@@ -1,6 +1,6 @@
 # ADR-0008: Type system and internal row/value representation
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-27
 - **Deciders:** @khaines
 - **Related:** ADR-0002 (columnar format), `docs/engineering/design/engine-architecture.md`
@@ -23,7 +23,16 @@ a columnar form (`ColumnarBatch`).
 
 ## Decision
 
-TBD — to be resolved during backlog work.
+A **row + columnar hybrid**: the mutable `ColumnBatch`/`ColumnVector` (ADR-0002)
+for scans and vectorized compute, plus a compact **binary row format (an
+`UnsafeRow` analog: 8-byte-aligned, null-bitset, byte-sortable, shuffle/spill
+serializable)** for shuffle partition/sort/join keys and materialized result rows.
+Full **Spark SQL type-system parity** — primitives, `decimal`, date/timestamp, and
+complex `array`/`map`/`struct` — with **ANSI** null and overflow semantics and SQL
+three-valued logic. Owned jointly by `dotnet-vectorized-columnar-compute-engineer`
+(columnar) and `dotnet-runtime-performance-engineer` (binary row layout/sort), with
+`query-execution-engine-engineer` and `sql-language-frontend-engineer` consuming
+the type system.
 
 ## Gating / dependencies
 

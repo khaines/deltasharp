@@ -1,6 +1,6 @@
 # ADR-0006: Scheduler, Adaptive Query Execution, and cost-based optimization
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-27
 - **Deciders:** @khaines
 - **Related:** ADR-0001, ADR-0004, `docs/engineering/design/engine-architecture.md`
@@ -23,7 +23,20 @@ sophistication — rule-based vs cost-based, and whether to do runtime replannin
 
 ## Decision
 
-TBD — to be resolved during backlog work.
+**v1 includes the full optimizer/scheduler stack:** a rule-based optimizer **plus a
+cost-based optimizer (CBO)** driven by table/column statistics, **Adaptive Query
+Execution (AQE)** — runtime re-optimization at stage boundaries (dynamic partition
+coalescing, skew-join handling, join-strategy switching) using live shuffle
+statistics — and a **fair scheduler with resource pools** (weighted pools,
+min-share, preemption) for multi-tenant scheduling.
+
+This requires a **statistics subsystem**: write-time table/column stats (row/NDV
+counts, min/max, histograms) collected by `delta-storage-format-engineer` into
+Delta/Parquet stats and the catalog (ADR-0005), plus runtime shuffle statistics
+feeding AQE. Owned primarily by `query-execution-engine-engineer` (optimizer + AQE);
+the fair scheduler spans `cloud-native-distributed-systems-architect` and
+`dotnet-distributed-execution-engineer`. Given the scope, a dedicated
+**scheduler/optimizer/statistics** seat is a candidate (tracked in the backlog).
 
 ## Gating / dependencies
 
