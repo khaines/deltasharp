@@ -15,6 +15,9 @@ around three pillars:
 3. **Kubernetes-native** — distributed execution designed for Kubernetes from the
    start, managed by a custom Operator and CRDs.
 
+DeltaSharp is **open-source** with a community-driven adoption strategy (Apache-2.0
+assumed; see [ADR-0015](../docs/adr/0015-open-source-positioning.md)).
+
 > **Status: greenfield.** The repository currently has no code. These
 > instructions describe the *intended* architecture and conventions to steer
 > early implementation. As concrete code lands, update sections here (especially

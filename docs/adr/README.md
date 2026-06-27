@@ -35,6 +35,7 @@ summary and an ADR disagree, the ADR wins.
 | [0012](0012-plan-serialization.md) | Plan serialization (driver ↔ executor) | Accepted |
 | [0013](0013-memory-model.md) | Memory model for in-memory batches | Accepted |
 | [0014](0014-target-framework-aot.md) | Target framework and AOT posture | Accepted |
+| [0015](0015-open-source-positioning.md) | Open-source positioning and community governance | Accepted |
 
 ## Backlog (Proposed ADRs)
 
