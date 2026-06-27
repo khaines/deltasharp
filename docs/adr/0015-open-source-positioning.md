@@ -13,12 +13,13 @@ community** — contributors, ecosystem integrations, and public trust.
 
 ## Decision
 
-**DeltaSharp is open-source** with an active community/adoption strategy. Establish
-OSS governance: a `LICENSE` (TBD — **Apache-2.0** is the lakehouse-ecosystem norm
-and the working assumption), `CONTRIBUTING`, a code of conduct, an RFC/proposal
-process, a public roadmap, issue/PR triage, and release communications. Add a
-dedicated **`developer-relations-community-lead`** persona to own community,
-contributor experience, evangelism, and governance — distinct from
+**DeltaSharp is open-source** with an active community/adoption strategy. It is
+licensed under the **Apache License 2.0** (the lakehouse-ecosystem norm — Spark,
+Delta, Iceberg, and Arrow all use it — with an explicit patent grant). Establish
+OSS governance: `LICENSE` + `NOTICE`, `CONTRIBUTING`, a code of conduct, an
+RFC/proposal process, a public roadmap, issue/PR triage, and release
+communications. Add a dedicated **`developer-relations-community-lead`** persona to
+own community, contributor experience, evangelism, and governance — distinct from
 `developer-experience-api-engineer` (API ergonomics/samples) and `technical-writer`
 (the docs themselves).
 
@@ -35,8 +36,9 @@ contributor experience, evangelism, and governance — distinct from
 
 ### Follow-ups
 
-- **Choose a `LICENSE`** (Apache-2.0 vs MIT) — open sub-decision (Apache-2.0 assumed).
-- Author `CONTRIBUTING`, code of conduct, and the RFC/proposal process
+- **License chosen: Apache-2.0** — `LICENSE` and `NOTICE` added; `CONTRIBUTING`,
+  `CODE_OF_CONDUCT`, `SECURITY`, and the RFC process (`docs/rfcs/`) authored.
+- Public roadmap and maintainership/`GOVERNANCE` docs remain to be authored
   (`developer-relations-community-lead` with `technical-writer`).
 
 ## Alternatives considered
