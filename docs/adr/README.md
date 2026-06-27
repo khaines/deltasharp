@@ -25,9 +25,21 @@ summary and an ADR disagree, the ADR wins.
 | [0002](0002-columnar-batch-format.md) | In-memory columnar batch format: Arrow-compatible custom (Arrow-first) | Accepted |
 | [0003](0003-data-plane-transport.md) | Transport split: gRPC control plane + Arrow Flight data plane | Accepted |
 | [0004](0004-shuffle-architecture.md) | Shuffle: native remote shuffle service with location registry, drain-migration + replication | Accepted |
+| [0005](0005-catalog-metastore.md) | Catalog / metastore | Proposed |
+| [0006](0006-scheduler-aqe-cbo.md) | Scheduler, Adaptive Query Execution, cost-based optimization | Proposed |
+| [0007](0007-sql-frontend.md) | SQL frontend — parser and dialect | Proposed |
+| [0008](0008-type-system-row-format.md) | Type system and internal row/value representation | Proposed |
+| [0009](0009-kubernetes-operator-crds.md) | Kubernetes Operator and CRD design | Proposed |
+| [0010](0010-structured-streaming-scope.md) | Structured Streaming scope | Proposed |
+| [0011](0011-delta-protocol-scope.md) | Delta protocol feature scope | Proposed |
+| [0012](0012-plan-serialization.md) | Plan serialization (driver ↔ executor) | Proposed |
+| [0013](0013-memory-model.md) | Memory model for in-memory batches | Proposed |
+| [0014](0014-target-framework-aot.md) | Target framework and AOT posture | Proposed |
 
-## Still open (tracked, not yet decided)
+## Backlog (Proposed ADRs)
 
-- Memory model for batches: off-heap (`NativeMemory`, 64-byte aligned) vs GC-heap + `ArrayPool` (leaning off-heap).
-- Target framework(s) and AOT posture (e.g., `net10.0`, multi-targeting, NativeAOT executor image).
-- Codegen granularity beyond intra-operator fusion (cross-stage fusion) — deferred optimization.
+ADR-0005 through ADR-0014 are **Proposed** — tracked decisions not yet made.
+Several **gate candidate personas**: catalog/metastore (0005), SQL language &
+frontend (0007), Kubernetes operator & controller (0009), and structured
+streaming engine (0010). Codegen granularity beyond intra-operator fusion
+(cross-stage) is tracked as a follow-up under ADR-0001.
