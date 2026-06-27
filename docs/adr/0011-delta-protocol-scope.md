@@ -1,6 +1,6 @@
 # ADR-0011: Delta protocol feature scope
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-27
 - **Deciders:** @khaines
 - **Related:** ADR-0002, `docs/engineering/design/engine-architecture.md`
@@ -22,7 +22,15 @@ decide which features DeltaSharp supports and in what order. Owned by
 
 ## Decision
 
-TBD — to be resolved during backlog work.
+**v1 targets a broad Delta feature set.** Baseline: add/remove/metadata actions,
+checkpoints, time travel, schema enforcement/evolution, `OPTIMIZE`/compaction, and
+`VACUUM`. Plus the advanced writer features: **deletion vectors** (merge-on-read
+deletes/updates), **column mapping** (id-based rename/drop without rewrite),
+**Change Data Feed (CDF)**, **liquid clustering**, and **row tracking**, with V2
+checkpoints. Reader/writer protocol-version negotiation gates capabilities so
+tables remain interoperable with other Delta engines. Owned by
+`delta-storage-format-engineer`; the write-time statistics that CBO/AQE (ADR-0006)
+consume are collected here.
 
 ## Gating / dependencies
 
