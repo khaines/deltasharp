@@ -1,6 +1,6 @@
 # ADR-0005: Catalog / metastore
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-27
 - **Deciders:** @khaines
 - **Related:** ADR-0002, ADR-0007 (SQL frontend), `docs/engineering/design/engine-architecture.md`
@@ -22,7 +22,11 @@ resolve them during analysis. Spark exposes a `Catalog` abstraction (V2
 
 ## Decision
 
-TBD — to be resolved during backlog work.
+A **pluggable catalog** modeled on Spark's V2 `CatalogPlugin`/`TableCatalog`
+extension point. Ship a **native DeltaSharp catalog** as the default; provide
+**Hive Metastore compatibility as a first-party plugin** for lakehouse interop;
+leave **Unity-Catalog-style REST governance** as a later plugin. A dedicated
+`catalog-metastore-engineer` seat owns this subsystem.
 
 ## Gating / dependencies
 

@@ -1,6 +1,6 @@
 # ADR-0007: SQL frontend — parser and dialect
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-27
 - **Deciders:** @khaines
 - **Related:** ADR-0005 (catalog), ADR-0006 (optimizer), `docs/engineering/design/engine-architecture.md`
@@ -20,7 +20,13 @@ the optimizer. Question: how to build the parser and how much dialect parity.
 
 ## Decision
 
-TBD — to be resolved during backlog work.
+Build the SQL frontend on an **ANTLR4 grammar that mirrors Spark's `SqlBase.g4`**
+(ANTLR4 C# target) with **ANSI SQL mode**, to maximize Spark SQL dialect parity.
+Ship a **core dialect first** and grow function/syntax coverage over time. A
+dedicated **`sql-language-frontend-engineer`** seat owns the grammar, parser,
+ANSI/dialect semantics, function registry, and name-resolution rules, and hands
+the resolved logical plan to `query-execution-engine-engineer`
+(optimize → physical → execute).
 
 ## Gating / dependencies
 
