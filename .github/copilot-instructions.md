@@ -90,6 +90,32 @@ only things that trigger the engine. Every new operator must preserve this.
   executor count per job for now; design interfaces so dynamic allocation can be
   added later without reworking the operator.
 
+## Engine architecture decisions
+
+Foundational engineering decisions are recorded as **ADRs in `docs/adr/`** (the
+source of truth) and summarized in
+`docs/engineering/design/engine-architecture.md`. Honor these and keep each
+abstraction swappable:
+
+- **Execution backend ([ADR-0001](../docs/adr/0001-execution-strategy.md)):**
+  pluggable — an AOT-safe **vectorized interpreter** is the default and the
+  correctness reference; an **optional JIT codegen tier** (intra-operator
+  `Expression.Compile` fusion) is enabled only when
+  `RuntimeFeature.IsDynamicCodeSupported`. Keep the codegen tier AOT-elidable
+  (`[RequiresDynamicCode]`/`[FeatureGuard]`); both backends must produce identical
+  results (parity oracle).
+- **Columnar batches ([ADR-0002](../docs/adr/0002-columnar-batch-format.md)):**
+  operators bind to an internal **mutable `ColumnBatch`/`ColumnVector`**
+  (selection-vector-aware), **Arrow-backed initially**, custom off-heap later —
+  **Arrow at the edges** (Parquet, Flight, interop).
+- **Transport ([ADR-0003](../docs/adr/0003-data-plane-transport.md)):** **gRPC
+  control plane + Arrow Flight data plane** behind `IDataExchange`.
+- **Shuffle ([ADR-0004](../docs/adr/0004-shuffle-architecture.md)):** a
+  **.NET-native remote shuffle service** — node-local workers + a **location
+  registry** with **dynamic resolution** (never pin a location; re-resolve +
+  retry), **drain-migration + configurable eager replication**, object-store
+  fallback later.
+
 ## Key conventions
 
 - **Mirror the Spark API.** Match Spark's public method names, argument shapes,
