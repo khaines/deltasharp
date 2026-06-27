@@ -1,0 +1,45 @@
+# CODEOWNERS — routes review requests to maintainers.
+#
+# DeltaSharp is early-stage; @khaines is the founding maintainer and default owner.
+# As maintainers join, replace/extend these rules with area owners. The intended
+# subsystem -> persona ownership is documented in docs/persona/agents/ and the ADRs;
+# the commented block at the bottom maps src/ subsystems to their persona owners and
+# should be activated (with real GitHub handles/teams) as code and maintainers land.
+
+# Default owner for everything
+*                           @khaines
+
+# Architecture & decisions (source of truth)
+/docs/adr/                  @khaines
+/docs/engineering/          @khaines
+
+# Persona / agent library
+/docs/persona/              @khaines
+
+# Governance, community, and project front door
+/README.md                  @khaines
+/LICENSE                    @khaines
+/NOTICE                     @khaines
+/GOVERNANCE.md              @khaines
+/CODE_OF_CONDUCT.md         @khaines
+/CONTRIBUTING.md            @khaines
+/SECURITY.md                @khaines
+/ROADMAP.md                 @khaines
+/docs/rfcs/                 @khaines
+/.github/                   @khaines
+
+# --- Intended subsystem ownership (activate as src/ lands and maintainers join) ---
+# Map each area to the persona that owns it (see docs/persona/agents/), then to a
+# real GitHub handle or team.
+#
+# /src/**/Sql/                       # sql-language-frontend-engineer
+# /src/**/Catalog/                   # catalog-metastore-engineer
+# /src/**/Optimizer/                 # query-optimizer-scheduler-engineer
+# /src/**/Execution/                 # query-execution-engine-engineer
+# /src/**/Vectorized/ /src/**/Columnar/   # dotnet-vectorized-columnar-compute-engineer
+# /src/**/Runtime/ /src/**/Memory/   # dotnet-runtime-performance-engineer
+# /src/**/Distributed/ /src/**/Shuffle/   # dotnet-distributed-execution-engineer
+# /src/**/Delta/ /src/**/Parquet/    # delta-storage-format-engineer
+# /src/**/Streaming/                 # structured-streaming-engine-engineer
+# /operator/ /src/**/Operator/       # kubernetes-operator-controller-engineer
+# Directory.Build.props /Directory.Packages.props /**/*.csproj   # dotnet-library-platform-engineer

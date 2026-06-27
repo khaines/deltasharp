@@ -38,9 +38,8 @@ own community, contributor experience, evangelism, and governance — distinct f
 
 - **License chosen: Apache-2.0** — `LICENSE` and `NOTICE` added; `CONTRIBUTING`,
   `CODE_OF_CONDUCT`, `SECURITY`, and the RFC process (`docs/rfcs/`) authored.
-- `GOVERNANCE.md` (maintainership model) and `ROADMAP.md` (public, ADR-grounded
-  roadmap) authored. A top-level project `README.md` and a `CODEOWNERS` file remain
-  as follow-ups.
+- `GOVERNANCE.md`, `ROADMAP.md`, a top-level `README.md`, and `.github/CODEOWNERS`
+  authored — OSS governance scaffolding complete.
 
 ## Alternatives considered
 
