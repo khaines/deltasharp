@@ -1,6 +1,6 @@
 # ADR-0010: Structured Streaming scope
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-27
 - **Deciders:** @khaines
 - **Related:** ADR-0004 (shuffle), ADR-0008 (type system), `docs/engineering/design/engine-architecture.md`
@@ -21,7 +21,12 @@ guarantees. This is a **scope/roadmap gate** for v1.
 
 ## Decision
 
-TBD — to be resolved during backlog work.
+**Micro-batch streaming is in scope for v1**, reusing the batch engine (streaming
+= incremental batch: source offset management, state stores, watermarks,
+checkpointing, exactly-once via transactional sinks). **Continuous /
+record-at-a-time processing (Flink-like) is deferred to a later release** — design
+the streaming source/sink, state-store, and execution seams so continuous mode can
+be added later without reworking the batch engine.
 
 ## Gating / dependencies
 

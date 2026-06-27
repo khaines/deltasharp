@@ -25,12 +25,12 @@ summary and an ADR disagree, the ADR wins.
 | [0002](0002-columnar-batch-format.md) | In-memory columnar batch format: Arrow-compatible custom (Arrow-first) | Accepted |
 | [0003](0003-data-plane-transport.md) | Transport split: gRPC control plane + Arrow Flight data plane | Accepted |
 | [0004](0004-shuffle-architecture.md) | Shuffle: native remote shuffle service with location registry, drain-migration + replication | Accepted |
-| [0005](0005-catalog-metastore.md) | Catalog / metastore | Proposed |
+| [0005](0005-catalog-metastore.md) | Catalog / metastore | Accepted |
 | [0006](0006-scheduler-aqe-cbo.md) | Scheduler, Adaptive Query Execution, cost-based optimization | Proposed |
-| [0007](0007-sql-frontend.md) | SQL frontend — parser and dialect | Proposed |
+| [0007](0007-sql-frontend.md) | SQL frontend — parser and dialect | Accepted |
 | [0008](0008-type-system-row-format.md) | Type system and internal row/value representation | Proposed |
-| [0009](0009-kubernetes-operator-crds.md) | Kubernetes Operator and CRD design | Proposed |
-| [0010](0010-structured-streaming-scope.md) | Structured Streaming scope | Proposed |
+| [0009](0009-kubernetes-operator-crds.md) | Kubernetes Operator and CRD design | Accepted |
+| [0010](0010-structured-streaming-scope.md) | Structured Streaming scope | Accepted |
 | [0011](0011-delta-protocol-scope.md) | Delta protocol feature scope | Proposed |
 | [0012](0012-plan-serialization.md) | Plan serialization (driver ↔ executor) | Proposed |
 | [0013](0013-memory-model.md) | Memory model for in-memory batches | Proposed |
