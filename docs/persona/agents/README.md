@@ -50,7 +50,7 @@ transport, shuffle) are recorded as ADRs in `docs/adr/` and summarized in
 `docs/engineering/design/engine-architecture.md`; every persona **defers** to those
 ADRs rather than redefining them.
 
-## Agent roster (24 agents)
+## Agent roster (25 agents)
 
 Cross-cutting and platform:
 
@@ -64,6 +64,7 @@ Cross-cutting and platform:
 | Privacy, Compliance & GRC Lead | PII handling in processed data, GDPR/CCPA/SOC 2, retention, data lineage, DSAR/erasure, audit evidence | encryption mechanics (Security SME), incident-response execution (SRE), commercial terms (PM) |
 | Technical Writer | documentation architecture, API/SDK reference, runbooks, migration guides, docs-as-code | engineering implementation, product strategy, or research outside docs scope |
 | Developer Experience & API Engineer | Spark API parity ergonomics, DataFrame/Dataset/SparkSession surface, source compatibility, PySpark/Scala migration paths, samples, API stability | engine internals (Query/Execution Engine, Delta & Storage Format) or product prioritization (PM) |
+| Developer Relations & Community Lead | OSS community & contributor experience, governance (CONTRIBUTING/CoC/RFC), evangelism/content, ecosystem partnerships, release comms (ADR-0015) | API ergonomics/samples (Developer Experience), the docs themselves (Technical Writer), product direction (PM) |
 
 Engine and data:
 
@@ -115,6 +116,7 @@ Subsystem seats (v1 scope decisions; see `docs/adr/`):
   SQL Language & Frontend (ADR-0007), Structured Streaming Engine (ADR-0010),
   Query Optimizer & Scheduler (ADR-0006), and Kubernetes Operator & Controller
   (ADR-0009) were added as the v1 scope decisions turned them on.
+- **Developer Relations & Community Lead** — re-added once DeltaSharp committed to open source (ADR-0015).
 - **Dropped from the lts base:** `game-data-analytics-experimentation-engineer`
   (dashboard-authoring focus, not relevant to a processing framework).
 
