@@ -1,6 +1,6 @@
 # ADR-0013: Memory model for in-memory batches
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-27
 - **Deciders:** @khaines
 - **Related:** ADR-0002 (columnar format), `docs/engineering/design/engine-architecture.md`
@@ -21,7 +21,14 @@ must decide the default and the unified memory management policy.
 
 ## Decision
 
-TBD — to be resolved during backlog work.
+**Off-heap** (`NativeMemory`, 64-byte aligned) for columnar batches and the binary
+row buffers (ADR-0008), consistent with Arrow C#'s default off-heap allocator
+(ADR-0002) — GC-invisible, deterministic reclamation, SIMD-aligned, no LOH/gen2
+pauses on large buffers. A **unified memory manager** governs execution vs storage
+pools with per-task budgets and **spills to local disk / object-store** under
+pressure (ties to ADR-0004). GC-heap + `ArrayPool<T>` is used only for small,
+short-lived scratch. Owned by `dotnet-runtime-performance-engineer` with
+`dotnet-vectorized-columnar-compute-engineer`.
 
 ## Gating / dependencies
 

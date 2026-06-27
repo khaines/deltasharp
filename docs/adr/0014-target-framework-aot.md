@@ -1,6 +1,6 @@
 # ADR-0014: Target framework and AOT posture
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-27
 - **Deciders:** @khaines
 - **Related:** ADR-0001 (codegen tier / AOT gating), `docs/engineering/design/engine-architecture.md`
@@ -21,7 +21,14 @@ the ADR-0001 codegen-tier elision. Decision needed early.
 
 ## Decision
 
-TBD — to be resolved during backlog work.
+**Engine and executor target `net10.0`** and ship a **NativeAOT executor image**
+(fast cold start, low memory for ephemeral pods); the vectorized interpreter runs
+under AOT and the optional codegen tier (ADR-0001) is dead-code-eliminated via
+feature switches. **Public-facing libraries multi-target `net8.0;net10.0`** for
+broad adoption and are kept **trim/AOT-annotation-clean** so AOT consumers (and the
+AOT executor image) build cleanly. Owned by `dotnet-library-platform-engineer`
+(packaging/TFM/trim hygiene) with `dotnet-runtime-performance-engineer` (AOT runtime
+trade-offs).
 
 ## Gating / dependencies
 
