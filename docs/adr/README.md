@@ -31,8 +31,8 @@ summary and an ADR disagree, the ADR wins.
 | [0008](0008-type-system-row-format.md) | Type system and internal row/value representation | Accepted |
 | [0009](0009-kubernetes-operator-crds.md) | Kubernetes Operator and CRD design | Accepted |
 | [0010](0010-structured-streaming-scope.md) | Structured Streaming scope | Accepted |
-| [0011](0011-delta-protocol-scope.md) | Delta protocol feature scope | Proposed |
-| [0012](0012-plan-serialization.md) | Plan serialization (driver ↔ executor) | Proposed |
+| [0011](0011-delta-protocol-scope.md) | Delta protocol feature scope | Accepted |
+| [0012](0012-plan-serialization.md) | Plan serialization (driver ↔ executor) | Accepted |
 | [0013](0013-memory-model.md) | Memory model for in-memory batches | Accepted |
 | [0014](0014-target-framework-aot.md) | Target framework and AOT posture | Accepted |
 
