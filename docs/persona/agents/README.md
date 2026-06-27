@@ -50,7 +50,7 @@ transport, shuffle) are recorded as ADRs in `docs/adr/` and summarized in
 `docs/engineering/design/engine-architecture.md`; every persona **defers** to those
 ADRs rather than redefining them.
 
-## Agent roster (19 agents)
+## Agent roster (24 agents)
 
 Cross-cutting and platform:
 
@@ -86,6 +86,16 @@ Deep .NET engineering (the four first-class seats; see `docs/adr/`):
 | .NET Distributed Execution Engineer | gRPC host + Kestrel HTTP/2, `IHostedService` lifecycle & graceful K8s shutdown, `Channels` task dispatch, the native remote shuffle service (workers, location registry, drain-migration, replication), Arrow Flight `IDataExchange` | topology/CRDs/operator design (Architect), task compute (Query/Execution Engine), runtime GC/JIT tuning (Runtime & Performance), production SLOs (SRE) |
 | .NET Library & Package Platform Engineer | NuGet/multi-targeting, build governance, Roslyn analyzers & source generators, public-API enforcement, trim/Native-AOT readiness & feature-switch hygiene | public API shape/docs/migration (Developer Experience & API), runtime/GC behavior (Runtime & Performance) |
 
+Subsystem seats (v1 scope decisions; see `docs/adr/`):
+
+| Agent | Use when the main need is... | Hands off when the main need becomes... |
+|---|---|---|
+| Catalog & Metastore Engineer | namespaces/tables/views/functions, pluggable `CatalogPlugin` + native catalog, Hive-metastore compatibility, identifier resolution (ADR-0005) | Delta log/Parquet on disk (Delta & Storage Format), external source federation (Data Sources & Connectors), authz (Security SME) |
+| SQL Language & Frontend Engineer | ANTLR4 grammar (Spark `SqlBase` parity), parser, ANSI mode, dialect/function parity, name/type resolution → resolved plan (ADR-0007) | optimize/physical/execute (Query/Execution Engine), CBO/AQE (Query Optimizer & Scheduler), DataFrame API surface (Developer Experience) |
+| Structured Streaming Engine Engineer | micro-batch incremental execution, sources/sinks, offsets, state stores, watermarks, checkpointing, exactly-once (ADR-0010) | the batch engine it reuses (Query/Execution Engine), Delta source/sink + CDF (Delta & Storage Format), external sources (Data Sources & Connectors) |
+| Query Optimizer & Scheduler Engineer | cost-based optimizer + statistics, Adaptive Query Execution (skew/coalesce/strategy), fair scheduler + resource pools (ADR-0006) | rule-based optimizer & execution mechanics (Query/Execution Engine), write-time stats (Delta & Storage Format), task dispatch (Distributed Execution) |
+| Kubernetes Operator & Controller Engineer | KubeOps operator, CRDs (Application/Session), reconcilers, webhooks, finalizers, driver/executor/shuffle lifecycle & scaling (ADR-0009) | topology/CRD design (Architect), process hosting/shuffle runtime (Distributed Execution), production SLOs (SRE) |
+
 ## Provenance
 
 - **Imported and adapted from `labtested-storage`** (closest domain): Product
@@ -101,6 +111,10 @@ Deep .NET engineering (the four first-class seats; see `docs/adr/`):
 - **Developer Experience & API Engineer** — new, drawing on `blogflow-pro`'s
   developer-experience-api-engineer and `gamegrid`'s
   game-developer-experience-sdk-engineer.
+- **Subsystem seats — from the engine ADRs.** Catalog & Metastore (ADR-0005),
+  SQL Language & Frontend (ADR-0007), Structured Streaming Engine (ADR-0010),
+  Query Optimizer & Scheduler (ADR-0006), and Kubernetes Operator & Controller
+  (ADR-0009) were added as the v1 scope decisions turned them on.
 - **Dropped from the lts base:** `game-data-analytics-experimentation-engineer`
   (dashboard-authoring focus, not relevant to a processing framework).
 
