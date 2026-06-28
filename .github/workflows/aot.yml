@@ -67,8 +67,22 @@ jobs:
           echo "$output" | grep -qF "interpreted-vectorized (dynamic-code=False)"
           echo "$output" | grep -qF "affine(20)=41"
           # AC3: the optional CompiledBackend must be dead-code-eliminated from the native image.
-          if nm "$publish_path" 2>/dev/null | grep -qi "CompiledBackend"; then
-            echo "ERROR: CompiledBackend symbol found in the NativeAOT image — codegen tier was not elided." >&2
+          # Use `strings`, not `nm`: NativeAOT strips managed type names from the binary symbol
+          # table, so `nm` yields a false-negative (a leaked managed type is invisible to it). The
+          # type name does remain in the image metadata, which `strings` surfaces. The bounded
+          # pattern matches the CompiledBackend type but not the reachable IsCompiledBackendAvailable
+          # guard property (whose name legitimately survives).
+          #
+          # Positive control first: confirm `strings` can actually see a backend type name that IS
+          # reachable (InterpretedVectorizedBackend). If it cannot, the image strips type metadata
+          # and an "absent" CompiledBackend result would be vacuous — fail rather than pass blindly
+          # (this is the false-negative class that makes `nm` unsuitable here).
+          if ! strings -a "$publish_path" | grep -Eq 'InterpretedVectorizedBackend([^A-Za-z]|$)'; then
+            echo "ERROR: positive control failed — strings cannot see backend type metadata, so the elision check is unreliable." >&2
+            exit 1
+          fi
+          if strings -a "$publish_path" | grep -Eq 'CompiledBackend([^A-Za-z]|$)'; then
+            echo "ERROR: CompiledBackend metadata found in the NativeAOT image — codegen tier was not elided." >&2
             exit 1
           fi
           echo "Verified: CompiledBackend elided; interpreted backend selected under NativeAOT."
