@@ -35,19 +35,34 @@ regardless of whether the bytes are off-heap or on a pooled array.
 
 ## Aligned off-heap as the default (AC1)
 
-`AlignedNativeBuffer` wraps `NativeMemory.AlignedAlloc(byteCount, 64)`. Every base address is
-**64-byte aligned** (`AlignedNativeBuffer.Alignment`), so the buffer can back SIMD kernels
-(AVX-512 / `Vector512`) without a misaligned-load penalty, and `AsSpan()` exposes **exactly** the
-requested `Length` bytes — `new Span<byte>((void*)pointer, Length)`. Off-heap bytes are invisible to
-the GC: large buffers never land on the LOH, never trigger a gen-2 compaction, and are reclaimed the
-instant they are disposed rather than at the next collection. This requires
-`<AllowUnsafeBlocks>true</AllowUnsafeBlocks>` (scoped to `DeltaSharp.Engine.csproj`, **not**
+`AlignedNativeBuffer` wraps `NativeMemory.AlignedAlloc`. Every base address is **64-byte aligned**
+(`AlignedNativeBuffer.Alignment`), and the physical allocation is **rounded up to a 64-byte multiple**
+(`Capacity`) so a vectorized kernel can over-read the final partial vector (AVX-512 / `Vector512`)
+past `Length` without faulting — Arrow-parity. `AsSpan()` still exposes **exactly** the requested
+`Length` bytes — `new Span<byte>((void*)pointer, Length)` — and the alignment guarantee is a
+root/offset-0 property: a sliced view starting at `base + offset` uses ordinary unaligned loads.
+Off-heap bytes are invisible to the GC: large buffers never land on the LOH, never trigger a gen-2
+compaction, and are reclaimed the instant they are disposed rather than at the next collection. This
+requires `<AllowUnsafeBlocks>true</AllowUnsafeBlocks>` (scoped to `DeltaSharp.Engine.csproj`, **not**
 `Directory.Build.props`); `NativeMemory` and unsafe pointers are AOT/trim-clean (the engine keeps
-`EnableTrimAnalyzer`/`EnableAotAnalyzer` on) and are not on `BannedSymbols.txt`.
+`EnableTrimAnalyzer`/`EnableAotAnalyzer` on) and are not on `BannedSymbols.txt`. A single `OwnedBuffer`
+is capped at `int.MaxValue` bytes — an intentional batch-granularity constraint (a buffer holds one
+column's vector for a 1k–8k-row batch, not an entire table).
 
 If the aligned allocation fails, `AlignedNativeBuffer.Allocate` throws `OutOfMemoryException`
 **before** any wrapper object is constructed or any counter is moved, so a failed allocation cannot
 leak accounting.
+
+## Zeroed by default; uninitialized is opt-in
+
+`Allocate` returns **zeroed** memory (the secure default, like `new byte[]`): native buffers clear
+their whole capacity, scratch clears its usable window. `AllocateUninitialized` skips zeroing for the
+hot path that fully overwrites before reading (like `GC.AllocateUninitializedArray` / `ArrayPool`);
+its bytes are arbitrary prior contents, so **the caller MUST write every byte before reading**. This
+makes the data-bearing path safe by default (buffers flow to shuffle/spill and, on a shared executor,
+across tenants) while preserving a zero-cost path for kernels that own initialization. `AsSpan()`
+returns a raw view: it does **not** keep the buffer alive and **must not outlive it** — a span retained
+past `Dispose()` dangles (use `GC.KeepAlive(buffer)` if the buffer is not otherwise rooted).
 
 ## Deterministic, exactly-once disposal (AC2)
 
@@ -68,11 +83,15 @@ is missed, the native memory is still freed (so the process does not leak off-he
 allocator's `FinalizedWithoutDispose` diagnostic counter is bumped, surfacing the missed dispose in
 tests and telemetry. A finalizer run is distinguished by `disposing == false`; reaching it means a
 leak. Correct callers always dispose (directly or via a `BufferGroup`), which suppresses
-finalization. `GcHeapBuffer` needs **no** finalizer: its backing store is a managed array the GC
-reclaims on its own, and returning an array to a pool from a finalizer is undesirable anyway. It
-returns the array with `clearArray: true`, so pooled scratch never carries one caller's bytes into
-the next renter (defense-in-depth for row/PII data; scratch is small, so the zeroing cost is
-negligible).
+finalization. A raw finalizer (not `SafeHandle`/`CriticalFinalizerObject`) is the deliberate v1
+choice: the resource is a plain `NativeMemory` pointer with no handle-recycling surface, and
+`SafeHandle`'s ref-count protection is moot because `AsSpan()` hands out a span that escapes any
+`DangerousAddRef` scope — the single-owner rooting contract is the real mechanism (revisit if buffers
+become concurrently shared or a pointer is held across a racing P/Invoke). `GcHeapBuffer` needs
+**no** finalizer: its backing store is a managed array the GC reclaims on its own, and returning an
+array to a pool from a finalizer is undesirable anyway. It returns the array with `clearArray: true`,
+so pooled scratch never carries one caller's bytes into the next renter (defense-in-depth for row/PII
+data; scratch is small, so the zeroing cost is negligible).
 
 **Scratch leak asymmetry (intentional).** Because `GcHeapBuffer` has no finalizer, a *leaked*
 (never-disposed) scratch buffer is reclaimed by the GC but its `LiveScratch*` counters are **never
@@ -115,7 +134,10 @@ memory pressure and leaks can be attributed to the right pool:
 
 Counters are accounted by the **requested** byte count (a pooled array may be larger than requested,
 but the logical usable size is what is tracked), so allocate and release are symmetric and balance to
-zero.
+zero. Each counter is updated atomically and the live counters return to zero once every buffer is
+released, but the gauges are **not** a jointly-consistent instantaneous snapshot — a concurrent reader
+can observe `LiveNativeBytes` and `LiveNativeCount` mid-flight between two `Interlocked` ops, so build
+leak assertions on quiescent state, not on a coherent multi-counter read during live concurrency.
 
 ## Exception-safe multi-buffer construction: `BufferGroup` (AC3)
 
@@ -141,7 +163,9 @@ If anything throws before `Detach()`, the `using` disposes the group and reclaim
 counters return to zero). On the success path `Detach()` transfers the buffers out and **empties** the
 group, so the trailing `using` disposal releases nothing — the new owner now holds the live buffers
 and is responsible for disposing them. This is the off-heap analogue of a scope guard /
-"commit-or-rollback" for native memory.
+"commit-or-rollback" for native memory. Note the handoff is exactly-transfer: detach **into** the
+consumer and let it take ownership only after all throwing work, e.g.
+`var bufs = group.Detach(); try { return new NativeColumnVector(bufs); } catch { foreach (var b in bufs) b.Dispose(); throw; }` — otherwise a throwing consumer constructor after a bare `Detach()` orphans the buffers (reclaimed late by the native finalizer; scratch leaks silently per the asymmetry above).
 
 ## v1 scope and deferrals
 
@@ -149,6 +173,11 @@ and is responsible for disposing them. This is the off-heap analogue of a scope 
   (`AlignedNativeBuffer`); the small-scratch GC-heap path (`GcHeapBuffer`); the size-routing,
   separately-accounted `NativeMemoryAllocator`; exactly-once disposal with a finalizer safety net and
   leak counters; and the `BufferGroup` exception-safety pattern.
+- **Deferred — off-heap `ColumnVector` lifetime:** `OwnedBuffer` is single-owner/exactly-once, but
+  ADR-0002 `ColumnVector.Slice`/`WithSelection` are **zero-copy views that share buffers**. A future
+  off-heap vector therefore needs an explicit lifetime model (ref-count, root-keepalive on each slice,
+  or batch-arena dispose) — the disposal analogue of #133's seal-on-slice — and SIMD over-read on
+  shared tails is already handled by the 64-byte capacity padding. This is the key #138 design risk.
 - **Deferred to [STORY-02.3.2](https://github.com/khaines/deltasharp/issues/138) (#138):** the
   **unified execution/storage memory manager** — execution vs. storage pools, **per-task budgets**,
   and **spill-to-disk / object-store under pressure** (Spark's `UnifiedMemoryManager`; ties to

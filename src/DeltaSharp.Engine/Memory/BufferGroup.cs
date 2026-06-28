@@ -30,6 +30,7 @@ public sealed class BufferGroup : IDisposable
     private readonly NativeMemoryAllocator _allocator;
     private readonly List<OwnedBuffer> _buffers = [];
     private bool _disposed;
+    private bool _detached;
 
     /// <summary>Creates a group that allocates through <paramref name="allocator"/> and owns what it hands out.</summary>
     /// <exception cref="ArgumentNullException"><paramref name="allocator"/> is null.</exception>
@@ -73,10 +74,16 @@ public sealed class BufferGroup : IDisposable
     /// </summary>
     /// <returns>The buffers, in allocation order; an empty array if none are tracked.</returns>
     /// <exception cref="ObjectDisposedException">The group has been disposed.</exception>
+    /// <exception cref="InvalidOperationException">Ownership has already been transferred by a prior <see cref="Detach"/>.</exception>
     public OwnedBuffer[] Detach()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_detached)
+        {
+            throw new InvalidOperationException("BufferGroup ownership has already been transferred by a prior Detach().");
+        }
 
+        _detached = true;
         OwnedBuffer[] detached = [.. _buffers];
         _buffers.Clear();
         return detached;

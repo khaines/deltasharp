@@ -68,6 +68,22 @@ public abstract class OwnedBuffer : IDisposable
     /// A writable view over the buffer's <see cref="Length"/> usable bytes. For an
     /// <see cref="AlignedNativeBuffer"/> the span starts at the 64-byte-aligned base address.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Lifetime:</b> the returned span MUST NOT outlive the buffer. The span is a raw view over the
+    /// backing memory and does <b>not</b> keep the <see cref="OwnedBuffer"/> alive; once the buffer is
+    /// disposed (or finalized) the native memory is freed and any retained span dangles — reading or
+    /// writing it is a use-after-free. Re-fetch the span after a possible <see cref="Dispose()"/> (this
+    /// method then throws), and use <c>GC.KeepAlive(buffer)</c> after the last span use if the buffer is
+    /// not otherwise rooted. The disposal guard here protects only this call site, not a previously
+    /// captured span.
+    /// </para>
+    /// <para>
+    /// <b>Initialization:</b> a buffer from <see cref="NativeMemoryAllocator.Allocate"/> is zeroed; a buffer
+    /// from <see cref="NativeMemoryAllocator.AllocateUninitialized"/> exposes arbitrary prior bytes — the
+    /// caller MUST fully write before read.
+    /// </para>
+    /// </remarks>
     /// <exception cref="ObjectDisposedException">The buffer has already been disposed.</exception>
     public Span<byte> AsSpan()
     {
@@ -98,6 +114,8 @@ public abstract class OwnedBuffer : IDisposable
             return;
         }
 
+        // Release() must be infallible: _disposed is already latched to 1, so a throw here would strand the
+        // live-counter decrement with no retry (and mask any original exception during a using-unwind).
         Release();
         _owner.OnReleased(this);
         if (!disposing)
@@ -108,10 +126,11 @@ public abstract class OwnedBuffer : IDisposable
 
     /// <summary>
     /// Releases the concrete backing memory (free native memory, or return the pooled array). Invoked at most
-    /// once, under the disposal guard. Must be safe to run from a finalizer for native implementations.
+    /// once, under the disposal guard. Must be safe to run from a finalizer for native implementations, and
+    /// <b>must not throw</b> (it runs after the disposal latch is set; see <see cref="Dispose(bool)"/>).
     /// </summary>
-    protected abstract void Release();
+    private protected abstract void Release();
 
     /// <summary>Returns the usable byte span without re-checking disposal (the public <see cref="AsSpan"/> guards it).</summary>
-    protected abstract Span<byte> AsSpanCore();
+    private protected abstract Span<byte> AsSpanCore();
 }

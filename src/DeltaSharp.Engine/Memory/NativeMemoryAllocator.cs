@@ -1,4 +1,10 @@
+using System.Buffers;
+using System.Runtime.InteropServices;
+
 namespace DeltaSharp.Engine.Memory;
+
+/// <summary>Native aligned-allocation primitive: returns a pointer to <paramref name="byteCount"/> bytes aligned to <paramref name="alignment"/>, or <c>null</c> on failure. Injectable so tests can simulate allocation failure.</summary>
+internal unsafe delegate void* AlignedAllocator(nuint byteCount, nuint alignment);
 
 /// <summary>
 /// The single source of <see cref="OwnedBuffer"/>s for the engine's columnar batches and binary rows (ADR-0013).
@@ -37,6 +43,8 @@ public sealed class NativeMemoryAllocator
     private long _finalizedWithoutDispose;
     private long _nativeFreeOperations;
     private long _scratchReturnOperations;
+    private readonly unsafe AlignedAllocator _alignedAlloc;
+    private readonly ArrayPool<byte> _scratchPool;
 
     /// <summary>Creates an allocator using the <see cref="DefaultScratchThresholdBytes"/> scratch threshold.</summary>
     public NativeMemoryAllocator()
@@ -47,11 +55,23 @@ public sealed class NativeMemoryAllocator
     /// <summary>Creates an allocator routing requests of <paramref name="scratchThreshold"/> bytes or fewer to pooled GC-heap scratch.</summary>
     /// <param name="scratchThreshold">The inclusive upper bound, in bytes, for the GC-heap scratch path.</param>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="scratchThreshold"/> is negative.</exception>
-    public NativeMemoryAllocator(int scratchThreshold)
+    public unsafe NativeMemoryAllocator(int scratchThreshold)
+        : this(scratchThreshold, DefaultAlignedAlloc, ArrayPool<byte>.Shared)
+    {
+    }
+
+    /// <summary>Test/extension seam: inject the native allocation primitive and scratch pool (e.g. to simulate OOM or isolate the pool).</summary>
+    internal NativeMemoryAllocator(int scratchThreshold, AlignedAllocator alignedAllocator, ArrayPool<byte> scratchPool)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(scratchThreshold);
+        ArgumentNullException.ThrowIfNull(alignedAllocator);
+        ArgumentNullException.ThrowIfNull(scratchPool);
         ScratchThreshold = scratchThreshold;
+        _alignedAlloc = alignedAllocator;
+        _scratchPool = scratchPool;
     }
+
+    private static unsafe void* DefaultAlignedAlloc(nuint byteCount, nuint alignment) => NativeMemory.AlignedAlloc(byteCount, alignment);
 
     /// <summary>The inclusive byte threshold at or below which a request is served from pooled GC-heap scratch.</summary>
     public int ScratchThreshold { get; }
@@ -91,29 +111,43 @@ public sealed class NativeMemoryAllocator
     public long ScratchReturnOperations => Interlocked.Read(ref _scratchReturnOperations);
 
     /// <summary>
-    /// Allocates an <see cref="OwnedBuffer"/> of <paramref name="byteCount"/> usable bytes. Requests at or below
-    /// <see cref="ScratchThreshold"/> are served from pooled GC-heap scratch (<see cref="GcHeapBuffer"/>); larger
-    /// requests are served from 64-byte-aligned off-heap memory (<see cref="AlignedNativeBuffer"/>). The matching
-    /// live counter is incremented only after the allocation succeeds.
+    /// Allocates a <b>zeroed</b> <see cref="OwnedBuffer"/> of <paramref name="byteCount"/> usable bytes (secure
+    /// default; like <c>new byte[]</c>). Requests at or below <see cref="ScratchThreshold"/> are served from pooled
+    /// GC-heap scratch (<see cref="GcHeapBuffer"/>); larger requests from 64-byte-aligned off-heap memory
+    /// (<see cref="AlignedNativeBuffer"/>). The matching live counter is incremented only after the allocation succeeds.
     /// </summary>
     /// <param name="byteCount">The number of usable bytes to allocate.</param>
     /// <returns>A buffer the caller owns and must dispose exactly once.</returns>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="byteCount"/> is negative.</exception>
     /// <exception cref="OutOfMemoryException">An off-heap allocation failed (no counter is moved).</exception>
-    public OwnedBuffer Allocate(int byteCount)
+    public OwnedBuffer Allocate(int byteCount) => AllocateCore(byteCount, zero: true);
+
+    /// <summary>
+    /// Allocates an <b>uninitialized</b> <see cref="OwnedBuffer"/> for the hot path that fully overwrites before reading
+    /// (like <see cref="GC.AllocateUninitializedArray{T}(int, bool)"/>/<see cref="ArrayPool{T}"/>). The returned bytes are
+    /// arbitrary prior contents; the caller MUST write every byte before reading, or use <see cref="Allocate"/> for the
+    /// zeroed, secure default. Same routing and accounting as <see cref="Allocate"/>.
+    /// </summary>
+    /// <param name="byteCount">The number of usable bytes to allocate.</param>
+    /// <returns>A buffer the caller owns and must dispose exactly once.</returns>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="byteCount"/> is negative.</exception>
+    /// <exception cref="OutOfMemoryException">An off-heap allocation failed (no counter is moved).</exception>
+    public OwnedBuffer AllocateUninitialized(int byteCount) => AllocateCore(byteCount, zero: false);
+
+    private OwnedBuffer AllocateCore(int byteCount, bool zero)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(byteCount);
 
         if (byteCount <= ScratchThreshold)
         {
-            var scratch = new GcHeapBuffer(this, byteCount);
+            var scratch = new GcHeapBuffer(this, byteCount, zero, _scratchPool);
             Interlocked.Add(ref _liveScratchBytes, byteCount);
             Interlocked.Increment(ref _liveScratchCount);
             return scratch;
         }
 
         // Allocate first; only on success do we publish a counter, so a failed AlignedAlloc cannot leak accounting.
-        AlignedNativeBuffer native = AlignedNativeBuffer.Allocate(this, byteCount);
+        AlignedNativeBuffer native = AlignedNativeBuffer.Allocate(this, byteCount, zero, _alignedAlloc);
         Interlocked.Add(ref _liveNativeBytes, byteCount);
         Interlocked.Increment(ref _liveNativeCount);
         return native;
