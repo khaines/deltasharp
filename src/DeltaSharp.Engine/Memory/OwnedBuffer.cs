@@ -57,6 +57,14 @@ public abstract class OwnedBuffer : IDisposable
     public bool IsDisposed => Volatile.Read(ref _disposed) != 0;
 
     /// <summary>
+    /// The allocator that produced this buffer. Concrete <see cref="Release"/> implementations notify it of the
+    /// <em>actual</em> free/return at the native or pool boundary (<see cref="NativeMemoryAllocator.OnNativeFreed"/> /
+    /// <see cref="NativeMemoryAllocator.OnScratchReturned"/>), so the release path is observable independently of the
+    /// live-counter bookkeeping.
+    /// </summary>
+    private protected NativeMemoryAllocator Owner => _owner;
+
+    /// <summary>
     /// A writable view over the buffer's <see cref="Length"/> usable bytes. For an
     /// <see cref="AlignedNativeBuffer"/> the span starts at the 64-byte-aligned base address.
     /// </summary>

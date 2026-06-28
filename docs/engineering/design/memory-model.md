@@ -69,7 +69,28 @@ allocator's `FinalizedWithoutDispose` diagnostic counter is bumped, surfacing th
 tests and telemetry. A finalizer run is distinguished by `disposing == false`; reaching it means a
 leak. Correct callers always dispose (directly or via a `BufferGroup`), which suppresses
 finalization. `GcHeapBuffer` needs **no** finalizer: its backing store is a managed array the GC
-reclaims on its own, and returning an array to a pool from a finalizer is undesirable anyway.
+reclaims on its own, and returning an array to a pool from a finalizer is undesirable anyway. It
+returns the array with `clearArray: true`, so pooled scratch never carries one caller's bytes into
+the next renter (defense-in-depth for row/PII data; scratch is small, so the zeroing cost is
+negligible).
+
+**Scratch leak asymmetry (intentional).** Because `GcHeapBuffer` has no finalizer, a *leaked*
+(never-disposed) scratch buffer is reclaimed by the GC but its `LiveScratch*` counters are **never
+decremented** and `FinalizedWithoutDispose` is **not** bumped — the leak is invisible to the
+diagnostics. This is an accepted trade-off: a missed scratch dispose costs only pool churn, not a
+process memory leak, so it does not warrant a finalizer on the cheap path. A *native* leak, by
+contrast, is always freed and flagged. A debug-only scratch-leak tracker can be added when the
+unified manager (STORY-02.3.2 / #138) lands.
+
+### Observing the real release
+
+The `Live*` gauges balance to zero on dispose, but balancing alone does not prove the backing
+memory was actually freed (a release that silently stopped freeing would still let the base
+`Dispose` decrement the gauge). So each concrete release also increments a cumulative
+**operation** counter from inside the release itself — `NativeFreeOperations` at the
+`NativeMemory.AlignedFree` boundary and `ScratchReturnOperations` at the `ArrayPool.Return`
+boundary. Tests assert these equal the number of allocations, which catches a no-op or
+double-release that the gauges cannot.
 
 ## Execution vs. scratch split (AC4)
 
@@ -87,8 +108,10 @@ memory pressure and leaks can be attributed to the right pool:
 | Counter | Meaning |
 | --- | --- |
 | `LiveNativeBytes` / `LiveNativeCount` | Off-heap bytes / buffers currently undisposed. |
-| `LiveScratchBytes` / `LiveScratchCount` | Pooled GC-heap scratch bytes / buffers currently undisposed. |
+| `LiveScratchBytes` / `LiveScratchCount` | Pooled GC-heap scratch bytes / buffers currently undisposed (no finalizer backstop — see the scratch leak asymmetry above). |
 | `FinalizedWithoutDispose` | Native buffers reclaimed by the finalizer safety net (a leak signal). |
+| `NativeFreeOperations` | Cumulative native frees actually performed at the `AlignedFree` boundary (observes the real release). |
+| `ScratchReturnOperations` | Cumulative scratch arrays actually returned to the pool. |
 
 Counters are accounted by the **requested** byte count (a pooled array may be larger than requested,
 but the logical usable size is what is tracked), so allocate and release are symmetric and balance to

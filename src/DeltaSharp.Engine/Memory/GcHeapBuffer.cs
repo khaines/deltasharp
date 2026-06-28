@@ -26,8 +26,11 @@ public sealed class GcHeapBuffer : OwnedBuffer
     /// <inheritdoc/>
     protected override void Release()
     {
-        ArrayPool<byte>.Shared.Return(_array);
+        // clearArray: true so a pooled scratch array never carries one caller's bytes into the next renter
+        // (defense-in-depth for row/PII data). Scratch is small (<= the allocator's threshold), so zeroing is cheap.
+        ArrayPool<byte>.Shared.Return(_array, clearArray: true);
         _array = [];
+        Owner.OnScratchReturned();
     }
 
     /// <inheritdoc/>

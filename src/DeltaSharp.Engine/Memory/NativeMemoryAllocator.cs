@@ -35,6 +35,8 @@ public sealed class NativeMemoryAllocator
     private long _liveScratchBytes;
     private long _liveScratchCount;
     private long _finalizedWithoutDispose;
+    private long _nativeFreeOperations;
+    private long _scratchReturnOperations;
 
     /// <summary>Creates an allocator using the <see cref="DefaultScratchThresholdBytes"/> scratch threshold.</summary>
     public NativeMemoryAllocator()
@@ -72,6 +74,21 @@ public sealed class NativeMemoryAllocator
     /// flags a leak to fix.
     /// </summary>
     public long FinalizedWithoutDispose => Interlocked.Read(ref _finalizedWithoutDispose);
+
+    /// <summary>
+    /// Cumulative number of native buffers whose backing memory was <em>actually</em> freed at the
+    /// <see cref="System.Runtime.InteropServices.NativeMemory.AlignedFree(void*)"/> boundary. Incremented inside the
+    /// native buffer's release, so it observes the real free rather than the live-counter bookkeeping: a release path
+    /// that stopped freeing (or freed twice) would diverge from the native allocation count, which the live gauges
+    /// alone cannot detect.
+    /// </summary>
+    public long NativeFreeOperations => Interlocked.Read(ref _nativeFreeOperations);
+
+    /// <summary>
+    /// Cumulative number of scratch buffers whose pooled array was <em>actually</em> returned to
+    /// <see cref="System.Buffers.ArrayPool{T}.Shared"/>. Incremented inside the scratch buffer's release.
+    /// </summary>
+    public long ScratchReturnOperations => Interlocked.Read(ref _scratchReturnOperations);
 
     /// <summary>
     /// Allocates an <see cref="OwnedBuffer"/> of <paramref name="byteCount"/> usable bytes. Requests at or below
@@ -119,4 +136,10 @@ public sealed class NativeMemoryAllocator
 
     /// <summary>Records that a native buffer was reclaimed by its finalizer because a deterministic dispose was missed.</summary>
     internal void OnFinalizedWithoutDispose() => Interlocked.Increment(ref _finalizedWithoutDispose);
+
+    /// <summary>Records that a native buffer's backing memory was actually freed at the native boundary.</summary>
+    internal void OnNativeFreed() => Interlocked.Increment(ref _nativeFreeOperations);
+
+    /// <summary>Records that a scratch buffer's pooled array was actually returned to the pool.</summary>
+    internal void OnScratchReturned() => Interlocked.Increment(ref _scratchReturnOperations);
 }

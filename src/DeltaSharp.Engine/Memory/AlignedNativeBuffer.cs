@@ -53,7 +53,11 @@ public sealed class AlignedNativeBuffer : OwnedBuffer
     }
 
     /// <inheritdoc/>
-    protected override unsafe void Release() => NativeMemory.AlignedFree((void*)_pointer);
+    protected override unsafe void Release()
+    {
+        NativeMemory.AlignedFree((void*)_pointer);
+        Owner.OnNativeFreed();
+    }
 
     /// <inheritdoc/>
     protected override unsafe Span<byte> AsSpanCore() => new((void*)_pointer, Length);
