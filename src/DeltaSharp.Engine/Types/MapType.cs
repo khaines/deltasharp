@@ -5,6 +5,11 @@ namespace DeltaSharp.Engine.Types;
 /// <see cref="ValueType"/> values. Keys are always non-null (Spark's <c>MapType</c> has no
 /// key-null flag); only values carry <see cref="ValueContainsNull"/>.
 /// </summary>
+/// <remarks>
+/// The key-type check (AC2) is intentionally stricter than Spark and <b>non-recursive</b>: a
+/// directly <see cref="NullType"/> or <see cref="MapType"/> key is rejected, but a key that
+/// merely contains one (e.g. <c>array&lt;void&gt;</c>) is permitted in v1.
+/// </remarks>
 public sealed class MapType : DataType
 {
     /// <summary>Creates a map type, validating the key type (STORY-02.5.1 AC2).</summary>

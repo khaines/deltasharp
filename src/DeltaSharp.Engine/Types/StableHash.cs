@@ -28,12 +28,19 @@ internal static class StableHash
         }
     }
 
-    /// <summary>Order-sensitive combination of two stable hash codes.</summary>
+    /// <summary>
+    /// Order-sensitive combination of a running hash <paramref name="left"/> with another
+    /// value <paramref name="right"/>. The accumulator is advanced by the FNV prime <b>before</b>
+    /// mixing in <paramref name="right"/>, so the result is non-commutative and well-distributed
+    /// (a plain xor-then-multiply is commutative, collapsing e.g. <c>Combine(8,4)</c> and
+    /// <c>Combine(12,0)</c> — since <c>8^4 == 12^0</c> — to the same value).
+    /// </summary>
     public static int Combine(int left, int right)
     {
         unchecked
         {
             uint hash = (uint)left;
+            hash *= FnvPrime;
             hash ^= (uint)right;
             hash *= FnvPrime;
             return (int)hash;

@@ -88,6 +88,12 @@ names the offending element precisely:
 valid *type* — matching Spark's `StructType`, where case-insensitive ambiguity is resolved (and
 errored) at name-resolution time, not at type construction.
 
+**Map keys.** The key-type check is **intentionally stricter than Spark** (whose `MapType`
+permits any key type at the type level, treating key suitability as a value/operation-time
+concern) because AC2 mandates an explicit "unsupported map key" error. It is **non-recursive**:
+a directly `void`/`map` key is rejected, but a key that merely *contains* a `void` (e.g.
+`map<array<void>, …>`) is permitted in v1.
+
 ## JSON serialization (AC3)
 
 `DataType.ToJson()` / `DataType.FromJson(string)` round-trip the type tree, nullability, and
@@ -105,9 +111,18 @@ stores in its transaction log. Atomic and decimal types serialize as a JSON stri
 Serialization is **deterministic** (metadata keys are emitted in sorted order) and uses the
 reflection-free `Utf8JsonWriter`/`JsonDocument` APIs so the engine stays trim/AOT-clean.
 Deserialization re-runs all validation (a malformed or invalid document throws
-`SchemaValidationException`). v1 metadata supports **string values** (Spark's most common field
+`SchemaValidationException`). For Spark parity on the read side, `FromJson` accepts **both**
+`"void"` and the legacy `"null"` spelling for `NullType` (Spark serializes `"void"` but its
+parser also accepts `"null"`).
+
+**Metadata scope (v1).** `FieldMetadata` is **string-valued** (Spark's most common field
 metadata, e.g. column comments); a non-string metadata value yields an explicit unsupported
-error.
+error rather than silent data loss. **Delta-log schema interop is explicitly out of v1 scope:**
+real Delta schemas carry *numeric/bool* metadata (`delta.columnMapping.id`, identity-column
+`start`/`step`), which v1 cannot read. Because `DeltaSharp.Engine` is unshipped, the
+`FieldMetadata` value shape can be widened to a typed model later without an external breaking
+change; this reshape is tracked in **#330** and lands before the storage lane consumes Delta
+logs (EPIC-05).
 
 ## Physical-layout seam (AC4)
 
@@ -120,7 +135,7 @@ is the seam the columnar and binary-row builders consume. A `PhysicalLayout` is 
 | `FixedWidth` (decimal) | `decimal(p,s)` | 8 bytes when `p ≤ 18` (`IsCompact`), else 16. |
 | `Variable` | string, binary | Offsets buffer + shared byte buffer. |
 | `Nested` | array, map, struct | Consumer recurses on the child types. |
-| *(none)* | `void` (`NullType`) | `TryGet…` returns `false`; `GetPhysicalLayout()` throws `UnsupportedTypeException`. |
+| *(none)* | `void` (`NullType`) | `TryGet…` returns `false` (the `out` value has `Kind == None`); `GetPhysicalLayout()` throws `UnsupportedTypeException`. |
 
 This is intentionally a **descriptor**, not a buffer: it tells a builder how to size and shape
 storage. Bit-packing of booleans/validity and the exact offset width are implementation choices
@@ -132,8 +147,8 @@ of the vector layer (ADR-0002), not of the logical type.
   query.
 - **Deferred (tracked elsewhere):** type **coercion**, decimal/timestamp arithmetic, and ANSI
   overflow rules (STORY-02.5.2, #142); a session-local **`TimestampNtz`** variant (EPIC-02 open
-  question); richer **typed metadata** (v1 is string-valued). `TimestampType` is a
-  UTC-normalized instant (microseconds since epoch).
+  question); richer **typed metadata** for Delta-log interop (v1 is string-valued; tracked in
+  **#330**). `TimestampType` is a UTC-normalized instant (microseconds since epoch).
 
 ## References
 

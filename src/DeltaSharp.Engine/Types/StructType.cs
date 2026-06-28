@@ -1,3 +1,4 @@
+using System.Collections.ObjectModel;
 using System.Text;
 
 namespace DeltaSharp.Engine.Types;
@@ -76,6 +77,7 @@ public sealed class StructField : IEquatable<StructField>
 public sealed class StructType : DataType, IReadOnlyList<StructField>
 {
     private readonly StructField[] _fields;
+    private readonly ReadOnlyCollection<StructField> _fieldsView;
     private readonly Dictionary<string, int> _indexByName;
 
     /// <summary>Creates a struct type, validating for duplicate field names (STORY-02.5.1 AC2).</summary>
@@ -99,13 +101,16 @@ public sealed class StructType : DataType, IReadOnlyList<StructField>
                     + $"{_indexByName[field.Name]} and {i}).");
             }
         }
+
+        _fieldsView = Array.AsReadOnly(_fields);
     }
 
     /// <summary>The empty struct (a schema with no fields).</summary>
     public static StructType Empty { get; } = new(Array.Empty<StructField>());
 
-    /// <summary>The fields, in declared order.</summary>
-    public IReadOnlyList<StructField> Fields => _fields;
+    /// <summary>The fields, in declared order. The returned view is read-only and cannot be
+    /// cast back to a mutable array, preserving the type's immutability.</summary>
+    public IReadOnlyList<StructField> Fields => _fieldsView;
 
     /// <inheritdoc/>
     public int Count => _fields.Length;

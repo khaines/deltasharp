@@ -88,9 +88,16 @@ internal static class SchemaJson
                 break;
 
             default:
-                // Atomic and decimal types serialize as their type-name string.
-                writer.WriteStringValue(type.TypeName);
-                break;
+                // Atomic and decimal types serialize as their type-name string. The default
+                // arm fails fast so a future DataType added without a matching case cannot be
+                // silently mis-serialized.
+                if (type is AtomicType or DecimalType)
+                {
+                    writer.WriteStringValue(type.TypeName);
+                    break;
+                }
+
+                throw new SchemaValidationException($"Cannot serialize unsupported type '{type.SimpleString}'.");
         }
     }
 
@@ -156,7 +163,7 @@ internal static class SchemaJson
             "binary" => BinaryType.Instance,
             "date" => DateType.Instance,
             "timestamp" => TimestampType.Instance,
-            "void" => NullType.Instance,
+            "void" or "null" => NullType.Instance,
             _ => throw new SchemaValidationException($"Unknown type name '{name}'."),
         };
     }
@@ -165,8 +172,10 @@ internal static class SchemaJson
     {
         int open = name.IndexOf('(', StringComparison.Ordinal);
         int close = name.IndexOf(')', StringComparison.Ordinal);
-        if (open < 0 || close <= open)
+        if (open < 0 || close <= open || close != name.Length - 1)
         {
+            // The closing paren must be the final character — reject trailing garbage such as
+            // "decimal(10,2) junk".
             throw new SchemaValidationException($"Malformed decimal type '{name}'.");
         }
 
@@ -209,6 +218,12 @@ internal static class SchemaJson
         var fields = new List<StructField>();
         foreach (JsonElement fieldElement in fieldsElement.EnumerateArray())
         {
+            if (fieldElement.ValueKind != JsonValueKind.Object)
+            {
+                throw new SchemaValidationException(
+                    $"Each struct field must be a JSON object, but found '{fieldElement.ValueKind}'.");
+            }
+
             string name = GetRequiredString(fieldElement, "name");
             DataType type = ReadType(GetRequired(fieldElement, "type"));
             bool nullable = GetRequiredBoolean(fieldElement, "nullable");

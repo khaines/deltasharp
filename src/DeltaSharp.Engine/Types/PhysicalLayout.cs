@@ -6,6 +6,14 @@ namespace DeltaSharp.Engine.Types;
 /// </summary>
 public enum PhysicalLayoutKind
 {
+    /// <summary>
+    /// No physical representation — the value of a <see cref="PhysicalLayout"/> that was never
+    /// resolved (the <c>out</c> value when <see cref="DataType.TryGetPhysicalLayout"/> returns
+    /// <see langword="false"/>, e.g. for <see cref="NullType"/>). It is the default so that an
+    /// unresolved layout is never mistaken for a real fixed-width one.
+    /// </summary>
+    None = 0,
+
     /// <summary>A fixed number of bytes per value — see <see cref="PhysicalLayout.FixedWidthBytes"/>.</summary>
     FixedWidth,
 
@@ -70,7 +78,7 @@ public readonly struct PhysicalLayout : IEquatable<PhysicalLayout>
     public override bool Equals(object? obj) => obj is PhysicalLayout other && Equals(other);
 
     /// <inheritdoc/>
-    public override int GetHashCode() => HashCode.Combine(Kind, FixedWidthBytes);
+    public override int GetHashCode() => StableHash.Combine((int)Kind, FixedWidthBytes);
 
     /// <inheritdoc/>
     public override string ToString() =>

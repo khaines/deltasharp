@@ -6,7 +6,9 @@ namespace DeltaSharp.Engine.Types;
 /// <summary>
 /// Immutable, order-independent metadata attached to a <see cref="StructField"/> (for example
 /// a column comment). v1 supports string-valued entries — Spark's most common field metadata
-/// and what Delta stores for column comments; richer typed metadata is a future extension.
+/// and what Delta stores for column comments. Richer typed metadata (numeric/bool values, for
+/// Delta-log schema interop) is a tracked future extension (issue #330); since the engine
+/// assembly is unshipped, widening the value shape later is not an external breaking change.
 /// </summary>
 /// <remarks>
 /// Entries are held in a key-sorted map so equality is order-independent and serialization is
