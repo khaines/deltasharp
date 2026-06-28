@@ -50,3 +50,6 @@ Thumbs.db
 *.p12
 secrets.json
 **/appsettings.*.Local.json
+
+# RFL review-fix-loop scratch (e.g. .rfl-report-<pr>.md) — never commit per-run artifacts
+.rfl-*

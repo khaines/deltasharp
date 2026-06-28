@@ -3,13 +3,14 @@ name: review-pr
 description: >-
   Orchestrates world-class pull request reviews using specialist agent personas and engineering checklists.
   Use this when asked to review a PR, review code changes, or assess PR quality.
-  Supports single-model review for simple changes and multi-model council (Opus 4.7, Sonnet 4.6,
-  GPT 5.5, Opus 4.7/Security) for complex changes. Posts findings as GitHub PR comments for remote PRs.
+  A cheap scout triages and routes; a multi-frontier council (Claude Opus 4.8 + GPT-5.5) reviews
+  complex changes with up to 3 scout-selected domain specialists; a decorrelated red-team executes
+  repros (C7) and gates. Posts findings as GitHub PR comments for remote PRs.
 ---
 
 # PR Review Skill — Orchestration Instructions
 
-Execute the following 8-phase pipeline to produce a thorough, actionable pull request review. Read all supporting files from this skill directory before beginning.
+Execute the following phased pipeline (Phase 1 → 1.6 scout → 2–7 council → 8 red-team gate → 9 feedback) to produce a thorough, actionable pull request review. Read all supporting files from this skill directory before beginning.
 
 ---
 
@@ -21,7 +22,7 @@ Detect whether a GitHub PR is available:
 
 - **PR number provided explicitly**: Use GitHub tools or `gh pr view` to fetch the PR title, description, diff, files changed, and linked issues or work items.
 - **Current branch has an open PR**: Run `git branch --show-current` to get the branch name, then find an open PR for that branch. If found, fetch its details as above.
-- **No PR exists (local-only changes)**: Use `git diff main...HEAD` (or the appropriate base branch) to collect the changes. Note that **Phase 8 (GitHub Feedback) will be skipped** for local-only reviews.
+- **No PR exists (local-only changes)**: Use `git diff main...HEAD` (or the appropriate base branch) to collect the changes. Note that **Phase 9 (GitHub Feedback) will be skipped** for local-only reviews.
 
 ### 1.2 Collect File List and Diff
 
@@ -69,6 +70,24 @@ Record the result for use in Phase 3 and Phase 5:
 - **Review mode**: Single Model | Multi-Model Council
 - **Design document(s)**: {list of governing design docs, or "None applicable — {reason}"}
 ```
+
+---
+
+## Phase 1.6: Scout Triage — the Review Package
+
+Before selecting agents, dispatch the **scout** (`.github/skills/review-pr/scout.md`) to produce
+the **Review Package** — the routing record for the whole review. The scout runs on a cheap
+frontier model (`gemini-3.5-flash` / `gpt-5-mini` / `claude-haiku-4.5`; `agent_type: explore` or
+`general-purpose`) so the voting seats spend their budget reviewing, not triaging.
+
+It returns: complexity (Simple/Complex), changed files by domain, the recommended `agent_type`
+per fixed lens, a roster of **≤3 domain specialist seats** (with verified `CANONICAL_SPEC` paths
+from `docs/persona/agents/`), per-seat checklist IDs, the claims to verify (C4/C7), and a red-team
+decorrelation hint. Verify each specialist's `CANONICAL_SPEC` exists; drop any that don't.
+
+For a trivial (1–2 file, docs-only) change the orchestrator may inline the scout's logic instead
+of dispatching it — but must say so in the triage summary. Phases 2–4 and 8 consume the Review
+Package.
 
 ---
 
@@ -129,12 +148,33 @@ Dispatch **4 parallel reviews** using the `task` tool. Each slot has a fixed **r
 
 | Slot | Role | Model | `agent_type` allowlist |
 |---|---|---|---|
-| **Architect** | Deep reasoning — architecture implications, subtle bugs, design flaws | `claude-opus-4.7` | `general-purpose`, `cloud-native-distributed-systems-architect`, `query-execution-engine-engineer`, `delta-storage-format-engineer`, `data-platform-connectors-engineer` |
-| **Balanced** | Code quality, patterns, maintainability, operational pragmatism | `claude-sonnet-4.6` | `general-purpose`, `dotnet-framework-runtime-engineer`, `cloud-native-site-reliability-engineer`, `developer-experience-api-engineer` |
-| **Quality** | Testability, measurability, reliability, alternative pattern recognition | `gpt-5.5` | `general-purpose`, `reliability-test-chaos-engineer`, `performance-benchmarking-engineer`, `technical-writer` |
-| **Security** | Tenant isolation, auth bypass, injection, supply-chain, cryptographic correctness, privacy/compliance | `claude-opus-4.7` | `cloud-native-security-sme`, `privacy-compliance-grc-lead` |
+| **Architect** | Deep reasoning — architecture implications, subtle bugs, design flaws | `claude-opus-4.8` (effort high/max) | `general-purpose`, `cloud-native-distributed-systems-architect`, `query-execution-engine-engineer`, `delta-storage-format-engineer`, `data-platform-connectors-engineer` |
+| **Balanced** | Code quality, patterns, maintainability, operational pragmatism | `claude-opus-4.8` (effort high/max) | `general-purpose`, `dotnet-framework-runtime-engineer`, `cloud-native-site-reliability-engineer`, `developer-experience-api-engineer` |
+| **Quality** | Testability, measurability, reliability, alternative pattern recognition | `gpt-5.5` (effort high) | `general-purpose`, `reliability-test-chaos-engineer`, `performance-benchmarking-engineer`, `technical-writer` |
+| **Security** | Tenant isolation, auth bypass, injection, supply-chain, cryptographic correctness, privacy/compliance | `claude-opus-4.8` (effort high/max) | `cloud-native-security-sme`, `privacy-compliance-grc-lead`, `general-purpose` |
+
+> **Models track the newest top-tier of each family** — currently Claude **Opus 4.8** (in place
+> of older Opus 4.7 / Sonnet 4.6) for the deep / balanced / security lenses, and **GPT-5.5** for
+> Quality. Update these as families advance. The red-team (Phase 8) runs on a family **distinct
+> from the majority spine and ideally used by no voting seat** (here: Gemini) — see Phase 8.
 
 **Models are fixed per slot.** Diverse pattern recognition across the council comes from the model mix; domain specialization comes from the per-slot `agent_type` choice.
+
+**Specialist seats (scout-selected, ≤3).** In addition to the 4 fixed lenses, dispatch each
+domain specialist from the scout's Review Package as an **additional voting seat** on a frontier
+model (`agent_type` = the specialist persona; model = a top-tier family, e.g. `claude-opus-4.8`),
+scoped to its owned files + checklist IDs. The 4 lenses are the spine; specialists add depth for
+the domains the diff actually touches (Delta storage, query execution, operator, connectors, …).
+
+**Execution is mandatory for execution-eligible claims (C7).** Any seat verifying an enforcement /
+parity / compat / migration / test-efficacy claim must either **run** a repro (see
+[`rigor-battery.md`](rigor-battery.md)) and quote command + output, or **explicitly defer the claim
+to the red-team** (the canonical C7 executor) — "verified by reading" does not clear a C7-eligible
+claim. A seat expected to execute MUST be dispatched **shell-capable** (`agent_type:
+general-purpose`, or another tool-capable type); a file-view-only persona seat may only review by
+reading and must defer every C7 claim. A seat that silently withholds judgment because it "couldn't
+run it" (instead of deferring, or being re-dispatched shell-capable) is a dispatch error, not a
+finding.
 
 **Selection rule for `agent_type`:**
 
@@ -363,23 +403,63 @@ For local-only reviews, omit the `**PR**:` line and `### PR Metadata` section. R
 
 ---
 
-## Phase 8: GitHub PR Feedback
+## Phase 8: Adversarial Red-Team Gate
+
+### Skip Condition (Simple changes)
+
+For a **Simple** review (scout says Simple) with **no execution-eligible claim** in the diff, run a
+single lightweight/inlined red-team pass — or skip it and record `red-team: n/a — Simple, no
+execution-eligible claim`. The **full decorrelated, shell-capable red-team is required for all
+Complex changes** and for any change touching a protected domain.
+
+After the rating, dispatch the **red-team** (`.github/skills/review-pr/red-team.md`) — the council's
+gate-keeper. It runs **last**, **shell-capable** (`agent_type: general-purpose`), on a frontier
+family **distinct from the majority voting spine and ideally used by no voting seat** (if the spine
+is Opus + GPT, use `gemini-3.1-pro-preview`; do not reuse a voting seat's family such as `gpt-5.5`).
+
+Give it the diff, the Review Package, and **every voting seat's full verdict + findings**. It
+assumes the PR is broken, tries to falsify the seats' approvals, hunts the council's historical
+miss-classes, and **executes C7 repros** (it does not reason about them). It returns findings in the
+canonical `Critical|High|Medium|Low|Info` set and a verdict:
+
+- `MISS-FOUND` — with new findings (each `file:line` + EVIDENCE). These are **actionable and
+  blocking**; in a fix-loop they go back to the fix phase.
+- `NO-MISS-CERTIFIED` — only valid with a **fully-populated Falsification-Attempts block** and a C7
+  line quoting real commands + output for every execution-eligible claim. A bare "no issues" is
+  rejected and **re-prompted once**; if still non-conformant, certification is **denied** (treat as
+  `MISS-FOUND` / escalate).
+
+**Independently verify before trusting the certification (anti-forgery).** The red-team's verdict,
+attestation, and quoted C7 output are self-asserted signals — before accepting `NO-MISS-CERTIFIED`
+the orchestrator MUST re-run at least one sampled C7 repro from its evidence block and confirm the
+output matches.
+
+Record which model gated. If the red-team shares the voting spine's family (no decorrelated frontier
+available), its certification is **provisional** and does **not** satisfy the gate for protected-
+domain changes — flag it and require a decorrelated re-run or a documented human waiver. The gate
+(`rating-rubric.md`) requires `NO-MISS-CERTIFIED`.
+
+---
+
+## Phase 9: GitHub PR Feedback
 
 ### Skip Condition
 
 Skip this phase entirely if reviewing local-only changes with no GitHub PR. Output the report from Phase 7 directly to the user and stop.
 
-### 8.1 Determine Review Action
+### 9.1 Determine Review Action
 
-Submit the review action that the rating maps to in the rating rubric's Overall Rating Scale:
+Submit the review action determined by **both** the rating and the Phase 8 red-team verdict:
 
-- **Rating 4–5** → submit as **APPROVE**.
-- **Rating 3** → submit as **COMMENT**.
-- **Rating 1–2** → submit as **REQUEST_CHANGES**.
+- A red-team **`MISS-FOUND`** (or a denied / withheld certification) → submit as **REQUEST_CHANGES**,
+  regardless of the rating. Never post `APPROVE` over an open red-team miss.
+- Otherwise (red-team `NO-MISS-CERTIFIED`, independently re-verified per Phase 8): **Rating 4–5** →
+  **APPROVE**; **Rating 3** → **COMMENT**; **Rating 1–2** → **REQUEST_CHANGES**.
 
-`APPROVE` is a review action, not a merge gate; the rating remains the quality signal.
+`APPROVE` is a review action, not a merge gate; the rating and red-team verdict together are the
+quality signal, and AI never merges.
 
-### 8.2 Post the Review
+### 9.2 Post the Review
 
 Use GitHub tools to submit the review:
 
@@ -389,7 +469,7 @@ Use GitHub tools to submit the review:
 4. Info findings remain in the review body only.
 5. If a finding references a file but not a specific line, post it as a file-level review comment when supported.
 
-### 8.3 Avoid Duplicates
+### 9.3 Avoid Duplicates
 
 Before posting, check for existing review comments from previous runs of this skill. Do not post duplicate comments on the same finding at the same file and line.
 
@@ -397,7 +477,10 @@ Before posting, check for existing review comments from previous runs of this sk
 
 ## Important Notes
 
-- **Always read supporting files first.** Load `agent-map.md`, `checklist-map.md`, and `rating-rubric.md` before starting the pipeline.
+- **Always read supporting files first.** Load `scout.md`, `agent-map.md`, `checklist-map.md`, `rating-rubric.md`, `rigor-battery.md`, and `red-team.md` before starting the pipeline.
+- **Scout first, red-team last.** Every Complex review is bracketed by a cheap scout (routing) and a decorrelated red-team (adversarial gate). The scout selects ≤3 specialist seats; the red-team must execute C7 repros and certify (`NO-MISS-CERTIFIED`) before the gate can PASS.
+- **Execution over reading (C7).** Seats and the red-team must RUN execution-eligible claims; dispatch any executing seat shell-capable (`general-purpose`), never a file-view-only persona.
+- **Decorrelate the red-team.** Run it on a frontier family distinct from the majority voting spine; same-family certification is provisional for protected-domain changes.
 - **Parallel execution in council mode.** The 4 model reviews must run in parallel, not sequentially.
 - **Handle model failures gracefully.** If a model fails or times out, proceed with remaining models and note which were unavailable.
 - **DeltaSharp canon is mandatory.** Reviews must enforce Spark parity, lazy/eager semantics, Catalyst-style planning, Delta/Parquet correctness, Kubernetes driver/executor/operator safety, object-store/PVC storage support, and .NET runtime correctness.
