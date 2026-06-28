@@ -45,4 +45,55 @@
     <RepositoryType>git</RepositoryType>
   </PropertyGroup>
 
+  <!-- ============================== lane:01.5 ==============================
+    API governance (FEAT-01.5 / #127 STORY-01.5.1 PublicApiAnalyzers,
+    #128 STORY-01.5.2 BannedApiAnalyzers). Wires both analyzers centrally and scopes
+    them so only the intended projects are governed. Enforcement rides on the
+    repository-wide TreatWarningsAsErrors=true above: PublicApi (RS0016/RS0017) and
+    Banned (RS0030) diagnostics are warnings by default and therefore become build
+    errors. See docs/engineering/design/api-governance.md, ADR-0001, ADR-0014.
+  -->
+  <PropertyGroup>
+    <!-- A "production assembly" lives under src/ (today: DeltaSharp.Core, DeltaSharp.Engine).
+         Gated on the project path, which is known when this file is imported. Both paths are
+         normalized to a trailing directory separator and the comparison is anchored at the
+         repo root ($(MSBuildThisFileDirectory)src/), so neither a parent directory named
+         "src" nor a sibling whose name merely starts with "src" (e.g. "src-tools") is
+         misclassified. Test projects (tests/) are intentionally excluded — they legitimately
+         use reflection, clocks, and randomness. -->
+    <_DeltaSharpSrcDir>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)src'))</_DeltaSharpSrcDir>
+    <_DeltaSharpProjectDir>$([MSBuild]::NormalizeDirectory('$(MSBuildProjectDirectory)'))</_DeltaSharpProjectDir>
+    <DeltaSharpIsProductionAssembly>false</DeltaSharpIsProductionAssembly>
+    <DeltaSharpIsProductionAssembly Condition="$(_DeltaSharpProjectDir.StartsWith('$(_DeltaSharpSrcDir)'))">true</DeltaSharpIsProductionAssembly>
+
+    <!-- Public-API baselines apply to packable public libraries (today: DeltaSharp.Core).
+         IsPackable is set in the .csproj body, which MSBuild evaluates AFTER this import,
+         so it is not readable here; gating the packable library by name is the
+         deterministic choice. Add new packable public libraries to this condition. -->
+    <DeltaSharpTracksPublicApi>false</DeltaSharpTracksPublicApi>
+    <DeltaSharpTracksPublicApi Condition="'$(MSBuildProjectName)' == 'DeltaSharp.Core'">true</DeltaSharpTracksPublicApi>
+  </PropertyGroup>
+
+  <!-- BannedApiAnalyzers on production assemblies (Core + Engine). The categorized ban
+       list lives at the repo root and is shared by every production assembly. -->
+  <ItemGroup Condition="'$(DeltaSharpIsProductionAssembly)' == 'true'">
+    <PackageReference Include="Microsoft.CodeAnalysis.BannedApiAnalyzers">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <AdditionalFiles Include="$(MSBuildThisFileDirectory)BannedSymbols.txt" />
+  </ItemGroup>
+
+  <!-- PublicApiAnalyzers on packable public libraries only. The Shipped/Unshipped baseline
+       lives next to the project so each assembly owns its own public surface. -->
+  <ItemGroup Condition="'$(DeltaSharpTracksPublicApi)' == 'true'">
+    <PackageReference Include="Microsoft.CodeAnalysis.PublicApiAnalyzers">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <AdditionalFiles Include="$(MSBuildProjectDirectory)/PublicAPI.Shipped.txt" />
+    <AdditionalFiles Include="$(MSBuildProjectDirectory)/PublicAPI.Unshipped.txt" />
+  </ItemGroup>
+  <!-- ============================ end lane:01.5 ============================ -->
+
 </Project>

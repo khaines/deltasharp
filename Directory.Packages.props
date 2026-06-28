@@ -18,4 +18,15 @@
     <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5" />
   </ItemGroup>
 
+  <!-- lane:01.5 (FEAT-01.5 / #127 STORY-01.5.1, #128 STORY-01.5.2) — API-governance
+       analyzers. PublicApiAnalyzers tracks the public surface baseline of packable
+       libraries; BannedApiAnalyzers enforces the AOT/trim/determinism/security policy on
+       production assemblies. Both are dev-time analyzers (referenced with PrivateAssets=all
+       in Directory.Build.props) — never runtime/package dependencies. The SDK ships
+       Roslyn 5.0, so the 4.14.0 analyzers load without CS9057 under warnings-as-errors. -->
+  <ItemGroup>
+    <PackageVersion Include="Microsoft.CodeAnalysis.PublicApiAnalyzers" Version="4.14.0" />
+    <PackageVersion Include="Microsoft.CodeAnalysis.BannedApiAnalyzers" Version="4.14.0" />
+  </ItemGroup>
+
 </Project>
