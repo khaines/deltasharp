@@ -1,0 +1,52 @@
+# .NET / Visual Studio build artifacts
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+artifacts/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+
+# Test results and coverage
+[Tt]est[Rr]esults/
+*.trx
+*.coverage
+*.coverage.json
+coverage/
+*.opencover.xml
+*.cobertura.xml
+
+# NuGet
+*.nupkg
+*.snupkg
+.nuget/
+**/packages/*
+!**/packages/build/
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userprefs
+*~
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Local environment
+*.local
+
+# Secrets / credentials — never commit (prevention only; pair with a CI secret scanner)
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+secrets.json
+**/appsettings.*.Local.json

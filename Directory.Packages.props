@@ -1,0 +1,21 @@
+<Project>
+
+  <!--
+    Central Package Management (EPIC-01 / FEAT-01.2). All NuGet versions are declared
+    here so dependency changes are visible to review and SCA tooling. Projects
+    reference packages with <PackageReference Include="..."/> and no Version attribute.
+  -->
+
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Test toolchain. -->
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.7.0" />
+    <PackageVersion Include="xunit" Version="2.9.3" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5" />
+  </ItemGroup>
+
+</Project>
