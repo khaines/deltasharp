@@ -86,11 +86,11 @@ do not reason about them.
      possible, **no ambient credentials / no network** — `d=$(mktemp -d); trap 'rm -rf "$d"' EXIT` —
      e.g. a tiny program/test that exercises the change, run with a scrubbed environment.
    - **Non-executing only, on the repo as-is.** Reserve "run on the repo as-is" for genuinely
-     non-executing operations — link/numbering greps, plain file reads. Treat any Roslyn/compiler
-     command (`dotnet build`/`restore`/`format`) as executing PR code whenever the PR touches build
-     inputs (`*.csproj`, `Directory.*.props`, `global.json`, `*.props`/`*.targets`, analyzer/
-     source-generator refs) — referenced analyzers/source generators run in the host process — and
-     run those on the isolated default path above.
+     non-executing operations — link/numbering greps, plain file reads. Treat **every** Roslyn/
+     compiler command (`dotnet build`/`restore`/`format`) as executing PR code — `restore` honors
+     PR-specified package sources (`nuget.config`) / tool manifests and `build`/`format` run
+     PR-referenced analyzers/source generators in the host process — so **always** run those on the
+     isolated default path above.
    - examples: execute the script/gate the PR claims works and capture the exit code; in a throwaway
      copy delete or invert the production symbol a "coverage" test claims to cover and confirm the test
      then **fails**; feed every form a validator accepts through the real consumer; load the old
