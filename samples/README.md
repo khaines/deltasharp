@@ -1,9 +1,11 @@
 # DeltaSharp samples
 
 Runnable example applications that show how to consume DeltaSharp. Samples are
-**examples, not products**: they are never published as NuGet packages and they are
-isolated from the production package-validation gate, so a broken sample never blocks a
-release of the real libraries.
+**examples, not products**: they are never published as NuGet packages, and because they
+are non-packable they are excluded from production **package validation** — a broken
+sample can never block packaging or a release of the real libraries. (A broken sample
+*will* still fail the required `build-test-format` gate, which compiles the whole
+solution; see [How CI builds samples](#how-ci-builds-samples).)
 
 > **Status:** scaffold created with
 > [STORY-01.1.3](https://github.com/khaines/deltasharp/blob/main/docs/planning/epics/EPIC-01-project-build-platform.md#story-0113-samples-directory-scaffold).
@@ -69,13 +71,19 @@ dotnet run --project samples/DeltaSharp.Samples.GettingStarted
 
 ## How CI builds samples
 
-Samples are built by a dedicated, **informational** workflow,
-[`.github/workflows/samples.yml`](../.github/workflows/samples.yml) — not by the required
-`build-test-format` gate's packaging path and not by the `pack-validate` job. A sample
-failure is therefore **reported** by the samples workflow without blocking the
-production package-validation diagnostics for `DeltaSharp.Core` (#119 AC4). The samples
-workflow is not a branch-protection required check, so it can never deadlock the merge
-button.
+Two things build the sample, with different consequences:
 
-Samples are still listed in `DeltaSharp.sln` for IDE discovery and local builds; because
-they are non-packable they contribute no package to `pack-validate`.
+- The required **`build-test-format`** gate runs `dotnet build DeltaSharp.sln`, which
+  compiles the sample because it is listed in the solution. A sample that fails to compile
+  is therefore caught and **reported** by the required gate — you should not merge a broken
+  example.
+- The informational **[`samples.yml`](../.github/workflows/samples.yml)** workflow builds
+  each sample project directly and smoke-runs the getting-started sample, giving samples a
+  dedicated signal. It is not a branch-protection required check, so it cannot deadlock the
+  merge button on its own.
+
+What **is** isolated is production **package validation** (#119 AC4): because the sample is
+non-packable, `dotnet pack DeltaSharp.sln` skips it entirely, so it produces no package and
+can never block the package-validation diagnostics for `DeltaSharp.Core`. The `pack-validate`
+job stays Core-only, and [`pack.yml`](../.github/workflows/pack.yml) additionally fails if any
+`*Samples*` project ever produces a package.

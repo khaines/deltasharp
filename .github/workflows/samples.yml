@@ -3,11 +3,16 @@ name: Samples
 # Builds and smoke-runs the example applications under samples/ (FEAT-01.1 / #119).
 #
 # This is intentionally a SEPARATE workflow from CI and is NOT a branch-protection
-# required check, so a broken sample is *reported* here without blocking the production
-# package-validation diagnostics in the Pack workflow or deadlocking the merge button
-# (#119 AC4). It builds the sample projects directly (which pull in their referenced
-# production projects via ProjectReference) rather than the whole solution, so the
-# samples signal stays isolated from the production build/pack path.
+# required check. It gives samples a dedicated build-and-run signal and builds the sample
+# projects directly (which pull in their referenced production projects via
+# ProjectReference) rather than the whole solution.
+#
+# Note on isolation (#119 AC4): the sample is part of DeltaSharp.sln, so the required
+# build-test-format gate ALSO compiles it — a broken sample is caught and reported there
+# like any project. What stays isolated is production PACKAGE VALIDATION: the sample is
+# non-packable, so `dotnet pack` skips it and it can never block the package-validation
+# diagnostics for DeltaSharp.Core (pack-validate stays Core-only). This workflow is never a
+# required check, so it cannot deadlock the merge button on its own.
 on:
   push:
     branches: [main]

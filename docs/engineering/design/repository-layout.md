@@ -77,15 +77,16 @@ CODEOWNERS already anticipates several of these seams (`/src/**/Sql/`,
 
 ## Samples
 
-Example applications live under `samples/` and are **never published**. They are built by
-a dedicated, informational [`samples.yml`](../../../.github/workflows/samples.yml) workflow
-rather than the required `build-test-format` packaging path, so a broken sample is reported
-without blocking the production package-validation diagnostics for `DeltaSharp.Core`
-(STORY-01.1.3). Samples are still listed in `DeltaSharp.sln` for IDE discovery; because
-they inherit `IsPackable=false` they contribute no package to `pack-validate`, and
-[`pack.yml`](../../../.github/workflows/pack.yml) fails if any `*Samples*` project ever
-produces one. In-repo samples reference production projects with a `ProjectReference` so
-they track the working tree. Full conventions — including how a sample makes **preview-API
+Example applications live under `samples/` and are **never published**. Because they are
+non-packable, `dotnet pack` skips them, so a broken sample can never block the production
+**package-validation** diagnostics for `DeltaSharp.Core` (`pack-validate` stays Core-only);
+[`pack.yml`](../../../.github/workflows/pack.yml) also fails if any `*Samples*` project ever
+produces a package. Samples *are* listed in `DeltaSharp.sln`, so the required
+`build-test-format` gate compiles them (a broken sample is caught and reported there), and a
+dedicated, informational [`samples.yml`](../../../.github/workflows/samples.yml) workflow
+builds and smoke-runs them as an extra signal (STORY-01.1.3). In-repo samples reference
+production projects with a `ProjectReference` so they track the working tree. Full
+conventions — including how a sample makes **preview-API
 status and expected compatibility** visible — are in
 [`samples/README.md`](../../../samples/README.md).
 

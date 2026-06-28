@@ -119,8 +119,9 @@ dotnet test --filter Category=Integration     # integration-only
 
 Long-running integration suites use the documented **900s** integration timeout budget
 rather than arbitrary sleeps. No `DeltaSharp.*.IntegrationTests` project exists yet (the
-skeleton has no cross-boundary behavior); this names the convention so the first one slots
-in without churn.
+skeleton has no cross-boundary behavior), so today `--filter Category=Integration` simply
+matches no tests (a clean no-op) and `Category!=Integration` runs the full unit suite; this
+names the convention so the first integration project slots in without churn.
 
 ## References
 
