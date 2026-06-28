@@ -32,6 +32,10 @@ public sealed class SelectedColumnVector : ColumnVector
         ReadOnlySpan<int> indices = selection.Indices;
         for (int i = 0; i < indices.Length; i++)
         {
+            // Load-bearing bounds gate: every selected physical index must be within the parent. This must
+            // not be removed even if NullCount becomes lazy — it is the view's last guard against an
+            // out-of-range physical read (security/refactor durability).
+            ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual((uint)indices[i], (uint)parent.Length, nameof(selection));
             if (parent.IsNull(indices[i]))
             {
                 nulls++;
