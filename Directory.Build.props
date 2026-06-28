@@ -96,4 +96,40 @@
   </ItemGroup>
   <!-- ============================ end lane:01.5 ============================ -->
 
+  <!-- ============================== lane:01.6 ==============================
+    NuGet packaging hygiene (FEAT-01.6 / #130 metadata + symbols, #131 SourceLink +
+    deterministic + package validation, #132 pack smoke test). These properties take effect
+    only when a project is packed (IsPackable=true; today just DeltaSharp.Core) and are inert
+    on non-packable projects, so they are safe to declare repository-wide. License/repo
+    metadata is inherited from the packaging defaults above (Apache-2.0 per ADR-0015).
+    SourceLink is provided IN-BOX by the .NET 8+ SDK, so NO Microsoft.SourceLink.* package
+    is referenced — this deliberately avoids the SDK-version-tied build-package coupling the
+    repo already hit with Microsoft.NET.ILLink.Tasks (see DeltaSharp.Core.csproj). See
+    docs/engineering/design/packaging.md.
+  -->
+  <PropertyGroup>
+    <!-- Symbols: emit a .snupkg alongside the .nupkg (#130). -->
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+
+    <!-- SourceLink + debuggability (#131): record the repository URL in the package and embed
+         otherwise-untracked sources so a debugger can step into package sources at the built
+         commit. Deterministic builds are already on above; CI sets ContinuousIntegrationBuild
+         (which makes SourceLink emit repository-relative source paths). -->
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+
+    <!-- Package validation (#131): validate the package is self-consistent across its target
+         frameworks — a net10.0-only public API the net8.0 target lacks fails validation. A
+         released-version baseline (PackageValidationBaselineVersion) is intentionally NOT set:
+         nothing is published yet, so there is no prior version to diff against. It is added at
+         the first release to also catch breaking changes versus the previous package. -->
+    <EnablePackageValidation>true</EnablePackageValidation>
+
+    <!-- Shared discovery metadata (#130). PackageId, Description, and PackageReadmeFile stay
+         per-package in each csproj. -->
+    <PackageTags>spark;apache-spark;delta;delta-lake;dataframe;dataset;sql;analytics;dotnet;data-engineering</PackageTags>
+  </PropertyGroup>
+  <!-- ============================ end lane:01.6 ============================ -->
+
 </Project>

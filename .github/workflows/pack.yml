@@ -1,0 +1,100 @@
+name: Pack
+
+# NuGet packaging smoke test (FEAT-01.6 / #132). Produces the .nupkg/.snupkg, runs package
+# validation, asserts the artifact set and SourceLink, and uploads the packages.
+#
+# This is intentionally a SEPARATE workflow from CI and is NOT a branch-protection required
+# check — it is informational packaging verification, so it must never deadlock the merge
+# button. CI (build-test-format) and DCO remain the only required checks.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pack-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pack-validate:
+    name: pack-validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # Same setup as CI: install the net8.0 runtime plus the exact SDK pinned by global.json
+      # so both target frameworks build and the rollForward policy stays in lockstep.
+      - name: Setup .NET (net8 runtime + pinned SDK)
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: 8.0.x
+          global-json-file: global.json
+
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', 'Directory.Packages.props', 'Directory.Build.props', 'global.json') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      - name: Restore (locked)
+        run: dotnet restore DeltaSharp.sln --locked-mode
+
+      # Pack from a clean CI checkout (#132 AC4: artifacts are regenerated from source, not
+      # reused from stale build outputs). GITHUB_ACTIONS=true makes Directory.Build.props set
+      # ContinuousIntegrationBuild=true, enabling deterministic source paths + SourceLink URL
+      # mapping. EnablePackageValidation runs during pack and fails the job with the offending
+      # package/TFM/rule on a TFM-compatibility regression (#131 AC2 / #132 AC2).
+      - name: Pack (Release)
+        run: dotnet pack DeltaSharp.sln -c Release --no-restore -o artifacts
+
+      - name: Assert package set (.nupkg + .snupkg for Core; no test/sample packages)
+        run: |
+          set -euo pipefail
+          echo "Artifacts produced:"; ls -1 artifacts
+          ls artifacts/DeltaSharp.Core.*.nupkg  >/dev/null || { echo "::error::missing DeltaSharp.Core .nupkg"; exit 1; }
+          ls artifacts/DeltaSharp.Core.*.snupkg >/dev/null || { echo "::error::missing DeltaSharp.Core .snupkg"; exit 1; }
+          if ls artifacts/*.nupkg | grep -iE 'Tests|Samples'; then
+            echo "::error::a test or sample project produced a package"; exit 1
+          fi
+
+      - name: Assert both target frameworks are packed (net8.0 + net10.0)
+        run: |
+          set -euo pipefail
+          pkg=$(ls artifacts/DeltaSharp.Core.*.nupkg | head -1)
+          unzip -l "$pkg" | grep -q 'lib/net8.0/DeltaSharp.Core.dll'  || { echo "::error::net8.0 lib asset missing"; exit 1; }
+          unzip -l "$pkg" | grep -q 'lib/net10.0/DeltaSharp.Core.dll' || { echo "::error::net10.0 lib asset missing"; exit 1; }
+
+      - name: Assert SourceLink resolves to repository URLs (#131 AC1)
+        run: |
+          set -euo pipefail
+          map=$(find src -name '*.sourcelink.json' | head -1)
+          test -n "$map" || { echo "::error::no SourceLink map was generated"; exit 1; }
+          echo "SourceLink map ($map):"; cat "$map"; echo
+          grep -q 'raw.githubusercontent.com/khaines/deltasharp/' "$map" \
+            || { echo "::error::SourceLink does not resolve to the repository"; exit 1; }
+
+      - name: Show package identity and dependency metadata (#132 AC3)
+        run: |
+          set -euo pipefail
+          pkg=$(ls artifacts/DeltaSharp.Core.*.nupkg | head -1)
+          echo "nuspec for $pkg:"; unzip -p "$pkg" '*.nuspec'
+
+      - name: Upload packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nuget-packages
+          path: |
+            artifacts/*.nupkg
+            artifacts/*.snupkg
+          if-no-files-found: error
