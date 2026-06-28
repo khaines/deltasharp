@@ -51,6 +51,13 @@ visible to a reader **without running the code**:
 - State it in the sample's `Program.cs` header comment **and** in a short note in this
   file's *Sample index* below — name the preview API and the milestone/version it is
   expected to stabilize in.
+- **Name the diagnostic ID.** Experimental DeltaSharp APIs carry
+  `[Experimental("DS####", …)]` (see
+  [api-lifecycle.md](../docs/engineering/design/api-lifecycle.md#DS0001) —
+  `DeltaSharpInfo.PreviewReleaseChannel` is the first such API, ID `DS0001`). A sample that
+  consumes one opts in explicitly and records *why*: either a scoped
+  `#pragma warning disable DS####` around the call (preferred) or `<NoWarn>DS####</NoWarn>`
+  in the sample's `.csproj`, with a comment pointing at the registry entry.
 - Samples in this repository track the current `main`. APIs marked preview can change
   between milestones; a sample that must pin to a specific released version says so in
   its header and uses a pinned `PackageReference` instead of a `ProjectReference`.
