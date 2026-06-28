@@ -39,6 +39,34 @@ public sealed class SelectionVector
         return new SelectionVector(indices);
     }
 
+    /// <summary>
+    /// Composes this selection (base → physical) with an <paramref name="outer"/> selection
+    /// layered on top, so the result at position <c>p</c> is <c>this[outer[p]]</c> — exactly the
+    /// physical rows produced by applying this selection then <paramref name="outer"/> in sequence.
+    /// No value buffers are involved; only a fresh index array is built (STORY-02.1.2 AC2).
+    /// </summary>
+    /// <exception cref="ArgumentNullException"><paramref name="outer"/> is null.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">An outer index is outside <c>[0, Count)</c>.</exception>
+    public SelectionVector Compose(SelectionVector outer)
+    {
+        ArgumentNullException.ThrowIfNull(outer);
+        ReadOnlySpan<int> outerIndices = outer.Indices;
+        var composed = new int[outerIndices.Length];
+        for (int p = 0; p < outerIndices.Length; p++)
+        {
+            int position = outerIndices[p];
+            if ((uint)position >= (uint)_indices.Length)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(outer), position, $"Outer index must be in [0, {_indices.Length}).");
+            }
+
+            composed[p] = _indices[position];
+        }
+
+        return new SelectionVector(composed);
+    }
+
     /// <summary>The number of selected rows (the selected cardinality).</summary>
     public int Count => _indices.Length;
 

@@ -23,7 +23,7 @@ public class ColumnContractTests
         Type[] contracts =
         {
             typeof(ColumnVector), typeof(MutableColumnVector), typeof(ColumnBatch), typeof(SelectionVector),
-            typeof(ColumnVectors),
+            typeof(SelectedColumnVector), typeof(ColumnVectors),
         };
         foreach (Type contract in contracts)
         {

@@ -25,17 +25,18 @@ These contracts live in the unshipped `DeltaSharp.Engine` assembly under
 | `ColumnVector` | Read contract for one column: type, length, offset, validity, typed value access, slicing. |
 | `MutableColumnVector` | Write contract: append/set values and null bits; reads observe the writes. |
 | `ColumnBatch` | A schema (`StructType`) + one equal-length vector per field; slicing; selection awareness. |
-| `SelectionVector` | An ordered set of selected physical row indices (late materialization). |
+| `SelectionVector` | An ordered set of selected physical row indices (late materialization); composable. |
+| `SelectedColumnVector` | A zero-copy view that re-maps a vector's logical rows to a selection's physical rows. |
 
 ### Logical indexing and offset
 
 All indices are **logical**: row `0` is the first row of a vector's view, regardless of any
 physical `Offset` into shared buffers. A `Slice(offset, length)` returns a view over the **same**
 buffers — no value or validity bytes are copied — with a consistent `Length`, `Offset`, and
-validity at each corresponding row (AC2). Because a slice shares the owner's buffers, **slicing
-seals the owner**: a mutable vector is built fully, then sliced/read, and any attempt to mutate it
-after slicing throws (rather than silently corrupting outstanding slices via a stale null count or
-an append-triggered buffer reallocation). Typed bulk access (`GetValues<T>()`) returns the
+validity at each corresponding row (AC2). Because a slice (or a selection view) shares the owner's
+buffers, **slicing or selecting seals the owner**: a mutable vector is built fully, then
+sliced/selected/read, and any attempt to mutate it afterward throws (rather than silently corrupting
+outstanding views via a stale null count or an append-triggered buffer reallocation). Typed bulk access (`GetValues<T>()`) returns the
 offset-adjusted span for the slice's own `[0, Length)`, so kernels never do offset arithmetic.
 
 ### Typed access without per-row boxing (AC1)
@@ -60,12 +61,30 @@ An operator materializes output through `MutableColumnVector` — `AppendValue<T
 immediately observable through the inherited read members, **with no immutable Arrow API on the
 hot path**. Slices are read-only views and reject mutation.
 
-### Selection-vector awareness
+### Selection-vector awareness and zero-copy selected views
 
-A `ColumnBatch` may carry a `SelectionVector` via `WithSelection`; its `LogicalRowCount` then
-reflects the selected cardinality while the physical columns are shared unchanged (no copy). This
-is the **awareness** hook; the zero-copy *selected views* over values (filters/joins reading only
-selected rows) are STORY-02.1.2 (#134) and build on this.
+A `ColumnVector` exposes `Select(SelectionVector)` and a `ColumnBatch` exposes `WithSelection`. Both
+return a **zero-copy selected view**: the logical rows become the selection's physical rows in
+selection order, so `Length`/`LogicalRowCount` equal the selected cardinality while every value and
+validity buffer is shared, never copied (STORY-02.1.2 AC1). A selecting allocation is just the view
+object plus the index array — independent of the parent's value-buffer size, which a regression test
+pins. `ColumnBatch.SelectedColumn(i)` returns column `i` re-based to those selected rows (or the
+column itself when no selection is present), so kernels enumerate `[0, LogicalRowCount)` with no
+selection bookkeeping.
+
+A selected row `i` resolves to physical index `selection[i]`: `GetValue<T>(i)`, `GetBytes(i)`, and
+`IsNull(i)` gather from the parent at that index, so **validity matches the parent's bitmap at each
+selected physical index** and `NullCount`/`HasNulls` reflect only the selected rows (AC4). Selection
+is **non-contiguous**, so `GetValues<T>()` (the contiguous fast path) is unavailable on a view —
+kernels enumerate per-row or materialize first. Empty / all-selected / partial selections enumerate
+in deterministic selection order and never read out of range (AC3).
+
+**Composition:** `Select` over an already-selected view (and `WithSelection` over a selected batch)
+fuses via `SelectionVector.Compose` — the outer indices address the current logical rows and resolve
+through to physical rows, so nesting never copies and never deepens: `v.Select(a).Select(b)` equals
+`v.Select(a.Compose(b))` (AC2). **Seal interaction:** like `Slice`, taking a selected view seals a
+mutable owner (the same `seal-on-slice` safety from STORY-02.1.1), so the shared buffers can't be
+mutated underneath the view; build a vector fully, then select/slice it.
 
 ## Reference implementation (the AC4 proof)
 
@@ -80,12 +99,12 @@ and off-heap vectors are separate stories.
 
 - **In scope:** the `ColumnVector`/`MutableColumnVector`/`ColumnBatch`/`SelectionVector` contracts,
   typed no-boxing access for the v1 primitives, the validity model, slicing, selection awareness,
-  and a managed reference implementation.
+  zero-copy selection **views** + composition (STORY-02.1.2, #134), and a managed reference
+  implementation.
 - **Deferred:** Arrow-backed vectors + boundary conversion (FEAT-02.2, #135/#136); off-heap
-  `NativeMemory` vectors + spill (FEAT-02.3, ADR-0013); selection-vector **views** over values
-  (STORY-02.1.2, #134); branchless null/validity helpers (FEAT-02.6, #143/#144); first-class
-  **nested** (`array`/`map`/`struct`) child vectors — the contracts classify them as `Nested` and
-  the managed factory does not yet build them.
+  `NativeMemory` vectors + spill (FEAT-02.3, ADR-0013); branchless null/validity helpers
+  (FEAT-02.6, #143/#144); first-class **nested** (`array`/`map`/`struct`) child vectors — the
+  contracts classify them as `Nested` and the managed factory does not yet build them.
 
 ## References
 

@@ -26,6 +26,16 @@ public class SelectionVectorTests
     }
 
     [Fact]
+    public void Compose_ResolvesOuterPositionsThroughBaseSelection()
+    {
+        var baseSelection = new SelectionVector(new[] { 5, 3, 1 }); // logical 0,1,2 -> physical 5,3,1
+        SelectionVector composed = baseSelection.Compose(new SelectionVector(new[] { 2, 0 }));
+
+        Assert.True(composed.Indices.SequenceEqual(new[] { 1, 5 }));
+        Assert.Throws<ArgumentOutOfRangeException>(() => baseSelection.Compose(new SelectionVector(new[] { 3 })));
+    }
+
+    [Fact]
     public void SelectionVector_RejectsNegativeIndex()
     {
         Assert.Throws<ArgumentOutOfRangeException>(() => new SelectionVector(new[] { 0, -1 }));

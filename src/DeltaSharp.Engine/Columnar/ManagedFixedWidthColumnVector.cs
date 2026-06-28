@@ -104,6 +104,9 @@ public sealed class ManagedFixedWidthColumnVector<T> : MutableColumnVector
         return new ManagedFixedWidthColumnVector<T>(Type, _data, _validity, absoluteOffset, length, nulls);
     }
 
+    /// <summary>Seals the owner so a selection view shares the buffers safely (see <see cref="Slice"/>).</summary>
+    protected override void SealForView() => _sealed = true;
+
     /// <inheritdoc/>
     public override void AppendValue<TRequest>(TRequest value)
     {
