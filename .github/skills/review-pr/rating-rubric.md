@@ -254,3 +254,54 @@ When the calculated rating falls between two integers, apply these rules in prio
 2. **Round DOWN** if validation evidence is missing for restore/build/format/test on code changes.
 3. **Round UP** if all Critical/High findings have mitigations already in progress and none are protected-domain findings.
 4. **Round to nearest** otherwise.
+
+---
+
+## Rigor battery & the PASS gate
+
+A rating answers "how good is this PR"; the **gate** answers "may the loop terminate / may this
+merge." They are separate. The gate consumes the [`rigor-battery.md`](rigor-battery.md) (C1–C7)
+and the red-team verdict.
+
+**PASS** requires ALL of:
+
+- every voting seat (4 lenses + each scout-selected specialist) at **5/5**, with a complete
+  Approve attestation (below);
+- **zero actionable** (blocking/major) findings open;
+- **zero open C1 / C2 / C4 / C5 / C7 items** — no proven-vacuous test, no dead/un-wired control
+  or validation↔enforcement gap, no unbacked PR/spec claim, no unmigrated compat break, and no
+  execution-eligible claim lacking executed evidence;
+- red-team **`NO-MISS-CERTIFIED`**, backed by executed C7 repros, on a decorrelated frontier
+  family (same-family certification is provisional for protected-domain changes).
+
+**Green CI is necessary but not sufficient** — C1/C2/C7 routinely catch defects that pass green
+CI (vacuous tests, validator↔consumer mismatches, migration notes the code contradicts).
+
+## Decorrelated red-team gate
+
+- The red-team runs **last** and on a **frontier family distinct from the majority voting
+  spine**. A red-team `MISS-FOUND` **always blocks** — its findings are actionable, blocking 5/5
+  items.
+- `NO-MISS-CERTIFIED` is valid only with a fully-populated Falsification-Attempts block and a C7
+  line quoting real commands + output for every execution-eligible claim. A bare "no issues", or
+  a "verified by reading" on a C7-eligible claim, is rejected (re-prompt once).
+- Protected domains (security / tenant isolation / auth / data integrity / Delta commit / query
+  correctness / privacy) may not be dismissed without an explicit `protected-domain assessment:
+  none`.
+
+## Approve attestation & the anti-impasse rule
+
+These exist to stop two specific failure modes the council has hit:
+
+- **Approve attestation.** Every seat that emits `APPROVE` / 5/5 MUST carry a completed
+  **Mandatory Checks** attestation — each applicable battery line is a real result or an explicit
+  `n/a — <reason>`. Findings without a `file:line` + EVIDENCE clause are dropped before scoring.
+  If an APPROVE lacks the attestation, **re-prompt that one seat** for it before counting the vote.
+- **Anti-impasse (sub-5/5 with no actionable finding).** A rating below 5/5 MUST be justified by
+  at least one concrete `file:line` finding (per the scale, 4/5 means 1–2 High findings). A seat
+  that returns **sub-5/5 but lists no actionable finding is incoherent** — re-prompt it **once**
+  for the specific `file:line` change that would make it 5/5. If it still names none and won't
+  revise to 5/5 → **impasse** (blocks PASS; escalate to a human). Never record a sub-5/5 "that
+  found nothing" as a substantive result, and never paper over it by reinterpreting the number.
+  A reviewer that down-rates only because it could not *execute* a check is a **dispatch error**
+  (re-dispatch it shell-capable), not a finding.

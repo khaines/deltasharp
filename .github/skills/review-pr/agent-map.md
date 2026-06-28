@@ -1,6 +1,6 @@
 # PR Review — Agent Mapping Reference
 
-This file maps file patterns and content signals to the specialist agent personas used during pull-request reviews. The `review-pr` skill consults this map to decide which agents should participate in a given review.
+This file maps file patterns and content signals to the specialist agent personas used during pull-request reviews. The `review-pr` skill consults this map to decide which agents should participate in a given review. The **scout** (`scout.md`, Phase 1.6) is the primary consumer: it reads this map to assemble the **≤3 domain specialist seats** (each with a verified `docs/persona/agents/<slug>-agent.md` canonical spec) that join the 4 fixed council lenses.
 
 **How it works:**
 

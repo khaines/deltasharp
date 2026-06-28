@@ -120,7 +120,9 @@ Findings in the following domains are **never auto-dismissed** based on low cons
 
 ## Dismissal Priority Order
 
-When evaluating a finding, apply dismissal rules in this order. Stop at the first match:
+**A red-team `MISS-FOUND` finding is never dismissed** — it is actionable and blocking by
+construction, closed only by a fix or by the red-team re-certifying `NO-MISS-CERTIFIED`. For all
+other findings, apply dismissal rules in this order. Stop at the first match:
 
 1. **Critical safety net** — If severity is Critical, skip ALL dismissal rules and investigate manually. Critical findings are never auto-dismissed.
 2. **Protected domain safety net** — If the finding touches a protected domain (§2.1), skip low-consensus auto-dismissal.
