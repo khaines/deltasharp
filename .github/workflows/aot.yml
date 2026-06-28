@@ -56,3 +56,37 @@ jobs:
           publish_path="src/DeltaSharp.Executor/bin/Release/net10.0/linux-x64/publish/DeltaSharp.Executor"
           test -x "$publish_path"
           echo "NativeAOT executable: $publish_path"
+
+      - name: Assert codegen tier elided and interpreted backend selected (ADR-0001)
+        run: |
+          publish_path="src/DeltaSharp.Executor/bin/Release/net10.0/linux-x64/publish/DeltaSharp.Executor"
+          # AC2/AC5: on a NativeAOT host (no dynamic code) the executor must select the
+          # interpreted backend and still evaluate the kernel correctly.
+          output="$("$publish_path")"
+          echo "$output"
+          echo "$output" | grep -qF "interpreted-vectorized (dynamic-code=False)"
+          echo "$output" | grep -qF "affine(20)=41"
+          # AC3: the optional CompiledBackend must be dead-code-eliminated from the native image.
+          # Use `strings`, not `nm`: NativeAOT strips managed type names from the binary symbol table,
+          # so `nm` yields a false-negative (a leaked managed type is invisible to it). The type name
+          # does remain in the image metadata, which `strings` surfaces.
+          #
+          # Use a plain fixed-string substring match, NOT a delimiter-bounded regex: NativeAOT packs
+          # metadata strings, so the type name can appear abutting the next symbol with no delimiter
+          # (e.g. `CompiledBackendgC`). A bounded pattern would fail OPEN there; a substring match
+          # stays fail-closed and still matches. (`CompiledBackend` is not a substring of the sibling
+          # `InterpretedVectorizedBackend`, so the positive control below is unaffected.)
+          #
+          # Positive control first: confirm `strings` can actually see a reachable backend type name
+          # (InterpretedVectorizedBackend). If it cannot, type metadata is stripped and an "absent
+          # CompiledBackend" result would be vacuous — fail closed rather than pass blindly (the
+          # false-negative class that makes `nm` unsuitable here).
+          if ! strings -a "$publish_path" | grep -qF 'InterpretedVectorizedBackend'; then
+            echo "ERROR: positive control failed — strings cannot see backend type metadata, so the elision check is unreliable." >&2
+            exit 1
+          fi
+          if strings -a "$publish_path" | grep -qF 'CompiledBackend'; then
+            echo "ERROR: CompiledBackend metadata found in the NativeAOT image — codegen tier was not elided." >&2
+            exit 1
+          fi
+          echo "Verified: CompiledBackend elided; interpreted backend selected under NativeAOT."
