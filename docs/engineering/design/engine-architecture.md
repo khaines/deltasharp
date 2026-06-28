@@ -24,7 +24,7 @@ optimize behind the interface.
 
 ```mermaid
 graph TD
-  API["SparkSession / DataFrame / Dataset&lt;T&gt; / SQL"] --> LP["Unresolved logical plan (lazy)"]
+  API["SparkSession / DataFrame / Dataset / SQL"] --> LP["Unresolved logical plan (lazy)"]
   LP --> AN["Analyzer + Catalyst-style optimizer"]
   AN --> PP["Physical plan"]
   PP --> EB{"Execution backend<br/>(ADR-0001)"}
@@ -32,7 +32,7 @@ graph TD
   EB -->|RuntimeFeature.IsDynamicCodeSupported| COD["JIT codegen tier<br/>Expression.Compile fusion"]
   INT --> CB["ColumnBatch / ColumnVector<br/>(Arrow-backed now, custom later) — ADR-0002"]
   COD --> CB
-  CB --> SC["Scan: Parquet -&gt; Arrow batches"]
+  CB --> SC["Scan: Parquet to Arrow batches"]
   SC --> DL["Delta log / Parquet (storage layer)"]
   INT -. parity oracle .-> COD
 ```
@@ -62,7 +62,7 @@ graph TD
   WKA -->|eager replication N copies| WKB
   EXB -->|"resolve location"| REG
   REG -->|"holder = Node A"| EXB
-  EXB -->|Arrow Flight fetch (data plane) — ADR-0003| WKA
+  EXB -->|"Arrow Flight fetch (data plane) — ADR-0003"| WKA
   WKA -. drain-migration on scale-down .-> WKB
   WKA -. togglable fallback .-> OBJ
 ```
