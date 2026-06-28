@@ -38,6 +38,16 @@ jobs:
           restore-keys: |
             nuget-${{ runner.os }}-
 
+      # NativeAOT publish. The restore here is intentionally NOT --locked-mode: a PublishAot
+      # publish pulls the RID-specific NativeAOT toolchain (Microsoft.DotNet.ILCompiler and
+      # runtime.linux-x64.Microsoft.DotNet.ILCompiler), which are SDK-band-pinned and
+      # Microsoft-signed (resolved via the global.json SDK pin). Forcing those into a
+      # packages.lock.json would reintroduce the SDK-version coupling the repo deliberately
+      # avoids for build-time toolchain packages (cf. Microsoft.NET.ILLink.Tasks). Third-party
+      # dependency pinning is already enforced on this same commit by the required CI job
+      # (build-test-format restores the solution with --locked-mode); this is a discard-only
+      # trim/AOT-regression gate — the binary is asserted, never signed or published.
+      # -warnaserror fails the publish on any IL2xxx/IL3xxx trim/AOT warning.
       - name: Publish executor (NativeAOT linux-x64)
         run: dotnet publish src/DeltaSharp.Executor -c Release -r linux-x64 -p:PublishAot=true -p:TreatWarningsAsErrors=true -warnaserror
 
