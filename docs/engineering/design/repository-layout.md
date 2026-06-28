@@ -13,7 +13,7 @@
 | `DeltaSharp.sln` | Root solution; references every `src/` and `tests/` project. |
 | `src/` | Production projects — one folder per assembly. |
 | `tests/` | Test projects — one per production project, suffixed `.Tests`. |
-| `samples/` | Example applications (added later; never packable). |
+| `samples/` | Runnable example applications — **never packable**, isolated from production package validation. See [`samples/README.md`](../../../samples/README.md) and [samples-conventions](#samples). |
 | `tools/` | Repository scripts (for example `dco-check.sh`). |
 | `global.json` | Pins the .NET SDK band (`10.0.1xx`). |
 | `Directory.Build.props` | Repository-wide MSBuild policy: nullable, deterministic builds, warnings-as-errors, version, and package-metadata defaults. |
@@ -30,9 +30,16 @@
 | `DeltaSharp.Core.Tests` | `tests/DeltaSharp.Core.Tests` | `net8.0;net10.0` | no | xUnit tests for `DeltaSharp.Core`, multi-targeted so both library targets are compiled and executed in CI. |
 | `DeltaSharp.Engine.Tests` | `tests/DeltaSharp.Engine.Tests` | `net10.0` | no | xUnit tests for `DeltaSharp.Engine` (matches the engine's single TFM). |
 | `DeltaSharp.Executor.Tests` | `tests/DeltaSharp.Executor.Tests` | `net10.0` | no | xUnit tests for `DeltaSharp.Executor` (matches the executor's single TFM). |
+| `DeltaSharp.Samples.GettingStarted` | `samples/DeltaSharp.Samples.GettingStarted` | `net8.0` | no | Minimal example consuming `DeltaSharp.Core` from the current LTS. Compiled by the solution build; non-packable, so excluded from package validation. |
 
 > The skeleton is intentionally **inert**: it exposes no Apache Spark or Delta Lake
 > behavior yet. Real engine and API code lands in later epics.
+
+Test-project naming/placement, the **test-access policy** (public-in-unshipped-assembly
+vs. `InternalsVisibleTo`), and the unit-vs-integration split are documented in
+[testing-conventions.md](testing-conventions.md). The sample conventions (non-packable,
+preview-status visibility, CI isolation) are documented in
+[`samples/README.md`](../../../samples/README.md).
 
 ## Intended assembly map (active and planned)
 
@@ -66,7 +73,22 @@ CODEOWNERS already anticipates several of these seams (`/src/**/Sql/`,
 - **Test projects:** `<Project>.Tests`, placed under `tests/` mirroring `src/`.
 - **Namespaces:** rooted at `DeltaSharp`; the public surface uses `DeltaSharp`
   directly, internal areas use `DeltaSharp.<Area>`.
-- **Samples:** `samples/<SampleName>/`, not packable.
+- **Samples:** `samples/<SampleName>/`, not packable. See [Samples](#samples).
+
+## Samples
+
+Example applications live under `samples/` and are **never published**. Because they are
+non-packable, `dotnet pack` skips them, so a broken sample can never block the production
+**package-validation** diagnostics for `DeltaSharp.Core` (`pack-validate` stays Core-only);
+[`pack.yml`](../../../.github/workflows/pack.yml) also fails if any `*Samples*` project ever
+produces a package. Samples *are* listed in `DeltaSharp.sln`, so the required
+`build-test-format` gate compiles them (a broken sample is caught and reported there), and a
+dedicated, informational [`samples.yml`](../../../.github/workflows/samples.yml) workflow
+builds and smoke-runs them as an extra signal (STORY-01.1.3). In-repo samples reference
+production projects with a `ProjectReference` so they track the working tree. Full
+conventions — including how a sample makes **preview-API
+status and expected compatibility** visible — are in
+[`samples/README.md`](../../../samples/README.md).
 
 ## Target-framework policy (ADR-0014)
 
