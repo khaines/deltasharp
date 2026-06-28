@@ -318,7 +318,9 @@ These exist to stop two specific failure modes the council has hit:
 
 - **Approve attestation.** Every seat that emits `APPROVE` / 5/5 MUST carry a completed
   **Mandatory Checks** attestation — each applicable battery line is a real result or an explicit
-  `n/a — <reason>`. Findings without a `file:line` + EVIDENCE clause are dropped before scoring.
+  `n/a — <reason>`. A finding is dropped before scoring **only if it carries neither a `file:line`
+  anchor nor any EVIDENCE clause**; a finding missing just one is re-prompted/normalized, not dropped
+  (matching the Finding Body Format Contract).
   If an APPROVE lacks the attestation, **re-prompt that one seat** for it before counting the vote.
 - **Anti-impasse (sub-5/5 with no actionable finding).** A rating below 5/5 MUST be justified by
   at least one concrete `file:line` finding (per the scale, 4/5 means 1–2 High findings). A seat

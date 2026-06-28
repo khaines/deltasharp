@@ -73,8 +73,12 @@ a repro and records the **command + observed output**:
   controlled code as the reviewer's process. Run any repro that builds or executes PR code in an
   isolated context — a throwaway dir **outside the worktree**, with guaranteed cleanup and, where
   possible, no ambient credentials/network: `d=$(mktemp -d); trap 'rm -rf "$d"' EXIT`. Reserve
-  "run on the repo as-is" for *non-executing / trusted-base* operations (format/lint, link greps,
-  building unchanged base), not for running PR-authored build/test logic;
+  "run on the repo as-is" for genuinely **non-executing** operations only (greps, link/numbering
+  checks, plain file reads). Treat any **Roslyn/compiler-driven** command (`dotnet build` /
+  `restore` / `format`) as executing PR-supplied code whenever the PR touches build inputs
+  (`*.csproj`, `Directory.Build.props`, `Directory.Packages.props`, `global.json`, `*.props` /
+  `*.targets`, analyzer/source-generator refs) — referenced analyzers and source generators run
+  in-process — and run those on the isolated default path, not as-is;
 - examples: execute the gate/script the PR claims works and capture the exit code; delete or invert
   the symbol a "coverage" test claims to cover (in a throwaway copy) and confirm the test **fails**;
   call the real constructor/loader/consumer with every form the validator accepts and capture the

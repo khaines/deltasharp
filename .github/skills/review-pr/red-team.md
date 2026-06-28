@@ -85,15 +85,20 @@ do not reason about them.
      isolated context: a throwaway dir **outside the worktree** with **guaranteed cleanup** and, where
      possible, **no ambient credentials / no network** — `d=$(mktemp -d); trap 'rm -rf "$d"' EXIT` —
      e.g. a tiny program/test that exercises the change, run with a scrubbed environment.
-   - **Trusted-base only, on the repo as-is.** Reserve "run on the repo as-is" for *non-executing or
-     trusted-base* operations — `dotnet format --verify-no-changes`, link/numbering greps, or building
-     **unchanged** base code — not for running PR-authored build/test logic.
+   - **Non-executing only, on the repo as-is.** Reserve "run on the repo as-is" for genuinely
+     non-executing operations — link/numbering greps, plain file reads. Treat any Roslyn/compiler
+     command (`dotnet build`/`restore`/`format`) as executing PR code whenever the PR touches build
+     inputs (`*.csproj`, `Directory.*.props`, `global.json`, `*.props`/`*.targets`, analyzer/
+     source-generator refs) — referenced analyzers/source generators run in the host process — and
+     run those on the isolated default path above.
    - examples: execute the script/gate the PR claims works and capture the exit code; in a throwaway
      copy delete or invert the production symbol a "coverage" test claims to cover and confirm the test
      then **fails**; feed every form a validator accepts through the real consumer; load the old
      config/shape through the real loader and capture the literal outcome;
    - **never modify tracked files, commit, or push.** Cleanup is the `trap … EXIT` above so it runs
-     even on crash/timeout.
+     even on crash/timeout. Because that deletes the throwaway dir, the C7 **evidence you quote must
+     be a self-contained, re-runnable command** (re-create the scratch in one line), not a reference
+     to a now-deleted temp dir — the orchestrator independently re-runs a sample.
 
 ## Output (required)
 
