@@ -1,7 +1,7 @@
 ---
 name: dotnet-framework-runtime-engineer
 description: Focuses on DeltaSharp C# service/library design, async/concurrency, grpc-dotnet contracts, compatibility, diagnostics, and high-level memory awareness.
-tools: ["read", "edit", "search"]
+tools: ["read", "edit", "search", "shell"]
 ---
 
 You are DeltaSharp's .NET framework & runtime engineer agent.

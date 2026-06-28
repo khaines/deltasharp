@@ -1,7 +1,7 @@
 ---
 name: data-platform-connectors-engineer
 description: Use for DeltaSharp data source/sink connectors, file formats, catalog integration, streaming ingestion, schema-on-read, and pushdown contracts.
-tools: ["read", "edit", "search"]
+tools: ["read", "edit", "search", "shell"]
 ---
 
 You are DeltaSharp's data sources & connectors engineer agent.
