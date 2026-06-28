@@ -1,4 +1,5 @@
 using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
 using System.Reflection;
 using Xunit;
 
@@ -25,11 +26,15 @@ public class ApiLifecycleTests
         // AC1: diagnostic ID is the first DS#### registry entry.
         Assert.Equal("DS0001", experimental!.DiagnosticId);
 
-        // AC1: a documentation URL is recorded; the {0} placeholder lets the compiler build a
-        // per-diagnostic help link, and it points at the diagnostic-ID registry.
-        Assert.False(string.IsNullOrEmpty(experimental.UrlFormat));
-        Assert.Contains("{0}", experimental.UrlFormat);
-        Assert.Contains("api-lifecycle", experimental.UrlFormat);
+        // AC1: the exact documentation-URL template is recorded, and its {0} placeholder resolves
+        // to the registry anchor for this diagnostic (api-lifecycle.md#DS0001). Pinning both the
+        // template and the formatted link stops a wrong or non-registry URL from passing.
+        const string expectedUrlFormat =
+            "https://github.com/khaines/deltasharp/blob/main/docs/engineering/design/api-lifecycle.md#{0}";
+        Assert.Equal(expectedUrlFormat, experimental.UrlFormat);
+        Assert.Equal(
+            "https://github.com/khaines/deltasharp/blob/main/docs/engineering/design/api-lifecycle.md#DS0001",
+            string.Format(CultureInfo.InvariantCulture, experimental.UrlFormat!, experimental.DiagnosticId));
     }
 
     [Fact]
@@ -53,11 +58,14 @@ public class ApiLifecycleTests
         Assert.NotNull(obsolete);
 
         // AC2: a deprecation warning (not a hard error) whose message states the replacement
-        // member and a removal timeline.
+        // member and a removal timeline. Pin the exact message: asserting only that it contains
+        // "Product" would be satisfied by the obsolete member's own name ("ProductName") even if
+        // the replacement guidance were dropped.
         Assert.False(obsolete!.IsError);
-        Assert.False(string.IsNullOrEmpty(obsolete.Message));
-        Assert.Contains("Product", obsolete.Message);
-        Assert.Contains("v0.2.0", obsolete.Message);
+        Assert.Equal(
+            "Use DeltaSharpInfo.Product instead. The ProductName alias is obsolete and is " +
+            "scheduled for removal in DeltaSharp v0.2.0.",
+            obsolete.Message);
     }
 
     [Fact]

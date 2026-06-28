@@ -21,7 +21,7 @@ Every new public API has exactly one stability state:
 | State | Marker | Compiler diagnostic | Consumer effect |
 | --- | --- | --- | --- |
 | Stable | *(none)* | — | Normal use; covered by SemVer compatibility once shipped. |
-| Experimental (preview) | `[Experimental("DS####", UrlFormat = …)]` | `DS####` (a DeltaSharp ID) | Build **warning** until explicitly acknowledged; shape may change or be removed. |
+| Experimental (preview) | `[Experimental("DS####", UrlFormat = …)]` | `DS####` (a DeltaSharp ID) | Build **error by default** (Roslyn reports `[Experimental]` at error severity) until explicitly suppressed; shape may change or be removed. |
 | Obsolete (deprecated) | `[Obsolete(message, error)]` | `CS0618`/`CS0612` (built-in) | Build warning (or error) with replacement/removal guidance. |
 | Internal | `internal` | — | Not part of the public surface; not in the PublicAPI baseline. |
 
@@ -55,9 +55,10 @@ the generated reference both see the contract without opening the source:
 The live reference implementation is `DeltaSharp.DeltaSharpInfo.PreviewReleaseChannel`
 ([DeltaSharpInfo.cs](../../../src/DeltaSharp.Core/DeltaSharpInfo.cs)).
 
-**Consuming an experimental API.** Using a `[Experimental]` member raises the `DS####` warning,
-which is build-breaking under the repository's `TreatWarningsAsErrors`. A consumer that accepts the
-risk opts in explicitly, with justification:
+**Consuming an experimental API.** Using a `[Experimental]` member is **build-breaking by
+default**: Roslyn reports the `DS####` diagnostic at **error** severity, independently of
+`TreatWarningsAsErrors`. A consumer that accepts the risk suppresses it explicitly, with
+justification:
 
 ```csharp
 #pragma warning disable DS0001 // Preview metadata API — shape may change (api-lifecycle.md#DS0001)
