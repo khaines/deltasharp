@@ -69,12 +69,19 @@ A CI build emits a SourceLink map (`obj/**/<project>.sourcelink.json`) of the fo
 so a debugger that downloads the `.snupkg` symbols resolves source to the repository at the
 exact built revision. The pack workflow asserts the map points at the repository.
 
+SourceLink needs git metadata (the remote URL and commit) to emit this map. `actions/checkout`
+provides it in CI, so the map is generated during the workflow build. A bare source export
+without a `.git` directory (for example `git archive`) legitimately produces no map — that is
+not a CI condition.
+
 ## Package validation (STORY-01.6.2)
 
 `EnablePackageValidation=true` runs during pack. For the multi-targeted `DeltaSharp.Core` it
-validates that the package is **self-consistent across `net8.0` and `net10.0`** — a
-`net10.0`-only public API that the `net8.0` target lacks fails validation with the offending
-package, target framework, and rule. A released-version baseline
+validates that the package is **self-consistent across `net8.0` and `net10.0`**: a public API
+present in the `net8.0` target but **missing from `net10.0`** fails validation (`CP0001` for a
+type, `CP0002` for a member) with the offending package, target framework, and rule — public
+surface may not be dropped in a higher target framework. (Adding a `net10.0`-only API is
+allowed, since a `net8.0` consumer simply does not see it.) A released-version baseline
 (`PackageValidationBaselineVersion`) is intentionally **not** set yet: nothing is published,
 so there is no prior version to diff against. It is added at the first release so validation
 also catches breaking changes versus the previous package.
