@@ -55,12 +55,16 @@
   -->
   <PropertyGroup>
     <!-- A "production assembly" lives under src/ (today: DeltaSharp.Core, DeltaSharp.Engine).
-         Gated on the project path, which is known when this file is imported. Anchored at
-         the repo root ($(MSBuildThisFileDirectory)) so a parent directory named "src"
-         cannot misclassify a test project. Test projects (tests/) are intentionally
-         excluded — they legitimately use reflection, clocks, and randomness. -->
+         Gated on the project path, which is known when this file is imported. Both paths are
+         normalized to a trailing directory separator and the comparison is anchored at the
+         repo root ($(MSBuildThisFileDirectory)src/), so neither a parent directory named
+         "src" nor a sibling whose name merely starts with "src" (e.g. "src-tools") is
+         misclassified. Test projects (tests/) are intentionally excluded — they legitimately
+         use reflection, clocks, and randomness. -->
+    <_DeltaSharpSrcDir>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)src'))</_DeltaSharpSrcDir>
+    <_DeltaSharpProjectDir>$([MSBuild]::NormalizeDirectory('$(MSBuildProjectDirectory)'))</_DeltaSharpProjectDir>
     <DeltaSharpIsProductionAssembly>false</DeltaSharpIsProductionAssembly>
-    <DeltaSharpIsProductionAssembly Condition="$(MSBuildProjectDirectory.StartsWith('$(MSBuildThisFileDirectory)src'))">true</DeltaSharpIsProductionAssembly>
+    <DeltaSharpIsProductionAssembly Condition="$(_DeltaSharpProjectDir.StartsWith('$(_DeltaSharpSrcDir)'))">true</DeltaSharpIsProductionAssembly>
 
     <!-- Public-API baselines apply to packable public libraries (today: DeltaSharp.Core).
          IsPackable is set in the .csproj body, which MSBuild evaluates AFTER this import,

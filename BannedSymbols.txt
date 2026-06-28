@@ -1,23 +1,29 @@
 // DeltaSharp banned-API policy. Each entry is a documentation-comment ID followed by
 // ";[category] remediation". Categories cover dynamic-code/AOT, trim/AOT, determinism, and
 // security-sensitive APIs. Name-only method IDs match only the parameterless overload, so
-// dangerous overloads are listed explicitly. Scoped, justified exceptions go through a
+// dangerous overloads are listed explicitly. BannedApiAnalyzers silently ignores any line it
+// cannot resolve (no diagnostic), so a mistyped documentation-ID is a no-op — keep IDs exact
+// and prove new bans actually fire. Scoped, justified exceptions go through a
 // "#pragma warning disable RS0030" linked to ADR-0001 or ADR-0014 — see
 // docs/engineering/design/api-governance.md.
 
 // === Dynamic code / AOT: runtime IL generation is NativeAOT-incompatible (ADR-0001, ADR-0014) ===
 M:System.Linq.Expressions.Expression`1.Compile;[dynamic-code/AOT] Expression<T>.Compile emits IL at runtime and is NativeAOT-incompatible (ADR-0001, ADR-0014). Use the InterpretedVectorizedBackend; gate any compiled tier behind RuntimeFeature.IsDynamicCodeSupported with [RequiresDynamicCode].
 M:System.Linq.Expressions.Expression`1.Compile(System.Boolean);[dynamic-code/AOT] Expression<T>.Compile emits IL at runtime and is NativeAOT-incompatible (ADR-0001, ADR-0014). Use the interpreted backend; gate any compiled tier behind RuntimeFeature.IsDynamicCodeSupported.
+M:System.Linq.Expressions.Expression`1.Compile(System.Runtime.CompilerServices.DebugInfoGenerator);[dynamic-code/AOT] Expression<T>.Compile emits IL at runtime and is NativeAOT-incompatible (ADR-0001, ADR-0014). Use the interpreted backend; gate any compiled tier behind RuntimeFeature.IsDynamicCodeSupported.
 M:System.Linq.Expressions.LambdaExpression.Compile;[dynamic-code/AOT] LambdaExpression.Compile emits IL at runtime and is NativeAOT-incompatible (ADR-0001, ADR-0014). Use the interpreted backend; gate any compiled tier behind RuntimeFeature.IsDynamicCodeSupported.
 M:System.Linq.Expressions.LambdaExpression.Compile(System.Boolean);[dynamic-code/AOT] LambdaExpression.Compile emits IL at runtime and is NativeAOT-incompatible (ADR-0001, ADR-0014). Use the interpreted backend.
+M:System.Linq.Expressions.LambdaExpression.Compile(System.Runtime.CompilerServices.DebugInfoGenerator);[dynamic-code/AOT] LambdaExpression.Compile emits IL at runtime and is NativeAOT-incompatible (ADR-0001, ADR-0014). Use the interpreted backend.
 N:System.Reflection.Emit;[dynamic-code/AOT] Reflection.Emit (DynamicMethod, ILGenerator, AssemblyBuilder) throws PlatformNotSupportedException under NativeAOT (ADR-0001, ADR-0014). Use the interpreted backend; any IL-emit path must be a feature-switched, AOT-elided fast tier.
 
 // === Trim / AOT: reflection and dynamic loading defeat trimming and AOT (ADR-0014) ===
 M:System.Activator.CreateInstance(System.Type);[trim/AOT] Activator.CreateInstance uses reflection that trimming and AOT cannot analyze (ADR-0014). Prefer a known constructor, factory delegate, or DI; if reflection is unavoidable annotate the caller with [RequiresUnreferencedCode] and [DynamicallyAccessedMembers].
+M:System.Activator.CreateInstance(System.Type,System.Boolean);[trim/AOT] Activator.CreateInstance uses reflection that trimming and AOT cannot analyze (ADR-0014). Prefer a known constructor, factory delegate, or DI.
 M:System.Activator.CreateInstance(System.Type,System.Object[]);[trim/AOT] Activator.CreateInstance uses reflection that trimming and AOT cannot analyze (ADR-0014). Prefer a known constructor, factory delegate, or DI.
-M:System.Activator.CreateInstance`1;[trim/AOT] Activator.CreateInstance<T> uses reflection that trimming and AOT cannot analyze (ADR-0014). Prefer new T() with a constraint, a factory delegate, or DI.
+M:System.Activator.CreateInstance``1;[trim/AOT] Activator.CreateInstance<T> uses reflection that trimming and AOT cannot analyze (ADR-0014). Prefer new T() with a constraint, a factory delegate, or DI.
 M:System.Type.GetType(System.String);[trim/AOT] Type.GetType(string) is a trim/AOT dataflow hole (ADR-0014). Prefer typeof and known types; if dynamic resolution is required annotate with [RequiresUnreferencedCode] and document why the target type is preserved.
 M:System.Type.GetType(System.String,System.Boolean);[trim/AOT] Type.GetType(string) is a trim/AOT dataflow hole (ADR-0014). Prefer typeof and known types.
+M:System.Type.GetType(System.String,System.Boolean,System.Boolean);[trim/AOT] Type.GetType(string) is a trim/AOT dataflow hole (ADR-0014). Prefer typeof and known types.
 M:System.Reflection.Assembly.LoadFrom(System.String);[trim/AOT] Dynamic assembly loading is not AOT-safe and defeats trimming (ADR-0014). Reference assemblies statically; plugin loading needs an ADR and security review.
 M:System.Reflection.Assembly.LoadFile(System.String);[trim/AOT] Dynamic assembly loading is not AOT-safe and defeats trimming (ADR-0014). Reference assemblies statically.
 
@@ -28,11 +34,15 @@ P:System.DateTime.Today;[determinism] DateTime.Today reads ambient local time an
 P:System.DateTimeOffset.Now;[determinism] DateTimeOffset.Now reads ambient local time and is nondeterministic. Inject a TimeProvider and use UTC.
 P:System.DateTimeOffset.UtcNow;[determinism] DateTimeOffset.UtcNow reads the wall clock and is nondeterministic. Inject a TimeProvider/clock.
 M:System.Guid.NewGuid;[determinism] Guid.NewGuid is a nondeterministic identity source. Inject an id/RNG abstraction so plan, shuffle, and file identifiers are reproducible and testable.
-T:System.Random;[determinism/security] System.Random without an explicit seed is nondeterministic and not thread-safe; use a seeded Random or an injected RNG so shuffles and sampling are reproducible. For security-sensitive randomness use System.Security.Cryptography.RandomNumberGenerator.
+T:System.Random;[determinism/security] System.Random is banned outright: it is not thread-safe and an unseeded instance is nondeterministic. Inject a deterministic RNG abstraction (seeded at a well-defined point) so shuffles and sampling are reproducible. For security-sensitive randomness use System.Security.Cryptography.RandomNumberGenerator.
 
 // === Security-sensitive: command execution and broken cryptography (checklist 05) ===
+M:System.Diagnostics.Process.Start;[security] Process.Start() (instance) spawns the configured external process (command-injection and sandbox-escape surface). Avoid in engine/executor paths; if a subprocess is unavoidable get security review (checklist 05) and pass a validated argument list, never a shell string.
 M:System.Diagnostics.Process.Start(System.String);[security] Process.Start spawns external processes (command-injection and sandbox-escape surface). Avoid in engine/executor paths; if a subprocess is unavoidable get security review (checklist 05) and pass a validated argument list, never a shell string.
 M:System.Diagnostics.Process.Start(System.String,System.String);[security] Process.Start spawns external processes (command-injection and sandbox-escape surface). Get security review (checklist 05) and pass a validated argument list, never a shell string.
+M:System.Diagnostics.Process.Start(System.String,System.Collections.Generic.IEnumerable{System.String});[security] Process.Start spawns external processes (command-injection and sandbox-escape surface). Get security review (checklist 05); the argument-list overload is preferred over a shell string but still requires validated, non-user-controlled arguments.
 M:System.Diagnostics.Process.Start(System.Diagnostics.ProcessStartInfo);[security] Process.Start spawns external processes (command-injection and sandbox-escape surface). Get security review (checklist 05) and set UseShellExecute=false with a validated argument list.
 T:System.Security.Cryptography.MD5;[security] MD5 is cryptographically broken. Use SHA-256 or stronger for security; for non-crypto partitioning use a clearly named non-crypto hash.
 T:System.Security.Cryptography.SHA1;[security] SHA-1 is cryptographically broken. Use SHA-256 or stronger for any security-relevant hashing.
+T:System.Security.Cryptography.HMACMD5;[security] HMAC-MD5 builds a MAC on the broken MD5 primitive. Use HMACSHA256 or stronger for message authentication.
+T:System.Security.Cryptography.HMACSHA1;[security] HMAC-SHA1 builds a MAC on the broken SHA-1 primitive. Use HMACSHA256 or stronger for message authentication.

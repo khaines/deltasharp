@@ -81,8 +81,10 @@ unless an ADR says otherwise.
 The shared ban list lives at [`BannedSymbols.txt`](../../../BannedSymbols.txt) in the
 repository root and is applied to every production assembly. Each entry carries a
 bracketed category tag plus remediation guidance, and links to the ADR that justifies the
-ban. Lines are grouped by category with blank lines; the file deliberately uses no `//`
-comments because `BannedApiAnalyzers` would reject them as malformed entries (`RS0033`).
+ban. Lines are grouped into category sections with `//` comment banners, which
+`BannedApiAnalyzers` supports. The analyzer **silently ignores any line it cannot resolve**
+(no diagnostic), so a mistyped documentation-ID is a no-op — entries must use exact IDs and
+new bans must be proven to fire.
 
 | Category | Examples | Why it is banned | Safe alternative |
 | --- | --- | --- | --- |
@@ -93,6 +95,13 @@ comments because `BannedApiAnalyzers` would reject them as malformed entries (`R
 
 A banned call fails the build with `RS0030` and the entry's remediation message, so the
 diagnostic tells the author both *why* it is banned and *what to use instead*.
+
+A method documentation-ID with no parameter list matches only the **parameterless**
+overload, so each dangerous overload of a banned method family is listed explicitly with its
+parameter types. For the reflection-style APIs (`Activator.CreateInstance`, `Type.GetType`)
+the trim/AOT analyzers (`EnableTrimAnalyzer` / `EnableAotAnalyzer`, already enabled on the
+production projects) provide a second, dataflow-aware backstop, so the ban list and the
+analyzers reinforce each other rather than relying on the ban list alone for completeness.
 
 ### Requesting a scoped exception
 
@@ -121,9 +130,13 @@ Requirements for an exception:
 ## Adding or changing governance
 
 - **A new banned API:** add a line to `BannedSymbols.txt` as
-  `<id>;[category] message with remediation and ADR link`, where `<id>` is the
-  documentation-ID form (`T:`, `M:`, `P:`, `F:`, `E:`, or `N:`). Omit the parameter list to
-  ban all overloads of a method.
+  `<id>;[category] message with remediation and ADR link`, where `<id>` is the C#
+  documentation-comment ID (`T:`, `M:`, `P:`, `F:`, `E:`, or `N:`). A method ID with **no
+  parameter list matches only the parameterless overload**, so list each dangerous overload
+  explicitly with its parameter types (the file does this for `Activator.CreateInstance`,
+  `Type.GetType`, `Process.Start`, and the `Compile` overloads); generic methods use the
+  doc-ID double-backtick arity form. Ban a whole namespace with `N:`. The analyzer silently
+  ignores IDs it cannot resolve, so verify each new entry actually fires.
 - **A new packable public library:** add its project name to the `DeltaSharpTracksPublicApi`
   condition in `Directory.Build.props` and create empty `PublicAPI.Shipped.txt` plus a
   populated `PublicAPI.Unshipped.txt` baseline.
