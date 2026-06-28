@@ -19,8 +19,8 @@ DeltaSharp is **open-source** with a community-driven adoption strategy (Apache-
 assumed; see [ADR-0015](../docs/adr/0015-open-source-positioning.md)).
 
 > **Status: M1 scaffolding.** The solution skeleton now exists — `DeltaSharp.sln`
-> with `src/DeltaSharp.Core`, `src/DeltaSharp.Engine`, and
-> `tests/DeltaSharp.Core.Tests`. It is intentionally **inert** (no Spark or Delta
+> with `src/DeltaSharp.Core`, `src/DeltaSharp.Engine`, `src/DeltaSharp.Executor`,
+> and matching test projects. It is intentionally **inert** (no Spark or Delta
 > behavior yet). Most architecture below is still *intended* and steers ongoing
 > implementation. See
 > [repository layout & project conventions](../docs/engineering/design/repository-layout.md),

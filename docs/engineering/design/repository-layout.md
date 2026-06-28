@@ -26,19 +26,22 @@
 | --- | --- | --- | --- | --- |
 | `DeltaSharp.Core` | `src/DeltaSharp.Core` | `net8.0;net10.0` | yes | Public, user-facing API surface. Multi-targeted for current-LTS adoption (ADR-0014). Root namespace `DeltaSharp`. Trim/AOT-annotation-clean (trim/AOT analyzers). |
 | `DeltaSharp.Engine` | `src/DeltaSharp.Engine` | `net10.0` | no | Engine internals — **not part of the published package surface** (the assembly is never shipped as NuGet). `net10.0`-only so it can use the newest runtime and NativeAOT; not referenced by the public `net8.0` surface. |
+| `DeltaSharp.Executor` | `src/DeltaSharp.Executor` | `net10.0` | no | Representative NativeAOT executor host process. `PublishAot=true` is local to this executable project so AOT publish settings do not leak to public libraries. |
 | `DeltaSharp.Core.Tests` | `tests/DeltaSharp.Core.Tests` | `net8.0;net10.0` | no | xUnit tests for `DeltaSharp.Core`, multi-targeted so both library targets are compiled and executed in CI. |
 | `DeltaSharp.Engine.Tests` | `tests/DeltaSharp.Engine.Tests` | `net10.0` | no | xUnit tests for `DeltaSharp.Engine` (matches the engine's single TFM). |
+| `DeltaSharp.Executor.Tests` | `tests/DeltaSharp.Executor.Tests` | `net10.0` | no | xUnit tests for `DeltaSharp.Executor` (matches the executor's single TFM). |
 
 > The skeleton is intentionally **inert**: it exposes no Apache Spark or Delta Lake
 > behavior yet. Real engine and API code lands in later epics.
 
-## Intended assembly map (planned — not yet created)
+## Intended assembly map (active and planned)
 
-The M1 skeleton has three production/test seams. As later epics land, engine
-internals are expected to split into focused assemblies along the layer and
-**control-plane / data-plane** boundaries (see the
+The M1 scaffold starts with Core, Engine, and the representative NativeAOT
+Executor host. As later epics land, engine internals are expected to split into
+focused assemblies along the layer and **control-plane / data-plane** boundaries (see the
 [architecture checklist](../checklists/01-architecture-checklist.md)). Names are
-indicative; each assembly is created only when its code arrives:
+indicative for assemblies not yet created; each planned assembly is created only when
+its code arrives:
 
 | Planned assembly | Plane | Responsibility |
 | --- | --- | --- |
@@ -48,7 +51,7 @@ indicative; each assembly is created only when its code arrives:
 | `DeltaSharp.Storage` (or `*.Delta`) | data | Delta transaction log, Parquet, object-store / PVC backends. |
 | `DeltaSharp.Distributed` | data | Driver/executor coordination and the native remote shuffle service (CODEOWNERS anticipates `/src/**/Shuffle/`). |
 | `DeltaSharp.Operator` | **control** | Kubernetes Operator, CRDs, reconcilers — kept out of executor hot paths. |
-| `DeltaSharp.Executor` (host exe) | data | NativeAOT executor host process (driver/executor task execution). |
+| `DeltaSharp.Executor` (host exe) | data | Active representative NativeAOT executor host process (driver/executor task execution). |
 
 Two rules govern this map: the **control plane** (Operator / CRDs / reconciliation)
 must never sit in per-task data-plane hot paths; and the **packable public surface**
