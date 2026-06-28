@@ -23,6 +23,7 @@ public sealed class ManagedFixedWidthColumnVector<T> : MutableColumnVector
     private int _length;
     private int _nullCount;
     private readonly bool _mutable;
+    private bool _sealed;
 
     /// <summary>Creates an empty, mutable vector for <paramref name="type"/> with the given initial capacity.</summary>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="capacity"/> is negative.</exception>
@@ -92,6 +93,12 @@ public sealed class ManagedFixedWidthColumnVector<T> : MutableColumnVector
     public override ColumnVector Slice(int offset, int length)
     {
         CheckRange(offset, length);
+
+        // Sealing on slice makes the shared buffers safe: a slice is a zero-copy view, so any
+        // later mutation of this owner could silently corrupt it (stale NullCount, or a detached
+        // buffer after an append-triggered resize). Build a vector fully, then slice it.
+        _sealed = true;
+
         int absoluteOffset = _offset + offset;
         int nulls = Bitmap.CountNulls(_validity, absoluteOffset, length);
         return new ManagedFixedWidthColumnVector<T>(Type, _data, _validity, absoluteOffset, length, nulls);
@@ -187,6 +194,12 @@ public sealed class ManagedFixedWidthColumnVector<T> : MutableColumnVector
         if (!_mutable)
         {
             throw new InvalidOperationException("This vector is a read-only slice and cannot be modified.");
+        }
+
+        if (_sealed)
+        {
+            throw new InvalidOperationException(
+                "This vector has been sliced and is now sealed; build a vector fully before slicing it.");
         }
     }
 

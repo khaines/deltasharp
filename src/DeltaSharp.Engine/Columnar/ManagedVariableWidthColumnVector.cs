@@ -18,6 +18,7 @@ public sealed class ManagedVariableWidthColumnVector : MutableColumnVector
     private int _dataLength;
     private int _nullCount;
     private readonly bool _mutable;
+    private bool _sealed;
 
     /// <summary>Creates an empty, mutable variable-width vector for <paramref name="type"/>.</summary>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="capacity"/> is negative.</exception>
@@ -81,6 +82,12 @@ public sealed class ManagedVariableWidthColumnVector : MutableColumnVector
     {
         CheckIndex(index);
         int physical = _offset + index;
+        if (!Bitmap.Get(_validity, physical))
+        {
+            // A null row carries no value; the contract returns empty (use IsNull to distinguish).
+            return default;
+        }
+
         int start = _offsets[physical];
         int end = _offsets[physical + 1];
         return _data.AsSpan(start, end - start);
@@ -90,6 +97,11 @@ public sealed class ManagedVariableWidthColumnVector : MutableColumnVector
     public override ColumnVector Slice(int offset, int length)
     {
         CheckRange(offset, length);
+
+        // See ManagedFixedWidthColumnVector.Slice: sealing keeps the shared offsets/data/validity
+        // buffers safe against post-slice mutation of this owner.
+        _sealed = true;
+
         int absoluteOffset = _offset + offset;
         int nulls = Bitmap.CountNulls(_validity, absoluteOffset, length);
         return new ManagedVariableWidthColumnVector(Type, _offsets, _data, _validity, absoluteOffset, length, nulls);
@@ -180,6 +192,12 @@ public sealed class ManagedVariableWidthColumnVector : MutableColumnVector
         if (!_mutable)
         {
             throw new InvalidOperationException("This vector is a read-only slice and cannot be modified.");
+        }
+
+        if (_sealed)
+        {
+            throw new InvalidOperationException(
+                "This vector has been sliced and is now sealed; build a vector fully before slicing it.");
         }
     }
 

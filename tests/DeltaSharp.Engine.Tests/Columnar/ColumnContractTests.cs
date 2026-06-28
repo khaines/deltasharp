@@ -23,10 +23,12 @@ public class ColumnContractTests
         Type[] contracts =
         {
             typeof(ColumnVector), typeof(MutableColumnVector), typeof(ColumnBatch), typeof(SelectionVector),
+            typeof(ColumnVectors),
         };
         foreach (Type contract in contracts)
         {
-            foreach (MemberInfo member in contract.GetMembers(BindingFlags.Public | BindingFlags.Instance))
+            foreach (MemberInfo member in contract.GetMembers(
+                BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static))
             {
                 foreach (Type referenced in MemberTypes(member))
                 {
@@ -94,6 +96,11 @@ public class ColumnContractTests
                 break;
             case PropertyInfo property:
                 yield return property.PropertyType;
+                foreach (ParameterInfo indexParameter in property.GetIndexParameters())
+                {
+                    yield return indexParameter.ParameterType;
+                }
+
                 break;
         }
     }

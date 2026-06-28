@@ -32,7 +32,10 @@ These contracts live in the unshipped `DeltaSharp.Engine` assembly under
 All indices are **logical**: row `0` is the first row of a vector's view, regardless of any
 physical `Offset` into shared buffers. A `Slice(offset, length)` returns a view over the **same**
 buffers — no value or validity bytes are copied — with a consistent `Length`, `Offset`, and
-validity at each corresponding row (AC2). Typed bulk access (`GetValues<T>()`) returns the
+validity at each corresponding row (AC2). Because a slice shares the owner's buffers, **slicing
+seals the owner**: a mutable vector is built fully, then sliced/read, and any attempt to mutate it
+after slicing throws (rather than silently corrupting outstanding slices via a stale null count or
+an append-triggered buffer reallocation). Typed bulk access (`GetValues<T>()`) returns the
 offset-adjusted span for the slice's own `[0, Length)`, so kernels never do offset arithmetic.
 
 ### Typed access without per-row boxing (AC1)

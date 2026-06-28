@@ -69,7 +69,16 @@ public abstract class ColumnVector
     /// <exception cref="InvalidOperationException">The element type is not <typeparamref name="T"/>.</exception>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="index"/> is outside <c>[0, Length)</c>.</exception>
     public virtual T GetValue<T>(int index)
-        where T : unmanaged => GetValues<T>()[index];
+        where T : unmanaged
+    {
+        ReadOnlySpan<T> values = GetValues<T>();
+        if ((uint)index >= (uint)values.Length)
+        {
+            throw new ArgumentOutOfRangeException(nameof(index), index, $"Index must be in [0, {values.Length}).");
+        }
+
+        return values[index];
+    }
 
     /// <summary>
     /// The raw bytes of the variable-width value at logical <paramref name="index"/> — UTF-8 for
