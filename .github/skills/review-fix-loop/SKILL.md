@@ -14,7 +14,7 @@ This skill automates the iterative cycle of reviewing a pull request, fixing dis
 
 Read all supporting files before beginning:
 
-- `.github/skills/review-pr/SKILL.md` — the review engine (Phases 1–8)
+- `.github/skills/review-pr/SKILL.md` — the review engine (Phases 1–9)
 - `.github/skills/review-pr/agent-map.md` — file → agent mapping
 - `.github/skills/review-pr/checklist-map.md` — file → checklist mapping
 - `.github/skills/review-pr/rating-rubric.md` — severity and rating definitions
@@ -27,9 +27,14 @@ Read all supporting files before beginning:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `max_rounds` | 5 | Maximum review-fix iterations before stopping |
-| `target_rating` | 5 | Minimum acceptable rating — a rubric **rating** (X/5), **not** the `APPROVE` action or council consensus. |
-| `auto_dismiss_low_consensus` | true | Auto-dismiss eligible 1/4 consensus findings after protected-domain checks |
+| `target_rating` | 5 | Minimum acceptable rating for the *termination* path — a rubric **rating** (X/5), **not** the `APPROVE` action or council consensus. **Does not relax the PASS/merge gate**, which always requires 5/5 (a `target_rating < 5` cannot satisfy "zero actionable findings"). |
+| `auto_dismiss_low_consensus` | true | Auto-dismiss eligible single-seat (`1/N`) low-consensus findings after protected-domain checks |
 | `auto_dismiss_out_of_diff` | true | Auto-dismiss findings referencing code not in the PR diff |
+
+> **Council shape (via `review-pr`).** Each round runs a **scout** (cheap routing), the 4 fixed
+> frontier lenses + up to **3 scout-selected specialist seats**, and a **decorrelated red-team
+> gate** that executes C7 repros. Termination is the **PASS gate**, not a bare rating — see
+> `review-pr/rating-rubric.md` (Rigor battery & the PASS gate).
 
 ---
 
@@ -113,13 +118,15 @@ If any halt marker has no matching closure comment, STOP. Surface a hard error l
 
 ### 2.1 Execute the Review
 
-Run the full `review-pr` skill pipeline (Phases 1–7) against the current state of the PR branch. Use the same complexity classification, agent selection, review mode, and checklist evaluation.
+Run the full `review-pr` skill pipeline — **Phases 1–8** (PR detection + complexity classification + scout → council → red-team gate), skipping only Phase 9 (GitHub Feedback) — against the current state of the PR branch. Use the same complexity classification, scout-driven agent selection (4 lenses + ≤3 specialists), review mode, checklist evaluation, and rigor battery.
 
-**Important**: Skip review-pr Phase 8 (GitHub Feedback) on ALL intermediate rounds. GitHub feedback is posted exclusively by this skill's Phase 6 (Final Report) after the loop terminates.
+**The red-team runs every round.** In round ≥2 its **fixer-diff re-review** treats every hunk changed since the previous round as newly-authored code and re-runs the full battery on it — this is what catches a **fix-induced regression in the same round it is introduced** (e.g. a fixer that widens a validator or adds a forgeable exemption). Fixer output is never pre-trusted.
+
+**Important**: Skip review-pr Phase 9 (GitHub Feedback) on ALL intermediate rounds. GitHub feedback is posted exclusively by this skill's Phase 6 (Final Report) after the loop terminates.
 
 ### 2.2 Collect Structured Findings
 
-Capture every finding from the review in structured format:
+Capture every finding from the review in structured format (the `review-pr` Finding Body Format Contract):
 
 ```json
 {
@@ -129,11 +136,15 @@ Capture every finding from the review in structured format:
   "line": 42,
   "finding": "Description of the issue",
   "recommendation": "Suggested fix",
-  "consensus": "4/4 | 3/4 | 2/4 | 1/4",
-  "models_flagging": ["opus", "sonnet", "gpt", "gemini"],
+  "evidence": "ran `<cmd>` → <output>  |  verified by reading <file:line>",
+  "consensus": "k/N (N = 4 lenses + scout-selected specialists that reviewed this file)",
+  "models_flagging": ["<seat>", "..."],
+  "source": "voting-seat | red-team",
   "in_pr_diff": true
 }
 ```
+
+Also record the **red-team verdict** for the round (`MISS-FOUND | NO-MISS-CERTIFIED | provisional | n/a`) and, when `NO-MISS-CERTIFIED`, the **orchestrator's independent re-run** of a sampled C7 repro (command + output) that confirmed it — the gate (Phase 3) requires this self-verification before the loop may terminate.
 
 ### 2.3 Record Round Results
 
@@ -164,11 +175,11 @@ For every finding, apply the dismissal rules in priority order to classify it as
 
 **Stop the loop** if ANY of these are true:
 
-1. **Target rating achieved** — the current rating meets or exceeds `target_rating` AND there are no remaining Critical or High actionable findings. Proceed to Phase 6.
+1. **Gate PASS achieved** (per `review-pr/rating-rubric.md` → Rigor battery & the PASS gate) — every voting seat (4 lenses + each specialist) at **5/5** (the PASS gate requires 5/5 unconditionally — `target_rating` only relaxes the separate sub-target *termination* path, never this gate) **with a complete Approve attestation**, **zero** actionable findings, **zero open C1/C2/C4/C5/C6/C7 items**, and the red-team **`NO-MISS-CERTIFIED`** (decorrelated, C7-backed). A red-team `MISS-FOUND` never satisfies this — its findings are actionable; continue. Apply the **anti-impasse rule**: a seat at sub-target with no `file:line` finding is re-prompted once, then is an impasse — never terminate on a reinterpreted "rating with no findings". Proceed to Phase 6.
 2. **Max rounds reached** — `current_round >= max_rounds`. Proceed to Phase 6 with a note that the limit was hit.
 3. **No progress** — the count of actionable findings has not decreased from the previous round AND no findings were fixed. Proceed to Phase 6.
 
-> The gate is the rating, not the review action. `APPROVE` does not distinguish a 4/5 from a 5/5. Terminate on the explicit `{rating}/5 ⭐` value.
+> The gate is the **PASS gate** (battery + red-team), not the review action — `APPROVE` spans 4/5 and 5/5, and a sub-5/5 with no finding is incoherent (anti-impasse). Terminate only on a real, finding-justified `5/5 ⭐` for every seat **and** a C7-backed red-team `NO-MISS-CERTIFIED`.
 
 **Below-target with no actionable findings — DO NOT terminate without escalation.** Re-examine dismissed High+ findings and all deferred findings. If any deferral or dismissal is weak, reclassify as actionable and continue fixing. If all are legitimate, terminate with a detailed rationale.
 
@@ -239,11 +250,11 @@ After all agents complete:
 
 ### 5.1 Stage and Commit
 
-Stage all fixed files and commit with a descriptive message:
+Stage all fixed files and commit with a descriptive, **DCO-signed** message. Every fix commit MUST be signed off (`-s`) — the repo's `dco` required check fails unsigned commits, so an unsigned fix commit would prevent the loop from ever reaching green CI:
 
 ```text
 git add {fixed_files}
-git commit -m "Review fixes (Round {N}): Address {count} findings
+git commit -s -m "Review fixes (Round {N}): Address {count} findings
 
 Fixed:
 - {finding.id}: {brief description} ({file})
@@ -251,6 +262,8 @@ Fixed:
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
+
+`git commit -s` appends the `Signed-off-by:` trailer; keep the `Co-authored-by: Copilot` trailer as well.
 
 ### 5.2 Push
 
@@ -277,7 +290,7 @@ Return to **Phase 2** for the next review round. Increment the round counter.
 
 ### 6.1 Execute Final Review
 
-Regardless of termination reason, run one final review-pr pass (including Phase 8 — GitHub Feedback) to post the conclusive review to the PR. If the loop exited due to `max_rounds` or `no_progress`, include a note in the review body explaining why the loop stopped and listing any actionable findings that remain unresolved.
+Regardless of termination reason, run one final review-pr pass (including Phase 9 — GitHub Feedback) to post the conclusive review to the PR. If the loop exited due to `max_rounds` or `no_progress`, include a note in the review body explaining why the loop stopped and listing any actionable findings that remain unresolved.
 
 Immediately after the final review pass completes, capture:
 
@@ -383,6 +396,16 @@ Procedure:
 7. On hard-error termination, post a sticky PR comment with marker `<!-- deltasharp-rfl-halt pr={pr_number} head={post_fix_head} reason=<short_slug> -->` and require a closure marker before a future invocation proceeds.
 8. Only after every required check is passing may the loop be declared terminated.
 
+### 6.7 Fold-forward (council learning)
+
+After the final round, capture the **miss-classes** the red-team (or a later round) caught that
+the voting seats missed, in the progression report's findings sections. When a miss-class recurs
+— or an external/frontier review or a later bug catches something this council missed — **fold
+the class forward**: sharpen the matching gate in `review-pr/rigor-battery.md` (C1–C7), the
+red-team's hunt list in `review-pr/red-team.md`, and/or the relevant checklist, and add a row to
+[`regression/README.md`](regression/README.md). Fix the *class*, not just the instance. (Do not
+commit per-run scratch logs to the repo — that is itself a C6 hygiene miss.)
+
 ---
 
 ## Important Notes
@@ -405,7 +428,7 @@ Procedure:
 ### Pre-Merge Checklist (ALL required before a PR is merge-ready)
 
 1. Full multi-model council RFL completed.
-2. `target_rating`⭐ rating (default 5/5) achieved, or below-target with all deferrals verified legitimate and tracked as GitHub issues.
+2. **PASS gate met** (`review-pr/rating-rubric.md`): every voting seat 5/5, zero actionable findings, zero open C1/C2/C4/C5/C6/C7 items, and a **decorrelated red-team `NO-MISS-CERTIFIED`** that the orchestrator **independently re-verified** (re-ran a sampled C7 repro). A loop that merely *stopped* below target (with verified deferrals) is **not** merge-ready — that requires an explicit, documented human waiver recorded on the PR. `target_rating` governs only the termination path, never the merge gate.
 3. Triage verification completed for any round with 5+ dismissals or any dismissed findings in protected domains.
 4. Dismissed findings audited and real items tracked as backlog issues.
 5. Full progression report posted as a PR comment with council composition audit and verified URL.

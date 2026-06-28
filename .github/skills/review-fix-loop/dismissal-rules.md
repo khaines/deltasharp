@@ -24,7 +24,7 @@ This document defines when a finding from the `review-pr` skill should be **dism
 
 ### 2. Low Consensus (Single Model)
 
-**Rule**: Dismiss non-Critical findings flagged by only 1 model when the full council (4/4 models) participated, **unless the finding touches a protected domain** (see §2.1 below). Apply stricter thresholds when the council is degraded.
+**Rule**: Dismiss non-Critical findings flagged by only **1 of the `N` eligible voting seats** (`N` = 4 fixed lenses + scout-selected specialists; see `review-pr/rating-rubric.md` → Consensus Scoring) when the full council participated, **unless the finding touches a protected domain** (see §2.1 below). The thresholds below are written for the canonical `N=4` lens-only council (`1/4`, `3/4`, …); for a larger `N`, read `1/4` as "single seat (`1/N`)" and scale the fractions proportionally. Apply stricter thresholds when the council is degraded.
 
 **Rationale**: A 1/4 consensus finding has a high probability of being a false positive, a subjective style preference, or a pattern disagreement rather than a genuine issue. The multi-model council's power comes from convergence — single-model findings lack that validation. However, when fewer models participate, the consensus denominator shrinks and the signal-to-noise ratio of single-model findings increases.
 
@@ -120,7 +120,9 @@ Findings in the following domains are **never auto-dismissed** based on low cons
 
 ## Dismissal Priority Order
 
-When evaluating a finding, apply dismissal rules in this order. Stop at the first match:
+**A red-team `MISS-FOUND` finding is never dismissed** — it is actionable and blocking by
+construction, closed only by a fix or by the red-team re-certifying `NO-MISS-CERTIFIED`. For all
+other findings, apply dismissal rules in this order. Stop at the first match:
 
 1. **Critical safety net** — If severity is Critical, skip ALL dismissal rules and investigate manually. Critical findings are never auto-dismissed.
 2. **Protected domain safety net** — If the finding touches a protected domain (§2.1), skip low-consensus auto-dismissal.
