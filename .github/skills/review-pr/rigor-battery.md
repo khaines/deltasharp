@@ -25,6 +25,9 @@ reading" never clears a C7-eligible claim.**
   enforced by the consumer (no "validator accepts CIDR/glob/trimmed, consumer does exact
   match"); every exemption/allowlist matches exactly the intended set (not forgeable, not
   over-broad).
+- **Reflexive:** this anti-forgeability rule applies to the **council's own signals** too — a
+  `NO-MISS-CERTIFIED`, a Mandatory-Checks attestation, or a quoted C7 output is a self-asserted
+  signal and must not be trusted without independent re-execution (see C7 and the PASS gate).
 - Auth/ordering: checks run before the work they guard; no pre-auth bypass.
 
 ## C3 — Observability & SRE behavior
@@ -66,22 +69,29 @@ For any **enforcement**, **validation↔enforcement parity**, **rollout-compat**
 **migration-note**, or **test-efficacy** claim, a reviewer (mandatorily the red-team) **runs**
 a repro and records the **command + observed output**:
 
-- run the targeted test/build/format/script on the repo as-is, or build a throwaway repro
-  **outside the worktree** (`d=$(mktemp -d)` …; `rm -rf "$d"` when done);
-- examples: execute the gate/script the PR claims works and capture the exit code; delete or
-  invert the symbol a "coverage" test claims to cover (in a throwaway copy) and confirm the
-  test **fails**; call the real constructor/loader/consumer with every form the validator
-  accepts and capture the literal outcome; load the old config/shape through the real loader.
+- **Treat PR-authored code as untrusted.** Building/running PR-supplied code executes attacker-
+  controlled code as the reviewer's process. Run any repro that builds or executes PR code in an
+  isolated context — a throwaway dir **outside the worktree**, with guaranteed cleanup and, where
+  possible, no ambient credentials/network: `d=$(mktemp -d); trap 'rm -rf "$d"' EXIT`. Reserve
+  "run on the repo as-is" for *non-executing / trusted-base* operations (format/lint, link greps,
+  building unchanged base), not for running PR-authored build/test logic;
+- examples: execute the gate/script the PR claims works and capture the exit code; delete or invert
+  the symbol a "coverage" test claims to cover (in a throwaway copy) and confirm the test **fails**;
+  call the real constructor/loader/consumer with every form the validator accepts and capture the
+  literal outcome; load the old config/shape through the real loader;
 - **never** modify tracked files, commit, or push.
 
-A C7-eligible claim with no executed evidence **blocks** approval/certification. This gate
-exists because static reading repeatedly missed defects that *passed green CI* — vacuous tests,
+A C7-eligible claim with no executed evidence **blocks** approval/certification. This gate exists
+because static reading repeatedly missed defects that *passed green CI* — vacuous tests,
 validator↔consumer mismatches, and migration notes whose stated behavior the code contradicted.
+Because the red-team's quoted C7 output is itself a self-asserted signal, the orchestrator
+independently re-runs a sampled repro before trusting `NO-MISS-CERTIFIED` (see `rating-rubric.md`).
 
 ---
 
 ### How the gates map to the PASS decision
 
 `rating-rubric.md` defines the gate: **PASS** requires every voting seat at 5/5, zero
-actionable findings, **zero open C1 / C2 / C4 / C5 / C7 items**, and a red-team
-`NO-MISS-CERTIFIED` backed by executed C7 repros. A red-team `MISS-FOUND` always blocks.
+actionable findings, **zero open C1 / C2 / C4 / C5 / C6 / C7 items** (C3 observability is enforced
+via CI + the red-team), and a red-team `NO-MISS-CERTIFIED` backed by executed C7 repros and
+independently re-verified by the orchestrator. A red-team `MISS-FOUND` always blocks.

@@ -38,10 +38,12 @@ Never write this under a tracked path.
 
 ## Miss-class ledger (curated — append when a class is folded forward)
 
-| Date | Miss-class | Caught by | Folded into |
-|------|-----------|-----------|-------------|
-| 2026-06-28 | Reviewer withheld a star for inability to *execute* (file-view-only seat) → incoherent "4/5 with zero findings" | Human | rigor-battery C7 (shell-capable red-team mandatory); rating-rubric anti-impasse rule; red-team must use `general-purpose` |
-| 2026-06-28 | Fix-induced regression: a fixer introduced a *forgeable* DCO bot-exemption (trusted client-settable author email) — caught a round late | Council R2 | red-team fixer-diff + C2 validation↔enforcement-parity hunt (catch in-round) |
+| Date (UTC) | PR | Miss-class | Caught by | Folded into |
+|------------|-----|-----------|-----------|-------------|
+| 2026-06-28 | #323 | Reviewer withheld a star for inability to *execute* (file-view-only seat) → incoherent "4/5 with zero findings" | Human | rigor-battery C7 (shell-capable red-team mandatory); rating-rubric anti-impasse rule; red-team must use `general-purpose` |
+| 2026-06-28 | #323 | Fix-induced regression: a fixer introduced a *forgeable* DCO bot-exemption (trusted client-settable author email) — caught a round late | Council R2 | red-team fixer-diff + C2 validation↔enforcement-parity hunt (catch in-round) |
+| 2026-06-28 | #324 | Council trusted its own forgeable self-asserted signals (`NO-MISS-CERTIFIED` / attestation / quoted C7 output) — the #323 class reflexively | Dogfood council (Security) | rating-rubric PASS gate: orchestrator independently re-runs a sampled C7 repro; rigor-battery C2 reflexive bullet |
+| 2026-06-28 | #324 | Process self-consistency: red-team output format broke the loop parser; fix-commit template lacked `-s` (DCO); `.gitignore` lacked `.rfl-*` | Dogfood council + red-team | canonical severities in `red-team.md`; `git commit -s` template; `.gitignore .rfl-*` |
 
 > When you add a row, also update the battery / red-team hunt list so the gate — not just the
 > ledger — enforces it.

@@ -82,19 +82,22 @@ This document defines the scoring system, severity definitions, and consensus al
 
 ## Finding Body Format Contract
 
-When a council reviewer emits a finding into a PR comment or council report, the quoted-finding line MUST use the following parenthesised-prefix format:
+When a council reviewer emits a finding into a PR comment or council report, the quoted-finding line MUST use the following parenthesised-prefix format, and EVERY finding MUST carry a `file:line` anchor and an `EVIDENCE:` clause:
 
 ```text
 **Finding ({Severity}, {ReviewerSlot} {Round}):** <finding text>
+- File: path:line
+- Recommendation: <fix>
+- EVIDENCE: "ran `<cmd>` → <output>" (required for C7-eligible claims) or "verified by reading <file:line>"
 ```
 
-- `{Severity}` — one of `Critical | High | Medium | Low | Info`.
-- `{ReviewerSlot}` — one of `Architect | Balanced | Quality | Security` or another slot label this skill defines.
+- `{Severity}` — one of `Critical | High | Medium | Low | Info`. **All voting seats AND the red-team use this same set** (the red-team does NOT use `blocking/major/minor`).
+- `{ReviewerSlot}` — one of `Architect | Balanced | Quality | Security | Red-Team`, a scout-selected specialist's domain label, or another slot label this skill defines.
 - `{Round}` — `R{N}` where `N` is the 1-based review-fix round index.
 
 **Example:** `**Finding (High, Architect R1):** Physical planner drops the required shuffle before hash aggregation.`
 
-This is a stable contract consumed by `review-fix-loop` validation. Any change to this format MUST be made in lockstep with that consumer.
+This is a stable contract consumed by `review-fix-loop` validation. Any change to this format MUST be made in lockstep with that consumer. The drop-rule (see "Approve attestation") removes only findings that carry **neither** a `file:line` anchor **nor** any EVIDENCE clause — a well-formed finding is never dropped.
 
 ---
 
@@ -117,16 +120,20 @@ Reviewers must explicitly consider these correctness dimensions when applicable:
 
 ## Multi-Model Consensus Scoring
 
-When the `review-pr` skill runs in **multi-model council mode** (4 models reviewing the same PR independently), each finding is tagged with a consensus label derived from how many models flagged the same issue.
+When the `review-pr` skill runs in **multi-model council mode**, each finding is tagged with a consensus label derived from how many of the **`N` voting seats whose scope covered the relevant file/domain** flagged the same issue. `N = 4 fixed lenses + each scout-selected specialist seat` (so `N` is 4–7). Consensus is computed **per finding** over the seats eligible to see it (a specialist scoped to a subset of files only counts toward findings in those files).
 
 ### Consensus Thresholds
 
-| Models Agreeing | Consensus Label | Confidence | Weight |
+Express agreement as a fraction `k/N` of eligible voting seats and map by ratio:
+
+| Agreement `k/N` | Consensus Label | Confidence | Weight |
 |-----------------|-----------------|------------|--------|
-| 4/4 | ✅ **Unanimous** | Very High | 1.0× severity |
-| 3/4 | ✅ **High consensus** | High | 1.0× severity |
-| 2/4 | ⚠️ **Split** | Moderate | 0.75× severity |
-| 1/4 | ⚠️ **Low consensus** | Low | 0.5× severity |
+| = `N/N` | ✅ **Unanimous** | Very High | 1.0× severity |
+| ≥ ~⅔ of `N` | ✅ **High consensus** | High | 1.0× severity |
+| ~½ of `N` | ⚠️ **Split** | Moderate | 0.75× severity |
+| single seat (`1/N`) | ⚠️ **Low consensus** | Low | 0.5× severity |
+
+(For the canonical 4-lens council with no specialists, `N=4`, i.e. 4/4, 3/4, 2/4, 1/4. The `models_flagging` list in the `review-fix-loop` structured finding is variable-length, one entry per eligible seat that flagged the finding.)
 
 ### Consensus Rules
 
@@ -265,26 +272,42 @@ and the red-team verdict.
 
 **PASS** requires ALL of:
 
-- every voting seat (4 lenses + each scout-selected specialist) at **5/5**, with a complete
-  Approve attestation (below);
-- **zero actionable** (blocking/major) findings open;
-- **zero open C1 / C2 / C4 / C5 / C7 items** — no proven-vacuous test, no dead/un-wired control
-  or validation↔enforcement gap, no unbacked PR/spec claim, no unmigrated compat break, and no
-  execution-eligible claim lacking executed evidence;
-- red-team **`NO-MISS-CERTIFIED`**, backed by executed C7 repros, on a decorrelated frontier
-  family (same-family certification is provisional for protected-domain changes).
+- every voting seat (the 4 lenses + each scout-selected specialist) at **5/5**, with a complete
+  Approve attestation (below). **The PASS gate requires 5/5 unconditionally; `target_rating` does
+  not relax it** — `target_rating` only governs the separate "below-target-with-verified-deferrals"
+  termination path in `review-fix-loop`, and any `target_rating < 5` cannot satisfy "zero
+  actionable" below (a sub-5/5 implies ≥1 actionable High);
+- **zero actionable** (Critical/High) findings open;
+- **zero open C1 / C2 / C4 / C5 / C6 / C7 items** — no proven-vacuous test, no dead/un-wired
+  control or validation↔enforcement gap, no unbacked PR/spec claim, no unmigrated compat break, no
+  committed scratch/cruft, and no execution-eligible claim lacking executed evidence. (C3
+  observability is enforced via CI + the red-team rather than the seat-gate.)
+- red-team **`NO-MISS-CERTIFIED`** — **and the orchestrator has independently re-run at least one
+  sampled C7 repro from the red-team's evidence block and confirmed the quoted output**, because the
+  council's own `NO-MISS-CERTIFIED` / attestations / quoted C7 output are **self-asserted signals**
+  and therefore subject to the same C2 anti-forgeability rule the council applies to reviewed code
+  (never trust a self-settable signal — the #323 class, applied reflexively);
+- the certifying red-team ran on a **decorrelated** frontier family. A **same-family (provisional)
+  certification does NOT satisfy PASS for protected-domain changes** — it blocks termination pending
+  a decorrelated re-run or a documented human waiver recorded in the composition audit.
 
 **Green CI is necessary but not sufficient** — C1/C2/C7 routinely catch defects that pass green
 CI (vacuous tests, validator↔consumer mismatches, migration notes the code contradicts).
 
 ## Decorrelated red-team gate
 
-- The red-team runs **last** and on a **frontier family distinct from the majority voting
-  spine**. A red-team `MISS-FOUND` **always blocks** — its findings are actionable, blocking 5/5
-  items.
+- The red-team runs **last** on a frontier family **distinct from the majority voting spine**, and
+  **ideally a family used by no voting seat** (true decorrelation). If the spine is Opus + GPT, use
+  Gemini — do **not** dispatch the red-team on a family a voting seat already uses (e.g. don't use
+  `gpt-5.5` while the Quality lens is `gpt-5.5`). A red-team `MISS-FOUND` **always blocks** — its
+  findings are actionable, in the canonical `Critical|High|Medium|Low|Info` set (the red-team does
+  not emit `blocking/major/minor`).
 - `NO-MISS-CERTIFIED` is valid only with a fully-populated Falsification-Attempts block and a C7
-  line quoting real commands + output for every execution-eligible claim. A bare "no issues", or
-  a "verified by reading" on a C7-eligible claim, is rejected (re-prompt once).
+  line quoting real commands + output for every execution-eligible claim, AND the orchestrator's
+  independent re-run of a sampled C7 repro (above) must match. A bare "no issues", or a "verified
+  by reading" on a C7-eligible claim, is rejected and **re-prompted once**; if the second attempt is
+  still non-conformant, certification is **denied** and the gate cannot PASS (treat as `MISS-FOUND`
+  / escalate to a human).
 - Protected domains (security / tenant isolation / auth / data integrity / Delta commit / query
   correctness / privacy) may not be dismissed without an explicit `protected-domain assessment:
   none`.

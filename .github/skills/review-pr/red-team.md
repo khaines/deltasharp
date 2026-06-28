@@ -16,11 +16,12 @@ manufactures the independent, adversarial error-checking that constructive revie
 ## Dispatch — decorrelation + shell are mandatory
 
 - **Different frontier family.** Run the red-team on a frontier family **distinct from the
-  majority of the voting seats**, so it does not share their blind spots. If the voting
-  spine is mostly Claude Opus, run the red-team on `gpt-5.5` or `gemini-3.1-pro-preview`
-  (and vice-versa). Record which model gated. A red-team on the *same* family as the seats
-  is **provisional** for Complex protected-domain changes — say so and recommend a
-  decorrelated re-run.
+  majority of the voting seats, and ideally a family no voting seat uses at all** — so it does
+  not share their blind spots. If the spine is Opus + GPT (the Quality lens is `gpt-5.5`), use
+  **`gemini-3.1-pro-preview`**; do **not** reuse a voting seat's family (e.g. `gpt-5.5`) as the
+  red-team. Record which model gated. A red-team on the *same* family as the majority spine is
+  **provisional** and does **not** satisfy the gate for protected-domain changes — say so and
+  require a decorrelated re-run or a documented human waiver.
 - **Shell-capable, always.** The red-team MUST hold a real shell to run C7 repros. Dispatch
   it with `agent_type: general-purpose` (full CLI tools) — **never** a file-view-only
   persona agent. (A reviewer that cannot execute cannot certify; a file-view-only seat that
@@ -75,31 +76,42 @@ do not reason about them.
    Confirm each "fixed" finding by re-deriving its check (mutation test, parity check, wiring
    trace, compat check), not by trusting the fixer's claim.
 5. **Execute the C7 repros (mandatory — you hold a shell).** For every enforcement /
-   validation↔enforcement parity / rollout-compat / migration-note / test-efficacy claim in
-   the diff, *run* a repro and record the **command + observed output** — never infer it:
-   - run the targeted test/build/format on the repo as-is (`dotnet test --filter …`,
-     `dotnet build -c Release`, `dotnet format --verify-no-changes`), or build a throwaway
-     repro **outside the worktree** (`d=$(mktemp -d)`; a tiny program/test that exercises the
-     change);
-   - examples: execute the script/gate the PR claims works and capture the exit code; in a
-     throwaway copy delete or invert the production symbol a "coverage" test claims to cover
-     and confirm the test then **fails**; feed every form a validator accepts through the real
-     consumer; load the old config/shape through the real loader and capture the literal
-     outcome;
-   - **never modify tracked files, commit, or push** — `rm -rf "$d"` when done.
+   validation↔enforcement parity / rollout-compat / migration-note / test-efficacy claim in the
+   diff, *run* a repro and record the **command + observed output** — never infer it.
+   **Trust boundary: treat PR-authored code as untrusted.** Building or running PR-supplied code
+   (`dotnet build/test`, MSBuild targets, source generators, the PR's scripts) executes attacker-
+   controlled code as your process, with whatever ambient credentials/network the host has. So:
+   - **Default path — isolate.** Run any repro that builds or executes PR-supplied code in an
+     isolated context: a throwaway dir **outside the worktree** with **guaranteed cleanup** and, where
+     possible, **no ambient credentials / no network** — `d=$(mktemp -d); trap 'rm -rf "$d"' EXIT` —
+     e.g. a tiny program/test that exercises the change, run with a scrubbed environment.
+   - **Trusted-base only, on the repo as-is.** Reserve "run on the repo as-is" for *non-executing or
+     trusted-base* operations — `dotnet format --verify-no-changes`, link/numbering greps, or building
+     **unchanged** base code — not for running PR-authored build/test logic.
+   - examples: execute the script/gate the PR claims works and capture the exit code; in a throwaway
+     copy delete or invert the production symbol a "coverage" test claims to cover and confirm the test
+     then **fails**; feed every form a validator accepts through the real consumer; load the old
+     config/shape through the real loader and capture the literal outcome;
+   - **never modify tracked files, commit, or push.** Cleanup is the `trap … EXIT` above so it runs
+     even on crash/timeout.
 
 ## Output (required)
 
 ```
 ## Red-Team Result
 VERDICT: MISS-FOUND | NO-MISS-CERTIFIED
-Gated by: <model> (family: <…>; decorrelated vs voting spine: yes|no → if no, certification is PROVISIONAL)
+Gated by: <model> (family: <…>; decorrelated vs voting spine: yes|no → if no, certification is PROVISIONAL and does NOT satisfy the gate for protected-domain changes)
 
 ## New findings (issues the voting seats missed)
-1. [blocking|major|minor] `file:line` [checklist: <ID|none>] — what they missed — why it
-   matters — fix — EVIDENCE: "ran `<cmd>` → <output>" (required for C7 claims) or
-   "verified by reading <file:line>".
-   (write "none" if truly none)
+Use the canonical Finding Body Format Contract (`rating-rubric.md`) — the same
+`Critical|High|Medium|Low|Info` severities as the voting seats, NOT blocking/major/minor:
+
+**Finding ({Severity}, Red-Team R{N}):** <what they missed — why it matters>
+- File: `file:line`   [checklist: <ID|none>]
+- Recommendation: <fix>
+- EVIDENCE: "ran `<cmd>` → <output>" (required for C7-eligible claims) or "verified by reading <file:line>"
+
+(write "zero new findings" if truly none)
 
 ## Falsification attempts (mandatory — what you tried)
 - vacuous/false-coverage test scan: <files examined → result>
@@ -122,6 +134,10 @@ You may emit `NO-MISS-CERTIFIED` **only** if the Falsification-Attempts block is
 populated with concrete attempts **and** the C7 line quotes real commands + output for every
 enforcement / parity / compat / migration / efficacy claim in the diff. A bare "no issues",
 or a C7 line that says "verified by reading" for a C7-eligible claim, is rejected — you are
-re-prompted once. Any miss → `MISS-FOUND`, and it becomes an **actionable, blocking** finding
-that the loop must fix. You review only: never modify tracked files, commit, or post — but you
-**must** run sandboxed read-only repros (C7) and discard them when done.
+**re-prompted once**; if the second attempt is still non-conformant, your certification is
+**denied** and the gate cannot PASS (the orchestrator treats it as `MISS-FOUND` / escalates).
+Note that the orchestrator will **independently re-run a sampled C7 repro** from your evidence and
+confirm the output before trusting `NO-MISS-CERTIFIED` — your quoted output is a self-asserted
+signal. Any miss → `MISS-FOUND`, and it becomes an **actionable, blocking** finding the loop must
+fix. You review only: never modify tracked files, commit, or post — but you **must** run sandboxed
+read-only repros (C7) and discard them when done.

@@ -87,6 +87,12 @@ dotnet test --filter "Name=Select_ProjectsColumns"
    pass, and commits are DCO-signed.
 4. A maintainer review is required to merge.
 
+> **What happens after you open a PR.** An automated AI review council (the "RFL" — a scout, a
+> multi-model council, and a decorrelated red-team gate) may comment on your PR with a structured
+> report (`PASS` / `MISS-FOUND`, severities, and `C1–C7` rigor checks). It is **advisory** and helps
+> reviewers — it **never merges**; humans decide. You don't need to do anything special for it; just
+> keep your commits DCO-signed and address the findings you agree with.
+
 ## Design changes, ADRs, and RFCs
 
 - **Architecture Decision Records (`docs/adr/`)** record foundational decisions.

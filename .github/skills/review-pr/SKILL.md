@@ -10,7 +10,7 @@ description: >-
 
 # PR Review Skill — Orchestration Instructions
 
-Execute the following 9-phase pipeline to produce a thorough, actionable pull request review. Read all supporting files from this skill directory before beginning.
+Execute the following phased pipeline (Phase 1 → 1.6 scout → 2–7 council → 8 red-team gate → 9 feedback) to produce a thorough, actionable pull request review. Read all supporting files from this skill directory before beginning.
 
 ---
 
@@ -151,12 +151,12 @@ Dispatch **4 parallel reviews** using the `task` tool. Each slot has a fixed **r
 | **Architect** | Deep reasoning — architecture implications, subtle bugs, design flaws | `claude-opus-4.8` (effort high/max) | `general-purpose`, `cloud-native-distributed-systems-architect`, `query-execution-engine-engineer`, `delta-storage-format-engineer`, `data-platform-connectors-engineer` |
 | **Balanced** | Code quality, patterns, maintainability, operational pragmatism | `claude-opus-4.8` (effort high/max) | `general-purpose`, `dotnet-framework-runtime-engineer`, `cloud-native-site-reliability-engineer`, `developer-experience-api-engineer` |
 | **Quality** | Testability, measurability, reliability, alternative pattern recognition | `gpt-5.5` (effort high) | `general-purpose`, `reliability-test-chaos-engineer`, `performance-benchmarking-engineer`, `technical-writer` |
-| **Security** | Tenant isolation, auth bypass, injection, supply-chain, cryptographic correctness, privacy/compliance | `claude-opus-4.8` (effort high/max) | `cloud-native-security-sme`, `privacy-compliance-grc-lead` |
+| **Security** | Tenant isolation, auth bypass, injection, supply-chain, cryptographic correctness, privacy/compliance | `claude-opus-4.8` (effort high/max) | `cloud-native-security-sme`, `privacy-compliance-grc-lead`, `general-purpose` |
 
 > **Models track the newest top-tier of each family** — currently Claude **Opus 4.8** (in place
 > of older Opus 4.7 / Sonnet 4.6) for the deep / balanced / security lenses, and **GPT-5.5** for
-> Quality. Update these as families advance. The red-team (Phase 8) runs on a **third** family
-> for decorrelation.
+> Quality. Update these as families advance. The red-team (Phase 8) runs on a family **distinct
+> from the majority spine and ideally used by no voting seat** (here: Gemini) — see Phase 8.
 
 **Models are fixed per slot.** Diverse pattern recognition across the council comes from the model mix; domain specialization comes from the per-slot `agent_type` choice.
 
@@ -167,12 +167,14 @@ scoped to its owned files + checklist IDs. The 4 lenses are the spine; specialis
 the domains the diff actually touches (Delta storage, query execution, operator, connectors, …).
 
 **Execution is mandatory for execution-eligible claims (C7).** Any seat verifying an enforcement /
-parity / compat / migration / test-efficacy claim must **run** a repro (see
-[`rigor-battery.md`](rigor-battery.md)) and quote command + output — "verified by reading" does
-not clear a C7-eligible claim. A seat that must execute MUST be dispatched **shell-capable**
-(`agent_type: general-purpose`, or another tool-capable type) — never a file-view-only persona
-that can only read. A seat that withholds judgment because it "couldn't run it" is a dispatch
-error, not a finding.
+parity / compat / migration / test-efficacy claim must either **run** a repro (see
+[`rigor-battery.md`](rigor-battery.md)) and quote command + output, or **explicitly defer the claim
+to the red-team** (the canonical C7 executor) — "verified by reading" does not clear a C7-eligible
+claim. A seat expected to execute MUST be dispatched **shell-capable** (`agent_type:
+general-purpose`, or another tool-capable type); a file-view-only persona seat may only review by
+reading and must defer every C7 claim. A seat that silently withholds judgment because it "couldn't
+run it" (instead of deferring, or being re-dispatched shell-capable) is a dispatch error, not a
+finding.
 
 **Selection rule for `agent_type`:**
 
@@ -403,25 +405,39 @@ For local-only reviews, omit the `**PR**:` line and `### PR Metadata` section. R
 
 ## Phase 8: Adversarial Red-Team Gate
 
-After the rating, dispatch the **red-team** (`.github/skills/review-pr/red-team.md`) — the
-council's gate-keeper. It runs **last**, on a **frontier family distinct from the majority voting
-spine** (if the spine is mostly Claude Opus, run the red-team on `gpt-5.5` or
-`gemini-3.1-pro-preview`), and **shell-capable** (`agent_type: general-purpose`).
+### Skip Condition (Simple changes)
+
+For a **Simple** review (scout says Simple) with **no execution-eligible claim** in the diff, run a
+single lightweight/inlined red-team pass — or skip it and record `red-team: n/a — Simple, no
+execution-eligible claim`. The **full decorrelated, shell-capable red-team is required for all
+Complex changes** and for any change touching a protected domain.
+
+After the rating, dispatch the **red-team** (`.github/skills/review-pr/red-team.md`) — the council's
+gate-keeper. It runs **last**, **shell-capable** (`agent_type: general-purpose`), on a frontier
+family **distinct from the majority voting spine and ideally used by no voting seat** (if the spine
+is Opus + GPT, use `gemini-3.1-pro-preview`; do not reuse a voting seat's family such as `gpt-5.5`).
 
 Give it the diff, the Review Package, and **every voting seat's full verdict + findings**. It
 assumes the PR is broken, tries to falsify the seats' approvals, hunts the council's historical
-miss-classes, and **executes C7 repros** (it does not reason about them). It returns:
+miss-classes, and **executes C7 repros** (it does not reason about them). It returns findings in the
+canonical `Critical|High|Medium|Low|Info` set and a verdict:
 
 - `MISS-FOUND` — with new findings (each `file:line` + EVIDENCE). These are **actionable and
   blocking**; in a fix-loop they go back to the fix phase.
-- `NO-MISS-CERTIFIED` — only valid with a **fully-populated Falsification-Attempts block** and a
-  C7 line quoting real commands + output for every execution-eligible claim. A bare "no issues"
-  is rejected — re-prompt once.
+- `NO-MISS-CERTIFIED` — only valid with a **fully-populated Falsification-Attempts block** and a C7
+  line quoting real commands + output for every execution-eligible claim. A bare "no issues" is
+  rejected and **re-prompted once**; if still non-conformant, certification is **denied** (treat as
+  `MISS-FOUND` / escalate).
 
-Record which model gated. If the red-team shares the voting spine's family (no decorrelated
-frontier available), its certification is **provisional** for Complex protected-domain changes —
-flag it and recommend a decorrelated re-run. The gate (`rating-rubric.md`) requires
-`NO-MISS-CERTIFIED`.
+**Independently verify before trusting the certification (anti-forgery).** The red-team's verdict,
+attestation, and quoted C7 output are self-asserted signals — before accepting `NO-MISS-CERTIFIED`
+the orchestrator MUST re-run at least one sampled C7 repro from its evidence block and confirm the
+output matches.
+
+Record which model gated. If the red-team shares the voting spine's family (no decorrelated frontier
+available), its certification is **provisional** and does **not** satisfy the gate for protected-
+domain changes — flag it and require a decorrelated re-run or a documented human waiver. The gate
+(`rating-rubric.md`) requires `NO-MISS-CERTIFIED`.
 
 ---
 
@@ -433,13 +449,15 @@ Skip this phase entirely if reviewing local-only changes with no GitHub PR. Outp
 
 ### 9.1 Determine Review Action
 
-Submit the review action that the rating maps to in the rating rubric's Overall Rating Scale:
+Submit the review action determined by **both** the rating and the Phase 8 red-team verdict:
 
-- **Rating 4–5** → submit as **APPROVE**.
-- **Rating 3** → submit as **COMMENT**.
-- **Rating 1–2** → submit as **REQUEST_CHANGES**.
+- A red-team **`MISS-FOUND`** (or a denied / withheld certification) → submit as **REQUEST_CHANGES**,
+  regardless of the rating. Never post `APPROVE` over an open red-team miss.
+- Otherwise (red-team `NO-MISS-CERTIFIED`, independently re-verified per Phase 8): **Rating 4–5** →
+  **APPROVE**; **Rating 3** → **COMMENT**; **Rating 1–2** → **REQUEST_CHANGES**.
 
-`APPROVE` is a review action, not a merge gate; the rating remains the quality signal.
+`APPROVE` is a review action, not a merge gate; the rating and red-team verdict together are the
+quality signal, and AI never merges.
 
 ### 9.2 Post the Review
 

@@ -10,7 +10,9 @@
 Run the scout with the `task` tool as a **cheap but capable frontier** model (it only
 reads/classifies — no deep reasoning needed):
 
-- Preferred models: `gemini-3.5-flash`, `gpt-5-mini`, or `claude-haiku-4.5`.
+- Preferred models: `gemini-3.5-flash`, `gpt-5-mini`, or `claude-haiku-4.5`. (These are real
+  `task`-tool model IDs; Gemini **flash** and **pro** tiers version independently — the scout's
+  `gemini-3.5-flash` and the red-team's `gemini-3.1-pro-preview` are both current, not a typo.)
 - `agent_type`: `explore` (read/grep/glob/bash) or `general-purpose`.
 - Always run the scout, even for small PRs — its Review Package is the audit record of
   *why* each seat was (or was not) selected. For a trivial 1–2 file docs-only change the
@@ -39,8 +41,11 @@ changed-file list.
    specialists whose path/content triggers match the changed files. For each give:
    `DOMAIN`, the `CANONICAL_SPEC` absolute path (`docs/persona/agents/<slug>-agent.md`),
    and the files it owns. **Confirm each spec file exists** (`ls`); drop any that don't.
-   The 4 fixed council lenses (Architect / Balanced / Quality / Security) are always
-   present — the roster is *additional* domain depth, not a replacement.
+   The 4 fixed council lenses (Architect / Balanced / Quality / Security) are always present —
+   the roster is *additional* domain depth, not a replacement. **Dedup:** do **not** list a
+   specialist whose persona is already the recommended `agent_type` of a fixed lens (step 5) —
+   that lens already provides the depth; pick the next-best distinct specialist or drop the slot
+   (a duplicate seat double-counts in consensus and wastes budget).
 4. **Map checklists per seat.** For each seat (4 lenses + specialists), list the
    `CHECKLIST_IDS` from `checklist-map.md` that apply to the changed files.
 5. **Recommend the per-lens `agent_type`.** For each of the 4 fixed lenses, pick the
