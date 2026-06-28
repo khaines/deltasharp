@@ -77,6 +77,11 @@ Because `DeltaSharp.Core` multi-targets `net8.0;net10.0`, both target frameworks
 analyzed against the same baseline files; keep the public surface identical across targets
 unless an ADR says otherwise.
 
+> **API stability states.** *What* is public (the baseline) is separate from *how stable* it
+> is. Marking a public API **experimental** or **obsolete** — and the `DS####` diagnostic-ID
+> registry — is governed by [api-lifecycle.md](api-lifecycle.md). Experimental members still
+> appear in `PublicAPI.Unshipped.txt` as ordinary lines; the lifecycle attribute lives in code.
+
 ## Banned APIs (STORY-01.5.2)
 
 The shared ban list lives at [`BannedSymbols.txt`](../../../BannedSymbols.txt) in the
@@ -144,8 +149,20 @@ Requirements for an exception:
 - **A new production assembly under `src/`:** it is governed by the banned-API policy
   automatically through the path-based `DeltaSharpIsProductionAssembly` gate.
 
+## API lifecycle (experimental and obsolete)
+
+Baselines record *what* is public; they do not record *how stable* it is. The
+**experimental / obsolete lifecycle** — the `[Experimental("DS####", …)]` and
+`[Obsolete(message, error)]` conventions, the four facts every experimental API documents
+(diagnostic ID, doc URL, owner, review point), and the **`DS####` diagnostic-ID registry** that
+keeps those IDs unique and traceable — lives in its own document:
+[**api-lifecycle.md**](api-lifecycle.md). Experimental members are tracked by PublicApiAnalyzers
+exactly like stable ones (an ordinary line in `PublicAPI.Unshipped.txt`); the attribute lives in
+code, and consuming such an API requires acknowledging its `DS####` diagnostic.
+
 ## References
 
+- [API lifecycle: experimental and obsolete](api-lifecycle.md)
 - [ADR-0001: Execution strategy](../../adr/0001-execution-strategy.md)
 - [ADR-0014: Target framework and AOT posture](../../adr/0014-target-framework-aot.md)
 - [03a — .NET coding standards checklist](../checklists/03a-dotnet-coding-standards.md)

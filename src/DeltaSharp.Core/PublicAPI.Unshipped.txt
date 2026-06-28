@@ -1,4 +1,6 @@
 #nullable enable
 DeltaSharp.DeltaSharpInfo
+static DeltaSharp.DeltaSharpInfo.PreviewReleaseChannel.get -> string!
 static DeltaSharp.DeltaSharpInfo.Product.get -> string!
+static DeltaSharp.DeltaSharpInfo.ProductName.get -> string!
 static DeltaSharp.DeltaSharpInfo.Version.get -> string!
