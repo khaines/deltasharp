@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Internal DeltaSharp engine assembly. Targets net10.0 only (ADR-0014): the
+    engine/executor seam may use the newest runtime and NativeAOT. Not packable, and
+    intentionally NOT referenced by the public net8.0 surface so a net8.0 consumer
+    never takes a net10.0-only dependency.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>DeltaSharp.Engine</RootNamespace>
+    <AssemblyName>DeltaSharp.Engine</AssemblyName>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+</Project>

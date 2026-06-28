@@ -1,0 +1,27 @@
+name: DCO
+
+# Verifies every commit in a pull request carries a Developer Certificate of Origin
+# `Signed-off-by` trailer (see CONTRIBUTING.md). Self-contained: no third-party
+# action is used, so there is no extra supply-chain surface to review.
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  dco:
+    name: dco
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify Signed-off-by trailers
+        run: ./tools/dco-check.sh
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}

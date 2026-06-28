@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Public, user-facing DeltaSharp API library. Multi-targets net8.0;net10.0
+    (ADR-0014) so current-LTS applications can consume DeltaSharp while the engine
+    runtime moves to net10.0. Packable. Must remain trim/AOT-annotation-clean.
+  -->
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <RootNamespace>DeltaSharp</RootNamespace>
+    <AssemblyName>DeltaSharp.Core</AssemblyName>
+    <IsPackable>true</IsPackable>
+    <PackageId>DeltaSharp.Core</PackageId>
+    <Description>Public API surface for DeltaSharp, a .NET-native reimplementation of Apache Spark. M1 skeleton — no engine or Delta behavior yet.</Description>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+</Project>
