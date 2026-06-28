@@ -11,8 +11,8 @@ public class DeltaSharpInfoTests
     }
 
     [Fact]
-    public void Version_IsNotNullOrWhiteSpace()
+    public void Version_StartsWithExpectedPrefix()
     {
-        Assert.False(string.IsNullOrWhiteSpace(DeltaSharpInfo.Version));
+        Assert.StartsWith("0.1", DeltaSharpInfo.Version);
     }
 }

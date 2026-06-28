@@ -1,3 +1,6 @@
+using System.Reflection;
+using System.Runtime.Versioning;
+
 namespace DeltaSharp.Engine;
 
 /// <summary>
@@ -11,7 +14,12 @@ namespace DeltaSharp.Engine;
 public static class EngineBuildInfo
 {
     /// <summary>
-    /// Gets the target framework moniker this engine assembly is built for.
+    /// Gets the framework name this engine assembly was compiled against — for example
+    /// <c>.NETCoreApp,Version=v10.0</c> — derived from the assembly's
+    /// <see cref="TargetFrameworkAttribute"/> so it cannot drift from the real build.
     /// </summary>
-    public static string TargetFramework => "net10.0";
+    public static string FrameworkName =>
+        typeof(EngineBuildInfo).Assembly
+            .GetCustomAttribute<TargetFrameworkAttribute>()?.FrameworkName
+        ?? "unknown";
 }

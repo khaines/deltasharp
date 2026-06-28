@@ -15,9 +15,11 @@ public static class DeltaSharpInfo
     /// </summary>
     public static string Product => "DeltaSharp";
 
+    private static readonly string _version =
+        typeof(DeltaSharpInfo).Assembly.GetName().Version?.ToString() ?? "0.0.0";
+
     /// <summary>
     /// Gets the version of the containing assembly, formatted as a dotted version string.
     /// </summary>
-    public static string Version =>
-        typeof(DeltaSharpInfo).Assembly.GetName().Version?.ToString() ?? "0.0.0";
+    public static string Version => _version;
 }

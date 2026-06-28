@@ -13,6 +13,9 @@
     <PackageId>DeltaSharp.Core</PackageId>
     <Description>Public API surface for DeltaSharp, a .NET-native reimplementation of Apache Spark. M1 skeleton — no engine or Delta behavior yet.</Description>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- ADR-0014: keep the public surface trim/AOT-annotation-clean. Enables the
+         trim, AOT, and single-file analyzers as a standing build gate on both TFMs. -->
+    <IsAotCompatible>true</IsAotCompatible>
   </PropertyGroup>
 
 </Project>

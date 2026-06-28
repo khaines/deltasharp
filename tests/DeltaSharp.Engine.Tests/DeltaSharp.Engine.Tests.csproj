@@ -1,15 +1,14 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <!--
-    Unit tests for DeltaSharp.Core. Test-project conventions: STORY-01.1.2.
-    Multi-targets net8.0;net10.0 so both public library targets (ADR-0014) are
-    compiled and executed in CI, exercising the matrix intent of STORY-00.1.2.
-    Not packable.
+    Unit tests for DeltaSharp.Engine. Targets net10.0 only, matching the engine's
+    single TFM (ADR-0014), and establishes the one-test-project-per-source-project
+    convention for the engine seam. Not packable.
   -->
   <PropertyGroup>
-    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
-    <RootNamespace>DeltaSharp.Core.Tests</RootNamespace>
-    <AssemblyName>DeltaSharp.Core.Tests</AssemblyName>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>DeltaSharp.Engine.Tests</RootNamespace>
+    <AssemblyName>DeltaSharp.Engine.Tests</AssemblyName>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
   </PropertyGroup>
@@ -24,7 +23,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="../../src/DeltaSharp.Core/DeltaSharp.Core.csproj" />
+    <ProjectReference Include="../../src/DeltaSharp.Engine/DeltaSharp.Engine.csproj" />
   </ItemGroup>
 
 </Project>

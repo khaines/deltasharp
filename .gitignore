@@ -40,3 +40,13 @@ Thumbs.db
 
 # Local environment
 *.local
+
+# Secrets / credentials — never commit (prevention only; pair with a CI secret scanner)
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+secrets.json
+**/appsettings.*.Local.json

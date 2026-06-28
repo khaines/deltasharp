@@ -1,6 +1,6 @@
 # EditorConfig — https://editorconfig.org
-# Repository formatting + .NET code-style policy. Enforced by `dotnet format`
-# (CI gate: `dotnet format --verify-no-changes`). See EPIC-00 / STORY-00.2.2.
+# Repository formatting + .NET code-style policy (EPIC-01 / STORY-01.2.3). Enforced by
+# `dotnet format`; the CI gate `dotnet format --verify-no-changes` is STORY-00.2.2.
 root = true
 
 [*]

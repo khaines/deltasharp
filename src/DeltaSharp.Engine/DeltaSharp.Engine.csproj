@@ -11,6 +11,9 @@
     <RootNamespace>DeltaSharp.Engine</RootNamespace>
     <AssemblyName>DeltaSharp.Engine</AssemblyName>
     <IsPackable>false</IsPackable>
+    <!-- ADR-0014: the engine is destined for the NativeAOT executor image, so keep
+         it AOT-clean from the first commit. -->
+    <IsAotCompatible>true</IsAotCompatible>
   </PropertyGroup>
 
 </Project>
