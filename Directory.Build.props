@@ -54,7 +54,8 @@
     errors. See docs/engineering/design/api-governance.md, ADR-0001, ADR-0014.
   -->
   <PropertyGroup>
-    <!-- A "production assembly" lives under src/ (today: DeltaSharp.Core, DeltaSharp.Engine).
+    <!-- A "production assembly" lives under src/ (today: DeltaSharp.Core, DeltaSharp.Engine,
+         DeltaSharp.Executor).
          Gated on the project path, which is known when this file is imported. Both paths are
          normalized to a trailing directory separator and the comparison is anchored at the
          repo root ($(MSBuildThisFileDirectory)src/), so neither a parent directory named
@@ -74,8 +75,8 @@
     <DeltaSharpTracksPublicApi Condition="'$(MSBuildProjectName)' == 'DeltaSharp.Core'">true</DeltaSharpTracksPublicApi>
   </PropertyGroup>
 
-  <!-- BannedApiAnalyzers on production assemblies (Core + Engine). The categorized ban
-       list lives at the repo root and is shared by every production assembly. -->
+  <!-- BannedApiAnalyzers on production assemblies (Core, Engine, Executor). The categorized
+       ban list lives at the repo root and is shared by every production assembly. -->
   <ItemGroup Condition="'$(DeltaSharpIsProductionAssembly)' == 'true'">
     <PackageReference Include="Microsoft.CodeAnalysis.BannedApiAnalyzers">
       <PrivateAssets>all</PrivateAssets>
