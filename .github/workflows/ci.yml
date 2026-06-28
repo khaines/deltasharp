@@ -33,12 +33,14 @@ jobs:
       # Install the runtimes needed to build AND run both target frameworks
       # (ADR-0014). global.json pins the SDK used by `dotnet` to the 10.0.1xx band;
       # the 8.0.x install provides the net8.0 runtime so net8.0 tests can execute.
-      - name: Setup .NET (8.0 + 10.0)
+      - name: Setup .NET (net8 runtime + pinned SDK)
         uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
         with:
-          dotnet-version: |
-            8.0.x
-            10.0.x
+          # Install the net8.0 runtime (to run net8.0 tests) plus the exact SDK pinned
+          # by global.json, so CI stays in lockstep with the rollForward policy and a
+          # future feature-band rollout cannot silently break the build.
+          dotnet-version: 8.0.x
+          global-json-file: global.json
 
       # Cache the global NuGet package folder. The key is derived from the project
       # files and central package-management files, so it only changes when

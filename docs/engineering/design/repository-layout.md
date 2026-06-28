@@ -24,7 +24,7 @@
 
 | Project | Folder | Target framework(s) | Packable | Role |
 | --- | --- | --- | --- | --- |
-| `DeltaSharp.Core` | `src/DeltaSharp.Core` | `net8.0;net10.0` | yes | Public, user-facing API surface. Multi-targeted for current-LTS adoption (ADR-0014). Root namespace `DeltaSharp`. AOT-annotation-clean (`IsAotCompatible`). |
+| `DeltaSharp.Core` | `src/DeltaSharp.Core` | `net8.0;net10.0` | yes | Public, user-facing API surface. Multi-targeted for current-LTS adoption (ADR-0014). Root namespace `DeltaSharp`. Trim/AOT-annotation-clean (trim/AOT analyzers). |
 | `DeltaSharp.Engine` | `src/DeltaSharp.Engine` | `net10.0` | no | Engine internals — **not part of the published package surface** (the assembly is never shipped as NuGet). `net10.0`-only so it can use the newest runtime and NativeAOT; not referenced by the public `net8.0` surface. |
 | `DeltaSharp.Core.Tests` | `tests/DeltaSharp.Core.Tests` | `net8.0;net10.0` | no | xUnit tests for `DeltaSharp.Core`, multi-targeted so both library targets are compiled and executed in CI. |
 | `DeltaSharp.Engine.Tests` | `tests/DeltaSharp.Engine.Tests` | `net10.0` | no | xUnit tests for `DeltaSharp.Engine` (matches the engine's single TFM). |
@@ -43,8 +43,10 @@ indicative; each assembly is created only when its code arrives:
 | Planned assembly | Plane | Responsibility |
 | --- | --- | --- |
 | `DeltaSharp.Core` | — | Public API + immutable logical plans (the only packable, multi-targeted surface). |
+| `DeltaSharp.Abstractions` (if needed) | — | Shared **packable** contracts bridging the public surface and the engine — a candidate `Core`↔`Engine` seam (see the TFM policy). |
 | `DeltaSharp.Engine` | data | Analyzer/optimizer, physical planning, vectorized execution internals. |
 | `DeltaSharp.Storage` (or `*.Delta`) | data | Delta transaction log, Parquet, object-store / PVC backends. |
+| `DeltaSharp.Distributed` | data | Driver/executor coordination and the native remote shuffle service (CODEOWNERS anticipates `/src/**/Shuffle/`). |
 | `DeltaSharp.Operator` | **control** | Kubernetes Operator, CRDs, reconcilers — kept out of executor hot paths. |
 | `DeltaSharp.Executor` (host exe) | data | NativeAOT executor host process (driver/executor task execution). |
 
@@ -67,7 +69,12 @@ CODEOWNERS already anticipates several of these seams (`/src/**/Sql/`,
 
 - **Engine / executor** projects target **`net10.0`** only.
 - **Public-facing libraries** multi-target **`net8.0;net10.0`** and stay
-  trim/AOT-annotation-clean (enforced with `IsAotCompatible`).
+  trim/AOT-annotation-clean (enforced by the `EnableTrimAnalyzer` /
+  `EnableAotAnalyzer` / `EnableSingleFileAnalyzer` Roslyn analyzers under
+  warnings-as-errors). Full assembly-level `IsAotCompatible` / `PublishAot`
+  verification is deferred to STORY-01.4.1 — note that `IsAotCompatible`/`IsTrimmable`
+  pull the SDK-patch-tied `Microsoft.NET.ILLink.Tasks` package, which would destabilize
+  the committed lock file under locked-mode restore.
 - A public `net8.0` library must never depend on a `net10.0`-only assembly.
 - A **packable** library must not reference a **non-packable** assembly on **any**
   target framework — the published package would ship an unresolvable dependency.
@@ -85,5 +92,11 @@ CODEOWNERS already anticipates several of these seams (`/src/**/Sql/`,
    `Directory.Packages.props`.
 4. Add it to the solution: `dotnet sln DeltaSharp.sln add <path>`.
 5. Add a matching `tests/DeltaSharp.<Area>.Tests` project.
-6. Once maintainers and code exist, activate the matching `CODEOWNERS` rule
+6. Enable a NuGet lock file (`<RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>`)
+   on any project that takes a real third-party `PackageReference` — every test project,
+   and any production project (including the packable `DeltaSharp.Core`) the moment it
+   gains its first third-party dependency. CI restores in locked mode and fails on an
+   out-of-date lock file. (SDK-only projects like the current Core/Engine deliberately
+   omit it, since their only locked package would be the patch-tied `ILLink.Tasks`.)
+7. Once maintainers and code exist, activate the matching `CODEOWNERS` rule
    (see [`.github/CODEOWNERS`](../../../.github/CODEOWNERS)).

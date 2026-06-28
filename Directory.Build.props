@@ -13,9 +13,10 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <EnableNETAnalyzers>true</EnableNETAnalyzers>
     <AnalysisLevel>latest</AnalysisLevel>
-    <!-- Surface NuGet advisories (NU1901-NU1904) but do not let a newly published
-         advisory against a pinned dependency fail an otherwise-unrelated build. -->
-    <WarningsNotAsErrors>$(WarningsNotAsErrors);NU1901;NU1902;NU1903;NU1904</WarningsNotAsErrors>
+    <!-- Don't let a newly published LOW/MODERATE NuGet advisory (NU1901/NU1902) fail an
+         otherwise-unrelated build; HIGH/CRITICAL advisories (NU1903/NU1904) stay
+         build-breaking under warnings-as-errors. -->
+    <WarningsNotAsErrors>$(WarningsNotAsErrors);NU1901;NU1902</WarningsNotAsErrors>
   </PropertyGroup>
 
   <!-- Deterministic / reproducible builds (CI sets ContinuousIntegrationBuild). -->

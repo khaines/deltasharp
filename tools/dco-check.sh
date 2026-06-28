@@ -21,6 +21,17 @@ else
   range="${head}~1..${head}"
 fi
 
+# Exempt automated dependency pull requests from the human DCO attestation. The bot
+# identity comes from a GitHub-asserted env var (PR_AUTHOR = the PR author login), NOT
+# a locally-forgeable commit field, so a contributor cannot spoof it. PR_AUTHOR is
+# unset for local runs (no exemption); .github/workflows/dco.yml sets it on CI.
+case "${PR_AUTHOR:-}" in
+  'dependabot[bot]' | 'dependabot-preview[bot]' | 'github-actions[bot]')
+    echo "DCO check skipped: pull request authored by automation ('${PR_AUTHOR}')."
+    exit 0
+    ;;
+esac
+
 # A valid sign-off looks like: "Signed-off-by: Real Name <email@example.com>".
 sign_off_re='^Signed-off-by: .+ <[^[:space:]]+@[^[:space:]]+>[[:space:]]*$'
 
@@ -39,16 +50,8 @@ checked=0
 
 while IFS= read -r sha; do
   [ -z "$sha" ] && continue
-  # Strip control characters before logging the untrusted commit subject.
-  subject="$(git show -s --format='%s' "$sha" | LC_ALL=C tr -d '\000-\037')"
-  # Exempt automated bot commits (e.g. dependabot[bot]): DCO is a human attestation
-  # and dependency-bump PRs cannot add a Signed-off-by trailer. GitHub bot accounts
-  # author commits from a *[bot]@users.noreply.github.com email.
-  author_email="$(git show -s --format='%ae' "$sha")"
-  if [[ "$author_email" == *'[bot]@users.noreply.github.com' ]]; then
-    echo "  skip  ${sha}  ${subject} (automated bot commit, DCO-exempt)"
-    continue
-  fi
+  # Strip control characters (C0 + DEL) before logging the untrusted commit subject.
+  subject="$(git show -s --format='%s' "$sha" | LC_ALL=C tr -d '\000-\037\177')"
   checked=$((checked + 1))
   # Read the full message into a variable first, so the match below is a here-string
   # rather than a `git ... | grep -q` pipeline (which can surface SIGPIPE under
