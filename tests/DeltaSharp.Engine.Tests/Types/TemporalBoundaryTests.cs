@@ -30,9 +30,9 @@ public class TemporalBoundaryTests
     [Fact]
     public void TimestampToDate_FloorsTowardNegativeInfinity()
     {
-        Assert.Equal(0, TemporalValues.TimestampToDate(0));
-        Assert.Equal(0, TemporalValues.TimestampToDate(TemporalValues.MicrosPerDay - 1));
-        Assert.Equal(-1, TemporalValues.TimestampToDate(-1)); // one micro before epoch → prior day
+        Assert.Equal(0, TemporalValues.TimestampToDate(0, AnsiMode.Ansi));
+        Assert.Equal(0, TemporalValues.TimestampToDate(TemporalValues.MicrosPerDay - 1, AnsiMode.Ansi));
+        Assert.Equal(-1, TemporalValues.TimestampToDate(-1, AnsiMode.Ansi)); // one micro before epoch → prior day
     }
 
     [Fact]
@@ -40,6 +40,15 @@ public class TemporalBoundaryTests
     {
         Assert.Throws<ArithmeticOverflowException>(() => TemporalValues.DateToTimestamp(TemporalValues.MaxEpochDay + 1, AnsiMode.Ansi));
         Assert.Null(TemporalValues.DateToTimestamp(TemporalValues.MaxEpochDay + 1, AnsiMode.Legacy));
+    }
+
+    [Fact]
+    public void Boundary_TimestampOutOfRange_AnsiThrows_LegacyNull_NeverWrapsEpochDay()
+    {
+        Assert.Throws<ArithmeticOverflowException>(() => TemporalValues.TimestampToDate(TemporalValues.MaxEpochMicros + 1, AnsiMode.Ansi));
+        Assert.Throws<ArithmeticOverflowException>(() => TemporalValues.TimestampToDate(TemporalValues.MinEpochMicros - 1, AnsiMode.Ansi));
+        Assert.Null(TemporalValues.TimestampToDate(long.MaxValue, AnsiMode.Legacy));
+        Assert.Null(TemporalValues.TimestampToDate(TemporalValues.MaxEpochMicros + 1, AnsiMode.Legacy));
     }
 
     [Fact]
@@ -54,7 +63,7 @@ public class TemporalBoundaryTests
     public void NullPropagation_OnAnyNullInput()
     {
         Assert.Null(TemporalValues.DateToTimestamp(null, AnsiMode.Ansi));
-        Assert.Null(TemporalValues.TimestampToDate(null));
+        Assert.Null(TemporalValues.TimestampToDate(null, AnsiMode.Ansi));
         Assert.Null(TemporalValues.Compare(0, null));
         Assert.Null(TemporalValues.CompareDateToTimestamp(null, 0, AnsiMode.Ansi));
         Assert.True(TemporalValues.IsDateInRange(null)); // null is in-range (stays null)

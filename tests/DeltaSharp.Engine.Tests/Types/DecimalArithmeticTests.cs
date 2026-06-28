@@ -79,4 +79,75 @@ public class DecimalArithmeticTests
         Assert.Null(lhs);
         Assert.Null(new DecimalValue(99999, 0).ToType(new DecimalType(3, 0), AnsiMode.Legacy));
     }
+
+    [Fact]
+    public void ToType_ExactPowerOfTen_Overflows() // 1000 needs 4 int digits, decimal(3,0) holds 3
+    {
+        var v = new DecimalValue(1000, 0);
+        Assert.Throws<ArithmeticOverflowException>(() => v.ToType(new DecimalType(3, 0), AnsiMode.Ansi));
+        Assert.Null(v.ToType(new DecimalType(3, 0), AnsiMode.Legacy));
+    }
+
+    [Fact]
+    public void ToType_Int128Max_RescaleUpOverflows_AnsiThrows_LegacyNull()
+    {
+        // decimal(38,1) requires ×10; Int128.MaxValue×10 wraps an unchecked multiply — must NOT.
+        var v = new DecimalValue(Int128.MaxValue, 0);
+        Assert.Throws<ArithmeticOverflowException>(() => v.ToType(new DecimalType(38, 1), AnsiMode.Ansi));
+        Assert.Null(v.ToType(new DecimalType(38, 1), AnsiMode.Legacy));
+    }
+
+    [Theory] // HALF_UP rounding for scale-reducing casts (Spark cast parity)
+    [InlineData(1255, 3, 3, 2, 126, 2)] // 1.255 → 1.26
+    [InlineData(25, 1, 2, 0, 3, 0)] // 2.5 → 3
+    [InlineData(125, 2, 2, 1, 13, 1)] // 1.25 → 1.3 (half rounds away)
+    [InlineData(-25, 1, 2, 0, -3, 0)] // -2.5 → -3 (half rounds away from zero)
+    public void ToType_RoundsHalfUp(int u, int s, int p, int ts, int ru, int rs)
+    {
+        DecimalValue? r = new DecimalValue(u, s).ToType(new DecimalType(p, ts), AnsiMode.Ansi);
+        Assert.Equal(new DecimalValue(ru, rs), r);
+    }
+
+    [Fact] // Mutation guard: an unchecked multiply wraps 1e21×1e21 into a value that re-fits — proves checked.
+    public void Multiply_1e21_Overflows_NeverWraps()
+    {
+        var big = new DecimalValue(Pow10(21), 0);
+        Assert.Throws<ArithmeticOverflowException>(() => DecimalValue.Apply(DecimalOp.Multiply, big, big, AnsiMode.Ansi));
+        Assert.Null(DecimalValue.Apply(DecimalOp.Multiply, big, big, AnsiMode.Legacy)); // NEVER a value
+    }
+
+    [Fact]
+    public void Multiply_1e36_Overflows_NeverWraps()
+    {
+        var huge = new DecimalValue(Pow10(36), 0);
+        Assert.Throws<ArithmeticOverflowException>(() => DecimalValue.Apply(DecimalOp.Multiply, huge, huge, AnsiMode.Ansi));
+        Assert.Null(DecimalValue.Apply(DecimalOp.Multiply, huge, huge, AnsiMode.Legacy)); // NEVER a value
+    }
+
+    [Fact] // scale sum 20+20=40 > 38 must overflow via AnsiMode, never ArgumentOutOfRangeException
+    public void Multiply_ScaleSumBeyond38_RoutesThroughAnsiMode()
+    {
+        var a = new DecimalValue(1, 20);
+        var b = new DecimalValue(1, 20);
+        Assert.Throws<ArithmeticOverflowException>(() => DecimalValue.Apply(DecimalOp.Multiply, a, b, AnsiMode.Ansi));
+        Assert.Null(DecimalValue.Apply(DecimalOp.Multiply, a, b, AnsiMode.Legacy));
+    }
+
+    [Fact]
+    public void Fits_DetectsRescaleOverflow_NotAlwaysTrue()
+    {
+        // Int128.MaxValue cannot upscale into decimal(38,1); Fits must say false, not wrap.
+        Assert.False(new DecimalValue(Int128.MaxValue, 0).Fits(new DecimalType(38, 1)));
+    }
+
+    private static Int128 Pow10(int n)
+    {
+        Int128 r = Int128.One;
+        for (int i = 0; i < n; i++)
+        {
+            r *= 10;
+        }
+
+        return r;
+    }
 }

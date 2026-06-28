@@ -133,54 +133,67 @@ public static class TypeCoercion
         ArgumentNullException.ThrowIfNull(source);
         ArgumentNullException.ThrowIfNull(target);
         ArgumentNullException.ThrowIfNull(path);
-
-        if (source.Equals(target) || source is NullType)
+        TryCoerce(source, target, path, out string failPath, out DataType failSource, out DataType failTarget);
+        if (failSource is not null)
         {
-            return; // identity and null-literal widening are always allowed (AC5).
-        }
-
-        switch (source, target)
-        {
-            case (ArrayType s, ArrayType t):
-                EnsureCoercible(s.ElementType, t.ElementType, path + ".element");
-                return;
-            case (MapType s, MapType t):
-                EnsureCoercible(s.KeyType, t.KeyType, path + ".key");
-                EnsureCoercible(s.ValueType, t.ValueType, path + ".value");
-                return;
-            case (StructType s, StructType t):
-                if (s.Count != t.Count)
-                {
-                    throw TypeCoercionException.ForPath(source, target, path);
-                }
-
-                for (int i = 0; i < s.Count; i++)
-                {
-                    EnsureCoercible(s[i].DataType, t[i].DataType, $"{path}.{t[i].Name}");
-                }
-
-                return;
-            default:
-                if (IsNumeric(source) && IsNumeric(target) && FindWiderTypeForTwo(source, target)!.Equals(target))
-                {
-                    return; // implicit widening to target
-                }
-
-                throw TypeCoercionException.ForPath(source, target, path);
+            throw TypeCoercionException.ForPath(failSource, failTarget, failPath);
         }
     }
 
     /// <summary>Whether <paramref name="source"/> can be implicitly coerced to <paramref name="target"/> (no throw).</summary>
     public static bool CanCoerce(DataType source, DataType target)
     {
-        try
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(target);
+        return TryCoerce(source, target, "value", out _, out _, out _);
+    }
+
+    private static bool TryCoerce(
+        DataType source, DataType target, string path, out string failPath, out DataType failSource, out DataType failTarget)
+    {
+        failPath = path;
+        failSource = source;
+        failTarget = target;
+        if (source.Equals(target) || source is NullType)
         {
-            EnsureCoercible(source, target);
-            return true;
+            failSource = null!;
+            failTarget = null!;
+            return true; // identity and null-literal widening are always allowed (AC5).
         }
-        catch (TypeCoercionException)
+
+        switch (source, target)
         {
-            return false;
+            case (ArrayType s, ArrayType t):
+                return TryCoerce(s.ElementType, t.ElementType, path + ".element", out failPath, out failSource, out failTarget);
+            case (MapType s, MapType t):
+                return TryCoerce(s.KeyType, t.KeyType, path + ".key", out failPath, out failSource, out failTarget)
+                    && TryCoerce(s.ValueType, t.ValueType, path + ".value", out failPath, out failSource, out failTarget);
+            case (StructType s, StructType t):
+                if (s.Count != t.Count)
+                {
+                    return false;
+                }
+
+                for (int i = 0; i < s.Count; i++)
+                {
+                    if (!TryCoerce(s[i].DataType, t[i].DataType, $"{path}.{t[i].Name}", out failPath, out failSource, out failTarget))
+                    {
+                        return false;
+                    }
+                }
+
+                failSource = null!;
+                failTarget = null!;
+                return true;
+            default:
+                if (IsNumeric(source) && IsNumeric(target) && FindWiderTypeForTwo(source, target)!.Equals(target))
+                {
+                    failSource = null!;
+                    failTarget = null!;
+                    return true; // implicit widening to target
+                }
+
+                return false;
         }
     }
 

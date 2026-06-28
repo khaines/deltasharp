@@ -57,13 +57,22 @@ public static class TemporalValues
 
     /// <summary>
     /// Casts a timestamp to its UTC calendar day, flooring toward negative infinity so instants
-    /// before the epoch map to the correct day (Spark <c>timestamp→date</c>). Null stays null (AC5).
+    /// before the epoch map to the correct day (Spark <c>timestamp→date</c>). Null stays null
+    /// (AC5); an out-of-range instant overflows under <see cref="AnsiMode.Ansi"/> and yields null
+    /// under <see cref="AnsiMode.Legacy"/> — never a silently wrapped epoch day.
     /// </summary>
-    public static int? TimestampToDate(long? micros)
+    public static int? TimestampToDate(long? micros, AnsiMode mode)
     {
         if (micros is null)
         {
             return null;
+        }
+
+        if (!IsTimestampInRange(micros))
+        {
+            return mode == AnsiMode.Ansi
+                ? throw new ArithmeticOverflowException($"Timestamp {micros} out of range for date cast.")
+                : null;
         }
 
         return (int)FloorDiv(micros.Value, MicrosPerDay);

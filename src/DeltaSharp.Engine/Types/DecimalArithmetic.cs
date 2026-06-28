@@ -143,41 +143,84 @@ public readonly struct DecimalValue : IEquatable<DecimalValue>
     public static DecimalValue Subtract(DecimalValue a, DecimalValue b) => Combine(a, b, subtract: true);
 
     /// <summary>Product of two values, exact; result scale is the sum of operand scales.</summary>
-    public static DecimalValue Multiply(DecimalValue a, DecimalValue b) =>
-        new(a.Unscaled * b.Unscaled, a.Scale + b.Scale);
+    /// <exception cref="ArithmeticOverflowException">The exact product cannot be represented (mantissa wraps Int128, or the scale sum exceeds <see cref="DecimalArithmetic.MaxScale"/>).</exception>
+    public static DecimalValue Multiply(DecimalValue a, DecimalValue b)
+    {
+        int scale = a.Scale + b.Scale;
+        if (scale > DecimalArithmetic.MaxScale)
+        {
+            throw new ArithmeticOverflowException(
+                $"Decimal multiply scale {scale} exceeds {DecimalArithmetic.MaxScale}.");
+        }
+
+        try
+        {
+            return new DecimalValue(checked(a.Unscaled * b.Unscaled), scale);
+        }
+        catch (OverflowException ex)
+        {
+            throw new ArithmeticOverflowException("Decimal multiply mantissa overflow.", ex);
+        }
+    }
 
     /// <summary>
-    /// Casts to <paramref name="target"/>, rounding to its scale and enforcing its precision.
-    /// Overflow throws under <see cref="AnsiMode.Ansi"/>; under <see cref="AnsiMode.Legacy"/> the
-    /// result is <c>null</c> (SQL <c>NULL</c>) — never a silently truncated value.
+    /// Casts to <paramref name="target"/>, rounding to its scale (HALF_UP — Spark cast parity)
+    /// and enforcing its precision. Overflow throws under <see cref="AnsiMode.Ansi"/>; under
+    /// <see cref="AnsiMode.Legacy"/> the result is <c>null</c> (SQL <c>NULL</c>) — never a
+    /// silently truncated or wrapped value.
     /// </summary>
     /// <exception cref="ArithmeticOverflowException">The value exceeds <paramref name="target"/> under ANSI mode.</exception>
     public DecimalValue? ToType(DecimalType target, AnsiMode mode)
     {
         ArgumentNullException.ThrowIfNull(target);
-        Int128 rescaled = Rescale(target.Scale);
-        if (Int128.Abs(rescaled) >= Pow10(target.Precision))
+        try
+        {
+            Int128 rescaled = RescaleHalfUp(target.Scale);
+            if (Int128.Abs(rescaled) >= Pow10(target.Precision))
+            {
+                return mode == AnsiMode.Ansi
+                    ? throw new ArithmeticOverflowException(
+                        $"Decimal value out of range for '{target.SimpleString}'.")
+                    : null;
+            }
+
+            return new DecimalValue(rescaled, target.Scale);
+        }
+        catch (OverflowException ex)
         {
             return mode == AnsiMode.Ansi
                 ? throw new ArithmeticOverflowException(
-                    $"Decimal value out of range for '{target.SimpleString}'.")
+                    $"Decimal value out of range for '{target.SimpleString}'.", ex)
                 : null;
         }
-
-        return new DecimalValue(rescaled, target.Scale);
     }
 
-    /// <summary>Applies a binary <paramref name="op"/>, fitting the exact result into its Spark result type.</summary>
+    /// <summary>
+    /// Applies a binary <paramref name="op"/>, fitting the exact result into its Spark result type.
+    /// Any out-of-range condition — mantissa overflow, scale-sum &gt; 38, or precision overflow —
+    /// is routed through the <paramref name="mode"/> contract: ANSI throws
+    /// <see cref="ArithmeticOverflowException"/>, Legacy yields <c>null</c>. Divide/Remainder value
+    /// rounding stays deferred (result <i>types</i> are defined; see type-system.md).
+    /// </summary>
     public static DecimalValue? Apply(DecimalOp op, DecimalValue a, DecimalValue b, AnsiMode mode)
     {
         DecimalType result = DecimalArithmetic.ResultType(op, a.AsType(), b.AsType());
-        DecimalValue exact = op switch
+        DecimalValue exact;
+        try
         {
-            DecimalOp.Add => Add(a, b),
-            DecimalOp.Subtract => Subtract(a, b),
-            DecimalOp.Multiply => Multiply(a, b),
-            _ => throw new ArgumentOutOfRangeException(nameof(op), "Divide/Remainder need rounding context."),
-        };
+            exact = op switch
+            {
+                DecimalOp.Add => Add(a, b),
+                DecimalOp.Subtract => Subtract(a, b),
+                DecimalOp.Multiply => Multiply(a, b),
+                _ => throw new ArgumentOutOfRangeException(nameof(op), "Divide/Remainder need rounding context."),
+            };
+        }
+        catch (ArithmeticOverflowException) when (mode == AnsiMode.Legacy)
+        {
+            return null;
+        }
+
         return exact.ToType(result, mode);
     }
 
@@ -200,15 +243,29 @@ public readonly struct DecimalValue : IEquatable<DecimalValue>
     /// <summary>Inequality.</summary>
     public static bool operator !=(DecimalValue left, DecimalValue right) => !left.Equals(right);
 
+    private static readonly Int128[] Pow10Table = BuildPow10Table();
+
     internal static Int128 Pow10(int n)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(n);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(n, DecimalArithmetic.MaxScale);
+        return Pow10Table[n];
+    }
+
+    private static Int128[] BuildPow10Table()
+    {
+        var table = new Int128[DecimalArithmetic.MaxScale + 1];
         Int128 r = Int128.One;
-        for (int i = 0; i < n; i++)
+        for (int i = 0; i <= DecimalArithmetic.MaxScale; i++)
         {
-            r *= 10;
+            table[i] = r;
+            if (i < DecimalArithmetic.MaxScale)
+            {
+                r *= 10;
+            }
         }
 
-        return r;
+        return table;
     }
 
     private DecimalType AsType() =>
@@ -230,16 +287,49 @@ public readonly struct DecimalValue : IEquatable<DecimalValue>
     private static DecimalValue Combine(DecimalValue a, DecimalValue b, bool subtract)
     {
         int scale = Math.Max(a.Scale, b.Scale);
-        Int128 av = a.Rescale(scale), bv = b.Rescale(scale);
-        return new DecimalValue(subtract ? av - bv : av + bv, scale);
+        try
+        {
+            Int128 av = a.RescaleChecked(scale), bv = b.RescaleChecked(scale);
+            return new DecimalValue(checked(subtract ? av - bv : av + bv), scale);
+        }
+        catch (OverflowException ex)
+        {
+            throw new ArithmeticOverflowException("Decimal add/subtract mantissa overflow.", ex);
+        }
     }
 
-    private Int128 Rescale(int targetScale) =>
-        targetScale >= Scale ? Unscaled * Pow10(targetScale - Scale) : Unscaled / Pow10(Scale - targetScale);
+    private Int128 RescaleChecked(int targetScale) =>
+        targetScale >= Scale ? checked(Unscaled * Pow10(targetScale - Scale)) : Unscaled / Pow10(Scale - targetScale);
+
+    private Int128 RescaleHalfUp(int targetScale)
+    {
+        if (targetScale >= Scale)
+        {
+            return checked(Unscaled * Pow10(targetScale - Scale));
+        }
+
+        Int128 divisor = Pow10(Scale - targetScale);
+        Int128 quotient = Unscaled / divisor;
+        Int128 remainder = Int128.Abs(Unscaled % divisor);
+        if (remainder >= divisor - remainder)
+        {
+            quotient += Unscaled < Int128.Zero ? Int128.NegativeOne : Int128.One;
+        }
+
+        return quotient;
+    }
 
     private bool TryRescale(int targetScale, out Int128 value)
     {
-        value = Rescale(targetScale);
-        return true;
+        try
+        {
+            value = RescaleChecked(targetScale);
+            return true;
+        }
+        catch (OverflowException)
+        {
+            value = Int128.Zero;
+            return false;
+        }
     }
 }
