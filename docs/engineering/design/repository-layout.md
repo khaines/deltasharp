@@ -30,7 +30,7 @@
 | `DeltaSharp.Core.Tests` | `tests/DeltaSharp.Core.Tests` | `net8.0;net10.0` | no | xUnit tests for `DeltaSharp.Core`, multi-targeted so both library targets are compiled and executed in CI. |
 | `DeltaSharp.Engine.Tests` | `tests/DeltaSharp.Engine.Tests` | `net10.0` | no | xUnit tests for `DeltaSharp.Engine` (matches the engine's single TFM). |
 | `DeltaSharp.Executor.Tests` | `tests/DeltaSharp.Executor.Tests` | `net10.0` | no | xUnit tests for `DeltaSharp.Executor` (matches the executor's single TFM). |
-| `DeltaSharp.Samples.GettingStarted` | `samples/DeltaSharp.Samples.GettingStarted` | `net8.0` | no | Minimal example consuming `DeltaSharp.Core` from the current LTS. Built by the informational `samples.yml`, not the production gate. |
+| `DeltaSharp.Samples.GettingStarted` | `samples/DeltaSharp.Samples.GettingStarted` | `net8.0` | no | Minimal example consuming `DeltaSharp.Core` from the current LTS. Compiled by the solution build; non-packable, so excluded from package validation. |
 
 > The skeleton is intentionally **inert**: it exposes no Apache Spark or Delta Lake
 > behavior yet. Real engine and API code lands in later epics.
