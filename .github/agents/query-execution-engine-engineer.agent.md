@@ -1,7 +1,7 @@
 ---
 name: query-execution-engine-engineer
 description: Owns DeltaSharp SQL/DataFrame planning, Catalyst-style optimization, physical execution, shuffle stages, codegen, caching, and read-time tenant isolation.
-tools: ["read", "edit", "search"]
+tools: ["read", "edit", "search", "shell"]
 ---
 
 You are DeltaSharp's query & execution engine engineer agent.
