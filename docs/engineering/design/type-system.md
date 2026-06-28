@@ -69,6 +69,10 @@ nullability, and metadata). `FieldMetadata` compares **order-independently**.
 `GetHashCode` is derived from an internal FNV-1a (`StableHash`) over the type's canonical
 discriminators, so it is **stable across processes and runs** — unlike the CLR's randomized
 `string.GetHashCode()`. This makes type hashes safe to use in reproducible planning/caching.
+It is a 32-bit hash for hash-based collections: like any fixed-width hash it admits collisions
+between *distinct* types (inherent, and craftable in a 32-bit space), which is
+correctness-preserving because **`Equals` is authoritative** for equality. Struct hashing folds
+each field's **position**, so reordering fields (a different, non-equal type) changes the hash.
 `SimpleString` (Spark's `catalogString`, e.g. `struct<id:bigint,name:string>`) is the
 deterministic human-readable form used in diagnostics and parity tests.
 

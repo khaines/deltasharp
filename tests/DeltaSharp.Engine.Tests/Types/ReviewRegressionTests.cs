@@ -22,6 +22,20 @@ public class ReviewRegressionTests
     }
 
     [Fact]
+    public void StructHash_IsOrderSensitive_ForSwappedFields()
+    {
+        // Reordering fields yields a different (non-equal) type; its hash must differ too,
+        // because struct hashing folds each field's position.
+        var alpha = new StructField("alpha", IntegerType.Instance);
+        var beta = new StructField("beta", StringType.Instance);
+        var s1 = new StructType(new[] { alpha, beta });
+        var s2 = new StructType(new[] { beta, alpha });
+
+        Assert.NotEqual(s1, s2);
+        Assert.NotEqual(s1.GetHashCode(), s2.GetHashCode());
+    }
+
+    [Fact]
     public void FromJson_AcceptsLegacyNullSpelling_ForNullType()
     {
         Assert.Equal(NullType.Instance, DataType.FromJson("\"null\""));

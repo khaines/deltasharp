@@ -187,10 +187,13 @@ public sealed class StructType : DataType, IReadOnlyList<StructField>
     /// <inheritdoc/>
     public override int GetHashCode()
     {
-        int hash = StableHash.OfString("struct");
-        foreach (StructField field in _fields)
+        // Fold the field count and each field's position so that reordering fields (which
+        // produces a different, non-equal type) also changes the hash.
+        int hash = StableHash.Combine(StableHash.OfString("struct"), _fields.Length);
+        for (int i = 0; i < _fields.Length; i++)
         {
-            hash = StableHash.Combine(hash, field.GetHashCode());
+            hash = StableHash.Combine(hash, i);
+            hash = StableHash.Combine(hash, _fields[i].GetHashCode());
         }
 
         return hash;
