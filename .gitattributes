@@ -1,0 +1,14 @@
+# Normalize line endings to LF in the repository and on checkout so the
+# `dotnet format` end_of_line rule (see .editorconfig) stays deterministic
+# across macOS, Linux, and Windows contributors.
+* text=auto eol=lf
+
+# Shell scripts must stay LF and executable.
+*.sh text eol=lf
+
+# Binary assets must not be normalized.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary

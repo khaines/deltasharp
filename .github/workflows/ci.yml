@@ -1,0 +1,66 @@
+name: CI
+
+# Build, test, and format gate for every pull request and for pushes to main.
+#
+# This workflow intentionally has NO `paths:` filter. Its jobs are intended to be
+# required by branch protection, so they must always report a status — even for
+# docs-only changes — otherwise the merge button can deadlock waiting for a check
+# that never runs. Keeping the build fast (an inert skeleton) makes always-on cheap.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test-format:
+    name: build-test-format
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # Install the runtimes needed to build AND run both target frameworks
+      # (ADR-0014). global.json pins the SDK used by `dotnet` to the 10.0.1xx band;
+      # the 8.0.x install provides the net8.0 runtime so net8.0 tests can execute.
+      - name: Setup .NET (net8 runtime + pinned SDK)
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          # Install the net8.0 runtime (to run net8.0 tests) plus the exact SDK pinned
+          # by global.json, so CI stays in lockstep with the rollForward policy and a
+          # future feature-band rollout cannot silently break the build.
+          dotnet-version: 8.0.x
+          global-json-file: global.json
+
+      # Cache the global NuGet package folder. The key is derived from the project
+      # files and central package-management files, so it only changes when
+      # dependencies change (STORY-00.1.2).
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', 'Directory.Packages.props', 'Directory.Build.props', 'global.json') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      - name: Restore
+        run: dotnet restore DeltaSharp.sln --locked-mode
+
+      - name: Build (Release)
+        run: dotnet build DeltaSharp.sln -c Release --no-restore
+
+      - name: Test
+        run: dotnet test DeltaSharp.sln -c Release --no-build --verbosity normal
+
+      - name: Format (verify no changes)
+        run: dotnet format DeltaSharp.sln --verify-no-changes --no-restore

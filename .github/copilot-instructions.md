@@ -18,11 +18,13 @@ around three pillars:
 DeltaSharp is **open-source** with a community-driven adoption strategy (Apache-2.0
 assumed; see [ADR-0015](../docs/adr/0015-open-source-positioning.md)).
 
-> **Status: greenfield.** The repository currently has no code. These
-> instructions describe the *intended* architecture and conventions to steer
-> early implementation. As concrete code lands, update sections here (especially
-> build/test commands and the repo layout) to match reality, and remove this
-> note once the scaffolding is real.
+> **Status: M1 scaffolding.** The solution skeleton now exists — `DeltaSharp.sln`
+> with `src/DeltaSharp.Core`, `src/DeltaSharp.Engine`, and
+> `tests/DeltaSharp.Core.Tests`. It is intentionally **inert** (no Spark or Delta
+> behavior yet). Most architecture below is still *intended* and steers ongoing
+> implementation. See
+> [repository layout & project conventions](../docs/engineering/design/repository-layout.md),
+> and keep these instructions in sync as real engine code lands.
 
 ## Build, test, and lint
 
@@ -132,6 +134,9 @@ abstraction swappable:
   than mutating in place.
 - **C#/.NET style.** Enable nullable reference types; PascalCase for public
   members, `_camelCase` for private fields; `async`/`await` for I/O.
-- **Intended repo layout:** `src/` for framework projects, `tests/` for test
-  projects (one per `src` project, suffixed `.Tests`), `samples/` (or
-  `examples/`) for the example applications, and a single `*.sln` at the root.
+- **Repo layout:** `src/` for framework projects, `tests/` for test projects
+  (one per `src` project, suffixed `.Tests`), `samples/` for example applications
+  (added later), and a single `DeltaSharp.sln` at the root. Engine/executor
+  projects target `net10.0`; public libraries multi-target `net8.0;net10.0`
+  (ADR-0014). Full conventions:
+  [repository layout](../docs/engineering/design/repository-layout.md).
