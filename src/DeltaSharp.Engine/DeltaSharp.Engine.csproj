@@ -11,9 +11,12 @@
     <RootNamespace>DeltaSharp.Engine</RootNamespace>
     <AssemblyName>DeltaSharp.Engine</AssemblyName>
     <IsPackable>false</IsPackable>
-    <!-- ADR-0014: the engine is destined for the NativeAOT executor image, so keep
-         it AOT-clean from the first commit. -->
-    <IsAotCompatible>true</IsAotCompatible>
+    <!-- ADR-0014: the engine is destined for the NativeAOT executor image, so keep it
+         AOT-clean from the first commit. Enable the analyzers (not IsAotCompatible) so
+         the lock file stays free of the SDK-version-tied ILLink.Tasks package. -->
+    <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
+    <EnableAotAnalyzer>true</EnableAotAnalyzer>
+    <EnableSingleFileAnalyzer>true</EnableSingleFileAnalyzer>
   </PropertyGroup>
 
 </Project>

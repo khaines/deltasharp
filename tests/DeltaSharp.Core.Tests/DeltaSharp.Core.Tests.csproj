@@ -12,6 +12,11 @@
     <AssemblyName>DeltaSharp.Core.Tests</AssemblyName>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
+    <!-- Lock third-party (xunit / test SDK) versions for reproducible, drift-detecting
+         restores; CI enforces in locked mode. Scoped to projects with real third-party
+         packages — the SDK-only Core/Engine would otherwise lock the runtime-patch-tied
+         ILLink.Tasks and break locked-mode restore across machines. -->
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
   </PropertyGroup>
 
   <ItemGroup>

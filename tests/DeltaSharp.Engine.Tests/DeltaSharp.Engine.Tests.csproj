@@ -11,6 +11,9 @@
     <AssemblyName>DeltaSharp.Engine.Tests</AssemblyName>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
+    <!-- Lock third-party versions for reproducible, drift-detecting restores
+         (CI enforces in locked mode); see DeltaSharp.Core.Tests for rationale. -->
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
   </PropertyGroup>
 
   <ItemGroup>
