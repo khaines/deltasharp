@@ -1,0 +1,218 @@
+namespace DeltaSharp.Engine.Types;
+
+/// <summary>
+/// Spark-parity type coercion for v1 (STORY-02.5.2). Owns numeric width precedence and the
+/// common-type matrix (AC1), nested-type coercion with precise error paths (AC4), and the
+/// null-type promotion that keeps SQL null propagation distinct from CLR defaults (AC5).
+/// Mirrors Apache Spark's <c>TypeCoercion.findTightestCommonType</c>/<c>findWiderTypeForTwo</c>.
+/// </summary>
+public static class TypeCoercion
+{
+    /// <summary>
+    /// Numeric width precedence, widest last (Spark <c>numericPrecedence</c>). The common type
+    /// of two members is whichever appears later; <see cref="DecimalType"/> sits outside this
+    /// list and is handled by the decimal widening rules.
+    /// </summary>
+    public static IReadOnlyList<DataType> NumericPrecedence { get; } = new DataType[]
+    {
+        ByteType.Instance,
+        ShortType.Instance,
+        IntegerType.Instance,
+        LongType.Instance,
+        FloatType.Instance,
+        DoubleType.Instance,
+    };
+
+    /// <summary>Whether <paramref name="type"/> is a v1 numeric type (integral, floating, or decimal).</summary>
+    public static bool IsNumeric(DataType type) =>
+        type is ByteType or ShortType or IntegerType or LongType or FloatType or DoubleType or DecimalType;
+
+    /// <summary>True for fixed-point integral types; false for float/double/decimal.</summary>
+    public static bool IsIntegral(DataType type) =>
+        type is ByteType or ShortType or IntegerType or LongType;
+
+    /// <summary>
+    /// The tightest common type without lossy promotion (Spark <c>findTightestCommonType</c>):
+    /// equal types, null promotion, integer widening, exact decimals, and <c>date→timestamp</c>.
+    /// Returns null when there is no lossless common type. Never widens an integer to a decimal.
+    /// </summary>
+    public static DataType? FindTightestCommonType(DataType left, DataType right)
+    {
+        ArgumentNullException.ThrowIfNull(left);
+        ArgumentNullException.ThrowIfNull(right);
+
+        if (left.Equals(right))
+        {
+            return left;
+        }
+
+        if (left is NullType)
+        {
+            return right;
+        }
+
+        if (right is NullType)
+        {
+            return left;
+        }
+
+        int li = PrecedenceIndex(left), ri = PrecedenceIndex(right);
+        if (li >= 0 && ri >= 0)
+        {
+            return NumericPrecedence[Math.Max(li, ri)];
+        }
+
+        if ((left is DateType && right is TimestampType) || (left is TimestampType && right is DateType))
+        {
+            return TimestampType.Instance;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// The wider common type, allowing decimal promotion (Spark <c>findWiderTypeForTwo</c>):
+    /// the AC1 matrix for mixed numeric widths. Integers widen into decimals, decimals widen to
+    /// the smallest decimal that holds both, and decimal⊕float/double widens to <c>double</c>.
+    /// Returns null for non-coercible pairs.
+    /// </summary>
+    public static DataType? FindWiderTypeForTwo(DataType left, DataType right)
+    {
+        ArgumentNullException.ThrowIfNull(left);
+        ArgumentNullException.ThrowIfNull(right);
+
+        DataType? tight = FindTightestCommonType(left, right);
+        if (tight is not null)
+        {
+            return tight;
+        }
+
+        if (left is DecimalType || right is DecimalType)
+        {
+            return WiderDecimal(left, right);
+        }
+
+        return null;
+    }
+
+    /// <summary>The wider common type of a non-empty sequence (left-folded), or null if any pair is incompatible.</summary>
+    /// <exception cref="ArgumentException"><paramref name="types"/> is empty.</exception>
+    public static DataType? FindWiderCommonType(IEnumerable<DataType> types)
+    {
+        ArgumentNullException.ThrowIfNull(types);
+        DataType? acc = null;
+        bool any = false;
+        foreach (DataType t in types)
+        {
+            ArgumentNullException.ThrowIfNull(t);
+            any = true;
+            if (acc is null)
+            {
+                acc = t;
+                continue;
+            }
+
+            acc = FindWiderTypeForTwo(acc, t);
+            if (acc is null)
+            {
+                return null;
+            }
+        }
+
+        return any ? acc : throw new ArgumentException("At least one type is required.", nameof(types));
+    }
+
+    /// <summary>
+    /// Verifies <paramref name="source"/> can be implicitly coerced to <paramref name="target"/>,
+    /// recursing structurally and throwing <see cref="TypeCoercionException"/> that names the
+    /// source, target, and dotted expression <paramref name="path"/> on the first mismatch (AC4).
+    /// </summary>
+    /// <exception cref="TypeCoercionException">No implicit coercion exists at some path.</exception>
+    public static void EnsureCoercible(DataType source, DataType target, string path = "value")
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(target);
+        ArgumentNullException.ThrowIfNull(path);
+
+        if (source.Equals(target) || source is NullType)
+        {
+            return; // identity and null-literal widening are always allowed (AC5).
+        }
+
+        switch (source, target)
+        {
+            case (ArrayType s, ArrayType t):
+                EnsureCoercible(s.ElementType, t.ElementType, path + ".element");
+                return;
+            case (MapType s, MapType t):
+                EnsureCoercible(s.KeyType, t.KeyType, path + ".key");
+                EnsureCoercible(s.ValueType, t.ValueType, path + ".value");
+                return;
+            case (StructType s, StructType t):
+                if (s.Count != t.Count)
+                {
+                    throw TypeCoercionException.ForPath(source, target, path);
+                }
+
+                for (int i = 0; i < s.Count; i++)
+                {
+                    EnsureCoercible(s[i].DataType, t[i].DataType, $"{path}.{t[i].Name}");
+                }
+
+                return;
+            default:
+                if (IsNumeric(source) && IsNumeric(target) && FindWiderTypeForTwo(source, target)!.Equals(target))
+                {
+                    return; // implicit widening to target
+                }
+
+                throw TypeCoercionException.ForPath(source, target, path);
+        }
+    }
+
+    /// <summary>Whether <paramref name="source"/> can be implicitly coerced to <paramref name="target"/> (no throw).</summary>
+    public static bool CanCoerce(DataType source, DataType target)
+    {
+        try
+        {
+            EnsureCoercible(source, target);
+            return true;
+        }
+        catch (TypeCoercionException)
+        {
+            return false;
+        }
+    }
+
+    private static int PrecedenceIndex(DataType type)
+    {
+        for (int i = 0; i < NumericPrecedence.Count; i++)
+        {
+            if (NumericPrecedence[i].Equals(type))
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    private static DataType? WiderDecimal(DataType left, DataType right)
+    {
+        // float/double dominate decimal (Spark widens decimal⊕float and decimal⊕double to double).
+        if (left is FloatType or DoubleType || right is FloatType or DoubleType)
+        {
+            return DoubleType.Instance;
+        }
+
+        if (!IsNumeric(left) || !IsNumeric(right))
+        {
+            return null;
+        }
+
+        DecimalType a = DecimalArithmetic.ForType(left), b = DecimalArithmetic.ForType(right);
+        int scale = Math.Max(a.Scale, b.Scale);
+        int range = Math.Max(a.Precision - a.Scale, b.Precision - b.Scale);
+        return DecimalArithmetic.Bounded(range + scale, scale);
+    }
+}

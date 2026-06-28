@@ -145,14 +145,78 @@ This is intentionally a **descriptor**, not a buffer: it tells a builder how to 
 storage. Bit-packing of booleans/validity and the exact offset width are implementation choices
 of the vector layer (ADR-0002), not of the logical type.
 
+## Type coercion, decimal/timestamp arithmetic, and ANSI rules (STORY-02.5.2, #142)
+
+Coercion is the analyzer/expression contract that turns mixed-width operands into a single
+shared type. It is implemented in `TypeCoercion`, `DecimalArithmetic`/`DecimalValue`, and
+`TemporalValues`, threaded by an explicit `AnsiMode` value (no ambient state). All four mirror
+Apache Spark's `TypeCoercion`/`DecimalPrecision`/`DateTimeUtils`.
+
+### ANSI mode flag (AC2)
+
+`AnsiMode` is the engine analog of Spark's `spark.sql.ansi.enabled`. **`Ansi` is the default**
+(ADR-0007/0008 make ANSI the semantic lens). The only difference between the modes is the
+out-of-range outcome — **neither ever silently truncates or wraps**:
+
+| Condition | `AnsiMode.Ansi` (default) | `AnsiMode.Legacy` |
+| --- | --- | --- |
+| Decimal/temporal result exceeds target precision/scale/range | throws `ArithmeticOverflowException` | yields SQL `NULL` |
+
+### Numeric width parity matrix (AC1)
+
+`TypeCoercion.FindWiderTypeForTwo` widens to the rightmost of Spark's `numericPrecedence`
+(`byte < short < int < long < float < double`); `FindTightestCommonType` is the same but
+**refuses** lossy integer→decimal widening (returns null) and tightens `date`+`timestamp` to
+`timestamp`. The wider-type matrix:
+
+| | tinyint | smallint | int | bigint | float | double | decimal |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **tinyint** | tinyint | smallint | int | bigint | float | double | decimal* |
+| **smallint** | | smallint | int | bigint | float | double | decimal* |
+| **int** | | | int | bigint | float | double | decimal* |
+| **bigint** | | | | bigint | float | double | decimal* |
+| **float** | | | | | float | double | double |
+| **double** | | | | | | double | double |
+| **decimal** | | | | | | | decimal* |
+
+`decimal*` = smallest decimal that holds both: integrals widen via Spark's `forType`
+(`byte→(3,0)`, `int→(10,0)`, `long→(20,0)`, `float→(14,7)`, `double→(30,15)`), then
+`scale = max`, `precision = max(int-digits) + scale`, bounded to 38. `decimal ⊕ float/double`
+widens to **double**. e.g. `decimal(10,2) ⊕ int → decimal(12,2)`.
+
+### Decimal result types + overflow (AC2)
+
+`DecimalArithmetic.ResultType` gives Spark's binary-operator precision/scale, clamped by
+`Bounded` (cap precision at 38, keep `MinimumAdjustedScale=6` while integer digits remain):
+add/sub `(max(p-s)+max(s)+1, max(s))`, mul `(p1+p2+1, s1+s2)`, div `(…, max(6, s1+p2+1))`.
+`DecimalValue` (128-bit unscaled mantissa) does exact arithmetic and fits the result into its
+type, overflowing per `AnsiMode`.
+
+### Time-zone / precision assumptions (AC3)
+
+v1 fixes these and `TemporalValues` enforces them exactly (integer arithmetic, no rounding):
+
+- **`timestamp`** = UTC-normalized **microseconds** since epoch; **no session time zone** in v1.
+- **`date`** = UTC **days** since epoch. `date→timestamp` is UTC midnight (`day × 86_400_000_000`);
+  `timestamp→date` floors toward −∞. Comparisons are integer compares in those units.
+- Bounds: `0001-01-01` … `9999-12-31` (`MinEpochDay/Micros`, `MaxEpochDay/Micros`). The
+  `TimestampNtz` variant remains deferred (EPIC-02 open question).
+
+### Nested coercion errors + null propagation (AC4/AC5)
+
+`TypeCoercion.EnsureCoercible` recurses arrays/maps/structs and throws `TypeCoercionException`
+naming source, target, and a dotted path (`order.price`, `value.element`, `value.key/value`).
+The **null type widens to any peer** and every coercion-sensitive op propagates SQL `NULL`
+(nullable results), never a CLR default (`0`, `0m`, `default`).
+
 ## v1 scope and deferrals
 
 - **In scope:** the type matrix above; equality/validation/serialization; the physical-layout
-  query.
-- **Deferred (tracked elsewhere):** type **coercion**, decimal/timestamp arithmetic, and ANSI
-  overflow rules (STORY-02.5.2, #142); a session-local **`TimestampNtz`** variant (EPIC-02 open
+  query; coercion/decimal/timestamp/ANSI rules (above, STORY-02.5.2).
+- **Deferred (tracked elsewhere):** a session-local **`TimestampNtz`** variant (EPIC-02 open
   question); richer **typed metadata** for Delta-log interop (v1 is string-valued; tracked in
-  **#330**). `TimestampType` is a UTC-normalized instant (microseconds since epoch).
+  **#330**); decimal **divide/modulo value rounding** (result *types* are defined now).
+  `TimestampType` is a UTC-normalized instant (microseconds since epoch).
 
 ## References
 
