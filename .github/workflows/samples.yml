@@ -1,0 +1,70 @@
+name: Samples
+
+# Builds and smoke-runs the example applications under samples/ (FEAT-01.1 / #119).
+#
+# This is intentionally a SEPARATE workflow from CI and is NOT a branch-protection
+# required check, so a broken sample is *reported* here without blocking the production
+# package-validation diagnostics in the Pack workflow or deadlocking the merge button
+# (#119 AC4). It builds the sample projects directly (which pull in their referenced
+# production projects via ProjectReference) rather than the whole solution, so the
+# samples signal stays isolated from the production build/pack path.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: samples-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-samples:
+    name: build-samples
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # Samples target net8.0 (the current LTS consumer path, ADR-0014), so install the
+      # net8.0 runtime alongside the SDK pinned by global.json — same setup as CI.
+      - name: Setup .NET (net8 runtime + pinned SDK)
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: 8.0.x
+          global-json-file: global.json
+
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', 'Directory.Packages.props', 'Directory.Build.props', 'global.json') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      # Build every sample project. Samples carry no third-party PackageReference (only a
+      # ProjectReference to a production project), so they have no NuGet lock file and are
+      # restored without --locked-mode, consistent with the SDK-only production projects.
+      - name: Build samples (Release)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob globstar
+          samples=(samples/**/*.csproj)
+          test "${#samples[@]}" -gt 0 || { echo "::error::no sample projects found under samples/"; exit 1; }
+          for proj in "${samples[@]}"; do
+            echo "::group::build $proj"
+            dotnet build "$proj" -c Release
+            echo "::endgroup::"
+          done
+
+      # Smoke-run the getting-started sample so a sample that compiles but fails at
+      # startup is still caught and reported.
+      - name: Run getting-started sample
+        run: dotnet run --project samples/DeltaSharp.Samples.GettingStarted/DeltaSharp.Samples.GettingStarted.csproj -c Release --no-build

@@ -135,4 +135,25 @@
   </PropertyGroup>
   <!-- ============================ end lane:01.6 ============================ -->
 
+  <!-- ============================== lane:01.1 ==============================
+    Test-access policy (FEAT-01.1 / #118 STORY-01.1.2 AC3). Every production assembly
+    under src/ grants internals-visibility to its matching `<Project>.Tests` assembly so
+    unit tests can exercise `internal` implementation details without widening them to
+    the assembly's public surface. Engine *contracts* that operators/kernels bind to
+    across assemblies are instead declared `public` — DeltaSharp.Engine is never packed
+    and carries no PublicAPI baseline, so `public` there is engine-internal surface, not
+    a shipped API (see docs/engineering/design/testing-conventions.md and api-governance.md).
+
+    Scoped to src/ via the existing DeltaSharpIsProductionAssembly gate (set in the
+    lane:01.5 block above). The friend name is derived from $(MSBuildProjectName) — a
+    reserved property known at import time — which equals the assembly name by our
+    naming convention (folder == project == assembly), so it resolves to
+    "<AssemblyName>.Tests". The InternalsVisibleTo item is materialized into the
+    assembly by the SDK's GenerateAssemblyInfo target. Assemblies are not strong-named,
+    so the bare assembly name (no PublicKey) is correct. -->
+  <ItemGroup Condition="'$(DeltaSharpIsProductionAssembly)' == 'true'">
+    <InternalsVisibleTo Include="$(MSBuildProjectName).Tests" />
+  </ItemGroup>
+  <!-- ============================ end lane:01.1 ============================ -->
+
 </Project>

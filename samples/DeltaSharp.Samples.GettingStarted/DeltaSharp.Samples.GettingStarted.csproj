@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Getting-started sample (FEAT-01.1 / #119 STORY-01.1.3). A minimal console
+    application that references the public DeltaSharp.Core surface via a ProjectReference
+    so the example always tracks the working tree. See samples/README.md for the sample
+    conventions (non-packable, preview-status visibility, how CI builds samples).
+
+    Targets net8.0 to demonstrate that DeltaSharp.Core is consumable from the current
+    .NET LTS — the multi-target adoption goal in ADR-0014. Samples may target net10.0
+    when they exercise net10.0-only engine features.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>DeltaSharp.Samples.GettingStarted</RootNamespace>
+    <AssemblyName>DeltaSharp.Samples.GettingStarted</AssemblyName>
+    <!-- Samples are examples, never shipped artifacts. Set explicitly (the repository
+         default is already non-packable) so the intent is visible where package
+         settings are inspected (#119 AC2); pack.yml additionally fails if any
+         *Samples* project ever produces a package. -->
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/DeltaSharp.Core/DeltaSharp.Core.csproj" />
+  </ItemGroup>
+
+</Project>
