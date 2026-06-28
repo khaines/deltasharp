@@ -34,5 +34,5 @@ public readonly record struct AffineInt64Kernel(long Multiplier, long Addend)
     /// </summary>
     /// <param name="value">The input value.</param>
     /// <returns><c>(Multiplier * value) + Addend</c>, with wrapping (unchecked) arithmetic.</returns>
-    public long Evaluate(long value) => (Multiplier * value) + Addend;
+    public long Evaluate(long value) => unchecked((Multiplier * value) + Addend);
 }

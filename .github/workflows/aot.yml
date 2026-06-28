@@ -56,3 +56,19 @@ jobs:
           publish_path="src/DeltaSharp.Executor/bin/Release/net10.0/linux-x64/publish/DeltaSharp.Executor"
           test -x "$publish_path"
           echo "NativeAOT executable: $publish_path"
+
+      - name: Assert codegen tier elided and interpreted backend selected (ADR-0001)
+        run: |
+          publish_path="src/DeltaSharp.Executor/bin/Release/net10.0/linux-x64/publish/DeltaSharp.Executor"
+          # AC2/AC5: on a NativeAOT host (no dynamic code) the executor must select the
+          # interpreted backend and still evaluate the kernel correctly.
+          output="$("$publish_path")"
+          echo "$output"
+          echo "$output" | grep -qF "interpreted-vectorized (dynamic-code=False)"
+          echo "$output" | grep -qF "affine(20)=41"
+          # AC3: the optional CompiledBackend must be dead-code-eliminated from the native image.
+          if nm "$publish_path" 2>/dev/null | grep -qi "CompiledBackend"; then
+            echo "ERROR: CompiledBackend symbol found in the NativeAOT image — codegen tier was not elided." >&2
+            exit 1
+          fi
+          echo "Verified: CompiledBackend elided; interpreted backend selected under NativeAOT."

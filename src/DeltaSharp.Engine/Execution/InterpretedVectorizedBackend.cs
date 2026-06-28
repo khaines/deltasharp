@@ -28,5 +28,5 @@ public sealed class InterpretedVectorizedBackend : IExecutionBackend
 
     /// <inheritdoc />
     public Func<long, long> BuildAffineEvaluator(AffineInt64Kernel kernel)
-        => value => (kernel.Multiplier * value) + kernel.Addend;
+        => value => unchecked((kernel.Multiplier * value) + kernel.Addend);
 }
