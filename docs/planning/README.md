@@ -63,17 +63,26 @@ assignment map for later automation.
   `dotnet format --verify-no-changes` to pass with DCO-signed commits.
 - Sizes are relative: **XS, S, M, L, XL**.
 
-## GitHub mapping (for later artifact creation)
+## GitHub mapping (implemented)
+
+The plan is materialized as GitHub artifacts by `files/ghbuild` (idempotent):
 
 | Plan level | GitHub artifact | Labels |
 |---|---|---|
-| Roadmap milestone | **Milestone** | — |
-| Epic | tracking **Issue** (sub-issues = Features) | `epic`, `milestone:Mn` |
-| Feature | **Issue** (sub-issues = Stories) | `feature`, `epic:NN` |
-| Story | **Issue** | `story`, `feature:NN.M`, `persona:<slug>`, `size:<S>` |
+| Roadmap milestone (M1–M4, v1.0) | **Milestone** | — |
+| Epic | tracking **Issue**; Features are native **sub-issues** | `epic`, `epic:NN` |
+| Feature | **Issue**; Stories are native **sub-issues** | `feature`, `epic:NN`, `persona:<slug>` |
+| Story | **Issue** | `story`, `epic:NN`, `persona:<slug>`, `size:<S>` |
 
-Persona slugs become `persona:<slug>` labels so work can be routed to the right
-specialist agent.
+- Every issue (epic + its features + stories) is assigned to its roadmap-phase
+  **Milestone**, so milestone progress bars roll up the whole subtree.
+- Hierarchy uses native **sub-issues** (Features under Epics, Stories under Features),
+  not `feature:NN.M` task lists.
+- Persona slugs become `persona:<slug>` labels so work can be routed to the right
+  specialist agent. GitHub caps label names at 50 chars; the single roster slug that
+  overflows (`dotnet-vectorized-columnar-compute-engineer`) drops its redundant
+  trailing `-engineer` in **label** form (`persona:dotnet-vectorized-columnar-compute`)
+  — the exact slug is always preserved in the issue body.
 
 ## Epic index
 

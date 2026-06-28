@@ -1,0 +1,4 @@
+model.json
+state.db
+*.log
+__pycache__/
