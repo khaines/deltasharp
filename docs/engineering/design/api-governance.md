@@ -24,6 +24,7 @@ wired centrally in [`Directory.Build.props`](../../../Directory.Build.props) ins
 | --- | --- | --- |
 | `DeltaSharp.Core` (packable, public) | yes | yes |
 | `DeltaSharp.Engine` (production, internal) | no | yes |
+| `DeltaSharp.Executor` (production, internal host) | no | yes |
 | `tests/**` | no | no |
 
 The scope follows intent: public-API baselines apply only to **packable public
