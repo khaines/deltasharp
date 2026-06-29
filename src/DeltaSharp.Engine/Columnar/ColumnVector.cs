@@ -53,6 +53,34 @@ public abstract class ColumnVector
     public abstract bool IsNull(int index);
 
     /// <summary>
+    /// Exposes this view's null state as a zero-copy <see cref="Validity"/> so a kernel can combine
+    /// validity in bulk instead of per-row <see cref="IsNull"/> dispatch (STORY-02.6.1). Returns
+    /// <see langword="true"/> when validity can be described as a packed Arrow LSB-first bitmap
+    /// (or as the absent, all-valid bitmap).
+    /// </summary>
+    /// <remarks>
+    /// The base contract only guarantees the <b>no-null fast path</b>: a vector with no nulls yields
+    /// <see cref="Validity.AllValid(int)"/> — an empty bitmap, treated as all-valid <b>without
+    /// allocating a synthetic all-ones buffer</b> (AC1). A vector that has nulls but does not surface
+    /// a packed buffer through this base returns <see langword="false"/>, and the caller falls back to
+    /// per-row <see cref="IsNull"/>; a concrete vector that owns a packed validity buffer may override
+    /// to return it (enabling the bulk validity path for null-bearing inputs too).
+    /// </remarks>
+    /// <param name="validity">The validity view, when this returns <see langword="true"/>.</param>
+    /// <returns><see langword="true"/> if <paramref name="validity"/> is populated; otherwise <see langword="false"/>.</returns>
+    public virtual bool TryGetValidity(out Validity validity)
+    {
+        if (!HasNulls)
+        {
+            validity = Validity.AllValid(Length);
+            return true;
+        }
+
+        validity = default;
+        return false;
+    }
+
+    /// <summary>
     /// The contiguous, offset-adjusted span of <c>Length</c> fixed-width values for this vector,
     /// typed as <typeparamref name="T"/> — the no-boxing hot-path accessor for the v1 primitives
     /// (bool, byte, short, int, long, float, double, date as <see cref="int"/>, timestamp and
