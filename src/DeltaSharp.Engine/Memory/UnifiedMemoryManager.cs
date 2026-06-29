@@ -147,6 +147,13 @@ public sealed class UnifiedMemoryManager
                 if (shortfall > 0)
                 {
                     SpillTaskReservations(task, kind, shortfall);
+
+                    // A spill callback runs arbitrary user code under the reentrant lock and may have
+                    // disposed THIS task (its ReleaseAll then releases and clears every reservation).
+                    // The top-of-method disposed check ran *before* the spill, so re-check now: charging
+                    // or appending a reservation to a task disposed mid-spill orphans it permanently (the
+                    // task's ReleaseAll has already run and will not run again) — an unrecoverable leak.
+                    ObjectDisposedException.ThrowIf(task.IsDisposed, task);
                 }
 
                 // (3) Charge the pool and task if it now fits; otherwise spill-or-fail (never OOM).

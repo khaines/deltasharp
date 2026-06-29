@@ -239,6 +239,31 @@ public class UnifiedMemoryManagerTests
     }
 
     [Fact]
+    public void ReserveTriggeringSpill_ThatDisposesTask_DoesNotChargeDisposedTask()
+    {
+        // Red-team C7 repro for the ReleaseAll-vs-spill asymmetry: a spillable whose Spill callback
+        // disposes its own task clears that task's reservations under the reentrant lock. The reserve
+        // that triggered the spill must then observe the task is disposed and refuse to charge/append —
+        // otherwise it orphans a reservation on a task whose ReleaseAll already ran (an unrecoverable
+        // leak). TaskMemoryManager.Dispose sets the disposed flag before ReleaseAll, so re-checking in
+        // ReserveCore after the spill (not guarding ReleaseAll) is the correct fix.
+        var manager = new UnifiedMemoryManager(200, storageRegionFraction: 0.0);
+        TaskMemoryManager task = manager.RegisterTask(1);
+
+        // A spillable that disposes its own task when asked to spill, freeing nothing itself.
+        var selfDisposing = new DelegateSpillable(_ =>
+        {
+            task.Dispose();
+            return 0;
+        });
+        task.Reserve(MemoryPoolKind.Execution, 150, selfDisposing);
+
+        // The next reserve is short, spills (invoking the self-dispose), then must NOT charge the task.
+        Assert.Throws<ObjectDisposedException>(() => task.Reserve(MemoryPoolKind.Execution, 100));
+        Assert.Equal(0, manager.ExecutionPool.UsedBytes); // no orphan charge — the pool balances to zero
+    }
+
+    [Fact]
     public void ReserveRacingDispose_NeverChargesDisposedTask()
     {
         // Regression for the dispose-vs-reserve TOCTOU. The *public* pre-check alone is insufficient:
