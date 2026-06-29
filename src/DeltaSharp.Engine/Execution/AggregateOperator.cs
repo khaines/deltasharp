@@ -43,6 +43,16 @@ public sealed class AggregateOperator : PhysicalOperator
                 nameof(outputSchema));
         }
 
+        int inputFields = input.OutputSchema.Count;
+        foreach (PhysicalExpression key in groupingKeys)
+        {
+            if (key is ColumnReference c && c.Ordinal >= inputFields)
+            {
+                throw new ArgumentException(
+                    $"Grouping key ordinal {c.Ordinal} is out of range for input schema ({inputFields} fields).", nameof(groupingKeys));
+            }
+        }
+
         _children = [input];
         _groupingKeys = [.. groupingKeys];
         _aggregates = [.. aggregates];

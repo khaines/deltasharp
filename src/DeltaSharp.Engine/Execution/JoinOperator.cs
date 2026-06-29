@@ -51,6 +51,19 @@ public sealed class JoinOperator : PhysicalOperator
             }
         }
 
+        for (int i = 0; i < leftKeys.Count; i++)
+        {
+            if (leftKeys[i] is ColumnReference lc && lc.Ordinal >= left.OutputSchema.Count)
+            {
+                throw new ArgumentException($"Left key {i} ordinal {lc.Ordinal} out of range for left input ({left.OutputSchema.Count} fields).", nameof(leftKeys));
+            }
+
+            if (rightKeys[i] is ColumnReference rc && rc.Ordinal >= right.OutputSchema.Count)
+            {
+                throw new ArgumentException($"Right key {i} ordinal {rc.Ordinal} out of range for right input ({right.OutputSchema.Count} fields).", nameof(rightKeys));
+            }
+        }
+
         _children = [left, right];
         JoinType = joinType;
         _leftKeys = [.. leftKeys];

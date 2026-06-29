@@ -49,6 +49,22 @@ public class ExecutionContractsTests
     }
 
     [Fact]
+    public void Aggregate_GroupingKeyOrdinalOutOfRange_Throws()
+    {
+        var outSchema = new StructType([new StructField("k", DataTypes.IntegerType, nullable: false), new StructField("c", DataTypes.LongType, nullable: true)]);
+        var badKey = new ColumnReference(9, DataTypes.IntegerType, nullable: false); // input has 2 fields
+        Assert.Throws<ArgumentException>(() =>
+            new AggregateOperator(Scan(), outSchema, groupingKeys: [badKey], aggregates: [new ColumnReference(1, DataTypes.LongType, true)]));
+    }
+
+    [Fact]
+    public void Join_KeyOrdinalOutOfRange_Throws()
+    {
+        var bad = new ColumnReference(9, DataTypes.IntegerType, nullable: false); // inputs have 2 fields
+        Assert.Throws<ArgumentException>(() => new JoinOperator(Scan(), Scan(), Schema, JoinType.Inner, [bad], [IntCol]));
+    }
+
+    [Fact]
     public void Project_TypedOutput_OneExpressionPerField()
     {
         var outSchema = new StructType([new StructField("x", DataTypes.IntegerType, nullable: false)]);
