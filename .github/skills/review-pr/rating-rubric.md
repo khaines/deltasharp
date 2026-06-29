@@ -273,10 +273,11 @@ and the red-team verdict.
 **PASS** requires ALL of:
 
 - every voting seat (the 4 lenses + each scout-selected specialist) at **5/5**, with a complete
-  Approve attestation (below). **The PASS gate requires 5/5 unconditionally; `target_rating` does
-  not relax it** — `target_rating` only governs the separate "below-target-with-verified-deferrals"
-  termination path in `review-fix-loop`, and any `target_rating < 5` cannot satisfy "zero
-  actionable" below (a sub-5/5 implies ≥1 actionable High);
+  Approve attestation (below). **5/5 from every seat is mandatory — there is NO exception, allowance,
+  tolerance, or human waiver for any seat below 5/5.** `target_rating` does not relax it; it only
+  governs the separate "below-target" *termination* path in `review-fix-loop` (which may STOP the loop
+  but is **never** a PASS and **never** merge-ready). A sub-5/5 seat implies ≥1 actionable item: fix it
+  and re-score — do not present, label, or merge a sub-5/5 PR as PASS;
 - **zero actionable** (Critical/High) findings open;
 - **zero open C1 / C2 / C4 / C5 / C6 / C7 items** — no proven-vacuous test, no dead/un-wired
   control or validation↔enforcement gap, no unbacked PR/spec claim, no unmigrated compat break, no

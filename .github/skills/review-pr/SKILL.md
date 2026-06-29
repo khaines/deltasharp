@@ -457,7 +457,9 @@ Submit the review action determined by **both** the rating and the Phase 8 red-t
   **APPROVE**; **Rating 3** → **COMMENT**; **Rating 1–2** → **REQUEST_CHANGES**.
 
 `APPROVE` is a review action, not a merge gate; the rating and red-team verdict together are the
-quality signal, and AI never merges.
+quality signal, and AI never merges. **The merge/PASS gate is unanimous 5/5 with no exception,
+allowance, or waiver — a 4/5 `APPROVE` is review feedback, not PASS, and must never be presented as
+merge-ready (see `rating-rubric.md` → PASS gate).**
 
 ### 9.2 Post the Review
 
