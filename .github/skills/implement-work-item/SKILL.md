@@ -396,7 +396,7 @@ Repeat the following cycle until termination (§8.2):
 
 **Step A — Review**: Invoke the `review-pr` skill on the PR. Collect findings.
 
-**Step B — Evaluate**: Apply the review-fix-loop's dismissal and consensus rules (from `.github/skills/review-fix-loop/dismissal-rules.md`) to filter actionable findings. If no actionable findings remain, terminate with success.
+**Step B — Evaluate**: Apply the review-fix-loop's dismissal and consensus rules (from `.github/skills/review-fix-loop/dismissal-rules.md`) to filter actionable findings. If no actionable findings remain AND the unconditional 5/5 PASS gate is met, terminate with success. If no actionable findings remain but the PR is below 5/5, it is a STOP (never a PASS).
 
 **Step C — Fix**: Dispatch the appropriate agent persona(s) to fix actionable findings. Agent selection follows the same routing used in Phase 3.
 
@@ -424,8 +424,8 @@ Push to the PR branch.
 
 The review-fix-test loop terminates when:
 
-- No new actionable findings AND all tests pass → **success**.
-- Target rating achieved AND all tests pass → **success**.
+- Unconditional 5/5 PASS gate achieved AND all tests pass → **success**.
+- No new actionable findings but below 5/5 → **stop** (never a PASS/merge-ready).
 - Max rounds reached (use the review-fix-loop's `max_rounds` default of 5) → **stop** with current state (tests must still be green).
 - A review fix cannot be reconciled with passing tests after `max_review_regression_fixes` attempts → **stop** and revert the problematic fix.
 
