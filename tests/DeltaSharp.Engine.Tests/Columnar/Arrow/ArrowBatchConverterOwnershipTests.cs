@@ -1,3 +1,4 @@
+using System.Threading;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using DeltaSharp.Engine.Columnar.Arrow;
@@ -29,6 +30,45 @@ public class ArrowBatchConverterOwnershipTests
 
         Assert.True(batch.IsDisposed);
         Assert.Equal(1, source.DisposeCalls);
+    }
+
+    [Fact]
+    public void Transfer_DisposesSourceExactlyOnce_UnderConcurrentDispose()
+    {
+        // The exactly-once guarantee is interlocked, so racing Dispose from many threads must still
+        // release the source exactly once. DisposeCountingRecordBatch carries no idempotency guard, so
+        // a non-atomic check/set in ArrowColumnBatch.Dispose would let two racers both enter the funnel
+        // (DisposeCalls == 2). A Barrier releases all racers simultaneously to maximize the
+        // interleaving, repeated across many rounds; on the interlocked code the invariant holds for
+        // every interleaving (never false-fails), and the non-atomic mutant is reliably killed.
+        const int rounds = 2000;
+        const int racers = 8;
+        for (int r = 0; r < rounds; r++)
+        {
+            DisposeCountingRecordBatch source = BuildCountingBatch();
+            ArrowColumnBatch batch = ArrowBatchConverter.FromArrow(source, ArrowImportOwnership.Transfer);
+
+            using var barrier = new Barrier(racers);
+            var threads = new Thread[racers];
+            for (int t = 0; t < racers; t++)
+            {
+                threads[t] = new Thread(() =>
+                {
+                    barrier.SignalAndWait(); // all racers cross together
+                    batch.Dispose();
+                })
+                { IsBackground = true };
+                threads[t].Start();
+            }
+
+            foreach (Thread thread in threads)
+            {
+                thread.Join();
+            }
+
+            Assert.True(batch.IsDisposed);
+            Assert.Equal(1, source.DisposeCalls); // exactly once despite the concurrent dispose
+        }
     }
 
     [Fact]
