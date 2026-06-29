@@ -11,6 +11,11 @@
     <RootNamespace>DeltaSharp.Engine</RootNamespace>
     <AssemblyName>DeltaSharp.Engine</AssemblyName>
     <IsPackable>false</IsPackable>
+    <!-- ADR-0013: the off-heap memory model (src/DeltaSharp.Engine/Memory/) builds Span<byte> over
+         NativeMemory.AlignedAlloc pointers, which requires unsafe pointer code. Scoped project-local
+         (NOT Directory.Build.props) so unsafe stays opt-in per assembly. NativeMemory and unsafe
+         pointers are AOT/trim-clean and not on BannedSymbols.txt, so the AOT analyzers above stay green. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <!-- ADR-0014: the engine is destined for the NativeAOT executor image, so keep it
          AOT-clean from the first commit. Enable the analyzers (not IsAotCompatible) so
          the lock file stays free of the SDK-version-tied ILLink.Tasks package. -->
