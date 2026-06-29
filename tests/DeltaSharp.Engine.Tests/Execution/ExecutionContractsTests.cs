@@ -159,20 +159,25 @@ public class ExecutionContractsTests
     [InlineData(OperatorKind.Scan)]
     [InlineData(OperatorKind.Filter)]
     [InlineData(OperatorKind.Project)]
+    public void Interpreted_SupportsV1ExecutableKinds(OperatorKind kind)
+        => Assert.True(InterpretedVectorizedBackend.Instance.Supports(kind));
+
+    [Theory]
     [InlineData(OperatorKind.Aggregate)]
     [InlineData(OperatorKind.Sort)]
     [InlineData(OperatorKind.Join)]
     [InlineData(OperatorKind.ExchangeLocal)]
-    public void Interpreted_DeclaresEveryKindUnsupported_ForV1(OperatorKind kind)
+    public void Interpreted_DeclaresRemainingKindsUnsupported_ForV1(OperatorKind kind)
         => Assert.False(InterpretedVectorizedBackend.Instance.Supports(kind));
 
     [Fact]
-    public void Open_Unsupported_ThrowsPreciseError_NoFallback()
+    public void Open_UnsupportedKind_ThrowsPreciseError_NoFallback()
     {
         IExecutionBackend backend = InterpretedVectorizedBackend.Instance;
         var ctx = new ExecutionContext(BoundedExecutionMemory.Unbounded);
-        var ex = Assert.Throws<UnsupportedOperatorException>(() => backend.Open(Scan(), ctx));
-        Assert.Equal(OperatorKind.Scan, ex.Kind);
+        var sort = new SortOperator(Scan(), [new SortOrder(IntCol, SortDirection.Ascending, NullOrdering.NullsFirst)]);
+        var ex = Assert.Throws<UnsupportedOperatorException>(() => backend.Open(sort, ctx));
+        Assert.Equal(OperatorKind.Sort, ex.Kind);
         Assert.Equal(backend.Name, ex.BackendName);
         Assert.Contains("No row-at-a-time fallback", ex.Message, StringComparison.Ordinal);
         Assert.IsAssignableFrom<NotSupportedException>(ex);
