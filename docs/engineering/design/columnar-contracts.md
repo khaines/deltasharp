@@ -91,17 +91,32 @@ mutated underneath the view; build a vector fully, then select/slice it.
 `ManagedFixedWidthColumnVector<T>`, `ManagedVariableWidthColumnVector`, and `ManagedColumnBatch`
 are a managed, GC-heap implementation of the contracts, obtained via the `ColumnVectors.Create`
 factory. They are the **correctness reference** and a concrete **non-Arrow** implementation — they
-prove AC4 (the contracts are fully implementable with no `Apache.Arrow` dependency; the engine
-assembly references no Arrow package). They are intentionally simple; the performant Arrow-backed
-and off-heap vectors are separate stories.
+prove AC4 (the contracts are fully implementable with no `Apache.Arrow` dependency; the
+operator-facing contract surface names no Arrow type). They are intentionally simple; the
+Arrow-backed vector (now landed, below) and the future off-heap vector are separate
+implementations of the same contracts.
+
+## Arrow-backed vector (STORY-02.2.1, #135)
+
+`ArrowColumnVector.Wrap(IArrowArray)` is the **boundary edge** ("Arrow at the edges", ADR-0002):
+it wraps an Apache Arrow primitive/variable array as an immutable `ColumnVector` with **no value or
+validity copy**. `Apache.Arrow` is named only inside `Columnar/Arrow/` (the `Wrap` factory); nothing
+operator-facing names an Arrow type, so kernels never change. Arrow's `Values`/`IsNull`/`NullCount`
+are already offset-adjusted and LSB-first (matching `Bitmap`), so non-zero offsets and slices resolve
+correctly. The vector is read-only (it is a `ColumnVector`, not a `MutableColumnVector`); a mutable
+output is built through `ColumnVectors.Create` and never mutates Arrow buffers. v1 maps Int8→`tinyint`,
+Int16/Int32/Int64, Float/Double, Date32, microsecond Timestamp, String, and Binary; bit-packed
+boolean, decimal, unsigned/half-float, non-microsecond timestamps, null, and nested arrays raise a
+precise `UnsupportedTypeException` rather than coercing or dropping data. See
+[arrow-backed-vector.md](arrow-backed-vector.md).
 
 ## v1 scope and deferrals
 
 - **In scope:** the `ColumnVector`/`MutableColumnVector`/`ColumnBatch`/`SelectionVector` contracts,
   typed no-boxing access for the v1 primitives, the validity model, slicing, selection awareness,
-  zero-copy selection **views** + composition (STORY-02.1.2, #134), and a managed reference
-  implementation.
-- **Deferred:** Arrow-backed vectors + boundary conversion (FEAT-02.2, #135/#136); off-heap
+  zero-copy selection **views** + composition (STORY-02.1.2, #134), a managed reference
+  implementation, and the **Arrow-backed `ColumnVector`** (STORY-02.2.1, #135).
+- **Deferred:** Arrow boundary round-trip + batch conversion (STORY-02.2.2, #136); off-heap
   `NativeMemory` vectors + spill (FEAT-02.3, ADR-0013); branchless null/validity helpers
   (FEAT-02.6, #143/#144); first-class **nested** (`array`/`map`/`struct`) child vectors — the
   contracts classify them as `Nested` and the managed factory does not yet build them.
