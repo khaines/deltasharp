@@ -4,8 +4,11 @@
 > [STORY-02.3.1](https://github.com/khaines/deltasharp/blob/main/docs/planning/epics/EPIC-02-columnar-memory-type-system.md#story-0231-implement-aligned-off-heap-allocation-ownership).
 > Grounded in [ADR-0013](../../adr/0013-memory-model.md) (off-heap `NativeMemory`, 64-byte
 > aligned, for in-memory batches) and [ADR-0002](../../adr/0002-columnar-batch-format.md) (the
-> `ColumnBatch`/`ColumnVector` buffers this memory backs). Update it whenever the buffer-ownership
-> contract or its accounting changes.
+> `ColumnBatch`/`ColumnVector` buffers this memory backs). Extended with
+> [STORY-02.3.2](https://github.com/khaines/deltasharp/issues/138) (#138), which adds the **unified
+> execution/storage memory manager** (one budget, two pools, per-task reservations, and spill
+> triggers; spill targets per [ADR-0004](../../adr/0004-shuffle-architecture.md)). Update it whenever
+> the buffer-ownership contract, the reservation/budget model, or their accounting changes.
 
 DeltaSharp's columnar batches and binary row buffers need a memory strategy that is
 **deterministically reclaimed**, **SIMD-aligned**, and **free of Large-Object-Heap (LOH) / gen-2
@@ -98,8 +101,9 @@ data; scratch is small, so the zeroing cost is negligible).
 decremented** and `FinalizedWithoutDispose` is **not** bumped — the leak is invisible to the
 diagnostics. This is an accepted trade-off: a missed scratch dispose costs only pool churn, not a
 process memory leak, so it does not warrant a finalizer on the cheap path. A *native* leak, by
-contrast, is always freed and flagged. A debug-only scratch-leak tracker can be added when the
-unified manager (STORY-02.3.2 / #138) lands.
+contrast, is always freed and flagged. A debug-only scratch-leak tracker remains a possible future
+diagnostic; the #138 unified manager does not add one, since it accounts logical reservations rather
+than scratch-buffer disposal.
 
 ### Observing the real release
 
@@ -167,6 +171,81 @@ and is responsible for disposing them. This is the off-heap analogue of a scope 
 consumer and let it take ownership only after all throwing work, e.g.
 `var bufs = group.Detach(); try { return new NativeColumnVector(bufs); } catch { foreach (var b in bufs) b.Dispose(); throw; }` — otherwise a throwing consumer constructor after a bare `Detach()` orphans the buffers (reclaimed late by the native finalizer; scratch leaks silently per the asymmetry above).
 
+## Unified execution/storage memory manager (STORY-02.3.2)
+
+The ownership layer above hands out and reclaims individual buffers; it does not **bound** how much an
+executor holds at once. [STORY-02.3.2](https://github.com/khaines/deltasharp/issues/138) (#138) adds the
+**unified memory manager** ADR-0013 calls for — Spark's `UnifiedMemoryManager` analog — a **reservation
+ledger** governing one executor-wide budget so a single unbounded query cannot exhaust shared memory. It
+lives beside the allocator in `src/DeltaSharp.Engine/Memory/` and is a **logical byte ledger**: it
+accounts reservations and triggers spills; it does **not** itself allocate. Callers reserve here, then
+allocate the physical bytes from a `NativeMemoryAllocator`, and release both in reverse. It is the
+machinery the operator-facing `IExecutionMemory` seam (`BoundedExecutionMemory`) is designed to front;
+connecting the two lives in `Execution/`, outside this story's `Memory/`-only scope.
+
+| Type | Role |
+| --- | --- |
+| `UnifiedMemoryManager` | Owns the total budget, both pools, the soft boundary, and the borrow/spill orchestration. One per executor. |
+| `MemoryPool` / `MemoryPoolKind` | Accounting for one region — `Execution` (non-evictable scratch) or `Storage` (evictable cache) — with its shifting `PoolSizeBytes`/`UsedBytes`/`FreeBytes`. |
+| `TaskMemoryManager` | The per-task reservation handle (Spark's `TaskMemoryManager`): tracks the task's used bytes and its reservations; disposing it releases them all. |
+| `MemoryReservation` | One reservation — the budget analogue of `OwnedBuffer`: exactly-once release, shrink-on-spill. |
+| `ISpillable` / `SpillCallback` / `DelegateSpillable` | The spill trigger: a consumer the manager asks to free reserved bytes under pressure. |
+| `MemoryBudgetExceededException` | The deterministic budget-exceeded error (task id, requested bytes, full pool state). |
+
+### Two pools, one budget, a soft borrowing boundary (AC1)
+
+The budget is split into an **execution** region (non-evictable scratch for sorts, joins, aggregation)
+and a **storage** region (evictable cached/broadcast batches), sized at construction by
+`StorageRegionBytes` (default half — Spark's `spark.memory.storageFraction`). The split is a **soft,
+shifting boundary**: a pool grows by **borrowing the other pool's free capacity** — execution may take
+all of storage's free space (the storage region only caps execution to the extent storage is *using*
+memory), and storage may take execution's free space (execution is never evicted on storage's behalf).
+Borrowing is a boundary shift (`IncrementPoolSize`/`DecrementPoolSize`), so the two pool sizes always
+sum to the budget. Each pool reports `PoolSizeBytes`/`UsedBytes`/`FreeBytes`, and each
+`TaskMemoryManager` reports its own `ExecutionUsedBytes`/`StorageUsedBytes`, so available bytes, used
+bytes, and **task ownership** are all accurately attributable (AC1).
+
+### Per-task reservations and release discipline
+
+A task reserves through a `TaskMemoryManager` (`manager.RegisterTask(taskId)`) **before** it allocates,
+and holds each grant as a `MemoryReservation` (`IDisposable`). Release is the budget analogue of the
+ownership layer's exactly-once disposal: `MemoryReservation.Dispose()` returns the reservation's
+remaining bytes to its pool and task exactly once (Interlocked-latched, so a double dispose or a
+disposer race is a safe no-op and totals never go negative), and disposing the `TaskMemoryManager`
+releases every reservation the task still holds — so a finished or failed task cannot leak budget.
+
+### Spill triggers: spill-or-fail, never OOM (AC2, AC3, AC5)
+
+When a reservation would push a pool over budget *after* borrowing, the manager invokes the requesting
+task's **spillable reservations** before it rejects (AC2). An `ISpillable` consumer (a sort buffer, hash
+aggregate, join build side) serializes in-memory state to a spill target supplied by later runtime
+layers — local disk / object store, [ADR-0004](../../adr/0004-shuffle-architecture.md) — and returns
+the bytes it freed; the manager then **releases exactly that many bytes** from the consumer's
+reservation and the pool/task totals (AC5), shrinking the reservation so a later `Dispose()` releases
+only the remainder. If spilling frees enough, the reservation is granted; if not, it **fails
+deterministically** — `TryReserve` returns `null` and `Reserve` throws `MemoryBudgetExceededException`
+carrying the task id, requested bytes, and full pool state (AC3). Either way the failure is a bounded,
+reproducible signal — **not** an `OutOfMemoryException`: the manager bounds memory by refusing the
+reservation, never by exhausting the process.
+
+The manager only ever spills the **requesting task's own** spillable reservations, so one task spilling
+never decrements or leaks a concurrent task's accounting (AC4). Spill callbacks run while the manager
+holds its coordinating lock, so a v1 `Spill` must be fast and must not re-enter the manager — it frees
+buffers and returns a count; the manager is the sole accountant (the callback must not also release, or
+bytes would be double-counted).
+
+### Deterministic accounting and thread-safety (AC4)
+
+Per-field byte counters are updated through `Interlocked`, so the public gauges are torn-free for a
+lock-free observer (metrics, leak assertions), matching the allocator's counters — but they are **not** a
+jointly-consistent multi-field snapshot during live concurrency, so assert on quiescent state. The
+compound reserve/borrow/spill *decision* is serialized by one coordinating lock per manager, because it
+must atomically read-and-shift two pools and orchestrate spills — a multi-variable invariant
+`Interlocked` alone cannot hold. Once every reservation and task is released, each pool's `UsedBytes`
+returns to zero **and** the soft boundary resets to the configured regions, so the manager returns to its
+exact initial baseline — the deterministic-accounting signal the unit tests assert (borrowing across
+pools, reserve/release balancing to zero, concurrent reserve/release, and double-release safety).
+
 ## v1 scope and deferrals
 
 - **In scope:** the `OwnedBuffer` ownership contract; the aligned off-heap default
@@ -177,14 +256,25 @@ consumer and let it take ownership only after all throwing work, e.g.
   ADR-0002 `ColumnVector.Slice`/`WithSelection` are **zero-copy views that share buffers**. A future
   off-heap vector therefore needs an explicit lifetime model (ref-count, root-keepalive on each slice,
   or batch-arena dispose) — the disposal analogue of #133's seal-on-slice — and SIMD over-read on
-  shared tails is already handled by the 64-byte capacity padding. This is the key #138 design risk.
-- **Deferred to [STORY-02.3.2](https://github.com/khaines/deltasharp/issues/138) (#138):** the
-  **unified execution/storage memory manager** — execution vs. storage pools, **per-task budgets**,
-  and **spill-to-disk / object-store under pressure** (Spark's `UnifiedMemoryManager`; ties to
-  [ADR-0004](../../adr/0004-shuffle-architecture.md)). This story deliberately provides only the
-  deterministic, aligned **ownership** primitive those pools and spill triggers will be built on; the
-  allocator is intentionally per-instance (no global pool) so a future manager can own budget and
-  pressure policy without reworking ownership.
+  shared tails is already handled by the 64-byte capacity padding. This stays the key design risk for a
+  future off-heap vector; the #138 manager sidesteps it by accounting bytes logically rather than owning
+  shared buffers.
+- **Delivered by [STORY-02.3.2](https://github.com/khaines/deltasharp/issues/138) (#138):** the
+  **unified execution/storage memory manager** documented above — two pools over one shared budget with
+  free-space borrowing, per-task reservations with exactly-once release discipline, and spill triggers
+  that spill-or-fail (never OOM). It builds on this ownership primitive without reworking it: the manager
+  is a logical reservation ledger, and the per-instance allocator (no global pool) still owns the
+  physical bytes — reserve in the manager, allocate from the allocator, release both in reverse.
+- **Deferred — the manager's own follow-ups:**
+  - **Physical wiring:** the manager is not yet connected to `NativeMemoryAllocator` (reserve → allocate)
+    or to the operator-facing `IExecutionMemory` / `BoundedExecutionMemory` seam — both live in
+    `Execution/`, outside this story's `Memory/`-only scope.
+  - **Used-storage eviction:** v1 borrows only the *free* capacity of the other pool; reclaiming
+    storage's *used* (cached) blocks down to `StorageRegionBytes` by eviction is later (ties to caching).
+  - **Cross-task spill and fair sharing:** v1 spills only the requesting task's own reservations and
+    never blocks; Spark's 1/2N..1/N per-task fair share with blocking and cross-task spill is later.
+  - **Spill I/O off the lock:** v1 invokes spill callbacks under the coordinating lock (fast,
+    non-reentrant); moving blocking disk / object-store spill I/O outside the lock is later.
 - **Also later:** wiring `AlignedNativeBuffer` under the off-heap `ColumnVector` implementation (the
   Arrow-backed vector, FEAT-02.2, remains the early baseline), pod-memory accounting/limits for
   executors, and a custom off-heap allocator beyond `NativeMemory` if profiling justifies it.
