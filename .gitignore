@@ -53,3 +53,6 @@ secrets.json
 
 # RFL review-fix-loop scratch (e.g. .rfl-report-<pr>.md) — never commit per-run artifacts
 .rfl-*
+
+# Editor backup artifacts — never commit into engine source
+*.bak
