@@ -24,7 +24,6 @@
     <EnableSingleFileAnalyzer>true</EnableSingleFileAnalyzer>
     <!-- Lock the Apache.Arrow boundary dependency for reproducible, drift-detecting restores
          (CI restores in locked mode), matching the test projects' policy. -->
-    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
   </PropertyGroup>
 
   <ItemGroup>
