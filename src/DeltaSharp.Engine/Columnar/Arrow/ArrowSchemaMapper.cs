@@ -18,8 +18,9 @@ internal static class ArrowSchemaMapper
     /// </summary>
     /// <exception cref="UnsupportedTypeException">
     /// The Arrow type has no v1 DeltaSharp mapping (unsigned/half-float primitives, a non-microsecond
-    /// timestamp, <c>date64</c>/<c>time</c>/<c>decimal256</c>, the null type, large/view layouts, or a
-    /// nested type whose children are themselves unsupported).
+    /// timestamp, <c>date64</c>/<c>time</c>/<c>decimal256</c>, a <c>decimal128</c> whose precision/scale
+    /// is outside DeltaSharp's range, the null type, large/view layouts, or a nested type whose children
+    /// are themselves unsupported).
     /// </exception>
     internal static DataType ToDeltaType(ArrowTypes.IArrowType arrowType)
     {
@@ -36,7 +37,7 @@ internal static class ArrowSchemaMapper
             ArrowTypes.BooleanType => BooleanType.Instance,
             ArrowTypes.Date32Type => DateType.Instance,
             ArrowTypes.TimestampType ts => MapTimestamp(ts),
-            ArrowTypes.Decimal128Type d => new DecimalType(d.Precision, d.Scale),
+            ArrowTypes.Decimal128Type d => MapDecimal(d),
             ArrowTypes.StringType => StringType.Instance,
             ArrowTypes.BinaryType => BinaryType.Instance,
             ArrowTypes.StructType st => MapStruct(st),
@@ -59,6 +60,28 @@ internal static class ArrowSchemaMapper
         }
 
         return TimestampType.Instance;
+    }
+
+    private static DecimalType MapDecimal(ArrowTypes.Decimal128Type decimal128)
+    {
+        int precision = decimal128.Precision;
+        int scale = decimal128.Scale;
+
+        // Apache.Arrow admits decimal128 precisions above DeltaSharp's Spark-parity cap of 38 (e.g.
+        // Decimal128Type(40, 2)) and other out-of-range precision/scale combinations. Constructing
+        // DecimalType for those would surface its SchemaValidationException, breaking this mapper's
+        // "every gap -> UnsupportedTypeException" promise, so fail closed here naming the exact Arrow
+        // type (council F-DEC1).
+        if (precision < DecimalType.MinPrecision || precision > DecimalType.MaxPrecision
+            || scale < 0 || scale > precision)
+        {
+            throw new UnsupportedTypeException(
+                $"Arrow decimal128(precision: {precision}, scale: {scale}) has no v1 DeltaSharp columnar "
+                + $"mapping; precision must be in [{DecimalType.MinPrecision}, {DecimalType.MaxPrecision}] "
+                + "and scale in [0, precision].");
+        }
+
+        return new DecimalType(precision, scale);
     }
 
     private static StructType MapStruct(ArrowTypes.StructType arrowStruct)

@@ -24,5 +24,14 @@ public enum ArrowImportOwnership
     /// under repeated <c>Dispose</c>), and the caller must not use or dispose the source afterward.
     /// This is the right choice when the import is the sole consumer of a freshly produced batch.
     /// </summary>
+    /// <remarks>
+    /// This is the <b>sharp</b> mode: disposing the batch frees the source Arrow buffers, so any
+    /// <see cref="ColumnVector"/>, <see cref="ReadOnlySpan{T}"/>, slice, or selection previously vended
+    /// from the batch is <b>invalidated</b> by that dispose. Reading such a view afterward is a
+    /// use-after-free with undefined results (it may throw, return recycled bytes, or crash); the
+    /// batch's <see cref="ObjectDisposedException"/> guards are disposal hygiene on the batch accessors,
+    /// not memory-safety protection for views already handed out. Keep no vended view past the dispose,
+    /// or copy out the values first.
+    /// </remarks>
     Transfer = 1,
 }

@@ -44,6 +44,17 @@ public class ArrowSchemaMapperTests
     }
 
     [Fact]
+    public void ToDeltaType_Decimal128PrecisionAbove38_Throws()
+    {
+        // Apache.Arrow admits decimal128 precisions above DeltaSharp's Spark-parity cap of 38. The
+        // mapper must fail closed with its own UnsupportedTypeException, not let DecimalType's
+        // SchemaValidationException leak and break the "every gap -> UnsupportedTypeException" promise
+        // (council F-DEC1).
+        Assert.Throws<UnsupportedTypeException>(
+            () => ArrowSchemaMapper.ToDeltaType(new ArrowDecimal128Type(40, 2)));
+    }
+
+    [Fact]
     public void ToDeltaType_MicrosecondTimestamp_MapsToTimestamp()
     {
         DataType mapped = ArrowSchemaMapper.ToDeltaType(new ArrowTimestampType(ArrowTimeUnit.Microsecond, "UTC"));

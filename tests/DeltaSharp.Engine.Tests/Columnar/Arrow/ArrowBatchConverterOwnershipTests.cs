@@ -1,6 +1,7 @@
 using System.Threading;
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Engine.Columnar.Arrow;
 using Xunit;
 
@@ -98,6 +99,7 @@ public class ArrowBatchConverterOwnershipTests
 
         Assert.Throws<ObjectDisposedException>(() => batch.Column(0));
         Assert.Throws<ObjectDisposedException>(() => batch.Slice(0, 1));
+        Assert.Throws<ObjectDisposedException>(() => batch.WithSelection(new SelectionVector(new[] { 0 })));
     }
 
     [Fact]
@@ -112,6 +114,10 @@ public class ArrowBatchConverterOwnershipTests
         batch.Dispose();
         batch.Dispose();
 
+        // This allocator-based oracle proves buffers are freed once at the IMemoryOwner level, but it
+        // can't detect a RecordBatch-level double-free: CountingOwner._freed makes Dispose idempotent,
+        // masking a second release of the same owner. DisposeCountingRecordBatch (used by the dispose
+        // tests above) is the real double-free detector; the two oracles are complementary.
         Assert.Equal(0, allocator.Outstanding); // every buffer freed
         Assert.Equal(allocator.AllocationCount, allocator.FreeCount); // exactly once each
     }

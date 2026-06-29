@@ -43,6 +43,23 @@ public static class ArrowBatchConverter
     /// The DeltaSharp schema mirrors the Arrow field names and nullability; each column's logical type
     /// is the wrapped vector's type.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Lifetime / use-after-free.</b> Import is zero-copy: every flat <see cref="ColumnVector"/>, the
+    /// <see cref="ReadOnlySpan{T}"/>s it vends, and any <see cref="ColumnBatch.Slice"/>/selection derived
+    /// from a column read straight through to the source Arrow buffers. Those buffers are released when
+    /// the owning lifetime ends — disposing the returned batch under
+    /// <see cref="ArrowImportOwnership.Transfer"/>, or the caller disposing the source under
+    /// <see cref="ArrowImportOwnership.Borrowed"/>. A column or span vended from the batch <b>must not
+    /// outlive that lifetime</b>: reading it afterward reads freed memory and is <b>undefined behavior</b>
+    /// (a use-after-free that may throw a native <see cref="NullReferenceException"/>, return recycled
+    /// bytes, or crash). The batch-level <see cref="ObjectDisposedException"/> guard on
+    /// <see cref="ArrowColumnBatch.Column"/>/<see cref="ArrowColumnBatch.Slice"/>/<see cref="ArrowColumnBatch.WithSelection"/>
+    /// is disposal <i>hygiene</i>, <b>not</b> a memory-safety guarantee — it does not invalidate a view
+    /// already handed out. <see cref="ArrowImportOwnership.Transfer"/> is the sharp mode (disposing the
+    /// batch frees the source). Materialize (copy out) any values you need to keep beyond the lifetime.
+    /// </para>
+    /// </remarks>
     /// <param name="recordBatch">The Arrow batch to import.</param>
     /// <param name="ownership">
     /// Who owns the source buffers (default <see cref="ArrowImportOwnership.Borrowed"/>); see

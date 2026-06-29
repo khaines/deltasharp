@@ -128,10 +128,38 @@ columns. `ArrowImportOwnership` makes "who frees them" explicit:
 | `Transfer` | disposes the source **exactly once** (idempotent on repeated/concurrent `Dispose`) | must not use or dispose the source afterward |
 
 Exactly-once is enforced with an `Interlocked.Exchange` flag: the first `Dispose` wins and performs the
-documented release; later calls are no-ops. After disposal the column accessors (`Column`, `Slice`,
-`WithSelection`) throw `ObjectDisposedException`. Tests prove this at both levels — a counting
-`RecordBatch` (dispose funnel entered once) and a counting `MemoryAllocator` (every imported buffer
-freed once, none leaked) — for both modes.
+documented release; later calls are no-ops. After disposal the **batch-level** accessors (`Column`,
+`Slice`, `WithSelection`) throw `ObjectDisposedException` as lifecycle **hygiene** — this is *not* a
+memory-safety guarantee for views already handed out (see **Lifetime contract / use-after-free** below).
+Tests prove the disposal accounting at both levels — a counting `RecordBatch` (dispose funnel entered
+once) and a counting `MemoryAllocator` (every imported buffer freed once, none leaked) — for both modes.
+
+## Lifetime contract / use-after-free
+
+Import is **zero-copy**, so a flat `ColumnVector` — and every `ReadOnlySpan<T>`, `Slice`, or selection
+derived from it — reads straight through to the source `RecordBatch`'s Arrow buffers. Those buffers are
+freed when the owning lifetime ends:
+
+| mode | what frees the source buffers |
+| --- | --- |
+| `Transfer` | disposing the `ArrowColumnBatch` (the **sharp** mode — the batch owns the source) |
+| `Borrowed` | the caller disposing the source (disposing the batch frees nothing) |
+
+A view vended from the batch **must not outlive that lifetime**. Reading a `ColumnVector`/span/slice
+after the batch (`Transfer`) or the source (`Borrowed`) is disposed reads freed memory and is
+**undefined behavior** — a use-after-free that may throw a native `NullReferenceException`, silently
+return recycled bytes (a future cross-tenant disclosure primitive once buffers are pooled/native), or
+crash.
+
+The batch-level `ObjectDisposedException` on `Column`/`Slice`/`WithSelection` is **disposal hygiene on
+those accessors only**: it does **not** invalidate a column already vended, and is therefore **not** a
+memory-safety boundary. The honest contract is *"do not let a vended view outlive its batch (`Transfer`)
+or source (`Borrowed`)"*; to keep values longer, **materialize** (copy) them out first. The XML docs on
+`FromArrow`, `ArrowColumnBatch.Column`/`Slice`/`WithSelection`, and `ArrowImportOwnership.Transfer` carry
+the same warning. A contract test pins the **safe** half — a `Borrowed` vended `ColumnVector` reads
+correctly while the source is alive, and the batch-level accessors throw `ObjectDisposedException` after
+dispose — and documents (but does **not** execute) the use-after-free half so the rule is recorded
+without invoking undefined behavior.
 
 ## Residual caveats
 
@@ -149,3 +177,8 @@ freed once, none leaked) — for both modes.
   source zone string is dropped.
 - **`NullArray`** is unsupported on purpose (the reader can't materialize an all-null typeless column
   consistently); convert to a typed all-null column before importing.
+- **Field and schema metadata are dropped in both directions**: v1 maps only name / type / nullability,
+  so Arrow field metadata and schema-level metadata — Delta column-mapping IDs, Spark field comments — do
+  **not** survive `FromArrow`/`ToArrow`. (A test pins this deliberate drop so it can't silently change;
+  `StructField.Equals` includes metadata, so round-tripping it would otherwise be required for schema
+  identity.)

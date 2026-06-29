@@ -18,7 +18,13 @@ namespace DeltaSharp.Engine.Columnar.Arrow;
 /// Disposal is exactly-once and thread-safe: the first <see cref="Dispose"/> wins (via an interlocked
 /// flag); a <see cref="ArrowImportOwnership.Transfer"/> import then disposes the source once, while a
 /// <see cref="ArrowImportOwnership.Borrowed"/> import releases nothing (the caller owns the source).
-/// After disposal the column accessors throw <see cref="ObjectDisposedException"/>.
+/// After disposal the batch-level accessors (<see cref="Column"/>, <see cref="Slice"/>,
+/// <see cref="WithSelection"/>) throw <see cref="ObjectDisposedException"/> as lifecycle hygiene. That
+/// guard is <b>not</b> memory safety: a <see cref="ColumnVector"/> or <see cref="ReadOnlySpan{T}"/>
+/// already vended from this batch is <b>invalidated</b> by disposing the batch (under
+/// <see cref="ArrowImportOwnership.Transfer"/>, which frees the source) or by the caller disposing the
+/// source (under <see cref="ArrowImportOwnership.Borrowed"/>), and reading it afterward is a
+/// use-after-free with undefined results. Copy out any values that must outlive the batch/source.
 /// </para>
 /// <para>
 /// <see cref="Slice"/> and <see cref="WithSelection"/> return managed views that share these columns
@@ -60,6 +66,14 @@ public sealed class ArrowColumnBatch : ColumnBatch, IDisposable
     public override SelectionVector? Selection => _inner.Selection;
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// The returned <see cref="ColumnVector"/> — and any span, slice, or selection taken from it — is a
+    /// zero-copy view over the source Arrow buffers. It must not be read after this batch is disposed
+    /// (under <see cref="ArrowImportOwnership.Transfer"/>) or after the caller disposes the source (under
+    /// <see cref="ArrowImportOwnership.Borrowed"/>); doing so is a use-after-free with undefined results.
+    /// The <see cref="ObjectDisposedException"/> below is disposal hygiene on <i>this</i> accessor, not
+    /// protection for a column already vended — copy out any values you need to outlive the batch/source.
+    /// </remarks>
     /// <exception cref="ObjectDisposedException">The batch has been disposed.</exception>
     public override ColumnVector Column(int ordinal)
     {
@@ -68,6 +82,13 @@ public sealed class ArrowColumnBatch : ColumnBatch, IDisposable
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// The returned view shares this batch's columns and (for a zero-copy column) the source Arrow
+    /// buffers; it must not be read after this batch is disposed (<see cref="ArrowImportOwnership.Transfer"/>)
+    /// or after the caller disposes the source (<see cref="ArrowImportOwnership.Borrowed"/>) — that is a
+    /// use-after-free. The <see cref="ObjectDisposedException"/> below guards <i>this</i> accessor only;
+    /// it does not invalidate a slice already vended.
+    /// </remarks>
     /// <exception cref="ObjectDisposedException">The batch has been disposed.</exception>
     public override ColumnBatch Slice(int offset, int length)
     {
@@ -76,6 +97,14 @@ public sealed class ArrowColumnBatch : ColumnBatch, IDisposable
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// The returned selection-aware view shares this batch's columns and (for a zero-copy column) the
+    /// source Arrow buffers; it must not be read after this batch is disposed
+    /// (<see cref="ArrowImportOwnership.Transfer"/>) or after the caller disposes the source
+    /// (<see cref="ArrowImportOwnership.Borrowed"/>) — that is a use-after-free. The
+    /// <see cref="ObjectDisposedException"/> below guards <i>this</i> accessor only; it does not
+    /// invalidate a view already vended.
+    /// </remarks>
     /// <exception cref="ObjectDisposedException">The batch has been disposed.</exception>
     public override ColumnBatch WithSelection(SelectionVector selection)
     {

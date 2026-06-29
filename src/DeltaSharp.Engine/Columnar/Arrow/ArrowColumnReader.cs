@@ -65,7 +65,11 @@ internal static class ArrowColumnReader
 
     private static ColumnVector MaterializeDecimal(Decimal128Array array)
     {
-        var type = new DecimalType(array.Precision, array.Scale);
+        // Resolve the DeltaSharp type through the schema mapper so an out-of-range precision/scale
+        // (Apache.Arrow admits e.g. decimal128(40, 2)) fails closed with an UnsupportedTypeException —
+        // consistent with the rest of the boundary — instead of surfacing DecimalType's
+        // SchemaValidationException (council F-DEC1).
+        var type = (DecimalType)ArrowSchemaMapper.ToDeltaType(array.Data.DataType);
         MutableColumnVector vector = ColumnVectors.Create(type, array.Length);
         for (int i = 0; i < array.Length; i++)
         {
@@ -80,6 +84,10 @@ internal static class ArrowColumnReader
             Int128 unscaled = BinaryPrimitives.ReadInt128LittleEndian(array.GetBytes(i));
             if (type.IsCompact)
             {
+                // A compact decimal narrows the unscaled value to 8 bytes. A malformed decimal128 whose
+                // unscaled magnitude exceeds the declared precision would silently truncate on the
+                // (long) cast and return a wrong value, so reject it instead (council F-DEC2).
+                EnsureUnscaledFitsPrecision(unscaled, type);
                 vector.AppendValue((long)unscaled);
             }
             else
@@ -89,5 +97,32 @@ internal static class ArrowColumnReader
         }
 
         return vector;
+    }
+
+    private static void EnsureUnscaledFitsPrecision(Int128 unscaled, DecimalType type)
+    {
+        // A precision-p decimal carries at most p significant digits, so a valid unscaled value
+        // satisfies |unscaled| < 10^p. Compare against +/- the bound directly rather than taking
+        // Int128.Abs, which would overflow at Int128.MinValue. The bound fits comfortably in Int128:
+        // this guard runs only for compact decimals, whose precision is at most 18 (10^18 < 2^63).
+        Int128 bound = Pow10(type.Precision);
+        if (unscaled >= bound || unscaled <= -bound)
+        {
+            throw new UnsupportedTypeException(
+                $"Arrow decimal128 carries an unscaled value with more significant digits than the "
+                + $"declared precision {type.Precision} ({type.SimpleString}); it does not fit and would "
+                + "be truncated, so the boundary rejects it rather than returning a wrong value.");
+        }
+    }
+
+    private static Int128 Pow10(int exponent)
+    {
+        Int128 result = Int128.One;
+        for (int i = 0; i < exponent; i++)
+        {
+            result *= 10;
+        }
+
+        return result;
     }
 }
