@@ -12,14 +12,11 @@ namespace DeltaSharp.Engine.Tests.Columnar;
 public class ColumnContractTests
 {
     [Fact]
-    public void ContractSurface_NamesNoApacheArrowType_AndAssemblyDoesNotReferenceArrow()
+    public void ContractSurface_NamesNoApacheArrowType()
     {
-        Assembly engine = typeof(ColumnVector).Assembly;
-
-        Assert.DoesNotContain(
-            engine.GetReferencedAssemblies(),
-            a => a.Name is not null && a.Name.StartsWith("Apache.Arrow", StringComparison.Ordinal));
-
+        // STORY-02.1.1 AC4 (still binding under STORY-02.2.1): the engine assembly may now reference
+        // Apache.Arrow at the edge (the ArrowColumnVector boundary, ADR-0002), but the operator-facing
+        // contract surface — what kernels/operators bind to — must name no Apache.Arrow type.
         Type[] contracts =
         {
             typeof(ColumnVector), typeof(MutableColumnVector), typeof(ColumnBatch), typeof(SelectionVector),

@@ -12,6 +12,14 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- ADR-0002 "Arrow at the edges": the Arrow-backed ColumnVector (STORY-02.2.1, #135)
+         wraps Apache.Arrow primitive/variable arrays so Parquet/Flight interop is zero-copy.
+         Operators bind only to ColumnVector — no operator-facing member names an Apache.Arrow
+         type — so this stays a boundary dependency of DeltaSharp.Engine, not the public surface. -->
+    <PackageVersion Include="Apache.Arrow" Version="23.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- Test toolchain. -->
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.7.0" />
     <PackageVersion Include="xunit" Version="2.9.3" />

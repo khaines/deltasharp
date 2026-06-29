@@ -22,6 +22,15 @@
     <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
     <EnableAotAnalyzer>true</EnableAotAnalyzer>
     <EnableSingleFileAnalyzer>true</EnableSingleFileAnalyzer>
+    <!-- Lock the Apache.Arrow boundary dependency for reproducible, drift-detecting restores
+         (CI restores in locked mode), matching the test projects' policy. -->
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- ADR-0002: Arrow only at the edges. Used by the Arrow-backed ColumnVector interop
+         (Columnar/Arrow/) to bridge Parquet/Flight arrays into the engine's columnar contract. -->
+    <PackageReference Include="Apache.Arrow" />
+  </ItemGroup>
 
 </Project>
