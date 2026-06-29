@@ -129,6 +129,27 @@ calls agree). Behavior across the canonical shapes:
 A randomized parity test compares `CountNulls` against an independent raw-bit oracle across hundreds
 of random buffers, offsets, and window lengths.
 
+### Output canonicalization (trailing padding bits)
+
+Bulk kernels clear exactly `Bitmap.ByteCount(length)` output bytes and write only the `[0, length)`
+logical lanes, so the **trailing padding bits of the final output byte are canonically `0`**. This
+makes a future `memcmp`/popcount parity oracle (STORY-02.6.2) unambiguous: the SIMD tier must tail-mask
+to the same canonical form, and callers must honor `length` rather than reading whole output bytes.
+
+## Operators outside the two families
+
+Propagate-on-any-null and Kleene are the only two families implemented here. Some operators are
+deliberately **out of scope** and must NOT be routed through either rule by a future kernel author:
+
+- **Always-valid output:** `IS NULL` / `IS NOT NULL`, and null-safe equality (`<=>` / `IS [NOT]
+  DISTINCT FROM`) — `NULL <=> NULL` is `true`, never null. Routing these through propagate-on-any-null
+  would wrongly nullify the result.
+- **Conditionally-valid:** `COALESCE` / `NULLIF` / `CASE` compute output validity from their own
+  branch logic, not a fixed operand-validity rule.
+
+These are deferred with the expression model; the contract here intentionally covers only the two
+null-uniform families.
+
 ## Worked example
 
 ```csharp

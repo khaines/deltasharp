@@ -122,10 +122,12 @@ public readonly ref struct Validity
     {
         ArgumentOutOfRangeException.ThrowIfNegative(offset);
         ArgumentOutOfRangeException.ThrowIfNegative(length);
-        if (offset + length > _length)
+        // Overflow-safe (long) bound, mirroring the constructor: int `offset + length` could wrap negative
+        // and silently accept an out-of-range slice (Security F1).
+        if ((long)offset + length > _length)
         {
             throw new ArgumentOutOfRangeException(
-                nameof(length), length, $"Slice [{offset}, {offset + length}) exceeds length {_length}.");
+                nameof(length), length, $"Slice [{offset}, {(long)offset + length}) exceeds length {_length}.");
         }
 
         return new Validity(_bits, _offset + offset, length);

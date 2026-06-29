@@ -283,7 +283,7 @@ public static class NullPropagation
         RequireSameLength(leftLength, rightValidity.Length, "right validity");
         if (resultValuesLength < leftLength)
         {
-            throw new ArgumentException($"Result values span needs {leftLength} rows but has {resultValuesLength}.");
+            throw new ArgumentException($"Result values span needs {leftLength} rows but has {resultValuesLength}.", nameof(resultValuesLength));
         }
 
         RequireOutput(resultValidityLength, Bitmap.ByteCount(leftLength));

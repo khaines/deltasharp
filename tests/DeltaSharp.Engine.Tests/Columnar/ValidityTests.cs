@@ -328,4 +328,12 @@ public class ValidityTests
     {
         Assert.Throws<ArgumentOutOfRangeException>(() => Validity.AllValid(4).Slice(2, 3));
     }
+
+    [Fact]
+    public void Slice_OffsetLengthOverflow_ThrowsNotWraps()
+    {
+        // int `offset + length` would wrap negative and silently accept the slice (Security F1).
+        Assert.Throws<ArgumentOutOfRangeException>(() => Validity.AllValid(100).Slice(int.MaxValue, 1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => Validity.AllValid(int.MaxValue).Slice(1, int.MaxValue));
+    }
 }
