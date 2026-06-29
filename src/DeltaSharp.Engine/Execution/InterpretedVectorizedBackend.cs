@@ -7,8 +7,10 @@ namespace DeltaSharp.Engine.Execution;
 /// <see cref="CompiledBackend"/> must match.
 /// </summary>
 /// <remarks>
-/// The M1 surface evaluates only the representative <see cref="AffineInt64Kernel"/>; the SIMD
-/// kernel library and real operator evaluation arrive in later EPIC-02 stories. A single shared
+/// The representative <see cref="AffineInt64Kernel"/> stands in for the SIMD expression-kernel
+/// library (later EPIC-03 stories); operator evaluation routes through the AOT-clean
+/// <see cref="InterpretedOperators"/> dispatch, which evaluates the v1 scan/filter/project shapes
+/// (STORY-03.2.1) and fails fast for kinds whose kernels have not shipped. A single shared
 /// <see cref="Instance"/> is exposed because the interpreted backend is stateless.
 /// </remarks>
 public sealed class InterpretedVectorizedBackend : IExecutionBackend
@@ -31,15 +33,14 @@ public sealed class InterpretedVectorizedBackend : IExecutionBackend
         => value => unchecked((kernel.Multiplier * value) + kernel.Addend);
 
     /// <inheritdoc />
-    /// <remarks>No operator kernels ship in STORY-03.1.1; they arrive in FEAT-03.2. The contract
-    /// is fail-fast, so every kind is currently unsupported rather than emulated row-at-a-time.</remarks>
-    public bool Supports(OperatorKind kind) => false;
+    /// <remarks>v1 evaluates the scan/filter/project operator shapes (STORY-03.2.1); remaining kinds
+    /// (aggregate, sort, joins, exchange) arrive in later FEAT-03.2 stories and are fail-fast until then.</remarks>
+    public bool Supports(OperatorKind kind) => InterpretedOperators.Supports(kind);
 
     /// <inheritdoc />
+    /// <remarks>Operator execution is delegated to the shared, AOT-clean <see cref="InterpretedOperators"/>
+    /// dispatch; building the returned stream performs no row work (lazy), and unsupported shapes throw
+    /// <see cref="UnsupportedOperatorException"/> attributed to this backend with no row-at-a-time fallback.</remarks>
     public IBatchStream Open(PhysicalOperator op, ExecutionContext context)
-    {
-        ArgumentNullException.ThrowIfNull(op);
-        ArgumentNullException.ThrowIfNull(context);
-        throw new UnsupportedOperatorException(op.Kind, Name, "interpreter operator kernels arrive in FEAT-03.2");
-    }
+        => InterpretedOperators.Open(Name, op, context);
 }

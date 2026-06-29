@@ -46,14 +46,15 @@ public sealed class CompiledBackend : IExecutionBackend
 
     /// <inheritdoc />
     /// <remarks>The compiled tier supports exactly what the interpreter does (it only fuses hot
-    /// expressions); operator kernels arrive in FEAT-03.2, so v1 supports none.</remarks>
-    public bool Supports(OperatorKind kind) => false;
+    /// scalar expressions; it never reimplements operators), so it reports the same supported kinds.</remarks>
+    public bool Supports(OperatorKind kind) => InterpretedOperators.Supports(kind);
 
     /// <inheritdoc />
+    /// <remarks>Operator execution is delegated to the shared <see cref="InterpretedOperators"/> dispatch —
+    /// the same code the interpreter runs — so operator results are identical across backends by construction
+    /// (ADR-0001 parity oracle). The compiled tier's value is fusing scalar expressions (later FEAT-03.2),
+    /// not reimplementing operators; unsupported shapes throw <see cref="UnsupportedOperatorException"/>
+    /// attributed to this backend.</remarks>
     public IBatchStream Open(PhysicalOperator op, ExecutionContext context)
-    {
-        ArgumentNullException.ThrowIfNull(op);
-        ArgumentNullException.ThrowIfNull(context);
-        throw new UnsupportedOperatorException(op.Kind, Name, "compiled operator kernels arrive in FEAT-03.2");
-    }
+        => InterpretedOperators.Open(Name, op, context);
 }
