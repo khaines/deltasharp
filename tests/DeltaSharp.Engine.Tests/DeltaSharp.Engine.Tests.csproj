@@ -27,6 +27,8 @@
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
+    <!-- The Arrow-backed ColumnVector tests build Apache.Arrow input arrays at the interop edge. -->
+    <PackageReference Include="Apache.Arrow" />
   </ItemGroup>
 
   <ItemGroup>
