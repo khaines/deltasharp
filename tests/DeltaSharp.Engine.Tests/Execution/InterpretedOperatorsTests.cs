@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Text;
 using DeltaSharp.Engine.Columnar;
@@ -136,6 +137,35 @@ public class InterpretedOperatorsTests
     // A non-column-reference expression: stands in for a cast/computed expression that the v1
     // operators cannot yet evaluate (general expression evaluation is STORY-03.4.1).
     private sealed class ConstantTrueExpression(DataType type) : PhysicalExpression(type, nullable: false);
+
+    // A child IBatchStream that deliberately never observes the cancellation token — used to prove the
+    // filter/project operators own their cancellation checks rather than relying on the child. The
+    // real InMemoryScanOperator child also checks the token, which masks a missing parent check in the
+    // end-to-end (Backend.Open) tests; constructing the operator stream directly over this fake removes
+    // that mask. An optional onPull hook lets a test cancel exactly when the parent pulls the child.
+    private sealed class FakeChildStream(StructType schema, ColumnBatch[] batches, Action? onPull = null) : IBatchStream
+    {
+        private int _index;
+
+        public StructType Schema { get; } = schema;
+
+        public bool TryGetNext([NotNullWhen(true)] out ColumnBatch? batch)
+        {
+            onPull?.Invoke();
+            if (_index < batches.Length)
+            {
+                batch = batches[_index++];
+                return true;
+            }
+
+            batch = null;
+            return false;
+        }
+
+        public void Dispose()
+        {
+        }
+    }
 
     // ===== Scan (AC: emits source batches verbatim; empty source; empty batch; preserves selection) =====
 
@@ -578,6 +608,38 @@ public class InterpretedOperatorsTests
         Assert.Throws<OperationCanceledException>(() => stream.TryGetNext(out _));
     }
 
+    [Fact]
+    public void Filter_EntryCancellation_IsOwnedByFilter_NotChild()
+    {
+        // The filter must observe an already-cancelled token through its OWN entry check, independent of
+        // the child. Driving it over a non-canceling EMPTY child isolates that check: if the filter's
+        // entry ThrowIfCancellationRequested is removed, the empty child makes TryGetNext return false
+        // instead of throwing — so this test fails on that mutation (it is not vacuous).
+        var op = new FilterOperator(Scan(Batch(ThreeCol, IntCol(1), StrCol("a"), BoolCol(true))), FlagRef);
+        var child = new FakeChildStream(ThreeCol, []);
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        using var stream = new InterpretedFilterStream(op, predicateOrdinal: 2, child, Ctx(cancellation: cts.Token));
+
+        Assert.Throws<OperationCanceledException>(() => stream.TryGetNext(out _));
+    }
+
+    [Fact]
+    public void Filter_PostChildPullCancellation_IsObservedBeforeProcessing()
+    {
+        // Cancellation that arrives DURING the child pull (token not yet cancelled at entry) must still
+        // be observed by the filter's post-pull check before it does any per-batch work. The child
+        // cancels the token as it yields a valid batch; if the filter's in-loop check is removed it
+        // would process the batch and return true, so this test fails on that mutation.
+        ColumnBatch batch = Batch(ThreeCol, IntCol(1, 2), StrCol("a", "b"), BoolCol(true, true));
+        using var cts = new CancellationTokenSource();
+        var op = new FilterOperator(Scan(batch), FlagRef);
+        var child = new FakeChildStream(ThreeCol, [batch], onPull: cts.Cancel);
+        using var stream = new InterpretedFilterStream(op, predicateOrdinal: 2, child, Ctx(cancellation: cts.Token));
+
+        Assert.Throws<OperationCanceledException>(() => stream.TryGetNext(out _));
+    }
+
     // ===== Bounded memory (reserve / release / refusal) =====
 
     [Fact]
@@ -656,7 +718,43 @@ public class InterpretedOperatorsTests
         Assert.Equal(0, mem.ReservedBytes);
     }
 
-    // ===== Backend dispatch + AOT cleanliness =====
+    [Fact]
+    public void Project_EntryCancellation_IsOwnedByProject_NotChild()
+    {
+        // Project's single entry check must observe an already-cancelled token without relying on the
+        // child. Over a non-canceling child that has a batch to yield, removing the project's
+        // ThrowIfCancellationRequested would process the batch and return true — so this fails on that
+        // mutation (not vacuous; the InMemoryScan child masks it in the Backend.Open path).
+        var outSchema = new StructType([new StructField("key", DataTypes.IntegerType, nullable: false)]);
+        ColumnBatch batch = Batch(ThreeCol, IntCol(1), StrCol("a"), BoolCol(true));
+        var op = new ProjectOperator(Scan(batch), outSchema, [IdRef]);
+        var child = new FakeChildStream(ThreeCol, [batch]);
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        using var stream = new InterpretedProjectStream(op, [0], child, Ctx(cancellation: cts.Token));
+
+        Assert.Throws<OperationCanceledException>(() => stream.TryGetNext(out _));
+    }
+
+    [Fact]
+    public void Project_OverBudget_ThrowsExecutionMemoryException()
+    {
+        // The projection reserves one sizeof(long) reference token per output column before allocating
+        // the column array. A budget below that must fail closed with a typed ExecutionMemoryException
+        // and leak no reservation. (Mirrors Filter_OverBudget_ThrowsExecutionMemoryException; without a
+        // reserve-before-allocate refusal this passes silently — see the Quality finding.)
+        ColumnBatch batch = Batch(ThreeCol, IntCol(1, 2), StrCol("a", "b"), BoolCol(true, true));
+        var outSchema = new StructType([new StructField("key", DataTypes.IntegerType, nullable: false)]);
+        var mem = new BoundedExecutionMemory(4); // one projection reference needs sizeof(long) == 8
+        var project = new ProjectOperator(Scan(batch), outSchema, [IdRef]);
+
+        using IBatchStream stream = Backend.Open(project, new ExecutionContext(mem));
+        var ex = Assert.Throws<ExecutionMemoryException>(() => stream.TryGetNext(out _));
+
+        Assert.Equal(sizeof(long), ex.RequestedBytes);
+        Assert.Equal(4, ex.BudgetBytes);
+        Assert.Equal(0, mem.ReservedBytes); // a refused reservation leaks nothing
+    }
 
     [Fact]
     public void Open_BareScanOperator_IsUnsupported_AndPointsAtInMemoryScan()
