@@ -86,7 +86,7 @@ internal sealed class ArrowFixedWidthColumnVector<S> : ArrowColumnVector
     {
         ArgumentOutOfRangeException.ThrowIfNegative(offset);
         ArgumentOutOfRangeException.ThrowIfNegative(length);
-        if (offset + length > _array.Length)
+        if (length > _array.Length - offset)
         {
             throw new ArgumentOutOfRangeException(
                 nameof(length), length, $"Slice [{offset}, {offset + length}) exceeds length {_array.Length}.");
