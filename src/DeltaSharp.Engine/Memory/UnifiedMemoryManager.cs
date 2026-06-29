@@ -39,6 +39,7 @@ public sealed class UnifiedMemoryManager
     public const double DefaultStorageRegionFraction = 0.5;
 
     private readonly object _lock = new();
+    private bool _inSpill;
     private readonly long _executionRegionBytes;
     private readonly long _storageRegionBytes;
 
@@ -109,6 +110,18 @@ public sealed class UnifiedMemoryManager
 
         lock (_lock)
         {
+            // Re-check disposal under the lock: the public Try/Reserve pre-check runs outside the lock, so a
+            // concurrent Dispose() could otherwise win the race and let a reservation be charged to a disposed
+            // task (TOCTOU). A disposed task always rejects, matching the documented ObjectDisposedException.
+            ObjectDisposedException.ThrowIf(task.IsDisposed, task);
+
+            // `lock` is reentrant on the same thread, so a misbehaving ISpillable.Spill that re-enters Reserve
+            // would silently mutate the reservation list being iterated. Fail fast instead of corrupting accounting.
+            if (_inSpill)
+            {
+                throw new InvalidOperationException("Cannot reserve memory from within an ISpillable.Spill callback.");
+            }
+
             MemoryPool pool = PoolFor(kind);
 
             // A zero-byte reservation always succeeds and tracks a 0-byte handle (so callers get uniform dispose
@@ -159,6 +172,11 @@ public sealed class UnifiedMemoryManager
 
         lock (_lock)
         {
+            if (_inSpill)
+            {
+                throw new InvalidOperationException("Cannot release memory from within an ISpillable.Spill callback.");
+            }
+
             if (!reservation.TryMarkReleasedUnlocked())
             {
                 return; // already released — double-dispose is a safe no-op.
@@ -214,31 +232,39 @@ public sealed class UnifiedMemoryManager
         long remaining = target;
         List<MemoryReservation> reservations = task.ReservationsUnlocked;
 
-        for (int i = 0; i < reservations.Count && remaining > 0; i++)
+        _inSpill = true;
+        try
         {
-            MemoryReservation reservation = reservations[i];
-            if (reservation.Kind != kind || reservation.Spillable is null || reservation.ReservedUnlocked <= 0)
+            for (int i = 0; i < reservations.Count && remaining > 0; i++)
             {
-                continue;
-            }
+                MemoryReservation reservation = reservations[i];
+                if (reservation.Kind != kind || reservation.Spillable is null || reservation.ReservedUnlocked <= 0)
+                {
+                    continue;
+                }
 
-            long freed = reservation.Spillable.Spill(remaining);
-            if (freed <= 0)
-            {
-                continue;
-            }
+                long freed = reservation.Spillable.Spill(remaining);
+                if (freed <= 0)
+                {
+                    continue;
+                }
 
-            // Defensive clamp: a well-behaved spillable never frees more than it reserved, but the manager must not
-            // over-release the pool/task if it does.
-            if (freed > reservation.ReservedUnlocked)
-            {
-                freed = reservation.ReservedUnlocked;
-            }
+                // Defensive clamp: a well-behaved spillable never frees more than it reserved, but the manager must not
+                // over-release the pool/task if it does.
+                if (freed > reservation.ReservedUnlocked)
+                {
+                    freed = reservation.ReservedUnlocked;
+                }
 
-            pool.Release(freed);
-            task.AddUsedUnlocked(kind, -freed);
-            reservation.ReduceByUnlocked(freed);
-            remaining -= freed;
+                pool.Release(freed);
+                task.AddUsedUnlocked(kind, -freed);
+                reservation.ReduceByUnlocked(freed);
+                remaining -= freed;
+            }
+        }
+        finally
+        {
+            _inSpill = false;
         }
     }
 

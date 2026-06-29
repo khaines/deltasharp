@@ -201,4 +201,36 @@ public class UnifiedMemoryManagerTests
         using TaskMemoryManager task = manager.RegisterTask(1);
         Assert.Throws<ArgumentOutOfRangeException>(() => task.TryReserve(MemoryPoolKind.Execution, -1));
     }
+
+    [Fact]
+    public void ReserveAfterDispose_Throws_NoPostDisposeReservation()
+    {
+        var manager = new UnifiedMemoryManager(1000);
+        TaskMemoryManager task = manager.RegisterTask(1);
+        task.Dispose();
+
+        // The in-lock disposed re-check rejects a reserve on a disposed task (TOCTOU guard).
+        Assert.Throws<ObjectDisposedException>(() => task.Reserve(MemoryPoolKind.Execution, 100));
+        Assert.Throws<ObjectDisposedException>(() => task.TryReserve(MemoryPoolKind.Execution, 100));
+        Assert.Equal(0, manager.ExecutionPool.UsedBytes);
+    }
+
+    [Fact]
+    public void ReserveFromWithinSpillCallback_Throws()
+    {
+        var manager = new UnifiedMemoryManager(200, storageRegionFraction: 0.0);
+        using TaskMemoryManager task = manager.RegisterTask(1);
+
+        // A spillable that re-enters Reserve during its own Spill must fail fast (reentrancy guard), not corrupt
+        // the reservation list being iterated under the reentrant lock.
+        var reentrant = new DelegateSpillable(_ =>
+        {
+            task.TryReserve(MemoryPoolKind.Execution, 1);
+            return 0;
+        });
+        task.Reserve(MemoryPoolKind.Execution, 150, reentrant);
+
+        // The next reservation forces a spill, which invokes the reentrant callback.
+        Assert.Throws<InvalidOperationException>(() => task.Reserve(MemoryPoolKind.Execution, 100));
+    }
 }
