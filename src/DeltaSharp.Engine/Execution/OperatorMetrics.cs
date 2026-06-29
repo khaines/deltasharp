@@ -33,7 +33,7 @@ public sealed class OperatorMetrics
     /// <summary>Peak memory reserved through the <see cref="IExecutionMemory"/> context.</summary>
     public long PeakMemoryBytes { get; private set; }
 
-    /// <summary>Wall-clock execution time accumulated by the backend, in nanoseconds.</summary>
+    /// <summary>Monotonic elapsed execution time accumulated by the backend, in nanoseconds (from a monotonic source such as <c>Stopwatch.GetTimestamp</c>, never wall-clock <c>UtcNow</c>).</summary>
     public long ElapsedNanos { get; private set; }
 
     /// <summary>Records input rows.</summary>

@@ -37,7 +37,9 @@ public sealed class BoundedExecutionMemory : IExecutionMemory
     {
         ArgumentOutOfRangeException.ThrowIfNegative(bytes);
         long updated = Interlocked.Add(ref _reserved, bytes);
-        if (updated > BudgetBytes)
+        // `updated < bytes` detects 64-bit overflow (wrap to negative) so a huge request can't
+        // bypass the budget by wrapping past BudgetBytes; treat it as over-budget and roll back.
+        if (updated > BudgetBytes || updated < bytes)
         {
             Interlocked.Add(ref _reserved, -bytes);
             return false;

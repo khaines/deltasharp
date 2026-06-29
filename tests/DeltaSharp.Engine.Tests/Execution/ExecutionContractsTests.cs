@@ -218,6 +218,16 @@ public class ExecutionContractsTests
     }
 
     [Fact]
+    public void Memory_HugeRequest_DoesNotOverflowBudget()
+    {
+        var mem = new BoundedExecutionMemory(100);
+        Assert.True(mem.TryReserve(80));
+        // Int64-overflow attempt must be rejected, not wrap past the budget.
+        Assert.False(mem.TryReserve(long.MaxValue));
+        Assert.Equal(20, mem.AvailableBytes); // reservation rolled back
+    }
+
+    [Fact]
     public void ExecutionContext_NullMemory_Throws()
         => Assert.Throws<ArgumentNullException>(() => new ExecutionContext(null!));
 
