@@ -43,4 +43,17 @@ public sealed class CompiledBackend : IExecutionBackend
         return lambda.Compile();
 #pragma warning restore RS0030
     }
+
+    /// <inheritdoc />
+    /// <remarks>The compiled tier supports exactly what the interpreter does (it only fuses hot
+    /// expressions); operator kernels arrive in FEAT-03.2, so v1 supports none.</remarks>
+    public bool Supports(OperatorKind kind) => false;
+
+    /// <inheritdoc />
+    public IBatchStream Open(PhysicalOperator op, ExecutionContext context)
+    {
+        ArgumentNullException.ThrowIfNull(op);
+        ArgumentNullException.ThrowIfNull(context);
+        throw new UnsupportedOperatorException(op.Kind, Name, "compiled operator kernels arrive in FEAT-03.2");
+    }
 }
