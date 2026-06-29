@@ -9,11 +9,13 @@ namespace DeltaSharp.Engine.Execution;
 /// tier stays elidable under NativeAOT.
 /// </summary>
 /// <remarks>
-/// The surface is intentionally minimal for M1: a single representative scalar-fusion entry
-/// point (<see cref="BuildAffineEvaluator"/>) that lets the seam — and the ADR-0001 parity
-/// oracle — be exercised before the general expression / operator model lands in later EPIC-02
-/// stories. New evaluation entry points are added here as the engine grows; <b>every</b>
-/// implementation must produce results identical to the interpreted backend.
+/// The surface has two layers: a representative scalar-fusion entry point
+/// (<see cref="BuildAffineEvaluator"/>) that exercised the seam in M1, and the operator-execution
+/// contract (<see cref="Supports"/> + <see cref="Open"/>) that turns a v1
+/// <see cref="PhysicalOperator"/> into a pull-based <see cref="IBatchStream"/> with cancellation
+/// and bounded memory. Operator <i>kernels</i> arrive in FEAT-03.2, so v1 backends declare every
+/// kind unsupported; the shape is fixed now. <b>Every</b> implementation must produce results
+/// identical to the interpreted backend (the ADR-0001 parity oracle).
 /// </remarks>
 public interface IExecutionBackend
 {
@@ -34,4 +36,29 @@ public interface IExecutionBackend
     /// <param name="kernel">The affine kernel to evaluate.</param>
     /// <returns>A delegate mapping an input <see cref="long"/> to the kernel's output.</returns>
     Func<long, long> BuildAffineEvaluator(AffineInt64Kernel kernel);
+
+    /// <summary>
+    /// Whether this backend can evaluate operators of <paramref name="kind"/>. The planner asks
+    /// before <see cref="Open"/> so it can pick a supported shape; a backend never silently
+    /// degrades an unsupported kind to a row-at-a-time fallback (STORY-03.1.1 AC3).
+    /// </summary>
+    /// <param name="kind">The operator kind to test.</param>
+    /// <returns><see langword="true"/> when <see cref="Open"/> can evaluate the kind.</returns>
+    bool Supports(OperatorKind kind);
+
+    /// <summary>
+    /// Opens an executing <see cref="IBatchStream"/> for <paramref name="op"/>, threading
+    /// cancellation and the bounded memory budget through <paramref name="context"/> and updating
+    /// the operator's <see cref="PhysicalOperator.Metrics"/>. The stream emits batches conforming
+    /// to <see cref="PhysicalOperator.OutputSchema"/>. Both backends must produce identical
+    /// results; the compiled tier only fuses hot expressions, never changes semantics.
+    /// </summary>
+    /// <param name="op">The physical operator to evaluate.</param>
+    /// <param name="context">Cancellation and memory context for this execution.</param>
+    /// <returns>A pull-based batch stream over the operator's output.</returns>
+    /// <exception cref="ArgumentNullException">An argument is null.</exception>
+    /// <exception cref="UnsupportedOperatorException">
+    /// The operator shape is not supported; no row-at-a-time fallback is attempted.
+    /// </exception>
+    IBatchStream Open(PhysicalOperator op, ExecutionContext context);
 }

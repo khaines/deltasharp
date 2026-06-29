@@ -29,4 +29,17 @@ public sealed class InterpretedVectorizedBackend : IExecutionBackend
     /// <inheritdoc />
     public Func<long, long> BuildAffineEvaluator(AffineInt64Kernel kernel)
         => value => unchecked((kernel.Multiplier * value) + kernel.Addend);
+
+    /// <inheritdoc />
+    /// <remarks>No operator kernels ship in STORY-03.1.1; they arrive in FEAT-03.2. The contract
+    /// is fail-fast, so every kind is currently unsupported rather than emulated row-at-a-time.</remarks>
+    public bool Supports(OperatorKind kind) => false;
+
+    /// <inheritdoc />
+    public IBatchStream Open(PhysicalOperator op, ExecutionContext context)
+    {
+        ArgumentNullException.ThrowIfNull(op);
+        ArgumentNullException.ThrowIfNull(context);
+        throw new UnsupportedOperatorException(op.Kind, Name, "interpreter operator kernels arrive in FEAT-03.2");
+    }
 }
