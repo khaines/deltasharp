@@ -73,6 +73,17 @@ public class TypeCoercionTests
     }
 
     [Fact]
+    public void IntDecimal_TightenWhenDecimalLosslesslyHoldsInt()
+    {
+        // decimal(12,2) keeps 10 integer digits — holds every int(10,0) value, so it is tight.
+        Assert.Equal(new DecimalType(12, 2), TypeCoercion.FindTightestCommonType(IntegerType.Instance, new DecimalType(12, 2)));
+        Assert.Equal(new DecimalType(12, 2), TypeCoercion.FindTightestCommonType(new DecimalType(12, 2), IntegerType.Instance));
+        // byte fits decimal(5,0) (needs 3 int digits); short→decimal(5,0) is exact too.
+        Assert.Equal(new DecimalType(5, 0), TypeCoercion.FindTightestCommonType(ByteType.Instance, new DecimalType(5, 0)));
+        Assert.Equal(new DecimalType(5, 0), TypeCoercion.FindTightestCommonType(ShortType.Instance, new DecimalType(5, 0)));
+    }
+
+    [Fact]
     public void DateAndTimestamp_TightenToTimestamp()
     {
         Assert.Equal(TimestampType.Instance, TypeCoercion.FindTightestCommonType(DateType.Instance, TimestampType.Instance));

@@ -231,7 +231,15 @@ public readonly struct DecimalValue : IEquatable<DecimalValue>
     public override bool Equals(object? obj) => obj is DecimalValue v && Equals(v);
 
     /// <inheritdoc/>
-    public override int GetHashCode() => StableHash.Combine((int)(long)Unscaled, Scale);
+    public override int GetHashCode()
+    {
+        // Fold all 128 mantissa bits, not just the low 32 of (int)(long): distinct values that
+        // share a low word (e.g. 1 and 1+2^64) must hash apart while equal values still agree.
+        UInt128 bits = (UInt128)Unscaled;
+        int hi = (int)((ulong)(bits >> 64) ^ ((ulong)(bits >> 64) >> 32));
+        int lo = (int)((ulong)bits ^ ((ulong)bits >> 32));
+        return StableHash.Combine(StableHash.Combine(hi, lo), Scale);
+    }
 
     /// <inheritdoc/>
     public override string ToString() =>

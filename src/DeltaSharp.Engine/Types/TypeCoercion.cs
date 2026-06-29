@@ -34,7 +34,9 @@ public static class TypeCoercion
     /// <summary>
     /// The tightest common type without lossy promotion (Spark <c>findTightestCommonType</c>):
     /// equal types, null promotion, integer widening, exact decimals, and <c>date→timestamp</c>.
-    /// Returns null when there is no lossless common type. Never widens an integer to a decimal.
+    /// An integer promotes to a decimal only when that decimal losslessly holds it (Spark
+    /// <c>DecimalType.isWiderThan</c>); a narrower decimal has no tightest common type (returns
+    /// null). Returns null when there is no lossless common type.
     /// </summary>
     public static DataType? FindTightestCommonType(DataType left, DataType right)
     {
@@ -54,6 +56,17 @@ public static class TypeCoercion
         if (right is NullType)
         {
             return left;
+        }
+
+        // Integer⊕decimal stays tight only when the decimal loses nothing holding the integer.
+        if (left is DecimalType ld && IsIntegral(right) && DecimalHolds(ld, right))
+        {
+            return ld;
+        }
+
+        if (right is DecimalType rd && IsIntegral(left) && DecimalHolds(rd, left))
+        {
+            return rd;
         }
 
         int li = PrecedenceIndex(left), ri = PrecedenceIndex(right);
@@ -208,6 +221,13 @@ public static class TypeCoercion
         }
 
         return -1;
+    }
+
+    /// <summary>Whether <paramref name="dec"/> holds every value of an integral type with no loss (Spark <c>isWiderThan</c>).</summary>
+    private static bool DecimalHolds(DecimalType dec, DataType integral)
+    {
+        DecimalType need = DecimalArithmetic.ForType(integral); // integral.forType has scale 0
+        return dec.Precision - dec.Scale >= need.Precision - need.Scale && dec.Scale >= need.Scale;
     }
 
     private static DataType? WiderDecimal(DataType left, DataType right)

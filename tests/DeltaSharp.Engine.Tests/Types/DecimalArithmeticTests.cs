@@ -140,6 +140,21 @@ public class DecimalArithmeticTests
         Assert.False(new DecimalValue(Int128.MaxValue, 0).Fits(new DecimalType(38, 1)));
     }
 
+    [Fact]
+    public void GetHashCode_FoldsFullInt128_DistinguishesHighWord_AgreesOnEquals()
+    {
+        // Same low 64 bits, different high word: (int)(long) truncation would collide; full fold must not.
+        var lowOnly = new DecimalValue(Int128.One, 0);
+        var highDiff = new DecimalValue(((Int128)1 << 64) + 1, 0);
+        Assert.NotEqual(lowOnly, highDiff);
+        Assert.NotEqual(lowOnly.GetHashCode(), highDiff.GetHashCode());
+
+        // Equality contract preserved: equal values share a hash; scale participates.
+        Assert.Equal(new DecimalValue(highDiff.Unscaled, 0), highDiff);
+        Assert.Equal(new DecimalValue(highDiff.Unscaled, 0).GetHashCode(), highDiff.GetHashCode());
+        Assert.NotEqual(new DecimalValue(Int128.One, 0).GetHashCode(), new DecimalValue(Int128.One, 1).GetHashCode());
+    }
+
     private static Int128 Pow10(int n)
     {
         Int128 r = Int128.One;

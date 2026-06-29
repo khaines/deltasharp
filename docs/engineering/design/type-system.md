@@ -166,7 +166,8 @@ out-of-range outcome — **neither ever silently truncates or wraps**:
 
 `TypeCoercion.FindWiderTypeForTwo` widens to the rightmost of Spark's `numericPrecedence`
 (`byte < short < int < long < float < double`); `FindTightestCommonType` is the same but
-**refuses** lossy integer→decimal widening (returns null) and tightens `date`+`timestamp` to
+**refuses lossy** integer→decimal widening (returns null) — promoting to the decimal only when
+it losslessly holds the integer (Spark `isWiderThan`) — and tightens `date`+`timestamp` to
 `timestamp`. The wider-type matrix:
 
 | | tinyint | smallint | int | bigint | float | double | decimal |
@@ -180,17 +181,19 @@ out-of-range outcome — **neither ever silently truncates or wraps**:
 | **decimal** | | | | | | | decimal* |
 
 `decimal*` = smallest decimal that holds both: integrals widen via Spark's `forType`
-(`byte→(3,0)`, `int→(10,0)`, `long→(20,0)`, `float→(14,7)`, `double→(30,15)`), then
-`scale = max`, `precision = max(int-digits) + scale`, bounded to 38. `decimal ⊕ float/double`
-widens to **double**. e.g. `decimal(10,2) ⊕ int → decimal(12,2)`.
+(`byte→(3,0)`, `short→(5,0)`, `int→(10,0)`, `long→(20,0)`, `float→(14,7)`, `double→(30,15)`),
+then `scale = max`, `precision = max(int-digits) + scale`, bounded to 38. `decimal ⊕
+float/double` widens to **double**. e.g. `decimal(10,2) ⊕ int → decimal(12,2)`.
 
 ### Decimal result types + overflow (AC2)
 
 `DecimalArithmetic.ResultType` gives Spark's binary-operator precision/scale, clamped by
 `Bounded` (cap precision at 38, keep `MinimumAdjustedScale=6` while integer digits remain):
 add/sub `(max(p-s)+max(s)+1, max(s))`, mul `(p1+p2+1, s1+s2)`, div `(…, max(6, s1+p2+1))`.
-`DecimalValue` (128-bit unscaled mantissa) does exact arithmetic and fits the result into its
-type, overflowing per `AnsiMode`.
+`DecimalValue` (128-bit unscaled mantissa) does exact add/sub/mul and fits the result into its
+type, overflowing per `AnsiMode`. Scale-reducing **casts** round **HALF_UP** (Spark cast
+parity). Divide/modulo **value** rounding is deferred — their result *types* are defined now,
+but `Apply` rejects them so no truncated/wrapped value escapes (see deferrals below).
 
 ### Time-zone / precision assumptions (AC3)
 
@@ -215,7 +218,8 @@ The **null type widens to any peer** and every coercion-sensitive op propagates 
   query; coercion/decimal/timestamp/ANSI rules (above, STORY-02.5.2).
 - **Deferred (tracked elsewhere):** a session-local **`TimestampNtz`** variant (EPIC-02 open
   question); richer **typed metadata** for Delta-log interop (v1 is string-valued; tracked in
-  **#330**); decimal **divide/modulo value rounding** (result *types* are defined now).
+  **#330**); decimal **divide/modulo value rounding** — result *types* are defined now and
+  scale-reducing casts already round HALF_UP, but quotient/remainder rounding stays deferred.
   `TimestampType` is a UTC-normalized instant (microseconds since epoch).
 
 ## References
