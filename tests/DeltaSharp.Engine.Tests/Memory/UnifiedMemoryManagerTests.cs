@@ -210,7 +210,10 @@ public class UnifiedMemoryManagerTests
         TaskMemoryManager task = manager.RegisterTask(1);
         task.Dispose();
 
-        // The in-lock disposed re-check rejects a reserve on a disposed task (TOCTOU guard).
+        // Sequential after-dispose: a reserve on an already-disposed task is rejected by the public
+        // pre-check (the outer ObjectDisposedException guard in TaskMemoryManager.Reserve/TryReserve).
+        // The *in-lock* re-check that closes the concurrent TOCTOU is exercised by
+        // ReserveRacingDispose_NeverChargesDisposedTask, not this single-threaded case.
         Assert.Throws<ObjectDisposedException>(() => task.Reserve(MemoryPoolKind.Execution, 100));
         Assert.Throws<ObjectDisposedException>(() => task.TryReserve(MemoryPoolKind.Execution, 100));
         Assert.Equal(0, manager.ExecutionPool.UsedBytes);
