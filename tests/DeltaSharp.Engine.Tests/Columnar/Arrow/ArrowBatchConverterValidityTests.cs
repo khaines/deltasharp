@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using Apache.Arrow;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Engine.Columnar.Arrow;
@@ -66,6 +67,32 @@ public class ArrowBatchConverterValidityTests
         {
             Assert.Equal(structValid[i], exportedStruct.IsNull(i));
         }
+    }
+
+    [Fact]
+    public void ToArrow_ZeroesNullSlots_NoStaleDataLeakOnExport()
+    {
+        // Multi-tenant safety: ToArrow must write a zeroed placeholder for every null slot, never copy
+        // through whatever bytes the logical vector holds there. We import an Arrow int32 whose values
+        // buffer carries garbage (0xDEADBEEF) at a null slot — Arrow leaves null-slot bytes arbitrary —
+        // so a copy-through (or stale-fill) export regression would leak it. Assert the exported buffer
+        // reads 0 at that slot: validity, not residual heap bytes, carries nullness.
+        int garbage = unchecked((int)0xDEADBEEF);
+        var values = new[] { 10, garbage, 30 };
+        var valuesBuffer = new ArrowBuffer(MemoryMarshal.AsBytes<int>(values).ToArray());
+        var validityBuffer = new ArrowBuffer(new byte[] { 0b0000_0101 }); // bits 0,2 valid; bit 1 null
+        var data = new ArrayData(
+            Apache.Arrow.Types.Int32Type.Default, length: 3, nullCount: 1, offset: 0, new[] { validityBuffer, valuesBuffer });
+        RecordBatch source = ArrowConverterTestSupport.RecordBatchOf(("c", new Int32Array(data), true));
+
+        using ArrowColumnBatch imported = ArrowBatchConverter.FromArrow(source);
+        using RecordBatch exported = ArrowBatchConverter.ToArrow(imported);
+
+        var exportedColumn = (Int32Array)exported.Column(0);
+        Assert.False(exportedColumn.IsValid(1));    // validity preserved: slot 1 is null
+        Assert.Equal(0, exportedColumn.Values[1]);  // the garbage did NOT leak through — null slot zeroed
+        Assert.Equal(10, exportedColumn.Values[0]);
+        Assert.Equal(30, exportedColumn.Values[2]);
     }
 
     private static void AssertValidityRoundTrips(IArrowArray sourceArray, bool[] isNull)
