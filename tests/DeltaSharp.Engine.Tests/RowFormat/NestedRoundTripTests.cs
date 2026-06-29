@@ -133,4 +133,12 @@ public class NestedRoundTripTests
         Assert.True(row.IsNullAt(1));
         Assert.Equal(source, row.ToRowData());
     }
+
+    [Fact]
+    public void MapData_NullKey_Rejected()
+    {
+        var ex = Assert.Throws<ArgumentException>(() =>
+            new MapData(StringType.Instance, IntegerType.Instance, ["ok", null], [1, 2]));
+        Assert.Equal("keys", ex.ParamName);
+    }
 }
