@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -164,6 +165,41 @@ public class InterpretedOperatorsTests
 
         public void Dispose()
         {
+        }
+    }
+
+    // An ArrayPool<int> that tracks outstanding rentals so a test can prove the filter returns its
+    // selection scratch buffer exactly once on every path (no leak, no double-return). Delegates to the
+    // shared pool for real buffers; flags a Return of an array not currently rented as a double-return.
+    private sealed class TrackingArrayPool : ArrayPool<int>
+    {
+        private readonly HashSet<int[]> _outstanding = new(ReferenceEqualityComparer.Instance);
+
+        public int Rents { get; private set; }
+
+        public int Returns { get; private set; }
+
+        public int DoubleReturns { get; private set; }
+
+        public int Outstanding => _outstanding.Count;
+
+        public override int[] Rent(int minimumLength)
+        {
+            Rents++;
+            int[] array = Shared.Rent(minimumLength);
+            _outstanding.Add(array);
+            return array;
+        }
+
+        public override void Return(int[] array, bool clearArray = false)
+        {
+            Returns++;
+            if (!_outstanding.Remove(array))
+            {
+                DoubleReturns++; // returning a buffer that is not currently rented (double or foreign)
+            }
+
+            Shared.Return(array, clearArray);
         }
     }
 
@@ -340,6 +376,26 @@ public class InterpretedOperatorsTests
 
         // Logical positions 0 and 2 pass (flags true, true) → physical rows 3 and 1 → values 4 and 2.
         Assert.Equal(new int?[] { 4, 2 }, IntValues(result, 0));
+    }
+
+    [Fact]
+    public void Filter_NullPredicate_ViaSelectionAwareGather_ExcludesNullRows()
+    {
+        // Spark WHERE null semantics on the SELECTION-AWARE gather path (input.Selection != null): a
+        // null predicate value in the selected view does not pass. The contiguous fast path covers
+        // nulls elsewhere; this drives nulls specifically through the gather branch, which the red-team
+        // and the query-execution seat both found untested for null-safety.
+        ColumnBatch full = Batch(ThreeCol, IntCol(1, 2, 3, 4), StrCol("a", "b", "c", "d"), BoolCol(true, null, false, null));
+        // Pre-select physical rows 0,1,3 → logical view flags true, null, null.
+        ColumnBatch preselected = full.WithSelection(new SelectionVector([0, 1, 3]));
+        var filter = new FilterOperator(Scan(preselected), FlagRef);
+
+        using IBatchStream stream = Backend.Open(filter, Ctx());
+        ColumnBatch result = Assert.Single(Drain(stream));
+
+        // Only logical row 0 (physical 0, flag true) passes; both null flags are excluded.
+        Assert.Equal(new int?[] { 1 }, IntValues(result, 0));
+        Assert.Equal(1, filter.Metrics.Snapshot().SelectedRows);
     }
 
     [Fact]
@@ -754,6 +810,55 @@ public class InterpretedOperatorsTests
         Assert.Equal(sizeof(long), ex.RequestedBytes);
         Assert.Equal(4, ex.BudgetBytes);
         Assert.Equal(0, mem.ReservedBytes); // a refused reservation leaks nothing
+    }
+
+    [Fact]
+    public void Filter_AfterDispose_ThrowsObjectDisposed_OwnedByFilter()
+    {
+        // TryGetNext after Dispose must fail fast through the filter's OWN guard. A non-disposing
+        // FakeChildStream (which would otherwise yield a batch) isolates it: removing the filter's
+        // ObjectDisposedException.ThrowIf would let it process the child batch and return true.
+        var op = new FilterOperator(Scan(Batch(ThreeCol, IntCol(1), StrCol("a"), BoolCol(true))), FlagRef);
+        ColumnBatch batch = Batch(ThreeCol, IntCol(1), StrCol("a"), BoolCol(true));
+        var stream = new InterpretedFilterStream(op, predicateOrdinal: 2, new FakeChildStream(ThreeCol, [batch]), Ctx());
+        stream.Dispose();
+
+        Assert.Throws<ObjectDisposedException>(() => stream.TryGetNext(out _));
+    }
+
+    [Fact]
+    public void Project_AfterDispose_ThrowsObjectDisposed_OwnedByProject()
+    {
+        // Same fail-fast contract for project, isolated from the child via a non-disposing fake.
+        var outSchema = new StructType([new StructField("key", DataTypes.IntegerType, nullable: false)]);
+        var op = new ProjectOperator(Scan(Batch(ThreeCol, IntCol(1), StrCol("a"), BoolCol(true))), outSchema, [IdRef]);
+        ColumnBatch batch = Batch(ThreeCol, IntCol(1), StrCol("a"), BoolCol(true));
+        var stream = new InterpretedProjectStream(op, [0], new FakeChildStream(ThreeCol, [batch]), Ctx());
+        stream.Dispose();
+
+        Assert.Throws<ObjectDisposedException>(() => stream.TryGetNext(out _));
+    }
+
+    [Fact]
+    public void Filter_ReturnsRentedSelectionBuffer_ExactlyOnce_OnEveryPath()
+    {
+        // The selection scratch buffer must be returned to the pool exactly once on every path —
+        // surviving rows, a fully-filtered drop, and drain — never leaked, never double-returned. A
+        // tracking pool proves it: a leak leaves Outstanding > 0; a double/foreign return is counted.
+        // (The InMemoryScan child does not rent, so every rent/return here is the filter's.)
+        ColumnBatch b1 = Batch(ThreeCol, IntCol(1, 2, 3), StrCol("a", "b", "c"), BoolCol(true, false, true)); // some pass
+        ColumnBatch b2 = Batch(ThreeCol, IntCol(4, 5), StrCol("d", "e"), BoolCol(false, false));              // none pass (drop)
+        var pool = new TrackingArrayPool();
+        var op = new FilterOperator(Scan(b1, b2), FlagRef);
+        using var stream = new InterpretedFilterStream(
+            op, predicateOrdinal: 2, Backend.Open(Scan(b1, b2), Ctx()), Ctx(), pool);
+
+        Drain(stream);
+
+        Assert.True(pool.Rents > 0);            // the filter actually rented
+        Assert.Equal(pool.Rents, pool.Returns); // returned as many as rented
+        Assert.Equal(0, pool.Outstanding);      // nothing leaked
+        Assert.Equal(0, pool.DoubleReturns);    // nothing returned twice
     }
 
     [Fact]

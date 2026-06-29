@@ -23,10 +23,12 @@ internal sealed class InterpretedFilterStream : IBatchStream
     private readonly IExecutionMemory _memory;
     private readonly CancellationToken _cancellationToken;
     private readonly int _predicateOrdinal;
+    private readonly ArrayPool<int> _selectionPool;
     private long _reservedBytes;
     private bool _disposed;
 
-    internal InterpretedFilterStream(FilterOperator op, int predicateOrdinal, IBatchStream input, ExecutionContext context)
+    internal InterpretedFilterStream(
+        FilterOperator op, int predicateOrdinal, IBatchStream input, ExecutionContext context, ArrayPool<int>? selectionPool = null)
     {
         Schema = op.OutputSchema;
         _predicateOrdinal = predicateOrdinal;
@@ -34,6 +36,7 @@ internal sealed class InterpretedFilterStream : IBatchStream
         _metrics = op.Metrics;
         _memory = context.Memory;
         _cancellationToken = context.CancellationToken;
+        _selectionPool = selectionPool ?? ArrayPool<int>.Shared;
     }
 
     /// <inheritdoc />
@@ -59,37 +62,39 @@ internal sealed class InterpretedFilterStream : IBatchStream
             int logicalRows = input.LogicalRowCount;
             _metrics.AddInputRows(logicalRows);
 
-            int[] rented = ArrayPool<int>.Shared.Rent(Math.Max(logicalRows, 1));
-            int passing = SelectPassingRows(input, rented);
-
-            if (passing == 0)
-            {
-                ArrayPool<int>.Shared.Return(rented);
-                _metrics.AddElapsedNanos(InterpretedOperators.ElapsedNanos(start));
-                continue; // fully filtered — pull the next input rather than emit an empty batch
-            }
-
-            // Reserve the retained selection vector (one int per surviving row) before materializing
-            // it; the rented scratch buffer is always returned, even if the reservation is refused.
-            SelectionVector selection;
+            int[] rented = _selectionPool.Rent(Math.Max(logicalRows, 1));
             try
             {
+                int passing = SelectPassingRows(input, rented);
+
+                if (passing == 0)
+                {
+                    _metrics.AddElapsedNanos(InterpretedOperators.ElapsedNanos(start));
+                    continue; // fully filtered — pull the next input rather than emit an empty batch
+                }
+
+                // Reserve the retained selection vector (one int per surviving row) before materializing
+                // it. The SelectionVector copies the indices out of the rented span, so the scratch
+                // buffer is safe to return immediately afterwards.
                 Reserve((long)passing * sizeof(int));
-                selection = new SelectionVector(rented.AsSpan(0, passing));
+                var selection = new SelectionVector(rented.AsSpan(0, passing));
+
+                // Zero-copy: WithSelection shares the input's columns and composes over any prior selection.
+                ColumnBatch selected = input.WithSelection(selection);
+                _metrics.AddSelectedRows(passing);
+                _metrics.AddOutput(passing);
+                _metrics.AddElapsedNanos(InterpretedOperators.ElapsedNanos(start));
+
+                batch = selected;
+                return true;
             }
             finally
             {
-                ArrayPool<int>.Shared.Return(rented);
+                // Single return site for every path (surviving rows, fully-filtered continue, or a throw
+                // from predicate evaluation / a refused reservation): the rented buffer is returned
+                // exactly once, never leaked, never double-returned.
+                _selectionPool.Return(rented);
             }
-
-            // Zero-copy: WithSelection shares the input's columns and composes over any prior selection.
-            ColumnBatch selected = input.WithSelection(selection);
-            _metrics.AddSelectedRows(passing);
-            _metrics.AddOutput(passing);
-            _metrics.AddElapsedNanos(InterpretedOperators.ElapsedNanos(start));
-
-            batch = selected;
-            return true;
         }
 
         batch = null;
