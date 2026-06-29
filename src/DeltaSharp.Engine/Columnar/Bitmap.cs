@@ -32,8 +32,20 @@ internal static class Bitmap
     }
 
     /// <summary>Counts cleared (null) bits in the window <c>[offset, offset + length)</c>.</summary>
+    /// <remarks>
+    /// An <b>empty</b> <paramref name="bitmap"/> means "no validity buffer", which by the
+    /// Arrow-compatible contract is all-valid: this returns <c>0</c> without touching any byte (the
+    /// no-bitmap fast path, STORY-02.6.1 AC1/AC4). A non-empty buffer must cover
+    /// <c>offset + length</c> bits. The result is a deterministic function of the bits, offset, and
+    /// length.
+    /// </remarks>
     public static int CountNulls(ReadOnlySpan<byte> bitmap, int offset, int length)
     {
+        if (bitmap.IsEmpty)
+        {
+            return 0;
+        }
+
         int nulls = 0;
         for (int i = 0; i < length; i++)
         {
