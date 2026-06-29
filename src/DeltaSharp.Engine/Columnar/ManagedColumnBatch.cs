@@ -78,17 +78,31 @@ public sealed class ManagedColumnBatch : ColumnBatch
     public override ColumnBatch WithSelection(SelectionVector selection)
     {
         ArgumentNullException.ThrowIfNull(selection);
-        ReadOnlySpan<int> indices = selection.Indices;
-        for (int i = 0; i < indices.Length; i++)
+
+        // Compose over any existing selection: indices address the current logical rows and must
+        // resolve to physical rows. With no prior selection they validate against the physical
+        // row count and pass through unchanged (no copy of the columns).
+        SelectionVector resolved;
+        if (_selection is null)
         {
-            if ((uint)indices[i] >= (uint)_rowCount)
+            ReadOnlySpan<int> indices = selection.Indices;
+            for (int i = 0; i < indices.Length; i++)
             {
-                throw new ArgumentOutOfRangeException(
-                    nameof(selection), indices[i], $"Selected index must be in [0, {_rowCount}).");
+                if ((uint)indices[i] >= (uint)_rowCount)
+                {
+                    throw new ArgumentOutOfRangeException(
+                        nameof(selection), indices[i], $"Selected index must be in [0, {_rowCount}).");
+                }
             }
+
+            resolved = selection;
+        }
+        else
+        {
+            resolved = _selection.Compose(selection);
         }
 
-        return new ManagedColumnBatch(Schema, _columns, _rowCount, selection);
+        return new ManagedColumnBatch(Schema, _columns, _rowCount, resolved);
     }
 
     private static ColumnVector[] ToValidatedArray(StructType schema, IReadOnlyList<ColumnVector> columns, int rowCount)

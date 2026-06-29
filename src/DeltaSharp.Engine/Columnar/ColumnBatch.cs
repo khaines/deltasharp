@@ -54,9 +54,23 @@ public abstract class ColumnBatch
 
     /// <summary>
     /// Returns a selection-aware view of this batch carrying <paramref name="selection"/>. The
-    /// underlying columns are shared (no copy); only the logical row mapping changes.
+    /// underlying columns are shared (no copy); only the logical row mapping changes. If the batch
+    /// already carries a selection, the two compose — <paramref name="selection"/> indexes the
+    /// current logical rows and resolves through to physical rows (STORY-02.1.2 AC1, AC2).
     /// </summary>
     /// <exception cref="ArgumentNullException"><paramref name="selection"/> is null.</exception>
-    /// <exception cref="ArgumentOutOfRangeException">A selected index is outside <c>[0, RowCount)</c>.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">A selected index is outside <c>[0, LogicalRowCount)</c>.</exception>
     public abstract ColumnBatch WithSelection(SelectionVector selection);
+
+    /// <summary>
+    /// The column at <paramref name="ordinal"/> as a logical view of the selected rows: when a
+    /// <see cref="Selection"/> is present, the returned vector's row <c>i</c> is the i-th selected
+    /// row (zero-copy via <see cref="ColumnVector.Select"/>); otherwise it is the column itself.
+    /// Kernels enumerate it over <c>[0, LogicalRowCount)</c> without selection bookkeeping. Each
+    /// call rebuilds a fresh selected view (a small allocation plus a one-time null count), so a
+    /// kernel that touches one column repeatedly should hoist the view once, not re-call per row.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="ordinal"/> is outside <c>[0, ColumnCount)</c>.</exception>
+    public ColumnVector SelectedColumn(int ordinal) =>
+        Selection is { } selection ? Column(ordinal).Select(selection) : Column(ordinal);
 }

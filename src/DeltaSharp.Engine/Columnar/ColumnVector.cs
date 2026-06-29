@@ -96,4 +96,40 @@ public abstract class ColumnVector
     /// </summary>
     /// <exception cref="ArgumentOutOfRangeException">The range is outside <c>[0, Length]</c>.</exception>
     public abstract ColumnVector Slice(int offset, int length);
+
+    /// <summary>
+    /// A zero-copy selected view whose logical rows are <paramref name="selection"/>'s physical
+    /// rows, in selection order: <c>Length</c> equals the selected cardinality and no value or
+    /// validity buffers are copied. Selecting over an existing selected view composes the two
+    /// selections (STORY-02.1.2 AC1, AC2). Like <see cref="Slice"/>, creating a view seals a
+    /// mutable owner so the shared buffers can't be mutated underneath the view. The view is
+    /// enumerated per-row through <see cref="GetValue{T}"/>/<see cref="GetBytes"/>/<see cref="IsNull"/>;
+    /// the contiguous <see cref="GetValues{T}"/> span is unavailable on a selection (kernels gather).
+    /// </summary>
+    /// <exception cref="ArgumentNullException"><paramref name="selection"/> is null.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">A selected index is outside <c>[0, Length)</c>.</exception>
+    public virtual ColumnVector Select(SelectionVector selection)
+    {
+        ArgumentNullException.ThrowIfNull(selection);
+        ReadOnlySpan<int> indices = selection.Indices;
+        for (int i = 0; i < indices.Length; i++)
+        {
+            if ((uint)indices[i] >= (uint)Length)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(selection), indices[i], $"Selected index must be in [0, {Length}).");
+            }
+        }
+
+        SealForView();
+        return new SelectedColumnVector(this, selection);
+    }
+
+    /// <summary>
+    /// Seals an owner when a zero-copy view (slice or selection) is taken over its buffers.
+    /// The base does nothing; a mutable reference vector overrides it to reject later mutation.
+    /// </summary>
+    protected virtual void SealForView()
+    {
+    }
 }
