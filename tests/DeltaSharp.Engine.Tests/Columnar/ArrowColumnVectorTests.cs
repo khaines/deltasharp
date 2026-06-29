@@ -211,4 +211,13 @@ public class ArrowColumnVectorTests
 
     [Fact]
     public void Wrap_Null_Throws() => Assert.Throws<ArgumentNullException>(() => ArrowColumnVector.Wrap(null!));
+
+    [Fact]
+    public void Slice_OffsetLengthOverflow_ThrowsNotWraps()
+    {
+        Int32Array full = new Int32Array.Builder().Append(1).Append(2).Append(3).Build();
+        ColumnVector v = ArrowColumnVector.Wrap(full);
+        // offset+length overflows Int32; must be rejected, not wrap to a negative in-range bound.
+        Assert.Throws<ArgumentOutOfRangeException>(() => v.Slice(1, int.MaxValue));
+    }
 }
