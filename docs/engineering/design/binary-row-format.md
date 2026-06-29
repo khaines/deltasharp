@@ -17,7 +17,8 @@ It lives in the unshipped `DeltaSharp.Engine` assembly under `src/DeltaSharp.Eng
 
 This story delivers v1: the layout geometry, encode/decode for every fixed- and variable-width
 type, the nested `array`/`map`/`struct` subset, and explicit off-heap ownership. Byte-sortable
-ordering and standalone spill serialization are STORY-02.4.2.
+ordering and standalone spill serialization are delivered by STORY-02.4.2 — see
+[byte-sortable ordering](byte-sortable-ordering.md).
 
 ## Block layout
 
@@ -91,8 +92,8 @@ the row and the transferred buffer.
 
 - **In scope:** the 8-aligned layout; encode/decode for all v1 scalar/decimal types; the nested
   array/map/struct subset; off-heap buffers with explicit, double-free-safe disposal and transfer.
-- **Deferred to STORY-02.4.2:** byte-sortable ordering, schema-version metadata, standalone spill
-  serialization, and bounded validation of malformed/truncated bytes.
+- **Delivered by [STORY-02.4.2](byte-sortable-ordering.md):** byte-sortable ordering, schema-version
+  metadata, standalone spill serialization, and bounded validation of malformed/truncated bytes.
 
 ## References
 
