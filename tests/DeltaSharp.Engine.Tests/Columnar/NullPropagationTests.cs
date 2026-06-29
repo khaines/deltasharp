@@ -209,9 +209,48 @@ public class NullPropagationTests
         Assert.False(needs);
         Assert.True(after - before <= 64, $"gate allocated {after - before} bytes (expected ~0)");
 
+        // The unary gate has its own all-valid fast path: an all-valid operand needs no bitmap.
+        Assert.False(NullPropagation.NeedsValidityBitmap(Validity.AllValid(8)));
+
         var bits = new byte[1];
         Assert.True(NullPropagation.NeedsValidityBitmap(new Validity(bits, 0, 8)));
         Assert.True(NullPropagation.NeedsValidityBitmap(Validity.AllValid(8), new Validity(bits, 0, 8)));
+    }
+
+    [Fact]
+    public void WriteLane_NullLane_DeterministicallyClearsStaleValue()
+    {
+        // A null output lane must write a deterministic placeholder value (false), not leave whatever
+        // was in the buffer — the result value span may be pooled/reused and carry stale data. We
+        // pre-dirty the buffer with `true` so a missing clear would survive (a fresh bool[] is already
+        // false). Covers every WriteLane caller (KleeneNot / KleeneAnd / KleeneOr).
+        bool?[] input = { true, false, null }; // KleeneNot -> { false, true, null }
+        (bool[] values, byte[] bitmap) = Encode(input);
+        var outValues = new bool[input.Length];
+        Array.Fill(outValues, true); // stale sentinel: any uncleared null lane would read `true`
+        var outValidity = new byte[Bitmap.ByteCount(input.Length)];
+
+        int nulls = NullPropagation.KleeneNot(
+            values, new Validity(bitmap, 0, input.Length), outValues, outValidity);
+
+        Assert.Equal(1, nulls);
+        Assert.False(Bitmap.Get(outValidity, 2));   // lane 2 is null...
+        Assert.False(outValues[2]);                 // ...and its value was deterministically cleared
+
+        // Same for the binary writers, which share WriteLane.
+        bool?[] left = { true, null };
+        bool?[] right = { true, null };
+        (bool[] lv, byte[] lb) = Encode(left);
+        (bool[] rv, byte[] rb) = Encode(right);
+        var binOut = new bool[2];
+        Array.Fill(binOut, true);
+        var binValidity = new byte[Bitmap.ByteCount(2)];
+
+        NullPropagation.KleeneAnd(
+            lv, new Validity(lb, 0, 2), rv, new Validity(rb, 0, 2), binOut, binValidity);
+
+        Assert.False(Bitmap.Get(binValidity, 1)); // null AND null = null
+        Assert.False(binOut[1]);                   // null lane cleared, not left stale `true`
     }
 
     [Fact]
