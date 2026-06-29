@@ -133,6 +133,14 @@ public sealed class MapData : IEquatable<MapData>
             throw new ArgumentException($"Map has {keys.Length} keys but {values.Length} values.", nameof(values));
         }
 
+        for (int i = 0; i < keys.Length; i++)
+        {
+            if (keys[i] is null)
+            {
+                throw new ArgumentException($"Map key at index {i} is null; map keys must be non-null.", nameof(keys));
+            }
+        }
+
         KeyType = keyType;
         ValueType = valueType;
         _keys = (object?[])keys.Clone();
