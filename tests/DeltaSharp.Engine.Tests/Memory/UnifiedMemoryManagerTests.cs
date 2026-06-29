@@ -1,3 +1,4 @@
+using System.Threading;
 using DeltaSharp.Engine.Memory;
 using Xunit;
 
@@ -232,5 +233,56 @@ public class UnifiedMemoryManagerTests
 
         // The next reservation forces a spill, which invokes the reentrant callback.
         Assert.Throws<InvalidOperationException>(() => task.Reserve(MemoryPoolKind.Execution, 100));
+    }
+
+    [Fact]
+    public void ReserveRacingDispose_NeverChargesDisposedTask()
+    {
+        // Regression for the dispose-vs-reserve TOCTOU. The *public* pre-check alone is insufficient:
+        // a reserve that passes the pre-check then loses the lock race to Dispose must be rejected by
+        // the *in-lock* disposed re-check, or it orphan-charges bytes that the task's Dispose already
+        // swept — a permanent budget leak. The sequential ReserveAfterDispose test cannot exercise
+        // this (the outer pre-check fires first); only a concurrent race oracle can. On the fixed code
+        // the zero-balance invariant holds for EVERY interleaving, so this test never false-fails;
+        // the mutant lacking the in-lock re-check leaks (reviewers reproduced ~60 orphaned bytes).
+        var manager = new UnifiedMemoryManager(1_000_000, storageRegionFraction: 0.0);
+        const int rounds = 400;
+        const int reserversPerRound = 4;
+        for (int r = 0; r < rounds; r++)
+        {
+            TaskMemoryManager task = manager.RegisterTask(r);
+            using var gate = new ManualResetEventSlim(false);
+            var reservers = new Thread[reserversPerRound];
+            for (int w = 0; w < reserversPerRound; w++)
+            {
+                reservers[w] = new Thread(() =>
+                {
+                    gate.Wait();
+                    for (int k = 0; k < 32; k++)
+                    {
+                        try
+                        {
+                            task.TryReserve(MemoryPoolKind.Execution, 16);
+                        }
+                        catch (ObjectDisposedException)
+                        {
+                            break; // fixed code rejects once disposed; mutant keeps charging
+                        }
+                    }
+                })
+                { IsBackground = true };
+                reservers[w].Start();
+            }
+
+            gate.Set();     // release the reserve storm and the disposer together
+            task.Dispose(); // races the in-flight reservations
+            foreach (Thread t in reservers)
+            {
+                t.Join();
+            }
+        }
+
+        // Every task is disposed: a disposed task must never retain a charge, so the pool balances to 0.
+        Assert.Equal(0, manager.ExecutionPool.UsedBytes);
     }
 }
