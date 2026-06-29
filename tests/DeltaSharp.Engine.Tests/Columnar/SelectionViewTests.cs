@@ -23,6 +23,17 @@ public class SelectionViewTests
         return v;
     }
 
+    private static int[] RandomSelection(Random rng, int domain, int take)
+    {
+        var picks = new int[take];
+        for (int i = 0; i < take; i++)
+        {
+            picks[i] = rng.Next(domain);
+        }
+
+        return picks;
+    }
+
     // ---- AC1: selected view has selected cardinality, shares (does not copy) physical buffers ----
 
     [Fact]
@@ -231,16 +242,156 @@ public class SelectionViewTests
             int physical = first[second[p]];
             Assert.Equal(physical * 10, view.GetValue<int>(p)); // deterministic, in selection order
         }
+    }
 
-        static int[] RandomSelection(Random rng, int domain, int take)
+    [Theory]
+    [InlineData(3)]
+    [InlineData(17)]
+    [InlineData(101)]
+    public void Composed_NullableVarWidth_MatchesManualGather_Randomized(int seed)
+    {
+        // Parity oracle for the nullable + variable-width path: a composed selection over a string
+        // vector with ~30% nulls must gather the same bytes and the same validity as resolving the
+        // two selections by hand — exercising the parent-has-nulls IsNull gather (AC2 + AC4).
+        var rng = new Random(seed);
+        const int parent = 48;
+        MutableColumnVector v = ColumnVectors.Create(StringType.Instance, parent);
+        var expected = new string?[parent];
+        for (int i = 0; i < parent; i++)
         {
-            var picks = new int[take];
-            for (int i = 0; i < take; i++)
+            if (rng.Next(10) < 3)
             {
-                picks[i] = rng.Next(domain);
+                v.AppendNull();
             }
-
-            return picks;
+            else
+            {
+                string s = new((char)('a' + (i % 26)), 1 + (i % 4));
+                expected[i] = s;
+                v.AppendBytes(Encoding.UTF8.GetBytes(s));
+            }
         }
+
+        int[] first = RandomSelection(rng, parent, rng.Next(parent + 1));
+        int[] second = RandomSelection(rng, first.Length, rng.Next(first.Length + 1));
+        ColumnVector view = v.Select(new SelectionVector(first)).Select(new SelectionVector(second));
+
+        int expectedNulls = 0;
+        Assert.Equal(second.Length, view.Length);
+        for (int p = 0; p < second.Length; p++)
+        {
+            int physical = first[second[p]];
+            if (expected[physical] is null)
+            {
+                Assert.True(view.IsNull(p));
+                Assert.True(view.GetBytes(p).IsEmpty); // null gathers to empty, never the wrong row
+                expectedNulls++;
+            }
+            else
+            {
+                Assert.False(view.IsNull(p));
+                Assert.Equal(expected[physical], Encoding.UTF8.GetString(view.GetBytes(p)));
+            }
+        }
+
+        Assert.Equal(expectedNulls, view.NullCount); // counted once at construction, multiset-aware
+    }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(57)]
+    public void DuplicateHeavySelection_KeepsMultisetAndCountsRepeatedNulls(int seed)
+    {
+        // Selections need not be distinct: the same physical row may repeat many times. Count is a
+        // multiset cardinality, each duplicate of a null row counts, and the no-null fast path still
+        // matches the nullable path for the same picks.
+        var rng = new Random(seed);
+        MutableColumnVector v = ColumnVectors.Create(IntegerType.Instance, 4);
+        v.AppendValue(0);
+        v.AppendNull(); // physical 1 is null
+        v.AppendValue(20);
+        v.AppendValue(30);
+
+        int[] picks = new int[24];
+        for (int i = 0; i < picks.Length; i++)
+        {
+            picks[i] = i % 4 == 0 ? 1 : rng.Next(4); // physical 1 (null) appears at least every 4th
+        }
+
+        ColumnVector view = v.Select(new SelectionVector(picks));
+        Assert.Equal(picks.Length, view.Length); // duplicates preserved, not deduped
+        int expectedNulls = 0;
+        for (int i = 0; i < picks.Length; i++)
+        {
+            bool isNull = picks[i] == 1;
+            Assert.Equal(isNull, view.IsNull(i));
+            if (isNull)
+            {
+                expectedNulls++;
+            }
+            else
+            {
+                Assert.Equal(picks[i] * 10, view.GetValue<int>(i));
+            }
+        }
+
+        Assert.Equal(expectedNulls, view.NullCount); // each duplicate null counted
+
+        // No-null parent over the same duplicate picks: fast path yields zero nulls, same values.
+        MutableColumnVector dense = BuildInts(4);
+        ColumnVector denseView = dense.Select(new SelectionVector(picks));
+        Assert.Equal(0, denseView.NullCount);
+        Assert.False(denseView.HasNulls);
+        Assert.Equal(picks[0] * 10, denseView.GetValue<int>(0));
+    }
+
+    [Theory]
+    [InlineData(8)]
+    [InlineData(64)]
+    [InlineData(255)]
+    public void SliceAfterSelect_StaysZeroCopyAndMatchesGather_Randomized(int seed)
+    {
+        // A slice of a selected view is a sub-range of the same selection over the same parent
+        // buffers: values, validity, and null count must equal gathering the windowed picks by hand.
+        var rng = new Random(seed);
+        const int parent = 50;
+        MutableColumnVector v = ColumnVectors.Create(IntegerType.Instance, parent);
+        var isNull = new bool[parent];
+        for (int i = 0; i < parent; i++)
+        {
+            if (rng.Next(5) == 0)
+            {
+                v.AppendNull();
+                isNull[i] = true;
+            }
+            else
+            {
+                v.AppendValue(i * 10);
+            }
+        }
+
+        int[] picks = RandomSelection(rng, parent, rng.Next(1, parent + 1));
+        ColumnVector selected = v.Select(new SelectionVector(picks));
+        int offset = rng.Next(picks.Length);
+        int length = rng.Next(picks.Length - offset + 1);
+        ColumnVector window = selected.Slice(offset, length);
+
+        Assert.Equal(length, window.Length);
+        int windowNulls = 0;
+        for (int i = 0; i < length; i++)
+        {
+            int physical = picks[offset + i];
+            Assert.Equal(isNull[physical], window.IsNull(i));
+            if (isNull[physical])
+            {
+                windowNulls++;
+            }
+            else
+            {
+                Assert.Equal(physical * 10, window.GetValue<int>(i));
+            }
+        }
+
+        Assert.Equal(windowNulls, window.NullCount);
+        Assert.Throws<ArgumentOutOfRangeException>(() => window.Slice(0, length + 1)); // can't widen past the view
     }
 }

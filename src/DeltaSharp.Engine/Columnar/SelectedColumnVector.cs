@@ -27,16 +27,20 @@ public sealed class SelectedColumnVector : ColumnVector
         _selection = selection;
 
         // The view's null count is the parent's null bits at the selected physical rows, counted
-        // once at construction so HasNulls/NullCount are O(1) reads thereafter.
+        // once at construction so HasNulls/NullCount are O(1) reads thereafter. A parent with no
+        // nulls can contribute none through any selection, so skip the per-row IsNull gather and
+        // keep only the bounds gate (no-null fast path).
         int nulls = 0;
+        bool parentHasNulls = parent.HasNulls;
         ReadOnlySpan<int> indices = selection.Indices;
         for (int i = 0; i < indices.Length; i++)
         {
             // Load-bearing bounds gate: every selected physical index must be within the parent. This must
             // not be removed even if NullCount becomes lazy — it is the view's last guard against an
-            // out-of-range physical read (security/refactor durability).
+            // out-of-range physical read (security/refactor durability). Slice/Compose build views
+            // directly, bypassing ColumnVector.Select's bounds check, so it stays unconditional here.
             ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual((uint)indices[i], (uint)parent.Length, nameof(selection));
-            if (parent.IsNull(indices[i]))
+            if (parentHasNulls && parent.IsNull(indices[i]))
             {
                 nulls++;
             }
