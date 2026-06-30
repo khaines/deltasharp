@@ -1,5 +1,7 @@
 using System.Diagnostics.CodeAnalysis;
 using System.Linq.Expressions;
+using DeltaSharp.Engine.Execution.Expressions;
+using DeltaSharp.Engine.Types;
 
 namespace DeltaSharp.Engine.Execution;
 
@@ -18,6 +20,10 @@ namespace DeltaSharp.Engine.Execution;
     "RuntimeFeature.IsDynamicCodeSupported is true.")]
 public sealed class CompiledBackend : IExecutionBackend
 {
+    // Compile-once-per-shape cache of fused expression kernels (STORY-03.4.2). Consulted at Open time
+    // (never per batch/row), so the engine stays lock-free; elided from NativeAOT with this type.
+    private readonly CompiledExpressionCache _expressionCache = new();
+
     /// <inheritdoc />
     public string Name => "compiled";
 
@@ -57,4 +63,25 @@ public sealed class CompiledBackend : IExecutionBackend
     /// attributed to this backend.</remarks>
     public IBatchStream Open(PhysicalOperator op, ExecutionContext context)
         => InterpretedOperators.Open(Name, op, context);
+
+    /// <summary>
+    /// Builds the fused, JIT-compiled evaluator for a hot filter predicate or projection expression
+    /// (STORY-03.4.2) — the compiled tier's value-add over the interpreter. Fusable fixed-width trees
+    /// (arithmetic/comparison/boolean/cast/null) lower to one cached <see cref="FusedRowKernel"/> per
+    /// shape (no per-node intermediate vectors); any other shape transparently falls back to the
+    /// interpreted evaluator, so the result is byte-identical to — and never worse than — the
+    /// interpreter (the ADR-0001 parity oracle). Wiring this into the operator-owned filter/project
+    /// streams is deferred to the operator layer (PR #148); the parity suite (#154) exercises it here.
+    /// </summary>
+    /// <param name="expression">The resolved predicate/projection expression to evaluate.</param>
+    /// <param name="inputSchema">The operator's input schema, for column-reference validation.</param>
+    /// <param name="kind">The operator kind attributed in any <see cref="UnsupportedOperatorException"/>.</param>
+    /// <returns>A compiled evaluator when fusable; otherwise the interpreted evaluator.</returns>
+    /// <exception cref="ArgumentNullException">An argument is null.</exception>
+    internal Expressions.ExpressionEvaluator BuildExpressionEvaluator(
+        PhysicalExpression expression, StructType inputSchema, OperatorKind kind)
+        => CompiledExpressionEvaluators.Build(expression, inputSchema, Name, kind, _expressionCache);
+
+    /// <summary>A snapshot of the expression-fusion cache counters (compile/hit/eviction); for diagnostics and tests.</summary>
+    internal CompiledExpressionCacheMetrics ExpressionCacheMetrics => _expressionCache.Metrics;
 }
