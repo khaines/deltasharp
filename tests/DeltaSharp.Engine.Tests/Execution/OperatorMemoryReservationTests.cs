@@ -143,6 +143,11 @@ public class OperatorMemoryReservationTests
         new StructField("id", DataTypes.IntegerType, nullable: false),
     ]);
 
+    private static readonly StructType StrSortSchema = new(
+    [
+        new StructField("s", DataTypes.StringType, nullable: true),
+    ]);
+
     private static readonly StructType JoinLeft = new(
     [
         new StructField("lk", DataTypes.IntegerType, nullable: true),
@@ -193,6 +198,9 @@ public class OperatorMemoryReservationTests
 
     private static SortOperator SortById(InMemoryScanOperator input)
         => new(input, [new SortOrder(new ColumnReference(0, DataTypes.IntegerType, nullable: false))]);
+
+    private static SortOperator SortByStr(InMemoryScanOperator input)
+        => new(input, [new SortOrder(new ColumnReference(0, DataTypes.StringType, nullable: true))]);
 
     private static ExchangeLocalOperator HashExchange(InMemoryScanOperator input)
         => new(input, partitionCount: 4, [new ColumnReference(0, DataTypes.IntegerType, nullable: false)]);
@@ -551,6 +559,52 @@ public class OperatorMemoryReservationTests
         AggregateOperator agg = GlobalMin(Scan(StrValIn, Batch(StrValIn, StrCol(big, big))));
         var mem = new BoundedExecutionMemory(6000);
         using IBatchStream stream = Backend.Open(agg, Ctx(mem));
+
+        Assert.Throws<ExecutionMemoryException>(() => Drain(stream));
+    }
+
+    // ==============================================================================================
+    // Input/build-side variable-width accounting — the var-width term on the BUFFERED payload (not
+    // the output copy) must fail the reservation closed. Knife-edge budgets bracket the reservation
+    // WITHOUT the var-width term (which fits and drains) and WITH it (which is refused). Deleting the
+    // input/build-side VariableWidthBytes term flips these from throw to pass.
+    // ==============================================================================================
+
+    [Fact]
+    public void Sort_LargeStringInput_TightBudget_FailsClosed_OnInputVarWidth()
+    {
+        // One sort row over a 4096-byte string. InterpretedSortStream reserves per buffered row:
+        //   _rowBytes(16, flat string estimate) + key.Length(4099 = 1 null-marker + 4096 body + 2 term)
+        //   + VariableWidthBytes(4096, true string length) + PermutationEntryBytes(8) = 8219.
+        // The output selection chunk then reserves length*sizeof(int) = 4. Without the var-width term
+        // the buffer reserve is 4123 (=> 4127 incl. chunk), which fits; with it the build needs 8219.
+        // Budget 6000 sits strictly between (4127 < 6000 < 8219): the build is admitted up to the flat
+        // + key + permutation reserve but refused once the TRUE string length is charged.
+        string big = new('y', 4096);
+        SortOperator sort = SortByStr(Scan(StrSortSchema, Batch(StrSortSchema, StrCol(big))));
+        var mem = new BoundedExecutionMemory(6000);
+        using IBatchStream stream = Backend.Open(sort, Ctx(mem));
+
+        Assert.Throws<ExecutionMemoryException>(() => Drain(stream));
+    }
+
+    [Fact]
+    public void Join_LargeStringBuild_TightBudget_FailsClosed_OnBuildVarWidth()
+    {
+        // 1 build (right) row carrying a 4096-byte string, EMPTY probe (left) so no output chunk ever
+        // reserves and can't mask the build charge. InterpretedJoinStream reserves for the build row:
+        //   _buildRowBytes(20 = int 4 + flat string 16) + key.Length(5 = 1 null-marker + 4 int)
+        //   + VariableWidthBytes(4096, true string length)
+        //   + overhead(113 = MatchFlag 1 + HashTableEntry 64 + ListHeader 48) = 4234.
+        // Without the var-width term the build reserve is 138, which fits and drains (the empty probe
+        // emits nothing); with it the build needs 4234. Budget 2000 sits strictly between
+        // (138 < 2000 < 4234): only the TRUE build-payload string length tips the reservation over.
+        string big = new('y', 4096);
+        JoinOperator join = InnerJoin(
+            Batch(JoinLeft, IntCol(), StrCol()),
+            Batch(JoinRight, IntCol(1), StrCol(big)));
+        var mem = new BoundedExecutionMemory(2000);
+        using IBatchStream stream = Backend.Open(join, Ctx(mem));
 
         Assert.Throws<ExecutionMemoryException>(() => Drain(stream));
     }

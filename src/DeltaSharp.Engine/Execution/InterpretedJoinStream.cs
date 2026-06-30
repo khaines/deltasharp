@@ -153,18 +153,34 @@ internal sealed class InterpretedJoinStream : IBatchStream
         }
 
         _disposed = true;
-        _leftScratch?.Release();
-        _leftScratch = null;
-        ReleaseOutputReservation();
-        if (_buildReserved > 0)
-        {
-            _memory.Release(_buildReserved);
-            _buildReserved = 0;
-        }
 
-        _metrics.ObserveRelease(0);
-        _probe.Dispose();
-        _build.Dispose();
+        // Release this operator's own reservations first (so its exactly-once accounting holds), then
+        // dispose the children in a nested try/finally so a throw from the probe Dispose (or the own-byte
+        // release) cannot skip the build Dispose and strand its (grandchild) reservations.
+        try
+        {
+            _leftScratch?.Release();
+            _leftScratch = null;
+            ReleaseOutputReservation();
+            if (_buildReserved > 0)
+            {
+                _memory.Release(_buildReserved);
+                _buildReserved = 0;
+            }
+
+            _metrics.ObserveRelease(0);
+        }
+        finally
+        {
+            try
+            {
+                _probe.Dispose();
+            }
+            finally
+            {
+                _build.Dispose();
+            }
+        }
     }
 
     private void EnsureBuilt()

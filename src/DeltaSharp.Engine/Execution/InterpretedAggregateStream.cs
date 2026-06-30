@@ -120,23 +120,59 @@ internal sealed class InterpretedAggregateStream : IBatchStream
         _disposed = true;
 
         // A blocking operator holds its accumulator/result reservation for its whole lifetime (the
-        // result rows are live until the consumer finishes draining), so release happens here. MIN/MAX
-        // over string/binary also reserves its retained best value's true length; release that too.
-        // Each reservation is released exactly once: the over-release-throwing budget ledger would
-        // throw if any byte were released twice, and the _disposed guard makes Dispose idempotent.
-        foreach (Aggregator aggregator in _aggregators)
+        // result rows are live until the consumer finishes draining), so the bulk release happens here.
+        // MIN/MAX over string/binary also reserves its retained best value's true length; release that
+        // too.
+        //
+        // Exactly-once release is guaranteed LOCALLY by the _disposed guard plus field-zeroing, NOT by
+        // the budget ledger: under a shared memory context the ledger only catches a NET over-release
+        // across the whole operator tree, so a per-operator double-release masked by a compensating leak
+        // elsewhere could slip past it. The local guarantee is concrete — _disposed makes this body run
+        // once, _reservedBytes is zeroed after its release, and each aggregator zeroes its own
+        // retained-bytes field — so a repeated or re-entrant Dispose releases nothing a second time.
+        //
+        // The releases are nested in try/finally so a throw from one aggregator's Release cannot strand a
+        // later aggregator's bytes, the flat _reservedBytes, or the child Dispose.
+        try
         {
-            aggregator.Release();
+            ReleaseAggregators(0);
+        }
+        finally
+        {
+            try
+            {
+                if (_reservedBytes > 0)
+                {
+                    _memory.Release(_reservedBytes);
+                    _reservedBytes = 0;
+                }
+
+                _metrics.ObserveRelease(0);
+            }
+            finally
+            {
+                _input.Dispose();
+            }
+        }
+    }
+
+    // Releases every aggregator's retained variable-width reservation. Structured as nested try/finally
+    // (via recursion) so a throw from one aggregator's Release cannot skip the rest.
+    private void ReleaseAggregators(int index)
+    {
+        if (index >= _aggregators.Length)
+        {
+            return;
         }
 
-        if (_reservedBytes > 0)
+        try
         {
-            _memory.Release(_reservedBytes);
-            _reservedBytes = 0;
+            _aggregators[index].Release();
         }
-
-        _metrics.ObserveRelease(0);
-        _input.Dispose();
+        finally
+        {
+            ReleaseAggregators(index + 1);
+        }
     }
 
     private void EnsureBuilt()

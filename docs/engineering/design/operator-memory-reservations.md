@@ -38,6 +38,13 @@ When a reservation is refused and the operator has nothing to spill (v1 always),
 [`ExecutionMemoryException`](../../../src/DeltaSharp.Engine/Execution/ExecutionMemoryException.cs), carrying
 the requested/available/budget figures for attribution.
 
+> **Note (doc==code precision).** The v1 reservation contract is **fail-closed**: a refused reservation
+> raises `ExecutionMemoryException` rather than spilling (spill is deferred to
+> [STORY-03.6.2](../../planning/epics/EPIC-03-vectorized-execution-backend.md#story-0362-implement-spill-paths-for-stateful-operators)
+> / #156). The pre-existing `BoundedExecutionMemory` class-summary phrasing "operators spill rather than
+> fail" is EPIC-02 wording that predates this fail-closed model; correcting that stale comment is tracked
+> separately and is intentionally out of this story's diff.
+
 ## 2. Reserve-before-allocate, per operator (AC1)
 
 Every operator computes the byte cost of the state it is about to materialize, calls its private `Reserve*`
@@ -48,10 +55,10 @@ buffered row, or selection vector is ever allocated against bytes the budget did
 | Operator | Reserve-before-allocate site | What is reserved |
 | --- | --- | --- |
 | [`InterpretedFilterStream`](../../../src/DeltaSharp.Engine/Execution/InterpretedFilter.cs) | `Reserve((long)passing * sizeof(int))` at [`:96`](../../../src/DeltaSharp.Engine/Execution/InterpretedFilter.cs) — **before** `new SelectionVector(...)` at `:97` | the retained selection vector (one `int` per surviving row) |
-| [`InterpretedProjectStream`](../../../src/DeltaSharp.Engine/Execution/InterpretedProject.cs) | `Reserve(... * sizeof(long))` at [`:103`](../../../src/DeltaSharp.Engine/Execution/InterpretedProject.cs); evaluator scratch reserved at [`:186`](../../../src/DeltaSharp.Engine/Execution/InterpretedProject.cs) | the projected-index map + per-expression evaluation scratch |
-| [`InterpretedSortStream`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs) | `ReserveBuffer(...)` at [`:174`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs) per buffered row; `ReserveChunk(...)` at [`:87`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs) per emitted chunk | the buffered rows + key bytes + permutation slot; the emitted-chunk index map |
-| [`InterpretedAggregateStream`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs) | global group at [`:167`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs); each new group at [`:237`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs); output copy at [`:278`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs) | accumulator state + output estimate + key bytes + hash-entry overhead; MIN/MAX output copy |
-| [`InterpretedJoinStream`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs) | `ReserveBuild(...)` at [`:227`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs) per build row; `ReserveOutput(...)` at [`:445`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)/`:464`/`:480`/`:496` per emitted row | buffered build columns + key + var-width + collection overhead; the output chunk |
+| [`InterpretedProjectStream`](../../../src/DeltaSharp.Engine/Execution/InterpretedProject.cs) | `Reserve(... * sizeof(long))` at [`:103`](../../../src/DeltaSharp.Engine/Execution/InterpretedProject.cs); per-expression evaluator scratch reserved internally by `Evaluate` at [`:139`](../../../src/DeltaSharp.Engine/Execution/InterpretedProject.cs); the gather var-width materialization reserved in `ReserveGather` at [`:174`](../../../src/DeltaSharp.Engine/Execution/InterpretedProject.cs)/[`:186`](../../../src/DeltaSharp.Engine/Execution/InterpretedProject.cs) | the projected-index map; the per-expression evaluator scratch; the gathered materialization of a passthrough `ColumnReference` under an input selection (fixed-width footprint at `:174`, plus its offsets + true value bytes at `:186`) |
+| [`InterpretedSortStream`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs) | `ReserveBuffer(...)` at [`:184`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs) per buffered row; `ReserveChunk(...)` at [`:87`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs) per emitted chunk | the buffered rows + key bytes + permutation slot; the emitted-chunk index map |
+| [`InterpretedAggregateStream`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs) | global group at [`:203`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs); each new group at [`:273`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs); output copy at [`:314`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs) | accumulator state + output estimate + key bytes + hash-entry overhead; MIN/MAX output copy |
+| [`InterpretedJoinStream`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs) | `ReserveBuild(...)` at [`:243`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs) per build row; `ReserveOutput(...)` at [`:461`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)/`:480`/`:496`/`:512` per emitted row | buffered build columns + key + var-width + collection overhead; the output chunk |
 | [`InterpretedExchangeLocalStream`](../../../src/DeltaSharp.Engine/Execution/InterpretedExchangeLocalStream.cs) | `Reserve(...)` at [`:140`](../../../src/DeltaSharp.Engine/Execution/InterpretedExchangeLocalStream.cs) | the per-row assignment + per-partition `counts`/`cursors`/bucket index arrays |
 
 The expression evaluators reserve their result/scratch through the project/aggregate paths above; they do
@@ -64,20 +71,27 @@ releases on whichever path it exits. The over-release-throwing ledger (§1) mean
 self-detecting; a `_disposed` / `_reservedBytes == 0` guard makes every release idempotent so a *double*
 release cannot occur.
 
-- **Streaming operators** (filter, project, exchange) account for **at most one in-flight batch**. Each
-  `TryGetNext` first calls `ReleaseReservation()` to free the previous emission, then reserves the current
-  one; `Dispose` releases the last in-flight reservation. See `InterpretedFilter.cs` `ReleaseReservation`
+- **Streaming operators** account for **at most one in-flight reservation**. **Filter** and **project**
+  reserve one emitted batch per `TryGetNext`: each pull first calls `ReleaseReservation()` to free the
+  previous emission, then reserves the current one; `Dispose` releases the last in-flight reservation. See
+  `InterpretedFilter.cs` `ReleaseReservation`
   ([`:247-252`](../../../src/DeltaSharp.Engine/Execution/InterpretedFilter.cs)) and its `_reservedBytes = 0`
-  guard, mirrored in project ([`:211-214`](../../../src/DeltaSharp.Engine/Execution/InterpretedProject.cs))
-  and exchange ([`:219-223`](../../../src/DeltaSharp.Engine/Execution/InterpretedExchangeLocalStream.cs)).
+  guard, mirrored in project ([`:211-214`](../../../src/DeltaSharp.Engine/Execution/InterpretedProject.cs)).
+  **Exchange** is also a streaming operator with at most one in-flight reservation, but its release cadence
+  differs: it holds a single input batch's assignment-array reservation across the **N partition-view
+  emissions** it produces from that batch and releases it inside `AdvanceInput`
+  ([`:109`](../../../src/DeltaSharp.Engine/Execution/InterpretedExchangeLocalStream.cs)) only when it
+  advances to the next input batch (and in `Dispose` for the final one), via the same `_reservedBytes = 0`
+  guard ([`:219-223`](../../../src/DeltaSharp.Engine/Execution/InterpretedExchangeLocalStream.cs)) — see §4
+  and §8.
 - **Pipeline breakers** (aggregate, sort, join) hold their reservation for the operator's whole lifetime —
   the materialized result rows are live until the consumer finishes draining — so the bulk release happens
   in `Dispose`: aggregate at
-  [`InterpretedAggregateStream.cs:127-139`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs)
+  [`InterpretedAggregateStream.cs:136-156`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs)
   (aggregator MIN/MAX best released first, then `_reservedBytes`, guarded by `if (_reservedBytes > 0)` and the
   `_disposed` flag), sort at
-  [`:104-114`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs), and join at
-  [`:148-168`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs) (the join additionally
+  [`:106-124`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs), and join at
+  [`:148-184`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs) (the join additionally
   releases its one in-flight output chunk via `ReleaseOutputReservation` at the top of each `TryGetNext`,
   [`:122`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)).
 
@@ -107,22 +121,22 @@ constants, defined in
 
 | Constant | Value | Charged where |
 | --- | --- | --- |
-| `HashTableEntryBytes` | `64` | once per newly discovered aggregate group ([`InterpretedAggregateStream.cs:237`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs)) and per distinct join build key ([`InterpretedJoinStream.cs:222`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) |
-| `ListHeaderBytes` | `48` | once when a join build key is first seen (new `List<int>` index) ([`InterpretedJoinStream.cs:222`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) |
-| `ListAppendBytes` | `sizeof(int) * 2` | per ordinal appended to an existing build-index list ([`InterpretedJoinStream.cs:221`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) |
-| `MatchFlagBytes` | `1` | per build row, for the `_matched bool[]` slot ([`InterpretedJoinStream.cs:214`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) |
-| `PermutationEntryBytes` | `sizeof(int) * 2` | per buffered sort row, for the `_order int[]` slot ([`InterpretedSortStream.cs:176`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs)) |
+| `HashTableEntryBytes` | `64` | once per newly discovered aggregate group ([`InterpretedAggregateStream.cs:273`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs)) and per distinct join build key ([`InterpretedJoinStream.cs:238`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) |
+| `ListHeaderBytes` | `48` | once when a join build key is first seen (new `List<int>` index) ([`InterpretedJoinStream.cs:238`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) |
+| `ListAppendBytes` | `sizeof(int) * 2` | per ordinal appended to an existing build-index list ([`InterpretedJoinStream.cs:237`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) |
+| `MatchFlagBytes` | `1` | per build row, for the `_matched bool[]` slot ([`InterpretedJoinStream.cs:230`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) |
+| `PermutationEntryBytes` | `sizeof(int) * 2` | per buffered sort row, for the `_order int[]` slot ([`InterpretedSortStream.cs:186`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs)) |
 
 The constants embed array-doubling headroom (e.g. `*2` on the int slots) so the reserved figure **bounds**
 the real peak in bytes rather than tracking only row count. The join decides this overhead **before** the
 reserve so the reservation still precedes every mutation: it looks the bucket up once
-([`:220`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) and reuses that lookup for
+([`:236`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) and reuses that lookup for
 both the cost decision and the later insert
-([`:248-250`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)). The exchange charges its
+([`:264-266`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)). The exchange charges its
 `O(partitionCount)` `counts` + `cursors` arrays in the same `Reserve` as the per-row assignment
 ([`:140`](../../../src/DeltaSharp.Engine/Execution/InterpretedExchangeLocalStream.cs)). The global (no-key)
 aggregate uses no hash table and is charged state + output only
-([`:163-167`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs)).
+([`:199-203`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs)).
 
 ## 5. Within-batch cancellation granularity — deferral (b)
 
@@ -141,10 +155,10 @@ closes it:
   bounded to `RowPollInterval` rows regardless of upstream batch size.
 
 `Poll` is called in every per-row loop that can be fed an arbitrarily large batch: aggregate accumulate
-([`:210`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs)), join build
-([`:207`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) and join probe-emit
-([`:328`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)), sort buffer
-([`:166`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs)), exchange assign/route
+([`:246`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs)), join build
+([`:223`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) and join probe-emit
+([`:344`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)), sort buffer
+([`:176`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs)), exchange assign/route
 ([`:155`,`:169`,`:185`](../../../src/DeltaSharp.Engine/Execution/InterpretedExchangeLocalStream.cs)), filter
 select ([`:160`,`:171`,`:186`,`:212`](../../../src/DeltaSharp.Engine/Execution/InterpretedFilter.cs)), and the
 five scalar expression evaluators
@@ -166,10 +180,10 @@ output copies:
 
 - **Join output chunk** — every `AppendJoinedRow`/`AppendLeftWithNullRight`/`AppendNullLeftWithBuild`/
   `AppendLeftOnly` charges the var-width of the left and/or build values it copies, on top of `_outputRowBytes`
-  ([`InterpretedJoinStream.cs:445-446`,`:464`,`:480`,`:496`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)).
+  ([`InterpretedJoinStream.cs:461-462`,`:480`,`:496`,`:512`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)).
 - **Aggregate MIN/MAX output** — `BuildResult` charges the var-width of each emitted MIN/MAX value as it is
   copied into the output column
-  ([`InterpretedAggregateStream.cs:266-279`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs)),
+  ([`InterpretedAggregateStream.cs:302-315`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs)),
   symmetric with the input-side running-best retention the
   [`MinMaxAggregator`](../../../src/DeltaSharp.Engine/Execution/Aggregators.cs) reserves.
 
@@ -184,7 +198,7 @@ This keeps the "output stays bounded" claim true **in bytes**, not just in the `
 | --- | --- | --- |
 | `PeakMemoryBytes` ([`:38`](../../../src/DeltaSharp.Engine/Execution/OperatorMetrics.cs)) | high-water mark of reserved bytes; never decays | `ObservePeakMemory` / `ObserveReservation` |
 | `CurrentReservedBytes` ([`:45`](../../../src/DeltaSharp.Engine/Execution/OperatorMetrics.cs)) | bytes currently held reserved; `0` once disposed | `ObserveReservation` (up) / `ObserveRelease` (down) |
-| `AllocationCount` ([`:51`](../../../src/DeltaSharp.Engine/Execution/OperatorMetrics.cs)) | number of successful reservation events against the budget | `ObserveReservation` |
+| `AllocationCount` ([`:51`](../../../src/DeltaSharp.Engine/Execution/OperatorMetrics.cs)) | number of **operator-level** reserve events — one per call through an operator's `Reserve*` helper; **excludes** the aggregator's internal MIN/MAX running-best retentions (see below) | `ObserveReservation` |
 | `SpilledBytes` ([`:35`](../../../src/DeltaSharp.Engine/Execution/OperatorMetrics.cs)) | **placeholder `0`** — wired but dormant; STORY-03.6.2 (#156) populates it | n/a in v1 |
 
 `ObserveReservation(currentTotal)` bumps the count, sets current, and rolls the peak in one call
@@ -193,6 +207,17 @@ after a successful `TryReserve`. `ObserveRelease(currentTotal)` lowers current o
 it after the out-of-band MIN/MAX retention growth, leaving the peak high-water mark untouched
 ([`:108`](../../../src/DeltaSharp.Engine/Execution/OperatorMetrics.cs)). For a blocking operator,
 `CurrentReservedBytes == PeakMemoryBytes` while the result is held and falls to `0` on `Dispose`.
+
+> **MIN/MAX retention and `AllocationCount`.** The [`MinMaxAggregator`](../../../src/DeltaSharp.Engine/Execution/Aggregators.cs)
+> charges a retained string/binary running-best value's true byte length **directly** against the budget
+> ([`Aggregators.cs:441-457`](../../../src/DeltaSharp.Engine/Execution/Aggregators.cs)), without routing
+> through `ObserveReservation`; the aggregate stream folds that growth into `PeakMemoryBytes` /
+> `CurrentReservedBytes` once per input batch via `ObservePeakMemory` + `ObserveRelease`
+> ([`InterpretedAggregateStream.cs:221-223`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs)).
+> Consequently `AllocationCount` counts only operator-level `Reserve*` events and **does not** include those
+> internal retentions — `PeakMemoryBytes` and `CurrentReservedBytes` stay byte-accurate, but a MIN/MAX
+> retention does not increment the reserve-event count. This is intentional in v1: the count measures
+> data-plane reserve calls (new groups, buffered rows, output chunks), not every byte-level adjustment.
 
 ## 8. Ownership-transfer contract (AC4)
 
@@ -208,7 +233,7 @@ Release ownership is held by the **producing** operator; a consumer never releas
 
 Transient evaluator scratch is owned by the evaluating operator via `BatchEvaluationMemory`, reserved during
 the batch and released in a `finally` (e.g. aggregate `scratch.Release()` at
-[`:220`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs)), so it never escapes the
+[`:256`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs)), so it never escapes the
 batch that allocated it.
 
 ## 9. AC-coverage table

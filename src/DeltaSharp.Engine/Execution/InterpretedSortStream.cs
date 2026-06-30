@@ -104,15 +104,25 @@ internal sealed class InterpretedSortStream : IBatchStream
         }
 
         _disposed = true;
-        ReleaseChunkReservation();
-        if (_bufferReserved > 0)
-        {
-            _memory.Release(_bufferReserved);
-            _bufferReserved = 0;
-        }
 
-        _metrics.ObserveRelease(0);
-        _input.Dispose();
+        // Release this operator's own reservations first (so its exactly-once accounting holds), then
+        // dispose the child in a finally so a throw from the own-byte release cannot strand the child's
+        // (grandchild) reservations.
+        try
+        {
+            ReleaseChunkReservation();
+            if (_bufferReserved > 0)
+            {
+                _memory.Release(_bufferReserved);
+                _bufferReserved = 0;
+            }
+
+            _metrics.ObserveRelease(0);
+        }
+        finally
+        {
+            _input.Dispose();
+        }
     }
 
     private void EnsureBuilt()
