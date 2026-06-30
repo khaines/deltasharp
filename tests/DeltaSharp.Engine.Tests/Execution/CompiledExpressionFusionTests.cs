@@ -246,6 +246,129 @@ public sealed class CompiledExpressionFusionTests
         Assert.Equal(fromInterpreted.Message, fromCompiled.Message);
     }
 
+    // Multi-error-kind batch: the interpreter is subtree/child-major (it evaluates the WHOLE left
+    // subtree across all rows, then the right) while the compiled kernel is row-major (per row: left,
+    // then right). When two subtrees fault under ANSI with DIFFERENT error kinds on DIFFERENT rows, the
+    // eval order decides which fault is reached first, so the throwing row, exception type, and message
+    // legitimately differ between tiers. The honest, test-backed guarantee is only that BOTH tiers abort
+    // with SOME ANSI error (no wrong/at-rest value). We therefore assert each throws an ANSI arithmetic
+    // error and deliberately do NOT assert type-equality. See the multi-error caveat in
+    // docs/engineering/design/compiled-expression-fusion.md.
+    [Fact]
+    public void Parity_MultiErrorKindBatch_Ansi_BothTiersThrowAnsiError()
+    {
+        if (!RuntimeFeature.IsDynamicCodeSupported)
+        {
+            return;
+        }
+
+        // (a + b) + (c % d) under ANSI. Row 0: a+b is fine but c%d divides by zero (right subtree).
+        // Row 1: a+b overflows int (left subtree) but c%d is fine. So the interpreter — evaluating the
+        // whole left subtree first — raises ArithmeticOverflowException at row 1, while the compiled
+        // kernel — row-major — hits the divide-by-zero at row 0 and raises DivideByZeroException.
+        StructType schema = Schema(
+            F("a", DataTypes.IntegerType, false),
+            F("b", DataTypes.IntegerType, false),
+            F("c", DataTypes.IntegerType, false),
+            F("d", DataTypes.IntegerType, false));
+        var left = new ArithmeticExpression(Ref(0, DataTypes.IntegerType), Ref(1, DataTypes.IntegerType), ArithmeticOperator.Add);
+        var right = new ArithmeticExpression(Ref(2, DataTypes.IntegerType), Ref(3, DataTypes.IntegerType), ArithmeticOperator.Remainder);
+        var expr = new ArithmeticExpression(left, right, ArithmeticOperator.Add);
+        ColumnBatch batch = Batch(
+            schema,
+            IntCol(0, int.MaxValue), // a
+            IntCol(0, 1),            // b: row 1 -> a+b overflows
+            IntCol(7, 5),            // c
+            IntCol(0, 1));           // d: row 0 -> c%d divides by zero
+
+        // Non-vacuity: this whole-integral tree fuses, so both faults are produced by the real tiers.
+        Assert.IsType<CompiledExpressionEvaluator>(Compiled(expr, schema));
+
+        Exception fromInterpreted = Assert.ThrowsAny<Exception>(() => Run(Interpreted(expr, schema), batch));
+        Exception fromCompiled = Assert.ThrowsAny<Exception>(() => Run(Compiled(expr, schema), batch));
+
+        // Both tiers must abort with an ANSI arithmetic error (overflow OR divide-by-zero). Type-equality
+        // is intentionally not asserted — the tiers may reach different faults first (see comment above).
+        Assert.True(
+            IsAnsiArithmeticError(fromInterpreted),
+            $"interpreted tier threw a non-ANSI exception: {fromInterpreted.GetType()}");
+        Assert.True(
+            IsAnsiArithmeticError(fromCompiled),
+            $"compiled tier threw a non-ANSI exception: {fromCompiled.GetType()}");
+    }
+
+    private static bool IsAnsiArithmeticError(Exception e) =>
+        e is ArithmeticOverflowException or DivideByZeroException;
+
+    // Headline fusion win: the fused per-row kernel eliminates intermediate vectors AND avoids per-row
+    // boxing. Integral arithmetic (a + b) lowers through CompiledScalarOps.TryIntegral, whose long?
+    // result flows the FallibleAssign nullable-struct path (HasValue/Unwrap take long? BY VALUE — no
+    // box). We drive the raw FusedRowKernel over many rows into a pre-reserved output and assert the
+    // STEADY-STATE per-row heap allocation is exactly zero via GC.GetAllocatedBytesForCurrentThread().
+    //
+    // Why poll for steady state: Expression.Compile delegates participate in tiered compilation. The
+    // first invocations may run in tier-0 (minopts), where the JIT can box the nullable temp; tier-1
+    // (the optimized steady state that a hot loop actually runs in) eliminates it. Tier-1 promotion is
+    // asynchronous on a background thread, so we loop full passes — giving the background JIT time —
+    // until a pass allocates nothing, then assert that allocation-free steady state was reached. A real
+    // regression (a per-row box that tier-1 cannot remove, e.g. ~24 bytes/row for a boxed Nullable<long>)
+    // never reaches zero and fails the assertion; the deliberate-box non-vacuity probe confirms this.
+    [Fact]
+    public void FusedKernel_PerRow_IsAllocationFree()
+    {
+        if (!RuntimeFeature.IsDynamicCodeSupported)
+        {
+            return;
+        }
+
+        StructType schema = Schema(F("a", DataTypes.IntegerType, false), F("b", DataTypes.IntegerType, false));
+        var expr = new ArithmeticExpression(Ref(0, DataTypes.IntegerType), Ref(1, DataTypes.IntegerType), ArithmeticOperator.Add);
+
+        const int rows = 8192;
+        var aValues = new int?[rows];
+        var bValues = new int?[rows];
+        for (int i = 0; i < rows; i++)
+        {
+            aValues[i] = i;
+            bValues[i] = rows - i;
+        }
+
+        ColumnBatch batch = Batch(schema, IntCol(aValues), IntCol(bValues));
+        CompiledFusion fusion = CompiledExpressionLowering.Lower(expr);
+        var inputs = new ColumnVector[fusion.SlotOrdinals.Length];
+        for (int slot = 0; slot < inputs.Length; slot++)
+        {
+            inputs[slot] = batch.SelectedColumn(fusion.SlotOrdinals[slot]);
+        }
+
+        // Each pass writes into a fresh output sized to `rows` (its backing array is the single permitted
+        // setup allocation and is created BEFORE the measurement window, so an append never reallocates
+        // inside the measured loop). Poll until a full pass is allocation-free (tier-1 reached).
+        const int maxAttempts = 200;
+        long perRowBytes = long.MaxValue;
+        for (int attempt = 0; attempt < maxAttempts && perRowBytes != 0; attempt++)
+        {
+            MutableColumnVector output = ColumnVectors.Create(expr.Type, rows);
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int row = 0; row < rows; row++)
+            {
+                fusion.Kernel(inputs, row, output);
+            }
+
+            perRowBytes = GC.GetAllocatedBytesForCurrentThread() - before;
+            Assert.Equal(rows, output.Length); // sanity: every row produced exactly one lane
+            if (perRowBytes != 0)
+            {
+                Thread.Sleep(5); // let the background JIT promote the kernel to tier-1, then retry
+            }
+        }
+
+        Assert.True(
+            perRowBytes == 0,
+            $"fused kernel still allocated {perRowBytes} bytes over {rows} rows after {maxAttempts} passes; " +
+            "the steady-state per-row path is not allocation-free.");
+    }
+
     // =====================================================================================
     // AC: selection- and slice-aware evaluation (deterministic output order)
     // =====================================================================================

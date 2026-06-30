@@ -40,7 +40,7 @@ interpreter remains the sole path. Everything here lives in the unshipped `Delta
 | `Expressions/CompiledScalarOps.cs` | Scalar helpers that mirror the interpreter's private math **and exception messages** verbatim (integral/float/double/decimal arithmetic, casts). |
 | `Expressions/CompiledVectorAccess.cs` | Trim-safe seam: non-generic wrappers around `ColumnVector.GetValue<T>` / `MutableColumnVector.AppendValue<T>` / `IsNull`, each exposed as a cached `MethodInfo`. |
 | `Expressions/CompiledExpressionEvaluator.cs` | The driver: derives `ExpressionEvaluator`, gathers referenced columns once per batch, runs the kernel per row. `[RequiresDynamicCode]`. |
-| `Expressions/CompiledExpressionCache.cs` | `CompiledFusion`, `CompiledExpressionCacheMetrics`, and the bounded, lock-free `CompiledExpressionCache`. |
+| `Expressions/CompiledExpressionCache.cs` | `CompiledFusion`, `CompiledExpressionCacheMetrics`, and the bounded `CompiledExpressionCache` (no explicit locks; consulted only at Build time, never on the per-row data path). |
 | `Expressions/CompiledExpressionKey.cs` | The deterministic structural cache key. |
 | `Expressions/FusedRowKernel.cs` | `internal delegate void FusedRowKernel(ColumnVector[] inputs, int row, MutableColumnVector output)`. |
 
@@ -142,7 +142,7 @@ unconditionally (the reads are side-effect-free).
 
 **Arithmetic** dispatches on `ArithmeticEvalKind`:
 
-- **Integral** — `CompiledScalarOps.TryIntegral(op, AsInt64(left), AsInt64(right), min, max, mode)`
+- **Integral** — `CompiledScalarOps.TryIntegral(op, AsInt64(left), AsInt64(right), min, max, mode, typeName)`
   returns `long?`; on success `Narrow` casts (unchecked) to the carrier. The helper performs
   checked `+`/`−`/`×` (catching `OverflowException`), the `Remainder` zero/`-1` guards, and the
   post-op range check, identical to `ArithmeticEvaluator`.
@@ -252,9 +252,11 @@ The cache is a field on each `CompiledBackend` instance, so its lifetime is the 
 consulted **only at expression-build (operator `Open`) time, never per batch or per row** — the
 hot path runs the already-compiled delegate — so the engine stays lock-free on the data path.
 
-Internally it is itself lock-free: a `ConcurrentDictionary<string, Lazy<CompiledFusion>>` keyed by the
-structural signature, plus a `ConcurrentQueue<string>` recording insertion order, plus `Interlocked`
-counters. `GetOrCompile`:
+Internally it uses **no explicit locks**: a `ConcurrentDictionary<string, Lazy<CompiledFusion>>` keyed by
+the structural signature, plus a `ConcurrentQueue<string>` recording insertion order, plus `Interlocked`
+counters (the `ConcurrentDictionary` may take internal per-bucket monitors during a write, but the cache
+is consulted **only at Build time, never on the per-row data path**, so the hot path itself is lock-free).
+`GetOrCompile`:
 
 1. `TryGetValue` hit → increment `Hits`, return.
 2. else create a `Lazy<CompiledFusion>` (`ExecutionAndPublication`) whose factory lowers + compiles and
@@ -299,7 +301,7 @@ combine:
 ### How the publish proves it
 
 `.github/workflows/aot.yml` publishes the representative executor with
-`dotnet publish src/DeltaSharp.Executor -c Release -r linux-x64 -p:PublishAot=true -warnaserror`:
+`dotnet publish src/DeltaSharp.Executor -c Release -r linux-x64 -p:PublishAot=true -p:TreatWarningsAsErrors=true -warnaserror`:
 
 - `-warnaserror` fails the publish on **any** IL2xxx/IL3xxx trim/AOT warning, so an un-guarded reach into
   the compiled tier would break CI.
@@ -310,7 +312,10 @@ combine:
   closed.
 - The elision assertion then requires `strings -a <image>` to **not** find `CompiledBackend` — proving
   the optional tier (and, transitively, every type only reachable through it) was eliminated from the
-  native image.
+  native image. The job is stronger than "transitively elided": it additionally asserts **each**
+  expression-fusion type by name (`CompiledExpressionEvaluator`, `CompiledExpressionLowering`,
+  `CompiledExpressionCache`, `CompiledExpressionKey`, `CompiledScalarOps`, `CompiledVectorAccess`,
+  `FusedRowKernel`) is absent, so a leak of any single tier type — not just the backend root — fails CI.
 
 ## The differential parity oracle
 
@@ -330,13 +335,21 @@ comparison) or disables fusion (failing the type assertion); either way the suit
 verified by injecting a fault — swapping the `LessThan` lowering to emit `GreaterThan` — which turned
 five parity cases red; reverting restored green.
 
+**Scope of the oracle.** The differential oracle proves **value/validity parity** lane-by-lane and,
+for an error path, **single-error-batch exception parity** (same exception type with a byte-identical
+message — see the ANSI coverage row). It does **not** assert exception-type parity for
+**multi-error-kind** batches, because the tiers evaluate in different orders (interpreter
+subtree/child-major vs. compiled row-major) and may reach a different fault first — see the multi-error
+caveat under *Deferred scope*. There, the contract is only that **both tiers raise some ANSI error** and
+that the **success-path result is byte-identical**.
+
 **Gating.** Every compiled-tier test early-returns when `!RuntimeFeature.IsDynamicCodeSupported` (the
 established `ExecutionBackendTests` convention), so on a NativeAOT host — where there is nothing to
 compare against — the suite is inert rather than failing. The test project does **not** enable the
 trim/AOT analyzers (only `src/` production assemblies do), so it may call the `[RequiresDynamicCode]`
 entry points directly without annotation.
 
-**Coverage** (80 tests):
+**Coverage** (82 tests):
 
 | Area | What it proves |
 | --- | --- |
@@ -345,13 +358,14 @@ entry points directly without annotation.
 | Boolean (Kleene 3VL) | `And`/`Or`/`Not` across the full true/false/null matrix; nested logical; predicates built from comparisons. |
 | Cast | int→{long,double,short,bool,decimal}; double→{int(trunc),float}; bool→{int,decimal}; decimal→{long(trunc),wide}; date↔timestamp. |
 | Null / null-check | null propagation through every kind; `IsNull`/`IsNotNull`; `IsNotNull` over arithmetic. |
-| ANSI errors | integer overflow, cast overflow (the `2^63` boundary), double divide-by-zero, integer remainder-by-zero — **both tiers throw the same type with byte-identical messages** (single-error batches). |
+| ANSI errors | integer overflow, cast overflow (the `2^63` boundary), double divide-by-zero, integer remainder-by-zero — **both tiers throw the same type with byte-identical messages** (single-error batches). A **multi-error-kind** batch (`(a+b)+(c%d)`, overflow + divide-by-zero on different rows) asserts both tiers raise *some* ANSI error — type-equality deliberately not asserted (see the multi-error caveat). |
 | Legacy (non-ANSI) | overflow/divide-by-zero/cast-overflow → SQL `NULL` on the same lanes. |
 | NaN / `-0.0` | arithmetic producing `-0.0`, `NaN`/`Inf` propagation, and comparisons across `NaN`/`±0.0` — bit-exact. |
 | Selection / slice | contiguous selection, **unordered** selection, and slice — identical logical-order output. |
 | Wide randomized | seeded 257-row integral and 211-row double batches with ~12% nulls over compound expressions — strong, reproducible non-vacuity. |
 | Fallback | string comparison, `IsNull` over string, decimal divide, unsupported cast (`double→decimal`), and a bad column reference — fusion declines and the interpreter handles it (or both reject identically). |
 | Cache | compile-once-per-shape + reuse across instances; distinct shapes compile separately; bounded eviction; `±0.0` literals key distinctly. |
+| Allocation | the fused integral kernel (`a + b`, the `long?` `FallibleAssign` path) drives many rows and asserts via `GC.GetAllocatedBytesForCurrentThread()` that the **steady-state per-row heap allocation is zero** — guarding the "no per-row boxing" fusion win. |
 
 ### Mapping to STORY-03.4.2 acceptance criteria
 
@@ -360,7 +374,7 @@ entry points directly without annotation.
 | **AC1** — dynamic code unsupported ⇒ interpreter, no compiled delegate | `IsCompiledBackendAvailable` feature guard; `Select` returns the interpreter; the whole tier is elided on AOT | `ExecutionBackendTests.Select_Default_TracksRuntimeDynamicCodeCapability`; the AOT elision job. |
 | **AC2** — same shape + type/nullability ⇒ cached delegate reused | `CompiledExpressionKey` structural key + `CompiledExpressionCache.GetOrCompile` | `Cache_CompilesOncePerShape_ReusesAcrossInstances`. |
 | **AC3** — bounded eviction + compile/hit/eviction metrics | `DefaultCapacity` + `EvictIfOverCapacity` + `CompiledExpressionCacheMetrics` | `Cache_BoundedCapacity_EvictsOldestShapes`, `Cache_DistinctShapes_CompileSeparately`. |
-| **AC4** — interpreter vs compiled: values, validity, errors, row counts match | the differential harness (byte-identical, incl. row count via vector length) | the whole parity suite (80 tests). |
+| **AC4** — interpreter vs compiled: values, validity, errors, row counts match | the differential harness (byte-identical, incl. row count via vector length) | the whole parity suite. Value/validity is byte-identical on every batch; *exception* parity (same type + message) is guaranteed for **single-error batches** — multi-error-kind batches only guarantee both tiers raise *some* ANSI error (see the multi-error caveat). |
 | **AC5** — dynamic-code APIs guarded with analyzer-visible attributes/feature switches | `[RequiresDynamicCode]` + `[FeatureGuard]` + `-warnaserror` publish | the AOT publish + `strings` elision proof. |
 
 ## Deferred scope
@@ -378,10 +392,24 @@ entry points directly without annotation.
   golden physical plans for every operator, randomized-expression property checks over v1 types,
   documented skip reasons when dynamic code is disabled, and richer mismatch diagnostics (plan shape,
   seed, first mismatching row). This story's suite is the per-expression foundation it builds on.
-- **Exception-ordering caveat.** The interpreter is column-at-a-time; the compiled kernel is
-  row-at-a-time interleaved. For a batch containing **multiple** error rows the *exact* row that throws
-  may differ between tiers, though the exception **type** always matches. The error-path parity tests
-  therefore use single-error batches, where the throwing row — and thus the message — is identical.
+- **Exception caveat (multi-error-kind batches).** The two tiers evaluate in **different orders**: the
+  interpreter is **subtree/child-major** (it materializes the *whole* left subtree across all rows, then
+  the right subtree), while the compiled kernel is **row-major** (per row it runs left, then right). On
+  the success path this is invisible — values and validity are byte-identical. But when a single batch
+  faults under ANSI in **two distinct subtrees with two distinct error kinds**, the *eval order decides
+  which fault is reached first*, so the throwing **row**, exception **type**, *and* message **may differ**
+  between tiers. Example — `(a + b) + (c % d)` under ANSI where `a + b` overflows `int` at one row and
+  `c % d` divides by zero at a *different* row: the interpreter evaluates the left subtree first and
+  raises `ArithmeticOverflowException` (the first failing row *of that subtree*), while the compiled tier
+  reaches the divide-by-zero first (the first failing row *overall*) and raises `DivideByZeroException`.
+  The honest guarantee is therefore: **both tiers raise *some* ANSI error** (the query aborts either way —
+  no wrong or at-rest value is ever produced), and the **success-path result (values + validity) is
+  byte-identical**; but in the multi-error-kind case the throwing row and the exception type/message are
+  *not* guaranteed to match. The differential oracle's scope is correspondingly explicit — it guarantees
+  **value/validity parity** and **single-error-batch exception parity** (same type + byte-identical
+  message), **not** multi-error-kind exception-type parity. The single-error error-path parity tests
+  exercise the former; `Parity_MultiErrorKindBatch_Ansi_BothTiersThrowAnsiError` pins the latter (both
+  tiers throw an ANSI error; type-equality is deliberately *not* asserted).
 - **Permanently interpreter-only shapes.** Decimal `Divide`/`Remainder` and `float`/`double → decimal`
   casts are deferred by the type system / v1 cast matrix; string and binary have no fixed-width carrier.
   These always take the fallback path and are never fused.

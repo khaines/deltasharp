@@ -16,16 +16,18 @@ internal readonly record struct CompiledFusion(FusedRowKernel Kernel, int[] Slot
 internal readonly record struct CompiledExpressionCacheMetrics(long Compilations, long Hits, long Evictions, int Count);
 
 /// <summary>
-/// A bounded, lock-free cache of compiled <see cref="FusedRowKernel"/> delegates keyed by a structural
+/// A bounded cache of compiled <see cref="FusedRowKernel"/> delegates keyed by a structural
 /// signature of the expression tree (STORY-03.4.2). It guarantees <b>compile-once-per-shape</b>: a hot
 /// predicate or projection is lowered and JIT-compiled the first time it is opened and the delegate is
 /// reused across every subsequent batch and across structurally-identical expressions, so there is no
 /// per-batch recompilation. The cache is consulted at operator <c>Open</c> time (never per row), so it
-/// stays off the hot path and the engine remains lock-free: entries use a
+/// stays off the hot path: the per-row data path runs the already-compiled delegate and takes no cache
+/// lock. The cache itself uses <b>no explicit <c>lock</c></b> — entries are a
 /// <see cref="ConcurrentDictionary{TKey,TValue}"/> of <see cref="Lazy{T}"/>
 /// (<see cref="LazyThreadSafetyMode.ExecutionAndPublication"/>, so a key compiles exactly once even
 /// under concurrent first use) and insertion-order eviction uses a <see cref="ConcurrentQueue{T}"/> and
-/// <see cref="Interlocked"/> counters — no <c>lock</c>.
+/// <see cref="Interlocked"/> counters. (The <see cref="ConcurrentDictionary{TKey,TValue}"/> may take an
+/// internal per-bucket monitor during a write, but only at Build time — never on the per-row data path.)
 /// </summary>
 /// <remarks>
 /// Annotated <see cref="RequiresDynamicCodeAttribute"/> because it invokes
@@ -79,6 +81,9 @@ internal sealed class CompiledExpressionCache
 
         // The compile runs at most once per key: the winning Lazy's factory increments _compilations;
         // a thread that loses the GetOrAdd race never materializes its own Lazy, so it counts a hit.
+        // A faulting factory caches the exception permanently for this key (ExecutionAndPublication
+        // memoizes the fault); that is acceptable because lowering is deterministic for a
+        // CanFuse-approved tree, so a retry would only reproduce the same failure.
         var created = new Lazy<CompiledFusion>(
             () =>
             {
