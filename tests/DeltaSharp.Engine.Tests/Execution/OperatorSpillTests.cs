@@ -608,7 +608,110 @@ public class OperatorSpillTests
             $"must fail closed MID-drain, not after writing the whole stream: failSpill={failSpill}, fullSpill={fullSpill}");
     }
 
+    [Fact]
+    public void Join_SpillCap_FailsClosedMidBuildDrain_BoundedOvershoot_NotWholeStream()
+    {
+        const int buildBatches = 400;
+        const int rowsPerBuildBatch = 64;
+        const int probeRows = 64;
 
+        // Build is MANY small batches: under a tight memory budget it grace-spills early, then each subsequent
+        // build batch is partitioned to disk and charges the spill cap INCREMENTALLY — so a breach can fail
+        // closed partway through the BUILD drain, before the probe is ever read. The probe is a single small
+        // batch, far too small to breach the cap on its own — so a passing test PROVES the build side charges
+        // the cap: removing the build-side `RecordSpill` makes the join drain the entire build to disk and
+        // never throw (the probe alone stays under the cap), which fails the `Assert.NotNull(error)` below.
+        ColumnBatch[] BuildBatches()
+        {
+            var batches = new ColumnBatch[buildBatches];
+            for (int b = 0; b < buildBatches; b++)
+            {
+                MutableColumnVector k = ColumnVectors.Create(DataTypes.IntegerType, 1);
+                MutableColumnVector v = ColumnVectors.Create(DataTypes.StringType, 1);
+                for (int r = 0; r < rowsPerBuildBatch; r++)
+                {
+                    k.AppendValue(((b * rowsPerBuildBatch) + r) % 1000);
+                    v.AppendBytes(Encoding.UTF8.GetBytes($"b{b}.{r}"));
+                }
+
+                batches[b] = Batch(JoinRight, k, v);
+            }
+
+            return batches;
+        }
+
+        // Probe keys are DISJOINT from the build keys (build uses 0..999), so the inner join produces zero
+        // output — the generous-cap arm completes without ever hitting the v1 join output-chunk floor, and the
+        // spill measured is purely the build side. The breach we want lands during the BUILD drain regardless.
+        ColumnBatch ProbeSide()
+        {
+            MutableColumnVector k = ColumnVectors.Create(DataTypes.IntegerType, 1);
+            MutableColumnVector v = ColumnVectors.Create(DataTypes.StringType, 1);
+            for (int r = 0; r < probeRows; r++)
+            {
+                k.AppendValue(100_000 + r);
+                v.AppendBytes(Encoding.UTF8.GetBytes($"p{r}"));
+            }
+
+            return Batch(JoinLeft, k, v);
+        }
+
+        JoinOperator BuildJoin() => new(
+            Scan(JoinLeft, ProbeSide()),
+            Scan(JoinRight, BuildBatches()),
+            JoinOut(JoinType.Inner),
+            JoinType.Inner,
+            [new ColumnReference(0, DataTypes.IntegerType, nullable: true)],
+            [new ColumnReference(0, DataTypes.IntegerType, nullable: true)]);
+
+        const long budget = 90000; // tight enough to grace-spill the build, ample enough for per-batch scratch
+
+        // Non-vacuity: with a GENEROUS cap the identical join completes; measure the (build-dominant) spill.
+        var genMem = new BoundedExecutionMemory(budget, long.MaxValue);
+        JoinOperator genOp = BuildJoin();
+        using (IBatchStream gen = Backend.Open(genOp, Ctx(genMem)))
+        {
+            Drain(gen);
+        }
+
+        long fullSpill = genOp.Metrics.Snapshot().SpilledBytes;
+        Assert.True(fullSpill > 0, "the tight budget must force the join to grace-spill the build");
+
+        // Tight cap = a fifth of the whole (build-dominant) spill: the build alone overruns it, so the breach
+        // lands DURING the build drain — before the probe is read.
+        long cap = fullSpill / 5;
+        var mem = new BoundedExecutionMemory(budget, cap);
+        JoinOperator op = BuildJoin();
+        IBatchStream stream = Backend.Open(op, Ctx(mem));
+
+        var emitted = new List<ColumnBatch>();
+        SpillBudgetExceededException? error = null;
+        try
+        {
+            while (stream.TryGetNext(out ColumnBatch? batch))
+            {
+                emitted.Add(batch);
+            }
+        }
+        catch (SpillBudgetExceededException ex)
+        {
+            error = ex;
+        }
+
+        long failSpill = mem.SpilledBytes;
+
+        Assert.NotNull(error);                                // deterministic typed fail-closed (build-side charge)
+        Assert.Equal(0, emitted.Sum(b => b.LogicalRowCount)); // build partitioning precedes emit → NO partial output
+        stream.Dispose();
+        Assert.Equal(0, mem.ReservedBytes);                   // release-all (the ledger proves exactly-once)
+
+        // Fail closed MID-build-drain: the cumulative spilled total at the throw is far below the whole spill —
+        // the build did NOT fully reach disk before the cap fired. Removing the build-side `RecordSpill` would
+        // drain the entire build and never throw, so this proves the build charges the cap incrementally.
+        Assert.True(
+            failSpill < fullSpill / 2,
+            $"must fail closed mid-build-drain, not after writing the whole build: failSpill={failSpill}, fullSpill={fullSpill}");
+    }
 
     [Fact]
     public void Exchange_Spill_MatchesNoSpill_PerPartitionCountsAndContents()

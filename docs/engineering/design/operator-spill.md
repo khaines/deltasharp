@@ -34,8 +34,8 @@ In #155 a refused `TryReserve` had nothing to fall back on and raised
 | Operator | Reservation site | On refusal (v2, this story) |
 | --- | --- | --- |
 | Aggregate | `ReserveOrSpill` ([`InterpretedAggregateStream.cs:420`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs)) | spill in-memory groups to partitions, release, retry |
-| Sort | buffer loop `TryReserve` ([`InterpretedSortStream.cs:280`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs)) | sort & write the current run, release, retry |
-| Join | `TryReserveBuild` ([`InterpretedJoinStream.cs:701`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) | switch to grace-hash, partition build + probe to disk |
+| Sort | buffer loop `TryReserve` ([`InterpretedSortStream.cs:289`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs)) | sort & write the current run, release, retry |
+| Join | `TryReserveBuild` ([`InterpretedJoinStream.cs:699`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) | switch to grace-hash, partition build + probe to disk |
 | Exchange | per-batch `TryReserve` ([`InterpretedExchangeLocalStream.cs:184`](../../../src/DeltaSharp.Engine/Execution/InterpretedExchangeLocalStream.cs)) | spill that batch's partitions to disk |
 
 The refusal is still detected by the ledger; the difference is the operator now **frees the reserved bytes
@@ -43,7 +43,7 @@ and continues** rather than throwing. `ExecutionMemoryException` is retained onl
 single indivisible unit (one group, one row, one recovered partition, one output chunk) that cannot fit an
 otherwise-empty budget still fails closed, because there is nothing left to spill (e.g.
 [`InterpretedAggregateStream.cs:448-451`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs),
-[`InterpretedJoinStream.cs:994-998`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)).
+[`InterpretedJoinStream.cs:1008-1012`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)).
 
 ## 2. The spill store abstraction
 
@@ -132,35 +132,35 @@ spill and no-spill runs (§4.1). Spilled bytes are reported once per spill
 
 When the sort buffer cannot reserve another row, the current buffer is sorted by `(keyBytes, globalSeq)` and
 written as one **run** (`SpillCurrentRun`,
-[`:319`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs)), the buffer's reservation is
+[`:328`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs)), the buffer's reservation is
 released, and buffering resumes — so peak memory stays near one run. `(keyBytes, globalSeq)` is the **same
 total order** the no-spill comparator uses: the #140 byte-sortable key first, ties broken by the global
 input ordinal (stability). At emit, `FinishExternalSort`
-([`:231`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs)) sorts and writes the final tail
+([`:240`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs)) sorts and writes the final tail
 as a run, then opens a cursor per run and a min-heap keyed by each run head's `(keyBytes, globalSeq)`. The
 merge repeatedly pops the global minimum, so the merged stream is **byte-identical** to no-spill. Spilled
-bytes are reported per run ([`:360`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs)).
+bytes are reported per run ([`:369`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs)).
 NaN, `-0.0`, multi-key, and nulls-first/last all survive because they are properties of the byte-sortable
 key, which is what the run records carry.
 
 ### 3.3 Join — grace-hash build partitioning + partitioned probe (AC3)
 
 When the build hash table cannot reserve another row (`TryReserveBuild`,
-[`:701`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) the join switches to
+[`:699`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) the join switches to
 **grace-hash** mode (`SwitchToGraceBuild`,
-[`:719`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)): every already-buffered build
+[`:717`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)): every already-buffered build
 row is partitioned to disk by `FNV-1a(encodedKey) mod PartitionCount` (`PartitionBuildRange`,
-[`:755`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)), the in-memory build state is
+[`:753`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)), the in-memory build state is
 released, and the rest of the build batch streams straight to its partition. Build records carry
 `[hasKey:bool][key bytes if hasKey][rowFrame]`; **null-key** build rows go to a dedicated null segment and
 are never indexed. The probe is then drained and partitioned by the **same hash** (`PartitionProbe`,
-[`:790`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) with null-key probe rows to
+[`:798`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) with null-key probe rows to
 their own segment.
 
 Emit walks partitions one at a time (`AdvanceGracePartition`,
-[`:854`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)): for each real partition it
+[`:868`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)): for each real partition it
 rebuilds the in-memory hash table from that partition's build segment (`LoadBuildPartition`,
-[`:912`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) and streams the co-located probe
+[`:926`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) and streams the co-located probe
 segment through the **unchanged** per-row emit machinery (`EmitLeftRow`/`Append*`). Two pseudo-partitions
 follow: a probe-null partition (empty build → LEFT/FULL/ANTI surface unmatched probe rows) and a build-null
 partition (empty probe → RIGHT/FULL surface unmatched build rows). Because a probe row and its matching
@@ -169,8 +169,8 @@ even when the key's partition is spilled, and the **null-key-never-matches** pol
 segments that are never indexed). All six join types reuse the same machinery, so the output **multiset** is
 identical to no-spill; only row **order** differs (partition order), which the tests compare as a multiset.
 Spilled bytes are reported for build and probe
-([`:312`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs),
-[`:844`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)).
+([`:792`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs),
+[`:857`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)).
 
 ### 3.4 Exchange-local — per-partition buffer spill/recover (AC4)
 
@@ -257,7 +257,7 @@ Spill adds two release events beyond #155's normal/cancel/exception set, and bot
   `SwitchToGraceBuild` [`:743-746`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs), sort
   buffer release in `SpillCurrentRun`). During emit, a recovered partition/run reserves its own working set
   and releases it before advancing to the next (e.g. join `AdvanceGracePartition`
-  [`:861-865`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)).
+  [`:875-880`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)).
 - **On a spill failure**, `Dispose` releases whatever remains reserved exactly once.
 
 The over-release ledger turns any double-release or release-without-reserve into a thrown
@@ -269,9 +269,9 @@ The over-release ledger turns any double-release or release-without-reserve into
 story makes it real: each operator sums the payload bytes it writes and calls `AddSpilledBytes` once per
 spill event — aggregate
 ([`:482`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs)), sort per run
-([`:360`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs)), join for build and probe
-([`:312`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs),
-[`:844`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)), and exchange per spilled batch
+([`:369`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs)), join for build and probe
+([`:792`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs),
+[`:857`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)), and exchange per spilled batch
 ([`:266`](../../../src/DeltaSharp.Engine/Execution/InterpretedExchangeLocalStream.cs)). A non-zero
 `Metrics.Snapshot().SpilledBytes` is the spill-happened signal the tests assert for non-vacuity.
 
@@ -297,8 +297,8 @@ pod OOM (Security F1). #156 B1 restores a real, **bounded** ceiling end-to-end:
    path as a spill I/O failure) and emits **no** partial output.
 
 So the blast-radius is bounded on both axes: memory by `BudgetBytes`, disk by `MaxSpillBytes`. The disk gap
-is **not** unbounded — it is the configured spill cap plus at most one in-flight spill event (one run/batch)
-per spilling operator, because the cap is charged incrementally as each spill event is written; crossing it fails closed with the same
+is **not** unbounded — it is the configured spill cap plus at most one in-flight spill event (one run/batch/grace-flush,
+each itself bounded by the in-memory budget) per spilling operator, because the cap is charged incrementally as each spill event is written; crossing it fails closed with the same
 discipline as #359/#363. `BoundedExecutionMemory(budgetBytes, maxSpillBytes)` configures both; the legacy
 single-argument constructor leaves the spill cap effectively unbounded (`long.MaxValue`) for callers that do
 not set one.
@@ -328,7 +328,7 @@ and reverted.
 ## 9. Deferred
 
 - **Recursive re-partitioning.** A single spilled partition whose recovered build still exceeds the budget
-  fails closed (`InterpretedJoinStream.cs:994-998`, `InterpretedAggregateStream.cs` merge reservation)
+  fails closed (`InterpretedJoinStream.cs:1008-1012`, `InterpretedAggregateStream.cs` merge reservation)
   rather than re-partitioning recursively; the message says so. v1 assumes one hash level suffices for the
   configured `PartitionCount = 16`.
 - **The output-chunk floor.** A spilling operator still needs enough budget to hold **one** output batch
