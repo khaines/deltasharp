@@ -118,10 +118,15 @@ branch can never fail a test. To close that hole every kernel threads an optiona
 [`NullMaskTier`](../../../src/DeltaSharp.Engine/Columnar/NullMaskTier.cs) (`Auto` in production;
 `Scalar`/`Word`/`Vector128`/`Vector256` for tests), resolved once per call by `NullMaskTierGate`. Because the
 kernels are written against the **portable** `Vector256<T>` API (whose software fallback runs on any
-architecture), a *forced* `Vector256` loop executes and is parity-checked **even on arm64**. `Auto` keeps the
-original `IsHardwareAccelerated`-guarded dispatch verbatim: the guard sub-expression still folds to its
-per-target constant, so the production codegen, the NativeAOT dead-code elimination of unsupported tiers, and
-the AOT publish gate are all unchanged.
+architecture), a *forced* `Vector256` loop executes and is parity-checked **even on arm64**. Under `Auto`
+the inner-loop codegen and AOT-safety are unchanged — the `IsHardwareAccelerated` sub-expression still folds
+to its per-target constant and the AOT publish stays IL-clean. One honest caveat: because `tier` is now a
+runtime parameter, the gate reduces to a `tier == Vector256` comparison rather than to a literal `false`, so a
+tier unsupported on the host (e.g. `Vector256` on arm64) becomes a **never-taken guarded branch** evaluated
+once at loop entry rather than being fully dead-code-eliminated. The cost is one predictable entry branch plus
+a marginally larger method body; correctness, parity, the per-element hot loop, and the NativeAOT gate are
+unaffected. (A future `Auto`-only entry split from the test-only forcing seam could restore full per-target
+DCE — tracked as a perf follow-up.)
 
 **Why there is no virtual dispatch.** The two Kleene connectives share one fused loop parameterized by a
 `readonly struct` operator implementing a `static abstract` interface (`IKleeneBinaryOperator`). The JIT/AOT
