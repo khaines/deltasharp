@@ -1,31 +1,34 @@
+using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Engine.Execution.Expressions;
+using DeltaSharp.Engine.Execution.Spill;
 using DeltaSharp.Engine.Types;
 
 namespace DeltaSharp.Engine.Execution;
 
 /// <summary>
-/// The pull-based <see cref="IBatchStream"/> for a <see cref="SortOperator"/> (STORY-03.2.2): an
-/// in-memory total sort over EPIC-02 byte-sortable keys. It is a <b>pipeline breaker</b> — the first
-/// <see cref="TryGetNext"/> buffers every input row, computes one order-preserving key per row, sorts
-/// a permutation of row ordinals by a <c>memcmp</c> of those keys, then streams the rows out in that
-/// order as bounded, zero-copy reordered views over the buffered columns.
+/// The pull-based <see cref="IBatchStream"/> for a <see cref="SortOperator"/> (STORY-03.2.2): a total
+/// sort over EPIC-02 byte-sortable keys that spills to sorted runs and k-way merges them when the input
+/// exceeds the budget (STORY-03.6.2 AC2). While the buffer fits memory it is an in-memory total sort
+/// (sort a permutation, emit zero-copy reordered views); when <see cref="ReserveBuffer"/> is refused the
+/// current buffer is sorted and written as a <b>run</b>, the memory is released, and buffering resumes.
+/// At emit, the runs are k-way merged in the same global order the in-memory comparator would produce.
 /// </summary>
 /// <remarks>
 /// <para><b>Ordering (Spark parity).</b> Each <see cref="SortOrder"/> maps to a
-/// <see cref="DeltaSharp.Engine.RowFormat.SortKeyOrdering"/> (direction + null placement) baked into the
-/// key bytes, so an ascending <c>memcmp</c> realizes the requested asc/desc × nulls-first/last order
-/// across all keys. The encoding is the one STORY-02.4.2 proved equal to
-/// <see cref="DeltaSharp.Engine.RowFormat.RowOrderingComparer"/>: nulls sort by their marker, <c>NaN</c>
-/// is the largest float, <c>-0.0 == +0.0</c>, decimals compare exactly, and dates/timestamps compare as
-/// their integral instants. Spark's sort is not guaranteed stable; this sort breaks key ties on input
-/// order so the result is deterministic.</para>
-/// <para><b>Memory.</b> The whole input is buffered (in-memory; spill is STORY-03.5.x). The buffer and
-/// per-row keys reserve before each row is stored and are held until <see cref="Dispose"/>; each
-/// emitted chunk additionally reserves its small selection array, released on the next pull. A refusal
-/// raises <see cref="ExecutionMemoryException"/>.</para>
+/// <see cref="DeltaSharp.Engine.RowFormat.SortKeyOrdering"/> baked into the key bytes, so an ascending
+/// <c>memcmp</c> realizes asc/desc × nulls-first/last across all keys (the STORY-02.4.2 encoding equal to
+/// <see cref="DeltaSharp.Engine.RowFormat.RowOrderingComparer"/>: nulls by marker, <c>NaN</c> largest,
+/// <c>-0.0 == +0.0</c>, exact decimals). Ties break by a global insertion ordinal so the result is
+/// deterministic.</para>
+/// <para><b>Spill identity.</b> The merge orders runs by <c>(keyBytes, globalSeq)</c> — the same total
+/// order the in-memory <see cref="Array.Sort{T}(T[], System.Comparison{T})"/> uses (key bytes, then input
+/// ordinal). Each run is internally sorted by that order and the merge picks the global minimum across run
+/// heads, so the merged output is byte-identical to the no-spill output. A run write/read failure (AC5)
+/// releases every reservation, disposes the runs (deleting temp files), and raises
+/// <see cref="SpillIOException"/> with no rows emitted.</para>
 /// </remarks>
 internal sealed class InterpretedSortStream : IBatchStream
 {
@@ -34,21 +37,33 @@ internal sealed class InterpretedSortStream : IBatchStream
     private readonly IBatchStream _input;
     private readonly OperatorMetrics _metrics;
     private readonly IExecutionMemory _memory;
+    private readonly ISpillStore _spillStore;
     private readonly CancellationToken _cancellationToken;
     private readonly RowKeyProjection _sortKeys;
     private readonly long _rowBytes;
+    private readonly RowSpillCodec _codec;
 
     private readonly List<byte[]> _keys = new();
+    private readonly List<long> _seq = new();
     private MutableColumnVector[] _buffer = [];
     private ManagedColumnBatch? _bufferBatch;
     private int[] _order = [];
     private int _rowCount;
+    private long _globalSeq;
     private int _cursor;
     private int _compareCounter;
     private long _bufferReserved;
     private long _chunkReserved;
     private bool _built;
     private bool _disposed;
+
+    // Spill (external merge sort) state.
+    private readonly List<ISpillSegment> _runs = new();
+    private bool _spilled;
+    private SortMergeCursor[] _mergeCursors = [];
+    private int[] _heap = [];
+    private int _heapSize;
+    private int _mergeChunkRows;
 
     internal InterpretedSortStream(
         SortOperator op, RowKeyProjection sortKeys, IBatchStream input, ExecutionContext context)
@@ -58,8 +73,10 @@ internal sealed class InterpretedSortStream : IBatchStream
         _input = input;
         _metrics = op.Metrics;
         _memory = context.Memory;
+        _spillStore = context.SpillStore;
         _cancellationToken = context.CancellationToken;
         _rowBytes = RowSizeEstimate.Bytes(op.OutputSchema);
+        _codec = new RowSpillCodec(op.OutputSchema);
     }
 
     /// <inheritdoc />
@@ -71,12 +88,17 @@ internal sealed class InterpretedSortStream : IBatchStream
         ObjectDisposedException.ThrowIf(_disposed, this);
         _cancellationToken.ThrowIfCancellationRequested();
 
-        // Release the previous emitted chunk's selection reservation (one in-flight chunk).
+        // Release the previous emitted chunk's reservation (one in-flight chunk).
         ReleaseChunkReservation();
 
-        // Lazy: the first pull buffers and sorts; later pulls only build the next selection view.
+        // Lazy: the first pull buffers and sorts (or builds the run cursors); later pulls slice/merge.
         EnsureBuilt();
 
+        return _spilled ? TryGetNextMerged(out batch) : TryGetNextInMemory(out batch);
+    }
+
+    private bool TryGetNextInMemory([NotNullWhen(true)] out ColumnBatch? batch)
+    {
         if (_bufferBatch is null || _cursor >= _rowCount)
         {
             batch = null;
@@ -96,6 +118,36 @@ internal sealed class InterpretedSortStream : IBatchStream
         return true;
     }
 
+    private bool TryGetNextMerged([NotNullWhen(true)] out ColumnBatch? batch)
+    {
+        if (_heapSize == 0)
+        {
+            batch = null;
+            return false;
+        }
+
+        long start = Stopwatch.GetTimestamp();
+        var columns = ColumnVectors.CreateForSchema(Schema, OutputBatchRows);
+        _mergeChunkRows = 0;
+        ReserveChunk((long)OutputBatchRows * _rowBytes);
+
+        while (_mergeChunkRows < OutputBatchRows && _heapSize > 0)
+        {
+            CancellationPolicy.Poll(_cancellationToken, _mergeChunkRows);
+            int run = _heap[0];
+            SortMergeCursor cursor = _mergeCursors[run];
+            _codec.DecodeInto(columns, cursor.RowFrame());
+            _mergeChunkRows++;
+            AdvanceMergeCursor(run);
+        }
+
+        var result = new ManagedColumnBatch(Schema, columns, _mergeChunkRows);
+        _metrics.AddOutput(_mergeChunkRows);
+        _metrics.AddElapsedNanos(InterpretedOperators.ElapsedNanos(start));
+        batch = result;
+        return true;
+    }
+
     /// <inheritdoc />
     public void Dispose()
     {
@@ -105,10 +157,6 @@ internal sealed class InterpretedSortStream : IBatchStream
         }
 
         _disposed = true;
-
-        // Release this operator's own reservations first (so its exactly-once accounting holds), then
-        // dispose the child in a finally so a throw from the own-byte release cannot strand the child's
-        // (grandchild) reservations.
         try
         {
             ReleaseChunkReservation();
@@ -116,6 +164,17 @@ internal sealed class InterpretedSortStream : IBatchStream
             {
                 _memory.Release(_bufferReserved);
                 _bufferReserved = 0;
+            }
+
+            // Dispose the runs even if a merge-cursor Dispose throws, so one fault cannot strand the
+            // run segments (and their temp files) — both teardown steps always run (Security F3).
+            try
+            {
+                DisposeMergeCursors();
+            }
+            finally
+            {
+                DisposeRuns();
             }
 
             _metrics.ObserveRelease(0);
@@ -145,6 +204,18 @@ internal sealed class InterpretedSortStream : IBatchStream
             _metrics.AddElapsedNanos(InterpretedOperators.ElapsedNanos(start));
         }
 
+        if (_spilled)
+        {
+            FinishExternalSort();
+        }
+        else
+        {
+            FinishInMemorySort();
+        }
+    }
+
+    private void FinishInMemorySort()
+    {
         long sortStart = Stopwatch.GetTimestamp();
         _bufferBatch = new ManagedColumnBatch(Schema, _buffer, _rowCount);
         _order = new int[_rowCount];
@@ -153,17 +224,7 @@ internal sealed class InterpretedSortStream : IBatchStream
             _order[i] = i;
         }
 
-        // Total order: key bytes first, input ordinal as a deterministic tie-break.
-        //
-        // Array.Sort is O(N log N) and ignores the token, so for a large buffer it is an arbitrarily long
-        // uncancellable window. CompareOrdinals polls the token at CancellationPolicy granularity, and
-        // because its comparison counter starts at zero the FIRST comparison polls — so an already- or
-        // buffer-cancelled token is observed at sort entry (before any reordering work), and a token
-        // cancelled mid-sort is observed within RowPollInterval comparisons. (A 0/1-row sort does no
-        // comparison, but it also does no ordering work; such a cancel is observed by the buffer-loop poll
-        // or the top-of-TryGetNext check.) Array.Sort wraps a comparer exception in an
-        // InvalidOperationException (the original as InnerException), so unwrap the OperationCanceledException
-        // and rethrow it cleanly — the operator must surface a plain OCE, not InvalidOperationException.
+        // Array.Sort wraps a comparer exception in InvalidOperationException; unwrap a cancellation OCE.
         try
         {
             Array.Sort(_order, CompareOrdinals);
@@ -174,6 +235,32 @@ internal sealed class InterpretedSortStream : IBatchStream
         }
 
         _metrics.AddElapsedNanos(InterpretedOperators.ElapsedNanos(sortStart));
+    }
+
+    private void FinishExternalSort()
+    {
+        // Sort and spill the final in-memory tail so every row lives in a run, then open the k-way merge.
+        if (_rowCount > 0)
+        {
+            SpillCurrentRun();
+        }
+        else
+        {
+            ReleaseBufferReservation();
+        }
+
+        _mergeCursors = new SortMergeCursor[_runs.Count];
+        _heap = new int[_runs.Count];
+        _heapSize = 0;
+        for (int i = 0; i < _runs.Count; i++)
+        {
+            var cursor = new SortMergeCursor(_runs[i].OpenRead());
+            _mergeCursors[i] = cursor;
+            if (cursor.MoveNext())
+            {
+                HeapPush(i);
+            }
+        }
     }
 
     private void BufferBatch(ColumnBatch batch)
@@ -195,15 +282,27 @@ internal sealed class InterpretedSortStream : IBatchStream
                 CancellationPolicy.Poll(_cancellationToken, r);
                 byte[] key = _sortKeys.Encode(keyVectors, r, out _);
 
-                // Reserve before storing the row so a refusal leaves the buffer consistent. The
-                // var-width term charges the TRUE byte length of every buffered string/binary column
-                // (not the flat 16-byte estimate), so a wide payload cannot bypass the budget. The
-                // permutation-entry term (deferral (a)) charges this row's slot in the _order int[]
-                // (allocated once after the build) so the sort's transient arrays are bounded in bytes.
-                ReserveBuffer(
-                    _rowBytes + key.Length + RowSizeEstimate.VariableWidthBytes(columns, r)
-                    + RowSizeEstimate.PermutationEntryBytes);
+                // Reserve before storing the row. On refusal, spill the current run and retry once; a
+                // single row that cannot fit even an empty budget then fails closed via ReserveBuffer.
+                long need = _rowBytes + key.Length + RowSizeEstimate.VariableWidthBytes(columns, r)
+                    + RowSizeEstimate.PermutationEntryBytes;
+                if (!_memory.TryReserve(need))
+                {
+                    if (_rowCount > 0)
+                    {
+                        SpillCurrentRun();
+                    }
+
+                    ReserveBuffer(need);
+                }
+                else
+                {
+                    _bufferReserved += need;
+                    _metrics.ObserveReservation(_bufferReserved + _chunkReserved);
+                }
+
                 _keys.Add(key);
+                _seq.Add(_globalSeq++);
                 for (int c = 0; c < columnCount; c++)
                 {
                     if (columns[c].IsNull(r))
@@ -225,12 +324,74 @@ internal sealed class InterpretedSortStream : IBatchStream
         }
     }
 
+    // Sorts the buffered rows by (key, seq) and writes them as one sorted run, then releases the buffer.
+    private void SpillCurrentRun()
+    {
+        _spilled = true;
+        var permutation = new int[_rowCount];
+        for (int i = 0; i < _rowCount; i++)
+        {
+            permutation[i] = i;
+        }
+
+        try
+        {
+            Array.Sort(permutation, CompareOrdinals);
+        }
+        catch (InvalidOperationException ex) when (ex.InnerException is OperationCanceledException oce)
+        {
+            throw oce;
+        }
+
+        ISpillSegment run = _spillStore.CreateSegment($"sort-run{_runs.Count}");
+        long spilled = 0;
+        try
+        {
+            var bufferBatch = new ManagedColumnBatch(Schema, _buffer, _rowCount);
+            ColumnVector[] columns = GetBufferColumns(bufferBatch);
+            for (int i = 0; i < _rowCount; i++)
+            {
+                _cancellationToken.ThrowIfCancellationRequested();
+                int row = permutation[i];
+                byte[] frame = _codec.Encode(columns, row);
+                byte[] record = BuildRunRecord(_keys[row], _seq[row], frame);
+                run.Write(record);
+                spilled += record.Length;
+            }
+        }
+        catch
+        {
+            run.Dispose();
+            throw;
+        }
+
+        _runs.Add(run);
+        _metrics.AddSpilledBytes(spilled);
+        // Fail closed if this run would breach the per-query spill cap; the buffer reservation is still held,
+        // so Dispose releases it exactly once and the added run's temp file is deleted on the failure path.
+        _memory.RecordSpill(spilled);
+
+        // Release the spilled buffer's reservation and reset for the next run.
+        ReleaseBufferReservation();
+        _keys.Clear();
+        _seq.Clear();
+        _buffer = ColumnVectors.CreateForSchema(Schema, OutputBatchRows);
+        _rowCount = 0;
+    }
+
+    private ColumnVector[] GetBufferColumns(ManagedColumnBatch bufferBatch)
+    {
+        var columns = new ColumnVector[Schema.Count];
+        for (int c = 0; c < columns.Length; c++)
+        {
+            columns[c] = bufferBatch.Column(c);
+        }
+
+        return columns;
+    }
+
     private int CompareOrdinals(int a, int b)
     {
-        // Poll the token inside the comparer at CancellationPolicy granularity so a cancel during a large
-        // Array.Sort is observed within a bounded number of comparisons. A mask-and-branch on a running
-        // counter mirrors CancellationPolicy.Poll; the throw propagates out of Array.Sort wrapped in an
-        // InvalidOperationException, which EnsureBuilt unwraps back to a clean OperationCanceledException.
         if ((_compareCounter++ & (CancellationPolicy.RowPollInterval - 1)) == 0)
         {
             _cancellationToken.ThrowIfCancellationRequested();
@@ -238,6 +399,92 @@ internal sealed class InterpretedSortStream : IBatchStream
 
         int comparison = _keys[a].AsSpan().SequenceCompareTo(_keys[b]);
         return comparison != 0 ? comparison : a.CompareTo(b);
+    }
+
+    // ---- k-way merge heap (min-heap of run indices, ordered by current head's (key, seq)) ----
+
+    private void AdvanceMergeCursor(int run)
+    {
+        if (_mergeCursors[run].MoveNext())
+        {
+            HeapSiftDown(0);
+        }
+        else
+        {
+            HeapPop();
+        }
+    }
+
+    private void HeapPush(int run)
+    {
+        _heap[_heapSize] = run;
+        int child = _heapSize++;
+        while (child > 0)
+        {
+            int parent = (child - 1) / 2;
+            if (CompareRuns(_heap[child], _heap[parent]) >= 0)
+            {
+                break;
+            }
+
+            (_heap[child], _heap[parent]) = (_heap[parent], _heap[child]);
+            child = parent;
+        }
+    }
+
+    private void HeapPop()
+    {
+        _heapSize--;
+        if (_heapSize > 0)
+        {
+            _heap[0] = _heap[_heapSize];
+            HeapSiftDown(0);
+        }
+    }
+
+    private void HeapSiftDown(int index)
+    {
+        while (true)
+        {
+            int left = (2 * index) + 1;
+            int right = left + 1;
+            int smallest = index;
+            if (left < _heapSize && CompareRuns(_heap[left], _heap[smallest]) < 0)
+            {
+                smallest = left;
+            }
+
+            if (right < _heapSize && CompareRuns(_heap[right], _heap[smallest]) < 0)
+            {
+                smallest = right;
+            }
+
+            if (smallest == index)
+            {
+                return;
+            }
+
+            (_heap[index], _heap[smallest]) = (_heap[smallest], _heap[index]);
+            index = smallest;
+        }
+    }
+
+    private int CompareRuns(int runA, int runB)
+    {
+        SortMergeCursor a = _mergeCursors[runA];
+        SortMergeCursor b = _mergeCursors[runB];
+        int comparison = a.Key().SequenceCompareTo(b.Key());
+        return comparison != 0 ? comparison : a.Seq.CompareTo(b.Seq);
+    }
+
+    private static byte[] BuildRunRecord(byte[] key, long seq, byte[] frame)
+    {
+        byte[] record = new byte[sizeof(int) + key.Length + sizeof(long) + frame.Length];
+        BinaryPrimitives.WriteInt32LittleEndian(record, key.Length);
+        key.CopyTo(record.AsSpan(sizeof(int)));
+        BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(sizeof(int) + key.Length), seq);
+        frame.CopyTo(record.AsSpan(sizeof(int) + key.Length + sizeof(long)));
+        return record;
     }
 
     private void ReserveBuffer(long bytes)
@@ -251,8 +498,7 @@ internal sealed class InterpretedSortStream : IBatchStream
         {
             throw new ExecutionMemoryException(
                 bytes, _memory.AvailableBytes, _memory.BudgetBytes,
-                "the in-memory sort buffer cannot spill in v1 (external sort is STORY-03.5.x); "
-                + "raise the query/tenant memory budget");
+                "a single sort row exceeds the whole memory budget even after spilling; raise the budget");
         }
 
         _bufferReserved += bytes;
@@ -270,11 +516,21 @@ internal sealed class InterpretedSortStream : IBatchStream
         {
             throw new ExecutionMemoryException(
                 bytes, _memory.AvailableBytes, _memory.BudgetBytes,
-                "the sort output selection has no spillable representation in v1; raise the memory budget");
+                "the sort output chunk has no spillable representation; raise the memory budget");
         }
 
         _chunkReserved += bytes;
         _metrics.ObserveReservation(_bufferReserved + _chunkReserved);
+    }
+
+    private void ReleaseBufferReservation()
+    {
+        if (_bufferReserved > 0)
+        {
+            _memory.Release(_bufferReserved);
+            _bufferReserved = 0;
+            _metrics.ObserveRelease(_bufferReserved + _chunkReserved);
+        }
     }
 
     private void ReleaseChunkReservation()
@@ -285,5 +541,101 @@ internal sealed class InterpretedSortStream : IBatchStream
             _chunkReserved = 0;
             _metrics.ObserveRelease(_bufferReserved + _chunkReserved);
         }
+    }
+
+    private void DisposeMergeCursors()
+    {
+        // Defense-in-depth (Security F3): one cursor's Dispose throwing an unexpected exception must not
+        // strand its siblings — dispose every cursor, then surface any failures aggregated (matches
+        // BufferGroup.Dispose). Lock-free: Dispose is single-threaded teardown.
+        List<Exception>? failures = null;
+        foreach (SortMergeCursor cursor in _mergeCursors)
+        {
+            try
+            {
+                cursor?.Dispose();
+            }
+            catch (Exception ex)
+            {
+                (failures ??= []).Add(ex);
+            }
+        }
+
+        _mergeCursors = [];
+        if (failures is not null)
+        {
+            throw new AggregateException("One or more sort merge cursors failed to dispose.", failures);
+        }
+    }
+
+    private void DisposeRuns()
+    {
+        // Defense-in-depth (Security F3): one run's Dispose throwing must not strand its siblings.
+        List<Exception>? failures = null;
+        foreach (ISpillSegment run in _runs)
+        {
+            try
+            {
+                run.Dispose();
+            }
+            catch (Exception ex)
+            {
+                (failures ??= []).Add(ex);
+            }
+        }
+
+        _runs.Clear();
+        if (failures is not null)
+        {
+            throw new AggregateException("One or more sort spill runs failed to dispose.", failures);
+        }
+    }
+
+    // The per-run merge cursor over a run's records (each [keyLen][key][seq][rowFrame]).
+    private sealed class SortMergeCursor : IDisposable
+    {
+        private readonly ISpillSegmentReader _reader;
+        private byte[]? _record;
+        private int _keyOffset;
+        private int _keyLength;
+        private int _frameOffset;
+
+        public SortMergeCursor(ISpillSegmentReader reader) => _reader = reader;
+
+        public long Seq { get; private set; }
+
+        public bool MoveNext()
+        {
+            if (!_reader.TryRead(out byte[]? record))
+            {
+                _record = null;
+                return false;
+            }
+
+            _record = record;
+            try
+            {
+                _keyLength = BinaryPrimitives.ReadInt32LittleEndian(record);
+                _keyOffset = sizeof(int);
+                int seqOffset = _keyOffset + _keyLength;
+                Seq = BinaryPrimitives.ReadInt64LittleEndian(record.AsSpan(seqOffset));
+                _frameOffset = seqOffset + sizeof(long);
+            }
+            catch (Exception ex) when (ex is ArgumentException or IndexOutOfRangeException)
+            {
+                // The outer length frame was intact but its inner [keyLen|key|seq|frame] layout is corrupt
+                // (a structural parse ran past the record). Surface AC5's uniform typed error, not a raw
+                // index/argument exception, so every spill-corruption mode fails the same deterministic way.
+                throw new SpillIOException("read", "sort spill run record (corrupt layout)", ex);
+            }
+
+            return true;
+        }
+
+        public ReadOnlySpan<byte> Key() => _record.AsSpan(_keyOffset, _keyLength);
+
+        public ReadOnlySpan<byte> RowFrame() => _record.AsSpan(_frameOffset);
+
+        public void Dispose() => _reader.Dispose();
     }
 }

@@ -1,6 +1,7 @@
 using System.Text;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Engine.Execution;
+using DeltaSharp.Engine.Execution.Spill;
 using DeltaSharp.Engine.Types;
 using Xunit;
 using ExecutionContext = DeltaSharp.Engine.Execution.ExecutionContext;
@@ -36,7 +37,7 @@ public class OperatorMemoryReservationTests
     private static IExecutionBackend Backend => InterpretedVectorizedBackend.Instance;
 
     private static ExecutionContext Ctx(IExecutionMemory memory, CancellationToken cancellation = default)
-        => new(memory, cancellation);
+        => new(memory, cancellation) { SpillStore = new MemorySpillStore() };
 
     private static MutableColumnVector IntCol(params int?[] values)
     {
@@ -373,6 +374,10 @@ public class OperatorMemoryReservationTests
 
         public long AvailableBytes => _inner.AvailableBytes;
 
+        public long MaxSpillBytes => _inner.MaxSpillBytes;
+
+        public long SpilledBytes => _inner.SpilledBytes;
+
         public bool TryReserve(long bytes)
         {
             if (!_inner.TryReserve(bytes))
@@ -390,6 +395,8 @@ public class OperatorMemoryReservationTests
         }
 
         public void Release(long bytes) => _inner.Release(bytes);
+
+        public void RecordSpill(long bytes) => _inner.RecordSpill(bytes);
     }
 
     // ==============================================================================================
@@ -478,17 +485,18 @@ public class OperatorMemoryReservationTests
     }
 
     [Fact]
-    public void Join_ReservationRefused_ReleasesAllReservations_ExactlyOnce()
+    public void Join_ReservationRefused_SpillsAndReleasesAllReservations_ExactlyOnce()
     {
-        // A tight budget refuses the build reservation partway through; the operator throws with its
-        // partial build still reserved. Dispose releases exactly that amount once (the ledger would throw
-        // on a double release) so the budget returns to zero.
+        // A tight budget refuses the build reservation partway through; STORY-03.6.2 now switches the join
+        // to a grace-hash spill instead of failing closed. The build/probe partition to disk and the join
+        // still completes; Dispose releases every reservation exactly once (the ledger would throw on a
+        // double release) so the budget returns to zero, and the spill is recorded in the metric.
         var mem = new BoundedExecutionMemory(4000);
         JoinOperator join = InnerJoin(Batch(JoinLeft, IntCol(), StrCol()), DistinctBuild(64));
         IBatchStream stream = Backend.Open(join, Ctx(mem));
 
-        Assert.Throws<ExecutionMemoryException>(() => Drain(stream));
-        Assert.True(mem.ReservedBytes > 0); // partial build table still held
+        Drain(stream); // grace spill, no throw
+        Assert.True(join.Metrics.Snapshot().SpilledBytes > 0); // the build side spilled
 
         stream.Dispose();
         Assert.Equal(0, mem.ReservedBytes);
@@ -539,7 +547,7 @@ public class OperatorMemoryReservationTests
         Assert.Equal(groups, held.AllocationCount);          // one reservation event per discovered group
         Assert.True(held.PeakMemoryBytes > 0);
         Assert.Equal(held.PeakMemoryBytes, held.CurrentReservedBytes); // blocking op holds its whole peak
-        Assert.Equal(0, held.SpilledBytes);                  // v1 placeholder: spill is STORY-03.6.2 (#156)
+        Assert.Equal(0, held.SpilledBytes);                  // ample budget: nothing spills (spill is STORY-03.6.2)
 
         stream.Dispose();
         OperatorMetricsSnapshot drained = agg.Metrics.Snapshot();
@@ -584,34 +592,38 @@ public class OperatorMemoryReservationTests
 
     // ==============================================================================================
     // Deferral (a) — collection-overhead accounting (hash entry / list / match flag).
-    // Knife-edge budgets: WITHOUT the overhead charge the build fits and drains; WITH it the build
-    // crosses the budget and fails closed. Deleting the overhead term flips these from throw to pass.
+    // Knife-edge budgets: WITHOUT the overhead charge the build fits and never spills; WITH it the build
+    // crosses the budget and triggers the STORY-03.6.2 spill. Deleting the overhead term flips these from
+    // spill (SpilledBytes > 0) to no-spill (SpilledBytes == 0).
     // ==============================================================================================
 
     [Fact]
-    public void Aggregate_HighCardinality_TightBudget_FailsClosed_OnCollectionOverhead()
+    public void Aggregate_HighCardinality_TightBudget_Spills_OnCollectionOverhead()
     {
         // 64 distinct groups. Per-group reserve = state(8) + output(12) + keyLen(5) + HashTableEntryBytes(64)
         // = 89 (=> 5696 total); without the 64-byte hash entry it is 25 (=> 1600 total). Budget 3200 sits
-        // between: the hash-entry overhead alone tips the build over the budget.
+        // between: the hash-entry overhead alone tips the build over the budget, so the aggregate spills.
         var mem = new BoundedExecutionMemory(3200);
         AggregateOperator agg = GroupByCount(DistinctKeyScan(64));
         using IBatchStream stream = Backend.Open(agg, Ctx(mem));
 
-        Assert.Throws<ExecutionMemoryException>(() => Drain(stream));
+        List<ColumnBatch> output = Drain(stream); // spills, no throw
+        Assert.True(agg.Metrics.Snapshot().SpilledBytes > 0);
+        Assert.Equal(64, output.Sum(b => b.LogicalRowCount)); // all 64 groups recovered
     }
 
     [Fact]
-    public void Join_HighCardinalityBuild_TightBudget_FailsClosed_OnCollectionOverhead()
+    public void Join_HighCardinalityBuild_TightBudget_Spills_OnCollectionOverhead()
     {
         // 64 distinct build keys. Per-key reserve = row+key(25) + payload(1) + match(1) + entry(64) +
         // list(48) = 139 (=> 8896 total); without the 113 bytes of collection overhead it is 26
-        // (=> 1664 total). Budget 4000 sits between, so the overhead alone fails the build closed.
+        // (=> 1664 total). Budget 4000 sits between, so the overhead alone trips the grace-hash spill.
         var mem = new BoundedExecutionMemory(4000);
         JoinOperator join = InnerJoin(Batch(JoinLeft, IntCol(), StrCol()), DistinctBuild(64));
         using IBatchStream stream = Backend.Open(join, Ctx(mem));
 
-        Assert.Throws<ExecutionMemoryException>(() => Drain(stream));
+        Drain(stream); // spills, no throw
+        Assert.True(join.Metrics.Snapshot().SpilledBytes > 0);
     }
 
     // ==============================================================================================
@@ -679,9 +691,10 @@ public class OperatorMemoryReservationTests
 
     // ==============================================================================================
     // Input/build-side variable-width accounting — the var-width term on the BUFFERED payload (not
-    // the output copy) must fail the reservation closed. Knife-edge budgets bracket the reservation
-    // WITHOUT the var-width term (which fits and drains) and WITH it (which is refused). Deleting the
-    // input/build-side VariableWidthBytes term flips these from throw to pass.
+    // the output copy) drives the spill decision. Knife-edge budgets bracket the reservation WITHOUT the
+    // var-width term (which fits and never spills) and WITH it (which trips the spill / fail-closed seam).
+    // Sort over a single oversized row still fails closed (a lone row cannot be partially spilled); the
+    // join spills its build side. Deleting the input/build-side VariableWidthBytes term flips these.
     // ==============================================================================================
 
     [Fact]
@@ -703,16 +716,16 @@ public class OperatorMemoryReservationTests
     }
 
     [Fact]
-    public void Join_LargeStringBuild_TightBudget_FailsClosed_OnBuildVarWidth()
+    public void Join_LargeStringBuild_TightBudget_Spills_OnBuildVarWidth()
     {
-        // 1 build (right) row carrying a 4096-byte string, EMPTY probe (left) so no output chunk ever
-        // reserves and can't mask the build charge. InterpretedJoinStream reserves for the build row:
+        // 1 build (right) row carrying a 4096-byte string, EMPTY probe (left). InterpretedJoinStream
+        // reserves for the build row:
         //   _buildRowBytes(20 = int 4 + flat string 16) + key.Length(5 = 1 null-marker + 4 int)
         //   + VariableWidthBytes(4096, true string length)
         //   + overhead(113 = MatchFlag 1 + HashTableEntry 64 + ListHeader 48) = 4234.
-        // Without the var-width term the build reserve is 138, which fits and drains (the empty probe
-        // emits nothing); with it the build needs 4234. Budget 2000 sits strictly between
-        // (138 < 2000 < 4234): only the TRUE build-payload string length tips the reservation over.
+        // Without the var-width term the build reserve is 138, which fits and never spills; with it the
+        // build needs 4234. Budget 2000 sits strictly between (138 < 2000 < 4234): only the TRUE build-
+        // payload string length tips the reservation over, switching the join to a grace-hash spill.
         string big = new('y', 4096);
         JoinOperator join = InnerJoin(
             Batch(JoinLeft, IntCol(), StrCol()),
@@ -720,7 +733,8 @@ public class OperatorMemoryReservationTests
         var mem = new BoundedExecutionMemory(2000);
         using IBatchStream stream = Backend.Open(join, Ctx(mem));
 
-        Assert.Throws<ExecutionMemoryException>(() => Drain(stream));
+        Drain(stream); // grace spill, no throw (empty probe -> zero output rows)
+        Assert.True(join.Metrics.Snapshot().SpilledBytes > 0);
     }
 
     // ==============================================================================================

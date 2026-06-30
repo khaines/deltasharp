@@ -10,14 +10,26 @@ namespace DeltaSharp.Engine.Execution;
 public sealed class BoundedExecutionMemory : IExecutionMemory
 {
     private long _reserved;
+    private long _spilled;
 
-    /// <summary>Creates a context with the given byte budget.</summary>
+    /// <summary>Creates a context with the given byte budget and an unbounded spill cap.</summary>
     /// <param name="budgetBytes">The reservation ceiling; use <see cref="long.MaxValue"/> for unbounded.</param>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="budgetBytes"/> is negative.</exception>
     public BoundedExecutionMemory(long budgetBytes)
+        : this(budgetBytes, long.MaxValue)
+    {
+    }
+
+    /// <summary>Creates a context with a byte budget and a cumulative spill-bytes cap.</summary>
+    /// <param name="budgetBytes">The reservation ceiling; use <see cref="long.MaxValue"/> for unbounded.</param>
+    /// <param name="maxSpillBytes">The cumulative spill-bytes ceiling; use <see cref="long.MaxValue"/> for unbounded.</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="budgetBytes"/> or <paramref name="maxSpillBytes"/> is negative.</exception>
+    public BoundedExecutionMemory(long budgetBytes, long maxSpillBytes)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(budgetBytes);
+        ArgumentOutOfRangeException.ThrowIfNegative(maxSpillBytes);
         BudgetBytes = budgetBytes;
+        MaxSpillBytes = maxSpillBytes;
     }
 
     /// <summary>An effectively unbounded context.</summary>
@@ -25,6 +37,12 @@ public sealed class BoundedExecutionMemory : IExecutionMemory
 
     /// <inheritdoc />
     public long BudgetBytes { get; }
+
+    /// <inheritdoc />
+    public long MaxSpillBytes { get; }
+
+    /// <inheritdoc />
+    public long SpilledBytes => Interlocked.Read(ref _spilled);
 
     /// <inheritdoc />
     public long ReservedBytes => Interlocked.Read(ref _reserved);
@@ -58,5 +76,18 @@ public sealed class BoundedExecutionMemory : IExecutionMemory
         }
 
         Interlocked.Add(ref _reserved, -bytes);
+    }
+
+    /// <inheritdoc />
+    public void RecordSpill(long bytes)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(bytes);
+        long updated = Interlocked.Add(ref _spilled, bytes);
+        // `updated < bytes` detects 64-bit overflow (wrap to negative) so an enormous spill cannot bypass
+        // the cap by wrapping past MaxSpillBytes; treat it as over-cap and fail closed.
+        if (updated > MaxSpillBytes || updated < bytes)
+        {
+            throw new Spill.SpillBudgetExceededException(bytes, updated, MaxSpillBytes);
+        }
     }
 }

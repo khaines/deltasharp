@@ -2,6 +2,7 @@ using System.Text;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Engine.Execution;
 using DeltaSharp.Engine.Execution.Expressions;
+using DeltaSharp.Engine.Execution.Spill;
 using DeltaSharp.Engine.RowFormat;
 using DeltaSharp.Engine.Types;
 using Xunit;
@@ -86,7 +87,7 @@ public class RelationalOperatorsTests
         => new(schema, batches);
 
     private static ExecutionContext Ctx(IExecutionMemory? memory = null, CancellationToken cancellation = default)
-        => new(memory ?? BoundedExecutionMemory.Unbounded, cancellation);
+        => new(memory ?? BoundedExecutionMemory.Unbounded, cancellation) { SpillStore = new MemorySpillStore() };
 
     private static List<ColumnBatch> Drain(IBatchStream stream)
     {
@@ -1526,7 +1527,8 @@ public class RelationalOperatorsTests
     [Fact]
     public void GlobalSum_Decimal_AnsiOverflow_Throws()
     {
-        // 9e37 + 9e37 = 1.8e38 overflows Int128 (max ~1.7e38) inside DecimalValue.Add.
+        // 9e37 + 9e37 = 1.8e38: the FINAL sum is out of range for decimal(38,0) (#156 B2 defers the fit
+        // check to emit, where the unchecked Int128 mantissa fails ToType). Order-independent — still throws.
         var schema = new StructType([new StructField("v", new DecimalType(38, 0), nullable: true)]);
         Int128 big = Int128.Parse("90000000000000000000000000000000000000");
         AggregateOperator agg = Agg(
