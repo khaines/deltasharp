@@ -42,7 +42,7 @@ public class SortKeyParityTests
     ];
 
     private static readonly object?[] Strings =
-        [null, string.Empty, "\u0000", "Z", "a", "ab", "b", "héllo", "z"];
+        [null, string.Empty, "\u0000", "\u0000\u0000", "\u0000a", "a\u0000", "a\u0000b", "Z", "a", "ab", "b", "héllo", "z"];
 
     public static TheoryData<SortKeyOrdering[]> OrderingConfigurations()
     {
@@ -174,6 +174,51 @@ public class SortKeyParityTests
 
         Assert.Equal(0, oracle.Compare(nan1, nan2));
         Assert.True(encoder.Encode(nan1).AsSpan().SequenceEqual(encoder.Encode(nan2)));
+    }
+
+    [Fact]
+    public void StringField_PrefixFreeEncoding_Parity_AllPairs_AscAndDesc()
+    {
+        // Prefix-freeness of the variable-width escape (0x00 -> 0x00 0xFF, terminated by 0x00 0x00) is
+        // what makes bytewise comparison agree with the scalar comparator AND makes the descending
+        // bitwise complement an EXACT order reversal. These embedded-NUL / overlapping-prefix strings
+        // expose a dropped escape: without it, the *descending* order of e.g. "\u0000" vs "\u0000\u0000"
+        // disagrees with the oracle (the existing fixtures put the string field last and ascending, so
+        // neither the cross-field bleed nor the complement-reversal was exercised). Isolate the string
+        // field and prove parity in both directions and both null placements.
+        string?[] strings = ["", "\u0000", "\u0000\u0000", "\u0000a", "\u0000b", "a", "a\u0000", "a\u0000b", "ab", "b", null];
+        RowData[] rows = new RowData[strings.Length];
+        for (int i = 0; i < strings.Length; i++)
+        {
+            rows[i] = new RowData(Schema, 0, 0.0d, Int128.Zero, 0L, strings[i]);
+        }
+
+        int[] keyFields = [4]; // isolate the string field so its encoding is the sole comparison
+        foreach (SortKeyDirection direction in new[] { SortKeyDirection.Ascending, SortKeyDirection.Descending })
+        {
+            foreach (NullSortOrder nulls in new[] { NullSortOrder.NullsFirst, NullSortOrder.NullsLast })
+            {
+                SortKeyOrdering[] orderings = [new(direction, nulls)];
+                var encoder = new SortKeyEncoder(Schema, keyFields, orderings);
+                var oracle = new RowOrderingComparer(Schema, keyFields, orderings);
+
+                byte[][] keys = new byte[rows.Length][];
+                for (int i = 0; i < rows.Length; i++)
+                {
+                    keys[i] = encoder.Encode(rows[i]);
+                }
+
+                for (int i = 0; i < rows.Length; i++)
+                {
+                    for (int j = 0; j < rows.Length; j++)
+                    {
+                        Assert.Equal(
+                            Math.Sign(oracle.Compare(rows[i], rows[j])),
+                            Math.Sign(keys[i].AsSpan().SequenceCompareTo(keys[j])));
+                    }
+                }
+            }
+        }
     }
 
     private static int[] StableOrder(int count, Comparison<int> comparison)
