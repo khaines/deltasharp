@@ -32,7 +32,7 @@ public class OperatorSpillTests
     private static IExecutionBackend Backend => InterpretedVectorizedBackend.Instance;
 
     private static ExecutionContext Ctx(IExecutionMemory memory, ISpillStore? store = null) =>
-        store is null ? new(memory) : new(memory) { SpillStore = store };
+        new(memory) { SpillStore = store ?? new MemorySpillStore() };
 
     // ==============================================================================================
     // AC1 — hash AGGREGATE spill: partial state serialized and merged to the same result as no-spill.
@@ -130,8 +130,9 @@ public class OperatorSpillTests
     [InlineData(AnsiMode.Legacy)]
     public void Aggregate_Spill_PreservesOverflowSemantics(AnsiMode mode)
     {
-        // Group 0 overflows regardless of grouping order (MaxValue + MaxValue); other groups are normal.
-        // ANSI throws in BOTH spill and no-spill; Legacy nulls group 0 in both, identical otherwise.
+        // Group 0 overflows on the FINAL value regardless of grouping order (MaxValue + MaxValue = 2·MaxValue
+        // does not fit bigint); other groups are normal. Post-#156-B2 the fit check is on the final sum, so
+        // ANSI throws in BOTH spill and no-spill and Legacy nulls group 0 in both, identical otherwise.
         ColumnBatch Data()
         {
             MutableColumnVector keys = ColumnVectors.Create(DataTypes.IntegerType, 1);
@@ -164,6 +165,57 @@ public class OperatorSpillTests
         {
             AssertSpillMatchesNoSpill(Build, tightBudget: 3000, ordered: false);
         }
+    }
+
+    [Theory]
+    [InlineData(AnsiMode.Ansi)]
+    [InlineData(AnsiMode.Legacy)]
+    public void Aggregate_Spill_TransientOverflow_FinalInRange_SpillEqualsNoSpill(AnsiMode mode)
+    {
+        // Architect A1 (#156 B2) repro: group 0's contributions are long.MaxValue, then (after many other
+        // groups push the table to spill) +1000 and -1000. The TRUE sum is long.MaxValue — IN RANGE — but a
+        // single-pass CHECKED fold poisons the group on the transient long.MaxValue+1000 step (Legacy→NULL,
+        // ANSI→throw), while a per-partition spill fold restarts +1000/-1000 from 0 and never sees the
+        // transient. That made the same query+data flip NULL/throw ↔ MaxValue purely on the memory budget.
+        //
+        // After B2 (Int128 accumulate, fit-check deferred to the FINAL value), BOTH arms react only to the
+        // true sum: neither throws nor nulls, and both emit long.MaxValue for group 0 — spill == no-spill.
+        ColumnBatch Data()
+        {
+            MutableColumnVector keys = ColumnVectors.Create(DataTypes.IntegerType, 1);
+            MutableColumnVector vals = ColumnVectors.Create(DataTypes.LongType, 1);
+            keys.AppendValue(0);
+            vals.AppendValue(long.MaxValue); // group 0's first contribution, spilled before the rest arrive
+            for (int g = 1; g < 400; g++)     // many groups in between → forces a spill that flushes group 0
+            {
+                keys.AppendValue(g);
+                vals.AppendValue((long)g);
+            }
+
+            keys.AppendValue(0);
+            vals.AppendValue(1000L);  // transient: MaxValue + 1000 would overflow a checked long fold
+            keys.AppendValue(0);
+            vals.AppendValue(-1000L); // …but the FINAL sum is long.MaxValue, back in range
+            return Batch(LongValIn, keys, vals);
+        }
+
+        AggregateOperator Build() => new(
+            Scan(LongValIn, Data()),
+            LongSumOut,
+            [Col(0, DataTypes.IntegerType)],
+            [new AggregateExpression(AggregateFunction.Sum, new ColumnReference(1, DataTypes.LongType, nullable: true), mode)]);
+
+        // No-spill (ample): the true in-range sum, no throw/null in EITHER mode.
+        List<string> ample = RunRender(Build(), LongSumOut, long.MaxValue, out long spilledAmple, out _);
+        Assert.Equal(0, spilledAmple);
+        Assert.Contains("0|" + long.MaxValue.ToString(System.Globalization.CultureInfo.InvariantCulture), ample);
+
+        // Spill (tight): must AGREE — same in-range value, no transient-driven divergence.
+        List<string> tight = RunRender(Build(), LongSumOut, 3000, out long spilledTight, out long leakTight);
+        Assert.True(spilledTight > 0, "the tight budget must force a spill");
+        Assert.Equal(0, leakTight);
+        Assert.Contains("0|" + long.MaxValue.ToString(System.Globalization.CultureInfo.InvariantCulture), tight);
+        AssertSameRows(ample, tight);
     }
 
     // ==============================================================================================
@@ -372,9 +424,11 @@ public class OperatorSpillTests
 
         // Render PER PARTITION: the exchange emits one batch per partition in id order, so partition i is
         // emission i. Compare each partition's row multiset (and therefore its count) independently.
+        ExchangeLocalOperator ampleOp = Build();
         var mem1 = new BoundedExecutionMemory(long.MaxValue);
-        IBatchStream s1 = Backend.Open(Build(), Ctx(mem1));
+        IBatchStream s1 = Backend.Open(ampleOp, Ctx(mem1));
         List<List<string>> ample = DrainPerBatch(s1, ExchangeSchema);
+        Assert.Equal(0, ampleOp.Metrics.Snapshot().SpilledBytes); // non-vacuity: the ample arm never spills
         s1.Dispose();
 
         ExchangeLocalOperator tightOp = Build();
@@ -471,7 +525,7 @@ public class OperatorSpillTests
         Assert.NotEmpty(Directory.GetFiles(store.Root));
 
         stream.Dispose();
-        Assert.Empty(Directory.GetFiles(store.Root)); // every run's temp file deleted on Dispose
+        AssertEventuallyNoFiles(store.Root); // every run's temp file deleted on Dispose
     }
 
     [Fact]
@@ -487,8 +541,196 @@ public class OperatorSpillTests
 
         Assert.Throws<SpillIOException>(() => Drain(stream));
         stream.Dispose();
-        Assert.Empty(Directory.GetFiles(inner.Root)); // partial run files cleaned up on the failure path
+        AssertEventuallyNoFiles(inner.Root); // partial run files cleaned up on the failure path
         Assert.Equal(0, mem.ReservedBytes);
+    }
+
+    [Fact]
+    public void TempFileSpillStore_Cancellation_DeletesAllTempFiles()
+    {
+        // Cancel deterministically AFTER real spill bytes have been written (the 200th spill write), then
+        // dispose: every temp file — the run being written and any completed runs — must be gone. The
+        // trigger is a write count, not a timer, so the test is race-free.
+        using var cts = new CancellationTokenSource();
+        using var inner = new TempFileSpillStore();
+        var store = new CancelAfterWritesStore(inner, cts, cancelAfter: 200);
+        SortOperator op = new(
+            Scan(SortTwoCol, SortInput(2000)),
+            [new SortOrder(new ColumnReference(0, DataTypes.IntegerType, nullable: false))]);
+        var mem = new BoundedExecutionMemory(8000);
+        IBatchStream stream = Backend.Open(op, new ExecutionContext(mem, cts.Token) { SpillStore = store });
+
+        Assert.Throws<OperationCanceledException>(() => Drain(stream));
+        stream.Dispose();
+        AssertEventuallyNoFiles(inner.Root);
+        Assert.Equal(0, mem.ReservedBytes);
+    }
+
+    // ==============================================================================================
+    // #156 B1 — bounded blast-radius: disk default, a cumulative spill cap, and owner-only temp perms.
+    // ==============================================================================================
+
+    [Fact]
+    public void ExecutorDefault_SpillStore_IsTempFileStore_NotMemory()
+    {
+        // B1(a): the production default must be the disk store (which actually relieves memory), NOT the
+        // off-ledger MemorySpillStore (which re-holds spilled bytes on the GC heap, untracked → pod OOM).
+        var ctx = new ExecutionContext(BoundedExecutionMemory.Unbounded);
+        try
+        {
+            Assert.IsType<TempFileSpillStore>(ctx.SpillStore);
+            Assert.IsNotType<MemorySpillStore>(ctx.SpillStore);
+        }
+        finally
+        {
+            ((IDisposable)ctx.SpillStore).Dispose();
+        }
+    }
+
+    [Fact]
+    public void SpillBytesCap_Exceeded_FailsClosed_DeterministicError_ReleasesAll_NoPartialOutput()
+    {
+        // B1(b): a tight MEMORY budget forces a spill, but a tiny cumulative SPILL cap is breached by the
+        // very first spilled run → fail closed with the typed SpillBudgetExceededException, no partial
+        // output, and (after Dispose) every reservation released to zero. The memory budget (20000) is the
+        // SAME as the Generous companion below — large enough to complete the merge — so the ONLY reason
+        // this run fails is the spill cap. That makes the non-vacuity clean: drop the cap check and this
+        // identical run drains to full output instead of throwing a different (memory) error.
+        SortOperator op = new(
+            Scan(SortTwoCol, SortInput(2000)),
+            [new SortOrder(new ColumnReference(0, DataTypes.IntegerType, nullable: false))]);
+        var mem = new BoundedExecutionMemory(budgetBytes: 20000, maxSpillBytes: 1);
+        var store = new MemorySpillStore();
+        IBatchStream stream = Backend.Open(op, Ctx(mem, store));
+
+        var emitted = new List<ColumnBatch>();
+        SpillBudgetExceededException? error = null;
+        try
+        {
+            while (stream.TryGetNext(out ColumnBatch? batch))
+            {
+                emitted.Add(batch);
+            }
+        }
+        catch (SpillBudgetExceededException ex)
+        {
+            error = ex;
+        }
+
+        Assert.NotNull(error);                                // deterministic typed error
+        Assert.Equal(0, emitted.Sum(b => b.LogicalRowCount)); // no partial output reached the consumer
+        stream.Dispose();
+        Assert.Equal(0, mem.ReservedBytes);                   // release-all (the ledger proves exactly-once)
+    }
+
+    [Fact]
+    public void SpillBytesCap_Generous_AllowsSpillToComplete()
+    {
+        // Non-vacuity for the cap: with the SAME tight memory budget but an unbounded spill cap, the spill
+        // completes and produces full output — so the failure above is the CAP, not just any spill.
+        SortOperator op = new(
+            Scan(SortTwoCol, SortInput(2000)),
+            [new SortOrder(new ColumnReference(0, DataTypes.IntegerType, nullable: false))]);
+        var mem = new BoundedExecutionMemory(budgetBytes: 20000, maxSpillBytes: long.MaxValue);
+        var store = new MemorySpillStore();
+        using IBatchStream stream = Backend.Open(op, Ctx(mem, store));
+
+        List<string> rows = Render(Drain(stream), SortTwoCol);
+        Assert.Equal(2000, rows.Count);
+        Assert.True(mem.SpilledBytes > 0, "the tight budget must force a spill");
+    }
+
+    [Fact]
+    public void TempFileSpillStore_OnUnix_CreatesOwnerOnlyDirAndFiles()
+    {
+        // B1(c): spilled tenant rows must not be world/group readable on a shared pod (Security F3).
+        if (OperatingSystem.IsWindows())
+        {
+            return; // UnixFileMode is a no-op on Windows
+        }
+
+        using var store = new TempFileSpillStore();
+        ISpillSegment segment = store.CreateSegment("perm");
+        segment.Write(new byte[] { 1, 2, 3 });
+
+        const UnixFileMode dir0700 = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+        const UnixFileMode file0600 = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+        Assert.Equal(dir0700, File.GetUnixFileMode(store.Root));
+
+        string file = Assert.Single(Directory.GetFiles(store.Root));
+        Assert.Equal(file0600, File.GetUnixFileMode(file));
+        segment.Dispose();
+    }
+
+    // Polls to a steady state instead of a single Directory.GetFiles snapshot, so a slow filesystem delete
+    // cannot flake the cleanup assertions; on failure it reports the remaining file names. (Quality MAJOR.)
+    private static void AssertEventuallyNoFiles(string root)
+    {
+        for (int attempt = 0; attempt < 100; attempt++)
+        {
+            if (!Directory.Exists(root) || Directory.GetFiles(root).Length == 0)
+            {
+                return;
+            }
+
+            Thread.Sleep(5);
+        }
+
+        string[] remaining = Directory.Exists(root) ? Directory.GetFiles(root) : [];
+        Assert.True(
+            remaining.Length == 0,
+            $"temp files remained under '{root}': {string.Join(", ", remaining.Select(Path.GetFileName))}");
+    }
+
+    // A spill store that cancels the supplied source after the Nth payload write reaches the inner store —
+    // a deterministic cancel-mid-spill trigger (no timing) for the cancellation cleanup test.
+    private sealed class CancelAfterWritesStore : ISpillStore
+    {
+        private readonly ISpillStore _inner;
+        private readonly CancellationTokenSource _cts;
+        private readonly int _cancelAfter;
+        private int _writes;
+
+        public CancelAfterWritesStore(ISpillStore inner, CancellationTokenSource cts, int cancelAfter)
+        {
+            _inner = inner;
+            _cts = cts;
+            _cancelAfter = cancelAfter;
+        }
+
+        public ISpillSegment CreateSegment(string label) => new Segment(this, _inner.CreateSegment(label));
+
+        private void OnWrite()
+        {
+            if (Interlocked.Increment(ref _writes) == _cancelAfter)
+            {
+                _cts.Cancel();
+            }
+        }
+
+        private sealed class Segment : ISpillSegment
+        {
+            private readonly CancelAfterWritesStore _store;
+            private readonly ISpillSegment _inner;
+
+            public Segment(CancelAfterWritesStore store, ISpillSegment inner)
+            {
+                _store = store;
+                _inner = inner;
+            }
+
+            public long BytesWritten => _inner.BytesWritten;
+
+            public void Write(ReadOnlySpan<byte> record)
+            {
+                _inner.Write(record);
+                _store.OnWrite();
+            }
+
+            public ISpillSegmentReader OpenRead() => _inner.OpenRead();
+
+            public void Dispose() => _inner.Dispose();
+        }
     }
 
     // ==============================================================================================

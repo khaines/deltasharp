@@ -480,6 +480,9 @@ internal sealed class InterpretedAggregateStream : IBatchStream
         }
 
         _metrics.AddSpilledBytes(spilled);
+        // Fail closed before releasing/continuing if this spill would breach the per-query spill cap; the
+        // reservations stay held so the consumer's Dispose releases them exactly once (no partial output).
+        _memory.RecordSpill(spilled);
         _spilled = true;
         ReleaseInMemoryGroups();
     }
@@ -602,29 +605,40 @@ internal sealed class InterpretedAggregateStream : IBatchStream
         while (reader.TryRead(out byte[]? record))
         {
             _cancellationToken.ThrowIfCancellationRequested();
-            var stateReader = new SpillStateReader(record);
-            ReadOnlySpan<byte> encodedKey = stateReader.ReadBytes();
-            ReadOnlySpan<byte> keyFrame = stateReader.ReadBytes();
-
-            var key = new RowKey(encodedKey.ToArray());
-            if (!_groups.TryGetValue(key, out int group))
+            try
             {
-                ReserveMerge(
-                    _stateBytesPerGroup + _outputBytesPerGroup + encodedKey.Length
-                    + RowSizeEstimate.HashTableEntryBytes);
-                group = _groupCount++;
-                for (int a = 0; a < _aggregators.Length; a++)
+                var stateReader = new SpillStateReader(record);
+                ReadOnlySpan<byte> encodedKey = stateReader.ReadBytes();
+                ReadOnlySpan<byte> keyFrame = stateReader.ReadBytes();
+
+                var key = new RowKey(encodedKey.ToArray());
+                if (!_groups.TryGetValue(key, out int group))
                 {
-                    _aggregators[a].EnsureCapacity(_groupCount);
+                    ReserveMerge(
+                        _stateBytesPerGroup + _outputBytesPerGroup + encodedKey.Length
+                        + RowSizeEstimate.HashTableEntryBytes);
+                    group = _groupCount++;
+                    for (int a = 0; a < _aggregators.Length; a++)
+                    {
+                        _aggregators[a].EnsureCapacity(_groupCount);
+                    }
+
+                    _groups[key] = group;
+                    _keyCodec!.DecodeInto(_keyColumns, keyFrame);
                 }
 
-                _groups[key] = group;
-                _keyCodec!.DecodeInto(_keyColumns, keyFrame);
+                for (int a = 0; a < _aggregators.Length; a++)
+                {
+                    _aggregators[a].MergeState(group, ref stateReader);
+                }
             }
-
-            for (int a = 0; a < _aggregators.Length; a++)
+            catch (Exception ex) when (ex is ArgumentException or IndexOutOfRangeException)
             {
-                _aggregators[a].MergeState(group, ref stateReader);
+                // The outer record framing was intact but its inner [key|keyFrame|aggstate...] layout is
+                // corrupt (a structural parse ran past the record). Surface AC5's uniform typed error rather
+                // than a raw index/argument exception. (ExecutionMemoryException from ReserveMerge is an
+                // InvalidOperationException, so a legitimate budget refusal is NOT caught here.)
+                throw new SpillIOException("read", $"aggregate spill partition {partition} (corrupt record)", ex);
             }
         }
     }

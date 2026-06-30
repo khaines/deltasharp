@@ -21,22 +21,67 @@ internal sealed class TempFileSpillStore : ISpillStore, IDisposable
 {
     private static long s_storeCounter;
 
+    // 0700: only the owner may read/list/traverse the spill dir — spilled tenant rows are never world- or
+    // group-readable on a shared pod (Security F3). Ignored on Windows, where UnixFileMode is a no-op.
+    private const UnixFileMode DirectoryMode =
+        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+
+    // 0600: only the owner may read/write a spilled segment file (Security F3).
+    private const UnixFileMode FileMode_0600 = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+
     private readonly string _root;
     private readonly List<Segment> _segments = new();
     private int _counter;
+    private bool _rootCreated;
     private bool _disposed;
 
-    /// <summary>Creates a store rooted in a fresh temp directory under the OS temp path.</summary>
-    /// <exception cref="SpillIOException">The temp directory could not be created.</exception>
+    /// <summary>
+    /// Creates a store whose temp directory is named eagerly but materialized lazily under the OS temp path
+    /// (so a context that never spills allocates no disk).
+    /// </summary>
     public TempFileSpillStore()
     {
+        // Deterministic, collision-free directory identity without the banned Guid.NewGuid: the process id
+        // plus a monotonic per-process counter uniquely names each store's temp root.
+        long id = Interlocked.Increment(ref s_storeCounter);
+        _root = Path.Combine(Path.GetTempPath(), $"deltasharp-spill-{Environment.ProcessId}-{id}");
+    }
+
+    /// <inheritdoc />
+    public ISpillSegment CreateSegment(string label)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        EnsureRoot();
+        string path = Path.Combine(_root, $"{label}-{_counter++}.spill");
+        var segment = new Segment(path);
+        _segments.Add(segment);
+        return segment;
+    }
+
+    /// <summary>The temp directory backing this store (test-visible so cleanup can be asserted).</summary>
+    internal string Root => _root;
+
+    // Creates the 0700 spill root on first use; idempotent.
+    private void EnsureRoot()
+    {
+        if (_rootCreated)
+        {
+            return;
+        }
+
         try
         {
-            // Deterministic, collision-free directory identity without the banned Guid.NewGuid: the
-            // process id plus a monotonic per-process counter uniquely names each store's temp root.
-            long id = Interlocked.Increment(ref s_storeCounter);
-            _root = Path.Combine(Path.GetTempPath(), $"deltasharp-spill-{Environment.ProcessId}-{id}");
-            Directory.CreateDirectory(_root);
+            if (OperatingSystem.IsWindows())
+            {
+                // UnixFileMode is a no-op on Windows; ACL-based isolation is the platform's concern there.
+                Directory.CreateDirectory(_root);
+            }
+            else
+            {
+                Directory.CreateDirectory(_root, DirectoryMode);
+            }
+
+            _rootCreated = true;
         }
         catch (IOException ex)
         {
@@ -47,19 +92,6 @@ internal sealed class TempFileSpillStore : ISpillStore, IDisposable
             throw new SpillIOException("open", "temp spill directory", ex);
         }
     }
-
-    /// <inheritdoc />
-    public ISpillSegment CreateSegment(string label)
-    {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        string path = Path.Combine(_root, $"{label}-{_counter++}.spill");
-        var segment = new Segment(path);
-        _segments.Add(segment);
-        return segment;
-    }
-
-    /// <summary>The temp directory backing this store (test-visible so cleanup can be asserted).</summary>
-    internal string Root => _root;
 
     /// <summary>Disposes every segment (deleting its file) and removes the temp directory.</summary>
     public void Dispose()
@@ -105,8 +137,21 @@ internal sealed class TempFileSpillStore : ISpillStore, IDisposable
             _path = path;
             try
             {
-                _writer = new FileStream(
-                    path, FileMode.CreateNew, FileAccess.Write, FileShare.None, bufferSize: 1 << 16);
+                // 0600 via UnixCreateMode so the file is owner-only the instant it exists — no world-readable
+                // window. UnixFileMode is ignored on Windows, so it is only set off-Windows.
+                var options = new FileStreamOptions
+                {
+                    Mode = FileMode.CreateNew,
+                    Access = FileAccess.Write,
+                    Share = FileShare.None,
+                    BufferSize = 1 << 16,
+                };
+                if (!OperatingSystem.IsWindows())
+                {
+                    options.UnixCreateMode = FileMode_0600;
+                }
+
+                _writer = new FileStream(path, options);
             }
             catch (IOException ex)
             {

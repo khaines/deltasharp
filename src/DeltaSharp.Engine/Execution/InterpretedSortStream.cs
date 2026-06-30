@@ -358,6 +358,9 @@ internal sealed class InterpretedSortStream : IBatchStream
 
         _runs.Add(run);
         _metrics.AddSpilledBytes(spilled);
+        // Fail closed if this run would breach the per-query spill cap; the buffer reservation is still held,
+        // so Dispose releases it exactly once and the added run's temp file is deleted on the failure path.
+        _memory.RecordSpill(spilled);
 
         // Release the spilled buffer's reservation and reset for the next run.
         ReleaseBufferReservation();
@@ -573,11 +576,22 @@ internal sealed class InterpretedSortStream : IBatchStream
             }
 
             _record = record;
-            _keyLength = BinaryPrimitives.ReadInt32LittleEndian(record);
-            _keyOffset = sizeof(int);
-            int seqOffset = _keyOffset + _keyLength;
-            Seq = BinaryPrimitives.ReadInt64LittleEndian(record.AsSpan(seqOffset));
-            _frameOffset = seqOffset + sizeof(long);
+            try
+            {
+                _keyLength = BinaryPrimitives.ReadInt32LittleEndian(record);
+                _keyOffset = sizeof(int);
+                int seqOffset = _keyOffset + _keyLength;
+                Seq = BinaryPrimitives.ReadInt64LittleEndian(record.AsSpan(seqOffset));
+                _frameOffset = seqOffset + sizeof(long);
+            }
+            catch (Exception ex) when (ex is ArgumentException or IndexOutOfRangeException)
+            {
+                // The outer length frame was intact but its inner [keyLen|key|seq|frame] layout is corrupt
+                // (a structural parse ran past the record). Surface AC5's uniform typed error, not a raw
+                // index/argument exception, so every spill-corruption mode fails the same deterministic way.
+                throw new SpillIOException("read", "sort spill run record (corrupt layout)", ex);
+            }
+
             return true;
         }
 

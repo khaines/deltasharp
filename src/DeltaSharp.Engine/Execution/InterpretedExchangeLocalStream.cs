@@ -264,6 +264,9 @@ internal sealed class InterpretedExchangeLocalStream : IBatchStream
         _currentSpilled = true;
         _currentBatch = null;
         _metrics.AddSpilledBytes(spilled);
+        // Fail closed if this batch's spill would breach the per-query spill cap; segments are stored in
+        // _spillSegments so Dispose deletes their temp files and releases reservations exactly once.
+        _memory.RecordSpill(spilled);
     }
 
     private int PartitionOf(ColumnVector[]? keyVectors, int row)

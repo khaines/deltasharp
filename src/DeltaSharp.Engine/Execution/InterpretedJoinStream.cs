@@ -310,6 +310,9 @@ internal sealed class InterpretedJoinStream : IBatchStream
             // Build spilled: every build row now lives in a partition (or null) segment. The probe is
             // partitioned lazily on first emit, then partitions are joined one at a time.
             _metrics.AddSpilledBytes(_spilledBytes);
+            // Fail closed if the build spill breached the per-query spill cap; the reservations and segments
+            // unwind through Dispose exactly once with no partial output.
+            _memory.RecordSpill(_spilledBytes);
             _spilledBytes = 0;
             _gracePartition = -1;
             return;
@@ -839,6 +842,8 @@ internal sealed class InterpretedJoinStream : IBatchStream
         }
 
         _metrics.AddSpilledBytes(spilled);
+        // Fail closed if probe partitioning breached the per-query spill cap (release-all via Dispose).
+        _memory.RecordSpill(spilled);
         _probePartitioned = true;
     }
 

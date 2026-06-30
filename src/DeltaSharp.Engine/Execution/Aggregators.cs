@@ -163,26 +163,33 @@ internal sealed class CountAggregator : Aggregator
 }
 
 /// <summary>
-/// <c>SUM</c> over an integral input, accumulated in a checked <see cref="long"/> (result
-/// <see cref="LongType"/>). Overflow follows <see cref="AnsiMode"/>: ANSI throws, Legacy nulls the
-/// group. A group with no non-null input is SQL <c>NULL</c>.
+/// <c>SUM</c> over an integral input, accumulated in an unchecked <see cref="Int128"/> (result
+/// <see cref="LongType"/>). Summing <see cref="long"/> lanes into an <see cref="Int128"/> cannot
+/// realistically overflow, so there is no intermediate overflow state: the fold is exact and the
+/// fit-to-<see cref="long"/> check happens once, at <see cref="Emit"/>, against the <b>final true sum</b>.
+/// Overflow of that final value follows <see cref="AnsiMode"/>: ANSI throws, Legacy nulls the group. A
+/// group with no non-null input is SQL <c>NULL</c>.
 /// </summary>
+/// <remarks>
+/// Deferring the overflow check to the final value (#156 B2) is what makes <c>SUM</c> exact under spill:
+/// because the running accumulator never poisons a group on a transient intermediate overflow, a
+/// re-partitioned spill fold and the single-pass no-spill fold accumulate the same modular
+/// <see cref="Int128"/> total and apply the same one fit check — spill == no-spill by construction.
+/// </remarks>
 internal sealed class SumLongAggregator : Aggregator
 {
     private readonly AnsiMode _mode;
-    private long[] _sums = [];
+    private Int128[] _sums = [];
     private bool[] _hasValue = [];
-    private bool[] _nulled = [];
 
     internal SumLongAggregator(AnsiMode mode) => _mode = mode;
 
-    internal override long BytesPerGroup => sizeof(long) + 2;
+    internal override long BytesPerGroup => 16 + 1;
 
     internal override void EnsureCapacity(int groupCount)
     {
         Grow(ref _sums, groupCount);
         Grow(ref _hasValue, groupCount);
-        Grow(ref _nulled, groupCount);
     }
 
     internal override void Accumulate(int group, ColumnVector? input, int row)
@@ -193,79 +200,51 @@ internal sealed class SumLongAggregator : Aggregator
         }
 
         _hasValue[group] = true;
-        if (_nulled[group])
-        {
-            return;
-        }
 
-        long value = ScalarReader.ReadInt64(input, row);
-        try
-        {
-            _sums[group] = checked(_sums[group] + value);
-        }
-        catch (OverflowException ex)
-        {
-            if (_mode == AnsiMode.Ansi)
-            {
-                throw new ArithmeticOverflowException("SUM overflowed bigint.", ex);
-            }
-
-            _nulled[group] = true;
-        }
+        // Unchecked Int128 add: a long summed into Int128 cannot overflow short of > 2^64 rows, so there is
+        // no intermediate overflow to detect here. The true-value fit check is deferred to Emit so a
+        // transient overflow that the true sum recovers from never poisons the group (spill == no-spill).
+        _sums[group] += ScalarReader.ReadInt64(input, row);
     }
 
     internal override void Emit(int group, MutableColumnVector destination)
     {
-        if (!_hasValue[group] || _nulled[group])
+        if (!_hasValue[group])
         {
             destination.AppendNull();
+            return;
         }
-        else
+
+        Int128 sum = _sums[group];
+        if (sum < long.MinValue || sum > long.MaxValue)
         {
-            VectorMaterializer.AppendIntegral(destination, _sums[group]);
+            // The FINAL true sum does not fit bigint: ANSI throws, Legacy yields NULL (EPIC-02 never-wrap).
+            if (_mode == AnsiMode.Ansi)
+            {
+                throw new ArithmeticOverflowException("SUM overflowed bigint.");
+            }
+
+            destination.AppendNull();
+            return;
         }
+
+        VectorMaterializer.AppendIntegral(destination, (long)sum);
     }
 
     internal override void WriteState(int group, SpillStateWriter writer)
     {
-        writer.WriteLong(_sums[group]);
+        writer.WriteInt128(_sums[group]);
         writer.WriteBool(_hasValue[group]);
-        writer.WriteBool(_nulled[group]);
     }
 
     internal override void MergeState(int group, ref SpillStateReader reader)
     {
-        long sum = reader.ReadLong();
-        bool has = reader.ReadBool();
-        bool nulled = reader.ReadBool();
-        if (has)
+        // Merge the partition's partial Int128 sum unchecked — no intermediate overflow check — so the merged
+        // total is the exact modular running sum and Emit applies the single final fit check.
+        _sums[group] += reader.ReadInt128();
+        if (reader.ReadBool())
         {
             _hasValue[group] = true;
-        }
-
-        if (nulled)
-        {
-            _nulled[group] = true;
-            return;
-        }
-
-        if (_nulled[group] || !has)
-        {
-            return;
-        }
-
-        try
-        {
-            _sums[group] = checked(_sums[group] + sum);
-        }
-        catch (OverflowException ex)
-        {
-            if (_mode == AnsiMode.Ansi)
-            {
-                throw new ArithmeticOverflowException("SUM overflowed bigint.", ex);
-            }
-
-            _nulled[group] = true;
         }
     }
 
@@ -273,7 +252,6 @@ internal sealed class SumLongAggregator : Aggregator
     {
         _sums = [];
         _hasValue = [];
-        _nulled = [];
     }
 }
 
@@ -341,17 +319,30 @@ internal sealed class SumDoubleAggregator : Aggregator
 }
 
 /// <summary>
-/// <c>SUM</c> over a decimal input, accumulated exactly via <see cref="DecimalValue"/> and fitted to
-/// the Spark result type <c>decimal(min(38, p+10), s)</c> at emit. Mantissa or precision overflow
-/// follows <see cref="AnsiMode"/>: ANSI throws, Legacy nulls the group.
+/// <c>SUM</c> over a decimal input, accumulated in an unchecked <see cref="Int128"/> unscaled mantissa at
+/// the input's (uniform) scale and fitted to the Spark result type <c>decimal(min(38, p+10), s)</c> at
+/// emit. Precision overflow of the <b>final</b> value follows <see cref="AnsiMode"/>: ANSI throws, Legacy
+/// nulls the group.
 /// </summary>
+/// <remarks>
+/// Like <see cref="SumLongAggregator"/> (#156 B2), the running mantissa add is unchecked and there is no
+/// intermediate overflow state: <see cref="Int128"/> addition is modular and associative, so the merged
+/// mantissa equals the true sum whenever that sum fits <see cref="Int128"/> — and any sum that fits the
+/// result decimal type necessarily fits <see cref="Int128"/>. The single overflow gate is the
+/// <see cref="DecimalValue.ToType(DecimalType, AnsiMode)"/> fit at <see cref="Emit"/>, applied to the final
+/// value. Because both arms accumulate the same modular mantissa and apply that one check, spill == no-spill
+/// by construction even when a transient partial overflows.
+/// </remarks>
 internal sealed class SumDecimalAggregator : Aggregator
 {
     private readonly DecimalType _resultType;
     private readonly AnsiMode _mode;
-    private DecimalValue[] _sums = [];
+    private Int128[] _sums = [];
     private bool[] _hasValue = [];
-    private bool[] _nulled = [];
+
+    // The uniform scale of the input decimal column, captured on the first observed value/merge. -1 until
+    // then; a group with no value never reads it (Emit short-circuits on !_hasValue).
+    private int _scale = -1;
 
     internal SumDecimalAggregator(DecimalType resultType, AnsiMode mode)
     {
@@ -359,13 +350,12 @@ internal sealed class SumDecimalAggregator : Aggregator
         _mode = mode;
     }
 
-    internal override long BytesPerGroup => 16 + 2;
+    internal override long BytesPerGroup => 16 + 1;
 
     internal override void EnsureCapacity(int groupCount)
     {
         Grow(ref _sums, groupCount);
         Grow(ref _hasValue, groupCount);
-        Grow(ref _nulled, groupCount);
     }
 
     internal override void Accumulate(int group, ColumnVector? input, int row)
@@ -375,38 +365,25 @@ internal sealed class SumDecimalAggregator : Aggregator
             return;
         }
 
-        _hasValue[group] = true;
-        if (_nulled[group])
-        {
-            return;
-        }
-
         DecimalValue value = ScalarReader.ReadDecimal(input, row);
-        try
-        {
-            // A default DecimalValue is 0 at scale 0, the additive identity for any scale.
-            _sums[group] = DecimalValue.Add(_sums[group], value);
-        }
-        catch (ArithmeticOverflowException)
-        {
-            if (_mode == AnsiMode.Ansi)
-            {
-                throw;
-            }
+        _scale = value.Scale; // uniform across the column; idempotent
+        _hasValue[group] = true;
 
-            _nulled[group] = true;
-        }
+        // Unchecked Int128 add: a transient mantissa overflow the final sum recovers from must not poison the
+        // group. The fit/precision check is deferred to Emit (ToType), so spill == no-spill by construction.
+        _sums[group] += value.Unscaled;
     }
 
     internal override void Emit(int group, MutableColumnVector destination)
     {
-        if (!_hasValue[group] || _nulled[group])
+        if (!_hasValue[group])
         {
             destination.AppendNull();
             return;
         }
 
-        DecimalValue? fitted = _sums[group].ToType(_resultType, _mode);
+        // The single overflow gate: fit the FINAL mantissa to the result type. ANSI throws, Legacy → NULL.
+        DecimalValue? fitted = new DecimalValue(_sums[group], _scale).ToType(_resultType, _mode);
         if (fitted is null)
         {
             destination.AppendNull();
@@ -419,10 +396,9 @@ internal sealed class SumDecimalAggregator : Aggregator
 
     internal override void WriteState(int group, SpillStateWriter writer)
     {
-        writer.WriteInt128(_sums[group].Unscaled);
-        writer.WriteInt(_sums[group].Scale);
+        writer.WriteInt128(_sums[group]);
+        writer.WriteInt(_scale);
         writer.WriteBool(_hasValue[group]);
-        writer.WriteBool(_nulled[group]);
     }
 
     internal override void MergeState(int group, ref SpillStateReader reader)
@@ -430,43 +406,22 @@ internal sealed class SumDecimalAggregator : Aggregator
         Int128 unscaled = reader.ReadInt128();
         int scale = reader.ReadInt();
         bool has = reader.ReadBool();
-        bool nulled = reader.ReadBool();
         if (has)
         {
+            _scale = scale;
             _hasValue[group] = true;
         }
 
-        if (nulled)
-        {
-            _nulled[group] = true;
-            return;
-        }
-
-        if (_nulled[group] || !has)
-        {
-            return;
-        }
-
-        try
-        {
-            _sums[group] = DecimalValue.Add(_sums[group], new DecimalValue(unscaled, scale));
-        }
-        catch (ArithmeticOverflowException)
-        {
-            if (_mode == AnsiMode.Ansi)
-            {
-                throw;
-            }
-
-            _nulled[group] = true;
-        }
+        // Merge the partition's partial mantissa unchecked — no intermediate check — so the merged total is
+        // the exact modular sum and Emit applies the single final fit check.
+        _sums[group] += unscaled;
     }
 
     internal override void Reset()
     {
         _sums = [];
         _hasValue = [];
-        _nulled = [];
+        _scale = -1;
     }
 }
 

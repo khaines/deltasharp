@@ -33,4 +33,26 @@ public interface IExecutionMemory
     /// <summary>Releases <paramref name="bytes"/> previously reserved.</summary>
     /// <param name="bytes">Bytes to release (must not exceed <see cref="ReservedBytes"/>).</param>
     void Release(long bytes);
+
+    /// <summary>
+    /// The cumulative spill-bytes ceiling for the whole run (STORY-03.6.2 #156 B1): the maximum total
+    /// bytes every operator combined may write to the spill store before the run fails closed.
+    /// <see cref="long.MaxValue"/> means effectively unbounded. This is the disk-side bound that pairs with
+    /// the in-process <see cref="BudgetBytes"/>: a query may overflow memory and spill, but only up to this
+    /// cap, so a single tenant cannot fill a shared spill volume and take out co-tenants.
+    /// </summary>
+    long MaxSpillBytes { get; }
+
+    /// <summary>Cumulative bytes spilled across every operator in this run so far.</summary>
+    long SpilledBytes { get; }
+
+    /// <summary>
+    /// Records <paramref name="bytes"/> just written to the spill store against the cumulative spill budget.
+    /// When the cumulative total would exceed <see cref="MaxSpillBytes"/> the call fails closed by throwing
+    /// <see cref="Spill.SpillBudgetExceededException"/>; the operator must then release all reservations and
+    /// emit no partial output (the same discipline as a spill I/O failure).
+    /// </summary>
+    /// <param name="bytes">The bytes just written to spill (non-negative).</param>
+    /// <exception cref="Spill.SpillBudgetExceededException">The cumulative spill total would exceed the cap.</exception>
+    void RecordSpill(long bytes);
 }

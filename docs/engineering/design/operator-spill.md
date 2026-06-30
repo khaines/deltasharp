@@ -42,7 +42,7 @@ The refusal is still detected by the ledger; the difference is the operator now 
 and continues** rather than throwing. `ExecutionMemoryException` is retained only as the terminal floor: a
 single indivisible unit (one group, one row, one recovered partition, one output chunk) that cannot fit an
 otherwise-empty budget still fails closed, because there is nothing left to spill (e.g.
-[`InterpretedAggregateStream.cs:444-450`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs),
+[`InterpretedAggregateStream.cs:448-451`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs),
 [`InterpretedJoinStream.cs:985-994`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)).
 
 ## 2. The spill store abstraction
@@ -63,20 +63,27 @@ byte records only — so one implementation serves all four operators and stays 
 Implementations:
 
 - [`MemorySpillStore`](../../../src/DeltaSharp.Engine/Execution/Spill/MemorySpillStore.cs) — segments are
-  in-process `byte[]` lists; the default
-  ([`ExecutionContext.cs:39`](../../../src/DeltaSharp.Engine/Execution/ExecutionContext.cs)), used when no
-  disk spill is configured. Lock-free, allocation-bounded.
+  in-process `byte[]` lists. Lock-free, allocation-bounded, and deterministic, so it is the in-memory store
+  tests and local in-process runs inject. It is **not** the production default: it frees the operator's
+  reserved-budget bookkeeping but re-holds the spilled bytes on the GC heap (off-ledger), so it does not
+  lower process memory — under real pressure that is worse than disk (Security F1).
 - [`TempFileSpillStore`](../../../src/DeltaSharp.Engine/Execution/Spill/TempFileSpillStore.cs) — segments
-  are length-prefixed records in a per-operator temp directory under the OS temp root; `Dispose` deletes
+  are length-prefixed records in a per-store temp directory under the OS temp root; it is the
+  **production default** ([`ExecutionContext.cs:39`](../../../src/DeltaSharp.Engine/Execution/ExecutionContext.cs)),
+  because it genuinely moves bytes out of process memory (#156 B1a). The temp directory is created **lazily**
+  on the first segment (a context that never spills allocates no disk) with `UnixFileMode` **0700**, and each
+  segment file is created **0600** via `FileStreamOptions.UnixCreateMode`, so spilled tenant rows are never
+  group/world-readable on a shared pod (Security F3); `UnixFileMode` is a no-op on Windows. `Dispose` deletes
   the directory. Names use `Environment.ProcessId` + an `Interlocked` counter (no `Guid.NewGuid`, which the
-  BannedApiAnalyzer forbids).
+  BannedApiAnalyzer forbids). The store is `IDisposable`; whoever builds the `ExecutionContext` (the executor)
+  owns its lifetime and disposes it after the run.
 - `FaultSpillStore` ([test](../../../tests/DeltaSharp.Engine.Tests/Execution/FaultSpillStore.cs)) — wraps a
   real store and throws `SpillIOException` deterministically on the Nth write (`FailOnWriteAfter`) or first
   read (`FailOnRead`), making the AC5 failure path reproducible.
 
 The store is injected through
 [`ExecutionContext.SpillStore`](../../../src/DeltaSharp.Engine/Execution/ExecutionContext.cs) (`init`-only,
-defaulting to `MemorySpillStore`); each operator captures it at `Open`.
+defaulting to `TempFileSpillStore`); each operator captures it at `Open`.
 
 ### 2.1 Serialization reuse (RowFormat)
 
@@ -84,7 +91,7 @@ The on-spill encoding **reuses** the EPIC-02 row primitives rather than reinvent
 
 - Operators that spill whole rows (sort runs, exchange partitions, join build/probe rows) frame each row
   with [`RowSpillCodec`](../../../src/DeltaSharp.Engine/Execution/Spill/RowSpillCodec.cs), which wraps the
-  existing `RowEncoder`/`RowDecoder` ([`RowFormat/`](../../../src/DeltaSharp.Engine/RowFormat/)) to encode a
+  existing `BinaryRowEncoder` ([`RowFormat/`](../../../src/DeltaSharp.Engine/RowFormat/)) to encode a
   `ColumnVector[]` row to a `BinaryRow` frame and decode it back into mutable vectors.
 - The aggregate spills **partial accumulator state**, not rows. Each aggregator implements
   `WriteState`/`MergeState`/`Reset` ([`Aggregators.cs`](../../../src/DeltaSharp.Engine/Execution/Aggregators.cs))
@@ -185,23 +192,31 @@ The core correctness property is that spilling changes **only** where bytes live
 | Sort | **byte-identical** (ordered) | runs and merge use the same `(keyBytes, globalSeq)` total order as the no-spill comparator (§3.2). |
 | Join | **identical multiset** (all 6 types) | matching keys co-locate by the same hash; per-row emit machinery is reused unchanged; only emission order differs (§3.3). |
 | Exchange | **identical per-partition multiset** | same partition function; recover is a faithful row round-trip (§3.4). |
-| Aggregate | **exact** for COUNT, SUM(int/decimal), MIN, MAX, AVG(int) | partial-state fold is associative for these and every partial co-locates (§3.1). |
+| Aggregate | **exact** for COUNT, SUM(int), SUM(decimal), MIN, MAX, AVG(int < 2^53) | partial-state fold is associative for these and every partial co-locates (§3.1, §4.1). |
 
 **Honest scope (§4.2).** Aggregate SUM/AVG over `double` is **not** bit-identical under repartitioning
 because IEEE-754 addition is non-associative: regrouping the summands across spilled partitions can change
 the last ULP. This is a floating-point reality, not a spill defect; the identity tests therefore exercise
-integer/decimal SUM/AVG (exact) and avoid asserting bit-identity on double sums. SUM overflow cases use
-order-independent inputs (`long.MaxValue + long.MaxValue`) so ANSI throws in both runs and Legacy nulls the
-group in both, regardless of fold order.
+integer/decimal SUM and integer AVG (exact) and avoid asserting bit-identity on double sums. `AVG` over an
+**integral** input accumulates its running sum in a `double` and is bit-exact only while the partial sums
+stay `< 2^53` (the `double` integer-exact range); beyond that the same non-associativity applies. SUM
+overflow cases use order-independent inputs (`long.MaxValue + long.MaxValue`, `9e37 + 9e37`) so ANSI throws
+in both runs and Legacy nulls the group in both, regardless of fold order.
 
 ### 4.1 Overflow / decimal survival
 
-`SumLong.MergeState` performs its add under the same `AnsiMode` the operator was configured with, so an
-overflow raised during the merge fold is the same `ArithmeticOverflowException`
-([`Types`](../../../src/DeltaSharp.Engine/Types/)) the no-spill accumulate would raise (ANSI), and the same
-null (Legacy). Decimal state is written/merged through the decimal accumulator's exact `WriteState`/`MergeState`
-([`Aggregators.cs`](../../../src/DeltaSharp.Engine/Execution/Aggregators.cs)); precision/scale ride along in
-the encoded state, so a `decimal(28,2)` sum survives serialize→merge unchanged.
+`SumLong` accumulates in an **unchecked `Int128`** and `SumDecimal` in an **unchecked `Int128` unscaled
+mantissa** ([`Aggregators.cs`](../../../src/DeltaSharp.Engine/Execution/Aggregators.cs)); the fit-to-`long`
+/ `ToType` precision check is applied **once, to the FINAL value, at emit** (#156 B2). Because `Int128`
+addition is modular and associative, the merged total equals the true sum whenever that sum fits `Int128`
+— and any value that fits the result type necessarily does — so a spilled per-partition partial and the
+single-pass no-spill fold reach the same final value and apply the same one check. This makes integer and
+decimal SUM **exact under spill by construction**, and it closes the transient-overflow divergence the
+Architect flagged (a cross-round transient that the true sum recovers from is never detected on either
+path). `WriteState`/`MergeState` carry the raw `Int128` partial (decimal also carries the uniform input
+scale) with **no intermediate overflow check**, so a `decimal(28,2)` sum survives serialize→merge unchanged
+and final overflow follows `AnsiMode`: ANSI throws `ArithmeticOverflowException`
+([`Types`](../../../src/DeltaSharp.Engine/Types/)), Legacy yields NULL.
 
 ## 5. The I/O-failure contract (AC5)
 
@@ -250,6 +265,32 @@ spill event — aggregate
 ([`:266`](../../../src/DeltaSharp.Engine/Execution/InterpretedExchangeLocalStream.cs)). A non-zero
 `Metrics.Snapshot().SpilledBytes` is the spill-happened signal the tests assert for non-vacuity.
 
+## 7.1 The bounded blast-radius — memory ceiling → spill cap → fail-closed (#156 B1)
+
+#155 enforced a fail-closed **memory** ceiling: a query that could not fit its reservation budget stopped.
+#156 turns that refusal into a spill, which on its own would trade a bounded in-memory blast-radius for an
+**unbounded disk** one — a tenant could fill a shared spill volume and `ENOSPC` its co-tenants (Security F2),
+and the off-ledger `MemorySpillStore` default would re-hold the spilled bytes on the GC heap, untracked, to a
+pod OOM (Security F1). #156 B1 restores a real, **bounded** ceiling end-to-end:
+
+1. **Memory budget** ([`IExecutionMemory.BudgetBytes`](../../../src/DeltaSharp.Engine/Execution/IExecutionMemory.cs)) —
+   the in-process reservation ceiling. On refusal the operator spills instead of failing.
+2. **Spill to disk** — the default store is the disk-backed `TempFileSpillStore` (B1a), which actually
+   relieves process memory; its temp dir/files are owner-only **0700/0600** (B1c, Security F3).
+3. **Cumulative spill cap** ([`IExecutionMemory.MaxSpillBytes`](../../../src/DeltaSharp.Engine/Execution/IExecutionMemory.cs)) —
+   a per-query ceiling on **total** bytes written to spill across every operator. Each operator records its
+   spill against the run budget via `IExecutionMemory.RecordSpill(bytes)` at the same point it sums
+   `AddSpilledBytes`. When the cumulative total would exceed the cap, `RecordSpill` throws the typed,
+   deterministic [`SpillBudgetExceededException`](../../../src/DeltaSharp.Engine/Execution/Spill/SpillBudgetExceededException.cs);
+   the operator releases **all** reservations exactly once (through the same `Dispose`/over-release-ledger
+   path as a spill I/O failure) and emits **no** partial output.
+
+So the blast-radius is bounded on both axes: memory by `BudgetBytes`, disk by `MaxSpillBytes`. The disk gap
+is **not** unbounded — it is exactly the configured spill cap, and crossing it fails closed with the same
+discipline as #359/#363. `BoundedExecutionMemory(budgetBytes, maxSpillBytes)` configures both; the legacy
+single-argument constructor leaves the spill cap effectively unbounded (`long.MaxValue`) for callers that do
+not set one.
+
 ## 8. AC coverage
 
 | Acceptance criterion | Implementation | Test (in [`OperatorSpillTests`](../../../tests/DeltaSharp.Engine.Tests/Execution/OperatorSpillTests.cs)) |
@@ -259,7 +300,11 @@ spill event — aggregate
 | AC3 — join cardinality + null-key across all 6 types | §3.3 | `Join_Spill_MatchesNoSpill_AllTypes` (×6), `Join_Spill_PreservesMultiplicityAcrossPartitionBoundary` |
 | AC4 — exchange per-partition counts/contents | §3.4 | `Exchange_Spill_MatchesNoSpill_PerPartitionCountsAndContents` |
 | AC5 — I/O failure: release-all + deterministic error + no partial output | §5 | `Aggregate/Sort/Join/Exchange_SpillWriteFailure_ReleasesAll_DeterministicError_NoPartialOutput`, `Sort_SpillReadFailure_ReleasesAll_DeterministicError` |
-| Temp-file hygiene (normal + failure) | §2, §5 | `TempFileSpillStore_NormalCompletion_DeletesAllTempFiles`, `TempFileSpillStore_WriteFailure_DeletesAllTempFiles` |
+| Temp-file hygiene (normal + failure + cancel) | §2, §5 | `TempFileSpillStore_NormalCompletion_DeletesAllTempFiles`, `TempFileSpillStore_WriteFailure_DeletesAllTempFiles`, `TempFileSpillStore_Cancellation_DeletesAllTempFiles` |
+| B1a — executor default store relieves memory | §2, §7.1 | `ExecutorDefault_SpillStore_IsTempFileStore_NotMemory` |
+| B1b — cumulative spill cap fails closed deterministically | §7.1 | `SpillBytesCap_Exceeded_FailsClosed_ReleasesAll_NoPartialOutput`, `SpillBytesCap_Generous_AllowsSpillToComplete` |
+| B1c — owner-only temp dir/files (Unix) | §2 | `TempFileSpillStore_OnUnix_CreatesOwnerOnlyDirAndFiles` |
+| B2 — transient-overflow SUM: spill == no-spill on in-range true sum | §4.1 | `Aggregate_Spill_TransientOverflow_FinalInRange_SpillEqualsNoSpill(Ansi/Legacy)` |
 
 The identity tests run the **same input** under an ample budget (never spills) and a tight budget (forces
 spill, asserted via `SpilledBytes > 0`) and require identical output — the spill-vs-no-spill oracle.
@@ -278,6 +323,10 @@ and reverted.
   (up to `OutputBatchRows` rows) plus the heaviest recovered partition/run; the output chunk has no
   spillable representation in v1 (sort/join raise `ExecutionMemoryException` with that message). This is the
   irreducible emit floor, identical in spirit to #365's fixed-scaffolding note.
+- **The cumulative spill cap is per-query, not per-volume.** `MaxSpillBytes` bounds one query's total
+  spill; it does not coordinate across concurrent queries sharing a spill volume. Global volume admission
+  (and remote spill below) is left to the scheduler/shuffle epic. Within a query the blast-radius is bounded
+  (§7.1): memory by `BudgetBytes`, disk by `MaxSpillBytes`, both fail-closed.
 - **Distributed / remote spill.** All spill here is node-local (`MemorySpillStore`/`TempFileSpillStore`).
   Cross-node and shuffle-service spill belong to the shuffle epic.
 

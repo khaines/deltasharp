@@ -1,6 +1,7 @@
 using System.Text;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Engine.Execution;
+using DeltaSharp.Engine.Execution.Spill;
 using DeltaSharp.Engine.Types;
 using Xunit;
 using ExecutionContext = DeltaSharp.Engine.Execution.ExecutionContext;
@@ -36,7 +37,7 @@ public class OperatorMemoryReservationTests
     private static IExecutionBackend Backend => InterpretedVectorizedBackend.Instance;
 
     private static ExecutionContext Ctx(IExecutionMemory memory, CancellationToken cancellation = default)
-        => new(memory, cancellation);
+        => new(memory, cancellation) { SpillStore = new MemorySpillStore() };
 
     private static MutableColumnVector IntCol(params int?[] values)
     {
@@ -373,6 +374,10 @@ public class OperatorMemoryReservationTests
 
         public long AvailableBytes => _inner.AvailableBytes;
 
+        public long MaxSpillBytes => _inner.MaxSpillBytes;
+
+        public long SpilledBytes => _inner.SpilledBytes;
+
         public bool TryReserve(long bytes)
         {
             if (!_inner.TryReserve(bytes))
@@ -390,6 +395,8 @@ public class OperatorMemoryReservationTests
         }
 
         public void Release(long bytes) => _inner.Release(bytes);
+
+        public void RecordSpill(long bytes) => _inner.RecordSpill(bytes);
     }
 
     // ==============================================================================================
