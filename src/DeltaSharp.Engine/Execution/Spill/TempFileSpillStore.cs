@@ -27,7 +27,7 @@ internal sealed class TempFileSpillStore : ISpillStore, IDisposable
         UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
 
     // 0600: only the owner may read/write a spilled segment file (Security F3).
-    private const UnixFileMode FileMode_0600 = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+    private const UnixFileMode SegmentFileMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
 
     private readonly string _root;
     private readonly List<Segment> _segments = new();
@@ -148,7 +148,7 @@ internal sealed class TempFileSpillStore : ISpillStore, IDisposable
                 };
                 if (!OperatingSystem.IsWindows())
                 {
-                    options.UnixCreateMode = FileMode_0600;
+                    options.UnixCreateMode = SegmentFileMode;
                 }
 
                 _writer = new FileStream(path, options);
