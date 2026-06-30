@@ -24,6 +24,7 @@ internal sealed class CastEvaluator : ExpressionEvaluator
     private readonly AnsiMode _mode;
     private readonly long _intMin;
     private readonly long _intMax;
+    private readonly double _doubleUpperExclusive;
 
     public CastEvaluator(CastExpression node, ExpressionEvaluator child)
         : base(node.Type, node.Nullable)
@@ -31,13 +32,20 @@ internal sealed class CastEvaluator : ExpressionEvaluator
         _child = child;
         _source = node.Child.Type;
         _mode = node.Mode;
-        (_intMin, _intMax) = node.TargetType switch
+        (_intMin, _intMax, _doubleUpperExclusive) = node.TargetType switch
         {
-            ByteType => (sbyte.MinValue, (long)sbyte.MaxValue),
-            ShortType => (short.MinValue, (long)short.MaxValue),
-            IntegerType => (int.MinValue, (long)int.MaxValue),
-            LongType => (long.MinValue, long.MaxValue),
-            _ => (0L, 0L),
+            ByteType => (sbyte.MinValue, (long)sbyte.MaxValue, sbyte.MaxValue + 1.0),
+            ShortType => (short.MinValue, (long)short.MaxValue, short.MaxValue + 1.0),
+            IntegerType => (int.MinValue, (long)int.MaxValue, int.MaxValue + 1.0),
+
+            // long.MaxValue (2^63 - 1) is not representable as a double — it rounds up to 2^63 — so an
+            // inclusive `truncated > long.MaxValue` guard (which promotes long.MaxValue to (double)2^63)
+            // fails to reject the boundary 2^63, and (long) then silently saturates it to long.MaxValue.
+            // Reject against the exact double-exclusive upper bound 2^63 (9223372036854775808.0) so 2^63
+            // and every larger double overflow. The lower bound long.MinValue (-2^63) IS exactly
+            // representable, so it stays correct via the inclusive `truncated < _intMin` guard below.
+            LongType => (long.MinValue, long.MaxValue, 9223372036854775808.0),
+            _ => (0L, 0L, 0.0),
         };
     }
 
@@ -178,7 +186,7 @@ internal sealed class CastEvaluator : ExpressionEvaluator
                 }
 
                 double truncated = Math.Truncate(d);
-                if (truncated < _intMin || truncated > _intMax)
+                if (truncated < _intMin || truncated >= _doubleUpperExclusive)
                 {
                     result = 0L;
                     return Fail();

@@ -575,15 +575,57 @@ public class InterpretedExpressionEvaluatorTests
     [Fact]
     public void Cast_DateTimestampRoundTrip_MatchesMicrosPerDay()
     {
+        // Spark's date<->timestamp factor is 86_400_000_000 micros/day. The oracle and the input
+        // fixtures are derived from this HARD-CODED literal — never TemporalValues.MicrosPerDay, the same
+        // constant the cast path reads — so a mutation to that constant moves only the implementation and
+        // this test catches the drift (deriving the oracle from MicrosPerDay would move oracle and impl
+        // together and pass vacuously).
+        const long microsPerDay = 86_400_000_000L;
+        const int epochDay = 19_000; // a fixed in-range UTC calendar day (~2022), well inside [Min,Max]EpochDay
+
         StructType dateSchema = Schema(F("d", DataTypes.DateType, false));
-        ColumnBatch dateBatch = Batch(dateSchema, DateCol(10));
+        ColumnBatch dateBatch = Batch(dateSchema, DateCol(epochDay));
         ColumnVector toTimestamp = Eval(new CastExpression(Ref(0, DataTypes.DateType), DataTypes.TimestampType), dateSchema, dateBatch);
-        Assert.Equal(new long?[] { 10L * TemporalValues.MicrosPerDay }, Longs(toTimestamp));
+        Assert.Equal(new long?[] { epochDay * microsPerDay }, Longs(toTimestamp));
 
         StructType tsSchema = Schema(F("t", DataTypes.TimestampType, false));
-        ColumnBatch tsBatch = Batch(tsSchema, TimestampCol((10L * TemporalValues.MicrosPerDay) + 500));
+        ColumnBatch tsBatch = Batch(tsSchema, TimestampCol((epochDay * microsPerDay) + 500));
         ColumnVector toDate = Eval(new CastExpression(Ref(0, DataTypes.TimestampType), DataTypes.DateType), tsSchema, tsBatch);
-        Assert.Equal(new int?[] { 10 }, Ints(toDate)); // floor to whole days
+        Assert.Equal(new int?[] { epochDay }, Ints(toDate)); // floor to whole days
+    }
+
+    [Fact]
+    public void Cast_DoubleToLong_RejectsTwoToThe63_Ansi_Throws_Legacy_Nulls()
+    {
+        // 2^63 is one past the largest bigint (long.MaxValue == 2^63 - 1). As a double it is the exact
+        // boundary the (long) conversion silently saturates to long.MaxValue, because long.MaxValue is not
+        // representable as a double and an inclusive `> long.MaxValue` guard promotes it to (double)2^63 and
+        // lets 2^63 through. The guard must reject against the double-exclusive bound 2^63, so 2^63 overflows
+        // (throws under ANSI, NULLs under Legacy) rather than clamping.
+        const double twoToThe63 = 9223372036854775808.0; // 2^63 — the first double strictly above long.MaxValue
+        StructType schema = Schema(F("a", DataTypes.DoubleType, false));
+        ColumnBatch batch = Batch(schema, DoubleCol(twoToThe63));
+
+        Assert.Throws<ArithmeticOverflowException>(
+            () => Eval(new CastExpression(Ref(0, DataTypes.DoubleType), DataTypes.LongType, AnsiMode.Ansi), schema, batch));
+
+        ColumnVector legacy = Eval(new CastExpression(Ref(0, DataTypes.DoubleType), DataTypes.LongType, AnsiMode.Legacy), schema, batch);
+        Assert.True(legacy.IsNull(0));
+    }
+
+    [Fact]
+    public void Cast_DoubleToLong_AcceptsLargestInRangeDouble()
+    {
+        // The largest double strictly below 2^63 is 2^63 - 1024 = 9223372036854774784 (doubles step by
+        // 1024 in [2^62, 2^63)). It is a valid bigint and must still cast — the fix rejects 2^63 and above,
+        // not the in-range neighbour just below it.
+        const double largestInRange = 9223372036854774784.0; // 2^63 - 1024
+        StructType schema = Schema(F("a", DataTypes.DoubleType, false));
+        ColumnBatch batch = Batch(schema, DoubleCol(largestInRange));
+
+        ColumnVector result = Eval(new CastExpression(Ref(0, DataTypes.DoubleType), DataTypes.LongType, AnsiMode.Ansi), schema, batch);
+
+        Assert.Equal(new long?[] { 9223372036854774784L }, Longs(result));
     }
 
     [Fact]
@@ -759,6 +801,57 @@ public class InterpretedExpressionEvaluatorTests
         using IBatchStream stream = InterpretedVectorizedBackend.Instance.Open(project, Ctx(new BoundedExecutionMemory(1)));
 
         Assert.Throws<ExecutionMemoryException>(() => Drain(stream));
+    }
+
+    [Fact]
+    public void Project_StringColumnReference_OverSelection_ReservesGatheredValueBytes()
+    {
+        // A string column-reference projected UNDER A SELECTION takes the project's gather branch, which
+        // must reserve the gathered VALUE bytes — not merely the validity footprint EstimateFixedWidthBytes
+        // counts for a var-width type — or a wide string column drains shared executor memory unmetered.
+        // Two selected rows of 50 KB each (100 KB of value bytes) must NOT fit a 64 KB budget.
+        StructType schema = Schema(F("id", DataTypes.IntegerType, false), F("name", DataTypes.StringType, false));
+        string big = new('x', 50_000);
+        ColumnBatch batch = Batch(schema, IntCol(1, 2, 3, 4), StrCol(big, big, big, big))
+            .WithSelection(new SelectionVector([0, 2])); // 2 logical rows -> 100 KB of selected value bytes
+
+        var scan = new InMemoryScanOperator(schema, [batch]);
+        StructType outSchema = Schema(F("name", DataTypes.StringType, false), F("idplus", DataTypes.IntegerType, false));
+
+        // Mix the string column-reference (gathered under the selection) with a computed column so the
+        // project takes the materializing path; an all-column-reference project stays a zero-copy reorder.
+        var idPlus = new ArithmeticExpression(Ref(0, DataTypes.IntegerType), Literal.OfInt(1), ArithmeticOperator.Add);
+        var project = new ProjectOperator(scan, outSchema, [Ref(1, DataTypes.StringType), idPlus]);
+
+        using IBatchStream stream = InterpretedVectorizedBackend.Instance.Open(project, Ctx(new BoundedExecutionMemory(64 * 1024)));
+
+        Assert.Throws<ExecutionMemoryException>(() => Drain(stream));
+    }
+
+    [Fact]
+    public void Project_FixedWidthColumnReference_OverSelection_StaysWithinBudget()
+    {
+        // The control: a FIXED-WIDTH column-reference gathered under a selection is already fully accounted
+        // by ReserveVector (value buffer + validity), so the same 64 KB budget the string case overruns
+        // comfortably holds two gathered int rows — proving the gather path itself is sound and the fix
+        // meters only the previously-unmetered var-width value bytes.
+        StructType schema = Schema(F("id", DataTypes.IntegerType, false), F("v", DataTypes.IntegerType, false));
+        ColumnBatch batch = Batch(schema, IntCol(1, 2, 3, 4), IntCol(10, 20, 30, 40))
+            .WithSelection(new SelectionVector([0, 2]));
+
+        var scan = new InMemoryScanOperator(schema, [batch]);
+        StructType outSchema = Schema(F("v", DataTypes.IntegerType, false), F("idplus", DataTypes.IntegerType, false));
+        var idPlus = new ArithmeticExpression(Ref(0, DataTypes.IntegerType), Literal.OfInt(1), ArithmeticOperator.Add);
+        var project = new ProjectOperator(scan, outSchema, [Ref(1, DataTypes.IntegerType), idPlus]);
+
+        using IBatchStream stream = InterpretedVectorizedBackend.Instance.Open(project, Ctx(new BoundedExecutionMemory(64 * 1024)));
+        List<ColumnBatch> output = Drain(stream);
+
+        // The gathered, selection-free batch carries the selected rows: v in {10, 30}, id+1 in {2, 4}.
+        Assert.Single(output);
+        Assert.Null(output[0].Selection);
+        Assert.Equal([10, 30], ColumnInts(output[0], 0));
+        Assert.Equal([2, 4], ColumnInts(output[0], 1));
     }
 
     // =====================================================================================

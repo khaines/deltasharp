@@ -149,13 +149,42 @@ internal sealed class InterpretedProjectStream : IBatchStream
                 // Selection present: gather the selected logical rows into a fresh contiguous vector so
                 // the emitted batch carries no selection and stays GetValues-capable downstream.
                 ColumnVector view = input.SelectedColumn(plan.Ordinal);
-                memory.ReserveVector(view.Type, rows);
+                ReserveGather(memory, view, rows);
                 columns[i] = VectorMaterializer.Materialize(view, rows);
             }
         }
 
         // The computed batch is selection-free: every column is contiguous and length == logical rows.
         return new ManagedColumnBatch(Schema, columns, rows);
+    }
+
+    /// <summary>
+    /// Reserves the footprint a gathered column-reference materialization will allocate. The fixed-width
+    /// footprint (value buffer + validity) is the whole reservation for primitives; a variable-width
+    /// column (<see cref="StringType"/>/<see cref="BinaryType"/>) additionally allocates an offset per
+    /// row plus the gathered value bytes, which <see cref="BatchEvaluationMemory.ReserveVector"/> does
+    /// NOT cover — for a var-width type it counts only the validity footprint. The selected rows' encoded
+    /// length is known here, so meter it too (exactly as <c>LiteralEvaluator</c> reserves a var-width
+    /// broadcast) and keep the reservation honest with what <see cref="VectorMaterializer.Materialize"/>
+    /// allocates; otherwise a wide string/binary projection under a selection drains shared executor
+    /// memory unmetered past the tenant budget.
+    /// </summary>
+    private static void ReserveGather(BatchEvaluationMemory memory, ColumnVector view, int rows)
+    {
+        memory.ReserveVector(view.Type, rows);
+        if (view.Type is StringType or BinaryType)
+        {
+            long valueBytes = 0;
+            for (int i = 0; i < rows; i++)
+            {
+                if (!view.IsNull(i))
+                {
+                    valueBytes += view.GetBytes(i).Length;
+                }
+            }
+
+            memory.Reserve(((long)rows * sizeof(int)) + valueBytes);
+        }
     }
 
     private void Reserve(long bytes)
