@@ -219,6 +219,110 @@ public class OperatorSpillTests
     }
 
     // ==============================================================================================
+    // AC1 (#156 N1) — decimal SUM full-width accumulator: a decimal mantissa is ALREADY a full-width
+    // Int128, so an unchecked Int128 accumulator wraps after as few as 3 near-max values and silently
+    // returns a wrong in-range value. The BigInteger accumulator holds the exact running sum and the single
+    // Emit gate detects the true overflow (ANSI throws, Legacy nulls) — order-invariantly.
+    // ==============================================================================================
+
+    [Theory]
+    [InlineData(AnsiMode.Ansi)]
+    [InlineData(AnsiMode.Legacy)]
+    public void Aggregate_Decimal_SumOverflowsInt128Accumulator_DetectedNotWrapped(AnsiMode mode)
+    {
+        // Architect C7 repro: three decimal(38,0) values of 8.5e37. Int128.MaxValue ≈ 1.7014e38, so the
+        // FIRST two already sum to 1.7e38 (still inside Int128) and the THIRD wraps an unchecked Int128
+        // accumulator to a small-magnitude value that PASSES ToType — a silent wrong result. The true sum is
+        // 2.55e38, a genuine decimal(38,0) overflow: ANSI must throw, Legacy must NULL the group.
+        var decType = new DecimalType(38, 0);
+        var schema = new StructType([new StructField("v", decType, nullable: true)]);
+        var outSchema = new StructType([new StructField("s", decType, nullable: true)]);
+        Int128 v = Int128.Parse("85000000000000000000000000000000000000"); // 8.5e37
+
+        AggregateOperator Build()
+        {
+            MutableColumnVector col = ColumnVectors.Create(decType, 3);
+            col.AppendValue(v);
+            col.AppendValue(v);
+            col.AppendValue(v);
+            return new AggregateOperator(
+                Scan(schema, Batch(schema, col)),
+                outSchema,
+                [],
+                [new AggregateExpression(AggregateFunction.Sum, new ColumnReference(0, decType, nullable: true), mode)]);
+        }
+
+        if (mode == AnsiMode.Ansi)
+        {
+            // No silent wrap: the true overflow surfaces as the typed exception, never a wrong value.
+            Assert.Throws<ArithmeticOverflowException>(() => RunRender(Build(), outSchema, long.MaxValue, out _, out _));
+        }
+        else
+        {
+            List<string> rows = RunRender(Build(), outSchema, long.MaxValue, out _, out _);
+            Assert.Single(rows);
+            Assert.Equal("\u2205", rows[0]); // Legacy overflow nulls the group — never the wrapped value
+        }
+    }
+
+    [Theory]
+    [InlineData(AnsiMode.Ansi)]
+    [InlineData(AnsiMode.Legacy)]
+    public void Aggregate_Spill_Decimal_TransientOverflow_FinalInRange_SpillEqualsNoSpill(AnsiMode mode)
+    {
+        // Decimal analogue of the A1 (#156 B2) order-invariance proof, now past the Int128 boundary: group 0
+        // gets +9.0e37, then (after many other groups force a spill that flushes it) +9.0e37 and -9.0e37. The
+        // INTERMEDIATE partial 1.8e38 exceeds Int128.MaxValue (≈1.7014e38) — a CHECKED Int128 fold would
+        // throw (ANSI) / null (Legacy) on that transient in the single-pass no-spill arm while a
+        // re-partitioned spill arm restarts +9.0e37/-9.0e37 from 0 and never sees it → divergence. The TRUE
+        // sum is 9.0e37, a valid decimal(38,0) (< 1e38). The BigInteger accumulator never wraps and never
+        // throws on the transient, so BOTH arms emit 9.0e37 and agree — spill == no-spill, order-invariant.
+        var decType = new DecimalType(38, 0);
+        var schema = new StructType([new StructField("k", DataTypes.IntegerType, nullable: true), new StructField("v", decType, nullable: true)]);
+        var outSchema = new StructType([new StructField("k", DataTypes.IntegerType, nullable: true), new StructField("s", decType, nullable: true)]);
+        Int128 nine = Int128.Parse("90000000000000000000000000000000000000"); // 9.0e37
+
+        ColumnBatch Data()
+        {
+            MutableColumnVector keys = ColumnVectors.Create(DataTypes.IntegerType, 1);
+            MutableColumnVector vals = ColumnVectors.Create(decType, 1);
+            keys.AppendValue(0);
+            vals.AppendValue(nine); // group 0's first contribution, spilled before the rest arrive
+            for (int g = 1; g < 400; g++) // many groups in between → forces a spill that flushes group 0
+            {
+                keys.AppendValue(g);
+                vals.AppendValue((Int128)g);
+            }
+
+            keys.AppendValue(0);
+            vals.AppendValue(nine); // transient: 9e37 + 9e37 = 1.8e38 overflows a checked Int128 fold…
+            keys.AppendValue(0);
+            vals.AppendValue(-nine); // …but the FINAL sum is 9.0e37, a valid decimal(38,0)
+            return Batch(schema, keys, vals);
+        }
+
+        AggregateOperator Build() => new(
+            Scan(schema, Data()),
+            outSchema,
+            [Col(0, DataTypes.IntegerType)],
+            [new AggregateExpression(AggregateFunction.Sum, new ColumnReference(1, decType, nullable: true), mode)]);
+
+        string expectedGroup0 = "0|" + nine.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+        // No-spill (ample): the true in-range sum, no throw/null in EITHER mode.
+        List<string> ample = RunRender(Build(), outSchema, long.MaxValue, out long spilledAmple, out _);
+        Assert.Equal(0, spilledAmple);
+        Assert.Contains(expectedGroup0, ample);
+
+        // Spill (tight): must AGREE — same in-range value, no transient-driven divergence.
+        List<string> tight = RunRender(Build(), outSchema, 5000, out long spilledTight, out long leakTight);
+        Assert.True(spilledTight > 0, "the tight budget must force a spill");
+        Assert.Equal(0, leakTight);
+        Assert.Contains(expectedGroup0, tight);
+        AssertSameRows(ample, tight);
+    }
+
+    // ==============================================================================================
     // AC2 — SORT spill: sorted runs are k-way merged in the same global order as no-spill (byte-identical).
     // ==============================================================================================
 

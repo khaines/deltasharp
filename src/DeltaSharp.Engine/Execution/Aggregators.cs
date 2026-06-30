@@ -1,3 +1,4 @@
+using System.Numerics;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Engine.Execution.Expressions;
 using DeltaSharp.Engine.Execution.Spill;
@@ -319,25 +320,38 @@ internal sealed class SumDoubleAggregator : Aggregator
 }
 
 /// <summary>
-/// <c>SUM</c> over a decimal input, accumulated in an unchecked <see cref="Int128"/> unscaled mantissa at
-/// the input's (uniform) scale and fitted to the Spark result type <c>decimal(min(38, p+10), s)</c> at
-/// emit. Precision overflow of the <b>final</b> value follows <see cref="AnsiMode"/>: ANSI throws, Legacy
-/// nulls the group.
+/// <c>SUM</c> over a decimal input, accumulated as an arbitrary-precision
+/// <see cref="System.Numerics.BigInteger"/> unscaled mantissa at the input's (uniform) scale and fitted
+/// to the Spark result type <c>decimal(min(38, p+10), s)</c> at emit. Precision overflow of the
+/// <b>final</b> value follows <see cref="AnsiMode"/>: ANSI throws, Legacy nulls the group.
 /// </summary>
 /// <remarks>
-/// Like <see cref="SumLongAggregator"/> (#156 B2), the running mantissa add is unchecked and there is no
-/// intermediate overflow state: <see cref="Int128"/> addition is modular and associative, so the merged
-/// mantissa equals the true sum whenever that sum fits <see cref="Int128"/> — and any sum that fits the
-/// result decimal type necessarily fits <see cref="Int128"/>. The single overflow gate is the
-/// <see cref="DecimalValue.ToType(DecimalType, AnsiMode)"/> fit at <see cref="Emit"/>, applied to the final
-/// value. Because both arms accumulate the same modular mantissa and apply that one check, spill == no-spill
-/// by construction even when a transient partial overflows.
+/// <para>Unlike <see cref="SumLongAggregator"/> (whose <see cref="long"/> lanes need ~2^64 rows to overflow
+/// an <see cref="Int128"/> accumulator), a single decimal mantissa is ALREADY a full-width
+/// <see cref="Int128"/> (<see cref="DecimalValue.Unscaled"/>, up to ±~1e38). As few as three near-max
+/// <c>decimal(38,0)</c> values overflow an <see cref="Int128"/> accumulator, so an <em>unchecked</em>
+/// <see cref="Int128"/> add would wrap (mod 2^128) to a small-magnitude value that then passes
+/// <see cref="DecimalValue.ToType(DecimalType, AnsiMode)"/> — a true overflow silently returned as a wrong
+/// value (#156 N1).</para>
+/// <para>The accumulator is therefore widened to <see cref="System.Numerics.BigInteger"/>: it is
+/// arbitrary-precision so it holds the EXACT true running sum and NEVER wraps. <see cref="BigInteger"/>
+/// addition is associative/commutative, so the merged mantissa is a pure function of the input multiset —
+/// independent of partition/accumulation order — which is what keeps spill == no-spill EXACT even when a
+/// transient partial exceeds <see cref="Int128"/> range but the final true sum is back in decimal range
+/// (#156 B2). A CHECKED <see cref="Int128"/> add would instead throw on that transient in the single-pass
+/// no-spill arm while a re-partitioned spill arm restarts from zero and never sees it — the exact A1
+/// divergence — so a non-wrapping wide accumulator is required, not a checked narrow one.</para>
+/// <para>The single overflow gate is at <see cref="Emit"/>, applied to the final value: any valid
+/// <c>decimal(≤38)</c> result fits <see cref="Int128"/>, so a sum outside
+/// <c>[Int128.MinValue, Int128.MaxValue]</c> is definitively an overflow (ANSI throws / Legacy nulls);
+/// otherwise the in-range mantissa is handed to <see cref="DecimalValue.ToType(DecimalType, AnsiMode)"/>,
+/// which performs the precision/ANSI/Legacy check exactly as the rest of EPIC-02.</para>
 /// </remarks>
 internal sealed class SumDecimalAggregator : Aggregator
 {
     private readonly DecimalType _resultType;
     private readonly AnsiMode _mode;
-    private Int128[] _sums = [];
+    private BigInteger[] _sums = [];
     private bool[] _hasValue = [];
 
     // The uniform scale of the input decimal column, captured on the first observed value/merge. -1 until
@@ -350,7 +364,10 @@ internal sealed class SumDecimalAggregator : Aggregator
         _mode = mode;
     }
 
-    internal override long BytesPerGroup => 16 + 1;
+    // BigInteger state is variable-width; a decimal(≤38) mantissa needs ≤16 bytes of magnitude and the
+    // exact running sum stays a few words wide. Use a fixed estimate covering the BigInteger handle plus a
+    // small magnitude buffer and the scale + has-value bytes.
+    internal override long BytesPerGroup => 40 + 4 + 1;
 
     internal override void EnsureCapacity(int groupCount)
     {
@@ -369,9 +386,10 @@ internal sealed class SumDecimalAggregator : Aggregator
         _scale = value.Scale; // uniform across the column; idempotent
         _hasValue[group] = true;
 
-        // Unchecked Int128 add: a transient mantissa overflow the final sum recovers from must not poison the
-        // group. The fit/precision check is deferred to Emit (ToType), so spill == no-spill by construction.
-        _sums[group] += value.Unscaled;
+        // Arbitrary-precision add: the BigInteger accumulator holds the EXACT true running sum and never
+        // wraps, so a transient mantissa beyond Int128 range that the final sum recovers from never poisons
+        // the group and the result is order-invariant. The single fit/precision gate is deferred to Emit.
+        _sums[group] += (BigInteger)value.Unscaled;
     }
 
     internal override void Emit(int group, MutableColumnVector destination)
@@ -382,8 +400,23 @@ internal sealed class SumDecimalAggregator : Aggregator
             return;
         }
 
-        // The single overflow gate: fit the FINAL mantissa to the result type. ANSI throws, Legacy → NULL.
-        DecimalValue? fitted = new DecimalValue(_sums[group], _scale).ToType(_resultType, _mode);
+        // The single overflow gate, applied to the FINAL exact sum. Any valid decimal(≤38) result fits
+        // Int128, so a sum outside the Int128 range is DEFINITELY an overflow: ANSI throws, Legacy → NULL.
+        BigInteger sum = _sums[group];
+        if (sum < (BigInteger)Int128.MinValue || sum > (BigInteger)Int128.MaxValue)
+        {
+            if (_mode == AnsiMode.Ansi)
+            {
+                throw new ArithmeticOverflowException(
+                    $"Decimal value out of range for '{_resultType.SimpleString}'.");
+            }
+
+            destination.AppendNull();
+            return;
+        }
+
+        // In Int128 range: ToType still applies the result type's precision/scale check (ANSI/Legacy).
+        DecimalValue? fitted = new DecimalValue((Int128)sum, _scale).ToType(_resultType, _mode);
         if (fitted is null)
         {
             destination.AppendNull();
@@ -396,14 +429,16 @@ internal sealed class SumDecimalAggregator : Aggregator
 
     internal override void WriteState(int group, SpillStateWriter writer)
     {
-        writer.WriteInt128(_sums[group]);
+        // Serialize the FULL-WIDTH partial sum (no intermediate fit check) so a spilled partial is the
+        // partition's exact running sum and Emit applies the single final gate.
+        writer.WriteBytes(_sums[group].ToByteArray());
         writer.WriteInt(_scale);
         writer.WriteBool(_hasValue[group]);
     }
 
     internal override void MergeState(int group, ref SpillStateReader reader)
     {
-        Int128 unscaled = reader.ReadInt128();
+        var unscaled = new BigInteger(reader.ReadBytes());
         int scale = reader.ReadInt();
         bool has = reader.ReadBool();
         if (has)
@@ -412,8 +447,8 @@ internal sealed class SumDecimalAggregator : Aggregator
             _hasValue[group] = true;
         }
 
-        // Merge the partition's partial mantissa unchecked — no intermediate check — so the merged total is
-        // the exact modular sum and Emit applies the single final fit check.
+        // Merge the partition's partial mantissa with no intermediate check — BigInteger never wraps, so the
+        // merged total is the exact running sum (order-invariant) and Emit applies the single final gate.
         _sums[group] += unscaled;
     }
 
