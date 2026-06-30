@@ -2,17 +2,20 @@ using System.Buffers;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using DeltaSharp.Engine.Columnar;
+using DeltaSharp.Engine.Execution.Expressions;
 using DeltaSharp.Engine.Types;
 
 namespace DeltaSharp.Engine.Execution;
 
 /// <summary>
-/// The pull-based <see cref="IBatchStream"/> for a <see cref="FilterOperator"/> whose predicate is a
-/// boolean <see cref="ColumnReference"/> (STORY-03.2.1). It evaluates the predicate over each input
-/// batch into a <see cref="SelectionVector"/> of the passing logical rows and exposes them through
-/// <see cref="ColumnBatch.WithSelection"/> — <b>no value column is ever copied</b>; only "which rows
-/// survive" is materialized (ADR-0002 late materialization). A row passes iff the predicate is
-/// <see langword="true"/>; null predicate values do not pass (Spark <c>WHERE</c> semantics). Output
+/// The pull-based <see cref="IBatchStream"/> for a <see cref="FilterOperator"/> (STORY-03.2.1 /
+/// STORY-03.4.1). It evaluates the predicate over each input batch into a <see cref="SelectionVector"/>
+/// of the passing logical rows and exposes them through <see cref="ColumnBatch.WithSelection"/> —
+/// <b>no value column is ever copied</b>; only "which rows survive" is materialized (ADR-0002 late
+/// materialization). A boolean <see cref="ColumnReference"/> predicate reads the column directly; a
+/// richer predicate is evaluated by an <see cref="ExpressionEvaluator"/> into a transient boolean
+/// vector that is released before the surviving selection is emitted. A row passes iff the predicate
+/// is <see langword="true"/>; null predicate values do not pass (Spark <c>WHERE</c> semantics). Output
 /// schema equals input schema. Fully-filtered batches are dropped (the stream pulls the next input
 /// rather than emitting an empty batch).
 /// </summary>
@@ -23,6 +26,7 @@ internal sealed class InterpretedFilterStream : IBatchStream
     private readonly IExecutionMemory _memory;
     private readonly CancellationToken _cancellationToken;
     private readonly int _predicateOrdinal;
+    private readonly ExpressionEvaluator? _predicate;
     private readonly ArrayPool<int> _selectionPool;
     private long _reservedBytes;
     private bool _disposed;
@@ -32,6 +36,19 @@ internal sealed class InterpretedFilterStream : IBatchStream
     {
         Schema = op.OutputSchema;
         _predicateOrdinal = predicateOrdinal;
+        _input = input;
+        _metrics = op.Metrics;
+        _memory = context.Memory;
+        _cancellationToken = context.CancellationToken;
+        _selectionPool = selectionPool ?? ArrayPool<int>.Shared;
+    }
+
+    internal InterpretedFilterStream(
+        FilterOperator op, ExpressionEvaluator predicate, IBatchStream input, ExecutionContext context, ArrayPool<int>? selectionPool = null)
+    {
+        Schema = op.OutputSchema;
+        _predicateOrdinal = -1;
+        _predicate = predicate;
         _input = input;
         _metrics = op.Metrics;
         _memory = context.Memory;
@@ -116,12 +133,17 @@ internal sealed class InterpretedFilterStream : IBatchStream
 
     /// <summary>
     /// Fills <paramref name="buffer"/> with the indices of the passing logical rows and returns the
-    /// count. The no-selection path reads the boolean value span directly (no gather); the
-    /// selection-aware path gathers through a logical view. A row passes iff its predicate value is
-    /// <see langword="true"/> and not null.
+    /// count. A row passes iff its predicate value is <see langword="true"/> and not null. Indices are
+    /// always logical (over <c>[0, LogicalRowCount)</c>) so <see cref="ColumnBatch.WithSelection"/>
+    /// composes them over any prior selection.
     /// </summary>
     private int SelectPassingRows(ColumnBatch input, int[] buffer)
     {
+        if (_predicate is not null)
+        {
+            return SelectByEvaluator(input, buffer);
+        }
+
         int passing = 0;
 
         if (input.Selection is null)
@@ -167,6 +189,35 @@ internal sealed class InterpretedFilterStream : IBatchStream
         }
 
         return passing;
+    }
+
+    /// <summary>
+    /// Evaluates a general boolean predicate into a transient vector and collects the passing logical
+    /// rows. The predicate vector and its intermediates are scratch — their reservation is released
+    /// before the surviving selection is built, so peak memory is bounded by the larger of the two.
+    /// </summary>
+    private int SelectByEvaluator(ColumnBatch input, int[] buffer)
+    {
+        var scratch = new BatchEvaluationMemory(_memory);
+        try
+        {
+            ColumnVector predicate = _predicate!.Evaluate(input, scratch, _cancellationToken);
+            bool hasNulls = predicate.HasNulls;
+            int passing = 0;
+            for (int i = 0; i < predicate.Length; i++)
+            {
+                if ((!hasNulls || !predicate.IsNull(i)) && predicate.GetValue<bool>(i))
+                {
+                    buffer[passing++] = i;
+                }
+            }
+
+            return passing;
+        }
+        finally
+        {
+            scratch.Release();
+        }
     }
 
     private void Reserve(long bytes)
