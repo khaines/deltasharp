@@ -117,10 +117,12 @@ allowed. Any input selection is preserved, so the projected batch exposes the sa
 - **Interpreted, AOT-clean.** No new type carries `[RequiresDynamicCode]`; the kernels are reachable
   from the interpreted backend so NativeAOT keeps them and elides only `CompiledBackend`.
 
-v1 only resolves `ColumnReference` predicates/projections; a richer expression (cast, arithmetic,
-literal) raises `UnsupportedOperatorException` rather than degrade, until the interpreted expression
-evaluator (STORY-03.4.1). Boolean columns are managed 1-byte vectors (Arrow bit-packed booleans have
-no v1 columnar mapping), which is why the filter's value-span fast path is sound.
+v1 STORY-03.2.1 only resolved `ColumnReference` predicates/projections; a richer expression (cast,
+arithmetic, comparison, boolean, null-check) now binds to an interpreted `ExpressionEvaluator` at Open
+([STORY-03.4.1](interpreted-expression-evaluator.md)), still failing fast with
+`UnsupportedOperatorException` for shapes outside the interpreted tier rather than degrading. Boolean
+columns are managed 1-byte vectors (Arrow bit-packed booleans have no v1 columnar mapping), which is why
+the filter's value-span fast path is sound.
 
 ## AOT-clean interpreter (AC4)
 
@@ -132,8 +134,9 @@ NativeAOT — the interpreter needs no codegen to be correct.
 ## What is deferred
 
 - Remaining operator **kernels** (aggregate, sort, join, exchange) and the SIMD library
-  (FEAT-03.2/03.3); the general expression/function model and interpreted expression evaluator
-  (STORY-03.4.1) that lifts the `ColumnReference`-only restriction on filter/project.
+  (FEAT-03.2/03.3). The interpreted **expression evaluator** (arithmetic, comparison, boolean Kleene
+  3VL, cast, null-check) that lifts the `ColumnReference`-only restriction on filter/project landed in
+  [STORY-03.4.1](interpreted-expression-evaluator.md); compiled expression fusion is STORY-03.4.2.
 - Real **Parquet/Delta and connector scan sources** (predicate/partition pushdown, column pruning,
   data skipping, byte-accurate scan accounting) behind the `Scan` shape — owned by the storage and
   connector layers; `InMemoryScanOperator` is the v1 stand-in.
