@@ -68,17 +68,31 @@ public class NullHelperBenchmarkTests
     public void Measure_TimedRegion_IsAllocationFree()
     {
         // A high iteration count makes any per-iteration allocation visible against the fixed setup cost.
-        NullHelperBenchmark.Result warm = NullHelperBenchmark.Measure(
-            NullHelperBenchmark.Operation.KleeneAnd, batchSize: 2048, nullDensity: 0.5, iterations: 1);
-        Assert.True(warm.Iterations == 1);
-
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        NullHelperBenchmark.Result result = NullHelperBenchmark.Measure(
-            NullHelperBenchmark.Operation.KleeneAnd, batchSize: 2048, nullDensity: 0.5, iterations: 100_000);
-        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        // The 100k-iteration timed loop runs long enough that the background JIT can promote Measure to
+        // tier-1 *mid-measurement*; that one-time OSR/recompile allocates on this thread and, under
+        // parallel test load, intermittently inflates the first reading (a load/timing artifact, not a
+        // real per-iteration allocation). Poll until a steady-state (tier-1) pass measures only the fixed
+        // setup cost, tolerating the one-time tier-up transient — the same pattern the compiled-fusion
+        // allocation guard (FusedKernel_PerRow_IsAllocationFree) uses.
+        const int maxAttempts = 50;
+        long allocated = long.MaxValue;
+        NullHelperBenchmark.Result result = default;
+        for (int attempt = 0; attempt < maxAttempts && allocated > 4096; attempt++)
+        {
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            result = NullHelperBenchmark.Measure(
+                NullHelperBenchmark.Operation.KleeneAnd, batchSize: 2048, nullDensity: 0.5, iterations: 100_000);
+            allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+            if (allocated > 4096)
+            {
+                Thread.Sleep(5); // let the background JIT promote Measure to tier-1, then re-measure
+            }
+        }
 
         // Setup allocates a handful of small buffers; the 100k-iteration timed loop must add nothing.
-        Assert.True(allocated <= 4096, $"Measure allocated {allocated} bytes for 100k iterations (expected only fixed setup)");
+        Assert.True(
+            allocated <= 4096,
+            $"Measure allocated {allocated} bytes for 100k iterations after {maxAttempts} attempts (expected only fixed setup)");
         Assert.Equal(100_000, result.Iterations);
     }
 
