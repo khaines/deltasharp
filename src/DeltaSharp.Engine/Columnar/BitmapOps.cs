@@ -15,13 +15,16 @@ namespace DeltaSharp.Engine.Columnar;
 /// <remarks>
 /// <para>
 /// <b>SIMD width and fallback (AOT-safe).</b> The vector tiers use
-/// <see cref="System.Runtime.Intrinsics"/> <see cref="Vector256"/>/<see cref="Vector128"/> guarded by
-/// their <c>IsHardwareAccelerated</c> properties, which the JIT and the NativeAOT ILCompiler resolve to
-/// <b>compile-time constants</b> per target — so an unsupported tier is dead-code-eliminated rather than
-/// throwing, and no dynamic codegen is involved (ADR-0001, ADR-0014). Below the vector tiers a
+/// <see cref="System.Runtime.Intrinsics"/> <see cref="Vector256"/>/<see cref="Vector128"/> dispatched by
+/// <see cref="NullMaskTierGate"/>. Under the production <see cref="NullMaskTier.Auto"/> selection each tier
+/// is guarded by its <c>IsHardwareAccelerated</c> property, which the JIT and the NativeAOT ILCompiler
+/// resolve to a <b>compile-time constant</b> per target — so an unsupported tier is dead-code-eliminated
+/// rather than throwing, and no dynamic codegen is involved (ADR-0001, ADR-0014). Below the vector tiers a
 /// <c>ulong</c> (8-byte) loop and a final <c>byte</c> loop are the scalar fallback, so the kernels stay
 /// correct even when no SIMD is available. <see cref="BitOperations.PopCount(ulong)"/> is itself the
-/// AOT-safe hardware popcount (lowers to <c>POPCNT</c>/<c>CNT</c> with a software fallback).
+/// AOT-safe hardware popcount (lowers to <c>POPCNT</c>/<c>CNT</c> with a software fallback). A
+/// <see cref="NullMaskTier"/> other than <see cref="NullMaskTier.Auto"/> forces a specific tier for parity
+/// testing (the portable vector API runs on any host) without changing the production dispatch.
 /// </para>
 /// <para>
 /// <b>Canonical padding.</b> The trailing bits of the final partial byte (the lanes at index
@@ -67,6 +70,9 @@ internal static class BitmapOps
             return 0;
         }
 
+        // Self-guard the unchecked Unsafe reads below (the precondition was previously caller-only).
+        RequireSpan(bits.Length, Bitmap.ByteCount(length), "bits");
+
         int fullBytes = length >> 3;
         int tailBits = length & 7;
         ref byte head = ref MemoryMarshal.GetReference(bits);
@@ -100,9 +106,12 @@ internal static class BitmapOps
     /// <summary>
     /// Writes <c>dest = a &amp; b</c> over the <c>ByteCount(length)</c> bytes covering <c>[0, length)</c>
     /// (propagate-on-any-null validity AND), canonicalizing the trailing padding to <c>0</c>. Inputs and
-    /// <paramref name="dest"/> must each be at least <c>ByteCount(length)</c> bytes.
+    /// <paramref name="dest"/> must each be at least <c>ByteCount(length)</c> bytes. The optional
+    /// <paramref name="tier"/> forces a specific word width (default <see cref="NullMaskTier.Auto"/> keeps
+    /// the production <c>IsHardwareAccelerated</c> dispatch); see <see cref="NullMaskTier"/>.
     /// </summary>
-    public static void And(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b, Span<byte> dest, int length)
+    /// <exception cref="ArgumentException">Any span is shorter than <c>ByteCount(length)</c>.</exception>
+    public static void And(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b, Span<byte> dest, int length, NullMaskTier tier = NullMaskTier.Auto)
     {
         int byteCount = Bitmap.ByteCount(length);
         if (byteCount == 0)
@@ -110,12 +119,18 @@ internal static class BitmapOps
             return;
         }
 
+        // Self-guard the unchecked Unsafe reads/writes below: a future undersized-span caller fails fast
+        // here instead of corrupting memory out of bounds (the precondition was previously caller-only).
+        RequireSpan(a.Length, byteCount, "left");
+        RequireSpan(b.Length, byteCount, "right");
+        RequireSpan(dest.Length, byteCount, "destination");
+
         ref byte ra = ref MemoryMarshal.GetReference(a);
         ref byte rb = ref MemoryMarshal.GetReference(b);
         ref byte rd = ref MemoryMarshal.GetReference(dest);
 
         int i = 0;
-        if (Vector256.IsHardwareAccelerated)
+        if (NullMaskTierGate.UseVector256(tier))
         {
             for (; i <= byteCount - Vector256<byte>.Count; i += Vector256<byte>.Count)
             {
@@ -123,7 +138,7 @@ internal static class BitmapOps
             }
         }
 
-        if (Vector128.IsHardwareAccelerated)
+        if (NullMaskTierGate.UseVector128(tier))
         {
             for (; i <= byteCount - Vector128<byte>.Count; i += Vector128<byte>.Count)
             {
@@ -131,10 +146,13 @@ internal static class BitmapOps
             }
         }
 
-        for (; i <= byteCount - sizeof(ulong); i += sizeof(ulong))
+        if (NullMaskTierGate.UseWord(tier))
         {
-            ulong word = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref ra, i)) & Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb, i));
-            Unsafe.WriteUnaligned(ref Unsafe.Add(ref rd, i), word);
+            for (; i <= byteCount - sizeof(ulong); i += sizeof(ulong))
+            {
+                ulong word = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref ra, i)) & Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb, i));
+                Unsafe.WriteUnaligned(ref Unsafe.Add(ref rd, i), word);
+            }
         }
 
         for (; i < byteCount; i++)
@@ -150,9 +168,11 @@ internal static class BitmapOps
     /// (<c>0xFF</c>) and canonicalizes the trailing padding to <c>0</c> — the materialized all-valid
     /// output used when an operand carries no bitmap.
     /// </summary>
+    /// <exception cref="ArgumentException"><paramref name="dest"/> is shorter than <c>ByteCount(length)</c>.</exception>
     public static void FillValid(Span<byte> dest, int length)
     {
         int byteCount = Bitmap.ByteCount(length);
+        RequireSpan(dest.Length, byteCount, "destination");
         dest[..byteCount].Fill(0xFF);
         ApplyTailMask(dest, length);
     }
@@ -162,9 +182,12 @@ internal static class BitmapOps
     /// <paramref name="src"/> to <paramref name="dest"/> and canonicalizes the trailing padding to
     /// <c>0</c> — unary propagate (<c>out = in</c>).
     /// </summary>
+    /// <exception cref="ArgumentException">Either span is shorter than <c>ByteCount(length)</c>.</exception>
     public static void CopyValidity(ReadOnlySpan<byte> src, Span<byte> dest, int length)
     {
         int byteCount = Bitmap.ByteCount(length);
+        RequireSpan(src.Length, byteCount, "source");
+        RequireSpan(dest.Length, byteCount, "destination");
         src[..byteCount].CopyTo(dest);
         ApplyTailMask(dest, length);
     }
@@ -176,6 +199,20 @@ internal static class BitmapOps
         if (byteCount > 0 && (length & 7) != 0)
         {
             dest[byteCount - 1] &= TailMask(length);
+        }
+    }
+
+    /// <summary>
+    /// Cheap fail-fast precondition for the unchecked-<see cref="System.Runtime.CompilerServices.Unsafe"/>
+    /// kernels above, mirroring the <c>RequireInput</c> discipline of <see cref="NullMasks"/>: it is a single
+    /// length comparison (allocation-free, off the per-element path), so an undersized span throws a clear
+    /// <see cref="ArgumentException"/> instead of reading or writing out of bounds.
+    /// </summary>
+    private static void RequireSpan(int spanLength, int requiredBytes, string what)
+    {
+        if (spanLength < requiredBytes)
+        {
+            throw new ArgumentException($"{what} bitmap needs at least {requiredBytes} byte(s) but has {spanLength}.");
         }
     }
 }

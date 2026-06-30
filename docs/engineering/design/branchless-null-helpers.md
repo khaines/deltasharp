@@ -20,9 +20,11 @@ Per [ADR-0001](../../adr/0001-execution-strategy.md) the interpreted scalar path
 ground truth**; these vectorized helpers are an additive fast path that must produce **byte-identical**
 results. The implementation lives in `src/DeltaSharp.Engine/Columnar/`:
 [`BitmapOps`](../../../src/DeltaSharp.Engine/Columnar/BitmapOps.cs) (low-level word primitives),
-[`NullMasks`](../../../src/DeltaSharp.Engine/Columnar/NullMasks.cs) (the propagate/Kleene kernels), and
+[`NullMasks`](../../../src/DeltaSharp.Engine/Columnar/NullMasks.cs) (the propagate/Kleene kernels),
+[`NullMaskTier`](../../../src/DeltaSharp.Engine/Columnar/NullMaskTier.cs) (the SIMD/scalar tier selector and
+its dispatch gate), and
 [`NullHelperBenchmark`](../../../src/DeltaSharp.Engine/Columnar/NullHelperBenchmark.cs) (the timing
-harness). All three are engine-internal (no `DeltaSharp.Core` surface) and exercised through the
+harness). All are engine-internal (no `DeltaSharp.Core` surface) and exercised through the
 friend-assembly test-access policy.
 
 ## The branchless mask scheme
@@ -107,6 +109,20 @@ vanish and the `ulong`/`byte` fallback runs. `BitOperations.PopCount` is itself 
 popcount (it lowers to `POPCNT`/`CNT` with a software fallback). The `dotnet publish … -p:PublishAot=true
 -warnaserror` gate over `DeltaSharp.Executor` proves the whole path is IL-clean.
 
+**CI architecture and the tier-forcing test seam.** The development/CI host is **arm64 (Apple Silicon)**.
+Its shell runs under Rosetta, so `uname` reports `x86_64`, but the .NET runtime is native arm64
+(`RuntimeInformation.ProcessArchitecture == Arm64`): there `Vector256.IsHardwareAccelerated == false` and only
+`Vector128` (NEON) is hardware-accelerated. **The `Vector256`/AVX2 tier is reachable under `Auto` only on an
+x64 host.** That makes the `Vector256` body *vacuously* covered on this box — a mutation in a constant-folded-away
+branch can never fail a test. To close that hole every kernel threads an optional
+[`NullMaskTier`](../../../src/DeltaSharp.Engine/Columnar/NullMaskTier.cs) (`Auto` in production;
+`Scalar`/`Word`/`Vector128`/`Vector256` for tests), resolved once per call by `NullMaskTierGate`. Because the
+kernels are written against the **portable** `Vector256<T>` API (whose software fallback runs on any
+architecture), a *forced* `Vector256` loop executes and is parity-checked **even on arm64**. `Auto` keeps the
+original `IsHardwareAccelerated`-guarded dispatch verbatim: the guard sub-expression still folds to its
+per-target constant, so the production codegen, the NativeAOT dead-code elimination of unsupported tiers, and
+the AOT publish gate are all unchanged.
+
 **Why there is no virtual dispatch.** The two Kleene connectives share one fused loop parameterized by a
 `readonly struct` operator implementing a `static abstract` interface (`IKleeneBinaryOperator`). The JIT/AOT
 **monomorphizes** the generic per operator struct and inlines the bitwise formula, so there is no boxing, no
@@ -119,24 +135,44 @@ is always reachable and is the oracle (ADR-0001). Byte-aligned slices (the commo
 block-aligned cases) take the SIMD path. `BitmapOps.IsHardwareAccelerated` exposes which tier is live for
 diagnostics and benchmark metadata.
 
+**Kleene entry points are offset-0 / byte-aligned only.** Unlike the propagate kernels (which accept a
+`Validity` carrying a bit `Offset`), the bit-packed `KleeneAnd`/`KleeneOr`/`KleeneNot` entry points take
+their value and validity **spans starting at bit 0** — there is no offset parameter. A consumer that holds a
+**bit-unaligned boolean slice** (e.g. a filtered/sliced boolean column whose logical row 0 is not on a byte
+boundary, as the #150/#153 filter and projection operators can produce) **must materialize it into a fresh
+offset-0 bitmap first** (a one-pass copy that re-aligns the bits) before calling these kernels. This keeps the
+fused word formulas a pure `byte`/`ulong`/vector stream with no per-lane shift, and matches how the operator
+layer is expected to stage boolean intermediates.
+
 ## Parity with the scalar oracle (AC2)
 
 The scalar `bool?` methods in `NullPropagation` (#143) are the **parity oracle**. The randomized tests assert
-the vectorized result equals it **exactly** along three axes simultaneously:
+the vectorized result equals it **exactly** along four axes simultaneously:
 
 1. **Validity bits** — a byte-for-byte `SequenceEqual` of the output validity bitmap over `ByteCount(length)`
    bytes (made unambiguous by canonical padding).
-2. **Null count** — the returned count equals both the scalar bulk kernel's count and an independent
+2. **Value bits** — a byte-for-byte `SequenceEqual` of the output **value** bitmap against the oracle-derived
+   canonical value bitmap (and against the packed scalar `bool[]` output). Asserting the value *bitmap*, not
+   only the decoded lanes, is what catches a regression that emits **garbage bits in null/padding lanes**:
+   dedicated cases seed `v=0, b=1` value bits into null input lanes (and dirty the trailing padding),
+   deliberately breaking the canonical `value ⊆ valid` invariant, so the kernels' `& validity` masking and
+   tail-canonicalization are *non-vacuously* exercised — dropping either mask (e.g. AND `value = bL & bR`
+   instead of `(vL&bL)&(vR&bR)`) leaks the garbage and fails this check.
+3. **Null count** — the returned count equals both the scalar bulk kernel's count and an independent
    lane-by-lane count.
-3. **Value lanes** — every output lane decoded from the bit-packed value+validity equals the single-lane
+4. **Value lanes** — every output lane decoded from the bit-packed value+validity equals the single-lane
    `NullPropagation.Kleene*` oracle *and* the scalar bulk kernel's `bool[]` output.
 
 Coverage (`BitmapOpsTests`, `NullMasksKleeneTests`, `NullMasksPropagateTests`):
 
 - **Null densities** `{0.0, 0.1, 0.5, 0.9, 1.0}` — no-null, sparse, half, dense, all-null.
-- **Tail / boundary lengths** `{0,1,7,8,9,…,127,128,255,256,257,1000,1024,4096}` — including the called-out
-  non-byte-aligned **257** and **1000**, every byte boundary, and the 16/32-byte vector boundaries so the
-  SIMD body, the `ulong` step, and the `byte` tail are all exercised in one batch.
+- **Tail / boundary lengths** `{0,1,7,8,9,…,127,128,255,256,257,1000,1024,4096}` — including **257**, the true
+  sub-byte tail (`257 % 8 == 1`), and **1000**, a *vector-width* tail (byte-aligned at `1000 % 8 == 0`, but its
+  125 bytes leave a sub-vector remainder below the 16/32-byte stride), every byte boundary, and the 16/32-byte
+  vector boundaries so the SIMD body, the `ulong` step, and the `byte` tail are all exercised in one batch.
+- **Forced tiers** — each kernel is additionally run with every tier *forced* (`Scalar`/`Word`/`Vector128`/
+  `Vector256`) over lengths ≥ 256 bits, so the wide `Vector256` body runs and is mutation-killable **on the
+  arm64 CI host** where `Auto` constant-folds it away (see "CI architecture and the tier-forcing test seam").
 - **Offsets/slices** — byte-aligned (`0, 8, 16, 24`, same and differing bytes) taking the SIMD path, and
   bit-unaligned (`3, 5, 11`) taking the scalar fallback; both proven byte-identical to the reference.
 - **Edge shapes** — empty (`length == 0`), all-null, all-valid, single lane, and the absent-bitmap fast
@@ -156,6 +192,11 @@ The hot path allocates **nothing**:
 - `Validity` is a `readonly ref struct` (stack-only), and the fused operators pass `out` value tuples that
   stay in registers.
 - The off-bitmap fast paths reuse `Span.Fill`/`CopyTo` rather than allocating synthetic buffers.
+- The `BitmapOps` word kernels (`And`/`FillValid`/`CopyValidity`/`PopCount`) read and write via unchecked
+  `Unsafe`, so each **self-guards** its size precondition with a single allocation-free length comparison
+  (`spanLength >= ByteCount(length)`, the same `RequireInput` discipline the Kleene kernels use): an
+  undersized span fails fast with a clear `ArgumentException` instead of corrupting memory, and the check is
+  off the per-element path so it does not perturb the zero-alloc/perf budget.
 
 This is pinned by tests that warm up, then call the kernel thousands of times inside a
 `GC.GetAllocatedBytesForCurrentThread()` window and assert ~0 bytes (≤ 64 B slack), mirroring the #143

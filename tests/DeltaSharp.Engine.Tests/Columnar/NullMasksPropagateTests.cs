@@ -16,6 +16,20 @@ public class NullMasksPropagateTests
     public static readonly TheoryData<int> Lengths =
         new() { 0, 1, 7, 8, 9, 63, 64, 65, 127, 128, 255, 256, 257, 1000, 1024, 4096 };
 
+    /// <summary>
+    /// Lengths whose byte count is >= 32, so a forced <see cref="NullMaskTier.Vector256"/> loop body
+    /// (32-byte stride) of the underlying <see cref="BitmapOps.And"/> executes at least once — including
+    /// the sub-byte (257) and vector-width (1000-bit = 125-byte) tails.
+    /// </summary>
+    public static readonly TheoryData<int> WideLengths =
+        new() { 256, 257, 320, 511, 512, 1000, 1024, 4096 };
+
+    /// <summary>The four explicitly-forced tiers (every tier except <see cref="NullMaskTier.Auto"/>).</summary>
+    private static readonly NullMaskTier[] ForcedTiers =
+    {
+        NullMaskTier.Scalar, NullMaskTier.Word, NullMaskTier.Vector128, NullMaskTier.Vector256,
+    };
+
     [Theory]
     [MemberData(nameof(Lengths))]
     public void PropagateBinary_RandomizedParity_AcrossNullDensitiesAndTails(int length)
@@ -156,7 +170,28 @@ public class NullMasksPropagateTests
             NullMasks.PropagateUnary(Validity.AllValid(16), new byte[1])); // needs 2 bytes
     }
 
-    private static void AssertBinaryParity(byte[]? leftBits, int leftOffset, byte[]? rightBits, int rightOffset, int length)
+    [Theory]
+    [MemberData(nameof(WideLengths))]
+    public void PropagateBinary_ForcedTierParity_MatchesScalar_OnAnyHost(int length)
+    {
+        // Both operands present and offset-0 so the byte-aligned BitmapOps.And path (the SIMD tier under
+        // test) is taken; forcing each tier makes the Vector256 word loop reachable and mutation-killable
+        // even on this arm64/NEON host, where Auto folds it away. (Finding #1.)
+        foreach (NullMaskTier tier in ForcedTiers)
+        {
+            foreach (double density in new[] { 0.0, 0.1, 0.5, 0.9, 1.0 })
+            {
+                var rng = new Random(unchecked(0xB17E ^ (length * 31) ^ ((int)tier * 7) ^ (int)(density * 1000)));
+                byte[] leftBits = ValidityBits(rng, length, density);
+                byte[] rightBits = ValidityBits(rng, length, density);
+
+                AssertBinaryParity(leftBits, 0, rightBits, 0, length, tier);
+            }
+        }
+    }
+
+    private static void AssertBinaryParity(
+        byte[]? leftBits, int leftOffset, byte[]? rightBits, int rightOffset, int length, NullMaskTier tier = NullMaskTier.Auto)
     {
         Validity left = leftBits is null ? Validity.AllValid(length) : new Validity(leftBits, leftOffset, length);
         Validity right = rightBits is null ? Validity.AllValid(length) : new Validity(rightBits, rightOffset, length);
@@ -165,7 +200,7 @@ public class NullMasksPropagateTests
         var mine = new byte[byteCount];
         var theirs = new byte[byteCount];
 
-        int myNulls = NullMasks.PropagateBinary(left, right, mine);
+        int myNulls = NullMasks.PropagateBinary(left, right, mine, tier);
         int theirNulls = NullPropagation.PropagateBinary(left, right, theirs);
 
         Assert.Equal(theirNulls, myNulls);

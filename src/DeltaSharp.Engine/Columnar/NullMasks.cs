@@ -44,9 +44,17 @@ internal static class NullMasks
     /// <paramref name="input"/> and returns the null count. Byte-identical to
     /// <see cref="NullPropagation.PropagateUnary"/>.
     /// </summary>
+    /// <param name="tier">
+    /// Accepted for API symmetry with <see cref="PropagateBinary"/> and forwarded by the engine as
+    /// <see cref="NullMaskTier.Auto"/>; the unary path is a validity <see cref="BitmapOps.CopyValidity"/> /
+    /// <see cref="BitmapOps.FillValid"/> (no fused vector formula), so the selected tier only governs the
+    /// binary AND and Kleene kernels. The parameter keeps the entry points uniform for the tier-forcing
+    /// parity tests (#144).
+    /// </param>
     /// <exception cref="ArgumentException"><paramref name="output"/> is smaller than <c>ByteCount(input.Length)</c>.</exception>
-    public static int PropagateUnary(Validity input, Span<byte> output)
+    public static int PropagateUnary(Validity input, Span<byte> output, NullMaskTier tier = NullMaskTier.Auto)
     {
+        _ = tier;
         int length = input.Length;
         RequireOutput(output.Length, Bitmap.ByteCount(length));
         if (length == 0)
@@ -75,8 +83,9 @@ internal static class NullMasks
     /// validity bitmap and returns the null count. Byte-identical to
     /// <see cref="NullPropagation.PropagateBinary"/>.
     /// </summary>
+    /// <param name="tier">Forces the SIMD/scalar word tier of the underlying <see cref="BitmapOps.And"/>; default <see cref="NullMaskTier.Auto"/>.</param>
     /// <exception cref="ArgumentException">The operand lengths differ, or <paramref name="output"/> is too small.</exception>
-    public static int PropagateBinary(Validity left, Validity right, Span<byte> output)
+    public static int PropagateBinary(Validity left, Validity right, Span<byte> output, NullMaskTier tier = NullMaskTier.Auto)
     {
         int length = left.Length;
         RequireSameLength(length, right.Length, "operand validity");
@@ -99,7 +108,7 @@ internal static class NullMasks
         // Both present and byte-aligned: a single bytewise AND over the sliced buffers.
         if (left.HasBitmap && right.HasBitmap && leftAligned && rightAligned)
         {
-            BitmapOps.And(left.Bits.Slice(left.Offset >> 3), right.Bits.Slice(right.Offset >> 3), output, length);
+            BitmapOps.And(left.Bits.Slice(left.Offset >> 3), right.Bits.Slice(right.Offset >> 3), output, length, tier);
             return BitmapOps.CountNulls(output, length);
         }
 
@@ -128,6 +137,11 @@ internal static class NullMasks
     /// Kleene <c>AND</c> over bit-packed boolean operands, writing the output value and validity bitmaps
     /// and returning the null count. Per-lane equal to <see cref="NullPropagation.KleeneAnd(bool?, bool?)"/>.
     /// </summary>
+    /// <remarks>
+    /// The value/validity spans are read from bit <c>0</c> (offset-0, byte-aligned): a bit-unaligned boolean
+    /// slice must be materialized into a fresh offset-0 bitmap before calling. The optional
+    /// <paramref name="tier"/> forces the SIMD/scalar word width (default <see cref="NullMaskTier.Auto"/>).
+    /// </remarks>
     public static int KleeneAnd(
         ReadOnlySpan<byte> leftValues,
         ReadOnlySpan<byte> leftValidity,
@@ -135,14 +149,20 @@ internal static class NullMasks
         ReadOnlySpan<byte> rightValidity,
         Span<byte> resultValues,
         Span<byte> resultValidity,
-        int length)
+        int length,
+        NullMaskTier tier = NullMaskTier.Auto)
         => ApplyBinary<KleeneAndOperator>(
-            leftValues, leftValidity, rightValues, rightValidity, resultValues, resultValidity, length);
+            leftValues, leftValidity, rightValues, rightValidity, resultValues, resultValidity, length, tier);
 
     /// <summary>
     /// Kleene <c>OR</c> over bit-packed boolean operands, writing the output value and validity bitmaps
     /// and returning the null count. Per-lane equal to <see cref="NullPropagation.KleeneOr(bool?, bool?)"/>.
     /// </summary>
+    /// <remarks>
+    /// The value/validity spans are read from bit <c>0</c> (offset-0, byte-aligned): a bit-unaligned boolean
+    /// slice must be materialized into a fresh offset-0 bitmap before calling. The optional
+    /// <paramref name="tier"/> forces the SIMD/scalar word width (default <see cref="NullMaskTier.Auto"/>).
+    /// </remarks>
     public static int KleeneOr(
         ReadOnlySpan<byte> leftValues,
         ReadOnlySpan<byte> leftValidity,
@@ -150,21 +170,28 @@ internal static class NullMasks
         ReadOnlySpan<byte> rightValidity,
         Span<byte> resultValues,
         Span<byte> resultValidity,
-        int length)
+        int length,
+        NullMaskTier tier = NullMaskTier.Auto)
         => ApplyBinary<KleeneOrOperator>(
-            leftValues, leftValidity, rightValues, rightValidity, resultValues, resultValidity, length);
+            leftValues, leftValidity, rightValues, rightValidity, resultValues, resultValidity, length, tier);
 
     /// <summary>
     /// Kleene <c>NOT</c> over a bit-packed boolean operand: <c>out_valid = valid</c>,
     /// <c>out_value = valid &amp; ~value</c>. Per-lane equal to
     /// <see cref="NullPropagation.KleeneNot(bool?)"/>; returns the null count.
     /// </summary>
+    /// <remarks>
+    /// The value/validity spans are read from bit <c>0</c> (offset-0, byte-aligned): a bit-unaligned boolean
+    /// slice must be materialized into a fresh offset-0 bitmap before calling. The optional
+    /// <paramref name="tier"/> forces the SIMD/scalar word width (default <see cref="NullMaskTier.Auto"/>).
+    /// </remarks>
     public static int KleeneNot(
         ReadOnlySpan<byte> values,
         ReadOnlySpan<byte> validity,
         Span<byte> resultValues,
         Span<byte> resultValidity,
-        int length)
+        int length,
+        NullMaskTier tier = NullMaskTier.Auto)
     {
         int byteCount = Bitmap.ByteCount(length);
         RequireInput(values.Length, byteCount, "values");
@@ -182,7 +209,7 @@ internal static class NullMasks
         ref byte rOutValid = ref MemoryMarshal.GetReference(resultValidity);
 
         int i = 0;
-        if (Vector256.IsHardwareAccelerated)
+        if (NullMaskTierGate.UseVector256(tier))
         {
             for (; i <= byteCount - Vector256<byte>.Count; i += Vector256<byte>.Count)
             {
@@ -193,7 +220,7 @@ internal static class NullMasks
             }
         }
 
-        if (Vector128.IsHardwareAccelerated)
+        if (NullMaskTierGate.UseVector128(tier))
         {
             for (; i <= byteCount - Vector128<byte>.Count; i += Vector128<byte>.Count)
             {
@@ -204,12 +231,15 @@ internal static class NullMasks
             }
         }
 
-        for (; i <= byteCount - sizeof(ulong); i += sizeof(ulong))
+        if (NullMaskTierGate.UseWord(tier))
         {
-            ulong b = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb, i));
-            ulong v = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rv, i));
-            Unsafe.WriteUnaligned(ref Unsafe.Add(ref rOutValue, i), v & ~b);
-            Unsafe.WriteUnaligned(ref Unsafe.Add(ref rOutValid, i), v);
+            for (; i <= byteCount - sizeof(ulong); i += sizeof(ulong))
+            {
+                ulong b = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb, i));
+                ulong v = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rv, i));
+                Unsafe.WriteUnaligned(ref Unsafe.Add(ref rOutValue, i), v & ~b);
+                Unsafe.WriteUnaligned(ref Unsafe.Add(ref rOutValid, i), v);
+            }
         }
 
         for (; i < byteCount; i++)
@@ -310,7 +340,8 @@ internal static class NullMasks
         ReadOnlySpan<byte> rightValidity,
         Span<byte> resultValues,
         Span<byte> resultValidity,
-        int length)
+        int length,
+        NullMaskTier tier)
         where TOp : struct, IKleeneBinaryOperator
     {
         int byteCount = Bitmap.ByteCount(length);
@@ -333,7 +364,7 @@ internal static class NullMasks
         ref byte rOutValid = ref MemoryMarshal.GetReference(resultValidity);
 
         int i = 0;
-        if (Vector256.IsHardwareAccelerated)
+        if (NullMaskTierGate.UseVector256(tier))
         {
             for (; i <= byteCount - Vector256<byte>.Count; i += Vector256<byte>.Count)
             {
@@ -346,7 +377,7 @@ internal static class NullMasks
             }
         }
 
-        if (Vector128.IsHardwareAccelerated)
+        if (NullMaskTierGate.UseVector128(tier))
         {
             for (; i <= byteCount - Vector128<byte>.Count; i += Vector128<byte>.Count)
             {
@@ -359,14 +390,17 @@ internal static class NullMasks
             }
         }
 
-        for (; i <= byteCount - sizeof(ulong); i += sizeof(ulong))
+        if (NullMaskTierGate.UseWord(tier))
         {
-            TOp.Apply(
-                Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rbL, i)), Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rvL, i)),
-                Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rbR, i)), Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rvR, i)),
-                out ulong value, out ulong valid);
-            Unsafe.WriteUnaligned(ref Unsafe.Add(ref rOutValue, i), value);
-            Unsafe.WriteUnaligned(ref Unsafe.Add(ref rOutValid, i), valid);
+            for (; i <= byteCount - sizeof(ulong); i += sizeof(ulong))
+            {
+                TOp.Apply(
+                    Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rbL, i)), Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rvL, i)),
+                    Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rbR, i)), Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rvR, i)),
+                    out ulong value, out ulong valid);
+                Unsafe.WriteUnaligned(ref Unsafe.Add(ref rOutValue, i), value);
+                Unsafe.WriteUnaligned(ref Unsafe.Add(ref rOutValid, i), valid);
+            }
         }
 
         for (; i < byteCount; i++)

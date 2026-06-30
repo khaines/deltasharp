@@ -11,10 +11,25 @@ namespace DeltaSharp.Engine.Tests.Columnar;
 /// </summary>
 public class BitmapOpsTests
 {
-    // Lengths chosen to exercise empty, sub-byte, byte/vector boundaries, and the called-out
-    // non-byte-aligned tails (257, 1000). 1024/4096 exercise the wide SIMD path end-to-end.
+    // Lengths chosen to exercise empty, sub-byte, byte/vector boundaries, and the called-out tails:
+    // 257 is the true sub-byte tail (257 % 8 == 1), while 1000 is a *vector-width* tail — byte-aligned
+    // (1000 % 8 == 0) but 125 bytes leaves a sub-vector remainder below the 16/32-byte stride. 1024/4096
+    // exercise the wide SIMD path end-to-end.
     public static readonly TheoryData<int> Lengths =
         new() { 0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 255, 256, 257, 1000, 1024, 4096 };
+
+    /// <summary>
+    /// Lengths whose byte count is >= 32, so a forced <see cref="NullMaskTier.Vector256"/> loop body
+    /// (32-byte stride) executes at least once — including the sub-byte (257) and vector-width (1000) tails.
+    /// </summary>
+    public static readonly TheoryData<int> WideLengths =
+        new() { 256, 257, 320, 511, 512, 1000, 1024, 4096 };
+
+    /// <summary>The four explicitly-forced tiers (every tier except <see cref="NullMaskTier.Auto"/>).</summary>
+    private static readonly NullMaskTier[] ForcedTiers =
+    {
+        NullMaskTier.Scalar, NullMaskTier.Word, NullMaskTier.Vector128, NullMaskTier.Vector256,
+    };
 
     [Theory]
     [MemberData(nameof(Lengths))]
@@ -62,6 +77,33 @@ public class BitmapOpsTests
         }
 
         AssertCanonicalPadding(dest, length);
+    }
+
+    [Theory]
+    [MemberData(nameof(WideLengths))]
+    public void And_ForcedTierParity_EqualsPerBitAnd_OnAnyHost(int length)
+    {
+        // Finding #1: drive each tier explicitly so the portable Vector256 word loop (32-byte stride),
+        // which Auto constant-folds away on this arm64/NEON host, actually runs and is mutation-killable.
+        foreach (NullMaskTier tier in ForcedTiers)
+        {
+            var rng = new Random(unchecked(0x5A4D ^ length ^ ((int)tier << 16)));
+            int byteCount = Bitmap.ByteCount(length);
+            byte[] a = RandomBytes(rng, byteCount);
+            byte[] b = RandomBytes(rng, byteCount);
+            var dest = new byte[Math.Max(1, byteCount)];
+            Array.Fill(dest, (byte)0xAA);
+
+            BitmapOps.And(a, b, dest, length, tier);
+
+            for (int i = 0; i < length; i++)
+            {
+                bool expected = Bitmap.Get(a, i) && Bitmap.Get(b, i);
+                Assert.Equal(expected, Bitmap.Get(dest, i));
+            }
+
+            AssertCanonicalPadding(dest, length);
+        }
     }
 
     [Theory]
@@ -138,6 +180,45 @@ public class BitmapOpsTests
 
         long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
         Assert.True(allocated <= 64, $"hot path allocated {allocated} bytes (expected ~0)");
+    }
+
+    [Fact]
+    public void And_RejectsUndersizedSpans()
+    {
+        // Finding #3: the unchecked-Unsafe kernels self-guard their size precondition (fail fast with a
+        // clear ArgumentException) instead of reading or writing out of bounds.
+        var ok = new byte[Bitmap.ByteCount(64)]; // 8 bytes
+        var tooSmall = new byte[1];
+
+        Assert.Throws<ArgumentException>(() => BitmapOps.And(tooSmall, ok, new byte[8], 64));
+        Assert.Throws<ArgumentException>(() => BitmapOps.And(ok, tooSmall, new byte[8], 64));
+        Assert.Throws<ArgumentException>(() => BitmapOps.And(ok, ok, tooSmall, 64));
+    }
+
+    [Fact]
+    public void FillValid_RejectsUndersizedDestination()
+    {
+        var tooSmall = new byte[1];
+        Assert.Throws<ArgumentException>(() => BitmapOps.FillValid(tooSmall, 64)); // needs 8 bytes
+    }
+
+    [Fact]
+    public void CopyValidity_RejectsUndersizedSpans()
+    {
+        var ok = new byte[Bitmap.ByteCount(64)]; // 8 bytes
+        var tooSmall = new byte[1];
+
+        Assert.Throws<ArgumentException>(() => BitmapOps.CopyValidity(tooSmall, new byte[8], 64));
+        Assert.Throws<ArgumentException>(() => BitmapOps.CopyValidity(ok, tooSmall, 64));
+    }
+
+    [Fact]
+    public void PopCount_RejectsUndersizedInput()
+    {
+        var tooSmall = new byte[1];
+
+        Assert.Throws<ArgumentException>(() => BitmapOps.PopCount(tooSmall, 64)); // needs 8 bytes
+        Assert.Equal(0, BitmapOps.PopCount(tooSmall, 0)); // length 0 reads nothing -> no guard trip
     }
 
     private static int NaiveSetBits(ReadOnlySpan<byte> bits, int length)
