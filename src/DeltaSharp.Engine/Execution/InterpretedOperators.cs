@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using DeltaSharp.Engine.Execution.Expressions;
+using DeltaSharp.Engine.RowFormat;
 using DeltaSharp.Engine.Types;
 
 namespace DeltaSharp.Engine.Execution;
@@ -28,7 +29,8 @@ internal static class InterpretedOperators
 
     /// <summary>The operator kinds the interpreted streams can evaluate in v1 (FEAT-03.2 first slice).</summary>
     public static bool Supports(OperatorKind kind) =>
-        kind is OperatorKind.Scan or OperatorKind.Filter or OperatorKind.Project;
+        kind is OperatorKind.Scan or OperatorKind.Filter or OperatorKind.Project
+            or OperatorKind.Aggregate or OperatorKind.Sort or OperatorKind.Join or OperatorKind.ExchangeLocal;
 
     /// <summary>
     /// Opens <paramref name="op"/> as a pull-based stream, recursively opening children. Building the
@@ -48,6 +50,10 @@ internal static class InterpretedOperators
             InMemoryScanOperator scan => new InterpretedScanStream(scan, context),
             FilterOperator filter => OpenFilter(backendName, filter, context),
             ProjectOperator project => OpenProject(backendName, project, context),
+            AggregateOperator aggregate => OpenAggregate(backendName, aggregate, context),
+            SortOperator sort => OpenSort(backendName, sort, context),
+            JoinOperator join => OpenJoin(backendName, join, context),
+            ExchangeLocalOperator exchange => OpenExchangeLocal(backendName, exchange, context),
             ScanOperator => throw new UnsupportedOperatorException(
                 op.Kind,
                 backendName,
@@ -178,5 +184,154 @@ internal static class InterpretedOperators
                 $"Projection {index} reads column '{input[column.Ordinal].Name}' of type '{input[column.Ordinal].DataType.SimpleString}' "
                 + $"but output field '{output[index].Name}' is '{output[index].DataType.SimpleString}'.", nameof(column));
         }
+    }
+
+    private static IBatchStream OpenAggregate(string backendName, AggregateOperator aggregate, ExecutionContext context)
+    {
+        StructType input = aggregate.InputSchema(0);
+        StructType output = aggregate.OutputSchema;
+        int keyCount = aggregate.GroupingKeys.Count;
+
+        // Validate + build the grouping/aggregate machinery before opening the child, so a build-time
+        // UnsupportedOperatorException (e.g. a non-byte-sortable key, or AVG(decimal)) leaks no child.
+        RowKeyProjection? keyProjection = null;
+        if (keyCount > 0)
+        {
+            for (int k = 0; k < keyCount; k++)
+            {
+                DataType keyType = aggregate.GroupingKeys[k].Type;
+                if (!keyType.Equals(output[k].DataType))
+                {
+                    throw new ArgumentException(
+                        $"Grouping key {k} type '{keyType.SimpleString}' disagrees with output field "
+                        + $"'{output[k].Name}' of type '{output[k].DataType.SimpleString}'.", nameof(aggregate));
+                }
+            }
+
+            keyProjection = new RowKeyProjection(aggregate.GroupingKeys, input, backendName, OperatorKind.Aggregate);
+        }
+
+        var aggregators = new Aggregator[aggregate.Aggregates.Count];
+        var aggInputs = new ExpressionEvaluator?[aggregate.Aggregates.Count];
+        for (int i = 0; i < aggregate.Aggregates.Count; i++)
+        {
+            if (aggregate.Aggregates[i] is not AggregateExpression term)
+            {
+                throw new ArgumentException(
+                    $"Aggregate {i} must be an AggregateExpression but was '{aggregate.Aggregates[i].GetType().Name}'.",
+                    nameof(aggregate));
+            }
+
+            if (!term.Type.Equals(output[keyCount + i].DataType))
+            {
+                throw new ArgumentException(
+                    $"Aggregate {i} result type '{term.Type.SimpleString}' disagrees with output field "
+                    + $"'{output[keyCount + i].Name}' of type '{output[keyCount + i].DataType.SimpleString}'.", nameof(aggregate));
+            }
+
+            aggregators[i] = Aggregator.Create(term, backendName, OperatorKind.Aggregate);
+            aggInputs[i] = term.Input is null
+                ? null
+                : ExpressionEvaluators.Build(term.Input, input, backendName, OperatorKind.Aggregate);
+        }
+
+        IBatchStream child = Open(backendName, aggregate.Children[0], context);
+        return new InterpretedAggregateStream(aggregate, keyProjection, aggInputs, aggregators, child, context);
+    }
+
+    private static IBatchStream OpenSort(string backendName, SortOperator sort, ExecutionContext context)
+    {
+        StructType input = sort.InputSchema(0);
+        var keyExpressions = new PhysicalExpression[sort.SortOrders.Count];
+        var orderings = new SortKeyOrdering[sort.SortOrders.Count];
+        for (int i = 0; i < sort.SortOrders.Count; i++)
+        {
+            SortOrder order = sort.SortOrders[i];
+            keyExpressions[i] = order.Expression;
+            orderings[i] = new SortKeyOrdering(
+                order.Direction == SortDirection.Descending ? SortKeyDirection.Descending : SortKeyDirection.Ascending,
+                order.NullOrdering == NullOrdering.NullsLast ? NullSortOrder.NullsLast : NullSortOrder.NullsFirst);
+        }
+
+        // Build the keyed projection (with the requested per-key orderings) before opening the child.
+        var projection = new RowKeyProjection(keyExpressions, input, backendName, OperatorKind.Sort, orderings);
+        IBatchStream child = Open(backendName, sort.Children[0], context);
+        return new InterpretedSortStream(sort, projection, child, context);
+    }
+
+    private static IBatchStream OpenJoin(string backendName, JoinOperator join, ExecutionContext context)
+    {
+        StructType left = join.InputSchema(0);
+        StructType right = join.InputSchema(1);
+        StructType output = join.OutputSchema;
+
+        // The output schema must be left++right (inner/outer) or left-only (semi/anti); validate the
+        // shape and per-field types so a malformed plan fails fast at Open, not mid-stream.
+        if (join.JoinType is JoinType.LeftSemi or JoinType.LeftAnti)
+        {
+            if (output.Count != left.Count)
+            {
+                throw new ArgumentException(
+                    $"{join.JoinType} output must have {left.Count} left field(s) but has {output.Count}.", nameof(join));
+            }
+
+            RequireJoinTypes(output, 0, left, "left", join);
+        }
+        else
+        {
+            if (output.Count != left.Count + right.Count)
+            {
+                throw new ArgumentException(
+                    $"{join.JoinType} output must have {left.Count + right.Count} (left++right) field(s) but has {output.Count}.",
+                    nameof(join));
+            }
+
+            RequireJoinTypes(output, 0, left, "left", join);
+            RequireJoinTypes(output, left.Count, right, "right", join);
+        }
+
+        var leftKeys = new RowKeyProjection(join.LeftKeys, left, backendName, OperatorKind.Join);
+        var rightKeys = new RowKeyProjection(join.RightKeys, right, backendName, OperatorKind.Join);
+
+        IBatchStream probe = Open(backendName, join.Children[0], context);
+        IBatchStream build;
+        try
+        {
+            build = Open(backendName, join.Children[1], context);
+        }
+        catch
+        {
+            // The probe (left) child is already open; dispose it so a failed build-side open leaks nothing.
+            probe.Dispose();
+            throw;
+        }
+
+        return new InterpretedJoinStream(join, leftKeys, rightKeys, probe, build, context);
+    }
+
+    private static void RequireJoinTypes(StructType output, int outputStart, StructType side, string sideName, JoinOperator join)
+    {
+        for (int i = 0; i < side.Count; i++)
+        {
+            if (!output[outputStart + i].DataType.Equals(side[i].DataType))
+            {
+                throw new ArgumentException(
+                    $"Join output field {outputStart + i} of type '{output[outputStart + i].DataType.SimpleString}' "
+                    + $"disagrees with {sideName} input field {i} of type '{side[i].DataType.SimpleString}'.", nameof(join));
+            }
+        }
+    }
+
+    private static IBatchStream OpenExchangeLocal(string backendName, ExchangeLocalOperator exchange, ExecutionContext context)
+    {
+        StructType input = exchange.InputSchema(0);
+
+        // Build the partition-key projection (empty keys = round-robin, no projection) before the child.
+        RowKeyProjection? keys = exchange.PartitionKeys.Count > 0
+            ? new RowKeyProjection(exchange.PartitionKeys, input, backendName, OperatorKind.ExchangeLocal)
+            : null;
+
+        IBatchStream child = Open(backendName, exchange.Children[0], context);
+        return new InterpretedExchangeLocalStream(exchange, keys, child, context);
     }
 }
