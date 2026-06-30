@@ -122,6 +122,13 @@ for *all* backends (tolerance 0); ±∞/NaN propagate per IEEE, matching Spark.
   NaN, `MIN` ignores NaN unless **every** value is NaN, and a ±0 tie keeps the first-seen value. Hardware
   `min`/`max` instructions implement IEEE minNum/maxNum (NaN-ignoring, −0/+0 unordered), which **disagree** with
   Spark's order, so they are intentionally not used.
+  > **Input-normalization assumption.** Because `−0.0 == +0.0` is a *tie* and the kernel keeps the **first-seen**
+  > representation, a `MIN`/`MAX` over a column that still contains a raw `−0.0` can surface `−0.0` where Spark
+  > surfaces `+0.0`. This kernel deliberately does **not** canonicalize: Spark applies `NormalizeFloatNumbers`
+  > (−0.0 → +0.0, and NaN → a canonical NaN bit-pattern) **upstream**, in the expression/operator layer that feeds
+  > grouping and aggregation. These kernels assume that normalization has already happened on their input; emitting
+  > the canonical zero/NaN is the operator story's (#148) responsibility, not the kernel's. The forced-tier parity
+  > tests therefore assert *cross-tier* agreement on whatever bits arrive, not post-normalization canonicality.
 - **Decimal** (`MinDecimal`/`MaxDecimal`): scalar, exact cross-scale via `KernelScalars.CompareDecimal`.
 
 ### AVG

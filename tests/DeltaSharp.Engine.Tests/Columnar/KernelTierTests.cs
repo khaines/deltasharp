@@ -10,6 +10,7 @@ namespace DeltaSharp.Engine.Tests.Columnar;
 /// forcing values make a specific portable-vector body deterministically reachable for parity testing. The kernel
 /// result must be identical no matter which tier the guard selects.
 /// </summary>
+[Collection("KernelParity")]
 public class KernelTierTests
 {
     [Fact]

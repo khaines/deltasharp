@@ -11,6 +11,7 @@ namespace DeltaSharp.Engine.Tests.Columnar;
 /// and date↔timestamp promotion. Forced-tier theories make the Vector256 path reachable and mutation-killable on
 /// any host; the high-level entry points are checked on both the SIMD (no-null) and scalar (null/selection) shapes.
 /// </summary>
+[Collection("KernelParity")]
 public class ComparisonKernelsTests
 {
     public static TheoryData<int> Lengths => new(KernelTestSupport.Lengths);

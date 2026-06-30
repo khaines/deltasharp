@@ -11,6 +11,7 @@ namespace DeltaSharp.Engine.Tests.Columnar;
 /// in-test oracle, and the forced-tier theories make the Vector256 body reachable and mutation-killable even on
 /// an arm64 host where <see cref="KernelTier.Auto"/> folds it away.
 /// </summary>
+[Collection("KernelParity")]
 public class AggregateKernelsTests
 {
     public static TheoryData<int> Lengths => new(KernelTestSupport.Lengths);
@@ -209,9 +210,18 @@ public class AggregateKernelsTests
     [Fact]
     public void MinMaxDouble_NegativeZeroTiesPositiveZero()
     {
-        // −0.0 == +0.0 under Spark's order, so the first-seen extreme wins (no flip).
-        ColumnVector vector = KernelTestSupport.Double(new[] { 0.0, -0.0, 1.0 });
-        Assert.Equal(0.0, AggregateKernels.MinDouble(vector)!.Value);
+        // −0.0 == +0.0 under Spark's order, so the FIRST-SEEN extreme wins (no flip on a ±0 tie). Assert
+        // the exact BIT PATTERN, not numeric equality — Assert.Equal(0.0, …) cannot tell +0.0 from −0.0,
+        // so a tie-comparison regression (strict `<` → `<=`, or `>` → `>=`) would survive it. Cover MIN
+        // and MAX in both tie orderings.
+        static long Bits(double d) => BitConverter.DoubleToInt64Bits(d);
+        long posZero = Bits(0.0);   // 0x0000000000000000
+        long negZero = Bits(-0.0);  // unchecked((long)0x8000000000000000)
+
+        Assert.Equal(posZero, Bits(AggregateKernels.MinDouble(KernelTestSupport.Double(new[] { 0.0, -0.0, 1.0 }))!.Value));
+        Assert.Equal(negZero, Bits(AggregateKernels.MinDouble(KernelTestSupport.Double(new[] { -0.0, 0.0, 1.0 }))!.Value));
+        Assert.Equal(posZero, Bits(AggregateKernels.MaxDouble(KernelTestSupport.Double(new[] { 0.0, -0.0, -1.0 }))!.Value));
+        Assert.Equal(negZero, Bits(AggregateKernels.MaxDouble(KernelTestSupport.Double(new[] { -0.0, 0.0, -1.0 }))!.Value));
     }
 
     [Fact]
