@@ -168,15 +168,23 @@ public sealed class SparkSession : IDisposable
     public void Stop()
     {
         // Transition under _globalLock so a session being reused inside GetOrCreate's locked decision
-        // cannot be concurrently flipped to stopped (TOCTOU): GetOrCreate observes IsActive and Stop
+        // cannot be concurrently flipped to stopped (B2 TOCTOU): GetOrCreate observes IsActive and Stop
         // mutates _state under the same lock, making the reuse decision and the lifecycle transition
-        // mutually exclusive. Stop takes only _globalLock (never _gate), preserving the
-        // _globalLock -> _gate lock ordering. The fast-path readers (IsActive / EnsureNotStopped) stay
-        // lock-free via Volatile.Read; Interlocked.Exchange keeps that write visible and idempotent.
+        // mutually exclusive. Additionally, the state transition runs under the RuntimeConfig gate so it
+        // is mutually exclusive with Conf.Set's in-gate stopped-check + mutation (F1 TOCTOU): a Set that
+        // observes the session active under the gate cannot be stopped before it writes, and a Set
+        // sequenced after this transition sees the stopped state under the gate and throws. Lock order
+        // is strictly _globalLock -> _gate (never the inverse), so it is deadlock-free. The fast-path
+        // readers (IsActive / EnsureNotStopped) stay lock-free via Volatile.Read; Interlocked.Exchange
+        // keeps that write visible and idempotent.
         bool transitioned;
         lock (_globalLock)
         {
-            transitioned = Interlocked.Exchange(ref _state, StateStopped) != StateStopped;
+            lock (_conf.SyncRoot)
+            {
+                transitioned = Interlocked.Exchange(ref _state, StateStopped) != StateStopped;
+            }
+
             if (transitioned && ReferenceEquals(_defaultSession, this))
             {
                 _defaultSession = null;
@@ -292,6 +300,21 @@ public sealed class SparkSession : IDisposable
         foreach (KeyValuePair<string, string> option in options)
         {
             session._conf.SetInternal(option.Key, option.Value);
+        }
+    }
+
+    /// <summary>
+    /// Validates a typed configuration value at <see cref="RuntimeConfig.Set(string, string)"/> time
+    /// (fail-fast). For the execution-backend key the value is parsed eagerly so an invalid value
+    /// throws the same deterministic <see cref="ArgumentException"/> at set time that
+    /// <see cref="GetOrCreate"/> and the <see cref="ExecutionBackend"/> read raise, ensuring an invalid
+    /// backend can never be stored. Unconstrained keys are accepted unchanged.
+    /// </summary>
+    internal static void ValidateTypedConfigValue(string key, string value)
+    {
+        if (string.Equals(key, ExecutionBackendConfigKey, StringComparison.Ordinal))
+        {
+            _ = ParseExecutionBackend(value);
         }
     }
 

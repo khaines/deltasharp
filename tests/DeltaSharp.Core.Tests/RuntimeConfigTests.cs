@@ -87,4 +87,40 @@ public sealed class RuntimeConfigTests
 
         Assert.Throws<SessionStoppedException>(() => spark.Conf.Set("k", "v"));
     }
+
+    // ----- F2: invalid execution backend via runtime Conf.Set fails fast at set time -----
+
+    [Fact]
+    public void Set_ExecutionBackend_InvalidValue_ThrowsAtSetTime_NotDeferred()
+    {
+        const string backendKey = "spark.deltasharp.execution.backend";
+        using SparkSession spark = SparkSession.Builder().AppName("backend").GetOrCreate();
+
+        // Fail-fast: the ArgumentException must come from Set itself, before the value is stored —
+        // not deferred to the later ExecutionBackend read.
+        ArgumentException ex =
+            Assert.Throws<ArgumentException>(() => spark.Conf.Set(backendKey, "garbage"));
+        Assert.Contains("garbage", ex.Message, StringComparison.Ordinal);
+
+        // The invalid value was never persisted: the key keeps its absent/default state, and reading
+        // the backend still yields the default rather than re-throwing on a stored bad value.
+        Assert.False(spark.Conf.Contains(backendKey));
+        Assert.Equal(ExecutionBackend.Auto, spark.ExecutionBackend);
+    }
+
+    [Theory]
+    [InlineData("interpreted", ExecutionBackend.Interpreted)]
+    [InlineData("COMPILED", ExecutionBackend.Compiled)]
+    [InlineData("  Auto  ", ExecutionBackend.Auto)]
+    public void Set_ExecutionBackend_ValidValue_IsAcceptedCaseInsensitively(
+        string value, ExecutionBackend expected)
+    {
+        const string backendKey = "spark.deltasharp.execution.backend";
+        using SparkSession spark = SparkSession.Builder().AppName("backend").GetOrCreate();
+
+        spark.Conf.Set(backendKey, value);
+
+        Assert.Equal(value, spark.Conf.Get(backendKey));
+        Assert.Equal(expected, spark.ExecutionBackend);
+    }
 }

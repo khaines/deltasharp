@@ -79,6 +79,101 @@ public sealed class SparkSessionConcurrencyTests
         Assert.Equal(0, violations);
     }
 
+    // ----- F1: Conf.Set racing Stop must never mutate an already-stopped session (TOCTOU) -----
+
+    [Fact]
+    public void Set_RacingStop_NeverMutatesAStoppedSession()
+    {
+        // F1 fix: Conf.Set performs its stopped-check AND its dictionary write together under the
+        // RuntimeConfig gate, and Stop() performs its state transition under that SAME gate (inside
+        // _globalLock, preserving the _globalLock -> _gate order). The check+write is therefore atomic
+        // w.r.t. the stop transition: a Set that observes the session active under the gate cannot be
+        // stopped before it writes, and a Set sequenced after the transition sees STOPPED and throws.
+        //
+        // This test is fully DETERMINISTIC, not a probabilistic stress test. It uses the internal
+        // StopRaceProbe seam to pause the writer at the precise TOCTOU window (after the stopped-check,
+        // before the write) and drive a concurrent Stop on another thread. The seam reports whether the
+        // Stop was able to COMPLETE before the write:
+        //   * With the fix, the writer holds the gate while paused, so the racing Stop blocks on the
+        //     gate and cannot complete before the write -> the probe times out (stopBeforeWrite=false),
+        //     and the value the writer persists was written while the session was still active (legal).
+        //   * Without the fix (revert the in-gate re-check or Stop's gate acquisition), the writer holds
+        //     no gate while paused, so the Stop completes (stopBeforeWrite=true) and the writer then
+        //     writes onto an already-stopped session -> a violation.
+        // The oracle asserts the persisted state against write-time ordering, so it never
+        // false-positives on a legitimate write-then-stop.
+        const int iterations = 6;
+        const int probeTimeoutMs = 400;
+        const string raceKey = "race.key";
+
+        for (int i = 0; i < iterations; i++)
+        {
+            SparkSession.ClearActiveSession();
+            SparkSession.ClearDefaultSession();
+            SparkSession seed = SparkSession.Builder().AppName("set-race").GetOrCreate();
+
+            using var writerInWindow = new SemaphoreSlim(0, 1);
+            using var stopReleased = new SemaphoreSlim(0, 1);
+            int probeFired = 0;
+            bool stopCompletedBeforeWrite = false;
+
+            seed.Conf.StopRaceProbe = () =>
+            {
+                // Fire exactly once, for the raced write only.
+                if (Interlocked.Exchange(ref probeFired, 1) != 0)
+                {
+                    return;
+                }
+
+                writerInWindow.Release();                              // writer is now post-check, pre-write
+                stopCompletedBeforeWrite = stopReleased.Wait(probeTimeoutMs);
+            };
+
+            bool setThrew = false;
+            var writer = new Thread(() =>
+            {
+                try
+                {
+                    seed.Conf.Set(raceKey, "written-during-race");
+                }
+                catch (SessionStoppedException)
+                {
+                    setThrew = true;
+                }
+            });
+            var stopper = new Thread(() =>
+            {
+                writerInWindow.Wait();                                 // wait until writer is in the window
+                seed.Stop();                                           // races the in-flight Set
+                stopReleased.Release();                                // signal: Stop returned
+            });
+
+            writer.Start();
+            stopper.Start();
+            writer.Join();
+            stopper.Join();
+
+            seed.Conf.StopRaceProbe = null;
+
+            bool persisted = seed.Conf.Get(raceKey, null) is not null;
+
+            // Sanity: persistence and a thrown lifecycle error are mutually exclusive (only Set writes).
+            Assert.Equal(persisted, !setThrew);
+
+            // The violation: the racing Stop COMPLETED before the write, yet the value was still
+            // persisted onto the (now stopped) session. With the fix this is impossible because the
+            // writer holds the gate across check+write, so Stop cannot complete first.
+            Assert.False(
+                stopCompletedBeforeWrite && persisted,
+                "Conf.Set mutated an already-stopped session (Stop completed before the write).");
+
+            seed.Stop();
+        }
+
+        SparkSession.ClearActiveSession();
+        SparkSession.ClearDefaultSession();
+    }
+
     // ----- Active session is thread-local; default session is process-wide -----
 
     [Fact]

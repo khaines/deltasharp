@@ -109,7 +109,22 @@ session is stopped/disposed** — `Get`/`GetAll`/`Contains` return the last-know
 which mutates session state, **throws `SessionStoppedException` on a stopped/disposed session** (see
 [Lifecycle-error contract](#lifecycle-error-contract)). This keeps post-mortem diagnostics (e.g.
 reading `spark.app.name` of a session that was stopped) ergonomic while preventing meaningless
-mutation.
+mutation. `Set`'s stopped-check and its dictionary write are performed **together under the
+`RuntimeConfig` gate**, and `Stop()` performs its state transition under that **same** gate, so the
+check+write is atomic with respect to the stop transition — a concurrent `Stop` can never land
+*between* `Set`'s check and its write (closing the F1 TOCTOU window: a stopped session can never
+retain a value written by a `Set` that raced the stop). See
+[concurrency model](#active--and-default-session-tracking-concurrency-model).
+
+**Typed-key validation (fail-fast).** `Set` validates the value of *typed* configuration keys **at
+set time**, before the lifecycle check or any storage. Currently the execution-backend key
+`spark.deltasharp.execution.backend` is validated: an unrecognized value throws the same
+deterministic `ArgumentException` that `GetOrCreate` raises, so an invalid backend can **never** be
+stored (and therefore can never surface only later when `SparkSession.ExecutionBackend` is read). The
+`ExecutionBackend` property keeps its parse as the read-side guard; together they guarantee conf can
+only ever hold a parseable backend value. This mirrors the builder/`GetOrCreate` fail-fast path
+(parse-before-lock) so an invalid backend fails fast regardless of whether it arrives via the builder
+or a runtime `Conf.Set`.
 
 ## Lifecycle state machine
 
@@ -176,12 +191,21 @@ observed `IsActive == true` inside the lock cannot be concurrently transitioned 
 `GetOrCreate` returns it (closing the B2 TOCTOU window). The state flag itself is still **read**
 lock-free with `Volatile.Read` on the hot path (`IsActive` / `EnsureNotStopped`) and written with
 `Interlocked.Exchange` (keeping `Stop`/`Dispose` idempotent and the write immediately visible).
-`Stop()` takes **only** `_globalLock` (never `RuntimeConfig`'s `_gate`), preserving the
-`_globalLock → _gate` lock ordering so there is no deadlock; clearing this thread's active slot is a
-thread-local write needing no lock. `RuntimeConfig` is backed by a thread-safe map so concurrent
-`Conf` reads are safe. Because reuse now happens only on a still-active session held under the lock,
-the reuse path's `ApplyOptions` can never mutate a stopped session's conf inconsistently with public
-`Set` (which throws on a stopped session).
+
+`Stop()` additionally performs that state transition **under `RuntimeConfig`'s `_gate`** (acquired
+*inside* the `_globalLock` region), so the transition is mutually exclusive with `Conf.Set`'s in-gate
+stopped-check + write (closing the **F1 TOCTOU window**): a `Set` that observes the session active
+under `_gate` cannot be stopped before it writes, and a `Set` sequenced after the transition observes
+the stopped state under `_gate` and throws — a stopped session can never retain a raced `Set` value.
+The lock order is strictly **`_globalLock → _gate`** (never the inverse): `Stop` and `GetOrCreate`
+(via `ApplyOptions`/`SetInternal`) both take `_gate` only *after* `_globalLock`, and `Set`/the conf
+reads take `_gate` alone and never reach for `_globalLock` (`EnsureNotStopped` reads `_state`
+lock-free and only re-enters `_gate` reentrantly to read the app name on the throw path). With no
+`_gate → _globalLock` path anywhere, the ordering is acyclic and **deadlock-free**. Clearing this
+thread's active slot is a thread-local write needing no lock. `RuntimeConfig` is backed by a
+gate-guarded map so concurrent `Conf` reads are safe. Because reuse now happens only on a still-active
+session held under the lock, the reuse path's `ApplyOptions` can never mutate a stopped session's conf
+inconsistently with public `Set` (which throws on a stopped session).
 
 > **Deviation (documented):** Spark's active session is reset to the default on a thread once a
 > `getActiveSession` lookup is needed; DeltaSharp keeps the thread-local strictly explicit (only
@@ -281,8 +305,11 @@ user's choice**.
 (`Config("spark.deltasharp.execution.backend", "interpreted")`). `GetOrCreate` **validates** the
 value up front (parse-before-lock, unconditional, fail-fast — see
 [GetOrCreate algorithm](#getorcreate-algorithm)): an unrecognized value throws a deterministic
-`ArgumentException` from `GetOrCreate` naming the offending value and the allowed set. Absent the key,
-the default is `ExecutionBackend.Auto`.
+`ArgumentException` from `GetOrCreate` naming the offending value and the allowed set. A runtime
+`Conf.Set("spark.deltasharp.execution.backend", …)` is validated identically **at set time** (see
+[Runtime configuration](#runtime-configuration-runtimeconfig--conf)): an invalid value throws the same
+`ArgumentException` immediately and is never stored, so the key can only ever hold a parseable value
+regardless of how it was supplied. Absent the key, the default is `ExecutionBackend.Auto`.
 
 **`SparkSession.ExecutionBackend` is derived from conf — never a construction-time cache.** The
 property parses the *current* `spark.deltasharp.execution.backend` conf value on each (cold-path)
@@ -321,8 +348,8 @@ Tests live in `tests/DeltaSharp.Core.Tests/SparkSessionTests.cs` (+
 | **AC1** | Builder app name + key/value config; `GetOrCreate` returns a usable session exposing the values **without executing**. | `Builder_AppNameAndConfig_AreExposedThroughConf`; `GetOrCreate_ReturnsUsableActiveSession_WithoutExecuting`; `Builder_ConfigOverloads_StoreInvariantStrings`; `Core_ReferencesNoEngineAssembly_SoNoQueryWorkIsPossible` (instrumented no-work) |
 | **AC2** | Existing active session + equivalent config → **same** active session; config applied to its runtime conf. | `GetOrCreate_WithActiveSession_ReturnsSameInstance`; `GetOrCreate_AppliesNewConfig_ToExistingSession`; `GetActiveSession_AfterGetOrCreate_ReturnsCreatedSession`; `ActiveSession_IsThreadLocal_WhileDefaultIsProcessWide`; `RepeatedGetOrCreateStopCycles_LeaveNoStaticStateLeak` |
 | **AC3** | Stopped/disposed session: `Read`/`Sql`/`CreateDataFrame` → deterministic lifecycle error. | `Read_OnStoppedSession_ThrowsSessionStopped`; `Sql_OnStoppedSession_ThrowsSessionStopped`; `Read_OnDisposedSession_ThrowsSessionStopped`; `Sql_OnDisposedSession_ThrowsSessionStopped`; `CreateDataFrame_OnStoppedSession_ThrowsSessionStopped`; `CreateDataFrame_OnDisposedSession_ThrowsSessionStopped`; `SessionStopped_Message_IsDeterministicAndNamesApp`; `Read_OnActiveSession_ThrowsNotSupported_NotLifecycle`; `CreateDataFrame_OnActiveSession_ThrowsNotSupported_NotLifecycle` |
-| **AC4** | Backend config recorded at creation for later execution **without initializing work**; the recorded value never diverges from conf. | `ExecutionBackend_DefaultsToAuto`; `Config_ExecutionBackend_Interpreted_IsRecorded`; `Config_ExecutionBackend_IsCaseInsensitive`; `Config_ExecutionBackend_InvalidValue_ThrowsAtGetOrCreate`; `Config_ExecutionBackend_InvalidValue_OnReusePath_ThrowsAtGetOrCreate`; `GetOrCreate_RecordsBackend_WithoutTouchingEngine`; `GetOrCreate_ReuseChangingBackend_KeepsExecutionBackendAndConfInAgreement`; `ExecutionBackend_ReflectsConfSet_AfterCreation`; `GetOrCreate_RecordingBackend_HasNoSideEffectBeyondConfigStorage`; `CreateDataFrame_OnActiveSession_DoesNotEnumerateItsInput` (instrumented no-work) |
-| Lifecycle | Stop/Dispose idempotent; clears active/default; Conf read-after-stop; Conf.Set-after-stop throws; B2 Stop/GetOrCreate race is TOCTOU-free. | `Stop_IsIdempotent`; `Dispose_StopsSession`; `Stop_ClearsActiveAndDefault`; `Conf_ReadsRemainValid_AfterStop`; `Conf_Set_AfterStop_ThrowsSessionStopped`; `Set_Double_AfterStop_ThrowsSessionStopped`; `ActiveSession_SetClear_RoundTrips`; `GetOrCreate_RacingStop_NeverReusesAStoppedSession` (concurrency stress) |
+| **AC4** | Backend config recorded at creation for later execution **without initializing work**; the recorded value never diverges from conf. | `ExecutionBackend_DefaultsToAuto`; `Config_ExecutionBackend_Interpreted_IsRecorded`; `Config_ExecutionBackend_IsCaseInsensitive`; `Config_ExecutionBackend_InvalidValue_ThrowsAtGetOrCreate`; `Config_ExecutionBackend_InvalidValue_OnReusePath_ThrowsAtGetOrCreate`; `GetOrCreate_RecordsBackend_WithoutTouchingEngine`; `GetOrCreate_ReuseChangingBackend_KeepsExecutionBackendAndConfInAgreement`; `ExecutionBackend_ReflectsConfSet_AfterCreation`; `Set_ExecutionBackend_InvalidValue_ThrowsAtSetTime_NotDeferred` (F2 fail-fast); `Set_ExecutionBackend_ValidValue_IsAcceptedCaseInsensitively` (F2); `GetOrCreate_RecordingBackend_HasNoSideEffectBeyondConfigStorage`; `CreateDataFrame_OnActiveSession_DoesNotEnumerateItsInput` (instrumented no-work) |
+| Lifecycle | Stop/Dispose idempotent; clears active/default; Conf read-after-stop; Conf.Set-after-stop throws; B2 Stop/GetOrCreate race is TOCTOU-free; F1 Stop/Conf.Set race is TOCTOU-free. | `Stop_IsIdempotent`; `Dispose_StopsSession`; `Stop_ClearsActiveAndDefault`; `Conf_ReadsRemainValid_AfterStop`; `Conf_Set_AfterStop_ThrowsSessionStopped`; `Set_Double_AfterStop_ThrowsSessionStopped`; `ActiveSession_SetClear_RoundTrips`; `GetOrCreate_RacingStop_NeverReusesAStoppedSession` (B2 concurrency stress); `Set_RacingStop_NeverMutatesAStoppedSession` (F1 deterministic interleaving) |
 
 ## API governance & lifecycle posture
 

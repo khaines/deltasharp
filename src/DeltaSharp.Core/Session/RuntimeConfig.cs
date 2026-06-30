@@ -37,6 +37,18 @@ public sealed class RuntimeConfig
     private readonly Dictionary<string, string> _values;
     private readonly object _gate = new();
 
+    /// <summary>
+    /// Test-only deterministic interleaving seam, invoked by <see cref="Set(string, string)"/> after
+    /// its stopped-check has passed and immediately before the dictionary write. <see langword="null"/>
+    /// (and therefore inert) in production. It exists so the F1 TOCTOU concurrency test can force the
+    /// exact dangerous interleaving — pause a writer between the stopped-check and the write, drive a
+    /// concurrent <see cref="SparkSession.Stop"/>, and observe whether the stop was able to complete
+    /// before the write. With the fix the seam runs <i>under the gate</i>, so a racing <c>Stop</c>
+    /// (which needs the same gate) cannot complete before the write; without the fix it can, exposing
+    /// the stopped-session mutation. See <c>SparkSessionConcurrencyTests</c>.
+    /// </summary>
+    internal volatile Action? StopRaceProbe;
+
     internal RuntimeConfig(SparkSession session, IReadOnlyDictionary<string, string> initial)
     {
         _session = session;
@@ -46,6 +58,16 @@ public sealed class RuntimeConfig
             _values[pair.Key] = pair.Value;
         }
     }
+
+    /// <summary>
+    /// The monitor guarding the value map. Exposed to the owning <see cref="SparkSession"/> so that
+    /// <see cref="SparkSession.Stop"/> can perform its lifecycle state transition under this same gate
+    /// (inside <c>_globalLock</c>, preserving the strict <c>_globalLock → _gate</c> lock order), making
+    /// the transition mutually exclusive with <see cref="Set(string, string)"/>'s in-gate
+    /// stopped-check + mutation. This closes the F1 TOCTOU window where a concurrent <c>Stop</c> could
+    /// land between <c>Set</c>'s stopped-check and its dictionary write.
+    /// </summary>
+    internal object SyncRoot => _gate;
 
     /// <summary>Gets the value of the configuration key.</summary>
     /// <param name="key">The configuration key.</param>
@@ -107,17 +129,50 @@ public sealed class RuntimeConfig
     }
 
     /// <summary>Sets a string configuration value on the live session.</summary>
+    /// <remarks>
+    /// <para>
+    /// The stopped-check and the dictionary write happen together under the configuration gate so they
+    /// are <b>atomic</b> with respect to <see cref="SparkSession.Stop"/> (which takes the same gate for
+    /// its state transition). A <c>Set</c> that observes the session active under the gate cannot be
+    /// concurrently stopped before it writes; a <c>Set</c> sequenced after the stop transition observes
+    /// the stopped state under the gate and throws — so a stopped session can never retain a raced
+    /// value (closes the F1 TOCTOU window).
+    /// </para>
+    /// <para>
+    /// <b>Typed-key validation (fail-fast).</b> When <paramref name="key"/> is a typed configuration
+    /// key whose value is constrained — currently the execution-backend key
+    /// <c>spark.deltasharp.execution.backend</c> — the value is parsed and validated <i>at set time</i>
+    /// and an invalid value throws <see cref="System.ArgumentException"/> immediately, before anything
+    /// is stored. This keeps an invalid backend from ever being persisted (so it can never surface only
+    /// later when <see cref="SparkSession.ExecutionBackend"/> is read); the property's parse remains the
+    /// read-side guard. Validation runs before the lifecycle check, matching the builder/<c>GetOrCreate</c>
+    /// fail-fast path.
+    /// </para>
+    /// </remarks>
     /// <param name="key">The configuration key.</param>
     /// <param name="value">The value to store.</param>
     /// <exception cref="ArgumentNullException"><paramref name="key"/> or <paramref name="value"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="key"/> is a typed configuration key and <paramref name="value"/> is invalid for it
+    /// (for example an unrecognized <c>spark.deltasharp.execution.backend</c> value).
+    /// </exception>
     /// <exception cref="SessionStoppedException">The owning session has been stopped or disposed.</exception>
     public void Set(string key, string value)
     {
         ArgumentNullException.ThrowIfNull(key);
         ArgumentNullException.ThrowIfNull(value);
-        _session.EnsureNotStopped("Conf.Set");
+
+        // Fail-fast: reject an invalid typed value (e.g. a bad execution backend) at set time, before
+        // the lifecycle check or any storage, so the invalid value can never be persisted.
+        SparkSession.ValidateTypedConfigValue(key, value);
+
         lock (_gate)
         {
+            // Re-check inside the gate, immediately before mutating: Stop() transitions the session
+            // state under this same gate, so observing the session active here guarantees it cannot be
+            // stopped before the write below completes (F1 atomicity).
+            _session.EnsureNotStopped("Conf.Set");
+            StopRaceProbe?.Invoke();
             _values[key] = value;
         }
     }
