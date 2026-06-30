@@ -62,9 +62,14 @@ control STORY-03.2.2 (#148) / #359 hardened and this story completes.
 > `ColumnVectors.Create(..., OutputBatchRows)`), so a wide-schema operator allocates
 > `schema-width × ~8–12 KB` of scaffolding before any reservation. This is **bounded and predictable**
 > (schema-width × a fixed 1024-row cap, known at plan time — not the unbounded per-payload class #359
-> demonstrated) and is **GC-released between pulls** (one in-flight chunk per operator), but it is a
-> deliberate exception to the bound: reserving it correctly is an output-batch-sizing / admission decision
-> (right-size vs. eagerly fail-close a small-budget query) tracked in
+> demonstrated). Its lifetime differs by operator shape: the **streaming** operators (filter, project,
+> exchange) and the join's **output** chunk hold one in-flight chunk that is released/replaced each pull,
+> whereas the **pipeline breakers** hold a fixed-capacity buffer for the operator's whole lifetime — the
+> sort buffer (`InterpretedSortStream` `_buffer`), the join **build** columns (`_buildColumns`), and the
+> aggregate key/agg result columns (`_keyColumns`/`_aggColumns`) are freed only at `Dispose` (these
+> build/result buffers are exactly what #365's repro targets). Either way it is a **deliberate exception**
+> to the bound: reserving it correctly is an output-batch-sizing / admission decision (right-size vs.
+> eagerly fail-close a small-budget query) tracked in
 > [#365](https://github.com/khaines/deltasharp/issues/365), alongside the #156 spill / output-sizing work.
 
 | Operator | Reserve-before-allocate site | What is reserved |
