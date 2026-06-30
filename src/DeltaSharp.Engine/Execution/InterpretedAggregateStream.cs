@@ -122,6 +122,8 @@ internal sealed class InterpretedAggregateStream : IBatchStream
         // A blocking operator holds its accumulator/result reservation for its whole lifetime (the
         // result rows are live until the consumer finishes draining), so release happens here. MIN/MAX
         // over string/binary also reserves its retained best value's true length; release that too.
+        // Each reservation is released exactly once: the over-release-throwing budget ledger would
+        // throw if any byte were released twice, and the _disposed guard makes Dispose idempotent.
         foreach (Aggregator aggregator in _aggregators)
         {
             aggregator.Release();
@@ -133,6 +135,7 @@ internal sealed class InterpretedAggregateStream : IBatchStream
             _reservedBytes = 0;
         }
 
+        _metrics.ObserveRelease(0);
         _input.Dispose();
     }
 
@@ -157,7 +160,8 @@ internal sealed class InterpretedAggregateStream : IBatchStream
             _aggColumns[a] = ColumnVectors.Create(Schema[_keyCount + a].DataType, OutputBatchRows);
         }
 
-        // A global (no-key) aggregate has exactly one group even over empty input.
+        // A global (no-key) aggregate has exactly one group even over empty input. It uses no hash
+        // table, so it is charged state + output only (no per-entry collection overhead).
         if (_keyEncoder is null)
         {
             Reserve(_stateBytesPerGroup + _outputBytesPerGroup);
@@ -177,8 +181,10 @@ internal sealed class InterpretedAggregateStream : IBatchStream
             ConsumeBatch(input);
 
             // MIN/MAX over string/binary grows its reservation inside Accumulate (not via Reserve),
-            // so observe peak after each batch to capture that growth.
-            _metrics.ObservePeakMemory(_reservedBytes + AggregatorReservedBytes());
+            // so observe peak after each batch to capture that growth and refresh current-reserved.
+            long total = _reservedBytes + AggregatorReservedBytes();
+            _metrics.ObservePeakMemory(total);
+            _metrics.ObserveRelease(total);
             _metrics.AddElapsedNanos(InterpretedOperators.ElapsedNanos(start));
         }
 
@@ -201,6 +207,7 @@ internal sealed class InterpretedAggregateStream : IBatchStream
 
             for (int r = 0; r < rows; r++)
             {
+                CancellationPolicy.Poll(_cancellationToken, r);
                 int group = keyVectors is null ? 0 : ResolveGroup(keyVectors, r);
                 for (int a = 0; a < _aggregators.Length; a++)
                 {
@@ -224,8 +231,10 @@ internal sealed class InterpretedAggregateStream : IBatchStream
             return existing;
         }
 
-        // Reserve before mutating any state so a refusal leaves the build consistent.
-        Reserve(_stateBytesPerGroup + _outputBytesPerGroup + encoded.Length);
+        // Reserve before mutating any state so a refusal leaves the build consistent. The hash-table
+        // entry overhead (deferral (a)) is charged once per newly discovered group on top of the state,
+        // output, and key bytes, so the reserved figure bounds the real peak in bytes.
+        Reserve(_stateBytesPerGroup + _outputBytesPerGroup + encoded.Length + RowSizeEstimate.HashTableEntryBytes);
         int group = _groupCount++;
         foreach (Aggregator aggregator in _aggregators)
         {
@@ -254,9 +263,20 @@ internal sealed class InterpretedAggregateStream : IBatchStream
         for (int a = 0; a < _aggregators.Length; a++)
         {
             MutableColumnVector destination = _aggColumns[a];
+            bool variableWidth = destination.Type is StringType or BinaryType;
             for (int group = 0; group < _groupCount; group++)
             {
                 _aggregators[a].Emit(group, destination);
+
+                // Output var-width accounting (deferral (c)): the emitted MIN/MAX value is copied into
+                // the output column, a real allocation the flat per-group estimate does not cover. Charge
+                // its true byte length for symmetry with the input-side retention charge, so the bound
+                // holds in bytes. The value's length is only known post-fold; a refusal disposes the
+                // stream, releasing everything.
+                if (variableWidth)
+                {
+                    Reserve(RowSizeEstimate.VariableWidthBytes(destination, group));
+                }
             }
         }
 
@@ -282,7 +302,7 @@ internal sealed class InterpretedAggregateStream : IBatchStream
         }
 
         _reservedBytes += bytes;
-        _metrics.ObservePeakMemory(_reservedBytes + AggregatorReservedBytes());
+        _metrics.ObserveReservation(_reservedBytes + AggregatorReservedBytes());
     }
 
     private long AggregatorReservedBytes()

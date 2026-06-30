@@ -157,6 +157,7 @@ internal sealed class InterpretedFilterStream : IBatchStream
             {
                 for (int i = 0; i < values.Length; i++)
                 {
+                    CancellationPolicy.Poll(_cancellationToken, i);
                     if (values[i] && !column.IsNull(i))
                     {
                         buffer[passing++] = i;
@@ -167,6 +168,7 @@ internal sealed class InterpretedFilterStream : IBatchStream
             {
                 for (int i = 0; i < values.Length; i++)
                 {
+                    CancellationPolicy.Poll(_cancellationToken, i);
                     if (values[i])
                     {
                         buffer[passing++] = i;
@@ -181,6 +183,7 @@ internal sealed class InterpretedFilterStream : IBatchStream
             bool hasNulls = view.HasNulls;
             for (int i = 0; i < view.Length; i++)
             {
+                CancellationPolicy.Poll(_cancellationToken, i);
                 if ((!hasNulls || !view.IsNull(i)) && view.GetValue<bool>(i))
                 {
                     buffer[passing++] = i;
@@ -206,6 +209,7 @@ internal sealed class InterpretedFilterStream : IBatchStream
             int passing = 0;
             for (int i = 0; i < predicate.Length; i++)
             {
+                CancellationPolicy.Poll(_cancellationToken, i);
                 if ((!hasNulls || !predicate.IsNull(i)) && predicate.GetValue<bool>(i))
                 {
                     buffer[passing++] = i;
@@ -235,7 +239,7 @@ internal sealed class InterpretedFilterStream : IBatchStream
         }
 
         _reservedBytes += bytes;
-        _metrics.ObservePeakMemory(_reservedBytes);
+        _metrics.ObserveReservation(_reservedBytes);
     }
 
     private void ReleaseReservation()
@@ -244,6 +248,7 @@ internal sealed class InterpretedFilterStream : IBatchStream
         {
             _memory.Release(_reservedBytes);
             _reservedBytes = 0;
+            _metrics.ObserveRelease(_reservedBytes);
         }
     }
 }

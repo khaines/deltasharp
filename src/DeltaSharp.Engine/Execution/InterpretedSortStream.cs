@@ -111,6 +111,7 @@ internal sealed class InterpretedSortStream : IBatchStream
             _bufferReserved = 0;
         }
 
+        _metrics.ObserveRelease(0);
         _input.Dispose();
     }
 
@@ -162,12 +163,17 @@ internal sealed class InterpretedSortStream : IBatchStream
 
             for (int r = 0; r < rows; r++)
             {
+                CancellationPolicy.Poll(_cancellationToken, r);
                 byte[] key = _sortKeys.Encode(keyVectors, r, out _);
 
                 // Reserve before storing the row so a refusal leaves the buffer consistent. The
                 // var-width term charges the TRUE byte length of every buffered string/binary column
-                // (not the flat 16-byte estimate), so a wide payload cannot bypass the budget.
-                ReserveBuffer(_rowBytes + key.Length + RowSizeEstimate.VariableWidthBytes(columns, r));
+                // (not the flat 16-byte estimate), so a wide payload cannot bypass the budget. The
+                // permutation-entry term (deferral (a)) charges this row's slot in the _order int[]
+                // (allocated once after the build) so the sort's transient arrays are bounded in bytes.
+                ReserveBuffer(
+                    _rowBytes + key.Length + RowSizeEstimate.VariableWidthBytes(columns, r)
+                    + RowSizeEstimate.PermutationEntryBytes);
                 _keys.Add(key);
                 for (int c = 0; c < columnCount; c++)
                 {
@@ -212,7 +218,7 @@ internal sealed class InterpretedSortStream : IBatchStream
         }
 
         _bufferReserved += bytes;
-        _metrics.ObservePeakMemory(_bufferReserved + _chunkReserved);
+        _metrics.ObserveReservation(_bufferReserved + _chunkReserved);
     }
 
     private void ReserveChunk(long bytes)
@@ -230,7 +236,7 @@ internal sealed class InterpretedSortStream : IBatchStream
         }
 
         _chunkReserved += bytes;
-        _metrics.ObservePeakMemory(_bufferReserved + _chunkReserved);
+        _metrics.ObserveReservation(_bufferReserved + _chunkReserved);
     }
 
     private void ReleaseChunkReservation()
@@ -239,6 +245,7 @@ internal sealed class InterpretedSortStream : IBatchStream
         {
             _memory.Release(_chunkReserved);
             _chunkReserved = 0;
+            _metrics.ObserveRelease(_bufferReserved + _chunkReserved);
         }
     }
 }
