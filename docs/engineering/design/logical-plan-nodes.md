@@ -60,7 +60,7 @@ Options evaluated:
 | --- | --- | --- |
 | **(a) IR + type/schema model in Core** | Plan IR as `internal` Core types; a `net8.0;net10.0`-compatible **public** type/schema model also in Core; Engine's internal ADR-0008 model is mapped to it at the physical bridge (#174). | **Chosen.** Matches repository-layout.md (Core owns the logical plans), keeps one IR, zero new projects, and reuses the auto-wired `InternalsVisibleTo` to `DeltaSharp.Core.Tests`. |
 | (b) New `net8.0;net10.0` IR project | A separate `DeltaSharp.Plans`/`DeltaSharp.Abstractions` assembly. | Rejected for M1. repository-layout.md lists `DeltaSharp.Abstractions` only as an *"if needed"* future seam; an extra packable/governed assembly is unjustified churn while the IR is `internal` and Core already multi-targets correctly. Revisit if the IR must be shared with a non-Core packable assembly. |
-| (c) IR in Engine | Co-locate with the ADR-0008 types. | Rejected. Engine is `net10.0`-only; Core's `net8.0` public API (`DataFrame.Plan`, `Explain`) could never reference it. Violates the TFM rule. |
+| (c) IR in Engine | Co-locate with the ADR-0008 types. | Rejected. Engine is `net10.0`-only; Core's `net8.0` public API (`DataFrame.Plan`, `Explain` — both **forward-looking**: the M1 `DataFrame` is a minimal plan holder and these surfaces arrive in FEAT-04.1/04.7) could never reference it. Violates the TFM rule. |
 
 ### 1.2 The type/schema-model seam (scope boundary)
 
@@ -119,6 +119,7 @@ Because the IR is plain, immutable, Engine-free data:
 src/DeltaSharp.Core/Plans/
   TreeNode.cs                     internal abstract class TreeNode<TNode>
   PlanHash.cs                     internal deterministic FNV-1a hashing for the IR
+  PlanDepthExceededException.cs   internal typed exception for the depth guard
   DataFrame.cs                    internal sealed class DataFrame (minimal M1 plan holder)
   Expressions/
     Expression.cs                 internal abstract class Expression : TreeNode<Expression>
@@ -162,11 +163,12 @@ derive from it.
 | `string NodeName` | abstract get | The Catalyst node name (e.g. `"Project"`), a constant per node — no reflection. |
 | `string SimpleString` | abstract get | One-line description of **this** node including its inline expression/descriptor arguments but **excluding** child plans (children render as their own tree lines). Prefixed with `'` when the node is not resolved. |
 | `TNode WithNewChildren(IReadOnlyList<TNode> newChildren)` | abstract | Rebuild this node with the supplied children (same count and positions), copying all non-child state. The only constructor-equivalent the transforms use. |
-| `TNode MapChildren(Func<TNode,TNode> f)` | sealed | Apply `f` to each child. Returns **`this`** (same reference) when no child changed (reference-equal); otherwise a new node via `WithNewChildren`. This is the structural-sharing primitive. |
-| `TNode TransformDown(Func<TNode,TNode> rule)` | sealed | Apply `rule` to this node, then recurse into the (possibly new) node's children. Pre-order. |
-| `TNode TransformUp(Func<TNode,TNode> rule)` | sealed | Recurse into children first, then apply `rule` to the rebuilt node. Post-order. |
-| `string TreeString()` | sealed | Multi-line, indented render of the whole subtree (§6). |
-| `bool Equals(TNode?)` / `Equals(object?)` / `GetHashCode()` | mixed | Structural value equality and a deterministic hash (§4.3). |
+| `int Depth` | get | The cached nesting depth: `1` for a leaf, else `1 + max(child depths)`. Computed once at construction (children's depths are themselves cached → O(1) per node) and used by the **construction-time depth guard**: the base constructor throws `PlanDepthExceededException` when `Depth > MaxDepth` (`= 1000`), bounding the recursive traversals (equality, hashing, transforms, rendering) and closing a `StackOverflow` DoS. |
+| `TNode MapChildren(Func<TNode,TNode> f)` | non-virtual | Apply `f` to each child. Returns **`this`** (same reference) when no child changed (reference-equal); otherwise a new node via `WithNewChildren`. This is the structural-sharing primitive. |
+| `TNode TransformDown(Func<TNode,TNode> rule)` | non-virtual | Apply `rule` to this node, then recurse into the (possibly new) node's children. Pre-order. |
+| `TNode TransformUp(Func<TNode,TNode> rule)` | non-virtual | Recurse into children first, then apply `rule` to the rebuilt node. Post-order. |
+| `string TreeString()` | non-virtual | Multi-line, indented render of the whole subtree (§6). |
+| `bool Equals(TNode?)` / `Equals(object?)` / `GetHashCode()` | mixed | Structural value equality and a deterministic, **memoized** hash (§4.3). |
 | `protected abstract bool NodeEquals(TNode other)` | abstract | Compare this node's **own** (non-child) state to another node of the **same concrete type**. |
 | `protected abstract int NodeHashCode()` | abstract | Deterministic hash of this node's **own** (non-child) state. |
 
@@ -215,6 +217,21 @@ Core) so hashes are **process-independent**; collisions are correctness-preservi
 `Equals` decides equality. Equality lets tests assert *"the original plan's content is
 unchanged"* by comparing the post-transform original against a pre-transform snapshot.
 
+Because nodes are immutable, the hash is **memoized** (computed once, cached in a field) — a
+benign race merely recomputes the same number — and `LogicalPlan.Resolved`/`Expression.Resolved`
+are memoized the same way, so repeated planning passes do not pay the O(n) walk each time. A
+pinned **golden hash** of a fixed sample plan (asserted equal across both TFMs and across
+processes) guards the determinism contract.
+
+**Recursion-depth guard.** `Equals`, `GetHashCode`, `TransformDown`/`TransformUp`, and
+`TreeString` recurse over the tree. To stop an adversarially deep tree (~thousands of nested
+nodes) from triggering an uncatchable `StackOverflowException` (and to bound the O(depth²)
+`TreeString` cost), each node computes and caches its `Depth` at construction and the base
+constructor throws `PlanDepthExceededException` when `Depth` exceeds `TreeNode<T>.MaxDepth`
+(`= 1000`). The limit is generous (M1 plans are a handful of nodes deep) yet well below the
+stack-overflow point. Converting the traversals to iterative form to drop the cap is tracked in
+[#376](https://github.com/khaines/deltasharp/issues/376) (§9).
+
 ---
 
 ## 5. The expression seam (for STORY-04.4.2 / #168)
@@ -252,14 +269,35 @@ unresolved until the analyzer (FEAT-04.5) replaces them — never during constru
 internal abstract class LogicalPlan : TreeNode<LogicalPlan>
 {
     public abstract IReadOnlyList<Expression> Expressions;   // expressions held directly
-    public virtual bool Resolved =>
+    public virtual bool Resolved =>                           // memoized
         Children.All(c => c.Resolved) && Expressions.All(e => e.Resolved);
+
+    // Expression-rewrite substrate (symmetric with the child-rewrite substrate on TreeNode<T>):
+    public abstract LogicalPlan WithNewExpressions(IReadOnlyList<Expression> newExpressions);
+    public LogicalPlan MapExpressions(Func<Expression,Expression> f);               // no-op ⇒ this
+    public LogicalPlan TransformExpressionsDown(Func<Expression,Expression> rule);  // pre-order
+    public LogicalPlan TransformExpressionsUp(Func<Expression,Expression> rule);    // post-order
 }
 ```
 
 `SimpleString` for a plan is `(Resolved ? "" : "'") + NodeName + <node args>`, where
 `<node args>` inlines the node's expressions/descriptors but **not** its child plans. Each node
-overrides `WithNewChildren`, `NodeEquals`, `NodeHashCode`, `Expressions`, and `SimpleString`.
+overrides `WithNewChildren`, `WithNewExpressions`, `NodeEquals`, `NodeHashCode`, `Expressions`,
+and `SimpleString`.
+
+**Expression-rewrite substrate (the analyzer/optimizer seam).** A plan's expressions are *not*
+its children, so `WithNewChildren`/`TransformDown` only ever touch child **plans** and never a
+`Project.ProjectList`, `Filter.Condition`, or `Aggregate` grouping/aggregate lists. The analyzer
+(#171: `UnresolvedAttribute → AttributeReference`, `UnresolvedFunction → bound`) and optimizer
+(#172: constant-fold, pushdown) mostly rewrite *plan-held expressions*, so the IR mirrors the
+child substrate on the expression axis: `WithNewExpressions(newExpressions)` rebuilds a node from
+its directly-held expressions (same count/positions; `Aggregate` honours the grouping ⧺ aggregate
+split; `Join` rebuilds its `Condition`; no-expression nodes validate empty and return self), and
+`MapExpressions`/`TransformExpressionsDown`/`Up` apply a rule to each held expression (sharing
+unchanged expressions and unchanged child plans by reference). A rule rewrites expressions across
+a whole plan with `plan.TransformDown(p => p.TransformExpressionsDown(rule))` — Catalyst's
+`transformAllExpressions`. This means every analyzer/optimizer rule rewrites expressions through
+one primitive instead of `switch`-ing on each node type and hand-rebuilding it.
 
 ### 6.1 Node catalogue
 
@@ -268,12 +306,12 @@ overrides `WithNewChildren`, `NodeEquals`, `NodeHashCode`, `Expressions`, and `S
 | **`UnresolvedRelation`** | `IReadOnlyList<string> Identifier`; `IReadOnlyDictionary<string,string> Options` | — (leaf) | none | The **logical source descriptor**: a multipart table identifier + read options. No schema (schema-on-read; resolved at analysis), no reader, no handle. `Resolved => false`. |
 | **`Project`** | `IReadOnlyList<Expression> ProjectList`; `LogicalPlan Child` | `[Child]` | `ProjectList` | `select`/`withColumn` target. |
 | **`Filter`** | `Expression Condition`; `LogicalPlan Child` | `[Child]` | `[Condition]` | `filter`/`where`. |
-| **`Aggregate`** | `IReadOnlyList<Expression> GroupingExpressions`; `IReadOnlyList<Expression> AggregateExpressions`; `LogicalPlan Child` | `[Child]` | grouping ⧺ aggregate | `groupBy(...).agg(...)`. |
-| **`Join`** | `LogicalPlan Left`; `LogicalPlan Right`; `JoinType JoinType`; `Expression? Condition` | `[Left, Right]` | `Condition` if present, else none | Records type + condition + both child plans; reads neither side. |
+| **`Aggregate`** | `IReadOnlyList<Expression> GroupingExpressions`; `IReadOnlyList<Expression> AggregateExpressions`; `LogicalPlan Child` | `[Child]` | grouping ⧺ aggregate | `groupBy(...).agg(...)`. `WithNewExpressions` splits the combined list back at `GroupingExpressions.Count`. |
+| **`Join`** | `LogicalPlan Left`; `LogicalPlan Right`; `JoinType JoinType`; `Expression? Condition`; `IReadOnlyList<string>? UsingColumns`; `bool IsNatural` | `[Left, Right]` | `Condition` if present, else none | Records type + criteria + both child plans; reads neither side. The three criteria — `Condition`, `UsingColumns` (`df.join(other, Seq("id"))`), `IsNatural` — are **mutually exclusive**; the analyzer desugars using/natural into a resolved equi-`Condition` once both sides resolve. |
 | **`Sort`** | `IReadOnlyList<Expression> Order`; `bool Global`; `LogicalPlan Child` | `[Child]` | `Order` | `orderBy` (global) / `sortWithinPartitions` (local). `Order` elements are `SortOrder` expressions once #168 lands. |
 | **`Limit`** | `int Count` (≥ 0); `LogicalPlan Child` | `[Child]` | none | `limit(n)`. The count is a literal integer, not an expression. |
 | **`Distinct`** | `LogicalPlan Child` | `[Child]` | none | `distinct` (analyzer later rewrites to `Aggregate`, as in Spark). |
-| **`Union`** | `IReadOnlyList<LogicalPlan> Inputs` (≥ 2) | `Inputs` | none | N-ary `union`/`unionByName`. |
+| **`Union`** | `IReadOnlyList<LogicalPlan> Inputs` (≥ 2) | `Inputs` | none | N-ary `union`/`unionByName`. `WithNewChildren` requires the **same arity** as the original. |
 | **`WriteToSource`** | `LogicalPlan Child`; `SinkDescriptor Sink` | `[Child]` | none | **Write intent.** The plan that an action (`DataFrameWriter.Save`, FEAT-04.6) executes. Holds only a logical sink descriptor — no writer, no stream, no commit. |
 
 ### 6.2 Logical descriptors and enums (no handles — AC3)
@@ -317,12 +355,14 @@ the sole trigger for the analyzer/optimizer/backend.
 continuation gutter (last child's descendants use three spaces). Each line is one node's
 `SimpleString`. Unresolved nodes/attributes/functions/relations carry a leading apostrophe.
 
-An unanalyzed plan built as `Project(['a, 'b])` over `Filter('age > 21)` over
-`UnresolvedRelation([people])` renders as:
+An unanalyzed plan built as `Project(['a, 'b])` over `Filter('>('age, '21))` over
+`UnresolvedRelation([people])` renders as (at M1 only `UnresolvedAttribute`/`UnresolvedFunction`
+render — there are no operator/literal expressions until #168, so the predicate prints in
+function **prefix** form, not infix):
 
 ```
 'Project ['a, 'b]
-+- 'Filter ('age > 21)
++- 'Filter ('>('age, '21))
    +- 'UnresolvedRelation [people]
 ```
 
@@ -357,8 +397,21 @@ logical mode (STORY-04.7.3) will print.
   to `Aggregate` by the analyzer — not at construction.
 - **`Union`.** Modelled N-ary (`Inputs`, ≥ 2) to match `DataFrame.union` chaining without deep
   binary nesting.
+- **`Join` using/natural.** `Join` carries `UsingColumns`/`IsNatural` facets (mutually exclusive
+  with `Condition`) to round-trip `df.join(other, Seq("id"))` and natural joins before
+  resolution; the analyzer desugars them into a resolved equi-`Condition`. (Catalyst threads the
+  same information through `UsingJoin`/`NaturalJoin` analyzer plans.)
 - **Visibility.** The IR is `internal` (Catalyst's `catalyst` package is not a stable public
   Spark API); the public Spark-parity surface is `DataFrame`/`Column`/functions (later FEATs).
+
+### 9.1 Deferred
+
+- **Iterative tree traversal ([#376](https://github.com/khaines/deltasharp/issues/376)).** The
+  hot traversals (`Equals`, `GetHashCode`, `TransformDown`/`TransformUp`, `TreeString`) are
+  recursive. M1 mitigates the resulting `StackOverflow`/`O(depth²)` risk with the construction-
+  time depth guard (`MaxDepth = 1000`, §4.3); converting the traversals to explicit-stack form —
+  removing the cap before deeply-nested machine-generated plans from the SQL frontend land — is
+  tracked as a follow-up.
 
 ---
 
@@ -369,9 +422,9 @@ auto `InternalsVisibleTo`.
 
 | AC | Statement | Test(s) |
 | --- | --- | --- |
-| **AC1** | Each M1 node and its children are immutable after construction. | `ImmutabilityTests`: every node type is `sealed`; mutating a caller's source array/dictionary after construction does not change the node (defensive copy); `Children`/list properties are read-only views that cannot be cast back to a mutable array. |
-| **AC2** | A transform produces a new plan; the original's reference and content are unchanged (structural sharing). | `StructuralSharingTests`: `TransformUp`/`MapChildren`/`WithNewChildren` on a leaf return a new root while the original root is reference-unchanged and deep-`Equals` to a pre-transform snapshot; the rewritten tree **shares** untouched siblings/subtrees by reference; `MapChildren` with a no-op rule returns the **same** reference. A minimal `DataFrame` test asserts `df.Plan` is unchanged after deriving a new `DataFrame`. |
-| **AC3** | Scan/write nodes hold logical descriptors only — no readers, writers, tasks, or backend handles. | `DescriptorOnlyTests`: `UnresolvedRelation` exposes only identifier/options; `WriteToSource`/`SinkDescriptor` expose only format/mode/path/identifier/partitions/options; a reflection-free structural assertion that no IR property is typed as `Stream`/`TextWriter`/Engine type; constructing a scan/write does no I/O (a path that would throw if opened is never opened). |
+| **AC1** | Each M1 node and its children are immutable after construction. | `ImmutabilityTests`: every node type is `sealed`; mutating a caller's source array/dictionary after construction does not change the node (defensive copy) — covered **per node** (Project list, Aggregate grouping+aggregate, Sort order, Union inputs, Join using-columns, `SinkDescriptor` partition-columns+options, relation options); every collection property/`Expressions` view is a read-only view that **cannot be cast back to a mutable array** (including the empty-collection cases). |
+| **AC2** | A transform produces a new plan; the original's reference and content are unchanged (structural sharing). | `StructuralSharingTests`: `TransformUp`/`MapChildren`/`WithNewChildren` on a leaf return a new root while the original root is reference-unchanged and deep-`Equals` to a pre-transform snapshot; the rewritten tree **shares** untouched siblings/subtrees by reference; `MapChildren` with a no-op rule returns the **same** reference; `WithNewChildren` success paths are covered **per node** (Limit, Sort, Aggregate, Distinct, WriteToSource, a binary Join, and arity-checked Union). `ExpressionRewriteTests` covers the expression-rewrite substrate (`WithNewExpressions`/`TransformExpressions*`). A minimal `DataFrame` test asserts `df.Plan` is unchanged after deriving a new `DataFrame`. |
+| **AC3** | Scan/write nodes hold logical descriptors only — no readers, writers, tasks, or backend handles. | `DescriptorOnlyTests`: `UnresolvedRelation` exposes only identifier/options; `WriteToSource`/`SinkDescriptor` expose only format/mode/path/identifier/partitions/options; a **reflection-based** structural assertion that no IR member — **public property or public/private field, on the type or any base IR type** — is typed as `Stream`/`TextReader`/`TextWriter`/`IDisposable`/Engine type; constructing a scan/write does no I/O (a path that would throw if opened is never opened). |
 | **AC4** | Serialization/debug rendering before analysis keeps unresolved attributes/functions explicitly unresolved. | `TreeRenderTests`: `TreeString()` of an unanalyzed `Project/Filter/UnresolvedRelation` and of a `Union` match the §8 golden strings; every line and every attribute/function is apostrophe-prefixed; `Resolved` is `false` for any plan containing an unresolved marker. |
 | (base) | `TreeNode<T>` transform/equality/hash contracts. | `TreeNodeTests`: pre/post-order visit order of `TransformDown`/`TransformUp`; structural `Equals`/`GetHashCode` (equal trees equal & same hash, differing trees not equal); deterministic hash (stable across constructions). |
 

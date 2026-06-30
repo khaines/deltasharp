@@ -10,21 +10,16 @@ internal sealed class Distinct : LogicalPlan
 {
     /// <summary>Creates a distinct.</summary>
     public Distinct(LogicalPlan child)
+        : base(PlanCollections.AsReadOnly(child ?? throw new ArgumentNullException(nameof(child))))
     {
-        Child = child ?? throw new ArgumentNullException(nameof(child));
-        _children = PlanCollections.AsReadOnly(Child);
+        Child = child;
     }
-
-    private readonly IReadOnlyList<LogicalPlan> _children;
 
     /// <summary>The input plan.</summary>
     public LogicalPlan Child { get; }
 
     /// <inheritdoc/>
-    public override IReadOnlyList<LogicalPlan> Children => _children;
-
-    /// <inheritdoc/>
-    public override IReadOnlyList<Expression> Expressions => Array.Empty<Expression>();
+    public override IReadOnlyList<Expression> Expressions => PlanCollections.Empty<Expression>();
 
     /// <inheritdoc/>
     public override string NodeName => "Distinct";
@@ -35,6 +30,13 @@ internal sealed class Distinct : LogicalPlan
     /// <inheritdoc/>
     public override LogicalPlan WithNewChildren(IReadOnlyList<LogicalPlan> newChildren) =>
         new Distinct(PlanNodes.SingleChild(newChildren, NodeName));
+
+    /// <inheritdoc/>
+    public override LogicalPlan WithNewExpressions(IReadOnlyList<Expression> newExpressions)
+    {
+        PlanNodes.RequireNoExpressions(newExpressions, NodeName);
+        return this;
+    }
 
     /// <inheritdoc/>
     protected override bool NodeEquals(LogicalPlan other) => other is Distinct;

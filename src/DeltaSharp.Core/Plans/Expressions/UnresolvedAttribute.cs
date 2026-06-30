@@ -12,6 +12,7 @@ internal sealed class UnresolvedAttribute : Expression
     /// <summary>Creates an unresolved attribute from its name parts (for example
     /// <c>["t", "a"]</c> for <c>t.a</c>).</summary>
     public UnresolvedAttribute(IEnumerable<string> nameParts)
+        : base(PlanCollections.Empty<Expression>())
     {
         NameParts = PlanCollections.ToIdentifier(nameParts, nameof(nameParts));
     }
@@ -24,12 +25,6 @@ internal sealed class UnresolvedAttribute : Expression
 
     /// <summary>The reference name parts, in order.</summary>
     public IReadOnlyList<string> NameParts { get; }
-
-    private static readonly IReadOnlyList<Expression> NoChildren =
-        PlanCollections.AsReadOnly<Expression>();
-
-    /// <inheritdoc/>
-    public override IReadOnlyList<Expression> Children => NoChildren;
 
     /// <inheritdoc/>
     public override string NodeName => "UnresolvedAttribute";

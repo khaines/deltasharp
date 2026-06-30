@@ -31,7 +31,7 @@ internal sealed class SinkDescriptor : IEquatable<SinkDescriptor>
             ? null
             : PlanCollections.ToIdentifier(tableIdentifier, nameof(tableIdentifier));
         PartitionColumns = partitionColumns is null
-            ? Array.Empty<string>()
+            ? PlanCollections.Empty<string>()
             : PlanCollections.ToImmutable(partitionColumns, nameof(partitionColumns));
         Options = PlanCollections.ToOptions(options);
     }

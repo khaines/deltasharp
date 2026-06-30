@@ -12,13 +12,11 @@ internal sealed class WriteToSource : LogicalPlan
 {
     /// <summary>Creates a write intent.</summary>
     public WriteToSource(LogicalPlan child, SinkDescriptor sink)
+        : base(PlanCollections.AsReadOnly(child ?? throw new ArgumentNullException(nameof(child))))
     {
-        Child = child ?? throw new ArgumentNullException(nameof(child));
+        Child = child;
         Sink = sink ?? throw new ArgumentNullException(nameof(sink));
-        _children = PlanCollections.AsReadOnly(Child);
     }
-
-    private readonly IReadOnlyList<LogicalPlan> _children;
 
     /// <summary>The plan producing the rows to write.</summary>
     public LogicalPlan Child { get; }
@@ -27,10 +25,7 @@ internal sealed class WriteToSource : LogicalPlan
     public SinkDescriptor Sink { get; }
 
     /// <inheritdoc/>
-    public override IReadOnlyList<LogicalPlan> Children => _children;
-
-    /// <inheritdoc/>
-    public override IReadOnlyList<Expression> Expressions => Array.Empty<Expression>();
+    public override IReadOnlyList<Expression> Expressions => PlanCollections.Empty<Expression>();
 
     /// <inheritdoc/>
     public override string NodeName => "WriteToSource";
@@ -41,6 +36,13 @@ internal sealed class WriteToSource : LogicalPlan
     /// <inheritdoc/>
     public override LogicalPlan WithNewChildren(IReadOnlyList<LogicalPlan> newChildren) =>
         new WriteToSource(PlanNodes.SingleChild(newChildren, NodeName), Sink);
+
+    /// <inheritdoc/>
+    public override LogicalPlan WithNewExpressions(IReadOnlyList<Expression> newExpressions)
+    {
+        PlanNodes.RequireNoExpressions(newExpressions, NodeName);
+        return this;
+    }
 
     /// <inheritdoc/>
     protected override bool NodeEquals(LogicalPlan other) =>

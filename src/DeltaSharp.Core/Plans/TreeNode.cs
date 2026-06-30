@@ -24,12 +24,68 @@ namespace DeltaSharp.Plans;
 /// types and carry no reference to <c>DeltaSharp.Engine</c>
 /// (see <c>docs/engineering/design/logical-plan-nodes.md</c>).
 /// </para>
+/// <para>
+/// Each node caches its <see cref="Depth"/> (computed in O(1) from its children's already-cached
+/// depths) and the constructor rejects trees deeper than <see cref="MaxDepth"/> with a
+/// <see cref="PlanDepthExceededException"/>. This fail-fast guard bounds the otherwise unbounded
+/// recursion in equality, hashing, the transforms, and tree rendering, closing a
+/// <see cref="StackOverflowException"/> denial-of-service vector. M1 plans are shallow, so the
+/// generous limit is invisible to real use.
+/// </para>
 /// </remarks>
 internal abstract class TreeNode<TNode> : IEquatable<TNode>
     where TNode : TreeNode<TNode>
 {
+    /// <summary>
+    /// The maximum supported tree depth. Chosen generously (M1 plans are a handful of nodes
+    /// deep) yet well below the ~4000-frame point at which the recursive traversals would
+    /// overflow the stack, leaving ample margin. Tracked follow-up: converting the hot
+    /// traversals to explicit-stack form removes the need for this cap (design doc §9).
+    /// </summary>
+    public const int MaxDepth = 1000;
+
+    private readonly IReadOnlyList<TNode> _children;
+    private int? _hashCache;
+
+    /// <summary>
+    /// Initializes the node with its (already immutable) children, caches the tree depth, and
+    /// rejects trees deeper than <see cref="MaxDepth"/>.
+    /// </summary>
+    /// <param name="children">
+    /// The child nodes, already defensively copied into a read-only view (a leaf passes an empty
+    /// list). The same instance is exposed by <see cref="Children"/>.
+    /// </param>
+    protected TreeNode(IReadOnlyList<TNode> children)
+    {
+        ArgumentNullException.ThrowIfNull(children);
+        _children = children;
+
+        int maxChildDepth = 0;
+        for (int i = 0; i < children.Count; i++)
+        {
+            int childDepth = children[i].Depth;
+            if (childDepth > maxChildDepth)
+            {
+                maxChildDepth = childDepth;
+            }
+        }
+
+        Depth = maxChildDepth + 1;
+        if (Depth > MaxDepth)
+        {
+            throw new PlanDepthExceededException(Depth, MaxDepth);
+        }
+    }
+
     /// <summary>The child nodes, in order. A leaf returns an empty list.</summary>
-    public abstract IReadOnlyList<TNode> Children { get; }
+    public IReadOnlyList<TNode> Children => _children;
+
+    /// <summary>
+    /// The nesting depth of this subtree: <c>1</c> for a leaf, otherwise
+    /// <c>1 + max(child depths)</c>. Cached at construction (children's depths are themselves
+    /// cached, so this is O(1) per node) and used by the construction-time depth guard.
+    /// </summary>
+    public int Depth { get; }
 
     /// <summary>The Catalyst node name (for example <c>"Project"</c>); a constant per node.</summary>
     public abstract string NodeName { get; }
@@ -185,14 +241,24 @@ internal abstract class TreeNode<TNode> : IEquatable<TNode>
     public sealed override bool Equals(object? obj) => obj is TNode node && Equals(node);
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Memoized: the hash is computed once and cached. Safe because nodes are immutable, so the
+    /// value never changes; a benign race merely recomputes the same number.
+    /// </remarks>
     public sealed override int GetHashCode()
     {
+        if (_hashCache is int cached)
+        {
+            return cached;
+        }
+
         int hash = PlanHash.Combine(NodeHashCode(), PlanHash.OfString(NodeName));
         foreach (TNode child in Children)
         {
             hash = PlanHash.Combine(hash, child.GetHashCode());
         }
 
+        _hashCache = hash;
         return hash;
     }
 

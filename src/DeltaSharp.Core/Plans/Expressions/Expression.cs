@@ -13,24 +13,45 @@ namespace DeltaSharp.Plans.Expressions;
 /// </remarks>
 internal abstract class Expression : TreeNode<Expression>
 {
+    private bool? _resolved;
+
+    /// <summary>Initializes the expression with its children (a leaf passes an empty list).</summary>
+    protected Expression(IReadOnlyList<Expression> children)
+        : base(children)
+    {
+    }
+
     /// <summary>
     /// Whether this expression and all of its children are resolved. Defaults to "all children
     /// resolved"; the unresolved markers override it to <see langword="false"/>. The analyzer
     /// (FEAT-04.5) — never construction — is what makes an expression resolved.
     /// </summary>
+    /// <remarks>Memoized: safe because nodes are immutable, so the value never changes.</remarks>
     public virtual bool Resolved
     {
         get
         {
-            foreach (Expression child in Children)
+            if (_resolved is bool cached)
             {
-                if (!child.Resolved)
-                {
-                    return false;
-                }
+                return cached;
             }
 
-            return true;
+            bool resolved = ComputeResolved();
+            _resolved = resolved;
+            return resolved;
         }
+    }
+
+    private bool ComputeResolved()
+    {
+        foreach (Expression child in Children)
+        {
+            if (!child.Resolved)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 }

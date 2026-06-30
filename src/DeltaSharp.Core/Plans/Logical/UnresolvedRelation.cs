@@ -16,6 +16,7 @@ internal sealed class UnresolvedRelation : LogicalPlan
     public UnresolvedRelation(
         IEnumerable<string> identifier,
         IReadOnlyDictionary<string, string>? options = null)
+        : base(PlanCollections.Empty<LogicalPlan>())
     {
         Identifier = PlanCollections.ToIdentifier(identifier, nameof(identifier));
         Options = PlanCollections.ToOptions(options);
@@ -27,14 +28,8 @@ internal sealed class UnresolvedRelation : LogicalPlan
     /// <summary>The read options.</summary>
     public IReadOnlyDictionary<string, string> Options { get; }
 
-    private static readonly IReadOnlyList<LogicalPlan> NoChildren =
-        PlanCollections.AsReadOnly<LogicalPlan>();
-
     /// <inheritdoc/>
-    public override IReadOnlyList<LogicalPlan> Children => NoChildren;
-
-    /// <inheritdoc/>
-    public override IReadOnlyList<Expression> Expressions => Array.Empty<Expression>();
+    public override IReadOnlyList<Expression> Expressions => PlanCollections.Empty<Expression>();
 
     /// <inheritdoc/>
     public override bool Resolved => false;
@@ -55,6 +50,13 @@ internal sealed class UnresolvedRelation : LogicalPlan
                 "UnresolvedRelation is a leaf and takes no children.", nameof(newChildren));
         }
 
+        return this;
+    }
+
+    /// <inheritdoc/>
+    public override LogicalPlan WithNewExpressions(IReadOnlyList<Expression> newExpressions)
+    {
+        PlanNodes.RequireNoExpressions(newExpressions, NodeName);
         return this;
     }
 

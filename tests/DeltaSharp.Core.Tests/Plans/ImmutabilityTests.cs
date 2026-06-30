@@ -95,6 +95,102 @@ public sealed class ImmutabilityTests
     }
 
     [Fact]
+    public void AggregateGroupingAndAggregateInputsAreDefensivelyCopied()
+    {
+        var grouping = new List<Expression> { PlanFixtures.Attr("g") };
+        var aggregate = new List<Expression> { PlanFixtures.Attr("a") };
+        var node = new Aggregate(grouping, aggregate, PlanFixtures.Relation("t"));
+
+        grouping.Add(PlanFixtures.Attr("g2"));
+        aggregate.Add(PlanFixtures.Attr("a2"));
+
+        Assert.Single(node.GroupingExpressions);
+        Assert.Single(node.AggregateExpressions);
+        Assert.IsNotType<Expression[]>(node.GroupingExpressions);
+        Assert.IsNotType<Expression[]>(node.AggregateExpressions);
+        Assert.IsNotType<Expression[]>(node.Expressions);
+    }
+
+    [Fact]
+    public void SortOrderInputIsDefensivelyCopiedAndNotCastable()
+    {
+        var order = new List<Expression> { PlanFixtures.Attr("a") };
+        var sort = new Sort(order, global: true, PlanFixtures.Relation("t"));
+
+        order.Add(PlanFixtures.Attr("b"));
+
+        Assert.Single(sort.Order);
+        Assert.IsNotType<Expression[]>(sort.Order);
+        Assert.IsNotType<Expression[]>(sort.Expressions);
+    }
+
+    [Fact]
+    public void UnionInputsAreDefensivelyCopiedAndNotCastable()
+    {
+        var inputs = new List<LogicalPlan> { PlanFixtures.Relation("a"), PlanFixtures.Relation("b") };
+        var union = new Union(inputs);
+
+        inputs.Add(PlanFixtures.Relation("c"));
+
+        Assert.Equal(2, union.Inputs.Count);
+        Assert.IsNotType<LogicalPlan[]>(union.Inputs);
+        Assert.IsNotType<LogicalPlan[]>(union.Children);
+    }
+
+    [Fact]
+    public void JoinUsingColumnsAreDefensivelyCopiedAndNotCastable()
+    {
+        var columns = new List<string> { "id" };
+        var join = new Join(
+            PlanFixtures.Relation("a"), PlanFixtures.Relation("b"), JoinType.Inner, usingColumns: columns);
+
+        columns.Add("k");
+
+        Assert.Single(join.UsingColumns!);
+        Assert.IsNotType<string[]>(join.UsingColumns);
+    }
+
+    [Fact]
+    public void FilterAndJoinExpressionsAreNotCastableToMutableArray()
+    {
+        var filter = new Filter(PlanFixtures.Attr("a"), PlanFixtures.Relation("t"));
+        Assert.IsNotType<Expression[]>(filter.Expressions);
+
+        var join = new Join(
+            PlanFixtures.Relation("a"), PlanFixtures.Relation("b"), JoinType.Inner,
+            condition: PlanFixtures.Attr("x"));
+        Assert.IsNotType<Expression[]>(join.Expressions);
+    }
+
+    [Fact]
+    public void SinkDescriptorPartitionColumnsAndOptionsAreDefensivelyCopiedAndNotCastable()
+    {
+        var partitions = new List<string> { "year" };
+        var options = new Dictionary<string, string> { ["k"] = "v" };
+        var sink = new SinkDescriptor(
+            "parquet", partitionColumns: partitions, options: options);
+
+        partitions.Add("month");
+        options["k2"] = "v2";
+
+        Assert.Single(sink.PartitionColumns);
+        Assert.Single(sink.Options);
+        Assert.IsNotType<string[]>(sink.PartitionColumns);
+
+        // Even the empty-partition case is a non-castable read-only view (no Array.Empty leak).
+        var noPartitions = new SinkDescriptor("parquet");
+        Assert.IsNotType<string[]>(noPartitions.PartitionColumns);
+    }
+
+    [Fact]
+    public void EmptyExpressionViewsAreNotCastableToMutableArray()
+    {
+        Assert.IsNotType<Expression[]>(new Limit(1, PlanFixtures.Relation("t")).Expressions);
+        Assert.IsNotType<Expression[]>(new Distinct(PlanFixtures.Relation("t")).Expressions);
+        Assert.IsNotType<Expression[]>(PlanFixtures.Relation("t").Expressions);
+    }
+
+    [Fact]
     public void LimitRejectsNegativeCount()
     {
         Assert.Throws<ArgumentOutOfRangeException>(

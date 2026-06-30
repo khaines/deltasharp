@@ -8,15 +8,16 @@ namespace DeltaSharp.Plans.Logical;
 /// </summary>
 internal sealed class Filter : LogicalPlan
 {
+    private readonly IReadOnlyList<Expression> _expressions;
+
     /// <summary>Creates a filter.</summary>
     public Filter(Expression condition, LogicalPlan child)
+        : base(PlanCollections.AsReadOnly(child ?? throw new ArgumentNullException(nameof(child))))
     {
         Condition = condition ?? throw new ArgumentNullException(nameof(condition));
-        Child = child ?? throw new ArgumentNullException(nameof(child));
-        _children = PlanCollections.AsReadOnly(Child);
+        Child = child;
+        _expressions = PlanCollections.AsReadOnly(Condition);
     }
-
-    private readonly IReadOnlyList<LogicalPlan> _children;
 
     /// <summary>The predicate expression.</summary>
     public Expression Condition { get; }
@@ -25,10 +26,7 @@ internal sealed class Filter : LogicalPlan
     public LogicalPlan Child { get; }
 
     /// <inheritdoc/>
-    public override IReadOnlyList<LogicalPlan> Children => _children;
-
-    /// <inheritdoc/>
-    public override IReadOnlyList<Expression> Expressions => new[] { Condition };
+    public override IReadOnlyList<Expression> Expressions => _expressions;
 
     /// <inheritdoc/>
     public override string NodeName => "Filter";
@@ -39,6 +37,10 @@ internal sealed class Filter : LogicalPlan
     /// <inheritdoc/>
     public override LogicalPlan WithNewChildren(IReadOnlyList<LogicalPlan> newChildren) =>
         new Filter(Condition, PlanNodes.SingleChild(newChildren, NodeName));
+
+    /// <inheritdoc/>
+    public override LogicalPlan WithNewExpressions(IReadOnlyList<Expression> newExpressions) =>
+        new Filter(PlanNodes.RequireExpressions(newExpressions, 1, NodeName)[0], Child);
 
     /// <inheritdoc/>
     protected override bool NodeEquals(LogicalPlan other) =>

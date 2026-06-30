@@ -11,14 +11,12 @@ internal sealed class Limit : LogicalPlan
 {
     /// <summary>Creates a limit.</summary>
     public Limit(int count, LogicalPlan child)
+        : base(PlanCollections.AsReadOnly(child ?? throw new ArgumentNullException(nameof(child))))
     {
         ArgumentOutOfRangeException.ThrowIfNegative(count);
         Count = count;
-        Child = child ?? throw new ArgumentNullException(nameof(child));
-        _children = PlanCollections.AsReadOnly(Child);
+        Child = child;
     }
-
-    private readonly IReadOnlyList<LogicalPlan> _children;
 
     /// <summary>The maximum number of rows to return (non-negative).</summary>
     public int Count { get; }
@@ -27,10 +25,7 @@ internal sealed class Limit : LogicalPlan
     public LogicalPlan Child { get; }
 
     /// <inheritdoc/>
-    public override IReadOnlyList<LogicalPlan> Children => _children;
-
-    /// <inheritdoc/>
-    public override IReadOnlyList<Expression> Expressions => Array.Empty<Expression>();
+    public override IReadOnlyList<Expression> Expressions => PlanCollections.Empty<Expression>();
 
     /// <inheritdoc/>
     public override string NodeName => "Limit";
@@ -41,6 +36,13 @@ internal sealed class Limit : LogicalPlan
     /// <inheritdoc/>
     public override LogicalPlan WithNewChildren(IReadOnlyList<LogicalPlan> newChildren) =>
         new Limit(Count, PlanNodes.SingleChild(newChildren, NodeName));
+
+    /// <inheritdoc/>
+    public override LogicalPlan WithNewExpressions(IReadOnlyList<Expression> newExpressions)
+    {
+        PlanNodes.RequireNoExpressions(newExpressions, NodeName);
+        return this;
+    }
 
     /// <inheritdoc/>
     protected override bool NodeEquals(LogicalPlan other) =>

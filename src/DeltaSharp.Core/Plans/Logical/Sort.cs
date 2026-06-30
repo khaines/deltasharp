@@ -14,14 +14,12 @@ internal sealed class Sort : LogicalPlan
     /// <param name="global">Whether the ordering is global (total) rather than per-partition.</param>
     /// <param name="child">The input plan.</param>
     public Sort(IEnumerable<Expression> order, bool global, LogicalPlan child)
+        : base(PlanCollections.AsReadOnly(child ?? throw new ArgumentNullException(nameof(child))))
     {
         Order = PlanCollections.ToImmutable(order, nameof(order));
         Global = global;
-        Child = child ?? throw new ArgumentNullException(nameof(child));
-        _children = PlanCollections.AsReadOnly(Child);
+        Child = child;
     }
-
-    private readonly IReadOnlyList<LogicalPlan> _children;
 
     /// <summary>The ordering expressions, in order.</summary>
     public IReadOnlyList<Expression> Order { get; }
@@ -31,9 +29,6 @@ internal sealed class Sort : LogicalPlan
 
     /// <summary>The input plan.</summary>
     public LogicalPlan Child { get; }
-
-    /// <inheritdoc/>
-    public override IReadOnlyList<LogicalPlan> Children => _children;
 
     /// <inheritdoc/>
     public override IReadOnlyList<Expression> Expressions => Order;
@@ -48,6 +43,11 @@ internal sealed class Sort : LogicalPlan
     /// <inheritdoc/>
     public override LogicalPlan WithNewChildren(IReadOnlyList<LogicalPlan> newChildren) =>
         new Sort(Order, Global, PlanNodes.SingleChild(newChildren, NodeName));
+
+    /// <inheritdoc/>
+    public override LogicalPlan WithNewExpressions(IReadOnlyList<Expression> newExpressions) =>
+        new Sort(
+            PlanNodes.RequireExpressions(newExpressions, Order.Count, NodeName), Global, Child);
 
     /// <inheritdoc/>
     protected override bool NodeEquals(LogicalPlan other) =>

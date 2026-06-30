@@ -44,6 +44,47 @@ internal static class PlanNodes
         return (left, right);
     }
 
+    /// <summary>
+    /// Validates that a <c>WithNewExpressions</c> call supplies exactly
+    /// <paramref name="expected"/> expressions (the node's arity), returning the list.
+    /// </summary>
+    public static IReadOnlyList<Expression> RequireExpressions(
+        IReadOnlyList<Expression> newExpressions, int expected, string nodeName)
+    {
+        ArgumentNullException.ThrowIfNull(newExpressions);
+        if (newExpressions.Count != expected)
+        {
+            throw new ArgumentException(
+                $"{nodeName} expects exactly {expected} expression(s) but got "
+                + $"{newExpressions.Count}.",
+                nameof(newExpressions));
+        }
+
+        for (int i = 0; i < newExpressions.Count; i++)
+        {
+            if (newExpressions[i] is null)
+            {
+                throw new ArgumentException(
+                    "Expression cannot be null.", nameof(newExpressions));
+            }
+        }
+
+        return newExpressions;
+    }
+
+    /// <summary>Validates that a no-expression node's <c>WithNewExpressions</c> call is empty.</summary>
+    public static void RequireNoExpressions(
+        IReadOnlyList<Expression> newExpressions, string nodeName)
+    {
+        ArgumentNullException.ThrowIfNull(newExpressions);
+        if (newExpressions.Count != 0)
+        {
+            throw new ArgumentException(
+                $"{nodeName} holds no expressions but got {newExpressions.Count}.",
+                nameof(newExpressions));
+        }
+    }
+
     /// <summary>Ordered structural equality of two expression lists.</summary>
     public static bool ExpressionsEqual(
         IReadOnlyList<Expression> a, IReadOnlyList<Expression> b)

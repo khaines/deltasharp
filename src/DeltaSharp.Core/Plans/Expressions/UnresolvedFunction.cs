@@ -6,7 +6,8 @@ namespace DeltaSharp.Plans.Expressions;
 /// <c>UnresolvedFunction</c>.
 /// </summary>
 /// <remarks>It is never resolved at construction (it renders with a leading apostrophe),
-/// satisfying the unresolved-before-analysis invariant (AC4).</remarks>
+/// satisfying the unresolved-before-analysis invariant (AC4). Its children are its
+/// <see cref="Arguments"/>.</remarks>
 internal sealed class UnresolvedFunction : Expression
 {
     /// <summary>Creates an unresolved function call.</summary>
@@ -14,10 +15,10 @@ internal sealed class UnresolvedFunction : Expression
     /// <param name="arguments">The argument expressions, in order.</param>
     /// <param name="isDistinct">Whether the call carries the <c>DISTINCT</c> qualifier.</param>
     public UnresolvedFunction(string name, IEnumerable<Expression> arguments, bool isDistinct = false)
+        : base(PlanCollections.ToImmutable(arguments, nameof(arguments)))
     {
         ArgumentException.ThrowIfNullOrEmpty(name);
         Name = name;
-        Arguments = PlanCollections.ToImmutable(arguments, nameof(arguments));
         IsDistinct = isDistinct;
     }
 
@@ -25,13 +26,10 @@ internal sealed class UnresolvedFunction : Expression
     public string Name { get; }
 
     /// <summary>The argument expressions, in order.</summary>
-    public IReadOnlyList<Expression> Arguments { get; }
+    public IReadOnlyList<Expression> Arguments => Children;
 
     /// <summary>Whether the call carries the <c>DISTINCT</c> qualifier.</summary>
     public bool IsDistinct { get; }
-
-    /// <inheritdoc/>
-    public override IReadOnlyList<Expression> Children => Arguments;
 
     /// <inheritdoc/>
     public override string NodeName => "UnresolvedFunction";

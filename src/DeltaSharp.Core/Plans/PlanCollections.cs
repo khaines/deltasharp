@@ -72,10 +72,32 @@ internal static class PlanCollections
         return new ReadOnlyDictionary<string, string>(copy);
     }
 
-    /// <summary>Wraps <paramref name="items"/> in a read-only view that cannot be cast back to a
-    /// mutable array, preserving node immutability.</summary>
-    public static IReadOnlyList<T> AsReadOnly<T>(params T[] items) =>
-        new ReadOnlyCollection<T>(items);
+    /// <summary>
+    /// Defensively copies <paramref name="items"/> into a read-only view that cannot be cast back
+    /// to a mutable array, preserving node immutability. The copy means the caller may safely pass
+    /// a shared or later-mutated array — the returned view never aliases the input.
+    /// </summary>
+    public static IReadOnlyList<T> AsReadOnly<T>(params T[] items)
+    {
+        ArgumentNullException.ThrowIfNull(items);
+        if (items.Length == 0)
+        {
+            return Empty<T>();
+        }
+
+        var copy = new T[items.Length];
+        Array.Copy(items, copy, items.Length);
+        return new ReadOnlyCollection<T>(copy);
+    }
+
+    /// <summary>The shared, immutable, non-castable empty read-only list for <typeparamref name="T"/>.</summary>
+    public static IReadOnlyList<T> Empty<T>() => EmptyHolder<T>.Value;
+
+    private static class EmptyHolder<T>
+    {
+        public static readonly IReadOnlyList<T> Value =
+            new ReadOnlyCollection<T>(Array.Empty<T>());
+    }
 
     /// <summary>The shared empty options map.</summary>
     public static IReadOnlyDictionary<string, string> EmptyOptions { get; } =

@@ -10,22 +10,17 @@ internal sealed class Project : LogicalPlan
 {
     /// <summary>Creates a projection.</summary>
     public Project(IEnumerable<Expression> projectList, LogicalPlan child)
+        : base(PlanCollections.AsReadOnly(child ?? throw new ArgumentNullException(nameof(child))))
     {
         ProjectList = PlanCollections.ToImmutable(projectList, nameof(projectList));
-        Child = child ?? throw new ArgumentNullException(nameof(child));
-        _children = PlanCollections.AsReadOnly(Child);
+        Child = child;
     }
-
-    private readonly IReadOnlyList<LogicalPlan> _children;
 
     /// <summary>The projected expressions, in order.</summary>
     public IReadOnlyList<Expression> ProjectList { get; }
 
     /// <summary>The input plan.</summary>
     public LogicalPlan Child { get; }
-
-    /// <inheritdoc/>
-    public override IReadOnlyList<LogicalPlan> Children => _children;
 
     /// <inheritdoc/>
     public override IReadOnlyList<Expression> Expressions => ProjectList;
@@ -39,6 +34,11 @@ internal sealed class Project : LogicalPlan
     /// <inheritdoc/>
     public override LogicalPlan WithNewChildren(IReadOnlyList<LogicalPlan> newChildren) =>
         new Project(ProjectList, PlanNodes.SingleChild(newChildren, NodeName));
+
+    /// <inheritdoc/>
+    public override LogicalPlan WithNewExpressions(IReadOnlyList<Expression> newExpressions) =>
+        new Project(
+            PlanNodes.RequireExpressions(newExpressions, ProjectList.Count, NodeName), Child);
 
     /// <inheritdoc/>
     protected override bool NodeEquals(LogicalPlan other) =>
