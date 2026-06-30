@@ -1,3 +1,5 @@
+using DeltaSharp.Engine.Execution.Spill;
+
 namespace DeltaSharp.Engine.Execution;
 
 /// <summary>
@@ -27,6 +29,14 @@ public sealed class ExecutionContext
 
     /// <summary>The bounded memory context; operators reserve before allocating and spill on refusal.</summary>
     public IExecutionMemory Memory { get; }
+
+    /// <summary>
+    /// The spill target stateful operators write partial state to when a reservation is refused
+    /// (STORY-03.6.2). Defaults to a <see cref="MemorySpillStore"/>; the executor or a test injects a
+    /// disk-backed or fault-injecting store via an object initializer. Engine-internal so the public
+    /// surface stays unchanged.
+    /// </summary>
+    internal ISpillStore SpillStore { get; init; } = new MemorySpillStore();
 
     /// <summary>Cancellation token; operators must observe it at bounded checkpoints and stop cleanly.</summary>
     public CancellationToken CancellationToken { get; }

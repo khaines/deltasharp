@@ -1,5 +1,6 @@
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Engine.Execution.Expressions;
+using DeltaSharp.Engine.Execution.Spill;
 using DeltaSharp.Engine.Types;
 
 namespace DeltaSharp.Engine.Execution;
@@ -29,6 +30,28 @@ internal abstract class Aggregator
 
     /// <summary>Appends <paramref name="group"/>'s finished value (or a null) to <paramref name="destination"/>.</summary>
     internal abstract void Emit(int group, MutableColumnVector destination);
+
+    /// <summary>
+    /// Serializes <paramref name="group"/>'s <b>partial</b> accumulator state to <paramref name="writer"/>
+    /// when the hash table spills (STORY-03.6.2 AC1). The bytes are the minimum needed to resume the fold:
+    /// running sums/counts plus the has-value/nulled flags, or the running MIN/MAX best — never the emitted
+    /// result, so AVG (sum + count) and overflow-tracking SUM merge exactly.
+    /// </summary>
+    internal abstract void WriteState(int group, SpillStateWriter writer);
+
+    /// <summary>
+    /// Folds a spilled partial state (read from <paramref name="reader"/> in the same field order
+    /// <see cref="WriteState"/> wrote it) into <paramref name="group"/> of the recovery table. The fold is
+    /// associative/commutative for the exact aggregates (COUNT/SUM-integer/SUM-decimal/MIN/MAX), so the
+    /// merged value equals the no-spill value; ANSI overflow re-raises and Legacy overflow nulls the group.
+    /// </summary>
+    internal abstract void MergeState(int group, ref SpillStateReader reader);
+
+    /// <summary>
+    /// Clears all per-group state (and releases any variable-width reservation) so the aggregator can be
+    /// reused for the next spill partition's recovery table.
+    /// </summary>
+    internal abstract void Reset();
 
     /// <summary>
     /// Variable-width bytes this aggregator has reserved beyond its flat <see cref="BytesPerGroup"/>
@@ -131,6 +154,12 @@ internal sealed class CountAggregator : Aggregator
 
     internal override void Emit(int group, MutableColumnVector destination) =>
         VectorMaterializer.AppendIntegral(destination, _counts[group]);
+
+    internal override void WriteState(int group, SpillStateWriter writer) => writer.WriteLong(_counts[group]);
+
+    internal override void MergeState(int group, ref SpillStateReader reader) => _counts[group] += reader.ReadLong();
+
+    internal override void Reset() => _counts = [];
 }
 
 /// <summary>
@@ -196,6 +225,56 @@ internal sealed class SumLongAggregator : Aggregator
             VectorMaterializer.AppendIntegral(destination, _sums[group]);
         }
     }
+
+    internal override void WriteState(int group, SpillStateWriter writer)
+    {
+        writer.WriteLong(_sums[group]);
+        writer.WriteBool(_hasValue[group]);
+        writer.WriteBool(_nulled[group]);
+    }
+
+    internal override void MergeState(int group, ref SpillStateReader reader)
+    {
+        long sum = reader.ReadLong();
+        bool has = reader.ReadBool();
+        bool nulled = reader.ReadBool();
+        if (has)
+        {
+            _hasValue[group] = true;
+        }
+
+        if (nulled)
+        {
+            _nulled[group] = true;
+            return;
+        }
+
+        if (_nulled[group] || !has)
+        {
+            return;
+        }
+
+        try
+        {
+            _sums[group] = checked(_sums[group] + sum);
+        }
+        catch (OverflowException ex)
+        {
+            if (_mode == AnsiMode.Ansi)
+            {
+                throw new ArithmeticOverflowException("SUM overflowed bigint.", ex);
+            }
+
+            _nulled[group] = true;
+        }
+    }
+
+    internal override void Reset()
+    {
+        _sums = [];
+        _hasValue = [];
+        _nulled = [];
+    }
 }
 
 /// <summary>
@@ -237,6 +316,27 @@ internal sealed class SumDoubleAggregator : Aggregator
         {
             destination.AppendNull();
         }
+    }
+
+    internal override void WriteState(int group, SpillStateWriter writer)
+    {
+        writer.WriteDouble(_sums[group]);
+        writer.WriteBool(_hasValue[group]);
+    }
+
+    internal override void MergeState(int group, ref SpillStateReader reader)
+    {
+        _sums[group] += reader.ReadDouble();
+        if (reader.ReadBool())
+        {
+            _hasValue[group] = true;
+        }
+    }
+
+    internal override void Reset()
+    {
+        _sums = [];
+        _hasValue = [];
     }
 }
 
@@ -316,6 +416,58 @@ internal sealed class SumDecimalAggregator : Aggregator
             VectorMaterializer.AppendDecimal(destination, fitted.Value.Unscaled);
         }
     }
+
+    internal override void WriteState(int group, SpillStateWriter writer)
+    {
+        writer.WriteInt128(_sums[group].Unscaled);
+        writer.WriteInt(_sums[group].Scale);
+        writer.WriteBool(_hasValue[group]);
+        writer.WriteBool(_nulled[group]);
+    }
+
+    internal override void MergeState(int group, ref SpillStateReader reader)
+    {
+        Int128 unscaled = reader.ReadInt128();
+        int scale = reader.ReadInt();
+        bool has = reader.ReadBool();
+        bool nulled = reader.ReadBool();
+        if (has)
+        {
+            _hasValue[group] = true;
+        }
+
+        if (nulled)
+        {
+            _nulled[group] = true;
+            return;
+        }
+
+        if (_nulled[group] || !has)
+        {
+            return;
+        }
+
+        try
+        {
+            _sums[group] = DecimalValue.Add(_sums[group], new DecimalValue(unscaled, scale));
+        }
+        catch (ArithmeticOverflowException)
+        {
+            if (_mode == AnsiMode.Ansi)
+            {
+                throw;
+            }
+
+            _nulled[group] = true;
+        }
+    }
+
+    internal override void Reset()
+    {
+        _sums = [];
+        _hasValue = [];
+        _nulled = [];
+    }
 }
 
 /// <summary>
@@ -357,6 +509,24 @@ internal sealed class AvgDoubleAggregator : Aggregator
         {
             destination.AppendValue(_sums[group] / _counts[group]);
         }
+    }
+
+    internal override void WriteState(int group, SpillStateWriter writer)
+    {
+        writer.WriteDouble(_sums[group]);
+        writer.WriteLong(_counts[group]);
+    }
+
+    internal override void MergeState(int group, ref SpillStateReader reader)
+    {
+        _sums[group] += reader.ReadDouble();
+        _counts[group] += reader.ReadLong();
+    }
+
+    internal override void Reset()
+    {
+        _sums = [];
+        _counts = [];
     }
 }
 
@@ -424,6 +594,81 @@ internal sealed class MinMaxAggregator : Aggregator
             ScalarValues.AppendStorage(destination, best);
         }
     }
+
+    internal override void WriteState(int group, SpillStateWriter writer)
+    {
+        object? best = _best[group];
+        if (best is null)
+        {
+            writer.WriteBool(false);
+            return;
+        }
+
+        writer.WriteBool(true);
+        WriteStorage(writer, best);
+    }
+
+    internal override void MergeState(int group, ref SpillStateReader reader)
+    {
+        if (!reader.ReadBool())
+        {
+            return;
+        }
+
+        object candidate = ReadStorage(ref reader);
+        object? current = _best[group];
+        if (current is null)
+        {
+            Retain(group, candidate);
+            return;
+        }
+
+        int comparison = ScalarValues.Compare(_type, candidate, current);
+        if (_isMin ? comparison < 0 : comparison > 0)
+        {
+            Retain(group, candidate);
+        }
+    }
+
+    internal override void Reset()
+    {
+        Release();
+        _best = [];
+    }
+
+    // Writes the running best in its storage CLR shape (the inverse of ReadStorage), keyed by _type.
+    private void WriteStorage(SpillStateWriter writer, object value)
+    {
+        switch (_type)
+        {
+            case BooleanType: writer.WriteBool((bool)value); break;
+            case ByteType: writer.WriteByte((byte)value); break;
+            case ShortType: writer.WriteShort((short)value); break;
+            case IntegerType or DateType: writer.WriteInt((int)value); break;
+            case LongType or TimestampType: writer.WriteLong((long)value); break;
+            case FloatType: writer.WriteSingle((float)value); break;
+            case DoubleType: writer.WriteDouble((double)value); break;
+            case DecimalType { IsCompact: true }: writer.WriteLong((long)value); break;
+            case DecimalType: writer.WriteInt128((Int128)value); break;
+            case StringType or BinaryType: writer.WriteBytes((byte[])value); break;
+            default: throw new UnsupportedTypeException($"MIN/MAX cannot spill type '{_type.SimpleString}'.");
+        }
+    }
+
+    private object ReadStorage(ref SpillStateReader reader) => _type switch
+    {
+        BooleanType => reader.ReadBool(),
+        ByteType => reader.ReadByte(),
+        ShortType => reader.ReadShort(),
+        IntegerType or DateType => reader.ReadInt(),
+        LongType or TimestampType => reader.ReadLong(),
+        FloatType => reader.ReadSingle(),
+        DoubleType => reader.ReadDouble(),
+        DecimalType { IsCompact: true } => reader.ReadLong(),
+        DecimalType => reader.ReadInt128(),
+        StringType or BinaryType => reader.ReadBytes().ToArray(),
+        _ => throw new UnsupportedTypeException($"MIN/MAX cannot recover type '{_type.SimpleString}'."),
+    };
 
     internal override void Release()
     {

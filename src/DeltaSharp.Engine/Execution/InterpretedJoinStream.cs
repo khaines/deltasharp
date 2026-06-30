@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Engine.Execution.Expressions;
+using DeltaSharp.Engine.Execution.Spill;
 using DeltaSharp.Engine.Types;
 
 namespace DeltaSharp.Engine.Execution;
@@ -25,13 +26,21 @@ namespace DeltaSharp.Engine.Execution;
 /// pass), and kept by <c>ANTI</c>. Non-null keys match through the canonical byte-sortable encoding
 /// (<see cref="RowKeyProjection"/>), so <c>NaN</c>/<c>-0.0</c> normalize exactly as Spark joins them.</para>
 /// <para><b>Memory.</b> The build relation, its hash table, and the matched-flags are buffered
-/// in-memory (spill is STORY-03.5.x) and held until <see cref="Dispose"/>; each emitted chunk reserves
-/// its own output columns, released on the next pull. A refusal raises
-/// <see cref="ExecutionMemoryException"/>.</para>
+/// in-memory and held until <see cref="Dispose"/>; each emitted chunk reserves its own output columns,
+/// released on the next pull. When a build reservation is refused the join switches to a grace-hash
+/// spill (STORY-03.6.2): build and probe are hash-partitioned to spill segments and joined one
+/// partition at a time, so cardinality and null-key semantics are preserved while peak memory stays
+/// bounded to a single partition.</para>
 /// </remarks>
 internal sealed class InterpretedJoinStream : IBatchStream
 {
     private const int OutputBatchRows = 1024;
+
+    // Grace-hash fan-out when the build side spills (STORY-03.6.2). A row's partition is
+    // FNV-1a(encodedKey) mod PartitionCount; matching keys hash identically so a probe row and its build
+    // matches always co-locate, preserving join cardinality. Null-key rows (which never match) bypass the
+    // partitions into dedicated null segments for the OUTER unmatched passes.
+    private const int PartitionCount = 16;
 
     private readonly IBatchStream _probe;
     private readonly IBatchStream _build;
@@ -49,6 +58,11 @@ internal sealed class InterpretedJoinStream : IBatchStream
     private readonly long _buildRowBytes;
     private readonly long _outputRowBytes;
 
+    private readonly ISpillStore _spillStore;
+    private readonly RowSpillCodec _buildCodec;
+    private readonly RowSpillCodec _probeCodec;
+    private readonly SpillStateWriter _recordWriter = new();
+
     private readonly Dictionary<RowKey, List<int>> _buildTable = new();
     private MutableColumnVector[] _buildColumns = [];
     private bool[] _matched = [];
@@ -58,6 +72,17 @@ internal sealed class InterpretedJoinStream : IBatchStream
     private int _outRows;
     private long _outReserved;
     private long _buildReserved;
+
+    // Grace-mode spill state.
+    private bool _grace;
+    private ISpillSegment[]? _buildPartitions;
+    private ISpillSegment[]? _probePartitions;
+    private ISpillSegment? _buildNull;
+    private ISpillSegment? _probeNull;
+    private bool _probePartitioned;
+    private int _gracePartition;
+    private ISpillSegmentReader? _probeReader;
+    private long _spilledBytes;
 
     // Probe state, preserved across pulls so a left row's matches resume mid-chunk.
     private ColumnBatch? _leftBatch;
@@ -107,6 +132,10 @@ internal sealed class InterpretedJoinStream : IBatchStream
         _emitUnmatchedBuild = _joinType is JoinType.RightOuter or JoinType.FullOuter;
         _buildRowBytes = RowSizeEstimate.Bytes(op.Children[1].OutputSchema);
         _outputRowBytes = RowSizeEstimate.Bytes(op.OutputSchema);
+
+        _spillStore = context.SpillStore;
+        _buildCodec = new RowSpillCodec(op.Children[1].OutputSchema);
+        _probeCodec = new RowSpillCodec(op.Children[0].OutputSchema);
     }
 
     /// <inheritdoc />
@@ -174,12 +203,86 @@ internal sealed class InterpretedJoinStream : IBatchStream
         {
             try
             {
-                _probe.Dispose();
+                // Dispose all spill resources (deletes temp files for a TempFileSpillStore) on the normal,
+                // cancellation, AND failure paths, so a grace join leaves no leaked temp files.
+                DisposeGraceResources();
             }
             finally
             {
-                _build.Dispose();
+                try
+                {
+                    _probe.Dispose();
+                }
+                finally
+                {
+                    _build.Dispose();
+                }
             }
+        }
+    }
+
+    private void DisposeGraceResources()
+    {
+        try
+        {
+            _probeReader?.Dispose();
+            _probeReader = null;
+        }
+        finally
+        {
+            try
+            {
+                DisposeSegmentArray(_buildPartitions);
+                _buildPartitions = null;
+            }
+            finally
+            {
+                try
+                {
+                    DisposeSegmentArray(_probePartitions);
+                    _probePartitions = null;
+                }
+                finally
+                {
+                    try
+                    {
+                        _buildNull?.Dispose();
+                        _buildNull = null;
+                    }
+                    finally
+                    {
+                        _probeNull?.Dispose();
+                        _probeNull = null;
+                    }
+                }
+            }
+        }
+    }
+
+    private static void DisposeSegmentArray(ISpillSegment[]? segments)
+    {
+        if (segments is null)
+        {
+            return;
+        }
+
+        DisposeSegmentsFrom(segments, 0);
+    }
+
+    private static void DisposeSegmentsFrom(ISpillSegment[] segments, int index)
+    {
+        if (index >= segments.Length)
+        {
+            return;
+        }
+
+        try
+        {
+            segments[index].Dispose();
+        }
+        finally
+        {
+            DisposeSegmentsFrom(segments, index + 1);
         }
     }
 
@@ -202,6 +305,16 @@ internal sealed class InterpretedJoinStream : IBatchStream
             _metrics.AddElapsedNanos(InterpretedOperators.ElapsedNanos(start));
         }
 
+        if (_grace)
+        {
+            // Build spilled: every build row now lives in a partition (or null) segment. The probe is
+            // partitioned lazily on first emit, then partitions are joined one at a time.
+            _metrics.AddSpilledBytes(_spilledBytes);
+            _spilledBytes = 0;
+            _gracePartition = -1;
+            return;
+        }
+
         _matched = new bool[_buildRowCount];
     }
 
@@ -216,6 +329,13 @@ internal sealed class InterpretedJoinStream : IBatchStream
             for (int c = 0; c < _rightCount; c++)
             {
                 columns[c] = batch.SelectedColumn(c);
+            }
+
+            // Already in grace mode: route the whole batch to spill partitions.
+            if (_grace)
+            {
+                PartitionBuildRange(keyVectors, columns, 0, rows);
+                return;
             }
 
             for (int r = 0; r < rows; r++)
@@ -240,8 +360,16 @@ internal sealed class InterpretedJoinStream : IBatchStream
 
                 // The var-width term charges the TRUE byte length of every buffered right column,
                 // so a wide string/binary build payload cannot bypass the budget.
-                ReserveBuild(
-                    _buildRowBytes + key.Length + RowSizeEstimate.VariableWidthBytes(columns, r) + overhead);
+                if (!TryReserveBuild(
+                    _buildRowBytes + key.Length + RowSizeEstimate.VariableWidthBytes(columns, r) + overhead))
+                {
+                    // Refused: spill all buffered build rows, then partition the rest of this batch
+                    // (including the current row r) straight to disk. The build side is now grace mode.
+                    SwitchToGraceBuild();
+                    PartitionBuildRange(keyVectors, columns, r, rows);
+                    return;
+                }
+
                 int ordinal = _buildRowCount++;
                 for (int c = 0; c < _rightCount; c++)
                 {
@@ -298,10 +426,19 @@ internal sealed class InterpretedJoinStream : IBatchStream
             }
             else
             {
-                if (!_emitUnmatchedBuild || !EmitUnmatchedBuild())
+                // Probe exhausted for the current scope: emit the unmatched build rows (OUTER), then in
+                // grace mode advance to the next partition; otherwise the join is complete.
+                if (_emitUnmatchedBuild && EmitUnmatchedBuild())
                 {
                     return;
                 }
+
+                if (_grace && AdvanceGracePartition())
+                {
+                    continue;
+                }
+
+                return;
             }
         }
     }
@@ -311,10 +448,20 @@ internal sealed class InterpretedJoinStream : IBatchStream
         _leftScratch?.Release();
         _leftScratch = null;
 
-        // Time the probe child pull separately so it is excluded from the join's self-time.
-        long probeStart = Stopwatch.GetTimestamp();
-        bool hasNext = _probe.TryGetNext(out ColumnBatch? next);
-        _probePullNanos += InterpretedOperators.ElapsedNanos(probeStart);
+        ColumnBatch? next;
+        bool hasNext;
+        if (_grace)
+        {
+            hasNext = TryReadProbePartitionBatch(out next);
+        }
+        else
+        {
+            // Time the probe child pull separately so it is excluded from the join's self-time.
+            long probeStart = Stopwatch.GetTimestamp();
+            hasNext = _probe.TryGetNext(out next);
+            _probePullNanos += InterpretedOperators.ElapsedNanos(probeStart);
+        }
+
         if (!hasNext)
         {
             _leftBatch = null;
@@ -326,7 +473,13 @@ internal sealed class InterpretedJoinStream : IBatchStream
         _leftRows = _leftBatch.LogicalRowCount;
         _leftRow = 0;
         _rowInitialized = false;
-        _metrics.AddInputRows(_leftRows);
+
+        // In grace mode probe rows were already counted as input during partitioning; only the streaming
+        // (no-spill) path counts them here.
+        if (!_grace)
+        {
+            _metrics.AddInputRows(_leftRows);
+        }
 
         _leftScratch = new BatchEvaluationMemory(_memory);
         _leftKeyVectors = _leftKeys.Evaluate(_leftBatch, _leftScratch, _cancellationToken);
@@ -542,19 +695,352 @@ internal sealed class InterpretedJoinStream : IBatchStream
         _outRows = 0;
     }
 
-    private void ReserveBuild(long bytes)
+    private bool TryReserveBuild(long bytes)
+    {
+        if (!_memory.TryReserve(bytes))
+        {
+            return false;
+        }
+
+        _buildReserved += bytes;
+        _metrics.ObserveReservation(_buildReserved + _outReserved);
+        return true;
+    }
+
+    // ---- Grace-hash spill (STORY-03.6.2) --------------------------------------------------------------
+
+    // Switches the build side to grace mode: creates the spill partitions and flushes every already-
+    // buffered build row to disk, then releases all in-memory build state. A spill-store write failure
+    // here propagates out of EnsureBuilt before any row is emitted; Dispose then releases memory and
+    // deletes temp files (AC5: release-all + deterministic error + no partial output).
+    private void SwitchToGraceBuild()
+    {
+        EnsureGracePartitions();
+
+        // Flush the rows already materialized in _buildColumns (ordinals 0.._buildRowCount). Re-evaluate
+        // their keys over the buffered columns so each lands in the same partition a probe match will.
+        if (_buildRowCount > 0)
+        {
+            var buffered = new ManagedColumnBatch(_build.Schema, _buildColumns, _buildRowCount);
+            var scratch = new BatchEvaluationMemory(_memory);
+            try
+            {
+                ColumnVector[] keyVectors = _rightKeys.Evaluate(buffered, scratch, _cancellationToken);
+                PartitionBuildRange(keyVectors, _buildColumns, 0, _buildRowCount);
+            }
+            finally
+            {
+                scratch.Release();
+            }
+        }
+
+        _grace = true;
+
+        // Release the in-memory build reservation and drop the buffered rows / index.
+        if (_buildReserved > 0)
+        {
+            _memory.Release(_buildReserved);
+            _buildReserved = 0;
+        }
+
+        _buildTable.Clear();
+        _buildRowCount = 0;
+        _buildColumns = ColumnVectors.CreateForSchema(_build.Schema, OutputBatchRows);
+        _metrics.ObserveRelease(_outReserved);
+    }
+
+    private void PartitionBuildRange(ColumnVector[] keyVectors, ColumnVector[] columns, int start, int end)
+    {
+        for (int r = start; r < end; r++)
+        {
+            CancellationPolicy.Poll(_cancellationToken, r);
+            byte[] key = _rightKeys.Encode(keyVectors, r, out bool anyNull);
+            byte[] frame = _buildCodec.Encode(columns, r);
+
+            _recordWriter.Reset();
+            _recordWriter.WriteBool(!anyNull);
+            if (!anyNull)
+            {
+                _recordWriter.WriteBytes(key);
+            }
+
+            _recordWriter.WriteBytes(frame);
+
+            ISpillSegment target;
+            if (anyNull)
+            {
+                EnsureBuildNull();
+                target = _buildNull!;
+            }
+            else
+            {
+                target = _buildPartitions![(int)(RowKey.Fnv1a(key) % PartitionCount)];
+            }
+
+            target.Write(_recordWriter.WrittenSpan);
+            _spilledBytes += _recordWriter.WrittenSpan.Length;
+        }
+    }
+
+    // Drains the entire probe and partitions it to disk by the same hash, so each partition's probe rows
+    // join only against the co-located build partition. Null-key probe rows go to the null segment.
+    private void PartitionProbe()
+    {
+        EnsureProbePartitions();
+        long spilled = 0;
+        while (true)
+        {
+            long probeStart = Stopwatch.GetTimestamp();
+            bool hasNext = _probe.TryGetNext(out ColumnBatch? batch);
+            _probePullNanos += InterpretedOperators.ElapsedNanos(probeStart);
+            if (!hasNext)
+            {
+                break;
+            }
+
+            _cancellationToken.ThrowIfCancellationRequested();
+            _metrics.AddInputRows(batch!.LogicalRowCount);
+            var scratch = new BatchEvaluationMemory(_memory);
+            try
+            {
+                ColumnVector[] keyVectors = _leftKeys.Evaluate(batch, scratch, _cancellationToken);
+                var columns = new ColumnVector[_leftCount];
+                for (int c = 0; c < _leftCount; c++)
+                {
+                    columns[c] = batch.SelectedColumn(c);
+                }
+
+                int rows = batch.LogicalRowCount;
+                for (int r = 0; r < rows; r++)
+                {
+                    CancellationPolicy.Poll(_cancellationToken, r);
+                    byte[] key = _leftKeys.Encode(keyVectors, r, out bool anyNull);
+                    byte[] frame = _probeCodec.Encode(columns, r);
+
+                    ISpillSegment target;
+                    if (anyNull)
+                    {
+                        EnsureProbeNull();
+                        target = _probeNull!;
+                    }
+                    else
+                    {
+                        target = _probePartitions![(int)(RowKey.Fnv1a(key) % PartitionCount)];
+                    }
+
+                    target.Write(frame);
+                    spilled += frame.Length;
+                }
+            }
+            finally
+            {
+                scratch.Release();
+            }
+        }
+
+        _metrics.AddSpilledBytes(spilled);
+        _probePartitioned = true;
+    }
+
+    // Advances to the next logical partition in the grace emit sequence: real partitions 0..P-1, then the
+    // probe-null pseudo-partition (empty build → unmatched probe rows for LEFT/FULL/ANTI), then the
+    // build-null pseudo-partition (empty probe → unmatched build rows for RIGHT/FULL). Returns false when
+    // every partition is drained. Reuses the in-memory per-row emit machinery unchanged.
+    private bool AdvanceGracePartition()
+    {
+        if (!_probePartitioned)
+        {
+            PartitionProbe();
+        }
+
+        // Release the previous partition's build reservation and probe reader before loading the next.
+        if (_buildReserved > 0)
+        {
+            _memory.Release(_buildReserved);
+            _buildReserved = 0;
+        }
+
+        _probeReader?.Dispose();
+        _probeReader = null;
+
+        _gracePartition++;
+        if (_gracePartition >= PartitionCount + 2)
+        {
+            return false;
+        }
+
+        ResetBuildTable();
+
+        if (_gracePartition < PartitionCount)
+        {
+            LoadBuildPartition(_buildPartitions?[_gracePartition]);
+            _probeReader = _probePartitions?[_gracePartition].OpenRead();
+        }
+        else if (_gracePartition == PartitionCount)
+        {
+            // Probe-null partition: empty build, probe = null-key probe rows (never match).
+            _probeReader = _probeNull?.OpenRead();
+        }
+        else
+        {
+            // Build-null partition: build = null-key build rows (never indexed), empty probe.
+            LoadBuildPartition(_buildNull);
+        }
+
+        _probeDone = false;
+        _unmatchedCursor = 0;
+        _leftBatch = null;
+        _leftRow = 0;
+        _leftRows = 0;
+        _rowInitialized = false;
+        return true;
+    }
+
+    private void ResetBuildTable()
+    {
+        _buildTable.Clear();
+        _buildRowCount = 0;
+        _buildColumns = ColumnVectors.CreateForSchema(_build.Schema, OutputBatchRows);
+        _matched = [];
+    }
+
+    private void LoadBuildPartition(ISpillSegment? segment)
+    {
+        if (segment is null)
+        {
+            _matched = new bool[0];
+            return;
+        }
+
+        using ISpillSegmentReader reader = segment.OpenRead();
+        while (reader.TryRead(out byte[]? record))
+        {
+            _cancellationToken.ThrowIfCancellationRequested();
+            var stateReader = new SpillStateReader(record);
+            bool hasKey = stateReader.ReadBool();
+            byte[]? key = hasKey ? stateReader.ReadBytes().ToArray() : null;
+            ReadOnlySpan<byte> frame = stateReader.ReadBytes();
+
+            long overhead = RowSizeEstimate.MatchFlagBytes;
+            RowKey rowKey = default;
+            List<int>? existing = null;
+            if (hasKey)
+            {
+                rowKey = new RowKey(key!);
+                overhead += _buildTable.TryGetValue(rowKey, out existing)
+                    ? RowSizeEstimate.ListAppendBytes
+                    : RowSizeEstimate.HashTableEntryBytes + RowSizeEstimate.ListHeaderBytes;
+            }
+
+            ReservePartitionBuild(_buildRowBytes + (key?.Length ?? 0) + overhead);
+            int ordinal = _buildRowCount++;
+            _buildCodec.DecodeInto(_buildColumns, frame);
+
+            if (!hasKey)
+            {
+                continue;
+            }
+
+            if (existing is not null)
+            {
+                existing.Add(ordinal);
+            }
+            else
+            {
+                _buildTable[rowKey] = [ordinal];
+            }
+        }
+
+        _matched = new bool[_buildRowCount];
+    }
+
+    private bool TryReadProbePartitionBatch([NotNullWhen(true)] out ColumnBatch? batch)
+    {
+        if (_probeReader is null)
+        {
+            batch = null;
+            return false;
+        }
+
+        MutableColumnVector[]? columns = null;
+        int rows = 0;
+        while (rows < OutputBatchRows && _probeReader.TryRead(out byte[]? record))
+        {
+            _cancellationToken.ThrowIfCancellationRequested();
+            columns ??= ColumnVectors.CreateForSchema(_probe.Schema, OutputBatchRows);
+            _probeCodec.DecodeInto(columns, record);
+            rows++;
+        }
+
+        if (columns is null)
+        {
+            batch = null;
+            return false;
+        }
+
+        batch = new ManagedColumnBatch(_probe.Schema, columns, rows);
+        return true;
+    }
+
+    private void ReservePartitionBuild(long bytes)
     {
         if (!_memory.TryReserve(bytes))
         {
             throw new ExecutionMemoryException(
                 bytes, _memory.AvailableBytes, _memory.BudgetBytes,
-                "the join build side cannot spill in v1 (grace-hash spill is STORY-03.5.x); "
-                + "raise the query/tenant memory budget or make the smaller relation the build side");
+                "a single spilled join partition's build side exceeds the operator memory budget on "
+                + "recovery; raise the budget (recursive re-partitioning of an over-large partition is "
+                + "deferred to the shuffle epic)");
         }
 
         _buildReserved += bytes;
         _metrics.ObserveReservation(_buildReserved + _outReserved);
     }
+
+    private void EnsureGracePartitions()
+    {
+        if (_buildPartitions is not null)
+        {
+            return;
+        }
+
+        _buildPartitions = CreatePartitionSegments("join-build");
+        _probePartitions = CreatePartitionSegments("join-probe");
+    }
+
+    private void EnsureProbePartitions()
+    {
+        // The probe partitions are created alongside the build partitions when grace mode begins.
+        EnsureGracePartitions();
+    }
+
+    private ISpillSegment[] CreatePartitionSegments(string label)
+    {
+        var segments = new ISpillSegment[PartitionCount];
+        int created = 0;
+        try
+        {
+            for (; created < PartitionCount; created++)
+            {
+                segments[created] = _spillStore.CreateSegment($"{label}-p{created}");
+            }
+        }
+        catch
+        {
+            for (int i = 0; i < created; i++)
+            {
+                segments[i].Dispose();
+            }
+
+            throw;
+        }
+
+        return segments;
+    }
+
+    private void EnsureBuildNull() => _buildNull ??= _spillStore.CreateSegment("join-build-null");
+
+    private void EnsureProbeNull() => _probeNull ??= _spillStore.CreateSegment("join-probe-null");
 
     private void ReserveOutput(long bytes)
     {
