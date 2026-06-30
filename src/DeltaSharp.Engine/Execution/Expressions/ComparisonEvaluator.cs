@@ -42,6 +42,7 @@ internal sealed class ComparisonEvaluator : ExpressionEvaluator
 
         for (int i = 0; i < rows; i++)
         {
+            CancellationPolicy.Poll(cancellationToken, i);
             if ((leftNulls && left.IsNull(i)) || (rightNulls && right.IsNull(i)))
             {
                 result.AppendNull();

@@ -39,6 +39,7 @@ internal sealed class LogicalEvaluator : ExpressionEvaluator
             bool leftNulls = left.HasNulls;
             for (int i = 0; i < rows; i++)
             {
+                CancellationPolicy.Poll(cancellationToken, i);
                 Append(result, NullPropagation.KleeneNot(ReadLane(left, leftNulls, i)));
             }
 
@@ -50,6 +51,7 @@ internal sealed class LogicalEvaluator : ExpressionEvaluator
         bool rhsNulls = right.HasNulls;
         for (int i = 0; i < rows; i++)
         {
+            CancellationPolicy.Poll(cancellationToken, i);
             bool? a = ReadLane(left, lhsNulls, i);
             bool? b = ReadLane(right, rhsNulls, i);
             Append(result, _op == LogicalOperator.And ? NullPropagation.KleeneAnd(a, b) : NullPropagation.KleeneOr(a, b));

@@ -153,17 +153,34 @@ internal sealed class InterpretedJoinStream : IBatchStream
         }
 
         _disposed = true;
-        _leftScratch?.Release();
-        _leftScratch = null;
-        ReleaseOutputReservation();
-        if (_buildReserved > 0)
-        {
-            _memory.Release(_buildReserved);
-            _buildReserved = 0;
-        }
 
-        _probe.Dispose();
-        _build.Dispose();
+        // Release this operator's own reservations first (so its exactly-once accounting holds), then
+        // dispose the children in a nested try/finally so a throw from the probe Dispose (or the own-byte
+        // release) cannot skip the build Dispose and strand its (grandchild) reservations.
+        try
+        {
+            _leftScratch?.Release();
+            _leftScratch = null;
+            ReleaseOutputReservation();
+            if (_buildReserved > 0)
+            {
+                _memory.Release(_buildReserved);
+                _buildReserved = 0;
+            }
+
+            _metrics.ObserveRelease(0);
+        }
+        finally
+        {
+            try
+            {
+                _probe.Dispose();
+            }
+            finally
+            {
+                _build.Dispose();
+            }
+        }
     }
 
     private void EnsureBuilt()
@@ -203,11 +220,28 @@ internal sealed class InterpretedJoinStream : IBatchStream
 
             for (int r = 0; r < rows; r++)
             {
+                CancellationPolicy.Poll(_cancellationToken, r);
                 byte[] key = _rightKeys.Encode(keyVectors, r, out bool anyNull);
+
+                // Decide the collection overhead (deferral (a)) BEFORE reserving, so the reservation
+                // precedes every mutation: the _matched flag is charged for every build row; a non-null
+                // key additionally charges a hash entry + new List<int> when first seen, or an amortized
+                // list-append when the key already exists. Look the bucket up once and reuse it below.
+                long overhead = RowSizeEstimate.MatchFlagBytes;
+                RowKey rowKey = default;
+                List<int>? existing = null;
+                if (!anyNull)
+                {
+                    rowKey = new RowKey(key);
+                    overhead += _buildTable.TryGetValue(rowKey, out existing)
+                        ? RowSizeEstimate.ListAppendBytes
+                        : RowSizeEstimate.HashTableEntryBytes + RowSizeEstimate.ListHeaderBytes;
+                }
 
                 // The var-width term charges the TRUE byte length of every buffered right column,
                 // so a wide string/binary build payload cannot bypass the budget.
-                ReserveBuild(_buildRowBytes + key.Length + RowSizeEstimate.VariableWidthBytes(columns, r));
+                ReserveBuild(
+                    _buildRowBytes + key.Length + RowSizeEstimate.VariableWidthBytes(columns, r) + overhead);
                 int ordinal = _buildRowCount++;
                 for (int c = 0; c < _rightCount; c++)
                 {
@@ -227,10 +261,9 @@ internal sealed class InterpretedJoinStream : IBatchStream
                     continue;
                 }
 
-                var rowKey = new RowKey(key);
-                if (_buildTable.TryGetValue(rowKey, out List<int>? list))
+                if (existing is not null)
                 {
-                    list.Add(ordinal);
+                    existing.Add(ordinal);
                 }
                 else
                 {
@@ -308,6 +341,7 @@ internal sealed class InterpretedJoinStream : IBatchStream
 
     private void EmitLeftRow()
     {
+        CancellationPolicy.Poll(_cancellationToken, _leftRow);
         if (!_rowInitialized)
         {
             InitializeLeftRow();
@@ -422,7 +456,12 @@ internal sealed class InterpretedJoinStream : IBatchStream
 
     private void AppendJoinedRow(int leftRow, int buildRow)
     {
-        ReserveOutput(_outputRowBytes);
+        // Output var-width accounting (deferral (c)): charge the TRUE byte length of the copied left and
+        // build values on top of the flat row estimate, so the bounded output chunk holds in bytes.
+        ReserveOutput(
+            _outputRowBytes
+            + RowSizeEstimate.VariableWidthBytes(_leftColumns!, leftRow)
+            + RowSizeEstimate.VariableWidthBytes(_buildColumns, buildRow));
         for (int c = 0; c < _leftCount; c++)
         {
             AppendValueOrNull(_outColumns[c], _leftColumns![c], leftRow);
@@ -438,7 +477,7 @@ internal sealed class InterpretedJoinStream : IBatchStream
 
     private void AppendLeftWithNullRight(int leftRow)
     {
-        ReserveOutput(_outputRowBytes);
+        ReserveOutput(_outputRowBytes + RowSizeEstimate.VariableWidthBytes(_leftColumns!, leftRow));
         for (int c = 0; c < _leftCount; c++)
         {
             AppendValueOrNull(_outColumns[c], _leftColumns![c], leftRow);
@@ -454,7 +493,7 @@ internal sealed class InterpretedJoinStream : IBatchStream
 
     private void AppendNullLeftWithBuild(int buildRow)
     {
-        ReserveOutput(_outputRowBytes);
+        ReserveOutput(_outputRowBytes + RowSizeEstimate.VariableWidthBytes(_buildColumns, buildRow));
         for (int c = 0; c < _leftCount; c++)
         {
             _outColumns[c].AppendNull();
@@ -470,7 +509,7 @@ internal sealed class InterpretedJoinStream : IBatchStream
 
     private void AppendLeftOnly(int leftRow)
     {
-        ReserveOutput(_outputRowBytes);
+        ReserveOutput(_outputRowBytes + RowSizeEstimate.VariableWidthBytes(_leftColumns!, leftRow));
         for (int c = 0; c < _leftCount; c++)
         {
             AppendValueOrNull(_outColumns[c], _leftColumns![c], leftRow);
@@ -514,7 +553,7 @@ internal sealed class InterpretedJoinStream : IBatchStream
         }
 
         _buildReserved += bytes;
-        _metrics.ObservePeakMemory(_buildReserved + _outReserved);
+        _metrics.ObserveReservation(_buildReserved + _outReserved);
     }
 
     private void ReserveOutput(long bytes)
@@ -527,7 +566,7 @@ internal sealed class InterpretedJoinStream : IBatchStream
         }
 
         _outReserved += bytes;
-        _metrics.ObservePeakMemory(_buildReserved + _outReserved);
+        _metrics.ObserveReservation(_buildReserved + _outReserved);
     }
 
     private void ReleaseOutputReservation()
@@ -536,6 +575,7 @@ internal sealed class InterpretedJoinStream : IBatchStream
         {
             _memory.Release(_outReserved);
             _outReserved = 0;
+            _metrics.ObserveRelease(_buildReserved + _outReserved);
         }
     }
 }

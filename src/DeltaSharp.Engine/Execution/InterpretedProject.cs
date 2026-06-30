@@ -202,7 +202,7 @@ internal sealed class InterpretedProjectStream : IBatchStream
         }
 
         _reservedBytes += bytes;
-        _metrics.ObservePeakMemory(_reservedBytes);
+        _metrics.ObserveReservation(_reservedBytes);
     }
 
     private void ReleaseReservation()
@@ -211,6 +211,7 @@ internal sealed class InterpretedProjectStream : IBatchStream
         {
             _memory.Release(_reservedBytes);
             _reservedBytes = 0;
+            _metrics.ObserveRelease(_reservedBytes);
         }
 
         if (_evalMemory is not null)
