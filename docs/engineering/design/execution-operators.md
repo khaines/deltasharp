@@ -4,7 +4,9 @@
 > [STORY-03.1.1](https://github.com/khaines/deltasharp/blob/main/docs/planning/epics/EPIC-03-vectorized-execution-backend.md#story-0311-define-backend-and-operator-execution-contracts);
 > extended with
 > [STORY-03.2.1](https://github.com/khaines/deltasharp/blob/main/docs/planning/epics/EPIC-03-vectorized-execution-backend.md#story-0321-implement-scan-filter-and-project-operators)
-> (the first executable scan/filter/project operators).
+> (the first executable scan/filter/project operators) and
+> [STORY-03.2.2](https://github.com/khaines/deltasharp/blob/main/docs/planning/epics/EPIC-03-vectorized-execution-backend.md#story-0322-implement-aggregate-sort-join-and-exchange-local-operators)
+> (aggregate/sort/join/exchange-local — see [relational-operators.md](relational-operators.md)).
 > Grounded in [ADR-0001](../../adr/0001-execution-strategy.md) (pluggable vectorized
 > interpreter + optional JIT codegen tier) and [ADR-0014](../../adr/0014-target-framework-aot.md)
 > (NativeAOT executor). Extends [execution-backend.md](execution-backend.md) from a single scalar
@@ -56,9 +58,12 @@ emits only `OutputSchema`-conforming batches. Every node owns an `OperatorMetric
 `Supports(kind)` lets the planner pick a supported shape; `Open` on an unsupported shape throws
 `UnsupportedOperatorException` (a `NotSupportedException`) naming the kind and backend. **No
 row-at-a-time fallback exists** — silent degradation would mask plan regressions, hide parity gaps,
-and forfeit columnar performance/cost bounds. As of STORY-03.2.1 the backend supports `Scan`,
-`Filter`, and `Project`; the remaining kinds (`Aggregate`, `Sort`, `Join`, `ExchangeLocal`) stay
-fail-fast until their kernels land in later FEAT-03.2 stories, behind this unchanged shape.
+and forfeit columnar performance/cost bounds. As of STORY-03.2.2 the backend supports **all seven**
+`OperatorKind`s (`Scan`, `Filter`, `Project`, `Aggregate`, `Sort`, `Join`, `ExchangeLocal`), so the
+fail-fast policy now guards unshipped **shapes within a supported kind** — `AVG(decimal)`, a
+non-byte-sortable group/sort/join key, or a non-`AggregateExpression` aggregate term — each of which
+throws the same precise, backend-attributed `UnsupportedOperatorException` at `Open` rather than
+degrading. See [relational-operators.md](relational-operators.md) for the per-operator shape matrix.
 
 ## Executable scan / filter / project (STORY-03.2.1)
 
@@ -133,10 +138,10 @@ NativeAOT — the interpreter needs no codegen to be correct.
 
 ## What is deferred
 
-- Remaining operator **kernels** (aggregate, sort, join, exchange) and the SIMD library
-  (FEAT-03.2/03.3). The interpreted **expression evaluator** (arithmetic, comparison, boolean Kleene
-  3VL, cast, null-check) that lifts the `ColumnReference`-only restriction on filter/project landed in
-  [STORY-03.4.1](interpreted-expression-evaluator.md); compiled expression fusion is STORY-03.4.2.
+- The relational operators **aggregate, sort, join, and exchange-local** are now implemented
+  (STORY-03.2.2, [relational-operators.md](relational-operators.md)); their **residual deferrals** —
+  `AVG(decimal)`, **spill** for the blocking buffers, zero-box typed-hash keys, and Murmur3 exchange
+  hashing — are tracked there. The SIMD/whole-stage **codegen** acceleration stays in FEAT-03.3.
 - Real **Parquet/Delta and connector scan sources** (predicate/partition pushdown, column pruning,
   data skipping, byte-accurate scan accounting) behind the `Scan` shape — owned by the storage and
   connector layers; `InMemoryScanOperator` is the v1 stand-in.

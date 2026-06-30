@@ -153,31 +153,40 @@ public class ExecutionContractsTests
     public void InputSchema_OutOfRange_Throws()
         => Assert.Throws<ArgumentOutOfRangeException>(() => Scan().InputSchema(0));
 
-    // ----- AC3: unsupported operators raise a precise error, never a row-at-a-time fallback -----
+    // ----- AC3: unsupported shapes raise a precise error, never a row-at-a-time fallback -----
 
+    // STORY-03.2.2 lit up Aggregate/Sort/Join/ExchangeLocal, so every defined OperatorKind is now an
+    // executable v1 shape. (Unshipped *shapes* within a supported kind still fail closed — see below.)
     [Theory]
     [InlineData(OperatorKind.Scan)]
     [InlineData(OperatorKind.Filter)]
     [InlineData(OperatorKind.Project)]
-    public void Interpreted_SupportsV1ExecutableKinds(OperatorKind kind)
-        => Assert.True(InterpretedVectorizedBackend.Instance.Supports(kind));
-
-    [Theory]
     [InlineData(OperatorKind.Aggregate)]
     [InlineData(OperatorKind.Sort)]
     [InlineData(OperatorKind.Join)]
     [InlineData(OperatorKind.ExchangeLocal)]
-    public void Interpreted_DeclaresRemainingKindsUnsupported_ForV1(OperatorKind kind)
-        => Assert.False(InterpretedVectorizedBackend.Instance.Supports(kind));
+    public void Interpreted_SupportsV1ExecutableKinds(OperatorKind kind)
+        => Assert.True(InterpretedVectorizedBackend.Instance.Supports(kind));
 
     [Fact]
-    public void Open_UnsupportedKind_ThrowsPreciseError_NoFallback()
+    public void Interpreted_SupportsEveryDefinedOperatorKind()
+        => Assert.All(Enum.GetValues<OperatorKind>(), kind => Assert.True(InterpretedVectorizedBackend.Instance.Supports(kind)));
+
+    [Fact]
+    public void Open_UnsupportedShape_ThrowsPreciseError_NoFallback()
     {
         IExecutionBackend backend = InterpretedVectorizedBackend.Instance;
         var ctx = new ExecutionContext(BoundedExecutionMemory.Unbounded);
-        var sort = new SortOperator(Scan(), [new SortOrder(IntCol, SortDirection.Ascending, NullOrdering.NullsFirst)]);
-        var ex = Assert.Throws<UnsupportedOperatorException>(() => backend.Open(sort, ctx));
-        Assert.Equal(OperatorKind.Sort, ex.Kind);
+
+        // AVG(decimal) is a deferred shape inside the supported Aggregate kind: it must fail closed with
+        // a precise, backend-attributed UnsupportedOperatorException, not silently fall back row-at-a-time.
+        var decType = new DecimalType(10, 2);
+        var avg = new AggregateExpression(AggregateFunction.Average, new ColumnReference(0, decType, nullable: true));
+        var input = new InMemoryScanOperator(new StructType([new StructField("d", decType, nullable: true)]), []);
+        var agg = new AggregateOperator(input, new StructType([new StructField("avg_d", avg.Type, avg.Nullable)]), groupingKeys: [], aggregates: [avg]);
+
+        var ex = Assert.Throws<UnsupportedOperatorException>(() => backend.Open(agg, ctx));
+        Assert.Equal(OperatorKind.Aggregate, ex.Kind);
         Assert.Equal(backend.Name, ex.BackendName);
         Assert.Contains("No row-at-a-time fallback", ex.Message, StringComparison.Ordinal);
         Assert.IsAssignableFrom<NotSupportedException>(ex);
