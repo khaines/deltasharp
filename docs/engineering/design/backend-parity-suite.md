@@ -7,7 +7,8 @@
 > *and* the parity oracle**, and the compiled tier is "an additive fast-path, never a dependency" that
 > "must match it bit-for-bit." Builds directly on
 > [compiled-expression-fusion.md](compiled-expression-fusion.md) (STORY-03.4.2, #152 — the compiled
-> tier under test and its existing 80 expression-level differential tests), the interpreted evaluator
+> tier under test and its existing curated expression-level differential tests — 61 differential cases
+> within an 82-test fusion suite), the interpreted evaluator
 > (STORY-03.4.1 — the reference), and [relational-operators.md](relational-operators.md) (the seven v1
 > operator shapes). Update it whenever the seam (where the tiers can diverge), the fusable surface, the
 > exception-parity scope, the generator grammar, or the skip policy changes.
@@ -108,9 +109,9 @@ timestamp`). 250 fixed seeds drive three theories:
 ### 3.3 Relationship to #152
 
 The #152 `CompiledExpressionFusionTests` are **expression-level** differential tests over a *curated*
-case table (80 cases: arithmetic/comparison/boolean/cast/null, NaN/`-0.0` edges, decimal carriers,
-selection/slice views, ANSI single- and multi-error). This suite **complements** them by adding the two
-things they do not cover:
+case table (61 differential cases within an 82-test fusion suite: arithmetic/comparison/boolean/cast/null,
+NaN/`-0.0` edges, decimal carriers, selection/slice views, ANSI single- and multi-error). This suite
+**complements** them by adding the two things they do not cover:
 
 1. **Operator/plan-level golden parity** across all seven v1 operator kinds (§3.1) — proving the
    expression seam is exercised through the actual `PhysicalOperator` shapes a planner emits.
