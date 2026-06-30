@@ -205,17 +205,25 @@ in both runs and Legacy nulls the group in both, regardless of fold order.
 
 ### 4.1 Overflow / decimal survival
 
-`SumLong` accumulates in an **unchecked `Int128`** and `SumDecimal` in an **unchecked `Int128` unscaled
-mantissa** ([`Aggregators.cs`](../../../src/DeltaSharp.Engine/Execution/Aggregators.cs)); the fit-to-`long`
-/ `ToType` precision check is applied **once, to the FINAL value, at emit** (#156 B2). Because `Int128`
-addition is modular and associative, the merged total equals the true sum whenever that sum fits `Int128`
-— and any value that fits the result type necessarily does — so a spilled per-partition partial and the
-single-pass no-spill fold reach the same final value and apply the same one check. This makes integer and
-decimal SUM **exact under spill by construction**, and it closes the transient-overflow divergence the
-Architect flagged (a cross-round transient that the true sum recovers from is never detected on either
-path). `WriteState`/`MergeState` carry the raw `Int128` partial (decimal also carries the uniform input
-scale) with **no intermediate overflow check**, so a `decimal(28,2)` sum survives serialize→merge unchanged
-and final overflow follows `AnsiMode`: ANSI throws `ArithmeticOverflowException`
+`SumLong` accumulates in an **unchecked `Int128`** and `SumDecimal` in an **unchecked arbitrary-precision
+`BigInteger`** unscaled mantissa
+([`Aggregators.cs:354`](../../../src/DeltaSharp.Engine/Execution/Aggregators.cs)); the fit-to-`long` /
+`ToType` precision check is applied **once, to the FINAL value, at emit** (#156 B2). The accumulator width is
+chosen so the running sum **never wraps**: a `long` summed into `Int128` needs ~2^64 rows to overflow, but a
+single decimal mantissa is *already* a full-width `Int128` (`DecimalValue.Unscaled`), so an unchecked
+`Int128` decimal accumulator would wrap (mod 2^128) after as few as three near-max `decimal(38,0)` values and
+silently return a wrong result (#156 N1) — decimal therefore accumulates in `BigInteger`, which is
+arbitrary-precision and holds the exact true sum. Because both accumulators are associative and never wrap, a
+spilled per-partition partial and the single-pass no-spill fold reach the **same** final value and apply the
+same one check; this makes integer and decimal SUM **exact under spill by construction** and closes the
+transient-overflow divergence the Architect flagged (a cross-round transient that the true sum recovers from
+is never detected on either path — including a decimal partial that transiently exceeds `Int128` range). At
+emit the final value is range-checked once: `SumLong` fits-to-`long`; `SumDecimal` is an overflow iff the
+`BigInteger` falls outside `[Int128.MinValue, Int128.MaxValue]` (any value that fits the result type fits
+`Int128`), otherwise `ToType` applies the precision check. `WriteState`/`MergeState` carry the raw full-width
+partial — `Int128` for `SumLong`, the `BigInteger` mantissa byte array (`ToByteArray()`) plus the uniform
+input scale for `SumDecimal` — with **no intermediate overflow check**, so a `decimal(28,2)` sum survives
+serialize→merge unchanged and final overflow follows `AnsiMode`: ANSI throws `ArithmeticOverflowException`
 ([`Types`](../../../src/DeltaSharp.Engine/Types/)), Legacy yields NULL.
 
 ## 5. The I/O-failure contract (AC5)
