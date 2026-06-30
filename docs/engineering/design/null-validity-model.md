@@ -172,8 +172,10 @@ if (NullPropagation.NeedsValidityBitmap(av, bv))          // true: a has nulls
 
 - **Branchless/SIMD null helpers, popcount-accelerated counts, and combined validity over selection
   vectors** are [STORY-02.6.2](../../planning/epics/EPIC-02-columnar-memory-type-system.md#story-0262-add-branchless-null-helper-primitives)
-  (#144). The v1 bulk kernels here are scalar **references** the SIMD tier must match; `Validity.Bits`
-  + `Offset` is the seam those block kernels read.
+  (#144) — see [branchless-null-helpers.md](branchless-null-helpers.md). The v1 bulk kernels here are
+  scalar **references** the SIMD tier must match byte-for-byte; `Validity.Bits` + `Offset` is the seam
+  those block kernels read. (Popcount-accelerated counts and the SIMD propagate/Kleene fast paths landed
+  with #144; combined validity over selection vectors remains a follow-up there.)
 - **Exposing a packed bitmap from null-bearing managed/Arrow vectors.** `ColumnVector.TryGetValidity`
   guarantees only the no-null fast path in the base; a concrete vector that owns a packed buffer may
   override it to surface that buffer (enabling the bulk path for null-bearing inputs) without changing
