@@ -61,33 +61,40 @@ public class SelectionBenchmarkTests
     [Fact]
     public void Measure_TimedRegion_IsAllocationFree()
     {
-        // A high iteration count makes any per-iteration allocation visible against the fixed setup cost. The 100k-
-        // iteration timed loop runs long enough that the background JIT can promote Measure to tier-1 *mid-measurement*;
-        // that one-time OSR/recompile allocates on this thread and, under parallel test load, intermittently inflates
-        // the first reading (a load/timing artifact, not a real per-iteration allocation). Poll until a steady-state
-        // (tier-1) pass measures only the fixed setup cost, tolerating the one-time tier-up transient — the same
-        // pattern NullHelperBenchmarkTests.Measure_TimedRegion_IsAllocationFree uses.
-        const int maxAttempts = 50;
-        long allocated = long.MaxValue;
-        SelectionBenchmark.Result result = default;
-        for (int attempt = 0; attempt < maxAttempts && allocated > 4096; attempt++)
+        // Cover BOTH kernels (ToSelection and Compose) so a per-invocation allocation regression on either hot path
+        // is caught. The internal Operation enum is kept out of the public test signature (CS0051) by iterating here,
+        // matching NullHelperBenchmarkTests' convention.
+        foreach (SelectionBenchmark.Operation operation in
+            new[] { SelectionBenchmark.Operation.ToSelection, SelectionBenchmark.Operation.Compose })
         {
-            long before = GC.GetAllocatedBytesForCurrentThread();
-            result = SelectionBenchmark.Measure(
-                SelectionBenchmark.Operation.ToSelection, batchSize: 256, selectivity: 0.5, iterations: 100_000);
-            allocated = GC.GetAllocatedBytesForCurrentThread() - before;
-            if (allocated > 4096)
+            // A high iteration count makes any per-iteration allocation visible against the fixed setup cost. The
+            // 100k-iteration timed loop runs long enough that the background JIT can promote Measure to tier-1
+            // *mid-measurement*; that one-time OSR/recompile allocates on this thread and, under parallel test load,
+            // intermittently inflates the first reading (a load/timing artifact, not a real per-iteration allocation).
+            // Poll until a steady-state (tier-1) pass measures only the fixed setup cost, tolerating the one-time
+            // tier-up transient — the same pattern NullHelperBenchmarkTests.Measure_TimedRegion_IsAllocationFree uses.
+            const int maxAttempts = 50;
+            long allocated = long.MaxValue;
+            SelectionBenchmark.Result result = default;
+            for (int attempt = 0; attempt < maxAttempts && allocated > 4096; attempt++)
             {
-                Thread.Sleep(5); // let the background JIT promote Measure to tier-1, then re-measure
+                long before = GC.GetAllocatedBytesForCurrentThread();
+                result = SelectionBenchmark.Measure(
+                    operation, batchSize: 256, selectivity: 0.5, iterations: 100_000);
+                allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+                if (allocated > 4096)
+                {
+                    Thread.Sleep(5); // let the background JIT promote Measure to tier-1, then re-measure
+                }
             }
-        }
 
-        // Setup allocates a handful of small int/byte buffers (~2 KB at 256 rows); the 100k-iteration timed loop
-        // must add nothing (a per-iteration leak of even a few bytes would total hundreds of KB here).
-        Assert.True(
-            allocated <= 4096,
-            $"Measure allocated {allocated} bytes for 100k iterations after {maxAttempts} attempts (expected only fixed setup)");
-        Assert.Equal(100_000, result.Iterations);
+            // Setup allocates a handful of small int/byte buffers (~2 KB at 256 rows); the 100k-iteration timed loop
+            // must add nothing (a per-iteration leak of even a few bytes would total hundreds of KB here).
+            Assert.True(
+                allocated <= 4096,
+                $"Measure({operation}) allocated {allocated} bytes for 100k iterations after {maxAttempts} attempts (expected only fixed setup)");
+            Assert.Equal(100_000, result.Iterations);
+        }
     }
 
     [Fact]
