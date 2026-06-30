@@ -18,6 +18,23 @@ public class RowFrameValidationTests
     private static readonly StructType IntString = new(
         [new StructField("a", IntegerType.Instance), new StructField("s", StringType.Instance)]);
 
+    private static readonly StructType IntIntMap = new(
+        [new StructField("m", new MapType(IntegerType.Instance, IntegerType.Instance))]);
+
+    // Inner struct reused by the nested fuzz schema below.
+    private static readonly StructType NestedInner = new(
+        [new StructField("x", IntegerType.Instance), new StructField("s", StringType.Instance)]);
+
+    // A schema that exercises every nested validator branch — map (key/value pairing + non-null
+    // keys), array (with nested nulls), and a nested struct — so the fuzz reaches the map invariants
+    // a flat int/string schema never touches.
+    private static readonly StructType NestedMapArrayStruct = new(
+    [
+        new StructField("m", new MapType(StringType.Instance, IntegerType.Instance)),
+        new StructField("a", new ArrayType(LongType.Instance)),
+        new StructField("nested", NestedInner),
+    ]);
+
     private static byte[] ValidFrame(out int payloadStart)
     {
         var encoder = new BinaryRowEncoder(new NativeMemoryAllocator(scratchThreshold: 0));
@@ -93,6 +110,37 @@ public class RowFrameValidationTests
     }
 
     [Fact]
+    public void Map_KeyCountNotEqualValueCount_ThrowsValidation_NotIndexOutOfRange()
+    {
+        byte[] frame = ValidMapFrame(out int valueCountOffset, out _);
+
+        // Shrink the value-array element count 2 -> 1, so the map has 2 keys but 1 value. The keys
+        // and values arrays still validate *independently*, so without the map-pairing check this
+        // reaches RowDecoder.DecodeMap, which indexes values[1] while iterating the 2 keys and throws
+        // System.IndexOutOfRangeException — escaping the AC4 "only RowValidationException" contract.
+        BinaryPrimitives.WriteInt64LittleEndian(frame.AsSpan(valueCountOffset), 1);
+
+        var ex = Assert.Throws<RowValidationException>(() => RowSpillSerializer.ReadFrame(frame, IntIntMap, out _));
+        Assert.Contains("keys", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("values", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Map_NullKeyBit_ThrowsValidation_NotArgumentException()
+    {
+        byte[] frame = ValidMapFrame(out _, out int keyBitsetOffset);
+
+        // Mark key 0 null in the key-array null bitset. Arrays allow null elements, so the key array
+        // still validates; but map keys are never null, so without the null-key check this reaches
+        // MapData's ctor, which throws System.ArgumentException — again escaping the AC4 contract.
+        frame[keyBitsetOffset] |= 0x01;
+
+        var ex = Assert.Throws<RowValidationException>(() => RowSpillSerializer.ReadFrame(frame, IntIntMap, out _));
+        Assert.Contains("key", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("null", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void Truncation_AtEveryLength_ThrowsValidation_FullLengthDecodes()
     {
         byte[] frame = ValidFrame(out _);
@@ -113,40 +161,108 @@ public class RowFrameValidationTests
     public void Fuzz_RandomBytes_OnlyThrowRowValidationException()
     {
         var rng = new Lcg(0xBADC0DE);
+
+        // (1) Purely random bytes against a flat (int,string) schema and a nested map/array/struct
+        //     schema. Half of each batch is seeded with a valid magic/version/fingerprint so the deep
+        //     structural checks are reached (a purely random buffer almost never clears the magic).
+        FuzzRandomBytes(ref rng, IntString);
+        FuzzRandomBytes(ref rng, NestedMapArrayStruct);
+
+        // (2) Bit/byte corruptions of a *valid* nested frame. These stay close enough to valid to
+        //     drive the deep map/array/struct validators — map key/value count pairing, non-null
+        //     keys, array counts, nested recursion — that random noise reaches only by accident.
+        FuzzCorruptValidFrame(ref rng, NestedMapArrayStruct, ValidNestedFrame());
+    }
+
+    private static void FuzzRandomBytes(ref Lcg rng, StructType schema)
+    {
         for (int iteration = 0; iteration < 20000; iteration++)
         {
-            int length = rng.Next(80);
+            int length = rng.Next(96);
             byte[] buffer = new byte[length];
             for (int i = 0; i < length; i++)
             {
                 buffer[i] = (byte)rng.Next(256);
             }
 
-            // Half the time, plant a valid magic + version so the deeper structural checks are fuzzed
-            // too (a purely random buffer almost never gets past the magic).
+            // Half the time, plant a valid magic + version + fingerprint so the deeper structural
+            // checks are fuzzed too (a purely random buffer almost never gets past the magic).
             if ((iteration & 1) == 0 && length >= RowSpillSerializer.HeaderSize)
             {
                 "DSR1"u8.CopyTo(buffer);
                 BinaryPrimitives.WriteUInt16LittleEndian(buffer.AsSpan(4), RowSpillSerializer.CurrentFormatVersion);
-                BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(8), RowSpillSerializer.SchemaFingerprint(IntString));
+                BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(8), RowSpillSerializer.SchemaFingerprint(schema));
             }
 
-            AssertOnlyValidationFailure(buffer);
+            AssertOnlyValidationFailure(buffer, schema);
         }
     }
 
-    private static void AssertOnlyValidationFailure(byte[] buffer)
+    private static void FuzzCorruptValidFrame(ref Lcg rng, StructType schema, byte[] valid)
+    {
+        for (int iteration = 0; iteration < 20000; iteration++)
+        {
+            byte[] buffer = (byte[])valid.Clone();
+            int mutations = 1 + rng.Next(4); // 1..4 byte flips keep the frame near-valid.
+            for (int m = 0; m < mutations; m++)
+            {
+                buffer[rng.Next(buffer.Length)] = (byte)rng.Next(256);
+            }
+
+            AssertOnlyValidationFailure(buffer, schema);
+        }
+    }
+
+    private static byte[] ValidNestedFrame()
+    {
+        var encoder = new BinaryRowEncoder(new NativeMemoryAllocator(scratchThreshold: 0));
+        var map = new MapData(StringType.Instance, IntegerType.Instance, ["alpha", "beta"], [1, 2]);
+        var array = new ArrayData(LongType.Instance, containsNull: true, 10L, null, 30L);
+        var nested = new RowData(NestedInner, 7, "inner");
+        using BinaryRow row = encoder.Encode(new RowData(NestedMapArrayStruct, map, array, nested));
+        return RowSpillSerializer.WriteFrame(row);
+    }
+
+    private static void AssertOnlyValidationFailure(byte[] buffer, StructType schema)
     {
         try
         {
             // Either a clean decode or a bounded RowValidationException is acceptable; anything else
-            // (OOB, overflow, NRE, ...) is a failure of the bounded-validation guarantee.
-            RowSpillSerializer.ReadFrame(buffer, IntString, out _);
+            // (OOB, overflow, NRE, ArgumentException, ...) is a failure of the bounded-validation
+            // guarantee.
+            RowSpillSerializer.ReadFrame(buffer, schema, out _);
         }
         catch (RowValidationException)
         {
             // expected, bounded failure
         }
+    }
+
+    /// <summary>
+    /// Encodes a valid 2-entry <c>map&lt;int,int&gt;</c> row to a frame and reports the byte offsets a
+    /// test corrupts to break the map's key/value structure. The offsets are parsed from the encoded
+    /// frame (not hard-coded), so they track the real layout.
+    /// </summary>
+    private static byte[] ValidMapFrame(out int valueCountOffset, out int keyBitsetOffset)
+    {
+        var encoder = new BinaryRowEncoder(new NativeMemoryAllocator(scratchThreshold: 0));
+        var map = new MapData(IntegerType.Instance, IntegerType.Instance, [1, 2], [10, 20]);
+        using BinaryRow row = encoder.Encode(new RowData(IntIntMap, map));
+        byte[] frame = RowSpillSerializer.WriteFrame(row);
+
+        // payload = the struct block; field 0 (the map) is a variable reference in slot 0 (which sits
+        // right after the struct's 8-byte null bitset).
+        int payloadStart = RowSpillSerializer.HeaderSize;
+        long mapRef = BinaryPrimitives.ReadInt64LittleEndian(frame.AsSpan(payloadStart + 8));
+        int mapStart = payloadStart + (int)(mapRef >> 32);
+
+        // map block = [8-byte key-array size][key array][value array]; each array =
+        // [8-byte element count][null bitset][slots].
+        int keyArrayBytes = (int)BinaryPrimitives.ReadInt64LittleEndian(frame.AsSpan(mapStart));
+        int keyArrayStart = mapStart + 8;
+        keyBitsetOffset = keyArrayStart + 8;              // null bitset follows the 8-byte element count
+        valueCountOffset = keyArrayStart + keyArrayBytes; // value array begins right after the key array
+        return frame;
     }
 
     // ----- Direct validator tests: precise hand-crafted blocks. -----

@@ -207,13 +207,37 @@ followed by the row's binary-row payload.
 └────────┴─────────┴──────────┴───────────────┴──────────────┴───────────────────────┘
 ```
 
-- **magic** `"DSR1"` identifies a DeltaSharp row frame.
-- **version** is the frame format version (so the on-disk shape can evolve compatibly).
-- **schema fingerprint** is the schema's deterministic, process-independent hash
-  (`StructType.GetHashCode()`, FNV-1a based) — the **schema-version metadata** a reader checks
-  against its expected schema before trusting the payload.
+- **magic** `"DSR1"` is a **fixed brand tag** that identifies a DeltaSharp row frame. The trailing
+  `1` is part of the brand, **not** a version counter: the magic is *never* bumped on a format change.
+  Format evolution happens **only** through the `version` field (below). If a future format instead
+  changed the magic, a v1 reader would misdiagnose a newer frame as foreign bytes (`invalid magic`)
+  rather than reporting the more useful `unsupported version`, and back-compat tooling could no longer
+  recognize the frame family at all.
+- **version** is the frame format version and the **sole** compatible-evolution mechanism: a reader
+  that knows version *v* rejects *v+1* with a typed `unsupported frame format version` error. New
+  fields are added by spending `reserved` (below) and bumping `version`, leaving the magic constant.
+- **schema fingerprint** is a 32-bit, deterministic, process-independent hash of the schema
+  (`StructType.GetHashCode()`, FNV-1a based) — it is **not** the schema itself. The frame does **not**
+  carry the schema; the reader must supply the *expected* schema out-of-band (planner-controlled in
+  v1, where both ends of a shuffle/spill agree on the plan). The fingerprint is only a cheap
+  **sanity / schema-version check** — a guard against accidentally reading a frame with the wrong
+  schema — and is explicitly **not** tamper-evidence: a 32-bit non-cryptographic hash is trivial to
+  forge or collide. The real integrity defense is the structural validation in
+  [AC4](#bounded-validation-ac4), which range-checks every byte regardless of the fingerprint.
 - **payload length** bounds the row block that follows; the header is 16 bytes (8-aligned) and the
   payload is already 8-aligned, so the frame stays aligned.
+- **reserved** is two zero bytes today; readers **ignore** it, so a later format can spend it for a
+  small additive field (with a `version` bump) and stay forward-compatible with this layout.
+
+### Frame scope: one row per frame
+
+A frame wraps **exactly one row**. There is deliberately **no** block envelope here — no row count,
+no total-length prefix, and no checksum spanning multiple rows. `ReadFrame` returns the bytes it
+consumed so a caller can walk back-to-back frames out of a spill/shuffle segment, but the framing
+*of* that segment — a block header (row count / total byte length), batching, and any integrity /
+bit-rot detection (e.g. a CRC) — belongs to the **shuffle block format** ([#245](https://github.com/khaines/deltasharp/issues/245)),
+not to the per-row frame. Keeping the per-row frame minimal avoids paying envelope/checksum overhead
+per row and keeps the two concerns (one row's bytes vs. a block of many rows) cleanly separated.
 
 `WriteFrame(row, Span<byte>)` writes with no allocation; `ReadFrame(source, schema, out consumed)`
 validates and decodes, returning the exact bytes consumed so frames can be read back-to-back from a
@@ -241,7 +265,16 @@ the block structure with explicit in-bounds tests **before any read**:
 - a `decimal` reference must be exactly 16 bytes;
 - an array/map **element count comes from the bytes but is bounded against the block length** before
   any size is computed (each element needs an 8-byte slot), so the bitset/slot math neither overflows
-  nor loops past the buffer.
+  nor loops past the buffer;
+- a **map** is validated as more than two independent arrays. After bounds-checking the key and value
+  arrays, the validator enforces the two cross-array invariants the decoder and `MapData` require:
+  the **key count must equal the value count** (the decoder pairs `keys[i]` with `values[i]` in
+  lockstep, so a mismatch would otherwise surface as an `IndexOutOfRangeException` at decode time), and
+  **every map key must be non-null** (a set bit in the key array's null bitset would otherwise reach
+  `MapData`'s constructor as an `ArgumentException`). Both are reported as the same typed
+  `RowValidationException` — with integers and type names only, never raw payload bytes — so a crafted
+  or corrupt map frame cannot escape the contract by raising a different exception type from inside the
+  decoder.
 
 Two structural facts keep this safe and terminating:
 
@@ -255,12 +288,18 @@ Only after validation succeeds is the (now-proven-in-bounds) payload decoded by 
 `RowFormatException`, so existing `catch (RowFormatException)` sites still observe it while new code
 can catch the untrusted-input case specifically.
 
-The tests assert this exhaustively: every header/structure corruption throws `RowValidationException`;
-**truncating a valid frame at every length** `0 … N−1` throws (and only the full frame decodes); and a
-**20,000-iteration pseudo-random fuzz** (half the inputs seeded with a valid magic/version/fingerprint
-to reach the deep structural checks) only ever produces a clean decode or a `RowValidationException`
-— never an out-of-bounds, overflow, or other exception. The fuzz/test data uses a small deterministic
-LCG rather than `System.Random`, so failures are reproducible.
+The tests assert this exhaustively: every header/structure corruption throws `RowValidationException`
+(including a map whose key/value counts disagree — which must surface as a typed validation error,
+not an `IndexOutOfRangeException` — and a map with a null-key bit set, which must not reach
+`MapData`'s `ArgumentException`); **truncating a valid frame at every length** `0 … N−1` throws (and
+only the full frame decodes); and a **multi-schema fuzz** only ever produces a clean decode or a
+`RowValidationException` — never an out-of-bounds, overflow, `ArgumentException`, or other exception.
+The fuzz runs three batches: random bytes against a flat `(int, string)` schema and against a nested
+`map`/`array`/`struct` schema (half of each seeded with a valid magic/version/fingerprint so the deep
+structural checks are reached), plus byte-level corruptions of a *valid* nested frame (which stay
+close enough to valid to drive the map pairing/null-key, array-count, and recursion checks that random
+noise reaches only by accident). All fuzz/test data uses a small deterministic LCG rather than
+`System.Random`, so failures are reproducible.
 
 ## Runtime / performance notes
 
@@ -277,11 +316,15 @@ LCG rather than `System.Random`, so failures are reproducible.
 
 - **In scope:** order-preserving byte encoding for all atomic + `decimal` key types under
   `ASC`/`DESC` × `NULLS FIRST`/`NULLS LAST`; the scalar comparator oracle and its parity contract;
-  the self-describing spill/shuffle frame with schema-version metadata; bounded, typed,
-  no-OOB validation of malformed/truncated frames.
+  the self-describing **per-row** spill/shuffle frame with schema-version metadata; bounded, typed,
+  no-OOB validation of malformed/truncated frames (including the map key/value-pairing and
+  non-null-key invariants).
 - **Deferred:** byte-sortable ordering by nested `array`/`map`/`struct` keys; a sort *prefix* (a
   packed leading `long` à la Spark's `PrefixComparator` for a fast first-pass compare) on top of the
-  full key; collation-aware string ordering (v1 is binary/UTF-8 order, matching Spark's default).
+  full key; collation-aware string ordering (v1 is binary/UTF-8 order, matching Spark's default); the
+  **block envelope** that wraps many back-to-back frames (row count / total length / optional CRC) and
+  any **integrity / bit-rot detection** — both belong to the shuffle block format
+  ([#245](https://github.com/khaines/deltasharp/issues/245)), not the per-row frame.
 
 ## References
 

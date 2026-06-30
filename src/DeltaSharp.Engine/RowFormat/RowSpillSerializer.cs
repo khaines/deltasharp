@@ -75,7 +75,10 @@ public static class RowSpillSerializer
     private const int FingerprintOffset = 8;
     private const int PayloadLengthOffset = 12;
 
-    // "DSR1" — DeltaSharp Row, format 1.
+    // "DSR1" — DeltaSharp Row. A FIXED brand tag, not a version counter: the trailing '1' is part of
+    // the brand and is NEVER bumped on a format change. Format evolution happens only through the
+    // VersionOffset field, so a v1 reader reports a newer frame as an unsupported *version* rather than
+    // misdiagnosing it as foreign bytes (bad magic).
     private static ReadOnlySpan<byte> Magic => "DSR1"u8;
 
     /// <summary>The total frame size (header + payload) for <paramref name="row"/>.</summary>

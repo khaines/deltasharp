@@ -136,8 +136,35 @@ internal static class BinaryRowValidator
             throw Malformed($"map key-array size {keyArrayBytes} is outside the {block.Length}-byte block.");
         }
 
-        ValidateArray(block.Slice(8, (int)keyArrayBytes), keyType);
-        ValidateArray(block[(8 + (int)keyArrayBytes)..], valueType);
+        ReadOnlySpan<byte> keyArray = block.Slice(8, (int)keyArrayBytes);
+        ReadOnlySpan<byte> valueArray = block[(8 + (int)keyArrayBytes)..];
+        ValidateArray(keyArray, keyType);
+        ValidateArray(valueArray, valueType);
+
+        // The two ValidateArray calls prove each sub-array carries a valid 8-byte element count and an
+        // in-bounds null bitset, so the reads below stay in bounds. But validating the arrays
+        // *independently* is not enough: RowDecoder.DecodeMap walks keys[i] -> values[i] in lockstep
+        // and MapData forbids a null key, so a frame that passes the per-array checks can still be
+        // malformed for a map. Enforce both map invariants here, after the array checks, so a crafted
+        // map keeps the AC4 contract (a typed RowValidationException) instead of escaping as a
+        // System.IndexOutOfRangeException (key/value count mismatch) or a System.ArgumentException
+        // (null key) raised later from the decoder. Messages stay integers + type names only — never
+        // raw payload bytes.
+        long keyCount = BinaryPrimitives.ReadInt64LittleEndian(keyArray);
+        long valueCount = BinaryPrimitives.ReadInt64LittleEndian(valueArray);
+        if (keyCount != valueCount)
+        {
+            throw Malformed($"map has {keyCount} keys but {valueCount} values.");
+        }
+
+        ReadOnlySpan<byte> keyBitset = keyArray.Slice(8, RowNullBitSet.ByteSize((int)keyCount));
+        for (int i = 0; i < keyCount; i++)
+        {
+            if (RowNullBitSet.IsNull(keyBitset, i))
+            {
+                throw Malformed($"map key at index {i} is null; map keys must be non-null.");
+            }
+        }
     }
 
     private static RowValidationException Malformed(string detail) =>

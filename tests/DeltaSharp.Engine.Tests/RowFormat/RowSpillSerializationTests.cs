@@ -95,6 +95,38 @@ public class RowSpillSerializationTests
     }
 
     [Fact]
+    public void Frame_RoundTrips_Map()
+    {
+        // Maps previously round-tripped only through the trusted encoder (BinaryRow.ToRowData). This
+        // drives a map all the way through RowSpillSerializer.ReadFrame, so the structural validator
+        // (including the key/value-count and non-null-key checks) runs on the deserialize path.
+        var mapType = new MapType(StringType.Instance, LongType.Instance);
+        var schema = new StructType([new StructField("m", mapType)]);
+        var map = new MapData(
+            StringType.Instance, LongType.Instance,
+            ["alpha", "beta", "gamma"],
+            [10L, null, 30L]);
+        var source = new RowData(schema, map);
+
+        using BinaryRow row = Encode(schema, map);
+        byte[] frame = RowSpillSerializer.WriteFrame(row);
+        RowData decoded = RowSpillSerializer.ReadFrame(frame, schema, out int consumed);
+
+        Assert.Equal(source, decoded);
+        Assert.Equal(frame.Length, consumed);
+
+        // Key/value pairing and the nested null value survive the frame round-trip.
+        var got = (MapData)decoded[0]!;
+        Assert.Equal(3, got.Count);
+        Assert.Equal("alpha", got.Key(0));
+        Assert.Equal(10L, got.Value(0));
+        Assert.Equal("beta", got.Key(1));
+        Assert.Null(got.Value(1));
+        Assert.Equal("gamma", got.Key(2));
+        Assert.Equal(30L, got.Value(2));
+    }
+
+    [Fact]
     public void Header_CarriesSchemaVersionMetadata()
     {
         using BinaryRow row = Encode(AllScalars, true, (sbyte)1, (short)2, 3, 4L, 5f, 6d, 7, 8L,
@@ -162,5 +194,39 @@ public class RowSpillSerializationTests
         using BinaryRow r2 = Encode(schema, 5, "hello");
 
         Assert.True(RowSpillSerializer.WriteFrame(r1).AsSpan().SequenceEqual(RowSpillSerializer.WriteFrame(r2)));
+    }
+
+    [Fact]
+    public void Frame_SchemaFingerprintAndBytes_AreGolden()
+    {
+        // Process-stable determinism is the cross-executor shuffle contract: the same schema must
+        // fingerprint to the same 32-bit value, and the same row must serialize to the same bytes, on
+        // every process and platform (the FNV-1a fingerprint, not the randomized CLR string hash).
+        // These literals were captured once and regression-guard that invariant. If the frame layout,
+        // the fingerprint, or the encoder changes intentionally, update the literals deliberately —
+        // and bump CurrentFormatVersion, never the "DSR1" magic, for a wire-format change.
+        var schema = new StructType(
+            [new StructField("i", IntegerType.Instance), new StructField("s", StringType.Instance)]);
+
+        Assert.Equal(0x324FE549, RowSpillSerializer.SchemaFingerprint(schema));
+
+        byte[] expected =
+        [
+            0x44, 0x53, 0x52, 0x31, // magic "DSR1" (fixed brand tag)
+            0x01, 0x00,             // format version 1 (LE)
+            0x00, 0x00,             // reserved (0)
+            0x49, 0xE5, 0x4F, 0x32, // schema fingerprint 0x324FE549 (LE)
+            0x20, 0x00, 0x00, 0x00, // payload length 32 (LE)
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // struct null bitset (both fields non-null)
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // slot 0: inline int i = 1
+            0x02, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, // slot 1: string ref (offset 24, length 2)
+            0x61, 0x62, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // "ab" + 8-byte padding
+        ];
+
+        using BinaryRow row = Encode(schema, 1, "ab");
+        Assert.Equal(expected, RowSpillSerializer.WriteFrame(row));
+
+        // And the golden frame still decodes to the row it encodes (defends against a stale literal).
+        Assert.Equal(new RowData(schema, 1, "ab"), RowSpillSerializer.ReadFrame(expected, schema, out _));
     }
 }
