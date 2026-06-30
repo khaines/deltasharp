@@ -49,8 +49,23 @@ the requested/available/budget figures for attribution.
 
 Every operator computes the byte cost of the state it is about to materialize, calls its private `Reserve*`
 helper (which routes through `IExecutionMemory.TryReserve`), and only then mutates its buffers. Because
-`TryReserve` is all-or-nothing, a refusal throws with the build left consistent — no output vector, group,
-buffered row, or selection vector is ever allocated against bytes the budget did not grant.
+`TryReserve` is all-or-nothing, a refusal throws with the build left consistent — no **data-scaled** state
+(a buffered row's columns, a hash-table group/entry, a per-key build index, a `bool[]` match flag, an
+`_order` permutation slot, a copied output row, or a variable-width payload) is ever accumulated against
+bytes the budget did not grant. This is the path that grows with tenant input, so it is the blast-radius
+control STORY-03.2.2 (#148) / #359 hardened and this story completes.
+
+> **Scope of the guarantee.** The reserve-before-allocate bound above covers the **data-scaled** state
+> (everything that grows with the number/size of tenant rows). It does **not** yet cover the **fixed
+> per-batch vector scaffolding** — each operator allocates its output/build `ColumnVector` backing arrays
+> at the `OutputBatchRows = 1024` chunk capacity (`ColumnVectors.CreateForSchema(...)` /
+> `ColumnVectors.Create(..., OutputBatchRows)`), so a wide-schema operator allocates
+> `schema-width × ~8–12 KB` of scaffolding before any reservation. This is **bounded and predictable**
+> (schema-width × a fixed 1024-row cap, known at plan time — not the unbounded per-payload class #359
+> demonstrated) and is **GC-released between pulls** (one in-flight chunk per operator), but it is a
+> deliberate exception to the bound: reserving it correctly is an output-batch-sizing / admission decision
+> (right-size vs. eagerly fail-close a small-budget query) tracked in
+> [#365](https://github.com/khaines/deltasharp/issues/365), alongside the #156 spill / output-sizing work.
 
 | Operator | Reserve-before-allocate site | What is reserved |
 | --- | --- | --- |
@@ -240,7 +255,7 @@ batch that allocated it.
 
 | Acceptance criterion | Implementation | Test (in [`OperatorMemoryReservationTests`](../../../tests/DeltaSharp.Engine.Tests/Execution/OperatorMemoryReservationTests.cs)) |
 | --- | --- | --- |
-| AC1 — reserve before use | §2 (all six operators reserve before allocating) | `Filter_OverBudget_FailsClosed_AndLeavesNoReservation` |
+| AC1 — reserve before use | §2 (all six operators reserve before allocating **data-scaled** state; fixed `OutputBatchRows` scaffolding tracked in [#365](https://github.com/khaines/deltasharp/issues/365)) | `Filter_OverBudget_FailsClosed_AndLeavesNoReservation` |
 | AC2 — exactly-once release, normal | §3 + `_disposed`/`_reservedBytes` guards | `Aggregate_NormalCompletion_ReleasesExactlyOnce_AndDisposeIsIdempotent`, `Sort_NormalCompletion_ReleasesExactlyOnce`, `ExchangeLocal_NormalCompletion_ReleasesExactlyOnce` |
 | AC2 — exactly-once release, cancellation | §3 + §5 | `Aggregate_CancelledMidBuild_ReleasesAllReservations` |
 | AC2 — exactly-once release, exception | §3 + `TryReserve` rollback | `Join_ReservationRefused_ReleasesAllReservations_ExactlyOnce` |
