@@ -164,8 +164,10 @@ internal sealed class InterpretedSortStream : IBatchStream
             {
                 byte[] key = _sortKeys.Encode(keyVectors, r, out _);
 
-                // Reserve before storing the row so a refusal leaves the buffer consistent.
-                ReserveBuffer(_rowBytes + key.Length);
+                // Reserve before storing the row so a refusal leaves the buffer consistent. The
+                // var-width term charges the TRUE byte length of every buffered string/binary column
+                // (not the flat 16-byte estimate), so a wide payload cannot bypass the budget.
+                ReserveBuffer(_rowBytes + key.Length + RowSizeEstimate.VariableWidthBytes(columns, r));
                 _keys.Add(key);
                 for (int c = 0; c < columnCount; c++)
                 {

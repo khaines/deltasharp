@@ -40,7 +40,8 @@ public enum AggregateFunction
 /// <item><description><c>SUM</c>: integral → <see cref="LongType"/>; float/double →
 /// <see cref="DoubleType"/>; <c>decimal(p,s)</c> → <c>decimal(min(38, p+10), s)</c>.</description></item>
 /// <item><description><c>AVG</c>: integral/float/double → <see cref="DoubleType"/>;
-/// <c>decimal(p,s)</c> → <c>decimal(min(38, p+4), s+4)</c> (execution deferred — see
+/// <c>decimal(p,s)</c> → <c>decimal(min(38, p+4), min(38, s+4))</c> (both capped at
+/// <see cref="DecimalType.MaxPrecision"/>; execution deferred — see
 /// relational-operators.md).</description></item>
 /// <item><description><c>MIN</c>/<c>MAX</c> → the input type.</description></item>
 /// </list>
@@ -139,9 +140,9 @@ public sealed class AggregateExpression : PhysicalExpression
 
                 if (t is DecimalType da)
                 {
-                    // Spark: AVG(decimal(p,s)) -> decimal(min(38, p+4), s+4). Execution of the decimal
-                    // case is deferred (it needs the deferred decimal-divide rounding); the type is
-                    // still resolved so the plan is well-typed and the stream fails fast at Open.
+                    // Spark: AVG(decimal(p,s)) -> decimal(min(38, p+4), min(38, s+4)). Execution of the
+                    // decimal case is deferred (it needs the deferred decimal-divide rounding); the type
+                    // is still resolved so the plan is well-typed and the stream fails fast at Open.
                     return new DecimalType(
                         Math.Min(DecimalType.MaxPrecision, da.Precision + 4),
                         Math.Min(DecimalType.MaxPrecision, da.Scale + 4));

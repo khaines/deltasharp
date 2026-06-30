@@ -31,10 +31,23 @@ internal abstract class Aggregator
     internal abstract void Emit(int group, MutableColumnVector destination);
 
     /// <summary>
+    /// Variable-width bytes this aggregator has reserved beyond its flat <see cref="BytesPerGroup"/>
+    /// estimate — non-zero only for <see cref="MinMaxAggregator"/> over string/binary, which retains a
+    /// boxed best value whose true length is charged to the budget at retention time.
+    /// </summary>
+    internal virtual long ReservedBytes => 0;
+
+    /// <summary>Releases any variable-width reservation this aggregator holds (see <see cref="ReservedBytes"/>).</summary>
+    internal virtual void Release()
+    {
+    }
+
+    /// <summary>
     /// Builds the accumulator matching <paramref name="aggregate"/>. Throws
     /// <see cref="UnsupportedOperatorException"/> for the one deferred shape, <c>AVG(decimal)</c>.
     /// </summary>
-    internal static Aggregator Create(AggregateExpression aggregate, string backendName, OperatorKind kind)
+    internal static Aggregator Create(
+        AggregateExpression aggregate, string backendName, OperatorKind kind, IExecutionMemory memory)
     {
         switch (aggregate.Function)
         {
@@ -69,7 +82,8 @@ internal abstract class Aggregator
                     + "cast the input to double, or compute SUM/COUNT and divide downstream");
 
             case AggregateFunction.Min or AggregateFunction.Max:
-                return new MinMaxAggregator(aggregate.Function == AggregateFunction.Min, aggregate.Input!.Type);
+                return new MinMaxAggregator(
+                    aggregate.Function == AggregateFunction.Min, aggregate.Input!.Type, memory);
 
             default:
                 throw new UnsupportedOperatorException(
@@ -357,15 +371,22 @@ internal sealed class MinMaxAggregator : Aggregator
 {
     private readonly bool _isMin;
     private readonly DataType _type;
+    private readonly bool _isVariableWidth;
+    private readonly IExecutionMemory _memory;
     private object?[] _best = [];
+    private long _reservedBytes;
 
-    internal MinMaxAggregator(bool isMin, DataType type)
+    internal MinMaxAggregator(bool isMin, DataType type, IExecutionMemory memory)
     {
         _isMin = isMin;
         _type = type;
+        _isVariableWidth = type is StringType or BinaryType;
+        _memory = memory;
     }
 
     internal override long BytesPerGroup => 32;
+
+    internal override long ReservedBytes => _reservedBytes;
 
     internal override void EnsureCapacity(int groupCount) => Grow(ref _best, groupCount);
 
@@ -380,14 +401,14 @@ internal sealed class MinMaxAggregator : Aggregator
         object? current = _best[group];
         if (current is null)
         {
-            _best[group] = candidate;
+            Retain(group, candidate);
             return;
         }
 
         int comparison = ScalarValues.Compare(_type, candidate, current);
         if (_isMin ? comparison < 0 : comparison > 0)
         {
-            _best[group] = candidate;
+            Retain(group, candidate);
         }
     }
 
@@ -402,5 +423,36 @@ internal sealed class MinMaxAggregator : Aggregator
         {
             ScalarValues.AppendStorage(destination, best);
         }
+    }
+
+    internal override void Release()
+    {
+        if (_reservedBytes > 0)
+        {
+            _memory.Release(_reservedBytes);
+            _reservedBytes = 0;
+        }
+    }
+
+    // Stores the new running best, charging the budget for a retained string/binary value's TRUE byte
+    // length (the flat 32-byte BytesPerGroup estimate cannot cover a wide payload). The reservation
+    // grows monotonically over a group's lifetime — the displaced best is conservatively not refunded —
+    // and is released wholesale by the owning stream via Release().
+    private void Retain(int group, object candidate)
+    {
+        if (_isVariableWidth && candidate is byte[] { Length: > 0 } bytes)
+        {
+            if (!_memory.TryReserve(bytes.Length))
+            {
+                throw new ExecutionMemoryException(
+                    bytes.Length, _memory.AvailableBytes, _memory.BudgetBytes,
+                    "the MIN/MAX running best has no spillable representation in v1 (spill is STORY-03.5.x); "
+                    + "raise the query/tenant memory budget");
+            }
+
+            _reservedBytes += bytes.Length;
+        }
+
+        _best[group] = candidate;
     }
 }

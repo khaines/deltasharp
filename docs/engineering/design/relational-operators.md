@@ -60,7 +60,10 @@ the laziness invariant — *transformations are lazy, actions are eager*. Concre
   boundary (not mid-row) and `Dispose` then releases buffers — satisfying the cancellation AC.
 - **Self-attributed timing.** Each operator times only its **own** work: it samples
   `Stopwatch.GetTimestamp()` *after* the child pull returns and adds `ElapsedNanos` for the slice it
-  computed, so child time is not double-counted up the tree.
+  computed, so child time is not double-counted up the tree. The blocking build loops (aggregate,
+  sort, join build) sample their clock after each child pull; the **join probe** measures the time
+  spent inside `_probe.TryGetNext` (in `AdvanceLeftBatch`) separately and **subtracts it** from the
+  join's `ElapsedNanos`, so a slow probe subtree is attributed to the probe child, not to the join.
 - **Metrics.** `InputRows`, `OutputRows`, `PeakMemoryBytes` are populated by all four; `ShuffleBytes`
   additionally by exchange-local. Output is emitted in **≤ 1024-row** chunks (`OutputBatchRows`) so a
   huge group set, sort run, or join fan-out flows incrementally and stays bounded.
@@ -121,6 +124,17 @@ live; streaming/chunked reservations are released at the **top of the next** `Tr
 advancing the input), so steady-state footprint is one batch, not the whole stream. Every operator's
 `Dispose` releases any residual reservation and the child(ren), so a cancellation or exception unwinds
 cleanly with no leak.
+
+**Variable-width payloads are charged at their true length.** `RowSizeEstimate.Width` is a flat
+per-type estimate (16 bytes for string/binary), but the sort buffer, join build table, and the
+`MIN`/`MAX` running best each retain the **full** value of every variable-width column they buffer.
+So each per-row reservation adds `RowSizeEstimate.VariableWidthBytes` — the summed real byte length of
+the row's buffered string/binary columns (read via `ColumnVector.GetBytes`, the same accessor the
+operator already uses) — on top of the flat estimate, mirroring the existing `+ key.Length` term.
+`MinMaxAggregator` charges its retained best's true length to the budget at retention time (released
+by the owning stream's `Dispose`). This closes a budget-bypass where a small fixed-width estimate let
+megabytes of wide strings materialize under a tiny budget. The flat estimate for fixed-width types is
+unchanged.
 
 ### 2.4 The columnar / vectorized evaluation model
 
@@ -211,6 +225,13 @@ sum to the widened result type with `ToType(resultType, mode)` — ANSI throws, 
 `AnsiMode` is carried on each `AggregateExpression`. Float/double `SUM`/`AVG` follow IEEE-754 and
 **never** raise overflow (they saturate to ±∞), matching Spark.
 
+> **Integral Legacy overflow is a deliberate deviation, not full Spark non-ANSI parity.** Spark's
+> non-ANSI `SUM` of integrals **wraps** (two's-complement) on overflow; DeltaSharp's `AnsiMode.Legacy`
+> **nulls the group and never wraps**, following the EPIC-02 *never-wrap* convention (checked
+> arithmetic everywhere; overflow is either thrown or nulled, never silently truncated). So the
+> ANSI path matches Spark exactly, but Legacy integral overflow yields `NULL` where Spark would yield
+> a wrapped value. Both `long` and `decimal` SUM overflow are tested at the aggregate level (§9).
+
 ### 3.4 Result-type widening (Spark parity)
 
 Resolved in `AggregateExpression`'s constructor so the plan is well-typed before execution:
@@ -245,7 +266,7 @@ A tiny budget makes the first group's reserve throw `ExecutionMemoryException` �
 `InterpretedSortStream` is an in-memory **total sort** via an indirect permutation sort over
 byte-sortable keys:
 
-1. **Buffer.** `EnsureBuilt` drains the child, copying every input row into a row-major
+1. **Buffer.** `EnsureBuilt` drains the child, copying every input row into a **columnar** (column-major)
    `MutableColumnVector[]` (`ColumnVectors.CreateForSchema`) and storing each row's **encoded sort
    key** (`byte[]`) in a parallel `List<byte[]> _keys`. Schema is unchanged (sort is a reorder).
 2. **Permute.** Build `_order = [0,1,…,n)`, then `Array.Sort(_order, CompareOrdinals)` where
@@ -298,7 +319,7 @@ is deferred to STORY-03.5.x; until then an over-budget sort fails fast.
 `InterpretedJoinStream` is a **hash join**. Per the `JoinOperator` stub the **build side is the right
 input** and the **probe side is the left input**:
 
-- **Build (right), blocking.** `EnsureBuilt` drains the right child into a row-major
+- **Build (right), blocking.** `EnsureBuilt` drains the right child into a **columnar** (column-major)
   `MutableColumnVector[]` and a `Dictionary<RowKey, List<int>>` mapping key → the list of build-row
   ordinals with that key (the `List<int>` carries **multiplicity**). **Null keys are buffered but
   never indexed** (`anyNull` rows are skipped from the table) so RIGHT/FULL OUTER can still emit them
@@ -453,6 +474,16 @@ full-outer join, and keyed exchange.
   decimal-divide work.
 - **Zero-box typed-hash keys** — v1 boxes key values and allocates a per-row key array; a zero-box
   fast path is deferred behind the `RowKeyProjection` contract.
+- **`MIN`/`MAX` per-non-null-row boxing** — `MinMaxAggregator` boxes every non-null input lane into
+  storage shape (`ScalarValues.ReadStorage`, a `byte[]` copy for string/binary) before comparing it to
+  the running best, even when the candidate is immediately discarded. A box-only-on-replacement
+  optimization is deferred behind the same `RowKeyProjection`/storage-shape contract; v1 is
+  correctness-first. The retained best's true byte length **is** charged to the memory budget so a
+  wide payload cannot bypass it (§2.3).
+- **Collection-overhead accounting** — the join's `Dictionary` buckets, `List<int>` match lists,
+  `_matched bool[]`, and amortized array doubling are not separately reserved beyond the per-row row
+  estimate; within-batch per-row cancellation polling is likewise not yet done. Both are tracked for
+  **STORY-03.5.x** (the spill/memory-manager work) and are intentionally out of scope for v1.
 - **Murmur3 exchange hashing and a partition-tagged batch** — land with the remote shuffle
   (STORY-03.5.x / STORY-03.6, ADR-0004); the positional contract (§6.2) is the v1 stand-in.
 - **Sort-merge / broadcast join strategies and AQE** — physical strategy selection is a later planner
@@ -488,6 +519,18 @@ Tests live in `tests/DeltaSharp.Engine.Tests/Execution/RelationalOperatorsTests.
 - **Cross-cutting** — laziness (`InputRows == 0` until first pull), cancellation-before-first-pull
   throws, bounded-memory refusal (`ExecutionMemoryException` with a tiny budget), populated metrics,
   and **interpreted↔compiled parity** for aggregate, join, and exchange.
+- **Preselected (selection-vector) inputs** — each operator (aggregate, sort, join build **and**
+  probe, exchange-local) is additionally driven by an input batch carrying a **non-identity, unordered
+  `SelectionVector`** whose **unselected** rows hold values (a null / an extreme) that would change the
+  result if wrongly included. The oracle compares against the result over the **logically-selected
+  rows only**, so reading the raw `Column(c)` instead of the selection-aware `SelectedColumn(c)` is
+  caught.
+- **Variable-width budget regression** — a 50-row sort and a 50-row join-build of ~50 KB strings under
+  a small byte budget must throw `ExecutionMemoryException` (the var-width payload is charged at true
+  length, §2.3), as must `MIN`/`MAX` over large strings under a tiny budget; the prior fixed-width
+  refusal tests still pass (no over-reservation of fixed-width). A multi-output-chunk join drained
+  under a budget of just `build + 2 chunks` succeeds, locking in the per-chunk output-reservation
+  release (no leak).
 
 ---
 

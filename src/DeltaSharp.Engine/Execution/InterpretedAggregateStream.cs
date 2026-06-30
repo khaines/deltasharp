@@ -120,7 +120,13 @@ internal sealed class InterpretedAggregateStream : IBatchStream
         _disposed = true;
 
         // A blocking operator holds its accumulator/result reservation for its whole lifetime (the
-        // result rows are live until the consumer finishes draining), so release happens here.
+        // result rows are live until the consumer finishes draining), so release happens here. MIN/MAX
+        // over string/binary also reserves its retained best value's true length; release that too.
+        foreach (Aggregator aggregator in _aggregators)
+        {
+            aggregator.Release();
+        }
+
         if (_reservedBytes > 0)
         {
             _memory.Release(_reservedBytes);
@@ -169,6 +175,10 @@ internal sealed class InterpretedAggregateStream : IBatchStream
             long start = Stopwatch.GetTimestamp();
             _metrics.AddInputRows(input.LogicalRowCount);
             ConsumeBatch(input);
+
+            // MIN/MAX over string/binary grows its reservation inside Accumulate (not via Reserve),
+            // so observe peak after each batch to capture that growth.
+            _metrics.ObservePeakMemory(_reservedBytes + AggregatorReservedBytes());
             _metrics.AddElapsedNanos(InterpretedOperators.ElapsedNanos(start));
         }
 
@@ -272,6 +282,17 @@ internal sealed class InterpretedAggregateStream : IBatchStream
         }
 
         _reservedBytes += bytes;
-        _metrics.ObservePeakMemory(_reservedBytes);
+        _metrics.ObservePeakMemory(_reservedBytes + AggregatorReservedBytes());
+    }
+
+    private long AggregatorReservedBytes()
+    {
+        long total = 0;
+        foreach (Aggregator aggregator in _aggregators)
+        {
+            total += aggregator.ReservedBytes;
+        }
+
+        return total;
     }
 }

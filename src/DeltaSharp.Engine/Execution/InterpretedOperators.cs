@@ -229,7 +229,7 @@ internal static class InterpretedOperators
                     + $"'{output[keyCount + i].Name}' of type '{output[keyCount + i].DataType.SimpleString}'.", nameof(aggregate));
             }
 
-            aggregators[i] = Aggregator.Create(term, backendName, OperatorKind.Aggregate);
+            aggregators[i] = Aggregator.Create(term, backendName, OperatorKind.Aggregate, context.Memory);
             aggInputs[i] = term.Input is null
                 ? null
                 : ExpressionEvaluators.Build(term.Input, input, backendName, OperatorKind.Aggregate);

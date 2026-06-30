@@ -77,6 +77,11 @@ internal sealed class InterpretedJoinStream : IBatchStream
     private bool _built;
     private bool _disposed;
 
+    // Nanos spent inside the probe child's TryGetNext during the current FillChunk, excluded from the
+    // join's own ElapsedNanos so child-pull time is not double-counted up the tree (mirrors the build
+    // loop, which samples its clock AFTER the build child pull returns).
+    private long _probePullNanos;
+
     internal InterpretedJoinStream(
         JoinOperator op,
         RowKeyProjection leftKeys,
@@ -119,18 +124,22 @@ internal sealed class InterpretedJoinStream : IBatchStream
         EnsureBuilt();
 
         long start = Stopwatch.GetTimestamp();
+        _probePullNanos = 0;
         ResetOutputColumns();
         FillChunk();
+
+        // Exclude the probe subtree's pull time so the join times only its own work (§2.1).
+        long elapsed = InterpretedOperators.ElapsedNanos(start) - _probePullNanos;
         if (_outRows == 0)
         {
-            _metrics.AddElapsedNanos(InterpretedOperators.ElapsedNanos(start));
+            _metrics.AddElapsedNanos(elapsed);
             batch = null;
             return false;
         }
 
         var result = new ManagedColumnBatch(Schema, _outColumns, _outRows);
         _metrics.AddOutput(_outRows);
-        _metrics.AddElapsedNanos(InterpretedOperators.ElapsedNanos(start));
+        _metrics.AddElapsedNanos(elapsed);
         batch = result;
         return true;
     }
@@ -196,7 +205,9 @@ internal sealed class InterpretedJoinStream : IBatchStream
             {
                 byte[] key = _rightKeys.Encode(keyVectors, r, out bool anyNull);
 
-                ReserveBuild(_buildRowBytes + key.Length);
+                // The var-width term charges the TRUE byte length of every buffered right column,
+                // so a wide string/binary build payload cannot bypass the budget.
+                ReserveBuild(_buildRowBytes + key.Length + RowSizeEstimate.VariableWidthBytes(columns, r));
                 int ordinal = _buildRowCount++;
                 for (int c = 0; c < _rightCount; c++)
                 {
@@ -267,25 +278,29 @@ internal sealed class InterpretedJoinStream : IBatchStream
         _leftScratch?.Release();
         _leftScratch = null;
 
-        if (!_probe.TryGetNext(out ColumnBatch? next))
+        // Time the probe child pull separately so it is excluded from the join's self-time.
+        long probeStart = Stopwatch.GetTimestamp();
+        bool hasNext = _probe.TryGetNext(out ColumnBatch? next);
+        _probePullNanos += InterpretedOperators.ElapsedNanos(probeStart);
+        if (!hasNext)
         {
             _leftBatch = null;
             return false;
         }
 
         _cancellationToken.ThrowIfCancellationRequested();
-        _leftBatch = next;
-        _leftRows = next.LogicalRowCount;
+        _leftBatch = next!;
+        _leftRows = _leftBatch.LogicalRowCount;
         _leftRow = 0;
         _rowInitialized = false;
         _metrics.AddInputRows(_leftRows);
 
         _leftScratch = new BatchEvaluationMemory(_memory);
-        _leftKeyVectors = _leftKeys.Evaluate(next, _leftScratch, _cancellationToken);
+        _leftKeyVectors = _leftKeys.Evaluate(_leftBatch, _leftScratch, _cancellationToken);
         _leftColumns = new ColumnVector[_leftCount];
         for (int c = 0; c < _leftCount; c++)
         {
-            _leftColumns[c] = next.SelectedColumn(c);
+            _leftColumns[c] = _leftBatch.SelectedColumn(c);
         }
 
         return true;

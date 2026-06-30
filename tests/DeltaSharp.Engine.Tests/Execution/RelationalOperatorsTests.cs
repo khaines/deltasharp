@@ -1305,4 +1305,252 @@ public class RelationalOperatorsTests
             Run(ExecutionBackends.Select(new ExecutionBackendOptions { ForceInterpreted = true })),
             Run(ExecutionBackends.Select()));
     }
+
+    // ===================================================================================================
+    // PRESELECTED (SELECTION-VECTOR) INPUTS  — B1
+    //
+    // Each operator is driven by an input batch carrying a NON-IDENTITY, UNORDERED SelectionVector whose
+    // UNSELECTED physical rows hold poison (an extreme / a null) that would change the result if wrongly
+    // included. The oracle compares against the result over the LOGICALLY-SELECTED rows only, so reading
+    // the raw Column(c) instead of the selection-aware SelectedColumn(c) is caught.
+    // ===================================================================================================
+
+    // Builds a batch over full physical columns, then carries an unordered selection over it. InMemoryScan
+    // preserves the selection, so the operator sees only the logical (selected) rows.
+    private static ColumnBatch Preselected(StructType schema, int[] selection, params ColumnVector[] columns)
+        => Batch(schema, columns).WithSelection(new SelectionVector(selection));
+
+    [Fact]
+    public void Sort_PreselectedUnorderedInput_SortsLogicalRowsOnly()
+    {
+        var schema = new StructType(
+        [
+            new StructField("key", DataTypes.IntegerType, nullable: true),
+            new StructField("id", DataTypes.LongType, nullable: false),
+        ]);
+
+        // Physical keys [100, 30, 10, null, 20]; unselected rows 0 (extreme 100) and 3 (null) are poison.
+        // Selection [4,1,2] (unordered) -> logical rows (20,id4),(30,id1),(10,id2).
+        ColumnBatch input = Preselected(schema, [4, 1, 2], IntCol(100, 30, 10, null, 20), LongCol(0, 1, 2, 3, 4));
+        var op = new SortOperator(
+            Scan(schema, input),
+            [new SortOrder(new ColumnReference(0, DataTypes.IntegerType, nullable: true), SortDirection.Ascending, NullOrdering.NullsFirst)]);
+
+        List<long?> ids = Longs(OpenDrain(op), 1);
+
+        // Sorted ascending by the selected keys [20,30,10] -> [10,20,30] -> ids [2,4,1].
+        Assert.Equal(new long?[] { 2, 4, 1 }, ids);
+    }
+
+    [Fact]
+    public void InnerJoin_PreselectedBothSides_JoinsLogicalRowsOnly()
+    {
+        // Left physical lk [2,3,2,1]; unselected rows 0 ("Q0") and 1 ("Q1") are poison. Selection [3,2]
+        // (unordered) -> logical (1,"a"),(2,"b"). Probe-side mutation would emit "Q1"/lk 3 instead.
+        ColumnBatch left = Preselected(LeftSchema, [3, 2], IntCol(2, 3, 2, 1), StrCol("Q0", "Q1", "b", "a"));
+
+        // Right physical rk [9,9,2,2,4]; unselected rows 0 ("P0") and 1 ("P1") are poison. Selection
+        // [4,2,3] (unordered) -> logical (4,"z"),(2,"x"),(2,"y"). Build-side mutation would emit "P1".
+        ColumnBatch right = Preselected(RightSchema, [4, 2, 3], IntCol(9, 9, 2, 2, 4), StrCol("P0", "P1", "x", "y", "z"));
+
+        List<ColumnBatch> result = OpenDrain(Join(JoinType.Inner, left, right));
+
+        AssertSameRows(
+            new (int?, string?, int?, string?)[] { (2, "b", 2, "x"), (2, "b", 2, "y") },
+            JoinRows(result));
+    }
+
+    [Fact]
+    public void GroupedAggregate_PreselectedUnorderedInput_AggregatesLogicalRowsOnly()
+    {
+        var schema = new StructType(
+        [
+            new StructField("k", DataTypes.StringType, nullable: false),
+            new StructField("v", DataTypes.IntegerType, nullable: true),
+        ]);
+
+        // Unselected rows 0 ("a",1000) and 3 ("z",-9999) are poison: they would inflate group "a" and
+        // add a phantom "z" group. Selection [4,2,1] (unordered) -> logical ("a",3),("b",2),("a",1).
+        ColumnBatch input = Preselected(
+            schema, [4, 2, 1], StrCol("a", "a", "b", "z", "a"), IntCol(1000, 1, 2, -9999, 3));
+        AggregateOperator agg = Agg(
+            Scan(schema, input),
+            keys: [new ColumnReference(0, DataTypes.StringType, nullable: false)],
+            aggs: [Of(AggregateFunction.Sum, 1, DataTypes.IntegerType)]);
+
+        List<ColumnBatch> result = OpenDrain(agg);
+
+        AssertSameRows(new (string?, long?)[] { ("a", 4L), ("b", 2L) }, Zip2(Strs(result, 0), Longs(result, 1)));
+        Assert.Equal(2, RowCount(result));
+    }
+
+    [Fact]
+    public void Exchange_PreselectedInput_RoutesLogicalRowsOnly()
+    {
+        const int n = 4;
+
+        // Unselected rows 0 (id 100) and 4 (id 200) are poison ids that must not leak into any partition.
+        // Selection [5,1,2,3] (unordered) -> logical keys [40,10,20,30], ids [4,1,2,3].
+        ColumnBatch input = Preselected(
+            ExSchema, [5, 1, 2, 3], IntCol(999, 10, 20, 30, 999, 40), LongCol(100, 1, 2, 3, 200, 4));
+
+        List<ColumnBatch> result = OpenDrain(Exchange(n, keyed: true, input));
+
+        AssertSameRows(new long?[] { 1, 2, 3, 4 }, Longs(result, 1)); // only selected rows survive
+        for (int p = 0; p < result.Count; p++)
+        {
+            ColumnVector kCol = result[p].SelectedColumn(0);
+            for (int r = 0; r < kCol.Length; r++)
+            {
+                Assert.Equal(ExpectedPartition(kCol.GetValue<int>(r), n), p);
+            }
+        }
+    }
+
+    // ===================================================================================================
+    // VARIABLE-WIDTH MEMORY BUDGET  — B2 (P3 / P3b / MIN-MAX) and no-leak lock-in (N5)
+    // ===================================================================================================
+
+    [Fact]
+    public void Sort_VariableWidthPayload_OverBudget_ThrowsExecutionMemoryException() // P3
+    {
+        var schema = new StructType(
+        [
+            new StructField("ord", DataTypes.IntegerType, nullable: false),     // small sort key
+            new StructField("payload", DataTypes.StringType, nullable: false),  // wide buffered value
+        ]);
+
+        string big = new string('x', 50_000);
+        var ords = new int?[50];
+        var payloads = new string?[50];
+        for (int i = 0; i < 50; i++)
+        {
+            ords[i] = i;
+            payloads[i] = big;
+        }
+
+        // The flat estimate would charge ~25 bytes/row (well under 8 KB for 50 rows); only charging the
+        // TRUE 50 KB payload makes the first buffered row exceed the budget.
+        var op = new SortOperator(
+            Scan(schema, Batch(schema, IntCol(ords), StrCol(payloads))),
+            [new SortOrder(new ColumnReference(0, DataTypes.IntegerType, nullable: false))]);
+
+        using IBatchStream stream = Backend.Open(op, Ctx(new BoundedExecutionMemory(8192)));
+        Assert.Throws<ExecutionMemoryException>(() => stream.TryGetNext(out _));
+    }
+
+    [Fact]
+    public void Join_VariableWidthBuildPayload_OverBudget_ThrowsExecutionMemoryException() // P3b
+    {
+        string big = new string('y', 50_000);
+        var rk = new int?[50];
+        var rv = new string?[50];
+        for (int i = 0; i < 50; i++)
+        {
+            rk[i] = 1;
+            rv[i] = big;
+        }
+
+        ColumnBatch left = Batch(LeftSchema, IntCol(1), StrCol("a"));
+        ColumnBatch right = Batch(RightSchema, IntCol(rk), StrCol(rv));
+        JoinOperator op = Join(JoinType.Inner, left, right);
+
+        using IBatchStream stream = Backend.Open(op, Ctx(new BoundedExecutionMemory(8192)));
+        Assert.Throws<ExecutionMemoryException>(() => stream.TryGetNext(out _));
+    }
+
+    [Fact]
+    public void GlobalMinMax_LargeStrings_OverBudget_ThrowsExecutionMemoryException()
+    {
+        var schema = new StructType([new StructField("v", DataTypes.StringType, nullable: true)]);
+        string a = new string('a', 50_000);
+        string b = new string('b', 50_000);
+
+        // MIN retains its running-best string; charging its true length makes the first retained value
+        // exceed the tiny budget (the flat 32-byte per-group estimate could not).
+        AggregateOperator agg = Agg(
+            Scan(schema, Batch(schema, StrCol(a, b))),
+            keys: [],
+            aggs: [Of(AggregateFunction.Min, 0, DataTypes.StringType)]);
+
+        using IBatchStream stream = Backend.Open(agg, Ctx(new BoundedExecutionMemory(4096)));
+        Assert.Throws<ExecutionMemoryException>(() => stream.TryGetNext(out _));
+    }
+
+    [Fact]
+    public void InnerJoin_MultiChunk_UnderBuildPlusTwoChunkBudget_Succeeds_NoLeak() // N5
+    {
+        // 40×40 = 1600 matches on key 1 -> two output chunks (1024 + 576). The budget covers the build
+        // table plus ~1.5 output chunks: it suffices ONLY because each emitted chunk's output reservation
+        // is released on the next pull. Were it leaked, draining the second chunk would need two full
+        // chunks and over-run the budget.
+        const int n = 40;
+        var lk = new int?[n];
+        var lv = new string?[n];
+        var rk = new int?[n];
+        var rv = new string?[n];
+        for (int i = 0; i < n; i++)
+        {
+            lk[i] = 1;
+            lv[i] = $"L{i}";
+            rk[i] = 1;
+            rv[i] = $"R{i}";
+        }
+
+        JoinOperator op = Join(
+            JoinType.Inner, Batch(LeftSchema, IntCol(lk), StrCol(lv)), Batch(RightSchema, IntCol(rk), StrCol(rv)));
+
+        List<ColumnBatch> result = OpenDrain(op, Ctx(new BoundedExecutionMemory(52_000)));
+
+        Assert.True(result.Count >= 2);          // chunked across at least two output batches
+        Assert.Equal(n * n, RowCount(result));   // every match emitted, none dropped, budget never refused
+    }
+
+    // ===================================================================================================
+    // DECIMAL SUM OVERFLOW AT THE AGGREGATE LEVEL  — B4
+    // ===================================================================================================
+
+    // Builds a (non-compact) decimal column from Int128 unscaled magnitudes — needed to drive the
+    // decimal SUM overflow branch, which the long-based DecCol helper cannot reach.
+    private static MutableColumnVector BigDecCol(int precision, int scale, params Int128[] unscaled)
+    {
+        MutableColumnVector v = ColumnVectors.Create(new DecimalType(precision, scale), Math.Max(unscaled.Length, 1));
+        foreach (Int128 x in unscaled)
+        {
+            v.AppendValue(x);
+        }
+
+        return v;
+    }
+
+    [Fact]
+    public void GlobalSum_Decimal_AnsiOverflow_Throws()
+    {
+        // 9e37 + 9e37 = 1.8e38 overflows Int128 (max ~1.7e38) inside DecimalValue.Add.
+        var schema = new StructType([new StructField("v", new DecimalType(38, 0), nullable: true)]);
+        Int128 big = Int128.Parse("90000000000000000000000000000000000000");
+        AggregateOperator agg = Agg(
+            Scan(schema, Batch(schema, BigDecCol(38, 0, big, big))),
+            keys: [],
+            aggs: [Of(AggregateFunction.Sum, 0, new DecimalType(38, 0), AnsiMode.Ansi)]);
+
+        using IBatchStream stream = Backend.Open(agg, Ctx());
+        Assert.Throws<ArithmeticOverflowException>(() => stream.TryGetNext(out _));
+    }
+
+    [Fact]
+    public void GlobalSum_Decimal_LegacyOverflow_NullsTheGroup()
+    {
+        var schema = new StructType([new StructField("v", new DecimalType(38, 0), nullable: true)]);
+        Int128 big = Int128.Parse("90000000000000000000000000000000000000");
+        AggregateOperator agg = Agg(
+            Scan(schema, Batch(schema, BigDecCol(38, 0, big, big))),
+            keys: [],
+            aggs: [Of(AggregateFunction.Sum, 0, new DecimalType(38, 0), AnsiMode.Legacy)]);
+
+        List<ColumnBatch> result = OpenDrain(agg);
+
+        Assert.Equal(1, RowCount(result));
+        Assert.True(result[0].SelectedColumn(0).IsNull(0)); // overflow nulled the group
+    }
 }
