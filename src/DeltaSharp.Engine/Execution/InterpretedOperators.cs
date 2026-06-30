@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using DeltaSharp.Engine.Execution.Expressions;
 using DeltaSharp.Engine.Types;
 
 namespace DeltaSharp.Engine.Execution;
@@ -13,10 +14,12 @@ namespace DeltaSharp.Engine.Execution;
 /// </summary>
 /// <remarks>
 /// The dispatch is recursive and lazy: opening a parent opens its child first (building the pipeline
-/// structure) but moves no rows; the first <see cref="IBatchStream.TryGetNext"/> drives work. v1 only
-/// resolves <see cref="ColumnReference"/> predicates/projections — richer expressions (casts,
-/// arithmetic) raise <see cref="UnsupportedOperatorException"/> rather than degrade, until the
-/// interpreted expression evaluator (STORY-03.4.1) lands. No member here carries
+/// structure) but moves no rows; the first <see cref="IBatchStream.TryGetNext"/> drives work. A
+/// <see cref="ColumnReference"/> predicate/projection keeps its zero-copy fast path; richer
+/// expressions (arithmetic, comparison, boolean, cast, null-check) are bound to an
+/// <see cref="ExpressionEvaluator"/> at Open (STORY-03.4.1) — still no row work until the first pull.
+/// Shapes the interpreted evaluator does not cover raise <see cref="UnsupportedOperatorException"/>
+/// rather than degrade to a row-at-a-time fallback. No member here carries
 /// <c>[RequiresDynamicCode]</c>, keeping the interpreter NativeAOT-clean.
 /// </remarks>
 internal static class InterpretedOperators
@@ -74,27 +77,38 @@ internal static class InterpretedOperators
 
     private static IBatchStream OpenFilter(string backendName, FilterOperator filter, ExecutionContext context)
     {
-        int ordinal = RequireColumnReference(filter.Predicate, backendName, OperatorKind.Filter, "filter predicate");
-
-        // Validate the predicate column against the real input schema before opening the child, so a
-        // malformed plan fails fast at Open (not mid-stream) and no child stream leaks.
         StructType input = filter.InputSchema(0);
-        if ((uint)ordinal >= (uint)input.Count)
+
+        // A boolean column-reference predicate keeps the zero-copy selection fast path (STORY-03.2.1).
+        if (filter.Predicate is ColumnReference column)
         {
-            throw new ArgumentException(
-                $"Filter predicate references column {ordinal}, out of range for the input schema ({input.Count} field(s)).",
-                nameof(filter));
+            int ordinal = column.Ordinal;
+
+            // Validate the predicate column against the real input schema before opening the child, so a
+            // malformed plan fails fast at Open (not mid-stream) and no child stream leaks.
+            if ((uint)ordinal >= (uint)input.Count)
+            {
+                throw new ArgumentException(
+                    $"Filter predicate references column {ordinal}, out of range for the input schema ({input.Count} field(s)).",
+                    nameof(filter));
+            }
+
+            if (input[ordinal].DataType is not BooleanType)
+            {
+                throw new ArgumentException(
+                    $"Filter predicate references column '{input[ordinal].Name}' of type '{input[ordinal].DataType.SimpleString}'; "
+                    + "a boolean column is required.", nameof(filter));
+            }
+
+            IBatchStream columnChild = Open(backendName, filter.Children[0], context);
+            return new InterpretedFilterStream(filter, ordinal, columnChild, context);
         }
 
-        if (input[ordinal].DataType is not BooleanType)
-        {
-            throw new ArgumentException(
-                $"Filter predicate references column '{input[ordinal].Name}' of type '{input[ordinal].DataType.SimpleString}'; "
-                + "a boolean column is required.", nameof(filter));
-        }
-
+        // General predicate (already boolean-typed by the FilterOperator ctor): bind the interpreted
+        // evaluator before opening the child so a build-time UnsupportedOperatorException leaks no child.
+        ExpressionEvaluator predicate = ExpressionEvaluators.Build(filter.Predicate, input, backendName, OperatorKind.Filter);
         IBatchStream child = Open(backendName, filter.Children[0], context);
-        return new InterpretedFilterStream(filter, ordinal, child, context);
+        return new InterpretedFilterStream(filter, predicate, child, context);
     }
 
     private static IBatchStream OpenProject(string backendName, ProjectOperator project, ExecutionContext context)
@@ -102,46 +116,67 @@ internal static class InterpretedOperators
         StructType input = project.InputSchema(0);
         StructType output = project.OutputSchema;
 
-        var ordinals = new int[project.Projections.Count];
-        for (int i = 0; i < ordinals.Length; i++)
+        // All-column-reference projections stay a zero-copy reorder/rename (STORY-03.2.1); any computed
+        // projection switches the whole batch to the materializing path.
+        bool allColumnReferences = true;
+        for (int i = 0; i < project.Projections.Count; i++)
         {
-            int ordinal = RequireColumnReference(project.Projections[i], backendName, OperatorKind.Project, $"projection {i}");
-            if ((uint)ordinal >= (uint)input.Count)
+            if (project.Projections[i] is not ColumnReference)
             {
-                throw new ArgumentException(
-                    $"Projection {i} references column {ordinal}, out of range for the input schema ({input.Count} field(s)).",
-                    nameof(project));
+                allColumnReferences = false;
+                break;
+            }
+        }
+
+        if (allColumnReferences)
+        {
+            var ordinals = new int[project.Projections.Count];
+            for (int i = 0; i < ordinals.Length; i++)
+            {
+                var column = (ColumnReference)project.Projections[i];
+                ValidateColumnProjection(column, i, input, output);
+                ordinals[i] = column.Ordinal;
             }
 
-            // The output column is the referenced input column verbatim (zero-copy reorder/rename), so
-            // their value types must agree; the output field name may differ (an alias).
-            if (!input[ordinal].DataType.Equals(output[i].DataType))
-            {
-                throw new ArgumentException(
-                    $"Projection {i} reads column '{input[ordinal].Name}' of type '{input[ordinal].DataType.SimpleString}' "
-                    + $"but output field '{output[i].Name}' is '{output[i].DataType.SimpleString}'.", nameof(project));
-            }
+            IBatchStream columnChild = Open(backendName, project.Children[0], context);
+            return new InterpretedProjectStream(project, ordinals, columnChild, context);
+        }
 
-            ordinals[i] = ordinal;
+        var plans = new ProjectionPlan[project.Projections.Count];
+        for (int i = 0; i < plans.Length; i++)
+        {
+            PhysicalExpression expression = project.Projections[i];
+            if (expression is ColumnReference column)
+            {
+                ValidateColumnProjection(column, i, input, output);
+                plans[i] = ProjectionPlan.Column(column.Ordinal);
+            }
+            else
+            {
+                plans[i] = ProjectionPlan.Computed(ExpressionEvaluators.Build(expression, input, backendName, OperatorKind.Project));
+            }
         }
 
         IBatchStream child = Open(backendName, project.Children[0], context);
-        return new InterpretedProjectStream(project, ordinals, child, context);
+        return new InterpretedProjectStream(project, plans, child, context);
     }
 
-    private static int RequireColumnReference(PhysicalExpression expression, string backendName, OperatorKind kind, string role)
+    private static void ValidateColumnProjection(ColumnReference column, int index, StructType input, StructType output)
     {
-        if (expression is ColumnReference column)
+        if ((uint)column.Ordinal >= (uint)input.Count)
         {
-            return column.Ordinal;
+            throw new ArgumentException(
+                $"Projection {index} references column {column.Ordinal}, out of range for the input schema ({input.Count} field(s)).",
+                nameof(column));
         }
 
-        // No silent row-at-a-time fallback: a non-column-reference expression needs the interpreted
-        // expression evaluator (STORY-03.4.1), which is not part of this first operator slice.
-        throw new UnsupportedOperatorException(
-            kind,
-            backendName,
-            $"{role} must be a column reference in v1 ('{expression.GetType().Name}' is not yet executable); "
-            + "general expression evaluation arrives in STORY-03.4.1");
+        // The output column is the referenced input column verbatim (zero-copy reorder/rename), so
+        // their value types must agree; the output field name may differ (an alias).
+        if (!input[column.Ordinal].DataType.Equals(output[index].DataType))
+        {
+            throw new ArgumentException(
+                $"Projection {index} reads column '{input[column.Ordinal].Name}' of type '{input[column.Ordinal].DataType.SimpleString}' "
+                + $"but output field '{output[index].Name}' is '{output[index].DataType.SimpleString}'.", nameof(column));
+        }
     }
 }
