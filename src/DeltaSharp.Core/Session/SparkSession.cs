@@ -1,3 +1,4 @@
+using System.Collections;
 using System.Collections.Generic;
 using System.Threading;
 
@@ -17,8 +18,9 @@ namespace DeltaSharp;
 /// </para>
 /// <para>
 /// A session is <b>active</b> until <see cref="Stop"/> or <see cref="Dispose"/> is called, after
-/// which it is <b>stopped</b> and its data doors (<see cref="Read"/>, <see cref="Sql(string)"/>)
-/// throw <see cref="SessionStoppedException"/>. Active-session tracking is thread-local
+/// which it is <b>stopped</b> and its data doors (<see cref="Read"/>, <see cref="Sql(string)"/>,
+/// <see cref="CreateDataFrame(System.Collections.IEnumerable)"/>) throw
+/// <see cref="SessionStoppedException"/>. Active-session tracking is thread-local
 /// (<see cref="GetActiveSession"/>) and the default session is process-wide
 /// (<see cref="GetDefaultSession"/>), matching Spark. See
 /// <c>docs/engineering/design/sparksession-lifecycle.md</c>.
@@ -53,14 +55,11 @@ public sealed class SparkSession : IDisposable
     private static readonly ThreadLocal<SparkSession?> _activeSession = new(() => null);
 
     private readonly RuntimeConfig _conf;
-    private readonly string? _appName;
     private int _state = StateActive;
 
-    private SparkSession(IReadOnlyDictionary<string, string> options, ExecutionBackend backend)
+    private SparkSession(IReadOnlyDictionary<string, string> options)
     {
         _conf = new RuntimeConfig(this, options);
-        ExecutionBackend = backend;
-        _appName = options.TryGetValue(AppNameConfigKey, out string? name) ? name : null;
     }
 
     /// <summary>Creates a fluent <see cref="SparkSessionBuilder"/> (Spark's <c>SparkSession.builder()</c>).</summary>
@@ -78,7 +77,22 @@ public sealed class SparkSession : IDisposable
     /// equivalent). The value is inert until an action consumes it and defaults to
     /// <see cref="ExecutionBackend.Auto"/>.
     /// </summary>
-    public ExecutionBackend ExecutionBackend { get; }
+    /// <remarks>
+    /// The backend is <b>derived from the live <see cref="Conf"/></b> (the
+    /// <c>spark.deltasharp.execution.backend</c> key) on every read rather than cached at
+    /// construction, so it can never diverge from the configuration: a later
+    /// <see cref="SparkSessionBuilder.GetOrCreate"/> reuse or a <see cref="RuntimeConfig.Set(string, string)"/>
+    /// that changes the backend is always reflected here, and the #174 physical-planning bridge that
+    /// consumes this property always observes a value consistent with conf. Reading is a cold-path
+    /// parse that performs no engine work. An invalid configured value throws the same deterministic
+    /// <see cref="System.ArgumentException"/> that <see cref="SparkSessionBuilder.GetOrCreate"/> raises.
+    /// </remarks>
+    /// <exception cref="System.ArgumentException">
+    /// The configured <c>spark.deltasharp.execution.backend</c> value is not one of <c>auto</c>,
+    /// <c>interpreted</c>, or <c>compiled</c>.
+    /// </exception>
+    public ExecutionBackend ExecutionBackend =>
+        ParseExecutionBackend(_conf.Get(ExecutionBackendConfigKey, null));
 
     /// <summary>Indicates whether the session is still active (not stopped or disposed).</summary>
     public bool IsActive => Volatile.Read(ref _state) == StateActive;
@@ -125,29 +139,55 @@ public sealed class SparkSession : IDisposable
     }
 
     /// <summary>
+    /// Creates a <see cref="DataFrame"/> from a local in-memory collection (Spark's
+    /// <c>createDataFrame</c>).
+    /// </summary>
+    /// <param name="data">The local rows to materialize into a <see cref="DataFrame"/>.</param>
+    /// <returns>A <see cref="DataFrame"/> backed by the supplied local data.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="data"/> is <see langword="null"/>.</exception>
+    /// <exception cref="SessionStoppedException">The session has been stopped or disposed.</exception>
+    /// <exception cref="NotSupportedException">
+    /// The session is active but the DataFrame-creation door is not yet available in M1; the local
+    /// data path ships with the reader work in STORY-04.1.2 (#158). It is wired here so AC3's "creates
+    /// a DataFrame" door reports the deterministic lifecycle error on a stopped/disposed session.
+    /// </exception>
+    public DataFrame CreateDataFrame(IEnumerable data)
+    {
+        EnsureNotStopped(nameof(CreateDataFrame));
+        ArgumentNullException.ThrowIfNull(data);
+        throw new NotSupportedException(
+            "SparkSession.CreateDataFrame is not yet available in this milestone; the local-data " +
+            "path ships in STORY-04.1.2 (#158).");
+    }
+
+    /// <summary>
     /// Stops this session, transitioning it to the terminal stopped state (Spark's <c>stop()</c>).
     /// Clears this thread's active session when it is this one, and the process-wide default when it
     /// is this one. Idempotent.
     /// </summary>
     public void Stop()
     {
-        // Idempotent: only the first transition does work.
-        if (Interlocked.Exchange(ref _state, StateStopped) == StateStopped)
-        {
-            return;
-        }
-
-        if (_activeSession.Value == this)
-        {
-            _activeSession.Value = null;
-        }
-
+        // Transition under _globalLock so a session being reused inside GetOrCreate's locked decision
+        // cannot be concurrently flipped to stopped (TOCTOU): GetOrCreate observes IsActive and Stop
+        // mutates _state under the same lock, making the reuse decision and the lifecycle transition
+        // mutually exclusive. Stop takes only _globalLock (never _gate), preserving the
+        // _globalLock -> _gate lock ordering. The fast-path readers (IsActive / EnsureNotStopped) stay
+        // lock-free via Volatile.Read; Interlocked.Exchange keeps that write visible and idempotent.
+        bool transitioned;
         lock (_globalLock)
         {
-            if (ReferenceEquals(_defaultSession, this))
+            transitioned = Interlocked.Exchange(ref _state, StateStopped) != StateStopped;
+            if (transitioned && ReferenceEquals(_defaultSession, this))
             {
                 _defaultSession = null;
             }
+        }
+
+        // Idempotent: only the first transition clears this thread's active slot (thread-local, so it
+        // needs no global lock).
+        if (transitioned && _activeSession.Value == this)
+        {
+            _activeSession.Value = null;
         }
     }
 
@@ -205,7 +245,9 @@ public sealed class SparkSession : IDisposable
     {
         if (Volatile.Read(ref _state) == StateStopped)
         {
-            throw SessionStoppedException.ForMember(memberName, _appName);
+            // Derive the app name from the live conf (never a cached field) so the message stays
+            // consistent with configuration even after a GetOrCreate reuse changed spark.app.name.
+            throw SessionStoppedException.ForMember(memberName, _conf.Get(AppNameConfigKey, null));
         }
     }
 
@@ -215,9 +257,12 @@ public sealed class SparkSession : IDisposable
     /// </summary>
     internal static SparkSession GetOrCreate(IReadOnlyDictionary<string, string> options)
     {
-        // Parse/validate backend selection first so an invalid value fails fast and deterministically,
-        // regardless of whether a session will be reused or created. No engine work happens here.
-        ExecutionBackend backend = ParseExecutionBackend(options);
+        // Parse/validate backend selection first, BEFORE acquiring _globalLock and UNCONDITIONALLY
+        // (whether a session will be reused or created), so an invalid value fails fast and
+        // deterministically — including on the reuse path. No engine work happens here. The parsed
+        // value is not cached on the session; SparkSession.ExecutionBackend is derived from conf.
+        _ = ParseExecutionBackend(
+            options.TryGetValue(ExecutionBackendConfigKey, out string? raw) ? raw : null);
 
         lock (_globalLock)
         {
@@ -235,7 +280,7 @@ public sealed class SparkSession : IDisposable
                 return _defaultSession;
             }
 
-            SparkSession session = new(options, backend);
+            SparkSession session = new(options);
             _defaultSession = session;
             _activeSession.Value = session;
             return session;
@@ -250,9 +295,9 @@ public sealed class SparkSession : IDisposable
         }
     }
 
-    private static ExecutionBackend ParseExecutionBackend(IReadOnlyDictionary<string, string> options)
+    private static ExecutionBackend ParseExecutionBackend(string? raw)
     {
-        if (!options.TryGetValue(ExecutionBackendConfigKey, out string? raw) || string.IsNullOrEmpty(raw))
+        if (string.IsNullOrEmpty(raw))
         {
             return ExecutionBackend.Auto;
         }

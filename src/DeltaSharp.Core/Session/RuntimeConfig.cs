@@ -137,6 +137,16 @@ public sealed class RuntimeConfig
     public void Set(string key, long value) => Set(key, value.ToString(CultureInfo.InvariantCulture));
 
     /// <summary>
+    /// Sets a floating-point configuration value (stored using the invariant culture, round-trip
+    /// <c>"R"</c> format). Symmetric with <see cref="SparkSessionBuilder.Config(string, double)"/>.
+    /// </summary>
+    /// <param name="key">The configuration key.</param>
+    /// <param name="value">The value to store.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="key"/> is <see langword="null"/>.</exception>
+    /// <exception cref="SessionStoppedException">The owning session has been stopped or disposed.</exception>
+    public void Set(string key, double value) => Set(key, value.ToString("R", CultureInfo.InvariantCulture));
+
+    /// <summary>
     /// Internal write used by session creation to seed the parsed configuration without a lifecycle
     /// check (the session is being constructed and is not yet stopped).
     /// </summary>

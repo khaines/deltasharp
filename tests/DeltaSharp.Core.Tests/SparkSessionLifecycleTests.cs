@@ -55,6 +55,36 @@ public sealed class SparkSessionLifecycleTests
     }
 
     [Fact]
+    public void CreateDataFrame_OnStoppedSession_ThrowsSessionStopped()
+    {
+        // AC3: "creates a DataFrame" door on a stopped session yields the deterministic lifecycle
+        // error via the same EnsureNotStopped guard as Read/Sql.
+        SparkSession spark = SparkSession.Builder().AppName("stopped").GetOrCreate();
+        spark.Stop();
+
+        Assert.Throws<SessionStoppedException>(() => spark.CreateDataFrame(new[] { "row" }));
+    }
+
+    [Fact]
+    public void CreateDataFrame_OnDisposedSession_ThrowsSessionStopped()
+    {
+        SparkSession spark = SparkSession.Builder().AppName("disposed").GetOrCreate();
+        spark.Dispose();
+
+        Assert.Throws<SessionStoppedException>(() => spark.CreateDataFrame(new[] { "row" }));
+    }
+
+    [Fact]
+    public void CreateDataFrame_OnActiveSession_ThrowsNotSupported_NotLifecycle()
+    {
+        // On an ACTIVE session the M1 door reports "not yet available" (NotSupportedException),
+        // distinct from the lifecycle error so callers can tell the states apart.
+        using SparkSession spark = SparkSession.Builder().AppName("active").GetOrCreate();
+
+        Assert.Throws<NotSupportedException>(() => spark.CreateDataFrame(new[] { "row" }));
+    }
+
+    [Fact]
     public void SessionStopped_Message_IsDeterministicAndNamesApp()
     {
         SparkSession spark = SparkSession.Builder().AppName("payments").GetOrCreate();

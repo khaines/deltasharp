@@ -53,9 +53,20 @@ public sealed class RuntimeConfigTests
 
         spark.Conf.Set("b", true);
         spark.Conf.Set("n", 7L);
+        spark.Conf.Set("d", 1.5d);
 
         Assert.Equal("true", spark.Conf.Get("b"));
         Assert.Equal("7", spark.Conf.Get("n"));
+        Assert.Equal("1.5", spark.Conf.Get("d"));
+    }
+
+    [Fact]
+    public void Set_Double_AfterStop_ThrowsSessionStopped()
+    {
+        SparkSession spark = SparkSession.Builder().AppName("post-mortem").GetOrCreate();
+        spark.Stop();
+
+        Assert.Throws<SessionStoppedException>(() => spark.Conf.Set("d", 1.5d));
     }
 
     [Fact]

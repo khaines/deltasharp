@@ -12,6 +12,7 @@ DeltaSharp.RuntimeConfig.Get(string! key) -> string!
 DeltaSharp.RuntimeConfig.Get(string! key, string? defaultValue) -> string?
 DeltaSharp.RuntimeConfig.GetAll() -> System.Collections.Generic.IReadOnlyDictionary<string!, string!>!
 DeltaSharp.RuntimeConfig.Set(string! key, bool value) -> void
+DeltaSharp.RuntimeConfig.Set(string! key, double value) -> void
 DeltaSharp.RuntimeConfig.Set(string! key, long value) -> void
 DeltaSharp.RuntimeConfig.Set(string! key, string! value) -> void
 DeltaSharp.SessionStoppedException
@@ -20,6 +21,7 @@ DeltaSharp.SessionStoppedException.SessionStoppedException(string! message) -> v
 DeltaSharp.SessionStoppedException.SessionStoppedException(string! message, System.Exception? innerException) -> void
 DeltaSharp.SparkSession
 DeltaSharp.SparkSession.Conf.get -> DeltaSharp.RuntimeConfig!
+DeltaSharp.SparkSession.CreateDataFrame(System.Collections.IEnumerable! data) -> DeltaSharp.DataFrame!
 DeltaSharp.SparkSession.Dispose() -> void
 DeltaSharp.SparkSession.ExecutionBackend.get -> DeltaSharp.ExecutionBackend
 DeltaSharp.SparkSession.IsActive.get -> bool

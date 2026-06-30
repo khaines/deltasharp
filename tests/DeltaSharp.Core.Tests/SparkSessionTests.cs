@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Reflection;
 using Xunit;
 
 namespace DeltaSharp.Core.Tests;
@@ -154,5 +155,141 @@ public sealed class SparkSessionTests
         Assert.Equal(ExecutionBackend.Compiled, spark.ExecutionBackend);
         Assert.Equal("compiled", spark.Conf.Get("spark.deltasharp.execution.backend"));
         Assert.True(spark.IsActive);
+    }
+
+    // ----- B1: ExecutionBackend is derived from conf and never diverges from it -----
+
+    [Fact]
+    public void GetOrCreate_ReuseChangingBackend_KeepsExecutionBackendAndConfInAgreement()
+    {
+        const string backendKey = "spark.deltasharp.execution.backend";
+
+        using SparkSession first = SparkSession.Builder()
+            .Config(backendKey, "interpreted")
+            .GetOrCreate();
+        Assert.Equal(ExecutionBackend.Interpreted, first.ExecutionBackend);
+        Assert.Equal("interpreted", first.Conf.Get(backendKey));
+
+        // Reuse the session, changing the backend to compiled. The enum and conf must AGREE on the
+        // new value — no stale construction-time cache. (Regression for the #174 bridge, which reads
+        // session.ExecutionBackend and must see a value consistent with conf.)
+        SparkSession second = SparkSession.Builder()
+            .Config(backendKey, "compiled")
+            .GetOrCreate();
+        Assert.Same(first, second);
+        Assert.Equal(ExecutionBackend.Compiled, second.ExecutionBackend);
+        Assert.Equal("compiled", second.Conf.Get(backendKey));
+        Assert.Equal(second.ExecutionBackend, ParseConfBackend(second));
+
+        // The original handle observes the same updated value — there is a single source of truth.
+        Assert.Equal(ExecutionBackend.Compiled, first.ExecutionBackend);
+
+        // The other direction: reuse back to interpreted; agreement holds again.
+        SparkSession third = SparkSession.Builder()
+            .Config(backendKey, "interpreted")
+            .GetOrCreate();
+        Assert.Same(first, third);
+        Assert.Equal(ExecutionBackend.Interpreted, third.ExecutionBackend);
+        Assert.Equal("interpreted", third.Conf.Get(backendKey));
+        Assert.Equal(third.ExecutionBackend, ParseConfBackend(third));
+    }
+
+    [Fact]
+    public void ExecutionBackend_ReflectsConfSet_AfterCreation()
+    {
+        const string backendKey = "spark.deltasharp.execution.backend";
+        using SparkSession spark = SparkSession.Builder().AppName("conf-set").GetOrCreate();
+        Assert.Equal(ExecutionBackend.Auto, spark.ExecutionBackend);
+
+        spark.Conf.Set(backendKey, "interpreted");
+
+        // ExecutionBackend is derived from the live conf, so a runtime Conf.Set is reflected too.
+        Assert.Equal(ExecutionBackend.Interpreted, spark.ExecutionBackend);
+        Assert.Equal("interpreted", spark.Conf.Get(backendKey));
+    }
+
+    private static ExecutionBackend ParseConfBackend(SparkSession session)
+        => session.Conf.Get("spark.deltasharp.execution.backend", "auto") switch
+        {
+            "interpreted" => ExecutionBackend.Interpreted,
+            "compiled" => ExecutionBackend.Compiled,
+            _ => ExecutionBackend.Auto,
+        };
+
+    // ----- B4: invalid backend on the REUSE path still fails fast at GetOrCreate -----
+
+    [Fact]
+    public void Config_ExecutionBackend_InvalidValue_OnReusePath_ThrowsAtGetOrCreate()
+    {
+        const string backendKey = "spark.deltasharp.execution.backend";
+
+        // A reusable session already exists; backend parse/validation is hoisted before the reuse
+        // decision and runs UNCONDITIONALLY, so an invalid value fails fast even on the reuse path.
+        using SparkSession first = SparkSession.Builder().AppName("reuse").GetOrCreate();
+
+        SparkSessionBuilder builder = SparkSession.Builder().Config(backendKey, "turbo");
+        ArgumentException ex = Assert.Throws<ArgumentException>(() => builder.GetOrCreate());
+        Assert.Contains("turbo", ex.Message, StringComparison.Ordinal);
+
+        // The invalid value was never applied to the reused session's conf.
+        Assert.False(first.Conf.Contains(backendKey));
+        Assert.Equal(ExecutionBackend.Auto, first.ExecutionBackend);
+        Assert.True(first.IsActive);
+    }
+
+    // ----- AC1/AC4: instrumented proof that creation/config/backend recording does NO work -----
+
+    [Fact]
+    public void Core_ReferencesNoEngineAssembly_SoNoQueryWorkIsPossible()
+    {
+        // The strongest AC1/AC4 "without executing / without initializing work" proof is structural:
+        // the public surface cannot touch the engine because DeltaSharp.Core references no
+        // DeltaSharp.Engine assembly. Session construction, config, GetOrCreate, and backend
+        // recording therefore cannot perform any query/engine work.
+        AssemblyName[] referenced = typeof(SparkSession).Assembly.GetReferencedAssemblies();
+        Assert.DoesNotContain(
+            referenced,
+            a => a.Name is not null && a.Name.Contains("Engine", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void GetOrCreate_RecordingBackend_HasNoSideEffectBeyondConfigStorage()
+    {
+        // Backend recording stores ONLY the user-supplied keys — no engine warm-up keys, capability
+        // probes, or other observable side effects beyond config storage.
+        using SparkSession spark = SparkSession.Builder()
+            .AppName("ac4")
+            .Config("spark.deltasharp.execution.backend", "interpreted")
+            .GetOrCreate();
+
+        IReadOnlyDictionary<string, string> all = spark.Conf.GetAll();
+        Assert.Equal(
+            new HashSet<string> { "spark.app.name", "spark.deltasharp.execution.backend" },
+            new HashSet<string>(all.Keys));
+        Assert.Equal(ExecutionBackend.Interpreted, spark.ExecutionBackend);
+    }
+
+    [Fact]
+    public void CreateDataFrame_OnActiveSession_DoesNotEnumerateItsInput()
+    {
+        // Instrumented no-work proof for the AC3 DataFrame door: the M1 door reports "not yet
+        // available" WITHOUT enumerating (touching) the supplied local data — a spy counter stays 0.
+        using SparkSession spark = SparkSession.Builder().AppName("nowork").GetOrCreate();
+        CountingEnumerable spy = new();
+
+        Assert.Throws<NotSupportedException>(() => spark.CreateDataFrame(spy));
+
+        Assert.Equal(0, spy.EnumerationCount);
+    }
+
+    private sealed class CountingEnumerable : System.Collections.IEnumerable
+    {
+        public int EnumerationCount { get; private set; }
+
+        public System.Collections.IEnumerator GetEnumerator()
+        {
+            EnumerationCount++;
+            yield break;
+        }
     }
 }
