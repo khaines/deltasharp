@@ -74,8 +74,10 @@ Implementations:
   on the first segment (a context that never spills allocates no disk) with `UnixFileMode` **0700**, and each
   segment file is created **0600** via `FileStreamOptions.UnixCreateMode`, so spilled tenant rows are never
   group/world-readable on a shared pod (Security F3); `UnixFileMode` is a no-op on Windows. `Dispose` deletes
-  the directory. Names use `Environment.ProcessId` + an `Interlocked` counter (no `Guid.NewGuid`, which the
-  BannedApiAnalyzer forbids). The store is `IDisposable`; whoever builds the `ExecutionContext` (the executor)
+  the directory, which is created via `Directory.CreateTempSubdirectory("deltasharp-spill-")` — an atomically
+  created, uniquely-named, **unpredictable** 0700 directory (mkdtemp semantics on Unix) that an attacker cannot
+  pre-create at a predictable path to weaken its permissions or strand/observe its segments (#156 F1); no
+  `Guid.NewGuid`, which the BannedApiAnalyzer forbids. The store is `IDisposable`; whoever builds the `ExecutionContext` (the executor)
   owns its lifetime and disposes it after the run.
 - `FaultSpillStore` ([test](../../../tests/DeltaSharp.Engine.Tests/Execution/FaultSpillStore.cs)) — wraps a
   real store and throws `SpillIOException` deterministically on the Nth write (`FailOnWriteAfter`) or first
@@ -288,13 +290,15 @@ pod OOM (Security F1). #156 B1 restores a real, **bounded** ceiling end-to-end:
 3. **Cumulative spill cap** ([`IExecutionMemory.MaxSpillBytes`](../../../src/DeltaSharp.Engine/Execution/IExecutionMemory.cs)) —
    a per-query ceiling on **total** bytes written to spill across every operator. Each operator records its
    spill against the run budget via `IExecutionMemory.RecordSpill(bytes)` at the same point it sums
-   `AddSpilledBytes`. When the cumulative total would exceed the cap, `RecordSpill` throws the typed,
+   `AddSpilledBytes`, **incrementally per spill event** (per spilled run, per spilled batch, per partitioned
+   join build/probe batch — never once at the end of a whole drain, #156 F2). When the cumulative total would exceed the cap, `RecordSpill` throws the typed,
    deterministic [`SpillBudgetExceededException`](../../../src/DeltaSharp.Engine/Execution/Spill/SpillBudgetExceededException.cs);
    the operator releases **all** reservations exactly once (through the same `Dispose`/over-release-ledger
    path as a spill I/O failure) and emits **no** partial output.
 
 So the blast-radius is bounded on both axes: memory by `BudgetBytes`, disk by `MaxSpillBytes`. The disk gap
-is **not** unbounded — it is exactly the configured spill cap, and crossing it fails closed with the same
+is **not** unbounded — it is the configured spill cap plus at most one in-flight spill event (one run/batch)
+per spilling operator, because the cap is charged incrementally as each spill event is written; crossing it fails closed with the same
 discipline as #359/#363. `BoundedExecutionMemory(budgetBytes, maxSpillBytes)` configures both; the legacy
 single-argument constructor leaves the spill cap effectively unbounded (`long.MaxValue`) for callers that do
 not set one.
