@@ -82,7 +82,6 @@ internal sealed class InterpretedJoinStream : IBatchStream
     private bool _probePartitioned;
     private int _gracePartition;
     private ISpillSegmentReader? _probeReader;
-    private long _spilledBytes;
 
     // Probe state, preserved across pulls so a left row's matches resume mid-chunk.
     private ColumnBatch? _leftBatch;
@@ -307,13 +306,12 @@ internal sealed class InterpretedJoinStream : IBatchStream
 
         if (_grace)
         {
-            // Build spilled: every build row now lives in a partition (or null) segment. The probe is
-            // partitioned lazily on first emit, then partitions are joined one at a time.
-            _metrics.AddSpilledBytes(_spilledBytes);
-            // Fail closed if the build spill breached the per-query spill cap; the reservations and segments
-            // unwind through Dispose exactly once with no partial output.
-            _memory.RecordSpill(_spilledBytes);
-            _spilledBytes = 0;
+            // Build spilled: every build row now lives in a partition (or null) segment. The spill cap was
+            // charged INCREMENTALLY, once per partitioned range during the drain (see PartitionBuildRange),
+            // so a breach already failed closed mid-drain after at most one range of overshoot — there is no
+            // end-of-drain RecordSpill here that could let the whole build side reach disk before the cap is
+            // checked (#156 B1b). The probe is partitioned lazily on first emit, then partitions are joined
+            // one at a time.
             _gracePartition = -1;
             return;
         }
@@ -754,6 +752,7 @@ internal sealed class InterpretedJoinStream : IBatchStream
 
     private void PartitionBuildRange(ColumnVector[] keyVectors, ColumnVector[] columns, int start, int end)
     {
+        long batchSpilled = 0;
         for (int r = start; r < end; r++)
         {
             CancellationPolicy.Poll(_cancellationToken, r);
@@ -781,8 +780,17 @@ internal sealed class InterpretedJoinStream : IBatchStream
             }
 
             target.Write(_recordWriter.WrittenSpan);
-            _spilledBytes += _recordWriter.WrittenSpan.Length;
+            batchSpilled += _recordWriter.WrittenSpan.Length;
         }
+
+        // Charge the spill cap INCREMENTALLY, once per partitioned build range (one build batch, or the
+        // one-time flush of the in-memory buffer when grace begins), so a breach fails closed mid-drain
+        // after at most one range of overshoot instead of after the whole build side is on disk (#156 B1b
+        // bounded blast radius). The throw propagates out of EnsureBuilt before any output is emitted, and
+        // the reservations/segments unwind through Dispose exactly once. Report the metric first so
+        // SpilledBytes reflects bytes actually written even when RecordSpill then fails closed.
+        _metrics.AddSpilledBytes(batchSpilled);
+        _memory.RecordSpill(batchSpilled);
     }
 
     // Drains the entire probe and partitions it to disk by the same hash, so each partition's probe rows
@@ -790,7 +798,6 @@ internal sealed class InterpretedJoinStream : IBatchStream
     private void PartitionProbe()
     {
         EnsureProbePartitions();
-        long spilled = 0;
         while (true)
         {
             long probeStart = Stopwatch.GetTimestamp();
@@ -803,6 +810,7 @@ internal sealed class InterpretedJoinStream : IBatchStream
 
             _cancellationToken.ThrowIfCancellationRequested();
             _metrics.AddInputRows(batch!.LogicalRowCount);
+            long batchSpilled = 0;
             var scratch = new BatchEvaluationMemory(_memory);
             try
             {
@@ -832,18 +840,24 @@ internal sealed class InterpretedJoinStream : IBatchStream
                     }
 
                     target.Write(frame);
-                    spilled += frame.Length;
+                    batchSpilled += frame.Length;
                 }
             }
             finally
             {
                 scratch.Release();
             }
+
+            // Charge the spill cap INCREMENTALLY, once per probe batch, BEFORE pulling the next batch, so a
+            // breach fails closed mid-drain after at most one batch of overshoot instead of after the entire
+            // probe stream is on disk (#156 B1b bounded blast radius). On the throwing path _probePartitioned
+            // stays false, so no partition is ever emitted and the partially-written segments unwind through
+            // Dispose exactly once with zero join output. Report the metric first so SpilledBytes reflects
+            // bytes actually written even when RecordSpill then fails closed.
+            _metrics.AddSpilledBytes(batchSpilled);
+            _memory.RecordSpill(batchSpilled);
         }
 
-        _metrics.AddSpilledBytes(spilled);
-        // Fail closed if probe partitioning breached the per-query spill cap (release-all via Dispose).
-        _memory.RecordSpill(spilled);
         _probePartitioned = true;
     }
 

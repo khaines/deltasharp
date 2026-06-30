@@ -166,8 +166,17 @@ internal sealed class InterpretedSortStream : IBatchStream
                 _bufferReserved = 0;
             }
 
-            DisposeMergeCursors();
-            DisposeRuns();
+            // Dispose the runs even if a merge-cursor Dispose throws, so one fault cannot strand the
+            // run segments (and their temp files) — both teardown steps always run (Security F3).
+            try
+            {
+                DisposeMergeCursors();
+            }
+            finally
+            {
+                DisposeRuns();
+            }
+
             _metrics.ObserveRelease(0);
         }
         finally
@@ -536,22 +545,50 @@ internal sealed class InterpretedSortStream : IBatchStream
 
     private void DisposeMergeCursors()
     {
+        // Defense-in-depth (Security F3): one cursor's Dispose throwing an unexpected exception must not
+        // strand its siblings — dispose every cursor, then surface any failures aggregated (matches
+        // BufferGroup.Dispose). Lock-free: Dispose is single-threaded teardown.
+        List<Exception>? failures = null;
         foreach (SortMergeCursor cursor in _mergeCursors)
         {
-            cursor?.Dispose();
+            try
+            {
+                cursor?.Dispose();
+            }
+            catch (Exception ex)
+            {
+                (failures ??= []).Add(ex);
+            }
         }
 
         _mergeCursors = [];
+        if (failures is not null)
+        {
+            throw new AggregateException("One or more sort merge cursors failed to dispose.", failures);
+        }
     }
 
     private void DisposeRuns()
     {
+        // Defense-in-depth (Security F3): one run's Dispose throwing must not strand its siblings.
+        List<Exception>? failures = null;
         foreach (ISpillSegment run in _runs)
         {
-            run.Dispose();
+            try
+            {
+                run.Dispose();
+            }
+            catch (Exception ex)
+            {
+                (failures ??= []).Add(ex);
+            }
         }
 
         _runs.Clear();
+        if (failures is not null)
+        {
+            throw new AggregateException("One or more sort spill runs failed to dispose.", failures);
+        }
     }
 
     // The per-run merge cursor over a run's records (each [keyLen][key][seq][rowFrame]).

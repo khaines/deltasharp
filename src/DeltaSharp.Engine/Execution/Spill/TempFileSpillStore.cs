@@ -19,32 +19,21 @@ namespace DeltaSharp.Engine.Execution.Spill;
 /// </remarks>
 internal sealed class TempFileSpillStore : ISpillStore, IDisposable
 {
-    private static long s_storeCounter;
-
-    // 0700: only the owner may read/list/traverse the spill dir — spilled tenant rows are never world- or
-    // group-readable on a shared pod (Security F3). Ignored on Windows, where UnixFileMode is a no-op.
-    private const UnixFileMode DirectoryMode =
-        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
-
     // 0600: only the owner may read/write a spilled segment file (Security F3).
     private const UnixFileMode SegmentFileMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
 
-    private readonly string _root;
+    private string _root = string.Empty;
     private readonly List<Segment> _segments = new();
     private int _counter;
     private bool _rootCreated;
     private bool _disposed;
 
     /// <summary>
-    /// Creates a store whose temp directory is named eagerly but materialized lazily under the OS temp path
-    /// (so a context that never spills allocates no disk).
+    /// Creates a store whose temp directory is materialized lazily on the first spill (so a context that
+    /// never spills allocates no disk). No predictable name is reserved up front.
     /// </summary>
     public TempFileSpillStore()
     {
-        // Deterministic, collision-free directory identity without the banned Guid.NewGuid: the process id
-        // plus a monotonic per-process counter uniquely names each store's temp root.
-        long id = Interlocked.Increment(ref s_storeCounter);
-        _root = Path.Combine(Path.GetTempPath(), $"deltasharp-spill-{Environment.ProcessId}-{id}");
     }
 
     /// <inheritdoc />
@@ -58,10 +47,11 @@ internal sealed class TempFileSpillStore : ISpillStore, IDisposable
         return segment;
     }
 
-    /// <summary>The temp directory backing this store (test-visible so cleanup can be asserted).</summary>
+    /// <summary>The temp directory backing this store (test-visible so cleanup can be asserted). Empty
+    /// until the first segment is created, since the directory is materialized lazily.</summary>
     internal string Root => _root;
 
-    // Creates the 0700 spill root on first use; idempotent.
+    // Creates the spill root on first use; idempotent.
     private void EnsureRoot()
     {
         if (_rootCreated)
@@ -71,16 +61,12 @@ internal sealed class TempFileSpillStore : ISpillStore, IDisposable
 
         try
         {
-            if (OperatingSystem.IsWindows())
-            {
-                // UnixFileMode is a no-op on Windows; ACL-based isolation is the platform's concern there.
-                Directory.CreateDirectory(_root);
-            }
-            else
-            {
-                Directory.CreateDirectory(_root, DirectoryMode);
-            }
-
+            // Directory.CreateTempSubdirectory atomically creates a UNIQUELY-named subdirectory under the OS
+            // temp root that an attacker cannot pre-create or predict (mkdtemp semantics → 0700 on Unix, a
+            // random unguessable name on Windows). This replaces the old deterministic
+            // deltasharp-spill-{pid}-{counter} name, which an attacker could pre-create 0777 to leak segment
+            // metadata or unlink/clobber the 0600 data files (Security F1). No Guid.NewGuid is used (banned).
+            _root = Directory.CreateTempSubdirectory("deltasharp-spill-").FullName;
             _rootCreated = true;
         }
         catch (IOException ex)
@@ -102,9 +88,23 @@ internal sealed class TempFileSpillStore : ISpillStore, IDisposable
         }
 
         _disposed = true;
+
+        // Defense-in-depth (Security F3): one segment's Dispose throwing an unexpected exception must not
+        // strand its siblings or skip the directory backstop below. Segment.Dispose already swallows the
+        // expected IOException/UnauthorizedAccessException; this guards any other escape so every segment is
+        // disposed (its temp file deleted) and the directory delete still runs. Lock-free single-threaded
+        // teardown; any failures are aggregated and surfaced AFTER cleanup completes.
+        List<Exception>? failures = null;
         foreach (Segment segment in _segments)
         {
-            segment.Dispose();
+            try
+            {
+                segment.Dispose();
+            }
+            catch (Exception ex)
+            {
+                (failures ??= []).Add(ex);
+            }
         }
 
         _segments.Clear();
@@ -123,6 +123,11 @@ internal sealed class TempFileSpillStore : ISpillStore, IDisposable
         }
         catch (UnauthorizedAccessException)
         {
+        }
+
+        if (failures is not null)
+        {
+            throw new AggregateException("One or more spill segments failed to dispose.", failures);
         }
     }
 

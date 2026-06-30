@@ -500,8 +500,115 @@ public class OperatorSpillTests
     }
 
     // ==============================================================================================
-    // AC4 — local EXCHANGE spill: partitions recoverable, per-partition row counts/contents match.
+    // F2 — the spill CAP must bound disk for JOIN incrementally: a join whose probe is many batches must
+    // fail closed MID-DRAIN after at most ~one batch of overshoot, not after the whole probe is on disk.
     // ==============================================================================================
+
+    [Fact]
+    public void Join_SpillCap_FailsClosedMidProbeDrain_BoundedOvershoot_NotWholeStream()
+    {
+        const int probeBatches = 300;
+        const int rowsPerProbeBatch = 64;
+        const int buildRows = 2000;
+
+        // Build is a single batch; under a tight memory budget it grace-spills. Probe is MANY small batches
+        // so the per-batch incremental cap check can fail closed partway through the probe drain.
+        ColumnBatch BuildSide()
+        {
+            MutableColumnVector k = ColumnVectors.Create(DataTypes.IntegerType, 1);
+            MutableColumnVector v = ColumnVectors.Create(DataTypes.StringType, 1);
+            for (int i = 0; i < buildRows; i++)
+            {
+                k.AppendValue(i % 1000);
+                v.AppendBytes(Encoding.UTF8.GetBytes($"b{i}"));
+            }
+
+            return Batch(JoinRight, k, v);
+        }
+
+        ColumnBatch[] ProbeBatches()
+        {
+            var batches = new ColumnBatch[probeBatches];
+            for (int b = 0; b < probeBatches; b++)
+            {
+                MutableColumnVector k = ColumnVectors.Create(DataTypes.IntegerType, 1);
+                MutableColumnVector v = ColumnVectors.Create(DataTypes.StringType, 1);
+                for (int r = 0; r < rowsPerProbeBatch; r++)
+                {
+                    k.AppendValue(((b * rowsPerProbeBatch) + r) % 1000);
+                    v.AppendBytes(Encoding.UTF8.GetBytes($"p{b}.{r}"));
+                }
+
+                batches[b] = Batch(JoinLeft, k, v);
+            }
+
+            return batches;
+        }
+
+        JoinOperator BuildJoin() => new(
+            Scan(JoinLeft, ProbeBatches()),
+            Scan(JoinRight, BuildSide()),
+            JoinOut(JoinType.Inner),
+            JoinType.Inner,
+            [new ColumnReference(0, DataTypes.IntegerType, nullable: true)],
+            [new ColumnReference(0, DataTypes.IntegerType, nullable: true)]);
+
+        const long budget = 90000; // tight enough to grace-spill the build, ample enough for per-batch scratch
+
+        // Non-vacuity: with a GENEROUS cap the identical join completes with full correct output.
+        var genMem = new BoundedExecutionMemory(budget, long.MaxValue);
+        JoinOperator genOp = BuildJoin();
+        long fullOutput;
+        using (IBatchStream gen = Backend.Open(genOp, Ctx(genMem)))
+        {
+            fullOutput = Drain(gen).Sum(b => (long)b.LogicalRowCount);
+        }
+
+        long fullSpill = genOp.Metrics.Snapshot().SpilledBytes;
+        Assert.True(fullSpill > 0, "the tight budget must force the join to grace-spill");
+        Assert.True(fullOutput > 0, "the generous-cap join must produce output");
+
+        // Tight cap: a fifth of the whole spill — well ABOVE the (small) build spill so the breach lands in
+        // the PROBE drain, yet a small fraction of the whole probe so it must trip partway through.
+        long cap = fullSpill / 5;
+        var mem = new BoundedExecutionMemory(budget, cap);
+        JoinOperator op = BuildJoin();
+        IBatchStream stream = Backend.Open(op, Ctx(mem));
+
+        var emitted = new List<ColumnBatch>();
+        SpillBudgetExceededException? error = null;
+        try
+        {
+            while (stream.TryGetNext(out ColumnBatch? batch))
+            {
+                emitted.Add(batch);
+            }
+        }
+        catch (SpillBudgetExceededException ex)
+        {
+            error = ex;
+        }
+
+        long failSpill = mem.SpilledBytes;
+
+        Assert.NotNull(error);                                // deterministic typed fail-closed
+        Assert.Equal(0, emitted.Sum(b => b.LogicalRowCount)); // partitioning precedes emit → NO partial join output
+        stream.Dispose();
+        Assert.Equal(0, mem.ReservedBytes);                   // release-all (the ledger proves exactly-once)
+
+        // Bounded overshoot: at the throw the cumulative spilled total is at most the cap plus ~one probe
+        // batch — NOT the entire probe stream. (fullSpill/probeBatches over-estimates a single probe batch
+        // since fullSpill includes the build too, so it is a safe per-batch upper bound.)
+        long oneBatchUpperBound = (fullSpill / probeBatches) + 256;
+        Assert.True(
+            failSpill <= cap + oneBatchUpperBound,
+            $"overshoot must be ≤ ~one batch: failSpill={failSpill}, cap={cap}, oneBatchUpperBound={oneBatchUpperBound}");
+        Assert.True(
+            failSpill < fullSpill / 2,
+            $"must fail closed MID-drain, not after writing the whole stream: failSpill={failSpill}, fullSpill={fullSpill}");
+    }
+
+
 
     [Fact]
     public void Exchange_Spill_MatchesNoSpill_PerPartitionCountsAndContents()
@@ -761,9 +868,112 @@ public class OperatorSpillTests
         const UnixFileMode file0600 = UnixFileMode.UserRead | UnixFileMode.UserWrite;
         Assert.Equal(dir0700, File.GetUnixFileMode(store.Root));
 
+        // Security F1: the dir name must carry the prefix but an UNPREDICTABLE random suffix (mkdtemp) — it
+        // must NOT be the old deterministic deltasharp-spill-{pid}-{counter} name an attacker could pre-create.
+        string name = Path.GetFileName(store.Root);
+        Assert.StartsWith("deltasharp-spill-", name);
+        Assert.NotEqual($"deltasharp-spill-{Environment.ProcessId}-1", name);
+
         string file = Assert.Single(Directory.GetFiles(store.Root));
         Assert.Equal(file0600, File.GetUnixFileMode(file));
         segment.Dispose();
+    }
+
+    [Fact]
+    public void TempFileSpillStore_Roots_AreUnpredictable_AndDistinct()
+    {
+        // Security F1: each store materializes a UNIQUE unguessable temp dir (Directory.CreateTempSubdirectory),
+        // so an attacker cannot pre-create the predicted path to leak segment metadata or clobber the 0600
+        // data files. Two stores must get distinct roots, both carrying the prefix but NOT the old predictable
+        // deltasharp-spill-{pid}-{counter} format.
+        using var a = new TempFileSpillStore();
+        using var b = new TempFileSpillStore();
+
+        // Root is empty until the first spill materializes the directory lazily (a store that never spills
+        // allocates no disk).
+        Assert.Equal(string.Empty, a.Root);
+
+        a.CreateSegment("x").Write(new byte[] { 1 });
+        b.CreateSegment("x").Write(new byte[] { 1 });
+
+        Assert.NotEqual(a.Root, b.Root);
+        Assert.StartsWith("deltasharp-spill-", Path.GetFileName(a.Root));
+        Assert.StartsWith("deltasharp-spill-", Path.GetFileName(b.Root));
+
+        string predictable = $"deltasharp-spill-{Environment.ProcessId}-1";
+        Assert.NotEqual(predictable, Path.GetFileName(a.Root));
+        Assert.NotEqual(predictable, Path.GetFileName(b.Root));
+    }
+
+    [Fact]
+    public void Sort_DisposeFaultOnOneRun_StillDisposesSiblings_CleansTempFiles()
+    {
+        // Security F3 (defense-in-depth): one run segment's Dispose throwing an unexpected exception must not
+        // strand its sibling runs — they must all be disposed (their temp files deleted) and the fault still
+        // surfaces (aggregated). Reverting DisposeRuns to a flat foreach makes a sibling file leak.
+        using var realStore = new TempFileSpillStore();
+        var store = new DisposeFaultSpillStore(realStore);
+        SortOperator op = new(
+            Scan(SortTwoCol, SortInput(2000)),
+            [new SortOrder(new ColumnReference(0, DataTypes.IntegerType, nullable: false))]);
+        var mem = new BoundedExecutionMemory(20000);
+        IBatchStream stream = Backend.Open(op, Ctx(mem, store));
+
+        Drain(stream); // full sorted output; spills into multiple runs (sibling segments)
+        Assert.True(op.Metrics.Snapshot().SpilledBytes > 0, "the tight budget must force a spill");
+        Assert.True(
+            Directory.GetFiles(realStore.Root).Length > 1,
+            "the test needs multiple sibling runs to prove siblings are disposed past the throw");
+
+        AggregateException agg = Assert.Throws<AggregateException>(stream.Dispose);
+        Assert.Single(agg.InnerExceptions); // exactly the one injected fault
+
+        // Every sibling run's temp file was still deleted despite the first run's Dispose throwing.
+        AssertEventuallyNoFiles(realStore.Root);
+        Assert.Equal(0, mem.ReservedBytes);
+    }
+
+    // A spill store that wraps a real store and makes the FIRST segment's Dispose throw (after delegating, so
+    // its own file is still deleted) — proves a Dispose fault on one run cannot strand the siblings (F3).
+    private sealed class DisposeFaultSpillStore : ISpillStore
+    {
+        private readonly ISpillStore _inner;
+        private int _created;
+
+        public DisposeFaultSpillStore(ISpillStore inner) => _inner = inner;
+
+        public ISpillSegment CreateSegment(string label)
+        {
+            bool faulty = Interlocked.Increment(ref _created) == 1;
+            return new Segment(_inner.CreateSegment(label), faulty);
+        }
+
+        private sealed class Segment : ISpillSegment
+        {
+            private readonly ISpillSegment _inner;
+            private readonly bool _faulty;
+
+            public Segment(ISpillSegment inner, bool faulty)
+            {
+                _inner = inner;
+                _faulty = faulty;
+            }
+
+            public long BytesWritten => _inner.BytesWritten;
+
+            public void Write(ReadOnlySpan<byte> record) => _inner.Write(record);
+
+            public ISpillSegmentReader OpenRead() => _inner.OpenRead();
+
+            public void Dispose()
+            {
+                _inner.Dispose();
+                if (_faulty)
+                {
+                    throw new InvalidOperationException("injected segment dispose fault");
+                }
+            }
+        }
     }
 
     // Polls to a steady state instead of a single Directory.GetFiles snapshot, so a slow filesystem delete
