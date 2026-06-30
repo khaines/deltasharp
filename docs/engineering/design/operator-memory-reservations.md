@@ -76,8 +76,8 @@ control STORY-03.2.2 (#148) / #359 hardened and this story completes.
 | --- | --- | --- |
 | [`InterpretedFilterStream`](../../../src/DeltaSharp.Engine/Execution/InterpretedFilter.cs) | `Reserve((long)passing * sizeof(int))` at [`:96`](../../../src/DeltaSharp.Engine/Execution/InterpretedFilter.cs) — **before** `new SelectionVector(...)` at `:97` | the retained selection vector (one `int` per surviving row) |
 | [`InterpretedProjectStream`](../../../src/DeltaSharp.Engine/Execution/InterpretedProject.cs) | `Reserve(... * sizeof(long))` at [`:103`](../../../src/DeltaSharp.Engine/Execution/InterpretedProject.cs); per-expression evaluator scratch reserved internally by `Evaluate` at [`:139`](../../../src/DeltaSharp.Engine/Execution/InterpretedProject.cs); the gather var-width materialization reserved in `ReserveGather` at [`:174`](../../../src/DeltaSharp.Engine/Execution/InterpretedProject.cs)/[`:186`](../../../src/DeltaSharp.Engine/Execution/InterpretedProject.cs) | the projected-index map; the per-expression evaluator scratch; the gathered materialization of a passthrough `ColumnReference` under an input selection (fixed-width footprint at `:174`, plus its offsets + true value bytes at `:186`) |
-| [`InterpretedSortStream`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs) | `ReserveBuffer(...)` at [`:184`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs) per buffered row; `ReserveChunk(...)` at [`:87`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs) per emitted chunk | the buffered rows + key bytes + permutation slot; the emitted-chunk index map |
-| [`InterpretedAggregateStream`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs) | global group at [`:203`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs); each new group at [`:273`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs); output copy at [`:314`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs) | accumulator state + output estimate + key bytes + hash-entry overhead; MIN/MAX output copy |
+| [`InterpretedSortStream`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs) | `ReserveBuffer(...)` at [`:203`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs) per buffered row; `ReserveChunk(...)` at [`:88`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs) per emitted chunk | the buffered rows + key bytes + permutation slot; the emitted-chunk index map |
+| [`InterpretedAggregateStream`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs) | global group at [`:203`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs); each new group at [`:281`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs); output copy at [`:330`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs) | accumulator state + output estimate + key bytes (dictionary + output-copy var-width) + hash-entry overhead; MIN/MAX output copy |
 | [`InterpretedJoinStream`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs) | `ReserveBuild(...)` at [`:243`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs) per build row; `ReserveOutput(...)` at [`:461`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)/`:480`/`:496`/`:512` per emitted row | buffered build columns + key + var-width + collection overhead; the output chunk |
 | [`InterpretedExchangeLocalStream`](../../../src/DeltaSharp.Engine/Execution/InterpretedExchangeLocalStream.cs) | `Reserve(...)` at [`:140`](../../../src/DeltaSharp.Engine/Execution/InterpretedExchangeLocalStream.cs) | the per-row assignment + per-partition `counts`/`cursors`/bucket index arrays |
 
@@ -141,11 +141,11 @@ constants, defined in
 
 | Constant | Value | Charged where |
 | --- | --- | --- |
-| `HashTableEntryBytes` | `64` | once per newly discovered aggregate group ([`InterpretedAggregateStream.cs:273`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs)) and per distinct join build key ([`InterpretedJoinStream.cs:238`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) |
+| `HashTableEntryBytes` | `64` | once per newly discovered aggregate group ([`InterpretedAggregateStream.cs:281`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs)) and per distinct join build key ([`InterpretedJoinStream.cs:238`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) |
 | `ListHeaderBytes` | `48` | once when a join build key is first seen (new `List<int>` index) ([`InterpretedJoinStream.cs:238`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) |
 | `ListAppendBytes` | `sizeof(int) * 2` | per ordinal appended to an existing build-index list ([`InterpretedJoinStream.cs:237`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) |
 | `MatchFlagBytes` | `1` | per build row, for the `_matched bool[]` slot ([`InterpretedJoinStream.cs:230`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) |
-| `PermutationEntryBytes` | `sizeof(int) * 2` | per buffered sort row, for the `_order int[]` slot ([`InterpretedSortStream.cs:186`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs)) |
+| `PermutationEntryBytes` | `sizeof(int) * 2` | per buffered sort row, for the `_order int[]` slot ([`InterpretedSortStream.cs:205`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs)) |
 
 The constants embed array-doubling headroom (e.g. `*2` on the int slots) so the reserved figure **bounds**
 the real peak in bytes rather than tracking only row count. The join decides this overhead **before** the
@@ -178,7 +178,7 @@ closes it:
 ([`:246`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs)), join build
 ([`:223`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)) and join probe-emit
 ([`:344`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)), sort buffer
-([`:176`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs)), exchange assign/route
+([`:195`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs)), exchange assign/route
 ([`:155`,`:169`,`:185`](../../../src/DeltaSharp.Engine/Execution/InterpretedExchangeLocalStream.cs)), filter
 select ([`:160`,`:171`,`:186`,`:212`](../../../src/DeltaSharp.Engine/Execution/InterpretedFilter.cs)), and the
 five scalar expression evaluators
@@ -187,6 +187,28 @@ five scalar expression evaluators
 [`ComparisonEvaluator.cs:45`](../../../src/DeltaSharp.Engine/Execution/Expressions/ComparisonEvaluator.cs),
 [`LogicalEvaluator.cs:42`,`:54`](../../../src/DeltaSharp.Engine/Execution/Expressions/LogicalEvaluator.cs),
 [`NullCheckEvaluator.cs:37`](../../../src/DeltaSharp.Engine/Execution/Expressions/NullCheckEvaluator.cs)).
+
+### 5.1 Result-production loops (not just per-input loops)
+
+The same bound applies to the blocking operators' **result-production** loops, which run after the child
+is drained and are sized by the *result* (group count / buffered-row count), not the input batch — so they
+too can be arbitrarily long uncancellable windows:
+
+- **Aggregate result emit** — `InterpretedAggregateStream.BuildResult` walks `_aggregators.Length ×
+  _groupCount`, reserving and copying a var-width value per group. It polls every `RowPollInterval` groups
+  ([`InterpretedAggregateStream.cs:320`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs)),
+  so a cancel during result emission is observed within `RowPollInterval` groups, before any output row is
+  produced, and `Dispose` releases the partial reservation exactly once.
+- **Sort** — `Array.Sort(_order, CompareOrdinals)` is `O(N log N)` and does not look at the token, so the
+  comparer itself polls every `RowPollInterval` comparisons on a running counter
+  ([`InterpretedSortStream.cs:234`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs)). Because
+  the counter starts at zero the **first** comparison polls, so an already-/buffer-cancelled token is seen at
+  sort entry (before any reordering) and a mid-sort cancel within `RowPollInterval` comparisons. `Array.Sort`
+  wraps a comparer exception in an `InvalidOperationException`; the call site unwraps an inner
+  `OperationCanceledException` and rethrows it cleanly so the operator surfaces a plain `OperationCanceledException`
+  ([`InterpretedSortStream.cs:167-173`](../../../src/DeltaSharp.Engine/Execution/InterpretedSortStream.cs)). A
+  0/1-row sort does no comparison but also no ordering work; such a cancel is observed by the buffer-loop poll
+  or the top-of-`TryGetNext` check. Either way `Dispose` releases the buffered-row reservation exactly once.
 
 ## 6. Output-side variable-width accounting — deferral (c)
 
@@ -203,9 +225,15 @@ output copies:
   ([`InterpretedJoinStream.cs:461-462`,`:480`,`:496`,`:512`](../../../src/DeltaSharp.Engine/Execution/InterpretedJoinStream.cs)).
 - **Aggregate MIN/MAX output** — `BuildResult` charges the var-width of each emitted MIN/MAX value as it is
   copied into the output column
-  ([`InterpretedAggregateStream.cs:302-315`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs)),
+  ([`InterpretedAggregateStream.cs:323-330`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs)),
   symmetric with the input-side running-best retention the
   [`MinMaxAggregator`](../../../src/DeltaSharp.Engine/Execution/Aggregators.cs) reserves.
+- **Aggregate group-key output** — when a new group is discovered, `ResolveGroup` charges the *true* var-width
+  of each grouping-key value as it is copied into the output key columns
+  ([`InterpretedAggregateStream.cs:281`](../../../src/DeltaSharp.Engine/Execution/InterpretedAggregateStream.cs)),
+  on top of the byte-sortable dictionary key (`encoded.Length`). The two are distinct allocations — the
+  dictionary key indexes the hash table; `_keyColumns` is the physical output copy — so charging both is not a
+  double-count, and grouping by N distinct wide string keys reserves N×(payload) rather than N×(flat 16).
 
 This keeps the "output stays bounded" claim true **in bytes**, not just in the `OutputBatchRows = 1024` cap.
 

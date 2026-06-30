@@ -270,7 +270,17 @@ internal sealed class InterpretedAggregateStream : IBatchStream
         // Reserve before mutating any state so a refusal leaves the build consistent. The hash-table
         // entry overhead (deferral (a)) is charged once per newly discovered group on top of the state,
         // output, and key bytes, so the reserved figure bounds the real peak in bytes.
-        Reserve(_stateBytesPerGroup + _outputBytesPerGroup + encoded.Length + RowSizeEstimate.HashTableEntryBytes);
+        //
+        // The var-width term (deferral (c), symmetric with BuildResult's agg-value charge) charges the
+        // TRUE byte length of the grouping-KEY value about to be copied into the OUTPUT key columns
+        // (_keyColumns) by the CopyValue loop below. This is a DISTINCT physical allocation from the
+        // byte-sortable DICTIONARY key (`encoded`, charged above): `encoded` keys the _groups dictionary,
+        // _keyColumns is the materialized output copy. Without this term a wide (e.g. 4 KB) string key
+        // appends its full payload to _keyColumns while reserving only the flat 16-byte per-group output
+        // estimate, so N distinct wide keys accumulate N×payload unreserved (the #359 data-scaled bypass).
+        Reserve(
+            _stateBytesPerGroup + _outputBytesPerGroup + encoded.Length
+            + RowSizeEstimate.HashTableEntryBytes + RowSizeEstimate.VariableWidthBytes(keyVectors, row));
         int group = _groupCount++;
         foreach (Aggregator aggregator in _aggregators)
         {
@@ -302,6 +312,12 @@ internal sealed class InterpretedAggregateStream : IBatchStream
             bool variableWidth = destination.Type is StringType or BinaryType;
             for (int group = 0; group < _groupCount; group++)
             {
+                // The emit loop runs _aggregators.Length × _groupCount iterations, each doing a reserve
+                // and (for var-width) a true-length string copy, so for a large group count it is itself
+                // an arbitrarily long uncancellable window. Poll at CancellationPolicy granularity so a
+                // cancel during result emission is observed within RowPollInterval groups; a refusal
+                // disposes the stream, releasing every reservation exactly once.
+                CancellationPolicy.Poll(_cancellationToken, group);
                 _aggregators[a].Emit(group, destination);
 
                 // Output var-width accounting (deferral (c)): the emitted MIN/MAX value is copied into

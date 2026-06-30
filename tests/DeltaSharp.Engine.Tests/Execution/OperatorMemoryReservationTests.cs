@@ -132,6 +132,29 @@ public class OperatorMemoryReservationTests
         new StructField("m", DataTypes.StringType, nullable: true),
     ]);
 
+    private static readonly StructType StrKeyIn = new(
+    [
+        new StructField("k", DataTypes.StringType, nullable: true),
+    ]);
+
+    private static readonly StructType StrKeyCountOut = new(
+    [
+        new StructField("k", DataTypes.StringType, nullable: true),
+        new StructField("c", DataTypes.LongType, nullable: false),
+    ]);
+
+    private static readonly StructType IntKeyMinStrIn = new(
+    [
+        new StructField("k", DataTypes.IntegerType, nullable: true),
+        new StructField("s", DataTypes.StringType, nullable: true),
+    ]);
+
+    private static readonly StructType IntKeyMinStrOut = new(
+    [
+        new StructField("k", DataTypes.IntegerType, nullable: true),
+        new StructField("m", DataTypes.StringType, nullable: true),
+    ]);
+
     private static readonly StructType FilterSchema = new(
     [
         new StructField("id", DataTypes.IntegerType, nullable: false),
@@ -176,6 +199,24 @@ public class OperatorMemoryReservationTests
             KeyCountOut,
             [new ColumnReference(0, DataTypes.IntegerType, nullable: true)],
             [new AggregateExpression(AggregateFunction.Count, null)]);
+
+    // GROUP BY a (variable-width) STRING key, COUNT(*). Exercises the key-column output copy whose true
+    // var-width must be reserved in ResolveGroup (F1).
+    private static AggregateOperator GroupByStrCount(InMemoryScanOperator input)
+        => new(
+            input,
+            StrKeyCountOut,
+            [new ColumnReference(0, DataTypes.StringType, nullable: true)],
+            [new AggregateExpression(AggregateFunction.Count, null)]);
+
+    // GROUP BY an INTEGER key, MIN(string). The MIN output copy reserves a var-width per group in the
+    // BuildResult emit loop, giving that loop an observable per-group reservation for the F2a cancel test.
+    private static AggregateOperator GroupByIntMinStr(InMemoryScanOperator input)
+        => new(
+            input,
+            IntKeyMinStrOut,
+            [new ColumnReference(0, DataTypes.IntegerType, nullable: true)],
+            [new AggregateExpression(AggregateFunction.Min, new ColumnReference(1, DataTypes.StringType, nullable: true))]);
 
     private static AggregateOperator GlobalMin(InMemoryScanOperator input)
         => new(
@@ -229,6 +270,79 @@ public class OperatorMemoryReservationTests
         }
 
         return Batch(JoinRight, rk, rv);
+    }
+
+    /// <summary>A scan of one batch with <paramref name="groups"/> distinct wide (<paramref name="keyLen"/>-byte)
+    /// string keys — exercises the aggregate grouping-KEY output copy's var-width charge (F1).</summary>
+    private static InMemoryScanOperator WideStringKeyScan(int groups, int keyLen)
+    {
+        MutableColumnVector keys = ColumnVectors.Create(DataTypes.StringType, groups);
+        for (int i = 0; i < groups; i++)
+        {
+            // Distinct keys that are all keyLen bytes long: a fixed filler plus a unique short prefix,
+            // truncated to keyLen so every group's reserved key var-width is identical and exact.
+            string s = i.ToString("D6") + new string('k', keyLen);
+            keys.AppendBytes(Encoding.UTF8.GetBytes(s)[..keyLen]);
+        }
+
+        return Scan(StrKeyIn, Batch(StrKeyIn, keys));
+    }
+
+    /// <summary>A scan of one batch with <paramref name="n"/> distinct integer keys, each carrying a
+    /// non-null non-empty string value so a grouped MIN reserves exactly once per group on input (retain)
+    /// and once per group on output (BuildResult emit). Used by the F2a emit-cancel test.</summary>
+    private static InMemoryScanOperator DistinctIntKeyStrScan(int n)
+    {
+        MutableColumnVector k = ColumnVectors.Create(DataTypes.IntegerType, n);
+        MutableColumnVector s = ColumnVectors.Create(DataTypes.StringType, n);
+        for (int i = 0; i < n; i++)
+        {
+            k.AppendValue(i);
+            s.AppendBytes(Encoding.UTF8.GetBytes("v" + i));
+        }
+
+        return Scan(IntKeyMinStrIn, Batch(IntKeyMinStrIn, k, s));
+    }
+
+    /// <summary>
+    /// A child <see cref="IBatchStream"/> that yields one buffered batch, then — on the EOF pull the sort's
+    /// buffer loop makes after draining — cancels the supplied source and returns <see langword="false"/>
+    /// <i>without</i> a batch-boundary token check. This lands the cancellation deterministically in the
+    /// window between buffering and <c>Array.Sort</c>, the only place the sort's in-comparer poll (F2b) can
+    /// be the observer (the real scan checks the token at its boundary, which would otherwise catch the
+    /// cancel before the sort). No thread race: cancellation is driven by the pull sequence itself.
+    /// </summary>
+    private sealed class CancelOnEofStream : IBatchStream
+    {
+        private readonly ColumnBatch _batch;
+        private readonly CancellationTokenSource _cts;
+        private int _calls;
+
+        internal CancelOnEofStream(StructType schema, ColumnBatch batch, CancellationTokenSource cts)
+        {
+            Schema = schema;
+            _batch = batch;
+            _cts = cts;
+        }
+
+        public StructType Schema { get; }
+
+        public bool TryGetNext([System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out ColumnBatch? batch)
+        {
+            if (_calls++ == 0)
+            {
+                batch = _batch;
+                return true;
+            }
+
+            _cts.Cancel();
+            batch = null;
+            return false;
+        }
+
+        public void Dispose()
+        {
+        }
     }
 
     /// <summary>
@@ -607,5 +721,139 @@ public class OperatorMemoryReservationTests
         using IBatchStream stream = Backend.Open(join, Ctx(mem));
 
         Assert.Throws<ExecutionMemoryException>(() => Drain(stream));
+    }
+
+    // ==============================================================================================
+    // F1 — aggregate grouping-KEY output var-width (the data-scaled budget bypass the red-team found).
+    // Knife-edge budget: the flat key sizing + the byte-sortable DICTIONARY key (encoded.Length) fit, but
+    // the TRUE var-width of the wide key copied into the OUTPUT key columns (_keyColumns) tips over.
+    // Deleting the new `+ VariableWidthBytes(keyVectors, row)` term in ResolveGroup flips this from throw
+    // to pass (the new test then DRAINS), so the term is the sole tipping factor.
+    // ==============================================================================================
+
+    [Fact]
+    public void Aggregate_GroupByLargeStringKey_TightBudget_FailsClosed_OnKeyVarWidth()
+    {
+        // One group whose key is a 4096-byte string, COUNT(*). InterpretedAggregateStream.ResolveGroup
+        // reserves per newly-discovered group:
+        //   state(8) + output(24 = flat string key 16 + long count 8) + encoded.Length(4099
+        //   = 1 null-marker + 4096 body + 2 terminator) + HashTableEntryBytes(64)
+        //   + VariableWidthBytes(keyVectors, row)(4096, the TRUE key length copied into _keyColumns) = 8291.
+        // Without the new key var-width term the reserve is 4195 (= 8291 - 4096), which fits and drains.
+        // Budget 6000 sits strictly between (4195 < 6000 < 8291): only the grouping-key var-width copied
+        // into the output key columns tips the reservation over — the exact #359 data-scaled class.
+        string big = new('k', 4096);
+        AggregateOperator agg = GroupByStrCount(Scan(StrKeyIn, Batch(StrKeyIn, StrCol(big, big))));
+        var mem = new BoundedExecutionMemory(6000);
+        using IBatchStream stream = Backend.Open(agg, Ctx(mem));
+
+        Assert.Throws<ExecutionMemoryException>(() => Drain(stream));
+    }
+
+    // ==============================================================================================
+    // F2a — the aggregate BuildResult emit loop is cancellable within a bounded window.
+    // A cancel fired the instant the emit loop starts reserving is observed at the next poll boundary
+    // (RowPollInterval groups), before any output batch is produced. Removing the emit-loop poll lets the
+    // whole emit loop run to completion (an output batch is emitted before the re-entry check throws), so
+    // the zero-output-before-cancel assertion flips — that is the non-vacuity contract.
+    // ==============================================================================================
+
+    [Fact]
+    public void Aggregate_CancelDuringResultEmit_ObservedWithinPollInterval_ReleasesAllReservations()
+    {
+        // 4096 distinct integer-key groups, MIN(string). The build phase reserves deterministically twice
+        // per row (ResolveGroup + the MIN running-best Retain) => 2*groups = 8192 reservations, all before
+        // BuildResult. The emit loop then reserves once per group (the MIN output var-width copy). Cancel
+        // after reservation 8193 — the first reservation of the emit loop (emit group 0) — so cancellation
+        // is fired strictly INSIDE BuildResult, past the whole build. The emit poll observes it at the next
+        // boundary (emit group RowPollInterval), so the build throws before emitting any output row.
+        const int groups = 4096;
+        const int buildReservations = 2 * groups;            // ResolveGroup + Retain per row (deterministic)
+        const int cancelAfter = buildReservations + 1;       // first emit-loop reservation
+        using var cts = new CancellationTokenSource();
+        var mem = new CancelOnReserveMemory(new BoundedExecutionMemory(long.MaxValue), cts, cancelAfter);
+        AggregateOperator agg = GroupByIntMinStr(DistinctIntKeyStrScan(groups));
+        IBatchStream stream = Backend.Open(agg, Ctx(mem, cts.Token));
+
+        int emitted = 0;
+        Assert.Throws<OperationCanceledException>(() =>
+        {
+            while (stream.TryGetNext(out _))
+            {
+                emitted++;
+            }
+        });
+
+        // Observed inside BuildResult: no output row was emitted before the cancel was seen.
+        Assert.Equal(0, emitted);
+        // Observed within RowPollInterval groups of the cancel: the emit loop stopped early, it did not run
+        // to completion. (Without the emit poll it would reserve all `groups` outputs => 3*groups total.)
+        Assert.True(
+            mem.Reservations < 3 * groups,
+            $"emit ran to completion ({mem.Reservations} reservations); the emit-loop poll did not stop it");
+        Assert.True(
+            mem.Reservations <= cancelAfter + CancellationPolicy.RowPollInterval,
+            $"cancel observed after {mem.Reservations - buildReservations} emit reservations; "
+            + $"expected within {CancellationPolicy.RowPollInterval}");
+        Assert.True(mem.ReservedBytes > 0); // partial build+emit still held until Dispose
+
+        stream.Dispose();
+        Assert.Equal(0, mem.ReservedBytes); // released exactly once (a double release trips the ledger)
+    }
+
+    // ==============================================================================================
+    // F2b — the in-memory sort (Array.Sort) is cancellable within a bounded number of comparisons.
+    // The cancel is fired deterministically in the window between buffering and the sort (the child's EOF
+    // pull), the only place the in-comparer poll can be the observer. Its first comparison polls, so the
+    // cancel is seen at sort entry and NO output row is produced. Removing the in-comparer poll lets
+    // Array.Sort run uncancellably to completion (an output batch is emitted before the re-entry check
+    // throws), flipping the zero-output assertion — the non-vacuity contract for the cancellable sort.
+    // ==============================================================================================
+
+    [Fact]
+    public void Sort_CancelEnteringSort_ObservedBeforeAnyOutput_ReleasesAllReservations()
+    {
+        // 64 reverse-ordered rows so Array.Sort performs comparisons. The child yields the one buffered
+        // batch, then cancels on its EOF pull (after buffering, before the sort) WITHOUT a boundary token
+        // check — so the sort's in-comparer poll is the sole observer. Constructed directly because the
+        // public scan checks the token at its boundary and would catch the cancel before the sort.
+        const int rows = 64;
+        var ids = ColumnVectors.Create(DataTypes.IntegerType, rows);
+        for (int i = 0; i < rows; i++)
+        {
+            ids.AppendValue(rows - i);
+        }
+
+        ColumnBatch batch = Batch(SortSchema, ids);
+        var sortOp = SortById(Scan(SortSchema, batch));
+        var orderings = new[]
+        {
+            new DeltaSharp.Engine.RowFormat.SortKeyOrdering(
+                DeltaSharp.Engine.RowFormat.SortKeyDirection.Ascending,
+                DeltaSharp.Engine.RowFormat.NullSortOrder.NullsFirst),
+        };
+        var projection = new RowKeyProjection(
+            [sortOp.SortOrders[0].Expression], sortOp.InputSchema(0), "interpreted-vectorized",
+            OperatorKind.Sort, orderings);
+
+        using var cts = new CancellationTokenSource();
+        var child = new CancelOnEofStream(SortSchema, batch, cts);
+        var mem = new BoundedExecutionMemory(long.MaxValue);
+        IBatchStream stream = new InterpretedSortStream(sortOp, projection, child, Ctx(mem, cts.Token));
+
+        int emitted = 0;
+        Assert.Throws<OperationCanceledException>(() =>
+        {
+            while (stream.TryGetNext(out _))
+            {
+                emitted++;
+            }
+        });
+
+        Assert.Equal(0, emitted); // the sort observed the cancel at entry; no reordered row was emitted
+        Assert.True(mem.ReservedBytes > 0); // buffered rows still held until Dispose
+
+        stream.Dispose();
+        Assert.Equal(0, mem.ReservedBytes); // released exactly once (a double release trips the ledger)
     }
 }

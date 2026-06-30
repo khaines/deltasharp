@@ -44,6 +44,7 @@ internal sealed class InterpretedSortStream : IBatchStream
     private int[] _order = [];
     private int _rowCount;
     private int _cursor;
+    private int _compareCounter;
     private long _bufferReserved;
     private long _chunkReserved;
     private bool _built;
@@ -153,7 +154,25 @@ internal sealed class InterpretedSortStream : IBatchStream
         }
 
         // Total order: key bytes first, input ordinal as a deterministic tie-break.
-        Array.Sort(_order, CompareOrdinals);
+        //
+        // Array.Sort is O(N log N) and ignores the token, so for a large buffer it is an arbitrarily long
+        // uncancellable window. CompareOrdinals polls the token at CancellationPolicy granularity, and
+        // because its comparison counter starts at zero the FIRST comparison polls — so an already- or
+        // buffer-cancelled token is observed at sort entry (before any reordering work), and a token
+        // cancelled mid-sort is observed within RowPollInterval comparisons. (A 0/1-row sort does no
+        // comparison, but it also does no ordering work; such a cancel is observed by the buffer-loop poll
+        // or the top-of-TryGetNext check.) Array.Sort wraps a comparer exception in an
+        // InvalidOperationException (the original as InnerException), so unwrap the OperationCanceledException
+        // and rethrow it cleanly — the operator must surface a plain OCE, not InvalidOperationException.
+        try
+        {
+            Array.Sort(_order, CompareOrdinals);
+        }
+        catch (InvalidOperationException ex) when (ex.InnerException is OperationCanceledException oce)
+        {
+            throw oce;
+        }
+
         _metrics.AddElapsedNanos(InterpretedOperators.ElapsedNanos(sortStart));
     }
 
@@ -208,6 +227,15 @@ internal sealed class InterpretedSortStream : IBatchStream
 
     private int CompareOrdinals(int a, int b)
     {
+        // Poll the token inside the comparer at CancellationPolicy granularity so a cancel during a large
+        // Array.Sort is observed within a bounded number of comparisons. A mask-and-branch on a running
+        // counter mirrors CancellationPolicy.Poll; the throw propagates out of Array.Sort wrapped in an
+        // InvalidOperationException, which EnsureBuilt unwraps back to a clean OperationCanceledException.
+        if ((_compareCounter++ & (CancellationPolicy.RowPollInterval - 1)) == 0)
+        {
+            _cancellationToken.ThrowIfCancellationRequested();
+        }
+
         int comparison = _keys[a].AsSpan().SequenceCompareTo(_keys[b]);
         return comparison != 0 ? comparison : a.CompareTo(b);
     }
