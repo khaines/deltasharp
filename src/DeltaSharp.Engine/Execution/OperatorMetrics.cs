@@ -27,11 +27,28 @@ public sealed class OperatorMetrics
     /// <summary>Bytes written to a local exchange/shuffle boundary.</summary>
     public long ShuffleBytes { get; private set; }
 
-    /// <summary>Bytes spilled to disk under memory pressure.</summary>
+    /// <summary>
+    /// Bytes spilled to disk under memory pressure. v1 has no spill — every blocking operator that
+    /// cannot reserve fails fast with <see cref="ExecutionMemoryException"/> — so this stays 0; it is
+    /// the wired-but-dormant surface that STORY-03.6.2 (spill) will populate.
+    /// </summary>
     public long SpilledBytes { get; private set; }
 
-    /// <summary>Peak memory reserved through the <see cref="IExecutionMemory"/> context.</summary>
+    /// <summary>Peak memory reserved through the <see cref="IExecutionMemory"/> context (high-water mark).</summary>
     public long PeakMemoryBytes { get; private set; }
+
+    /// <summary>
+    /// Bytes the operator currently holds reserved against the <see cref="IExecutionMemory"/> budget.
+    /// Rises on each reservation and falls on each release, reaching 0 once the operator is disposed
+    /// (every reservation released exactly once — STORY-03.6.1 AC2).
+    /// </summary>
+    public long CurrentReservedBytes { get; private set; }
+
+    /// <summary>
+    /// The number of successful reservation events the operator made against the budget — its
+    /// allocation count for the reserved data plane (new groups, buffered rows, output chunks, …).
+    /// </summary>
+    public long AllocationCount { get; private set; }
 
     /// <summary>Monotonic elapsed execution time accumulated by the backend, in nanoseconds (from a monotonic source such as <c>Stopwatch.GetTimestamp</c>, never wall-clock <c>UtcNow</c>).</summary>
     public long ElapsedNanos { get; private set; }
@@ -67,13 +84,36 @@ public sealed class OperatorMetrics
         }
     }
 
+    /// <summary>
+    /// Records one successful reservation event: bumps <see cref="AllocationCount"/>, sets
+    /// <see cref="CurrentReservedBytes"/> to the operator's new live total, and rolls the
+    /// <see cref="PeakMemoryBytes"/> high-water mark. Operators call this after every successful
+    /// <see cref="IExecutionMemory.TryReserve"/> so peak, current, and allocation count stay coherent.
+    /// </summary>
+    /// <param name="currentReservedBytes">The operator's total live reservation after this reserve.</param>
+    public void ObserveReservation(long currentReservedBytes)
+    {
+        AllocationCount++;
+        CurrentReservedBytes = currentReservedBytes;
+        ObservePeakMemory(currentReservedBytes);
+    }
+
+    /// <summary>
+    /// Sets the operator's live <see cref="CurrentReservedBytes"/> total. Called on every release to
+    /// lower it, and to refresh it after an out-of-band reservation (e.g. the aggregate's MIN/MAX
+    /// running best, which charges the budget inside the aggregator). <see cref="PeakMemoryBytes"/> is
+    /// a high-water mark and is left unchanged.
+    /// </summary>
+    /// <param name="currentReservedBytes">The operator's total live reservation after the change.</param>
+    public void ObserveRelease(long currentReservedBytes) => CurrentReservedBytes = currentReservedBytes;
+
     /// <summary>Adds elapsed nanoseconds measured by the backend.</summary>
     public void AddElapsedNanos(long nanos) => ElapsedNanos += nanos;
 
     /// <summary>An immutable point-in-time copy for downstream consumers.</summary>
     public OperatorMetricsSnapshot Snapshot() => new(
         InputRows, OutputRows, SelectedRows, OutputBatches, BytesScanned, ShuffleBytes,
-        SpilledBytes, PeakMemoryBytes, ElapsedNanos);
+        SpilledBytes, PeakMemoryBytes, ElapsedNanos, CurrentReservedBytes, AllocationCount);
 }
 
 /// <summary>An immutable snapshot of <see cref="OperatorMetrics"/> for SRE/perf/FinOps consumers.</summary>
@@ -83,9 +123,11 @@ public sealed class OperatorMetrics
 /// <param name="OutputBatches">Batches emitted.</param>
 /// <param name="BytesScanned">Bytes read from the data plane.</param>
 /// <param name="ShuffleBytes">Bytes written to a local exchange.</param>
-/// <param name="SpilledBytes">Bytes spilled under pressure.</param>
-/// <param name="PeakMemoryBytes">Peak reserved memory.</param>
+/// <param name="SpilledBytes">Bytes spilled under pressure (0 until STORY-03.6.2 lands spill).</param>
+/// <param name="PeakMemoryBytes">Peak reserved memory (high-water mark).</param>
 /// <param name="ElapsedNanos">Accumulated execution time.</param>
+/// <param name="CurrentReservedBytes">Bytes currently held reserved (0 once disposed).</param>
+/// <param name="AllocationCount">Number of reservation events against the budget.</param>
 public readonly record struct OperatorMetricsSnapshot(
     long InputRows,
     long OutputRows,
@@ -95,4 +137,6 @@ public readonly record struct OperatorMetricsSnapshot(
     long ShuffleBytes,
     long SpilledBytes,
     long PeakMemoryBytes,
-    long ElapsedNanos);
+    long ElapsedNanos,
+    long CurrentReservedBytes,
+    long AllocationCount);

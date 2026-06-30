@@ -34,6 +34,7 @@ internal sealed class NullCheckEvaluator : ExpressionEvaluator
 
         for (int i = 0; i < rows; i++)
         {
+            CancellationPolicy.Poll(cancellationToken, i);
             bool isNull = hasNulls && child.IsNull(i);
             result.AppendValue(_negated ? !isNull : isNull);
         }

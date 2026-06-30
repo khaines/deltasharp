@@ -17,6 +17,42 @@ namespace DeltaSharp.Engine.Execution;
 internal static class RowSizeEstimate
 {
     /// <summary>
+    /// The per-entry overhead of a managed hash table (the <see cref="System.Collections.Generic.Dictionary{TKey,TValue}"/>
+    /// the aggregate uses for groups and the join uses for the build table) charged once per newly
+    /// discovered group / distinct build key (STORY-03.6.1, deferral (a)). It covers the bucket slot,
+    /// the entry record (hash code, next index, key reference, value), and amortized headroom for the
+    /// array-doubling transient the parallel state arrays incur as they grow — so the reserved figure
+    /// bounds the real peak (which otherwise ran ~1.5–3× over) in bytes, not just row count. The key
+    /// <i>bytes</i> themselves are charged separately by each operator's <c>+ key.Length</c> term.
+    /// </summary>
+    internal const long HashTableEntryBytes = 64;
+
+    /// <summary>
+    /// The overhead of a per-key <see cref="System.Collections.Generic.List{T}"/> build-index, charged
+    /// once when a join build key is first seen: the list object header plus its initial backing array.
+    /// Subsequent ordinals appended to an existing list are charged <see cref="ListAppendBytes"/> each.
+    /// </summary>
+    internal const long ListHeaderBytes = 48;
+
+    /// <summary>The amortized per-append cost of growing a join build-index <c>List&lt;int&gt;</c> (int slot + doubling headroom).</summary>
+    internal const long ListAppendBytes = sizeof(int) * 2;
+
+    /// <summary>The per-build-row cost of the join's <c>_matched bool[]</c> flag (STORY-03.6.1, deferral (a)).</summary>
+    internal const long MatchFlagBytes = 1;
+
+    /// <summary>The per-buffered-row cost of the sort's permutation <c>int[]</c> ordinal slot (with doubling headroom).</summary>
+    internal const long PermutationEntryBytes = sizeof(int) * 2;
+
+    /// <summary>
+    /// The <i>true</i> byte length of the variable-width (string/binary) value at <paramref name="row"/>
+    /// of <paramref name="column"/>; fixed-width and null lanes contribute nothing. Output paths charge
+    /// this on the values they copy so a wide payload cannot bypass the byte bound (STORY-03.6.1,
+    /// deferral (c)), symmetric with the input-side <see cref="VariableWidthBytes(ColumnVector[], int)"/>.
+    /// </summary>
+    internal static long VariableWidthBytes(ColumnVector column, int row) =>
+        column.Type is StringType or BinaryType && !column.IsNull(row) ? column.GetBytes(row).Length : 0;
+
+    /// <summary>
     /// The summed <i>true</i> byte length of the variable-width (string/binary) values at logical
     /// <paramref name="row"/> across <paramref name="columns"/>; fixed-width and null lanes add nothing.
     /// Blocking operators add this to the flat <see cref="Bytes(StructType)"/> so the reservation
@@ -27,11 +63,7 @@ internal static class RowSizeEstimate
         long total = 0;
         for (int c = 0; c < columns.Length; c++)
         {
-            ColumnVector column = columns[c];
-            if (column.Type is StringType or BinaryType && !column.IsNull(row))
-            {
-                total += column.GetBytes(row).Length;
-            }
+            total += VariableWidthBytes(columns[c], row);
         }
 
         return total;

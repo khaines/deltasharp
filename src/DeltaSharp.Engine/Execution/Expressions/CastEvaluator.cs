@@ -85,6 +85,7 @@ internal sealed class CastEvaluator : ExpressionEvaluator
 
         for (int i = 0; i < rows; i++)
         {
+            CancellationPolicy.Poll(cancellationToken, i);
             if (hasNulls && child.IsNull(i))
             {
                 result.AppendNull();

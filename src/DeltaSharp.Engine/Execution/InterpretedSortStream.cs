@@ -44,6 +44,7 @@ internal sealed class InterpretedSortStream : IBatchStream
     private int[] _order = [];
     private int _rowCount;
     private int _cursor;
+    private int _compareCounter;
     private long _bufferReserved;
     private long _chunkReserved;
     private bool _built;
@@ -104,14 +105,25 @@ internal sealed class InterpretedSortStream : IBatchStream
         }
 
         _disposed = true;
-        ReleaseChunkReservation();
-        if (_bufferReserved > 0)
-        {
-            _memory.Release(_bufferReserved);
-            _bufferReserved = 0;
-        }
 
-        _input.Dispose();
+        // Release this operator's own reservations first (so its exactly-once accounting holds), then
+        // dispose the child in a finally so a throw from the own-byte release cannot strand the child's
+        // (grandchild) reservations.
+        try
+        {
+            ReleaseChunkReservation();
+            if (_bufferReserved > 0)
+            {
+                _memory.Release(_bufferReserved);
+                _bufferReserved = 0;
+            }
+
+            _metrics.ObserveRelease(0);
+        }
+        finally
+        {
+            _input.Dispose();
+        }
     }
 
     private void EnsureBuilt()
@@ -142,7 +154,25 @@ internal sealed class InterpretedSortStream : IBatchStream
         }
 
         // Total order: key bytes first, input ordinal as a deterministic tie-break.
-        Array.Sort(_order, CompareOrdinals);
+        //
+        // Array.Sort is O(N log N) and ignores the token, so for a large buffer it is an arbitrarily long
+        // uncancellable window. CompareOrdinals polls the token at CancellationPolicy granularity, and
+        // because its comparison counter starts at zero the FIRST comparison polls — so an already- or
+        // buffer-cancelled token is observed at sort entry (before any reordering work), and a token
+        // cancelled mid-sort is observed within RowPollInterval comparisons. (A 0/1-row sort does no
+        // comparison, but it also does no ordering work; such a cancel is observed by the buffer-loop poll
+        // or the top-of-TryGetNext check.) Array.Sort wraps a comparer exception in an
+        // InvalidOperationException (the original as InnerException), so unwrap the OperationCanceledException
+        // and rethrow it cleanly — the operator must surface a plain OCE, not InvalidOperationException.
+        try
+        {
+            Array.Sort(_order, CompareOrdinals);
+        }
+        catch (InvalidOperationException ex) when (ex.InnerException is OperationCanceledException oce)
+        {
+            throw oce;
+        }
+
         _metrics.AddElapsedNanos(InterpretedOperators.ElapsedNanos(sortStart));
     }
 
@@ -162,12 +192,17 @@ internal sealed class InterpretedSortStream : IBatchStream
 
             for (int r = 0; r < rows; r++)
             {
+                CancellationPolicy.Poll(_cancellationToken, r);
                 byte[] key = _sortKeys.Encode(keyVectors, r, out _);
 
                 // Reserve before storing the row so a refusal leaves the buffer consistent. The
                 // var-width term charges the TRUE byte length of every buffered string/binary column
-                // (not the flat 16-byte estimate), so a wide payload cannot bypass the budget.
-                ReserveBuffer(_rowBytes + key.Length + RowSizeEstimate.VariableWidthBytes(columns, r));
+                // (not the flat 16-byte estimate), so a wide payload cannot bypass the budget. The
+                // permutation-entry term (deferral (a)) charges this row's slot in the _order int[]
+                // (allocated once after the build) so the sort's transient arrays are bounded in bytes.
+                ReserveBuffer(
+                    _rowBytes + key.Length + RowSizeEstimate.VariableWidthBytes(columns, r)
+                    + RowSizeEstimate.PermutationEntryBytes);
                 _keys.Add(key);
                 for (int c = 0; c < columnCount; c++)
                 {
@@ -192,6 +227,15 @@ internal sealed class InterpretedSortStream : IBatchStream
 
     private int CompareOrdinals(int a, int b)
     {
+        // Poll the token inside the comparer at CancellationPolicy granularity so a cancel during a large
+        // Array.Sort is observed within a bounded number of comparisons. A mask-and-branch on a running
+        // counter mirrors CancellationPolicy.Poll; the throw propagates out of Array.Sort wrapped in an
+        // InvalidOperationException, which EnsureBuilt unwraps back to a clean OperationCanceledException.
+        if ((_compareCounter++ & (CancellationPolicy.RowPollInterval - 1)) == 0)
+        {
+            _cancellationToken.ThrowIfCancellationRequested();
+        }
+
         int comparison = _keys[a].AsSpan().SequenceCompareTo(_keys[b]);
         return comparison != 0 ? comparison : a.CompareTo(b);
     }
@@ -212,7 +256,7 @@ internal sealed class InterpretedSortStream : IBatchStream
         }
 
         _bufferReserved += bytes;
-        _metrics.ObservePeakMemory(_bufferReserved + _chunkReserved);
+        _metrics.ObserveReservation(_bufferReserved + _chunkReserved);
     }
 
     private void ReserveChunk(long bytes)
@@ -230,7 +274,7 @@ internal sealed class InterpretedSortStream : IBatchStream
         }
 
         _chunkReserved += bytes;
-        _metrics.ObservePeakMemory(_bufferReserved + _chunkReserved);
+        _metrics.ObserveReservation(_bufferReserved + _chunkReserved);
     }
 
     private void ReleaseChunkReservation()
@@ -239,6 +283,7 @@ internal sealed class InterpretedSortStream : IBatchStream
         {
             _memory.Release(_chunkReserved);
             _chunkReserved = 0;
+            _metrics.ObserveRelease(_bufferReserved + _chunkReserved);
         }
     }
 }

@@ -135,8 +135,9 @@ internal sealed class InterpretedExchangeLocalStream : IBatchStream
     private void Partition(ColumnBatch batch, int rows)
     {
         // Reserve before allocating the assignment storage: the per-row partition id plus the bucket
-        // index arrays are ~2 ints per row.
-        Reserve(2L * rows * sizeof(int));
+        // index arrays are ~2 ints per row, and the O(partitionCount) counts + cursors arrays are
+        // charged too (deferral (a)) so the reservation bounds every transient this method allocates.
+        Reserve((2L * rows * sizeof(int)) + (2L * _partitionCount * sizeof(int)));
 
         var assignment = new int[rows];
         var counts = new int[_partitionCount];
@@ -151,6 +152,7 @@ internal sealed class InterpretedExchangeLocalStream : IBatchStream
         var cursors = new int[_partitionCount];
         for (int r = 0; r < rows; r++)
         {
+            CancellationPolicy.Poll(_cancellationToken, r);
             int p = assignment[r];
             buckets[p][cursors[p]++] = r;
         }
@@ -164,6 +166,7 @@ internal sealed class InterpretedExchangeLocalStream : IBatchStream
         {
             for (int r = 0; r < rows; r++)
             {
+                CancellationPolicy.Poll(_cancellationToken, r);
                 int p = _roundRobin;
                 _roundRobin = _roundRobin + 1 == _partitionCount ? 0 : _roundRobin + 1;
                 assignment[r] = p;
@@ -179,6 +182,7 @@ internal sealed class InterpretedExchangeLocalStream : IBatchStream
             ColumnVector[] keyVectors = _partitionKeys.Evaluate(batch, scratch, _cancellationToken);
             for (int r = 0; r < rows; r++)
             {
+                CancellationPolicy.Poll(_cancellationToken, r);
                 byte[] key = _partitionKeys.Encode(keyVectors, r, out _);
                 int p = (int)(RowKey.Fnv1a(key) % (uint)_partitionCount);
                 assignment[r] = p;
@@ -207,7 +211,7 @@ internal sealed class InterpretedExchangeLocalStream : IBatchStream
         }
 
         _reservedBytes += bytes;
-        _metrics.ObservePeakMemory(_reservedBytes);
+        _metrics.ObserveReservation(_reservedBytes);
     }
 
     private void ReleaseReservation()
@@ -216,6 +220,7 @@ internal sealed class InterpretedExchangeLocalStream : IBatchStream
         {
             _memory.Release(_reservedBytes);
             _reservedBytes = 0;
+            _metrics.ObserveRelease(_reservedBytes);
         }
     }
 }
