@@ -89,4 +89,13 @@ jobs:
             echo "ERROR: CompiledBackend metadata found in the NativeAOT image — codegen tier was not elided." >&2
             exit 1
           fi
+          # STORY-03.4.2: the compiled expression-fusion types are reachable only through the
+          # (elided) CompiledBackend, so they must vanish from the native image too. Assert each by
+          # name with the same fail-closed substring match (none is a substring of a reachable type).
+          for fusion_type in CompiledExpressionEvaluator CompiledExpressionLowering CompiledExpressionCache CompiledExpressionKey CompiledScalarOps CompiledVectorAccess FusedRowKernel; do
+            if strings -a "$publish_path" | grep -qF "$fusion_type"; then
+              echo "ERROR: $fusion_type metadata found in the NativeAOT image — expression-fusion tier was not elided." >&2
+              exit 1
+            fi
+          done
           echo "Verified: CompiledBackend elided; interpreted backend selected under NativeAOT."

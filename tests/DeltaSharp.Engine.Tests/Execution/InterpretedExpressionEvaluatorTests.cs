@@ -875,9 +875,14 @@ public class InterpretedExpressionEvaluatorTests
                 continue;
             }
 
+            // The optional compiled-fusion tier (STORY-03.4.2) is the codegen path: its types are
+            // explicitly annotated [RequiresDynamicCode] at the type level and are reachable only
+            // behind the IsCompiledBackendAvailable feature guard, so NativeAOT elides them. They are
+            // *expected* to require dynamic code — skip them. Every interpreted-baseline type (and any
+            // member of an unannotated type) must still declare no dynamic-code requirement.
             if (type.GetCustomAttribute<RequiresDynamicCodeAttribute>() is not null)
             {
-                offenders.Add(type.FullName!);
+                continue;
             }
 
             foreach (MethodBase member in type.GetMembers(All).OfType<MethodBase>())
@@ -890,7 +895,8 @@ public class InterpretedExpressionEvaluatorTests
         }
 
         // The interpreted evaluator is the AOT-clean baseline: no node or kernel may require dynamic
-        // code (Expression.Compile / reflection-emit fusion is STORY-03.4.2, out of scope here).
+        // code. Expression.Compile fusion (STORY-03.4.2) lives in sibling types that opt in with a
+        // type-level [RequiresDynamicCode] (skipped above); an unannotated type must never leak one.
         Assert.Empty(offenders);
     }
 }
