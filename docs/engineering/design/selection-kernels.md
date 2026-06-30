@@ -21,7 +21,7 @@ exercised through the friend-assembly test-access policy.
 | [`SelectionVector`](../../../src/DeltaSharp.Engine/Columnar/SelectionVector.cs) | The ordered physical-row index set the kernels produce/consume (ADR-0002 late materialization; pre-existing, unchanged). |
 | [`KernelTier`](../../../src/DeltaSharp.Engine/Columnar/KernelTier.cs) | The SIMD/scalar tier selector + `KernelTierGate` dispatch (reused from #149). |
 | [`Bitmap`](../../../src/DeltaSharp.Engine/Columnar/Bitmap.cs) | The scalar LSB-first bit reader (`Bitmap.Get`) used by the reference loops. |
-| [`SelectionBenchmark`](../../../src/DeltaSharp.Engine/Columnar/SelectionBenchmark.cs) | The lock-free, allocation-free timing harness recording batch size / selectivity / throughput. |
+| [`SelectionBenchmark`](../../../src/DeltaSharp.Engine/Columnar/SelectionBenchmark.cs) | The lock-free timing harness (allocation-free **timed region**) recording batch size / selectivity / throughput. |
 
 ## Where this sits
 
@@ -178,7 +178,8 @@ The allocation guard (`Measure_TimedRegion_IsAllocationFree`) uses the **poll-to
 suite uses: it re-measures (up to 50 attempts, `Thread.Sleep(5)` between) until a tier-1 pass sees only the small
 fixed setup allocation, tolerating the one-time background-JIT tier-up transient that a single 100k-iteration
 measurement would otherwise flake on under parallel xUnit load (the exact flake fixed in
-`NullHelperBenchmarkTests`).
+`NullHelperBenchmarkTests`). It sweeps **both** `ToSelection` and `Compose` so a per-invocation allocation
+regression on either hot path is caught (#361).
 
 ## AC-coverage table
 
@@ -186,7 +187,7 @@ measurement would otherwise flake on under parallel xUnit load (the exact flake 
 | --- | --- | --- | --- |
 | 1 | Bitmap→selection over arbitrary offsets/tails → ordered, unique, in-`[0,length)` indices | `SelectionKernels.ToSelection` (scalar lead-in + whole-byte body + scalar tail) | `ToSelection_MatchesPerBitOracle_AcrossOffsetsAndTiers`, `ToSelection_EdgePredicates_AllTiersIdentical`, `ToSelection_NonByteAlignedOffset_SkipsLeadInBits`, `ToSelection_ReturnsSelectionVector_OrderedUniqueInBounds` (`AssertOrderedUniqueInBounds`) |
 | 2 | Selection + new predicate → selection of applying both in order, original-row-space | `SelectionKernels.Compose` (gather `selection[p]` for set `p`) | `Compose_MatchesIndependentOracle_AcrossTiers`, `Compose_AppliesPredicateOverAlreadySelectedRows_InOriginalRowSpace`, `Compose_EqualsApplyingBothPredicatesInOrder`, `Compose_EmptySelection_YieldsEmpty` |
-| 3 | Scalar/SIMD parity over empty/all-pass/all-fail/sparse → identical counts + indexes | Tier zero-skip is bit-identical to the per-byte scan; forced-tier seam (`KernelTierGate`) | `*_AcrossTiers` theories over `ForcedTiers` × lengths `{7,8,9,15,16,17,31,32,33,63,64,65,127,128,255,256,257,…}`; `ToSelection_EdgePredicates_AllTiersIdentical` |
+| 3 | Scalar/SIMD parity over empty/all-pass/all-fail/sparse → identical counts + indexes | Tier zero-skip is bit-identical to the per-byte scan; forced-tier seam (`KernelTierGate`) | `*_AcrossTiers` theories over `ForcedTiers` × lengths `{0,1,7,8,9,15,16,17,31,32,33,63,64,65,127,128,255,256,257,…}`; `ToSelection_EdgePredicates_AllTiersIdentical` |
 | 4 | Zero-alloc hot path + throughput across selectivity/batch size for regression gating | `Span<int>` overloads allocate nothing; `SelectionBenchmark` records ns/row | `Measure_TimedRegion_IsAllocationFree` (poll-to-steady-state), `Measure_RecordsBatchSizeAndSelectivityMetadata_ForEveryOperation`, `RunSuite_CoversTheBatchSizeAndSelectivityGrid`, `Measure_Checksum_ReflectsActualWork` |
 
 ## Non-vacuity (mutation evidence)
