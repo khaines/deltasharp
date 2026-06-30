@@ -75,6 +75,38 @@ public class ExecutionBackendTests
     }
 
     [Fact]
+    public void Select_ForceInterpreted_OverridesAvailableCompiledTier_AndCreatesNoCompiledDelegate()
+    {
+        // AC3: a force-interpreter override must pin the interpreter and skip the compiled tier
+        // entirely — so no CompiledBackend is constructed and no dynamic-code delegate is created —
+        // EVEN on a runtime where the compiled tier IS available. Establish that precondition
+        // explicitly so the assertion is non-vacuous: on a dynamic-code host the unforced selector
+        // genuinely picks the compiled, IL-emitting backend, and the override must still beat it.
+        if (!RuntimeFeature.IsDynamicCodeSupported)
+        {
+            return; // the compiled tier is elided here, so "override an available tier" is unreachable
+        }
+
+        IExecutionBackend unforced = ExecutionBackends.Select();
+        Assert.True(unforced.UsesDynamicCode);   // the compiled tier is genuinely available on this host
+        Assert.Equal("compiled", unforced.Name);
+
+        IExecutionBackend forced =
+            ExecutionBackends.Select(new ExecutionBackendOptions { ForceInterpreted = true });
+
+        // The override wins over the available compiled tier...
+        Assert.Same(InterpretedVectorizedBackend.Instance, forced);
+        Assert.NotSame(unforced, forced);
+
+        // ...and the pinned backend never emits dynamic code: no compiled delegate is created, so its
+        // evaluator is the interpreted closure — byte-identical to the kernel reference.
+        Assert.False(forced.UsesDynamicCode);
+        var kernel = new AffineInt64Kernel(2, 1);
+        Func<long, long> evaluator = forced.BuildAffineEvaluator(kernel);
+        Assert.Equal(kernel.Evaluate(20), evaluator(20));
+    }
+
+    [Fact]
     public void Select_Default_TracksRuntimeDynamicCodeCapability()
     {
         // AC2: when dynamic code is unsupported the interpreted backend is chosen and the compiled
