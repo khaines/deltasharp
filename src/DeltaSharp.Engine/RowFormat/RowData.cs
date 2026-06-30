@@ -4,9 +4,12 @@ namespace DeltaSharp.Engine.RowFormat;
 
 /// <summary>
 /// Thrown when binary-row encoding or decoding fails — an unsupported type, a value whose CLR
-/// type does not match its field's <see cref="DataType"/>, or malformed/truncated row bytes.
+/// type does not match its field's <see cref="DataType"/>, or malformed/truncated row bytes. The
+/// untrusted-input case (malformed/truncated spill or shuffle bytes) is refined by
+/// <see cref="RowValidationException"/>, so callers can catch either the general or the specific
+/// failure (STORY-02.4.2 AC4).
 /// </summary>
-public sealed class RowFormatException : Exception
+public class RowFormatException : Exception
 {
     /// <summary>Creates the exception with a message.</summary>
     public RowFormatException(string message)
