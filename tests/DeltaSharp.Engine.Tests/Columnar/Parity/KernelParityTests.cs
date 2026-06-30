@@ -100,6 +100,11 @@ public sealed class KernelParityTests
 
         // The harness internally runs Scalar + Vector128 + Vector256 + Auto for every family and asserts
         // identity; reaching here without an XunitException proves each tier executed and agreed.
+        // (That each forced tier genuinely runs a *vector body* rather than silently falling back to scalar —
+        // the property the test name promises — is proven host-independently by the per-tier mutation battery
+        // in kernel-parity-suite.md §9: a perturbation injected into only the Vector256/Vector128 body fails
+        // exactly that forced tier on a host where Auto would have elided it. This test is the end-to-end
+        // exercise of that seam; the assert below is only a host-reality sanity check.)
         KernelParityHarness.AssertAllFamilies(c);
 
         // Document the host reality this seam exists to defeat: the portable V256 fallback is what runs here.

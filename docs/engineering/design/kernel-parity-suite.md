@@ -98,13 +98,19 @@ does not accelerate it.
 The six comparison predicates (`=`, `<>`, `<`, `<=`, `>`, `>=`) are each run for both the vector·vector and
 vector·scalar overloads at every tier, so a single seed produces 24 comparison parity checks.
 
+> The `(incl. \`date\` layout)` / `(incl. \`timestamp\` layout)` notes mean the suite drives the kernels with
+> raw `int[]` / `long[]` spans — it does **not** construct typed `date`/`timestamp` vectors. `date` is physically
+> an `int32` and `timestamp` a `int64`, dispatching to the very `Int32`/`Int64` span kernels exercised here, so
+> their SIMD paths are covered by physical-layout identity (not by a separate typed code path).
+
 ### The five generated dimensions (AC1)
 
 The generator (`KernelParityGenerator`) draws all five AC1 dimensions from one seed:
 
 - **type** — covered by running int32, int64, 3VL-boolean, and packed-validity families on the *same* case.
-- **batch size** `n` — half the cases pick a boundary length (`0,1,…,9,15,16,17,…,63,64,65,…,4096`, i.e.
-  sub-byte tails, exact byte/vector-width multiples ±1) and half pick a uniform random length in `[0,4096]`,
+- **batch size** `n` — half the cases pick a boundary length
+  (`0,1,2,3,7,8,9,15,16,17,31,32,33,63,64,65,127,128,129,255,256,257,511,512,513,1000,1023,1024,1025,2048,4096`,
+  i.e. sub-byte tails and exact byte/vector-width multiples ±1) and half pick a uniform random length in `[0,4096]`,
   so a forced tier's vector body, its narrower tails, and the scalar remainder are all exercised.
 - **null density** — fraction of `NULL`/`UNKNOWN` lanes; drives the validity bitmaps and the 3VL lanes.
 - **selection density** — fraction of set predicate/selection bits; drives `ToSelection`/`Compose`/`And`.
