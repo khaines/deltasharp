@@ -77,7 +77,7 @@ internal sealed class BatchEvaluationMemory
     {
         ArgumentNullException.ThrowIfNull(type);
         long validity = (rows + 7L) / 8L;
-        if (type.TryGetPhysicalLayout(out PhysicalLayout layout) && layout.IsFixedWidth)
+        if (PhysicalLayoutResolver.TryResolve(type, out PhysicalLayout layout) && layout.IsFixedWidth)
         {
             return ((long)rows * layout.FixedWidthBytes) + validity;
         }

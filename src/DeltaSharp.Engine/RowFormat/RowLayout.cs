@@ -68,7 +68,7 @@ public sealed class RowLayout
     public static bool IsInlineFixedWidth(DataType type)
     {
         ArgumentNullException.ThrowIfNull(type);
-        PhysicalLayout layout = type.GetPhysicalLayout();
+        PhysicalLayout layout = PhysicalLayoutResolver.Resolve(type);
         return layout.Kind == PhysicalLayoutKind.FixedWidth && layout.FixedWidthBytes <= SlotBytes;
     }
 }

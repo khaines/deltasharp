@@ -64,11 +64,4 @@ public sealed class MapType : DataType
             StableHash.Combine(
                 KeyType.GetHashCode(),
                 StableHash.Combine(ValueType.GetHashCode(), ValueContainsNull ? 1 : 0)));
-
-    /// <inheritdoc/>
-    public override bool TryGetPhysicalLayout(out PhysicalLayout layout)
-    {
-        layout = PhysicalLayout.Nested;
-        return true;
-    }
 }

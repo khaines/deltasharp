@@ -32,7 +32,7 @@ public sealed class ManagedFixedWidthColumnVector<T> : MutableColumnVector
         : base(type)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(capacity);
-        if (!type.TryGetPhysicalLayout(out PhysicalLayout layout)
+        if (!PhysicalLayoutResolver.TryResolve(type, out PhysicalLayout layout)
             || layout.Kind != PhysicalLayoutKind.FixedWidth
             || layout.FixedWidthBytes != Unsafe.SizeOf<T>())
         {

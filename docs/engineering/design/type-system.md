@@ -100,10 +100,11 @@ a directly `void`/`map` key is rejected, but a key that merely *contains* a `voi
 
 ## JSON serialization (AC3)
 
-`DataType.ToJson()` / `DataType.FromJson(string)` round-trip the type tree, nullability, and
-string metadata using the **Spark-compatible schema JSON** — the same representation Delta
-stores in its transaction log. Atomic and decimal types serialize as a JSON string
-(`"integer"`, `"decimal(10,2)"`, `"void"`); `array`/`map`/`struct` serialize as objects:
+`SchemaJson.ToJson(DataType)` / `SchemaJson.FromJson(string)` round-trip the type tree,
+nullability, and string metadata using the **Spark-compatible schema JSON** — the same
+representation Delta stores in its transaction log. Atomic and decimal types serialize as a
+JSON string (`"integer"`, `"decimal(10,2)"`, `"void"`); `array`/`map`/`struct` serialize as
+objects:
 
 ```json
 {"type":"struct","fields":[
@@ -130,8 +131,10 @@ logs (EPIC-05).
 
 ## Physical-layout seam (AC4)
 
-`DataType.TryGetPhysicalLayout(out PhysicalLayout)` (and the throwing `GetPhysicalLayout()`)
-is the seam the columnar and binary-row builders consume. A `PhysicalLayout` is one of:
+`PhysicalLayoutResolver.TryResolve(DataType, out PhysicalLayout)` (and the throwing
+`PhysicalLayoutResolver.Resolve(DataType)`) is the seam the columnar and binary-row builders
+consume. Keeping it out of `DataType` itself makes the logical descriptors free of any
+physical-layout knowledge (shared type-model prep, ADR-0016). A `PhysicalLayout` is one of:
 
 | Kind | Types | Detail |
 | --- | --- | --- |
@@ -139,7 +142,7 @@ is the seam the columnar and binary-row builders consume. A `PhysicalLayout` is 
 | `FixedWidth` (decimal) | `decimal(p,s)` | 8 bytes when `p ≤ 18` (`IsCompact`), else 16. |
 | `Variable` | string, binary | Offsets buffer + shared byte buffer. |
 | `Nested` | array, map, struct | Consumer recurses on the child types. |
-| *(none)* | `void` (`NullType`) | `TryGet…` returns `false` (the `out` value has `Kind == None`); `GetPhysicalLayout()` throws `UnsupportedTypeException`. |
+| *(none)* | `void` (`NullType`) | `TryResolve` returns `false` (the `out` value has `Kind == None`); `Resolve` throws `UnsupportedTypeException`. |
 
 This is intentionally a **descriptor**, not a buffer: it tells a builder how to size and shape
 storage. Bit-packing of booleans/validity and the exact offset width are implementation choices
