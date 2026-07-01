@@ -228,4 +228,10 @@ public class SchemaJsonRoundTripTests
     {
         Assert.Throws<ArgumentNullException>(() => SchemaJson.FromJson(null!));
     }
+
+    [Fact]
+    public void ToJson_RejectsNullArgument()
+    {
+        Assert.Throws<ArgumentNullException>(() => SchemaJson.ToJson(null!));
+    }
 }

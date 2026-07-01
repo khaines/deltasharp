@@ -12,8 +12,12 @@ namespace DeltaSharp.Engine.Types;
 /// to is byte-for-byte identical to the descriptors' former overrides.
 /// </para>
 /// <para>
-/// The switch is exhaustive over the closed <see cref="DataType"/> hierarchy; a type with no
-/// physical representation (for example <see cref="NullType"/>) resolves to no layout.
+/// The switch is exhaustive over the closed <see cref="DataType"/> hierarchy.
+/// <see cref="NullType"/> is the sole type that legitimately has no physical representation and
+/// resolves to no layout. Any other unrecognized type — for example a future
+/// <see cref="DataType"/> leaf added without a resolver case — fails loudly with an
+/// <see cref="UnsupportedTypeException"/> rather than silently reporting no layout, so the
+/// resolver must be extended whenever a new <see cref="DataType"/> is introduced.
 /// </para>
 /// </remarks>
 internal static class PhysicalLayoutResolver
@@ -45,10 +49,14 @@ internal static class PhysicalLayoutResolver
     /// <returns>
     /// <see langword="true"/> and a supported <paramref name="layout"/> for representable types;
     /// <see langword="false"/> (with <paramref name="layout"/> defaulted to
-    /// <see cref="PhysicalLayoutKind.None"/>) for types with no physical representation
-    /// (for example <see cref="NullType"/>).
+    /// <see cref="PhysicalLayoutKind.None"/>) for <see cref="NullType"/>, the only type with no
+    /// physical representation.
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="type"/> is null.</exception>
+    /// <exception cref="UnsupportedTypeException">
+    /// <paramref name="type"/> is an unrecognized <see cref="DataType"/> (for example a new leaf
+    /// added without a resolver case); the resolver must be extended to handle it.
+    /// </exception>
     public static bool TryResolve(DataType type, out PhysicalLayout layout)
     {
         ArgumentNullException.ThrowIfNull(type);
@@ -84,9 +92,12 @@ internal static class PhysicalLayoutResolver
                 layout = PhysicalLayout.Nested;
                 return true;
             case NullType:
-            default:
                 layout = default;
                 return false;
+            default:
+                throw new UnsupportedTypeException(
+                    $"No physical layout mapping is defined for type '{type.SimpleString}'. " +
+                    "PhysicalLayoutResolver must be extended when a new DataType is added.");
         }
     }
 }

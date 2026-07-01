@@ -1,3 +1,4 @@
+using System.Linq;
 using DeltaSharp.Engine.Types;
 using Xunit;
 
@@ -97,6 +98,74 @@ public class PhysicalLayoutTests
         Assert.True(PhysicalLayout.FixedWidth(4) != PhysicalLayout.FixedWidth(8));
         Assert.NotEqual(PhysicalLayout.Variable, PhysicalLayout.Nested);
         Assert.Equal(PhysicalLayout.FixedWidth(8).GetHashCode(), PhysicalLayout.FixedWidth(8).GetHashCode());
+    }
+
+    [Fact]
+    public void EveryConcreteDataType_IsHandledByResolver()
+    {
+        // Discover every concrete (non-abstract) DataType leaf shipped in the engine assembly.
+        // The resolver's default branch now throws UnsupportedTypeException, so a new leaf added
+        // without a matching case makes this test fail — exactly the intended tripwire. NullType
+        // is the sole leaf that legitimately reports no layout (TryResolve == false).
+        System.Reflection.Assembly engine = typeof(DataType).Assembly;
+        Type[] leaves = engine.GetTypes()
+            .Where(t => t is { IsAbstract: false, IsClass: true } && typeof(DataType).IsAssignableFrom(t))
+            .ToArray();
+
+        Assert.Contains(typeof(NullType), leaves);
+        Assert.True(leaves.Length >= 16, $"Expected at least 16 concrete DataType leaves, found {leaves.Length}.");
+
+        foreach (Type leaf in leaves)
+        {
+            DataType type = Canonical(leaf);
+
+            bool resolved = PhysicalLayoutResolver.TryResolve(type, out PhysicalLayout layout);
+
+            if (type is NullType)
+            {
+                Assert.False(resolved, "NullType must be the only leaf that reports no physical layout.");
+                Assert.Equal(default, layout);
+            }
+            else
+            {
+                Assert.True(resolved, $"'{leaf.Name}' has no resolver case; extend PhysicalLayoutResolver.");
+                Assert.NotEqual(PhysicalLayoutKind.None, layout.Kind);
+            }
+        }
+    }
+
+    private static DataType Canonical(Type leaf)
+    {
+        // Instantiate each leaf via its canonical form: atomic singletons through the static
+        // `Instance` property; the parameterized leaves through minimal valid constructors
+        // (mirroring the fixtures other tests use).
+        if (leaf == typeof(DecimalType))
+        {
+            return new DecimalType(10, 2);
+        }
+
+        if (leaf == typeof(ArrayType))
+        {
+            return new ArrayType(IntegerType.Instance);
+        }
+
+        if (leaf == typeof(MapType))
+        {
+            return new MapType(StringType.Instance, IntegerType.Instance);
+        }
+
+        if (leaf == typeof(StructType))
+        {
+            return new StructType(new[] { new StructField("a", IntegerType.Instance) });
+        }
+
+        System.Reflection.PropertyInfo? instance =
+            leaf.GetProperty("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+        Assert.True(
+            instance is not null,
+            $"'{leaf.Name}' is a concrete DataType leaf with no singleton `Instance` and no canonical " +
+            "constructor known to this test; extend Canonical(...) so the new leaf is still exercised.");
+        return (DataType)instance!.GetValue(null)!;
     }
 
     private static DataType InstanceOf(Type clrType)
