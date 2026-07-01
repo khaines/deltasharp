@@ -101,7 +101,7 @@
   <!-- ============================== lane:01.6 ==============================
     NuGet packaging hygiene (FEAT-01.6 / #130 metadata + symbols, #131 SourceLink +
     deterministic + package validation, #132 pack smoke test). Most of these properties take
-    effect only when a project is packed (IsPackable=true; today just DeltaSharp.Core) and are
+    effect only when a project is packed (IsPackable=true; today DeltaSharp.Core and DeltaSharp.Abstractions) and are
     inert on non-packable projects; PublishRepositoryUrl/EmbedUntrackedSources are build-time
     (they enrich every project's PDB) but harmless on non-packable assemblies — so the block is
     safe to declare repository-wide. License/repo metadata is inherited from the packaging
