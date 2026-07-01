@@ -7,14 +7,17 @@
 > [repository-layout.md](repository-layout.md), and [api-governance.md](api-governance.md).
 > Update it whenever the shared/type split, the dependency DAG, or the sequencing changes.
 
-## Current status (what S1a delivered)
+## Current status (what S1b+S2 delivered)
 
-**STORY-04.T.S1a is scaffold + docs only.** It creates the empty, governance-wired
-`src/DeltaSharp.Abstractions` assembly (an internal `AbstractionsAssemblyMarker` so it
-compiles; a trivially empty PublicAPI baseline) and this design. **No type-model code has
-moved yet** — the ADR-0008 types still live in `src/DeltaSharp.Engine/Types/`. The move is
-the separate **atomic** S1b+S2 PR (below). This document describes the end-state the
-scaffold exists to enable.
+**The atomic move is complete.** The ADR-0008 logical type model now lives in
+`src/DeltaSharp.Abstractions` (namespace `DeltaSharp.Types`): the `DataType` hierarchy, complex
+types, the `DataTypes` factory, `TypeCoercion`, the decimal type-rules, `AnsiMode`, the
+exceptions, and the internal `StableHash`. Both `DeltaSharp.Core` and `DeltaSharp.Engine`
+reference the assembly. The **physical / storage** helpers — `PhysicalLayout`,
+`PhysicalLayoutResolver`, `DecimalValue`, `TemporalValues`, and `SchemaJson` — stay in
+`DeltaSharp.Engine` (same `DeltaSharp.Types` namespace). The prior S1a scaffold marker
+(`AbstractionsAssemblyMarker`) has been removed now that the real type surface populates the
+assembly and its PublicAPI baseline. This document describes that end-state.
 
 ## Problem
 
@@ -171,6 +174,26 @@ Consequences, all wired in this scaffold (S1a):
   and `net10.0` public surfaces to be identical; the type model uses no `net10.0`-only APIs.
 - **Lock files** — none for Abstractions (SDK-only). A future `DeltaSharp.Abstractions.Tests`
   (xunit) would carry a `packages.lock.json` per repo policy.
+
+### Governance asymmetry: `DeltaSharp.Types` spans two assemblies (intentional)
+
+After the move the `DeltaSharp.Types` namespace deliberately spans **two** assemblies with
+**different governance**:
+
+- **`DeltaSharp.Abstractions`** — the governed public logical surface. Packable, shipped, and
+  tracked by a PublicAPI baseline (`PublicAPI.Shipped.txt` / `PublicAPI.Unshipped.txt`); every
+  public addition/removal is reviewable.
+- **`DeltaSharp.Engine`** — the physical slice (`PhysicalLayout`, `PhysicalLayoutResolver`,
+  `DecimalValue`, `TemporalValues`, `SchemaJson`). These are `public` for cross-file/test use
+  within the solution, but the assembly is `IsPackable=false` and **not** PublicAPI-tracked, so
+  they carry **no** PublicAPI baseline.
+
+This is intentional, not an oversight. The Engine physical slice is **solution-internal** — it
+never appears in the `DeltaSharp.Abstractions` nupkg — so it needs no shipped-API baseline. A
+future `public` addition to the Engine slice is engine-internal surface, not shipped API, and
+must **not** trigger a PublicAPI baseline on Engine (that would contradict repo policy that only
+packable, shipped assemblies track public API). Only the Abstractions half of the namespace is
+the shipped contract.
 
 ## Sequencing
 
