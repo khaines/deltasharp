@@ -1,6 +1,47 @@
 #nullable enable
+DeltaSharp.DataFrame
+DeltaSharp.DataFrameReader
 DeltaSharp.DeltaSharpInfo
+DeltaSharp.ExecutionBackend
+DeltaSharp.ExecutionBackend.Auto = 0 -> DeltaSharp.ExecutionBackend
+DeltaSharp.ExecutionBackend.Compiled = 2 -> DeltaSharp.ExecutionBackend
+DeltaSharp.ExecutionBackend.Interpreted = 1 -> DeltaSharp.ExecutionBackend
+DeltaSharp.RuntimeConfig
+DeltaSharp.RuntimeConfig.Contains(string! key) -> bool
+DeltaSharp.RuntimeConfig.Get(string! key) -> string!
+DeltaSharp.RuntimeConfig.Get(string! key, string? defaultValue) -> string?
+DeltaSharp.RuntimeConfig.GetAll() -> System.Collections.Generic.IReadOnlyDictionary<string!, string!>!
+DeltaSharp.RuntimeConfig.Set(string! key, bool value) -> void
+DeltaSharp.RuntimeConfig.Set(string! key, double value) -> void
+DeltaSharp.RuntimeConfig.Set(string! key, long value) -> void
+DeltaSharp.RuntimeConfig.Set(string! key, string! value) -> void
+DeltaSharp.SessionStoppedException
+DeltaSharp.SessionStoppedException.SessionStoppedException() -> void
+DeltaSharp.SessionStoppedException.SessionStoppedException(string! message) -> void
+DeltaSharp.SessionStoppedException.SessionStoppedException(string! message, System.Exception? innerException) -> void
+DeltaSharp.SparkSession
+DeltaSharp.SparkSession.Conf.get -> DeltaSharp.RuntimeConfig!
+DeltaSharp.SparkSession.CreateDataFrame(System.Collections.IEnumerable! data) -> DeltaSharp.DataFrame!
+DeltaSharp.SparkSession.Dispose() -> void
+DeltaSharp.SparkSession.ExecutionBackend.get -> DeltaSharp.ExecutionBackend
+DeltaSharp.SparkSession.IsActive.get -> bool
+DeltaSharp.SparkSession.Read.get -> DeltaSharp.DataFrameReader!
+DeltaSharp.SparkSession.Sql(string! sqlText) -> DeltaSharp.DataFrame!
+DeltaSharp.SparkSession.Stop() -> void
+DeltaSharp.SparkSessionBuilder
+DeltaSharp.SparkSessionBuilder.AppName(string! name) -> DeltaSharp.SparkSessionBuilder!
+DeltaSharp.SparkSessionBuilder.Config(string! key, bool value) -> DeltaSharp.SparkSessionBuilder!
+DeltaSharp.SparkSessionBuilder.Config(string! key, double value) -> DeltaSharp.SparkSessionBuilder!
+DeltaSharp.SparkSessionBuilder.Config(string! key, long value) -> DeltaSharp.SparkSessionBuilder!
+DeltaSharp.SparkSessionBuilder.Config(string! key, string! value) -> DeltaSharp.SparkSessionBuilder!
+DeltaSharp.SparkSessionBuilder.GetOrCreate() -> DeltaSharp.SparkSession!
 static DeltaSharp.DeltaSharpInfo.PreviewReleaseChannel.get -> string!
 static DeltaSharp.DeltaSharpInfo.Product.get -> string!
 static DeltaSharp.DeltaSharpInfo.ProductName.get -> string!
 static DeltaSharp.DeltaSharpInfo.Version.get -> string!
+static DeltaSharp.SparkSession.Builder() -> DeltaSharp.SparkSessionBuilder!
+static DeltaSharp.SparkSession.ClearActiveSession() -> void
+static DeltaSharp.SparkSession.ClearDefaultSession() -> void
+static DeltaSharp.SparkSession.GetActiveSession() -> DeltaSharp.SparkSession?
+static DeltaSharp.SparkSession.GetDefaultSession() -> DeltaSharp.SparkSession?
+static DeltaSharp.SparkSession.SetActiveSession(DeltaSharp.SparkSession! session) -> void
