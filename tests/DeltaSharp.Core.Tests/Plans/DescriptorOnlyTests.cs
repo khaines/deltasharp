@@ -85,7 +85,20 @@ public sealed class DescriptorOnlyTests
     /// (their arguments recurse to non-banned leaves). For DeltaSharp-defined types it additionally
     /// recurses into declared instance <b>fields and properties</b> (so an interface member that
     /// declares a banned property, or a computed property whose type wraps a banned type, is
-    /// caught); BCL/third-party types are treated as leaves to avoid false positives.
+    /// caught) AND scans the <b>transitive interface closure</b> (<see cref="Type.GetInterfaces"/>)
+    /// so a banned property declared on a <b>base interface</b> at any inheritance depth (2-level,
+    /// diamond) is caught even though an interface's <see cref="Type.BaseType"/> is
+    /// <see langword="null"/>; BCL/third-party types are treated as leaves to avoid false positives.
+    /// After this, the guard catches every STATICALLY-DECLARED banned member reachable from an IR
+    /// type via its fields, properties, base classes, and the transitive interface closure, plus
+    /// arrays/generics/tuples/nullable unwrapping and DeltaSharp-type recursion. The ONLY remaining
+    /// residuals are inherent to static type scanning and are covered by the compile-time
+    /// Core⊄Engine assembly boundary (the PRIMARY guarantee, asserted in
+    /// <see cref="CoreAssemblyDoesNotReferenceTheEngineAssembly"/>): (i) a handle held by the
+    /// IMPLEMENTATION of a marker interface that DECLARES no banned member (the runtime type is
+    /// unknowable statically); (ii) a handle inside a third-party/BCL type's private internals
+    /// (recursing BCL internals would false-positive); and (iii) a handle produced by a method
+    /// return or static member (not held instance state).
     /// </summary>
     private static Type? FindBannedType(Type type) => FindBannedType(type, new HashSet<Type>());
 
@@ -166,6 +179,37 @@ public sealed class DescriptorOnlyTests
                     if (FindBannedType(property.PropertyType, visited) is Type fromProperty)
                     {
                         return fromProperty;
+                    }
+                }
+            }
+
+            // F4: INTERFACE-INHERITANCE closure. The base-CLASS-chain loop above walks
+            // `t = t.BaseType`, but an interface's BaseType is null — so for an interface `type`
+            // that loop visits only the interface's OWN declared members and never reaches its BASE
+            // interfaces. A DeltaSharp `interface IDerived : IBase` whose IBase declares a banned
+            // `Stream Handle { get; }`, held by an IR member typed IDerived, therefore bypassed a
+            // members-only scan (the property is declared on IBase, statically visible through the
+            // IDerived closure). `GetInterfaces()` returns the FULL TRANSITIVE set of implemented /
+            // base interfaces, so scanning each one's declared properties closes interface-declared
+            // banned members at ANY inheritance depth (2-level, diamond) in a single call — no
+            // per-level walking. Each interface property TYPE is run through the same
+            // leaf/unwrap/DeltaSharp-recurse logic, so benign interfaces stay clean: BCL interfaces
+            // (`IEnumerable<Expression>`, `IReadOnlyList<string>`, `IEquatable<T>`) declare either no
+            // properties or property types that unwrap to non-banned leaves, and are never falsely
+            // flagged. Scanned interfaces are added to `visited` so diamond hierarchies (and any
+            // self-/mutually-referential interface graph) are scanned once and terminate.
+            foreach (Type iface in type.GetInterfaces())
+            {
+                if (!visited.Add(iface))
+                {
+                    continue;
+                }
+
+                foreach (PropertyInfo property in iface.GetProperties(memberFlags))
+                {
+                    if (FindBannedType(property.PropertyType, visited) is Type fromInterface)
+                    {
+                        return fromInterface;
                     }
                 }
             }
@@ -396,6 +440,110 @@ public sealed class DescriptorOnlyTests
     public void PropertyRecursionTerminatesOnSelfReferentialTypes()
     {
         Assert.Null(FindBannedType(typeof(SelfReferentialPropertyFixture)));
+    }
+
+    // ---- F4: banned property declared on a BASE interface (interface-inheritance closure) -------
+    // An interface's Type.BaseType is null, so the base-CLASS-chain loop visits only an interface's
+    // OWN declared members and never its BASE interfaces. The red-team repro below — a DeltaSharp
+    // `interface IDerived : IBase` whose IBase declares `Stream Handle { get; }`, held by an IR
+    // member typed IDerived — is genuinely reachable held state (a declared property statically
+    // visible through the IDerived closure) yet bypassed a members-only scan. The scan now walks
+    // Type.GetInterfaces() (the FULL TRANSITIVE interface set) and applies FindBannedType to each
+    // interface's declared property types, closing this at any depth (2-level, diamond) in one call.
+    private interface IBaseStreamDescriptorFixture
+    {
+        Stream Handle { get; }
+    }
+
+    // The exact repro: derived interface adds nothing; the banned member lives on the base.
+    private interface IDerivedDescriptorFixture : IBaseStreamDescriptorFixture
+    {
+    }
+
+    // 2-level interface inheritance: IDeep : IMid : IBase{Stream}.
+    private interface IMidDescriptorFixture : IBaseStreamDescriptorFixture
+    {
+    }
+
+    private interface IDeepDescriptorFixture : IMidDescriptorFixture
+    {
+    }
+
+    // Diamond: IDiamond : ILeft, IRight ; ILeft and IRight both : IBase{Stream}. GetInterfaces()
+    // deduplicates IBase, and the visited-set guard ensures it is scanned once.
+    private interface ILeftDescriptorFixture : IBaseStreamDescriptorFixture
+    {
+    }
+
+    private interface IRightDescriptorFixture : IBaseStreamDescriptorFixture
+    {
+    }
+
+    private interface IDiamondDescriptorFixture : ILeftDescriptorFixture, IRightDescriptorFixture
+    {
+    }
+
+    // A mutually/self-referential interface graph must terminate (cycle guard covers interfaces).
+    private interface ISelfReferentialDescriptorFixture
+    {
+        ISelfReferentialDescriptorFixture? Next { get; }
+    }
+
+    // Benign DeltaSharp interfaces (own + inherited) with no banned member must stay clean.
+    private interface IBenignDescriptorFixture
+    {
+        IReadOnlyList<Expression> Expressions { get; }
+
+        string Name { get; }
+    }
+
+    private interface IDerivedBenignDescriptorFixture : IBenignDescriptorFixture
+    {
+    }
+
+#pragma warning disable CS0649 // Fields exist only to be inspected reflectively; never assigned.
+    private sealed class DerivedInterfaceTypedMemberFixture
+    {
+        public IDerivedDescriptorFixture? Descriptor;
+    }
+#pragma warning restore CS0649
+
+    [Fact]
+    public void RecursiveScanCatchesBannedPropertyDeclaredByABaseInterface()
+    {
+        // Red-team repro: the banned Stream is declared on the BASE interface, not the derived one.
+        // type.BaseType is null for interfaces, so ONLY the GetInterfaces() closure reaches it.
+        Assert.NotNull(FindBannedType(typeof(IDerivedDescriptorFixture)));
+        Assert.NotNull(FindBannedType(typeof(DerivedInterfaceTypedMemberFixture)));
+
+        // 2-level interface inheritance (IDeep : IMid : IBase{Stream}).
+        Assert.NotNull(FindBannedType(typeof(IDeepDescriptorFixture)));
+
+        // Diamond (IDiamond : ILeft, IRight ; both : IBase{Stream}) — caught, no infinite loop.
+        Assert.NotNull(FindBannedType(typeof(IDiamondDescriptorFixture)));
+    }
+
+    [Fact]
+    public void InterfaceClosureScanTerminatesAndDoesNotFalselyFlagBenignInterfaces()
+    {
+        // Cycle guard covers self-/mutually-referential interface hierarchies (no stack overflow).
+        Assert.Null(FindBannedType(typeof(ISelfReferentialDescriptorFixture)));
+
+        // Benign DeltaSharp interfaces (own members and inherited) with no banned member stay clean.
+        Assert.Null(FindBannedType(typeof(IBenignDescriptorFixture)));
+        Assert.Null(FindBannedType(typeof(IDerivedBenignDescriptorFixture)));
+
+        // Benign BCL interfaces must NOT be flagged — the exact false-positive risk from
+        // GetInterfaces() returning framework interfaces.
+        Assert.Null(FindBannedType(typeof(IEnumerable<Expression>)));
+        Assert.Null(FindBannedType(typeof(IReadOnlyList<string>)));
+        Assert.Null(FindBannedType(typeof(IReadOnlyList<Expression>)));
+
+        // The real IR descriptor types (which implement IEquatable<T>) stay clean.
+        foreach (Type type in AllIrTypes)
+        {
+            Assert.Null(FindBannedType(type));
+        }
     }
 
 
