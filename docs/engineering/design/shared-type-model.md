@@ -63,9 +63,10 @@ reference it.
   resolves its `net10.0` asset; Core (`net8.0;net10.0`) matches on both. No `net8.0`
   consumer ever pulls a `net10.0`-only dependency.
 - **Packable rule satisfied.** Core (packable) → Abstractions (packable). Because
-  Abstractions ships transitively inside the `DeltaSharp.Core` package, it **must** set
-  `IsPackable=true`; otherwise the published package would carry an unresolvable
-  dependency.
+  `DeltaSharp.Core` takes a package **dependency** on Abstractions (Abstractions ships as its
+  own package that Core depends on, not bundled inside `Core.nupkg`), it **must** set
+  `IsPackable=true`; otherwise the published `DeltaSharp.Core` package would carry a
+  dependency on an unpublished assembly.
 - **SDK-only ⇒ no lock file.** Abstractions takes no third-party `PackageReference`, so it
   carries **no `packages.lock.json`** — matching Core and Engine (only test projects lock).
 
@@ -127,6 +128,19 @@ grounded in the actual cross-file symbol references inside `src/DeltaSharp.Engin
    `SchemaJson.FromJson(string)` static. Zero production consumers today (only 2 Engine
    **test** files call it). If plan-serialization (ADR-0012) later needs schema JSON in
    Core, promote `SchemaJson` to Abstractions then.
+4. **`StableHash` ↔ Engine-resident `GetHashCode` callers.** `StableHash` moves to
+   Abstractions but stays **`internal`** (it is an implementation detail, not part of the
+   Spark-parity public surface). Two Engine types that stay in Engine after the split call
+   the internal `StableHash.Combine` from their `GetHashCode`:
+   `PhysicalLayout.GetHashCode` (`src/DeltaSharp.Engine/Types/PhysicalLayout.cs`) and
+   `DecimalValue.GetHashCode` (split out of `DecimalArithmetic`). After the move these become
+   **cross-assembly** reads of an `internal` symbol, which would not compile. Resolution:
+   Abstractions grants `[InternalsVisibleTo("DeltaSharp.Engine")]` (in addition to the
+   auto-injected `[InternalsVisibleTo("DeltaSharp.Abstractions.Tests")]`) so Engine's
+   `PhysicalLayout`/`DecimalValue` `GetHashCode` keep calling `StableHash.Combine` after the
+   move. This IVT is added as part of the **S1b** atomic move — i.e. in the same PR that
+   actually relocates `StableHash` into Abstractions — **not** in the S1a scaffold, which has
+   no `StableHash` yet. `StableHash` remains `internal` (it is **not** promoted to public).
 
 ## Public surface + governance
 
@@ -166,7 +180,7 @@ Sized for ≤3 parallel worktrees; each story is its own PR.
 | --- | --- | --- |
 | **S0** | In-Engine physical decoupling: drop the abstract layout + `ToJson`/`FromJson` from `DataType`, split `DecimalArithmetic` → `+DecimalValue`, add `PhysicalLayoutResolver`, relocate the JSON convenience to `SchemaJson`; update the 5 layout call sites + 2 JSON tests. Isolated to Engine. | — |
 | **S1a** *(this story)* | Scaffold the empty `DeltaSharp.Abstractions` (net8;net10, packable, trim/AOT analyzers), empty PublicAPI baseline, sln + `Directory.Build.props` (`DeltaSharpTracksPublicApi += Abstractions`) + ADR-0016 + this doc. | — |
-| **S1b+S2** | **Atomic** move + re-point: move ~10 logical files → `Abstractions/` (ns `DeltaSharp.Types`); add `ProjectReference` Engine→Abstractions (+Engine.Tests); re-point the `using` directives; populate `PublicAPI.Unshipped.txt`. | S0 + S1a |
+| **S1b+S2** | **Atomic** move + re-point: move ~13 logical files → `Abstractions/` (ns `DeltaSharp.Types`); add `ProjectReference` Engine→Abstractions (+Engine.Tests); grant `[InternalsVisibleTo("DeltaSharp.Engine")]` for the internal `StableHash` (straddler 4); re-point the `using` directives; populate `PublicAPI.Unshipped.txt`. | S0 + S1a |
 | **S3** | `Core.csproj` `ProjectReference` → Abstractions; (deferred) unify `PlanHash` → `StableHash`. | S1b+S2 |
 | **#168** | Rebase typed expressions onto the shared `DataType` (`DeltaSharp.Types.DataType`) — satisfies AC3. | S3 |
 

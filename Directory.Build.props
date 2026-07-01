@@ -76,7 +76,7 @@
     <DeltaSharpTracksPublicApi Condition="'$(MSBuildProjectName)' == 'DeltaSharp.Core' Or '$(MSBuildProjectName)' == 'DeltaSharp.Abstractions'">true</DeltaSharpTracksPublicApi>
   </PropertyGroup>
 
-  <!-- BannedApiAnalyzers on production assemblies (Core, Engine, Executor). The categorized
+  <!-- BannedApiAnalyzers on production assemblies (Core, Abstractions, Engine, Executor). The categorized
        ban list lives at the repo root and is shared by every production assembly. -->
   <ItemGroup Condition="'$(DeltaSharpIsProductionAssembly)' == 'true'">
     <PackageReference Include="Microsoft.CodeAnalysis.BannedApiAnalyzers">

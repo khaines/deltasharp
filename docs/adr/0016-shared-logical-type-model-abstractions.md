@@ -39,8 +39,11 @@ surface and the `net10.0` engine.
    (`DecimalArithmetic.ForType`/`Bounded`/`ResultType`), `AnsiMode`, the four
    type/coercion exceptions, and the internal `StableHash`. Both `Core` and `Engine`
    add a `ProjectReference` to it. Core and Engine remain mutually independent.
-   (Chosen over hosting the model in Core with Engine→Core, which would invert
-   sibling independence and pull the public API into the execution/AOT image.)
+   `DeltaSharp.Abstractions` ships as its **own** NuGet package that `DeltaSharp.Core`
+   takes a package **dependency** on (it is *not* bundled inside `Core.nupkg`); because a
+   packable library may not depend on a non-packable one, `IsPackable=true` on Abstractions
+   is **mandatory**. (Chosen over hosting the model in Core with Engine→Core, which would
+   invert sibling independence and pull the public API into the execution/AOT image.)
 
 2. **Logical/physical split.** The shared assembly is free of Arrow/execution/storage
    dependencies. The following stay in `DeltaSharp.Engine`:
@@ -58,6 +61,18 @@ surface and the `net10.0` engine.
    `StableHash` stays `internal`. The Engine-only physical helpers are never part of
    the shipped API.
 
+4. **Internal `StableHash` visibility to Engine.** `StableHash` moves into Abstractions
+   but stays `internal`. Two Engine-resident types that stay in Engine after the split
+   call it from their `GetHashCode`: `PhysicalLayout.GetHashCode`
+   (`src/DeltaSharp.Engine/Types/PhysicalLayout.cs`) and `DecimalValue.GetHashCode` (split
+   out of `DecimalArithmetic`). Once `StableHash` relocates, these become cross-assembly
+   reads of an `internal` symbol and would fail to compile. Resolution: Abstractions grants
+   `[InternalsVisibleTo("DeltaSharp.Engine")]` (in addition to the auto-injected
+   `DeltaSharp.Abstractions.Tests` grant) so those `GetHashCode` implementations keep calling
+   the internal `StableHash.Combine` after the move. This IVT is added as part of the **S1b**
+   atomic move (the same PR that relocates `StableHash`) — **not** in the S1a scaffold, which
+   contains no `StableHash` yet. `StableHash` is **not** promoted to public.
+
 ## Consequences
 
 ### Positive
@@ -72,7 +87,7 @@ surface and the `net10.0` engine.
 
 ### Negative / costs
 
-- One **atomic** PR must move ~10 logical type files and re-point **73 production**
+- One **atomic** PR must move ~13 logical type files and re-point **73 production**
   Engine files (+49 test files) from `using DeltaSharp.Engine.Types;` to
   `using DeltaSharp.Types;` — Engine does not compile between the move and the
   re-point.

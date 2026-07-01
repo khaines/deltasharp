@@ -4,8 +4,9 @@
     Shared, packable logical-contract library (ADR-0016). Multi-targets net8.0;net10.0
     (ADR-0014) so it can be referenced by BOTH the public net8.0;net10.0 DeltaSharp.Core
     surface AND the net10.0-only DeltaSharp.Engine, without inverting their sibling
-    independence (Core ⟂ Engine preserved). Packable: it ships transitively via
-    DeltaSharp.Core, so it MUST be IsPackable=true (a packable library may not reference a
+    independence (Core ⟂ Engine preserved). Packable: Core takes a package dependency on
+    Abstractions (Abstractions ships as its own package that Core depends on, not bundled
+    inside Core.nupkg), so it MUST be IsPackable=true (a packable library may not reference a
     non-packable assembly). Namespace root DeltaSharp; the logical type model lands under
     DeltaSharp.Types (ADR-0008), mirroring Spark's org.apache.spark.sql.types.
 
@@ -21,6 +22,7 @@
     <IsPackable>true</IsPackable>
     <PackageId>DeltaSharp.Abstractions</PackageId>
     <Description>Shared logical contracts for DeltaSharp, a .NET-native reimplementation of Apache Spark — the packable Core↔Engine seam that will hold the ADR-0008 logical type model. M1 skeleton — no type-model code yet.</Description>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <!-- ADR-0014: keep the public surface trim/AOT-annotation-clean. Enable the
          trim/AOT/single-file Roslyn analyzers as a standing build gate on both TFMs.
@@ -33,5 +35,11 @@
     <EnableAotAnalyzer>true</EnableAotAnalyzer>
     <EnableSingleFileAnalyzer>true</EnableSingleFileAnalyzer>
   </PropertyGroup>
+
+  <!-- Pack the package README at the .nupkg root (referenced by PackageReadmeFile above).
+       Per-package because the readme content is package-specific (FEAT-01.6 / #130). -->
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
 
 </Project>
