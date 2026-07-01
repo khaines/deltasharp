@@ -8,11 +8,11 @@ namespace DeltaSharp;
 /// </summary>
 /// <remarks>
 /// <b>M1 placeholder.</b> STORY-04.1.1 (#157) introduces this type as the return shape of the
-/// <see cref="SparkSession"/> doors (<see cref="SparkSession.Sql(string)"/> and the reader), and
-/// STORY-04.4.1 (#167) backs it with the immutable logical <see cref="Plan"/> it wraps. Its
-/// transformation and action surface is delivered by later FEAT-04.1/FEAT-04.2 stories
-/// (#158/#159 and following); it is intentionally inert here. Instances are created by the engine
-/// from a logical plan, not by user code, so the constructor is non-public.
+/// <see cref="SparkSession"/> doors (<see cref="SparkSession.Sql(string)"/> and the reader), and it
+/// is backed here by the immutable logical <see cref="Plan"/> it wraps — the structural-sharing
+/// foundation from STORY-04.4.1 (#167). Its transformation and action surface is delivered by later
+/// FEAT-04.1/FEAT-04.2 stories (#158/#159 and following); it is intentionally inert here. Instances
+/// are created by the engine from a logical plan, not by user code, so the constructor is non-public.
 /// </remarks>
 public sealed class DataFrame
 {
