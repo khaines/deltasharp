@@ -118,14 +118,46 @@ public sealed class DescriptorOnlyTests
             }
         }
 
+        // F2: recurse into the instance fields of a *DeltaSharp-defined* custom type (the IR's own
+        // structs/classes) so a wrapper such as `struct ExoticWrapper { Stream Handle; }` cannot
+        // hide a handle. Scoped to DeltaSharp namespaces on purpose: BCL/third-party types (string,
+        // List<T>, Task, …) internally hold IDisposable/Stream fields, so recursing into them would
+        // explode into false positives. Their public generic arguments are already unwrapped above,
+        // which is the only handle-carrying surface a benign BCL wrapper legitimately exposes.
+        if (IsDeltaSharpDefinedType(type))
+        {
+            const BindingFlags fieldFlags =
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly;
+
+            for (Type? t = type; t is not null && t != typeof(object); t = t.BaseType)
+            {
+                foreach (FieldInfo field in t.GetFields(fieldFlags))
+                {
+                    if (FindBannedType(field.FieldType, visited) is Type fromField)
+                    {
+                        return fromField;
+                    }
+                }
+            }
+        }
+
         return null;
     }
+
+    /// <summary>
+    /// True when <paramref name="type"/> is defined in the DeltaSharp assemblies (namespace starts
+    /// with <c>DeltaSharp</c>) — i.e. one of the IR's own types — and is therefore safe to recurse
+    /// into field-by-field. BCL/third-party types are treated as leaves.
+    /// </summary>
+    private static bool IsDeltaSharpDefinedType(Type type) =>
+        type.Namespace?.StartsWith("DeltaSharp", StringComparison.Ordinal) == true;
 
     private static bool IsBannedLeaf(Type type) =>
         typeof(Stream).IsAssignableFrom(type)
         || typeof(TextReader).IsAssignableFrom(type)
         || typeof(TextWriter).IsAssignableFrom(type)
         || typeof(IDisposable).IsAssignableFrom(type)
+        || typeof(IAsyncDisposable).IsAssignableFrom(type)
         || type.Namespace?.StartsWith("DeltaSharp.Engine", StringComparison.Ordinal) == true;
 
     /// <summary>A test-only fixture whose fields hide stream handles inside generics/tuples to
@@ -175,6 +207,89 @@ public sealed class DescriptorOnlyTests
         Assert.Null(FindBannedType(typeof(System.Collections.ObjectModel.ReadOnlyCollection<string>)));
         Assert.Null(FindBannedType(typeof((string, int))));
         Assert.Null(FindBannedType(typeof(int?)));
+    }
+
+    // ---- F1: IAsyncDisposable leaf gap ----------------------------------------------------------
+    // Every Stream (e.g. FileStream) implements IAsyncDisposable, which does NOT derive from
+    // IDisposable — so a field typed IAsyncDisposable (or List<IAsyncDisposable>, …) would bypass a
+    // guard that only knows IDisposable. IAsyncDisposable is now a banned leaf.
+#pragma warning disable CS0649 // Fields exist only to be inspected reflectively; never assigned.
+    private sealed class AsyncDisposableFixture
+    {
+        public IAsyncDisposable? AsyncHandle;
+        public List<IAsyncDisposable>? ListOfAsyncHandles;
+    }
+#pragma warning restore CS0649
+
+    [Fact]
+    public void RecursiveScanCatchesIAsyncDisposableHandles()
+    {
+        Assert.NotNull(FindBannedType(typeof(IAsyncDisposable)));
+        Assert.NotNull(FindBannedType(typeof(List<IAsyncDisposable>)));
+
+        const BindingFlags fieldFlags =
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly;
+        foreach (FieldInfo field in typeof(AsyncDisposableFixture).GetFields(fieldFlags))
+        {
+            Assert.True(
+                FindBannedType(field.FieldType) is not null,
+                $"The scan failed to catch the IAsyncDisposable handle in "
+                + $"{nameof(AsyncDisposableFixture)}.{field.Name} ({field.FieldType.Name}).");
+        }
+    }
+
+    // ---- F2: custom (DeltaSharp-defined) struct/class fields must be recursed -------------------
+    // FindBannedType unwraps arrays/generics/tuples/nullable but did NOT descend into the fields of
+    // a custom wrapper, so `struct ExoticWrapper { Stream Handle; }` slipped past. The scan now
+    // recurses into DeltaSharp-defined types' fields (these fixtures live in a DeltaSharp.* test
+    // namespace, mirroring an IR-owned wrapper). BCL/third-party types stay leaves.
+#pragma warning disable CS0649 // Fields exist only to be inspected reflectively; never assigned.
+    private struct ExoticWrapperFixture
+    {
+        public Stream Handle;
+    }
+
+    private sealed class HandleWrapperFixture
+    {
+        public ExoticWrapperFixture Inner; // nested two levels: wrapper -> struct -> Stream
+    }
+
+    private sealed class DirectHandleWrapperFixture
+    {
+        private readonly Stream? _handle;
+
+        public DirectHandleWrapperFixture(Stream? handle) => _handle = handle;
+    }
+
+    private sealed class BenignWrapperFixture
+    {
+        public string? Name;
+        public int? Count;
+        public IReadOnlyList<Expression>? Expressions;
+    }
+#pragma warning restore CS0649
+
+    [Fact]
+    public void RecursiveScanCatchesHandlesHiddenInsideDeltaSharpDefinedCustomTypes()
+    {
+        // Bypass proof: unwrapping alone (arrays/generics/tuples) returns null for a custom wrapper;
+        // the field recursion must find the Stream nested one and two levels deep.
+        Assert.NotNull(FindBannedType(typeof(ExoticWrapperFixture)));
+        Assert.NotNull(FindBannedType(typeof(HandleWrapperFixture)));
+        Assert.NotNull(FindBannedType(typeof(DirectHandleWrapperFixture)));
+
+        // And a member-level path: an IR node holding such a wrapper is caught.
+        Assert.NotNull(FindBannedType(typeof(List<HandleWrapperFixture>)));
+    }
+
+    [Fact]
+    public void RecursiveScanDoesNotFalselyFlagDeltaSharpTypesWithOnlyBenignFields()
+    {
+        // The field recursion must NOT over-reach: a DeltaSharp type whose fields are only BCL
+        // scalars/collections and other benign IR types stays clean.
+        Assert.Null(FindBannedType(typeof(BenignWrapperFixture)));
+        Assert.Null(FindBannedType(typeof(Expression)));
+        Assert.Null(FindBannedType(typeof(LogicalPlan)));
     }
 
     /// <summary>
