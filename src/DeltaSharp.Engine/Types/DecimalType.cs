@@ -73,11 +73,4 @@ public sealed class DecimalType : DataType
     /// <inheritdoc/>
     public override int GetHashCode() =>
         StableHash.Combine(StableHash.OfString("decimal"), StableHash.Combine(Precision, Scale));
-
-    /// <inheritdoc/>
-    public override bool TryGetPhysicalLayout(out PhysicalLayout layout)
-    {
-        layout = PhysicalLayout.FixedWidth(IsCompact ? 8 : 16);
-        return true;
-    }
 }

@@ -73,7 +73,7 @@ internal sealed class InterpretedScanStream : IBatchStream
         for (int c = 0; c < batch.ColumnCount; c++)
         {
             ColumnVector column = batch.Column(c);
-            if (!column.Type.TryGetPhysicalLayout(out PhysicalLayout layout))
+            if (!PhysicalLayoutResolver.TryResolve(column.Type, out PhysicalLayout layout))
             {
                 continue;
             }

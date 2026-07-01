@@ -25,7 +25,7 @@ public class SchemaJsonRoundTripTests
     [MemberData(nameof(AllAtomicTypes))]
     public void Atomic_RoundTrips(DataType type)
     {
-        Assert.Equal(type, DataType.FromJson(type.ToJson()));
+        Assert.Equal(type, SchemaJson.FromJson(SchemaJson.ToJson(type)));
     }
 
     [Theory]
@@ -35,7 +35,7 @@ public class SchemaJsonRoundTripTests
     public void Decimal_RoundTrips(int precision, int scale)
     {
         var type = new DecimalType(precision, scale);
-        Assert.Equal(type, DataType.FromJson(type.ToJson()));
+        Assert.Equal(type, SchemaJson.FromJson(SchemaJson.ToJson(type)));
     }
 
     [Fact]
@@ -44,7 +44,7 @@ public class SchemaJsonRoundTripTests
         foreach (bool containsNull in new[] { true, false })
         {
             var type = new ArrayType(IntegerType.Instance, containsNull);
-            var roundTripped = (ArrayType)DataType.FromJson(type.ToJson());
+            var roundTripped = (ArrayType)SchemaJson.FromJson(SchemaJson.ToJson(type));
             Assert.Equal(type, roundTripped);
             Assert.Equal(containsNull, roundTripped.ContainsNull);
         }
@@ -56,7 +56,7 @@ public class SchemaJsonRoundTripTests
         foreach (bool valueContainsNull in new[] { true, false })
         {
             var type = new MapType(StringType.Instance, new DecimalType(20, 2), valueContainsNull);
-            var roundTripped = (MapType)DataType.FromJson(type.ToJson());
+            var roundTripped = (MapType)SchemaJson.FromJson(SchemaJson.ToJson(type));
             Assert.Equal(type, roundTripped);
             Assert.Equal(valueContainsNull, roundTripped.ValueContainsNull);
         }
@@ -75,7 +75,7 @@ public class SchemaJsonRoundTripTests
             new StructField("name", StringType.Instance, nullable: true),
         });
 
-        var roundTripped = (StructType)DataType.FromJson(schema.ToJson());
+        var roundTripped = (StructType)SchemaJson.FromJson(SchemaJson.ToJson(schema));
 
         Assert.Equal(schema, roundTripped);
         Assert.False(roundTripped["id"].Nullable);
@@ -104,7 +104,7 @@ public class SchemaJsonRoundTripTests
                     containsNull: false)),
         });
 
-        Assert.Equal(schema, DataType.FromJson(schema.ToJson()));
+        Assert.Equal(schema, SchemaJson.FromJson(SchemaJson.ToJson(schema)));
     }
 
     [Fact]
@@ -123,8 +123,8 @@ public class SchemaJsonRoundTripTests
                 })),
         });
 
-        string first = schema.ToJson();
-        string second = schema.ToJson();
+        string first = SchemaJson.ToJson(schema);
+        string second = SchemaJson.ToJson(schema);
 
         Assert.Equal(first, second);
         Assert.True(first.IndexOf("alpha", StringComparison.Ordinal) < first.IndexOf("zeta", StringComparison.Ordinal));
@@ -133,16 +133,16 @@ public class SchemaJsonRoundTripTests
     [Fact]
     public void Json_UsesSparkCompatibleShapes()
     {
-        Assert.Equal("\"integer\"", IntegerType.Instance.ToJson());
-        Assert.Equal("\"decimal(10,2)\"", new DecimalType(10, 2).ToJson());
-        Assert.Equal("\"void\"", NullType.Instance.ToJson());
+        Assert.Equal("\"integer\"", SchemaJson.ToJson(IntegerType.Instance));
+        Assert.Equal("\"decimal(10,2)\"", SchemaJson.ToJson(new DecimalType(10, 2)));
+        Assert.Equal("\"void\"", SchemaJson.ToJson(NullType.Instance));
 
-        string arrayJson = new ArrayType(StringType.Instance, containsNull: false).ToJson();
+        string arrayJson = SchemaJson.ToJson(new ArrayType(StringType.Instance, containsNull: false));
         Assert.Contains("\"type\":\"array\"", arrayJson);
         Assert.Contains("\"elementType\":\"string\"", arrayJson);
         Assert.Contains("\"containsNull\":false", arrayJson);
 
-        string structJson = new StructType(new[] { new StructField("a", IntegerType.Instance) }).ToJson();
+        string structJson = SchemaJson.ToJson(new StructType(new[] { new StructField("a", IntegerType.Instance) }));
         Assert.Contains("\"type\":\"struct\"", structJson);
         Assert.Contains("\"name\":\"a\"", structJson);
         Assert.Contains("\"nullable\":true", structJson);
@@ -156,7 +156,7 @@ public class SchemaJsonRoundTripTests
             "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}," +
             "{\"name\":\"amount\",\"type\":\"decimal(12,2)\",\"nullable\":true,\"metadata\":{}}]}";
 
-        var schema = (StructType)DataType.FromJson(json);
+        var schema = (StructType)SchemaJson.FromJson(json);
 
         Assert.Equal(2, schema.Count);
         Assert.Equal(LongType.Instance, schema["id"].DataType);
@@ -170,7 +170,7 @@ public class SchemaJsonRoundTripTests
         const string json =
             "{\"type\":\"struct\",\"fields\":[{\"name\":\"a\",\"type\":\"integer\",\"nullable\":true}]}";
 
-        var schema = (StructType)DataType.FromJson(json);
+        var schema = (StructType)SchemaJson.FromJson(json);
 
         Assert.True(schema["a"].Metadata.IsEmpty);
     }
@@ -178,20 +178,20 @@ public class SchemaJsonRoundTripTests
     [Fact]
     public void FromJson_RejectsMalformedJson()
     {
-        Assert.Throws<SchemaValidationException>(() => DataType.FromJson("{ not json"));
+        Assert.Throws<SchemaValidationException>(() => SchemaJson.FromJson("{ not json"));
     }
 
     [Fact]
     public void FromJson_RejectsUnknownTypeName()
     {
-        Assert.Throws<SchemaValidationException>(() => DataType.FromJson("\"int128\""));
+        Assert.Throws<SchemaValidationException>(() => SchemaJson.FromJson("\"int128\""));
     }
 
     [Fact]
     public void FromJson_RejectsMissingRequiredProperty()
     {
         Assert.Throws<SchemaValidationException>(() =>
-            DataType.FromJson("{\"type\":\"array\",\"containsNull\":true}"));
+            SchemaJson.FromJson("{\"type\":\"array\",\"containsNull\":true}"));
     }
 
     [Fact]
@@ -202,14 +202,14 @@ public class SchemaJsonRoundTripTests
             "{\"name\":\"a\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{\"weight\":3}}]}";
 
         SchemaValidationException ex =
-            Assert.Throws<SchemaValidationException>(() => DataType.FromJson(json));
+            Assert.Throws<SchemaValidationException>(() => SchemaJson.FromJson(json));
         Assert.Contains("metadata", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
     public void FromJson_PropagatesValidationErrors_ForInvalidDecimal()
     {
-        Assert.Throws<SchemaValidationException>(() => DataType.FromJson("\"decimal(50,0)\""));
+        Assert.Throws<SchemaValidationException>(() => SchemaJson.FromJson("\"decimal(50,0)\""));
     }
 
     [Fact]
@@ -220,12 +220,18 @@ public class SchemaJsonRoundTripTests
             "{\"name\":\"a\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}," +
             "{\"name\":\"a\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}";
 
-        Assert.Throws<SchemaValidationException>(() => DataType.FromJson(json));
+        Assert.Throws<SchemaValidationException>(() => SchemaJson.FromJson(json));
     }
 
     [Fact]
     public void FromJson_RejectsNullArgument()
     {
-        Assert.Throws<ArgumentNullException>(() => DataType.FromJson(null!));
+        Assert.Throws<ArgumentNullException>(() => SchemaJson.FromJson(null!));
+    }
+
+    [Fact]
+    public void ToJson_RejectsNullArgument()
+    {
+        Assert.Throws<ArgumentNullException>(() => SchemaJson.ToJson(null!));
     }
 }

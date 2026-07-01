@@ -200,13 +200,6 @@ public sealed class StructType : DataType, IReadOnlyList<StructField>
     }
 
     /// <inheritdoc/>
-    public override bool TryGetPhysicalLayout(out PhysicalLayout layout)
-    {
-        layout = PhysicalLayout.Nested;
-        return true;
-    }
-
-    /// <inheritdoc/>
     public IEnumerator<StructField> GetEnumerator() =>
         ((IEnumerable<StructField>)_fields).GetEnumerator();
 

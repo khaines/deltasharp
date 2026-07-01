@@ -18,8 +18,15 @@ namespace DeltaSharp.Engine.Types;
 /// </remarks>
 internal static class SchemaJson
 {
-    public static string Serialize(DataType type)
+    /// <summary>
+    /// Serializes a <see cref="DataType"/> tree to the Spark-compatible schema JSON (the same
+    /// format Delta stores in its log), round-trippable with <see cref="FromJson(string)"/>
+    /// (STORY-02.5.1 AC3).
+    /// </summary>
+    /// <exception cref="ArgumentNullException"><paramref name="type"/> is null.</exception>
+    public static string ToJson(DataType type)
     {
+        ArgumentNullException.ThrowIfNull(type);
         var buffer = new ArrayBufferWriter<byte>();
         using (var writer = new Utf8JsonWriter(buffer))
         {
@@ -29,8 +36,12 @@ internal static class SchemaJson
         return Encoding.UTF8.GetString(buffer.WrittenSpan);
     }
 
-    public static DataType Deserialize(string json)
+    /// <summary>Parses a type tree from Spark-compatible schema JSON produced by <see cref="ToJson(DataType)"/>.</summary>
+    /// <exception cref="ArgumentNullException"><paramref name="json"/> is null.</exception>
+    /// <exception cref="SchemaValidationException">The JSON is malformed or describes an invalid/unknown type.</exception>
+    public static DataType FromJson(string json)
     {
+        ArgumentNullException.ThrowIfNull(json);
         try
         {
             using JsonDocument document = JsonDocument.Parse(json);

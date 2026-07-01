@@ -38,15 +38,15 @@ public class ReviewRegressionTests
     [Fact]
     public void FromJson_AcceptsLegacyNullSpelling_ForNullType()
     {
-        Assert.Equal(NullType.Instance, DataType.FromJson("\"null\""));
-        Assert.Equal(NullType.Instance, DataType.FromJson("\"void\""));
+        Assert.Equal(NullType.Instance, SchemaJson.FromJson("\"null\""));
+        Assert.Equal(NullType.Instance, SchemaJson.FromJson("\"void\""));
     }
 
     [Fact]
     public void FromJson_RejectsDecimalWithTrailingGarbage()
     {
-        Assert.Throws<SchemaValidationException>(() => DataType.FromJson("\"decimal(10,2) junk\""));
-        Assert.Throws<SchemaValidationException>(() => DataType.FromJson("\"decimal(10,2)x\""));
+        Assert.Throws<SchemaValidationException>(() => SchemaJson.FromJson("\"decimal(10,2) junk\""));
+        Assert.Throws<SchemaValidationException>(() => SchemaJson.FromJson("\"decimal(10,2)x\""));
     }
 
     [Fact]
@@ -55,7 +55,7 @@ public class ReviewRegressionTests
         const string json = "{\"type\":\"struct\",\"fields\":[42]}";
 
         // Must be a SchemaValidationException, not a leaked InvalidOperationException.
-        Assert.Throws<SchemaValidationException>(() => DataType.FromJson(json));
+        Assert.Throws<SchemaValidationException>(() => SchemaJson.FromJson(json));
     }
 
     [Fact]
@@ -81,7 +81,7 @@ public class ReviewRegressionTests
         Assert.False(defaultLayout.IsFixedWidth);
 
         // The unsupported out-value is the None sentinel, never a plausible FixedWidth(0).
-        Assert.False(NullType.Instance.TryGetPhysicalLayout(out PhysicalLayout unsupported));
+        Assert.False(PhysicalLayoutResolver.TryResolve(NullType.Instance, out PhysicalLayout unsupported));
         Assert.Equal(PhysicalLayoutKind.None, unsupported.Kind);
     }
 }

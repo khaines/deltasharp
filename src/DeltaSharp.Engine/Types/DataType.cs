@@ -60,48 +60,4 @@ public abstract class DataType : IEquatable<DataType>
 
     /// <summary>Structural value inequality.</summary>
     public static bool operator !=(DataType? left, DataType? right) => !Equals(left, right);
-
-    /// <summary>
-    /// Resolves the physical layout a vector or binary-row builder should use for this type
-    /// (STORY-02.5.1 AC4).
-    /// </summary>
-    /// <param name="layout">The resolved layout when the type is physically representable.</param>
-    /// <returns>
-    /// <see langword="true"/> and a supported <paramref name="layout"/> for representable
-    /// types; <see langword="false"/> for types with no physical representation
-    /// (for example <see cref="NullType"/>).
-    /// </returns>
-    public abstract bool TryGetPhysicalLayout(out PhysicalLayout layout);
-
-    /// <summary>
-    /// Resolves the physical layout for this type, throwing when the type has no supported
-    /// physical representation. Prefer <see cref="TryGetPhysicalLayout"/> to avoid exceptions
-    /// on hot paths.
-    /// </summary>
-    /// <exception cref="UnsupportedTypeException">The type has no physical representation.</exception>
-    public PhysicalLayout GetPhysicalLayout()
-    {
-        if (TryGetPhysicalLayout(out PhysicalLayout layout))
-        {
-            return layout;
-        }
-
-        throw new UnsupportedTypeException(
-            $"Type '{SimpleString}' has no supported physical layout.");
-    }
-
-    /// <summary>
-    /// Serializes this type tree to the Spark-compatible schema JSON (the same format Delta
-    /// stores in its log), round-trippable with <see cref="FromJson(string)"/>
-    /// (STORY-02.5.1 AC3).
-    /// </summary>
-    public string ToJson() => SchemaJson.Serialize(this);
-
-    /// <summary>Parses a type tree from Spark-compatible schema JSON produced by <see cref="ToJson"/>.</summary>
-    /// <exception cref="SchemaValidationException">The JSON is malformed or describes an invalid/unknown type.</exception>
-    public static DataType FromJson(string json)
-    {
-        ArgumentNullException.ThrowIfNull(json);
-        return SchemaJson.Deserialize(json);
-    }
 }
