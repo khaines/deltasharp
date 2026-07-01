@@ -175,7 +175,7 @@ For every finding, apply the dismissal rules in priority order to classify it as
 
 **Stop the loop** if ANY of these are true:
 
-1. **Gate PASS achieved** (per `review-pr/rating-rubric.md` → Rigor battery & the PASS gate) — every voting seat (4 lenses + each specialist) at **5/5** (the PASS gate requires 5/5 unconditionally — `target_rating` only relaxes the separate sub-target *termination* path, never this gate) **with a complete Approve attestation**, **zero** actionable findings, **zero open C1/C2/C4/C5/C6/C7 items**, and the red-team **`NO-MISS-CERTIFIED`** (decorrelated, C7-backed). A red-team `MISS-FOUND` never satisfies this — its findings are actionable; continue. Apply the **anti-impasse rule**: a seat at sub-5/5 with no `file:line` finding is re-prompted once, then is an impasse — never terminate on a reinterpreted "rating with no findings". Proceed to Phase 6.
+1. **Gate PASS achieved** (per `review-pr/rating-rubric.md` → Rigor battery & the PASS gate) — every voting seat (4 lenses + each specialist) at **5/5** (the PASS gate requires 5/5 unconditionally — `target_rating` only relaxes the separate sub-target *termination* path, never this gate) **with a complete Approve attestation**, **zero** actionable findings, **zero open C1/C2/C4/C5/C6/C7 items**, **every deferred finding tracked by an orchestrator-verified GitHub issue** (`gh issue view <n>` → open, scope matches; see `review-pr/rating-rubric.md` → PASS gate), and the red-team **`NO-MISS-CERTIFIED`** (decorrelated, C7-backed). A red-team `MISS-FOUND` never satisfies this — its findings are actionable; continue. Apply the **anti-impasse rule**: a seat at sub-5/5 with no `file:line` finding is re-prompted once, then is an impasse — never terminate on a reinterpreted "rating with no findings". Proceed to Phase 6.
 2. **Max rounds reached** — `current_round >= max_rounds`. Proceed to Phase 6 with a note that the limit was hit.
 3. **No progress** — the count of actionable findings has not decreased from the previous round AND no findings were fixed. Proceed to Phase 6.
 
@@ -333,7 +333,13 @@ Compile the full round-by-round progression:
 {For each dismissed finding and rationale}
 
 ### Findings Deferred
-{For each deferred finding with tracking issue}
+{For each deferred finding: description, why it cannot be fixed in this PR, and the **orchestrator-
+verified** GitHub tracking issue — `#<n>`, confirmed **open** and scope-matching via `gh issue view`.
+A deferral with no filed+verified issue is not allowed: file it, or reclassify as actionable and fix.}
+
+### Findings — Inherent / Won't-Fix
+{For each finding adjudicated as inherent to the approach (not separately tracked): description + the
+durable in-code/in-PR rationale that records the decision. Not a substitute for deferring fixable work.}
 
 ### Validation
 - Restore/build/format/test evidence for .NET changes.
@@ -431,9 +437,10 @@ commit per-run scratch logs to the repo — that is itself a C6 hygiene miss.)
 2. **PASS gate met** (`review-pr/rating-rubric.md`): every voting seat 5/5, zero actionable findings, zero open C1/C2/C4/C5/C6/C7 items, and a **decorrelated red-team `NO-MISS-CERTIFIED`** that the orchestrator **independently re-verified** (re-ran a sampled C7 repro). A loop that merely *stopped* below 5/5 is **never** merge-ready — **there is no exception, allowance, or human waiver for a sub-5/5 seat**; fix the finding and re-score to 5/5. `target_rating` governs only the termination path, never the merge gate.
 3. Triage verification completed for any round with 5+ dismissals or any dismissed findings in protected domains.
 4. Dismissed findings audited and real items tracked as backlog issues.
-5. Full progression report posted as a PR comment with council composition audit and verified URL.
-6. Restore/build/format/test validation green for .NET changes.
-7. CI green on all required checks when remote checks exist.
+5. **Every deferred finding has a GitHub tracking issue the orchestrator verified exists** (`gh issue view <n>` → open, scope matches the finding), with its number recorded in the report. **No un-filed deferral may PASS**; any `inherent/won't-fix` residual instead carries a durable in-code/in-PR rationale.
+6. Full progression report posted as a PR comment with council composition audit and verified URL.
+7. Restore/build/format/test validation green for .NET changes.
+8. CI green on all required checks when remote checks exist.
 
 ### What is NOT acceptable
 

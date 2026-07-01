@@ -291,6 +291,15 @@ and the red-team verdict.
 - the certifying red-team ran on a **decorrelated** frontier family. A **same-family (provisional)
   certification does NOT satisfy PASS for protected-domain changes** — it blocks termination pending
   a decorrelated re-run or a documented human waiver recorded in the composition audit.
+- **every finding not fixed in-PR is dispositioned** as exactly one of {fixed, dismissed-with-
+  rationale, deferred, inherent/won't-fix-documented}, and **every _deferred_ finding has a GitHub
+  tracking issue the orchestrator verified exists** — `gh issue view <n>` returns an **open** issue
+  whose scope matches the finding — with its number recorded in the report. A deferral whose issue was
+  never filed, was closed, or cannot be found is an **un-tracked deferral** and **blocks PASS**: file
+  it (or reclassify the finding as actionable and fix it) before terminating. An `inherent/won't-fix`
+  disposition requires a **durable in-code or in-PR rationale**, never a bare assertion. This is a
+  self-settable-signal (C2) discipline applied to process bookkeeping — "we'll track it later" is not
+  tracked.
 
 **Green CI is necessary but not sufficient** — C1/C2/C7 routinely catch defects that pass green
 CI (vacuous tests, validator↔consumer mismatches, migration notes the code contradicts).

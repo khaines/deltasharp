@@ -475,6 +475,17 @@ Use GitHub tools to submit the review:
 
 Before posting, check for existing review comments from previous runs of this skill. Do not post duplicate comments on the same finding at the same file and line.
 
+### 9.4 Track Deferred Findings as Issues (gate-blocking)
+
+Any valid finding that is **not fixed in this PR** must be dispositioned as exactly one of: **fixed**,
+**dismissed-with-rationale**, **deferred**, or **inherent/won't-fix-documented** (see
+`review-fix-loop/dismissal-rules.md` → Deferral Policy). For **every deferred finding**, file a GitHub
+tracking issue and **verify it exists** (`gh issue view <n>` returns an **open** issue whose scope
+matches the finding), then record its number in the report. An `inherent/won't-fix` disposition
+carries a durable in-code/in-PR rationale instead of an issue. **A deferral with no filed+verified
+tracking issue blocks PASS** (`rating-rubric.md` → PASS gate) — file it, or reclassify as actionable
+and fix it. This applies whenever a repository is available, including local-only reviews.
+
 ---
 
 ## Important Notes
@@ -488,4 +499,5 @@ Before posting, check for existing review comments from previous runs of this sk
 - **DeltaSharp canon is mandatory.** Reviews must enforce Spark parity, lazy/eager semantics, Catalyst-style planning, Delta/Parquet correctness, Kubernetes driver/executor/operator safety, object-store/PVC storage support, and .NET runtime correctness.
 - **Professional and constructive tone.** Findings should help the author improve; be specific and suggest concrete fixes.
 - **Design document conformance is mandatory for implementation PRs.** The design document is the source of truth.
+- **Every deferral is a filed, verified issue.** No finding is left "to track later": each unfixed finding is fixed, dismissed-with-rationale, deferred with an orchestrator-verified GitHub tracking issue (`gh issue view <n>` → open), or dispositioned inherent/won't-fix with a durable rationale. An un-filed deferral blocks PASS (`rating-rubric.md` → PASS gate).
 - **No duplicate comments.** Never post duplicate comments on the same finding.

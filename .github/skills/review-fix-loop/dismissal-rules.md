@@ -167,8 +167,18 @@ A finding may ONLY be deferred if ALL of these conditions are true:
 Every deferred finding MUST include:
 
 - A specific explanation of WHY it cannot be fixed in this PR.
-- A **GitHub issue number** tracking the follow-up — mandatory, not optional.
+- A **GitHub issue number** tracking the follow-up — mandatory, not optional, and **filed before the
+  gate can PASS** (not "to be filed later").
+- **Orchestrator verification** that the issue actually exists and is open, whose scope matches the
+  finding — confirmed with `gh issue view <n>` and its number recorded in the progression report. An
+  un-filed, closed, or unfindable tracking issue makes the deferral **un-tracked**, which **blocks
+  PASS** (reclassify as actionable and fix, or file the issue).
 - An assessment of risk: what happens if this is never fixed?
+
+A finding that is genuinely **inherent to the approach** (cannot be fixed at all, e.g. a limitation
+of static analysis covered by a stronger primary guarantee) is not a deferral: disposition it as
+**inherent/won't-fix** with a durable in-code or in-PR rationale instead of a tracking issue. It must
+still appear in the report so the decision is auditable.
 
 ---
 
