@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Shared, packable logical-contract library (ADR-0016). Multi-targets net8.0;net10.0
+    (ADR-0014) so it can be referenced by BOTH the public net8.0;net10.0 DeltaSharp.Core
+    surface AND the net10.0-only DeltaSharp.Engine, without inverting their sibling
+    independence (Core ⟂ Engine preserved). Packable: it ships transitively via
+    DeltaSharp.Core, so it MUST be IsPackable=true (a packable library may not reference a
+    non-packable assembly). Namespace root DeltaSharp; the logical type model lands under
+    DeltaSharp.Types (ADR-0008), mirroring Spark's org.apache.spark.sql.types.
+
+    STORY-04.T.S1a scaffolds this assembly EMPTY of type-model code — only an internal
+    marker so it compiles and its PublicAPI baseline is trivially empty. The logical types
+    (DataType hierarchy, DataTypes factory, TypeCoercion, AnsiMode, exceptions, internal
+    StableHash) MOVE here atomically in S1b+S2. Must remain trim/AOT-annotation-clean.
+  -->
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <RootNamespace>DeltaSharp</RootNamespace>
+    <AssemblyName>DeltaSharp.Abstractions</AssemblyName>
+    <IsPackable>true</IsPackable>
+    <PackageId>DeltaSharp.Abstractions</PackageId>
+    <Description>Shared logical contracts for DeltaSharp, a .NET-native reimplementation of Apache Spark — the packable Core↔Engine seam that will hold the ADR-0008 logical type model. M1 skeleton — no type-model code yet.</Description>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- ADR-0014: keep the public surface trim/AOT-annotation-clean. Enable the
+         trim/AOT/single-file Roslyn analyzers as a standing build gate on both TFMs.
+         We enable the analyzers rather than IsAotCompatible/IsTrimmable so the
+         SDK-version-tied Microsoft.NET.ILLink.Tasks package is not pulled into the
+         committed lock file; actual AOT publish verification is STORY-01.4.1. This
+         matters because the shipped logical model flows into the Executor NativeAOT
+         image via DeltaSharp.Engine. -->
+    <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
+    <EnableAotAnalyzer>true</EnableAotAnalyzer>
+    <EnableSingleFileAnalyzer>true</EnableSingleFileAnalyzer>
+  </PropertyGroup>
+
+</Project>

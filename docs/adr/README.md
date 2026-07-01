@@ -36,6 +36,7 @@ summary and an ADR disagree, the ADR wins.
 | [0013](0013-memory-model.md) | Memory model for in-memory batches | Accepted |
 | [0014](0014-target-framework-aot.md) | Target framework and AOT posture | Accepted |
 | [0015](0015-open-source-positioning.md) | Open-source positioning and community governance | Accepted |
+| [0016](0016-shared-logical-type-model-abstractions.md) | Shared logical type-model assembly (DeltaSharp.Abstractions) | Accepted |
 
 ## Backlog (Proposed ADRs)
 

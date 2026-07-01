@@ -54,8 +54,8 @@
     errors. See docs/engineering/design/api-governance.md, ADR-0001, ADR-0014.
   -->
   <PropertyGroup>
-    <!-- A "production assembly" lives under src/ (today: DeltaSharp.Core, DeltaSharp.Engine,
-         DeltaSharp.Executor).
+    <!-- A "production assembly" lives under src/ (today: DeltaSharp.Core, DeltaSharp.Abstractions,
+         DeltaSharp.Engine, DeltaSharp.Executor).
          Gated on the project path, which is known when this file is imported. Both paths are
          normalized to a trailing directory separator and the comparison is anchored at the
          repo root ($(MSBuildThisFileDirectory)src/), so neither a parent directory named
@@ -67,12 +67,13 @@
     <DeltaSharpIsProductionAssembly>false</DeltaSharpIsProductionAssembly>
     <DeltaSharpIsProductionAssembly Condition="$(_DeltaSharpProjectDir.StartsWith('$(_DeltaSharpSrcDir)'))">true</DeltaSharpIsProductionAssembly>
 
-    <!-- Public-API baselines apply to packable public libraries (today: DeltaSharp.Core).
-         IsPackable is set in the .csproj body, which MSBuild evaluates AFTER this import,
-         so it is not readable here; gating the packable library by name is the
-         deterministic choice. Add new packable public libraries to this condition. -->
+    <!-- Public-API baselines apply to packable public libraries (today: DeltaSharp.Core,
+         DeltaSharp.Abstractions). IsPackable is set in the .csproj body, which MSBuild
+         evaluates AFTER this import, so it is not readable here; gating the packable
+         libraries by name is the deterministic choice. Add new packable public libraries
+         to this condition. -->
     <DeltaSharpTracksPublicApi>false</DeltaSharpTracksPublicApi>
-    <DeltaSharpTracksPublicApi Condition="'$(MSBuildProjectName)' == 'DeltaSharp.Core'">true</DeltaSharpTracksPublicApi>
+    <DeltaSharpTracksPublicApi Condition="'$(MSBuildProjectName)' == 'DeltaSharp.Core' Or '$(MSBuildProjectName)' == 'DeltaSharp.Abstractions'">true</DeltaSharpTracksPublicApi>
   </PropertyGroup>
 
   <!-- BannedApiAnalyzers on production assemblies (Core, Engine, Executor). The categorized
