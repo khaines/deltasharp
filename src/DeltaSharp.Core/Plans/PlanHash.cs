@@ -11,7 +11,7 @@ namespace DeltaSharp.Plans;
 /// These are 32-bit hash codes for hash-based collections. Like any fixed-width hash they admit
 /// collisions between distinct values; that is correctness-preserving because <c>Equals</c> —
 /// not the hash — is authoritative for equality. This mirrors the Engine's
-/// <c>DeltaSharp.Engine.Types.StableHash</c> rationale, re-homed as <see langword="internal"/>
+/// <c>DeltaSharp.Types.StableHash</c> rationale, re-homed as <see langword="internal"/>
 /// to <c>DeltaSharp.Core</c> because Core cannot reference the <c>net10.0</c>-only Engine.
 /// </remarks>
 internal static class PlanHash

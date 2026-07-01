@@ -14,9 +14,15 @@ is the foundation of EPIC-02: the columnar `ColumnVector`/`ColumnBatch` contract
 and the binary row format (STORY-02.4.1) both bind a column/field to a `DataType` and consume
 its **physical layout** to size buffers.
 
-It lives in the unshipped `DeltaSharp.Engine` assembly under `src/DeltaSharp.Engine/Types/`.
-`public` here is an **engine-internal** seam (the assembly is never packed and carries no
-PublicAPI baseline — see [api-governance.md](api-governance.md) and
+The **logical** type model — the `DataType` hierarchy, complex types, the `DataTypes` factory,
+`TypeCoercion`, the decimal type-rules, `AnsiMode`, the exceptions, and the internal
+`StableHash` — now lives in the shipped, packable `DeltaSharp.Abstractions` assembly under the
+`DeltaSharp.Types` namespace (moved out of Engine via the ADR-0016 S1b+S2 migration). The
+**physical / storage** helpers — `PhysicalLayout`, `PhysicalLayoutResolver`, `DecimalValue`,
+`TemporalValues`, and `SchemaJson` — stay in the unshipped `DeltaSharp.Engine` assembly under
+`src/DeltaSharp.Engine/Types/` (same `DeltaSharp.Types` namespace). `public` on that Engine
+slice is an **engine-internal** seam (the assembly is never packed and carries no PublicAPI
+baseline — see [api-governance.md](api-governance.md) and
 [testing-conventions.md](testing-conventions.md)); the public `df.schema` surface is a later
 EPIC-04 concern and is intentionally **not** exposed from `DeltaSharp.Core` here.
 

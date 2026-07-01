@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using DeltaSharp.Engine.Columnar;
-using DeltaSharp.Engine.Types;
+using DeltaSharp.Types;
 
 namespace DeltaSharp.Engine.Execution;
 

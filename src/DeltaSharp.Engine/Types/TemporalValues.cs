@@ -1,4 +1,4 @@
-namespace DeltaSharp.Engine.Types;
+namespace DeltaSharp.Types;
 
 /// <summary>
 /// v1 date/timestamp boundary, cast, and comparison helpers (STORY-02.5.2 AC3). v1 fixes two

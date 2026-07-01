@@ -2,7 +2,7 @@ using System.Buffers.Binary;
 using System.Numerics;
 using System.Text;
 using DeltaSharp.Engine.Memory;
-using DeltaSharp.Engine.Types;
+using DeltaSharp.Types;
 
 namespace DeltaSharp.Engine.RowFormat;
 

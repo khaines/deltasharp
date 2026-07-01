@@ -1,4 +1,4 @@
-namespace DeltaSharp.Engine.Types;
+namespace DeltaSharp.Types;
 
 /// <summary>
 /// Thrown when a schema or type definition is invalid — for example a struct with duplicate
@@ -28,7 +28,7 @@ public sealed class SchemaValidationException : Exception
 /// <summary>
 /// Thrown when a logical type has no supported physical representation for a builder that
 /// requires one (STORY-02.5.1 AC4) — for example <see cref="NullType"/>. Prefer
-/// <see cref="PhysicalLayoutResolver.TryResolve"/> to branch without exceptions on the hot path.
+/// <c>PhysicalLayoutResolver.TryResolve</c> to branch without exceptions on the hot path.
 /// </summary>
 public sealed class UnsupportedTypeException : Exception
 {

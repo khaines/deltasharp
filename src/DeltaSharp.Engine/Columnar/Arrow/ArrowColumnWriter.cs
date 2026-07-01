@@ -1,7 +1,7 @@
 using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using Apache.Arrow;
-using DeltaSharp.Engine.Types;
+using DeltaSharp.Types;
 using ArrowTypes = Apache.Arrow.Types;
 
 namespace DeltaSharp.Engine.Columnar.Arrow;

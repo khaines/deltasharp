@@ -107,10 +107,14 @@
           "xunit.extensibility.core": "[2.9.3]"
         }
       },
+      "deltasharp.abstractions": {
+        "type": "Project"
+      },
       "deltasharp.engine": {
         "type": "Project",
         "dependencies": {
-          "Apache.Arrow": "[23.0.0, )"
+          "Apache.Arrow": "[23.0.0, )",
+          "DeltaSharp.Abstractions": "[0.1.0, )"
         }
       }
     }

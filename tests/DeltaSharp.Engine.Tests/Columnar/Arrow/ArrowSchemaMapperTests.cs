@@ -1,6 +1,6 @@
 using Apache.Arrow;
 using DeltaSharp.Engine.Columnar.Arrow;
-using DeltaSharp.Engine.Types;
+using DeltaSharp.Types;
 using Xunit;
 using ArrowDate32Type = Apache.Arrow.Types.Date32Type;
 using ArrowDate64Type = Apache.Arrow.Types.Date64Type;

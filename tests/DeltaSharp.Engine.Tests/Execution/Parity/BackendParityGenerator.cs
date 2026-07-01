@@ -1,6 +1,6 @@
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Engine.Execution;
-using DeltaSharp.Engine.Types;
+using DeltaSharp.Types;
 
 namespace DeltaSharp.Engine.Tests.Execution.Parity;
 
