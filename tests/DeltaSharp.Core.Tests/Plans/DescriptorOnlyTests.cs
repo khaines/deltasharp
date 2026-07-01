@@ -59,21 +59,122 @@ public sealed class DescriptorOnlyTests
                     _ => typeof(void),
                 };
 
-                Assert.False(
-                    typeof(Stream).IsAssignableFrom(memberType)
-                    || typeof(TextReader).IsAssignableFrom(memberType)
-                    || typeof(TextWriter).IsAssignableFrom(memberType)
-                    || typeof(IDisposable).IsAssignableFrom(memberType),
-                    $"{type.Name}.{member.Name} is a stream/handle/disposable type "
-                    + $"({memberType.Name}); plan nodes must hold logical descriptors only — "
-                    + "even in a private field.");
-
-                Assert.False(
-                    memberType.Namespace?.StartsWith("DeltaSharp.Engine", StringComparison.Ordinal) == true,
-                    $"{type.Name}.{member.Name} references the engine type {memberType.FullName}; "
-                    + "the logical plan IR must be Engine-free.");
+                Type? banned = FindBannedType(memberType);
+                Assert.True(
+                    banned is null,
+                    $"{type.Name}.{member.Name} (declared type {memberType.Name}) exposes the "
+                    + $"banned type {banned?.FullName} — reachable through arrays, generic type "
+                    + "arguments, tuple elements, or nullable. Plan nodes must hold logical "
+                    + "descriptors only (no stream/reader/writer/disposable/engine handle), even "
+                    + "when the handle is nested inside a generic or tuple, and even in a private "
+                    + "field.");
             }
         }
+    }
+
+    /// <summary>
+    /// Recursively unwraps <paramref name="type"/> — arrays (element type), all generic type
+    /// arguments (which naturally covers <c>List&lt;T&gt;</c>, <c>Lazy&lt;T&gt;</c>,
+    /// <c>Func&lt;T&gt;</c>, <c>Dictionary&lt;K,V&gt;</c>, <c>Nullable&lt;T&gt;</c>, and
+    /// <c>ValueTuple</c>/<c>Tuple</c> elements), and by-ref/pointer wrappers — and returns the
+    /// first contained type that is a <see cref="Stream"/>, <see cref="TextReader"/>,
+    /// <see cref="TextWriter"/>, <see cref="IDisposable"/>, or an engine
+    /// (<c>DeltaSharp.Engine</c>) type, or <see langword="null"/> if none. Only the banned
+    /// <b>leaf</b> types are flagged, so benign generics such as
+    /// <c>IReadOnlyList&lt;Expression&gt;</c> or <c>ReadOnlyCollection&lt;string&gt;</c> pass
+    /// (their arguments recurse to non-banned leaves).
+    /// </summary>
+    private static Type? FindBannedType(Type type) => FindBannedType(type, new HashSet<Type>());
+
+    private static Type? FindBannedType(Type type, HashSet<Type> visited)
+    {
+        if (!visited.Add(type))
+        {
+            return null;
+        }
+
+        if (IsBannedLeaf(type))
+        {
+            return type;
+        }
+
+        if (type.HasElementType)
+        {
+            Type? element = type.GetElementType();
+            if (element is not null && FindBannedType(element, visited) is Type fromElement)
+            {
+                return fromElement;
+            }
+        }
+
+        if (type.IsGenericType)
+        {
+            foreach (Type argument in type.GetGenericArguments())
+            {
+                if (FindBannedType(argument, visited) is Type fromArgument)
+                {
+                    return fromArgument;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static bool IsBannedLeaf(Type type) =>
+        typeof(Stream).IsAssignableFrom(type)
+        || typeof(TextReader).IsAssignableFrom(type)
+        || typeof(TextWriter).IsAssignableFrom(type)
+        || typeof(IDisposable).IsAssignableFrom(type)
+        || type.Namespace?.StartsWith("DeltaSharp.Engine", StringComparison.Ordinal) == true;
+
+    /// <summary>A test-only fixture whose fields hide stream handles inside generics/tuples to
+    /// prove the recursive scan (unlike a shallow <c>IsAssignableFrom</c> check) catches them.</summary>
+#pragma warning disable CS0649 // Fields exist only to be inspected reflectively; never assigned.
+    private sealed class HiddenHandleFixture
+    {
+        public List<Stream>? ListOfStream;
+        public Lazy<Stream>? LazyStream;
+        public Func<Stream>? StreamFactory;
+        public Stream[]? StreamArray;
+        public (Stream Handle, int Id) TupleWithStream;
+        public Dictionary<string, Stream>? MapToStream;
+    }
+#pragma warning restore CS0649
+
+    [Fact]
+    public void RecursiveScanCatchesHandlesNestedInGenericsArraysAndTuples()
+    {
+        // Non-vacuity: a shallow typeof(Stream).IsAssignableFrom(memberType) check would MISS every
+        // one of these — the recursive scan must flag them all.
+        Assert.NotNull(FindBannedType(typeof(List<Stream>)));
+        Assert.NotNull(FindBannedType(typeof(Lazy<Stream>)));
+        Assert.NotNull(FindBannedType(typeof(Func<Stream>)));
+        Assert.NotNull(FindBannedType(typeof(Stream[])));
+        Assert.NotNull(FindBannedType(typeof((Stream, int))));
+        Assert.NotNull(FindBannedType(typeof(Dictionary<string, Stream>)));
+
+        // And the member-level path (mirroring the production scan) catches a hidden field too.
+        const BindingFlags fieldFlags =
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly;
+        foreach (FieldInfo field in typeof(HiddenHandleFixture).GetFields(fieldFlags))
+        {
+            Assert.True(
+                FindBannedType(field.FieldType) is not null,
+                $"The recursive scan failed to catch the hidden handle in "
+                + $"{nameof(HiddenHandleFixture)}.{field.Name} ({field.FieldType.Name}).");
+        }
+    }
+
+    [Fact]
+    public void RecursiveScanDoesNotFlagBenignGenericsUsedByTheRealIr()
+    {
+        Assert.Null(FindBannedType(typeof(IReadOnlyList<Expression>)));
+        Assert.Null(FindBannedType(typeof(IReadOnlyList<string>)));
+        Assert.Null(FindBannedType(typeof(IReadOnlyDictionary<string, string>)));
+        Assert.Null(FindBannedType(typeof(System.Collections.ObjectModel.ReadOnlyCollection<string>)));
+        Assert.Null(FindBannedType(typeof((string, int))));
+        Assert.Null(FindBannedType(typeof(int?)));
     }
 
     /// <summary>

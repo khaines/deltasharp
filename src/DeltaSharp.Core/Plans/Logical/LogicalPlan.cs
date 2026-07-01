@@ -43,8 +43,24 @@ internal abstract class LogicalPlan : TreeNode<LogicalPlan>
         }
     }
 
+    /// <summary>
+    /// Whether this node's <b>own</b> (non-child, non-expression) state is resolved. Defaults to
+    /// <see langword="true"/> so the generic "children + directly-held expressions" check in
+    /// <see cref="Resolved"/> fully governs resolution. A node overrides this to gate resolution
+    /// on state the generic check cannot see — most importantly a <see cref="Join"/> that is still
+    /// an unresolved using/natural join, whose shared columns live outside the expression
+    /// substrate (its <see cref="Expressions"/> are empty) and so must never be reported resolved
+    /// until the analyzer desugars them into a <see cref="Join.Condition"/>.
+    /// </summary>
+    protected virtual bool IsNodeResolved => true;
+
     private bool ComputeResolved()
     {
+        if (!IsNodeResolved)
+        {
+            return false;
+        }
+
         foreach (LogicalPlan child in Children)
         {
             if (!child.Resolved)

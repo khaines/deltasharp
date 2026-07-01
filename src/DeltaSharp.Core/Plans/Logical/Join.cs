@@ -93,6 +93,19 @@ internal sealed class Join : LogicalPlan
     /// <inheritdoc/>
     public override IReadOnlyList<Expression> Expressions => _expressions;
 
+    /// <summary>
+    /// A using/natural join is <b>never</b> resolved: its shared columns are recorded outside the
+    /// expression substrate (<see cref="Expressions"/> is empty), so the base "children +
+    /// expressions resolved" check would otherwise report it resolved the moment both sides
+    /// resolve — before the analyzer has desugared the shared columns into an equi-<see
+    /// cref="Condition"/>. Reporting it resolved prematurely would let the fixed-point analyzer
+    /// skip the desugaring rule and emit a physical join with no condition. It becomes resolvable
+    /// only once desugared into a condition-join (<see cref="UsingColumns"/> <see langword="null"/>,
+    /// <see cref="IsNatural"/> <see langword="false"/>), at which point the base check governs via
+    /// its resolved <see cref="Condition"/>.
+    /// </summary>
+    protected override bool IsNodeResolved => !(IsNatural || UsingColumns is { Count: > 0 });
+
     /// <inheritdoc/>
     public override string NodeName => "Join";
 

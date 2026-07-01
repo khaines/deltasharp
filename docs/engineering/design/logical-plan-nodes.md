@@ -270,7 +270,12 @@ internal abstract class LogicalPlan : TreeNode<LogicalPlan>
 {
     public abstract IReadOnlyList<Expression> Expressions;   // expressions held directly
     public virtual bool Resolved =>                           // memoized
-        Children.All(c => c.Resolved) && Expressions.All(e => e.Resolved);
+        IsNodeResolved                                        // node's own state (default true)
+        && Children.All(c => c.Resolved) && Expressions.All(e => e.Resolved);
+
+    // A node's own (non-child, non-expression) resolution gate. Defaults to true; Join overrides
+    // it to false while it is still an unresolved using/natural join (see §6.1).
+    protected virtual bool IsNodeResolved => true;
 
     // Expression-rewrite substrate (symmetric with the child-rewrite substrate on TreeNode<T>):
     public abstract LogicalPlan WithNewExpressions(IReadOnlyList<Expression> newExpressions);
@@ -307,7 +312,7 @@ one primitive instead of `switch`-ing on each node type and hand-rebuilding it.
 | **`Project`** | `IReadOnlyList<Expression> ProjectList`; `LogicalPlan Child` | `[Child]` | `ProjectList` | `select`/`withColumn` target. |
 | **`Filter`** | `Expression Condition`; `LogicalPlan Child` | `[Child]` | `[Condition]` | `filter`/`where`. |
 | **`Aggregate`** | `IReadOnlyList<Expression> GroupingExpressions`; `IReadOnlyList<Expression> AggregateExpressions`; `LogicalPlan Child` | `[Child]` | grouping ⧺ aggregate | `groupBy(...).agg(...)`. `WithNewExpressions` splits the combined list back at `GroupingExpressions.Count`. |
-| **`Join`** | `LogicalPlan Left`; `LogicalPlan Right`; `JoinType JoinType`; `Expression? Condition`; `IReadOnlyList<string>? UsingColumns`; `bool IsNatural` | `[Left, Right]` | `Condition` if present, else none | Records type + criteria + both child plans; reads neither side. The three criteria — `Condition`, `UsingColumns` (`df.join(other, Seq("id"))`), `IsNatural` — are **mutually exclusive**; the analyzer desugars using/natural into a resolved equi-`Condition` once both sides resolve. |
+| **`Join`** | `LogicalPlan Left`; `LogicalPlan Right`; `JoinType JoinType`; `Expression? Condition`; `IReadOnlyList<string>? UsingColumns`; `bool IsNatural` | `[Left, Right]` | `Condition` if present, else none | Records type + criteria + both child plans; reads neither side. The three criteria — `Condition`, `UsingColumns` (`df.join(other, Seq("id"))`), `IsNatural` — are **mutually exclusive**; the analyzer desugars using/natural into a resolved equi-`Condition` once both sides resolve. **A using/natural join is never `Resolved`** (it overrides `IsNodeResolved => !(IsNatural \|\| UsingColumns is { Count: > 0 })`): its shared columns live **outside** the expression substrate (`Expressions` is empty), so the generic "children + expressions resolved" check would otherwise flip it to `Resolved` the instant both sides resolve — letting the fixed-point analyzer skip the desugaring rule and emit a physical join with no condition. It becomes resolvable only once desugared into a condition-join (`Condition` set, `UsingColumns` null, `IsNatural` false). |
 | **`Sort`** | `IReadOnlyList<Expression> Order`; `bool Global`; `LogicalPlan Child` | `[Child]` | `Order` | `orderBy` (global) / `sortWithinPartitions` (local). `Order` elements are `SortOrder` expressions once #168 lands. |
 | **`Limit`** | `int Count` (≥ 0); `LogicalPlan Child` | `[Child]` | none | `limit(n)`. The count is a literal integer, not an expression. |
 | **`Distinct`** | `LogicalPlan Child` | `[Child]` | none | `distinct` (analyzer later rewrites to `Aggregate`, as in Spark). |
@@ -340,7 +345,7 @@ how AC3 is tested (§8).
 | **Nodes immutable after construction (AC1)** | Every concrete node is `sealed`; every field is a get-only auto-property set once in the constructor. Collection fields are defensively **copied** into arrays at construction and exposed only as `IReadOnlyList<>`/`IReadOnlyDictionary<>` (never the live array), exactly as `StructType` does. There is no setter, no mutating method, and no API that returns the backing array. |
 | **Transforms return new trees; original unchanged (AC2)** | `WithNewChildren` constructs a **new** node; `MapChildren` returns `this` only when nothing changed and otherwise builds a new spine, sharing untouched subtrees by reference. Nothing writes through an existing node. Tests snapshot the original (deep `Equals`) before a transform and assert it is byte-for-byte unchanged and that the new tree shares the untouched children by reference. |
 | **Construction does zero work (AC3)** | Nodes hold only logical descriptors and child references. There is no field of an Engine, reader, writer, stream, task, or scheduler type — the IR does not even reference `DeltaSharp.Engine` (§1) — so a constructor *cannot* perform I/O or start execution. |
-| **Unresolved stays unresolved before analysis (AC4)** | The unresolved markers hard-code `Resolved => false`; `LogicalPlan.Resolved`/`Expression.Resolved` are derived (all children + expressions resolved), so any plan containing an unresolved attribute/function/relation is itself unresolved, and the renderer prefixes it with `'`. No constructor performs name resolution. |
+| **Unresolved stays unresolved before analysis (AC4)** | The unresolved markers hard-code `Resolved => false`; `LogicalPlan.Resolved`/`Expression.Resolved` are derived (own `IsNodeResolved` gate + all children + expressions resolved), so any plan containing an unresolved attribute/function/relation is itself unresolved, and the renderer prefixes it with `'`. A **using/natural `Join`** additionally overrides `IsNodeResolved` to `false` because its shared columns sit outside the expression substrate: without the gate a using-join would report `Resolved` as soon as both sides resolve — *before* desugaring — and the fixed-point analyzer would skip the desugaring rule, yielding a physical join with no condition. It stays unresolved until the analyzer replaces it with a resolved `Condition`-join. No constructor performs name resolution. |
 
 The **lazy/eager** invariant (ADR-0001) is thus *structural*, not merely a convention: the
 public API can only ever build these nodes, and these nodes are inert. Actions (FEAT-04.6) are
