@@ -39,11 +39,4 @@ public sealed class ArrayType : DataType
         StableHash.Combine(
             StableHash.OfString("array"),
             StableHash.Combine(ElementType.GetHashCode(), ContainsNull ? 1 : 0));
-
-    /// <inheritdoc/>
-    public override bool TryGetPhysicalLayout(out PhysicalLayout layout)
-    {
-        layout = PhysicalLayout.Nested;
-        return true;
-    }
 }

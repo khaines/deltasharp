@@ -19,11 +19,11 @@ public class PhysicalLayoutTests
     {
         DataType type = InstanceOf(clrType);
 
-        Assert.True(type.TryGetPhysicalLayout(out PhysicalLayout layout));
+        Assert.True(PhysicalLayoutResolver.TryResolve(type, out PhysicalLayout layout));
         Assert.Equal(PhysicalLayoutKind.FixedWidth, layout.Kind);
         Assert.True(layout.IsFixedWidth);
         Assert.Equal(expectedBytes, layout.FixedWidthBytes);
-        Assert.Equal(layout, type.GetPhysicalLayout());
+        Assert.Equal(layout, PhysicalLayoutResolver.Resolve(type));
     }
 
     [Theory]
@@ -33,7 +33,7 @@ public class PhysicalLayoutTests
     {
         DataType type = InstanceOf(clrType);
 
-        Assert.True(type.TryGetPhysicalLayout(out PhysicalLayout layout));
+        Assert.True(PhysicalLayoutResolver.TryResolve(type, out PhysicalLayout layout));
         Assert.Equal(PhysicalLayoutKind.Variable, layout.Kind);
         Assert.False(layout.IsFixedWidth);
         Assert.Equal(0, layout.FixedWidthBytes);
@@ -48,7 +48,7 @@ public class PhysicalLayoutTests
     {
         var type = new DecimalType(precision, 0);
 
-        Assert.True(type.TryGetPhysicalLayout(out PhysicalLayout layout));
+        Assert.True(PhysicalLayoutResolver.TryResolve(type, out PhysicalLayout layout));
         Assert.Equal(PhysicalLayoutKind.FixedWidth, layout.Kind);
         Assert.Equal(expectedBytes, layout.FixedWidthBytes);
         Assert.Equal(precision <= DecimalType.MaxCompactPrecision, type.IsCompact);
@@ -66,7 +66,7 @@ public class PhysicalLayoutTests
 
         foreach (DataType type in nested)
         {
-            Assert.True(type.TryGetPhysicalLayout(out PhysicalLayout layout));
+            Assert.True(PhysicalLayoutResolver.TryResolve(type, out PhysicalLayout layout));
             Assert.Equal(PhysicalLayoutKind.Nested, layout.Kind);
         }
     }
@@ -74,11 +74,11 @@ public class PhysicalLayoutTests
     [Fact]
     public void NullType_HasNoPhysicalLayout()
     {
-        Assert.False(NullType.Instance.TryGetPhysicalLayout(out PhysicalLayout layout));
+        Assert.False(PhysicalLayoutResolver.TryResolve(NullType.Instance, out PhysicalLayout layout));
         Assert.Equal(default, layout);
 
         UnsupportedTypeException ex =
-            Assert.Throws<UnsupportedTypeException>(() => NullType.Instance.GetPhysicalLayout());
+            Assert.Throws<UnsupportedTypeException>(() => PhysicalLayoutResolver.Resolve(NullType.Instance));
         Assert.Contains("void", ex.Message);
     }
 

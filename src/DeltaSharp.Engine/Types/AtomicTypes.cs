@@ -40,13 +40,6 @@ public sealed class BooleanType : AtomicType
 
     /// <inheritdoc/>
     public override string SimpleString => "boolean";
-
-    /// <inheritdoc/>
-    public override bool TryGetPhysicalLayout(out PhysicalLayout layout)
-    {
-        layout = PhysicalLayout.FixedWidth(1);
-        return true;
-    }
 }
 
 /// <summary>The Spark <c>byte</c> (<c>tinyint</c>) type: signed 8-bit integer.</summary>
@@ -64,13 +57,6 @@ public sealed class ByteType : AtomicType
 
     /// <inheritdoc/>
     public override string SimpleString => "tinyint";
-
-    /// <inheritdoc/>
-    public override bool TryGetPhysicalLayout(out PhysicalLayout layout)
-    {
-        layout = PhysicalLayout.FixedWidth(1);
-        return true;
-    }
 }
 
 /// <summary>The Spark <c>short</c> (<c>smallint</c>) type: signed 16-bit integer.</summary>
@@ -88,13 +74,6 @@ public sealed class ShortType : AtomicType
 
     /// <inheritdoc/>
     public override string SimpleString => "smallint";
-
-    /// <inheritdoc/>
-    public override bool TryGetPhysicalLayout(out PhysicalLayout layout)
-    {
-        layout = PhysicalLayout.FixedWidth(2);
-        return true;
-    }
 }
 
 /// <summary>The Spark <c>integer</c> (<c>int</c>) type: signed 32-bit integer.</summary>
@@ -112,13 +91,6 @@ public sealed class IntegerType : AtomicType
 
     /// <inheritdoc/>
     public override string SimpleString => "int";
-
-    /// <inheritdoc/>
-    public override bool TryGetPhysicalLayout(out PhysicalLayout layout)
-    {
-        layout = PhysicalLayout.FixedWidth(4);
-        return true;
-    }
 }
 
 /// <summary>The Spark <c>long</c> (<c>bigint</c>) type: signed 64-bit integer.</summary>
@@ -136,13 +108,6 @@ public sealed class LongType : AtomicType
 
     /// <inheritdoc/>
     public override string SimpleString => "bigint";
-
-    /// <inheritdoc/>
-    public override bool TryGetPhysicalLayout(out PhysicalLayout layout)
-    {
-        layout = PhysicalLayout.FixedWidth(8);
-        return true;
-    }
 }
 
 /// <summary>The Spark <c>float</c> type: IEEE-754 single-precision.</summary>
@@ -160,13 +125,6 @@ public sealed class FloatType : AtomicType
 
     /// <inheritdoc/>
     public override string SimpleString => "float";
-
-    /// <inheritdoc/>
-    public override bool TryGetPhysicalLayout(out PhysicalLayout layout)
-    {
-        layout = PhysicalLayout.FixedWidth(4);
-        return true;
-    }
 }
 
 /// <summary>The Spark <c>double</c> type: IEEE-754 double-precision.</summary>
@@ -184,13 +142,6 @@ public sealed class DoubleType : AtomicType
 
     /// <inheritdoc/>
     public override string SimpleString => "double";
-
-    /// <inheritdoc/>
-    public override bool TryGetPhysicalLayout(out PhysicalLayout layout)
-    {
-        layout = PhysicalLayout.FixedWidth(8);
-        return true;
-    }
 }
 
 /// <summary>The Spark <c>string</c> type: UTF-8 text. Physical layout: variable length.</summary>
@@ -208,13 +159,6 @@ public sealed class StringType : AtomicType
 
     /// <inheritdoc/>
     public override string SimpleString => "string";
-
-    /// <inheritdoc/>
-    public override bool TryGetPhysicalLayout(out PhysicalLayout layout)
-    {
-        layout = PhysicalLayout.Variable;
-        return true;
-    }
 }
 
 /// <summary>The Spark <c>binary</c> type: opaque bytes. Physical layout: variable length.</summary>
@@ -232,13 +176,6 @@ public sealed class BinaryType : AtomicType
 
     /// <inheritdoc/>
     public override string SimpleString => "binary";
-
-    /// <inheritdoc/>
-    public override bool TryGetPhysicalLayout(out PhysicalLayout layout)
-    {
-        layout = PhysicalLayout.Variable;
-        return true;
-    }
 }
 
 /// <summary>
@@ -259,13 +196,6 @@ public sealed class DateType : AtomicType
 
     /// <inheritdoc/>
     public override string SimpleString => "date";
-
-    /// <inheritdoc/>
-    public override bool TryGetPhysicalLayout(out PhysicalLayout layout)
-    {
-        layout = PhysicalLayout.FixedWidth(4);
-        return true;
-    }
 }
 
 /// <summary>
@@ -287,22 +217,14 @@ public sealed class TimestampType : AtomicType
 
     /// <inheritdoc/>
     public override string SimpleString => "timestamp";
-
-    /// <inheritdoc/>
-    public override bool TryGetPhysicalLayout(out PhysicalLayout layout)
-    {
-        layout = PhysicalLayout.FixedWidth(8);
-        return true;
-    }
 }
 
 /// <summary>
 /// The Spark <c>void</c> (null) type — the type of a bare <c>NULL</c> literal. It is a valid
 /// member of the type system (it participates in equality, validation, and serialization)
-/// but has <b>no physical representation</b>: <see cref="TryGetPhysicalLayout"/> returns
-/// <see langword="false"/>, which is the concrete case behind STORY-02.5.1 AC4's explicit
-/// unsupported-layout path. A column of this type must be widened to a concrete type before
-/// it can be materialized.
+/// but has <b>no physical representation</b> — the concrete case behind STORY-02.5.1 AC4's
+/// explicit unsupported-layout path. A column of this type must be widened to a concrete type
+/// before it can be materialized.
 /// </summary>
 public sealed class NullType : AtomicType
 {
@@ -318,11 +240,4 @@ public sealed class NullType : AtomicType
 
     /// <inheritdoc/>
     public override string SimpleString => "void";
-
-    /// <inheritdoc/>
-    public override bool TryGetPhysicalLayout(out PhysicalLayout layout)
-    {
-        layout = default;
-        return false;
-    }
 }

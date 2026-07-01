@@ -8,7 +8,7 @@ public enum PhysicalLayoutKind
 {
     /// <summary>
     /// No physical representation — the value of a <see cref="PhysicalLayout"/> that was never
-    /// resolved (the <c>out</c> value when <see cref="DataType.TryGetPhysicalLayout"/> returns
+    /// resolved (the <c>out</c> value when <see cref="PhysicalLayoutResolver.TryResolve"/> returns
     /// <see langword="false"/>, e.g. for <see cref="NullType"/>). It is the default so that an
     /// unresolved layout is never mistaken for a real fixed-width one.
     /// </summary>
@@ -33,7 +33,7 @@ public enum PhysicalLayoutKind
 /// <summary>
 /// The physical representation a <see cref="DataType"/> advertises to buffer/builder code.
 /// This is the seam the columnar and binary-row layers consume (STORY-02.5.1 AC4): a type
-/// either resolves to a supported layout, or <see cref="DataType.TryGetPhysicalLayout"/>
+/// either resolves to a supported layout, or <see cref="PhysicalLayoutResolver.TryResolve"/>
 /// reports that it has none (for example <see cref="NullType"/>).
 /// </summary>
 public readonly struct PhysicalLayout : IEquatable<PhysicalLayout>

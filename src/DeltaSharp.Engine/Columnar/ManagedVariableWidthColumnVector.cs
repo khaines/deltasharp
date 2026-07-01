@@ -27,7 +27,7 @@ public sealed class ManagedVariableWidthColumnVector : MutableColumnVector
         : base(type)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(capacity);
-        if (!type.TryGetPhysicalLayout(out PhysicalLayout layout) || layout.Kind != PhysicalLayoutKind.Variable)
+        if (!PhysicalLayoutResolver.TryResolve(type, out PhysicalLayout layout) || layout.Kind != PhysicalLayoutKind.Variable)
         {
             throw new ArgumentException(
                 $"Type '{type.SimpleString}' does not have a variable-width layout.", nameof(type));
