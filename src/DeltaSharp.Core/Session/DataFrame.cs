@@ -1,3 +1,5 @@
+using DeltaSharp.Plans.Logical;
+
 namespace DeltaSharp;
 
 /// <summary>
@@ -5,15 +7,21 @@ namespace DeltaSharp;
 /// <c>DataFrame</c> (an untyped <c>Dataset&lt;Row&gt;</c>).
 /// </summary>
 /// <remarks>
-/// <b>M1 placeholder.</b> STORY-04.1.1 (#157) introduces this type only as the return shape of the
-/// <see cref="SparkSession"/> doors (<see cref="SparkSession.Sql(string)"/> and the reader). Its
+/// <b>M1 placeholder.</b> STORY-04.1.1 (#157) introduces this type as the return shape of the
+/// <see cref="SparkSession"/> doors (<see cref="SparkSession.Sql(string)"/> and the reader), and
+/// STORY-04.4.1 (#167) backs it with the immutable logical <see cref="Plan"/> it wraps. Its
 /// transformation and action surface is delivered by later FEAT-04.1/FEAT-04.2 stories
-/// (#158/#159 and following); it is intentionally inert here. Instances are created by the engine,
-/// not by user code, so the constructor is non-public.
+/// (#158/#159 and following); it is intentionally inert here. Instances are created by the engine
+/// from a logical plan, not by user code, so the constructor is non-public.
 /// </remarks>
 public sealed class DataFrame
 {
-    internal DataFrame()
+    /// <summary>Wraps an immutable, unresolved logical plan.</summary>
+    internal DataFrame(LogicalPlan plan)
     {
+        Plan = plan ?? throw new ArgumentNullException(nameof(plan));
     }
+
+    /// <summary>The immutable, unresolved logical plan backing this DataFrame.</summary>
+    internal LogicalPlan Plan { get; }
 }
