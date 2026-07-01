@@ -82,7 +82,10 @@ public sealed class DescriptorOnlyTests
     /// (<c>DeltaSharp.Engine</c>) type, or <see langword="null"/> if none. Only the banned
     /// <b>leaf</b> types are flagged, so benign generics such as
     /// <c>IReadOnlyList&lt;Expression&gt;</c> or <c>ReadOnlyCollection&lt;string&gt;</c> pass
-    /// (their arguments recurse to non-banned leaves).
+    /// (their arguments recurse to non-banned leaves). For DeltaSharp-defined types it additionally
+    /// recurses into declared instance <b>fields and properties</b> (so an interface member that
+    /// declares a banned property, or a computed property whose type wraps a banned type, is
+    /// caught); BCL/third-party types are treated as leaves to avoid false positives.
     /// </summary>
     private static Type? FindBannedType(Type type) => FindBannedType(type, new HashSet<Type>());
 
@@ -118,24 +121,51 @@ public sealed class DescriptorOnlyTests
             }
         }
 
-        // F2: recurse into the instance fields of a *DeltaSharp-defined* custom type (the IR's own
-        // structs/classes) so a wrapper such as `struct ExoticWrapper { Stream Handle; }` cannot
-        // hide a handle. Scoped to DeltaSharp namespaces on purpose: BCL/third-party types (string,
-        // List<T>, Task, …) internally hold IDisposable/Stream fields, so recursing into them would
-        // explode into false positives. Their public generic arguments are already unwrapped above,
-        // which is the only handle-carrying surface a benign BCL wrapper legitimately exposes.
+        // F2/F3: recurse into the instance FIELDS and declared PROPERTIES of a *DeltaSharp-defined*
+        // custom type (the IR's own structs/classes/interfaces) so held state cannot hide a handle:
+        //   • a wrapper `struct ExoticWrapper { Stream Handle; }` (a field), and
+        //   • an interface member that DECLARES a banned property
+        //     (`interface IPartitionDescriptor { Stream Handle { get; } }` — interfaces have no
+        //     fields, so a field-only scan missed them), and
+        //   • a computed/auto property whose type is (or wraps) a banned type
+        //     (`Stream StreamProp => …` — not backed by a scannable field).
+        // Scoped to DeltaSharp namespaces on purpose: BCL/third-party types (string, List<T>, Task,
+        // …) internally hold IDisposable/Stream fields and expose disposable-typed properties, so
+        // recursing into them would explode into false positives. Their public generic arguments are
+        // already unwrapped above, which is the only handle-carrying surface a benign BCL wrapper
+        // legitimately exposes.
+        //
+        // Inherent residual (a static type scan CANNOT close these — they are covered by the
+        // compile-time boundary asserted in CoreAssemblyDoesNotReferenceTheEngineAssembly, which is
+        // the PRIMARY guarantee the plan IR holds no Engine handles):
+        //   • a handle held by the *implementation* of a marker interface that does not itself
+        //     declare a banned member — the concrete runtime type is unknown at scan time; and
+        //   • a handle buried in a third-party/BCL wrapper's private internals — recursing BCL
+        //     internals would explode into false positives (every string/List<T>/Task transitively
+        //     references IDisposable/Stream state).
+        // This scan enforces the remaining surface: BCL handles held as *declared* state (fields or
+        // properties of banned or DeltaSharp-wrapping types). Only held instance state is in scope;
+        // method return types and static members are deliberately not scanned.
         if (IsDeltaSharpDefinedType(type))
         {
-            const BindingFlags fieldFlags =
+            const BindingFlags memberFlags =
                 BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly;
 
             for (Type? t = type; t is not null && t != typeof(object); t = t.BaseType)
             {
-                foreach (FieldInfo field in t.GetFields(fieldFlags))
+                foreach (FieldInfo field in t.GetFields(memberFlags))
                 {
                     if (FindBannedType(field.FieldType, visited) is Type fromField)
                     {
                         return fromField;
+                    }
+                }
+
+                foreach (PropertyInfo property in t.GetProperties(memberFlags))
+                {
+                    if (FindBannedType(property.PropertyType, visited) is Type fromProperty)
+                    {
+                        return fromProperty;
                     }
                 }
             }
@@ -291,6 +321,83 @@ public sealed class DescriptorOnlyTests
         Assert.Null(FindBannedType(typeof(Expression)));
         Assert.Null(FindBannedType(typeof(LogicalPlan)));
     }
+
+    // ---- F3: interface-declared + computed properties must be recursed --------------------------
+    // The recursion scanned FIELDS ONLY, so two surfaces slipped past:
+    //   (a) a DeltaSharp interface DECLARING a banned property — interfaces have no fields, so
+    //       GetFields() is empty; but GetProperties() exposes the declared member; and
+    //   (b) a computed/auto property whose type is (or wraps) a banned type — not backed by a
+    //       scannable field.
+    // The scan now also applies FindBannedType to each declared instance property's PropertyType.
+#pragma warning disable CS0649 // Fields exist only to be inspected reflectively; never assigned.
+    private interface IStreamDescriptorFixture
+    {
+        Stream Handle { get; }
+    }
+
+    private sealed class InterfaceTypedMemberFixture
+    {
+        public IStreamDescriptorFixture? Descriptor;
+    }
+
+    private sealed class ComputedStreamPropertyFixture
+    {
+        public Stream StreamProp => throw new NotSupportedException("fixture: never invoked");
+    }
+
+    private sealed class AsyncDisposablePropertyFixture
+    {
+        public IAsyncDisposable AsyncHandle => throw new NotSupportedException("fixture: never invoked");
+    }
+
+    private sealed class BenignPropertyFixture
+    {
+        public IReadOnlyList<Expression>? Expressions { get; init; }
+
+        public LogicalPlan? Child { get; init; }
+
+        public string Name => "benign";
+    }
+#pragma warning restore CS0649
+
+    [Fact]
+    public void RecursiveScanCatchesBannedPropertyDeclaredByADeltaSharpInterface()
+    {
+        // (a) The interface itself declares a Stream property — caught directly and via a member.
+        Assert.NotNull(FindBannedType(typeof(IStreamDescriptorFixture)));
+        Assert.NotNull(FindBannedType(typeof(InterfaceTypedMemberFixture)));
+    }
+
+    [Fact]
+    public void RecursiveScanCatchesComputedBannedProperties()
+    {
+        // (b) A computed Stream property and (c) an IAsyncDisposable property — no backing field.
+        Assert.NotNull(FindBannedType(typeof(ComputedStreamPropertyFixture)));
+        Assert.NotNull(FindBannedType(typeof(AsyncDisposablePropertyFixture)));
+    }
+
+    [Fact]
+    public void RecursiveScanDoesNotFalselyFlagDeltaSharpTypesWithOnlyBenignProperties()
+    {
+        // The property recursion must NOT over-reach: benign IR-shaped properties (an expression
+        // list, a child plan, a string) stay clean — mirroring the real IR's property surface.
+        Assert.Null(FindBannedType(typeof(BenignPropertyFixture)));
+    }
+
+    // A self-referential property must not loop — the visited-set cycle guard covers properties too.
+    private sealed class SelfReferentialPropertyFixture
+    {
+        public SelfReferentialPropertyFixture? Next { get; init; }
+
+        public string Name => "cycle";
+    }
+
+    [Fact]
+    public void PropertyRecursionTerminatesOnSelfReferentialTypes()
+    {
+        Assert.Null(FindBannedType(typeof(SelfReferentialPropertyFixture)));
+    }
+
 
     /// <summary>
     /// Every instance field (public and private, declared on the type or any base IR type) and
