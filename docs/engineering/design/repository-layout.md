@@ -25,6 +25,7 @@
 | Project | Folder | Target framework(s) | Packable | Role |
 | --- | --- | --- | --- | --- |
 | `DeltaSharp.Core` | `src/DeltaSharp.Core` | `net8.0;net10.0` | yes | Public, user-facing API surface. Multi-targeted for current-LTS adoption (ADR-0014). Root namespace `DeltaSharp`. Trim/AOT-annotation-clean (trim/AOT analyzers). |
+| `DeltaSharp.Abstractions` | `src/DeltaSharp.Abstractions` | `net8.0;net10.0` | yes | Shared **packable** logical contracts — the `Core`↔`Engine` seam (ADR-0016). Multi-targeted so both `Core` and `Engine` can reference it while staying independent siblings. Root namespace `DeltaSharp`; types under `DeltaSharp.Types`. Trim/AOT-annotation-clean; PublicAPI-governed. **Scaffolded empty** in STORY-04.T.S1a; the ADR-0008 logical type model moves in atomically in S1b+S2. |
 | `DeltaSharp.Engine` | `src/DeltaSharp.Engine` | `net10.0` | no | Engine internals — **not part of the published package surface** (the assembly is never shipped as NuGet). `net10.0`-only so it can use the newest runtime and NativeAOT; not referenced by the public `net8.0` surface. |
 | `DeltaSharp.Executor` | `src/DeltaSharp.Executor` | `net10.0` | no | Representative NativeAOT executor host process. `PublishAot=true` is local to this executable project so AOT publish settings do not leak to public libraries. |
 | `DeltaSharp.Core.Tests` | `tests/DeltaSharp.Core.Tests` | `net8.0;net10.0` | no | xUnit tests for `DeltaSharp.Core`, multi-targeted so both library targets are compiled and executed in CI. |
@@ -53,7 +54,7 @@ its code arrives:
 | Planned assembly | Plane | Responsibility |
 | --- | --- | --- |
 | `DeltaSharp.Core` | — | Public API + immutable logical plans (the only packable, multi-targeted surface). |
-| `DeltaSharp.Abstractions` (if needed) | — | Shared **packable** contracts bridging the public surface and the engine — a candidate `Core`↔`Engine` seam (see the TFM policy). |
+| `DeltaSharp.Abstractions` | — | Shared **packable** contracts bridging the public surface and the engine — the `Core`↔`Engine` seam (ADR-0016). **Active** (`src/DeltaSharp.Abstractions`, `net8.0;net10.0`): scaffolded empty in STORY-04.T.S1a to hold the ADR-0008 logical type model, which moves in atomically in S1b+S2. See [shared-type-model.md](shared-type-model.md). |
 | `DeltaSharp.Engine` | data | Analyzer/optimizer, physical planning, vectorized execution internals. |
 | `DeltaSharp.Storage` (or `*.Delta`) | data | Delta transaction log, Parquet, object-store / PVC backends. |
 | `DeltaSharp.Distributed` | data | Driver/executor coordination and the native remote shuffle service (CODEOWNERS anticipates `/src/**/Shuffle/`). |
