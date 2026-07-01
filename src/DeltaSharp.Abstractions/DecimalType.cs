@@ -1,6 +1,6 @@
 using System.Globalization;
 
-namespace DeltaSharp.Engine.Types;
+namespace DeltaSharp.Types;
 
 /// <summary>
 /// The Spark <c>decimal(precision, scale)</c> type: a fixed-point number with

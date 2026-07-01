@@ -1,7 +1,7 @@
 using System.Buffers.Binary;
 using DeltaSharp.Engine.Memory;
 using DeltaSharp.Engine.RowFormat;
-using DeltaSharp.Engine.Types;
+using DeltaSharp.Types;
 using Xunit;
 
 namespace DeltaSharp.Engine.Tests.RowFormat;

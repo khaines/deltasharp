@@ -1,4 +1,4 @@
-namespace DeltaSharp.Engine.Types;
+namespace DeltaSharp.Types;
 
 /// <summary>
 /// Spark-parity decimal result-type, widening, and overflow rules (STORY-02.5.2 AC2). Mirrors

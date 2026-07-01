@@ -1,4 +1,4 @@
-namespace DeltaSharp.Engine.Types;
+namespace DeltaSharp.Types;
 
 /// <summary>
 /// Spark-parity type coercion for v1 (STORY-02.5.2). Owns numeric width precedence and the

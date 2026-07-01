@@ -1,7 +1,7 @@
 using Apache.Arrow;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Engine.Columnar.Arrow;
-using DeltaSharp.Engine.Types;
+using DeltaSharp.Types;
 using Xunit;
 
 namespace DeltaSharp.Engine.Tests.Columnar.Arrow;

@@ -2,7 +2,7 @@ using System.Text;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Engine.Execution;
 using DeltaSharp.Engine.Execution.Spill;
-using DeltaSharp.Engine.Types;
+using DeltaSharp.Types;
 using Xunit;
 using ExecutionContext = DeltaSharp.Engine.Execution.ExecutionContext;
 

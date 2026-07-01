@@ -1,5 +1,5 @@
 using System.Diagnostics;
-using DeltaSharp.Engine.Types;
+using DeltaSharp.Types;
 
 namespace DeltaSharp.Engine.Columnar;
 

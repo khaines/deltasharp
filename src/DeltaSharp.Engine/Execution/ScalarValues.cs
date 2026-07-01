@@ -1,6 +1,6 @@
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Engine.Execution.Expressions;
-using DeltaSharp.Engine.Types;
+using DeltaSharp.Types;
 
 namespace DeltaSharp.Engine.Execution;
 

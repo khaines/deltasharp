@@ -1,5 +1,5 @@
 using Apache.Arrow;
-using DeltaSharp.Engine.Types;
+using DeltaSharp.Types;
 using ArrowTimestampType = Apache.Arrow.Types.TimestampType;
 
 namespace DeltaSharp.Engine.Columnar.Arrow;

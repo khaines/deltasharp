@@ -32,4 +32,14 @@
     <PackageReference Include="Apache.Arrow" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- ADR-0016 (S1b): the logical type model (DataType hierarchy, DataTypes factory,
+         TypeCoercion, AnsiMode, exceptions, internal StableHash) moved into the shared
+         packable DeltaSharp.Abstractions. Engine's physical/storage helpers
+         (PhysicalLayout, DecimalValue, TemporalValues, SchemaJson) reference those
+         descriptors, and PhysicalLayout/DecimalValue GetHashCode call the internal
+         StableHash (granted via InternalsVisibleTo in Abstractions.csproj). -->
+    <ProjectReference Include="../DeltaSharp.Abstractions/DeltaSharp.Abstractions.csproj" />
+  </ItemGroup>
+
 </Project>

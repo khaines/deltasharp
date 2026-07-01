@@ -1,4 +1,4 @@
-namespace DeltaSharp.Engine.Types;
+namespace DeltaSharp.Types;
 
 /// <summary>
 /// Base of the DeltaSharp logical type system — the Spark SQL-compatible descriptor that

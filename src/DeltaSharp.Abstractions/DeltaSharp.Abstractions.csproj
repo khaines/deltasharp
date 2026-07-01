@@ -42,4 +42,15 @@
     <None Include="README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
+  <!-- ADR-0016 (straddler 4, S1b): StableHash moved here but stays internal. Two Engine
+       types that stay in DeltaSharp.Engine after the split — PhysicalLayout and DecimalValue —
+       call the internal StableHash.Combine from their GetHashCode, and DeltaSharp.Engine.Tests
+       has a direct StableHash regression test. Grant both assemblies access to the internal
+       surface so those cross-assembly reads compile. StableHash is NOT promoted to public.
+       (Directory.Build.props already auto-injects the DeltaSharp.Abstractions.Tests grant.) -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="DeltaSharp.Engine" />
+    <InternalsVisibleTo Include="DeltaSharp.Engine.Tests" />
+  </ItemGroup>
+
 </Project>

@@ -1,7 +1,7 @@
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Engine.Memory;
 using DeltaSharp.Engine.RowFormat;
-using DeltaSharp.Engine.Types;
+using DeltaSharp.Types;
 
 namespace DeltaSharp.Engine.Execution.Spill;
 

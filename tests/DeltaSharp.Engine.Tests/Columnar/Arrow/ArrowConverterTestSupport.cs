@@ -3,7 +3,7 @@ using System.Runtime.InteropServices;
 using Apache.Arrow;
 using Apache.Arrow.Memory;
 using DeltaSharp.Engine.Columnar;
-using DeltaSharp.Engine.Types;
+using DeltaSharp.Types;
 using Xunit;
 using ArrowListType = Apache.Arrow.Types.ListType;
 using ArrowStructType = Apache.Arrow.Types.StructType;

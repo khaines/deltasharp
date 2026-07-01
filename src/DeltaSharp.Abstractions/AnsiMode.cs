@@ -1,4 +1,4 @@
-namespace DeltaSharp.Engine.Types;
+namespace DeltaSharp.Types;
 
 /// <summary>
 /// Selects the strictness lens for type coercion, decimal/timestamp arithmetic, and casts —

@@ -1,7 +1,7 @@
 using System.Buffers.Binary;
 using Apache.Arrow;
 using DeltaSharp.Engine.Columnar.Arrow;
-using DeltaSharp.Engine.Types;
+using DeltaSharp.Types;
 using Xunit;
 using ArrowDecimal128Type = Apache.Arrow.Types.Decimal128Type;
 

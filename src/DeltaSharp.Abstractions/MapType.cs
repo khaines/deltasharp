@@ -1,4 +1,4 @@
-namespace DeltaSharp.Engine.Types;
+namespace DeltaSharp.Types;
 
 /// <summary>
 /// The Spark <c>map</c> type: an association from <see cref="KeyType"/> values to

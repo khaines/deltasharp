@@ -4,7 +4,7 @@ using DeltaSharp.Engine.Execution;
 using DeltaSharp.Engine.Execution.Expressions;
 using DeltaSharp.Engine.Execution.Spill;
 using DeltaSharp.Engine.RowFormat;
-using DeltaSharp.Engine.Types;
+using DeltaSharp.Types;
 using Xunit;
 using ExecutionContext = DeltaSharp.Engine.Execution.ExecutionContext;
 

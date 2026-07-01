@@ -1,6 +1,6 @@
 using System.Globalization;
 
-namespace DeltaSharp.Engine.Types;
+namespace DeltaSharp.Types;
 
 /// <summary>
 /// An exact fixed-point value: a 128-bit <see cref="Unscaled"/> mantissa and a non-negative

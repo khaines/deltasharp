@@ -1,4 +1,4 @@
-using DeltaSharp.Engine.Types;
+using DeltaSharp.Types;
 using ArrowTypes = Apache.Arrow.Types;
 
 namespace DeltaSharp.Engine.Columnar.Arrow;
