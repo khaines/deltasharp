@@ -7,11 +7,11 @@ runtime. It holds the **shared logical Spark-parity type model**: the `DataType`
 `DataTypes` factory, coercion, and ANSI mode (ADR-0008), under the `DeltaSharp.Types`
 namespace (mirroring Spark's `org.apache.spark.sql.types`).
 
-> **Status: M1 scaffold.** This package is intentionally **empty of type-model code** — it
-> exposes only an internal marker so it compiles, and its PublicAPI baseline is trivially
-> empty. The logical type surface **lands here via the ADR-0016 migration** (the atomic
-> S1b+S2 move of the type model out of `DeltaSharp.Engine`). Do not take a production
-> dependency on M1 behavior.
+> **Status: M1 (pre-1.0).** The ADR-0008 **logical type model now lives here**: the shared
+> Spark-parity `DataType` hierarchy and factory listed above, consumed by both
+> `DeltaSharp.Core` and `DeltaSharp.Engine` (moved out of `DeltaSharp.Engine` via the atomic
+> ADR-0016 S1b+S2 migration). The internal `StableHash` is an implementation detail, not part
+> of the public surface. Do not take a production dependency on M1 behavior.
 
 ## Target frameworks
 

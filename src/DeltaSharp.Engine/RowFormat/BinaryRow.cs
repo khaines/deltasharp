@@ -1,6 +1,6 @@
 using System.Buffers.Binary;
 using DeltaSharp.Engine.Memory;
-using DeltaSharp.Engine.Types;
+using DeltaSharp.Types;
 
 namespace DeltaSharp.Engine.RowFormat;
 

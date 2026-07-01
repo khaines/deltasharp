@@ -1,4 +1,4 @@
-namespace DeltaSharp.Engine.Types;
+namespace DeltaSharp.Types;
 
 /// <summary>
 /// Resolves the <see cref="PhysicalLayout"/> a vector or binary-row builder should use for a

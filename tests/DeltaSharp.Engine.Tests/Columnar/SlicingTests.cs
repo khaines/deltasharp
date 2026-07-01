@@ -1,6 +1,6 @@
 using System.Text;
 using DeltaSharp.Engine.Columnar;
-using DeltaSharp.Engine.Types;
+using DeltaSharp.Types;
 using Xunit;
 
 namespace DeltaSharp.Engine.Tests.Columnar;

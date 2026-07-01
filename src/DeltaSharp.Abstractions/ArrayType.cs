@@ -1,4 +1,4 @@
-namespace DeltaSharp.Engine.Types;
+namespace DeltaSharp.Types;
 
 /// <summary>
 /// The Spark <c>array</c> type: an ordered collection of <see cref="ElementType"/> values.

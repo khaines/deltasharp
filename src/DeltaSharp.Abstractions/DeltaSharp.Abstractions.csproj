@@ -10,10 +10,10 @@
     non-packable assembly). Namespace root DeltaSharp; the logical type model lands under
     DeltaSharp.Types (ADR-0008), mirroring Spark's org.apache.spark.sql.types.
 
-    STORY-04.T.S1a scaffolds this assembly EMPTY of type-model code — only an internal
-    marker so it compiles and its PublicAPI baseline is trivially empty. The logical types
-    (DataType hierarchy, DataTypes factory, TypeCoercion, AnsiMode, exceptions, internal
-    StableHash) MOVE here atomically in S1b+S2. Must remain trim/AOT-annotation-clean.
+    STORY-04.T.S1b+S2 completes the atomic move: the logical type model now LIVES here —
+    the DataType hierarchy, complex types, DataTypes factory, TypeCoercion, decimal type-rules,
+    AnsiMode, exceptions, and the internal StableHash (an implementation detail). Must remain
+    trim/AOT-annotation-clean.
   -->
   <PropertyGroup>
     <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
@@ -21,7 +21,7 @@
     <AssemblyName>DeltaSharp.Abstractions</AssemblyName>
     <IsPackable>true</IsPackable>
     <PackageId>DeltaSharp.Abstractions</PackageId>
-    <Description>Shared logical contracts for DeltaSharp, a .NET-native reimplementation of Apache Spark — the packable Core↔Engine seam that will hold the ADR-0008 logical type model. M1 skeleton — no type-model code yet.</Description>
+    <Description>Shared logical contracts for DeltaSharp, a .NET-native reimplementation of Apache Spark — the packable Core↔Engine seam that holds the ADR-0008 logical type model: the shared Spark-parity DataType hierarchy (namespace DeltaSharp.Types), consumed by both DeltaSharp.Core and DeltaSharp.Engine. Pre-1.0 (M1).</Description>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <!-- ADR-0014: keep the public surface trim/AOT-annotation-clean. Enable the
@@ -40,6 +40,18 @@
        Per-package because the readme content is package-specific (FEAT-01.6 / #130). -->
   <ItemGroup>
     <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <!-- ADR-0016 (straddler 4, S1b): StableHash moved here but stays internal. Two Engine
+       types that stay in DeltaSharp.Engine after the split — PhysicalLayout and DecimalValue —
+       call the internal StableHash.Combine from their GetHashCode (PhysicalLayout.GetHashCode /
+       DecimalValue.GetHashCode). After the move those are cross-assembly reads of an internal
+       symbol, so grant DeltaSharp.Engine access to the internal surface. This is the only
+       grant needed: no test reads StableHash members (the Engine.Tests hashing tests exercise
+       the PUBLIC GetHashCode). StableHash is NOT promoted to public.
+       (Directory.Build.props already auto-injects the DeltaSharp.Abstractions.Tests grant.) -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="DeltaSharp.Engine" />
   </ItemGroup>
 
 </Project>

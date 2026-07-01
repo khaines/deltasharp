@@ -1,1 +1,191 @@
 #nullable enable
+DeltaSharp.Types.AnsiMode
+DeltaSharp.Types.AnsiMode.Ansi = 0 -> DeltaSharp.Types.AnsiMode
+DeltaSharp.Types.AnsiMode.Legacy = 1 -> DeltaSharp.Types.AnsiMode
+DeltaSharp.Types.ArithmeticOverflowException
+DeltaSharp.Types.ArithmeticOverflowException.ArithmeticOverflowException() -> void
+DeltaSharp.Types.ArithmeticOverflowException.ArithmeticOverflowException(string! message) -> void
+DeltaSharp.Types.ArithmeticOverflowException.ArithmeticOverflowException(string! message, System.Exception! innerException) -> void
+DeltaSharp.Types.ArrayType
+DeltaSharp.Types.ArrayType.ArrayType(DeltaSharp.Types.DataType! elementType, bool containsNull = true) -> void
+DeltaSharp.Types.ArrayType.ContainsNull.get -> bool
+DeltaSharp.Types.ArrayType.ElementType.get -> DeltaSharp.Types.DataType!
+DeltaSharp.Types.AtomicType
+DeltaSharp.Types.BinaryType
+DeltaSharp.Types.BooleanType
+DeltaSharp.Types.ByteType
+DeltaSharp.Types.DataType
+DeltaSharp.Types.DataTypes
+DeltaSharp.Types.DateType
+DeltaSharp.Types.DecimalArithmetic
+DeltaSharp.Types.DecimalOp
+DeltaSharp.Types.DecimalOp.Add = 0 -> DeltaSharp.Types.DecimalOp
+DeltaSharp.Types.DecimalOp.Divide = 3 -> DeltaSharp.Types.DecimalOp
+DeltaSharp.Types.DecimalOp.Multiply = 2 -> DeltaSharp.Types.DecimalOp
+DeltaSharp.Types.DecimalOp.Remainder = 4 -> DeltaSharp.Types.DecimalOp
+DeltaSharp.Types.DecimalOp.Subtract = 1 -> DeltaSharp.Types.DecimalOp
+DeltaSharp.Types.DecimalType
+DeltaSharp.Types.DecimalType.DecimalType(int precision, int scale) -> void
+DeltaSharp.Types.DecimalType.IsCompact.get -> bool
+DeltaSharp.Types.DecimalType.Precision.get -> int
+DeltaSharp.Types.DecimalType.Scale.get -> int
+DeltaSharp.Types.DoubleType
+DeltaSharp.Types.FieldMetadata
+DeltaSharp.Types.FieldMetadata.ContainsKey(string! key) -> bool
+DeltaSharp.Types.FieldMetadata.Count.get -> int
+DeltaSharp.Types.FieldMetadata.Equals(DeltaSharp.Types.FieldMetadata? other) -> bool
+DeltaSharp.Types.FieldMetadata.GetEnumerator() -> System.Collections.Generic.IEnumerator<System.Collections.Generic.KeyValuePair<string!, string!>>!
+DeltaSharp.Types.FieldMetadata.IsEmpty.get -> bool
+DeltaSharp.Types.FieldMetadata.Keys.get -> System.Collections.Generic.IEnumerable<string!>!
+DeltaSharp.Types.FieldMetadata.TryGetValue(string! key, out string! value) -> bool
+DeltaSharp.Types.FieldMetadata.Values.get -> System.Collections.Generic.IEnumerable<string!>!
+DeltaSharp.Types.FieldMetadata.this[string! key].get -> string!
+DeltaSharp.Types.FloatType
+DeltaSharp.Types.IntegerType
+DeltaSharp.Types.LongType
+DeltaSharp.Types.MapType
+DeltaSharp.Types.MapType.KeyType.get -> DeltaSharp.Types.DataType!
+DeltaSharp.Types.MapType.MapType(DeltaSharp.Types.DataType! keyType, DeltaSharp.Types.DataType! valueType, bool valueContainsNull = true) -> void
+DeltaSharp.Types.MapType.ValueContainsNull.get -> bool
+DeltaSharp.Types.MapType.ValueType.get -> DeltaSharp.Types.DataType!
+DeltaSharp.Types.NullType
+DeltaSharp.Types.SchemaValidationException
+DeltaSharp.Types.SchemaValidationException.SchemaValidationException() -> void
+DeltaSharp.Types.SchemaValidationException.SchemaValidationException(string! message) -> void
+DeltaSharp.Types.SchemaValidationException.SchemaValidationException(string! message, System.Exception! innerException) -> void
+DeltaSharp.Types.ShortType
+DeltaSharp.Types.StringType
+DeltaSharp.Types.StructField
+DeltaSharp.Types.StructField.DataType.get -> DeltaSharp.Types.DataType!
+DeltaSharp.Types.StructField.Equals(DeltaSharp.Types.StructField? other) -> bool
+DeltaSharp.Types.StructField.Metadata.get -> DeltaSharp.Types.FieldMetadata!
+DeltaSharp.Types.StructField.Name.get -> string!
+DeltaSharp.Types.StructField.Nullable.get -> bool
+DeltaSharp.Types.StructField.StructField(string! name, DeltaSharp.Types.DataType! dataType, bool nullable = true, DeltaSharp.Types.FieldMetadata? metadata = null) -> void
+DeltaSharp.Types.StructType
+DeltaSharp.Types.StructType.Count.get -> int
+DeltaSharp.Types.StructType.Fields.get -> System.Collections.Generic.IReadOnlyList<DeltaSharp.Types.StructField!>!
+DeltaSharp.Types.StructType.GetEnumerator() -> System.Collections.Generic.IEnumerator<DeltaSharp.Types.StructField!>!
+DeltaSharp.Types.StructType.IndexOf(string! name) -> int
+DeltaSharp.Types.StructType.StructType(System.Collections.Generic.IEnumerable<DeltaSharp.Types.StructField!>! fields) -> void
+DeltaSharp.Types.StructType.TryGetField(string! name, out DeltaSharp.Types.StructField! field) -> bool
+DeltaSharp.Types.StructType.this[int index].get -> DeltaSharp.Types.StructField!
+DeltaSharp.Types.StructType.this[string! name].get -> DeltaSharp.Types.StructField!
+DeltaSharp.Types.TimestampType
+DeltaSharp.Types.TypeCoercion
+DeltaSharp.Types.TypeCoercionException
+DeltaSharp.Types.TypeCoercionException.Path.get -> string?
+DeltaSharp.Types.TypeCoercionException.SourceType.get -> string?
+DeltaSharp.Types.TypeCoercionException.TargetType.get -> string?
+DeltaSharp.Types.TypeCoercionException.TypeCoercionException() -> void
+DeltaSharp.Types.TypeCoercionException.TypeCoercionException(string! message) -> void
+DeltaSharp.Types.TypeCoercionException.TypeCoercionException(string! message, System.Exception! innerException) -> void
+DeltaSharp.Types.UnsupportedTypeException
+DeltaSharp.Types.UnsupportedTypeException.UnsupportedTypeException() -> void
+DeltaSharp.Types.UnsupportedTypeException.UnsupportedTypeException(string! message) -> void
+DeltaSharp.Types.UnsupportedTypeException.UnsupportedTypeException(string! message, System.Exception! innerException) -> void
+abstract DeltaSharp.Types.DataType.Equals(DeltaSharp.Types.DataType? other) -> bool
+abstract DeltaSharp.Types.DataType.SimpleString.get -> string!
+abstract DeltaSharp.Types.DataType.TypeName.get -> string!
+const DeltaSharp.Types.DecimalArithmetic.MaxScale = 38 -> int
+const DeltaSharp.Types.DecimalArithmetic.MinimumAdjustedScale = 6 -> int
+const DeltaSharp.Types.DecimalType.MaxCompactPrecision = 18 -> int
+const DeltaSharp.Types.DecimalType.MaxPrecision = 38 -> int
+const DeltaSharp.Types.DecimalType.MinPrecision = 1 -> int
+override DeltaSharp.Types.ArrayType.Equals(DeltaSharp.Types.DataType? other) -> bool
+override DeltaSharp.Types.ArrayType.GetHashCode() -> int
+override DeltaSharp.Types.ArrayType.SimpleString.get -> string!
+override DeltaSharp.Types.ArrayType.TypeName.get -> string!
+override DeltaSharp.Types.BinaryType.SimpleString.get -> string!
+override DeltaSharp.Types.BinaryType.TypeName.get -> string!
+override DeltaSharp.Types.BooleanType.SimpleString.get -> string!
+override DeltaSharp.Types.BooleanType.TypeName.get -> string!
+override DeltaSharp.Types.ByteType.SimpleString.get -> string!
+override DeltaSharp.Types.ByteType.TypeName.get -> string!
+override DeltaSharp.Types.DateType.SimpleString.get -> string!
+override DeltaSharp.Types.DateType.TypeName.get -> string!
+override DeltaSharp.Types.DecimalType.Equals(DeltaSharp.Types.DataType? other) -> bool
+override DeltaSharp.Types.DecimalType.GetHashCode() -> int
+override DeltaSharp.Types.DecimalType.SimpleString.get -> string!
+override DeltaSharp.Types.DecimalType.TypeName.get -> string!
+override DeltaSharp.Types.DoubleType.SimpleString.get -> string!
+override DeltaSharp.Types.DoubleType.TypeName.get -> string!
+override DeltaSharp.Types.FieldMetadata.Equals(object? obj) -> bool
+override DeltaSharp.Types.FieldMetadata.GetHashCode() -> int
+override DeltaSharp.Types.FloatType.SimpleString.get -> string!
+override DeltaSharp.Types.FloatType.TypeName.get -> string!
+override DeltaSharp.Types.IntegerType.SimpleString.get -> string!
+override DeltaSharp.Types.IntegerType.TypeName.get -> string!
+override DeltaSharp.Types.LongType.SimpleString.get -> string!
+override DeltaSharp.Types.LongType.TypeName.get -> string!
+override DeltaSharp.Types.MapType.Equals(DeltaSharp.Types.DataType? other) -> bool
+override DeltaSharp.Types.MapType.GetHashCode() -> int
+override DeltaSharp.Types.MapType.SimpleString.get -> string!
+override DeltaSharp.Types.MapType.TypeName.get -> string!
+override DeltaSharp.Types.NullType.SimpleString.get -> string!
+override DeltaSharp.Types.NullType.TypeName.get -> string!
+override DeltaSharp.Types.ShortType.SimpleString.get -> string!
+override DeltaSharp.Types.ShortType.TypeName.get -> string!
+override DeltaSharp.Types.StringType.SimpleString.get -> string!
+override DeltaSharp.Types.StringType.TypeName.get -> string!
+override DeltaSharp.Types.StructField.Equals(object? obj) -> bool
+override DeltaSharp.Types.StructField.GetHashCode() -> int
+override DeltaSharp.Types.StructField.ToString() -> string!
+override DeltaSharp.Types.StructType.Equals(DeltaSharp.Types.DataType? other) -> bool
+override DeltaSharp.Types.StructType.GetHashCode() -> int
+override DeltaSharp.Types.StructType.SimpleString.get -> string!
+override DeltaSharp.Types.StructType.TypeName.get -> string!
+override DeltaSharp.Types.TimestampType.SimpleString.get -> string!
+override DeltaSharp.Types.TimestampType.TypeName.get -> string!
+override abstract DeltaSharp.Types.DataType.GetHashCode() -> int
+override sealed DeltaSharp.Types.AtomicType.Equals(DeltaSharp.Types.DataType? other) -> bool
+override sealed DeltaSharp.Types.AtomicType.GetHashCode() -> int
+override sealed DeltaSharp.Types.DataType.Equals(object? obj) -> bool
+override sealed DeltaSharp.Types.DataType.ToString() -> string!
+static DeltaSharp.Types.BinaryType.Instance.get -> DeltaSharp.Types.BinaryType!
+static DeltaSharp.Types.BooleanType.Instance.get -> DeltaSharp.Types.BooleanType!
+static DeltaSharp.Types.ByteType.Instance.get -> DeltaSharp.Types.ByteType!
+static DeltaSharp.Types.DataType.operator !=(DeltaSharp.Types.DataType? left, DeltaSharp.Types.DataType? right) -> bool
+static DeltaSharp.Types.DataType.operator ==(DeltaSharp.Types.DataType? left, DeltaSharp.Types.DataType? right) -> bool
+static DeltaSharp.Types.DataTypes.BinaryType.get -> DeltaSharp.Types.BinaryType!
+static DeltaSharp.Types.DataTypes.BooleanType.get -> DeltaSharp.Types.BooleanType!
+static DeltaSharp.Types.DataTypes.ByteType.get -> DeltaSharp.Types.ByteType!
+static DeltaSharp.Types.DataTypes.CreateArrayType(DeltaSharp.Types.DataType! elementType, bool containsNull = true) -> DeltaSharp.Types.ArrayType!
+static DeltaSharp.Types.DataTypes.CreateDecimalType(int precision, int scale) -> DeltaSharp.Types.DecimalType!
+static DeltaSharp.Types.DataTypes.CreateMapType(DeltaSharp.Types.DataType! keyType, DeltaSharp.Types.DataType! valueType, bool valueContainsNull = true) -> DeltaSharp.Types.MapType!
+static DeltaSharp.Types.DataTypes.CreateStructField(string! name, DeltaSharp.Types.DataType! dataType, bool nullable = true, DeltaSharp.Types.FieldMetadata? metadata = null) -> DeltaSharp.Types.StructField!
+static DeltaSharp.Types.DataTypes.CreateStructType(System.Collections.Generic.IEnumerable<DeltaSharp.Types.StructField!>! fields) -> DeltaSharp.Types.StructType!
+static DeltaSharp.Types.DataTypes.DateType.get -> DeltaSharp.Types.DateType!
+static DeltaSharp.Types.DataTypes.DoubleType.get -> DeltaSharp.Types.DoubleType!
+static DeltaSharp.Types.DataTypes.FloatType.get -> DeltaSharp.Types.FloatType!
+static DeltaSharp.Types.DataTypes.IntegerType.get -> DeltaSharp.Types.IntegerType!
+static DeltaSharp.Types.DataTypes.LongType.get -> DeltaSharp.Types.LongType!
+static DeltaSharp.Types.DataTypes.NullType.get -> DeltaSharp.Types.NullType!
+static DeltaSharp.Types.DataTypes.ShortType.get -> DeltaSharp.Types.ShortType!
+static DeltaSharp.Types.DataTypes.StringType.get -> DeltaSharp.Types.StringType!
+static DeltaSharp.Types.DataTypes.TimestampType.get -> DeltaSharp.Types.TimestampType!
+static DeltaSharp.Types.DateType.Instance.get -> DeltaSharp.Types.DateType!
+static DeltaSharp.Types.DecimalArithmetic.Bounded(int precision, int scale) -> DeltaSharp.Types.DecimalType!
+static DeltaSharp.Types.DecimalArithmetic.ForType(DeltaSharp.Types.DataType! type) -> DeltaSharp.Types.DecimalType!
+static DeltaSharp.Types.DecimalArithmetic.ResultType(DeltaSharp.Types.DecimalOp op, DeltaSharp.Types.DecimalType! left, DeltaSharp.Types.DecimalType! right) -> DeltaSharp.Types.DecimalType!
+static DeltaSharp.Types.DecimalArithmetic.SystemDefault.get -> DeltaSharp.Types.DecimalType!
+static DeltaSharp.Types.DoubleType.Instance.get -> DeltaSharp.Types.DoubleType!
+static DeltaSharp.Types.FieldMetadata.Empty.get -> DeltaSharp.Types.FieldMetadata!
+static DeltaSharp.Types.FieldMetadata.FromEntries(System.Collections.Generic.IEnumerable<System.Collections.Generic.KeyValuePair<string!, string!>>! entries) -> DeltaSharp.Types.FieldMetadata!
+static DeltaSharp.Types.FloatType.Instance.get -> DeltaSharp.Types.FloatType!
+static DeltaSharp.Types.IntegerType.Instance.get -> DeltaSharp.Types.IntegerType!
+static DeltaSharp.Types.LongType.Instance.get -> DeltaSharp.Types.LongType!
+static DeltaSharp.Types.NullType.Instance.get -> DeltaSharp.Types.NullType!
+static DeltaSharp.Types.ShortType.Instance.get -> DeltaSharp.Types.ShortType!
+static DeltaSharp.Types.StringType.Instance.get -> DeltaSharp.Types.StringType!
+static DeltaSharp.Types.StructType.Empty.get -> DeltaSharp.Types.StructType!
+static DeltaSharp.Types.TimestampType.Instance.get -> DeltaSharp.Types.TimestampType!
+static DeltaSharp.Types.TypeCoercion.CanCoerce(DeltaSharp.Types.DataType! source, DeltaSharp.Types.DataType! target) -> bool
+static DeltaSharp.Types.TypeCoercion.EnsureCoercible(DeltaSharp.Types.DataType! source, DeltaSharp.Types.DataType! target, string! path = "value") -> void
+static DeltaSharp.Types.TypeCoercion.FindTightestCommonType(DeltaSharp.Types.DataType! left, DeltaSharp.Types.DataType! right) -> DeltaSharp.Types.DataType?
+static DeltaSharp.Types.TypeCoercion.FindWiderCommonType(System.Collections.Generic.IEnumerable<DeltaSharp.Types.DataType!>! types) -> DeltaSharp.Types.DataType?
+static DeltaSharp.Types.TypeCoercion.FindWiderTypeForTwo(DeltaSharp.Types.DataType! left, DeltaSharp.Types.DataType! right) -> DeltaSharp.Types.DataType?
+static DeltaSharp.Types.TypeCoercion.IsIntegral(DeltaSharp.Types.DataType! type) -> bool
+static DeltaSharp.Types.TypeCoercion.IsNumeric(DeltaSharp.Types.DataType! type) -> bool
+static DeltaSharp.Types.TypeCoercion.NumericPrecedence.get -> System.Collections.Generic.IReadOnlyList<DeltaSharp.Types.DataType!>!
+static DeltaSharp.Types.TypeCoercionException.ForPath(DeltaSharp.Types.DataType! source, DeltaSharp.Types.DataType! target, string! path) -> DeltaSharp.Types.TypeCoercionException!

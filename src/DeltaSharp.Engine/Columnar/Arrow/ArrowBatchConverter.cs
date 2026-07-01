@@ -1,5 +1,5 @@
 using Apache.Arrow;
-using DeltaSharp.Engine.Types;
+using DeltaSharp.Types;
 using ArrowField = Apache.Arrow.Field;
 using ArrowSchema = Apache.Arrow.Schema;
 
