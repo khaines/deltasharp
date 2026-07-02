@@ -26,6 +26,11 @@ internal enum AnalysisErrorKind
     /// example an alias over an expression whose type is undetermined before type coercion
     /// (STORY-04.5.2 / #171), or an unnamed projection element.</summary>
     UnsupportedProjection,
+
+    /// <summary>A set operation (currently <c>Union</c>) was given inputs whose <b>column counts</b>
+    /// differ — a structural (arity) incompatibility. Deep column-type compatibility/coercion is a
+    /// separate concern (STORY-04.5.2 / #171).</summary>
+    NumberOfColumnsMismatch,
 }
 
 /// <summary>
@@ -139,4 +144,21 @@ internal sealed class AnalysisException : Exception
             AnalysisErrorKind.UnsupportedProjection,
             reference,
             Array.Empty<string>());
+
+    /// <summary>Builds a <see cref="AnalysisErrorKind.NumberOfColumnsMismatch"/> failure for a
+    /// <c>Union</c> whose inputs have differing column counts, naming the first input's arity and the
+    /// offending input's arity (Spark parity). This is a structural (arity) check only; column-type
+    /// compatibility is deferred to STORY-04.5.2 / #171.</summary>
+    public static AnalysisException NumberOfColumnsMismatch(
+        string nodeName, int firstColumnCount, int inputIndex, int inputColumnCount)
+    {
+        ArgumentNullException.ThrowIfNull(nodeName);
+        return new AnalysisException(
+            $"{nodeName} can only be performed on inputs with the same number of columns, but the "
+            + $"first input has {firstColumnCount} columns and input {inputIndex} has "
+            + $"{inputColumnCount} columns.",
+            AnalysisErrorKind.NumberOfColumnsMismatch,
+            nodeName,
+            Array.Empty<string>());
+    }
 }

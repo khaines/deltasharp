@@ -62,8 +62,10 @@ internal sealed class Analyzer
 
         var idGenerator = new ExprIdGenerator();
         LogicalPlan withRelations = ResolveRelations(plan, idGenerator);
-        LogicalPlan resolved = ResolveReferences(withRelations, idGenerator);
-        CheckAnalysis(resolved);
+        var outputByPlan = new Dictionary<LogicalPlan, IReadOnlyList<AttributeReference>>(
+            ReferenceEqualityComparer.Instance);
+        LogicalPlan resolved = ResolveReferences(withRelations, idGenerator, outputByPlan);
+        CheckAnalysis(resolved, outputByPlan);
         return resolved;
     }
 
@@ -98,11 +100,11 @@ internal sealed class Analyzer
     /// the (already-resolved) output of its children, whose attribute lists are memoized as they are
     /// produced so a parent reads its children's output in O(1).
     /// </summary>
-    private LogicalPlan ResolveReferences(LogicalPlan plan, ExprIdGenerator idGenerator)
+    private LogicalPlan ResolveReferences(
+        LogicalPlan plan,
+        ExprIdGenerator idGenerator,
+        Dictionary<LogicalPlan, IReadOnlyList<AttributeReference>> outputByPlan)
     {
-        var outputByPlan = new Dictionary<LogicalPlan, IReadOnlyList<AttributeReference>>(
-            ReferenceEqualityComparer.Instance);
-
         return plan.TransformUp(node =>
         {
             IReadOnlyList<AttributeReference> input = CollectInput(node, outputByPlan);
@@ -131,13 +133,17 @@ internal sealed class Analyzer
     /// <see cref="UnresolvedFunction"/> (function resolution is a later story), or an operator that
     /// is otherwise still unresolved (for example a using/natural <see cref="Join"/> the analyzer
     /// has not desugared). Without this check such residuals would leak silently as a
-    /// not-fully-resolved plan.
+    /// not-fully-resolved plan. It additionally enforces structural set-operation compatibility: a
+    /// <see cref="Union"/> whose inputs differ in <b>column count</b> (arity) raises a Spark-parity
+    /// diagnostic (deep column-type compatibility/coercion is deferred to STORY-04.5.2 / #171).
     /// </summary>
-    private static void CheckAnalysis(LogicalPlan plan)
+    private static void CheckAnalysis(
+        LogicalPlan plan,
+        IReadOnlyDictionary<LogicalPlan, IReadOnlyList<AttributeReference>> outputByPlan)
     {
         foreach (LogicalPlan child in plan.Children)
         {
-            CheckAnalysis(child);
+            CheckAnalysis(child, outputByPlan);
         }
 
         foreach (Expression expression in plan.Expressions)
@@ -150,6 +156,32 @@ internal sealed class Analyzer
         if (!plan.Resolved)
         {
             throw AnalysisException.UnresolvedOperator(plan.NodeName);
+        }
+
+        // Structural set-operation compatibility: every Union input must expose the same number of
+        // columns (arity). Deep column-type compatibility/coercion is deferred to STORY-04.5.2
+        // (#171); this is the arity half only (AC3).
+        if (plan is Union union)
+        {
+            CheckUnionArity(union, outputByPlan);
+        }
+    }
+
+    /// <summary>Verifies every input of a resolved <see cref="Union"/> exposes the same column
+    /// count, raising a Spark-parity diagnostic naming the mismatched arities otherwise.</summary>
+    private static void CheckUnionArity(
+        Union union,
+        IReadOnlyDictionary<LogicalPlan, IReadOnlyList<AttributeReference>> outputByPlan)
+    {
+        int firstColumnCount = ChildOutput(union.Inputs[0], outputByPlan).Count;
+        for (int i = 1; i < union.Inputs.Count; i++)
+        {
+            int columnCount = ChildOutput(union.Inputs[i], outputByPlan).Count;
+            if (columnCount != firstColumnCount)
+            {
+                throw AnalysisException.NumberOfColumnsMismatch(
+                    union.NodeName, firstColumnCount, i, columnCount);
+            }
         }
     }
 

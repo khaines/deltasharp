@@ -391,6 +391,56 @@ public sealed class AnalyzerTests
         Assert.Equal("upper", ex.Reference);
     }
 
+    // ---- AC3: Union structural arity check (STORY-04.2.3 / #162) ----
+
+    [Fact]
+    public void CheckAnalysis_Union_SameColumnCount_Resolves()
+    {
+        var catalog = new LocalCatalog();
+        catalog.Register("a", new StructType(new[]
+        {
+            new StructField("x", LongType.Instance),
+            new StructField("y", StringType.Instance),
+        }));
+        catalog.Register("b", new StructType(new[]
+        {
+            new StructField("p", LongType.Instance),
+            new StructField("q", StringType.Instance),
+        }));
+        var analyzer = new Analyzer(catalog);
+        var union = new Union(new[] { Relation("a"), (LogicalPlan)Relation("b") });
+
+        LogicalPlan resolved = analyzer.Resolve(union);
+
+        // By-position union: output arity/names follow the first input (type coercion deferred to #171).
+        Assert.True(resolved.Resolved);
+        Assert.IsType<Union>(resolved);
+    }
+
+    [Fact]
+    public void CheckAnalysis_Union_MismatchedColumnCount_ThrowsNumberOfColumnsMismatch()
+    {
+        var catalog = new LocalCatalog();
+        catalog.Register("wide", new StructType(new[]
+        {
+            new StructField("x", LongType.Instance),
+            new StructField("y", StringType.Instance),
+        }));
+        catalog.Register("narrow", new StructType(new[]
+        {
+            new StructField("z", LongType.Instance),
+        }));
+        var analyzer = new Analyzer(catalog);
+        var union = new Union(new[] { Relation("wide"), (LogicalPlan)Relation("narrow") });
+
+        var ex = Assert.Throws<AnalysisException>(() => analyzer.Resolve(union));
+
+        Assert.Equal(AnalysisErrorKind.NumberOfColumnsMismatch, ex.Kind);
+        // The Spark-parity diagnostic names both arities.
+        Assert.Contains("2 columns", ex.Message);
+        Assert.Contains("1 columns", ex.Message);
+    }
+
     private static void AssertAttribute(
         AttributeReference attribute, string name, DataType type, bool nullable)
     {
