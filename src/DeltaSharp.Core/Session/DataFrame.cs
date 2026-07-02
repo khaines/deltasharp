@@ -50,15 +50,7 @@ public sealed class DataFrame
     public DataFrame Select(params Column[] columns)
     {
         ArgumentNullException.ThrowIfNull(columns);
-        var projectList = new Expression[columns.Length];
-        for (int i = 0; i < columns.Length; i++)
-        {
-            Column column = columns[i]
-                ?? throw new ArgumentNullException($"{nameof(columns)}[{i}]");
-            projectList[i] = column.Expr;
-        }
-
-        return new DataFrame(new Project(projectList, Plan));
+        return new DataFrame(new Project(ToExprs(columns, nameof(columns)), Plan));
     }
 
     /// <summary>
@@ -83,14 +75,7 @@ public sealed class DataFrame
     {
         ArgumentException.ThrowIfNullOrEmpty(column);
         ArgumentNullException.ThrowIfNull(columns);
-        var projectList = new Expression[columns.Length + 1];
-        projectList[0] = Functions.Col(column).Expr;
-        for (int i = 0; i < columns.Length; i++)
-        {
-            projectList[i + 1] = Functions.Col(columns[i]).Expr;
-        }
-
-        return new DataFrame(new Project(projectList, Plan));
+        return new DataFrame(new Project(NamesToExprs(column, columns, nameof(columns)), Plan));
     }
 
     /// <summary>
@@ -190,15 +175,7 @@ public sealed class DataFrame
     public RelationalGroupedDataset GroupBy(params Column[] columns)
     {
         ArgumentNullException.ThrowIfNull(columns);
-        var grouping = new Expression[columns.Length];
-        for (int i = 0; i < columns.Length; i++)
-        {
-            Column column = columns[i]
-                ?? throw new ArgumentNullException($"{nameof(columns)}[{i}]");
-            grouping[i] = column.Expr;
-        }
-
-        return new RelationalGroupedDataset(Plan, grouping);
+        return new RelationalGroupedDataset(Plan, ToExprs(columns, nameof(columns)));
     }
 
     /// <summary>
@@ -223,14 +200,7 @@ public sealed class DataFrame
     {
         ArgumentException.ThrowIfNullOrEmpty(column);
         ArgumentNullException.ThrowIfNull(columns);
-        var grouping = new Expression[columns.Length + 1];
-        grouping[0] = Functions.Col(column).Expr;
-        for (int i = 0; i < columns.Length; i++)
-        {
-            grouping[i + 1] = Functions.Col(columns[i]).Expr;
-        }
-
-        return new RelationalGroupedDataset(Plan, grouping);
+        return new RelationalGroupedDataset(Plan, NamesToExprs(column, columns, nameof(columns)));
     }
 
     /// <summary>
@@ -247,4 +217,57 @@ public sealed class DataFrame
     /// any element of <paramref name="exprs"/> is null.</exception>
     public DataFrame Agg(Column expr, params Column[] exprs) =>
         new RelationalGroupedDataset(Plan, Array.Empty<Expression>()).Agg(expr, exprs);
+
+    /// <summary>
+    /// Materializes a <see cref="Column"/> array into the internal <see cref="Expression"/> array the
+    /// plan nodes consume, unwrapping each <see cref="Column.Expr"/> and rejecting a null element with
+    /// an <b>indexed</b> parameter name (for example <c>columns[2]</c>). Shared by
+    /// <see cref="Select(Column[])"/>, <see cref="GroupBy(Column[])"/>, and
+    /// <see cref="RelationalGroupedDataset.Agg(Column, Column[])"/> so the per-element null guard is
+    /// expressed once.
+    /// </summary>
+    /// <param name="columns">The (non-null) column array to materialize.</param>
+    /// <param name="paramName">The caller's parameter name, used to build the indexed guard message.</param>
+    /// <returns>The unwrapped expressions, in order.</returns>
+    /// <exception cref="ArgumentNullException">Any element of <paramref name="columns"/> is null.</exception>
+    internal static Expression[] ToExprs(Column[] columns, string paramName)
+    {
+        var exprs = new Expression[columns.Length];
+        for (int i = 0; i < columns.Length; i++)
+        {
+            Column column = columns[i]
+                ?? throw new ArgumentNullException($"{paramName}[{i}]");
+            exprs[i] = column.Expr;
+        }
+
+        return exprs;
+    }
+
+    /// <summary>
+    /// Materializes a required first name plus a rest array of names into an
+    /// <see cref="Expression"/> array of <see cref="UnresolvedAttribute"/>s (via
+    /// <see cref="Functions.Col(string)"/>), rejecting a null-or-empty rest element with an
+    /// <b>indexed</b> parameter name (for example <c>columns[1]</c>) so its guard is symmetric with the
+    /// <see cref="Column"/>-array path. Shared by <see cref="Select(string, string[])"/> and
+    /// <see cref="GroupBy(string, string[])"/>. The first name is assumed already validated by the
+    /// caller.
+    /// </summary>
+    /// <param name="first">The (already-validated) first column name.</param>
+    /// <param name="rest">The (non-null) rest array of column names.</param>
+    /// <param name="restParamName">The caller's rest parameter name for the indexed guard message.</param>
+    /// <returns>The name expressions, first then rest, in order.</returns>
+    /// <exception cref="ArgumentException">Any element of <paramref name="rest"/> is null or empty.</exception>
+    private static Expression[] NamesToExprs(string first, string[] rest, string restParamName)
+    {
+        var exprs = new Expression[rest.Length + 1];
+        exprs[0] = Functions.Col(first).Expr;
+        for (int i = 0; i < rest.Length; i++)
+        {
+            string name = rest[i];
+            ArgumentException.ThrowIfNullOrEmpty(name, $"{restParamName}[{i}]");
+            exprs[i + 1] = Functions.Col(name).Expr;
+        }
+
+        return exprs;
+    }
 }

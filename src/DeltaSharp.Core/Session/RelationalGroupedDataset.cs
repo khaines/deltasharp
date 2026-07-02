@@ -29,6 +29,20 @@ namespace DeltaSharp;
 /// Instances are created by <see cref="DataFrame.GroupBy(Column[])"/>, not by user code, so the
 /// constructor is non-public. See <c>docs/engineering/design/aggregation-api.md</c>.
 /// </para>
+/// <para>
+/// <b>Deferred Spark surface.</b> Apache Spark's <c>RelationalGroupedDataset</c> also exposes typed
+/// aggregate shortcuts (<c>sum</c>/<c>avg</c>/<c>mean</c>/<c>min</c>/<c>max</c> over named columns),
+/// <c>pivot</c>, and the string-map/tuple forms (<c>agg(Map&lt;string,string&gt;)</c> /
+/// <c>agg((string, string)*)</c>). DeltaSharp ships only <see cref="Agg(Column, Column[])"/> and
+/// <see cref="Count"/> in M1; the general <c>Agg(Functions.Sum(...).As("total"))</c> door is the
+/// workaround for every typed shortcut. Those members — and the matching global
+/// <c>DataFrame.Agg(Map/tuple)</c> forms — are tracked as a parity backlog in
+/// <see href="https://github.com/khaines/deltasharp/issues/406">#406</see>. Note that a <b>real</b>
+/// aggregate needs aggregate-function resolution + Spark auto-naming
+/// (<see href="https://github.com/khaines/deltasharp/issues/171">#171</see>) <i>and</i> the action
+/// surface (<c>Collect</c>/<c>Show</c>/<c>count</c>) to analyze and execute end-to-end — not just
+/// naming.
+/// </para>
 /// </remarks>
 public sealed class RelationalGroupedDataset
 {
@@ -89,8 +103,9 @@ public sealed class RelationalGroupedDataset
         ArgumentNullException.ThrowIfNull(expr);
         ArgumentNullException.ThrowIfNull(exprs);
 
+        Expression[] tail = DataFrame.ToExprs(exprs, nameof(exprs));
         var aggregateExpressions =
-            new Expression[_groupingExpressions.Count + 1 + exprs.Length];
+            new Expression[_groupingExpressions.Count + 1 + tail.Length];
         int next = 0;
 
         // Spark's retainGroupColumns=true: grouping keys lead the aggregate output.
@@ -100,11 +115,9 @@ public sealed class RelationalGroupedDataset
         }
 
         aggregateExpressions[next++] = expr.Expr;
-        for (int i = 0; i < exprs.Length; i++)
+        foreach (Expression tailExpr in tail)
         {
-            Column column = exprs[i]
-                ?? throw new ArgumentNullException($"{nameof(exprs)}[{i}]");
-            aggregateExpressions[next++] = column.Expr;
+            aggregateExpressions[next++] = tailExpr;
         }
 
         return new DataFrame(new Aggregate(_groupingExpressions, aggregateExpressions, _plan));
@@ -116,7 +129,7 @@ public sealed class RelationalGroupedDataset
     /// <c>"count"</c>, mirroring Spark's <c>RelationalGroupedDataset.count()</c>. Like
     /// <see cref="Agg(Column, Column[])"/> this is a lazy transformation that evaluates nothing.
     /// </summary>
-    /// <remarks>Realized as <c>Agg(Count(Lit(1)).As("count"))</c> — Spark counts rows via
+    /// <remarks>Realized as <c>Agg(Count(Lit(1L)).As("count"))</c> — Spark counts rows via
     /// <c>count(1)</c> and names the output <c>count</c>.</remarks>
     /// <returns>A new <see cref="DataFrame"/> with the per-group row counts.</returns>
     public DataFrame Count() => Agg(Functions.Count(Functions.Lit(1L)).As("count"));

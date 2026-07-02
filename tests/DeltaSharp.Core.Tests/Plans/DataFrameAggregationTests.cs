@@ -103,6 +103,9 @@ public sealed class DataFrameAggregationTests
             aggregate.AggregateExpressions,
             e => Assert.Equal("dept", Assert.IsType<UnresolvedAttribute>(e).Name),
             e => Assert.Equal("sum", Assert.IsType<UnresolvedFunction>(e).Name));
+        // The retained grouping key is the SAME instance in both lists (structural sharing) — the
+        // API prepends the recorded grouping expressions verbatim, it does not rebuild them.
+        Assert.Same(aggregate.GroupingExpressions[0], aggregate.AggregateExpressions[0]);
         Assert.Same(df.Plan, aggregate.Child);
     }
 
@@ -207,6 +210,63 @@ public sealed class DataFrameAggregationTests
         Assert.Equal(viaGroupBy.Plan, viaGlobal.Plan);
     }
 
+    [Fact]
+    public void GlobalAgg_MultipleAggregates_AppendInOrder()
+    {
+        // Non-vacuity guard for DataFrame.Agg's varargs: every supplied aggregate (the required first
+        // plus each `exprs` element) must appear in the Aggregate output, in call order, with an
+        // EMPTY grouping (global aggregation). If Agg were mutated to ignore exprs[1..], this reddens.
+        DataFrame df = People();
+
+        DataFrame result = df.Agg(
+            Functions.Sum(Functions.Col("salary")).As("total"),
+            Functions.Avg(Functions.Col("salary")).As("mean"),
+            Functions.Min(Functions.Col("salary")).As("low"),
+            Functions.Max(Functions.Col("salary")).As("high"));
+
+        var aggregate = Assert.IsType<Aggregate>(result.Plan);
+        Assert.Empty(aggregate.GroupingExpressions);
+        // No retained keys (empty grouping) — the four aggregates appear verbatim, in order.
+        Assert.Collection(
+            aggregate.AggregateExpressions,
+            e => Assert.Equal("total", Assert.IsType<Alias>(e).Name),
+            e => Assert.Equal("mean", Assert.IsType<Alias>(e).Name),
+            e => Assert.Equal("low", Assert.IsType<Alias>(e).Name),
+            e => Assert.Equal("high", Assert.IsType<Alias>(e).Name));
+    }
+
+    [Fact]
+    public void GlobalAgg_NullExprsArray_Throws()
+    {
+        DataFrame df = People();
+        Assert.Throws<ArgumentNullException>(
+            () => df.Agg(Functions.Sum(Functions.Col("salary")), (Column[])null!));
+    }
+
+    [Fact]
+    public void GlobalAgg_NullExprElement_Throws()
+    {
+        DataFrame df = People();
+        Assert.Throws<ArgumentNullException>(
+            () => df.Agg(Functions.Sum(Functions.Col("salary")), null!));
+    }
+
+    [Fact]
+    public void GlobalCount_BuildsAggregateWithEmptyGroupingAndSingleCountColumn()
+    {
+        // GroupBy().Count() is a global (no-key) row count: empty grouping, a single aliased `count`.
+        DataFrame df = People();
+
+        DataFrame result = df.GroupBy().Count();
+
+        var aggregate = Assert.IsType<Aggregate>(result.Plan);
+        Assert.Empty(aggregate.GroupingExpressions);
+        Expression only = Assert.Single(aggregate.AggregateExpressions);
+        var alias = Assert.IsType<Alias>(only);
+        Assert.Equal("count", alias.Name);
+        Assert.Equal("count", Assert.IsType<UnresolvedFunction>(alias.Child).Name);
+    }
+
     // ----- Immutability / structural sharing -----
 
     [Fact]
@@ -248,7 +308,10 @@ public sealed class DataFrameAggregationTests
         // aggregate aliases) is exercised here. Aggregate-FUNCTION resolution and pretty-naming are
         // deferred to #171, so this round-trip uses grouping keys retained by the API plus a
         // resolvable aliased expression (a literal) in aggregate position — enough to prove the
-        // output shape without depending on function resolution.
+        // output shape without depending on function resolution. A parent Project over the resolved
+        // Aggregate then references BOTH the grouping key and the aggregate alias, proving they are
+        // visible in the aggregate's derived output and that the retained grouping attribute reuses
+        // (not rebuilds) the child grouping key's ExprId (the retainGroupColumns ↔ ExprId-reuse loop).
         var catalog = new LocalCatalog();
         catalog.Register("people", new StructType(new[]
         {
@@ -259,25 +322,76 @@ public sealed class DataFrameAggregationTests
         DataFrame df = new(new UnresolvedRelation(new[] { "people" }));
 
         DataFrame aggregated = df.GroupBy("dept").Agg(Functions.Lit(1L).As("marker"));
-        LogicalPlan resolved = analyzer.Resolve(aggregated.Plan);
+        // Parent projection reads the grouping key + the aggregate alias out of the Aggregate output.
+        var projected = new Project(
+            new Expression[] { Functions.Col("dept").Expr, Functions.Col("marker").Expr },
+            aggregated.Plan);
+        LogicalPlan resolved = analyzer.Resolve(projected);
 
-        var aggregate = Assert.IsType<Aggregate>(resolved);
+        var project = Assert.IsType<Project>(resolved);
+        var aggregate = Assert.IsType<Aggregate>(project.Child);
+
         // Grouping key resolves to the dept attribute.
-        Assert.Equal("dept", Assert.IsType<AttributeReference>(Assert.Single(aggregate.GroupingExpressions)).Name);
+        var groupingKey = Assert.IsType<AttributeReference>(Assert.Single(aggregate.GroupingExpressions));
+        Assert.Equal("dept", groupingKey.Name);
         // Output (AggregateExpressions) = retained grouping attribute ⧺ aggregate alias.
         Assert.Collection(
             aggregate.AggregateExpressions,
             e => Assert.Equal("dept", Assert.IsType<AttributeReference>(e).Name),
             e => Assert.Equal("marker", Assert.IsType<Alias>(e).Name));
+
+        // (ii) The retained grouping attribute reuses the child grouping key's ExprId (structural
+        // sharing survives resolution — the key is bound once, to one identity).
+        var retainedKey = Assert.IsType<AttributeReference>(aggregate.AggregateExpressions[0]);
+        Assert.Equal(groupingKey.ExprId, retainedKey.ExprId);
+
+        // (i) The parent Project's references bind against the Aggregate output: `dept` reuses the
+        // retained grouping attribute's ExprId, `marker` binds to the aggregate alias' fresh id.
+        var projectedDept = Assert.IsType<AttributeReference>(project.ProjectList[0]);
+        var projectedMarker = Assert.IsType<AttributeReference>(project.ProjectList[1]);
+        Assert.Equal("dept", projectedDept.Name);
+        Assert.Equal(retainedKey.ExprId, projectedDept.ExprId);
+        Assert.Equal("marker", projectedMarker.Name);
+    }
+
+    [Fact]
+    public void Analyzer_ComplexGroupingKey_ThrowsDeterministically_TrackedUnder171()
+    {
+        // F1 boundary: a COMPLEX grouping key (a non-attribute expression, e.g. Col("a") + Col("b"))
+        // is retained at the front of the aggregate output; today output derivation cannot name a
+        // non-attribute/non-alias element, so Resolve throws a deterministic AnalysisException. This
+        // documents the boundary — aggregate naming/aliasing for computed keys lands with #171.
+        var catalog = new LocalCatalog();
+        catalog.Register("t", new StructType(new[]
+        {
+            new StructField("a", LongType.Instance, nullable: true),
+            new StructField("b", LongType.Instance, nullable: true),
+        }));
+        var analyzer = new Analyzer(catalog);
+        DataFrame df = new(new UnresolvedRelation(new[] { "t" }));
+
+        DataFrame aggregated = df
+            .GroupBy(Functions.Col("a").Plus(Functions.Col("b")))
+            .Agg(Functions.Lit(1L).As("m"));
+
+        var ex = Assert.Throws<AnalysisException>(() => analyzer.Resolve(aggregated.Plan));
+        Assert.Equal(AnalysisErrorKind.UnsupportedProjection, ex.Kind);
     }
 
     [Fact]
     public void Analyzer_RealAggregateFunction_ReportsDeferredResolution_NotApiExecution()
     {
         // AC3 boundary: an aggregate FUNCTION (count/sum/…) is still unresolved after this story — the
-        // ANALYZER is the gate that reports it (deterministic AnalysisException), never the API. The
+        // ANALYZER is the gate that reports it (a deterministic AnalysisException), never the API. The
         // API only builds a well-formed unresolved Aggregate; it neither coerces nor executes.
-        // Aggregate input type-validation + function resolution land with STORY-04.5.2 (#171).
+        // Aggregate input type-validation + function resolution + Spark auto-naming land with
+        // STORY-04.5.2 (#171). ("Nothing is read/executed" is proven by the §7 lazy tests in
+        // DataFrameAggregationLazyTests, not here.)
+        //
+        // The message is PINNED so #171 improves it deliberately: for a bare aggregate the failure
+        // fires from output derivation (DeriveOutput → ToAttribute's UnresolvedFunction branch) during
+        // ResolveReferences — BEFORE CheckAnalysis — so it carries the UnsupportedProjection kind and
+        // the deferred-resolution message (not CheckAnalysis' generic unresolved-reference text).
         var catalog = new LocalCatalog();
         catalog.Register("people", new StructType(new[]
         {
@@ -289,7 +403,13 @@ public sealed class DataFrameAggregationTests
 
         DataFrame aggregated = df.GroupBy("dept").Agg(Functions.Sum(Functions.Col("salary")));
 
-        Assert.Throws<AnalysisException>(() => analyzer.Resolve(aggregated.Plan));
+        var ex = Assert.Throws<AnalysisException>(() => analyzer.Resolve(aggregated.Plan));
+        Assert.Equal(AnalysisErrorKind.UnsupportedProjection, ex.Kind);
+        Assert.Equal(
+            "Aggregate/function output 'sum' cannot be named yet: aggregate-function resolution and "
+            + "Spark auto-naming are deferred to STORY-04.5.2 (#171). Alias the expression (for "
+            + "example .As(\"total\")) as the M1 workaround.",
+            ex.Message);
     }
 
     // ----- Null / empty argument guards -----
