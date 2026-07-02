@@ -100,6 +100,8 @@ public sealed class Column
     /// <paramref name="value"/> (coerced via <see cref="Functions.Lit(object?)"/>).
     /// </summary>
     /// <param name="value">The right operand as a literal value (or an existing column).</param>
+    /// <remarks>A bare <c>null</c> binds the <c>Column</c> overload (which throws); pass
+    /// <c>(object?)null</c> for a SQL <c>NULL</c> literal.</remarks>
     /// <returns>A new <see cref="Column"/>; this instance is unchanged.</returns>
     public Column Plus(object? value) => Arithmetic(value, ArithmeticOperator.Add);
 
@@ -117,6 +119,8 @@ public sealed class Column
     /// literal <paramref name="value"/>.
     /// </summary>
     /// <param name="value">The right operand as a literal value (or an existing column).</param>
+    /// <remarks>A bare <c>null</c> binds the <c>Column</c> overload (which throws); pass
+    /// <c>(object?)null</c> for a SQL <c>NULL</c> literal.</remarks>
     /// <returns>A new <see cref="Column"/>; this instance is unchanged.</returns>
     public Column Minus(object? value) => Arithmetic(value, ArithmeticOperator.Subtract);
 
@@ -134,6 +138,8 @@ public sealed class Column
     /// literal <paramref name="value"/>.
     /// </summary>
     /// <param name="value">The right operand as a literal value (or an existing column).</param>
+    /// <remarks>A bare <c>null</c> binds the <c>Column</c> overload (which throws); pass
+    /// <c>(object?)null</c> for a SQL <c>NULL</c> literal.</remarks>
     /// <returns>A new <see cref="Column"/>; this instance is unchanged.</returns>
     public Column Multiply(object? value) => Arithmetic(value, ArithmeticOperator.Multiply);
 
@@ -151,6 +157,8 @@ public sealed class Column
     /// <paramref name="value"/>.
     /// </summary>
     /// <param name="value">The right operand as a literal value (or an existing column).</param>
+    /// <remarks>A bare <c>null</c> binds the <c>Column</c> overload (which throws); pass
+    /// <c>(object?)null</c> for a SQL <c>NULL</c> literal.</remarks>
     /// <returns>A new <see cref="Column"/>; this instance is unchanged.</returns>
     public Column Divide(object? value) => Arithmetic(value, ArithmeticOperator.Divide);
 
@@ -168,6 +176,8 @@ public sealed class Column
     /// literal <paramref name="value"/>.
     /// </summary>
     /// <param name="value">The right operand as a literal value (or an existing column).</param>
+    /// <remarks>A bare <c>null</c> binds the <c>Column</c> overload (which throws); pass
+    /// <c>(object?)null</c> for a SQL <c>NULL</c> literal.</remarks>
     /// <returns>A new <see cref="Column"/>; this instance is unchanged.</returns>
     public Column Mod(object? value) => Arithmetic(value, ArithmeticOperator.Remainder);
 
@@ -198,6 +208,8 @@ public sealed class Column
     /// literal <paramref name="value"/> (coerced via <see cref="Functions.Lit(object?)"/>).
     /// </summary>
     /// <param name="value">The right operand as a literal value (or an existing column).</param>
+    /// <remarks>A bare <c>null</c> binds the <c>Column</c> overload (which throws); pass
+    /// <c>(object?)null</c> for a SQL <c>NULL</c> literal.</remarks>
     /// <returns>A new boolean-valued <see cref="Column"/>; this instance is unchanged.</returns>
     public Column EqualTo(object? value) => Comparison(value, ComparisonOperator.Equal);
 
@@ -216,6 +228,8 @@ public sealed class Column
     /// the literal <paramref name="value"/>.
     /// </summary>
     /// <param name="value">The right operand as a literal value (or an existing column).</param>
+    /// <remarks>A bare <c>null</c> binds the <c>Column</c> overload (which throws); pass
+    /// <c>(object?)null</c> for a SQL <c>NULL</c> literal.</remarks>
     /// <returns>A new boolean-valued <see cref="Column"/>; this instance is unchanged.</returns>
     public Column NotEqual(object? value) => Comparison(value, ComparisonOperator.NotEqual);
 
@@ -233,6 +247,8 @@ public sealed class Column
     /// literal <paramref name="value"/>.
     /// </summary>
     /// <param name="value">The right operand as a literal value (or an existing column).</param>
+    /// <remarks>A bare <c>null</c> binds the <c>Column</c> overload (which throws); pass
+    /// <c>(object?)null</c> for a SQL <c>NULL</c> literal.</remarks>
     /// <returns>A new boolean-valued <see cref="Column"/>; this instance is unchanged.</returns>
     public Column Lt(object? value) => Comparison(value, ComparisonOperator.LessThan);
 
@@ -250,6 +266,8 @@ public sealed class Column
     /// the literal <paramref name="value"/>.
     /// </summary>
     /// <param name="value">The right operand as a literal value (or an existing column).</param>
+    /// <remarks>A bare <c>null</c> binds the <c>Column</c> overload (which throws); pass
+    /// <c>(object?)null</c> for a SQL <c>NULL</c> literal.</remarks>
     /// <returns>A new boolean-valued <see cref="Column"/>; this instance is unchanged.</returns>
     public Column Leq(object? value) => Comparison(value, ComparisonOperator.LessThanOrEqual);
 
@@ -267,6 +285,8 @@ public sealed class Column
     /// literal <paramref name="value"/>.
     /// </summary>
     /// <param name="value">The right operand as a literal value (or an existing column).</param>
+    /// <remarks>A bare <c>null</c> binds the <c>Column</c> overload (which throws); pass
+    /// <c>(object?)null</c> for a SQL <c>NULL</c> literal.</remarks>
     /// <returns>A new boolean-valued <see cref="Column"/>; this instance is unchanged.</returns>
     public Column Gt(object? value) => Comparison(value, ComparisonOperator.GreaterThan);
 
@@ -284,6 +304,8 @@ public sealed class Column
     /// against the literal <paramref name="value"/>.
     /// </summary>
     /// <param name="value">The right operand as a literal value (or an existing column).</param>
+    /// <remarks>A bare <c>null</c> binds the <c>Column</c> overload (which throws); pass
+    /// <c>(object?)null</c> for a SQL <c>NULL</c> literal.</remarks>
     /// <returns>A new boolean-valued <see cref="Column"/>; this instance is unchanged.</returns>
     public Column Geq(object? value) => Comparison(value, ComparisonOperator.GreaterThanOrEqual);
 
@@ -312,6 +334,8 @@ public sealed class Column
     /// <paramref name="value"/> (coerced via <see cref="Functions.Lit(object?)"/>).
     /// </summary>
     /// <param name="value">The right operand as a literal value (or an existing column).</param>
+    /// <remarks>A bare <c>null</c> binds the <c>Column</c> overload (which throws); pass
+    /// <c>(object?)null</c> for a SQL <c>NULL</c> literal.</remarks>
     /// <returns>A new boolean-valued <see cref="Column"/>; this instance is unchanged.</returns>
     public Column And(object? value) => new(new And(Expr, Functions.Lit(value).Expr));
 
@@ -333,6 +357,8 @@ public sealed class Column
     /// <paramref name="value"/>.
     /// </summary>
     /// <param name="value">The right operand as a literal value (or an existing column).</param>
+    /// <remarks>A bare <c>null</c> binds the <c>Column</c> overload (which throws); pass
+    /// <c>(object?)null</c> for a SQL <c>NULL</c> literal.</remarks>
     /// <returns>A new boolean-valued <see cref="Column"/>; this instance is unchanged.</returns>
     public Column Or(object? value) => new(new Or(Expr, Functions.Lit(value).Expr));
 
@@ -382,13 +408,44 @@ public sealed class Column
     /// <summary>
     /// Returns <c>this &lt;=&gt; <paramref name="value"/></c> as an <c>EqualNullSafe</c> predicate
     /// against the literal <paramref name="value"/> (coerced via <see cref="Functions.Lit(object?)"/>).
-    /// A <c>null</c> value becomes a typed SQL <c>NULL</c> literal, so <c>col.EqualNullSafe(null)</c>
-    /// tests "is this column null" with null-safe semantics.
+    /// A <c>null</c> value becomes a typed SQL <c>NULL</c> literal, so
+    /// <c>col.EqualNullSafe((object?)null)</c> tests "is this column null" with null-safe semantics.
     /// </summary>
+    /// <remarks>
+    /// A <b>bare</b> <c>null</c> (<c>col.EqualNullSafe(null)</c>) binds to the more-specific
+    /// <see cref="EqualNullSafe(DeltaSharp.Column)"/> overload — which null-guards and throws — not to
+    /// this overload. To pass a SQL <c>NULL</c> literal write <c>(object?)null</c>, or prefer
+    /// <see cref="IsNull"/> for the "is this column null" idiom.
+    /// </remarks>
     /// <param name="value">The right operand as a literal value (or an existing column).</param>
     /// <returns>A new boolean-valued <see cref="Column"/>; this instance is unchanged.</returns>
     public Column EqualNullSafe(object? value) =>
         new(new EqualNullSafe(Expr, Functions.Lit(value).Expr));
+
+    /// <summary>
+    /// Alias for <see cref="EqualNullSafe(DeltaSharp.Column)"/> matching Spark's
+    /// <c>Column.eqNullSafe</c> spelling for prefix-match IntelliSense discoverability.
+    /// <see cref="EqualNullSafe(DeltaSharp.Column)"/> remains the canonical member.
+    /// </summary>
+    /// <param name="other">The right operand.</param>
+    /// <returns>A new boolean-valued <see cref="Column"/>; this instance is unchanged.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="other"/> is null.</exception>
+    public Column EqNullSafe(Column other) => EqualNullSafe(other);
+
+    /// <summary>
+    /// Alias for <see cref="EqualNullSafe(object?)"/> matching Spark's <c>Column.eqNullSafe</c>
+    /// spelling for prefix-match IntelliSense discoverability.
+    /// <see cref="EqualNullSafe(object?)"/> remains the canonical member.
+    /// </summary>
+    /// <remarks>
+    /// A <b>bare</b> <c>null</c> (<c>col.EqNullSafe(null)</c>) binds to the more-specific
+    /// <see cref="EqNullSafe(DeltaSharp.Column)"/> overload — which null-guards and throws — not to
+    /// this overload. Write <c>(object?)null</c> for a SQL <c>NULL</c> literal, or prefer
+    /// <see cref="IsNull"/>.
+    /// </remarks>
+    /// <param name="value">The right operand as a literal value (or an existing column).</param>
+    /// <returns>A new boolean-valued <see cref="Column"/>; this instance is unchanged.</returns>
+    public Column EqNullSafe(object? value) => EqualNullSafe(value);
 
     // ---------------------------------------------------------------------------------------------
     // C# operator overloads. Arithmetic (+ - * / %) and ordering comparison (< <= > >=) are
@@ -492,9 +549,18 @@ public sealed class Column
     public static Column operator |(Column left, Column right) => Require(left).Or(right);
 
     /// <summary>
-    /// Builds <c>NOT operand</c> (PySpark-aligned <c>~</c>); see <see cref="Not"/>.
+    /// Builds <c>NOT operand</c> (Scala-aligned <c>!col</c>); see <see cref="Not"/>. Equivalent to
+    /// <see cref="operator ~(DeltaSharp.Column)"/>.
     /// </summary>
     public static Column operator !(Column operand) => Require(operand).Not();
+
+    /// <summary>
+    /// Builds <c>NOT operand</c> (PySpark-aligned <c>~col</c>, Spark's primary negation); see
+    /// <see cref="Not"/>. Equivalent to <see cref="operator !(DeltaSharp.Column)"/> — both build a
+    /// <c>Not</c> node — and legal C# because the operator returns the reference type
+    /// <see cref="Column"/> rather than an integral bitwise complement.
+    /// </summary>
+    public static Column operator ~(Column operand) => Require(operand).Not();
 
     private static Column Require(Column column)
     {

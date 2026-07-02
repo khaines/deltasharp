@@ -58,6 +58,8 @@ DeltaSharp.Column.And(DeltaSharp.Column! other) -> DeltaSharp.Column!
 DeltaSharp.Column.And(object? value) -> DeltaSharp.Column!
 DeltaSharp.Column.Divide(DeltaSharp.Column! other) -> DeltaSharp.Column!
 DeltaSharp.Column.Divide(object? value) -> DeltaSharp.Column!
+DeltaSharp.Column.EqNullSafe(DeltaSharp.Column! other) -> DeltaSharp.Column!
+DeltaSharp.Column.EqNullSafe(object? value) -> DeltaSharp.Column!
 DeltaSharp.Column.EqualNullSafe(DeltaSharp.Column! other) -> DeltaSharp.Column!
 DeltaSharp.Column.EqualNullSafe(object? value) -> DeltaSharp.Column!
 DeltaSharp.Column.EqualTo(DeltaSharp.Column! other) -> DeltaSharp.Column!
@@ -86,6 +88,7 @@ DeltaSharp.Column.Or(object? value) -> DeltaSharp.Column!
 DeltaSharp.Column.Plus(DeltaSharp.Column! other) -> DeltaSharp.Column!
 DeltaSharp.Column.Plus(object? value) -> DeltaSharp.Column!
 static DeltaSharp.Column.operator !(DeltaSharp.Column! operand) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator ~(DeltaSharp.Column! operand) -> DeltaSharp.Column!
 static DeltaSharp.Column.operator %(DeltaSharp.Column! left, DeltaSharp.Column! right) -> DeltaSharp.Column!
 static DeltaSharp.Column.operator %(DeltaSharp.Column! left, object? value) -> DeltaSharp.Column!
 static DeltaSharp.Column.operator %(object? value, DeltaSharp.Column! right) -> DeltaSharp.Column!

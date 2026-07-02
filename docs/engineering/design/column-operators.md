@@ -4,8 +4,9 @@
 > [STORY-04.3.2](https://github.com/khaines/deltasharp/blob/main/docs/planning/epics/EPIC-04-core-api-logical-plan.md)
 > (issue [#165](https://github.com/khaines/deltasharp/issues/165), FEAT-04.3 — column operators and
 > boolean/null semantics). Grounded in [ADR-0008](../../adr/0008-type-system-row-format.md) (type
-> system + SQL three-valued logic) and [ADR-0001](../../adr/0001-execution-strategy.md) (lazy/eager
-> execution). Builds directly on [column-and-functions.md](column-and-functions.md) (STORY-04.3.1 #164,
+> system + SQL three-valued logic) and [ADR-0001](../../adr/0001-execution-strategy.md) (execution
+> strategy — the action-triggered *lazy build → eager execute* boundary this story's builders sit on the
+> lazy side of). Builds directly on [column-and-functions.md](column-and-functions.md) (STORY-04.3.1 #164,
 > the public `Column`/`Functions` surface), [expression-model.md](expression-model.md) (the internal
 > expression IR, #168), and [api-governance.md](api-governance.md) (the `PublicAPI` baseline). Update
 > it whenever the public operator surface, the Spark→DeltaSharp name map, the literal-coercion rules,
@@ -64,8 +65,9 @@ the operator by *method identity* (`Plus` → `Add`, `Gt` → `GreaterThan`, …
 ### Why `BinaryArithmetic.Type` is `null` but comparisons/booleans are `BooleanType`
 
 Arithmetic result type needs Spark's numeric promotion / decimal result-type coercion, which is the
-analyzer's job, so `BinaryArithmetic` reports an unknown (`null`) type hint until analysis
-(`BinaryOperatorExpressions.cs:8-11`). Comparisons, `And`/`Or`/`Not`, and the null predicates are
+analyzer's job, so `BinaryArithmetic` reports an unknown (`null`) type hint until analysis — it inherits
+`Expression`'s default `Type => null` (`Expression.cs:44`), as documented on the node
+(`BinaryOperatorExpressions.cs:8-9`). Comparisons, `And`/`Or`/`Not`, and the null predicates are
 boolean by construction, so their `Type` is `BooleanType` even before analysis — the API records that
 directly. This is verified by `ArithmeticMethod_*` (asserts `Type == null`) and `ComparisonMethod_*` /
 `And_*` / `Or_*` / `Not_*` (assert `BooleanType`).
@@ -92,7 +94,7 @@ where they are unambiguous and safe. Every named method has a `Column` overload 
 | `geq` / `>=` | `Geq` | `>=` | `BinaryComparison(GreaterThanOrEqual)` |
 | `and` / `&&` | `And` | `&` | `And` |
 | `or` / `\|\|` | `Or` | `\|` | `Or` |
-| `functions.not` / `!col` / `~col` | `Not` | `!` | `Not` |
+| `functions.not` / `!col` / `~col` | `Not` | `!` and `~` | `Not` |
 | `isNull` | `IsNull` | — | `IsNull` |
 | `isNotNull` | `IsNotNull` | — | `IsNotNull` |
 | `eqNullSafe` / `<=>` | `EqualNullSafe` | — | `EqualNullSafe` |
@@ -105,10 +107,14 @@ Ported code reads naturally: Spark `col("a").plus(1).gt(10).and(col("b").isNotNu
 
 - **`EqualNullSafe`** (not Spark's `eqNullSafe`) — the method is named after the internal Catalyst node
   (`EqualNullSafe`) for immediate readability and to match the diagnostic `SimpleString` (`<=>`). The
-  Spark name and symbol are documented on the member.
+  Spark name and symbol are documented on the member. An **`EqNullSafe`** alias (both the `Column` and
+  `object?` overloads) is also shipped — it matches Spark's `Column.eqNullSafe` spelling exactly so
+  IntelliSense prefix-matching surfaces it; it simply delegates to `EqualNullSafe`, which stays the
+  canonical member.
 - **`Not()` is an instance method** (Spark exposes negation as `functions.not(col)` / Scala `!col` /
   PySpark `~col`, not `Column.not()`). An instance `Not()` is the most discoverable .NET shape and pairs
-  with the `!`/`~`-style `operator !` below.
+  with **both** `operator !` (Scala-style `!col`) and `operator ~` (PySpark-style `~col`) below — the
+  two operators are identical (both build a `Not` node); we ship both for cross-dialect muscle memory.
 
 ## The `==` landmine: why methods, not `operator ==`/`operator !=`
 
@@ -139,10 +145,24 @@ they **are** provided as operators in addition to `Lt/Leq/Gt/Geq`.
 C# cannot meaningfully overload `&&`/`||` for lazy user semantics (they require `operator true`/`false`
 and short-circuit on the *runtime* value, which does not exist at plan-build time). DeltaSharp therefore
 exposes boolean combinators as `And`/`Or`/`Not` methods and provides the **non-short-circuiting**
-`operator &`/`operator |`/`operator !` as PySpark-aligned sugar (`col1 & col2`, `~col`). Non-short-
-circuiting is correct here: building an expression tree must assemble *both* operands regardless — there
-is nothing to short-circuit at construction time; SQL three-valued evaluation happens later in the
-engine.
+`operator &`/`operator |` as PySpark-aligned sugar (`col1 & col2`). Non-short-circuiting is correct
+here: building an expression tree must assemble *both* operands regardless — there is nothing to
+short-circuit at construction time; SQL three-valued evaluation happens later in the engine.
+
+Negation ships as **two** equivalent unary operators — `operator !` (Scala-style `!col`) and
+`operator ~` (PySpark-style `~col`, Spark's *primary* negation) — both delegating to `Not()` and
+building an identical `Not` node. `operator ~` is legal C# on `Column` because it returns the reference
+type `Column` (it is not constrained to integral bitwise complement); shipping both spellings gives
+Scala- and Python-origin users their native muscle memory. Pinned by `TildeOperator_BuildsNotNode_LikeBangAndNot`.
+
+### Deferred: unary minus / negate (`-col`)
+
+Spark's **unary minus** / `negate` (`-col`, `functions.negate(col)`) is **not** shipped by this story.
+It is deferred pending a `UnaryMinus` expression IR node, which #168 (the expression model) did **not**
+deliver — this story adds no new node, it only wraps existing ones. Note the **binary** `operator -`
+(`col - other`, `col - 1`, `1 - col`) *is* shipped; only the **unary** form is absent. This is an
+intentional, tracked gap — [#400](https://github.com/khaines/deltasharp/issues/400) covers adding the
+`UnaryMinus` node plus `Negate()` / unary `operator -(Column)` — not an oversight.
 
 ## Literal coercion rules
 
@@ -195,6 +215,24 @@ public API:
 The API does not *evaluate* any of this; it guarantees the correct **node kind** is recorded so the
 downstream 3VL contract is unambiguous.
 
+### `NotEqual` is a dedicated node, not `Not(EqualTo(...))`
+
+`NotEqual` / `<>` builds a **dedicated** `BinaryComparison(ComparisonOperator.NotEqual)` node
+(`NodeName = "NotEqualTo"`), **not** the `Not(EqualTo(...))` tree that Apache Spark's Catalyst lowers
+`!=` / `notEqual` to. This is a deliberate structural divergence:
+
+- **Rationale.** A dedicated `NotEqualTo` maps **directly** to Parquet's `FilterApi.notEq`, so it can be
+  pushed down for Delta/Parquet **data-skipping** without first having to re-recognize a `Not(EqualTo)`
+  shape. It is semantically faithful under 3VL — `a <> b` and `NOT (a = b)` agree on
+  `true`/`false`/`NULL`.
+- **Forward obligation.** Because the shape diverges from Catalyst, any rule that pattern-matches the
+  canonical `Not(EqualTo(...))` must **special-case `NotEqualTo`** — specifically future optimizer rules
+  (`BooleanSimplification`, `NullPropagation`, De Morgan normalization) and Parquet/Delta predicate
+  translation — **or** the analyzer must canonicalize `NotEqualTo` to `Not(EqualTo(...))` (and
+  reconstruct `notEq` at the filter boundary). This decision is tracked in
+  [#399](https://github.com/khaines/deltasharp/issues/399); until it is resolved, optimizer and
+  filter-translation rules must handle the `NotEqualTo` node kind.
+
 ## AC4 — the API does not coerce types; the analyzer reports misuse
 
 This is the load-bearing correctness contract of the story. The `Column` operator API is a **dumb
@@ -214,6 +252,17 @@ Adding type checks in the `Column` API would **mask** analyzer errors (produce a
 wrong-layer diagnostic) and violate the EPIC-04 layer separation (API builds plans; the analyzer
 resolves and type-checks them). So the only guard the API applies is the **null-reference** guard on
 `Column` operands — a CLR programming error, not a SQL type error.
+
+> **Deferred: the analyzer-rejection half of AC4.** AC4 has two halves. The *"API does not
+> coerce/mask"* half is delivered and tested here (above). The complementary *"the analyzer **reports**
+> operator misuse (e.g. bool-in-arithmetic)"* half is **not yet delivered**: the analyzer
+> (`CheckAnalysis`, #170) currently rejects only `Unresolved*` markers and does **not** type-check
+> operator operands, so `col.IsNull().Plus(1)` builds *and* survives analysis today. Operator operand
+> type-checking is expected to land with STORY-04.5.2 function binding & type coercion
+> ([#171](https://github.com/khaines/deltasharp/issues/171)); a review comment on that issue asks it to
+> confirm operator (not just function) type errors are in scope. Until then the misuse is caught neither
+> by the API (by design) nor the analyzer (not yet built) — an intentional, tracked gap, not a
+> regression.
 
 ## Lazy guarantee
 
@@ -235,16 +284,23 @@ operands' `Expr` is unchanged.
 
 All new members are appended (append-only, grouped) to `src/DeltaSharp.Core/PublicAPI.Unshipped.txt`
 (RS0016/RS0017 enforced as errors under `-warnaserror`; lanes #160/#166 append to the same file in
-parallel). The added surface is: the 30 named-method overloads (5 arithmetic × 2, 6 comparison × 2,
-`And`/`Or` × 2, `Not`/`IsNull`/`IsNotNull`, `EqualNullSafe` × 2) plus the operator overloads
-(`+ - * / %` and `< <= > >=` each in `(Column,Column)`, `(Column,object?)`, `(object?,Column)` forms,
-and `&`/`|`/`!`). `Column.Expr` and `Column(Expression)` stay `internal` — no public member exposes the
+parallel). The added surface is **64 public members = 33 named-method overloads + 31 operator
+overloads**:
+
+- **33 named-method overloads** — 5 arithmetic × 2 (`Column`/`object?`) = 10, 6 comparison × 2 = 12,
+  `And`/`Or` × 2 = 4, `Not`/`IsNull`/`IsNotNull` = 3, `EqualNullSafe` × 2 = 2, and the `EqNullSafe`
+  alias × 2 = 2.
+- **31 operator overloads** — `+ - * / %` (5) and `< <= > >=` (4) each in `(Column,Column)`,
+  `(Column,object?)`, `(object?,Column)` forms = 9 × 3 = 27, plus `&`/`|` (2) and the two equivalent
+  unary negations `!`/`~` (2).
+
+`Column.Expr` and `Column(Expression)` stay `internal` — no public member exposes the
 IR. **CA2225** (operator alternate methods) does not fire in this repo's analysis mode, and is satisfied
-anyway: every operator has a named method equivalent (`Plus`/`Lt`/`And`/…).
+anyway: every operator has a named method equivalent (`Plus`/`Lt`/`And`/`Not`/…).
 
 ## AC → test mapping
 
-Tests live in `tests/DeltaSharp.Core.Tests/ColumnOperatorTests.cs` (33 tests, run on `net8.0` and
+Tests live in `tests/DeltaSharp.Core.Tests/ColumnOperatorTests.cs` (45 tests, run on `net8.0` and
 `net10.0`).
 
 | AC | Requirement | Tests |
@@ -253,6 +309,12 @@ Tests live in `tests/DeltaSharp.Core.Tests/ColumnOperatorTests.cs` (33 tests, ru
 | **AC2** | Boolean And/Or/Not — SQL 3VL is the recorded/analyzed contract | `And_BuildsAndNode`, `Or_BuildsOrNode`, `Not_BuildsNotNode_OverChild`, `Not_NullabilityFollowsChild`, `BooleanOperators_BuildBooleanNodes` |
 | **AC3** | Null checks + null-safe equality are distinct node kinds preserving Spark null behavior | `IsNull_And_IsNotNull_AreDistinctNodeKinds`, `EqualNullSafe_IsDistinctFromEqualTo`, `EqualNullSafe_WithNull_CoercesToNullLiteral` |
 | **AC4** | Operator misuse is reported by the analyzer later, not hidden by API coercion (the API does not coerce/validate types) | `ArithmeticOverBooleanPredicate_BuildsNodeWithoutThrowing`, `Arithmetic_DoesNotInsertCastsOrCoercions` |
+| Operand order & identity | every C# operator overload pins Left/Right identity & source order (swap/reverse reddens) | `ArithmeticOperators_ColumnColumn_PreserveOperandOrder`, `ArithmeticOperators_ScalarOnRight_PreserveOperandOrder`, `ArithmeticOperators_ScalarOnLeft_PreserveOperandOrder`, `ComparisonOperators_ColumnColumn_PreserveOperandOrder`, `ComparisonOperators_ScalarOnRight_PreserveOperandOrder`, `ComparisonOperators_ScalarOnLeft_PreserveOperandOrder` |
+| `object?` overloads | every scalar overload builds the right node with the scalar coerced to a right `Literal` | `ObjectOverloads_Arithmetic_And_Comparison_CoerceScalarToRightLiteral`, `ObjectOverloads_Boolean_And_NullSafe_BuildRightNodeWithLiteral` |
+| No `operator ==` | `col == null` / `col == other` is CLR reference identity (builds no node); `EqualTo` builds the node | `EqualityOperator_IsReferenceIdentity_AndBuildsNoExpression` |
+| `~`/`!` negation | `~col` and `!col` build the same `Not` node as `.Not()` | `TildeOperator_BuildsNotNode_LikeBangAndNot`, `BooleanOperators_BuildBooleanNodes` |
+| `EqNullSafe` alias | `EqNullSafe(Column)`/`EqNullSafe(object?)` delegate to `EqualNullSafe` | `EqNullSafe_Aliases_DelegateToEqualNullSafe` |
+| Null-binding | `EqualNullSafe((object?)null)` builds a null `Literal`; bare `null` binds the `Column` overload and throws | `EqualNullSafe_NullBinding_IsExplicit` |
 | Literal coercion | `col ⟨op⟩ scalar` builds `⟨op⟩(colExpr, Lit(scalar))`; order preserved; `Column` passthrough | `Gt_WithScalar_CoercesToLiteral`, `Plus_WithScalar_CoercesToLiteral`, `ScalarOverload_WithColumn_PassesThroughUnchanged`, `ComparisonOperator_WithScalar_KeepsOperandOrder` |
 | Null guards | null `Column` operand throws; null scalar is a SQL `NULL` literal | `Method_NullColumnOperand_Throws`, `Operator_NullColumnOperand_Throws`, `ScalarOverload_NullValue_BuildsNullLiteral` |
 | Immutability | operators return new `Column`s; operands unchanged | `Operators_ReturnNewColumns_OperandsUnchanged` |

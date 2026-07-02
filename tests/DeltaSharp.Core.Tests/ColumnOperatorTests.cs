@@ -383,4 +383,262 @@ public class ColumnOperatorTests
         Assert.False(result.Expr.Resolved); // still unresolved: no catalog/schema was consulted
         Assert.Equal("(('unknown_a + 'unknown_b) > 0)", result.ToString());
     }
+
+    // ----- Operand-order efficacy: pin Left/Right *identity* for every C# operator overload --------
+    // These close the mutation gaps Quality proved: swapping operands (a-b → b-a) or reversing the
+    // scalar-on-left forms (5-col → col-5) previously stayed GREEN. Assert.Same on Left/Right makes
+    // any operand swap redden. Arithmetic and reversed comparisons are non-commutative, so order is
+    // semantically load-bearing (5 - col ≠ col - 5; 5 < col ≠ col < 5).
+
+    [Fact] // FIX 1: C# arithmetic Column⟨op⟩Column overloads pin operand identity & order
+    public void ArithmeticOperators_ColumnColumn_PreserveOperandOrder()
+    {
+        Column a = Col("a");
+        Column b = Col("b");
+
+        AssertArith(a + b, ArithmeticOperator.Add, a, b);
+        AssertArith(a - b, ArithmeticOperator.Subtract, a, b);
+        AssertArith(a * b, ArithmeticOperator.Multiply, a, b);
+        AssertArith(a / b, ArithmeticOperator.Divide, a, b);
+        AssertArith(a % b, ArithmeticOperator.Remainder, a, b);
+
+        static void AssertArith(Column result, ArithmeticOperator op, Column left, Column right)
+        {
+            var node = Assert.IsType<BinaryArithmetic>(result.Expr);
+            Assert.Equal(op, node.Operator);
+            Assert.Same(left.Expr, node.Left);
+            Assert.Same(right.Expr, node.Right);
+        }
+    }
+
+    [Fact] // FIX 1: `col ⟨op⟩ scalar` keeps the column on the LEFT and the literal on the RIGHT
+    public void ArithmeticOperators_ScalarOnRight_PreserveOperandOrder()
+    {
+        Column c = Col("age");
+
+        AssertRight(c + 5, ArithmeticOperator.Add, c, 5);
+        AssertRight(c - 5, ArithmeticOperator.Subtract, c, 5);
+        AssertRight(c * 5, ArithmeticOperator.Multiply, c, 5);
+        AssertRight(c / 5, ArithmeticOperator.Divide, c, 5);
+        AssertRight(c % 5, ArithmeticOperator.Remainder, c, 5);
+
+        static void AssertRight(Column result, ArithmeticOperator op, Column left, int rightLit)
+        {
+            var node = Assert.IsType<BinaryArithmetic>(result.Expr);
+            Assert.Equal(op, node.Operator);
+            Assert.Same(left.Expr, node.Left);
+            Assert.Equal(rightLit, Assert.IsType<Literal>(node.Right).Value);
+        }
+    }
+
+    [Fact] // FIX 1: reversed `scalar ⟨op⟩ col` keeps the literal on the LEFT (NOT rewritten/swapped)
+    public void ArithmeticOperators_ScalarOnLeft_PreserveOperandOrder()
+    {
+        Column c = Col("age");
+
+        AssertLeft(5 + c, ArithmeticOperator.Add, 5, c);
+        AssertLeft(5 - c, ArithmeticOperator.Subtract, 5, c);
+        AssertLeft(5 * c, ArithmeticOperator.Multiply, 5, c);
+        AssertLeft(5 / c, ArithmeticOperator.Divide, 5, c);
+        AssertLeft(5 % c, ArithmeticOperator.Remainder, 5, c);
+
+        static void AssertLeft(Column result, ArithmeticOperator op, int leftLit, Column right)
+        {
+            var node = Assert.IsType<BinaryArithmetic>(result.Expr);
+            Assert.Equal(op, node.Operator);
+            Assert.Equal(leftLit, Assert.IsType<Literal>(node.Left).Value);
+            Assert.Same(right.Expr, node.Right);
+        }
+    }
+
+    [Fact] // FIX 1: ordering comparison Column⟨op⟩Column overloads pin operand identity & order
+    public void ComparisonOperators_ColumnColumn_PreserveOperandOrder()
+    {
+        Column a = Col("a");
+        Column b = Col("b");
+
+        AssertCmp(a < b, ComparisonOperator.LessThan, a, b);
+        AssertCmp(a <= b, ComparisonOperator.LessThanOrEqual, a, b);
+        AssertCmp(a > b, ComparisonOperator.GreaterThan, a, b);
+        AssertCmp(a >= b, ComparisonOperator.GreaterThanOrEqual, a, b);
+
+        static void AssertCmp(Column result, ComparisonOperator op, Column left, Column right)
+        {
+            var node = Assert.IsType<BinaryComparison>(result.Expr);
+            Assert.Equal(op, node.Operator);
+            Assert.Same(left.Expr, node.Left);
+            Assert.Same(right.Expr, node.Right);
+        }
+    }
+
+    [Fact] // FIX 1: `col ⟨op⟩ scalar` keeps the column on the LEFT, literal on the RIGHT
+    public void ComparisonOperators_ScalarOnRight_PreserveOperandOrder()
+    {
+        Column c = Col("age");
+
+        AssertRight(c < 5, ComparisonOperator.LessThan, c);
+        AssertRight(c <= 5, ComparisonOperator.LessThanOrEqual, c);
+        AssertRight(c > 5, ComparisonOperator.GreaterThan, c);
+        AssertRight(c >= 5, ComparisonOperator.GreaterThanOrEqual, c);
+
+        static void AssertRight(Column result, ComparisonOperator op, Column left)
+        {
+            var node = Assert.IsType<BinaryComparison>(result.Expr);
+            Assert.Equal(op, node.Operator);
+            Assert.Same(left.Expr, node.Left);
+            Assert.IsType<Literal>(node.Right);
+        }
+    }
+
+    [Fact] // FIX 1: reversed `scalar ⟨op⟩ col` keeps the literal on the LEFT (operator NOT flipped)
+    public void ComparisonOperators_ScalarOnLeft_PreserveOperandOrder()
+    {
+        Column c = Col("age");
+
+        AssertLeft(5 < c, ComparisonOperator.LessThan, c);
+        AssertLeft(5 <= c, ComparisonOperator.LessThanOrEqual, c);
+        AssertLeft(5 > c, ComparisonOperator.GreaterThan, c);
+        AssertLeft(5 >= c, ComparisonOperator.GreaterThanOrEqual, c);
+
+        static void AssertLeft(Column result, ComparisonOperator op, Column right)
+        {
+            var node = Assert.IsType<BinaryComparison>(result.Expr);
+            Assert.Equal(op, node.Operator); // e.g. `5 < col` stays LessThan(lit, col), not GreaterThan
+            Assert.IsType<Literal>(node.Left);
+            Assert.Same(right.Expr, node.Right);
+        }
+    }
+
+    // ----- object? overload efficacy: every scalar overload builds the right node + right-side Literal
+
+    [Fact] // FIX 1: arithmetic & comparison object? overloads coerce the scalar to a right Literal
+    public void ObjectOverloads_Arithmetic_And_Comparison_CoerceScalarToRightLiteral()
+    {
+        Column a = Col("a");
+
+        AssertArith(a.Plus(1), ArithmeticOperator.Add, a);
+        AssertArith(a.Minus(1), ArithmeticOperator.Subtract, a);
+        AssertArith(a.Multiply(1), ArithmeticOperator.Multiply, a);
+        AssertArith(a.Divide(1), ArithmeticOperator.Divide, a);
+        AssertArith(a.Mod(1), ArithmeticOperator.Remainder, a);
+
+        AssertCmp(a.EqualTo(1), ComparisonOperator.Equal, a);
+        AssertCmp(a.NotEqual(1), ComparisonOperator.NotEqual, a);
+        AssertCmp(a.Lt(1), ComparisonOperator.LessThan, a);
+        AssertCmp(a.Leq(1), ComparisonOperator.LessThanOrEqual, a);
+        AssertCmp(a.Gt(1), ComparisonOperator.GreaterThan, a);
+        AssertCmp(a.Geq(1), ComparisonOperator.GreaterThanOrEqual, a);
+
+        static void AssertArith(Column result, ArithmeticOperator op, Column left)
+        {
+            var node = Assert.IsType<BinaryArithmetic>(result.Expr);
+            Assert.Equal(op, node.Operator);
+            Assert.Same(left.Expr, node.Left);
+            Assert.IsType<Literal>(node.Right);
+        }
+
+        static void AssertCmp(Column result, ComparisonOperator op, Column left)
+        {
+            var node = Assert.IsType<BinaryComparison>(result.Expr);
+            Assert.Equal(op, node.Operator);
+            Assert.Same(left.Expr, node.Left);
+            Assert.IsType<Literal>(node.Right);
+        }
+    }
+
+    [Fact] // FIX 1: And/Or/EqualNullSafe object? overloads build the right node with a right Literal
+    public void ObjectOverloads_Boolean_And_NullSafe_BuildRightNodeWithLiteral()
+    {
+        Column a = Col("a");
+
+        var and = Assert.IsType<And>(ExprOf(a.And(true)));
+        Assert.Same(a.Expr, and.Left);
+        Assert.Equal(true, Assert.IsType<Literal>(and.Right).Value);
+
+        var or = Assert.IsType<Or>(ExprOf(a.Or(false)));
+        Assert.Same(a.Expr, or.Left);
+        Assert.Equal(false, Assert.IsType<Literal>(or.Right).Value);
+
+        // EqualNullSafe with a NON-null scalar → a non-null Literal on the right (the mutation-proof case).
+        var ens = Assert.IsType<EqualNullSafe>(ExprOf(a.EqualNullSafe((object?)5)));
+        Assert.Same(a.Expr, ens.Left);
+        var lit = Assert.IsType<Literal>(ens.Right);
+        Assert.Equal(5, lit.Value);
+        Assert.False(lit.IsNull);
+    }
+
+    // ----- The `==` decision is unpinned no more: reference identity, never an expression -----------
+
+    [Fact] // FIX 1: no operator == is defined — col == null / col == other is CLR reference identity
+    public void EqualityOperator_IsReferenceIdentity_AndBuildsNoExpression()
+    {
+        Column a = Col("a");
+        Column b = Col("b");
+        Column aRef = a;
+
+        // == is NOT overloaded, so it is reference equality returning bool — it builds no IR node.
+        Assert.False(a == null);
+        Assert.False(a == b);
+        Assert.True(a == aRef);
+        Assert.True(ReferenceEquals(a, aRef));
+
+        // Value equality of the *expression* is the EqualTo method, which DOES build a node.
+        var node = Assert.IsType<BinaryComparison>(ExprOf(a.EqualTo(b)));
+        Assert.Equal(ComparisonOperator.Equal, node.Operator);
+        Assert.Same(a.Expr, node.Left);
+        Assert.Same(b.Expr, node.Right);
+    }
+
+    // ----- FIX 2: EqualNullSafe null-binding is explicit (bare null throws; (object?)null is a NULL) -
+
+    [Fact] // FIX 2: (object?)null builds a null Literal; a bare null binds the Column overload → throws
+    public void EqualNullSafe_NullBinding_IsExplicit()
+    {
+        Column a = Col("a");
+
+        var node = Assert.IsType<EqualNullSafe>(ExprOf(a.EqualNullSafe((object?)null)));
+        var lit = Assert.IsType<Literal>(node.Right);
+        Assert.True(lit.IsNull);
+
+        // A BARE null binds the more-specific Column overload, which null-guards and throws — this is
+        // exactly why the XML doc steers users to (object?)null / IsNull().
+        Assert.Throws<ArgumentNullException>(() => a.EqualNullSafe((Column)null!));
+    }
+
+    // ----- FIX 3: ~col (PySpark's primary negation) builds the same Not node as !col / .Not() --------
+
+    [Fact] // FIX 3: operator ~ builds a Not node identical to operator ! and .Not()
+    public void TildeOperator_BuildsNotNode_LikeBangAndNot()
+    {
+        Column a = Col("a");
+
+        var tilde = Assert.IsType<Not>(ExprOf(~a));
+        Assert.Same(a.Expr, tilde.Child);
+
+        Assert.IsType<Not>(ExprOf(!a));
+        Assert.IsType<Not>(ExprOf(a.Not()));
+
+        // ~col guards null the same way ! does.
+        Assert.Throws<ArgumentNullException>(() => ~(null as Column)!);
+    }
+
+    // ----- FIX 7: EqNullSafe aliases delegate to EqualNullSafe (same node, same operands) -----------
+
+    [Fact] // FIX 7: EqNullSafe(Column) / EqNullSafe(object?) delegate to EqualNullSafe
+    public void EqNullSafe_Aliases_DelegateToEqualNullSafe()
+    {
+        Column a = Col("a");
+        Column b = Col("b");
+
+        var colNode = Assert.IsType<EqualNullSafe>(ExprOf(a.EqNullSafe(b)));
+        Assert.Same(a.Expr, colNode.Left);
+        Assert.Same(b.Expr, colNode.Right);
+
+        var scalarNode = Assert.IsType<EqualNullSafe>(ExprOf(a.EqNullSafe((object?)5)));
+        Assert.Same(a.Expr, scalarNode.Left);
+        Assert.Equal(5, Assert.IsType<Literal>(scalarNode.Right).Value);
+
+        // Same bare-null binding rule as EqualNullSafe.
+        Assert.Throws<ArgumentNullException>(() => a.EqNullSafe((Column)null!));
+    }
 }
