@@ -3,6 +3,8 @@ DeltaSharp.Column
 DeltaSharp.Column.Alias(string! alias) -> DeltaSharp.Column!
 DeltaSharp.Column.As(string! alias) -> DeltaSharp.Column!
 DeltaSharp.Column.Name(string! alias) -> DeltaSharp.Column!
+DeltaSharp.Column.Otherwise(object? value) -> DeltaSharp.Column!
+DeltaSharp.Column.When(DeltaSharp.Column! condition, object? value) -> DeltaSharp.Column!
 DeltaSharp.DataFrame
 DeltaSharp.DataFrame.Filter(DeltaSharp.Column! condition) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.Select(params DeltaSharp.Column![]! columns) -> DeltaSharp.DataFrame!
@@ -51,7 +53,32 @@ static DeltaSharp.DeltaSharpInfo.ProductName.get -> string!
 static DeltaSharp.DeltaSharpInfo.Version.get -> string!
 static DeltaSharp.Functions.Col(string! columnName) -> DeltaSharp.Column!
 static DeltaSharp.Functions.Column(string! columnName) -> DeltaSharp.Column!
+static DeltaSharp.Functions.Avg(DeltaSharp.Column! column) -> DeltaSharp.Column!
+static DeltaSharp.Functions.Avg(string! columnName) -> DeltaSharp.Column!
+static DeltaSharp.Functions.Coalesce(params DeltaSharp.Column![]! columns) -> DeltaSharp.Column!
+static DeltaSharp.Functions.Concat(params DeltaSharp.Column![]! columns) -> DeltaSharp.Column!
+static DeltaSharp.Functions.Count(DeltaSharp.Column! column) -> DeltaSharp.Column!
+static DeltaSharp.Functions.Count(string! columnName) -> DeltaSharp.Column!
+static DeltaSharp.Functions.CountDistinct(DeltaSharp.Column! column, params DeltaSharp.Column![]! additional) -> DeltaSharp.Column!
+static DeltaSharp.Functions.CurrentDate() -> DeltaSharp.Column!
+static DeltaSharp.Functions.CurrentTimestamp() -> DeltaSharp.Column!
+static DeltaSharp.Functions.DayOfMonth(DeltaSharp.Column! column) -> DeltaSharp.Column!
+static DeltaSharp.Functions.Expr(string! expression) -> DeltaSharp.Column!
+static DeltaSharp.Functions.Length(DeltaSharp.Column! column) -> DeltaSharp.Column!
 static DeltaSharp.Functions.Lit(object? value) -> DeltaSharp.Column!
+static DeltaSharp.Functions.Lower(DeltaSharp.Column! column) -> DeltaSharp.Column!
+static DeltaSharp.Functions.Max(DeltaSharp.Column! column) -> DeltaSharp.Column!
+static DeltaSharp.Functions.Max(string! columnName) -> DeltaSharp.Column!
+static DeltaSharp.Functions.Min(DeltaSharp.Column! column) -> DeltaSharp.Column!
+static DeltaSharp.Functions.Min(string! columnName) -> DeltaSharp.Column!
+static DeltaSharp.Functions.Month(DeltaSharp.Column! column) -> DeltaSharp.Column!
+static DeltaSharp.Functions.Sum(DeltaSharp.Column! column) -> DeltaSharp.Column!
+static DeltaSharp.Functions.Sum(string! columnName) -> DeltaSharp.Column!
+static DeltaSharp.Functions.ToDate(DeltaSharp.Column! column) -> DeltaSharp.Column!
+static DeltaSharp.Functions.Trim(DeltaSharp.Column! column) -> DeltaSharp.Column!
+static DeltaSharp.Functions.Upper(DeltaSharp.Column! column) -> DeltaSharp.Column!
+static DeltaSharp.Functions.When(DeltaSharp.Column! condition, object? value) -> DeltaSharp.Column!
+static DeltaSharp.Functions.Year(DeltaSharp.Column! column) -> DeltaSharp.Column!
 override DeltaSharp.Column.ToString() -> string!
 static DeltaSharp.SparkSession.Builder() -> DeltaSharp.SparkSessionBuilder!
 static DeltaSharp.SparkSession.ClearActiveSession() -> void
