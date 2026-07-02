@@ -8,8 +8,8 @@ namespace DeltaSharp.Core.Tests.LazyEager;
 /// backend invocation path through the ambient <see cref="IExecutionAudit"/> sink. It is invoked by
 /// nothing until an <b>action</b> asks it to <see cref="Execute"/>: building a logical plan never
 /// reaches it, which is what the AC2 lazy test asserts. <see cref="Execute"/> drives the exact
-/// substrate a real action (#173) will run — analyze, plan, scan the source, invoke the backend — so
-/// AC3 can assert the observed path.
+/// substrate a real action (#173) will run — analyze, plan, then <b>enter the backend</b> and drive
+/// the source scan as part of backend execution — so AC3 can assert the observed path.
 /// </summary>
 internal sealed class FakeExecutionBackend
 {
@@ -28,8 +28,10 @@ internal sealed class FakeExecutionBackend
 
         ExecutionAudit.StageEntered(ExecutionStage.Analyzer);
         ExecutionAudit.StageEntered(ExecutionStage.Planner);
-        long rows = source.Read();
+        // A real backend is entered/invoked first and then drives the physical scan: the source read
+        // is part of backend execution, so the Backend stage is entered before source.Read().
         ExecutionAudit.StageEntered(ExecutionStage.Backend);
+        long rows = source.Read();
         return rows;
     }
 }

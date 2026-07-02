@@ -40,16 +40,26 @@ internal sealed class RecordingAudit : IExecutionAudit
     /// no stage entered. This is the assertion the AC1/AC2 lazy tests make while only transformations
     /// run.
     /// </summary>
+    /// <remarks>
+    /// This is a <b>best-effort composite snapshot</b>, not an atomic read of all three fields: the two
+    /// counters are read via <see cref="Interlocked"/> and the stage list under its own lock, with no
+    /// single lock spanning all three. That is intentional and sufficient because the property is only
+    /// asserted <b>after</b> the audit scope closes, single-threaded — by then no writer is running, so
+    /// the three reads observe a consistent, final state.
+    /// </remarks>
     public bool ObservedNoExecution
     {
         get
         {
+            int stageCount;
             lock (_stageLock)
             {
-                return Interlocked.Read(ref _filesOpened) == 0
-                    && Interlocked.Read(ref _rowsRead) == 0
-                    && _stages.Count == 0;
+                stageCount = _stages.Count;
             }
+
+            return Interlocked.Read(ref _filesOpened) == 0
+                && Interlocked.Read(ref _rowsRead) == 0
+                && stageCount == 0;
         }
     }
 

@@ -49,9 +49,25 @@
        symbol, so grant DeltaSharp.Engine access to the internal surface. This is the only
        grant needed: no test reads StableHash members (the Engine.Tests hashing tests exercise
        the PUBLIC GetHashCode). StableHash is NOT promoted to public.
-       (Directory.Build.props already auto-injects the DeltaSharp.Abstractions.Tests grant.) -->
+       (Directory.Build.props already auto-injects the DeltaSharp.Abstractions.Tests grant.)
+
+       STORY-04.4.3 (#169): the internal ExecutionAudit lazy/eager seam (namespace
+       DeltaSharp.Diagnostics) also lives here — like StableHash it is a shared Core+Engine
+       INTERNAL contract, not public API. Its callers straddle both siblings, so grant both:
+       - DeltaSharp.Engine (already granted above for StableHash) — real source readers (#158)
+         and the #174 backend bridge call ExecutionAudit.FileOpened/RowsRead/StageEntered from
+         their eager scan/execution path. Engine references only Abstractions (never Core), so
+         a Core internal was unreachable; this is exactly why the seam belongs in Abstractions.
+       - DeltaSharp.Core — the future action driver (#173) + Core product code begin audit
+         scopes and drive StageEntered during eager execution.
+       - DeltaSharp.Core.Tests — the STORY-04.4.3 regression tests (LazyEagerAuditTests and its
+         doubles) stay in Core.Tests because they also bind Core plan IR (DeltaSharp.Plans.*);
+         they observe the internal seam through this grant. The seam is NOT promoted to public
+         (Abstractions PublicAPI baseline is unchanged; RS0016 stays clean). -->
   <ItemGroup>
     <InternalsVisibleTo Include="DeltaSharp.Engine" />
+    <InternalsVisibleTo Include="DeltaSharp.Core" />
+    <InternalsVisibleTo Include="DeltaSharp.Core.Tests" />
   </ItemGroup>
 
 </Project>

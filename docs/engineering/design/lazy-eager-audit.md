@@ -28,17 +28,44 @@ the seam those stories wire into, and the tests that will guard them.
 
 ## The audit seam
 
-All types live in `src/DeltaSharp.Core/Diagnostics/ExecutionAudit.cs`, namespace
+All types live in `src/DeltaSharp.Abstractions/Diagnostics/ExecutionAudit.cs`, namespace
 `DeltaSharp.Diagnostics`. The whole seam is **`internal`** — it is an engine implementation detail,
-not public API, so it adds nothing to the `DeltaSharp.Core` PublicAPI baseline (RS0016 stays clean;
-`PublicAPI.Unshipped.txt` is untouched). `DeltaSharp.Core.Tests` observes it through the standard
-`InternalsVisibleTo` grant (`Directory.Build.props`).
+not public API, so it adds nothing to the `DeltaSharp.Abstractions` PublicAPI baseline (RS0016 stays
+clean; `PublicAPI.Unshipped.txt` is untouched in **both** `DeltaSharp.Abstractions` and
+`DeltaSharp.Core`).
+
+### Why the seam lives in `DeltaSharp.Abstractions`
+
+The seam is a **shared internal contract straddling both siblings**, `DeltaSharp.Core` **and**
+`DeltaSharp.Engine`, so — exactly like the internal `StableHash` under
+[ADR-0016](../../adr/0016-shared-logical-type-model-abstractions.md) — it belongs in `DeltaSharp.Abstractions`, not in
+`DeltaSharp.Core`:
+
+- The **wiring points** below are **Engine-side**: a real source reader's eager pull loop (#158,
+  EPIC-02/03) calls `ExecutionAudit.FileOpened`/`RowsRead`, and the #174 backend bridge calls
+  `StageEntered(Backend)`. But `DeltaSharp.Engine` references **only** `DeltaSharp.Abstractions` and
+  **never** `DeltaSharp.Core` (guarded by `Core_ReferencesNoEngineAssembly_*` /
+  `CoreAssemblyDoesNotReferenceTheEngineAssembly`). A seam `internal` to `DeltaSharp.Core` would be
+  **unreachable** from the very Engine callers the design names.
+- Placing it in `DeltaSharp.Abstractions` (which both Core and Engine reference, preserving
+  Core ⟂ Engine sibling independence) makes it reachable by everyone who must call it, while keeping
+  every type `internal`. Cross-assembly access is granted through `InternalsVisibleTo` in
+  `DeltaSharp.Abstractions.csproj`:
+  - **`DeltaSharp.Engine`** — the pre-existing StableHash grant; the readers (#158) and #174 backend
+    bridge reach the seam through it (no new grant needed).
+  - **`DeltaSharp.Core`** — the future action driver (#173) and Core product code begin audit scopes
+    and drive `StageEntered` during eager execution.
+  - **`DeltaSharp.Core.Tests`** — the STORY-04.4.3 regression tests stay in `Core.Tests` (they also
+    bind Core plan IR, `DeltaSharp.Plans.*`) and observe the internal seam through this grant.
+
+  This mirrors ADR-0016's resolution for `StableHash`: a shared Core+Engine internal contract lives in
+  `DeltaSharp.Abstractions` and stays internal, granted to the specific friend assemblies that need it.
 
 | Type | Kind | Role |
 | --- | --- | --- |
 | `IExecutionAudit` | `internal interface` | The sink real readers/backends notify at eager-only observation points. |
 | `ExecutionAudit` | `internal static class` | The ambient accessor: a current-sink slot plus zero-alloc forwarders. |
-| `ExecutionAudit.AuditScope` | `internal readonly struct : IDisposable` | Installs a sink for a scope and restores the previous one on dispose. |
+| `ExecutionAudit.AuditScope` | `internal readonly struct : IDisposable` | Installs a sink for a scope and restores the previous one on dispose (LIFO `using` contract). |
 | `ExecutionStage` | `internal enum` | The ordered pipeline milestones: `Analyzer`, `Planner`, `Backend`. |
 
 ### Observation points
@@ -65,9 +92,9 @@ analyzer → planner → backend path.
 `ExecutionAudit` holds the current sink in a **`static readonly AsyncLocal<IExecutionAudit?>`**:
 
 ```csharp
-internal static void FileOpened(string source)   => _current.Value?.OnFileOpened(source);
-internal static void RowsRead(long count)         => _current.Value?.OnRowsRead(count);
-internal static void StageEntered(ExecutionStage) => _current.Value?.OnStageEntered(stage);
+internal static void FileOpened(string source)      => _current.Value?.OnFileOpened(source);
+internal static void RowsRead(long count)            => _current.Value?.OnRowsRead(count);
+internal static void StageEntered(ExecutionStage stage) => _current.Value?.OnStageEntered(stage);
 internal static AuditScope BeginScope(IExecutionAudit sink); // sets _current, returns restoring scope
 ```
 
@@ -86,7 +113,11 @@ Design choices:
 - **Determinism.** Counters are plain `long`s; nothing here reads a clock, a GUID, or randomness
   (BannedApi-clean).
 - **Nesting.** `AuditScope.Dispose` restores the *previous* sink, so scopes nest correctly (proven by
-  `BeginScope_RestoresPreviousSinkOnDispose`).
+  `BeginScope_RestoresPreviousSinkOnDispose`). The scope models a **LIFO stack**: it must be
+  `using`-disposed in the same asynchronous control flow that opened it, and nested scopes must be
+  disposed in reverse order. Disposing out of order restores the wrong sink; the `using` pattern the
+  tests and #173's executor follow guarantees LIFO by construction. This contract is documented on
+  `BeginScope`/`AuditScope` (mirroring how #167's memoization documents its single-thread assumption).
 
 ## Test doubles
 
@@ -96,7 +127,7 @@ In `tests/DeltaSharp.Core.Tests/LazyEager/`:
 | --- | --- |
 | `RecordingAudit : IExecutionAudit` | Counts files/rows with `Interlocked`, captures the ordered `ExecutionStage` path under a lock, and exposes `ObservedNoExecution` (all counters zero + empty path). |
 | `FakeSource` | `Describe()` builds an `UnresolvedRelation` (pure construction, **no** audit); `Read()` simulates the eager scan and notifies `FileOpened`/`RowsRead`. This is the seam a real reader (#158) plugs into. |
-| `FakeExecutionBackend` | `Execute(plan, source)` drives `Analyzer → Planner → source.Read() → Backend` through the seam — the substrate the #173 action + #174 backend bridge will drive. Building a plan never reaches it. |
+| `FakeExecutionBackend` | `Execute(plan, source)` drives `Analyzer → Planner → Backend → source.Read()` through the seam — a real backend is entered/invoked first and then drives the physical scan (the source read is part of backend execution), so the `Backend` stage is entered before `source.Read()`. This is the substrate the #173 action + #174 backend bridge will drive; building a plan never reaches it. The observed `StagePath` is `[Analyzer, Planner, Backend]` either way (a read adds no stage). |
 
 ## Wiring points future stories MUST call
 
@@ -110,9 +141,11 @@ The seam is the *contract*; the following future work fulfils it:
   `Filter`, …) exactly as the AC1/AC2 tests do today. They must never touch `ExecutionAudit`. The
   existing zero-counter tests become their standing guard automatically.
 - **Actions + backend bridge (#173/#174).** An action (`Collect`/`count`/…) installs a sink scope for
-  its execution and drives `ExecutionAudit.StageEntered(Analyzer)` → `Planner` → the reader's
-  file/row notifications → `Backend`. The AC3 contract test asserts exactly this ordered path today
-  against the substrate; when #173 lands, the `FakeExecutionBackend.Execute(...)` call in
+  its execution and drives `ExecutionAudit.StageEntered(Analyzer)` → `Planner` → `Backend`, then the
+  backend's physical scan issues the reader's file/row notifications (the scan is part of backend
+  execution, so `Backend` is entered before the reads). The AC3 contract test asserts exactly this
+  observed `StagePath` (`[Analyzer, Planner, Backend]`) today against the substrate; when #173 lands,
+  the `FakeExecutionBackend.Execute(...)` call in
   `Action_ThroughFakeBackend_ObservesExpectedPathAndSourceReads` is swapped for the real action and
   the assertion holds unchanged.
 
@@ -134,11 +167,18 @@ The AC1/AC2 zero-counter assertions are only meaningful if they can fail. Two th
    (`ObservedNoExecution == false`).
 2. **Mutation proof (performed during development, reverted).** Temporarily making
    `FakeSource.Describe()` call `ExecutionAudit.FileOpened(...)` — i.e. injecting a real lazy/eager
-   regression into the construction path — turned **3** lazy tests red
-   (`TransformationsOnly_LeaveFileAndRowCountersAtZero`,
-   `TransformationsOnly_DoNotInvokeAnyBackendStage`,
-   `TransformationsOnly_OverExistingPlanFixture_ObservesNoExecution`). The mutation was reverted; the
-   suite is green.
+   regression into the construction path — turned **exactly 3** tests red (empirically re-run on this
+   suite):
+   - `TransformationsOnly_LeaveFileAndRowCountersAtZero` — its `FilesOpened == 0` / `ObservedNoExecution`
+     assertions fire.
+   - `TransformationsOnly_DoNotInvokeAnyBackendStage` — its `ObservedNoExecution` assertion fires.
+   - `Action_ThroughFakeBackend_ObservesExpectedPathAndSourceReads` — its **pre-execution**
+     `Assert.True(recording.ObservedNoExecution)` (asserting nothing is observed *before* the action
+     runs) fires, because `Describe()` now leaks a file-open at construction time.
+
+   `TransformationsOnly_OverExistingPlanFixture_ObservesNoExecution` stays **green**: it builds from
+   `PlanFixtures.SamplePlan()` and never touches `FakeSource`, so the mutation cannot reach it. The
+   mutation was reverted; the suite is green.
 
 ## What is proven today vs guarded for the future
 
@@ -151,3 +191,9 @@ The AC1/AC2 zero-counter assertions are only meaningful if they can fail. Two th
   AC3 contract fixes the expected action path now so the real action lands against a pinned
   observable contract, and the AC1/AC2 guards automatically cover #160's transformations without new
   tests.
+- **Known completeness gap (tracked by [#393](https://github.com/khaines/deltasharp/issues/393)).** The
+  guard tests the **seam**, not real I/O: a future real reader (#158) that opens a file **without**
+  calling `ExecutionAudit.FileOpened(...)` would evade the guard (a false green). When #158 lands, route
+  every engine file-open through one audited reader abstraction, or add a BannedApi/Roslyn rule
+  forbidding raw `File.Open`/stream opens outside it, and upgrade the AC1 contract test to drive a real
+  reader end-to-end. A `TODO(#393)` marks the seam in `ExecutionAudit.cs`.

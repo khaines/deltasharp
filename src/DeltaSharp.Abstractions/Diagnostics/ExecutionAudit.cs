@@ -44,6 +44,10 @@ internal enum ExecutionStage
 /// not a public API, so it adds nothing to the PublicAPI baseline.
 /// </para>
 /// </remarks>
+// TODO(#393): the guard tests the SEAM, not real I/O. When the real source reader (#158) lands, route
+// every engine file-open through one audited reader (or add a BannedApi rule forbidding raw File.Open
+// outside it) so a reader cannot open a file without calling OnFileOpened — otherwise a bypass is a
+// silent false green.
 internal interface IExecutionAudit
 {
     /// <summary>Notifies the sink that a source reader opened a physical file or relation.</summary>
@@ -94,6 +98,14 @@ internal static class ExecutionAudit
     /// <param name="sink">The sink to make current.</param>
     /// <returns>A scope that restores the previous sink on disposal.</returns>
     /// <exception cref="System.ArgumentNullException"><paramref name="sink"/> is <see langword="null"/>.</exception>
+    /// <remarks>
+    /// The returned <see cref="AuditScope"/> <b>must</b> be disposed with a <c>using</c> statement in
+    /// the same asynchronous control flow that opened it, and nested scopes must be disposed in
+    /// strict <b>LIFO</b> order. Each scope's <see cref="AuditScope.Dispose"/> restores the sink that
+    /// was current when the scope was opened; disposing scopes out of order therefore restores the
+    /// wrong sink. The <c>using</c> pattern the tests and #173's executor follow guarantees LIFO by
+    /// construction, so callers never encounter the out-of-order case.
+    /// </remarks>
     internal static AuditScope BeginScope(IExecutionAudit sink)
     {
         ArgumentNullException.ThrowIfNull(sink);
@@ -118,6 +130,13 @@ internal static class ExecutionAudit
     /// Restores the previously installed <see cref="IExecutionAudit"/> sink when disposed. Returned by
     /// <see cref="BeginScope(IExecutionAudit)"/>; use it with a <c>using</c> statement.
     /// </summary>
+    /// <remarks>
+    /// This scope models a <b>LIFO stack</b> of sinks: <see cref="Dispose"/> restores the sink that was
+    /// current when the scope was opened, so scopes must be disposed in the reverse order they were
+    /// opened, within the same asynchronous control flow. Disposing out of order (or from a different
+    /// flow) restores the wrong sink. A <c>using</c> statement guarantees the required LIFO discipline;
+    /// this is the only supported usage.
+    /// </remarks>
     internal readonly struct AuditScope : IDisposable
     {
         private readonly IExecutionAudit? _previous;

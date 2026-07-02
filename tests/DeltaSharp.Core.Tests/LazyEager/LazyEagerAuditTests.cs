@@ -64,6 +64,9 @@ public sealed class LazyEagerAuditTests
 
         Assert.Equal(0, recording.FilesOpened);
         Assert.Equal(0, recording.RowsRead);
+        // Defense-in-depth: the strongest all-three oracle (files, rows, and stage path) holds on the
+        // FakeSource construction path — nothing eager was observed.
+        Assert.True(recording.ObservedNoExecution);
     }
 
     // ----- AC2: fake execution backend is never invoked while only transformations run -----
