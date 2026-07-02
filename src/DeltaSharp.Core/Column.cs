@@ -137,6 +137,10 @@ public sealed class Column
     /// evaluation (ADR-0001) — and leaves this instance unchanged.
     /// </summary>
     /// <returns>A new <see cref="Column"/> describing an ascending, nulls-first ordering term.</returns>
+    /// <remarks>Explicit null-placement helpers (<c>AscNullsFirst</c>/<c>AscNullsLast</c>/
+    /// <c>DescNullsFirst</c>/<c>DescNullsLast</c>) are deferred to
+    /// <see href="https://github.com/khaines/deltasharp/issues/405">#405</see>; the underlying
+    /// <c>SortOrder</c>/<c>NullOrdering</c> IR already supports all four placements.</remarks>
     public Column Asc() =>
         new(new SortOrder(Expr, SortDirection.Ascending, NullOrdering.NullsFirst));
 
@@ -148,6 +152,10 @@ public sealed class Column
     /// <see cref="Asc"/> it is a lazy builder that leaves this instance unchanged.
     /// </summary>
     /// <returns>A new <see cref="Column"/> describing a descending, nulls-last ordering term.</returns>
+    /// <remarks>Explicit null-placement helpers (<c>AscNullsFirst</c>/<c>AscNullsLast</c>/
+    /// <c>DescNullsFirst</c>/<c>DescNullsLast</c>) are deferred to
+    /// <see href="https://github.com/khaines/deltasharp/issues/405">#405</see>; the underlying
+    /// <c>SortOrder</c>/<c>NullOrdering</c> IR already supports all four placements.</remarks>
     public Column Desc() =>
         new(new SortOrder(Expr, SortDirection.Descending, NullOrdering.NullsLast));
 

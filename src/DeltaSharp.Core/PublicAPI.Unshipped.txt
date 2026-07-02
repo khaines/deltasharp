@@ -7,6 +7,7 @@ DeltaSharp.Column.Otherwise(object? value) -> DeltaSharp.Column!
 DeltaSharp.Column.When(DeltaSharp.Column! condition, object? value) -> DeltaSharp.Column!
 DeltaSharp.DataFrame
 DeltaSharp.DataFrame.Agg(DeltaSharp.Column! expr, params DeltaSharp.Column![]! exprs) -> DeltaSharp.DataFrame!
+DeltaSharp.DataFrame.CrossJoin(DeltaSharp.DataFrame! right) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.Distinct() -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.Filter(DeltaSharp.Column! condition) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.GroupBy(params DeltaSharp.Column![]! columns) -> DeltaSharp.RelationalGroupedDataset!

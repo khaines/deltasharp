@@ -328,9 +328,15 @@ public sealed class DataFrame
 
     /// <summary>
     /// Inner-joins this frame with <paramref name="right"/> on a single shared column, mirroring
-    /// Spark's <c>Dataset.join(right, usingColumn)</c>. The shared column is recorded pre-resolution;
-    /// the analyzer later desugars it into an equi-condition over the two sides (no resolution happens
-    /// here — a lazy transformation reading neither side, ADR-0001).
+    /// Spark's <c>Dataset.join(right, usingColumn)</c>. Building the node is supported now — it
+    /// records the shared column pre-resolution and reads neither side (a lazy transformation,
+    /// ADR-0001).
+    /// <para>
+    /// <b>Resolution is deferred.</b> The analyzer rule that desugars a using-column join into an
+    /// equi-condition is not yet implemented, so <b>analyzing</b> a plan that contains this join
+    /// currently fails with a targeted <c>AnalysisException</c> until the follow-up
+    /// (<see href="https://github.com/khaines/deltasharp/issues/405">#405</see>) lands.
+    /// </para>
     /// </summary>
     /// <param name="right">The frame to join with.</param>
     /// <param name="usingColumn">The name of the column shared by both frames.</param>
@@ -347,7 +353,12 @@ public sealed class DataFrame
     /// <summary>
     /// Inner-joins this frame with <paramref name="right"/> on a set of shared columns, mirroring
     /// Spark's <c>Dataset.join(right, usingColumns)</c>. Like the single-column overload the shared
-    /// columns are recorded pre-resolution and desugared by the analyzer; this reads neither side.
+    /// columns are recorded pre-resolution and this reads neither side.
+    /// <para>
+    /// <b>Resolution is deferred</b> (the desugar-to-equi-condition rule is not yet implemented);
+    /// analyzing a plan with this join fails with a targeted <c>AnalysisException</c> until
+    /// <see href="https://github.com/khaines/deltasharp/issues/405">#405</see> lands.
+    /// </para>
     /// </summary>
     /// <param name="right">The frame to join with.</param>
     /// <param name="usingColumns">The names of the columns shared by both frames.</param>
@@ -363,6 +374,11 @@ public sealed class DataFrame
     /// Joins this frame with <paramref name="right"/> on a set of shared columns using the join kind
     /// named by <paramref name="joinType"/>, mirroring Spark's
     /// <c>Dataset.join(right, usingColumns, joinType)</c>. A lazy transformation reading neither side.
+    /// <para>
+    /// <b>Resolution is deferred</b> (the desugar-to-equi-condition rule is not yet implemented);
+    /// analyzing a plan with this join fails with a targeted <c>AnalysisException</c> until
+    /// <see href="https://github.com/khaines/deltasharp/issues/405">#405</see> lands.
+    /// </para>
     /// </summary>
     /// <param name="right">The frame to join with.</param>
     /// <param name="usingColumns">The names of the columns shared by both frames.</param>
@@ -386,6 +402,23 @@ public sealed class DataFrame
         }
 
         return new DataFrame(new Join(Plan, right.Plan, type, usingColumns: columns));
+    }
+
+    /// <summary>
+    /// Explicitly cross-joins (Cartesian product) this frame with <paramref name="right"/>, mirroring
+    /// Spark's <c>Dataset.crossJoin(right)</c> — the safe, intent-revealing way to ask for a product
+    /// (unlike a conditionless <see cref="Join(DataFrame)"/>, which records an <c>Inner</c> join).
+    /// This is a lazy <b>transformation</b>: it records a <c>Cross</c> join with <b>no</b> condition
+    /// and reads <b>neither</b> side (ADR-0001); both frames are unchanged and the result shares both
+    /// plan subtrees by reference (structural sharing, #167).
+    /// </summary>
+    /// <param name="right">The frame to cross-join with.</param>
+    /// <returns>A new <see cref="DataFrame"/> that is the Cartesian product of the two frames.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="right"/> is null.</exception>
+    public DataFrame CrossJoin(DataFrame right)
+    {
+        ArgumentNullException.ThrowIfNull(right);
+        return new DataFrame(new Join(Plan, right.Plan, JoinType.Cross, condition: null));
     }
 
     /// <summary>
@@ -463,6 +496,10 @@ public sealed class DataFrame
     /// lazy <b>transformation</b>: it records a <c>Union</c> over both plans and reads neither side
     /// (ADR-0001).
     /// </summary>
+    /// <remarks>
+    /// By-<b>name</b> alignment is Spark's separate <c>unionByName</c> (deferred, tracked by
+    /// <see href="https://github.com/khaines/deltasharp/issues/405">#405</see>).
+    /// </remarks>
     /// <param name="other">The frame whose rows are appended.</param>
     /// <returns>A new <see cref="DataFrame"/> unioning the two frames by position.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="other"/> is null.</exception>
@@ -476,7 +513,9 @@ public sealed class DataFrame
     /// An alias for <see cref="Union(DataFrame)"/>, mirroring Spark's <c>Dataset.unionAll(other)</c>.
     /// In Spark <c>unionAll</c> is a deprecated synonym of <c>union</c> — both are the same
     /// row-preserving, by-position bag union — so this is exactly equivalent to
-    /// <see cref="Union(DataFrame)"/>.
+    /// <see cref="Union(DataFrame)"/>. DeltaSharp intentionally keeps this member
+    /// <b>non-obsolete</b> for migration ergonomics: Spark code that calls <c>unionAll</c> ports
+    /// across without warning churn (see the design doc §6).
     /// </summary>
     /// <param name="other">The frame whose rows are appended.</param>
     /// <returns>A new <see cref="DataFrame"/> unioning the two frames by position.</returns>
@@ -490,7 +529,8 @@ public sealed class DataFrame
         for (int i = 0; i < columns.Length; i++)
         {
             Column column = columns[i]
-                ?? throw new ArgumentNullException($"{nameof(columns)}[{i}]");
+                ?? throw new ArgumentNullException(
+                    nameof(columns), $"Ordering column at index {i} is null.");
             order[i] = ToSortOrder(column.Expr);
         }
 

@@ -85,15 +85,16 @@ public sealed class DataFrameRelationalTransformationsTests
     }
 
     [Theory]
-    [InlineData("INNER")]
-    [InlineData("Left_Outer")]
-    [InlineData("LEFT OUTER")]
-    public void Join_JoinTypeString_IsCaseAndSeparatorInsensitive(string joinTypeString)
+    [InlineData("INNER", "Inner")]
+    [InlineData("Left_Outer", "LeftOuter")]
+    [InlineData("LEFT OUTER", "LeftOuter")]
+    public void Join_JoinTypeString_IsCaseAndSeparatorInsensitive(string joinTypeString, string expected)
     {
-        // Normalization (lower-case + strip spaces/underscores) accepts every Spark spelling.
+        // Normalization (lower-case + strip spaces/underscores) accepts every Spark spelling AND maps
+        // to the right kind — asserting the enum reddens a wrong mapping (e.g. "LEFT OUTER" -> Inner).
         DataFrame result = Left().Join(Right(), Functions.Col("id"), joinTypeString);
 
-        Assert.IsType<Join>(result.Plan);
+        Assert.Equal(expected, Assert.IsType<Join>(result.Plan).JoinType.ToString());
     }
 
     // ----- AC1: Join — using columns -----
@@ -111,26 +112,63 @@ public sealed class DataFrameRelationalTransformationsTests
         Assert.Null(join.Condition);
         Assert.NotNull(join.UsingColumns);
         Assert.Equal(new[] { "id" }, join.UsingColumns!);
+        Assert.Same(left.Plan, join.Left);
+        Assert.Same(right.Plan, join.Right);
     }
 
     [Fact]
     public void Join_UsingColumns_BuildsInnerUsingJoinWithAllColumns()
     {
-        DataFrame result = Left().Join(Right(), new[] { "id", "dept" });
+        DataFrame left = Left();
+        DataFrame right = Right();
+
+        DataFrame result = left.Join(right, new[] { "id", "dept" });
 
         var join = Assert.IsType<Join>(result.Plan);
         Assert.Equal(JoinType.Inner, join.JoinType);
         Assert.Equal(new[] { "id", "dept" }, join.UsingColumns!);
+        Assert.Same(left.Plan, join.Left);
+        Assert.Same(right.Plan, join.Right);
     }
 
     [Fact]
     public void Join_UsingColumnsWithJoinType_MapsJoinType()
     {
-        DataFrame result = Left().Join(Right(), new[] { "id" }, "left");
+        DataFrame left = Left();
+        DataFrame right = Right();
+
+        DataFrame result = left.Join(right, new[] { "id" }, "left");
 
         var join = Assert.IsType<Join>(result.Plan);
         Assert.Equal(JoinType.LeftOuter, join.JoinType);
         Assert.Equal(new[] { "id" }, join.UsingColumns!);
+        Assert.Same(left.Plan, join.Left);
+        Assert.Same(right.Plan, join.Right);
+    }
+
+    // ----- DX-API F2: explicit CrossJoin -----
+
+    [Fact]
+    public void CrossJoin_BuildsCrossJoinWithNullCondition_AndBothChildren()
+    {
+        DataFrame left = Left();
+        DataFrame right = Right();
+
+        DataFrame result = left.CrossJoin(right);
+
+        var join = Assert.IsType<Join>(result.Plan);
+        Assert.Equal(JoinType.Cross, join.JoinType);
+        Assert.Null(join.Condition);
+        Assert.Null(join.UsingColumns);
+        Assert.False(join.IsNatural);
+        Assert.Same(left.Plan, join.Left);
+        Assert.Same(right.Plan, join.Right);
+    }
+
+    [Fact]
+    public void CrossJoin_NullRight_Throws()
+    {
+        Assert.Throws<ArgumentNullException>(() => Left().CrossJoin(null!));
     }
 
     // ----- AC1: Join immutability -----
@@ -164,6 +202,19 @@ public sealed class DataFrameRelationalTransformationsTests
         // The diagnostic names the supported aliases (AC3).
         Assert.Contains("inner", ex.Message);
         Assert.Contains("left_semi", ex.Message);
+    }
+
+    [Fact]
+    public void Join_PathologicallyLongJoinTypeString_ThrowsCleanArgumentException_NotStackOverflow()
+    {
+        // A very long, attacker-controlled join-type string must not overflow the stack in the
+        // normalizer (it must fall back off the stackalloc fast path); it fails cleanly at the API.
+        string huge = new('x', 5_000_000);
+
+        var ex = Assert.Throws<ArgumentException>(
+            () => Left().Join(Right(), Functions.Col("id"), huge));
+
+        Assert.Contains("Unsupported join type", ex.Message);
     }
 
     // ----- AC2: OrderBy / Sort -----
@@ -411,6 +462,18 @@ public sealed class DataFrameRelationalTransformationsTests
     public void OrderBy_NullFirstName_Throws()
     {
         Assert.ThrowsAny<ArgumentException>(() => Left().OrderBy((string)null!));
+    }
+
+    [Fact]
+    public void OrderBy_NullNameElement_Throws()
+    {
+        Assert.ThrowsAny<ArgumentException>(() => Left().OrderBy("a", null!));
+    }
+
+    [Fact]
+    public void OrderBy_EmptyNameElement_Throws()
+    {
+        Assert.ThrowsAny<ArgumentException>(() => Left().OrderBy("a", string.Empty));
     }
 
     [Fact]

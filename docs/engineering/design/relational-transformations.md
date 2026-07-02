@@ -25,6 +25,7 @@ ordering helpers to `DeltaSharp.Column` (`src/DeltaSharp.Core/Column.cs`), each 
 | Public method | Spark parity | Result plan |
 | --- | --- | --- |
 | `Join(DataFrame right)` | `join(right)` | `Join(this.Plan, right.Plan, Inner, condition: null)` |
+| `CrossJoin(DataFrame right)` | `crossJoin(right)` | `Join(this.Plan, right.Plan, Cross, condition: null)` |
 | `Join(DataFrame right, Column condition)` | `join(right, joinExprs)` | `Join(…, Inner, condition)` (delegates to the string overload with `"inner"`) |
 | `Join(DataFrame right, Column condition, string joinType)` | `join(right, joinExprs, joinType)` | `Join(…, JoinTypes.FromSparkString(joinType), condition)` |
 | `Join(DataFrame right, string usingColumn)` | `join(right, usingColumn)` | `Join(…, Inner, usingColumns: [usingColumn])` |
@@ -32,8 +33,8 @@ ordering helpers to `DeltaSharp.Column` (`src/DeltaSharp.Core/Column.cs`), each 
 | `Join(DataFrame right, IEnumerable<string> usingColumns, string joinType)` | `join(right, usingColumns, joinType)` | `Join(…, FromSparkString(joinType), usingColumns)` |
 | `OrderBy(params Column[] columns)` | `orderBy(cols: Column*)` | `Sort(order, global: true, this.Plan)` |
 | `OrderBy(string column, params string[] columns)` | `orderBy(col: String, cols: String*)` | `Sort(order, global: true, this.Plan)` |
-| `Sort(params Column[] columns)` | `sort(cols: Column*)` | delegates to `OrderBy` (Spark synonym) |
-| `Sort(string column, params string[] columns)` | `sort(col: String, cols: String*)` | delegates to `OrderBy` |
+| `Sort(params Column[] columns)` | `sort(cols: Column*)` | equivalent to `OrderBy` (both build a global `Sort` via the shared private `BuildSort` helper) |
+| `Sort(string column, params string[] columns)` | `sort(col: String, cols: String*)` | equivalent to `OrderBy` (shared `BuildSort` helper) |
 | `Limit(int n)` | `limit(n)` | `Limit(n, this.Plan)` |
 | `Distinct()` | `distinct()` | `Distinct(this.Plan)` |
 | `Union(DataFrame other)` | `union(other)` | `Union([this.Plan, other.Plan])` |
@@ -92,7 +93,11 @@ The public overloads cover Spark's shapes:
 - **`Join(right)`** — an **inner** join with **no** condition. Like Spark's `join(right)` the absent
   condition means a Cartesian product; callers add a condition (or use the using-column overloads) to
   avoid it. (DeltaSharp records `JoinType.Inner`, not `Cross`; `Cross` is reachable via the explicit
-  `"cross"` string.)
+  `"cross"` string, or the dedicated `CrossJoin` overload below.)
+- **`CrossJoin(right)`** — the explicit, intent-revealing Cartesian product (Spark's
+  `crossJoin(right)`). It records a `Join(Plan, right.Plan, JoinType.Cross, condition: null)` — the
+  safe way to *ask* for a product, distinct from the conditionless `Join(right)` (which records
+  `Inner`). Lazy, reads neither side (`CrossJoin_BuildsCrossJoinWithNullCondition_AndBothChildren`).
 - **`Join(right, condition)`** — an **inner** join on `condition`; it delegates to
   `Join(right, condition, "inner")` so there is one code path.
 - **`Join(right, condition, joinType)`** — the primary overload. It null-checks `right`/`condition`,
@@ -100,17 +105,27 @@ The public overloads cover Spark's shapes:
   condition.Expr)`. The condition expression is recorded **by reference** — never evaluated or
   rewritten (asserted by `Join_WithCondition_BuildsInnerJoinRecordingConditionByReference`).
 - **`Join(right, usingColumn)`** / **`Join(right, usingColumns)`** / **`Join(right, usingColumns,
-  joinType)`** — using-joins. The shared column names are recorded in the node's `UsingColumns`; the
-  analyzer later desugars them into an equi-`Condition` once both sides resolve (see
-  [analyzer-resolution.md](analyzer-resolution.md) and `JoinUsingTests`). Each name is validated
-  non-null/non-empty at the API.
+  joinType)`** — using-joins. The shared column names are recorded in the node's `UsingColumns`.
+  **Building the node is supported now, but resolution is deferred:** the analyzer rule that desugars
+  the shared columns into an equi-`Condition` is **not yet implemented**, so `Analyzer.Resolve` of a
+  plan containing a using/natural join fails fast with a **targeted** `AnalysisException`
+  (kind `UsingOrNaturalJoinNotImplemented`, message pointing at the follow-up
+  [#405](https://github.com/khaines/deltasharp/issues/405)) rather than the generic
+  `UnresolvedOperator("Join")`. Each name is validated non-null/non-empty at the API. See
+  [analyzer-resolution.md](analyzer-resolution.md);
+  `Resolve_UsingColumnJoin_ThrowsTargetedNotImplemented_NotGenericUnresolvedOperator` pins the
+  diagnostic.
 
 ### 3.1 The join-type string → enum mapping (Spark parity)
 
-`JoinTypes.FromSparkString` is the single mapping point. It **normalizes** the input — trims nothing
-but lower-cases every character and drops `'_'` and `' '` — then matches, so `"LEFT OUTER"`,
-`"left_outer"`, and `"leftouter"` are the same kind. Parity target: Spark's
-`JoinType.apply(String)`.
+`JoinTypes.FromSparkString` is the single mapping point. It **normalizes** the input — lower-cases
+every character and drops `'_'` and `' '` (it does **not** trim) — then matches, so `"LEFT OUTER"`,
+`"left_outer"`, and `"leftouter"` are the same kind. This is a **superset** of Spark's
+`JoinType.apply(String)` aliases: Spark strips underscores only, whereas DeltaSharp additionally
+tolerates spaces for a friendlier UX. The on-stack normalization buffer is capped (≤ 256 chars use
+`stackalloc`; longer strings fall back to `ArrayPool<char>`), so a pathologically long
+attacker-controlled `joinType` cannot overflow the stack — it fails cleanly with the
+`ArgumentException` below (`Join_PathologicallyLongJoinTypeString_ThrowsCleanArgumentException_NotStackOverflow`).
 
 | Spark string alias(es) (after normalization) | `JoinType` |
 | --- | --- |
@@ -139,9 +154,10 @@ adds no analyzer output logic for joins; it is covered by `AnalyzerTests`
 `OrderBy` and `Sort` both build a **global** `Sort` node
 (`src/DeltaSharp.Core/Plans/Logical/Sort.cs`: `Sort(IEnumerable<Expression> order, bool global,
 LogicalPlan child)`) with `global: true`. In Spark `orderBy` and `sort` are exact synonyms (both a
-total order), so `Sort(...)` delegates to `OrderBy(...)`; the per-partition
-`sortWithinPartitions` (`global: false`) is a later story and out of scope. This is asserted by
-`Sort_IsEquivalentToOrderBy`.
+total order). Neither method delegates to the other: `OrderBy` and `Sort` are both thin wrappers over
+the **shared private `BuildSort` helper**, so they are equivalent by construction rather than one
+calling the other; the per-partition `sortWithinPartitions` (`global: false`) is a later story and
+out of scope. This is asserted by `Sort_IsEquivalentToOrderBy`.
 
 Each ordering term is a `SortOrder` expression
 (`src/DeltaSharp.Core/Plans/Expressions/SortOrder.cs`: `SortOrder(Expression child, SortDirection
@@ -158,6 +174,12 @@ The direction/null defaults come from `Column.Asc()`/`Column.Desc()`:
 | `Column.Asc()` | `Ascending` | `NullsFirst` | `Column.asc` (= `asc_nulls_first`) |
 | `Column.Desc()` | `Descending` | `NullsLast` | `Column.desc` (= `desc_nulls_last`) |
 | bare column in `OrderBy` | `Ascending` | `NullsFirst` | plain `orderBy(col)` |
+
+**Deferred to [#405](https://github.com/khaines/deltasharp/issues/405):** the four explicit
+null-placement helpers `Column.AscNullsFirst` / `AscNullsLast` / `DescNullsFirst` / `DescNullsLast`.
+The IR is already **forward-compatible** — `SortOrder`/`NullOrdering` model all four
+direction×null-placement combinations — so this is a public-`Column`-surface addition only, with no
+IR change required. `Column.Asc()`/`Desc()` XML remarks carry a one-line pointer to #405.
 
 The string overloads turn each name into `Functions.Col(name)` first (so a required first name keeps
 `OrderBy()` unambiguous, exactly as the `Select` overload does — see
@@ -185,10 +207,20 @@ the analyzer passes through unchanged.
 semantics matter and are documented on the API:
 
 - **By position, not by name.** The *n*th column of each input is unioned regardless of column name.
-  (Name-aligned union is Spark's separate `unionByName`, not shipped here.)
+  Name-aligned union is Spark's separate `unionByName`, deferred and tracked by
+  [#405](https://github.com/khaines/deltasharp/issues/405); the `Union` XML `<remarks>` carries the
+  same pointer.
 - **Row-preserving (bag union), no dedup.** `union` keeps duplicates; call `Distinct()` to dedupe.
   `unionAll` is a deprecated Spark synonym of `union`, so `UnionAll` delegates to `Union`
   (`UnionAll_IsEquivalentToUnion`).
+
+**`UnionAll` deprecation decision (DX-API F4).** Spark marks `unionAll` `@deprecated`. DeltaSharp
+**consciously keeps `UnionAll` non-obsolete** rather than attaching `[Obsolete]`: the framework's core
+value is letting Spark code port across unchanged, so emitting an obsolete-warning on a
+directly-ported `unionAll` call would create migration friction (and, under `-warnaserror`, break
+builds of ported code) for no correctness benefit. The method is a one-line delegate to `Union` and
+its XML doc already flags Spark's deprecation, so callers who prefer the current name are steered
+without a hard warning. Revisit if/when we add analyzer-level migration guidance.
 
 Union output derivation follows the **first input's** attributes (the analyzer's `Union` case in
 `DeriveOutput`). Minting fresh output ids and widening nullability across inputs is tracked as
@@ -220,11 +252,25 @@ inputs (e.g. widening `int`/`long`, promoting nullability). This story implement
 **structural** (arity) half; the type half is explicitly out of scope and tracked by #171 (and the
 related `TODO(#392)` in `DeriveOutput`).
 
+### 7.3 Using/natural join resolution → targeted `AnalysisException` (deferred, #405)
+
+A using-column or natural join can be **built** today, but the analyzer rule that desugars its shared
+columns into an equi-`Condition` is **not yet implemented**. `Join.IsNodeResolved` therefore reports
+such a join permanently unresolved, so `CheckAnalysis` catches it. Rather than emit the generic
+`UnresolvedOperator("Join")`, `CheckAnalysis` recognises the `UsingColumns`/`IsNatural` shape and
+throws a **targeted** `AnalysisException` (kind
+`AnalysisErrorKind.UsingOrNaturalJoinNotImplemented`) whose message says the feature is not yet
+implemented and links [#405](https://github.com/khaines/deltasharp/issues/405) — deterministic and
+actionable. Covered by
+`Resolve_UsingColumnJoin_ThrowsTargetedNotImplemented_NotGenericUnresolvedOperator` and
+`Resolve_NaturalJoin_ThrowsTargetedNotImplemented`. The desugaring rule itself is tracked by #405.
+
+
 ## 8. Public API surface
 
 The additions to `src/DeltaSharp.Core/PublicAPI.Unshipped.txt` are the two `Column` ordering helpers
-(`Asc`/`Desc`) and the `DataFrame` methods `Join` (6 overloads), `OrderBy`/`Sort` (2 each), `Limit`,
-`Distinct`, `Union`, and `UnionAll`. No internal IR type (`Expression`, `LogicalPlan`, `JoinType`,
+(`Asc`/`Desc`) and the `DataFrame` methods `Join` (6 overloads), `CrossJoin`, `OrderBy`/`Sort`
+(2 each), `Limit`, `Distinct`, `Union`, and `UnionAll`. No internal IR type (`Expression`, `LogicalPlan`, `JoinType`,
 `SortOrder`, `SortDirection`, `NullOrdering`) is added to the public surface. `PublicAPI` entries are
 append-only and shared with the parallel FEAT-04.3 lane (#161).
 
@@ -233,6 +279,7 @@ append-only and shared with the parallel FEAT-04.3 lane (#161).
 | Method | Guard |
 | --- | --- |
 | `Join(right, …)` | `right` non-null (`ArgumentNullException`) |
+| `CrossJoin(right)` | `right` non-null (`ArgumentNullException`) |
 | `Join(right, condition[, joinType])` | `condition` non-null; `joinType` non-null and a supported alias (`ArgumentException`) |
 | `Join(right, usingColumn)` | `usingColumn` non-null/non-empty (`ArgumentException`) |
 | `Join(right, usingColumns[, joinType])` | `usingColumns` non-null; each element non-null/non-empty |

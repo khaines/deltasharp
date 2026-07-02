@@ -155,6 +155,14 @@ internal sealed class Analyzer
         // node's own state (e.g. an undesugared using/natural join).
         if (!plan.Resolved)
         {
+            // A using-column/natural Join is permanently unresolved until the desugar-to-equi-
+            // condition rule lands (#405). Surface a targeted, actionable diagnostic instead of the
+            // generic UnresolvedOperator("Join") so callers know the feature is deferred, not broken.
+            if (plan is Join { UsingColumns: { Count: > 0 } } or Join { IsNatural: true })
+            {
+                throw AnalysisException.UsingOrNaturalJoinNotImplemented(((Join)plan).IsNatural);
+            }
+
             throw AnalysisException.UnresolvedOperator(plan.NodeName);
         }
 

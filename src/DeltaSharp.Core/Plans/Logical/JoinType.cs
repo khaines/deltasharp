@@ -1,3 +1,5 @@
+using System.Buffers;
+
 namespace DeltaSharp.Plans.Logical;
 
 /// <summary>The relational join kinds the M1 logical plan can record. Spark parity.</summary>
@@ -29,9 +31,11 @@ internal enum JoinType
 /// Maps Spark's join-type <b>string aliases</b> (the <c>joinType</c> argument of
 /// <c>Dataset.join</c>) onto the internal <see cref="JoinType"/> enum, so the enum stays off the
 /// public surface while <see cref="DataFrame.Join(DataFrame, Column, string)"/> accepts the same
-/// strings Spark users already know. Parity target: Spark's <c>JoinType.apply(String)</c> — the
-/// input is normalized (trimmed, lower-cased, and with spaces/underscores removed) before matching,
-/// so <c>"left_outer"</c>, <c>"leftouter"</c>, and <c>"LEFT OUTER"</c> are all the same kind.
+/// strings Spark users already know. The input is normalized (lower-cased, with underscores
+/// <b>and</b> spaces dropped) before matching, so <c>"left_outer"</c>, <c>"leftouter"</c>, and
+/// <c>"LEFT OUTER"</c> are all the same kind. This is a <b>superset</b> of Spark's
+/// <c>JoinType.apply(String)</c> aliases (Spark strips <c>'_'</c> only; DeltaSharp also tolerates
+/// spaces for a friendlier UX).
 /// </summary>
 internal static class JoinTypes
 {
@@ -66,20 +70,39 @@ internal static class JoinTypes
         };
     }
 
+    // A join-type alias is a short literal; only the longest supported alias needs the fast path.
+    // Anything longer is a caller error (it will fail the switch anyway) — cap the on-stack buffer so
+    // a pathologically long attacker-controlled string cannot overflow the stack (consistent with the
+    // TreeNode.MaxDepth adversarial-bound posture).
+    private const int MaxStackAllocChars = 256;
+
     private static string Normalize(string joinType)
     {
-        Span<char> buffer = stackalloc char[joinType.Length];
-        int length = 0;
-        foreach (char c in joinType)
+        char[]? rented = joinType.Length > MaxStackAllocChars
+            ? ArrayPool<char>.Shared.Rent(joinType.Length)
+            : null;
+        Span<char> buffer = rented is null ? stackalloc char[joinType.Length] : rented;
+        try
         {
-            if (c is '_' or ' ')
+            int length = 0;
+            foreach (char c in joinType)
             {
-                continue;
+                if (c is '_' or ' ')
+                {
+                    continue;
+                }
+
+                buffer[length++] = char.ToLowerInvariant(c);
             }
 
-            buffer[length++] = char.ToLowerInvariant(c);
+            return new string(buffer[..length]);
         }
-
-        return new string(buffer[..length]);
+        finally
+        {
+            if (rented is not null)
+            {
+                ArrayPool<char>.Shared.Return(rented);
+            }
+        }
     }
 }

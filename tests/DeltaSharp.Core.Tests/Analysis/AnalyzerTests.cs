@@ -436,9 +436,41 @@ public sealed class AnalyzerTests
         var ex = Assert.Throws<AnalysisException>(() => analyzer.Resolve(union));
 
         Assert.Equal(AnalysisErrorKind.NumberOfColumnsMismatch, ex.Kind);
-        // The Spark-parity diagnostic names both arities.
+        // The Spark-parity diagnostic names both arities (pluralized) and the 1-based input ordinal.
         Assert.Contains("2 columns", ex.Message);
-        Assert.Contains("1 columns", ex.Message);
+        Assert.Contains("1 column", ex.Message);
+        Assert.Contains("input 2", ex.Message);
+    }
+
+    // ---- FIX 1 (#405): using/natural join resolution is deferred — targeted diagnostic ----
+
+    [Fact]
+    public void Resolve_UsingColumnJoin_ThrowsTargetedNotImplemented_NotGenericUnresolvedOperator()
+    {
+        var analyzer = new Analyzer(CatalogWithTwoSides());
+        var join = new Join(Relation("l"), Relation("r"), JoinType.Inner, usingColumns: new[] { "lid" });
+
+        var ex = Assert.Throws<AnalysisException>(() => analyzer.Resolve(join));
+
+        Assert.Equal(AnalysisErrorKind.UsingOrNaturalJoinNotImplemented, ex.Kind);
+        Assert.Contains("using/natural join resolution is not yet implemented", ex.Message);
+        Assert.Contains("using-column", ex.Message);
+        Assert.Contains("issues/405", ex.Message);
+        // It must NOT fall back to the generic "operator 'Join' remains unresolved" message.
+        Assert.DoesNotContain("remains unresolved after analysis", ex.Message);
+    }
+
+    [Fact]
+    public void Resolve_NaturalJoin_ThrowsTargetedNotImplemented()
+    {
+        var analyzer = new Analyzer(CatalogWithTwoSides());
+        var join = new Join(Relation("l"), Relation("r"), JoinType.Inner, isNatural: true);
+
+        var ex = Assert.Throws<AnalysisException>(() => analyzer.Resolve(join));
+
+        Assert.Equal(AnalysisErrorKind.UsingOrNaturalJoinNotImplemented, ex.Kind);
+        Assert.Contains("natural", ex.Message);
+        Assert.Contains("issues/405", ex.Message);
     }
 
     private static void AssertAttribute(
