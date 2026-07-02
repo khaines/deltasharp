@@ -1,4 +1,8 @@
 #nullable enable
+DeltaSharp.Column
+DeltaSharp.Column.Alias(string! alias) -> DeltaSharp.Column!
+DeltaSharp.Column.As(string! alias) -> DeltaSharp.Column!
+DeltaSharp.Column.Name(string! alias) -> DeltaSharp.Column!
 DeltaSharp.DataFrame
 DeltaSharp.DataFrameReader
 DeltaSharp.DeltaSharpInfo
@@ -6,6 +10,7 @@ DeltaSharp.ExecutionBackend
 DeltaSharp.ExecutionBackend.Auto = 0 -> DeltaSharp.ExecutionBackend
 DeltaSharp.ExecutionBackend.Compiled = 2 -> DeltaSharp.ExecutionBackend
 DeltaSharp.ExecutionBackend.Interpreted = 1 -> DeltaSharp.ExecutionBackend
+DeltaSharp.Functions
 DeltaSharp.RuntimeConfig
 DeltaSharp.RuntimeConfig.Contains(string! key) -> bool
 DeltaSharp.RuntimeConfig.Get(string! key) -> string!
@@ -39,6 +44,10 @@ static DeltaSharp.DeltaSharpInfo.PreviewReleaseChannel.get -> string!
 static DeltaSharp.DeltaSharpInfo.Product.get -> string!
 static DeltaSharp.DeltaSharpInfo.ProductName.get -> string!
 static DeltaSharp.DeltaSharpInfo.Version.get -> string!
+static DeltaSharp.Functions.Col(string! columnName) -> DeltaSharp.Column!
+static DeltaSharp.Functions.Column(string! columnName) -> DeltaSharp.Column!
+static DeltaSharp.Functions.Lit(object? value) -> DeltaSharp.Column!
+override DeltaSharp.Column.ToString() -> string!
 static DeltaSharp.SparkSession.Builder() -> DeltaSharp.SparkSessionBuilder!
 static DeltaSharp.SparkSession.ClearActiveSession() -> void
 static DeltaSharp.SparkSession.ClearDefaultSession() -> void
