@@ -216,6 +216,24 @@ The IR nodes are immutable (structural sharing from #167/#168): chaining `When(.
 **re-wraps** into a new `CaseWhen`/`Column` and never mutates the source column
 (`Chaining_DoesNotMutateSource`). No function on this surface touches a data source or runs a kernel.
 
+## Performance characteristics (`CaseWhen` is a wide, flat node)
+
+`CaseWhen` flattens `N` branches + an optional else into `2N+1` children, so its **depth stays ~2**
+regardless of branch count. Two consequences follow, both **acceptable and caller-bounded** for an
+in-memory IR builder and tracked for a future optimization in
+[#401](https://github.com/khaines/deltasharp/issues/401):
+
+- **Fluent chaining is `O(N²)` time / `O(N)` memory.** Each `.When(...)` calls `AddBranch`, which copies
+  the child array to build a new immutable node, so an `N`-branch CASE built by chaining is `O(N²)` total.
+- **Equality / hash / render are `O(width)`.** `NodeEquals`/`NodeHashCode`/`SimpleString` iterate all
+  `2N+1` children.
+
+This is **not** a DoS surface: `CaseWhen` is bounded by *caller* code (a user authoring `.When()` calls),
+has no unconstrained external-input vector at runtime, and the work is horizontal iteration — **not**
+recursion, so it carries none of the stack-overflow risk that the `TreeNode.MaxDepth=1000` guard exists to
+prevent (that guard bounds depth, not width). It is congruent with the equally-unbounded arity of
+`Coalesce`/`Concat` varargs and nested-plan width.
+
 ## Public-surface & governance
 
 All new members are `public static` on `Functions` (or public instance on `Column`) returning
@@ -234,5 +252,5 @@ and `tests/DeltaSharp.Core.Tests/Plans/Expressions/CaseWhenTests.cs` (the `CaseW
 | **AC2** | Aggregate calls are distinguishable by canonical Spark name (binding is the analyzer's job) | `FunctionsRegistryTests.Aggregate_Column_BuildsNamedUnaryFunction`, `Aggregate_ColumnName_BindsToColReference`, `Count_*`, `CountDistinct_SetsIsDistinctAndOrdersArgs` (name + `IsDistinct` are the classification inputs) |
 | **AC3** | Unsupported Spark functions report a documented diagnostic | `FunctionsRegistryTests.Expr_IsUnsupported_ThrowsNotSupported`, `Expr_NullOrEmpty_ThrowsArgument`; guards `Coalesce_Empty/NullElement/NullArray_Throws`, `Concat_Empty_Throws`, `UnaryFunction_NullColumn_Throws` |
 | **AC4** | Each function's XML doc states laziness and Spark deviation | XML docs on every member of `Functions.cs`/`Column.cs`; the [parity matrix](#the-m1-function-set-parity-matrix) Notes column |
-| `when`/`CaseWhen` model | Chained `when`/`otherwise` build the right structure; Spark-parity misuse guards; immutability; structural equality | `CaseWhenTests.*` (`When_OnNonCaseWhenColumn_Throws`, `Otherwise_OnNonCaseWhenColumn_Throws`, `When_AfterOtherwise_Throws`, `Otherwise_Twice_Throws`, `When_NullCondition_Throws`, `Chaining_DoesNotMutateSource`, `Resolved_FollowsChildren`, `WithNewChildren_*`, `Equality_IsStructural`, `Constructor_SingleBranch_*`) |
-| Lazy | Constructing functions does no work | `FunctionsRegistryTests` (`Resolved == false`/`Type == null` asserted in `AssertFunction`); `CaseWhenTests.When_BuildsSingleBranchCaseWhen` (`Resolved == false`, `Type == null`) |
+| `when`/`CaseWhen` model | Chained `when`/`otherwise` build the right structure; Spark-parity misuse guards; immutability; structural equality; `Nullable` derived from branch/else values; changed-child round-trip | `CaseWhenTests.*` (`When_OnNonCaseWhenColumn_Throws`, `Otherwise_OnNonCaseWhenColumn_Throws`, `When_AfterOtherwise_Throws`, `Otherwise_Twice_Throws`, `When_NullCondition_Throws`, `Chaining_DoesNotMutateSource`, `Resolved_FollowsChildren`, `WithNewChildren_*` incl. `WithNewChildren_ChangedChild_RebuildsAndPreservesElseAndBranches`, `MapChildren_SwapsChild_PreservesElse`, `Equality_IsStructural`, `Equality_DifferentNodeType_IsNotEqual`, `Nullable_*` [`NoElse_IsNullable`, `ElseAndAllNonNullValues_IsNotNullable`, `NullableElse_IsNullable`, `NullableBranchValue_IsNullable`, `NullableConditionOnly_IsNotNullable`], `Constructor_SingleBranch_*`) |
+| Lazy / determinism | Constructing functions does no work; `current_date`/`current_timestamp` build unresolved nodes capturing **no** wall clock | `FunctionsRegistryTests` (`Resolved == false`/`Type == null` asserted in `AssertFunction`); `CaseWhenTests.When_BuildsSingleBranchCaseWhen` (`Resolved == false`, `Type == null`); `CurrentDate_IsDeterministic_NoWallClockCaptured`, `CurrentTimestamp_IsDeterministic_NoWallClockCaptured` |
