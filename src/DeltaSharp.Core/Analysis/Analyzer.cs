@@ -261,7 +261,8 @@ internal sealed class Analyzer
 
         if (expression.Resolved && expression.Type is null)
         {
-            throw AnalysisException.UntypedResolvedExpression(expression.SimpleString, ownerNodeName);
+            throw AnalysisException.UntypedResolvedExpression(
+                CoercionHelpers.PrettyReference(expression), ownerNodeName);
         }
     }
 
@@ -557,7 +558,8 @@ internal sealed class Analyzer
                 // resolved alias exposes a concrete type; a residual null here is a coercion gap the
                 // untyped-resolved guard reports symmetrically with CheckAnalysis.
                 DataType type = alias.Type
-                    ?? throw AnalysisException.UntypedResolvedExpression(alias.Child.SimpleString, "Project");
+                    ?? throw AnalysisException.UntypedResolvedExpression(
+                        CoercionHelpers.PrettyReference(alias.Child), "Project");
                 return new AttributeReference(alias.Name, type, alias.Nullable, idGenerator.Next());
 
             case ResolvedFunction function:
@@ -568,7 +570,8 @@ internal sealed class Analyzer
                 // ResolveReferences, so the call is already typed here; a residual null type is a
                 // coercion gap reported symmetrically with the Alias case.
                 DataType functionType = function.Type
-                    ?? throw AnalysisException.UntypedResolvedExpression(function.SimpleString, "Aggregate");
+                    ?? throw AnalysisException.UntypedResolvedExpression(
+                        CoercionHelpers.PrettyReference(function), "Aggregate");
                 return new AttributeReference(
                     SparkAutoName(function), functionType, function.Nullable, idGenerator.Next());
 

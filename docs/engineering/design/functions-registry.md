@@ -43,7 +43,7 @@ the SQL expression parser is the SQL frontend (EPIC-07 / #159).
 ## The M1 function set (parity matrix)
 
 The M1 registry set below is delivered by this story. "Kind" is the Spark classification the analyzer
-(#171) will apply by canonical name — this surface only guarantees faithful naming (see
+(#171) applies by canonical name — this surface only guarantees faithful naming (see
 [§ aggregate-vs-scalar](#aggregate-vs-scalar-classification-ac2)). Every function is **lazy** and
 builds an unresolved node; no listed function deviates from Spark semantics (deviations are called out
 in the Notes column).

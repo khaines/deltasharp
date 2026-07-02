@@ -144,11 +144,11 @@ Aggregate output names follow Spark:
   the output column is named `total`. Verified by `Agg_HonorsUserAliasOnAggregateOutput`.
 - **Bare aggregate → analyzer names it.** A bare aggregate such as `Functions.Sum(Functions.Col("v"))`
   is an `UnresolvedFunction`; the API leaves it **unaliased**. Spark's auto-name (`sum(v)`) is a
-  pretty-printed name assigned by the analyzer when aggregate-function resolution and naming land —
-  DeltaSharp defers that to STORY-04.5.2 (#171). This is a deliberate **plan-shape divergence** from
-  Spark: Spark wraps an unnamed aggregate in an `UnresolvedAlias` naming marker (later resolved by
+  pretty-printed name assigned by the analyzer when aggregate-function resolution and naming run —
+  DeltaSharp **delivers** that in STORY-04.5.2 (#171). This is a deliberate **plan-shape divergence**
+  from Spark: Spark wraps an unnamed aggregate in an `UnresolvedAlias` naming marker (later resolved by
   `ResolveAliases`), whereas DeltaSharp plants a **raw `UnresolvedFunction`** with no naming marker —
-  so #171 must *synthesize* the output name from the expression rather than resolve a pre-planted
+  so #171 **synthesizes** the output name from the expression rather than resolving a pre-planted
   marker. The API never computes the name eagerly (it would have to inspect/execute the expression).
   Verified by `Agg_BareAggregate_IsLeftUnaliased_ForAnalyzerNaming`.
 - **`Count()`** is the one door that fixes a name: it is `Agg(Count(Lit(1L)).As("count"))`, matching
@@ -178,40 +178,47 @@ attribute reuses the child grouping key's `ExprId`** (the retained key at the fr
 `AggregateExpressions` is bound to one identity, closing the retainGroupColumns ↔ derivation ↔
 ExprId-reuse loop).
 
-## 6. What is deferred to #171 (aggregate type-validation & function resolution)
+## 6. Aggregate function resolution, type-validation & auto-naming (delivered by #171)
 
 Per AC3, an **invalid aggregate input** (a non-aggregate expression in aggregate position, an
 aggregate outside an aggregate context, or a type-incompatible aggregate argument) is reported by the
 **analyzer**, deterministically — never by the API executing or coercing. This story:
 
 - builds only a **well-formed unresolved** `Aggregate`; it neither coerces nor executes;
-- leaves aggregate **function resolution** and **pretty-naming** to the analyzer. Today an
-  `UnresolvedFunction` (`sum`/`count`/…) is *not* resolved, and the analyzer rejects it
-  deterministically along **whichever of two gates fires first**:
+- delegates aggregate **function resolution**, **type-validation**, and **pretty-naming** to the
+  analyzer. A bare aggregate `UnresolvedFunction` (`sum`/`count`/…) is now **bound** to a typed
+  `ResolvedFunction` by `FunctionRegistry` and its arguments coerced during `ResolveReferences`, then
+  **auto-named** in output position. The two analyzer gates behave as follows:
   - **output derivation** — for a bare aggregate in output position (the most common call,
-    `df.GroupBy("k").Agg(Functions.Sum(Functions.Col("v")))`), the failure fires from
-    `DeriveOutput → ToAttribute` **during `ResolveReferences`**, *before* `CheckAnalysis` runs.
-    `ToAttribute` cannot mint an output name for a raw `UnresolvedFunction`, so it throws a targeted
-    `AnalysisException` (`Kind = UnsupportedProjection`) naming the deferred-resolution boundary and
-    the alias workaround. This is the path `Analyzer_RealAggregateFunction_ReportsDeferredResolution_NotApiExecution`
-    pins (message asserted verbatim so #171 improves it deliberately);
-  - **`CheckAnalysis`** — the post-condition sweep that throws when an `UnresolvedFunction` (or other
-    unresolved marker) survives to a position that output derivation does not name (for example an
-    aggregate argument, or a function nested where it is not the projected element).
+    `df.GroupBy("k").Agg(Functions.Sum(Functions.Col("v")))`), function binding runs earlier in
+    `ResolveReferences`, so by the time `DeriveOutput → ToAttribute` runs the call is already a typed
+    `ResolvedFunction`. `ToAttribute`'s `case ResolvedFunction` (`Analyzer.cs`) **mints the Spark
+    auto-name** — the function's pretty SQL string `sum(v)` (unqualified argument names, no `#id`
+    suffix) — via `CoercionHelpers.PrettyReference`. A residual **raw `UnresolvedFunction`** reaching
+    `ToAttribute` means the bind pass was skipped for that subtree; its branch throws
+    `UnknownFunction` ("Undefined function …") rather than naming a boundary. This is the path
+    `Analyzer_RealAggregateFunction_ResolvesToAutoNamedOutput` pins (a bare aggregate function
+    **resolves → auto-named output**, it is no longer rejected);
+  - **`CheckAnalysis`** — the post-condition sweep that throws when an unresolved marker survives to a
+    position that output derivation does not name (for example an aggregate argument, or a function
+    nested where it is not the projected element).
 
-  So the accurate statement is that the analyzer is the gate via **output-derivation
-  (`DeriveOutput`/`ToAttribute`) OR `CheckAnalysis`, whichever fires first** — not solely
-  `CheckAnalysis`. ("Nothing is read/executed" on this path is proven separately by the §7 lazy
-  tests, not by the AC3 boundary test.)
+  So the accurate statement is that the analyzer **binds and auto-names** a bare aggregate function via
+  output-derivation (`DeriveOutput`/`ToAttribute`), and `CheckAnalysis` remains the backstop for any
+  unresolved marker that escapes naming. ("Nothing is read/executed" on this path is proven separately
+  by the §7 lazy tests, not by the AC3 boundary test.)
 
 Aggregate function resolution, aggregate input type-validation, and Spark auto-naming **are delivered**
 by STORY-04.5.2 ([#171](https://github.com/khaines/deltasharp/issues/171)): a bare aggregate now binds,
 type-validates, and is auto-named under its Spark pretty SQL string (e.g. `sum(salary)`) — see
 [function-binding-coercion.md §4.2](function-binding-coercion.md). The API surface stays lazy and the
-analyzer boundary is explicit. A **complex grouping key** (a non-attribute expression retained at the
-front of the aggregate output, e.g. `GroupBy(Col("a").Plus(Col("b")))`)
-hits the same output-derivation gate today and is likewise deferred to #171 for naming/aliasing —
-pinned by `Analyzer_ComplexGroupingKey_ThrowsDeterministically_TrackedUnder171`.
+analyzer boundary is explicit. The one **genuinely-still-deferred** case is a **complex grouping key**
+(a non-attribute expression retained at the front of the aggregate output, e.g.
+`GroupBy(Col("a").Plus(Col("b")))`): output derivation cannot yet mint a name for a bare
+`BinaryArithmetic`/computed grouping key, so it deterministically throws `UnsupportedProjection`. Naming
+/ aliasing for computed keys is tracked under
+[#410](https://github.com/khaines/deltasharp/issues/410) — pinned by
+`Analyzer_ComplexGroupingKey_ThrowsDeterministically_TrackedUnder171`.
 
 ## 7. The lazy invariant and how it is proven
 
@@ -243,7 +250,7 @@ Proven three ways:
 | --- | --- | --- |
 | **AC1** | `GroupBy` returns a grouped handle recording grouping expressions **without executing**; the handle is not a `DataFrame`. | `GroupBy_Columns_RecordsGroupingExpressionsInOrder`, `GroupBy_Names_RecordsUnresolvedAttributeGroupingExpressions`, `GroupBy_SingleName_RecordsSingleGroupingExpression`, `GroupBy_NoColumns_RecordsEmptyGrouping`, `GroupBy_DoesNotBuildAnAggregate_UntilAggIsChosen` |
 | **AC2** | `Agg` (grouped) builds `Aggregate` with grouping + retained keys ⧺ aggregate exprs and Spark aliases; global `df.Agg` builds `Aggregate` with empty grouping. | `Agg_BuildsAggregateWithGroupingAndRetainedKeysThenAggregate` (also pins retained-key `Assert.Same` structural sharing), `Agg_HonorsUserAliasOnAggregateOutput`, `Agg_BareAggregate_IsLeftUnaliased_ForAnalyzerNaming`, `Agg_MultipleAggregates_AppendInOrderAfterRetainedKeys`, `Count_BuildsAggregateWithNamedCountAfterRetainedKeys`, `GlobalAgg_BuildsAggregateWithEmptyGrouping`, `GlobalAgg_IsEquivalentToGroupByNoKeysThenAgg`, `GlobalAgg_MultipleAggregates_AppendInOrder`, `GlobalCount_BuildsAggregateWithEmptyGroupingAndSingleCountColumn` |
-| **AC3** | Invalid aggregate input is reported by the **analyzer** (output derivation OR `CheckAnalysis`, whichever fires first), not the API; the API builds a well-formed unresolved plan (deep validation deferred to #171). | `Analyzer_RealAggregateFunction_ReportsDeferredResolution_NotApiExecution` (message pinned); complex-key boundary via `Analyzer_ComplexGroupingKey_ThrowsDeterministically_TrackedUnder171`; structural derivation + parent-`Project` interplay via `Analyzer_DerivesAggregateOutput_AsGroupingAttributesThenAggregateAliases` |
+| **AC3** | Invalid aggregate input is reported by the **analyzer** (function binding + auto-naming via output derivation, or `CheckAnalysis` as backstop), not the API; the API builds a well-formed unresolved plan. | `Analyzer_RealAggregateFunction_ResolvesToAutoNamedOutput` (bare aggregate resolves → auto-named `sum(salary)`); complex-key boundary via `Analyzer_ComplexGroupingKey_ThrowsDeterministically_TrackedUnder171` (naming tracked under #410); structural derivation + parent-`Project` interplay via `Analyzer_DerivesAggregateOutput_AsGroupingAttributesThenAggregateAliases` |
 | **AC4** | Method names + chaining order recognizable to Spark users (`df.GroupBy("k").Agg(Functions.Sum(...).As("total"))`). | `Agg_*` (surface + shape), `GroupByAgg_ChainsOverPriorTransformations_LeavingEachStageIntact` |
 | **Lazy** | Transformations do no work; the source frame is unchanged. | `Agg_LeavesSourceFrameUnchanged_AndSharesChildByReference`, `DataFrameAggregationLazyTests.*` |
 | **Guards** | Null/empty argument rejection. | `GroupBy_Null*`/`GroupBy_Empty*`, `Agg_Null*`, `GlobalAgg_NullFirstExpr_Throws`, `GlobalAgg_NullExprsArray_Throws`, `GlobalAgg_NullExprElement_Throws` |

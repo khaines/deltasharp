@@ -32,9 +32,13 @@ internal static class CoercionHelpers
     /// contributes its bare <c>Name</c> (never the internal <c>name#ExprId</c>), an implicit coercion
     /// <see cref="Cast"/> is transparent (its child's pretty form), binary arithmetic/comparison render
     /// as the infix <c>(left op right)</c>, a <see cref="ResolvedFunction"/> renders as
-    /// <c>name(DISTINCT? args)</c>, and anything else (a literal, an unresolved marker) falls back to
-    /// its <c>SimpleString</c>. Critically, it never leaks an ExprId, so diagnostics
-    /// show <c>(b + i)</c> / <c>i</c> rather than <c>(b#7 + i#8)</c> / <c>i#8</c>.
+    /// <c>name(DISTINCT? args)</c>, the boolean composites (<see cref="And"/>, <see cref="Or"/>,
+    /// <see cref="Not"/>) render as their parenthesized SQL forms, a <see cref="CaseWhen"/> renders as
+    /// <c>CASE WHEN … THEN … [ELSE …] END</c>, and anything else (a literal, an unresolved marker)
+    /// falls back to its <c>SimpleString</c>. Every composite recurses through this renderer, so no
+    /// resolved sub-expression reaches the <c>SimpleString</c> leaf fallback carrying an ExprId.
+    /// Critically, it never leaks an ExprId, so diagnostics show <c>(b + i)</c> / <c>i</c> /
+    /// <c>(b AND i)</c> / <c>CASE WHEN b THEN i ELSE s END</c> rather than <c>(b#7 + i#8)</c> etc.
     /// </summary>
     public static string PrettyReference(Expression expression)
     {
@@ -47,6 +51,10 @@ internal static class CoercionHelpers
                 $"({PrettyReference(arithmetic.Left)} {arithmetic.Symbol} {PrettyReference(arithmetic.Right)})",
             BinaryComparison comparison =>
                 $"({PrettyReference(comparison.Left)} {comparison.Symbol} {PrettyReference(comparison.Right)})",
+            And and => $"({PrettyReference(and.Left)} AND {PrettyReference(and.Right)})",
+            Or or => $"({PrettyReference(or.Left)} OR {PrettyReference(or.Right)})",
+            Not not => $"(NOT {PrettyReference(not.Child)})",
+            CaseWhen caseWhen => PrettyCaseWhen(caseWhen),
             ResolvedFunction function => PrettyFunction(function),
             _ => expression.SimpleString,
         };
@@ -57,5 +65,17 @@ internal static class CoercionHelpers
         string distinct = function.IsDistinct ? "DISTINCT " : string.Empty;
         string args = string.Join(", ", function.Arguments.Select(PrettyReference));
         return $"{function.Name}({distinct}{args})";
+    }
+
+    private static string PrettyCaseWhen(CaseWhen caseWhen)
+    {
+        string branches = string.Join(
+            " ",
+            caseWhen.Branches.Select(
+                b => $"WHEN {PrettyReference(b.Condition)} THEN {PrettyReference(b.Value)}"));
+        string elsePart = caseWhen.ElseValue is { } elseValue
+            ? $" ELSE {PrettyReference(elseValue)}"
+            : string.Empty;
+        return $"CASE {branches}{elsePart} END";
     }
 }

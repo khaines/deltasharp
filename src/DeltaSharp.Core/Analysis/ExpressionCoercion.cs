@@ -113,7 +113,7 @@ internal static class ExpressionCoercion
         if (common is null)
         {
             throw AnalysisException.DataTypeMismatch(
-                caseWhen.SimpleString,
+                CoercionHelpers.PrettyReference(caseWhen),
                 "the branch/else result values of a CASE expression must share a common type but got "
                 + $"[{string.Join(", ", valueTypes.Select(t => t.SimpleString))}].");
         }
@@ -170,7 +170,7 @@ internal static class ExpressionCoercion
             NullType => new Cast(operand, BooleanType.Instance),
             null => operand,
             _ => throw AnalysisException.DataTypeMismatch(
-                operand.SimpleString,
+                CoercionHelpers.PrettyReference(operand),
                 $"a '{context}' operand must be boolean but got '{operand.Type.SimpleString}'."),
         };
     }

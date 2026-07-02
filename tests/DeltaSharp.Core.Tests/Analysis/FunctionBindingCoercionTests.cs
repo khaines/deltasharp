@@ -529,6 +529,46 @@ public class FunctionBindingCoercionTests
         Assert.DoesNotContain("#", ex.Reference!);
     }
 
+    // ---- A2b: composite resolved references (CASE WHEN / boolean) never leak an ExprId ----
+
+    [Fact]
+    public void Resolve_CaseWhenIncompatibleValues_DiagnosticReference_HasNoExprIdAndRendersCaseWhen()
+    {
+        // The :116 branch/else common-type mismatch must render the offending CASE via the pretty
+        // (ExprId-free) renderer — recursing through the boolean `And` condition and the branch/else
+        // values — never the internal SimpleString with `#id` suffixes.
+        var analyzer = NumbersAnalyzer();
+        var condition = new And(
+            new BinaryComparison(Col("i"), Literal.OfInt(1), ComparisonOperator.GreaterThan),
+            new BinaryComparison(Col("i"), Literal.OfInt(9), ComparisonOperator.LessThan));
+        var caseWhen = new CaseWhen(condition, Col("i")).WithElse(Col("s"));   // int vs string: no common type
+        var project = new Project(new[] { new Alias(caseWhen, "r") }, Relation("nums"));
+
+        var ex = Assert.Throws<AnalysisException>(() => analyzer.Resolve(project));
+
+        Assert.Equal(AnalysisErrorKind.DataTypeMismatch, ex.Kind);
+        Assert.DoesNotContain("#", ex.Message);
+        Assert.DoesNotContain("#", ex.Reference!);
+        Assert.Contains("CASE WHEN", ex.Message);   // Spark pretty CASE form, bare names
+    }
+
+    [Fact]
+    public void Resolve_NonBooleanBooleanOperand_DiagnosticReference_HasNoExprId()
+    {
+        // A non-boolean operand of And/Or/Not (:173) must render its reference via the pretty
+        // renderer, so a bare `i` attribute appears without its `#id`.
+        var analyzer = NumbersAnalyzer();
+        var and = new And(Col("i"), Col("b"));   // left operand `i` is int, not boolean
+        var project = new Project(new[] { new Alias(and, "r") }, Relation("nums"));
+
+        var ex = Assert.Throws<AnalysisException>(() => analyzer.Resolve(project));
+
+        Assert.Equal(AnalysisErrorKind.DataTypeMismatch, ex.Kind);
+        Assert.Contains("boolean", ex.Message);
+        Assert.DoesNotContain("#", ex.Message);
+        Assert.DoesNotContain("#", ex.Reference!);
+    }
+
     // ---- A3: DISTINCT is uppercased in the auto-name ----
 
     [Fact]

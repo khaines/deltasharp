@@ -201,12 +201,33 @@ deterministic and assertable (the tests assert `Kind`, `Reference`, and message 
 (`src/DeltaSharp.Core/Analysis/CoercionHelpers.cs`), Spark's `usePrettyExpression` form: an
 `AttributeReference` contributes its **bare** `Name` (never the internal `name#ExprId`), an implicit
 coercion `Cast` is transparent (its child's pretty form), binary arithmetic/comparison render as the
-infix `(left op right)`, and a `ResolvedFunction` renders as `name(DISTINCT? args)`. So the operand
-mismatch above reads `(b + i)` — not the raw `(b#7 + i#8)` — and a non-boolean `Filter`/`Join`
-condition reads `i`, not `i#8`. This is the **same** renderer that produces the function auto-name
-(§4.2), so diagnostics and output column names never diverge and **neither leaks an ExprId**.
-(Pre-existing `UnresolvedAttribute` "cannot resolve 'name'" diagnostics have no ExprId and are
-untouched.)
+infix `(left op right)`, the boolean composites `And`/`Or`/`Not` render as `(l AND r)` / `(l OR r)` /
+`(NOT c)`, a `CaseWhen` renders as `CASE WHEN <c> THEN <v> [… ELSE <e>] END`, and a `ResolvedFunction`
+renders as `name(DISTINCT? args)`. Every composite **recurses** through the renderer, so no resolved
+sub-expression reaches the `SimpleString` leaf fallback (reserved for literals / unresolved markers,
+which carry no ExprId). So the operand mismatch above reads `(b + i)` — not the raw `(b#7 + i#8)` — a
+non-boolean `Filter`/`Join` condition reads `i`, not `i#8`, an incompatible-branch CASE reads
+`CASE WHEN (i > 1) THEN i ELSE s END`, and a non-boolean boolean operand reads `i`. This is the
+**same** renderer that produces the function auto-name (§4.2), so diagnostics and output column names
+never diverge and **neither leaks an ExprId**. (Pre-existing `UnresolvedAttribute` "cannot resolve
+'name'" diagnostics have no ExprId and are untouched.)
+
+**Every** resolved-expression reference in a `DataTypeMismatch` / `UntypedResolvedExpression`
+diagnostic routes through `PrettyReference`, so no site leaks an ExprId. The complete site list:
+
+| Site | Node passed | File |
+| --- | --- | --- |
+| arithmetic non-numeric | `BinaryArithmetic` | `ExpressionCoercion.CoerceArithmetic` |
+| incomparable comparison | `BinaryComparison` | `ExpressionCoercion.CoerceComparison` |
+| CASE branch/else no common type | `CaseWhen` | `ExpressionCoercion.CoerceCaseWhen` |
+| non-boolean And/Or/Not operand | operand | `ExpressionCoercion.RequireBoolean` |
+| non-boolean `Filter`/`Join` condition | condition | `Analyzer.RequireBooleanCondition` |
+| null-typed resolved node (guard) | expression / `alias.Child` / `function` | `Analyzer.CheckResultTypes`, `Analyzer.ToAttribute` (Alias, ResolvedFunction cases) |
+
+These are pinned by `Resolve_ArithmeticMismatch_DiagnosticReference_HasNoExprIdAndIsInfix`,
+`Resolve_CaseWhenIncompatibleValues_DiagnosticReference_HasNoExprIdAndRendersCaseWhen`, and
+`Resolve_NonBooleanBooleanOperand_DiagnosticReference_HasNoExprId`
+(`FunctionBindingCoercionTests`), which assert the message/reference contain no `#`.
 
 ### 4.2 Function auto-naming (Spark parity)
 
@@ -308,7 +329,7 @@ updated `AnalyzerTests` and `ExpressionTypeModelTests`).
 | AC4 / #166 | nested aggregate rejected; plain aggregate + scalar accepted | `Resolve_NestedAggregate_IsRejected`, `Resolve_PlainAggregateWithScalarArithmetic_IsAccepted` |
 | AC2 | scalar function binds over a resolved column | `Resolve_BindsScalarFunctionOverColumn` |
 | auto-name | bare aggregate/scalar exposed under its Spark pretty name; DISTINCT uppercased | `Resolve_BareAggregate_AutoNamesOutputColumn_SparkParity`, `Resolve_BareAggregates_AutoNameCountAvgAndAlias`, `Resolve_DistinctAggregate_AutoNamesWithUppercaseDistinct`, `DataFrameAggregationTests.Analyzer_RealAggregateFunction_ResolvesToAutoNamedOutput` |
-| diagnostics | mismatch reference is pretty/infix with no leaked ExprId | `Resolve_ArithmeticMismatch_DiagnosticReference_HasNoExprIdAndIsInfix` |
+| diagnostics | mismatch reference is pretty/infix with no leaked ExprId | `Resolve_ArithmeticMismatch_DiagnosticReference_HasNoExprIdAndIsInfix`, `Resolve_CaseWhenIncompatibleValues_DiagnosticReference_HasNoExprIdAndRendersCaseWhen`, `Resolve_NonBooleanBooleanOperand_DiagnosticReference_HasNoExprId` |
 | AC2 | non-decimal `/` yields Double with both operands cast; comparison widening | `Resolve_DivideNonDecimal_YieldsDouble_WithBothOperandsCast`, `Resolve_CrossNumericComparison_InsertsWideningCast` |
 | AC3 | non-boolean `Join` condition rejected; uncomparable comparison rejected | `Resolve_NonBooleanJoinCondition_ThrowsDataTypeMismatch`, `Resolve_UncomparableComparison_ThrowsDataTypeMismatch` |
 | null-typed guard | resolved-but-untyped rejected by CheckAnalysis | `CheckAnalysis_ResolvedButUntypedExpression_IsRejected` |
