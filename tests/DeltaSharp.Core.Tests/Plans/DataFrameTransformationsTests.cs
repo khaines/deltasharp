@@ -198,7 +198,7 @@ public sealed class DataFrameTransformationsTests
     public void WithColumn_ReplacingExistingName_BuildsSameStarPlusAliasShape()
     {
         // Append and replace build the identical unresolved shape (star + alias). Spark's
-        // replace-in-place is a name-resolution concern the analyzer owns (deferred, #170); the
+        // replace-in-place is a name-resolution concern the analyzer owns (deferred, #398); the
         // DataFrame method's job is only to build the correct unresolved plan.
         DataFrame df = People();
 
@@ -245,6 +245,33 @@ public sealed class DataFrameTransformationsTests
             e => Assert.Equal("name", Assert.IsType<AttributeReference>(e).Name),
             e => Assert.Equal("age", Assert.IsType<AttributeReference>(e).Name),
             e => Assert.Equal("age_plus", Assert.IsType<Alias>(e).Name));
+    }
+
+    // ----- AC3: WithColumn replace-in-place is NOT yet implemented (characterization tripwire) -----
+
+    [Fact]
+    public void WithColumn_ReplacingExistingName_ResolvesToDuplicateColumns_KnownWrong_Tripwire()
+    {
+        // CHARACTERIZATION TRIPWIRE (#398): replace-in-place is not implemented. Today WithColumn on an
+        // EXISTING name resolves to TWO same-named outputs (star-expanded original + appended alias)
+        // instead of Spark's single in-place replacement. This test pins that known-wrong behaviour so
+        // it fails — prompting its removal — the moment #398 lands and replace-in-place is correct.
+        var catalog = new LocalCatalog();
+        catalog.Register("people", PeopleSchema);
+        var analyzer = new Analyzer(catalog);
+        DataFrame df = new(new UnresolvedRelation(new[] { "people" }));
+
+        DataFrame replaced = df.WithColumn("age", Functions.Lit(99).As("age"));
+        LogicalPlan resolved = analyzer.Resolve(replaced.Plan);
+
+        var project = Assert.IsType<Project>(resolved);
+        // Known-wrong: id, name, age (from star), age (appended) — a DUPLICATE age, not a replacement.
+        Assert.Collection(
+            project.ProjectList,
+            e => Assert.Equal("id", Assert.IsType<AttributeReference>(e).Name),
+            e => Assert.Equal("name", Assert.IsType<AttributeReference>(e).Name),
+            e => Assert.Equal("age", Assert.IsType<AttributeReference>(e).Name),
+            e => Assert.Equal("age", Assert.IsType<Alias>(e).Name));
     }
 
     // ----- Chaining preserves laziness/immutability of every intermediate frame -----
@@ -304,6 +331,24 @@ public sealed class DataFrameTransformationsTests
     {
         DataFrame df = People();
         Assert.ThrowsAny<ArgumentException>(() => df.Select("a", null!));
+    }
+
+    [Fact]
+    public void Select_NullRestElement_Throws()
+    {
+        // A null ELEMENT within a non-null rest array (distinct from Select_NullRestName_Throws, which
+        // passes a null ARRAY). Each rest name flows through Functions.Col, whose ThrowIfNullOrEmpty
+        // raises ArgumentNullException for a null element.
+        DataFrame df = People();
+        Assert.ThrowsAny<ArgumentException>(() => df.Select("a", "b", null!));
+    }
+
+    [Fact]
+    public void Select_EmptyRestElement_Throws()
+    {
+        // An empty rest name is rejected per-element by Functions.Col's ThrowIfNullOrEmpty guard.
+        DataFrame df = People();
+        Assert.ThrowsAny<ArgumentException>(() => df.Select("a", string.Empty));
     }
 
     [Fact]
