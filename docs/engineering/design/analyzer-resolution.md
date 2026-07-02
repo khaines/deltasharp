@@ -37,25 +37,36 @@ surface (no `PublicAPI.Unshipped.txt` change) and references only the Core IR pl
 ```csharp
 internal interface ICatalog
 {
-    bool TryGetRelation(IReadOnlyList<string> identifier, out StructType? schema);
+    bool TryGetRelation(IReadOnlyList<string> identifier, out CatalogTable? table);
 }
 ```
 
-`ICatalog` is the **only** abstraction between name→schema resolution and where metadata lives.
+`ICatalog` is the **only** abstraction between name→table resolution and where metadata lives. It
+yields a **table descriptor** — `CatalogTable` (the resolved `Identifier`, its ADR-0008
+`StructType` `Schema`, and a `CatalogTableType` stub defaulting to `Table`) — rather than a bare
+schema, because the seam resolves a *table* (the miss diagnostic is literally
+`TableOrViewNotFound`). A real catalog can grow the descriptor (table type, provider,
+table-properties) without reshaping the contract or touching the analyzer.
+
 M1 ships one implementation, `LocalCatalog`, an in-memory registry:
 
 - `Register(string name, StructType schema)` / `Register(IReadOnlyList<string> identifier, StructType schema)`
-  register (or replace) a source's schema. It holds **schemas only** — no data, files, or readers —
-  so registration and lookup do no I/O.
-- Identifiers are joined into a dotted key and matched **case-insensitively**
-  (`StringComparer.OrdinalIgnoreCase`), following Spark's default `spark.sql.caseSensitive=false`
-  for table names.
+  register (or replace) a source's schema (wrapped internally into a `CatalogTable`). It holds
+  **schemas only** — no data, files, or readers — so registration and lookup do no I/O.
+  `Register` validates the identifier via `PlanCollections.ToIdentifier`, rejecting an empty
+  identifier **or an empty part**.
+- Identifiers are keyed by a **collision-free, part-aware** composite key: each part is
+  length-prefixed (`len:part`), so distinct identifiers that share a naive dotted rendering — for
+  example `["a.b", "c"]` and `["a", "b.c"]` (both `"a.b.c"` under `string.Join('.')`) — never
+  collide. Keys are matched **case-insensitively** (`StringComparer.OrdinalIgnoreCase`), following
+  Spark's default `spark.sql.caseSensitive=false` for table names.
 - Lookup is **total and side-effect-free**: a miss returns `false` rather than throwing, so the
   analyzer raises exactly one diagnostic at the point of use.
 
 **Metastore seam.** A Hive/Delta/native metastore-backed catalog can replace `LocalCatalog` later
-without touching the analyzer, which depends on `ICatalog` alone. Case-sensitive resolution and
-multi-level namespaces are deferred behind this seam.
+without touching the analyzer, which depends on `ICatalog` alone. Case-sensitive resolution,
+multi-level namespaces, table-vs-view/provider metadata, and a listing/existence surface
+(`TableExists`/`ListTables`) are deferred behind this seam (follow-up #392).
 
 ## 3. The resolved-vs-unresolved contract
 
@@ -72,14 +83,33 @@ a plan is resolved when all children and all directly-held expressions are resol
 The analyzer **never mutates** a node. Every rewrite goes through the immutable `TreeNode<T>` /
 `LogicalPlan` substrate (`TransformUp`, `MapExpressions`, `Expression.TransformUp`), returning new
 trees that share unchanged subtrees by reference. A successful `Resolve` returns a plan whose
-`Resolved` is `true` for the M1 node/expression set. (A plan still containing an unresolved
-`UnresolvedFunction` — function resolution is a later story — remains unresolved; the analyzer binds
-the attribute leaves inside it regardless.)
+`Resolved` is `true`.
+
+### 3.1 CheckAnalysis (post-condition)
+
+`Resolve` runs the rule pass **once** and then runs a final **CheckAnalysis** walk that enforces the
+post-condition: the result must be *fully* resolved. Without it, a residual unresolved marker would
+leak **silently** as a not-fully-resolved plan. CheckAnalysis walks the resolved plan and every
+directly-held expression bottom-up and throws an `AnalysisException`
+(`AnalysisErrorKind.UnresolvedPlan`) — naming the offending marker and its owning operator — if any
+of these survive:
+
+- an `UnresolvedAttribute` (a name that never bound);
+- an `UnresolvedStar` — for example a star **outside** a `Project` (only a `Project` expands stars),
+  such as `Filter('*, scan)`, which is otherwise never rewritten;
+- an `UnresolvedFunction` — **function resolution is a later story**, so a residual function call now
+  fails loudly here (the analyzer still binds the attribute leaves inside it during the rule pass);
+- an operator still unresolved for a reason outside its expressions — most importantly an
+  **undesugared using/natural `Join`** (its shared columns live outside the expression substrate),
+  which reports `UnresolvedPlan` rather than leaking through.
+
+This makes "unresolved leaks" a loud failure instead of a silent, wrong plan.
 
 ## 4. The resolver rule set
 
-`Analyzer.Resolve(LogicalPlan)` runs two rule passes in order, each a bottom-up
-`plan.TransformUp(...)` over the immutable tree:
+`Analyzer.Resolve(LogicalPlan)` runs two rule passes in order — each a bottom-up
+`plan.TransformUp(...)` over the immutable tree — then a final **CheckAnalysis** post-condition walk
+(§3.1):
 
 ### 4.1 ResolveRelations (AC1)
 
@@ -89,23 +119,25 @@ plan.TransformUp(node =>
 ```
 
 `BindRelation` looks the identifier up in the catalog. On a **miss** it throws
-`AnalysisException.TableOrViewNotFound` (AC4). On a hit it derives one `AttributeReference` per
-schema field — in field order, carrying the field's name, ADR-0008 `DataType`, and `Nullable` flag,
-each assigned a fresh `ExprId` — and returns a `ResolvedRelation` carrying the identifier, schema,
-that output list, and the read options.
+`AnalysisException.TableOrViewNotFound` (AC4). On a hit it receives a `CatalogTable` descriptor,
+unwraps its `Schema`, and derives one `AttributeReference` per schema field — in field order,
+carrying the field's name, ADR-0008 `DataType`, and `Nullable` flag, each assigned a fresh `ExprId`
+— and returns a `ResolvedRelation` carrying the identifier, schema, that output list, and the read
+options.
 
 ### 4.2 ResolveReferences (AC2)
 
 A single bottom-up `TransformUp` rule that, for each node (whose children are already resolved):
 
 1. **collects the input scope** — the concatenation of the node's resolved children's output
-   attributes (empty for a leaf; left ⧺ right for a `Join`);
+   attributes (empty for a leaf; left ⧺ right for a `Join`, so a join condition can bind against
+   both sides);
 2. **expands stars** — if the node is a `Project` containing an `UnresolvedStar`, each star is
    replaced (in place, preserving order) by the child's full output attribute list, producing a new
    `Project`;
-3. **binds attributes** — `node.MapExpressions(e => e.TransformUp(x => x is UnresolvedAttribute a ? ResolveAttribute(a, input) : x))`
-   rewrites every `UnresolvedAttribute` anywhere in the node's directly-held expressions to the
-   matching input `AttributeReference`;
+3. **binds attributes** — `resolved.MapExpressions(e => e.TransformUp(x => x is UnresolvedAttribute a ? ResolveAttribute(a, input) : x))`
+   rewrites every `UnresolvedAttribute` anywhere in the (post-star-expansion) node's directly-held
+   expressions to the matching input `AttributeReference`;
 4. **memoizes output** — derives and caches the resulting node's output (see §5).
 
 `ResolveAttribute` matches the reference's trailing name part against the input attributes
@@ -137,13 +169,29 @@ parent reads its children's output straight from the cache.
 | `ResolvedRelation` | its stored `Output` (one attribute per schema field) |
 | `Project` | each project-list element as an attribute (see below) |
 | `Aggregate` | each aggregate expression as an attribute |
-| `Join` | left output ⧺ right output |
-| `Filter`, `Sort`, `Limit`, `Distinct`, `WriteToSource`, `Union` | the (first) child's output, unchanged |
+| `Join` (`Inner`/`Cross`/`LeftOuter`/`RightOuter`/`FullOuter`) | left output ⧺ right output |
+| `Join` (`LeftSemi`/`LeftAnti`) | **left output only** — a semi/anti join filters the left side and never adds right-side columns (Spark parity) |
+| `Filter`, `Sort`, `Limit`, `Distinct`, `WriteToSource` | the child's output, unchanged (shape-preserving unary) |
+| `Union` | the **first** input's output, unchanged (M1; see below) |
+| any other operator | **rejected** — `DeriveOutput` throws `NotSupportedException` |
+
+`DeriveOutput` derives output only for the operators it explicitly models. Any other operator — for
+example a future set-op (`Intersect`/`Except`) or a `Generate` — is **rejected** with a
+`NotSupportedException` rather than silently passing a child's output through, which would derive a
+wrong output and corrupt downstream name resolution. A new operator must add an explicit
+`DeriveOutput` case.
+
+`Union` output currently reuses its **first** input's attributes (same `ExprId`s) and does not widen
+nullability. Spark set-op semantics mint **fresh** output attributes and widen nullability across all
+inputs; that is deferred to follow-up **#392** (a `// TODO(#392)` marks the `Union` case).
 
 An element becomes an attribute via `ToAttribute`: an `AttributeReference` is itself (id preserved);
 an `Alias` becomes a fresh `AttributeReference` named for the alias, typed by the alias's forwarded
-type hint, with a newly-allocated `ExprId`. (An alias over an expression whose type is unknown before
-type coercion — e.g. bare arithmetic — is out of M1 scope and rejected with a clear error.)
+type hint, with a newly-allocated `ExprId`. An alias over an expression whose type is unknown before
+type coercion (e.g. bare arithmetic), or an unnamed projection element, is out of M1 scope and
+rejected with an `AnalysisException` (`AnalysisErrorKind.UnsupportedProjection`) whose message points
+at type coercion (STORY-04.5.2 / #171) — **not** a raw `InvalidOperationException`, since these are
+name-resolvable user inputs, not programming errors.
 
 Output is derived **inside the analyzer** rather than added as an abstract member on every existing
 `LogicalPlan` node: the intrinsic schema lives on the new `ResolvedRelation` node, and operator
@@ -174,9 +222,14 @@ One failure type, `AnalysisException`, carries a structured `Kind` (`AnalysisErr
 | `TableOrViewNotFound` | catalog miss | `Table or view not found: ghost` |
 | `UnresolvedColumn` | no attribute matches | `Cannot resolve column name 'salary' given input columns: [id, name, age]` |
 | `AmbiguousReference` | >1 attribute matches | `Reference 'id' is ambiguous, could be: id#0, id#3.` |
+| `UnresolvedPlan` | CheckAnalysis found a residual unresolved marker/operator | `Plan is not fully resolved: unresolved reference '*' remains in operator 'Filter' after analysis.` |
+| `UnsupportedProjection` | alias over an untyped expr / unnamed projection element | `Output type of '(...)' (aliased as 'x') cannot be determined until type coercion (STORY-04.5.2 / #171).` |
 
-Each names the offending reference **and** its candidate columns, matching Spark's analyzer
-diagnostics in spirit (AC3).
+For `UnresolvedColumn` (missing) and `AmbiguousReference`, the `Candidates` list has two distinct
+meanings: for a **missing** column, `Candidates` is the **full set of in-scope input columns** (what
+the user *could* have meant); for an **ambiguous** reference, `Candidates` is **only the matching
+attributes** (rendered `name#id`) the reference could bind to. Each diagnostic names the offending
+reference **and** its candidates, matching Spark's analyzer diagnostics in spirit (AC3).
 
 ## 8. The "no execution on failure" guarantee (AC4)
 
@@ -198,15 +251,19 @@ Tests live in `tests/DeltaSharp.Core.Tests/Analysis/` (`AnalyzerTests`, `LocalCa
 | **AC2** | valid refs → stable id/name/type/nullability; ids shared | `ResolveReferences_BindsAttributes_WithStableIdsNamesTypesNullability`, `ResolveReferences_ReuseScanExprId_SoColumnAndReferenceShareIdentity`, `ResolveReferences_ResolvesAttributesInsideFilterPredicate`, `ResolveReferences_MatchesColumnNamesCaseInsensitively`, `ResolveReferences_ExpandsStar_ToChildOutput`, `ResolveReferences_ExpandsStar_PreservingSurroundingElements`, `Resolve_IsDeterministic_AcrossRuns` |
 | **AC3** | Spark-compatible missing/ambiguous diagnostics naming reference + candidates | `MissingColumn_ThrowsUnresolvedColumn_NamingReferenceAndCandidates`, `AmbiguousColumn_ThrowsAmbiguousReference_ListingBothCandidates` |
 | **AC4** | catalog miss → no physical planning/backend call | `CatalogMiss_ThrowsTableOrViewNotFound_NamingIdentifier`, `CatalogMiss_ThrowsBeforeResolvingAnyReferences` |
-| catalog seam | register/replace, case-insensitive, multipart, miss | `LocalCatalogTests.*` |
+| join output | semi/anti join output is left-only; inner is both sides | `ResolveReferences_LeftSemiJoin_OutputIsLeftOnly`, `ResolveReferences_LeftSemiJoin_RightColumnAbove_IsUnresolved`, `ResolveReferences_LeftAntiJoin_OutputIsLeftOnly`, `ResolveReferences_InnerJoin_OutputIsBothSides` |
+| CheckAnalysis | residual unresolved marker → loud `UnresolvedPlan` | `CheckAnalysis_StarOutsideProject_ThrowsUnresolvedPlan`, `CheckAnalysis_ResidualUnresolvedFunction_ThrowsUnresolvedPlan` |
+| alias output | fresh distinct id + forwarded type | `ResolveReferences_AliasOutput_HasFreshDistinctExprId_AndForwardedType` |
+| catalog seam | register/replace, case-insensitive, multipart, miss, part-aware non-collision, empty-part | `LocalCatalogTests.*` (incl. `Register_MultipartParts_DoNotCollide_AcrossDottedRenderings`, `Register_Multipart_RejectsEmptyPart`) |
 
 ## 10. Files
 
 | File | Role |
 | --- | --- |
-| `src/DeltaSharp.Core/Analysis/ICatalog.cs` | the catalog seam |
-| `src/DeltaSharp.Core/Analysis/LocalCatalog.cs` | M1 in-memory catalog |
-| `src/DeltaSharp.Core/Analysis/Analyzer.cs` | ResolveRelations + ResolveReferences + output derivation |
+| `src/DeltaSharp.Core/Analysis/ICatalog.cs` | the catalog seam (yields a `CatalogTable` descriptor) |
+| `src/DeltaSharp.Core/Analysis/CatalogTable.cs` | the analyzer-facing table descriptor (identifier + schema + `CatalogTableType` stub) |
+| `src/DeltaSharp.Core/Analysis/LocalCatalog.cs` | M1 in-memory catalog (collision-free part-aware keys) |
+| `src/DeltaSharp.Core/Analysis/Analyzer.cs` | ResolveRelations + ResolveReferences + output derivation + CheckAnalysis |
 | `src/DeltaSharp.Core/Analysis/ExprIdGenerator.cs` | deterministic monotonic id source |
 | `src/DeltaSharp.Core/Analysis/AnalysisException.cs` | Spark-compatible diagnostics |
 | `src/DeltaSharp.Core/Plans/Logical/ResolvedRelation.cs` | the resolved scan node (schema + output) |

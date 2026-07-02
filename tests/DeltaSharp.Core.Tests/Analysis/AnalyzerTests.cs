@@ -228,7 +228,12 @@ public sealed class AnalyzerTests
         Assert.Equal(AnalysisErrorKind.AmbiguousReference, ex.Kind);
         Assert.Equal("id", ex.Reference);
         Assert.Equal(2, ex.Candidates.Count);
+        // AC3: the diagnostic must name the candidate attributes (id#<left>, id#<right>), not just
+        // report the count. Left ids are 0 (l.id) and 1 (r.id) in scan/bottom-up order.
+        Assert.Equal(new[] { "id#0", "id#1" }, ex.Candidates);
         Assert.Contains("ambiguous", ex.Message);
+        Assert.Contains("id#0", ex.Message);
+        Assert.Contains("id#1", ex.Message);
     }
 
     // ---- AC4: catalog miss is self-contained ----
@@ -258,6 +263,132 @@ public sealed class AnalyzerTests
         var ex = Assert.Throws<AnalysisException>(() => analyzer.Resolve(plan));
 
         Assert.Equal(AnalysisErrorKind.TableOrViewNotFound, ex.Kind);
+    }
+
+    // ---- F10: alias output contract ----
+
+    [Fact]
+    public void ResolveReferences_AliasOutput_HasFreshDistinctExprId_AndForwardedType()
+    {
+        // An Alias over a resolved attribute exposes a NEW output attribute (fresh ExprId, distinct
+        // from the aliased column's id) that forwards the child's type. Observe the alias output by
+        // referencing it by name from an enclosing projection.
+        var analyzer = new Analyzer(CatalogWithPeople());
+        var inner = new Project(
+            new Expression[] { new Alias(new UnresolvedAttribute("age"), "age_copy") },
+            Relation("people"));
+        var outer = new Project(
+            new Expression[] { new UnresolvedAttribute("age_copy") }, inner);
+
+        var resolvedOuter = Assert.IsType<Project>(analyzer.Resolve(outer));
+
+        var aliasOutput = Assert.IsType<AttributeReference>(resolvedOuter.ProjectList[0]);
+        AssertAttribute(aliasOutput, "age_copy", IntegerType.Instance, nullable: true);
+
+        var resolvedInner = Assert.IsType<Project>(resolvedOuter.Child);
+        var scan = Assert.IsType<ResolvedRelation>(resolvedInner.Child);
+        AttributeReference scanAge = scan.Output.Single(a => a.Name == "age");
+        Assert.NotEqual(scanAge.ExprId, aliasOutput.ExprId);
+    }
+
+    // ---- F1: LeftSemi/LeftAnti join output is left-only ----
+
+    private static LocalCatalog CatalogWithTwoSides()
+    {
+        var catalog = new LocalCatalog();
+        catalog.Register("l", new StructType(new[] { new StructField("lid", LongType.Instance) }));
+        catalog.Register("r", new StructType(new[] { new StructField("rid", LongType.Instance) }));
+        return catalog;
+    }
+
+    [Fact]
+    public void ResolveReferences_LeftSemiJoin_OutputIsLeftOnly()
+    {
+        var analyzer = new Analyzer(CatalogWithTwoSides());
+        var join = new Join(Relation("l"), Relation("r"), JoinType.LeftSemi);
+        var plan = new Project(new Expression[] { new UnresolvedStar() }, join);
+
+        var project = Assert.IsType<Project>(analyzer.Resolve(plan));
+
+        // The star expands to the join's output, which for a LeftSemi join is the left side only.
+        Assert.Collection(
+            project.ProjectList,
+            a => Assert.Equal("lid", ((AttributeReference)a).Name));
+    }
+
+    [Fact]
+    public void ResolveReferences_LeftSemiJoin_RightColumnAbove_IsUnresolved()
+    {
+        var analyzer = new Analyzer(CatalogWithTwoSides());
+        var join = new Join(Relation("l"), Relation("r"), JoinType.LeftSemi);
+        var plan = new Project(new Expression[] { new UnresolvedAttribute("rid") }, join);
+
+        var ex = Assert.Throws<AnalysisException>(() => analyzer.Resolve(plan));
+
+        Assert.Equal(AnalysisErrorKind.UnresolvedColumn, ex.Kind);
+        Assert.Equal("rid", ex.Reference);
+    }
+
+    [Fact]
+    public void ResolveReferences_LeftAntiJoin_OutputIsLeftOnly()
+    {
+        var analyzer = new Analyzer(CatalogWithTwoSides());
+        var join = new Join(Relation("l"), Relation("r"), JoinType.LeftAnti);
+        var plan = new Project(new Expression[] { new UnresolvedStar() }, join);
+
+        var project = Assert.IsType<Project>(analyzer.Resolve(plan));
+
+        Assert.Collection(
+            project.ProjectList,
+            a => Assert.Equal("lid", ((AttributeReference)a).Name));
+    }
+
+    [Fact]
+    public void ResolveReferences_InnerJoin_OutputIsBothSides()
+    {
+        var analyzer = new Analyzer(CatalogWithTwoSides());
+        var join = new Join(Relation("l"), Relation("r"), JoinType.Inner);
+        var plan = new Project(new Expression[] { new UnresolvedStar() }, join);
+
+        var project = Assert.IsType<Project>(analyzer.Resolve(plan));
+
+        Assert.Collection(
+            project.ProjectList,
+            a => Assert.Equal("lid", ((AttributeReference)a).Name),
+            a => Assert.Equal("rid", ((AttributeReference)a).Name));
+    }
+
+    // ---- F2: CheckAnalysis post-condition ----
+
+    [Fact]
+    public void CheckAnalysis_StarOutsideProject_ThrowsUnresolvedPlan()
+    {
+        // A star can only be expanded inside a Project; a star elsewhere (here a Filter condition)
+        // survives resolution. CheckAnalysis must fail LOUDLY rather than return an unresolved plan.
+        var analyzer = new Analyzer(CatalogWithPeople());
+        var plan = new Filter(new UnresolvedStar(), Relation("people"));
+
+        var ex = Assert.Throws<AnalysisException>(() => analyzer.Resolve(plan));
+
+        Assert.Equal(AnalysisErrorKind.UnresolvedPlan, ex.Kind);
+        Assert.Equal("*", ex.Reference);
+        Assert.Contains("Filter", ex.Message);
+    }
+
+    [Fact]
+    public void CheckAnalysis_ResidualUnresolvedFunction_ThrowsUnresolvedPlan()
+    {
+        // Function resolution is a later story; a residual UnresolvedFunction leaves the plan
+        // not-fully-resolved. CheckAnalysis names the offending reference and throws.
+        var analyzer = new Analyzer(CatalogWithPeople());
+        var plan = new Filter(
+            new UnresolvedFunction("upper", new Expression[] { new UnresolvedAttribute("name") }),
+            Relation("people"));
+
+        var ex = Assert.Throws<AnalysisException>(() => analyzer.Resolve(plan));
+
+        Assert.Equal(AnalysisErrorKind.UnresolvedPlan, ex.Kind);
+        Assert.Equal("upper", ex.Reference);
     }
 
     private static void AssertAttribute(

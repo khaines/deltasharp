@@ -54,7 +54,9 @@ internal sealed class Analyzer
         ArgumentNullException.ThrowIfNull(plan);
         var idGenerator = new ExprIdGenerator();
         LogicalPlan withRelations = ResolveRelations(plan, idGenerator);
-        return ResolveReferences(withRelations, idGenerator);
+        LogicalPlan resolved = ResolveReferences(withRelations, idGenerator);
+        CheckAnalysis(resolved);
+        return resolved;
     }
 
     /// <summary>ResolveRelations: bind every <see cref="UnresolvedRelation"/> via the catalog.</summary>
@@ -66,11 +68,12 @@ internal sealed class Analyzer
 
     private ResolvedRelation BindRelation(UnresolvedRelation relation, ExprIdGenerator idGenerator)
     {
-        if (!_catalog.TryGetRelation(relation.Identifier, out StructType? schema))
+        if (!_catalog.TryGetRelation(relation.Identifier, out CatalogTable? table))
         {
             throw AnalysisException.TableOrViewNotFound(relation.Identifier);
         }
 
+        StructType schema = table.Schema;
         var output = new AttributeReference[schema.Count];
         for (int i = 0; i < schema.Count; i++)
         {
@@ -97,7 +100,7 @@ internal sealed class Analyzer
             IReadOnlyList<AttributeReference> input = CollectInput(node, outputByPlan);
 
             LogicalPlan resolved = node is Project project
-                ? ExpandStars(project, node, outputByPlan)
+                ? ExpandStars(project, outputByPlan)
                 : node;
 
             resolved = resolved.MapExpressions(
@@ -109,6 +112,58 @@ internal sealed class Analyzer
             outputByPlan[resolved] = DeriveOutput(resolved, outputByPlan, idGenerator);
             return resolved;
         });
+    }
+
+    /// <summary>
+    /// CheckAnalysis: the analyzer's post-condition. After the rule pass, the result must be
+    /// <b>fully resolved</b>. This walk verifies that and throws a loud
+    /// <see cref="AnalysisException"/> naming the offending node/expression if any unresolved marker
+    /// survived — an <see cref="UnresolvedAttribute"/>, an <see cref="UnresolvedStar"/> (for example
+    /// a star outside a <see cref="Project"/> that was never expanded), an
+    /// <see cref="UnresolvedFunction"/> (function resolution is a later story), or an operator that
+    /// is otherwise still unresolved (for example a using/natural <see cref="Join"/> the analyzer
+    /// has not desugared). Without this check such residuals would leak silently as a
+    /// not-fully-resolved plan.
+    /// </summary>
+    private static void CheckAnalysis(LogicalPlan plan)
+    {
+        foreach (LogicalPlan child in plan.Children)
+        {
+            CheckAnalysis(child);
+        }
+
+        foreach (Expression expression in plan.Expressions)
+        {
+            CheckExpression(expression, plan.NodeName);
+        }
+
+        // Children and directly-held expressions are clean; any remaining unresolution is the
+        // node's own state (e.g. an undesugared using/natural join).
+        if (!plan.Resolved)
+        {
+            throw AnalysisException.UnresolvedOperator(plan.NodeName);
+        }
+    }
+
+    /// <summary>Walks an expression subtree, throwing if any unresolved marker survives.</summary>
+    private static void CheckExpression(Expression expression, string ownerNodeName)
+    {
+        switch (expression)
+        {
+            case UnresolvedAttribute attribute:
+                throw AnalysisException.UnresolvedExpression(attribute.Name, ownerNodeName);
+
+            case UnresolvedStar star:
+                throw AnalysisException.UnresolvedExpression(star.SimpleString, ownerNodeName);
+
+            case UnresolvedFunction function:
+                throw AnalysisException.UnresolvedExpression(function.Name, ownerNodeName);
+        }
+
+        foreach (Expression child in expression.Children)
+        {
+            CheckExpression(child, ownerNodeName);
+        }
     }
 
     /// <summary>The concatenated output attributes of <paramref name="node"/>'s resolved children
@@ -139,7 +194,6 @@ internal sealed class Analyzer
     /// attributes, preserving the position of the star within the projection list.</summary>
     private static LogicalPlan ExpandStars(
         Project project,
-        LogicalPlan resolvedNode,
         IReadOnlyDictionary<LogicalPlan, IReadOnlyList<AttributeReference>> outputByPlan)
     {
         bool hasStar = false;
@@ -154,11 +208,11 @@ internal sealed class Analyzer
 
         if (!hasStar)
         {
-            return resolvedNode;
+            return project;
         }
 
         IReadOnlyList<AttributeReference> childOutput =
-            ChildOutput(resolvedNode.Children[0], outputByPlan);
+            ChildOutput(project.Child, outputByPlan);
         var expanded = new List<Expression>(project.ProjectList.Count);
         foreach (Expression element in project.ProjectList)
         {
@@ -174,7 +228,7 @@ internal sealed class Analyzer
             }
         }
 
-        return new Project(expanded, ((Project)resolvedNode).Child);
+        return new Project(expanded, project.Child);
     }
 
     private static AttributeReference ResolveAttribute(
@@ -230,17 +284,43 @@ internal sealed class Analyzer
             case Aggregate aggregate:
                 return ProjectionOutput(aggregate.AggregateExpressions, idGenerator);
 
-            case Join:
-                return CollectInput(node, outputByPlan);
+            case Join join:
+                return JoinOutput(join, node, outputByPlan);
+
+            // Shape-preserving unary operators expose their single child's output unchanged.
+            case Filter:
+            case Sort:
+            case Limit:
+            case Distinct:
+            case WriteToSource:
+                return ChildOutput(node.Children[0], outputByPlan);
+
+            case Union:
+                // TODO(#392): set-op output semantics (fresh ids + nullability widening). Union
+                // currently reuses its first input's attributes; Spark mints fresh output
+                // attributes and widens nullability across inputs.
+                return ChildOutput(node.Children[0], outputByPlan);
 
             default:
-                // Unary shape-preserving operators (Filter, Sort, Limit, Distinct, WriteToSource)
-                // and Union pass their (first) child's output through unchanged.
-                return node.Children.Count == 0
-                    ? Array.Empty<AttributeReference>()
-                    : ChildOutput(node.Children[0], outputByPlan);
+                // A node whose output shape is not explicitly modelled (e.g. a future set-op such as
+                // Intersect/Except or a Generate) must not silently pass a child's output through —
+                // that would derive a wrong output and corrupt downstream name resolution.
+                throw new NotSupportedException(
+                    $"Output derivation is not defined for operator '{node.NodeName}'. Add an "
+                    + "explicit DeriveOutput case before introducing this operator to the analyzer.");
         }
     }
+
+    /// <summary>The output of a resolved <see cref="Join"/>: left ⧺ right for value-adding joins,
+    /// but <b>left-only</b> for <see cref="JoinType.LeftSemi"/>/<see cref="JoinType.LeftAnti"/>,
+    /// which filter the left side and never widen it with right-side columns (Spark parity).</summary>
+    private static IReadOnlyList<AttributeReference> JoinOutput(
+        Join join,
+        LogicalPlan node,
+        IReadOnlyDictionary<LogicalPlan, IReadOnlyList<AttributeReference>> outputByPlan) =>
+        join.JoinType is JoinType.LeftSemi or JoinType.LeftAnti
+            ? ChildOutput(node.Children[0], outputByPlan)
+            : CollectInput(node, outputByPlan);
 
     private static IReadOnlyList<AttributeReference> ProjectionOutput(
         IReadOnlyList<Expression> projectList, ExprIdGenerator idGenerator)
@@ -265,13 +345,14 @@ internal sealed class Analyzer
 
             case Alias alias:
                 DataType type = alias.Type
-                    ?? throw new InvalidOperationException(
-                        $"Alias '{alias.Name}' has no resolved type; type coercion is not part of "
-                        + "the M1 analyzer.");
+                    ?? throw AnalysisException.UnsupportedProjection(
+                        $"Output type of '{alias.Child.SimpleString}' (aliased as '{alias.Name}') "
+                        + "cannot be determined until type coercion (STORY-04.5.2 / #171).",
+                        alias.Name);
                 return new AttributeReference(alias.Name, type, alias.Nullable, idGenerator.Next());
 
             default:
-                throw new InvalidOperationException(
+                throw AnalysisException.UnsupportedProjection(
                     $"Projection element '{element.SimpleString}' is not a named output element "
                     + "(expected an attribute or an alias).");
         }

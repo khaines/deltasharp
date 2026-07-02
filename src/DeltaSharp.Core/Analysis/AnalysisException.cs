@@ -17,6 +17,15 @@ internal enum AnalysisErrorKind
 
     /// <summary>A column reference matched more than one input attribute.</summary>
     AmbiguousReference,
+
+    /// <summary>The analyzer's post-condition (CheckAnalysis) found the plan still not fully
+    /// resolved — an unresolved attribute, star, function, or operator survived the rule pass.</summary>
+    UnresolvedPlan,
+
+    /// <summary>A projection element cannot be turned into a named output attribute yet — for
+    /// example an alias over an expression whose type is undetermined before type coercion
+    /// (STORY-04.5.2 / #171), or an unnamed projection element.</summary>
+    UnsupportedProjection,
 }
 
 /// <summary>
@@ -93,4 +102,41 @@ internal sealed class AnalysisException : Exception
             name,
             candidates);
     }
+
+    /// <summary>Builds an <see cref="AnalysisErrorKind.UnresolvedPlan"/> failure for an unresolved
+    /// expression marker (attribute, star, or function) that survived analysis, naming the marker
+    /// and the operator that still holds it.</summary>
+    public static AnalysisException UnresolvedExpression(string reference, string nodeName)
+    {
+        ArgumentNullException.ThrowIfNull(reference);
+        ArgumentNullException.ThrowIfNull(nodeName);
+        return new AnalysisException(
+            $"Plan is not fully resolved: unresolved reference '{reference}' remains in operator "
+            + $"'{nodeName}' after analysis.",
+            AnalysisErrorKind.UnresolvedPlan,
+            reference,
+            Array.Empty<string>());
+    }
+
+    /// <summary>Builds an <see cref="AnalysisErrorKind.UnresolvedPlan"/> failure for an operator
+    /// that is still unresolved after analysis for a reason outside its expressions — for example a
+    /// using/natural join the analyzer has not yet desugared.</summary>
+    public static AnalysisException UnresolvedOperator(string nodeName)
+    {
+        ArgumentNullException.ThrowIfNull(nodeName);
+        return new AnalysisException(
+            $"Plan is not fully resolved: operator '{nodeName}' remains unresolved after analysis.",
+            AnalysisErrorKind.UnresolvedPlan,
+            nodeName,
+            Array.Empty<string>());
+    }
+
+    /// <summary>Builds an <see cref="AnalysisErrorKind.UnsupportedProjection"/> failure for a
+    /// projection element that cannot yet be exposed as a named output attribute.</summary>
+    public static AnalysisException UnsupportedProjection(string message, string? reference = null) =>
+        new(
+            message ?? throw new ArgumentNullException(nameof(message)),
+            AnalysisErrorKind.UnsupportedProjection,
+            reference,
+            Array.Empty<string>());
 }
