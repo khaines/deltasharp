@@ -109,12 +109,14 @@ This surface does **not** classify functions; it only **names** them. `Count`/`S
 build an `UnresolvedFunction` whose `Name` is the canonical Spark aggregate name (`"count"`, `"sum"`,
 …), and `coalesce`/string/date helpers build one named with the canonical scalar name. Whether a call
 is an aggregate is decided **later, by canonical name**, when the analyzer's function registry
-resolves `UnresolvedFunction` inside an `Aggregate` operator (STORY-04.5.2 / #171).
+resolves `UnresolvedFunction` inside an `Aggregate` operator (STORY-04.5.2 / #171 — now delivered:
+`FunctionRegistry` binds by canonical name and stamps `FunctionKind.Scalar`/`Aggregate`).
 
-This is faithful to Spark and to the existing analyzer contract: today `Analyzer.CheckAnalysis` treats
-any residual `UnresolvedFunction` as a hard error because *function resolution is a later story*
-(`src/DeltaSharp.Core/Analysis/Analyzer.cs`, `CheckExpression`; documented in
-[analyzer-resolution.md](analyzer-resolution.md) §3.1). So AC2 is satisfied here by producing
+This is faithful to Spark and to the analyzer contract: `FunctionRegistry.Bind` binds a known
+function during the coercion sub-pass and classifies it by canonical name, and `CheckAnalysis`
+rejects an aggregate used outside a valid aggregate context (`MisplacedAggregate`); an unknown
+function fails as `UnresolvedFunction` (see [function-binding-coercion.md](function-binding-coercion.md)
+§2/§5). So AC2 is satisfied here by producing
 **correctly-named** unresolved nodes with the right arity, argument order, and `IsDistinct` flag — the
 exact inputs #171 needs to distinguish aggregate from scalar. No node on this surface carries an
 "is-aggregate" bit; the name is the contract.
@@ -138,18 +140,20 @@ via `functions.when(cond, val)` and chained with `Column.when(...)` / `Column.ot
   derivable from the child count, the node has **no extra own-state**: `NodeEquals` returns `true` and
   `NodeHashCode` returns `PlanHash.Seed` (identical to `And`/`Or`), and two `CaseWhen`s are equal
   exactly when their children are.
-- **Lazy hints.** `Type` is `null` (the common type across branch values needs coercion — an analyzer
-  concern, #171, consistent with how arithmetic defers its result type), `Nullable` is **derived** from
+- **Lazy hints.** Before analysis `Type` is `null` (the common type across branch values needs
+  coercion — an analyzer concern), `Nullable` is **derived** from
   the possible result values — nullable if any branch value is nullable, the else value is nullable, or
   there is **no** else (an unmatched row then yields an implicit SQL `NULL`); a `CASE` with an else and
   all-non-null values is therefore non-nullable (conditions do not affect result nullability). `Resolved`
   follows the default "all children resolved" rule — so a `CaseWhen` over an unresolved condition stays
-  unresolved. It is **not** an unresolved *marker*: it becomes resolved once its children are (its residual
-  coercion is #171's concern), so `CheckAnalysis` does not special-case it. The precedent for this
-  "resolved-by-children but `Type == null` pending coercion" shape is **`BinaryArithmetic`** (not
-  `And`/`Or`, which override `Type => BooleanType` and are thus resolved *with* a known type); like
-  `BinaryArithmetic`, a resolved `CaseWhen` can still carry a `null` result type until #171 coerces the
-  branch values to a common type.
+  unresolved. It is **not** an unresolved *marker*: it becomes resolved once its children are. As of
+  STORY-04.5.2 / #171, once resolved `CaseWhen.Type` **derives** the common type of its branch/else
+  values via `TypeCoercion.FindWiderCommonType` (returning `null` only while a value is still untyped),
+  and the analyzer's coercion pass widens the values and rejects non-boolean conditions or
+  incompatible values — so a resolved `CaseWhen` is now typed (or rejected), and the null-typed guard
+  in `CheckAnalysis` backstops it. The precedent for this "type is a function of children" shape is
+  **`BinaryArithmetic`** (not `And`/`Or`, which override `Type => BooleanType`); see
+  [function-binding-coercion.md](function-binding-coercion.md) §3.4.
 - **Immutable builders.** `AddBranch(condition, value)` returns a new `CaseWhen` with one branch
   appended; `WithElse(value)` returns a new `CaseWhen` with the else set. Both reject the operation
   once an else is present (`InvalidOperationException`), enforcing Spark's rule that `when` cannot
