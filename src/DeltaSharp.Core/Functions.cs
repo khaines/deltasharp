@@ -147,6 +147,355 @@ public static class Functions
         return new Column(literal);
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // Common functions registry (STORY-04.3.3 / #166). Each entry point below builds a single
+    // *unresolved* IR node (an UnresolvedFunction, or a CaseWhen for `when`) and performs no
+    // evaluation, no schema lookup, and no binding — the analyzer (FEAT-04.5 / #171) later resolves
+    // and classifies the call. Aggregate vs. scalar classification is therefore purely by canonical
+    // Spark name here (AC2); these builders only guarantee faithful naming and argument order.
+    // ---------------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Returns the <b>aggregate</b> row count of <paramref name="column"/>, mirroring Spark's
+    /// <c>functions.count(col)</c> — the number of rows for which the argument is non-null. Pass
+    /// <see cref="Col(string)"/> with <c>"*"</c> (or <see cref="Count(string)"/> with <c>"*"</c>)
+    /// to count every row. <b>Lazy:</b> builds an unresolved <c>count</c> function node; the
+    /// analyzer classifies it as an aggregate. No Spark deviation.
+    /// </summary>
+    /// <param name="column">The column (or star) to count.</param>
+    /// <returns>An unresolved aggregate <c>count</c> column.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
+    public static Column Count(Column column) => UnaryFunction("count", column, nameof(column));
+
+    /// <summary>
+    /// Convenience overload of <see cref="Count(Column)"/> that counts the column named
+    /// <paramref name="columnName"/>; pass <c>"*"</c> to count every row (Spark's
+    /// <c>count("*")</c>). <b>Lazy:</b> resolves the name to an unresolved reference/star, then a
+    /// <c>count</c> node. No Spark deviation.
+    /// </summary>
+    /// <param name="columnName">The column name, or <c>"*"</c> to count all rows.</param>
+    /// <returns>An unresolved aggregate <c>count</c> column.</returns>
+    /// <exception cref="ArgumentException"><paramref name="columnName"/> is null or empty.</exception>
+    public static Column Count(string columnName) => Count(Col(columnName));
+
+    /// <summary>
+    /// Returns the <b>aggregate</b> count of <b>distinct</b> non-null value combinations across the
+    /// supplied columns, mirroring Spark's <c>functions.countDistinct(col, cols…)</c>. <b>Lazy:</b>
+    /// builds a <c>count</c> function node tagged <c>DISTINCT</c> (<c>IsDistinct</c>); the analyzer
+    /// classifies it as an aggregate. No Spark deviation.
+    /// </summary>
+    /// <param name="column">The first column (required).</param>
+    /// <param name="additional">Further columns whose distinct combinations are counted.</param>
+    /// <returns>An unresolved distinct aggregate <c>count</c> column.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="column"/> or
+    /// <paramref name="additional"/> is null.</exception>
+    /// <exception cref="ArgumentException">Any element of <paramref name="additional"/> is null.</exception>
+    public static Column CountDistinct(Column column, params Column[] additional)
+    {
+        ArgumentNullException.ThrowIfNull(column);
+        ArgumentNullException.ThrowIfNull(additional);
+        var columns = new Column[additional.Length + 1];
+        columns[0] = column;
+        Array.Copy(additional, 0, columns, 1, additional.Length);
+        return NaryFunction("count", columns, nameof(additional), isDistinct: true);
+    }
+
+    /// <summary>
+    /// Convenience overload of <see cref="CountDistinct(Column, Column[])"/> that counts the
+    /// distinct non-null combinations of the columns named <paramref name="columnName"/> and
+    /// <paramref name="additionalColumnNames"/>, mirroring Spark's
+    /// <c>functions.countDistinct(columnName, columnNames…)</c>. <b>Lazy:</b> resolves each name to
+    /// an unresolved reference via <see cref="Col(string)"/>, then builds a <c>count</c> node tagged
+    /// <c>DISTINCT</c>; the analyzer classifies it as an aggregate. No Spark deviation.
+    /// </summary>
+    /// <param name="columnName">The first column name (required).</param>
+    /// <param name="additionalColumnNames">Further column names whose distinct combinations are
+    /// counted.</param>
+    /// <returns>An unresolved distinct aggregate <c>count</c> column.</returns>
+    /// <exception cref="ArgumentException"><paramref name="columnName"/> is null or empty, or any
+    /// element of <paramref name="additionalColumnNames"/> is null or empty.</exception>
+    /// <exception cref="ArgumentNullException"><paramref name="additionalColumnNames"/> is
+    /// null.</exception>
+    public static Column CountDistinct(string columnName, params string[] additionalColumnNames)
+    {
+        ArgumentNullException.ThrowIfNull(additionalColumnNames);
+        var additional = new Column[additionalColumnNames.Length];
+        for (int i = 0; i < additionalColumnNames.Length; i++)
+        {
+            additional[i] = Col(additionalColumnNames[i]);
+        }
+
+        return CountDistinct(Col(columnName), additional);
+    }
+
+    /// <summary>
+    /// Returns the <b>aggregate</b> sum of <paramref name="column"/>, mirroring Spark's
+    /// <c>functions.sum(col)</c> (nulls are skipped). <b>Lazy:</b> builds an unresolved <c>sum</c>
+    /// function node the analyzer classifies as an aggregate. No Spark deviation.
+    /// </summary>
+    /// <param name="column">The numeric column to sum.</param>
+    /// <returns>An unresolved aggregate <c>sum</c> column.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
+    public static Column Sum(Column column) => UnaryFunction("sum", column, nameof(column));
+
+    /// <summary>Convenience overload of <see cref="Sum(Column)"/> for the column named
+    /// <paramref name="columnName"/>. <b>Lazy;</b> no Spark deviation.</summary>
+    /// <param name="columnName">The numeric column name to sum.</param>
+    /// <returns>An unresolved aggregate <c>sum</c> column.</returns>
+    /// <exception cref="ArgumentException"><paramref name="columnName"/> is null or empty.</exception>
+    public static Column Sum(string columnName) => Sum(Col(columnName));
+
+    /// <summary>
+    /// Returns the <b>aggregate</b> mean of <paramref name="column"/>, mirroring Spark's
+    /// <c>functions.avg(col)</c> (nulls are skipped). <b>Lazy:</b> builds an unresolved <c>avg</c>
+    /// function node the analyzer classifies as an aggregate. No Spark deviation (Spark's
+    /// <c>mean</c> synonym is deferred).
+    /// </summary>
+    /// <param name="column">The numeric column to average.</param>
+    /// <returns>An unresolved aggregate <c>avg</c> column.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
+    public static Column Avg(Column column) => UnaryFunction("avg", column, nameof(column));
+
+    /// <summary>Convenience overload of <see cref="Avg(Column)"/> for the column named
+    /// <paramref name="columnName"/>. <b>Lazy;</b> no Spark deviation.</summary>
+    /// <param name="columnName">The numeric column name to average.</param>
+    /// <returns>An unresolved aggregate <c>avg</c> column.</returns>
+    /// <exception cref="ArgumentException"><paramref name="columnName"/> is null or empty.</exception>
+    public static Column Avg(string columnName) => Avg(Col(columnName));
+
+    /// <summary>
+    /// Returns the <b>aggregate</b> minimum of <paramref name="column"/>, mirroring Spark's
+    /// <c>functions.min(col)</c> (nulls are skipped). <b>Lazy:</b> builds an unresolved <c>min</c>
+    /// function node the analyzer classifies as an aggregate. No Spark deviation.
+    /// </summary>
+    /// <param name="column">The column to reduce.</param>
+    /// <returns>An unresolved aggregate <c>min</c> column.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
+    public static Column Min(Column column) => UnaryFunction("min", column, nameof(column));
+
+    /// <summary>Convenience overload of <see cref="Min(Column)"/> for the column named
+    /// <paramref name="columnName"/>. <b>Lazy;</b> no Spark deviation.</summary>
+    /// <param name="columnName">The column name to reduce.</param>
+    /// <returns>An unresolved aggregate <c>min</c> column.</returns>
+    /// <exception cref="ArgumentException"><paramref name="columnName"/> is null or empty.</exception>
+    public static Column Min(string columnName) => Min(Col(columnName));
+
+    /// <summary>
+    /// Returns the <b>aggregate</b> maximum of <paramref name="column"/>, mirroring Spark's
+    /// <c>functions.max(col)</c> (nulls are skipped). <b>Lazy:</b> builds an unresolved <c>max</c>
+    /// function node the analyzer classifies as an aggregate. No Spark deviation.
+    /// </summary>
+    /// <param name="column">The column to reduce.</param>
+    /// <returns>An unresolved aggregate <c>max</c> column.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
+    public static Column Max(Column column) => UnaryFunction("max", column, nameof(column));
+
+    /// <summary>Convenience overload of <see cref="Max(Column)"/> for the column named
+    /// <paramref name="columnName"/>. <b>Lazy;</b> no Spark deviation.</summary>
+    /// <param name="columnName">The column name to reduce.</param>
+    /// <returns>An unresolved aggregate <c>max</c> column.</returns>
+    /// <exception cref="ArgumentException"><paramref name="columnName"/> is null or empty.</exception>
+    public static Column Max(string columnName) => Max(Col(columnName));
+
+    /// <summary>
+    /// Returns the first non-null value among <paramref name="columns"/>, mirroring Spark's
+    /// <b>scalar</b> <c>functions.coalesce(cols…)</c>. <b>Lazy:</b> builds an unresolved
+    /// <c>coalesce</c> function node (never an aggregate). No Spark deviation.
+    /// </summary>
+    /// <param name="columns">The candidate columns, tried left to right (at least one).</param>
+    /// <returns>An unresolved scalar <c>coalesce</c> column.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="columns"/> is null.</exception>
+    /// <exception cref="ArgumentException"><paramref name="columns"/> is empty or contains a null
+    /// element.</exception>
+    public static Column Coalesce(params Column[] columns) =>
+        NaryFunction("coalesce", columns, nameof(columns));
+
+    /// <summary>
+    /// Starts a <c>CASE</c> expression that yields <paramref name="value"/> when
+    /// <paramref name="condition"/> holds, mirroring Spark's <c>functions.when(condition, value)</c>.
+    /// Chain further branches with <see cref="DeltaSharp.Column.When(Column, object?)"/> and a default
+    /// with <see cref="DeltaSharp.Column.Otherwise(object?)"/>; with no <c>otherwise</c>, an unmatched
+    /// row is SQL <c>NULL</c> (Spark parity). <b>Lazy:</b> builds an unresolved <c>CaseWhen</c> node;
+    /// <paramref name="value"/> is wrapped via <see cref="Lit(object?)"/> (an existing
+    /// <see cref="DeltaSharp.Column"/> passes through unchanged). No Spark deviation.
+    /// </summary>
+    /// <param name="condition">The boolean predicate column (built via Column operators, #165).</param>
+    /// <param name="value">The result when <paramref name="condition"/> is true; a literal or a
+    /// <see cref="DeltaSharp.Column"/>.</param>
+    /// <returns>An unresolved <c>CaseWhen</c> column open for chaining.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="condition"/> is null.</exception>
+    public static Column When(Column condition, object? value)
+    {
+        ArgumentNullException.ThrowIfNull(condition);
+        return new Column(new CaseWhen(condition.Expr, Lit(value).Expr));
+    }
+
+    /// <summary>
+    /// Parses the SQL expression string <paramref name="expression"/>, mirroring Spark's
+    /// <c>functions.expr(sqlText)</c>. <b>Not supported in M1 Core:</b> the SQL expression parser is
+    /// the SQL frontend (EPIC-07 / #159) and is not available here, so this door throws a documented
+    /// unsupported-feature diagnostic (AC3) rather than half-parsing SQL. Compose the same intent
+    /// with the typed <see cref="Functions"/> / <see cref="DeltaSharp.Column"/> builders in the
+    /// meantime. Builds nothing.
+    /// </summary>
+    /// <param name="expression">The SQL expression text (validated non-empty before the diagnostic).</param>
+    /// <returns>Never returns; always throws.</returns>
+    /// <exception cref="ArgumentException"><paramref name="expression"/> is null or empty.</exception>
+    /// <exception cref="NotSupportedException">Always — SQL expression parsing lands with the SQL
+    /// frontend (EPIC-07 / #159).</exception>
+    public static Column Expr(string expression)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(expression);
+        throw new NotSupportedException(
+            "Functions.Expr(string) requires the SQL expression parser, which is delivered by the "
+            + "SQL frontend (EPIC-07, issue #159) and is not available in the M1 Core API. Build the "
+            + "expression with the typed Functions/Column builders instead.");
+    }
+
+    /// <summary>
+    /// Returns the uppercase of the string <paramref name="column"/>, mirroring Spark's <b>scalar</b>
+    /// <c>functions.upper(col)</c>. <b>Lazy:</b> builds an unresolved <c>upper</c> function node. No
+    /// Spark deviation.
+    /// </summary>
+    /// <param name="column">The string column.</param>
+    /// <returns>An unresolved scalar <c>upper</c> column.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
+    public static Column Upper(Column column) => UnaryFunction("upper", column, nameof(column));
+
+    /// <summary>
+    /// Returns the lowercase of the string <paramref name="column"/>, mirroring Spark's <b>scalar</b>
+    /// <c>functions.lower(col)</c>. <b>Lazy:</b> builds an unresolved <c>lower</c> function node. No
+    /// Spark deviation.
+    /// </summary>
+    /// <param name="column">The string column.</param>
+    /// <returns>An unresolved scalar <c>lower</c> column.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
+    public static Column Lower(Column column) => UnaryFunction("lower", column, nameof(column));
+
+    /// <summary>
+    /// Returns the character length of the string <paramref name="column"/>, mirroring Spark's
+    /// <b>scalar</b> <c>functions.length(col)</c>. <b>Lazy:</b> builds an unresolved <c>length</c>
+    /// function node. No Spark deviation.
+    /// </summary>
+    /// <param name="column">The string column.</param>
+    /// <returns>An unresolved scalar <c>length</c> column.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
+    public static Column Length(Column column) => UnaryFunction("length", column, nameof(column));
+
+    /// <summary>
+    /// Trims leading and trailing whitespace from the string <paramref name="column"/>, mirroring
+    /// Spark's <b>scalar</b> <c>functions.trim(col)</c>. <b>Lazy:</b> builds an unresolved
+    /// <c>trim</c> function node. No Spark deviation.
+    /// </summary>
+    /// <param name="column">The string column.</param>
+    /// <returns>An unresolved scalar <c>trim</c> column.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
+    public static Column Trim(Column column) => UnaryFunction("trim", column, nameof(column));
+
+    /// <summary>
+    /// Concatenates <paramref name="columns"/> into one string, mirroring Spark's <b>scalar</b>
+    /// <c>functions.concat(cols…)</c>. <b>Lazy:</b> builds an unresolved <c>concat</c> function
+    /// node. No Spark deviation.
+    /// </summary>
+    /// <param name="columns">The columns to concatenate, in order (at least one).</param>
+    /// <returns>An unresolved scalar <c>concat</c> column.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="columns"/> is null.</exception>
+    /// <exception cref="ArgumentException"><paramref name="columns"/> is empty or contains a null
+    /// element.</exception>
+    public static Column Concat(params Column[] columns) =>
+        NaryFunction("concat", columns, nameof(columns));
+
+    /// <summary>
+    /// Returns the current date at the start of query evaluation, mirroring Spark's <b>scalar</b>
+    /// <c>functions.current_date()</c>. <b>Lazy:</b> builds a zero-argument unresolved
+    /// <c>current_date</c> function node; the value is fixed once per query at execution, not at
+    /// build time. No Spark deviation.
+    /// </summary>
+    /// <returns>An unresolved scalar <c>current_date</c> column.</returns>
+    public static Column CurrentDate() => NullaryFunction("current_date");
+
+    /// <summary>
+    /// Returns the current timestamp at the start of query evaluation, mirroring Spark's
+    /// <b>scalar</b> <c>functions.current_timestamp()</c>. <b>Lazy:</b> builds a zero-argument
+    /// unresolved <c>current_timestamp</c> function node; the value is fixed once per query at
+    /// execution, not at build time. No Spark deviation.
+    /// </summary>
+    /// <returns>An unresolved scalar <c>current_timestamp</c> column.</returns>
+    public static Column CurrentTimestamp() => NullaryFunction("current_timestamp");
+
+    /// <summary>
+    /// Extracts the year from the date/timestamp <paramref name="column"/>, mirroring Spark's
+    /// <b>scalar</b> <c>functions.year(col)</c>. <b>Lazy:</b> builds an unresolved <c>year</c>
+    /// function node. No Spark deviation.
+    /// </summary>
+    /// <param name="column">The date/timestamp column.</param>
+    /// <returns>An unresolved scalar <c>year</c> column.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
+    public static Column Year(Column column) => UnaryFunction("year", column, nameof(column));
+
+    /// <summary>
+    /// Extracts the month (1–12) from the date/timestamp <paramref name="column"/>, mirroring
+    /// Spark's <b>scalar</b> <c>functions.month(col)</c>. <b>Lazy:</b> builds an unresolved
+    /// <c>month</c> function node. No Spark deviation.
+    /// </summary>
+    /// <param name="column">The date/timestamp column.</param>
+    /// <returns>An unresolved scalar <c>month</c> column.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
+    public static Column Month(Column column) => UnaryFunction("month", column, nameof(column));
+
+    /// <summary>
+    /// Extracts the day of month (1–31) from the date/timestamp <paramref name="column"/>, mirroring
+    /// Spark's <b>scalar</b> <c>functions.dayofmonth(col)</c>. <b>Lazy:</b> builds an unresolved
+    /// <c>dayofmonth</c> function node. No Spark deviation.
+    /// </summary>
+    /// <param name="column">The date/timestamp column.</param>
+    /// <returns>An unresolved scalar <c>dayofmonth</c> column.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
+    public static Column DayOfMonth(Column column) =>
+        UnaryFunction("dayofmonth", column, nameof(column));
+
+    /// <summary>
+    /// Converts the <paramref name="column"/> to a date, mirroring Spark's <b>scalar</b>
+    /// <c>functions.to_date(col)</c> (default format). <b>Lazy:</b> builds an unresolved
+    /// <c>to_date</c> function node. No Spark deviation (the optional format-string overload is
+    /// deferred).
+    /// </summary>
+    /// <param name="column">The column to convert to a date.</param>
+    /// <returns>An unresolved scalar <c>to_date</c> column.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
+    public static Column ToDate(Column column) => UnaryFunction("to_date", column, nameof(column));
+
+    private static Column UnaryFunction(string name, Column column, string paramName)
+    {
+        ArgumentNullException.ThrowIfNull(column, paramName);
+        return new Column(new UnresolvedFunction(name, new[] { column.Expr }));
+    }
+
+    private static Column NaryFunction(
+        string name, Column[] columns, string paramName, bool isDistinct = false)
+    {
+        ArgumentNullException.ThrowIfNull(columns, paramName);
+        if (columns.Length == 0)
+        {
+            throw new ArgumentException(
+                $"{name}(...) requires at least one column argument.", paramName);
+        }
+
+        var arguments = new Expression[columns.Length];
+        for (int i = 0; i < columns.Length; i++)
+        {
+            Column column = columns[i]
+                ?? throw new ArgumentException(
+                    $"{name}(...) column arguments cannot be null.", paramName);
+            arguments[i] = column.Expr;
+        }
+
+        return new Column(new UnresolvedFunction(name, arguments, isDistinct));
+    }
+
+    private static Column NullaryFunction(string name) =>
+        new(new UnresolvedFunction(name, Array.Empty<Expression>()));
+
     private static Literal DateLiteral(DateOnly date) =>
         Literal.OfDate(date.DayNumber - UnixEpochDate.DayNumber);
 
