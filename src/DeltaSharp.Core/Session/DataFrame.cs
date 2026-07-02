@@ -100,6 +100,12 @@ public sealed class DataFrame
     /// <i>recorded</i> in the plan — it is never evaluated here, and no scan or backend call happens
     /// (ADR-0001). This instance is unchanged.
     /// </summary>
+    /// <remarks>
+    /// Only the <see cref="Column"/>-typed overload ships in M1. Spark's string/SQL-expression
+    /// overload (<c>filter(conditionExpr: String)</c>) needs the SQL expression parser and lands with
+    /// the SQL frontend (ADR-0007, STORY-07.2.1 / #217); until then, build predicates with
+    /// <see cref="Filter(Column)"/> and the <see cref="Column"/> operators.
+    /// </remarks>
     /// <param name="condition">The boolean predicate to retain rows by.</param>
     /// <returns>A new <see cref="DataFrame"/> filtered by <paramref name="condition"/>.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="condition"/> is null.</exception>
@@ -113,15 +119,25 @@ public sealed class DataFrame
     /// An alias for <see cref="Filter(Column)"/>, mirroring Spark's <c>Dataset.where(Column)</c>. It
     /// is exactly equivalent — same lazy <c>Filter</c> plan node, same immutability.
     /// </summary>
+    /// <remarks>
+    /// As with <see cref="Filter(Column)"/>, only the <see cref="Column"/>-typed overload ships in M1;
+    /// Spark's string/SQL-expression <c>where(conditionExpr: String)</c> lands with the SQL frontend
+    /// (ADR-0007, STORY-07.2.1 / #217).
+    /// </remarks>
     /// <param name="condition">The boolean predicate to retain rows by.</param>
     /// <returns>A new <see cref="DataFrame"/> filtered by <paramref name="condition"/>.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="condition"/> is null.</exception>
     public DataFrame Where(Column condition) => Filter(condition);
 
     /// <summary>
-    /// Adds a column, or replaces an existing column of the same name, returning a new
-    /// <see cref="DataFrame"/>, mirroring Spark's <c>Dataset.withColumn(String, Column)</c>. This is a
-    /// lazy <b>transformation</b> that leaves this instance unchanged and performs no work (ADR-0001).
+    /// Adds a column by appending it to this frame's output, returning a new <see cref="DataFrame"/>,
+    /// mirroring Spark's <c>Dataset.withColumn(String, Column)</c>. This is a lazy
+    /// <b>transformation</b> that leaves this instance unchanged and performs no work (ADR-0001).
+    /// <b>Append</b> (a <paramref name="colName"/> that does not match an existing column) is fully
+    /// correct end-to-end today. Spark's <b>in-place replacement</b> of a same-named column is the
+    /// intended parity target but is <b>not yet implemented</b> in M1 (see the remarks and issue
+    /// #398); a name that matches an existing column currently yields a duplicate rather than an
+    /// in-place replace.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -133,7 +149,8 @@ public sealed class DataFrame
     /// name-resolution concern that the analyzer owns; DeltaSharp's <see cref="DataFrame"/> is a
     /// lazy, session-free plan wrapper and cannot resolve the schema at this point without executing
     /// analysis, so it builds the correct unresolved shape and defers replace-on-duplicate resolution
-    /// to the analyzer (tracked with FEAT-04.5 / #170). See
+    /// to the analyzer (tracked as FEAT-04.5 follow-up work in
+    /// <see href="https://github.com/khaines/deltasharp/issues/398">#398</see>). See
     /// <c>docs/engineering/design/dataframe-transformations.md</c>.
     /// </para>
     /// </remarks>

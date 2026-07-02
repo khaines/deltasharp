@@ -58,10 +58,14 @@ This is proven two ways:
   the new node's `Child` (`DataFrameTransformationsTests`).
 - **The marquee non-vacuity proof** (`DataFrameLazyTransformationTests`) chains all five methods over
   a `ThrowOnReadSource` whose `Read()` throws, and asserts nothing is read (`ReadCount == 0`, no
-  exception). A companion test runs the chain inside an `ExecutionAudit` scope and asserts
-  `RecordingAudit.ObservedNoExecution` (no file opened, no row read, no analyzer/planner/backend
-  stage entered). This mirrors the #169 `LazyEagerAuditTests` pattern but exercises the **real public
-  API** rather than raw node construction — the standing guard that #160's transformations stay lazy.
+  exception). Companion tests run a similar transformation chain inside an `ExecutionAudit` scope over
+  a `FakeSource` and assert `RecordingAudit.ObservedNoExecution` (no file opened, no row read, no
+  analyzer/planner/backend stage entered) — and, specifically, that the **Analyzer** stage is never
+  entered, so an eager-analyze regression in any transform reddens. `Analyzer.Resolve` emits the #169
+  `ExecutionStage.Analyzer` milestone, and a dedicated non-vacuity test drives the real analyzer
+  inside the scope to prove that guard is not a false green. This mirrors the #169
+  `LazyEagerAuditTests` pattern but exercises the **real public API** rather than raw node
+  construction — the standing guard that #160's transformations stay lazy.
 
 ## 3. Select — projection
 
@@ -72,8 +76,10 @@ This is proven two ways:
   it to the child's output at resolution (see §5). Aliased columns (`Col("age").As("years")` →
   `Alias`) are preserved so the analyzer keeps the output name.
 - **`Select(string column, params string[] columns)`** turns each name into a `Column` via
-  `Functions.Col`, so `"*"` becomes a star and every other name an `UnresolvedAttribute`. It reuses
-  `Functions.Col`'s null/empty guard for each name (no duplicate validation).
+  `Functions.Col`, so `"*"` becomes a star and every other name an `UnresolvedAttribute`. The rest
+  names reuse `Functions.Col`'s null/empty guard per element; the first name (`column`) is guarded
+  explicitly first (an `ArgumentException.ThrowIfNullOrEmpty(column)` that names the `column`
+  parameter) and then again by `Functions.Col`.
 
 ### Overload shape (why the string overload takes a required first name)
 
@@ -100,9 +106,11 @@ an equal plan.
 ### Deferred: `Where(string)` SQL-predicate overload
 
 Spark also offers `where(conditionExpr: String)` / `filter(conditionExpr: String)`, which parse a SQL
-predicate string. That requires the SQL expression parser (ADR-0007, FEAT for the SQL frontend), which
-does not exist in M1. Rather than half-build it, this overload is **omitted**; it lands with the SQL
-frontend. Only the `Column`-typed overloads ship here.
+predicate string. That requires the SQL expression parser (ADR-0007, EPIC-07 SQL frontend —
+STORY-07.2.1 / [#217](https://github.com/khaines/deltasharp/issues/217)), which does not exist in M1.
+Rather than half-build it, this overload is **omitted**; it lands with the SQL frontend. Only the
+`Column`-typed overloads ship here, and the `Filter`/`Where` XML `<remarks>` point users at that
+follow-up so the deferral is discoverable from quick-info.
 
 ## 5. WithColumn — add or replace a derived column
 
@@ -143,7 +151,8 @@ deviation from Spark's API-level implementation, forced by (and consistent with)
   Spark's plain `select($"*", expr.as("age"))` intentionally keeps duplicates — replace is specific
   to the `withColumn` intent, not to star expansion. Adding a faithful replace therefore needs a
   distinct signal (a marker on the projection or a dedicated analyzer rule) and is tracked as
-  follow-up analyzer work under FEAT-04.5 ([#170](https://github.com/khaines/deltasharp/issues/170)).
+  follow-up analyzer work under FEAT-04.5
+  ([#398](https://github.com/khaines/deltasharp/issues/398)).
   This story ships the correct unresolved plan shape and asserts it
   (`WithColumn_ReplacingExistingName_BuildsSameStarPlusAliasShape`).
 
@@ -184,6 +193,6 @@ for empty; the tests assert with `ThrowsAny<ArgumentException>` for the null-or-
 | --- | --- | --- |
 | **AC1** | `Select` (Column & string) → `Project`; star preserved; aliases preserved; empty select; original unchanged + structural sharing | `Select_Columns_BuildsProjectWithExpressionsInOrder`, `Select_PreservesAliasExpressions`, `Select_StarColumn_IsPreservedUnexpanded`, `Select_Empty_BuildsEmptyProjection`, `Select_LeavesSourceFrameUnchanged_AndSharesChildByReference`, `Select_Names_BuildsProjectOfUnresolvedAttributes`, `Select_SingleName_BuildsSingleAttributeProjection`, `Select_StarName_BuildsUnresolvedStar` |
 | **AC2** | `Filter`/`Where` → `Filter`; `Where` == `Filter`; predicate unevaluated; original unchanged | `Filter_BuildsFilterWithConditionExpressionUnevaluated`, `Where_IsEquivalentToFilter`, `Filter_LeavesSourceFrameUnchanged` |
-| **AC3** | `WithColumn` builds `Project([*, col AS name])`; append resolves end-to-end; replace builds same shape (deferred) | `WithColumn_BuildsProjectOfStarThenAliasedColumn`, `WithColumn_ReplacingExistingName_BuildsSameStarPlusAliasShape`, `WithColumn_RewrapsAlreadyAliasedColumnWithGivenName`, `WithColumn_Append_ResolvesToOriginalColumnsPlusNewColumn` |
-| **AC4** | chaining over a throw-on-read source triggers no scan/backend (lazy proof) | `ChainedTransformations_OverThrowOnReadSource_NeverRead`, `ChainedTransformations_TouchNoAuditSeam`, `ChainedTransformations_BuildNestedPlan_LeavingEachStageIntact` |
-| Guards | null/empty argument guards | `Select_NullColumnsArray_Throws`, `Select_NullColumnElement_Throws`, `Select_NullFirstName_Throws`, `Select_EmptyFirstName_Throws`, `Select_NullRestName_Throws`, `Filter_NullCondition_Throws`, `Where_NullCondition_Throws`, `WithColumn_NullName_Throws`, `WithColumn_EmptyName_Throws`, `WithColumn_NullColumn_Throws` |
+| **AC3** | `WithColumn` builds `Project([*, col AS name])`; append resolves end-to-end; replace builds same shape (in-place replace deferred to #398, with a characterization tripwire) | `WithColumn_BuildsProjectOfStarThenAliasedColumn`, `WithColumn_ReplacingExistingName_BuildsSameStarPlusAliasShape`, `WithColumn_RewrapsAlreadyAliasedColumnWithGivenName`, `WithColumn_Append_ResolvesToOriginalColumnsPlusNewColumn`, `WithColumn_ReplacingExistingName_ResolvesToDuplicateColumns_KnownWrong_Tripwire` |
+| **AC4** | chaining over a throw-on-read source triggers no scan/backend and no analysis (lazy proof) | `ChainedTransformations_OverThrowOnReadSource_NeverRead`, `ChainedTransformations_TouchNoAuditSeam`, `ChainedTransformations_NeverEnterTheAnalyzerStage`, `EagerAnalyzeMutation_IsRecordedByTheSeam`, `ChainedTransformations_BuildNestedPlan_LeavingEachStageIntact` |
+| Guards | null/empty argument guards | `Select_NullColumnsArray_Throws`, `Select_NullColumnElement_Throws`, `Select_NullFirstName_Throws`, `Select_EmptyFirstName_Throws`, `Select_NullRestName_Throws`, `Select_NullRestElement_Throws`, `Select_EmptyRestElement_Throws`, `Filter_NullCondition_Throws`, `Where_NullCondition_Throws`, `WithColumn_NullName_Throws`, `WithColumn_EmptyName_Throws`, `WithColumn_NullColumn_Throws` |
