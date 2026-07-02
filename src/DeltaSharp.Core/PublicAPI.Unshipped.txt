@@ -54,3 +54,67 @@ static DeltaSharp.SparkSession.ClearDefaultSession() -> void
 static DeltaSharp.SparkSession.GetActiveSession() -> DeltaSharp.SparkSession?
 static DeltaSharp.SparkSession.GetDefaultSession() -> DeltaSharp.SparkSession?
 static DeltaSharp.SparkSession.SetActiveSession(DeltaSharp.SparkSession! session) -> void
+DeltaSharp.Column.And(DeltaSharp.Column! other) -> DeltaSharp.Column!
+DeltaSharp.Column.And(object? value) -> DeltaSharp.Column!
+DeltaSharp.Column.Divide(DeltaSharp.Column! other) -> DeltaSharp.Column!
+DeltaSharp.Column.Divide(object? value) -> DeltaSharp.Column!
+DeltaSharp.Column.EqNullSafe(DeltaSharp.Column! other) -> DeltaSharp.Column!
+DeltaSharp.Column.EqNullSafe(object? value) -> DeltaSharp.Column!
+DeltaSharp.Column.EqualNullSafe(DeltaSharp.Column! other) -> DeltaSharp.Column!
+DeltaSharp.Column.EqualNullSafe(object? value) -> DeltaSharp.Column!
+DeltaSharp.Column.EqualTo(DeltaSharp.Column! other) -> DeltaSharp.Column!
+DeltaSharp.Column.EqualTo(object? value) -> DeltaSharp.Column!
+DeltaSharp.Column.Geq(DeltaSharp.Column! other) -> DeltaSharp.Column!
+DeltaSharp.Column.Geq(object? value) -> DeltaSharp.Column!
+DeltaSharp.Column.Gt(DeltaSharp.Column! other) -> DeltaSharp.Column!
+DeltaSharp.Column.Gt(object? value) -> DeltaSharp.Column!
+DeltaSharp.Column.IsNotNull() -> DeltaSharp.Column!
+DeltaSharp.Column.IsNull() -> DeltaSharp.Column!
+DeltaSharp.Column.Leq(DeltaSharp.Column! other) -> DeltaSharp.Column!
+DeltaSharp.Column.Leq(object? value) -> DeltaSharp.Column!
+DeltaSharp.Column.Lt(DeltaSharp.Column! other) -> DeltaSharp.Column!
+DeltaSharp.Column.Lt(object? value) -> DeltaSharp.Column!
+DeltaSharp.Column.Minus(DeltaSharp.Column! other) -> DeltaSharp.Column!
+DeltaSharp.Column.Minus(object? value) -> DeltaSharp.Column!
+DeltaSharp.Column.Mod(DeltaSharp.Column! other) -> DeltaSharp.Column!
+DeltaSharp.Column.Mod(object? value) -> DeltaSharp.Column!
+DeltaSharp.Column.Multiply(DeltaSharp.Column! other) -> DeltaSharp.Column!
+DeltaSharp.Column.Multiply(object? value) -> DeltaSharp.Column!
+DeltaSharp.Column.Not() -> DeltaSharp.Column!
+DeltaSharp.Column.NotEqual(DeltaSharp.Column! other) -> DeltaSharp.Column!
+DeltaSharp.Column.NotEqual(object? value) -> DeltaSharp.Column!
+DeltaSharp.Column.Or(DeltaSharp.Column! other) -> DeltaSharp.Column!
+DeltaSharp.Column.Or(object? value) -> DeltaSharp.Column!
+DeltaSharp.Column.Plus(DeltaSharp.Column! other) -> DeltaSharp.Column!
+DeltaSharp.Column.Plus(object? value) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator !(DeltaSharp.Column! operand) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator ~(DeltaSharp.Column! operand) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator %(DeltaSharp.Column! left, DeltaSharp.Column! right) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator %(DeltaSharp.Column! left, object? value) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator %(object? value, DeltaSharp.Column! right) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator &(DeltaSharp.Column! left, DeltaSharp.Column! right) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator *(DeltaSharp.Column! left, DeltaSharp.Column! right) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator *(DeltaSharp.Column! left, object? value) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator *(object? value, DeltaSharp.Column! right) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator +(DeltaSharp.Column! left, DeltaSharp.Column! right) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator +(DeltaSharp.Column! left, object? value) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator +(object? value, DeltaSharp.Column! right) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator -(DeltaSharp.Column! left, DeltaSharp.Column! right) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator -(DeltaSharp.Column! left, object? value) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator -(object? value, DeltaSharp.Column! right) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator /(DeltaSharp.Column! left, DeltaSharp.Column! right) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator /(DeltaSharp.Column! left, object? value) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator /(object? value, DeltaSharp.Column! right) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator <(DeltaSharp.Column! left, DeltaSharp.Column! right) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator <(DeltaSharp.Column! left, object? value) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator <(object? value, DeltaSharp.Column! right) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator <=(DeltaSharp.Column! left, DeltaSharp.Column! right) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator <=(DeltaSharp.Column! left, object? value) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator <=(object? value, DeltaSharp.Column! right) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator >(DeltaSharp.Column! left, DeltaSharp.Column! right) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator >(DeltaSharp.Column! left, object? value) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator >(object? value, DeltaSharp.Column! right) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator >=(DeltaSharp.Column! left, DeltaSharp.Column! right) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator >=(DeltaSharp.Column! left, object? value) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator >=(object? value, DeltaSharp.Column! right) -> DeltaSharp.Column!
+static DeltaSharp.Column.operator |(DeltaSharp.Column! left, DeltaSharp.Column! right) -> DeltaSharp.Column!
