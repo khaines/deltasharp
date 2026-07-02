@@ -1,3 +1,4 @@
+using DeltaSharp.Diagnostics;
 using DeltaSharp.Plans.Expressions;
 using DeltaSharp.Plans.Logical;
 using DeltaSharp.Types;
@@ -52,6 +53,13 @@ internal sealed class Analyzer
     public LogicalPlan Resolve(LogicalPlan plan)
     {
         ArgumentNullException.ThrowIfNull(plan);
+
+        // Emit the #169 audit seam's Analyzer milestone. Analysis is an eager, action-driven stage:
+        // a lazy transformation (Select/Filter/WithColumn/…) must never reach here. A recording sink
+        // installed for a transformation-only chain therefore observes an empty stage path, so an
+        // accidental eager-analyze regression reddens (see DataFrameLazyTransformationTests).
+        ExecutionAudit.StageEntered(ExecutionStage.Analyzer);
+
         var idGenerator = new ExprIdGenerator();
         LogicalPlan withRelations = ResolveRelations(plan, idGenerator);
         LogicalPlan resolved = ResolveReferences(withRelations, idGenerator);
