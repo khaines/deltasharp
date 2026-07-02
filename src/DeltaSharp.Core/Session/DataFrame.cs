@@ -50,15 +50,7 @@ public sealed class DataFrame
     public DataFrame Select(params Column[] columns)
     {
         ArgumentNullException.ThrowIfNull(columns);
-        var projectList = new Expression[columns.Length];
-        for (int i = 0; i < columns.Length; i++)
-        {
-            Column column = columns[i]
-                ?? throw new ArgumentNullException($"{nameof(columns)}[{i}]");
-            projectList[i] = column.Expr;
-        }
-
-        return new DataFrame(new Project(projectList, Plan));
+        return new DataFrame(new Project(ToExprs(columns, nameof(columns)), Plan));
     }
 
     /// <summary>
@@ -83,14 +75,7 @@ public sealed class DataFrame
     {
         ArgumentException.ThrowIfNullOrEmpty(column);
         ArgumentNullException.ThrowIfNull(columns);
-        var projectList = new Expression[columns.Length + 1];
-        projectList[0] = Functions.Col(column).Expr;
-        for (int i = 0; i < columns.Length; i++)
-        {
-            projectList[i + 1] = Functions.Col(columns[i]).Expr;
-        }
-
-        return new DataFrame(new Project(projectList, Plan));
+        return new DataFrame(new Project(NamesToExprs(column, columns, nameof(columns)), Plan));
     }
 
     /// <summary>
@@ -165,5 +150,124 @@ public sealed class DataFrame
         ArgumentNullException.ThrowIfNull(col);
         var projectList = new Expression[] { new UnresolvedStar(), new Alias(col.Expr, colName) };
         return new DataFrame(new Project(projectList, Plan));
+    }
+
+    /// <summary>
+    /// Groups rows by a set of column expressions, returning a <see cref="RelationalGroupedDataset"/>
+    /// on which an aggregation can be chosen, mirroring Spark's <c>Dataset.groupBy(cols: Column*)</c>.
+    /// This is a <b>transformation</b>: it only <i>records</i> the grouping expressions over this
+    /// frame's plan — no grouping is computed, no schema is consulted, and no scan or backend call
+    /// happens (ADR-0001). This instance is unchanged; the grouped handle shares this frame's plan by
+    /// reference (structural sharing, #167).
+    /// </summary>
+    /// <remarks>
+    /// The returned handle is <b>not</b> a <see cref="DataFrame"/> — a grouping alone is not a
+    /// scannable relation — so it exposes only aggregation doors
+    /// (<see cref="RelationalGroupedDataset.Agg(Column, Column[])"/>,
+    /// <see cref="RelationalGroupedDataset.Count"/>), each of which produces a
+    /// <see cref="DataFrame"/> wrapping an <c>Aggregate</c> plan. Grouping by no columns
+    /// (<c>GroupBy()</c>) records an empty grouping — a global aggregation over all rows — matching
+    /// the semantics of <see cref="Agg(Column, Column[])"/>.
+    /// </remarks>
+    /// <param name="columns">The grouping key expressions, in order.</param>
+    /// <returns>A <see cref="RelationalGroupedDataset"/> recording the grouping.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="columns"/> or any element is null.</exception>
+    public RelationalGroupedDataset GroupBy(params Column[] columns)
+    {
+        ArgumentNullException.ThrowIfNull(columns);
+        return new RelationalGroupedDataset(Plan, ToExprs(columns, nameof(columns)));
+    }
+
+    /// <summary>
+    /// Groups rows by column name, returning a <see cref="RelationalGroupedDataset"/>, mirroring
+    /// Spark's <c>Dataset.groupBy(col1: String, cols: String*)</c>. Each name is turned into an
+    /// unresolved reference via <see cref="Functions.Col(string)"/>. Like the
+    /// <see cref="GroupBy(Column[])"/> overload this is a lazy transformation that leaves this
+    /// instance unchanged.
+    /// </summary>
+    /// <remarks>
+    /// The first name is a required parameter (Spark's <c>groupBy(col1: String, cols: String*)</c>
+    /// shape), so <c>GroupBy()</c> with no arguments unambiguously resolves to the
+    /// <see cref="GroupBy(Column[])"/> overload (a global, no-key grouping).
+    /// </remarks>
+    /// <param name="column">The first grouping column name.</param>
+    /// <param name="columns">Any further grouping column names, in order.</param>
+    /// <returns>A <see cref="RelationalGroupedDataset"/> recording the grouping.</returns>
+    /// <exception cref="ArgumentException"><paramref name="column"/> or any element of
+    /// <paramref name="columns"/> is null or empty.</exception>
+    /// <exception cref="ArgumentNullException"><paramref name="columns"/> is null.</exception>
+    public RelationalGroupedDataset GroupBy(string column, params string[] columns)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(column);
+        ArgumentNullException.ThrowIfNull(columns);
+        return new RelationalGroupedDataset(Plan, NamesToExprs(column, columns, nameof(columns)));
+    }
+
+    /// <summary>
+    /// Computes one or more aggregate expressions over the whole frame (no grouping), returning a new
+    /// <see cref="DataFrame"/>, mirroring Spark's <c>Dataset.agg(expr: Column, exprs: Column*)</c> —
+    /// which is exactly <c>groupBy().agg(...)</c>. This is a lazy <b>transformation</b> that builds an
+    /// <c>Aggregate</c> plan with an <b>empty grouping</b> and evaluates nothing (ADR-0001). This
+    /// instance is unchanged.
+    /// </summary>
+    /// <param name="expr">The first aggregate expression (required).</param>
+    /// <param name="exprs">Any further aggregate expressions, in output order.</param>
+    /// <returns>A new <see cref="DataFrame"/> wrapping the global aggregation.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="expr"/>, <paramref name="exprs"/>, or
+    /// any element of <paramref name="exprs"/> is null.</exception>
+    public DataFrame Agg(Column expr, params Column[] exprs) =>
+        new RelationalGroupedDataset(Plan, Array.Empty<Expression>()).Agg(expr, exprs);
+
+    /// <summary>
+    /// Materializes a <see cref="Column"/> array into the internal <see cref="Expression"/> array the
+    /// plan nodes consume, unwrapping each <see cref="Column.Expr"/> and rejecting a null element with
+    /// an <b>indexed</b> parameter name (for example <c>columns[2]</c>). Shared by
+    /// <see cref="Select(Column[])"/>, <see cref="GroupBy(Column[])"/>, and
+    /// <see cref="RelationalGroupedDataset.Agg(Column, Column[])"/> so the per-element null guard is
+    /// expressed once.
+    /// </summary>
+    /// <param name="columns">The (non-null) column array to materialize.</param>
+    /// <param name="paramName">The caller's parameter name, used to build the indexed guard message.</param>
+    /// <returns>The unwrapped expressions, in order.</returns>
+    /// <exception cref="ArgumentNullException">Any element of <paramref name="columns"/> is null.</exception>
+    internal static Expression[] ToExprs(Column[] columns, string paramName)
+    {
+        var exprs = new Expression[columns.Length];
+        for (int i = 0; i < columns.Length; i++)
+        {
+            Column column = columns[i]
+                ?? throw new ArgumentNullException($"{paramName}[{i}]");
+            exprs[i] = column.Expr;
+        }
+
+        return exprs;
+    }
+
+    /// <summary>
+    /// Materializes a required first name plus a rest array of names into an
+    /// <see cref="Expression"/> array of <see cref="UnresolvedAttribute"/>s (via
+    /// <see cref="Functions.Col(string)"/>), rejecting a null-or-empty rest element with an
+    /// <b>indexed</b> parameter name (for example <c>columns[1]</c>) so its guard is symmetric with the
+    /// <see cref="Column"/>-array path. Shared by <see cref="Select(string, string[])"/> and
+    /// <see cref="GroupBy(string, string[])"/>. The first name is assumed already validated by the
+    /// caller.
+    /// </summary>
+    /// <param name="first">The (already-validated) first column name.</param>
+    /// <param name="rest">The (non-null) rest array of column names.</param>
+    /// <param name="restParamName">The caller's rest parameter name for the indexed guard message.</param>
+    /// <returns>The name expressions, first then rest, in order.</returns>
+    /// <exception cref="ArgumentException">Any element of <paramref name="rest"/> is null or empty.</exception>
+    private static Expression[] NamesToExprs(string first, string[] rest, string restParamName)
+    {
+        var exprs = new Expression[rest.Length + 1];
+        exprs[0] = Functions.Col(first).Expr;
+        for (int i = 0; i < rest.Length; i++)
+        {
+            string name = rest[i];
+            ArgumentException.ThrowIfNullOrEmpty(name, $"{restParamName}[{i}]");
+            exprs[i + 1] = Functions.Col(name).Expr;
+        }
+
+        return exprs;
     }
 }
