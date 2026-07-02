@@ -33,12 +33,20 @@ internal static class CoercionHelpers
     /// <see cref="Cast"/> is transparent (its child's pretty form), binary arithmetic/comparison render
     /// as the infix <c>(left op right)</c>, a <see cref="ResolvedFunction"/> renders as
     /// <c>name(DISTINCT? args)</c>, the boolean composites (<see cref="And"/>, <see cref="Or"/>,
-    /// <see cref="Not"/>) render as their parenthesized SQL forms, a <see cref="CaseWhen"/> renders as
-    /// <c>CASE WHEN … THEN … [ELSE …] END</c>, and anything else (a literal, an unresolved marker)
-    /// falls back to its <c>SimpleString</c>. Every composite recurses through this renderer, so no
-    /// resolved sub-expression reaches the <c>SimpleString</c> leaf fallback carrying an ExprId.
-    /// Critically, it never leaks an ExprId, so diagnostics show <c>(b + i)</c> / <c>i</c> /
-    /// <c>(b AND i)</c> / <c>CASE WHEN b THEN i ELSE s END</c> rather than <c>(b#7 + i#8)</c> etc.
+    /// <see cref="Not"/>) and null predicates (<see cref="IsNull"/>, <see cref="IsNotNull"/>,
+    /// <see cref="EqualNullSafe"/>) render as their parenthesized SQL forms, <see cref="Alias"/> /
+    /// <see cref="SortOrder"/> render their wrapped child, and a <see cref="CaseWhen"/> renders as
+    /// <c>CASE WHEN … THEN … [ELSE …] END</c>.
+    /// <para>
+    /// The ExprId-free guarantee holds <b>by construction</b>: the only leaf whose
+    /// <c>SimpleString</c> carries an ExprId is an <see cref="AttributeReference"/>, and it is cased
+    /// first (to its bare <c>Name</c>). Every other node is rendered from its <em>pretty</em> children,
+    /// including via the generic fallback (<see cref="PrettyFallback"/>) for any node type not given a
+    /// bespoke SQL form — so a resolved <see cref="AttributeReference"/> can never leak its
+    /// <c>#ExprId</c> through the <c>SimpleString</c> of an un-cased parent, and the invariant survives
+    /// future node types. Diagnostics therefore show <c>(b + i)</c> / <c>i</c> / <c>(b AND i)</c> /
+    /// <c>(i IS NULL)</c> / <c>CASE WHEN b THEN i ELSE s END</c> rather than <c>(b#7 + i#8)</c> etc.
+    /// </para>
     /// </summary>
     public static string PrettyReference(Expression expression)
     {
@@ -54,10 +62,32 @@ internal static class CoercionHelpers
             And and => $"({PrettyReference(and.Left)} AND {PrettyReference(and.Right)})",
             Or or => $"({PrettyReference(or.Left)} OR {PrettyReference(or.Right)})",
             Not not => $"(NOT {PrettyReference(not.Child)})",
+            IsNull isNull => $"({PrettyReference(isNull.Child)} IS NULL)",
+            IsNotNull isNotNull => $"({PrettyReference(isNotNull.Child)} IS NOT NULL)",
+            EqualNullSafe equalNullSafe =>
+                $"({PrettyReference(equalNullSafe.Left)} <=> {PrettyReference(equalNullSafe.Right)})",
+            Alias alias => $"{PrettyReference(alias.Child)} AS {alias.Name}",
+            SortOrder sortOrder => PrettySortOrder(sortOrder),
             CaseWhen caseWhen => PrettyCaseWhen(caseWhen),
             ResolvedFunction function => PrettyFunction(function),
-            _ => expression.SimpleString,
+            _ => PrettyFallback(expression),
         };
+    }
+
+    /// <summary>Total, leak-proof fallback for any node without a bespoke SQL form. A true leaf
+    /// (<see cref="Literal"/>, an unresolved marker) carries no ExprId, so its <c>SimpleString</c> is
+    /// safe; any composite is rendered generically from <em>pretty</em> children so no resolved
+    /// <see cref="AttributeReference"/> descendant can leak its <c>#ExprId</c>.</summary>
+    private static string PrettyFallback(Expression expression) =>
+        expression.Children.Count == 0
+            ? expression.SimpleString
+            : $"{expression.NodeName}({string.Join(", ", expression.Children.Select(PrettyReference))})";
+
+    private static string PrettySortOrder(SortOrder sortOrder)
+    {
+        string direction = sortOrder.Direction == SortDirection.Ascending ? "ASC" : "DESC";
+        string nulls = sortOrder.NullOrdering == NullOrdering.NullsFirst ? "NULLS FIRST" : "NULLS LAST";
+        return $"{PrettyReference(sortOrder.Child)} {direction} {nulls}";
     }
 
     private static string PrettyFunction(ResolvedFunction function)

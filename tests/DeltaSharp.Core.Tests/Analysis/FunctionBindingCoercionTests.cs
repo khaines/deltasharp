@@ -569,6 +569,25 @@ public class FunctionBindingCoercionTests
         Assert.DoesNotContain("#", ex.Reference!);
     }
 
+    [Fact]
+    public void Resolve_CaseWhenNullPredicateCondition_DiagnosticReference_HasNoExprId()
+    {
+        // A null-predicate CASE condition (IsNull/IsNotNull/EqualNullSafe) is boolean-typed and valid,
+        // so the :116 branch/else mismatch renders it via the pretty renderer — `(i IS NULL)`, never
+        // the internal `(i#0 IS NULL)`. Guards the total-by-construction ExprId-free invariant against
+        // the null-predicate node family (whack-a-mole regression: these hit the generic fallback).
+        var analyzer = NumbersAnalyzer();
+        var caseWhen = new CaseWhen(new IsNull(Col("i")), Col("i")).WithElse(Col("s"));  // int vs string
+        var project = new Project(new[] { new Alias(caseWhen, "r") }, Relation("nums"));
+
+        var ex = Assert.Throws<AnalysisException>(() => analyzer.Resolve(project));
+
+        Assert.Equal(AnalysisErrorKind.DataTypeMismatch, ex.Kind);
+        Assert.DoesNotContain("#", ex.Message);
+        Assert.DoesNotContain("#", ex.Reference!);
+        Assert.Contains("(i IS NULL)", ex.Message);   // pretty null-predicate, bare name
+    }
+
     // ---- A3: DISTINCT is uppercased in the auto-name ----
 
     [Fact]
