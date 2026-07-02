@@ -128,6 +128,59 @@ public sealed class CaseWhenTests
         Assert.Same(caseWhen, same);
     }
 
+    [Fact] // WithNewChildren with a genuinely different child rebuilds and preserves shape
+    public void WithNewChildren_ChangedChild_RebuildsAndPreservesElseAndBranches()
+    {
+        // CASE WHEN 'flag THEN 1 WHEN 'other THEN 2 ELSE 0 END
+        var original = (CaseWhen)Functions.When(Flag, 1).When(Other, 2).Otherwise(0).Expr;
+        Assert.True(original.HasElse);
+        Assert.Equal(2, original.BranchCount);
+
+        // Swap the second branch's condition for a genuinely different expression.
+        var replacement = Functions.Col("swapped").Expr;
+        var newChildren = original.Children.ToArray();
+        int changedIndex = 2; // second branch condition in [c0, v0, c1, v1, else]
+        newChildren[changedIndex] = replacement;
+
+        var rebuilt = Assert.IsType<CaseWhen>(original.WithNewChildren(newChildren));
+
+        Assert.NotSame(original, rebuilt); // ignoring the new children (return this) would fail here
+        Assert.True(rebuilt.HasElse);
+        Assert.Equal(2, rebuilt.BranchCount);
+        Assert.Same(original.ElseValue, rebuilt.ElseValue); // else preserved
+        Assert.Same(replacement, rebuilt.Branches[1].Condition); // the changed child is present
+        Assert.Same(original.Branches[0].Condition, rebuilt.Branches[0].Condition); // others intact
+        Assert.Same(original.Branches[1].Value, rebuilt.Branches[1].Value);
+    }
+
+    [Fact] // MapChildren rewrite swaps a child and rebuilds, preserving the else
+    public void MapChildren_SwapsChild_PreservesElse()
+    {
+        var original = (CaseWhen)Functions.When(Flag, 1).Otherwise(0).Expr;
+        var replacement = Functions.Col("swapped").Expr;
+
+        var rebuilt = Assert.IsType<CaseWhen>(
+            original.MapChildren(child => ReferenceEquals(child, Flag.Expr) ? replacement : child));
+
+        Assert.NotSame(original, rebuilt);
+        Assert.True(rebuilt.HasElse);
+        Assert.Same(replacement, rebuilt.Branches[0].Condition);
+        Assert.Same(original.ElseValue, rebuilt.ElseValue);
+    }
+
+    [Fact] // cross-type: NodeEquals=>true is safe only under the base same-type guard
+    public void Equality_DifferentNodeType_IsNotEqual()
+    {
+        Expression a = Functions.Col("a").Expr;
+        Expression b = Functions.Col("b").Expr;
+
+        var caseWhen = new CaseWhen(a, b);
+        var and = new And(a, b);
+
+        Assert.NotEqual<Expression>(caseWhen, and);
+        Assert.NotEqual<Expression>(and, caseWhen);
+    }
+
     [Fact]
     public void WithNewChildren_WrongArity_Throws()
     {
@@ -155,5 +208,45 @@ public sealed class CaseWhenTests
     {
         Assert.Throws<ArgumentNullException>(() => new CaseWhen(null!, Literal.OfInt(1)));
         Assert.Throws<ArgumentNullException>(() => new CaseWhen(Flag.Expr, null!));
+    }
+
+    [Fact] // nullability derives from result values + else (not the blanket base true)
+    public void Nullable_NoElse_IsNullable()
+    {
+        // No else -> an unmatched row is an implicit SQL NULL, so the result is nullable.
+        var caseWhen = new CaseWhen(Flag.Expr, Literal.OfInt(1));
+        Assert.True(caseWhen.Nullable);
+    }
+
+    [Fact] // an else plus all non-null values makes the CASE non-nullable
+    public void Nullable_ElseAndAllNonNullValues_IsNotNullable()
+    {
+        var caseWhen = new CaseWhen(Flag.Expr, Literal.OfInt(1)).WithElse(Literal.OfInt(0));
+        Assert.False(caseWhen.Nullable);
+    }
+
+    [Fact] // a nullable else propagates nullability
+    public void Nullable_NullableElse_IsNullable()
+    {
+        var caseWhen = new CaseWhen(Flag.Expr, Literal.OfInt(1))
+            .WithElse(Literal.Null(DeltaSharp.Types.IntegerType.Instance));
+        Assert.True(caseWhen.Nullable);
+    }
+
+    [Fact] // a nullable branch value propagates nullability even with a non-null else
+    public void Nullable_NullableBranchValue_IsNullable()
+    {
+        var caseWhen = new CaseWhen(Flag.Expr, Literal.Null(DeltaSharp.Types.IntegerType.Instance))
+            .WithElse(Literal.OfInt(0));
+        Assert.True(caseWhen.Nullable);
+    }
+
+    [Fact] // a nullable condition does NOT make the result nullable
+    public void Nullable_NullableConditionOnly_IsNotNullable()
+    {
+        // Flag is an unresolved attribute (Nullable == true), used only as the condition.
+        var caseWhen = new CaseWhen(Flag.Expr, Literal.OfInt(1)).WithElse(Literal.OfInt(0));
+        Assert.True(Flag.Expr.Nullable);
+        Assert.False(caseWhen.Nullable);
     }
 }

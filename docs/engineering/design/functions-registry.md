@@ -52,7 +52,7 @@ in the Notes column).
 | --- | --- | --- | --- | --- | --- |
 | `count(col)` | `Count(Column)` | `'count(x)` | aggregate | ✅ delivered | |
 | `count(colName)` | `Count(string)` | `'count(x)` | aggregate | ✅ delivered | pass `"*"` for `count(*)` (builds `'count(*)`) |
-| `countDistinct(col, cols…)` | `CountDistinct(Column, params Column[])` | `'count(distinct …)` | aggregate | ✅ delivered | sets `IsDistinct` |
+| `countDistinct(col, cols…)` / `countDistinct(colName, colNames…)` | `CountDistinct(Column, params Column[])` / `CountDistinct(string, params string[])` | `'count(distinct …)` | aggregate | ✅ delivered | sets `IsDistinct`; tail may be empty |
 | `sum(col)` / `sum(colName)` | `Sum(Column)` / `Sum(string)` | `'sum(x)` | aggregate | ✅ delivered | |
 | `avg(col)` / `avg(colName)` | `Avg(Column)` / `Avg(string)` | `'avg(x)` | aggregate | ✅ delivered | `mean` synonym deferred |
 | `min(col)` / `min(colName)` | `Min(Column)` / `Min(string)` | `'min(x)` | aggregate | ✅ delivered | |
@@ -86,11 +86,17 @@ guidance.
 - **`(Column)` + `(string)` overloads.** The aggregates (`Count`/`Sum`/`Avg`/`Min`/`Max`) provide both
   a `Column` overload and a `string` convenience overload; the `string` overload just calls
   `Col(name)` (which rejects null/empty), mirroring Spark's twin `count(e: Column)` /
-  `count(columnName: String)`. String/date helpers take a `Column` only.
-- **`params Column[]` variadics** (`Coalesce`, `Concat`, and `CountDistinct`'s tail) require **≥1**
-  argument. The shared `NaryFunction` helper throws `ArgumentNullException` for a null array,
-  `ArgumentException` for an empty array, and `ArgumentException` for any null element.
-- **Unary builders** (`ScalarFunction` helper) throw `ArgumentNullException` for a null `Column`.
+  `count(columnName: String)`. `CountDistinct` likewise offers a `string` variadic overload
+  (`CountDistinct(string, params string[])`) that resolves each name through `Col(...)`, mirroring
+  Spark's `countDistinct(String, String...)`. String/date helpers take a `Column` only.
+- **`params Column[]` variadics.** `Coalesce` and `Concat` require a **non-empty** params array —
+  the shared `NaryFunction` helper throws `ArgumentException` for an empty array. `CountDistinct`'s
+  trailing `params` (`additional` / `additionalColumnNames`) **may be empty**: its mandatory leading
+  `column`/`columnName` argument already guarantees **≥1 column total** (see
+  `CountDistinct_SingleColumn_HasOneArg`), so only that leading arg is required. In all cases
+  `NaryFunction` also throws `ArgumentNullException` for a null array and `ArgumentException` for any
+  null element.
+- **Unary builders** (`UnaryFunction` helper) throw `ArgumentNullException` for a null `Column`.
 - **`When(condition, value)`** rejects a null `condition` (`ArgumentNullException`); `value` is
   wrapped through `Lit(object?)`, so a raw literal becomes a `Literal` and an existing `Column` passes
   through unchanged (Spark's `when(cond, Any)` semantics, reusing `Lit`'s idempotence).
@@ -133,11 +139,17 @@ via `functions.when(cond, val)` and chained with `Column.when(...)` / `Column.ot
   `NodeHashCode` returns `PlanHash.Seed` (identical to `And`/`Or`), and two `CaseWhen`s are equal
   exactly when their children are.
 - **Lazy hints.** `Type` is `null` (the common type across branch values needs coercion — an analyzer
-  concern, #171, consistent with how arithmetic defers its result type), `Nullable` is conservatively
-  `true`, and `Resolved` follows the default "all children resolved" rule — so a `CaseWhen` over an
-  unresolved condition stays unresolved. It is **not** an unresolved *marker*: like `And`/`Or` it
-  becomes resolved once its children are (its residual coercion is #171's concern), so
-  `CheckAnalysis` does not special-case it.
+  concern, #171, consistent with how arithmetic defers its result type), `Nullable` is **derived** from
+  the possible result values — nullable if any branch value is nullable, the else value is nullable, or
+  there is **no** else (an unmatched row then yields an implicit SQL `NULL`); a `CASE` with an else and
+  all-non-null values is therefore non-nullable (conditions do not affect result nullability). `Resolved`
+  follows the default "all children resolved" rule — so a `CaseWhen` over an unresolved condition stays
+  unresolved. It is **not** an unresolved *marker*: it becomes resolved once its children are (its residual
+  coercion is #171's concern), so `CheckAnalysis` does not special-case it. The precedent for this
+  "resolved-by-children but `Type == null` pending coercion" shape is **`BinaryArithmetic`** (not
+  `And`/`Or`, which override `Type => BooleanType` and are thus resolved *with* a known type); like
+  `BinaryArithmetic`, a resolved `CaseWhen` can still carry a `null` result type until #171 coerces the
+  branch values to a common type.
 - **Immutable builders.** `AddBranch(condition, value)` returns a new `CaseWhen` with one branch
   appended; `WithElse(value)` returns a new `CaseWhen` with the else set. Both reject the operation
   once an else is present (`InvalidOperationException`), enforcing Spark's rule that `when` cannot
@@ -159,9 +171,9 @@ Lit(value).Expr))`. Chaining lives on `Column` because Spark chains on `Column`:
 
 These two members are added to `Column` (not to #165's operator surface) because they are conditional
 builders tightly coupled to `CaseWhen`, and the story assigns them here. They consume only
-`Column`/`Column.Expr` and `Lit`, so they carry **no dependency on the parallel #165 operator work**:
-the user builds the boolean `condition` with #165's operators once merged, and this registry just
-consumes the resulting `Column`.
+`Column`/`Column.Expr` and `Lit`, so they carry **no dependency on the #165 operator work** (now merged
+into this PR's base): the user builds the boolean `condition` with #165's operators, and this registry
+just consumes the resulting `Column`.
 
 ## The `expr` decision (AC3)
 

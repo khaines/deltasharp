@@ -165,7 +165,7 @@ public static class Functions
     /// <param name="column">The column (or star) to count.</param>
     /// <returns>An unresolved aggregate <c>count</c> column.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
-    public static Column Count(Column column) => ScalarFunction("count", column, nameof(column));
+    public static Column Count(Column column) => UnaryFunction("count", column, nameof(column));
 
     /// <summary>
     /// Convenience overload of <see cref="Count(Column)"/> that counts the column named
@@ -201,6 +201,34 @@ public static class Functions
     }
 
     /// <summary>
+    /// Convenience overload of <see cref="CountDistinct(Column, Column[])"/> that counts the
+    /// distinct non-null combinations of the columns named <paramref name="columnName"/> and
+    /// <paramref name="additionalColumnNames"/>, mirroring Spark's
+    /// <c>functions.countDistinct(columnName, columnNames…)</c>. <b>Lazy:</b> resolves each name to
+    /// an unresolved reference via <see cref="Col(string)"/>, then builds a <c>count</c> node tagged
+    /// <c>DISTINCT</c>; the analyzer classifies it as an aggregate. No Spark deviation.
+    /// </summary>
+    /// <param name="columnName">The first column name (required).</param>
+    /// <param name="additionalColumnNames">Further column names whose distinct combinations are
+    /// counted.</param>
+    /// <returns>An unresolved distinct aggregate <c>count</c> column.</returns>
+    /// <exception cref="ArgumentException"><paramref name="columnName"/> is null or empty, or any
+    /// element of <paramref name="additionalColumnNames"/> is null or empty.</exception>
+    /// <exception cref="ArgumentNullException"><paramref name="additionalColumnNames"/> is
+    /// null.</exception>
+    public static Column CountDistinct(string columnName, params string[] additionalColumnNames)
+    {
+        ArgumentNullException.ThrowIfNull(additionalColumnNames);
+        var additional = new Column[additionalColumnNames.Length];
+        for (int i = 0; i < additionalColumnNames.Length; i++)
+        {
+            additional[i] = Col(additionalColumnNames[i]);
+        }
+
+        return CountDistinct(Col(columnName), additional);
+    }
+
+    /// <summary>
     /// Returns the <b>aggregate</b> sum of <paramref name="column"/>, mirroring Spark's
     /// <c>functions.sum(col)</c> (nulls are skipped). <b>Lazy:</b> builds an unresolved <c>sum</c>
     /// function node the analyzer classifies as an aggregate. No Spark deviation.
@@ -208,7 +236,7 @@ public static class Functions
     /// <param name="column">The numeric column to sum.</param>
     /// <returns>An unresolved aggregate <c>sum</c> column.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
-    public static Column Sum(Column column) => ScalarFunction("sum", column, nameof(column));
+    public static Column Sum(Column column) => UnaryFunction("sum", column, nameof(column));
 
     /// <summary>Convenience overload of <see cref="Sum(Column)"/> for the column named
     /// <paramref name="columnName"/>. <b>Lazy;</b> no Spark deviation.</summary>
@@ -226,7 +254,7 @@ public static class Functions
     /// <param name="column">The numeric column to average.</param>
     /// <returns>An unresolved aggregate <c>avg</c> column.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
-    public static Column Avg(Column column) => ScalarFunction("avg", column, nameof(column));
+    public static Column Avg(Column column) => UnaryFunction("avg", column, nameof(column));
 
     /// <summary>Convenience overload of <see cref="Avg(Column)"/> for the column named
     /// <paramref name="columnName"/>. <b>Lazy;</b> no Spark deviation.</summary>
@@ -243,7 +271,7 @@ public static class Functions
     /// <param name="column">The column to reduce.</param>
     /// <returns>An unresolved aggregate <c>min</c> column.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
-    public static Column Min(Column column) => ScalarFunction("min", column, nameof(column));
+    public static Column Min(Column column) => UnaryFunction("min", column, nameof(column));
 
     /// <summary>Convenience overload of <see cref="Min(Column)"/> for the column named
     /// <paramref name="columnName"/>. <b>Lazy;</b> no Spark deviation.</summary>
@@ -260,7 +288,7 @@ public static class Functions
     /// <param name="column">The column to reduce.</param>
     /// <returns>An unresolved aggregate <c>max</c> column.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
-    public static Column Max(Column column) => ScalarFunction("max", column, nameof(column));
+    public static Column Max(Column column) => UnaryFunction("max", column, nameof(column));
 
     /// <summary>Convenience overload of <see cref="Max(Column)"/> for the column named
     /// <paramref name="columnName"/>. <b>Lazy;</b> no Spark deviation.</summary>
@@ -332,7 +360,7 @@ public static class Functions
     /// <param name="column">The string column.</param>
     /// <returns>An unresolved scalar <c>upper</c> column.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
-    public static Column Upper(Column column) => ScalarFunction("upper", column, nameof(column));
+    public static Column Upper(Column column) => UnaryFunction("upper", column, nameof(column));
 
     /// <summary>
     /// Returns the lowercase of the string <paramref name="column"/>, mirroring Spark's <b>scalar</b>
@@ -342,7 +370,7 @@ public static class Functions
     /// <param name="column">The string column.</param>
     /// <returns>An unresolved scalar <c>lower</c> column.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
-    public static Column Lower(Column column) => ScalarFunction("lower", column, nameof(column));
+    public static Column Lower(Column column) => UnaryFunction("lower", column, nameof(column));
 
     /// <summary>
     /// Returns the character length of the string <paramref name="column"/>, mirroring Spark's
@@ -352,7 +380,7 @@ public static class Functions
     /// <param name="column">The string column.</param>
     /// <returns>An unresolved scalar <c>length</c> column.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
-    public static Column Length(Column column) => ScalarFunction("length", column, nameof(column));
+    public static Column Length(Column column) => UnaryFunction("length", column, nameof(column));
 
     /// <summary>
     /// Trims leading and trailing whitespace from the string <paramref name="column"/>, mirroring
@@ -362,7 +390,7 @@ public static class Functions
     /// <param name="column">The string column.</param>
     /// <returns>An unresolved scalar <c>trim</c> column.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
-    public static Column Trim(Column column) => ScalarFunction("trim", column, nameof(column));
+    public static Column Trim(Column column) => UnaryFunction("trim", column, nameof(column));
 
     /// <summary>
     /// Concatenates <paramref name="columns"/> into one string, mirroring Spark's <b>scalar</b>
@@ -403,7 +431,7 @@ public static class Functions
     /// <param name="column">The date/timestamp column.</param>
     /// <returns>An unresolved scalar <c>year</c> column.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
-    public static Column Year(Column column) => ScalarFunction("year", column, nameof(column));
+    public static Column Year(Column column) => UnaryFunction("year", column, nameof(column));
 
     /// <summary>
     /// Extracts the month (1–12) from the date/timestamp <paramref name="column"/>, mirroring
@@ -413,7 +441,7 @@ public static class Functions
     /// <param name="column">The date/timestamp column.</param>
     /// <returns>An unresolved scalar <c>month</c> column.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
-    public static Column Month(Column column) => ScalarFunction("month", column, nameof(column));
+    public static Column Month(Column column) => UnaryFunction("month", column, nameof(column));
 
     /// <summary>
     /// Extracts the day of month (1–31) from the date/timestamp <paramref name="column"/>, mirroring
@@ -424,7 +452,7 @@ public static class Functions
     /// <returns>An unresolved scalar <c>dayofmonth</c> column.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
     public static Column DayOfMonth(Column column) =>
-        ScalarFunction("dayofmonth", column, nameof(column));
+        UnaryFunction("dayofmonth", column, nameof(column));
 
     /// <summary>
     /// Converts the <paramref name="column"/> to a date, mirroring Spark's <b>scalar</b>
@@ -435,9 +463,9 @@ public static class Functions
     /// <param name="column">The column to convert to a date.</param>
     /// <returns>An unresolved scalar <c>to_date</c> column.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
-    public static Column ToDate(Column column) => ScalarFunction("to_date", column, nameof(column));
+    public static Column ToDate(Column column) => UnaryFunction("to_date", column, nameof(column));
 
-    private static Column ScalarFunction(string name, Column column, string paramName)
+    private static Column UnaryFunction(string name, Column column, string paramName)
     {
         ArgumentNullException.ThrowIfNull(column, paramName);
         return new Column(new UnresolvedFunction(name, new[] { column.Expr }));

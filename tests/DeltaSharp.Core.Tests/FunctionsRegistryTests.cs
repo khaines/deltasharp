@@ -26,7 +26,9 @@ public class FunctionsRegistryTests
     [Fact] // AC1/AC2
     public void Count_Column_BuildsUnresolvedCountOfOneArg()
     {
-        UnresolvedFunction function = AssertFunction(Functions.Count(Functions.Col("id")), "count", 1);
+        Column input = Functions.Col("id");
+        UnresolvedFunction function = AssertFunction(Functions.Count(input), "count", 1);
+        Assert.Same(input.Expr, function.Arguments[0]); // wraps the supplied column, not a fresh one
         Assert.IsType<UnresolvedAttribute>(function.Arguments[0]);
     }
 
@@ -61,6 +63,27 @@ public class FunctionsRegistryTests
     public void CountDistinct_SingleColumn_HasOneArg()
         => AssertFunction(Functions.CountDistinct(Functions.Col("a")), "count", 1, isDistinct: true);
 
+    [Fact] // AC1/AC2: string overload resolves each name through Col(...) in order
+    public void CountDistinct_StringOverload_ResolvesNamesAndOrders()
+    {
+        UnresolvedFunction function = AssertFunction(
+            Functions.CountDistinct("a", "b"), "count", argCount: 2, isDistinct: true);
+        Assert.Equal("a", Assert.IsType<UnresolvedAttribute>(function.Arguments[0]).Name);
+        Assert.Equal("b", Assert.IsType<UnresolvedAttribute>(function.Arguments[1]).Name);
+    }
+
+    [Fact] // string overload with a single (mandatory) name still yields one arg
+    public void CountDistinct_StringOverload_SingleName_HasOneArg()
+    {
+        UnresolvedFunction function =
+            AssertFunction(Functions.CountDistinct("a"), "count", 1, isDistinct: true);
+        Assert.Equal("a", Assert.IsType<UnresolvedAttribute>(function.Arguments[0]).Name);
+    }
+
+    [Fact] // guard: the mandatory leading name is validated by Col(...)
+    public void CountDistinct_StringOverload_NullOrEmptyName_Throws()
+        => Assert.Throws<ArgumentException>(() => Functions.CountDistinct(""));
+
     [Theory] // AC1/AC2: the aggregate names the analyzer classifies as aggregates
     [InlineData("sum")]
     [InlineData("avg")]
@@ -68,15 +91,17 @@ public class FunctionsRegistryTests
     [InlineData("max")]
     public void Aggregate_Column_BuildsNamedUnaryFunction(string name)
     {
+        Column input = Functions.Col("x");
         Column column = name switch
         {
-            "sum" => Functions.Sum(Functions.Col("x")),
-            "avg" => Functions.Avg(Functions.Col("x")),
-            "min" => Functions.Min(Functions.Col("x")),
-            _ => Functions.Max(Functions.Col("x")),
+            "sum" => Functions.Sum(input),
+            "avg" => Functions.Avg(input),
+            "min" => Functions.Min(input),
+            _ => Functions.Max(input),
         };
 
-        AssertFunction(column, name, 1);
+        UnresolvedFunction function = AssertFunction(column, name, 1);
+        Assert.Same(input.Expr, function.Arguments[0]); // the built node wraps the supplied column
     }
 
     [Theory]
@@ -122,9 +147,28 @@ public class FunctionsRegistryTests
     public void Coalesce_NullArray_Throws()
         => Assert.Throws<ArgumentNullException>(() => Functions.Coalesce(null!));
 
-    [Fact]
+    [Fact] // AC1: concat keeps its argument order (arg0, arg1, … in order)
     public void Concat_BuildsScalarFunction()
-        => AssertFunction(Functions.Concat(Functions.Col("a"), Functions.Col("b")), "concat", 2);
+    {
+        Column a = Functions.Col("a");
+        Column b = Functions.Col("b");
+        UnresolvedFunction function = AssertFunction(Functions.Concat(a, b), "concat", 2);
+        Assert.Same(a.Expr, function.Arguments[0]);
+        Assert.Same(b.Expr, function.Arguments[1]);
+    }
+
+    [Fact] // AC1: concat preserves order even when the columns share a name shape
+    public void Concat_PreservesArgumentOrder()
+    {
+        Column first = Functions.Col("first");
+        Column second = Functions.Col("second");
+        Column third = Functions.Col("third");
+        UnresolvedFunction function =
+            AssertFunction(Functions.Concat(first, second, third), "concat", 3);
+        Assert.Equal("first", Assert.IsType<UnresolvedAttribute>(function.Arguments[0]).Name);
+        Assert.Equal("second", Assert.IsType<UnresolvedAttribute>(function.Arguments[1]).Name);
+        Assert.Equal("third", Assert.IsType<UnresolvedAttribute>(function.Arguments[2]).Name);
+    }
 
     [Fact]
     public void Concat_Empty_Throws()
@@ -137,15 +181,17 @@ public class FunctionsRegistryTests
     [InlineData("trim")]
     public void StringHelper_BuildsUnaryScalarFunction(string name)
     {
+        Column input = Functions.Col("s");
         Column column = name switch
         {
-            "upper" => Functions.Upper(Functions.Col("s")),
-            "lower" => Functions.Lower(Functions.Col("s")),
-            "length" => Functions.Length(Functions.Col("s")),
-            _ => Functions.Trim(Functions.Col("s")),
+            "upper" => Functions.Upper(input),
+            "lower" => Functions.Lower(input),
+            "length" => Functions.Length(input),
+            _ => Functions.Trim(input),
         };
 
-        AssertFunction(column, name, 1);
+        UnresolvedFunction function = AssertFunction(column, name, 1);
+        Assert.Same(input.Expr, function.Arguments[0]); // the built node wraps the supplied column
     }
 
     [Fact] // AC1: nullary date helpers take no arguments
@@ -155,6 +201,24 @@ public class FunctionsRegistryTests
         AssertFunction(Functions.CurrentTimestamp(), "current_timestamp", 0);
     }
 
+    [Fact] // determinism: no wall-clock is captured at build time (structural equality holds)
+    public void CurrentDate_IsDeterministic_NoWallClockCaptured()
+    {
+        Assert.Equal(Functions.CurrentDate().Expr, Functions.CurrentDate().Expr);
+        Assert.Equal(
+            Functions.CurrentDate().Expr.GetHashCode(),
+            Functions.CurrentDate().Expr.GetHashCode());
+    }
+
+    [Fact] // determinism: no wall-clock is captured at build time (structural equality holds)
+    public void CurrentTimestamp_IsDeterministic_NoWallClockCaptured()
+    {
+        Assert.Equal(Functions.CurrentTimestamp().Expr, Functions.CurrentTimestamp().Expr);
+        Assert.Equal(
+            Functions.CurrentTimestamp().Expr.GetHashCode(),
+            Functions.CurrentTimestamp().Expr.GetHashCode());
+    }
+
     [Theory] // AC1: date extraction helpers
     [InlineData("year")]
     [InlineData("month")]
@@ -162,15 +226,17 @@ public class FunctionsRegistryTests
     [InlineData("to_date")]
     public void DateHelper_BuildsUnaryScalarFunction(string name)
     {
+        Column input = Functions.Col("d");
         Column column = name switch
         {
-            "year" => Functions.Year(Functions.Col("d")),
-            "month" => Functions.Month(Functions.Col("d")),
-            "dayofmonth" => Functions.DayOfMonth(Functions.Col("d")),
-            _ => Functions.ToDate(Functions.Col("d")),
+            "year" => Functions.Year(input),
+            "month" => Functions.Month(input),
+            "dayofmonth" => Functions.DayOfMonth(input),
+            _ => Functions.ToDate(input),
         };
 
-        AssertFunction(column, name, 1);
+        UnresolvedFunction function = AssertFunction(column, name, 1);
+        Assert.Same(input.Expr, function.Arguments[0]); // the built node wraps the supplied column
     }
 
     [Theory] // null-argument guards on the unary builders

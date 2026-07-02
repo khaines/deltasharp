@@ -60,6 +60,7 @@ static DeltaSharp.Functions.Concat(params DeltaSharp.Column![]! columns) -> Delt
 static DeltaSharp.Functions.Count(DeltaSharp.Column! column) -> DeltaSharp.Column!
 static DeltaSharp.Functions.Count(string! columnName) -> DeltaSharp.Column!
 static DeltaSharp.Functions.CountDistinct(DeltaSharp.Column! column, params DeltaSharp.Column![]! additional) -> DeltaSharp.Column!
+static DeltaSharp.Functions.CountDistinct(string! columnName, params string![]! additionalColumnNames) -> DeltaSharp.Column!
 static DeltaSharp.Functions.CurrentDate() -> DeltaSharp.Column!
 static DeltaSharp.Functions.CurrentTimestamp() -> DeltaSharp.Column!
 static DeltaSharp.Functions.DayOfMonth(DeltaSharp.Column! column) -> DeltaSharp.Column!

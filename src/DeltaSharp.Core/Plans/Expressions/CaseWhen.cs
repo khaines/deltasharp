@@ -19,8 +19,9 @@ namespace DeltaSharp.Plans.Expressions;
 /// <para>
 /// Building a node does no work and no type coercion: the result <see cref="Type"/> is
 /// <see langword="null"/> (the common type across the branch values needs coercion, an analyzer
-/// concern — STORY-04.5.2 / #171) and <see cref="Nullable"/> is conservatively
-/// <see langword="true"/>. It is resolved exactly when every child is (the default), so a
+/// concern — STORY-04.5.2 / #171) and <see cref="Nullable"/> is <b>derived</b> from the possible
+/// result values — nullable if any branch value or the else value is nullable, or if there is no
+/// else (implicit-NULL). It is resolved exactly when every child is (the default), so a
 /// <see cref="CaseWhen"/> over unresolved conditions/values stays unresolved until analysis.
 /// </para>
 /// </remarks>
@@ -79,6 +80,35 @@ internal sealed class CaseWhen : Expression
 
     /// <summary>The trailing <c>ELSE</c> value, or <see langword="null"/> when absent.</summary>
     public Expression? ElseValue => HasElse ? Children[^1] : null;
+
+    /// <summary>
+    /// Derives nullability from the possible result values (mirroring how <see cref="And"/>/
+    /// <see cref="Or"/>/<see cref="BinaryArithmetic"/> derive theirs from their operands): the
+    /// result is nullable if any branch value is nullable, the else value is nullable, or there is
+    /// <b>no</b> else at all (an unmatched row then yields an implicit SQL <c>NULL</c>). A
+    /// <c>CASE</c> with an else whose branch values and else are all non-nullable is therefore
+    /// non-nullable. Conditions do not affect result nullability.
+    /// </summary>
+    public override bool Nullable
+    {
+        get
+        {
+            if (!HasElse || ElseValue!.Nullable)
+            {
+                return true;
+            }
+
+            foreach ((Expression _, Expression value) in Branches)
+            {
+                if (value.Nullable)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
 
     /// <inheritdoc/>
     public override string NodeName => "CaseWhen";
