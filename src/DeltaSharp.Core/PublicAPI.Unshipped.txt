@@ -7,11 +7,26 @@ DeltaSharp.Column.Otherwise(object? value) -> DeltaSharp.Column!
 DeltaSharp.Column.When(DeltaSharp.Column! condition, object? value) -> DeltaSharp.Column!
 DeltaSharp.DataFrame
 DeltaSharp.DataFrame.Agg(DeltaSharp.Column! expr, params DeltaSharp.Column![]! exprs) -> DeltaSharp.DataFrame!
+DeltaSharp.DataFrame.CrossJoin(DeltaSharp.DataFrame! right) -> DeltaSharp.DataFrame!
+DeltaSharp.DataFrame.Distinct() -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.Filter(DeltaSharp.Column! condition) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.GroupBy(params DeltaSharp.Column![]! columns) -> DeltaSharp.RelationalGroupedDataset!
 DeltaSharp.DataFrame.GroupBy(string! column, params string![]! columns) -> DeltaSharp.RelationalGroupedDataset!
+DeltaSharp.DataFrame.Join(DeltaSharp.DataFrame! right) -> DeltaSharp.DataFrame!
+DeltaSharp.DataFrame.Join(DeltaSharp.DataFrame! right, DeltaSharp.Column! condition) -> DeltaSharp.DataFrame!
+DeltaSharp.DataFrame.Join(DeltaSharp.DataFrame! right, DeltaSharp.Column! condition, string! joinType) -> DeltaSharp.DataFrame!
+DeltaSharp.DataFrame.Join(DeltaSharp.DataFrame! right, System.Collections.Generic.IEnumerable<string!>! usingColumns) -> DeltaSharp.DataFrame!
+DeltaSharp.DataFrame.Join(DeltaSharp.DataFrame! right, System.Collections.Generic.IEnumerable<string!>! usingColumns, string! joinType) -> DeltaSharp.DataFrame!
+DeltaSharp.DataFrame.Join(DeltaSharp.DataFrame! right, string! usingColumn) -> DeltaSharp.DataFrame!
+DeltaSharp.DataFrame.Limit(int n) -> DeltaSharp.DataFrame!
+DeltaSharp.DataFrame.OrderBy(params DeltaSharp.Column![]! columns) -> DeltaSharp.DataFrame!
+DeltaSharp.DataFrame.OrderBy(string! column, params string![]! columns) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.Select(params DeltaSharp.Column![]! columns) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.Select(string! column, params string![]! columns) -> DeltaSharp.DataFrame!
+DeltaSharp.DataFrame.Sort(params DeltaSharp.Column![]! columns) -> DeltaSharp.DataFrame!
+DeltaSharp.DataFrame.Sort(string! column, params string![]! columns) -> DeltaSharp.DataFrame!
+DeltaSharp.DataFrame.Union(DeltaSharp.DataFrame! other) -> DeltaSharp.DataFrame!
+DeltaSharp.DataFrame.UnionAll(DeltaSharp.DataFrame! other) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.Where(DeltaSharp.Column! condition) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.WithColumn(string! colName, DeltaSharp.Column! col) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrameReader
@@ -95,6 +110,8 @@ static DeltaSharp.SparkSession.GetDefaultSession() -> DeltaSharp.SparkSession?
 static DeltaSharp.SparkSession.SetActiveSession(DeltaSharp.SparkSession! session) -> void
 DeltaSharp.Column.And(DeltaSharp.Column! other) -> DeltaSharp.Column!
 DeltaSharp.Column.And(object? value) -> DeltaSharp.Column!
+DeltaSharp.Column.Asc() -> DeltaSharp.Column!
+DeltaSharp.Column.Desc() -> DeltaSharp.Column!
 DeltaSharp.Column.Divide(DeltaSharp.Column! other) -> DeltaSharp.Column!
 DeltaSharp.Column.Divide(object? value) -> DeltaSharp.Column!
 DeltaSharp.Column.EqNullSafe(DeltaSharp.Column! other) -> DeltaSharp.Column!

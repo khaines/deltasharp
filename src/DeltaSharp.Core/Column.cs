@@ -129,6 +129,37 @@ public sealed class Column
     }
 
     /// <summary>
+    /// Marks this column for <b>ascending</b> ordering, mirroring Spark's <c>Column.asc</c>. Returns a
+    /// new <see cref="Column"/> wrapping a <c>SortOrder(this, Ascending, NullsFirst)</c> — Spark's
+    /// <c>asc</c> defaults SQL <c>NULL</c>s <b>first</b>. Intended as an argument to
+    /// <see cref="DataFrame.OrderBy(Column[])"/>/<see cref="DataFrame.Sort(Column[])"/>. This is a
+    /// <b>lazy</b> builder: it only wraps a new immutable ordering node — no schema lookup and no
+    /// evaluation (ADR-0001) — and leaves this instance unchanged.
+    /// </summary>
+    /// <returns>A new <see cref="Column"/> describing an ascending, nulls-first ordering term.</returns>
+    /// <remarks>Explicit null-placement helpers (<c>AscNullsFirst</c>/<c>AscNullsLast</c>/
+    /// <c>DescNullsFirst</c>/<c>DescNullsLast</c>) are deferred to
+    /// <see href="https://github.com/khaines/deltasharp/issues/405">#405</see>; the underlying
+    /// <c>SortOrder</c>/<c>NullOrdering</c> IR already supports all four placements.</remarks>
+    public Column Asc() =>
+        new(new SortOrder(Expr, SortDirection.Ascending, NullOrdering.NullsFirst));
+
+    /// <summary>
+    /// Marks this column for <b>descending</b> ordering, mirroring Spark's <c>Column.desc</c>. Returns
+    /// a new <see cref="Column"/> wrapping a <c>SortOrder(this, Descending, NullsLast)</c> — Spark's
+    /// <c>desc</c> defaults SQL <c>NULL</c>s <b>last</b>. Intended as an argument to
+    /// <see cref="DataFrame.OrderBy(Column[])"/>/<see cref="DataFrame.Sort(Column[])"/>. Like
+    /// <see cref="Asc"/> it is a lazy builder that leaves this instance unchanged.
+    /// </summary>
+    /// <returns>A new <see cref="Column"/> describing a descending, nulls-last ordering term.</returns>
+    /// <remarks>Explicit null-placement helpers (<c>AscNullsFirst</c>/<c>AscNullsLast</c>/
+    /// <c>DescNullsFirst</c>/<c>DescNullsLast</c>) are deferred to
+    /// <see href="https://github.com/khaines/deltasharp/issues/405">#405</see>; the underlying
+    /// <c>SortOrder</c>/<c>NullOrdering</c> IR already supports all four placements.</remarks>
+    public Column Desc() =>
+        new(new SortOrder(Expr, SortDirection.Descending, NullOrdering.NullsLast));
+
+    /// <summary>
     /// Returns the Catalyst-style inline rendering of the wrapped expression (for example
     /// <c>'name</c> for an unresolved reference or <c>'name AS x</c> for an alias), matching Spark's
     /// <c>Column.toString</c>. Intended for diagnostics; it performs no analysis.
