@@ -359,6 +359,20 @@ internal sealed class Analyzer
                         alias.Name);
                 return new AttributeReference(alias.Name, type, alias.Nullable, idGenerator.Next());
 
+            case UnresolvedFunction function:
+                // A bare aggregate/scalar function reached output derivation while still unresolved.
+                // Aggregate-function resolution and Spark auto-naming are deferred to STORY-04.5.2
+                // (#171), so we cannot mint an output name yet. Reject deterministically here (this
+                // fires during ResolveReferences, before CheckAnalysis) with a targeted message
+                // rather than the generic "not a named output element" fallback, and point at the
+                // alias workaround. Kind stays UnsupportedProjection.
+                throw AnalysisException.UnsupportedProjection(
+                    $"Aggregate/function output '{function.Name}' cannot be named yet: "
+                    + "aggregate-function resolution and Spark auto-naming are deferred to "
+                    + "STORY-04.5.2 (#171). Alias the expression (for example .As(\"total\")) as the "
+                    + "M1 workaround.",
+                    function.Name);
+
             default:
                 throw AnalysisException.UnsupportedProjection(
                     $"Projection element '{element.SimpleString}' is not a named output element "

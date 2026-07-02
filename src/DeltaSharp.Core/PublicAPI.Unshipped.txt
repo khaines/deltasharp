@@ -6,7 +6,10 @@ DeltaSharp.Column.Name(string! alias) -> DeltaSharp.Column!
 DeltaSharp.Column.Otherwise(object? value) -> DeltaSharp.Column!
 DeltaSharp.Column.When(DeltaSharp.Column! condition, object? value) -> DeltaSharp.Column!
 DeltaSharp.DataFrame
+DeltaSharp.DataFrame.Agg(DeltaSharp.Column! expr, params DeltaSharp.Column![]! exprs) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.Filter(DeltaSharp.Column! condition) -> DeltaSharp.DataFrame!
+DeltaSharp.DataFrame.GroupBy(params DeltaSharp.Column![]! columns) -> DeltaSharp.RelationalGroupedDataset!
+DeltaSharp.DataFrame.GroupBy(string! column, params string![]! columns) -> DeltaSharp.RelationalGroupedDataset!
 DeltaSharp.DataFrame.Select(params DeltaSharp.Column![]! columns) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.Select(string! column, params string![]! columns) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.Where(DeltaSharp.Column! condition) -> DeltaSharp.DataFrame!
@@ -18,6 +21,9 @@ DeltaSharp.ExecutionBackend.Auto = 0 -> DeltaSharp.ExecutionBackend
 DeltaSharp.ExecutionBackend.Compiled = 2 -> DeltaSharp.ExecutionBackend
 DeltaSharp.ExecutionBackend.Interpreted = 1 -> DeltaSharp.ExecutionBackend
 DeltaSharp.Functions
+DeltaSharp.RelationalGroupedDataset
+DeltaSharp.RelationalGroupedDataset.Agg(DeltaSharp.Column! expr, params DeltaSharp.Column![]! exprs) -> DeltaSharp.DataFrame!
+DeltaSharp.RelationalGroupedDataset.Count() -> DeltaSharp.DataFrame!
 DeltaSharp.RuntimeConfig
 DeltaSharp.RuntimeConfig.Contains(string! key) -> bool
 DeltaSharp.RuntimeConfig.Get(string! key) -> string!
