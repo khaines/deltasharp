@@ -23,7 +23,10 @@ namespace `DeltaSharp`:
   internal logical expression IR. It exposes only alias builders (`As`/`Alias`/`Name`) and a
   diagnostic `ToString`; the wrapped IR is **never** exposed publicly.
 - **`Functions`** (`src/DeltaSharp.Core/Functions.cs`) — the static entry points `Col`/`Column`
-  (references) and `Lit` (literals) that construct a `Column`.
+  (references) and `Lit` (literals) that construct a `Column`. The **common functions registry**
+  (`count`/`sum`/`avg`/`min`/`max`, `when`, `coalesce`, string/date helpers) also lives on
+  `Functions`, delivered by STORY-04.3.3 (#166) and documented in
+  [functions-registry.md](functions-registry.md).
 
 It is **not** the expression IR itself (that is `DeltaSharp.Plans.Expressions`, all `internal`,
 delivered by #168), and it is **not** evaluation, analysis, or schema binding. Building a `Column`
