@@ -85,7 +85,11 @@ public class ColumnTests
 
         var alias = Assert.IsType<Alias>(aliased.Expr);
         Assert.False(alias.Resolved); // unresolved child keeps the alias unresolved
-        Assert.Same(aliased.Expr, aliased.Expr); // immutable, no re-computation work
+        Assert.Equal("s", alias.Name); // the alias name is preserved on the node
+
+        // The alias wraps and preserves the original child expression untouched.
+        var child = Assert.IsType<UnresolvedAttribute>(alias.Child);
+        Assert.Equal("salary", child.Name);
     }
 
     [Fact]

@@ -78,8 +78,9 @@ public static class Functions
     /// <item><term><see cref="byte"/><c>[]</c></term><description><see cref="BinaryType"/></description></item>
     /// <item><term><see cref="decimal"/></term><description><see cref="DecimalType"/> (precision/scale from the value)</description></item>
     /// <item><term><see cref="DateOnly"/></term><description><see cref="DateType"/></description></item>
-    /// <item><term><see cref="DateTime"/></term><description><see cref="DateType"/> — date component (see note below)</description></item>
+    /// <item><term><see cref="DateTime"/></term><description><see cref="TimestampType"/> — full instant, see note below</description></item>
     /// <item><term><see cref="DateTimeOffset"/></term><description><see cref="TimestampType"/></description></item>
+    /// <item><term><see cref="DeltaSharp.Column"/></term><description>returned unchanged (Spark <c>lit(col)</c> idempotence)</description></item>
     /// <item><term><see langword="null"/></term><description><see cref="NullType"/></description></item>
     /// </list>
     /// <para>
@@ -90,9 +91,20 @@ public static class Functions
     /// <see cref="sbyte"/> to get a <see cref="ByteType"/> literal.
     /// </para>
     /// <para>
-    /// <b>DateTime note.</b> A <see cref="DateTime"/> maps to <see cref="DateType"/> using its date
-    /// component; the time-of-day is not represented by <see cref="DateType"/>. Pass a
-    /// <see cref="DateTimeOffset"/> for a <see cref="TimestampType"/> literal.
+    /// <b>DateTime note.</b> A <see cref="DateTime"/> maps to <see cref="TimestampType"/> (an
+    /// epoch-microsecond instant), preserving its time-of-day — matching Spark's <c>lit</c>, where a
+    /// Python <c>datetime.datetime</c> (the analogue of .NET <see cref="DateTime"/>) becomes a
+    /// timestamp. The <see cref="DateTime.Kind"/> is honored deterministically:
+    /// <see cref="DateTimeKind.Utc"/> is used directly; <see cref="DateTimeKind.Local"/> is converted
+    /// via <see cref="DateTime.ToUniversalTime"/> (machine-time-zone dependent, inherent to a local
+    /// value); and <see cref="DateTimeKind.Unspecified"/> is treated as <b>UTC</b> (the deterministic
+    /// choice — it avoids any machine-time-zone dependence for the common naive value). Pass a
+    /// <see cref="DateOnly"/> for a date-only (<see cref="DateType"/>) literal.
+    /// </para>
+    /// <para>
+    /// <b>Idempotence note.</b> Passing an existing <see cref="DeltaSharp.Column"/> returns it
+    /// unchanged, mirroring Spark's <c>lit(col)</c>, so generic <c>object?</c> code paths can call
+    /// <c>Lit</c> uniformly on values and columns alike.
     /// </para>
     /// </remarks>
     /// <param name="value">The literal value, or <see langword="null"/> for a typed SQL <c>NULL</c>.</param>
@@ -103,6 +115,11 @@ public static class Functions
     /// </exception>
     public static Column Lit(object? value)
     {
+        if (value is Column column)
+        {
+            return column;
+        }
+
         Literal literal = value switch
         {
             null => Literal.Null(NullType.Instance),
@@ -118,12 +135,12 @@ public static class Functions
             byte[] bytes => Literal.OfBinary(bytes),
             decimal dec => DecimalLiteral(dec),
             DateOnly date => DateLiteral(date),
-            DateTime dt => DateLiteral(DateOnly.FromDateTime(dt)),
+            DateTime dt => TimestampLiteral(dt),
             DateTimeOffset dto => TimestampLiteral(dto),
             _ => throw new ArgumentException(
                 $"Cannot create a literal from an unsupported .NET type '{value.GetType()}'. "
                 + "Supported types are bool, sbyte, byte, short, int, long, float, double, string, "
-                + "byte[], decimal, DateOnly, DateTime, DateTimeOffset, and null.",
+                + "byte[], decimal, DateOnly, DateTime, DateTimeOffset, Column, and null.",
                 nameof(value)),
         };
 
@@ -134,7 +151,25 @@ public static class Functions
         Literal.OfDate(date.DayNumber - UnixEpochDate.DayNumber);
 
     private static Literal TimestampLiteral(DateTimeOffset value) =>
-        Literal.OfTimestamp((value - DateTimeOffset.UnixEpoch).Ticks / TimeSpan.TicksPerMicrosecond);
+        Literal.OfTimestamp(ToEpochMicros(value));
+
+    private static Literal TimestampLiteral(DateTime value)
+    {
+        // Normalize to a UTC instant, then reuse the same epoch-micros path as DateTimeOffset.
+        // Kind is honored deterministically: Local converts via the machine time zone; Utc and
+        // Unspecified are both taken as UTC (Unspecified is treated as UTC by deliberate choice so
+        // the common naive value never depends on the machine time zone).
+        DateTimeOffset instant = value.Kind == DateTimeKind.Local
+            ? new DateTimeOffset(value.ToUniversalTime().Ticks, TimeSpan.Zero)
+            : new DateTimeOffset(value.Ticks, TimeSpan.Zero);
+
+        return Literal.OfTimestamp(ToEpochMicros(instant));
+    }
+
+    // Microseconds since the Unix epoch, truncated toward zero (integer division). Sub-microsecond
+    // ticks are dropped; for pre-1970 instants the negative tick count truncates toward zero too.
+    private static long ToEpochMicros(DateTimeOffset value) =>
+        (value - DateTimeOffset.UnixEpoch).Ticks / TimeSpan.TicksPerMicrosecond;
 
     private static Literal DecimalLiteral(decimal value)
     {
