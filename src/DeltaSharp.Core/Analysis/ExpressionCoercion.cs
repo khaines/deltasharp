@@ -51,13 +51,13 @@ internal static class ExpressionCoercion
         if (coercion is not { } c)
         {
             throw AnalysisException.DataTypeMismatch(
-                arithmetic.SimpleString,
+                CoercionHelpers.PrettyReference(arithmetic),
                 $"the '{arithmetic.NodeName}' operator requires numeric operands but got "
                 + $"'{leftType.SimpleString}' and '{rightType.SimpleString}'.");
         }
 
-        Expression left = CoerceTo(arithmetic.Left, c.LeftTarget);
-        Expression right = CoerceTo(arithmetic.Right, c.RightTarget);
+        Expression left = CoercionHelpers.CastIfNeeded(arithmetic.Left, c.LeftTarget);
+        Expression right = CoercionHelpers.CastIfNeeded(arithmetic.Right, c.RightTarget);
         return ReferenceEquals(left, arithmetic.Left) && ReferenceEquals(right, arithmetic.Right)
             ? arithmetic
             : new BinaryArithmetic(left, right, arithmetic.Operator);
@@ -74,13 +74,13 @@ internal static class ExpressionCoercion
         if (common is null)
         {
             throw AnalysisException.DataTypeMismatch(
-                comparison.SimpleString,
+                CoercionHelpers.PrettyReference(comparison),
                 $"the '{comparison.NodeName}' operator requires comparable operand types but got "
                 + $"'{leftType.SimpleString}' and '{rightType.SimpleString}'.");
         }
 
-        Expression left = CoerceTo(comparison.Left, common);
-        Expression right = CoerceTo(comparison.Right, common);
+        Expression left = CoercionHelpers.CastIfNeeded(comparison.Left, common);
+        Expression right = CoercionHelpers.CastIfNeeded(comparison.Right, common);
         return ReferenceEquals(left, comparison.Left) && ReferenceEquals(right, comparison.Right)
             ? comparison
             : new BinaryComparison(left, right, comparison.Operator);
@@ -125,12 +125,12 @@ internal static class ExpressionCoercion
         foreach ((Expression condition, Expression value) in caseWhen.Branches)
         {
             rebuilt[i++] = RequireBoolean(condition, "CASE WHEN condition");
-            rebuilt[i++] = CoerceTo(value, common);
+            rebuilt[i++] = CoercionHelpers.CastIfNeeded(value, common);
         }
 
         if (caseWhen.ElseValue is { } trailingElse)
         {
-            rebuilt[i] = CoerceTo(trailingElse, common);
+            rebuilt[i] = CoercionHelpers.CastIfNeeded(trailingElse, common);
         }
 
         return caseWhen.WithNewChildren(rebuilt);
@@ -175,11 +175,8 @@ internal static class ExpressionCoercion
         };
     }
 
-    /// <summary>Wraps <paramref name="operand"/> in a <see cref="Cast"/> to <paramref name="target"/>
-    /// unless it already has that type (structural sharing on a no-op coercion).</summary>
-    private static Expression CoerceTo(Expression operand, DataType target) =>
-        operand.Type is { } t && t.Equals(target) ? operand : new Cast(operand, target);
-
+    /// <summary>Returns <paramref name="original"/> when a rebuilt boolean node is structurally equal
+    /// to it (structural sharing so the transform stays idempotent), else the rebuilt node.</summary>
     private static Expression PreserveIfUnchanged(this Expression rebuilt, Expression original) =>
         rebuilt.Equals(original) ? original : rebuilt;
 }

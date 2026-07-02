@@ -21,7 +21,7 @@
 This is the analyzer's **binding + type-coercion** sub-pass. It runs **inside**
 `ResolveReferences`, immediately after attribute names are bound and before output derivation
 (`Analyzer.ResolveReferences`, `src/DeltaSharp.Core/Analysis/Analyzer.cs`, the second
-`MapExpressions` at lines 124–125). It does exactly three things:
+`MapExpressions` at lines 126–127). It does exactly four user-observable things:
 
 1. **Function binding (AC1)** — replace each `UnresolvedFunction` with a typed `ResolvedFunction`,
    classified **scalar** or **aggregate**, with a concrete ADR-0008 result type and nullability
@@ -30,10 +30,13 @@ This is the analyzer's **binding + type-coercion** sub-pass. It runs **inside**
    nodes, and the arguments of functions, to Spark-compatible common types, inserting `Cast` nodes
    for implicit widenings (`ExpressionCoercion`, `FunctionRegistry`, `ArithmeticResultType`).
 3. **Type validation (AC3/AC4)** — reject type-invalid operand combinations, non-boolean
-   `Filter`/`Join` conditions, misplaced aggregates, and any resolved-but-untyped expression, with a
-   precise `AnalysisException`. Operand/argument mismatches are rejected **eagerly** during the
+   `Filter`/`Join` conditions, misplaced/nested aggregates, and any resolved-but-untyped expression,
+   with a precise `AnalysisException`. Operand/argument mismatches are rejected **eagerly** during the
    coercion pass; the plan-scoped rules (condition-is-boolean, aggregate context, the null-typed
    guard) are enforced in the `CheckAnalysis` post-condition walk.
+4. **Auto-naming (Spark parity)** — a **bare** function in output position (no alias) is exposed under
+   its Spark pretty SQL name, e.g. `groupBy("dept").agg(sum("salary"))` yields a `sum(salary)` column.
+   This runs in output derivation (`ToAttribute`), on the already-typed `ResolvedFunction` (§4.1).
 
 It is **not** physical planning, optimization, constant folding, or execution. Every failure is a
 single `AnalysisException` thrown before any backend exists (AC4). All new types are `internal`
@@ -112,7 +115,7 @@ mis-bind.
 
 `ExpressionCoercion.Coerce` (`src/DeltaSharp.Core/Analysis/ExpressionCoercion.cs`) is applied
 **bottom-up** via `expression.TransformUp(ExpressionCoercion.Coerce)` inside `ResolveReferences`
-(Analyzer.cs:124–125). Because it is bottom-up, a node's operands are already bound, coerced, and
+(Analyzer.cs:126–127). Because it is bottom-up, a node's operands are already bound, coerced, and
 typed when the node itself is visited, so operand types are always known. `Coerce` dispatches:
 
 | Node | Rule |
@@ -185,12 +188,36 @@ deterministic message naming the function/operator, the supplied types, and the 
 | --- | --- | --- |
 | `UnresolvedFunction` | unknown function name | `Undefined function: 'no_such_fn'. The function is neither a registered scalar nor an aggregate function in the M1 registry (supplied argument types: [int]).` |
 | `InvalidFunctionArgument` | wrong arity or uncoercible argument | `Cannot resolve function 'upper(string, string)': upper requires exactly one argument but got 2.` |
-| `DataTypeMismatch` | operator/comparison/boolean/CaseWhen operand type mismatch, or non-boolean condition | `cannot resolve 'Add(b, i)' due to data type mismatch: the 'Add' operator requires numeric operands but got 'boolean' and 'int'.` |
+| `DataTypeMismatch` | operator/comparison/boolean/CaseWhen operand type mismatch, or non-boolean condition | `cannot resolve '(b + i)' due to data type mismatch: the 'Add' operator requires numeric operands but got 'boolean' and 'int'.` |
 | `MisplacedAggregate` | aggregate outside a valid aggregate context | `Aggregate function 'sum' is not allowed in operator 'Project': aggregate functions are only permitted in the aggregate expressions of a grouped aggregation (groupBy(...).agg(...)).` |
 | `UntypedResolvedExpression` | a resolved expression left without a result type | `Resolved expression '…' in operator 'Project' has no result type after type coercion (STORY-04.5.2 / #171); an untyped resolved expression must not reach physical planning.` |
 
 The messages are pure functions of the inputs (no clocks, RNG, or ambient state), so they are
 deterministic and assertable (the tests assert `Kind`, `Reference`, and message substrings).
+
+### 4.1 The pretty (ExprId-free) reference renderer
+
+`DataTypeMismatch` names the offending reference through `CoercionHelpers.PrettyReference`
+(`src/DeltaSharp.Core/Analysis/CoercionHelpers.cs`), Spark's `usePrettyExpression` form: an
+`AttributeReference` contributes its **bare** `Name` (never the internal `name#ExprId`), an implicit
+coercion `Cast` is transparent (its child's pretty form), binary arithmetic/comparison render as the
+infix `(left op right)`, and a `ResolvedFunction` renders as `name(DISTINCT? args)`. So the operand
+mismatch above reads `(b + i)` — not the raw `(b#7 + i#8)` — and a non-boolean `Filter`/`Join`
+condition reads `i`, not `i#8`. This is the **same** renderer that produces the function auto-name
+(§4.2), so diagnostics and output column names never diverge and **neither leaks an ExprId**.
+(Pre-existing `UnresolvedAttribute` "cannot resolve 'name'" diagnostics have no ExprId and are
+untouched.)
+
+### 4.2 Function auto-naming (Spark parity)
+
+A **bare** function call in output position (an aggregate/scalar with no enclosing `Alias`) is exposed
+under Spark's pretty SQL name rather than rejected. `Analyzer.ToAttribute`'s `case ResolvedFunction`
+mints an output `AttributeReference` named by `SparkAutoName`, which delegates to
+`CoercionHelpers.PrettyReference` (§4.1): the call renders `name(DISTINCT? args)` with unqualified
+argument names (no `#id`), implicit coercion `Cast`s unwrapped, and an uppercase `DISTINCT`
+qualifier. Examples: `sum(salary)`, `count(1)`, `avg(d)`, `count(DISTINCT v)`. Binding + coercion ran
+earlier in `ResolveReferences`, so the call is already typed here; a residual null result type is a
+coercion gap routed to `UntypedResolvedExpression` (the same null-typed guard as the `Alias` case, §5).
 
 ## 5. CheckAnalysis type-validation completeness
 
@@ -213,8 +240,12 @@ over the resolved plan, in this order:
 3. **`CheckAggregateContext` (#166).** For an `Aggregate`, aggregates are allowed **only** in
    `AggregateExpressions`, not in `GroupingExpressions`. For any **other** operator, an aggregate
    anywhere in its expressions is rejected. Detection is `FindAggregate` (finds the first
-   `ResolvedFunction` with `Kind == Aggregate`). Both produce `MisplacedAggregate`. Nested-aggregate
-   detection (an aggregate whose argument contains another aggregate) is deferred and tracked.
+   `ResolvedFunction` with `Kind == Aggregate`). Both produce `MisplacedAggregate`. **Nested
+   aggregates are now enforced:** within an `Aggregate`, each aggregate expression is walked by
+   `CheckNoNestedAggregate`, and an aggregate whose argument subtree contains another aggregate
+   (`sum(sum(x))`, `sum(count(x))`) is rejected via `AnalysisException.NestedAggregate` (reusing the
+   `MisplacedAggregate` kind, naming both the outer and nested call). A plain aggregate (`sum(x)`,
+   `count(1)`) or an aggregate combined with scalars (`sum(x)+1`) stays legal.
 
 Because operand-level mismatches throw during the earlier coercion pass, CheckAnalysis's own throws
 are the plan-scoped rules plus the defensive guard — together they make "a resolved plan is
@@ -230,15 +261,31 @@ obligation is now discharged:
 | **#165** | operator operand type-checking (reject bool-in-arithmetic, non-numeric arithmetic) | `ExpressionCoercion.CoerceArithmetic` + `ArithmeticResultType.TryResolve` → `DataTypeMismatch` |
 | **#166** (values) | `CaseWhen` branch/else values coerce to a common type | `CaseWhen.Type` + `ExpressionCoercion.CoerceCaseWhen` |
 | **#166** (conditions) | `CaseWhen` branch conditions must be boolean | `ExpressionCoercion.RequireBoolean` in `CoerceCaseWhen` |
-| **#166** (classification) | aggregate vs scalar classification by canonical name; aggregate-context validation | `FunctionRegistry` (`FunctionKind`) + `CheckAggregateContext` |
+| **#166** (classification) | aggregate vs scalar classification by canonical name; aggregate-context validation incl. nested-aggregate rejection | `FunctionRegistry` (`FunctionKind`) + `CheckAggregateContext` / `CheckNoNestedAggregate` |
 | **#160** | `Filter`/`Where`/join conditions must be boolean | `CheckConditionIsBoolean` → `DataTypeMismatch` |
 | null-typed-resolved guard | a resolved arithmetic/CaseWhen must get a concrete result Type; a null-typed resolved expr is rejected | node-derived `Type` (concrete after coercion) + `CheckResultTypes` / `ToAttribute` guard |
 | alias-over-arithmetic | an alias over arithmetic can derive its output type | node-derived `BinaryArithmetic.Type`, computed before `DeriveOutput` |
 
+With nested-aggregate rejection landed, **#166 is fully discharged** (values, conditions,
+classification, aggregate-context placement, and nesting).
+
 **Still deferred (tracked, narrowed):** full Spark cross-family comparison casts (§3.3); the full
-Spark function catalog and coercion tables (§2.3); nested-aggregate detection (§5); format-string
-function overloads. Each is narrowed to a loud failure (unknown function / incomparable types) rather
+Spark function catalog and coercion tables (§2.3); format-string function overloads. Newly-filed
+follow-ups for the Spark-parity gaps this pass narrows to loud failures:
+
+| Issue | Deferred parity gap |
+| --- | --- |
+| [#407](https://github.com/khaines/deltasharp/issues/407) | null-type coercion parity: `NULL+NULL` arithmetic → typed-null double, and a `NULL` `Filter`/`Join` condition → coerce to boolean (both currently rejected loud). |
+| [#408](https://github.com/khaines/deltasharp/issues/408) | auto-name pretty-printer parity: string-literal args are currently quoted, and explicit **user** casts are unwrapped like implicit ones (needs a `USER_SPECIFIED_CAST` provenance marker to tell them apart). |
+| [#409](https://github.com/khaines/deltasharp/issues/409) | HAVING / ORDER-BY-over-aggregate: a direct aggregate in a `Filter`/`Sort` above an `Aggregate` is currently rejected as `MisplacedAggregate`. |
+
+Each is narrowed to a loud failure (unknown function / incomparable types / rejected aggregate) rather
 than a silent wrong result, so nothing mis-binds while deferred.
+
+> **Design note (not tracked as an issue).** `CaseWhen.Type` and `BinaryArithmetic.Type` recompute
+> their result type on each access from their (immutable) children rather than caching it. This is an
+> intentional immutable-design choice — the derivation is a pure function of the children and is
+> negligible at analysis time — not a deferred optimization.
 
 ## 7. AC → test mapping
 
@@ -258,6 +305,12 @@ updated `AnalyzerTests` and `ExpressionTypeModelTests`).
 | AC3 / #160 | non-boolean `Filter` condition rejected; boolean accepted | `Resolve_NonBooleanFilterCondition_*`, `Resolve_BooleanFilterCondition_IsAccepted` |
 | AC3 / #166 | `CaseWhen` non-boolean condition + incompatible branches rejected; compatible derive common type | `Resolve_CaseWhen_NonBooleanCondition_*`, `Resolve_CaseWhen_IncompatibleBranchValues_*`, `Resolve_CaseWhen_CompatibleBranches_*` |
 | AC4 / #166 | aggregate outside agg context rejected; in agg list accepted | `Resolve_AggregateInProjection_*`, `Resolve_AggregateInGroupingKey_*`, `Resolve_AggregateInAggregateExpressions_*` |
+| AC4 / #166 | nested aggregate rejected; plain aggregate + scalar accepted | `Resolve_NestedAggregate_IsRejected`, `Resolve_PlainAggregateWithScalarArithmetic_IsAccepted` |
+| AC2 | scalar function binds over a resolved column | `Resolve_BindsScalarFunctionOverColumn` |
+| auto-name | bare aggregate/scalar exposed under its Spark pretty name; DISTINCT uppercased | `Resolve_BareAggregate_AutoNamesOutputColumn_SparkParity`, `Resolve_BareAggregates_AutoNameCountAvgAndAlias`, `Resolve_DistinctAggregate_AutoNamesWithUppercaseDistinct`, `DataFrameAggregationTests.Analyzer_RealAggregateFunction_ResolvesToAutoNamedOutput` |
+| diagnostics | mismatch reference is pretty/infix with no leaked ExprId | `Resolve_ArithmeticMismatch_DiagnosticReference_HasNoExprIdAndIsInfix` |
+| AC2 | non-decimal `/` yields Double with both operands cast; comparison widening | `Resolve_DivideNonDecimal_YieldsDouble_WithBothOperandsCast`, `Resolve_CrossNumericComparison_InsertsWideningCast` |
+| AC3 | non-boolean `Join` condition rejected; uncomparable comparison rejected | `Resolve_NonBooleanJoinCondition_ThrowsDataTypeMismatch`, `Resolve_UncomparableComparison_ThrowsDataTypeMismatch` |
 | null-typed guard | resolved-but-untyped rejected by CheckAnalysis | `CheckAnalysis_ResolvedButUntypedExpression_IsRejected` |
 
 **Non-vacuity.** The coercion assertions check inserted `Cast` nodes and derived result types, so
@@ -274,8 +327,9 @@ CheckAnalysis rule reddens the corresponding rejection test.
 | `src/DeltaSharp.Core/Plans/Expressions/ArithmeticResultType.cs` | shared arithmetic coercion/result-type helper |
 | `src/DeltaSharp.Core/Analysis/FunctionRegistry.cs` | M1 function binding + result-type rules + diagnostics |
 | `src/DeltaSharp.Core/Analysis/ExpressionCoercion.cs` | bottom-up operand/argument coercion + operand validation |
-| `src/DeltaSharp.Core/Analysis/AnalysisException.cs` | new error kinds + factories |
-| `src/DeltaSharp.Core/Analysis/Analyzer.cs` | coercion pass wiring + CheckAnalysis type validation |
+| `src/DeltaSharp.Core/Analysis/CoercionHelpers.cs` | shared `CastIfNeeded` widening + ExprId-free `PrettyReference` renderer (auto-name + diagnostics) |
+| `src/DeltaSharp.Core/Analysis/AnalysisException.cs` | new error kinds + factories (incl. `NestedAggregate`) |
+| `src/DeltaSharp.Core/Analysis/Analyzer.cs` | coercion pass wiring + CheckAnalysis type validation (nested-aggregate + condition/aggregate rules) + `ToAttribute` function auto-naming |
 | `src/DeltaSharp.Core/Plans/Expressions/BinaryOperatorExpressions.cs` | `BinaryArithmetic.Type` derived from children |
 | `src/DeltaSharp.Core/Plans/Expressions/CaseWhen.cs` | `CaseWhen.Type` derived from children |
 | `tests/DeltaSharp.Core.Tests/Analysis/FunctionBindingCoercionTests.cs` | binding/coercion/validation tests |

@@ -466,6 +466,206 @@ public class FunctionBindingCoercionTests
         Assert.IsType<LongType>(projectedSum.Type);   // integral sum accumulates in bigint
     }
 
+    // ---- A1 (#166): nested aggregates are rejected ----
+
+    [Theory]
+    [InlineData("sum")]    // sum(sum(l)) — aggregate directly inside another aggregate's argument
+    [InlineData("count")]  // sum(count(l)) — a different nested aggregate
+    public void Resolve_NestedAggregate_IsRejected(string innerName)
+    {
+        // Spark rejects one aggregate nested inside another aggregate's argument subtree. A plain
+        // aggregate (sum(l), count(1)) stays legal — only an aggregate ARGUMENT that itself contains
+        // an aggregate is the nesting error this closes for #166.
+        var analyzer = NumbersAnalyzer();
+        var aggregate = new Aggregate(
+            groupingExpressions: new Expression[] { Col("i") },
+            aggregateExpressions: new[] { new Alias(Fn("sum", Fn(innerName, Col("l"))), "x") },
+            Relation("nums"));
+
+        var ex = Assert.Throws<AnalysisException>(() => analyzer.Resolve(aggregate));
+
+        Assert.Equal(AnalysisErrorKind.MisplacedAggregate, ex.Kind);
+        Assert.Contains("nested", ex.Message);
+        Assert.Contains("aggregate", ex.Message);
+        Assert.Contains(innerName, ex.Message);   // names the offending nested aggregate
+    }
+
+    [Fact]
+    public void Resolve_PlainAggregateWithScalarArithmetic_IsAccepted()
+    {
+        // Guard the accept side of A1: a plain aggregate combined with a scalar (sum(x)+1) is NOT a
+        // nested aggregate and must still pass — only aggregate-inside-aggregate is rejected.
+        var analyzer = NumbersAnalyzer();
+        var aggregate = new Aggregate(
+            groupingExpressions: new Expression[] { Col("i") },
+            aggregateExpressions: new[]
+            {
+                new Alias(new BinaryArithmetic(Fn("sum", Col("l")), Literal.OfLong(1), ArithmeticOperator.Add), "x"),
+            },
+            Relation("nums"));
+
+        var resolved = Assert.IsType<Aggregate>(analyzer.Resolve(aggregate));
+
+        Assert.True(resolved.Resolved);
+    }
+
+    // ---- A2: diagnostics render the pretty (ExprId-free) reference ----
+
+    [Fact]
+    public void Resolve_ArithmeticMismatch_DiagnosticReference_HasNoExprIdAndIsInfix()
+    {
+        // The DataTypeMismatch 'reference' must use Spark's pretty SQL form — the infix `(b + i)`
+        // with BARE attribute names — never the internal `(b#7 + i#8)` with ExprIds.
+        var analyzer = NumbersAnalyzer();
+        var project = new Project(
+            new[] { new Alias(new BinaryArithmetic(Col("b"), Col("i"), ArithmeticOperator.Add), "r") },
+            Relation("nums"));
+
+        var ex = Assert.Throws<AnalysisException>(() => analyzer.Resolve(project));
+
+        Assert.Equal(AnalysisErrorKind.DataTypeMismatch, ex.Kind);
+        Assert.DoesNotContain("#", ex.Message);          // no leaked ExprId anywhere in the message
+        Assert.Contains("(b + i)", ex.Message);          // infix pretty form, bare names
+        Assert.DoesNotContain("#", ex.Reference!);
+    }
+
+    // ---- A3: DISTINCT is uppercased in the auto-name ----
+
+    [Fact]
+    public void Resolve_DistinctAggregate_AutoNamesWithUppercaseDistinct()
+    {
+        // Spark's pretty SQL uppercases the DISTINCT qualifier: count(DISTINCT l), not count(distinct l).
+        var analyzer = NumbersAnalyzer();
+        var distinctCount = new UnresolvedFunction("count", new Expression[] { Col("l") }, isDistinct: true);
+        var aggregate = new Aggregate(
+            groupingExpressions: new Expression[] { Col("i") },
+            aggregateExpressions: new Expression[] { Col("i"), distinctCount },
+            Relation("nums"));
+        var project = new Project(
+            new Expression[] { Col("i"), Col("count(DISTINCT l)") }, aggregate);
+
+        var resolved = Assert.IsType<Project>(analyzer.Resolve(project));
+
+        var projected = Assert.IsType<AttributeReference>(resolved.ProjectList[1]);
+        Assert.Equal("count(DISTINCT l)", projected.Name);   // uppercase DISTINCT, no `#id`
+    }
+
+    // ---- B1: non-decimal Divide yields Double with both operands cast to Double ----
+
+    [Theory]
+    [InlineData("i")]   // int / int
+    [InlineData("l")]   // int / long
+    public void Resolve_DivideNonDecimal_YieldsDouble_WithBothOperandsCast(string rightColumn)
+    {
+        var analyzer = NumbersAnalyzer();
+        var project = new Project(
+            new[]
+            {
+                new Alias(
+                    new BinaryArithmetic(Col("i"), Col(rightColumn), ArithmeticOperator.Divide), "r"),
+            },
+            Relation("nums"));
+
+        var resolved = Assert.IsType<Project>(analyzer.Resolve(project));
+        var alias = Assert.IsType<Alias>(resolved.ProjectList[0]);
+        var divide = Assert.IsType<BinaryArithmetic>(alias.Child);
+
+        Assert.Equal(DoubleType.Instance, divide.Type);
+        var leftCast = Assert.IsType<Cast>(divide.Left);
+        Assert.Equal(DoubleType.Instance, leftCast.TargetType);
+        var rightCast = Assert.IsType<Cast>(divide.Right);
+        Assert.Equal(DoubleType.Instance, rightCast.TargetType);
+    }
+
+    // ---- B2: a non-boolean Join condition is a DataTypeMismatch ----
+
+    [Fact]
+    public void Resolve_NonBooleanJoinCondition_ThrowsDataTypeMismatch()
+    {
+        var catalog = new LocalCatalog();
+        catalog.Register("l", new StructType(new[] { new StructField("lid", LongType.Instance) }));
+        catalog.Register("r", new StructType(new[] { new StructField("rid", LongType.Instance) }));
+        var analyzer = new Analyzer(catalog);
+        var join = new Join(Relation("l"), Relation("r"), JoinType.Inner, condition: Col("lid"));
+
+        var ex = Assert.Throws<AnalysisException>(() => analyzer.Resolve(join));
+
+        Assert.Equal(AnalysisErrorKind.DataTypeMismatch, ex.Kind);
+        Assert.Contains("Join", ex.Message);
+        Assert.Contains("boolean", ex.Message);
+    }
+
+    // ---- B3: bare/aliased aggregate auto-name coverage beyond sum(...) ----
+
+    [Fact]
+    public void Resolve_BareAggregates_AutoNameCountAvgAndAlias()
+    {
+        // Pins output column names for count(1) → count(1), avg(d) → avg(d), and an aliased
+        // sum(i).As("total") → total, beyond the single sum(...) case previously covered.
+        var analyzer = NumbersAnalyzer();
+        var aggregate = new Aggregate(
+            groupingExpressions: new Expression[] { Col("i") },
+            aggregateExpressions: new Expression[]
+            {
+                Col("i"),
+                Fn("count", Literal.OfInt(1)),
+                Fn("avg", Col("d")),
+                new Alias(Fn("sum", Col("i")), "total"),
+            },
+            Relation("nums"));
+        var project = new Project(
+            new Expression[] { Col("count(1)"), Col("avg(d)"), Col("total") }, aggregate);
+
+        var resolved = Assert.IsType<Project>(analyzer.Resolve(project));
+
+        Assert.Equal("count(1)", Assert.IsType<AttributeReference>(resolved.ProjectList[0]).Name);
+        Assert.Equal("avg(d)", Assert.IsType<AttributeReference>(resolved.ProjectList[1]).Name);
+        Assert.Equal("total", Assert.IsType<AttributeReference>(resolved.ProjectList[2]).Name);
+    }
+
+    // ---- B4: BinaryComparison widening + reject ----
+
+    [Fact]
+    public void Resolve_CrossNumericComparison_InsertsWideningCast()
+    {
+        // A comparison over int vs long widens the int operand to long via an inserted Cast (the
+        // long operand is untouched); the comparison itself is boolean-typed.
+        var analyzer = NumbersAnalyzer();
+        var project = new Project(
+            new[]
+            {
+                new Alias(new BinaryComparison(Col("i"), Col("l"), ComparisonOperator.Equal), "r"),
+            },
+            Relation("nums"));
+
+        var resolved = Assert.IsType<Project>(analyzer.Resolve(project));
+        var alias = Assert.IsType<Alias>(resolved.ProjectList[0]);
+        var comparison = Assert.IsType<BinaryComparison>(alias.Child);
+
+        var leftCast = Assert.IsType<Cast>(comparison.Left);
+        Assert.Equal(LongType.Instance, leftCast.TargetType);
+        Assert.IsType<AttributeReference>(comparison.Right);
+    }
+
+    [Fact]
+    public void Resolve_UncomparableComparison_ThrowsDataTypeMismatch()
+    {
+        // string vs int has no common comparable type in M1 (string↔numeric casts deferred), so the
+        // comparison is rejected with a DataTypeMismatch rather than silently mis-comparing.
+        var analyzer = NumbersAnalyzer();
+        var project = new Project(
+            new[]
+            {
+                new Alias(new BinaryComparison(Col("s"), Col("i"), ComparisonOperator.Equal), "r"),
+            },
+            Relation("nums"));
+
+        var ex = Assert.Throws<AnalysisException>(() => analyzer.Resolve(project));
+
+        Assert.Equal(AnalysisErrorKind.DataTypeMismatch, ex.Kind);
+        Assert.Contains("comparable", ex.Message);
+    }
+
     // ---- null-typed-resolved guard (defense-in-depth over the coercion pass) ----
 
     [Fact]

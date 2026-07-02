@@ -269,6 +269,22 @@ internal sealed class AnalysisException : Exception
             Array.Empty<string>());
     }
 
+    /// <summary>Builds an <see cref="AnalysisErrorKind.MisplacedAggregate"/> failure for a nested
+    /// aggregate — an aggregate function whose argument subtree contains another aggregate (e.g.
+    /// <c>sum(sum(x))</c>). Reuses the misplaced-aggregate kind (nesting is a placement error) but
+    /// names both the outer and the nested aggregate so the diagnostic is actionable (#166).</summary>
+    public static AnalysisException NestedAggregate(string outerName, string nestedName)
+    {
+        ArgumentNullException.ThrowIfNull(outerName);
+        ArgumentNullException.ThrowIfNull(nestedName);
+        return new AnalysisException(
+            $"Aggregate function '{outerName}' contains a nested aggregate '{nestedName}': aggregate "
+            + "functions cannot be nested inside the arguments of another aggregate.",
+            AnalysisErrorKind.MisplacedAggregate,
+            nestedName,
+            Array.Empty<string>());
+    }
+
     /// <summary>Builds an <see cref="AnalysisErrorKind.UntypedResolvedExpression"/> failure for a
     /// resolved expression the coercion pass left without a concrete result type.</summary>
     public static AnalysisException UntypedResolvedExpression(string reference, string ownerNodeName)

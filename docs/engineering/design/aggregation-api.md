@@ -204,10 +204,12 @@ aggregate outside an aggregate context, or a type-incompatible aggregate argumen
   `CheckAnalysis`. ("Nothing is read/executed" on this path is proven separately by the §7 lazy
   tests, not by the AC3 boundary test.)
 
-Aggregate function resolution, aggregate input type-validation, and Spark auto-naming land with
-STORY-04.5.2 ([#171](https://github.com/khaines/deltasharp/issues/171)). Until then the API surface is
-complete and lazy, and the analyzer boundary is explicit. A **complex grouping key** (a non-attribute
-expression retained at the front of the aggregate output, e.g. `GroupBy(Col("a").Plus(Col("b")))`)
+Aggregate function resolution, aggregate input type-validation, and Spark auto-naming **are delivered**
+by STORY-04.5.2 ([#171](https://github.com/khaines/deltasharp/issues/171)): a bare aggregate now binds,
+type-validates, and is auto-named under its Spark pretty SQL string (e.g. `sum(salary)`) — see
+[function-binding-coercion.md §4.2](function-binding-coercion.md). The API surface stays lazy and the
+analyzer boundary is explicit. A **complex grouping key** (a non-attribute expression retained at the
+front of the aggregate output, e.g. `GroupBy(Col("a").Plus(Col("b")))`)
 hits the same output-derivation gate today and is likewise deferred to #171 for naming/aliasing —
 pinned by `Analyzer_ComplexGroupingKey_ThrowsDeterministically_TrackedUnder171`.
 

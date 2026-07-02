@@ -288,7 +288,7 @@ internal sealed class Analyzer
         {
             string actual = condition.Type?.SimpleString ?? "unknown";
             throw AnalysisException.DataTypeMismatch(
-                condition.SimpleString,
+                CoercionHelpers.PrettyReference(condition),
                 $"the condition of a '{ownerNodeName}' must be boolean but is '{actual}'.");
         }
     }
@@ -311,6 +311,14 @@ internal sealed class Analyzer
                 }
             }
 
+            // A plain aggregate (sum(x), count(1)) is legal here, but an aggregate whose ARGUMENT
+            // subtree contains another aggregate (sum(sum(x)), sum(count(x))) is not — Spark rejects
+            // nesting one aggregate inside another. Validate each aggregate expression's subtree.
+            foreach (Expression expression in aggregate.AggregateExpressions)
+            {
+                CheckNoNestedAggregate(expression);
+            }
+
             return;
         }
 
@@ -320,6 +328,30 @@ internal sealed class Analyzer
             {
                 throw AnalysisException.MisplacedAggregate(misplaced.Name, plan.NodeName);
             }
+        }
+    }
+
+    /// <summary>Walks an aggregate expression subtree and rejects a nested aggregate — an aggregate
+    /// <see cref="ResolvedFunction"/> whose own argument subtree contains another aggregate (e.g.
+    /// <c>sum(sum(x))</c>, <c>sum(count(x))</c>). A plain aggregate (<c>sum(x)</c>, <c>count(1)</c>)
+    /// or an aggregate combined with scalars (<c>sum(x)+1</c>) is left untouched; only an aggregate
+    /// argument that itself contains an aggregate is a nesting error (Spark parity, #166).</summary>
+    private static void CheckNoNestedAggregate(Expression expression)
+    {
+        if (expression is ResolvedFunction { Kind: FunctionKind.Aggregate } aggregate)
+        {
+            foreach (Expression argument in aggregate.Arguments)
+            {
+                if (FindAggregate(argument) is { } nested)
+                {
+                    throw AnalysisException.NestedAggregate(aggregate.Name, nested.Name);
+                }
+            }
+        }
+
+        foreach (Expression child in expression.Children)
+        {
+            CheckNoNestedAggregate(child);
         }
     }
 
@@ -561,25 +593,14 @@ internal sealed class Analyzer
 
     /// <summary>The Spark auto-name for a bare function call in output position: the pretty SQL
     /// string <c>name(arg, …)</c> built from unqualified argument names (no <c>#id</c> ExprId
-    /// suffix), e.g. <c>sum(salary)</c>, <c>count(1)</c>, <c>avg(x)</c>. Implicit coercion
-    /// <see cref="Cast"/>s the binder inserted are unwrapped so they do not pollute the name, mirroring
-    /// Spark's <c>usePrettyExpression</c>.</summary>
-    private static string SparkAutoName(ResolvedFunction function)
-    {
-        string distinct = function.IsDistinct ? "distinct " : string.Empty;
-        string args = string.Join(", ", function.Arguments.Select(PrettyArgumentName));
-        return $"{function.Name}({distinct}{args})";
-    }
-
-    /// <summary>Renders a resolved argument for a function's auto-name: an attribute contributes its
-    /// bare name (never <c>name#id</c>), an implicit coercion cast is transparent (its child's pretty
-    /// name), and anything else (a literal, arithmetic) falls back to its <c>SimpleString</c>.</summary>
-    private static string PrettyArgumentName(Expression argument) => argument switch
-    {
-        AttributeReference attribute => attribute.Name,
-        Cast cast => PrettyArgumentName(cast.Child),
-        _ => argument.SimpleString,
-    };
+    /// suffix), e.g. <c>sum(salary)</c>, <c>count(1)</c>, <c>avg(x)</c>, <c>count(DISTINCT v)</c>.
+    /// It delegates to the shared <see cref="CoercionHelpers.PrettyReference"/> renderer, which
+    /// unwraps implicit coercion <see cref="Cast"/>s and uppercases <c>DISTINCT</c>, mirroring Spark's
+    /// <c>usePrettyExpression</c>. The same renderer names the offending reference in a
+    /// <see cref="AnalysisException.DataTypeMismatch"/> diagnostic, so auto-names and diagnostics never
+    /// diverge and neither leaks an ExprId.</summary>
+    private static string SparkAutoName(ResolvedFunction function) =>
+        CoercionHelpers.PrettyReference(function);
 
     private static IReadOnlyList<AttributeReference> ChildOutput(
         LogicalPlan child,

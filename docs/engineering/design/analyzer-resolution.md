@@ -192,7 +192,11 @@ inputs; that is deferred to follow-up **#392** (a `// TODO(#392)` marks the `Uni
 
 An element becomes an attribute via `ToAttribute`: an `AttributeReference` is itself (id preserved);
 an `Alias` becomes a fresh `AttributeReference` named for the alias, typed by the alias's forwarded
-type hint, with a newly-allocated `ExprId`. Since STORY-04.5.2 / #171 the binding + coercion sub-pass
+type hint, with a newly-allocated `ExprId`; and — since STORY-04.5.2 / #171 — a **bare**
+`ResolvedFunction` (an aggregate/scalar with no enclosing alias) becomes a fresh attribute **auto-named**
+by its Spark pretty SQL string (`SparkAutoName` → `CoercionHelpers.PrettyReference`), e.g.
+`sum(salary)`, `count(1)`, `count(DISTINCT v)` — unqualified argument names, no `#id`, implicit casts
+unwrapped. Since STORY-04.5.2 / #171 the binding + coercion sub-pass
 runs **before** output derivation, so an alias over arithmetic/`CaseWhen` now exposes a concrete
 type; a residual null-typed alias child is a coercion gap routed to
 `AnalysisErrorKind.UntypedResolvedExpression` (symmetric with the CheckAnalysis null-typed guard) —

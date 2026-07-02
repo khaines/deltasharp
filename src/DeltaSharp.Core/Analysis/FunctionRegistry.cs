@@ -203,7 +203,7 @@ internal static class FunctionRegistry
         bool allNullable = true;
         for (int i = 0; i < args.Count; i++)
         {
-            coerced[i] = CoerceTo(args[i], common);
+            coerced[i] = CoercionHelpers.CastIfNeeded(args[i], common);
             allNullable &= args[i].Nullable;
         }
 
@@ -313,11 +313,6 @@ internal static class FunctionRegistry
 
         return new Cast(arg, StringType.Instance);
     }
-
-    /// <summary>Wraps <paramref name="arg"/> in a <see cref="Cast"/> to <paramref name="target"/>
-    /// unless it already has that type (structural sharing on a no-op coercion).</summary>
-    private static Expression CoerceTo(Expression arg, DataType target) =>
-        arg.Type is { } t && t.Equals(target) ? arg : new Cast(arg, target);
 
     private static bool IsOrderable(DataType type) =>
         type is BooleanType or ByteType or ShortType or IntegerType or LongType

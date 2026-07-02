@@ -73,7 +73,9 @@ internal sealed class BinaryArithmetic : Expression
     /// <inheritdoc/>
     public override string SimpleString => $"({Left.SimpleString} {Symbol} {Right.SimpleString})";
 
-    private string Symbol => Operator switch
+    /// <summary>The infix operator glyph (e.g. <c>+</c>), used by <see cref="SimpleString"/> and the
+    /// analyzer's ExprId-free pretty renderer.</summary>
+    internal string Symbol => Operator switch
     {
         ArithmeticOperator.Add => "+",
         ArithmeticOperator.Subtract => "-",
@@ -149,7 +151,9 @@ internal sealed class BinaryComparison : Expression
     /// <inheritdoc/>
     public override string SimpleString => $"({Left.SimpleString} {Symbol} {Right.SimpleString})";
 
-    private string Symbol => Operator switch
+    /// <summary>The infix operator glyph (e.g. <c>=</c>), used by <see cref="SimpleString"/> and the
+    /// analyzer's ExprId-free pretty renderer.</summary>
+    internal string Symbol => Operator switch
     {
         ComparisonOperator.Equal => "=",
         ComparisonOperator.NotEqual => "<>",
