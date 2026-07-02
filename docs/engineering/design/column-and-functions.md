@@ -137,16 +137,21 @@ A `DateTime` may be UTC, Local, or Unspecified. `Lit` normalizes each to a UTC i
 | `Local` | `ToUniversalTime()` then epoch-micros | machine-time-zone dependent — inherent to a Local value; Spark has the same session-time-zone behavior. |
 | `Unspecified` | treated as **UTC** | the deterministic choice: a naive value never depends on the machine time zone. Documented explicitly so callers can rely on it. |
 
-#### Timestamp microsecond truncation
+#### Timestamp microsecond flooring
 
-The epoch-microsecond conversion uses integer division, which **truncates toward zero**. Two
-consequences are pinned by tests:
+The epoch-microsecond conversion **floors toward negative infinity**, matching Spark's
+`Math.floorDiv`/`instantToMicros` semantics (C# integer division truncates toward zero, so
+`ToEpochMicros` corrects negative remainders down by one). Three consequences are pinned by tests:
 
-- **Sub-microsecond ticks are dropped.** .NET `DateTime`/`DateTimeOffset` have 100-ns tick
-  resolution; the sub-microsecond remainder is discarded (e.g. epoch + 5 ticks → `0` µs).
-- **Pre-1970 instants** produce a negative epoch-micros count, also truncated toward zero
-  (e.g. one second before the epoch → `-1_000_000` µs). Truncation toward zero (not floor) means a
-  pre-1970 sub-microsecond remainder rounds toward the epoch, consistent with the post-1970 direction.
+- **Sub-microsecond ticks are dropped toward negative infinity.** .NET `DateTime`/`DateTimeOffset`
+  have 100-ns tick resolution; the sub-microsecond remainder is floored (e.g. epoch + 5 ticks →
+  `0` µs).
+- **Pre-1970 instants** produce a negative epoch-micros count (e.g. one second before the epoch →
+  `-1_000_000` µs).
+- **Pre-1970 sub-microsecond flooring is exact, not truncated toward the epoch.** A single 100-ns
+  tick before 1970 is `-1` µs (not `0`), and `-11` ticks is `-2` µs. Truncation toward zero would
+  wrongly collapse the `(-1µs, +1µs)` interval onto bucket `0`, shifting pre-epoch time forward and
+  breaking monotonic ordering across the boundary; flooring keeps DeltaSharp bit-for-bit with Spark.
 
 ### Why `Lit(object?)` and not typed overloads
 
@@ -243,6 +248,6 @@ Tests live in `tests/DeltaSharp.Core.Tests/ColumnTests.cs` and `FunctionsLitTest
 | AC | Requirement | Tests |
 | --- | --- | --- |
 | **AC1** | `Col`/`Column`/star create an **unresolved** attribute with no schema lookup (lazy; `Resolved == false`, `Type == null`) | `ColumnTests.Col_WrapsUnresolvedAttribute_WithoutSchemaLookup`, `Column_IsAliasForCol`, `Col_Star_WrapsBareUnresolvedStar`, `Col_QualifiedStar_WrapsTargetedUnresolvedStar`, `Col_NullOrEmptyName_Throws` |
-| **AC2** | `Lit(value)` for scalars incl. null/decimal/date/timestamp records an ADR-0008 `DataType` | `FunctionsLitTests.Lit_*` (one per supported type: bool, sbyte, byte-widen, short, int, long, float, double, string, empty-string, bytes, decimal, zero/large/high-scale-negative decimal, DateOnly, DateTime→Timestamp incl. Unspecified/Local Kind + pre-1970 + sub-µs truncation, DateTimeOffset, `Column` passthrough, null) |
+| **AC2** | `Lit(value)` for scalars incl. null/decimal/date/timestamp records an ADR-0008 `DataType` | `FunctionsLitTests.Lit_*` (one per supported type: bool, sbyte, byte-widen, short, int, long, float, double, string, empty-string, bytes, decimal, zero/large/high-scale-negative decimal, DateOnly, DateTime→Timestamp incl. Unspecified/Local Kind + pre-1970 + sub-µs flooring (both signs), DateTimeOffset, `Column` passthrough, null) |
 | **AC3** | An alias (`col.As("x")`) is preserved as an `Alias` node for analyzer resolution | `ColumnTests.As_WrapsExpressionInAliasPreservingChildAndName`, `Alias_And_Name_AreEquivalentToAs`, `As_PreservedInExpressionTree`, `As_NullOrEmptyAlias_Throws` |
 | **AC4** | Invalid literal .NET type → deterministic public error naming the unsupported type | `FunctionsLitTests.Lit_UnsupportedType_ThrowsNamingType`, `Lit_UnsupportedChar_ThrowsNamingType`, `Lit_UnsupportedTypes_ThrowNamingType` (uint/object/array) |

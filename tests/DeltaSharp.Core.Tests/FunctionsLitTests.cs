@@ -165,7 +165,7 @@ public class FunctionsLitTests
         Assert.Equal(expected, literal.Value);
     }
 
-    [Fact] // F1: a pre-1970 DateTime maps to a negative epoch-micros instant (truncated toward zero)
+    [Fact] // F1: a pre-1970 DateTime maps to a negative epoch-micros instant (floored, Spark parity)
     public void Lit_DateTimePre1970_MapsToNegativeEpochMicros()
     {
         var pre1970 = new DateTime(1969, 12, 31, 23, 59, 59, DateTimeKind.Utc);
@@ -176,13 +176,28 @@ public class FunctionsLitTests
         Assert.Equal(-1_000_000L, literal.Value);
     }
 
-    [Fact] // F1: sub-microsecond ticks truncate toward zero (pin the rounding behavior)
-    public void Lit_DateTimeSubMicrosecond_TruncatesTowardZero()
+    [Fact] // F1: sub-microsecond ticks floor toward negative infinity (Spark Math.floorDiv parity)
+    public void Lit_DateTimeSubMicrosecond_FloorsTowardNegativeInfinity()
     {
-        // 1970-01-01T00:00:00 plus 5 ticks (0.5µs) — truncates down to 0 microseconds.
-        var subMicro = new DateTime(DateTimeOffset.UnixEpoch.Ticks + 5, DateTimeKind.Utc);
-        Literal literal = LiteralOf(subMicro);
-        Assert.Equal(0L, literal.Value);
+        // Post-epoch: +5 ticks (0.5µs) floors down to 0 (floor == truncation for positives).
+        var plusHalf = new DateTime(DateTimeOffset.UnixEpoch.Ticks + 5, DateTimeKind.Utc);
+        Assert.Equal(0L, LiteralOf(plusHalf).Value);
+
+        // Pre-epoch: a single 100ns tick before 1970 is -1µs, NOT 0. C# integer division truncates
+        // toward zero (-1 tick / 10 == 0), which would map two full microseconds (-1µs..+1µs) onto
+        // bucket 0 and shift pre-epoch time forward. Spark uses floorDiv, so -1 tick => -1µs.
+        var minusOneTick = new DateTime(DateTimeOffset.UnixEpoch.Ticks - 1, DateTimeKind.Utc);
+        Assert.Equal(-1L, LiteralOf(minusOneTick).Value);
+
+        // -5 ticks (-0.5µs) also floors to -1 (truncation would wrongly give 0).
+        var minusHalf = new DateTime(DateTimeOffset.UnixEpoch.Ticks - 5, DateTimeKind.Utc);
+        Assert.Equal(-1L, LiteralOf(minusHalf).Value);
+
+        // -10 ticks is exactly -1µs (on the boundary, no adjustment); -11 ticks floors to -2µs.
+        var minusOneMicro = new DateTime(DateTimeOffset.UnixEpoch.Ticks - 10, DateTimeKind.Utc);
+        Assert.Equal(-1L, LiteralOf(minusOneMicro).Value);
+        var justPastOneMicro = new DateTime(DateTimeOffset.UnixEpoch.Ticks - 11, DateTimeKind.Utc);
+        Assert.Equal(-2L, LiteralOf(justPastOneMicro).Value);
     }
 
     [Fact] // AC2

@@ -166,10 +166,21 @@ public static class Functions
         return Literal.OfTimestamp(ToEpochMicros(instant));
     }
 
-    // Microseconds since the Unix epoch, truncated toward zero (integer division). Sub-microsecond
-    // ticks are dropped; for pre-1970 instants the negative tick count truncates toward zero too.
-    private static long ToEpochMicros(DateTimeOffset value) =>
-        (value - DateTimeOffset.UnixEpoch).Ticks / TimeSpan.TicksPerMicrosecond;
+    // Microseconds since the Unix epoch. Sub-microsecond ticks are floored toward negative infinity
+    // (matching Spark's Math.floorDiv), NOT truncated toward zero: an instant one tick (100 ns)
+    // before 1970 maps to -1 micros, not 0, so temporal ordering stays monotonic across the epoch
+    // boundary and pre-1970 timestamps agree with Spark's instantToMicros.
+    private static long ToEpochMicros(DateTimeOffset value)
+    {
+        long ticks = (value - DateTimeOffset.UnixEpoch).Ticks;
+        long micros = ticks / TimeSpan.TicksPerMicrosecond;
+        if (ticks < 0 && micros * TimeSpan.TicksPerMicrosecond != ticks)
+        {
+            micros--;
+        }
+
+        return micros;
+    }
 
     private static Literal DecimalLiteral(decimal value)
     {
