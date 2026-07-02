@@ -7,7 +7,8 @@ namespace DeltaSharp.Plans.Expressions;
 /// target is an ADR-0008 <see cref="DataType"/> (AC3) and is the node's known result type even
 /// before analysis. The supported-conversion matrix and ANSI overflow behavior are an
 /// analyzer/execution concern (EPIC-02/EPIC-03); building the node does no work. The nullability
-/// hint conservatively forwards the child's (analysis may widen it for a lossy legacy cast).
+/// hint forwards the child's as a pre-analysis hint; the analyzer (FEAT-04.5) widens it for
+/// null-introducing (lossy/non-ANSI) casts.
 /// </summary>
 internal sealed class Cast : Expression
 {
@@ -33,6 +34,7 @@ internal sealed class Cast : Expression
     public override DataType Type => TargetType;
 
     /// <inheritdoc/>
+    // TODO(FEAT-04.5): widen for null-introducing (lossy/non-ANSI) casts
     public override bool Nullable => Child.Nullable;
 
     /// <inheritdoc/>

@@ -19,6 +19,10 @@ public sealed class DescriptorOnlyTests
         typeof(Join), typeof(Sort), typeof(Limit), typeof(Distinct), typeof(Union),
         typeof(WriteToSource), typeof(SinkDescriptor),
         typeof(UnresolvedAttribute), typeof(UnresolvedFunction),
+        typeof(Literal), typeof(Cast), typeof(AttributeReference), typeof(Alias),
+        typeof(And), typeof(Or), typeof(Not), typeof(BinaryComparison),
+        typeof(BinaryArithmetic), typeof(EqualNullSafe), typeof(IsNull), typeof(IsNotNull),
+        typeof(SortOrder), typeof(UnresolvedStar),
     };
 
     [Fact]

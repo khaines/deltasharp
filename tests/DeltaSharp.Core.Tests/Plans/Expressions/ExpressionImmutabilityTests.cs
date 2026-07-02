@@ -129,4 +129,30 @@ public class ExpressionImmutabilityTests
         Assert.Equal(a.GetHashCode(), b.GetHashCode());
         Assert.NotEqual(a, different);
     }
+
+    [Fact]
+    public void BinaryLiteral_IsImmutable_AgainstInputAndReturnedArrayMutation()
+    {
+        var input = new byte[] { 1, 2, 3 };
+        var literal = Literal.OfBinary(input);
+
+        string renderBefore = literal.SimpleString;
+        int hashBefore = literal.GetHashCode();
+        var equalBefore = Literal.OfBinary(new byte[] { 1, 2, 3 });
+        Assert.Equal("0x010203", renderBefore);
+
+        // Mutate the ORIGINAL input array after construction (defensive copy on the way in).
+        input[0] = 0x63;
+
+        // Mutate the array handed back from the Value getter (defensive copy on the way out).
+        var returned = Assert.IsType<byte[]>(literal.Value);
+        returned[0] = 0x63;
+
+        // Neither mutation is visible: render, equality, and hash are unchanged.
+        Assert.Equal("0x010203", literal.SimpleString);
+        Assert.Equal(renderBefore, literal.SimpleString);
+        Assert.Equal(hashBefore, literal.GetHashCode());
+        Assert.Equal(equalBefore, literal);
+        Assert.Equal(equalBefore.GetHashCode(), literal.GetHashCode());
+    }
 }

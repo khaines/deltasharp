@@ -13,11 +13,13 @@ namespace DeltaSharp.Plans.Expressions;
 /// </summary>
 internal sealed class Literal : Expression
 {
+    private readonly object? _value;
+
     private Literal(DataType type, object? value, bool isNull)
         : base(PlanCollections.Empty<Expression>())
     {
         Type = type;
-        Value = value;
+        _value = value;
         IsNull = isNull;
     }
 
@@ -28,8 +30,9 @@ internal sealed class Literal : Expression
     public bool IsNull { get; }
 
     /// <summary>The constant value in its CLR storage shape, or <see langword="null"/> when
-    /// <see cref="IsNull"/>.</summary>
-    public object? Value { get; }
+    /// <see cref="IsNull"/>. For a binary literal a fresh defensive copy of the bytes is returned
+    /// on every access so callers can never mutate the immutable internal state.</summary>
+    public object? Value => _value is byte[] bytes ? bytes.Clone() : _value;
 
     /// <summary>A SQL <c>NULL</c> literal is nullable; a value literal is not.</summary>
     public override bool Nullable => IsNull;
@@ -118,12 +121,12 @@ internal sealed class Literal : Expression
             return true;
         }
 
-        if (Value is byte[] left && literal.Value is byte[] right)
+        if (_value is byte[] left && literal._value is byte[] right)
         {
             return left.AsSpan().SequenceEqual(right);
         }
 
-        return Equals(Value, literal.Value);
+        return Equals(_value, literal._value);
     }
 
     /// <inheritdoc/>
@@ -135,12 +138,12 @@ internal sealed class Literal : Expression
             return PlanHash.Combine(hash, 0);
         }
 
-        int valueHash = Value switch
+        int valueHash = _value switch
         {
             byte[] bytes => HashBytes(bytes),
             string s => PlanHash.OfString(s),
             null => 0,
-            _ => Value.GetHashCode(),
+            _ => _value.GetHashCode(),
         };
 
         return PlanHash.Combine(hash, valueHash);
@@ -164,14 +167,14 @@ internal sealed class Literal : Expression
             return "null";
         }
 
-        return Value switch
+        return _value switch
         {
             string s => $"\"{s}\"",
             byte[] bytes => $"0x{Convert.ToHexString(bytes)}",
             bool b => b ? "true" : "false",
             null => "null",
             IFormattable f => f.ToString(null, CultureInfo.InvariantCulture),
-            _ => Value.ToString() ?? "null",
+            _ => _value.ToString() ?? "null",
         };
     }
 }

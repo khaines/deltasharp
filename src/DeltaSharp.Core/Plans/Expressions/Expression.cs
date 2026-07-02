@@ -54,7 +54,10 @@ internal abstract class Expression : TreeNode<Expression>
     /// resolved"; the unresolved markers override it to <see langword="false"/>. The analyzer
     /// (FEAT-04.5) — never construction — is what makes an expression resolved.
     /// </summary>
-    /// <remarks>Memoized: safe because nodes are immutable, so the value never changes.</remarks>
+    /// <remarks>Memoized: safe because nodes are immutable, so the value never changes. The lazy
+    /// <c>bool?</c> memo is written without synchronization; this is benign because the recompute is
+    /// idempotent over immutable nodes, so a race merely repeats identical work (matching #167's
+    /// memoized hash). The assumption is single-threaded resolution by today's analyzer.</remarks>
     public virtual bool Resolved
     {
         get

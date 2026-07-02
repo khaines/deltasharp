@@ -137,7 +137,7 @@ explicitly and does **not** allocate ids (no `Guid.NewGuid`, no reflection — B
 | Node (file) | Catalyst analog | Children (order) + extra state | `Resolved` | `Type` hint | `Nullable` hint |
 | --- | --- | --- | --- | --- | --- |
 | `Alias` (`Alias.cs`) | `Alias` | `[Child]` + `string Name` | folds child | child's | child's |
-| `Cast` (`Cast.cs`) | `Cast` | `[Child]` + `DataType TargetType` | folds child | **`TargetType`** | child's |
+| `Cast` (`Cast.cs`) | `Cast` | `[Child]` + `DataType TargetType` | folds child | **`TargetType`** | child's (pre-analysis hint; analyzer widens for null-introducing casts) |
 | `UnresolvedFunction` (`UnresolvedFunction.cs`) | `UnresolvedFunction` | `Arguments` (ordered) + `string Name` + `bool IsDistinct` | **`false`** | `null` (base) | `true` (base) |
 | `BinaryArithmetic` (`BinaryOperatorExpressions.cs`) | `Add`/`Subtract`/`Multiply`/`Divide`/`Remainder` | `[Left, Right]` + `ArithmeticOperator Operator` | folds children | `null` (coercion is analyzer work) | `Left ‖ Right` |
 | `BinaryComparison` (`BinaryOperatorExpressions.cs`) | `EqualTo`/`LessThan`/… | `[Left, Right]` + `ComparisonOperator Operator` | folds children | `BooleanType` | `Left ‖ Right` |
@@ -167,8 +167,8 @@ it contains an `UnresolvedAttribute`, `UnresolvedStar`, or `UnresolvedFunction`;
 for the whole tree because the base property folds over children. The analyzer rewrites those nodes
 into `AttributeReference` (and bound function/aggregate forms) via `TransformUp`, after which
 `Resolved` becomes `true`. Because resolution is a `Transform*` rewrite, it produces a **new** tree and
-never mutates the unresolved one (AC2). The unresolved markers render with a leading apostrophe, so an
-unanalyzed tree is *visibly* unresolved (AC4).
+never mutates the unresolved one (AC2). The unresolved attribute and function markers render with a
+leading apostrophe (the star renders as `*`/`t.*`), so an unanalyzed tree is *visibly* unresolved (AC4).
 
 ## Inline render (AC4)
 
@@ -215,6 +215,15 @@ Tests live in `tests/DeltaSharp.Core.Tests/Plans/Expressions/`, namespace
 - **Spark/Catalyst parity.** Node and operator names mirror `org.apache.spark.sql.catalyst`.
   Deviations are documented here (aggregates-as-`UnresolvedFunction`; logical operator enums decoupled
   from any execution enums; double-quoted string literals in the inline render).
+  - **`!=`/`<>` is a first-class node.** DeltaSharp models `!=`/`<>` as a `BinaryComparison` with
+    `ComparisonOperator.NotEqual` (NodeName `NotEqualTo`) rather than Catalyst's `Not(EqualTo(l, r))`
+    desugaring — a cleaner, flatter IR that avoids an extra `Not` wrapper (a defensible .NET idiom).
+    Consequence: analyzer/optimizer rules that match `Not(EqualTo(...))` must **also** handle the
+    standalone `NotEqualTo`. Likewise `EqualNullSafe` (`<=>`) is a standalone node rather than a
+    `BinaryComparison` subclass as in Catalyst.
+  - **Cast nullability is a pre-analysis hint.** `Cast.Nullable` forwards the child's nullability as a
+    hint; the analyzer (FEAT-04.5) widens it for null-introducing (lossy/non-ANSI) casts, e.g.
+    `string → int`, which can yield `NULL` from a non-null child.
 - **Layering.** The IR lives in `DeltaSharp.Core` and references only `DeltaSharp.Abstractions` for the
   shared type model — never `DeltaSharp.Engine`. The `CoreAssemblyDoesNotReferenceTheEngineAssembly`
   guard enforces this.
