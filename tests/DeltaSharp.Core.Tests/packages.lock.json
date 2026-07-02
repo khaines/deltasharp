@@ -93,8 +93,14 @@
           "xunit.extensibility.core": "[2.9.3]"
         }
       },
-      "deltasharp.core": {
+      "deltasharp.abstractions": {
         "type": "Project"
+      },
+      "deltasharp.core": {
+        "type": "Project",
+        "dependencies": {
+          "DeltaSharp.Abstractions": "[0.1.0, )"
+        }
       }
     },
     "net8.0": {
@@ -189,8 +195,14 @@
           "xunit.extensibility.core": "[2.9.3]"
         }
       },
-      "deltasharp.core": {
+      "deltasharp.abstractions": {
         "type": "Project"
+      },
+      "deltasharp.core": {
+        "type": "Project",
+        "dependencies": {
+          "DeltaSharp.Abstractions": "[0.1.0, )"
+        }
       }
     }
   }
