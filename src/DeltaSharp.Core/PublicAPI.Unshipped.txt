@@ -4,6 +4,11 @@ DeltaSharp.Column.Alias(string! alias) -> DeltaSharp.Column!
 DeltaSharp.Column.As(string! alias) -> DeltaSharp.Column!
 DeltaSharp.Column.Name(string! alias) -> DeltaSharp.Column!
 DeltaSharp.DataFrame
+DeltaSharp.DataFrame.Filter(DeltaSharp.Column! condition) -> DeltaSharp.DataFrame!
+DeltaSharp.DataFrame.Select(params DeltaSharp.Column![]! columns) -> DeltaSharp.DataFrame!
+DeltaSharp.DataFrame.Select(string! column, params string![]! columns) -> DeltaSharp.DataFrame!
+DeltaSharp.DataFrame.Where(DeltaSharp.Column! condition) -> DeltaSharp.DataFrame!
+DeltaSharp.DataFrame.WithColumn(string! colName, DeltaSharp.Column! col) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrameReader
 DeltaSharp.DeltaSharpInfo
 DeltaSharp.ExecutionBackend
