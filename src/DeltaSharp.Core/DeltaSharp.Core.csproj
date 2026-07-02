@@ -30,4 +30,14 @@
     <None Include="README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
+  <!-- Fold S3 (STORY-04.4.2 / #168): reference the shared, packable logical type model
+       (ADR-0016) so the internal plan-expression IR (DeltaSharp.Plans.Expressions) can name
+       DeltaSharp.Types.DataType for literal/cast/attribute type hints. Abstractions is NOT the
+       Engine, so Core⟂Engine sibling independence is preserved
+       (CoreAssemblyDoesNotReferenceTheEngineAssembly stays green). The IR is internal, so this
+       reference does not widen Core's public API surface. -->
+  <ItemGroup>
+    <ProjectReference Include="..\DeltaSharp.Abstractions\DeltaSharp.Abstractions.csproj" />
+  </ItemGroup>
+
 </Project>

@@ -26,6 +26,9 @@ internal sealed class UnresolvedAttribute : Expression
     /// <summary>The reference name parts, in order.</summary>
     public IReadOnlyList<string> NameParts { get; }
 
+    /// <summary>The dotted name (for example <c>t.a</c>), joined from <see cref="NameParts"/>.</summary>
+    public string Name => string.Join('.', NameParts);
+
     /// <inheritdoc/>
     public override string NodeName => "UnresolvedAttribute";
 
