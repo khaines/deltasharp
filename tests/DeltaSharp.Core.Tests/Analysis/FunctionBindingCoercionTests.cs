@@ -435,6 +435,37 @@ public class FunctionBindingCoercionTests
         Assert.Equal(LongType.Instance, bound.Type);
     }
 
+    [Fact]
+    public void Resolve_BareAggregate_AutoNamesOutputColumn_SparkParity()
+    {
+        // Spark parity: a BARE aggregate (no alias) in aggregate-expression position is auto-named
+        // with the function's pretty SQL string — `groupBy(i).agg(sum(l))` exposes a `sum(l)` output
+        // column (unqualified argument name, NO `#id` ExprId suffix). This pins the auto-naming the
+        // ToAttribute ResolvedFunction case mints once binding has typed the call.
+        var analyzer = NumbersAnalyzer();
+        var aggregate = new Aggregate(
+            groupingExpressions: new Expression[] { Col("i") },
+            aggregateExpressions: new Expression[] { Col("i"), Fn("sum", Col("l")) },
+            Relation("nums"));
+
+        // A parent projection reads the auto-named aggregate out of the Aggregate's derived output,
+        // proving `sum(l)` is exposed under its pretty SQL name (unqualified arg, no `#id`).
+        var project = new Project(new Expression[] { Col("i"), Col("sum(l)") }, aggregate);
+
+        var resolved = Assert.IsType<Project>(analyzer.Resolve(project));
+        var resolvedAggregate = Assert.IsType<Aggregate>(resolved.Child);
+
+        Assert.True(resolvedAggregate.Resolved);
+        // The bare aggregate stays a ResolvedFunction in the plan; its output attribute is auto-named.
+        var sumCall = Assert.IsType<ResolvedFunction>(resolvedAggregate.AggregateExpressions[1]);
+        Assert.Equal("sum", sumCall.Name);
+
+        // The parent Project bound `sum(l)` against the Aggregate output: the auto-named, typed column.
+        var projectedSum = Assert.IsType<AttributeReference>(resolved.ProjectList[1]);
+        Assert.Equal("sum(l)", projectedSum.Name);   // pretty SQL name, no `#id`
+        Assert.IsType<LongType>(projectedSum.Type);   // integral sum accumulates in bigint
+    }
+
     // ---- null-typed-resolved guard (defense-in-depth over the coercion pass) ----
 
     [Fact]

@@ -528,19 +528,29 @@ internal sealed class Analyzer
                     ?? throw AnalysisException.UntypedResolvedExpression(alias.Child.SimpleString, "Project");
                 return new AttributeReference(alias.Name, type, alias.Nullable, idGenerator.Next());
 
+            case ResolvedFunction function:
+                // A bare aggregate/scalar function in output position is auto-named exactly like
+                // Spark: `groupBy("dept").agg(sum("salary"))` exposes a `sum(salary)` column (the
+                // function's pretty SQL string, using unqualified child names WITHOUT the `#id`
+                // suffix). Function binding + coercion (STORY-04.5.2 / #171) ran earlier in
+                // ResolveReferences, so the call is already typed here; a residual null type is a
+                // coercion gap reported symmetrically with the Alias case.
+                DataType functionType = function.Type
+                    ?? throw AnalysisException.UntypedResolvedExpression(function.SimpleString, "Aggregate");
+                return new AttributeReference(
+                    SparkAutoName(function), functionType, function.Nullable, idGenerator.Next());
+
             case UnresolvedFunction function:
-                // A bare aggregate/scalar function reached output derivation while still unresolved.
-                // Aggregate-function resolution and Spark auto-naming are deferred to STORY-04.5.2
-                // (#171), so we cannot mint an output name yet. Reject deterministically here (this
-                // fires during ResolveReferences, before CheckAnalysis) with a targeted message
-                // rather than the generic "not a named output element" fallback, and point at the
-                // alias workaround. Kind stays UnsupportedProjection.
-                throw AnalysisException.UnsupportedProjection(
-                    $"Aggregate/function output '{function.Name}' cannot be named yet: "
-                    + "aggregate-function resolution and Spark auto-naming are deferred to "
-                    + "STORY-04.5.2 (#171). Alias the expression (for example .As(\"total\")) as the "
-                    + "M1 workaround.",
-                    function.Name);
+                // Defensive invariant: function binding (ExpressionCoercion → FunctionRegistry.Bind)
+                // runs over every expression in ResolveReferences BEFORE output derivation, and it is
+                // total — it either produces a typed ResolvedFunction (handled above) or throws
+                // (UnknownFunction for an unregistered name, InvalidFunctionArgument for a bad call).
+                // An UnresolvedFunction therefore cannot normally reach here; if one does, the bind
+                // pass was skipped for this subtree. Report it as an undefined/unbound function rather
+                // than the obsolete "deferred to #171" self-reference (this story IS #171).
+                throw AnalysisException.UnknownFunction(
+                    function.Name,
+                    function.Arguments.Select(a => a.Type ?? NullType.Instance).ToArray());
 
             default:
                 throw AnalysisException.UnsupportedProjection(
@@ -548,6 +558,28 @@ internal sealed class Analyzer
                     + "(expected an attribute or an alias).");
         }
     }
+
+    /// <summary>The Spark auto-name for a bare function call in output position: the pretty SQL
+    /// string <c>name(arg, …)</c> built from unqualified argument names (no <c>#id</c> ExprId
+    /// suffix), e.g. <c>sum(salary)</c>, <c>count(1)</c>, <c>avg(x)</c>. Implicit coercion
+    /// <see cref="Cast"/>s the binder inserted are unwrapped so they do not pollute the name, mirroring
+    /// Spark's <c>usePrettyExpression</c>.</summary>
+    private static string SparkAutoName(ResolvedFunction function)
+    {
+        string distinct = function.IsDistinct ? "distinct " : string.Empty;
+        string args = string.Join(", ", function.Arguments.Select(PrettyArgumentName));
+        return $"{function.Name}({distinct}{args})";
+    }
+
+    /// <summary>Renders a resolved argument for a function's auto-name: an attribute contributes its
+    /// bare name (never <c>name#id</c>), an implicit coercion cast is transparent (its child's pretty
+    /// name), and anything else (a literal, arithmetic) falls back to its <c>SimpleString</c>.</summary>
+    private static string PrettyArgumentName(Expression argument) => argument switch
+    {
+        AttributeReference attribute => attribute.Name,
+        Cast cast => PrettyArgumentName(cast.Child),
+        _ => argument.SimpleString,
+    };
 
     private static IReadOnlyList<AttributeReference> ChildOutput(
         LogicalPlan child,

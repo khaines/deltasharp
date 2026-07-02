@@ -385,19 +385,15 @@ public sealed class DataFrameAggregationTests
     }
 
     [Fact]
-    public void Analyzer_RealAggregateFunction_ReportsDeferredResolution_NotApiExecution()
+    public void Analyzer_RealAggregateFunction_ResolvesToAutoNamedOutput()
     {
-        // AC3 boundary: an aggregate FUNCTION (count/sum/…) is still unresolved after this story — the
-        // ANALYZER is the gate that reports it (a deterministic AnalysisException), never the API. The
-        // API only builds a well-formed unresolved Aggregate; it neither coerces nor executes.
-        // Aggregate input type-validation + function resolution + Spark auto-naming land with
-        // STORY-04.5.2 (#171). ("Nothing is read/executed" is proven by the §7 lazy tests in
-        // DataFrameAggregationLazyTests, not here.)
-        //
-        // The message is PINNED so #171 improves it deliberately: for a bare aggregate the failure
-        // fires from output derivation (DeriveOutput → ToAttribute's UnresolvedFunction branch) during
-        // ResolveReferences — BEFORE CheckAnalysis — so it carries the UnsupportedProjection kind and
-        // the deferred-resolution message (not CheckAnalysis' generic unresolved-reference text).
+        // STORY-04.5.2 / #171 FULFILLED: a bare aggregate FUNCTION (count/sum/…) now BINDS and is
+        // auto-named exactly like Spark — the ANALYZER (not the API) is the gate that resolves it.
+        // `groupBy("dept").agg(sum("salary"))` resolves end-to-end to output columns
+        // [dept, "sum(salary)"]: the retained grouping attribute followed by the auto-named aggregate
+        // (the function's pretty SQL string, WITHOUT the `#id` suffix). The API only builds a
+        // well-formed unresolved Aggregate; it neither coerces nor executes ("nothing is executed" is
+        // proven by the §7 lazy tests in DataFrameAggregationLazyTests, not here).
         var catalog = new LocalCatalog();
         catalog.Register("people", new StructType(new[]
         {
@@ -409,13 +405,36 @@ public sealed class DataFrameAggregationTests
 
         DataFrame aggregated = df.GroupBy("dept").Agg(Functions.Sum(Functions.Col("salary")));
 
-        var ex = Assert.Throws<AnalysisException>(() => analyzer.Resolve(aggregated.Plan));
-        Assert.Equal(AnalysisErrorKind.UnsupportedProjection, ex.Kind);
-        Assert.Equal(
-            "Aggregate/function output 'sum' cannot be named yet: aggregate-function resolution and "
-            + "Spark auto-naming are deferred to STORY-04.5.2 (#171). Alias the expression (for "
-            + "example .As(\"total\")) as the M1 workaround.",
-            ex.Message);
+        // A parent projection reads the grouping key + the AUTO-NAMED aggregate column out of the
+        // Aggregate's derived output, proving the bare aggregate resolves end-to-end and is exposed
+        // under its Spark pretty name `sum(salary)` (no `#id` suffix) — not rejected as before #171.
+        var projected = new Project(
+            new Expression[] { Functions.Col("dept").Expr, Functions.Col("sum(salary)").Expr },
+            aggregated.Plan);
+
+        LogicalPlan resolved = analyzer.Resolve(projected);
+
+        var project = Assert.IsType<Project>(resolved);
+        var aggregate = Assert.IsType<Aggregate>(project.Child);
+        var groupingKey = Assert.IsType<AttributeReference>(Assert.Single(aggregate.GroupingExpressions));
+        Assert.Equal("dept", groupingKey.Name);
+
+        // AggregateExpressions = retained grouping attribute ⧺ the (still) bare ResolvedFunction.
+        Assert.Collection(
+            aggregate.AggregateExpressions,
+            e => Assert.Equal("dept", Assert.IsType<AttributeReference>(e).Name),
+            e => Assert.Equal("sum", Assert.IsType<ResolvedFunction>(e).Name));
+
+        // The parent Project bound BOTH names against the Aggregate's derived output: the grouping key
+        // and the auto-named aggregate `sum(salary)` (typed LongType — an integral sum widens to
+        // bigint — with a fresh identity distinct from the grouping key).
+        var projectedDept = Assert.IsType<AttributeReference>(project.ProjectList[0]);
+        var projectedSum = Assert.IsType<AttributeReference>(project.ProjectList[1]);
+        Assert.Equal("dept", projectedDept.Name);
+        Assert.Equal(groupingKey.ExprId, projectedDept.ExprId);
+        Assert.Equal("sum(salary)", projectedSum.Name);
+        Assert.IsType<LongType>(projectedSum.Type);
+        Assert.NotEqual(groupingKey.ExprId, projectedSum.ExprId);
     }
 
     // ----- Null / empty argument guards -----
