@@ -177,7 +177,10 @@ public sealed class DataFrameAggregationTests
             {
                 var alias = Assert.IsType<Alias>(e);
                 Assert.Equal("count", alias.Name);
-                Assert.Equal("count", Assert.IsType<UnresolvedFunction>(alias.Child).Name);
+                var countFn = Assert.IsType<UnresolvedFunction>(alias.Child);
+                Assert.Equal("count", countFn.Name);
+                Expression arg = Assert.Single(countFn.Arguments);
+                Assert.Equal(1L, Assert.IsType<Literal>(arg).Value);
             });
     }
 
@@ -264,7 +267,10 @@ public sealed class DataFrameAggregationTests
         Expression only = Assert.Single(aggregate.AggregateExpressions);
         var alias = Assert.IsType<Alias>(only);
         Assert.Equal("count", alias.Name);
-        Assert.Equal("count", Assert.IsType<UnresolvedFunction>(alias.Child).Name);
+        var countFn = Assert.IsType<UnresolvedFunction>(alias.Child);
+        Assert.Equal("count", countFn.Name);
+        Expression arg = Assert.Single(countFn.Arguments);
+        Assert.Equal(1L, Assert.IsType<Literal>(arg).Value);
     }
 
     // ----- Immutability / structural sharing -----
