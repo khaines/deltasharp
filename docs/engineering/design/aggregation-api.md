@@ -218,7 +218,7 @@ analyzer boundary is explicit. The one **genuinely-still-deferred** case is a **
 `BinaryArithmetic`/computed grouping key, so it deterministically throws `UnsupportedProjection`. Naming
 / aliasing for computed keys is tracked under
 [#410](https://github.com/khaines/deltasharp/issues/410) — pinned by
-`Analyzer_ComplexGroupingKey_ThrowsDeterministically_TrackedUnder171`.
+`Analyzer_ComplexGroupingKey_ThrowsDeterministically_TrackedUnder410`.
 
 ## 7. The lazy invariant and how it is proven
 
@@ -250,7 +250,7 @@ Proven three ways:
 | --- | --- | --- |
 | **AC1** | `GroupBy` returns a grouped handle recording grouping expressions **without executing**; the handle is not a `DataFrame`. | `GroupBy_Columns_RecordsGroupingExpressionsInOrder`, `GroupBy_Names_RecordsUnresolvedAttributeGroupingExpressions`, `GroupBy_SingleName_RecordsSingleGroupingExpression`, `GroupBy_NoColumns_RecordsEmptyGrouping`, `GroupBy_DoesNotBuildAnAggregate_UntilAggIsChosen` |
 | **AC2** | `Agg` (grouped) builds `Aggregate` with grouping + retained keys ⧺ aggregate exprs and Spark aliases; global `df.Agg` builds `Aggregate` with empty grouping. | `Agg_BuildsAggregateWithGroupingAndRetainedKeysThenAggregate` (also pins retained-key `Assert.Same` structural sharing), `Agg_HonorsUserAliasOnAggregateOutput`, `Agg_BareAggregate_IsLeftUnaliased_ForAnalyzerNaming`, `Agg_MultipleAggregates_AppendInOrderAfterRetainedKeys`, `Count_BuildsAggregateWithNamedCountAfterRetainedKeys`, `GlobalAgg_BuildsAggregateWithEmptyGrouping`, `GlobalAgg_IsEquivalentToGroupByNoKeysThenAgg`, `GlobalAgg_MultipleAggregates_AppendInOrder`, `GlobalCount_BuildsAggregateWithEmptyGroupingAndSingleCountColumn` |
-| **AC3** | Invalid aggregate input is reported by the **analyzer** (function binding + auto-naming via output derivation, or `CheckAnalysis` as backstop), not the API; the API builds a well-formed unresolved plan. | `Analyzer_RealAggregateFunction_ResolvesToAutoNamedOutput` (bare aggregate resolves → auto-named `sum(salary)`); complex-key boundary via `Analyzer_ComplexGroupingKey_ThrowsDeterministically_TrackedUnder171` (naming tracked under #410); structural derivation + parent-`Project` interplay via `Analyzer_DerivesAggregateOutput_AsGroupingAttributesThenAggregateAliases` |
+| **AC3** | Invalid aggregate input is reported by the **analyzer** (function binding + auto-naming via output derivation, or `CheckAnalysis` as backstop), not the API; the API builds a well-formed unresolved plan. | `Analyzer_RealAggregateFunction_ResolvesToAutoNamedOutput` (bare aggregate resolves → auto-named `sum(salary)`); complex-key boundary via `Analyzer_ComplexGroupingKey_ThrowsDeterministically_TrackedUnder410` (naming tracked under #410); structural derivation + parent-`Project` interplay via `Analyzer_DerivesAggregateOutput_AsGroupingAttributesThenAggregateAliases` |
 | **AC4** | Method names + chaining order recognizable to Spark users (`df.GroupBy("k").Agg(Functions.Sum(...).As("total"))`). | `Agg_*` (surface + shape), `GroupByAgg_ChainsOverPriorTransformations_LeavingEachStageIntact` |
 | **Lazy** | Transformations do no work; the source frame is unchanged. | `Agg_LeavesSourceFrameUnchanged_AndSharesChildByReference`, `DataFrameAggregationLazyTests.*` |
 | **Guards** | Null/empty argument rejection. | `GroupBy_Null*`/`GroupBy_Empty*`, `Agg_Null*`, `GlobalAgg_NullFirstExpr_Throws`, `GlobalAgg_NullExprsArray_Throws`, `GlobalAgg_NullExprElement_Throws` |

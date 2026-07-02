@@ -589,7 +589,7 @@ internal sealed class Analyzer
 
             default:
                 throw AnalysisException.UnsupportedProjection(
-                    $"Projection element '{element.SimpleString}' is not a named output element "
+                    $"Projection element '{CoercionHelpers.PrettyReference(element)}' is not a named output element "
                     + "(expected an attribute or an alias).");
         }
     }

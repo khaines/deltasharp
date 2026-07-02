@@ -361,12 +361,12 @@ public sealed class DataFrameAggregationTests
     }
 
     [Fact]
-    public void Analyzer_ComplexGroupingKey_ThrowsDeterministically_TrackedUnder171()
+    public void Analyzer_ComplexGroupingKey_ThrowsDeterministically_TrackedUnder410()
     {
         // F1 boundary: a COMPLEX grouping key (a non-attribute expression, e.g. Col("a") + Col("b"))
         // is retained at the front of the aggregate output; today output derivation cannot name a
         // non-attribute/non-alias element, so Resolve throws a deterministic AnalysisException. This
-        // documents the boundary — aggregate naming/aliasing for computed keys lands with #171.
+        // documents the boundary — aggregate naming/aliasing for computed keys lands with #410.
         var catalog = new LocalCatalog();
         catalog.Register("t", new StructType(new[]
         {
@@ -382,6 +382,8 @@ public sealed class DataFrameAggregationTests
 
         var ex = Assert.Throws<AnalysisException>(() => analyzer.Resolve(aggregated.Plan));
         Assert.Equal(AnalysisErrorKind.UnsupportedProjection, ex.Kind);
+        Assert.DoesNotContain("#", ex.Message);   // pretty reference, no leaked ExprId
+        Assert.Contains("(a + b)", ex.Message);    // Spark infix pretty form, bare names
     }
 
     [Fact]
