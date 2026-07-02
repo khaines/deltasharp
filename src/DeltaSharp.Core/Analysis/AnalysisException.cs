@@ -26,6 +26,16 @@ internal enum AnalysisErrorKind
     /// example an alias over an expression whose type is undetermined before type coercion
     /// (STORY-04.5.2 / #171), or an unnamed projection element.</summary>
     UnsupportedProjection,
+
+    /// <summary>A set operation (currently <c>Union</c>) was given inputs whose <b>column counts</b>
+    /// differ — a structural (arity) incompatibility. Deep column-type compatibility/coercion is a
+    /// separate concern (STORY-04.5.2 / #171).</summary>
+    NumberOfColumnsMismatch,
+
+    /// <summary>A using-column or natural <c>Join</c> reached analysis, but the analyzer rule that
+    /// desugars its shared columns into an equi-condition is not yet implemented (tracked by #405).
+    /// The join node builds fine; only its <i>resolution</i> is deferred.</summary>
+    UsingOrNaturalJoinNotImplemented,
 }
 
 /// <summary>
@@ -131,6 +141,23 @@ internal sealed class AnalysisException : Exception
             Array.Empty<string>());
     }
 
+    /// <summary>Builds a <see cref="AnalysisErrorKind.UsingOrNaturalJoinNotImplemented"/> failure for
+    /// a using-column or natural <c>Join</c> that reached analysis. Building such a join is supported
+    /// today, but the analyzer rule that desugars its shared columns into an equi-condition is not
+    /// yet implemented; the message points at the follow-up (#405) so the failure is actionable
+    /// rather than the generic "operator remains unresolved".</summary>
+    public static AnalysisException UsingOrNaturalJoinNotImplemented(bool isNatural)
+    {
+        string kind = isNatural ? "natural" : "using-column";
+        return new AnalysisException(
+            $"using/natural join resolution is not yet implemented: a {kind} join cannot be "
+            + "analyzed until the desugar-to-equi-condition rule lands (see "
+            + "https://github.com/khaines/deltasharp/issues/405).",
+            AnalysisErrorKind.UsingOrNaturalJoinNotImplemented,
+            "Join",
+            Array.Empty<string>());
+    }
+
     /// <summary>Builds an <see cref="AnalysisErrorKind.UnsupportedProjection"/> failure for a
     /// projection element that cannot yet be exposed as a named output attribute.</summary>
     public static AnalysisException UnsupportedProjection(string message, string? reference = null) =>
@@ -139,4 +166,28 @@ internal sealed class AnalysisException : Exception
             AnalysisErrorKind.UnsupportedProjection,
             reference,
             Array.Empty<string>());
+
+    /// <summary>Builds a <see cref="AnalysisErrorKind.NumberOfColumnsMismatch"/> failure for a
+    /// <c>Union</c> whose inputs have differing column counts, naming the first input's arity and the
+    /// offending input's arity (Spark parity). This is a structural (arity) check only; column-type
+    /// compatibility is deferred to STORY-04.5.2 / #171.</summary>
+    /// <param name="nodeName">The set-operation node name (e.g. <c>Union</c>).</param>
+    /// <param name="firstColumnCount">The column count of the first input.</param>
+    /// <param name="inputIndex">The zero-based position of the offending input (reported to the user
+    /// as the one-based ordinal <c>inputIndex + 1</c>).</param>
+    /// <param name="inputColumnCount">The column count of the offending input.</param>
+    public static AnalysisException NumberOfColumnsMismatch(
+        string nodeName, int firstColumnCount, int inputIndex, int inputColumnCount)
+    {
+        ArgumentNullException.ThrowIfNull(nodeName);
+        return new AnalysisException(
+            $"{nodeName} can only be performed on inputs with the same number of columns, but the "
+            + $"first input has {Columns(firstColumnCount)} and input {inputIndex + 1} has "
+            + $"{Columns(inputColumnCount)}.",
+            AnalysisErrorKind.NumberOfColumnsMismatch,
+            nodeName,
+            Array.Empty<string>());
+    }
+
+    private static string Columns(int count) => count == 1 ? "1 column" : $"{count} columns";
 }
