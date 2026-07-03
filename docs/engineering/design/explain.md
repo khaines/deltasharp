@@ -25,7 +25,7 @@ physical rendering *plans* the query (through the executor seam) but never *runs
 
 | Concern | Assembly | Type(s) |
 | --- | --- | --- |
-| Public `Explain` API + section assembly | `DeltaSharp.Core` (`net8.0;net10.0`, packable) | `DataFrame.Explain*`, `ExplainMode` |
+| Public `Explain` API + section assembly | `DeltaSharp.Core` (`net8.0;net10.0`, packable) | `DataFrame.Explain*`, `DataFrame.ToExplainString`, `ExplainMode` |
 | Tree rendering of the logical IR | `DeltaSharp.Core` | `TreeNode<T>.TreeString()` (reused as-is) |
 | Analyze/optimize stages | `DeltaSharp.Core` | `Analyzer`, `Optimizer`/`DataFrame.Optimize` seam |
 | Physical-plan string (the seam) | contract in `DeltaSharp.Core`, impl in `DeltaSharp.Executor` | `IQueryExecutor.ExplainPhysical`, `LocalQueryExecutor`, `PhysicalPlan.TreeString()` |
@@ -42,16 +42,25 @@ Executor.
 
 ## 2. Public API (Spark parity)
 
-The public surface mirrors Spark's `Dataset.explain` overloads. Like `Show`, each method prints to the
+The public surface mirrors Spark's `Dataset.explain` overloads. Each `Explain` method prints to the
 console (Spark's `explain` returns `void`); an `internal string ExplainString(ExplainMode)` backs the
-console methods so the rendered text is unit-testable (the same pattern as `Show`/`ShowString`).
+console methods so the rendered text is unit-testable (the same pattern as `Show`/`ShowString`). Unlike
+`Show`, `Explain` also exposes a **public** string-returning form, `ToExplainString(mode)`, a zero-logic
+wrapper over `ExplainString` (a matching `ToShowString` for `Show` is a separate follow-up, out of scope
+here).
 
 ```csharp
 public void Explain();                       // Spark explain()          -> physical plan only
 public void Explain(bool extended);          // Spark explain(extended)  -> all four sections when true
 public void Explain(string mode);            // Spark explain(mode)      -> "simple"/"extended"/...
 public void Explain(ExplainMode mode);       // strongly-typed .NET overload
+public string ToExplainString(ExplainMode mode = ExplainMode.Simple); // returns the text instead of printing
 ```
+
+`Explain(...)` prints to the console (Spark's `explain` returns `void`); `ToExplainString(mode)` is a thin
+public wrapper over the same internal `ExplainString(mode)` that **returns** the rendered text instead of
+writing it, so callers can capture the plan in logs, tests, or diagnostics without redirecting
+`Console.Out`. Like `Explain`, it renders **without executing**.
 
 `ExplainMode` mirrors Spark's `org.apache.spark.sql.execution.ExplainMode` exactly:
 
@@ -77,15 +86,21 @@ plan-diagnostic behaviour of §6 (which concerns plan **content**, not the mode 
 
 ```csharp
 SparkSession spark = SparkSession.Builder().AppName("explain-demo").GetOrCreate();
-DataFrame df = spark.Read.Table("people")          // any DataFrame
+DataFrame df = spark.Sql("SELECT name, age FROM people")   // any DataFrame door (Sql/Read/CreateDataFrame)
     .Filter(Col("age").Gt(21))
     .Select(Col("name"), Col("age"));
 
-df.Explain();                       // physical plan only (Spark default)
-df.Explain(extended: true);         // parsed + analyzed + optimized + physical
-df.Explain("extended");             // same, via the Spark mode string
-df.Explain(ExplainMode.Simple);     // strongly-typed overload
+df.Explain();                                  // physical plan only (Spark default)
+df.Explain(extended: true);                    // parsed + analyzed + optimized + physical
+df.Explain("extended");                        // same, via the Spark mode string
+df.Explain(ExplainMode.Simple);                // strongly-typed overload
+string text = df.ToExplainString(ExplainMode.Extended); // capture instead of print
 ```
+
+> **M1 door note.** `spark.Sql(...)` returns a DataFrame backed by an unresolved plan without executing
+> (the public file read-door `Read.Parquet`/`CreateDataFrame` is STORY-04.1.2 / #158); there is **no**
+> `spark.Read.Table(...)` in M1. Any door that yields a `DataFrame` works — `Explain` only builds and
+> renders plans.
 
 None of these executes the query — `Explain` is a debugging aid, not an action.
 
@@ -109,56 +124,66 @@ The story's acceptance criteria describe rendered **content**; the modes above d
 
 ```
 == Parsed Logical Plan ==
-'Project ['a, 'b]
-+- 'Filter ('>('age, '21))
+'Project ['name, 'age]
++- 'Filter (('age > 21))
    +- 'UnresolvedRelation [people]
 
 == Analyzed Logical Plan ==
-Project [a#0, b#1]
-+- Filter (age#2 > 21)
-   +- Relation people [a#0, b#1, age#2]
+Project [name#0, age#1]
++- Filter ((age#1 > 21))
+   +- ResolvedRelation [people], [name#0, age#1]
 
 == Optimized Logical Plan ==
-Project [a#0, b#1]
-+- Filter (age#2 > 21)
-   +- Relation people [a#0, b#1, age#2]
+Project [name#0, age#1]
++- Filter ((age#1 > 21))
+   +- ResolvedRelation [people], [name#0, age#1]
 
 == Physical Plan ==
-Project [a#0, b#1]
-+- Filter (#2 > 21)
-   +- Scan [a, b, age]
+Project [name#0, age#1]
++- Filter ((age#1 > 21))
+   +- Scan [name, age]
 ```
 
-`Simple` and `Formatted` emit only the `== Physical Plan ==` section. `Cost` emits the four logical/
-physical sections plus a diagnostic note that statistics are unavailable in M1. `Codegen` emits the
-physical section plus a diagnostic note that whole-stage codegen is not part of the M1 interpreted
-backend (ADR-0001).
+`Simple` emits only the `== Physical Plan ==` section. `Formatted` emits the physical section **plus** a
+diagnostic note that its per-node detail sections arrive with execution metrics (#176). `Cost` emits the
+four logical/physical sections plus a diagnostic note that statistics are unavailable in M1. `Codegen`
+emits the physical section plus a diagnostic note that whole-stage codegen is not part of the M1
+interpreted backend (ADR-0001).
 
 The logical trees are rendered by the **existing** `TreeNode<T>.TreeString()`
-(`src/DeltaSharp.Core/Plans/TreeNode.cs`), which already produces Spark's numbered/indented tree with
+(`src/DeltaSharp.Core/Plans/TreeNode.cs`), which already produces Spark's indented tree with
 `+-`/`:-` connectors and the leading-apostrophe unresolved marker (`LogicalPlan.UnresolvedPrefix`). We
 **reuse** it verbatim — no new logical renderer. Physical rendering (§5) mirrors the same connector
-format.
+format. (Neither renderer numbers nodes.)
 
 ---
 
 ## 4. How each stage is obtained (Core)
 
-`ExplainString(ExplainMode)` reuses the *exact* analyze+optimize path the actions use, so what
+`ExplainString(ExplainMode)` **analyzes the plan once** (a single `Resolve` pass via the private
+`TryAnalyze` helper), then reuses that one analyzed plan for *both* the logical analyzed/optimized
+sections *and* the physical section — so the rendered analyzed plan and the rendered physical plan can
+never come from divergent analyses. It resolves and optimizes on the same seam the actions use, so what
 `Explain` shows is what would run:
 
 1. **Parsed Logical Plan** — `this.Plan` (the unresolved `LogicalPlan` the DataFrame wraps).
    `Plan.TreeString()`. No session, no analysis, no execution.
-2. **Analyzed Logical Plan** — `new Analyzer(session.Catalog).Resolve(Plan)` (the same call
-   `Collect`/`Count` make in `DataFrame.AnalyzeForExecution`). Wrapped in `try/catch` (§6).
-3. **Optimized Logical Plan** — `DataFrame.Optimize(analyzed)` — the **same seam** the action pipeline
-   drives. In M1 that seam is an intentional identity pass
+2. **Analyzed Logical Plan** — the single `TryAnalyze` result, i.e. `new Analyzer(session.Catalog).Resolve(Plan)`
+   — the same `Resolve` call `Collect`/`Count` make (they route it through `DataFrame.AnalyzeForExecution`;
+   `Explain` calls it directly in `TryAnalyze` so it can capture a failure as a diagnostic). Wrapped in
+   `try/catch` (§6).
+3. **Optimized Logical Plan** — `DataFrame.Optimize(analyzed)` over that same analyzed plan — the **same
+   seam** the action pipeline drives. In M1 that seam is an intentional identity pass
    (`DataFrame.Optimize`, documented at `src/DeltaSharp.Core/Session/DataFrame.cs`), so the Optimized
    section is structurally identical to the Analyzed section. Spark also prints both sections even when
    they are equal; keeping `Explain` on the same seam guarantees the Optimized section always reflects
    what the executor will actually plan (when #415/#174 wire the real optimizer into the action
    pipeline, `Explain` follows automatically because it shares the seam).
-4. **Physical Plan** — `session.QueryExecutor.ExplainPhysical(optimized)` (§5). Planned, not executed.
+4. **Physical Plan** — `session.QueryExecutor.ExplainPhysical(Optimize(analyzed))` over the **same**
+   analyzed plan (§5). Planned, not executed.
+
+The whole output is normalized to end with exactly one newline: sections are separated by a blank line,
+but no trailing blank line is emitted after the final section (Spark layout parity).
 
 `ExplainString` obtains the session through the same `RequireSession` guard as the actions (so
 `Explain` after `Stop()` throws `SessionStoppedException`, Spark parity). A session-less internal frame
@@ -185,9 +210,15 @@ Implementations:
 - **`LocalQueryExecutor.ExplainPhysical`** (`DeltaSharp.Executor`) runs
   `new PhysicalPlanner(_scanSource).Plan(analyzedPlan)` — the *same* planner `Collect`/`Count` use —
   and returns `physicalPlan.TreeString()`. It does **not** call `PhysicalPlan.Execute`, so no operator
-  opens, no batch is read, no backend runs. Any `UnsupportedPlanException` (an operator/expression with
-  no M1 mapping, e.g. a `CrossJoin` or a `WriteToSource`) is **caught** and rendered as a diagnostic
-  line (§6), never rethrown.
+  opens, no batch is read, no backend runs. Two failure modes are caught and rendered as a diagnostic
+  line (§6), never rethrown: a specific `catch (UnsupportedPlanException)` (an operator/expression with
+  no M1 mapping, e.g. a `CrossJoin` or a `WriteToSource`) preserves the planner's precise message, and a
+  **broad** `catch (Exception ex)` fallback renders `<cannot plan physically: {ex.Message}>`. The broad
+  catch is required because `PhysicalPlanner.Plan` eagerly constructs Engine expressions during planning,
+  and some Engine expression constructors throw a raw `ArgumentException` for operand-type combinations
+  the analyzer *accepts* (e.g. `lit(null) == lit(null)` on `void`/`void`, or `array<int> == array<int>`).
+  The `IQueryExecutor.ExplainPhysical` contract is non-throwing (AC4), so those must degrade to a
+  diagnostic rather than escape.
 - **`UnsupportedQueryExecutor.ExplainPhysical`** (`DeltaSharp.Core`, the fail-closed default when no
   Executor is registered) returns a diagnostic line explaining that no execution backend is registered
   — it does **not** throw (unlike `Collect`/`Count`, which do). Physical mode therefore degrades
@@ -198,24 +229,33 @@ Implementations:
 `PhysicalPlan` gains a `NodeName`, a `SimpleString`, and a `TreeString()` that mirrors the Core
 `TreeNode` connector format (`+-`/`:-`). Each node renders its type and light, always-available
 metadata (output field names, join type, limit count, sort keys), plus a defensive expression renderer
-(`PhysicalExpressionText`) for predicates/projections/keys:
+(`PhysicalPlanText.Expr`) for predicates/projections/keys:
 
 | Physical node | `SimpleString` example |
 | --- | --- |
 | `ScanPlan` | `Scan [id, dept, salary]` |
-| `FilterPlan` | `Filter (#2 > 21)` |
-| `ProjectPlan` | `Project [id, salary]` |
-| `AggregatePlan` | `Aggregate keys=[#1], functions=[sum(#2)]` |
-| `JoinPlan` | `Join Inner [#1] = [#0]` |
-| `SortPlan` | `Sort [#2 DESC]` |
+| `FilterPlan` | `Filter ((salary#2 > 21))` |
+| `ProjectPlan` | `Project [id#0, salary#2]` |
+| `AggregatePlan` | `Aggregate keys=[dept#1], functions=[sum(salary#2)]` |
+| `JoinPlan` | `Join Inner [deptId#1] = [dId#0]` |
+| `SortPlan` | `Sort [salary#2 DESC] global` |
 | `LimitPlan` | `Limit 5` |
-| `UnionPlan` | `Union` |
+| `UnionPlan` | `Union [id, dept, salary]` |
 
-`PhysicalExpressionText` handles the known Engine expression leaves/nodes (`ColumnReference` → `#ord`,
+`ProjectPlan` renders the projection **expressions** (not just the output names), consistent with how
+Filter/Aggregate/Sort render theirs: a computed projection gets an `AS name` suffix
+(`Select((id+id).As("twice"))` → `Project [(id#0 + id#0) AS twice]`), while a bare column reference
+renders as just `name#ordinal`. `SortPlan` appends ` global` for a top-level (non-partition-local) sort,
+matching Spark's global/local distinction.
+
+`PhysicalPlanText.Expr` handles the known Engine expression leaves/nodes (`ColumnReference` →
+`name#ordinal` when the node's input `StructType` is available, else a bare `#ordinal`;
 `Literal` → its value, `ComparisonExpression`/`ArithmeticExpression`/`LogicalExpression` →
 `(l op r)`, `IsNullExpression` → `isnull(x)`/`isnotnull(x)`, `CastExpression` → `cast(x as T)`,
 `AggregateExpression` → `fn(x)`), and falls back to `TypeName(children…)` for anything unknown. It
-**never throws** — meaningful physical output must not become a crash (AC4).
+**never throws** — meaningful physical output must not become a crash (AC4). The `name#ordinal` form is
+best-effort: each physical node threads its child/input `OutputSchema` into `Expr`, so where the schema
+is cleanly available the ordinal is resolved to a name; where it is not, the bare `#ordinal` remains.
 
 > **Write nodes (AC3).** `WriteToSource` is visible in the logical/analyzed/optimized sections (it has
 > a `SimpleString`). The M1 physical planner has no write strategy yet (there is no public
@@ -233,10 +273,13 @@ metadata (output field names, join type, limit count, sort keys), plus a defensi
 - **Parsed section** is always renderable (it is a pure `TreeString` of the unresolved plan) and shows
   the leading-apostrophe markers for unresolved attributes/functions/relations
   (`TreeRenderTests` already pin this format).
-- **Analyzed/Optimized sections**: `Resolve`/`Optimize` are wrapped in `try/catch (AnalysisException)`.
-  A failure renders a single diagnostic line — e.g. `<cannot analyze: <message>>` — under the section
-  header instead of propagating. The Parsed section above it still shows the offending unresolved plan,
-  so diagnostics are *not hidden*.
+- **Analyzed/Optimized sections**: only `Resolve` is wrapped in `try/catch (AnalysisException)`
+  (`Optimize` is the M1 identity seam and is invoked *outside* the guard — it cannot fail in M1). A
+  resolution failure renders a single diagnostic line — e.g. `<cannot analyze plan: <message>>` — under
+  the section header instead of propagating. Because the plan is analyzed **once** (§4), a resolution
+  failure yields the *same* diagnostic under both the Analyzed and Optimized headers, and the physical
+  section renders its own no-plan diagnostic. The Parsed section above still shows the offending
+  unresolved plan, so diagnostics are *not hidden*.
 - **Physical section**: obtained via the seam, which is contractually non-throwing (§5). Unsupported
   operators/expressions and the no-backend case both become diagnostic lines.
 
@@ -274,10 +317,13 @@ This keeps the seam minimal (one method) while giving #176 a clear, non-breaking
   and the identity `Optimize` seam do no I/O and touch no backend (ADR-0001, lazy/eager invariant).
 - Physical rendering calls `PhysicalPlanner.Plan` only; it never calls `PhysicalPlan.Execute`. Planning
   reads batch *references* to build a `ScanPlan` but iterates no rows and opens no operator.
-- The `#169` execution audit seam (`ExecutionAudit`) records nothing during any `Explain` mode: no
-  `OnFileOpened`, no `OnRowsRead`, no `Planner`/`Backend` stage. The Core test suite asserts
-  `RecordingAudit.ObservedNoExecution` after `Explain(Extended)`, and the fake executor's
-  `Collect`/`Count` counters stay at zero.
+- The `#169` execution audit seam (`ExecutionAudit`) records no *execution* during any `Explain` mode.
+  `Explain` does enter the **Analyzer** stage (it calls `Resolve`, exactly as an action would), so it is
+  **not** true that zero stages are observed — `RecordingAudit.ObservedNoExecution` (which requires
+  `stageCount == 0`) would be *false* and must **not** be asserted. The real, testable guarantee is
+  narrower: `Explain` records the Analyzer stage but **no files or rows are read** (`OnFileOpened`/
+  `OnRowsRead` never fire), **no Planner or Backend stage** is entered, and the fake executor's
+  `Collect`/`Count` counters stay at zero. The Core suite asserts exactly that.
 
 ---
 
@@ -286,25 +332,34 @@ This keeps the seam minimal (one method) while giving #176 a clear, non-breaking
 **`DeltaSharp.Core.Tests`** (logical/extended, no execution — via `FakeQueryExecutor`):
 
 - AC1: `Explain(Extended)` Parsed section shows apostrophe-prefixed unresolved nodes; `Collect`/`Count`
-  never called; `RecordingAudit.ObservedNoExecution` holds.
+  never called; the audit records the Analyzer stage but no files/rows read and no Planner/Backend stage
+  (§8) — `RecordingAudit.ObservedNoExecution` is **not** asserted (Explain enters the Analyzer stage).
 - AC2: `Extended` emits the four `== … ==` headers in order; the Analyzed section has no apostrophe
   markers (resolved), and is rendered separately from the Parsed section.
 - AC3 (Core view): `Simple`/`Extended` include a `== Physical Plan ==` section carrying the fake
   executor's physical string.
-- AC4: a frame over an unknown relation/column renders a `<cannot analyze: …>` diagnostic (no throw),
-  and the no-backend path (default `UnsupportedQueryExecutor`) renders a physical diagnostic (no throw).
+- AC4: a frame over an unknown relation/column renders a `<cannot analyze plan: …>` diagnostic (no
+  throw), and the no-backend path (default `UnsupportedQueryExecutor`) renders a physical diagnostic (no
+  throw).
 - AC5: the physical string flows through unchanged; documents the metrics seam (no metrics in M1).
-- API: `Explain(true)`/`Explain(false)`, `Explain("extended")`/`Explain("simple")` parity; an unknown
-  mode string throws `ArgumentException`; `Explain` after `Stop()` throws `SessionStoppedException`.
+- API: `Explain(true)`/`Explain(false)`, `Explain("extended")`/`Explain("simple")` parity (pinned by a
+  Console-capture / `ToExplainString` mapping test); an unknown mode string throws `ArgumentException`;
+  `Explain` after `Stop()` throws `SessionStoppedException`.
+- `ToExplainString(mode)` returns the same text `Explain(mode)` prints, for every mode (public wrapper).
 - `Codegen`/`Cost`/`Formatted` render their documented sections + diagnostic notes.
 
 **`DeltaSharp.Executor.Tests`** (physical mode via the registered executor + `InMemoryRelationFixture`):
 
 - AC3: for each supported node (scan/filter/project/aggregate/join/sort/limit/union/distinct) the
-  physical string contains the expected operator line; nested trees use `+-`/`:-` connectors.
-- No-execution: `ExplainPhysical` returns the tree string and materializes no rows (a separate
-  `Collect` is the only path that runs).
+  physical string contains the expected operator line; nested trees use `+-`/`:-` connectors. `Project`
+  renders projection expressions (with `AS name` for computed columns).
+- No-execution: a rigorous oracle (`ExecutionSentinelScanSource`, whose batch list throws / increments a
+  counter on any access) drives `ExplainPhysical` and asserts **zero** batch accesses and no
+  `<cannot plan physically …>` diagnostic — the test fails if `ExplainPhysical` were changed to execute.
+  A subsequent `Collect` through the same source proves the sentinel *does* trip on real execution.
 - AC4: an unsupported node (`CrossJoin`, or a `WriteToSource` plan) renders a diagnostic line rather
-  than throwing `UnsupportedPlanException`.
+  than throwing `UnsupportedPlanException`; and a plan whose Engine expressions throw during planning
+  (`lit(null) == lit(null)`, `array<int> == array<int>`) renders a `<cannot plan physically: …>`
+  diagnostic via the real `LocalQueryExecutor` (broad-catch path) rather than throwing.
 - Seam: `session.QueryExecutor.ExplainPhysical(analyzed)` returns the physical string (proves the
   registered `LocalQueryExecutor` implements the extended seam).

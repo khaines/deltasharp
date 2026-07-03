@@ -637,6 +637,7 @@ public sealed class DataFrame
     /// executing.
     /// </summary>
     /// <param name="mode">The Spark explain-mode string.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="mode"/> is <see langword="null"/>.</exception>
     /// <exception cref="ArgumentException"><paramref name="mode"/> is not a recognised mode string.</exception>
     /// <exception cref="InvalidOperationException">This frame is not bound to a <see cref="SparkSession"/>.</exception>
     /// <exception cref="SessionStoppedException">The owning session has been stopped or disposed.</exception>
@@ -652,6 +653,20 @@ public sealed class DataFrame
     /// <exception cref="InvalidOperationException">This frame is not bound to a <see cref="SparkSession"/>.</exception>
     /// <exception cref="SessionStoppedException">The owning session has been stopped or disposed.</exception>
     public void Explain(ExplainMode mode) => Console.Out.Write(ExplainString(mode));
+
+    /// <summary>
+    /// Returns this query's plan rendered in the given <paramref name="mode"/> as a string, the
+    /// value-returning counterpart of <see cref="Explain(ExplainMode)"/> (which writes the same text to
+    /// the console for Spark parity). Like <c>Explain</c>, it renders <b>without executing</b> the query
+    /// (ADR-0001, lazy/eager invariant): logical/analyzed/optimized sections are produced entirely in
+    /// <c>DeltaSharp.Core</c>, and the physical section is planned through the executor seam but never
+    /// run. Useful for capturing the plan in logs, tests, or diagnostics without redirecting the console.
+    /// </summary>
+    /// <param name="mode">The explain mode (defaults to <see cref="ExplainMode.Simple"/>).</param>
+    /// <returns>The rendered, newline-terminated plan text.</returns>
+    /// <exception cref="InvalidOperationException">This frame is not bound to a <see cref="SparkSession"/>.</exception>
+    /// <exception cref="SessionStoppedException">The owning session has been stopped or disposed.</exception>
+    public string ToExplainString(ExplainMode mode = ExplainMode.Simple) => ExplainString(mode);
 
     /// <summary>
     /// Builds the Spark-style table string that <see cref="Show(int, bool)"/> prints, returning it
@@ -775,40 +790,49 @@ public sealed class DataFrame
         SparkSession session = RequireSession(nameof(Explain));
         var builder = new StringBuilder();
 
+        // Analyze ONCE (AC4-guarded) at the top: BOTH the analyzed/optimized logical sections and the
+        // physical section render from this SINGLE analysis pass, so the rendered analyzed plan and the
+        // rendered physical plan can never come from divergent analyses. Analysis is NOT execution
+        // (ADR-0001 lazy/eager holds); a resolution failure is captured as a diagnostic string, not an
+        // escaping exception (AC4) — the Parsed section below still shows the offending unresolved plan.
+        bool resolved = TryAnalyze(session, out LogicalPlan? analyzed, out string? diagnostic);
+
         bool includeLogical = mode is ExplainMode.Extended or ExplainMode.Cost;
         if (includeLogical)
         {
             AppendSection(builder, "Parsed Logical Plan", Plan.TreeString());
 
-            // Analyze + optimize on the SAME seam the actions use (AnalyzeForExecution/Optimize), so the
-            // rendered plans reflect what the executor will actually plan. A resolution failure is a
-            // diagnostic line, not an escaping exception (AC4) — the Parsed section above still shows the
-            // offending unresolved plan, so the diagnostic is not hidden.
-            if (TryAnalyze(session, out LogicalPlan? analyzed, out string? analysisDiagnostic))
+            if (resolved)
             {
                 AppendSection(builder, "Analyzed Logical Plan", analyzed!.TreeString());
                 AppendSection(builder, "Optimized Logical Plan", Optimize(analyzed!).TreeString());
             }
             else
             {
-                AppendSection(builder, "Analyzed Logical Plan", analysisDiagnostic!);
-                AppendSection(builder, "Optimized Logical Plan", analysisDiagnostic!);
+                AppendSection(builder, "Analyzed Logical Plan", diagnostic!);
+                AppendSection(builder, "Optimized Logical Plan", diagnostic!);
             }
         }
 
-        AppendSection(builder, "Physical Plan", PhysicalPlanText(session));
+        AppendSection(builder, "Physical Plan", RenderPhysicalSection(session, resolved, analyzed, diagnostic));
 
         AppendModeNote(builder, mode);
-        return builder.ToString();
+
+        // Spark separates sections with a blank line but does NOT emit a trailing blank line after the
+        // final section; AppendSection appends a separator after every section, so normalize the whole
+        // output to end with exactly one newline (Architect layout parity).
+        return builder.ToString().TrimEnd('\n') + "\n";
     }
 
     /// <summary>
     /// Renders the physical-plan section by planning (not executing) through the session's execution
-    /// seam. When the plan cannot be analyzed, the physical section carries the analysis diagnostic; the
+    /// seam, reusing the <b>single</b> analysis pass <see cref="ExplainString"/> already performed. When
+    /// the plan could not be analyzed, the physical section carries that same analysis diagnostic; the
     /// seam itself is contractually non-throwing (unsupported operators / no-backend become diagnostics).
     /// </summary>
-    private string PhysicalPlanText(SparkSession session) =>
-        TryAnalyze(session, out LogicalPlan? analyzed, out string? diagnostic)
+    private static string RenderPhysicalSection(
+        SparkSession session, bool resolved, LogicalPlan? analyzed, string? diagnostic) =>
+        resolved
             ? session.QueryExecutor.ExplainPhysical(Optimize(analyzed!))
             : diagnostic!;
 

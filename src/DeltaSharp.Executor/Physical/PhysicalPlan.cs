@@ -50,6 +50,11 @@ internal abstract class PhysicalPlan
     /// </summary>
     public string TreeString()
     {
+        // Recursion-depth bound: this walk mirrors the physical tree, whose depth is INHERITED from
+        // Core's TreeNode (MaxDepth=1000, rejected at logical-plan construction) times the planner's
+        // ≤2× node multiplier (e.g. Distinct → Project-over-Aggregate), so no physical-side depth guard
+        // is needed today. A physical-only build path (one that never builds the logical tree) or a
+        // raised TreeNode.MaxDepth would remove that inherited bound and MUST add a physical depth guard.
         var builder = new System.Text.StringBuilder();
         GenerateTreeString(0, new List<bool>(), builder);
         return builder.ToString();
@@ -141,7 +146,7 @@ internal sealed class FilterPlan : PhysicalPlan
     public override string NodeName => "Filter";
 
     /// <inheritdoc/>
-    public override string SimpleString => $"Filter ({PhysicalPlanText.Expr(_predicate)})";
+    public override string SimpleString => $"Filter ({PhysicalPlanText.Expr(_predicate, _child.OutputSchema)})";
 
     public override BatchResult Execute(PhysicalRuntime runtime)
     {
@@ -174,7 +179,7 @@ internal sealed class ProjectPlan : PhysicalPlan
 
     /// <inheritdoc/>
     public override string SimpleString =>
-        $"Project {PhysicalPlanText.Columns(OutputSchema)}";
+        $"Project {PhysicalPlanText.ProjectionList(_projections, _child.OutputSchema, OutputSchema)}";
 
     public override BatchResult Execute(PhysicalRuntime runtime)
     {
@@ -217,8 +222,8 @@ internal sealed class AggregatePlan : PhysicalPlan
 
     /// <inheritdoc/>
     public override string SimpleString =>
-        $"Aggregate keys={PhysicalPlanText.ExprList(_groupingKeys)}, "
-        + $"functions={PhysicalPlanText.AggregateList(_aggregates)}";
+        $"Aggregate keys={PhysicalPlanText.ExprList(_groupingKeys, _child.OutputSchema)}, "
+        + $"functions={PhysicalPlanText.AggregateList(_aggregates, _child.OutputSchema)}";
 
     public override BatchResult Execute(PhysicalRuntime runtime)
     {
@@ -269,7 +274,7 @@ internal sealed class JoinPlan : PhysicalPlan
 
     /// <inheritdoc/>
     public override string SimpleString =>
-        $"Join {JoinType} {PhysicalPlanText.ExprList(_leftKeys)} = {PhysicalPlanText.ExprList(_rightKeys)}";
+        $"Join {JoinType} {PhysicalPlanText.ExprList(_leftKeys, _left.OutputSchema)} = {PhysicalPlanText.ExprList(_rightKeys, _right.OutputSchema)}";
 
     public override BatchResult Execute(PhysicalRuntime runtime)
     {
@@ -311,7 +316,7 @@ internal sealed class SortPlan : PhysicalPlan
 
     /// <inheritdoc/>
     public override string SimpleString =>
-        $"Sort {PhysicalPlanText.SortList(_sortOrders)}{(_global ? " global" : string.Empty)}";
+        $"Sort {PhysicalPlanText.SortList(_sortOrders, _child.OutputSchema)}{(_global ? " global" : string.Empty)}";
 
     public override BatchResult Execute(PhysicalRuntime runtime)
     {

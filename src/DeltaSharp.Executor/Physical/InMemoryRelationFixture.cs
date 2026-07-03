@@ -54,6 +54,32 @@ internal sealed class InMemoryRelationFixture
         return new DataFrame(new UnresolvedRelation(new[] { name }));
     }
 
+    /// <summary>
+    /// Registers a relation and returns a <see cref="DataFrame"/> <b>bound to <paramref name="session"/></b>
+    /// (so <c>DataFrame.Explain</c>/<c>ToExplainString</c>, which require a session, render through the
+    /// full Core↔Executor seam). The schema registers in both the fixture catalog and the session catalog,
+    /// and the batches register in this fixture's scan source — use <c>useDefaultScanSource: true</c> so the
+    /// session's own <see cref="LocalQueryExecutor"/> (backed by <see cref="InMemoryScanSource.Default"/>)
+    /// resolves the same batches.
+    /// </summary>
+    /// <param name="session">The session to bind the frame to (and register the schema in).</param>
+    /// <param name="name">The relation name (single-part identifier).</param>
+    /// <param name="schema">The relation schema.</param>
+    /// <param name="batches">The backing batches (each must conform to <paramref name="schema"/>).</param>
+    /// <returns>A session-bound <see cref="DataFrame"/> over the relation.</returns>
+    public DataFrame RelationBoundTo(SparkSession session, string name, StructType schema, params ColumnBatch[] batches)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        ArgumentNullException.ThrowIfNull(name);
+        ArgumentNullException.ThrowIfNull(schema);
+        ArgumentNullException.ThrowIfNull(batches);
+
+        _catalog.Register(name, schema);
+        session.Catalog.Register(name, schema);
+        _scanSource.Register(new[] { name }, schema, batches);
+        return new DataFrame(session, new UnresolvedRelation(new[] { name }));
+    }
+
     /// <summary>Analyzes a DataFrame's logical plan through the real Core analyzer.</summary>
     /// <param name="frame">The DataFrame whose plan to analyze.</param>
     /// <returns>The analyzed logical plan.</returns>
@@ -75,6 +101,47 @@ internal sealed class InMemoryRelationFixture
     /// <returns>The rendered physical-plan tree (or a diagnostic line for an unsupported plan).</returns>
     public string ExplainPhysical(DataFrame frame) =>
         new LocalQueryExecutor(_scanSource, ExecutionBackendOptions.Default).ExplainPhysical(Analyze(frame));
+
+    /// <summary>
+    /// Renders a DataFrame's physical plan through a <see cref="LocalQueryExecutor"/> backed by an
+    /// <see cref="ExecutionSentinelScanSource"/> whose batches trip on any read, returning the tree and
+    /// the sentinel's batch-access count. Pure physical planning stores only the batch reference, so a
+    /// correct (non-executing) <see cref="LocalQueryExecutor.ExplainPhysical"/> leaves the count at 0.
+    /// </summary>
+    /// <param name="frame">The DataFrame to explain.</param>
+    /// <returns>The rendered tree and the number of times the sentinel batches were accessed.</returns>
+    public (string Tree, int BatchAccessCount) ExplainPhysicalWatched(DataFrame frame)
+    {
+        var sentinel = new ExecutionSentinelScanSource();
+        var executor = new LocalQueryExecutor(sentinel, ExecutionBackendOptions.Default);
+        string tree = executor.ExplainPhysical(Analyze(frame));
+        return (tree, sentinel.BatchAccessCount);
+    }
+
+    /// <summary>
+    /// Attempts to execute (<c>Collect</c>) a DataFrame through a <see cref="LocalQueryExecutor"/> backed
+    /// by an <see cref="ExecutionSentinelScanSource"/>, returning the sentinel's batch-access count. Real
+    /// execution reads the batches, so the count is <c>&gt; 0</c> (proving the sentinel discriminates
+    /// execution from planning); the sentinel's trip exception is swallowed.
+    /// </summary>
+    /// <param name="frame">The DataFrame to execute against the sentinel source.</param>
+    /// <returns>The number of times the sentinel batches were accessed during the execution attempt.</returns>
+    public int CountBatchAccessesDuringCollect(DataFrame frame)
+    {
+        var sentinel = new ExecutionSentinelScanSource();
+        var executor = new LocalQueryExecutor(sentinel, ExecutionBackendOptions.Default);
+        try
+        {
+            _ = executor.Collect(Analyze(frame));
+        }
+        catch (Exception)
+        {
+            // Expected: executing the plan reads the sentinel batches, which trip. Any wrapping is fine —
+            // the discriminator is the batch-access count, asserted by the caller.
+        }
+
+        return sentinel.BatchAccessCount;
+    }
 
     /// <summary>Renders a DataFrame's physical plan through a <see cref="SparkSession"/>'s registered
     /// executor (full Core↔Executor seam).</summary>

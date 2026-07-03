@@ -283,6 +283,77 @@ public sealed class DataFrameExplainTests
         }
     }
 
+    // ----- Public string API (ToExplainString) + void-overload → mode mappings -----
+
+    [Theory]
+    [InlineData(ExplainMode.Simple)]
+    [InlineData(ExplainMode.Extended)]
+    [InlineData(ExplainMode.Codegen)]
+    [InlineData(ExplainMode.Cost)]
+    [InlineData(ExplainMode.Formatted)]
+    public void ToExplainString_ReturnsSameText_AsExplainString_PerMode(ExplainMode mode)
+    {
+        var executor = NewExecutor();
+        (SparkSession spark, DataFrame df) = NewBoundFrame(executor);
+        using (spark)
+        {
+            DataFrame query = df.Select(Col("name")).Filter(Col("age").Gt(21));
+
+            string captured = query.ToExplainString(mode);
+
+            Assert.Equal(query.ExplainString(mode), captured);
+            Assert.Contains("== Physical Plan ==", captured);
+            // Public string API renders WITHOUT executing (same invariant as Explain).
+            Assert.Equal(0, executor.CollectCallCount);
+            Assert.Equal(0, executor.CountCallCount);
+        }
+    }
+
+    [Fact]
+    public void ToExplainString_DefaultsToSimpleMode()
+    {
+        var executor = NewExecutor();
+        (SparkSession spark, DataFrame df) = NewBoundFrame(executor);
+        using (spark)
+        {
+            Assert.Equal(df.ToExplainString(ExplainMode.Simple), df.ToExplainString());
+        }
+    }
+
+    [Fact]
+    public void Explain_VoidOverloads_MapToExpectedModes()
+    {
+        var executor = NewExecutor();
+        (SparkSession spark, DataFrame df) = NewBoundFrame(executor);
+        using (spark)
+        {
+            // explain() and explain(false) -> Simple; explain(true) -> Extended (Spark parity). Pin the
+            // mapping by capturing what the void overloads print and comparing to ToExplainString.
+            Assert.Equal(df.ToExplainString(ExplainMode.Simple), Capture(() => df.Explain()));
+            Assert.Equal(df.ToExplainString(ExplainMode.Simple), Capture(() => df.Explain(false)));
+            Assert.Equal(df.ToExplainString(ExplainMode.Extended), Capture(() => df.Explain(true)));
+            Assert.Equal(df.ToExplainString(ExplainMode.Cost), Capture(() => df.Explain(ExplainMode.Cost)));
+        }
+    }
+
+    /// <summary>Captures what an <c>Explain(...)</c> void overload prints to the console.</summary>
+    private static string Capture(Action action)
+    {
+        System.IO.TextWriter original = Console.Out;
+        var buffer = new System.IO.StringWriter();
+        Console.SetOut(buffer);
+        try
+        {
+            action();
+        }
+        finally
+        {
+            Console.SetOut(original);
+        }
+
+        return buffer.ToString();
+    }
+
     /// <summary>Reads the body of a named EXPLAIN section (from its header to the next header or EOF).</summary>
     private static string Section(string explainText, string title)
     {

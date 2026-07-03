@@ -201,6 +201,7 @@ DeltaSharp.DataFrame.Explain() -> void
 DeltaSharp.DataFrame.Explain(bool extended) -> void
 DeltaSharp.DataFrame.Explain(string! mode) -> void
 DeltaSharp.DataFrame.Explain(DeltaSharp.ExplainMode mode) -> void
+DeltaSharp.DataFrame.ToExplainString(DeltaSharp.ExplainMode mode = DeltaSharp.ExplainMode.Simple) -> string!
 DeltaSharp.ExplainMode
 DeltaSharp.ExplainMode.Simple = 0 -> DeltaSharp.ExplainMode
 DeltaSharp.ExplainMode.Extended = 1 -> DeltaSharp.ExplainMode
