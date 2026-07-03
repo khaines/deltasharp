@@ -63,6 +63,14 @@ internal sealed class PhysicalRuntime : IDisposable
     /// <summary>The aggregate estimated data-plane bytes scanned across every genuine source read (diagnostics).</summary>
     public long BytesScanned => _bytesScanned;
 
+    /// <summary>
+    /// The run's <b>effective</b> cancellation token (user cancellation linked with any timeout). Exposed so
+    /// a deferred source read that materializes outside <see cref="Run"/>'s per-batch poll — the #158
+    /// <c>LocalRelation</c> row→batch encode in <see cref="ScanPlan.Execute"/> — can poll it while draining
+    /// its source, keeping cancellation/timeout deterministic for that plan shape too (STORY-04.6.4 AC2).
+    /// </summary>
+    public CancellationToken CancellationToken => _cancellationToken;
+
     /// <summary>The high-water reserved execution memory across every operator run (diagnostics).</summary>
     public long PeakMemoryBytes => _peakMemoryBytes;
 

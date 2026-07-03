@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
 using DeltaSharp.Engine.Columnar;
+using DeltaSharp.Plans.Logical;
 using DeltaSharp.Types;
 
 namespace DeltaSharp.Executor;
@@ -26,37 +27,56 @@ internal static class LocalRelationBatches
     /// which a lazily-created DataFrame's rows are finally read).</summary>
     /// <param name="schema">The authoritative relation schema.</param>
     /// <param name="data">The in-memory rows, read positionally against <paramref name="schema"/>.</param>
+    /// <param name="cancellationToken">The run's effective token (user cancellation linked with any
+    /// timeout). Threaded into the <b>source drain</b> so a slow/large/unbounded source honors
+    /// cancel/timeout: a <c>LocalRelation</c>'s rows are a <c>MemoizedRowSequence</c> that snapshots the
+    /// user <see cref="IEnumerable{T}"/> <b>eagerly</b> (in Core) on first read, so its token-aware
+    /// <c>Snapshot</c> polls per source row while draining; a raw sequence is drained here the same way.
+    /// This deferred encode runs in <c>ScanPlan.Execute</c> — between the driver's upfront gate and
+    /// <c>PhysicalRuntime.Run</c>'s per-batch poll — so without this the source drain would run past a
+    /// cancellation/timeout (STORY-04.6.4 AC2). Encoding also polls every 1024 rows for a large relation.</param>
     /// <returns>A single-element list holding the encoded batch (a zero-row batch when empty).</returns>
     /// <exception cref="UnsupportedPlanException">A row's arity or a value's CLR type does not match the
     /// schema, or a value cannot be encoded onto its lane.</exception>
-    public static IReadOnlyList<ColumnBatch> Build(StructType schema, IEnumerable<Row> data)
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled
+    /// (surfaced by the driver as an <see cref="OperationCanceledException"/> or a timeout).</exception>
+    public static IReadOnlyList<ColumnBatch> Build(
+        StructType schema, IEnumerable<Row> data, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(schema);
         ArgumentNullException.ThrowIfNull(data);
 
-        var rows = new List<Row>();
-        foreach (Row row in data)
+        IReadOnlyList<Row> rows = Drain(data, cancellationToken);
+
+        int rowCount = rows.Count;
+        int columnCount = schema.Count;
+
+        // Validate arity/null once up front (a Stage=Scan data error), polling every 1024 rows so a very
+        // large relation stays cancellable during validation too.
+        for (int r = 0; r < rowCount; r++)
         {
-            if (row is null)
+            if ((r & CancellationPollMask) == 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
+            Row current = rows[r];
+            if (current is null)
             {
                 throw new UnsupportedPlanException(
                     QueryExecutionStage.Scan,
                     "A LocalRelation row is null; every row supplied to CreateDataFrame must be a Row.");
             }
 
-            if (row.Length != schema.Count)
+            if (current.Length != columnCount)
             {
                 throw new UnsupportedPlanException(
                     QueryExecutionStage.Scan,
-                    $"A LocalRelation row has {row.Length} value(s) but the schema declares "
-                    + $"{schema.Count} column(s); every row must match the schema arity.");
+                    $"A LocalRelation row has {current.Length} value(s) but the schema declares "
+                    + $"{columnCount} column(s); every row must match the schema arity.");
             }
-
-            rows.Add(row);
         }
 
-        int rowCount = rows.Count;
-        int columnCount = schema.Count;
         var columns = new ColumnVector[columnCount];
         for (int c = 0; c < columnCount; c++)
         {
@@ -64,6 +84,13 @@ internal static class LocalRelationBatches
             MutableColumnVector vector = ColumnVectors.Create(field.DataType, Math.Max(rowCount, 1));
             for (int r = 0; r < rowCount; r++)
             {
+                // The source is fully drained (in memory) by here, so a coarser every-1024-rows poll
+                // suffices to bound the uncancellable encode of a very large collected relation.
+                if ((r & CancellationPollMask) == 0)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+
                 object? value = rows[r][c];
                 if (value is null)
                 {
@@ -80,6 +107,32 @@ internal static class LocalRelationBatches
 
         return new ColumnBatch[] { new ManagedColumnBatch(schema, columns, rowCount) };
     }
+
+    // Drains the LocalRelation's rows cancellation-aware. The rows are normally a MemoizedRowSequence whose
+    // snapshot drains the user IEnumerable EAGERLY on first read (in Core); its Snapshot(token) overload
+    // threads the per-row poll INTO that drain, which is the actual point a slow/large/unbounded source is
+    // pulled. A raw sequence (a direct Build call, e.g. a test) is drained here with the same per-row poll.
+    private static IReadOnlyList<Row> Drain(IEnumerable<Row> data, CancellationToken cancellationToken)
+    {
+        if (data is MemoizedRowSequence memoized)
+        {
+            return memoized.Snapshot(cancellationToken);
+        }
+
+        var rows = new List<Row>();
+        foreach (Row row in data)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            rows.Add(row);
+        }
+
+        return rows;
+    }
+
+    // Poll cancellation every 1024 rows (power-of-two mask) while encoding the already-collected rows,
+    // matching RowMaterializer.CancellationPollMask so the two inverse encode/decode paths bound
+    // uncancellable in-memory work identically.
+    private const int CancellationPollMask = 1023;
 
     private static void Append(MutableColumnVector vector, StructField field, object value)
     {

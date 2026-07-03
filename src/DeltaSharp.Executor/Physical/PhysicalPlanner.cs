@@ -125,7 +125,7 @@ internal sealed class PhysicalPlanner
         // the first action's execution. The relation schema is authoritative.
         StructType schema = relation.Schema;
         IEnumerable<Row> data = relation.Data;
-        return new ScanPlan(schema, () => LocalRelationBatches.Build(schema, data));
+        return new ScanPlan(schema, token => LocalRelationBatches.Build(schema, data, token));
     }
 
     private PhysicalPlan PlanFilter(LogicalFilter filter, LogicalOutput outputs)

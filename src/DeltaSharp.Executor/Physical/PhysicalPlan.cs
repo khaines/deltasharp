@@ -103,7 +103,7 @@ internal abstract class PhysicalPlan
 /// enumeration or I/O (STORY-04.1.2 / #158).</summary>
 internal sealed class ScanPlan : PhysicalPlan
 {
-    private readonly Func<IReadOnlyList<ColumnBatch>> _batchesFactory;
+    private readonly Func<CancellationToken, IReadOnlyList<ColumnBatch>> _batchesFactory;
     private IReadOnlyList<ColumnBatch>? _batches;
 
     /// <summary>Creates a scan over already-materialized <paramref name="batches"/>.</summary>
@@ -111,12 +111,14 @@ internal sealed class ScanPlan : PhysicalPlan
         : base(outputSchema)
     {
         _batches = batches ?? throw new ArgumentNullException(nameof(batches));
-        _batchesFactory = static () => throw new InvalidOperationException("Batches are already materialized.");
+        _batchesFactory = static _ => throw new InvalidOperationException("Batches are already materialized.");
     }
 
     /// <summary>Creates a scan whose batches are produced lazily by <paramref name="batchesFactory"/> on
-    /// first <see cref="Execute"/> (no enumeration/encoding happens at planning time).</summary>
-    public ScanPlan(StructType outputSchema, Func<IReadOnlyList<ColumnBatch>> batchesFactory)
+    /// first <see cref="Execute"/> (no enumeration/encoding happens at planning time). The factory receives
+    /// the run's effective cancellation token so a slow/large deferred source can be cancelled/timed out
+    /// while it drains (STORY-04.6.4 AC2).</summary>
+    public ScanPlan(StructType outputSchema, Func<CancellationToken, IReadOnlyList<ColumnBatch>> batchesFactory)
         : base(outputSchema)
     {
         _batchesFactory = batchesFactory ?? throw new ArgumentNullException(nameof(batchesFactory));
@@ -132,7 +134,7 @@ internal sealed class ScanPlan : PhysicalPlan
 
     /// <inheritdoc/>
     public override BatchResult Execute(PhysicalRuntime runtime)
-        => new(OutputSchema, _batches ??= _batchesFactory());
+        => new(OutputSchema, _batches ??= _batchesFactory(runtime.CancellationToken));
 }
 
 /// <summary>Maps <c>Filter</c> to an EPIC-03 <see cref="FilterOperator"/>.</summary>

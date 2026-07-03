@@ -55,7 +55,21 @@ internal sealed class MemoizedRowSequence : IEnumerable<Row>
     /// <inheritdoc/>
     IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
 
-    private IReadOnlyList<Row> Snapshot()
+    /// <summary>
+    /// Returns the memoized snapshot, taking it (on the first call) by draining the source into an
+    /// immutable list. The <paramref name="cancellationToken"/> is polled <b>per source row</b> during that
+    /// first drain, so a slow/large/unbounded source honors cancellation/timeout — the drain is the point
+    /// at which the deferred read door (STORY-04.1.2) actually pulls the user <see cref="IEnumerable{Row}"/>,
+    /// and it runs inside the executor's <c>ScanPlan.Execute</c>, outside <c>PhysicalRuntime.Run</c>'s
+    /// per-batch cancellation poll (STORY-04.6.4 AC2 / #425). Subsequent calls replay the cached snapshot
+    /// and never re-drain, so the token only bounds the one-time source read.
+    /// </summary>
+    /// <param name="cancellationToken">The run's effective token, polled per source row during the first
+    /// drain. Defaults to <see cref="CancellationToken.None"/> for enumeration outside an execution run.</param>
+    /// <returns>The stable, replayable row snapshot.</returns>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled
+    /// mid-drain (the snapshot is not published, so a later call re-attempts the drain).</exception>
+    internal IReadOnlyList<Row> Snapshot(CancellationToken cancellationToken = default)
     {
         IReadOnlyList<Row>? snapshot = Volatile.Read(ref _snapshot);
         if (snapshot is not null)
@@ -70,6 +84,9 @@ internal sealed class MemoizedRowSequence : IEnumerable<Row>
                 var buffer = new List<Row>();
                 foreach (Row row in _source!)
                 {
+                    // The eager source drain is the actual (potentially slow/unbounded) read; poll per row
+                    // so cancellation/timeout is honored here rather than only after the whole drain (#425).
+                    cancellationToken.ThrowIfCancellationRequested();
                     buffer.Add(row);
                 }
 

@@ -96,6 +96,14 @@ bypasses `PhysicalRuntime.Run`'s per-batch poll:
   while building the `Row` list, and `RowMaterializer.CountRows` polls per drained batch, bounding a
   single huge batch's uncancellable materialization/count exactly as `CancellationPolicy` bounds the
   interpreted loops.
+- The #158 `LocalRelation` **deferred encode** (`ScanPlan.Execute` → `LocalRelationBatches.Build`) drains
+  the user `IEnumerable<Row>` a `CreateDataFrame` carries. That source is normally a `MemoizedRowSequence`
+  that snapshots the source **eagerly** on first read, so the token is threaded into that drain
+  (`MemoizedRowSequence.Snapshot(token)`, polled **per source row**) — a slow/large/unbounded
+  `CreateDataFrame` source therefore honors cancellation/timeout *during* the encode, not only after it
+  drains. This closes the one plan shape that runs a source read between the upfront gate and `Run`'s
+  per-batch poll (STORY-04.6.4 AC2). The encode's `OperationCanceledException` unwinds through the
+  `Backend`-stage catch, so a timeout there still surfaces as `TimeoutException`.
 
 ### 2.3 Deterministic disposal & batch ownership (discharges #420)
 
