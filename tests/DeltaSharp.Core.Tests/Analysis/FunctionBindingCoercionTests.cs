@@ -575,7 +575,8 @@ public class FunctionBindingCoercionTests
         // A null-predicate CASE condition (IsNull/IsNotNull/EqualNullSafe) is boolean-typed and valid,
         // so the :116 branch/else mismatch renders it via the pretty renderer — `(i IS NULL)`, never
         // the internal `(i#0 IS NULL)`. Guards the total-by-construction ExprId-free invariant against
-        // the null-predicate node family (whack-a-mole regression: these hit the generic fallback).
+        // the null-predicate node family: these now have bespoke pretty arms (before this fix they hit
+        // the ExprId-leaking SimpleString fallback; the generic PrettyFallback is the leak-proof net).
         var analyzer = NumbersAnalyzer();
         var caseWhen = new CaseWhen(new IsNull(Col("i")), Col("i")).WithElse(Col("s"));  // int vs string
         var project = new Project(new[] { new Alias(caseWhen, "r") }, Relation("nums"));
