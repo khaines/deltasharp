@@ -75,15 +75,30 @@ internal abstract class PhysicalPlan
     }
 }
 
-/// <summary>A leaf scan over in-memory batches supplied by an <see cref="IScanSource"/> (the M1 data-in door; the public read-door is STORY-04.1.2 / #158).</summary>
+/// <summary>A leaf scan over in-memory batches. The batches are supplied either eagerly (an
+/// <see cref="IScanSource"/> catalog scan already holds them) or via a <b>lazy thunk</b> evaluated on
+/// first <see cref="Execute"/> — the latter lets a <c>LocalRelation</c> defer row→batch encoding out of
+/// physical planning so <see cref="PhysicalPlanner.Plan"/> (and thus #179 <c>Explain</c>) performs no
+/// enumeration or I/O (STORY-04.1.2 / #158).</summary>
 internal sealed class ScanPlan : PhysicalPlan
 {
-    private readonly IReadOnlyList<ColumnBatch> _batches;
+    private readonly Func<IReadOnlyList<ColumnBatch>> _batchesFactory;
+    private IReadOnlyList<ColumnBatch>? _batches;
 
+    /// <summary>Creates a scan over already-materialized <paramref name="batches"/>.</summary>
     public ScanPlan(StructType outputSchema, IReadOnlyList<ColumnBatch> batches)
         : base(outputSchema)
     {
         _batches = batches ?? throw new ArgumentNullException(nameof(batches));
+        _batchesFactory = static () => throw new InvalidOperationException("Batches are already materialized.");
+    }
+
+    /// <summary>Creates a scan whose batches are produced lazily by <paramref name="batchesFactory"/> on
+    /// first <see cref="Execute"/> (no enumeration/encoding happens at planning time).</summary>
+    public ScanPlan(StructType outputSchema, Func<IReadOnlyList<ColumnBatch>> batchesFactory)
+        : base(outputSchema)
+    {
+        _batchesFactory = batchesFactory ?? throw new ArgumentNullException(nameof(batchesFactory));
     }
 
     public override IReadOnlyList<PhysicalPlan> Children => Array.Empty<PhysicalPlan>();
@@ -94,7 +109,8 @@ internal sealed class ScanPlan : PhysicalPlan
     /// <inheritdoc/>
     public override string SimpleString => $"Scan {PhysicalPlanText.Columns(OutputSchema)}";
 
-    public override BatchResult Execute(PhysicalRuntime runtime) => new(OutputSchema, _batches);
+    public override BatchResult Execute(PhysicalRuntime runtime) =>
+        new(OutputSchema, _batches ??= _batchesFactory());
 }
 
 /// <summary>Maps <c>Filter</c> to an EPIC-03 <see cref="FilterOperator"/>.</summary>
