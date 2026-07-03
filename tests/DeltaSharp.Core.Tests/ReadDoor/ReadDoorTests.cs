@@ -256,6 +256,7 @@ public sealed class ReadDoorTests
 
         Assert.Contains("badOption", ex.Message);
         Assert.Contains("Schema", ex.Message);
+        Assert.Null(ex.ParamName); // no private-var leak: single-arg ArgumentException (DX council nit)
     }
 
     [Theory]

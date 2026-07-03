@@ -254,6 +254,24 @@ public class ReadDoorEndToEndTests
         Assert.Equal(0, source.EnumerationCount);
     }
 
+    [Fact]
+    public void ExplainPhysical_OverCreateDataFrame_DoesNotEnumerateTheSource()
+    {
+        // Cross-lane integration (#158 read-door × #179 Explain): the real IQueryExecutor.ExplainPhysical
+        // seam plans a CreateDataFrame LocalRelation and renders its tree WITHOUT enumerating the user
+        // source — the row→batch encoding is deferred to ScanPlan.Execute (M3), so Explain over an
+        // IO-backed source stays IO-free.
+        using SparkSession spark = NewSession();
+        var schema = new StructType(new[] { new StructField("id", IntegerType.Instance, nullable: false) });
+        var source = new CountingRowSequence(new[] { new Row(schema, 1), new Row(schema, 2) });
+        DataFrame df = spark.CreateDataFrame(source, schema);
+
+        string tree = new InMemoryRelationFixture().ExplainPhysical(df);
+
+        Assert.Contains("Scan", tree);            // the LocalRelation renders as a physical Scan node
+        Assert.Equal(0, source.EnumerationCount); // Explain planned it without enumerating the source
+    }
+
     /// <summary>An <see cref="IEnumerable{Row}"/> that counts how many times it is enumerated, so a test
     /// can prove CreateDataFrame is lazy (zero until an action) and materialization enumerates once.</summary>
     private sealed class CountingRowSequence : IEnumerable<Row>
