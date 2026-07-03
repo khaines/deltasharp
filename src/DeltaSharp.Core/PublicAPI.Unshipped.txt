@@ -7,6 +7,8 @@ DeltaSharp.Column.Otherwise(object? value) -> DeltaSharp.Column!
 DeltaSharp.Column.When(DeltaSharp.Column! condition, object? value) -> DeltaSharp.Column!
 DeltaSharp.DataFrame
 DeltaSharp.DataFrame.Agg(DeltaSharp.Column! expr, params DeltaSharp.Column![]! exprs) -> DeltaSharp.DataFrame!
+DeltaSharp.DataFrame.Collect() -> System.Collections.Generic.IReadOnlyList<DeltaSharp.Row!>!
+DeltaSharp.DataFrame.Count() -> long
 DeltaSharp.DataFrame.CrossJoin(DeltaSharp.DataFrame! right) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.Distinct() -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.Filter(DeltaSharp.Column! condition) -> DeltaSharp.DataFrame!
@@ -23,6 +25,7 @@ DeltaSharp.DataFrame.OrderBy(params DeltaSharp.Column![]! columns) -> DeltaSharp
 DeltaSharp.DataFrame.OrderBy(string! column, params string![]! columns) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.Select(params DeltaSharp.Column![]! columns) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.Select(string! column, params string![]! columns) -> DeltaSharp.DataFrame!
+DeltaSharp.DataFrame.Show(int numRows = 20, bool truncate = true) -> void
 DeltaSharp.DataFrame.Sort(params DeltaSharp.Column![]! columns) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.Sort(string! column, params string![]! columns) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.Union(DeltaSharp.DataFrame! other) -> DeltaSharp.DataFrame!
@@ -36,9 +39,26 @@ DeltaSharp.ExecutionBackend.Auto = 0 -> DeltaSharp.ExecutionBackend
 DeltaSharp.ExecutionBackend.Compiled = 2 -> DeltaSharp.ExecutionBackend
 DeltaSharp.ExecutionBackend.Interpreted = 1 -> DeltaSharp.ExecutionBackend
 DeltaSharp.Functions
+DeltaSharp.QueryExecutionException
+DeltaSharp.QueryExecutionException.QueryExecutionException() -> void
+DeltaSharp.QueryExecutionException.QueryExecutionException(string! message) -> void
+DeltaSharp.QueryExecutionException.QueryExecutionException(string! message, System.Exception! innerException) -> void
 DeltaSharp.RelationalGroupedDataset
 DeltaSharp.RelationalGroupedDataset.Agg(DeltaSharp.Column! expr, params DeltaSharp.Column![]! exprs) -> DeltaSharp.DataFrame!
 DeltaSharp.RelationalGroupedDataset.Count() -> DeltaSharp.DataFrame!
+DeltaSharp.Row
+DeltaSharp.Row.AnyNull.get -> bool
+DeltaSharp.Row.FieldIndex(string! name) -> int
+DeltaSharp.Row.GetAs<T>(int ordinal) -> T
+DeltaSharp.Row.GetAs<T>(string! fieldName) -> T
+DeltaSharp.Row.IsNullAt(int ordinal) -> bool
+DeltaSharp.Row.Length.get -> int
+DeltaSharp.Row.Row(DeltaSharp.Types.StructType! schema, System.Collections.Generic.IReadOnlyList<object?>! values) -> void
+DeltaSharp.Row.Row(DeltaSharp.Types.StructType! schema, params object?[]! values) -> void
+DeltaSharp.Row.Schema.get -> DeltaSharp.Types.StructType!
+DeltaSharp.Row.Size.get -> int
+DeltaSharp.Row.this[int ordinal].get -> object?
+DeltaSharp.Row.this[string! fieldName].get -> object?
 DeltaSharp.RuntimeConfig
 DeltaSharp.RuntimeConfig.Contains(string! key) -> bool
 DeltaSharp.RuntimeConfig.Get(string! key) -> string!
@@ -102,6 +122,9 @@ static DeltaSharp.Functions.Upper(DeltaSharp.Column! column) -> DeltaSharp.Colum
 static DeltaSharp.Functions.When(DeltaSharp.Column! condition, object? value) -> DeltaSharp.Column!
 static DeltaSharp.Functions.Year(DeltaSharp.Column! column) -> DeltaSharp.Column!
 override DeltaSharp.Column.ToString() -> string!
+override DeltaSharp.Row.Equals(object? obj) -> bool
+override DeltaSharp.Row.GetHashCode() -> int
+override DeltaSharp.Row.ToString() -> string!
 static DeltaSharp.SparkSession.Builder() -> DeltaSharp.SparkSessionBuilder!
 static DeltaSharp.SparkSession.ClearActiveSession() -> void
 static DeltaSharp.SparkSession.ClearDefaultSession() -> void

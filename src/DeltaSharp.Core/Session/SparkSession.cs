@@ -1,6 +1,8 @@
 using System.Collections;
 using System.Collections.Generic;
 using System.Threading;
+using DeltaSharp.Analysis;
+using DeltaSharp.Execution;
 
 namespace DeltaSharp;
 
@@ -52,9 +54,19 @@ public sealed class SparkSession : IDisposable
     private static readonly object _globalLock = new();
     private static SparkSession? _defaultSession;
 
+    /// <summary>
+    /// The process-wide factory the executor lane (STORY-04.6.2 / #174) installs via
+    /// <see cref="RegisterQueryExecutorFactory"/> to build the real backend for every session. It is
+    /// <see langword="null"/> until #174 (or a test) registers one, in which case a session falls back
+    /// to <see cref="UnsupportedQueryExecutor"/>.
+    /// </summary>
+    private static volatile Func<SparkSession, IQueryExecutor>? _queryExecutorFactory;
+
     private static readonly ThreadLocal<SparkSession?> _activeSession = new(() => null);
 
     private readonly RuntimeConfig _conf;
+    private readonly LocalCatalog _catalog = new();
+    private IQueryExecutor? _queryExecutor;
     private int _state = StateActive;
 
     private SparkSession(IReadOnlyDictionary<string, string> options)
@@ -96,6 +108,59 @@ public sealed class SparkSession : IDisposable
 
     /// <summary>Indicates whether the session is still active (not stopped or disposed).</summary>
     public bool IsActive => Volatile.Read(ref _state) == StateActive;
+
+    /// <summary>
+    /// The session's in-memory catalog (M1 <see cref="LocalCatalog"/>): the name-to-schema registry
+    /// the analyzer binds by-name relation references through when a <see cref="DataFrame"/> action
+    /// analyzes its plan. Internal — the catalog seam is an engine implementation detail, not public
+    /// API, until the reader/SQL doors (#158/#159) and a metastore-backed catalog land.
+    /// </summary>
+    internal LocalCatalog Catalog => _catalog;
+
+    /// <summary>
+    /// The execution backend this session drives a <see cref="DataFrame"/> action through — the
+    /// dependency-inversion seam (<see cref="IQueryExecutor"/>) that lets <c>DeltaSharp.Core</c> execute
+    /// without referencing the engine. It is created lazily from the registered factory (or
+    /// <see cref="UnsupportedQueryExecutor"/> when none is registered) and can be overridden per session
+    /// (used by tests and, later, by the executor lane / #174). Never null.
+    /// </summary>
+    internal IQueryExecutor QueryExecutor
+    {
+        get
+        {
+            // Publish the lazily-built executor atomically. SparkSession is explicitly multi-threaded
+            // (see the _globalLock / Volatile / Interlocked discipline above), and a #174 factory may be
+            // stateful, so a non-atomic `??=` could hand two threads two different executors. Read once;
+            // if unset, build and CAS the field. Under a concurrent first-access race BOTH threads may
+            // build (and so invoke the factory) — only PUBLICATION is single: the CAS loser discards its
+            // own instance and adopts the winner's, so every caller observes the same executor. Never
+            // null: the fail-closed default is UnsupportedQueryExecutor.
+            IQueryExecutor? existing = Volatile.Read(ref _queryExecutor);
+            if (existing is not null)
+            {
+                return existing;
+            }
+
+            IQueryExecutor created =
+                _queryExecutorFactory?.Invoke(this) ?? UnsupportedQueryExecutor.Instance;
+            return Interlocked.CompareExchange(ref _queryExecutor, created, null) ?? created;
+        }
+
+        set => Volatile.Write(ref _queryExecutor, value ?? throw new ArgumentNullException(nameof(value)));
+    }
+
+    /// <summary>
+    /// Registers (or clears, when <paramref name="factory"/> is <see langword="null"/>) the process-wide
+    /// factory that builds the <see cref="IQueryExecutor"/> for every subsequently-resolved session.
+    /// The executor lane (STORY-04.6.2 / #174) calls this once at startup so real query execution is
+    /// wired without inverting Core ⟂ Engine independence; tests use it (or the per-session
+    /// <see cref="QueryExecutor"/> setter) to install a double. Affects only sessions that have not yet
+    /// resolved their executor.
+    /// </summary>
+    /// <param name="factory">The factory to install, or <see langword="null"/> to reset to the
+    /// unsupported default.</param>
+    internal static void RegisterQueryExecutorFactory(Func<SparkSession, IQueryExecutor>? factory) =>
+        _queryExecutorFactory = factory;
 
     /// <summary>
     /// Gets a <see cref="DataFrameReader"/> for reading data into a <see cref="DataFrame"/> (Spark's

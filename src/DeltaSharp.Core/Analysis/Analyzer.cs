@@ -27,7 +27,7 @@ namespace DeltaSharp.Analysis;
 /// none is called: resolution failure never triggers physical planning or execution (AC4).
 /// </para>
 /// <para>
-/// Ids come from an <see cref="ExprIdGenerator"/> seeded fresh per <see cref="Resolve"/> call, so
+/// Ids come from an <see cref="ExprIdGenerator"/> seeded fresh per <see cref="Resolve(LogicalPlan)"/> call, so
 /// resolution is deterministic run-to-run (no <c>Guid</c>/<c>System.Random</c>).
 /// </para>
 /// </remarks>
@@ -50,7 +50,37 @@ internal sealed class Analyzer
     /// <returns>A new resolved plan tree; unchanged subtrees are shared by reference.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="plan"/> is null.</exception>
     /// <exception cref="AnalysisException">A relation or column reference did not resolve.</exception>
-    public LogicalPlan Resolve(LogicalPlan plan)
+    public LogicalPlan Resolve(LogicalPlan plan) => ResolveCore(plan, out _);
+
+    /// <summary>
+    /// Resolves <paramref name="plan"/> and additionally reports the analyzed plan's ordered root
+    /// <paramref name="output"/> columns (name, type, nullability) the result carries. This lets an
+    /// action derive its result columns — for example <see cref="DataFrame.Show(int, bool)"/> rendering
+    /// column headers — from the <b>single</b> analyze pass, so no second
+    /// <see cref="ExecutionStage.Analyzer"/> audit stage is emitted. The list is <b>duplicate-name
+    /// tolerant</b> (unlike a <see cref="StructType"/>, which rejects duplicate field names), so a plan
+    /// whose output carries duplicate column names — e.g. a self-join or <c>Select(Col("x"),
+    /// Col("x"))</c> — still yields headers, matching Spark's <c>show()</c> (see
+    /// <see href="https://github.com/khaines/deltasharp/issues/419">#419</see> for the deeper
+    /// <c>StructType</c>/<c>Row</c> materialization policy).
+    /// </summary>
+    /// <param name="plan">The unresolved (or partially resolved) input plan.</param>
+    /// <param name="output">On return, the analyzed plan's ordered root output columns.</param>
+    /// <returns>A new resolved plan tree; unchanged subtrees are shared by reference.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="plan"/> is null.</exception>
+    /// <exception cref="AnalysisException">A relation or column reference did not resolve.</exception>
+    public LogicalPlan Resolve(
+        LogicalPlan plan, out IReadOnlyList<(string Name, DataType Type, bool Nullable)> output)
+    {
+        LogicalPlan resolved = ResolveCore(plan, out IReadOnlyList<AttributeReference> rootOutput);
+        output = ToOutputColumns(rootOutput);
+        return resolved;
+    }
+
+    /// <summary>The shared resolution pass. It also yields the root's output attributes so a caller
+    /// that needs the result columns derives them without a second pass; <see cref="Resolve(LogicalPlan)"/>
+    /// discards them.</summary>
+    private LogicalPlan ResolveCore(LogicalPlan plan, out IReadOnlyList<AttributeReference> rootOutput)
     {
         ArgumentNullException.ThrowIfNull(plan);
 
@@ -66,7 +96,28 @@ internal sealed class Analyzer
             ReferenceEqualityComparer.Instance);
         LogicalPlan resolved = ResolveReferences(withRelations, idGenerator, outputByPlan);
         CheckAnalysis(resolved, outputByPlan);
+        rootOutput = outputByPlan[resolved];
         return resolved;
+    }
+
+    /// <summary>Projects a resolved plan's output attributes into the ordered
+    /// <c>(name, type, nullable)</c> columns the materialized result carries. Unlike a
+    /// <see cref="StructType"/> this list <b>tolerates duplicate names</b> (e.g. a self-join or
+    /// <c>Select(Col("x"), Col("x"))</c>), so <see cref="DataFrame.Show(int, bool)"/> can render a
+    /// duplicate-name header the way Spark's <c>show()</c> does. The dup-rejecting
+    /// <see cref="StructType"/>/<see cref="Row"/> materialization policy is tracked by
+    /// <see href="https://github.com/khaines/deltasharp/issues/419">#419</see>.</summary>
+    private static IReadOnlyList<(string Name, DataType Type, bool Nullable)> ToOutputColumns(
+        IReadOnlyList<AttributeReference> output)
+    {
+        var columns = new (string Name, DataType Type, bool Nullable)[output.Count];
+        for (int i = 0; i < output.Count; i++)
+        {
+            AttributeReference attribute = output[i];
+            columns[i] = (attribute.Name, attribute.Type!, attribute.Nullable);
+        }
+
+        return columns;
     }
 
     /// <summary>ResolveRelations: bind every <see cref="UnresolvedRelation"/> via the catalog.</summary>

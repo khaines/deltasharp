@@ -243,13 +243,18 @@ public sealed class SparkSessionTests
     public void Core_ReferencesNoEngineAssembly_SoNoQueryWorkIsPossible()
     {
         // The strongest AC1/AC4 "without executing / without initializing work" proof is structural:
-        // the public surface cannot touch the engine because DeltaSharp.Core references no
-        // DeltaSharp.Engine assembly. Session construction, config, GetOrCreate, and backend
-        // recording therefore cannot perform any query/engine work.
+        // the public surface cannot touch the engine because DeltaSharp.Core references neither
+        // DeltaSharp.Engine nor DeltaSharp.Executor. Session construction, config, GetOrCreate, and
+        // backend recording therefore cannot perform any query/engine work — execution only ever
+        // happens across the IQueryExecutor dependency-inversion seam that the Executor lane (#174)
+        // implements, so Core → Executor stays inverted.
         AssemblyName[] referenced = typeof(SparkSession).Assembly.GetReferencedAssemblies();
         Assert.DoesNotContain(
             referenced,
             a => a.Name is not null && a.Name.Contains("Engine", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(
+            referenced,
+            a => a.Name is not null && a.Name.Contains("Executor", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]

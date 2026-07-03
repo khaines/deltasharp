@@ -40,4 +40,16 @@
     <ProjectReference Include="..\DeltaSharp.Abstractions\DeltaSharp.Abstractions.csproj" />
   </ItemGroup>
 
+  <!-- STORY-04.6.1 (#173): the action pipeline's execution seam (internal IQueryExecutor, under
+       DeltaSharp.Execution) is implemented by the executor lane in DeltaSharp.Executor
+       (STORY-04.6.2 / #174). That is the dependency-inversion seam that lets this packable
+       net8.0;net10.0 Core drive execution WITHOUT referencing the net10.0-only engine: Core defines
+       the internal contract; DeltaSharp.Executor implements and registers it. Grant it internals
+       visibility so it can bind IQueryExecutor and SparkSession.RegisterQueryExecutorFactory. This
+       does NOT widen Core's public API (the seam stays internal; PublicAPI baseline is unaffected).
+       (Directory.Build.props already auto-injects the DeltaSharp.Core.Tests grant.) -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="DeltaSharp.Executor" />
+  </ItemGroup>
+
 </Project>
