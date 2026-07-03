@@ -101,7 +101,10 @@ an *action* over a zero-column frame yields is a later-story concern.
 `Filter(Column condition)` maps to `Filter(condition.Expr, this.Plan)`. The predicate is **recorded
 by reference** — never evaluated, never rewritten (tests assert `Assert.Same(condition.Expr,
 filter.Condition)`). `Where` is a Spark-parity synonym that delegates to `Filter`, so the two produce
-an equal plan.
+an equal plan. The API does **not** check that the predicate is boolean; that is the analyzer's job:
+since STORY-04.5.2 / #171 the analyzer's `CheckAnalysis` rejects a non-boolean `Filter`/`Join`
+condition with an `AnalysisException` (`DataTypeMismatch`) before physical planning (see
+[function-binding-coercion.md](function-binding-coercion.md) §5).
 
 ### Deferred: `Where(string)` SQL-predicate overload
 

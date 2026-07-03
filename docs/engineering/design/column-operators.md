@@ -253,16 +253,14 @@ wrong-layer diagnostic) and violate the EPIC-04 layer separation (API builds pla
 resolves and type-checks them). So the only guard the API applies is the **null-reference** guard on
 `Column` operands — a CLR programming error, not a SQL type error.
 
-> **Deferred: the analyzer-rejection half of AC4.** AC4 has two halves. The *"API does not
+> **Delivered by #171: the analyzer-rejection half of AC4.** AC4 has two halves. The *"API does not
 > coerce/mask"* half is delivered and tested here (above). The complementary *"the analyzer **reports**
-> operator misuse (e.g. bool-in-arithmetic)"* half is **not yet delivered**: the analyzer
-> (`CheckAnalysis`, #170) currently rejects only `Unresolved*` markers and does **not** type-check
-> operator operands, so `col.IsNull().Plus(1)` builds *and* survives analysis today. Operator operand
-> type-checking is expected to land with STORY-04.5.2 function binding & type coercion
-> ([#171](https://github.com/khaines/deltasharp/issues/171)); a review comment on that issue asks it to
-> confirm operator (not just function) type errors are in scope. Until then the misuse is caught neither
-> by the API (by design) nor the analyzer (not yet built) — an intentional, tracked gap, not a
-> regression.
+> operator misuse (e.g. bool-in-arithmetic)"* half is now **delivered** by STORY-04.5.2
+> ([#171](https://github.com/khaines/deltasharp/issues/171)): the analyzer's coercion sub-pass
+> rejects bool-in-arithmetic and non-numeric arithmetic operands with an `AnalysisException`
+> (`DataTypeMismatch`), and inserts numeric-promotion casts for valid mixed-type arithmetic. So
+> `col.IsNull().Plus(1)` still **builds** at the API layer (by design) but is now **rejected** by the
+> analyzer. See [function-binding-coercion.md](function-binding-coercion.md) §3.2 / §4.
 
 ## Lazy guarantee
 

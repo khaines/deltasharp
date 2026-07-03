@@ -1,4 +1,5 @@
 using DeltaSharp.Plans.Expressions;
+using DeltaSharp.Types;
 
 namespace DeltaSharp.Analysis;
 
@@ -36,6 +37,26 @@ internal enum AnalysisErrorKind
     /// desugars its shared columns into an equi-condition is not yet implemented (tracked by #405).
     /// The join node builds fine; only its <i>resolution</i> is deferred.</summary>
     UsingOrNaturalJoinNotImplemented,
+
+    /// <summary>A function call names a function the analyzer's registry does not know.</summary>
+    UnresolvedFunction,
+
+    /// <summary>A function call supplied the wrong number of arguments, or an argument whose type
+    /// cannot be coerced to the function's expected input type.</summary>
+    InvalidFunctionArgument,
+
+    /// <summary>An operator, conditional, or predicate was given operands whose types are not valid
+    /// under ADR-0008 — e.g. a boolean in an arithmetic context, a non-boolean branch condition, or
+    /// incompatible <c>CASE</c> branch value types.</summary>
+    DataTypeMismatch,
+
+    /// <summary>An aggregate function appears outside a valid aggregate context (e.g. in a
+    /// <c>Select</c>/<c>Filter</c> with no <c>groupBy</c>/<c>agg</c>).</summary>
+    MisplacedAggregate,
+
+    /// <summary>A resolved expression reached the post-condition without a concrete result type — the
+    /// coercion pass left it null-typed (a guard against leaking an untyped node downstream).</summary>
+    UntypedResolvedExpression,
 }
 
 /// <summary>
@@ -190,4 +211,95 @@ internal sealed class AnalysisException : Exception
     }
 
     private static string Columns(int count) => count == 1 ? "1 column" : $"{count} columns";
+
+    /// <summary>Builds an <see cref="AnalysisErrorKind.UnresolvedFunction"/> failure naming the
+    /// unknown function and the supplied argument types.</summary>
+    public static AnalysisException UnknownFunction(string name, IReadOnlyList<DataType> argumentTypes)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        ArgumentNullException.ThrowIfNull(argumentTypes);
+        return new AnalysisException(
+            $"Undefined function: '{name}'. The function is neither a registered scalar nor an "
+            + $"aggregate function in the M1 registry (supplied argument types: [{RenderTypes(argumentTypes)}]).",
+            AnalysisErrorKind.UnresolvedFunction,
+            name,
+            Array.Empty<string>());
+    }
+
+    /// <summary>Builds an <see cref="AnalysisErrorKind.InvalidFunctionArgument"/> failure naming the
+    /// function, the supplied argument types, and the expected argument forms.</summary>
+    public static AnalysisException InvalidFunctionArgument(
+        string name, IReadOnlyList<DataType> argumentTypes, string expected)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        ArgumentNullException.ThrowIfNull(argumentTypes);
+        ArgumentNullException.ThrowIfNull(expected);
+        return new AnalysisException(
+            $"Cannot resolve function '{name}({RenderTypes(argumentTypes)})': {expected}",
+            AnalysisErrorKind.InvalidFunctionArgument,
+            name,
+            Array.Empty<string>());
+    }
+
+    /// <summary>Builds an <see cref="AnalysisErrorKind.DataTypeMismatch"/> failure describing an
+    /// operator/conditional/predicate whose operand types are invalid under ADR-0008.</summary>
+    public static AnalysisException DataTypeMismatch(string reference, string detail)
+    {
+        ArgumentNullException.ThrowIfNull(reference);
+        ArgumentNullException.ThrowIfNull(detail);
+        return new AnalysisException(
+            $"cannot resolve '{reference}' due to data type mismatch: {detail}",
+            AnalysisErrorKind.DataTypeMismatch,
+            reference,
+            Array.Empty<string>());
+    }
+
+    /// <summary>Builds an <see cref="AnalysisErrorKind.MisplacedAggregate"/> failure for an aggregate
+    /// function used outside a valid aggregate context.</summary>
+    public static AnalysisException MisplacedAggregate(string reference, string ownerNodeName)
+    {
+        ArgumentNullException.ThrowIfNull(reference);
+        ArgumentNullException.ThrowIfNull(ownerNodeName);
+        return new AnalysisException(
+            $"Aggregate function '{reference}' is not allowed in operator '{ownerNodeName}': aggregate "
+            + "functions are only permitted in the aggregate expressions of a grouped aggregation "
+            + "(groupBy(...).agg(...)).",
+            AnalysisErrorKind.MisplacedAggregate,
+            reference,
+            Array.Empty<string>());
+    }
+
+    /// <summary>Builds an <see cref="AnalysisErrorKind.MisplacedAggregate"/> failure for a nested
+    /// aggregate — an aggregate function whose argument subtree contains another aggregate (e.g.
+    /// <c>sum(sum(x))</c>). Reuses the misplaced-aggregate kind (nesting is a placement error) but
+    /// names both the outer and the nested aggregate so the diagnostic is actionable (#166).</summary>
+    public static AnalysisException NestedAggregate(string outerName, string nestedName)
+    {
+        ArgumentNullException.ThrowIfNull(outerName);
+        ArgumentNullException.ThrowIfNull(nestedName);
+        return new AnalysisException(
+            $"Aggregate function '{outerName}' contains a nested aggregate '{nestedName}': aggregate "
+            + "functions cannot be nested inside the arguments of another aggregate.",
+            AnalysisErrorKind.MisplacedAggregate,
+            nestedName,
+            Array.Empty<string>());
+    }
+
+    /// <summary>Builds an <see cref="AnalysisErrorKind.UntypedResolvedExpression"/> failure for a
+    /// resolved expression the coercion pass left without a concrete result type.</summary>
+    public static AnalysisException UntypedResolvedExpression(string reference, string ownerNodeName)
+    {
+        ArgumentNullException.ThrowIfNull(reference);
+        ArgumentNullException.ThrowIfNull(ownerNodeName);
+        return new AnalysisException(
+            $"Resolved expression '{reference}' in operator '{ownerNodeName}' has no result type after "
+            + "type coercion (STORY-04.5.2 / #171); an untyped resolved expression must not reach "
+            + "physical planning.",
+            AnalysisErrorKind.UntypedResolvedExpression,
+            reference,
+            Array.Empty<string>());
+    }
+
+    private static string RenderTypes(IReadOnlyList<DataType> types) =>
+        string.Join(", ", types.Select(t => t.SimpleString));
 }
