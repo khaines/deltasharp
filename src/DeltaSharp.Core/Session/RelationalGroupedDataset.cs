@@ -48,14 +48,25 @@ public sealed class RelationalGroupedDataset
 {
     private readonly LogicalPlan _plan;
     private readonly IReadOnlyList<Expression> _groupingExpressions;
+    private readonly SparkSession? _session;
 
     /// <summary>Records <paramref name="groupingExpressions"/> over <paramref name="plan"/> without
     /// evaluating either.</summary>
     internal RelationalGroupedDataset(LogicalPlan plan, IReadOnlyList<Expression> groupingExpressions)
+        : this(null, plan, groupingExpressions)
+    {
+    }
+
+    /// <summary>Records <paramref name="groupingExpressions"/> over <paramref name="plan"/>, carrying
+    /// the owning <paramref name="session"/> so the aggregated <see cref="DataFrame"/> stays bound to
+    /// it (and remains executable). Neither the grouping nor the plan is evaluated.</summary>
+    internal RelationalGroupedDataset(
+        SparkSession? session, LogicalPlan plan, IReadOnlyList<Expression> groupingExpressions)
     {
         _plan = plan ?? throw new ArgumentNullException(nameof(plan));
         _groupingExpressions =
             groupingExpressions ?? throw new ArgumentNullException(nameof(groupingExpressions));
+        _session = session;
     }
 
     /// <summary>The source plan being grouped (for tests and internal use).</summary>
@@ -120,7 +131,7 @@ public sealed class RelationalGroupedDataset
             aggregateExpressions[next++] = tailExpr;
         }
 
-        return new DataFrame(new Aggregate(_groupingExpressions, aggregateExpressions, _plan));
+        return new DataFrame(_session, new Aggregate(_groupingExpressions, aggregateExpressions, _plan));
     }
 
     /// <summary>

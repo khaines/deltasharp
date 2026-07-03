@@ -1,5 +1,11 @@
+using System.Collections.Generic;
+using System.Globalization;
+using System.Text;
+using DeltaSharp.Analysis;
+using DeltaSharp.Execution;
 using DeltaSharp.Plans.Expressions;
 using DeltaSharp.Plans.Logical;
+using DeltaSharp.Types;
 
 namespace DeltaSharp;
 
@@ -21,14 +27,31 @@ namespace DeltaSharp;
 /// </remarks>
 public sealed class DataFrame
 {
-    /// <summary>Wraps an immutable, unresolved logical plan.</summary>
+    /// <summary>Wraps an immutable, unresolved logical plan with no owning session (execution is
+    /// unavailable until the frame is bound to a <see cref="SparkSession"/>).</summary>
     internal DataFrame(LogicalPlan plan)
+        : this(null, plan)
+    {
+    }
+
+    /// <summary>Wraps an immutable, unresolved logical plan bound to the <paramref name="session"/>
+    /// whose <see cref="Analysis.LocalCatalog"/> and <see cref="IQueryExecutor"/> an action uses to
+    /// analyze and execute it. A <see langword="null"/> session yields a session-free frame.</summary>
+    internal DataFrame(SparkSession? session, LogicalPlan plan)
     {
         Plan = plan ?? throw new ArgumentNullException(nameof(plan));
+        Session = session;
     }
 
     /// <summary>The immutable, unresolved logical plan backing this DataFrame.</summary>
     internal LogicalPlan Plan { get; }
+
+    /// <summary>
+    /// The session that owns this frame, or <see langword="null"/> for a session-free frame. Actions
+    /// (<see cref="Collect"/>/<see cref="Count"/>/<see cref="Show(int, bool)"/>) analyze and execute
+    /// through it; transformations propagate it unchanged so a whole chain shares one session.
+    /// </summary>
+    internal SparkSession? Session { get; }
 
     /// <summary>
     /// Selects a set of column expressions, returning a new <see cref="DataFrame"/> whose plan is a
@@ -50,7 +73,7 @@ public sealed class DataFrame
     public DataFrame Select(params Column[] columns)
     {
         ArgumentNullException.ThrowIfNull(columns);
-        return new DataFrame(new Project(ToExprs(columns, nameof(columns)), Plan));
+        return new DataFrame(Session, new Project(ToExprs(columns, nameof(columns)), Plan));
     }
 
     /// <summary>
@@ -75,7 +98,7 @@ public sealed class DataFrame
     {
         ArgumentException.ThrowIfNullOrEmpty(column);
         ArgumentNullException.ThrowIfNull(columns);
-        return new DataFrame(new Project(NamesToExprs(column, columns, nameof(columns)), Plan));
+        return new DataFrame(Session, new Project(NamesToExprs(column, columns, nameof(columns)), Plan));
     }
 
     /// <summary>
@@ -97,7 +120,7 @@ public sealed class DataFrame
     public DataFrame Filter(Column condition)
     {
         ArgumentNullException.ThrowIfNull(condition);
-        return new DataFrame(new Filter(condition.Expr, Plan));
+        return new DataFrame(Session, new Filter(condition.Expr, Plan));
     }
 
     /// <summary>
@@ -149,7 +172,7 @@ public sealed class DataFrame
         ArgumentException.ThrowIfNullOrEmpty(colName);
         ArgumentNullException.ThrowIfNull(col);
         var projectList = new Expression[] { new UnresolvedStar(), new Alias(col.Expr, colName) };
-        return new DataFrame(new Project(projectList, Plan));
+        return new DataFrame(Session, new Project(projectList, Plan));
     }
 
     /// <summary>
@@ -175,7 +198,7 @@ public sealed class DataFrame
     public RelationalGroupedDataset GroupBy(params Column[] columns)
     {
         ArgumentNullException.ThrowIfNull(columns);
-        return new RelationalGroupedDataset(Plan, ToExprs(columns, nameof(columns)));
+        return new RelationalGroupedDataset(Session, Plan, ToExprs(columns, nameof(columns)));
     }
 
     /// <summary>
@@ -200,7 +223,7 @@ public sealed class DataFrame
     {
         ArgumentException.ThrowIfNullOrEmpty(column);
         ArgumentNullException.ThrowIfNull(columns);
-        return new RelationalGroupedDataset(Plan, NamesToExprs(column, columns, nameof(columns)));
+        return new RelationalGroupedDataset(Session, Plan, NamesToExprs(column, columns, nameof(columns)));
     }
 
     /// <summary>
@@ -216,7 +239,7 @@ public sealed class DataFrame
     /// <exception cref="ArgumentNullException"><paramref name="expr"/>, <paramref name="exprs"/>, or
     /// any element of <paramref name="exprs"/> is null.</exception>
     public DataFrame Agg(Column expr, params Column[] exprs) =>
-        new RelationalGroupedDataset(Plan, Array.Empty<Expression>()).Agg(expr, exprs);
+        new RelationalGroupedDataset(Session, Plan, Array.Empty<Expression>()).Agg(expr, exprs);
 
     /// <summary>
     /// Materializes a <see cref="Column"/> array into the internal <see cref="Expression"/> array the
@@ -285,7 +308,7 @@ public sealed class DataFrame
     public DataFrame Join(DataFrame right)
     {
         ArgumentNullException.ThrowIfNull(right);
-        return new DataFrame(new Join(Plan, right.Plan, JoinType.Inner));
+        return new DataFrame(Session ?? right.Session, new Join(Plan, right.Plan, JoinType.Inner));
     }
 
     /// <summary>
@@ -323,7 +346,7 @@ public sealed class DataFrame
         ArgumentNullException.ThrowIfNull(right);
         ArgumentNullException.ThrowIfNull(condition);
         JoinType type = JoinTypes.FromSparkString(joinType);
-        return new DataFrame(new Join(Plan, right.Plan, type, condition.Expr));
+        return new DataFrame(Session ?? right.Session, new Join(Plan, right.Plan, type, condition.Expr));
     }
 
     /// <summary>
@@ -401,7 +424,7 @@ public sealed class DataFrame
             columns.Add(column);
         }
 
-        return new DataFrame(new Join(Plan, right.Plan, type, usingColumns: columns));
+        return new DataFrame(Session ?? right.Session, new Join(Plan, right.Plan, type, usingColumns: columns));
     }
 
     /// <summary>
@@ -418,7 +441,7 @@ public sealed class DataFrame
     public DataFrame CrossJoin(DataFrame right)
     {
         ArgumentNullException.ThrowIfNull(right);
-        return new DataFrame(new Join(Plan, right.Plan, JoinType.Cross, condition: null));
+        return new DataFrame(Session ?? right.Session, new Join(Plan, right.Plan, JoinType.Cross, condition: null));
     }
 
     /// <summary>
@@ -506,7 +529,7 @@ public sealed class DataFrame
     public DataFrame Union(DataFrame other)
     {
         ArgumentNullException.ThrowIfNull(other);
-        return new DataFrame(new Union(new[] { Plan, other.Plan }));
+        return new DataFrame(Session ?? other.Session, new Union(new[] { Plan, other.Plan }));
     }
 
     /// <summary>
@@ -522,6 +545,252 @@ public sealed class DataFrame
     /// <exception cref="ArgumentNullException"><paramref name="other"/> is null.</exception>
     public DataFrame UnionAll(DataFrame other) => Union(other);
 
+    // ------------------------------------------------------------------------------------------
+    // Actions (eager). These are the ONLY DataFrame members that execute — they analyze the plan,
+    // (optionally optimize it), and drive the session's IQueryExecutor. Building or chaining a
+    // transformation above never reaches here (the lazy/eager invariant, ADR-0001), which the #169
+    // audit seam makes observable: an action records exactly one Analyzer stage; a transformation
+    // records none. See docs/engineering/design/actions-and-row.md.
+    // ------------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Executes the query and returns every result row as an in-memory list, mirroring Spark's
+    /// <c>Dataset.collect()</c>. This is an <b>action</b>: it analyzes this frame's plan, optionally
+    /// optimizes it, and drives the session's execution backend exactly once — the crossing from lazy
+    /// plan construction into eager execution.
+    /// </summary>
+    /// <returns>The materialized <see cref="Row"/>s, in result order.</returns>
+    /// <exception cref="InvalidOperationException">This frame is not bound to a <see cref="SparkSession"/>.</exception>
+    /// <exception cref="QueryExecutionException">No execution backend is registered, or the backend
+    /// reported a runtime failure.</exception>
+    public IReadOnlyList<Row> Collect()
+    {
+        SparkSession session = RequireSession();
+        LogicalPlan analyzed = AnalyzeForExecution(session, Plan);
+        return session.QueryExecutor.Collect(analyzed);
+    }
+
+    /// <summary>
+    /// Executes the query and returns the number of rows in the result, mirroring Spark's
+    /// <c>Dataset.count()</c>. Like <see cref="Collect"/> this is an <b>action</b>: it analyzes,
+    /// optionally optimizes, and drives the backend exactly once, without materializing the rows.
+    /// </summary>
+    /// <returns>The number of result rows.</returns>
+    /// <exception cref="InvalidOperationException">This frame is not bound to a <see cref="SparkSession"/>.</exception>
+    /// <exception cref="QueryExecutionException">No execution backend is registered, or the backend
+    /// reported a runtime failure.</exception>
+    public long Count()
+    {
+        SparkSession session = RequireSession();
+        LogicalPlan analyzed = AnalyzeForExecution(session, Plan);
+        return session.QueryExecutor.Count(analyzed);
+    }
+
+    /// <summary>
+    /// Executes the query and prints the first <paramref name="numRows"/> rows to the console as a
+    /// Spark-style bordered table, mirroring Spark's <c>Dataset.show(numRows, truncate)</c>. This is an
+    /// <b>action</b>: it drives the backend to materialize (up to <paramref name="numRows"/> + 1) rows
+    /// but leaves this frame's plan unchanged — the row bound is applied to a derived plan, not this one.
+    /// </summary>
+    /// <param name="numRows">The maximum number of rows to display (default 20).</param>
+    /// <param name="truncate">When <see langword="true"/> (default) cells longer than 20 characters are
+    /// truncated with a trailing <c>...</c>; when <see langword="false"/> full values are shown.</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="numRows"/> is negative.</exception>
+    /// <exception cref="InvalidOperationException">This frame is not bound to a <see cref="SparkSession"/>.</exception>
+    /// <exception cref="QueryExecutionException">No execution backend is registered, or the backend
+    /// reported a runtime failure.</exception>
+    public void Show(int numRows = 20, bool truncate = true) =>
+        Console.Out.Write(ShowString(numRows, truncate));
+
+    /// <summary>
+    /// Builds the Spark-style table string that <see cref="Show(int, bool)"/> prints, returning it
+    /// instead of writing to the console so formatting is unit-testable. It executes the query
+    /// (bounded to <paramref name="numRows"/> + 1 rows to detect whether more rows exist) but does not
+    /// mutate this frame's plan.
+    /// </summary>
+    /// <param name="numRows">The maximum number of rows to render.</param>
+    /// <param name="truncate">Whether cells wider than 20 characters are truncated.</param>
+    /// <returns>The rendered table, including a trailing "only showing top N rows" footer when the
+    /// result has more than <paramref name="numRows"/> rows.</returns>
+    internal string ShowString(int numRows, bool truncate)
+    {
+        if (numRows < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(numRows), numRows, "The number of rows to show cannot be negative.");
+        }
+
+        int truncateWidth = truncate ? DefaultTruncateWidth : 0;
+
+        // Collect numRows + 1 so we can tell whether the result has more rows than we display, without
+        // materializing the whole result. The bound is pushed onto a DERIVED plan; this frame is
+        // unchanged (AC3: show respects row limits without changing the underlying plan).
+        SparkSession session = RequireSession();
+        long boundLong = (long)numRows + 1;
+        int bound = boundLong > int.MaxValue ? int.MaxValue : (int)boundLong;
+        LogicalPlan analyzed = AnalyzeForExecution(session, new Limit(bound, Plan));
+        IReadOnlyList<Row> collected = session.QueryExecutor.Collect(analyzed);
+
+        bool hasMoreData = collected.Count > numRows;
+        int displayCount = Math.Min(collected.Count, numRows);
+        StructType schema = collected.Count > 0 ? collected[0].Schema : StructType.Empty;
+
+        return FormatTable(schema, collected, displayCount, numRows, truncateWidth, hasMoreData);
+    }
+
+    /// <summary>The Spark-default column truncation width applied when <c>truncate</c> is true.</summary>
+    private const int DefaultTruncateWidth = 20;
+
+    /// <summary>The minimum rendered width of any column (Spark parity).</summary>
+    private const int MinColumnWidth = 3;
+
+    private SparkSession RequireSession() =>
+        Session ?? throw new InvalidOperationException(
+            "This DataFrame is not bound to a SparkSession and cannot be executed. Obtain DataFrames "
+            + "from a SparkSession (for example spark.Read/spark.Sql) so actions can analyze and run "
+            + "them.");
+
+    /// <summary>
+    /// The eager analyze (and optimize) stage shared by every action: it resolves <paramref name="plan"/>
+    /// against the session catalog (emitting the #169 audit's Analyzer stage) and then runs the optional
+    /// optimizer seam. Returns the plan the executor runs.
+    /// </summary>
+    private static LogicalPlan AnalyzeForExecution(SparkSession session, LogicalPlan plan)
+    {
+        LogicalPlan analyzed = new Analyzer(session.Catalog).Resolve(plan);
+        return Optimize(analyzed);
+    }
+
+    /// <summary>
+    /// The optimizer seam (STORY-04.5.3 / #172). It is an identity pass today so actions have a single,
+    /// stable place to insert rule-based optimization once it lands, without reshaping the action
+    /// pipeline or the <see cref="IQueryExecutor"/> contract.
+    /// </summary>
+    private static LogicalPlan Optimize(LogicalPlan analyzedPlan) => analyzedPlan;
+
+    /// <summary>
+    /// Renders <paramref name="rows"/> (up to <paramref name="displayCount"/>) as a Spark-style
+    /// bordered table with a header derived from <paramref name="schema"/>. Cells are right-justified
+    /// when truncating (Spark parity), null is shown as <c>null</c>, and a footer is appended when
+    /// <paramref name="hasMoreData"/> is set.
+    /// </summary>
+    private static string FormatTable(
+        StructType schema,
+        IReadOnlyList<Row> rows,
+        int displayCount,
+        int numRows,
+        int truncateWidth,
+        bool hasMoreData)
+    {
+        int numCols = schema.Count;
+        if (numCols == 0)
+        {
+            // An empty schema (no columns) still renders a stable, closed box.
+            var emptyBuilder = new StringBuilder("++\n++\n");
+            if (hasMoreData)
+            {
+                AppendFooter(emptyBuilder, numRows);
+            }
+
+            return emptyBuilder.ToString();
+        }
+
+        var cells = new List<string[]>(displayCount + 1);
+        var header = new string[numCols];
+        for (int c = 0; c < numCols; c++)
+        {
+            header[c] = schema[c].Name;
+        }
+
+        cells.Add(header);
+
+        for (int r = 0; r < displayCount; r++)
+        {
+            Row row = rows[r];
+            var line = new string[numCols];
+            for (int c = 0; c < numCols; c++)
+            {
+                line[c] = TruncateCell(Row.Render(row[c]), truncateWidth);
+            }
+
+            cells.Add(line);
+        }
+
+        var widths = new int[numCols];
+        for (int c = 0; c < numCols; c++)
+        {
+            widths[c] = MinColumnWidth;
+        }
+
+        foreach (string[] line in cells)
+        {
+            for (int c = 0; c < numCols; c++)
+            {
+                widths[c] = Math.Max(widths[c], line[c].Length);
+            }
+        }
+
+        var builder = new StringBuilder();
+        string separator = BuildSeparator(widths);
+        builder.Append(separator);
+        AppendRow(builder, cells[0], widths, truncateWidth);
+        builder.Append(separator);
+        for (int i = 1; i < cells.Count; i++)
+        {
+            AppendRow(builder, cells[i], widths, truncateWidth);
+        }
+
+        builder.Append(separator);
+        if (hasMoreData)
+        {
+            AppendFooter(builder, numRows);
+        }
+
+        return builder.ToString();
+    }
+
+    private static string TruncateCell(string cell, int truncateWidth)
+    {
+        if (truncateWidth <= 0 || cell.Length <= truncateWidth)
+        {
+            return cell;
+        }
+
+        return truncateWidth < 4
+            ? cell.Substring(0, truncateWidth)
+            : cell.Substring(0, truncateWidth - 3) + "...";
+    }
+
+    private static string BuildSeparator(int[] widths)
+    {
+        var builder = new StringBuilder("+");
+        foreach (int width in widths)
+        {
+            builder.Append('-', width).Append('+');
+        }
+
+        return builder.Append('\n').ToString();
+    }
+
+    private static void AppendRow(StringBuilder builder, string[] cells, int[] widths, int truncateWidth)
+    {
+        builder.Append('|');
+        for (int c = 0; c < cells.Length; c++)
+        {
+            string padded = truncateWidth > 0
+                ? cells[c].PadLeft(widths[c])
+                : cells[c].PadRight(widths[c]);
+            builder.Append(padded).Append('|');
+        }
+
+        builder.Append('\n');
+    }
+
+    private static void AppendFooter(StringBuilder builder, int numRows) =>
+        builder.Append(
+            CultureInfo.InvariantCulture,
+            $"only showing top {numRows} {(numRows == 1 ? "row" : "rows")}\n");
+
     private DataFrame BuildSort(Column[] columns)
     {
         ArgumentNullException.ThrowIfNull(columns);
@@ -534,7 +803,7 @@ public sealed class DataFrame
             order[i] = ToSortOrder(column.Expr);
         }
 
-        return new DataFrame(new Sort(order, global: true, Plan));
+        return new DataFrame(Session, new Sort(order, global: true, Plan));
     }
 
     private DataFrame BuildSort(string column, string[] columns)
@@ -548,7 +817,7 @@ public sealed class DataFrame
             order[i + 1] = ToSortOrder(Functions.Col(columns[i]).Expr);
         }
 
-        return new DataFrame(new Sort(order, global: true, Plan));
+        return new DataFrame(Session, new Sort(order, global: true, Plan));
     }
 
     /// <summary>Wraps a bare expression as an ascending (nulls-first) ordering term, but passes an
