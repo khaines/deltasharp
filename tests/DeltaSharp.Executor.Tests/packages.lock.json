@@ -101,6 +101,12 @@
       "deltasharp.abstractions": {
         "type": "Project"
       },
+      "deltasharp.core": {
+        "type": "Project",
+        "dependencies": {
+          "DeltaSharp.Abstractions": "[0.1.0, )"
+        }
+      },
       "deltasharp.engine": {
         "type": "Project",
         "dependencies": {
@@ -111,6 +117,7 @@
       "deltasharp.executor": {
         "type": "Project",
         "dependencies": {
+          "DeltaSharp.Core": "[0.1.0, )",
           "DeltaSharp.Engine": "[0.1.0, )"
         }
       },
