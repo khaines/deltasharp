@@ -57,6 +57,11 @@ internal enum AnalysisErrorKind
     /// <summary>A resolved expression reached the post-condition without a concrete result type — the
     /// coercion pass left it null-typed (a guard against leaking an untyped node downstream).</summary>
     UntypedResolvedExpression,
+
+    /// <summary>A file-format data source (for example a <c>Read.Parquet(path)</c> scan) reached
+    /// analysis, but the file-format reader is delivered by EPIC-05 (Delta/Parquet storage) and is not
+    /// available in M1. The scan node builds fine; only its <i>resolution</i> is deferred.</summary>
+    UnsupportedDataSource,
 }
 
 /// <summary>
@@ -103,6 +108,26 @@ internal sealed class AnalysisException : Exception
             $"Table or view not found: {name}",
             AnalysisErrorKind.TableOrViewNotFound,
             name,
+            Array.Empty<string>());
+    }
+
+    /// <summary>Builds an <see cref="AnalysisErrorKind.UnsupportedDataSource"/> failure for a
+    /// file-format scan (for example <c>Read.Parquet(path)</c>) whose reader is delivered by EPIC-05
+    /// (Delta/Parquet storage) and is unavailable in M1. The message names the format, the path, and
+    /// EPIC-05 ownership, and points at the working alternative (in-memory <c>CreateDataFrame</c>) — the
+    /// analysis-time analog of the physical planner's deterministic <c>UnsupportedPlanException</c>.</summary>
+    /// <param name="format">The data-source format (for example <c>parquet</c>).</param>
+    /// <param name="path">The scanned path.</param>
+    public static AnalysisException UnsupportedDataSource(string format, string path)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(format);
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        return new AnalysisException(
+            $"Reading a '{format}' data source is not supported in this milestone: the file-format "
+            + $"reader for path '{path}' is delivered by EPIC-05 (Delta/Parquet storage). Until then, "
+            + "create a DataFrame from in-memory data with SparkSession.CreateDataFrame(rows, schema).",
+            AnalysisErrorKind.UnsupportedDataSource,
+            path,
             Array.Empty<string>());
     }
 

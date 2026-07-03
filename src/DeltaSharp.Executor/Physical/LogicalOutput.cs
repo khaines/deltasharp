@@ -93,6 +93,9 @@ internal sealed class LogicalOutput
             case ResolvedRelation relation:
                 return relation.Output;
 
+            case LocalRelation { Output: { } localOutput }:
+                return localOutput;
+
             case Project project:
                 return ProjectionOutput(project.ProjectList);
 
@@ -167,7 +170,12 @@ internal sealed class LogicalOutput
 
     private static long CountRelationAttributes(LogicalPlan plan)
     {
-        long count = plan is ResolvedRelation relation ? relation.Output.Count : 0;
+        long count = plan switch
+        {
+            ResolvedRelation relation => relation.Output.Count,
+            LocalRelation { Output: { } output } => output.Count,
+            _ => 0,
+        };
         foreach (LogicalPlan child in plan.Children)
         {
             count += CountRelationAttributes(child);

@@ -9,6 +9,7 @@ namespace DeltaSharp.Executor.Tests;
 /// <see cref="LocalQueryExecutor"/> into <see cref="SparkSession"/>, so a session created by any app
 /// that references DeltaSharp.Executor executes queries for real (STORY-04.6.2 — IQueryExecutor wiring).
 /// </summary>
+[Collection(SessionExecutionTestCollection.Name)]
 public class SessionRegistrationTests
 {
     private static StructType PeopleSchema => TestData.Schema(

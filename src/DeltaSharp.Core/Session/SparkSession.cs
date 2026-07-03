@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Threading;
 using DeltaSharp.Analysis;
 using DeltaSharp.Execution;
+using DeltaSharp.Plans.Logical;
+using DeltaSharp.Types;
 
 namespace DeltaSharp;
 
@@ -167,18 +169,12 @@ public sealed class SparkSession : IDisposable
     /// <c>spark.read</c>).
     /// </summary>
     /// <exception cref="SessionStoppedException">The session has been stopped or disposed.</exception>
-    /// <exception cref="NotSupportedException">
-    /// The session is active but the read door is not yet available in M1; it ships in STORY-04.1.2
-    /// (#158).
-    /// </exception>
     public DataFrameReader Read
     {
         get
         {
             EnsureNotStopped(nameof(Read));
-            throw new NotSupportedException(
-                "SparkSession.Read is not yet available in this milestone; it ships in " +
-                "STORY-04.1.2 (#158).");
+            return new DataFrameReader(this);
         }
     }
 
@@ -212,17 +208,46 @@ public sealed class SparkSession : IDisposable
     /// <exception cref="ArgumentNullException"><paramref name="data"/> is <see langword="null"/>.</exception>
     /// <exception cref="SessionStoppedException">The session has been stopped or disposed.</exception>
     /// <exception cref="NotSupportedException">
-    /// The session is active but the DataFrame-creation door is not yet available in M1; the local
-    /// data path ships with the reader work in STORY-04.1.2 (#158). It is wired here so AC3's "creates
-    /// a DataFrame" door reports the deterministic lifecycle error on a stopped/disposed session.
+    /// The session is active but this untyped overload requires schema inference, which is out of M1
+    /// scope. Supply an explicit schema via
+    /// <see cref="CreateDataFrame(IEnumerable{Row}, StructType)"/> instead (STORY-04.1.2 / #158).
     /// </exception>
     public DataFrame CreateDataFrame(IEnumerable data)
     {
         EnsureNotStopped(nameof(CreateDataFrame));
         ArgumentNullException.ThrowIfNull(data);
         throw new NotSupportedException(
-            "SparkSession.CreateDataFrame is not yet available in this milestone; the local-data " +
-            "path ships in STORY-04.1.2 (#158).");
+            "SparkSession.CreateDataFrame(IEnumerable) requires schema inference, which is out of " +
+            "scope for this milestone. Supply an explicit schema via " +
+            "CreateDataFrame(IEnumerable<Row>, StructType) (STORY-04.1.2 / #158).");
+    }
+
+    /// <summary>
+    /// Creates a <see cref="DataFrame"/> from an in-memory sequence of <see cref="Row"/>s with an
+    /// explicit schema (Spark's <c>createDataFrame(rows, schema)</c>). The schema is authoritative and
+    /// row values are read positionally by ordinal.
+    /// </summary>
+    /// <remarks>
+    /// This is a <b>transformation</b>: it builds a scan (<c>LocalRelation</c>) logical plan and
+    /// <b>materializes no rows</b> — the sequence is not enumerated until an action
+    /// (<see cref="DataFrame.Collect"/>, <see cref="DataFrame.Count"/>, …) runs (STORY-04.1.2 / #158,
+    /// AC1). Because the plan captures <paramref name="data"/> by reference, mutating the underlying
+    /// collection before an action affects the observed rows; pass a stable snapshot for deterministic
+    /// results.
+    /// </remarks>
+    /// <param name="data">The in-memory rows. Each row's values are read positionally against
+    /// <paramref name="schema"/>.</param>
+    /// <param name="schema">The explicit, authoritative schema of the DataFrame.</param>
+    /// <returns>A <see cref="DataFrame"/> backed by a <c>LocalRelation</c> scan over the supplied data.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="data"/> or <paramref name="schema"/> is
+    /// <see langword="null"/>.</exception>
+    /// <exception cref="SessionStoppedException">The session has been stopped or disposed.</exception>
+    public DataFrame CreateDataFrame(IEnumerable<Row> data, StructType schema)
+    {
+        EnsureNotStopped(nameof(CreateDataFrame));
+        ArgumentNullException.ThrowIfNull(data);
+        ArgumentNullException.ThrowIfNull(schema);
+        return new DataFrame(this, new LocalRelation(schema, data));
     }
 
     /// <summary>

@@ -120,12 +120,36 @@ internal sealed class Analyzer
         return columns;
     }
 
-    /// <summary>ResolveRelations: bind every <see cref="UnresolvedRelation"/> via the catalog.</summary>
+    /// <summary>ResolveRelations: bind every <see cref="UnresolvedRelation"/> via the catalog, mint the
+    /// output of every in-memory <see cref="LocalRelation"/> (#158), and reject an unresolved
+    /// file-format scan (<see cref="UnresolvedFileRelation"/>) whose reader is EPIC-05.</summary>
     private LogicalPlan ResolveRelations(LogicalPlan plan, ExprIdGenerator idGenerator) =>
-        plan.TransformUp(node =>
-            node is UnresolvedRelation relation
-                ? BindRelation(relation, idGenerator)
-                : node);
+        plan.TransformUp(node => node switch
+        {
+            UnresolvedRelation relation => BindRelation(relation, idGenerator),
+            LocalRelation { Resolved: false } local => BindLocalRelation(local, idGenerator),
+            UnresolvedFileRelation file =>
+                throw AnalysisException.UnsupportedDataSource(file.Format, file.Path),
+            _ => node,
+        });
+
+    /// <summary>Mints the output attributes of an unresolved <see cref="LocalRelation"/> from the
+    /// shared per-pass id generator (identically to <see cref="BindRelation"/> for a catalog table), so
+    /// its relation attributes are numbered in the same 0..k-1 range the physical-planning bridge
+    /// reconstructs from.</summary>
+    private static LocalRelation BindLocalRelation(LocalRelation relation, ExprIdGenerator idGenerator)
+    {
+        StructType schema = relation.Schema;
+        var output = new AttributeReference[schema.Count];
+        for (int i = 0; i < schema.Count; i++)
+        {
+            StructField field = schema[i];
+            output[i] = new AttributeReference(
+                field.Name, field.DataType, field.Nullable, idGenerator.Next());
+        }
+
+        return relation.WithResolvedOutput(output);
+    }
 
     private ResolvedRelation BindRelation(UnresolvedRelation relation, ExprIdGenerator idGenerator)
     {
@@ -538,6 +562,9 @@ internal sealed class Analyzer
         {
             case ResolvedRelation relation:
                 return relation.Output;
+
+            case LocalRelation { Output: { } output }:
+                return output;
 
             case Project project:
                 return ProjectionOutput(project.ProjectList, idGenerator);
