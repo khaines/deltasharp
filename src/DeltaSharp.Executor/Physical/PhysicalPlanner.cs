@@ -259,11 +259,41 @@ internal sealed class PhysicalPlanner
             aggregateFields[i] = childSchema[i];
         }
 
-        aggregateFields[childSchema.Count] = new StructField("count", LongType.Instance, nullable: false);
+        // The COUNT(*) probe column is dropped by the final ProjectPlan, so its name only has to be
+        // unique w.r.t. the child schema; a hardcoded "count" collides when the child already carries a
+        // column named "count" (the common df.GroupBy(...).Count().Distinct() idiom), which would make
+        // the intermediate StructType throw SchemaValidationException. Derive a collision-proof internal
+        // name so distinct() dedups correctly (Spark parity) instead of throwing.
+        aggregateFields[childSchema.Count] = new StructField(
+            UniqueProbeName(childSchema), LongType.Instance, nullable: false);
         var aggregates = new[] { new EngineAggregateExpression(EngineAggregateFunction.Count, input: null, _mode) };
 
         var aggregatePlan = new AggregatePlan(child, new StructType(aggregateFields), groupingKeys, aggregates);
         return new ProjectPlan(aggregatePlan, childSchema, projections);
+    }
+
+    private static string UniqueProbeName(StructType childSchema)
+    {
+        var names = new HashSet<string>(childSchema.Count, StringComparer.Ordinal);
+        for (int i = 0; i < childSchema.Count; i++)
+        {
+            names.Add(childSchema[i].Name);
+        }
+
+        const string sentinel = "__distinct_count";
+        if (!names.Contains(sentinel))
+        {
+            return sentinel;
+        }
+
+        for (int suffix = 0; ; suffix++)
+        {
+            string candidate = $"{sentinel}_{suffix}";
+            if (!names.Contains(candidate))
+            {
+                return candidate;
+            }
+        }
     }
 
     private PhysicalPlan PlanUnion(LogicalUnion union, LogicalOutput outputs)

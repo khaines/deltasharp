@@ -88,8 +88,34 @@ internal static class RowMaterializer
     // A TimestampType lane stores the Spark epoch-microsecond instant as a long; surface it as a UTC
     // DateTime — the inverse of lit(DateTime)/lit(DateTimeOffset), which normalize to epoch-micros —
     // so Collect()/GetAs<DateTime> round-trips and Show renders an instant, not the raw epoch number.
-    private static DateTime ReadTimestamp(ColumnVector column, int index) =>
-        DateTime.UnixEpoch.AddTicks(column.GetValue<long>(index) * TimeSpan.TicksPerMicrosecond);
+    // A micros value whose ticks overflow long, or whose instant falls outside DateTime's range, is a
+    // deterministic UnsupportedPlanException (mirrors the decimal path) rather than a raw
+    // ArgumentOutOfRangeException or a silent mis-decode.
+    private static DateTime ReadTimestamp(ColumnVector column, int index)
+    {
+        long micros = column.GetValue<long>(index);
+        long ticks;
+        try
+        {
+            ticks = checked(micros * TimeSpan.TicksPerMicrosecond);
+            ticks = checked(DateTime.UnixEpoch.Ticks + ticks);
+        }
+        catch (OverflowException)
+        {
+            throw OutOfRangeTimestamp(micros);
+        }
+
+        if (ticks < DateTime.MinValue.Ticks || ticks > DateTime.MaxValue.Ticks)
+        {
+            throw OutOfRangeTimestamp(micros);
+        }
+
+        return new DateTime(ticks, DateTimeKind.Utc);
+    }
+
+    private static UnsupportedPlanException OutOfRangeTimestamp(long micros) =>
+        new($"Row materialization cannot surface the timestamp epoch-microsecond value {micros} as "
+            + "System.DateTime: the instant falls outside the representable DateTime range.");
 
     private static readonly DateOnly UnixEpochDate = new(1970, 1, 1);
 

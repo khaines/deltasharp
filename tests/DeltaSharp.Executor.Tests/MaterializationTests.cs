@@ -181,6 +181,20 @@ public class MaterializationTests
         Assert.Contains("2024", RenderInvariant(row[0]));
     }
 
+    [Fact]
+    public void Timestamp_OutOfDateTimeRange_ThrowsDeterministicUnsupported()
+    {
+        var fixture = new InMemoryRelationFixture();
+        StructType schema = TestData.Schema(TestData.Field("ts", TimestampType.Instance, nullable: false));
+        // long.MaxValue epoch-micros overflows the micros -> ticks (*10) conversion; the guard must
+        // surface a deterministic UnsupportedPlanException rather than a raw ArgumentOutOfRange/overflow.
+        DataFrame df = fixture.Relation("tsoob", schema, TestData.Batch(
+            schema, TestData.Timestamps(long.MaxValue)));
+
+        var ex = Assert.Throws<UnsupportedPlanException>(() => fixture.Collect(df));
+        Assert.Contains("DateTime", ex.Message, StringComparison.Ordinal);
+    }
+
     // ---- MEDIUM 1: duplicate output names -> deterministic UnsupportedPlanException (not SchemaValidationException) ----
 
     [Fact]

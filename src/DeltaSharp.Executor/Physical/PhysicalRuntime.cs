@@ -51,9 +51,10 @@ internal sealed class PhysicalRuntime
     /// <b>Batch-ownership invariant (#420).</b> Accumulating every emitted <see cref="ColumnBatch"/> into
     /// a list relies on each batch being <b>independently owned</b> — a batch stays valid across
     /// subsequent <see cref="IBatchStream.TryGetNext"/> calls and the stream's <see cref="IDisposable.Dispose"/>.
-    /// Every M1 operator allocates a fresh output batch, so this holds today. A future pooled/off-heap
-    /// operator that reuses (or frees on <c>Dispose</c>) its output buffers would violate it and MUST
-    /// copy-out here before adding to the list; that streaming/pooling seam is tracked by #420.
+    /// Every M1 operator produces fresh, independently-owned output (fresh columns, or a view over
+    /// immutable GC-owned buffers), so this holds today. A future pooled/off-heap operator that reuses
+    /// (or frees on <c>Dispose</c>) its output buffers would violate it and MUST copy-out here before
+    /// adding to the list; that streaming/pooling seam is tracked by #420.
     /// </remarks>
     /// <param name="op">The shallow Engine operator (built over an in-memory scan of child batches).</param>
     /// <returns>Every batch the operator emitted, in order.</returns>
@@ -61,10 +62,12 @@ internal sealed class PhysicalRuntime
     {
         ArgumentNullException.ThrowIfNull(op);
 
-        // Each operator open builds its own ExecutionContext (BoundedExecutionMemory.Unbounded, no
-        // spill in M1), so nothing operator-owned needs disposal here beyond the batch stream. When the
-        // Engine grows a spill/arena seam that the context owns, this per-operator context will need
-        // disposal — benign to omit today, tracked with the streaming/pooling work in #420.
+        // Each operator open builds its own ExecutionContext (BoundedExecutionMemory.Unbounded). That
+        // context owns an inert lazy spill store today (a default TempFileSpillStore that creates no disk
+        // until a reservation is refused — which never happens under Unbounded memory), so nothing
+        // operator-owned needs disposal here beyond the batch stream. When the executor grows a run that
+        // injects a real spill store (or the context owns a broader arena seam), this per-operator context
+        // will need disposal — benign to omit today, tracked with the streaming/pooling work in #420.
         var context = new ExecutionContext(BoundedExecutionMemory.Unbounded, _cancellationToken, _options);
         var batches = new List<ColumnBatch>();
         IBatchStream stream = _backend.Open(op, context);

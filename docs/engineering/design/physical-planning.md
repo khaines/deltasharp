@@ -312,9 +312,13 @@ This PR was implemented against the #173 contract before #172/#173/#177 merged. 
    rejects a same-id bind to a name/type-mismatched column) — that is the signal to switch to the
    exposed seam.
 3. **AnsiMode / backend selection.** Confirm the merged `SparkSession` execution-backend config
-   (`spark.deltasharp.execution.backend`) still maps as in `LocalQueryExecutor.OptionsFor`. In M1 both
-   selections delegate to the same interpreted `Open` (compiled fusion is **#148**), so the
-   backend-parity check is a smoke test until that tier lands.
+   (`spark.deltasharp.execution.backend`) still maps as in `LocalQueryExecutor.OptionsFor`. Both
+   selections share the interpreted `InterpretedOperators` dispatch; `Default` resolves to
+   `CompiledBackend` (ADR-0001 codegen tier, **STORY-03.4.2**), which fuses scalar expressions via
+   `Expression.Compile` when `RuntimeFeature.IsDynamicCodeSupported` — so the backend-parity check is a
+   genuine interpreted-vs-compiled **expression**-evaluation differential where dynamic code is
+   available, degrading to identical under AOT. Operator-level codegen remains out of scope (ADR-0001
+   §Follow-ups / **EPIC-13**, **#309/#310**).
 
 **Tracked deferrals.** Full **duplicate output-name** support (Spark permits duplicate names) is
 **#419**; the streaming/pooling seam (batch-ownership copy-out and per-operator `ExecutionContext`

@@ -130,6 +130,41 @@ public class EndToEndExecutionTests
     }
 
     [Fact]
+    public void GroupByCountThenDistinct_DedupsWithoutCollision()
+    {
+        // Regression: PlanDistinct lowers Distinct to GROUP-BY-all + a COUNT(*) probe. A hardcoded
+        // "count" probe name collided with GroupBy().Count()'s own "count" output column, throwing
+        // SchemaValidationException. A collision-proof probe name lets distinct() dedup and return rows.
+        (InMemoryRelationFixture fixture, DataFrame people) = NewPeople();
+
+        DataFrame query = people.GroupBy(Col("dept")).Count().Distinct();
+        IReadOnlyList<Row> rows = fixture.Collect(query);
+
+        Assert.Equal(new[] { "dept", "count" }, rows[0].Schema.Select(f => f.Name));
+        Dictionary<string, long> byDept = rows.ToDictionary(
+            r => r.GetAs<string>("dept"), r => r.GetAs<long>("count"));
+        Assert.Equal(2, byDept.Count);
+        Assert.Equal(2L, byDept["eng"]);   // ids 1,2
+        Assert.Equal(3L, byDept["sales"]); // ids 3,4,5
+    }
+
+    [Fact]
+    public void Distinct_OverUserColumnNamedCount_Works()
+    {
+        // A relation whose own column is literally named "count" must still dedup, not collide with the
+        // synthetic COUNT(*) probe.
+        var fixture = new InMemoryRelationFixture();
+        StructType schema = TestData.Schema(TestData.Field("count", IntegerType.Instance, nullable: false));
+        DataFrame df = fixture.Relation("counts", schema, TestData.Batch(
+            schema, TestData.Ints(7, 7, 8, 9, 9)));
+
+        IReadOnlyList<Row> rows = fixture.Collect(df.Distinct());
+
+        Assert.Equal(new[] { "count" }, rows[0].Schema.Select(f => f.Name));
+        Assert.Equal(new[] { 7, 8, 9 }, rows.Select(r => r.GetAs<int>(0)).OrderBy(v => v));
+    }
+
+    [Fact]
     public void Union_ConcatenatesBothInputs()
     {
         var fixture = new InMemoryRelationFixture();
@@ -168,9 +203,12 @@ public class EndToEndExecutionTests
     [Fact]
     public void InterpretedAndDefaultBackends_ProduceIdenticalRows()
     {
-        // Smoke test, not (yet) a true differential oracle: in M1 both backend selections delegate to
-        // the same InterpretedOperators.Open, because the compiled Expression.Compile fusion tier is not
-        // wired (#148). It becomes a real interpreted-vs-compiled parity oracle once that tier lands.
+        // Real interpreted-vs-compiled parity check: ForceInterpreted uses InterpretedOperators, while
+        // ExecutionBackendOptions.Default resolves to CompiledBackend (ADR-0001 codegen tier,
+        // STORY-03.4.2), which JIT-fuses scalar expressions via Expression.Compile when dynamic code is
+        // supported. This is a genuine expression-evaluation differential where dynamic code is available,
+        // degrading to identical under AOT. Operator-level codegen is out of scope (ADR-0001 §Follow-ups /
+        // EPIC-13, #309/#310).
         (InMemoryRelationFixture fixture, DataFrame people) = NewPeople();
         DataFrame query = people.GroupBy(Col("dept")).Agg(Sum(Col("salary")));
 
@@ -181,5 +219,30 @@ public class EndToEndExecutionTests
             .ToDictionary(r => r.GetAs<string>("dept"), r => r.GetAs<double>(1));
 
         Assert.Equal(interpreted, auto);
+    }
+
+    [Fact]
+    public void MultipleSourceBatches_MaterializeAllRowsInGlobalOrder()
+    {
+        // Enforces the PhysicalRuntime.Run batch-ownership invariant: a scan/filter over a relation backed
+        // by 2+ source batches yields 2+ ColumnBatches, and Collect() must accumulate every batch and
+        // materialize all rows in correct global order AFTER the stream is drained and disposed.
+        var fixture = new InMemoryRelationFixture();
+        StructType schema = TestData.Schema(TestData.Field("v", IntegerType.Instance, nullable: false));
+        DataFrame df = fixture.Relation(
+            "multibatch",
+            schema,
+            TestData.Batch(schema, TestData.Ints(1, 2, 3)),
+            TestData.Batch(schema, TestData.Ints(4, 5, 6)),
+            TestData.Batch(schema, TestData.Ints(7, 8, 9)));
+
+        // Keep the even values across all three batches so a per-batch selection vector is left behind.
+        IReadOnlyList<Row> rows = fixture.Collect(df.Filter(Col("v").Mod(2).EqualTo(0)));
+
+        Assert.Equal(new[] { 2, 4, 6, 8 }, rows.Select(r => r.GetAs<int>(0)));
+
+        // Unfiltered scan preserves every row in global order across the batch boundaries.
+        IReadOnlyList<Row> all = fixture.Collect(df);
+        Assert.Equal(new[] { 1, 2, 3, 4, 5, 6, 7, 8, 9 }, all.Select(r => r.GetAs<int>(0)));
     }
 }

@@ -55,10 +55,12 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
         ArgumentNullException.ThrowIfNull(session);
 
         // ADR-0001: the interpreted vectorized backend is the default and the correctness reference.
-        // In M1 the "compiled" tier is not yet wired (intra-operator Expression.Compile fusion is #148),
-        // so both backend selections currently delegate to the same InterpretedOperators.Open — the
-        // end-to-end backend-parity check is therefore a smoke test today, not yet a true differential
-        // oracle; it becomes one once the compiled tier lands.
+        // Both ExecutionBackend selections share the interpreted InterpretedOperators dispatch;
+        // ExecutionBackend.Default resolves to CompiledBackend (ADR-0001 codegen tier, STORY-03.4.2),
+        // which fuses scalar expressions via Expression.Compile when RuntimeFeature.IsDynamicCodeSupported.
+        // So the backend-parity check compares interpreted vs compiled *expression* evaluation — a real
+        // differential where dynamic code is available, degrading to identical under AOT. Operator-level
+        // codegen is out of scope (ADR-0001 §Follow-ups / EPIC-13, #309/#310).
         return session.ExecutionBackend == ExecutionBackend.Interpreted
             ? new ExecutionBackendOptions { ForceInterpreted = true }
             : ExecutionBackendOptions.Default;
