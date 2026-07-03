@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using DeltaSharp.Engine.Execution;
 using DeltaSharp.Execution;
 using DeltaSharp.Plans.Logical;
@@ -5,9 +6,12 @@ using DeltaSharp.Plans.Logical;
 namespace DeltaSharp.Executor;
 
 /// <summary>
-/// The Executor-side implementation of Core's <see cref="IQueryExecutor"/> seam (STORY-04.6.1 / #173):
-/// it plans an analyzed logical plan onto EPIC-03 operators, drives them on the selected backend
-/// (ADR-0001 — interpreted vectorized by default), and materializes the result. Registering it into a
+/// The Executor-side implementation of Core's <see cref="IQueryExecutor"/> seam (STORY-04.6.1 / #173,
+/// hardened by STORY-04.6.4 / #176): it plans an analyzed logical plan onto EPIC-03 operators, drives
+/// them on the selected backend (ADR-0001 — interpreted vectorized by default) under a cancellation/
+/// timeout boundary, materializes the result within configured row/byte bounds, and reports planning +
+/// execution metrics. Every path releases the run's <see cref="PhysicalRuntime"/> (and its shared
+/// <see cref="ExecutionContext"/> / spill store) deterministically. Registering it into a
 /// <see cref="SparkSession"/> is what finally makes a DeltaSharp query run end-to-end.
 /// </summary>
 internal sealed class LocalQueryExecutor : IQueryExecutor
@@ -31,14 +35,6 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
         _scanSource = scanSource ?? throw new ArgumentNullException(nameof(scanSource));
         _backendOptions = backendOptions ?? throw new ArgumentNullException(nameof(backendOptions));
     }
-
-    /// <inheritdoc />
-    public IReadOnlyList<Row> Collect(LogicalPlan analyzedPlan) =>
-        RowMaterializer.Materialize(ExecutePlan(analyzedPlan));
-
-    /// <inheritdoc />
-    public long Count(LogicalPlan analyzedPlan) =>
-        RowMaterializer.CountRows(ExecutePlan(analyzedPlan));
 
     /// <inheritdoc />
     /// <remarks>
@@ -76,14 +72,179 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
         }
     }
 
-    private BatchResult ExecutePlan(LogicalPlan analyzedPlan)
+    /// <inheritdoc />
+    public IReadOnlyList<Row> Collect(LogicalPlan analyzedPlan, ExecutionOptions options)
     {
         ArgumentNullException.ThrowIfNull(analyzedPlan);
-        var planner = new PhysicalPlanner(_scanSource);
-        PhysicalPlan physical = planner.Plan(analyzedPlan);
-        IExecutionBackend backend = ExecutionBackends.Select(_backendOptions);
-        var runtime = new PhysicalRuntime(backend, _backendOptions, CancellationToken.None);
-        return physical.Execute(runtime);
+        ArgumentNullException.ThrowIfNull(options);
+        return Execute(
+            analyzedPlan,
+            options,
+            static (result, opts, token) =>
+            {
+                IReadOnlyList<Row> rows = RowMaterializer.Materialize(
+                    result, opts.MaxResultRows, opts.MaxResultBytes, token);
+                return (Rows: rows, OutputRows: (long)rows.Count);
+            }).Rows!;
+    }
+
+    /// <inheritdoc />
+    public long Count(LogicalPlan analyzedPlan, ExecutionOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(analyzedPlan);
+        ArgumentNullException.ThrowIfNull(options);
+        return Execute(
+            analyzedPlan,
+            options,
+            static (result, opts, token) =>
+            {
+                long count = RowMaterializer.CountRows(result);
+                return (Rows: (IReadOnlyList<Row>?)null, OutputRows: count);
+            }).OutputRows;
+    }
+
+    // The single stage-attributed driver shared by Collect/Count. It times planning and execution, drives
+    // the plan under an effective token (user cancellation linked with any timeout), materializes via
+    // finalize within the configured result bounds, populates options.Metrics on both success and
+    // failure, and disposes the runtime on every path (success, cancel/timeout, fault).
+    private (IReadOnlyList<Row>? Rows, long OutputRows) Execute(
+        LogicalPlan analyzedPlan,
+        ExecutionOptions options,
+        Func<BatchResult, ExecutionOptions, CancellationToken, (IReadOnlyList<Row>? Rows, long OutputRows)> finalize)
+    {
+        using CancellationTokenSource? timeoutCts = options.Timeout is { } timeout
+            ? CancellationTokenSource.CreateLinkedTokenSource(options.CancellationToken)
+            : null;
+        if (timeoutCts is not null)
+        {
+            // A non-positive timeout means the deadline has already passed (config never produces this —
+            // ExecutionOptions maps <=0 to "disabled"/null — so it only arrives via the direct options
+            // API), so cancel synchronously for a deterministic, race-free timeout; otherwise schedule it.
+            if (options.Timeout!.Value <= TimeSpan.Zero)
+            {
+                timeoutCts.Cancel();
+            }
+            else
+            {
+                timeoutCts.CancelAfter(options.Timeout.Value);
+            }
+        }
+
+        CancellationToken effectiveToken = timeoutCts?.Token ?? options.CancellationToken;
+
+        TimeSpan planningDuration = TimeSpan.Zero;
+        long executionStart = 0;
+        long outputRows = 0;
+        long outputBatches = 0;
+        PhysicalRuntime? runtime = null;
+
+        ExecutionMetrics BuildMetrics() => new(
+            planningDuration,
+            executionStart == 0 ? TimeSpan.Zero : Stopwatch.GetElapsedTime(executionStart),
+            outputRows,
+            outputBatches,
+            runtime?.BytesScanned ?? 0,
+            runtime?.PeakMemoryBytes ?? 0);
+
+        try
+        {
+            // Stage: Plan. UnsupportedPlanException is already stage-attributed and must propagate
+            // unwrapped (callers assert on it); any other planner fault is attributed to Plan.
+            long planningStart = Stopwatch.GetTimestamp();
+            PhysicalPlan physical;
+            try
+            {
+                physical = new PhysicalPlanner(_scanSource).Plan(analyzedPlan);
+            }
+            catch (UnsupportedPlanException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                throw new QueryExecutionException(
+                    QueryExecutionStage.Plan,
+                    $"Physical planning failed: {ex.Message}",
+                    ex,
+                    BuildMetrics());
+            }
+
+            planningDuration = Stopwatch.GetElapsedTime(planningStart);
+
+            // Stage: Backend + Materialize (both timed as execution).
+            executionStart = Stopwatch.GetTimestamp();
+            IExecutionBackend backend = ExecutionBackends.Select(_backendOptions);
+            runtime = new PhysicalRuntime(backend, _backendOptions, effectiveToken, options.MemoryBudgetBytes);
+
+            BatchResult result;
+            try
+            {
+                result = physical.Execute(runtime);
+            }
+            catch (OperationCanceledException oce)
+            {
+                throw MapCancellation(options.CancellationToken, oce);
+            }
+            catch (UnsupportedPlanException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                throw new QueryExecutionException(
+                    QueryExecutionStage.Backend,
+                    $"Query execution failed in the backend: {ex.Message}",
+                    ex,
+                    BuildMetrics());
+            }
+
+            outputBatches = result.Batches.Count;
+
+            // Stage: Materialize. Result-bound breaches become a Materialize-attributed public exception;
+            // value-mapping failures surface as the (Materialize-attributed) UnsupportedPlanException.
+            (IReadOnlyList<Row>? Rows, long OutputRows) finalized;
+            try
+            {
+                finalized = finalize(result, options, effectiveToken);
+            }
+            catch (OperationCanceledException oce)
+            {
+                throw MapCancellation(options.CancellationToken, oce);
+            }
+            catch (UnsupportedPlanException)
+            {
+                throw;
+            }
+            catch (ResultLimitExceededException ex)
+            {
+                throw new QueryExecutionException(
+                    QueryExecutionStage.Materialize, ex.Message, ex, BuildMetrics());
+            }
+
+            outputRows = finalized.OutputRows;
+            options.Metrics = BuildMetrics();
+            return finalized;
+        }
+        finally
+        {
+            runtime?.Dispose();
+        }
+    }
+
+    // Distinguishes a user cancellation from a timeout: if the user's own token is cancelled the original
+    // OperationCanceledException is rethrown (Spark parity for cancellation); otherwise the effective
+    // token was cancelled by CancelAfter, so the boundary is surfaced as a TimeoutException preserving
+    // the cancellation as its cause. User cancellation wins a race with the timeout.
+    private static Exception MapCancellation(CancellationToken userToken, OperationCanceledException oce)
+    {
+        if (userToken.IsCancellationRequested)
+        {
+            return oce;
+        }
+
+        return new TimeoutException(
+            "The DataFrame action exceeded its configured execution timeout "
+            + "('spark.deltasharp.execution.timeoutMs') and was cancelled.", oce);
     }
 
     private static ExecutionBackendOptions OptionsFor(SparkSession session)

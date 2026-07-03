@@ -33,18 +33,38 @@ internal sealed class FakeQueryExecutor : IQueryExecutor
 
     internal LogicalPlan? LastPlan { get; private set; }
 
-    public IReadOnlyList<Row> Collect(LogicalPlan analyzedPlan)
+    /// <summary>The <see cref="ExecutionOptions"/> the most recent action threaded across the seam.</summary>
+    internal ExecutionOptions? LastOptions { get; private set; }
+
+    /// <summary>When set, published into <c>options.Metrics</c> so the out-metrics overloads can be exercised.</summary>
+    internal ExecutionMetrics? MetricsToPublish { get; set; }
+
+    public IReadOnlyList<Row> Collect(LogicalPlan analyzedPlan, ExecutionOptions options)
     {
         CollectCallCount++;
         LastPlan = analyzedPlan;
+        LastOptions = options;
+        options.CancellationToken.ThrowIfCancellationRequested();
+        if (MetricsToPublish is not null)
+        {
+            options.Metrics = MetricsToPublish;
+        }
+
         DriveBackend();
         return _rows;
     }
 
-    public long Count(LogicalPlan analyzedPlan)
+    public long Count(LogicalPlan analyzedPlan, ExecutionOptions options)
     {
         CountCallCount++;
         LastPlan = analyzedPlan;
+        LastOptions = options;
+        options.CancellationToken.ThrowIfCancellationRequested();
+        if (MetricsToPublish is not null)
+        {
+            options.Metrics = MetricsToPublish;
+        }
+
         DriveBackend();
         return _countOverride ?? _rows.Count;
     }

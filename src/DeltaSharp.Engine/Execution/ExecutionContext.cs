@@ -9,7 +9,15 @@ namespace DeltaSharp.Engine.Execution;
 /// run-scoped controls that bound and stop work. It is immutable and shared across an operator
 /// tree so cancellation and accounting are consistent end-to-end.
 /// </summary>
-public sealed class ExecutionContext
+/// <remarks>
+/// The context owns the run's <see cref="SpillStore"/>, so it is <see cref="IDisposable"/>: whoever
+/// builds it (the executor) disposes it after the run — on the normal, cancellation, and failure
+/// paths alike — which releases the spill store's temp files/handles. A default
+/// <see cref="TempFileSpillStore"/> creates no disk until it spills, so disposing a context that never
+/// spilled is a no-op. This is the durable disposal seam STORY-04.6.4 (#420) required
+/// (<c>docs/engineering/design/execution-boundaries.md</c> §2.3).
+/// </remarks>
+public sealed class ExecutionContext : IDisposable
 {
     /// <summary>Creates an execution context.</summary>
     /// <param name="memory">The bounded memory context operators reserve against.</param>
@@ -47,4 +55,11 @@ public sealed class ExecutionContext
 
     /// <summary>Backend selection options for this execution.</summary>
     public ExecutionBackendOptions Options { get; }
+
+    /// <summary>
+    /// Disposes the run's <see cref="SpillStore"/> when it holds disposable resources (a
+    /// <see cref="TempFileSpillStore"/> deletes its temp files; an in-memory store has nothing to
+    /// release). Idempotent and safe to call on a context that never spilled. STORY-04.6.4 / #420.
+    /// </summary>
+    public void Dispose() => (SpillStore as IDisposable)?.Dispose();
 }

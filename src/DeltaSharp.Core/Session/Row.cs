@@ -11,7 +11,7 @@ namespace DeltaSharp;
 /// A single row of a materialized action result, equivalent to Apache Spark's <c>Row</c> — an
 /// ordered, schema-carrying tuple of column values with Spark-parity field access. A
 /// <see cref="DataFrame"/> is conceptually an untyped <c>Dataset&lt;Row&gt;</c>, so
-/// <see cref="DataFrame.Collect"/> returns <see cref="Row"/> values and <see cref="DataFrame.Show(int, bool)"/>
+/// <see cref="DataFrame.Collect()"/> returns <see cref="Row"/> values and <see cref="DataFrame.Show(int, bool)"/>
 /// renders them.
 /// </summary>
 /// <remarks>

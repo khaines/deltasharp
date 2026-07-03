@@ -1,6 +1,7 @@
 using DeltaSharp.Analysis;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Engine.Execution;
+using DeltaSharp.Execution;
 using DeltaSharp.Plans.Logical;
 using DeltaSharp.Types;
 
@@ -78,6 +79,24 @@ internal sealed class InMemoryRelationFixture
         session.Catalog.Register(name, schema);
         _scanSource.Register(new[] { name }, schema, batches);
         return new DataFrame(session, new UnresolvedRelation(new[] { name }));
+    }
+
+    /// <summary>
+    /// Registers a relation's SCHEMA in the catalog only (not the scan source), so the analyzer resolves
+    /// the relation but the planner's scan resolution misses it. This drives the Scan-stage failure path
+    /// (STORY-04.6.4 criterion 2): the planner raises an <see cref="UnsupportedPlanException"/> attributed
+    /// to <see cref="QueryExecutionStage.Scan"/>.
+    /// </summary>
+    /// <param name="name">The relation name (single-part identifier).</param>
+    /// <param name="schema">The relation schema.</param>
+    /// <returns>A base <see cref="DataFrame"/> over the schema-only relation.</returns>
+    public DataFrame RelationSchemaOnly(string name, StructType schema)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        ArgumentNullException.ThrowIfNull(schema);
+
+        _catalog.Register(name, schema);
+        return new DataFrame(new UnresolvedRelation(new[] { name }));
     }
 
     /// <summary>Analyzes a DataFrame's logical plan through the real Core analyzer.</summary>
@@ -159,14 +178,81 @@ internal sealed class InMemoryRelationFixture
     /// <param name="options">Backend options (defaults to <see cref="ExecutionBackendOptions.Default"/>).</param>
     /// <returns>The materialized rows.</returns>
     public IReadOnlyList<Row> Collect(DataFrame frame, ExecutionBackendOptions? options = null) =>
-        new LocalQueryExecutor(_scanSource, options ?? ExecutionBackendOptions.Default).Collect(Analyze(frame));
+        new LocalQueryExecutor(_scanSource, options ?? ExecutionBackendOptions.Default)
+            .Collect(Analyze(frame), ExecutionOptions.Default);
 
     /// <summary>Executes a DataFrame end-to-end and counts rows without full materialization.</summary>
     /// <param name="frame">The DataFrame to count.</param>
     /// <param name="options">Backend options (defaults to <see cref="ExecutionBackendOptions.Default"/>).</param>
     /// <returns>The row count.</returns>
     public long Count(DataFrame frame, ExecutionBackendOptions? options = null) =>
-        new LocalQueryExecutor(_scanSource, options ?? ExecutionBackendOptions.Default).Count(Analyze(frame));
+        new LocalQueryExecutor(_scanSource, options ?? ExecutionBackendOptions.Default)
+            .Count(Analyze(frame), ExecutionOptions.Default);
+
+    /// <summary>
+    /// Executes a DataFrame end-to-end under STORY-04.6.4 boundaries (cancellation/timeout/result bounds/
+    /// memory budget) and returns the rows plus the planning/execution <see cref="ExecutionMetrics"/>. It
+    /// is the fixture seam <c>DeltaSharp.Executor.Tests</c> drives the failure-mode tests through, since
+    /// Core's <c>ExecutionOptions</c> is a Core internal the test assembly cannot name directly.
+    /// </summary>
+    /// <param name="frame">The DataFrame to collect.</param>
+    /// <param name="cancellationToken">Cooperative cancellation observed at batch/row boundaries.</param>
+    /// <param name="timeout">An optional execution timeout.</param>
+    /// <param name="maxResultRows">An optional result row cap.</param>
+    /// <param name="maxResultBytes">An optional result byte cap.</param>
+    /// <param name="memoryBudgetBytes">An optional per-run operator memory budget.</param>
+    /// <param name="backendOptions">Backend options (defaults to <see cref="ExecutionBackendOptions.Default"/>).</param>
+    /// <returns>The materialized rows and the metrics gathered on success.</returns>
+    public (IReadOnlyList<Row> Rows, ExecutionMetrics Metrics) CollectWithMetrics(
+        DataFrame frame,
+        CancellationToken cancellationToken = default,
+        TimeSpan? timeout = null,
+        long? maxResultRows = null,
+        long? maxResultBytes = null,
+        long? memoryBudgetBytes = null,
+        ExecutionBackendOptions? backendOptions = null)
+    {
+        var options = BuildOptions(
+            cancellationToken, timeout, maxResultRows, maxResultBytes, memoryBudgetBytes);
+        IReadOnlyList<Row> rows = new LocalQueryExecutor(_scanSource, backendOptions ?? ExecutionBackendOptions.Default)
+            .Collect(Analyze(frame), options);
+        return (rows, options.Metrics ?? ExecutionMetrics.Empty);
+    }
+
+    /// <summary>The <see cref="CollectWithMetrics"/> counterpart for <c>count</c>.</summary>
+    /// <param name="frame">The DataFrame to count.</param>
+    /// <param name="cancellationToken">Cooperative cancellation observed at batch boundaries.</param>
+    /// <param name="timeout">An optional execution timeout.</param>
+    /// <param name="memoryBudgetBytes">An optional per-run operator memory budget.</param>
+    /// <param name="backendOptions">Backend options (defaults to <see cref="ExecutionBackendOptions.Default"/>).</param>
+    /// <returns>The count and the metrics gathered on success.</returns>
+    public (long Count, ExecutionMetrics Metrics) CountWithMetrics(
+        DataFrame frame,
+        CancellationToken cancellationToken = default,
+        TimeSpan? timeout = null,
+        long? memoryBudgetBytes = null,
+        ExecutionBackendOptions? backendOptions = null)
+    {
+        var options = BuildOptions(cancellationToken, timeout, null, null, memoryBudgetBytes);
+        long count = new LocalQueryExecutor(_scanSource, backendOptions ?? ExecutionBackendOptions.Default)
+            .Count(Analyze(frame), options);
+        return (count, options.Metrics ?? ExecutionMetrics.Empty);
+    }
+
+    private static ExecutionOptions BuildOptions(
+        CancellationToken cancellationToken,
+        TimeSpan? timeout,
+        long? maxResultRows,
+        long? maxResultBytes,
+        long? memoryBudgetBytes) =>
+        new()
+        {
+            CancellationToken = cancellationToken,
+            Timeout = timeout,
+            MaxResultRows = maxResultRows,
+            MaxResultBytes = maxResultBytes,
+            MemoryBudgetBytes = memoryBudgetBytes,
+        };
 
     /// <summary>Collects a DataFrame through a <see cref="SparkSession"/>'s registered executor (full seam).</summary>
     /// <param name="session">The session whose <c>QueryExecutor</c> runs the plan.</param>
@@ -175,6 +261,6 @@ internal sealed class InMemoryRelationFixture
     public IReadOnlyList<Row> CollectViaSession(SparkSession session, DataFrame frame)
     {
         ArgumentNullException.ThrowIfNull(session);
-        return session.QueryExecutor.Collect(Analyze(frame));
+        return session.QueryExecutor.Collect(Analyze(frame), ExecutionOptions.Default);
     }
 }

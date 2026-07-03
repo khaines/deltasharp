@@ -204,14 +204,38 @@ static DeltaSharp.Column.operator >=(DeltaSharp.Column! left, DeltaSharp.Column!
 static DeltaSharp.Column.operator >=(DeltaSharp.Column! left, object? value) -> DeltaSharp.Column!
 static DeltaSharp.Column.operator >=(object? value, DeltaSharp.Column! right) -> DeltaSharp.Column!
 static DeltaSharp.Column.operator |(DeltaSharp.Column! left, DeltaSharp.Column! right) -> DeltaSharp.Column!
+DeltaSharp.DataFrame.Collect(System.Threading.CancellationToken cancellationToken) -> System.Collections.Generic.IReadOnlyList<DeltaSharp.Row!>!
+DeltaSharp.DataFrame.Collect(out DeltaSharp.ExecutionMetrics! metrics, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Collections.Generic.IReadOnlyList<DeltaSharp.Row!>!
+DeltaSharp.DataFrame.Count(System.Threading.CancellationToken cancellationToken) -> long
+DeltaSharp.DataFrame.Count(out DeltaSharp.ExecutionMetrics! metrics, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> long
 DeltaSharp.DataFrame.Explain() -> void
 DeltaSharp.DataFrame.Explain(bool extended) -> void
 DeltaSharp.DataFrame.Explain(string! mode) -> void
 DeltaSharp.DataFrame.Explain(DeltaSharp.ExplainMode mode) -> void
 DeltaSharp.DataFrame.ToExplainString(DeltaSharp.ExplainMode mode = DeltaSharp.ExplainMode.Simple) -> string!
+DeltaSharp.ExecutionMetrics
+DeltaSharp.ExecutionMetrics.BytesScanned.get -> long
+DeltaSharp.ExecutionMetrics.ExecutionDuration.get -> System.TimeSpan
+DeltaSharp.ExecutionMetrics.ExecutionMetrics(System.TimeSpan planningDuration, System.TimeSpan executionDuration, long outputRows, long outputBatches, long bytesScanned, long peakMemoryBytes) -> void
+DeltaSharp.ExecutionMetrics.OutputBatches.get -> long
+DeltaSharp.ExecutionMetrics.OutputRows.get -> long
+DeltaSharp.ExecutionMetrics.PeakMemoryBytes.get -> long
+DeltaSharp.ExecutionMetrics.PlanningDuration.get -> System.TimeSpan
+DeltaSharp.ExecutionMetrics.TotalDuration.get -> System.TimeSpan
 DeltaSharp.ExplainMode
 DeltaSharp.ExplainMode.Simple = 0 -> DeltaSharp.ExplainMode
 DeltaSharp.ExplainMode.Extended = 1 -> DeltaSharp.ExplainMode
 DeltaSharp.ExplainMode.Codegen = 2 -> DeltaSharp.ExplainMode
 DeltaSharp.ExplainMode.Cost = 3 -> DeltaSharp.ExplainMode
 DeltaSharp.ExplainMode.Formatted = 4 -> DeltaSharp.ExplainMode
+DeltaSharp.QueryExecutionException.Metrics.get -> DeltaSharp.ExecutionMetrics?
+DeltaSharp.QueryExecutionException.QueryExecutionException(DeltaSharp.QueryExecutionStage stage, string! message, System.Exception? innerException = null, DeltaSharp.ExecutionMetrics? metrics = null) -> void
+DeltaSharp.QueryExecutionException.Stage.get -> DeltaSharp.QueryExecutionStage?
+DeltaSharp.QueryExecutionStage
+DeltaSharp.QueryExecutionStage.Analyze = 0 -> DeltaSharp.QueryExecutionStage
+DeltaSharp.QueryExecutionStage.Backend = 3 -> DeltaSharp.QueryExecutionStage
+DeltaSharp.QueryExecutionStage.Materialize = 4 -> DeltaSharp.QueryExecutionStage
+DeltaSharp.QueryExecutionStage.Plan = 1 -> DeltaSharp.QueryExecutionStage
+DeltaSharp.QueryExecutionStage.Scan = 2 -> DeltaSharp.QueryExecutionStage
+override DeltaSharp.ExecutionMetrics.ToString() -> string!
+static DeltaSharp.ExecutionMetrics.Empty.get -> DeltaSharp.ExecutionMetrics!

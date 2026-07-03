@@ -105,6 +105,7 @@ internal sealed class PhysicalPlanner
         if (!_scanSource.TryGetBatches(relation, out var batches))
         {
             throw new UnsupportedPlanException(
+                QueryExecutionStage.Scan,
                 $"No scan source is registered for relation '{string.Join('.', relation.Identifier)}'. "
                 + "The M1 data-in door is the in-memory relation fixture; the public read-door is STORY-04.1.2 (#158).");
         }

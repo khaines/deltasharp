@@ -19,33 +19,57 @@ internal readonly record struct BatchResult(StructType Schema, IReadOnlyList<Col
 /// <summary>
 /// The per-execution context a <see cref="PhysicalPlan"/> tree is driven with: the selected EPIC-03
 /// <see cref="IExecutionBackend"/> (ADR-0001 — interpreted vectorized by default), the backend
-/// options, and the cancellation token. It also builds the Engine <see cref="ExecutionContext"/> each
-/// operator open needs and drives a shallow Engine operator to completion.
+/// options, and the run's cancellation token. It owns a <b>single</b> Engine
+/// <see cref="ExecutionContext"/> shared across the whole operator tree (matching that type's
+/// "immutable and shared across an operator tree" contract) and is <see cref="IDisposable"/> so the
+/// executor releases the run's spill store / memory context deterministically on every path —
+/// success, cancellation, timeout, and failure alike (STORY-04.6.4 / #176, discharging
+/// <see href="https://github.com/khaines/deltasharp/issues/420">#420</see>).
 /// </summary>
-internal sealed class PhysicalRuntime
+internal sealed class PhysicalRuntime : IDisposable
 {
     private readonly IExecutionBackend _backend;
-    private readonly ExecutionBackendOptions _options;
+    private readonly ExecutionContext _context;
     private readonly CancellationToken _cancellationToken;
+    private long _bytesScanned;
+    private long _peakMemoryBytes;
 
-    /// <summary>Creates a runtime bound to a backend, its options, and a cancellation token.</summary>
+    /// <summary>Creates a runtime bound to a backend, its options, a token, and an optional memory budget.</summary>
     /// <param name="backend">The EPIC-03 execution backend chosen for this run.</param>
-    /// <param name="options">Backend options (e.g. force-interpreter) threaded into each context.</param>
-    /// <param name="cancellationToken">Cancellation observed at batch boundaries.</param>
+    /// <param name="options">Backend options (e.g. force-interpreter) threaded into the shared context.</param>
+    /// <param name="cancellationToken">The <b>effective</b> token (user cancellation linked with any timeout).</param>
+    /// <param name="memoryBudgetBytes">The operator memory budget in bytes, or <see langword="null"/> for unbounded.</param>
     public PhysicalRuntime(
         IExecutionBackend backend,
         ExecutionBackendOptions options,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        long? memoryBudgetBytes = null)
     {
         _backend = backend ?? throw new ArgumentNullException(nameof(backend));
-        _options = options ?? throw new ArgumentNullException(nameof(options));
+        ArgumentNullException.ThrowIfNull(options);
         _cancellationToken = cancellationToken;
+
+        // One shared context for the whole tree. A configured memory budget swaps the unbounded memory
+        // for a BoundedExecutionMemory, so an operator that cannot reserve within it fails fast with a
+        // deterministic ExecutionMemoryException (criterion 3) instead of materializing unbounded state.
+        IExecutionMemory memory = memoryBudgetBytes is { } budget
+            ? new BoundedExecutionMemory(budget)
+            : BoundedExecutionMemory.Unbounded;
+        _context = new ExecutionContext(memory, cancellationToken, options);
     }
 
+    /// <summary>The aggregate estimated data-plane bytes scanned across every operator run (diagnostics).</summary>
+    public long BytesScanned => _bytesScanned;
+
+    /// <summary>The high-water reserved execution memory across every operator run (diagnostics).</summary>
+    public long PeakMemoryBytes => _peakMemoryBytes;
+
     /// <summary>
-    /// Opens <paramref name="op"/> on the backend and drains its <see cref="IBatchStream"/> to a fully
-    /// materialized batch list. Engine construction/validation failures (an ill-typed operator the
-    /// bridge could not have foreseen) are surfaced as a deterministic <see cref="UnsupportedPlanException"/>.
+    /// Opens <paramref name="op"/> on the backend over the shared context and drains its
+    /// <see cref="IBatchStream"/> to a fully materialized batch list, polling cancellation at each batch
+    /// boundary and folding the operator's <see cref="OperatorMetrics"/> into the run totals. Engine
+    /// construction/validation failures are surfaced by the callers' <c>BuildOperator</c> guard as a
+    /// deterministic <see cref="UnsupportedPlanException"/>.
     /// </summary>
     /// <remarks>
     /// <b>Batch-ownership invariant (#420).</b> Accumulating every emitted <see cref="ColumnBatch"/> into
@@ -54,36 +78,63 @@ internal sealed class PhysicalRuntime
     /// Every M1 operator produces fresh, independently-owned output (fresh columns, or a view over
     /// immutable GC-owned buffers), so this holds today. A future pooled/off-heap operator that reuses
     /// (or frees on <c>Dispose</c>) its output buffers would violate it and MUST copy-out here before
-    /// adding to the list; that streaming/pooling seam is tracked by #420.
+    /// adding to the list; that streaming/pooling seam is tracked by #420. The stream is disposed in a
+    /// <c>finally</c> on every path (drain, cancellation, fault), and the run's shared context — which
+    /// owns the spill store / memory ledger — is disposed by <see cref="Dispose"/>.
     /// </remarks>
     /// <param name="op">The shallow Engine operator (built over an in-memory scan of child batches).</param>
     /// <returns>Every batch the operator emitted, in order.</returns>
+    /// <exception cref="OperationCanceledException">The effective token was cancelled (user cancel or timeout).</exception>
     public IReadOnlyList<ColumnBatch> Run(PhysicalOperator op)
     {
         ArgumentNullException.ThrowIfNull(op);
 
-        // Each operator open builds its own ExecutionContext (BoundedExecutionMemory.Unbounded). That
-        // context owns an inert lazy spill store today (a default TempFileSpillStore that creates no disk
-        // until a reservation is refused — which never happens under Unbounded memory), so nothing
-        // operator-owned needs disposal here beyond the batch stream. When the executor grows a run that
-        // injects a real spill store (or the context owns a broader arena seam), this per-operator context
-        // will need disposal — benign to omit today, tracked with the streaming/pooling work in #420.
-        var context = new ExecutionContext(BoundedExecutionMemory.Unbounded, _cancellationToken, _options);
         var batches = new List<ColumnBatch>();
-        IBatchStream stream = _backend.Open(op, context);
+        IBatchStream stream = _backend.Open(op, _context);
         try
         {
-            while (stream.TryGetNext(out ColumnBatch? batch))
+            // Belt-and-suspenders cancellation: Engine streams already poll the context token internally
+            // (InterpretedScanStream/CancellationPolicy), but the driver also checks between batches so a
+            // cancel/timeout stops promptly even for an operator that emits everything in one batch.
+            while (true)
             {
+                _cancellationToken.ThrowIfCancellationRequested();
+                if (!stream.TryGetNext(out ColumnBatch? batch))
+                {
+                    break;
+                }
+
                 batches.Add(batch);
             }
         }
         finally
         {
             stream.Dispose();
+            AccumulateMetrics(op);
         }
 
         return batches;
+    }
+
+    /// <summary>Disposes the run's shared <see cref="ExecutionContext"/> (spill store / memory ledger); idempotent.</summary>
+    public void Dispose() => _context.Dispose();
+
+    // Folds this operator's (and its shallow children's) engine metrics into the run totals: BytesScanned
+    // sums across scan leaves; PeakMemoryBytes is a high-water max (operators run sequentially over the
+    // shared budget, releasing on dispose, so the max per-operator peak is the whole-run peak).
+    private void AccumulateMetrics(PhysicalOperator op)
+    {
+        OperatorMetricsSnapshot snapshot = op.Metrics.Snapshot();
+        _bytesScanned += snapshot.BytesScanned;
+        if (snapshot.PeakMemoryBytes > _peakMemoryBytes)
+        {
+            _peakMemoryBytes = snapshot.PeakMemoryBytes;
+        }
+
+        foreach (PhysicalOperator child in op.Children)
+        {
+            AccumulateMetrics(child);
+        }
     }
 
     /// <summary>Wraps a child result's batches in an EPIC-03 in-memory scan so an operator can open over them.</summary>

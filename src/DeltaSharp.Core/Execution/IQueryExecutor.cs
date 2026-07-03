@@ -30,9 +30,10 @@ namespace DeltaSharp.Execution;
 /// so Core stays self-contained and testable.
 /// </para>
 /// <para>
-/// <b>Deferred (M1):</b> a seam <c>CancellationToken</c> and result/resource bounds are tracked by
-/// <see href="https://github.com/khaines/deltasharp/issues/416">#416</see>; per-<see cref="DataFrame"/>
-/// analyzed-plan memoization (each action re-analyzes today) by
+/// The execution seam carries a <c>CancellationToken</c> and result/resource bounds via
+/// <see cref="ExecutionOptions"/> (STORY-04.6.4 / #176, discharging
+/// <see href="https://github.com/khaines/deltasharp/issues/416">#416</see>); per-<see cref="DataFrame"/>
+/// analyzed-plan memoization (each action re-analyzes today) remains tracked by
 /// <see href="https://github.com/khaines/deltasharp/issues/417">#417</see>.
 /// </para>
 /// </remarks>
@@ -44,16 +45,24 @@ internal interface IQueryExecutor
     /// All returned rows share the analyzed plan's output schema.
     /// </summary>
     /// <param name="analyzedPlan">The analyzer-resolved logical plan to execute.</param>
+    /// <param name="options">
+    /// The execution-time controls (cancellation, timeout, result/memory bounds) and the metrics sink
+    /// the executor fills before it returns or throws (STORY-04.6.4 / #176; discharges #416).
+    /// </param>
     /// <returns>The materialized rows, in result order; every row carries the analyzed plan's output schema.</returns>
-    IReadOnlyList<Row> Collect(LogicalPlan analyzedPlan);
+    IReadOnlyList<Row> Collect(LogicalPlan analyzedPlan, ExecutionOptions options);
 
     /// <summary>
     /// Executes <paramref name="analyzedPlan"/> and returns the number of result rows (Spark's
     /// <c>count</c>) without materializing them.
     /// </summary>
     /// <param name="analyzedPlan">The analyzer-resolved logical plan to execute.</param>
+    /// <param name="options">
+    /// The execution-time controls (cancellation, timeout, memory bound) and the metrics sink the
+    /// executor fills before it returns or throws (STORY-04.6.4 / #176; discharges #416).
+    /// </param>
     /// <returns>The row count.</returns>
-    long Count(LogicalPlan analyzedPlan);
+    long Count(LogicalPlan analyzedPlan, ExecutionOptions options);
 
     /// <summary>
     /// Renders the physical plan of <paramref name="analyzedPlan"/> as a multi-line tree string for

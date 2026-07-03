@@ -13,15 +13,26 @@ namespace DeltaSharp.Executor;
 /// </summary>
 internal static class RowMaterializer
 {
-    /// <summary>Materializes every logical row of every batch into a <see cref="Row"/>.</summary>
+    /// <summary>Materializes every logical row of every batch into a <see cref="Row"/>, honoring result bounds.</summary>
     /// <param name="result">The executed schema + batches.</param>
+    /// <param name="maxRows">The maximum rows to materialize, or <see langword="null"/> for unbounded.</param>
+    /// <param name="maxBytes">The maximum estimated bytes to materialize, or <see langword="null"/> for unbounded.</param>
+    /// <param name="cancellationToken">The effective cancellation token (user cancel linked with any timeout).</param>
     /// <returns>All rows, in batch-then-row order.</returns>
-    public static IReadOnlyList<Row> Materialize(BatchResult result)
+    /// <exception cref="ResultLimitExceededException">A configured row/byte bound would be exceeded (checked
+    /// <b>before</b> the offending batch is materialized — bounded, not OOM).</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public static IReadOnlyList<Row> Materialize(
+        BatchResult result, long? maxRows, long? maxBytes, CancellationToken cancellationToken)
     {
         StructType schema = result.Schema;
         var rows = new List<Row>();
+        long rowsSoFar = 0;
+        long bytesSoFar = 0;
         foreach (ColumnBatch batch in result.Batches)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+
             int rowCount = batch.LogicalRowCount;
             int columnCount = schema.Count;
             var columns = new ColumnVector[columnCount];
@@ -30,8 +41,31 @@ internal static class RowMaterializer
                 columns[c] = batch.SelectedColumn(c);
             }
 
+            // Enforce the result bounds BEFORE materializing this batch's rows, so the row list is never
+            // grown past the bound: a deterministic fail-fast rather than an OOM (criterion 3).
+            if (maxRows is { } rowCap && rowsSoFar + rowCount > rowCap)
+            {
+                throw ResultLimitExceededException.Rows(rowCap, rowsSoFar + rowCount);
+            }
+
+            if (maxBytes is { } byteCap)
+            {
+                long batchBytes = EstimateBatchBytes(columns, schema, rowCount);
+                if (bytesSoFar + batchBytes > byteCap)
+                {
+                    throw ResultLimitExceededException.Bytes(byteCap, bytesSoFar + batchBytes);
+                }
+
+                bytesSoFar += batchBytes;
+            }
+
             for (int r = 0; r < rowCount; r++)
             {
+                if ((r & CancellationPollMask) == 0)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+
                 var values = new object?[columnCount];
                 for (int c = 0; c < columnCount; c++)
                 {
@@ -40,6 +74,8 @@ internal static class RowMaterializer
 
                 rows.Add(new Row(schema, values));
             }
+
+            rowsSoFar += rowCount;
         }
 
         return rows;
@@ -76,7 +112,52 @@ internal static class RowMaterializer
         StringType => Encoding.UTF8.GetString(column.GetBytes(index)),
         BinaryType => column.GetBytes(index).ToArray(),
         _ => throw new UnsupportedPlanException(
+            QueryExecutionStage.Materialize,
             $"Row materialization has no CLR mapping for type '{type.SimpleString}'."),
+    };
+
+    // The driver polls the effective cancellation token every 1024 materialized rows (a power-of-two
+    // mask keeps the check branch-cheap) so a cancel/timeout stops a large single-batch result promptly.
+    private const int CancellationPollMask = 1023;
+
+    // A best-effort estimate of the bytes materializing this batch would hold, mirroring the Engine
+    // scan's EstimateBatchBytes (fixed-width: rows × width; variable-width: sum of non-null value
+    // lengths), read through the already-resolved selected columns. It is the byte proxy the result
+    // byte-bound (criterion 3) is enforced against; the exact figure is not required for a safety bound.
+    private static long EstimateBatchBytes(ColumnVector[] columns, StructType schema, int rowCount)
+    {
+        long bytes = 0;
+        for (int c = 0; c < columns.Length; c++)
+        {
+            ColumnVector column = columns[c];
+            DataType type = schema[c].DataType;
+            if (type is StringType or BinaryType)
+            {
+                for (int r = 0; r < rowCount; r++)
+                {
+                    if (!column.IsNull(r))
+                    {
+                        bytes += column.GetBytes(r).Length;
+                    }
+                }
+            }
+            else
+            {
+                bytes += (long)rowCount * FixedWidthBytes(type);
+            }
+        }
+
+        return bytes;
+    }
+
+    private static int FixedWidthBytes(DataType type) => type switch
+    {
+        BooleanType or ByteType => 1,
+        ShortType => 2,
+        IntegerType or FloatType or DateType => 4,
+        LongType or DoubleType or TimestampType => 8,
+        DecimalType decimalType => decimalType.IsCompact ? 8 : 16,
+        _ => 8,
     };
 
     // A DateType lane stores the Spark epoch-day (days since 1970-01-01) as an int; surface it as the
@@ -99,7 +180,8 @@ internal static class RowMaterializer
     }
 
     private static UnsupportedPlanException OutOfRangeDate(int epochDay) =>
-        new($"Row materialization cannot surface the date epoch-day value {epochDay} as "
+        new(QueryExecutionStage.Materialize,
+            $"Row materialization cannot surface the date epoch-day value {epochDay} as "
             + "System.DateOnly: the date falls outside the representable DateOnly range.");
 
     // A TimestampType lane stores the Spark epoch-microsecond instant as a long; surface it as a UTC
@@ -131,7 +213,8 @@ internal static class RowMaterializer
     }
 
     private static UnsupportedPlanException OutOfRangeTimestamp(long micros) =>
-        new($"Row materialization cannot surface the timestamp epoch-microsecond value {micros} as "
+        new(QueryExecutionStage.Materialize,
+            $"Row materialization cannot surface the timestamp epoch-microsecond value {micros} as "
             + "System.DateTime: the instant falls outside the representable DateTime range.");
 
     private static readonly DateOnly UnixEpochDate = new(1970, 1, 1);
@@ -146,6 +229,7 @@ internal static class RowMaterializer
         if (type.Scale > MaxDecimalScale)
         {
             throw new UnsupportedPlanException(
+                QueryExecutionStage.Materialize,
                 $"Row materialization cannot surface '{type.SimpleString}' as System.Decimal: scale "
                 + $"{type.Scale} exceeds the System.Decimal maximum of {MaxDecimalScale}.");
         }
@@ -156,6 +240,7 @@ internal static class RowMaterializer
         if (magnitude > MaxDecimalMagnitude)
         {
             throw new UnsupportedPlanException(
+                QueryExecutionStage.Materialize,
                 $"Row materialization cannot surface a '{type.SimpleString}' value as System.Decimal: "
                 + "its unscaled magnitude exceeds the 96-bit System.Decimal range.");
         }
