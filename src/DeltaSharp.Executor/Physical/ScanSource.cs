@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Plans.Logical;
 using DeltaSharp.Types;
@@ -16,7 +18,7 @@ internal interface IScanSource
     /// <param name="relation">The scanned relation.</param>
     /// <param name="batches">The resolved batches when found.</param>
     /// <returns><see langword="true"/> if the relation is registered; otherwise <see langword="false"/>.</returns>
-    bool TryGetBatches(ResolvedRelation relation, out IReadOnlyList<ColumnBatch> batches);
+    bool TryGetBatches(ResolvedRelation relation, [NotNullWhen(true)] out IReadOnlyList<ColumnBatch>? batches);
 }
 
 /// <summary>
@@ -27,7 +29,9 @@ internal interface IScanSource
 /// </summary>
 internal sealed class InMemoryScanSource : IScanSource
 {
-    private readonly Dictionary<string, IReadOnlyList<ColumnBatch>> _byIdentifier = new(StringComparer.Ordinal);
+    // Concurrent because the process-global Default is shared across threads (parallel test hosts, and
+    // any future concurrent data-in path); registration and resolution must stay thread-safe.
+    private readonly ConcurrentDictionary<string, IReadOnlyList<ColumnBatch>> _byIdentifier = new(StringComparer.Ordinal);
 
     /// <summary>A process-wide default source the auto-registered <see cref="LocalQueryExecutor"/> reads from.</summary>
     public static InMemoryScanSource Default { get; } = new();
@@ -57,10 +61,10 @@ internal sealed class InMemoryScanSource : IScanSource
     }
 
     /// <inheritdoc />
-    public bool TryGetBatches(ResolvedRelation relation, out IReadOnlyList<ColumnBatch> batches)
+    public bool TryGetBatches(ResolvedRelation relation, [NotNullWhen(true)] out IReadOnlyList<ColumnBatch>? batches)
     {
         ArgumentNullException.ThrowIfNull(relation);
-        return _byIdentifier.TryGetValue(Key(relation.Identifier), out batches!);
+        return _byIdentifier.TryGetValue(Key(relation.Identifier), out batches);
     }
 
     private static string Key(IReadOnlyList<string> identifier) => string.Join('.', identifier);

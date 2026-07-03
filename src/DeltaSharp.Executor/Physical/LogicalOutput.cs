@@ -30,9 +30,11 @@ namespace DeltaSharp.Executor;
 /// loudly via <see cref="UnsupportedPlanException"/> rather than producing a silently wrong plan.
 /// </para>
 /// <para>
-/// <b>Rebase note (#172/#173).</b> This mirroring is a pre-merge shim. The durable fix is an exposed
-/// output seam on the analyzer/optimizer; when #172 (optimizer) and #173 land, replace this with the
-/// real seam and delete the reconstruction. See <c>docs/engineering/design/physical-planning.md</c>.
+/// <b>Rebase note (#421).</b> This mirroring duplicates analyzer internals. #172 (optimizer) and #173
+/// (Row/IQueryExecutor) are now merged, so the branch binds the real Core seam — but the durable
+/// analyzer/optimizer <i>output</i> seam is still pending (<b>#421</b>): once it lands, replace this
+/// reconstruction with the exposed seam and delete the mirroring. See
+/// <c>docs/engineering/design/physical-planning.md</c>.
 /// </para>
 /// </remarks>
 internal sealed class LogicalOutput

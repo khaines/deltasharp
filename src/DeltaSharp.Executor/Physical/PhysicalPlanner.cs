@@ -64,7 +64,7 @@ internal sealed class PhysicalPlanner
         switch (node)
         {
             case LogicalResolvedRelation relation:
-                return PlanScan(relation, outputs);
+                return PlanScan(relation);
 
             case LogicalFilter filter:
                 return PlanFilter(filter, outputs);
@@ -96,7 +96,7 @@ internal sealed class PhysicalPlanner
         }
     }
 
-    private PhysicalPlan PlanScan(LogicalResolvedRelation relation, LogicalOutput outputs)
+    private PhysicalPlan PlanScan(LogicalResolvedRelation relation)
     {
         if (!_scanSource.TryGetBatches(relation, out var batches))
         {
@@ -105,9 +105,9 @@ internal sealed class PhysicalPlanner
                 + "The M1 data-in door is the in-memory relation fixture; the public read-door is STORY-04.1.2 (#158).");
         }
 
-        // The relation schema is authoritative for the leaf's batches; the derived attributes carry
-        // the ExprIds downstream expression resolution binds against.
-        _ = outputs.OutputOf(relation);
+        // The relation schema is authoritative for the leaf's batches; the derived attributes (carrying
+        // the ExprIds downstream expression resolution binds against) are memoized in `outputs` by
+        // LogicalOutput.Derive during the initial traversal, so no per-scan derivation is needed here.
         return new ScanPlan(relation.Schema, batches);
     }
 
@@ -293,9 +293,24 @@ internal sealed class PhysicalPlanner
 
     private static StructType SchemaOf(IReadOnlyList<ExprAttributeReference> attributes)
     {
+        // A StructType rejects duplicate field names with a raw SchemaValidationException; detect the
+        // collision first so a plan whose output carries a repeated name (e.g. Select(col, col), or an
+        // equi-join whose sides share a column name) fails with the contractual deterministic
+        // UnsupportedPlanException naming the offender instead. Full duplicate-name support (Spark
+        // permits duplicate output names) is deferred to #419.
+        var seen = new HashSet<string>(attributes.Count, StringComparer.Ordinal);
         var fields = new StructField[attributes.Count];
         for (int i = 0; i < attributes.Count; i++)
         {
+            if (!seen.Add(attributes[i].Name))
+            {
+                throw new UnsupportedPlanException(
+                    $"Physical planning does not support a plan with a duplicate output column name "
+                    + $"'{attributes[i].Name}'; rename/alias the column (this commonly arises from "
+                    + "Select(col, col) or an equi-join whose sides share a column name) "
+                    + "— full duplicate-name support is tracked in #419.");
+            }
+
             fields[i] = new StructField(attributes[i].Name, attributes[i].Type, attributes[i].Nullable);
         }
 

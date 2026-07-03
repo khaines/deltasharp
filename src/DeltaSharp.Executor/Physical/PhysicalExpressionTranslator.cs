@@ -45,17 +45,17 @@ namespace DeltaSharp.Executor;
 /// </summary>
 internal sealed class PhysicalExpressionTranslator
 {
-    private readonly Dictionary<long, int> _ordinalByExprId;
+    private readonly Dictionary<long, (int Ordinal, ExprAttributeReference Attribute)> _bindingByExprId;
     private readonly AnsiMode _mode;
 
     private PhysicalExpressionTranslator(IReadOnlyList<ExprAttributeReference> input, AnsiMode mode)
     {
         _mode = mode;
-        _ordinalByExprId = new Dictionary<long, int>(input.Count);
+        _bindingByExprId = new Dictionary<long, (int, ExprAttributeReference)>(input.Count);
         for (int i = 0; i < input.Count; i++)
         {
             // A later duplicate id would shadow an earlier column; keep the first (leftmost) binding.
-            _ordinalByExprId.TryAdd(input[i].ExprId.Value, i);
+            _bindingByExprId.TryAdd(input[i].ExprId.Value, (i, input[i]));
         }
     }
 
@@ -178,14 +178,27 @@ internal sealed class PhysicalExpressionTranslator
 
     private EngineColumnReference ColumnRef(ExprAttributeReference attribute)
     {
-        if (!_ordinalByExprId.TryGetValue(attribute.ExprId.Value, out int ordinal))
+        if (!_bindingByExprId.TryGetValue(attribute.ExprId.Value, out (int Ordinal, ExprAttributeReference Attribute) binding))
         {
             throw new UnsupportedPlanException(
                 $"Could not resolve attribute '{attribute.Name}#{attribute.ExprId}' against the operator's input; "
-                + "the reconstructed output ExprIds drifted from the plan (needs the #172/#173 output seam).");
+                + "the reconstructed output ExprIds drifted from the plan (needs the #421 analyzer/optimizer output seam).");
         }
 
-        return new EngineColumnReference(ordinal, attribute.Type, attribute.Nullable);
+        // Self-check (#421): id-membership alone would accept a bind whose reconstructed output attribute
+        // drifted to the wrong column (same id, different name/type — a valid-but-wrong-ordinal bind). The
+        // reference and the reconstructed input attribute the id resolves to must agree on name and type;
+        // if they don't, the reconstruction is unsound, so fail loudly rather than emit a wrong plan.
+        if (!string.Equals(binding.Attribute.Name, attribute.Name, StringComparison.Ordinal)
+            || !binding.Attribute.Type.Equals(attribute.Type))
+        {
+            throw new UnsupportedPlanException(
+                $"Resolved attribute '{attribute.Name}#{attribute.ExprId}' to input column "
+                + $"'{binding.Attribute.Name}#{binding.Attribute.ExprId}' at ordinal {binding.Ordinal}, but they "
+                + "disagree on name/type; the reconstructed output drifted from the plan (needs the #421 output seam).");
+        }
+
+        return new EngineColumnReference(binding.Ordinal, attribute.Type, attribute.Nullable);
     }
 
     private static EngineLiteral LiteralOf(CoreLiteral literal)

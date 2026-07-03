@@ -54,8 +54,11 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
     {
         ArgumentNullException.ThrowIfNull(session);
 
-        // ADR-0001: the interpreted vectorized backend is the default and the correctness reference;
-        // the compiled tier is a best-effort override that both maps to identical results (parity).
+        // ADR-0001: the interpreted vectorized backend is the default and the correctness reference.
+        // In M1 the "compiled" tier is not yet wired (intra-operator Expression.Compile fusion is #148),
+        // so both backend selections currently delegate to the same InterpretedOperators.Open — the
+        // end-to-end backend-parity check is therefore a smoke test today, not yet a true differential
+        // oracle; it becomes one once the compiled tier lands.
         return session.ExecutionBackend == ExecutionBackend.Interpreted
             ? new ExecutionBackendOptions { ForceInterpreted = true }
             : ExecutionBackendOptions.Default;

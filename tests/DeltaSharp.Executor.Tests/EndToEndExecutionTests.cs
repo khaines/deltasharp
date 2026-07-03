@@ -168,6 +168,9 @@ public class EndToEndExecutionTests
     [Fact]
     public void InterpretedAndDefaultBackends_ProduceIdenticalRows()
     {
+        // Smoke test, not (yet) a true differential oracle: in M1 both backend selections delegate to
+        // the same InterpretedOperators.Open, because the compiled Expression.Compile fusion tier is not
+        // wired (#148). It becomes a real interpreted-vs-compiled parity oracle once that tier lands.
         (InMemoryRelationFixture fixture, DataFrame people) = NewPeople();
         DataFrame query = people.GroupBy(Col("dept")).Agg(Sum(Col("salary")));
 

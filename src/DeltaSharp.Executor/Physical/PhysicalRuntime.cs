@@ -42,20 +42,29 @@ internal sealed class PhysicalRuntime
         _cancellationToken = cancellationToken;
     }
 
-    /// <summary>The ANSI strictness lens M1 evaluates arithmetic/casts under (Spark/Engine default).</summary>
-    public AnsiMode AnsiMode => AnsiMode.Ansi;
-
     /// <summary>
     /// Opens <paramref name="op"/> on the backend and drains its <see cref="IBatchStream"/> to a fully
     /// materialized batch list. Engine construction/validation failures (an ill-typed operator the
     /// bridge could not have foreseen) are surfaced as a deterministic <see cref="UnsupportedPlanException"/>.
     /// </summary>
+    /// <remarks>
+    /// <b>Batch-ownership invariant (#420).</b> Accumulating every emitted <see cref="ColumnBatch"/> into
+    /// a list relies on each batch being <b>independently owned</b> — a batch stays valid across
+    /// subsequent <see cref="IBatchStream.TryGetNext"/> calls and the stream's <see cref="IDisposable.Dispose"/>.
+    /// Every M1 operator allocates a fresh output batch, so this holds today. A future pooled/off-heap
+    /// operator that reuses (or frees on <c>Dispose</c>) its output buffers would violate it and MUST
+    /// copy-out here before adding to the list; that streaming/pooling seam is tracked by #420.
+    /// </remarks>
     /// <param name="op">The shallow Engine operator (built over an in-memory scan of child batches).</param>
     /// <returns>Every batch the operator emitted, in order.</returns>
     public IReadOnlyList<ColumnBatch> Run(PhysicalOperator op)
     {
         ArgumentNullException.ThrowIfNull(op);
 
+        // Each operator open builds its own ExecutionContext (BoundedExecutionMemory.Unbounded, no
+        // spill in M1), so nothing operator-owned needs disposal here beyond the batch stream. When the
+        // Engine grows a spill/arena seam that the context owns, this per-operator context will need
+        // disposal — benign to omit today, tracked with the streaming/pooling work in #420.
         var context = new ExecutionContext(BoundedExecutionMemory.Unbounded, _cancellationToken, _options);
         var batches = new List<ColumnBatch>();
         IBatchStream stream = _backend.Open(op, context);

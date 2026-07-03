@@ -66,31 +66,64 @@ internal static class RowMaterializer
         // Spark ByteType is a signed tinyint; the Engine stores it as an unsigned byte lane.
         ByteType => unchecked((sbyte)column.GetValue<byte>(index)),
         ShortType => column.GetValue<short>(index),
-        IntegerType or DateType => column.GetValue<int>(index),
-        LongType or TimestampType => column.GetValue<long>(index),
+        IntegerType => column.GetValue<int>(index),
+        LongType => column.GetValue<long>(index),
         FloatType => column.GetValue<float>(index),
         DoubleType => column.GetValue<double>(index),
         DecimalType decimalType => ReadDecimal(column, decimalType, index),
+        DateType => ReadDate(column, index),
+        TimestampType => ReadTimestamp(column, index),
         StringType => Encoding.UTF8.GetString(column.GetBytes(index)),
         BinaryType => column.GetBytes(index).ToArray(),
         _ => throw new UnsupportedPlanException(
             $"Row materialization has no CLR mapping for type '{type.SimpleString}'."),
     };
 
+    // A DateType lane stores the Spark epoch-day (days since 1970-01-01) as an int; surface it as the
+    // CLR DateOnly that lit(DateOnly) round-trips (Functions.DateLiteral uses the same epoch), so
+    // Collect()/GetAs<DateOnly> and Show render a calendar date rather than the raw epoch number.
+    private static DateOnly ReadDate(ColumnVector column, int index) =>
+        UnixEpochDate.AddDays(column.GetValue<int>(index));
+
+    // A TimestampType lane stores the Spark epoch-microsecond instant as a long; surface it as a UTC
+    // DateTime — the inverse of lit(DateTime)/lit(DateTimeOffset), which normalize to epoch-micros —
+    // so Collect()/GetAs<DateTime> round-trips and Show renders an instant, not the raw epoch number.
+    private static DateTime ReadTimestamp(ColumnVector column, int index) =>
+        DateTime.UnixEpoch.AddTicks(column.GetValue<long>(index) * TimeSpan.TicksPerMicrosecond);
+
+    private static readonly DateOnly UnixEpochDate = new(1970, 1, 1);
+
     private static decimal ReadDecimal(ColumnVector column, DecimalType type, int index)
     {
-        Int128 unscaled = type.IsCompact ? column.GetValue<long>(index) : column.GetValue<Int128>(index);
-        return (decimal)unscaled / Pow10(type.Scale);
-    }
-
-    private static decimal Pow10(int scale)
-    {
-        decimal result = 1m;
-        for (int i = 0; i < scale; i++)
+        // System.Decimal is a sign + 96-bit magnitude + scale in [0, 28]. Reconstruct it directly from
+        // the unscaled integer preserving the declared scale (so decimal(5,2) 100.00 keeps scale 2 and
+        // renders "100.00", instead of dividing by 10^scale — which both overflows for wide values
+        // representable at their scale and normalizes trailing zeros away). A genuinely unrepresentable
+        // value (scale > 28, or a magnitude wider than 96 bits) is a deterministic UnsupportedPlanException.
+        if (type.Scale > MaxDecimalScale)
         {
-            result *= 10m;
+            throw new UnsupportedPlanException(
+                $"Row materialization cannot surface '{type.SimpleString}' as System.Decimal: scale "
+                + $"{type.Scale} exceeds the System.Decimal maximum of {MaxDecimalScale}.");
         }
 
-        return result;
+        Int128 unscaled = type.IsCompact ? column.GetValue<long>(index) : column.GetValue<Int128>(index);
+        bool isNegative = unscaled < 0;
+        UInt128 magnitude = isNegative ? (UInt128)(-unscaled) : (UInt128)unscaled;
+        if (magnitude > MaxDecimalMagnitude)
+        {
+            throw new UnsupportedPlanException(
+                $"Row materialization cannot surface a '{type.SimpleString}' value as System.Decimal: "
+                + "its unscaled magnitude exceeds the 96-bit System.Decimal range.");
+        }
+
+        int lo = unchecked((int)(uint)magnitude);
+        int mid = unchecked((int)(uint)(magnitude >> 32));
+        int hi = unchecked((int)(uint)(magnitude >> 64));
+        return new decimal(lo, mid, hi, isNegative, (byte)type.Scale);
     }
+
+    // System.Decimal supports at most 28 fractional digits and a 96-bit magnitude.
+    private const int MaxDecimalScale = 28;
+    private static readonly UInt128 MaxDecimalMagnitude = UInt128.MaxValue >> 32;
 }
