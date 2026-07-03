@@ -1,4 +1,5 @@
 using DeltaSharp.Plans.Expressions;
+using DeltaSharp.Plans.Logical;
 using DeltaSharp.Types;
 
 namespace DeltaSharp.Analysis;
@@ -122,12 +123,16 @@ internal sealed class AnalysisException : Exception
     {
         ArgumentException.ThrowIfNullOrEmpty(format);
         ArgumentException.ThrowIfNullOrEmpty(path);
+
+        // Redact credential-bearing fragments (SAS ?sig=, presigned URLs, userinfo) so the diagnostic
+        // (and any log that captures it) never leaks a secret embedded in the path.
+        string safePath = SecretRedaction.RedactPath(path);
         return new AnalysisException(
             $"Reading a '{format}' data source is not supported in this milestone: the file-format "
-            + $"reader for path '{path}' is delivered by EPIC-05 (Delta/Parquet storage). Until then, "
+            + $"reader for path '{safePath}' is delivered by EPIC-05 (Delta/Parquet storage). Until then, "
             + "create a DataFrame from in-memory data with SparkSession.CreateDataFrame(rows, schema).",
             AnalysisErrorKind.UnsupportedDataSource,
-            path,
+            safePath,
             Array.Empty<string>());
     }
 

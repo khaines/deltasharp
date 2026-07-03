@@ -68,12 +68,14 @@ internal sealed class UnresolvedFileRelation : LogicalPlan
     {
         get
         {
+            // Render option KEYS ONLY (never values) and a redacted path: options and cloud paths can
+            // carry credentials (SAS ?sig=, presigned URLs, userinfo), which must not leak the moment
+            // this node is stringified (Explain #179, logging).
             string options = Options.Count == 0
                 ? string.Empty
-                : ", options=[" + string.Join(", ", Options.OrderBy(o => o.Key, StringComparer.Ordinal)
-                    .Select(o => $"{o.Key}={o.Value}")) + "]";
+                : ", options=[" + string.Join(", ", Options.Keys.OrderBy(k => k, StringComparer.Ordinal)) + "]";
             string schema = UserSchema is null ? string.Empty : $", userSchema={UserSchema.SimpleString}";
-            return $"{UnresolvedPrefix}UnresolvedRelation {Format} [{Path}]{options}{schema}";
+            return $"{UnresolvedPrefix}UnresolvedRelation {Format} [{SecretRedaction.RedactPath(Path)}]{options}{schema}";
         }
     }
 

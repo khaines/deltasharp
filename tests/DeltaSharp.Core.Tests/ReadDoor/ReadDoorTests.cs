@@ -187,6 +187,47 @@ public sealed class ReadDoorTests
         Assert.Contains("/data/x.parquet", tree);
     }
 
+    // ---------------- security: rendering must not leak secrets ----------------
+
+    [Fact]
+    public void ParquetScan_SimpleString_RendersOptionKeysOnly_NeverValues()
+    {
+        using SparkSession spark = NewSession();
+
+        LogicalPlan plan = spark.Read.Option("pathGlobFilter", "S3CR3T-OPTION-VALUE").Parquet("/p").Plan;
+        string rendered = plan.SimpleString;
+
+        Assert.Contains("options=[pathGlobFilter]", rendered);
+        Assert.DoesNotContain("S3CR3T-OPTION-VALUE", rendered);
+    }
+
+    [Fact]
+    public void ParquetScan_SimpleString_RedactsCredentialBearingPathQuery()
+    {
+        using SparkSession spark = NewSession();
+
+        LogicalPlan plan = spark.Read.Parquet(
+            "wasbs://c@acct.blob.core.windows.net/f.parquet?sig=SUPERSECRETSAS&sp=r").Plan;
+        string rendered = plan.SimpleString;
+
+        Assert.DoesNotContain("SUPERSECRETSAS", rendered);
+        Assert.Contains("<redacted>", rendered);
+    }
+
+    [Fact]
+    public void AnalyzingParquetScan_DiagnosticRedactsSecretInPath()
+    {
+        using SparkSession spark = NewSession();
+        LogicalPlan plan = spark.Read.Parquet(
+            "s3://bucket/f.parquet?X-Amz-Signature=DEADBEEFSECRET").Plan;
+
+        AnalysisException ex = Assert.Throws<AnalysisException>(
+            () => new Analyzer(new LocalCatalog()).Resolve(plan));
+
+        Assert.DoesNotContain("DEADBEEFSECRET", ex.Message);
+        Assert.Contains("<redacted>", ex.Message);
+    }
+
     [Fact]
     public void AnalyzingParquetScan_ThrowsUnsupportedDataSource_NamingEpic05()
     {

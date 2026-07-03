@@ -1,3 +1,4 @@
+using System.Collections.Frozen;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -19,8 +20,14 @@ namespace DeltaSharp;
 /// <b>unresolved</b> Parquet scan in the plan and opens <b>no</b> file (STORY-04.1.2 / #158, AC2). The
 /// Parquet <i>reader</i> itself is EPIC-05 (Delta/Parquet storage): an action that analyzes a Parquet
 /// scan fails with a deterministic diagnostic naming EPIC-05 ownership. Instances are created by
-/// <see cref="SparkSession.Read"/>, so the constructor is non-public. See
+/// <see cref="SparkSession.Read"/> (a fresh reader per access), so the constructor is non-public. See
 /// <c>docs/engineering/design/read-door.md</c>.
+/// </para>
+/// <para>
+/// <b>Option-key validation is finalize-time.</b> <see cref="Option(string, string)"/> and its
+/// overloads only stage keys; whether a key is a recognized read option is checked at the terminal
+/// <see cref="Parquet(string)"/> call (Spark parity: options are validated when the read is finalized),
+/// so options may be staged in any order.
 /// </para>
 /// </remarks>
 public sealed class DataFrameReader
@@ -28,7 +35,7 @@ public sealed class DataFrameReader
     /// <summary>The Spark Parquet read options DeltaSharp recognizes and records onto the scan node for
     /// the EPIC-05 reader to honor. Any other key is rejected at <see cref="Parquet(string)"/> time
     /// (AC3). Case-insensitive, matching Spark's case-insensitive option map.</summary>
-    private static readonly IReadOnlySet<string> RecognizedParquetOptions =
+    private static readonly FrozenSet<string> RecognizedParquetOptions =
         new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             "mergeSchema",
@@ -38,7 +45,7 @@ public sealed class DataFrameReader
             "modifiedAfter",
             "datetimeRebaseMode",
             "int96RebaseMode",
-        };
+        }.ToFrozenSet(StringComparer.OrdinalIgnoreCase);
 
     private readonly SparkSession _session;
     private readonly Dictionary<string, string> _options = new(StringComparer.OrdinalIgnoreCase);
@@ -131,22 +138,22 @@ public sealed class DataFrameReader
     /// options keyed by their canonical recognized spelling, so option handling is case-insensitive
     /// (Spark parity) yet the scan node carries deterministic keys. An unrecognized key raises a
     /// deterministic diagnostic naming the offending option and the documented alternative (AC3).</summary>
-    private IReadOnlyDictionary<string, string> CanonicalizeOptions(IReadOnlySet<string> recognized)
+    private IReadOnlyDictionary<string, string> CanonicalizeOptions(FrozenSet<string> recognized)
     {
         var canonical = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (KeyValuePair<string, string> option in _options)
         {
-            string? match = recognized.FirstOrDefault(
-                o => string.Equals(o, option.Key, StringComparison.OrdinalIgnoreCase));
-            if (match is null)
+            // TryGetValue returns the stored element under its canonical (recognized) spelling, so option
+            // handling stays case-insensitive (Spark parity) while the scan node carries deterministic
+            // keys — an O(1) frozen-set lookup instead of an O(n) scan.
+            if (!recognized.TryGetValue(option.Key, out string? match))
             {
                 string supported = string.Join(
                     ", ", recognized.OrderBy(o => o, StringComparer.OrdinalIgnoreCase));
                 throw new ArgumentException(
                     $"Unsupported Parquet reader option '{option.Key}'. DeltaSharp M1 recognizes these "
                     + $"Parquet read options: [{supported}]. To fix a read schema, call "
-                    + "DataFrameReader.Schema(StructType) instead of an option.",
-                    nameof(recognized));
+                    + "DataFrameReader.Schema(StructType) instead of an option.");
             }
 
             canonical[match] = option.Value;

@@ -36,7 +36,9 @@ internal sealed class UnsupportedQueryExecutor : IQueryExecutor
         + "physical plan (STORY-04.6.2 / #174)>";
 
     private static QueryExecutionException NotRegistered() =>
-        new("No execution backend is registered, so this DataFrame action cannot run. "
-            + "Reference the DeltaSharp.Executor package to enable query execution "
-            + "(collect/count/show); it ships in STORY-04.6.2 (#174).");
+        new("No execution backend is registered, so this DataFrame action cannot run. Reference the "
+            + "DeltaSharp.Executor assembly and enable execution by calling "
+            + "DeltaSharp.Executor.DeltaSharpExecutor.Enable() once at startup (a program that reaches an "
+            + "action through only DeltaSharp.Core types does not auto-initialize the backend). The "
+            + "backend also self-registers the first time any DeltaSharp.Executor type is used.");
 }

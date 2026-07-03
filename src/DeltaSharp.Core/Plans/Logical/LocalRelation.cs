@@ -22,11 +22,20 @@ namespace DeltaSharp.Plans.Logical;
 /// <see cref="WithResolvedOutput"/>, carrying the <see cref="Data"/> reference through unchanged.
 /// </para>
 /// <para>
-/// <b>Laziness.</b> The <see cref="Data"/> sequence is stored <b>by reference and never enumerated by
-/// Core</b>; it is iterated exactly once, at physical planning, by the Executor. Construction opens no
-/// file and materializes no row (ADR-0001). Consequently <see cref="NodeEquals"/>/<see cref="NodeHashCode"/>
-/// compare <see cref="Data"/> by <b>reference identity</b> (schema and output by value): value-comparing
-/// the rows would force enumeration and mishandle one-shot iterators.
+/// <b>Laziness + stable snapshot.</b> The caller's sequence is wrapped in a
+/// <see cref="MemoizedRowSequence"/> and exposed as <see cref="Data"/>. Construction enumerates
+/// <b>nothing</b> (AC1 — opens no file, materializes no row, per ADR-0001); the <b>first</b> action's
+/// execution enumerates the source once and caches an immutable snapshot, and every later enumeration
+/// (multi-action, multi-scan, self-join) replays that same snapshot. This gives Spark's
+/// <c>createDataFrame(List, schema)</c> stable semantics without breaking laziness: mutating the source
+/// after the first action, or passing a single-use iterator, can no longer make
+/// <see cref="DataFrame.Count"/> and <see cref="DataFrame.Collect"/> disagree.
+/// </para>
+/// <para>
+/// <b>Node identity.</b> <see cref="NodeEquals"/>/<see cref="NodeHashCode"/> compare <see cref="Data"/>
+/// by <b>reference identity</b> (schema and output by value): value-comparing the rows would force
+/// enumeration and mishandle one-shot iterators. The single memoizing wrapper is shared across the
+/// unresolved/resolved forms (see <see cref="WithResolvedOutput"/>), so reference identity holds.
 /// </para>
 /// </remarks>
 internal sealed class LocalRelation : LogicalPlan
@@ -45,14 +54,20 @@ internal sealed class LocalRelation : LogicalPlan
         : base(PlanCollections.Empty<LogicalPlan>())
     {
         Schema = schema ?? throw new ArgumentNullException(nameof(schema));
-        Data = data ?? throw new ArgumentNullException(nameof(data));
+        ArgumentNullException.ThrowIfNull(data);
+
+        // Wrap the caller's sequence in a memoizing snapshot so every action replays identical rows
+        // (Wrap is idempotent, so the resolved form shares the unresolved form's snapshot and keeps
+        // reference identity). Wrapping enumerates nothing, preserving AC1 laziness.
+        Data = MemoizedRowSequence.Wrap(data);
         Output = output;
     }
 
     /// <summary>The authoritative ADR-0008 schema of every row.</summary>
     public StructType Schema { get; }
 
-    /// <summary>The local rows, stored by reference and enumerated once at execution.</summary>
+    /// <summary>The local rows as a memoizing snapshot: never enumerated by Core (only at execution), and
+    /// replayable so every action sees the same stable rows.</summary>
     public IEnumerable<Row> Data { get; }
 
     /// <summary>The resolved output attributes (one per schema field), or <see langword="null"/> until

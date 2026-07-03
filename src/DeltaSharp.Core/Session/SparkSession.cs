@@ -166,7 +166,8 @@ public sealed class SparkSession : IDisposable
 
     /// <summary>
     /// Gets a <see cref="DataFrameReader"/> for reading data into a <see cref="DataFrame"/> (Spark's
-    /// <c>spark.read</c>).
+    /// <c>spark.read</c>). Each access returns a <b>fresh</b> reader (a new mutable builder), so staged
+    /// schema/options on one reader never leak into another.
     /// </summary>
     /// <exception cref="SessionStoppedException">The session has been stopped or disposed.</exception>
     public DataFrameReader Read
@@ -231,9 +232,12 @@ public sealed class SparkSession : IDisposable
     /// This is a <b>transformation</b>: it builds a scan (<c>LocalRelation</c>) logical plan and
     /// <b>materializes no rows</b> — the sequence is not enumerated until an action
     /// (<see cref="DataFrame.Collect"/>, <see cref="DataFrame.Count"/>, …) runs (STORY-04.1.2 / #158,
-    /// AC1). Because the plan captures <paramref name="data"/> by reference, mutating the underlying
-    /// collection before an action affects the observed rows; pass a stable snapshot for deterministic
-    /// results.
+    /// AC1). The captured sequence is wrapped in a <b>memoizing snapshot</b>: the first action enumerates
+    /// it once and caches an immutable snapshot, and every later action replays that same snapshot. So,
+    /// like Spark's <c>createDataFrame(List, schema)</c>, all actions on the returned frame observe
+    /// identical, stable rows — mutating the source after the first action, or passing a single-use
+    /// iterator, does not change results. (Mutating the source <i>before</i> the first action is still
+    /// observed, since laziness defers the snapshot to that first action.)
     /// </remarks>
     /// <param name="data">The in-memory rows. Each row's values are read positionally against
     /// <paramref name="schema"/>.</param>

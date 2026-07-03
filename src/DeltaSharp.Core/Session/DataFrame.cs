@@ -561,6 +561,10 @@ public sealed class DataFrame
     /// once — the crossing from lazy plan construction into eager execution.
     /// </summary>
     /// <returns>The materialized <see cref="Row"/>s, in result order.</returns>
+    /// <remarks>Because analysis happens here, any analysis-time failure surfaces on this action rather
+    /// than when the plan was built — for example reading an unsupported data source
+    /// (<c>Read.Parquet(...)</c>, whose reader is deferred to EPIC-05) throws its deterministic
+    /// diagnostic on the first action, not at <see cref="SparkSession.Read"/>.</remarks>
     /// <exception cref="InvalidOperationException">This frame is not bound to a <see cref="SparkSession"/>.</exception>
     /// <exception cref="SessionStoppedException">The owning session has been stopped or disposed.</exception>
     /// <exception cref="QueryExecutionException">No execution backend is registered, or the backend
@@ -579,6 +583,8 @@ public sealed class DataFrame
     /// materializing the rows.
     /// </summary>
     /// <returns>The number of result rows.</returns>
+    /// <remarks>Analysis happens here, so any analysis-time failure (for example an unsupported
+    /// EPIC-05-deferred data source) surfaces on this action, not at plan-build time.</remarks>
     /// <exception cref="InvalidOperationException">This frame is not bound to a <see cref="SparkSession"/>.</exception>
     /// <exception cref="SessionStoppedException">The owning session has been stopped or disposed.</exception>
     /// <exception cref="QueryExecutionException">No execution backend is registered, or the backend
@@ -599,6 +605,8 @@ public sealed class DataFrame
     /// <param name="numRows">The maximum number of rows to display (default 20).</param>
     /// <param name="truncate">When <see langword="true"/> (default) cells longer than 20 characters are
     /// truncated with a trailing <c>...</c>; when <see langword="false"/> full values are shown.</param>
+    /// <remarks>Analysis happens here, so any analysis-time failure (for example an unsupported
+    /// EPIC-05-deferred data source) surfaces on this action, not at plan-build time.</remarks>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="numRows"/> is negative.</exception>
     /// <exception cref="InvalidOperationException">This frame is not bound to a <see cref="SparkSession"/>.</exception>
     /// <exception cref="SessionStoppedException">The owning session has been stopped or disposed.</exception>
