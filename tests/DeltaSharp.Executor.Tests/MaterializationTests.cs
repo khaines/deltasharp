@@ -223,6 +223,33 @@ public class MaterializationTests
         Assert.Contains("DateOnly", ex.Message, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void Date_ExactInRangeBoundaries_RoundTrip_AndOnePastEachBoundThrows()
+    {
+        // Proves the ReadDate out-of-range guard is EXACT and not over-eager: the extreme IN-RANGE
+        // epoch-days materialize to the correct calendar date, while one day past either bound is a
+        // deterministic UnsupportedPlanException. DateOnly's window 0001-01-01..9999-12-31 is exactly
+        // epoch-days [-719162, 2932896] (days since 1970-01-01).
+        int maxEpochDay = EpochDay(DateOnly.MaxValue);
+        int minEpochDay = EpochDay(DateOnly.MinValue);
+        Assert.Equal(2932896, maxEpochDay);
+        Assert.Equal(-719162, minEpochDay);
+
+        var fixture = new InMemoryRelationFixture();
+        StructType schema = TestData.Schema(TestData.Field("d", DateType.Instance, nullable: false));
+
+        IReadOnlyList<Row> rows = fixture.Collect(fixture.Relation("dbounds", schema, TestData.Batch(
+            schema, TestData.Dates(maxEpochDay, minEpochDay))));
+        Assert.Equal(2, rows.Count);
+        Assert.Equal(DateOnly.MaxValue, rows[0].GetAs<DateOnly>(0)); // 9999-12-31, not rejected
+        Assert.Equal(DateOnly.MinValue, rows[1].GetAs<DateOnly>(0)); // 0001-01-01, not rejected
+
+        Assert.Throws<UnsupportedPlanException>(() => fixture.Collect(fixture.Relation("dovermax", schema,
+            TestData.Batch(schema, TestData.Dates(maxEpochDay + 1)))));
+        Assert.Throws<UnsupportedPlanException>(() => fixture.Collect(fixture.Relation("dundermin", schema,
+            TestData.Batch(schema, TestData.Dates(minEpochDay - 1)))));
+    }
+
     // ---- MEDIUM 1: duplicate output names -> deterministic UnsupportedPlanException (not SchemaValidationException) ----
 
     [Fact]
