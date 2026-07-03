@@ -19,6 +19,7 @@ using LogicalDistinct = DeltaSharp.Plans.Logical.Distinct;
 using LogicalFilter = DeltaSharp.Plans.Logical.Filter;
 using LogicalJoin = DeltaSharp.Plans.Logical.Join;
 using LogicalLimit = DeltaSharp.Plans.Logical.Limit;
+using LogicalLocalRelation = DeltaSharp.Plans.Logical.LocalRelation;
 using LogicalPlanNode = DeltaSharp.Plans.Logical.LogicalPlan;
 using LogicalProject = DeltaSharp.Plans.Logical.Project;
 using LogicalResolvedRelation = DeltaSharp.Plans.Logical.ResolvedRelation;
@@ -66,6 +67,9 @@ internal sealed class PhysicalPlanner
             case LogicalResolvedRelation relation:
                 return PlanScan(relation);
 
+            case LogicalLocalRelation local:
+                return PlanLocalRelation(local);
+
             case LogicalFilter filter:
                 return PlanFilter(filter, outputs);
 
@@ -109,6 +113,18 @@ internal sealed class PhysicalPlanner
         // the ExprIds downstream expression resolution binds against) are memoized in `outputs` by
         // LogicalOutput.Derive during the initial traversal, so no per-scan derivation is needed here.
         return new ScanPlan(relation.Schema, batches);
+    }
+
+    private static PhysicalPlan PlanLocalRelation(LogicalLocalRelation relation)
+    {
+        // Unlike a catalog relation (resolved through the IScanSource seam), a LocalRelation carries its
+        // rows inline. Defer the row→batch encoding into a thunk the ScanPlan runs on first Execute — so
+        // Plan() (which #179 Explain also runs) performs NO enumeration or I/O, honoring the no-work
+        // planning invariant (#158 AC1). The memoized LocalRelation.Data is enumerated exactly once, at
+        // the first action's execution. The relation schema is authoritative.
+        StructType schema = relation.Schema;
+        IEnumerable<Row> data = relation.Data;
+        return new ScanPlan(schema, () => LocalRelationBatches.Build(schema, data));
     }
 
     private PhysicalPlan PlanFilter(LogicalFilter filter, LogicalOutput outputs)

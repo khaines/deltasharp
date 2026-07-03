@@ -10,8 +10,11 @@ namespace DeltaSharp.Executor;
 /// </summary>
 /// <remarks>
 /// The <see cref="ModuleInitializerAttribute"/> runs the first time any Executor type is touched
-/// (which includes the test host loading the assembly), so no explicit bootstrap call is required.
-/// <see cref="Register"/> is also exposed for callers that want to register deterministically.
+/// (which includes the test host loading the assembly), so no explicit bootstrap call is required for
+/// a program that already uses an Executor type. A program that reaches an action through <b>only</b>
+/// <c>DeltaSharp.Core</c> public types (for example <c>CreateDataFrame(...).Collect()</c>) never
+/// touches an Executor type, so it must call the public <see cref="DeltaSharpExecutor.Enable"/>
+/// bootstrap (which delegates here). <see cref="Register"/> is idempotent.
 /// </remarks>
 internal static class ExecutorRegistration
 {
