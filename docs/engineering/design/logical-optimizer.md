@@ -237,8 +237,9 @@ Plan nodes are immutable (`TreeNode<T>`); no rule mutates a node in place. Every
 `TransformExpressionsUp`, and `MapChildren`, which **share unchanged subtrees by reference** (they
 return the same instance when a transform is a no-op, short-circuiting on `ReferenceEquals`); changed
 nodes are rebuilt through the shared `WithNewChildren`/`WithNewExpressions` primitives (reached
-transitively via `MapChildren`/`MapExpressions`). `ColumnPruning` rebuilds through `MapChildren`, so a unary node is rebuilt only
-when its pruned child is not reference-equal to the original, otherwise the original node is returned.
+transitively via `MapChildren`/`MapExpressions`). `ColumnPruning` rebuilds through `MapChildren`, so
+a unary node is rebuilt only when its pruned child is not reference-equal to the original, otherwise
+the original node is returned.
 Net effect: a rule that changes nothing returns the input instance, and a rule that changes one leaf
 shares the entire untouched remainder of the tree.
 
