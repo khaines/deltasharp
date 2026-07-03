@@ -376,6 +376,37 @@ public class ExecutionBoundariesTests
     }
 
     [Fact]
+    public void Metrics_BytesScanned_BridgeBetweenScanAndOperator_StillCountsSourceOnce()
+    {
+        (InMemoryRelationFixture fixture, DataFrame people) = NewPeople();
+
+        // A source scan reports its bytes once (filter over scan).
+        (_, ExecutionMetrics direct) = fixture.CollectWithMetrics(people.Filter(Col("salary").Gt(0.0)));
+        // A pass-through bridge (Limit) sitting BETWEEN the scan and the mapped operator must NOT zero
+        // BytesScanned — the earlier boundary-detection heuristic did (#176 review #1). Source read once.
+        (_, ExecutionMetrics viaLimit) = fixture.CollectWithMetrics(
+            people.Limit(100).Filter(Col("salary").Gt(0.0)));
+
+        Assert.True(direct.BytesScanned > 0);
+        Assert.Equal(direct.BytesScanned, viaLimit.BytesScanned);
+    }
+
+    [Fact]
+    public void Metrics_BytesScanned_Union_SumsBothSourceScans()
+    {
+        (InMemoryRelationFixture fixture, DataFrame people) = NewPeople();
+
+        (_, ExecutionMetrics single) = fixture.CollectWithMetrics(people.Filter(Col("salary").Gt(0.0)));
+        // A union of two scans of the same source reads it TWICE — BytesScanned is the SUM (2×), not the
+        // single value and not zero (#176 review #1: the boundary heuristic zeroed union shapes).
+        (_, ExecutionMetrics union) = fixture.CollectWithMetrics(
+            people.Union(people).Filter(Col("salary").Gt(0.0)));
+
+        Assert.True(single.BytesScanned > 0);
+        Assert.Equal(2 * single.BytesScanned, union.BytesScanned);
+    }
+
+    [Fact]
     public void Metrics_OnRowLimitFailure_ArePopulatedWithMeaningfulValues()
     {
         (InMemoryRelationFixture fixture, DataFrame people) = NewPeople();

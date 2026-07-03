@@ -31,6 +31,7 @@ internal sealed class PhysicalRuntime : IDisposable
     private readonly IExecutionBackend _backend;
     private readonly ExecutionContext _context;
     private readonly CancellationToken _cancellationToken;
+    private readonly HashSet<PhysicalOperator> _sourceScans = new(ReferenceEqualityComparer.Instance);
     private long _bytesScanned;
     private long _peakMemoryBytes;
     private long _spilledBytes;
@@ -59,7 +60,7 @@ internal sealed class PhysicalRuntime : IDisposable
         _context = new ExecutionContext(memory, cancellationToken, options);
     }
 
-    /// <summary>The aggregate estimated data-plane bytes scanned across every operator run (diagnostics).</summary>
+    /// <summary>The aggregate estimated data-plane bytes scanned across every genuine source read (diagnostics).</summary>
     public long BytesScanned => _bytesScanned;
 
     /// <summary>The high-water reserved execution memory across every operator run (diagnostics).</summary>
@@ -135,17 +136,17 @@ internal sealed class PhysicalRuntime : IDisposable
     public bool IsDisposed { get; private set; }
 
     // Folds this operator's (and its shallow children's) engine metrics into the run totals. BytesScanned
-    // is attributed only ONCE, at the true leaf source scan: every materialization boundary re-wraps its
-    // already-materialized child in an InMemoryScanOperator (ScanOf) whose InterpretedScanStream re-reports
-    // AddBytesScanned, so summing every scan would inflate BytesScanned ∝ plan depth (measured 2× for
-    // project(filter(scan)) — #176 review #3). Boundary re-scans are marked (BoundaryRescanSourceId) and
-    // excluded here; only the source-scan wrapper over the original leaf contributes. SpilledBytes sums
-    // across operators; PeakMemoryBytes is a high-water max (operators run sequentially over the shared
-    // budget, releasing on dispose, so the max per-operator peak is the whole-run peak).
+    // is taken only from InMemoryScanOperators marked as genuine SOURCE reads (see ScanOf): every other
+    // InMemoryScanOperator here is a boundary re-scan wrapper re-streaming an already-materialized
+    // intermediate, and counting those would inflate BytesScanned ∝ plan depth (2× for
+    // project(filter(scan))) and mis-count bridge/union shapes (#176 review). Mapped operators
+    // (Filter/Project/…) report BytesScanned 0 and are always folded. SpilledBytes sums across operators;
+    // PeakMemoryBytes is a high-water max (operators run sequentially over the shared budget, releasing on
+    // dispose, so the max per-operator peak is the whole-run peak).
     private void AccumulateMetrics(PhysicalOperator op)
     {
         OperatorMetricsSnapshot snapshot = op.Metrics.Snapshot();
-        if (!IsBoundaryRescan(op))
+        if (op is not InMemoryScanOperator || _sourceScans.Contains(op))
         {
             _bytesScanned += snapshot.BytesScanned;
         }
@@ -162,29 +163,27 @@ internal sealed class PhysicalRuntime : IDisposable
         }
     }
 
-    // True when the operator is a boundary re-scan wrapper (an InMemoryScanOperator ScanOf built over an
-    // already-materialized intermediate result) rather than the true leaf source scan, so its estimated
-    // bytes must NOT be counted toward BytesScanned (see AccumulateMetrics).
-    private static bool IsBoundaryRescan(PhysicalOperator op) =>
-        op is InMemoryScanOperator scan && scan.SourceId == BoundaryRescanSourceId;
-
     /// <summary>
-    /// The <see cref="InMemoryScanOperator.SourceId"/> sentinel marking a boundary re-scan wrapper — a
-    /// scan over an already-materialized intermediate result rather than the true leaf source. Its
-    /// estimated scanned bytes are excluded from <see cref="BytesScanned"/> so the metric is attributed
-    /// once at the source and not inflated ∝ plan depth (#176 review #3).
+    /// Wraps a child result's batches in an EPIC-03 in-memory scan so an operator can open over them.
+    /// When <paramref name="readsSourceDirectly"/> is <see langword="true"/> the wrapped scan is the
+    /// genuine source read for this branch (its child subtree is a <c>ScanPlan</c> or a Limit/Union bridge
+    /// over sources — see <see cref="PhysicalPlan.ReadsSourceDirectly"/>), so its estimated bytes are
+    /// counted toward <see cref="BytesScanned"/> exactly once; otherwise it is a boundary re-scan of an
+    /// already-materialized intermediate and its bytes are excluded (avoiding depth inflation / double
+    /// counting). The scan itself streams the batches verbatim and its byte estimate is accumulated lazily
+    /// as batches are pulled, so a cancelled/limited run only counts the bytes it actually read.
     /// </summary>
-    internal const string BoundaryRescanSourceId = "boundary-rescan";
-
-    /// <summary>Wraps a child result's batches in an EPIC-03 in-memory scan so an operator can open over them.</summary>
     /// <param name="child">The already-materialized child result.</param>
-    /// <param name="isSourceScan">
-    /// <see langword="true"/> when <paramref name="child"/> is the true leaf source scan (its estimated
-    /// bytes are the real data-plane read and count toward <see cref="BytesScanned"/>); <see langword="false"/>
-    /// when it re-scans an already-materialized intermediate result at a materialization boundary (its
-    /// bytes are excluded to avoid inflating <see cref="BytesScanned"/> ∝ plan depth — #176 review #3).
-    /// </param>
+    /// <param name="readsSourceDirectly">Whether this scan is the branch's genuine source read.</param>
     /// <returns>A leaf <see cref="PhysicalOperator"/> streaming the child batches verbatim.</returns>
-    public static PhysicalOperator ScanOf(BatchResult child, bool isSourceScan = false) =>
-        new InMemoryScanOperator(child.Schema, child.Batches, isSourceScan ? "memory" : BoundaryRescanSourceId);
+    public PhysicalOperator ScanOf(BatchResult child, bool readsSourceDirectly)
+    {
+        var op = new InMemoryScanOperator(child.Schema, child.Batches);
+        if (readsSourceDirectly)
+        {
+            _sourceScans.Add(op);
+        }
+
+        return op;
+    }
 }

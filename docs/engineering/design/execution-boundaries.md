@@ -79,8 +79,8 @@ Engine operators already observe cancellation cooperatively: `InterpretedScanStr
 
 This story adds an **upfront driver gate plus two driver-level poll points** so cancellation and an
 already-elapsed timeout are honored even for plan shapes that never reach a polling operator — a bare
-`ScanPlan` root (`ScanPlan.Execute`, `PhysicalPlan.cs:112-113`) returns its batches directly, and a
-bare `LimitPlan` (`PhysicalPlan.cs:346-374`) or `UnionPlan` (`PhysicalPlan.cs:402-412`) root likewise
+`ScanPlan` root (`ScanPlan.Execute`, `PhysicalPlan.cs:134-135`) returns its batches directly, and a
+bare `LimitPlan` (`PhysicalPlan.cs:368-396`) or `UnionPlan` (`PhysicalPlan.cs:424-434`) root likewise
 bypasses `PhysicalRuntime.Run`'s per-batch poll:
 
 - **Upfront gate (this story).** `LocalQueryExecutor.Execute` calls
@@ -138,8 +138,10 @@ Timeout is sourced from config `spark.deltasharp.execution.timeoutMs` (§4). A p
 linked CTS (`CreateLinkedTokenSource(userToken)`) with `CancelAfter(timeout)`. A **non-positive**
 timeout is an already-elapsed deadline, so the driver cancels the linked CTS **synchronously**
 (`Cancel()`) for a deterministic, race-free result rather than scheduling it; config never produces this
-(≤0 maps to "disabled"/`null` in `ExecutionOptions.From`), so it only arises via the direct options API
-and the `TimeSpan.Zero` timeout test. On expiry the linked CTS cancels the effective token; the driver
+(a configured `0` maps to `null`/"disabled" and a **negative** value is rejected fail-fast with
+`ArgumentException` in `ExecutionOptions.From` → `ReadPositiveLong`, `ExecutionOptions.cs:82-100`), so it
+only arises via the direct options API and the `TimeSpan.Zero` timeout test. On expiry the linked CTS
+cancels the effective token; the driver
 distinguishes the two cases in its catch:
 
 - user token cancelled → rethrow the `OperationCanceledException` (the .NET idiom; a user who cancels
@@ -220,12 +222,18 @@ Two categories, both of which "identify the failed stage and preserve the root c
 | `Backend` | `PhysicalPlan.Execute` (operator `Open`/drain) | `UnsupportedPlanException` (ill-typed bridge build) | `QueryExecutionException(Backend, cause)` for `ExecutionMemoryException` & unforeseen faults |
 | `Materialize` | `RowMaterializer.Materialize` (+ final batch-list read) | `UnsupportedPlanException(Materialize)` (unrepresentable value) | `QueryExecutionException(Materialize, cause)` for a `ResultLimitExceededException` (§4.1) **or any other materialization fault** (a trailing general `catch` mirrors the `Backend` stage, so an unforeseen materialization fault is wrapped/attributed/metrics-bearing, never escaping raw) |
 
-`OperationCanceledException`/`TimeoutException` are **mapped and rethrown** (never wrapped) by each
-stage's catch, and `QueryExecutionException` itself is rethrown as-is by the general catches so a
-re-thrown wrapper is **not double-wrapped**: each stage `try` catches only its own specific diagnostic
-types plus a trailing general `catch (Exception)`, and the `QueryExecutionException` it *throws* from
-that catch propagates through the method's outer `finally` (which only publishes metrics and disposes
-the runtime — it has no catch), so it reaches the caller exactly once. Scan resolution runs *inside*
+An `OperationCanceledException` from a cancelled effective token (a user cancel or an expired timeout
+CTS) is caught by the **`Backend` and `Materialize`** stage catches and passed through `MapCancellation`,
+which **rethrows** the original OCE for a user cancel or **synthesizes** a `TimeoutException` (preserving
+the OCE as its cause) for a timeout — it is never wrapped in a `QueryExecutionException`. (Planning polls
+no token and is preceded by the upfront gate, so the `Plan` stage has no dedicated OCE catch.) A
+`QueryExecutionException` is never **double-wrapped** because the stage `try`s are **sequential, not
+nested**: the wrapper an earlier stage throws propagates straight out of the method through the outer
+`finally` (which only publishes metrics and disposes the runtime — it has no `catch`) and never enters a
+later stage's `try`. Each stage `try` catches only the faults of *its own* work — its specific
+diagnostic types (`UnsupportedPlanException`, plus `ResultLimitExceededException` in `Materialize`) and a
+trailing general `catch (Exception)` that wraps exactly once — so a fault reaches the caller a single
+time. Scan resolution runs *inside*
 `PhysicalPlanner.Plan` in M1 (the in-memory scan source resolves during planning,
 `PhysicalPlanner.cs:103-117`), so a scan-source miss is raised there; it is attributed to the distinct
 `Scan` stage value (rather than `Plan`) so the failed stage is reported precisely. Now that the #158
@@ -312,7 +320,7 @@ An immutable diagnostics object retrievable after an action:
 | `TotalDuration` | `PlanningDuration + ExecutionDuration` | derived |
 | `OutputRows` | rows the action produced | final `BatchResult` logical row count |
 | `OutputBatches` | batches the action produced | final `BatchResult` batch count |
-| `BytesScanned` | estimated data-plane bytes read | Engine `OperatorMetrics.BytesScanned`, attributed **once** at the true source-scan leaves |
+| `BytesScanned` | estimated data-plane bytes read | Engine `OperatorMetrics.BytesScanned`, counted **once per genuine source read** (see below) |
 | `PeakMemoryBytes` | high-water reserved memory | max Engine `OperatorMetrics.PeakMemoryBytes` |
 | `SpilledBytes` | bytes spilled to the spill store during the run | summed Engine `OperatorMetrics.SpilledBytes` (0 under M1's default unbounded memory) |
 
@@ -320,12 +328,20 @@ Timings use the monotonic `Stopwatch` clock the Engine already standardizes on
 (`OperatorMetrics.cs:54` / `InterpretedOperators.ElapsedNanos`) — **never** the banned wall clock.
 `OutputRows`/`OutputBatches` are computed at the driver from the final result so they are populated for
 **every** plan shape, including bare-scan/limit/union roots that never open an Engine operator.
-`BytesScanned` is attributed **once, at the true source-scan leaves only**: each materialization
-boundary re-wraps its child in an `InMemoryScanOperator` (`PhysicalRuntime.ScanOf`) whose
-`InterpretedScanStream` re-reports `AddBytesScanned`, so naively summing would over-count in proportion
-to plan depth (a `project(filter(scan))` measured `2×` the true bytes). `AccumulateMetrics` therefore
-excludes those boundary **re-scan** wrappers (marked with a sentinel source id) and counts only the leaf
-scan over the original source, so `BytesScanned` reflects the data actually read once.
+`BytesScanned` is counted **once per genuine source read**. Each materialization boundary re-wraps its
+child in an `InMemoryScanOperator` (`PhysicalRuntime.ScanOf`) whose `InterpretedScanStream` reports
+`AddBytesScanned` as it streams, so naively summing every wrapper would over-count in proportion to plan
+depth (a `project(filter(scan))` would measure `2×` the true bytes). Instead, `ScanOf` marks a wrapper
+as a genuine source read exactly when its child subtree *reads source directly* —
+`PhysicalPlan.ReadsSourceDirectly` (`PhysicalPlan.cs:91-95`): a `ScanPlan`, or a `Limit`/`Union` bridge
+whose inputs all read source directly — and `AccumulateMetrics` counts `BytesScanned` only from those
+source-marked scans, excluding every other (intermediate re-scan) wrapper. This makes the metric the
+true source volume regardless of plan depth (`project(filter(scan))` = one source read), keeps a
+`Limit`/`Union` bridge sitting between a scan and the nearest operator counted rather than zeroed, and
+counts a union of two sources as their **sum** (`union(scan, scan)` = `2×`). Because counting rides the
+stream, a cancelled or `Limit`-truncated run only accrues the bytes it actually pulled. A bare
+scan/limit/union root that opens no consuming operator reports `0` (there is no source-read wrapper), an
+accepted best-effort limitation of this diagnostic proxy.
 `PeakMemoryBytes`/`SpilledBytes` aggregate the per-operator `OperatorMetrics` (`OperatorMetrics.cs`)
 that `PhysicalRuntime.Run` snapshots after draining each operator (`PeakMemoryBytes` as a `max`,
 `SpilledBytes` as a sum).
@@ -457,7 +473,8 @@ threading):
 5. **Metrics on success and failure (AC4, non-vacuous).** Success: the capturing fixture helpers return
    metrics with `OutputRows`/`OutputBatches` **non-zero where expected**, `PlanningDuration` present,
    `TotalDuration >= 0`, and correct `BytesScanned` (a known N-byte source over a 2-deep plan reports
-   `N`, not `2N`, #3); the Core `Collect(out metrics, …)`/`Count(out metrics, …)` overloads surface the
+   `N`, not `2N`; a `Limit`/`Union` **bridge** between the scan and the operator still reports `N` rather
+   than `0`; and a `union(scan, scan)` reports `2N` — #3); the Core `Collect(out metrics, …)`/`Count(out metrics, …)` overloads surface the
    executor-published metrics (or `ExecutionMetrics.Empty` when none). Failure: the thrown
    `QueryExecutionException.Metrics` **and** the `out` metrics surfaced on a Backend/row-limit failure and
    on cancel/timeout carry meaningful values (planning duration present, partial counters) — not merely
