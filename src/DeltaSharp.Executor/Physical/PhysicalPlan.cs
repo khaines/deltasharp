@@ -1,5 +1,6 @@
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Engine.Execution;
+using DeltaSharp.Plans;
 using DeltaSharp.Types;
 using EnginePhysicalExpression = DeltaSharp.Engine.Execution.PhysicalExpression;
 
@@ -48,41 +49,13 @@ internal abstract class PhysicalPlan
     /// <b>no</b> execution — it walks the already-built physical tree — so it preserves the lazy/eager
     /// invariant (ADR-0001).
     /// </summary>
-    public string TreeString()
-    {
+    public string TreeString() =>
         // Recursion-depth bound: this walk mirrors the physical tree, whose depth is INHERITED from
         // Core's TreeNode (MaxDepth=1000, rejected at logical-plan construction) times the planner's
         // ≤2× node multiplier (e.g. Distinct → Project-over-Aggregate), so no physical-side depth guard
         // is needed today. A physical-only build path (one that never builds the logical tree) or a
         // raised TreeNode.MaxDepth would remove that inherited bound and MUST add a physical depth guard.
-        var builder = new System.Text.StringBuilder();
-        GenerateTreeString(0, new List<bool>(), builder);
-        return builder.ToString();
-    }
-
-    private void GenerateTreeString(int depth, List<bool> lastChildFlags, System.Text.StringBuilder builder)
-    {
-        if (depth > 0)
-        {
-            for (int i = 0; i < lastChildFlags.Count - 1; i++)
-            {
-                builder.Append(lastChildFlags[i] ? "   " : ":  ");
-            }
-
-            builder.Append(lastChildFlags[^1] ? "+- " : ":- ");
-        }
-
-        builder.Append(SimpleString);
-        builder.Append('\n');
-
-        IReadOnlyList<PhysicalPlan> children = Children;
-        for (int i = 0; i < children.Count; i++)
-        {
-            lastChildFlags.Add(i == children.Count - 1);
-            children[i].GenerateTreeString(depth + 1, lastChildFlags, builder);
-            lastChildFlags.RemoveAt(lastChildFlags.Count - 1);
-        }
-    }
+        TreeStringRenderer.Render(this, node => node.SimpleString, node => node.Children);
 
     /// <summary>Wraps an Engine operator build so its validation failures become deterministic diagnostics.</summary>
     /// <param name="build">Builds the Engine operator (may throw <see cref="ArgumentException"/>).</param>
