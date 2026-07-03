@@ -5,7 +5,7 @@
 > (FEAT-04.1, issue #158). Builds on STORY-04.1.1 (#157, the `SparkSession` doors and the
 > `DataFrameReader`/`CreateDataFrame` placeholders — [sparksession-lifecycle.md](sparksession-lifecycle.md)),
 > the immutable logical IR (#167, [logical-plan-nodes.md](logical-plan-nodes.md)), the analyzer
-> (#171, [analyzer-resolution.md](analyzer-resolution.md)), the actions/`Row` contract
+> (#170, [analyzer-resolution.md](analyzer-resolution.md)), the actions/`Row` contract
 > (#173/#177, [actions-and-row.md](actions-and-row.md)), and the physical-planning bridge
 > (#174, [physical-planning.md](physical-planning.md), esp. §9). Grounded in
 > [ADR-0001](../../adr/0001-execution-strategy.md) (lazy/eager execution), [ADR-0002](../../adr/0002-columnar-batch-format.md)
@@ -50,15 +50,15 @@ public DataFrameReader Read { get; }
 public DataFrame CreateDataFrame(System.Collections.IEnumerable data);
 
 // NEW (this story) — the Spark createDataFrame(rows, schema) door.
-public DataFrame CreateDataFrame(IEnumerable<Row> rows, DeltaSharp.Types.StructType schema);
+public DataFrame CreateDataFrame(IEnumerable<Row> data, DeltaSharp.Types.StructType schema);
 ```
 
-`CreateDataFrame(rows, schema)` mirrors Spark's
+`CreateDataFrame(data, schema)` mirrors Spark's
 `createDataFrame(rows: java.util.List[Row], schema: StructType)`: the **supplied `schema` is
 authoritative**, and each `Row`'s values are read **positionally** by ordinal (a `Row`'s own
 `Schema` is not consulted, matching Spark, which accepts schema-less `RowFactory` rows). It returns a
 session-bound `DataFrame` whose plan is a single `LocalRelation` leaf. **It does not enumerate
-`rows`** — see "Lazy/eager guarantees".
+`data`** — see "Lazy/eager guarantees".
 
 ### `DataFrameReader` (mutable fluent builder)
 
@@ -99,8 +99,8 @@ A leaf that carries an **explicit `StructType` schema** and the **in-memory rows
 materializes:
 
 ```
-LocalRelation(StructType schema, IEnumerable<Row> data)                      // unresolved (Output == null)
-LocalRelation(StructType schema, IEnumerable<Row> data, IReadOnlyList<AttributeReference> output)  // resolved
+LocalRelation(StructType schema, IEnumerable<Row> data)   // unresolved (Output == null, Resolved == false)
+local.WithResolvedOutput(IReadOnlyList<AttributeReference> output) -> LocalRelation  // resolved (Output != null)
 ```
 
 - **Two-phase, mirroring `UnresolvedRelation` → `ResolvedRelation`.** As built by `CreateDataFrame`
@@ -108,15 +108,29 @@ LocalRelation(StructType schema, IEnumerable<Row> data, IReadOnlyList<AttributeR
   `ExprId`s **fresh per analyze pass** ([ExprIdGenerator](../../../src/DeltaSharp.Core/Analysis/ExprIdGenerator.cs));
   a self-assigned `ExprId` would collide with the analyzer's counter. The analyzer's
   `ResolveRelations` rule mints the output `AttributeReference`s from the shared per-pass id
-  generator (identical to `BindRelation` for a catalog table), producing the resolved form. The data
-  reference is carried through unchanged.
-- **`Data` is never enumerated by Core.** The sequence is stored by reference and iterated exactly
-  once, at physical planning, by the Executor. `NodeEquals`/`NodeHashCode` therefore compare `Data`
-  by **reference identity** (plus schema/output by value): value-comparing the rows would require
-  enumerating them, breaking laziness and mishandling one-shot iterators. Two `CreateDataFrame` calls
-  with distinct sequences are distinct plans (safe for plan caching / structural sharing #167).
-- Render: unresolved `'LocalRelation <n rows>, [f1, f2, …]`; resolved
-  `LocalRelation [attr#id, …]`. The `'` prefix marks it unresolved
+  generator (identical to `BindRelation` for a catalog table) and calls `WithResolvedOutput` to
+  produce the resolved form. The single-argument constructor is the only public one; the resolved
+  form is reached exclusively through `WithResolvedOutput` (the underlying three-argument constructor
+  is private), which carries the same data reference through unchanged.
+- **`Data` is a memoizing snapshot, never enumerated by Core (M1).** The caller's sequence is wrapped
+  in a `MemoizedRowSequence` at construction, which enumerates **nothing** (preserving AC1 laziness).
+  The **first** enumeration — at the first action's execution, in the Executor — copies the source
+  into an immutable `IReadOnlyList<Row>` snapshot; every later enumeration (a second action, a
+  multi-scan, a self-join) **replays that same snapshot**. This gives Spark's
+  `createDataFrame(List, schema)` stable semantics *without* eager materialization: after the first
+  action every action observes identical rows, so `Count` and `Collect` can never diverge, a
+  single-use iterator replays correctly, and mutating the source *after* the first action changes
+  nothing. (Mutating the source *before* the first action is still observed, since the snapshot is
+  deferred to that first action.) `NodeEquals`/`NodeHashCode` compare `Data` by **reference identity**
+  (plus schema/output by value): value-comparing the rows would force enumeration and mishandle
+  one-shot iterators. `Wrap` is idempotent, so the resolved form shares the unresolved form's snapshot
+  and reference identity holds. Two `CreateDataFrame` calls with distinct sequences are distinct plans
+  (safe for plan caching / structural sharing #167).
+- Render (actual `TreeString()` output — no row count, which would violate laziness):
+  - unresolved: `'LocalRelation [id: bigint, name: string, age: int]` (each field as `name: type`)
+  - resolved: `LocalRelation [id#0, name#1, age#2]` (each output attribute as `name#exprId`)
+
+  The leading `'` marks the node unresolved
   ([TreeNode](../../../src/DeltaSharp.Core/Plans/TreeNode.cs)).
 
 ### `UnresolvedFileRelation` (Spark's path-based `UnresolvedRelation`)
@@ -130,7 +144,12 @@ UnresolvedFileRelation(string format, string path,
 
 - Always **`Resolved == false`** — it holds no reader, no file handle, no schema binding; it is a
   pure descriptor (AC2).
-- Render: `'UnresolvedRelation parquet [path], options=[k=v, …]` (a visible scan node — AC4).
+- Render: `'UnresolvedRelation parquet [<redacted path>], options=[k1, k2, …]` (a visible scan node —
+  AC4). To avoid leaking credentials the moment a node is stringified (Explain #179, logging), the
+  render shows option **keys only** (never values) and a **redacted path** — userinfo passwords and
+  credential-bearing query-string values (SAS `?sig=`, presigned-URL signatures, `token`/`secret`/…)
+  are masked as `<redacted>` by `SecretRedaction.RedactPath`. The same redaction is applied to the
+  EPIC-05 analysis diagnostic.
 - Its `Options`/`UserSchema` are what EPIC-05's reader will consume; recording them on the node (not
   acting on them) is exactly Spark's lazy `DataFrameReader` behaviour.
 
@@ -142,15 +161,19 @@ Core cannot build `ColumnBatch`es (ADR-0002 columnar types live in the `net10.0`
 Executor converts them to batches during physical planning. This reuses the existing scan seam shape
 described in [physical-planning.md §9](physical-planning.md):
 
-1. `CreateDataFrame(rows, schema)` → `new DataFrame(session, new LocalRelation(schema, rows))`.
+1. `CreateDataFrame(data, schema)` → `new DataFrame(session, new LocalRelation(schema, data))` (the
+   constructor wraps `data` in a `MemoizedRowSequence`; nothing is enumerated).
 2. An action calls `DataFrame.AnalyzeForExecution` → `Analyzer.Resolve`. The `ResolveRelations` rule
    turns the unresolved `LocalRelation` into its resolved form (minting output attributes from the
    shared id generator). `DeriveOutput` returns `local.Output`.
-3. `IQueryExecutor.Collect/Count` (the `LocalQueryExecutor`, #174) runs the `PhysicalPlanner`. A new
-   `case LocalRelation` lowers it: `LocalRelationBatches.Build(schema, data)` iterates the rows
-   **once**, encoding each column into an engine `MutableColumnVector` (the exact inverse of
-   [`RowMaterializer.ReadValue`](../../../src/DeltaSharp.Executor/Physical/RowMaterializer.cs)), and
-   produces a `ScanPlan(schema, batches)` — the same physical leaf a catalog scan produces.
+3. `IQueryExecutor.Collect/Count` (the `LocalQueryExecutor`, #174) runs the `PhysicalPlanner`. A
+   `case LocalRelation` lowers it to a `ScanPlan` carrying a **lazy thunk** — `PhysicalPlanner.Plan`
+   performs **no** enumeration or encoding (so #179 `Explain`, which also runs `Plan`, never touches
+   the user source or does IO). The thunk (`() => LocalRelationBatches.Build(schema, data)`) runs on
+   the **first `ScanPlan.Execute`**, iterating the memoized snapshot **once** and encoding each column
+   into an engine `MutableColumnVector` (the exact inverse of
+   [`RowMaterializer.ReadValue`](../../../src/DeltaSharp.Executor/Physical/RowMaterializer.cs)),
+   producing the same physical leaf a catalog scan produces.
 4. `RowMaterializer` turns the executed batches back into `Row`s, so
    `CreateDataFrame([...]).Collect()` **round-trips** the input values.
 
@@ -165,16 +188,44 @@ The `LocalRelation` path does **not** use `InMemoryScanSource`: the data is inli
 identifier-keyed registration is needed. `InMemoryScanSource` remains the fixture seam for
 catalog-style relations (#174 tests).
 
+### Enabling execution from a Core-only program (the Executor bootstrap)
+
+`CreateDataFrame(data, schema).Collect()` reaches an action through **only `DeltaSharp.Core` public
+types**. The execution backend registers itself via a `[ModuleInitializer]` in `DeltaSharp.Executor`,
+but that fires only the first time **an Executor type is used** — a pure-Core program never touches
+one, so the action would otherwise fail with the deterministic *"No execution backend is registered"*
+`QueryExecutionException`. To make the read door usable end-to-end, `DeltaSharp.Executor` exposes a
+public, idempotent bootstrap:
+
+```csharp
+using DeltaSharp.Executor;
+
+DeltaSharpExecutor.Enable();   // once at startup — wires the backend onto SparkSession
+long n = spark.CreateDataFrame(rows, schema).Count();   // now runs
+```
+
+`DeltaSharpExecutor.Enable()` calls the same registration the module initializer does and is safe to
+call any number of times, from any thread. `DeltaSharp.Executor` is a **non-packable, engine-internal**
+assembly (its `public` types carry no governed `PublicAPI.*.txt` baseline — ADR-0014), so this entry
+point is documented here rather than tracked as shipped public API. The `UnsupportedQueryExecutor`
+"no backend registered" diagnostic names this bootstrap so the failure is self-explaining. The
+read-door end-to-end test collection calls `Enable()` in a collection fixture, so those tests pass
+**in isolation** (e.g. `--filter ~ReadDoorEndToEnd`) rather than relying on a sibling test to load an
+Executor type first.
+
 ### Supported cell types
 
 `LocalRelationBatches` encodes every ADR-0008 atomic type `RowMaterializer` can read, so the two are
 symmetric: `Boolean`, `Byte`, `Short`, `Integer`, `Long`, `Float`, `Double`, `String`, `Binary`,
 `Date` (`DateOnly` ↔ epoch-day), `Timestamp` (`DateTime` UTC ↔ epoch-micros), and `Decimal`
 (`decimal` ↔ unscaled `long`/`Int128` at the declared scale). A `null` cell becomes SQL `NULL`
-(`AppendNull`). A cell whose CLR type does not match the field, a row shorter/longer than the schema,
-or a value outside the type's representable range fails with a deterministic `UnsupportedPlanException`
-naming the offending field/ordinal — mirroring the row-materialization error style. Complex types
-(`Array`/`Map`/`Struct`) are deferred with the same deferral as `Row` deep-equality (#418).
+(`AppendNull`) — including a `null` in a field declared **non-nullable**, since Spark treats schema
+nullability as advisory at `createDataFrame` (see "Deviations"). A cell whose CLR type does not match
+the field (checked **exactly** — no silent widening), a row shorter/longer than the schema, or a value
+outside the type's representable range fails with a deterministic `UnsupportedPlanException` naming the
+offending field/ordinal (numeric values formatted with `InvariantCulture`) — mirroring the
+row-materialization error style. Complex types (`Array`/`Map`/`Struct`) are deferred with the same
+deferral as `Row` deep-equality ([#418](https://github.com/khaines/deltasharp/issues/418)).
 
 ## Parquet scan node + deferred-execution boundary (EPIC-05)
 
@@ -227,16 +278,19 @@ lets a caller stage options in any order before the terminal `Parquet` call. No 
 
 | Call | Work performed | Lazy proof |
 | --- | --- | --- |
-| `CreateDataFrame(rows, schema)` | Wrap rows in a `LocalRelation`. **`rows` is not enumerated.** No analyze, no scan, no backend. | An `IEnumerable<Row>` whose `GetEnumerator` throws is accepted without throwing; the #169 `ExecutionAudit` records an empty stage path. |
+| `CreateDataFrame(data, schema)` | Wrap `data` in a memoizing `LocalRelation`. **`data` is not enumerated.** No analyze, no scan, no backend. | An `IEnumerable<Row>` whose `GetEnumerator` throws is accepted without throwing; the #169 `ExecutionAudit` records an empty stage path. |
 | `Read` / `Option` / `Schema` | Mutate the builder. | Pure in-memory; no audit stage. |
 | `Parquet(path)` | Validate options; wrap in `UnresolvedFileRelation`. No file opened. | Audit stage path stays empty; no `FileOpened`. |
-| `Collect` / `Count` / `Show` | Analyze → optimize (identity seam, #174) → execute. | The **only** members that record an Analyzer stage / run the engine. |
+| `Collect` / `Count` / `Show` | Analyze → optimize (identity seam, #174) → physical-plan (no enumeration, M3) → execute (first action snapshots + encodes `data`). | The **only** members that record an Analyzer stage / run the engine. |
 
 The `CreateDataFrame` non-enumeration guarantee is the strongest reading of AC1 ("no rows are
 materialized by the call"): the rows the user already holds are neither iterated, copied, nor scanned
-until an action pulls them through the engine. This is consistent with the existing transformation
-laziness proof ([DataFrameLazyTransformationTests](../../../tests/DeltaSharp.Core.Tests/LazyEager/DataFrameLazyTransformationTests.cs))
-that asserts an empty `ExecutionAudit` stage path.
+until an action pulls them through the engine — and even physical planning stays enumeration-free (the
+row→batch encoding is deferred into the `ScanPlan` thunk, M3), so #179 `Explain` never touches the
+source. This is consistent with the existing transformation laziness proof
+([DataFrameLazyTransformationTests](../../../tests/DeltaSharp.Core.Tests/LazyEager/DataFrameLazyTransformationTests.cs))
+that asserts an empty `ExecutionAudit` stage path. The first action then takes a **stable snapshot**
+(see `LocalRelation` above), so subsequent actions replay identical rows.
 
 ## Seam to #179 (`Explain`)
 
@@ -245,12 +299,13 @@ sibling **EXPLAIN** lane (#179); this story does **not** implement `DataFrame.Ex
 contract this story owns is that both new leaves render as sane, visibly-labelled scan nodes through
 the existing `TreeNode.TreeString()`/`SimpleString` machinery, so #179 can consume them unchanged:
 
-- `LocalRelation` → `'LocalRelation …` / `LocalRelation …`
-- `UnresolvedFileRelation` → `'UnresolvedRelation parquet [path]…`
+- `LocalRelation` → `'LocalRelation [id: bigint, name: string, …]` (unresolved) /
+  `LocalRelation [id#0, name#1, …]` (resolved)
+- `UnresolvedFileRelation` → `'UnresolvedRelation parquet [<redacted path>], options=[k1, k2, …]`
 
-A Core test asserts the unanalyzed plan's `TreeString()` contains the scan node for each door. When
-#179's `Explain` lands it renders the same tree (unresolved and, for the analyzed mode, the resolved
-`LocalRelation`); no change to these nodes is required.
+Because `PhysicalPlanner.Plan` (which `Explain`'s physical mode runs) does **no** enumeration for a
+`LocalRelation` (M3), explaining an in-memory frame never reads the user source. The renders redact
+secrets (keys-only options, masked path), so `Explain`/logging cannot leak credentials.
 
 ## Test plan
 
@@ -273,8 +328,9 @@ execution, since Core.Tests does not reference the Executor):
 - **Analyzer:** a `LocalRelation` resolves; output attributes carry the schema's names/types; a
   `Project`/`Filter` over a `LocalRelation` resolves against its output.
 
-**Executor tests (`DeltaSharp.Executor.Tests`)** — end-to-end materialization (the module initializer
-registers the real `LocalQueryExecutor`, all through the public API):
+**Executor tests (`DeltaSharp.Executor.Tests`)** — end-to-end materialization through the public API.
+The read-door end-to-end collection calls `DeltaSharpExecutor.Enable()` in a collection fixture, so it
+does not depend on a sibling test loading an Executor type first (M2):
 
 - **AC1 (eager):** `spark.CreateDataFrame(rows, schema).Collect()` returns rows equal to the input
   (round-trip) across the common types; `.Count()` equals the row count; an empty sequence yields no
@@ -282,6 +338,16 @@ registers the real `LocalQueryExecutor`, all through the public API):
 - **Transformations over a local relation:** `CreateDataFrame(...).Filter(...).Select(...).Collect()`
   returns the expected rows (the `LocalRelation` scan feeds the operator pipeline).
 - **Nulls & types:** null cells round-trip as SQL `NULL`; date/timestamp/decimal round-trip.
+- **M1 stable snapshot:** on the same frame `Count()` and `Collect()` agree; a single-use iterator
+  replays across two actions; mutating the source *after* the first action does not change results.
+- **M2 Core-only bootstrap:** a `CreateDataFrame(...).Count()` reached through only Core public types
+  runs (passes under `--filter ~ReadDoorEndToEnd` in isolation).
+- **M3 no-work planning:** `PhysicalPlanner.Plan` over a `LocalRelation` (the path `Explain` runs)
+  does **not** enumerate the source (a counting sequence stays at zero enumerations).
+- **Negative paths (`LocalRelationBatches`):** a null row, a row/schema arity mismatch, a declared-type
+  vs Row-value CLR mismatch, and decimal scale/precision violations each throw a deterministic,
+  field-named `UnsupportedPlanException` with a pinned message; a `null` in a non-nullable field is
+  silently encoded as SQL `NULL` (pinned deviation).
 - **EPIC-05 boundary end-to-end:** `spark.Read.Parquet(path).Collect()` throws the deterministic
   EPIC-05 diagnostic without opening a file.
 
@@ -290,8 +356,23 @@ registers the real `LocalQueryExecutor`, all through the public API):
 - **`CreateDataFrame(IEnumerable)` (schema-less) stays deferred.** Spark infers a schema from the
   element type via reflection; reflection-based inference is out of the M1 scope (and in tension with
   the ADR-0014 trim/AOT posture). The untyped door keeps throwing `NotSupportedException`, now
-  pointing at the `(rows, schema)` overload. Schema inference is a follow-up.
+  pointing at the `(data, schema)` overload. Schema inference is a follow-up.
 - **`Explain` is out of scope** (owned by #179) — this story only guarantees scan-node rendering, as
   the story instructs.
 - **No Parquet reader** — the Parquet *node* is delivered; the reader is EPIC-05. Executing a Parquet
   plan is the deterministic EPIC-05 diagnostic, not a partial read.
+- **Nullability is advisory at encode time.** A `null` supplied for a field declared non-nullable is
+  silently encoded as SQL `NULL` rather than rejected — matching Spark, whose `createDataFrame` treats
+  `StructField.nullable` as advisory metadata, not an insertion-time constraint. (Pinned by a test so a
+  future nullability-enforcement change is a conscious one.)
+- **Exact CLR types (no widening).** `LocalRelationBatches` requires each cell's CLR type to match the
+  field's ADR-0008 encoding type exactly (an `int` is not accepted for a `bigint`/`LongType` lane); a
+  mismatch fails loudly rather than silently widening, so a schema/value drift surfaces immediately.
+- **`Timestamp` truncates toward zero (not floor).** `EncodeTimestamp` divides ticks-from-epoch by
+  ticks-per-microsecond, which truncates **toward zero**. For pre-epoch instants carrying
+  sub-microsecond ticks this rounds *up* toward the epoch, whereas Spark floors (rounds toward negative
+  infinity). Only sub-microsecond precision below the Unix epoch is affected.
+- **`DateTimeKind.Local` is shifted to UTC.** A `DateTime` with `Kind == Local` is converted with
+  `ToUniversalTime()` before encoding (a `Utc`/`Unspecified` value is treated as the instant as-is), so
+  the stored epoch-microsecond instant depends on the machine's time zone for `Local` inputs. Supply
+  `Utc` (or `Unspecified`) timestamps for machine-independent results.
