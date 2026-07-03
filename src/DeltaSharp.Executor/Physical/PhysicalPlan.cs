@@ -1,5 +1,6 @@
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Engine.Execution;
+using DeltaSharp.Plans;
 using DeltaSharp.Types;
 using EnginePhysicalExpression = DeltaSharp.Engine.Execution.PhysicalExpression;
 
@@ -27,10 +28,34 @@ internal abstract class PhysicalPlan
     /// <summary>This node's inputs, left-to-right.</summary>
     public abstract IReadOnlyList<PhysicalPlan> Children { get; }
 
+    /// <summary>The operator name (for example <c>"Filter"</c>); a constant per node.</summary>
+    public abstract string NodeName { get; }
+
+    /// <summary>
+    /// A one-line description of <b>this</b> node — its name and inline metadata (output columns, keys,
+    /// predicate) — <b>excluding</b> child plans, which render as their own tree lines. Used by
+    /// <see cref="TreeString"/> for <c>DataFrame.Explain</c>'s physical section (STORY-04.7.3).
+    /// </summary>
+    public abstract string SimpleString { get; }
+
     /// <summary>Executes the subtree rooted here to a fully materialized batch list.</summary>
     /// <param name="runtime">The backend + context driving the operators.</param>
     /// <returns>The output schema and batches.</returns>
     public abstract BatchResult Execute(PhysicalRuntime runtime);
+
+    /// <summary>
+    /// Renders this subtree as an indented, multi-line tree string mirroring the Core logical-plan
+    /// renderer's connector format (<c>+-</c>/<c>:-</c>, see <c>TreeNode.TreeString</c>). This does
+    /// <b>no</b> execution — it walks the already-built physical tree — so it preserves the lazy/eager
+    /// invariant (ADR-0001).
+    /// </summary>
+    public string TreeString() =>
+        // Recursion-depth bound: this walk mirrors the physical tree, whose depth is INHERITED from
+        // Core's TreeNode (MaxDepth=1000, rejected at logical-plan construction) times the planner's
+        // ≤2× node multiplier (e.g. Distinct → Project-over-Aggregate), so no physical-side depth guard
+        // is needed today. A physical-only build path (one that never builds the logical tree) or a
+        // raised TreeNode.MaxDepth would remove that inherited bound and MUST add a physical depth guard.
+        TreeStringRenderer.Render(this, node => node.SimpleString, node => node.Children);
 
     /// <summary>Wraps an Engine operator build so its validation failures become deterministic diagnostics.</summary>
     /// <param name="build">Builds the Engine operator (may throw <see cref="ArgumentException"/>).</param>
@@ -63,6 +88,12 @@ internal sealed class ScanPlan : PhysicalPlan
 
     public override IReadOnlyList<PhysicalPlan> Children => Array.Empty<PhysicalPlan>();
 
+    /// <inheritdoc/>
+    public override string NodeName => "Scan";
+
+    /// <inheritdoc/>
+    public override string SimpleString => $"Scan {PhysicalPlanText.Columns(OutputSchema)}";
+
     public override BatchResult Execute(PhysicalRuntime runtime) => new(OutputSchema, _batches);
 }
 
@@ -83,6 +114,12 @@ internal sealed class FilterPlan : PhysicalPlan
     public EnginePhysicalExpression Predicate => _predicate;
 
     public override IReadOnlyList<PhysicalPlan> Children => [_child];
+
+    /// <inheritdoc/>
+    public override string NodeName => "Filter";
+
+    /// <inheritdoc/>
+    public override string SimpleString => $"Filter ({PhysicalPlanText.Expr(_predicate, _child.OutputSchema)})";
 
     public override BatchResult Execute(PhysicalRuntime runtime)
     {
@@ -109,6 +146,13 @@ internal sealed class ProjectPlan : PhysicalPlan
     public IReadOnlyList<EnginePhysicalExpression> Projections => _projections;
 
     public override IReadOnlyList<PhysicalPlan> Children => [_child];
+
+    /// <inheritdoc/>
+    public override string NodeName => "Project";
+
+    /// <inheritdoc/>
+    public override string SimpleString =>
+        $"Project {PhysicalPlanText.ProjectionList(_projections, _child.OutputSchema, OutputSchema)}";
 
     public override BatchResult Execute(PhysicalRuntime runtime)
     {
@@ -145,6 +189,14 @@ internal sealed class AggregatePlan : PhysicalPlan
     public IReadOnlyList<AggregateExpression> Aggregates => _aggregates;
 
     public override IReadOnlyList<PhysicalPlan> Children => [_child];
+
+    /// <inheritdoc/>
+    public override string NodeName => "Aggregate";
+
+    /// <inheritdoc/>
+    public override string SimpleString =>
+        $"Aggregate keys={PhysicalPlanText.ExprList(_groupingKeys, _child.OutputSchema)}, "
+        + $"functions={PhysicalPlanText.AggregateList(_aggregates, _child.OutputSchema)}";
 
     public override BatchResult Execute(PhysicalRuntime runtime)
     {
@@ -190,6 +242,13 @@ internal sealed class JoinPlan : PhysicalPlan
 
     public override IReadOnlyList<PhysicalPlan> Children => [_left, _right];
 
+    /// <inheritdoc/>
+    public override string NodeName => "Join";
+
+    /// <inheritdoc/>
+    public override string SimpleString =>
+        $"Join {JoinType} {PhysicalPlanText.ExprList(_leftKeys, _left.OutputSchema)} = {PhysicalPlanText.ExprList(_rightKeys, _right.OutputSchema)}";
+
     public override BatchResult Execute(PhysicalRuntime runtime)
     {
         BatchResult left = _left.Execute(runtime);
@@ -225,6 +284,13 @@ internal sealed class SortPlan : PhysicalPlan
 
     public override IReadOnlyList<PhysicalPlan> Children => [_child];
 
+    /// <inheritdoc/>
+    public override string NodeName => "Sort";
+
+    /// <inheritdoc/>
+    public override string SimpleString =>
+        $"Sort {PhysicalPlanText.SortList(_sortOrders, _child.OutputSchema)}{(_global ? " global" : string.Empty)}";
+
     public override BatchResult Execute(PhysicalRuntime runtime)
     {
         BatchResult child = _child.Execute(runtime);
@@ -254,6 +320,12 @@ internal sealed class LimitPlan : PhysicalPlan
     public int Count => _count;
 
     public override IReadOnlyList<PhysicalPlan> Children => [_child];
+
+    /// <inheritdoc/>
+    public override string NodeName => "Limit";
+
+    /// <inheritdoc/>
+    public override string SimpleString => $"Limit {_count}";
 
     public override BatchResult Execute(PhysicalRuntime runtime)
     {
@@ -304,6 +376,12 @@ internal sealed class UnionPlan : PhysicalPlan
     }
 
     public override IReadOnlyList<PhysicalPlan> Children => _children;
+
+    /// <inheritdoc/>
+    public override string NodeName => "Union";
+
+    /// <inheritdoc/>
+    public override string SimpleString => $"Union {PhysicalPlanText.Columns(OutputSchema)}";
 
     public override BatchResult Execute(PhysicalRuntime runtime)
     {

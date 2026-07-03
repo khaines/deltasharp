@@ -54,4 +54,17 @@ internal interface IQueryExecutor
     /// <param name="analyzedPlan">The analyzer-resolved logical plan to execute.</param>
     /// <returns>The row count.</returns>
     long Count(LogicalPlan analyzedPlan);
+
+    /// <summary>
+    /// Renders the physical plan of <paramref name="analyzedPlan"/> as a multi-line tree string for
+    /// <see cref="DataFrame.Explain(ExplainMode)"/>'s physical section. This is the EXPLAIN counterpart
+    /// of <see cref="Collect"/>/<see cref="Count"/>: it <b>plans but never executes</b> — no operator is
+    /// opened, no batch is read, no backend runs — so the lazy/eager invariant (ADR-0001) holds for
+    /// physical mode. It is contractually <b>non-throwing</b>: an operator/expression with no M1 mapping,
+    /// or the absence of a registered backend, is rendered as a diagnostic line rather than raised
+    /// (STORY-04.7.3 AC4). See <c>docs/engineering/design/explain.md</c>.
+    /// </summary>
+    /// <param name="analyzedPlan">The analyzer-resolved (and optimizer-seam) logical plan to render.</param>
+    /// <returns>The rendered physical-plan tree, or a diagnostic line when it cannot be planned.</returns>
+    string ExplainPhysical(LogicalPlan analyzedPlan);
 }

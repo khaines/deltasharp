@@ -169,36 +169,8 @@ internal abstract class TreeNode<TNode> : IEquatable<TNode>
     }
 
     /// <summary>Renders this subtree as an indented, multi-line tree string.</summary>
-    public string TreeString()
-    {
-        var builder = new StringBuilder();
-        GenerateTreeString(0, new List<bool>(), builder);
-        return builder.ToString();
-    }
-
-    private void GenerateTreeString(int depth, List<bool> lastChildFlags, StringBuilder builder)
-    {
-        if (depth > 0)
-        {
-            for (int i = 0; i < lastChildFlags.Count - 1; i++)
-            {
-                builder.Append(lastChildFlags[i] ? "   " : ":  ");
-            }
-
-            builder.Append(lastChildFlags[^1] ? "+- " : ":- ");
-        }
-
-        builder.Append(SimpleString);
-        builder.Append('\n');
-
-        IReadOnlyList<TNode> children = Children;
-        for (int i = 0; i < children.Count; i++)
-        {
-            lastChildFlags.Add(i == children.Count - 1);
-            children[i].GenerateTreeString(depth + 1, lastChildFlags, builder);
-            lastChildFlags.RemoveAt(lastChildFlags.Count - 1);
-        }
-    }
+    public string TreeString() =>
+        TreeStringRenderer.Render((TNode)this, node => node.SimpleString, node => node.Children);
 
     /// <summary>Structural value equality: same concrete type, equal own state, pairwise-equal
     /// children.</summary>

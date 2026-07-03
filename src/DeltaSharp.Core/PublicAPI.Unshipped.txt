@@ -197,3 +197,14 @@ static DeltaSharp.Column.operator >=(DeltaSharp.Column! left, DeltaSharp.Column!
 static DeltaSharp.Column.operator >=(DeltaSharp.Column! left, object? value) -> DeltaSharp.Column!
 static DeltaSharp.Column.operator >=(object? value, DeltaSharp.Column! right) -> DeltaSharp.Column!
 static DeltaSharp.Column.operator |(DeltaSharp.Column! left, DeltaSharp.Column! right) -> DeltaSharp.Column!
+DeltaSharp.DataFrame.Explain() -> void
+DeltaSharp.DataFrame.Explain(bool extended) -> void
+DeltaSharp.DataFrame.Explain(string! mode) -> void
+DeltaSharp.DataFrame.Explain(DeltaSharp.ExplainMode mode) -> void
+DeltaSharp.DataFrame.ToExplainString(DeltaSharp.ExplainMode mode = DeltaSharp.ExplainMode.Simple) -> string!
+DeltaSharp.ExplainMode
+DeltaSharp.ExplainMode.Simple = 0 -> DeltaSharp.ExplainMode
+DeltaSharp.ExplainMode.Extended = 1 -> DeltaSharp.ExplainMode
+DeltaSharp.ExplainMode.Codegen = 2 -> DeltaSharp.ExplainMode
+DeltaSharp.ExplainMode.Cost = 3 -> DeltaSharp.ExplainMode
+DeltaSharp.ExplainMode.Formatted = 4 -> DeltaSharp.ExplainMode

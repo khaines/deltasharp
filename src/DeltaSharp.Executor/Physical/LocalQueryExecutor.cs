@@ -40,6 +40,42 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
     public long Count(LogicalPlan analyzedPlan) =>
         RowMaterializer.CountRows(ExecutePlan(analyzedPlan));
 
+    /// <inheritdoc />
+    /// <remarks>
+    /// Plans the query with the SAME <see cref="PhysicalPlanner"/> <see cref="Collect"/>/<see cref="Count"/>
+    /// use, then renders the tree — it does <b>not</b> call <see cref="PhysicalPlan.Execute"/>, so no
+    /// operator opens, no batch is read, and no backend runs (ADR-0001, lazy/eager). The seam is
+    /// contractually <b>non-throwing</b> (STORY-04.7.3 AC4): an <see cref="UnsupportedPlanException"/>
+    /// (an operator/expression with no M1 mapping, e.g. a cross join or a write plan) renders its precise
+    /// diagnostic, and ANY other planning-time fault is also rendered as a diagnostic line rather than
+    /// rethrown. The broad fallback is required because <see cref="PhysicalPlanner.Plan"/> eagerly builds
+    /// Engine expressions during planning, and some Engine expression constructors (e.g.
+    /// <c>ComparisonExpression</c>/<c>ArithmeticExpression</c>) throw a raw <see cref="ArgumentException"/>
+    /// on ill-typed operand combinations the analyzer accepts (e.g. <c>lit(null) == lit(null)</c> or a
+    /// complex-typed equality) — those must degrade to a diagnostic, never crash a debugging aid.
+    /// </remarks>
+    public string ExplainPhysical(LogicalPlan analyzedPlan)
+    {
+        ArgumentNullException.ThrowIfNull(analyzedPlan);
+        try
+        {
+            PhysicalPlan physical = new PhysicalPlanner(_scanSource).Plan(analyzedPlan);
+            return physical.TreeString();
+        }
+        catch (UnsupportedPlanException ex)
+        {
+            return $"<cannot plan physically: {ex.Message}>";
+        }
+        catch (Exception ex)
+        {
+            // Non-throwing seam (AC4): any other planning-time fault — most notably a raw
+            // ArgumentException from an Engine expression constructor for an operand-type combination
+            // the analyzer permitted but the interpreted backend has no kernel for — becomes a
+            // diagnostic line so Explain still renders the logical sections instead of throwing.
+            return $"<cannot plan physically: {ex.Message}>";
+        }
+    }
+
     private BatchResult ExecutePlan(LogicalPlan analyzedPlan)
     {
         ArgumentNullException.ThrowIfNull(analyzedPlan);
