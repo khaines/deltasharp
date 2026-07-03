@@ -60,7 +60,7 @@ public sealed class SparkSession : IDisposable
     /// <see langword="null"/> until #174 (or a test) registers one, in which case a session falls back
     /// to <see cref="UnsupportedQueryExecutor"/>.
     /// </summary>
-    private static Func<SparkSession, IQueryExecutor>? _queryExecutorFactory;
+    private static volatile Func<SparkSession, IQueryExecutor>? _queryExecutorFactory;
 
     private static readonly ThreadLocal<SparkSession?> _activeSession = new(() => null);
 
@@ -126,8 +126,26 @@ public sealed class SparkSession : IDisposable
     /// </summary>
     internal IQueryExecutor QueryExecutor
     {
-        get => _queryExecutor ??= _queryExecutorFactory?.Invoke(this) ?? UnsupportedQueryExecutor.Instance;
-        set => _queryExecutor = value ?? throw new ArgumentNullException(nameof(value));
+        get
+        {
+            // Publish the lazily-built executor atomically. SparkSession is explicitly multi-threaded
+            // (see the _globalLock / Volatile / Interlocked discipline above), and a #174 factory may be
+            // stateful, so a non-atomic `??=` could double-invoke the factory or hand two threads two
+            // different executors. Read once; if unset, build and CAS the field — the loser discards its
+            // instance and adopts the winner's, so every caller observes the same executor. Never null:
+            // the fail-closed default is UnsupportedQueryExecutor.
+            IQueryExecutor? existing = Volatile.Read(ref _queryExecutor);
+            if (existing is not null)
+            {
+                return existing;
+            }
+
+            IQueryExecutor created =
+                _queryExecutorFactory?.Invoke(this) ?? UnsupportedQueryExecutor.Instance;
+            return Interlocked.CompareExchange(ref _queryExecutor, created, null) ?? created;
+        }
+
+        set => Volatile.Write(ref _queryExecutor, value ?? throw new ArgumentNullException(nameof(value)));
     }
 
     /// <summary>

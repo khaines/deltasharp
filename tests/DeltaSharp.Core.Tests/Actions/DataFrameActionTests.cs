@@ -254,6 +254,127 @@ public sealed class DataFrameActionTests
         Assert.Throws<InvalidOperationException>(() => df.Collect());
     }
 
+    // ----- A (#412): Limit/Distinct must thread the session so a following action runs -----
+
+    [Fact]
+    public void Limit_ThreadsSession_SoAFollowingActionRuns()
+    {
+        var rows = new List<Row> { Person("Alice", 30) };
+        var executor = new FakeQueryExecutor(rows);
+        (SparkSession spark, DataFrame df) = NewBoundFrame(executor);
+        using (spark)
+        {
+            DataFrame limited = df.Limit(1);
+            Assert.NotNull(limited.Session);
+            Assert.Same(spark, limited.Session);
+
+            // Would throw InvalidOperationException on a session-dropping Limit (the #412 regression).
+            Assert.Single(limited.Collect());
+        }
+    }
+
+    [Fact]
+    public void Distinct_ThreadsSession_SoCountRuns()
+    {
+        var executor = new FakeQueryExecutor(Array.Empty<Row>(), countOverride: 4);
+        (SparkSession spark, DataFrame df) = NewBoundFrame(executor);
+        using (spark)
+        {
+            DataFrame distinct = df.Distinct();
+            Assert.NotNull(distinct.Session);
+            Assert.Same(spark, distinct.Session);
+
+            Assert.Equal(4, distinct.Count());
+        }
+    }
+
+    [Fact]
+    public void SelectThenLimit_ThreadsSession_SoShowRuns()
+    {
+        var rows = new List<Row> { Person("Alice", 30) };
+        var executor = new FakeQueryExecutor(rows);
+        (SparkSession spark, DataFrame df) = NewBoundFrame(executor);
+        using (spark)
+        {
+            DataFrame projected = df.Select(Functions.Col("name")).Limit(5);
+            Assert.Same(spark, projected.Session);
+
+            string table = projected.ShowString(numRows: 20, truncate: true);
+            Assert.Contains("Alice", table);
+        }
+    }
+
+    [Fact]
+    public void EveryTransformation_ThreadsTheSameNonNullSession_AndStaysExecutable()
+    {
+        var rows = new List<Row> { Person("Alice", 30) };
+        var executor = new FakeQueryExecutor(rows);
+        (SparkSession spark, DataFrame df) = NewBoundFrame(executor);
+        using (spark)
+        {
+            DataFrame other = new DataFrame(spark, new UnresolvedRelation(new[] { "people" }));
+
+            var transforms = new (string Name, Func<DataFrame, DataFrame> Apply)[]
+            {
+                ("Select", d => d.Select(Functions.Col("name"))),
+                ("Select(names)", d => d.Select("name")),
+                ("Filter", d => d.Filter(Functions.Col("age").Gt(21))),
+                ("Where", d => d.Where(Functions.Col("age").Gt(21))),
+                ("WithColumn", d => d.WithColumn("bump", Functions.Col("age").Plus(1))),
+                ("Sort", d => d.Sort(Functions.Col("name"))),
+                ("OrderBy", d => d.OrderBy("name")),
+                ("Limit", d => d.Limit(3)),
+                ("Distinct", d => d.Distinct()),
+                ("Join", d => d.Join(other)),
+                ("Union", d => d.Union(other)),
+                ("CrossJoin", d => d.CrossJoin(other)),
+            };
+
+            foreach ((string name, Func<DataFrame, DataFrame> apply) in transforms)
+            {
+                DataFrame result = apply(df);
+                Assert.True(result.Session is not null, $"{name} dropped the session.");
+                Assert.Same(spark, result.Session);
+
+                // The frame stays executable: an action on it reaches the fake backend (would throw
+                // InvalidOperationException if the session had been dropped).
+                Assert.Equal(rows.Count, result.Collect().Count);
+            }
+        }
+    }
+
+    // ----- F (#412): an action must reject a stopped session (Spark parity) -----
+
+    [Fact]
+    public void Collect_OnStoppedSession_ThrowsSessionStopped()
+    {
+        var executor = new FakeQueryExecutor(Array.Empty<Row>());
+        (SparkSession spark, DataFrame df) = NewBoundFrame(executor);
+        spark.Stop();
+
+        Assert.Throws<SessionStoppedException>(() => df.Collect());
+    }
+
+    [Fact]
+    public void ShowString_OnEmptyResult_StillRendersColumnHeaders()
+    {
+        var executor = new FakeQueryExecutor(Array.Empty<Row>());
+        (SparkSession spark, DataFrame df) = NewBoundFrame(executor);
+        using (spark)
+        {
+            string table = df.ShowString(numRows: 20, truncate: true);
+
+            // The header is derived from the analyzed output schema, so an empty result still shows
+            // real column names (Spark parity) rather than the degenerate ++/++ box.
+            const string expected =
+                "+----+---+\n" +
+                "|name|age|\n" +
+                "+----+---+\n" +
+                "+----+---+\n";
+            Assert.Equal(expected, table);
+        }
+    }
+
     // ----- executor factory registration seam (#174 wiring point) -----
 
     [Fact]

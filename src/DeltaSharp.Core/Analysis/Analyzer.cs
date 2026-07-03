@@ -27,7 +27,7 @@ namespace DeltaSharp.Analysis;
 /// none is called: resolution failure never triggers physical planning or execution (AC4).
 /// </para>
 /// <para>
-/// Ids come from an <see cref="ExprIdGenerator"/> seeded fresh per <see cref="Resolve"/> call, so
+/// Ids come from an <see cref="ExprIdGenerator"/> seeded fresh per <see cref="Resolve(LogicalPlan)"/> call, so
 /// resolution is deterministic run-to-run (no <c>Guid</c>/<c>System.Random</c>).
 /// </para>
 /// </remarks>
@@ -50,7 +50,32 @@ internal sealed class Analyzer
     /// <returns>A new resolved plan tree; unchanged subtrees are shared by reference.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="plan"/> is null.</exception>
     /// <exception cref="AnalysisException">A relation or column reference did not resolve.</exception>
-    public LogicalPlan Resolve(LogicalPlan plan)
+    public LogicalPlan Resolve(LogicalPlan plan) => ResolveCore(plan, out _);
+
+    /// <summary>
+    /// Resolves <paramref name="plan"/> and additionally reports the analyzed plan's
+    /// <paramref name="outputSchema"/> (the ordered column names/types the result carries). This lets an
+    /// action derive its result schema — for example <see cref="DataFrame.Show(int, bool)"/> rendering
+    /// column headers for an empty result — from the <b>single</b> analyze pass, so no second
+    /// <see cref="ExecutionStage.Analyzer"/> audit stage is emitted.
+    /// </summary>
+    /// <param name="plan">The unresolved (or partially resolved) input plan.</param>
+    /// <param name="outputSchema">On return, the analyzed plan's output schema.</param>
+    /// <returns>A new resolved plan tree; unchanged subtrees are shared by reference.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="plan"/> is null.</exception>
+    /// <exception cref="AnalysisException">A relation or column reference did not resolve.</exception>
+    public LogicalPlan Resolve(LogicalPlan plan, out StructType outputSchema)
+    {
+        LogicalPlan resolved = ResolveCore(plan, out IReadOnlyList<AttributeReference> rootOutput);
+        outputSchema = ToOutputSchema(rootOutput);
+        return resolved;
+    }
+
+    /// <summary>The shared resolution pass. It also yields the root's output attributes so a caller
+    /// that needs the result schema derives it without a second pass; <see cref="Resolve(LogicalPlan)"/>
+    /// discards them (and never materializes a <see cref="StructType"/>, so a plan whose output carries
+    /// duplicate column names — e.g. a self-join — still collects/counts).</summary>
+    private LogicalPlan ResolveCore(LogicalPlan plan, out IReadOnlyList<AttributeReference> rootOutput)
     {
         ArgumentNullException.ThrowIfNull(plan);
 
@@ -66,7 +91,22 @@ internal sealed class Analyzer
             ReferenceEqualityComparer.Instance);
         LogicalPlan resolved = ResolveReferences(withRelations, idGenerator, outputByPlan);
         CheckAnalysis(resolved, outputByPlan);
+        rootOutput = outputByPlan[resolved];
         return resolved;
+    }
+
+    /// <summary>Projects a resolved plan's output attributes into the <see cref="StructType"/> the
+    /// materialized result carries (name, type, nullability, in ordinal order).</summary>
+    private static StructType ToOutputSchema(IReadOnlyList<AttributeReference> output)
+    {
+        var fields = new StructField[output.Count];
+        for (int i = 0; i < output.Count; i++)
+        {
+            AttributeReference attribute = output[i];
+            fields[i] = new StructField(attribute.Name, attribute.Type!, attribute.Nullable);
+        }
+
+        return new StructType(fields);
     }
 
     /// <summary>ResolveRelations: bind every <see cref="UnresolvedRelation"/> via the catalog.</summary>

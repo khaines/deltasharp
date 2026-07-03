@@ -501,7 +501,7 @@ public sealed class DataFrame
     /// <param name="n">The maximum number of rows to keep (non-negative).</param>
     /// <returns>A new <see cref="DataFrame"/> limited to <paramref name="n"/> rows.</returns>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="n"/> is negative.</exception>
-    public DataFrame Limit(int n) => new(new Limit(n, Plan));
+    public DataFrame Limit(int n) => new(Session, new Limit(n, Plan));
 
     /// <summary>
     /// Returns a new <see cref="DataFrame"/> with duplicate rows removed, mirroring Spark's
@@ -509,7 +509,7 @@ public sealed class DataFrame
     /// node and deduplicates nothing here (ADR-0001). This instance is unchanged.
     /// </summary>
     /// <returns>A new <see cref="DataFrame"/> over distinct rows.</returns>
-    public DataFrame Distinct() => new(new Distinct(Plan));
+    public DataFrame Distinct() => new(Session, new Distinct(Plan));
 
     /// <summary>
     /// Returns a new <see cref="DataFrame"/> containing the rows of this frame followed by those of
@@ -547,41 +547,45 @@ public sealed class DataFrame
 
     // ------------------------------------------------------------------------------------------
     // Actions (eager). These are the ONLY DataFrame members that execute — they analyze the plan,
-    // (optionally optimize it), and drive the session's IQueryExecutor. Building or chaining a
-    // transformation above never reaches here (the lazy/eager invariant, ADR-0001), which the #169
-    // audit seam makes observable: an action records exactly one Analyzer stage; a transformation
-    // records none. See docs/engineering/design/actions-and-row.md.
+    // run the optimizer seam (an intentional identity pass in M1 — see Optimize), and drive the
+    // session's IQueryExecutor. Building or chaining a transformation above never reaches here (the
+    // lazy/eager invariant, ADR-0001), which the #169 audit seam makes observable: an action records
+    // exactly one Analyzer stage; a transformation records none. See
+    // docs/engineering/design/actions-and-row.md.
     // ------------------------------------------------------------------------------------------
 
     /// <summary>
     /// Executes the query and returns every result row as an in-memory list, mirroring Spark's
-    /// <c>Dataset.collect()</c>. This is an <b>action</b>: it analyzes this frame's plan, optionally
-    /// optimizes it, and drives the session's execution backend exactly once — the crossing from lazy
-    /// plan construction into eager execution.
+    /// <c>Dataset.collect()</c>. This is an <b>action</b>: it analyzes this frame's plan, runs the
+    /// optimizer seam (an identity pass in M1), and drives the session's execution backend exactly
+    /// once — the crossing from lazy plan construction into eager execution.
     /// </summary>
     /// <returns>The materialized <see cref="Row"/>s, in result order.</returns>
     /// <exception cref="InvalidOperationException">This frame is not bound to a <see cref="SparkSession"/>.</exception>
+    /// <exception cref="SessionStoppedException">The owning session has been stopped or disposed.</exception>
     /// <exception cref="QueryExecutionException">No execution backend is registered, or the backend
     /// reported a runtime failure.</exception>
     public IReadOnlyList<Row> Collect()
     {
-        SparkSession session = RequireSession();
+        SparkSession session = RequireSession(nameof(Collect));
         LogicalPlan analyzed = AnalyzeForExecution(session, Plan);
         return session.QueryExecutor.Collect(analyzed);
     }
 
     /// <summary>
     /// Executes the query and returns the number of rows in the result, mirroring Spark's
-    /// <c>Dataset.count()</c>. Like <see cref="Collect"/> this is an <b>action</b>: it analyzes,
-    /// optionally optimizes, and drives the backend exactly once, without materializing the rows.
+    /// <c>Dataset.count()</c>. Like <see cref="Collect"/> this is an <b>action</b>: it analyzes, runs
+    /// the optimizer seam (an identity pass in M1), and drives the backend exactly once, without
+    /// materializing the rows.
     /// </summary>
     /// <returns>The number of result rows.</returns>
     /// <exception cref="InvalidOperationException">This frame is not bound to a <see cref="SparkSession"/>.</exception>
+    /// <exception cref="SessionStoppedException">The owning session has been stopped or disposed.</exception>
     /// <exception cref="QueryExecutionException">No execution backend is registered, or the backend
     /// reported a runtime failure.</exception>
     public long Count()
     {
-        SparkSession session = RequireSession();
+        SparkSession session = RequireSession(nameof(Count));
         LogicalPlan analyzed = AnalyzeForExecution(session, Plan);
         return session.QueryExecutor.Count(analyzed);
     }
@@ -597,6 +601,7 @@ public sealed class DataFrame
     /// truncated with a trailing <c>...</c>; when <see langword="false"/> full values are shown.</param>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="numRows"/> is negative.</exception>
     /// <exception cref="InvalidOperationException">This frame is not bound to a <see cref="SparkSession"/>.</exception>
+    /// <exception cref="SessionStoppedException">The owning session has been stopped or disposed.</exception>
     /// <exception cref="QueryExecutionException">No execution backend is registered, or the backend
     /// reported a runtime failure.</exception>
     public void Show(int numRows = 20, bool truncate = true) =>
@@ -625,16 +630,19 @@ public sealed class DataFrame
         // Collect numRows + 1 so we can tell whether the result has more rows than we display, without
         // materializing the whole result. The bound is pushed onto a DERIVED plan; this frame is
         // unchanged (AC3: show respects row limits without changing the underlying plan).
-        SparkSession session = RequireSession();
+        SparkSession session = RequireSession(nameof(Show));
         long boundLong = (long)numRows + 1;
         int bound = boundLong > int.MaxValue ? int.MaxValue : (int)boundLong;
-        LogicalPlan analyzed = AnalyzeForExecution(session, new Limit(bound, Plan));
+        LogicalPlan analyzed = AnalyzeForExecution(session, new Limit(bound, Plan), out StructType schema);
         IReadOnlyList<Row> collected = session.QueryExecutor.Collect(analyzed);
 
         bool hasMoreData = collected.Count > numRows;
         int displayCount = Math.Min(collected.Count, numRows);
-        StructType schema = collected.Count > 0 ? collected[0].Schema : StructType.Empty;
 
+        // The header is derived from the analyzed plan's output schema (not collected[0].Schema) so an
+        // EMPTY result still renders real column headers (Spark parity), instead of a degenerate ++/++
+        // box. Every returned row shares this analyzed output schema (the IQueryExecutor.Collect
+        // contract), so the header stays correct whether the result is empty or not.
         return FormatTable(schema, collected, displayCount, numRows, truncateWidth, hasMoreData);
     }
 
@@ -644,27 +652,50 @@ public sealed class DataFrame
     /// <summary>The minimum rendered width of any column (Spark parity).</summary>
     private const int MinColumnWidth = 3;
 
-    private SparkSession RequireSession() =>
-        Session ?? throw new InvalidOperationException(
+    private SparkSession RequireSession(string action)
+    {
+        SparkSession session = Session ?? throw new InvalidOperationException(
             "This DataFrame is not bound to a SparkSession and cannot be executed. Obtain DataFrames "
             + "from a SparkSession (for example spark.Read/spark.Sql) so actions can analyze and run "
             + "them.");
 
-    /// <summary>
-    /// The eager analyze (and optimize) stage shared by every action: it resolves <paramref name="plan"/>
-    /// against the session catalog (emitting the #169 audit's Analyzer stage) and then runs the optional
-    /// optimizer seam. Returns the plan the executor runs.
-    /// </summary>
-    private static LogicalPlan AnalyzeForExecution(SparkSession session, LogicalPlan plan)
-    {
-        LogicalPlan analyzed = new Analyzer(session.Catalog).Resolve(plan);
-        return Optimize(analyzed);
+        // An action must not run on a stopped/disposed session (Spark parity): route through the
+        // single lifecycle guard so Collect/Count/Show after Stop() throw SessionStoppedException
+        // instead of reaching the analyzer/executor.
+        session.EnsureNotStopped(action);
+        return session;
     }
 
     /// <summary>
-    /// The optimizer seam (STORY-04.5.3 / #172). It is an identity pass today so actions have a single,
-    /// stable place to insert rule-based optimization once it lands, without reshaping the action
-    /// pipeline or the <see cref="IQueryExecutor"/> contract.
+    /// The eager analyze (and optimize) stage shared by <see cref="Collect"/>/<see cref="Count"/>: it
+    /// resolves <paramref name="plan"/> against the session catalog (emitting the #169 audit's Analyzer
+    /// stage) and then runs the optimizer seam, returning the plan the executor runs. It does not
+    /// materialize the output schema — the collect/count contract needs only the executor's rows.
+    /// </summary>
+    private static LogicalPlan AnalyzeForExecution(SparkSession session, LogicalPlan plan) =>
+        Optimize(new Analyzer(session.Catalog).Resolve(plan));
+
+    /// <summary>
+    /// The analyze + optimize stage for <see cref="Show(int, bool)"/>: like
+    /// <see cref="AnalyzeForExecution(SparkSession, LogicalPlan)"/> but also captures the analyzed
+    /// plan's <paramref name="outputSchema"/> from the <b>single</b> Resolve call (so deriving it emits
+    /// no extra Analyzer audit stage), which the header is rendered from — even when the result is
+    /// empty. Optimize is an intentional identity pass in M1 (see <see cref="Optimize"/>), so the
+    /// analyzed output schema is also the optimized plan's output schema.
+    /// </summary>
+    private static LogicalPlan AnalyzeForExecution(
+        SparkSession session, LogicalPlan plan, out StructType outputSchema) =>
+        Optimize(new Analyzer(session.Catalog).Resolve(plan, out outputSchema));
+
+    /// <summary>
+    /// The optimizer seam. The standalone rule-based <c>Optimizer</c> (STORY-04.5.3 / #172) is already
+    /// merged, but this action-pipeline seam is <b>intentionally an identity pass in M1</b>: wiring the
+    /// optimizer in is deferred to the #174 physical-planning bridge and is gated on
+    /// <see href="https://github.com/khaines/deltasharp/issues/415">#415</see> — the engine currently
+    /// evaluates <c>And</c>/<c>Or</c> eagerly with no per-lane short-circuit, so an optimizer-combined
+    /// filter could raise ANSI errors on guard-excluded rows. Keeping the seam as an explicit, named
+    /// step is the point: #174 can wire it without reshaping the action pipeline or the
+    /// <see cref="IQueryExecutor"/> contract.
     /// </summary>
     private static LogicalPlan Optimize(LogicalPlan analyzedPlan) => analyzedPlan;
 

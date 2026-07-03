@@ -28,7 +28,9 @@ backend     →  execution                                (EPIC-03)
 It takes a **resolved** `LogicalPlan` (every name bound, every expression typed) and returns an
 **equivalent, cheaper** resolved `LogicalPlan`. It is a pure tree-to-tree function: it performs no
 I/O, touches no catalog, and triggers no execution — building or optimizing a plan is still lazy
-(ADR-0001). The optimizer is **not** yet wired into an action driver; that bridge is #173/#174. This
+(ADR-0001). The optimizer is **not** yet wired into an action driver: STORY-04.6.1 (#173) ships the
+action pipeline with `Optimize` as an **intentional identity pass**, and wiring this optimizer in is
+deferred to the #174 physical-planning bridge (gated on #415 — see the closing note). This
 story delivers the optimizer as a standalone, testable component (`new Optimizer().Optimize(plan)`).
 
 Everything here is `internal` (namespace `DeltaSharp.Optimization`, under
@@ -309,7 +311,7 @@ context, so method names are unprefixed).
 Comparison/`Cast`/decimal constant folding and `NullPropagation`; `BooleanSimplification`;
 `CollapseProject`; predicate pushdown through joins/aggregates and into scans as data-source filters;
 limit pushdown (`LocalLimit`/`GlobalLimit`); a cost-based layer; and wiring `Optimize` into the
-action driver's `analyzed → optimized → planner` path (#173/#174) with an EXPLAIN command. That
+action driver's `analyzed → optimized → planner` path (#174) with an EXPLAIN command. That
 wiring is gated on [#415](https://github.com/khaines/deltasharp/issues/415): DeltaSharp's engine
 evaluates `And`/`Or` **eagerly** (no per-lane short-circuit), so a `CombineFilters`-merged filter
 could raise an ANSI error on rows a guard predicate removed until the engine short-circuit lands.

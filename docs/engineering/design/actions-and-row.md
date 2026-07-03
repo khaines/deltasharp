@@ -55,22 +55,28 @@ construction into eager execution:
 
 ```
 DataFrame.Collect/Count/Show
-  └─ RequireSession()                         // the frame must be bound to a SparkSession
+  └─ RequireSession()                         // frame bound to an ACTIVE SparkSession (not stopped)
   └─ AnalyzeForExecution(session, plan)
         ├─ new Analyzer(session.Catalog).Resolve(plan)   // emits ExecutionAudit.StageEntered(Analyzer)
-        └─ Optimize(analyzed)                            // #172 seam — identity pass today
+        └─ Optimize(analyzed)                            // #172 seam — INTENTIONAL identity pass in M1
   └─ session.QueryExecutor.Collect/Count(analyzedPlan)   // the IQueryExecutor seam (eager)
-  └─ (Show only) FormatTable(...)                        // render the collected rows
+  └─ (Show only) FormatTable(...)                        // render, header from the analyzed output schema
 ```
 
 - **Analyze** reuses the existing `Analyzer.Resolve` (#171). Resolution is idempotent for an
   already-resolved plan, so re-analysis is safe. The analyzer already emits the `Analyzer` audit
   milestone (#169), which is what makes "an action executed" observable.
-- **Optimize** is a **seam**: `DataFrame.Optimize(LogicalPlan)` is an identity pass today. STORY-04.5.3
-  (#172) replaces its body with the rule-based optimizer without touching the action pipeline or the
-  `IQueryExecutor` contract. Keeping it as an explicit, named step is the whole point — #172 wires in
-  cleanly.
+- **Optimize** is a **seam**: `DataFrame.Optimize(LogicalPlan)` is an **intentional identity pass in
+  M1**. The standalone rule-based optimizer (STORY-04.5.3 / #172) is **already merged** — it ships as a
+  standalone `internal Optimizer` (`new Optimizer().Optimize(plan)`), *not* wired into this pipeline.
+  Wiring it into the action driver is deferred to the **#174** physical-planning bridge and is **gated
+  on [#415](https://github.com/khaines/deltasharp/issues/415)**: the engine currently evaluates
+  `And`/`Or` **eagerly** with no per-lane short-circuit, so an optimizer-combined filter could raise
+  ANSI errors on guard-excluded rows. Keeping `Optimize` as an explicit, named step is the point — #174
+  can wire it without reshaping the action pipeline or the `IQueryExecutor` contract.
 - **Execute** is delegated to the session's `IQueryExecutor` (below).
+- **RequireSession** also asserts the owning session is **active**: an action on a stopped/disposed
+  session throws `SessionStoppedException` (Spark parity), before the analyzer or executor is reached.
 
 ### `Show` formatting contract (M1)
 
@@ -79,7 +85,10 @@ frame's own `Plan` is never mutated, satisfying #173 AC3) so it can tell whether
 then renders:
 
 - A bordered box using `+`, `-`, `|` with per-column widths (minimum 3, Spark parity).
-- The **header** from the collected rows' schema (`collected[0].Schema`).
+- The **header** from the **analyzed plan's output schema** (not `collected[0].Schema`), so an **empty**
+  result still renders real column headers (Spark parity) instead of a degenerate `++`/`++` box. The
+  schema is captured from the *same* analyze pass the execution uses (`Analyzer.Resolve(plan, out
+  schema)`), so deriving it costs no extra `Analyzer` audit stage.
 - Cells rendered by `Row.Render`: `null` → `null`, booleans lower-cased, numeric/temporal values via
   `IFormattable.ToString(null, CultureInfo.InvariantCulture)` so output is locale-independent and
   deterministic.
@@ -101,10 +110,13 @@ Example — `df.ShowString(2, truncate: true)` over `[name:string, age:int]`:
 only showing top 2 rows
 ```
 
-**M1 limitation.** The header schema is taken from the collected rows. When the result is **empty**,
-Core does not yet compute the analyzed output schema independently (that is a later `schema`/
-`printSchema` story), so a zero-row result renders a closed empty box (`++`/`++`). Non-empty results —
-the case every formatting test covers — render full Spark-style headers.
+**Guard ordering.** `ShowString` validates `numRows` first — the `numRows < 0` check throws
+`ArgumentOutOfRangeException` **before** `RequireSession()` — so a bad argument fails the same way on a
+session-free or stopped frame as on a bound one.
+
+**Empty results.** Because the header comes from the analyzed output schema, a zero-row result renders
+the full header and a closed (data-less) box rather than the degenerate `++`/`++`. A genuinely
+zero-*column* result still renders `++`/`++`.
 
 ## The lazy → eager boundary and how #169 proves it
 
@@ -126,8 +138,10 @@ The oracle the tests assert:
 - transformation-only chain ⇒ **zero** `Analyzer` stages (and zero files/rows), and
 - each action ⇒ **exactly one** `Analyzer` stage.
 
-This directly encodes #173 AC1 ("analyzer/optimizer/planner/backend invoked exactly once for the
-action") and AC4 ("no action execution steps occur for a transformation chain").
+This directly encodes #173 AC1 (the analyzer and planner/backend are invoked exactly once per action;
+the optimizer is an **intentional identity pass in M1**, not an audited stage — the cited test asserts
+the `[Analyzer, Planner, Backend]` path) and AC4 ("no action execution steps occur for a
+transformation chain").
 
 ## The `IQueryExecutor` dependency-inversion seam
 
@@ -152,8 +166,11 @@ internal interface IQueryExecutor
 ```
 
 - It is **`internal`** because it references the internal `LogicalPlan` IR; it can never be public.
-- `analyzedPlan` is the analyzer-resolved plan (and, once #172 lands, the optimized plan — the
-  `Optimize` seam sits *before* this call, so the executor always receives the final logical plan).
+- `analyzedPlan` is the analyzer-resolved plan. The `Optimize` seam sits *before* this call, so the
+  executor always receives the final logical plan; because that seam is an **intentional identity pass
+  in M1** (the standalone #172 optimizer is not wired in — see above), the resolved plan and the plan
+  the executor runs are currently the same tree. All rows an implementation returns from `Collect`
+  share the **analyzed plan's output schema**.
 - An implementation owns physical planning, the EPIC-03 backend invocation, and `ColumnBatch → Row`
   materialization. It is the sole eager-execution owner.
 
@@ -180,11 +197,16 @@ internal static void RegisterQueryExecutorFactory(Func<SparkSession, IQueryExecu
 ```
 
 - `QueryExecutor` is created lazily from the registered **factory**, defaulting to
-  `UnsupportedQueryExecutor` when no factory is registered. The per-session **setter** lets a test (or
-  a caller) install a double for one session.
+  `UnsupportedQueryExecutor` when no factory is registered. The lazy publish is **atomic**
+  (`Interlocked.CompareExchange` on a `Volatile`-read field): `SparkSession` is explicitly
+  multi-threaded, and a #174 factory may be stateful, so the getter never double-invokes the factory or
+  hands two threads two different executors. The per-session **setter** lets a test (or a caller)
+  install a double for one session.
 - `RegisterQueryExecutorFactory` is the **process-wide** wiring point the executor lane (#174) calls
   once at startup so every subsequently-resolved session gets the real backend — without inverting
-  Core ⟂ Engine independence. Passing `null` resets to the unsupported default (tests reset in a
+  Core ⟂ Engine independence. The backing static is `volatile`. It is a process-global, so **register
+  the factory at startup, before any session is used concurrently**; it affects only sessions that have
+  not yet resolved their executor. Passing `null` resets to the unsupported default (tests reset in a
   `finally`).
 - `Catalog` is the session's in-memory `LocalCatalog`; an action constructs `new Analyzer(Catalog)` to
   resolve its plan. It is internal — the catalog seam is not yet public API.
@@ -197,9 +219,14 @@ internal DataFrame(SparkSession? session, LogicalPlan plan)
 internal SparkSession? Session { get; }
 ```
 
-Every transformation **propagates** the session (`Select`/`Filter`/`Sort`/… pass `Session`; `Join`/
-`Union` pass `Session ?? right.Session`; `GroupBy`/`Agg` thread it through
-`RelationalGroupedDataset`), so a whole chain remains bound to one session and stays executable. A
+Every transformation **propagates** the session so a whole chain remains bound to one session and stays
+executable. Single-source transformations (`Select`/`Filter`/`Where`/`WithColumn`/`Sort`/`OrderBy`/
+**`Limit`**/**`Distinct`**) pass `Session`; the binary ones pass `Session ?? other.Session` (for
+`Union`, whose parameter is `other`) or `Session ?? right.Session` (for `Join`/`CrossJoin`);
+`GroupBy`/`Agg` thread it through `RelationalGroupedDataset`. A table-driven guard test
+(`EveryTransformation_ThreadsTheSameNonNullSession_AndStaysExecutable`) applies every transformation to
+a bound frame and asserts each result keeps the same non-null session and stays executable, so a
+future transformation that drops the session (as `Limit`/`Distinct` once did, #412) reddens. A
 session-free frame (constructed directly in tests without a session) throws a deterministic
 `InvalidOperationException` from an action.
 
@@ -222,6 +249,7 @@ empty results.
 | --- | --- | --- |
 | Analyze | unknown table/column, unresolved plan | `AnalysisException` (internal; raised before execution) |
 | Bind | frame not bound to a session | `InvalidOperationException` |
+| Bind | owning session stopped/disposed | `SessionStoppedException` (public) |
 | Execute | no backend registered / backend runtime fault | `QueryExecutionException` (public) |
 
 A resolution error is raised during analysis, *before* the executor is reached (so it can never hit
@@ -255,8 +283,18 @@ public int FieldIndex(string name)       // Spark: Row.fieldIndex (case-sensitiv
 public T GetAs<T>(int ordinal)           // Spark: Row.getAs[T](i)
 public T GetAs<T>(string fieldName)      // Spark: Row.getAs[T](name)
 
+public override bool Equals(object? obj) // Spark: Row is value-equal (same schema + values)
+public override int GetHashCode()        // consistent with Equals (schema + ordered values)
 public override string ToString()        // Spark: Row.toString => "[a,null,c]"
 ```
+
+**Value equality (Spark parity).** `Row` overrides `Equals`/`GetHashCode` for **structural value
+equality**: two rows are equal iff their `Schema`s are equal (`StructType` value equality) and every
+value is equal in ordinal order (null-aware — two SQL `NULL`s at the same ordinal are equal). This is
+the first thing a Spark user does after `collect()`: `Assert.Equal(expectedRow, actualRow)`,
+`Contains`, `Distinct`, and `HashSet<Row>` de-duplication all work as expected. `Render` (used by
+`ToString`/`Show`) has an `IFormattable`-first switch with a `_ => value.ToString() ?? "null"`
+catch-all so any CLR value renders deterministically.
 
 ### Type and null semantics (ADR-0008)
 
@@ -280,6 +318,14 @@ public override string ToString()        // Spark: Row.toString => "[a,null,c]"
 | constructor | value count ≠ schema field count | `ArgumentException` |
 | constructor | null schema/values | `ArgumentNullException` |
 
+### Value equality (#412 council)
+
+| Behavior | Test(s) |
+| --- | --- |
+| schema- and value-equal rows compare equal + hash equal | `Equals_And_GetHashCode_AreValueBased`, `Equals_NullAwareAcrossOrdinals` |
+| differing value / nullness / schema compare unequal | `Equals_DifferentValue_IsNotEqual`, `Equals_DifferentNullness_IsNotEqual`, `Equals_DifferentSchema_IsNotEqual` |
+| `Assert.Equal(new[]{row}, collected)` and `HashSet<Row>` de-dup | `Equals_AgainstCollectedArray_Works`, `HashSet_DedupsValueEqualRows` |
+
 ### The #174 materialization seam
 
 #174 (physical planning, `DeltaSharp.Executor`) is the producer of `Row`s: it materializes engine
@@ -297,11 +343,12 @@ Tests live in `tests/DeltaSharp.Core.Tests/Actions/` (`DataFrameActionTests`, `R
 
 | AC | Test(s) |
 | --- | --- |
-| AC1 — `Collect` invokes analyzer/optimizer/planner/backend exactly once | `Collect_ReturnsExecutorRows_AndInvokesBackendOnce`, `Collect_PassesAnAnalyzedPlanToTheExecutor`, `Collect_RecordsExactlyOneAnalyzerStage_AndTheFullBackendPath` |
+| AC1 — `Collect` invokes analyzer + planner/backend exactly once (the optimizer is an intentional identity pass in M1, not an audited stage) | `Collect_ReturnsExecutorRows_AndInvokesBackendOnce`, `Collect_PassesAnAnalyzedPlanToTheExecutor`, `Collect_RecordsExactlyOneAnalyzerStage_AndTheFullBackendPath` |
 | AC2 — `Count` matches Spark semantics | `Count_ReturnsExecutorCount_WithoutMaterializing`, `Count_RecordsExactlyOneAnalyzerStagePerAction` |
-| AC3 — `Show` respects row limits/truncation without changing the plan | `ShowString_RendersSparkStyleTable_WithTruncationFooter`, `ShowString_NoFooter_WhenResultFitsWithinNumRows`, `ShowString_TruncateFalse_LeftJustifiesAndKeepsFullValue`, `ShowString_Truncate_CutsLongCellsWithEllipsis`, `ShowString_NegativeNumRows_Throws`, `Show_DoesNotChangeTheUnderlyingPlan` |
+| AC3 — `Show` respects row limits/truncation without changing the plan; empty result still renders headers | `ShowString_RendersSparkStyleTable_WithTruncationFooter`, `ShowString_NoFooter_WhenResultFitsWithinNumRows`, `ShowString_TruncateFalse_LeftJustifiesAndKeepsFullValue`, `ShowString_Truncate_CutsLongCellsWithEllipsis`, `ShowString_NegativeNumRows_Throws`, `Show_DoesNotChangeTheUnderlyingPlan`, `ShowString_OnEmptyResult_StillRendersColumnHeaders` |
 | AC4 — no action steps occur for a transformation chain | `TransformationChain_TriggersNoExecution` |
 | (seam) default-unsupported backend + injection | `Collect_WithNoBackendRegistered_ThrowsClearDiagnostic`, `Count_WithNoBackendRegistered_ThrowsClearDiagnostic`, `Action_OnSessionFreeFrame_ThrowsInvalidOperation`, `RegisterQueryExecutorFactory_InstallsBackendForNewSessions` |
+| (#412) transformations thread the session; actions reject a stopped session | `Limit_ThreadsSession_SoAFollowingActionRuns`, `Distinct_ThreadsSession_SoCountRuns`, `SelectThenLimit_ThreadsSession_SoShowRuns`, `EveryTransformation_ThreadsTheSameNonNullSession_AndStaysExecutable`, `Collect_OnStoppedSession_ThrowsSessionStopped` |
 
 ### STORY-04.7.1 (#177)
 
@@ -309,5 +356,23 @@ Tests live in `tests/DeltaSharp.Core.Tests/Actions/` (`DataFrameActionTests`, `R
 | --- | --- |
 | AC1 — names, ordinal access, typed getters, null checks | `Schema_And_Length_ReflectFields`, `OrdinalIndexer_ReturnsValues`, `NameIndexer_ResolvesViaSchema`, `FieldIndex_ReturnsOrdinal_AndIsCaseSensitive`, `GetAs_ByOrdinalAndName_ReturnsTypedValue`, `IsNullAt_And_AnyNull_TrackNulls` |
 | AC2 — preserve type, nullability, ANSI semantics | `Constructor_CopiesValues_SoRowIsImmutable`, `IReadOnlyListConstructor_MatchesParamsConstructor`, `GetAs_NullValue_NullableValueType_ReturnsNull`, `ToString_UsesInvariantCulture_ForNumbers` |
-| AC3 — deterministic errors for missing fields, bad casts, null typed getters | `Constructor_RejectsNullSchemaAndValues`, `Constructor_RejectsValueCountMismatch`, `OrdinalIndexer_OutOfRange_Throws`, `NameIndexer_MissingField_Throws`, `FieldIndex_NullName_Throws`, `IsNullAt_OutOfRange_Throws`, `GetAs_WrongType_ThrowsInvalidCast`, `GetAs_NullValue_ReferenceType_ReturnsNull`, `GetAs_NullValue_NonNullableValueType_Throws` |
+| AC3 — deterministic errors for missing fields, bad casts, null typed getters | `Constructor_RejectsNullSchemaAndValues`, `Constructor_RejectsValueCountMismatch`, `OrdinalIndexer_OutOfRange_Throws`, `NameIndexer_MissingField_Throws`, `FieldIndex_NullName_Throws`, `IsNullAt_OutOfRange_Throws`, `GetAs_WrongType_ThrowsInvalidCast`, `GetAs_ByOrdinal_OutOfRange_Throws`, `GetAs_ByName_MissingField_Throws`, `GetAs_NullValue_ReferenceType_ReturnsNull`, `GetAs_NullValue_NonNullableValueType_Throws` |
 | AC4 — `Show` rendering stable with nulls | `ShowString_RendersNullAsLiteral`, `ToString_RendersBracketedCsv_WithNullAsLiteral` |
+
+## Deferred (M1)
+
+The following are intentionally out of scope for M1 and tracked as open issues; the seams above are
+shaped so each lands without reshaping the action pipeline:
+
+- **Optimizer wiring** — the standalone rule-based optimizer (#172) is merged but **not** wired into
+  the action `Optimize` seam; wiring is deferred to **#174** and gated on
+  [#415](https://github.com/khaines/deltasharp/issues/415) (engine `And`/`Or` per-lane short-circuit
+  for ANSI filter safety once filters are combined).
+- **[#416](https://github.com/khaines/deltasharp/issues/416)** — an `IQueryExecutor` seam
+  `CancellationToken` and result/resource bounds (a `collect()` of an unbounded result is unbounded in
+  M1).
+- **[#417](https://github.com/khaines/deltasharp/issues/417)** — `DataFrame` analyzed-plan memoization
+  (each action re-analyzes from scratch today).
+- **[#418](https://github.com/khaines/deltasharp/issues/418)** — the `Row`/`Show` Spark-parity backlog:
+  typed getters (`getInt`/`getString`/…), `toSeq`/`mkString`, complex-type getters, a `Show`
+  truncate-width overload, and CJK display-width handling.

@@ -155,6 +155,22 @@ public sealed class RowTests
         Assert.Throws<InvalidCastException>(() => row.GetAs<int>(0));
     }
 
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(3)]
+    public void GetAs_ByOrdinal_OutOfRange_Throws(int ordinal)
+    {
+        Row row = SampleRow();
+        Assert.Throws<ArgumentOutOfRangeException>(() => row.GetAs<string>(ordinal));
+    }
+
+    [Fact]
+    public void GetAs_ByName_MissingField_Throws()
+    {
+        Row row = SampleRow();
+        Assert.Throws<ArgumentException>(() => row.GetAs<string>("missing"));
+    }
+
     [Fact]
     public void GetAs_NullValue_ReferenceType_ReturnsNull()
     {
@@ -191,5 +207,72 @@ public sealed class RowTests
         var schema = new StructType(new[] { new StructField("d", DataTypes.DoubleType) });
         var row = new Row(schema, 1234.5);
         Assert.Equal("[1234.5]", row.ToString());
+    }
+
+    // ----- value equality (#412 / Spark parity: Row is value-equal) -----
+
+    [Fact]
+    public void Equals_And_GetHashCode_AreValueBased()
+    {
+        Row a = SampleRow();
+        Row b = SampleRow();
+
+        Assert.True(a.Equals(b));
+        Assert.Equal(a, b);
+        Assert.Equal(a.GetHashCode(), b.GetHashCode());
+    }
+
+    [Fact]
+    public void Equals_NullAwareAcrossOrdinals()
+    {
+        var a = new Row(Schema(), "Alice", null, true);
+        var b = new Row(Schema(), "Alice", null, true);
+
+        Assert.Equal(a, b);
+        Assert.Equal(a.GetHashCode(), b.GetHashCode());
+    }
+
+    [Fact]
+    public void Equals_DifferentValue_IsNotEqual()
+    {
+        var a = new Row(Schema(), "Alice", 30, true);
+        var b = new Row(Schema(), "Alice", 31, true);
+        Assert.NotEqual(a, b);
+    }
+
+    [Fact]
+    public void Equals_DifferentNullness_IsNotEqual()
+    {
+        var a = new Row(Schema(), "Alice", 30, true);
+        var b = new Row(Schema(), "Alice", null, true);
+        Assert.NotEqual(a, b);
+    }
+
+    [Fact]
+    public void Equals_DifferentSchema_IsNotEqual()
+    {
+        var other = new StructType(new[]
+        {
+            new StructField("name", DataTypes.StringType),
+            new StructField("age", DataTypes.LongType),
+            new StructField("active", DataTypes.BooleanType),
+        });
+        var a = new Row(Schema(), "Alice", 30, true);
+        var b = new Row(other, "Alice", 30L, true);
+        Assert.NotEqual(a, b);
+    }
+
+    [Fact]
+    public void Equals_AgainstCollectedArray_Works()
+    {
+        var collected = new[] { SampleRow() };
+        Assert.Equal(new[] { SampleRow() }, collected);
+    }
+
+    [Fact]
+    public void HashSet_DedupsValueEqualRows()
+    {
+        var set = new HashSet<Row> { SampleRow(), SampleRow(), new Row(Schema(), "Bob", 25, false) };
+        Assert.Equal(2, set.Count);
     }
 }

@@ -25,13 +25,13 @@ DeltaSharp.DataFrame.OrderBy(params DeltaSharp.Column![]! columns) -> DeltaSharp
 DeltaSharp.DataFrame.OrderBy(string! column, params string![]! columns) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.Select(params DeltaSharp.Column![]! columns) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.Select(string! column, params string![]! columns) -> DeltaSharp.DataFrame!
+DeltaSharp.DataFrame.Show(int numRows = 20, bool truncate = true) -> void
 DeltaSharp.DataFrame.Sort(params DeltaSharp.Column![]! columns) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.Sort(string! column, params string![]! columns) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.Union(DeltaSharp.DataFrame! other) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.UnionAll(DeltaSharp.DataFrame! other) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.Where(DeltaSharp.Column! condition) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrame.WithColumn(string! colName, DeltaSharp.Column! col) -> DeltaSharp.DataFrame!
-DeltaSharp.DataFrame.Show(int numRows = 20, bool truncate = true) -> void
 DeltaSharp.DataFrameReader
 DeltaSharp.DeltaSharpInfo
 DeltaSharp.ExecutionBackend
@@ -122,6 +122,8 @@ static DeltaSharp.Functions.Upper(DeltaSharp.Column! column) -> DeltaSharp.Colum
 static DeltaSharp.Functions.When(DeltaSharp.Column! condition, object? value) -> DeltaSharp.Column!
 static DeltaSharp.Functions.Year(DeltaSharp.Column! column) -> DeltaSharp.Column!
 override DeltaSharp.Column.ToString() -> string!
+override DeltaSharp.Row.Equals(object? obj) -> bool
+override DeltaSharp.Row.GetHashCode() -> int
 override DeltaSharp.Row.ToString() -> string!
 static DeltaSharp.SparkSession.Builder() -> DeltaSharp.SparkSessionBuilder!
 static DeltaSharp.SparkSession.ClearActiveSession() -> void

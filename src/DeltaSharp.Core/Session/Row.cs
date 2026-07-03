@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -33,6 +34,13 @@ namespace DeltaSharp;
 /// The engine (the <c>DeltaSharp.Executor</c> backend, STORY-04.6.2 / #174) is what produces rows
 /// from executed physical plans; user code does not usually construct <see cref="Row"/> instances,
 /// but the constructors are public so tests and adapters can build canned rows.
+/// </para>
+/// <para>
+/// A row has <b>structural value equality</b> (see <see cref="Equals(object?)"/>), matching Spark's
+/// value-equal <c>Row</c>. <b>Deferred (M1):</b> the Spark-parity backlog — typed getters
+/// (<c>getInt</c>/<c>getString</c>/…), <c>toSeq</c>/<c>mkString</c>, complex-type getters, a
+/// <see cref="DataFrame.Show(int, bool)"/> truncate-width overload, and CJK display-width handling — is
+/// tracked by <see href="https://github.com/khaines/deltasharp/issues/418">#418</see>.
 /// </para>
 /// </remarks>
 public sealed class Row
@@ -249,6 +257,58 @@ public sealed class Row
         IFormattable formattable => formattable.ToString(null, CultureInfo.InvariantCulture),
         _ => value.ToString() ?? "null",
     };
+
+    /// <summary>
+    /// Determines whether <paramref name="obj"/> is a <see cref="Row"/> with the <b>same schema and the
+    /// same values</b>, mirroring Spark's value-equal <c>Row</c>. Two rows are equal iff their
+    /// <see cref="Schema"/>s are equal (<see cref="StructType"/> value equality) and every value is
+    /// equal in ordinal order (null-aware — two SQL <c>NULL</c>s at the same ordinal are equal). This
+    /// makes rows usable as expected results (<c>Assert.Equal(expected, row)</c>), in
+    /// <see cref="System.Collections.Generic.HashSet{T}"/> de-duplication, and with
+    /// <c>Contains</c>/<c>Distinct</c>.
+    /// </summary>
+    /// <param name="obj">The object to compare with.</param>
+    /// <returns><see langword="true"/> when <paramref name="obj"/> is a schema- and value-equal row.</returns>
+    public override bool Equals(object? obj)
+    {
+        if (ReferenceEquals(this, obj))
+        {
+            return true;
+        }
+
+        if (obj is not Row other || _values.Length != other._values.Length || !Schema.Equals(other.Schema))
+        {
+            return false;
+        }
+
+        for (int i = 0; i < _values.Length; i++)
+        {
+            if (!Equals(_values[i], other._values[i]))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Returns a hash code consistent with <see cref="Equals(object?)"/>: it combines the
+    /// <see cref="Schema"/> hash with each value in ordinal order (null-aware), so schema- and
+    /// value-equal rows hash equal and de-duplicate correctly in a hash set.
+    /// </summary>
+    /// <returns>A hash code over the schema and ordered values.</returns>
+    public override int GetHashCode()
+    {
+        var hash = default(HashCode);
+        hash.Add(Schema);
+        for (int i = 0; i < _values.Length; i++)
+        {
+            hash.Add(_values[i]);
+        }
+
+        return hash.ToHashCode();
+    }
 
     private static object?[] ToArray(IReadOnlyList<object?> values)
     {
