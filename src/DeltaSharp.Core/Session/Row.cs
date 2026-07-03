@@ -36,9 +36,14 @@ namespace DeltaSharp;
 /// but the constructors are public so tests and adapters can build canned rows.
 /// </para>
 /// <para>
-/// A row has <b>structural value equality</b> (see <see cref="Equals(object?)"/>), matching Spark's
-/// value-equal <c>Row</c>. <b>Deferred (M1):</b> the Spark-parity backlog — typed getters
-/// (<c>getInt</c>/<c>getString</c>/…), <c>toSeq</c>/<c>mkString</c>, complex-type getters, a
+/// A row has <b>structural value equality</b> (see <see cref="Equals(object?)"/>). Unlike Spark's
+/// <c>Row.equals</c> — which is <b>values-only</b> (length + values, ignoring the schema) — DeltaSharp's
+/// <see cref="Row"/> is <b>schema-inclusive</b>: two rows are equal only when their <see cref="Schema"/>s
+/// <i>and</i> values match. This is an intentional, <b>stricter-than-Spark</b> choice (a strictly
+/// schema-carrying <see cref="Row"/>), not plain Spark parity. <see cref="BinaryType"/> (<c>byte[]</c>)
+/// cells compare by <b>content</b> (Spark parity for binary); deeper nested-type deep equality
+/// (arrays/maps/structs) is <b>deferred (M1)</b>. That backlog — typed getters
+/// (<c>getInt</c>/<c>getString</c>/…), <c>toSeq</c>/<c>mkString</c>, complex-type getters and equality, a
 /// <see cref="DataFrame.Show(int, bool)"/> truncate-width overload, and CJK display-width handling — is
 /// tracked by <see href="https://github.com/khaines/deltasharp/issues/418">#418</see>.
 /// </para>
@@ -57,6 +62,28 @@ public sealed class Row
     /// <exception cref="ArgumentNullException"><paramref name="schema"/> or <paramref name="values"/> is null.</exception>
     /// <exception cref="ArgumentException">The number of values does not match the schema field count.</exception>
     public Row(StructType schema, params object?[] values)
+        : this(schema, values, cloneValues: true)
+    {
+    }
+
+    /// <summary>
+    /// Creates a row with the given <paramref name="schema"/> and column <paramref name="values"/>.
+    /// </summary>
+    /// <param name="schema">The row's schema; its field count must equal <paramref name="values"/> count.</param>
+    /// <param name="values">The column values in ordinal order (copied).</param>
+    /// <exception cref="ArgumentNullException"><paramref name="schema"/> or <paramref name="values"/> is null.</exception>
+    /// <exception cref="ArgumentException">The number of values does not match the schema field count.</exception>
+    public Row(StructType schema, IReadOnlyList<object?> values)
+        : this(schema, ToArray(values), cloneValues: false)
+    {
+    }
+
+    /// <summary>The single shared init path for both public constructors: it validates the schema and
+    /// value count once and takes ownership of exactly one array. <paramref name="cloneValues"/> is
+    /// <see langword="true"/> only for the caller-supplied <c>params</c> array (a defensive copy so the
+    /// row stays immutable); the <see cref="IReadOnlyList{T}"/> overload already passes a freshly
+    /// allocated, privately owned array via <see cref="ToArray"/>, so no second copy is made.</summary>
+    private Row(StructType schema, object?[] values, bool cloneValues)
     {
         ArgumentNullException.ThrowIfNull(schema);
         ArgumentNullException.ThrowIfNull(values);
@@ -68,19 +95,7 @@ public sealed class Row
         }
 
         Schema = schema;
-        _values = (object?[])values.Clone();
-    }
-
-    /// <summary>
-    /// Creates a row with the given <paramref name="schema"/> and column <paramref name="values"/>.
-    /// </summary>
-    /// <param name="schema">The row's schema; its field count must equal <paramref name="values"/> count.</param>
-    /// <param name="values">The column values in ordinal order (copied).</param>
-    /// <exception cref="ArgumentNullException"><paramref name="schema"/> or <paramref name="values"/> is null.</exception>
-    /// <exception cref="ArgumentException">The number of values does not match the schema field count.</exception>
-    public Row(StructType schema, IReadOnlyList<object?> values)
-        : this(schema, ToArray(values))
-    {
+        _values = cloneValues ? (object?[])values.Clone() : values;
     }
 
     /// <summary>The row's schema (never null). Mirrors Spark's <c>Row.schema</c>.</summary>
@@ -260,10 +275,13 @@ public sealed class Row
 
     /// <summary>
     /// Determines whether <paramref name="obj"/> is a <see cref="Row"/> with the <b>same schema and the
-    /// same values</b>, mirroring Spark's value-equal <c>Row</c>. Two rows are equal iff their
-    /// <see cref="Schema"/>s are equal (<see cref="StructType"/> value equality) and every value is
-    /// equal in ordinal order (null-aware — two SQL <c>NULL</c>s at the same ordinal are equal). This
-    /// makes rows usable as expected results (<c>Assert.Equal(expected, row)</c>), in
+    /// same values</b>. Two rows are equal iff their <see cref="Schema"/>s are equal
+    /// (<see cref="StructType"/> value equality) and every value is equal in ordinal order (null-aware —
+    /// two SQL <c>NULL</c>s at the same ordinal are equal; <see cref="BinaryType"/> <c>byte[]</c> cells
+    /// compare by content, Spark parity). This is <b>schema-inclusive and intentionally stricter than
+    /// Spark</b>, whose <c>Row.equals</c> is values-only (it ignores the schema): DeltaSharp's row is a
+    /// strictly schema-carrying value. It makes rows usable as expected results
+    /// (<c>Assert.Equal(expected, row)</c>), in
     /// <see cref="System.Collections.Generic.HashSet{T}"/> de-duplication, and with
     /// <c>Contains</c>/<c>Distinct</c>.
     /// </summary>
@@ -283,13 +301,32 @@ public sealed class Row
 
         for (int i = 0; i < _values.Length; i++)
         {
-            if (!Equals(_values[i], other._values[i]))
+            if (!ValuesEqual(_values[i], other._values[i]))
             {
                 return false;
             }
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Compares two boxed cell values for structural equality. Scalars use their own
+    /// <see cref="object.Equals(object?, object?)"/> (null-aware). <see cref="BinaryType"/> values are
+    /// backed by <see cref="byte"/> arrays, whose default equality is by <b>reference</b>; Spark
+    /// compares binary <b>by content</b> (<c>java.util.Arrays.equals</c>), so two equal-content
+    /// <c>byte[]</c> cells are equal here. Other complex/nested types (arrays, maps, structs) still fall
+    /// back to reference/default equality in M1 — that Spark-parity deep-equality work is tracked by
+    /// <see href="https://github.com/khaines/deltasharp/issues/418">#418</see>.
+    /// </summary>
+    private static bool ValuesEqual(object? a, object? b)
+    {
+        if (a is byte[] ba && b is byte[] bb)
+        {
+            return ba.AsSpan().SequenceEqual(bb);
+        }
+
+        return Equals(a, b);
     }
 
     /// <summary>
@@ -304,7 +341,17 @@ public sealed class Row
         hash.Add(Schema);
         for (int i = 0; i < _values.Length; i++)
         {
-            hash.Add(_values[i]);
+            // byte[] cells hash by CONTENT (via HashCode.AddBytes) so equal-content binary rows hash
+            // equal, staying consistent with ValuesEqual's content comparison; all other values hash by
+            // their own GetHashCode.
+            if (_values[i] is byte[] bytes)
+            {
+                hash.AddBytes(bytes);
+            }
+            else
+            {
+                hash.Add(_values[i]);
+            }
         }
 
         return hash.ToHashCode();

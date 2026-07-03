@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using DeltaSharp.Core.Tests.LazyEager;
 using DeltaSharp.Diagnostics;
 using DeltaSharp.Plans.Logical;
@@ -328,6 +329,8 @@ public sealed class DataFrameActionTests
                 ("Join", d => d.Join(other)),
                 ("Union", d => d.Union(other)),
                 ("CrossJoin", d => d.CrossJoin(other)),
+                ("GroupBy.Count", d => d.GroupBy(Functions.Col("name")).Count()),
+                ("GroupBy.Agg", d => d.GroupBy(Functions.Col("name")).Agg(Functions.Count(Functions.Lit(1L)))),
             };
 
             foreach ((string name, Func<DataFrame, DataFrame> apply) in transforms)
@@ -372,6 +375,41 @@ public sealed class DataFrameActionTests
                 "+----+---+\n" +
                 "+----+---+\n";
             Assert.Equal(expected, table);
+        }
+    }
+
+    [Fact]
+    public void ShowString_RendersDuplicateOutputColumnNames_WhereCollectAndCountSucceed()
+    {
+        // A join of two frames over the same relation (name, age) yields a duplicate-name output
+        // (name, age, name, age); Select(Col("name"), Col("name")) yields (name, name). Spark's show()
+        // renders duplicate headers, and Collect/Count already succeed on such plans (they never
+        // materialize a dup-rejecting StructType). The header must be dup-name tolerant too (#419).
+        var executor = new FakeQueryExecutor(Array.Empty<Row>());
+        (SparkSession spark, DataFrame df) = NewBoundFrame(executor);
+        using (spark)
+        {
+            DataFrame other = new DataFrame(spark, new UnresolvedRelation(new[] { "people" }));
+
+            foreach (DataFrame dup in new[]
+            {
+                df.Join(other),
+                df.Select(Functions.Col("name"), Functions.Col("name")),
+            })
+            {
+                string table = dup.ShowString(numRows: 20, truncate: true);
+
+                // The header (second line: separator, header, separator, separator) renders the
+                // duplicate "name" column twice rather than throwing SchemaValidationException (which the
+                // StructType-based header path did).
+                string headerLine = table.Split('\n')[1];
+                int nameHeaders = headerLine.Split('|').Count(cell => cell == "name");
+                Assert.Equal(2, nameHeaders);
+
+                // Collect/Count remain reachable on the very same duplicate-output-name plan.
+                Assert.Empty(dup.Collect());
+                Assert.Equal(0, dup.Count());
+            }
         }
     }
 

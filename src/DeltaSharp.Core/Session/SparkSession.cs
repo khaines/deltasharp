@@ -130,10 +130,11 @@ public sealed class SparkSession : IDisposable
         {
             // Publish the lazily-built executor atomically. SparkSession is explicitly multi-threaded
             // (see the _globalLock / Volatile / Interlocked discipline above), and a #174 factory may be
-            // stateful, so a non-atomic `??=` could double-invoke the factory or hand two threads two
-            // different executors. Read once; if unset, build and CAS the field — the loser discards its
-            // instance and adopts the winner's, so every caller observes the same executor. Never null:
-            // the fail-closed default is UnsupportedQueryExecutor.
+            // stateful, so a non-atomic `??=` could hand two threads two different executors. Read once;
+            // if unset, build and CAS the field. Under a concurrent first-access race BOTH threads may
+            // build (and so invoke the factory) — only PUBLICATION is single: the CAS loser discards its
+            // own instance and adopts the winner's, so every caller observes the same executor. Never
+            // null: the fail-closed default is UnsupportedQueryExecutor.
             IQueryExecutor? existing = Volatile.Read(ref _queryExecutor);
             if (existing is not null)
             {

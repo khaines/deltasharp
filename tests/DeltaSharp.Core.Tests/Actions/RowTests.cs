@@ -275,4 +275,45 @@ public sealed class RowTests
         var set = new HashSet<Row> { SampleRow(), SampleRow(), new Row(Schema(), "Bob", 25, false) };
         Assert.Equal(2, set.Count);
     }
+
+    [Fact]
+    public void GetHashCode_DistinctValueRows_ProduceDistinctHashCodes()
+    {
+        var schema = new StructType(new[]
+        {
+            new StructField("name", DataTypes.StringType),
+            new StructField("age", DataTypes.IntegerType),
+        });
+
+        // A constant/degenerate GetHashCode still de-dups via Equals in a HashSet, so this pins the hash
+        // itself: distinct-value rows must produce distinct hash codes (kills a constant-hash mutation).
+        int a = new Row(schema, "a", 1).GetHashCode();
+        int b = new Row(schema, "b", 2).GetHashCode();
+        Assert.NotEqual(a, b);
+    }
+
+    // ----- byte[] (BinaryType) content equality (#412 / Spark parity) -----
+
+    [Fact]
+    public void Equals_And_GetHashCode_CompareByteArraysByContent()
+    {
+        var schema = new StructType(new[] { new StructField("bin", DataTypes.BinaryType) });
+        var a = new Row(schema, new byte[] { 1, 2, 3 });
+        var b = new Row(schema, new byte[] { 1, 2, 3 });
+
+        // Spark compares binary by content (java.util.Arrays.equals), not by reference: equal-content
+        // byte[] rows are equal and hash equal even though the arrays are distinct instances.
+        Assert.NotSame(a[0], b[0]);
+        Assert.Equal(a, b);
+        Assert.Equal(a.GetHashCode(), b.GetHashCode());
+    }
+
+    [Fact]
+    public void Equals_DifferentByteArrayContent_IsNotEqual()
+    {
+        var schema = new StructType(new[] { new StructField("bin", DataTypes.BinaryType) });
+        var a = new Row(schema, new byte[] { 1, 2, 3 });
+        var b = new Row(schema, new byte[] { 1, 2, 4 });
+        Assert.NotEqual(a, b);
+    }
 }

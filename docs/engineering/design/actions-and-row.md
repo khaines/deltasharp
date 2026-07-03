@@ -85,10 +85,18 @@ frame's own `Plan` is never mutated, satisfying #173 AC3) so it can tell whether
 then renders:
 
 - A bordered box using `+`, `-`, `|` with per-column widths (minimum 3, Spark parity).
-- The **header** from the **analyzed plan's output schema** (not `collected[0].Schema`), so an **empty**
-  result still renders real column headers (Spark parity) instead of a degenerate `++`/`++` box. The
-  schema is captured from the *same* analyze pass the execution uses (`Analyzer.Resolve(plan, out
-  schema)`), so deriving it costs no extra `Analyzer` audit stage.
+- The **header** from the **analyzed plan's ordered output columns** (not `collected[0].Schema`), so an
+  **empty** result still renders real column headers (Spark parity) instead of a degenerate `++`/`++`
+  box. The columns are captured from the *same* analyze pass the execution uses (`Analyzer.Resolve(plan,
+  out output)`), so deriving them costs no extra `Analyzer` audit stage. The column list is a
+  **duplicate-name-tolerant** `(name, type, nullable)` list, **not** a dup-rejecting `StructType`, so a
+  plan whose output has repeated names — `df.Join(other)` (shared non-coalesced column) or
+  `df.Select(Col("name"), Col("name"))` — renders **duplicate headers** the way Spark's `show()` does,
+  and `Show` stays reachable exactly where `Collect`/`Count` already were. (Before this fix `Show`
+  derived its header through the `StructType` constructor, which threw `SchemaValidationException` on
+  duplicate names while `Collect`/`Count` on the same plan succeeded.) The deeper policy for real `Row`
+  materialization of duplicate-name outputs (`StructType`/`Row` forbid dups vs Spark) is tracked by
+  [#419](https://github.com/khaines/deltasharp/issues/419).
 - Cells rendered by `Row.Render`: `null` → `null`, booleans lower-cased, numeric/temporal values via
   `IFormattable.ToString(null, CultureInfo.InvariantCulture)` so output is locale-independent and
   deterministic.
@@ -199,9 +207,11 @@ internal static void RegisterQueryExecutorFactory(Func<SparkSession, IQueryExecu
 - `QueryExecutor` is created lazily from the registered **factory**, defaulting to
   `UnsupportedQueryExecutor` when no factory is registered. The lazy publish is **atomic**
   (`Interlocked.CompareExchange` on a `Volatile`-read field): `SparkSession` is explicitly
-  multi-threaded, and a #174 factory may be stateful, so the getter never double-invokes the factory or
-  hands two threads two different executors. The per-session **setter** lets a test (or a caller)
-  install a double for one session.
+  multi-threaded, and a #174 factory may be stateful, so the getter **publishes exactly one executor**
+  (a losing racer's instance is discarded) rather than handing two threads two different executors.
+  Only *publication* is single — under a concurrent first-access race the factory may still be invoked
+  more than once (each racer builds a candidate; the CAS loser drops its instance). The per-session
+  **setter** lets a test (or a caller) install a double for one session.
 - `RegisterQueryExecutorFactory` is the **process-wide** wiring point the executor lane (#174) calls
   once at startup so every subsequently-resolved session gets the real backend — without inverting
   Core ⟂ Engine independence. The backing static is `volatile`. It is a process-global, so **register
@@ -224,11 +234,12 @@ executable. Single-source transformations (`Select`/`Filter`/`Where`/`WithColumn
 **`Limit`**/**`Distinct`**) pass `Session`; the binary ones pass `Session ?? other.Session` (for
 `Union`, whose parameter is `other`) or `Session ?? right.Session` (for `Join`/`CrossJoin`);
 `GroupBy`/`Agg` thread it through `RelationalGroupedDataset`. A table-driven guard test
-(`EveryTransformation_ThreadsTheSameNonNullSession_AndStaysExecutable`) applies every transformation to
-a bound frame and asserts each result keeps the same non-null session and stays executable, so a
-future transformation that drops the session (as `Limit`/`Distinct` once did, #412) reddens. A
-session-free frame (constructed directly in tests without a session) throws a deterministic
-`InvalidOperationException` from an action.
+(`EveryTransformation_ThreadsTheSameNonNullSession_AndStaysExecutable`) applies every frame-returning
+transformation to a bound frame — including the `GroupBy(...).Count()`/`GroupBy(...).Agg(...)` paths that
+route through `RelationalGroupedDataset` — and asserts each result keeps the same non-null session and
+stays executable, so a future transformation that drops the session (as `Limit`/`Distinct` once did,
+#412) reddens. A session-free frame (constructed directly in tests without a session) throws a
+deterministic `InvalidOperationException` from an action.
 
 ### The default-unsupported backend
 
@@ -288,12 +299,18 @@ public override int GetHashCode()        // consistent with Equals (schema + ord
 public override string ToString()        // Spark: Row.toString => "[a,null,c]"
 ```
 
-**Value equality (Spark parity).** `Row` overrides `Equals`/`GetHashCode` for **structural value
-equality**: two rows are equal iff their `Schema`s are equal (`StructType` value equality) and every
-value is equal in ordinal order (null-aware — two SQL `NULL`s at the same ordinal are equal). This is
-the first thing a Spark user does after `collect()`: `Assert.Equal(expectedRow, actualRow)`,
-`Contains`, `Distinct`, and `HashSet<Row>` de-duplication all work as expected. `Render` (used by
-`ToString`/`Show`) has an `IFormattable`-first switch with a `_ => value.ToString() ?? "null"`
+**Value equality (schema-inclusive; stricter than Spark).** `Row` overrides `Equals`/`GetHashCode` for
+**structural value equality**: two rows are equal iff their `Schema`s are equal (`StructType` value
+equality) and every value is equal in ordinal order (null-aware — two SQL `NULL`s at the same ordinal
+are equal). This is an **intentional, stricter-than-Spark** choice: Spark's `Row.equals` is
+**values-only** (length + values, ignoring the schema), whereas DeltaSharp's `Row` is a strictly
+schema-carrying value that also compares its `Schema`. Equality is the first thing a Spark user does
+after `collect()`: `Assert.Equal(expectedRow, actualRow)`, `Contains`, `Distinct`, and `HashSet<Row>`
+de-duplication all work as expected. `BinaryType` (`byte[]`) cells compare by **content** (Spark parity
+for binary — `java.util.Arrays.equals`), with a content-based hash (`HashCode.AddBytes`) kept consistent
+with `Equals`; **M1 handles scalars + `byte[]`**, and deeper deep-equality for nested types
+(arrays/maps/structs) is deferred to [#418](https://github.com/khaines/deltasharp/issues/418). `Render`
+(used by `ToString`/`Show`) has an `IFormattable`-first switch with a `_ => value.ToString() ?? "null"`
 catch-all so any CLR value renders deterministically.
 
 ### Type and null semantics (ADR-0008)
@@ -324,6 +341,8 @@ catch-all so any CLR value renders deterministically.
 | --- | --- |
 | schema- and value-equal rows compare equal + hash equal | `Equals_And_GetHashCode_AreValueBased`, `Equals_NullAwareAcrossOrdinals` |
 | differing value / nullness / schema compare unequal | `Equals_DifferentValue_IsNotEqual`, `Equals_DifferentNullness_IsNotEqual`, `Equals_DifferentSchema_IsNotEqual` |
+| distinct-value rows hash distinctly (pins `GetHashCode` against a constant-hash mutation) | `GetHashCode_DistinctValueRows_ProduceDistinctHashCodes` |
+| `byte[]` (`BinaryType`) cells compare + hash by **content** (Spark parity), not by reference | `Equals_And_GetHashCode_CompareByteArraysByContent`, `Equals_DifferentByteArrayContent_IsNotEqual` |
 | `Assert.Equal(new[]{row}, collected)` and `HashSet<Row>` de-dup | `Equals_AgainstCollectedArray_Works`, `HashSet_DedupsValueEqualRows` |
 
 ### The #174 materialization seam
@@ -345,7 +364,7 @@ Tests live in `tests/DeltaSharp.Core.Tests/Actions/` (`DataFrameActionTests`, `R
 | --- | --- |
 | AC1 — `Collect` invokes analyzer + planner/backend exactly once (the optimizer is an intentional identity pass in M1, not an audited stage) | `Collect_ReturnsExecutorRows_AndInvokesBackendOnce`, `Collect_PassesAnAnalyzedPlanToTheExecutor`, `Collect_RecordsExactlyOneAnalyzerStage_AndTheFullBackendPath` |
 | AC2 — `Count` matches Spark semantics | `Count_ReturnsExecutorCount_WithoutMaterializing`, `Count_RecordsExactlyOneAnalyzerStagePerAction` |
-| AC3 — `Show` respects row limits/truncation without changing the plan; empty result still renders headers | `ShowString_RendersSparkStyleTable_WithTruncationFooter`, `ShowString_NoFooter_WhenResultFitsWithinNumRows`, `ShowString_TruncateFalse_LeftJustifiesAndKeepsFullValue`, `ShowString_Truncate_CutsLongCellsWithEllipsis`, `ShowString_NegativeNumRows_Throws`, `Show_DoesNotChangeTheUnderlyingPlan`, `ShowString_OnEmptyResult_StillRendersColumnHeaders` |
+| AC3 — `Show` respects row limits/truncation without changing the plan; empty result still renders headers; duplicate output-column names render (Spark parity) where `Collect`/`Count` already succeed (#419) | `ShowString_RendersSparkStyleTable_WithTruncationFooter`, `ShowString_NoFooter_WhenResultFitsWithinNumRows`, `ShowString_TruncateFalse_LeftJustifiesAndKeepsFullValue`, `ShowString_Truncate_CutsLongCellsWithEllipsis`, `ShowString_NegativeNumRows_Throws`, `Show_DoesNotChangeTheUnderlyingPlan`, `ShowString_OnEmptyResult_StillRendersColumnHeaders`, `ShowString_RendersDuplicateOutputColumnNames_WhereCollectAndCountSucceed` |
 | AC4 — no action steps occur for a transformation chain | `TransformationChain_TriggersNoExecution` |
 | (seam) default-unsupported backend + injection | `Collect_WithNoBackendRegistered_ThrowsClearDiagnostic`, `Count_WithNoBackendRegistered_ThrowsClearDiagnostic`, `Action_OnSessionFreeFrame_ThrowsInvalidOperation`, `RegisterQueryExecutorFactory_InstallsBackendForNewSessions` |
 | (#412) transformations thread the session; actions reject a stopped session | `Limit_ThreadsSession_SoAFollowingActionRuns`, `Distinct_ThreadsSession_SoCountRuns`, `SelectThenLimit_ThreadsSession_SoShowRuns`, `EveryTransformation_ThreadsTheSameNonNullSession_AndStaysExecutable`, `Collect_OnStoppedSession_ThrowsSessionStopped` |
@@ -374,5 +393,10 @@ shaped so each lands without reshaping the action pipeline:
 - **[#417](https://github.com/khaines/deltasharp/issues/417)** — `DataFrame` analyzed-plan memoization
   (each action re-analyzes from scratch today).
 - **[#418](https://github.com/khaines/deltasharp/issues/418)** — the `Row`/`Show` Spark-parity backlog:
-  typed getters (`getInt`/`getString`/…), `toSeq`/`mkString`, complex-type getters, a `Show`
-  truncate-width overload, and CJK display-width handling.
+  typed getters (`getInt`/`getString`/…), `toSeq`/`mkString`, complex-type getters, deep value
+  **equality for nested types** (arrays/maps/structs — M1 `Row.Equals`/`GetHashCode` handle scalars and
+  `byte[]` content only), a `Show` truncate-width overload, and CJK display-width handling.
+- **[#419](https://github.com/khaines/deltasharp/issues/419)** — the duplicate-output-column-name policy
+  for real `Row` materialization: `Show` **renders** duplicate headers in M1 (dup-name-tolerant column
+  list), but `StructType`/`Row` still **forbid** duplicate field names (unlike Spark), so materializing
+  a duplicate-name output into a `Row` is deferred.

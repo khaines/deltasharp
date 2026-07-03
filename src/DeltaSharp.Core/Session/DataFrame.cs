@@ -633,17 +633,22 @@ public sealed class DataFrame
         SparkSession session = RequireSession(nameof(Show));
         long boundLong = (long)numRows + 1;
         int bound = boundLong > int.MaxValue ? int.MaxValue : (int)boundLong;
-        LogicalPlan analyzed = AnalyzeForExecution(session, new Limit(bound, Plan), out StructType schema);
+        LogicalPlan analyzed = AnalyzeForExecution(
+            session,
+            new Limit(bound, Plan),
+            out IReadOnlyList<(string Name, DataType Type, bool Nullable)> outputColumns);
         IReadOnlyList<Row> collected = session.QueryExecutor.Collect(analyzed);
 
         bool hasMoreData = collected.Count > numRows;
         int displayCount = Math.Min(collected.Count, numRows);
 
-        // The header is derived from the analyzed plan's output schema (not collected[0].Schema) so an
-        // EMPTY result still renders real column headers (Spark parity), instead of a degenerate ++/++
-        // box. Every returned row shares this analyzed output schema (the IQueryExecutor.Collect
-        // contract), so the header stays correct whether the result is empty or not.
-        return FormatTable(schema, collected, displayCount, numRows, truncateWidth, hasMoreData);
+        // The header is derived from the analyzed plan's ordered output columns (not collected[0].Schema)
+        // so an EMPTY result still renders real column headers (Spark parity) instead of a degenerate
+        // ++/++ box. The column list is duplicate-name tolerant (unlike a StructType), so a plan whose
+        // output has repeated names — df.Join(other) or Select(Col("x"), Col("x")) — renders duplicate
+        // headers the way Spark's show() does, and stays reachable where Collect/Count already were. The
+        // dup-rejecting StructType/Row materialization policy is tracked by #419.
+        return FormatTable(outputColumns, collected, displayCount, numRows, truncateWidth, hasMoreData);
     }
 
     /// <summary>The Spark-default column truncation width applied when <c>truncate</c> is true.</summary>
@@ -678,14 +683,17 @@ public sealed class DataFrame
     /// <summary>
     /// The analyze + optimize stage for <see cref="Show(int, bool)"/>: like
     /// <see cref="AnalyzeForExecution(SparkSession, LogicalPlan)"/> but also captures the analyzed
-    /// plan's <paramref name="outputSchema"/> from the <b>single</b> Resolve call (so deriving it emits
-    /// no extra Analyzer audit stage), which the header is rendered from — even when the result is
-    /// empty. Optimize is an intentional identity pass in M1 (see <see cref="Optimize"/>), so the
-    /// analyzed output schema is also the optimized plan's output schema.
+    /// plan's ordered <paramref name="outputColumns"/> from the <b>single</b> Resolve call (so deriving
+    /// them emits no extra Analyzer audit stage), which the header is rendered from — even when the
+    /// result is empty or the output has duplicate column names (#419). Optimize is an intentional
+    /// identity pass in M1 (see <see cref="Optimize"/>), so the analyzed output columns are also the
+    /// optimized plan's output columns.
     /// </summary>
     private static LogicalPlan AnalyzeForExecution(
-        SparkSession session, LogicalPlan plan, out StructType outputSchema) =>
-        Optimize(new Analyzer(session.Catalog).Resolve(plan, out outputSchema));
+        SparkSession session,
+        LogicalPlan plan,
+        out IReadOnlyList<(string Name, DataType Type, bool Nullable)> outputColumns) =>
+        Optimize(new Analyzer(session.Catalog).Resolve(plan, out outputColumns));
 
     /// <summary>
     /// The optimizer seam. The standalone rule-based <c>Optimizer</c> (STORY-04.5.3 / #172) is already
@@ -701,19 +709,21 @@ public sealed class DataFrame
 
     /// <summary>
     /// Renders <paramref name="rows"/> (up to <paramref name="displayCount"/>) as a Spark-style
-    /// bordered table with a header derived from <paramref name="schema"/>. Cells are right-justified
-    /// when truncating (Spark parity), null is shown as <c>null</c>, and a footer is appended when
+    /// bordered table with a header derived from <paramref name="columns"/>. The column list is
+    /// duplicate-name tolerant (Spark renders duplicate headers; the dup-rejecting <c>StructType</c>/
+    /// <c>Row</c> materialization policy is tracked by #419). Cells are right-justified when truncating
+    /// (Spark parity), null is shown as <c>null</c>, and a footer is appended when
     /// <paramref name="hasMoreData"/> is set.
     /// </summary>
     private static string FormatTable(
-        StructType schema,
+        IReadOnlyList<(string Name, DataType Type, bool Nullable)> columns,
         IReadOnlyList<Row> rows,
         int displayCount,
         int numRows,
         int truncateWidth,
         bool hasMoreData)
     {
-        int numCols = schema.Count;
+        int numCols = columns.Count;
         if (numCols == 0)
         {
             // An empty schema (no columns) still renders a stable, closed box.
@@ -730,7 +740,7 @@ public sealed class DataFrame
         var header = new string[numCols];
         for (int c = 0; c < numCols; c++)
         {
-            header[c] = schema[c].Name;
+            header[c] = columns[c].Name;
         }
 
         cells.Add(header);
