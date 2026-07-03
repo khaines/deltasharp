@@ -50,6 +50,32 @@ internal abstract class Expression : TreeNode<Expression>
     public virtual bool Nullable => true;
 
     /// <summary>
+    /// Whether evaluating this expression yields the same result for the same input row every time
+    /// (Catalyst <c>Expression.deterministic</c>). An expression is deterministic exactly when it
+    /// and all of its children are; a <b>non-deterministic</b> node (a future <c>rand</c>/<c>uuid</c>/
+    /// <c>current_row_timestamp</c>, tracked under #413) <b>must override this to
+    /// <see langword="false"/></b> so optimizer rules never duplicate, reorder, or push it in a way
+    /// that changes how often it is evaluated. Every expression the M1 IR models is deterministic, so
+    /// the guard is inert today; it exists so <c>CombineFilters</c> and
+    /// <c>PushPredicateThroughProject</c> stay correct the moment such nodes land.
+    /// </summary>
+    public virtual bool Deterministic
+    {
+        get
+        {
+            foreach (Expression child in Children)
+            {
+                if (!child.Deterministic)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+    }
+
+    /// <summary>
     /// Whether this expression and all of its children are resolved. Defaults to "all children
     /// resolved"; the unresolved markers override it to <see langword="false"/>. The analyzer
     /// (FEAT-04.5) — never construction — is what makes an expression resolved.
