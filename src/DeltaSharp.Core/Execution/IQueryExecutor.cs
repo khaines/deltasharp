@@ -46,11 +46,15 @@ internal interface IQueryExecutor
     /// </summary>
     /// <param name="analyzedPlan">The analyzer-resolved logical plan to execute.</param>
     /// <param name="options">
-    /// The execution-time controls (cancellation, timeout, result/memory bounds) and the metrics sink
-    /// the executor fills before it returns or throws (STORY-04.6.4 / #176; discharges #416).
+    /// The execution-time controls (cancellation, timeout, result/memory bounds). It carries no mutable
+    /// per-run state (STORY-04.6.4 / #176; discharges #416).
+    /// </param>
+    /// <param name="metricsSink">
+    /// An optional per-action sink the executor fills with the run's <see cref="ExecutionMetrics"/> before
+    /// it returns or throws, so the counters are retrievable on both the success and failure paths.
     /// </param>
     /// <returns>The materialized rows, in result order; every row carries the analyzed plan's output schema.</returns>
-    IReadOnlyList<Row> Collect(LogicalPlan analyzedPlan, ExecutionOptions options);
+    IReadOnlyList<Row> Collect(LogicalPlan analyzedPlan, ExecutionOptions options, ExecutionMetricsSink? metricsSink = null);
 
     /// <summary>
     /// Executes <paramref name="analyzedPlan"/> and returns the number of result rows (Spark's
@@ -58,11 +62,15 @@ internal interface IQueryExecutor
     /// </summary>
     /// <param name="analyzedPlan">The analyzer-resolved logical plan to execute.</param>
     /// <param name="options">
-    /// The execution-time controls (cancellation, timeout, memory bound) and the metrics sink the
-    /// executor fills before it returns or throws (STORY-04.6.4 / #176; discharges #416).
+    /// The execution-time controls (cancellation, timeout, memory bound). It carries no mutable per-run
+    /// state (STORY-04.6.4 / #176; discharges #416).
+    /// </param>
+    /// <param name="metricsSink">
+    /// An optional per-action sink the executor fills with the run's <see cref="ExecutionMetrics"/> before
+    /// it returns or throws, so the counters are retrievable on both the success and failure paths.
     /// </param>
     /// <returns>The row count.</returns>
-    long Count(LogicalPlan analyzedPlan, ExecutionOptions options);
+    long Count(LogicalPlan analyzedPlan, ExecutionOptions options, ExecutionMetricsSink? metricsSink = null);
 
     /// <summary>
     /// Renders the physical plan of <paramref name="analyzedPlan"/> as a multi-line tree string for

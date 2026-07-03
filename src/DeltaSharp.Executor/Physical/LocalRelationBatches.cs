@@ -14,7 +14,10 @@ namespace DeltaSharp.Executor;
 /// writes it onto the typed <see cref="MutableColumnVector"/> lane for the column's ADR-0008
 /// <see cref="DataType"/> (null-aware). Any row whose shape or a value's CLR type does not match the
 /// schema — or a value that cannot be encoded (overflow, unrepresentable date/timestamp/decimal) —
-/// raises the deterministic <see cref="UnsupportedPlanException"/> rather than a raw failure.
+/// raises the deterministic <see cref="UnsupportedPlanException"/> attributed to
+/// <see cref="QueryExecutionStage.Scan"/> (this deferred row→batch encode runs inside
+/// <c>ScanPlan.Execute</c> — a scan/data-in failure, not a planning one, now that #158 is merged)
+/// rather than a raw failure.
 /// </summary>
 internal static class LocalRelationBatches
 {
@@ -37,12 +40,14 @@ internal static class LocalRelationBatches
             if (row is null)
             {
                 throw new UnsupportedPlanException(
+                    QueryExecutionStage.Scan,
                     "A LocalRelation row is null; every row supplied to CreateDataFrame must be a Row.");
             }
 
             if (row.Length != schema.Count)
             {
                 throw new UnsupportedPlanException(
+                    QueryExecutionStage.Scan,
                     $"A LocalRelation row has {row.Length} value(s) but the schema declares "
                     + $"{schema.Count} column(s); every row must match the schema arity.");
             }
@@ -131,6 +136,7 @@ internal static class LocalRelationBatches
 
             default:
                 throw new UnsupportedPlanException(
+                    QueryExecutionStage.Scan,
                     $"CreateDataFrame has no CLR encoding for column '{field.Name}' of type "
                     + $"'{field.DataType.SimpleString}'.");
         }
@@ -150,6 +156,7 @@ internal static class LocalRelationBatches
         }
 
         throw new UnsupportedPlanException(
+            QueryExecutionStage.Scan,
             $"Column '{field.Name}' is '{field.DataType.SimpleString}', which expects a "
             + $"{typeof(T).Name} value, but a row supplied a {value.GetType().Name}.");
     }
@@ -181,6 +188,7 @@ internal static class LocalRelationBatches
         if (type.Scale > MaxDecimalScale)
         {
             throw new UnsupportedPlanException(
+                QueryExecutionStage.Scan,
                 $"Column '{field.Name}' is '{type.SimpleString}': scale {type.Scale.ToString(CultureInfo.InvariantCulture)} exceeds the "
                 + $"System.Decimal maximum of {MaxDecimalScale.ToString(CultureInfo.InvariantCulture)}, so a decimal value cannot be encoded.");
         }
@@ -198,6 +206,7 @@ internal static class LocalRelationBatches
         if (scaled != decimal.Truncate(scaled))
         {
             throw new UnsupportedPlanException(
+                QueryExecutionStage.Scan,
                 $"Decimal value {Invariant(value)} for column '{field.Name}' cannot be represented at scale "
                 + $"{type.Scale.ToString(CultureInfo.InvariantCulture)} without loss of precision.");
         }
@@ -216,6 +225,7 @@ internal static class LocalRelationBatches
         if (magnitude >= Pow10Int128(type.Precision))
         {
             throw new UnsupportedPlanException(
+                QueryExecutionStage.Scan,
                 $"Decimal value {Invariant(value)} for column '{field.Name}' does not fit in precision "
                 + $"{type.Precision.ToString(CultureInfo.InvariantCulture)} (type '{type.SimpleString}').");
         }
@@ -232,7 +242,8 @@ internal static class LocalRelationBatches
 
     private static UnsupportedPlanException DecimalOutOfRange(
         StructField field, DecimalType type, decimal value) =>
-        new($"Decimal value {Invariant(value)} for column '{field.Name}' is out of range for type "
+        new(QueryExecutionStage.Scan,
+            $"Decimal value {Invariant(value)} for column '{field.Name}' is out of range for type "
             + $"'{type.SimpleString}'.");
 
     private static string Invariant(decimal value) => value.ToString(CultureInfo.InvariantCulture);

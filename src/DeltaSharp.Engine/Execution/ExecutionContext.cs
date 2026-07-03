@@ -59,7 +59,20 @@ public sealed class ExecutionContext : IDisposable
     /// <summary>
     /// Disposes the run's <see cref="SpillStore"/> when it holds disposable resources (a
     /// <see cref="TempFileSpillStore"/> deletes its temp files; an in-memory store has nothing to
-    /// release). Idempotent and safe to call on a context that never spilled. STORY-04.6.4 / #420.
+    /// release). Idempotent (a <c>_disposed</c> guard makes a second call a genuine no-op, so the store
+    /// is disposed at most once even under repeated/concurrent disposal) and safe to call on a context
+    /// that never spilled. STORY-04.6.4 / #420.
     /// </summary>
-    public void Dispose() => (SpillStore as IDisposable)?.Dispose();
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        (SpillStore as IDisposable)?.Dispose();
+    }
+
+    private bool _disposed;
 }

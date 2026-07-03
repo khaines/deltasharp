@@ -69,7 +69,7 @@ internal static class RowMaterializer
                 var values = new object?[columnCount];
                 for (int c = 0; c < columnCount; c++)
                 {
-                    values[c] = columns[c].IsNull(r) ? null : ReadValue(columns[c], schema[c].DataType, r);
+                    values[c] = columns[c].IsNull(r) ? null : ReadValue(columns[c], schema[c], r);
                 }
 
                 rows.Add(new Row(schema, values));
@@ -83,47 +83,59 @@ internal static class RowMaterializer
 
     /// <summary>Sums the logical row counts across the result's batches without materializing values.</summary>
     /// <param name="result">The executed schema + batches.</param>
+    /// <param name="cancellationToken">The effective cancellation token, polled per batch so a
+    /// cancel/timeout stops a long count promptly (criterion 1).</param>
     /// <returns>The total logical row count.</returns>
-    public static long CountRows(BatchResult result)
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public static long CountRows(BatchResult result, CancellationToken cancellationToken = default)
     {
         long count = 0;
         foreach (ColumnBatch batch in result.Batches)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             count += batch.LogicalRowCount;
         }
 
         return count;
     }
 
-    private static object ReadValue(ColumnVector column, DataType type, int index) => type switch
+    private static object ReadValue(ColumnVector column, StructField field, int index)
     {
-        BooleanType => column.GetValue<bool>(index),
+        DataType type = field.DataType;
+        return type switch
+        {
+            BooleanType => column.GetValue<bool>(index),
 
-        // Spark ByteType is a signed tinyint; the Engine stores it as an unsigned byte lane.
-        ByteType => unchecked((sbyte)column.GetValue<byte>(index)),
-        ShortType => column.GetValue<short>(index),
-        IntegerType => column.GetValue<int>(index),
-        LongType => column.GetValue<long>(index),
-        FloatType => column.GetValue<float>(index),
-        DoubleType => column.GetValue<double>(index),
-        DecimalType decimalType => ReadDecimal(column, decimalType, index),
-        DateType => ReadDate(column, index),
-        TimestampType => ReadTimestamp(column, index),
-        StringType => Encoding.UTF8.GetString(column.GetBytes(index)),
-        BinaryType => column.GetBytes(index).ToArray(),
-        _ => throw new UnsupportedPlanException(
-            QueryExecutionStage.Materialize,
-            $"Row materialization has no CLR mapping for type '{type.SimpleString}'."),
-    };
+            // Spark ByteType is a signed tinyint; the Engine stores it as an unsigned byte lane.
+            ByteType => unchecked((sbyte)column.GetValue<byte>(index)),
+            ShortType => column.GetValue<short>(index),
+            IntegerType => column.GetValue<int>(index),
+            LongType => column.GetValue<long>(index),
+            FloatType => column.GetValue<float>(index),
+            DoubleType => column.GetValue<double>(index),
+            DecimalType decimalType => ReadDecimal(column, decimalType, index),
+            DateType => ReadDate(column, field, index),
+            TimestampType => ReadTimestamp(column, field, index),
+            StringType => Encoding.UTF8.GetString(column.GetBytes(index)),
+            BinaryType => column.GetBytes(index).ToArray(),
+            _ => throw new UnsupportedPlanException(
+                QueryExecutionStage.Materialize,
+                $"Row materialization has no CLR mapping for type '{type.SimpleString}'."),
+        };
+    }
 
     // The driver polls the effective cancellation token every 1024 materialized rows (a power-of-two
     // mask keeps the check branch-cheap) so a cancel/timeout stops a large single-batch result promptly.
     private const int CancellationPollMask = 1023;
 
-    // A best-effort estimate of the bytes materializing this batch would hold, mirroring the Engine
-    // scan's EstimateBatchBytes (fixed-width: rows × width; variable-width: sum of non-null value
-    // lengths), read through the already-resolved selected columns. It is the byte proxy the result
-    // byte-bound (criterion 3) is enforced against; the exact figure is not required for a safety bound.
+    // A best-effort estimate of the driver bytes materializing this batch would hold. It sums the columnar
+    // value bytes (fixed-width: rows × width; variable-width: sum of non-null value lengths, mirroring the
+    // Engine scan's EstimateBatchBytes) PLUS a conservative per-row/per-value CLR object-overhead term:
+    // Materialize builds a List<Row> of BOXED CLR values (each value a heap object with a header, each Row
+    // an object plus an object?[] array), which the coarse columnar figure alone under-counts by roughly an
+    // order of magnitude. This is NOT an exact driver-heap figure (see MaxResultBytes doc / #176 #9) — it
+    // is a deliberately pessimistic safety proxy the result byte-bound (criterion 3) is enforced against so
+    // the cap trips before, not after, an over-optimistic estimate would have let the heap balloon.
     private static long EstimateBatchBytes(ColumnVector[] columns, StructType schema, int rowCount)
     {
         long bytes = 0;
@@ -147,8 +159,19 @@ internal static class RowMaterializer
             }
         }
 
+        // Add the boxed-value / Row-object overhead the columnar figure omits (per value: a boxed heap
+        // object + its object?[] slot; per row: the Row object + its array). Conservative on a 64-bit CLR.
+        bytes += (long)rowCount * columns.Length * PerValueObjectOverheadBytes;
+        bytes += (long)rowCount * PerRowObjectOverheadBytes;
         return bytes;
     }
+
+    // Conservative 64-bit CLR overhead for a boxed value (object header + padding + the enclosing
+    // object?[] reference slot) and for a materialized Row (the Row object + its object?[] array header).
+    // These make the byte estimate pessimistic rather than wildly optimistic (#176 #9); they are a safety
+    // proxy, not an exact driver-heap measurement.
+    private const long PerValueObjectOverheadBytes = 32;
+    private const long PerRowObjectOverheadBytes = 48;
 
     private static int FixedWidthBytes(DataType type) => type switch
     {
@@ -166,7 +189,7 @@ internal static class RowMaterializer
     // An epoch-day whose date falls outside DateOnly's representable range (0001-01-01..9999-12-31) is a
     // deterministic UnsupportedPlanException (mirrors the timestamp/decimal paths) rather than a raw
     // ArgumentOutOfRangeException leaked from DateOnly.AddDays.
-    private static DateOnly ReadDate(ColumnVector column, int index)
+    private static DateOnly ReadDate(ColumnVector column, StructField field, int index)
     {
         int epochDay = column.GetValue<int>(index);
         try
@@ -175,14 +198,17 @@ internal static class RowMaterializer
         }
         catch (ArgumentOutOfRangeException)
         {
-            throw OutOfRangeDate(epochDay);
+            throw OutOfRangeDate(field);
         }
     }
 
-    private static UnsupportedPlanException OutOfRangeDate(int epochDay) =>
+    // The out-of-range message names the offending column and type but deliberately does NOT embed the raw
+    // cell value (the epoch-day), which would leak row-level data into logs/diagnostics (#176 #8).
+    private static UnsupportedPlanException OutOfRangeDate(StructField field) =>
         new(QueryExecutionStage.Materialize,
-            $"Row materialization cannot surface the date epoch-day value {epochDay} as "
-            + "System.DateOnly: the date falls outside the representable DateOnly range.");
+            $"Row materialization cannot surface column '{field.Name}' of type "
+            + $"'{field.DataType.SimpleString}' as System.DateOnly: the date falls outside the "
+            + "representable DateOnly range.");
 
     // A TimestampType lane stores the Spark epoch-microsecond instant as a long; surface it as a UTC
     // DateTime — the inverse of lit(DateTime)/lit(DateTimeOffset), which normalize to epoch-micros —
@@ -190,7 +216,7 @@ internal static class RowMaterializer
     // A micros value whose ticks overflow long, or whose instant falls outside DateTime's range, is a
     // deterministic UnsupportedPlanException (mirrors the decimal path) rather than a raw
     // ArgumentOutOfRangeException or a silent mis-decode.
-    private static DateTime ReadTimestamp(ColumnVector column, int index)
+    private static DateTime ReadTimestamp(ColumnVector column, StructField field, int index)
     {
         long micros = column.GetValue<long>(index);
         long ticks;
@@ -201,21 +227,24 @@ internal static class RowMaterializer
         }
         catch (OverflowException)
         {
-            throw OutOfRangeTimestamp(micros);
+            throw OutOfRangeTimestamp(field);
         }
 
         if (ticks < DateTime.MinValue.Ticks || ticks > DateTime.MaxValue.Ticks)
         {
-            throw OutOfRangeTimestamp(micros);
+            throw OutOfRangeTimestamp(field);
         }
 
         return new DateTime(ticks, DateTimeKind.Utc);
     }
 
-    private static UnsupportedPlanException OutOfRangeTimestamp(long micros) =>
+    // Names the offending column and type but deliberately does NOT embed the raw epoch-microsecond cell
+    // value, which would leak row-level data into logs/diagnostics (#176 #8).
+    private static UnsupportedPlanException OutOfRangeTimestamp(StructField field) =>
         new(QueryExecutionStage.Materialize,
-            $"Row materialization cannot surface the timestamp epoch-microsecond value {micros} as "
-            + "System.DateTime: the instant falls outside the representable DateTime range.");
+            $"Row materialization cannot surface column '{field.Name}' of type "
+            + $"'{field.DataType.SimpleString}' as System.DateTime: the instant falls outside the "
+            + "representable DateTime range.");
 
     private static readonly DateOnly UnixEpochDate = new(1970, 1, 1);
 

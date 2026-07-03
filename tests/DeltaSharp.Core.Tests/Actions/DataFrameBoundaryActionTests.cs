@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using DeltaSharp.Plans.Logical;
 using DeltaSharp.Types;
 using Xunit;
@@ -161,6 +162,24 @@ public sealed class DataFrameBoundaryActionTests
 
             Assert.Throws<ArgumentException>(() => df.Collect());
             Assert.Equal(0, executor.CollectCallCount);
+        }
+    }
+
+    [Fact]
+    public void Collect_WithTimeoutAboveCancelAfterCeiling_ClampsInsteadOfThrowing()
+    {
+        var executor = new FakeQueryExecutor(Array.Empty<Row>());
+        (SparkSession spark, DataFrame df) = NewBoundFrame(executor);
+        using (spark)
+        {
+            // A timeout far above CancellationTokenSource.CancelAfter's ~49.7-day ceiling must NOT surface a
+            // raw ArgumentOutOfRangeException outside the driver; it is clamped to the max supported (#176 #7).
+            spark.Conf.Set("spark.deltasharp.execution.timeoutMs", long.MaxValue.ToString(CultureInfo.InvariantCulture));
+
+            _ = df.Collect();
+
+            Assert.NotNull(executor.LastOptions);
+            Assert.Equal(TimeSpan.FromMilliseconds(uint.MaxValue - 1), executor.LastOptions!.Timeout);
         }
     }
 }

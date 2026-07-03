@@ -20,10 +20,10 @@ internal sealed class UnsupportedQueryExecutor : IQueryExecutor
     }
 
     /// <inheritdoc/>
-    public IReadOnlyList<Row> Collect(LogicalPlan analyzedPlan, ExecutionOptions options) => throw NotRegistered();
+    public IReadOnlyList<Row> Collect(LogicalPlan analyzedPlan, ExecutionOptions options, ExecutionMetricsSink? metricsSink = null) => throw NotRegistered();
 
     /// <inheritdoc/>
-    public long Count(LogicalPlan analyzedPlan, ExecutionOptions options) => throw NotRegistered();
+    public long Count(LogicalPlan analyzedPlan, ExecutionOptions options, ExecutionMetricsSink? metricsSink = null) => throw NotRegistered();
 
     /// <inheritdoc/>
     /// <remarks>

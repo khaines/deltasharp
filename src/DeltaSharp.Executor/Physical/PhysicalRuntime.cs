@@ -33,6 +33,7 @@ internal sealed class PhysicalRuntime : IDisposable
     private readonly CancellationToken _cancellationToken;
     private long _bytesScanned;
     private long _peakMemoryBytes;
+    private long _spilledBytes;
 
     /// <summary>Creates a runtime bound to a backend, its options, a token, and an optional memory budget.</summary>
     /// <param name="backend">The EPIC-03 execution backend chosen for this run.</param>
@@ -63,6 +64,9 @@ internal sealed class PhysicalRuntime : IDisposable
 
     /// <summary>The high-water reserved execution memory across every operator run (diagnostics).</summary>
     public long PeakMemoryBytes => _peakMemoryBytes;
+
+    /// <summary>The aggregate bytes spilled under memory pressure across every operator run (diagnostics).</summary>
+    public long SpilledBytes => _spilledBytes;
 
     /// <summary>
     /// Opens <paramref name="op"/> on the backend over the shared context and drains its
@@ -117,15 +121,36 @@ internal sealed class PhysicalRuntime : IDisposable
     }
 
     /// <summary>Disposes the run's shared <see cref="ExecutionContext"/> (spill store / memory ledger); idempotent.</summary>
-    public void Dispose() => _context.Dispose();
+    public void Dispose()
+    {
+        IsDisposed = true;
+        _context.Dispose();
+    }
 
-    // Folds this operator's (and its shallow children's) engine metrics into the run totals: BytesScanned
-    // sums across scan leaves; PeakMemoryBytes is a high-water max (operators run sequentially over the
-    // shared budget, releasing on dispose, so the max per-operator peak is the whole-run peak).
+    /// <summary>
+    /// Whether <see cref="Dispose"/> has run. A disposal-observability seam for STORY-04.6.4 tests that a
+    /// cancelled/failed action still releases the runtime (the test fails if the executor's disposal
+    /// <c>finally</c> is removed); the context's own <c>_disposed</c> guard keeps disposal idempotent.
+    /// </summary>
+    public bool IsDisposed { get; private set; }
+
+    // Folds this operator's (and its shallow children's) engine metrics into the run totals. BytesScanned
+    // is attributed only ONCE, at the true leaf source scan: every materialization boundary re-wraps its
+    // already-materialized child in an InMemoryScanOperator (ScanOf) whose InterpretedScanStream re-reports
+    // AddBytesScanned, so summing every scan would inflate BytesScanned ∝ plan depth (measured 2× for
+    // project(filter(scan)) — #176 review #3). Boundary re-scans are marked (BoundaryRescanSourceId) and
+    // excluded here; only the source-scan wrapper over the original leaf contributes. SpilledBytes sums
+    // across operators; PeakMemoryBytes is a high-water max (operators run sequentially over the shared
+    // budget, releasing on dispose, so the max per-operator peak is the whole-run peak).
     private void AccumulateMetrics(PhysicalOperator op)
     {
         OperatorMetricsSnapshot snapshot = op.Metrics.Snapshot();
-        _bytesScanned += snapshot.BytesScanned;
+        if (!IsBoundaryRescan(op))
+        {
+            _bytesScanned += snapshot.BytesScanned;
+        }
+
+        _spilledBytes += snapshot.SpilledBytes;
         if (snapshot.PeakMemoryBytes > _peakMemoryBytes)
         {
             _peakMemoryBytes = snapshot.PeakMemoryBytes;
@@ -137,9 +162,29 @@ internal sealed class PhysicalRuntime : IDisposable
         }
     }
 
+    // True when the operator is a boundary re-scan wrapper (an InMemoryScanOperator ScanOf built over an
+    // already-materialized intermediate result) rather than the true leaf source scan, so its estimated
+    // bytes must NOT be counted toward BytesScanned (see AccumulateMetrics).
+    private static bool IsBoundaryRescan(PhysicalOperator op) =>
+        op is InMemoryScanOperator scan && scan.SourceId == BoundaryRescanSourceId;
+
+    /// <summary>
+    /// The <see cref="InMemoryScanOperator.SourceId"/> sentinel marking a boundary re-scan wrapper — a
+    /// scan over an already-materialized intermediate result rather than the true leaf source. Its
+    /// estimated scanned bytes are excluded from <see cref="BytesScanned"/> so the metric is attributed
+    /// once at the source and not inflated ∝ plan depth (#176 review #3).
+    /// </summary>
+    internal const string BoundaryRescanSourceId = "boundary-rescan";
+
     /// <summary>Wraps a child result's batches in an EPIC-03 in-memory scan so an operator can open over them.</summary>
     /// <param name="child">The already-materialized child result.</param>
+    /// <param name="isSourceScan">
+    /// <see langword="true"/> when <paramref name="child"/> is the true leaf source scan (its estimated
+    /// bytes are the real data-plane read and count toward <see cref="BytesScanned"/>); <see langword="false"/>
+    /// when it re-scans an already-materialized intermediate result at a materialization boundary (its
+    /// bytes are excluded to avoid inflating <see cref="BytesScanned"/> ∝ plan depth — #176 review #3).
+    /// </param>
     /// <returns>A leaf <see cref="PhysicalOperator"/> streaming the child batches verbatim.</returns>
-    public static PhysicalOperator ScanOf(BatchResult child) =>
-        new InMemoryScanOperator(child.Schema, child.Batches);
+    public static PhysicalOperator ScanOf(BatchResult child, bool isSourceScan = false) =>
+        new InMemoryScanOperator(child.Schema, child.Batches, isSourceScan ? "memory" : BoundaryRescanSourceId);
 }

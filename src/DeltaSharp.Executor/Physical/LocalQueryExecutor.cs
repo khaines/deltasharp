@@ -19,6 +19,14 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
     private readonly IScanSource _scanSource;
     private readonly ExecutionBackendOptions _backendOptions;
 
+    /// <summary>
+    /// A test-only seam (STORY-04.6.4 disposal-observability) that builds the run's
+    /// <see cref="PhysicalRuntime"/>. Defaults to the real constructor; a test supplies a factory that
+    /// captures the created runtime so it can assert the executor disposed it on the cancel/timeout/fault
+    /// path (the assertion fails if the disposal <c>finally</c> below is removed). Never set in production.
+    /// </summary>
+    internal Func<IExecutionBackend, ExecutionBackendOptions, CancellationToken, long?, PhysicalRuntime>? RuntimeFactory { get; init; }
+
     /// <summary>Creates an executor bound to a session (backend chosen from the session's config).</summary>
     /// <param name="scanSource">The data-in seam resolving scans to in-memory batches.</param>
     /// <param name="session">The owning session; its execution-backend config selects the backend.</param>
@@ -73,13 +81,14 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
     }
 
     /// <inheritdoc />
-    public IReadOnlyList<Row> Collect(LogicalPlan analyzedPlan, ExecutionOptions options)
+    public IReadOnlyList<Row> Collect(LogicalPlan analyzedPlan, ExecutionOptions options, ExecutionMetricsSink? metricsSink = null)
     {
         ArgumentNullException.ThrowIfNull(analyzedPlan);
         ArgumentNullException.ThrowIfNull(options);
         return Execute(
             analyzedPlan,
             options,
+            metricsSink,
             static (result, opts, token) =>
             {
                 IReadOnlyList<Row> rows = RowMaterializer.Materialize(
@@ -89,27 +98,30 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
     }
 
     /// <inheritdoc />
-    public long Count(LogicalPlan analyzedPlan, ExecutionOptions options)
+    public long Count(LogicalPlan analyzedPlan, ExecutionOptions options, ExecutionMetricsSink? metricsSink = null)
     {
         ArgumentNullException.ThrowIfNull(analyzedPlan);
         ArgumentNullException.ThrowIfNull(options);
         return Execute(
             analyzedPlan,
             options,
+            metricsSink,
             static (result, opts, token) =>
             {
-                long count = RowMaterializer.CountRows(result);
+                long count = RowMaterializer.CountRows(result, token);
                 return (Rows: (IReadOnlyList<Row>?)null, OutputRows: count);
             }).OutputRows;
     }
 
     // The single stage-attributed driver shared by Collect/Count. It times planning and execution, drives
     // the plan under an effective token (user cancellation linked with any timeout), materializes via
-    // finalize within the configured result bounds, populates options.Metrics on both success and
-    // failure, and disposes the runtime on every path (success, cancel/timeout, fault).
+    // finalize within the configured result bounds, publishes the run's metrics into the per-call sink on
+    // both the success and failure paths (in a finally), and disposes the runtime on every path (success,
+    // cancel/timeout, fault).
     private (IReadOnlyList<Row>? Rows, long OutputRows) Execute(
         LogicalPlan analyzedPlan,
         ExecutionOptions options,
+        ExecutionMetricsSink? metricsSink,
         Func<BatchResult, ExecutionOptions, CancellationToken, (IReadOnlyList<Row>? Rows, long OutputRows)> finalize)
     {
         using CancellationTokenSource? timeoutCts = options.Timeout is { } timeout
@@ -120,19 +132,28 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
             // A non-positive timeout means the deadline has already passed (config never produces this —
             // ExecutionOptions maps <=0 to "disabled"/null — so it only arrives via the direct options
             // API), so cancel synchronously for a deterministic, race-free timeout; otherwise schedule it.
+            // The timeout has already been clamped to CancelAfter's ceiling in ExecutionOptions.From, but
+            // clamp defensively here too so a direct-options huge timeout never leaks a raw framework throw.
             if (options.Timeout!.Value <= TimeSpan.Zero)
             {
                 timeoutCts.Cancel();
             }
             else
             {
-                timeoutCts.CancelAfter(options.Timeout.Value);
+                TimeSpan delay = options.Timeout.Value;
+                if (delay.TotalMilliseconds > ExecutionOptions.MaxTimeoutMilliseconds)
+                {
+                    delay = TimeSpan.FromMilliseconds(ExecutionOptions.MaxTimeoutMilliseconds);
+                }
+
+                timeoutCts.CancelAfter(delay);
             }
         }
 
         CancellationToken effectiveToken = timeoutCts?.Token ?? options.CancellationToken;
 
         TimeSpan planningDuration = TimeSpan.Zero;
+        long planningStart = 0;
         long executionStart = 0;
         long outputRows = 0;
         long outputBatches = 0;
@@ -144,13 +165,24 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
             outputRows,
             outputBatches,
             runtime?.BytesScanned ?? 0,
-            runtime?.PeakMemoryBytes ?? 0);
+            runtime?.PeakMemoryBytes ?? 0,
+            runtime?.SpilledBytes ?? 0);
 
         try
         {
+            // Upfront cancellation/timeout gate (criterion 1). Checked BEFORE any stage runs so a
+            // pre-cancelled token or an already-elapsed timeout stops the action deterministically for
+            // BOTH Collect and Count and for EVERY plan shape — including a bare ScanPlan/LimitPlan/
+            // UnionPlan root that never reaches PhysicalRuntime.Run's per-batch poll, and Count (which
+            // never materializes rows). Mapped so a timeout surfaces as TimeoutException, not OCE.
+            if (effectiveToken.IsCancellationRequested)
+            {
+                throw MapCancellation(options.CancellationToken, new OperationCanceledException(effectiveToken));
+            }
+
             // Stage: Plan. UnsupportedPlanException is already stage-attributed and must propagate
             // unwrapped (callers assert on it); any other planner fault is attributed to Plan.
-            long planningStart = Stopwatch.GetTimestamp();
+            planningStart = Stopwatch.GetTimestamp();
             PhysicalPlan physical;
             try
             {
@@ -162,6 +194,9 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
             }
             catch (Exception ex)
             {
+                // Record the elapsed planning time even on a planning fault so PlanningDuration reflects
+                // real work rather than 0 (criterion 4 / #176 #11).
+                planningDuration = Stopwatch.GetElapsedTime(planningStart);
                 throw new QueryExecutionException(
                     QueryExecutionStage.Plan,
                     $"Physical planning failed: {ex.Message}",
@@ -174,7 +209,8 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
             // Stage: Backend + Materialize (both timed as execution).
             executionStart = Stopwatch.GetTimestamp();
             IExecutionBackend backend = ExecutionBackends.Select(_backendOptions);
-            runtime = new PhysicalRuntime(backend, _backendOptions, effectiveToken, options.MemoryBudgetBytes);
+            runtime = (RuntimeFactory ?? DefaultRuntimeFactory)(
+                backend, _backendOptions, effectiveToken, options.MemoryBudgetBytes);
 
             BatchResult result;
             try
@@ -198,13 +234,16 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
                     BuildMetrics());
             }
 
-            outputBatches = result.Batches.Count;
-
             // Stage: Materialize. Result-bound breaches become a Materialize-attributed public exception;
-            // value-mapping failures surface as the (Materialize-attributed) UnsupportedPlanException.
+            // value-mapping failures surface as the (Materialize-attributed) UnsupportedPlanException; any
+            // other unforeseen materialization fault is wrapped as Stage = Materialize (mirrors the Backend
+            // stage's general catch — #176 #2). Counting the output batches is part of materialization, so
+            // it lives inside this try too (a lazily-faulting batch list is attributed here, not left to
+            // escape unwrapped through the outer finally).
             (IReadOnlyList<Row>? Rows, long OutputRows) finalized;
             try
             {
+                outputBatches = result.Batches.Count;
                 finalized = finalize(result, options, effectiveToken);
             }
             catch (OperationCanceledException oce)
@@ -220,16 +259,35 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
                 throw new QueryExecutionException(
                     QueryExecutionStage.Materialize, ex.Message, ex, BuildMetrics());
             }
+            catch (Exception ex)
+            {
+                throw new QueryExecutionException(
+                    QueryExecutionStage.Materialize,
+                    $"Result materialization failed: {ex.Message}",
+                    ex,
+                    BuildMetrics());
+            }
 
             outputRows = finalized.OutputRows;
-            options.Metrics = BuildMetrics();
             return finalized;
         }
         finally
         {
+            // Publish the run's metrics into the per-call sink on EVERY path (success, cancel/timeout,
+            // fault) so the out-metrics overloads surface partial counters even when the action throws
+            // (#176 #4/#5). The sink is per-action, so this never mutates shared/static state.
+            if (metricsSink is not null)
+            {
+                metricsSink.Metrics = BuildMetrics();
+            }
+
             runtime?.Dispose();
         }
     }
+
+    private static readonly Func<IExecutionBackend, ExecutionBackendOptions, CancellationToken, long?, PhysicalRuntime>
+        DefaultRuntimeFactory = static (backend, options, token, budget) =>
+            new PhysicalRuntime(backend, options, token, budget);
 
     // Distinguishes a user cancellation from a timeout: if the user's own token is cancelled the original
     // OperationCanceledException is rethrown (Spark parity for cancellation); otherwise the effective

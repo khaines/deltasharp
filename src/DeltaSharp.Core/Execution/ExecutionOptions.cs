@@ -39,13 +39,6 @@ internal sealed class ExecutionOptions
     public long? MemoryBudgetBytes { get; init; }
 
     /// <summary>
-    /// The counters the executor fills before it returns or throws, so they are retrievable on both
-    /// the success and failure paths (STORY-04.6.4 criterion 4). This is the seam sibling lane #179
-    /// (EXPLAIN) can read for physical-execution metadata.
-    /// </summary>
-    public ExecutionMetrics? Metrics { get; set; }
-
-    /// <summary>
     /// Builds options from a session's live configuration and the action's cancellation token. Reads
     /// the <c>spark.deltasharp.execution.*</c> keys through the live <see cref="RuntimeConfig"/> so a
     /// runtime <c>Conf.Set</c> is honored on the next action.
@@ -60,6 +53,15 @@ internal sealed class ExecutionOptions
         RuntimeConfig conf = session.Conf;
 
         long? timeoutMs = ReadPositiveLong(conf, SparkSession.ExecutionTimeoutMsConfigKey);
+        if (timeoutMs is { } configuredMs && configuredMs > MaxTimeoutMilliseconds)
+        {
+            // CancellationTokenSource.CancelAfter caps the delay at ~49.7 days (uint.MaxValue - 1 ms) and
+            // throws ArgumentOutOfRangeException above it. Clamp here — before the driver arms the timer —
+            // so a huge configured timeout degrades to "effectively no timeout" rather than crashing the
+            // action with a raw framework exception outside the stage-attributed driver try (#176 #7).
+            timeoutMs = MaxTimeoutMilliseconds;
+        }
+
         return new ExecutionOptions
         {
             CancellationToken = cancellationToken,
@@ -69,6 +71,13 @@ internal sealed class ExecutionOptions
             MemoryBudgetBytes = ReadPositiveLong(conf, SparkSession.MemoryBudgetBytesConfigKey),
         };
     }
+
+    /// <summary>
+    /// The largest timeout (in milliseconds) a linked <see cref="CancellationTokenSource"/> can be armed
+    /// with via <see cref="CancellationTokenSource.CancelAfter(TimeSpan)"/> (<c>uint.MaxValue - 1</c>,
+    /// ~49.7 days). A configured timeout above this is clamped to it in <see cref="From"/>.
+    /// </summary>
+    internal const long MaxTimeoutMilliseconds = uint.MaxValue - 1;
 
     // Absent -> null (unbounded/disabled). Present & parseable & > 0 -> the value. Present & <= 0 ->
     // null (explicitly disabled). Present & unparseable/negative -> fail-fast ArgumentException,

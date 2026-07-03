@@ -26,7 +26,7 @@ public sealed class ExecutionMetrics
 {
     /// <summary>Metrics with all counters zero — the value reported when no work was measured.</summary>
     public static ExecutionMetrics Empty { get; } =
-        new(TimeSpan.Zero, TimeSpan.Zero, outputRows: 0, outputBatches: 0, bytesScanned: 0, peakMemoryBytes: 0);
+        new(TimeSpan.Zero, TimeSpan.Zero, outputRows: 0, outputBatches: 0, bytesScanned: 0, peakMemoryBytes: 0, spilledBytes: 0);
 
     /// <summary>Creates an immutable metrics snapshot.</summary>
     /// <param name="planningDuration">Time spent in physical planning.</param>
@@ -35,13 +35,15 @@ public sealed class ExecutionMetrics
     /// <param name="outputBatches">Column batches the action produced.</param>
     /// <param name="bytesScanned">Estimated data-plane bytes read by scans.</param>
     /// <param name="peakMemoryBytes">High-water reserved execution memory across operators.</param>
+    /// <param name="spilledBytes">Bytes spilled to the spill store under memory pressure across operators.</param>
     public ExecutionMetrics(
         TimeSpan planningDuration,
         TimeSpan executionDuration,
         long outputRows,
         long outputBatches,
         long bytesScanned,
-        long peakMemoryBytes)
+        long peakMemoryBytes,
+        long spilledBytes = 0)
     {
         PlanningDuration = planningDuration;
         ExecutionDuration = executionDuration;
@@ -49,6 +51,7 @@ public sealed class ExecutionMetrics
         OutputBatches = outputBatches;
         BytesScanned = bytesScanned;
         PeakMemoryBytes = peakMemoryBytes;
+        SpilledBytes = spilledBytes;
     }
 
     /// <summary>Wall-to-wall time spent in physical planning (<c>PhysicalPlanner.Plan</c>).</summary>
@@ -72,15 +75,20 @@ public sealed class ExecutionMetrics
     /// <summary>High-water reserved execution memory in bytes (max across operators).</summary>
     public long PeakMemoryBytes { get; }
 
+    /// <summary>Bytes spilled to the spill store under memory pressure (summed across operators; 0 when
+    /// no operator spilled).</summary>
+    public long SpilledBytes { get; }
+
     /// <summary>A compact single-line rendering for logs and diagnostics.</summary>
     /// <returns>A diagnostic string naming each counter.</returns>
     public override string ToString() => string.Format(
         CultureInfo.InvariantCulture,
-        "ExecutionMetrics(planning={0:g}, execution={1:g}, rows={2}, batches={3}, bytesScanned={4}, peakMemoryBytes={5})",
+        "ExecutionMetrics(planning={0:g}, execution={1:g}, rows={2}, batches={3}, bytesScanned={4}, peakMemoryBytes={5}, spilledBytes={6})",
         PlanningDuration,
         ExecutionDuration,
         OutputRows,
         OutputBatches,
         BytesScanned,
-        PeakMemoryBytes);
+        PeakMemoryBytes,
+        SpilledBytes);
 }

@@ -140,7 +140,7 @@ internal sealed class FilterPlan : PhysicalPlan
     public override BatchResult Execute(PhysicalRuntime runtime)
     {
         BatchResult child = _child.Execute(runtime);
-        PhysicalOperator op = BuildOperator(() => new FilterOperator(PhysicalRuntime.ScanOf(child), _predicate));
+        PhysicalOperator op = BuildOperator(() => new FilterOperator(PhysicalRuntime.ScanOf(child, _child is ScanPlan), _predicate));
         return new BatchResult(OutputSchema, runtime.Run(op));
     }
 }
@@ -174,7 +174,7 @@ internal sealed class ProjectPlan : PhysicalPlan
     {
         BatchResult child = _child.Execute(runtime);
         PhysicalOperator op = BuildOperator(
-            () => new ProjectOperator(PhysicalRuntime.ScanOf(child), OutputSchema, _projections));
+            () => new ProjectOperator(PhysicalRuntime.ScanOf(child, _child is ScanPlan), OutputSchema, _projections));
         return new BatchResult(OutputSchema, runtime.Run(op));
     }
 }
@@ -218,7 +218,7 @@ internal sealed class AggregatePlan : PhysicalPlan
     {
         BatchResult child = _child.Execute(runtime);
         PhysicalOperator op = BuildOperator(
-            () => new AggregateOperator(PhysicalRuntime.ScanOf(child), OutputSchema, _groupingKeys, _aggregates));
+            () => new AggregateOperator(PhysicalRuntime.ScanOf(child, _child is ScanPlan), OutputSchema, _groupingKeys, _aggregates));
         return new BatchResult(OutputSchema, runtime.Run(op));
     }
 }
@@ -270,8 +270,8 @@ internal sealed class JoinPlan : PhysicalPlan
         BatchResult left = _left.Execute(runtime);
         BatchResult right = _right.Execute(runtime);
         PhysicalOperator op = BuildOperator(() => new JoinOperator(
-            PhysicalRuntime.ScanOf(left),
-            PhysicalRuntime.ScanOf(right),
+            PhysicalRuntime.ScanOf(left, _left is ScanPlan),
+            PhysicalRuntime.ScanOf(right, _right is ScanPlan),
             OutputSchema,
             JoinType,
             _leftKeys,
@@ -311,7 +311,7 @@ internal sealed class SortPlan : PhysicalPlan
     {
         BatchResult child = _child.Execute(runtime);
         PhysicalOperator op = BuildOperator(
-            () => new SortOperator(PhysicalRuntime.ScanOf(child), _sortOrders, _global));
+            () => new SortOperator(PhysicalRuntime.ScanOf(child, _child is ScanPlan), _sortOrders, _global));
         return new BatchResult(OutputSchema, runtime.Run(op));
     }
 }
@@ -405,13 +405,13 @@ internal sealed class UnionPlan : PhysicalPlan
         foreach (PhysicalPlan child in _children)
         {
             BatchResult result = child.Execute(runtime);
-            batches.AddRange(Normalize(result, runtime));
+            batches.AddRange(Normalize(result, child, runtime));
         }
 
         return new BatchResult(OutputSchema, batches);
     }
 
-    private IReadOnlyList<ColumnBatch> Normalize(BatchResult result, PhysicalRuntime runtime)
+    private IReadOnlyList<ColumnBatch> Normalize(BatchResult result, PhysicalPlan childPlan, PhysicalRuntime runtime)
     {
         if (result.Schema.Equals(OutputSchema))
         {
@@ -442,7 +442,7 @@ internal sealed class UnionPlan : PhysicalPlan
             projections[i] = new ColumnReference(i, OutputSchema[i].DataType, OutputSchema[i].Nullable);
         }
 
-        var op = new ProjectOperator(PhysicalRuntime.ScanOf(result), OutputSchema, projections);
+        var op = new ProjectOperator(PhysicalRuntime.ScanOf(result, childPlan is ScanPlan), OutputSchema, projections);
         return runtime.Run(op);
     }
 }

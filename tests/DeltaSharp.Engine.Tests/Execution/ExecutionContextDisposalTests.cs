@@ -34,7 +34,9 @@ public sealed class ExecutionContextDisposalTests
         context.Dispose();
         context.Dispose();
 
-        Assert.Equal(2, store.DisposeCalls);
+        // Genuinely idempotent: the _disposed guard makes the second Dispose a no-op, so the store is
+        // disposed exactly once (a pass-through Dispose would forward both calls — DisposeCalls == 2).
+        Assert.Equal(1, store.DisposeCalls);
     }
 
     [Fact]

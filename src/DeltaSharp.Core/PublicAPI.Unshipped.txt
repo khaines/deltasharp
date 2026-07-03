@@ -216,11 +216,12 @@ DeltaSharp.DataFrame.ToExplainString(DeltaSharp.ExplainMode mode = DeltaSharp.Ex
 DeltaSharp.ExecutionMetrics
 DeltaSharp.ExecutionMetrics.BytesScanned.get -> long
 DeltaSharp.ExecutionMetrics.ExecutionDuration.get -> System.TimeSpan
-DeltaSharp.ExecutionMetrics.ExecutionMetrics(System.TimeSpan planningDuration, System.TimeSpan executionDuration, long outputRows, long outputBatches, long bytesScanned, long peakMemoryBytes) -> void
+DeltaSharp.ExecutionMetrics.ExecutionMetrics(System.TimeSpan planningDuration, System.TimeSpan executionDuration, long outputRows, long outputBatches, long bytesScanned, long peakMemoryBytes, long spilledBytes = 0) -> void
 DeltaSharp.ExecutionMetrics.OutputBatches.get -> long
 DeltaSharp.ExecutionMetrics.OutputRows.get -> long
 DeltaSharp.ExecutionMetrics.PeakMemoryBytes.get -> long
 DeltaSharp.ExecutionMetrics.PlanningDuration.get -> System.TimeSpan
+DeltaSharp.ExecutionMetrics.SpilledBytes.get -> long
 DeltaSharp.ExecutionMetrics.TotalDuration.get -> System.TimeSpan
 DeltaSharp.ExplainMode
 DeltaSharp.ExplainMode.Simple = 0 -> DeltaSharp.ExplainMode

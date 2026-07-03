@@ -594,11 +594,13 @@ public sealed class DataFrame
     }
 
     /// <summary>
-    /// The metrics-reporting overload of <see cref="Collect()"/> (STORY-04.6.4 criterion 4). On success
-    /// <paramref name="metrics"/> receives the planning + execution counters for diagnostics; on failure
-    /// they are instead carried by <see cref="QueryExecutionException.Metrics"/>.
+    /// The metrics-reporting overload of <see cref="Collect()"/> (STORY-04.6.4 criterion 4). Whether the
+    /// action succeeds OR throws (cancel/timeout/stage fault), <paramref name="metrics"/> receives the
+    /// planning + execution counters gathered so far — the executor fills a per-call sink in its own
+    /// <c>finally</c>, and this overload reads it in a <c>finally</c>, so partial metrics surface even on
+    /// the failure path (a wrapped fault also carries them on <see cref="QueryExecutionException.Metrics"/>).
     /// </summary>
-    /// <param name="metrics">On success, the planning + execution counters for this action.</param>
+    /// <param name="metrics">The planning + execution counters for this action, populated on success and on failure alike.</param>
     /// <param name="cancellationToken">A token that cooperatively cancels the action.</param>
     /// <returns>The materialized <see cref="Row"/>s, in result order.</returns>
     /// <exception cref="InvalidOperationException">This frame is not bound to a <see cref="SparkSession"/>.</exception>
@@ -612,9 +614,17 @@ public sealed class DataFrame
         SparkSession session = RequireSession(nameof(Collect));
         LogicalPlan analyzed = AnalyzeForExecution(session, Plan);
         ExecutionOptions options = ExecutionOptions.From(session, cancellationToken);
-        IReadOnlyList<Row> rows = session.QueryExecutor.Collect(analyzed, options);
-        metrics = options.Metrics ?? ExecutionMetrics.Empty;
-        return rows;
+        var sink = new ExecutionMetricsSink();
+        try
+        {
+            return session.QueryExecutor.Collect(analyzed, options, sink);
+        }
+        finally
+        {
+            // Read the sink in a finally so metrics surface even when the action throws (cancel/timeout/
+            // fault): the executor fills the sink in its own finally with the partial counters (#176 #4/#5).
+            metrics = sink.Metrics ?? ExecutionMetrics.Empty;
+        }
     }
 
     /// <summary>
@@ -654,11 +664,12 @@ public sealed class DataFrame
     }
 
     /// <summary>
-    /// The metrics-reporting overload of <see cref="Count()"/> (STORY-04.6.4 criterion 4). On success
-    /// <paramref name="metrics"/> receives the planning + execution counters; on failure they are
-    /// carried by <see cref="QueryExecutionException.Metrics"/>.
+    /// The metrics-reporting overload of <see cref="Count()"/> (STORY-04.6.4 criterion 4). Whether the
+    /// action succeeds OR throws (cancel/timeout/stage fault), <paramref name="metrics"/> receives the
+    /// planning + execution counters gathered so far (the executor fills a per-call sink in a
+    /// <c>finally</c>); a wrapped fault also carries them on <see cref="QueryExecutionException.Metrics"/>.
     /// </summary>
-    /// <param name="metrics">On success, the planning + execution counters for this action.</param>
+    /// <param name="metrics">The planning + execution counters for this action, populated on success and on failure alike.</param>
     /// <param name="cancellationToken">A token that cooperatively cancels the action.</param>
     /// <returns>The number of result rows.</returns>
     /// <exception cref="InvalidOperationException">This frame is not bound to a <see cref="SparkSession"/>.</exception>
@@ -672,9 +683,17 @@ public sealed class DataFrame
         SparkSession session = RequireSession(nameof(Count));
         LogicalPlan analyzed = AnalyzeForExecution(session, Plan);
         ExecutionOptions options = ExecutionOptions.From(session, cancellationToken);
-        long count = session.QueryExecutor.Count(analyzed, options);
-        metrics = options.Metrics ?? ExecutionMetrics.Empty;
-        return count;
+        var sink = new ExecutionMetricsSink();
+        try
+        {
+            return session.QueryExecutor.Count(analyzed, options, sink);
+        }
+        finally
+        {
+            // Read the sink in a finally so metrics surface even when the action throws (cancel/timeout/
+            // fault): the executor fills the sink in its own finally with the partial counters (#176 #4/#5).
+            metrics = sink.Metrics ?? ExecutionMetrics.Empty;
+        }
     }
 
     /// <summary>
