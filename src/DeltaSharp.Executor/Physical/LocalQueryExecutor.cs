@@ -40,6 +40,28 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
     public long Count(LogicalPlan analyzedPlan) =>
         RowMaterializer.CountRows(ExecutePlan(analyzedPlan));
 
+    /// <inheritdoc />
+    /// <remarks>
+    /// Plans the query with the SAME <see cref="PhysicalPlanner"/> <see cref="Collect"/>/<see cref="Count"/>
+    /// use, then renders the tree — it does <b>not</b> call <see cref="PhysicalPlan.Execute"/>, so no
+    /// operator opens, no batch is read, and no backend runs (ADR-0001, lazy/eager). An
+    /// <see cref="UnsupportedPlanException"/> (an operator/expression with no M1 mapping, e.g. a cross
+    /// join or a write plan) is rendered as a diagnostic line rather than rethrown (STORY-04.7.3 AC4).
+    /// </remarks>
+    public string ExplainPhysical(LogicalPlan analyzedPlan)
+    {
+        ArgumentNullException.ThrowIfNull(analyzedPlan);
+        try
+        {
+            PhysicalPlan physical = new PhysicalPlanner(_scanSource).Plan(analyzedPlan);
+            return physical.TreeString();
+        }
+        catch (UnsupportedPlanException ex)
+        {
+            return $"<cannot plan physically: {ex.Message}>";
+        }
+    }
+
     private BatchResult ExecutePlan(LogicalPlan analyzedPlan)
     {
         ArgumentNullException.ThrowIfNull(analyzedPlan);

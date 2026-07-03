@@ -29,6 +29,8 @@ internal sealed class FakeQueryExecutor : IQueryExecutor
 
     internal int CountCallCount { get; private set; }
 
+    internal int ExplainPhysicalCallCount { get; private set; }
+
     internal LogicalPlan? LastPlan { get; private set; }
 
     public IReadOnlyList<Row> Collect(LogicalPlan analyzedPlan)
@@ -46,6 +48,23 @@ internal sealed class FakeQueryExecutor : IQueryExecutor
         DriveBackend();
         return _countOverride ?? _rows.Count;
     }
+
+    /// <summary>
+    /// Returns a canned physical-plan string for <c>DataFrame.Explain</c>'s physical section, recording
+    /// the call and the plan. It deliberately does <b>not</b> drive the backend audit stages — EXPLAIN
+    /// plans but never executes (STORY-04.7.3, lazy/eager), so the lazy/eager tests can assert that
+    /// Explain touched neither <see cref="Collect"/> nor <see cref="Count"/> and left the audit empty.
+    /// </summary>
+    public string ExplainPhysical(LogicalPlan analyzedPlan)
+    {
+        ExplainPhysicalCallCount++;
+        LastPlan = analyzedPlan;
+        return FakePhysicalPlanText;
+    }
+
+    /// <summary>The stub physical-plan text this fake renders so Core tests can assert the physical
+    /// section is present without a real physical planner (which lives in DeltaSharp.Executor).</summary>
+    internal const string FakePhysicalPlanText = "FakePhysicalPlan [stub]";
 
     private static void DriveBackend()
     {

@@ -69,6 +69,24 @@ internal sealed class InMemoryRelationFixture
     public PhysicalPlan Plan(DataFrame frame) =>
         new PhysicalPlanner(_scanSource).Plan(Analyze(frame));
 
+    /// <summary>Renders a DataFrame's physical plan string through a <see cref="LocalQueryExecutor"/>
+    /// (analyze + <see cref="LocalQueryExecutor.ExplainPhysical"/>) — plans, never executes.</summary>
+    /// <param name="frame">The DataFrame to explain.</param>
+    /// <returns>The rendered physical-plan tree (or a diagnostic line for an unsupported plan).</returns>
+    public string ExplainPhysical(DataFrame frame) =>
+        new LocalQueryExecutor(_scanSource, ExecutionBackendOptions.Default).ExplainPhysical(Analyze(frame));
+
+    /// <summary>Renders a DataFrame's physical plan through a <see cref="SparkSession"/>'s registered
+    /// executor (full Core↔Executor seam).</summary>
+    /// <param name="session">The session whose <c>QueryExecutor</c> renders the plan.</param>
+    /// <param name="frame">The DataFrame to explain (its relation must be registered in the default source).</param>
+    /// <returns>The rendered physical-plan tree.</returns>
+    public string ExplainPhysicalViaSession(SparkSession session, DataFrame frame)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        return session.QueryExecutor.ExplainPhysical(Analyze(frame));
+    }
+
     /// <summary>Executes a DataFrame end-to-end and materializes all rows.</summary>
     /// <param name="frame">The DataFrame to collect.</param>
     /// <param name="options">Backend options (defaults to <see cref="ExecutionBackendOptions.Default"/>).</param>

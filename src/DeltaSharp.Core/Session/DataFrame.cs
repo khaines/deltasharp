@@ -608,6 +608,52 @@ public sealed class DataFrame
         Console.Out.Write(ShowString(numRows, truncate));
 
     /// <summary>
+    /// Prints the physical plan of this query to the console, mirroring Spark's <c>Dataset.explain()</c>
+    /// (the <see cref="ExplainMode.Simple"/> mode). This is <b>not</b> an action: it renders the plan
+    /// without executing it (the physical plan is <i>planned</i>, not run — ADR-0001), so it is safe to
+    /// call while debugging a query.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">This frame is not bound to a <see cref="SparkSession"/>.</exception>
+    /// <exception cref="SessionStoppedException">The owning session has been stopped or disposed.</exception>
+    public void Explain() => Explain(ExplainMode.Simple);
+
+    /// <summary>
+    /// Prints this query's plan to the console, mirroring Spark's <c>Dataset.explain(extended)</c>. When
+    /// <paramref name="extended"/> is <see langword="true"/> the parsed (unresolved), analyzed,
+    /// optimized, and physical plans are printed in separate sections (<see cref="ExplainMode.Extended"/>);
+    /// otherwise only the physical plan is printed (<see cref="ExplainMode.Simple"/>). Like
+    /// <see cref="Explain()"/>, this renders without executing.
+    /// </summary>
+    /// <param name="extended">Whether to include the logical (parsed/analyzed/optimized) sections.</param>
+    /// <exception cref="InvalidOperationException">This frame is not bound to a <see cref="SparkSession"/>.</exception>
+    /// <exception cref="SessionStoppedException">The owning session has been stopped or disposed.</exception>
+    public void Explain(bool extended) =>
+        Explain(extended ? ExplainMode.Extended : ExplainMode.Simple);
+
+    /// <summary>
+    /// Prints this query's plan to the console in the given <paramref name="mode"/>, mirroring Spark's
+    /// <c>Dataset.explain(mode)</c>. Accepted mode strings (case-insensitive) are <c>"simple"</c>,
+    /// <c>"extended"</c>, <c>"codegen"</c>, <c>"cost"</c>, and <c>"formatted"</c>. Renders without
+    /// executing.
+    /// </summary>
+    /// <param name="mode">The Spark explain-mode string.</param>
+    /// <exception cref="ArgumentException"><paramref name="mode"/> is not a recognised mode string.</exception>
+    /// <exception cref="InvalidOperationException">This frame is not bound to a <see cref="SparkSession"/>.</exception>
+    /// <exception cref="SessionStoppedException">The owning session has been stopped or disposed.</exception>
+    public void Explain(string mode) => Explain(ParseMode(mode));
+
+    /// <summary>
+    /// Prints this query's plan to the console in the given <paramref name="mode"/>, the strongly-typed
+    /// counterpart of <see cref="Explain(string)"/>. Renders without executing (ADR-0001): logical
+    /// sections are produced entirely in <c>DeltaSharp.Core</c>, and the physical section is planned
+    /// (through the execution seam) but never run. See <c>docs/engineering/design/explain.md</c>.
+    /// </summary>
+    /// <param name="mode">The explain mode.</param>
+    /// <exception cref="InvalidOperationException">This frame is not bound to a <see cref="SparkSession"/>.</exception>
+    /// <exception cref="SessionStoppedException">The owning session has been stopped or disposed.</exception>
+    public void Explain(ExplainMode mode) => Console.Out.Write(ExplainString(mode));
+
+    /// <summary>
     /// Builds the Spark-style table string that <see cref="Show(int, bool)"/> prints, returning it
     /// instead of writing to the console so formatting is unit-testable. It executes the query
     /// (bounded to <paramref name="numRows"/> + 1 rows to detect whether more rows exist) but does not
@@ -706,6 +752,138 @@ public sealed class DataFrame
     /// <see cref="IQueryExecutor"/> contract.
     /// </summary>
     private static LogicalPlan Optimize(LogicalPlan analyzedPlan) => analyzedPlan;
+
+    // ------------------------------------------------------------------------------------------
+    // EXPLAIN (STORY-04.7.3 / #179). Renders each pipeline stage WITHOUT executing: logical/analyzed/
+    // optimized entirely in Core; the physical section is PLANNED (not run) through the IQueryExecutor
+    // seam. Diagnostics are rendered as text, never thrown in place of a diagnostic line (AC4). See
+    // docs/engineering/design/explain.md.
+    // ------------------------------------------------------------------------------------------
+
+    /// <summary>The header prefixing every EXPLAIN section (Spark parity), e.g. <c>== Physical Plan ==</c>.</summary>
+    private static string SectionHeader(string title) => $"== {title} ==";
+
+    /// <summary>
+    /// Builds the console text that <see cref="Explain(ExplainMode)"/> prints, returning it instead of
+    /// writing to the console so the rendered plan is unit-testable (the same pattern as
+    /// <see cref="ShowString(int, bool)"/>). It renders without executing (ADR-0001).
+    /// </summary>
+    /// <param name="mode">The explain mode.</param>
+    /// <returns>The rendered, newline-terminated plan text.</returns>
+    internal string ExplainString(ExplainMode mode)
+    {
+        SparkSession session = RequireSession(nameof(Explain));
+        var builder = new StringBuilder();
+
+        bool includeLogical = mode is ExplainMode.Extended or ExplainMode.Cost;
+        if (includeLogical)
+        {
+            AppendSection(builder, "Parsed Logical Plan", Plan.TreeString());
+
+            // Analyze + optimize on the SAME seam the actions use (AnalyzeForExecution/Optimize), so the
+            // rendered plans reflect what the executor will actually plan. A resolution failure is a
+            // diagnostic line, not an escaping exception (AC4) — the Parsed section above still shows the
+            // offending unresolved plan, so the diagnostic is not hidden.
+            if (TryAnalyze(session, out LogicalPlan? analyzed, out string? analysisDiagnostic))
+            {
+                AppendSection(builder, "Analyzed Logical Plan", analyzed!.TreeString());
+                AppendSection(builder, "Optimized Logical Plan", Optimize(analyzed!).TreeString());
+            }
+            else
+            {
+                AppendSection(builder, "Analyzed Logical Plan", analysisDiagnostic!);
+                AppendSection(builder, "Optimized Logical Plan", analysisDiagnostic!);
+            }
+        }
+
+        AppendSection(builder, "Physical Plan", PhysicalPlanText(session));
+
+        AppendModeNote(builder, mode);
+        return builder.ToString();
+    }
+
+    /// <summary>
+    /// Renders the physical-plan section by planning (not executing) through the session's execution
+    /// seam. When the plan cannot be analyzed, the physical section carries the analysis diagnostic; the
+    /// seam itself is contractually non-throwing (unsupported operators / no-backend become diagnostics).
+    /// </summary>
+    private string PhysicalPlanText(SparkSession session) =>
+        TryAnalyze(session, out LogicalPlan? analyzed, out string? diagnostic)
+            ? session.QueryExecutor.ExplainPhysical(Optimize(analyzed!))
+            : diagnostic!;
+
+    /// <summary>
+    /// Resolves this frame's plan against the session catalog, capturing an <see cref="AnalysisException"/>
+    /// as a diagnostic string instead of letting it escape (AC4). Other exception types are genuine
+    /// faults and are not swallowed.
+    /// </summary>
+    private bool TryAnalyze(SparkSession session, out LogicalPlan? analyzed, out string? diagnostic)
+    {
+        try
+        {
+            analyzed = new Analyzer(session.Catalog).Resolve(Plan);
+            diagnostic = null;
+            return true;
+        }
+        catch (AnalysisException ex)
+        {
+            analyzed = null;
+            diagnostic = $"<cannot analyze plan: {ex.Message}>";
+            return false;
+        }
+    }
+
+    /// <summary>Appends a titled section (header, body, trailing blank line) to <paramref name="builder"/>.</summary>
+    private static void AppendSection(StringBuilder builder, string title, string body)
+    {
+        builder.Append(SectionHeader(title)).Append('\n');
+        builder.Append(body);
+        if (body.Length > 0 && body[^1] != '\n')
+        {
+            builder.Append('\n');
+        }
+
+        builder.Append('\n');
+    }
+
+    /// <summary>Appends the mode-specific diagnostic footer for modes M1 does not fully realize (AC4).</summary>
+    private static void AppendModeNote(StringBuilder builder, ExplainMode mode)
+    {
+        string? note = mode switch
+        {
+            ExplainMode.Codegen =>
+                "<codegen mode: whole-stage codegen is not part of the M1 interpreted backend (ADR-0001)>",
+            ExplainMode.Cost =>
+                "<cost mode: plan cost statistics are not collected in M1>",
+            ExplainMode.Formatted =>
+                "<formatted mode: per-node detail sections arrive with execution metrics (#176)>",
+            _ => null,
+        };
+
+        if (note is not null)
+        {
+            builder.Append(note).Append('\n');
+        }
+    }
+
+    /// <summary>Parses a Spark explain-mode string (case-insensitive) into an <see cref="ExplainMode"/>.</summary>
+    /// <exception cref="ArgumentException">The string is not a recognised mode (Spark parity).</exception>
+    private static ExplainMode ParseMode(string mode)
+    {
+        ArgumentNullException.ThrowIfNull(mode);
+        return mode.Trim().ToLowerInvariant() switch
+        {
+            "simple" => ExplainMode.Simple,
+            "extended" => ExplainMode.Extended,
+            "codegen" => ExplainMode.Codegen,
+            "cost" => ExplainMode.Cost,
+            "formatted" => ExplainMode.Formatted,
+            _ => throw new ArgumentException(
+                $"Unsupported EXPLAIN mode '{mode}'. Supported modes are 'simple', 'extended', "
+                + "'codegen', 'cost', and 'formatted'.",
+                nameof(mode)),
+        };
+    }
 
     /// <summary>
     /// Renders <paramref name="rows"/> (up to <paramref name="displayCount"/>) as a Spark-style
