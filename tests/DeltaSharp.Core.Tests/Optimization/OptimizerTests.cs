@@ -91,7 +91,7 @@ public sealed class OptimizerTests
     }
 
     [Fact]
-    public void CombinesFoldsAndPrunes_AcrossBatches()
+    public void CombinesFoldsAndPrunes_InFixpointBatch()
     {
         // Filter(true AND (age > 21)) over Filter(true) over Project(age) over people.
         var trueLit = Literal.OfBoolean(true);

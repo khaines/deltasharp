@@ -12,7 +12,9 @@ namespace DeltaSharp.Optimization.Rules;
 /// <b>inner (child) predicate first</b> to match Spark: under short-circuit ANSI evaluation the
 /// operand order is observable, and preserving <c>inner AND outer</c> keeps a guard the inner filter
 /// provided (e.g. <c>age != 0</c>) ahead of a predicate that depends on it (e.g. <c>1 / age &gt; 0</c>),
-/// never raising an error the original nested plan could not. Because the rule runs
+/// never raising an error the original nested plan could not. (This ANSI safety assumes the engine
+/// short-circuits <c>And</c> per-lane; DeltaSharp evaluates <c>And</c> eagerly today, so wiring the
+/// optimizer into ANSI execution needs the engine short-circuit tracked under #415.) Because the rule runs
 /// <c>TransformUp</c> (post-order), a chain of N stacked filters collapses in a
 /// <b>single</b> bottom-up sweep (see <c>docs/engineering/design/logical-optimizer.md</c> §3.2). The
 /// merge fires only when both predicates are <see cref="Expression.Deterministic"/> — combining a

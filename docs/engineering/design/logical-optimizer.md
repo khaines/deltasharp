@@ -93,7 +93,7 @@ RunBatch(batch, plan):
             current = rule.Apply(current)
         if batch.Strategy == Once:            break
         if current.Equals(start):             break   # fixpoint
-        if iteration >= batch.MaxIterations:  break   # safety valve
+        if iteration >= batch.MaxIterations:  break   # safety valve (throws in DEBUG — see §5)
     return current
 ```
 
@@ -160,7 +160,9 @@ semantics-preserving. The conjunction is emitted **inner (child) predicate first
 under short-circuit ANSI evaluation the operand order is observable, and keeping the child predicate
 first preserves a guard the inner filter provided (e.g. `age != 0`) ahead of a predicate that depends
 on it (e.g. `1 / age > 0`), so the combined filter never raises an error the original nested plan
-could not. Because the rule runs `TransformUp` (**post-order**), an N-filter chain collapses in a
+could not. (This ANSI safety property assumes the execution engine short-circuits `And` per-lane;
+DeltaSharp's engine currently evaluates `And` **eagerly**, so wiring `Optimize` into ANSI execution
+requires the engine short-circuit tracked under [#415](https://github.com/khaines/deltasharp/issues/415).) Because the rule runs `TransformUp` (**post-order**), an N-filter chain collapses in a
 **single bottom-up sweep** — not over successive fixpoint iterations. The deterministic-only guard is
 inert in M1 (every M1 predicate is deterministic) and correct once `rand`/`uuid` land (#413). (AC:
 "filter combination".)
@@ -231,10 +233,11 @@ existing projection is performed.
 ## 4. Immutability and structural sharing
 
 Plan nodes are immutable (`TreeNode<T>`); no rule mutates a node in place. Every rewrite produces a
-**new** tree through the existing structural transforms — the M1 rules use exactly `TransformUp`,
-`TransformExpressionsUp`, `MapChildren`, and `WithNewChildren` — all of which **share unchanged
-subtrees by reference** (they return the same instance when a transform is a no-op, short-circuiting
-on `ReferenceEquals`). `ColumnPruning` rebuilds through `MapChildren`, so a unary node is rebuilt only
+**new** tree through the existing structural transforms — the M1 rules use `TransformUp`,
+`TransformExpressionsUp`, and `MapChildren`, which **share unchanged subtrees by reference** (they
+return the same instance when a transform is a no-op, short-circuiting on `ReferenceEquals`); changed
+nodes are rebuilt through the shared `WithNewChildren` primitive (reached transitively via
+`MapChildren`). `ColumnPruning` rebuilds through `MapChildren`, so a unary node is rebuilt only
 when its pruned child is not reference-equal to the original, otherwise the original node is returned.
 Net effect: a rule that changes nothing returns the input instance, and a rule that changes one leaf
 shares the entire untouched remainder of the tree.
@@ -275,7 +278,7 @@ set; and column pruning only removes scan columns that are provably unreferenced
 that already dropped them (§3.4).
 
 **Nullability note.** Boolean 3VL folding can *tighten* a result's nullability hint toward a
-provably-correct **non-nullable** literal (e.g. `And(x, false) → false`, which is never `NULL`); it
+provably-correct **non-nullable** literal (e.g. `And(true, false) → false`, which is never `NULL`); it
 never **widens** nullability. This is Spark-faithful — a folded constant carries its own exact
 nullability. It also means the user-facing schema must be derived from the **analyzed** plan, not the
 optimized one, so folding can never surprise a caller by reporting a narrower/wider column
@@ -305,7 +308,10 @@ context, so method names are unprefixed).
 Comparison/`Cast`/decimal constant folding and `NullPropagation`; `BooleanSimplification`;
 `CollapseProject`; predicate pushdown through joins/aggregates and into scans as data-source filters;
 limit pushdown (`LocalLimit`/`GlobalLimit`); a cost-based layer; and wiring `Optimize` into the
-action driver's `analyzed → optimized → planner` path (#173/#174) with an EXPLAIN command.
+action driver's `analyzed → optimized → planner` path (#173/#174) with an EXPLAIN command. That
+wiring is gated on [#415](https://github.com/khaines/deltasharp/issues/415): DeltaSharp's engine
+evaluates `And`/`Or` **eagerly** (no per-lane short-circuit), so a `CombineFilters`-merged filter
+could raise an ANSI error on rows a guard predicate removed until the engine short-circuit lands.
 
 **Determinism-guard, dedup, and alias-substitution follow-ups are tracked under
 [#413](https://github.com/khaines/deltasharp/issues/413).** The `Expression.Deterministic` seam
