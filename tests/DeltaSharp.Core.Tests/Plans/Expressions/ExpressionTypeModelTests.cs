@@ -82,9 +82,21 @@ public class ExpressionTypeModelTests
     }
 
     [Fact]
-    public void Arithmetic_TypeIsUnknownUntilAnalysis()
+    public void Arithmetic_ResultTypeDerivesFromResolvedOperands()
     {
+        // Once both operands are typed, the result type is a function of the children (Spark parity:
+        // Add.dataType). int + long widens to bigint under ADR-0008 numeric promotion.
         var arithmetic = new BinaryArithmetic(Literal.OfInt(1), Literal.OfLong(2), ArithmeticOperator.Add);
+
+        Assert.Equal(LongType.Instance, arithmetic.Type);
+    }
+
+    [Fact]
+    public void Arithmetic_TypeIsNullWhileOperandUnresolved()
+    {
+        // With an unresolved operand the result type cannot be derived and stays null until analysis.
+        var arithmetic = new BinaryArithmetic(
+            new UnresolvedAttribute("x"), Literal.OfInt(2), ArithmeticOperator.Add);
 
         Assert.Null(arithmetic.Type);
     }

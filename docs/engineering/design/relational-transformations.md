@@ -224,7 +224,7 @@ without a hard warning. Revisit if/when we add analyzer-level migration guidance
 
 Union output derivation follows the **first input's** attributes (the analyzer's `Union` case in
 `DeriveOutput`). Minting fresh output ids and widening nullability across inputs is tracked as
-`TODO(#392)`/#171 and is out of scope here.
+`TODO(#392)` and is out of scope here.
 
 ## 7. Diagnostics — what is validated here vs deferred
 
@@ -247,10 +247,10 @@ unknown until relations resolve — so the check lives in the analyzer, not the 
 Covered by `CheckAnalysis_Union_MismatchedColumnCount_ThrowsNumberOfColumnsMismatch` (and the
 matching-arity happy path `CheckAnalysis_Union_SameColumnCount_Resolves`).
 
-**Deferred to STORY-04.5.2 / #171:** deep column **type** compatibility and coercion across union
+**Deferred:** deep column **type** compatibility and coercion across union
 inputs (e.g. widening `int`/`long`, promoting nullability). This story implements only the
-**structural** (arity) half; the type half is explicitly out of scope and tracked by #171 (and the
-related `TODO(#392)` in `DeriveOutput`).
+**structural** (arity) half; the type half is explicitly out of scope and tracked by **#392**
+(Union set-op output; see the related `TODO(#392)` in `DeriveOutput`).
 
 ### 7.3 Using/natural join resolution → targeted `AnalysisException` (deferred, #405)
 

@@ -1,3 +1,5 @@
+using DeltaSharp.Types;
+
 namespace DeltaSharp.Plans.Expressions;
 
 /// <summary>
@@ -17,12 +19,13 @@ namespace DeltaSharp.Plans.Expressions;
 /// children are (mirroring <see cref="And"/>/<see cref="Or"/>).
 /// </para>
 /// <para>
-/// Building a node does no work and no type coercion: the result <see cref="Type"/> is
-/// <see langword="null"/> (the common type across the branch values needs coercion, an analyzer
-/// concern — STORY-04.5.2 / #171) and <see cref="Nullable"/> is <b>derived</b> from the possible
-/// result values — nullable if any branch value or the else value is nullable, or if there is no
-/// else (implicit-NULL). It is resolved exactly when every child is (the default), so a
-/// <see cref="CaseWhen"/> over unresolved conditions/values stays unresolved until analysis.
+/// Building a node does no work and no type coercion: before analysis the result <see cref="Type"/>
+/// is <see langword="null"/> (its value operands are still unresolved), and <see cref="Nullable"/>
+/// is <b>derived</b> from the possible result values — nullable if any branch value or the else value
+/// is nullable, or if there is no else (implicit-NULL). Once the analyzer (STORY-04.5.2 / #171)
+/// resolves and coerces the branch/else values to a common type the node <b>derives</b> that common
+/// type as its result <see cref="Type"/>. It is resolved exactly when every child is (the default),
+/// so a <see cref="CaseWhen"/> over unresolved conditions/values stays unresolved until analysis.
 /// </para>
 /// </remarks>
 internal sealed class CaseWhen : Expression
@@ -80,6 +83,48 @@ internal sealed class CaseWhen : Expression
 
     /// <summary>The trailing <c>ELSE</c> value, or <see langword="null"/> when absent.</summary>
     public Expression? ElseValue => HasElse ? Children[^1] : null;
+
+    /// <summary>
+    /// The ADR-0008 result type, <b>derived</b> as the common type across the branch values and the
+    /// else value once the node is resolved (Spark's <c>CaseWhen.dataType</c>). It is
+    /// <see langword="null"/> before analysis (while children are unresolved) and stays
+    /// <see langword="null"/> when the values have no common type, which the analyzer's coercion pass
+    /// rejects with a precise diagnostic (STORY-04.5.2 / #171). A missing else does not contribute a
+    /// value type (the unmatched-row NULL only affects <see cref="Nullable"/>).
+    /// </summary>
+    public override DataType? Type
+    {
+        get
+        {
+            if (!Resolved)
+            {
+                return null;
+            }
+
+            var valueTypes = new List<DataType>(BranchCount + 1);
+            foreach ((Expression _, Expression value) in Branches)
+            {
+                if (value.Type is not { } branchType)
+                {
+                    return null;
+                }
+
+                valueTypes.Add(branchType);
+            }
+
+            if (ElseValue is { } elseValue)
+            {
+                if (elseValue.Type is not { } elseType)
+                {
+                    return null;
+                }
+
+                valueTypes.Add(elseType);
+            }
+
+            return TypeCoercion.FindWiderCommonType(valueTypes);
+        }
+    }
 
     /// <summary>
     /// Derives nullability from the possible result values (mirroring how <see cref="And"/>/

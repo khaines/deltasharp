@@ -22,11 +22,14 @@ into a **resolved** one by binding names to schemas. It does exactly two things:
 1. **ResolveRelations** — bind each by-name `UnresolvedRelation` to a concrete ADR-0008 schema via
    a **catalog** lookup, producing a `ResolvedRelation` scan node (AC1).
 2. **ResolveReferences** — bind each by-name `UnresolvedAttribute` to a resolved
-   `AttributeReference` (stable id, name, type, nullability) against the plan's derived output, and
-   expand `UnresolvedStar` (AC2).
+   `AttributeReference` (stable id, name, type, nullability) against the plan's derived output,
+   expand `UnresolvedStar` (AC2), and then run the **function-binding + type-coercion** sub-pass
+   (STORY-04.5.2 / #171; see [function-binding-coercion.md](function-binding-coercion.md)).
 
-It is **not** physical planning, optimization, function/type coercion, or execution. On any
-catalog or name-resolution failure it raises a single Spark-compatible `AnalysisException` and stops
+It is **not** physical planning, optimization, or execution. Function binding and type coercion were
+originally out of this pass and are now delivered as the sub-pass documented in
+[function-binding-coercion.md](function-binding-coercion.md). On any catalog or name-resolution
+failure it raises a single Spark-compatible `AnalysisException` and stops
 — there is no backend to call and none is reached (AC4). All types are `internal` (namespace
 `DeltaSharp.Analysis`, under `src/DeltaSharp.Core/Analysis/`), so the analyzer adds **no** public API
 surface (no `PublicAPI.Unshipped.txt` change) and references only the Core IR plus the shared
@@ -97,8 +100,10 @@ of these survive:
 - an `UnresolvedAttribute` (a name that never bound);
 - an `UnresolvedStar` — for example a star **outside** a `Project` (only a `Project` expands stars),
   such as `Filter('*, scan)`, which is otherwise never rewritten;
-- an `UnresolvedFunction` — **function resolution is a later story**, so a residual function call now
-  fails loudly here (the analyzer still binds the attribute leaves inside it during the rule pass);
+- an `UnresolvedFunction` the registry **cannot bind** — since STORY-04.5.2 / #171 known functions are
+  bound to a typed `ResolvedFunction` during the coercion sub-pass and an unknown name fails there with
+  `UnresolvedFunction`; a residual `UnresolvedFunction` reaching CheckAnalysis (e.g. never visited) is
+  still caught here as `UnresolvedPlan`;
 - an operator still unresolved for a reason outside its expressions — most importantly an
   **undesugared using/natural `Join`** (its shared columns live outside the expression substrate),
   which reports `UnresolvedPlan` rather than leaking through.
@@ -187,11 +192,17 @@ inputs; that is deferred to follow-up **#392** (a `// TODO(#392)` marks the `Uni
 
 An element becomes an attribute via `ToAttribute`: an `AttributeReference` is itself (id preserved);
 an `Alias` becomes a fresh `AttributeReference` named for the alias, typed by the alias's forwarded
-type hint, with a newly-allocated `ExprId`. An alias over an expression whose type is unknown before
-type coercion (e.g. bare arithmetic), or an unnamed projection element, is out of M1 scope and
-rejected with an `AnalysisException` (`AnalysisErrorKind.UnsupportedProjection`) whose message points
-at type coercion (STORY-04.5.2 / #171) — **not** a raw `InvalidOperationException`, since these are
-name-resolvable user inputs, not programming errors.
+type hint, with a newly-allocated `ExprId`; and — since STORY-04.5.2 / #171 — a **bare**
+`ResolvedFunction` (an aggregate/scalar with no enclosing alias) becomes a fresh attribute **auto-named**
+by its Spark pretty SQL string (`SparkAutoName` → `CoercionHelpers.PrettyReference`), e.g.
+`sum(salary)`, `count(1)`, `count(DISTINCT v)` — unqualified argument names, no `#id`, implicit casts
+unwrapped. Since STORY-04.5.2 / #171 the binding + coercion sub-pass
+runs **before** output derivation, so an alias over arithmetic/`CaseWhen` now exposes a concrete
+type; a residual null-typed alias child is a coercion gap routed to
+`AnalysisErrorKind.UntypedResolvedExpression` (symmetric with the CheckAnalysis null-typed guard) —
+**not** a raw `InvalidOperationException`, since these are name-resolvable user inputs, not
+programming errors. Function binding, operand coercion, and type validation are documented in
+[function-binding-coercion.md](function-binding-coercion.md).
 
 Output is derived **inside the analyzer** rather than added as an abstract member on every existing
 `LogicalPlan` node: the intrinsic schema lives on the new `ResolvedRelation` node, and operator
@@ -223,7 +234,12 @@ One failure type, `AnalysisException`, carries a structured `Kind` (`AnalysisErr
 | `UnresolvedColumn` | no attribute matches | `Cannot resolve column name 'salary' given input columns: [id, name, age]` |
 | `AmbiguousReference` | >1 attribute matches | `Reference 'id' is ambiguous, could be: id#0, id#3.` |
 | `UnresolvedPlan` | CheckAnalysis found a residual unresolved marker/operator | `Plan is not fully resolved: unresolved reference '*' remains in operator 'Filter' after analysis.` |
-| `UnsupportedProjection` | alias over an untyped expr / unnamed projection element | `Output type of '(...)' (aliased as 'x') cannot be determined until type coercion (STORY-04.5.2 / #171).` |
+| `UnsupportedProjection` | unnamed projection element (not an attribute or alias) | `Projection element '(...)' is not a named output element (expected an attribute or an alias).` |
+| `UntypedResolvedExpression` | alias over a resolved-but-untyped expr (coercion gap) | `Resolved expression '(...)' in operator 'Project' has no result type after type coercion (STORY-04.5.2 / #171); an untyped resolved expression must not reach physical planning.` |
+
+The function-binding/coercion diagnostics (`UnresolvedFunction`, `InvalidFunctionArgument`,
+`DataTypeMismatch`, `MisplacedAggregate`) are documented in
+[function-binding-coercion.md](function-binding-coercion.md) §4.
 
 For `UnresolvedColumn` (missing) and `AmbiguousReference`, the `Candidates` list has two distinct
 meanings: for a **missing** column, `Candidates` is the **full set of in-scope input columns** (what
@@ -252,7 +268,8 @@ Tests live in `tests/DeltaSharp.Core.Tests/Analysis/` (`AnalyzerTests`, `LocalCa
 | **AC3** | Spark-compatible missing/ambiguous diagnostics naming reference + candidates | `MissingColumn_ThrowsUnresolvedColumn_NamingReferenceAndCandidates`, `AmbiguousColumn_ThrowsAmbiguousReference_ListingBothCandidates` |
 | **AC4** | catalog miss → no physical planning/backend call | `CatalogMiss_ThrowsTableOrViewNotFound_NamingIdentifier`, `CatalogMiss_ThrowsBeforeResolvingAnyReferences` |
 | join output | semi/anti join output is left-only; inner is both sides | `ResolveReferences_LeftSemiJoin_OutputIsLeftOnly`, `ResolveReferences_LeftSemiJoin_RightColumnAbove_IsUnresolved`, `ResolveReferences_LeftAntiJoin_OutputIsLeftOnly`, `ResolveReferences_InnerJoin_OutputIsBothSides` |
-| CheckAnalysis | residual unresolved marker → loud `UnresolvedPlan` | `CheckAnalysis_StarOutsideProject_ThrowsUnresolvedPlan`, `CheckAnalysis_ResidualUnresolvedFunction_ThrowsUnresolvedPlan` |
+| CheckAnalysis | residual unresolved marker → loud `UnresolvedPlan`; unknown function → `UnresolvedFunction` | `CheckAnalysis_StarOutsideProject_ThrowsUnresolvedPlan`, `CheckAnalysis_UnknownFunction_ThrowsNamingFunction` |
+| function binding + coercion (#171) | see [function-binding-coercion.md](function-binding-coercion.md) §7 | `FunctionBindingCoercionTests.*` |
 | alias output | fresh distinct id + forwarded type | `ResolveReferences_AliasOutput_HasFreshDistinctExprId_AndForwardedType` |
 | catalog seam | register/replace, case-insensitive, multipart, miss, part-aware non-collision, empty-part | `LocalCatalogTests.*` (incl. `Register_MultipartParts_DoNotCollide_AcrossDottedRenderings`, `Register_Multipart_RejectsEmptyPart`) |
 

@@ -4,11 +4,12 @@ namespace DeltaSharp.Plans.Expressions;
 
 /// <summary>
 /// A binary arithmetic expression (Catalyst <c>Add</c>/<c>Subtract</c>/<c>Multiply</c>/
-/// <c>Divide</c>/<c>Remainder</c>) — <c>left ⟨op⟩ right</c> over two operands. At the
-/// logical/unresolved stage the result type is <b>unknown</b> (<see cref="Type"/> is
-/// <see langword="null"/>): Spark's numeric promotion / decimal result-type coercion is the
-/// analyzer's job (FEAT-04.5/EPIC-02). The nullability hint is <b>propagate-on-any-null</b> (the
-/// OR of its operands' hints).
+/// <c>Divide</c>/<c>Remainder</c>) — <c>left ⟨op⟩ right</c> over two operands. Before analysis the
+/// result type is <b>unknown</b> (<see cref="Type"/> is <see langword="null"/>) because its operands
+/// are still unresolved; once the analyzer (FEAT-04.5 / #171) resolves and coerces the operands to a
+/// common numeric type the node <b>derives</b> its result type from them via
+/// <see cref="ArithmeticResultType"/> (Spark numeric promotion / decimal result-type rules). The
+/// nullability hint is <b>propagate-on-any-null</b> (the OR of its operands' hints).
 /// </summary>
 internal sealed class BinaryArithmetic : Expression
 {
@@ -33,6 +34,28 @@ internal sealed class BinaryArithmetic : Expression
     /// <summary>The right operand.</summary>
     public Expression Right => Children[1];
 
+    /// <summary>
+    /// The ADR-0008 result type, <b>derived</b> from the operands once they are resolved and typed
+    /// (Catalyst parity: <c>Add.dataType</c> is a function of its children). It is
+    /// <see langword="null"/> before analysis — while an operand is still an unresolved marker or
+    /// carries no type — and stays <see langword="null"/> when an operand is non-numeric, which the
+    /// analyzer's coercion pass rejects with a precise diagnostic (STORY-04.5.2 / #171). Once the
+    /// analyzer has coerced the operands to a common numeric type the result type is concrete,
+    /// following <see cref="ArithmeticResultType"/> (numeric widening and decimal result-type rules).
+    /// </summary>
+    public override DataType? Type
+    {
+        get
+        {
+            if (!Resolved || Left.Type is not { } leftType || Right.Type is not { } rightType)
+            {
+                return null;
+            }
+
+            return ArithmeticResultType.TryResolve(Operator, leftType, rightType)?.ResultType;
+        }
+    }
+
     /// <inheritdoc/>
     public override bool Nullable => Left.Nullable || Right.Nullable;
 
@@ -50,7 +73,9 @@ internal sealed class BinaryArithmetic : Expression
     /// <inheritdoc/>
     public override string SimpleString => $"({Left.SimpleString} {Symbol} {Right.SimpleString})";
 
-    private string Symbol => Operator switch
+    /// <summary>The infix operator glyph (e.g. <c>+</c>), used by <see cref="SimpleString"/> and the
+    /// analyzer's ExprId-free pretty renderer.</summary>
+    internal string Symbol => Operator switch
     {
         ArithmeticOperator.Add => "+",
         ArithmeticOperator.Subtract => "-",
@@ -126,7 +151,9 @@ internal sealed class BinaryComparison : Expression
     /// <inheritdoc/>
     public override string SimpleString => $"({Left.SimpleString} {Symbol} {Right.SimpleString})";
 
-    private string Symbol => Operator switch
+    /// <summary>The infix operator glyph (e.g. <c>=</c>), used by <see cref="SimpleString"/> and the
+    /// analyzer's ExprId-free pretty renderer.</summary>
+    internal string Symbol => Operator switch
     {
         ComparisonOperator.Equal => "=",
         ComparisonOperator.NotEqual => "<>",

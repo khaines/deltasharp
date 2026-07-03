@@ -376,19 +376,22 @@ public sealed class AnalyzerTests
     }
 
     [Fact]
-    public void CheckAnalysis_ResidualUnresolvedFunction_ThrowsUnresolvedPlan()
+    public void CheckAnalysis_UnknownFunction_ThrowsNamingFunction()
     {
-        // Function resolution is a later story; a residual UnresolvedFunction leaves the plan
-        // not-fully-resolved. CheckAnalysis names the offending reference and throws.
+        // An UnresolvedFunction the registry cannot bind is rejected during the bind-and-coerce
+        // pass, naming the offending function (a residual can no longer survive to CheckAnalysis).
         var analyzer = new Analyzer(CatalogWithPeople());
-        var plan = new Filter(
-            new UnresolvedFunction("upper", new Expression[] { new UnresolvedAttribute("name") }),
+        var plan = new Project(
+            new Expression[]
+            {
+                new UnresolvedFunction("no_such_fn", new Expression[] { new UnresolvedAttribute("name") }),
+            },
             Relation("people"));
 
         var ex = Assert.Throws<AnalysisException>(() => analyzer.Resolve(plan));
 
-        Assert.Equal(AnalysisErrorKind.UnresolvedPlan, ex.Kind);
-        Assert.Equal("upper", ex.Reference);
+        Assert.Equal(AnalysisErrorKind.UnresolvedFunction, ex.Kind);
+        Assert.Equal("no_such_fn", ex.Reference);
     }
 
     // ---- AC3: Union structural arity check (STORY-04.2.3 / #162) ----

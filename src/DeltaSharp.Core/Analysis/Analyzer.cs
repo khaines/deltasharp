@@ -119,6 +119,13 @@ internal sealed class Analyzer
                         ? ResolveAttribute(attribute, input)
                         : inner));
 
+            // With names bound, bind functions and apply type coercion bottom-up (STORY-04.5.2 /
+            // #171): each UnresolvedFunction becomes a typed ResolvedFunction and operator/CaseWhen
+            // operands are coerced to Spark-compatible common types (implicit casts inserted). This
+            // runs before DeriveOutput so an aliased expression exposes a concrete output type.
+            resolved = resolved.MapExpressions(
+                expression => expression.TransformUp(ExpressionCoercion.Coerce));
+
             outputByPlan[resolved] = DeriveOutput(resolved, outputByPlan, idGenerator);
             return resolved;
         });
@@ -126,16 +133,26 @@ internal sealed class Analyzer
 
     /// <summary>
     /// CheckAnalysis: the analyzer's post-condition. After the rule pass, the result must be
-    /// <b>fully resolved</b>. This walk verifies that and throws a loud
-    /// <see cref="AnalysisException"/> naming the offending node/expression if any unresolved marker
-    /// survived — an <see cref="UnresolvedAttribute"/>, an <see cref="UnresolvedStar"/> (for example
-    /// a star outside a <see cref="Project"/> that was never expanded), an
-    /// <see cref="UnresolvedFunction"/> (function resolution is a later story), or an operator that
-    /// is otherwise still unresolved (for example a using/natural <see cref="Join"/> the analyzer
-    /// has not desugared). Without this check such residuals would leak silently as a
-    /// not-fully-resolved plan. It additionally enforces structural set-operation compatibility: a
-    /// <see cref="Union"/> whose inputs differ in <b>column count</b> (arity) raises a Spark-parity
-    /// diagnostic (deep column-type compatibility/coercion is deferred to STORY-04.5.2 / #171).
+    /// <b>fully resolved</b> and <b>well-typed</b>. This walk verifies that and throws a loud
+    /// <see cref="AnalysisException"/> naming the offending node/expression if:
+    /// <list type="bullet">
+    /// <item>an unresolved marker survived — an <see cref="UnresolvedAttribute"/>, an
+    /// <see cref="UnresolvedStar"/> (for example a star outside a <see cref="Project"/> that was
+    /// never expanded), an <see cref="UnresolvedFunction"/> (a function the registry could not bind),
+    /// or an operator otherwise still unresolved (e.g. an undesugared using/natural
+    /// <see cref="Join"/>);</item>
+    /// <item>a <see cref="Union"/>'s inputs differ in <b>column count</b> (arity) — a Spark-parity
+    /// structural check (deep column-type compatibility/coercion is deferred to STORY-04.5.2 / #171);</item>
+    /// <item>a resolved expression carries no result type (the coercion pass left it null-typed —
+    /// a symmetric guard for <see cref="BinaryArithmetic"/>/<see cref="CaseWhen"/>, #171);</item>
+    /// <item>a <see cref="Filter"/>/<see cref="Join"/> condition does not resolve to
+    /// <see cref="BooleanType"/> (#160);</item>
+    /// <item>an aggregate function appears outside a valid aggregate context (#166).</item>
+    /// </list>
+    /// Operand type coercion (arithmetic/comparison/boolean/CaseWhen operands, #165/#166) and
+    /// function argument coercion are applied — and their mismatches rejected — during the
+    /// bind-and-coerce sub-pass (<see cref="ExpressionCoercion"/>) that runs earlier within analysis,
+    /// before physical planning; this walk is the final invariant gate over its result.
     /// </summary>
     private static void CheckAnalysis(
         LogicalPlan plan,
@@ -173,6 +190,15 @@ internal sealed class Analyzer
         {
             CheckUnionArity(union, outputByPlan);
         }
+
+        // The plan is fully resolved: enforce the type-validation post-conditions (#171 completeness).
+        foreach (Expression expression in plan.Expressions)
+        {
+            CheckResultTypes(expression, plan.NodeName);
+        }
+
+        CheckConditionIsBoolean(plan);
+        CheckAggregateContext(plan);
     }
 
     /// <summary>Verifies every input of a resolved <see cref="Union"/> exposes the same column
@@ -212,6 +238,142 @@ internal sealed class Analyzer
         {
             CheckExpression(child, ownerNodeName);
         }
+    }
+
+    /// <summary>
+    /// The null-typed-resolved guard: every resolved value expression must carry a concrete result
+    /// type. A resolved node with a <see langword="null"/> <see cref="Expression.Type"/> means the
+    /// coercion pass could not type it (e.g. a coercion gap) — a loud failure here prevents an
+    /// untyped node leaking into physical planning (#171).
+    /// </summary>
+    private static void CheckResultTypes(Expression expression, string ownerNodeName)
+    {
+        foreach (Expression child in expression.Children)
+        {
+            CheckResultTypes(child, ownerNodeName);
+        }
+
+        // Sort orders and stars are structural carriers, not value expressions with a result type.
+        if (expression is SortOrder or UnresolvedStar)
+        {
+            return;
+        }
+
+        if (expression.Resolved && expression.Type is null)
+        {
+            throw AnalysisException.UntypedResolvedExpression(
+                CoercionHelpers.PrettyReference(expression), ownerNodeName);
+        }
+    }
+
+    /// <summary>Enforces that a <see cref="Filter"/> predicate and an explicit <see cref="Join"/>
+    /// condition resolve to <see cref="BooleanType"/> (#160). A non-boolean predicate — for example
+    /// a bare arithmetic or string column — is a data-type mismatch the API cannot catch.</summary>
+    private static void CheckConditionIsBoolean(LogicalPlan plan)
+    {
+        switch (plan)
+        {
+            case Filter filter:
+                RequireBooleanCondition(filter.Condition, filter.NodeName);
+                break;
+
+            case Join { Condition: { } condition } join:
+                RequireBooleanCondition(condition, join.NodeName);
+                break;
+        }
+    }
+
+    private static void RequireBooleanCondition(Expression condition, string ownerNodeName)
+    {
+        if (condition.Type is not BooleanType)
+        {
+            string actual = condition.Type?.SimpleString ?? "unknown";
+            throw AnalysisException.DataTypeMismatch(
+                CoercionHelpers.PrettyReference(condition),
+                $"the condition of a '{ownerNodeName}' must be boolean but is '{actual}'.");
+        }
+    }
+
+    /// <summary>Enforces that aggregate functions appear only in a valid aggregate context (#166):
+    /// the aggregate expressions of an <see cref="Aggregate"/>. An aggregate used in any other
+    /// operator — a <see cref="Project"/>, a <see cref="Filter"/>, an <see cref="Aggregate"/>'s
+    /// grouping keys — is rejected before physical planning.</summary>
+    private static void CheckAggregateContext(LogicalPlan plan)
+    {
+        if (plan is Aggregate aggregate)
+        {
+            // Grouping keys must be plain expressions; aggregates belong in the aggregate list only.
+            foreach (Expression grouping in aggregate.GroupingExpressions)
+            {
+                if (FindAggregate(grouping) is { } misplaced)
+                {
+                    throw AnalysisException.MisplacedAggregate(
+                        misplaced.Name, "Aggregate grouping expressions");
+                }
+            }
+
+            // A plain aggregate (sum(x), count(1)) is legal here, but an aggregate whose ARGUMENT
+            // subtree contains another aggregate (sum(sum(x)), sum(count(x))) is not — Spark rejects
+            // nesting one aggregate inside another. Validate each aggregate expression's subtree.
+            foreach (Expression expression in aggregate.AggregateExpressions)
+            {
+                CheckNoNestedAggregate(expression);
+            }
+
+            return;
+        }
+
+        foreach (Expression expression in plan.Expressions)
+        {
+            if (FindAggregate(expression) is { } misplaced)
+            {
+                throw AnalysisException.MisplacedAggregate(misplaced.Name, plan.NodeName);
+            }
+        }
+    }
+
+    /// <summary>Walks an aggregate expression subtree and rejects a nested aggregate — an aggregate
+    /// <see cref="ResolvedFunction"/> whose own argument subtree contains another aggregate (e.g.
+    /// <c>sum(sum(x))</c>, <c>sum(count(x))</c>). A plain aggregate (<c>sum(x)</c>, <c>count(1)</c>)
+    /// or an aggregate combined with scalars (<c>sum(x)+1</c>) is left untouched; only an aggregate
+    /// argument that itself contains an aggregate is a nesting error (Spark parity, #166).</summary>
+    private static void CheckNoNestedAggregate(Expression expression)
+    {
+        if (expression is ResolvedFunction { Kind: FunctionKind.Aggregate } aggregate)
+        {
+            foreach (Expression argument in aggregate.Arguments)
+            {
+                if (FindAggregate(argument) is { } nested)
+                {
+                    throw AnalysisException.NestedAggregate(aggregate.Name, nested.Name);
+                }
+            }
+        }
+
+        foreach (Expression child in expression.Children)
+        {
+            CheckNoNestedAggregate(child);
+        }
+    }
+
+    /// <summary>Returns the first aggregate <see cref="ResolvedFunction"/> in
+    /// <paramref name="expression"/>, or <see langword="null"/> if there is none.</summary>
+    private static ResolvedFunction? FindAggregate(Expression expression)
+    {
+        if (expression is ResolvedFunction { Kind: FunctionKind.Aggregate } aggregate)
+        {
+            return aggregate;
+        }
+
+        foreach (Expression child in expression.Children)
+        {
+            if (FindAggregate(child) is { } found)
+            {
+                return found;
+            }
+        }
+
+        return null;
     }
 
     /// <summary>The concatenated output attributes of <paramref name="node"/>'s resolved children
@@ -392,33 +554,56 @@ internal sealed class Analyzer
                 return attribute;
 
             case Alias alias:
+                // Type coercion (STORY-04.5.2 / #171) now runs before output derivation, so a
+                // resolved alias exposes a concrete type; a residual null here is a coercion gap the
+                // untyped-resolved guard reports symmetrically with CheckAnalysis.
                 DataType type = alias.Type
-                    ?? throw AnalysisException.UnsupportedProjection(
-                        $"Output type of '{alias.Child.SimpleString}' (aliased as '{alias.Name}') "
-                        + "cannot be determined until type coercion (STORY-04.5.2 / #171).",
-                        alias.Name);
+                    ?? throw AnalysisException.UntypedResolvedExpression(
+                        CoercionHelpers.PrettyReference(alias.Child), "Project");
                 return new AttributeReference(alias.Name, type, alias.Nullable, idGenerator.Next());
 
+            case ResolvedFunction function:
+                // A bare aggregate/scalar function in output position is auto-named exactly like
+                // Spark: `groupBy("dept").agg(sum("salary"))` exposes a `sum(salary)` column (the
+                // function's pretty SQL string, using unqualified child names WITHOUT the `#id`
+                // suffix). Function binding + coercion (STORY-04.5.2 / #171) ran earlier in
+                // ResolveReferences, so the call is already typed here; a residual null type is a
+                // coercion gap reported symmetrically with the Alias case.
+                DataType functionType = function.Type
+                    ?? throw AnalysisException.UntypedResolvedExpression(
+                        CoercionHelpers.PrettyReference(function), "Aggregate");
+                return new AttributeReference(
+                    SparkAutoName(function), functionType, function.Nullable, idGenerator.Next());
+
             case UnresolvedFunction function:
-                // A bare aggregate/scalar function reached output derivation while still unresolved.
-                // Aggregate-function resolution and Spark auto-naming are deferred to STORY-04.5.2
-                // (#171), so we cannot mint an output name yet. Reject deterministically here (this
-                // fires during ResolveReferences, before CheckAnalysis) with a targeted message
-                // rather than the generic "not a named output element" fallback, and point at the
-                // alias workaround. Kind stays UnsupportedProjection.
-                throw AnalysisException.UnsupportedProjection(
-                    $"Aggregate/function output '{function.Name}' cannot be named yet: "
-                    + "aggregate-function resolution and Spark auto-naming are deferred to "
-                    + "STORY-04.5.2 (#171). Alias the expression (for example .As(\"total\")) as the "
-                    + "M1 workaround.",
-                    function.Name);
+                // Defensive invariant: function binding (ExpressionCoercion → FunctionRegistry.Bind)
+                // runs over every expression in ResolveReferences BEFORE output derivation, and it is
+                // total — it either produces a typed ResolvedFunction (handled above) or throws
+                // (UnknownFunction for an unregistered name, InvalidFunctionArgument for a bad call).
+                // An UnresolvedFunction therefore cannot normally reach here; if one does, the bind
+                // pass was skipped for this subtree. Report it as an undefined/unbound function rather
+                // than the obsolete "deferred to #171" self-reference (this story IS #171).
+                throw AnalysisException.UnknownFunction(
+                    function.Name,
+                    function.Arguments.Select(a => a.Type ?? NullType.Instance).ToArray());
 
             default:
                 throw AnalysisException.UnsupportedProjection(
-                    $"Projection element '{element.SimpleString}' is not a named output element "
+                    $"Projection element '{CoercionHelpers.PrettyReference(element)}' is not a named output element "
                     + "(expected an attribute or an alias).");
         }
     }
+
+    /// <summary>The Spark auto-name for a bare function call in output position: the pretty SQL
+    /// string <c>name(arg, …)</c> built from unqualified argument names (no <c>#id</c> ExprId
+    /// suffix), e.g. <c>sum(salary)</c>, <c>count(1)</c>, <c>avg(x)</c>, <c>count(DISTINCT v)</c>.
+    /// It delegates to the shared <see cref="CoercionHelpers.PrettyReference"/> renderer, which
+    /// unwraps implicit coercion <see cref="Cast"/>s and uppercases <c>DISTINCT</c>, mirroring Spark's
+    /// <c>usePrettyExpression</c>. The same renderer names the offending reference in a
+    /// <see cref="AnalysisException.DataTypeMismatch"/> diagnostic, so auto-names and diagnostics never
+    /// diverge and neither leaks an ExprId.</summary>
+    private static string SparkAutoName(ResolvedFunction function) =>
+        CoercionHelpers.PrettyReference(function);
 
     private static IReadOnlyList<AttributeReference> ChildOutput(
         LogicalPlan child,
