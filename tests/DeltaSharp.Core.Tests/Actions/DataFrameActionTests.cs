@@ -482,6 +482,25 @@ public sealed class DataFrameActionTests
     }
 
     [Fact]
+    public void Show_RecordsExactlyOneAnalyzerStage_AndTheFullBackendPath()
+    {
+        var rows = new List<Row> { Person("Alice", 30) };
+        var executor = new FakeQueryExecutor(rows);
+        var recording = new RecordingAudit();
+        (SparkSession spark, DataFrame df) = NewBoundFrame(executor);
+        using (spark)
+        using (ExecutionAudit.BeginScope(recording))
+        {
+            _ = df.ShowString(20, truncate: true);
+
+            Assert.Equal(
+                new[] { ExecutionStage.Analyzer, ExecutionStage.Planner, ExecutionStage.Backend },
+                recording.StagePath);
+            Assert.Single(recording.StagePath, s => s == ExecutionStage.Analyzer);
+        }
+    }
+
+    [Fact]
     public void Count_RecordsExactlyOneAnalyzerStagePerAction()
     {
         var executor = new FakeQueryExecutor(Array.Empty<Row>(), countOverride: 3);
