@@ -217,8 +217,10 @@ Implementations:
   and returns `physicalPlan.TreeString()`. It does **not** call `PhysicalPlan.Execute`, so no operator
   opens, no batch is read, no backend runs. Two failure modes are caught and rendered as a diagnostic
   line (§6), never rethrown: a specific `catch (UnsupportedPlanException)` (an operator/expression with
-  no M1 mapping, e.g. a `CrossJoin` or a `WriteToSource`) preserves the planner's precise message, and a
-  **broad** `catch (Exception ex)` fallback renders `<cannot plan physically: {ex.Message}>`. The broad
+  no M1 mapping, e.g. a `CrossJoin` or a `WriteToSource`) and a **broad** `catch (Exception ex)` fallback.
+  Both return the same `<cannot plan physically: {ex.Message}>` wrapper — for the specific catch that
+  `{ex.Message}` is the planner's precise `UnsupportedPlanException` message, for the broad catch it is the
+  underlying fault's. The broad
   catch is required because `PhysicalPlanner.Plan` eagerly constructs Engine expressions during planning,
   and some Engine expression constructors throw a raw `ArgumentException` for operand-type combinations
   the analyzer *accepts* (e.g. `lit(null) == lit(null)` on `void`/`void`, or `array<int> == array<int>`).
