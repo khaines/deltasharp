@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Globalization;
 using System.Text;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Types;
@@ -135,6 +136,12 @@ internal static class LocalRelationBatches
         }
     }
 
+    // Requires the row value's CLR type to match the field's expected encoding type EXACTLY (an int is
+    // not accepted for a LongType lane, etc.). This mirrors Spark's createDataFrame, which does not
+    // silently widen local values, and keeps the failure deterministic and field-named: a caller must
+    // supply the ADR-0008 CLR type for the declared column type. Widening is intentionally NOT performed
+    // so a mismatched literal (e.g. `1` where a `long` is declared) fails loudly rather than masking a
+    // schema/value drift.
     private static T Expect<T>(StructField field, object value)
     {
         if (value is T typed)
@@ -174,8 +181,8 @@ internal static class LocalRelationBatches
         if (type.Scale > MaxDecimalScale)
         {
             throw new UnsupportedPlanException(
-                $"Column '{field.Name}' is '{type.SimpleString}': scale {type.Scale} exceeds the "
-                + $"System.Decimal maximum of {MaxDecimalScale}, so a decimal value cannot be encoded.");
+                $"Column '{field.Name}' is '{type.SimpleString}': scale {type.Scale.ToString(CultureInfo.InvariantCulture)} exceeds the "
+                + $"System.Decimal maximum of {MaxDecimalScale.ToString(CultureInfo.InvariantCulture)}, so a decimal value cannot be encoded.");
         }
 
         decimal scaled;
@@ -191,8 +198,8 @@ internal static class LocalRelationBatches
         if (scaled != decimal.Truncate(scaled))
         {
             throw new UnsupportedPlanException(
-                $"Decimal value {value} for column '{field.Name}' cannot be represented at scale "
-                + $"{type.Scale} without loss of precision.");
+                $"Decimal value {Invariant(value)} for column '{field.Name}' cannot be represented at scale "
+                + $"{type.Scale.ToString(CultureInfo.InvariantCulture)} without loss of precision.");
         }
 
         Int128 unscaled;
@@ -209,8 +216,8 @@ internal static class LocalRelationBatches
         if (magnitude >= Pow10Int128(type.Precision))
         {
             throw new UnsupportedPlanException(
-                $"Decimal value {value} for column '{field.Name}' does not fit in precision "
-                + $"{type.Precision} (type '{type.SimpleString}').");
+                $"Decimal value {Invariant(value)} for column '{field.Name}' does not fit in precision "
+                + $"{type.Precision.ToString(CultureInfo.InvariantCulture)} (type '{type.SimpleString}').");
         }
 
         if (type.IsCompact)
@@ -225,8 +232,10 @@ internal static class LocalRelationBatches
 
     private static UnsupportedPlanException DecimalOutOfRange(
         StructField field, DecimalType type, decimal value) =>
-        new($"Decimal value {value} for column '{field.Name}' is out of range for type "
+        new($"Decimal value {Invariant(value)} for column '{field.Name}' is out of range for type "
             + $"'{type.SimpleString}'.");
+
+    private static string Invariant(decimal value) => value.ToString(CultureInfo.InvariantCulture);
 
     private static decimal Pow10Decimal(int exponent)
     {

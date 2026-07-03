@@ -118,11 +118,13 @@ internal sealed class PhysicalPlanner
     private static PhysicalPlan PlanLocalRelation(LogicalLocalRelation relation)
     {
         // Unlike a catalog relation (resolved through the IScanSource seam), a LocalRelation carries its
-        // rows inline: encode them into columnar batches here (the point at which a lazily-created
-        // in-memory DataFrame's rows are finally read — #158 AC1). The relation schema is authoritative.
-        IReadOnlyList<DeltaSharp.Engine.Columnar.ColumnBatch> batches =
-            LocalRelationBatches.Build(relation.Schema, relation.Data);
-        return new ScanPlan(relation.Schema, batches);
+        // rows inline. Defer the row→batch encoding into a thunk the ScanPlan runs on first Execute — so
+        // Plan() (which #179 Explain also runs) performs NO enumeration or I/O, honoring the no-work
+        // planning invariant (#158 AC1). The memoized LocalRelation.Data is enumerated exactly once, at
+        // the first action's execution. The relation schema is authoritative.
+        StructType schema = relation.Schema;
+        IEnumerable<Row> data = relation.Data;
+        return new ScanPlan(schema, () => LocalRelationBatches.Build(schema, data));
     }
 
     private PhysicalPlan PlanFilter(LogicalFilter filter, LogicalOutput outputs)

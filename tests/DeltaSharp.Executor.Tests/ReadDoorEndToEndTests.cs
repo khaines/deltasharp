@@ -168,6 +168,92 @@ public class ReadDoorEndToEndTests
         Assert.Contains("parquet", ex.Message);
     }
 
+    // ---------------- M1: stable, replayable snapshot (Count == Collect, no divergence) ----------------
+
+    [Fact]
+    public void CreateDataFrame_MultiAction_CountAndCollectAgree_OnTheSameFrame()
+    {
+        using SparkSession spark = NewSession();
+        var schema = new StructType(new[] { new StructField("id", IntegerType.Instance, nullable: false) });
+        DataFrame df = spark.CreateDataFrame(new[] { new Row(schema, 1), new Row(schema, 2) }, schema);
+
+        long count = df.Count();
+        IReadOnlyList<Row> collected = df.Collect();
+
+        // The memoizing snapshot makes every action see identical rows: Count and Collect never diverge.
+        Assert.Equal(collected.Count, count);
+        Assert.Equal(2, collected.Count);
+    }
+
+    [Fact]
+    public void CreateDataFrame_SingleUseIterator_ReplaysAcrossTwoActions()
+    {
+        using SparkSession spark = NewSession();
+        var schema = new StructType(new[] { new StructField("id", IntegerType.Instance, nullable: false) });
+        var source = new SingleUseRowSequence(new[] { new Row(schema, 1), new Row(schema, 2), new Row(schema, 3) });
+
+        DataFrame df = spark.CreateDataFrame(source, schema);
+
+        // First action snapshots; a second action replays the snapshot rather than re-enumerating the
+        // (now-exhausted) single-use source. Without memoization the second action would see zero rows.
+        Assert.Equal(3L, df.Count());
+        Assert.Equal(3, df.Collect().Count);
+    }
+
+    [Fact]
+    public void CreateDataFrame_MutationAfterFirstAction_DoesNotChangeResults()
+    {
+        using SparkSession spark = NewSession();
+        var schema = new StructType(new[] { new StructField("id", IntegerType.Instance, nullable: false) });
+        var source = new List<Row> { new(schema, 1), new(schema, 2) };
+
+        DataFrame df = spark.CreateDataFrame(source, schema);
+        long firstCount = df.Count();      // snapshots the two rows
+        source.Add(new Row(schema, 3));    // mutate the source AFTER the first action
+
+        // The snapshot is stable: the mutation is invisible to every later action on the same frame.
+        Assert.Equal(2L, firstCount);
+        Assert.Equal(2L, df.Count());
+        Assert.Equal(2, df.Collect().Count);
+    }
+
+    // ---------------- M2: a Core-only action path runs (bootstrap-enabled) ----------------
+
+    [Fact]
+    public void CreateDataFrame_Count_RunsThroughCoreOnlyPublicApi()
+    {
+        // Reaches an action through ONLY DeltaSharp.Core public types. This passes in isolation
+        // (e.g. --filter ~ReadDoorEndToEnd) because the collection's ExecutorBootstrapFixture called
+        // DeltaSharpExecutor.Enable() — proving the M2 bootstrap makes the read door usable end-to-end
+        // without first touching an Executor type to trip the module initializer.
+        using SparkSession spark = NewSession();
+        var schema = new StructType(new[] { new StructField("id", IntegerType.Instance, nullable: false) });
+
+        long count = spark.CreateDataFrame(new[] { new Row(schema, 1), new Row(schema, 2) }, schema).Count();
+
+        Assert.Equal(2L, count);
+    }
+
+    // ---------------- M3: planning a LocalRelation does not enumerate the source ----------------
+
+    [Fact]
+    public void PlanningLocalRelation_DoesNotEnumerateTheSource()
+    {
+        using SparkSession spark = NewSession();
+        var schema = new StructType(new[] { new StructField("id", IntegerType.Instance, nullable: false) });
+        var source = new CountingRowSequence(new[] { new Row(schema, 1), new Row(schema, 2) });
+        DataFrame df = spark.CreateDataFrame(source, schema);
+
+        // PhysicalPlanner.Plan is the path #179 ExplainPhysical runs; it must build the physical tree
+        // WITHOUT enumerating (or doing IO on) the user source — the row→batch encoding is deferred to
+        // ScanPlan.Execute (M3). If Plan() enumerated, an IO-backed source would do IO at explain time.
+        var fixture = new InMemoryRelationFixture();
+        PhysicalPlan physical = fixture.Plan(df);
+
+        Assert.NotNull(physical);
+        Assert.Equal(0, source.EnumerationCount);
+    }
+
     /// <summary>An <see cref="IEnumerable{Row}"/> that counts how many times it is enumerated, so a test
     /// can prove CreateDataFrame is lazy (zero until an action) and materialization enumerates once.</summary>
     private sealed class CountingRowSequence : IEnumerable<Row>
@@ -181,6 +267,30 @@ public class ReadDoorEndToEndTests
         public IEnumerator<Row> GetEnumerator()
         {
             EnumerationCount++;
+            return _rows.GetEnumerator();
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+    }
+
+    /// <summary>An <see cref="IEnumerable{Row}"/> that yields its rows only on the FIRST enumeration and
+    /// an empty sequence thereafter — proving the memoizing snapshot replays from cache rather than
+    /// re-enumerating a single-use source (M1).</summary>
+    private sealed class SingleUseRowSequence : IEnumerable<Row>
+    {
+        private readonly IReadOnlyList<Row> _rows;
+        private bool _consumed;
+
+        public SingleUseRowSequence(IReadOnlyList<Row> rows) => _rows = rows;
+
+        public IEnumerator<Row> GetEnumerator()
+        {
+            if (_consumed)
+            {
+                return System.Linq.Enumerable.Empty<Row>().GetEnumerator();
+            }
+
+            _consumed = true;
             return _rows.GetEnumerator();
         }
 
