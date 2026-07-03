@@ -26,7 +26,7 @@ physical rendering *plans* the query (through the executor seam) but never *runs
 | Concern | Assembly | Type(s) |
 | --- | --- | --- |
 | Public `Explain` API + section assembly | `DeltaSharp.Core` (`net8.0;net10.0`, packable) | `DataFrame.Explain*`, `DataFrame.ToExplainString`, `ExplainMode` |
-| Tree rendering of the logical IR | `DeltaSharp.Core` | `TreeNode<T>.TreeString()` (reused as-is) |
+| Tree-string rendering (logical + physical) | `DeltaSharp.Core` | shared `TreeStringRenderer.Render<T>`, backing `TreeNode<T>.TreeString()` and `PhysicalPlan.TreeString()` |
 | Analyze/optimize stages | `DeltaSharp.Core` | `Analyzer`, `Optimizer`/`DataFrame.Optimize` seam |
 | Physical-plan string (the seam) | contract in `DeltaSharp.Core`, impl in `DeltaSharp.Executor` | `IQueryExecutor.ExplainPhysical`, `LocalQueryExecutor`, `PhysicalPlan.TreeString()` |
 
@@ -86,7 +86,7 @@ plan-diagnostic behaviour of §6 (which concerns plan **content**, not the mode 
 
 ```csharp
 SparkSession spark = SparkSession.Builder().AppName("explain-demo").GetOrCreate();
-DataFrame df = spark.Sql("SELECT name, age FROM people")   // any DataFrame door (Sql/Read/CreateDataFrame)
+DataFrame df = spark.Sql("SELECT name, age FROM people")   // illustrative — public doors land in #158/#159 (see note)
     .Filter(Col("age").Gt(21))
     .Select(Col("name"), Col("age"));
 
@@ -97,10 +97,13 @@ df.Explain(ExplainMode.Simple);                // strongly-typed overload
 string text = df.ToExplainString(ExplainMode.Extended); // capture instead of print
 ```
 
-> **M1 door note.** `spark.Sql(...)` returns a DataFrame backed by an unresolved plan without executing
-> (the public file read-door `Read.Parquet`/`CreateDataFrame` is STORY-04.1.2 / #158); there is **no**
-> `spark.Read.Table(...)` in M1. Any door that yields a `DataFrame` works — `Explain` only builds and
-> renders plans.
+> **M1 door note (illustrative sample).** The DataFrame doors shown — `spark.Sql(...)`
+> (STORY-04.1.3 / #159) and `spark.CreateDataFrame(...)` / `spark.Read.Parquet(...)` (STORY-04.1.2 /
+> #158) — are **not yet wired in M1**: today they throw a deferral diagnostic, and there is **no**
+> `spark.Read.Table(...)`. The snippet illustrates the intended public usage once a door lands.
+> `Explain`/`ToExplainString` themselves are fully functional and render the plan of *any* `DataFrame`
+> (until a public door lands, DataFrames are produced internally — e.g. the test relation fixture).
+> `Explain` only builds and renders plans — it never executes.
 
 None of these executes the query — `Explain` is a debugging aid, not an action.
 
@@ -112,7 +115,7 @@ The story's acceptance criteria describe rendered **content**; the modes above d
 | --- | --- |
 | AC1 — *logical mode*: unresolved plan rendered without execution | The **Parsed Logical Plan** section (present in `Extended`), rendered from the raw unresolved `LogicalPlan`; never executes. |
 | AC2 — *extended mode*: analyzed/optimized rendered separately from unresolved | `Extended`'s four separately-headed sections. |
-| AC3 — *physical mode*: scans/filters/projections/joins/aggregates/sorts/limits/writes visible | The **Physical Plan** section (present in `Simple`, `Extended`, `Formatted`). |
+| AC3 — *physical mode*: scans/filters/projections/joins/aggregates/sorts/limits/writes visible | The **Physical Plan** section (emitted in **every** mode; `Extended`/`Cost` add the logical sections above it). |
 | AC4 — unsupported/unresolved status without hiding diagnostics; never a raw exception | §6. |
 | AC5 — physical execution metadata after an action, without changing results | §7 (optional metrics seam). |
 
@@ -153,8 +156,10 @@ interpreted backend (ADR-0001).
 The logical trees are rendered by the **existing** `TreeNode<T>.TreeString()`
 (`src/DeltaSharp.Core/Plans/TreeNode.cs`), which already produces Spark's indented tree with
 `+-`/`:-` connectors and the leading-apostrophe unresolved marker (`LogicalPlan.UnresolvedPrefix`). We
-**reuse** it verbatim — no new logical renderer. Physical rendering (§5) mirrors the same connector
-format. (Neither renderer numbers nodes.)
+**reuse** it verbatim — no new logical renderer. Both `TreeNode<T>.TreeString()` and the physical
+`PhysicalPlan.TreeString()` (§5) delegate to one shared internal renderer,
+`DeltaSharp.Plans.TreeStringRenderer.Render<T>`, so the Spark connector format is a single source of
+truth (no duplicated copy to drift between the layers). (Neither renderer numbers nodes.)
 
 ---
 
@@ -226,8 +231,9 @@ Implementations:
 
 ### Physical-plan rendering (`PhysicalPlan.TreeString()`)
 
-`PhysicalPlan` gains a `NodeName`, a `SimpleString`, and a `TreeString()` that mirrors the Core
-`TreeNode` connector format (`+-`/`:-`). Each node renders its type and light, always-available
+`PhysicalPlan` gains a `NodeName`, a `SimpleString`, and a `TreeString()` that delegates to the shared
+`TreeStringRenderer` (the same renderer backing Core's `TreeNode<T>.TreeString()`), so both trees use
+one connector format (`+-`/`:-`). Each node renders its type and light, always-available
 metadata (output field names, join type, limit count, sort keys), plus a defensive expression renderer
 (`PhysicalPlanText.Expr`) for predicates/projections/keys:
 
