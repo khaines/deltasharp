@@ -16,7 +16,10 @@ namespace DeltaSharp.Optimization.Rules;
 /// <b>fresh</b> id absent from <c>child</c>. So "references only pass-through columns" is precisely
 /// "every referenced id exists in <c>child</c>", under which the pushed filter is well-formed and
 /// evaluates identically. Predicates over a computed alias are left in place (precondition not met →
-/// subtree preserved). See <c>docs/engineering/design/logical-optimizer.md</c> §3.3.
+/// subtree preserved). The push additionally requires the predicate (and the pass-through targets it
+/// lands on) to be <see cref="Expression.Deterministic"/> — inert in M1, correct once
+/// non-deterministic expressions land (#413). See
+/// <c>docs/engineering/design/logical-optimizer.md</c> §3.3.
 /// </remarks>
 internal sealed class PushPredicateThroughProject : Rule
 {
@@ -37,10 +40,18 @@ internal sealed class PushPredicateThroughProject : Rule
             return node;
         }
 
+        // Do not move a non-deterministic predicate below a projection: pushing it past the
+        // projection could change how often/over which rows it evaluates (guard inert in M1, #413).
+        if (!filter.Condition.Deterministic)
+        {
+            return node;
+        }
+
         var passThroughIds = new HashSet<ExprId>();
         foreach (Expression element in project.ProjectList)
         {
-            if (element is AttributeReference reference)
+            // Only a deterministic pass-through attribute is a safe landing target for the predicate.
+            if (element is AttributeReference reference && element.Deterministic)
             {
                 passThroughIds.Add(reference.ExprId);
             }

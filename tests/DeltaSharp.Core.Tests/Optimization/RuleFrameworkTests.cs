@@ -58,10 +58,19 @@ public sealed class RuleFrameworkTests
     {
         var rule = new TogglingRule();
         var batch = new RuleBatch("toggle", RuleStrategy.FixedPoint, 3, rule);
+        var optimizer = new Optimizer(new[] { batch });
 
-        _ = new Optimizer(new[] { batch }).Optimize(OptimizerFixtures.People());
+        // The rule never converges. In DEBUG/test builds the optimizer surfaces non-convergence as an
+        // exception (a rule/ordering bug should be loud); in Release it defensively returns the
+        // best-effort plan. Either way the safety valve stops after exactly MaxIterations sweeps.
+#if DEBUG
+        var ex = Assert.Throws<InvalidOperationException>(
+            () => optimizer.Optimize(OptimizerFixtures.People()));
+        Assert.Contains("did not converge", ex.Message, StringComparison.Ordinal);
+#else
+        _ = optimizer.Optimize(OptimizerFixtures.People());
+#endif
 
-        // The safety valve stops after exactly MaxIterations sweeps (each sweep applies the rule once).
         Assert.Equal(3, rule.Applications);
     }
 

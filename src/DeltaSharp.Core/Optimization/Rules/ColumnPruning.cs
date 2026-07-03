@@ -44,30 +44,30 @@ internal sealed class ColumnPruning : Rule
                 {
                     // A projection cuts the output: below it, only what the list references survives.
                     HashSet<ExprId> childRequired = AttributeReferences.Of(project.ProjectList);
-                    return RebuildUnary(project, project.Child, Prune(project.Child, childRequired));
+                    return project.MapChildren(child => Prune(child, childRequired));
                 }
 
             case Filter filter:
                 {
                     // Output = child output (pass-through); the predicate also needs its columns.
                     HashSet<ExprId>? childRequired = With(required, filter.Condition);
-                    return RebuildUnary(filter, filter.Child, Prune(filter.Child, childRequired));
+                    return filter.MapChildren(child => Prune(child, childRequired));
                 }
 
             case Sort sort:
                 {
                     // Output = child output; the ordering additionally needs its key columns.
-                    HashSet<ExprId>? childRequired = required is null ? null : Union(required, sort.Order);
-                    return RebuildUnary(sort, sort.Child, Prune(sort.Child, childRequired));
+                    HashSet<ExprId>? childRequired = With(required, sort.Order);
+                    return sort.MapChildren(child => Prune(child, childRequired));
                 }
 
             case Limit limit:
                 // Positional truncation: the required set passes through unchanged.
-                return RebuildUnary(limit, limit.Child, Prune(limit.Child, required));
+                return limit.MapChildren(child => Prune(child, required));
 
             case Distinct distinct:
                 // The dedup key is ALL child columns; pruning any would change the row multiset.
-                return RebuildUnary(distinct, distinct.Child, Prune(distinct.Child, required: null));
+                return distinct.MapChildren(child => Prune(child, required: null));
 
             case ResolvedRelation relation:
                 return PruneRelation(relation, required);
@@ -117,16 +117,17 @@ internal sealed class ColumnPruning : Rule
             relation.Identifier, new StructType(keptFields), keptOutput, relation.Options);
     }
 
-    /// <summary>Rebuilds a unary node with a pruned child, sharing the original instance when the
-    /// child is unchanged (reference-equal).</summary>
-    private static LogicalPlan RebuildUnary(LogicalPlan node, LogicalPlan originalChild, LogicalPlan newChild) =>
-        ReferenceEquals(newChild, originalChild)
-            ? node
-            : node.WithNewChildren(new[] { newChild });
+    /// <summary>Adds every expression's referenced ids to a copy of <paramref name="required"/>, or
+    /// returns <see langword="null"/> when the required set is <see langword="null"/> (output not yet
+    /// cut by a projection — keep everything). The single nullable-aware "extend the required set"
+    /// helper shared by the pass-through operators (<see cref="Filter"/>'s condition,
+    /// <see cref="Sort"/>'s ordering keys).</summary>
+    private static HashSet<ExprId>? With(HashSet<ExprId>? required, params Expression[] expressions) =>
+        With(required, (IEnumerable<Expression>)expressions);
 
-    /// <summary>Adds an expression's referenced ids to a copy of <paramref name="required"/>
-    /// (or returns <see langword="null"/> when the required set is <see langword="null"/>).</summary>
-    private static HashSet<ExprId>? With(HashSet<ExprId>? required, Expression expression)
+    /// <summary>Sequence form of the required-set extension helper (the params overload forwards
+    /// here); shares the same null handling.</summary>
+    private static HashSet<ExprId>? With(HashSet<ExprId>? required, IEnumerable<Expression> expressions)
     {
         if (required is null)
         {
@@ -134,16 +135,9 @@ internal sealed class ColumnPruning : Rule
         }
 
         var union = new HashSet<ExprId>(required);
-        AttributeReferences.Collect(expression, union);
-        return union;
-    }
-
-    private static HashSet<ExprId> Union(HashSet<ExprId> required, IReadOnlyList<Expression> expressions)
-    {
-        var union = new HashSet<ExprId>(required);
-        for (int i = 0; i < expressions.Count; i++)
+        foreach (Expression expression in expressions)
         {
-            AttributeReferences.Collect(expressions[i], union);
+            AttributeReferences.Collect(expression, union);
         }
 
         return union;

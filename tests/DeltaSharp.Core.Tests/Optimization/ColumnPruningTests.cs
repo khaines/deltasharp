@@ -1,6 +1,7 @@
 using DeltaSharp.Optimization.Rules;
 using DeltaSharp.Plans.Expressions;
 using DeltaSharp.Plans.Logical;
+using DeltaSharp.Types;
 using Xunit;
 
 namespace DeltaSharp.Core.Tests.Optimization;
@@ -97,6 +98,43 @@ public sealed class ColumnPruningTests
         LogicalPlan pruned = Prune(plan);
 
         Assert.Same(plan, pruned);
+        Assert.Equal(3, RelationUnder(pruned).Output.Count);
+    }
+
+    [Fact]
+    public void KeepsColumnRequiredBySort_BetweenProjectAndScan()
+    {
+        // Project 'age' (#2) over Sort(by name #1) over people: the scan must retain 'name' because
+        // the ordering below the projection still needs it, even though it is not in the output.
+        var order = new SortOrder(OptimizerFixtures.Name, SortDirection.Ascending, NullOrdering.NullsFirst);
+        LogicalPlan plan = new Project(
+            new Expression[] { OptimizerFixtures.Age },
+            new Sort(new Expression[] { order }, global: true, OptimizerFixtures.People()));
+
+        ResolvedRelation relation = RelationUnder(Prune(plan));
+
+        // 'id' is dropped; both 'name' (sort key) and 'age' (output) are retained, in schema order.
+        Assert.Equal(new[] { "name", "age" }, relation.Output.Select(a => a.Name));
+    }
+
+    [Fact]
+    public void DoesNotPrune_AggregateInputs_PreservingReferences()
+    {
+        // Project a group column over an Aggregate: M1 does not model Aggregate's output, so it never
+        // prunes the Aggregate's direct scan input. The whole plan (Aggregate and its child relation)
+        // must be reference-preserved so a future "prune aggregate inputs" change cannot silently
+        // corrupt retained group columns / auto-named outputs (#402/#404).
+        var count = new ResolvedFunction(
+            "count", FunctionKind.Aggregate, LongType.Instance, nullable: false,
+            new Expression[] { OptimizerFixtures.Age });
+        var aggregate = new Aggregate(
+            new Expression[] { OptimizerFixtures.Age }, new Expression[] { count }, OptimizerFixtures.People());
+        LogicalPlan plan = new Project(new Expression[] { OptimizerFixtures.Age }, aggregate);
+
+        LogicalPlan pruned = Prune(plan);
+
+        Assert.Same(plan, pruned);
+        Assert.Same(aggregate, Assert.IsType<Project>(pruned).Child);
         Assert.Equal(3, RelationUnder(pruned).Output.Count);
     }
 

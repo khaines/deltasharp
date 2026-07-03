@@ -101,14 +101,17 @@ RunBatch(batch, plan):
 
 | # | Batch | Strategy | Rules (in order) |
 |---|-------|----------|------------------|
-| 1 | `ConstantFolding`       | FixedPoint | `ConstantFolding` |
-| 2 | `Operator Optimization` | FixedPoint | `CombineFilters`, `PushPredicateThroughProject`, `ColumnPruning` |
+| 1 | `Operator Optimization` | FixedPoint | `ConstantFolding`, `CombineFilters`, `PushPredicateThroughProject`, `ColumnPruning` |
 
-Constant folding runs **first** so later rules see simplified predicates (e.g. a folded
-`Filter(true)`). The operator batch then combines adjacent filters, pushes predicates toward the
-scan, and prunes unused scan columns; running these together to a fixpoint lets pushdown expose more
-pruning and vice versa. The batch list, the rule order within each batch, and every rule's internal
-logic are **fixed and deterministic**, so `Optimize` is a deterministic function of its input (§5).
+`ConstantFolding` runs **first within the batch** so later rules in the same sweep see simplified
+predicates (e.g. a folded `Filter(false)`). Crucially it is **co-located inside** the operator batch
+rather than in a separate earlier batch, so the whole pipeline reaches a **global** fixpoint: when
+`CombineFilters` synthesizes an `And(c1, c2)` of two boolean literals, the *next* sweep's
+`ConstantFolding` folds it, and the sweep after that is a no-op. The batch then combines adjacent
+filters, pushes predicates toward the scan, and prunes unused scan columns; running these together to
+a fixpoint lets pushdown expose more pruning and folding expose more combination, and vice versa. The
+batch list, the rule order within the batch, and every rule's internal logic are **fixed and
+deterministic**, so `Optimize` is a deterministic function of its input (§5).
 
 ## 3. The M1 rules
 
@@ -150,10 +153,17 @@ None of these fire; each is a future rule.
 
 ### 3.2 `CombineFilters`
 
-**Trigger.** A `Filter` whose child is a `Filter`. **Transform.**
-`Filter(c1, Filter(c2, g)) → Filter(And(c1, c2), g)`. A row survives two nested filters iff both
-predicates are TRUE, which is exactly `c1 AND c2` under 3VL — so this is semantics-preserving. Chains
-of three or more filters collapse over successive fixpoint iterations. (AC: "filter combination".)
+**Trigger.** A `Filter` whose child is a `Filter`, where **both** predicates are deterministic.
+**Transform.** `Filter(outer, Filter(inner, g)) → Filter(And(inner, outer), g)`. A row survives two
+nested filters iff both predicates are TRUE, which is exactly `inner AND outer` under 3VL — so this is
+semantics-preserving. The conjunction is emitted **inner (child) predicate first** to match Spark:
+under short-circuit ANSI evaluation the operand order is observable, and keeping the child predicate
+first preserves a guard the inner filter provided (e.g. `age != 0`) ahead of a predicate that depends
+on it (e.g. `1 / age > 0`), so the combined filter never raises an error the original nested plan
+could not. Because the rule runs `TransformUp` (**post-order**), an N-filter chain collapses in a
+**single bottom-up sweep** — not over successive fixpoint iterations. The deterministic-only guard is
+inert in M1 (every M1 predicate is deterministic) and correct once `rand`/`uuid` land (#413). (AC:
+"filter combination".)
 
 ### 3.3 `PushPredicateThroughProject`
 
@@ -174,7 +184,8 @@ through a stack of projections one level per iteration.
 **Deliberately NOT in M1:** pushing a filter into/through `Aggregate`, `Join` (either side),
 `Union`, `Window`, or a `Project` with aliases (would require rewriting the predicate in terms of the
 alias definitions). Conservative and Spark-faithful: pushing through an aggregate or join can change
-semantics, so M1 refuses.
+semantics, so M1 refuses. The push also requires the predicate and its pass-through landing targets
+to be deterministic — inert in M1, correct once non-deterministic expressions land (#413).
 
 ### 3.4 `ColumnPruning`
 
@@ -196,7 +207,7 @@ Per operator:
 | `Limit`        | `required` unchanged | Positional truncation; column values are irrelevant. |
 | `Distinct`     | **`null`** | Dedup key is *all* child columns; dropping any would change the row multiset. |
 | `ResolvedRelation` | — | If `required` is `null`, keep all. Otherwise keep only `Output` attributes whose `ExprId ∈ required`, in original order, and prune `Schema` to the matching fields. |
-| any other (`Aggregate`, `Join`, `Union`, `WriteToSource`, …) | prune each child with **`null`** | Conservative: M1 does not model these outputs, so it never prunes beneath them. |
+| any other (`Aggregate`, `Join`, `Union`, `WriteToSource`, …) | prune each child with **`null`** | Conservative: M1 does not model these operators' outputs, so it resets `required` to keep-all before recursing — it never prunes their **direct inputs**. |
 
 Only **`ResolvedRelation` leaves are ever rewritten**; the pruned relation reuses the very same
 `AttributeReference` instances (identical `ExprId`/type/nullability) for the kept columns, so every
@@ -205,6 +216,14 @@ reference above it stays valid and the plan's final output schema is unchanged. 
 flow to the result un-projected are never pruned (that would drop result columns) — the pass only
 prunes below a `Project` that has already cut them.
 
+Precisely, the "any other" reset means pruning does **not** apply to the *direct* input of an
+`Aggregate`/`Join`/`Union` (their child is pruned with `required == null`, i.e. keep-all). It does
+**not** mean pruning stops for the whole subtree: a **deeper `Project`** re-establishes a fresh
+required set from its projection list, so scan pruning resumes below that inner projection. One
+degenerate case is worth noting: when a projection references nothing usable (`keptOutput.Count == 0`
+at a scan — an empty required intersection), `PruneRelation` keeps **all** columns rather than
+producing a zero-column scan, preserving a well-formed relation.
+
 **Deliberately NOT in M1:** pruning `Aggregate`/`Join`/`Union` inputs, collapsing adjacent
 projections, and introducing new intermediate `Project` nodes. Only scan-column pruning below an
 existing projection is performed.
@@ -212,13 +231,13 @@ existing projection is performed.
 ## 4. Immutability and structural sharing
 
 Plan nodes are immutable (`TreeNode<T>`); no rule mutates a node in place. Every rewrite produces a
-**new** tree through the existing structural transforms — `TransformUp`/`TransformDown`,
-`MapChildren`, `WithNewChildren`, and `TransformExpressionsUp`/`MapExpressions` — all of which
-**share unchanged subtrees by reference** (they return the same instance when a transform is a no-op,
-short-circuiting on `ReferenceEquals`). `ColumnPruning` mirrors this discipline by hand: it rebuilds
-a unary node only when its pruned child is not reference-equal to the original, otherwise it returns
-the original node. Net effect: a rule that changes nothing returns the input instance, and a rule
-that changes one leaf shares the entire untouched remainder of the tree.
+**new** tree through the existing structural transforms — the M1 rules use exactly `TransformUp`,
+`TransformExpressionsUp`, `MapChildren`, and `WithNewChildren` — all of which **share unchanged
+subtrees by reference** (they return the same instance when a transform is a no-op, short-circuiting
+on `ReferenceEquals`). `ColumnPruning` rebuilds through `MapChildren`, so a unary node is rebuilt only
+when its pruned child is not reference-equal to the original, otherwise the original node is returned.
+Net effect: a rule that changes nothing returns the input instance, and a rule that changes one leaf
+shares the entire untouched remainder of the tree.
 
 ## 5. Determinism, idempotence, and termination
 
@@ -229,36 +248,57 @@ nondeterministic API is used (no `Guid.NewGuid`, `DateTime.Now/UtcNow`, `Random`
 `Reflection.Emit`); the optimizer never mints an `ExprId`. So `Optimize(p)` is a pure function of
 `p`.
 
-**Idempotent.** Every batch runs to a fixpoint, so a second `Optimize` re-runs each batch, finds the
-plan already at its fixpoint (first sweep reproduces a structurally-equal tree), and stops —
-`Optimize(Optimize(p)).Equals(Optimize(p))`.
+**Idempotent.** The single operator-optimization batch runs to a **global** fixpoint. This is what
+makes idempotence hold *across* rules that feed each other: `CombineFilters` may synthesize an
+`And(c1, c2)` that only `ConstantFolding` can then fold, and because both rules live in the *same*
+fixpoint batch the batch keeps sweeping until neither fires — for example
+`Optimize(Filter(true, Filter(true, r)))` converges to `Filter(true, r)` (combine → `And(true, true)`
+→ fold → `true`). A second `Optimize` re-runs the batch, finds the plan already at that fixpoint (the
+first sweep reproduces a structurally-equal tree), and stops — `Optimize(Optimize(p)).Equals(Optimize(p))`.
+Had constant folding stayed a separate earlier batch, the synthesized `And(true, true)` would survive
+the first `Optimize` and only fold on the second, breaking idempotence.
 
 **Terminating.** `Once` batches are a single sweep. Each `FixedPoint` batch stops as soon as a sweep
-is a no-op *or* after `MaxIterations` (default `100`), so termination is guaranteed regardless. The
-rules also converge on their own: `ConstantFolding` and `CombineFilters` strictly reduce node count;
-`PushPredicateThroughProject` strictly increases a filter's depth, bounded by the (finite) number of
-`Project` ancestors; `ColumnPruning` strictly reduces the total scan-column count. Each measure is
-bounded below, so the combined sweep reaches a fixpoint well within the safety valve for the shallow
-M1 plans.
+is a no-op *or* after `MaxIterations` (default `100`), so termination is guaranteed regardless (a
+`FixedPoint` batch that exits via the cap rather than a no-op sweep is a rule/ordering bug and is
+surfaced as an exception in DEBUG/test builds). The rules also converge on their own: `ConstantFolding`
+strictly reduces expression-node count; `CombineFilters` strictly reduces the count of adjacent
+`Filter` **operators** (2 → 1 — note it *adds* an `And` expression node, so the decreasing measure is
+the number of `Filter` operators, not the total tree-node count); `PushPredicateThroughProject`
+strictly increases a filter's depth, bounded by the (finite) number of `Project` ancestors;
+`ColumnPruning` strictly reduces the total scan-column count. Each measure is bounded below, so the
+combined sweep reaches a fixpoint well within the safety valve for the shallow M1 plans.
 
 **Semantics-preserving.** No rule changes the plan's output schema or its result multiset: folding
 replaces an expression with its own value; filter combination/pushdown preserves the surviving-row
 set; and column pruning only removes scan columns that are provably unreferenced above the projection
 that already dropped them (§3.4).
 
+**Nullability note.** Boolean 3VL folding can *tighten* a result's nullability hint toward a
+provably-correct **non-nullable** literal (e.g. `And(x, false) → false`, which is never `NULL`); it
+never **widens** nullability. This is Spark-faithful — a folded constant carries its own exact
+nullability. It also means the user-facing schema must be derived from the **analyzed** plan, not the
+optimized one, so folding can never surprise a caller by reporting a narrower/wider column
+nullability than analysis promised; the `analyzed → optimized → planner` bridge (#174) derives the
+reported schema from the analyzed plan.
+
 ## 6. Acceptance criteria → tests
 
 Tests live in `tests/DeltaSharp.Core.Tests/Optimization/` (`OptimizerTests.cs`,
 `ConstantFoldingTests.cs`, `ColumnPruningTests.cs`, `PredicatePushdownTests.cs`,
-`RuleFrameworkTests.cs`).
+`RuleFrameworkTests.cs`). Names below are `Class.Method` (the classes carry the `Optimizer`/rule
+context, so method names are unprefixed).
 
 | Acceptance criterion | Tests |
 |---|---|
-| **AC1** — rules (pruning, filter combination, constant folding) return **new immutable** plan trees | `ConstantFolding_FoldsIntegerArithmetic`; `CombineFilters_MergesNestedFilters`; `PushPredicate_MovesFilterBelowProject`; `ColumnPruning_DropsUnreferencedScanColumns`; `Optimizer_ReturnsNewTree_WithoutMutatingInput` (input tree unchanged; result is a distinct tree) |
-| **AC2** — precondition not met ⇒ subtree preserved | `ConstantFolding_DoesNotFold_NonConstantExpression`; `ConstantFolding_DoesNotFold_OnAnsiOverflow`; `PushPredicate_DoesNotPush_ThroughAliasColumn`; `ColumnPruning_DoesNotPrune_BelowDistinct`; `ColumnPruning_NoOp_WhenAllColumnsUsed`; `Optimizer_NoOp_ReturnsReferenceEqualPlan` |
-| **AC3** — analyzed and optimized render separately (EXPLAIN) | `Optimizer_AnalyzedAndOptimizedPlans_RenderIndependently` (both `TreeString()`s differ and each renders standalone) |
-| **AC4** — output schema/results equivalent to the analyzed plan | `ColumnPruning_PreservesTopLevelOutputSchema`; `Optimizer_PreservesPlanOutput_ForAnalyzedPlan`; `ConstantFolding_PreservesResultType` |
-| Framework — batch/fixpoint/ordering, idempotence, termination | `RuleFramework_RunsBatchesToFixpoint`; `RuleFramework_HonorsMaxIterations`; `Optimizer_IsIdempotent`; `Optimizer_IsDeterministic_AcrossRuns` |
+| **AC1** — rules (pruning, filter combination, constant folding) return **new immutable** plan trees | `ConstantFoldingTests.FoldsIntegerArithmetic_ToLiteral`; `PredicatePushdownTests.CombineFilters_MergesNestedFilters_IntoConjunction`; `PredicatePushdownTests.PushPredicate_MovesFilterBelowProject_ForPassThroughColumn`; `ColumnPruningTests.DropsUnreferencedScanColumns_BelowProjection`; `OptimizerTests.ReturnsNewTree_WithoutMutatingInput` (input tree unchanged; result is a distinct tree) |
+| **AC2** — precondition not met ⇒ subtree preserved | `ConstantFoldingTests.DoesNotFold_NonConstantExpression`; `ConstantFoldingTests.DoesNotFold_OnAnsiOverflow`; `PredicatePushdownTests.PushPredicate_DoesNotPush_ThroughAliasColumn`; `ColumnPruningTests.DoesNotPrune_BelowDistinct`; `ColumnPruningTests.NoOp_WhenAllColumnsUsed`; `OptimizerTests.NoOp_ReturnsReferenceEqualPlan` |
+| **AC3** — analyzed and optimized render separately (EXPLAIN) | `OptimizerTests.AnalyzedAndOptimizedPlans_RenderIndependently` (both `TreeString()`s differ and each renders standalone) |
+| **AC4** — output schema/results equivalent to the analyzed plan | `ColumnPruningTests.PreservesTopLevelOutputSchema`; `OptimizerTests.PreservesPlanOutput_ForAnalyzedPlan`; `ConstantFoldingTests.PreservesResultType_ForLongMultiply` |
+| **M1** — `CombineFilters` emits inner (child) conjunct first (Spark ANSI short-circuit parity) | `PredicatePushdownTests.CombineFilters_EmitsInnerConjunctFirst_ForAnsiShortCircuitSafety`; `PredicatePushdownTests.CombineFilters_MergesNestedFilters_IntoConjunction` |
+| **M2** — global-fixpoint idempotence on stacked constant filters | `OptimizerTests.IsIdempotent_ForStackedConstantTrueFilters`; `OptimizerTests.IsIdempotent_ForStackedConstantFilters_FoldingToFalse` |
+| **L3** — `Optimize` rejects an unresolved plan | `OptimizerTests.Optimize_RejectsUnresolvedPlan` |
+| Framework — batch/fixpoint/ordering, idempotence, termination | `RuleFrameworkTests.RunsFixpointBatch_UntilNoFurtherChange`; `RuleFrameworkTests.RunsBatchesInOrder`; `RuleFrameworkTests.HonorsMaxIterations_ForNonConvergingBatch`; `OptimizerTests.IsIdempotent`; `OptimizerTests.IsDeterministic_AcrossRuns` |
 
 ## 7. Follow-ups (post-M1)
 
@@ -266,3 +306,10 @@ Comparison/`Cast`/decimal constant folding and `NullPropagation`; `BooleanSimpli
 `CollapseProject`; predicate pushdown through joins/aggregates and into scans as data-source filters;
 limit pushdown (`LocalLimit`/`GlobalLimit`); a cost-based layer; and wiring `Optimize` into the
 action driver's `analyzed → optimized → planner` path (#173/#174) with an EXPLAIN command.
+
+**Determinism-guard, dedup, and alias-substitution follow-ups are tracked under
+[#413](https://github.com/khaines/deltasharp/issues/413).** The `Expression.Deterministic` seam
+already gates `CombineFilters` and `PushPredicateThroughProject` (inert in M1, since every M1
+expression is deterministic); #413 lands the first non-deterministic expressions (`rand`/`uuid`/
+`current_row_timestamp`) that override `Deterministic => false`, plus common-subexpression dedup and
+the alias-substitution needed to push predicates through aliasing projections.

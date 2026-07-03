@@ -103,10 +103,19 @@ public sealed class OptimizerTests
 
         LogicalPlan optimized = new Optimizer().Optimize(plan);
 
-        // Constant folding collapses the redundant true predicates; the scan is pruned to 'age'.
+        // CombineFilters merges the two filters and PushPredicateThroughProject moves the merged
+        // filter below the projection; ColumnPruning then prunes the scan to just 'age'. The redundant
+        // `true` predicates are NOT folded away: M1 constant folding only collapses an all-literal
+        // node, and `And(true, age > 21)` has a non-literal operand (M1 has no BooleanSimplification),
+        // so the conjunction structure is preserved.
         var relation = (ResolvedRelation)DescendToRelation(optimized);
         Assert.Single(relation.Output);
         Assert.Equal("age", relation.Output[0].Name);
+
+        // The pushed filter still carries a conjunction (the `true` conjuncts survive, unfolded).
+        var project = Assert.IsType<Project>(optimized);
+        var pushedFilter = Assert.IsType<Filter>(project.Child);
+        Assert.IsType<And>(pushedFilter.Condition);
     }
 
     [Fact]
@@ -118,6 +127,60 @@ public sealed class OptimizerTests
         LogicalPlan twice = new Optimizer().Optimize(once);
 
         Assert.Equal(once, twice);
+    }
+
+    [Fact]
+    public void IsIdempotent_ForStackedConstantTrueFilters()
+    {
+        // Filter(true, Filter(true, relation)). CombineFilters synthesizes And(true, true), which the
+        // co-located ConstantFolding (in the same global fixpoint batch) folds to `true` on the next
+        // sweep. A second Optimize must reproduce a structurally-equal plan (global-fixpoint idempotence).
+        LogicalPlan plan = new Filter(
+            Literal.OfBoolean(true),
+            new Filter(Literal.OfBoolean(true), OptimizerFixtures.People()));
+
+        LogicalPlan once = new Optimizer().Optimize(plan);
+        LogicalPlan twice = new Optimizer().Optimize(once);
+
+        Assert.Equal(once, twice);
+
+        // The two stacked filters collapsed to a single filter and the synthesized And(true, true)
+        // was fully folded to a boolean literal — no residual conjunction survives.
+        var filter = Assert.IsType<Filter>(once);
+        var literal = Assert.IsType<Literal>(filter.Condition);
+        Assert.Equal(BooleanType.Instance, literal.Type);
+        Assert.True((bool)literal.Value!);
+        Assert.IsType<ResolvedRelation>(filter.Child);
+    }
+
+    [Fact]
+    public void IsIdempotent_ForStackedConstantFilters_FoldingToFalse()
+    {
+        // Filter(true, Filter(false, relation)) → And(false, true) → folded to `false`.
+        LogicalPlan plan = new Filter(
+            Literal.OfBoolean(true),
+            new Filter(Literal.OfBoolean(false), OptimizerFixtures.People()));
+
+        LogicalPlan once = new Optimizer().Optimize(plan);
+        LogicalPlan twice = new Optimizer().Optimize(once);
+
+        Assert.Equal(once, twice);
+
+        var filter = Assert.IsType<Filter>(once);
+        var literal = Assert.IsType<Literal>(filter.Condition);
+        Assert.False((bool)literal.Value!);
+    }
+
+    [Fact]
+    public void Optimize_RejectsUnresolvedPlan()
+    {
+        // The optimizer's rules assume a resolved (analyzed) plan with bound ids/types; an unresolved
+        // plan is a programming error and must be rejected up front rather than silently mis-optimized.
+        LogicalPlan unresolved = new UnresolvedRelation(new[] { "people" });
+
+        Assert.False(unresolved.Resolved);
+        var ex = Assert.Throws<InvalidOperationException>(() => new Optimizer().Optimize(unresolved));
+        Assert.Contains("resolved", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

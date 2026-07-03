@@ -23,10 +23,35 @@ public sealed class PredicatePushdownTests
 
         var combined = Assert.IsType<Filter>(new CombineFilters().Apply(outer));
 
+        // Spark emits the child (inner) predicate first: And(inner, outer). Under short-circuit ANSI
+        // evaluation this order is observable, so it must match Spark exactly.
         var and = Assert.IsType<And>(combined.Condition);
-        Assert.Equal(outer.Condition, and.Left);
-        Assert.Equal(inner.Condition, and.Right);
+        Assert.Equal(inner.Condition, and.Left);
+        Assert.Equal(outer.Condition, and.Right);
         Assert.IsType<ResolvedRelation>(combined.Child);
+    }
+
+    [Fact]
+    public void CombineFilters_EmitsInnerConjunctFirst_ForAnsiShortCircuitSafety()
+    {
+        // Inner filter guards division: age != 0. Outer filter divides: (1 / age) > 0. Combining
+        // MUST keep the guard first — And(age != 0, (1 / age) > 0) — so short-circuit ANSI evaluation
+        // never runs the division on the age = 0 rows the inner filter excluded (Spark parity).
+        var guard = new BinaryComparison(
+            OptimizerFixtures.Age, Literal.OfInt(0), ComparisonOperator.NotEqual);
+        var division = new BinaryArithmetic(
+            Literal.OfInt(1), OptimizerFixtures.Age, ArithmeticOperator.Divide);
+        var dependent = new BinaryComparison(
+            division, Literal.OfInt(0), ComparisonOperator.GreaterThan);
+
+        var inner = new Filter(guard, OptimizerFixtures.People());
+        var outer = new Filter(dependent, inner);
+
+        var combined = Assert.IsType<Filter>(new CombineFilters().Apply(outer));
+
+        var and = Assert.IsType<And>(combined.Condition);
+        Assert.Equal(guard, and.Left);       // inner guard evaluated first
+        Assert.Equal(dependent, and.Right);  // outer division-dependent predicate second
     }
 
     [Fact]

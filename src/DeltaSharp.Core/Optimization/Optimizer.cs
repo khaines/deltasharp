@@ -18,9 +18,10 @@ namespace DeltaSharp.Optimization;
 /// <c>DeltaSharp.Types</c> model, so it adds no public API surface and no reference to the engine.
 /// </para>
 /// <para>
-/// <see cref="Optimize"/> is deterministic (fixed batch/rule order), idempotent (every batch runs to
-/// a fixpoint), and terminating (each fixpoint batch stops at a structural fixpoint or after
-/// <see cref="DefaultMaxIterations"/>).
+/// <see cref="Optimize"/> is deterministic (fixed batch/rule order), idempotent (the single
+/// operator-optimization batch runs to a <b>global</b> fixpoint, so a second <c>Optimize</c> re-runs
+/// it, finds the plan already at that fixpoint, and stops), and terminating (each fixpoint batch
+/// stops at a structural fixpoint or after <see cref="DefaultMaxIterations"/>).
 /// </para>
 /// </remarks>
 internal sealed class Optimizer
@@ -57,9 +58,14 @@ internal sealed class Optimizer
     /// <param name="analyzedPlan">A resolved (analyzed) logical plan.</param>
     /// <returns>The optimized logical plan (the same instance when no rule fired).</returns>
     /// <exception cref="ArgumentNullException"><paramref name="analyzedPlan"/> is null.</exception>
+    /// <exception cref="InvalidOperationException"><paramref name="analyzedPlan"/> is not resolved.</exception>
     public LogicalPlan Optimize(LogicalPlan analyzedPlan)
     {
         ArgumentNullException.ThrowIfNull(analyzedPlan);
+        if (!analyzedPlan.Resolved)
+        {
+            throw new InvalidOperationException("Optimize requires an analyzed (resolved) plan.");
+        }
 
         LogicalPlan current = analyzedPlan;
         foreach (RuleBatch batch in _batches)
@@ -70,18 +76,21 @@ internal sealed class Optimizer
         return current;
     }
 
-    /// <summary>The M1 optimization pipeline: constant folding, then operator optimization.</summary>
+    /// <summary>
+    /// The M1 optimization pipeline: a single "Operator Optimization" fixpoint batch. Constant
+    /// folding is co-located <b>inside</b> this batch (not a separate earlier batch) so the whole
+    /// pipeline reaches a <b>global</b> fixpoint: after <see cref="CombineFilters"/> synthesizes an
+    /// <c>And(c1, c2)</c> of two boolean literals, the next sweep's <see cref="ConstantFolding"/>
+    /// folds it, and the sweep after that is a no-op — which is what makes <c>Optimize</c> idempotent
+    /// (design doc §5).
+    /// </summary>
     private static RuleBatch[] DefaultBatches(int maxIterations) =>
     [
-        new RuleBatch(
-            "ConstantFolding",
-            RuleStrategy.FixedPoint,
-            maxIterations,
-            new ConstantFolding()),
         new RuleBatch(
             "Operator Optimization",
             RuleStrategy.FixedPoint,
             maxIterations,
+            new ConstantFolding(),
             new CombineFilters(),
             new PushPredicateThroughProject(),
             new ColumnPruning()),
@@ -115,7 +124,17 @@ internal sealed class Optimizer
 
             if (iteration >= batch.MaxIterations)
             {
+                // A fixpoint batch that exits via the safety valve (rather than a no-op sweep) has
+                // NOT converged: it may still be mid-rewrite. That is a rule/ordering bug, so surface
+                // it loudly in DEBUG/test builds; in Release, defensively return the best-effort plan
+                // (a partially-optimized plan is still semantically equivalent).
+#if DEBUG
+                throw new InvalidOperationException(
+                    $"Optimization batch '{batch.Name}' did not converge within "
+                    + $"{batch.MaxIterations} iterations.");
+#else
                 break;
+#endif
             }
         }
 
