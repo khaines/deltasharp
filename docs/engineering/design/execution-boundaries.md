@@ -340,8 +340,10 @@ true source volume regardless of plan depth (`project(filter(scan))` = one sourc
 `Limit`/`Union` bridge sitting between a scan and the nearest operator counted rather than zeroed, and
 counts a union of two sources as their **sum** (`union(scan, scan)` = `2×`). Because counting rides the
 stream, a cancelled or `Limit`-truncated run only accrues the bytes it actually pulled. A bare
-scan/limit/union root that opens no consuming operator reports `0` (there is no source-read wrapper), an
-accepted best-effort limitation of this diagnostic proxy.
+scan/limit/union root that opens no consuming operator reports `0` (there is no source-read wrapper), and
+a mixed union whose branches are not all direct source reads (e.g. `union(filter(scan), scan)`) counts
+only the branch an operator wraps — both accepted best-effort limitations of this diagnostic proxy,
+tracked for a future whole-plan accounting revision by [#436](https://github.com/khaines/deltasharp/issues/436).
 `PeakMemoryBytes`/`SpilledBytes` aggregate the per-operator `OperatorMetrics` (`OperatorMetrics.cs`)
 that `PhysicalRuntime.Run` snapshots after draining each operator (`PeakMemoryBytes` as a `max`,
 `SpilledBytes` as a sum).
