@@ -254,7 +254,9 @@ materialization). **Date/Timestamp** surface as the CLR temporal types `lit()` r
 `Show` yield a calendar date/instant rather than the raw epoch number. A `TimestampType` epoch-microsecond
 value whose tick count overflows `long`, or whose instant falls outside `System.DateTime`'s representable
 range, raises a deterministic `UnsupportedPlanException` rather than a raw `ArgumentOutOfRangeException`
-(§8) — mirroring the decimal path. **Decimal** reconstructs
+(§8) — mirroring the decimal path; a `DateType` epoch-day whose date falls outside `System.DateOnly`'s
+representable range (`0001-01-01`..`9999-12-31`) is guarded the same way (deterministic
+`UnsupportedPlanException`, not a raw `ArgumentOutOfRangeException` from `DateOnly.AddDays`). **Decimal** reconstructs
 `System.Decimal` from the unscaled magnitude **preserving the declared scale** (so `decimal(5,2)`
 `100.00` keeps scale 2 and renders `100.00`, not `100`); a value that genuinely cannot be represented
 as `System.Decimal` — `scale > 28`, or an unscaled magnitude wider than 96 bits — raises a
@@ -282,6 +284,9 @@ The bridge never silently produces a wrong plan. Every unmapped node or expressi
 - a **timestamp value not representable as `System.DateTime`** (the epoch-microsecond tick count
   overflows `long`, or the instant falls outside the `DateTime` range) — `RowMaterializer`, in place of
   a raw `ArgumentOutOfRangeException`;
+- a **date value not representable as `System.DateOnly`** (the epoch-day falls outside the
+  `0001-01-01`..`9999-12-31` range) — `RowMaterializer`, in place of a raw `ArgumentOutOfRangeException`
+  from `DateOnly.AddDays`;
 - an attribute that does not resolve against its input, **or resolves by id to an input column that
   disagrees on name/type** (ExprId reconstruction drift) — the translator;
 - an ill-typed Engine operator build — wrapped by `PhysicalPlan.BuildOperator`.

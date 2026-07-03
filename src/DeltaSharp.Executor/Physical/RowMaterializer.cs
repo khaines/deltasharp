@@ -82,8 +82,25 @@ internal static class RowMaterializer
     // A DateType lane stores the Spark epoch-day (days since 1970-01-01) as an int; surface it as the
     // CLR DateOnly that lit(DateOnly) round-trips (Functions.DateLiteral uses the same epoch), so
     // Collect()/GetAs<DateOnly> and Show render a calendar date rather than the raw epoch number.
-    private static DateOnly ReadDate(ColumnVector column, int index) =>
-        UnixEpochDate.AddDays(column.GetValue<int>(index));
+    // An epoch-day whose date falls outside DateOnly's representable range (0001-01-01..9999-12-31) is a
+    // deterministic UnsupportedPlanException (mirrors the timestamp/decimal paths) rather than a raw
+    // ArgumentOutOfRangeException leaked from DateOnly.AddDays.
+    private static DateOnly ReadDate(ColumnVector column, int index)
+    {
+        int epochDay = column.GetValue<int>(index);
+        try
+        {
+            return UnixEpochDate.AddDays(epochDay);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            throw OutOfRangeDate(epochDay);
+        }
+    }
+
+    private static UnsupportedPlanException OutOfRangeDate(int epochDay) =>
+        new($"Row materialization cannot surface the date epoch-day value {epochDay} as "
+            + "System.DateOnly: the date falls outside the representable DateOnly range.");
 
     // A TimestampType lane stores the Spark epoch-microsecond instant as a long; surface it as a UTC
     // DateTime — the inverse of lit(DateTime)/lit(DateTimeOffset), which normalize to epoch-micros —

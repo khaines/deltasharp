@@ -195,6 +195,34 @@ public class MaterializationTests
         Assert.Contains("DateTime", ex.Message, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void Date_OutOfDateOnlyRange_ThrowsDeterministicUnsupported()
+    {
+        var fixture = new InMemoryRelationFixture();
+        StructType schema = TestData.Schema(TestData.Field("d", DateType.Instance, nullable: false));
+        // int.MaxValue epoch-days is ~5.9M years past 1970 — far outside DateOnly's 0001..9999 range; the
+        // guard must surface a deterministic UnsupportedPlanException, not a raw ArgumentOutOfRangeException
+        // leaked from DateOnly.AddDays (mirrors the timestamp/decimal out-of-range guards).
+        DataFrame df = fixture.Relation("doob", schema, TestData.Batch(
+            schema, TestData.Dates(int.MaxValue)));
+
+        var ex = Assert.Throws<UnsupportedPlanException>(() => fixture.Collect(df));
+        Assert.Contains("DateOnly", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Date_MinIntEpochDay_ThrowsDeterministicUnsupported()
+    {
+        var fixture = new InMemoryRelationFixture();
+        StructType schema = TestData.Schema(TestData.Field("d", DateType.Instance, nullable: false));
+        // int.MinValue epoch-days underflows below DateOnly.MinValue (0001-01-01); still deterministic.
+        DataFrame df = fixture.Relation("doub", schema, TestData.Batch(
+            schema, TestData.Dates(int.MinValue)));
+
+        var ex = Assert.Throws<UnsupportedPlanException>(() => fixture.Collect(df));
+        Assert.Contains("DateOnly", ex.Message, StringComparison.Ordinal);
+    }
+
     // ---- MEDIUM 1: duplicate output names -> deterministic UnsupportedPlanException (not SchemaValidationException) ----
 
     [Fact]
