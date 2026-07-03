@@ -151,7 +151,7 @@ internal sealed class InMemoryRelationFixture
         var executor = new LocalQueryExecutor(sentinel, ExecutionBackendOptions.Default);
         try
         {
-            _ = executor.Collect(Analyze(frame));
+            _ = executor.Collect(Analyze(frame), ExecutionOptions.Default);
         }
         catch (Exception)
         {

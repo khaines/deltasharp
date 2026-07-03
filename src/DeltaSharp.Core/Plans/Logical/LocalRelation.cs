@@ -29,7 +29,7 @@ namespace DeltaSharp.Plans.Logical;
 /// (multi-action, multi-scan, self-join) replays that same snapshot. This gives Spark's
 /// <c>createDataFrame(List, schema)</c> stable semantics without breaking laziness: mutating the source
 /// after the first action, or passing a single-use iterator, can no longer make
-/// <see cref="DataFrame.Count"/> and <see cref="DataFrame.Collect"/> disagree.
+/// <see cref="DataFrame.Count()"/> and <see cref="DataFrame.Collect()"/> disagree.
 /// </para>
 /// <para>
 /// <b>Node identity.</b> <see cref="NodeEquals"/>/<see cref="NodeHashCode"/> compare <see cref="Data"/>

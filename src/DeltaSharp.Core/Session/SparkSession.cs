@@ -243,7 +243,7 @@ public sealed class SparkSession : IDisposable
     /// <remarks>
     /// This is a <b>transformation</b>: it builds a scan (<c>LocalRelation</c>) logical plan and
     /// <b>materializes no rows</b> — the sequence is not enumerated until an action
-    /// (<see cref="DataFrame.Collect"/>, <see cref="DataFrame.Count"/>, …) runs (STORY-04.1.2 / #158,
+    /// (<see cref="DataFrame.Collect()"/>, <see cref="DataFrame.Count()"/>, …) runs (STORY-04.1.2 / #158,
     /// AC1). The captured sequence is wrapped in a <b>memoizing snapshot</b>: the first action enumerates
     /// it once and caches an immutable snapshot, and every later action replays that same snapshot. So,
     /// like Spark's <c>createDataFrame(List, schema)</c>, all actions on the returned frame observe

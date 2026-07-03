@@ -16,7 +16,7 @@ namespace DeltaSharp.Plans.Logical;
 /// <para>
 /// This closes the "by-reference row capture" divergence: without memoization the source was
 /// re-enumerated once per action, so mutating the source between actions, or passing a single-use
-/// iterator, could make <see cref="DataFrame.Count"/> and <see cref="DataFrame.Collect"/> disagree on
+/// iterator, could make <see cref="DataFrame.Count()"/> and <see cref="DataFrame.Collect()"/> disagree on
 /// the <b>same</b> DataFrame (violating plan immutability and Spark's <c>createDataFrame(List, schema)</c>
 /// snapshot semantics). After the first action every action sees identical rows, and multi-scans /
 /// self-joins observe one stable snapshot.
