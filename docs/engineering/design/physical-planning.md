@@ -251,7 +251,10 @@ to the natural CLR value for its logical type, null-aware:
 materialization). **Date/Timestamp** surface as the CLR temporal types `lit()` round-trips — a
 `DateType` epoch-day as a `DateOnly`, a `TimestampType` epoch-microsecond instant as a UTC `DateTime`
 (the inverse of `lit(DateOnly)`/`lit(DateTime)`/`lit(DateTimeOffset)`) — so `Collect()`/`GetAs<T>` and
-`Show` yield a calendar date/instant rather than the raw epoch number. **Decimal** reconstructs
+`Show` yield a calendar date/instant rather than the raw epoch number. A `TimestampType` epoch-microsecond
+value whose tick count overflows `long`, or whose instant falls outside `System.DateTime`'s representable
+range, raises a deterministic `UnsupportedPlanException` rather than a raw `ArgumentOutOfRangeException`
+(§8) — mirroring the decimal path. **Decimal** reconstructs
 `System.Decimal` from the unscaled magnitude **preserving the declared scale** (so `decimal(5,2)`
 `100.00` keeps scale 2 and renders `100.00`, not `100`); a value that genuinely cannot be represented
 as `System.Decimal` — `scale > 28`, or an unscaled magnitude wider than 96 bits — raises a
@@ -276,6 +279,9 @@ The bridge never silently produces a wrong plan. Every unmapped node or expressi
   EPIC-03 aggregate; grouping-only dedup goes through `Distinct`);
 - a **decimal value not representable as `System.Decimal`** (`scale > 28`, or an unscaled magnitude
   wider than 96 bits) — `RowMaterializer`, in place of a raw `OverflowException`;
+- a **timestamp value not representable as `System.DateTime`** (the epoch-microsecond tick count
+  overflows `long`, or the instant falls outside the `DateTime` range) — `RowMaterializer`, in place of
+  a raw `ArgumentOutOfRangeException`;
 - an attribute that does not resolve against its input, **or resolves by id to an input column that
   disagrees on name/type** (ExprId reconstruction drift) — the translator;
 - an ill-typed Engine operator build — wrapped by `PhysicalPlan.BuildOperator`.
@@ -313,11 +319,15 @@ This PR was implemented against the #173 contract before #172/#173/#177 merged. 
    exposed seam.
 3. **AnsiMode / backend selection.** Confirm the merged `SparkSession` execution-backend config
    (`spark.deltasharp.execution.backend`) still maps as in `LocalQueryExecutor.OptionsFor`. Both
-   selections share the interpreted `InterpretedOperators` dispatch; `Default` resolves to
-   `CompiledBackend` (ADR-0001 codegen tier, **STORY-03.4.2**), which fuses scalar expressions via
-   `Expression.Compile` when `RuntimeFeature.IsDynamicCodeSupported` — so the backend-parity check is a
-   genuine interpreted-vs-compiled **expression**-evaluation differential where dynamic code is
-   available, degrading to identical under AOT. Operator-level codegen remains out of scope (ADR-0001
+   selections execute operators through the **same** `InterpretedOperators.Open` dispatch, which always
+   builds interpreted `ExpressionEvaluators` (the backend name only attributes exceptions). `Default`
+   resolves to `CompiledBackend` (ADR-0001 codegen tier, **STORY-03.4.2**), whose `Expression.Compile`
+   scalar fusion is **not** wired into the operator `Open()` path (deferred to the operator layer) — so
+   both selections currently run byte-identical interpreted code. The end-to-end backend-parity check is
+   therefore a **plumbing/smoke cross-check** (result-identity across the selection seam), **not** an
+   interpreted-vs-compiled differential; the genuine expression-level differential is the Engine parity
+   oracle (`BackendParityOracle`, **#154**), which calls `CompiledBackend.BuildExpressionEvaluator`
+   directly. The end-to-end check becomes a differential once operator-level fusion wiring lands (ADR-0001
    §Follow-ups / **EPIC-13**, **#309/#310**).
 
 **Tracked deferrals.** Full **duplicate output-name** support (Spark permits duplicate names) is

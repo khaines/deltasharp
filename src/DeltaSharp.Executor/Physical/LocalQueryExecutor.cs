@@ -55,12 +55,16 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
         ArgumentNullException.ThrowIfNull(session);
 
         // ADR-0001: the interpreted vectorized backend is the default and the correctness reference.
-        // Both ExecutionBackend selections share the interpreted InterpretedOperators dispatch;
-        // ExecutionBackend.Default resolves to CompiledBackend (ADR-0001 codegen tier, STORY-03.4.2),
-        // which fuses scalar expressions via Expression.Compile when RuntimeFeature.IsDynamicCodeSupported.
-        // So the backend-parity check compares interpreted vs compiled *expression* evaluation — a real
-        // differential where dynamic code is available, degrading to identical under AOT. Operator-level
-        // codegen is out of scope (ADR-0001 §Follow-ups / EPIC-13, #309/#310).
+        // Both ExecutionBackend selections execute operators through the SAME InterpretedOperators.Open
+        // dispatch, which always builds interpreted ExpressionEvaluators (the backend name only attributes
+        // exceptions). CompiledBackend's Expression.Compile scalar fusion (STORY-03.4.2) is NOT wired into
+        // the operator Open() path — that wiring is deferred to the operator layer — so both selections
+        // currently run byte-identical interpreted code. The end-to-end backend-parity check is therefore a
+        // plumbing/smoke cross-check (result-identity across the selection seam), not an interpreted-vs-
+        // compiled differential; the genuine expression-level differential lives in the Engine parity oracle
+        // (BackendParityOracle, #154), which calls CompiledBackend.BuildExpressionEvaluator directly. The
+        // end-to-end check becomes a differential once operator-level fusion wiring lands (ADR-0001
+        // §Follow-ups / EPIC-13, #309/#310).
         return session.ExecutionBackend == ExecutionBackend.Interpreted
             ? new ExecutionBackendOptions { ForceInterpreted = true }
             : ExecutionBackendOptions.Default;

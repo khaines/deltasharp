@@ -203,12 +203,14 @@ public class EndToEndExecutionTests
     [Fact]
     public void InterpretedAndDefaultBackends_ProduceIdenticalRows()
     {
-        // Real interpreted-vs-compiled parity check: ForceInterpreted uses InterpretedOperators, while
-        // ExecutionBackendOptions.Default resolves to CompiledBackend (ADR-0001 codegen tier,
-        // STORY-03.4.2), which JIT-fuses scalar expressions via Expression.Compile when dynamic code is
-        // supported. This is a genuine expression-evaluation differential where dynamic code is available,
-        // degrading to identical under AOT. Operator-level codegen is out of scope (ADR-0001 §Follow-ups /
-        // EPIC-13, #309/#310).
+        // Backend-parity smoke check: ForceInterpreted and ExecutionBackendOptions.Default both execute
+        // operators through the shared InterpretedOperators.Open dispatch, which builds interpreted
+        // ExpressionEvaluators regardless of backend. CompiledBackend's Expression.Compile scalar fusion
+        // (STORY-03.4.2) is not yet wired into the operator Open() path (deferred to the operator layer), so
+        // both selections currently run byte-identical interpreted code — this asserts the selection plumbing
+        // stays result-identical. The genuine interpreted-vs-compiled *expression* differential is the
+        // Engine's BackendParityOracle (#154), which calls BuildExpressionEvaluator directly; this end-to-end
+        // check becomes a differential once operator-level fusion wiring lands (EPIC-13, #309/#310).
         (InMemoryRelationFixture fixture, DataFrame people) = NewPeople();
         DataFrame query = people.GroupBy(Col("dept")).Agg(Sum(Col("salary")));
 
