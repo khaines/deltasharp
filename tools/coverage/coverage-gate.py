@@ -19,16 +19,18 @@ in ANY report, and the denominator is the set of distinct (file, line) pairs. Th
 the same merge semantics ReportGenerator uses, implemented here with the Python stdlib
 only (no third-party or network dependency, so the gate is deterministic and offline).
 
-Fail-closed on a partial report set
------------------------------------
-Unioning "whatever reports were globbed" is fail-OPEN: if one test assembly's report is
-lost (a crashed/dropped suite) it silently vanishes from the denominator, which can make
-coverage RISE and the gate PASS while a whole suite went missing. It is also an injection
-vector — a report could be dropped (or a fake one added) to move the number. To close this,
-the gate asserts that EVERY expected production assembly listed in `expectedAssemblies`
-(coverage-config.json) is present in the merged report set with measurable lines; if any is
-absent it exits non-zero (fail-closed) with a `::error::` naming the missing assembly. CI
-also deletes stale `TestResults` before collecting so only in-step-generated reports count.
+Fail-closed on an unexpected report set (provenance)
+----------------------------------------------------
+Unioning "whatever reports were globbed" is fail-OPEN in BOTH directions. If one test
+assembly's report is lost (a crashed/dropped suite) it silently vanishes from the denominator,
+which can make coverage RISE and the gate PASS while a whole suite went missing. Symmetrically,
+an EXTRA report (a planted/fake assembly, or a trivially-100%-covered helper) added to the set
+inflates the aggregate and dilutes a real regression. Both are injection vectors. To close this,
+`expectedAssemblies` (coverage-config.json) is treated as the EXACT set of production assemblies:
+the gate exits non-zero (fail-closed) if any expected assembly is MISSING (naming it), OR if any
+UNEXPECTED assembly is present (naming it), and it computes the percentage over ONLY the expected
+set so no out-of-allowlist package can move the number. CI also deletes stale `TestResults` before
+collecting so only in-step-generated reports count.
 
 Usage
 -----
@@ -37,7 +39,8 @@ Usage
         [--threshold 87.0] [--summary-out TestResults/coverage-summary.md]
 
 Exit codes: 0 = at/above threshold, 1 = below threshold, 2 = usage/data error
-(unreadable/malformed/empty reports, or a missing expected production assembly).
+(unreadable/malformed/empty reports, or a missing expected / unexpected extra production
+assembly in the merged report set).
 """
 
 from __future__ import annotations
@@ -188,14 +191,16 @@ def main(argv=None) -> int:
         _log(f"::error::no coverage.cobertura.xml found under {args.results_dir!r}")
         return 2
 
-    per_package, covered, total = merge_reports(reports)
-    if total == 0:
+    per_package, _global_covered, _global_total = merge_reports(reports)
+    if not per_package:
         _log("::error::coverage reports contained no measurable production lines")
         return 2
 
-    # Fail-closed provenance check: every expected production assembly MUST be present in
-    # the merged report set with measurable lines. A missing (lost/crashed/dropped) suite
-    # must FAIL the gate, never silently shrink the denominator and let coverage rise.
+    expected_set = set(expected_assemblies)
+
+    # Fail-closed provenance (symmetric): treat `expectedAssemblies` as the EXACT production set.
+    # (1) Every expected assembly MUST be present with measurable lines — a missing (lost/crashed/
+    #     dropped) suite must FAIL, never silently shrink the denominator and let coverage rise.
     missing = [
         name
         for name in expected_assemblies
@@ -210,7 +215,37 @@ def main(argv=None) -> int:
             )
         return 2
 
-    measured = round(pct(covered, total), 2)
+    # (2) No UNEXPECTED assembly may be present — an extra/planted/trivially-covered package would
+    #     inflate the aggregate and dilute a real regression. A genuinely new src/ production
+    #     assembly is a deliberate governance event: add it to `expectedAssemblies` (mirrors the
+    #     PublicAPI baseline). Only enforced when an allowlist is configured.
+    if expected_set:
+        unexpected = sorted(name for name in per_package if name not in expected_set)
+        if unexpected:
+            _log(
+                f"::error::coverage report contains unexpected production assembl"
+                f"{'y' if len(unexpected) == 1 else 'ies'} not in the expectedAssemblies "
+                f"allowlist: {unexpected}. An out-of-allowlist assembly must not dilute or "
+                f"inflate the aggregate — add a genuine new src/ production assembly to the "
+                f"allowlist deliberately, or remove the planted/leaked report."
+            )
+            return 2
+
+    # Compute coverage over EXACTLY the governed (allowlisted) set so no out-of-allowlist package
+    # can move the number. With an empty allowlist (unconfigured) fall back to the full merged set.
+    accounted = (
+        {name: value for name, value in per_package.items() if name in expected_set}
+        if expected_set
+        else dict(per_package)
+    )
+    covered = sum(cov for (cov, _tot) in accounted.values())
+    total = sum(tot for (_cov, tot) in accounted.values())
+    if total == 0:
+        _log("::error::coverage reports contained no measurable production lines")
+        return 2
+
+    raw_measured = pct(covered, total)
+    measured = round(raw_measured, 2)  # display only; the pass decision uses the unrounded value
 
     _log(f"Coverage gate — merged {len(reports)} Cobertura report(s), TFM-deduplicated")
     _log("")
@@ -224,13 +259,13 @@ def main(argv=None) -> int:
     _log(f"  {'TOTAL'.ljust(name_w)}   {covered:>7}  {total:>7}   {measured:6.2f}%")
     _log("")
 
-    passed = measured >= threshold
+    passed = raw_measured >= threshold
     detail = f"measured line coverage {measured:.2f}% vs threshold {threshold:.2f}%"
     if passed:
         _log(f"PASS: {detail}")
         if _gha():
             _log(f"::notice::coverage gate PASS — {detail}")
-        headroom = measured - threshold
+        headroom = raw_measured - threshold
         if slack > 0 and headroom >= slack:
             hint = (
                 f"coverage has {headroom:.2f}% headroom over the floor; ratchet "

@@ -128,6 +128,12 @@ jobs:
           --results-directory TestResults
           --filter "FullyQualifiedName!~SparkSessionConcurrencyTests.GetOrCreate_RacingStop_NeverReusesAStoppedSession"
 
+      # Regression-test the gate's own exit-code contract (fail-closed on missing/unexpected
+      # assemblies, rounding-boundary, malformed/empty) before trusting it on real data. Python
+      # stdlib unittest — no dependency; a broken gate fails the build loudly here.
+      - name: Coverage gate self-test
+        run: python3 tools/coverage/coverage-gate-selftest.py
+
       # Merge the per-assembly/per-TFM Cobertura reports by unioning per-line hits and FAIL when
       # merged line coverage is below the floor in tools/coverage/coverage-config.json (the single
       # source of truth). The measured value and the threshold are printed and annotated so a
