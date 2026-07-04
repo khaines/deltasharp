@@ -1,0 +1,75 @@
+name: Feature request
+description: Propose a new capability or enhancement for DeltaSharp.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for proposing an improvement. Requests framed around a user problem
+        and verifiable outcomes are easiest to schedule.
+
+        > [!NOTE]
+        > Substantial or cross-cutting changes (new public APIs, wire protocols,
+        > engine subsystems) usually need an
+        > [RFC](https://github.com/khaines/deltasharp/blob/main/docs/rfcs/README.md)
+        > before implementation. See
+        > [CONTRIBUTING.md](https://github.com/khaines/deltasharp/blob/main/CONTRIBUTING.md).
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or motivation
+      description: What problem does this solve, and who feels it? Include the Spark API or workflow you are trying to match, if relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the capability you want. Include a sketch of the API surface or behavior where possible.
+    validations:
+      required: true
+  - type: dropdown
+    id: milestone
+    attributes:
+      label: Target roadmap milestone
+      description: Which roadmap milestone does this align with? See the [Roadmap](https://github.com/khaines/deltasharp/blob/main/ROADMAP.md) and [workstream plan](https://github.com/khaines/deltasharp/blob/main/docs/planning/README.md).
+      options:
+        - "M1 — Engine foundations (v0.1)"
+        - "M2 — Storage & SQL (v0.x)"
+        - "M3 — Distributed execution (v0.x)"
+        - "M4 — Optimization (v0.x)"
+        - "v1.0 — Spark-parity batch + streaming on Kubernetes"
+        - "Unsure / needs triage"
+    validations:
+      required: true
+  - type: textarea
+    id: personas
+    attributes:
+      label: Affected implementer personas
+      description: |
+        Which specialist role(s) would own this work? Use exact slugs from the
+        25-role roster in
+        [docs/persona/agents/README.md](https://github.com/khaines/deltasharp/blob/main/docs/persona/agents/README.md).
+        Maintainers apply these as `persona:<slug>` labels during triage.
+      placeholder: |
+        e.g. persona:query-execution-engine-engineer, persona:delta-storage-format-engineer
+    validations:
+      required: false
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Verifiable outcomes a reviewer can objectively confirm. Prefer Given / When / Then.
+      value: |
+        - [ ] Given ... When ... Then ...
+        - [ ] ...
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches, workarounds, or prior art you evaluated, and why they fall short. Enter "None" if you have not considered any.
+    validations:
+      required: false
