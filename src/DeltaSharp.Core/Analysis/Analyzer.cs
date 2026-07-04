@@ -130,8 +130,33 @@ internal sealed class Analyzer
             LocalRelation { Resolved: false } local => BindLocalRelation(local, idGenerator),
             UnresolvedFileRelation file =>
                 throw AnalysisException.UnsupportedDataSource(file.Format, file.Path),
+            WriteToSource write => ValidateWriteSink(write),
             _ => node,
         });
+
+    /// <summary>Rejects a <see cref="WriteToSource"/> whose sink <b>format</b> has no M1 write mapping —
+    /// an EPIC-05-deferred writer (Delta/Parquet — AC4) or an unsupported format (AC3) — with a
+    /// deterministic <see cref="AnalysisException"/>, mirroring how <see cref="UnresolvedFileRelation"/>
+    /// defers a read. This fires during analysis, before any physical planning or output commit, so a
+    /// bad format produces the diagnostic before partial output. A supported local sink passes through
+    /// unchanged (its child is already resolved bottom-up; a local sink has no reader/writer to bind).</summary>
+    private static WriteToSource ValidateWriteSink(WriteToSource write)
+    {
+        SinkDescriptor sink = write.Sink;
+        switch (WriteFormats.Classify(sink.Format))
+        {
+            case WriteFormatKind.Local:
+                return write;
+
+            case WriteFormatKind.DeferredToEpic05:
+                throw AnalysisException.UnsupportedDataSink(
+                    sink.Format, sink.Path, WriteFormats.LocalFormatNames);
+
+            default:
+                throw AnalysisException.UnsupportedWriteFormat(
+                    sink.Format, sink.Path, WriteFormats.LocalFormatNames, WriteFormats.DeferredFormatNames);
+        }
+    }
 
     /// <summary>Mints the output attributes of an unresolved <see cref="LocalRelation"/> from the
     /// shared per-pass id generator (identically to <see cref="BindRelation"/> for a catalog table), so

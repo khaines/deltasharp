@@ -570,6 +570,15 @@ public sealed class DataFrame
     public Dataset<T> As<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicProperties)] T>() =>
         new(Session, Plan);
 
+    /// <summary>
+    /// Gets a <see cref="DataFrameWriter"/> for saving this frame to a sink, mirroring Spark's
+    /// <c>df.write</c>. Each access returns a <b>fresh</b> writer (a new mutable builder), so staged
+    /// format/mode/options on one writer never leak into another. Getting the writer and configuring it
+    /// does <b>no</b> work (ADR-0001); only <see cref="DataFrameWriter.Save()"/> executes (STORY-04.6.3 /
+    /// #175). See <c>docs/engineering/design/write-door.md</c>.
+    /// </summary>
+    public DataFrameWriter Write => new(this);
+
     // ------------------------------------------------------------------------------------------
     // Actions (eager). These are the ONLY DataFrame members that execute — they analyze the plan,
     // run the optimizer seam (an intentional identity pass in M1 — see Optimize), and drive the
@@ -874,6 +883,26 @@ public sealed class DataFrame
     /// </summary>
     private static LogicalPlan AnalyzeForExecution(SparkSession session, LogicalPlan plan) =>
         Optimize(new Analyzer(session.Catalog).Resolve(plan));
+
+    /// <summary>
+    /// The eager write action shared by <see cref="DataFrameWriter.Save()"/> (STORY-04.6.3 / #175): it
+    /// wraps this frame's plan in a <see cref="WriteToSource"/> write intent, runs the SAME
+    /// analyze→optimize→execute pipeline the read actions use (so a bad format/mode surfaces its
+    /// deterministic diagnostic here, before any output is committed), and drives the write through the
+    /// execution seam exactly once. It lives on <see cref="DataFrame"/> beside the other actions so all
+    /// eager crossings share one lifecycle guard and one analyze pass; the writer owns only the lazy
+    /// configuration. It is internal because <see cref="WriteToSource"/> and <see cref="SinkDescriptor"/>
+    /// are the internal logical IR.
+    /// </summary>
+    /// <param name="sink">The logical sink descriptor the writer built from its staged intent.</param>
+    /// <param name="cancellationToken">A token that cooperatively cancels the write.</param>
+    internal void ExecuteWrite(SinkDescriptor sink, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(sink);
+        SparkSession session = RequireSession(nameof(DataFrameWriter.Save));
+        LogicalPlan analyzed = AnalyzeForExecution(session, new WriteToSource(Plan, sink));
+        _ = session.QueryExecutor.Write(analyzed, ExecutionOptions.From(session, cancellationToken));
+    }
 
     /// <summary>
     /// The analyze + optimize stage for <see cref="Show(int, bool)"/>: like

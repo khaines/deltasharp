@@ -62,7 +62,10 @@ internal sealed class SinkDescriptor : IEquatable<SinkDescriptor>
             var parts = new List<string> { $"format={Format}", $"mode={Mode}" };
             if (Path is not null)
             {
-                parts.Add($"path={Path}");
+                // Redact credential-bearing fragments (SAS ?sig=, presigned-URL signatures, userinfo)
+                // so stringifying a write node — Explain (#179), a log line, or a diagnostic — never
+                // leaks a secret embedded in the sink path (mirrors UnresolvedFileRelation, #424/#432).
+                parts.Add($"path={SecretRedaction.RedactPath(Path)}");
             }
 
             if (TableIdentifier is not null)

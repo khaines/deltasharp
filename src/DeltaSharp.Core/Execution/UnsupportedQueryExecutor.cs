@@ -26,6 +26,9 @@ internal sealed class UnsupportedQueryExecutor : IQueryExecutor
     public long Count(LogicalPlan analyzedPlan, ExecutionOptions options, ExecutionMetricsSink? metricsSink = null) => throw NotRegistered();
 
     /// <inheritdoc/>
+    public long Write(LogicalPlan analyzedPlan, ExecutionOptions options, ExecutionMetricsSink? metricsSink = null) => throw NotRegistered();
+
+    /// <inheritdoc/>
     /// <remarks>
     /// Unlike <see cref="Collect"/>/<see cref="Count"/> this does <b>not</b> throw: physical-mode EXPLAIN
     /// degrades gracefully to a diagnostic line when no backend is registered (STORY-04.7.3 AC4), so a

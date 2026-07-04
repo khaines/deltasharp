@@ -17,6 +17,7 @@ namespace DeltaSharp.Executor;
 internal sealed class LocalQueryExecutor : IQueryExecutor
 {
     private readonly IScanSource _scanSource;
+    private readonly ILocalSinkFactory _sinkFactory;
     private readonly ExecutionBackendOptions _backendOptions;
 
     /// <summary>
@@ -39,9 +40,21 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
     /// <param name="scanSource">The data-in seam resolving scans to in-memory batches.</param>
     /// <param name="backendOptions">The backend selection options.</param>
     public LocalQueryExecutor(IScanSource scanSource, ExecutionBackendOptions backendOptions)
+        : this(scanSource, backendOptions, InMemorySinkRegistry.Default)
+    {
+    }
+
+    /// <summary>Creates an executor with explicit backend options and an explicit sink factory (the write
+    /// door's data-out seam, STORY-04.6.3). Tests supply a fresh <see cref="InMemorySinkRegistry"/> for
+    /// isolation; the production paths use the process-wide <see cref="InMemorySinkRegistry.Default"/>.</summary>
+    /// <param name="scanSource">The data-in seam resolving scans to in-memory batches.</param>
+    /// <param name="backendOptions">The backend selection options.</param>
+    /// <param name="sinkFactory">The data-out seam resolving a write intent to a local sink.</param>
+    public LocalQueryExecutor(IScanSource scanSource, ExecutionBackendOptions backendOptions, ILocalSinkFactory sinkFactory)
     {
         _scanSource = scanSource ?? throw new ArgumentNullException(nameof(scanSource));
         _backendOptions = backendOptions ?? throw new ArgumentNullException(nameof(backendOptions));
+        _sinkFactory = sinkFactory ?? throw new ArgumentNullException(nameof(sinkFactory));
     }
 
     /// <inheritdoc />
@@ -63,7 +76,7 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
         ArgumentNullException.ThrowIfNull(analyzedPlan);
         try
         {
-            PhysicalPlan physical = new PhysicalPlanner(_scanSource).Plan(analyzedPlan);
+            PhysicalPlan physical = new PhysicalPlanner(_scanSource, _sinkFactory).Plan(analyzedPlan);
             return physical.TreeString();
         }
         catch (UnsupportedPlanException ex)
@@ -110,6 +123,34 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
             {
                 long count = RowMaterializer.CountRows(result, token);
                 return (Rows: (IReadOnlyList<Row>?)null, OutputRows: count);
+            }).OutputRows;
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// Drives the write plan through the SAME stage-attributed <see cref="Execute"/> driver as
+    /// <see cref="Collect"/>/<see cref="Count"/>: planning maps the <c>WriteToSource</c> to a
+    /// <see cref="WriteToSinkPlan"/> (resolving the sink through the data-out seam), the backend stage
+    /// executes it — draining the child and committing to the sink atomically — and the finalize counts
+    /// the rows written. A sink-resolution miss is a Plan-stage <see cref="UnsupportedPlanException"/>; a
+    /// commit conflict (e.g. <see cref="SaveMode.ErrorIfExists"/> onto an existing target) surfaces as a
+    /// Backend-stage <see cref="QueryExecutionException"/>, so a write failure is stage-attributed exactly
+    /// like a read failure (STORY-04.6.4).
+    /// </remarks>
+    public long Write(LogicalPlan analyzedPlan, ExecutionOptions options, ExecutionMetricsSink? metricsSink = null)
+    {
+        ArgumentNullException.ThrowIfNull(analyzedPlan);
+        ArgumentNullException.ThrowIfNull(options);
+        return Execute(
+            analyzedPlan,
+            options,
+            metricsSink,
+            static (result, opts, token) =>
+            {
+                // The WriteToSinkPlan already committed during the backend stage; count the rows it wrote
+                // (its returned child result) for the metrics/return value without re-executing.
+                long written = RowMaterializer.CountRows(result, token);
+                return (Rows: (IReadOnlyList<Row>?)null, OutputRows: written);
             }).OutputRows;
     }
 
@@ -186,7 +227,7 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
             PhysicalPlan physical;
             try
             {
-                physical = new PhysicalPlanner(_scanSource).Plan(analyzedPlan);
+                physical = new PhysicalPlanner(_scanSource, _sinkFactory).Plan(analyzedPlan);
             }
             catch (UnsupportedPlanException)
             {

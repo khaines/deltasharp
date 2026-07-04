@@ -474,3 +474,55 @@ internal sealed class UnionPlan : PhysicalPlan
         return runtime.Run(op);
     }
 }
+
+/// <summary>
+/// Executes a <b>write intent</b> (STORY-04.6.3 / #175): it drains its child subtree, materializes the
+/// child rows once, and atomically <see cref="ILocalSink.Commit"/>s them to the resolved local sink,
+/// honoring the descriptor's <see cref="SaveMode"/>. It is the physical mirror of a leaf
+/// <see cref="ScanPlan"/> at the top of the tree — a sink instead of a source — and is the only physical
+/// node that produces a side effect. The commit is atomic (materialize-then-commit), so a mode conflict
+/// or a mid-write fault leaves no partial output (AC1/AC3). It returns its child's <see cref="BatchResult"/>
+/// unchanged so the driver's finalize can count the rows written without a second execution.
+/// </summary>
+internal sealed class WriteToSinkPlan : PhysicalPlan
+{
+    private readonly PhysicalPlan _child;
+    private readonly ILocalSink _sink;
+    private readonly DeltaSharp.Plans.Logical.SinkDescriptor _descriptor;
+
+    /// <summary>Creates a write node draining <paramref name="child"/> into <paramref name="sink"/>.</summary>
+    /// <param name="child">The subtree whose rows are written.</param>
+    /// <param name="sink">The resolved local sink the rows commit to.</param>
+    /// <param name="descriptor">The logical sink descriptor (for the rendered node metadata; path redacted).</param>
+    public WriteToSinkPlan(PhysicalPlan child, ILocalSink sink, DeltaSharp.Plans.Logical.SinkDescriptor descriptor)
+        : base(child.OutputSchema)
+    {
+        _child = child ?? throw new ArgumentNullException(nameof(child));
+        _sink = sink ?? throw new ArgumentNullException(nameof(sink));
+        _descriptor = descriptor ?? throw new ArgumentNullException(nameof(descriptor));
+    }
+
+    public override IReadOnlyList<PhysicalPlan> Children => [_child];
+
+    /// <inheritdoc/>
+    public override string NodeName => "WriteToSink";
+
+    /// <inheritdoc/>
+    // SinkDescriptor.SimpleString already redacts a credential-bearing path, so rendering a write node in
+    // #179 Explain never leaks a secret (#432).
+    public override string SimpleString => $"WriteToSink {_descriptor.SimpleString}";
+
+    public override BatchResult Execute(PhysicalRuntime runtime)
+    {
+        ArgumentNullException.ThrowIfNull(runtime);
+        BatchResult child = _child.Execute(runtime);
+
+        // Materialize the whole result once, then commit atomically: the sink never observes a
+        // half-written result, so a mode conflict (ErrorIfExists) or a fault commits nothing (AC1/AC3).
+        IReadOnlyList<Row> rows = RowMaterializer.Materialize(child, maxRows: null, maxBytes: null, runtime.CancellationToken);
+        _sink.Commit(child.Schema, rows);
+
+        // Return the child result so the driver's finalize counts the rows written (no re-execution).
+        return child;
+    }
+}

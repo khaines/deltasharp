@@ -270,3 +270,22 @@ DeltaSharp.UnsupportedTypedSchemaException
 DeltaSharp.UnsupportedTypedSchemaException.UnsupportedTypedSchemaException() -> void
 DeltaSharp.UnsupportedTypedSchemaException.UnsupportedTypedSchemaException(string! message) -> void
 DeltaSharp.UnsupportedTypedSchemaException.UnsupportedTypedSchemaException(string! message, System.Exception! innerException) -> void
+DeltaSharp.DataFrame.Write.get -> DeltaSharp.DataFrameWriter!
+DeltaSharp.DataFrameWriter
+DeltaSharp.DataFrameWriter.Format(string! source) -> DeltaSharp.DataFrameWriter!
+DeltaSharp.DataFrameWriter.Mode(DeltaSharp.SaveMode saveMode) -> DeltaSharp.DataFrameWriter!
+DeltaSharp.DataFrameWriter.Mode(string! saveMode) -> DeltaSharp.DataFrameWriter!
+DeltaSharp.DataFrameWriter.Option(string! key, bool value) -> DeltaSharp.DataFrameWriter!
+DeltaSharp.DataFrameWriter.Option(string! key, double value) -> DeltaSharp.DataFrameWriter!
+DeltaSharp.DataFrameWriter.Option(string! key, long value) -> DeltaSharp.DataFrameWriter!
+DeltaSharp.DataFrameWriter.Option(string! key, string! value) -> DeltaSharp.DataFrameWriter!
+DeltaSharp.DataFrameWriter.Options(System.Collections.Generic.IReadOnlyDictionary<string!, string!>! options) -> DeltaSharp.DataFrameWriter!
+DeltaSharp.DataFrameWriter.PartitionBy(params string![]! colNames) -> DeltaSharp.DataFrameWriter!
+DeltaSharp.DataFrameWriter.Save() -> void
+DeltaSharp.DataFrameWriter.Save(System.Threading.CancellationToken cancellationToken) -> void
+DeltaSharp.DataFrameWriter.Save(string! path) -> void
+DeltaSharp.SaveMode
+DeltaSharp.SaveMode.Append = 0 -> DeltaSharp.SaveMode
+DeltaSharp.SaveMode.Overwrite = 1 -> DeltaSharp.SaveMode
+DeltaSharp.SaveMode.ErrorIfExists = 2 -> DeltaSharp.SaveMode
+DeltaSharp.SaveMode.Ignore = 3 -> DeltaSharp.SaveMode
