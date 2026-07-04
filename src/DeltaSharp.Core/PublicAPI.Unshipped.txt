@@ -251,6 +251,8 @@ override DeltaSharp.ExecutionMetrics.ToString() -> string!
 static DeltaSharp.ExecutionMetrics.Empty.get -> DeltaSharp.ExecutionMetrics!
 DeltaSharp.DataFrame.As<T>() -> DeltaSharp.Dataset<T>!
 DeltaSharp.Dataset<T>
+DeltaSharp.Dataset<T>.Collect() -> System.Collections.Generic.IReadOnlyList<T>!
+DeltaSharp.Dataset<T>.Collect(System.Threading.CancellationToken cancellationToken) -> System.Collections.Generic.IReadOnlyList<T>!
 DeltaSharp.Dataset<T>.Filter(DeltaSharp.Column! condition) -> DeltaSharp.Dataset<T>!
 DeltaSharp.Dataset<T>.Filter(System.Linq.Expressions.Expression<System.Func<T, bool>!>! predicate) -> DeltaSharp.Dataset<T>!
 DeltaSharp.Dataset<T>.Schema.get -> DeltaSharp.Types.StructType!
