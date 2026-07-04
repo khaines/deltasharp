@@ -281,6 +281,78 @@ public sealed class WriteDoorTests
         }
     }
 
+    // ---------------- SHOULD-FIX 3: `path` option reconciled with Save(path) (Spark parity) ----------
+
+    [Theory]
+    [InlineData("path")]
+    [InlineData("PATH")]
+    [InlineData("Path")]
+    public void Save_WithPathOption_NoSavePath_ReconcilesOptionIntoTheDescriptorPath(string optionKey)
+    {
+        var executor = new FakeQueryExecutor(Array.Empty<Row>());
+        (SparkSession spark, DataFrame df) = NewBoundFrame(executor);
+        using (spark)
+        {
+            // Spark parity: save(path) == option("path", path).save(). With no Save(path), a `path` option
+            // (any casing — the writer's options are case-insensitive) reconciles into the descriptor path,
+            // so Option("path", p).Save() and Save(p) build an equivalent write intent.
+            df.Write.Format("memory").Option(optionKey, "mem://opt-path").Save();
+
+            var write = Assert.IsType<WriteToSource>(executor.LastPlan);
+            Assert.Equal("mem://opt-path", write.Sink.Path);
+        }
+    }
+
+    [Fact]
+    public void Save_ExplicitPath_TakesPrecedenceOverPathOption()
+    {
+        var executor = new FakeQueryExecutor(Array.Empty<Row>());
+        (SparkSession spark, DataFrame df) = NewBoundFrame(executor);
+        using (spark)
+        {
+            // An explicit Save(path) wins over a staged `path` option (Spark parity).
+            df.Write.Format("memory").Option("path", "mem://from-option").Save("mem://from-save");
+
+            var write = Assert.IsType<WriteToSource>(executor.LastPlan);
+            Assert.Equal("mem://from-save", write.Sink.Path);
+        }
+    }
+
+    // ---------------- MUST-FIX 2: PartitionBy intent is carried onto the built write plan ----------
+    [Fact]
+    public void PartitionBy_CarriesConfiguredColumns_OntoTheBuiltWriteIntent()
+    {
+        var executor = new FakeQueryExecutor(Array.Empty<Row>());
+        (SparkSession spark, DataFrame df) = NewBoundFrame(executor);
+        using (spark)
+        {
+            df.Write.Format("memory").PartitionBy("name", "age").Save("mem://parts");
+
+            // The built (analyzed) write intent carries the configured partition columns, in order.
+            var write = Assert.IsType<WriteToSource>(executor.LastPlan);
+            Assert.Equal(new[] { "name", "age" }, write.Sink.PartitionColumns);
+        }
+    }
+
+    [Fact]
+    public void PartitionBy_DefensivelyCopies_SoLaterMutationOfTheInputArrayDoesNotLeak()
+    {
+        var executor = new FakeQueryExecutor(Array.Empty<Row>());
+        (SparkSession spark, DataFrame df) = NewBoundFrame(executor);
+        using (spark)
+        {
+            var cols = new[] { "name", "age" };
+            DataFrameWriter writer = df.Write.Format("memory").PartitionBy(cols);
+
+            // Mutating the caller's array after PartitionBy must NOT leak into the built plan.
+            cols[0] = "MUTATED";
+            writer.Save("mem://parts");
+
+            var write = Assert.IsType<WriteToSource>(executor.LastPlan);
+            Assert.Equal(new[] { "name", "age" }, write.Sink.PartitionColumns);
+        }
+    }
+
     // ---------------- lifecycle parity with the read door ----------------
 
     [Fact]

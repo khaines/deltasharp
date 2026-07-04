@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using DeltaSharp.Types;
 using Xunit;
 using static DeltaSharp.Functions;
@@ -231,5 +232,153 @@ public class WriteDoorEndToEndTests
         Assert.DoesNotContain("DEADBEEFSECRET", ex.Message);
 
         InMemorySinkRegistry.Default.Clear(target);
+    }
+
+    // ---------------- MUST-FIX 1: authoritative committed count + post-commit cancellation boundary ----
+
+    [Fact]
+    public void Write_IgnoreMode_OntoExistingTarget_ReportsAndCommitsZeroRows()
+    {
+        // Regression: the write finalize used to re-count the CHILD result (rows PRODUCED), so an Ignore
+        // that skipped an existing target over-reported the full child count instead of the 0 the sink
+        // actually committed. This asserts the AUTHORITATIVE committed count is threaded out.
+        var fixture = new InMemoryRelationFixture();
+        var registry = new InMemorySinkRegistry();
+        string target = UniqueTarget();
+
+        DataFrame initial = fixture.LocalRelationFrame(PeopleSchema, Rows()); // 3 rows
+        (long firstCount, _) = fixture.WriteWithMetrics(
+            initial, "memory", SaveMode.Overwrite, target, registry);
+        Assert.Equal(3, firstCount);
+
+        // A DIFFERENT, LARGER frame (4 rows) with Ignore onto the existing target must skip.
+        DataFrame other = fixture.LocalRelationFrame(PeopleSchema, new[]
+        {
+            new Row(PeopleSchema, 9, "z"),
+            new Row(PeopleSchema, 8, "y"),
+            new Row(PeopleSchema, 7, "x"),
+            new Row(PeopleSchema, 6, "w"),
+        });
+        (long ignoreCount, ExecutionMetrics metrics) = fixture.WriteWithMetrics(
+            other, "memory", SaveMode.Ignore, target, registry);
+
+        // The committed count (and the reported metrics) is 0 — NOT the child's produced 4 rows.
+        Assert.Equal(0, ignoreCount);
+        Assert.Equal(0, metrics.OutputRows);
+
+        // The existing target is unchanged (still the original 3 rows) — the ignore committed nothing.
+        Assert.True(registry.TryRead(target, out _, out IReadOnlyList<Row> written));
+        Assert.Equal(3, written.Count);
+    }
+
+    [Fact]
+    public void Write_CancelFiringAfterCommit_DoesNotFail_AndLeavesTheWriteCommitted()
+    {
+        // Regression (Quality C7): a cancel scheduled to fire AFTER the commit used to throw from the
+        // post-commit CountRows finalize, surfacing an ALREADY-COMMITTED write as a cancelled/failed Save.
+        // The commit is now the final failure boundary: a post-commit cancel is never observed.
+        var fixture = new InMemoryRelationFixture();
+        var registry = new InMemorySinkRegistry();
+        string target = UniqueTarget();
+        using var cts = new CancellationTokenSource();
+
+        // The hook fires cancellation in the window immediately AFTER the sink commits and returns.
+        var factory = new PostCommitHookSinkFactory(registry, cts.Cancel);
+        DataFrame df = fixture.LocalRelationFrame(PeopleSchema, Rows()); // 3 rows
+
+        Exception? error = Record.Exception(() =>
+        {
+            (long committed, _) = fixture.WriteWithMetrics(
+                df, "memory", SaveMode.Overwrite, target, factory, cts.Token);
+            Assert.Equal(3, committed); // the write reports the committed rows, not a failure
+        });
+
+        // No exception — a committed write never surfaces as cancelled/failed.
+        Assert.Null(error);
+        Assert.True(cts.IsCancellationRequested); // the post-commit cancel really did fire
+
+        // The rows are present: the write committed and completed.
+        Assert.True(registry.TryRead(target, out _, out IReadOnlyList<Row> written));
+        Assert.Equal(3, written.Count);
+    }
+
+    // ---------------- MUST-FIX 2: Overwrite replacement is proven ----------------
+
+    [Fact]
+    public void Save_Overwrite_OnExistingTarget_ReplacesRows()
+    {
+        using SparkSession spark = NewSession();
+        string target = UniqueTarget();
+
+        // Initial write: rows with ids 1,2,3.
+        spark.CreateDataFrame(Rows(), PeopleSchema)
+            .Write.Format("memory").Mode("overwrite").Save(target);
+
+        // Overwrite with DIFFERENT rows (ids 100,200) — the target must hold ONLY these afterwards.
+        DataFrame replacement = spark.CreateDataFrame(
+            new[]
+            {
+                new Row(PeopleSchema, 100, "neo"),
+                new Row(PeopleSchema, 200, "trinity"),
+            },
+            PeopleSchema);
+        replacement.Write.Format("memory").Mode("overwrite").Save(target);
+
+        Assert.True(InMemorySinkRegistry.Default.TryRead(target, out _, out IReadOnlyList<Row> written));
+        // Replacement — not append (would be 4) and not ignore (would keep the original 3).
+        Assert.Equal(2, written.Count);
+        Assert.Equal(new[] { 100, 200 }, written.Select(r => r.GetAs<int>("id")));
+
+        InMemorySinkRegistry.Default.Clear(target);
+    }
+
+    // ---------------- SHOULD-FIX 3: `path` option honored + case-insensitive routing ----------------
+
+    [Theory]
+    [InlineData("path")]
+    [InlineData("PATH")]
+    [InlineData("Path")]
+    public void Save_WithPathOption_NoSavePath_RoutesToThatTarget(string optionKey)
+    {
+        using SparkSession spark = NewSession();
+        InMemorySinkRegistry.Default.Clear("memory://default");
+        string target = UniqueTarget();
+        DataFrame df = spark.CreateDataFrame(Rows(), PeopleSchema);
+
+        // No Save(path): the `path` option (any casing, Spark parity) resolves the target.
+        df.Write.Format("memory").Mode("overwrite").Option(optionKey, target).Save();
+
+        Assert.True(InMemorySinkRegistry.Default.TryRead(target, out _, out IReadOnlyList<Row> written));
+        Assert.Equal(3, written.Count);
+        // It must NOT have fallen through to the path-less default key.
+        Assert.False(InMemorySinkRegistry.Default.TryRead("memory://default", out _, out _));
+
+        InMemorySinkRegistry.Default.Clear(target);
+    }
+
+    [Theory]
+    [InlineData("path")]
+    [InlineData("PATH")]
+    public void Write_PathOptionOnDescriptorWithoutPath_RoutesCaseInsensitively(string optionKey)
+    {
+        // Exercises SinkRegistry.TargetKey directly: a descriptor whose target lives ONLY in a `path`
+        // option (any casing), with no descriptor.Path, must still route to that target — not the default.
+        var fixture = new InMemoryRelationFixture();
+        var registry = new InMemorySinkRegistry();
+        string target = UniqueTarget();
+        DataFrame df = fixture.LocalRelationFrame(PeopleSchema, Rows());
+
+        (long committed, _) = fixture.WriteWithMetrics(
+            df,
+            "memory",
+            SaveMode.Overwrite,
+            path: null,
+            registry,
+            options: new Dictionary<string, string> { [optionKey] = target });
+
+        Assert.Equal(3, committed);
+        Assert.True(registry.TryRead(target, out _, out IReadOnlyList<Row> written));
+        Assert.Equal(3, written.Count);
+        Assert.False(registry.TryRead("memory://default", out _, out _));
     }
 }
