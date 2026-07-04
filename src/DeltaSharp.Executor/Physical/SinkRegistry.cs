@@ -172,7 +172,10 @@ internal sealed class InMemorySinkRegistry : ILocalSinkFactory
 
     // A write is keyed by its path (the common case), then a table identifier, then a stable default for a
     // path-less memory Save. Callers in M1 always supply a path, so collisions on the default are a
-    // test-only concern handled by using unique keys.
+    // test-only concern handled by using unique keys. The DataFrameWriter reconciles a `path` option into
+    // descriptor.Path, but resolve a `path` option here too (case-insensitively, matching the writer's
+    // OrdinalIgnoreCase option contract) so a descriptor built without that reconciliation still routes to
+    // the intended target rather than "memory://default" (Architect/DevEx).
     private static string TargetKey(SinkDescriptor descriptor)
     {
         if (!string.IsNullOrEmpty(descriptor.Path))
@@ -180,9 +183,13 @@ internal sealed class InMemorySinkRegistry : ILocalSinkFactory
             return descriptor.Path;
         }
 
-        if (descriptor.Options.TryGetValue("path", out string? optionPath) && !string.IsNullOrEmpty(optionPath))
+        foreach (KeyValuePair<string, string> option in descriptor.Options)
         {
-            return optionPath;
+            if (string.Equals(option.Key, "path", StringComparison.OrdinalIgnoreCase)
+                && !string.IsNullOrEmpty(option.Value))
+            {
+                return option.Value;
+            }
         }
 
         return descriptor.TableIdentifier is { Count: > 0 } identifier

@@ -215,7 +215,21 @@ public sealed class DataFrameWriter
 
     /// <summary>Snapshots the writer's staged intent into an immutable logical <see cref="SinkDescriptor"/>.
     /// A defensive copy of the mutable options/partition-columns keeps the built plan immutable even if
-    /// the writer is mutated further afterwards.</summary>
-    private SinkDescriptor BuildSink(string? path) =>
-        new(_format, _mode, path, tableIdentifier: null, partitionColumns: _partitionColumns, options: _options);
+    /// the writer is mutated further afterwards. When no explicit <see cref="Save(string)"/> path was
+    /// staged, a <c>path</c> option (case-insensitive, Spark parity: <c>save(path)</c> is
+    /// <c>option("path", path).save()</c>) is reconciled into the descriptor's path so
+    /// <c>Option("path", p).Save()</c> and <c>Save(p)</c> resolve to the same target; an explicit
+    /// <see cref="Save(string)"/> path takes precedence.</summary>
+    private SinkDescriptor BuildSink(string? path)
+    {
+        string? effectivePath = path;
+        if (effectivePath is null
+            && _options.TryGetValue("path", out string? optionPath)
+            && !string.IsNullOrEmpty(optionPath))
+        {
+            effectivePath = optionPath;
+        }
+
+        return new(_format, _mode, effectivePath, tableIdentifier: null, partitionColumns: _partitionColumns, options: _options);
+    }
 }
