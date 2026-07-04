@@ -14,7 +14,7 @@ x86/
 *.trx
 *.coverage
 *.coverage.json
-coverage/
+/coverage/
 *.opencover.xml
 *.cobertura.xml
 
@@ -56,3 +56,7 @@ secrets.json
 
 # Editor backup artifacts — never commit into engine source
 *.bak
+
+# Python tooling bytecode cache (tools/coverage/*.py)
+__pycache__/
+*.pyc

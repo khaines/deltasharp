@@ -1,0 +1,31 @@
+{
+  "_comment": [
+    "Coverage gate configuration (FEAT-00.2 / STORY-00.2.3, #106). SINGLE SOURCE OF TRUTH",
+    "for the enforced line-coverage threshold and the ratcheting policy. Read by",
+    "tools/coverage/coverage-gate.py, which the CI 'build-test-format' job runs after tests.",
+    "Prose policy lives in docs/engineering/design/quality-gates.md; the numbers here are what",
+    "is actually enforced."
+  ],
+  "minimumLineCoverage": 85.0,
+  "ratchetPolicy": "monotonic-non-decreasing",
+  "ratchetNotes": [
+    "The threshold only ever goes UP. When a PR raises measured coverage with real headroom",
+    "over the current floor, bump minimumLineCoverage toward (but not above) the measured",
+    "value in the same or a follow-up PR so the gain cannot silently erode later. Never lower",
+    "this number to make a red build pass; fix the tests instead. The gate prints a ratchet",
+    "suggestion when headroom exceeds 'ratchetSuggestSlack'.",
+    "Initial floor 85.0 set for FEAT-00.2 against a measured merged 89.16% (see quality-gates.md):",
+    "a deliberate ~4-point buffer below the locally-measured value absorbs cross-platform",
+    "variance (local arm64/macOS vs CI x64/Linux) and run-to-run nondeterminism, so the gate",
+    "flags genuine regressions rather than noise. Ratchet upward toward the CI-observed value."
+  ],
+  "ratchetSuggestSlack": 5.0,
+  "metric": "line",
+  "measurement": {
+    "tool": "coverlet.collector",
+    "reportFormat": "cobertura",
+    "mergeSemantics": "A production line is covered if hits > 0 in ANY report; totals are the union of distinct (file, line) pairs across all reports, so multi-TFM runs of the same assembly are de-duplicated rather than double-counted.",
+    "includedAssemblies": "[DeltaSharp.*] (production assemblies)",
+    "excludedAssemblies": "[*.Tests] test projects and [DeltaSharp.Samples.*] example apps, plus any assembly/member marked [ExcludeFromCodeCoverage] / [GeneratedCode] / [CompilerGenerated] (see coverlet.runsettings)"
+  }
+}

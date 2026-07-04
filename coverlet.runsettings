@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Code-coverage collection policy (FEAT-00.2 / STORY-00.2.3, #106).
+
+  Consumed by the coverlet.collector data collector when tests run with the
+  "XPlat Code Coverage" collector and this settings file. The exact `dotnet test`
+  invocation is documented in docs/engineering/design/quality-gates.md (kept there
+  because command flags use double dashes, which are illegal inside an XML comment).
+
+  This file configures WHAT is measured and HOW the report is shaped. The numeric
+  threshold and the ratcheting policy live separately in
+  tools/coverage/coverage-config.json (the single source of truth the CI gate reads).
+-->
+<RunSettings>
+  <DataCollectionRunSettings>
+    <DataCollectors>
+      <DataCollector friendlyName="XPlat Code Coverage">
+        <Configuration>
+          <!-- Cobertura: the portable, tool-agnostic report the coverage gate parses. -->
+          <Format>cobertura</Format>
+
+          <!-- Measure ONLY DeltaSharp production libraries under src/. The Include restricts
+               the denominator to shippable code; the Exclude then removes the test assemblies
+               themselves so a project "with no executable code" (the test projects) cannot
+               dilute or inflate the measured percentage (STORY-00.2.3 AC3), and removes the
+               samples/ example apps, which are not shippable libraries. Filter syntax is
+               [AssemblyGlob]TypeGlob, comma-separated; Excludes are applied after Includes. -->
+          <Include>[DeltaSharp.*]*</Include>
+          <Exclude>[*.Tests]*,[DeltaSharp.Samples.*]*</Exclude>
+
+          <!-- Never count generated / no-op / explicitly-excluded members. Attribute-scoped
+               so any future generated code (e.g. [GeneratedCode] source-generator output) is
+               excluded at the file/member level, never repo-wide. -->
+          <ExcludeByAttribute>Obsolete,GeneratedCodeAttribute,CompilerGeneratedAttribute,ExcludeFromCodeCoverageAttribute</ExcludeByAttribute>
+
+          <!-- Trivial auto-property get/set bodies are not meaningful coverage targets;
+               skipping them keeps the metric on real logic and keeps the number stable. -->
+          <SkipAutoProps>true</SkipAutoProps>
+
+          <!-- Deterministic + offline: no SourceLink round-trips during collection. -->
+          <UseSourceLink>false</UseSourceLink>
+          <SingleHit>false</SingleHit>
+        </Configuration>
+      </DataCollector>
+    </DataCollectors>
+  </DataCollectionRunSettings>
+</RunSettings>

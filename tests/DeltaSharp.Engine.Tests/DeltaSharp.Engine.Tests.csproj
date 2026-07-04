@@ -27,6 +27,11 @@
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
+    <!-- Coverage data collector (STORY-00.2.3). PrivateAssets=all: test-only, never shipped. -->
+    <PackageReference Include="coverlet.collector">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
     <!-- The Arrow-backed ColumnVector tests build Apache.Arrow input arrays at the interop edge. -->
     <PackageReference Include="Apache.Arrow" />
   </ItemGroup>

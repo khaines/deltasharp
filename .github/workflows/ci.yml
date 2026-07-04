@@ -59,8 +59,39 @@ jobs:
       - name: Build (Release)
         run: dotnet build DeltaSharp.sln -c Release --no-restore
 
-      - name: Test
-        run: dotnet test DeltaSharp.sln -c Release --no-build --verbosity normal
+      # Run tests AND collect line coverage in one pass. The coverlet.collector data collector
+      # instruments the already-built assemblies at run time (compatible with --no-build) and
+      # writes one Cobertura report per test assembly/TFM under TestResults/. WHAT is measured
+      # (production assemblies only) is defined by coverlet.runsettings (STORY-00.2.3).
+      - name: Test (with coverage)
+        run: >-
+          dotnet test DeltaSharp.sln -c Release --no-build --verbosity normal
+          --collect:"XPlat Code Coverage"
+          --settings coverlet.runsettings
+          --results-directory TestResults
 
       - name: Format (verify no changes)
         run: dotnet format DeltaSharp.sln --verify-no-changes --no-restore
+
+      # Coverage gate (STORY-00.2.3). Merges the per-assembly/per-TFM Cobertura reports by
+      # unioning per-line hits and FAILS the job when merged line coverage is below the floor
+      # recorded in tools/coverage/coverage-config.json (the single source of truth). The
+      # measured value and the threshold are printed and annotated so a failure is actionable.
+      # Uses only the Python 3 stdlib (preinstalled on the runner) — deterministic and offline.
+      - name: Coverage gate (line threshold)
+        run: >-
+          python3 tools/coverage/coverage-gate.py
+          --results-dir TestResults
+          --summary-out TestResults/coverage-summary.md
+
+      # Publish the Cobertura reports + merged summary as a workflow artifact (STORY-00.2.3 AC1),
+      # even when the gate above fails, so a contributor can inspect which lines regressed.
+      - name: Upload coverage report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-report
+          path: |
+            TestResults/**/coverage.cobertura.xml
+            TestResults/coverage-summary.md
+          if-no-files-found: warn

@@ -36,9 +36,10 @@ DeltaSharp targets **.NET 10** for the engine and multi-targets public libraries
 
 ```bash
 dotnet restore                          # restore dependencies
-dotnet build -c Release                 # build the solution
+dotnet build -c Release                 # build the solution (warnings are errors)
 dotnet test                             # run all tests
-dotnet format --verify-no-changes       # lint: fail if unformatted
+dotnet format                           # auto-fix formatting + code style (remediation)
+dotnet format --verify-no-changes       # lint gate: fail if unformatted
 ```
 
 Run a single test project or test:
@@ -68,10 +69,31 @@ dotnet test --filter "Name=Select_ProjectsColumns"
   fields; `async`/`await` for I/O.
 - Formatting and analyzer rules are enforced via `.editorconfig` and `dotnet
   format`; keep public-AOT/trim annotations clean (see the
-  `dotnet-library-platform-engineer` conventions).
+  `dotnet-library-platform-engineer` conventions). Run `dotnet format` to fix
+  formatting locally before pushing.
 - Mirror the Apache Spark public API where practical (see
   `.github/copilot-instructions.md`); document any deliberate deviation.
 - Preserve the engine invariant: **transformations are lazy, actions are eager.**
+
+## Quality gates
+
+Every pull request must pass three automated gates in the required CI job
+`build-test-format` (see
+[docs/engineering/design/quality-gates.md](docs/engineering/design/quality-gates.md) for the
+full policy). Each has a local command that reproduces the CI result:
+
+1. **Warnings-as-errors** — `dotnet build -c Release`. `TreatWarningsAsErrors=true` plus the
+   .NET, trim/AOT, and API analyzers mean any warning fails the build. Suppressions must be
+   **scoped and justified** (never a project-wide `<NoWarn>`).
+2. **Formatting** — `dotnet format --verify-no-changes` checks; **`dotnet format`** fixes.
+3. **Coverage** — CI collects line coverage and fails when it drops below the floor recorded in
+   [`tools/coverage/coverage-config.json`](tools/coverage/coverage-config.json). Reproduce with:
+
+   ```bash
+   dotnet test -c Release --collect:"XPlat Code Coverage" \
+     --settings coverlet.runsettings --results-directory TestResults
+   python3 tools/coverage/coverage-gate.py --results-dir TestResults
+   ```
 
 ## Tests
 
