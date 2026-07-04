@@ -202,9 +202,17 @@ data-in seam:
 - `ILocalSinkFactory.TryCreate(descriptor, schema, out sink)` (`:15`, impl `:59`) resolves a logical
   `SinkDescriptor` to a concrete sink. Only the `memory` format is engine-backed in M1 (`:63`, a
   defense-in-depth check — the analyzer already gated the format), keyed by the write target
-  (`TargetKey`, `:176`: path → option `path` → table identifier → a stable default).
+  (`TargetKey`, `:176`: `descriptor.Path` → a **case-insensitive** `path` option → table identifier → a
+  stable default). The `path`-option lookup is case-insensitive to match the writer's `OrdinalIgnoreCase`
+  option contract; the writer additionally reconciles a `path` option into `descriptor.Path` when no
+  `Save(path)` is given, so `Option("path", p).Save()` and `Save(p)` resolve to the same target (Spark
+  parity — `save(path)` is `option("path", path).save()`).
 - `ILocalSink.Commit(schema, rows)` (`:39`, impl `:208`) atomically commits the fully-materialized rows,
-  honoring the `SaveMode`.
+  honoring the `SaveMode`, and **returns the authoritative committed row count** (0 when an `Ignore`
+  skipped an existing target). This whole-result, row-oriented `Commit(rows)` is an **M1 in-memory
+  convenience** — NOT the final storage-sink seam. EPIC-05 introduces a batched/columnar transactional
+  contract (`Begin → WriteBatch(ColumnBatch) → Commit/Abort`) rather than extending this row-list
+  signature (see [#443](https://github.com/khaines/deltasharp/issues/443)).
 - `InMemorySinkRegistry` (`:50`) holds committed tables keyed by target; commits are serialized under a
   monitor (`Commit`, `:113`) so the `SaveMode` check-and-set is atomic even on the process-wide
   `Default` (`:56`). `TryRead` (`:81`) reads a committed target back — the seam the end-to-end tests use
@@ -221,10 +229,14 @@ in the target.
 `src/DeltaSharp.Executor/Physical/PhysicalPlan.cs:487` — the physical mirror of a leaf `ScanPlan`, but a
 sink at the top instead of a source, and the only physical node with a side effect. Its `Execute`
 (`:515`) drains the child, materializes the child rows once
-(`RowMaterializer.Materialize(child, null, null, ct)`, `:522`), then `_sink.Commit(child.Schema, rows)`
-(`:523`). **Materialize-then-commit is atomic**, so a mode conflict or a mid-write fault leaves no
-partial output (AC1/AC3). It returns the child `BatchResult` unchanged so the driver's finalize can count
-the rows written without re-executing. Its `SimpleString` renders the **redacted** `SinkDescriptor`.
+(`RowMaterializer.Materialize(child, null, null, ct)`), then captures the sink's authoritative committed
+count: `CommittedRowCount = _sink.Commit(child.Schema, rows)`. **Materialize-then-commit is atomic**, so a
+mode conflict or a mid-write fault leaves no partial output (AC1/AC3). **The commit is the final failure
+boundary**: after it succeeds the node does NO cancellable or fault-prone work — a cancel/timeout is
+observed before the commit or not at all, so a committed write never surfaces as a cancelled/failed
+`Save`. It returns the child `BatchResult` unchanged and exposes `CommittedRowCount` so the driver's
+finalize reports the rows actually WRITTEN — not the rows the child produced — without re-executing or
+re-polling the token. Its `SimpleString` renders the **redacted** `SinkDescriptor`.
 
 ### Planner + output derivation
 
@@ -239,11 +251,14 @@ the rows written without re-executing. Its `SimpleString` renders the **redacted
 ### Driver (`LocalQueryExecutor.Write`)
 
 `src/DeltaSharp.Executor/Physical/LocalQueryExecutor.cs:140` implements `Write` by reusing the SAME
-stage-attributed `Execute` driver as `Collect`/`Count`, with a finalize that counts the rows the
-`WriteToSinkPlan` already committed (`RowMaterializer.CountRows`) — no second execution. The executor
-threads the sink factory into both `PhysicalPlanner` instantiations (Explain and Execute), and the
-module initializer wires the process-wide `InMemorySinkRegistry.Default` via the
-`(IScanSource, SparkSession)` constructor chain.
+stage-attributed `Execute` driver as `Collect`/`Count`, with a finalize that returns the sink's
+**authoritative committed count** (`WriteToSinkPlan.CommittedRowCount`) — 0 for an `Ignore` that skipped
+an existing target, NOT the child's produced row count. The finalize does **no** cancellable or
+fault-prone work (no post-commit `CountRows`, no post-commit token poll), so a cancel/timeout in the
+post-commit window can never turn a committed write into a failed `Save`. The executor threads the sink
+factory into both `PhysicalPlanner` instantiations (Explain and Execute), and the module initializer
+wires the process-wide `InMemorySinkRegistry.Default` via the `(IScanSource, SparkSession)` constructor
+chain.
 
 ## Stage attribution (a write failure is deterministic)
 
@@ -255,6 +270,19 @@ Because `Write` reuses the #176 driver, a write failure is stage-attributed exac
   `WriteToSinkPlan.Execute` → caught by the driver's backend-stage catch → `QueryExecutionException`
   with `Stage == QueryExecutionStage.Backend`. The end-to-end test asserts both the stage attribution
   **and** that the original target's rows are intact (no partial output).
+
+### Read vs. write materialization-fault asymmetry (intended)
+
+A **generic** materialization fault during a WRITE is attributed to `Stage == Backend`, whereas the same
+fault during a READ is attributed to `Stage == Materialize`. This is intended, not a bug: a write drains
+and materializes its child rows *inside* `WriteToSinkPlan.Execute` (materialization is a sub-step of the
+sink commit, which is a backend side-effect), so any fault there is caught by the driver's Backend catch
+before the read path's separate `Materialize` stage runs. A READ materializes in the driver's finalize,
+which has its own `Materialize`-attributed catch. Note the asymmetry applies only to *generic*
+materialization faults — a value/type-mapping fault still carries its own embedded `Materialize`-stage
+`UnsupportedPlanException` (from `RowMaterializer`), which propagates unwrapped from either path. Per the
+QueryExec review this is documented as intended rather than re-architected for exact read/write parity;
+the sink commit legitimately owns the write-side materialization boundary.
 
 ## Lazy/eager guarantees
 
@@ -275,19 +303,24 @@ the **redacted** path — so explaining a write plan never opens a sink and neve
 
 ## Test plan
 
-**Core (`tests/DeltaSharp.Core.Tests/WriteDoor/WriteDoorTests.cs`, 22 tests)** — a fresh writer per
+**Core (`tests/DeltaSharp.Core.Tests/WriteDoor/WriteDoorTests.cs`, 28 tests)** — a fresh writer per
 access; lazy config touches no audit seam and never crosses the seam (AC2); `Mode(string)` case-insensitive
 parse + call-time validation of a bad mode; `Save` builds an analyzed `WriteToSource` and crosses the
 seam once recording `[Analyzer, Planner, Backend]` (AC1); typed-option coercion on the intent;
 unsupported-format (AC3) and Delta/Parquet EPIC-05 (AC4) diagnostics fire **before** the seam;
 default-parquet routing; diagnostic path redaction; stopped-session parity; `SinkDescriptor.SimpleString`
-redaction.
+redaction; a `path` option (any casing) reconciled into the descriptor path with `Save(path)` precedence;
+and `PartitionBy` columns carried onto the built intent (with defensive-copy proof).
 
-**Executor (`tests/DeltaSharp.Executor.Tests/WriteDoorEndToEndTests.cs`, 12 tests)** — `Save`
+**Executor (`tests/DeltaSharp.Executor.Tests/WriteDoorEndToEndTests.cs`, 20 tests)** — `Save`
 materializes to the in-memory sink and round-trips rows/nulls; writes the **transformed** result;
-`Append`/`Ignore`/`Overwrite` semantics; `ErrorIfExists` collision is `Backend`-stage-attributed and
-leaves no partial output; unsupported/deferred/default formats fail before any output; empty-frame write;
-and no secret leaks in a failure diagnostic (both the analysis-deferral and the commit-collision paths).
+`Append`/`Ignore`/`Overwrite` semantics; an `Overwrite` onto an existing target **replaces** (not
+appends/ignores); an `Ignore` onto an existing target reports/commits the **authoritative 0** (not the
+child's produced count) via the count-returning seam; a cancel firing in the **post-commit** window does
+NOT fail the `Save` and leaves the write committed; a `path` option (any casing) routes case-insensitively
+through `TargetKey`; `ErrorIfExists` collision is `Backend`-stage-attributed and leaves no partial output;
+unsupported/deferred/default formats fail before any output; empty-frame write; and no secret leaks in a
+failure diagnostic (both the analysis-deferral and the commit-collision paths).
 
 ## Deviations from the story
 
@@ -298,4 +331,19 @@ and no secret leaks in a failure diagnostic (both the analysis-deferral and the 
 - **One local sink in M1.** Only Spark's `memory` format executes end-to-end (AC1). File-format writers
   (`delta`/`parquet`) are deferred to EPIC-05 (AC4), mirroring how the read door defers Parquet reads.
 - **`PartitionBy` is recorded intent only.** The partition columns are carried on the `SinkDescriptor`
-  and honored by future storage sinks; the M1 in-memory sink does not physically partition.
+  and honored by future storage sinks; the M1 in-memory sink does not physically partition, and the
+  columns are not yet validated against the child schema (Spark errors on an unknown partition column —
+  deferred to [#444](https://github.com/khaines/deltasharp/issues/444)).
+
+## Deferred follow-ups (write-door review, PR #441)
+
+- **Unbounded write materialization** — the write drains the whole result into a driver `List<Row>`
+  (result bounds intentionally not applied to a write); a tenant-aware write ceiling / streaming staged
+  commit is [#442](https://github.com/khaines/deltasharp/issues/442).
+- **EPIC-05 sink contract shape** — `Commit(schema, rows)` is an M1 in-memory convenience; the batched/
+  columnar transactional seam (`Begin → WriteBatch → Commit/Abort`) is
+  [#443](https://github.com/khaines/deltasharp/issues/443).
+- **`PartitionBy` schema validation** at analysis — [#444](https://github.com/khaines/deltasharp/issues/444).
+- **`Save(string, CancellationToken)` overload** for cancellable path writes —
+  [#445](https://github.com/khaines/deltasharp/issues/445) (the honored `path` option already makes
+  `Option("path", p).Save(ct)` a cancellable path write).
