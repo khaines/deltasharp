@@ -208,6 +208,31 @@ public sealed class WriteDoorTests
         }
     }
 
+    [Fact]
+    public void Save_OptionKeys_AreCaseInsensitive_OnTheWriteDescriptor()
+    {
+        // Regression (red-team MEDIUM): the writer collects options case-insensitively (Spark parity),
+        // but the descriptor used to copy them into an ORDINAL (case-sensitive) map, so a `.Option("HEADER",
+        // …)` was invisible to a downstream `Options["header"]`/TryGetValue("header") lookup. The descriptor
+        // options must be case-insensitive so any-casing option keys are retrievable by any casing.
+        var executor = new FakeQueryExecutor(Array.Empty<Row>());
+        (SparkSession spark, DataFrame df) = NewBoundFrame(executor);
+        using (spark)
+        {
+            df.Write.Format("memory")
+                .Option("HEADER", "true")
+                .Save("mem://ci-options");
+
+            var write = Assert.IsType<WriteToSource>(executor.LastPlan);
+
+            // The value written under "HEADER" is retrievable under the lower-cased key (and any casing).
+            Assert.True(write.Sink.Options.TryGetValue("header", out string? headerValue));
+            Assert.Equal("true", headerValue);
+            Assert.Equal("true", write.Sink.Options["header"]);
+            Assert.Equal("true", write.Sink.Options["Header"]);
+        }
+    }
+
     // ---------------- AC3: unsupported format is a deterministic diagnostic ----------------
 
     [Fact]

@@ -79,17 +79,20 @@ internal static class PlanHash
     }
 
     /// <summary>
-    /// Order-independent hash of a string-keyed string map: each entry contributes
-    /// <c>Combine(OfString(key), OfString(value))</c> and the per-entry hashes are XOR-folded so
-    /// the result does not depend on enumeration order (consistent with order-independent map
-    /// equality).
+    /// Order-independent hash of a string-keyed string map whose keys are compared
+    /// <b>case-insensitively</b> (as the IR's option maps are — <see cref="PlanCollections.ToOptions"/>
+    /// builds them with <see cref="System.StringComparer.OrdinalIgnoreCase"/>). Each entry contributes
+    /// <c>Combine(OfString(lowercased key), OfString(value))</c> so two maps that are
+    /// <see cref="PlanCollections.OptionsEqual"/> but differ only in key case hash IDENTICALLY (keeping
+    /// the <c>Equals</c>/<c>GetHashCode</c> contract); values are hashed case-sensitively. The per-entry
+    /// hashes are XOR-folded so the result does not depend on enumeration order.
     /// </summary>
     public static int OfStringMap(IReadOnlyDictionary<string, string> map)
     {
         int acc = 0;
         foreach (KeyValuePair<string, string> entry in map)
         {
-            acc ^= Combine(OfString(entry.Key), OfString(entry.Value));
+            acc ^= Combine(OfString(entry.Key.ToLowerInvariant()), OfString(entry.Value));
         }
 
         return acc;

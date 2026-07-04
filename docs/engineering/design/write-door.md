@@ -122,6 +122,15 @@ write target: `Format`, `Mode`, optional `Path`/`TableIdentifier`, `PartitionCol
 or a diagnostic — never leaks a SAS token / presigned-URL signature / userinfo secret (the write-side
 fix mirroring the read door's #424; discharges #432).
 
+`Options` is a **case-insensitive** map (`PlanCollections.ToOptions`/`EmptyOptions` build it with
+`StringComparer.OrdinalIgnoreCase`), matching Spark's case-insensitive data-source option keys: the
+writer collects options case-insensitively, so a `.Option("HEADER", …)` must be retrievable downstream
+as `descriptor.Options["header"]`/`TryGetValue("header")`. Option *values* stay case-sensitive.
+`PlanCollections.OptionsEqual` (key-insensitive, value-ordinal) and `PlanHash.OfStringMap` (which hashes
+keys via their lower-cased form) are kept consistent so two writers that differ only in option-key case
+are structurally equal **and** hash identically (Spark parity). This case-insensitivity applies to every
+`ToOptions`-built option map (read relations too), not just the write descriptor.
+
 ## Write-format taxonomy (AC routing)
 
 `src/DeltaSharp.Core/Plans/Logical/WriteFormats.cs` is the single, deterministic, case-insensitive
