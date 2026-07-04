@@ -229,7 +229,9 @@ internal static class SqlLexer
                     throw SqlParseException.Syntax("empty backtick-quoted identifier", position);
                 }
 
-                return new SqlToken(SqlTokenKind.Identifier, value.ToString(), position);
+                // A backtick-quoted (delimited) identifier is a literal name: mark it IsQuoted so the
+                // parser never re-interprets it as a keyword/quantifier/pseudo-keyword (Spark parity).
+                return new SqlToken(SqlTokenKind.Identifier, value.ToString(), position, IsQuoted: true);
             }
 
             value.Append(c);

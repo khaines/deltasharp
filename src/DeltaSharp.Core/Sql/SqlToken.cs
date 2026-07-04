@@ -109,4 +109,11 @@ internal enum SqlTokenKind
 /// <param name="Kind">The lexical category.</param>
 /// <param name="Text">The source text of the lexeme (for a string literal, the decoded value).</param>
 /// <param name="Position">The 1-based index of the lexeme's first character in the source.</param>
-internal readonly record struct SqlToken(SqlTokenKind Kind, string Text, int Position);
+/// <param name="IsQuoted">
+/// <see langword="true"/> when an <see cref="SqlTokenKind.Identifier"/> was backtick-quoted (a Spark
+/// <em>delimited</em> identifier). A delimited identifier is ALWAYS a literal column/relation name and
+/// is never interpreted as a keyword, set quantifier, or pseudo-keyword by the parser. Always
+/// <see langword="false"/> for every other token kind.
+/// </param>
+internal readonly record struct SqlToken(
+    SqlTokenKind Kind, string Text, int Position, bool IsQuoted = false);

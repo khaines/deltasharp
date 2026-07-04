@@ -173,6 +173,7 @@ internal sealed class SqlParser
 
     private bool IsSetQuantifier(string keyword) =>
         Current.Kind == SqlTokenKind.Identifier
+        && !Current.IsQuoted
         && string.Equals(Current.Text, keyword, System.StringComparison.OrdinalIgnoreCase);
 
     private static bool StartsSelectItem(SqlToken token) =>
@@ -643,7 +644,9 @@ internal sealed class SqlParser
 
     private static string? MapPredicateKeyword(SqlToken token)
     {
-        if (token.Kind != SqlTokenKind.Identifier)
+        // A backtick-quoted (delimited) identifier is a literal column name, never a predicate
+        // keyword: 'WHERE a = `is`' references a column named 'is' (Spark parity).
+        if (token.Kind != SqlTokenKind.Identifier || token.IsQuoted)
         {
             return null;
         }
@@ -660,7 +663,9 @@ internal sealed class SqlParser
 
     private static string? MapNotPredicateKeyword(SqlToken notToken, SqlToken next)
     {
-        if (notToken.Kind != SqlTokenKind.Not || next.Kind != SqlTokenKind.Identifier)
+        // Only an UNQUOTED IN/LIKE/BETWEEN after NOT names an unsupported predicate; a quoted
+        // 'NOT `in`' has a delimited identifier that is a literal name, not a predicate keyword.
+        if (notToken.Kind != SqlTokenKind.Not || next.Kind != SqlTokenKind.Identifier || next.IsQuoted)
         {
             return null;
         }
@@ -676,7 +681,8 @@ internal sealed class SqlParser
 
     private static string? MapStatementKeyword(SqlToken token)
     {
-        if (token.Kind != SqlTokenKind.Identifier)
+        // A backtick-quoted identifier is a delimited name, not a statement keyword.
+        if (token.Kind != SqlTokenKind.Identifier || token.IsQuoted)
         {
             return null;
         }
@@ -709,7 +715,7 @@ internal sealed class SqlParser
             return "IMPLICIT_JOIN";
         }
 
-        if (token.Kind != SqlTokenKind.Identifier)
+        if (token.Kind != SqlTokenKind.Identifier || token.IsQuoted)
         {
             return null;
         }

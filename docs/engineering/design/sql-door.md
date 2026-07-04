@@ -137,6 +137,20 @@ mis-parsed as an implicitly-aliased column. `FROM` is **required** in M1 (a bare
 is a `SyntaxError` here — a data-source-free `SELECT` needs the one-row relation the table door adds
 later).
 
+**Backtick-quoted (delimited) identifiers are literal names.** A backtick-quoted identifier is a Spark
+*delimited* identifier: it is ALWAYS a column/relation NAME and is **never** interpreted as a keyword, set
+quantifier, or pseudo-keyword — even when its text matches one. The lexer records the quoting on the token
+(`SqlToken.IsQuoted`), and every identifier-as-keyword check in the parser (`RejectSetQuantifier` for
+`ALL`/`DISTINCT`, `MapPredicateKeyword`/`MapNotPredicateKeyword` for `IS`/`IN`/`LIKE`/`BETWEEN`, and the
+`MapStatementKeyword`/`MapTrailingConstruct` hooks) applies **only to unquoted** identifiers. So
+`` SELECT `all` a FROM t `` projects a column named `all` aliased to `a` (it is not swallowed as the default
+`ALL` quantifier), `` SELECT `distinct` FROM t `` projects a column named `distinct` (not an
+`UnsupportedFeature`), and `` WHERE a = `is` `` is a reference to a column named `is` (not `IS [NOT] NULL`).
+Reserved keywords (`SELECT`/`FROM`/`WHERE`/`AND`/`OR`/`NOT`/…) are distinct lexer token kinds only when
+unquoted; `` `select` ``/`` `from` `` scan as ordinary (quoted) identifiers and likewise parse as names. A
+quoted identifier is a **single** name part even if it contains a dot (`` `a.b` `` is one part `a.b`, not
+`a` qualified by `b`), and `` `` `` still escapes a literal backtick inside the quotes.
+
 **Precedence** (lowest → highest): `OR` < `AND` < `NOT` < comparison < `+`/`-` < `*`/`/`/`%` <
 unary sign < primary. This mirrors Spark/ANSI SQL and matches the DataFrame `Column` operator
 composition so equivalent expressions build identical trees (AC3).
@@ -153,7 +167,8 @@ into a `SqlParseException`.
 **Lexer** (`SqlLexer.cs`): skips whitespace and SQL comments (`--` to end of line, `/* … */` block —
 so `SELECT 1--1` is `SELECT 1`, not `1 - (-1)`); recognizes the keywords `SELECT FROM WHERE AS AND OR
 NOT TRUE FALSE NULL`; unquoted identifiers (a leading Unicode letter or `_` via `char.IsLetter`, then
-letters/digits/`_`) and backtick-quoted identifiers (with `` `` `` escaping a backtick); single-quoted
+letters/digits/`_`) and backtick-quoted identifiers (with `` `` `` escaping a backtick, and an
+`IsQuoted` flag recorded so the parser treats them as delimited literal names — see above); single-quoted
 string literals (with `''` escaping a quote); integer vs. decimal numeric literals (a `.` or exponent
 makes it decimal); and the punctuation / operator glyphs. Every token carries its 1-based source
 position for deterministic diagnostics.
@@ -294,6 +309,11 @@ session throws `SessionStoppedException`, not `ArgumentNullException` (asserted 
   set quantifier (`SELECT ALL DISTINCT a`) is rejected, not mis-parsed. `NOT IN`/`NOT LIKE`/`NOT BETWEEN`
   surface the named `UnsupportedFeature` (`NOT_IN`/`NOT_LIKE`/`NOT_BETWEEN`), while `WHERE NOT a = b`
   still parses as boolean negation.
+- **Delimited identifiers:** a backtick-quoted name is exempt from keyword/quantifier/pseudo-keyword
+  interpretation — `` SELECT `all` a FROM t `` keeps the `all` column (not the `ALL` quantifier),
+  `` SELECT `distinct` FROM t `` projects a `distinct` column (no `SELECT_DISTINCT`), `` WHERE a = `is` ``
+  is a column reference (no `IS_NULL`), and `` `a.b` `` stays a single-part name — while the unquoted
+  `SELECT ALL/DISTINCT`, `a IN (1)`, and `a NOT IN (1)` behaviors are unchanged (regression guarded).
 - **AC4 (lifecycle):** a stopped session throws `SessionStoppedException` from `Sql` with the same
   `ForMember` message model as `Read`, and the guard precedes the null check.
 

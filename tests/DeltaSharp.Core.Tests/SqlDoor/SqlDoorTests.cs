@@ -508,6 +508,109 @@ public sealed class SqlDoorTests
         Assert.True(Functions.Lit(1).Expr.Equals(literal));
     }
 
+    // ---------------- Backtick-quoted (delimited) identifiers are literal names ----------------
+
+    [Fact]
+    public void Sql_QuotedAllColumn_IsPreserved_NotConsumedAsSetQuantifier()
+    {
+        using SparkSession spark = NewSession();
+        spark.QueryExecutor = new ThrowingQueryExecutor();
+
+        // '`all`' is a delimited identifier — a column NAME, never the default ALL set quantifier.
+        // Mutation sentinel: dropping the IsQuoted guard in IsSetQuantifier lets RejectSetQuantifier
+        // swallow the '`all`' column, mis-parsing to a wrong Project ['a] plan (the column vanishes).
+        DataFrame df = spark.Sql("SELECT `all` a FROM t");
+
+        var project = (Project)df.Plan;
+        Expression only = Assert.Single(project.ProjectList);
+        var alias = Assert.IsType<Alias>(only);
+        Assert.Equal("a", alias.Name);
+        var attribute = Assert.IsType<UnresolvedAttribute>(alias.Child);
+        Assert.Equal(new[] { "all" }, attribute.NameParts);
+        Assert.True(Functions.Col("all").As("a").Expr.Equals(only));
+    }
+
+    [Fact]
+    public void Sql_QuotedDistinctColumn_ProjectsColumn_NotRejectedAsDistinct()
+    {
+        using SparkSession spark = NewSession();
+
+        // '`distinct`' is a delimited identifier — a column named 'distinct', not the DISTINCT
+        // quantifier. Sentinel: without the IsQuoted guard this throws UnsupportedFeature(SELECT_DISTINCT).
+        DataFrame df = spark.Sql("SELECT `distinct` FROM t");
+
+        var project = (Project)df.Plan;
+        Expression only = Assert.Single(project.ProjectList);
+        var attribute = Assert.IsType<UnresolvedAttribute>(only);
+        Assert.Equal(new[] { "distinct" }, attribute.NameParts);
+    }
+
+    [Fact]
+    public void Sql_QuotedIsColumn_IsColumnReference_NotIsNullPredicate()
+    {
+        using SparkSession spark = NewSession();
+
+        // '`is`' on the right of '=' is a delimited identifier — a column named 'is'. Sentinel:
+        // without the IsQuoted guard MapPredicateKeyword throws UnsupportedFeature(IS_NULL) instead.
+        DataFrame df = spark.Sql("SELECT a FROM t WHERE a = `is`");
+
+        var filter = (Filter)((Project)df.Plan).Child;
+        var comparison = Assert.IsType<BinaryComparison>(filter.Condition);
+        Assert.Equal(ComparisonOperator.Equal, comparison.Operator);
+        Assert.Equal(new[] { "a" }, Assert.IsType<UnresolvedAttribute>(comparison.Left).NameParts);
+        Assert.Equal(new[] { "is" }, Assert.IsType<UnresolvedAttribute>(comparison.Right).NameParts);
+        Assert.True(Functions.Col("a").EqualTo(Functions.Col("is")).Expr.Equals(filter.Condition));
+    }
+
+    [Theory]
+    [InlineData("in")]
+    [InlineData("like")]
+    [InlineData("between")]
+    [InlineData("not")]
+    [InlineData("select")]
+    [InlineData("from")]
+    [InlineData("where")]
+    public void Sql_QuotedKeywordName_ParsesAsColumnReference(string name)
+    {
+        using SparkSession spark = NewSession();
+
+        // Every quoted pseudo-keyword or reserved keyword in a name position is a literal column name.
+        DataFrame df = spark.Sql($"SELECT `{name}` FROM t");
+
+        var project = (Project)df.Plan;
+        Expression only = Assert.Single(project.ProjectList);
+        var attribute = Assert.IsType<UnresolvedAttribute>(only);
+        Assert.Equal(new[] { name }, attribute.NameParts);
+    }
+
+    [Fact]
+    public void Sql_QuotedNotInColumn_IsColumnReference_NotNegatedPredicate()
+    {
+        using SparkSession spark = NewSession();
+
+        // 'NOT `in`' — the delimited '`in`' is a column name, so NOT is a leading boolean negation of
+        // the column, NOT the NOT_IN predicate. Sentinel: without the guard this throws NOT_IN.
+        DataFrame df = spark.Sql("SELECT a FROM t WHERE NOT `in`");
+
+        var filter = (Filter)((Project)df.Plan).Child;
+        Assert.True(Functions.Col("in").Not().Expr.Equals(filter.Condition));
+    }
+
+    [Fact]
+    public void Sql_QuotedDottedName_StaysSinglePartIdentifier()
+    {
+        using SparkSession spark = NewSession();
+
+        // A backtick-quoted '`a.b`' is a SINGLE-part delimited name (the dot is literal), not a
+        // two-part qualified reference — regression guard for the design-doc backtick semantics.
+        DataFrame df = spark.Sql("SELECT `a.b` FROM t");
+
+        var project = (Project)df.Plan;
+        Expression only = Assert.Single(project.ProjectList);
+        var attribute = Assert.IsType<UnresolvedAttribute>(only);
+        Assert.Equal(new[] { "a.b" }, attribute.NameParts);
+    }
+
     // ---------------- AC3: multipart references converge across both front-ends (item 5) ----------------
 
     [Fact]
