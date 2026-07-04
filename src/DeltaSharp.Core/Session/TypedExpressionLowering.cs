@@ -1,6 +1,5 @@
 using System.Linq.Expressions;
 using System.Reflection;
-using DeltaSharp.Types;
 
 namespace DeltaSharp;
 
@@ -23,8 +22,10 @@ namespace DeltaSharp;
 /// <para>
 /// Fidelity is preserved where C# and SQL diverge: a <c>== null</c>/<c>!= null</c> comparison lowers to
 /// <see cref="Column.IsNull"/>/<see cref="Column.IsNotNull"/> (not a 3VL comparison against a NULL
-/// literal, which would match nothing); a value-changing numeric <c>Convert</c> (for example
-/// <c>(double)intCol</c>) lowers to an explicit <c>Cast</c> rather than being silently dropped; and a
+/// literal, which would match nothing); a C# numeric <c>Convert</c> the compiler inserts (an implicit
+/// promotion or an explicit cast such as <c>(double)intCol</c>) is <b>unwrapped</b> so the plan carries
+/// the bare column reference — matching the untyped API and letting Spark's Catalyst perform type
+/// coercion (no fork); and a
 /// bitwise <c>&amp;</c>/<c>|</c> is rejected rather than mis-lowered to logical <c>And</c>/<c>Or</c>.
 /// </para>
 /// <para>
@@ -81,12 +82,26 @@ internal static class TypedExpressionLowering
         };
     }
 
-    // A Convert node may be a *safe unwrap* that carries no logical/value meaning — boxing a value type
-    // to object (Func<T, object?> selectors), a Nullable<U> lift/unlift, or an identity convert — in
-    // which case it is dropped and the operand lowered. A *value-changing numeric conversion* (for
-    // example (double)intCol) must NOT be dropped: doing so would silently reinterpret the operation in
-    // the source domain (e.g. integer division), so it is preserved as an explicit Cast to the target
-    // ADR-0008 type — or, if that target has no supported mapping, rejected deterministically.
+    // A Convert node the C# compiler inserts within a typed lambda is a *coercion*, not an
+    // independently meaningful operation — a boxing of a value type to object (Func<T, object?>
+    // selectors), a Nullable<U> lift/unlift, an identity convert, AND every value-changing numeric
+    // promotion or explicit numeric cast the compiler emits (short+short → both Convert-ed to int,
+    // int op long → int Convert-ed to long, float op double, (double)intCol, enum `==` → Convert to
+    // the underlying int, …). ALL are UNWRAPPED: the lowered plan carries the bare column reference —
+    // byte-identical to the untyped Functions.Col/Column API — and Spark's analyzer (Catalyst) performs
+    // type coercion at analysis time. Baking C#'s coercion rules into the logical plan as explicit Cast
+    // IR would pre-empt Catalyst's TypeCoercion and FORK the typed plan from the untyped one
+    // (`Plus(Cast(Col,Int), Cast(Col,Int))` vs `Plus(Col, Col)`), so it is deliberately not done. A C#
+    // cast in a typed lambda is therefore NOT independently represented in M1; a typed-cast facility is
+    // future work.
+    //
+    // The sole exception is a CHECKED numeric conversion over a column operand
+    // (`checked((int)p.LongCol)`): the C# `checked` context asks for a per-expression overflow guard
+    // that has no faithful Spark-plan mapping (Spark overflow is session-config governed), so it is
+    // rejected rather than silently unwrapped to a plain (unchecked) operation. A value-*preserving*
+    // checked convert (boxing / Nullable lift / identity) changes nothing and is still unwrapped.
+    // (A parameter-independent `ConvertChecked` was already folded by EvaluateConstant, so only column
+    // operands reach here.)
     private static Column LowerConvert(UnaryExpression convert, ParameterExpression parameter)
     {
         Type target = convert.Type;
@@ -94,30 +109,13 @@ internal static class TypedExpressionLowering
         Type targetUnderlying = Nullable.GetUnderlyingType(target) ?? target;
         Type sourceUnderlying = Nullable.GetUnderlyingType(source) ?? source;
 
-        // Boxing to object, or a convert whose underlying types match (identity / Nullable<> lift or
-        // unlift), changes no value: unwrap it.
-        if (target == typeof(object) || targetUnderlying == sourceUnderlying)
-        {
-            return LowerNode(convert.Operand, parameter);
-        }
-
-        // A value-changing `checked((int)p.LongCol)` reaches here with a COLUMN operand (a
-        // parameter-independent `ConvertChecked` was already folded by EvaluateConstant). The C#
-        // `checked` context asks for an overflow guard that has no faithful per-expression Spark
-        // mapping, so reject it rather than silently emitting a plain (unchecked) Cast.
-        if (convert.NodeType == ExpressionType.ConvertChecked)
+        bool valuePreservingUnwrap = target == typeof(object) || targetUnderlying == sourceUnderlying;
+        if (convert.NodeType == ExpressionType.ConvertChecked && !valuePreservingUnwrap)
         {
             throw CheckedColumnArithmeticUnsupported(convert);
         }
 
-        Column operand = LowerNode(convert.Operand, parameter);
-        DataType targetType = DatasetSchema.MapClrType(targetUnderlying)
-            ?? throw new UnsupportedTypedExpressionException(
-                $"Unsupported typed conversion to '{target.Name}' in a Dataset<T> lambda: '{convert}'. "
-                + "A value-changing numeric conversion lowers to a Cast, but the target CLR type has no "
-                + "supported DeltaSharp DataType mapping.");
-
-        return new Column(new Plans.Expressions.Cast(operand.Expr, targetType));
+        return LowerNode(convert.Operand, parameter);
     }
 
     private static Column LowerMember(MemberExpression member, ParameterExpression parameter)

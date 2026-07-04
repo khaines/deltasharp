@@ -10,14 +10,22 @@ namespace DeltaSharp.Core.Tests.Typed;
 /// STORY-04.2.4 (#163) AC1 — structural-fidelity tests for <see cref="TypedExpressionLowering"/>. Each
 /// case lowers a typed lambda and asserts the produced expression IR is <b>structurally equal</b> to
 /// the hand-built <see cref="Functions"/>/<see cref="Column"/> equivalent, so a mutation to a single
-/// lowering arm (for example <c>Add</c>&#8594;<c>Subtract</c>, or dropping a value-changing cast)
+/// lowering arm (for example <c>Add</c>&#8594;<c>Subtract</c>, or reintroducing a value-changing cast)
 /// reddens the corresponding test. It also pins the correctness fixes the review council flagged:
 /// <c>== null</c>/<c>!= null</c> &#8594; <c>IsNull</c>/<c>IsNotNull</c>, bitwise <c>&amp;</c>/<c>|</c>
-/// rejection, value-changing numeric <c>Convert</c> &#8594; <c>Cast</c>, and folding of
-/// parameter-independent arithmetic subtrees.
+/// rejection, C# numeric <c>Convert</c> promotions/casts <b>unwrapped</b> so a typed expression lowers
+/// to the byte-identical plan as its untyped <c>Col op Col</c> equivalent (<b>no fork</b>), and folding
+/// of parameter-independent arithmetic subtrees.
 /// </summary>
 public sealed class DatasetTypedLoweringTests
 {
+    public enum Color
+    {
+        Red = 0,
+        Green = 1,
+        Blue = 2,
+    }
+
     public sealed class Rec
     {
         public long Id { get; set; }
@@ -33,6 +41,28 @@ public sealed class DatasetTypedLoweringTests
         public bool A { get; set; }
 
         public bool B { get; set; }
+
+        public short ShortCol1 { get; set; }
+
+        public short ShortCol2 { get; set; }
+
+        // Spark's `byte`/TINYINT is a *signed* 8-bit integer; the schema deriver maps C# `sbyte`
+        // (not the unsigned `byte`) to ByteType, so these use `sbyte`.
+        public sbyte ByteCol1 { get; set; }
+
+        public sbyte ByteCol2 { get; set; }
+
+        public float FloatCol { get; set; }
+
+        public double DoubleCol { get; set; }
+    }
+
+    // Separate record: an enum property has no ADR-0008 schema mapping, so it must NOT sit on `Rec`
+    // (which `df.As<Rec>()` derives a schema from). The enum no-fork test lowers a lambda directly and
+    // never derives a schema, so a dedicated encoded type is safe.
+    public sealed class EnumRec
+    {
+        public Color EnumCol { get; set; }
     }
 
     private static Column Lower(Expression<Func<Rec, bool>> predicate) =>
@@ -117,20 +147,117 @@ public sealed class DatasetTypedLoweringTests
         Assert.Equal(Functions.Col("A").Or(Functions.Col("B")).Expr, lowered.Expr);
     }
 
-    // ----- Item 3: a value-changing numeric Convert lowers to an explicit Cast -----
+    // ----- Item 3 / NO-FORK: C# numeric Convert promotions & explicit casts are UNWRAPPED so a typed
+    // arithmetic/comparison expression lowers to the byte-identical plan as its untyped `Col op Col`
+    // equivalent. Each pin below REDDENS if a `Cast` the untyped side lacks is (re)introduced. -----
 
     [Fact]
-    public void ValueChangingNumericConvert_LowersToCast()
+    public void NumericConvert_UnwrapsToMatchUntyped()
     {
-        Column lowered = LowerSelect(p => (double)p.Flags / p.Other);
+        // `(double)p.Flags / p.Other` — C# inserts Convert(Flags→double) and promotes Other→double.
+        // Both Converts UNWRAP, so the typed plan is the SAME `Divide(Col, Col)` as the untyped API.
+        // DeltaSharp's `/` is ALREADY fractional (returns DOUBLE, matching Spark — see
+        // ArithmeticResultType), so the `(double)` cast is redundant AND must not bake a Cast into the
+        // plan; doing so would pre-empt Catalyst's TypeCoercion and FORK from the untyped side.
+        Column typed = LowerSelect(p => (double)p.Flags / p.Other);
+        Column untyped = Functions.Col("Flags") / Functions.Col("Other");
 
+        Assert.Equal(untyped.Expr, typed.Expr);
+
+        // Reddens if the removed value-changing-Cast branch is reintroduced:
         Column castLeft = new(new DeltaSharp.Plans.Expressions.Cast(Functions.Col("Flags").Expr, DoubleType.Instance));
         Column castRight = new(new DeltaSharp.Plans.Expressions.Cast(Functions.Col("Other").Expr, DoubleType.Instance));
-        Column expected = castLeft.Divide(castRight);
+        Assert.NotEqual(castLeft.Divide(castRight).Expr, typed.Expr);
+    }
 
-        Assert.Equal(expected.Expr, lowered.Expr);
-        // Silently dropping the convert (integer division) would produce a different tree:
-        Assert.NotEqual(Functions.Col("Flags").Divide(Functions.Col("Other")).Expr, lowered.Expr);
+    [Fact]
+    public void ShortAddition_LowersToSamePlanAsUntyped_NoFork()
+    {
+        // C# promotes both `short` operands to `int` (Plus(Convert(Col,int), Convert(Col,int))); both
+        // Converts UNWRAP so the typed plan equals the untyped `Plus(Col, Col)`.
+        Column typed = LowerSelect(p => p.ShortCol1 + p.ShortCol2);
+        Column untyped = Functions.Col("ShortCol1").Plus(Functions.Col("ShortCol2"));
+
+        Assert.Equal(untyped.Expr, typed.Expr);
+        // Reddens if a Cast(Col AS int) is reintroduced on either operand:
+        Assert.NotEqual(
+            new Column(new DeltaSharp.Plans.Expressions.Cast(Functions.Col("ShortCol1").Expr, IntegerType.Instance))
+                .Plus(new Column(new DeltaSharp.Plans.Expressions.Cast(Functions.Col("ShortCol2").Expr, IntegerType.Instance)))
+                .Expr,
+            typed.Expr);
+    }
+
+    [Fact]
+    public void ByteAddition_LowersToSamePlanAsUntyped_NoFork()
+    {
+        // Two `sbyte` (Spark TINYINT) operands promote to `int` in C#; both Converts UNWRAP so the typed
+        // plan equals the untyped `Plus(Col, Col)`.
+        Column typed = LowerSelect(p => p.ByteCol1 + p.ByteCol2);
+        Column untyped = Functions.Col("ByteCol1").Plus(Functions.Col("ByteCol2"));
+
+        Assert.Equal(untyped.Expr, typed.Expr);
+    }
+
+    [Fact]
+    public void MixedIntLongAddition_LowersToSamePlanAsUntyped_NoFork()
+    {
+        // `int op long` promotes the int operand to long (Plus(Convert(Age,long), Id)); the Convert
+        // UNWRAPS so the typed plan equals the untyped `Plus(Col, Col)` — Catalyst does the widening.
+        Column typed = LowerSelect(p => p.Age + p.Id);
+        Column untyped = Functions.Col("Age").Plus(Functions.Col("Id"));
+
+        Assert.Equal(untyped.Expr, typed.Expr);
+        // Reddens if a Cast(Age AS long) is reintroduced:
+        Assert.NotEqual(
+            new Column(new DeltaSharp.Plans.Expressions.Cast(Functions.Col("Age").Expr, LongType.Instance))
+                .Plus(Functions.Col("Id")).Expr,
+            typed.Expr);
+    }
+
+    [Fact]
+    public void MixedFloatDoubleAddition_LowersToSamePlanAsUntyped_NoFork()
+    {
+        // `float op double` promotes the float operand to double; the Convert UNWRAPS so the typed plan
+        // equals the untyped `Plus(Col, Col)`.
+        Column typed = LowerSelect(p => p.FloatCol + p.DoubleCol);
+        Column untyped = Functions.Col("FloatCol").Plus(Functions.Col("DoubleCol"));
+
+        Assert.Equal(untyped.Expr, typed.Expr);
+        // Reddens if a Cast(FloatCol AS double) is reintroduced:
+        Assert.NotEqual(
+            new Column(new DeltaSharp.Plans.Expressions.Cast(Functions.Col("FloatCol").Expr, DoubleType.Instance))
+                .Plus(Functions.Col("DoubleCol")).Expr,
+            typed.Expr);
+    }
+
+    [Fact]
+    public void ShortComparison_LowersToSamePlanAsUntyped_NoFork()
+    {
+        // A comparison over two `short` operands also promotes both to `int`; both Converts UNWRAP so
+        // the typed plan equals the untyped `Gt(Col, Col)`.
+        Column typed = Lower(p => p.ShortCol1 > p.ShortCol2);
+        Column untyped = Functions.Col("ShortCol1").Gt(Functions.Col("ShortCol2"));
+
+        Assert.Equal(untyped.Expr, typed.Expr);
+    }
+
+    [Fact]
+    public void EnumComparison_LowersToSamePlanAsUntyped_NoFork()
+    {
+        // `p.EnumCol == Color.Green` compiles to Equal(Convert(EnumCol,int), Convert(Green,int)). The
+        // left Convert (enum→int on a column) UNWRAPS to `Col("EnumCol")`; the right folds to `Lit(1)`.
+        // The typed plan is therefore the SAME `(EnumCol = 1)` as the untyped API — NOT the forked
+        // `(cast(EnumCol as int) = 1)`.
+        Expression<Func<EnumRec, bool>> predicate = p => p.EnumCol == Color.Green;
+        Column typed = TypedExpressionLowering.Lower(predicate);
+        Column untyped = Functions.Col("EnumCol").EqualTo(Functions.Lit(1));
+
+        Assert.Equal(untyped.Expr, typed.Expr);
+        // Reddens if a Cast(EnumCol AS int) is reintroduced on the column operand:
+        Assert.NotEqual(
+            new Column(new DeltaSharp.Plans.Expressions.Cast(Functions.Col("EnumCol").Expr, IntegerType.Instance))
+                .EqualTo(Functions.Lit(1)).Expr,
+            typed.Expr);
     }
 
     [Fact]
@@ -246,8 +373,9 @@ public sealed class DatasetTypedLoweringTests
     public void CheckedColumnConvert_ThrowsDeterministicDiagnostic()
     {
         // `checked((int)p.Id)` is a ConvertChecked (long→int) over a COLUMN operand. A plain
-        // value-changing convert lowers to a Cast, but a *checked* one has no faithful Spark mapping, so
-        // it must be rejected — NOT silently lowered to an unchecked Cast.
+        // (unchecked) value-changing convert now UNWRAPS to the bare column, but a *checked* one asks
+        // for a per-expression overflow guard that has no faithful Spark mapping, so it must be
+        // rejected — NOT silently unwrapped (nor lowered to an unchecked Cast).
         var ex = Assert.Throws<UnsupportedTypedExpressionException>(
             () => LowerSelect(p => checked((int)p.Id)));
 
@@ -258,9 +386,9 @@ public sealed class DatasetTypedLoweringTests
     [Fact]
     public void CheckedColumnConvert_DoesNotSilentlyLowerToCast()
     {
-        // Mutation-sensitive: if the ConvertChecked reached the value-changing Cast branch it would
-        // silently emit `Cast('Id' AS int)` — dropping the checked intent. Prove lowering throws and the
-        // dropped-guard Cast tree is never the result.
+        // Mutation-sensitive: if the ConvertChecked reached a value-changing Cast/unwrap branch it would
+        // silently emit `Cast('Id' AS int)` (or the bare column) — dropping the checked intent. Prove
+        // lowering throws and the dropped-guard Cast tree is never the result.
         Column? lowered = null;
         Assert.Throws<UnsupportedTypedExpressionException>(
             () => lowered = LowerSelect(p => checked((int)p.Id)));

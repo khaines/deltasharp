@@ -90,8 +90,8 @@ Lowering table (`TypedExpressionLowering.cs`):
 | --- | --- | --- |
 | `p.Prop` (member access on the lambda parameter) | `Functions.Col("Prop")` | `TypedExpressionLowering.cs` (`LowerMember`) |
 | constant / captured value / captured arithmetic subtree (not referencing the parameter) | `Functions.Lit(value)` (folded) | `TypedExpressionLowering.cs` (`EvaluateConstant`) |
-| `Convert` / `ConvertChecked` — **safe unwrap** (boxing to `object`, `Nullable<T>` lift/unlift, identity) | unwrapped (operand lowered) | `TypedExpressionLowering.cs` (`LowerConvert`) |
-| `Convert` — **value-changing numeric** (e.g. `(double)intCol`) | `Cast(operand, targetDataType)` (or deterministic throw if the target has no mapping) | `TypedExpressionLowering.cs` (`LowerConvert`) |
+| `Convert` / `ConvertChecked` — **value-preserving unwrap** (boxing to `object`, `Nullable<T>` lift/unlift, identity) | unwrapped (operand lowered) | `TypedExpressionLowering.cs` (`LowerConvert`) |
+| `Convert` — **numeric promotion or explicit numeric cast** (e.g. `short + short` → `int`, `int op long`, `float op double`, `(double)intCol`, enum `==` → underlying `int`) | **unwrapped** (operand lowered) — the plan carries the bare column and Spark's Catalyst performs type coercion, byte-identical to the untyped `Col`/`Column` API (**no fork**). A C# cast is not independently represented in M1 (a typed-cast facility is future). | `TypedExpressionLowering.cs` (`LowerConvert`) |
 | `ConvertChecked` — **value-changing numeric** on a column (e.g. `checked((int)p.LongCol)`) | deterministic throw (`checked`/`unchecked` not honored per-expression on column operands — M1) | `TypedExpressionLowering.cs` (`LowerConvert`) |
 | `Not` | `col.Not()` | `TypedExpressionLowering.cs` (`LowerNode`) |
 | `Equal` / `NotEqual` (operand a NULL literal) | `col.IsNull()` / `col.IsNotNull()` | `TypedExpressionLowering.cs` (`LowerBinary`) |
@@ -113,10 +113,18 @@ silently mis-lowered:
   *bitwise* `&`/`|`; the bridge maps to logical `And`/`Or` only when the binary result is `bool`/`bool?`
   and otherwise throws (`&&`/`||` always emit `AndAlso`/`OrElse`, so no supported functionality is
   lost).
-- **Value-changing numeric `Convert`.** A boxing/lifting/identity convert carries no value change and is
-  unwrapped; a value-changing numeric conversion (e.g. `(double)intCol`) is preserved as an explicit
-  `Cast` to the target ADR-0008 `DataType` rather than being dropped into a source-domain operation
-  (e.g. integer division).
+- **C# numeric `Convert` promotions and casts.** A boxing/lifting/identity convert carries no value
+  change and is unwrapped. Every value-changing numeric conversion the C# compiler inserts — an
+  implicit promotion (`short + short` → both `Convert`ed to `int`; `int op long`; `float op double`;
+  enum `==` → `Convert` to the underlying `int`) *and* an explicit cast (`(double)intCol`) — is **also
+  unwrapped**: the lowered plan carries the **bare column reference**, byte-identical to the untyped
+  `Functions.Col`/`Column` API, and Spark's analyzer (Catalyst) performs the type coercion at analysis
+  time. Emitting an explicit `Cast` IR node here would bake C#'s coercion rules into the logical plan,
+  pre-empt Catalyst's `TypeCoercion`, and **fork** the typed plan from the untyped one
+  (`Plus(Cast(Col,Int), Cast(Col,Int))` vs `Plus(Col, Col)`), so it is deliberately not done. A C# cast
+  in a typed lambda is therefore **not** independently represented in M1 (a typed-cast facility is
+  future work). *(Note: DeltaSharp's `/` is already fractional and returns `DOUBLE` — matching Spark —
+  so a `(double)` cast on an int-division operand is redundant, not load-bearing.)*
 - **`checked` / `unchecked` on column operands.** `checked(p.A + p.B)` / `checked((int)p.LongCol)` reach
   the `*Checked` arms with a column operand; the `checked`/`unchecked` keyword has **no faithful
   per-expression Spark-plan mapping** (Spark overflow behavior is session-config governed), so the
@@ -141,6 +149,12 @@ divergences:
   non-decimal `/` result type is `DoubleType`
   (`src/DeltaSharp.Core/Plans/Expressions/ArithmeticResultType.cs:71`). To get integer semantics, cast
   or use an integer-division function once available.
+- **C# numeric casts and promotions are unwrapped, not represented.** A cast or implicit promotion
+  inside a typed lambda (`(double)p.A`, `short + short`, `int op long`, enum `==`) does **not** add a
+  `Cast` node to the plan; it is unwrapped so the plan carries the **bare column reference** and Spark's
+  Catalyst performs type coercion — exactly matching the untyped `Column` API (**no fork**). A C# cast
+  is therefore not independently representable in a typed lambda in M1; a typed-cast facility is future
+  work.
 - **`checked` / `unchecked` are not honored on column operands.** They are rejected (see the fidelity
   list above); arithmetic overflow follows the session ANSI mode — **ANSI throws
   `ArithmeticOverflowException`, Legacy yields `NULL`, and it never wraps** — not the C# per-expression

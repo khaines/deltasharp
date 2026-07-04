@@ -96,8 +96,7 @@ internal static class DatasetSchema
     // LocalRelationBatches.Append (src/DeltaSharp.Executor/Physical/LocalRelationBatches.cs) and
     // documented in docs/engineering/design/read-door.md, so a schema derived here binds to values a
     // Row can carry once STORY-04.7.2 (#178) lands the value encoders. Widening is intentionally NOT
-    // performed (an int property maps to IntegerType, never LongType). Shared with
-    // TypedExpressionLowering so a value-changing numeric Convert lowers to a Cast to the same type.
+    // performed (an int property maps to IntegerType, never LongType).
     internal static DataType? MapClrType(Type type)
     {
         if (type == typeof(bool))
