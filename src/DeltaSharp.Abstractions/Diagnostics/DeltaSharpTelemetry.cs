@@ -83,11 +83,17 @@ internal static class DeltaSharpTelemetry
     internal const string ExecutorIdKey = "deltasharp.executor.id";
 
     /// <summary>The logical table identity a signal concerns (catalog-qualified name), used instead of a
-    /// raw, credential-bearing storage path so the dimension stays bounded and secret-free.</summary>
+    /// raw, credential-bearing storage path (which is neither low-cardinality nor safe). A
+    /// <b>correlation/exemplar-only</b> field: valid on structured logs and span attributes, but
+    /// <b>never</b> a metric label (the set of tables is workload-dependent). A catalog-qualified name may
+    /// itself embed a tenant id, so it must be scrubbed or omitted when it reveals a tenant boundary or
+    /// regulated dataset.</summary>
     internal const string TableKey = "deltasharp.table";
 
-    /// <summary>The Delta table version (commit version) a signal concerns. A small integer, safe as a
-    /// bounded dimension.</summary>
+    /// <summary>The Delta table version (commit version) a signal concerns. Small at any instant but
+    /// <b>unbounded over a table's commit history</b>, so it is a <b>correlation/exemplar-only</b> field
+    /// (structured logs, span attributes, metric exemplars) and <b>never</b> a metric label — a per-commit
+    /// label would multiply a metric's time-series cardinality without bound.</summary>
     internal const string TableVersionKey = "deltasharp.table.version";
 
     /// <summary>An explicit request/action correlation identifier for paths that predate an ambient

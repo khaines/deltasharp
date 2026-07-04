@@ -278,8 +278,9 @@ rendering it**, not by a redactor:
   query-string parameters; it does **not** parse a `;`-delimited connection string, so it would leave an
   `AccountKey=…;` in an ADO/ADLS-style connection string exposed. Connection-string safety therefore does
   **not** rest on `RedactPath`: it rests on **never rendering option values at all**. `SinkDescriptor`
-  renders option **keys only** (values are never stringified), which is the property that keeps connection
-  strings and other option secrets out of diagnostics.
+  omits options entirely from its rendered form (`SinkDescriptor.SimpleString`), and the read-side
+  `UnresolvedFileRelation` renders option **keys only** (values are never stringified), which is the
+  property that keeps connection strings and other option secrets out of diagnostics.
 - **Table/catalog names may still carry tenant data.** Prefer the **logical** `deltasharp.table` identity
   over a path entirely; a raw path is neither a low-cardinality dimension nor safe, so it is never a metric
   label or span attribute regardless of redaction. A catalog-qualified `deltasharp.table` (or catalog
