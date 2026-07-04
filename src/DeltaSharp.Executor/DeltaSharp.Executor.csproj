@@ -12,12 +12,10 @@
     <AssemblyName>DeltaSharp.Executor</AssemblyName>
     <IsPackable>false</IsPackable>
     <PublishAot>true</PublishAot>
-    <!-- Enable the trim/AOT/single-file Roslyn analyzers at build time too (not only at
-         publish) so AOT-cleanliness gets fast local feedback and matches the Core/Engine
-         posture, in addition to the authoritative `dotnet publish` gate in aot.yml. -->
-    <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
-    <EnableAotAnalyzer>true</EnableAotAnalyzer>
-    <EnableSingleFileAnalyzer>true</EnableSingleFileAnalyzer>
+    <!-- The trim/AOT/single-file Roslyn analyzers are wired centrally in Directory.Build.props
+         for every src/ production assembly (so no project can drift), giving AOT-cleanliness fast
+         local feedback at build time in addition to the authoritative `dotnet publish` gate in
+         aot.yml. -->
   </PropertyGroup>
 
   <ItemGroup>

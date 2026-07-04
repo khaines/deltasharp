@@ -24,16 +24,10 @@
     <Description>Shared logical contracts for DeltaSharp, a .NET-native reimplementation of Apache Spark — the packable Core↔Engine seam that holds the ADR-0008 logical type model: the shared Spark-parity DataType hierarchy (namespace DeltaSharp.Types), consumed by both DeltaSharp.Core and DeltaSharp.Engine. Pre-1.0 (M1).</Description>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
-    <!-- ADR-0014: keep the public surface trim/AOT-annotation-clean. Enable the
-         trim/AOT/single-file Roslyn analyzers as a standing build gate on both TFMs.
-         We enable the analyzers rather than IsAotCompatible/IsTrimmable so the
-         SDK-version-tied Microsoft.NET.ILLink.Tasks package is not pulled into the
-         committed lock file; actual AOT publish verification is STORY-01.4.1. This
-         matters because the shipped logical model flows into the Executor NativeAOT
-         image via DeltaSharp.Engine. -->
-    <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
-    <EnableAotAnalyzer>true</EnableAotAnalyzer>
-    <EnableSingleFileAnalyzer>true</EnableSingleFileAnalyzer>
+    <!-- ADR-0014: keep the public surface trim/AOT-annotation-clean. The trim/AOT/single-file
+         Roslyn analyzers are wired centrally in Directory.Build.props for every src/ production
+         assembly (so no project can drift); this shipped logical model flows into the Executor
+         NativeAOT image via DeltaSharp.Engine. -->
   </PropertyGroup>
 
   <!-- Pack the package README at the .nupkg root (referenced by PackageReadmeFile above).
