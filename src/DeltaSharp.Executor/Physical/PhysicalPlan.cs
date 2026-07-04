@@ -481,8 +481,11 @@ internal sealed class UnionPlan : PhysicalPlan
 /// honoring the descriptor's <see cref="SaveMode"/>. It is the physical mirror of a leaf
 /// <see cref="ScanPlan"/> at the top of the tree — a sink instead of a source — and is the only physical
 /// node that produces a side effect. The commit is atomic (materialize-then-commit), so a mode conflict
-/// or a mid-write fault leaves no partial output (AC1/AC3). It returns its child's <see cref="BatchResult"/>
-/// unchanged so the driver's finalize can count the rows written without a second execution.
+/// or a mid-write fault leaves no partial output (AC1/AC3). It captures the sink's <b>authoritative</b>
+/// committed row count on <see cref="CommittedRowCount"/> (the value <see cref="ILocalSink.Commit"/>
+/// returns — 0 when a <see cref="SaveMode.Ignore"/> skipped an existing target) so the driver's finalize
+/// reports the rows actually WRITTEN, not the rows the child produced, without a second execution or any
+/// cancellable post-commit work. It returns its child's <see cref="BatchResult"/> unchanged.
 /// </summary>
 internal sealed class WriteToSinkPlan : PhysicalPlan
 {
@@ -507,6 +510,15 @@ internal sealed class WriteToSinkPlan : PhysicalPlan
     /// <inheritdoc/>
     public override string NodeName => "WriteToSink";
 
+    /// <summary>
+    /// The authoritative number of rows the sink committed, captured from <see cref="ILocalSink.Commit"/>
+    /// after <see cref="Execute"/> runs (<see langword="null"/> before). It is 0 when a
+    /// <see cref="SaveMode.Ignore"/> skipped an existing target, so it is NOT the same as the child's row
+    /// count. The driver's write finalize returns this value (never a post-commit re-count), so a skipped
+    /// write reports 0 and no cancellable work runs after the commit boundary.
+    /// </summary>
+    public long? CommittedRowCount { get; private set; }
+
     /// <inheritdoc/>
     // SinkDescriptor.SimpleString already redacts a credential-bearing path, so rendering a write node in
     // #179 Explain never leaks a secret (#432).
@@ -519,10 +531,15 @@ internal sealed class WriteToSinkPlan : PhysicalPlan
 
         // Materialize the whole result once, then commit atomically: the sink never observes a
         // half-written result, so a mode conflict (ErrorIfExists) or a fault commits nothing (AC1/AC3).
+        // Cancellation/faults are only possible up to and including the commit — the commit is the final
+        // failure boundary. Capture the sink's authoritative committed count and do NO cancellable or
+        // fault-prone work afterwards, so a cancel/timeout in the post-commit window can never surface a
+        // committed write as a failed Save (MUST-FIX: post-commit cancellation window).
         IReadOnlyList<Row> rows = RowMaterializer.Materialize(child, maxRows: null, maxBytes: null, runtime.CancellationToken);
-        _sink.Commit(child.Schema, rows);
+        CommittedRowCount = _sink.Commit(child.Schema, rows);
 
-        // Return the child result so the driver's finalize counts the rows written (no re-execution).
+        // Return the child result so the driver's finalize can read CommittedRowCount (no re-execution and
+        // no post-commit row count that could re-poll the cancellation token).
         return child;
     }
 }

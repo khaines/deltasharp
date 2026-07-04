@@ -257,6 +257,48 @@ internal sealed class InMemoryRelationFixture
         return (count, sink.Metrics ?? ExecutionMetrics.Empty);
     }
 
+    /// <summary>
+    /// The <see cref="CollectWithMetrics"/> counterpart for the write door (STORY-04.6.3): it wraps
+    /// <paramref name="frame"/> in an analyzed <c>WriteToSource</c> over a <see cref="SinkDescriptor"/>
+    /// built from the supplied write intent, drives it through a <see cref="LocalQueryExecutor"/> bound to
+    /// the given <paramref name="sinkFactory"/> (the data-out seam), and returns the AUTHORITATIVE
+    /// committed row count the executor reports plus the run's metrics. It is the count-returning seam the
+    /// executor tests assert the committed count (and the post-commit cancellation boundary) through,
+    /// since Core's <c>ExecutionOptions</c>/<c>WriteToSource</c> are Core internals the test assembly
+    /// cannot name directly.
+    /// </summary>
+    /// <param name="frame">The DataFrame whose rows are written.</param>
+    /// <param name="format">The sink format (for example <c>"memory"</c>).</param>
+    /// <param name="mode">The save mode.</param>
+    /// <param name="path">The write target path.</param>
+    /// <param name="sinkFactory">The data-out seam resolving the write intent to a local sink.</param>
+    /// <param name="cancellationToken">Cooperative cancellation observed while the result drains.</param>
+    /// <param name="partitionColumns">Optional partition columns carried on the descriptor.</param>
+    /// <param name="options">Optional writer options carried on the descriptor (e.g. a <c>path</c> option).</param>
+    /// <returns>The committed row count and the metrics gathered.</returns>
+    public (long Count, ExecutionMetrics Metrics) WriteWithMetrics(
+        DataFrame frame,
+        string format,
+        SaveMode mode,
+        string? path,
+        ILocalSinkFactory sinkFactory,
+        CancellationToken cancellationToken = default,
+        IEnumerable<string>? partitionColumns = null,
+        IReadOnlyDictionary<string, string>? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(frame);
+        ArgumentNullException.ThrowIfNull(sinkFactory);
+
+        var sink = new SinkDescriptor(
+            format, mode, path, tableIdentifier: null, partitionColumns: partitionColumns, options: options);
+        LogicalPlan analyzed = new Analyzer(_catalog).Resolve(new WriteToSource(frame.Plan, sink));
+        var execOptions = BuildOptions(cancellationToken, null, null, null, null);
+        var metricsSink = new ExecutionMetricsSink();
+        long count = new LocalQueryExecutor(_scanSource, ExecutionBackendOptions.Default, sinkFactory)
+            .Write(analyzed, execOptions, metricsSink);
+        return (count, metricsSink.Metrics ?? ExecutionMetrics.Empty);
+    }
+
     private static ExecutionOptions BuildOptions(
         CancellationToken cancellationToken,
         TimeSpan? timeout,
@@ -401,5 +443,59 @@ internal sealed class InMemoryRelationFixture
         }
 
         throw new InvalidOperationException("Expected the sentinel materialization to fault, but the collect succeeded.");
+    }
+}
+
+/// <summary>
+/// A test-support <see cref="ILocalSinkFactory"/> decorator that invokes a hook AFTER each successful
+/// <see cref="ILocalSink.Commit"/> (once the inner sink has committed and returned its count). It lets an
+/// executor test fire a cancellation in the narrow post-commit window to prove the write path treats the
+/// commit as its final failure boundary: a cancel/timeout observed only after the commit must NOT surface
+/// a committed write as a cancelled/failed <c>Save</c> (MUST-FIX: post-commit cancellation window). Lives
+/// in the Executor assembly because <see cref="ILocalSinkFactory"/>/<see cref="SinkDescriptor"/> are
+/// internal to it and Core; the test assembly consumes it by name.
+/// </summary>
+internal sealed class PostCommitHookSinkFactory : ILocalSinkFactory
+{
+    private readonly ILocalSinkFactory _inner;
+    private readonly Action _afterCommit;
+
+    /// <summary>Wraps <paramref name="inner"/>, invoking <paramref name="afterCommit"/> after each commit.</summary>
+    public PostCommitHookSinkFactory(ILocalSinkFactory inner, Action afterCommit)
+    {
+        _inner = inner ?? throw new ArgumentNullException(nameof(inner));
+        _afterCommit = afterCommit ?? throw new ArgumentNullException(nameof(afterCommit));
+    }
+
+    /// <inheritdoc/>
+    public bool TryCreate(SinkDescriptor descriptor, StructType schema, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out ILocalSink? sink)
+    {
+        if (_inner.TryCreate(descriptor, schema, out ILocalSink? innerSink))
+        {
+            sink = new HookSink(innerSink, _afterCommit);
+            return true;
+        }
+
+        sink = null;
+        return false;
+    }
+
+    private sealed class HookSink : ILocalSink
+    {
+        private readonly ILocalSink _inner;
+        private readonly Action _afterCommit;
+
+        public HookSink(ILocalSink inner, Action afterCommit)
+        {
+            _inner = inner;
+            _afterCommit = afterCommit;
+        }
+
+        public long Commit(StructType schema, IReadOnlyList<Row> rows)
+        {
+            long written = _inner.Commit(schema, rows);
+            _afterCommit();
+            return written;
+        }
     }
 }

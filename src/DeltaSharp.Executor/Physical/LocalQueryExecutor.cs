@@ -102,7 +102,7 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
             analyzedPlan,
             options,
             metricsSink,
-            static (result, opts, token) =>
+            static (physical, result, opts, token) =>
             {
                 IReadOnlyList<Row> rows = RowMaterializer.Materialize(
                     result, opts.MaxResultRows, opts.MaxResultBytes, token);
@@ -119,7 +119,7 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
             analyzedPlan,
             options,
             metricsSink,
-            static (result, opts, token) =>
+            static (physical, result, opts, token) =>
             {
                 long count = RowMaterializer.CountRows(result, token);
                 return (Rows: (IReadOnlyList<Row>?)null, OutputRows: count);
@@ -131,11 +131,15 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
     /// Drives the write plan through the SAME stage-attributed <see cref="Execute"/> driver as
     /// <see cref="Collect"/>/<see cref="Count"/>: planning maps the <c>WriteToSource</c> to a
     /// <see cref="WriteToSinkPlan"/> (resolving the sink through the data-out seam), the backend stage
-    /// executes it — draining the child and committing to the sink atomically — and the finalize counts
-    /// the rows written. A sink-resolution miss is a Plan-stage <see cref="UnsupportedPlanException"/>; a
-    /// commit conflict (e.g. <see cref="SaveMode.ErrorIfExists"/> onto an existing target) surfaces as a
-    /// Backend-stage <see cref="QueryExecutionException"/>, so a write failure is stage-attributed exactly
-    /// like a read failure (STORY-04.6.4).
+    /// executes it — draining the child and committing to the sink atomically — and the finalize returns
+    /// the sink's AUTHORITATIVE committed count (<see cref="WriteToSinkPlan.CommittedRowCount"/>), which is
+    /// 0 for an <see cref="SaveMode.Ignore"/> that skipped an existing target — NOT the child's produced
+    /// row count. The finalize does <b>no</b> cancellable or fault-prone work: the commit is the final
+    /// failure boundary, so a cancel/timeout is observed before the commit or not at all, and a committed
+    /// write never surfaces as a cancelled/failed <c>Save</c>. A sink-resolution miss is a Plan-stage
+    /// <see cref="UnsupportedPlanException"/>; a commit conflict (e.g. <see cref="SaveMode.ErrorIfExists"/>
+    /// onto an existing target) surfaces as a Backend-stage <see cref="QueryExecutionException"/>, so a
+    /// write failure is stage-attributed exactly like a read failure (STORY-04.6.4).
     /// </remarks>
     public long Write(LogicalPlan analyzedPlan, ExecutionOptions options, ExecutionMetricsSink? metricsSink = null)
     {
@@ -145,11 +149,13 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
             analyzedPlan,
             options,
             metricsSink,
-            static (result, opts, token) =>
+            static (physical, result, opts, token) =>
             {
-                // The WriteToSinkPlan already committed during the backend stage; count the rows it wrote
-                // (its returned child result) for the metrics/return value without re-executing.
-                long written = RowMaterializer.CountRows(result, token);
+                // The WriteToSinkPlan already committed during the backend stage; report the rows it
+                // actually WROTE (its captured authoritative count) — not a post-commit CountRows over the
+                // child, which would (a) over-report a skipped Ignore and (b) re-poll the cancellation
+                // token in the post-commit window, turning a committed write into a failed Save.
+                long written = ((WriteToSinkPlan)physical).CommittedRowCount ?? 0;
                 return (Rows: (IReadOnlyList<Row>?)null, OutputRows: written);
             }).OutputRows;
     }
@@ -163,7 +169,7 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
         LogicalPlan analyzedPlan,
         ExecutionOptions options,
         ExecutionMetricsSink? metricsSink,
-        Func<BatchResult, ExecutionOptions, CancellationToken, (IReadOnlyList<Row>? Rows, long OutputRows)> finalize)
+        Func<PhysicalPlan, BatchResult, ExecutionOptions, CancellationToken, (IReadOnlyList<Row>? Rows, long OutputRows)> finalize)
     {
         using CancellationTokenSource? timeoutCts = options.Timeout is { } timeout
             ? CancellationTokenSource.CreateLinkedTokenSource(options.CancellationToken)
@@ -285,7 +291,7 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
             try
             {
                 outputBatches = result.Batches.Count;
-                finalized = finalize(result, options, effectiveToken);
+                finalized = finalize(physical, result, options, effectiveToken);
             }
             catch (OperationCanceledException oce)
             {
