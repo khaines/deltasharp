@@ -102,12 +102,18 @@ internal sealed class MemoizedRowSequence : IEnumerable<Row>
         bool taken = false;
         try
         {
-            while (!Monitor.TryEnter(_gate, LockAcquirePollMilliseconds))
+            // The ref-bool TryEnter overload sets `taken` ATOMICALLY with acquisition, so the lock can
+            // never leak in the window between acquiring and recording it (the separate-assignment overload's
+            // hazard) — the canonical robust idiom.
+            while (!taken)
             {
-                cancellationToken.ThrowIfCancellationRequested();
+                Monitor.TryEnter(_gate, LockAcquirePollMilliseconds, ref taken);
+                if (!taken)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
             }
 
-            taken = true;
             cancellationToken.ThrowIfCancellationRequested();
 
             if (_snapshot is null)
