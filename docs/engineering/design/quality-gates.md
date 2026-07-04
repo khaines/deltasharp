@@ -207,6 +207,12 @@ target framework under `TestResults/<guid>/coverage.cobertura.xml`.
   generated code is excluded at the member level, not repo-wide).
 - **`<SkipAutoProps>true</SkipAutoProps>`** — trivial auto-property accessors are not counted,
   keeping the metric on real logic and stable across runs.
+- **`<SingleHit>true</SingleHit>`** — record each line as a single hit rather than an incrementing
+  count. The gate measures hit **presence** (`hits > 0`), never counts, so this is
+  coverage-identical; it removes the per-execution counter write from every instrumented line so a
+  hot multi-threaded stress test (the 25k-iteration `SparkSession` lifecycle race) is not slowed by
+  cross-thread counter contention. This keeps the instrumented run's timing close to an
+  uninstrumented run, so **collecting coverage does not destabilize timing-sensitive tests**.
 
 **Artifacts (AC1).** CI publishes the reports and the merged summary as the **`coverage-report`**
 workflow artifact (`TestResults/**/coverage.cobertura.xml` + `TestResults/coverage-summary.md`),

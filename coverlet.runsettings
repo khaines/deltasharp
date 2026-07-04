@@ -39,7 +39,17 @@
 
           <!-- Deterministic + offline: no SourceLink round-trips during collection. -->
           <UseSourceLink>false</UseSourceLink>
-          <SingleHit>false</SingleHit>
+
+          <!-- Record each line's coverage as a single hit rather than an incrementing count.
+               The gate measures hit PRESENCE (covered iff hits > 0), never hit counts, so this
+               is coverage-identical. It also removes the per-execution counter increment from
+               every instrumented line: in a hot, multi-threaded stress test (e.g. the 25k-iteration
+               SparkSession lifecycle race) the shared per-line counters would otherwise be written
+               on every iteration by multiple threads, and that cross-thread counter contention
+               perturbs the timing of the very concurrency code under test. Single-hit keeps the
+               instrumented run's timing close to an uninstrumented run, so coverage collection does
+               not destabilize timing-sensitive tests. -->
+          <SingleHit>true</SingleHit>
         </Configuration>
       </DataCollector>
     </DataCollectors>
