@@ -15,15 +15,16 @@ single-maintainer phase.
 ## Label families
 
 DeltaSharp uses five label families. The first four are project-specific and are
-created and kept current by the plan-sync tooling (`files/ghbuild`) that
-materializes the [workstream plan](README.md); the fifth is the default GitHub
-triage set. As of this snapshot, 56 labels exist in total.
+created and kept current **manually** by maintainers (via the `gh` CLI) as the
+[workstream plan](README.md) is materialized into issues; there is no automated
+plan-sync tool in the repository yet. The fifth is the default GitHub triage set.
+As of this snapshot, 56 labels exist in total.
 
 | Family | Pattern | Count | Meaning | Applied by |
 |---|---|---|---|---|
-| Work-item type | `epic`, `feature`, `story` | 3 | Which plan level an issue represents | Plan sync / triage |
-| Epic | `epic:NN` (`epic:00`–`epic:13`) | 14 | The owning epic (EPIC-00 … EPIC-13) | Plan sync / triage |
-| Persona | `persona:<slug>` | 25 | The implementer persona that owns the work | Plan sync / triage |
+| Work-item type | `epic`, `feature`, `story` | 3 | Which plan level an issue represents | Maintainers (triage) |
+| Epic | `epic:NN` (`epic:00`–`epic:13`) | 14 | The owning epic (EPIC-00 … EPIC-13) | Maintainers (triage) |
+| Persona | `persona:<slug>` | 25 | The implementer persona that owns the work | Maintainers (triage) |
 | Size | `size:<XS\|S\|M\|L\|XL>` | 5 | Relative T-shirt estimate | Triage |
 | GitHub defaults | `bug`, `enhancement`, `documentation`, … | 9 | Standard triage signals | Issue forms + triage |
 
@@ -46,10 +47,11 @@ triage.
 
 ### Persona labels and the roster
 
-- A persona label is the exact roster slug prefixed with `persona:`. The roster —
-  25 roles — is defined in
-  [`docs/persona/agents/README.md`](../persona/agents/README.md) and mirrored by
-  the wrappers in `.github/agents/*.agent.md`.
+- A persona label is the exact roster slug prefixed with `persona:`. The roster
+  **list** — 25 roles — is maintained in the [workstream plan](README.md) (the
+  source of truth for *which* personas exist); the **canonical per-role specs**
+  live in [`docs/persona/agents/README.md`](../persona/agents/README.md) and are
+  mirrored by the wrappers in `.github/agents/*.agent.md`.
 - **One slug is truncated in label form.** GitHub caps label names at 50
   characters. `persona:dotnet-vectorized-columnar-compute-engineer` is 51
   characters, so its label drops the redundant trailing `-engineer`:
@@ -110,7 +112,7 @@ matches a known subsystem resolves to a maintainer (STORY-00.6.2 AC1). Each sour
 rule carries a trailing `# persona:<slug>` note naming the specialist that takes
 the area over as maintainers join.
 
-| Path pattern | Owner | Intended persona |
+| Path grouping (see [`CODEOWNERS`](../../.github/CODEOWNERS) for exact patterns) | Owner | Intended persona |
 |---|---|---|
 | `/src/DeltaSharp.Abstractions/**` | `@khaines` | `dotnet-vectorized-columnar-compute-engineer` |
 | `/src/DeltaSharp.Core/**` | `@khaines` | `developer-experience-api-engineer` |

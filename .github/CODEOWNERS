@@ -36,6 +36,14 @@
 
 # --- Source tree: subsystem ownership (active) ---
 # Owner is @khaines for now; the trailing comment names the intended persona owner.
+#
+# By design, only subsystems with a dedicated rule below carry their own persona
+# handoff. Any subfolder without its own line (e.g. src/DeltaSharp.Core/Session,
+# src/DeltaSharp.Executor/Physical, src/DeltaSharp.Abstractions/Diagnostics)
+# intentionally inherits its parent project's persona via the closest matching
+# rule — CODEOWNERS applies the last match, so the project-level rule governs.
+# Add a dedicated line (like Engine/Execution below) only when a subfolder needs a
+# distinct specialist owner.
 
 /src/DeltaSharp.Abstractions/**       @khaines  # persona:dotnet-vectorized-columnar-compute-engineer (public type system)
 /src/DeltaSharp.Core/**               @khaines  # persona:developer-experience-api-engineer (+ query-execution-engine-engineer)

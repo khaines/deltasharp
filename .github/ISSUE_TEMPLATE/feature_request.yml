@@ -46,12 +46,13 @@ body:
   - type: textarea
     id: personas
     attributes:
-      label: Affected implementer personas
+      label: Affected implementer personas (optional)
       description: |
         Which specialist role(s) would own this work? Use exact slugs from the
         25-role roster in
         [docs/persona/agents/README.md](https://github.com/khaines/deltasharp/blob/main/docs/persona/agents/README.md).
-        Maintainers apply these as `persona:<slug>` labels during triage.
+        Leave blank if unsure — maintainers apply the `persona:<slug>` labels
+        during triage.
       placeholder: |
         e.g. persona:query-execution-engine-engineer, persona:delta-storage-format-engineer
     validations:

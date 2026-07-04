@@ -1,5 +1,7 @@
 ## Summary
 
+<!-- New here? See CONTRIBUTING.md and the Definition-of-Done checklists in docs/engineering/checklists/ for the full contribution funnel. -->
+
 <!-- What does this PR change, and why? -->
 
 <!-- Link the issues this PR resolves, e.g. "Closes #123" (one per line). -->
