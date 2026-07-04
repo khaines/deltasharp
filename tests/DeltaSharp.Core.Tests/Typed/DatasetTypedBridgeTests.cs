@@ -90,6 +90,20 @@ public sealed class DatasetTypedBridgeTests
         Assert.Equal(untyped.Plan, typed.Plan);
     }
 
+    // ----- Filter is the primary typed alias; Where delegates to it (DataFrame parity) -----
+
+    [Fact]
+    public void TypedFilterAndWhere_ProduceEqualFilterPlans()
+    {
+        DataFrame df = People();
+
+        Dataset<Person> viaFilter = df.As<Person>().Filter(p => p.Age >= 21);
+        Dataset<Person> viaWhere = df.As<Person>().Where(p => p.Age >= 21);
+
+        Assert.IsType<Filter>(viaFilter.Plan);
+        Assert.Equal(viaFilter.Plan, viaWhere.Plan);
+    }
+
     // ----- AC2: As<T>() / ToDF() preserve plan identity without materialization -----
 
     [Fact]

@@ -23,15 +23,17 @@ New public surface (`src/DeltaSharp.Core/`):
 
 | Public member | Spark parity | Result |
 | --- | --- | --- |
-| `DataFrame.As<T>()` | `Dataset.as[T]` | `Dataset<T>` over the **identical** `this.Plan` (`src/DeltaSharp.Core/Session/DataFrame.cs:570`) |
-| `Dataset<T>.ToDF()` | `Dataset.toDF()` | `DataFrame` over the **identical** `this.Plan` (`src/DeltaSharp.Core/Session/Dataset.cs:75`) |
-| `Dataset<T>.Schema` | `Dataset.schema` | `StructType` derived from `T` (`Dataset.cs:66`) |
-| `Dataset<T>.Where(Expression<Func<T,bool>>)` | `filter(FilterFunction<T>)` | `Dataset<T>` wrapping `Filter(lowered, Plan)` (`Dataset.cs:91`) |
-| `Dataset<T>.Filter(Expression<Func<T,bool>>)` | `filter(...)` | delegates to `Where` (`Dataset.cs:107`) |
-| `Dataset<T>.Where(Column)` | `filter(Column)` | `Dataset<T>` wrapping `Filter(condition, Plan)` (`Dataset.cs:119`) |
-| `Dataset<T>.Filter(Column)` | `filter(Column)` | delegates to `Where(Column)` (`Dataset.cs:129`) |
-| `Dataset<T>.Select(params Expression<Func<T,object?>>[])` | `select(...)` | `DataFrame` wrapping `Project(lowered, Plan)` (`Dataset.cs:147`) |
-| `UnsupportedTypedExpressionException` | (parity: analysis error) | AC4 deterministic diagnostic (`src/DeltaSharp.Core/Session/UnsupportedTypedExpressionException.cs:26`) |
+| `DataFrame.As<T>()` | `Dataset.as[T]` | `Dataset<T>` over the **identical** `this.Plan` (`src/DeltaSharp.Core/Session/DataFrame.cs`) |
+| `Dataset<T>.ToDF()` | `Dataset.toDF()` | `DataFrame` over the **identical** `this.Plan` (`Dataset.cs`) |
+| `Dataset<T>.Schema` | `Dataset.schema` | `StructType` derived from `T`, cached per `T` (`Dataset.cs`) |
+| `Dataset<T>.Filter(Expression<Func<T,bool>>)` | `filter(FilterFunction<T>)` | **primary**; `Dataset<T>` wrapping `Filter(lowered, Plan)` (`Dataset.cs`) |
+| `Dataset<T>.Where(Expression<Func<T,bool>>)` | `where(...)` | delegates to `Filter` (`Dataset.cs`) |
+| `Dataset<T>.Filter(Column)` | `filter(Column)` | **primary**; `Dataset<T>` wrapping `Filter(condition, Plan)` (`Dataset.cs`) |
+| `Dataset<T>.Where(Column)` | `where(Column)` | delegates to `Filter(Column)` (`Dataset.cs`) |
+| `Dataset<T>.Select(params Expression<Func<T,object?>>[])` | `select(...)` | `DataFrame` wrapping `Project(lowered, Plan)` (`Dataset.cs`) |
+| `UnsupportedTypedException` | (parity: analysis error) | abstract base of the two AC4 diagnostics (`src/DeltaSharp.Core/Session/UnsupportedTypedException.cs`) |
+| `UnsupportedTypedExpressionException` | (parity: analysis error) | AC4 **lambda-lowering** diagnostic (`src/DeltaSharp.Core/Session/UnsupportedTypedExpressionException.cs`) |
+| `UnsupportedTypedSchemaException` | (parity: analysis error) | AC4 **schema-mapping** diagnostic (`src/DeltaSharp.Core/Session/UnsupportedTypedSchemaException.cs`) |
 
 Every typed transformation is a **transformation**: it constructs an immutable logical-plan node over
 `this.Plan` and returns a **new** typed/untyped handle. It performs **no** analysis, optimization,
@@ -86,22 +88,42 @@ Lowering table (`TypedExpressionLowering.cs`):
 
 | LINQ `ExpressionType` node | Lowers to | Cite |
 | --- | --- | --- |
-| `p.Prop` (member access on the lambda parameter) | `Functions.Col("Prop")` | `TypedExpressionLowering.cs:72` |
-| constant / captured value (subtree not referencing the parameter) | `Functions.Lit(value)` | `TypedExpressionLowering.cs:50` |
-| `Convert` / `ConvertChecked` (boxing/lifting) | unwrapped (operand lowered) | `TypedExpressionLowering.cs:57` |
-| `Not` | `col.Not()` | `TypedExpressionLowering.cs:59` |
-| `Equal` / `NotEqual` | `EqualTo` / `NotEqual` | `TypedExpressionLowering.cs:87` |
-| `LessThan` / `LessThanOrEqual` | `Lt` / `Leq` | `TypedExpressionLowering.cs:89` |
-| `GreaterThan` / `GreaterThanOrEqual` | `Gt` / `Geq` | `TypedExpressionLowering.cs:91` |
-| `AndAlso` / `And` | `And` | `TypedExpressionLowering.cs:93` |
-| `OrElse` / `Or` | `Or` | `TypedExpressionLowering.cs:94` |
-| `Add` / `Subtract` / `Multiply` / `Divide` / `Modulo` | `Plus` / `Minus` / `Multiply` / `Divide` / `Mod` | `TypedExpressionLowering.cs:95` |
+| `p.Prop` (member access on the lambda parameter) | `Functions.Col("Prop")` | `TypedExpressionLowering.cs` (`LowerMember`) |
+| constant / captured value / captured arithmetic subtree (not referencing the parameter) | `Functions.Lit(value)` (folded) | `TypedExpressionLowering.cs` (`EvaluateConstant`) |
+| `Convert` / `ConvertChecked` — **safe unwrap** (boxing to `object`, `Nullable<T>` lift/unlift, identity) | unwrapped (operand lowered) | `TypedExpressionLowering.cs` (`LowerConvert`) |
+| `Convert` / `ConvertChecked` — **value-changing numeric** (e.g. `(double)intCol`) | `Cast(operand, targetDataType)` (or deterministic throw if the target has no mapping) | `TypedExpressionLowering.cs` (`LowerConvert`) |
+| `Not` | `col.Not()` | `TypedExpressionLowering.cs` (`LowerNode`) |
+| `Equal` / `NotEqual` (operand a NULL literal) | `col.IsNull()` / `col.IsNotNull()` | `TypedExpressionLowering.cs` (`LowerBinary`) |
+| `Equal` / `NotEqual` (otherwise) | `EqualTo` / `NotEqual` | `TypedExpressionLowering.cs` (`LowerBinary`) |
+| `LessThan` / `LessThanOrEqual` | `Lt` / `Leq` | `TypedExpressionLowering.cs` (`LowerBinary`) |
+| `GreaterThan` / `GreaterThanOrEqual` | `Gt` / `Geq` | `TypedExpressionLowering.cs` (`LowerBinary`) |
+| `AndAlso` / `OrElse`, and `And` / `Or` **with boolean operands** | `And` / `Or` | `TypedExpressionLowering.cs` (`LowerBinary`) |
+| `And` / `Or` with **non-boolean** operands (bitwise `&`/`\|`) | deterministic throw (not supported in M1) | `TypedExpressionLowering.cs` (`RequireBooleanLogical`) |
+| `Add` / `Subtract` / `Multiply` / `Divide` / `Modulo` | `Plus` / `Minus` / `Multiply` / `Divide` / `Mod` | `TypedExpressionLowering.cs` (`LowerBinary`) |
 
-A parameter-independent subtree (a `21` constant, or a captured local like `threshold`) is read to a
-value **without compiling** — a `ConstantExpression` is read directly and a captured closure
-field/property is read by reflecting the `MemberInfo` off the tree (`EvaluateConstant`,
-`TypedExpressionLowering.cs:107`). `ReferencesParameter` (`TypedExpressionLowering.cs:136`) — an
-`ExpressionVisitor` that flags the lambda parameter — decides constant-vs-column.
+**Fidelity where C# and SQL diverge.** Three cases are handled explicitly so a typed predicate is not
+silently mis-lowered:
+
+- **`== null` / `!= null`.** SQL three-valued logic makes `col = NULL` / `col <> NULL` UNKNOWN for
+  every row (matching nothing), so a C# null comparison lowers to the dedicated `IsNull` / `IsNotNull`
+  predicates instead of a comparison against a NULL literal.
+- **Bitwise `&` / `|`.** C# emits the *same* `And`/`Or` `ExpressionType` for boolean `&`/`|` and integer
+  *bitwise* `&`/`|`; the bridge maps to logical `And`/`Or` only when the binary result is `bool`/`bool?`
+  and otherwise throws (`&&`/`||` always emit `AndAlso`/`OrElse`, so no supported functionality is
+  lost).
+- **Value-changing numeric `Convert`.** A boxing/lifting/identity convert carries no value change and is
+  unwrapped; a value-changing numeric conversion (e.g. `(double)intCol`) is preserved as an explicit
+  `Cast` to the target ADR-0008 `DataType` rather than being dropped into a source-domain operation
+  (e.g. integer division).
+
+A parameter-independent subtree is folded to a value **without compiling** — a `ConstantExpression` is
+read directly, a captured closure field/property is read by reflecting the `MemberInfo` off the tree,
+and a parameter-independent arithmetic/`Convert` subtree (for example `threshold + 1`) is folded by
+recursively evaluating its operands (`EvaluateConstant`, `TypedExpressionLowering.cs`). A
+parameter-independent subtree the bridge cannot fold (e.g. a method call) throws an honest
+`UnsupportedTypedExpressionException` telling the caller to hoist it into a local.
+`ReferencesParameter` — an `ExpressionVisitor` that flags the lambda parameter — decides
+constant-vs-column.
 
 Because the lowered `Column.Expr` matches the untyped one, `Dataset<T>.Where(...)` builds
 `new Filter(condition.Expr, Plan)` (`Dataset.cs:95`) — the same node `DataFrame.Filter(Column)` builds
@@ -114,12 +136,19 @@ Because the lowered `Column.Expr` matches the untyped one, `Dataset<T>.Where(...
 
 ## 4. AC3 — schema derivation from `T` and ADR-0008 nullability
 
-`DatasetSchema.Derive<T>()` (`src/DeltaSharp.Core/Session/DatasetSchema.cs:38`) reflects `T`'s
-**public, readable, non-indexer instance properties** into an ordered `StructType`. Properties are
-ordered by `MemberInfo.MetadataToken` (`DatasetSchema.cs:45`) — declaration order within the type — so
-the derived schema is **deterministic** rather than depending on the unspecified order of
-`Type.GetProperties()`. Derivation reads only property **metadata**; it never instantiates `T` or
-reads a value, so it materializes nothing.
+`DatasetSchema.Derive<T>()` (`src/DeltaSharp.Core/Session/DatasetSchema.cs`) reflects `T`'s
+**public, readable, non-indexer instance properties** — **including inherited public properties**
+(matching Spark's JavaBean/product encoders, which project inherited getters) — into an ordered
+`StructType`. Properties are ordered **base-class first** (by inheritance depth, most-derived last) and,
+within a single declaring type, by `MemberInfo.MetadataToken` (declaration order). Metadata-token order
+is only stable *within* one type's metadata scope, so combining it with inheritance depth keeps the
+derived schema **deterministic** even when a base type lives in another module or assembly, rather than
+depending on the unspecified order of `Type.GetProperties()`. Derivation reads only property
+**metadata**; it never instantiates `T` or reads a value, so it materializes nothing. The result is
+cached per `T` in `TypedSchemaCache<T>` (a per-closed-generic slot) so a long typed chain derives the
+schema once; a `T` with an unmappable property still throws `UnsupportedTypedSchemaException` directly
+(the cache defers derivation through a `Lazy<StructType>`, so the exception is never wrapped in a
+`TypeInitializationException`).
 
 **Nullability (ADR-0008).** [ADR-0008](../../adr/0008-type-system-row-format.md) and
 [type-system.md](type-system.md) place nullability on `StructField.Nullable`, not on the `DataType`.
@@ -170,27 +199,36 @@ satisfies `ReferenceEquals(df.Plan, df.As<T>().ToDF().Plan)`, asserted with `Ass
 `DatasetTypedBridgeTests.As_And_ToDF_PreservePlanIdentity`. The schema travels as the `Dataset<T>`'s
 `Schema` property (derived from `T`, not from executing the plan), so "schema and plan identity are
 preserved without materialization" holds end-to-end. The marquee lazy proof
-(`DatasetTypedLoweringDiagnosticsTests.TypedChain_OverThrowOnReadSource_NeverReads`) chains
-`As<T>().Where(...).Filter(...).Select(...)` over a booby-trapped scan and asserts `ReadCount == 0`.
+(`DatasetTypedLoweringDiagnosticsTests.TypedChain_BuildsPlanWithoutReading_WhileAnActionWouldRead`)
+builds the full `As<T>().Where(...).Filter(...).Select(...)`/`ToDF()` chain over a `FakeSource` inside
+an `ExecutionAudit` scope and asserts **zero** reads while building, then runs an action over the built
+plan and observes the source **does** read — so the zero-read assertion is proven non-vacuous (the scan
+is genuinely reachable; only an action reaches it).
 
-## 6. AC4 — the deterministic unsupported-expression diagnostic
+## 6. AC4 — the deterministic unsupported-expression diagnostics
 
-`UnsupportedTypedExpressionException`
-(`src/DeltaSharp.Core/Session/UnsupportedTypedExpressionException.cs:26`) is the single public
-diagnostic for both typed-bridge failure modes, raised **eagerly at plan-construction time** (never at
-execution):
+The typed bridge has **two** deterministic diagnostics, both raised **eagerly at plan-construction
+time** (never at execution) and both derived from the shared abstract base
+`UnsupportedTypedException` (`src/DeltaSharp.Core/Session/UnsupportedTypedException.cs`) so a caller can
+`catch` one precisely or the base to handle both:
 
-- **Unsupported property type (schema):** a property whose CLR type has no `DataType` mapping throws
-  with the offending `Type.Property` and CLR type named (`DatasetSchema.cs:67`). Test:
-  `DatasetSchemaDeriverTests.Derive_UnsupportedPropertyType_ThrowsDeterministicDiagnostic`.
-- **Unsupported lambda node:** a node the lowering does not understand — a method call, a nested member
-  access (`p.Name.Length`), an unsupported operator — throws with the exact `ExpressionType` /
-  member named (`TypedExpressionLowering.cs:75`, `:139`). Tests:
+- **`UnsupportedTypedSchemaException` — unsupported property type (schema):** a property whose CLR type
+  has no `DataType` mapping throws with the offending `Type.Property` and CLR type named
+  (`DatasetSchema.cs`). Test:
+  `DatasetSchemaDeriverTests.Derive_UnsupportedPropertyType_ThrowsDeterministicDiagnostic` and
+  `DatasetTypedLoweringDiagnosticsTests.As_WithUnmappableProperty_ThrowsSchemaExceptionDirectly`.
+- **`UnsupportedTypedExpressionException` — unsupported lambda node:** a node the lowering does not
+  understand — a method call, a nested member access (`p.Name.Length`), an unsupported operator (a
+  bitwise `&`/`|`), or an unfoldable parameter-independent subexpression — throws with the exact
+  `ExpressionType` / member named (`TypedExpressionLowering.cs`). Tests:
   `DatasetTypedLoweringDiagnosticsTests.Where_MethodCall_*` / `Where_NestedMemberAccess_*` /
-  `Select_UnsupportedNode_*`.
+  `Select_UnsupportedNode_*` and `DatasetTypedLoweringTests.BitwiseAnd_*` /
+  `UnfoldableParameterIndependentSubtree_*`.
 
-Messages name the exact offender so failures are reproducible and greppable rather than surfacing as a
-raw reflection or expression-tree error.
+The two are **distinct types** (not a single conflated exception) so a `catch` for a bad lambda does
+not also swallow an unmappable POCO property, and vice versa. Messages name the exact offender so
+failures are reproducible and greppable rather than surfacing as a raw reflection or expression-tree
+error.
 
 ## 7. Layering, governance, and parity
 

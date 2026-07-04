@@ -41,13 +41,13 @@ public sealed class Dataset<[DynamicallyAccessedMembers(DynamicallyAccessedMembe
     /// <summary>Wraps a logical plan as a typed dataset, deriving <typeparamref name="T"/>'s schema.
     /// Non-public: a <see cref="Dataset{T}"/> is produced by <see cref="DataFrame.As{T}"/>, not by
     /// user code.</summary>
-    /// <exception cref="UnsupportedTypedExpressionException">A property of <typeparamref name="T"/> has
+    /// <exception cref="UnsupportedTypedSchemaException">A property of <typeparamref name="T"/> has
     /// no supported schema mapping (AC4).</exception>
     internal Dataset(SparkSession? session, LogicalPlan plan)
     {
         Plan = plan ?? throw new ArgumentNullException(nameof(plan));
         Session = session;
-        Schema = DatasetSchema.Derive<T>();
+        Schema = TypedSchemaCache<T>.Value;
     }
 
     /// <summary>The immutable, unresolved logical plan backing this dataset — the same plan model a
@@ -88,7 +88,7 @@ public sealed class Dataset<[DynamicallyAccessedMembers(DynamicallyAccessedMembe
     /// <exception cref="ArgumentNullException"><paramref name="predicate"/> is null.</exception>
     /// <exception cref="UnsupportedTypedExpressionException">The predicate contains a node the bridge
     /// cannot lower (AC4).</exception>
-    public Dataset<T> Where(Expression<Func<T, bool>> predicate)
+    public Dataset<T> Filter(Expression<Func<T, bool>> predicate)
     {
         ArgumentNullException.ThrowIfNull(predicate);
         Column condition = TypedExpressionLowering.Lower(predicate);
@@ -96,15 +96,15 @@ public sealed class Dataset<[DynamicallyAccessedMembers(DynamicallyAccessedMembe
     }
 
     /// <summary>
-    /// An alias for <see cref="Where(Expression{Func{T, bool}})"/>, mirroring Spark's
-    /// <c>Dataset.filter</c>. Exactly equivalent — same lowered <c>Filter</c> plan node.
+    /// An alias for <see cref="Filter(Expression{Func{T, bool}})"/>, mirroring Spark's
+    /// <c>Dataset.where</c>. Exactly equivalent — same lowered <c>Filter</c> plan node.
     /// </summary>
     /// <param name="predicate">A boolean predicate over a row of <typeparamref name="T"/>.</param>
     /// <returns>A new filtered <see cref="Dataset{T}"/>.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="predicate"/> is null.</exception>
     /// <exception cref="UnsupportedTypedExpressionException">The predicate contains a node the bridge
     /// cannot lower (AC4).</exception>
-    public Dataset<T> Filter(Expression<Func<T, bool>> predicate) => Where(predicate);
+    public Dataset<T> Where(Expression<Func<T, bool>> predicate) => Filter(predicate);
 
     /// <summary>
     /// Filters rows with an already-built <see cref="Column"/> predicate, returning a new
@@ -116,17 +116,17 @@ public sealed class Dataset<[DynamicallyAccessedMembers(DynamicallyAccessedMembe
     /// <param name="condition">The boolean predicate to retain rows by.</param>
     /// <returns>A new filtered <see cref="Dataset{T}"/>.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="condition"/> is null.</exception>
-    public Dataset<T> Where(Column condition)
+    public Dataset<T> Filter(Column condition)
     {
         ArgumentNullException.ThrowIfNull(condition);
         return new Dataset<T>(Session, new Filter(condition.Expr, Plan));
     }
 
-    /// <summary>An alias for <see cref="Where(Column)"/>, mirroring Spark's <c>Dataset.filter(Column)</c>.</summary>
+    /// <summary>An alias for <see cref="Filter(Column)"/>, mirroring Spark's <c>Dataset.where(Column)</c>.</summary>
     /// <param name="condition">The boolean predicate to retain rows by.</param>
     /// <returns>A new filtered <see cref="Dataset{T}"/>.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="condition"/> is null.</exception>
-    public Dataset<T> Filter(Column condition) => Where(condition);
+    public Dataset<T> Where(Column condition) => Filter(condition);
 
     /// <summary>
     /// Projects a set of typed member/expression selectors, returning an untyped
