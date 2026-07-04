@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Text;
 using DeltaSharp.Analysis;
@@ -544,6 +545,30 @@ public sealed class DataFrame
     /// <returns>A new <see cref="DataFrame"/> unioning the two frames by position.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="other"/> is null.</exception>
     public DataFrame UnionAll(DataFrame other) => Union(other);
+
+    /// <summary>
+    /// Returns a strongly typed <see cref="Dataset{T}"/> view over this frame's plan, mirroring
+    /// Spark's <c>Dataset.as[T]</c> (STORY-04.2.4 / #163). The typed view wraps the <b>identical</b>
+    /// <see cref="Plan"/> reference bound to the same session — this is a lazy reinterpretation that
+    /// <b>materializes nothing</b>: no schema is consulted on the plan and no rows are read (ADR-0001).
+    /// The dataset's schema is derived from <typeparamref name="T"/>'s public properties with ADR-0008
+    /// nullability.
+    /// </summary>
+    /// <remarks>
+    /// This is the entry point into the typed transformation bridge: typed <c>Where</c>/<c>Select</c>
+    /// lambdas on the returned <see cref="Dataset{T}"/> lower to the same logical plan nodes as the
+    /// untyped <see cref="DataFrame"/> operators, and <see cref="Dataset{T}.ToDF"/> returns a
+    /// <see cref="DataFrame"/> over the identical plan. The <c>Row</c>&#8596;<typeparamref name="T"/>
+    /// value encoders that let typed rows be materialized are the separate deferred STORY-04.7.2
+    /// (#178); until then run a typed pipeline by converting back with
+    /// <see cref="Dataset{T}.ToDF"/>. See <c>docs/engineering/design/dataset-typed-bridge.md</c>.
+    /// </remarks>
+    /// <typeparam name="T">The encoded record/POCO type whose properties define the typed schema.</typeparam>
+    /// <returns>A <see cref="Dataset{T}"/> over this frame's plan.</returns>
+    /// <exception cref="UnsupportedTypedExpressionException">A property of <typeparamref name="T"/> has
+    /// no supported schema mapping.</exception>
+    public Dataset<T> As<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicProperties)] T>() =>
+        new(Session, Plan);
 
     // ------------------------------------------------------------------------------------------
     // Actions (eager). These are the ONLY DataFrame members that execute — they analyze the plan,
