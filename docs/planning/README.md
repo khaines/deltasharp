@@ -53,6 +53,15 @@ assignment map for later automation.
 
 </details>
 
+> **Roster changes are tracked here.** This section is the source of truth for the
+> **roster list** (which personas exist); the **canonical per-role specifications**
+> live under [`docs/persona/agents/`](../persona/agents/README.md). When a persona
+> is added, removed, or renamed, update this list
+> and the canonical spec under `docs/persona/agents/`, then reconcile the
+> `persona:<slug>` labels and the counts in
+> [label-taxonomy.md](label-taxonomy.md) (see its reconciliation snapshot). This
+> keeps labels, CODEOWNERS, and the roster from drifting (STORY-00.6.2).
+
 ## Acceptance-criteria conventions
 
 - Criteria are **verifiable** (a reviewer can objectively confirm pass/fail).
@@ -65,14 +74,15 @@ assignment map for later automation.
 
 ## GitHub mapping (implemented)
 
-The plan is materialized as GitHub artifacts by `files/ghbuild` (idempotent):
+The plan is materialized as GitHub artifacts **manually** by maintainers (using the
+`gh` CLI); there is no automated plan-sync tool in the repository yet:
 
 | Plan level | GitHub artifact | Labels |
 |---|---|---|
 | Roadmap milestone (M1–M4, v1.0) | **Milestone** | — |
 | Epic | tracking **Issue**; Features are native **sub-issues** | `epic`, `epic:NN` |
 | Feature | **Issue**; Stories are native **sub-issues** | `feature`, `epic:NN`, `persona:<slug>` |
-| Story | **Issue** | `story`, `epic:NN`, `persona:<slug>`, `size:<S>` |
+| Story | **Issue** | `story`, `epic:NN`, `persona:<slug>`, `size:<XS…XL>` |
 
 - Every issue (epic + its features + stories) is assigned to its roadmap-phase
   **Milestone**, so milestone progress bars roll up the whole subtree.
@@ -83,6 +93,10 @@ The plan is materialized as GitHub artifacts by `files/ghbuild` (idempotent):
   overflows (`dotnet-vectorized-columnar-compute-engineer`) drops its redundant
   trailing `-engineer` in **label** form (`persona:dotnet-vectorized-columnar-compute`)
   — the exact slug is always preserved in the issue body.
+
+See [label-taxonomy.md](label-taxonomy.md) for the full label families, the
+`CODEOWNERS` subsystem-ownership map, roster↔label reconciliation, and the
+branch-protection review policy.
 
 ## Epic index
 

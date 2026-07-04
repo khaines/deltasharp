@@ -1,0 +1,16 @@
+# Issue-form chooser configuration.
+# blank_issues_enabled is false so contributors pick a structured template (or a
+# contact link below) instead of an empty issue. This keeps triage information
+# complete and, critically, routes security reports to a PRIVATE channel instead
+# of a public issue that could leak exploit details (STORY-00.6.1, AC4).
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability (private)
+    url: https://github.com/khaines/deltasharp/security/advisories/new
+    about: Never open a public issue for security problems and do not post exploit details. Use GitHub Private Vulnerability Reporting ("Report a vulnerability") to open a private advisory visible only to you and the maintainers, per the Security Policy.
+  - name: Questions and ideas (GitHub Discussions)
+    url: https://github.com/khaines/deltasharp/discussions
+    about: Ask usage questions, share ideas, or discuss a change before filing an issue. Do not report security vulnerabilities here — use the private security report above.
+  - name: Contributing guide and RFC process
+    url: https://github.com/khaines/deltasharp/blob/main/CONTRIBUTING.md
+    about: How to contribute, sign off commits (DCO), and when a substantial change needs an RFC.
