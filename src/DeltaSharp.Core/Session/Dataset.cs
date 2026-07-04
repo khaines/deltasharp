@@ -26,17 +26,22 @@ namespace DeltaSharp;
 /// </para>
 /// <para>
 /// <b>Scope boundary.</b> This bridge owns the typed-transformation lowering and the
-/// reflection-derived <see cref="Schema"/> (AC3); it does <b>not</b> materialize values. The full
-/// <c>Row</c>&#8596;<typeparamref name="T"/> value encoders (turning collected rows into
-/// <typeparamref name="T"/> instances and back) are the separate deferred STORY-04.7.2 (#178), which
-/// chains after this. Until then a <see cref="Dataset{T}"/> is a typed plan builder; run it by
-/// converting to a <see cref="DataFrame"/> with <see cref="ToDF"/>. See
+/// reflection-derived <see cref="Schema"/> (AC3). STORY-04.7.2 (#178) adds the
+/// <c>Row</c>&#8594;<typeparamref name="T"/> value <b>decoder</b> behind <see cref="Collect()"/>: it
+/// runs the plan through the same executor seam <see cref="DataFrame.Collect()"/> uses and materializes
+/// each result row as a <typeparamref name="T"/> without mutating the row. The reverse
+/// <typeparamref name="T"/>&#8594;<c>Row</c> encode and non-bean shapes (positional records, structs,
+/// nested/collection types) remain deferred. Every typed transformation stays <b>lazy</b>; only
+/// <see cref="Collect()"/> (an action) executes. See
+/// <c>docs/engineering/design/dataset-encoders.md</c> and
 /// <c>docs/engineering/design/dataset-typed-bridge.md</c>.
 /// </para>
 /// </remarks>
 /// <typeparam name="T">The encoded record/POCO type whose public properties define the
 /// <see cref="Schema"/>.</typeparam>
-public sealed class Dataset<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicProperties)] T>
+public sealed class Dataset<[DynamicallyAccessedMembers(
+    DynamicallyAccessedMemberTypes.PublicProperties |
+    DynamicallyAccessedMemberTypes.PublicParameterlessConstructor)] T>
 {
     /// <summary>Wraps a logical plan as a typed dataset, deriving <typeparamref name="T"/>'s schema.
     /// Non-public: a <see cref="Dataset{T}"/> is produced by <see cref="DataFrame.As{T}"/>, not by
@@ -73,6 +78,50 @@ public sealed class Dataset<[DynamicallyAccessedMembers(DynamicallyAccessedMembe
     /// </summary>
     /// <returns>A <see cref="DataFrame"/> over this dataset's plan.</returns>
     public DataFrame ToDF() => new(Session, Plan);
+
+    /// <summary>
+    /// Runs this dataset's plan and returns every row decoded as a <typeparamref name="T"/> value,
+    /// mirroring Spark's <c>Dataset.collect()</c>. This is an <b>action</b> (ADR-0001): it executes the
+    /// plan through the <b>same</b> engine seam <see cref="DataFrame.Collect()"/> uses, then decodes each
+    /// resulting <see cref="Row"/> into a <typeparamref name="T"/> with the STORY-04.7.2 value encoder —
+    /// reading the row only, never mutating it. As with any <c>collect</c>, the full result is buffered
+    /// into driver memory. See <c>docs/engineering/design/dataset-encoders.md</c>.
+    /// </summary>
+    /// <returns>The decoded <typeparamref name="T"/> values, in the plan's result order.</returns>
+    /// <exception cref="InvalidOperationException">This dataset is not bound to a
+    /// <see cref="SparkSession"/>, or a SQL <c>NULL</c> maps to a non-nullable value-typed property.</exception>
+    /// <exception cref="UnsupportedTypedSchemaException"><typeparamref name="T"/> is not an encodable
+    /// bean — a value type, abstract/interface, missing a public parameterless constructor, having a
+    /// mapped property with no public setter, or an ambiguous (duplicated) property name. Validated once,
+    /// before execution, and re-thrown deterministically.</exception>
+    /// <exception cref="InvalidCastException">A row cell's runtime type does not match its property.</exception>
+    public IReadOnlyList<T> Collect() => Collect(CancellationToken.None);
+
+    /// <summary>The cancellable overload of <see cref="Collect()"/>; cancellation is observed by the
+    /// underlying <see cref="DataFrame.Collect(CancellationToken)"/> execution before any decoding.</summary>
+    /// <param name="cancellationToken">A token that cooperatively cancels the action.</param>
+    /// <returns>The decoded <typeparamref name="T"/> values, in the plan's result order.</returns>
+    /// <exception cref="InvalidOperationException">This dataset is not bound to a
+    /// <see cref="SparkSession"/>, or a SQL <c>NULL</c> maps to a non-nullable value-typed property.</exception>
+    /// <exception cref="UnsupportedTypedSchemaException"><typeparamref name="T"/> is not an encodable bean.</exception>
+    /// <exception cref="InvalidCastException">A row cell's runtime type does not match its property.</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public IReadOnlyList<T> Collect(CancellationToken cancellationToken)
+    {
+        // Build/validate the decoder FIRST so an unsupported T fails fast and deterministically, before
+        // any execution work (AC3). The decoder (and any diagnostic) is cached per T, so a repeated
+        // typed collect re-throws the identical message.
+        RowDecoder<T> decoder = TypedRowDecoderCache<T>.Value;
+
+        IReadOnlyList<Row> rows = ToDF().Collect(cancellationToken);
+        var results = new T[rows.Count];
+        for (int i = 0; i < rows.Count; i++)
+        {
+            results[i] = decoder.Decode(rows[i]);
+        }
+
+        return results;
+    }
 
     /// <summary>
     /// Filters rows with a typed predicate lambda, returning a new <see cref="Dataset{T}"/> whose plan

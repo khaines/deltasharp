@@ -558,16 +558,18 @@ public sealed class DataFrame
     /// This is the entry point into the typed transformation bridge: typed <c>Where</c>/<c>Select</c>
     /// lambdas on the returned <see cref="Dataset{T}"/> lower to the same logical plan nodes as the
     /// untyped <see cref="DataFrame"/> operators, and <see cref="Dataset{T}.ToDF"/> returns a
-    /// <see cref="DataFrame"/> over the identical plan. The <c>Row</c>&#8596;<typeparamref name="T"/>
-    /// value encoders that let typed rows be materialized are the separate deferred STORY-04.7.2
-    /// (#178); until then run a typed pipeline by converting back with
-    /// <see cref="Dataset{T}.ToDF"/>. See <c>docs/engineering/design/dataset-typed-bridge.md</c>.
+    /// <see cref="DataFrame"/> over the identical plan. The <c>Row</c>&#8594;<typeparamref name="T"/>
+    /// value decoder that materializes typed rows is <see cref="Dataset{T}.Collect()"/> (STORY-04.7.2 /
+    /// #178). See <c>docs/engineering/design/dataset-typed-bridge.md</c> and
+    /// <c>docs/engineering/design/dataset-encoders.md</c>.
     /// </remarks>
     /// <typeparam name="T">The encoded record/POCO type whose properties define the typed schema.</typeparam>
     /// <returns>A <see cref="Dataset{T}"/> over this frame's plan.</returns>
     /// <exception cref="UnsupportedTypedExpressionException">A property of <typeparamref name="T"/> has
     /// no supported schema mapping.</exception>
-    public Dataset<T> As<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicProperties)] T>() =>
+    public Dataset<T> As<[DynamicallyAccessedMembers(
+        DynamicallyAccessedMemberTypes.PublicProperties |
+        DynamicallyAccessedMemberTypes.PublicParameterlessConstructor)] T>() =>
         new(Session, Plan);
 
     /// <summary>

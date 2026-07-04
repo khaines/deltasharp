@@ -18,8 +18,11 @@ namespace DeltaSharp;
 /// <remarks>
 /// This type performs <b>no</b> value materialization — it reads only property <i>metadata</i>, never
 /// property values — so deriving a schema never instantiates <c>T</c> or reads a row. The full
-/// <c>Row</c>&#8596;<c>T</c> value encoders are deferred to STORY-04.7.2 (#178). See
-/// <c>docs/engineering/design/dataset-typed-bridge.md</c>.
+/// <c>Row</c>&#8594;<c>T</c> value decoder that turns collected rows into <c>T</c> instances is
+/// <see cref="RowDecoder{T}"/> (STORY-04.7.2 / #178), which reuses this schema and the
+/// <see cref="MappableProperties{T}"/> ordering. See
+/// <c>docs/engineering/design/dataset-typed-bridge.md</c> and
+/// <c>docs/engineering/design/dataset-encoders.md</c>.
 /// </remarks>
 internal static class DatasetSchema
 {
@@ -38,22 +41,60 @@ internal static class DatasetSchema
     /// <returns>The derived schema (an empty struct when <typeparamref name="T"/> has no mappable
     /// properties).</returns>
     /// <exception cref="UnsupportedTypedSchemaException">A property's CLR type has no ADR-0008
-    /// <see cref="DataType"/> mapping.</exception>
+    /// <see cref="DataType"/> mapping, or two mapped properties share a name (an ambiguous mapping — for
+    /// example a property hidden by <c>new</c> in a derived type).</exception>
     public static StructType Derive<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicProperties)] T>()
     {
-        PropertyInfo[] properties = typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance);
+        PropertyInfo[] properties = MappableProperties<T>();
+        DetectAmbiguousMapping(typeof(T), properties);
 
         var fields = new List<StructField>(properties.Length);
-        foreach (PropertyInfo property in properties
-                     .Where(static p => p.CanRead && p.GetIndexParameters().Length == 0)
-                     .OrderByDescending(p => InheritanceDepth(typeof(T), p.DeclaringType))
-                     .ThenBy(static p => p.MetadataToken))
+        foreach (PropertyInfo property in properties)
         {
             fields.Add(ToField(property));
         }
 
         return new StructType(fields);
     }
+
+    // Two mapped properties that reflect to the SAME name (for example a base property re-declared with
+    // 'new' in a derived type, which Type.GetProperties surfaces twice) cannot bind to a single schema
+    // column deterministically. Detected here so BOTH the schema deriver and the RowDecoder<T> encoder
+    // (STORY-04.7.2 / #178) report the same deterministic UnsupportedTypedSchemaException naming the
+    // member — rather than the lower-level SchemaValidationException StructType would otherwise raise.
+    private static void DetectAmbiguousMapping(Type ownerType, PropertyInfo[] properties)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (PropertyInfo property in properties)
+        {
+            if (!seen.Add(property.Name))
+            {
+                throw new UnsupportedTypedSchemaException(
+                    $"Type '{ownerType.Name}' has an ambiguous typed mapping: the property name "
+                    + $"'{property.Name}' is declared more than once (for example hidden by 'new' in a "
+                    + "derived type), so it cannot be bound to a single schema column deterministically. "
+                    + "Rename or remove the duplicate property.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Reflects <typeparamref name="T"/>'s public, readable, non-indexer instance properties in the
+    /// <b>same deterministic order</b> <see cref="Derive{T}"/> maps them into schema fields
+    /// (base-class first by inheritance depth, then <see cref="MemberInfo.MetadataToken"/> within a
+    /// declaring type). This is the single ordering source of truth shared by the schema deriver and
+    /// the <see cref="RowDecoder{T}"/> value encoder (STORY-04.7.2 / #178), so the property at index
+    /// <c>i</c> here binds to the schema field at index <c>i</c> — the encoder's deterministic
+    /// property&#8596;ordinal binding — with no risk of the two drifting apart.
+    /// </summary>
+    /// <typeparam name="T">The encoded record/POCO type whose properties are reflected.</typeparam>
+    /// <returns>The ordered mappable properties (empty when <typeparamref name="T"/> has none).</returns>
+    internal static PropertyInfo[] MappableProperties<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicProperties)] T>() =>
+        typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance)
+            .Where(static p => p.CanRead && p.GetIndexParameters().Length == 0)
+            .OrderByDescending(p => InheritanceDepth(typeof(T), p.DeclaringType))
+            .ThenBy(static p => p.MetadataToken)
+            .ToArray();
 
     // The number of base-type hops from T down to the property's declaring type. A property declared
     // on T itself has depth 0; one inherited from T's base has depth 1, and so on. Ordering by
