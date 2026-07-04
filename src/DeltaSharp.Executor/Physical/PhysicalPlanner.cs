@@ -25,6 +25,7 @@ using LogicalProject = DeltaSharp.Plans.Logical.Project;
 using LogicalResolvedRelation = DeltaSharp.Plans.Logical.ResolvedRelation;
 using LogicalSort = DeltaSharp.Plans.Logical.Sort;
 using LogicalUnion = DeltaSharp.Plans.Logical.Union;
+using LogicalWriteToSource = DeltaSharp.Plans.Logical.WriteToSource;
 
 namespace DeltaSharp.Executor;
 
@@ -38,14 +39,18 @@ namespace DeltaSharp.Executor;
 internal sealed class PhysicalPlanner
 {
     private readonly IScanSource _scanSource;
+    private readonly ILocalSinkFactory? _sinkFactory;
     private readonly AnsiMode _mode;
 
     /// <summary>Creates a planner that resolves scans against <paramref name="scanSource"/>.</summary>
     /// <param name="scanSource">The data-in seam mapping a relation to its in-memory batches.</param>
+    /// <param name="sinkFactory">The data-out seam mapping a write intent to a local sink, or
+    /// <see langword="null"/> when the planner is read-only (a write plan then fails deterministically).</param>
     /// <param name="mode">The ANSI lens baked into arithmetic/cast expressions (M1 default: ANSI).</param>
-    public PhysicalPlanner(IScanSource scanSource, AnsiMode mode = AnsiMode.Ansi)
+    public PhysicalPlanner(IScanSource scanSource, ILocalSinkFactory? sinkFactory = null, AnsiMode mode = AnsiMode.Ansi)
     {
         _scanSource = scanSource ?? throw new ArgumentNullException(nameof(scanSource));
+        _sinkFactory = sinkFactory;
         _mode = mode;
     }
 
@@ -93,6 +98,9 @@ internal sealed class PhysicalPlanner
 
             case LogicalUnion union:
                 return PlanUnion(union, outputs);
+
+            case LogicalWriteToSource write:
+                return PlanWrite(write, outputs);
 
             default:
                 throw UnsupportedPlanException.ForNode(
@@ -322,6 +330,24 @@ internal sealed class PhysicalPlanner
         }
 
         return new UnionPlan(SchemaOf(outputs.OutputOf(union)), children);
+    }
+
+    private PhysicalPlan PlanWrite(LogicalWriteToSource write, LogicalOutput outputs)
+    {
+        PhysicalPlan child = PlanNode(write.Child, outputs);
+
+        // The analyzer has already validated the sink format is a supported LOCAL sink (a deferred or
+        // unsupported format threw during analysis, before planning), so a factory miss here means the
+        // sink seam was not wired — a deterministic Plan-stage diagnostic, never a silent no-op.
+        if (_sinkFactory is null || !_sinkFactory.TryCreate(write.Sink, child.OutputSchema, out ILocalSink? sink))
+        {
+            throw new UnsupportedPlanException(
+                QueryExecutionStage.Plan,
+                $"No local sink is registered for write format '{write.Sink.Format}'. The M1 write door "
+                + "executes the in-memory sink; file-format writers (Delta/Parquet) are delivered by EPIC-05.");
+        }
+
+        return new WriteToSinkPlan(child, sink, write.Sink);
     }
 
     private PhysicalExpressionTranslator TranslatorFor(LogicalPlanNode child, LogicalOutput outputs) =>

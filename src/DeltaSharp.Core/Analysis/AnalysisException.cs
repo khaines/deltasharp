@@ -63,6 +63,12 @@ internal enum AnalysisErrorKind
     /// analysis, but the file-format reader is delivered by EPIC-05 (Delta/Parquet storage) and is not
     /// available in M1. The scan node builds fine; only its <i>resolution</i> is deferred.</summary>
     UnsupportedDataSource,
+
+    /// <summary>A write intent (<c>DataFrame.Write…Save</c>) named a sink <b>format</b> the M1 write door
+    /// cannot execute: either an EPIC-05-deferred writer (Delta/Parquet storage — STORY-04.6.3 AC4) or a
+    /// format with no M1 write mapping at all (AC3). The <see cref="WriteToSource"/> node builds fine;
+    /// only its <i>resolution</i> is rejected, before any output is committed.</summary>
+    UnsupportedDataSink,
 }
 
 /// <summary>
@@ -136,8 +142,61 @@ internal sealed class AnalysisException : Exception
             Array.Empty<string>());
     }
 
-    /// <summary>Builds an <see cref="AnalysisErrorKind.UnresolvedColumn"/> failure naming the
-    /// missing column and the candidate input columns.</summary>
+    /// <summary>Builds an <see cref="AnalysisErrorKind.UnsupportedDataSink"/> failure for a write whose
+    /// sink <b>format</b> is delivered by EPIC-05 (Delta/Parquet storage) and is unavailable in M1
+    /// (STORY-04.6.3 AC4). The message names the format, the (redacted) path, and EPIC-05 ownership, and
+    /// points at the working M1 local sink — the write-side analog of <see cref="UnsupportedDataSource"/>.
+    /// It fires during analysis, before any output is committed.</summary>
+    /// <param name="format">The sink format (for example <c>delta</c> or <c>parquet</c>).</param>
+    /// <param name="path">The target path, or <see langword="null"/> when the sink is path-less.</param>
+    /// <param name="localFormats">The M1-supported local sink formats, for the actionable alternative.</param>
+    public static AnalysisException UnsupportedDataSink(
+        string format, string? path, IReadOnlyList<string> localFormats)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(format);
+        ArgumentNullException.ThrowIfNull(localFormats);
+
+        // Redact credential-bearing fragments so neither the diagnostic nor any log capturing it leaks a
+        // secret embedded in the sink path (parity with the read-door's UnsupportedDataSource, #424/#432).
+        string safePath = path is null ? "<none>" : SecretRedaction.RedactPath(path);
+        string alternatives = string.Join(", ", localFormats);
+        return new AnalysisException(
+            $"Writing a '{format}' data source is not supported in this milestone: the writer for target "
+            + $"'{safePath}' is delivered by EPIC-05 (Delta transaction-log storage). Until then, write to a "
+            + $"supported M1 local sink (format: [{alternatives}]).",
+            AnalysisErrorKind.UnsupportedDataSink,
+            safePath,
+            Array.Empty<string>());
+    }
+
+    /// <summary>Builds an <see cref="AnalysisErrorKind.UnsupportedDataSink"/> failure for a write whose
+    /// sink <b>format</b> has no M1 write mapping at all (STORY-04.6.3 AC3) — neither an engine-backed
+    /// local sink nor an EPIC-05-deferred format. The message names the offending format and the
+    /// recognized local/deferred formats, and fires during analysis before any output is committed.</summary>
+    /// <param name="format">The unsupported sink format.</param>
+    /// <param name="path">The target path, or <see langword="null"/> when the sink is path-less.</param>
+    /// <param name="localFormats">The M1-supported local sink formats.</param>
+    /// <param name="deferredFormats">The EPIC-05-deferred formats.</param>
+    public static AnalysisException UnsupportedWriteFormat(
+        string format,
+        string? path,
+        IReadOnlyList<string> localFormats,
+        IReadOnlyList<string> deferredFormats)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(format);
+        ArgumentNullException.ThrowIfNull(localFormats);
+        ArgumentNullException.ThrowIfNull(deferredFormats);
+
+        string safePath = path is null ? "<none>" : SecretRedaction.RedactPath(path);
+        return new AnalysisException(
+            $"Unsupported write format '{format}' for target '{safePath}'. DeltaSharp M1 writes these "
+            + $"local sink formats: [{string.Join(", ", localFormats)}]; these formats are recognized but "
+            + $"deferred to EPIC-05 (Delta/Parquet storage): [{string.Join(", ", deferredFormats)}].",
+            AnalysisErrorKind.UnsupportedDataSink,
+            safePath,
+            Array.Empty<string>());
+    }
+
     public static AnalysisException UnresolvedColumn(
         string name, IReadOnlyList<AttributeReference> input)
     {

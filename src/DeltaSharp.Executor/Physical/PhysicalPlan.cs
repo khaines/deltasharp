@@ -474,3 +474,100 @@ internal sealed class UnionPlan : PhysicalPlan
         return runtime.Run(op);
     }
 }
+
+/// <summary>
+/// Executes a <b>write intent</b> (STORY-04.6.3 / #175): it drains its child subtree, materializes the
+/// child rows once, and atomically <see cref="ILocalSink.Commit"/>s them to the resolved local sink,
+/// honoring the descriptor's <see cref="SaveMode"/>. It is the physical mirror of a leaf
+/// <see cref="ScanPlan"/> at the top of the tree — a sink instead of a source — and is the only physical
+/// node that produces a side effect. The commit is atomic (materialize-then-commit), so a mode conflict
+/// or a mid-write fault leaves no partial output (AC1/AC3). It captures the sink's <b>authoritative</b>
+/// committed row count on <see cref="CommittedRowCount"/> (the value <see cref="ILocalSink.Commit"/>
+/// returns — 0 when a <see cref="SaveMode.Ignore"/> skipped an existing target) so the driver's finalize
+/// reports the rows actually WRITTEN, not the rows the child produced, without a second execution or any
+/// cancellable post-commit work. It returns its child's <see cref="BatchResult"/> unchanged.
+/// <para>
+/// <b>Early existence short-circuit.</b> For <see cref="SaveMode.Ignore"/>/<see cref="SaveMode.ErrorIfExists"/>
+/// onto an ALREADY-EXISTING target, <see cref="Execute"/> probes the sink (<see cref="ILocalSink.ShouldSkipOrThrow"/>)
+/// and short-circuits BEFORE executing/materializing the child — an Ignore returns an empty result with
+/// <see cref="CommittedRowCount"/> 0, an ErrorIfExists throws its conflict — so a doomed or skipped write
+/// never reads the whole input (Spark-parity + OOM safety). This is only an optimization:
+/// <see cref="ILocalSink.Commit"/> stays the atomic boundary and re-checks existence, so a race that creates
+/// the target after the probe is still caught at commit.
+/// </para>
+/// </summary>
+internal sealed class WriteToSinkPlan : PhysicalPlan
+{
+    private readonly PhysicalPlan _child;
+    private readonly ILocalSink _sink;
+    private readonly DeltaSharp.Plans.Logical.SinkDescriptor _descriptor;
+
+    /// <summary>Creates a write node draining <paramref name="child"/> into <paramref name="sink"/>.</summary>
+    /// <param name="child">The subtree whose rows are written.</param>
+    /// <param name="sink">The resolved local sink the rows commit to.</param>
+    /// <param name="descriptor">The logical sink descriptor (for the rendered node metadata; path redacted).</param>
+    public WriteToSinkPlan(PhysicalPlan child, ILocalSink sink, DeltaSharp.Plans.Logical.SinkDescriptor descriptor)
+        : base(child.OutputSchema)
+    {
+        _child = child ?? throw new ArgumentNullException(nameof(child));
+        _sink = sink ?? throw new ArgumentNullException(nameof(sink));
+        _descriptor = descriptor ?? throw new ArgumentNullException(nameof(descriptor));
+    }
+
+    public override IReadOnlyList<PhysicalPlan> Children => [_child];
+
+    /// <inheritdoc/>
+    public override string NodeName => "WriteToSink";
+
+    /// <summary>
+    /// The authoritative number of rows the sink committed, captured from <see cref="ILocalSink.Commit"/>
+    /// after <see cref="Execute"/> runs (<see langword="null"/> before). It is 0 when a
+    /// <see cref="SaveMode.Ignore"/> skipped an existing target, so it is NOT the same as the child's row
+    /// count. The driver's write finalize returns this value (never a post-commit re-count), so a skipped
+    /// write reports 0 and no cancellable work runs after the commit boundary.
+    /// </summary>
+    public long? CommittedRowCount { get; private set; }
+
+    /// <inheritdoc/>
+    // SinkDescriptor.SimpleString already redacts a credential-bearing path, so rendering a write node in
+    // #179 Explain never leaks a secret (#432).
+    public override string SimpleString => $"WriteToSink {_descriptor.SimpleString}";
+
+    public override BatchResult Execute(PhysicalRuntime runtime)
+    {
+        ArgumentNullException.ThrowIfNull(runtime);
+
+        // Early existence short-circuit (optimization; Spark parity). Decide an Ignore/ErrorIfExists write
+        // onto an ALREADY-EXISTING target BEFORE executing/materializing the child, so a doomed
+        // (ErrorIfExists) or skipped (Ignore) write never reads or materializes the whole DataFrame just to
+        // throw or return 0 — avoiding an OOM risk on large inputs and matching Spark, which checks
+        // existence before running the job for these modes. ShouldSkipOrThrow throws the ErrorIfExists
+        // conflict (before any child work), or returns true for an Ignore that must skip; Append/Overwrite
+        // (and a fresh target) return false and execute normally below. This is only an optimization —
+        // Commit REMAINS the atomic final boundary and re-checks existence under its monitor, so a race that
+        // creates the target between this probe and the commit is still caught at commit.
+        if (_sink.ShouldSkipOrThrow())
+        {
+            // SaveMode.Ignore onto an existing target: skip the write entirely — no child execution, no
+            // materialization — reporting 0 committed rows (the authoritative count) and an EMPTY result
+            // over the child schema (no batches) so the driver's finalize reads 0 without re-executing.
+            CommittedRowCount = 0;
+            return new BatchResult(OutputSchema, Array.Empty<ColumnBatch>());
+        }
+
+        BatchResult child = _child.Execute(runtime);
+
+        // Materialize the whole result once, then commit atomically: the sink never observes a
+        // half-written result, so a mode conflict (ErrorIfExists) or a fault commits nothing (AC1/AC3).
+        // Cancellation/faults are only possible up to and including the commit — the commit is the final
+        // failure boundary. Capture the sink's authoritative committed count and do NO cancellable or
+        // fault-prone work afterwards, so a cancel/timeout in the post-commit window can never surface a
+        // committed write as a failed Save (MUST-FIX: post-commit cancellation window).
+        IReadOnlyList<Row> rows = RowMaterializer.Materialize(child, maxRows: null, maxBytes: null, runtime.CancellationToken);
+        CommittedRowCount = _sink.Commit(child.Schema, rows);
+
+        // Return the child result so the driver's finalize can read CommittedRowCount (no re-execution and
+        // no post-commit row count that could re-poll the cancellation token).
+        return child;
+    }
+}

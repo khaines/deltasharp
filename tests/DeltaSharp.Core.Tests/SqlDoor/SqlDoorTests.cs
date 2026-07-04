@@ -764,5 +764,9 @@ public sealed class SqlDoorTests
 
         public string ExplainPhysical(LogicalPlan analyzedPlan) =>
             throw new InvalidOperationException("The SQL door must not execute.");
+
+        public long Write(
+            LogicalPlan analyzedPlan, ExecutionOptions options, ExecutionMetricsSink? metricsSink = null) =>
+            throw new InvalidOperationException("The SQL door must not execute.");
     }
 }

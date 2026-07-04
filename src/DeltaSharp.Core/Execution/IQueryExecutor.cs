@@ -73,6 +73,23 @@ internal interface IQueryExecutor
     long Count(LogicalPlan analyzedPlan, ExecutionOptions options, ExecutionMetricsSink? metricsSink = null);
 
     /// <summary>
+    /// Executes a <b>write intent</b> (<c>DataFrameWriter.Save</c>, STORY-04.6.3) by driving
+    /// <paramref name="analyzedPlan"/> — a <c>WriteToSource</c> over the writer's analyzed child — through
+    /// the SAME analyze→plan→execute pipeline as <see cref="Collect"/>/<see cref="Count"/>, but draining
+    /// the result rows into the configured local sink instead of returning them. This is an <b>eager</b>
+    /// action: it is the writer's crossing into execution (ADR-0001 — writer configuration is lazy, only
+    /// <c>Save</c> executes). The sink commit is atomic, so a mid-write fault leaves no partial output.
+    /// </summary>
+    /// <param name="analyzedPlan">The analyzer-resolved write plan (a <c>WriteToSource</c> root).</param>
+    /// <param name="options">The execution-time controls (cancellation, timeout, memory bound).</param>
+    /// <param name="metricsSink">
+    /// An optional per-action sink the executor fills with the run's <see cref="ExecutionMetrics"/> before
+    /// it returns or throws, so the counters are retrievable on both the success and failure paths.
+    /// </param>
+    /// <returns>The number of rows written to the sink.</returns>
+    long Write(LogicalPlan analyzedPlan, ExecutionOptions options, ExecutionMetricsSink? metricsSink = null);
+
+    /// <summary>
     /// Renders the physical plan of <paramref name="analyzedPlan"/> as a multi-line tree string for
     /// <see cref="DataFrame.Explain(ExplainMode)"/>'s physical section. This is the EXPLAIN counterpart
     /// of <see cref="Collect"/>/<see cref="Count"/>: it <b>plans but never executes</b> — no operator is
