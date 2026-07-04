@@ -103,7 +103,14 @@ bypasses `PhysicalRuntime.Run`'s per-batch poll:
   `CreateDataFrame` source therefore honors cancellation/timeout *during* the encode, not only after it
   drains. This closes the one plan shape that runs a source read between the upfront gate and `Run`'s
   per-batch poll (STORY-04.6.4 AC2). The encode's `OperationCanceledException` unwinds through the
-  `Backend`-stage catch, so a timeout there still surfaces as `TimeoutException`.
+  `Backend`-stage catch, so a timeout there still surfaces as `TimeoutException`. `Snapshot` honors the
+  token on **every** return path (before the cached read, while acquiring the one-time drain gate, and
+  after) so a second action blocked behind the first's in-progress drain still observes *its own*
+  cancellation ([#437](https://github.com/khaines/deltasharp/issues/437)). Because a snapshot is only
+  taken when the drain **completes**, a cancelled first drain re-drains on retry — correct for a
+  re-enumerable source (a `List`/array, the norm); a **single-use** source cannot be replayed after a
+  cancelled first drain (an inherent tradeoff of an interruptible drain, tracked by
+  [#438](https://github.com/khaines/deltasharp/issues/438)).
 
 ### 2.3 Deterministic disposal & batch ownership (discharges #420)
 
