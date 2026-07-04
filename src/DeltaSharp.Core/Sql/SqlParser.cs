@@ -1,5 +1,7 @@
 using System.Collections.Generic;
 using System.Globalization;
+using System.Runtime.CompilerServices;
+using DeltaSharp.Plans;
 using DeltaSharp.Plans.Expressions;
 using DeltaSharp.Plans.Logical;
 using DeltaSharp.Types;
@@ -34,8 +36,21 @@ namespace DeltaSharp.Sql;
 /// </summary>
 internal sealed class SqlParser
 {
+    /// <summary>
+    /// The maximum expression-nesting recursion depth the parser accepts. Aligned with
+    /// <see cref="TreeNode{TNode}.MaxDepth"/> (the node-tree depth bound). Deeply nested inputs —
+    /// e.g. thousands of parentheses or a long <c>NOT NOT …</c> chain — would otherwise recurse
+    /// unboundedly and overflow the (small, ~1&#160;MB under gRPC/Kestrel) worker-thread stack,
+    /// crashing the whole process with an <b>uncatchable</b> <see cref="System.StackOverflowException"/>.
+    /// Note parenthesized groups build no node (they return the inner expression unwrapped), so the
+    /// construction-time <see cref="TreeNode{TNode}"/> guard cannot see them — this explicit counter
+    /// is what makes over-deep input a deterministic, catchable <see cref="SqlParseException"/>.
+    /// </summary>
+    private const int MaxExpressionDepth = TreeNode<LogicalPlan>.MaxDepth;
+
     private readonly IReadOnlyList<SqlToken> _tokens;
     private int _pos;
+    private int _depth;
 
     private SqlParser(IReadOnlyList<SqlToken> tokens)
     {
@@ -51,7 +66,28 @@ internal sealed class SqlParser
     public static LogicalPlan Parse(string sql)
     {
         IReadOnlyList<SqlToken> tokens = SqlLexer.Tokenize(sql);
-        return new SqlParser(tokens).ParseStatement();
+        try
+        {
+            return new SqlParser(tokens).ParseStatement();
+        }
+        catch (PlanDepthExceededException ex)
+        {
+            // Belt-and-suspenders: the recursion-depth guard below should fire first, but if an
+            // over-deep tree ever reaches node construction, translate the INTERNAL plan-depth
+            // exception into the public, catchable SqlParseException the door promises (AC2).
+            throw new SqlParseException(
+                "Syntax error: expression nesting too deep to parse.", ex);
+        }
+        catch (InsufficientExecutionStackException ex)
+        {
+            // Defense-in-depth for inputs whose *physical* call-stack cost outruns the node-depth
+            // counter (e.g. thousands of parentheses, each of which descends the full precedence
+            // ladder but builds no node). RuntimeHelpers.EnsureSufficientExecutionStack() fires while
+            // there is still headroom, so this is a deterministic, catchable failure — never an
+            // uncatchable StackOverflowException that would crash the whole driver process.
+            throw new SqlParseException(
+                "Syntax error: expression nesting too deep to parse.", ex);
+        }
     }
 
     private SqlToken Current => _tokens[_pos];
@@ -103,14 +139,33 @@ internal sealed class SqlParser
 
     private void RejectSetQuantifier()
     {
-        // DISTINCT/ALL as a set quantifier immediately after SELECT is recognizable SQL the M1 door
-        // does not implement (DISTINCT needs the Distinct operator + dedup semantics).
-        if (Current.Kind == SqlTokenKind.Identifier
-            && string.Equals(Current.Text, "DISTINCT", System.StringComparison.OrdinalIgnoreCase))
+        if (Current.Kind != SqlTokenKind.Identifier)
         {
-            throw SqlParseException.Unsupported("SELECT DISTINCT", Current.Position);
+            return;
+        }
+
+        // DISTINCT as a set quantifier immediately after SELECT is recognizable SQL the M1 door does
+        // not implement (DISTINCT needs the Distinct operator + dedup semantics).
+        if (string.Equals(Current.Text, "DISTINCT", System.StringComparison.OrdinalIgnoreCase))
+        {
+            throw SqlParseException.Unsupported("SELECT_DISTINCT", Current.Position);
+        }
+
+        // ALL is the DEFAULT set quantifier (Spark parity): 'SELECT ALL a' means 'SELECT a'. Consume
+        // and ignore it — but only when a select item actually follows, so a column literally named
+        // 'all' ('SELECT all FROM t') is still parsed as a column reference.
+        if (string.Equals(Current.Text, "ALL", System.StringComparison.OrdinalIgnoreCase)
+            && StartsSelectItem(Peek(1)))
+        {
+            Advance();
         }
     }
+
+    private static bool StartsSelectItem(SqlToken token) =>
+        token.Kind is not (SqlTokenKind.From
+            or SqlTokenKind.Comma
+            or SqlTokenKind.As
+            or SqlTokenKind.EndOfInput);
 
     private IReadOnlyList<Expression> ParseSelectList()
     {
@@ -177,7 +232,7 @@ internal sealed class SqlParser
     {
         if (Current.Kind == SqlTokenKind.LParen)
         {
-            throw SqlParseException.Unsupported("subquery", Current.Position);
+            throw SqlParseException.Unsupported("SUBQUERY", Current.Position);
         }
 
         var parts = new List<string>();
@@ -254,8 +309,17 @@ internal sealed class SqlParser
     {
         if (Current.Kind == SqlTokenKind.Not)
         {
+            int position = Current.Position;
             Advance();
-            return new Not(ParseNot());
+            EnterRecursion(position);
+            try
+            {
+                return new Not(ParseNot());
+            }
+            finally
+            {
+                _depth--;
+            }
         }
 
         return ParseComparison();
@@ -264,10 +328,28 @@ internal sealed class SqlParser
     private Expression ParseComparison()
     {
         Expression left = ParseAdditive();
+
+        // Recognizable-but-unsupported predicates (IS [NOT] NULL, IN, LIKE, BETWEEN) surface here as a
+        // named UnsupportedFeature rather than as a misleading trailing-token SyntaxError.
+        string? predicate = MapPredicateKeyword(Current);
+        if (predicate is not null)
+        {
+            throw SqlParseException.Unsupported(predicate, Current.Position);
+        }
+
         if (TryComparisonOperator(Current.Kind, out ComparisonOperator op))
         {
             Advance();
             Expression right = ParseAdditive();
+
+            // Comparisons are non-associative in the M1 grammar; 'a = b = c' is a common mistake with
+            // a clearer hint than an opaque "unexpected '=' after the query".
+            if (TryComparisonOperator(Current.Kind, out _))
+            {
+                throw SqlParseException.Syntax(
+                    "chained comparison is not supported; parenthesize the operands", Current.Position);
+            }
+
             return new BinaryComparison(left, right, op);
         }
 
@@ -341,9 +423,7 @@ internal sealed class SqlParser
                 return ParseNumericLiteral(negative);
             }
 
-            throw SqlParseException.Syntax(
-                $"unary '{sign.Text}' is only supported directly before a numeric literal",
-                sign.Position);
+            throw SqlParseException.Unsupported("UNARY_MINUS", sign.Position);
         }
 
         return ParsePrimary();
@@ -378,12 +458,20 @@ internal sealed class SqlParser
                 Advance();
                 if (Current.Kind == SqlTokenKind.Select)
                 {
-                    throw SqlParseException.Unsupported("subquery", token.Position);
+                    throw SqlParseException.Unsupported("SUBQUERY", token.Position);
                 }
 
-                Expression inner = ParseExpression();
-                Expect(SqlTokenKind.RParen, ")");
-                return inner;
+                EnterRecursion(token.Position);
+                try
+                {
+                    Expression inner = ParseExpression();
+                    Expect(SqlTokenKind.RParen, ")");
+                    return inner;
+                }
+                finally
+                {
+                    _depth--;
+                }
 
             case SqlTokenKind.Identifier:
                 return ParseColumnReference();
@@ -402,7 +490,7 @@ internal sealed class SqlParser
         // functions arrive with the analyzer's function registry usage in EPIC-07).
         if (Peek(1).Kind == SqlTokenKind.LParen)
         {
-            throw SqlParseException.Unsupported("function call", start.Position);
+            throw SqlParseException.Unsupported("FUNCTION_CALL", start.Position);
         }
 
         var parts = new List<string> { start.Text };
@@ -449,7 +537,9 @@ internal sealed class SqlParser
                 : Literal.OfLong(signed);
         }
 
-        throw SqlParseException.Syntax($"integer literal '{token.Text}' is out of range", token.Position);
+        // Spark promotes an out-of-INT64-range integer literal to DECIMAL; the M1 door has no DECIMAL
+        // literal node yet, so name it as an unsupported feature rather than a plain syntax error.
+        throw SqlParseException.Unsupported("DECIMAL_LITERAL", token.Position);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -457,6 +547,19 @@ internal sealed class SqlParser
     // ---------------------------------------------------------------------------------------------
 
     private void Advance() => _pos++;
+
+    private void EnterRecursion(int position)
+    {
+        // Two complementary bounds make over-deep input a deterministic, catchable SqlParseException
+        // instead of an uncatchable StackOverflowException: (1) a node-depth counter aligned with
+        // TreeNode.MaxDepth, and (2) a physical-stack check that fires when the actual call stack —
+        // which grows ~one full precedence ladder per parenthesis level — nears exhaustion.
+        RuntimeHelpers.EnsureSufficientExecutionStack();
+        if (++_depth > MaxExpressionDepth)
+        {
+            throw SqlParseException.Syntax("expression nesting too deep", position);
+        }
+    }
 
     private SqlToken Peek(int ahead)
     {
@@ -503,8 +606,31 @@ internal sealed class SqlParser
         }
     }
 
-    private static string Describe(SqlToken token) =>
-        token.Kind == SqlTokenKind.EndOfInput ? "end of input" : token.Text;
+    private static string Describe(SqlToken token) => token.Kind switch
+    {
+        // Do not echo the decoded value of a string literal into an error message; report its kind so
+        // untrusted literal contents never leak back to the caller verbatim.
+        SqlTokenKind.EndOfInput => "end of input",
+        SqlTokenKind.StringLiteral => "string literal",
+        _ => token.Text,
+    };
+
+    private static string? MapPredicateKeyword(SqlToken token)
+    {
+        if (token.Kind != SqlTokenKind.Identifier)
+        {
+            return null;
+        }
+
+        return token.Text.ToUpperInvariant() switch
+        {
+            "IS" => "IS_NULL",
+            "IN" => "IN",
+            "LIKE" => "LIKE",
+            "BETWEEN" => "BETWEEN",
+            _ => null,
+        };
+    }
 
     private static string? MapStatementKeyword(SqlToken token)
     {
@@ -523,7 +649,7 @@ internal sealed class SqlParser
             "DROP" => "DROP",
             "ALTER" => "ALTER",
             "TRUNCATE" => "TRUNCATE",
-            "WITH" => "WITH (common table expression)",
+            "WITH" => "CTE",
             "VALUES" => "VALUES",
             "SHOW" => "SHOW",
             "DESCRIBE" or "DESC" => "DESCRIBE",
@@ -538,7 +664,7 @@ internal sealed class SqlParser
     {
         if (token.Kind == SqlTokenKind.Comma)
         {
-            return "comma-separated table list (implicit join)";
+            return "IMPLICIT_JOIN";
         }
 
         if (token.Kind != SqlTokenKind.Identifier)
@@ -549,14 +675,14 @@ internal sealed class SqlParser
         return token.Text.ToUpperInvariant() switch
         {
             "JOIN" or "INNER" or "LEFT" or "RIGHT" or "FULL" or "CROSS" or "OUTER" => "JOIN",
-            "GROUP" => "GROUP BY",
-            "ORDER" => "ORDER BY",
+            "GROUP" => "GROUP_BY",
+            "ORDER" => "ORDER_BY",
             "HAVING" => "HAVING",
             "LIMIT" => "LIMIT",
             "OFFSET" => "OFFSET",
-            "UNION" or "INTERSECT" or "EXCEPT" or "MINUS" => "set operation (UNION/INTERSECT/EXCEPT)",
+            "UNION" or "INTERSECT" or "EXCEPT" or "MINUS" => "UNION",
             "WINDOW" => "WINDOW",
-            "CLUSTER" or "DISTRIBUTE" or "SORT" => "CLUSTER/DISTRIBUTE/SORT BY",
+            "CLUSTER" or "DISTRIBUTE" or "SORT" => "SORT_BY",
             _ => null,
         };
     }
