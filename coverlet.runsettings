@@ -24,7 +24,11 @@
                themselves so a project "with no executable code" (the test projects) cannot
                dilute or inflate the measured percentage (STORY-00.2.3 AC3), and removes the
                samples/ example apps, which are not shippable libraries. Filter syntax is
-               [AssemblyGlob]TypeGlob, comma-separated; Excludes are applied after Includes. -->
+               [AssemblyGlob]TypeGlob, comma-separated; Excludes are applied after Includes.
+               NOTE: [*.Tests]* keys on the '.Tests' assembly-name suffix. A test-SUPPORT
+               assembly that does NOT end in '.Tests' (e.g. a shared DeltaSharp.TestFixtures
+               helper) would match [DeltaSharp.*] and leak into the denominator — add an explicit
+               Exclude (e.g. [DeltaSharp.TestFixtures]*) or give it a '.Tests'-matching name. -->
           <Include>[DeltaSharp.*]*</Include>
           <Exclude>[*.Tests]*,[DeltaSharp.Samples.*]*</Exclude>
 

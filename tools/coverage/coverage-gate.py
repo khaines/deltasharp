@@ -19,13 +19,25 @@ in ANY report, and the denominator is the set of distinct (file, line) pairs. Th
 the same merge semantics ReportGenerator uses, implemented here with the Python stdlib
 only (no third-party or network dependency, so the gate is deterministic and offline).
 
+Fail-closed on a partial report set
+-----------------------------------
+Unioning "whatever reports were globbed" is fail-OPEN: if one test assembly's report is
+lost (a crashed/dropped suite) it silently vanishes from the denominator, which can make
+coverage RISE and the gate PASS while a whole suite went missing. It is also an injection
+vector — a report could be dropped (or a fake one added) to move the number. To close this,
+the gate asserts that EVERY expected production assembly listed in `expectedAssemblies`
+(coverage-config.json) is present in the merged report set with measurable lines; if any is
+absent it exits non-zero (fail-closed) with a `::error::` naming the missing assembly. CI
+also deletes stale `TestResults` before collecting so only in-step-generated reports count.
+
 Usage
 -----
     python3 tools/coverage/coverage-gate.py --results-dir TestResults \
         [--config tools/coverage/coverage-config.json] \
-        [--threshold 78.0] [--summary-out TestResults/coverage-summary.md]
+        [--threshold 87.0] [--summary-out TestResults/coverage-summary.md]
 
-Exit codes: 0 = at/above threshold, 1 = below threshold, 2 = usage/data error.
+Exit codes: 0 = at/above threshold, 1 = below threshold, 2 = usage/data error
+(unreadable/malformed/empty reports, or a missing expected production assembly).
 """
 
 from __future__ import annotations
@@ -130,12 +142,18 @@ def render_summary(per_package, covered, total, threshold, measured, passed) -> 
     return "\n".join(lines)
 
 
-def load_threshold(config_path: str) -> tuple[float, float]:
+def load_config(config_path: str) -> tuple[float, float, list[str]]:
+    """Read the enforced threshold, ratchet slack, and expected assemblies.
+
+    `expectedAssemblies` is the provenance allowlist: the production assemblies that MUST
+    appear in the merged report set. It makes the gate fail-closed on a partial report set.
+    """
     with open(config_path, "r", encoding="utf-8") as handle:
         config = json.load(handle)
     threshold = float(config["minimumLineCoverage"])
     slack = float(config.get("ratchetSuggestSlack", 0.0))
-    return threshold, slack
+    expected = [str(name) for name in config.get("expectedAssemblies", [])]
+    return threshold, slack, expected
 
 
 def main(argv=None) -> int:
@@ -155,14 +173,15 @@ def main(argv=None) -> int:
     parser.add_argument("--summary-out", default=None)
     args = parser.parse_args(argv)
 
+    # Always read the config for the provenance allowlist (expectedAssemblies); a
+    # --threshold override only substitutes the numeric floor for local dry runs.
+    try:
+        threshold, slack, expected_assemblies = load_config(args.config)
+    except (OSError, ValueError, KeyError) as exc:
+        _log(f"::error::could not read coverage config {args.config}: {exc}")
+        return 2
     if args.threshold is not None:
         threshold, slack = args.threshold, 0.0
-    else:
-        try:
-            threshold, slack = load_threshold(args.config)
-        except (OSError, ValueError, KeyError) as exc:
-            _log(f"::error::could not read threshold from {args.config}: {exc}")
-            return 2
 
     reports = find_reports(args.results_dir)
     if not reports:
@@ -172,6 +191,23 @@ def main(argv=None) -> int:
     per_package, covered, total = merge_reports(reports)
     if total == 0:
         _log("::error::coverage reports contained no measurable production lines")
+        return 2
+
+    # Fail-closed provenance check: every expected production assembly MUST be present in
+    # the merged report set with measurable lines. A missing (lost/crashed/dropped) suite
+    # must FAIL the gate, never silently shrink the denominator and let coverage rise.
+    missing = [
+        name
+        for name in expected_assemblies
+        if per_package.get(name, (0, 0))[1] == 0
+    ]
+    if missing:
+        for name in missing:
+            _log(
+                f"::error::coverage report is missing expected production assembly "
+                f"{name!r} — a lost/dropped suite must fail the gate (fail-closed), not "
+                f"vanish from the denominator. Present: {sorted(per_package) or '(none)'}"
+            )
         return 2
 
     measured = round(pct(covered, total), 2)
