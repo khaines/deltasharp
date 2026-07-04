@@ -1,6 +1,7 @@
 using DeltaSharp.Analysis;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Engine.Execution;
+using DeltaSharp.Execution;
 using DeltaSharp.Plans.Logical;
 using DeltaSharp.Types;
 
@@ -80,6 +81,40 @@ internal sealed class InMemoryRelationFixture
         return new DataFrame(session, new UnresolvedRelation(new[] { name }));
     }
 
+    /// <summary>
+    /// Registers a relation's SCHEMA in the catalog only (not the scan source), so the analyzer resolves
+    /// the relation but the planner's scan resolution misses it. This drives the Scan-stage failure path
+    /// (STORY-04.6.4 criterion 2): the planner raises an <see cref="UnsupportedPlanException"/> attributed
+    /// to <see cref="QueryExecutionStage.Scan"/>.
+    /// </summary>
+    /// <param name="name">The relation name (single-part identifier).</param>
+    /// <param name="schema">The relation schema.</param>
+    /// <returns>A base <see cref="DataFrame"/> over the schema-only relation.</returns>
+    public DataFrame RelationSchemaOnly(string name, StructType schema)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        ArgumentNullException.ThrowIfNull(schema);
+
+        _catalog.Register(name, schema);
+        return new DataFrame(new UnresolvedRelation(new[] { name }));
+    }
+
+    /// <summary>
+    /// Builds a <see cref="DataFrame"/> over an in-memory <c>LocalRelation</c> (#158 read-door) carrying
+    /// <paramref name="rows"/> inline, WITHOUT registering a scan source: the planner defers the row→batch
+    /// encode into <c>ScanPlan.Execute</c>, so a schema/CLR-type/encode mismatch surfaces at execution as a
+    /// <see cref="QueryExecutionStage.Scan"/>-attributed <see cref="UnsupportedPlanException"/> (#176 #6).
+    /// </summary>
+    /// <param name="schema">The authoritative relation schema.</param>
+    /// <param name="rows">The inline rows (read positionally against <paramref name="schema"/> on the first action).</param>
+    /// <returns>A base <see cref="DataFrame"/> over the local relation.</returns>
+    public DataFrame LocalRelationFrame(StructType schema, IEnumerable<Row> rows)
+    {
+        ArgumentNullException.ThrowIfNull(schema);
+        ArgumentNullException.ThrowIfNull(rows);
+        return new DataFrame(new LocalRelation(schema, rows));
+    }
+
     /// <summary>Analyzes a DataFrame's logical plan through the real Core analyzer.</summary>
     /// <param name="frame">The DataFrame whose plan to analyze.</param>
     /// <returns>The analyzed logical plan.</returns>
@@ -132,7 +167,7 @@ internal sealed class InMemoryRelationFixture
         var executor = new LocalQueryExecutor(sentinel, ExecutionBackendOptions.Default);
         try
         {
-            _ = executor.Collect(Analyze(frame));
+            _ = executor.Collect(Analyze(frame), ExecutionOptions.Default);
         }
         catch (Exception)
         {
@@ -159,14 +194,138 @@ internal sealed class InMemoryRelationFixture
     /// <param name="options">Backend options (defaults to <see cref="ExecutionBackendOptions.Default"/>).</param>
     /// <returns>The materialized rows.</returns>
     public IReadOnlyList<Row> Collect(DataFrame frame, ExecutionBackendOptions? options = null) =>
-        new LocalQueryExecutor(_scanSource, options ?? ExecutionBackendOptions.Default).Collect(Analyze(frame));
+        new LocalQueryExecutor(_scanSource, options ?? ExecutionBackendOptions.Default)
+            .Collect(Analyze(frame), ExecutionOptions.Default);
 
     /// <summary>Executes a DataFrame end-to-end and counts rows without full materialization.</summary>
     /// <param name="frame">The DataFrame to count.</param>
     /// <param name="options">Backend options (defaults to <see cref="ExecutionBackendOptions.Default"/>).</param>
     /// <returns>The row count.</returns>
     public long Count(DataFrame frame, ExecutionBackendOptions? options = null) =>
-        new LocalQueryExecutor(_scanSource, options ?? ExecutionBackendOptions.Default).Count(Analyze(frame));
+        new LocalQueryExecutor(_scanSource, options ?? ExecutionBackendOptions.Default)
+            .Count(Analyze(frame), ExecutionOptions.Default);
+
+    /// <summary>
+    /// Executes a DataFrame end-to-end under STORY-04.6.4 boundaries (cancellation/timeout/result bounds/
+    /// memory budget) and returns the rows plus the planning/execution <see cref="ExecutionMetrics"/>. It
+    /// is the fixture seam <c>DeltaSharp.Executor.Tests</c> drives the failure-mode tests through, since
+    /// Core's <c>ExecutionOptions</c> is a Core internal the test assembly cannot name directly.
+    /// </summary>
+    /// <param name="frame">The DataFrame to collect.</param>
+    /// <param name="cancellationToken">Cooperative cancellation observed at batch/row boundaries.</param>
+    /// <param name="timeout">An optional execution timeout.</param>
+    /// <param name="maxResultRows">An optional result row cap.</param>
+    /// <param name="maxResultBytes">An optional result byte cap.</param>
+    /// <param name="memoryBudgetBytes">An optional per-run operator memory budget.</param>
+    /// <param name="backendOptions">Backend options (defaults to <see cref="ExecutionBackendOptions.Default"/>).</param>
+    /// <returns>The materialized rows and the metrics gathered on success.</returns>
+    public (IReadOnlyList<Row> Rows, ExecutionMetrics Metrics) CollectWithMetrics(
+        DataFrame frame,
+        CancellationToken cancellationToken = default,
+        TimeSpan? timeout = null,
+        long? maxResultRows = null,
+        long? maxResultBytes = null,
+        long? memoryBudgetBytes = null,
+        ExecutionBackendOptions? backendOptions = null)
+    {
+        var options = BuildOptions(
+            cancellationToken, timeout, maxResultRows, maxResultBytes, memoryBudgetBytes);
+        var sink = new ExecutionMetricsSink();
+        IReadOnlyList<Row> rows = new LocalQueryExecutor(_scanSource, backendOptions ?? ExecutionBackendOptions.Default)
+            .Collect(Analyze(frame), options, sink);
+        return (rows, sink.Metrics ?? ExecutionMetrics.Empty);
+    }
+
+    /// <summary>The <see cref="CollectWithMetrics"/> counterpart for <c>count</c>.</summary>
+    /// <param name="frame">The DataFrame to count.</param>
+    /// <param name="cancellationToken">Cooperative cancellation observed at batch boundaries.</param>
+    /// <param name="timeout">An optional execution timeout.</param>
+    /// <param name="memoryBudgetBytes">An optional per-run operator memory budget.</param>
+    /// <param name="backendOptions">Backend options (defaults to <see cref="ExecutionBackendOptions.Default"/>).</param>
+    /// <returns>The count and the metrics gathered on success.</returns>
+    public (long Count, ExecutionMetrics Metrics) CountWithMetrics(
+        DataFrame frame,
+        CancellationToken cancellationToken = default,
+        TimeSpan? timeout = null,
+        long? memoryBudgetBytes = null,
+        ExecutionBackendOptions? backendOptions = null)
+    {
+        var options = BuildOptions(cancellationToken, timeout, null, null, memoryBudgetBytes);
+        var sink = new ExecutionMetricsSink();
+        long count = new LocalQueryExecutor(_scanSource, backendOptions ?? ExecutionBackendOptions.Default)
+            .Count(Analyze(frame), options, sink);
+        return (count, sink.Metrics ?? ExecutionMetrics.Empty);
+    }
+
+    private static ExecutionOptions BuildOptions(
+        CancellationToken cancellationToken,
+        TimeSpan? timeout,
+        long? maxResultRows,
+        long? maxResultBytes,
+        long? memoryBudgetBytes) =>
+        new()
+        {
+            CancellationToken = cancellationToken,
+            Timeout = timeout,
+            MaxResultRows = maxResultRows,
+            MaxResultBytes = maxResultBytes,
+            MemoryBudgetBytes = memoryBudgetBytes,
+        };
+
+    /// <summary>
+    /// Runs a collect that is expected to <b>throw</b>, capturing the metrics the executor published into
+    /// the per-call sink even though the action failed (the executor fills the sink in a <c>finally</c>).
+    /// Returns the captured metrics and the thrown exception, so failure-path metrics (STORY-04.6.4
+    /// criterion 4 — planning duration present, partial counters) can be asserted through the sink the
+    /// <c>out</c>-metrics overloads read.
+    /// </summary>
+    /// <param name="frame">The DataFrame to collect.</param>
+    /// <param name="cancellationToken">Cooperative cancellation observed at batch/row boundaries.</param>
+    /// <param name="timeout">An optional execution timeout.</param>
+    /// <param name="maxResultRows">An optional result row cap.</param>
+    /// <param name="maxResultBytes">An optional result byte cap.</param>
+    /// <param name="memoryBudgetBytes">An optional per-run operator memory budget.</param>
+    /// <returns>The captured metrics (from the sink) and the exception the action threw, if any.</returns>
+    public (ExecutionMetrics Metrics, Exception? Error) CollectCapturingMetrics(
+        DataFrame frame,
+        CancellationToken cancellationToken = default,
+        TimeSpan? timeout = null,
+        long? maxResultRows = null,
+        long? maxResultBytes = null,
+        long? memoryBudgetBytes = null)
+    {
+        var options = BuildOptions(cancellationToken, timeout, maxResultRows, maxResultBytes, memoryBudgetBytes);
+        var sink = new ExecutionMetricsSink();
+        Exception? error = null;
+        try
+        {
+            _ = new LocalQueryExecutor(_scanSource, ExecutionBackendOptions.Default)
+                .Collect(Analyze(frame), options, sink);
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        return (sink.Metrics ?? ExecutionMetrics.Empty, error);
+    }
+
+    /// <summary>
+    /// Collects using the process-wide shared <see cref="ExecutionOptions.Default"/> with a FRESH per-call
+    /// metrics sink, so a concurrency test can prove two actions over the shared default options do not
+    /// corrupt each other's metrics — the sink is per-call and the options carry no mutable per-run state
+    /// (STORY-04.6.4 / #176 #4/#5). The plan is pre-analyzed by the caller to avoid analyzer concurrency.
+    /// </summary>
+    /// <param name="frame">The DataFrame to collect (analyzed here).</param>
+    /// <returns>The materialized rows and the metrics gathered from this call's own sink.</returns>
+    public (IReadOnlyList<Row> Rows, ExecutionMetrics Metrics) CollectViaDefaultOptions(DataFrame frame)
+    {
+        LogicalPlan analyzed = Analyze(frame);
+        var sink = new ExecutionMetricsSink();
+        IReadOnlyList<Row> rows = new LocalQueryExecutor(_scanSource, ExecutionBackendOptions.Default)
+            .Collect(analyzed, ExecutionOptions.Default, sink);
+        return (rows, sink.Metrics ?? ExecutionMetrics.Empty);
+    }
 
     /// <summary>Collects a DataFrame through a <see cref="SparkSession"/>'s registered executor (full seam).</summary>
     /// <param name="session">The session whose <c>QueryExecutor</c> runs the plan.</param>
@@ -175,6 +334,72 @@ internal sealed class InMemoryRelationFixture
     public IReadOnlyList<Row> CollectViaSession(SparkSession session, DataFrame frame)
     {
         ArgumentNullException.ThrowIfNull(session);
-        return session.QueryExecutor.Collect(Analyze(frame));
+        return session.QueryExecutor.Collect(Analyze(frame), ExecutionOptions.Default);
+    }
+
+    /// <summary>
+    /// Executes <paramref name="frame"/> against a <see cref="CancellationTriggerScanSource"/> that cancels
+    /// the action in flight on the first batch read, capturing the thrown exception, the trigger's batch-
+    /// access count (prompt-stop evidence), and — via a disposal-observing <see cref="PhysicalRuntime"/>
+    /// factory — whether the executor disposed the run's runtime on the cancellation path. Drives
+    /// STORY-04.6.4 (#176) criterion 1: the returned <c>RuntimeDisposed</c> is <see langword="false"/>
+    /// (failing the caller's assertion) if <see cref="LocalQueryExecutor"/>'s disposal <c>finally</c> is removed.
+    /// </summary>
+    /// <param name="frame">A frame whose relation is registered schema-only, resolved by the trigger source.</param>
+    /// <returns>The thrown exception, whether the runtime was disposed, and the trigger's access count.</returns>
+    public (Exception? Error, bool RuntimeDisposed, int BatchAccessCount) RunInFlightCancelDisposalProbe(DataFrame frame)
+    {
+        ArgumentNullException.ThrowIfNull(frame);
+        var trigger = new CancellationTriggerScanSource();
+        PhysicalRuntime? captured = null;
+        var executor = new LocalQueryExecutor(trigger, ExecutionBackendOptions.Default)
+        {
+            RuntimeFactory = (backend, options, token, budget) =>
+            {
+                captured = new PhysicalRuntime(backend, options, token, budget);
+                return captured;
+            },
+        };
+
+        var runOptions = BuildOptions(trigger.Token, null, null, null, null);
+        Exception? error = null;
+        try
+        {
+            _ = executor.Collect(Analyze(frame), runOptions);
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        return (error, captured?.IsDisposed ?? false, trigger.AccessCount);
+    }
+
+    /// <summary>
+    /// Collects <paramref name="frame"/> against an <see cref="ExecutionSentinelScanSource"/> whose batches
+    /// throw a generic <see cref="ExecutionSentinelScanSource.BatchExecutedException"/> when the materializer
+    /// reads them, returning the exception the executor surfaces. Because a bare scan returns the batch
+    /// reference unread from the backend stage and the fault is neither cancellation, an unsupported plan,
+    /// nor a result-limit breach, it exercises the executor's <b>general</b> Materialize catch (#176 #2):
+    /// the surfaced exception is a <see cref="QueryExecutionException"/> with
+    /// <see cref="QueryExecutionStage.Materialize"/> wrapping the sentinel exception as its root cause.
+    /// </summary>
+    /// <param name="frame">A bare-scan frame whose relation is registered schema-only.</param>
+    /// <returns>The exception the executor surfaced (expected: a Materialize-attributed wrapper).</returns>
+    public Exception CollectExpectingMaterializeFault(DataFrame frame)
+    {
+        ArgumentNullException.ThrowIfNull(frame);
+        var sentinel = new ExecutionSentinelScanSource();
+        var executor = new LocalQueryExecutor(sentinel, ExecutionBackendOptions.Default);
+        try
+        {
+            _ = executor.Collect(Analyze(frame), ExecutionOptions.Default);
+        }
+        catch (Exception ex)
+        {
+            return ex;
+        }
+
+        throw new InvalidOperationException("Expected the sentinel materialization to fault, but the collect succeeded.");
     }
 }

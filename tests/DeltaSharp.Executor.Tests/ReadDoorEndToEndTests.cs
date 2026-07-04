@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using DeltaSharp.Types;
 using Xunit;
 using static DeltaSharp.Functions;
@@ -157,6 +158,48 @@ public class ReadDoorEndToEndTests
     }
 
     [Fact]
+    public void CreateDataFrame_CancellationDuringEncode_StopsPromptly_WithoutDrainingSource()
+    {
+        // Regression (#425 red-team, AC2): the #158 LocalRelation row→batch encode runs in
+        // ScanPlan.Execute — between the driver's upfront cancel gate and PhysicalRuntime.Run's per-batch
+        // poll — so before the fix it drained the WHOLE IEnumerable<Row> with no cancellation poll and a
+        // slow/large/unbounded source bypassed cancellation. The encode now polls the run's effective token
+        // per source row, so cancellation stops it within one row rather than after the whole drain.
+        using SparkSession spark = NewSession();
+        var schema = new StructType(new[] { new StructField("id", IntegerType.Instance, nullable: false) });
+        using var cts = new CancellationTokenSource();
+
+        // A large LAZY source that cancels the run once it has yielded a few rows. With the per-row poll the
+        // encode throws within a row of the cancel; without it the encode would pull all 100_000 rows.
+        var source = new CancelAfterRowSequence(schema, totalRows: 100_000, cancelAfter: 3, cts);
+        DataFrame df = spark.CreateDataFrame(source, schema);
+
+        Assert.Throws<OperationCanceledException>(() => df.Count(cts.Token));
+
+        // Non-vacuous: the encode was interrupted mid-enumeration, not after draining the whole source.
+        Assert.True(source.PulledCount < 1000, $"encode pulled {source.PulledCount} rows before stopping");
+    }
+
+    [Fact]
+    public void CreateDataFrame_TimeoutDuringEncode_SurfacesTimeout_WithoutDrainingSource()
+    {
+        // The same AC2 gap under a configured TIMEOUT (the red-team's exact repro): a slow source's encode
+        // must not run past the timeout. The per-row poll observes the elapsed-timeout effective token and
+        // the driver maps it to TimeoutException — before the whole slow source is drained.
+        using SparkSession spark = NewSession();
+        spark.Conf.Set("spark.deltasharp.execution.timeoutMs", "50");
+        var schema = new StructType(new[] { new StructField("id", IntegerType.Instance, nullable: false) });
+
+        // 200 rows × 20 ms/row = ~4 s if drained; the 50 ms timeout must trip after only a handful of rows.
+        var source = new SlowRowSequence(schema, totalRows: 200, perRowDelayMs: 20);
+        DataFrame df = spark.CreateDataFrame(source, schema);
+
+        Assert.Throws<TimeoutException>(() => df.Count());
+
+        Assert.True(source.PulledCount < 100, $"encode pulled {source.PulledCount} rows before timing out");
+    }
+
+    [Fact]
     public void ReadParquet_Action_FailsWithDeterministicEpic05Diagnostic()
     {
         using SparkSession spark = NewSession();
@@ -310,6 +353,74 @@ public class ReadDoorEndToEndTests
 
             _consumed = true;
             return _rows.GetEnumerator();
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+    }
+
+    /// <summary>An <see cref="IEnumerable{Row}"/> that cancels <paramref name="_cts"/> once it has yielded
+    /// <c>cancelAfter</c> rows and tracks how many rows were pulled — so a test can prove the deferred
+    /// encode stops within a row of cancellation rather than draining the whole (large) source (#425).</summary>
+    private sealed class CancelAfterRowSequence : IEnumerable<Row>
+    {
+        private readonly StructType _schema;
+        private readonly int _totalRows;
+        private readonly int _cancelAfter;
+        private readonly CancellationTokenSource _cts;
+
+        public CancelAfterRowSequence(StructType schema, int totalRows, int cancelAfter, CancellationTokenSource cts)
+        {
+            _schema = schema;
+            _totalRows = totalRows;
+            _cancelAfter = cancelAfter;
+            _cts = cts;
+        }
+
+        public int PulledCount { get; private set; }
+
+        public IEnumerator<Row> GetEnumerator()
+        {
+            for (int i = 0; i < _totalRows; i++)
+            {
+                PulledCount++;
+                if (PulledCount == _cancelAfter)
+                {
+                    _cts.Cancel();
+                }
+
+                yield return new Row(_schema, i);
+            }
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+    }
+
+    /// <summary>An <see cref="IEnumerable{Row}"/> that sleeps before each row (a slow/blocking source) and
+    /// tracks how many rows were pulled — so a test can prove the deferred encode honors a configured
+    /// timeout mid-enumeration rather than blocking for the whole source (#425).</summary>
+    private sealed class SlowRowSequence : IEnumerable<Row>
+    {
+        private readonly StructType _schema;
+        private readonly int _totalRows;
+        private readonly int _perRowDelayMs;
+
+        public SlowRowSequence(StructType schema, int totalRows, int perRowDelayMs)
+        {
+            _schema = schema;
+            _totalRows = totalRows;
+            _perRowDelayMs = perRowDelayMs;
+        }
+
+        public int PulledCount { get; private set; }
+
+        public IEnumerator<Row> GetEnumerator()
+        {
+            for (int i = 0; i < _totalRows; i++)
+            {
+                Thread.Sleep(_perRowDelayMs);
+                PulledCount++;
+                yield return new Row(_schema, i);
+            }
         }
 
         System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();

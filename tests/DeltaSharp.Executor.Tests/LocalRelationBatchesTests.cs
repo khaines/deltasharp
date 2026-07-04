@@ -115,7 +115,7 @@ public sealed class LocalRelationBatchesTests
         var rows = new[] { new Row(schema, new object?[] { null }) };
 
         IReadOnlyList<Row> materialized = RowMaterializer.Materialize(
-            new BatchResult(schema, LocalRelationBatches.Build(schema, rows)));
+            new BatchResult(schema, LocalRelationBatches.Build(schema, rows)), maxRows: null, maxBytes: null, default);
 
         Row row = Assert.Single(materialized);
         Assert.True(row.IsNullAt(0));

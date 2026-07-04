@@ -33,20 +33,51 @@ internal sealed class FakeQueryExecutor : IQueryExecutor
 
     internal LogicalPlan? LastPlan { get; private set; }
 
-    public IReadOnlyList<Row> Collect(LogicalPlan analyzedPlan)
+    /// <summary>The <see cref="ExecutionOptions"/> the most recent action threaded across the seam.</summary>
+    internal ExecutionOptions? LastOptions { get; private set; }
+
+    /// <summary>When set, published into the metrics sink so the out-metrics overloads can be exercised.</summary>
+    internal ExecutionMetrics? MetricsToPublish { get; set; }
+
+    public IReadOnlyList<Row> Collect(LogicalPlan analyzedPlan, ExecutionOptions options, ExecutionMetricsSink? metricsSink = null)
     {
         CollectCallCount++;
         LastPlan = analyzedPlan;
-        DriveBackend();
-        return _rows;
+        LastOptions = options;
+        try
+        {
+            options.CancellationToken.ThrowIfCancellationRequested();
+            DriveBackend();
+            return _rows;
+        }
+        finally
+        {
+            // Publish in a finally (like the real executor) so metrics surface on the failure path too.
+            if (metricsSink is not null && MetricsToPublish is not null)
+            {
+                metricsSink.Metrics = MetricsToPublish;
+            }
+        }
     }
 
-    public long Count(LogicalPlan analyzedPlan)
+    public long Count(LogicalPlan analyzedPlan, ExecutionOptions options, ExecutionMetricsSink? metricsSink = null)
     {
         CountCallCount++;
         LastPlan = analyzedPlan;
-        DriveBackend();
-        return _countOverride ?? _rows.Count;
+        LastOptions = options;
+        try
+        {
+            options.CancellationToken.ThrowIfCancellationRequested();
+            DriveBackend();
+            return _countOverride ?? _rows.Count;
+        }
+        finally
+        {
+            if (metricsSink is not null && MetricsToPublish is not null)
+            {
+                metricsSink.Metrics = MetricsToPublish;
+            }
+        }
     }
 
     /// <summary>
