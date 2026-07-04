@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
 using DeltaSharp.Plans;
@@ -47,6 +48,24 @@ public sealed class DescriptorOnlyTests
         Assert.Equal(SaveMode.Append, write.Sink.Mode);
         Assert.Equal("/out", write.Sink.Path);
         Assert.Equal(new[] { "year" }, write.Sink.PartitionColumns);
+    }
+
+    [Fact]
+    public void SinkDescriptor_OptionKeys_DifferingOnlyByUnicodeCaseFold_AreEqual_AndHashEqual()
+    {
+        // Equals/GetHashCode contract for the case-insensitive option map, exercised on the Greek final
+        // sigma: 'ς' (U+03C2) and 'σ' (U+03C3) are DISTINCT under ToLowerInvariant but the SAME under the
+        // StringComparer.OrdinalIgnoreCase the option map uses (both upper-case to 'Σ'). Two descriptors
+        // whose only difference is this key casing must be Equal AND hash identically. Mutation sentinel:
+        // hashing the key with ToLowerInvariant (instead of ToUpperInvariant, which matches how
+        // OrdinalIgnoreCase folds) leaves them Equal but hashing DIFFERENTLY — an Equals/GetHashCode break.
+        var finalSigma = new SinkDescriptor(
+            "parquet", options: new Dictionary<string, string> { ["\u03C2"] = "v" });
+        var lowerSigma = new SinkDescriptor(
+            "parquet", options: new Dictionary<string, string> { ["\u03C3"] = "v" });
+
+        Assert.Equal(finalSigma, lowerSigma);
+        Assert.Equal(finalSigma.GetHashCode(), lowerSigma.GetHashCode());
     }
 
     [Fact]

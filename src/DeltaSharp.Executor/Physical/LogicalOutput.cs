@@ -109,7 +109,9 @@ internal sealed class LogicalOutput
 
             // Shape-preserving operators expose their (first) child's output unchanged. Union reuses
             // its first input's attributes to match the analyzer (set-op widening is TODO(#392)).
-            case Filter or Sort or Limit or Distinct or Union:
+            // WriteToSource (STORY-04.6.3) is a shape-preserving root over its child's rows: the write
+            // node's output attributes are its child's, so the physical WriteToSink drains that schema.
+            case Filter or Sort or Limit or Distinct or Union or WriteToSource:
                 return outputs[node.Children[0]];
 
             default:

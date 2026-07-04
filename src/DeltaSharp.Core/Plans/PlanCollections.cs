@@ -54,7 +54,14 @@ internal static class PlanCollections
         return new ReadOnlyCollection<string>(array);
     }
 
-    /// <summary>Defensively copies <paramref name="options"/> into an ordinal read-only map.</summary>
+    /// <summary>
+    /// Defensively copies <paramref name="options"/> into a <b>case-insensitive</b>
+    /// (<see cref="StringComparer.OrdinalIgnoreCase"/>) read-only map, matching Spark's
+    /// case-insensitive data-source option contract (the <see cref="DataFrameWriter"/>/reader collect
+    /// options case-insensitively, so <c>Option("HEADER", …)</c> must be retrievable as
+    /// <c>Options["header"]</c>). The copy uses the indexer (last write wins) so a source map whose keys
+    /// collide only by case cannot throw here.
+    /// </summary>
     public static IReadOnlyDictionary<string, string> ToOptions(
         IReadOnlyDictionary<string, string>? options)
     {
@@ -63,7 +70,7 @@ internal static class PlanCollections
             return EmptyOptions;
         }
 
-        var copy = new Dictionary<string, string>(options.Count, StringComparer.Ordinal);
+        var copy = new Dictionary<string, string>(options.Count, StringComparer.OrdinalIgnoreCase);
         foreach (KeyValuePair<string, string> entry in options)
         {
             copy[entry.Key] = entry.Value;
@@ -99,9 +106,10 @@ internal static class PlanCollections
             new ReadOnlyCollection<T>(Array.Empty<T>());
     }
 
-    /// <summary>The shared empty options map.</summary>
+    /// <summary>The shared empty options map (case-insensitive, matching <see cref="ToOptions"/>).</summary>
     public static IReadOnlyDictionary<string, string> EmptyOptions { get; } =
-        new ReadOnlyDictionary<string, string>(new Dictionary<string, string>(StringComparer.Ordinal));
+        new ReadOnlyDictionary<string, string>(
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase));
 
     /// <summary>Ordinal element-wise equality of two string sequences.</summary>
     public static bool StringSequenceEquals(IReadOnlyList<string> a, IReadOnlyList<string> b)
@@ -122,7 +130,12 @@ internal static class PlanCollections
         return true;
     }
 
-    /// <summary>Order-independent equality of two string-keyed string maps (ordinal).</summary>
+    /// <summary>
+    /// Order-independent equality of two string-keyed string maps. Keys are compared
+    /// <b>case-insensitively</b> (the maps are built with <see cref="StringComparer.OrdinalIgnoreCase"/>
+    /// by <see cref="ToOptions"/>, so the lookup honors that comparer, matching Spark's case-insensitive
+    /// option keys); values are compared <b>ordinally</b> (option values are case-sensitive).
+    /// </summary>
     public static bool OptionsEqual(
         IReadOnlyDictionary<string, string> a,
         IReadOnlyDictionary<string, string> b)

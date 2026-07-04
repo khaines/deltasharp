@@ -29,6 +29,8 @@ internal sealed class FakeQueryExecutor : IQueryExecutor
 
     internal int CountCallCount { get; private set; }
 
+    internal int WriteCallCount { get; private set; }
+
     internal int ExplainPhysicalCallCount { get; private set; }
 
     internal LogicalPlan? LastPlan { get; private set; }
@@ -63,6 +65,32 @@ internal sealed class FakeQueryExecutor : IQueryExecutor
     public long Count(LogicalPlan analyzedPlan, ExecutionOptions options, ExecutionMetricsSink? metricsSink = null)
     {
         CountCallCount++;
+        LastPlan = analyzedPlan;
+        LastOptions = options;
+        try
+        {
+            options.CancellationToken.ThrowIfCancellationRequested();
+            DriveBackend();
+            return _countOverride ?? _rows.Count;
+        }
+        finally
+        {
+            if (metricsSink is not null && MetricsToPublish is not null)
+            {
+                metricsSink.Metrics = MetricsToPublish;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Records a write action and drives the same backend audit stages as <see cref="Collect"/>/
+    /// <see cref="Count"/>, then returns a canned row-written count — so a Core test can assert that
+    /// <c>DataFrameWriter.Save</c> crosses the execution seam as an eager action (STORY-04.6.3) without a
+    /// real physical sink (which lives in DeltaSharp.Executor).
+    /// </summary>
+    public long Write(LogicalPlan analyzedPlan, ExecutionOptions options, ExecutionMetricsSink? metricsSink = null)
+    {
+        WriteCallCount++;
         LastPlan = analyzedPlan;
         LastOptions = options;
         try
