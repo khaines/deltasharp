@@ -5,10 +5,17 @@
 **Please do not report security vulnerabilities through public GitHub issues,
 discussions, or pull requests.**
 
-Report privately via **[GitHub Security Advisories](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability)**
-("Report a vulnerability" on the repository's Security tab), or by email to
-**security@deltasharp.dev** _(placeholder — replace with the project's real,
-monitored contact before launch)_.
+Report privately using **[GitHub Private Vulnerability Reporting](https://github.com/khaines/deltasharp/security/advisories/new)** —
+click **"Report a vulnerability"** on the repository's
+[Security tab](https://github.com/khaines/deltasharp/security/policy). GitHub
+opens a private advisory visible only to you and the maintainers, so exploit
+details never touch a public channel. This is the preferred report path and works
+without depending on any external email or DNS.
+
+If you are unable to use GitHub Private Vulnerability Reporting, reach a maintainer
+privately (see [GOVERNANCE.md](GOVERNANCE.md)) and ask them to open an advisory on
+your behalf. **Do not** disclose the issue in a public issue, discussion, or pull
+request.
 
 Please include:
 
