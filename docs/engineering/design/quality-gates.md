@@ -19,7 +19,7 @@
 
 DeltaSharp enforces **three automated quality gates** on every pull request and every push to
 `main`, across two CI jobs in [`.github/workflows/ci.yml`](../../../.github/workflows/ci.yml) so a
-policy violation blocks the merge button rather than accumulating as debt:
+policy violation surfaces on the pull request rather than accumulating as debt:
 
 - **`build-test-format`** — the analyzer/warnings-as-errors gate and the formatting gate, and the
   authoritative **correctness** (test pass/fail) run. Tests run here **uninstrumented**.
@@ -27,6 +27,16 @@ policy violation blocks the merge button rather than accumulating as debt:
   **measurement-only**: because coverage instrumentation perturbs execution timing, it must never
   be able to change the correctness verdict, which `build-test-format` owns (see
   [Why coverage is a separate job](#why-coverage-is-a-separate-job)).
+
+> **Which checks are merge-blocking.** A CI job only blocks the merge button once it is listed in
+> the repository's **branch-protection required status checks**. `build-test-format` is (or is
+> intended to be) a required check. The **`coverage`** job is **not yet** merge-blocking: a status
+> check can only be added to branch protection **after it has run at least once on `main`**, which
+> happens only **after this PR merges** and the `coverage` job first executes on the `main` push.
+> Wiring `coverage` into the required-checks list is therefore a **documented post-merge step**;
+> until it is done, a `coverage` failure is visible on the PR but does not itself block the button.
+> This doc does not claim `coverage` blocks merges today — it will once it is added to the required
+> checks.
 
 | # | Gate | Job | Enforced by | Fails when |
 | --- | --- | --- | --- | --- |
@@ -60,10 +70,13 @@ All of the following are wired centrally in
 - **`EnableNETAnalyzers=true`** with **`AnalysisLevel=latest`** — the full current .NET
   analyzer set (the `CAxxxx` rules) runs on every project.
 - **Trim / AOT / single-file analyzers** — `EnableTrimAnalyzer`, `EnableAotAnalyzer`, and
-  `EnableSingleFileAnalyzer` are enabled on every production assembly under `src/`
-  (`DeltaSharp.Abstractions`, `DeltaSharp.Core`, `DeltaSharp.Engine`, `DeltaSharp.Executor`).
-  They surface `IL2xxx`/`IL3xxx` dataflow warnings, which — under warnings-as-errors — fail
-  the build. This is the standing enforcement of the [ADR-0014](../../adr/0014-target-framework-aot.md)
+  `EnableSingleFileAnalyzer` are enabled **once, centrally, in `Directory.Build.props`** under the
+  `DeltaSharpIsProductionAssembly` condition, so they apply to **every** production assembly under
+  `src/` (`DeltaSharp.Abstractions`, `DeltaSharp.Core`, `DeltaSharp.Engine`, `DeltaSharp.Executor`)
+  and **no project can drift** — a new `src/` assembly inherits them automatically, and none can
+  silently opt out. They surface `IL2xxx`/`IL3xxx` dataflow warnings, which — under
+  warnings-as-errors — fail the build. This is the standing enforcement of the
+  [ADR-0014](../../adr/0014-target-framework-aot.md)
   AOT posture. The analyzers (not `IsAotCompatible`/`IsTrimmable`) are used deliberately so the
   SDK-version-tied `Microsoft.NET.ILLink.Tasks` package is not pulled into the committed lock
   files; a real AOT publish is verified separately by the `aot.yml` workflow.
@@ -236,8 +249,7 @@ deliberately-raced `GetOrCreate` vs. `Stop`; its own oracle notes that reading `
 instrumentation on a 2-vCPU runner that window widens enough to make the oracle occasionally count
 a legitimate interleaving as a violation — a **false** failure unrelated to any real regression.
 
-The fix is architectural, not a test change (the repo treats a flaky test as a harness/oracle
-defect, not something to quietly weaken):
+What the job split does — and does **not** — fix:
 
 - **`build-test-format` runs the tests uninstrumented** and is the single source of truth for
   correctness — exactly as before coverage existed, and exactly as on `main`. The stress test runs
@@ -250,6 +262,16 @@ defect, not something to quietly weaken):
   `--filter "FullyQualifiedName!~SparkSessionConcurrencyTests.GetOrCreate_RacingStop_NeverReusesAStoppedSession"`,
   which is **coverage-neutral**: the merged percentage is identical with or without it, because
   every line it exercises is covered by other tests.
+
+**This removes only the instrumentation *amplification* of the flake — it does not fix the
+oracle.** The test still runs uninstrumented in `build-test-format`, where its post-return
+`IsActive` read remains racy against a legitimate `Stop`, so a rare false positive is still
+possible. The proper fix is an **oracle-determinism rewrite** that drives the race through the
+existing in-repo seam `RuntimeConfig.StopRaceProbe` (the sibling F1 test already uses it to pause a
+thread at the exact TOCTOU window) instead of sampling mutable state after the lock is released.
+That rewrite is **out of scope for this PR and tracked in
+[#454](https://github.com/khaines/deltasharp/issues/454)**; this document will be updated to say the
+oracle is resolved once that lands.
 
 ### The merge: why per-report sums are wrong
 
@@ -273,7 +295,7 @@ The enforced floor and the ratcheting policy live in **one machine-readable sing
 truth**, [`tools/coverage/coverage-config.json`](../../../tools/coverage/coverage-config.json):
 
 ```jsonc
-"minimumLineCoverage": 85.0,
+"minimumLineCoverage": 87.0,
 "ratchetPolicy": "monotonic-non-decreasing"
 ```
 
@@ -282,9 +304,34 @@ threshold**, and **exits non-zero when merged line coverage is below the floor**
 GitHub `::error::` annotation so the failure is visible in the checks UI):
 
 ```text
-FAIL: measured line coverage 82.10% vs threshold 85.00%
-::error::coverage gate FAIL — measured line coverage 82.10% vs threshold 85.00%
+FAIL: measured line coverage 82.10% vs threshold 87.00%
+::error::coverage gate FAIL — measured line coverage 82.10% vs threshold 87.00%
 ```
+
+### Fail-closed on a partial report set (provenance)
+
+Merging *whatever reports were globbed* is **fail-open**: if one test assembly's report is lost
+(a crashed or dropped suite) or deleted, that assembly silently vanishes from the denominator, which
+can make coverage **rise** and the gate **pass** while a whole suite went missing. It is also an
+injection vector — a report could be removed (or a fake one planted) to move the number. The gate
+closes this two ways:
+
+- **Expected-assembly provenance allowlist.** `coverage-config.json` carries an
+  **`expectedAssemblies`** list (`DeltaSharp.Abstractions`, `DeltaSharp.Core`, `DeltaSharp.Engine`,
+  `DeltaSharp.Executor`). Every listed assembly **must** appear in the merged report set with
+  measurable lines; if any is absent the gate **exits non-zero (fail-closed)** with a `::error::`
+  naming the missing assembly, instead of letting it drop out of the denominator. Add a new `src/`
+  production assembly to this list when it lands.
+- **In-run reports only.** The `coverage` job deletes any pre-existing `TestResults` **before**
+  collecting, so the gate trusts only reports generated by the collect step in that run (closing
+  stale-report reuse and a planted-report injection).
+
+**Reproduced.** Dropping the single `DeltaSharp.Executor` report from the merged set removes that
+assembly from the denominator and makes measured coverage **rise 89.16% → 89.50%**; the *old*
+fail-open gate **passed** on that partial set. With the provenance check the gate now **exits
+non-zero** — `::error::coverage report is missing expected production assembly 'DeltaSharp.Executor'`
+— so a lost suite fails the gate rather than being masked. The existing all-missing / malformed /
+zero-line cases still exit `2` as before.
 
 ### Measured baseline
 
@@ -302,7 +349,11 @@ green):
 ### Exclusions prevent false failures (AC3)
 
 - **Test projects** carry no shippable code and are removed from the measurement by the
-  `Exclude [*.Tests]*` filter, so they can never dilute or inflate the percentage.
+  `Exclude [*.Tests]*` filter, so they can never dilute or inflate the percentage. **Caveat:** that
+  filter keys on the **`.Tests` assembly-name suffix**. A test-*support* assembly that does **not**
+  end in `.Tests` (e.g. a shared `DeltaSharp.TestFixtures` helper) would match `[DeltaSharp.*]` and
+  leak into the denominator; if such an assembly is added, exclude it explicitly in
+  `coverlet.runsettings` (e.g. `[DeltaSharp.TestFixtures]*`) or give it a `.Tests`-matching name.
 - **`samples/` example apps** (`[DeltaSharp.Samples.*]*`) are excluded — they are illustrative
   application code, not shippable libraries, so they stay out of the library-coverage denominator.
 - **Generated / no-op members** are removed by `ExcludeByAttribute` and `SkipAutoProps`.
@@ -312,15 +363,25 @@ green):
 
 ### Ratcheting policy (AC4)
 
-The threshold is **monotonic non-decreasing — it only ever goes up.** The initial floor is
-**85.0%**, set deliberately below the measured **89.16%**: a ~4-point buffer absorbs
-cross-platform variance (the baseline was measured on arm64/macOS; CI runs on x64/Linux) and
-run-to-run nondeterminism, so a red gate means a **genuine** regression, not noise. As
-CI-observed coverage stabilizes and new work lands, **raise `minimumLineCoverage` toward (never
-above) the measured value** in the same or a follow-up PR; the gate prints a ratchet suggestion
-once headroom exceeds `ratchetSuggestSlack`. **Never lower the number to make a red build
-pass** — add or fix tests instead. Both the number and this policy are recorded in
-`coverage-config.json`.
+The threshold is **monotonic non-decreasing — it only ever goes up.** The floor is **87.0%**, set
+deliberately below the measured **89.16%**: a **~2-point** buffer absorbs cross-platform variance
+(the baseline was measured on arm64/macOS; CI runs on x64/Linux) and run-to-run nondeterminism, so
+a red gate means a **genuine** regression, not noise — while still actively guarding the range a
+wider buffer left unenforced (the old 85.0 floor let coverage regress ~4 points, from 89 down to 85,
+without failing). As CI-observed coverage stabilizes and new work lands, **raise
+`minimumLineCoverage` toward (never above) the measured value** in the same or a follow-up PR; the
+gate prints a ratchet suggestion once headroom exceeds `ratchetSuggestSlack` (**1.5**, below the
+current ~2.16-point headroom, so the nudge actually fires at the baseline rather than lying dormant
+as the old `5.0` slack did). **Never lower the number to make a red build pass** — add or fix tests
+instead.
+
+**Narrow override — a floor decrease tied to code removal.** The only sanctioned way to *lower* the
+floor is when a PR **removes well-tested code**, which legitimately lowers the measured percentage;
+a coverage dip from deleting code that was covered is not a regression. Such a decrease is allowed
+**only** when the removed component and its justification are recorded in the `ratchetOverride`
+block of `coverage-config.json` (and the PR), so the change is auditable and a genuine dip is not
+mistaken for a red gate. Absent code removal, the floor never decreases. Both the numbers and this
+policy are recorded in `coverage-config.json`.
 
 ### Reproducing the coverage gate locally
 
