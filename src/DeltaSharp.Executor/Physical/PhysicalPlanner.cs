@@ -105,6 +105,7 @@ internal sealed class PhysicalPlanner
         if (!_scanSource.TryGetBatches(relation, out var batches))
         {
             throw new UnsupportedPlanException(
+                QueryExecutionStage.Scan,
                 $"No scan source is registered for relation '{string.Join('.', relation.Identifier)}'. "
                 + "The M1 data-in door is the in-memory relation fixture; the public read-door is STORY-04.1.2 (#158).");
         }
@@ -124,7 +125,7 @@ internal sealed class PhysicalPlanner
         // the first action's execution. The relation schema is authoritative.
         StructType schema = relation.Schema;
         IEnumerable<Row> data = relation.Data;
-        return new ScanPlan(schema, () => LocalRelationBatches.Build(schema, data));
+        return new ScanPlan(schema, token => LocalRelationBatches.Build(schema, data, token));
     }
 
     private PhysicalPlan PlanFilter(LogicalFilter filter, LogicalOutput outputs)

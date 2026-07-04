@@ -50,6 +50,18 @@ public sealed class SparkSession : IDisposable
     /// <summary>The configuration key selecting the recorded execution backend (DeltaSharp-specific).</summary>
     internal const string ExecutionBackendConfigKey = "spark.deltasharp.execution.backend";
 
+    /// <summary>The action-timeout key, in milliseconds (STORY-04.6.4 / #176); unset/&lt;=0 disables the timeout.</summary>
+    internal const string ExecutionTimeoutMsConfigKey = "spark.deltasharp.execution.timeoutMs";
+
+    /// <summary>The driver result row cap (STORY-04.6.4 / #176); unset/&lt;=0 is unbounded.</summary>
+    internal const string MaxResultRowsConfigKey = "spark.deltasharp.execution.maxResultRows";
+
+    /// <summary>The driver result byte cap (STORY-04.6.4 / #176); unset/&lt;=0 is unbounded.</summary>
+    internal const string MaxResultBytesConfigKey = "spark.deltasharp.execution.maxResultBytes";
+
+    /// <summary>The per-run operator memory budget in bytes (STORY-04.6.4 / #176); unset/&lt;=0 is unbounded.</summary>
+    internal const string MemoryBudgetBytesConfigKey = "spark.deltasharp.execution.memoryBudgetBytes";
+
     private const int StateActive = 0;
     private const int StateStopped = 1;
 
@@ -231,7 +243,7 @@ public sealed class SparkSession : IDisposable
     /// <remarks>
     /// This is a <b>transformation</b>: it builds a scan (<c>LocalRelation</c>) logical plan and
     /// <b>materializes no rows</b> — the sequence is not enumerated until an action
-    /// (<see cref="DataFrame.Collect"/>, <see cref="DataFrame.Count"/>, …) runs (STORY-04.1.2 / #158,
+    /// (<see cref="DataFrame.Collect()"/>, <see cref="DataFrame.Count()"/>, …) runs (STORY-04.1.2 / #158,
     /// AC1). The captured sequence is wrapped in a <b>memoizing snapshot</b>: the first action enumerates
     /// it once and caches an immutable snapshot, and every later action replays that same snapshot. So,
     /// like Spark's <c>createDataFrame(List, schema)</c>, all actions on the returned frame observe

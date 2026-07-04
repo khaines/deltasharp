@@ -1,3 +1,4 @@
+using System.Linq;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Engine.Execution;
 using DeltaSharp.Plans;
@@ -73,6 +74,26 @@ internal abstract class PhysicalPlan
                 $"{GetType().Name} could not build its EPIC-03 operator: {ex.Message}", ex);
         }
     }
+
+    /// <summary>
+    /// Whether <paramref name="plan"/> delivers <b>original source rows</b> to its parent without an
+    /// intervening row-producing operator — a <see cref="ScanPlan"/>, or a <c>Limit</c>/<c>Union</c>
+    /// bridge whose inputs all read source directly. The parent's <see cref="PhysicalRuntime.ScanOf"/>
+    /// over such a child is the genuine source read that <see cref="PhysicalRuntime.BytesScanned"/> counts
+    /// once. A child that is itself a mapped operator (Filter/Project/Aggregate/Join/Sort) already had its
+    /// source counted below it, so the parent's re-scan of that intermediate is excluded. This keeps
+    /// BytesScanned at the true source volume regardless of plan depth (no depth inflation), counts a
+    /// union of two sources as their sum, and never zeroes when a Limit/Union bridge sits between the scan
+    /// and the nearest operator (STORY-04.6.4 / #176 review).
+    /// </summary>
+    /// <param name="plan">The child plan to classify.</param>
+    /// <returns><see langword="true"/> if the child reads source rows directly; otherwise <see langword="false"/>.</returns>
+    internal static bool ReadsSourceDirectly(PhysicalPlan plan) => plan switch
+    {
+        ScanPlan => true,
+        LimitPlan or UnionPlan => plan.Children.Count > 0 && plan.Children.All(ReadsSourceDirectly),
+        _ => false,
+    };
 }
 
 /// <summary>A leaf scan over in-memory batches. The batches are supplied either eagerly (an
@@ -82,7 +103,7 @@ internal abstract class PhysicalPlan
 /// enumeration or I/O (STORY-04.1.2 / #158).</summary>
 internal sealed class ScanPlan : PhysicalPlan
 {
-    private readonly Func<IReadOnlyList<ColumnBatch>> _batchesFactory;
+    private readonly Func<CancellationToken, IReadOnlyList<ColumnBatch>> _batchesFactory;
     private IReadOnlyList<ColumnBatch>? _batches;
 
     /// <summary>Creates a scan over already-materialized <paramref name="batches"/>.</summary>
@@ -90,12 +111,14 @@ internal sealed class ScanPlan : PhysicalPlan
         : base(outputSchema)
     {
         _batches = batches ?? throw new ArgumentNullException(nameof(batches));
-        _batchesFactory = static () => throw new InvalidOperationException("Batches are already materialized.");
+        _batchesFactory = static _ => throw new InvalidOperationException("Batches are already materialized.");
     }
 
     /// <summary>Creates a scan whose batches are produced lazily by <paramref name="batchesFactory"/> on
-    /// first <see cref="Execute"/> (no enumeration/encoding happens at planning time).</summary>
-    public ScanPlan(StructType outputSchema, Func<IReadOnlyList<ColumnBatch>> batchesFactory)
+    /// first <see cref="Execute"/> (no enumeration/encoding happens at planning time). The factory receives
+    /// the run's effective cancellation token so a slow/large deferred source can be cancelled/timed out
+    /// while it drains (STORY-04.6.4 AC2).</summary>
+    public ScanPlan(StructType outputSchema, Func<CancellationToken, IReadOnlyList<ColumnBatch>> batchesFactory)
         : base(outputSchema)
     {
         _batchesFactory = batchesFactory ?? throw new ArgumentNullException(nameof(batchesFactory));
@@ -109,8 +132,9 @@ internal sealed class ScanPlan : PhysicalPlan
     /// <inheritdoc/>
     public override string SimpleString => $"Scan {PhysicalPlanText.Columns(OutputSchema)}";
 
-    public override BatchResult Execute(PhysicalRuntime runtime) =>
-        new(OutputSchema, _batches ??= _batchesFactory());
+    /// <inheritdoc/>
+    public override BatchResult Execute(PhysicalRuntime runtime)
+        => new(OutputSchema, _batches ??= _batchesFactory(runtime.CancellationToken));
 }
 
 /// <summary>Maps <c>Filter</c> to an EPIC-03 <see cref="FilterOperator"/>.</summary>
@@ -140,7 +164,7 @@ internal sealed class FilterPlan : PhysicalPlan
     public override BatchResult Execute(PhysicalRuntime runtime)
     {
         BatchResult child = _child.Execute(runtime);
-        PhysicalOperator op = BuildOperator(() => new FilterOperator(PhysicalRuntime.ScanOf(child), _predicate));
+        PhysicalOperator op = BuildOperator(() => new FilterOperator(runtime.ScanOf(child, ReadsSourceDirectly(_child)), _predicate));
         return new BatchResult(OutputSchema, runtime.Run(op));
     }
 }
@@ -174,7 +198,7 @@ internal sealed class ProjectPlan : PhysicalPlan
     {
         BatchResult child = _child.Execute(runtime);
         PhysicalOperator op = BuildOperator(
-            () => new ProjectOperator(PhysicalRuntime.ScanOf(child), OutputSchema, _projections));
+            () => new ProjectOperator(runtime.ScanOf(child, ReadsSourceDirectly(_child)), OutputSchema, _projections));
         return new BatchResult(OutputSchema, runtime.Run(op));
     }
 }
@@ -218,7 +242,7 @@ internal sealed class AggregatePlan : PhysicalPlan
     {
         BatchResult child = _child.Execute(runtime);
         PhysicalOperator op = BuildOperator(
-            () => new AggregateOperator(PhysicalRuntime.ScanOf(child), OutputSchema, _groupingKeys, _aggregates));
+            () => new AggregateOperator(runtime.ScanOf(child, ReadsSourceDirectly(_child)), OutputSchema, _groupingKeys, _aggregates));
         return new BatchResult(OutputSchema, runtime.Run(op));
     }
 }
@@ -270,8 +294,8 @@ internal sealed class JoinPlan : PhysicalPlan
         BatchResult left = _left.Execute(runtime);
         BatchResult right = _right.Execute(runtime);
         PhysicalOperator op = BuildOperator(() => new JoinOperator(
-            PhysicalRuntime.ScanOf(left),
-            PhysicalRuntime.ScanOf(right),
+            runtime.ScanOf(left, ReadsSourceDirectly(_left)),
+            runtime.ScanOf(right, ReadsSourceDirectly(_right)),
             OutputSchema,
             JoinType,
             _leftKeys,
@@ -311,7 +335,7 @@ internal sealed class SortPlan : PhysicalPlan
     {
         BatchResult child = _child.Execute(runtime);
         PhysicalOperator op = BuildOperator(
-            () => new SortOperator(PhysicalRuntime.ScanOf(child), _sortOrders, _global));
+            () => new SortOperator(runtime.ScanOf(child, ReadsSourceDirectly(_child)), _sortOrders, _global));
         return new BatchResult(OutputSchema, runtime.Run(op));
     }
 }
@@ -405,13 +429,13 @@ internal sealed class UnionPlan : PhysicalPlan
         foreach (PhysicalPlan child in _children)
         {
             BatchResult result = child.Execute(runtime);
-            batches.AddRange(Normalize(result, runtime));
+            batches.AddRange(Normalize(result, child, runtime));
         }
 
         return new BatchResult(OutputSchema, batches);
     }
 
-    private IReadOnlyList<ColumnBatch> Normalize(BatchResult result, PhysicalRuntime runtime)
+    private IReadOnlyList<ColumnBatch> Normalize(BatchResult result, PhysicalPlan childPlan, PhysicalRuntime runtime)
     {
         if (result.Schema.Equals(OutputSchema))
         {
@@ -442,7 +466,11 @@ internal sealed class UnionPlan : PhysicalPlan
             projections[i] = new ColumnReference(i, OutputSchema[i].DataType, OutputSchema[i].Nullable);
         }
 
-        var op = new ProjectOperator(PhysicalRuntime.ScanOf(result), OutputSchema, projections);
+        // The rename is an internal schema-normalization re-scan (identity projection), NOT a counted
+        // source read: whatever operator consumes the Union's output attributes the source bytes via its
+        // own ScanOf (ReadsSourceDirectly(union) is true when the branches read source directly), so
+        // marking this scan as source too would double-count the renamed branch.
+        var op = new ProjectOperator(runtime.ScanOf(result, readsSourceDirectly: false), OutputSchema, projections);
         return runtime.Run(op);
     }
 }

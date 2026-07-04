@@ -48,7 +48,7 @@ public sealed class DataFrame
 
     /// <summary>
     /// The session that owns this frame, or <see langword="null"/> for a session-free frame. Actions
-    /// (<see cref="Collect"/>/<see cref="Count"/>/<see cref="Show(int, bool)"/>) analyze and execute
+    /// (<see cref="Collect()"/>/<see cref="Count()"/>/<see cref="Show(int, bool)"/>) analyze and execute
     /// through it; transformations propagate it unchanged so a whole chain shares one session.
     /// </summary>
     internal SparkSession? Session { get; }
@@ -569,16 +569,67 @@ public sealed class DataFrame
     /// <exception cref="SessionStoppedException">The owning session has been stopped or disposed.</exception>
     /// <exception cref="QueryExecutionException">No execution backend is registered, or the backend
     /// reported a runtime failure.</exception>
-    public IReadOnlyList<Row> Collect()
+    public IReadOnlyList<Row> Collect() => Collect(CancellationToken.None);
+
+    /// <summary>
+    /// The cancellable overload of <see cref="Collect()"/> (STORY-04.6.4 / #176). Cancellation and any
+    /// session-configured timeout/limits are observed cooperatively between operator batches and result
+    /// rows; on cancel/timeout the local execution resources are released deterministically and an
+    /// <see cref="OperationCanceledException"/> (cancel) or <see cref="TimeoutException"/> (timeout) is
+    /// thrown before the result is returned.
+    /// </summary>
+    /// <param name="cancellationToken">A token that cooperatively cancels the action.</param>
+    /// <returns>The materialized <see cref="Row"/>s, in result order.</returns>
+    /// <exception cref="InvalidOperationException">This frame is not bound to a <see cref="SparkSession"/>.</exception>
+    /// <exception cref="SessionStoppedException">The owning session has been stopped or disposed.</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    /// <exception cref="TimeoutException">A configured execution timeout elapsed.</exception>
+    /// <exception cref="QueryExecutionException">No execution backend is registered, or the backend
+    /// reported a runtime failure; <see cref="QueryExecutionException.Stage"/> names the failed stage.</exception>
+    public IReadOnlyList<Row> Collect(CancellationToken cancellationToken)
     {
         SparkSession session = RequireSession(nameof(Collect));
         LogicalPlan analyzed = AnalyzeForExecution(session, Plan);
-        return session.QueryExecutor.Collect(analyzed);
+        return session.QueryExecutor.Collect(analyzed, ExecutionOptions.From(session, cancellationToken));
+    }
+
+    /// <summary>
+    /// The metrics-reporting overload of <see cref="Collect()"/> (STORY-04.6.4 criterion 4). Whether the
+    /// action succeeds OR throws (cancel/timeout/stage fault), <paramref name="metrics"/> receives the
+    /// planning + execution counters gathered so far — the executor fills a per-call sink in its own
+    /// <c>finally</c>, and this overload reads it in a <c>finally</c>, so partial metrics surface even on
+    /// the failure path (a wrapped fault also carries them on <see cref="QueryExecutionException.Metrics"/>).
+    /// </summary>
+    /// <param name="metrics">The planning + execution counters for this action, populated on success and on failure alike.</param>
+    /// <param name="cancellationToken">A token that cooperatively cancels the action.</param>
+    /// <returns>The materialized <see cref="Row"/>s, in result order.</returns>
+    /// <exception cref="InvalidOperationException">This frame is not bound to a <see cref="SparkSession"/>.</exception>
+    /// <exception cref="SessionStoppedException">The owning session has been stopped or disposed.</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    /// <exception cref="TimeoutException">A configured execution timeout elapsed.</exception>
+    /// <exception cref="QueryExecutionException">No execution backend is registered, or the backend
+    /// reported a runtime failure; <see cref="QueryExecutionException.Stage"/> names the failed stage.</exception>
+    public IReadOnlyList<Row> Collect(out ExecutionMetrics metrics, CancellationToken cancellationToken = default)
+    {
+        SparkSession session = RequireSession(nameof(Collect));
+        LogicalPlan analyzed = AnalyzeForExecution(session, Plan);
+        ExecutionOptions options = ExecutionOptions.From(session, cancellationToken);
+        var sink = new ExecutionMetricsSink();
+        try
+        {
+            return session.QueryExecutor.Collect(analyzed, options, sink);
+        }
+        finally
+        {
+            // Read the sink in a finally so metrics surface even when the action throws (cancel/timeout/
+            // fault): the executor fills the sink in its own finally with the partial counters (#176 #4/#5).
+            metrics = sink.Metrics ?? ExecutionMetrics.Empty;
+        }
     }
 
     /// <summary>
     /// Executes the query and returns the number of rows in the result, mirroring Spark's
-    /// <c>Dataset.count()</c>. Like <see cref="Collect"/> this is an <b>action</b>: it analyzes, runs
+    /// <c>Dataset.count()</c>. Like <see cref="Collect()"/> this is an <b>action</b>: it analyzes, runs
     /// the optimizer seam (an identity pass in M1), and drives the backend exactly once, without
     /// materializing the rows.
     /// </summary>
@@ -589,11 +640,60 @@ public sealed class DataFrame
     /// <exception cref="SessionStoppedException">The owning session has been stopped or disposed.</exception>
     /// <exception cref="QueryExecutionException">No execution backend is registered, or the backend
     /// reported a runtime failure.</exception>
-    public long Count()
+    public long Count() => Count(CancellationToken.None);
+
+    /// <summary>
+    /// The cancellable overload of <see cref="Count()"/> (STORY-04.6.4 / #176). Cancellation and any
+    /// session-configured timeout are observed cooperatively between operator batches; on cancel/timeout
+    /// local resources are released deterministically and an <see cref="OperationCanceledException"/> or
+    /// <see cref="TimeoutException"/> is thrown.
+    /// </summary>
+    /// <param name="cancellationToken">A token that cooperatively cancels the action.</param>
+    /// <returns>The number of result rows.</returns>
+    /// <exception cref="InvalidOperationException">This frame is not bound to a <see cref="SparkSession"/>.</exception>
+    /// <exception cref="SessionStoppedException">The owning session has been stopped or disposed.</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    /// <exception cref="TimeoutException">A configured execution timeout elapsed.</exception>
+    /// <exception cref="QueryExecutionException">No execution backend is registered, or the backend
+    /// reported a runtime failure; <see cref="QueryExecutionException.Stage"/> names the failed stage.</exception>
+    public long Count(CancellationToken cancellationToken)
     {
         SparkSession session = RequireSession(nameof(Count));
         LogicalPlan analyzed = AnalyzeForExecution(session, Plan);
-        return session.QueryExecutor.Count(analyzed);
+        return session.QueryExecutor.Count(analyzed, ExecutionOptions.From(session, cancellationToken));
+    }
+
+    /// <summary>
+    /// The metrics-reporting overload of <see cref="Count()"/> (STORY-04.6.4 criterion 4). Whether the
+    /// action succeeds OR throws (cancel/timeout/stage fault), <paramref name="metrics"/> receives the
+    /// planning + execution counters gathered so far (the executor fills a per-call sink in a
+    /// <c>finally</c>); a wrapped fault also carries them on <see cref="QueryExecutionException.Metrics"/>.
+    /// </summary>
+    /// <param name="metrics">The planning + execution counters for this action, populated on success and on failure alike.</param>
+    /// <param name="cancellationToken">A token that cooperatively cancels the action.</param>
+    /// <returns>The number of result rows.</returns>
+    /// <exception cref="InvalidOperationException">This frame is not bound to a <see cref="SparkSession"/>.</exception>
+    /// <exception cref="SessionStoppedException">The owning session has been stopped or disposed.</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    /// <exception cref="TimeoutException">A configured execution timeout elapsed.</exception>
+    /// <exception cref="QueryExecutionException">No execution backend is registered, or the backend
+    /// reported a runtime failure; <see cref="QueryExecutionException.Stage"/> names the failed stage.</exception>
+    public long Count(out ExecutionMetrics metrics, CancellationToken cancellationToken = default)
+    {
+        SparkSession session = RequireSession(nameof(Count));
+        LogicalPlan analyzed = AnalyzeForExecution(session, Plan);
+        ExecutionOptions options = ExecutionOptions.From(session, cancellationToken);
+        var sink = new ExecutionMetricsSink();
+        try
+        {
+            return session.QueryExecutor.Count(analyzed, options, sink);
+        }
+        finally
+        {
+            // Read the sink in a finally so metrics surface even when the action throws (cancel/timeout/
+            // fault): the executor fills the sink in its own finally with the partial counters (#176 #4/#5).
+            metrics = sink.Metrics ?? ExecutionMetrics.Empty;
+        }
     }
 
     /// <summary>
@@ -706,7 +806,8 @@ public sealed class DataFrame
             session,
             new Limit(bound, Plan),
             out IReadOnlyList<(string Name, DataType Type, bool Nullable)> outputColumns);
-        IReadOnlyList<Row> collected = session.QueryExecutor.Collect(analyzed);
+        IReadOnlyList<Row> collected = session.QueryExecutor.Collect(
+            analyzed, ExecutionOptions.From(session, CancellationToken.None));
 
         bool hasMoreData = collected.Count > numRows;
         int displayCount = Math.Min(collected.Count, numRows);
@@ -741,7 +842,7 @@ public sealed class DataFrame
     }
 
     /// <summary>
-    /// The eager analyze (and optimize) stage shared by <see cref="Collect"/>/<see cref="Count"/>: it
+    /// The eager analyze (and optimize) stage shared by <see cref="Collect()"/>/<see cref="Count()"/>: it
     /// resolves <paramref name="plan"/> against the session catalog (emitting the #169 audit's Analyzer
     /// stage) and then runs the optimizer seam, returning the plan the executor runs. It does not
     /// materialize the output schema — the collect/count contract needs only the executor's rows.
