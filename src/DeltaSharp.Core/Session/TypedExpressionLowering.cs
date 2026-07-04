@@ -174,18 +174,28 @@ internal static class TypedExpressionLowering
             case ExpressionType.OrElse:
                 return left.Or(right);
 
+            // C# compiles string concatenation (`p.StrVal + "b"`) to an Add node whose result type is
+            // string and whose Method is string.Concat — NOT a numeric add. Every arithmetic arm below
+            // therefore requires numeric operands/result first, so a string concat (or any non-numeric
+            // operand) is rejected deterministically instead of being silently lowered to a numeric
+            // Plus that would execute as CAST(...) + CAST(...) — a silent wrong plan.
             case ExpressionType.Add:
             case ExpressionType.AddChecked:
+                RequireNumericArithmetic(binary);
                 return left.Plus(right);
             case ExpressionType.Subtract:
             case ExpressionType.SubtractChecked:
+                RequireNumericArithmetic(binary);
                 return left.Minus(right);
             case ExpressionType.Multiply:
             case ExpressionType.MultiplyChecked:
+                RequireNumericArithmetic(binary);
                 return left.Multiply(right);
             case ExpressionType.Divide:
+                RequireNumericArithmetic(binary);
                 return left.Divide(right);
             case ExpressionType.Modulo:
+                RequireNumericArithmetic(binary);
                 return left.Mod(right);
 
             default:
@@ -204,6 +214,42 @@ internal static class TypedExpressionLowering
                 + "Bitwise operators are not supported (M1); use the boolean short-circuit operators "
                 + "'&&'/'||' for logical predicates.");
         }
+    }
+
+    // Guards the arithmetic arms (+, -, *, /, %). C# reuses the Add node kind for string concatenation
+    // (`p.StrVal + "b"` -> Add with result type string, Method string.Concat) and can build arithmetic
+    // nodes over non-numeric operands; lowering those to a numeric Plus/Minus/... would silently emit a
+    // wrong plan (CAST both operands to Double). DeltaSharp M1 has no string-concat lowering, so a
+    // non-numeric arithmetic node is rejected deterministically — consistent with how bitwise
+    // `&`/`|` is handled by RequireBooleanLogical.
+    private static void RequireNumericArithmetic(BinaryExpression binary)
+    {
+        if (IsStringType(binary.Type) || IsStringType(binary.Left.Type) || IsStringType(binary.Right.Type))
+        {
+            throw new UnsupportedTypedExpressionException(
+                $"Unsupported operator '{binary.NodeType}' in a Dataset<T> lambda: '{binary}'. "
+                + "String concatenation is not supported (M1).");
+        }
+
+        if (!IsNumericType(binary.Type) || !IsNumericType(binary.Left.Type) || !IsNumericType(binary.Right.Type))
+        {
+            throw new UnsupportedTypedExpressionException(
+                $"Unsupported arithmetic operator '{binary.NodeType}' on non-numeric operands in a "
+                + $"Dataset<T> lambda: '{binary}'. Arithmetic (+, -, *, /, %) requires numeric operands.");
+        }
+    }
+
+    private static bool IsStringType(Type type) => (Nullable.GetUnderlyingType(type) ?? type) == typeof(string);
+
+    private static bool IsNumericType(Type type)
+    {
+        Type underlying = Nullable.GetUnderlyingType(type) ?? type;
+        return underlying == typeof(sbyte) || underlying == typeof(byte)
+            || underlying == typeof(short) || underlying == typeof(ushort)
+            || underlying == typeof(int) || underlying == typeof(uint)
+            || underlying == typeof(long) || underlying == typeof(ulong)
+            || underlying == typeof(float) || underlying == typeof(double)
+            || underlying == typeof(decimal);
     }
 
     // Reads a parameter-independent subtree to a value WITHOUT compiling or executing the lambda: a
@@ -280,22 +326,40 @@ internal static class TypedExpressionLowering
             throw Unfoldable(node);
         }
 
-        return (left, right) switch
+        try
         {
-            (int a, int b) => Arithmetic(op, a, b, node),
-            (long a, long b) => Arithmetic(op, a, b, node),
-            (double a, double b) => Arithmetic(op, a, b, node),
-            (float a, float b) => Arithmetic(op, a, b, node),
-            (decimal a, decimal b) => Arithmetic(op, a, b, node),
-            _ => throw Unfoldable(node),
-        };
+            return (left, right) switch
+            {
+                (int a, int b) => Arithmetic(op, a, b, node),
+                (long a, long b) => Arithmetic(op, a, b, node),
+                (double a, double b) => Arithmetic(op, a, b, node),
+                (float a, float b) => Arithmetic(op, a, b, node),
+                (decimal a, decimal b) => Arithmetic(op, a, b, node),
+                _ => throw Unfoldable(node),
+            };
+        }
+        catch (OverflowException ex)
+        {
+            // A `checked(...)` subtree explicitly requested overflow protection; honoring it here (see
+            // the *Checked arms below) means the fold throws rather than silently wrapping. Surface it
+            // as the deterministic translation-time diagnostic instead of a raw arithmetic error.
+            throw new UnsupportedTypedExpressionException(
+                $"The parameter-independent checked expression '{node}' overflows at translation time; "
+                + "it cannot be folded to a constant.", ex);
+        }
     }
 
+    // The unchecked arms honor DeltaSharp.Core's default `unchecked` compile context (plain `+`); the
+    // *Checked arms evaluate in an explicit `checked(...)` context so a `checked(int.MaxValue + 1)`
+    // subtree throws OverflowException (surfaced by ApplyArithmetic) instead of silently wrapping.
     private static int Arithmetic(ExpressionType op, int a, int b, Expression node) => op switch
     {
-        ExpressionType.Add or ExpressionType.AddChecked => a + b,
-        ExpressionType.Subtract or ExpressionType.SubtractChecked => a - b,
-        ExpressionType.Multiply or ExpressionType.MultiplyChecked => a * b,
+        ExpressionType.Add => unchecked(a + b),
+        ExpressionType.AddChecked => checked(a + b),
+        ExpressionType.Subtract => unchecked(a - b),
+        ExpressionType.SubtractChecked => checked(a - b),
+        ExpressionType.Multiply => unchecked(a * b),
+        ExpressionType.MultiplyChecked => checked(a * b),
         ExpressionType.Divide => a / b,
         ExpressionType.Modulo => a % b,
         _ => throw Unfoldable(node),
@@ -303,9 +367,12 @@ internal static class TypedExpressionLowering
 
     private static long Arithmetic(ExpressionType op, long a, long b, Expression node) => op switch
     {
-        ExpressionType.Add or ExpressionType.AddChecked => a + b,
-        ExpressionType.Subtract or ExpressionType.SubtractChecked => a - b,
-        ExpressionType.Multiply or ExpressionType.MultiplyChecked => a * b,
+        ExpressionType.Add => unchecked(a + b),
+        ExpressionType.AddChecked => checked(a + b),
+        ExpressionType.Subtract => unchecked(a - b),
+        ExpressionType.SubtractChecked => checked(a - b),
+        ExpressionType.Multiply => unchecked(a * b),
+        ExpressionType.MultiplyChecked => checked(a * b),
         ExpressionType.Divide => a / b,
         ExpressionType.Modulo => a % b,
         _ => throw Unfoldable(node),

@@ -162,6 +162,54 @@ public sealed class DatasetTypedLoweringTests
         Assert.Contains("Assign it to a local variable", ex.Message);
     }
 
+    // ----- Finding 2: `checked(...)` constant folding honors overflow protection -----
+
+    [Fact]
+    public void CheckedOverflowingConstantFold_ThrowsDeterministicDiagnostic()
+    {
+        int max = int.MaxValue;
+
+        // `checked(max + 1)` is a parameter-independent AddChecked subtree the user explicitly asked to
+        // overflow-guard. Folding it must THROW rather than silently wrap to int.MinValue
+        // (-2147483648) and emit `('Age' > -2147483648)` — a silent wrong plan.
+        var ex = Assert.Throws<UnsupportedTypedExpressionException>(
+            () => Lower(p => p.Age > checked(max + 1)));
+
+        Assert.Contains("overflows at translation time", ex.Message);
+        Assert.IsType<OverflowException>(ex.InnerException);
+    }
+
+    [Fact]
+    public void CheckedOverflowingConstantFold_DoesNotSilentlyWrap()
+    {
+        int max = int.MaxValue;
+
+        // Mutation-sensitive: if the fold used plain (unchecked) `a + b` it would return the wrapped
+        // literal int.MinValue and lowering would SUCCEED with `('Age' > -2147483648)`. Prove it never
+        // does by confirming lowering throws and produces no column.
+        Column? lowered = null;
+        Assert.Throws<UnsupportedTypedExpressionException>(
+            () => lowered = Lower(p => p.Age > checked(max + 1)));
+        Assert.Null(lowered);
+
+        // The wrapped constant that a silent mis-fold would have produced:
+        Assert.NotEqual(
+            Functions.Col("Age").Gt(Functions.Lit(unchecked(int.MaxValue + 1))).Expr,
+            (lowered ?? Functions.Col("Age")).Expr);
+    }
+
+    [Fact]
+    public void CheckedNonOverflowingConstantFold_StillFoldsToConstant()
+    {
+        int one = 1;
+
+        // A non-overflowing `checked(one + 1)` must still fold to Lit(2) — the checked guard only
+        // rejects genuine overflow, not all checked arithmetic.
+        Column lowered = Lower(p => p.Age > checked(one + 1));
+
+        Assert.Equal(Functions.Col("Age").Gt(Functions.Lit(2)).Expr, lowered.Expr);
+    }
+
     // ----- Item 10: arithmetic operators lower structurally (mutation-sensitive) -----
 
     [Theory]
@@ -181,6 +229,42 @@ public sealed class DatasetTypedLoweringTests
         { p => p.Age / 2, Functions.Col("Age").Divide(Functions.Lit(2)) },
         { p => p.Age % 2, Functions.Col("Age").Mod(Functions.Lit(2)) },
     };
+
+    // ----- Finding 1: string concatenation `+` is rejected, never mis-lowered to numeric Plus -----
+
+    [Fact]
+    public void StringConcatenation_ThrowsDeterministicDiagnostic()
+    {
+        // C# compiles `p.Name + "b"` to an ExpressionType.Add node (Method == string.Concat, result
+        // type string). It must NOT lower to a numeric Plus (which would execute as
+        // CAST(Name AS Double) + CAST("b" AS Double)) — reject it deterministically instead.
+        var ex = Assert.Throws<UnsupportedTypedExpressionException>(
+            () => LowerSelect(p => p.Name + "b"));
+
+        Assert.Contains("String concatenation is not supported", ex.Message);
+    }
+
+    [Fact]
+    public void StringConcatenation_DoesNotLowerToNumericPlus()
+    {
+        // Mutation-sensitive: if the numeric guard were removed the Add arm would silently produce a
+        // `Plus(Col("Name"), Lit("b"))` tree. Prove it never does by confirming lowering throws rather
+        // than returning that (or any) column.
+        Column? lowered = null;
+        Assert.Throws<UnsupportedTypedExpressionException>(
+            () => lowered = LowerSelect(p => p.Name + "b"));
+        Assert.Null(lowered);
+    }
+
+    [Fact]
+    public void NumericAddition_StillLowersToArithmeticPlus_NoRegression()
+    {
+        // The numeric guard must not regress genuine numeric arithmetic: `p.Age + 1` still lowers to
+        // the arithmetic Plus op.
+        Column lowered = LowerSelect(p => p.Age + 1);
+
+        Assert.Equal(Functions.Col("Age").Plus(Functions.Lit(1)).Expr, lowered.Expr);
+    }
 
     // ----- Item 10: boolean operators lower structurally (mutation-sensitive) -----
 
