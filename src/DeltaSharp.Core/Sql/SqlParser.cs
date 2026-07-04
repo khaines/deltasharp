@@ -116,6 +116,16 @@ internal sealed class SqlParser
         SqlToken fromToken = Current;
         if (fromToken.Kind != SqlTokenKind.From)
         {
+            // A recognizable clause/statement keyword standing where FROM is expected ('SELECT a
+            // LIMIT 10', 'SELECT a GROUP BY b') is a named UnsupportedFeature, not an opaque token
+            // error. ParseSelectItem deliberately leaves such an unquoted keyword unconsumed (it is
+            // not an implicit alias) precisely so it surfaces here with the right diagnostic.
+            string? unsupported = MapTrailingConstruct(fromToken) ?? MapStatementKeyword(fromToken);
+            if (unsupported is not null)
+            {
+                throw SqlParseException.Unsupported(unsupported, fromToken.Position);
+            }
+
             throw SqlParseException.Syntax(
                 fromToken.Kind == SqlTokenKind.EndOfInput
                     ? "expected FROM but found end of input"
@@ -219,8 +229,15 @@ internal sealed class SqlParser
             return new Alias(expr, ExpectAliasName());
         }
 
-        // Implicit alias: 'SELECT a b' aliases 'a' as 'b' (Spark parity).
-        if (Current.Kind == SqlTokenKind.Identifier)
+        // Implicit alias: 'SELECT a b' aliases 'a' as 'b' (Spark parity). An unquoted clause/statement
+        // keyword (LIMIT/GROUP/ORDER/HAVING/JOIN/UNION/…) is NOT an implicit alias: leaving it
+        // unconsumed lets the clause-position diagnostic name it as an UnsupportedFeature ('SELECT a
+        // LIMIT 10') instead of eating it as 'a AS LIMIT' and then failing on the following token with
+        // a misleading error. A *quoted* '`limit`' is a delimited literal name and remains a valid
+        // implicit alias (MapTrailingConstruct/MapStatementKeyword ignore quoted identifiers).
+        if (Current.Kind == SqlTokenKind.Identifier
+            && MapTrailingConstruct(Current) is null
+            && MapStatementKeyword(Current) is null)
         {
             string alias = Current.Text;
             Advance();

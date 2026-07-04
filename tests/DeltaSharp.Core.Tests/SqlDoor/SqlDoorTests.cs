@@ -550,8 +550,9 @@ public sealed class SqlDoorTests
     {
         using SparkSession spark = NewSession();
 
-        // '`is`' on the right of '=' is a delimited identifier — a column named 'is'. Sentinel:
-        // without the IsQuoted guard MapPredicateKeyword throws UnsupportedFeature(IS_NULL) instead.
+        // '`is`' on the right of '=' is a delimited identifier — a column named 'is' — parsed as an
+        // ordinary operand (this OPERAND position never reaches MapPredicateKeyword; the guard on that
+        // hook is exercised by Sql_QuotedKeywordInKeywordPosition_IsNotTreatedAsKeyword below).
         DataFrame df = spark.Sql("SELECT a FROM t WHERE a = `is`");
 
         var filter = (Filter)((Project)df.Plan).Child;
@@ -588,8 +589,9 @@ public sealed class SqlDoorTests
     {
         using SparkSession spark = NewSession();
 
-        // 'NOT `in`' — the delimited '`in`' is a column name, so NOT is a leading boolean negation of
-        // the column, NOT the NOT_IN predicate. Sentinel: without the guard this throws NOT_IN.
+        // Leading 'NOT `in`' — the delimited '`in`' is a column name, so NOT is a boolean negation of
+        // the column (the ParseNot path), NOT the NOT_IN predicate. (The NOT-in-predicate-slot guard on
+        // MapNotPredicateKeyword is exercised by Sql_QuotedKeywordInKeywordPosition_IsNotTreatedAsKeyword.)
         DataFrame df = spark.Sql("SELECT a FROM t WHERE NOT `in`");
 
         var filter = (Filter)((Project)df.Plan).Child;
@@ -609,6 +611,48 @@ public sealed class SqlDoorTests
         Expression only = Assert.Single(project.ProjectList);
         var attribute = Assert.IsType<UnresolvedAttribute>(only);
         Assert.Equal(new[] { "a.b" }, attribute.NameParts);
+    }
+
+    [Theory]
+    // A backtick-quoted keyword sitting in the very slot the parser scans for a keyword must be treated
+    // as a delimited identifier, so the keyword hook does NOT fire and the token is left as an ordinary
+    // name — yielding an opaque SyntaxError (null Construct) here, never a named UnsupportedFeature.
+    // Mutation sentinel: dropping the `IsQuoted` guard at the named site reclassifies each case as
+    // UnsupportedFeature(<construct>) with a non-null Construct (proving the guard is load-bearing).
+    [InlineData("SELECT a FROM t WHERE a `is` b")]        // MapPredicateKeyword (IS/IN/LIKE/BETWEEN slot)
+    [InlineData("SELECT a FROM t WHERE a `like` b")]      // MapPredicateKeyword
+    [InlineData("SELECT a FROM t WHERE a NOT `in` (1)")]  // MapNotPredicateKeyword (NOT <pred> slot)
+    [InlineData("`insert` a")]                            // MapStatementKeyword (leading statement slot)
+    [InlineData("SELECT a FROM t `limit` 5")]             // MapTrailingConstruct (trailing clause slot)
+    public void Sql_QuotedKeywordInKeywordPosition_IsNotTreatedAsKeyword(string sql)
+    {
+        using SparkSession spark = NewSession();
+        spark.QueryExecutor = new ThrowingQueryExecutor();
+
+        SqlParseException ex = Assert.Throws<SqlParseException>(() => spark.Sql(sql));
+
+        Assert.Equal(SqlParseErrorKind.SyntaxError, ex.ErrorKind);
+        Assert.Null(ex.Construct);
+    }
+
+    [Theory]
+    [InlineData("SELECT a LIMIT 10", "LIMIT")]
+    [InlineData("SELECT a GROUP BY a", "GROUP_BY")]
+    [InlineData("SELECT a ORDER BY a", "ORDER_BY")]
+    public void Sql_ClauseKeywordInsteadOfFrom_NamesUnsupportedConstruct_NotOpaqueTokenError(
+        string sql, string expectedConstruct)
+    {
+        using SparkSession spark = NewSession();
+        spark.QueryExecutor = new ThrowingQueryExecutor();
+
+        // Regression for the LIMIT-eaten-as-implicit-alias diagnostic gap: an UNQUOTED clause keyword
+        // standing where FROM is expected is a named UnsupportedFeature, not 'expected FROM but found
+        // <next token>'. Sentinel: if ParseSelectItem consumed the keyword as an implicit alias
+        // ('a AS LIMIT') the parser would fail later with an opaque SyntaxError on the following token.
+        SqlParseException ex = Assert.Throws<SqlParseException>(() => spark.Sql(sql));
+
+        Assert.Equal(SqlParseErrorKind.UnsupportedFeature, ex.ErrorKind);
+        Assert.Equal(expectedConstruct, ex.Construct);
     }
 
     // ---------------- AC3: multipart references converge across both front-ends (item 5) ----------------
