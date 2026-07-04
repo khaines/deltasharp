@@ -139,27 +139,41 @@ internal sealed class SqlParser
 
     private void RejectSetQuantifier()
     {
-        if (Current.Kind != SqlTokenKind.Identifier)
+        // At most ONE leading set quantifier is allowed after SELECT. ALL is the DEFAULT quantifier
+        // (Spark parity): 'SELECT ALL a' means 'SELECT a'. Consume and ignore it — but only when a
+        // select item actually follows, so a column literally named 'all' ('SELECT all FROM t') is
+        // still parsed as a column reference.
+        bool consumedAll = false;
+        if (IsSetQuantifier("ALL") && StartsSelectItem(Peek(1)))
         {
-            return;
+            Advance();
+            consumedAll = true;
         }
 
-        // DISTINCT as a set quantifier immediately after SELECT is recognizable SQL the M1 door does
-        // not implement (DISTINCT needs the Distinct operator + dedup semantics).
-        if (string.Equals(Current.Text, "DISTINCT", System.StringComparison.OrdinalIgnoreCase))
+        // DISTINCT as a set quantifier is recognizable SQL the M1 door does not implement (DISTINCT
+        // needs the Distinct operator + dedup semantics). Reject it whether it leads the select list
+        // ('SELECT DISTINCT a') or follows a consumed ALL ('SELECT ALL DISTINCT a'). In the latter
+        // case it must be in quantifier position (another select item follows) so it never slips
+        // through ParseSelectList as an implicitly-aliased column reference.
+        if (IsSetQuantifier("DISTINCT") && (!consumedAll || StartsSelectItem(Peek(1))))
         {
             throw SqlParseException.Unsupported("SELECT_DISTINCT", Current.Position);
         }
 
-        // ALL is the DEFAULT set quantifier (Spark parity): 'SELECT ALL a' means 'SELECT a'. Consume
-        // and ignore it — but only when a select item actually follows, so a column literally named
-        // 'all' ('SELECT all FROM t') is still parsed as a column reference.
-        if (string.Equals(Current.Text, "ALL", System.StringComparison.OrdinalIgnoreCase)
-            && StartsSelectItem(Peek(1)))
+        // A SECOND set quantifier after a consumed ALL ('SELECT ALL ALL a') is malformed: SQL allows
+        // at most one leading set quantifier. Guard it explicitly so it cannot be mis-parsed as an
+        // implicitly-aliased column ('ALL' aliased to the following item).
+        if (consumedAll && IsSetQuantifier("ALL") && StartsSelectItem(Peek(1)))
         {
-            Advance();
+            throw SqlParseException.Syntax(
+                "duplicate set quantifier after SELECT; at most one of ALL or DISTINCT is allowed",
+                Current.Position);
         }
     }
+
+    private bool IsSetQuantifier(string keyword) =>
+        Current.Kind == SqlTokenKind.Identifier
+        && string.Equals(Current.Text, keyword, System.StringComparison.OrdinalIgnoreCase);
 
     private static bool StartsSelectItem(SqlToken token) =>
         token.Kind is not (SqlTokenKind.From
@@ -328,6 +342,18 @@ internal sealed class SqlParser
     private Expression ParseComparison()
     {
         Expression left = ParseAdditive();
+
+        // A predicate-position NOT prefixing IN/LIKE/BETWEEN ('a NOT IN (…)') is a recognizable-but-
+        // unsupported predicate. NOT is a keyword token, so it would otherwise escape the identifier-
+        // based MapPredicateKeyword hook below and be left trailing after the query as an opaque
+        // "unexpected 'NOT'" SyntaxError — surface the named UnsupportedFeature hint here instead.
+        // (A LEADING boolean NOT — 'WHERE NOT a = b' — is consumed by ParseNot before reaching here,
+        // so this never intercepts logical negation.)
+        string? negatedPredicate = MapNotPredicateKeyword(Current, Peek(1));
+        if (negatedPredicate is not null)
+        {
+            throw SqlParseException.Unsupported(negatedPredicate, Current.Position);
+        }
 
         // Recognizable-but-unsupported predicates (IS [NOT] NULL, IN, LIKE, BETWEEN) surface here as a
         // named UnsupportedFeature rather than as a misleading trailing-token SyntaxError.
@@ -628,6 +654,22 @@ internal sealed class SqlParser
             "IN" => "IN",
             "LIKE" => "LIKE",
             "BETWEEN" => "BETWEEN",
+            _ => null,
+        };
+    }
+
+    private static string? MapNotPredicateKeyword(SqlToken notToken, SqlToken next)
+    {
+        if (notToken.Kind != SqlTokenKind.Not || next.Kind != SqlTokenKind.Identifier)
+        {
+            return null;
+        }
+
+        return next.Text.ToUpperInvariant() switch
+        {
+            "IN" => "NOT_IN",
+            "LIKE" => "NOT_LIKE",
+            "BETWEEN" => "NOT_BETWEEN",
             _ => null,
         };
     }

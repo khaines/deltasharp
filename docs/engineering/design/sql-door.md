@@ -131,7 +131,9 @@ identifier     := unquotedIdent | '`' backtickIdent '`'
 `selectItem` allows a bare `*` (or a qualified `t.*`) **per item**, so `*` may be mixed with columns
 (e.g. `SELECT *, a`), matching the parser. `SELECT ALL …` is accepted — `ALL` is the default set
 quantifier and is consumed and ignored (`SELECT ALL a` ≡ `SELECT a`, Spark parity); `SELECT DISTINCT`
-is a named `UnsupportedFeature`. `FROM` is **required** in M1 (a bare `SELECT 1`, which Spark accepts,
+is a named `UnsupportedFeature`. At most **one** leading set quantifier is allowed, so a second one
+(`SELECT ALL DISTINCT a`, `SELECT DISTINCT ALL a`, `SELECT ALL ALL a`) is rejected rather than
+mis-parsed as an implicitly-aliased column. `FROM` is **required** in M1 (a bare `SELECT 1`, which Spark accepts,
 is a `SyntaxError` here — a data-source-free `SELECT` needs the one-row relation the table door adds
 later).
 
@@ -223,12 +225,13 @@ stable and catchable (`SqlParseException.cs`).
 | `LIMIT` / `OFFSET` / `WINDOW`          | `UnsupportedFeature`| `LIMIT` / `OFFSET` / `WINDOW`               | `ExpectEnd`                    |
 | `UNION` / `INTERSECT` / `EXCEPT`       | `UnsupportedFeature`| `UNION`                                     | `ExpectEnd`                    |
 | `CLUSTER/DISTRIBUTE/SORT BY`           | `UnsupportedFeature`| `SORT_BY`                                   | `ExpectEnd`                    |
-| `SELECT DISTINCT …`                    | `UnsupportedFeature`| `SELECT_DISTINCT`                           | `RejectSetQuantifier`          |
+| `SELECT DISTINCT …`, duplicate quantifier | `UnsupportedFeature`/`SyntaxError`| `SELECT_DISTINCT` / `null`      | `RejectSetQuantifier`          |
 | `count(a)`, any `name(...)`            | `UnsupportedFeature`| `FUNCTION_CALL`                             | `ParseColumnReference`         |
 | `FROM (SELECT …)`, `(SELECT …)` operand| `UnsupportedFeature`| `SUBQUERY`                                  | `ParseRelation`/`ParsePrimary` |
 | `-a`, `-(expr)` (general negation)     | `UnsupportedFeature`| `UNARY_MINUS`                               | `ParseUnary`                   |
 | integer literal beyond `long` range    | `UnsupportedFeature`| `DECIMAL_LITERAL`                           | `ParseNumericLiteral`          |
 | `IS [NOT] NULL` / `IN` / `LIKE` / `BETWEEN` | `UnsupportedFeature`| `IS_NULL` / `IN` / `LIKE` / `BETWEEN`  | `ParseComparison`              |
+| `NOT IN` / `NOT LIKE` / `NOT BETWEEN`  | `UnsupportedFeature`| `NOT_IN` / `NOT_LIKE` / `NOT_BETWEEN`       | `ParseComparison`              |
 | `INSERT/UPDATE/DELETE/MERGE`           | `UnsupportedFeature`| `INSERT` / `UPDATE` / …                     | `MapStatementKeyword`          |
 | `CREATE/DROP/ALTER/TRUNCATE/…`         | `UnsupportedFeature`| `CREATE` / `DROP` / …                       | `MapStatementKeyword`          |
 | `WITH`, `VALUES`, `SHOW`, `EXPLAIN`, … | `UnsupportedFeature`| `CTE` / `VALUES` / `SHOW` / `EXPLAIN` / …   | `MapStatementKeyword`          |
@@ -287,7 +290,10 @@ session throws `SessionStoppedException`, not `ArgumentNullException` (asserted 
   **caught** `SqlParseException` (never a `StackOverflowException` or the internal
   `PlanDepthExceededException`), while moderate nesting still parses.
 - **Comments & quantifier:** `--`/`/* */` comments are skipped (`1--1` is `SELECT 1`, not arithmetic);
-  `SELECT ALL a` ≡ `SELECT a` while a column named `all` still parses as a column.
+  `SELECT ALL a` ≡ `SELECT a` while a column named `all` still parses as a column; a duplicate leading
+  set quantifier (`SELECT ALL DISTINCT a`) is rejected, not mis-parsed. `NOT IN`/`NOT LIKE`/`NOT BETWEEN`
+  surface the named `UnsupportedFeature` (`NOT_IN`/`NOT_LIKE`/`NOT_BETWEEN`), while `WHERE NOT a = b`
+  still parses as boolean negation.
 - **AC4 (lifecycle):** a stopped session throws `SessionStoppedException` from `Sql` with the same
   `ForMember` message model as `Read`, and the guard precedes the null check.
 

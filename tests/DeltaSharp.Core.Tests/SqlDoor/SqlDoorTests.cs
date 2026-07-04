@@ -401,6 +401,77 @@ public sealed class SqlDoorTests
         Assert.Equal(new[] { "all" }, attribute.NameParts);
     }
 
+    [Fact]
+    public void Sql_SelectAllDistinct_IsRejected_NotMisParsedAsAliasedColumn()
+    {
+        using SparkSession spark = NewSession();
+        spark.QueryExecutor = new ThrowingQueryExecutor();
+
+        // A leading ALL is consumed as the default quantifier, but a following DISTINCT is a SECOND
+        // set quantifier — it must be rejected, never mis-parsed as a column 'DISTINCT' implicitly
+        // aliased to 'a'. Mutation sentinel: dropping the post-ALL DISTINCT guard would let this
+        // parse into a wrong Project ['DISTINCT AS a] plan instead of throwing.
+        SqlParseException ex = Assert.Throws<SqlParseException>(() => spark.Sql("SELECT ALL DISTINCT a FROM t"));
+
+        Assert.Equal(SqlParseErrorKind.UnsupportedFeature, ex.ErrorKind);
+        Assert.Equal("SELECT_DISTINCT", ex.Construct);
+    }
+
+    [Fact]
+    public void Sql_SelectDistinctAll_IsRejected()
+    {
+        using SparkSession spark = NewSession();
+
+        SqlParseException ex = Assert.Throws<SqlParseException>(() => spark.Sql("SELECT DISTINCT ALL a FROM t"));
+
+        Assert.Equal(SqlParseErrorKind.UnsupportedFeature, ex.ErrorKind);
+        Assert.Equal("SELECT_DISTINCT", ex.Construct);
+    }
+
+    [Fact]
+    public void Sql_SelectAllAll_IsRejectedAsDuplicateQuantifier()
+    {
+        using SparkSession spark = NewSession();
+
+        // Two ALL quantifiers is malformed: at most one leading set quantifier is allowed.
+        SqlParseException ex = Assert.Throws<SqlParseException>(() => spark.Sql("SELECT ALL ALL a FROM t"));
+
+        Assert.Equal(SqlParseErrorKind.SyntaxError, ex.ErrorKind);
+    }
+
+    // ---------------- NOT IN / NOT LIKE / NOT BETWEEN → named UnsupportedFeature ----------------
+
+    [Theory]
+    [InlineData("SELECT a FROM t WHERE a NOT IN (1, 2)", "NOT_IN")]
+    [InlineData("SELECT a FROM t WHERE a NOT LIKE 'x%'", "NOT_LIKE")]
+    [InlineData("SELECT a FROM t WHERE a NOT BETWEEN 1 AND 2", "NOT_BETWEEN")]
+    public void Sql_NegatedPredicate_ClassifiesAsUnsupportedFeature_NotOpaqueSyntaxError(
+        string sql, string expectedConstruct)
+    {
+        using SparkSession spark = NewSession();
+        spark.QueryExecutor = new ThrowingQueryExecutor();
+
+        SqlParseException ex = Assert.Throws<SqlParseException>(() => spark.Sql(sql));
+
+        // Sentinel: without the NOT-predicate detection the parser leaves 'NOT' trailing and throws an
+        // opaque SyntaxError ("unexpected 'NOT' after the query") with a null Construct.
+        Assert.Equal(SqlParseErrorKind.UnsupportedFeature, ex.ErrorKind);
+        Assert.Equal(expectedConstruct, ex.Construct);
+    }
+
+    [Fact]
+    public void Sql_LeadingBooleanNot_StillParsesAsLogicalNegation()
+    {
+        using SparkSession spark = NewSession();
+
+        // Regression guard: the NOT-predicate detection must NOT intercept a leading boolean NOT.
+        DataFrame df = spark.Sql("SELECT a FROM t WHERE NOT a = b");
+
+        var filter = (Filter)((Project)df.Plan).Child;
+        Column expected = Functions.Col("a").EqualTo(Functions.Col("b")).Not();
+        Assert.True(expected.Expr.Equals(filter.Condition));
+    }
+
     // ---------------- SQL comments (line and block) are skipped ----------------
 
     [Fact]

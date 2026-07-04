@@ -134,5 +134,8 @@ public sealed class SqlParseException : Exception
             ["IN"] = ("an IN predicate", null),
             ["LIKE"] = ("a LIKE predicate", null),
             ["BETWEEN"] = ("a BETWEEN predicate", null),
+            ["NOT_IN"] = ("a NOT IN predicate", null),
+            ["NOT_LIKE"] = ("a NOT LIKE predicate", null),
+            ["NOT_BETWEEN"] = ("a NOT BETWEEN predicate", null),
         };
 }
