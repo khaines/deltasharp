@@ -486,6 +486,15 @@ internal sealed class UnionPlan : PhysicalPlan
 /// returns — 0 when a <see cref="SaveMode.Ignore"/> skipped an existing target) so the driver's finalize
 /// reports the rows actually WRITTEN, not the rows the child produced, without a second execution or any
 /// cancellable post-commit work. It returns its child's <see cref="BatchResult"/> unchanged.
+/// <para>
+/// <b>Early existence short-circuit.</b> For <see cref="SaveMode.Ignore"/>/<see cref="SaveMode.ErrorIfExists"/>
+/// onto an ALREADY-EXISTING target, <see cref="Execute"/> probes the sink (<see cref="ILocalSink.ShouldSkipOrThrow"/>)
+/// and short-circuits BEFORE executing/materializing the child — an Ignore returns an empty result with
+/// <see cref="CommittedRowCount"/> 0, an ErrorIfExists throws its conflict — so a doomed or skipped write
+/// never reads the whole input (Spark-parity + OOM safety). This is only an optimization:
+/// <see cref="ILocalSink.Commit"/> stays the atomic boundary and re-checks existence, so a race that creates
+/// the target after the probe is still caught at commit.
+/// </para>
 /// </summary>
 internal sealed class WriteToSinkPlan : PhysicalPlan
 {
@@ -527,6 +536,25 @@ internal sealed class WriteToSinkPlan : PhysicalPlan
     public override BatchResult Execute(PhysicalRuntime runtime)
     {
         ArgumentNullException.ThrowIfNull(runtime);
+
+        // Early existence short-circuit (optimization; Spark parity). Decide an Ignore/ErrorIfExists write
+        // onto an ALREADY-EXISTING target BEFORE executing/materializing the child, so a doomed
+        // (ErrorIfExists) or skipped (Ignore) write never reads or materializes the whole DataFrame just to
+        // throw or return 0 — avoiding an OOM risk on large inputs and matching Spark, which checks
+        // existence before running the job for these modes. ShouldSkipOrThrow throws the ErrorIfExists
+        // conflict (before any child work), or returns true for an Ignore that must skip; Append/Overwrite
+        // (and a fresh target) return false and execute normally below. This is only an optimization —
+        // Commit REMAINS the atomic final boundary and re-checks existence under its monitor, so a race that
+        // creates the target between this probe and the commit is still caught at commit.
+        if (_sink.ShouldSkipOrThrow())
+        {
+            // SaveMode.Ignore onto an existing target: skip the write entirely — no child execution, no
+            // materialization — reporting 0 committed rows (the authoritative count) and an EMPTY result
+            // over the child schema (no batches) so the driver's finalize reads 0 without re-executing.
+            CommittedRowCount = 0;
+            return new BatchResult(OutputSchema, Array.Empty<ColumnBatch>());
+        }
+
         BatchResult child = _child.Execute(runtime);
 
         // Materialize the whole result once, then commit atomically: the sink never observes a

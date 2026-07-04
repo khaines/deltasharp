@@ -37,6 +37,24 @@ internal interface ILocalSink
     /// (<see cref="SaveMode.ErrorIfExists"/> onto an existing target, or an <see cref="SaveMode.Append"/>
     /// schema mismatch).</exception>
     long Commit(StructType schema, IReadOnlyList<Row> rows);
+
+    /// <summary>
+    /// Cheaply decides — <b>before</b> the write input is executed/materialized — whether an
+    /// <see cref="SaveMode.Ignore"/>/<see cref="SaveMode.ErrorIfExists"/> write onto an ALREADY-EXISTING
+    /// target can be short-circuited, so a doomed or skipped write never reads or materializes the whole
+    /// DataFrame just to throw or return 0 (an OOM risk on large inputs, and a Spark-parity gap — Spark
+    /// checks existence before running the job for these modes). Returns <see langword="true"/> when the
+    /// write must be SKIPPED (<see cref="SaveMode.Ignore"/> onto an existing target — the caller reports 0
+    /// committed rows without executing the child); returns <see langword="false"/> when the write must
+    /// PROCEED (a fresh target, or an <see cref="SaveMode.Append"/>/<see cref="SaveMode.Overwrite"/> mode).
+    /// This is purely an <b>optimization</b>: <see cref="Commit"/> REMAINS the atomic boundary and
+    /// re-checks existence, so a race that creates the target between this probe and the commit is still
+    /// caught (an <see cref="SaveMode.ErrorIfExists"/> still throws at commit).
+    /// </summary>
+    /// <returns><see langword="true"/> to skip the write (Ignore onto an existing target); otherwise <see langword="false"/>.</returns>
+    /// <exception cref="InvalidOperationException"><see cref="SaveMode.ErrorIfExists"/> onto an existing
+    /// target — the same conflict <see cref="Commit"/> would throw, raised before the child executes.</exception>
+    bool ShouldSkipOrThrow();
 }
 
 /// <summary>
@@ -120,11 +138,7 @@ internal sealed class InMemorySinkRegistry : ILocalSinkFactory
                 case SaveMode.ErrorIfExists:
                     if (exists)
                     {
-                        // Redact the target so a collision diagnostic (or a log capturing it) never leaks a
-                        // secret embedded in the write path (parity with the analyzer diagnostics, #432).
-                        throw new InvalidOperationException(
-                            $"Cannot write to '{SecretRedaction.RedactPath(target)}': it already exists and the save "
-                            + "mode is ErrorIfExists. Use Overwrite, Append, or Ignore to write to an existing target.");
+                        throw ErrorIfExistsConflict(target);
                     }
 
                     _tables[target] = new CommittedTable(schema, rows);
@@ -169,6 +183,43 @@ internal sealed class InMemorySinkRegistry : ILocalSinkFactory
             }
         }
     }
+
+    // The cheap pre-commit existence probe the InMemorySink delegates ShouldSkipOrThrow to, used by
+    // WriteToSinkPlan to short-circuit an Ignore/ErrorIfExists write onto an existing target BEFORE the
+    // child is executed/materialized. Returns true when an Ignore must skip an existing target, throws the
+    // ErrorIfExists conflict (the SAME exception Commit throws), and returns false when the write must
+    // proceed (fresh target, or an Append/Overwrite mode). It re-uses the same monitor as Commit, but is
+    // only an OPTIMIZATION: Commit re-checks existence under the lock, so a target created between this
+    // probe and the commit is still handled correctly there (ErrorIfExists still throws at commit).
+    private bool CheckPreCommit(string target, SaveMode mode)
+    {
+        if (mode is not (SaveMode.Ignore or SaveMode.ErrorIfExists))
+        {
+            return false;
+        }
+
+        lock (_gate)
+        {
+            if (!_tables.ContainsKey(target))
+            {
+                return false;
+            }
+
+            if (mode == SaveMode.Ignore)
+            {
+                return true;
+            }
+
+            throw ErrorIfExistsConflict(target);
+        }
+    }
+
+    // The ErrorIfExists conflict, shared by Commit and the CheckPreCommit early probe so the two paths
+    // never drift. The target is redacted so a collision diagnostic (or a log capturing it) never leaks a
+    // secret embedded in the write path (parity with the analyzer diagnostics, #432).
+    private static InvalidOperationException ErrorIfExistsConflict(string target) =>
+        new($"Cannot write to '{SecretRedaction.RedactPath(target)}': it already exists and the save "
+            + "mode is ErrorIfExists. Use Overwrite, Append, or Ignore to write to an existing target.");
 
     // A write is keyed by its path (the common case), then a table identifier, then a stable default for a
     // path-less memory Save. Callers in M1 always supply a path, so collisions on the default are a
@@ -218,5 +269,7 @@ internal sealed class InMemorySinkRegistry : ILocalSinkFactory
             ArgumentNullException.ThrowIfNull(rows);
             return _registry.Commit(_target, _mode, schema, rows);
         }
+
+        public bool ShouldSkipOrThrow() => _registry.CheckPreCommit(_target, _mode);
     }
 }

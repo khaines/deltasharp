@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
@@ -366,6 +367,99 @@ public class WriteDoorEndToEndTests
         Assert.Equal(3, written.Count);
     }
 
+    // ---------------- Red-team HIGH: short-circuit before materializing the write input ----------------
+
+    [Fact]
+    public void Write_IgnoreMode_OntoExistingTarget_ShortCircuits_WithoutMaterializingChild()
+    {
+        // Regression (red-team HIGH): Ignore onto an EXISTING target must decide BEFORE executing/
+        // materializing the child, so a skipped write never reads the whole input (OOM risk / Spark-parity
+        // gap). A materialization-spy child records whether its rows were enumerated; a correct short-circuit
+        // leaves it un-enumerated and reports 0 committed rows.
+        var fixture = new InMemoryRelationFixture();
+        var registry = new InMemorySinkRegistry();
+        string target = UniqueTarget();
+
+        // Seed the target so it exists.
+        (long seedCount, _) = fixture.WriteWithMetrics(
+            fixture.LocalRelationFrame(PeopleSchema, Rows()), "memory", SaveMode.Overwrite, target, registry);
+        Assert.Equal(3, seedCount);
+
+        var spy = new MaterializationSpyRows(new[] { new Row(PeopleSchema, 9, "z") });
+        DataFrame child = fixture.LocalRelationFrame(PeopleSchema, spy);
+
+        (long ignoreCount, ExecutionMetrics metrics) = fixture.WriteWithMetrics(
+            child, "memory", SaveMode.Ignore, target, registry);
+
+        Assert.Equal(0, ignoreCount);
+        Assert.Equal(0, metrics.OutputRows);
+        Assert.False(spy.Enumerated); // the child was NOT materialized — the write short-circuited
+
+        // The existing target is unchanged (still the original 3 rows).
+        Assert.True(registry.TryRead(target, out _, out IReadOnlyList<Row> written));
+        Assert.Equal(3, written.Count);
+    }
+
+    [Fact]
+    public void Write_ErrorIfExists_OntoExistingTarget_Throws_WithoutMaterializingChild()
+    {
+        // Regression (red-team HIGH): ErrorIfExists onto an EXISTING target must throw its conflict BEFORE
+        // executing/materializing the child, so a doomed write never reads the whole input. The spy child
+        // stays un-enumerated and the conflict is a Backend-stage QueryExecutionException.
+        var fixture = new InMemoryRelationFixture();
+        var registry = new InMemorySinkRegistry();
+        string target = UniqueTarget();
+
+        (long seedCount, _) = fixture.WriteWithMetrics(
+            fixture.LocalRelationFrame(PeopleSchema, Rows()), "memory", SaveMode.Overwrite, target, registry);
+        Assert.Equal(3, seedCount);
+
+        var spy = new MaterializationSpyRows(new[] { new Row(PeopleSchema, 9, "z") });
+        DataFrame child = fixture.LocalRelationFrame(PeopleSchema, spy);
+
+        QueryExecutionException ex = Assert.Throws<QueryExecutionException>(
+            () => fixture.WriteWithMetrics(child, "memory", SaveMode.ErrorIfExists, target, registry));
+
+        Assert.Equal(QueryExecutionStage.Backend, ex.Stage);
+        Assert.False(spy.Enumerated); // threw BEFORE executing/materializing the child
+
+        // The existing target is intact — no partial output.
+        Assert.True(registry.TryRead(target, out _, out IReadOnlyList<Row> written));
+        Assert.Equal(3, written.Count);
+    }
+
+    [Fact]
+    public void Write_ErrorIfExists_CommitStillReChecksExistence_EvenWhenEarlyProbeProceeds()
+    {
+        // Atomicity: the early short-circuit is only an OPTIMIZATION. If the probe reports "proceed" (e.g. a
+        // race where the target did not exist at probe time), Commit MUST still re-check existence under its
+        // monitor and throw for ErrorIfExists onto a target that exists at commit time. A LyingProbeSink
+        // forces ShouldSkipOrThrow to always return false, proving Commit — not the early check — is the
+        // authoritative guard. Removing the in-Commit existence check reddens this test.
+        var fixture = new InMemoryRelationFixture();
+        var registry = new InMemorySinkRegistry();
+        string target = UniqueTarget();
+
+        (long seedCount, _) = fixture.WriteWithMetrics(
+            fixture.LocalRelationFrame(PeopleSchema, Rows()), "memory", SaveMode.Overwrite, target, registry);
+        Assert.Equal(3, seedCount);
+
+        var spy = new MaterializationSpyRows(new[] { new Row(PeopleSchema, 9, "z") });
+        DataFrame child = fixture.LocalRelationFrame(PeopleSchema, spy);
+        var lying = new LyingProbeSinkFactory(registry);
+
+        QueryExecutionException ex = Assert.Throws<QueryExecutionException>(
+            () => fixture.WriteWithMetrics(child, "memory", SaveMode.ErrorIfExists, target, lying));
+
+        Assert.Equal(QueryExecutionStage.Backend, ex.Stage);
+
+        // The early probe LIED "proceed", so the child DID execute/materialize — and it was Commit's
+        // re-check (not the early check) that threw the conflict.
+        Assert.True(spy.Enumerated);
+        Assert.True(registry.TryRead(target, out _, out IReadOnlyList<Row> written));
+        Assert.Equal(3, written.Count);
+    }
+
     // ---------------- MUST-FIX 2: Overwrite replacement is proven ----------------
 
     [Fact]
@@ -444,5 +538,26 @@ public class WriteDoorEndToEndTests
         Assert.True(registry.TryRead(target, out _, out IReadOnlyList<Row> written));
         Assert.Equal(3, written.Count);
         Assert.False(registry.TryRead("memory://default", out _, out _));
+    }
+
+    // A materialization spy: an IEnumerable<Row> that records whether it was ENUMERATED (the LocalRelation
+    // encodes rows lazily in ScanPlan.Execute, so enumeration happens only when the write's child actually
+    // executes/materializes). A correct Ignore/ErrorIfExists short-circuit onto an existing target leaves
+    // Enumerated false.
+    private sealed class MaterializationSpyRows : IEnumerable<Row>
+    {
+        private readonly IReadOnlyList<Row> _rows;
+
+        public MaterializationSpyRows(IReadOnlyList<Row> rows) => _rows = rows;
+
+        public bool Enumerated { get; private set; }
+
+        public IEnumerator<Row> GetEnumerator()
+        {
+            Enumerated = true;
+            return _rows.GetEnumerator();
+        }
+
+        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
     }
 }

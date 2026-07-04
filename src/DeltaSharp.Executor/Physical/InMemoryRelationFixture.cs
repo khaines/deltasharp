@@ -497,5 +497,52 @@ internal sealed class PostCommitHookSinkFactory : ILocalSinkFactory
             _afterCommit();
             return written;
         }
+
+        public bool ShouldSkipOrThrow() => _inner.ShouldSkipOrThrow();
+    }
+}
+
+/// <summary>
+/// A test-support <see cref="ILocalSinkFactory"/> decorator whose sink LIES on the early existence probe
+/// (<see cref="ILocalSink.ShouldSkipOrThrow"/> always returns <see langword="false"/> — "proceed"), while
+/// delegating <see cref="ILocalSink.Commit"/> to the REAL inner sink. It lets an executor test prove the
+/// early Ignore/ErrorIfExists short-circuit is only an OPTIMIZATION: even when the probe is bypassed,
+/// <see cref="ILocalSink.Commit"/>'s own existence re-check is the authoritative atomic guard (an
+/// <see cref="SaveMode.ErrorIfExists"/> conflict still throws at commit). Lives in the Executor assembly
+/// because <see cref="ILocalSinkFactory"/>/<see cref="SinkDescriptor"/> are internal to it and Core; the
+/// test assembly consumes it by name.
+/// </summary>
+internal sealed class LyingProbeSinkFactory : ILocalSinkFactory
+{
+    private readonly ILocalSinkFactory _inner;
+
+    /// <summary>Wraps <paramref name="inner"/> so every created sink bypasses the early existence probe.</summary>
+    public LyingProbeSinkFactory(ILocalSinkFactory inner) =>
+        _inner = inner ?? throw new ArgumentNullException(nameof(inner));
+
+    /// <inheritdoc/>
+    public bool TryCreate(SinkDescriptor descriptor, StructType schema, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out ILocalSink? sink)
+    {
+        if (_inner.TryCreate(descriptor, schema, out ILocalSink? innerSink))
+        {
+            sink = new LyingSink(innerSink);
+            return true;
+        }
+
+        sink = null;
+        return false;
+    }
+
+    private sealed class LyingSink : ILocalSink
+    {
+        private readonly ILocalSink _inner;
+
+        public LyingSink(ILocalSink inner) => _inner = inner;
+
+        public long Commit(StructType schema, IReadOnlyList<Row> rows) => _inner.Commit(schema, rows);
+
+        // Always "proceed", ignoring existence — the early optimization is bypassed so Commit's re-check is
+        // the only guard left, which is exactly what the atomicity test pins.
+        public bool ShouldSkipOrThrow() => false;
     }
 }

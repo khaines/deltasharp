@@ -224,11 +224,25 @@ exists; `Overwrite` replaces; `Append` concatenates after an equal-schema check 
 diagnostic paths call `SecretRedaction.RedactPath` so a collision message never leaks a secret embedded
 in the target.
 
+**Early existence short-circuit (Ignore/ErrorIfExists).** `ILocalSink` also exposes a cheap
+`ShouldSkipOrThrow()` probe (`InMemorySink` delegates to `InMemorySinkRegistry.CheckPreCommit`, sharing
+the same `ErrorIfExistsConflict` message as `Commit`). `WriteToSinkPlan.Execute` calls it **before**
+executing/materializing the child so an `Ignore`/`ErrorIfExists` write onto an ALREADY-EXISTING target
+short-circuits without reading the whole DataFrame: an `Ignore` returns an empty result with
+`CommittedRowCount = 0`, an `ErrorIfExists` throws its conflict. This avoids the OOM risk of materializing
+every input row just to throw or return 0, and matches Spark (which checks existence before running the
+job for these modes). It is purely an **optimization** — `Commit` REMAINS the atomic boundary and
+re-checks existence under the same monitor, so a race that creates the target between the probe and the
+commit is still caught there (an `ErrorIfExists` still throws at commit; the in-`Commit` check is never
+removed). `Append`/`Overwrite` (and a fresh target) return `false` and execute the child normally.
+
 ### Physical node (`WriteToSinkPlan`)
 
 `src/DeltaSharp.Executor/Physical/PhysicalPlan.cs:487` — the physical mirror of a leaf `ScanPlan`, but a
 sink at the top instead of a source, and the only physical node with a side effect. Its `Execute`
-(`:515`) drains the child, materializes the child rows once
+(`:515`) first probes the sink (`ShouldSkipOrThrow`) to short-circuit an `Ignore`/`ErrorIfExists` write
+onto an existing target **before** touching the child (see the early-short-circuit note above), then for
+a proceeding write drains the child, materializes the child rows once
 (`RowMaterializer.Materialize(child, null, null, ct)`), then captures the sink's authoritative committed
 count: `CommittedRowCount = _sink.Commit(child.Schema, rows)`. **Materialize-then-commit is atomic**, so a
 mode conflict or a mid-write fault leaves no partial output (AC1/AC3). **The commit is the final failure
