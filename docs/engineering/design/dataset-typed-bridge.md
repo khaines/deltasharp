@@ -46,18 +46,20 @@ The internal IR stays hidden: the public members take/return only
 `Column.Expr` (`internal`) to build the plan node, so `DeltaSharp.Plans.*` never appears on the public
 surface.
 
-**Scope boundary with STORY-04.7.2 (#178).** This story delivers the typed-transformation **bridge**
-and **schema derivation from `T`** only. It does **not** implement the `Row`↔`T` **value encoders**
-(instantiating an arbitrary `T` from a collected `Row`, or encoding a `T` into row values). That is
-the separate deferred [STORY-04.7.2](https://github.com/khaines/deltasharp/issues/178), which
-`Depends on: STORY-04.7.1, STORY-04.2.4` (EPIC-04 §STORY-04.7.2). Consequently:
+**Scope boundary with STORY-04.7.2 (#178).** This story (#163) delivers the typed-transformation
+**bridge** and **schema derivation from `T`** only; it does not itself decode rows. The `Row`→`T` value
+**decoder** and the typed `Collect()` action were subsequently landed by
+[STORY-04.7.2](https://github.com/khaines/deltasharp/issues/178) — see
+[dataset-encoders.md](dataset-encoders.md). Note therefore:
 
-- `Dataset<T>` carries no typed action (`collect(): T[]`); run a typed pipeline by converting back with
-  `ToDF()` and using the untyped actions.
+- The typed **decode**/`collect()` now exists: `Dataset<T>.Collect()` runs the plan through the same
+  executor seam `DataFrame.Collect()` uses and decodes each `Row` into a `T` (#178). The reverse
+  `T`→`Row` **encode** (materializing rows *from* `T` values) remains deferred.
 - `Dataset<T>.Select(...)` returns a `DataFrame` (an untyped `Dataset<Row>`), not a `Dataset<U>`,
-  because reconstructing a typed output would require the output-type value encoder (#178).
-- The clean seam #178 completes: `DatasetSchema.Derive<T>()` (the schema) plus the CLR→`DataType`
-  mapping, which is already aligned with the executor's value contract (§4).
+  because reconstructing a typed output would require the output-type value encoder (deferred).
+- The seam #178 built on: `DatasetSchema.Derive<T>()` (the schema) plus the CLR→`DataType` mapping,
+  already aligned with the executor's value contract (§4), reused by the decoder's property↔ordinal
+  binding.
 
 ## 2. The `Dataset<T>` model
 
@@ -293,8 +295,12 @@ error.
   net10.0-only executor lane; §4 keeps the two in lockstep by citation.
 - **Public API governance.** Every new public member is registered in
   `src/DeltaSharp.Core/PublicAPI.Unshipped.txt` (RS0016/RS0017 gate under `-warnaserror`).
-- **AOT/trim.** `T` is annotated `[DynamicallyAccessedMembers(PublicProperties)]` everywhere it flows;
-  lowering walks the expression tree as data (no `Expression.Compile`), so the surface is AOT-clean.
+- **AOT/trim.** `T` is annotated `[DynamicallyAccessedMembers(...)]` everywhere it flows (the typed
+  transformation surface preserves `PublicProperties`; `Dataset<T>`/`As<T>` widen to
+  `PublicProperties | PublicParameterlessConstructor` for the #178 decoder, which constructs `T`).
+  Lowering walks the expression tree as data (no `Expression.Compile`), so the transformation surface is
+  AOT-clean; the decoder's optional compiled tier is guarded (see [dataset-encoders.md](dataset-encoders.md) §4).
 - **Spark parity.** `As<T>`/`ToDF`/`Schema` mirror `as[T]`/`toDF()`/`schema`; typed `Where`/`Filter`
   mirror `filter(FilterFunction<T>)`; typed `Select` returning a `DataFrame` mirrors `Dataset.select`.
-  The typed value actions (`collect(): T`) are the #178 follow-up.
+  The typed value action `Dataset<T>.Collect(): IReadOnlyList<T>` (mirroring `Dataset.collect()`) landed
+  in #178 ([dataset-encoders.md](dataset-encoders.md)).
