@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using DeltaSharp.Analysis;
 using DeltaSharp.Execution;
 using DeltaSharp.Plans.Expressions;
@@ -334,6 +335,40 @@ public sealed class SqlDoorTests
         DataFrame df = spark.Sql(sql);
 
         Assert.IsType<Filter>(((Project)df.Plan).Child);
+    }
+
+    [Fact]
+    public void Sql_DeepNesting_OnSmallWorkerStack_SurfacesCatchableSqlParseException_ViaPhysicalStackGuard()
+    {
+        // The recursion-depth COUNTER alone is not enough: on a realistic small worker-thread stack (how
+        // Sql() runs under gRPC/Kestrel handlers) a nest can overflow the PHYSICAL stack BELOW the counter
+        // bound. RuntimeHelpers.EnsureSufficientExecutionStack must fire first and be translated to the
+        // public, catchable SqlParseException — otherwise the whole process dies with an uncatchable
+        // StackOverflow. This pins that physical-stack defense and its InsufficientExecutionStackException
+        // translation branch (which every other DoS test — running on the large default test stack, where
+        // the counter trips first — leaves uncovered).
+        Exception? captured = null;
+        var worker = new Thread(
+            () =>
+            {
+                try
+                {
+                    using SparkSession spark = NewSession();
+                    string sql = "SELECT a FROM t WHERE " + new string('(', 2000) + "1" + new string(')', 2000) + " = 1";
+                    spark.Sql(sql);
+                }
+                catch (Exception ex)
+                {
+                    captured = ex;
+                }
+            },
+            maxStackSize: 512 * 1024);
+        worker.Start();
+
+        Assert.True(worker.Join(TimeSpan.FromSeconds(30)), "the small-stack parse did not complete");
+        SqlParseException ex = Assert.IsType<SqlParseException>(captured);
+        Assert.Equal(SqlParseErrorKind.SyntaxError, ex.ErrorKind);
+        Assert.IsType<InsufficientExecutionStackException>(ex.InnerException);
     }
 
     // ---------------- SELECT ALL (default set quantifier) ----------------
