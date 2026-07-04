@@ -18,15 +18,21 @@
 > configuration, or the coverage threshold changes.
 
 DeltaSharp enforces **three automated quality gates** on every pull request and every push to
-`main`. All three live in the single required CI job **`build-test-format`**
-([`.github/workflows/ci.yml`](../../../.github/workflows/ci.yml)) so a policy violation blocks
-the merge button rather than accumulating as debt.
+`main`, across two CI jobs in [`.github/workflows/ci.yml`](../../../.github/workflows/ci.yml) so a
+policy violation blocks the merge button rather than accumulating as debt:
 
-| # | Gate | Enforced by | Fails when |
-| --- | --- | --- | --- |
-| 1 | Analyzers & warnings-as-errors | `TreatWarningsAsErrors=true` + the .NET / trim / AOT / API analyzers | any analyzer or compiler **warning** is emitted by a build |
-| 2 | Formatting | `dotnet format --verify-no-changes` against the checked-in `.editorconfig` | a file does not match the formatting/style rules |
-| 3 | Coverage | `coverlet.collector` + [`tools/coverage/coverage-gate.py`](../../../tools/coverage/coverage-gate.py) | merged line coverage is below the configured floor |
+- **`build-test-format`** — the analyzer/warnings-as-errors gate and the formatting gate, and the
+  authoritative **correctness** (test pass/fail) run. Tests run here **uninstrumented**.
+- **`coverage`** — the line-coverage measurement and threshold gate. It runs in parallel and is
+  **measurement-only**: because coverage instrumentation perturbs execution timing, it must never
+  be able to change the correctness verdict, which `build-test-format` owns (see
+  [Why coverage is a separate job](#why-coverage-is-a-separate-job)).
+
+| # | Gate | Job | Enforced by | Fails when |
+| --- | --- | --- | --- | --- |
+| 1 | Analyzers & warnings-as-errors | `build-test-format` | `TreatWarningsAsErrors=true` + the .NET / trim / AOT / API analyzers | any analyzer or compiler **warning** is emitted by a build |
+| 2 | Formatting | `build-test-format` | `dotnet format --verify-no-changes` against the checked-in `.editorconfig` | a file does not match the formatting/style rules |
+| 3 | Coverage | `coverage` | `coverlet.collector` + [`tools/coverage/coverage-gate.py`](../../../tools/coverage/coverage-gate.py) | merged line coverage is below the configured floor |
 
 Every gate has a **local command that reproduces the CI result exactly**, because the policy
 lives in checked-in configuration (`Directory.Build.props`, `.editorconfig`,
@@ -35,9 +41,9 @@ consume — CI adds no hidden flags.
 
 | Gate | CI step (`ci.yml`) | Local command that reproduces it |
 | --- | --- | --- |
-| 1. Warnings-as-errors | `dotnet build DeltaSharp.sln -c Release --no-restore` | `dotnet build -c Release` |
-| 2. Formatting | `dotnet format DeltaSharp.sln --verify-no-changes --no-restore` | `dotnet format --verify-no-changes` (fix with `dotnet format`) |
-| 3. Coverage | `dotnet test … --collect:"XPlat Code Coverage" --settings coverlet.runsettings` then `python3 tools/coverage/coverage-gate.py` | see [Reproducing the coverage gate locally](#reproducing-the-coverage-gate-locally) |
+| 1. Warnings-as-errors | `build-test-format` › `dotnet build DeltaSharp.sln -c Release --no-restore` | `dotnet build -c Release` |
+| 2. Formatting | `build-test-format` › `dotnet format DeltaSharp.sln --verify-no-changes --no-restore` | `dotnet format --verify-no-changes` (fix with `dotnet format`) |
+| 3. Coverage | `coverage` › `dotnet test … --collect:"XPlat Code Coverage" --settings coverlet.runsettings` then `python3 tools/coverage/coverage-gate.py` | see [Reproducing the coverage gate locally](#reproducing-the-coverage-gate-locally) |
 
 ---
 
@@ -192,9 +198,10 @@ dotnet test DeltaSharp.sln -c Release --no-build \
   --results-directory TestResults
 ```
 
-The collector instruments the already-built assemblies at run time (so it composes with the
-existing `--no-build` test step) and writes one **Cobertura** report per test assembly per
-target framework under `TestResults/<guid>/coverage.cobertura.xml`.
+The **`coverage`** CI job runs this after its own restore + build (adding `--verbosity normal` and
+a coverage-neutral `--filter`; see [Why coverage is a separate job](#why-coverage-is-a-separate-job)).
+The collector instruments the already-built assemblies at run time and writes one **Cobertura**
+report per test assembly per target framework under `TestResults/<guid>/coverage.cobertura.xml`.
 
 [`coverlet.runsettings`](../../../coverlet.runsettings) defines **what** is measured:
 
@@ -209,14 +216,40 @@ target framework under `TestResults/<guid>/coverage.cobertura.xml`.
   keeping the metric on real logic and stable across runs.
 - **`<SingleHit>true</SingleHit>`** — record each line as a single hit rather than an incrementing
   count. The gate measures hit **presence** (`hits > 0`), never counts, so this is
-  coverage-identical; it removes the per-execution counter write from every instrumented line so a
-  hot multi-threaded stress test (the 25k-iteration `SparkSession` lifecycle race) is not slowed by
-  cross-thread counter contention. This keeps the instrumented run's timing close to an
-  uninstrumented run, so **collecting coverage does not destabilize timing-sensitive tests**.
+  coverage-identical (verified: the merged total is byte-for-byte the same either way). It also
+  removes the per-execution counter write from every instrumented line, lowering the overhead of a
+  hot multi-threaded loop. It is **not**, on its own, relied on to keep the correctness verdict
+  stable — that guarantee comes from running the correctness tests uninstrumented in a separate job
+  (see [Why coverage is a separate job](#why-coverage-is-a-separate-job)).
 
 **Artifacts (AC1).** CI publishes the reports and the merged summary as the **`coverage-report`**
 workflow artifact (`TestResults/**/coverage.cobertura.xml` + `TestResults/coverage-summary.md`),
 uploaded with `if: ${{ !cancelled() }}` so the report is available **even when the gate fails**.
+
+### Why coverage is a separate job
+
+Coverage is collected in the **`coverage`** job, **not** in `build-test-format`, and that
+separation is deliberate. coverlet instruments the production assemblies at run time, which changes
+execution timing. A `SparkSession` lifecycle **stress test** runs 25,000 iterations of a
+deliberately-raced `GetOrCreate` vs. `Stop`; its own oracle notes that reading `IsActive` after
+`GetOrCreate` returns is *"inherently racy against a legitimate post-return Stop."* Under
+instrumentation on a 2-vCPU runner that window widens enough to make the oracle occasionally count
+a legitimate interleaving as a violation — a **false** failure unrelated to any real regression.
+
+The fix is architectural, not a test change (the repo treats a flaky test as a harness/oracle
+defect, not something to quietly weaken):
+
+- **`build-test-format` runs the tests uninstrumented** and is the single source of truth for
+  correctness — exactly as before coverage existed, and exactly as on `main`. The stress test runs
+  here, strictly.
+- **The `coverage` job's collect step is measurement-only.** It carries `continue-on-error: true`
+  so a test that flakes *only under instrumentation* can never fail the build — correctness is
+  already gated by `build-test-format` — while the threshold gate still runs on the emitted reports
+  (a genuinely missing report fails the gate, so the tolerance is fail-safe). It also excludes just
+  that one stress test with
+  `--filter "FullyQualifiedName!~SparkSessionConcurrencyTests.GetOrCreate_RacingStop_NeverReusesAStoppedSession"`,
+  which is **coverage-neutral**: the merged percentage is identical with or without it, because
+  every line it exercises is covered by other tests.
 
 ### The merge: why per-report sums are wrong
 
@@ -305,6 +338,12 @@ python3 tools/coverage/coverage-gate.py --results-dir TestResults \
 
 `--threshold <n>` overrides the configured floor for local experiments; CI never passes it, so
 the JSON file remains the single enforced source of truth.
+
+> The full test run above measures coverage faithfully (89.16%). If the `SparkSession` lifecycle
+> stress test flakes *under instrumentation* on a small local machine, coverlet still writes
+> complete reports, so the gate still evaluates; you can also append CI's coverage-neutral filter
+> — `--filter "FullyQualifiedName!~SparkSessionConcurrencyTests.GetOrCreate_RacingStop_NeverReusesAStoppedSession"`
+> — to skip just that test without changing the number.
 
 ---
 

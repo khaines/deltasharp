@@ -77,16 +77,23 @@ dotnet test --filter "Name=Select_ProjectsColumns"
 
 ## Quality gates
 
-Every pull request must pass three automated gates in the required CI job
-`build-test-format` (see
+Every pull request must pass three automated gates across two CI jobs (see
 [docs/engineering/design/quality-gates.md](docs/engineering/design/quality-gates.md) for the
-full policy). Each has a local command that reproduces the CI result:
+full policy):
+
+- **`build-test-format`** enforces gates 1 and 2 and is the authoritative test-correctness run
+  (tests run **uninstrumented** here).
+- **`coverage`** runs in parallel and enforces gate 3 (line-coverage threshold); it is
+  measurement-only so coverage instrumentation can never change the correctness verdict.
+
+Each gate has a local command that reproduces the CI result:
 
 1. **Warnings-as-errors** — `dotnet build -c Release`. `TreatWarningsAsErrors=true` plus the
    .NET, trim/AOT, and API analyzers mean any warning fails the build. Suppressions must be
    **scoped and justified** (never a project-wide `<NoWarn>`).
 2. **Formatting** — `dotnet format --verify-no-changes` checks; **`dotnet format`** fixes.
-3. **Coverage** — CI collects line coverage and fails when it drops below the floor recorded in
+3. **Coverage** — the `coverage` job collects line coverage and fails when it drops below the floor
+   recorded in
    [`tools/coverage/coverage-config.json`](tools/coverage/coverage-config.json). Reproduce with:
 
    ```bash
