@@ -75,7 +75,7 @@ internal static class TypedExpressionLowering
         {
             UnaryExpression { NodeType: ExpressionType.Convert or ExpressionType.ConvertChecked } convert =>
                 LowerConvert(convert, parameter),
-            UnaryExpression { NodeType: ExpressionType.Not } not => LowerNode(not.Operand, parameter).Not(),
+            UnaryExpression { NodeType: ExpressionType.Not } not => LowerNot(not, parameter),
             MemberExpression member => LowerMember(member, parameter),
             BinaryExpression binary => LowerBinary(binary, parameter),
             _ => throw Unsupported(node),
@@ -229,6 +229,25 @@ internal static class TypedExpressionLowering
     }
 
     private static bool IsNullLiteral(Column column) => column.Expr is Plans.Expressions.Literal { IsNull: true };
+
+    // C# reuses ExpressionType.Not for BOTH logical negation '!' (a bool operand) and the bitwise
+    // complement '~' (an integral operand: '~p.IntCol' is a 'Not' node whose Type is Int32, not
+    // Boolean). Only logical '!' maps to Spark's boolean Not; a bitwise '~' has no faithful M1
+    // mapping and MUST NOT silently lower to a boolean Spark Not over a numeric column (a silent
+    // wrong plan) — reject it deterministically, mirroring how binary bitwise '&'/'|' is rejected by
+    // RequireBooleanLogical. (A parameter-independent '~const' was already folded by EvaluateConstant.)
+    private static Column LowerNot(UnaryExpression not, ParameterExpression parameter)
+    {
+        if (not.Type != typeof(bool) && not.Type != typeof(bool?))
+        {
+            throw new UnsupportedTypedExpressionException(
+                $"Unsupported bitwise complement operator '~' in a Dataset<T> lambda: '{not}'. "
+                + "Bitwise operators are not supported (M1); '!' over a boolean predicate is the only "
+                + "supported unary negation.");
+        }
+
+        return LowerNode(not.Operand, parameter).Not();
+    }
 
     private static void RequireBooleanLogical(BinaryExpression binary)
     {

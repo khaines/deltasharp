@@ -493,6 +493,19 @@ public sealed class DatasetTypedLoweringTests
     }
 
     [Fact]
+    public void BitwiseComplement_OnNumericColumn_ThrowsDeterministicDiagnostic()
+    {
+        // C# '~p.Age' is a BITWISE complement over an integer column. It shares ExpressionType.Not
+        // with logical '!' (the compiler emits a 'Not' node whose Type is Int32, not Boolean), but
+        // has no faithful Spark mapping. It must be REJECTED, never silently lowered to a boolean
+        // Spark Not over a numeric column. Mutation sentinel: dropping the operand-type guard in
+        // LowerNot lowers this to `NOT 'Age` (a silent wrong plan) instead of throwing.
+        var ex = Assert.Throws<UnsupportedTypedExpressionException>(() => LowerSelect(p => ~p.Age));
+
+        Assert.Contains("bitwise", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void ShortCircuitAnd_LowersStructurally()
     {
         Column lowered = Lower(p => p.Age > 18 && p.Age < 65);
