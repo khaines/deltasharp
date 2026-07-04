@@ -272,6 +272,70 @@ public class WriteDoorEndToEndTests
     }
 
     [Fact]
+    public void Write_AppendMode_OntoExistingTarget_ReportsAppendedCount_AndAppendsRows()
+    {
+        // Regression: the write finalize must thread out the AUTHORITATIVE committed count the sink
+        // returns — for Append that is the number of rows APPENDED (rows.Count), NOT the child's produced
+        // count and NOT the combined prior+new total. The end-state must be prior+N (appended, not
+        // replaced). Initial 2 rows + appended 3 rows distinguishes the appended count (3) from the
+        // combined total (5) and from a replace (which would keep only 3).
+        var fixture = new InMemoryRelationFixture();
+        var registry = new InMemorySinkRegistry();
+        string target = UniqueTarget();
+
+        DataFrame initial = fixture.LocalRelationFrame(PeopleSchema, new[]
+        {
+            new Row(PeopleSchema, 10, "carol"),
+            new Row(PeopleSchema, 20, "dave"),
+        }); // 2 rows
+        (long firstCount, _) = fixture.WriteWithMetrics(
+            initial, "memory", SaveMode.Overwrite, target, registry);
+        Assert.Equal(2, firstCount);
+
+        // A DIFFERENT 3-row frame (same schema) appended onto the existing 2-row target.
+        DataFrame appended = fixture.LocalRelationFrame(PeopleSchema, Rows()); // 3 rows (ids 1,2,3)
+        (long appendCount, ExecutionMetrics metrics) = fixture.WriteWithMetrics(
+            appended, "memory", SaveMode.Append, target, registry);
+
+        // The committed count (and reported metrics) is the 3 APPENDED rows — not 5 (the combined total)
+        // and not 2 (the prior count).
+        Assert.Equal(3, appendCount);
+        Assert.Equal(3, metrics.OutputRows);
+
+        // The end-state is prior + appended = 5 rows, in order (appended, not replaced).
+        Assert.True(registry.TryRead(target, out _, out IReadOnlyList<Row> written));
+        Assert.Equal(5, written.Count);
+        Assert.Equal(new[] { 10, 20, 1, 2, 3 }, written.Select(r => r.GetAs<int>("id")));
+    }
+
+    [Fact]
+    public void Write_ErrorIfExists_OntoFreshTarget_ReportsCommittedCount_AndCommitsRows()
+    {
+        // Regression: ErrorIfExists onto a NON-existing target is the success path — it must WRITE the
+        // rows and thread out the AUTHORITATIVE committed count (rows.Count). The failing-collision path is
+        // covered elsewhere; this pins the success path's count contract AND end-state. A fresh per-test
+        // registry guarantees the target does not already exist (no timing/ordering race).
+        var fixture = new InMemoryRelationFixture();
+        var registry = new InMemorySinkRegistry();
+        string target = UniqueTarget();
+
+        DataFrame df = fixture.LocalRelationFrame(PeopleSchema, Rows()); // 3 rows
+
+        // No prior write: ErrorIfExists onto the empty target succeeds and commits.
+        (long committed, ExecutionMetrics metrics) = fixture.WriteWithMetrics(
+            df, "memory", SaveMode.ErrorIfExists, target, registry);
+
+        // The committed count (and reported metrics) is the 3 rows written.
+        Assert.Equal(3, committed);
+        Assert.Equal(3, metrics.OutputRows);
+
+        // The target holds exactly those 3 rows.
+        Assert.True(registry.TryRead(target, out _, out IReadOnlyList<Row> written));
+        Assert.Equal(3, written.Count);
+        Assert.Equal(new[] { 1, 2, 3 }, written.Select(r => r.GetAs<int>("id")));
+    }
+
+    [Fact]
     public void Write_CancelFiringAfterCommit_DoesNotFail_AndLeavesTheWriteCommitted()
     {
         // Regression (Quality C7): a cancel scheduled to fire AFTER the commit used to throw from the
