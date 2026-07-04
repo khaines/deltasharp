@@ -23,9 +23,13 @@ namespace DeltaSharp.Diagnostics;
 /// <para>
 /// The attribute keys use the OpenTelemetry-style dotted, lowercase, <c>deltasharp.</c>-prefixed form so
 /// the identical string is valid as a metric tag key, an <c>Activity</c> tag key, and an
-/// <c>Microsoft.Extensions.Logging.ILogger</c> scope key. They name only <b>bounded</b>,
-/// low-cardinality dimensions; high-cardinality values (raw storage paths, SQL text, row values) are
-/// never telemetry keys or values (checklists <c>09a</c>/<c>09b</c>/<c>09c</c>).
+/// <c>Microsoft.Extensions.Logging.ILogger</c> scope key. They split into two disjoint groups the prose
+/// keeps distinct: <b>metric-label-safe</b> keys name closed, bounded-at-any-instant dimensions
+/// (component, operation, outcome, stage); <b>correlation/exemplar-only</b> keys (job/task/executor id,
+/// correlation id, attempt, partition, table version) belong on logs, spans, and exemplars but are
+/// <b>never</b> metric labels because they are unbounded over a run's lifetime. High-cardinality values
+/// (raw storage paths, SQL text, row values) are never telemetry keys or values at all
+/// (checklists <c>09a</c>/<c>09b</c>/<c>09c</c>).
 /// </para>
 /// <para>
 /// The type is deliberately <see langword="internal"/>: it seeds a convention, not a public contract, so
@@ -90,4 +94,17 @@ internal static class DeltaSharpTelemetry
     /// <c>Activity</c> trace context, or that must carry correlation across a boundary where trace context
     /// is not propagated. Opaque and bounded — never a user or tenant identity.</summary>
     internal const string CorrelationIdKey = "deltasharp.correlation.id";
+
+    /// <summary>The task/stage <b>attempt</b> number a signal belongs to (the first try, then incremented
+    /// on each retry / shuffle re-resolution, per ADR-0004). A <b>correlation/exemplar-only</b> field:
+    /// valid on structured logs, span attributes, and metric exemplars, but <b>never</b> a metric label,
+    /// because attempts grow per retry and would multiply a metric's time-series cardinality. Bounded per
+    /// run; populated once the retry/re-resolution paths exist.</summary>
+    internal const string AttemptKey = "deltasharp.attempt";
+
+    /// <summary>The <b>partition</b> (split) index a task-scoped signal processes. A
+    /// <b>correlation/exemplar-only</b> field: valid on structured logs and span attributes, but
+    /// <b>never</b> a metric label, because partition counts are workload-dependent and unbounded across
+    /// jobs. Populated once the distributed executor exists.</summary>
+    internal const string PartitionKey = "deltasharp.partition";
 }

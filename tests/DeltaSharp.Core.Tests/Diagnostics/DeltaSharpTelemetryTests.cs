@@ -31,6 +31,8 @@ public class DeltaSharpTelemetryTests
         ["TableKey"] = "deltasharp.table",
         ["TableVersionKey"] = "deltasharp.table.version",
         ["CorrelationIdKey"] = "deltasharp.correlation.id",
+        ["AttemptKey"] = "deltasharp.attempt",
+        ["PartitionKey"] = "deltasharp.partition",
     };
 
     [Fact]
@@ -54,6 +56,8 @@ public class DeltaSharpTelemetryTests
         Assert.Equal("deltasharp.table", DeltaSharpTelemetry.TableKey);
         Assert.Equal("deltasharp.table.version", DeltaSharpTelemetry.TableVersionKey);
         Assert.Equal("deltasharp.correlation.id", DeltaSharpTelemetry.CorrelationIdKey);
+        Assert.Equal("deltasharp.attempt", DeltaSharpTelemetry.AttemptKey);
+        Assert.Equal("deltasharp.partition", DeltaSharpTelemetry.PartitionKey);
     }
 
     [Fact]
