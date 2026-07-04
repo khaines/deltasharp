@@ -240,3 +240,16 @@ DeltaSharp.QueryExecutionStage.Plan = 1 -> DeltaSharp.QueryExecutionStage
 DeltaSharp.QueryExecutionStage.Scan = 2 -> DeltaSharp.QueryExecutionStage
 override DeltaSharp.ExecutionMetrics.ToString() -> string!
 static DeltaSharp.ExecutionMetrics.Empty.get -> DeltaSharp.ExecutionMetrics!
+DeltaSharp.DataFrame.As<T>() -> DeltaSharp.Dataset<T>!
+DeltaSharp.Dataset<T>
+DeltaSharp.Dataset<T>.Filter(DeltaSharp.Column! condition) -> DeltaSharp.Dataset<T>!
+DeltaSharp.Dataset<T>.Filter(System.Linq.Expressions.Expression<System.Func<T, bool>!>! predicate) -> DeltaSharp.Dataset<T>!
+DeltaSharp.Dataset<T>.Schema.get -> DeltaSharp.Types.StructType!
+DeltaSharp.Dataset<T>.Select(params System.Linq.Expressions.Expression<System.Func<T, object?>!>![]! selectors) -> DeltaSharp.DataFrame!
+DeltaSharp.Dataset<T>.ToDF() -> DeltaSharp.DataFrame!
+DeltaSharp.Dataset<T>.Where(DeltaSharp.Column! condition) -> DeltaSharp.Dataset<T>!
+DeltaSharp.Dataset<T>.Where(System.Linq.Expressions.Expression<System.Func<T, bool>!>! predicate) -> DeltaSharp.Dataset<T>!
+DeltaSharp.UnsupportedTypedExpressionException
+DeltaSharp.UnsupportedTypedExpressionException.UnsupportedTypedExpressionException() -> void
+DeltaSharp.UnsupportedTypedExpressionException.UnsupportedTypedExpressionException(string! message) -> void
+DeltaSharp.UnsupportedTypedExpressionException.UnsupportedTypedExpressionException(string! message, System.Exception! innerException) -> void
