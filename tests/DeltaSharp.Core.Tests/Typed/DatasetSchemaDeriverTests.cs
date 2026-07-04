@@ -57,6 +57,33 @@ public sealed class DatasetSchemaDeriverTests
         public Guid Key { get; set; }
     }
 
+    private class Base
+    {
+        public int BaseId { get; set; }
+
+        public string? BaseName { get; set; }
+    }
+
+    private sealed class Derived : Base
+    {
+        public int DerivedValue { get; set; }
+    }
+
+    private sealed class NullabilityCoverage
+    {
+        public bool Flag { get; set; }
+
+        public string? Text { get; set; }
+
+        public byte[]? Blob { get; set; }
+
+        public DateOnly? Day { get; set; }
+    }
+
+    private sealed class Empty
+    {
+    }
+
     // ----- AC3: nullability per ADR-0008 -----
 
     [Fact]
@@ -115,15 +142,64 @@ public sealed class DatasetSchemaDeriverTests
         Assert.Equal(new[] { "Id", "Name", "Age" }, schema.Fields.Select(f => f.Name).ToArray());
     }
 
-    // ----- AC4: unsupported property type -> deterministic diagnostic -----
+    // ----- AC3: inherited properties are included, base-class first (Spark-bean parity) -----
+
+    [Fact]
+    public void Derive_IncludesInheritedProperties_BaseClassFirst()
+    {
+        StructType schema = DatasetSchema.Derive<Derived>();
+
+        // Base-declared properties precede the derived type's own, and metadata-token order holds
+        // within each declaring type. A regression to plain MetadataToken ordering (unstable across a
+        // base in another metadata scope) or dropping inherited props would fail this pin.
+        Assert.Equal(
+            new[] { "BaseId", "BaseName", "DerivedValue" },
+            schema.Fields.Select(f => f.Name).ToArray());
+    }
+
+    // ----- AC3: nullability coverage across value/reference/Nullable<> shapes and a degenerate T -----
+
+    [Fact]
+    public void Derive_MapsNullabilityAcrossValueReferenceAndNullableShapes()
+    {
+        StructType schema = DatasetSchema.Derive<NullabilityCoverage>();
+
+        Assert.False(schema["Flag"].Nullable); // non-nullable value type
+        Assert.True(schema["Text"].Nullable);  // reference type (string)
+        Assert.True(schema["Blob"].Nullable);  // reference type (byte[])
+        Assert.True(schema["Day"].Nullable);   // Nullable<DateOnly>
+        Assert.Equal(DateType.Instance, schema["Day"].DataType); // unwraps to DateOnly -> DateType
+    }
+
+    [Fact]
+    public void Derive_EmptyType_ProducesEmptySchema()
+    {
+        StructType schema = DatasetSchema.Derive<Empty>();
+
+        Assert.Empty(schema.Fields);
+    }
+
+    // ----- AC4: unsupported property type -> deterministic schema diagnostic -----
 
     [Fact]
     public void Derive_UnsupportedPropertyType_ThrowsDeterministicDiagnostic()
     {
-        var ex = Assert.Throws<UnsupportedTypedExpressionException>(
+        var ex = Assert.Throws<UnsupportedTypedSchemaException>(
             () => DatasetSchema.Derive<WithUnsupportedProperty>());
 
         Assert.Contains("WithUnsupportedProperty.Key", ex.Message);
         Assert.Contains("Guid", ex.Message);
+    }
+
+    [Fact]
+    public void Derive_SchemaException_IsAnUnsupportedTypedException()
+    {
+        // The schema diagnostic shares the UnsupportedTypedException base with the lambda diagnostic,
+        // but is a DISTINCT type so a catch for a bad lambda does not swallow an unmappable property.
+        var ex = Assert.Throws<UnsupportedTypedSchemaException>(
+            () => DatasetSchema.Derive<WithUnsupportedProperty>());
+
+        Assert.IsAssignableFrom<UnsupportedTypedException>(ex);
+        Assert.IsNotType<UnsupportedTypedExpressionException>(ex);
     }
 }

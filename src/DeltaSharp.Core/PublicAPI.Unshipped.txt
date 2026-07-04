@@ -249,7 +249,15 @@ DeltaSharp.Dataset<T>.Select(params System.Linq.Expressions.Expression<System.Fu
 DeltaSharp.Dataset<T>.ToDF() -> DeltaSharp.DataFrame!
 DeltaSharp.Dataset<T>.Where(DeltaSharp.Column! condition) -> DeltaSharp.Dataset<T>!
 DeltaSharp.Dataset<T>.Where(System.Linq.Expressions.Expression<System.Func<T, bool>!>! predicate) -> DeltaSharp.Dataset<T>!
+DeltaSharp.UnsupportedTypedException
+DeltaSharp.UnsupportedTypedException.UnsupportedTypedException() -> void
+DeltaSharp.UnsupportedTypedException.UnsupportedTypedException(string! message) -> void
+DeltaSharp.UnsupportedTypedException.UnsupportedTypedException(string! message, System.Exception! innerException) -> void
 DeltaSharp.UnsupportedTypedExpressionException
 DeltaSharp.UnsupportedTypedExpressionException.UnsupportedTypedExpressionException() -> void
 DeltaSharp.UnsupportedTypedExpressionException.UnsupportedTypedExpressionException(string! message) -> void
 DeltaSharp.UnsupportedTypedExpressionException.UnsupportedTypedExpressionException(string! message, System.Exception! innerException) -> void
+DeltaSharp.UnsupportedTypedSchemaException
+DeltaSharp.UnsupportedTypedSchemaException.UnsupportedTypedSchemaException() -> void
+DeltaSharp.UnsupportedTypedSchemaException.UnsupportedTypedSchemaException(string! message) -> void
+DeltaSharp.UnsupportedTypedSchemaException.UnsupportedTypedSchemaException(string! message, System.Exception! innerException) -> void
