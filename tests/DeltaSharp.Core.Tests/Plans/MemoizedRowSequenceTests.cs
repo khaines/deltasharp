@@ -1,8 +1,6 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Threading;
-using System.Threading.Tasks;
 using DeltaSharp.Plans.Logical;
 using DeltaSharp.Types;
 using Xunit;
@@ -24,39 +22,64 @@ public sealed class MemoizedRowSequenceTests
     });
 
     [Fact]
-    public async Task Snapshot_SecondCallerBlockedOnGate_HonorsItsOwnCancellation()
+    public void Snapshot_SecondCallerBlockedOnGate_HonorsItsOwnCancellation()
     {
-        var drainStarted = new ManualResetEventSlim();
+        // Deterministic (no timers / no thread pool, so it can't flake under CI scheduling): caller 1 takes
+        // the drain gate and holds it on a manual signal; caller 2 blocks behind it and is then cancelled
+        // EXPLICITLY while blocked. With a plain lock caller 2 would stay blocked until caller 1 released
+        // and then return the cached snapshot WITHOUT throwing; the cancellable acquisition makes it observe
+        // its own cancellation while still blocked, before caller 1 is released.
+        var caller1HasGate = new ManualResetEventSlim();
+        var releaseCaller1 = new ManualResetEventSlim();
 
-        // The first caller (below) drains this source; MoveNext signals then holds the drain gate ~800 ms.
-        IEnumerable<Row> SlowHoldingSource()
+        IEnumerable<Row> GatedSource()
         {
-            drainStarted.Set();
-            Thread.Sleep(800);
+            caller1HasGate.Set();
+            releaseCaller1.Wait();
             yield return new Row(Schema, 1);
         }
 
-        var sequence = MemoizedRowSequence.Wrap(SlowHoldingSource());
+        var sequence = MemoizedRowSequence.Wrap(GatedSource());
 
-        // Caller 1 wins the gate and drains (uncancelled) for ~800 ms.
-        Task<IReadOnlyList<Row>> first = Task.Run(() => sequence.Snapshot(CancellationToken.None));
-        Assert.True(drainStarted.Wait(TimeSpan.FromSeconds(5)), "the first drain never started");
+        // Dedicated threads (NOT Task.Run) so caller 1's blocking hold cannot starve caller 2 or the token.
+        var caller1 = new Thread(() => sequence.Snapshot(CancellationToken.None)) { IsBackground = true };
+        caller1.Start();
+        Assert.True(caller1HasGate.Wait(TimeSpan.FromSeconds(5)), "caller 1 never took the drain gate");
 
-        // Caller 2 blocks behind caller 1's in-progress drain with a 50 ms timeout. With a plain lock it
-        // would ignore its token until caller 1 finishes (~800 ms) and then return the cached snapshot
-        // WITHOUT throwing; the cancellable acquisition makes it observe its own cancellation promptly.
         using var cts = new CancellationTokenSource();
-        cts.CancelAfter(TimeSpan.FromMilliseconds(50));
-        var stopwatch = Stopwatch.StartNew();
-        Assert.Throws<OperationCanceledException>(() => sequence.Snapshot(cts.Token));
-        stopwatch.Stop();
+        Exception? thrown = null;
+        var caller2Done = new ManualResetEventSlim();
+        var caller2 = new Thread(() =>
+        {
+            try
+            {
+                sequence.Snapshot(cts.Token);
+            }
+            catch (Exception ex)
+            {
+                thrown = ex;
+            }
+            finally
+            {
+                caller2Done.Set();
+            }
+        })
+        { IsBackground = true };
+        caller2.Start();
 
+        // Give caller 2 time to block on the gate, then cancel it explicitly.
+        Thread.Sleep(200);
+        cts.Cancel();
+
+        // Caller 2 must finish (by throwing) WITHOUT caller 1 ever being released.
         Assert.True(
-            stopwatch.ElapsedMilliseconds < 600,
-            $"the blocked caller waited {stopwatch.ElapsedMilliseconds} ms instead of honoring its 50 ms token");
+            caller2Done.Wait(TimeSpan.FromSeconds(5)),
+            "the blocked caller never observed its cancellation (it waited for caller 1's drain)");
+        Assert.IsAssignableFrom<OperationCanceledException>(thrown);
 
-        // Let caller 1 finish cleanly (it drains one row uncancelled).
-        Assert.Single(await first);
+        // Clean up caller 1.
+        releaseCaller1.Set();
+        caller1.Join(TimeSpan.FromSeconds(5));
     }
 
     [Fact]
