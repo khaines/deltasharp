@@ -146,8 +146,12 @@ The `where applicable` qualifier from STORY-00.4.1 is deliberate: `task.id`, `ex
 distributed executor and the Delta layer), and are omitted rather than faked in M1's single-node, tableless
 paths.
 
-**Cardinality rule.** Every **metric-label** key names a **bounded** set (the four metric-label-safe keys
-above, plus storage `backend`, storage I/O `direction` (read/write), error class, and protocol). Values that are unbounded or credential-bearing
+**Cardinality rule.** Every **metric-label** key names a **bounded** set — today the four metric-label-safe
+keys above. Future storage, error-classification, and propagation instruments will add their own bounded
+labels (a storage `backend`, a storage-I/O `direction` — `read`/`write` —, a sanitized error class, and a
+wire `protocol`); these are **documented here but not yet minted** in `DeltaSharpTelemetry` (exactly like the
+Resource keys above), and will be added as `deltasharp.`-prefixed keys — or adopted OpenTelemetry
+semantic-convention keys such as `error.type` — in the same PR as the instrument that first emits them. Values that are unbounded or credential-bearing
 — raw storage paths, SQL text, plan text, row/cell values, user or tenant identity, pod UIDs, object keys,
 shuffle block IDs — are **never** a metric label or attribute **value**, and secrets/PII/SQL literals/row
 values are **never** placed anywhere at all (see redaction below). Bounded correlation detail (job/task/
@@ -388,9 +392,12 @@ executor, and operator unless the instrument name identifies the viewpoint.
 
 ### Labels and cardinality limits
 
-Labels use the **metric-label-safe** set only — the four bounded `DeltaSharpTelemetry` keys
-(`deltasharp.component`, `deltasharp.operation`, `deltasharp.outcome`, `deltasharp.stage`) plus storage
-`backend`, storage I/O `direction` (read/write), error class, and protocol. The **correlation/exemplar-only** keys (`deltasharp.job.id`,
+Labels use the **metric-label-safe** set only — today the four bounded `DeltaSharpTelemetry` keys
+(`deltasharp.component`, `deltasharp.operation`, `deltasharp.outcome`, `deltasharp.stage`). Future storage,
+error-classification, and propagation instruments add their own bounded labels (a storage `backend`, a
+storage-I/O `direction` — `read`/`write` —, a sanitized error class, and a wire `protocol`), **documented
+here but not yet minted** in `DeltaSharpTelemetry` and added as `deltasharp.`-prefixed (or adopted OpenTelemetry
+semantic-convention) keys when those instruments land. The **correlation/exemplar-only** keys (`deltasharp.job.id`,
 `deltasharp.task.id`, `deltasharp.executor.id`, `deltasharp.attempt`, `deltasharp.partition`,
 `deltasharp.table`, `deltasharp.table.version`, `deltasharp.correlation.id`) are **never** metric labels —
 they grow unbounded over a run's or table's lifetime — and attach instead to logs, span attributes, and

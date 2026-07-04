@@ -65,8 +65,10 @@ internal static class DeltaSharpTelemetry
     /// never collapsed into one ambiguous count (checklist <c>09b</c>).</summary>
     internal const string OutcomeKey = "deltasharp.outcome";
 
-    /// <summary>Correlates every signal for one logical job/application. An opaque, bounded-generation
-    /// identifier — never a user, tenant, or path value.</summary>
+    /// <summary>Correlates every signal for one logical job/application. An opaque identifier — never a
+    /// user, tenant, or path value. A <b>correlation/exemplar-only</b> field: valid on structured logs, span
+    /// attributes, and metric exemplars, but <b>never</b> a metric label — job ids are unbounded across runs
+    /// and would multiply a metric's time-series cardinality without bound.</summary>
     internal const string JobIdKey = "deltasharp.job.id";
 
     /// <summary>The pipeline stage a signal belongs to. A bounded enum-like value drawn from the
@@ -74,12 +76,15 @@ internal static class DeltaSharpTelemetry
     /// <c>materialize</c>), never free text.</summary>
     internal const string StageKey = "deltasharp.stage";
 
-    /// <summary>Identifies a task within a stage. Opaque and bounded per run; used on task-scoped signals
-    /// once the distributed executor exists.</summary>
+    /// <summary>Identifies a task within a stage. Opaque; bounded per run but unbounded across runs, so it is
+    /// a <b>correlation/exemplar-only</b> field (structured logs, span attributes, metric exemplars) and
+    /// <b>never</b> a metric label. Used on task-scoped signals once the distributed executor exists.</summary>
     internal const string TaskIdKey = "deltasharp.task.id";
 
-    /// <summary>Identifies the executor that produced the signal. Opaque and bounded (an executor
-    /// ordinal/slot), never a pod UID or other unbounded identity.</summary>
+    /// <summary>Identifies the executor that produced the signal — an executor ordinal/slot, never a pod UID
+    /// or other unbounded identity. Bounded per run but unbounded across runs, so it is a
+    /// <b>correlation/exemplar-only</b> field (structured logs, span attributes, metric exemplars) and
+    /// <b>never</b> a metric label.</summary>
     internal const string ExecutorIdKey = "deltasharp.executor.id";
 
     /// <summary>The logical table identity a signal concerns (catalog-qualified name), used instead of a
@@ -98,7 +103,9 @@ internal static class DeltaSharpTelemetry
 
     /// <summary>An explicit request/action correlation identifier for paths that predate an ambient
     /// <c>Activity</c> trace context, or that must carry correlation across a boundary where trace context
-    /// is not propagated. Opaque and bounded — never a user or tenant identity.</summary>
+    /// is not propagated. Opaque — never a user or tenant identity. A <b>correlation/exemplar-only</b> field:
+    /// valid on structured logs, span attributes, and metric exemplars, but <b>never</b> a metric label,
+    /// because correlation ids are unbounded.</summary>
     internal const string CorrelationIdKey = "deltasharp.correlation.id";
 
     /// <summary>The task/stage <b>attempt</b> number a signal belongs to (the first try, then incremented
