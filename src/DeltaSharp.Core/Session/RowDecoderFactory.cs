@@ -93,10 +93,24 @@ internal static class RowDecoderFactory
     /// <summary>
     /// Chooses the setter tier once. The compiled tier is taken only through the <b>direct</b>
     /// <see cref="UseCompiledSetters"/> guard (mirroring the ADR-0001 <c>ExecutionBackends</c> exemplar)
-    /// so the .NET 9+ feature-guard analyzer recognizes it; on net8.0 (which lacks
-    /// <c>FeatureGuardAttribute</c>) the guarded call locally suppresses IL3050 because the same
-    /// runtime guard still makes it safe.
+    /// so the .NET 9+ feature-guard analyzer recognizes it. On net8.0 (which lacks
+    /// <c>FeatureGuardAttribute</c>) the guarded <see cref="RequiresDynamicCodeAttribute"/> call cannot be
+    /// proven elided by the analyzer, so IL3050 is suppressed with an
+    /// <see cref="UnconditionalSuppressMessageAttribute"/> — honored by BOTH the build analyzer AND the
+    /// NativeAOT publish (ILC), unlike a <c>#pragma</c> which the C# compiler applies but ILC ignores. The
+    /// same <see cref="RuntimeFeature.IsDynamicCodeSupported"/> runtime guard keeps it safe: under AOT the
+    /// gate is false and the compiled tier is never invoked (the reflection tier runs).
     /// </summary>
+#if !NET9_0_OR_GREATER
+    [UnconditionalSuppressMessage(
+        "AOT",
+        "IL3050:RequiresDynamicCode",
+        Justification =
+            "The compiled setter tier is invoked only when RuntimeFeature.IsDynamicCodeSupported is true; "
+            + "under NativeAOT the gate is false and the AOT-safe reflection tier runs. net8.0 lacks "
+            + "[FeatureGuard] to prove this to the analyzer, and #pragma warning disable IL3050 is not "
+            + "honored by the ILC publish step, so the guarantee is asserted here.")]
+#endif
     private static Action<object, object?>[] BuildSetters(
         PropertyInfo[] properties,
         bool forceReflectionSetters,
@@ -107,13 +121,7 @@ internal static class RowDecoderFactory
             if (UseCompiledSetters)
             {
                 usesCompiled = true;
-#if !NET9_0_OR_GREATER
-#pragma warning disable IL3050 // net8.0 lacks [FeatureGuard]; the UseCompiledSetters runtime guard keeps this safe (reflection under AOT).
-#endif
                 return CompileSetters(properties);
-#if !NET9_0_OR_GREATER
-#pragma warning restore IL3050
-#endif
             }
         }
 

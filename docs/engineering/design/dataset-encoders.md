@@ -170,11 +170,16 @@ The guarded call site takes the compiled tier through a **direct** `if (UseCompi
 **Cross-TFM note.** `DeltaSharp.Core` multi-targets `net8.0;net10.0` (ADR-0014), but
 `FeatureGuardAttribute` only exists on **.NET 9+**. So the attribute is `#if NET9_0_OR_GREATER`, and on
 `net8.0` — where the analyzer cannot see the guard — the guarded call to the `[RequiresDynamicCode]`
-`CompileSetters` locally suppresses IL3050 (`#if !NET9_0_OR_GREATER #pragma warning disable IL3050`),
-because the **same** `RuntimeFeature.IsDynamicCodeSupported` runtime guard still makes the call safe (it
-falls back to reflection under AOT). The `Expression.Compile()` call itself is a banned API (RS0030) and
-carries a scoped `#pragma warning disable RS0030`, exactly as the engine's `CompiledBackend` does. The
-whole file builds `-warnaserror` clean (0/0) on **both** TFMs.
+`CompileSetters` suppresses IL3050 with a `net8.0`-only
+`[UnconditionalSuppressMessage("AOT", "IL3050")]` on `BuildSetters`, because the **same**
+`RuntimeFeature.IsDynamicCodeSupported` runtime guard still makes the call safe (it falls back to
+reflection under AOT). `UnconditionalSuppressMessage` is used rather than `#pragma warning disable
+IL3050` deliberately: a `#pragma` is honored only by the C# compiler's build-time analyzer, **not** by
+the NativeAOT publish step (ILC), which re-analyzes the IL and would still emit IL3050 at
+`dotnet publish /p:PublishAot=true`; the attribute is honored by both. (Verified: a rooted `net8.0`
+consumer publishes AOT with **0** IL3050.) The `Expression.Compile()` call itself is a banned API
+(RS0030) and carries a scoped `#pragma warning disable RS0030`, exactly as the engine's
+`CompiledBackend` does. The whole file builds `-warnaserror` clean (0/0) on **both** TFMs.
 
 **Parity.** Because both tiers share construction and `PrepareValue` and differ only in the setter, they
 must decode any row to an identical `T`. Tests assert this directly (`forceReflectionSetters:true` vs the
