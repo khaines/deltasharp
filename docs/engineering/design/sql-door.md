@@ -108,9 +108,9 @@ The parser (`src/DeltaSharp.Core/Sql/SqlParser.cs`) accepts exactly this grammar
 case-insensitive, ANSI parity):
 
 ```ebnf
-statement      := SELECT selectList FROM relation [ WHERE booleanExpr ] EOF
-selectList     := '*' | selectItem (',' selectItem)*
-selectItem     := expr [ [AS] identifier ] | qualifiedStar
+statement      := SELECT [ ALL ] selectList FROM relation [ WHERE booleanExpr ] EOF
+selectList     := selectItem (',' selectItem)*
+selectItem     := '*' | qualifiedStar | expr [ [AS] identifier ]
 qualifiedStar  := identifier ('.' identifier)* '.' '*'
 relation       := identifier ('.' identifier)*          (* multipart table id, e.g. db.t *)
 booleanExpr    := orExpr
@@ -128,15 +128,33 @@ literal        := integer | decimal | string | TRUE | FALSE | NULL
 identifier     := unquotedIdent | '`' backtickIdent '`'
 ```
 
+`selectItem` allows a bare `*` (or a qualified `t.*`) **per item**, so `*` may be mixed with columns
+(e.g. `SELECT *, a`), matching the parser. `SELECT ALL …` is accepted — `ALL` is the default set
+quantifier and is consumed and ignored (`SELECT ALL a` ≡ `SELECT a`, Spark parity); `SELECT DISTINCT`
+is a named `UnsupportedFeature`. `FROM` is **required** in M1 (a bare `SELECT 1`, which Spark accepts,
+is a `SyntaxError` here — a data-source-free `SELECT` needs the one-row relation the table door adds
+later).
+
 **Precedence** (lowest → highest): `OR` < `AND` < `NOT` < comparison < `+`/`-` < `*`/`/`/`%` <
 unary sign < primary. This mirrors Spark/ANSI SQL and matches the DataFrame `Column` operator
 composition so equivalent expressions build identical trees (AC3).
 
-**Lexer** (`SqlLexer.cs`): skips whitespace; recognizes the keywords `SELECT FROM WHERE AS AND OR NOT
-TRUE FALSE NULL`; unquoted identifiers `[A-Za-z_][A-Za-z0-9_]*` and backtick-quoted identifiers
-(with `` `` `` escaping a backtick); single-quoted string literals (with `''` escaping a quote);
-integer vs. decimal numeric literals (a `.` or exponent makes it decimal); and the punctuation /
-operator glyphs. Every token carries its 1-based source position for deterministic diagnostics.
+**Recursion-depth guard.** Expression parsing is bounded by an explicit recursion counter aligned with
+`TreeNode.MaxDepth` (1000) plus a `RuntimeHelpers.EnsureSufficientExecutionStack()` check, both threaded
+through `ParseExpression`/`ParseNot`/`ParsePrimary`. Adversarially deep input (thousands of nested
+parentheses — which build **no** node, so the construction-time `TreeNode` guard never sees them — or a
+long `NOT NOT …` chain) is therefore rejected as a deterministic, **catchable** `SqlParseException`
+rather than an **uncatchable** `StackOverflowException` that would crash the whole driver process
+(AC2). As belt-and-suspenders, `Parse` also translates any escaping internal `PlanDepthExceededException`
+into a `SqlParseException`.
+
+**Lexer** (`SqlLexer.cs`): skips whitespace and SQL comments (`--` to end of line, `/* … */` block —
+so `SELECT 1--1` is `SELECT 1`, not `1 - (-1)`); recognizes the keywords `SELECT FROM WHERE AS AND OR
+NOT TRUE FALSE NULL`; unquoted identifiers (a leading Unicode letter or `_` via `char.IsLetter`, then
+letters/digits/`_`) and backtick-quoted identifiers (with `` `` `` escaping a backtick); single-quoted
+string literals (with `''` escaping a quote); integer vs. decimal numeric literals (a `.` or exponent
+makes it decimal); and the punctuation / operator glyphs. Every token carries its 1-based source
+position for deterministic diagnostics.
 
 ### Literal typing (matches `Functions.Lit`)
 
@@ -144,15 +162,17 @@ operator glyphs. Every token carries its 1-based source position for determinist
 | ---------------------- | ------------------------------------- | ----------------------------------------------- |
 | `1` (fits `int`)       | `Literal.OfInt`                       | same as `Functions.Lit(1)`                      |
 | `9999999999` (> `int`) | `Literal.OfLong`                      | widens like a CLR `long` literal                |
-| `1.5`, `2e3`           | `Literal.OfDouble`                    | same as `Functions.Lit(1.5)`; DECIMAL → EPIC-07 |
+| `1.5`, `2e3`           | `Literal.OfDouble`                    | **known Spark divergence**: Spark types a decimal literal as DECIMAL; M1 lowers to DOUBLE (DECIMAL → EPIC-07) |
 | `'abc'`                | `Literal.OfString`                    | same as `Functions.Lit("abc")`                  |
 | `TRUE` / `FALSE`       | `Literal.OfBoolean`                   | same as `Functions.Lit(true)`                   |
 | `NULL`                 | `Literal.Null(NullType.Instance)`     | same as `Functions.Lit(null)`                   |
 | `-1` (unary on number) | `Literal.OfInt(-1)` (sign folded)     | same as `Functions.Lit(-1)`                     |
 
-Unary `+`/`-` is accepted **only** directly in front of a numeric literal and folded into the literal
-(`SqlParser.cs:329-350`); a general negation node is out of the M1 subset (there is no `UnaryMinus`
-IR node yet).
+Unary `+`/`-` is accepted **only** directly in front of a numeric literal and folded into the literal;
+a general negation of a non-literal (`-a`, `-(expr)`) is a named `UnsupportedFeature` (`UNARY_MINUS`) —
+there is no `UnaryMinus` IR node yet. An integer literal beyond `long` range is a named
+`UnsupportedFeature` (`DECIMAL_LITERAL`), reflecting Spark's DECIMAL promotion.
+
 
 ## Lowering table (SQL construct → shared logical/expression node) — AC3
 
@@ -167,7 +187,7 @@ two front ends converge. Nodes live in `src/DeltaSharp.Core/Plans/Logical/` and
 | `FROM t` / `FROM db.t`           | `UnresolvedRelation([parts])`                               | `SqlParser.cs:206`    | (table door; #158 relation family)          |
 | bare `*`                         | `UnresolvedStar()`                                          | `SqlParser.cs:135`    | `Functions.Col("*")`                        |
 | `t.*`                            | `UnresolvedStar([target])`                                  | `SqlParser.cs:417`    | `Functions.Col("t.*")`                      |
-| column `a` / `t.a`               | `UnresolvedAttribute([parts])`                              | `SqlParser.cs:430`    | `Functions.Col("a")`                        |
+| column `a` / `t.a`               | `UnresolvedAttribute([parts])`                              | `SqlParser.cs`        | `Functions.Col("a")` / `Functions.Col("t.a")` (both split on `.`) |
 | `expr AS x` / `expr x`           | `Alias(expr, "x")`                                          | `SqlParser.cs:149,157`| `Column.As("x")`                            |
 | `= <> != < <= > >=`              | `BinaryComparison(l, r, op)`                                | `SqlParser.cs:271`    | `Column.EqualTo/Lt/Gt/...`                  |
 | `+ - * / %`                      | `BinaryArithmetic(l, r, op)`                                | `SqlParser.cs:297,325`| `Column` `+ - * / %` operators              |
@@ -188,27 +208,35 @@ no catalog and no executor.
 
 Anything outside the subset raises a deterministic `SqlParseException` at **parse time**, so it can
 never reach analysis or a backend. The exception carries a structured `ErrorKind` and, for
-unsupported constructs, the named `Construct` — so callers branch without matching message text (the
-same rationale as the analyzer's `AnalysisException.Kind`). Messages are built only from deterministic
-inputs (the construct name / offending token and its 1-based position), so they are stable and
-catchable (`SqlParseException.cs`).
+unsupported constructs, a short **stable** `Construct` token — the programmatic branch key callers
+switch on (it freezes once shipped, so it is a terse identifier like `GROUP_BY`, not prose). The
+human-readable phrasing — and, where a live DataFrame equivalent exists, an onboarding hint such as
+"use `DataFrame.GroupBy(...)`" — lives **only** in the message. Messages are built only from
+deterministic inputs (the construct token / offending token and its 1-based position), so they are
+stable and catchable (`SqlParseException.cs`).
 
-| Rejected input                         | `ErrorKind`         | `Construct`                                 | Detected at                    |
+| Rejected input                         | `ErrorKind`         | `Construct` (stable token)                  | Detected at                    |
 | -------------------------------------- | ------------------- | ------------------------------------------- | ------------------------------ |
 | `… JOIN …`, `INNER/LEFT/… JOIN`        | `UnsupportedFeature`| `JOIN`                                      | `ExpectEnd` → `MapTrailingConstruct` |
-| `FROM t, u`                            | `UnsupportedFeature`| `comma-separated table list (implicit join)`| `ExpectEnd`                    |
-| `GROUP BY` / `ORDER BY` / `HAVING`     | `UnsupportedFeature`| `GROUP BY` / `ORDER BY` / `HAVING`          | `ExpectEnd`                    |
+| `FROM t, u`                            | `UnsupportedFeature`| `IMPLICIT_JOIN`                             | `ExpectEnd`                    |
+| `GROUP BY` / `ORDER BY` / `HAVING`     | `UnsupportedFeature`| `GROUP_BY` / `ORDER_BY` / `HAVING`          | `ExpectEnd`                    |
 | `LIMIT` / `OFFSET` / `WINDOW`          | `UnsupportedFeature`| `LIMIT` / `OFFSET` / `WINDOW`               | `ExpectEnd`                    |
-| `UNION` / `INTERSECT` / `EXCEPT`       | `UnsupportedFeature`| `set operation (UNION/INTERSECT/EXCEPT)`    | `ExpectEnd`                    |
-| `SELECT DISTINCT …`                    | `UnsupportedFeature`| `SELECT DISTINCT`                           | `RejectSetQuantifier` (`:104`) |
-| `count(a)`, any `name(...)`            | `UnsupportedFeature`| `function call`                             | `ParseColumnReference` (`:405`)|
-| `FROM (SELECT …)`, `(SELECT …)` operand| `UnsupportedFeature`| `subquery`                                  | `ParseRelation`/`ParsePrimary` |
-| `INSERT/UPDATE/DELETE/MERGE`           | `UnsupportedFeature`| `INSERT` / `UPDATE` / …                     | `MapStatementKeyword` (`:69`)  |
+| `UNION` / `INTERSECT` / `EXCEPT`       | `UnsupportedFeature`| `UNION`                                     | `ExpectEnd`                    |
+| `CLUSTER/DISTRIBUTE/SORT BY`           | `UnsupportedFeature`| `SORT_BY`                                   | `ExpectEnd`                    |
+| `SELECT DISTINCT …`                    | `UnsupportedFeature`| `SELECT_DISTINCT`                           | `RejectSetQuantifier`          |
+| `count(a)`, any `name(...)`            | `UnsupportedFeature`| `FUNCTION_CALL`                             | `ParseColumnReference`         |
+| `FROM (SELECT …)`, `(SELECT …)` operand| `UnsupportedFeature`| `SUBQUERY`                                  | `ParseRelation`/`ParsePrimary` |
+| `-a`, `-(expr)` (general negation)     | `UnsupportedFeature`| `UNARY_MINUS`                               | `ParseUnary`                   |
+| integer literal beyond `long` range    | `UnsupportedFeature`| `DECIMAL_LITERAL`                           | `ParseNumericLiteral`          |
+| `IS [NOT] NULL` / `IN` / `LIKE` / `BETWEEN` | `UnsupportedFeature`| `IS_NULL` / `IN` / `LIKE` / `BETWEEN`  | `ParseComparison`              |
+| `INSERT/UPDATE/DELETE/MERGE`           | `UnsupportedFeature`| `INSERT` / `UPDATE` / …                     | `MapStatementKeyword`          |
 | `CREATE/DROP/ALTER/TRUNCATE/…`         | `UnsupportedFeature`| `CREATE` / `DROP` / …                       | `MapStatementKeyword`          |
-| `WITH`, `VALUES`, `SHOW`, `EXPLAIN`, … | `UnsupportedFeature`| `WITH (common table expression)` / …        | `MapStatementKeyword`          |
+| `WITH`, `VALUES`, `SHOW`, `EXPLAIN`, … | `UnsupportedFeature`| `CTE` / `VALUES` / `SHOW` / `EXPLAIN` / …   | `MapStatementKeyword`          |
 | empty / not `SELECT` / missing `FROM`  | `SyntaxError`       | `null`                                      | statement / relation parse     |
-| unterminated string / bad char         | `SyntaxError`       | `null`                                      | `SqlLexer`                     |
+| unterminated string/comment / bad char | `SyntaxError`       | `null`                                      | `SqlLexer`                     |
 | `SELECT a FROM t WHERE` (dangling)     | `SyntaxError`       | `null`                                      | expression parse               |
+| `a = b = c` (chained comparison)       | `SyntaxError`       | `null`                                      | `ParseComparison`              |
+| expression nesting too deep            | `SyntaxError`       | `null`                                      | recursion-depth guard          |
 
 "Recognizable SQL we do not implement yet" → `UnsupportedFeature` (names the construct);
 "not well-formed against the grammar" → `SyntaxError`. Both are thrown from `SqlParser.Parse` before
@@ -239,18 +267,27 @@ session throws `SessionStoppedException`, not `ArgumentNullException` (asserted 
 
 ## Testing
 
-`tests/DeltaSharp.Core.Tests/SqlDoor/SqlDoorTests.cs` (31 cases across both TFMs):
+`tests/DeltaSharp.Core.Tests/SqlDoor/SqlDoorTests.cs` (across both TFMs):
 
 - **AC1 (lazy):** `SELECT * FROM t` and `SELECT a FROM t WHERE b > 1` build `Project`/`Filter`/
   `UnresolvedRelation` with `Plan.Resolved == false`; a `ThrowingQueryExecutor` is installed to prove
   the door never executes.
 - **AC3 (shared nodes):** the lowered plan is **structurally equal** to a hand-built expected tree and
   the lowered expressions **equal** the live `Functions.Col`/`Column`-operator expressions
-  (projection, filter, alias, qualified star, boolean/arithmetic precedence, negative-literal folding).
+  (projection, multi-column projection **order**, filter, alias, qualified star, qualified column
+  `t.a` ≡ `Col("t.a")`, boolean/arithmetic precedence, negative-literal folding); a qualified column
+  also **resolves** through the shared analyzer pipeline (`t.a` → `a`).
 - **AC2 (unsupported):** a table of constructs (joins, aggregates, `GROUP BY`/`ORDER BY`/`HAVING`/
-  `LIMIT`, subqueries, function calls, set operations, DDL/DML) each throw `UnsupportedFeature` naming
-  the construct; malformed inputs throw `SyntaxError`; determinism is asserted (same input → identical
-  message).
+  `LIMIT`, subqueries, function calls, set operations, DDL/DML, `SELECT DISTINCT`, general unary minus,
+  large-integer DECIMAL promotion, `IS NULL`/`IN`/`LIKE`/`BETWEEN`) each throw `UnsupportedFeature`
+  with the stable `Construct` token; the DataFrame-onboarding hints are asserted; malformed inputs
+  (including chained comparison and a known 1-based position) throw `SyntaxError`; determinism is
+  asserted (same input → identical message).
+- **DoS guard:** deeply nested parentheses (≥2000) and a long `NOT` chain (≥2000) each throw a
+  **caught** `SqlParseException` (never a `StackOverflowException` or the internal
+  `PlanDepthExceededException`), while moderate nesting still parses.
+- **Comments & quantifier:** `--`/`/* */` comments are skipped (`1--1` is `SELECT 1`, not arithmetic);
+  `SELECT ALL a` ≡ `SELECT a` while a column named `all` still parses as a column.
 - **AC4 (lifecycle):** a stopped session throws `SessionStoppedException` from `Sql` with the same
   `ForMember` message model as `Read`, and the guard precedes the null check.
 

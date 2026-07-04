@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
+using DeltaSharp.Analysis;
 using DeltaSharp.Execution;
 using DeltaSharp.Plans.Expressions;
 using DeltaSharp.Plans.Logical;
+using DeltaSharp.Types;
 using Xunit;
 
 namespace DeltaSharp.Core.Tests.SqlDoor;
@@ -140,20 +142,20 @@ public sealed class SqlDoorTests
     // ---------------- AC2: unsupported constructs → deterministic error at parse time ----------------
 
     [Theory]
-    [InlineData("SELECT a FROM t JOIN u ON t.a = u.a", "JOIN")]
-    [InlineData("SELECT a FROM t, u", "comma-separated table list (implicit join)")]
-    [InlineData("SELECT count(a) FROM t", "function call")]
-    [InlineData("SELECT a FROM t GROUP BY a", "GROUP BY")]
-    [InlineData("SELECT a FROM t ORDER BY a", "ORDER BY")]
-    [InlineData("SELECT a FROM t HAVING a > 1", "HAVING")]
-    [InlineData("SELECT a FROM t LIMIT 5", "LIMIT")]
-    [InlineData("SELECT DISTINCT a FROM t", "SELECT DISTINCT")]
-    [InlineData("SELECT a FROM (SELECT a FROM t)", "subquery")]
-    [InlineData("SELECT a FROM t UNION SELECT a FROM u", "set operation (UNION/INTERSECT/EXCEPT)")]
-    [InlineData("INSERT INTO t VALUES (1)", "INSERT")]
-    [InlineData("CREATE TABLE t (a INT)", "CREATE")]
+    [InlineData("SELECT a FROM t JOIN u ON t.a = u.a", "JOIN", "JOIN")]
+    [InlineData("SELECT a FROM t, u", "IMPLICIT_JOIN", "implicit join")]
+    [InlineData("SELECT count(a) FROM t", "FUNCTION_CALL", "function call")]
+    [InlineData("SELECT a FROM t GROUP BY a", "GROUP_BY", "GROUP BY")]
+    [InlineData("SELECT a FROM t ORDER BY a", "ORDER_BY", "ORDER BY")]
+    [InlineData("SELECT a FROM t HAVING a > 1", "HAVING", "HAVING")]
+    [InlineData("SELECT a FROM t LIMIT 5", "LIMIT", "LIMIT")]
+    [InlineData("SELECT DISTINCT a FROM t", "SELECT_DISTINCT", "SELECT DISTINCT")]
+    [InlineData("SELECT a FROM (SELECT a FROM t)", "SUBQUERY", "subquery")]
+    [InlineData("SELECT a FROM t UNION SELECT a FROM u", "UNION", "UNION")]
+    [InlineData("INSERT INTO t VALUES (1)", "INSERT", "INSERT")]
+    [InlineData("CREATE TABLE t (a INT)", "CREATE", "CREATE")]
     public void Sql_UnsupportedConstruct_ThrowsUnsupportedFeature_NamingConstruct_WithoutExecuting(
-        string sql, string expectedConstruct)
+        string sql, string expectedConstruct, string expectedMessagePart)
     {
         using SparkSession spark = NewSession();
         spark.QueryExecutor = new ThrowingQueryExecutor();
@@ -162,7 +164,61 @@ public sealed class SqlDoorTests
 
         Assert.Equal(SqlParseErrorKind.UnsupportedFeature, ex.ErrorKind);
         Assert.Equal(expectedConstruct, ex.Construct);
-        Assert.Contains(expectedConstruct, ex.Message, StringComparison.Ordinal);
+        Assert.Contains(expectedMessagePart, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Sql_UnsupportedConstruct_ExposesStableTokenSeparateFromProse()
+    {
+        using SparkSession spark = NewSession();
+
+        SqlParseException ex = Assert.Throws<SqlParseException>(() => spark.Sql("SELECT a FROM t GROUP BY a"));
+
+        // The Construct is the stable programmatic token (no spaces / prose); the human phrasing lives
+        // only in the message.
+        Assert.Equal("GROUP_BY", ex.Construct);
+        string construct = Assert.IsType<string>(ex.Construct);
+        Assert.DoesNotContain(' ', construct);
+        Assert.Contains("GROUP BY", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("SELECT a FROM t JOIN u ON t.a = u.a", "DataFrame.Join(")]
+    [InlineData("SELECT a FROM t GROUP BY a", "DataFrame.GroupBy(")]
+    [InlineData("SELECT a FROM t ORDER BY a", "DataFrame.OrderBy(")]
+    [InlineData("SELECT a FROM t LIMIT 5", "DataFrame.Limit(")]
+    [InlineData("SELECT DISTINCT a FROM t", "DataFrame.Distinct(")]
+    [InlineData("SELECT a FROM t UNION SELECT a FROM u", "DataFrame.Union(")]
+    public void Sql_UnsupportedConstructWithDataFrameEquivalent_AppendsOnboardingHint(
+        string sql, string expectedHint)
+    {
+        using SparkSession spark = NewSession();
+
+        SqlParseException ex = Assert.Throws<SqlParseException>(() => spark.Sql(sql));
+
+        Assert.Contains(expectedHint, ex.Message, StringComparison.Ordinal);
+    }
+
+    // ---- AC2: recognizable-but-unsupported constructs classify as UnsupportedFeature (not syntax) ----
+
+    [Theory]
+    [InlineData("SELECT a FROM t WHERE -a > 1", "UNARY_MINUS")]
+    [InlineData("SELECT a FROM t WHERE -(a) > 1", "UNARY_MINUS")]
+    [InlineData("SELECT 99999999999999999999999999 FROM t", "DECIMAL_LITERAL")]
+    [InlineData("SELECT a FROM t WHERE a IS NULL", "IS_NULL")]
+    [InlineData("SELECT a FROM t WHERE a IS NOT NULL", "IS_NULL")]
+    [InlineData("SELECT a FROM t WHERE a IN (1, 2)", "IN")]
+    [InlineData("SELECT a FROM t WHERE a LIKE 'x%'", "LIKE")]
+    [InlineData("SELECT a FROM t WHERE a BETWEEN 1 AND 2", "BETWEEN")]
+    public void Sql_RecognizableUnsupportedConstruct_ClassifiesAsUnsupportedFeature(
+        string sql, string expectedConstruct)
+    {
+        using SparkSession spark = NewSession();
+
+        SqlParseException ex = Assert.Throws<SqlParseException>(() => spark.Sql(sql));
+
+        Assert.Equal(SqlParseErrorKind.UnsupportedFeature, ex.ErrorKind);
+        Assert.Equal(expectedConstruct, ex.Construct);
     }
 
     [Fact]
@@ -231,6 +287,216 @@ public sealed class SqlDoorTests
 
         // Lifecycle guard runs before the null-argument check, exactly like Read has no body to reach.
         Assert.Throws<SessionStoppedException>(() => spark.Sql(null!));
+    }
+
+    // ---------------- Recursion-depth guard: deep input is a caught error, not a crash ----------------
+
+    [Fact]
+    public void Sql_DeeplyNestedParentheses_ThrowsCaughtSqlParseException_NotStackOverflow()
+    {
+        using SparkSession spark = NewSession();
+
+        // ~2000 nested parens would overflow a realistic 1 MB worker-thread stack (uncatchable
+        // StackOverflow crashing the whole process) without the parser's recursion-depth guard.
+        const int depth = 2000;
+        string sql = "SELECT a FROM t WHERE " + new string('(', depth) + "1" + new string(')', depth) + " = 1";
+
+        SqlParseException ex = Assert.Throws<SqlParseException>(() => spark.Sql(sql));
+
+        Assert.Equal(SqlParseErrorKind.SyntaxError, ex.ErrorKind);
+        Assert.Contains("nesting too deep", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Sql_DeepNotChain_ThrowsCaughtSqlParseException_NotPlanDepthExceeded()
+    {
+        using SparkSession spark = NewSession();
+
+        // A long NOT chain used to leak the INTERNAL PlanDepthExceededException (or, past the guard,
+        // overflow the stack). It must surface as the public, catchable SqlParseException.
+        string notChain = string.Concat(System.Linq.Enumerable.Repeat("NOT ", 2000));
+        string sql = "SELECT a FROM t WHERE " + notChain + "c";
+
+        SqlParseException ex = Assert.Throws<SqlParseException>(() => spark.Sql(sql));
+
+        Assert.Equal(SqlParseErrorKind.SyntaxError, ex.ErrorKind);
+    }
+
+    [Fact]
+    public void Sql_ModeratelyNestedParentheses_StillParses()
+    {
+        using SparkSession spark = NewSession();
+
+        // Well within the bound: proves the guard does not reject legitimate nesting.
+        const int depth = 50;
+        string sql = "SELECT a FROM t WHERE " + new string('(', depth) + "b > 1" + new string(')', depth);
+
+        DataFrame df = spark.Sql(sql);
+
+        Assert.IsType<Filter>(((Project)df.Plan).Child);
+    }
+
+    // ---------------- SELECT ALL (default set quantifier) ----------------
+
+    [Fact]
+    public void Sql_SelectAll_IsEquivalentToSelectWithoutQuantifier()
+    {
+        using SparkSession spark = NewSession();
+
+        DataFrame withAll = spark.Sql("SELECT ALL a FROM t");
+        DataFrame without = spark.Sql("SELECT a FROM t");
+
+        Assert.True(without.Plan.Equals(withAll.Plan));
+        var project = (Project)withAll.Plan;
+        Expression only = Assert.Single(project.ProjectList);
+        Assert.True(Functions.Col("a").Expr.Equals(only));
+    }
+
+    [Fact]
+    public void Sql_ColumnNamedAll_IsStillParsedAsColumn()
+    {
+        using SparkSession spark = NewSession();
+
+        // 'all' followed by FROM is a column reference, not a quantifier.
+        DataFrame df = spark.Sql("SELECT all FROM t");
+
+        var project = (Project)df.Plan;
+        Expression only = Assert.Single(project.ProjectList);
+        var attribute = Assert.IsType<UnresolvedAttribute>(only);
+        Assert.Equal(new[] { "all" }, attribute.NameParts);
+    }
+
+    // ---------------- SQL comments (line and block) are skipped ----------------
+
+    [Fact]
+    public void Sql_LineComment_IsSkipped()
+    {
+        using SparkSession spark = NewSession();
+
+        DataFrame df = spark.Sql("SELECT a FROM t -- trailing comment\n");
+
+        Assert.True(spark.Sql("SELECT a FROM t").Plan.Equals(df.Plan));
+    }
+
+    [Fact]
+    public void Sql_BlockComment_IsSkipped()
+    {
+        using SparkSession spark = NewSession();
+
+        DataFrame df = spark.Sql("SELECT a /* inline */ FROM t");
+
+        Assert.True(spark.Sql("SELECT a FROM t").Plan.Equals(df.Plan));
+    }
+
+    [Fact]
+    public void Sql_DoubleDash_NoLongerParsesAsArithmetic()
+    {
+        using SparkSession spark = NewSession();
+
+        // '1--1' is 'SELECT 1' with the rest of the line commented out — NOT 1 - (-1) arithmetic.
+        DataFrame df = spark.Sql("SELECT 1--1\nFROM t");
+
+        var project = (Project)df.Plan;
+        Expression only = Assert.Single(project.ProjectList);
+        Literal literal = Assert.IsType<Literal>(only);
+        Assert.True(Functions.Lit(1).Expr.Equals(literal));
+    }
+
+    // ---------------- AC3: multipart references converge across both front-ends (item 5) ----------------
+
+    [Fact]
+    public void Sql_QualifiedColumn_LowersToSameMultipartAttributeAsCol()
+    {
+        using SparkSession spark = NewSession();
+
+        DataFrame df = spark.Sql("SELECT t.a FROM t");
+
+        var project = (Project)df.Plan;
+        Expression element = Assert.Single(project.ProjectList);
+        var attribute = Assert.IsType<UnresolvedAttribute>(element);
+        Assert.Equal(new[] { "t", "a" }, attribute.NameParts);
+
+        // Both doors now build the identical multipart reference.
+        Assert.True(Functions.Col("t.a").Expr.Equals(element));
+    }
+
+    [Fact]
+    public void Sql_QualifiedColumn_ResolvesThroughSharedAnalyzerPipeline()
+    {
+        using SparkSession spark = NewSession();
+        var schema = new StructType(new[]
+        {
+            new StructField("a", IntegerType.Instance, nullable: true),
+        });
+        var catalog = new LocalCatalog();
+        catalog.Register("t", schema);
+        var analyzer = new Analyzer(catalog);
+
+        DataFrame df = spark.Sql("SELECT t.a FROM t");
+        var resolved = Assert.IsType<Project>(analyzer.Resolve(df.Plan));
+
+        Assert.True(resolved.Resolved);
+        var reference = Assert.IsType<AttributeReference>(Assert.Single(resolved.ProjectList));
+        Assert.Equal("a", reference.Name);
+    }
+
+    // ---------------- AC3: multi-column projection order is significant (item 7) ----------------
+
+    [Fact]
+    public void Sql_MultiColumnProject_PreservesOrderAndContent()
+    {
+        using SparkSession spark = NewSession();
+
+        DataFrame df = spark.Sql("SELECT a, b FROM t");
+
+        var expected = new Project(
+            new Expression[] { new UnresolvedAttribute("a"), new UnresolvedAttribute("b") },
+            new UnresolvedRelation(new[] { "t" }));
+        Assert.True(expected.Equals(df.Plan));
+
+        // Reversing the projection order must NOT compare equal — proves order is asserted.
+        var reversed = new Project(
+            new Expression[] { new UnresolvedAttribute("b"), new UnresolvedAttribute("a") },
+            new UnresolvedRelation(new[] { "t" }));
+        Assert.False(reversed.Equals(df.Plan));
+    }
+
+    [Fact]
+    public void Sql_MultiColumnProjectWithAliases_PreservesOrderAndContent()
+    {
+        using SparkSession spark = NewSession();
+
+        DataFrame df = spark.Sql("SELECT a AS x, b AS y FROM t");
+
+        var project = (Project)df.Plan;
+        Assert.Collection(
+            project.ProjectList,
+            e => Assert.True(Functions.Col("a").As("x").Expr.Equals(e)),
+            e => Assert.True(Functions.Col("b").As("y").Expr.Equals(e)));
+    }
+
+    // ---------------- Diagnostics: position and chained-comparison hint ----------------
+
+    [Fact]
+    public void Sql_SyntaxError_ReportsOneBasedPositionOfOffendingToken()
+    {
+        using SparkSession spark = NewSession();
+
+        // '#' is the 8th character (1-based) of the string; the deterministic message tags that offset.
+        SqlParseException ex = Assert.Throws<SqlParseException>(() => spark.Sql("SELECT # FROM t"));
+
+        Assert.Contains("position 8", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Sql_ChainedComparison_GivesParenthesizeHint()
+    {
+        using SparkSession spark = NewSession();
+
+        SqlParseException ex = Assert.Throws<SqlParseException>(() => spark.Sql("SELECT a FROM t WHERE a = b = c"));
+
+        Assert.Equal(SqlParseErrorKind.SyntaxError, ex.ErrorKind);
+        Assert.Contains("chained comparison", ex.Message, StringComparison.Ordinal);
     }
 
     private sealed class ThrowingQueryExecutor : IQueryExecutor
