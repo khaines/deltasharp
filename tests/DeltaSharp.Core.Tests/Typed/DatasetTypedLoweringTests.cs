@@ -210,6 +210,94 @@ public sealed class DatasetTypedLoweringTests
         Assert.Equal(Functions.Col("Age").Gt(Functions.Lit(2)).Expr, lowered.Expr);
     }
 
+    // ----- Finding A: `checked`/`unchecked` on COLUMN operands is rejected (no per-expression Spark
+    // mapping), never silently lowered to a plain (unchecked) Plus/Cast -----
+
+    [Fact]
+    public void CheckedColumnArithmetic_ThrowsDeterministicDiagnostic()
+    {
+        // `checked(p.Age + p.Other)` is an AddChecked node over COLUMN operands. C# `checked`/`unchecked`
+        // has no faithful per-expression Spark mapping (overflow is session-config governed), so it must
+        // be rejected — NOT silently lowered to a plain (unchecked) Plus.
+        var ex = Assert.Throws<UnsupportedTypedExpressionException>(
+            () => Lower(p => checked(p.Age + p.Other) > 0));
+
+        Assert.Contains("not honored per-expression on column operands", ex.Message);
+        Assert.Contains("ANSI", ex.Message);
+    }
+
+    [Fact]
+    public void CheckedColumnArithmetic_DoesNotSilentlyLowerToPlus()
+    {
+        // Mutation-sensitive: if the AddChecked arm fell through to `left.Plus(right)` it would silently
+        // emit `(('Age' + 'Other') > 0)` — dropping the explicit `checked` intent. Prove lowering throws
+        // and produces no column, and that the dropped-guard tree is never the result.
+        Column? lowered = null;
+        Assert.Throws<UnsupportedTypedExpressionException>(
+            () => lowered = Lower(p => checked(p.Age + p.Other) > 0));
+        Assert.Null(lowered);
+
+        Assert.NotEqual(
+            Functions.Col("Age").Plus(Functions.Col("Other")).Gt(Functions.Lit(0)).Expr,
+            (lowered ?? Functions.Col("Age")).Expr);
+    }
+
+    [Fact]
+    public void CheckedColumnConvert_ThrowsDeterministicDiagnostic()
+    {
+        // `checked((int)p.Id)` is a ConvertChecked (long→int) over a COLUMN operand. A plain
+        // value-changing convert lowers to a Cast, but a *checked* one has no faithful Spark mapping, so
+        // it must be rejected — NOT silently lowered to an unchecked Cast.
+        var ex = Assert.Throws<UnsupportedTypedExpressionException>(
+            () => LowerSelect(p => checked((int)p.Id)));
+
+        Assert.Contains("not honored per-expression on column operands", ex.Message);
+        Assert.Contains("ANSI", ex.Message);
+    }
+
+    [Fact]
+    public void CheckedColumnConvert_DoesNotSilentlyLowerToCast()
+    {
+        // Mutation-sensitive: if the ConvertChecked reached the value-changing Cast branch it would
+        // silently emit `Cast('Id' AS int)` — dropping the checked intent. Prove lowering throws and the
+        // dropped-guard Cast tree is never the result.
+        Column? lowered = null;
+        Assert.Throws<UnsupportedTypedExpressionException>(
+            () => lowered = LowerSelect(p => checked((int)p.Id)));
+        Assert.Null(lowered);
+
+        Column droppedGuardCast = new(new DeltaSharp.Plans.Expressions.Cast(
+            Functions.Col("Id").Expr, IntegerType.Instance));
+        Assert.NotEqual(droppedGuardCast.Expr, (lowered ?? Functions.Col("Id")).Expr);
+    }
+
+    [Fact]
+    public void NormalColumnArithmetic_StillLowersToPlus_NoRegression()
+    {
+        // The checked rejection must not regress plain (non-checked) column arithmetic: `p.Age + p.Other`
+        // still lowers to the arithmetic Plus over two column references.
+        Column lowered = LowerSelect(p => p.Age + p.Other);
+
+        Assert.Equal(Functions.Col("Age").Plus(Functions.Col("Other")).Expr, lowered.Expr);
+    }
+
+    // ----- Finding B: integer `/` lowers to Spark FRACTIONAL division (DOUBLE), identical to the
+    // untyped `Functions`/`Column` API — no fork. Pinned as intentional (Spark SQL semantics). -----
+
+    [Fact]
+    public void IntegerDivision_LowersToSamePlanAsUntyped()
+    {
+        // `p => p.Age / p.Other` (C# int / int) lowers to the SAME `Divide` IR as the untyped
+        // `Functions.Col("Age") / Functions.Col("Other")`. Per Spark SQL this is fractional division
+        // returning DOUBLE (5/2 → 2.5), NOT C# integer truncation (2). This is Spark-faithful, shared
+        // with the untyped API (no fork), and pinned here as intentional. Result-type materialization
+        // (double vs int) is a #178 encoder concern; M1 only lowers to expressions.
+        Column typed = LowerSelect(p => p.Age / p.Other);
+        Column untyped = Functions.Col("Age") / Functions.Col("Other");
+
+        Assert.Equal(untyped.Expr, typed.Expr);
+    }
+
     // ----- Item 10: arithmetic operators lower structurally (mutation-sensitive) -----
 
     [Theory]

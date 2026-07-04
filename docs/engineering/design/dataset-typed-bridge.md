@@ -91,7 +91,8 @@ Lowering table (`TypedExpressionLowering.cs`):
 | `p.Prop` (member access on the lambda parameter) | `Functions.Col("Prop")` | `TypedExpressionLowering.cs` (`LowerMember`) |
 | constant / captured value / captured arithmetic subtree (not referencing the parameter) | `Functions.Lit(value)` (folded) | `TypedExpressionLowering.cs` (`EvaluateConstant`) |
 | `Convert` / `ConvertChecked` — **safe unwrap** (boxing to `object`, `Nullable<T>` lift/unlift, identity) | unwrapped (operand lowered) | `TypedExpressionLowering.cs` (`LowerConvert`) |
-| `Convert` / `ConvertChecked` — **value-changing numeric** (e.g. `(double)intCol`) | `Cast(operand, targetDataType)` (or deterministic throw if the target has no mapping) | `TypedExpressionLowering.cs` (`LowerConvert`) |
+| `Convert` — **value-changing numeric** (e.g. `(double)intCol`) | `Cast(operand, targetDataType)` (or deterministic throw if the target has no mapping) | `TypedExpressionLowering.cs` (`LowerConvert`) |
+| `ConvertChecked` — **value-changing numeric** on a column (e.g. `checked((int)p.LongCol)`) | deterministic throw (`checked`/`unchecked` not honored per-expression on column operands — M1) | `TypedExpressionLowering.cs` (`LowerConvert`) |
 | `Not` | `col.Not()` | `TypedExpressionLowering.cs` (`LowerNode`) |
 | `Equal` / `NotEqual` (operand a NULL literal) | `col.IsNull()` / `col.IsNotNull()` | `TypedExpressionLowering.cs` (`LowerBinary`) |
 | `Equal` / `NotEqual` (otherwise) | `EqualTo` / `NotEqual` | `TypedExpressionLowering.cs` (`LowerBinary`) |
@@ -100,8 +101,9 @@ Lowering table (`TypedExpressionLowering.cs`):
 | `AndAlso` / `OrElse`, and `And` / `Or` **with boolean operands** | `And` / `Or` | `TypedExpressionLowering.cs` (`LowerBinary`) |
 | `And` / `Or` with **non-boolean** operands (bitwise `&`/`\|`) | deterministic throw (not supported in M1) | `TypedExpressionLowering.cs` (`RequireBooleanLogical`) |
 | `Add` / `Subtract` / `Multiply` / `Divide` / `Modulo` | `Plus` / `Minus` / `Multiply` / `Divide` / `Mod` | `TypedExpressionLowering.cs` (`LowerBinary`) |
+| `AddChecked` / `SubtractChecked` / `MultiplyChecked` on a column (e.g. `checked(p.A + p.B)`) | deterministic throw (`checked`/`unchecked` not honored per-expression on column operands — M1) | `TypedExpressionLowering.cs` (`LowerBinary`) |
 
-**Fidelity where C# and SQL diverge.** Three cases are handled explicitly so a typed predicate is not
+**Fidelity where C# and SQL diverge.** Four cases are handled explicitly so a typed predicate is not
 silently mis-lowered:
 
 - **`== null` / `!= null`.** SQL three-valued logic makes `col = NULL` / `col <> NULL` UNKNOWN for
@@ -115,6 +117,43 @@ silently mis-lowered:
   unwrapped; a value-changing numeric conversion (e.g. `(double)intCol`) is preserved as an explicit
   `Cast` to the target ADR-0008 `DataType` rather than being dropped into a source-domain operation
   (e.g. integer division).
+- **`checked` / `unchecked` on column operands.** `checked(p.A + p.B)` / `checked((int)p.LongCol)` reach
+  the `*Checked` arms with a column operand; the `checked`/`unchecked` keyword has **no faithful
+  per-expression Spark-plan mapping** (Spark overflow behavior is session-config governed), so the
+  bridge **rejects** it deterministically instead of silently dropping the guard and emitting a plain
+  (unchecked) `Plus`/`Cast`. Overflow instead follows the session ANSI mode (see below). A
+  *parameter-independent* `checked(...)` subtree still folds to a constant — and still **throws** on
+  genuine overflow — in `EvaluateConstant`/`ApplyArithmetic`; only column operands are rejected.
+
+### Expression semantics: Spark SQL, not C#
+
+A typed `Where`/`Select`/`Filter` lambda is **translated** (lowered) to Spark Column IR — it is **not**
+executed as C#. The lowered `Column.Expr` is *identical* to what the untyped `Functions`/`Column` API
+builds (structural equality; **no fork**), so the plan carries **Spark SQL** execution semantics, exactly
+as EF Core / LINQ-to-SQL carry their provider's semantics. **Where C# and Spark SQL operator semantics
+differ, Spark SQL semantics apply.** A C# developer must not assume C# runtime behavior. The notable
+divergences:
+
+- **Integer `/` is fractional division returning `DOUBLE`.** `p => p.A / p.B` over two `int` columns
+  lowers to `ArithmeticOperator.Divide` — the **same** node as `Functions.Col("A") / Functions.Col("B")`
+  — which per Spark SQL yields a fractional `DOUBLE` (`5 / 2` → `2.5`), **not** C# integer truncation
+  (`2`). This is Spark-faithful and intentional; it is not a defect and is not "fixed". Spark's
+  non-decimal `/` result type is `DoubleType`
+  (`src/DeltaSharp.Core/Plans/Expressions/ArithmeticResultType.cs:71`). To get integer semantics, cast
+  or use an integer-division function once available.
+- **`checked` / `unchecked` are not honored on column operands.** They are rejected (see the fidelity
+  list above); arithmetic overflow follows the session ANSI mode — **ANSI throws
+  `ArithmeticOverflowException`, Legacy yields `NULL`, and it never wraps** — not the C# per-expression
+  `checked`/`unchecked` context.
+
+**Typed result-type materialization is a #178 (encoder) concern.** In M1 typed `Select`/`Where`/`Filter`
+only **lower to expressions**; they do **not** materialize a typed C# result. So the fact that Spark `/`
+produces a `double` (vs. the C# `int` a developer might expect) is a *plan/result-type* observation, not
+a typed-output-encoding one: reconstructing a typed `Dataset<U>` (and its CLR result types) is the
+deferred [STORY-04.7.2](https://github.com/khaines/deltasharp/issues/178) value-encoder work (§1 scope
+boundary). The pin test `DatasetTypedLoweringTests.IntegerDivision_LowersToSamePlanAsUntyped` asserts the
+typed and untyped division lower to the **same** IR, documenting the fractional-division mapping as
+intentional and proving there is no fork.
 
 A parameter-independent subtree is folded to a value **without compiling** — a `ConstantExpression` is
 read directly, a captured closure field/property is read by reflecting the `MemberInfo` off the tree,

@@ -85,6 +85,10 @@ public sealed class Dataset<[DynamicallyAccessedMembers(DynamicallyAccessedMembe
     /// <param name="predicate">A boolean predicate over a row of <typeparamref name="T"/> (for example
     /// <c>row =&gt; row.Age &gt;= 21</c>).</param>
     /// <returns>A new filtered <see cref="Dataset{T}"/>.</returns>
+    /// <remarks>The predicate is <b>translated</b> to Spark Column IR, so where C# and Spark SQL
+    /// semantics differ (e.g. integer <c>/</c> is fractional division; <c>checked</c>/<c>unchecked</c>
+    /// is not honored on column operands), <b>Spark SQL</b> semantics apply — see
+    /// <c>docs/engineering/design/dataset-typed-bridge.md</c> §"Expression semantics: Spark SQL, not C#".</remarks>
     /// <exception cref="ArgumentNullException"><paramref name="predicate"/> is null.</exception>
     /// <exception cref="UnsupportedTypedExpressionException">The predicate contains a node the bridge
     /// cannot lower (AC4).</exception>
@@ -141,6 +145,11 @@ public sealed class Dataset<[DynamicallyAccessedMembers(DynamicallyAccessedMembe
     /// <c>row =&gt; row.Name</c>, <c>row =&gt; row.Age</c>). Calling with none builds an empty
     /// projection, matching <see cref="DataFrame.Select(Column[])"/>.</param>
     /// <returns>A new <see cref="DataFrame"/> projecting the selectors.</returns>
+    /// <remarks>Each selector is <b>translated</b> to Spark Column IR, so where C# and Spark SQL
+    /// semantics differ (e.g. integer <c>/</c> is fractional division returning <c>DOUBLE</c>;
+    /// <c>checked</c>/<c>unchecked</c> is not honored on column operands), <b>Spark SQL</b> semantics
+    /// apply — see <c>docs/engineering/design/dataset-typed-bridge.md</c> §"Expression semantics: Spark
+    /// SQL, not C#".</remarks>
     /// <exception cref="ArgumentNullException"><paramref name="selectors"/> or any element is null.</exception>
     /// <exception cref="UnsupportedTypedExpressionException">A selector contains a node the bridge
     /// cannot lower (AC4).</exception>

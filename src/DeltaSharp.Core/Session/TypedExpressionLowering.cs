@@ -28,6 +28,16 @@ namespace DeltaSharp;
 /// bitwise <c>&amp;</c>/<c>|</c> is rejected rather than mis-lowered to logical <c>And</c>/<c>Or</c>.
 /// </para>
 /// <para>
+/// <b>Expression semantics are Spark SQL, not C#.</b> Because the body is <b>translated</b> to Spark
+/// Column IR (never executed as C#), where C# and Spark SQL operator semantics differ the <b>Spark SQL</b>
+/// semantics apply — identical to the untyped <see cref="Functions"/>/<see cref="Column"/> API (no fork).
+/// Most notably integer <c>/</c> lowers to Spark's fractional division returning a <c>DOUBLE</c>
+/// (<c>5 / 2</c> is <c>2.5</c>), not C# integer truncation; and the C# <c>checked</c>/<c>unchecked</c>
+/// keyword is <b>not</b> honored per-expression on column operands (it is rejected — overflow instead
+/// follows the session ANSI mode). See
+/// <c>docs/engineering/design/dataset-typed-bridge.md</c> §"Expression semantics: Spark SQL, not C#".
+/// </para>
+/// <para>
 /// Any node the translator does not understand — a method call, a nested member access, an
 /// unsupported operator — raises the deterministic
 /// <see cref="UnsupportedTypedExpressionException"/> (AC4). See
@@ -89,6 +99,15 @@ internal static class TypedExpressionLowering
         if (target == typeof(object) || targetUnderlying == sourceUnderlying)
         {
             return LowerNode(convert.Operand, parameter);
+        }
+
+        // A value-changing `checked((int)p.LongCol)` reaches here with a COLUMN operand (a
+        // parameter-independent `ConvertChecked` was already folded by EvaluateConstant). The C#
+        // `checked` context asks for an overflow guard that has no faithful per-expression Spark
+        // mapping, so reject it rather than silently emitting a plain (unchecked) Cast.
+        if (convert.NodeType == ExpressionType.ConvertChecked)
+        {
+            throw CheckedColumnArithmeticUnsupported(convert);
         }
 
         Column operand = LowerNode(convert.Operand, parameter);
@@ -180,17 +199,25 @@ internal static class TypedExpressionLowering
             // operand) is rejected deterministically instead of being silently lowered to a numeric
             // Plus that would execute as CAST(...) + CAST(...) — a silent wrong plan.
             case ExpressionType.Add:
-            case ExpressionType.AddChecked:
                 RequireNumericArithmetic(binary);
                 return left.Plus(right);
             case ExpressionType.Subtract:
-            case ExpressionType.SubtractChecked:
                 RequireNumericArithmetic(binary);
                 return left.Minus(right);
             case ExpressionType.Multiply:
-            case ExpressionType.MultiplyChecked:
                 RequireNumericArithmetic(binary);
                 return left.Multiply(right);
+
+            // C# `checked(...)` arithmetic over COLUMN operands (`checked(p.A + p.B)`) reaches these
+            // arms — a parameter-independent `checked(...)` subtree was already folded (and throws on
+            // overflow) by EvaluateConstant. The `checked`/`unchecked` keyword has no faithful
+            // per-expression Spark-plan mapping, so reject it rather than silently dropping the guard
+            // and emitting a plain (unchecked) Plus/Minus/Multiply.
+            case ExpressionType.AddChecked:
+            case ExpressionType.SubtractChecked:
+            case ExpressionType.MultiplyChecked:
+                throw CheckedColumnArithmeticUnsupported(binary);
+
             case ExpressionType.Divide:
                 RequireNumericArithmetic(binary);
                 return left.Divide(right);
@@ -418,6 +445,19 @@ internal static class TypedExpressionLowering
 
     private static bool ReferencesParameter(Expression node, ParameterExpression parameter) =>
         new ParameterFinder(parameter).Found(node);
+
+    // C# `checked`/`unchecked` arithmetic (and `checked` narrowing conversions) over COLUMN operands
+    // has no faithful per-expression Spark-plan mapping: Spark's overflow behavior is session-config
+    // governed, not per-expression. Reject it deterministically rather than silently dropping the guard
+    // and emitting a plain (unchecked) op. (Parameter-independent `checked(...)` folds still fold — and
+    // throw on genuine overflow — in EvaluateConstant/ApplyArithmetic; only column operands land here.)
+    private static UnsupportedTypedExpressionException CheckedColumnArithmeticUnsupported(Expression node) =>
+        new($"C# 'checked'/'unchecked' arithmetic is not honored per-expression on column operands in a "
+            + $"Dataset<T> lambda: '{node}'. The 'checked'/'unchecked' keyword has no faithful "
+            + "per-expression Spark-plan mapping; arithmetic overflow instead follows the session ANSI "
+            + "mode — ANSI throws ArithmeticOverflowException, Legacy yields NULL, and it never wraps. "
+            + "Drop the 'checked'/'unchecked' and use plain arithmetic so the session overflow policy "
+            + "applies.");
 
     private static UnsupportedTypedExpressionException Unsupported(Expression node) =>
         new($"Unsupported typed expression node '{node.NodeType}' in a Dataset<T> lambda: '{node}'. "
