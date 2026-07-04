@@ -25,7 +25,10 @@ public static class Functions
     /// <paramref name="columnName"/>, mirroring Spark's <c>functions.col(colName)</c>. The reference
     /// is <b>unresolved</b> — no schema is consulted — until the analyzer binds it. The wildcard
     /// <c>"*"</c> and a qualified <c>"t.*"</c> produce a star that expands to all (qualified) columns
-    /// at analysis, matching Spark.
+    /// at analysis, matching Spark. A dotted name such as <c>"t.a"</c> is a <b>multipart</b> reference
+    /// (<c>["t", "a"]</c>), matching Spark and the SQL door's lowering of <c>t.a</c>, so the two
+    /// front-ends converge (AC3). A column whose name literally contains a dot must be backtick-quoted
+    /// through the SQL door; this API always treats a dot as a name-part separator.
     /// </summary>
     /// <param name="columnName">The column name, or <c>"*"</c>/<c>"t.*"</c> for a star.</param>
     /// <returns>An unresolved column reference.</returns>
@@ -43,6 +46,11 @@ public static class Functions
         {
             string[] target = columnName[..^2].Split('.');
             return new Column(new UnresolvedStar(target));
+        }
+
+        if (columnName.Contains('.', StringComparison.Ordinal))
+        {
+            return new Column(new UnresolvedAttribute(columnName.Split('.')));
         }
 
         return new Column(new UnresolvedAttribute(columnName));

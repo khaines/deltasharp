@@ -95,6 +95,15 @@ DeltaSharp.SparkSessionBuilder.Config(string! key, double value) -> DeltaSharp.S
 DeltaSharp.SparkSessionBuilder.Config(string! key, long value) -> DeltaSharp.SparkSessionBuilder!
 DeltaSharp.SparkSessionBuilder.Config(string! key, string! value) -> DeltaSharp.SparkSessionBuilder!
 DeltaSharp.SparkSessionBuilder.GetOrCreate() -> DeltaSharp.SparkSession!
+DeltaSharp.SqlParseErrorKind
+DeltaSharp.SqlParseErrorKind.SyntaxError = 0 -> DeltaSharp.SqlParseErrorKind
+DeltaSharp.SqlParseErrorKind.UnsupportedFeature = 1 -> DeltaSharp.SqlParseErrorKind
+DeltaSharp.SqlParseException
+DeltaSharp.SqlParseException.Construct.get -> string?
+DeltaSharp.SqlParseException.ErrorKind.get -> DeltaSharp.SqlParseErrorKind
+DeltaSharp.SqlParseException.SqlParseException() -> void
+DeltaSharp.SqlParseException.SqlParseException(string! message) -> void
+DeltaSharp.SqlParseException.SqlParseException(string! message, System.Exception? innerException) -> void
 static DeltaSharp.DeltaSharpInfo.PreviewReleaseChannel.get -> string!
 static DeltaSharp.DeltaSharpInfo.Product.get -> string!
 static DeltaSharp.DeltaSharpInfo.ProductName.get -> string!

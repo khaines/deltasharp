@@ -4,6 +4,7 @@ using System.Threading;
 using DeltaSharp.Analysis;
 using DeltaSharp.Execution;
 using DeltaSharp.Plans.Logical;
+using DeltaSharp.Sql;
 using DeltaSharp.Types;
 
 namespace DeltaSharp;
@@ -37,7 +38,7 @@ namespace DeltaSharp;
 ///     .GetOrCreate();
 ///
 /// string app = spark.Conf.Get("spark.app.name");   // "getting-started"
-/// // spark.Read / spark.Sql(...) arrive in later stories (#158/#159).
+/// DataFrame df = spark.Sql("SELECT * FROM t");      // lazy plan; #158 Read / #159 Sql doors are open.
 /// spark.Stop();                                     // or rely on the using block / Dispose.
 /// </code>
 /// </example>
@@ -192,24 +193,36 @@ public sealed class SparkSession : IDisposable
     }
 
     /// <summary>
-    /// Executes a SQL query and returns its result as a <see cref="DataFrame"/> (Spark's
-    /// <c>spark.sql</c>).
+    /// Parses a SQL query and returns its result as a <see cref="DataFrame"/> (Spark's
+    /// <c>spark.sql</c>), routing SQL through the <b>same</b> planning pipeline as the DataFrame API so
+    /// the two converge after parsing/lowering (STORY-04.1.3 / #159).
     /// </summary>
-    /// <param name="sqlText">The SQL text to execute.</param>
-    /// <returns>A <see cref="DataFrame"/> backed by the query's logical plan.</returns>
+    /// <remarks>
+    /// This is a <b>transformation</b>, not an action: the SQL is lexed and lowered into an
+    /// <b>unresolved</b> logical plan built from the same shared IR nodes (<c>Project</c>,
+    /// <c>Filter</c>, <c>UnresolvedRelation</c>, …) the DataFrame API constructs (AC3), and
+    /// <b>no</b> analysis, optimization, or execution runs until a later action (ADR-0001, AC1). The
+    /// M1 door implements a small, well-scoped subset — <c>SELECT &lt;cols|*&gt; FROM &lt;relation&gt;
+    /// [WHERE &lt;predicate&gt;]</c> with literals, column references, comparisons, arithmetic, and
+    /// boolean combinators. Any construct outside it (joins, aggregates, subqueries, function calls,
+    /// DDL/DML, set operations, …) raises a deterministic <see cref="SqlParseException"/> at parse
+    /// time, before any execution (AC2). The full ANTLR4 frontend arrives in EPIC-07 (ADR-0007). See
+    /// <c>docs/engineering/design/sql-door.md</c>.
+    /// </remarks>
+    /// <param name="sqlText">The SQL text to parse and lower.</param>
+    /// <returns>A <see cref="DataFrame"/> backed by the query's unresolved logical plan.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="sqlText"/> is <see langword="null"/>.</exception>
     /// <exception cref="SessionStoppedException">The session has been stopped or disposed.</exception>
-    /// <exception cref="NotSupportedException">
-    /// The session is active but the SQL door is not yet available in M1; it ships in STORY-04.1.3
-    /// (#159).
+    /// <exception cref="SqlParseException">
+    /// <paramref name="sqlText"/> is malformed (<see cref="SqlParseErrorKind.SyntaxError"/>) or uses a
+    /// construct outside the M1 subset (<see cref="SqlParseErrorKind.UnsupportedFeature"/>).
     /// </exception>
     public DataFrame Sql(string sqlText)
     {
         EnsureNotStopped(nameof(Sql));
         ArgumentNullException.ThrowIfNull(sqlText);
-        throw new NotSupportedException(
-            "SparkSession.Sql is not yet available in this milestone; it ships in " +
-            "STORY-04.1.3 (#159).");
+        LogicalPlan plan = SqlParser.Parse(sqlText);
+        return new DataFrame(this, plan);
     }
 
     /// <summary>

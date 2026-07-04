@@ -100,15 +100,17 @@ public sealed class SparkSessionLifecycleTests
     }
 
     [Fact]
-    public void Read_OnActiveSession_ReturnsReader_AndSqlThrowsNotSupported_NotLifecycle()
+    public void Read_AndSql_OnActiveSession_OpenBothDoors_NotLifecycle()
     {
-        // On an ACTIVE session the read door is open (STORY-04.1.2 / #158): Read returns a reader. The
-        // remaining M1 stub door (Sql) still reports "not yet available" (NotSupportedException), which
-        // must be distinct from the lifecycle error so callers can tell the states apart.
+        // On an ACTIVE session both data-in doors are open: Read returns a reader (STORY-04.1.2 / #158)
+        // and Sql lowers a supported statement to a lazy DataFrame (STORY-04.1.3 / #159). A malformed
+        // statement surfaces a SqlParseException, which must be distinct from the lifecycle error so
+        // callers can tell the states apart.
         using SparkSession spark = SparkSession.Builder().AppName("active").GetOrCreate();
 
         Assert.NotNull(spark.Read);
-        Assert.Throws<NotSupportedException>(() => spark.Sql("SELECT 1"));
+        Assert.NotNull(spark.Sql("SELECT * FROM t"));
+        Assert.Throws<SqlParseException>(() => spark.Sql("SELECT 1"));
     }
 
     // ----- stop/dispose state machine -----
