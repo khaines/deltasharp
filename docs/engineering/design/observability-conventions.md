@@ -147,7 +147,7 @@ distributed executor and the Delta layer), and are omitted rather than faked in 
 paths.
 
 **Cardinality rule.** Every **metric-label** key names a **bounded** set (the four metric-label-safe keys
-above, plus storage `backend`, error class, and protocol). Values that are unbounded or credential-bearing
+above, plus storage `backend`, storage I/O `direction` (read/write), error class, and protocol). Values that are unbounded or credential-bearing
 — raw storage paths, SQL text, plan text, row/cell values, user or tenant identity, pod UIDs, object keys,
 shuffle block IDs — are **never** a metric label or attribute **value**, and secrets/PII/SQL literals/row
 values are **never** placed anywhere at all (see redaction below). Bounded correlation detail (job/task/
@@ -288,6 +288,16 @@ rendering it**, not by a redactor:
   does, it must be **scrubbed or omitted** (checklists [09a](../checklists/09a-logging-checklist.md) line —
   "table names, catalog names … scrubbed when they may reveal regulated data or tenant boundaries",
   [14](../checklists/14-tenant-isolation-checklist.md)).
+- **Diagnostics are not telemetry — scrub identifiers at the boundary between them.** User-facing
+  diagnostics legitimately name the resource they concern: an `AnalysisException` (e.g. table-not-found)
+  embeds the table identifier in its message, and `SinkDescriptor.SimpleString`/EXPLAIN render
+  `table=<identifier>` — that is required for the diagnostic to be useful and is **not** a telemetry sink.
+  The tenant-scrubbing rule applies at the moment such a diagnostic **crosses into telemetry**: do **not**
+  blindly `Activity.RecordException(ex)` (which captures `exception.message`) on a span, nor attach a raw
+  EXPLAIN/plan string to a span or structured log, when the identifier can carry tenant identity — record a
+  structural/redacted form or omit the identifier. Auditing the existing diagnostic-render paths against
+  this rule once instrumentation is wired is tracked in
+  [#455](https://github.com/khaines/deltasharp/issues/455).
 - Redaction is **centralized and tested**: `SecretRedaction` has unit coverage, and any new diagnostic
   path adds a redaction test (checklist [09a](../checklists/09a-logging-checklist.md)). `SecretRedaction`
   is `internal` to `DeltaSharp.Core` today; a log site in another assembly reuses it through the existing
@@ -380,7 +390,7 @@ executor, and operator unless the instrument name identifies the viewpoint.
 
 Labels use the **metric-label-safe** set only — the four bounded `DeltaSharpTelemetry` keys
 (`deltasharp.component`, `deltasharp.operation`, `deltasharp.outcome`, `deltasharp.stage`) plus storage
-`backend`, error class, and protocol. The **correlation/exemplar-only** keys (`deltasharp.job.id`,
+`backend`, storage I/O `direction` (read/write), error class, and protocol. The **correlation/exemplar-only** keys (`deltasharp.job.id`,
 `deltasharp.task.id`, `deltasharp.executor.id`, `deltasharp.attempt`, `deltasharp.partition`,
 `deltasharp.table`, `deltasharp.table.version`, `deltasharp.correlation.id`) are **never** metric labels —
 they grow unbounded over a run's or table's lifetime — and attach instead to logs, span attributes, and
