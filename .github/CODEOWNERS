@@ -1,45 +1,63 @@
 # CODEOWNERS — routes review requests to maintainers.
 #
-# DeltaSharp is early-stage; @khaines is the founding maintainer and default owner.
-# As maintainers join, replace/extend these rules with area owners. The intended
-# subsystem -> persona ownership is documented in docs/persona/agents/ and the ADRs;
-# the commented block at the bottom maps src/ subsystems to their persona owners and
-# should be activated (with real GitHub handles/teams) as code and maintainers land.
+# DeltaSharp is early-stage; @khaines is the founding maintainer and default owner,
+# so every path resolves to a real owner today. The trailing "# persona:<slug>"
+# note on each source rule records the specialist that will own the area as
+# maintainers join — swap @khaines for that real handle or team then. The persona
+# roster and the label taxonomy live in docs/persona/agents/README.md and
+# docs/planning/label-taxonomy.md.
+#
+# NOTE ON REVIEW ENFORCEMENT: branch protection on `main` does not currently
+# require code-owner review (single-maintainer phase). That is a documented
+# exception; see docs/planning/label-taxonomy.md ("Branch protection and required
+# review"). CODEOWNERS still auto-requests review from the owner below.
 
 # Default owner for everything
-*                           @khaines
+*                               @khaines
 
 # Architecture & decisions (source of truth)
-/docs/adr/                  @khaines
-/docs/engineering/          @khaines
+/docs/adr/                      @khaines
+/docs/engineering/              @khaines
 
 # Persona / agent library
-/docs/persona/              @khaines
+/docs/persona/                  @khaines
 
 # Governance, community, and project front door
-/README.md                  @khaines
-/LICENSE                    @khaines
-/NOTICE                     @khaines
-/GOVERNANCE.md              @khaines
-/CODE_OF_CONDUCT.md         @khaines
-/CONTRIBUTING.md            @khaines
-/SECURITY.md                @khaines
-/ROADMAP.md                 @khaines
-/docs/rfcs/                 @khaines
-/.github/                   @khaines
+/README.md                      @khaines
+/LICENSE                        @khaines
+/NOTICE                         @khaines
+/GOVERNANCE.md                  @khaines
+/CODE_OF_CONDUCT.md             @khaines
+/CONTRIBUTING.md                @khaines
+/SECURITY.md                    @khaines
+/ROADMAP.md                     @khaines
+/docs/rfcs/                     @khaines
+/.github/                       @khaines
 
-# --- Intended subsystem ownership (activate as src/ lands and maintainers join) ---
-# Map each area to the persona that owns it (see docs/persona/agents/), then to a
-# real GitHub handle or team.
-#
-# /src/**/Sql/                       # sql-language-frontend-engineer
-# /src/**/Catalog/                   # catalog-metastore-engineer
-# /src/**/Optimizer/                 # query-optimizer-scheduler-engineer
-# /src/**/Execution/                 # query-execution-engine-engineer
-# /src/**/Vectorized/ /src/**/Columnar/   # dotnet-vectorized-columnar-compute-engineer
-# /src/**/Runtime/ /src/**/Memory/   # dotnet-runtime-performance-engineer
-# /src/**/Distributed/ /src/**/Shuffle/   # dotnet-distributed-execution-engineer
-# /src/**/Delta/ /src/**/Parquet/    # delta-storage-format-engineer
-# /src/**/Streaming/                 # structured-streaming-engine-engineer
-# /operator/ /src/**/Operator/       # kubernetes-operator-controller-engineer
-# Directory.Build.props /Directory.Packages.props /**/*.csproj   # dotnet-library-platform-engineer
+# --- Source tree: subsystem ownership (active) ---
+# Owner is @khaines for now; the trailing comment names the intended persona owner.
+
+/src/DeltaSharp.Abstractions/**       @khaines  # persona:dotnet-vectorized-columnar-compute-engineer (public type system)
+/src/DeltaSharp.Core/**               @khaines  # persona:developer-experience-api-engineer (+ query-execution-engine-engineer)
+/src/DeltaSharp.Core/Analysis/**      @khaines  # persona:query-execution-engine-engineer (analyzer/name resolution)
+/src/DeltaSharp.Core/Optimization/**  @khaines  # persona:query-optimizer-scheduler-engineer
+/src/DeltaSharp.Core/Plans/**         @khaines  # persona:query-execution-engine-engineer (logical plan)
+/src/DeltaSharp.Core/Sql/**           @khaines  # persona:sql-language-frontend-engineer
+/src/DeltaSharp.Engine/**             @khaines  # persona:dotnet-vectorized-columnar-compute-engineer (+ query-execution-engine-engineer)
+/src/DeltaSharp.Engine/Memory/**      @khaines  # persona:dotnet-runtime-performance-engineer
+/src/DeltaSharp.Engine/Execution/**   @khaines  # persona:query-execution-engine-engineer
+/src/DeltaSharp.Executor/**           @khaines  # persona:dotnet-distributed-execution-engineer (+ query-execution-engine-engineer)
+
+# Tests track the owner of the src area under test.
+/tests/**                       @khaines  # persona: mirror the corresponding src/ subsystem
+
+# Build, packaging, multi-target, and analyzers.
+/DeltaSharp.sln                 @khaines  # persona:dotnet-library-platform-engineer
+/Directory.Build.props          @khaines  # persona:dotnet-library-platform-engineer
+/Directory.Packages.props       @khaines  # persona:dotnet-library-platform-engineer
+/global.json                    @khaines  # persona:dotnet-library-platform-engineer
+**/*.csproj                     @khaines  # persona:dotnet-library-platform-engineer
+
+# CI/CD and release automation.
+/.github/workflows/             @khaines  # persona:cloud-native-site-reliability-engineer
+/.github/dependabot.yml         @khaines  # persona:cloud-native-site-reliability-engineer

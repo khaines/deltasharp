@@ -53,6 +53,13 @@ assignment map for later automation.
 
 </details>
 
+> **Roster changes are tracked here.** This section is the source of truth for the
+> persona roster. When a persona is added, removed, or renamed, update this list
+> and the canonical spec under `docs/persona/agents/`, then reconcile the
+> `persona:<slug>` labels and the counts in
+> [label-taxonomy.md](label-taxonomy.md) (see its reconciliation snapshot). This
+> keeps labels, CODEOWNERS, and the roster from drifting (STORY-00.6.2).
+
 ## Acceptance-criteria conventions
 
 - Criteria are **verifiable** (a reviewer can objectively confirm pass/fail).
@@ -83,6 +90,10 @@ The plan is materialized as GitHub artifacts by `files/ghbuild` (idempotent):
   overflows (`dotnet-vectorized-columnar-compute-engineer`) drops its redundant
   trailing `-engineer` in **label** form (`persona:dotnet-vectorized-columnar-compute`)
   — the exact slug is always preserved in the issue body.
+
+See [label-taxonomy.md](label-taxonomy.md) for the full label families, the
+`CODEOWNERS` subsystem-ownership map, roster↔label reconciliation, and the
+branch-protection review policy.
 
 ## Epic index
 
