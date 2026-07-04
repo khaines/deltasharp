@@ -565,7 +565,7 @@ public sealed class DataFrame
     /// </remarks>
     /// <typeparam name="T">The encoded record/POCO type whose properties define the typed schema.</typeparam>
     /// <returns>A <see cref="Dataset{T}"/> over this frame's plan.</returns>
-    /// <exception cref="UnsupportedTypedExpressionException">A property of <typeparamref name="T"/> has
+    /// <exception cref="UnsupportedTypedSchemaException">A property of <typeparamref name="T"/> has
     /// no supported schema mapping.</exception>
     public Dataset<T> As<[DynamicallyAccessedMembers(
         DynamicallyAccessedMemberTypes.PublicProperties |

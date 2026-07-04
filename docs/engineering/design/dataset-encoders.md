@@ -51,7 +51,7 @@ typed transformation still does no work.
 column, a **public settable** (`set`/`init`) property whose type is one of the ADR-0008 supported
 scalars (§3). Nullable value types, reference types, and `byte[]` are handled per ADR-0008.
 
-**Deferred (with a proposed tracking issue — "Dataset&lt;T&gt; encoder: non-bean shapes &amp; `T`→`Row`
+**Deferred (tracked in [#447](https://github.com/khaines/deltasharp/issues/447) — "Dataset&lt;T&gt; encoder: non-bean shapes &amp; `T`→`Row`
 encode").**
 
 - **`T`→`Row` encode** (materializing rows *from* `T` values, e.g. `createDataset(IEnumerable<T>)`). This

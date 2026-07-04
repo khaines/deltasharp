@@ -95,6 +95,9 @@ public sealed class Dataset<[DynamicallyAccessedMembers(
     /// mapped property with no public setter, or an ambiguous (duplicated) property name. Validated once,
     /// before execution, and re-thrown deterministically.</exception>
     /// <exception cref="InvalidCastException">A row cell's runtime type does not match its property.</exception>
+    /// <exception cref="SessionStoppedException">The owning session has been stopped or disposed.</exception>
+    /// <exception cref="QueryExecutionException">No execution backend is registered, or the backend
+    /// failed while running the plan (propagated from <see cref="DataFrame.Collect()"/>).</exception>
     public IReadOnlyList<T> Collect() => Collect(CancellationToken.None);
 
     /// <summary>The cancellable overload of <see cref="Collect()"/>; cancellation is observed by the
@@ -106,6 +109,10 @@ public sealed class Dataset<[DynamicallyAccessedMembers(
     /// <exception cref="UnsupportedTypedSchemaException"><typeparamref name="T"/> is not an encodable bean.</exception>
     /// <exception cref="InvalidCastException">A row cell's runtime type does not match its property.</exception>
     /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    /// <exception cref="SessionStoppedException">The owning session has been stopped or disposed.</exception>
+    /// <exception cref="TimeoutException">A configured execution timeout elapsed.</exception>
+    /// <exception cref="QueryExecutionException">No execution backend is registered, or the backend
+    /// failed while running the plan (propagated from <see cref="DataFrame.Collect(CancellationToken)"/>).</exception>
     public IReadOnlyList<T> Collect(CancellationToken cancellationToken)
     {
         // Build/validate the decoder FIRST so an unsupported T fails fast and deterministically, before
@@ -188,7 +195,7 @@ public sealed class Dataset<[DynamicallyAccessedMembers(
     /// expression IR, so it builds the same <c>Project</c> node as the untyped
     /// <see cref="DataFrame.Select(Column[])"/> (AC1). The result is a <see cref="DataFrame"/> (an
     /// untyped <c>Dataset&lt;Row&gt;</c>): a projection changes the row shape, and reconstructing a
-    /// typed <c>Dataset&lt;U&gt;</c> needs the output-type value encoders deferred to #178.
+    /// typed <c>Dataset&lt;U&gt;</c> needs the output-type value encoders deferred to #447.
     /// </summary>
     /// <param name="selectors">The typed projection selectors, in output order (for example
     /// <c>row =&gt; row.Name</c>, <c>row =&gt; row.Age</c>). Calling with none builds an empty

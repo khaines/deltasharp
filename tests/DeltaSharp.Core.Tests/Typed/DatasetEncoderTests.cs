@@ -58,6 +58,17 @@ public sealed class AllScalars
     public DateTime Timestamp { get; set; }
 }
 
+/// <summary>Two same-typed (string) properties: because a bind-by-ordinal regression would SWAP them
+/// undetectably (same type) when a row's field order differs from the property order, this model pins
+/// that decode binds columns strictly BY NAME. Column reordering is a real Spark scenario (projections,
+/// joins, SQL).</summary>
+public sealed class TwoNames
+{
+    public string? First { get; set; }
+
+    public string? Last { get; set; }
+}
+
 /// <summary>Nullable value-typed properties, for ADR-0008 null/non-null decode semantics.</summary>
 public sealed class NullableScalars
 {
@@ -183,6 +194,25 @@ public sealed class DatasetEncoderTests
 
         Assert.Equal("Ada", person.Name);
         Assert.Equal(36, person.Age);
+    }
+
+    [Fact]
+    public void Decode_BindsColumnsByName_NotByOrdinal_WhenRowFieldOrderDiffers()
+    {
+        RowDecoder<TwoNames> decoder = RowDecoderFactory.Create<TwoNames>();
+
+        // Build a row whose field ORDER is the reverse of T's property order ([Last, First] vs the
+        // derived [First, Last]), keeping the same names/types, and with two same-typed (string)
+        // columns so a bind-by-ordinal regression would silently SWAP the values. Decode must bind
+        // BY NAME: First <- row["First"], Last <- row["Last"].
+        var reversedSchema = new StructType(decoder.Schema.Fields.Reverse());
+        var row = new Row(reversedSchema, "Smith", "John");
+
+        TwoNames decoded = decoder.Decode(row);
+
+        // Mutation sentinel: bind-by-ordinal (row[i]) yields First="Smith", Last="John".
+        Assert.Equal("John", decoded.First);
+        Assert.Equal("Smith", decoded.Last);
     }
 
     [Fact]
