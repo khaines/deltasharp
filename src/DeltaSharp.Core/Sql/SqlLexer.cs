@@ -53,6 +53,25 @@ internal static class SqlLexer
 
             int position = i + 1;
 
+            // SQL comments (ANSI/Spark): '--' runs to end of line, '/* ... */' is a block comment.
+            // They are lexed away entirely so `SELECT 1--1` is `SELECT 1`, not `1 - (-1)`.
+            if (c == '-' && i + 1 < n && sql[i + 1] == '-')
+            {
+                i += 2;
+                while (i < n && sql[i] != '\n')
+                {
+                    i++;
+                }
+
+                continue;
+            }
+
+            if (c == '/' && i + 1 < n && sql[i + 1] == '*')
+            {
+                SkipBlockComment(sql, ref i, position);
+                continue;
+            }
+
             if (c == '\'')
             {
                 tokens.Add(ScanString(sql, ref i, position));
@@ -82,6 +101,23 @@ internal static class SqlLexer
 
         tokens.Add(new SqlToken(SqlTokenKind.EndOfInput, string.Empty, n + 1));
         return tokens;
+    }
+
+    private static void SkipBlockComment(string sql, ref int i, int position)
+    {
+        i += 2; // opening '/*'
+        while (i + 1 < sql.Length)
+        {
+            if (sql[i] == '*' && sql[i + 1] == '/')
+            {
+                i += 2; // closing '*/'
+                return;
+            }
+
+            i++;
+        }
+
+        throw SqlParseException.Syntax("unterminated block comment", position);
     }
 
     private static SqlToken ScanWord(string sql, ref int i, int position)
