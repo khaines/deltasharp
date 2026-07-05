@@ -1,0 +1,53 @@
+<Project>
+
+  <!--
+    Shared build settings for every DeltaSharp test project (STORY-00.5.1, #112 AC4). MSBuild
+    auto-imports only the NEAREST Directory.Build.props, so this file explicitly chains to the
+    repository-root policy first, then layers the settings common to ALL `.Tests` projects: the
+    xUnit toolchain, the coverage collector, the NuGet lock-file policy, and the deterministic-seed
+    harness. A new `tests/DeltaSharp.<Area>.Tests` project therefore needs only its own
+    TargetFramework(s) and ProjectReference. Per-project specifics (extra packages like
+    Apache.Arrow, AllowUnsafeBlocks) stay in each `.csproj`. See
+    docs/engineering/design/test-harness-conventions.md and testing-conventions.md.
+  -->
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
+
+  <PropertyGroup>
+    <!-- Every test project is an xUnit test project, non-packable, with a committed NuGet lock file
+         (CI restores in locked mode). IsPackable=false is already inherited from the root but is
+         restated here so the test-project intent is explicit and self-contained. -->
+    <IsTestProject>true</IsTestProject>
+    <IsPackable>false</IsPackable>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+
+  <!-- Test toolchain shared by every `.Tests` project: the VSTest SDK, xUnit + its VS runner, and
+       the coverlet coverage collector. Versions are centrally managed in Directory.Packages.props
+       (CPM). Centralizing these removes the copy-pasted block from each csproj. The runner and
+       collector are dev-time only (PrivateAssets=all): never shipped. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="coverlet.collector">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <!-- Deterministic-seed test harness (STORY-00.5.1). A LINKED shared source file, compiled INTO
+       each `.Tests` assembly rather than shipped as a separate assembly, so it is automatically
+       excluded from the coverage denominator (coverlet excludes `[*.Tests]*` by name suffix) with
+       NO coverlet.runsettings / coverage-config.json change. The files live outside every project
+       cone (tests/Shared/), so the SDK default `**/*.cs` glob never double-includes them. See the
+       design note for the trade-off versus a standalone DeltaSharp.TestSupport package. -->
+  <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)Shared/**/*.cs">
+      <Link>Shared/%(RecursiveDir)%(Filename)%(Extension)</Link>
+    </Compile>
+  </ItemGroup>
+
+</Project>

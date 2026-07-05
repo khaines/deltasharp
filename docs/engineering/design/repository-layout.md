@@ -117,9 +117,12 @@ status and expected compatibility** visible — are in
 3. Reference NuGet packages **without** inline versions — versions live in
    `Directory.Packages.props`.
 4. Add it to the solution: `dotnet sln DeltaSharp.sln add <path>`.
-5. Add a matching `tests/DeltaSharp.<Area>.Tests` project.
+5. Add a matching `tests/DeltaSharp.<Area>.Tests` project. It inherits the xUnit toolchain and the
+   deterministic-seed harness from [`tests/Directory.Build.props`](../../../tests/Directory.Build.props)
+   — see [test-harness-conventions.md](test-harness-conventions.md).
 6. Enable a NuGet lock file (`<RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>`)
-   on any project that takes a real third-party `PackageReference` — every test project,
+   on any project that takes a real third-party `PackageReference` — every test project (inherited
+   from [`tests/Directory.Build.props`](../../../tests/Directory.Build.props)),
    and any production project (including the packable `DeltaSharp.Core`) the moment it
    gains its first third-party dependency. CI restores in locked mode and fails on an
    out-of-date lock file. (SDK-only projects like the current Core/Engine deliberately
