@@ -126,6 +126,7 @@ names the convention so the first integration project slots in without churn.
 ## References
 
 - [Repository layout & project conventions](repository-layout.md)
+- [Test harness conventions & deterministic seed policy](test-harness-conventions.md)
 - [API governance: public-API baselines and banned APIs](api-governance.md)
 - [04 — Testing Checklist](../checklists/04-testing-checklist.md)
 - [04a — Unit Testing Checklist](../checklists/04a-unit-testing-checklist.md)
