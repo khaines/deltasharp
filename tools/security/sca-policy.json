@@ -24,8 +24,29 @@
     "    \"owner\": \"@khaines\",",
     "    \"expiry\": \"2026-01-31\",",
     "    \"reviewCriteria\": \"Remove when Foo >= 2.0 (fixed) is adopted.\"",
-    "  }"
+    "  }",
+    "",
+    "expectedProjects: FAIL-CLOSED report-provenance allowlist — the project names that MUST",
+    "appear in `dotnet list DeltaSharp.sln package --vulnerable --format json`. That command",
+    "exits 0 with an EMPTY finding set for BOTH a genuinely clean run AND an unreachable",
+    "advisory DB / dropped project / truncated JSON, so 'no findings' alone is fail-OPEN. A",
+    "healthy report lists a path for EVERY solution project even when clean; the gate asserts",
+    "each name here is present (matched by project name, path/OS-independent) and FAILS CLOSED",
+    "naming any missing project. Mirrors coverage-config.json's expectedAssemblies. Keep this",
+    "in sync with the solution: add a project here when it lands (a deliberate governance event);",
+    "removing one that is still in the solution will (correctly) fail the gate. An empty list",
+    "still fails closed on a wholly empty report."
   ],
   "failOnSeverity": "high",
+  "expectedProjects": [
+    "DeltaSharp.Abstractions",
+    "DeltaSharp.Core",
+    "DeltaSharp.Engine",
+    "DeltaSharp.Executor",
+    "DeltaSharp.Core.Tests",
+    "DeltaSharp.Engine.Tests",
+    "DeltaSharp.Executor.Tests",
+    "DeltaSharp.Samples.GettingStarted"
+  ],
   "suppressions": []
 }

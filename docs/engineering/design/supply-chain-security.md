@@ -144,12 +144,35 @@ It complements Layer 1 by producing the reviewable report and enforcing the thre
 independently, and it runs a `--selftest` first (mirroring the coverage gate) to prove its
 own threshold/suppression/expiry logic before trusting it on real data.
 
+**Runs on push, PR, and nightly.** Besides every push to `main` and every PR, the `sca` job
+also runs on a **nightly `schedule`** (cron `27 6 * * *`). Because vulnerability data is
+external and time-varying, a CVE can be disclosed against a **pinned, unchanged** dependency
+between pushes; the nightly re-audit surfaces it within a day instead of waiting for the next
+commit. (`secret-scan` and `sbom` are skipped on the schedule — they are pure functions of
+committed source, so a nightly run would be identical.)
+
+**Fail-closed on an empty/partial report (provenance).** `dotnet list package --vulnerable`
+exits 0 with an empty finding set for BOTH a genuinely clean run and an unreachable advisory
+DB / dropped project / truncated JSON, so "no findings" alone is fail-**open**. Mirroring the
+coverage gate's `expectedAssemblies` check, the SCA gate asserts **report provenance**: a
+healthy report lists a `path` for every solution project even when clean, so an empty/absent
+project list fails closed, and — using the `expectedProjects` allowlist in
+[`sca-policy.json`](../../../tools/security/sca-policy.json) — a report **missing** any
+expected project (truncated/partial/dropped) also fails closed, naming the missing project.
+Only a report with all expected projects present and zero blocking findings passes.
+`expectedProjects` is kept in sync with the solution (adding a project is a deliberate
+governance event, like the coverage `expectedAssemblies` allowlist).
+
 ### Layer 3 — PR `dependency-review`
 
 [`dependency-review.yml`](../../../.github/workflows/dependency-review.yml) runs GitHub's
 `dependency-review-action` (pinned by SHA) on pull requests. Using the dependency graph it
-diffs base↔head and **fails on newly introduced high-severity vulnerabilities** and flags
-license-incompatible dependency changes, catching risk at the moment a dependency is added.
+diffs base↔head and **fails on newly introduced high-severity vulnerabilities**
+(`fail-on-severity: high`), catching risk at the moment a dependency is added. It also
+**surfaces license information** for the changed dependencies in the job summary, but does
+**not gate** on licenses: no `deny-licenses`/`allow-licenses` policy is configured, so a
+license change is reported for review, not blocked. (If a license *gate* is wanted later,
+add a `deny-licenses`/`allow-licenses` list to the action and update this section.)
 The repository is public, so dependency review needs no GitHub Advanced Security licence; it
 does require the repository **dependency graph**, which is **enabled** on this repo (turned on
 together with **Dependabot alerts** — `PUT /repos/khaines/deltasharp/vulnerability-alerts`).
@@ -284,10 +307,13 @@ Branch protection on `main` (verified **2026-07-04** via
 
 **Required checks (AC #109a).** CI (`build-test-format`) and DCO (`dco`) are required, and
 `coverage` was added to the required set (FEAT-00.2 post-merge wiring, #456). The FEAT-00.3
-**security scans** (`sca`, `secret-scan`, `sbom`, `dependency-review`) run on every PR/push
-but are **not yet required checks** — a status check can only be added to branch protection
-**after it has first run on `main`**, which happens once this change merges. Promoting them is
-therefore a **documented post-merge step** (the same pattern used for `coverage`):
+**security scans** are **not yet required checks**. Their triggers differ: `sca`,
+`secret-scan`, and `sbom` (in `security.yml`) run on **every PR and every push to `main`**
+(and `sca` also on a nightly `schedule`), while `dependency-review` (in
+`dependency-review.yml`) is **PR-only** — it needs a base↔head range to diff. A status check
+can only be added to branch protection **after it has first run on `main`**, which happens
+once this change merges. Promoting them is therefore a **documented post-merge step** (the
+same pattern used for `coverage`):
 
 ```bash
 gh api -X PATCH repos/khaines/deltasharp/branches/main/protection/required_status_checks \
@@ -348,7 +374,8 @@ python3 tools/security/secret-scan.py
 dotnet tool restore
 dotnet CycloneDX src/DeltaSharp.Core/DeltaSharp.Core.csproj \
   --output sbom --filename DeltaSharp.Core-0.1.0.cdx.json --output-format Json \
-  --set-name DeltaSharp.Core --set-version 0.1.0 --set-type Library --exclude-test-projects
+  --set-name DeltaSharp.Core --set-version 0.1.0 --set-type Library \
+  --exclude-test-projects --configuration Release
 
 # Reproducible-build check (byte-identical DLLs across repeated builds):
 dotnet build src/DeltaSharp.Core/DeltaSharp.Core.csproj -c Release -f net8.0 --no-restore --no-incremental -o repro/a

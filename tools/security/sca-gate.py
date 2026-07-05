@@ -13,6 +13,19 @@ dependency, no network) so it is deterministic and offline. ``dotnet list packag
 --vulnerable`` always exits 0 (it is a reporting command), so THIS gate — not the dotnet
 CLI — is what turns a vulnerability above threshold into a red CI check.
 
+Fail-closed on an unexpected report set (provenance)
+----------------------------------------------------
+``dotnet list package --vulnerable --format json`` exits 0 with an EMPTY finding set both
+when (a) every project is genuinely CLEAN and (b) the advisory DB was unreachable, a
+project was dropped from solution load, or the JSON was truncated — so treating "no
+findings" as PASS is fail-OPEN in case (b). Mirroring the coverage gate's
+``expectedAssemblies`` provenance check, this gate asserts REPORT PROVENANCE: a healthy
+report lists a ``path`` for EVERY project even when clean, so an empty/absent ``projects``
+list FAILS CLOSED, and — when ``expectedProjects`` is configured in the policy — a report
+MISSING any expected project (a truncated/partial/dropped report) also FAILS CLOSED,
+naming the missing project. Only a report with all expected projects present and zero
+blocking vulnerabilities PASSes.
+
 This complements, and does not replace, the build-time NuGet audit already wired in
 ``Directory.Build.props`` (NU1901/NU1902 LOW/MODERATE are warnings; NU1903/NU1904
 HIGH/CRITICAL are build-breaking under TreatWarningsAsErrors). The build audit fails the
@@ -87,9 +100,10 @@ class Finding:
 def parse_report(doc: dict[str, Any]) -> list[Finding]:
     """Flatten the ``dotnet list package --vulnerable`` JSON into a list of Findings.
 
-    A project with no vulnerabilities appears as ``{"path": ...}`` with no ``frameworks``
-    key, so the absence of vulnerabilities is represented as an empty result — never an
-    error.
+    A CLEAN project appears as ``{"path": ...}`` with no ``frameworks`` key, so the absence
+    of vulnerabilities *within a project that is present* is an empty result, never an error.
+    The complementary provenance guard (``check_provenance``) is what fails closed when a
+    project is ABSENT from the report entirely (empty/truncated/unreachable report).
     """
     if not isinstance(doc, dict) or "projects" not in doc:
         raise GateError("report JSON has no 'projects' array — is this "
@@ -113,6 +127,63 @@ def parse_report(doc: dict[str, Any]) -> list[Finding]:
     return findings
 
 
+def _project_name(path: str) -> str:
+    """Reduce a project ``path`` to a stable, environment-independent identity.
+
+    Report paths are absolute and differ between local and CI checkouts
+    (``/Users/…/DeltaSharp.Core.csproj`` vs ``/home/runner/…/DeltaSharp.Core.csproj``), so
+    provenance matches on the project *name* — the filename with its ``*proj`` extension
+    stripped — normalizing both ``/`` and ``\\`` separators so it is OS-independent.
+    """
+    base = str(path).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    for ext in (".csproj", ".fsproj", ".vbproj"):
+        if base.lower().endswith(ext):
+            return base[: -len(ext)]
+    return base
+
+
+def report_project_names(doc: dict[str, Any]) -> list[str]:
+    """The set of project names the report actually enumerates (those carrying a path)."""
+    names: list[str] = []
+    for project in doc.get("projects", []) or []:
+        if isinstance(project, dict) and project.get("path"):
+            names.append(_project_name(str(project["path"])))
+    return names
+
+
+def check_provenance(doc: dict[str, Any], expected_projects: list[str]) -> None:
+    """Fail closed on an empty/partial report (mirrors coverage-gate ``expectedAssemblies``).
+
+    A healthy ``dotnet list package --vulnerable`` run lists a path for EVERY project even
+    when clean, so:
+      * an EMPTY/absent project list means the advisory DB was unreachable, a project
+        failed to load, or the JSON was truncated — NOT a clean result; and
+      * with ``expectedProjects`` configured, a report MISSING any expected project is a
+        truncated/partial report or a project dropped from solution load.
+    Both are fail-OPEN vectors (a hidden project hides its vulnerabilities), so both raise
+    ``GateError`` and fail the gate closed. (Asymmetric by design, unlike the coverage
+    gate: an EXTRA/unexpected project only adds more scanning — it cannot hide a vuln — so
+    an unexpected project is not an error here.)
+    """
+    present = set(report_project_names(doc))
+    if not present:
+        raise GateError(
+            "report contains no project data — `dotnet list package --vulnerable "
+            "--format json` emits a path for EVERY project even when clean, so an empty "
+            "'projects' list (or projects with no 'path') means the advisory DB was "
+            "unreachable, a project failed to load, or the JSON was truncated. Failing "
+            "closed: a clean run is NOT an empty report.")
+    if expected_projects:
+        missing = sorted(name for name in expected_projects if name not in present)
+        if missing:
+            raise GateError(
+                f"report is missing expected project(s) {missing} (present: "
+                f"{sorted(present)}). A truncated/partial report, or a project dropped "
+                f"from solution load, must FAIL CLOSED rather than pass on incomplete "
+                f"data. If a project was intentionally removed, update 'expectedProjects' "
+                f"in the policy.")
+
+
 def load_policy(path: Path) -> dict[str, Any]:
     try:
         policy = json.loads(path.read_text(encoding="utf-8"))
@@ -123,8 +194,20 @@ def load_policy(path: Path) -> dict[str, Any]:
     if policy.get("failOnSeverity", "high").lower() not in _SEVERITY_RANK:
         raise GateError(f"policy failOnSeverity must be one of "
                         f"{sorted(set(_SEVERITY_RANK))}")
+    _validate_expected_projects(policy.get("expectedProjects", []))
     _validate_suppressions(policy.get("suppressions", []))
     return policy
+
+
+def _validate_expected_projects(expected: Any) -> None:
+    """``expectedProjects`` (optional) is the provenance allowlist: the project names that
+    MUST appear in the report. It must be an array of non-empty strings so a partial report
+    can be detected reliably."""
+    if not isinstance(expected, list):
+        raise GateError("policy 'expectedProjects' must be an array of project names")
+    for i, name in enumerate(expected):
+        if not isinstance(name, str) or not name.strip():
+            raise GateError(f"policy 'expectedProjects'[{i}] must be a non-empty string")
 
 
 def _validate_suppressions(suppressions: list[Any]) -> None:
@@ -191,8 +274,13 @@ def run_gate(report_path: Path, policy_path: Path, summary_out: Path | None,
     fail_rank = _rank(policy.get("failOnSeverity", "high"))
     fail_label = str(policy.get("failOnSeverity", "high")).lower()
     suppressions = policy.get("suppressions", [])
+    expected_projects = policy.get("expectedProjects", [])
 
     findings = parse_report(doc)
+
+    # Provenance: fail closed BEFORE trusting an empty finding set, so an unreachable
+    # advisory DB or a truncated/dropped project cannot masquerade as a clean report.
+    check_provenance(doc, expected_projects)
     blocking: list[Finding] = []
     suppressed: list[tuple[Finding, dict]] = []
     below: list[Finding] = []
@@ -313,8 +401,8 @@ def _selftest() -> int:
           run(report_with("Moderate"), policy_with([])) == 0)
     check("unknown severity fails closed",
           run(report_with("Bogus"), policy_with([])) == 1)
-    check("empty report passes", run({"version": 1, "projects": [
-        {"path": "P.csproj"}]}, policy_with([])) == 0)
+    check("clean report (project present, no vulns) passes",
+          run({"version": 1, "projects": [{"path": "P.csproj"}]}, policy_with([])) == 0)
     check("unexpired suppression suppresses HIGH",
           run(report_with("High"), policy_with([valid_supp])) == 0)
     expired_supp = dict(valid_supp, expiry=past)
@@ -334,6 +422,74 @@ def _selftest() -> int:
           raises(lambda: run(report_with("High"), policy_with([incomplete]))))
     check("bad expiry rejected", raises(lambda: run(report_with("High"),
           policy_with([dict(valid_supp, expiry="not-a-date")]))))
+
+    # --- Report provenance / fail-closed on empty|partial|corrupt input (Finding #1) -----
+    # `dotnet list package --vulnerable` exits 0 with an empty finding set for BOTH a clean
+    # run and an unreachable/truncated one; these cases prove the gate no longer trusts an
+    # empty/partial/corrupt report as "clean". Each is fail-closed (raises GateError) and
+    # reddens if its guard is mutated to pass (verified by neutering check_provenance /
+    # the JSON-decode guards → selftest FAILs → revert).
+    def report_projects(paths: list) -> dict:
+        return {"version": 1, "projects": [{"path": p} for p in paths]}
+
+    def run_raw(report_text: str, policy: dict) -> int:
+        """Run the gate with EXACT report bytes (malformed / whitespace / zero-byte)."""
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as d:
+            rp = Path(d) / "r.json"
+            pp = Path(d) / "p.json"
+            rp.write_bytes(report_text.encode("utf-8"))
+            pp.write_text(json.dumps(policy), encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                return run_gate(rp, pp, None)
+
+    def run_missing(which: str, report: dict, policy: dict) -> int:
+        """Run the gate with the report or policy file absent (which='report'|'policy')."""
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as d:
+            rp = Path(d) / "r.json"
+            pp = Path(d) / "p.json"
+            if which != "report":
+                rp.write_text(json.dumps(report), encoding="utf-8")
+            if which != "policy":
+                pp.write_text(json.dumps(policy), encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                return run_gate(rp, pp, None)
+
+    # (a) An EMPTY projects array is NOT clean — a healthy report lists every project path.
+    check("empty projects array fails closed",
+          raises(lambda: run(report_projects([]), policy_with([]))))
+    # (b) A project object carrying no 'path' is truncated/corrupt data, not clean.
+    check("projects without a path fail closed",
+          raises(lambda: run({"version": 1, "projects": [{}]}, policy_with([]))))
+    # (c) With expectedProjects configured, all present + no vulns PASSes ...
+    expects_ab = dict(policy_with([]), expectedProjects=["A", "B"])
+    check("all expected projects present, no vulns, passes",
+          run(report_projects(["A.csproj", "B.csproj"]), expects_ab) == 0)
+    # ... and a report MISSING an expected project (truncated/dropped) FAILS CLOSED.
+    check("missing expected project fails closed",
+          raises(lambda: run(report_projects(["A.csproj"]), expects_ab)))
+    check("expectedProjects match is path/OS-independent",
+          run(report_projects(["/home/runner/src/A/A.csproj",
+                               "C:\\ci\\src\\B\\B.csproj"]), expects_ab) == 0)
+    # (d) Malformed / empty / zero-byte report content fails closed (not silently PASS).
+    check("malformed JSON report fails closed",
+          raises(lambda: run_raw("{ not valid json", policy_with([]))))
+    check("empty (whitespace-only) report fails closed",
+          raises(lambda: run_raw("   \n", policy_with([]))))
+    check("zero-byte report fails closed",
+          raises(lambda: run_raw("", policy_with([]))))
+    # (e) A missing report or policy FILE fails closed.
+    check("missing report file fails closed",
+          raises(lambda: run_missing("report", report_with("High"), policy_with([]))))
+    check("missing policy file fails closed",
+          raises(lambda: run_missing("policy", report_with("High"), policy_with([]))))
+    # (f) A malformed expectedProjects knob fails closed (config guard).
+    check("malformed expectedProjects rejected",
+          raises(lambda: run(report_projects(["A.csproj"]),
+                             dict(policy_with([]), expectedProjects=[""]))))
 
     print()
     if failures:

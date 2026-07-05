@@ -251,7 +251,10 @@ def _selftest(allowlist_path: Path) -> int:
     check("scanner does not match itself", len(self_matches) == 0)
 
     # The committed fixture must be detected (fail-closed if it is removed or a regex
-    # regresses) AND must be fully covered by an unexpired allowlist entry.
+    # regresses) AND must be fully covered by an unexpired allowlist entry. Assert the
+    # SPECIFIC detectors the fixture is built to exercise (not merely ">=1"), so a broken
+    # regex for either one reddens instead of hiding behind the other, and assert the output
+    # is MASKED (never the raw secret).
     root = _repo_root()
     allow = load_allowlist(allowlist_path)
     fixture_rel = None
@@ -262,7 +265,16 @@ def _selftest(allowlist_path: Path) -> int:
     check("fixture allowlist entry present", fixture_rel is not None)
     if fixture_rel is not None:
         fmatches = scan_file(root, fixture_rel)
-        check("fixture is detected by >=1 detector", len(fmatches) > 0)
+        fired = {m.rule for m in fmatches}
+        # The fixture carries exactly one AWS access-key id and one project canary.
+        expected_fixture_rules = {"aws-access-key-id", "deltasharp-test-canary"}
+        for rule in sorted(expected_fixture_rules):
+            check(f"fixture fires detector: {rule}", rule in fired)
+        check("fixture fires exactly the expected detectors",
+              fired == expected_fixture_rules)
+        # Masked output must NOT echo the raw secret value (checklist 05: no creds in logs).
+        check("fixture matches are masked (no raw secret in rendered output)",
+              all(m.value not in m.describe() for m in fmatches) and len(fmatches) > 0)
         _, expected, expired = classify(fmatches, allow, _dt.date.today())
         check("fixture is fully allowlisted & unexpired",
               len(expected) == len(fmatches) and not expired)

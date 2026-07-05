@@ -8,15 +8,23 @@ name: Security
 #   * sbom        — CycloneDX SBOM per packable project + reproducible-build evidence,
 #                   uploaded as a retained artifact.
 #
-# These jobs run on every pull request and every push to main so a status is always
+# All three jobs run on every pull request and every push to main so a status is always
 # reported and they can be promoted to branch-protection required checks (a documented
-# post-merge step — see docs/engineering/design/supply-chain-security.md). Actions are
+# post-merge step — see docs/engineering/design/supply-chain-security.md). The `sca` job
+# ALSO runs on a nightly schedule so a newly-disclosed CVE on an otherwise-unchanged
+# dependency is caught without waiting for a push/PR; secret-scan and sbom are skipped on
+# the schedule (they only depend on committed source, which a nightly run would not change),
+# so the nightly cron does the vulnerability re-audit without wasteful rebuilds. Actions are
 # pinned by commit SHA; permissions are least-privilege (read-only token).
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # Nightly ~06:27 UTC — re-run the SCA audit so a CVE disclosed against a pinned,
+    # unchanged dependency surfaces within a day rather than at the next push.
+    - cron: "27 6 * * *"
   workflow_dispatch:
 
 permissions:
@@ -88,6 +96,9 @@ jobs:
     name: secret-scan
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Skip on the nightly schedule: the tripwire only reads committed source, which a
+    # scheduled run would not change, so nightly re-runs add nothing (only `sca` re-audits).
+    if: github.event_name != 'schedule'
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -108,6 +119,9 @@ jobs:
     name: sbom
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Skip on the nightly schedule: the SBOM + reproducible-build evidence are a function of
+    # committed source only, so a nightly rebuild would be identical (only `sca` re-audits).
+    if: github.event_name != 'schedule'
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -169,8 +183,14 @@ jobs:
           found=(sbom/DeltaSharp.Core-*.cdx.json sbom/DeltaSharp.Abstractions-*.cdx.json)
           test "${#found[@]}" -eq 2 || { echo "::error::expected 2 SBOMs, found ${#found[@]}"; exit 1; }
           for f in "${found[@]}"; do
-            grep -q '"bomFormat": "CycloneDX"' "$f" || { echo "::error::$f is not a CycloneDX BOM"; exit 1; }
-            grep -q '"components"' "$f" || { echo "::error::$f has no components"; exit 1; }
+            jq -e '.bomFormat == "CycloneDX"' "$f" >/dev/null \
+              || { echo "::error::$f is not a CycloneDX BOM"; exit 1; }
+            # Assert a TOP-LEVEL, non-empty components array. A substring grep for
+            # '"components"' would also match the nested .metadata.tools.components (the
+            # CycloneDX tool's own entry), so it could pass on an SBOM with an empty/absent
+            # top-level component list; jq scopes the check to the real dependency list.
+            jq -e '(.components | type) == "array" and (.components | length) > 0' "$f" >/dev/null \
+              || { echo "::error::$f has no top-level components"; exit 1; }
             echo "ok: $f"
           done
 
