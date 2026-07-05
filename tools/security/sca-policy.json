@@ -1,0 +1,31 @@
+{
+  "_comment": [
+    "SCA (software-composition-analysis) policy for DeltaSharp — STORY-00.3.1 (#107).",
+    "Consumed by tools/security/sca-gate.py and the 'sca' job in .github/workflows/security.yml.",
+    "See docs/engineering/design/supply-chain-security.md for the full policy narrative.",
+    "",
+    "failOnSeverity: the gate FAILS CI when any dependency has a vulnerability at or above",
+    "this severity (one of: low, moderate, high, critical). Set to 'high' to match the",
+    "build-time NuGet audit posture (NU1903/NU1904 HIGH/CRITICAL are build-breaking; ",
+    "NU1901/NU1902 LOW/MODERATE are warnings) declared in Directory.Build.props.",
+    "",
+    "suppressions[]: an auditable waiver for an accepted/false-positive finding. EVERY entry",
+    "MUST carry package, scope, reason, owner, and expiry (YYYY-MM-DD). An EXPIRED suppression",
+    "stops suppressing — the finding re-surfaces and fails the gate — so waivers cannot rot.",
+    "Optional: versions ('*' or a comma-separated exact list), advisory (pin to one URL),",
+    "reviewCriteria (the condition to re-review instead of blanket expiry).",
+    "Example entry:",
+    "  {",
+    "    \"package\": \"Some.Transitive.Package\",",
+    "    \"versions\": \"1.2.3,1.2.4\",",
+    "    \"advisory\": \"https://github.com/advisories/GHSA-xxxx-xxxx-xxxx\",",
+    "    \"scope\": \"DeltaSharp.Core (transitive via Foo)\",",
+    "    \"reason\": \"Not reachable from DeltaSharp code paths; upstream fix pending.\",",
+    "    \"owner\": \"@khaines\",",
+    "    \"expiry\": \"2026-01-31\",",
+    "    \"reviewCriteria\": \"Remove when Foo >= 2.0 (fixed) is adopted.\"",
+    "  }"
+  ],
+  "failOnSeverity": "high",
+  "suppressions": []
+}

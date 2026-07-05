@@ -1,0 +1,230 @@
+name: Security
+
+# Supply-chain security gates (FEAT-00.3 / #107, #108). Three independent jobs:
+#   * sca         — software-composition-analysis: fails on a dependency vulnerability at or
+#                   above the documented threshold (tools/security/sca-policy.json).
+#   * secret-scan — in-repo secret tripwire with a safe fixture (GitHub-native secret
+#                   scanning + push protection remain the primary control).
+#   * sbom        — CycloneDX SBOM per packable project + reproducible-build evidence,
+#                   uploaded as a retained artifact.
+#
+# These jobs run on every pull request and every push to main so a status is always
+# reported and they can be promoted to branch-protection required checks (a documented
+# post-merge step — see docs/engineering/design/supply-chain-security.md). Actions are
+# pinned by commit SHA; permissions are least-privilege (read-only token).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sca:
+    name: sca
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup .NET (net8 runtime + pinned SDK)
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: 8.0.x
+          global-json-file: global.json
+
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', 'Directory.Packages.props', 'Directory.Build.props', 'global.json') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      - name: Restore (locked)
+        run: dotnet restore DeltaSharp.sln --locked-mode
+
+      # Prove the gate's own threshold / suppression / expiry contract before trusting it
+      # on real data (mirrors the coverage gate self-test).
+      - name: SCA gate self-test
+        run: python3 tools/security/sca-gate.py --selftest
+
+      # `dotnet list package --vulnerable` queries the NuGet audit database and always
+      # exits 0 (it is a reporting command), emitting JSON on stdout; the gate below turns
+      # a finding above threshold into a red check.
+      - name: List vulnerable packages (JSON)
+        run: >-
+          dotnet list DeltaSharp.sln package --vulnerable --include-transitive
+          --format json > sca-report.json
+
+      - name: SCA gate (severity threshold)
+        run: >-
+          python3 tools/security/sca-gate.py
+          --input sca-report.json
+          --summary-out sca-summary.md
+
+      - name: Upload SCA report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sca-report
+          path: |
+            sca-report.json
+            sca-summary.md
+          if-no-files-found: warn
+          retention-days: 90
+
+  secret-scan:
+    name: secret-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # Prove every detector still fires and the safe fixture is detected + allowlisted
+      # (fails closed if a regex regresses or the fixture is removed).
+      - name: Secret-scan self-test
+        run: python3 tools/security/secret-scan.py --selftest
+
+      # Scan every git-tracked file. Un-allowlisted matches fail the job; the safe fixture
+      # is reported as an expected, masked match.
+      - name: Secret scan (tracked files)
+        run: python3 tools/security/secret-scan.py
+
+  sbom:
+    name: sbom
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup .NET (net8 runtime + pinned SDK)
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: 8.0.x
+          global-json-file: global.json
+
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', 'Directory.Packages.props', 'Directory.Build.props', 'global.json') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      - name: Restore (locked)
+        run: dotnet restore DeltaSharp.sln --locked-mode
+
+      # Restore the pinned CycloneDX .NET tool (.config/dotnet-tools.json). CycloneDX is the
+      # OWASP-standard SBOM generator for .NET and integrates with `dotnet`, so no
+      # third-party GitHub Action is added to the supply-chain surface.
+      - name: Restore .NET tools (CycloneDX)
+        run: dotnet tool restore
+
+      # One CycloneDX SBOM per packable project (DeltaSharp.Core, DeltaSharp.Abstractions).
+      # Naming convention: <PackageId>-<Version>.cdx.json, version derived from
+      # Directory.Build.props so the SBOM name tracks the real package version.
+      - name: Generate SBOMs (CycloneDX)
+        run: |
+          set -euo pipefail
+          version="$(grep -oPm1 '(?<=<VersionPrefix>)[^<]+' Directory.Build.props)"
+          echo "Package version: $version"
+          mkdir -p sbom
+          for proj in \
+            "src/DeltaSharp.Core/DeltaSharp.Core.csproj" \
+            "src/DeltaSharp.Abstractions/DeltaSharp.Abstractions.csproj"; do
+            id="$(basename "$proj" .csproj)"
+            dotnet CycloneDX "$proj" \
+              --output sbom \
+              --filename "${id}-${version}.cdx.json" \
+              --output-format Json \
+              --set-name "$id" \
+              --set-version "$version" \
+              --set-type Library \
+              --exclude-test-projects \
+              --configuration Release
+          done
+          ls -1 sbom
+
+      - name: Assert SBOM artifacts are valid CycloneDX
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          found=(sbom/DeltaSharp.Core-*.cdx.json sbom/DeltaSharp.Abstractions-*.cdx.json)
+          test "${#found[@]}" -eq 2 || { echo "::error::expected 2 SBOMs, found ${#found[@]}"; exit 1; }
+          for f in "${found[@]}"; do
+            grep -q '"bomFormat": "CycloneDX"' "$f" || { echo "::error::$f is not a CycloneDX BOM"; exit 1; }
+            grep -q '"components"' "$f" || { echo "::error::$f has no components"; exit 1; }
+            echo "ok: $f"
+          done
+
+      # Reproducible-build evidence (#108b): compile each packable assembly TWICE from the
+      # same commit into separate output dirs and compare SHA-256. Deterministic=true
+      # (Directory.Build.props) plus ContinuousIntegrationBuild=true (set on GITHUB_ACTIONS)
+      # make the compiler emit a byte-identical PE (hash-derived MVID) for identical inputs.
+      # The hashes are written to a retained evidence file.
+      - name: Reproducible build evidence
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          repo_url="$(grep -oPm1 '(?<=<RepositoryUrl>)[^<]+' Directory.Build.props)"
+          evidence="sbom/reproducible-build-evidence.md"
+          {
+            echo "# Reproducible build evidence"
+            echo
+            echo "- Repository: $repo_url"
+            echo "- Commit: \`$commit\`"
+            echo "- Settings: Deterministic=true, ContinuousIntegrationBuild=true (CI),"
+            echo "  EmbedUntrackedSources=true, PublishRepositoryUrl=true, in-box SourceLink."
+            echo
+            echo "Each assembly is compiled twice (\`--no-incremental\`) from the same commit;"
+            echo "byte-identical SHA-256 across builds demonstrates deterministic output."
+            echo
+            echo "| Assembly | TFM | SHA-256 | Reproducible |"
+            echo "| --- | --- | --- | --- |"
+          } > "$evidence"
+          fail=0
+          for proj in \
+            "src/DeltaSharp.Core/DeltaSharp.Core.csproj" \
+            "src/DeltaSharp.Abstractions/DeltaSharp.Abstractions.csproj"; do
+            id="$(basename "$proj" .csproj)"
+            for tfm in net8.0 net10.0; do
+              dotnet build "$proj" -c Release -f "$tfm" --no-restore --no-incremental -o "repro/a/$id/$tfm" >/dev/null
+              dotnet build "$proj" -c Release -f "$tfm" --no-restore --no-incremental -o "repro/b/$id/$tfm" >/dev/null
+              a="$(sha256sum "repro/a/$id/$tfm/$id.dll" | cut -d' ' -f1)"
+              b="$(sha256sum "repro/b/$id/$tfm/$id.dll" | cut -d' ' -f1)"
+              if [ "$a" = "$b" ]; then repro="yes"; else repro="NO"; fail=1; echo "::error::non-deterministic build: $id/$tfm ($a != $b)"; fi
+              echo "| $id | $tfm | \`$a\` | $repro |" >> "$evidence"
+            done
+          done
+          echo; cat "$evidence"
+          test "$fail" -eq 0 || { echo "::error::reproducible-build evidence failed"; exit 1; }
+
+      # Naming convention (#108d): SBOM files are <PackageId>-<Version>.cdx.json, retained as
+      # the `sbom-cyclonedx` artifact for 90 days alongside the reproducible-build evidence.
+      - name: Upload SBOMs + evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom-cyclonedx
+          path: |
+            sbom/*.cdx.json
+            sbom/reproducible-build-evidence.md
+          if-no-files-found: error
+          retention-days: 90

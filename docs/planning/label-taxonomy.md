@@ -144,7 +144,9 @@ protection on `main` (verified 2026-07-04) is:
 
 - `required_pull_request_reviews.require_code_owner_reviews`: **false**.
 - `required_pull_request_reviews.required_approving_review_count`: **0**.
-- Required status checks: `build-test-format` and `dco`.
+- Required status checks: `build-test-format`, `dco`, and `coverage` (the FEAT-00.3
+  supply-chain scans run on every PR and are documented for the same post-merge promotion
+  in [supply-chain-security.md](../engineering/design/supply-chain-security.md)).
 - `enforce_admins`: true; `required_linear_history`: true;
   `required_conversation_resolution`: true; force-pushes and deletions blocked.
 

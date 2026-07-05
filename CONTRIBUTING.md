@@ -84,9 +84,9 @@ full policy):
 - **`build-test-format`** enforces gates 1 and 2 and is the authoritative test-correctness run
   (tests run **uninstrumented** here).
 - **`coverage`** runs in parallel and enforces gate 3 (line-coverage threshold); it is
-  measurement-only so coverage instrumentation can never change the correctness verdict. It becomes
-  **merge-blocking** once added to the repository's branch-protection required checks — a post-merge
-  step, since a check can only be required after it has first run on `main`.
+  measurement-only so coverage instrumentation can never change the correctness verdict. It is a
+  **required check** on `main` (added to branch protection after it first ran there, #456), so a
+  coverage breach **blocks merge**.
 
 Each gate has a local command that reproduces the CI result:
 

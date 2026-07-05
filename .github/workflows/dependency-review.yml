@@ -1,0 +1,40 @@
+name: Dependency review
+
+# Flags vulnerable or license-incompatible dependency CHANGES introduced by a pull request
+# (FEAT-00.3 / #107), using GitHub's dependency graph to diff the base and head. This is a
+# pull-request-only control (it needs a base..head range), complementing the security.yml
+# `sca` job which audits the full resolved dependency set on every push and PR.
+#
+# The repository is public, so the dependency graph and this action are available without
+# GitHub Advanced Security. The action is pinned by commit SHA; the token is read-only
+# (findings surface in the job summary and check status, not as a PR comment, so no
+# pull-requests: write scope is needed).
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-review-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-review:
+    name: dependency-review
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # fail-on-severity: high matches the documented SCA threshold (see
+      # docs/engineering/design/supply-chain-security.md and tools/security/sca-policy.json).
+      - name: Dependency review
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: never

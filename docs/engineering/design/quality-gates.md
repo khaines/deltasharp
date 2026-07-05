@@ -28,15 +28,14 @@ policy violation surfaces on the pull request rather than accumulating as debt:
   be able to change the correctness verdict, which `build-test-format` owns (see
   [Why coverage is a separate job](#why-coverage-is-a-separate-job)).
 
-> **Which checks are merge-blocking.** A CI job only blocks the merge button once it is listed in
-> the repository's **branch-protection required status checks**. `build-test-format` is (or is
-> intended to be) a required check. The **`coverage`** job is **not yet** merge-blocking: a status
-> check can only be added to branch protection **after it has run at least once on `main`**, which
-> happens only **after this PR merges** and the `coverage` job first executes on the `main` push.
-> Wiring `coverage` into the required-checks list is therefore a **documented post-merge step**;
-> until it is done, a `coverage` failure is visible on the PR but does not itself block the button.
-> This doc does not claim `coverage` blocks merges today — it will once it is added to the required
-> checks.
+> **Which checks are merge-blocking.** A CI job blocks the merge button once it is listed in
+> the repository's **branch-protection required status checks**. On `main` the required checks
+> are **`build-test-format`**, **`coverage`**, and **`dco`**, so **all three gates block merge**
+> — including **`coverage`**, which was wired into the required set after it first ran on `main`
+> (#456; a status check can only be made required once it has executed on the default branch).
+> The FEAT-00.3 supply-chain security scans (`sca`, `secret-scan`, `sbom`,
+> `dependency-review`) run on every PR and are documented for the same post-merge promotion in
+> [supply-chain-security.md](supply-chain-security.md).
 
 | # | Gate | Job | Enforced by | Fails when |
 | --- | --- | --- | --- | --- |
