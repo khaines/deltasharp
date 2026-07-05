@@ -49,12 +49,12 @@ features and their checklists (05, 14, 18); this document does not restate them.
 | # | Control | Mechanism | Enforcement today | Config / code |
 | --- | --- | --- | --- | --- |
 | 107a | Secret scanning | GitHub-native secret scanning + push protection (primary); in-repo tripwire (testable) | Enabled; `secret-scan` CI job fails on un-allowlisted match | repo settings; [`security.yml`](../../../.github/workflows/security.yml), [`tools/security/secret-scan.py`](../../../tools/security/secret-scan.py) |
-| 107b/c | Dependency / SCA scanning | Build-time NuGet audit + `sca` gate + PR `dependency-review` | HIGH/CRITICAL fail the build **and** the `sca` gate; `dependency-review` fails on high | [`Directory.Build.props`](../../../Directory.Build.props), [`security.yml`](../../../.github/workflows/security.yml), [`dependency-review.yml`](../../../.github/workflows/dependency-review.yml), [`tools/security/sca-gate.py`](../../../tools/security/sca-gate.py) |
+| 107b/c | Dependency / SCA scanning | Build-time NuGet audit + `sca` gate + PR `dependency-review` | HIGH/CRITICAL fail the build **and** the `sca` gate; `dependency-review` (advisory, PR-only) fails on high | [`Directory.Build.props`](../../../Directory.Build.props), [`security.yml`](../../../.github/workflows/security.yml), [`dependency-review.yml`](../../../.github/workflows/dependency-review.yml), [`tools/security/sca-gate.py`](../../../tools/security/sca-gate.py) |
 | 107d | Suppression hygiene | Allowlists carrying scope/reason/owner/expiry, expiry-enforced | Malformed/expired waivers fail closed | [`sca-policy.json`](../../../tools/security/sca-policy.json), [`secret-scan-allowlist.json`](../../../tools/security/secret-scan-allowlist.json) |
 | 108a/d | SBOM | CycloneDX per packable project, retained artifact | `sbom` CI job generates + uploads | [`security.yml`](../../../.github/workflows/security.yml), [`.config/dotnet-tools.json`](../../../.config/dotnet-tools.json) |
 | 108b | Deterministic build evidence | Deterministic compile + double-build hash comparison | `sbom` job fails on non-deterministic output | [`Directory.Build.props`](../../../Directory.Build.props), [`security.yml`](../../../.github/workflows/security.yml) |
 | 108c | Source provenance | In-box SourceLink + repository metadata | `pack.yml` asserts SourceLink resolves to the repo | [`Directory.Build.props`](../../../Directory.Build.props), [`pack.yml`](../../../.github/workflows/pack.yml) |
-| 109a | Required checks | Branch protection on `main` | `build-test-format`, `dco`, `coverage` required; security scans documented for post-merge wiring | GitHub branch protection (see below) |
+| 109a | Required checks | Branch protection on `main` | `build-test-format`, `dco`, `coverage`, `sca`, `secret-scan`, `sbom` required; `dependency-review` stays advisory PR-only | GitHub branch protection (see below) |
 | 109b | Signing posture | DCO today; package/image signing documented future | DCO enforced via `dco` check | [`dco.yml`](../../../.github/workflows/dco.yml), this doc |
 | 109c | Release traceability | This baseline referenced by a future release workflow | Documented | this doc |
 | 109d | Bypass control | `enforce_admins=true`; protection editable only by repo admins | No merge bypass; admin change limited to maintainers | GitHub branch protection, [`GOVERNANCE.md`](../../../GOVERNANCE.md), [`.github/CODEOWNERS`](../../../.github/CODEOWNERS) |
@@ -300,7 +300,7 @@ Branch protection on `main` (verified **2026-07-04** via
 
 | Setting | Value |
 | --- | --- |
-| Required status checks | `build-test-format`, `dco`, `coverage` (`strict: false`) |
+| Required status checks | `build-test-format`, `dco`, `coverage`, `sca`, `secret-scan`, `sbom` (`strict: false`) |
 | `enforce_admins` | **true** (rules apply to admins; no merge bypass) |
 | `required_linear_history` | true |
 | `required_conversation_resolution` | true |
@@ -309,24 +309,38 @@ Branch protection on `main` (verified **2026-07-04** via
 | `required_signatures` | false (DCO is the commit attestation today) |
 | Merge methods (repo) | **squash-only** (`allow_squash_merge: true`; merge-commit and rebase disabled), `delete_branch_on_merge: true` |
 
-**Required checks (AC #109a).** CI (`build-test-format`) and DCO (`dco`) are required, and
-`coverage` was added to the required set (FEAT-00.2 post-merge wiring, #456). The FEAT-00.3
-**security scans** are **not yet required checks**. Their triggers differ: `sca`,
-`secret-scan`, and `sbom` (in `security.yml`) run on **every PR and every push to `main`**
-(and `sca` also on a nightly `schedule`), while `dependency-review` (in
-`dependency-review.yml`) is **PR-only** — it needs a base↔head range to diff. A status check
-can only be added to branch protection **after it has first run on `main`**, which happens
-once this change merges. Promoting them is therefore a **documented post-merge step** (the
-same pattern used for `coverage`):
+**Required checks (AC #109a).** Six checks are required on `main`: `build-test-format`,
+`dco`, `coverage`, `sca`, `secret-scan`, and `sbom` (all `strict: false`). CI
+(`build-test-format`) and DCO (`dco`) were required first; `coverage` followed (FEAT-00.2
+post-merge wiring, #456); and the FEAT-00.3 **security scans** — `sca`, `secret-scan`, and
+`sbom` (in `security.yml`) — **are now required checks as well** (#461), so a failing scan
+**blocks merge**. Those three run on **every PR and every push to `main`** (and `sca` also on
+a nightly `schedule`); each therefore first ran on `main` and was then promoted, since a
+status check can only be added to branch protection **after it has first run on `main`** — the
+same post-merge pattern used for `coverage`.
+
+`dependency-review` (in `dependency-review.yml`) is deliberately **not** a required check: it
+is **advisory and PR-only**. It needs a base↔head range to diff, so it never runs on a push to
+`main` and cannot become a required status check there; it still runs on every pull request and
+fails on a high-severity introduced dependency, but it does not gate `main` via branch
+protection.
+
+The security scans were promoted with the documented step:
 
 ```bash
 gh api -X PATCH repos/khaines/deltasharp/branches/main/protection/required_status_checks \
   --input - <<'JSON'
 { "strict": false, "checks": [
   {"context": "build-test-format"}, {"context": "dco"}, {"context": "coverage"},
-  {"context": "sca"}, {"context": "secret-scan"}, {"context": "sbom"},
-  {"context": "dependency-review"} ] }
+  {"context": "sca"}, {"context": "secret-scan"}, {"context": "sbom"} ] }
 JSON
+```
+
+Verify the live set (it includes the three security scans and **not** `dependency-review`):
+
+```bash
+gh api repos/khaines/deltasharp/branches/main/protection/required_status_checks --jq '.contexts'
+# ["build-test-format","dco","coverage","sca","secret-scan","sbom"]
 ```
 
 **Code-owner review.** [`.github/CODEOWNERS`](../../../.github/CODEOWNERS) routes review
