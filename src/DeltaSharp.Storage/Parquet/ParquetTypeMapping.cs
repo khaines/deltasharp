@@ -89,8 +89,22 @@ internal static class ParquetTypeMapping
 
     /// <summary>Converts a DeltaSharp epoch-day (days since 1970-01-01) to the UTC-midnight
     /// <see cref="DateTime"/> Parquet.Net writes for a DATE column.</summary>
-    public static DateTime EpochDayToDateTime(int epochDay) =>
-        DateTime.UnixEpoch.AddDays(epochDay);
+    /// <exception cref="DeltaStorageException">The epoch-day is outside the representable
+    /// <see cref="DateTime"/> range (<see cref="StorageErrorKind.CorruptData"/>) — mapped
+    /// deterministically so no raw <see cref="ArgumentOutOfRangeException"/> escapes the codec contract,
+    /// mirroring <see cref="EpochMicrosToDateTime"/>.</exception>
+    public static DateTime EpochDayToDateTime(int epochDay)
+    {
+        try
+        {
+            return DateTime.UnixEpoch.AddDays(epochDay);
+        }
+        catch (Exception ex) when (ex is OverflowException or ArgumentOutOfRangeException)
+        {
+            throw DeltaStorageException.CorruptData(
+                $"date epoch-day value {epochDay} is outside the representable DateTime range.", ex);
+        }
+    }
 
     /// <summary>Converts a Parquet DATE <see cref="DateTime"/> back to the DeltaSharp epoch-day.</summary>
     public static int DateTimeToEpochDay(DateTime value) =>
@@ -154,28 +168,85 @@ internal static class ParquetTypeMapping
 
     /// <summary>Encodes a <see cref="decimal"/> read from Parquet as the unscaled integer lane value and
     /// appends it to <paramref name="vector"/> (mirrors <c>LocalRelationBatches.AppendDecimal</c>).</summary>
-    public static void AppendDecimal(MutableColumnVector vector, DecimalType type, decimal value)
+    /// <exception cref="DeltaStorageException">The value cannot be represented at the declared
+    /// scale/precision, or scaling overflows <see cref="decimal"/>/<see cref="Int128"/>
+    /// (<see cref="StorageErrorKind.CorruptData"/>); the scale is unsupported
+    /// (<see cref="StorageErrorKind.UnsupportedFeature"/>).</exception>
+    public static void AppendDecimal(MutableColumnVector vector, DecimalType type, decimal value) =>
+        AppendDecimal(vector, type, value, DecimalScaleFactors.For(type));
+
+    /// <summary>The two loop-invariant powers <see cref="AppendDecimal(MutableColumnVector, DecimalType,
+    /// decimal, DecimalScaleFactors)"/> needs — the decimal scaling factor <c>10^scale</c> and the
+    /// <see cref="Int128"/> over-precision ceiling <c>10^precision</c>. Hoisted once per column chunk (L1)
+    /// so the O(exponent) power loops run once per chunk, not once per value.</summary>
+    internal readonly struct DecimalScaleFactors
     {
-        if (type.Scale > MaxDecimalScale)
+        private DecimalScaleFactors(decimal scaleFactor, Int128 precisionCeiling)
         {
-            throw DeltaStorageException.UnsupportedFeature(
-                $"decimal scale {type.Scale} exceeds the System.Decimal maximum of {MaxDecimalScale}.");
+            ScaleFactor = scaleFactor;
+            PrecisionCeiling = precisionCeiling;
         }
 
-        decimal scaled = value * Pow10Decimal(type.Scale);
+        internal decimal ScaleFactor { get; }
+
+        internal Int128 PrecisionCeiling { get; }
+
+        /// <summary>Validates the scale and precomputes the powers for <paramref name="type"/>.</summary>
+        /// <exception cref="DeltaStorageException">The scale exceeds the <see cref="decimal"/> maximum
+        /// (<see cref="StorageErrorKind.UnsupportedFeature"/>).</exception>
+        internal static DecimalScaleFactors For(DecimalType type)
+        {
+            if (type.Scale > MaxDecimalScale)
+            {
+                throw DeltaStorageException.UnsupportedFeature(
+                    $"decimal scale {type.Scale} exceeds the System.Decimal maximum of {MaxDecimalScale}.");
+            }
+
+            return new DecimalScaleFactors(Pow10Decimal(type.Scale), Pow10Int128(type.Precision));
+        }
+    }
+
+    /// <summary>Encodes <paramref name="value"/> using the pre-hoisted <paramref name="factors"/>,
+    /// avoiding the per-value <c>Pow10</c> recompute (L1). Overflow of the scale multiply or the
+    /// <see cref="Int128"/> conversion maps to <see cref="StorageErrorKind.CorruptData"/> rather than
+    /// letting a raw <see cref="OverflowException"/> escape the codec contract (mirrors
+    /// <c>LocalRelationBatches.AppendDecimal</c>).</summary>
+    internal static void AppendDecimal(
+        MutableColumnVector vector, DecimalType type, decimal value, DecimalScaleFactors factors)
+    {
+        decimal scaled;
+        try
+        {
+            scaled = value * factors.ScaleFactor;
+        }
+        catch (OverflowException ex)
+        {
+            throw DeltaStorageException.CorruptData(
+                $"decimal value is out of range for type '{type.SimpleString}'.", ex);
+        }
+
         if (scaled != decimal.Truncate(scaled))
         {
             throw DeltaStorageException.CorruptData(
                 $"decimal value cannot be represented at scale {type.Scale} without loss of precision.");
         }
 
-        Int128 unscaled = Int128.CreateChecked(scaled);
+        Int128 unscaled;
+        try
+        {
+            unscaled = Int128.CreateChecked(scaled);
+        }
+        catch (OverflowException ex)
+        {
+            throw DeltaStorageException.CorruptData(
+                $"decimal value is out of range for type '{type.SimpleString}'.", ex);
+        }
 
         // Over-precision guard (§2.9.1 mandates it on the read path too): a value whose unscaled
         // magnitude reaches 10^precision does not fit the declared decimal(P,S) and is corrupt. Mirrors
         // LocalRelationBatches.AppendDecimal.
         Int128 magnitude = unscaled < 0 ? -unscaled : unscaled;
-        if (magnitude >= Pow10Int128(type.Precision))
+        if (magnitude >= factors.PrecisionCeiling)
         {
             throw DeltaStorageException.CorruptData(
                 $"decimal value does not fit in precision {type.Precision} (type '{type.SimpleString}').");
@@ -189,38 +260,6 @@ internal static class ParquetTypeMapping
         {
             vector.AppendValue(unscaled);
         }
-    }
-
-    /// <summary>Converts a Parquet-space <see cref="decimal"/> to the engine's unscaled
-    /// <see cref="Int128"/> lane value (value × 10^scale), applying the same scale/precision guards as
-    /// <see cref="AppendDecimal"/>. Used to lane-normalize row-group statistics for pruning.</summary>
-    /// <exception cref="DeltaStorageException">The value cannot be represented at the declared
-    /// scale/precision (<see cref="StorageErrorKind.CorruptData"/>) or the scale is unsupported
-    /// (<see cref="StorageErrorKind.UnsupportedFeature"/>).</exception>
-    public static Int128 DecimalToUnscaled(DecimalType type, decimal value)
-    {
-        if (type.Scale > MaxDecimalScale)
-        {
-            throw DeltaStorageException.UnsupportedFeature(
-                $"decimal scale {type.Scale} exceeds the System.Decimal maximum of {MaxDecimalScale}.");
-        }
-
-        decimal scaled = value * Pow10Decimal(type.Scale);
-        if (scaled != decimal.Truncate(scaled))
-        {
-            throw DeltaStorageException.CorruptData(
-                $"decimal value cannot be represented at scale {type.Scale} without loss of precision.");
-        }
-
-        Int128 unscaled = Int128.CreateChecked(scaled);
-        Int128 magnitude = unscaled < 0 ? -unscaled : unscaled;
-        if (magnitude >= Pow10Int128(type.Precision))
-        {
-            throw DeltaStorageException.CorruptData(
-                $"decimal value does not fit in precision {type.Precision} (type '{type.SimpleString}').");
-        }
-
-        return unscaled;
     }
 
     private static decimal Pow10Decimal(int exponent)

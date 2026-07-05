@@ -332,4 +332,169 @@ public sealed class LocalFileSystemBackendTests : IDisposable
         Assert.Contains("a/2.bin", paths);
         Assert.DoesNotContain("b/3.bin", paths);
     }
+
+    [Fact]
+    public async Task List_DoesNotLeakEntriesUnderSymlinkedAncestorDirectory()
+    {
+        // CF-2: a symlinked DIRECTORY inside the root pointing outside it. Directory.GetFiles(...,
+        // AllDirectories) follows it and yields the out-of-root file with a NON-reparse leaf, so only the
+        // real-target ancestor check catches it. The listing must not leak the out-of-root metadata
+        // (design §5.5 "no cross-tenant listing").
+        string outsideDir = Path.Combine(Path.GetDirectoryName(_root)!, $"{Path.GetFileName(_root)}-outside");
+        Directory.CreateDirectory(outsideDir);
+        await File.WriteAllBytesAsync(Path.Combine(outsideDir, "secret.bin"), new byte[] { 7, 7, 7 });
+
+        await _backend.PutIfAbsentAsync("inside.bin", new byte[] { 1 }, CancellationToken.None);
+
+        string dirLink = Path.Combine(_root, "dirlink");
+        try
+        {
+            Directory.CreateSymbolicLink(dirLink, outsideDir);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            // Symlink creation is unprivileged on this platform/run — the guard cannot be exercised here.
+            Directory.Delete(outsideDir, recursive: true);
+            return;
+        }
+
+        try
+        {
+            var paths = new List<string>();
+            await foreach (StorageObjectInfo info in _backend.ListAsync(string.Empty, CancellationToken.None))
+            {
+                paths.Add(info.Path);
+            }
+
+            Assert.Contains("inside.bin", paths);
+            Assert.DoesNotContain(paths, p => p.Contains("secret", StringComparison.Ordinal));
+        }
+        finally
+        {
+            try
+            {
+                Directory.Delete(dirLink, recursive: false);
+            }
+            catch (IOException)
+            {
+                // Best-effort teardown of the symlink.
+            }
+
+            try
+            {
+                Directory.Delete(outsideDir, recursive: true);
+            }
+            catch (IOException)
+            {
+                // Best-effort teardown.
+            }
+        }
+    }
+
+    [Fact]
+    public async Task DirectoryFsyncFailure_OnPutIfAbsent_SurfacesRetryUnsafeAmbiguous()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            // Windows journals directory metadata; DirectoryFsync is a no-op and the hook is not consulted.
+            return;
+        }
+
+        // CF-3: force the commit-path directory fsync to fail. A publish we cannot make durable is an
+        // ambiguous outcome the caller must re-resolve — never a silently-successful commit.
+        DirectoryFsync.FsyncHook = static _ => 1;
+        try
+        {
+            DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+                async () => await _backend.PutIfAbsentAsync("commit.bin", new byte[] { 1 }, CancellationToken.None));
+            Assert.Equal(StorageErrorKind.RetryUnsafeAmbiguous, error.Kind);
+        }
+        finally
+        {
+            DirectoryFsync.FsyncHook = null;
+        }
+    }
+
+    [Fact]
+    public async Task CommitDurabilityOrder_IsFileFsyncThenPublishThenDirFsync()
+    {
+        // CF-3: prove the durability ordering — the staged bytes are fsync'd, THEN atomically published,
+        // THEN the directory entry is fsync'd. A reordering (e.g. publish before the data fsync) would
+        // let a crash expose a name whose bytes are not yet durable.
+        var steps = new List<string>();
+        LocalFileSystemBackend.CommitStepProbe = step =>
+        {
+            lock (steps)
+            {
+                steps.Add(step);
+            }
+        };
+        try
+        {
+            bool won = await _backend.PutIfAbsentAsync("ordered.bin", new byte[] { 1, 2, 3 }, CancellationToken.None);
+            Assert.True(won);
+        }
+        finally
+        {
+            LocalFileSystemBackend.CommitStepProbe = null;
+        }
+
+        Assert.Equal(new[] { "file-fsync", "publish", "dir-fsync" }, steps);
+    }
+
+    [Fact]
+    public void CreateFreshTemp_RetriesOnCollision_WithoutDeletingForeignTemp()
+    {
+        // CF-4: a foreign in-flight temp already owns the name the first ordinal would pick. The staging
+        // temp must retry with a FRESH ordinal and NEVER delete the foreign temp (which would be a mutual
+        // commit DoS between two writer pods sharing a PID namespace on an RWX PVC).
+        Directory.CreateDirectory(_root);
+        string dest = Path.Combine(_root, "obj.bin");
+        string foreign = LocalFileSystemBackend.BuildTempName(dest, 5, ".tmp");
+        File.WriteAllBytes(foreign, new byte[] { 9 });
+
+        var ordinals = new Queue<long>(new long[] { 5, 6 });
+        using (FileStream created = LocalFileSystemBackend.CreateFreshTempFrom(
+            dest, ".tmp", () => ordinals.Dequeue(), out string tempPath))
+        {
+            Assert.Equal(LocalFileSystemBackend.BuildTempName(dest, 6, ".tmp"), tempPath);
+            Assert.NotEqual(foreign, tempPath);
+        }
+
+        Assert.True(File.Exists(foreign));
+        Assert.Equal(new byte[] { 9 }, File.ReadAllBytes(foreign));
+    }
+
+    [Fact]
+    public void BuildTempName_IncludesSanitizedMachineNameForCrossPodUniqueness()
+    {
+        // CF-4: the temp name embeds the (sanitized) pod hostname so two pods with identical PIDs on a
+        // shared PVC cannot generate identical temp names.
+        string dest = Path.Combine(_root, "obj.bin");
+        string name = LocalFileSystemBackend.BuildTempName(dest, 1, ".tmp");
+
+        Assert.Contains($".{SanitizeHostForTest(Environment.MachineName)}.", name);
+        Assert.StartsWith(dest + ".", name);
+        Assert.EndsWith(".tmp", name);
+    }
+
+    private static string SanitizeHostForTest(string host)
+    {
+        if (string.IsNullOrEmpty(host))
+        {
+            return "host";
+        }
+
+        int length = Math.Min(host.Length, 64);
+        char[] chars = new char[length];
+        for (int i = 0; i < length; i++)
+        {
+            char c = host[i];
+            bool safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                || (c >= '0' && c <= '9') || c == '-';
+            chars[i] = safe ? c : '-';
+        }
+
+        return new string(chars);
+    }
 }

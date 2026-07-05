@@ -31,19 +31,30 @@ namespace DeltaSharp.Storage.Parquet;
 /// The reader deliberately keeps streaming (it does not buffer every row group to make the whole file
 /// atomic): the honest, design-consistent guarantee is that a batch is never torn, not that the whole
 /// file is validated before the first batch.</para>
-/// <para><b>Decode ceiling (H4, design §5.4 C-DECODE).</b> Before the eager per-column allocation, an
-/// attacker-controllable <c>RowCount</c> is cross-checked against the physical stream length via
-/// <see cref="EnsureDecodeCeiling"/>, failing closed on an implausible ratio so a crafted footer cannot
-/// drive an out-of-memory decompression bomb.</para>
+/// <para><b>Decode ceiling (H4/CF-1, design §5.4 C-DECODE).</b> Before the eager per-column allocation,
+/// each projected row group's declared metadata is validated via <see cref="EnsureDecodeCeiling"/>: a
+/// per-chunk decompression-ratio ceiling, an absolute decompressed-size ceiling, and a row-count
+/// plausibility bound on the bytes the declared row count would materialize. These declared-size bounds
+/// are sound where a physical rows/byte proxy is not — legitimately compressible data (constant/RLE/
+/// all-null columns encode millions of rows in a few hundred bytes) passes, while a crafted footer that
+/// inflates the decompressed size or row count fails closed rather than driving an out-of-memory
+/// decompression bomb.</para>
 /// </remarks>
 internal sealed class ParquetFileReader
 {
-    /// <summary>The decompression-bomb decode ceiling: the maximum plausible rows a single byte of the
-    /// physical stream can encode (design §5.4 C-DECODE). Even a fully dictionary/RLE-encoded row costs
-    /// more than a fraction of a byte once page/definition-level overhead is counted, so a
-    /// <c>RowCount</c> exceeding <c>streamLength × MaxRowsPerByte</c> is a crafted footer, not a real
-    /// file. Chosen generously so no legitimate file is ever rejected.</summary>
-    internal const long MaxRowsPerByte = 64;
+    /// <summary>The maximum plausible ratio of a column chunk's declared decompressed bytes to its
+    /// declared compressed bytes (design §5.4 C-DECODE). Real Parquet encodings — even Snappy over
+    /// constant/RLE/all-null data — stay well under this (empirically ≈ 20:1 at the column-chunk level),
+    /// so a declared ratio beyond it is a crafted footer, not a real file, and is rejected as a
+    /// decompression bomb.</summary>
+    internal const long MaxDecompressionRatio = 1000;
+
+    /// <summary>The absolute per-row-group decode ceiling (4&#160;GiB), applied to both the declared
+    /// decompressed bytes AND the bytes a row group's declared row count would eagerly materialize
+    /// (design §5.4 C-DECODE). It bounds decode/allocation memory so a crafted footer — whether inflating
+    /// the decompressed size or the row count — fails closed rather than driving an out-of-memory
+    /// allocation.</summary>
+    internal const long MaxRowGroupDecodedBytes = 4L * 1024 * 1024 * 1024;
 
     /// <summary>A row-group pruning hint: return <see langword="false"/> to skip a row group whose
     /// <see cref="RowGroupStatistics"/> prove it cannot match. Pruning is a hint only — a kept group is
@@ -76,9 +87,6 @@ internal sealed class ParquetFileReader
             _ = ParquetTypeMapping.CreateField(requested[c]);
         }
 
-        // Physical stream length for the decode ceiling (H4); -1 when the stream is not seekable.
-        long streamLength = input.CanSeek ? input.Length : -1;
-
         ParquetReader reader = await OpenAsync(input, cancellationToken).ConfigureAwait(false);
         await using (reader.ConfigureAwait(false))
         {
@@ -89,7 +97,7 @@ internal sealed class ParquetFileReader
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 ColumnBatch? batch = await ReadRowGroupAsync(
-                    reader, group, requested, fileFields, keepRowGroup, streamLength, cancellationToken)
+                    reader, group, requested, fileFields, keepRowGroup, cancellationToken)
                     .ConfigureAwait(false);
                 if (batch is not null)
                 {
@@ -99,27 +107,125 @@ internal sealed class ParquetFileReader
         }
     }
 
-    /// <summary>Fails closed when a row group's declared <paramref name="rowCount"/> is implausible for
-    /// the physical <paramref name="streamLength"/> (design §5.4 C-DECODE decompression-bomb control),
-    /// so a crafted footer cannot drive an out-of-memory allocation. A negative row count is likewise
-    /// rejected. No-op when the stream length is unknown (<paramref name="streamLength"/> &lt; 0).</summary>
-    /// <exception cref="DeltaStorageException"><paramref name="rowCount"/> is negative or exceeds the
-    /// decode ceiling (<see cref="StorageErrorKind.CorruptData"/>).</exception>
-    internal static void EnsureDecodeCeiling(long rowCount, long streamLength, int group)
+    /// <summary>The declared compressed/decompressed footprint of one projected column chunk, plus the
+    /// per-row width the reader will materialize it into — the inputs to <see cref="EnsureDecodeCeiling"/>.
+    /// </summary>
+    internal readonly record struct ColumnChunkFootprint(
+        long CompressedBytes, long UncompressedBytes, int ElementBytes);
+
+    /// <summary>Fails closed when a row group's declared metadata is an implausible decode target (design
+    /// §5.4 C-DECODE), so a crafted footer cannot drive an out-of-memory decompression or materialization.
+    /// Over the projected column chunks it enforces: (i) a per-chunk decompression-<b>ratio</b> ceiling
+    /// (<see cref="MaxDecompressionRatio"/>); (ii) an <b>absolute</b> decompressed-size ceiling
+    /// (<see cref="MaxRowGroupDecodedBytes"/>); and (iii) a <b>row-count plausibility</b> bound — the
+    /// bytes the declared <paramref name="rowCount"/> would eagerly materialize must not exceed the same
+    /// absolute ceiling. A negative row count or a negative declared size is likewise rejected. Unlike the
+    /// physical rows/byte proxy this replaces, these declared-size bounds are sound: legitimately
+    /// compressible data (constant/RLE/all-null columns, which encode millions of rows in a few hundred
+    /// bytes) passes, while an inflated decompressed size or row count is caught.</summary>
+    /// <exception cref="ArgumentNullException"><paramref name="projectedChunks"/> is null.</exception>
+    /// <exception cref="DeltaStorageException">A declared value is negative, or a ceiling is exceeded
+    /// (<see cref="StorageErrorKind.CorruptData"/>).</exception>
+    internal static void EnsureDecodeCeiling(
+        long rowCount, IReadOnlyList<ColumnChunkFootprint> projectedChunks, int group)
     {
+        ArgumentNullException.ThrowIfNull(projectedChunks);
         if (rowCount < 0)
         {
             throw DeltaStorageException.CorruptData(
                 $"Row group {group} declares a negative row count ({rowCount}).");
         }
 
-        if (streamLength >= 0 && rowCount > streamLength * MaxRowsPerByte)
+        long totalDecompressedBytes = 0;
+        for (int c = 0; c < projectedChunks.Count; c++)
+        {
+            ColumnChunkFootprint chunk = projectedChunks[c];
+            if (chunk.CompressedBytes < 0 || chunk.UncompressedBytes < 0)
+            {
+                throw DeltaStorageException.CorruptData(
+                    $"Row group {group} declares a negative column-chunk size (compressed "
+                    + $"{chunk.CompressedBytes}, decompressed {chunk.UncompressedBytes}).");
+            }
+
+            // (i) Decompression-ratio ceiling: a chunk claiming far more decompressed than compressed
+            // bytes is a decompression bomb. The floor of 1 avoids a divide-by/zero-compressed edge.
+            long compressedFloor = Math.Max(chunk.CompressedBytes, 1);
+            if (chunk.UncompressedBytes > compressedFloor * MaxDecompressionRatio)
+            {
+                throw DeltaStorageException.CorruptData(
+                    $"Row group {group} declares {chunk.UncompressedBytes} decompressed bytes for "
+                    + $"{chunk.CompressedBytes} compressed, exceeding the {MaxDecompressionRatio}:1 "
+                    + "decompression-ratio ceiling (possible decompression bomb).");
+            }
+
+            // (iii) Row-count plausibility: reject BEFORE the eager per-column allocation if this row
+            // count would materialize more than the absolute ceiling. Dividing (rather than multiplying
+            // rowCount by the width) keeps the check overflow-safe for an attacker-sized row count.
+            if (chunk.ElementBytes > 0 && rowCount > MaxRowGroupDecodedBytes / chunk.ElementBytes)
+            {
+                throw DeltaStorageException.CorruptData(
+                    $"Row group {group} declares {rowCount} rows, which would eagerly materialize more "
+                    + $"than the {MaxRowGroupDecodedBytes}-byte decode ceiling for a {chunk.ElementBytes}-"
+                    + "byte column (possible decompression bomb).");
+            }
+
+            totalDecompressedBytes = SaturatingAdd(totalDecompressedBytes, chunk.UncompressedBytes);
+        }
+
+        // (ii) Absolute decompressed-size ceiling over the row group's projected chunks.
+        if (totalDecompressedBytes > MaxRowGroupDecodedBytes)
         {
             throw DeltaStorageException.CorruptData(
-                $"Row group {group} declares {rowCount} rows for a {streamLength}-byte stream, exceeding "
-                + $"the decode ceiling of {MaxRowsPerByte} rows/byte (possible decompression bomb).");
+                $"Row group {group} declares {totalDecompressedBytes} decompressed bytes across its "
+                + $"projected columns, exceeding the {MaxRowGroupDecodedBytes}-byte decode ceiling "
+                + "(possible decompression bomb).");
         }
     }
+
+    private static long SaturatingAdd(long a, long b) => b > long.MaxValue - a ? long.MaxValue : a + b;
+
+    // The declared footprint the reader will decode/materialize for each projected column, pulled from
+    // the row group's Parquet metadata (CF-1). Missing/encrypted chunk metadata contributes a zero
+    // footprint (harmless: the subsequent read surfaces any real defect via IsParquetDefect).
+    private static List<ColumnChunkFootprint> ProjectedFootprints(
+        ParquetRowGroupReader rowGroup, StructType requested, DataField[] fileFields)
+    {
+        var footprints = new List<ColumnChunkFootprint>(requested.Count);
+        for (int c = 0; c < requested.Count; c++)
+        {
+            long compressed = 0;
+            long uncompressed = 0;
+            if (rowGroup.ColumnExists(fileFields[c]))
+            {
+                global::Parquet.Meta.ColumnMetaData? meta = rowGroup.GetMetadata(fileFields[c])?.MetaData;
+                if (meta is not null)
+                {
+                    compressed = meta.TotalCompressedSize;
+                    uncompressed = meta.TotalUncompressedSize;
+                }
+            }
+
+            footprints.Add(
+                new ColumnChunkFootprint(compressed, uncompressed, ElementByteWidth(requested[c].DataType)));
+        }
+
+        return footprints;
+    }
+
+    // The per-row byte width the reader materializes a column into — used only to bound the eager
+    // allocation (CF-1 (iii)); an order-of-magnitude bound, not an exact sizeof. String/binary read into
+    // a per-row managed reference (8 bytes); their backing bytes are bounded by the decompressed ceiling.
+    private static int ElementByteWidth(DataType type) => type switch
+    {
+        BooleanType or ByteType => 1,
+        ShortType => 2,
+        IntegerType or DateType or FloatType => 4,
+        LongType or TimestampType or DoubleType => 8,
+        DecimalType { IsCompact: true } => 8,
+        DecimalType => 16,
+        StringType or BinaryType => 8,
+        _ => 8,
+    };
 
     private static async Task<ParquetReader> OpenAsync(Stream input, CancellationToken cancellationToken)
     {
@@ -234,7 +340,6 @@ internal sealed class ParquetFileReader
         StructType requested,
         DataField[] fileFields,
         RowGroupPredicate? keepRowGroup,
-        long streamLength,
         CancellationToken cancellationToken)
     {
         using ParquetRowGroupReader rowGroup = reader.OpenRowGroupReader(group);
@@ -249,11 +354,11 @@ internal sealed class ParquetFileReader
             }
         }
 
-        // H4/L3: reject an implausible or out-of-range row count BEFORE the eager allocation below, so a
-        // crafted footer surfaces as a deterministic CorruptData error rather than an OOM or a raw
-        // OverflowException escaping the codec contract.
+        // CF-1/H4/L3: reject an implausible or out-of-range row group BEFORE the eager allocation below,
+        // so a crafted footer (inflated decompressed size or row count) surfaces as a deterministic
+        // CorruptData error rather than an OOM or a raw OverflowException escaping the codec contract.
         long declaredRows = rowGroup.RowCount;
-        EnsureDecodeCeiling(declaredRows, streamLength, group);
+        EnsureDecodeCeiling(declaredRows, ProjectedFootprints(rowGroup, requested, fileFields), group);
         int rowCount;
         try
         {
@@ -405,6 +510,9 @@ internal sealed class ParquetFileReader
         DecimalType decimalType,
         CancellationToken cancellationToken)
     {
+        // L1/CF-5: the scale factor (10^scale) and over-precision ceiling (10^precision) are invariant
+        // across the whole column chunk, so compute them ONCE here instead of per value in AppendDecimal.
+        ParquetTypeMapping.DecimalScaleFactors factors = ParquetTypeMapping.DecimalScaleFactors.For(decimalType);
         if (fileField.IsNullable)
         {
             var buffer = new decimal?[rowCount];
@@ -414,7 +522,7 @@ internal sealed class ParquetFileReader
             {
                 if (buffer[i] is { } value)
                 {
-                    ParquetTypeMapping.AppendDecimal(vector, decimalType, value);
+                    ParquetTypeMapping.AppendDecimal(vector, decimalType, value, factors);
                 }
                 else
                 {
@@ -429,7 +537,7 @@ internal sealed class ParquetFileReader
                 .ConfigureAwait(false);
             for (int i = 0; i < rowCount; i++)
             {
-                ParquetTypeMapping.AppendDecimal(vector, decimalType, buffer[i]);
+                ParquetTypeMapping.AppendDecimal(vector, decimalType, buffer[i], factors);
             }
         }
     }

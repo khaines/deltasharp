@@ -22,6 +22,11 @@ internal sealed class ParquetFileWriter
 
     private const string WriterIdentity = "DeltaSharp.Storage/0.1";
 
+    // CF-8: cooperative-cancellation stride for the per-row string/binary build loops — check the token
+    // every 16384 rows so a large single-row-group write stays cancellable without a per-row token read.
+    // (Fixed-width schemas and every row-group boundary are already checked at the WriteAsync while loop.)
+    private const int CancellationCheckMask = 0x3FFF;
+
     private readonly int _rowGroupRowLimit;
 
     /// <summary>Creates a writer with the given row-group row cap.</summary>
@@ -101,6 +106,7 @@ internal sealed class ParquetFileWriter
         var segments = new List<Segment>();
         while (emitted < totalRows)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             int size = (int)Math.Min(_rowGroupRowLimit, totalRows - emitted);
             CollectSegments(batchRowCounts, ref cursorBatch, ref cursorRow, size, segments);
 
@@ -211,11 +217,13 @@ internal sealed class ParquetFileWriter
                     cancellationToken).ConfigureAwait(false);
                 break;
             case StringType:
-                await WriteStringAsync(rowGroup, field, nullable, selectedColumns, columnIndex, segments, size)
+                await WriteStringAsync(
+                    rowGroup, field, nullable, selectedColumns, columnIndex, segments, size, cancellationToken)
                     .ConfigureAwait(false);
                 break;
             case BinaryType:
-                await WriteBinaryAsync(rowGroup, field, nullable, selectedColumns, columnIndex, segments, size)
+                await WriteBinaryAsync(
+                    rowGroup, field, nullable, selectedColumns, columnIndex, segments, size, cancellationToken)
                     .ConfigureAwait(false);
                 break;
             default:
@@ -339,7 +347,8 @@ internal sealed class ParquetFileWriter
         List<ColumnVector[]> selectedColumns,
         int columnIndex,
         List<Segment> segments,
-        int size)
+        int size,
+        CancellationToken cancellationToken)
     {
         var values = new string?[size];
         int idx = 0;
@@ -348,6 +357,11 @@ internal sealed class ParquetFileWriter
             ColumnVector vector = selectedColumns[segment.Batch][columnIndex];
             for (int j = 0; j < segment.Length; j++)
             {
+                if ((idx & CancellationCheckMask) == 0)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+
                 int row = segment.Start + j;
                 if (vector.IsNull(row))
                 {
@@ -371,7 +385,8 @@ internal sealed class ParquetFileWriter
         List<ColumnVector[]> selectedColumns,
         int columnIndex,
         List<Segment> segments,
-        int size)
+        int size,
+        CancellationToken cancellationToken)
     {
         var values = new byte[]?[size];
         int idx = 0;
@@ -380,6 +395,11 @@ internal sealed class ParquetFileWriter
             ColumnVector vector = selectedColumns[segment.Batch][columnIndex];
             for (int j = 0; j < segment.Length; j++)
             {
+                if ((idx & CancellationCheckMask) == 0)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+
                 int row = segment.Start + j;
                 if (vector.IsNull(row))
                 {

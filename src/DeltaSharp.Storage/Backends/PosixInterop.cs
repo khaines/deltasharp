@@ -3,35 +3,53 @@ using System.Runtime.InteropServices;
 namespace DeltaSharp.Storage.Backends;
 
 /// <summary>
-/// Best-effort POSIX directory <c>fsync</c> so that a newly created or renamed entry's <b>name</b> is
-/// durable in its parent directory, not just the file's data (design §2.13.2 durability). Writing and
+/// POSIX directory <c>fsync</c> so that a newly created or renamed entry's <b>name</b> is durable in
+/// its parent directory, not just the file's data (design §2.13.2 durability). Writing and
 /// <c>fsync</c>ing a file only guarantees the file <i>contents</i> survive a crash; the directory
 /// entry that makes the file discoverable is a separate metadata write that must itself be
 /// <c>fsync</c>ed. On Windows this is a no-op — NTFS journals directory metadata so a completed
-/// <c>MoveFileEx</c>/create is already crash-durable.
+/// <c>MoveFileEx</c>/create is already crash-durable. The result is <b>reported</b> (not swallowed) so a
+/// commit path can treat a directory-durability failure as an ambiguous, retry-unsafe outcome.
 /// </summary>
 internal static class DirectoryFsync
 {
-    /// <summary>Durably flushes <paramref name="directoryPath"/>'s directory entry table. Best-effort:
-    /// a failure to open/fsync the directory is swallowed (the data fsync already ran and an
-    /// unreferenced object is reclaimed by VACUUM), so it never masks the primary operation.</summary>
-    public static void Sync(string directoryPath)
+    /// <summary>Fault-injection seam (tests only): when non-null, its return code <b>replaces</b> the
+    /// native directory <c>fsync</c> result so a test can force a durability failure and prove the commit
+    /// path surfaces <see cref="StorageErrorKind.RetryUnsafeAmbiguous"/> without inducing a real one. A
+    /// non-zero code simulates a failed <c>fsync</c>; zero falls through to the genuine syscall. Null and
+    /// inert in production; consulted at the exact <c>fsync</c> point.</summary>
+    internal static volatile Func<string, int>? FsyncHook;
+
+    /// <summary>Durably flushes <paramref name="directoryPath"/>'s directory entry table. Returns
+    /// <see langword="true"/> when the entry is durable (and on Windows, where NTFS journals directory
+    /// metadata so a completed create/rename is already crash-durable), and <see langword="false"/> when
+    /// the directory could not be opened or <c>fsync</c>ed — the signal the commit path maps to an
+    /// ambiguous, retry-unsafe outcome so a crash-in-window can never silently lose a name the caller was
+    /// told was committed (design §2.13.2).</summary>
+    public static bool Sync(string directoryPath)
     {
         if (OperatingSystem.IsWindows())
         {
-            return;
+            return true;
         }
 
         ArgumentException.ThrowIfNullOrEmpty(directoryPath);
+
+        Func<string, int>? hook = FsyncHook;
+        if (hook is not null && hook(directoryPath) != 0)
+        {
+            return false;
+        }
+
         int fd = PosixInterop.Open(directoryPath, PosixInterop.O_RDONLY);
         if (fd < 0)
         {
-            return;
+            return false;
         }
 
         try
         {
-            _ = PosixInterop.Fsync(fd);
+            return PosixInterop.Fsync(fd) == 0;
         }
         finally
         {

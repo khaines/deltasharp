@@ -131,4 +131,32 @@ public sealed class ParquetWriterTests
         Assert.Contains("\"name\":\"amount\"", schemaJson);
         Assert.True(reader.CustomMetadata.ContainsKey(DeltaSchemaJson.WriterMetadataKey));
     }
+
+    [Fact]
+    public async Task WriteAsync_CancelledToken_ThrowsOnMultiRowGroupStringWrite()
+    {
+        // CF-8: the writer honors cancellation at row-group granularity for ALL schemas (previously only
+        // the reader did). A cancelled multi-row-group string write surfaces OperationCanceledException
+        // rather than running to completion. ParquetWriter.CreateAsync does NOT observe the token, so the
+        // writer's own per-row-group check is the first observation point (non-vacuous: removing it lets
+        // the write complete).
+        var schema = new StructType(new[] { new StructField("s", DataTypes.StringType, nullable: false) });
+        const int rows = 5000;
+        MutableColumnVector s = ColumnVectors.Create(DataTypes.StringType, rows);
+        for (int i = 0; i < rows; i++)
+        {
+            s.AppendBytes(System.Text.Encoding.UTF8.GetBytes(
+                string.Create(System.Globalization.CultureInfo.InvariantCulture, $"row-{i}")));
+        }
+
+        var batch = new ManagedColumnBatch(schema, new ColumnVector[] { s }, rows);
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        using var stream = new MemoryStream();
+
+        // rowGroupRowLimit small so the write spans multiple row groups absent cancellation.
+        await Assert.ThrowsAsync<OperationCanceledException>(
+            async () => await new ParquetFileWriter(rowGroupRowLimit: 1024)
+                .WriteAsync(stream, schema, new[] { batch }, cts.Token));
+    }
 }

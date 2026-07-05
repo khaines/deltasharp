@@ -115,12 +115,47 @@ public sealed class ParquetCorruptionTests
         }
     }
 
+    // ---- CF-1: decode ceiling (design §5.4 C-DECODE) --------------------------------------------
+
+    private static IReadOnlyList<ParquetFileReader.ColumnChunkFootprint> Footprints(
+        params ParquetFileReader.ColumnChunkFootprint[] chunks) => chunks;
+
+    [Fact]
+    public void DecodeCeiling_RejectsImplausibleDecompressionRatio()
+    {
+        // A chunk claiming >1000x more decompressed than compressed bytes is a decompression bomb.
+        DeltaStorageException error = Assert.Throws<DeltaStorageException>(
+            () => ParquetFileReader.EnsureDecodeCeiling(
+                rowCount: 8,
+                Footprints(new ParquetFileReader.ColumnChunkFootprint(
+                    CompressedBytes: 100, UncompressedBytes: (100 * 1000) + 1, ElementBytes: 8)),
+                group: 0));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+    }
+
+    [Fact]
+    public void DecodeCeiling_RejectsAbsoluteDecompressedSize()
+    {
+        // Within the ratio ceiling, but the absolute decompressed size (5 GiB) blows the memory bound.
+        DeltaStorageException error = Assert.Throws<DeltaStorageException>(
+            () => ParquetFileReader.EnsureDecodeCeiling(
+                rowCount: 8,
+                Footprints(new ParquetFileReader.ColumnChunkFootprint(
+                    CompressedBytes: 5_000_000, UncompressedBytes: 5_000_000_000L, ElementBytes: 8)),
+                group: 0));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+    }
+
     [Fact]
     public void DecodeCeiling_RejectsImplausibleRowCount()
     {
-        // A footer claiming a billion rows for a 100-byte stream is a decompression bomb, not a file.
+        // A billion rows for a physically tiny chunk would eagerly materialize past the memory bound.
         DeltaStorageException error = Assert.Throws<DeltaStorageException>(
-            () => ParquetFileReader.EnsureDecodeCeiling(rowCount: 1_000_000_000, streamLength: 100, group: 0));
+            () => ParquetFileReader.EnsureDecodeCeiling(
+                rowCount: 1_000_000_000,
+                Footprints(new ParquetFileReader.ColumnChunkFootprint(
+                    CompressedBytes: 100, UncompressedBytes: 200, ElementBytes: 8)),
+                group: 0));
         Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
     }
 
@@ -128,16 +163,102 @@ public sealed class ParquetCorruptionTests
     public void DecodeCeiling_RejectsNegativeRowCount()
     {
         DeltaStorageException error = Assert.Throws<DeltaStorageException>(
-            () => ParquetFileReader.EnsureDecodeCeiling(rowCount: -1, streamLength: 100, group: 0));
+            () => ParquetFileReader.EnsureDecodeCeiling(
+                rowCount: -1,
+                Array.Empty<ParquetFileReader.ColumnChunkFootprint>(),
+                group: 0));
         Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
     }
 
     [Fact]
-    public void DecodeCeiling_AllowsPlausibleRowCountAndUnknownLength()
+    public void DecodeCeiling_RejectsNegativeChunkSize()
     {
-        // Well within the ceiling.
-        ParquetFileReader.EnsureDecodeCeiling(rowCount: 50, streamLength: 100, group: 0);
-        // Unknown length (non-seekable stream) disables the ratio check.
-        ParquetFileReader.EnsureDecodeCeiling(rowCount: long.MaxValue, streamLength: -1, group: 0);
+        DeltaStorageException error = Assert.Throws<DeltaStorageException>(
+            () => ParquetFileReader.EnsureDecodeCeiling(
+                rowCount: 8,
+                Footprints(new ParquetFileReader.ColumnChunkFootprint(
+                    CompressedBytes: -1, UncompressedBytes: 10, ElementBytes: 8)),
+                group: 0));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+    }
+
+    [Fact]
+    public void DecodeCeiling_AllowsLegitimatelyCompressibleRowGroup()
+    {
+        // Real measured footprints for a 131072-row constant-bool chunk plus an all-null long chunk
+        // (SNAPPY): a high logical-rows-to-byte density the old rows/byte proxy false-rejected, but sound
+        // under the ratio + absolute-size + row-plausibility controls. Must NOT throw.
+        ParquetFileReader.EnsureDecodeCeiling(
+            rowCount: 131072,
+            Footprints(
+                new ParquetFileReader.ColumnChunkFootprint(
+                    CompressedBytes: 799, UncompressedBytes: 16410, ElementBytes: 1),
+                new ParquetFileReader.ColumnChunkFootprint(
+                    CompressedBytes: 75, UncompressedBytes: 73, ElementBytes: 8)),
+            group: 0);
+    }
+
+    [Fact]
+    public async Task LegitimateCompressibleFile_RoundTripsThroughReadAsync()
+    {
+        // A constant bool column and an all-null long column filling a full default row group (131072
+        // rows): legitimately compressible data that the pre-fix rows/byte decode ceiling false-rejected.
+        // Written through the DEFAULT writer and read back through ReadAsync — every value must survive.
+        const int rows = 131072;
+        var schema = new StructType(new[]
+        {
+            new StructField("flag", DataTypes.BooleanType, nullable: false),
+            new StructField("value", DataTypes.LongType, nullable: true),
+        });
+
+        MutableColumnVector flag = ColumnVectors.Create(DataTypes.BooleanType, rows);
+        MutableColumnVector value = ColumnVectors.Create(DataTypes.LongType, rows);
+        for (int i = 0; i < rows; i++)
+        {
+            flag.AppendValue(true);
+            value.AppendNull();
+        }
+
+        var batch = new ManagedColumnBatch(schema, new ColumnVector[] { flag, value }, rows);
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+
+        List<ColumnBatch> read = await ParquetTestHelpers.ReadAllAsync(file, schema);
+        int seen = 0;
+        foreach (ColumnBatch group in read)
+        {
+            ColumnVector flags = group.SelectedColumn(0);
+            ColumnVector values = group.SelectedColumn(1);
+            for (int r = 0; r < group.LogicalRowCount; r++)
+            {
+                Assert.False(flags.IsNull(r));
+                Assert.True(flags.GetValue<bool>(r));
+                Assert.True(values.IsNull(r));
+                seen++;
+            }
+        }
+
+        Assert.Equal(rows, seen);
+    }
+
+    [Fact]
+    public async Task DecodeBomb_ViaReadAsync_IsRejected()
+    {
+        // A physically tiny file whose footer is forged to declare a 100 GB decompressed column chunk:
+        // ReadAsync must reject it as CorruptData at the decode ceiling — never attempt the allocation.
+        var schema = new StructType(new[] { new StructField("value", DataTypes.LongType, nullable: false) });
+        MutableColumnVector value = ColumnVectors.Create(DataTypes.LongType, 8);
+        for (long i = 0; i < 8; i++)
+        {
+            value.AppendValue(i);
+        }
+
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(
+            schema, new[] { new ManagedColumnBatch(schema, new ColumnVector[] { value }, 8) });
+        byte[] forged = await ParquetTestHelpers.ForgeColumnUncompressedSizeAsync(
+            file, rowGroup: 0, columnIndex: 0, inflatedUncompressedSize: 100_000_000_000L);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(forged, schema));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
     }
 }

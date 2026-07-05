@@ -1,3 +1,4 @@
+using System.Reflection;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Types;
@@ -67,5 +68,57 @@ internal static class ParquetTestHelpers
             long start = meta.DictionaryPageOffset ?? meta.DataPageOffset;
             return (start, meta.TotalCompressedSize);
         }
+    }
+
+    /// <summary>Rewrites the footer of <paramref name="bytes"/> so that
+    /// (<paramref name="rowGroup"/>, <paramref name="columnIndex"/>)'s column chunk declares an inflated
+    /// <c>TotalUncompressedSize</c> — a forged decompression-bomb file whose physical bytes are unchanged
+    /// but whose metadata claims an implausible decode target. The result reopens cleanly through
+    /// Parquet.Net, so a <see cref="ParquetFileReader"/> read must reject it via its decode ceiling rather
+    /// than attempting the (impossible) allocation. Re-serializes the parsed <c>FileMetaData</c> with
+    /// Parquet.Net's own Thrift writer (reached by reflection) and splices it back as a valid footer.</summary>
+    public static async Task<byte[]> ForgeColumnUncompressedSizeAsync(
+        byte[] bytes, int rowGroup, int columnIndex, long inflatedUncompressedSize)
+    {
+        byte[] newFooter;
+        using (var stream = new MemoryStream(bytes, writable: false))
+        {
+            ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                global::Parquet.Meta.FileMetaData metadata = reader.Metadata!;
+                metadata.RowGroups[rowGroup].Columns[columnIndex].MetaData!.TotalUncompressedSize =
+                    inflatedUncompressedSize;
+                newFooter = SerializeFooter(metadata);
+            }
+        }
+
+        // Splice: original bytes up to the old footer, then the forged footer, its little-endian length,
+        // and the trailing "PAR1" magic — the layout Parquet.Net expects at the tail of the file.
+        int originalFooterLength = BitConverter.ToInt32(bytes, bytes.Length - 8);
+        int footerStart = bytes.Length - 8 - originalFooterLength;
+        using var forged = new MemoryStream();
+        forged.Write(bytes, 0, footerStart);
+        forged.Write(newFooter, 0, newFooter.Length);
+        forged.Write(BitConverter.GetBytes(newFooter.Length), 0, 4);
+        forged.Write("PAR1"u8);
+        return forged.ToArray();
+    }
+
+    private static byte[] SerializeFooter(global::Parquet.Meta.FileMetaData metadata)
+    {
+        Assembly parquet = typeof(ParquetReader).Assembly;
+        Type writerType = parquet.GetType("Parquet.Meta.Proto.ThriftCompactProtocolWriter", throwOnError: true)!;
+        using var footerStream = new MemoryStream();
+        object protocolWriter = Activator.CreateInstance(
+            writerType,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+            binder: null,
+            args: new object[] { footerStream },
+            culture: null)!;
+        MethodInfo write = typeof(global::Parquet.Meta.FileMetaData).GetMethod(
+            "Write", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!;
+        write.Invoke(metadata, new[] { protocolWriter });
+        return footerStream.ToArray();
     }
 }

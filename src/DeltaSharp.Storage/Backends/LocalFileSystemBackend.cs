@@ -37,10 +37,25 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
     private readonly string _realRoot;
     private readonly string _realRootWithSeparator;
 
-    // Local temp-file names must be unique to avoid two concurrent staged writes colliding. A monotonic
-    // per-process counter (not a banned nondeterministic id source) plus the process id gives that
-    // uniqueness deterministically; the temp name is ephemeral and never persisted in the Delta log.
+    // Local temp-file names must be unique so two concurrent staged writes never collide. A monotonic
+    // per-process counter (not a banned nondeterministic id source) gives in-process uniqueness; the pod
+    // hostname (Environment.MachineName) gives CROSS-process/cross-pod uniqueness on a shared RWX PVC,
+    // where Environment.ProcessId is only namespace-local and can repeat across pods. A residual name
+    // collision is resolved by retrying with a fresh ordinal (never by deleting a foreign temp), so the
+    // ordinal alone is NOT relied on for cross-process uniqueness. The temp name is ephemeral and never
+    // persisted in the Delta log.
     private static long _tempCounter;
+
+    // The filename-safe pod/host token mixed into every staging temp name for cross-pod uniqueness.
+    private static readonly string TempHostToken = SanitizeHostToken(Environment.MachineName);
+
+    // Bounded retry budget when a staging temp name is already taken by a foreign in-flight temp.
+    private const int MaxTempAttempts = 64;
+
+    // Ordering-observation seam (tests only): fired with a commit-step label at each durability step so a
+    // test can prove the write -> file-fsync -> atomic-publish -> dir-fsync order. Null/inert in
+    // production; fired at the exact step boundary.
+    internal static volatile Action<string>? CommitStepProbe;
 
     /// <summary>Creates a backend confined to <paramref name="tableRoot"/>. The directory is created if
     /// it does not exist so the backend is usable immediately.</summary>
@@ -122,10 +137,8 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         string directory = Path.GetDirectoryName(full) ?? _root;
         Directory.CreateDirectory(directory);
 
-        long ordinal = Interlocked.Increment(ref _tempCounter);
-        string temp = string.Create(
-            CultureInfo.InvariantCulture, $"{full}.{Environment.ProcessId}.{ordinal}.tmp");
-        Stream stream = new StagedWriteStream(temp, full, directory);
+        FileStream inner = CreateFreshTemp(full, ".tmp", out string temp);
+        Stream stream = new StagedWriteStream(inner, temp, full, directory);
         return ValueTask.FromResult(stream);
     }
 
@@ -138,21 +151,29 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         string directory = Path.GetDirectoryName(full) ?? _root;
         Directory.CreateDirectory(directory);
 
-        long ordinal = Interlocked.Increment(ref _tempCounter);
-        string temp = string.Create(
-            CultureInfo.InvariantCulture, $"{full}.{Environment.ProcessId}.{ordinal}.put.tmp");
-
-        // Stage: write the full content to a private temp file and fsync it BEFORE publishing. A
-        // write/cancel/fsync failure can therefore only leave an orphan temp — never a partial or
-        // zero-length destination (design §2.13.2).
+        // Stage: create a PRIVATE temp with O_EXCL (CreateNew) semantics so it can never alias or clobber
+        // another writer's in-flight temp, write the full content, and fsync it BEFORE publishing. A
+        // write/cancel/fsync failure can therefore only leave an orphan temp THIS call created — never a
+        // partial or zero-length destination, and never a foreign temp deletion (design §2.13.2).
+        FileStream stagingStream;
+        string temp;
         try
         {
-            var stream = new FileStream(
-                temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, bufferSize: 4096, useAsync: true);
-            await using (stream.ConfigureAwait(false))
+            stagingStream = CreateFreshTemp(full, ".put.tmp", out temp);
+        }
+        catch (Exception ex)
+        {
+            throw DeltaStorageException.Transient(
+                $"Staging conditional-create of '{path}' failed: {ex.Message}", ex);
+        }
+
+        try
+        {
+            await using (stagingStream.ConfigureAwait(false))
             {
-                await stream.WriteAsync(content, cancellationToken).ConfigureAwait(false);
-                stream.Flush(flushToDisk: true);
+                await stagingStream.WriteAsync(content, cancellationToken).ConfigureAwait(false);
+                stagingStream.Flush(flushToDisk: true);
+                CommitStepProbe?.Invoke("file-fsync");
             }
         }
         catch (OperationCanceledException)
@@ -187,9 +208,20 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             return false;
         }
 
+        CommitStepProbe?.Invoke("publish");
+
         // The name is now published; make the directory entry durable and drop the temp alias (on POSIX
-        // link() leaves both names pointing at the same inode).
-        DirectoryFsync.Sync(directory);
+        // link() leaves both names pointing at the same inode). A directory-fsync failure means the name
+        // may not survive a crash even though link() succeeded — the outcome is ambiguous and the caller
+        // must re-resolve rather than trust a commit we cannot make durable (CF-3).
+        CommitStepProbe?.Invoke("dir-fsync");
+        if (!DirectoryFsync.Sync(directory))
+        {
+            throw DeltaStorageException.RetryUnsafeAmbiguous(
+                $"Conditional-create of '{path}' linked its destination but the directory entry could not "
+                + "be made durable; the outcome is ambiguous and must be re-resolved.");
+        }
+
         TryDelete(temp);
         return true;
     }
@@ -246,6 +278,17 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             // Skip reparse points (symlinks/junctions): a listing must not surface an entry that
             // resolves outside the confined root (design §5.5 C-SCOPE).
             if (info.Attributes.HasFlag(FileAttributes.ReparsePoint))
+            {
+                continue;
+            }
+
+            // The leaf reparse check is not enough: a file under a symlinked ANCESTOR directory has a
+            // non-reparse leaf, yet Directory.GetFiles(..., AllDirectories) follows directory symlinks
+            // and would surface it — leaking out-of-root path/Length/mtime/ETag (cross-tenant metadata
+            // disclosure). Re-resolve the real path and skip fail-closed anything whose real target
+            // escapes the confined root (design §5.5 "no cross-tenant listing").
+            string realFile = CanonicalizeExisting(file);
+            if (!realFile.StartsWith(_realRootWithSeparator, StringComparison.Ordinal))
             {
                 continue;
             }
@@ -338,6 +381,72 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         {
             // Likewise best-effort.
         }
+    }
+
+    // Builds a staging temp name mixing the pod/host token (cross-pod uniqueness), the process id
+    // (in-namespace uniqueness) and a monotonic ordinal (in-process uniqueness). Deterministic given its
+    // inputs — no Guid/Random.
+    internal static string BuildTempName(string destinationFull, long ordinal, string suffix) =>
+        string.Create(
+            CultureInfo.InvariantCulture,
+            $"{destinationFull}.{TempHostToken}.{Environment.ProcessId}.{ordinal}{suffix}");
+
+    // Reduces a hostname to a bounded, filename-safe token: non-[A-Za-z0-9-] characters become '-' and
+    // the result is capped. Deterministic and environment-sourced (Environment.MachineName is the K8s
+    // pod hostname), so it never introduces a banned nondeterministic id.
+    private static string SanitizeHostToken(string host)
+    {
+        if (string.IsNullOrEmpty(host))
+        {
+            return "host";
+        }
+
+        const int maxLength = 64;
+        int length = Math.Min(host.Length, maxLength);
+        return string.Create(length, host, static (span, source) =>
+        {
+            for (int i = 0; i < span.Length; i++)
+            {
+                char c = source[i];
+                bool safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                    || (c >= '0' && c <= '9') || c == '-';
+                span[i] = safe ? c : '-';
+            }
+        });
+    }
+
+    // Opens a private staging temp with O_EXCL (FileMode.CreateNew) semantics, drawing a fresh monotonic
+    // ordinal each attempt. Used by every write path so a temp can NEVER clobber or alias a foreign
+    // in-flight temp (critical on a shared RWX PVC where two pods share a PID namespace).
+    private static FileStream CreateFreshTemp(string destinationFull, string suffix, out string tempPath) =>
+        CreateFreshTempFrom(
+            destinationFull, suffix, static () => Interlocked.Increment(ref _tempCounter), out tempPath);
+
+    // Core of CreateFreshTemp with an injectable ordinal source (for deterministic collision tests): on a
+    // CreateNew collision with a foreign temp of the same name, retries with the NEXT ordinal — it never
+    // deletes the colliding file, because that file belongs to another in-flight writer.
+    internal static FileStream CreateFreshTempFrom(
+        string destinationFull, string suffix, Func<long> nextOrdinal, out string tempPath)
+    {
+        for (int attempt = 0; attempt < MaxTempAttempts; attempt++)
+        {
+            string candidate = BuildTempName(destinationFull, nextOrdinal(), suffix);
+            try
+            {
+                var stream = new FileStream(
+                    candidate, FileMode.CreateNew, FileAccess.Write, FileShare.None, bufferSize: 4096, useAsync: true);
+                tempPath = candidate;
+                return stream;
+            }
+            catch (IOException) when (attempt < MaxTempAttempts - 1 && File.Exists(candidate))
+            {
+                // A foreign temp already owns this name: retry with a fresh ordinal, never deleting it.
+            }
+        }
+
+        throw new IOException(string.Create(
+            CultureInfo.InvariantCulture,
+            $"Could not create a unique staging temp for '{destinationFull}' after {MaxTempAttempts} attempts."));
     }
 
     // Canonicalizes an incoming path and confines it to the table root, rejecting fail-closed anything
@@ -460,13 +569,12 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         private bool _completed;
         private bool _disposed;
 
-        public StagedWriteStream(string tempPath, string destinationPath, string destinationDirectory)
+        public StagedWriteStream(FileStream inner, string tempPath, string destinationPath, string destinationDirectory)
         {
             _tempPath = tempPath;
             _destinationPath = destinationPath;
             _destinationDirectory = destinationDirectory;
-            _inner = new FileStream(
-                tempPath, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 4096, useAsync: true);
+            _inner = inner;
         }
 
         public override bool CanRead => false;
@@ -521,6 +629,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             // so a producer that faults before completing never lands a readable destination.
             await _inner.FlushAsync(cancellationToken).ConfigureAwait(false);
             _inner.Flush(flushToDisk: true);
+            CommitStepProbe?.Invoke("file-fsync");
             await _inner.DisposeAsync().ConfigureAwait(false);
             Publish();
             _completed = true;
@@ -581,9 +690,20 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
                     $"Cannot publish staged write: destination '{_destinationPath}' already exists.");
             }
 
+            CommitStepProbe?.Invoke("publish");
+
             // The single-winner rename/link landed; make its directory entry durable, then drop the
-            // temp alias (on POSIX link() left both names pointing at the same inode).
-            DirectoryFsync.Sync(_destinationDirectory);
+            // temp alias (on POSIX link() left both names pointing at the same inode). A directory-fsync
+            // failure means the name may not survive a crash even though the publish succeeded — the
+            // outcome is ambiguous and the caller must re-resolve rather than trust it (CF-3).
+            CommitStepProbe?.Invoke("dir-fsync");
+            if (!DirectoryFsync.Sync(_destinationDirectory))
+            {
+                throw DeltaStorageException.RetryUnsafeAmbiguous(
+                    $"Staged write to '{_destinationPath}' published but the directory entry could not be "
+                    + "made durable; the outcome is ambiguous and must be re-resolved.");
+            }
+
             CleanupTemp();
         }
 
