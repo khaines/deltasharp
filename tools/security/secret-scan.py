@@ -318,9 +318,11 @@ def _selftest(allowlist_path: Path) -> int:
     # omitted 'rules' (or set ['*']) would re-open the blanket-mask hole and silently suppress
     # a NEW real secret in an allowlisted file. load_allowlist now FAILS CLOSED on such
     # entries (same rigor as the SCA suppression validator, which rejects incomplete waivers).
-    # Non-vacuity: neutering the wildcard guard in _validate_rules reddens the ['*'] case in
-    # isolation (verified in a scratch clone); the missing/empty cases are pinned by 'rules'
-    # being in _REQUIRED_ALLOW_FIELDS.
+    # Non-vacuity: neutering the wildcard guard in _validate_rules reddens the ['*'] and
+    # '*'-among-rules cases; neutering the non-list type branch reddens the bare-string case;
+    # neutering the per-element branch reddens the blank-rule-id case; and 'rules' being in
+    # _REQUIRED_ALLOW_FIELDS pins the missing/empty cases — each guard is pinned in isolation
+    # (all verified in a scratch clone).
     import tempfile
 
     def loads_ok(entry: dict) -> bool:
@@ -345,6 +347,13 @@ def _selftest(allowlist_path: Path) -> int:
           not loads_ok(dict(base_entry, rules=["*"])))
     check("allowlist entry with '*' among rules is rejected (no blanket mask)",
           not loads_ok(dict(base_entry, rules=["aws-access-key-id", "*"])))
+    # Pin _validate_rules' remaining sub-guards uniquely: a bare-string (non-list) 'rules' and a
+    # blank/non-string rule id are TRUTHY, so they pass the _REQUIRED_ALLOW_FIELDS check and can
+    # only be rejected by _validate_rules' type / per-element branches (verified in isolation).
+    check("allowlist entry with a non-list 'rules' (bare string) is rejected",
+          not loads_ok(dict(base_entry, rules="aws-access-key-id")))
+    check("allowlist entry with a blank/non-string rule id is rejected",
+          not loads_ok(dict(base_entry, rules=["aws-access-key-id", ""])))
 
     print()
     if failures:
