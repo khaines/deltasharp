@@ -159,4 +159,30 @@ public sealed class ParquetWriterTests
             async () => await new ParquetFileWriter(rowGroupRowLimit: 1024)
                 .WriteAsync(stream, schema, new[] { batch }, cts.Token));
     }
+
+    [Fact]
+    public async Task WriteAsync_CancelledToken_ThrowsOnMultiRowGroupNumericWrite()
+    {
+        // RF-6: a NUMERIC column has no per-row cancellation check (unlike string/binary), so the writer's
+        // row-group-loop check is the ONLY observation point for a numeric schema. A cancelled
+        // multi-row-group long write must still surface OperationCanceledException. Non-vacuous: deleting
+        // the loop-level ThrowIfCancellationRequested lets this numeric write run to completion (the string
+        // CF-8 test would not catch that regression because its per-row check masks it).
+        var schema = new StructType(new[] { new StructField("n", DataTypes.LongType, nullable: false) });
+        const int rows = 5000;
+        MutableColumnVector n = ColumnVectors.Create(DataTypes.LongType, rows);
+        for (int i = 0; i < rows; i++)
+        {
+            n.AppendValue((long)i);
+        }
+
+        var batch = new ManagedColumnBatch(schema, new ColumnVector[] { n }, rows);
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        using var stream = new MemoryStream();
+
+        await Assert.ThrowsAsync<OperationCanceledException>(
+            async () => await new ParquetFileWriter(rowGroupRowLimit: 1024)
+                .WriteAsync(stream, schema, new[] { batch }, cts.Token));
+    }
 }

@@ -57,6 +57,18 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
     // production; fired at the exact step boundary.
     internal static volatile Action<string>? CommitStepProbe;
 
+    // RF-5 file-data durability seam (tests only): substitutes the staged bytes' flush-to-disk so a test
+    // can observe that the staging file is fsync'd BEFORE the atomic publish. Null in production, where
+    // FlushToDisk performs the real fsync; a test sets it to record the flushed stream. Because the flush
+    // and its observation are the SAME call, dropping the flush also drops the observation (the flush
+    // test reddens) -- the durability step is no longer independent of its ordering label.
+    internal static volatile Action<FileStream>? FlushToDiskProbe;
+
+    // RF-1 perf-observation seam (tests only): invoked with a directory path the FIRST time that
+    // directory prefix is canonicalized during a ListAsync scan, so a test can prove the shared ancestor
+    // chain is resolved once per directory, not once per listed entry. Null/inert in production.
+    internal static volatile Action<string>? ListDirectoryResolveProbe;
+
     /// <summary>Creates a backend confined to <paramref name="tableRoot"/>. The directory is created if
     /// it does not exist so the backend is usable immediately.</summary>
     /// <exception cref="ArgumentException"><paramref name="tableRoot"/> is null or empty.</exception>
@@ -138,7 +150,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         Directory.CreateDirectory(directory);
 
         FileStream inner = CreateFreshTemp(full, ".tmp", out string temp);
-        Stream stream = new StagedWriteStream(inner, temp, full, directory);
+        Stream stream = new StagedWriteStream(inner, temp, full, directory, path);
         return ValueTask.FromResult(stream);
     }
 
@@ -172,8 +184,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             await using (stagingStream.ConfigureAwait(false))
             {
                 await stagingStream.WriteAsync(content, cancellationToken).ConfigureAwait(false);
-                stagingStream.Flush(flushToDisk: true);
-                CommitStepProbe?.Invoke("file-fsync");
+                FlushToDisk(stagingStream);
             }
         }
         catch (OperationCanceledException)
@@ -215,14 +226,20 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         // may not survive a crash even though link() succeeded — the outcome is ambiguous and the caller
         // must re-resolve rather than trust a commit we cannot make durable (CF-3).
         CommitStepProbe?.Invoke("dir-fsync");
-        if (!DirectoryFsync.Sync(directory))
+
+        // The destination is published (link succeeded), so drop the temp alias whether or not the
+        // directory entry can be made durable -- otherwise the ambiguous-durability throw below would
+        // orphan it (RF-2). Deleting the temp alias is safe: it leaves the published destination inode
+        // intact (on POSIX link() left both names pointing at the same inode).
+        bool durable = DirectoryFsync.Sync(directory);
+        TryDelete(temp);
+        if (!durable)
         {
             throw DeltaStorageException.RetryUnsafeAmbiguous(
                 $"Conditional-create of '{path}' linked its destination but the directory entry could not "
                 + "be made durable; the outcome is ambiguous and must be re-resolved.");
         }
 
-        TryDelete(temp);
         return true;
     }
 
@@ -266,6 +283,11 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             cancellationToken).ConfigureAwait(false);
 
         Array.Sort(files, StringComparer.Ordinal);
+
+        // RF-1: the ancestor chain is shared by every file in a directory, so each directory prefix's
+        // real (symlink-resolved) path is canonicalized ONCE and memoized -- never re-walked leaf->root
+        // per entry, which was an O(depth) syscall storm on a networked PVC (measured ~67 syscalls/entry).
+        var resolvedDirectories = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (string file in files)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -274,27 +296,39 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
                 continue;
             }
 
-            var info = new FileInfo(file);
-            // Skip reparse points (symlinks/junctions): a listing must not surface an entry that
-            // resolves outside the confined root (design §5.5 C-SCOPE).
-            if (info.Attributes.HasFlag(FileAttributes.ReparsePoint))
+            // Skip reparse-point LEAVES (symlinks/junctions): a listing surfaces real objects, not link
+            // entries (design §5.5 C-SCOPE). FileInfo.Attributes reflects the link itself (lstat -- it
+            // does not follow the target), so a symlinked leaf is detected without reading a target's
+            // metadata.
+            if (new FileInfo(file).Attributes.HasFlag(FileAttributes.ReparsePoint))
             {
                 continue;
             }
 
-            // The leaf reparse check is not enough: a file under a symlinked ANCESTOR directory has a
-            // non-reparse leaf, yet Directory.GetFiles(..., AllDirectories) follows directory symlinks
-            // and would surface it — leaking out-of-root path/Length/mtime/ETag (cross-tenant metadata
-            // disclosure). Re-resolve the real path and skip fail-closed anything whose real target
-            // escapes the confined root (design §5.5 "no cross-tenant listing").
-            string realFile = CanonicalizeExisting(file);
+            // RF-1: confine FIRST, then read metadata from the confinement-confirmed real path. Resolving
+            // the real path BEFORE reading Length/mtime closes a metadata TOCTOU -- otherwise a directory
+            // symlink swapped in between a metadata read and the confinement check could leak an
+            // out-of-root Length/mtime/ETag (cross-tenant metadata disclosure). A file under a symlinked
+            // ANCESTOR directory has a non-reparse leaf, yet Directory.GetFiles(..., AllDirectories)
+            // follows directory symlinks and would surface it, so the ancestor chain (not just the leaf)
+            // is resolved and confined (design §5.5 "no cross-tenant listing").
+            string directory = Path.GetDirectoryName(file) ?? _root;
+            if (!resolvedDirectories.TryGetValue(directory, out string? realDirectory))
+            {
+                ListDirectoryResolveProbe?.Invoke(directory);
+                realDirectory = CanonicalizeExisting(directory);
+                resolvedDirectories[directory] = realDirectory;
+            }
+
+            string realFile = Path.Combine(realDirectory, Path.GetFileName(file));
             if (!realFile.StartsWith(_realRootWithSeparator, StringComparison.Ordinal))
             {
                 continue;
             }
 
+            var info = new FileInfo(realFile);
             yield return new StorageObjectInfo(
-                ToRelative(file), info.Length, info.LastWriteTimeUtc, MakeETag(info));
+                ToRelativeReal(realFile), info.Length, info.LastWriteTimeUtc, MakeETag(info));
         }
     }
 
@@ -381,6 +415,26 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         {
             // Likewise best-effort.
         }
+    }
+
+    // RF-5: the single file-data durability flush for the staged bytes, routed through one helper so the
+    // flush and its observation are the SAME action. In production FlushToDiskProbe is null and this
+    // performs the real fsync; a test substitutes the probe to record the flushed stream. The "file-fsync"
+    // ordering step is emitted HERE (not at the call site) so removing the flush also removes its
+    // observation -- both the durability-order test and the flush test redden if the flush is dropped.
+    private static void FlushToDisk(FileStream stream)
+    {
+        Action<FileStream>? probe = FlushToDiskProbe;
+        if (probe is not null)
+        {
+            probe(stream);
+        }
+        else
+        {
+            stream.Flush(flushToDisk: true);
+        }
+
+        CommitStepProbe?.Invoke("file-fsync");
     }
 
     // Builds a staging temp name mixing the pod/host token (cross-pod uniqueness), the process id
@@ -545,6 +599,13 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
     private string ToRelative(string full) =>
         Path.GetRelativePath(_root, full).Replace(Path.DirectorySeparatorChar, '/');
 
+    // Relativizes a REAL (symlink-resolved) path against the real root, so a listed object key is correct
+    // even when an ambient ancestor symlink makes the lexical root differ from the real root (RF-1: the
+    // ListAsync metadata + key are read from the confinement-confirmed real path, which lives under
+    // _realRoot, not the lexical _root).
+    private string ToRelativeReal(string realFull) =>
+        Path.GetRelativePath(_realRoot, realFull).Replace(Path.DirectorySeparatorChar, '/');
+
     // A cheap, non-cryptographic entity tag over the size + mtime — enough for idempotent-retry probes;
     // POSIX has no native ETag (design §2.13.2).
     private static string MakeETag(FileInfo info) =>
@@ -566,14 +627,20 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         private readonly string _tempPath;
         private readonly string _destinationPath;
         private readonly string _destinationDirectory;
+        private readonly string _displayPath;
         private bool _completed;
         private bool _disposed;
 
-        public StagedWriteStream(FileStream inner, string tempPath, string destinationPath, string destinationDirectory)
+        public StagedWriteStream(
+            FileStream inner, string tempPath, string destinationPath, string destinationDirectory, string displayPath)
         {
             _tempPath = tempPath;
             _destinationPath = destinationPath;
             _destinationDirectory = destinationDirectory;
+
+            // RF-7: the caller-supplied RELATIVE path is used in ambiguous-failure messages (mirroring
+            // PutIfAbsent) so a surfaced error never leaks the internal absolute mount/warehouse layout.
+            _displayPath = displayPath;
             _inner = inner;
         }
 
@@ -626,10 +693,10 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             cancellationToken.ThrowIfCancellationRequested();
 
             // Durably flush the staged bytes, then publish atomically. Publication happens ONLY here,
-            // so a producer that faults before completing never lands a readable destination.
+            // so a producer that faults before completing never lands a readable destination. The flush
+            // is routed through FlushToDisk (RF-5) so the durability step is observable.
             await _inner.FlushAsync(cancellationToken).ConfigureAwait(false);
-            _inner.Flush(flushToDisk: true);
-            CommitStepProbe?.Invoke("file-fsync");
+            FlushToDisk(_inner);
             await _inner.DisposeAsync().ConfigureAwait(false);
             Publish();
             _completed = true;
@@ -680,14 +747,18 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             }
             catch (Exception ex) when (ex is not DeltaStorageException)
             {
+                // RF-2: the atomic publish failed, so the temp is unpublished -- drop it before surfacing
+                // the ambiguous outcome so it is not orphaned.
+                CleanupTemp();
                 throw DeltaStorageException.RetryUnsafeAmbiguous(
-                    $"Publishing staged write to '{_destinationPath}' failed ambiguously: {ex.Message}", ex);
+                    $"Publishing staged write to '{_displayPath}' failed ambiguously: {ex.Message}", ex);
             }
 
             if (!won)
             {
+                CleanupTemp();
                 throw DeltaStorageException.AlreadyExists(
-                    $"Cannot publish staged write: destination '{_destinationPath}' already exists.");
+                    $"Cannot publish staged write: destination '{_displayPath}' already exists.");
             }
 
             CommitStepProbe?.Invoke("publish");
@@ -695,16 +766,18 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             // The single-winner rename/link landed; make its directory entry durable, then drop the
             // temp alias (on POSIX link() left both names pointing at the same inode). A directory-fsync
             // failure means the name may not survive a crash even though the publish succeeded — the
-            // outcome is ambiguous and the caller must re-resolve rather than trust it (CF-3).
+            // outcome is ambiguous and the caller must re-resolve rather than trust it (CF-3). The temp
+            // alias is dropped whether or not the entry is durable, so the ambiguous-durability throw
+            // never orphans it (RF-2): the published destination inode stays intact.
             CommitStepProbe?.Invoke("dir-fsync");
-            if (!DirectoryFsync.Sync(_destinationDirectory))
+            bool durable = DirectoryFsync.Sync(_destinationDirectory);
+            CleanupTemp();
+            if (!durable)
             {
                 throw DeltaStorageException.RetryUnsafeAmbiguous(
-                    $"Staged write to '{_destinationPath}' published but the directory entry could not be "
+                    $"Staged write to '{_displayPath}' published but the directory entry could not be "
                     + "made durable; the outcome is ambiguous and must be re-resolved.");
             }
-
-            CleanupTemp();
         }
 
         private void CleanupTemp() => TryDelete(_tempPath);

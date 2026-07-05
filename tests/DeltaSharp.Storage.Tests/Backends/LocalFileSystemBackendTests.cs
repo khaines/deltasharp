@@ -443,6 +443,182 @@ public sealed class LocalFileSystemBackendTests : IDisposable
     }
 
     [Fact]
+    public async Task PutIfAbsent_FlushesStagingFileToDiskBeforePublish()
+    {
+        // RF-5: the file-data durability flush is routed through FlushToDisk, whose observation IS the
+        // flush. This test proves the staging bytes are flushed-to-disk strictly BEFORE the atomic
+        // publish. Non-vacuous: deleting the FlushToDisk call removes both the real fsync and this
+        // observation, so "file-flush" is never recorded and the ordering assertion reddens.
+        var events = new List<string>();
+        FileStream? flushedStream = null;
+        LocalFileSystemBackend.FlushToDiskProbe = stream =>
+        {
+            lock (events)
+            {
+                events.Add("file-flush");
+            }
+
+            flushedStream = stream;
+            stream.Flush(flushToDisk: true); // preserve production-faithful durability during the test
+        };
+        LocalFileSystemBackend.CommitStepProbe = step =>
+        {
+            lock (events)
+            {
+                events.Add(step);
+            }
+        };
+        try
+        {
+            Assert.True(await _backend.PutIfAbsentAsync("flush.bin", new byte[] { 1, 2, 3 }, CancellationToken.None));
+        }
+        finally
+        {
+            LocalFileSystemBackend.FlushToDiskProbe = null;
+            LocalFileSystemBackend.CommitStepProbe = null;
+        }
+
+        Assert.NotNull(flushedStream);
+        int flushIndex = events.IndexOf("file-flush");
+        int publishIndex = events.IndexOf("publish");
+        Assert.True(flushIndex >= 0, "the staging file must be flushed-to-disk (FlushToDisk was not invoked)");
+        Assert.True(publishIndex > flushIndex, "the staging file must be flushed-to-disk BEFORE the atomic publish");
+    }
+
+    [Fact]
+    public async Task DirectoryFsyncFailure_OnStagedWrite_SurfacesRetryUnsafeAmbiguousAndLeavesNoOrphanTemp()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            // Windows journals directory metadata; DirectoryFsync is a no-op and the hook is not consulted.
+            return;
+        }
+
+        // RF-2/F2b: force the staged-write commit path's directory fsync to fail. The publish (link)
+        // already landed, so the outcome is RetryUnsafeAmbiguous — but the now-redundant temp alias must
+        // still be cleaned up on the throw path (no orphan .tmp), and the destination stays published.
+        const string key = "staged/part-00000.parquet";
+        byte[] payload = System.Text.Encoding.UTF8.GetBytes("staged-durable");
+
+        DirectoryFsync.FsyncHook = static _ => 1;
+        try
+        {
+            Stream write = await _backend.OpenWriteAsync(key, CancellationToken.None);
+            await using (write.ConfigureAwait(false))
+            {
+                await write.WriteAsync(payload, CancellationToken.None);
+                DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+                    async () => await ((ICompletableWriteStream)write).CompleteAsync(CancellationToken.None));
+                Assert.Equal(StorageErrorKind.RetryUnsafeAmbiguous, error.Kind);
+            }
+        }
+        finally
+        {
+            DirectoryFsync.FsyncHook = null;
+        }
+
+        // The destination was published (link succeeded) even though its durability is unconfirmed.
+        await using Stream stored = await _backend.OpenReadAsync(key, CancellationToken.None);
+        using var buffer = new MemoryStream();
+        await stored.CopyToAsync(buffer);
+        Assert.Equal(payload, buffer.ToArray());
+
+        // No orphan temp alias remains under the root.
+        string[] leftovers = Directory.Exists(_root)
+            ? Directory.GetFiles(_root, "*", SearchOption.AllDirectories)
+            : Array.Empty<string>();
+        Assert.DoesNotContain(leftovers, f => f.Contains(".tmp", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task DirectoryFsyncFailure_OnPutIfAbsent_LeavesNoOrphanTemp()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        // RF-2/F2b: the PutIfAbsent dir-fsync-failure throw path must also drop its published temp alias.
+        DirectoryFsync.FsyncHook = static _ => 1;
+        try
+        {
+            DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+                async () => await _backend.PutIfAbsentAsync("commit.bin", new byte[] { 1 }, CancellationToken.None));
+            Assert.Equal(StorageErrorKind.RetryUnsafeAmbiguous, error.Kind);
+        }
+        finally
+        {
+            DirectoryFsync.FsyncHook = null;
+        }
+
+        string[] leftovers = Directory.Exists(_root)
+            ? Directory.GetFiles(_root, "*", SearchOption.AllDirectories)
+            : Array.Empty<string>();
+        Assert.DoesNotContain(leftovers, f => f.Contains(".tmp", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task List_ReturnsMetadataFromConfinedRealFile()
+    {
+        // RF-1: a surfaced entry's metadata (Length/mtime/ETag) is read from the confinement-confirmed
+        // real path, AFTER confinement — never from a pre-resolution path. Here the happy-path Length and
+        // mtime must exactly match the on-disk object.
+        byte[] payload = System.Text.Encoding.UTF8.GetBytes("metadata-source");
+        await _backend.PutIfAbsentAsync("meta/obj.bin", payload, CancellationToken.None);
+
+        StorageObjectInfo? listed = null;
+        await foreach (StorageObjectInfo info in _backend.ListAsync("meta/", CancellationToken.None))
+        {
+            listed = info;
+        }
+
+        Assert.NotNull(listed);
+        Assert.Equal("meta/obj.bin", listed.Path);
+
+        string realPath = new FileInfo(Path.Combine(_root, "meta", "obj.bin")).FullName;
+        var actual = new FileInfo(realPath);
+        Assert.Equal(actual.Length, listed.Length);
+        Assert.Equal(payload.Length, listed.Length);
+        Assert.Equal(actual.LastWriteTimeUtc, listed.LastModifiedUtc);
+    }
+
+    [Fact]
+    public async Task List_ResolvesEachDirectoryPrefixOncePerDirectoryNotPerEntry()
+    {
+        // RF-1 perf: every file in a directory shares its ancestor chain, so the confinement
+        // canonicalization must run ONCE per directory, not once per entry (a per-entry re-walk was an
+        // O(depth) syscall storm on a networked PVC). Non-vacuous: reverting to a per-file re-resolution
+        // fires the probe once per file, so the single-directory assertion reddens.
+        await _backend.PutIfAbsentAsync("bulk/1.bin", new byte[] { 1 }, CancellationToken.None);
+        await _backend.PutIfAbsentAsync("bulk/2.bin", new byte[] { 2 }, CancellationToken.None);
+        await _backend.PutIfAbsentAsync("bulk/3.bin", new byte[] { 3 }, CancellationToken.None);
+
+        var resolvedDirectories = new List<string>();
+        LocalFileSystemBackend.ListDirectoryResolveProbe = dir =>
+        {
+            lock (resolvedDirectories)
+            {
+                resolvedDirectories.Add(dir);
+            }
+        };
+        int listed = 0;
+        try
+        {
+            await foreach (StorageObjectInfo _ in _backend.ListAsync("bulk/", CancellationToken.None))
+            {
+                listed++;
+            }
+        }
+        finally
+        {
+            LocalFileSystemBackend.ListDirectoryResolveProbe = null;
+        }
+
+        Assert.Equal(3, listed); // all three files are surfaced
+        Assert.Single(resolvedDirectories); // the shared directory prefix is canonicalized exactly once
+    }
+
+    [Fact]
     public void CreateFreshTemp_RetriesOnCollision_WithoutDeletingForeignTemp()
     {
         // CF-4: a foreign in-flight temp already owns the name the first ordinal would pick. The staging

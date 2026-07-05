@@ -39,6 +39,16 @@ internal interface IStorageBackend
     /// not already exist — the single-winner commit primitive (design §2.11.1/§2.13.1). Returns
     /// <see langword="true"/> iff <b>this</b> caller created the object; a caller that lost the race
     /// gets <see langword="false"/>, never an exception.</summary>
+    /// <remarks>
+    /// <para><b>Ambiguous-outcome contract (F2a).</b> A <see cref="StorageErrorKind.RetryUnsafeAmbiguous"/>
+    /// raised by this conditional-create means the destination <b>may</b> have been created but its
+    /// durability could not be confirmed (for example the object was linked but its directory entry could
+    /// not be made durable). The caller <b>must not</b> treat it as a definite failure, and <b>must not</b>
+    /// blindly re-apply its intended actions to the next version — either can double-commit. It must
+    /// instead re-resolve <b>idempotently</b>: read back whether <b>its own</b> commit landed (by
+    /// transaction id or content identity) and continue from that observed state, retrying the same slot
+    /// only when it can prove the slot is still unclaimed by anyone.</para>
+    /// </remarks>
     /// <exception cref="DeltaStorageException">The path escapes the root, or the outcome is ambiguous
     /// (<see cref="StorageErrorKind.RetryUnsafeAmbiguous"/>).</exception>
     ValueTask<bool> PutIfAbsentAsync(string path, ReadOnlyMemory<byte> content, CancellationToken cancellationToken);

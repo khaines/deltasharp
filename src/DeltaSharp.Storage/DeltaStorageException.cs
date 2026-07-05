@@ -32,7 +32,10 @@ internal enum StorageErrorKind
     PathNotConfined,
 
     /// <summary>A storage operation failed in a way that cannot be safely retried because its outcome is
-    /// ambiguous (design §2.11.3 "ambiguous commit PUT"). The caller must re-resolve, not blindly retry.</summary>
+    /// ambiguous (design §2.11.3 "ambiguous commit PUT"): the effect <b>may</b> have taken place but could
+    /// not be confirmed durable. The caller must re-resolve <b>idempotently</b> — read back whether its own
+    /// effect landed (by transaction id or content) — and must never blindly retry the same slot or advance
+    /// as if it definitely failed, since either can double-commit.</summary>
     RetryUnsafeAmbiguous,
 
     /// <summary>A transient, retryable condition (throttling, a temporary I/O error). Design §2.13.3
@@ -77,7 +80,8 @@ internal sealed class DeltaStorageException : Exception
         new(StorageErrorKind.Transient, message, innerException);
 
     /// <summary>Creates a <see cref="StorageErrorKind.RetryUnsafeAmbiguous"/> error: an operation whose
-    /// outcome cannot be determined, so the caller must re-resolve rather than blindly retry.</summary>
+    /// outcome cannot be determined (the effect may have landed but is not confirmed durable), so the
+    /// caller must re-resolve idempotently rather than blindly retry or assume failure.</summary>
     public static DeltaStorageException RetryUnsafeAmbiguous(string message, Exception? innerException = null) =>
         new(StorageErrorKind.RetryUnsafeAmbiguous, message, innerException);
 

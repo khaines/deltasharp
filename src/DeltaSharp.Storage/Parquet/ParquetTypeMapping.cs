@@ -212,7 +212,7 @@ internal static class ParquetTypeMapping
     /// letting a raw <see cref="OverflowException"/> escape the codec contract (mirrors
     /// <c>LocalRelationBatches.AppendDecimal</c>).</summary>
     internal static void AppendDecimal(
-        MutableColumnVector vector, DecimalType type, decimal value, DecimalScaleFactors factors)
+        MutableColumnVector vector, DecimalType type, decimal value, in DecimalScaleFactors factors)
     {
         decimal scaled;
         try

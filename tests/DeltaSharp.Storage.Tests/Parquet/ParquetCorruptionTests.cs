@@ -199,6 +199,54 @@ public sealed class ParquetCorruptionTests
     }
 
     [Fact]
+    public void DecodeCeiling_RowCountBound_AccountsForNullableElementWidth()
+    {
+        // RF-4a: a nullable long column reads into new long?[] (16B/element), not long[] (8B). A row count
+        // that fits under the 4 GiB eager-decode cap at the unwrapped 8B width but EXCEEDS it at the true
+        // 16B nullable width must be rejected — otherwise the real transient is ~2x the cap. Non-vacuous:
+        // reverting AllocatedElementByteWidth to the unwrapped size collapses nullableWidth to plainWidth
+        // and the first assertion (and the rejection) reddens.
+        int nullableWidth = ParquetFileReader.AllocatedElementByteWidth(DataTypes.LongType, nullable: true);
+        int plainWidth = ParquetFileReader.AllocatedElementByteWidth(DataTypes.LongType, nullable: false);
+        Assert.True(nullableWidth > plainWidth, "long? must allocate wider than long");
+
+        // A row count in the gap: over the nullable-width bound, still under the unwrapped-width bound.
+        long rowCount = (ParquetFileReader.MaxRowGroupDecodedBytes / nullableWidth) + 1;
+        Assert.True(rowCount <= ParquetFileReader.MaxRowGroupDecodedBytes / plainWidth);
+
+        // The bound with the TRUE nullable width rejects it.
+        DeltaStorageException error = Assert.Throws<DeltaStorageException>(
+            () => ParquetFileReader.EnsureDecodeCeiling(
+                rowCount,
+                Footprints(new ParquetFileReader.ColumnChunkFootprint(
+                    CompressedBytes: 100, UncompressedBytes: 200, ElementBytes: nullableWidth)),
+                group: 0));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+
+        // Positive control: at the UNWRAPPED width the SAME row count is NOT rejected — proving the
+        // nullable accounting is precisely what catches it (the test is not vacuous by rejecting all).
+        ParquetFileReader.EnsureDecodeCeiling(
+            rowCount,
+            Footprints(new ParquetFileReader.ColumnChunkFootprint(
+                CompressedBytes: 100, UncompressedBytes: 200, ElementBytes: plainWidth)),
+            group: 0);
+    }
+
+    [Fact]
+    public void IsParquetDefect_MapsEagerAllocationFailuresToCorruptData()
+    {
+        // RF-4b/ADR-0013: an OutOfMemoryException or OverflowException from the eager decode allocation is
+        // classified as a decode defect (→ CorruptData), never escaping raw. Non-vacuous: removing either
+        // type from IsParquetDefect flips its assertion to false.
+        Assert.True(ParquetFileReader.IsParquetDefect(new OutOfMemoryException()));
+        Assert.True(ParquetFileReader.IsParquetDefect(new OverflowException()));
+
+        // A genuine logic bug in our own decode path still surfaces as itself (not masked as corruption).
+        Assert.False(ParquetFileReader.IsParquetDefect(new InvalidOperationException()));
+        Assert.False(ParquetFileReader.IsParquetDefect(new ArgumentException()));
+    }
+
+    [Fact]
     public async Task LegitimateCompressibleFile_RoundTripsThroughReadAsync()
     {
         // A constant bool column and an all-null long column filling a full default row group (131072

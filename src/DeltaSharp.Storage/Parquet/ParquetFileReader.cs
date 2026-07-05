@@ -31,14 +31,18 @@ namespace DeltaSharp.Storage.Parquet;
 /// The reader deliberately keeps streaming (it does not buffer every row group to make the whole file
 /// atomic): the honest, design-consistent guarantee is that a batch is never torn, not that the whole
 /// file is validated before the first batch.</para>
-/// <para><b>Decode ceiling (H4/CF-1, design §5.4 C-DECODE).</b> Before the eager per-column allocation,
-/// each projected row group's declared metadata is validated via <see cref="EnsureDecodeCeiling"/>: a
-/// per-chunk decompression-ratio ceiling, an absolute decompressed-size ceiling, and a row-count
-/// plausibility bound on the bytes the declared row count would materialize. These declared-size bounds
-/// are sound where a physical rows/byte proxy is not — legitimately compressible data (constant/RLE/
-/// all-null columns encode millions of rows in a few hundred bytes) passes, while a crafted footer that
-/// inflates the decompressed size or row count fails closed rather than driving an out-of-memory
-/// decompression bomb.</para>
+/// <para><b>Eager-decode memory ceiling (H4/CF-1, design §5.4 C-DECODE).</b> Before the eager
+/// per-column allocation, each projected row group's declared metadata is validated via
+/// <see cref="EnsureDecodeCeiling"/>: a per-chunk decompression-ratio ceiling, an absolute
+/// decompressed-size ceiling, and a row-count bound on the bytes the declared row count would eagerly
+/// materialize. This is fundamentally a bound on the <b>transient memory this reader allocates</b>
+/// because it decodes each row group eagerly and whole, not purely a "decompression bomb" guard: a
+/// crafted footer that inflates the decompressed size or row count fails closed rather than driving an
+/// out-of-memory allocation, and a <i>legitimate</i> row group whose projected columns would
+/// materialize past the cap is likewise rejected because the eager decode cannot fit it. Legitimately
+/// compressible data (constant/RLE/all-null columns that encode millions of rows in a few hundred
+/// bytes) passes, since the bound is on the decoded footprint rather than a physical rows/byte proxy.
+/// Chunked/streaming page-at-a-time decode that would lift the cap is a tracked follow-up.</para>
 /// </remarks>
 internal sealed class ParquetFileReader
 {
@@ -49,11 +53,13 @@ internal sealed class ParquetFileReader
     /// decompression bomb.</summary>
     internal const long MaxDecompressionRatio = 1000;
 
-    /// <summary>The absolute per-row-group decode ceiling (4&#160;GiB), applied to both the declared
-    /// decompressed bytes AND the bytes a row group's declared row count would eagerly materialize
-    /// (design §5.4 C-DECODE). It bounds decode/allocation memory so a crafted footer — whether inflating
-    /// the decompressed size or the row count — fails closed rather than driving an out-of-memory
-    /// allocation.</summary>
+    /// <summary>The absolute per-row-group <b>eager-decode</b> memory ceiling (4&#160;GiB), applied to both
+    /// the declared decompressed bytes AND the bytes a row group's declared row count would eagerly
+    /// materialize (design §5.4 C-DECODE). Because this reader decodes each row group whole, it bounds the
+    /// transient decode/allocation memory: a crafted footer (inflating the decompressed size or row count)
+    /// fails closed rather than driving an out-of-memory allocation, and a legitimate row group whose
+    /// projected columns exceed the cap is likewise rejected until chunked/streaming decode lifts the limit
+    /// (tracked follow-up).</summary>
     internal const long MaxRowGroupDecodedBytes = 4L * 1024 * 1024 * 1024;
 
     /// <summary>A row-group pruning hint: return <see langword="false"/> to skip a row group whose
@@ -108,21 +114,24 @@ internal sealed class ParquetFileReader
     }
 
     /// <summary>The declared compressed/decompressed footprint of one projected column chunk, plus the
-    /// per-row width the reader will materialize it into — the inputs to <see cref="EnsureDecodeCeiling"/>.
+    /// per-row width of the read buffer the reader will eagerly allocate for it (including any
+    /// <see cref="Nullable{T}"/> overhead) — the inputs to <see cref="EnsureDecodeCeiling"/>.
     /// </summary>
     internal readonly record struct ColumnChunkFootprint(
         long CompressedBytes, long UncompressedBytes, int ElementBytes);
 
-    /// <summary>Fails closed when a row group's declared metadata is an implausible decode target (design
-    /// §5.4 C-DECODE), so a crafted footer cannot drive an out-of-memory decompression or materialization.
-    /// Over the projected column chunks it enforces: (i) a per-chunk decompression-<b>ratio</b> ceiling
+    /// <summary>Fails closed when a row group's declared metadata would exceed this reader's
+    /// <b>eager-decode</b> memory ceiling (design §5.4 C-DECODE), so neither a crafted footer nor a
+    /// genuinely oversized row group can drive an out-of-memory allocation. Over the projected column
+    /// chunks it enforces: (i) a per-chunk decompression-<b>ratio</b> ceiling
     /// (<see cref="MaxDecompressionRatio"/>); (ii) an <b>absolute</b> decompressed-size ceiling
-    /// (<see cref="MaxRowGroupDecodedBytes"/>); and (iii) a <b>row-count plausibility</b> bound — the
-    /// bytes the declared <paramref name="rowCount"/> would eagerly materialize must not exceed the same
-    /// absolute ceiling. A negative row count or a negative declared size is likewise rejected. Unlike the
-    /// physical rows/byte proxy this replaces, these declared-size bounds are sound: legitimately
-    /// compressible data (constant/RLE/all-null columns, which encode millions of rows in a few hundred
-    /// bytes) passes, while an inflated decompressed size or row count is caught.</summary>
+    /// (<see cref="MaxRowGroupDecodedBytes"/>); and (iii) a <b>row-count</b> bound — the bytes the declared
+    /// <paramref name="rowCount"/> would eagerly materialize, at the column's <b>actual</b> allocated
+    /// element width (including any <see cref="Nullable{T}"/> overhead), must not exceed the same absolute
+    /// ceiling. A negative row count or a negative declared size is likewise rejected. These declared-size
+    /// bounds are sound where a physical rows/byte proxy is not: legitimately compressible data
+    /// (constant/RLE/all-null columns, which encode millions of rows in a few hundred bytes) passes, while
+    /// an inflated decompressed size or row count is caught.</summary>
     /// <exception cref="ArgumentNullException"><paramref name="projectedChunks"/> is null.</exception>
     /// <exception cref="DeltaStorageException">A declared value is negative, or a ceiling is exceeded
     /// (<see cref="StorageErrorKind.CorruptData"/>).</exception>
@@ -158,15 +167,16 @@ internal sealed class ParquetFileReader
                     + "decompression-ratio ceiling (possible decompression bomb).");
             }
 
-            // (iii) Row-count plausibility: reject BEFORE the eager per-column allocation if this row
-            // count would materialize more than the absolute ceiling. Dividing (rather than multiplying
-            // rowCount by the width) keeps the check overflow-safe for an attacker-sized row count.
+            // (iii) Row-count bound: reject BEFORE the eager per-column allocation if this row count would
+            // materialize more than the absolute eager-decode ceiling. ElementBytes is the ACTUAL read
+            // buffer width (Nullable<T>-aware, RF-4a). Dividing (rather than multiplying rowCount by the
+            // width) keeps the check overflow-safe for an attacker-sized row count.
             if (chunk.ElementBytes > 0 && rowCount > MaxRowGroupDecodedBytes / chunk.ElementBytes)
             {
                 throw DeltaStorageException.CorruptData(
                     $"Row group {group} declares {rowCount} rows, which would eagerly materialize more "
-                    + $"than the {MaxRowGroupDecodedBytes}-byte decode ceiling for a {chunk.ElementBytes}-"
-                    + "byte column (possible decompression bomb).");
+                    + $"than the {MaxRowGroupDecodedBytes}-byte eager-decode ceiling for a "
+                    + $"{chunk.ElementBytes}-byte column.");
             }
 
             totalDecompressedBytes = SaturatingAdd(totalDecompressedBytes, chunk.UncompressedBytes);
@@ -177,8 +187,7 @@ internal sealed class ParquetFileReader
         {
             throw DeltaStorageException.CorruptData(
                 $"Row group {group} declares {totalDecompressedBytes} decompressed bytes across its "
-                + $"projected columns, exceeding the {MaxRowGroupDecodedBytes}-byte decode ceiling "
-                + "(possible decompression bomb).");
+                + $"projected columns, exceeding the {MaxRowGroupDecodedBytes}-byte eager-decode ceiling.");
         }
     }
 
@@ -206,25 +215,34 @@ internal sealed class ParquetFileReader
             }
 
             footprints.Add(
-                new ColumnChunkFootprint(compressed, uncompressed, ElementByteWidth(requested[c].DataType)));
+                new ColumnChunkFootprint(
+                    compressed,
+                    uncompressed,
+                    AllocatedElementByteWidth(requested[c].DataType, fileFields[c].IsNullable)));
         }
 
         return footprints;
     }
 
-    // The per-row byte width the reader materializes a column into — used only to bound the eager
-    // allocation (CF-1 (iii)); an order-of-magnitude bound, not an exact sizeof. String/binary read into
-    // a per-row managed reference (8 bytes); their backing bytes are bounded by the decompressed ceiling.
-    private static int ElementByteWidth(DataType type) => type switch
+    // The per-row byte width of the read buffer the reader eagerly allocates for a column — used only to
+    // bound that allocation (CF-1 (iii)/RF-4a). It is the ACTUAL element size of the `new T[]`/`new T?[]`
+    // read buffer, INCLUDING Nullable<T> overhead (long? is 16 bytes, decimal? is 24), so the (iii) bound
+    // reflects the true transient rather than the unwrapped width. String/binary read into a per-row
+    // managed reference (IntPtr.Size); their backing bytes are separately bounded by the decompressed
+    // ceiling.
+    internal static int AllocatedElementByteWidth(DataType type, bool nullable) => type switch
     {
-        BooleanType or ByteType => 1,
-        ShortType => 2,
-        IntegerType or DateType or FloatType => 4,
-        LongType or TimestampType or DoubleType => 8,
-        DecimalType { IsCompact: true } => 8,
-        DecimalType => 16,
-        StringType or BinaryType => 8,
-        _ => 8,
+        BooleanType => nullable ? Unsafe.SizeOf<bool?>() : Unsafe.SizeOf<bool>(),
+        ByteType => nullable ? Unsafe.SizeOf<sbyte?>() : Unsafe.SizeOf<sbyte>(),
+        ShortType => nullable ? Unsafe.SizeOf<short?>() : Unsafe.SizeOf<short>(),
+        IntegerType => nullable ? Unsafe.SizeOf<int?>() : Unsafe.SizeOf<int>(),
+        LongType => nullable ? Unsafe.SizeOf<long?>() : Unsafe.SizeOf<long>(),
+        FloatType => nullable ? Unsafe.SizeOf<float?>() : Unsafe.SizeOf<float>(),
+        DoubleType => nullable ? Unsafe.SizeOf<double?>() : Unsafe.SizeOf<double>(),
+        DateType or TimestampType => nullable ? Unsafe.SizeOf<DateTime?>() : Unsafe.SizeOf<DateTime>(),
+        DecimalType => nullable ? Unsafe.SizeOf<decimal?>() : Unsafe.SizeOf<decimal>(),
+        StringType or BinaryType => IntPtr.Size,
+        _ => IntPtr.Size,
     };
 
     private static async Task<ParquetReader> OpenAsync(Stream input, CancellationToken cancellationToken)
@@ -588,15 +606,22 @@ internal sealed class ParquetFileReader
         }
     }
 
-    // M2: the narrow set of exceptions Parquet.Net actually raises for a malformed, truncated, or
-    // otherwise undecodable stream — I/O/format faults plus Parquet.Net's own format exceptions. Broad
-    // CLR exceptions (InvalidOperationException/ArgumentException/IndexOutOfRangeException/
-    // NotSupportedException/OverflowException/FormatException) are deliberately NOT swallowed here, so a
-    // genuine bug in our own decode path surfaces as itself instead of being masked as "corrupt data".
-    private static bool IsParquetDefect(Exception ex) => ex is
+    // M2/RF-4b: the narrow set of exceptions the read path maps to a deterministic CorruptData — the
+    // faults Parquet.Net actually raises for a malformed, truncated, or otherwise undecodable stream
+    // (I/O/format faults plus Parquet.Net's own format exceptions), PLUS the two failure modes an eager
+    // per-column allocation can raise if a row group slips past the decode ceiling: OutOfMemoryException
+    // and OverflowException. ADR-0013 mandates the reader never let a raw OutOfMemoryException (nor an
+    // unchecked-arithmetic OverflowException) escape the decode boundary, so both fail closed as
+    // CorruptData rather than escaping raw. Other broad CLR exceptions (InvalidOperationException/
+    // ArgumentException/IndexOutOfRangeException/NotSupportedException/FormatException) are deliberately
+    // NOT swallowed here, so a genuine bug in our own decode path surfaces as itself instead of being
+    // masked as "corrupt data".
+    internal static bool IsParquetDefect(Exception ex) => ex is
         IOException or
         InvalidDataException or
         EndOfStreamException or
+        OutOfMemoryException or
+        OverflowException or
         global::Parquet.ParquetException or
         global::Parquet.Meta.Proto.ThriftProtocolException;
 
