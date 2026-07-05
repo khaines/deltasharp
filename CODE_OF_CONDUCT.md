@@ -36,9 +36,14 @@ This Code of Conduct applies within all community spaces, and also applies when 
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the community leaders responsible for enforcement at **conduct@deltasharp.dev** _(placeholder — replace with the project's real, monitored contact before launch)_. All complaints will be reviewed and investigated promptly and fairly.
+Instances of abusive, harassing, or otherwise unacceptable behavior may be reported **privately to the community leaders responsible for enforcement**. During DeltaSharp's single-maintainer phase this is the founding maintainer, **[@khaines](https://github.com/khaines)** (also named in [GOVERNANCE.md](GOVERNANCE.md)). Please report **privately** — never in a public issue, discussion, or pull request — so the reporter's privacy is protected. Two confidential routes are available today:
 
-All community leaders are obligated to respect the privacy and security of the reporter of any incident.
+* **Reach the maintainer directly.** Contact **[@khaines](https://github.com/khaines)** through the contact links on that GitHub profile, and mark the message clearly as a confidential Code-of-Conduct report. Do not post details publicly.
+* **Report on-platform abuse to GitHub.** For harassment or abusive content on GitHub itself, use GitHub's built-in [report abuse](https://github.com/contact/report-abuse) tool, monitored by GitHub Trust & Safety — a confidential channel independent of the maintainer.
+
+There is **no separate private Code-of-Conduct mailbox yet.** Standing up a dedicated, monitored contact — a private report form or a real, monitored mailbox — is a tracked **action item before DeltaSharp's public launch**, and it will be listed here once it exists. Security vulnerabilities are **not** handled here; report them through the private channel in [SECURITY.md](SECURITY.md).
+
+All complaints will be reviewed and investigated promptly and fairly. All community leaders are obligated to respect the privacy and security of the reporter of any incident.
 
 ## Enforcement Guidelines
 
