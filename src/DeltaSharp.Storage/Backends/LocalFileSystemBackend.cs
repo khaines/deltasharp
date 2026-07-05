@@ -105,8 +105,17 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             throw DeltaStorageException.NotFound($"Object '{path}' does not exist.");
         }
 
-        var source = new FileStream(
-            full, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 4096, useAsync: true);
+        FileStream source;
+        try
+        {
+            source = new FileStream(
+                full, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 4096, useAsync: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw SurfaceFailure("Reading", path, ex);
+        }
+
         await using (source.ConfigureAwait(false))
         {
             long fileLength = source.Length;
@@ -128,7 +137,16 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             int toRead = (int)toReadLong;
             source.Seek(offset, SeekOrigin.Begin);
             var buffer = new byte[toRead];
-            await source.ReadExactlyAsync(buffer.AsMemory(), cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await source.ReadExactlyAsync(buffer.AsMemory(), cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // RF-8b: a read-time I/O error must not leak the absolute mount/warehouse path.
+                throw SurfaceFailure("Reading", path, ex);
+            }
+
             return new MemoryStream(buffer, writable: false);
         }
     }
@@ -143,9 +161,17 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             throw DeltaStorageException.NotFound($"Object '{path}' does not exist.");
         }
 
-        Stream stream = new FileStream(
-            full, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 4096, useAsync: true);
-        return ValueTask.FromResult(stream);
+        try
+        {
+            Stream stream = new FileStream(
+                full, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 4096, useAsync: true);
+            return ValueTask.FromResult(stream);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // RF-8b: an open-for-read failure must not leak the absolute mount/warehouse path.
+            throw SurfaceFailure("Opening a read for", path, ex);
+        }
     }
 
     /// <inheritdoc/>
@@ -166,7 +192,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         }
         catch (Exception ex)
         {
-            throw StagingFailure("Opening a staged write for", path, ex);
+            throw SurfaceFailure("Opening a staged write for", path, ex);
         }
 
         Stream stream = new StagedWriteStream(inner, temp, full, directory, path, Redact);
@@ -195,7 +221,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         }
         catch (Exception ex)
         {
-            throw StagingFailure("Staging conditional-create of", path, ex);
+            throw SurfaceFailure("Staging conditional-create of", path, ex);
         }
 
         try
@@ -214,7 +240,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         catch (Exception ex)
         {
             TryDelete(temp);
-            throw StagingFailure("Staging conditional-create of", path, ex);
+            throw SurfaceFailure("Staging conditional-create of", path, ex);
         }
 
         // Publish: the atomic single-winner. A lost race deletes the temp and returns false — never an
@@ -367,6 +393,12 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         catch (DirectoryNotFoundException)
         {
             // Idempotent: a missing object (or its missing parent) is a no-op, not an error.
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // RF-8b: a delete failure (permission, or the path is a directory) must not leak the absolute
+            // mount/warehouse path.
+            throw SurfaceFailure("Deleting", path, ex);
         }
 
         return ValueTask.CompletedTask;
@@ -570,13 +602,13 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         return redacted;
     }
 
-    // Wraps a staging filesystem failure into a Transient DeltaStorageException that discloses ONLY the
+    // Wraps a filesystem operation failure into a Transient DeltaStorageException that discloses ONLY the
     // caller-relative object path and the failure type -- never the absolute mount/warehouse layout, in
     // the message OR the inner-exception chain. Exception.ToString() surfaces an inner exception's own
     // message, so the raw path-bearing framework exception must NOT be chained; a synthetic, path-free
     // inner carrying the redacted detail is attached instead so diagnostics survive without disclosure
     // (RF-8b: never let a raw filesystem exception become the inner of a surfaced storage error).
-    private DeltaStorageException StagingFailure(string operation, string path, Exception ex)
+    internal DeltaStorageException SurfaceFailure(string operation, string path, Exception ex)
     {
         string detail = string.Create(
             CultureInfo.InvariantCulture, $"{ex.GetType().Name}: {Redact(ex.Message)}");

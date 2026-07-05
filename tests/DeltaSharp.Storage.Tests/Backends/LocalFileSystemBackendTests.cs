@@ -858,6 +858,39 @@ public sealed class LocalFileSystemBackendTests : IDisposable
     }
 
     [Fact]
+    public void SurfaceFailure_StripsAbsoluteRootFromMessageAndInnerChain()
+    {
+        // RF-8b: the SurfaceFailure mechanism (used by every read/write/delete surfaced error) discloses
+        // only the caller-relative path + failure type, never the absolute root — in .Message AND the inner
+        // chain. Non-vacuous: reverting Redact reddens .Message; chaining the raw exception reddens .ToString().
+        var raw = new IOException(string.Create(
+            System.Globalization.CultureInfo.InvariantCulture,
+            $"No space left on device : '{Path.Combine(_root, "logs", "x.tmp")}'"));
+        DeltaStorageException surfaced = _backend.SurfaceFailure("Testing", "logs/x", raw);
+
+        Assert.Equal(StorageErrorKind.Transient, surfaced.Kind);
+        Assert.Contains("logs/x", surfaced.Message, StringComparison.Ordinal); // relative path retained
+        Assert.DoesNotContain(_root, surfaced.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(_root, surfaced.ToString(), StringComparison.Ordinal); // inner chain too
+        Assert.NotSame(raw, surfaced.InnerException); // the raw path-bearing exception is NOT chained
+    }
+
+    [Fact]
+    public async Task DeleteFailure_OnDirectoryPath_DoesNotLeakAbsolutePath()
+    {
+        // RF-8b: File.Delete on a path that is a DIRECTORY throws a root-bearing framework exception; the
+        // surfaced error must disclose only the relative path (message + inner). Deterministic +
+        // cross-platform + root-safe (deleting a directory via File.Delete fails regardless of uid), so it
+        // is the non-vacuous end-to-end oracle for the delete-path SurfaceFailure wrapping.
+        Directory.CreateDirectory(Path.Combine(_root, "adir"));
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => _backend.DeleteAsync("adir", CancellationToken.None).AsTask());
+        Assert.DoesNotContain(_root, error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(_root, error.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void BuildTempName_IncludesSanitizedMachineNameForCrossPodUniqueness()
     {
         // CF-4: the temp name embeds the (sanitized) pod hostname so two pods with identical PIDs on a
