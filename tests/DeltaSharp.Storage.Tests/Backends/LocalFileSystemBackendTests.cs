@@ -642,6 +642,108 @@ public sealed class LocalFileSystemBackendTests : IDisposable
     }
 
     [Fact]
+    public async Task OpenWrite_FlushesDataFileToDiskBeforePublish()
+    {
+        // R4F-2 (Quality): the STAGED-WRITE data path (OpenWriteAsync -> CompleteAsync) must flush the
+        // data file to disk BEFORE it is published, exactly like the conditional-create path. Non-vacuous:
+        // the flush is routed through FlushToDisk whose observation IS the flush, so deleting
+        // FlushToDisk(_inner) in CompleteAsync removes this observation and the ordering assertion reddens.
+        var events = new List<string>();
+        LocalFileSystemBackend.FlushToDiskProbe = stream =>
+        {
+            lock (events)
+            {
+                events.Add("file-flush");
+            }
+
+            stream.Flush(flushToDisk: true); // production-faithful durability during the test
+        };
+        LocalFileSystemBackend.CommitStepProbe = step =>
+        {
+            lock (events)
+            {
+                events.Add(step);
+            }
+        };
+        try
+        {
+            Stream stream = await _backend.OpenWriteAsync("data/part-0.parquet", CancellationToken.None);
+            await using (stream.ConfigureAwait(false))
+            {
+                await stream.WriteAsync(new byte[] { 1, 2, 3, 4 });
+                await ((ICompletableWriteStream)stream).CompleteAsync(CancellationToken.None);
+            }
+        }
+        finally
+        {
+            LocalFileSystemBackend.FlushToDiskProbe = null;
+            LocalFileSystemBackend.CommitStepProbe = null;
+        }
+
+        int flushIndex = events.IndexOf("file-flush");
+        int publishIndex = events.IndexOf("publish");
+        Assert.True(flushIndex >= 0, "the staged data file must be flushed-to-disk (FlushToDisk was not invoked)");
+        Assert.True(publishIndex > flushIndex, "the staged data file must be flushed-to-disk BEFORE the atomic publish");
+    }
+
+    [Fact]
+    public async Task PublishFault_AmbiguousError_DoesNotLeakAbsoluteStoragePath()
+    {
+        // R4F-1 (Security): a non-EEXIST link() failure surfaces RetryUnsafeAmbiguous; its message must
+        // disclose only the caller-relative object path + errno, never the absolute mount/warehouse
+        // layout. Non-vacuous: reverting TryAtomicPublish's IOException to interpolate the absolute
+        // temp/dest paths makes both the surfaced message and its inner exception contain the confined
+        // root, reddening the assertions.
+        LocalFileSystemBackend.PublishFaultErrnoHook = () => 5; // simulate EIO (a non-EEXIST link failure)
+        DeltaStorageException error;
+        try
+        {
+            error = await Assert.ThrowsAsync<DeltaStorageException>(
+                () => _backend.PutIfAbsentAsync(
+                    "logs/00000000000000000005.json", new byte[] { 1 }, CancellationToken.None).AsTask());
+        }
+        finally
+        {
+            LocalFileSystemBackend.PublishFaultErrnoHook = null;
+        }
+
+        Assert.Equal(StorageErrorKind.RetryUnsafeAmbiguous, error.Kind);
+        Assert.DoesNotContain(_root, error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(_root, error.InnerException?.Message ?? string.Empty, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task List_YieldsRealPathForInRootDirectorySymlink()
+    {
+        // R4F-3 (Quality): makes the RF-1 metadata-from-real-path guarantee non-vacuous. An IN-ROOT
+        // directory symlink (dirlink -> realdir, both under the root) is the only case where the lexical
+        // and the confined-real path DIVERGE, so listing through it must surface the object under its REAL
+        // path ("realdir/...") not the symlink path ("dirlink/..."). Non-vacuous: reverting
+        // ToRelativeReal(realFile) to ToRelative(file) yields the "dirlink/" path and reddens this.
+        await _backend.PutIfAbsentAsync("realdir/obj.bin", new byte[] { 1, 2 }, CancellationToken.None);
+
+        string dirLink = Path.Combine(_root, "dirlink");
+        try
+        {
+            Directory.CreateSymbolicLink(dirLink, Path.Combine(_root, "realdir"));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            // Symlink creation is unprivileged on this platform/run — the guarantee cannot be exercised.
+            return;
+        }
+
+        var paths = new List<string>();
+        await foreach (StorageObjectInfo info in _backend.ListAsync("dirlink/", CancellationToken.None))
+        {
+            paths.Add(info.Path);
+        }
+
+        Assert.Contains("realdir/obj.bin", paths); // surfaced under the confined REAL path
+        Assert.DoesNotContain(paths, p => p.Contains("dirlink", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void BuildTempName_IncludesSanitizedMachineNameForCrossPodUniqueness()
     {
         // CF-4: the temp name embeds the (sanitized) pod hostname so two pods with identical PIDs on a

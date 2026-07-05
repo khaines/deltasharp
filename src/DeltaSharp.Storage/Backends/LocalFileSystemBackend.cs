@@ -64,6 +64,13 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
     // test reddens) -- the durability step is no longer independent of its ordering label.
     internal static volatile Action<FileStream>? FlushToDiskProbe;
 
+    // R4F-1 publish-fault seam (tests only): when set, its return code REPLACES the native link() result
+    // in TryAtomicPublish so a test can drive the non-EEXIST ambiguous-publish path (e.g. simulate EIO)
+    // and assert the surfaced error leaks no absolute path -- without inducing a real link failure. A
+    // zero return falls through to the genuine syscall; EEXIST simulates a lost race; any other non-zero
+    // simulates an ambiguous failure. Null and inert in production; consulted at the exact link() point.
+    internal static volatile Func<int>? PublishFaultErrnoHook;
+
     // RF-1 perf-observation seam (tests only): invoked with a directory path the FIRST time that
     // directory prefix is canonicalized during a ListAsync scan, so a test can prove the shared ancestor
     // chain is resolved once per directory, not once per listed entry. Null/inert in production.
@@ -385,20 +392,40 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             }
         }
 
-        int rc = PosixInterop.Link(tempPath, destinationPath);
-        if (rc == 0)
+        int errno;
+        Func<int>? fault = PublishFaultErrnoHook;
+        if (fault is not null)
         {
-            return true;
+            // Test-only: simulate the link() outcome without touching the filesystem.
+            errno = fault();
+            if (errno == 0)
+            {
+                return true;
+            }
+        }
+        else
+        {
+            int rc = PosixInterop.Link(tempPath, destinationPath);
+            if (rc == 0)
+            {
+                return true;
+            }
+
+            errno = Marshal.GetLastPInvokeError();
         }
 
-        int errno = Marshal.GetLastPInvokeError();
         if (errno == PosixInterop.EEXIST)
         {
             return false;
         }
 
+        // Surface only the file NAMES (never the absolute directory paths) so that when a caller wraps
+        // this into an ambiguous-outcome error and logs its message, the internal mount/warehouse layout
+        // is not disclosed (RF-7 message hygiene); the errno is the actionable diagnostic.
         throw new IOException(
-            string.Create(CultureInfo.InvariantCulture, $"link('{tempPath}' -> '{destinationPath}') failed with errno {errno}."));
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"link('{Path.GetFileName(tempPath)}' -> '{Path.GetFileName(destinationPath)}') failed with errno {errno}."));
     }
 
     private static void TryDelete(string path)
