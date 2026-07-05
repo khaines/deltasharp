@@ -19,10 +19,23 @@ public sealed class SparkSessionConcurrencyTests
         SparkSession.ClearDefaultSession();
     }
 
+    // Fail-fast bounds for the deterministic race tests below. Both are far larger than the sub-second
+    // oracle windows (probeWatchMs / probeTimeoutMs) so neither is hit on the happy path; they exist only
+    // to convert a genuine regression into a bounded, named FAILURE instead of an indefinite CI hang.
+    //
+    // WindowHandshakeMs bounds the cross-thread window-entry handshake (the stopper waiting for the probe
+    // to open the reuse / check->write window). JoinGuardMs bounds Thread.Join and is deliberately LARGER,
+    // so that when the probe never fires the handshake wait times out FIRST and the stopper thread is then
+    // cleanly joined — surfacing the precise "probe never fired" assertion rather than a join timeout.
+    private const int WindowHandshakeMs = 5000;
+    private const int JoinGuardMs = 20000;
+
     // ----- B2: GetOrCreate must never reuse a session it observed as stopped (TOCTOU) -----
 
-    [Fact]
-    public void GetOrCreate_RacingStop_NeverReusesAStoppedSession()
+    [Theory]
+    [InlineData(false)]  // DEFAULT reuse path: a fresh getter thread reuses the process-wide _defaultSession.
+    [InlineData(true)]   // ACTIVE reuse path: the getter seeds its thread-local active session, reusing via _activeSession.
+    public void GetOrCreate_RacingStop_NeverReusesAStoppedSession(bool activePath)
     {
         // B2 fix: GetOrCreate makes its reuse decision — reading the candidate session's IsActive —
         // UNDER _globalLock, and Stop() performs its state transition under that SAME _globalLock. The
@@ -48,6 +61,13 @@ public sealed class SparkSessionConcurrencyTests
         // Stop can only complete once the getter releases _globalLock (i.e. after the window closes),
         // and the oracle observes state strictly inside the window rather than sampling IsActive after
         // the lock is released (which is what made the old stress oracle racy).
+        //
+        // GetOrCreate has TWO structurally-identical reuse branches that both make the IsActive decision
+        // and fire the probe under _globalLock: the ACTIVE branch (thread-local _activeSession) and the
+        // DEFAULT branch (process-wide _defaultSession). A fresh getter thread has a null thread-local
+        // active session and always takes the DEFAULT branch, so activePath==true first seeds the getter
+        // thread's active session (SetActiveSession) to drive the ACTIVE branch. Both branches are thus
+        // race-tested: reverting the B2 fix fails BOTH theory cases, so neither is vacuous.
         const int iterations = 6;
         const int probeWatchMs = 200;
 
@@ -86,20 +106,41 @@ public sealed class SparkSessionConcurrencyTests
 
             var getter = new Thread(() =>
             {
+                if (activePath)
+                {
+                    // Seed THIS thread's thread-local active session so GetOrCreate takes the ACTIVE reuse
+                    // branch instead of the DEFAULT branch. A fresh thread's active session is null, so
+                    // without this the active-path probe would never be race-driven and only one of the
+                    // two structurally-identical reuse branches would be proven.
+                    SparkSession.SetActiveSession(seed);
+                }
+
                 returned = SparkSession.Builder().AppName("race").GetOrCreate();
             });
             var stopper = new Thread(() =>
             {
-                getterInWindow.Wait();   // wait until the getter is in the reuse window
-                seed.Stop();             // races the in-flight reuse decision
+                // Bounded handshake (fail-fast, never hang): if the probe never fires — a future seam
+                // move, or the getter taking the create path — this returns false instead of blocking
+                // forever, and the probeFired assertion below turns that into a CLEAN failure.
+                if (getterInWindow.Wait(WindowHandshakeMs))   // wait until the getter is in the reuse window
+                {
+                    seed.Stop();                            // races the in-flight reuse decision
+                }
             });
 
             getter.Start();
             stopper.Start();
-            getter.Join();
-            stopper.Join();
+            Assert.True(getter.Join(JoinGuardMs), "getter thread did not finish within the deadlock guard.");
+            Assert.True(stopper.Join(JoinGuardMs), "stopper thread did not finish within the deadlock guard.");
 
             seed.ReuseRaceProbe = null;
+
+            // Fail-fast premise: the probe MUST have fired (the getter reached the reuse window and ran the
+            // in-lock oracle). A future change that stops the getter reaching the window is then a CLEAN
+            // FAIL naming the cause — never a silent pass, never an indefinite hang.
+            Assert.True(
+                Volatile.Read(ref probeFired) == 1,
+                "probe never fired (getter did not reach the reuse window).");
 
             // The getter must have taken the reuse path (returned the seed) — that is the path B2 guards.
             Assert.Same(seed, returned);
@@ -184,17 +225,27 @@ public sealed class SparkSessionConcurrencyTests
             });
             var stopper = new Thread(() =>
             {
-                writerInWindow.Wait();                                 // wait until writer is in the window
-                seed.Stop();                                           // races the in-flight Set
-                stopReleased.Release();                                // signal: Stop returned
+                // Bounded handshake (fail-fast, never hang): if the probe never fires this returns false
+                // instead of blocking forever; the probeFired assertion below turns that into a clean fail.
+                if (writerInWindow.Wait(WindowHandshakeMs))           // wait until writer is in the window
+                {
+                    seed.Stop();                                       // races the in-flight Set
+                    stopReleased.Release();                            // signal: Stop returned
+                }
             });
 
             writer.Start();
             stopper.Start();
-            writer.Join();
-            stopper.Join();
+            Assert.True(writer.Join(JoinGuardMs), "writer thread did not finish within the deadlock guard.");
+            Assert.True(stopper.Join(JoinGuardMs), "stopper thread did not finish within the deadlock guard.");
 
             seed.Conf.StopRaceProbe = null;
+
+            // Fail-fast premise: the probe MUST have fired (the writer reached the check->write window). A
+            // future change that stops the writer reaching the window is a CLEAN fail, never a silent pass.
+            Assert.True(
+                Volatile.Read(ref probeFired) == 1,
+                "probe never fired (writer did not reach the check->write window).");
 
             bool persisted = seed.Conf.Get(raceKey, null) is not null;
 

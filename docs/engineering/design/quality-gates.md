@@ -327,7 +327,7 @@ closes this two ways:
   `expectedAssemblies` **fails closed** (`::error::` + non-zero exit) instead of reverting to
   fail-open global accounting over every globbed package — emptying the list can no longer disarm
   the gate. Second, the gate **derives the ground-truth production set from `src/`** (every
-  `src/*/**.csproj`'s `AssemblyName`, matching the `DeltaSharpIsProductionAssembly` path rule in
+  `src/**/*.csproj`'s `AssemblyName`, matching the `DeltaSharpIsProductionAssembly` path rule in
   [`Directory.Build.props`](../../../Directory.Build.props)) and requires `expectedAssemblies` to
   **exactly equal** it. If the two diverge — a new `src/` assembly was added but not allowlisted, or
   a stale allowlist entry no longer exists in `src/` — the gate **fails closed** naming the drift.

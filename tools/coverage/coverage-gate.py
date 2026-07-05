@@ -43,7 +43,7 @@ holes are closed here:
     non-zero when the allowlist is empty/absent — an unconfigured allowlist is treated exactly like
     a missing assembly, never as "measure everything".
   * Allowlist-vs-src drift -> FAIL CLOSED. The allowlist is cross-checked against the ACTUAL set of
-    `src/` production projects (every `src/*/*.csproj`, keyed by `<AssemblyName>`), which is the same
+    `src/` production projects (every `src/**/*.csproj`, keyed by `<AssemblyName>`), which is the same
     ground truth the MSBuild `DeltaSharpIsProductionAssembly` path gate uses in Directory.Build.props.
     If the two disagree — the allowlist was emptied, a NEW src/ assembly was added without being
     allowlisted, or a removed assembly was left stale in the list — the gate fails, naming the delta.
