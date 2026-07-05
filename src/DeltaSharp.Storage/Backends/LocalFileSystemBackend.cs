@@ -154,23 +154,22 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         cancellationToken.ThrowIfCancellationRequested();
         string full = Resolve(path);
         string directory = Path.GetDirectoryName(full) ?? _root;
-        Directory.CreateDirectory(directory);
 
         FileStream inner;
         string temp;
         try
         {
+            // RF-8b: the directory create is inside the sanitizing catch too -- a missing-parent inside a
+            // read-only ancestor throws a path-bearing framework exception that would otherwise escape raw.
+            Directory.CreateDirectory(directory);
             inner = CreateFreshTemp(full, ".tmp", out temp);
         }
         catch (Exception ex)
         {
-            // RF-8: surface only the caller-relative path (root-redacted message), never the absolute
-            // mount/warehouse layout, on a staging-create failure (read-only PVC, quota, missing parent).
-            throw DeltaStorageException.Transient(
-                $"Opening a staged write for '{path}' failed: {Redact(ex.Message)}", ex);
+            throw StagingFailure("Opening a staged write for", path, ex);
         }
 
-        Stream stream = new StagedWriteStream(inner, temp, full, directory, path);
+        Stream stream = new StagedWriteStream(inner, temp, full, directory, path, Redact);
         return ValueTask.FromResult(stream);
     }
 
@@ -181,7 +180,6 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         cancellationToken.ThrowIfCancellationRequested();
         string full = Resolve(path);
         string directory = Path.GetDirectoryName(full) ?? _root;
-        Directory.CreateDirectory(directory);
 
         // Stage: create a PRIVATE temp with O_EXCL (CreateNew) semantics so it can never alias or clobber
         // another writer's in-flight temp, write the full content, and fsync it BEFORE publishing. A
@@ -191,12 +189,13 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         string temp;
         try
         {
+            // RF-8b: the directory create is inside the sanitizing catch (see OpenWriteAsync).
+            Directory.CreateDirectory(directory);
             stagingStream = CreateFreshTemp(full, ".put.tmp", out temp);
         }
         catch (Exception ex)
         {
-            throw DeltaStorageException.Transient(
-                $"Staging conditional-create of '{path}' failed: {Redact(ex.Message)}", ex);
+            throw StagingFailure("Staging conditional-create of", path, ex);
         }
 
         try
@@ -215,8 +214,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         catch (Exception ex)
         {
             TryDelete(temp);
-            throw DeltaStorageException.Transient(
-                $"Staging conditional-create of '{path}' failed: {Redact(ex.Message)}", ex);
+            throw StagingFailure("Staging conditional-create of", path, ex);
         }
 
         // Publish: the atomic single-winner. A lost race deletes the temp and returns false — never an
@@ -229,8 +227,13 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         catch (Exception ex)
         {
             TryDelete(temp);
+            // RF-8b: redact + path-free synthetic inner (Windows File.Move failures carry an absolute
+            // path; POSIX TryAtomicPublish is already file-name-only).
+            string detail = string.Create(
+                CultureInfo.InvariantCulture, $"{ex.GetType().Name}: {Redact(ex.Message)}");
             throw DeltaStorageException.RetryUnsafeAmbiguous(
-                $"Conditional-create of '{path}' failed ambiguously: {ex.Message}", ex);
+                string.Create(CultureInfo.InvariantCulture, $"Conditional-create of '{path}' failed ambiguously: {detail}"),
+                new IOException(detail));
         }
 
         if (!won)
@@ -567,6 +570,21 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         return redacted;
     }
 
+    // Wraps a staging filesystem failure into a Transient DeltaStorageException that discloses ONLY the
+    // caller-relative object path and the failure type -- never the absolute mount/warehouse layout, in
+    // the message OR the inner-exception chain. Exception.ToString() surfaces an inner exception's own
+    // message, so the raw path-bearing framework exception must NOT be chained; a synthetic, path-free
+    // inner carrying the redacted detail is attached instead so diagnostics survive without disclosure
+    // (RF-8b: never let a raw filesystem exception become the inner of a surfaced storage error).
+    private DeltaStorageException StagingFailure(string operation, string path, Exception ex)
+    {
+        string detail = string.Create(
+            CultureInfo.InvariantCulture, $"{ex.GetType().Name}: {Redact(ex.Message)}");
+        return DeltaStorageException.Transient(
+            string.Create(CultureInfo.InvariantCulture, $"{operation} '{path}' failed: {detail}"),
+            new IOException(detail));
+    }
+
     // Canonicalizes an incoming path and confines it to the table root, rejecting fail-closed anything
     // that escapes (absolute-outside-root, ".." traversal, or a symlink whose real target leaves the
     // root). This is the LOG-E control (§5.5): it runs for EVERY path, whether user- or log-supplied.
@@ -692,11 +710,13 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         private readonly string _destinationPath;
         private readonly string _destinationDirectory;
         private readonly string _displayPath;
+        private readonly Func<string, string> _redact;
         private bool _completed;
         private bool _disposed;
 
         public StagedWriteStream(
-            FileStream inner, string tempPath, string destinationPath, string destinationDirectory, string displayPath)
+            FileStream inner, string tempPath, string destinationPath, string destinationDirectory,
+            string displayPath, Func<string, string> redact)
         {
             _tempPath = tempPath;
             _destinationPath = destinationPath;
@@ -705,7 +725,19 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             // RF-7: the caller-supplied RELATIVE path is used in ambiguous-failure messages (mirroring
             // PutIfAbsent) so a surfaced error never leaks the internal absolute mount/warehouse layout.
             _displayPath = displayPath;
+            _redact = redact;
             _inner = inner;
+        }
+
+        // RF-8b: a staged-stream write/flush failure (mid-write ENOSPC/EDQUOT/EIO) surfaces ONLY the
+        // relative object path + failure type, never the absolute path in the message OR the inner chain.
+        private DeltaStorageException Sanitize(string operation, Exception ex)
+        {
+            string detail = string.Create(
+                CultureInfo.InvariantCulture, $"{ex.GetType().Name}: {_redact(ex.Message)}");
+            return DeltaStorageException.Transient(
+                string.Create(CultureInfo.InvariantCulture, $"{operation} staged write to '{_displayPath}' failed: {detail}"),
+                new IOException(detail));
         }
 
         public override bool CanRead => false;
@@ -722,10 +754,29 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             set => throw new NotSupportedException();
         }
 
-        public override void Flush() => _inner.Flush();
+        public override void Flush()
+        {
+            try
+            {
+                _inner.Flush();
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                throw Sanitize("Flushing", ex);
+            }
+        }
 
-        public override Task FlushAsync(CancellationToken cancellationToken) =>
-            _inner.FlushAsync(cancellationToken);
+        public override async Task FlushAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                await _inner.FlushAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                throw Sanitize("Flushing", ex);
+            }
+        }
 
         public override int Read(byte[] buffer, int offset, int count) =>
             throw new NotSupportedException();
@@ -734,17 +785,54 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
 
         public override void SetLength(long value) => _inner.SetLength(value);
 
-        public override void Write(byte[] buffer, int offset, int count) =>
-            _inner.Write(buffer, offset, count);
+        public override void Write(byte[] buffer, int offset, int count)
+        {
+            try
+            {
+                _inner.Write(buffer, offset, count);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                throw Sanitize("Writing", ex);
+            }
+        }
 
-        public override void Write(ReadOnlySpan<byte> buffer) => _inner.Write(buffer);
+        public override void Write(ReadOnlySpan<byte> buffer)
+        {
+            try
+            {
+                _inner.Write(buffer);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                throw Sanitize("Writing", ex);
+            }
+        }
 
-        public override ValueTask WriteAsync(
-            ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default) =>
-            _inner.WriteAsync(buffer, cancellationToken);
+        public override async ValueTask WriteAsync(
+            ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                await _inner.WriteAsync(buffer, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                throw Sanitize("Writing", ex);
+            }
+        }
 
-        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
-            _inner.WriteAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+        public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+        {
+            try
+            {
+                await _inner.WriteAsync(buffer.AsMemory(offset, count), cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                throw Sanitize("Writing", ex);
+            }
+        }
 
         public async ValueTask CompleteAsync(CancellationToken cancellationToken = default)
         {
@@ -758,10 +846,20 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
 
             // Durably flush the staged bytes, then publish atomically. Publication happens ONLY here,
             // so a producer that faults before completing never lands a readable destination. The flush
-            // is routed through FlushToDisk (RF-5) so the durability step is observable.
-            await _inner.FlushAsync(cancellationToken).ConfigureAwait(false);
-            FlushToDisk(_inner);
-            await _inner.DisposeAsync().ConfigureAwait(false);
+            // is routed through FlushToDisk (RF-5) so the durability step is observable. A flush/dispose
+            // failure (mid-completion ENOSPC/quota) is sanitized (RF-8b) so it never leaks the absolute
+            // path; Publish() throws its own already-sanitized DeltaStorageException outside the catch.
+            try
+            {
+                await _inner.FlushAsync(cancellationToken).ConfigureAwait(false);
+                FlushToDisk(_inner);
+                await _inner.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                throw Sanitize("Completing", ex);
+            }
+
             Publish();
             _completed = true;
         }
@@ -812,10 +910,15 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             catch (Exception ex) when (ex is not DeltaStorageException)
             {
                 // RF-2: the atomic publish failed, so the temp is unpublished -- drop it before surfacing
-                // the ambiguous outcome so it is not orphaned.
+                // the ambiguous outcome so it is not orphaned. RF-8b: redact the message and attach a
+                // path-free synthetic inner (Windows File.Move failures carry an absolute path; POSIX
+                // TryAtomicPublish is already file-name-only).
                 CleanupTemp();
+                string detail = string.Create(
+                    CultureInfo.InvariantCulture, $"{ex.GetType().Name}: {_redact(ex.Message)}");
                 throw DeltaStorageException.RetryUnsafeAmbiguous(
-                    $"Publishing staged write to '{_displayPath}' failed ambiguously: {ex.Message}", ex);
+                    string.Create(CultureInfo.InvariantCulture, $"Publishing staged write to '{_displayPath}' failed ambiguously: {detail}"),
+                    new IOException(detail));
             }
 
             if (!won)

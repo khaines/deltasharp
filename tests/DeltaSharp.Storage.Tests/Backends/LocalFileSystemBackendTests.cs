@@ -759,6 +759,23 @@ public sealed class LocalFileSystemBackendTests : IDisposable
         string dir = Path.Combine(_root, "sekret-warehouse");
         Directory.CreateDirectory(dir);
         File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserExecute); // no write -> CreateNew fails
+        // The RO-directory trigger is ineffective under a uid that bypasses DAC mode bits (e.g. root in a
+        // CI container), so probe it: if a write into the "read-only" dir unexpectedly succeeds, skip
+        // rather than hard-fail the ThrowsAsync assertion.
+        string probe = Path.Combine(dir, ".ro-probe");
+        try
+        {
+            File.WriteAllBytes(probe, Array.Empty<byte>());
+            File.Delete(probe);
+            File.SetUnixFileMode(
+                dir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            return; // mode not enforced for this uid (root) — trigger unavailable
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Good: the directory is genuinely read-only for this uid; the trigger will fire.
+        }
+
         try
         {
             DeltaStorageException putError = await Assert.ThrowsAsync<DeltaStorageException>(
@@ -777,6 +794,66 @@ public sealed class LocalFileSystemBackendTests : IDisposable
         {
             File.SetUnixFileMode(
                 dir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+    }
+
+    [Fact]
+    public async Task StagingSetupFailure_ThroughFileWhereDirectoryExpected_DoesNotLeakAbsolutePath()
+    {
+        // RF-8b: a staging-SETUP failure whose framework exception carries the absolute path — here a path
+        // component ("collide") is a FILE, so Directory.CreateDirectory of the parent throws a root-bearing
+        // IOException — must surface ONLY the relative object path, in BOTH .Message and .ToString() (inner
+        // chain). Deterministic + cross-platform + root-safe (NOT permission-based). This exercises the
+        // CreateDirectory-inside-the-catch move AND makes Redact() non-vacuous (ex.Message here really does
+        // contain the root, unlike the create-temp path which is already clean at source).
+        await _backend.PutIfAbsentAsync("collide", new byte[] { 1 }, CancellationToken.None); // now a FILE
+
+        DeltaStorageException putError = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => _backend.PutIfAbsentAsync("collide/obj.json", new byte[] { 2 }, CancellationToken.None).AsTask());
+        Assert.Equal(StorageErrorKind.Transient, putError.Kind);
+        Assert.DoesNotContain(_root, putError.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(_root, putError.ToString(), StringComparison.Ordinal);
+
+        DeltaStorageException openError = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => _backend.OpenWriteAsync("collide/obj.parquet", CancellationToken.None).AsTask());
+        Assert.DoesNotContain(_root, openError.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(_root, openError.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task StagingWriteFailure_DoesNotLeakAbsolutePathInInnerChain()
+    {
+        // RF-8b (Security): a write/flush-time failure (the ENOSPC/EDQUOT/EIO quota class) whose framework
+        // exception carries the absolute temp path must surface ONLY the relative path — in .Message AND
+        // .ToString() (the inner chain, which Exception.ToString() includes). Simulated via the FlushToDisk
+        // seam throwing a root-bearing IOException. Covers BOTH PutIfAbsentAsync (write block) and the
+        // StagedWriteStream CompleteAsync path. Non-vacuous: reverting the StagingFailure/Sanitize helpers
+        // to chain the raw exception reintroduces the absolute path into .ToString().
+        LocalFileSystemBackend.FlushToDiskProbe = stream =>
+            throw new IOException(string.Create(
+                System.Globalization.CultureInfo.InvariantCulture, $"No space left on device : '{stream.Name}'"));
+        try
+        {
+            DeltaStorageException putError = await Assert.ThrowsAsync<DeltaStorageException>(
+                () => _backend.PutIfAbsentAsync("logs/x.json", new byte[] { 1 }, CancellationToken.None).AsTask());
+            Assert.DoesNotContain(_root, putError.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(_root, putError.ToString(), StringComparison.Ordinal);
+
+            Stream stream = await _backend.OpenWriteAsync("logs/y.parquet", CancellationToken.None);
+            DeltaStorageException openError = await Assert.ThrowsAsync<DeltaStorageException>(async () =>
+            {
+                await using (stream.ConfigureAwait(false))
+                {
+                    await stream.WriteAsync(new byte[] { 1, 2 });
+                    await ((ICompletableWriteStream)stream).CompleteAsync(CancellationToken.None);
+                }
+            });
+            Assert.DoesNotContain(_root, openError.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(_root, openError.ToString(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            LocalFileSystemBackend.FlushToDiskProbe = null;
         }
     }
 
