@@ -15,6 +15,11 @@ internal enum StorageErrorKind
     /// partial rows (design §2.9.1); the message names the defect.</summary>
     CorruptData,
 
+    /// <summary>A structurally valid file whose column physical type or nullability does not match the
+    /// requested engine type (design §2.9.1). Distinct from <see cref="CorruptData"/> so a schema/type
+    /// disagreement is not conflated with byte-level corruption; the message names the mismatch.</summary>
+    SchemaMismatch,
+
     /// <summary>A required object (file/path) does not exist.</summary>
     NotFound,
 
@@ -59,6 +64,22 @@ internal sealed class DeltaStorageException : Exception
     /// <summary>Creates a <see cref="StorageErrorKind.CorruptData"/> error naming the defect.</summary>
     public static DeltaStorageException CorruptData(string defect, Exception? innerException = null) =>
         new(StorageErrorKind.CorruptData, defect, innerException);
+
+    /// <summary>Creates a <see cref="StorageErrorKind.SchemaMismatch"/> error naming the mismatch.</summary>
+    public static DeltaStorageException SchemaMismatch(string message) =>
+        new(StorageErrorKind.SchemaMismatch, message);
+
+    /// <summary>Creates a <see cref="StorageErrorKind.Transient"/> error (a retryable I/O condition).</summary>
+    // NOTE (#113): when the object-store backends (S3/ADLS/GCS) land, any URI/credential embedded in a
+    // path or message MUST be routed through SecretRedaction before it reaches this factory. Local
+    // POSIX paths carry no secret, so they are passed through verbatim today.
+    public static DeltaStorageException Transient(string message, Exception? innerException = null) =>
+        new(StorageErrorKind.Transient, message, innerException);
+
+    /// <summary>Creates a <see cref="StorageErrorKind.RetryUnsafeAmbiguous"/> error: an operation whose
+    /// outcome cannot be determined, so the caller must re-resolve rather than blindly retry.</summary>
+    public static DeltaStorageException RetryUnsafeAmbiguous(string message, Exception? innerException = null) =>
+        new(StorageErrorKind.RetryUnsafeAmbiguous, message, innerException);
 
     /// <summary>Creates a <see cref="StorageErrorKind.PathNotConfined"/> error naming the rejected path.</summary>
     public static DeltaStorageException PathNotConfined(string message) =>

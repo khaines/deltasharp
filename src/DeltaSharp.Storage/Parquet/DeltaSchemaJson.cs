@@ -50,12 +50,28 @@ internal static class DeltaSchemaJson
             WriteType(writer, field.DataType);
             writer.WriteBoolean("nullable", field.Nullable);
             writer.WritePropertyName("metadata");
-            writer.WriteStartObject();
-            writer.WriteEndObject();
+            WriteMetadata(writer, field.Metadata);
             writer.WriteEndObject();
         }
 
         writer.WriteEndArray();
+        writer.WriteEndObject();
+    }
+
+    // Faithful copy of DeltaSharp.Engine's SchemaJson.WriteMetadata (M7): each field-metadata entry
+    // is emitted as a string key/value in FieldMetadata's key-sorted order, so a schema carrying field
+    // metadata serializes byte-for-byte like the engine (a previous always-empty object dropped it).
+    // D-6 relocation follow-up: once SchemaJson is shared/relocated out of the Engine assembly, delete
+    // this copy and call the engine serializer directly.
+    private static void WriteMetadata(Utf8JsonWriter writer, FieldMetadata metadata)
+    {
+        writer.WriteStartObject();
+        foreach (KeyValuePair<string, string> entry in metadata)
+        {
+            // FieldMetadata enumerates in sorted key order => deterministic output.
+            writer.WriteString(entry.Key, entry.Value);
+        }
+
         writer.WriteEndObject();
     }
 

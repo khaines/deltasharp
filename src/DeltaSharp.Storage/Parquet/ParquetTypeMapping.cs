@@ -98,10 +98,21 @@ internal static class ParquetTypeMapping
 
     /// <summary>Converts a DeltaSharp epoch-microsecond instant to the UTC <see cref="DateTime"/>
     /// Parquet.Net writes for a micros TIMESTAMP column.</summary>
+    /// <exception cref="DeltaStorageException">The value is outside the representable
+    /// <see cref="DateTime"/> range (<see cref="StorageErrorKind.CorruptData"/>) — mapped
+    /// deterministically so no raw <see cref="OverflowException"/> escapes the codec contract.</exception>
     public static DateTime EpochMicrosToDateTime(long micros)
     {
-        long ticks = DateTime.UnixEpoch.Ticks + (micros * TimeSpan.TicksPerMicrosecond);
-        return new DateTime(ticks, DateTimeKind.Utc);
+        try
+        {
+            long ticks = checked(DateTime.UnixEpoch.Ticks + (micros * TimeSpan.TicksPerMicrosecond));
+            return new DateTime(ticks, DateTimeKind.Utc);
+        }
+        catch (Exception ex) when (ex is OverflowException or ArgumentOutOfRangeException)
+        {
+            throw DeltaStorageException.CorruptData(
+                $"timestamp epoch-microsecond value {micros} is outside the representable DateTime range.", ex);
+        }
     }
 
     /// <summary>Converts a Parquet micros TIMESTAMP <see cref="DateTime"/> back to the DeltaSharp
@@ -159,6 +170,17 @@ internal static class ParquetTypeMapping
         }
 
         Int128 unscaled = Int128.CreateChecked(scaled);
+
+        // Over-precision guard (§2.9.1 mandates it on the read path too): a value whose unscaled
+        // magnitude reaches 10^precision does not fit the declared decimal(P,S) and is corrupt. Mirrors
+        // LocalRelationBatches.AppendDecimal.
+        Int128 magnitude = unscaled < 0 ? -unscaled : unscaled;
+        if (magnitude >= Pow10Int128(type.Precision))
+        {
+            throw DeltaStorageException.CorruptData(
+                $"decimal value does not fit in precision {type.Precision} (type '{type.SimpleString}').");
+        }
+
         if (type.IsCompact)
         {
             vector.AppendValue((long)unscaled);
@@ -169,12 +191,55 @@ internal static class ParquetTypeMapping
         }
     }
 
+    /// <summary>Converts a Parquet-space <see cref="decimal"/> to the engine's unscaled
+    /// <see cref="Int128"/> lane value (value × 10^scale), applying the same scale/precision guards as
+    /// <see cref="AppendDecimal"/>. Used to lane-normalize row-group statistics for pruning.</summary>
+    /// <exception cref="DeltaStorageException">The value cannot be represented at the declared
+    /// scale/precision (<see cref="StorageErrorKind.CorruptData"/>) or the scale is unsupported
+    /// (<see cref="StorageErrorKind.UnsupportedFeature"/>).</exception>
+    public static Int128 DecimalToUnscaled(DecimalType type, decimal value)
+    {
+        if (type.Scale > MaxDecimalScale)
+        {
+            throw DeltaStorageException.UnsupportedFeature(
+                $"decimal scale {type.Scale} exceeds the System.Decimal maximum of {MaxDecimalScale}.");
+        }
+
+        decimal scaled = value * Pow10Decimal(type.Scale);
+        if (scaled != decimal.Truncate(scaled))
+        {
+            throw DeltaStorageException.CorruptData(
+                $"decimal value cannot be represented at scale {type.Scale} without loss of precision.");
+        }
+
+        Int128 unscaled = Int128.CreateChecked(scaled);
+        Int128 magnitude = unscaled < 0 ? -unscaled : unscaled;
+        if (magnitude >= Pow10Int128(type.Precision))
+        {
+            throw DeltaStorageException.CorruptData(
+                $"decimal value does not fit in precision {type.Precision} (type '{type.SimpleString}').");
+        }
+
+        return unscaled;
+    }
+
     private static decimal Pow10Decimal(int exponent)
     {
         decimal result = 1m;
         for (int i = 0; i < exponent; i++)
         {
             result *= 10m;
+        }
+
+        return result;
+    }
+
+    private static Int128 Pow10Int128(int exponent)
+    {
+        Int128 result = Int128.One;
+        for (int i = 0; i < exponent; i++)
+        {
+            result *= 10;
         }
 
         return result;

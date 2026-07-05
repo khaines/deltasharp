@@ -157,7 +157,7 @@ public sealed class LocalFileSystemBackendTests : IDisposable
     }
 
     [Fact]
-    public async Task StagedWrite_PublishesAtomicallyOnClose()
+    public async Task StagedWrite_PublishesAtomicallyOnComplete()
     {
         const string key = "part-00000.parquet";
         byte[] payload = Encoding.UTF8.GetBytes("durable-content");
@@ -166,6 +166,11 @@ public sealed class LocalFileSystemBackendTests : IDisposable
         await using (write.ConfigureAwait(false))
         {
             await write.WriteAsync(payload, CancellationToken.None);
+
+            // Publish-on-complete: the destination is NOT visible until CompleteAsync is invoked.
+            Assert.Null(await _backend.HeadAsync(key, CancellationToken.None));
+
+            await ((ICompletableWriteStream)write).CompleteAsync(CancellationToken.None);
         }
 
         StorageObjectInfo? head = await _backend.HeadAsync(key, CancellationToken.None);
@@ -176,6 +181,130 @@ public sealed class LocalFileSystemBackendTests : IDisposable
         using var buffer = new MemoryStream();
         await stored.CopyToAsync(buffer);
         Assert.Equal(payload, buffer.ToArray());
+    }
+
+    [Fact]
+    public async Task StagedWrite_AbandonedWithoutComplete_LeavesNoDestinationOrTemp()
+    {
+        const string key = "abandoned/part.parquet";
+
+        Stream write = await _backend.OpenWriteAsync(key, CancellationToken.None);
+        await using (write.ConfigureAwait(false))
+        {
+            await write.WriteAsync(Encoding.UTF8.GetBytes("half-written"), CancellationToken.None);
+            // Dispose WITHOUT completing (faulted/abandoned) — must publish nothing.
+        }
+
+        Assert.Null(await _backend.HeadAsync(key, CancellationToken.None));
+
+        // No orphan temp files remain under the root.
+        string[] leftovers = Directory.Exists(_root)
+            ? Directory.GetFiles(_root, "*", SearchOption.AllDirectories)
+            : Array.Empty<string>();
+        Assert.DoesNotContain(leftovers, f => f.Contains(".tmp", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task StagedWrite_PublishOntoExistingDestination_ThrowsAlreadyExists()
+    {
+        const string key = "existing.parquet";
+        Assert.True(await _backend.PutIfAbsentAsync(key, new byte[] { 1, 2, 3 }, CancellationToken.None));
+
+        Stream write = await _backend.OpenWriteAsync(key, CancellationToken.None);
+        await using (write.ConfigureAwait(false))
+        {
+            await write.WriteAsync(new byte[] { 9, 9, 9 }, CancellationToken.None);
+            DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+                async () => await ((ICompletableWriteStream)write).CompleteAsync(CancellationToken.None));
+            Assert.Equal(StorageErrorKind.AlreadyExists, error.Kind);
+        }
+
+        // The original content is untouched (no overwrite).
+        await using Stream stored = await _backend.OpenReadAsync(key, CancellationToken.None);
+        using var buffer = new MemoryStream();
+        await stored.CopyToAsync(buffer);
+        Assert.Equal(new byte[] { 1, 2, 3 }, buffer.ToArray());
+    }
+
+    [Fact]
+    public async Task PutIfAbsent_CanceledBeforePublish_LeavesNoDestination()
+    {
+        const string key = "commits/00000000000000000005.json";
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            async () => await _backend.PutIfAbsentAsync(key, new byte[] { 1, 2, 3, 4 }, cts.Token));
+
+        // The commit slot must NOT be poisoned by a canceled winner — no dest, no orphan temp.
+        Assert.Null(await _backend.HeadAsync(key, CancellationToken.None));
+        string[] leftovers = Directory.Exists(_root)
+            ? Directory.GetFiles(_root, "*", SearchOption.AllDirectories)
+            : Array.Empty<string>();
+        Assert.DoesNotContain(leftovers, f => f.Contains(".tmp", StringComparison.Ordinal));
+
+        // A later, uncanceled writer can still claim the slot.
+        Assert.True(await _backend.PutIfAbsentAsync(key, new byte[] { 5 }, CancellationToken.None));
+    }
+
+    [Theory]
+    [InlineData("../escape.bin")]
+    [InlineData("nested/../../escape.bin")]
+    public async Task PathConfinement_EnforcedOnEveryBackendMethod(string escape)
+    {
+        await AssertNotConfinedAsync(() => _backend.PutIfAbsentAsync(escape, new byte[] { 0 }, CancellationToken.None).AsTask());
+        await AssertNotConfinedAsync(() => _backend.OpenReadAsync(escape, CancellationToken.None).AsTask());
+        await AssertNotConfinedAsync(() => _backend.OpenWriteAsync(escape, CancellationToken.None).AsTask());
+        await AssertNotConfinedAsync(() => _backend.ReadRangeAsync(escape, 0, 1, CancellationToken.None).AsTask());
+        await AssertNotConfinedAsync(() => _backend.DeleteAsync(escape, CancellationToken.None).AsTask());
+        await AssertNotConfinedAsync(() => _backend.HeadAsync(escape, CancellationToken.None).AsTask());
+        await AssertNotConfinedAsync(async () =>
+        {
+            await foreach (StorageObjectInfo _ in _backend.ListAsync(escape, CancellationToken.None))
+            {
+            }
+        });
+    }
+
+    private static async Task AssertNotConfinedAsync(Func<Task> action)
+    {
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(action);
+        Assert.Equal(StorageErrorKind.PathNotConfined, error.Kind);
+    }
+
+    [Fact]
+    public async Task Symlink_EscapingRoot_IsRejected()
+    {
+        // A symlink INSIDE the root whose real target escapes the root must be rejected (M4), closing
+        // the lexical-confinement gap where "safe/link.bin" canonicalizes outside the table root.
+        string outsideDir = Path.Combine(Path.GetDirectoryName(_root)!, $"{Path.GetFileName(_root)}-outside");
+        Directory.CreateDirectory(outsideDir);
+        string outsideFile = Path.Combine(outsideDir, "secret.bin");
+        await File.WriteAllBytesAsync(outsideFile, new byte[] { 42 });
+
+        Directory.CreateDirectory(_root);
+        string linkPath = Path.Combine(_root, "escape-link.bin");
+        try
+        {
+            File.CreateSymbolicLink(linkPath, outsideFile);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            // Symlink creation is unprivileged on this platform/run — the guard cannot be exercised here.
+            Directory.Delete(outsideDir, recursive: true);
+            return;
+        }
+
+        try
+        {
+            DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+                async () => await _backend.OpenReadAsync("escape-link.bin", CancellationToken.None));
+            Assert.Equal(StorageErrorKind.PathNotConfined, error.Kind);
+        }
+        finally
+        {
+            Directory.Delete(outsideDir, recursive: true);
+        }
     }
 
     [Fact]

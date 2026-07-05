@@ -27,8 +27,11 @@ internal interface IStorageBackend
     ValueTask<Stream> OpenReadAsync(string path, CancellationToken cancellationToken);
 
     /// <summary>Opens a staged write stream for <paramref name="path"/>. The bytes are written to a
-    /// temporary object, durably flushed, and atomically published to <paramref name="path"/> when the
-    /// returned stream is disposed (design §2.13.2 "write to temp + fsync + rename").</summary>
+    /// temporary object and are <b>published atomically only when the caller signals success</b> — the
+    /// returned stream implements <see cref="ICompletableWriteStream"/>, and the caller must invoke
+    /// <see cref="ICompletableWriteStream.CompleteAsync"/> after a successful write. Disposing the
+    /// stream <b>without</b> completing (a faulted/abandoned write) discards the staged bytes and never
+    /// publishes a partial/torn destination (design §2.13.2 "write to temp + fsync + rename").</summary>
     /// <exception cref="DeltaStorageException">The path escapes the root.</exception>
     ValueTask<Stream> OpenWriteAsync(string path, CancellationToken cancellationToken);
 

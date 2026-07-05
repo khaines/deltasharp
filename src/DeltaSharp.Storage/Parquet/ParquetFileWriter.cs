@@ -15,8 +15,9 @@ namespace DeltaSharp.Storage.Parquet;
 /// </summary>
 internal sealed class ParquetFileWriter
 {
-    /// <summary>The default maximum number of logical rows per row group (a row-count proxy for the
-    /// design's ≈128&#160;MiB target; §2.9.2).</summary>
+    /// <summary>The default maximum number of logical rows per row group. This is a <b>row-count
+    /// proxy</b> for the design's ≈128&#160;MiB byte target (§2.9.2): a byte-aware flush that sizes row
+    /// groups by encoded bytes directly (rather than by row count) is a tracked follow-up.</summary>
     public const int DefaultRowGroupRowLimit = 128 * 1024;
 
     private const string WriterIdentity = "DeltaSharp.Storage/0.1";
@@ -55,10 +56,12 @@ internal sealed class ParquetFileWriter
             fields[c] = ParquetTypeMapping.CreateField(schema[c]);
         }
 
-        // Apply any selection once, and build the flat logical-row map across all batches so row groups
-        // can be sized independently of the input batch boundaries.
+        // Apply any selection once and record each batch's logical row count, so row groups can be sized
+        // independently of the input batch boundaries with a running cursor — no O(total-rows) per-row
+        // index is materialized (M5).
         var selectedColumns = new List<ColumnVector[]>(batches.Count);
-        var rowMap = new List<(int Batch, int Row)>();
+        var batchRowCounts = new int[batches.Count];
+        long totalRows = 0;
         for (int b = 0; b < batches.Count; b++)
         {
             ColumnBatch batch = batches[b] ?? throw new ArgumentNullException(nameof(batches), $"Batch {b} is null.");
@@ -76,10 +79,8 @@ internal sealed class ParquetFileWriter
             }
 
             selectedColumns.Add(columns);
-            for (int r = 0; r < batch.LogicalRowCount; r++)
-            {
-                rowMap.Add((b, r));
-            }
+            batchRowCounts[b] = batch.LogicalRowCount;
+            totalRows += batch.LogicalRowCount;
         }
 
         var metadata = new Dictionary<string, string>(StringComparer.Ordinal)
@@ -93,21 +94,61 @@ internal sealed class ParquetFileWriter
                 .ConfigureAwait(false);
         writer.CustomMetadata = metadata;
 
-        int start = 0;
-        do
+        // L2: a pre-test loop, so zero input rows produce ZERO row groups (never one empty group).
+        int cursorBatch = 0;
+        int cursorRow = 0;
+        long emitted = 0;
+        var segments = new List<Segment>();
+        while (emitted < totalRows)
         {
-            int size = Math.Min(_rowGroupRowLimit, rowMap.Count - start);
+            int size = (int)Math.Min(_rowGroupRowLimit, totalRows - emitted);
+            CollectSegments(batchRowCounts, ref cursorBatch, ref cursorRow, size, segments);
+
             using ParquetRowGroupWriter rowGroup = writer.CreateRowGroup();
             for (int c = 0; c < columnCount; c++)
             {
                 await WriteColumnAsync(
-                    rowGroup, fields[c], schema[c], selectedColumns, c, rowMap, start, size, cancellationToken)
+                    rowGroup, fields[c], schema[c], selectedColumns, c, segments, size, cancellationToken)
                     .ConfigureAwait(false);
             }
 
-            start += size;
+            emitted += size;
         }
-        while (start < rowMap.Count);
+    }
+
+    // Advance the (batch, row) cursor by exactly `size` logical rows, recording the contiguous
+    // (batch, start, length) segments spanned — which lets a row group straddle input batch boundaries
+    // without a per-row index. Empty batches are skipped.
+    private static void CollectSegments(
+        int[] batchRowCounts, ref int cursorBatch, ref int cursorRow, int size, List<Segment> segments)
+    {
+        segments.Clear();
+        int need = size;
+        int b = cursorBatch;
+        int r = cursorRow;
+        while (need > 0)
+        {
+            int available = batchRowCounts[b] - r;
+            if (available <= 0)
+            {
+                b++;
+                r = 0;
+                continue;
+            }
+
+            int take = Math.Min(available, need);
+            segments.Add(new Segment(b, r, take));
+            r += take;
+            need -= take;
+            if (r >= batchRowCounts[b])
+            {
+                b++;
+                r = 0;
+            }
+        }
+
+        cursorBatch = b;
+        cursorRow = r;
     }
 
     private static async Task WriteColumnAsync(
@@ -116,8 +157,7 @@ internal sealed class ParquetFileWriter
         StructField schemaField,
         List<ColumnVector[]> selectedColumns,
         int columnIndex,
-        List<(int Batch, int Row)> rowMap,
-        int start,
+        List<Segment> segments,
         int size,
         CancellationToken cancellationToken)
     {
@@ -125,55 +165,57 @@ internal sealed class ParquetFileWriter
         switch (schemaField.DataType)
         {
             case BooleanType:
-                await WriteValueAsync<bool>(rowGroup, field, nullable, selectedColumns, columnIndex, rowMap, start, size,
+                await WriteValueAsync<bool>(rowGroup, field, nullable, selectedColumns, columnIndex, segments, size,
                     static (vector, row) => vector.GetValue<bool>(row), cancellationToken).ConfigureAwait(false);
                 break;
             case ByteType:
-                await WriteValueAsync<sbyte>(rowGroup, field, nullable, selectedColumns, columnIndex, rowMap, start, size,
+                await WriteValueAsync<sbyte>(rowGroup, field, nullable, selectedColumns, columnIndex, segments, size,
                     static (vector, row) => unchecked((sbyte)vector.GetValue<byte>(row)), cancellationToken)
                     .ConfigureAwait(false);
                 break;
             case ShortType:
-                await WriteValueAsync<short>(rowGroup, field, nullable, selectedColumns, columnIndex, rowMap, start, size,
+                await WriteValueAsync<short>(rowGroup, field, nullable, selectedColumns, columnIndex, segments, size,
                     static (vector, row) => vector.GetValue<short>(row), cancellationToken).ConfigureAwait(false);
                 break;
             case IntegerType:
-                await WriteValueAsync<int>(rowGroup, field, nullable, selectedColumns, columnIndex, rowMap, start, size,
+                await WriteValueAsync<int>(rowGroup, field, nullable, selectedColumns, columnIndex, segments, size,
                     static (vector, row) => vector.GetValue<int>(row), cancellationToken).ConfigureAwait(false);
                 break;
             case LongType:
-                await WriteValueAsync<long>(rowGroup, field, nullable, selectedColumns, columnIndex, rowMap, start, size,
+                await WriteValueAsync<long>(rowGroup, field, nullable, selectedColumns, columnIndex, segments, size,
                     static (vector, row) => vector.GetValue<long>(row), cancellationToken).ConfigureAwait(false);
                 break;
             case FloatType:
-                await WriteValueAsync<float>(rowGroup, field, nullable, selectedColumns, columnIndex, rowMap, start, size,
+                await WriteValueAsync<float>(rowGroup, field, nullable, selectedColumns, columnIndex, segments, size,
                     static (vector, row) => vector.GetValue<float>(row), cancellationToken).ConfigureAwait(false);
                 break;
             case DoubleType:
-                await WriteValueAsync<double>(rowGroup, field, nullable, selectedColumns, columnIndex, rowMap, start, size,
+                await WriteValueAsync<double>(rowGroup, field, nullable, selectedColumns, columnIndex, segments, size,
                     static (vector, row) => vector.GetValue<double>(row), cancellationToken).ConfigureAwait(false);
                 break;
             case DateType:
-                await WriteValueAsync<DateTime>(rowGroup, field, nullable, selectedColumns, columnIndex, rowMap, start, size,
+                await WriteValueAsync<DateTime>(rowGroup, field, nullable, selectedColumns, columnIndex, segments, size,
                     static (vector, row) => ParquetTypeMapping.EpochDayToDateTime(vector.GetValue<int>(row)),
                     cancellationToken).ConfigureAwait(false);
                 break;
             case TimestampType:
-                await WriteValueAsync<DateTime>(rowGroup, field, nullable, selectedColumns, columnIndex, rowMap, start, size,
+                await WriteValueAsync<DateTime>(rowGroup, field, nullable, selectedColumns, columnIndex, segments, size,
                     static (vector, row) => ParquetTypeMapping.EpochMicrosToDateTime(vector.GetValue<long>(row)),
                     cancellationToken).ConfigureAwait(false);
                 break;
             case DecimalType decimalType:
-                await WriteValueAsync<decimal>(rowGroup, field, nullable, selectedColumns, columnIndex, rowMap, start, size,
-                    (vector, row) => ParquetTypeMapping.ReadDecimal(vector, decimalType, row), cancellationToken)
-                    .ConfigureAwait(false);
+                // L1: thread decimalType through a non-capturing static writer instead of a closure so no
+                // per-column-chunk delegate allocation occurs (mirrors the static primitive delegates).
+                await WriteDecimalAsync(
+                    rowGroup, field, nullable, selectedColumns, columnIndex, segments, size, decimalType,
+                    cancellationToken).ConfigureAwait(false);
                 break;
             case StringType:
-                await WriteStringAsync(rowGroup, field, nullable, selectedColumns, columnIndex, rowMap, start, size)
+                await WriteStringAsync(rowGroup, field, nullable, selectedColumns, columnIndex, segments, size)
                     .ConfigureAwait(false);
                 break;
             case BinaryType:
-                await WriteBinaryAsync(rowGroup, field, nullable, selectedColumns, columnIndex, rowMap, start, size)
+                await WriteBinaryAsync(rowGroup, field, nullable, selectedColumns, columnIndex, segments, size)
                     .ConfigureAwait(false);
                 break;
             default:
@@ -189,8 +231,7 @@ internal sealed class ParquetFileWriter
         bool nullable,
         List<ColumnVector[]> selectedColumns,
         int columnIndex,
-        List<(int Batch, int Row)> rowMap,
-        int start,
+        List<Segment> segments,
         int size,
         Func<ColumnVector, int, T> read,
         CancellationToken cancellationToken)
@@ -199,11 +240,15 @@ internal sealed class ParquetFileWriter
         if (nullable)
         {
             var values = new T?[size];
-            for (int i = 0; i < size; i++)
+            int idx = 0;
+            foreach (Segment segment in segments)
             {
-                (int batch, int row) = rowMap[start + i];
-                ColumnVector vector = selectedColumns[batch][columnIndex];
-                values[i] = vector.IsNull(row) ? null : read(vector, row);
+                ColumnVector vector = selectedColumns[segment.Batch][columnIndex];
+                for (int j = 0; j < segment.Length; j++)
+                {
+                    int row = segment.Start + j;
+                    values[idx++] = vector.IsNull(row) ? null : read(vector, row);
+                }
             }
 
             await rowGroup.WriteAsync<T>(field, new ReadOnlyMemory<T?>(values), null, null, cancellationToken)
@@ -212,20 +257,77 @@ internal sealed class ParquetFileWriter
         else
         {
             var values = new T[size];
-            for (int i = 0; i < size; i++)
+            int idx = 0;
+            foreach (Segment segment in segments)
             {
-                (int batch, int row) = rowMap[start + i];
-                ColumnVector vector = selectedColumns[batch][columnIndex];
-                if (vector.IsNull(row))
+                ColumnVector vector = selectedColumns[segment.Batch][columnIndex];
+                for (int j = 0; j < segment.Length; j++)
                 {
-                    throw DeltaStorageException.CorruptData(
-                        $"Non-nullable column '{field.Name}' holds a null at row {row}.");
-                }
+                    int row = segment.Start + j;
+                    if (vector.IsNull(row))
+                    {
+                        throw DeltaStorageException.CorruptData(
+                            $"Non-nullable column '{field.Name}' holds a null at row {row}.");
+                    }
 
-                values[i] = read(vector, row);
+                    values[idx++] = read(vector, row);
+                }
             }
 
             await rowGroup.WriteAsync<T>(field, new ReadOnlyMemory<T>(values), null, null, cancellationToken)
+                .ConfigureAwait(false);
+        }
+    }
+
+    private static async Task WriteDecimalAsync(
+        ParquetRowGroupWriter rowGroup,
+        DataField field,
+        bool nullable,
+        List<ColumnVector[]> selectedColumns,
+        int columnIndex,
+        List<Segment> segments,
+        int size,
+        DecimalType decimalType,
+        CancellationToken cancellationToken)
+    {
+        if (nullable)
+        {
+            var values = new decimal?[size];
+            int idx = 0;
+            foreach (Segment segment in segments)
+            {
+                ColumnVector vector = selectedColumns[segment.Batch][columnIndex];
+                for (int j = 0; j < segment.Length; j++)
+                {
+                    int row = segment.Start + j;
+                    values[idx++] = vector.IsNull(row) ? null : ParquetTypeMapping.ReadDecimal(vector, decimalType, row);
+                }
+            }
+
+            await rowGroup.WriteAsync<decimal>(field, new ReadOnlyMemory<decimal?>(values), null, null, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        else
+        {
+            var values = new decimal[size];
+            int idx = 0;
+            foreach (Segment segment in segments)
+            {
+                ColumnVector vector = selectedColumns[segment.Batch][columnIndex];
+                for (int j = 0; j < segment.Length; j++)
+                {
+                    int row = segment.Start + j;
+                    if (vector.IsNull(row))
+                    {
+                        throw DeltaStorageException.CorruptData(
+                            $"Non-nullable column '{field.Name}' holds a null at row {row}.");
+                    }
+
+                    values[idx++] = ParquetTypeMapping.ReadDecimal(vector, decimalType, row);
+                }
+            }
+
+            await rowGroup.WriteAsync<decimal>(field, new ReadOnlyMemory<decimal>(values), null, null, cancellationToken)
                 .ConfigureAwait(false);
         }
     }
@@ -236,23 +338,26 @@ internal sealed class ParquetFileWriter
         bool nullable,
         List<ColumnVector[]> selectedColumns,
         int columnIndex,
-        List<(int Batch, int Row)> rowMap,
-        int start,
+        List<Segment> segments,
         int size)
     {
         var values = new string?[size];
-        for (int i = 0; i < size; i++)
+        int idx = 0;
+        foreach (Segment segment in segments)
         {
-            (int batch, int row) = rowMap[start + i];
-            ColumnVector vector = selectedColumns[batch][columnIndex];
-            if (vector.IsNull(row))
+            ColumnVector vector = selectedColumns[segment.Batch][columnIndex];
+            for (int j = 0; j < segment.Length; j++)
             {
-                EnsureNullable(nullable, field, row);
-                values[i] = null;
-            }
-            else
-            {
-                values[i] = System.Text.Encoding.UTF8.GetString(vector.GetBytes(row));
+                int row = segment.Start + j;
+                if (vector.IsNull(row))
+                {
+                    EnsureNullable(nullable, field, row);
+                    values[idx++] = null;
+                }
+                else
+                {
+                    values[idx++] = System.Text.Encoding.UTF8.GetString(vector.GetBytes(row));
+                }
             }
         }
 
@@ -265,23 +370,26 @@ internal sealed class ParquetFileWriter
         bool nullable,
         List<ColumnVector[]> selectedColumns,
         int columnIndex,
-        List<(int Batch, int Row)> rowMap,
-        int start,
+        List<Segment> segments,
         int size)
     {
         var values = new byte[]?[size];
-        for (int i = 0; i < size; i++)
+        int idx = 0;
+        foreach (Segment segment in segments)
         {
-            (int batch, int row) = rowMap[start + i];
-            ColumnVector vector = selectedColumns[batch][columnIndex];
-            if (vector.IsNull(row))
+            ColumnVector vector = selectedColumns[segment.Batch][columnIndex];
+            for (int j = 0; j < segment.Length; j++)
             {
-                EnsureNullable(nullable, field, row);
-                values[i] = null;
-            }
-            else
-            {
-                values[i] = vector.GetBytes(row).ToArray();
+                int row = segment.Start + j;
+                if (vector.IsNull(row))
+                {
+                    EnsureNullable(nullable, field, row);
+                    values[idx++] = null;
+                }
+                else
+                {
+                    values[idx++] = vector.GetBytes(row).ToArray();
+                }
             }
         }
 
@@ -295,5 +403,22 @@ internal sealed class ParquetFileWriter
             throw DeltaStorageException.CorruptData(
                 $"Non-nullable column '{field.Name}' holds a null at row {row}.");
         }
+    }
+
+    // A contiguous run of logical rows within a single input batch that a row group covers.
+    private readonly struct Segment
+    {
+        internal Segment(int batch, int start, int length)
+        {
+            Batch = batch;
+            Start = start;
+            Length = length;
+        }
+
+        internal int Batch { get; }
+
+        internal int Start { get; }
+
+        internal int Length { get; }
     }
 }
