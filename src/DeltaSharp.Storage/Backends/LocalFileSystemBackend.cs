@@ -374,7 +374,19 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
                     return Directory.Exists(enumerationRoot)
                         ? Directory.GetFiles(
                             enumerationRoot, "*",
-                            new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true })
+                            new EnumerationOptions
+                            {
+                                RecurseSubdirectories = true,
+                                IgnoreInaccessible = true,
+                                // A fresh EnumerationOptions defaults AttributesToSkip = Hidden|System and
+                                // MatchType = Simple; the replaced SearchOption.AllDirectories overload used
+                                // None/Win32. Restore both so listing keeps base semantics -- otherwise
+                                // dot/hidden entries are silently dropped AND a non-zero AttributesToSkip
+                                // forces a per-entry stat (a ~4x LIST syscall storm on Unix, the very
+                                // per-entry-syscall class the RF-1 memoization defends against).
+                                AttributesToSkip = FileAttributes.None,
+                                MatchType = MatchType.Win32,
+                            })
                         : Array.Empty<string>();
                 },
                 cancellationToken).ConfigureAwait(false);
@@ -421,6 +433,12 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
                 ListDirectoryResolveProbe?.Invoke(directory);
                 try
                 {
+                    Func<string, Exception?>? faultHook = IoFaultHook;
+                    if (faultHook?.Invoke("list-canon") is { } fault)
+                    {
+                        throw fault;
+                    }
+
                     realDirectory = CanonicalizeExisting(directory);
                 }
                 catch (IOException)
@@ -453,7 +471,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
                 entry = new StorageObjectInfo(
                     ToRelativeReal(realFile), info.Length, info.LastWriteTimeUtc, MakeETag(info));
             }
-            catch (Exception ex) when (ex is FileNotFoundException or IOException)
+            catch (Exception ex) when (ex is FileNotFoundException or IOException or UnauthorizedAccessException)
             {
                 // S3: the object vanished between enumeration and this metadata read (a delete race), so
                 // its FileInfo throws FileNotFoundException; skip it rather than leak a raw path.
@@ -959,6 +977,12 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         {
             try
             {
+                Func<string, Exception?>? faultHook = LocalFileSystemBackend.IoFaultHook;
+                if (faultHook?.Invoke("write") is { } fault)
+                {
+                    throw fault;
+                }
+
                 _inner.Write(buffer, offset, count);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -971,6 +995,12 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         {
             try
             {
+                Func<string, Exception?>? faultHook = LocalFileSystemBackend.IoFaultHook;
+                if (faultHook?.Invoke("write") is { } fault)
+                {
+                    throw fault;
+                }
+
                 _inner.Write(buffer);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -1002,6 +1032,12 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         {
             try
             {
+                Func<string, Exception?>? faultHook = LocalFileSystemBackend.IoFaultHook;
+                if (faultHook?.Invoke("write") is { } fault)
+                {
+                    throw fault;
+                }
+
                 await _inner.WriteAsync(buffer.AsMemory(offset, count), cancellationToken).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)

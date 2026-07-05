@@ -891,6 +891,147 @@ public sealed class LocalFileSystemBackendTests : IDisposable
     }
 
     [Fact]
+    public async Task ReadIoFault_ViaIoFaultHook_DoesNotLeakAbsolutePath()
+    {
+        // Quality: the ReadRangeAsync ReadExactlyAsync ("read-io") sanitizer is made non-vacuous. A
+        // root-bearing exception injected at "read-io" must surface a DeltaStorageException root-free.
+        await _backend.PutIfAbsentAsync("logs/ri.json", new byte[] { 1, 2, 3 }, CancellationToken.None);
+
+        LocalFileSystemBackend.IoFaultHook = tag => tag == "read-io"
+            ? new IOException($"io failure '{Path.Combine(_root, "logs", "ri.json")}'")
+            : null;
+        try
+        {
+            DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+                () => _backend.ReadRangeAsync("logs/ri.json", 0, 3, CancellationToken.None).AsTask());
+            Assert.DoesNotContain(_root, error.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(_root, error.ToString(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            LocalFileSystemBackend.IoFaultHook = null;
+        }
+    }
+
+    [Fact]
+    public async Task StagedStreamWriteAndFlushOverloads_FaultViaIoFaultHook_DoNotLeakAbsolutePath()
+    {
+        // Quality: EACH StagedWriteStream write/flush override -- sync Write(byte[]), sync Write(span),
+        // legacy WriteAsync(byte[]), and sync Flush() -- routes a faulting IO through Sanitize; a root-
+        // bearing exception injected via IoFaultHook must surface a DeltaStorageException root-free.
+        LocalFileSystemBackend.IoFaultHook = tag => tag is "write" or "flush"
+            ? new IOException($"io failure '{Path.Combine(_root, "part.tmp")}'")
+            : null;
+        try
+        {
+            await AssertOverloadSanitizes("wa.bin", s => s.Write(new byte[] { 1 }, 0, 1));
+            await AssertOverloadSanitizes("wb.bin", s => s.Write(new byte[] { 1 }.AsSpan()));
+            await AssertOverloadSanitizes("wc.bin", s => s.Flush());
+            await AssertOverloadSanitizesAsync("wd.bin", s => s.WriteAsync(new byte[] { 1 }, 0, 1));
+        }
+        finally
+        {
+            LocalFileSystemBackend.IoFaultHook = null;
+        }
+
+        async Task AssertOverloadSanitizes(string key, Action<Stream> op)
+        {
+            Stream s = await _backend.OpenWriteAsync(key, CancellationToken.None);
+            await using (s.ConfigureAwait(false))
+            {
+                var error = Assert.Throws<DeltaStorageException>(() => op(s));
+                Assert.DoesNotContain(_root, error.Message, StringComparison.Ordinal);
+                Assert.DoesNotContain(_root, error.ToString(), StringComparison.Ordinal);
+            }
+        }
+
+        async Task AssertOverloadSanitizesAsync(string key, Func<Stream, Task> op)
+        {
+            Stream s = await _backend.OpenWriteAsync(key, CancellationToken.None);
+            await using (s.ConfigureAwait(false))
+            {
+                DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(() => op(s));
+                Assert.DoesNotContain(_root, error.Message, StringComparison.Ordinal);
+                Assert.DoesNotContain(_root, error.ToString(), StringComparison.Ordinal);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task ListCanonFault_ViaIoFaultHook_SkipsEntryWithoutLeaking()
+    {
+        // Quality/S1: an ELOOP resolving an entry's ancestor directory ("list-canon") skips the entry
+        // fail-closed (never leaks, never aborts the listing). Non-vacuous: removing the catch/continue
+        // lets the injected exception escape the iterator.
+        await _backend.PutIfAbsentAsync("lc/only.bin", new byte[] { 1 }, CancellationToken.None);
+
+        LocalFileSystemBackend.IoFaultHook = tag => tag == "list-canon"
+            ? new IOException($"Too many levels of symbolic links in '{Path.Combine(_root, "lc")}'")
+            : null;
+        var paths = new List<string>();
+        try
+        {
+            await foreach (StorageObjectInfo info in _backend.ListAsync("lc/", CancellationToken.None))
+            {
+                paths.Add(info.Path);
+            }
+        }
+        finally
+        {
+            LocalFileSystemBackend.IoFaultHook = null;
+        }
+
+        Assert.Empty(paths); // the sole entry's ancestor canonicalization faulted → skipped, not surfaced
+    }
+
+    [Fact]
+    public async Task ListMetaFault_UnauthorizedAccess_SkipsEntryWithoutLeaking()
+    {
+        // Balanced: a mid-listing PERMISSION race (UnauthorizedAccessException, which is NOT an
+        // IOException) on the metadata read must be skipped fail-closed, not leak the absolute path.
+        // Non-vacuous: dropping "or UnauthorizedAccessException" from the list-meta filter lets it escape.
+        await _backend.PutIfAbsentAsync("lu/only.bin", new byte[] { 1 }, CancellationToken.None);
+
+        LocalFileSystemBackend.IoFaultHook = tag => tag == "list-meta"
+            ? new UnauthorizedAccessException($"denied '{Path.Combine(_root, "lu", "only.bin")}'")
+            : null;
+        var paths = new List<string>();
+        try
+        {
+            await foreach (StorageObjectInfo info in _backend.ListAsync("lu/", CancellationToken.None))
+            {
+                paths.Add(info.Path);
+            }
+        }
+        finally
+        {
+            LocalFileSystemBackend.IoFaultHook = null;
+        }
+
+        Assert.Empty(paths);
+    }
+
+    [Fact]
+    public async Task List_IncludesDotAndHiddenEntries()
+    {
+        // Architect/Performance regression guard: EnumerationOptions must NOT inherit the default
+        // AttributesToSkip = Hidden|System (which silently drops dot/hidden entries AND forces a per-entry
+        // stat). A dot-prefixed object must be surfaced by a listing, matching the base SearchOption
+        // behavior. Non-vacuous: reverting to the default AttributesToSkip drops ".hidden.crc".
+        await _backend.PutIfAbsentAsync("d/.hidden.crc", new byte[] { 1 }, CancellationToken.None);
+        await _backend.PutIfAbsentAsync("d/visible.json", new byte[] { 2 }, CancellationToken.None);
+
+        var paths = new List<string>();
+        await foreach (StorageObjectInfo info in _backend.ListAsync("d/", CancellationToken.None))
+        {
+            paths.Add(info.Path);
+        }
+
+        Assert.Contains("d/.hidden.crc", paths); // dot/hidden entry not dropped
+        Assert.Contains("d/visible.json", paths);
+    }
+
+    [Fact]
     public void BuildTempName_IncludesSanitizedMachineNameForCrossPodUniqueness()
     {
         // CF-4: the temp name embeds the (sanitized) pod hostname so two pods with identical PIDs on a
