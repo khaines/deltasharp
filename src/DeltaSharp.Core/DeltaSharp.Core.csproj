@@ -14,14 +14,9 @@
     <Description>Public API surface for DeltaSharp, a .NET-native reimplementation of Apache Spark. M1 skeleton — no engine or Delta behavior yet.</Description>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
-    <!-- ADR-0014: keep the public surface trim/AOT-annotation-clean. Enable the
-         trim/AOT/single-file Roslyn analyzers as a standing build gate on both TFMs.
-         We enable the analyzers rather than IsAotCompatible/IsTrimmable so the
-         SDK-version-tied Microsoft.NET.ILLink.Tasks package is not pulled into the
-         committed lock file; actual AOT publish verification is STORY-01.4.1. -->
-    <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
-    <EnableAotAnalyzer>true</EnableAotAnalyzer>
-    <EnableSingleFileAnalyzer>true</EnableSingleFileAnalyzer>
+    <!-- ADR-0014: keep the public surface trim/AOT-annotation-clean. The trim/AOT/single-file
+         Roslyn analyzers are wired centrally in Directory.Build.props for every src/ production
+         assembly (so no project can drift). -->
   </PropertyGroup>
 
   <!-- Pack the package README at the .nupkg root (referenced by PackageReadmeFile above).

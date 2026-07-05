@@ -76,6 +76,22 @@
     <DeltaSharpTracksPublicApi Condition="'$(MSBuildProjectName)' == 'DeltaSharp.Core' Or '$(MSBuildProjectName)' == 'DeltaSharp.Abstractions'">true</DeltaSharpTracksPublicApi>
   </PropertyGroup>
 
+  <!-- Trim / AOT / single-file analyzers on EVERY production assembly under src/
+       (DeltaSharp.Abstractions, DeltaSharp.Core, DeltaSharp.Engine, DeltaSharp.Executor),
+       wired centrally here so no project can drift (ADR-0014). They surface
+       IL2xxx/IL3xxx dataflow warnings which — under the repository-wide
+       TreatWarningsAsErrors above — fail the build, standing enforcement of the AOT
+       posture. We enable the ANALYZERS (not IsAotCompatible/IsTrimmable) deliberately so
+       the SDK-version-tied Microsoft.NET.ILLink.Tasks package is never pulled into the
+       committed lock files; a real AOT publish is verified separately by aot.yml. Scoped to
+       src/ via the DeltaSharpIsProductionAssembly gate set above — test projects are excluded
+       (they legitimately use reflection/dynamic code). -->
+  <PropertyGroup Condition="'$(DeltaSharpIsProductionAssembly)' == 'true'">
+    <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
+    <EnableAotAnalyzer>true</EnableAotAnalyzer>
+    <EnableSingleFileAnalyzer>true</EnableSingleFileAnalyzer>
+  </PropertyGroup>
+
   <!-- BannedApiAnalyzers on production assemblies (Core, Abstractions, Engine, Executor). The categorized
        ban list lives at the repo root and is shared by every production assembly. -->
   <ItemGroup Condition="'$(DeltaSharpIsProductionAssembly)' == 'true'">

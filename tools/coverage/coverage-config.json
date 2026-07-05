@@ -1,0 +1,60 @@
+{
+  "_comment": [
+    "Coverage gate configuration (FEAT-00.2 / STORY-00.2.3, #106). SINGLE SOURCE OF TRUTH",
+    "for the enforced line-coverage threshold, the expected-assembly provenance allowlist, and",
+    "the ratcheting policy. Read by tools/coverage/coverage-gate.py, which the CI 'coverage' job",
+    "runs after collecting coverage (a separate job from 'build-test-format'; see quality-gates.md).",
+    "Prose policy lives in docs/engineering/design/quality-gates.md; the numbers here are what",
+    "is actually enforced."
+  ],
+  "minimumLineCoverage": 87.0,
+  "expectedAssemblies": [
+    "DeltaSharp.Abstractions",
+    "DeltaSharp.Core",
+    "DeltaSharp.Engine",
+    "DeltaSharp.Executor"
+  ],
+  "expectedAssembliesNotes": [
+    "FAIL-CLOSED provenance allowlist — the EXACT set of production assemblies (symmetric).",
+    "Every production assembly listed here MUST appear in the merged Cobertura report set with",
+    "measurable lines; if any is ABSENT (a lost/crashed/dropped test suite, or a report deleted to",
+    "game the number) the gate EXITS NON-ZERO naming the missing assembly, rather than letting it",
+    "silently drop out of the denominator and inflate coverage. Symmetrically, any UNEXPECTED",
+    "assembly present in the reports (a planted/leaked or trivially-100%-covered package) also",
+    "FAILS the gate — an out-of-allowlist assembly must not dilute or inflate the aggregate — and",
+    "coverage is computed over ONLY this allowlisted set so no extra package can move the number.",
+    "Add a new src/ production assembly here when it lands (a deliberate governance event, like the",
+    "PublicAPI baseline) so its coverage is measured and it is not rejected as unexpected."
+  ],
+  "ratchetPolicy": "monotonic-non-decreasing",
+  "ratchetNotes": [
+    "The threshold only ever goes UP. When a PR raises measured coverage with real headroom",
+    "over the current floor, bump minimumLineCoverage toward (but not above) the measured",
+    "value in the same or a follow-up PR so the gain cannot silently erode later. Never lower",
+    "this number to make a red build pass; fix the tests instead. The gate prints a ratchet",
+    "suggestion when headroom exceeds 'ratchetSuggestSlack'.",
+    "Floor 87.0 set for FEAT-00.2 against a measured merged 89.16% (see quality-gates.md): a ~2-point",
+    "buffer below the locally-measured value absorbs cross-platform variance (local arm64/macOS vs CI",
+    "x64/Linux) and run-to-run nondeterminism, so the gate flags genuine regressions rather than noise",
+    "AND actively guards the 85->89 range that a wider buffer left unenforced. Ratchet upward toward",
+    "the CI-observed value."
+  ],
+  "ratchetOverride": {
+    "policy": "A floor DECREASE is permitted ONLY when it is tied to CODE REMOVAL that deleted",
+    "policyCont": "well-tested code (which legitimately lowers the measured percentage). Any decrease MUST",
+    "policyCont2": "record its justification here (the removed component + the PR/issue) so a genuine dip is",
+    "policyCont3": "not mistaken for a regression, and so the decrease is auditable. Absent code removal, the",
+    "policyCont4": "floor is monotonic non-decreasing — add or fix tests instead of lowering it.",
+    "decreases": []
+  },
+  "ratchetSuggestSlack": 1.5,
+  "metric": "line",
+  "measurement": {
+    "tool": "coverlet.collector",
+    "reportFormat": "cobertura",
+    "mergeSemantics": "A production line is covered if hits > 0 in ANY report; totals are the union of distinct (file, line) pairs across all reports, so multi-TFM runs of the same assembly are de-duplicated rather than double-counted.",
+    "includedAssemblies": "[DeltaSharp.*] (production assemblies)",
+    "excludedAssemblies": "[*.Tests] test projects and [DeltaSharp.Samples.*] example apps, plus any assembly/member marked [ExcludeFromCodeCoverage] / [GeneratedCode] / [CompilerGenerated] (see coverlet.runsettings)",
+    "testSupportCaveat": "The [*.Tests] exclusion keys on the '.Tests' assembly-name suffix. A test-SUPPORT assembly that does NOT end in '.Tests' (e.g. a shared 'DeltaSharp.TestFixtures' helper) would match [DeltaSharp.*] and leak into the denominator. If such an assembly is added, exclude it explicitly in coverlet.runsettings (e.g. [DeltaSharp.TestFixtures]*) or name it with a '.Tests'-matching suffix."
+  }
+}
