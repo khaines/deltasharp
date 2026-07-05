@@ -486,10 +486,21 @@ def _selftest() -> int:
           raises(lambda: run_missing("report", report_with("High"), policy_with([]))))
     check("missing policy file fails closed",
           raises(lambda: run_missing("policy", report_with("High"), policy_with([]))))
-    # (f) A malformed expectedProjects knob fails closed (config guard).
-    check("malformed expectedProjects rejected",
-          raises(lambda: run(report_projects(["A.csproj"]),
-                             dict(policy_with([]), expectedProjects=[""]))))
+    # (f) A malformed 'expectedProjects' knob (wrong TYPE — a JSON object, not an array of
+    #     names) fails closed at config-validation time. This case UNIQUELY pins
+    #     _validate_expected_projects: the report lists BOTH real projects (A, B), so the
+    #     provenance empty-branch passes AND — because the malformed value's members (its keys
+    #     "A"/"B") are all present — the provenance missing-branch also runs and passes. Thus
+    #     ONLY the config guard (expectedProjects must be a list) can reject this input. (A
+    #     list with a malformed element, e.g. [""], would be double-covered: an empty/blank
+    #     name is never a present project name, so check_provenance's missing-branch would
+    #     ALSO reject it, making it vacuous as a pin of the config guard.) Non-vacuity:
+    #     neutering _validate_expected_projects alone reddens THIS case in isolation, because
+    #     provenance no longer masks a non-list expectedProjects.
+    check("malformed expectedProjects (non-list) rejected",
+          raises(lambda: run(report_projects(["A.csproj", "B.csproj"]),
+                             dict(policy_with([]),
+                                  expectedProjects={"A": True, "B": True}))))
 
     print()
     if failures:

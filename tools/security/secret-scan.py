@@ -58,7 +58,7 @@ _DETECTORS: dict[str, re.Pattern[str]] = {
     "deltasharp-test-canary": re.compile(r"DELTASHARP_TEST_SECRET_[0-9A-Za-z_]{16,}"),
 }
 
-_REQUIRED_ALLOW_FIELDS = ("path", "scope", "reason", "owner", "expiry")
+_REQUIRED_ALLOW_FIELDS = ("path", "scope", "reason", "owner", "expiry", "rules")
 _MAX_BYTES = 1_000_000  # skip files larger than 1 MB (data/binaries, not source)
 DEFAULT_ALLOWLIST = Path(__file__).with_name("secret-scan-allowlist.json")
 
@@ -145,14 +145,47 @@ def load_allowlist(path: Path) -> list[dict[str, Any]]:
         except ValueError as exc:
             raise ScanError(f"allow entry #{i} ({entry['path']}) has an invalid expiry "
                             f"(expected YYYY-MM-DD): {entry['expiry']}") from exc
+        _validate_rules(entry, i)
     return allow
+
+
+def _validate_rules(entry: dict[str, Any], i: int) -> None:
+    """Enforce that an allowlist entry's ``rules`` enumerate the SPECIFIC detector ids it may
+    suppress — never a blanket mask. ``rules`` is required (see ``_REQUIRED_ALLOW_FIELDS``, so
+    an absent/empty ``rules`` is already rejected as a missing field); this additionally
+    rejects a non-list, a blank/non-string detector id, and — critically — the ``["*"]``
+    wildcard (or any entry containing ``"*"``).
+
+    An absent/empty/``["*"]`` ``rules`` historically DEFAULTED to "match any detector" in
+    ``_entry_covers``, so a future entry that omitted or wildcarded ``rules`` would silently
+    suppress a NEW, real provider secret added to an allowlisted file (the exact round-1
+    blanket-mask hole). Failing closed here — the same rigor with which the SCA suppression
+    validator rejects an incomplete waiver — keeps that hole closed by construction rather
+    than by convention."""
+    rules = entry.get("rules")
+    path = entry.get("path", "?")
+    if not isinstance(rules, list):
+        raise ScanError(f"allow entry #{i} ({path}) 'rules' must be a non-empty list of "
+                        f"detector ids")
+    for r in rules:
+        if not isinstance(r, str) or not r.strip():
+            raise ScanError(f"allow entry #{i} ({path}) 'rules' entries must be non-empty "
+                            f"detector-id strings")
+    if any(r.strip() == "*" for r in rules):
+        raise ScanError(f"allow entry #{i} ({path}) 'rules' must not be ['*'] or contain "
+                        f"'*' — a blanket mask would silently suppress a NEW real secret "
+                        f"added to '{path}'; list the specific detector id(s) instead")
 
 
 def _entry_covers(entry: dict[str, Any], match: Match) -> bool:
     if not fnmatch.fnmatch(match.path, entry["path"]):
         return False
-    rules = entry.get("rules", ["*"])
-    return "*" in rules or match.rule in rules
+    # 'rules' is REQUIRED and validated (non-empty, wildcard-free) at load time, so an entry
+    # suppresses ONLY the specific detectors it enumerates — never a blanket mask. Default to
+    # covering NOTHING (fail-safe) rather than ['*'] (fail-open) if 'rules' is somehow absent,
+    # so a missing/loosened 'rules' can never silently suppress a real secret.
+    rules = entry.get("rules") or []
+    return match.rule in rules
 
 
 def classify(matches: list[Match], allow: list[dict[str, Any]],
@@ -278,6 +311,40 @@ def _selftest(allowlist_path: Path) -> int:
         _, expected, expired = classify(fmatches, allow, _dt.date.today())
         check("fixture is fully allowlisted & unexpired",
               len(expected) == len(fmatches) and not expired)
+
+    # --- Allowlist 'rules' is REQUIRED and SPECIFIC (never a blanket mask). ----------------
+    # Round-1 scoped the fixture entry's rules from ['*'] to explicit detector ids, but
+    # _entry_covers historically DEFAULTED an absent 'rules' to ['*'] — so a FUTURE entry that
+    # omitted 'rules' (or set ['*']) would re-open the blanket-mask hole and silently suppress
+    # a NEW real secret in an allowlisted file. load_allowlist now FAILS CLOSED on such
+    # entries (same rigor as the SCA suppression validator, which rejects incomplete waivers).
+    # Non-vacuity: neutering the wildcard guard in _validate_rules reddens the ['*'] case in
+    # isolation (verified in a scratch clone); the missing/empty cases are pinned by 'rules'
+    # being in _REQUIRED_ALLOW_FIELDS.
+    import tempfile
+
+    def loads_ok(entry: dict) -> bool:
+        """True iff load_allowlist ACCEPTS a one-entry allowlist; False if it fails closed."""
+        with tempfile.TemporaryDirectory() as d:
+            ap = Path(d) / "allow.json"
+            ap.write_text(json.dumps({"allow": [entry]}), encoding="utf-8")
+            try:
+                load_allowlist(ap)
+                return True
+            except ScanError:
+                return False
+
+    base_entry = {"path": "x/y.txt", "scope": "s", "reason": "r", "owner": "@o",
+                  "expiry": "2999-01-01", "rules": ["aws-access-key-id"]}
+    check("allowlist entry with specific rules is accepted", loads_ok(base_entry))
+    check("allowlist entry missing 'rules' is rejected (fail closed)",
+          not loads_ok({k: v for k, v in base_entry.items() if k != "rules"}))
+    check("allowlist entry with empty 'rules' is rejected (fail closed)",
+          not loads_ok(dict(base_entry, rules=[])))
+    check("allowlist entry with rules=['*'] is rejected (no blanket mask)",
+          not loads_ok(dict(base_entry, rules=["*"])))
+    check("allowlist entry with '*' among rules is rejected (no blanket mask)",
+          not loads_ok(dict(base_entry, rules=["aws-access-key-id", "*"])))
 
     print()
     if failures:

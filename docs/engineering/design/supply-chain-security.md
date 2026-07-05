@@ -111,11 +111,15 @@ scanner without exposing real creds") is proven on every run.
 
 A match is suppressed only by an entry in
 [`secret-scan-allowlist.json`](../../../tools/security/secret-scan-allowlist.json). Every
-entry **must** carry `path` (an fnmatch glob, repo-relative), `scope`, `reason`, `owner`, and
-`expiry` (`YYYY-MM-DD`); `rules` (detector ids, or `["*"]`) and `reviewCriteria` are
-optional. A **malformed** entry fails the scan closed, and an **expired** entry stops
-suppressing — the match re-surfaces and fails the scan — so waivers cannot silently rot. A
-real leaked secret is **rotated, never allowlisted**.
+entry **must** carry `path` (an fnmatch glob, repo-relative), `scope`, `reason`, `owner`,
+`expiry` (`YYYY-MM-DD`), and `rules` (a **non-empty** list of the **specific** detector ids
+this entry may suppress); `reviewCriteria` is optional. `rules` is **required** and **must
+not** be `["*"]` (nor contain `"*"`): a blanket mask is **rejected at load time** (fail
+closed), so a NEW real secret added to an allowlisted file surfaces as a violation instead of
+being silently suppressed — mirroring the SCA suppression validator, which likewise fails
+closed on an incomplete waiver. A **malformed** entry fails the scan closed, and an
+**expired** entry stops suppressing — the match re-surfaces and fails the scan — so waivers
+cannot silently rot. A real leaked secret is **rotated, never allowlisted**.
 
 ## 2. Dependency / SCA scanning (STORY-00.3.1, #107b, #107c)
 
