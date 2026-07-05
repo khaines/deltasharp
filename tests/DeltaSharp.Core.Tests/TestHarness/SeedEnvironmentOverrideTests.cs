@@ -1,5 +1,6 @@
 using DeltaSharp.TestSupport;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace DeltaSharp.Core.Tests.TestHarness;
 
@@ -13,6 +14,10 @@ namespace DeltaSharp.Core.Tests.TestHarness;
 [Collection(EnvironmentSensitiveTestCollection.Name)]
 public sealed class SeedEnvironmentOverrideTests
 {
+    private readonly ITestOutputHelper _output;
+
+    public SeedEnvironmentOverrideTests(ITestOutputHelper output) => _output = output;
+
     [Fact]
     public void Resolve_UsesEnvironmentOverride_WhenSet()
     {
@@ -23,7 +28,7 @@ public sealed class SeedEnvironmentOverrideTests
 
             Assert.Equal(13579, TestSeed.Resolve());
 
-            SeededRandom random = SeededRandom.Create("scenario");
+            SeededRandom random = SeededRandom.Create(_output, "scenario");
             Assert.Equal(13579, random.BaseSeed);
             Assert.Equal(TestSeed.Combine(13579, "scenario"), random.Seed);
         }

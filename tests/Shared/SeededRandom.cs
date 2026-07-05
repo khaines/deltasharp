@@ -18,6 +18,8 @@ namespace DeltaSharp.TestSupport;
 /// logger surfaces for FAILING tests — so a CI failure shows exactly how to replay it locally.
 /// This facade exposes only the RNG surface tests need and deliberately does not leak the
 /// underlying <c>System.Random</c>.
+/// <para><b>Not thread-safe:</b> it wraps a single <c>System.Random</c>; create one instance per
+/// test and do not share it across threads (mirrors <c>System.Random</c>).</para>
 /// </remarks>
 internal sealed class SeededRandom
 {
@@ -47,10 +49,6 @@ internal sealed class SeededRandom
     /// <summary>A single log line carrying the seed and <see cref="ReproductionCommand"/>, surfaced by VSTest on failure.</summary>
     public string SeedAnnouncement =>
         Invariant($"[deltasharp-seed] scope={Scope} baseSeed={BaseSeed} effectiveSeed={Seed} | reproduce: {ReproductionCommand}");
-
-    /// <summary>Creates a source from the resolved base seed without logging (prefer the <see cref="ITestOutputHelper"/> overload).</summary>
-    public static SeededRandom Create([CallerMemberName] string scope = "") =>
-        new(TestSeed.Resolve(), scope);
 
     /// <summary>Creates a source from the resolved base seed and logs <see cref="SeedAnnouncement"/> to <paramref name="output"/>.</summary>
     public static SeededRandom Create(ITestOutputHelper output, [CallerMemberName] string scope = "")

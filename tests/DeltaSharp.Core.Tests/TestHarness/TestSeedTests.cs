@@ -12,6 +12,7 @@ public sealed class TestSeedTests
     [Theory]
     [InlineData("0", 0)]
     [InlineData("12345", 12345)]
+    [InlineData("-1", -1)] // a negative int is a valid 32-bit seed and wins (AC: "a valid 32-bit integer wins")
     [InlineData("-7", -7)]
     [InlineData(" 42 ", 42)] // NumberStyles.Integer tolerates surrounding whitespace
     [InlineData("2147483647", int.MaxValue)]

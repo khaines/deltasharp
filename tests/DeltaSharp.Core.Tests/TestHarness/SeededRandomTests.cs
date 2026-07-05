@@ -1,3 +1,4 @@
+using System.Globalization;
 using DeltaSharp.TestSupport;
 using Xunit;
 using Xunit.Abstractions;
@@ -75,13 +76,20 @@ public sealed class SeededRandomTests
     [Fact]
     public void Create_WithOutput_LogsReproducibleSeedLine()
     {
-        // The default entry point logs the seed line to the test output. On a FAILING test the
-        // VSTest console logger surfaces this output, so the seed + reproduction command are
-        // visible in CI. (Robust to a concurrent env override: only substring presence is asserted.)
-        SeededRandom random = SeededRandom.Create(_output);
+        // Prove Create(output) actually WRITES the seed line to the test output — not merely that
+        // the SeedAnnouncement property renders correctly. A capturing ITestOutputHelper records the
+        // WriteLine call, so this reddens if Create's `output.WriteLine(random.SeedAnnouncement)` is
+        // ever removed (the capture would be empty and Assert.Single would throw). On a FAILING test
+        // VSTest surfaces this output, making the seed + reproduction command visible in CI.
+        var capturing = new CapturingTestOutputHelper();
 
-        Assert.Contains("DELTASHARP_TEST_SEED=", random.SeedAnnouncement, StringComparison.Ordinal);
-        Assert.Contains("dotnet test --filter", random.SeedAnnouncement, StringComparison.Ordinal);
+        SeededRandom random = SeededRandom.Create(capturing, "SomeScope");
+
+        string logged = Assert.Single(capturing.Lines);
+        Assert.Equal(random.SeedAnnouncement, logged);
+        Assert.Contains("[deltasharp-seed]", logged, StringComparison.Ordinal);
+        Assert.Contains("DELTASHARP_TEST_SEED=", logged, StringComparison.Ordinal);
+        Assert.Contains("dotnet test --filter", logged, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -96,6 +104,40 @@ public sealed class SeededRandomTests
             Assert.InRange(random.NextDouble(), 0.0, 0.9999999999);
             _ = random.NextBool();
         }
+    }
+
+    [Fact]
+    public void NextBool_IsDeterministicAndProducesBothValues()
+    {
+        // Pin the exact first draws AND require BOTH values across N draws, so mutating NextBool to a
+        // constant (always true / always false) reddens this test — the range test above only
+        // discards NextBool, so it alone would stay green under such a mutation. ForSeed bypasses the
+        // env override and the seeded System.Random algorithm is version-stable, so the pinned prefix
+        // is identical on every target framework.
+        SeededRandom random = SeededRandom.ForSeed(99, "boolseq");
+
+        bool[] expectedPrefix = { true, true, true, true, false, true, false, false, false, false };
+        foreach (bool expected in expectedPrefix)
+        {
+            Assert.Equal(expected, random.NextBool());
+        }
+
+        bool sawTrue = false;
+        bool sawFalse = false;
+        for (int i = 0; i < 100; i++)
+        {
+            if (random.NextBool())
+            {
+                sawTrue = true;
+            }
+            else
+            {
+                sawFalse = true;
+            }
+        }
+
+        Assert.True(sawTrue, "NextBool must produce at least one true over many draws");
+        Assert.True(sawFalse, "NextBool must produce at least one false over many draws");
     }
 
     [Fact]
@@ -139,5 +181,21 @@ public sealed class SeededRandomTests
         {
             Assert.Equal(i, items[i]);
         }
+    }
+
+    /// <summary>
+    /// A test double for <see cref="ITestOutputHelper"/> that records every <c>WriteLine</c> call so
+    /// a test can assert on what was actually written, rather than only on the source of the text.
+    /// </summary>
+    private sealed class CapturingTestOutputHelper : ITestOutputHelper
+    {
+        private readonly List<string> _lines = new();
+
+        public IReadOnlyList<string> Lines => _lines;
+
+        public void WriteLine(string message) => _lines.Add(message);
+
+        public void WriteLine(string format, params object[] args) =>
+            _lines.Add(string.Format(CultureInfo.InvariantCulture, format, args));
     }
 }

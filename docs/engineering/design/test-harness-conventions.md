@@ -69,7 +69,9 @@ ad hoc across the engine tests (a fixed literal per test) into one overridable, 
   so unattended runs are reproducible with no configuration.
 - `TestSeed.Resolve()` returns `Parse(Environment.GetEnvironmentVariable(EnvironmentVariable))`.
   `TestSeed.Parse(string?)` accepts a valid invariant-culture 32-bit integer and otherwise falls
-  back to `Default` (null, blank, non-numeric, and out-of-range input all fall back).
+  back to `Default` (null, blank, non-numeric, and out-of-range input all fall back). A **negative**
+  value is a valid 32-bit seed and is accepted (for example `DELTASHARP_TEST_SEED=-1` resolves to
+  `-1`); only non-integer, out-of-range (overflow), blank, or unset input falls back to `Default`.
 - `TestSeed.Combine(int baseSeed, string scope)` mixes a per-scope salt into the base seed with
   FNV-1a over the scope characters, deliberately **not** `string.GetHashCode()` (which is
   randomized per process and therefore not reproducible across runs or machines).
@@ -81,13 +83,18 @@ test draws from. The **effective seed** that feeds the stream is `TestSeed.Combi
 of the resolved base seed and a per-test `Scope`, so every test gets an independent-but-reproducible
 stream from the single override knob.
 
-- `SeededRandom.Create(ITestOutputHelper output)` is the preferred entry point. `scope` defaults to
-  the calling test method name via `[CallerMemberName]`. It logs `SeedAnnouncement` to the test
-  output.
-- `SeededRandom.Create()` is the same without logging; `SeededRandom.ForSeed(int baseSeed)` bypasses
-  configuration with an explicit base seed (used by the harness self-tests).
+- `SeededRandom.Create(ITestOutputHelper output)` is the entry point for a **randomized** test.
+  `scope` defaults to the calling test method name via `[CallerMemberName]`, and it **always** logs
+  `SeedAnnouncement` to the test output, so a randomized test can never silently lose its seed on
+  failure. There is deliberately **no** no-output `Create()` overload: an environment-resolved seed
+  that was not logged would be unreproducible precisely when a test failed.
+- `SeededRandom.ForSeed(int baseSeed)` bypasses configuration with an explicit base seed for
+  **deterministic** self-tests. The seed is pinned in source, so the stream is reproducible by
+  construction and needs no logging.
 - The RNG surface is intentionally small: `Next()`, `Next(max)`, `Next(min, max)`, `NextDouble()`,
-  `NextBool()`, and `NextBytes(byte[])`. The underlying `System.Random` is not exposed.
+  `NextBool()`, and `NextBytes(byte[])`. The underlying `System.Random` is not exposed. A
+  `SeededRandom` is **not thread-safe** (it wraps a single `System.Random`); create one instance per
+  test rather than sharing it across threads.
 - `BaseSeed`, `Seed` (effective), and `Scope` are readable; `ReproductionCommand` and
   `SeedAnnouncement` render the reproduction guidance.
 
@@ -101,9 +108,16 @@ The VSTest console logger surfaces a failing test's output messages (a "Standard
 section), so on failure the seed and the reproduction command are visible in CI logs
 (#112(a), (c)). Passing tests capture the same line without printing it at normal verbosity.
 
-> **Caveat.** The reproduction filter uses `FullyQualifiedName~<method>`, a contains-match. Method
-> names in DeltaSharp are descriptive and usually unique; if a name is ambiguous, pass an explicit
-> `scope` to narrow it.
+> **Caveat — `scope` defaults to the method name.** Because `scope` defaults to `[CallerMemberName]`,
+> the effective seed and stream are keyed on the calling **method name**. Two different methods that
+> share a name (across classes), or the multiple rows of a single `[Theory]`, therefore resolve to the
+> **same** effective seed/stream, and the reproduction filter — `FullyQualifiedName~<method>`, a
+> contains-match — can over-select (replay more than the one test you meant). For a `[Theory]` or any
+> duplicate-named method, pass an **explicit** `scope` (for example include the case parameters) to
+> give each row an independent stream and an unambiguous filter.
+>
+> An explicit `scope` must be **filter-safe** — identifier-like. Avoid spaces, quotes, commas, and
+> other characters that would malform the VSTest `--filter` expression in `ReproductionCommand`.
 
 ### Writing a randomized test
 
