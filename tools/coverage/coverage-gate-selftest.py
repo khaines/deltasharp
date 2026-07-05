@@ -4,8 +4,8 @@
 The coverage gate (`coverage-gate.py`) is itself a piece of CI-critical logic: a bug that
 makes it fail-OPEN would let real coverage regressions merge silently. These tests exercise
 its exit-code contract end-to-end against synthetic Cobertura fixtures, so the gate's own
-behaviour is regression-tested on every CI run — including the two provenance holes a review
-red-team found and this change closed:
+behaviour is regression-tested on every CI run — including the provenance holes a review red-team
+found and this change closed:
 
   * union-inflate — an EXTRA (planted / trivially-100%-covered) assembly must NOT dilute or
     inflate the aggregate; an out-of-allowlist package fails the gate closed (exit 2), so a
@@ -13,6 +13,13 @@ red-team found and this change closed:
   * rounding-boundary — a percentage strictly below the floor that merely ROUNDS to the floor
     (for example 86.999% -> 87.00) must FAIL (exit 1); the pass decision compares the
     unrounded value.
+  * empty allowlist (#457) — an emptied/absent expectedAssemblies must fail CLOSED (exit 2), never
+    revert to fail-open global accounting.
+  * allowlist-vs-src drift (#457) — the allowlist must equal the actual src/ production projects; a
+    new src/ assembly left off the list, or a stale entry with no src/ project, fails CLOSED (exit 2).
+
+Each test synthesizes a matching `src/` tree (via `--src-root`) so the drift guard has a hermetic
+ground truth that is independent of the real repository layout.
 
 Stdlib only (`unittest`, `tempfile`, `subprocess`) — no third-party dependency, mirroring the
 gate's own offline/deterministic design. Run with: `python3 tools/coverage/coverage-gate-selftest.py`
@@ -53,8 +60,13 @@ def _report_xml(packages) -> str:
 
 
 class CoverageGateSelfTest(unittest.TestCase):
-    def _run(self, packages=None, *, threshold=87.0, expected=None, raw_files=None):
-        """Write fixtures to a temp dir, invoke the gate, and return its exit code."""
+    def _run(self, packages=None, *, threshold=87.0, expected=None, raw_files=None, src_assemblies=None):
+        """Write fixtures to a temp dir, invoke the gate, and return its exit code.
+
+        A synthetic `src/` tree is materialized so the fail-closed allowlist-vs-src drift guard has a
+        ground truth. By default it mirrors the config's `expectedAssemblies` (so drift passes and the
+        test exercises the behaviour it actually targets); pass `src_assemblies` to force a drift.
+        """
         with tempfile.TemporaryDirectory() as root:
             results = os.path.join(root, "TestResults")
             os.makedirs(results, exist_ok=True)
@@ -70,18 +82,37 @@ class CoverageGateSelfTest(unittest.TestCase):
                 os.makedirs(d, exist_ok=True)
                 with open(os.path.join(results, rel), "w", encoding="utf-8") as fh:
                     fh.write(content)
+            config_expected = _EXPECTED if expected is None else expected
+            # The drift ground truth: default to the config's allowlist so drift passes; a test forces
+            # a mismatch by passing src_assemblies explicitly.
+            src_names = config_expected if src_assemblies is None else src_assemblies
+            src_root = os.path.join(root, "src")
+            os.makedirs(src_root, exist_ok=True)
+            for name in src_names:
+                pdir = os.path.join(src_root, name)
+                os.makedirs(pdir, exist_ok=True)
+                with open(os.path.join(pdir, f"{name}.csproj"), "w", encoding="utf-8") as fh:
+                    fh.write(
+                        '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup>'
+                        f"<AssemblyName>{name}</AssemblyName></PropertyGroup></Project>"
+                    )
             config = os.path.join(root, "config.json")
             with open(config, "w", encoding="utf-8") as fh:
                 json.dump(
                     {
                         "minimumLineCoverage": threshold,
-                        "expectedAssemblies": _EXPECTED if expected is None else expected,
+                        "expectedAssemblies": config_expected,
                         "ratchetSuggestSlack": 1.5,
                     },
                     fh,
                 )
             proc = subprocess.run(
-                [sys.executable, _GATE, "--results-dir", results, "--config", config],
+                [
+                    sys.executable, _GATE,
+                    "--results-dir", results,
+                    "--config", config,
+                    "--src-root", src_root,
+                ],
                 capture_output=True,
                 text=True,
             )
@@ -113,6 +144,40 @@ class CoverageGateSelfTest(unittest.TestCase):
         self.assertEqual(code, 2, out)
         self.assertIn("Fake.Assembly", out)
         self.assertIn("unexpected", out.lower())
+
+    def test_empty_allowlist_fails_closed(self):
+        # #457 empty-allowlist hole: an emptied/absent expectedAssemblies must NOT revert to
+        # fail-OPEN global accounting. Even a healthy, above-floor real set fails closed (exit 2)
+        # when the allowlist is empty, so deleting one config line cannot silently disable the
+        # provenance guards.
+        code, out = self._run([(n, 890, 1000) for n in _EXPECTED], expected=[])
+        self.assertEqual(code, 2, out)
+        self.assertIn("expectedAssemblies is empty", out)
+
+    def test_new_src_assembly_not_allowlisted_fails_closed(self):
+        # #457 drift hole (add): a NEW src/ production assembly that was not added to the allowlist
+        # must fail closed (exit 2) — the allowlist cannot silently omit a production assembly, the
+        # same "cannot drift" property the centrally-hoisted analyzers have. Allowlist + reports carry
+        # the 4 known assemblies; src/ has a 5th.
+        code, out = self._run(
+            [(n, 890, 1000) for n in _EXPECTED],
+            src_assemblies=_EXPECTED + ["DeltaSharp.NewThing"],
+        )
+        self.assertEqual(code, 2, out)
+        self.assertIn("drifted", out)
+        self.assertIn("DeltaSharp.NewThing", out)
+
+    def test_stale_allowlist_entry_not_in_src_fails_closed(self):
+        # #457 drift hole (remove/typo): an allowlist entry with no matching src/ project must fail
+        # closed (exit 2). src/ has the 4 known assemblies; the allowlist has a 5th ghost.
+        code, out = self._run(
+            [(n, 890, 1000) for n in _EXPECTED],
+            expected=_EXPECTED + ["DeltaSharp.Ghost"],
+            src_assemblies=_EXPECTED,
+        )
+        self.assertEqual(code, 2, out)
+        self.assertIn("drifted", out)
+        self.assertIn("DeltaSharp.Ghost", out)
 
     def test_rounding_boundary_below_floor_fails(self):
         # Red-team rounding-boundary: aggregate 86.999% is strictly below the 87.0 floor but

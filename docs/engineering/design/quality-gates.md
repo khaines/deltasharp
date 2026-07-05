@@ -210,8 +210,8 @@ dotnet test DeltaSharp.sln -c Release --no-build \
   --results-directory TestResults
 ```
 
-The **`coverage`** CI job runs this after its own restore + build (adding `--verbosity normal` and
-a coverage-neutral `--filter`; see [Why coverage is a separate job](#why-coverage-is-a-separate-job)).
+The **`coverage`** CI job runs this after its own restore + build (adding `--verbosity normal`; see
+[Why coverage is a separate job](#why-coverage-is-a-separate-job)).
 The collector instruments the already-built assemblies at run time and writes one **Cobertura**
 report per test assembly per target framework under `TestResults/<guid>/coverage.cobertura.xml`.
 
@@ -242,35 +242,31 @@ uploaded with `if: ${{ !cancelled() }}` so the report is available **even when t
 
 Coverage is collected in the **`coverage`** job, **not** in `build-test-format`, and that
 separation is deliberate. coverlet instruments the production assemblies at run time, which changes
-execution timing. A `SparkSession` lifecycle **stress test** runs 25,000 iterations of a
-deliberately-raced `GetOrCreate` vs. `Stop`; its own oracle notes that reading `IsActive` after
-`GetOrCreate` returns is *"inherently racy against a legitimate post-return Stop."* Under
-instrumentation on a 2-vCPU runner that window widens enough to make the oracle occasionally count
-a legitimate interleaving as a violation — a **false** failure unrelated to any real regression.
+execution timing, so a test that flakes *only under instrumentation* must never be able to fail the
+build.
 
-What the job split does — and does **not** — fix:
+What the job split does:
 
 - **`build-test-format` runs the tests uninstrumented** and is the single source of truth for
-  correctness — exactly as before coverage existed, and exactly as on `main`. The stress test runs
-  here, strictly.
+  correctness — exactly as before coverage existed, and exactly as on `main`.
 - **The `coverage` job's collect step is measurement-only.** It carries `continue-on-error: true`
   so a test that flakes *only under instrumentation* can never fail the build — correctness is
   already gated by `build-test-format` — while the threshold gate still runs on the emitted reports
-  (a genuinely missing report fails the gate, so the tolerance is fail-safe). It also excludes just
-  that one stress test with
-  `--filter "FullyQualifiedName!~SparkSessionConcurrencyTests.GetOrCreate_RacingStop_NeverReusesAStoppedSession"`,
-  which is **coverage-neutral**: the merged percentage is identical with or without it, because
-  every line it exercises is covered by other tests.
+  (a genuinely missing report fails the gate, so the tolerance is fail-safe).
 
-**This removes only the instrumentation *amplification* of the flake — it does not fix the
-oracle.** The test still runs uninstrumented in `build-test-format`, where its post-return
-`IsActive` read remains racy against a legitimate `Stop`, so a rare false positive is still
-possible. The proper fix is an **oracle-determinism rewrite** that drives the race through the
-existing in-repo seam `RuntimeConfig.StopRaceProbe` (the sibling F1 test already uses it to pause a
-thread at the exact TOCTOU window) instead of sampling mutable state after the lock is released.
-That rewrite is **out of scope for this PR and tracked in
-[#454](https://github.com/khaines/deltasharp/issues/454)**; this document will be updated to say the
-oracle is resolved once that lands.
+> **History (resolved).** The `coverage` job previously excluded one `SparkSession` lifecycle test
+> — `SparkSessionConcurrencyTests.GetOrCreate_RacingStop_NeverReusesAStoppedSession` — with a
+> coverage-neutral `--filter`, because it was a **25,000-iteration stress test** whose oracle read
+> `IsActive` *after* `GetOrCreate` returned and released `_globalLock`; that read is inherently racy
+> against a legitimate post-return `Stop`, and coverlet's widened timing windows amplified it into
+> rare false failures ([#454](https://github.com/khaines/deltasharp/issues/454)). That test has been
+> **rewritten to be deterministic**: it drives the race through the internal `SparkSession.ReuseRaceProbe`
+> seam (the sibling of `RuntimeConfig.StopRaceProbe`, which the F1 test uses), pausing the getter at
+> the exact in-lock reuse window and asserting an **exact oracle** — the session it committed to reuse
+> stayed active for the *entire in-lock decision window* — rather than sampling mutable state after
+> the lock is released. The oracle can no longer false-positive on a legitimate post-return `Stop`, so
+> the test now runs **instrumented in the `coverage` job** with **no `--filter` exclusion**, and there
+> is no residual oracle caveat to track.
 
 ### The merge: why per-report sums are wrong
 
@@ -326,6 +322,17 @@ closes this two ways:
   aggregate. Coverage is computed over **only** the allowlisted set, so no extra package can move
   the number. Adding a genuine new `src/` production assembly is a deliberate governance event:
   add it to this list when it lands (mirrors the PublicAPI baseline).
+- **The allowlist itself cannot drift (fail-closed provenance).** A defense-in-depth layer removes
+  the two ways the allowlist could silently become untrustworthy. First, an **empty or absent**
+  `expectedAssemblies` **fails closed** (`::error::` + non-zero exit) instead of reverting to
+  fail-open global accounting over every globbed package — emptying the list can no longer disarm
+  the gate. Second, the gate **derives the ground-truth production set from `src/`** (every
+  `src/**/*.csproj`'s `AssemblyName`, matching the `DeltaSharpIsProductionAssembly` path rule in
+  [`Directory.Build.props`](../../../Directory.Build.props)) and requires `expectedAssemblies` to
+  **exactly equal** it. If the two diverge — a new `src/` assembly was added but not allowlisted, or
+  a stale allowlist entry no longer exists in `src/` — the gate **fails closed** naming the drift.
+  This gives the allowlist the same **cannot-drift** property the analyzer/formatting hoist has:
+  forgetting to enroll a new assembly is caught mechanically, not left to reviewer vigilance.
 - **In-run reports only.** The `coverage` job deletes any pre-existing `TestResults` **before**
   collecting, so the gate trusts only reports generated by the collect step in that run (closing
   stale-report reuse and a planted-report injection).
@@ -342,8 +349,17 @@ non-zero** — `::error::coverage report is missing expected production assembly
 false PASS) is rejected — `::error::coverage report contains unexpected production assembly … not
 in the expectedAssemblies allowlist`. The existing all-missing / malformed / zero-line cases still
 exit `2` as before. These exit-code contracts (missing, unexpected/inflate, rounding-boundary,
-malformed, empty) are regression-tested by `tools/coverage/coverage-gate-selftest.py`, which CI
-runs before the gate.
+malformed, empty-allowlist, allowlist-vs-`src/` drift) are regression-tested by
+`tools/coverage/coverage-gate-selftest.py`, which CI runs before the gate.
+
+**Residual (documented, not fully closeable).** The provenance allowlist authenticates an assembly
+by its Cobertura `<package name>`; a report that *forges* an allowlisted name (an **in-list
+synthetic spoof**) is still trusted on its face. This is not closeable by content inspection alone —
+line counts are legitimately unbounded — so the primary control is the **in-run wipe**: because the
+`coverage` job `rm -rf TestResults` before collecting and the gate reads only that run's freshly
+generated reports, planting a forged report requires arbitrary code execution *inside* the CI job,
+which already subverts the gate itself (a strictly larger compromise). We therefore accept the
+residual rather than add brittle magic-number line bounds that would false-fail on legitimate growth.
 
 ### Measured baseline
 
@@ -412,11 +428,10 @@ python3 tools/coverage/coverage-gate.py --results-dir TestResults \
 `--threshold <n>` overrides the configured floor for local experiments; CI never passes it, so
 the JSON file remains the single enforced source of truth.
 
-> The full test run above measures coverage faithfully (89.16%). If the `SparkSession` lifecycle
-> stress test flakes *under instrumentation* on a small local machine, coverlet still writes
-> complete reports, so the gate still evaluates; you can also append CI's coverage-neutral filter
-> — `--filter "FullyQualifiedName!~SparkSessionConcurrencyTests.GetOrCreate_RacingStop_NeverReusesAStoppedSession"`
-> — to skip just that test without changing the number.
+> The full test run above measures coverage faithfully (89.16%). The `SparkSession` lifecycle TOCTOU
+> tests are deterministic (they drive the race through the internal `ReuseRaceProbe` /
+> `StopRaceProbe` seams — see [#454](https://github.com/khaines/deltasharp/issues/454)), so they no
+> longer flake under instrumentation and need no coverage-time `--filter`.
 
 ---
 
