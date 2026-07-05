@@ -237,7 +237,12 @@ The reuse decision (steps 2–4, the `IsActive` checks) runs entirely under `_gl
 `Stop()` performs its lifecycle state transition under the **same** lock (see
 [concurrency model](#active--and-default-session-tracking-concurrency-model)), so a concurrent `Stop`
 cannot invalidate an `IsActive == true` check mid-decision — `GetOrCreate` returns a session that was
-active at the instant of the reuse decision (no TOCTOU).
+active at the instant of the reuse decision (no TOCTOU). This invariant is verified **deterministically**
+by the internal `SparkSession.ReuseRaceProbe` test seam (the sibling of `RuntimeConfig.StopRaceProbe`,
+which the F1 test uses): it pauses the getter at the exact in-lock reuse window, drives a concurrent
+`Stop` on another thread, and asserts the reused session stayed active for the whole in-lock decision
+window — an exact oracle that cannot false-positive on a legitimate post-return `Stop`
+([#454](https://github.com/khaines/deltasharp/issues/454)).
 
 > **Deviation (documented):** Spark logs a warning when `getOrCreate` is called with config on an
 > already-existing session because most settings cannot change after the `SparkContext` is live.
@@ -349,7 +354,7 @@ Tests live in `tests/DeltaSharp.Core.Tests/SparkSessionTests.cs` (+
 | **AC2** | Existing active session + equivalent config → **same** active session; config applied to its runtime conf. | `GetOrCreate_WithActiveSession_ReturnsSameInstance`; `GetOrCreate_AppliesNewConfig_ToExistingSession`; `GetActiveSession_AfterGetOrCreate_ReturnsCreatedSession`; `ActiveSession_IsThreadLocal_WhileDefaultIsProcessWide`; `RepeatedGetOrCreateStopCycles_LeaveNoStaticStateLeak` |
 | **AC3** | Stopped/disposed session: `Read`/`Sql`/`CreateDataFrame` → deterministic lifecycle error. | `Read_OnStoppedSession_ThrowsSessionStopped`; `Sql_OnStoppedSession_ThrowsSessionStopped`; `Read_OnDisposedSession_ThrowsSessionStopped`; `Sql_OnDisposedSession_ThrowsSessionStopped`; `CreateDataFrame_OnStoppedSession_ThrowsSessionStopped`; `CreateDataFrame_OnDisposedSession_ThrowsSessionStopped`; `SessionStopped_Message_IsDeterministicAndNamesApp`; `Read_OnActiveSession_ThrowsNotSupported_NotLifecycle`; `CreateDataFrame_OnActiveSession_ThrowsNotSupported_NotLifecycle` |
 | **AC4** | Backend config recorded at creation for later execution **without initializing work**; the recorded value never diverges from conf. | `ExecutionBackend_DefaultsToAuto`; `Config_ExecutionBackend_Interpreted_IsRecorded`; `Config_ExecutionBackend_IsCaseInsensitive`; `Config_ExecutionBackend_InvalidValue_ThrowsAtGetOrCreate`; `Config_ExecutionBackend_InvalidValue_OnReusePath_ThrowsAtGetOrCreate`; `GetOrCreate_RecordsBackend_WithoutTouchingEngine`; `GetOrCreate_ReuseChangingBackend_KeepsExecutionBackendAndConfInAgreement`; `ExecutionBackend_ReflectsConfSet_AfterCreation`; `Set_ExecutionBackend_InvalidValue_ThrowsAtSetTime_NotDeferred` (F2 fail-fast); `Set_ExecutionBackend_ValidValue_IsAcceptedCaseInsensitively` (F2); `GetOrCreate_RecordingBackend_HasNoSideEffectBeyondConfigStorage`; `CreateDataFrame_OnActiveSession_DoesNotEnumerateItsInput` (instrumented no-work) |
-| Lifecycle | Stop/Dispose idempotent; clears active/default; Conf read-after-stop; Conf.Set-after-stop throws; B2 Stop/GetOrCreate race is TOCTOU-free; F1 Stop/Conf.Set race is TOCTOU-free. | `Stop_IsIdempotent`; `Dispose_StopsSession`; `Stop_ClearsActiveAndDefault`; `Conf_ReadsRemainValid_AfterStop`; `Conf_Set_AfterStop_ThrowsSessionStopped`; `Set_Double_AfterStop_ThrowsSessionStopped`; `ActiveSession_SetClear_RoundTrips`; `GetOrCreate_RacingStop_NeverReusesAStoppedSession` (B2 concurrency stress); `Set_RacingStop_NeverMutatesAStoppedSession` (F1 deterministic interleaving) |
+| Lifecycle | Stop/Dispose idempotent; clears active/default; Conf read-after-stop; Conf.Set-after-stop throws; B2 Stop/GetOrCreate race is TOCTOU-free; F1 Stop/Conf.Set race is TOCTOU-free. | `Stop_IsIdempotent`; `Dispose_StopsSession`; `Stop_ClearsActiveAndDefault`; `Conf_ReadsRemainValid_AfterStop`; `Conf_Set_AfterStop_ThrowsSessionStopped`; `Set_Double_AfterStop_ThrowsSessionStopped`; `ActiveSession_SetClear_RoundTrips`; `GetOrCreate_RacingStop_NeverReusesAStoppedSession` (B2 deterministic interleaving); `Set_RacingStop_NeverMutatesAStoppedSession` (F1 deterministic interleaving) |
 
 ## API governance & lifecycle posture
 

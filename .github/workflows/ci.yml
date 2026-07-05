@@ -115,10 +115,11 @@ jobs:
       #     timing windows) must never fail the build here; the uninstrumented build-test-format
       #     job is the correctness authority. coverlet still writes complete reports when a test
       #     fails, so the gate below runs on full data (and a truly missing report fails the gate).
-      #   * --filter excludes the one high-iteration SparkSession-lifecycle STRESS test whose
-      #     post-return race is sensitive to instrumentation timing. It still runs (strictly) in
-      #     build-test-format, and excluding it here is coverage-neutral — it covers no line that
-      #     another test does not (verified: merged coverage is identical with or without it).
+      #   * The SparkSession B2/F1 lifecycle TOCTOU tests now run INSTRUMENTED here (no --filter
+      #     exclusion): #454 rewrote GetOrCreate_RacingStop from a 25k-iteration stress test with a
+      #     post-return (instrumentation-timing-sensitive) oracle into a deterministic probe-driven
+      #     test whose oracle observes state strictly inside the in-lock decision window, so coverlet
+      #     instrumentation can no longer amplify it into a false failure.
       - name: Collect coverage (measurement only)
         continue-on-error: true
         run: >-
@@ -126,7 +127,6 @@ jobs:
           --collect:"XPlat Code Coverage"
           --settings coverlet.runsettings
           --results-directory TestResults
-          --filter "FullyQualifiedName!~SparkSessionConcurrencyTests.GetOrCreate_RacingStop_NeverReusesAStoppedSession"
 
       # Regression-test the gate's own exit-code contract (fail-closed on missing/unexpected
       # assemblies, rounding-boundary, malformed/empty) before trusting it on real data. Python
