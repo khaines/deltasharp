@@ -5,8 +5,10 @@ name: Reconcile
 # feature-request milestone dropdown drift out of the manual reconciliation recorded in
 # docs/planning/label-taxonomy.md (#449). It reconciles three sources of drift:
 #   * roster<->labels    — every .github/agents/*.agent.md wrapper has a persona:<slug> label
-#                          and vice-versa (allowing the ONE documented 50-char truncation).
-#   * codeowners-errors  — GET /repos/{repo}/codeowners/errors reports no parse/owner errors.
+#                          and vice-versa (allowing the ONE documented 50-char truncation),
+#                          reconciled against the committed label list AND the live labels.
+#   * codeowners-errors  — GET /repos/{repo}/codeowners/errors?ref=<PR head> reports no
+#                          parse/owner errors (pinned to the PR head so a breaking PR fails).
 #   * milestone-dropdown — the feature_request.yml milestone options match the live GitHub
 #                          milestones (plus the documented "needs triage" sentinel).
 #
@@ -65,9 +67,16 @@ jobs:
         run: python3 tools/reconcile/roster-labels.py --selftest
 
       # The live checks read public repo metadata (labels, milestones, codeowners/errors) via
-      # the GitHub CLI using the default read-only token. --require-remote makes a skipped
-      # remote lookup a hard failure so the gate cannot silently pass without verifying.
+      # the GitHub CLI using the default read-only token. --require-remote makes a remote lookup
+      # that could not run a hard failure (exit 2 — a remote outage, distinct from drift) so the
+      # gate cannot silently pass without verifying. --ref pins the CODEOWNERS validation to the
+      # PR head/merge commit (github.sha) so a PR that breaks CODEOWNERS fails the PR gate rather
+      # than only being caught post-merge on the default branch.
       - name: Reconcile roster, labels, CODEOWNERS, milestones
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 tools/reconcile/roster-labels.py --repo "${{ github.repository }}" --require-remote
+        run: >-
+          python3 tools/reconcile/roster-labels.py
+          --repo "${{ github.repository }}"
+          --ref "${{ github.sha }}"
+          --require-remote

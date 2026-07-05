@@ -61,6 +61,48 @@ triage.
   in issue bodies and in this taxonomy. Every other slug fits; the next longest,
   `persona:cloud-native-distributed-systems-architect`, is exactly 50 characters.
 
+#### The persona label set (committed source for offline reconciliation)
+
+The complete `persona:` label set is committed below so the
+[reconcile gate](#automated-reconciliation-gate-ci) has an offline source of truth for it:
+`--offline` reconciles the roster against **this** list (catching a persona added to or
+removed from the roster with no network), while remote mode additionally diffs the roster
+against the **live** GitHub labels (catching drift introduced in the GitHub UI). Each entry
+is the label **exactly as stored on GitHub** — i.e. with the one 50-character truncation
+above applied — sorted, one per line. Keep it in step with the roster whenever a persona is
+added, removed, or renamed (see
+[Keeping persona labels in step with the roster](#keeping-persona-labels-in-step-with-the-roster)).
+
+<!-- BEGIN persona-labels (parsed by tools/reconcile/roster-labels.py — keep sorted, one per line) -->
+```text
+persona:catalog-metastore-engineer
+persona:cloud-native-distributed-systems-architect
+persona:cloud-native-security-sme
+persona:cloud-native-site-reliability-engineer
+persona:compute-storage-finops-engineer
+persona:data-platform-connectors-engineer
+persona:delta-storage-format-engineer
+persona:developer-experience-api-engineer
+persona:developer-relations-community-lead
+persona:dotnet-distributed-execution-engineer
+persona:dotnet-framework-runtime-engineer
+persona:dotnet-library-platform-engineer
+persona:dotnet-runtime-performance-engineer
+persona:dotnet-vectorized-columnar-compute
+persona:kubernetes-operator-controller-engineer
+persona:performance-benchmarking-engineer
+persona:privacy-compliance-grc-lead
+persona:product-manager
+persona:program-manager
+persona:query-execution-engine-engineer
+persona:query-optimizer-scheduler-engineer
+persona:reliability-test-chaos-engineer
+persona:sql-language-frontend-engineer
+persona:structured-streaming-engine-engineer
+persona:technical-writer
+```
+<!-- END persona-labels -->
+
 ## Story-to-issue label mapping
 
 When a plan item becomes a GitHub issue, labels are applied as follows (from the
@@ -86,7 +128,10 @@ tracked there. When a persona is added, removed, or renamed:
    spec under `docs/persona/agents/` (plus its `.github/agents/` wrapper).
 2. Add or remove the matching `persona:<slug>` label, honoring the 50-character
    truncation rule above.
-3. Update this document's counts and the reconciliation snapshot below.
+3. Update the committed
+   [persona label set](#the-persona-label-set-committed-source-for-offline-reconciliation)
+   so the offline reconciliation stays accurate.
+4. Update this document's counts and the reconciliation snapshot below.
 
 ### Reconciliation snapshot (verified)
 
@@ -121,11 +166,18 @@ of three reconciliations breaks:
    matching `persona:<slug>` label and vice-versa. The one 50-character truncation
    (`persona:dotnet-vectorized-columnar-compute`) is accepted **only because this
    document records it**: the gate reads both the full slug and the standalone
-   truncated label out of this file, so an *undocumented* truncation still fails. Any
-   other roster/label difference fails.
+   truncated label out of this file, so an *undocumented* truncation still fails. The
+   roster is reconciled against both the committed
+   [persona label set](#the-persona-label-set-committed-source-for-offline-reconciliation)
+   above (so `--offline` still catches a removed/added persona) and the **live** GitHub
+   labels (so a label renamed/deleted in the UI is caught too). Any other roster/label
+   difference fails.
 2. **`CODEOWNERS` parse errors.** `GET /repos/<repo>/codeowners/errors` (the same check
    in [Code ownership](#code-ownership-codeowners)) must return an empty `errors`
-   array; a syntax or unknown-owner error fails.
+   array; a syntax or unknown-owner error fails. In CI the check is pinned to the PR
+   head/merge commit (`--ref "${{ github.sha }}"`) so a PR that *breaks* `CODEOWNERS`
+   fails the PR gate rather than only being caught after merge; locally it falls back to
+   the default branch.
 3. **Milestone dropdown.** The `id: milestone` options in
    [`feature_request.yml`](../../.github/ISSUE_TEMPLATE/feature_request.yml) must equal
    the live **open** GitHub milestones plus the documented `Unsure / needs triage`
@@ -147,11 +199,14 @@ python3 tools/reconcile/roster-labels.py            # remote checks need `gh` au
 python3 tools/reconcile/roster-labels.py --selftest # prove the gate's logic, no network
 ```
 
-The three GitHub-API checks degrade gracefully: without `gh` (or a token) they are
+The live GitHub-API checks degrade gracefully: without `gh` (or a token) they are
 **skipped** with a warning so local dev works offline, while the script still parses the
-roster and the milestone dropdown. CI passes `--require-remote`, so a skipped remote
-check there is a hard failure. Exit codes: `0` reconciled, `1` drift detected, `2`
-usage/data error (or a required remote check could not run).
+roster and the milestone dropdown **and reconciles the roster against the committed persona
+label set above** (so `--offline` still catches roster↔label drift). CI passes
+`--require-remote`, so a remote check that could not run there is a hard failure — reported
+as a **remote outage (exit 2), distinct from drift**, so a `gh`/API outage is never
+miscounted as roster drift. Exit codes: `0` reconciled, `1` drift detected, `2` usage/data
+error **or** a required remote check could not run (a remote outage under `--require-remote`).
 
 **Promotion to a required check.** The gate is not a branch-protection required check
 today; like `coverage` and the supply-chain scans it can be promoted post-merge once it
@@ -186,12 +241,15 @@ the area over as maintainers join.
 Validate the file with GitHub's own parser:
 
 ```bash
+# Default branch (drop ?ref= for the local check):
 gh api repos/khaines/deltasharp/codeowners/errors --jq '.errors | length'
-# 0 means no syntax or ownership errors on the default branch.
+# A specific commit/PR head — what CI validates so a PR that breaks CODEOWNERS is caught:
+gh api "repos/khaines/deltasharp/codeowners/errors?ref=$GITHUB_SHA" --jq '.errors | length'
+# 0 means no syntax or ownership errors at that ref.
 ```
 
-The [reconcile gate](#automated-reconciliation-gate-ci) runs this same check in CI and
-fails on any non-empty `errors` array.
+The [reconcile gate](#automated-reconciliation-gate-ci) runs this same check in CI, pinned
+to the PR head/merge commit (`--ref`), and fails on any non-empty `errors` array.
 
 ## Branch protection and required review
 
