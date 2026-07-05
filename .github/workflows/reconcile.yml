@@ -1,0 +1,73 @@
+name: Reconcile
+
+# Governance reconciliation gate (STORY-00.6.2, #452). A lightweight, build-free check that
+# fails when the persona roster, the GitHub label taxonomy, CODEOWNERS, and the
+# feature-request milestone dropdown drift out of the manual reconciliation recorded in
+# docs/planning/label-taxonomy.md (#449). It reconciles three sources of drift:
+#   * roster<->labels    — every .github/agents/*.agent.md wrapper has a persona:<slug> label
+#                          and vice-versa (allowing the ONE documented 50-char truncation).
+#   * codeowners-errors  — GET /repos/{repo}/codeowners/errors reports no parse/owner errors.
+#   * milestone-dropdown — the feature_request.yml milestone options match the live GitHub
+#                          milestones (plus the documented "needs triage" sentinel).
+#
+# It runs on PRs and pushes that touch the governance files (drift introduced by a code
+# change), on a weekly schedule and on demand (drift introduced GitHub-side, e.g. a label or
+# milestone renamed in the UI, which is not a file change). The gate is intentionally NOT a
+# branch-protection required check today (it can be promoted post-merge like the other gates,
+# see label-taxonomy.md). Least-privilege read-only token; the one action is pinned by SHA.
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/agents/**"
+      - ".github/ISSUE_TEMPLATE/feature_request.yml"
+      - ".github/CODEOWNERS"
+      - "docs/planning/label-taxonomy.md"
+      - ".github/workflows/reconcile.yml"
+      - "tools/reconcile/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/agents/**"
+      - ".github/ISSUE_TEMPLATE/feature_request.yml"
+      - ".github/CODEOWNERS"
+      - "docs/planning/label-taxonomy.md"
+      - ".github/workflows/reconcile.yml"
+      - "tools/reconcile/**"
+  schedule:
+    # Weekly, Mondays ~07:17 UTC — catch GitHub-side drift (a label/milestone edited in the
+    # UI) that no file change would otherwise trigger.
+    - cron: "17 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reconcile-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reconcile:
+    name: reconcile
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # Prove the gate's own reconciliation logic (truncation, dropdown parse, milestone and
+      # label diffing) with in-memory fixtures before trusting it on live data — mirrors the
+      # coverage and SCA gate self-tests. Stdlib-only Python; nothing to install.
+      - name: Reconcile gate self-test
+        run: python3 tools/reconcile/roster-labels.py --selftest
+
+      # The live checks read public repo metadata (labels, milestones, codeowners/errors) via
+      # the GitHub CLI using the default read-only token. --require-remote makes a skipped
+      # remote lookup a hard failure so the gate cannot silently pass without verifying.
+      - name: Reconcile roster, labels, CODEOWNERS, milestones
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/reconcile/roster-labels.py --repo "${{ github.repository }}" --require-remote

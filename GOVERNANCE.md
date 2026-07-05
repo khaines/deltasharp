@@ -53,8 +53,12 @@ become inactive may move to emeritus status; they are always welcome back.
 
 ## Code of Conduct
 
-Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md). Reports are
-handled confidentially by the community leaders named there.
+Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md). During the
+project's single-maintainer phase, the community leader responsible for enforcement is
+the founding maintainer, **[@khaines](https://github.com/khaines)**; reports are handled
+confidentially through the reporting channels in the
+[Code of Conduct](CODE_OF_CONDUCT.md). As additional maintainers join, the enforcement
+group grows with them.
 
 ## Security
 

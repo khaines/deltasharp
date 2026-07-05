@@ -5,12 +5,14 @@
 > source tree (`CODEOWNERS`), and how required review is gated today. Companion to
 > the [workstream plan](README.md), which stays the source of truth for the roster.
 >
-> **Status:** active. Reconciled with the repository on 2026-07-04.
+> **Status:** active. Reconciled with the repository on 2026-07-04 and enforced by the
+> [`reconcile`](../../.github/workflows/reconcile.yml) CI gate.
 
 This document activates STORY-00.6.2. It records the label families the project
 uses, the rule that keeps `persona:<slug>` labels in step with the roster, the
-`CODEOWNERS` subsystem map, and the branch-protection exception for the current
-single-maintainer phase.
+`CODEOWNERS` subsystem map, the branch-protection exception for the current
+single-maintainer phase, and the CI gate that reconciles all of these against live
+GitHub state (see [Automated reconciliation gate (CI)](#automated-reconciliation-gate-ci)).
 
 ## Label families
 
@@ -102,7 +104,59 @@ comm -3 \
 The only expected difference is the truncated slug — roster-only
 `dotnet-vectorized-columnar-compute-engineer` versus label-only
 `dotnet-vectorized-columnar-compute`. Any other difference means a label and the
-roster have drifted and must be reconciled.
+roster have drifted and must be reconciled. This `comm -3` snapshot is now also
+enforced automatically — see
+[Automated reconciliation gate (CI)](#automated-reconciliation-gate-ci) below.
+
+## Automated reconciliation gate (CI)
+
+The manual snapshots above are backed by a lightweight CI gate so the roster, the
+labels, `CODEOWNERS`, and the milestone dropdown cannot silently drift apart
+(STORY-00.6.2, #452). The gate is the stdlib-only script
+[`tools/reconcile/roster-labels.py`](../../tools/reconcile/roster-labels.py), run by
+the [`reconcile`](../../.github/workflows/reconcile.yml) workflow. It fails when any
+of three reconciliations breaks:
+
+1. **Roster ↔ persona labels.** Every `.github/agents/*.agent.md` wrapper must have a
+   matching `persona:<slug>` label and vice-versa. The one 50-character truncation
+   (`persona:dotnet-vectorized-columnar-compute`) is accepted **only because this
+   document records it**: the gate reads both the full slug and the standalone
+   truncated label out of this file, so an *undocumented* truncation still fails. Any
+   other roster/label difference fails.
+2. **`CODEOWNERS` parse errors.** `GET /repos/<repo>/codeowners/errors` (the same check
+   in [Code ownership](#code-ownership-codeowners)) must return an empty `errors`
+   array; a syntax or unknown-owner error fails.
+3. **Milestone dropdown.** The `id: milestone` options in
+   [`feature_request.yml`](../../.github/ISSUE_TEMPLATE/feature_request.yml) must equal
+   the live **open** GitHub milestones plus the documented `Unsure / needs triage`
+   sentinel. A stale/renamed option, or a live milestone missing from the dropdown,
+   fails.
+
+**When it runs.** On pull requests and pushes to `main` that touch the governance
+files (roster, `CODEOWNERS`, the feature form, this document, the script, or the
+workflow), on a weekly schedule, and on demand — the schedule catches drift
+introduced GitHub-side (a label or milestone renamed in the UI), which no file change
+would otherwise trigger. It uses a least-privilege read-only token
+(`permissions: contents: read`; the default token suffices for labels, milestones, and
+CODEOWNERS on a public repo) and pins its one action by commit SHA.
+
+**Run it locally.**
+
+```bash
+python3 tools/reconcile/roster-labels.py            # remote checks need `gh` authenticated
+python3 tools/reconcile/roster-labels.py --selftest # prove the gate's logic, no network
+```
+
+The three GitHub-API checks degrade gracefully: without `gh` (or a token) they are
+**skipped** with a warning so local dev works offline, while the script still parses the
+roster and the milestone dropdown. CI passes `--require-remote`, so a skipped remote
+check there is a hard failure. Exit codes: `0` reconciled, `1` drift detected, `2`
+usage/data error (or a required remote check could not run).
+
+**Promotion to a required check.** The gate is not a branch-protection required check
+today; like `coverage` and the supply-chain scans it can be promoted post-merge once it
+has first run on `main` (the same pattern documented in
+[supply-chain-security.md](../engineering/design/supply-chain-security.md)).
 
 ## Code ownership (CODEOWNERS)
 
@@ -136,6 +190,9 @@ gh api repos/khaines/deltasharp/codeowners/errors --jq '.errors | length'
 # 0 means no syntax or ownership errors on the default branch.
 ```
 
+The [reconcile gate](#automated-reconciliation-gate-ci) runs this same check in CI and
+fails on any non-empty `errors` array.
+
 ## Branch protection and required review
 
 STORY-00.6.2 AC4 asks that a protected-file change require code-owner review, or
@@ -144,17 +201,18 @@ protection on `main` (verified 2026-07-04) is:
 
 - `required_pull_request_reviews.require_code_owner_reviews`: **false**.
 - `required_pull_request_reviews.required_approving_review_count`: **0**.
-- Required status checks: `build-test-format`, `dco`, and `coverage` (the FEAT-00.3
-  supply-chain scans run on every PR and are documented for the same post-merge promotion
-  in [supply-chain-security.md](../engineering/design/supply-chain-security.md)).
+- Required status checks: `build-test-format`, `dco`, `coverage`, `sca`, `secret-scan`,
+  and `sbom` — the FEAT-00.3 supply-chain scans are now required checks too (#461; see
+  [supply-chain-security.md](../engineering/design/supply-chain-security.md)).
+  `dependency-review` stays advisory PR-only.
 - `enforce_admins`: true; `required_linear_history`: true;
   `required_conversation_resolution`: true; force-pushes and deletions blocked.
 
 With a single maintainer, requiring code-owner review would route every PR to
 `@khaines` — the sole owner — and block that maintainer's own changes without
 adding a second reviewer. Required code-owner review is therefore intentionally
-**off**. `CODEOWNERS` still auto-requests review from the owner, and the
-`build-test-format` and `dco` checks gate every merge.
+**off**. `CODEOWNERS` still auto-requests review from the owner, and the required
+status checks above gate every merge.
 
 **Exit from the exception.** When a second maintainer joins, enable
 `require_code_owner_reviews` and set `required_approving_review_count` to at least
