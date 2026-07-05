@@ -24,6 +24,14 @@
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.7.0" />
     <PackageVersion Include="xunit" Version="2.9.3" />
     <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5" />
+    <!-- Coverage collection (FEAT-00.2 / #106 STORY-00.2.3). coverlet.collector is the
+         xunit-integrated data collector invoked by the "XPlat Code Coverage" collector; it
+         instruments the already-built assemblies at test-run time (no rebuild required) and
+         emits a Cobertura report the CI coverage gate parses. It is a developmentDependency
+         (referenced with PrivateAssets=all in each test project) — never a runtime dependency.
+         The 10.0.x line ships build/net8.0 + build/net10.0, matching both test TFMs (ADR-0014).
+         See docs/engineering/design/quality-gates.md. -->
+    <PackageVersion Include="coverlet.collector" Version="10.0.1" />
   </ItemGroup>
 
   <!-- lane:01.5 (FEAT-01.5 / #127 STORY-01.5.1, #128 STORY-01.5.2) — API-governance
