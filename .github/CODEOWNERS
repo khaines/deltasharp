@@ -55,6 +55,7 @@
 /src/DeltaSharp.Engine/Memory/**      @khaines  # persona:dotnet-runtime-performance-engineer
 /src/DeltaSharp.Engine/Execution/**   @khaines  # persona:query-execution-engine-engineer
 /src/DeltaSharp.Executor/**           @khaines  # persona:dotnet-distributed-execution-engineer (+ query-execution-engine-engineer)
+/src/DeltaSharp.Storage/**            @khaines  # persona:delta-storage-format-engineer (Delta log, Parquet, storage adapters)
 
 # Tests track the owner of the src area under test.
 /tests/**                       @khaines  # persona: mirror the corresponding src/ subsystem

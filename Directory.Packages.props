@@ -17,6 +17,12 @@
          Operators bind only to ColumnVector — no operator-facing member names an Apache.Arrow
          type — so this stays a boundary dependency of DeltaSharp.Engine, not the public surface. -->
     <PackageVersion Include="Apache.Arrow" Version="23.0.0" />
+    <!-- STORY-05.1.1/.2 (#180/#181): Parquet codec for DeltaSharp.Storage. ADR-0002 anticipates
+         Parquet.Net as the Parquet<->columnar bridge. v6 is pure-managed with ZERO transitive
+         dependencies (clean SBOM/SCA) and targets net8/net10. The Storage layer uses its LOW-LEVEL
+         DataColumn API (not the reflection-based class serializer) so the Parquet->ColumnVector
+         decode path stays AOT/trim-friendly (OQ-1 / empirical codec-AOT gate, design §2.7/§8.5). -->
+    <PackageVersion Include="Parquet.Net" Version="6.0.3" />
   </ItemGroup>
 
   <ItemGroup>

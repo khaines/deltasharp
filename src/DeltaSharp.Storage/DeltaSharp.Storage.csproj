@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    DeltaSharp native Delta/Parquet storage assembly (EPIC-05 / FEAT-05.1). Engine-internal,
+    net10.0-only, non-packable, sibling to DeltaSharp.Engine (ADR-0014; design
+    docs/engineering/design/storage-delta-architecture.md §2.1). References Engine (for the
+    columnar ColumnBatch/ColumnVector + off-heap Memory that Parquet decodes into) and
+    Abstractions (DataType). Engine never references Storage (no cycle) — the scan/sink wiring
+    lives on the Executor↔Storage edge (§2.2).
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>DeltaSharp.Storage</RootNamespace>
+    <AssemblyName>DeltaSharp.Storage</AssemblyName>
+    <IsPackable>false</IsPackable>
+    <!-- design §2.1: gated on a demonstrated unsafe-requiring decode kernel; the Parquet
+         reader slices Span<byte> over decoded/native buffers. Scoped project-local (NOT
+         Directory.Build.props), matching the Engine's opt-in pattern (ADR-0013). -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- First-dep governance (design §2.7/§8.5, #468): a committed NuGet lock file so
+         `restore` in locked mode is reproducible and drift-detecting the moment this assembly
+         takes its first third-party dependency (Parquet.Net). -->
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <!-- OQ-1 / empirical codec-AOT gate (design §2.7 B-F1): Parquet.Net's LOW-LEVEL DataColumn API
+         is used (not the reflection class serializer). DeltaSharp.Storage is NOT yet reachable from
+         the NativeAOT Executor image (the scan/sink wiring lands in a later story), so its codec
+         AOT-cleanliness is verified empirically here rather than asserted. Any trim/AOT-analyzer
+         diagnostic from the codec boundary is scoped locally with a documented justification. -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Parquet.Net" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../DeltaSharp.Engine/DeltaSharp.Engine.csproj" />
+    <ProjectReference Include="../DeltaSharp.Abstractions/DeltaSharp.Abstractions.csproj" />
+  </ItemGroup>
+
+</Project>

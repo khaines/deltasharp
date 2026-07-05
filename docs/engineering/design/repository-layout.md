@@ -28,9 +28,11 @@
 | `DeltaSharp.Abstractions` | `src/DeltaSharp.Abstractions` | `net8.0;net10.0` | yes | Shared **packable** logical contracts — the `Core`↔`Engine` seam (ADR-0016). Multi-targeted so both `Core` and `Engine` can reference it while staying independent siblings. Root namespace `DeltaSharp`; types under `DeltaSharp.Types`. Trim/AOT-annotation-clean; PublicAPI-governed. **Scaffolded empty** in STORY-04.T.S1a; the ADR-0008 logical type model moves in atomically in S1b+S2. |
 | `DeltaSharp.Engine` | `src/DeltaSharp.Engine` | `net10.0` | no | Engine internals — **not part of the published package surface** (the assembly is never shipped as NuGet). `net10.0`-only so it can use the newest runtime and NativeAOT; not referenced by the public `net8.0` surface. |
 | `DeltaSharp.Executor` | `src/DeltaSharp.Executor` | `net10.0` | no | Representative NativeAOT executor host process. `PublishAot=true` is local to this executable project so AOT publish settings do not leak to public libraries. |
+| `DeltaSharp.Storage` | `src/DeltaSharp.Storage` | `net10.0` | no | Native Delta/Parquet storage internals (EPIC-05). `net10.0`-only, non-packable, sibling to Engine; references Engine + Abstractions (Engine never references it). First assembly with a third-party codec (Parquet.Net) → carries a committed `packages.lock.json`. |
 | `DeltaSharp.Core.Tests` | `tests/DeltaSharp.Core.Tests` | `net8.0;net10.0` | no | xUnit tests for `DeltaSharp.Core`, multi-targeted so both library targets are compiled and executed in CI. |
 | `DeltaSharp.Engine.Tests` | `tests/DeltaSharp.Engine.Tests` | `net10.0` | no | xUnit tests for `DeltaSharp.Engine` (matches the engine's single TFM). |
 | `DeltaSharp.Executor.Tests` | `tests/DeltaSharp.Executor.Tests` | `net10.0` | no | xUnit tests for `DeltaSharp.Executor` (matches the executor's single TFM). |
+| `DeltaSharp.Storage.Tests` | `tests/DeltaSharp.Storage.Tests` | `net10.0` | no | xUnit tests for `DeltaSharp.Storage` (Parquet round-trip parity, adapter conditional-put, malformed handling). |
 | `DeltaSharp.Samples.GettingStarted` | `samples/DeltaSharp.Samples.GettingStarted` | `net8.0` | no | Minimal example consuming `DeltaSharp.Core` from the current LTS. Compiled by the solution build; non-packable, so excluded from package validation. |
 
 > The skeleton is intentionally **inert**: it exposes no Apache Spark or Delta Lake
@@ -56,7 +58,7 @@ its code arrives:
 | `DeltaSharp.Core` | — | Public API + immutable logical plans (the only packable, multi-targeted surface). |
 | `DeltaSharp.Abstractions` | — | Shared **packable** contracts bridging the public surface and the engine — the `Core`↔`Engine` seam (ADR-0016). **Active** (`src/DeltaSharp.Abstractions`, `net8.0;net10.0`): scaffolded empty in STORY-04.T.S1a to hold the ADR-0008 logical type model, which moves in atomically in S1b+S2. See [shared-type-model.md](shared-type-model.md). |
 | `DeltaSharp.Engine` | data | Analyzer/optimizer, physical planning, vectorized execution internals. |
-| `DeltaSharp.Storage` (or `*.Delta`) | data | Delta transaction log, Parquet, object-store / PVC backends. |
+| `DeltaSharp.Storage` | data | Delta transaction log, Parquet, object-store / PVC backends. **Active** (`src/DeltaSharp.Storage`, `net10.0`, non-packable): EPIC-05 / FEAT-05.1 landed the vectorized Parquet reader/writer and the storage-adapter contract (Parquet.Net codec). See [storage-delta-architecture.md](storage-delta-architecture.md). |
 | `DeltaSharp.Distributed` | data | Driver/executor coordination and the native remote shuffle service (CODEOWNERS anticipates `/src/**/Shuffle/`). |
 | `DeltaSharp.Operator` | **control** | Kubernetes Operator, CRDs, reconcilers — kept out of executor hot paths. |
 | `DeltaSharp.Executor` (host exe) | data | Active representative NativeAOT executor host process (driver/executor task execution). |
@@ -125,7 +127,11 @@ status and expected compatibility** visible — are in
    from [`tests/Directory.Build.props`](../../../tests/Directory.Build.props)),
    and any production project (including the packable `DeltaSharp.Core`) the moment it
    gains its first third-party dependency. CI restores in locked mode and fails on an
-   out-of-date lock file. (SDK-only projects like the current Core/Engine deliberately
-   omit it, since their only locked package would be the patch-tied `ILLink.Tasks`.)
+   out-of-date lock file. `DeltaSharp.Engine` (Apache.Arrow) and `DeltaSharp.Storage`
+   (Parquet.Net) therefore carry a committed `packages.lock.json`; the still-SDK-only
+   `DeltaSharp.Core`/`DeltaSharp.Abstractions` deliberately omit one (their only locked
+   package would be the patch-tied `ILLink.Tasks` — the NU1004 hazard). Enabling the
+   lock file is NU1004-safe for Engine/Storage because they enable the trim/AOT
+   *analyzers* rather than `IsTrimmable`/`IsAotCompatible`, so no `ILLink.Tasks` is pulled.
 7. Once maintainers and code exist, activate the matching `CODEOWNERS` rule
    (see [`.github/CODEOWNERS`](../../../.github/CODEOWNERS)).

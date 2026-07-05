@@ -1,0 +1,134 @@
+using DeltaSharp.Engine.Columnar;
+using DeltaSharp.Storage.Parquet;
+using DeltaSharp.Types;
+using Parquet;
+using Parquet.Data;
+using Parquet.Schema;
+using Xunit;
+using StructField = DeltaSharp.Types.StructField;
+
+namespace DeltaSharp.Storage.Tests;
+
+/// <summary>
+/// Cross-engine standards-compliance checks: a DeltaSharp-written Parquet file is read back with
+/// Parquet.Net <b>directly</b> (not our reader) and asserted to carry equivalent data (AC1), and the
+/// footer must expose per-column statistics (AC3) plus the Delta/Spark schema metadata.
+/// </summary>
+public sealed class ParquetWriterTests
+{
+    private static readonly StructType Schema = new(new[]
+    {
+        new StructField("id", DataTypes.LongType, nullable: false),
+        new StructField("amount", DataTypes.CreateDecimalType(10, 2), nullable: true),
+        new StructField("label", DataTypes.StringType, nullable: true),
+    });
+
+    private static readonly long[] Ids = { 10L, 20L, 30L, 40L };
+    private static readonly long?[] AmountsUnscaled = { 12345L, null, -678L, 0L };
+    private static readonly string?[] Labels = { "alpha", string.Empty, null, "üni" };
+
+    private static ColumnBatch BuildKnownBatch()
+    {
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, Ids.Length);
+        MutableColumnVector amount = ColumnVectors.Create(DataTypes.CreateDecimalType(10, 2), Ids.Length);
+        MutableColumnVector label = ColumnVectors.Create(DataTypes.StringType, Ids.Length);
+        for (int i = 0; i < Ids.Length; i++)
+        {
+            id.AppendValue(Ids[i]);
+
+            if (AmountsUnscaled[i] is long unscaled)
+            {
+                amount.AppendValue(unscaled);
+            }
+            else
+            {
+                amount.AppendNull();
+            }
+
+            if (Labels[i] is string text)
+            {
+                label.AppendBytes(System.Text.Encoding.UTF8.GetBytes(text));
+            }
+            else
+            {
+                label.AppendNull();
+            }
+        }
+
+        return new ManagedColumnBatch(Schema, new ColumnVector[] { id, amount, label }, Ids.Length);
+    }
+
+    [Fact]
+    public async Task WrittenFile_IsReadableByParquetNetDirectly()
+    {
+        using var stream = new MemoryStream();
+        await new ParquetFileWriter().WriteAsync(stream, Schema, new[] { BuildKnownBatch() }, CancellationToken.None);
+        stream.Position = 0;
+
+        await using ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+        Assert.Equal(1, reader.RowGroupCount);
+
+        DataField[] fields = reader.Schema.DataFields;
+        DataField idField = Array.Find(fields, f => f.Name == "id")!;
+        DataField amountField = Array.Find(fields, f => f.Name == "amount")!;
+        DataField labelField = Array.Find(fields, f => f.Name == "label")!;
+
+        using ParquetRowGroupReader rowGroup = reader.OpenRowGroupReader(0);
+        Assert.Equal(Ids.Length, rowGroup.RowCount);
+
+        var idBuffer = new long[rowGroup.RowCount];
+        await rowGroup.ReadAsync<long>(idField, idBuffer.AsMemory(), null, CancellationToken.None);
+        Assert.Equal(Ids, idBuffer);
+
+        var amountBuffer = new decimal?[rowGroup.RowCount];
+        await rowGroup.ReadAsync<decimal>(amountField, amountBuffer.AsMemory(), null, CancellationToken.None);
+        Assert.Equal(new decimal?[] { 123.45m, null, -6.78m, 0.00m }, amountBuffer);
+
+        var labelBuffer = new string?[rowGroup.RowCount];
+        await rowGroup.ReadAsync(labelField, labelBuffer.AsMemory(), null, CancellationToken.None);
+        Assert.Equal(Labels, labelBuffer);
+    }
+
+    [Fact]
+    public async Task WrittenFile_ExposesColumnStatistics()
+    {
+        using var stream = new MemoryStream();
+        await new ParquetFileWriter().WriteAsync(stream, Schema, new[] { BuildKnownBatch() }, CancellationToken.None);
+        stream.Position = 0;
+
+        await using ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+        DataField idField = Array.Find(reader.Schema.DataFields, f => f.Name == "id")!;
+        DataField amountField = Array.Find(reader.Schema.DataFields, f => f.Name == "amount")!;
+
+        using ParquetRowGroupReader rowGroup = reader.OpenRowGroupReader(0);
+
+        DataColumnStatistics? idStats = rowGroup.GetStatistics(idField);
+        Assert.NotNull(idStats);
+        Assert.NotNull(idStats.MinValue);
+        Assert.NotNull(idStats.MaxValue);
+        Assert.Equal(10L, idStats.MinValue);
+        Assert.Equal(40L, idStats.MaxValue);
+        Assert.Equal(0L, idStats.NullCount);
+
+        DataColumnStatistics? amountStats = rowGroup.GetStatistics(amountField);
+        Assert.NotNull(amountStats);
+        Assert.Equal(1L, amountStats.NullCount);
+    }
+
+    [Fact]
+    public async Task WrittenFile_CarriesDeltaSchemaMetadata()
+    {
+        using var stream = new MemoryStream();
+        await new ParquetFileWriter().WriteAsync(stream, Schema, new[] { BuildKnownBatch() }, CancellationToken.None);
+        stream.Position = 0;
+
+        await using ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+
+        Assert.True(reader.CustomMetadata.ContainsKey(DeltaSchemaJson.SchemaMetadataKey));
+        string schemaJson = reader.CustomMetadata[DeltaSchemaJson.SchemaMetadataKey];
+        Assert.Contains("\"type\":\"struct\"", schemaJson);
+        Assert.Contains("\"name\":\"id\"", schemaJson);
+        Assert.Contains("\"name\":\"amount\"", schemaJson);
+        Assert.True(reader.CustomMetadata.ContainsKey(DeltaSchemaJson.WriterMetadataKey));
+    }
+}
