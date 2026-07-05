@@ -18,6 +18,12 @@ x86/
 *.opencover.xml
 *.cobertura.xml
 
+# Supply-chain security scan / SBOM outputs (generated locally or in CI; never commit)
+/sbom/
+/repro/
+/sca-report.json
+/sca-summary.md
+
 # NuGet
 *.nupkg
 *.snupkg

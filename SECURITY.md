@@ -31,6 +31,15 @@ Please include:
   public advisory, and credit you (with your consent) once a fix is available.
 - Please give us reasonable time to remediate before any public disclosure.
 
+## Supply-chain security
+
+DeltaSharp's supply-chain controls — GitHub-native secret scanning with push protection,
+dependency/SCA scanning and gating, SBOM generation, deterministic-build provenance, the
+artifact-signing posture, and the branch-protection policy — are documented in
+[docs/engineering/design/supply-chain-security.md](docs/engineering/design/supply-chain-security.md).
+Secret scanning with push protection is enabled on the repository; if you believe a real
+credential has been committed, report it through the private channel above so it can be rotated.
+
 ## Supported versions
 
 DeltaSharp is pre-release. Until a 1.0 release, only the latest `main` and the most
