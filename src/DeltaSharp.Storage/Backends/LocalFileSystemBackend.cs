@@ -37,6 +37,10 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
     private readonly string _realRoot;
     private readonly string _realRootWithSeparator;
 
+    // PERF: Redact is handed to every StagedWriteStream; binding the instance method once avoids
+    // allocating a fresh method-group delegate on each OpenWriteAsync call.
+    private readonly Func<string, string> _redactDelegate;
+
     // Local temp-file names must be unique so two concurrent staged writes never collide. A monotonic
     // per-process counter (not a banned nondeterministic id source) gives in-process uniqueness; the pod
     // hostname (Environment.MachineName) gives CROSS-process/cross-pod uniqueness on a shared RWX PVC,
@@ -76,6 +80,13 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
     // chain is resolved once per directory, not once per listed entry. Null/inert in production.
     internal static volatile Action<string>? ListDirectoryResolveProbe;
 
+    // Unified I/O fault seam (tests only): when non-null, its return for a given op tag REPLACES the real
+    // syscall at that op so a test can inject a root-bearing failure and prove a sanitizer non-vacuously.
+    // A null return (or a null hook) leaves the real syscall to run; null and inert in production. It is
+    // consulted at the exact op boundary of the read/write/flush/list/publish paths, so the injected
+    // exception flows into that site's EXISTING sanitizing catch.
+    internal static volatile Func<string, Exception?>? IoFaultHook;
+
     /// <summary>Creates a backend confined to <paramref name="tableRoot"/>. The directory is created if
     /// it does not exist so the backend is usable immediately.</summary>
     /// <exception cref="ArgumentException"><paramref name="tableRoot"/> is null or empty.</exception>
@@ -91,6 +102,9 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         // that ambient ancestor symlinks cancel out and only an *escape* is rejected.
         _realRoot = CanonicalizeExisting(_root);
         _realRootWithSeparator = _realRoot + Path.DirectorySeparatorChar;
+
+        // PERF: bind Redact once for reuse by every staged write (see _redactDelegate).
+        _redactDelegate = Redact;
     }
 
     /// <inheritdoc/>
@@ -108,6 +122,12 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         FileStream source;
         try
         {
+            Func<string, Exception?>? faultHook = IoFaultHook;
+            if (faultHook?.Invoke("read-open") is { } fault)
+            {
+                throw fault;
+            }
+
             source = new FileStream(
                 full, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 4096, useAsync: true);
         }
@@ -139,6 +159,12 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             var buffer = new byte[toRead];
             try
             {
+                Func<string, Exception?>? faultHook = IoFaultHook;
+                if (faultHook?.Invoke("read-io") is { } fault)
+                {
+                    throw fault;
+                }
+
                 await source.ReadExactlyAsync(buffer.AsMemory(), cancellationToken).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -163,6 +189,12 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
 
         try
         {
+            Func<string, Exception?>? faultHook = IoFaultHook;
+            if (faultHook?.Invoke("read-open") is { } fault)
+            {
+                throw fault;
+            }
+
             Stream stream = new FileStream(
                 full, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 4096, useAsync: true);
             return ValueTask.FromResult(stream);
@@ -195,7 +227,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             throw SurfaceFailure("Opening a staged write for", path, ex);
         }
 
-        Stream stream = new StagedWriteStream(inner, temp, full, directory, path, Redact);
+        Stream stream = new StagedWriteStream(inner, temp, full, directory, path, _redactDelegate);
         return ValueTask.FromResult(stream);
     }
 
@@ -325,11 +357,33 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             literalMatchPrefix = fullPrefix;
         }
 
-        string[] files = await Task.Run(
-            () => Directory.Exists(enumerationRoot)
-                ? Directory.GetFiles(enumerationRoot, "*", SearchOption.AllDirectories)
-                : Array.Empty<string>(),
-            cancellationToken).ConfigureAwait(false);
+        string[] files;
+        try
+        {
+            files = await Task.Run(
+                () =>
+                {
+                    Func<string, Exception?>? faultHook = IoFaultHook;
+                    if (faultHook?.Invoke("list-enumerate") is { } fault)
+                    {
+                        throw fault;
+                    }
+
+                    // S2: IgnoreInaccessible SKIPS an unreadable subtree instead of throwing a raw,
+                    // path-bearing UnauthorizedAccessException that would leak the mount/warehouse layout.
+                    return Directory.Exists(enumerationRoot)
+                        ? Directory.GetFiles(
+                            enumerationRoot, "*",
+                            new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true })
+                        : Array.Empty<string>();
+                },
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // S2: an enumeration failure surfaces a redacted, classified error, never a raw path leak.
+            throw SurfaceFailure("Listing", prefix, ex);
+        }
 
         Array.Sort(files, StringComparer.Ordinal);
 
@@ -358,14 +412,25 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             // the real path BEFORE reading Length/mtime closes a metadata TOCTOU -- otherwise a directory
             // symlink swapped in between a metadata read and the confinement check could leak an
             // out-of-root Length/mtime/ETag (cross-tenant metadata disclosure). A file under a symlinked
-            // ANCESTOR directory has a non-reparse leaf, yet Directory.GetFiles(..., AllDirectories)
+            // ANCESTOR directory has a non-reparse leaf, yet Directory.GetFiles with recursion enabled
             // follows directory symlinks and would surface it, so the ancestor chain (not just the leaf)
             // is resolved and confined (design §5.5 "no cross-tenant listing").
             string directory = Path.GetDirectoryName(file) ?? _root;
             if (!resolvedDirectories.TryGetValue(directory, out string? realDirectory))
             {
                 ListDirectoryResolveProbe?.Invoke(directory);
-                realDirectory = CanonicalizeExisting(directory);
+                try
+                {
+                    realDirectory = CanonicalizeExisting(directory);
+                }
+                catch (IOException)
+                {
+                    // S1: a symlink cycle (ELOOP) in this entry's ancestor chain makes ResolveLinkTarget
+                    // throw a raw, path-bearing IOException; skip the entry fail-closed so it neither
+                    // leaks the absolute path nor aborts the whole listing.
+                    continue;
+                }
+
                 resolvedDirectories[directory] = realDirectory;
             }
 
@@ -375,9 +440,27 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
                 continue;
             }
 
-            var info = new FileInfo(realFile);
-            yield return new StorageObjectInfo(
-                ToRelativeReal(realFile), info.Length, info.LastWriteTimeUtc, MakeETag(info));
+            StorageObjectInfo entry;
+            try
+            {
+                Func<string, Exception?>? faultHook = IoFaultHook;
+                if (faultHook?.Invoke("list-meta") is { } fault)
+                {
+                    throw fault;
+                }
+
+                var info = new FileInfo(realFile);
+                entry = new StorageObjectInfo(
+                    ToRelativeReal(realFile), info.Length, info.LastWriteTimeUtc, MakeETag(info));
+            }
+            catch (Exception ex) when (ex is FileNotFoundException or IOException)
+            {
+                // S3: the object vanished between enumeration and this metadata read (a delete race), so
+                // its FileInfo throws FileNotFoundException; skip it rather than leak a raw path.
+                continue;
+            }
+
+            yield return entry;
         }
     }
 
@@ -414,9 +497,29 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             return ValueTask.FromResult<StorageObjectInfo?>(null);
         }
 
-        var info = new FileInfo(full);
-        return ValueTask.FromResult<StorageObjectInfo?>(
-            new StorageObjectInfo(ToRelative(full), info.Length, info.LastWriteTimeUtc, MakeETag(info)));
+        try
+        {
+            Func<string, Exception?>? faultHook = IoFaultHook;
+            if (faultHook?.Invoke("head-meta") is { } injected)
+            {
+                throw injected;
+            }
+
+            var info = new FileInfo(full);
+            return ValueTask.FromResult<StorageObjectInfo?>(
+                new StorageObjectInfo(ToRelative(full), info.Length, info.LastWriteTimeUtc, MakeETag(info)));
+        }
+        catch (FileNotFoundException)
+        {
+            // S3: the object vanished between the File.Exists check and this metadata read (a delete
+            // race). Head is nullable and a vanished object is correctly reported as "not found".
+            return ValueTask.FromResult<StorageObjectInfo?>(null);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Any other metadata-read failure must not leak the absolute mount/warehouse path.
+            throw SurfaceFailure("Reading metadata for", path, ex);
+        }
     }
 
     // Atomically publishes the fsync'd temp file to the destination as the single-winner. Returns true
@@ -427,6 +530,15 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
     // MOVEFILE_REPLACE_EXISTING fails atomically when the destination exists.
     internal static bool TryAtomicPublish(string tempPath, string destinationPath)
     {
+        Func<string, Exception?>? faultHook = IoFaultHook;
+        if (faultHook?.Invoke("publish") is { } injected)
+        {
+            // Test-only: inject a publish-time failure BEFORE the real link/Move so the injected exception
+            // flows into the caller's publish catch and exercises its redaction non-vacuously. Inert in
+            // production (IoFaultHook is null).
+            throw injected;
+        }
+
         if (OperatingSystem.IsWindows())
         {
             try
@@ -637,7 +749,21 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
 
         // Real-target gate: follow symlinks on the existing portion and re-check containment, so a
         // lexically-clean path cannot tunnel out of the root through a planted symlink.
-        string realFull = CanonicalizeExisting(full);
+        string realFull;
+        try
+        {
+            realFull = CanonicalizeExisting(full);
+        }
+        catch (IOException)
+        {
+            // S1: a symlink cycle (ELOOP) under the root makes ResolveLinkTarget throw a raw, path-bearing,
+            // UNCLASSIFIED IOException that would escape before any sanitizer. Fail closed: reject as
+            // unconfined with a RELATIVE-path-only message so the absolute root never leaks and a
+            // catch(DeltaStorageException) caller still traps it.
+            throw DeltaStorageException.PathNotConfined(
+                $"Path '{path}' could not be resolved (possible symlink cycle) and is rejected.");
+        }
+
         bool realIsRoot = string.Equals(realFull, _realRoot, StringComparison.Ordinal);
         bool realIsUnderRoot = realFull.StartsWith(_realRootWithSeparator, StringComparison.Ordinal);
         if (!realIsUnderRoot && !(allowRoot && realIsRoot))
@@ -790,6 +916,12 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         {
             try
             {
+                Func<string, Exception?>? faultHook = LocalFileSystemBackend.IoFaultHook;
+                if (faultHook?.Invoke("flush") is { } fault)
+                {
+                    throw fault;
+                }
+
                 _inner.Flush();
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -802,6 +934,12 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         {
             try
             {
+                Func<string, Exception?>? faultHook = LocalFileSystemBackend.IoFaultHook;
+                if (faultHook?.Invoke("flush") is { } fault)
+                {
+                    throw fault;
+                }
+
                 await _inner.FlushAsync(cancellationToken).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -846,6 +984,12 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         {
             try
             {
+                Func<string, Exception?>? faultHook = LocalFileSystemBackend.IoFaultHook;
+                if (faultHook?.Invoke("write") is { } fault)
+                {
+                    throw fault;
+                }
+
                 await _inner.WriteAsync(buffer, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)

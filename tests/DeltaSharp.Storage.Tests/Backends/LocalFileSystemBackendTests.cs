@@ -903,6 +903,309 @@ public sealed class LocalFileSystemBackendTests : IDisposable
         Assert.EndsWith(".tmp", name);
     }
 
+    [Fact]
+    public async Task SymlinkCycle_IsRejectedFailClosed_WithoutLeakingRoot()
+    {
+        // S1 (Security): an IN-ROOT symlink cycle (cycleA -> cycleB -> cycleA) makes the confinement
+        // primitive's real-target canonicalization (ResolveLinkTarget final=true) throw a raw,
+        // path-bearing, UNCLASSIFIED IOException that escapes BEFORE any sanitizer -- leaking the absolute
+        // root AND evading a catch(DeltaStorageException) caller. EVERY op must instead fail closed with a
+        // CLASSIFIED PathNotConfined whose .Message and .ToString() (inner chain) exclude the root.
+        // Non-vacuous: removing the Resolve ELOOP catch reddens this with a raw, unclassified IOException.
+        string a = Path.Combine(_root, "cycleA");
+        string b = Path.Combine(_root, "cycleB");
+        try
+        {
+            File.CreateSymbolicLink(a, b); // cycleA -> cycleB
+            File.CreateSymbolicLink(b, a); // cycleB -> cycleA (an in-root ELOOP cycle)
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            // Symlink creation is unprivileged on this platform/run — the guard cannot be exercised here.
+            return;
+        }
+
+        try
+        {
+            await AssertCycleRejectedAsync(() => _backend.ReadRangeAsync("cycleA", 0, 1, CancellationToken.None).AsTask());
+            await AssertCycleRejectedAsync(() => _backend.OpenReadAsync("cycleA", CancellationToken.None).AsTask());
+            await AssertCycleRejectedAsync(() => _backend.DeleteAsync("cycleA", CancellationToken.None).AsTask());
+            await AssertCycleRejectedAsync(() => _backend.HeadAsync("cycleA", CancellationToken.None).AsTask());
+            await AssertCycleRejectedAsync(() => _backend.PutIfAbsentAsync("cycleA", new byte[] { 1 }, CancellationToken.None).AsTask());
+            await AssertCycleRejectedAsync(() => _backend.OpenWriteAsync("cycleA", CancellationToken.None).AsTask());
+        }
+        finally
+        {
+            try { File.Delete(a); } catch (IOException) { }
+            try { File.Delete(b); } catch (IOException) { }
+        }
+    }
+
+    private async Task AssertCycleRejectedAsync(Func<Task> action)
+    {
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(action);
+        Assert.Equal(StorageErrorKind.PathNotConfined, error.Kind);
+        Assert.DoesNotContain(_root, error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(_root, error.ToString(), StringComparison.Ordinal); // incl. inner chain
+    }
+
+    [Fact]
+    public async Task ReadOpenFault_ViaIoFaultHook_DoesNotLeakAbsolutePath()
+    {
+        // Q1 (Quality): the read-open sanitizer (OpenReadAsync / ReadRangeAsync open) is made non-vacuous
+        // via IoFaultHook. A root-bearing UnauthorizedAccessException injected at "read-open" must surface
+        // a DeltaStorageException whose .Message and .ToString() (inner chain) exclude the absolute root.
+        // Non-vacuous: reverting SurfaceFailure's Redact/synthetic-inner reddens these assertions.
+        await _backend.PutIfAbsentAsync("logs/r.json", new byte[] { 1 }, CancellationToken.None); // File.Exists passes
+
+        LocalFileSystemBackend.IoFaultHook = tag => tag == "read-open"
+            ? new UnauthorizedAccessException($"denied '{Path.Combine(_root, "x")}'")
+            : null;
+        try
+        {
+            DeltaStorageException openError = await Assert.ThrowsAsync<DeltaStorageException>(
+                () => _backend.OpenReadAsync("logs/r.json", CancellationToken.None).AsTask());
+            Assert.DoesNotContain(_root, openError.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(_root, openError.ToString(), StringComparison.Ordinal);
+
+            DeltaStorageException rangeError = await Assert.ThrowsAsync<DeltaStorageException>(
+                () => _backend.ReadRangeAsync("logs/r.json", 0, 1, CancellationToken.None).AsTask());
+            Assert.DoesNotContain(_root, rangeError.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(_root, rangeError.ToString(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            LocalFileSystemBackend.IoFaultHook = null;
+        }
+    }
+
+    [Fact]
+    public async Task StagedWriteOverrideFault_ViaIoFaultHook_DoesNotLeakAbsolutePath()
+    {
+        // Q2 (Quality): the StagedWriteStream.WriteAsync sanitizer is made non-vacuous via IoFaultHook. A
+        // root-bearing IOException injected at "write" during an OpenWriteAsync stream write must surface a
+        // DeltaStorageException whose .Message and .ToString() (inner chain) exclude the absolute root.
+        // Non-vacuous: reverting Sanitize's synthetic-inner to chain the raw exception reddens .ToString().
+        LocalFileSystemBackend.IoFaultHook = tag => tag == "write"
+            ? new IOException($"No space left on device : '{Path.Combine(_root, "logs", "w.tmp")}'")
+            : null;
+        try
+        {
+            Stream stream = await _backend.OpenWriteAsync("logs/w.parquet", CancellationToken.None);
+            DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(async () =>
+            {
+                await using (stream.ConfigureAwait(false))
+                {
+                    await stream.WriteAsync(new byte[] { 1, 2, 3 });
+                }
+            });
+            Assert.Equal(StorageErrorKind.Transient, error.Kind);
+            Assert.DoesNotContain(_root, error.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(_root, error.ToString(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            LocalFileSystemBackend.IoFaultHook = null;
+        }
+    }
+
+    [Fact]
+    public async Task StagedWriteFlushFault_ViaIoFaultHook_DoesNotLeakAbsolutePath()
+    {
+        // Quality: the StagedWriteStream.Flush/FlushAsync sanitizer is made non-vacuous via IoFaultHook. A
+        // root-bearing IOException injected at "flush" during an explicit FlushAsync must surface a
+        // DeltaStorageException whose .Message and .ToString() exclude the absolute root.
+        LocalFileSystemBackend.IoFaultHook = tag => tag == "flush"
+            ? new IOException($"No space left on device : '{Path.Combine(_root, "logs", "f.tmp")}'")
+            : null;
+        try
+        {
+            Stream stream = await _backend.OpenWriteAsync("logs/f.parquet", CancellationToken.None);
+            DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(async () =>
+            {
+                await using (stream.ConfigureAwait(false))
+                {
+                    await stream.FlushAsync(CancellationToken.None);
+                }
+            });
+            Assert.Equal(StorageErrorKind.Transient, error.Kind);
+            Assert.DoesNotContain(_root, error.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(_root, error.ToString(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            LocalFileSystemBackend.IoFaultHook = null;
+        }
+    }
+
+    [Fact]
+    public async Task PublishFault_ViaIoFaultHook_DoesNotLeakAbsolutePath()
+    {
+        // publish (Security/Quality): a root-bearing IOException injected at "publish" (BEFORE the real
+        // link/Move) flows into the PutIfAbsent publish catch, which must redact + attach a path-free
+        // synthetic inner. Both .Message and .ToString() (inner chain) must exclude the absolute root.
+        // Non-vacuous: reverting the publish-catch Redact/synthetic-inner reddens these assertions.
+        LocalFileSystemBackend.IoFaultHook = tag => tag == "publish"
+            ? new IOException($"I/O error : '{Path.Combine(_root, "logs", "p.tmp")}'")
+            : null;
+        try
+        {
+            DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+                () => _backend.PutIfAbsentAsync("logs/p.json", new byte[] { 1 }, CancellationToken.None).AsTask());
+            Assert.Equal(StorageErrorKind.RetryUnsafeAmbiguous, error.Kind);
+            Assert.DoesNotContain(_root, error.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(_root, error.ToString(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            LocalFileSystemBackend.IoFaultHook = null;
+        }
+    }
+
+    [Fact]
+    public async Task ListEnumerateFault_ViaIoFaultHook_SurfacesCleanDeltaStorageException()
+    {
+        // S2 (Security): a root-bearing exception injected at "list-enumerate" (the recursive GetFiles)
+        // must surface a CLASSIFIED, redacted DeltaStorageException — never a raw path leak. Non-vacuous:
+        // removing the list-enumerate sanitizing catch lets the raw exception escape the iterator and
+        // reddens the Kind + no-leak assertions.
+        await _backend.PutIfAbsentAsync("d/obj.bin", new byte[] { 1 }, CancellationToken.None);
+
+        LocalFileSystemBackend.IoFaultHook = tag => tag == "list-enumerate"
+            ? new UnauthorizedAccessException($"denied '{Path.Combine(_root, "d")}'")
+            : null;
+        try
+        {
+            DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(async () =>
+            {
+                await foreach (StorageObjectInfo _ in _backend.ListAsync("d/", CancellationToken.None))
+                {
+                }
+            });
+            Assert.Equal(StorageErrorKind.Transient, error.Kind);
+            Assert.DoesNotContain(_root, error.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(_root, error.ToString(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            LocalFileSystemBackend.IoFaultHook = null;
+        }
+    }
+
+    [Fact]
+    public async Task ListMetaFault_ViaIoFaultHook_SkipsEntryWithoutLeaking()
+    {
+        // S3 (Security): an object that vanishes between enumeration and its metadata read (a delete race)
+        // makes FileInfo throw FileNotFoundException; the entry is SKIPPED, never surfaced with a raw path.
+        // Injected at "list-meta" via IoFaultHook. Non-vacuous: removing the list-meta hook consult yields
+        // the entry (Assert.Empty reddens); removing the try/catch lets the exception escape the iterator.
+        await _backend.PutIfAbsentAsync("m/only.bin", new byte[] { 1 }, CancellationToken.None);
+
+        LocalFileSystemBackend.IoFaultHook = tag => tag == "list-meta"
+            ? new FileNotFoundException($"vanished '{Path.Combine(_root, "m", "only.bin")}'")
+            : null;
+        var paths = new List<string>();
+        try
+        {
+            await foreach (StorageObjectInfo info in _backend.ListAsync("m/", CancellationToken.None))
+            {
+                paths.Add(info.Path);
+            }
+        }
+        finally
+        {
+            LocalFileSystemBackend.IoFaultHook = null;
+        }
+
+        Assert.Empty(paths); // the sole entry's metadata read faulted, so it is skipped, not surfaced
+    }
+
+    [Fact]
+    public async Task HeadMetaFault_ViaIoFaultHook_DoesNotLeakAbsolutePath()
+    {
+        // S3 (Security): a HeadAsync metadata-read failure OTHER than a vanished object (FileNotFound ->
+        // null) must surface a DeltaStorageException whose .Message and .ToString() exclude the absolute
+        // root. Injected at "head-meta" via IoFaultHook. Non-vacuous: reverting SurfaceFailure's
+        // Redact/synthetic-inner reddens; a plain FileNotFoundException instead returns null (control).
+        await _backend.PutIfAbsentAsync("h/obj.bin", new byte[] { 1 }, CancellationToken.None); // File.Exists passes
+
+        LocalFileSystemBackend.IoFaultHook = tag => tag == "head-meta"
+            ? new UnauthorizedAccessException($"denied '{Path.Combine(_root, "h", "obj.bin")}'")
+            : null;
+        try
+        {
+            DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+                () => _backend.HeadAsync("h/obj.bin", CancellationToken.None).AsTask());
+            Assert.DoesNotContain(_root, error.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(_root, error.ToString(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            LocalFileSystemBackend.IoFaultHook = null;
+        }
+
+        // Control: a vanished object (FileNotFoundException) is reported as "not found" (null), not surfaced.
+        LocalFileSystemBackend.IoFaultHook = tag => tag == "head-meta"
+            ? new FileNotFoundException($"vanished '{Path.Combine(_root, "h", "obj.bin")}'")
+            : null;
+        try
+        {
+            Assert.Null(await _backend.HeadAsync("h/obj.bin", CancellationToken.None));
+        }
+        finally
+        {
+            LocalFileSystemBackend.IoFaultHook = null;
+        }
+    }
+
+    [Fact]
+    public async Task List_SkipsUnreadableSubtree_WithoutRawLeak()
+    {
+        // S2 (Security): an unreadable subdirectory under the root must be SKIPPED by the listing
+        // (IgnoreInaccessible), never surface a raw path-bearing UnauthorizedAccessException. Non-vacuous:
+        // reverting GetFiles to SearchOption.AllDirectories makes the unreadable subtree throw, which the
+        // list-enumerate catch then surfaces as a DeltaStorageException instead of a clean listing.
+        if (OperatingSystem.IsWindows())
+        {
+            return; // Unix file-mode gating is unavailable; the unreadable-subdir trigger cannot be set here.
+        }
+
+        await _backend.PutIfAbsentAsync("ok.bin", new byte[] { 1 }, CancellationToken.None);
+        await _backend.PutIfAbsentAsync("locked/secret.bin", new byte[] { 2 }, CancellationToken.None);
+        string locked = Path.Combine(_root, "locked");
+        File.SetUnixFileMode(locked, UnixFileMode.None); // no r/x -> recursion into it is inaccessible
+
+        // The mode gate is ineffective under a uid that bypasses DAC (e.g. root in CI); probe and skip.
+        try
+        {
+            _ = Directory.GetFiles(locked);
+            File.SetUnixFileMode(
+                locked, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            return; // mode not enforced for this uid (root) — trigger unavailable
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Good: the subdir is genuinely inaccessible for this uid; the skip will be exercised.
+        }
+
+        try
+        {
+            var paths = new List<string>();
+            await foreach (StorageObjectInfo info in _backend.ListAsync(string.Empty, CancellationToken.None))
+            {
+                paths.Add(info.Path);
+            }
+
+            Assert.Contains("ok.bin", paths); // the readable entry is still surfaced
+            Assert.DoesNotContain(paths, p => p.Contains("secret", StringComparison.Ordinal)); // subtree skipped
+        }
+        finally
+        {
+            File.SetUnixFileMode(
+                locked, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+    }
+
     private static string SanitizeHostForTest(string host)
     {
         if (string.IsNullOrEmpty(host))
