@@ -84,6 +84,21 @@ public sealed class SparkSession : IDisposable
     private IQueryExecutor? _queryExecutor;
     private int _state = StateActive;
 
+    /// <summary>
+    /// Test-only deterministic interleaving seam, invoked by <see cref="GetOrCreate"/> after it has
+    /// read this session's <see cref="IsActive"/> state <b>under <c>_globalLock</c></b> and committed
+    /// to reusing it, immediately before it returns the session. <see langword="null"/> (and therefore
+    /// inert — a single volatile read, no allocation, no call) in production. It exists so the B2
+    /// TOCTOU concurrency test can force the exact dangerous interleaving — pause the getter inside the
+    /// lock at the reuse window and drive a concurrent <see cref="Stop"/> — and observe whether the
+    /// stop's state transition could land before the getter returns. With the fix the seam runs
+    /// <i>under <c>_globalLock</c></i>, so a racing <c>Stop</c> (whose transition needs the same lock)
+    /// cannot flip the session to stopped while the getter holds it; without the fix it can, exposing
+    /// the reuse of a stopped session. Symmetric with <see cref="RuntimeConfig.StopRaceProbe"/> (the F1
+    /// seam). See <c>SparkSessionConcurrencyTests</c>.
+    /// </summary>
+    internal volatile Action? ReuseRaceProbe;
+
     private SparkSession(IReadOnlyDictionary<string, string> options)
     {
         _conf = new RuntimeConfig(this, options);
@@ -397,6 +412,9 @@ public sealed class SparkSession : IDisposable
             if (active is not null && active.IsActive)
             {
                 ApplyOptions(active, options);
+                // Test seam: fire at the reuse window — decision made under _globalLock, session still
+                // held active by the lock, about to be returned. Inert (null) in production.
+                active.ReuseRaceProbe?.Invoke();
                 return active;
             }
 
@@ -404,6 +422,8 @@ public sealed class SparkSession : IDisposable
             {
                 ApplyOptions(_defaultSession, options);
                 _activeSession.Value = _defaultSession;
+                // Test seam: see the active-path note above.
+                _defaultSession.ReuseRaceProbe?.Invoke();
                 return _defaultSession;
             }
 
