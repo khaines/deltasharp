@@ -3,35 +3,21 @@
   <!--
     Unit tests for DeltaSharp.Engine. Targets net10.0 only, matching the engine's
     single TFM (ADR-0014), and establishes the one-test-project-per-source-project
-    convention for the engine seam. Not packable.
+    convention for the engine seam. The xUnit toolchain, coverage collector, NuGet lock-file
+    policy, and the deterministic-seed harness are inherited from tests/Directory.Build.props
+    (STORY-00.5.1). Not packable.
   -->
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <RootNamespace>DeltaSharp.Engine.Tests</RootNamespace>
     <AssemblyName>DeltaSharp.Engine.Tests</AssemblyName>
-    <IsPackable>false</IsPackable>
-    <IsTestProject>true</IsTestProject>
     <!-- The off-heap allocator tests inject the native allocation primitive (an unsafe `void*` delegate)
          to simulate OOM, so this test project opts into unsafe locally — matching the Engine's project-local
          AllowUnsafeBlocks, not Directory.Build.props. -->
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <!-- Lock third-party versions for reproducible, drift-detecting restores
-         (CI enforces in locked mode); see DeltaSharp.Core.Tests for rationale. -->
-    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.NET.Test.Sdk" />
-    <PackageReference Include="xunit" />
-    <PackageReference Include="xunit.runner.visualstudio">
-      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
-      <PrivateAssets>all</PrivateAssets>
-    </PackageReference>
-    <!-- Coverage data collector (STORY-00.2.3). PrivateAssets=all: test-only, never shipped. -->
-    <PackageReference Include="coverlet.collector">
-      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
-      <PrivateAssets>all</PrivateAssets>
-    </PackageReference>
     <!-- The Arrow-backed ColumnVector tests build Apache.Arrow input arrays at the interop edge. -->
     <PackageReference Include="Apache.Arrow" />
   </ItemGroup>
