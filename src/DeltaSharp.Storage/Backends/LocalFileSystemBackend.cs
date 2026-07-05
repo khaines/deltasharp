@@ -156,7 +156,20 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         string directory = Path.GetDirectoryName(full) ?? _root;
         Directory.CreateDirectory(directory);
 
-        FileStream inner = CreateFreshTemp(full, ".tmp", out string temp);
+        FileStream inner;
+        string temp;
+        try
+        {
+            inner = CreateFreshTemp(full, ".tmp", out temp);
+        }
+        catch (Exception ex)
+        {
+            // RF-8: surface only the caller-relative path (root-redacted message), never the absolute
+            // mount/warehouse layout, on a staging-create failure (read-only PVC, quota, missing parent).
+            throw DeltaStorageException.Transient(
+                $"Opening a staged write for '{path}' failed: {Redact(ex.Message)}", ex);
+        }
+
         Stream stream = new StagedWriteStream(inner, temp, full, directory, path);
         return ValueTask.FromResult(stream);
     }
@@ -183,7 +196,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         catch (Exception ex)
         {
             throw DeltaStorageException.Transient(
-                $"Staging conditional-create of '{path}' failed: {ex.Message}", ex);
+                $"Staging conditional-create of '{path}' failed: {Redact(ex.Message)}", ex);
         }
 
         try
@@ -203,7 +216,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         {
             TryDelete(temp);
             throw DeltaStorageException.Transient(
-                $"Staging conditional-create of '{path}' failed: {ex.Message}", ex);
+                $"Staging conditional-create of '{path}' failed: {Redact(ex.Message)}", ex);
         }
 
         // Publish: the atomic single-winner. A lost race deletes the temp and returns false — never an
@@ -523,11 +536,35 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             {
                 // A foreign temp already owns this name: retry with a fresh ordinal, never deleting it.
             }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // A genuine staging-create failure (permissions, no space, missing parent, or a final-
+                // attempt collision). Surface only the file NAME and the failure TYPE -- never the absolute
+                // directory path (nor the path-bearing framework exception as an inner) -- so a caller that
+                // logs this cannot learn the internal mount/warehouse layout (RF-8 message hygiene).
+                throw new IOException(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"Could not create staging temp '{Path.GetFileName(candidate)}' ({ex.GetType().Name})."));
+            }
         }
 
         throw new IOException(string.Create(
             CultureInfo.InvariantCulture,
-            $"Could not create a unique staging temp for '{destinationFull}' after {MaxTempAttempts} attempts."));
+            $"Could not create a unique staging temp for '{Path.GetFileName(destinationFull)}' after {MaxTempAttempts} attempts."));
+    }
+
+    // Strips the confined table root (both its lexical and real forms) from a message so a surfaced error
+    // never discloses the internal mount/warehouse layout (RF-7/RF-8 message hygiene). A relative object
+    // path or a bare file name is retained -- only the absolute root prefix is redacted.
+    private string Redact(string message)
+    {
+        string redacted = message.Replace(_root, "<table-root>", StringComparison.Ordinal);
+        if (!string.Equals(_realRoot, _root, StringComparison.Ordinal))
+        {
+            redacted = redacted.Replace(_realRoot, "<table-root>", StringComparison.Ordinal);
+        }
+
+        return redacted;
     }
 
     // Canonicalizes an incoming path and confines it to the table root, rejecting fail-closed anything

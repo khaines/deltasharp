@@ -744,6 +744,43 @@ public sealed class LocalFileSystemBackendTests : IDisposable
     }
 
     [Fact]
+    public async Task StagingCreateFailure_DoesNotLeakAbsoluteStoragePath()
+    {
+        // RF-8 (Security): a staging-create failure (here a read-only target directory: the RO-PVC / quota
+        // class) must surface an error that discloses only the caller-relative object path, never the
+        // absolute mount/warehouse layout — in BOTH the message and the inner exception chain. Non-vacuous:
+        // reverting CreateFreshTempFrom's clean-wrap or the Redact() on the staging catch reintroduces the
+        // absolute path into Message/ToString and reddens the assertions.
+        if (OperatingSystem.IsWindows())
+        {
+            return; // Unix file-mode gating is unavailable; the RO-directory trigger cannot be set here.
+        }
+
+        string dir = Path.Combine(_root, "sekret-warehouse");
+        Directory.CreateDirectory(dir);
+        File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserExecute); // no write -> CreateNew fails
+        try
+        {
+            DeltaStorageException putError = await Assert.ThrowsAsync<DeltaStorageException>(
+                () => _backend.PutIfAbsentAsync(
+                    "sekret-warehouse/obj.json", new byte[] { 1 }, CancellationToken.None).AsTask());
+            Assert.Equal(StorageErrorKind.Transient, putError.Kind);
+            Assert.DoesNotContain(_root, putError.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(_root, putError.ToString(), StringComparison.Ordinal); // incl. inner chain
+
+            DeltaStorageException openError = await Assert.ThrowsAsync<DeltaStorageException>(
+                () => _backend.OpenWriteAsync("sekret-warehouse/obj.parquet", CancellationToken.None).AsTask());
+            Assert.DoesNotContain(_root, openError.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(_root, openError.ToString(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.SetUnixFileMode(
+                dir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+    }
+
+    [Fact]
     public void BuildTempName_IncludesSanitizedMachineNameForCrossPodUniqueness()
     {
         // CF-4: the temp name embeds the (sanitized) pod hostname so two pods with identical PIDs on a
