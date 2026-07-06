@@ -441,11 +441,12 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
 
                     realDirectory = CanonicalizeExisting(directory);
                 }
-                catch (IOException)
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
-                    // S1: a symlink cycle (ELOOP) in this entry's ancestor chain makes ResolveLinkTarget
-                    // throw a raw, path-bearing IOException; skip the entry fail-closed so it neither
-                    // leaks the absolute path nor aborts the whole listing.
+                    // S1/RF-8f: canonicalizing this entry's ancestor chain can throw a raw, path-bearing
+                    // framework exception -- an IOException on a symlink cycle (ELOOP) or an
+                    // UnauthorizedAccessException when ResolveLinkTarget crosses an EACCES component. Skip
+                    // the entry fail-closed so it neither leaks the absolute path nor aborts the listing.
                     continue;
                 }
 
@@ -770,16 +771,24 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         string realFull;
         try
         {
+            Func<string, Exception?>? faultHook = IoFaultHook;
+            if (faultHook?.Invoke("resolve-canon") is { } fault)
+            {
+                throw fault;
+            }
+
             realFull = CanonicalizeExisting(full);
         }
-        catch (IOException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // S1: a symlink cycle (ELOOP) under the root makes ResolveLinkTarget throw a raw, path-bearing,
-            // UNCLASSIFIED IOException that would escape before any sanitizer. Fail closed: reject as
-            // unconfined with a RELATIVE-path-only message so the absolute root never leaks and a
-            // catch(DeltaStorageException) caller still traps it.
+            // S1/RF-8f: canonicalizing the real target can throw a raw, path-bearing, UNCLASSIFIED
+            // framework exception -- an IOException on a symlink cycle (ELOOP), or an
+            // UnauthorizedAccessException when ResolveLinkTarget crosses an EACCES component. Either would
+            // escape before any sanitizer. Fail closed uniformly: reject as unconfined with a
+            // RELATIVE-path-only message so the absolute root never leaks and a catch(DeltaStorageException)
+            // caller still traps it.
             throw DeltaStorageException.PathNotConfined(
-                $"Path '{path}' could not be resolved (possible symlink cycle) and is rejected.");
+                $"Path '{path}' could not be resolved (possible symlink cycle or inaccessible ancestor) and is rejected.");
         }
 
         bool realIsRoot = string.Equals(realFull, _realRoot, StringComparison.Ordinal);

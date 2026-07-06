@@ -1032,6 +1032,170 @@ public sealed class LocalFileSystemBackendTests : IDisposable
     }
 
     [Fact]
+    public async Task ResolveCanonFault_UnauthorizedAccess_RejectsClassifiedWithoutLeaking()
+    {
+        // Balanced/RF-8f: the Resolve real-target canonicalization can throw UnauthorizedAccessException
+        // (ResolveLinkTarget crossing an EACCES ancestor), not just IOException/ELOOP. It must fail closed
+        // as a CLASSIFIED PathNotConfined with a relative-only message, on EVERY operation. Non-vacuous:
+        // narrowing the canon catch back to IOException-only lets the UAE escape raw with the absolute path.
+        await _backend.PutIfAbsentAsync("rc.bin", new byte[] { 1 }, CancellationToken.None);
+
+        LocalFileSystemBackend.IoFaultHook = tag => tag == "resolve-canon"
+            ? new UnauthorizedAccessException($"denied '{Path.Combine(_root, "rc.bin")}'")
+            : null;
+        try
+        {
+            foreach (Func<Task> op in new Func<Task>[]
+            {
+                () => _backend.OpenReadAsync("rc.bin", CancellationToken.None).AsTask(),
+                () => _backend.DeleteAsync("rc.bin", CancellationToken.None).AsTask(),
+                () => _backend.HeadAsync("rc.bin", CancellationToken.None).AsTask(),
+                () => _backend.PutIfAbsentAsync("rc.bin", new byte[] { 1 }, CancellationToken.None).AsTask(),
+            })
+            {
+                DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(op);
+                Assert.Equal(StorageErrorKind.PathNotConfined, error.Kind);
+                Assert.DoesNotContain(_root, error.Message, StringComparison.Ordinal);
+                Assert.DoesNotContain(_root, error.ToString(), StringComparison.Ordinal);
+            }
+        }
+        finally
+        {
+            LocalFileSystemBackend.IoFaultHook = null;
+        }
+    }
+
+    [Fact]
+    public async Task ListCanonFault_UnauthorizedAccess_SkipsEntryWithoutLeaking()
+    {
+        // Balanced/RF-8f: an UnauthorizedAccessException canonicalizing an entry's ancestor (EACCES race)
+        // must be skipped fail-closed like the ELOOP/IOException case, not leak the absolute path.
+        // Non-vacuous: narrowing the list-canon catch to IOException-only lets the UAE escape the iterator.
+        await _backend.PutIfAbsentAsync("lcu/only.bin", new byte[] { 1 }, CancellationToken.None);
+
+        LocalFileSystemBackend.IoFaultHook = tag => tag == "list-canon"
+            ? new UnauthorizedAccessException($"denied '{Path.Combine(_root, "lcu")}'")
+            : null;
+        var paths = new List<string>();
+        try
+        {
+            await foreach (StorageObjectInfo info in _backend.ListAsync("lcu/", CancellationToken.None))
+            {
+                paths.Add(info.Path);
+            }
+        }
+        finally
+        {
+            LocalFileSystemBackend.IoFaultHook = null;
+        }
+
+        Assert.Empty(paths);
+    }
+
+    [Fact]
+    public async Task ListMetaFault_GenericIOException_SkipsEntryWithoutLeaking()
+    {
+        // Quality: the list-meta catch's generic IOException branch (distinct from FileNotFound/Unauthorized)
+        // must also skip fail-closed. Non-vacuous: dropping "or IOException" from the filter lets it escape.
+        await _backend.PutIfAbsentAsync("lg/only.bin", new byte[] { 1 }, CancellationToken.None);
+
+        LocalFileSystemBackend.IoFaultHook = tag => tag == "list-meta"
+            ? new IOException($"io error '{Path.Combine(_root, "lg", "only.bin")}'")
+            : null;
+        var paths = new List<string>();
+        try
+        {
+            await foreach (StorageObjectInfo info in _backend.ListAsync("lg/", CancellationToken.None))
+            {
+                paths.Add(info.Path);
+            }
+        }
+        finally
+        {
+            LocalFileSystemBackend.IoFaultHook = null;
+        }
+
+        Assert.Empty(paths);
+    }
+
+    [Fact]
+    public async Task StagedWritePublishFault_ViaIoFaultHook_DoesNotLeakAbsolutePath()
+    {
+        // Quality: the StagedWriteStream.Publish ambiguous-publish redaction (Windows-parity path) is made
+        // non-vacuous. A root-bearing exception injected at "publish" flows through CompleteAsync -> Publish
+        // and must surface a RetryUnsafeAmbiguous DeltaStorageException root-free in .Message + .ToString().
+        LocalFileSystemBackend.IoFaultHook = tag => tag == "publish"
+            ? new IOException($"publish io '{Path.Combine(_root, "sp.parquet")}'")
+            : null;
+        try
+        {
+            Stream stream = await _backend.OpenWriteAsync("sp.parquet", CancellationToken.None);
+            DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(async () =>
+            {
+                await using (stream.ConfigureAwait(false))
+                {
+                    await stream.WriteAsync(new byte[] { 1, 2 });
+                    await ((ICompletableWriteStream)stream).CompleteAsync(CancellationToken.None);
+                }
+            });
+            Assert.DoesNotContain(_root, error.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(_root, error.ToString(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            LocalFileSystemBackend.IoFaultHook = null;
+        }
+    }
+
+    [Fact]
+    public void CreateFreshTempFrom_CreateFailure_ThrowsFileNameOnlyWithoutLeakingPath()
+    {
+        // Quality: CreateFreshTempFrom's clean-wrap (defense-in-depth at source) reports only the file NAME
+        // + failure type on a create failure, never the absolute path. Deterministic + root-safe: a missing
+        // parent directory makes FileMode.CreateNew throw a path-bearing DirectoryNotFoundException that the
+        // clean-wrap converts to a file-name-only IOException. Non-vacuous: reverting the clean-wrap to raw-
+        // rethrow leaks the absolute path.
+        Directory.CreateDirectory(_root);
+        string destInMissingParent = Path.Combine(_root, "no-such-dir", "obj.bin");
+
+        var ordinals = new Queue<long>(new long[] { 1, 2, 3 });
+        IOException error = Assert.Throws<IOException>(() =>
+            LocalFileSystemBackend.CreateFreshTempFrom(
+                destInMissingParent, ".tmp", () => ordinals.Dequeue(), out _));
+
+        Assert.IsNotType<DirectoryNotFoundException>(error); // wrapped, not the raw framework type
+        Assert.DoesNotContain(_root, error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(_root, error.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task List_SkipsLeafSymlinkReparsePoint()
+    {
+        // Quality: a leaf symlink (reparse point) is skipped from a listing (design §5.5 -- a listing
+        // surfaces real objects, not link entries). Non-vacuous: removing the leaf reparse-skip surfaces the
+        // symlink. Deterministic; skips where symlink creation is unprivileged.
+        await _backend.PutIfAbsentAsync("ls/real.bin", new byte[] { 1, 2 }, CancellationToken.None);
+        string link = Path.Combine(_root, "ls", "link.bin");
+        try
+        {
+            File.CreateSymbolicLink(link, Path.Combine(_root, "ls", "real.bin"));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            return; // symlink creation unprivileged on this platform/run
+        }
+
+        var paths = new List<string>();
+        await foreach (StorageObjectInfo info in _backend.ListAsync("ls/", CancellationToken.None))
+        {
+            paths.Add(info.Path);
+        }
+
+        Assert.Contains("ls/real.bin", paths);
+        Assert.DoesNotContain(paths, p => p.Contains("link.bin", StringComparison.Ordinal)); // symlink leaf skipped
+    }
+
+    [Fact]
     public void BuildTempName_IncludesSanitizedMachineNameForCrossPodUniqueness()
     {
         // CF-4: the temp name embeds the (sanitized) pod hostname so two pods with identical PIDs on a
