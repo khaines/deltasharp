@@ -77,8 +77,68 @@ internal static partial class PosixInterop
     /// <summary>The <c>O_RDONLY</c> open flag (0 on Linux and macOS).</summary>
     internal const int O_RDONLY = 0;
 
-    /// <summary>The <c>EEXIST</c> errno (17 on Linux and macOS): the link target already exists.</summary>
+    /// <summary>The <c>O_WRONLY</c> open flag (1 on Linux and macOS).</summary>
+    internal const int O_WRONLY = 1;
+
+    /// <summary>The <c>EEXIST</c> errno (17 on Linux and macOS): the link/create target already exists.</summary>
     internal const int EEXIST = 17;
+
+    /// <summary>The <c>ENOENT</c> errno (2 on Linux and macOS): a path component does not exist.</summary>
+    internal const int ENOENT = 2;
+
+    /// <summary>The <c>ENOTDIR</c> errno (20 on Linux and macOS): a path component is not a directory.</summary>
+    internal const int ENOTDIR = 20;
+
+    private static readonly bool IsMac = OperatingSystem.IsMacOS();
+
+    /// <summary>The <c>O_DIRECTORY</c> open flag — fail unless the target is a directory. Linux
+    /// <c>0200000</c> (65536), macOS <c>0x100000</c> (1048576).</summary>
+    internal static readonly int O_DIRECTORY = IsMac ? 0x100000 : 0x10000;
+
+    /// <summary>The <c>O_NOFOLLOW</c> open flag — fail (<see cref="ELOOP"/>) if the final component is a
+    /// symbolic link, the load-bearing anti-symlink control. Linux <c>0400000</c> (131072), macOS
+    /// <c>0x100</c> (256).</summary>
+    internal static readonly int O_NOFOLLOW = IsMac ? 0x100 : 0x20000;
+
+    /// <summary>The <c>O_CLOEXEC</c> open flag — close the descriptor across <c>exec</c>. Linux
+    /// <c>02000000</c> (524288), macOS <c>0x1000000</c> (16777216).</summary>
+    internal static readonly int O_CLOEXEC = IsMac ? 0x1000000 : 0x80000;
+
+    /// <summary>The <c>O_CREAT</c> open flag. Linux <c>0100</c> (64), macOS <c>0x200</c> (512).</summary>
+    internal static readonly int O_CREAT = IsMac ? 0x200 : 0x40;
+
+    /// <summary>The <c>O_EXCL</c> open flag — with <see cref="O_CREAT"/>, fail
+    /// (<see cref="EEXIST"/>) if the target already exists. Linux <c>0200</c> (128), macOS
+    /// <c>0x800</c> (2048).</summary>
+    internal static readonly int O_EXCL = IsMac ? 0x800 : 0x80;
+
+    /// <summary>The <c>ELOOP</c> errno — an <see cref="O_NOFOLLOW"/> open hit a symbolic link (or too
+    /// many links). Linux <c>40</c>, macOS <c>62</c>. This is the signal that a path component was a
+    /// symlink (a confinement-escape attempt).</summary>
+    internal static readonly int ELOOP = IsMac ? 62 : 40;
+
+    /// <summary>The <c>AT_REMOVEDIR</c> flag for <see cref="UnlinkAt"/> (unused for files but reserved).
+    /// Linux <c>0x200</c> (512), macOS <c>0x80</c> (128).</summary>
+    internal static readonly int AT_REMOVEDIR = IsMac ? 0x80 : 0x200;
+
+    /// <summary>Byte offset of <c>st_size</c> (an <see cref="long"/>) within <c>struct stat</c>. macOS
+    /// <c>96</c>; Linux (glibc x86-64/arm64) <c>48</c>. Verified empirically; cross-checked at runtime
+    /// against <see cref="System.IO.RandomAccess.GetLength(Microsoft.Win32.SafeHandles.SafeFileHandle)"/>
+    /// so a wrong layout fails closed rather than returning garbage.</summary>
+    internal static readonly int StatSizeOffset = IsMac ? 96 : 48;
+
+    /// <summary>Byte offset of <c>st_mtim(e)spec.tv_sec</c> (an <see cref="long"/>) within
+    /// <c>struct stat</c>. macOS <c>48</c>; Linux (glibc x86-64/arm64) <c>88</c>.</summary>
+    internal static readonly int StatMtimeSecOffset = IsMac ? 48 : 88;
+
+    /// <summary>Size of the <c>struct stat</c> receive buffer — over-allocated (160) to cover macOS
+    /// (144) and both Linux ABIs (x86-64 144, arm64 128) so <c>fstat</c> never writes out of bounds.</summary>
+    internal const int StatBufferSize = 160;
+
+    /// <summary>Byte offset of <c>d_name</c> within <c>struct dirent</c>. macOS <c>21</c>; Linux <c>19</c>.
+    /// <c>d_name</c> is a NUL-terminated name; only it is read (never the platform-variant numeric
+    /// fields).</summary>
+    internal static readonly int DirentNameOffset = IsMac ? 21 : 19;
 
     [LibraryImport("libc", EntryPoint = "open", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
     internal static partial int Open(string path, int flags);
@@ -91,4 +151,40 @@ internal static partial class PosixInterop
 
     [LibraryImport("libc", EntryPoint = "link", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
     internal static partial int Link(string existingPath, string newPath);
+
+    /// <summary><c>openat(2)</c> — open <paramref name="path"/> resolved <b>relative to the directory
+    /// descriptor</b> <paramref name="dirfd"/> (never a re-resolvable absolute string). Combined with
+    /// <see cref="O_NOFOLLOW"/> per component this is the race-free confinement primitive.</summary>
+    [LibraryImport("libc", EntryPoint = "openat", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
+    internal static partial int OpenAt(int dirfd, string path, int flags, uint mode);
+
+    /// <summary><c>fstat(2)</c> into a caller-provided <see cref="StatBufferSize"/>-byte buffer. Only
+    /// <c>st_size</c>/<c>st_mtime</c> are read, at platform offsets, with a size cross-check.</summary>
+    [LibraryImport("libc", EntryPoint = "fstat", SetLastError = true)]
+    internal static partial int FStat(int fd, Span<byte> statBuffer);
+
+    /// <summary><c>unlinkat(2)</c> — remove <paramref name="path"/> relative to <paramref name="dirfd"/>.</summary>
+    [LibraryImport("libc", EntryPoint = "unlinkat", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
+    internal static partial int UnlinkAt(int dirfd, string path, int flags);
+
+    /// <summary><c>linkat(2)</c> — atomically hard-link <paramref name="oldPath"/> (relative to
+    /// <paramref name="oldDirfd"/>) to <paramref name="newPath"/> (relative to
+    /// <paramref name="newDirfd"/>); fails with <see cref="EEXIST"/> if the target exists (the
+    /// single-winner publish primitive, now anchored to a confined parent descriptor).</summary>
+    [LibraryImport("libc", EntryPoint = "linkat", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
+    internal static partial int LinkAt(int oldDirfd, string oldPath, int newDirfd, string newPath, int flags);
+
+    /// <summary><c>fdopendir(3)</c> — turn a directory descriptor into a <c>DIR*</c> stream for
+    /// <see cref="ReadDir"/>. The stream owns the descriptor and closes it on <see cref="CloseDir"/>.</summary>
+    [LibraryImport("libc", EntryPoint = "fdopendir", SetLastError = true)]
+    internal static partial nint FdOpenDir(int fd);
+
+    /// <summary><c>readdir(3)</c> — next entry (a <c>struct dirent*</c>) from a <c>DIR*</c>, or
+    /// <see cref="nint.Zero"/> at end of stream. Only <c>d_name</c> is read.</summary>
+    [LibraryImport("libc", EntryPoint = "readdir", SetLastError = true)]
+    internal static partial nint ReadDir(nint dir);
+
+    /// <summary><c>closedir(3)</c> — close a <c>DIR*</c> and its underlying descriptor.</summary>
+    [LibraryImport("libc", EntryPoint = "closedir", SetLastError = true)]
+    internal static partial int CloseDir(nint dir);
 }

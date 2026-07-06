@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 
 namespace DeltaSharp.Storage.Backends;
 
@@ -36,6 +37,12 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
     private readonly string _rootWithSeparator;
     private readonly string _realRoot;
     private readonly string _realRootWithSeparator;
+
+    // The long-lived table-root directory descriptor for the race-free (openat + O_NOFOLLOW) confinement
+    // walk on POSIX (issue #474). Null on Windows, which retains the canonicalize-then-open confinement.
+    // The root is trusted (established + canonicalized once at construction), so opening it by absolute
+    // path is not a TOCTOU surface; every subsequent path is resolved relative to this descriptor.
+    private readonly SafeFileHandle? _rootHandle;
 
     // PERF: Redact is handed to every StagedWriteStream; binding the instance method once avoids
     // allocating a fresh method-group delegate on each OpenWriteAsync call.
@@ -107,6 +114,12 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         _realRoot = CanonicalizeExisting(_root);
         _realRootWithSeparator = _realRoot + Path.DirectorySeparatorChar;
 
+        // On POSIX, pin the real root as a directory descriptor for race-free confinement (issue #474).
+        if (!OperatingSystem.IsWindows())
+        {
+            _rootHandle = ConfinedFileSystem.OpenRoot(_realRoot);
+        }
+
         // PERF: bind Redact once for reuse by every staged write (see _redactDelegate).
         _redactDelegate = Redact;
     }
@@ -117,11 +130,6 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
     {
         ArgumentOutOfRangeException.ThrowIfNegative(offset);
         ArgumentOutOfRangeException.ThrowIfNegative(length);
-        string full = Resolve(path);
-        if (!File.Exists(full))
-        {
-            throw DeltaStorageException.NotFound($"Object '{path}' does not exist.");
-        }
 
         FileStream source;
         try
@@ -132,8 +140,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
                 throw fault;
             }
 
-            source = new FileStream(
-                full, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 4096, useAsync: true);
+            source = OpenConfinedRead(path);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -202,12 +209,6 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
     public ValueTask<Stream> OpenReadAsync(string path, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        string full = Resolve(path);
-        if (!File.Exists(full))
-        {
-            throw DeltaStorageException.NotFound($"Object '{path}' does not exist.");
-        }
-
         try
         {
             Func<string, Exception?>? faultHook = IoFaultHook;
@@ -216,8 +217,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
                 throw fault;
             }
 
-            Stream stream = new FileStream(
-                full, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 4096, useAsync: true);
+            Stream stream = OpenConfinedRead(path);
             return ValueTask.FromResult(stream);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -531,6 +531,11 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
     public ValueTask DeleteAsync(string path, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        if (!OperatingSystem.IsWindows())
+        {
+            return DeleteConfinedUnix(path);
+        }
+
         string full = Resolve(path);
         try
         {
@@ -560,6 +565,11 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
     public ValueTask<StorageObjectInfo?> HeadAsync(string path, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        if (!OperatingSystem.IsWindows())
+        {
+            return HeadConfinedUnix(path);
+        }
+
         string full = Resolve(path);
         if (!File.Exists(full))
         {
@@ -797,6 +807,199 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             string.Create(CultureInfo.InvariantCulture, $"{operation} '{path}' failed: {detail}"),
             new IOException(detail));
     }
+
+    // Resolves a path to its root-relative form using the cheap lexical gate only (reject absolute-
+    // outside-root and ".." traversal). On POSIX the symlink/real-target gate that Resolve performs is
+    // REPLACED by the race-free openat + O_NOFOLLOW walk (strictly stronger — it closes the check-to-use
+    // window), so only the lexical portion is needed here to derive the components to walk.
+    private string ResolveRelative(string path, bool allowRoot = false)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        string combined = Path.IsPathFullyQualified(path) ? path : Path.Combine(_root, path);
+        string full = Path.TrimEndingDirectorySeparator(Path.GetFullPath(combined));
+
+        bool isRoot = string.Equals(full, _root, StringComparison.Ordinal);
+        bool isUnderRoot = full.StartsWith(_rootWithSeparator, StringComparison.Ordinal);
+        if (!isUnderRoot && !(allowRoot && isRoot))
+        {
+            throw DeltaStorageException.PathNotConfined(
+                $"Path '{path}' escapes the confined table root and is rejected.");
+        }
+
+        return isRoot ? string.Empty : full[_rootWithSeparator.Length..];
+    }
+
+    // Maps a confinement-walk failure to the deterministic storage error the backend contract promises.
+    private static DeltaStorageException MapWalkError(ConfinedFileSystem.WalkError error, string path) => error switch
+    {
+        ConfinedFileSystem.WalkError.NotFound => DeltaStorageException.NotFound($"Object '{path}' does not exist."),
+        ConfinedFileSystem.WalkError.NotConfined => DeltaStorageException.PathNotConfined(
+            $"Path '{path}' resolves through a symlink to a location outside the confined table root and is rejected."),
+        _ => DeltaStorageException.Transient($"Resolving '{path}' failed."),
+    };
+
+    // Race-free confined open of a leaf (POSIX): walks each component with openat + O_NOFOLLOW from the
+    // root descriptor and returns the leaf descriptor, mapping ELOOP/ENOTDIR (a symlink swap) to
+    // PathNotConfined and ENOENT to NotFound. Caller must be on the non-Windows path.
+    private SafeFileHandle OpenConfinedLeaf(string path, int leafFlags, uint mode = 0)
+    {
+        // Defense-in-depth: the lexical + canonicalize pre-check rejects obvious escapes early and keeps
+        // the §5.5 LOG-E path-sanitization on the hot path; the openat + O_NOFOLLOW walk below is the
+        // load-bearing RACE-FREE enforcement that also catches a component swapped in after this check.
+        _ = Resolve(path);
+        string rel = ResolveRelative(path);
+        string[] components = ConfinedFileSystem.SplitConfinedComponents(rel);
+        SafeFileHandle? handle = ConfinedFileSystem.TryOpenLeaf(
+            _rootHandle!, components, leafFlags, mode, out ConfinedFileSystem.WalkError error);
+        return handle ?? throw MapWalkError(error, path);
+    }
+
+    // Opens a confined read stream over an existing object. On POSIX this is race-free (openat +
+    // O_NOFOLLOW component walk from the root descriptor), so a symlink swapped in after any check still
+    // cannot redirect the open outside the root (issue #474). On Windows the existing canonicalize-then-
+    // open confinement is retained. Throws NotFound for a missing object and PathNotConfined for an escape.
+    private FileStream OpenConfinedRead(string path)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            string full = Resolve(path);
+            if (!File.Exists(full))
+            {
+                throw DeltaStorageException.NotFound($"Object '{path}' does not exist.");
+            }
+
+            return new FileStream(
+                full, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 4096, useAsync: true);
+        }
+
+        SafeFileHandle handle = OpenConfinedLeaf(path, PosixInterop.O_RDONLY);
+        return new FileStream(handle, FileAccess.Read, bufferSize: 4096, isAsync: false);
+    }
+
+    // POSIX race-free HeadAsync: reach the leaf by an openat + O_NOFOLLOW walk, then read size (via the
+    // descriptor, not a re-resolvable path) and mtime (fstat, size-cross-checked). A missing object is
+    // reported as null; a symlink-swap escape as PathNotConfined.
+    private ValueTask<StorageObjectInfo?> HeadConfinedUnix(string path)
+    {
+        try
+        {
+            Func<string, Exception?>? faultHook = IoFaultHook;
+            if (faultHook?.Invoke("head-meta") is { } injected)
+            {
+                throw injected;
+            }
+
+            // Defense-in-depth pre-check (see OpenConfinedLeaf); openat below is the race-free enforcement.
+            _ = Resolve(path);
+            string rel = ResolveRelative(path);
+            string[] components = ConfinedFileSystem.SplitConfinedComponents(rel);
+            SafeFileHandle? handle = ConfinedFileSystem.TryOpenLeaf(
+                _rootHandle!, components, PosixInterop.O_RDONLY, 0, out ConfinedFileSystem.WalkError error);
+            if (handle is null)
+            {
+                return error == ConfinedFileSystem.WalkError.NotFound
+                    ? ValueTask.FromResult<StorageObjectInfo?>(null)
+                    : throw MapWalkError(error, path);
+            }
+
+            using (handle)
+            {
+                long length = RandomAccess.GetLength(handle);
+                DateTime lastWriteUtc = ConfinedFileSystem.GetLastModifiedUtc(handle, length);
+                return ValueTask.FromResult<StorageObjectInfo?>(
+                    new StorageObjectInfo(rel, length, lastWriteUtc, MakeETagFromParts(length, lastWriteUtc)));
+            }
+        }
+        catch (FileNotFoundException)
+        {
+            // Parity with the Windows path: a vanished object (e.g. an injected head-meta fault modelling a
+            // delete race) is reported as "not found" (null), not surfaced.
+            return ValueTask.FromResult<StorageObjectInfo?>(null);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw SurfaceFailure("Reading metadata for", path, ex);
+        }
+    }
+
+    // POSIX race-free DeleteAsync: reach the leaf's confined PARENT descriptor by an openat + O_NOFOLLOW
+    // walk, then unlinkat the leaf name relative to it. Idempotent: a missing leaf or missing parent is a
+    // no-op; a symlink-swap escape is PathNotConfined.
+    private ValueTask DeleteConfinedUnix(string path)
+    {
+        try
+        {
+            Func<string, Exception?>? faultHook = IoFaultHook;
+            if (faultHook?.Invoke("delete") is { } fault)
+            {
+                throw fault;
+            }
+
+            // Defense-in-depth pre-check (see OpenConfinedLeaf); openat below is the race-free enforcement.
+            _ = Resolve(path);
+            string rel = ResolveRelative(path);
+            string[] components = ConfinedFileSystem.SplitConfinedComponents(rel);
+            SafeFileHandle? parent = ConfinedFileSystem.TryOpenParent(
+                _rootHandle!, components, out string leafName, out ConfinedFileSystem.WalkError error);
+            if (parent is null)
+            {
+                // A missing parent means the object is already gone — idempotent no-op.
+                return error == ConfinedFileSystem.WalkError.NotFound
+                    ? ValueTask.CompletedTask
+                    : throw MapWalkError(error, path);
+            }
+
+            using (parent)
+            {
+                int parentFd = (int)parent.DangerousGetHandle();
+
+                // Reject a symlink leaf, uniform with read/head (O_NOFOLLOW): operating on a symlink is an
+                // escape attempt. unlinkat itself never follows a symlink, so this probe only enforces that
+                // policy — a swapped-in symlink would at worst have its in-root entry removed, never an
+                // out-of-root target, so confinement holds regardless of the probe→unlink window.
+                int probe = PosixInterop.OpenAt(
+                    parentFd, leafName, PosixInterop.O_RDONLY | PosixInterop.O_NOFOLLOW | PosixInterop.O_CLOEXEC, 0);
+                if (probe < 0)
+                {
+                    int probeErrno = Marshal.GetLastPInvokeError();
+                    if (probeErrno == PosixInterop.ENOENT)
+                    {
+                        return ValueTask.CompletedTask; // idempotent
+                    }
+
+                    if (probeErrno == PosixInterop.ELOOP || probeErrno == PosixInterop.ENOTDIR)
+                    {
+                        throw MapWalkError(ConfinedFileSystem.WalkError.NotConfined, path);
+                    }
+
+                    throw SurfaceFailure("Deleting", path, new IOException($"openat failed (errno {probeErrno})."));
+                }
+
+                _ = PosixInterop.Close(probe);
+
+                if (PosixInterop.UnlinkAt(parentFd, leafName, 0) != 0)
+                {
+                    int errno = Marshal.GetLastPInvokeError();
+                    if (errno == PosixInterop.ENOENT)
+                    {
+                        return ValueTask.CompletedTask; // idempotent
+                    }
+
+                    throw SurfaceFailure("Deleting", path, new IOException($"unlinkat failed (errno {errno})."));
+                }
+            }
+
+            return ValueTask.CompletedTask;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw SurfaceFailure("Deleting", path, ex);
+        }
+    }
+
+    // A synthetic entity tag over size + mtime for descriptor-based Head/List (POSIX has no native ETag).
+    private static string MakeETagFromParts(long length, DateTime lastWriteUtc) =>
+        string.Create(CultureInfo.InvariantCulture, $"{length:x}-{lastWriteUtc.Ticks:x}");
 
     // Canonicalizes an incoming path and confines it to the table root, rejecting fail-closed anything
     // that escapes (absolute-outside-root, ".." traversal, or a symlink whose real target leaves the
