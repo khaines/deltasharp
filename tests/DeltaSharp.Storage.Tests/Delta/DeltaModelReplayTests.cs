@@ -153,7 +153,7 @@ public sealed class DeltaModelReplayTests : IDisposable
                 .Metadata(id: "model-table", schemaString: EmptySchemaUnescaped, partitionColumns: ["year"]);
             foreach ((string path, (long size, string year)) in _active)
             {
-                fixture.Add(path, size: size, partitionValues: [("year", year)]);
+                fixture.Add(path, size: size, partitionValues: [("year", year)], modificationTime: 1);
             }
 
             foreach ((string appId, long version) in _txns)
@@ -181,6 +181,7 @@ public sealed class DeltaModelReplayTests : IDisposable
             foreach ((string path, (long size, string year)) in _active)
             {
                 sb.Append("add path=").Append(path).Append(" size=").Append(size)
+                    .Append(" mtime=1 dc=True")
                     .Append(" pv={year=").Append(year).Append("} tags={} stats=∅\n");
             }
 

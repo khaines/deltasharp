@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Linq;
 using DeltaSharp.Storage.Backends;
 
 namespace DeltaSharp.Storage.Delta;
@@ -23,14 +24,28 @@ internal sealed class DeltaLog
     private const string LogPrefix = "_delta_log/";
     private const int VersionDigits = DeltaLogFiles.VersionDigits;
 
+    /// <summary>The maximum size of a single untrusted <c>_delta_log</c> object (a JSON commit or the
+    /// <c>_last_checkpoint</c> hint) this reader will buffer (design §5.4 C-DECODE). An oversized/corrupt
+    /// object fails closed rather than driving an unbounded read, mirroring the checkpoint part cap.</summary>
+    internal const long MaxLogObjectBytes = 256L * 1024 * 1024;
+
     private readonly IStorageBackend _backend;
+    private readonly long _maxLogObjectBytes;
 
     /// <summary>Creates a reader over <paramref name="backend"/>, which must be rooted at the Delta table
     /// directory (so <c>_delta_log/…</c> is reachable).</summary>
     public DeltaLog(IStorageBackend backend)
+        : this(backend, MaxLogObjectBytes)
+    {
+    }
+
+    /// <summary>Creates a reader with an explicit untrusted-object read ceiling (tests use a small ceiling
+    /// to exercise the fail-closed bound without materializing a multi-hundred-MiB object).</summary>
+    internal DeltaLog(IStorageBackend backend, long maxLogObjectBytes)
     {
         ArgumentNullException.ThrowIfNull(backend);
         _backend = backend;
+        _maxLogObjectBytes = maxLogObjectBytes;
     }
 
     /// <summary>
@@ -58,18 +73,24 @@ internal sealed class DeltaLog
                 $"Requested Delta version {requested} does not exist; the table has versions 0 through {latest}."));
         }
 
-        CheckpointSelection? checkpoint = await SelectCheckpointAsync(listing, target, cancellationToken).ConfigureAwait(false);
+        IReadOnlyList<CheckpointSelection> checkpoints =
+            await SelectCheckpointsAsync(listing, target, cancellationToken).ConfigureAwait(false);
 
         var state = new SnapshotState();
         long? checkpointVersion = null;
-        if (checkpoint is not null)
+        foreach (CheckpointSelection candidate in checkpoints)
         {
-            checkpointVersion = await TrySeedFromCheckpointAsync(state, checkpoint, cancellationToken).ConfigureAwait(false);
-            if (checkpointVersion is null)
+            long? seeded = await TrySeedFromCheckpointAsync(state, candidate, cancellationToken).ConfigureAwait(false);
+            if (seeded is not null)
             {
-                // Corrupt/partial checkpoint: discard any partial seed and replay from version 0.
-                state = new SnapshotState();
+                checkpointVersion = seeded;
+                break;
             }
+
+            // Corrupt/partial checkpoint: discard any partial seed and try the next-older complete
+            // checkpoint before falling all the way back to JSON replay from version 0. This keeps a
+            // log-cleaned table (early *.json VACUUMed) readable when only the newest checkpoint is corrupt.
+            state = new SnapshotState();
         }
 
         long replayStart = checkpointVersion is { } c ? c + 1 : 0;
@@ -140,34 +161,39 @@ internal sealed class DeltaLog
         return replayed;
     }
 
-    /// <summary>Chooses the newest usable classic checkpoint at version ≤ <paramref name="target"/>:
-    /// preferring the validated <c>_last_checkpoint</c> hint, else the newest complete checkpoint found by
-    /// listing. Returns null when no complete checkpoint applies (→ full replay).</summary>
-    private async Task<CheckpointSelection?> SelectCheckpointAsync(
+    /// <summary>The usable classic checkpoints at version ≤ <paramref name="target"/>, ordered newest-first,
+    /// so the caller seeds from the newest and — if it is corrupt — falls back to the next-older complete
+    /// checkpoint before full JSON replay. The validated <c>_last_checkpoint</c> hint (when it names a
+    /// complete checkpoint) is tried first; the rest follow in descending version order. Empty ⇒ full replay.</summary>
+    private async Task<IReadOnlyList<CheckpointSelection>> SelectCheckpointsAsync(
         LogListing listing, long target, CancellationToken cancellationToken)
     {
-        LastCheckpointHint? hint = listing.HasHint
-            ? await ReadHintAsync(cancellationToken).ConfigureAwait(false)
-            : null;
-
-        if (hint is { } h && h.Version <= target
-            && listing.Checkpoints.TryGetValue(h.Version, out CheckpointGroup? hinted) && hinted.IsComplete)
+        // All complete checkpoints ≤ target, newest first.
+        var candidates = new List<CheckpointSelection>();
+        foreach (long version in listing.Checkpoints.Keys.Where(v => v <= target).OrderByDescending(v => v))
         {
-            return new CheckpointSelection(h.Version, hinted.OrderedPartPaths());
-        }
-
-        long best = -1;
-        CheckpointGroup? bestGroup = null;
-        foreach ((long checkpointVersion, CheckpointGroup group) in listing.Checkpoints)
-        {
-            if (checkpointVersion <= target && checkpointVersion > best && group.IsComplete)
+            CheckpointGroup group = listing.Checkpoints[version];
+            if (group.IsComplete)
             {
-                best = checkpointVersion;
-                bestGroup = group;
+                candidates.Add(new CheckpointSelection(version, group.OrderedPartPaths()));
             }
         }
 
-        return bestGroup is null ? null : new CheckpointSelection(best, bestGroup.OrderedPartPaths());
+        // Hint preference: if the (validated) hint names a complete checkpoint ≤ target, try it first.
+        if (listing.HasHint
+            && await ReadHintAsync(cancellationToken).ConfigureAwait(false) is { } hint
+            && hint.Version <= target)
+        {
+            int hintIndex = candidates.FindIndex(c => c.Version == hint.Version);
+            if (hintIndex > 0)
+            {
+                CheckpointSelection hinted = candidates[hintIndex];
+                candidates.RemoveAt(hintIndex);
+                candidates.Insert(0, hinted);
+            }
+        }
+
+        return candidates;
     }
 
     private async Task<LastCheckpointHint?> ReadHintAsync(CancellationToken cancellationToken)
@@ -242,7 +268,23 @@ internal sealed class DeltaLog
         await using (stream.ConfigureAwait(false))
         {
             using var buffer = new MemoryStream();
-            await stream.CopyToAsync(buffer, cancellationToken).ConfigureAwait(false);
+            byte[] chunk = new byte[81920];
+            int read;
+            while ((read = await stream.ReadAsync(chunk, cancellationToken).ConfigureAwait(false)) > 0)
+            {
+                // A commit file / _last_checkpoint hint is untrusted input (design §5.4 C-DECODE); bound the
+                // buffered read so an oversized/corrupt object fails closed rather than driving an unbounded
+                // allocation, mirroring the checkpoint part cap.
+                if (buffer.Length + read > _maxLogObjectBytes)
+                {
+                    throw DeltaProtocolException.Inconsistent(string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"Delta log object '{path}' exceeds the {_maxLogObjectBytes}-byte read ceiling."));
+                }
+
+                buffer.Write(chunk, 0, read);
+            }
+
             return buffer.ToArray();
         }
     }

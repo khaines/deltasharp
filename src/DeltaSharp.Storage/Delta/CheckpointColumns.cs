@@ -110,8 +110,8 @@ internal sealed class CheckpointColumns
 
     /// <summary>Builds the single action a checkpoint row encodes (exactly one action struct is non-null),
     /// or null for an all-null row (defensively tolerated, like an empty JSON action object).</summary>
-    /// <exception cref="DeltaProtocolException">The row encodes more than one action, or an action is
-    /// missing a required field.</exception>
+    /// <exception cref="DeltaProtocolException">The row encodes more than one action, an action is
+    /// present but missing its required primary key, or a required field is absent.</exception>
     public DeltaAction? BuildAction(int row, int group)
     {
         bool isAdd = _addPath[row] is not null;
@@ -127,6 +127,27 @@ internal sealed class CheckpointColumns
                 CultureInfo.InvariantCulture,
                 $"Checkpoint row {row} (group {group}) encodes {count} actions but a row must encode exactly one."));
         }
+
+        // Fail closed on a PARTIAL action: a row that carries any field of an action struct but is missing
+        // that action's required primary key is a malformed/corrupt checkpoint. It must throw (→ the caller
+        // falls back to JSON replay), never be silently skipped — a silent skip would drop a committed file
+        // or the metaData from the reconstructed state, producing a wrong active-file set with no error.
+        RequireKeyIfPresent(!isAdd, "add", "path", row, group,
+            _addSize[row] is not null || _addModificationTime[row] is not null || _addDataChange[row] is not null
+            || _addStats[row] is not null || _addPartitionValues[row].Count > 0 || _addTags[row].Count > 0);
+        RequireKeyIfPresent(!isRemove, "remove", "path", row, group,
+            _removeDeletionTimestamp[row] is not null || _removeDataChange[row] is not null
+            || _removeExtendedFileMetadata[row] is not null || _removeSize[row] is not null
+            || _removePartitionValues[row].Count > 0);
+        RequireKeyIfPresent(!isMeta, "metaData", "id", row, group,
+            _metaName[row] is not null || _metaDescription[row] is not null || _metaSchemaString[row] is not null
+            || _metaCreatedTime[row] is not null || _formatProvider[row] is not null || _formatOptions[row].Count > 0
+            || _metaPartitionColumns[row].Length > 0 || _metaConfiguration[row].Count > 0);
+        RequireKeyIfPresent(!isProtocol, "protocol", "minReaderVersion", row, group,
+            _protocolMinWriterVersion[row] is not null || _protocolReaderFeatures[row].Length > 0
+            || _protocolWriterFeatures[row].Length > 0);
+        RequireKeyIfPresent(!isTxn, "txn", "appId", row, group,
+            _txnVersion[row] is not null || _txnLastUpdated[row] is not null);
 
         if (isAdd)
         {
@@ -190,6 +211,18 @@ internal sealed class CheckpointColumns
 
     private static T Require<T>(T? value, string action, string field, int row, int group) where T : struct =>
         value ?? throw Missing(action, field, row, group);
+
+    /// <summary>Fails closed when an action struct is present (<paramref name="anyFieldPresent"/>) yet its
+    /// required primary key is absent (<paramref name="keyAbsent"/>) — a partial/corrupt checkpoint row
+    /// that must never be silently skipped.</summary>
+    private static void RequireKeyIfPresent(
+        bool keyAbsent, string action, string keyField, int row, int group, bool anyFieldPresent)
+    {
+        if (keyAbsent && anyFieldPresent)
+        {
+            throw Missing(action, keyField, row, group);
+        }
+    }
 
     private static DeltaProtocolException Missing(string action, string field, int row, int group) =>
         DeltaProtocolException.Malformed(string.Create(

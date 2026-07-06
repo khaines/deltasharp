@@ -8,8 +8,16 @@ namespace DeltaSharp.Storage.Delta;
 /// sub-fields → map key/value and list element leaves). Every column is optional: a checkpoint written by
 /// a different engine may omit columns a baseline table never uses (e.g. <c>tags</c>), and unknown columns
 /// are simply not resolved — matching <see cref="DeltaLogActionReader"/>'s forward-compatible tolerance.
-/// Resolution binds only to the standard 3-level MAP (<c>key_value/key</c>,<c>key_value/value</c>) and
-/// LIST (<c>list/element</c>) shapes Parquet.Net and Spark/delta-rs emit.
+///
+/// <para>Maps and lists are bound through Parquet.Net's <b>logical</b> <see cref="MapField"/>/
+/// <see cref="ListField"/> abstraction (via <c>.Key</c>/<c>.Value</c>/<c>.Item</c>), so the resolution is
+/// agnostic to the physical group/element names — it works for the standard 3-level MAP
+/// (<c>key_value</c>) and LIST (<c>list</c>/<c>element</c>) shapes Spark/delta-rs/parquet-mr emit
+/// regardless of whether a writer names the list element <c>element</c> or <c>array_element</c>. A column
+/// a writer encodes in a shape Parquet.Net does <b>not</b> surface as a logical MAP/LIST (e.g. a legacy
+/// 2-level list from <c>writeLegacyFormat=true</c>, which no mainstream Delta writer emits) resolves to
+/// null and is read as empty; for <c>partitionColumns</c> that would present a partitioned table as
+/// unpartitioned — a v1-scope limitation tracked for a golden-file compatibility test.</para>
 /// </summary>
 internal sealed class CheckpointSchema
 {
@@ -104,6 +112,41 @@ internal sealed class CheckpointSchema
             TxnVersion = Scalar(txn, "version"),
             TxnLastUpdated = Scalar(txn, "lastUpdated"),
         };
+    }
+
+    /// <summary>All resolved leaf <see cref="DataField"/>s this reader will decode for a row group — the
+    /// inputs to the decode-ceiling guard (design §5.4 C-DECODE). Only columns actually read are included
+    /// (unknown columns are neither resolved nor bounded).</summary>
+    public IReadOnlyList<DataField> LeafFields()
+    {
+        var fields = new List<DataField>(24);
+        void Add(DataField? f)
+        {
+            if (f is not null)
+            {
+                fields.Add(f);
+            }
+        }
+
+        void AddMap(MapLeaves? m)
+        {
+            if (m is not null)
+            {
+                fields.Add(m.Key);
+                fields.Add(m.Value);
+            }
+        }
+
+        Add(AddPath); Add(AddSize); Add(AddModificationTime); Add(AddDataChange); Add(AddStats);
+        AddMap(AddPartitionValues); AddMap(AddTags);
+        Add(RemovePath); Add(RemoveDeletionTimestamp); Add(RemoveDataChange); Add(RemoveExtendedFileMetadata);
+        Add(RemoveSize); AddMap(RemovePartitionValues);
+        Add(MetaId); Add(MetaName); Add(MetaDescription); Add(MetaSchemaString); Add(MetaCreatedTime);
+        Add(FormatProvider); AddMap(FormatOptions); Add(MetaPartitionColumns); AddMap(MetaConfiguration);
+        Add(ProtocolMinReaderVersion); Add(ProtocolMinWriterVersion); Add(ProtocolReaderFeatures);
+        Add(ProtocolWriterFeatures);
+        Add(TxnAppId); Add(TxnVersion); Add(TxnLastUpdated);
+        return fields;
     }
 
     private static StructField? Struct(ParquetSchema schema, string name)

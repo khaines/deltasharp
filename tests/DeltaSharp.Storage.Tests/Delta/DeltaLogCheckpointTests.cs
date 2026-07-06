@@ -61,8 +61,8 @@ public sealed class DeltaLogCheckpointTests : IDisposable
         new CheckpointFixture()
             .Protocol(1, 2)
             .Metadata(id: "table-1", schemaString: EmptySchemaUnescaped, partitionColumns: ["year"])
-            .Add("b.parquet", size: 1, stats: StatsB)
-            .Add("c.parquet", size: 1, partitionValues: [("year", "2026")]);
+            .Add("b.parquet", size: 1, stats: StatsB, modificationTime: 1)
+            .Add("c.parquet", size: 1, partitionValues: [("year", "2026")], modificationTime: 1);
 
     [Fact]
     public async Task CheckpointSeededReconstruction_EqualsJsonReplay()
@@ -212,6 +212,74 @@ public sealed class DeltaLogCheckpointTests : IDisposable
         Assert.Equal(1, atV1.Metrics.CheckpointVersion);
         Assert.Equal(0, atV1.Metrics.ReplayedCommitCount); // seeded at exactly the target
         Assert.Equal(["b.parquet", "c.parquet"], atV1.ActiveFiles.Select(a => a.Path));
+    }
+
+    [Fact]
+    public async Task CorruptNewestCheckpoint_FallsBackToOlderCheckpoint()
+    {
+        // Reference: full JSON history.
+        IStorageBackend full = NewBackend();
+        await WriteJsonHistoryAsync(full);
+        Snapshot fromJson = await new DeltaLog(full).LoadSnapshotAsync(version: 2);
+
+        // Log-cleaned table: JSON 0 & 1 are gone; a COMPLETE checkpoint at 1, a CORRUPT checkpoint at 2,
+        // JSON commit 2, and a hint pointing at the corrupt newest checkpoint.
+        IStorageBackend backend = NewBackend();
+        await DeltaTestHarness.WriteCheckpointAsync(backend, 1, CheckpointAtV1());
+        await DeltaTestHarness.WriteRawCheckpointAsync(backend, 2, "corrupt newest checkpoint"u8.ToArray());
+        await DeltaTestHarness.WriteCommitAsync(backend, 2,
+            DeltaTestHarness.Add("d.parquet"),
+            DeltaTestHarness.Txn("app-1", 5));
+        await DeltaTestHarness.WriteLastCheckpointAsync(backend, 2);
+
+        Snapshot snapshot = await new DeltaLog(backend).LoadSnapshotAsync();
+
+        // The corrupt v2 checkpoint is skipped; reconstruction seeds from the older complete v1 checkpoint
+        // and replays commit 2 — rather than failing with a gap on the cleaned early commits.
+        Assert.Equal(1, snapshot.Metrics.CheckpointVersion);
+        Assert.Equal(1, snapshot.Metrics.ReplayedCommitCount);
+        Assert.Equal(DeltaTestHarness.Describe(fromJson), DeltaTestHarness.Describe(snapshot));
+    }
+
+    [Fact]
+    public async Task IncompleteMultipartCheckpoint_IsNotUsed_FallsBackToJsonReplay()
+    {
+        IStorageBackend jsonOnly = NewBackend();
+        await WriteJsonHistoryAsync(jsonOnly);
+        Snapshot fromJson = await new DeltaLog(jsonOnly).LoadSnapshotAsync();
+
+        IStorageBackend backend = NewBackend();
+        await WriteJsonHistoryAsync(backend);
+        // A 3-part checkpoint at v1 with part 2 MISSING → incomplete → must not be selected.
+        await DeltaTestHarness.WritePartialMultipartCheckpointAsync(backend, 1, CheckpointAtV1(), parts: 3, partsToWrite: [1, 3]);
+        await DeltaTestHarness.WriteLastCheckpointAsync(backend, 1, parts: 3);
+
+        Snapshot snapshot = await new DeltaLog(backend).LoadSnapshotAsync();
+
+        Assert.Null(snapshot.Metrics.CheckpointVersion); // incomplete checkpoint ignored → full JSON replay
+        Assert.Equal(3, snapshot.Metrics.ReplayedCommitCount);
+        Assert.Equal(DeltaTestHarness.Describe(fromJson), DeltaTestHarness.Describe(snapshot));
+    }
+
+    [Fact]
+    public async Task CheckpointEmbeddedRemove_SurfacesInTombstones()
+    {
+        // A classic checkpoint retains recent tombstones; seeding from it must surface them in Snapshot
+        // .Tombstones through the fast path (not just at the reader/SnapshotState level).
+        IStorageBackend backend = NewBackend();
+        CheckpointFixture fixture = new CheckpointFixture()
+            .Protocol(1, 2)
+            .Metadata(id: "table-1", schemaString: EmptySchemaUnescaped)
+            .Add("b.parquet", size: 1, modificationTime: 1)
+            .Remove("a.parquet", deletionTimestamp: 100, size: 7);
+        await DeltaTestHarness.WriteCheckpointAsync(backend, 1, fixture);
+        await DeltaTestHarness.WriteLastCheckpointAsync(backend, 1);
+
+        Snapshot snapshot = await new DeltaLog(backend).LoadSnapshotAsync();
+
+        Assert.Equal(1, snapshot.Metrics.CheckpointVersion);
+        Assert.Equal(["b.parquet"], snapshot.ActiveFiles.Select(a => a.Path));
+        Assert.Equal(["a.parquet"], snapshot.Tombstones.Select(r => r.Path));
     }
 
     // The metaData.schemaString stored inside a checkpoint column is the raw (unescaped) JSON string,

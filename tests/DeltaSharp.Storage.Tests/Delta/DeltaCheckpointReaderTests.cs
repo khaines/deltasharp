@@ -22,6 +22,8 @@ public sealed class DeltaCheckpointReaderTests
                 size: 100,
                 partitionValues: [("year", "2026"), ("month", null)],
                 stats: """{"numRecords":10,"minValues":{"id":1},"maxValues":{"id":9},"nullCount":{"id":0}}""",
+                modificationTime: 1717171717,
+                dataChange: false,
                 tags: [("ENGINE", "deltasharp")])
             .Remove("part-old.parquet", deletionTimestamp: 123, size: 50)
             .Txn("app-1", version: 7, lastUpdated: 999)
@@ -44,6 +46,8 @@ public sealed class DeltaCheckpointReaderTests
         AddFileAction add = Assert.Single(actions.OfType<AddFileAction>());
         Assert.Equal("part-a.parquet", add.Path);
         Assert.Equal(100, add.Size);
+        Assert.Equal(1717171717, add.ModificationTime); // decoded, not defaulted (guards the ?? 0L path)
+        Assert.False(add.DataChange);                    // decoded, not defaulted (guards the ?? true path)
         Assert.Equal("2026", add.PartitionValues["year"]);
         Assert.Null(add.PartitionValues["month"]); // explicit null partition value round-trips
         Assert.Equal("deltasharp", add.Tags["ENGINE"]);
@@ -143,6 +147,90 @@ public sealed class DeltaCheckpointReaderTests
         DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
             () => DeltaCheckpointReader.ReadAsync(new MemoryStream(garbage), default));
         Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+    }
+
+    [Fact]
+    public async Task PartialMetadataRow_MissingId_FailsClosed()
+    {
+        // A metaData present (schemaString set) but missing its required primary key `id` is a corrupt
+        // row: it must fail closed, never be silently dropped (which would reconstruct a wrong state).
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(1, 2)
+            .Metadata(id: null!, schemaString: EmptySchema)
+            .ToParquetAsync();
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default));
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.Contains("id", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PartialAddRow_MissingPath_FailsClosed()
+    {
+        // An add present (size set) but missing its required `path` must fail closed — a silent skip would
+        // drop a committed data file from the reconstructed active-file set.
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(1, 2)
+            .Metadata("t", EmptySchema)
+            .Add(path: null!, size: 5)
+            .ToParquetAsync();
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default));
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.Contains("path", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void DecodeCeiling_RejectsAmplifiedRowCount()
+    {
+        // A tiny compressed chunk that declares an enormous value count would eagerly allocate huge
+        // value/level arrays: its footprint must exceed the per-row-group decode ceiling (fail closed).
+        long footprint = DeltaCheckpointReader.ColumnFootprintBytes(
+            typeof(string), numValues: 100_000_000, compressedBytes: 4_096, uncompressedBytes: 4_096, "add/path", 0);
+        Assert.True(footprint > DeltaCheckpointReader.MaxCheckpointRowGroupDecodedBytes,
+            $"footprint {footprint} should exceed the {DeltaCheckpointReader.MaxCheckpointRowGroupDecodedBytes}-byte ceiling");
+    }
+
+    [Fact]
+    public void DecodeCeiling_RejectsDecompressionBomb()
+    {
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() =>
+            DeltaCheckpointReader.ColumnFootprintBytes(
+                typeof(long), numValues: 8, compressedBytes: 1_000, uncompressedBytes: 1_000 * 5_000, "add/size", 0));
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.Contains("ratio", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void DecodeCeiling_RejectsNegativeMetadata()
+    {
+        Assert.Throws<DeltaProtocolException>(() =>
+            DeltaCheckpointReader.ColumnFootprintBytes(typeof(long), -1, 10, 10, "add/size", 0));
+    }
+
+    [Fact]
+    public void DecodeCeiling_AllowsNormalColumn()
+    {
+        // A realistic column (100k rows, ~2 MB) is well under the ceiling and does not throw.
+        long footprint = DeltaCheckpointReader.ColumnFootprintBytes(
+            typeof(long), numValues: 100_000, compressedBytes: 500_000, uncompressedBytes: 2_000_000, "add/size", 0);
+        Assert.True(footprint > 0 && footprint < DeltaCheckpointReader.MaxCheckpointRowGroupDecodedBytes);
+    }
+
+    [Fact]
+    public async Task PartByteCeiling_RejectsOversizedPart()
+    {
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(1, 2).Metadata("t", EmptySchema).Add("f.parquet", size: 1)
+            .ToParquetAsync();
+
+        // With a tiny part ceiling the (valid) part is refused before decode — the fail-closed outer bound.
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default, maxPartBytes: 16));
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.Contains("ceiling", ex.Message, StringComparison.Ordinal);
     }
 
     private const string EmptySchema = """{"type":"struct","fields":[]}""";

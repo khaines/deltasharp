@@ -87,6 +87,19 @@ internal static class DeltaTestHarness
         }
     }
 
+    /// <summary>Writes only the specified <paramref name="partsToWrite"/> of an <paramref name="parts"/>-part
+    /// checkpoint, modelling an incomplete multi-part checkpoint (a missing part).</summary>
+    public static async Task WritePartialMultipartCheckpointAsync(
+        IStorageBackend backend, long version, CheckpointFixture fixture, int parts, params int[] partsToWrite)
+    {
+        byte[][] partBytes = await fixture.ToPartsAsync(parts);
+        foreach (int p in partsToWrite)
+        {
+            string name = LogPath($"{Pad20(version)}.checkpoint.{Pad10(p)}.{Pad10(parts)}.parquet");
+            await backend.PutIfAbsentAsync(name, partBytes[p - 1], CancellationToken.None);
+        }
+    }
+
     public static async Task WriteRawCheckpointAsync(IStorageBackend backend, long version, byte[] content)
     {
         string name = LogPath(Pad20(version) + ".checkpoint.parquet");
@@ -130,6 +143,8 @@ internal static class DeltaTestHarness
         {
             sb.Append("add path=").Append(add.Path)
                 .Append(" size=").Append(add.Size)
+                .Append(" mtime=").Append(add.ModificationTime)
+                .Append(" dc=").Append(add.DataChange)
                 .Append(" pv=").Append(DescribeNullableMap(add.PartitionValues))
                 .Append(" tags=").Append(DescribeMap(add.Tags))
                 .Append(" stats=").Append(DescribeStats(add.Stats))

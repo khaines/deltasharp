@@ -107,4 +107,18 @@ public sealed class DeltaLogTests : IDisposable
         Assert.Equal(DeltaProtocolErrorKind.InconsistentLog, ex.Kind);
         Assert.Contains("gap", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
+
+    [Fact]
+    public async Task Load_FailsClosed_OnOversizedCommit()
+    {
+        await WriteCommitAsync(0, Protocol, Metadata, Add("a.parquet"));
+
+        // A commit file is untrusted input; a read ceiling makes an oversized/corrupt object fail closed
+        // rather than driving an unbounded allocation (design §5.4 C-DECODE). A small injected ceiling
+        // exercises the bound without materializing a multi-hundred-MiB file.
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => new DeltaLog(_backend, maxLogObjectBytes: 8).LoadSnapshotAsync());
+        Assert.Equal(DeltaProtocolErrorKind.InconsistentLog, ex.Kind);
+        Assert.Contains("ceiling", ex.Message, StringComparison.Ordinal);
+    }
 }

@@ -52,6 +52,23 @@ public sealed class FilePruningTests
         FilePruner.Prune(files, request);
 
     [Fact]
+    public void EmptyRequest_KeepsAllFiles()
+    {
+        ImmutableArray<AddFileAction> files =
+        [
+            File("a.parquet", partitions: [("year", "2025")], stats: IntStats(5, [("id", 1, 10, 0)])),
+            File("b.parquet", partitions: [("year", "2026")]),
+        ];
+
+        FilePruningResult result = Prune(files, FilePruningRequest.Empty);
+
+        Assert.Equal(2, result.Candidates.Length);
+        Assert.Equal(0, result.PrunedByPartition);
+        Assert.Equal(0, result.PrunedByStatistics);
+        Assert.Equal(2, result.TotalFiles);
+    }
+
+    [Fact]
     public void PartitionFilter_PrunesNonMatchingPartitions()
     {
         ImmutableArray<AddFileAction> files =
