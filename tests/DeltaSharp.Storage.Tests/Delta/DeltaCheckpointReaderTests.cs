@@ -240,6 +240,19 @@ public sealed class DeltaCheckpointReaderTests
     }
 
     [Fact]
+    public void DecodeCeiling_LargeCompressedSize_DoesNotOverflow()
+    {
+        // Overflow-safety of the checkpoint decompression-ratio ceiling: a chunk with a huge declared
+        // COMPRESSED size and a tiny decompressed payload is NOT a ratio bomb (ratio << 1) and must be
+        // accepted. The compressed×ratio product is widened to Int128 so the 64-bit multiply cannot wrap into
+        // a spurious verdict — pre-fix, `Math.Max(compressedBytes, 1) * MaxDecompressionRatio` overflowed
+        // (here to a negative product), flipping the comparison and wrongly rejecting this legitimate column.
+        long footprint = DeltaCheckpointReader.ColumnFootprintBytes(
+            typeof(long), numValues: 1, compressedBytes: 9_223_372_036_854_776L, uncompressedBytes: 1_000, "add/size", 0);
+        Assert.True(footprint > 0 && footprint < DeltaCheckpointReader.MaxCheckpointRowGroupDecodedBytes);
+    }
+
+    [Fact]
     public void DecodeCeiling_RejectsNegativeMetadata()
     {
         Assert.Throws<DeltaProtocolException>(() =>
