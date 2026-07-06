@@ -100,6 +100,10 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         // The real root may differ from the lexical root when an ancestor is itself a symlink (for
         // example macOS's /var -> /private/var). Confinement compares real target against real root so
         // that ambient ancestor symlinks cancel out and only an *escape* is rejected.
+        // NOTE: this is the ONE CanonicalizeExisting call NOT wrapped in a fail-closed catch. It is
+        // intentional: it runs at construction time on the operator's OWN supplied tableRoot (not a
+        // lower-trust request/log path), so failing fast -- and surfacing that self-supplied root -- on a
+        // mis-permissioned or cyclic root is acceptable and is not a cross-trust path disclosure.
         _realRoot = CanonicalizeExisting(_root);
         _realRootWithSeparator = _realRoot + Path.DirectorySeparatorChar;
 
@@ -138,7 +142,24 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
 
         await using (source.ConfigureAwait(false))
         {
-            long fileLength = source.Length;
+            long fileLength;
+            try
+            {
+                Func<string, Exception?>? faultHook = IoFaultHook;
+                if (faultHook?.Invoke("read-len") is { } fault)
+                {
+                    throw fault;
+                }
+
+                fileLength = source.Length;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // RF-8g: reading the open handle's length can throw a path-bearing framework exception;
+                // surface it redacted rather than letting the raw absolute path escape.
+                throw SurfaceFailure("Reading", path, ex);
+            }
+
             if (offset > fileLength)
             {
                 throw new ArgumentOutOfRangeException(
@@ -155,7 +176,6 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             }
 
             int toRead = (int)toReadLong;
-            source.Seek(offset, SeekOrigin.Begin);
             var buffer = new byte[toRead];
             try
             {
@@ -165,6 +185,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
                     throw fault;
                 }
 
+                source.Seek(offset, SeekOrigin.Begin);
                 await source.ReadExactlyAsync(buffer.AsMemory(), cancellationToken).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -415,7 +436,30 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             // entries (design §5.5 C-SCOPE). FileInfo.Attributes reflects the link itself (lstat -- it
             // does not follow the target), so a symlinked leaf is detected without reading a target's
             // metadata.
-            if (new FileInfo(file).Attributes.HasFlag(FileAttributes.ReparsePoint))
+            bool isReparseLeaf;
+            try
+            {
+                Func<string, Exception?>? faultHook = IoFaultHook;
+                if (faultHook?.Invoke("list-leaf-attr") is { } fault)
+                {
+                    throw fault;
+                }
+
+                isReparseLeaf = new FileInfo(file).Attributes.HasFlag(FileAttributes.ReparsePoint);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // RF-8g (red-team MISS): reading FileInfo.Attributes stats the leaf, and is the FIRST
+                // per-entry syscall -- outside the list-canon/list-meta guards below. It can throw a raw,
+                // path-bearing UnauthorizedAccessException (an EACCES race on the entry or its parent) or an
+                // IOException (incl. FileNotFound/DirectoryNotFound when the entry vanished between
+                // enumeration and this read). An unwrapped throw would escape the async iterator and leak
+                // the absolute path. Skip the entry fail-closed -- consistent with the list-canon/list-meta
+                // skips -- so it neither leaks the absolute path nor aborts the whole listing.
+                continue;
+            }
+
+            if (isReparseLeaf)
             {
                 continue;
             }
@@ -490,6 +534,12 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         string full = Resolve(path);
         try
         {
+            Func<string, Exception?>? faultHook = IoFaultHook;
+            if (faultHook?.Invoke("delete") is { } fault)
+            {
+                throw fault;
+            }
+
             File.Delete(full);
         }
         catch (DirectoryNotFoundException)
@@ -980,7 +1030,10 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
 
         public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
 
-        public override void SetLength(long value) => _inner.SetLength(value);
+        // A staged write is forward-only (Read/Seek throw NotSupported); SetLength likewise -- both keeps
+        // the stream contract consistent (SetLength requires CanSeek) and avoids delegating to an unguarded
+        // _inner.SetLength whose failure would carry the temp's absolute path (RF-8g, Security R10 Info).
+        public override void SetLength(long value) => throw new NotSupportedException();
 
         public override void Write(byte[] buffer, int offset, int count)
         {
@@ -1093,7 +1146,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             }
 
             _disposed = true;
-            await _inner.DisposeAsync().ConfigureAwait(false);
+            await QuietDisposeInnerAsync().ConfigureAwait(false);
             if (!_completed)
             {
                 CleanupTemp();
@@ -1111,7 +1164,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             _disposed = true;
             if (disposing)
             {
-                _inner.Dispose();
+                QuietDisposeInner();
                 if (!_completed)
                 {
                     CleanupTemp();
@@ -1119,6 +1172,51 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             }
 
             base.Dispose(disposing);
+        }
+
+        // A staged write abandoned WITHOUT CompleteAsync discards its bytes (CleanupTemp drops the temp),
+        // so a dispose-time flush fault (ENOSPC/EDQUOT/EIO on the buffered bytes) is irrelevant AND must
+        // not throw out of Dispose: on Unix a FileStream flush failure carries the temp's absolute path
+        // (SafeFileHandle.Path, which is under _root), so an unguarded rethrow would both leak the root and
+        // MASK the in-flight exception that triggered the abandon. Swallow it best-effort (RF-8g, Security
+        // R10) -- like TryDelete -- after consulting the fault seam so the swallow is non-vacuously testable.
+        // When _completed the inner was already disposed inside CompleteAsync (guarded), so this second
+        // dispose is a no-op and cannot throw.
+        private async ValueTask QuietDisposeInnerAsync()
+        {
+            try
+            {
+                await _inner.DisposeAsync().ConfigureAwait(false);
+
+                Func<string, Exception?>? faultHook = IoFaultHook;
+                if (faultHook?.Invoke("dispose") is { } fault)
+                {
+                    throw fault;
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Best-effort: the abandoned temp is discarded regardless; never throw the path out of
+                // Dispose nor mask the in-flight exception that triggered the abandon.
+            }
+        }
+
+        private void QuietDisposeInner()
+        {
+            try
+            {
+                _inner.Dispose();
+
+                Func<string, Exception?>? faultHook = IoFaultHook;
+                if (faultHook?.Invoke("dispose") is { } fault)
+                {
+                    throw fault;
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Best-effort: see QuietDisposeInnerAsync.
+            }
         }
 
         private void Publish()

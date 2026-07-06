@@ -891,6 +891,32 @@ public sealed class LocalFileSystemBackendTests : IDisposable
     }
 
     [Fact]
+    public async Task DeleteFault_GenericIOException_DoesNotLeakAbsolutePath()
+    {
+        // Quality/RF-8g: uniquely pin the generic-IOException arm of the DeleteAsync catch via the "delete"
+        // IoFaultHook seam (symmetric to read/write/list/head -- DeleteAsync was previously the only
+        // mutating op without a seam). Non-vacuous: narrowing the catch to UnauthorizedAccessException-only,
+        // or removing the seam consult, lets the injected IOException escape raw (not a DeltaStorageException).
+        await _backend.PutIfAbsentAsync("del/obj.bin", new byte[] { 1 }, CancellationToken.None);
+
+        LocalFileSystemBackend.IoFaultHook = tag => tag == "delete"
+            ? new IOException($"io '{Path.Combine(_root, "del", "obj.bin")}'")
+            : null;
+        try
+        {
+            DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+                () => _backend.DeleteAsync("del/obj.bin", CancellationToken.None).AsTask());
+            Assert.Equal(StorageErrorKind.Transient, error.Kind);
+            Assert.DoesNotContain(_root, error.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(_root, error.ToString(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            LocalFileSystemBackend.IoFaultHook = null;
+        }
+    }
+
+    [Fact]
     public async Task ReadIoFault_ViaIoFaultHook_DoesNotLeakAbsolutePath()
     {
         // Quality: the ReadRangeAsync ReadExactlyAsync ("read-io") sanitizer is made non-vacuous. A
@@ -1138,6 +1164,7 @@ public sealed class LocalFileSystemBackendTests : IDisposable
                     await ((ICompletableWriteStream)stream).CompleteAsync(CancellationToken.None);
                 }
             });
+            Assert.Equal(StorageErrorKind.RetryUnsafeAmbiguous, error.Kind); // classified, not just redacted
             Assert.DoesNotContain(_root, error.Message, StringComparison.Ordinal);
             Assert.DoesNotContain(_root, error.ToString(), StringComparison.Ordinal);
         }
@@ -1193,6 +1220,131 @@ public sealed class LocalFileSystemBackendTests : IDisposable
 
         Assert.Contains("ls/real.bin", paths);
         Assert.DoesNotContain(paths, p => p.Contains("link.bin", StringComparison.Ordinal)); // symlink leaf skipped
+    }
+
+    [Fact]
+    public async Task ListLeafAttrFault_UnauthorizedAccess_SkipsEntryWithoutLeaking()
+    {
+        // Red-team MISS (RF-8g): the reparse-point leaf check reads FileInfo.Attributes -- the FIRST
+        // per-entry stat, OUTSIDE the list-canon/list-meta guards. An EACCES race there threw a raw,
+        // path-bearing UnauthorizedAccessException that escaped the async iterator and leaked the absolute
+        // root. The entry must now be SKIPPED fail-closed. Non-vacuous: removing the list-leaf-attr
+        // try/catch lets the injected UAE escape the iterator (the await foreach throws; Assert.Empty and
+        // the no-throw expectation redden).
+        await _backend.PutIfAbsentAsync("la/only.bin", new byte[] { 1 }, CancellationToken.None);
+
+        LocalFileSystemBackend.IoFaultHook = tag => tag == "list-leaf-attr"
+            ? new UnauthorizedAccessException($"denied '{Path.Combine(_root, "la", "only.bin")}'")
+            : null;
+        var paths = new List<string>();
+        try
+        {
+            await foreach (StorageObjectInfo info in _backend.ListAsync("la/", CancellationToken.None))
+            {
+                paths.Add(info.Path);
+            }
+        }
+        finally
+        {
+            LocalFileSystemBackend.IoFaultHook = null;
+        }
+
+        Assert.Empty(paths);
+    }
+
+    [Fact]
+    public async Task ListLeafAttrFault_GenericIOException_SkipsEntryWithoutLeaking()
+    {
+        // Red-team MISS (RF-8g) sibling: the leaf-attr stat can also throw a generic IOException (incl.
+        // FileNotFound/DirectoryNotFound on a vanished-entry race); it too must skip fail-closed. Uniquely
+        // pins the IOException arm of the list-leaf-attr catch (distinct from the UAE sibling above).
+        await _backend.PutIfAbsentAsync("lai/only.bin", new byte[] { 1 }, CancellationToken.None);
+
+        LocalFileSystemBackend.IoFaultHook = tag => tag == "list-leaf-attr"
+            ? new IOException($"io '{Path.Combine(_root, "lai", "only.bin")}'")
+            : null;
+        var paths = new List<string>();
+        try
+        {
+            await foreach (StorageObjectInfo info in _backend.ListAsync("lai/", CancellationToken.None))
+            {
+                paths.Add(info.Path);
+            }
+        }
+        finally
+        {
+            LocalFileSystemBackend.IoFaultHook = null;
+        }
+
+        Assert.Empty(paths);
+    }
+
+    [Fact]
+    public async Task ReadLenFault_ViaIoFaultHook_DoesNotLeakAbsolutePath()
+    {
+        // RF-8g: reading the open read handle's Length (between read-open and read-io) can throw a
+        // path-bearing framework exception; it must surface a redacted DeltaStorageException, never the raw
+        // absolute path. Injected at "read-len". Non-vacuous: removing the read-len try/catch lets the raw
+        // exception escape (ThrowsAsync<DeltaStorageException> + no-leak assertions redden).
+        await _backend.PutIfAbsentAsync("rl/obj.bin", new byte[] { 1, 2, 3 }, CancellationToken.None);
+
+        LocalFileSystemBackend.IoFaultHook = tag => tag == "read-len"
+            ? new IOException($"io '{Path.Combine(_root, "rl", "obj.bin")}'")
+            : null;
+        try
+        {
+            DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+                () => _backend.ReadRangeAsync("rl/obj.bin", 0, 3, CancellationToken.None).AsTask());
+            Assert.Equal(StorageErrorKind.Transient, error.Kind);
+            Assert.DoesNotContain(_root, error.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(_root, error.ToString(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            LocalFileSystemBackend.IoFaultHook = null;
+        }
+    }
+
+    [Fact]
+    public async Task AbandonedStagedWrite_DisposeFault_SwallowedWithoutThrowingOrLeaking()
+    {
+        // Security R10 (RF-8g): a staged write abandoned WITHOUT CompleteAsync discards its bytes; a
+        // dispose-time flush fault (path-bearing on Unix -- SafeFileHandle.Path under _root) must be
+        // SWALLOWED, never thrown out of Dispose (that would leak the temp path AND mask the in-flight
+        // exception that caused the abandon). Injected at "dispose". Non-vacuous: narrowing the
+        // QuietDisposeInner catch so it does not catch the injected type lets the fault escape
+        // (Record.ExceptionAsync returns non-null -> reddens).
+        Stream stream = await _backend.OpenWriteAsync("ab.parquet", CancellationToken.None);
+        await stream.WriteAsync(new byte[] { 1, 2, 3 });
+
+        LocalFileSystemBackend.IoFaultHook = tag => tag == "dispose"
+            ? new IOException($"dispose io '{Path.Combine(_root, "ab.parquet.tmp")}'")
+            : null;
+        Exception? escaped;
+        try
+        {
+            escaped = await Record.ExceptionAsync(async () => await stream.DisposeAsync());
+        }
+        finally
+        {
+            LocalFileSystemBackend.IoFaultHook = null;
+        }
+
+        Assert.Null(escaped); // dispose-flush fault swallowed, not thrown/leaked
+        Assert.Null(await _backend.HeadAsync("ab.parquet", CancellationToken.None)); // abandon left no destination
+    }
+
+    [Fact]
+    public async Task StagedWriteStream_SetLength_IsNotSupported()
+    {
+        // Security R10 Info (RF-8g): the staged write stream is forward-only (Read/Seek throw); SetLength
+        // must likewise throw NotSupportedException rather than delegate to an unguarded _inner.SetLength
+        // whose failure would carry the temp's absolute path.
+        Stream stream = await _backend.OpenWriteAsync("sl.parquet", CancellationToken.None);
+        await using (stream.ConfigureAwait(false))
+        {
+            Assert.Throws<NotSupportedException>(() => stream.SetLength(4));
+        }
     }
 
     [Fact]
@@ -1398,6 +1550,36 @@ public sealed class LocalFileSystemBackendTests : IDisposable
     }
 
     [Fact]
+    public async Task ListEnumerateFault_GenericIOException_SurfacesCleanDeltaStorageException()
+    {
+        // Quality/RF-8g: uniquely pin the generic-IOException arm of the list-enumerate catch (distinct
+        // from the UnauthorizedAccessException sibling). Non-vacuous: narrowing the catch filter to
+        // UnauthorizedAccessException-only lets the injected IOException escape the iterator, reddening the
+        // Kind + no-leak assertions.
+        await _backend.PutIfAbsentAsync("dg/obj.bin", new byte[] { 1 }, CancellationToken.None);
+
+        LocalFileSystemBackend.IoFaultHook = tag => tag == "list-enumerate"
+            ? new IOException($"io '{Path.Combine(_root, "dg")}'")
+            : null;
+        try
+        {
+            DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(async () =>
+            {
+                await foreach (StorageObjectInfo _ in _backend.ListAsync("dg/", CancellationToken.None))
+                {
+                }
+            });
+            Assert.Equal(StorageErrorKind.Transient, error.Kind);
+            Assert.DoesNotContain(_root, error.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(_root, error.ToString(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            LocalFileSystemBackend.IoFaultHook = null;
+        }
+    }
+
+    [Fact]
     public async Task ListMetaFault_ViaIoFaultHook_SkipsEntryWithoutLeaking()
     {
         // S3 (Security): an object that vanishes between enumeration and its metadata read (a delete race)
@@ -1456,6 +1638,32 @@ public sealed class LocalFileSystemBackendTests : IDisposable
         try
         {
             Assert.Null(await _backend.HeadAsync("h/obj.bin", CancellationToken.None));
+        }
+        finally
+        {
+            LocalFileSystemBackend.IoFaultHook = null;
+        }
+    }
+
+    [Fact]
+    public async Task HeadMetaFault_GenericIOException_DoesNotLeakAbsolutePath()
+    {
+        // Quality/RF-8g: uniquely pin the generic-IOException arm of the head-meta catch (distinct from the
+        // UnauthorizedAccessException sibling and the FileNotFound->null control). Non-vacuous: narrowing
+        // the catch filter to UnauthorizedAccessException-only lets the injected IOException escape raw
+        // (not a DeltaStorageException), reddening the assertions.
+        await _backend.PutIfAbsentAsync("hg/obj.bin", new byte[] { 1 }, CancellationToken.None); // File.Exists passes
+
+        LocalFileSystemBackend.IoFaultHook = tag => tag == "head-meta"
+            ? new IOException($"io '{Path.Combine(_root, "hg", "obj.bin")}'")
+            : null;
+        try
+        {
+            DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+                () => _backend.HeadAsync("hg/obj.bin", CancellationToken.None).AsTask());
+            Assert.Equal(StorageErrorKind.Transient, error.Kind);
+            Assert.DoesNotContain(_root, error.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(_root, error.ToString(), StringComparison.Ordinal);
         }
         finally
         {

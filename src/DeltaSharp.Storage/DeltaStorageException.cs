@@ -27,8 +27,10 @@ internal enum StorageErrorKind
     /// unambiguously not this caller's win, or a data file already present at the destination).</summary>
     AlreadyExists,
 
-    /// <summary>A user- or log-supplied path escapes the configured table root / tenant prefix and is
-    /// rejected fail-closed (design §5.5 C-SCOPE, checklist 14). The message names the offending path.</summary>
+    /// <summary>A user- or log-supplied path escapes the configured table root / tenant prefix -- or its
+    /// confinement <b>could not be proven</b> (e.g. an inaccessible or cyclic ancestor blocks real-path
+    /// resolution) -- and is rejected fail-closed (design §5.5 C-SCOPE, checklist 14). The message names
+    /// only the relative offending path, never the absolute root.</summary>
     PathNotConfined,
 
     /// <summary>A storage operation failed in a way that cannot be safely retried because its outcome is
