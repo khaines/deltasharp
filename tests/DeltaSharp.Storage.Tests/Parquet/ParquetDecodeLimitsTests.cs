@@ -70,6 +70,19 @@ public sealed class ParquetDecodeLimitsTests
     }
 
     [Fact]
+    public void CustomHigherRatio_AcceptsWhatDefaultRejects()
+    {
+        // 10 compressed → 20000 decompressed = 2000:1: over the 1000:1 default, under a raised 5000:1 ceiling
+        // (trusted workload). The absolute-size and row-count branches stay slack, so only the ratio branch decides.
+        IReadOnlyList<ParquetFileReader.ColumnChunkFootprint> footprint = Footprint(10, 20000, 8);
+
+        DeltaStorageException ex = Assert.Throws<DeltaStorageException>(() =>
+            ParquetFileReader.EnsureDecodeCeiling(rowCount: 1, footprint, group: 0, ParquetDecodeLimits.Default));
+        Assert.Contains("1000:1", ex.Message, StringComparison.Ordinal);
+        ParquetFileReader.EnsureDecodeCeiling(rowCount: 1, footprint, group: 0, new ParquetDecodeLimits(maxDecompressionRatio: 5000));
+    }
+
+    [Fact]
     public void EnsureDecodeCeiling_NullLimits_UsesDefault()
     {
         // The default-parameter path keeps existing call sites (and the default ceiling) working.
