@@ -82,7 +82,12 @@ internal sealed class DeltaLog
             ActiveFileCount: 0,
             LoadDuration: Stopwatch.GetElapsedTime(start));
 
-        return state.ToSnapshot(target, metrics);
+        Snapshot snapshot = state.ToSnapshot(target, metrics);
+
+        // Protocol negotiation (§2.10.5): fail closed on an unsupported reader version/feature BEFORE the
+        // snapshot is served to a scan — never read past a feature this build does not implement.
+        ProtocolSupport.EnsureReadable(snapshot.Protocol);
+        return snapshot;
     }
 
     /// <summary>Seeds <paramref name="state"/> from the selected checkpoint's parts, returning its version,

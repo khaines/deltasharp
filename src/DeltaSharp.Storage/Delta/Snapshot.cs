@@ -80,6 +80,15 @@ internal sealed class Snapshot
     /// <summary>The load observability for how this snapshot was reconstructed (checkpoint + replay depth).</summary>
     public SnapshotLoadMetrics Metrics => _metrics with { ActiveFileCount = ActiveFileCount };
 
+    /// <summary>
+    /// Selects the active files that <b>might</b> satisfy <paramref name="request"/> (partition + data-skip
+    /// filters), pruning only files the committed partition values / statistics <b>prove</b> cannot match
+    /// (design §2.4; STORY-05.2.3 AC2). The result is a <b>sound over-approximation</b> — every truly
+    /// matching file is a candidate — and the residual predicate remains the scan's responsibility. This is
+    /// the file-pruning half of the snapshot's handoff contract to query execution (§2.10.5).
+    /// </summary>
+    public FilePruningResult PruneFiles(FilePruningRequest request) => FilePruner.Prune(ActiveFiles, request);
+
     private StructType ParseSchema()
     {
         DataType parsed;
