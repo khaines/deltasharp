@@ -6,10 +6,24 @@ using Xunit;
 namespace DeltaSharp.Storage.Tests;
 
 /// <summary>
+/// xUnit collection that runs its member classes with parallelization disabled against all other
+/// collections. <see cref="LocalFileSystemBackendTests"/> exercises <b>process-global</b> fault-injection
+/// seams (<c>LocalFileSystemBackend.IoFaultHook</c> et al.); running it concurrently with any other test
+/// that uses a <see cref="LocalFileSystemBackend"/> would let an injected fault leak across tests (the
+/// pre-existing intermittent storage-suite flake). Isolating it here makes the whole suite deterministic.
+/// </summary>
+[CollectionDefinition(Name, DisableParallelization = true)]
+public sealed class BackendFaultInjectionCollection
+{
+    public const string Name = "LocalFileSystemBackend fault injection (process-global seams)";
+}
+
+/// <summary>
 /// Behavioral tests for <see cref="LocalFileSystemBackend"/>: the single-winner conditional-create
 /// primitive under concurrency, log-resolved-path confinement (§5.5), idempotent delete, range-read
 /// correctness, and the staged write→fsync→rename durability sequence.
 /// </summary>
+[Collection(BackendFaultInjectionCollection.Name)]
 public sealed class LocalFileSystemBackendTests : IDisposable
 {
     private readonly string _root;
