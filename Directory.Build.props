@@ -162,7 +162,8 @@
     defaults above (Apache-2.0 per ADR-0015). SourceLink is provided IN-BOX by the .NET 8+ SDK,
     so NO Microsoft.SourceLink.* package is referenced — this deliberately avoids the
     SDK-version-tied build-package coupling the repo already hit with Microsoft.NET.ILLink.Tasks
-    (see DeltaSharp.Core.csproj). See docs/engineering/design/packaging.md.
+    (see the #468 ILLink pin block above and DeltaSharp.Engine/DeltaSharp.Storage csproj).
+    See docs/engineering/design/packaging.md.
   -->
   <PropertyGroup>
     <!-- Symbols: emit a .snupkg alongside the .nupkg (#130). -->

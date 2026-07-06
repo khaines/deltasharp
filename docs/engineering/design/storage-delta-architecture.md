@@ -273,7 +273,10 @@ Whatever is chosen:
 - `DeltaSharp.Storage` gains a **`packages.lock.json`** on its first third-party `PackageReference`
   (repository-layout "Adding a new project" step 6); the **Engine lock-file drift**
   ([#468](https://github.com/khaines/deltasharp/issues/468)) is settled **consistently** in the same
-  change (option A — add Engine's lock file; NU1004-safe because Engine sets no `IsTrimmable`/`IsAotCompatible`).
+  change: the trim/AOT analyzers make the SDK inject an implicit, SDK-patch-tied
+  `Microsoft.NET.ILLink.Tasks`, so for both lock-file projects its version is pinned via an explicit
+  `PackageReference` + `VersionOverride` name-gated in `Directory.Build.props` (avoiding the NU1004
+  locked-restore drift; Executor is excluded — real NativeAOT, no lock file).
 - `DeltaSharp.Storage`'s `AssemblyName` is registered in **`tools/coverage/coverage-config.json`
   `expectedAssemblies`** (production assemblies only — no `.Tests`), and **both `DeltaSharp.Storage` and
   `DeltaSharp.Storage.Tests` in `tools/security/sca-policy.json` `expectedProjects`** (which enumerates

@@ -1317,9 +1317,17 @@ public sealed class LocalFileSystemBackendTests : IDisposable
         Stream stream = await _backend.OpenWriteAsync("ab.parquet", CancellationToken.None);
         await stream.WriteAsync(new byte[] { 1, 2, 3 });
 
-        LocalFileSystemBackend.IoFaultHook = tag => tag == "dispose"
-            ? new IOException($"dispose io '{Path.Combine(_root, "ab.parquet.tmp")}'")
-            : null;
+        int disposeHookHits = 0;
+        LocalFileSystemBackend.IoFaultHook = tag =>
+        {
+            if (tag != "dispose")
+            {
+                return null;
+            }
+
+            disposeHookHits++;
+            return new IOException($"dispose io '{Path.Combine(_root, "ab.parquet.tmp")}'");
+        };
         Exception? escaped;
         try
         {
@@ -1331,6 +1339,8 @@ public sealed class LocalFileSystemBackendTests : IDisposable
         }
 
         Assert.Null(escaped); // dispose-flush fault swallowed, not thrown/leaked
+        Assert.True(disposeHookHits >= 1, "the async QuietDisposeInnerAsync swallow path was actually reached");
+        Assert.Empty(Directory.GetFiles(_root, "*.tmp", SearchOption.AllDirectories)); // abandon still cleaned the temp
         Assert.Null(await _backend.HeadAsync("ab.parquet", CancellationToken.None)); // abandon left no destination
     }
 
@@ -1375,9 +1385,17 @@ public sealed class LocalFileSystemBackendTests : IDisposable
         Stream stream = await _backend.OpenWriteAsync("abs.parquet", CancellationToken.None);
         await stream.WriteAsync(new byte[] { 1, 2, 3 });
 
-        LocalFileSystemBackend.IoFaultHook = tag => tag == "dispose"
-            ? new IOException($"dispose io '{Path.Combine(_root, "abs.parquet.tmp")}'")
-            : null;
+        int disposeHookHits = 0;
+        LocalFileSystemBackend.IoFaultHook = tag =>
+        {
+            if (tag != "dispose")
+            {
+                return null;
+            }
+
+            disposeHookHits++;
+            return new IOException($"dispose io '{Path.Combine(_root, "abs.parquet.tmp")}'");
+        };
         Exception? escaped;
         try
         {
@@ -1389,6 +1407,8 @@ public sealed class LocalFileSystemBackendTests : IDisposable
         }
 
         Assert.Null(escaped); // sync dispose-flush fault swallowed, not thrown/leaked
+        Assert.True(disposeHookHits >= 1, "the sync QuietDisposeInner swallow path was actually reached");
+        Assert.Empty(Directory.GetFiles(_root, "*.tmp", SearchOption.AllDirectories)); // abandon still cleaned the temp
         Assert.Null(await _backend.HeadAsync("abs.parquet", CancellationToken.None)); // abandon left no destination
     }
 

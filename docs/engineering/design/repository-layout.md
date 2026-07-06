@@ -101,8 +101,10 @@ status and expected compatibility** visible — are in
   `EnableAotAnalyzer` / `EnableSingleFileAnalyzer` Roslyn analyzers under
   warnings-as-errors). Full assembly-level `IsAotCompatible` / `PublishAot`
   verification is deferred to STORY-01.4.1 — note that `IsAotCompatible`/`IsTrimmable`
-  pull the SDK-patch-tied `Microsoft.NET.ILLink.Tasks` package, which would destabilize
-  the committed lock file under locked-mode restore.
+  **and the trim/AOT analyzers above** all pull the SDK-patch-tied
+  `Microsoft.NET.ILLink.Tasks` package (it ships the trim Roslyn analyzer), which
+  destabilizes a committed lock file under locked-mode restore unless its version is
+  pinned (see "Adding a new project" step 6 and [#468](https://github.com/khaines/deltasharp/issues/468)).
 - A public `net8.0` library must never depend on a `net10.0`-only assembly.
 - A **packable** library must not reference a **non-packable** assembly on **any**
   target framework — the published package would ship an unresolvable dependency.
@@ -129,9 +131,19 @@ status and expected compatibility** visible — are in
    gains its first third-party dependency. CI restores in locked mode and fails on an
    out-of-date lock file. `DeltaSharp.Engine` (Apache.Arrow) and `DeltaSharp.Storage`
    (Parquet.Net) therefore carry a committed `packages.lock.json`; the still-SDK-only
-   `DeltaSharp.Core`/`DeltaSharp.Abstractions` deliberately omit one (their only locked
-   package would be the patch-tied `ILLink.Tasks` — the NU1004 hazard). Enabling the
-   lock file is NU1004-safe for Engine/Storage because they enable the trim/AOT
-   *analyzers* rather than `IsTrimmable`/`IsAotCompatible`, so no `ILLink.Tasks` is pulled.
+   `DeltaSharp.Core`/`DeltaSharp.Abstractions` deliberately omit one. Note
+   ([#468](https://github.com/khaines/deltasharp/issues/468)): the trim/AOT *analyzers*
+   enabled on every production assembly make the SDK inject an **implicit, SDK-patch-tied**
+   `Microsoft.NET.ILLink.Tasks` (it ships the trim Roslyn analyzer). For a project that
+   commits a lock file that floating version drifts between a contributor's and CI's SDK
+   and breaks locked-mode restore (NU1004); `Core`/`Abstractions` escape this only because
+   they commit no lock file. `Engine` and `Storage` pin it to a fixed version via an
+   explicit `PackageReference` + `VersionOverride`, name-gated to those two projects in
+   [`Directory.Build.props`](../../../Directory.Build.props) (bump knob
+   `DeltaSharpILLinkTasksVersion`). **When you add a new lock-file-committing production
+   assembly, extend that name-gate** — CPM cannot pin an implicit reference (NU1009), so
+   `VersionOverride` is the mechanism. `DeltaSharp.Executor` is deliberately excluded (its
+   real NativeAOT publish must keep the SDK-matched ILLink/ILCompiler toolchain and it
+   commits no lock file).
 7. Once maintainers and code exist, activate the matching `CODEOWNERS` rule
    (see [`.github/CODEOWNERS`](../../../.github/CODEOWNERS)).
