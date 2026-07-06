@@ -34,8 +34,10 @@ pulls the RID-specific NativeAOT toolchain (`Microsoft.DotNet.ILCompiler` and
 `runtime.linux-x64.Microsoft.DotNet.ILCompiler`), which are SDK-band-pinned and
 Microsoft-signed and resolved through the `global.json` SDK pin. Forcing them into a
 `packages.lock.json` would reintroduce the SDK-version coupling the repo deliberately avoids
-for build-time toolchain packages (the same reason the public libraries enable the trim/AOT
-*analyzers* rather than `Microsoft.NET.ILLink.Tasks`). Third-party dependency pinning is
+for build-time toolchain packages (the same SDK-band coupling that makes `DeltaSharp.Engine`
+/ `DeltaSharp.Storage` pin the analyzer-injected `Microsoft.NET.ILLink.Tasks` via
+`VersionOverride` rather than let its SDK-tied version float in their committed lock files —
+[#468](https://github.com/khaines/deltasharp/issues/468)). Third-party dependency pinning is
 already enforced on the same commit by the required `build-test-format` job, which restores
 the solution with `--locked-mode`. This NativeAOT job is a discard-only trim/AOT-regression
 gate — the produced binary is asserted to exist and then thrown away, never signed,

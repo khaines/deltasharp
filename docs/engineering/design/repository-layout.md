@@ -134,8 +134,8 @@ status and expected compatibility** visible — are in
    `DeltaSharp.Core`/`DeltaSharp.Abstractions` deliberately omit one. Note
    ([#468](https://github.com/khaines/deltasharp/issues/468)): the trim/AOT *analyzers*
    enabled on every production assembly make the SDK inject an **implicit, SDK-patch-tied**
-   `Microsoft.NET.ILLink.Tasks` (it ships the trim Roslyn analyzer). For a project that
-   commits a lock file that floating version drifts between a contributor's and CI's SDK
+   `Microsoft.NET.ILLink.Tasks` (it ships the trim Roslyn analyzer). In a project that
+   commits a lock file, that floating version drifts between a contributor's SDK and CI's
    and breaks locked-mode restore (NU1004); `Core`/`Abstractions` escape this only because
    they commit no lock file. `Engine` and `Storage` pin it to a fixed version via an
    explicit `PackageReference` + `VersionOverride`, name-gated to those two projects in

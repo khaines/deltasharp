@@ -1305,15 +1305,18 @@ public sealed class LocalFileSystemBackendTests : IDisposable
         }
     }
 
-    [Fact]
-    public async Task AbandonedStagedWrite_DisposeFault_SwallowedWithoutThrowingOrLeaking()
+    [Theory]
+    [InlineData(false)] // IOException arm of the swallow filter
+    [InlineData(true)]  // UnauthorizedAccessException arm of the swallow filter
+    public async Task AbandonedStagedWrite_DisposeFault_SwallowedWithoutThrowingOrLeaking(bool useUnauthorizedAccess)
     {
         // Security R10 (RF-8g): a staged write abandoned WITHOUT CompleteAsync discards its bytes; a
         // dispose-time flush fault (path-bearing on Unix -- SafeFileHandle.Path under _root) must be
         // SWALLOWED, never thrown out of Dispose (that would leak the temp path AND mask the in-flight
-        // exception that caused the abandon). Injected at "dispose". Non-vacuous: narrowing the
-        // QuietDisposeInner catch so it does not catch the injected type lets the fault escape
-        // (Record.ExceptionAsync returns non-null -> reddens).
+        // exception that caused the abandon). Injected at "dispose". Non-vacuous over BOTH swallow-filter
+        // arms (IOException AND UnauthorizedAccessException, Quality R13): narrowing/dropping either arm of
+        // the QuietDisposeInnerAsync catch lets the matching injected type escape (Record.ExceptionAsync
+        // returns non-null -> reddens); a no-op DisposeAsync reddens the hook-hit + temp-cleanup oracles.
         Stream stream = await _backend.OpenWriteAsync("ab.parquet", CancellationToken.None);
         await stream.WriteAsync(new byte[] { 1, 2, 3 });
 
@@ -1326,7 +1329,8 @@ public sealed class LocalFileSystemBackendTests : IDisposable
             }
 
             disposeHookHits++;
-            return new IOException($"dispose io '{Path.Combine(_root, "ab.parquet.tmp")}'");
+            string msg = $"dispose fault '{Path.Combine(_root, "ab.parquet.tmp")}'";
+            return useUnauthorizedAccess ? new UnauthorizedAccessException(msg) : new IOException(msg);
         };
         Exception? escaped;
         try
@@ -1375,13 +1379,17 @@ public sealed class LocalFileSystemBackendTests : IDisposable
         }
     }
 
-    [Fact]
-    public async Task AbandonedStagedWrite_SyncDisposeFault_SwallowedWithoutThrowingOrLeaking()
+    [Theory]
+    [InlineData(false)] // IOException arm of the swallow filter
+    [InlineData(true)]  // UnauthorizedAccessException arm of the swallow filter
+    public async Task AbandonedStagedWrite_SyncDisposeFault_SwallowedWithoutThrowingOrLeaking(bool useUnauthorizedAccess)
     {
         // Quality R11 (RF-8h): the SYNC abandon-dispose swallow (Dispose(bool) -> QuietDisposeInner) is
         // reachable via a synchronous `using`/Stream.Dispose() and must swallow a dispose-flush fault just
-        // like the async path. Non-vacuous: narrowing the sync QuietDisposeInner catch lets the injected
-        // fault escape (Record.Exception returns non-null -> reddens).
+        // like the async path. Non-vacuous over BOTH swallow-filter arms (IOException AND
+        // UnauthorizedAccessException, Quality R13): narrowing/dropping either arm of the sync
+        // QuietDisposeInner catch lets the matching injected type escape (Record.Exception returns non-null
+        // -> reddens); a no-op Dispose(bool) reddens the hook-hit + temp-cleanup oracles.
         Stream stream = await _backend.OpenWriteAsync("abs.parquet", CancellationToken.None);
         await stream.WriteAsync(new byte[] { 1, 2, 3 });
 
@@ -1394,7 +1402,8 @@ public sealed class LocalFileSystemBackendTests : IDisposable
             }
 
             disposeHookHits++;
-            return new IOException($"dispose io '{Path.Combine(_root, "abs.parquet.tmp")}'");
+            string msg = $"dispose fault '{Path.Combine(_root, "abs.parquet.tmp")}'";
+            return useUnauthorizedAccess ? new UnauthorizedAccessException(msg) : new IOException(msg);
         };
         Exception? escaped;
         try

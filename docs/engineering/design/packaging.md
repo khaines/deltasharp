@@ -53,7 +53,8 @@ on deterministic source-path normalization and SourceLink URL mapping.
 **SourceLink is provided in-box by the .NET 8+ SDK**, so DeltaSharp references **no**
 `Microsoft.SourceLink.*` package. This is deliberate: a standalone SourceLink package version
 is tied to an SDK band, which is the same SDK-version coupling the repository already hit with
-`Microsoft.NET.ILLink.Tasks` (see the comment in `DeltaSharp.Core.csproj`). Using the in-box
+`Microsoft.NET.ILLink.Tasks` (see the #468 ILLink pin block in `Directory.Build.props` and
+`DeltaSharp.Engine`/`DeltaSharp.Storage.csproj`). Using the in-box
 provider keeps the SDK pinned in one place (`global.json`).
 
 A CI build emits a SourceLink map (`obj/**/<project>.sourcelink.json`) of the form:
