@@ -166,9 +166,12 @@ internal sealed class ParquetFileReader
             }
 
             // (i) Decompression-ratio ceiling: a chunk claiming far more decompressed than compressed
-            // bytes is a decompression bomb. The floor of 1 avoids a divide-by/zero-compressed edge.
+            // bytes is a decompression bomb. The floor of 1 avoids a divide-by/zero-compressed edge. The
+            // product is widened to Int128 so a large declared compressed size cannot overflow the 64-bit
+            // multiply into a spurious verdict (wrapping to a negative or small-positive threshold that would
+            // either wrongly reject a legitimate chunk or wrongly accept a bomb).
             long compressedFloor = Math.Max(chunk.CompressedBytes, 1);
-            if (chunk.UncompressedBytes > compressedFloor * limits.MaxDecompressionRatio)
+            if (chunk.UncompressedBytes > (Int128)compressedFloor * limits.MaxDecompressionRatio)
             {
                 throw DeltaStorageException.CorruptData(
                     $"Row group {group} declares {chunk.UncompressedBytes} decompressed bytes for "

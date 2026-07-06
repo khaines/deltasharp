@@ -83,6 +83,33 @@ public sealed class ParquetDecodeLimitsTests
     }
 
     [Fact]
+    public void RatioGuard_LargeCompressedSize_DoesNotOverflow()
+    {
+        // Overflow-safety of the decompression-ratio check: a chunk with a huge declared COMPRESSED size and
+        // a tiny decompressed payload is NOT a ratio bomb (ratio << 1) and must be accepted. The check widens
+        // the compressed×ratio product to Int128 so it never wraps a 64-bit multiply into a spurious verdict.
+        // Pre-fix, `long compressedFloor * MaxDecompressionRatio` overflowed (here to a negative product),
+        // flipping the comparison and wrongly rejecting this legitimate chunk — the same wrap can, for other
+        // crafted sizes, land on a positive product and wrongly ACCEPT (a false negative in a decode-bomb guard).
+        IReadOnlyList<ParquetFileReader.ColumnChunkFootprint> footprint = Footprint(9_223_372_036_854_776L, 1000, 8);
+
+        // Must not throw: well under every ceiling and not a ratio bomb.
+        ParquetFileReader.EnsureDecodeCeiling(rowCount: 1, footprint, group: 0, ParquetDecodeLimits.Default);
+    }
+
+    [Fact]
+    public void RatioGuard_RealBomb_StillRejected()
+    {
+        // The overflow fix widens the product; it must not relax detection. A genuine ratio bomb (1000 bytes
+        // compressed → 2 GiB decompressed ≈ 2.1M:1) is still rejected by the ratio ceiling.
+        IReadOnlyList<ParquetFileReader.ColumnChunkFootprint> footprint = Footprint(1000, 2L * 1024 * 1024 * 1024, 8);
+
+        DeltaStorageException ex = Assert.Throws<DeltaStorageException>(() =>
+            ParquetFileReader.EnsureDecodeCeiling(rowCount: 1, footprint, group: 0, ParquetDecodeLimits.Default));
+        Assert.Contains("decompression-ratio ceiling", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void EnsureDecodeCeiling_NullLimits_UsesDefault()
     {
         // The default-parameter path keeps existing call sites (and the default ceiling) working.
