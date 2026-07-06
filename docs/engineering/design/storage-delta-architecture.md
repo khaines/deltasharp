@@ -1432,12 +1432,13 @@ Each phased feature is "done" only when its checklist obligations are green (per
   seams (§2.2).
 - **D-5 · Settle the Engine lock-file drift (#468), register the new assembly in both fail-closed gates,
   and activate its `CODEOWNERS` rule in the same change that adds Storage's first third-party dep**
-  (§2.7). No `/src/DeltaSharp.Storage/**` `CODEOWNERS` line exists yet; add one
-  (`persona:delta-storage-format-engineer`) when the assembly lands. The #468 change-set must also
-  **correct the now-stale governance docs it exposes**: `repository-layout.md` step 6 still calls
-  Core/Engine "SDK-only" (false for Engine, which references `Apache.Arrow` — the drift's root cause), and
-  the Engine `.csproj` has a dangling "lock the Apache.Arrow boundary" comment with no
-  `RestorePackagesWithLockFile` behind it — both reconciled when Engine's `packages.lock.json` lands.
+  (§2.7). A `/src/DeltaSharp.Storage/**` `CODEOWNERS` line (`persona:delta-storage-format-engineer`) was
+  added when the assembly landed. The #468 change-set **also corrected the governance docs it exposed**:
+  `repository-layout.md` step 6 **previously called** Core/Engine "SDK-only" (which was false for Engine,
+  which references `Apache.Arrow` — the drift's root cause), and the Engine `.csproj`'s "lock the
+  Apache.Arrow boundary" comment **is now backed by** `RestorePackagesWithLockFile` — both reconciled when
+  Engine's `packages.lock.json` **landed** (this PR). The #468 root cause is the analyzer-injected,
+  SDK-patch-tied `Microsoft.NET.ILLink.Tasks`, pinned to a fixed version via a name-gated `VersionOverride`.
 - **D-6 · `SchemaJson` gains typed field metadata and moves to `DeltaSharp.Abstractions`.** The Delta
   `metaData.schemaString` round-trip (§2.10.1) needs `FieldMetadata`/`SchemaJson` extended from
   **string-only** to **typed** JSON metadata values (numbers/booleans/nested) before column mapping and
