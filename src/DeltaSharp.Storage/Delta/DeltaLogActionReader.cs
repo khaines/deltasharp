@@ -234,7 +234,30 @@ internal static class DeltaLogActionReader
                 $"Delta log version {version} line {line}: add.stats must be a JSON string, but was '{stats.ValueKind}'."));
         }
 
-        string? statsJson = stats.GetString();
+        try
+        {
+            return ParseStatsString(stats.GetString());
+        }
+        catch (DeltaProtocolException ex)
+        {
+            // Re-wrap with the precise version/line context the JSON path can provide.
+            throw DeltaProtocolException.Malformed(string.Create(
+                CultureInfo.InvariantCulture,
+                $"Delta log version {version} line {line}: add.stats is not valid JSON."),
+                ex.InnerException ?? ex);
+        }
+    }
+
+    /// <summary>
+    /// Parses an <c>add.stats</c> JSON <b>string</b> (the value that Delta stores as a JSON-encoded string
+    /// within the log/checkpoint) into <see cref="FileStatistics"/>. Shared by the JSON commit path and
+    /// the checkpoint-Parquet path so both interpret <c>stats</c> identically — a precondition of the
+    /// checkpoint-vs-JSON-replay parity oracle (design §2.10.2/§2.10.3, STORY-05.2.2 AC3). A blank/absent
+    /// string yields <see langword="null"/>; a non-object JSON yields <see cref="FileStatistics.Empty"/>.
+    /// </summary>
+    /// <exception cref="DeltaProtocolException">The string is not valid JSON (fail closed).</exception>
+    internal static FileStatistics? ParseStatsString(string? statsJson)
+    {
         if (string.IsNullOrWhiteSpace(statsJson))
         {
             return null;
@@ -247,10 +270,7 @@ internal static class DeltaLogActionReader
         }
         catch (JsonException ex)
         {
-            throw DeltaProtocolException.Malformed(string.Create(
-                CultureInfo.InvariantCulture,
-                $"Delta log version {version} line {line}: add.stats is not valid JSON."),
-                ex);
+            throw DeltaProtocolException.Malformed("A Delta add.stats value is not valid JSON.", ex);
         }
 
         using (statsDocument)
