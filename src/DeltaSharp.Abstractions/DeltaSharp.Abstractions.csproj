@@ -62,6 +62,13 @@
     <InternalsVisibleTo Include="DeltaSharp.Engine" />
     <InternalsVisibleTo Include="DeltaSharp.Core" />
     <InternalsVisibleTo Include="DeltaSharp.Core.Tests" />
+    <!-- FEAT-05.2 (#47) / design §9.1 D-6: DeltaSharp.Storage reads the Delta log's
+         metaData.schemaString via the internal SchemaJson serializer, relocated here from Engine
+         (it operates only on Abstractions DataType/StructType). DeltaSharp.Engine.Tests keeps the
+         SchemaJson round-trip tests in place after the relocation. The seam stays internal — the
+         Abstractions PublicAPI baseline is unchanged. -->
+    <InternalsVisibleTo Include="DeltaSharp.Storage" />
+    <InternalsVisibleTo Include="DeltaSharp.Engine.Tests" />
   </ItemGroup>
 
 </Project>
