@@ -273,7 +273,10 @@ Whatever is chosen:
 - `DeltaSharp.Storage` gains a **`packages.lock.json`** on its first third-party `PackageReference`
   (repository-layout "Adding a new project" step 6); the **Engine lock-file drift**
   ([#468](https://github.com/khaines/deltasharp/issues/468)) is settled **consistently** in the same
-  change (option A — add Engine's lock file; NU1004-safe because Engine sets no `IsTrimmable`/`IsAotCompatible`).
+  change: the trim/AOT analyzers make the SDK inject an implicit, SDK-patch-tied
+  `Microsoft.NET.ILLink.Tasks`, so for both lock-file projects its version is pinned via an explicit
+  `PackageReference` + `VersionOverride` name-gated in `Directory.Build.props` (avoiding the NU1004
+  locked-restore drift; Executor is excluded — real NativeAOT, no lock file).
 - `DeltaSharp.Storage`'s `AssemblyName` is registered in **`tools/coverage/coverage-config.json`
   `expectedAssemblies`** (production assemblies only — no `.Tests`), and **both `DeltaSharp.Storage` and
   `DeltaSharp.Storage.Tests` in `tools/security/sca-policy.json` `expectedProjects`** (which enumerates
@@ -1387,7 +1390,7 @@ The real "feature flag" is **reader/writer protocol-version negotiation** (ADR-0
 | `sca` (`security.yml`) | **Register `DeltaSharp.Storage` *and* `DeltaSharp.Storage.Tests` in `tools/security/sca-policy.json` `expectedProjects`** — the fail-closed allowlist enumerates **every solution project** (it already lists `*.Tests` + the sample), so a missing project name fails CI. `failOnSeverity: high`. If the proposed non-shipping `bench/DeltaSharp.Storage.Benchmarks` (§4.5) is ever added to `DeltaSharp.sln`, it too must be added here **and** enters SBOM/SCA scope (it pulls BenchmarkDotNet). |
 | `secret-scan` (`security.yml`) | Stays green — no fixtures/connection strings committed; emulator/test credentials are placeholders (checklist 13). |
 | `sbom` (`security.yml`) | CycloneDX SBOM must generate for the new assembly and its first third-party deps. |
-| **Lock files** | Add **`DeltaSharp.Storage/packages.lock.json`** on the **first third-party dependency** (a Parquet impl and/or object-store SDKs) so `--locked-mode` restores stay reproducible. **Settle the Engine lock-file drift ([#468](https://github.com/khaines/deltasharp/issues/468)) consistently** — `DeltaSharp.Engine` references `Apache.Arrow` but ships no lock file — so the repo's lock-file posture is uniform across engine-internal assemblies. The same change-set must **correct the now-stale governance docs**: `repository-layout.md` step 6 still calls Core/Engine "SDK-only … only locked package would be `ILLink.Tasks`" (false for Engine, which took `Apache.Arrow` — the #468 root cause), and the Engine `.csproj` carries a dangling "lock the Apache.Arrow boundary" comment with no `RestorePackagesWithLockFile` behind it (§9.1 D-5). |
+| **Lock files** | Add **`DeltaSharp.Storage/packages.lock.json`** on the **first third-party dependency** (a Parquet impl and/or object-store SDKs) so `--locked-mode` restores stay reproducible. **Settle the Engine lock-file drift ([#468](https://github.com/khaines/deltasharp/issues/468)) consistently** — done in this PR: `DeltaSharp.Engine` (`Apache.Arrow`) and `DeltaSharp.Storage` (`Parquet.Net`) both carry a committed `packages.lock.json` (`RestorePackagesWithLockFile`), and the analyzer-injected SDK-patch-tied `Microsoft.NET.ILLink.Tasks` — the #468 root cause — is pinned via a name-gated `VersionOverride` (`Directory.Build.props`) so locked-mode restore is drift-free across SDK patches. The governance docs (`repository-layout.md` step 6, `quality-gates.md`, `native-aot.md`, `packaging.md`) were corrected to match reality (analyzers DO inject `ILLink.Tasks`; §9.1 D-5). |
 | `aot.yml` (NativeAOT publish) | **Keep green if Storage becomes reachable from `DeltaSharp.Executor`** (it will — the executor reads/writes tables). DeltaSharp's **own** decode kernels use no dynamic code (`Reflection.Emit`/`Expression.Compile` banned per ADR-0001/`BannedSymbols.txt` — but that analyzer governs first-party source only, **not** a third-party codec). AOT-cleanliness of the chosen Parquet codec is therefore an **empirical gate, not a policy**: the FEAT-05.1 codec-selection prototype must pass `dotnet publish src/DeltaSharp.Executor -p:PublishAot=true -warnaserror` **and** a runtime AOT decode smoke — this is the first codec task and the go/no-go for OQ-1, since a reflection-heavy codec surfaces `IL2xxx`/`IL3xxx` at publish (ADR-0014; checklist 10). |
 | `pack.yml` (informational, **not required**) | No change expected — Storage is non-packable; this gate confirms it never leaks into the packable net8.0 surface (R7). |
 
@@ -1429,12 +1432,13 @@ Each phased feature is "done" only when its checklist obligations are green (per
   seams (§2.2).
 - **D-5 · Settle the Engine lock-file drift (#468), register the new assembly in both fail-closed gates,
   and activate its `CODEOWNERS` rule in the same change that adds Storage's first third-party dep**
-  (§2.7). No `/src/DeltaSharp.Storage/**` `CODEOWNERS` line exists yet; add one
-  (`persona:delta-storage-format-engineer`) when the assembly lands. The #468 change-set must also
-  **correct the now-stale governance docs it exposes**: `repository-layout.md` step 6 still calls
-  Core/Engine "SDK-only" (false for Engine, which references `Apache.Arrow` — the drift's root cause), and
-  the Engine `.csproj` has a dangling "lock the Apache.Arrow boundary" comment with no
-  `RestorePackagesWithLockFile` behind it — both reconciled when Engine's `packages.lock.json` lands.
+  (§2.7). A `/src/DeltaSharp.Storage/**` `CODEOWNERS` line (`persona:delta-storage-format-engineer`) was
+  added when the assembly landed. The #468 change-set **also corrected the governance docs it exposed**:
+  `repository-layout.md` step 6 **previously called** Core/Engine "SDK-only" (which was false for Engine,
+  which references `Apache.Arrow` — the drift's root cause), and the Engine `.csproj`'s "lock the
+  Apache.Arrow boundary" comment **is now backed by** `RestorePackagesWithLockFile` — both reconciled when
+  Engine's `packages.lock.json` **landed** (this PR). The #468 root cause is the analyzer-injected,
+  SDK-patch-tied `Microsoft.NET.ILLink.Tasks`, pinned to a fixed version via a name-gated `VersionOverride`.
 - **D-6 · `SchemaJson` gains typed field metadata and moves to `DeltaSharp.Abstractions`.** The Delta
   `metaData.schemaString` round-trip (§2.10.1) needs `FieldMetadata`/`SchemaJson` extended from
   **string-only** to **typed** JSON metadata values (numbers/booleans/nested) before column mapping and

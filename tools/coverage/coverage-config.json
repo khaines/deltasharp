@@ -12,7 +12,8 @@
     "DeltaSharp.Abstractions",
     "DeltaSharp.Core",
     "DeltaSharp.Engine",
-    "DeltaSharp.Executor"
+    "DeltaSharp.Executor",
+    "DeltaSharp.Storage"
   ],
   "expectedAssembliesNotes": [
     "FAIL-CLOSED provenance allowlist — the EXACT set of production assemblies (symmetric).",

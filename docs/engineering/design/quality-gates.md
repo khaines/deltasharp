@@ -76,9 +76,14 @@ All of the following are wired centrally in
   silently opt out. They surface `IL2xxx`/`IL3xxx` dataflow warnings, which — under
   warnings-as-errors — fail the build. This is the standing enforcement of the
   [ADR-0014](../../adr/0014-target-framework-aot.md)
-  AOT posture. The analyzers (not `IsAotCompatible`/`IsTrimmable`) are used deliberately so the
-  SDK-version-tied `Microsoft.NET.ILLink.Tasks` package is not pulled into the committed lock
-  files; a real AOT publish is verified separately by the `aot.yml` workflow.
+  AOT posture. The analyzers (not `IsAotCompatible`/`IsTrimmable`) are used so no real
+  trim/AOT rewrite happens at build; a real AOT publish is verified separately by the
+  `aot.yml` workflow. Enabling the analyzers does, however, make the SDK inject an
+  implicit, SDK-patch-tied `Microsoft.NET.ILLink.Tasks` (it ships the trim analyzer); for
+  the production assemblies that commit a lock file (`DeltaSharp.Engine`,
+  `DeltaSharp.Storage`) its version is pinned via `VersionOverride` in `Directory.Build.props`
+  ([#468](https://github.com/khaines/deltasharp/issues/468)) so locked-mode restore does not
+  drift across SDK patches.
 - **`BannedApiAnalyzers` (`RS0030`) and `PublicApiAnalyzers` (`RS0016`/`RS0017`/`RS0025`)** —
   API-governance analyzers that also ride on warnings-as-errors. Their scope and ban list are
   documented in [api-governance.md](api-governance.md); this gate is what makes their
