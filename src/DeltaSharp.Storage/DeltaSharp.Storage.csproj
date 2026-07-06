@@ -19,7 +19,10 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <!-- First-dep governance (design §2.7/§8.5, #468): a committed NuGet lock file so
          `restore` in locked mode is reproducible and drift-detecting the moment this assembly
-         takes its first third-party dependency (Parquet.Net). -->
+         takes its first third-party dependency (Parquet.Net). The trim/AOT analyzers enabled
+         centrally in Directory.Build.props also pull the SDK-implicit Microsoft.NET.ILLink.Tasks;
+         its version is pinned centrally there (name-gated to this project + DeltaSharp.Engine)
+         so this lock file does not drift under locked-mode restore across SDK patches. -->
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
     <!-- OQ-1 / empirical codec-AOT gate (design §2.7 B-F1): Parquet.Net's LOW-LEVEL DataColumn API
          is used (not the reflection class serializer). DeltaSharp.Storage is NOT yet reachable from

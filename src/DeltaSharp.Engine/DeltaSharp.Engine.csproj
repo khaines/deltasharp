@@ -17,15 +17,19 @@
          pointers are AOT/trim-clean and not on BannedSymbols.txt, so the AOT analyzers above stay green. -->
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <!-- #468: lock the Apache.Arrow boundary dependency for reproducible, drift-detecting
-         restores (CI restores in locked mode). NU1004-safe: the trim/AOT analyzers (not
-         IsTrimmable/IsAotCompatible) are enabled, so no SDK-patch-tied ILLink.Tasks enters the
-         lock file; the only pinned package is CPM-managed Apache.Arrow. -->
+         restores (CI restores in locked mode). The trim/AOT analyzers enabled centrally in
+         Directory.Build.props make the .NET 10 SDK inject an implicit, SDK-patch-tied
+         Microsoft.NET.ILLink.Tasks (it ships the trim analyzer); its version is pinned
+         centrally there (name-gated to this project + DeltaSharp.Storage) so this lock file
+         does not drift under locked-mode restore across SDK patches. -->
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
     <!-- ADR-0014: the engine is destined for the NativeAOT executor image, so keep it
          AOT-clean from the first commit. The trim/AOT/single-file analyzers are wired
          centrally in Directory.Build.props for every src/ production assembly (so no project
-         can drift); enabling the analyzers (not IsAotCompatible) keeps the lock file free of
-         the SDK-version-tied ILLink.Tasks package. -->
+         can drift). Because those analyzers pull the SDK-implicit ILLink.Tasks and this
+         project commits a lock file, that package's version is pinned centrally (see
+         Directory.Build.props, #468) to keep locked-mode restore reproducible across SDK
+         patches. -->
   </PropertyGroup>
 
   <ItemGroup>

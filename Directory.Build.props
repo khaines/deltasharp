@@ -81,16 +81,54 @@
        wired centrally here so no project can drift (ADR-0014). They surface
        IL2xxx/IL3xxx dataflow warnings which — under the repository-wide
        TreatWarningsAsErrors above — fail the build, standing enforcement of the AOT
-       posture. We enable the ANALYZERS (not IsAotCompatible/IsTrimmable) deliberately so
-       the SDK-version-tied Microsoft.NET.ILLink.Tasks package is never pulled into the
-       committed lock files; a real AOT publish is verified separately by aot.yml. Scoped to
-       src/ via the DeltaSharpIsProductionAssembly gate set above — test projects are excluded
-       (they legitimately use reflection/dynamic code). -->
+       posture. We enable the ANALYZERS (not IsAotCompatible/IsTrimmable) so no real
+       trim/AOT rewrite happens at build; a real AOT publish is verified separately by
+       aot.yml (the Executor). Scoped to src/ via the DeltaSharpIsProductionAssembly gate set
+       above — test projects are excluded (they legitimately use reflection/dynamic code).
+
+       NB (#468): on the .NET 10 SDK, enabling ANY of these analyzers makes the SDK add an
+       *implicit* PackageReference to Microsoft.NET.ILLink.Tasks (it ships the trim Roslyn
+       analyzer) at an SDK-patch-tied version (KnownILLinkPack.ILLinkPackVersion — 10.0.0 on
+       SDK 10.0.100, a higher 10.0.x on newer patches). For the production assemblies that
+       commit a NuGet lock file that implicit version is pinned in the block below so
+       locked-mode restore does not drift across SDK patches. -->
   <PropertyGroup Condition="'$(DeltaSharpIsProductionAssembly)' == 'true'">
     <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
     <EnableAotAnalyzer>true</EnableAotAnalyzer>
     <EnableSingleFileAnalyzer>true</EnableSingleFileAnalyzer>
   </PropertyGroup>
+
+  <!-- #468 — pin the SDK-implicit Microsoft.NET.ILLink.Tasks analyzer package for the
+       production assemblies that commit a NuGet lock file (DeltaSharp.Engine,
+       DeltaSharp.Storage). Enabling the trim/AOT/single-file analyzers above makes the .NET
+       10 SDK inject an implicit PackageReference to this package at the version bundled with
+       the running SDK. Because that version floats with the SDK patch, the committed lock
+       files' requested range drifts between a contributor's SDK and CI's SDK and
+       `dotnet restore` in locked mode fails NU1004 (the CI blocker on #468 / PR #470).
+
+       Central Package Management CANNOT pin it: an implicitly-defined PackageReference may
+       not take a PackageVersion (NuGet NU1009 — "implicit package versions [must] be
+       specified by the PackageReference item"). The sanctioned fix is an explicit
+       PackageReference carrying a VersionOverride, which (a) de-duplicates the SDK's implicit
+       reference — the SDK drops its implicit ILLink ref when an explicit reference for the
+       same id already exists — and (b) fixes the version independent of the SDK patch. This
+       also makes the trim/AOT analyzer diagnostics reproducible across SDK patches (a newer
+       SDK cannot silently introduce a new IL2xxx/IL3xxx warning that breaks warnings-as-errors).
+
+       DeltaSharp.Executor is deliberately EXCLUDED: it performs a real NativeAOT publish
+       (PublishAot=true, verified by aot.yml) and must keep the SDK-matched ILLink/ILCompiler
+       toolchain, and it commits no lock file. DeltaSharp.Core / DeltaSharp.Abstractions also
+       commit no lock file, so their implicit ILLink reference may float harmlessly. Name-gated
+       (mirrors the DeltaSharpTracksPublicApi gate above); extend the condition if another
+       lock-file-committing production assembly is added. -->
+  <PropertyGroup>
+    <!-- .NET 10 GA baseline. Bump deliberately (e.g. when moving to a .NET 11 SDK) and
+         regenerate the two lock files with `dotnet restore <proj>` using force-evaluate. -->
+    <DeltaSharpILLinkTasksVersion>10.0.0</DeltaSharpILLinkTasksVersion>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(MSBuildProjectName)' == 'DeltaSharp.Engine' Or '$(MSBuildProjectName)' == 'DeltaSharp.Storage'">
+    <PackageReference Include="Microsoft.NET.ILLink.Tasks" VersionOverride="$(DeltaSharpILLinkTasksVersion)" PrivateAssets="all" />
+  </ItemGroup>
 
   <!-- BannedApiAnalyzers on production assemblies (Core, Abstractions, Engine, Executor). The categorized
        ban list lives at the repo root and is shared by every production assembly. -->
