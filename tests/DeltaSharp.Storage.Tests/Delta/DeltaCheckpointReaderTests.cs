@@ -158,6 +158,24 @@ public sealed class DeltaCheckpointReaderTests
     }
 
     [Fact]
+    public async Task PartialMetadataRow_OnlyEmptyMapsAndNulls_FailsClosed()
+    {
+        // Red-team R3: a metaData struct that is PRESENT but whose scalar fields are all null and whose
+        // only sub-content is empty maps/lists (format.options={}, configuration={}, partitionColumns=[])
+        // must still fail closed — the struct-present signal comes from the key column's definition level,
+        // not from field content, so an empty-map-only partial action is not silently skipped.
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(1, 2)
+            .Metadata(id: null!, schemaString: null!, provider: null!)
+            .ToParquetAsync();
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default));
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.Contains("id", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Corrupt_Parquet_FailsClosed()
     {
         byte[] garbage = "this is not a parquet file, just bytes"u8.ToArray();

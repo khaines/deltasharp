@@ -61,6 +61,16 @@ internal sealed class CheckpointColumns
     private long?[] _txnVersion = [];
     private long?[] _txnLastUpdated = [];
 
+    // Per-row "the action struct is present" flags, derived from each action's primary-key column
+    // definition levels (def ≥ 1). Used to fail closed on a partial action row whose struct is present but
+    // whose required key is null — even when its only content is an empty map/list (which field-content
+    // checks cannot detect).
+    private bool[] _addPresent = [];
+    private bool[] _removePresent = [];
+    private bool[] _metaPresent = [];
+    private bool[] _protocolPresent = [];
+    private bool[] _txnPresent = [];
+
     private CheckpointColumns()
     {
     }
@@ -68,9 +78,19 @@ internal sealed class CheckpointColumns
     public static async Task<CheckpointColumns> ReadAsync(
         ParquetRowGroupReader rowGroup, CheckpointSchema schema, int rowCount, CancellationToken cancellationToken)
     {
+        var addPresent = new bool[rowCount];
+        var removePresent = new bool[rowCount];
+        var metaPresent = new bool[rowCount];
+        var protocolPresent = new bool[rowCount];
+        var txnPresent = new bool[rowCount];
         var columns = new CheckpointColumns
         {
-            _addPath = await ReadStringScalarAsync(rowGroup, schema.AddPath, rowCount, cancellationToken).ConfigureAwait(false),
+            _addPresent = addPresent,
+            _removePresent = removePresent,
+            _metaPresent = metaPresent,
+            _protocolPresent = protocolPresent,
+            _txnPresent = txnPresent,
+            _addPath = await ReadStringScalarAsync(rowGroup, schema.AddPath, rowCount, cancellationToken, addPresent).ConfigureAwait(false),
             _addSize = await ReadLongScalarAsync(rowGroup, schema.AddSize, rowCount, cancellationToken).ConfigureAwait(false),
             _addModificationTime = await ReadLongScalarAsync(rowGroup, schema.AddModificationTime, rowCount, cancellationToken).ConfigureAwait(false),
             _addDataChange = await ReadBoolScalarAsync(rowGroup, schema.AddDataChange, rowCount, cancellationToken).ConfigureAwait(false),
@@ -78,14 +98,14 @@ internal sealed class CheckpointColumns
             _addPartitionValues = await ReadNullableMapAsync(rowGroup, schema.AddPartitionValues, rowCount, cancellationToken).ConfigureAwait(false),
             _addTags = await ReadStringMapAsync(rowGroup, schema.AddTags, rowCount, cancellationToken).ConfigureAwait(false),
 
-            _removePath = await ReadStringScalarAsync(rowGroup, schema.RemovePath, rowCount, cancellationToken).ConfigureAwait(false),
+            _removePath = await ReadStringScalarAsync(rowGroup, schema.RemovePath, rowCount, cancellationToken, removePresent).ConfigureAwait(false),
             _removeDeletionTimestamp = await ReadLongScalarAsync(rowGroup, schema.RemoveDeletionTimestamp, rowCount, cancellationToken).ConfigureAwait(false),
             _removeDataChange = await ReadBoolScalarAsync(rowGroup, schema.RemoveDataChange, rowCount, cancellationToken).ConfigureAwait(false),
             _removeExtendedFileMetadata = await ReadBoolScalarAsync(rowGroup, schema.RemoveExtendedFileMetadata, rowCount, cancellationToken).ConfigureAwait(false),
             _removeSize = await ReadLongScalarAsync(rowGroup, schema.RemoveSize, rowCount, cancellationToken).ConfigureAwait(false),
             _removePartitionValues = await ReadNullableMapAsync(rowGroup, schema.RemovePartitionValues, rowCount, cancellationToken).ConfigureAwait(false),
 
-            _metaId = await ReadStringScalarAsync(rowGroup, schema.MetaId, rowCount, cancellationToken).ConfigureAwait(false),
+            _metaId = await ReadStringScalarAsync(rowGroup, schema.MetaId, rowCount, cancellationToken, metaPresent).ConfigureAwait(false),
             _metaName = await ReadStringScalarAsync(rowGroup, schema.MetaName, rowCount, cancellationToken).ConfigureAwait(false),
             _metaDescription = await ReadStringScalarAsync(rowGroup, schema.MetaDescription, rowCount, cancellationToken).ConfigureAwait(false),
             _metaSchemaString = await ReadStringScalarAsync(rowGroup, schema.MetaSchemaString, rowCount, cancellationToken).ConfigureAwait(false),
@@ -95,12 +115,12 @@ internal sealed class CheckpointColumns
             _metaPartitionColumns = await ReadStringListAsync(rowGroup, schema.MetaPartitionColumns, rowCount, cancellationToken).ConfigureAwait(false),
             _metaConfiguration = await ReadStringMapAsync(rowGroup, schema.MetaConfiguration, rowCount, cancellationToken).ConfigureAwait(false),
 
-            _protocolMinReaderVersion = await ReadIntScalarAsync(rowGroup, schema.ProtocolMinReaderVersion, rowCount, cancellationToken).ConfigureAwait(false),
+            _protocolMinReaderVersion = await ReadIntScalarAsync(rowGroup, schema.ProtocolMinReaderVersion, rowCount, cancellationToken, protocolPresent).ConfigureAwait(false),
             _protocolMinWriterVersion = await ReadIntScalarAsync(rowGroup, schema.ProtocolMinWriterVersion, rowCount, cancellationToken).ConfigureAwait(false),
             _protocolReaderFeatures = await ReadStringListAsync(rowGroup, schema.ProtocolReaderFeatures, rowCount, cancellationToken).ConfigureAwait(false),
             _protocolWriterFeatures = await ReadStringListAsync(rowGroup, schema.ProtocolWriterFeatures, rowCount, cancellationToken).ConfigureAwait(false),
 
-            _txnAppId = await ReadStringScalarAsync(rowGroup, schema.TxnAppId, rowCount, cancellationToken).ConfigureAwait(false),
+            _txnAppId = await ReadStringScalarAsync(rowGroup, schema.TxnAppId, rowCount, cancellationToken, txnPresent).ConfigureAwait(false),
             _txnVersion = await ReadLongScalarAsync(rowGroup, schema.TxnVersion, rowCount, cancellationToken).ConfigureAwait(false),
             _txnLastUpdated = await ReadLongScalarAsync(rowGroup, schema.TxnLastUpdated, rowCount, cancellationToken).ConfigureAwait(false),
         };
@@ -128,26 +148,33 @@ internal sealed class CheckpointColumns
                 $"Checkpoint row {row} (group {group}) encodes {count} actions but a row must encode exactly one."));
         }
 
-        // Fail closed on a PARTIAL action: a row that carries any field of an action struct but is missing
-        // that action's required primary key is a malformed/corrupt checkpoint. It must throw (→ the caller
-        // falls back to JSON replay), never be silently skipped — a silent skip would drop a committed file
-        // or the metaData from the reconstructed state, producing a wrong active-file set with no error.
+        // Fail closed on a PARTIAL action: a row whose action struct is present (its primary-key column's
+        // definition level says so) but whose required primary key is null is a malformed/corrupt checkpoint.
+        // It must throw (→ the caller falls back to JSON replay), never be silently skipped — a silent skip
+        // would drop a committed file or the metaData from the reconstructed state with no error. The
+        // struct-present signal (from the key column's def level) catches a struct whose only content is an
+        // empty map/list; the field-content disjunction is a redundant, defence-in-depth backstop.
         RequireKeyIfPresent(!isAdd, "add", "path", row, group,
-            _addSize[row] is not null || _addModificationTime[row] is not null || _addDataChange[row] is not null
+            _addPresent[row]
+            || _addSize[row] is not null || _addModificationTime[row] is not null || _addDataChange[row] is not null
             || _addStats[row] is not null || _addPartitionValues[row].Count > 0 || _addTags[row].Count > 0);
         RequireKeyIfPresent(!isRemove, "remove", "path", row, group,
-            _removeDeletionTimestamp[row] is not null || _removeDataChange[row] is not null
+            _removePresent[row]
+            || _removeDeletionTimestamp[row] is not null || _removeDataChange[row] is not null
             || _removeExtendedFileMetadata[row] is not null || _removeSize[row] is not null
             || _removePartitionValues[row].Count > 0);
         RequireKeyIfPresent(!isMeta, "metaData", "id", row, group,
-            _metaName[row] is not null || _metaDescription[row] is not null || _metaSchemaString[row] is not null
+            _metaPresent[row]
+            || _metaName[row] is not null || _metaDescription[row] is not null || _metaSchemaString[row] is not null
             || _metaCreatedTime[row] is not null || _formatProvider[row] is not null || _formatOptions[row].Count > 0
             || _metaPartitionColumns[row].Length > 0 || _metaConfiguration[row].Count > 0);
         RequireKeyIfPresent(!isProtocol, "protocol", "minReaderVersion", row, group,
-            _protocolMinWriterVersion[row] is not null || _protocolReaderFeatures[row].Length > 0
+            _protocolPresent[row]
+            || _protocolMinWriterVersion[row] is not null || _protocolReaderFeatures[row].Length > 0
             || _protocolWriterFeatures[row].Length > 0);
         RequireKeyIfPresent(!isTxn, "txn", "appId", row, group,
-            _txnVersion[row] is not null || _txnLastUpdated[row] is not null);
+            _txnPresent[row]
+            || _txnVersion[row] is not null || _txnLastUpdated[row] is not null);
 
         if (isAdd)
         {
@@ -232,7 +259,8 @@ internal sealed class CheckpointColumns
     // ---- scalar column readers (row-aligned nullable arrays) ----
 
     private static async Task<string?[]> ReadStringScalarAsync(
-        ParquetRowGroupReader rowGroup, DataField? field, int rowCount, CancellationToken cancellationToken)
+        ParquetRowGroupReader rowGroup, DataField? field, int rowCount, CancellationToken cancellationToken,
+        bool[]? structPresent = null)
     {
         var result = new string?[rowCount];
         if (field is null)
@@ -241,7 +269,7 @@ internal sealed class CheckpointColumns
         }
 
         RawColumn<ReadOnlyMemory<char>> col = await ReadRawAsync<ReadOnlyMemory<char>>(rowGroup, field, cancellationToken).ConfigureAwait(false);
-        FillScalar(col, rowCount, field, (r, v) => result[r] = v.ToString());
+        FillScalar(col, rowCount, field, (r, v) => result[r] = v.ToString(), structPresent);
         return result;
     }
 
@@ -260,7 +288,8 @@ internal sealed class CheckpointColumns
     }
 
     private static async Task<int?[]> ReadIntScalarAsync(
-        ParquetRowGroupReader rowGroup, DataField? field, int rowCount, CancellationToken cancellationToken)
+        ParquetRowGroupReader rowGroup, DataField? field, int rowCount, CancellationToken cancellationToken,
+        bool[]? structPresent = null)
     {
         var result = new int?[rowCount];
         if (field is null)
@@ -269,7 +298,7 @@ internal sealed class CheckpointColumns
         }
 
         RawColumn<int> col = await ReadRawAsync<int>(rowGroup, field, cancellationToken).ConfigureAwait(false);
-        FillScalar(col, rowCount, field, (r, v) => result[r] = v);
+        FillScalar(col, rowCount, field, (r, v) => result[r] = v, structPresent);
         return result;
     }
 
@@ -287,7 +316,8 @@ internal sealed class CheckpointColumns
         return result;
     }
 
-    private static void FillScalar<T>(RawColumn<T> col, int rowCount, DataField field, Action<int, T> assign)
+    private static void FillScalar<T>(RawColumn<T> col, int rowCount, DataField field, Action<int, T> assign,
+        bool[]? structPresent = null)
         where T : struct
     {
         if (col.MaxRepetition != 0)
@@ -306,6 +336,10 @@ internal sealed class CheckpointColumns
             for (int r = 0; r < rowCount; r++)
             {
                 assign(r, col.Values[r]);
+                if (structPresent is not null)
+                {
+                    structPresent[r] = true;
+                }
             }
 
             return;
@@ -322,6 +356,14 @@ internal sealed class CheckpointColumns
             if (col.Definition[r] == col.MaxDefinition)
             {
                 assign(r, col.Values[valueIndex++]);
+            }
+
+            // Definition ≥ 1 means the enclosing (optional) action struct is PRESENT for this row, even
+            // when the key value itself is null — the signal BuildAction uses to fail closed on a partial
+            // action whose only content is empty maps/lists (which the field-content check cannot see).
+            if (structPresent is not null)
+            {
+                structPresent[r] = col.Definition[r] >= 1;
             }
         }
     }
