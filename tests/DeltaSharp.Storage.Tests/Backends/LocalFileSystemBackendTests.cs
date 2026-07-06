@@ -1348,6 +1348,51 @@ public sealed class LocalFileSystemBackendTests : IDisposable
     }
 
     [Fact]
+    public async Task StagedWriteStream_LengthAndPosition_AreNotSupported()
+    {
+        // Security R11 (RF-8i): the forward-only write stream is CanSeek==false, so the Length/Position
+        // getters must throw NotSupportedException rather than delegate to _inner. Length in particular
+        // must not delegate -- FileStream.Length does an fstat that throws a path-bearing IOException on a
+        // degraded mount (the temp's absolute path under _root), the mirror of the read-path source.Length
+        // leak the read-len seam guards. Non-vacuous: reverting Length to `=> _inner.Length` returns a
+        // number instead of throwing.
+        Stream stream = await _backend.OpenWriteAsync("lp.parquet", CancellationToken.None);
+        await using (stream.ConfigureAwait(false))
+        {
+            Assert.Throws<NotSupportedException>(() => _ = stream.Length);
+            Assert.Throws<NotSupportedException>(() => _ = stream.Position);
+            Assert.Throws<NotSupportedException>(() => stream.Position = 0);
+        }
+    }
+
+    [Fact]
+    public async Task AbandonedStagedWrite_SyncDisposeFault_SwallowedWithoutThrowingOrLeaking()
+    {
+        // Quality R11 (RF-8h): the SYNC abandon-dispose swallow (Dispose(bool) -> QuietDisposeInner) is
+        // reachable via a synchronous `using`/Stream.Dispose() and must swallow a dispose-flush fault just
+        // like the async path. Non-vacuous: narrowing the sync QuietDisposeInner catch lets the injected
+        // fault escape (Record.Exception returns non-null -> reddens).
+        Stream stream = await _backend.OpenWriteAsync("abs.parquet", CancellationToken.None);
+        await stream.WriteAsync(new byte[] { 1, 2, 3 });
+
+        LocalFileSystemBackend.IoFaultHook = tag => tag == "dispose"
+            ? new IOException($"dispose io '{Path.Combine(_root, "abs.parquet.tmp")}'")
+            : null;
+        Exception? escaped;
+        try
+        {
+            escaped = Record.Exception(() => stream.Dispose());
+        }
+        finally
+        {
+            LocalFileSystemBackend.IoFaultHook = null;
+        }
+
+        Assert.Null(escaped); // sync dispose-flush fault swallowed, not thrown/leaked
+        Assert.Null(await _backend.HeadAsync("abs.parquet", CancellationToken.None)); // abandon left no destination
+    }
+
+    [Fact]
     public void BuildTempName_IncludesSanitizedMachineNameForCrossPodUniqueness()
     {
         // CF-4: the temp name embeds the (sanitized) pod hostname so two pods with identical PIDs on a

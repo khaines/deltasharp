@@ -981,11 +981,16 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
 
         public override bool CanWrite => true;
 
-        public override long Length => _inner.Length;
+        // CanSeek is false, so Length/Position are not part of this forward-only write stream's contract
+        // (like Read/Seek/SetLength above they throw NotSupportedException). Length in particular must NOT
+        // delegate to _inner.Length: FileStream.Length does an fstat that, on a degraded mount, throws a
+        // path-bearing IOException carrying the temp's absolute path under _root -- the same fstat leak the
+        // read path guards via the "read-len" seam (RF-8g, Security R11).
+        public override long Length => throw new NotSupportedException();
 
         public override long Position
         {
-            get => _inner.Position;
+            get => throw new NotSupportedException();
             set => throw new NotSupportedException();
         }
 
