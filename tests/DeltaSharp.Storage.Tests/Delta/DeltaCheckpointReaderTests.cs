@@ -140,6 +140,24 @@ public sealed class DeltaCheckpointReaderTests
     }
 
     [Fact]
+    public async Task Reads_OmittedOptionalAddFields_UseDeltaDefaults()
+    {
+        // A foreign checkpoint may omit optional add fields; the reader must apply Delta's defaults
+        // (modificationTime → 0, dataChange → true), which guards the `?? 0L` / `?? true` fallbacks.
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(1, 2)
+            .Metadata("t", EmptySchema)
+            .Add("f.parquet", size: 3, modificationTime: null, dataChange: null)
+            .ToParquetAsync();
+
+        IReadOnlyList<DeltaAction> actions = await DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default);
+
+        AddFileAction add = Assert.Single(actions.OfType<AddFileAction>());
+        Assert.Equal(0, add.ModificationTime); // default (guards ?? 0L)
+        Assert.True(add.DataChange);            // default (guards ?? true)
+    }
+
+    [Fact]
     public async Task Corrupt_Parquet_FailsClosed()
     {
         byte[] garbage = "this is not a parquet file, just bytes"u8.ToArray();

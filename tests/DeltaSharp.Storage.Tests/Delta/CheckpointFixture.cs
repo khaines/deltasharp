@@ -77,8 +77,8 @@ internal sealed class CheckpointFixture
         long size,
         (string Key, string? Value)[]? partitionValues = null,
         string? stats = null,
-        long modificationTime = 0,
-        bool dataChange = true,
+        long? modificationTime = 0,
+        bool? dataChange = true,
         (string Key, string Value)[]? tags = null)
     {
         var add = new Dictionary<string, object?>
@@ -86,10 +86,21 @@ internal sealed class CheckpointFixture
             ["path"] = path,
             ["partitionValues"] = ToNullableMap(partitionValues),
             ["size"] = size,
-            ["modificationTime"] = modificationTime,
-            ["dataChange"] = dataChange,
             ["tags"] = ToMap(tags),
         };
+
+        // A null modificationTime/dataChange omits the column entirely, modelling a foreign checkpoint that
+        // leaves the optional field absent — so the reader's default (0 / true) is exercised.
+        if (modificationTime is not null)
+        {
+            add["modificationTime"] = modificationTime.Value;
+        }
+
+        if (dataChange is not null)
+        {
+            add["dataChange"] = dataChange.Value;
+        }
+
         if (stats is not null)
         {
             add["stats"] = stats;
