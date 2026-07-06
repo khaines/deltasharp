@@ -106,6 +106,15 @@ internal static class DeltaTestHarness
         await backend.PutIfAbsentAsync(name, content, CancellationToken.None);
     }
 
+    /// <summary>Writes one part of a multi-part checkpoint with raw <paramref name="content"/> (used to
+    /// place a valid part alongside a deliberately-corrupt later part).</summary>
+    public static async Task WriteRawMultipartPartAsync(
+        IStorageBackend backend, long version, int part, int parts, byte[] content)
+    {
+        string name = LogPath($"{Pad20(version)}.checkpoint.{Pad10(part)}.{Pad10(parts)}.parquet");
+        await backend.PutIfAbsentAsync(name, content, CancellationToken.None);
+    }
+
     public static async Task WriteLastCheckpointAsync(IStorageBackend backend, long version, int? parts = null)
     {
         string json = parts is null

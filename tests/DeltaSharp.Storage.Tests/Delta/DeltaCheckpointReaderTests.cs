@@ -238,6 +238,21 @@ public sealed class DeltaCheckpointReaderTests
     }
 
     [Fact]
+    public async Task DecodeCeiling_RejectsRowGroup_ViaAbsoluteBound()
+    {
+        // A normal checkpoint decoded under a tiny injected per-row-group ceiling trips the ABSOLUTE
+        // (summed-across-columns) throw path in EnsureDecodeCeiling — the integration guard, before decode.
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(1, 2).Metadata("t", EmptySchema).Add("f.parquet", size: 1)
+            .ToParquetAsync();
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default, maxDecodedBytes: 10));
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.Contains("decode ceiling", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task PartByteCeiling_RejectsOversizedPart()
     {
         byte[] parquet = await new CheckpointFixture()

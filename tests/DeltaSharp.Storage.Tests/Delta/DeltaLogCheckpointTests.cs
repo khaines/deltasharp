@@ -282,6 +282,37 @@ public sealed class DeltaLogCheckpointTests : IDisposable
         Assert.Equal(["a.parquet"], snapshot.Tombstones.Select(r => r.Path));
     }
 
+    [Fact]
+    public async Task MidSeedCorruptMultipartPart_DiscardsPartialState_AndFallsBack()
+    {
+        // A COMPLETE multi-part checkpoint whose FIRST part decodes+applies but a LATER part is corrupt
+        // forces a mid-seed throw AFTER partial state was applied. The reader must discard that partial
+        // seed (state reset) before falling back — a leaked part-1 "ghost" add would corrupt the result.
+        IStorageBackend jsonOnly = NewBackend();
+        await WriteJsonHistoryAsync(jsonOnly);
+        Snapshot fromJson = await new DeltaLog(jsonOnly).LoadSnapshotAsync();
+
+        IStorageBackend backend = NewBackend();
+        await WriteJsonHistoryAsync(backend);
+        // Part 1 (valid) seeds protocol/metadata + a "ghost" file that is NOT in the JSON history; part 2
+        // is corrupt → the seed throws mid-way, after ghost was applied.
+        byte[] part1 = await new CheckpointFixture()
+            .Protocol(1, 2)
+            .Metadata(id: "table-1", schemaString: EmptySchemaUnescaped, partitionColumns: ["year"])
+            .Add("ghost.parquet", size: 1, modificationTime: 1)
+            .ToParquetAsync();
+        await DeltaTestHarness.WriteRawMultipartPartAsync(backend, 1, 1, 2, part1);
+        await DeltaTestHarness.WriteRawMultipartPartAsync(backend, 1, 2, 2, "corrupt later part"u8.ToArray());
+        await DeltaTestHarness.WriteLastCheckpointAsync(backend, 1, parts: 2);
+
+        Snapshot snapshot = await new DeltaLog(backend).LoadSnapshotAsync();
+
+        // The partial "ghost" seed is discarded; reconstruction equals the JSON-only replay (no ghost).
+        Assert.Null(snapshot.Metrics.CheckpointVersion);
+        Assert.DoesNotContain("ghost.parquet", snapshot.ActiveFiles.Select(a => a.Path));
+        Assert.Equal(DeltaTestHarness.Describe(fromJson), DeltaTestHarness.Describe(snapshot));
+    }
+
     // The metaData.schemaString stored inside a checkpoint column is the raw (unescaped) JSON string,
     // whereas the JSON-commit form is a JSON-encoded string; both must parse to the same schema.
     private const string EmptySchemaUnescaped = """{"type":"struct","fields":[]}""";

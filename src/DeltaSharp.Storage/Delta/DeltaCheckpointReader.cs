@@ -69,7 +69,8 @@ internal static class DeltaCheckpointReader
     /// <exception cref="DeltaProtocolException">The part is malformed/truncated, exceeds a decode ceiling,
     /// or carries an action row that violates the required Delta action shape (fail closed).</exception>
     public static async Task<IReadOnlyList<DeltaAction>> ReadAsync(
-        Stream stream, CancellationToken cancellationToken, long maxPartBytes = MaxCheckpointPartBytes)
+        Stream stream, CancellationToken cancellationToken,
+        long maxPartBytes = MaxCheckpointPartBytes, long maxDecodedBytes = MaxCheckpointRowGroupDecodedBytes)
     {
         ArgumentNullException.ThrowIfNull(stream);
 
@@ -87,7 +88,7 @@ internal static class DeltaCheckpointReader
                     {
                         cancellationToken.ThrowIfCancellationRequested();
                         using ParquetRowGroupReader rowGroup = reader.OpenRowGroupReader(group);
-                        await ReadRowGroupAsync(rowGroup, schema, actions, group, cancellationToken).ConfigureAwait(false);
+                        await ReadRowGroupAsync(rowGroup, schema, actions, group, maxDecodedBytes, cancellationToken).ConfigureAwait(false);
                     }
 
                     return actions;
@@ -143,6 +144,7 @@ internal static class DeltaCheckpointReader
         CheckpointSchema schema,
         List<DeltaAction> actions,
         int group,
+        long maxDecodedBytes,
         CancellationToken cancellationToken)
     {
         long declaredRows = rowGroup.RowCount;
@@ -160,7 +162,7 @@ internal static class DeltaCheckpointReader
             return;
         }
 
-        EnsureDecodeCeiling(rowGroup, schema.LeafFields(), group);
+        EnsureDecodeCeiling(rowGroup, schema.LeafFields(), group, maxDecodedBytes);
 
         var columns = await CheckpointColumns.ReadAsync(rowGroup, schema, rowCount, cancellationToken)
             .ConfigureAwait(false);
@@ -176,15 +178,16 @@ internal static class DeltaCheckpointReader
     }
 
     /// <summary>Fails closed when the columns this reader will decode for <paramref name="group"/> would
-    /// eagerly allocate more than <see cref="MaxCheckpointRowGroupDecodedBytes"/>, or when any column
-    /// declares a decompression ratio beyond <see cref="ParquetFileReader.MaxDecompressionRatio"/> — so an
-    /// untrusted checkpoint cannot drive an OOM/CPU DoS on the driver (design §5.4 C-DECODE). The bound is
-    /// on the reader's <b>actual</b> per-slot footprint (packed value width + the two Dremel level ints)
-    /// plus the declared decompressed payload, computed from each column chunk's declared metadata before
-    /// any decode. Overflow-safe (saturating).</summary>
+    /// eagerly allocate more than <paramref name="maxDecodedBytes"/>, or when any column declares a
+    /// decompression ratio beyond <see cref="ParquetFileReader.MaxDecompressionRatio"/> — so an untrusted
+    /// checkpoint cannot drive an OOM/CPU DoS on the driver (design §5.4 C-DECODE). The bound is on the
+    /// reader's <b>actual</b> per-slot footprint (packed value width + the two Dremel level ints) plus the
+    /// declared decompressed payload, computed from each column chunk's declared metadata before any decode.
+    /// Overflow-safe (saturating).</summary>
     /// <exception cref="DeltaProtocolException">A ceiling is exceeded or a declared size is negative.</exception>
     internal static void EnsureDecodeCeiling(
-        ParquetRowGroupReader rowGroup, IReadOnlyList<DataField> leafFields, int group)
+        ParquetRowGroupReader rowGroup, IReadOnlyList<DataField> leafFields, int group,
+        long maxDecodedBytes = MaxCheckpointRowGroupDecodedBytes)
     {
         long totalBytes = 0;
         foreach (DataField field in leafFields)
@@ -207,12 +210,12 @@ internal static class DeltaCheckpointReader
                 totalBytes, ColumnFootprintBytes(field.ClrType, numValues, compressed, uncompressed, field.Path.ToString(), group));
         }
 
-        if (totalBytes > MaxCheckpointRowGroupDecodedBytes)
+        if (totalBytes > maxDecodedBytes)
         {
             throw DeltaProtocolException.Malformed(string.Create(
                 CultureInfo.InvariantCulture,
                 $"Checkpoint row group {group} would eagerly allocate {totalBytes} bytes across its columns, "
-                + $"exceeding the {MaxCheckpointRowGroupDecodedBytes}-byte decode ceiling."));
+                + $"exceeding the {maxDecodedBytes}-byte decode ceiling."));
         }
     }
 
