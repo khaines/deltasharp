@@ -46,21 +46,29 @@ namespace DeltaSharp.Storage.Parquet;
 /// </remarks>
 internal sealed class ParquetFileReader
 {
-    /// <summary>The maximum plausible ratio of a column chunk's declared decompressed bytes to its
+    /// <summary>The default maximum plausible ratio of a column chunk's declared decompressed bytes to its
     /// declared compressed bytes (design §5.4 C-DECODE). Real Parquet encodings — even Snappy over
     /// constant/RLE/all-null data — stay well under this (empirically ≈ 20:1 at the column-chunk level),
     /// so a declared ratio beyond it is a crafted footer, not a real file, and is rejected as a
-    /// decompression bomb.</summary>
-    internal const long MaxDecompressionRatio = 1000;
+    /// decompression bomb. Configurable per reader via <see cref="ParquetDecodeLimits"/>; this constant is
+    /// the default (and the reference used by the checkpoint reader's own guard).</summary>
+    internal const long MaxDecompressionRatio = ParquetDecodeLimits.DefaultMaxDecompressionRatio;
 
-    /// <summary>The absolute per-row-group <b>eager-decode</b> memory ceiling (4&#160;GiB), applied to both
-    /// the declared decompressed bytes AND the bytes a row group's declared row count would eagerly
+    /// <summary>The default absolute per-row-group <b>eager-decode</b> memory ceiling (4&#160;GiB), applied
+    /// to both the declared decompressed bytes AND the bytes a row group's declared row count would eagerly
     /// materialize (design §5.4 C-DECODE). Because this reader decodes each row group whole, it bounds the
     /// transient decode/allocation memory: a crafted footer (inflating the decompressed size or row count)
     /// fails closed rather than driving an out-of-memory allocation, and a legitimate row group whose
     /// projected columns exceed the cap is likewise rejected until chunked/streaming decode lifts the limit
-    /// (tracked follow-up).</summary>
-    internal const long MaxRowGroupDecodedBytes = 4L * 1024 * 1024 * 1024;
+    /// (tracked follow-up). Configurable per reader via <see cref="ParquetDecodeLimits"/> — lower it below a
+    /// constrained executor budget, or raise it for a trusted large-row-group workload.</summary>
+    internal const long MaxRowGroupDecodedBytes = ParquetDecodeLimits.DefaultMaxRowGroupDecodedBytes;
+
+    private readonly ParquetDecodeLimits _limits;
+
+    /// <summary>Creates a reader whose eager-decode guard uses <paramref name="limits"/> (or the safe
+    /// <see cref="ParquetDecodeLimits.Default"/> when unset).</summary>
+    public ParquetFileReader(ParquetDecodeLimits? limits = null) => _limits = limits ?? ParquetDecodeLimits.Default;
 
     /// <summary>A row-group pruning hint: return <see langword="false"/> to skip a row group whose
     /// <see cref="RowGroupStatistics"/> prove it cannot match. Pruning is a hint only — a kept group is
@@ -103,7 +111,7 @@ internal sealed class ParquetFileReader
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 ColumnBatch? batch = await ReadRowGroupAsync(
-                    reader, group, requested, fileFields, keepRowGroup, cancellationToken)
+                    reader, group, requested, fileFields, keepRowGroup, _limits, cancellationToken)
                     .ConfigureAwait(false);
                 if (batch is not null)
                 {
@@ -136,9 +144,10 @@ internal sealed class ParquetFileReader
     /// <exception cref="DeltaStorageException">A declared value is negative, or a ceiling is exceeded
     /// (<see cref="StorageErrorKind.CorruptData"/>).</exception>
     internal static void EnsureDecodeCeiling(
-        long rowCount, IReadOnlyList<ColumnChunkFootprint> projectedChunks, int group)
+        long rowCount, IReadOnlyList<ColumnChunkFootprint> projectedChunks, int group, ParquetDecodeLimits? limits = null)
     {
         ArgumentNullException.ThrowIfNull(projectedChunks);
+        limits ??= ParquetDecodeLimits.Default;
         if (rowCount < 0)
         {
             throw DeltaStorageException.CorruptData(
@@ -157,13 +166,16 @@ internal sealed class ParquetFileReader
             }
 
             // (i) Decompression-ratio ceiling: a chunk claiming far more decompressed than compressed
-            // bytes is a decompression bomb. The floor of 1 avoids a divide-by/zero-compressed edge.
+            // bytes is a decompression bomb. The floor of 1 avoids a divide-by/zero-compressed edge. The
+            // product is widened to Int128 so a large declared compressed size cannot overflow the 64-bit
+            // multiply into a spurious verdict (wrapping to a negative or small-positive threshold that would
+            // either wrongly reject a legitimate chunk or wrongly accept a bomb).
             long compressedFloor = Math.Max(chunk.CompressedBytes, 1);
-            if (chunk.UncompressedBytes > compressedFloor * MaxDecompressionRatio)
+            if (chunk.UncompressedBytes > (Int128)compressedFloor * limits.MaxDecompressionRatio)
             {
                 throw DeltaStorageException.CorruptData(
                     $"Row group {group} declares {chunk.UncompressedBytes} decompressed bytes for "
-                    + $"{chunk.CompressedBytes} compressed, exceeding the {MaxDecompressionRatio}:1 "
+                    + $"{chunk.CompressedBytes} compressed, exceeding the {limits.MaxDecompressionRatio}:1 "
                     + "decompression-ratio ceiling (possible decompression bomb).");
             }
 
@@ -171,11 +183,11 @@ internal sealed class ParquetFileReader
             // materialize more than the absolute eager-decode ceiling. ElementBytes is the ACTUAL read
             // buffer width (Nullable<T>-aware, RF-4a). Dividing (rather than multiplying rowCount by the
             // width) keeps the check overflow-safe for an attacker-sized row count.
-            if (chunk.ElementBytes > 0 && rowCount > MaxRowGroupDecodedBytes / chunk.ElementBytes)
+            if (chunk.ElementBytes > 0 && rowCount > limits.MaxRowGroupDecodedBytes / chunk.ElementBytes)
             {
                 throw DeltaStorageException.CorruptData(
                     $"Row group {group} declares {rowCount} rows, which would eagerly materialize more "
-                    + $"than the {MaxRowGroupDecodedBytes}-byte eager-decode ceiling for a "
+                    + $"than the {limits.MaxRowGroupDecodedBytes}-byte eager-decode ceiling for a "
                     + $"{chunk.ElementBytes}-byte column.");
             }
 
@@ -183,11 +195,11 @@ internal sealed class ParquetFileReader
         }
 
         // (ii) Absolute decompressed-size ceiling over the row group's projected chunks.
-        if (totalDecompressedBytes > MaxRowGroupDecodedBytes)
+        if (totalDecompressedBytes > limits.MaxRowGroupDecodedBytes)
         {
             throw DeltaStorageException.CorruptData(
                 $"Row group {group} declares {totalDecompressedBytes} decompressed bytes across its "
-                + $"projected columns, exceeding the {MaxRowGroupDecodedBytes}-byte eager-decode ceiling.");
+                + $"projected columns, exceeding the {limits.MaxRowGroupDecodedBytes}-byte eager-decode ceiling.");
         }
     }
 
@@ -358,6 +370,7 @@ internal sealed class ParquetFileReader
         StructType requested,
         DataField[] fileFields,
         RowGroupPredicate? keepRowGroup,
+        ParquetDecodeLimits limits,
         CancellationToken cancellationToken)
     {
         using ParquetRowGroupReader rowGroup = reader.OpenRowGroupReader(group);
@@ -376,7 +389,7 @@ internal sealed class ParquetFileReader
         // so a crafted footer (inflated decompressed size or row count) surfaces as a deterministic
         // CorruptData error rather than an OOM or a raw OverflowException escaping the codec contract.
         long declaredRows = rowGroup.RowCount;
-        EnsureDecodeCeiling(declaredRows, ProjectedFootprints(rowGroup, requested, fileFields), group);
+        EnsureDecodeCeiling(declaredRows, ProjectedFootprints(rowGroup, requested, fileFields), group, limits);
         int rowCount;
         try
         {

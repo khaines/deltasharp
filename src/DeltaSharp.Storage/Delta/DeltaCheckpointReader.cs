@@ -237,8 +237,9 @@ internal static class DeltaCheckpointReader
         }
 
         // Decompression-ratio ceiling — a chunk claiming far more decompressed than compressed bytes is a
-        // decompression bomb.
-        if (uncompressedBytes > Math.Max(compressedBytes, 1) * ParquetFileReader.MaxDecompressionRatio)
+        // decompression bomb. The product is widened to Int128 so a large declared compressed size cannot
+        // overflow the 64-bit multiply into a spurious verdict (wrapping past a bomb check).
+        if (uncompressedBytes > (Int128)Math.Max(compressedBytes, 1) * ParquetFileReader.MaxDecompressionRatio)
         {
             throw DeltaProtocolException.Malformed(string.Create(
                 CultureInfo.InvariantCulture,
