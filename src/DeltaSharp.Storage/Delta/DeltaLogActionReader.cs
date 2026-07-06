@@ -74,51 +74,68 @@ internal static class DeltaLogActionReader
 
         using (document)
         {
-            JsonElement root = document.RootElement;
-            if (root.ValueKind != JsonValueKind.Object)
+            try
+            {
+                return ParseDocument(document, version, line);
+            }
+            catch (InvalidOperationException ex)
+            {
+                // A structurally-valid JSON line can still carry malformed content (e.g. invalid UTF-8 in
+                // a string, which System.Text.Json only rejects when the value is materialized). Fail
+                // closed with the typed error rather than leaking the raw transcoding exception.
+                throw DeltaProtocolException.Malformed(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"Delta log version {version} line {line} contains malformed JSON content."), ex);
+            }
+        }
+    }
+
+    private static DeltaAction? ParseDocument(JsonDocument document, long version, int line)
+    {
+        JsonElement root = document.RootElement;
+        if (root.ValueKind != JsonValueKind.Object)
+        {
+            throw DeltaProtocolException.Malformed(string.Create(
+                CultureInfo.InvariantCulture,
+                $"Delta log version {version} line {line} must be a JSON object with a single action key, but was '{root.ValueKind}'."));
+        }
+
+        // Each action line is a single-key object: {"add": {...}} / {"protocol": {...}} / ...
+        string? actionKey = null;
+        JsonElement body = default;
+        foreach (JsonProperty property in root.EnumerateObject())
+        {
+            if (actionKey is not null)
             {
                 throw DeltaProtocolException.Malformed(string.Create(
                     CultureInfo.InvariantCulture,
-                    $"Delta log version {version} line {line} must be a JSON object with a single action key, but was '{root.ValueKind}'."));
+                    $"Delta log version {version} line {line} must contain exactly one action key, but found multiple."));
             }
 
-            // Each action line is a single-key object: {"add": {...}} / {"protocol": {...}} / ...
-            string? actionKey = null;
-            JsonElement body = default;
-            foreach (JsonProperty property in root.EnumerateObject())
-            {
-                if (actionKey is not null)
-                {
-                    throw DeltaProtocolException.Malformed(string.Create(
-                        CultureInfo.InvariantCulture,
-                        $"Delta log version {version} line {line} must contain exactly one action key, but found multiple."));
-                }
-
-                actionKey = property.Name;
-                body = property.Value;
-            }
-
-            if (actionKey is null)
-            {
-                // An empty object {} carries no action; tolerate it.
-                return null;
-            }
-
-            return actionKey switch
-            {
-                "protocol" => ParseProtocol(body, version, line),
-                "metaData" => ParseMetadata(body, version, line),
-                "add" => ParseAdd(body, version, line),
-                "remove" => ParseRemove(body, version, line),
-                "txn" => ParseTxn(body, version, line),
-                "commitInfo" => ParseCommitInfo(body),
-                // Forward compatibility: an unknown action key (e.g. a future/phased action) is ignored.
-                // A table that *requires* understanding it advertises a reader feature, which protocol
-                // negotiation (§2.10.5) rejects up front — so ignoring here can never read past an
-                // unsupported feature.
-                _ => null,
-            };
+            actionKey = property.Name;
+            body = property.Value;
         }
+
+        if (actionKey is null)
+        {
+            // An empty object {} carries no action; tolerate it.
+            return null;
+        }
+
+        return actionKey switch
+        {
+            "protocol" => ParseProtocol(body, version, line),
+            "metaData" => ParseMetadata(body, version, line),
+            "add" => ParseAdd(body, version, line),
+            "remove" => ParseRemove(body, version, line),
+            "txn" => ParseTxn(body, version, line),
+            "commitInfo" => ParseCommitInfo(body),
+            // Forward compatibility: an unknown action key (e.g. a future/phased action) is ignored.
+            // A table that *requires* understanding it advertises a reader feature, which protocol
+            // negotiation (§2.10.5) rejects up front — so ignoring here can never read past an
+            // unsupported feature.
+            _ => null,
+        };
     }
 
     private static ProtocolAction ParseProtocol(JsonElement body, long version, int line)

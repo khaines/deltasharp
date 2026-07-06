@@ -66,16 +66,26 @@ internal static class DeltaCheckpointReader
             ParquetReader reader = await OpenAsync(buffer, cancellationToken).ConfigureAwait(false);
             await using (reader.ConfigureAwait(false))
             {
-                var schema = CheckpointSchema.Resolve(reader.Schema);
-                var actions = new List<DeltaAction>();
-                for (int group = 0; group < reader.RowGroupCount; group++)
+                try
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    using ParquetRowGroupReader rowGroup = reader.OpenRowGroupReader(group);
-                    await ReadRowGroupAsync(rowGroup, schema, actions, group, cancellationToken).ConfigureAwait(false);
-                }
+                    var schema = CheckpointSchema.Resolve(reader.Schema);
+                    var actions = new List<DeltaAction>();
+                    for (int group = 0; group < reader.RowGroupCount; group++)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        using ParquetRowGroupReader rowGroup = reader.OpenRowGroupReader(group);
+                        await ReadRowGroupAsync(rowGroup, schema, actions, group, cancellationToken).ConfigureAwait(false);
+                    }
 
-                return actions;
+                    return actions;
+                }
+                catch (Exception ex) when (ex is not (OperationCanceledException or DeltaProtocolException))
+                {
+                    // Any lower-level decode failure (a page-level defect a byte-flip introduced past the
+                    // footer) is a corrupt checkpoint: fail closed so the caller falls back to JSON replay.
+                    throw DeltaProtocolException.Malformed(
+                        $"The Delta checkpoint Parquet is malformed: {ex.Message}", ex);
+                }
             }
         }
     }
