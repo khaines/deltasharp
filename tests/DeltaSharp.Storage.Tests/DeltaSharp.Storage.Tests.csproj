@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Unit tests for DeltaSharp.Storage (EPIC-05 / FEAT-05.1). net10.0, matching the Storage
+    assembly's single TFM (ADR-0014). The xUnit toolchain, coverage collector, NuGet lock-file
+    policy, and deterministic-seed harness are inherited from tests/Directory.Build.props. Not
+    packable. References Parquet.Net directly so cross-engine interop tests can read/write with
+    the reference codec (the reader↔writer round-trip parity oracle, design §3.3.2).
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>DeltaSharp.Storage.Tests</RootNamespace>
+    <AssemblyName>DeltaSharp.Storage.Tests</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Parquet.Net" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/DeltaSharp.Storage/DeltaSharp.Storage.csproj" />
+  </ItemGroup>
+
+</Project>
