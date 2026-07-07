@@ -108,6 +108,8 @@ internal sealed class DeltaCommitter
     /// <exception cref="DeltaProtocolException">The table's writer protocol is unsupported (fail closed).</exception>
     /// <exception cref="DeltaConcurrentModificationException">A concurrent commit logically conflicts with
     /// this one (aborted, not rebased).</exception>
+    /// <exception cref="DeltaCommitContentionException">The commit did not converge within the rebase-retry
+    /// budget under sustained concurrency (retryable — the commit provably did not land).</exception>
     /// <exception cref="DeltaCommitUnknownStateException">An ambiguous outcome could not be resolved.</exception>
     public async Task<DeltaCommitResult> CommitAsync(
         Snapshot readSnapshot,
@@ -137,14 +139,16 @@ internal sealed class DeltaCommitter
 
         // Writer protocol negotiation: fail closed before any write if the table requires a writer
         // version/feature this build does not enforce (design §2.11 / §2.14 P3). Validate both the current
-        // table protocol and any protocol this commit itself installs (a protocol upgrade must not raise the
-        // table to a version/feature this writer cannot honor).
+        // table protocol and any protocol this commit itself installs (an installed protocol must not raise
+        // the table to a writer version/feature this writer cannot honor, nor to a reader version/feature it
+        // could not read back — never publish a table this build cannot itself read).
         ProtocolSupport.EnsureWritable(readSnapshot.Protocol);
         foreach (DeltaAction action in actions)
         {
             if (action is ProtocolAction committedProtocol)
             {
                 ProtocolSupport.EnsureWritable(committedProtocol);
+                ProtocolSupport.EnsureReadable(committedProtocol);
             }
         }
 

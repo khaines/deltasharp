@@ -234,6 +234,22 @@ public sealed class DeltaCommitterEdgeCaseTests : IDisposable
     }
 
     [Fact]
+    public async Task CommitInstallingUnreadableProtocol_FailsClosed()
+    {
+        // A commit that installs a protocol this build could not read back (unsupported reader version) is
+        // rejected before any write — never publish a table this build cannot itself read.
+        Snapshot snapshot = await SeedAndLoadAsync();
+        var unreadable = new ProtocolAction(
+            ProtocolSupport.ColumnMappingReaderVersion, 2, ImmutableArray<string>.Empty, ImmutableArray<string>.Empty);
+
+        var ex = await Assert.ThrowsAsync<DeltaProtocolException>(() =>
+            new DeltaCommitter(_backend).CommitAsync(
+                snapshot, new DeltaAction[] { unreadable, Add("a.parquet") }, DeltaReadScope.WholeTable));
+        Assert.Equal(DeltaProtocolErrorKind.UnsupportedProtocol, ex.Kind);
+        Assert.Equal(0L, (await new DeltaLog(_backend).LoadSnapshotAsync()).Version);
+    }
+
+    [Fact]
     public async Task TransientPutFailure_WithDefaultBackoff_RetriesAndSucceeds()
     {
         // Exercises the production exponential-jitter backoff: one transient failure → one real (short)
