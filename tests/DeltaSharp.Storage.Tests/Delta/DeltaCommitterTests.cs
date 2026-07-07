@@ -88,9 +88,11 @@ public sealed class DeltaCommitterTests : IDisposable
         using var barrier = new Barrier(2);
         Func<int, long, CancellationToken, Task> gate = (attempt, _, ct) =>
         {
-            if (attempt == 0)
+            if (attempt == 0 && !barrier.SignalAndWait(TimeSpan.FromSeconds(30), ct))
             {
-                barrier.SignalAndWait(ct); // both reach the v1 put-if-absent together
+                // Bounded: if a peer writer fails before the barrier, surface a fast timeout instead of
+                // hanging the test until the host harness kills it.
+                throw new TimeoutException("Race barrier: a peer writer did not reach the put-if-absent in time.");
             }
 
             return Task.CompletedTask;
@@ -115,6 +117,44 @@ public sealed class DeltaCommitterTests : IDisposable
         Snapshot reloaded = await LoadAsync();
         Assert.Equal(2L, reloaded.Version);
         Assert.Equal(new[] { "a.parquet", "b.parquet" }, reloaded.ActiveFiles.Select(a => a.Path).OrderBy(p => p).ToArray());
+    }
+
+    [Fact]
+    public async Task RebasesPastMultipleConcurrentWinners_InOneWinnersPass()
+    {
+        // Two safe winners (v1, v2) landed since the read snapshot; a blind append reads BOTH in one winners
+        // pass and rebases to v3 in a SINGLE rebase — so it wins on its 2nd attempt. (Reading only the first
+        // winner per pass would need an extra attempt, so asserting Attempts=2 pins the whole (R,M] range read.)
+        await SeedTableAsync();
+        Snapshot snapshot = await LoadAsync(); // v0
+        await CommitRawAsync(1, DeltaTestHarness.Add("a.parquet"));
+        await CommitRawAsync(2, DeltaTestHarness.Add("b.parquet"));
+
+        DeltaCommitResult result = await new DeltaCommitter(_backend).CommitAsync(
+            snapshot, new DeltaAction[] { Add("c.parquet") }, DeltaReadScope.BlindAppend);
+
+        Assert.Equal(3L, result.Version);
+        Assert.Equal(2, result.Attempts); // one lost put + one winning put after a single (R,M]=2 rebase
+
+        Snapshot reloaded = await LoadAsync();
+        Assert.Equal(
+            new[] { "a.parquet", "b.parquet", "c.parquet" },
+            reloaded.ActiveFiles.Select(a => a.Path).OrderBy(p => p).ToArray());
+    }
+
+    [Fact]
+    public async Task DetectsConflictInLaterWinner_AcrossMultiVersionRange()
+    {
+        // Winners v1 (safe append) + v2 (metadata change): the loser must classify the WHOLE (R,M] range and
+        // abort on the v2 metadata change — proving multi-winner classification, not just the first winner.
+        await SeedTableAsync();
+        Snapshot snapshot = await LoadAsync(); // v0
+        await CommitRawAsync(1, DeltaTestHarness.Add("a.parquet"));
+        await CommitRawAsync(2, DeltaTestHarness.Metadata(id: "changed"));
+
+        await Assert.ThrowsAsync<MetadataChangedException>(() =>
+            new DeltaCommitter(_backend).CommitAsync(
+                snapshot, new DeltaAction[] { Add("late.parquet") }, DeltaReadScope.BlindAppend));
     }
 
     [Fact]

@@ -110,3 +110,27 @@ internal sealed class DeltaCommitUnknownStateException : Exception
     /// <summary>The commit version whose durability could not be determined.</summary>
     public long Version { get; }
 }
+
+/// <summary>
+/// The commit could not be published within the writer's rebase-retry budget under sustained concurrency
+/// (design §2.11.3 "definite conflict" repeated past <see cref="MaxAttempts"/>). Unlike
+/// <see cref="DeltaCommitUnknownStateException"/> this is a <b>known, retryable</b> outcome: the commit
+/// provably did <b>not</b> land (every exhausted attempt ended in a lost race or a safe rebase, never a
+/// durable put), so the caller may safely retry from a fresh snapshot. It is surfaced rather than looping
+/// forever so pathological contention is visible instead of manifesting as a hang.
+/// </summary>
+internal sealed class DeltaCommitContentionException : Exception
+{
+    public DeltaCommitContentionException(long version, int maxAttempts, string message)
+        : base(message)
+    {
+        Version = version;
+        MaxAttempts = maxAttempts;
+    }
+
+    /// <summary>The version the writer was attempting to publish when it exhausted its retry budget.</summary>
+    public long Version { get; }
+
+    /// <summary>The rebase-retry budget that was exhausted.</summary>
+    public int MaxAttempts { get; }
+}

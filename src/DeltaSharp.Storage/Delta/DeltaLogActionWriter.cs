@@ -37,16 +37,14 @@ internal static class DeltaLogActionWriter
         ArgumentNullException.ThrowIfNull(actions);
 
         var buffer = new ArrayBufferWriter<byte>();
+        using var writer = new Utf8JsonWriter(buffer, WriterOptions);
         foreach (DeltaAction action in actions)
         {
-            // A fresh writer per line keeps each object a valid single JSON root; newlines are written
-            // to the shared buffer between/after them.
-            using (var writer = new Utf8JsonWriter(buffer, WriterOptions))
-            {
-                WriteAction(writer, action);
-                writer.Flush();
-            }
-
+            // One writer, reset per line: each object stays a valid single JSON root, and newlines are
+            // written to the shared buffer between/after them (avoids a per-line writer allocation).
+            writer.Reset();
+            WriteAction(writer, action);
+            writer.Flush();
             buffer.Write(Newline);
         }
 
@@ -280,7 +278,10 @@ internal static class DeltaLogActionWriter
             }
             else
             {
-                // Long / Double / Boolean are already invariant-culture JSON scalar text.
+                // Long / Double / Boolean are already invariant-culture JSON scalar text. A non-finite
+                // double (NaN/±Infinity) has no JSON representation and WriteRawValue would reject it — not
+                // reachable today (stats only originate from the reader, which cannot parse those), and the
+                // write-time-statistics story (#197) will skip/clamp non-finite bounds at their source.
                 writer.WritePropertyName(entry.Key);
                 writer.WriteRawValue(value.Raw, skipInputValidation: false);
             }

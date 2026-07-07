@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Linq;
 using DeltaSharp.Storage;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
@@ -42,6 +43,9 @@ public sealed class DeltaCommitterEdgeCaseTests : IDisposable
 
     private static AddFileAction Add(string path) =>
         new(path, NoPartition, 1L, 1L, DataChange: true, Stats: null, Tags: NoTags);
+
+    private static RemoveFileAction Remove(string path) =>
+        new(path, DeletionTimestamp: 1L, DataChange: true, ExtendedFileMetadata: false, NoPartition, Size: null);
 
     private static ProtocolAction Writer(int minWriter, params string[] writerFeatures) =>
         new(1, minWriter, ImmutableArray<string>.Empty, writerFeatures.ToImmutableArray());
@@ -139,14 +143,111 @@ public sealed class DeltaCommitterEdgeCaseTests : IDisposable
     public async Task SustainedContention_BeyondMaxAttempts_FailsClosed()
     {
         // A single-attempt committer that must rebase (a winner already holds v1) exhausts its budget and
-        // fails closed rather than spinning.
+        // fails closed with a RETRYABLE contention error (the commit provably did not land) — distinct from
+        // the genuine unknown-state paths.
         Snapshot snapshot = await SeedAndLoadAsync();
         await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Add("winner.parquet"));
 
-        await Assert.ThrowsAsync<DeltaCommitUnknownStateException>(() =>
+        var ex = await Assert.ThrowsAsync<DeltaCommitContentionException>(() =>
             new DeltaCommitter(_backend, maxAttempts: 1, nonceFactory: null)
                 .CommitAsync(snapshot, new DeltaAction[] { Add("mine.parquet") }, DeltaReadScope.BlindAppend));
+        Assert.Equal(1, ex.MaxAttempts);
     }
+
+    [Fact]
+    public async Task BlindAppend_WithRemoveAction_IsRejected()
+    {
+        // A BlindAppend scope performs no data-conflict detection, so a remove-bearing payload (which could
+        // silently rebase past a concurrent same-file remove — the deferred ConcurrentDeleteDelete cell) is
+        // rejected up front; such a commit must use WholeTable or ReadFiles.
+        Snapshot snapshot = await SeedAndLoadAsync();
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() =>
+            new DeltaCommitter(_backend).CommitAsync(
+                snapshot,
+                new DeltaAction[] { Add("a.parquet"), Remove("gone.parquet") },
+                DeltaReadScope.BlindAppend));
+        Assert.Equal("actions", ex.ParamName);
+    }
+
+    [Fact]
+    public async Task CommitWithUnsupportedProtocolUpgrade_FailsClosed()
+    {
+        // A commit that installs a protocol this writer cannot honor is rejected before any write, even
+        // though the current table protocol is writable.
+        Snapshot snapshot = await SeedAndLoadAsync();
+        var upgrade = new ProtocolAction(1, 5, ImmutableArray<string>.Empty, ImmutableArray<string>.Empty);
+
+        var ex = await Assert.ThrowsAsync<DeltaProtocolException>(() =>
+            new DeltaCommitter(_backend).CommitAsync(
+                snapshot, new DeltaAction[] { upgrade, Add("a.parquet") }, DeltaReadScope.WholeTable));
+        Assert.Equal(DeltaProtocolErrorKind.UnsupportedProtocol, ex.Kind);
+        Assert.Equal(0L, (await new DeltaLog(_backend).LoadSnapshotAsync()).Version);
+    }
+
+    [Fact]
+    public async Task TransientPutFailure_IsRetriedWithinTheAttempt_AndSucceeds()
+    {
+        // A transient storage failure on the commit put is retried with (test-injected no-op) backoff and
+        // succeeds without consuming a rebase attempt (design §2.11.3).
+        Snapshot snapshot = await SeedAndLoadAsync();
+        var faulty = new FaultInjectingBackend(_backend) { TransientPutCalls = 3 };
+
+        DeltaCommitResult result = await new DeltaCommitter(
+                faulty, DeltaCommitter.DefaultMaxAttempts, nonceFactory: null, transientBackoff: NoBackoff)
+            .CommitAsync(snapshot, new DeltaAction[] { Add("part-0.parquet") }, DeltaReadScope.BlindAppend);
+
+        Assert.Equal(1L, result.Version);
+        Assert.Equal(1, result.Attempts); // transient retries are within the attempt, not a rebase
+    }
+
+    [Fact]
+    public async Task TransientPutFailure_BeyondBudget_Propagates()
+    {
+        // A transient failure that never clears exhausts the bounded transient-retry budget and surfaces
+        // rather than looping forever.
+        Snapshot snapshot = await SeedAndLoadAsync();
+        var faulty = new FaultInjectingBackend(_backend) { TransientPutCalls = DeltaCommitter.MaxTransientRetries + 5 };
+
+        var ex = await Assert.ThrowsAsync<DeltaStorageException>(() =>
+            new DeltaCommitter(faulty, DeltaCommitter.DefaultMaxAttempts, nonceFactory: null, transientBackoff: NoBackoff)
+                .CommitAsync(snapshot, new DeltaAction[] { Add("part-0.parquet") }, DeltaReadScope.BlindAppend));
+        Assert.Equal(StorageErrorKind.Transient, ex.Kind);
+    }
+
+    [Fact]
+    public async Task Reentrant_SharedCommitter_CommitsConcurrentlyWithoutLoss()
+    {
+        // A single committer instance is safe to share across concurrent commits (documented reentrancy).
+        Snapshot snapshot = await SeedAndLoadAsync();
+        var committer = new DeltaCommitter(_backend);
+
+        Task<DeltaCommitResult>[] commits = Enumerable.Range(0, 5)
+            .Select(i => Task.Run(() => committer.CommitAsync(
+                snapshot, new DeltaAction[] { Add($"f{i}.parquet") }, DeltaReadScope.BlindAppend)))
+            .ToArray();
+        await Task.WhenAll(commits);
+
+        Snapshot reloaded = await new DeltaLog(_backend).LoadSnapshotAsync();
+        Assert.Equal(5L, reloaded.Version);
+        Assert.Equal(5, reloaded.ActiveFiles.Length); // all five landed exactly once
+        Assert.Equal(new[] { 1L, 2L, 3L, 4L, 5L }, commits.Select(c => c.Result.Version).OrderBy(v => v).ToArray());
+    }
+
+    [Fact]
+    public async Task TransientPutFailure_WithDefaultBackoff_RetriesAndSucceeds()
+    {
+        // Exercises the production exponential-jitter backoff: one transient failure → one real (short)
+        // backoff → success. Uses the default committer (no injected backoff).
+        Snapshot snapshot = await SeedAndLoadAsync();
+        var faulty = new FaultInjectingBackend(_backend) { TransientPutCalls = 1 };
+
+        DeltaCommitResult result = await new DeltaCommitter(faulty)
+            .CommitAsync(snapshot, new DeltaAction[] { Add("part-0.parquet") }, DeltaReadScope.BlindAppend);
+
+        Assert.Equal(1L, result.Version);
+    }
+
+    private static Task NoBackoff(int attempt, CancellationToken cancellationToken) => Task.CompletedTask;
 
     [Fact]
     public async Task LostRaceWithNoVisibleWinner_FailsClosedWithUnknownState()
@@ -176,7 +277,8 @@ public sealed class DeltaCommitterEdgeCaseTests : IDisposable
         };
 
         await Assert.ThrowsAsync<DeltaCommitUnknownStateException>(() =>
-            new DeltaCommitter(faulty).CommitAsync(
+            new DeltaCommitter(faulty, DeltaCommitter.DefaultMaxAttempts, nonceFactory: null, transientBackoff: NoBackoff)
+                .CommitAsync(
                 snapshot, new DeltaAction[] { Add("part-0.parquet") }, DeltaReadScope.BlindAppend));
     }
 }

@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Linq;
 using System.Security.Cryptography;
 using DeltaSharp.Storage.Backends;
 
@@ -22,7 +23,21 @@ internal readonly record struct DeltaCommitResult(long Version, int Attempts);
 /// duplicating data (the same nonce-stable bytes are re-published at the new version). The engine never
 /// blindly retries an ambiguous slot and never advances as if a commit definitely failed — either could
 /// double-commit — and fails closed with <see cref="DeltaCommitUnknownStateException"/> when an outcome
-/// cannot be resolved.</para>
+/// cannot be resolved. A transient storage failure is retried with bounded backoff (§2.11.3).</para>
+///
+/// <para><b>Reentrancy.</b> A <see cref="DeltaCommitter"/> holds only immutable configuration; all
+/// per-commit state is local to <see cref="CommitAsync"/>. A single instance is therefore safe to share
+/// across concurrent <see cref="CommitAsync"/> calls (the concurrency tests use one instance per writer
+/// only to model independent writers). The <see cref="BeforePutProbe"/> seam is test-only.</para>
+///
+/// <para><b>Consistency assumption.</b> Recovery from a lost/ambiguous race depends on the backend being
+/// <b>read-after-write consistent</b> for a commit object versus a failed/ambiguous
+/// <see cref="IStorageBackend.PutIfAbsentAsync"/> on the same key: a re-GET must observe a just-durable
+/// commit. Under that contract no double-commit is possible (a durable-but-unacknowledged commit is
+/// recognized by its nonce on both the ambiguous and the definite-conflict paths). The idempotency nonce is
+/// <b>in-memory, per <see cref="CommitAsync"/> call</b>: it makes a commit exactly-once <i>within</i> one
+/// call (including its retries), <b>not</b> across a driver restart mid-commit — cross-process idempotency
+/// is provided by <c>txn{appId,version}</c> (design §2.11.4, STORY-05.3.2 / #187).</para>
 /// </summary>
 internal sealed class DeltaCommitter
 {
@@ -31,24 +46,33 @@ internal sealed class DeltaCommitter
     internal const string CommitNonceKey = "txnId";
 
     /// <summary>A generous bound on rebase-retries; reaching it implies sustained contention (or a bug) and
-    /// fails closed rather than spinning forever.</summary>
+    /// fails closed with <see cref="DeltaCommitContentionException"/> rather than spinning forever.</summary>
     internal const int DefaultMaxAttempts = 64;
+
+    /// <summary>The bound on consecutive transient-failure retries for a single storage operation before the
+    /// transient error is surfaced (design §2.11.3 "bounded retries").</summary>
+    internal const int MaxTransientRetries = 8;
 
     private readonly IStorageBackend _backend;
     private readonly DeltaLog _log;
     private readonly int _maxAttempts;
     private readonly Func<string> _nonceFactory;
+    private readonly Func<int, CancellationToken, Task> _transientBackoff;
 
     /// <summary>Test seam (null/inert in production): awaited immediately before each put-if-absent with
     /// <c>(attemptIndex, targetVersion)</c>, so a test can deterministically interleave a racing writer.</summary>
     internal volatile Func<int, long, CancellationToken, Task>? BeforePutProbe;
 
     public DeltaCommitter(IStorageBackend backend)
-        : this(backend, DefaultMaxAttempts, nonceFactory: null)
+        : this(backend, DefaultMaxAttempts, nonceFactory: null, transientBackoff: null)
     {
     }
 
-    internal DeltaCommitter(IStorageBackend backend, int maxAttempts, Func<string>? nonceFactory)
+    internal DeltaCommitter(
+        IStorageBackend backend,
+        int maxAttempts,
+        Func<string>? nonceFactory,
+        Func<int, CancellationToken, Task>? transientBackoff = null)
     {
         ArgumentNullException.ThrowIfNull(backend);
         if (maxAttempts < 1)
@@ -60,12 +84,22 @@ internal sealed class DeltaCommitter
         _log = new DeltaLog(backend);
         _maxAttempts = maxAttempts;
         _nonceFactory = nonceFactory ?? DefaultNonceFactory;
+        _transientBackoff = transientBackoff ?? DefaultTransientBackoffAsync;
     }
 
     /// <summary>The production idempotency-nonce source: 128 bits from a cryptographic RNG, hex-encoded.
     /// Uses <see cref="RandomNumberGenerator"/> (not the banned <c>Guid.NewGuid</c>/<c>System.Random</c>) so
     /// nonces are collision-resistant, while a deterministic factory can be injected in tests.</summary>
     internal static string DefaultNonceFactory() => Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
+
+    /// <summary>The production transient-retry backoff: capped exponential delay with full jitter
+    /// (RandomNumberGenerator, not the banned <c>System.Random</c>). Tests inject a no-op for determinism.</summary>
+    private static async Task DefaultTransientBackoffAsync(int attempt, CancellationToken cancellationToken)
+    {
+        int baseMs = Math.Min(1000, 25 * (1 << Math.Min(attempt, 5)));
+        int delayMs = baseMs + RandomNumberGenerator.GetInt32(0, baseMs + 1);
+        await Task.Delay(delayMs, cancellationToken).ConfigureAwait(false);
+    }
 
     /// <summary>
     /// Commits <paramref name="actions"/> against <paramref name="readSnapshot"/> under
@@ -89,9 +123,30 @@ internal sealed class DeltaCommitter
             throw new ArgumentException("A commit must contain at least one action.", nameof(actions));
         }
 
+        // A BlindAppend read scope registers no read set, so it performs no data-conflict detection; a
+        // commit that *removes* files (a delete/overwrite) must therefore use WholeTable or ReadFiles so a
+        // concurrent delete/overwrite is caught. Reject a remove-bearing blind append up front rather than
+        // silently rebasing past a concurrent same-file remove (the ConcurrentDeleteDelete cell, deferred
+        // with the blind-overwrite scope to STORY-05.3.3 / #188).
+        if (readScope is DeltaReadScope.BlindAppendScope && actions.Any(a => a is RemoveFileAction))
+        {
+            throw new ArgumentException(
+                "A BlindAppend commit must be append-only (it contains no read set to detect a concurrent delete); a commit that removes files must use DeltaReadScope.WholeTable or DeltaReadScope.ReadFiles.",
+                nameof(actions));
+        }
+
         // Writer protocol negotiation: fail closed before any write if the table requires a writer
-        // version/feature this build does not enforce (design §2.11 / §2.14 P3).
+        // version/feature this build does not enforce (design §2.11 / §2.14 P3). Validate both the current
+        // table protocol and any protocol this commit itself installs (a protocol upgrade must not raise the
+        // table to a version/feature this writer cannot honor).
         ProtocolSupport.EnsureWritable(readSnapshot.Protocol);
+        foreach (DeltaAction action in actions)
+        {
+            if (action is ProtocolAction committedProtocol)
+            {
+                ProtocolSupport.EnsureWritable(committedProtocol);
+            }
+        }
 
         (IReadOnlyList<DeltaAction> payload, string nonce) = BuildPayload(actions, _nonceFactory());
         byte[] bytes = DeltaLogActionWriter.SerializeCommit(payload);
@@ -110,7 +165,8 @@ internal sealed class DeltaCommitter
             bool won;
             try
             {
-                won = await _backend.PutIfAbsentAsync(path, bytes, cancellationToken).ConfigureAwait(false);
+                won = await WithTransientRetryAsync(
+                    ct => _backend.PutIfAbsentAsync(path, bytes, ct).AsTask(), cancellationToken).ConfigureAwait(false);
             }
             catch (DeltaStorageException ex) when (ex.Kind == StorageErrorKind.RetryUnsafeAmbiguous)
             {
@@ -131,6 +187,15 @@ internal sealed class DeltaCommitter
                 return new DeltaCommitResult(target, attempt + 1);
             }
 
+            // Idempotent self-check (§2.11.6 "after commit, before ack"): our own durable-but-unacknowledged
+            // commit can surface as a lost race — a lost ack routed here as LostToOther, or a HEAD that lagged
+            // the durable put and drove a SlotFree retry that now loses. If <target> is OUR commit, succeed
+            // idempotently; never rebase past our own commit (which would double-commit at target+1).
+            if (await CommittedByUsAsync(target, nonce, cancellationToken).ConfigureAwait(false))
+            {
+                return new DeltaCommitResult(target, attempt + 1);
+            }
+
             // Definite conflict: read the winners over (baseVersion, M], classify, then rebase or abort.
             (long latest, IReadOnlyList<DeltaAction> winners) =
                 await ReadWinnersAsync(baseVersion, cancellationToken).ConfigureAwait(false);
@@ -138,21 +203,27 @@ internal sealed class DeltaCommitter
             baseVersion = latest; // safe: rebase onto M and retry with the same nonce-stable bytes.
         }
 
-        throw new DeltaCommitUnknownStateException(
+        // Budget exhausted under sustained contention: the commit provably did NOT land (every attempt ended
+        // in a lost race or a safe rebase), so this is a known, retryable outcome — distinct from the genuine
+        // unknown-state paths (§2.11.3).
+        throw new DeltaCommitContentionException(
             baseVersion + 1,
-            $"The commit did not converge within {_maxAttempts} attempts under sustained concurrent writers.");
+            _maxAttempts,
+            $"The commit did not converge within {_maxAttempts} attempts under sustained concurrent writers; it did not land — retry from a fresh snapshot.");
     }
 
     /// <summary>Reads and concatenates the actions of every commit over <c>(afterExclusive, M]</c> — the
-    /// winners since the read snapshot — returning the latest version <c>M</c> and their actions.</summary>
+    /// winners since the read snapshot — returning the latest version <c>M</c> and their actions. The walk
+    /// terminates at the first absent version; it is bounded in practice by the backend's finite, monotonic
+    /// commit log (the same contract that makes the log the source of truth).</summary>
     private async Task<(long Latest, IReadOnlyList<DeltaAction> Winners)> ReadWinnersAsync(
         long afterExclusive, CancellationToken cancellationToken)
     {
         var winners = new List<DeltaAction>();
         long version = afterExclusive + 1;
-        while (await _log.CommitExistsAsync(version, cancellationToken).ConfigureAwait(false))
+        while (await CommitVisibleAsync(version, cancellationToken).ConfigureAwait(false))
         {
-            winners.AddRange(await _log.ReadCommitActionsAsync(version, cancellationToken).ConfigureAwait(false));
+            winners.AddRange(await ReadCommitAsync(version, cancellationToken).ConfigureAwait(false));
             version++;
         }
 
@@ -169,16 +240,58 @@ internal sealed class DeltaCommitter
         return (latest, winners);
     }
 
+    /// <summary>Whether the commit at <paramref name="version"/> exists and carries this attempt's
+    /// <paramref name="nonce"/> — i.e. it is <b>our own</b> durable commit surfacing as a lost race
+    /// (§2.11.6). Fails closed (propagates) if the version cannot be read after transient retries.</summary>
+    private async Task<bool> CommittedByUsAsync(long version, string nonce, CancellationToken cancellationToken)
+    {
+        if (!await CommitVisibleAsync(version, cancellationToken).ConfigureAwait(false))
+        {
+            return false;
+        }
+
+        IReadOnlyList<DeltaAction> committed = await ReadCommitAsync(version, cancellationToken).ConfigureAwait(false);
+        return CommitCarriesNonce(committed, nonce);
+    }
+
+    private Task<bool> CommitVisibleAsync(long version, CancellationToken cancellationToken) =>
+        WithTransientRetryAsync(ct => _log.CommitExistsAsync(version, ct), cancellationToken);
+
+    private Task<IReadOnlyList<DeltaAction>> ReadCommitAsync(long version, CancellationToken cancellationToken) =>
+        WithTransientRetryAsync(ct => _log.ReadCommitActionsAsync(version, ct), cancellationToken);
+
+    /// <summary>Runs a storage operation, retrying a <see cref="StorageErrorKind.Transient"/> failure with
+    /// bounded backoff (design §2.11.3). A non-transient failure (including
+    /// <see cref="StorageErrorKind.RetryUnsafeAmbiguous"/>) propagates immediately to its handler.</summary>
+    private async Task<T> WithTransientRetryAsync<T>(Func<CancellationToken, Task<T>> operation, CancellationToken cancellationToken)
+    {
+        for (int retry = 0; ; retry++)
+        {
+            try
+            {
+                return await operation(cancellationToken).ConfigureAwait(false);
+            }
+            catch (DeltaStorageException ex) when (ex.Kind == StorageErrorKind.Transient && retry < MaxTransientRetries)
+            {
+                await _transientBackoff(retry, cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
     /// <summary>Re-resolves an ambiguous put-if-absent (design §2.11.3): re-GET <c>&lt;version&gt;.json</c>
     /// and decide whether this writer's own commit landed (nonce match), the slot is still free, or another
-    /// writer won it.</summary>
+    /// writer won it. Correctness of the <see cref="AmbiguousResolution.SlotFree"/> verdict depends on the
+    /// backend being read-after-write consistent for this key versus the ambiguous put (a re-GET must see a
+    /// just-durable commit); a residual lag is caught anyway by the definite-conflict self-check on the
+    /// subsequent retry (<see cref="CommittedByUsAsync"/>). Transient read failures are retried; a persistent
+    /// failure fails closed as unknown-state.</summary>
     private async Task<AmbiguousResolution> ResolveAmbiguousAsync(
         long version, string nonce, CancellationToken cancellationToken)
     {
         bool exists;
         try
         {
-            exists = await _log.CommitExistsAsync(version, cancellationToken).ConfigureAwait(false);
+            exists = await CommitVisibleAsync(version, cancellationToken).ConfigureAwait(false);
         }
         catch (DeltaStorageException ex)
         {
@@ -194,7 +307,7 @@ internal sealed class DeltaCommitter
         IReadOnlyList<DeltaAction> committed;
         try
         {
-            committed = await _log.ReadCommitActionsAsync(version, cancellationToken).ConfigureAwait(false);
+            committed = await ReadCommitAsync(version, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is DeltaStorageException or DeltaProtocolException)
         {
@@ -230,6 +343,8 @@ internal sealed class DeltaCommitter
             }
         }
 
+        // The engine owns the idempotency nonce: overwrite any caller-supplied commitInfo["txnId"] so the
+        // nonce is authoritative for ambiguous-ack recognition (a caller cannot forge/override it).
         entries[CommitNonceKey] = nonce;
 
         var payload = new List<DeltaAction>(rest.Count + 1) { new CommitInfoAction(entries.ToImmutable()) };

@@ -12,8 +12,9 @@ internal sealed class FaultInjectingBackend : IStorageBackend
 {
     private readonly IStorageBackend _inner;
     private int _putCalls;
-    private bool _failNextHead;
-    private bool _failNextRead;
+    private int _transientPutsThrown;
+    private bool _failHead;
+    private bool _failRead;
 
     public FaultInjectingBackend(IStorageBackend inner) => _inner = inner;
 
@@ -23,23 +24,46 @@ internal sealed class FaultInjectingBackend : IStorageBackend
     /// <summary>Whether the ambiguous put still writes the object (models ack-lost-but-durable).</summary>
     public bool PerformPutBeforeAmbiguous { get; init; }
 
-    /// <summary>Whether the re-GET <c>Head</c> that follows the ambiguous put also fails (unresolvable).</summary>
+    /// <summary>Whether the re-GET <c>Head</c> that follows the ambiguous put fails <b>persistently</b> —
+    /// modelling a re-GET that cannot confirm the outcome (the transient-retry budget is exhausted →
+    /// unknown-state).</summary>
     public bool FailReGetHead { get; init; }
 
-    /// <summary>Whether the re-GET <c>OpenRead</c> that follows the ambiguous put fails (unresolvable read).</summary>
+    /// <summary>Whether the re-GET <c>OpenRead</c> that follows the ambiguous put fails persistently
+    /// (unresolvable read → unknown-state).</summary>
     public bool FailReGetRead { get; init; }
 
-    /// <summary>The 0-based put-if-absent call index that returns <see langword="false"/> (lost) WITHOUT
-    /// writing anything — a self-inconsistent backend used to drive the "rejected but nothing visible"
-    /// fail-closed guard (-1 = never).</summary>
+    /// <summary>The 0-based put-if-absent call index that returns <see langword="false"/> (lost) — a
+    /// self-inconsistent backend used to drive the "rejected but nothing visible" fail-closed guard, and
+    /// (with <see cref="PerformPutBeforeLie"/>) the own-commit-durable-but-reported-lost double-commit guard
+    /// (-1 = never).</summary>
     public int LieLostOnPutCall { get; init; } = -1;
+
+    /// <summary>Whether the lying-lost put still writes the object (models our own durable commit surfacing
+    /// as a lost race — the §2.11.6 "after commit, before ack" case).</summary>
+    public bool PerformPutBeforeLie { get; init; }
+
+    /// <summary>The number of leading put-if-absent invocations that raise a transient failure before any
+    /// real put (drives the §2.11.3 bounded transient-retry path).</summary>
+    public int TransientPutCalls { get; init; }
 
     public async ValueTask<bool> PutIfAbsentAsync(string path, ReadOnlyMemory<byte> content, CancellationToken cancellationToken)
     {
+        if (_transientPutsThrown < TransientPutCalls)
+        {
+            _transientPutsThrown++;
+            throw new DeltaStorageException(StorageErrorKind.Transient, "injected transient put-if-absent failure.");
+        }
+
         int call = _putCalls++;
         if (call == LieLostOnPutCall)
         {
-            return false; // report a lost race though the object was never created.
+            if (PerformPutBeforeLie)
+            {
+                await _inner.PutIfAbsentAsync(path, content, cancellationToken); // our commit lands...
+            }
+
+            return false; // ...but the backend reports a lost race.
         }
 
         if (call == AmbiguousOnPutCall)
@@ -51,12 +75,12 @@ internal sealed class FaultInjectingBackend : IStorageBackend
 
             if (FailReGetHead)
             {
-                _failNextHead = true;
+                _failHead = true;
             }
 
             if (FailReGetRead)
             {
-                _failNextRead = true;
+                _failRead = true;
             }
 
             throw new DeltaStorageException(StorageErrorKind.RetryUnsafeAmbiguous, "injected ambiguous commit acknowledgment.");
@@ -67,10 +91,9 @@ internal sealed class FaultInjectingBackend : IStorageBackend
 
     public ValueTask<StorageObjectInfo?> HeadAsync(string path, CancellationToken cancellationToken)
     {
-        if (_failNextHead)
+        if (_failHead)
         {
-            _failNextHead = false;
-            throw new DeltaStorageException(StorageErrorKind.Transient, "injected re-GET head failure.");
+            throw new DeltaStorageException(StorageErrorKind.Transient, "injected persistent re-GET head failure.");
         }
 
         return _inner.HeadAsync(path, cancellationToken);
@@ -78,10 +101,9 @@ internal sealed class FaultInjectingBackend : IStorageBackend
 
     public ValueTask<Stream> OpenReadAsync(string path, CancellationToken cancellationToken)
     {
-        if (_failNextRead)
+        if (_failRead)
         {
-            _failNextRead = false;
-            throw new DeltaStorageException(StorageErrorKind.Transient, "injected re-GET read failure.");
+            throw new DeltaStorageException(StorageErrorKind.Transient, "injected persistent re-GET read failure.");
         }
 
         return _inner.OpenReadAsync(path, cancellationToken);

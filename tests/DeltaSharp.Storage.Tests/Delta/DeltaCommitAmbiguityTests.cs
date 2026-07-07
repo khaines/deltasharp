@@ -45,6 +45,8 @@ public sealed class DeltaCommitAmbiguityTests : IDisposable
     private static AddFileAction Add(string path) =>
         new(path, NoPartition, 1L, 1L, DataChange: true, Stats: null, Tags: NoTags);
 
+    private static Task NoBackoff(int attempt, CancellationToken cancellationToken) => Task.CompletedTask;
+
     private async Task<Snapshot> SeedAndLoadAsync()
     {
         await DeltaTestHarness.WriteCommitAsync(
@@ -111,8 +113,57 @@ public sealed class DeltaCommitAmbiguityTests : IDisposable
         };
 
         var ex = await Assert.ThrowsAsync<DeltaCommitUnknownStateException>(() =>
-            new DeltaCommitter(faulty)
+            new DeltaCommitter(faulty, DeltaCommitter.DefaultMaxAttempts, nonceFactory: null, transientBackoff: NoBackoff)
                 .CommitAsync(snapshot, new DeltaAction[] { Add("part-0.parquet") }, DeltaReadScope.BlindAppend));
         Assert.Equal(1L, ex.Version);
+    }
+
+    [Fact]
+    public async Task OwnDurableCommitReportedLost_ResolvesAsSuccess_WithoutDoubleCommit()
+    {
+        // §2.11.6 "after commit, before ack": our own durable commit surfaces as a *lost race* (put reports
+        // false though it landed — e.g. an ack lost after a HEAD-lag SlotFree retry). The definite-conflict
+        // path must recognize our own nonce and succeed idempotently, never rebasing past our own commit
+        // (which would publish the same add at v1 AND v2). This is the regression test for the council's
+        // headline double-commit finding.
+        Snapshot snapshot = await SeedAndLoadAsync();
+        var faulty = new FaultInjectingBackend(_backend) { LieLostOnPutCall = 0, PerformPutBeforeLie = true };
+
+        DeltaCommitResult result = await new DeltaCommitter(faulty)
+            .CommitAsync(snapshot, new DeltaAction[] { Add("part-0.parquet") }, DeltaReadScope.BlindAppend);
+
+        Assert.Equal(1L, result.Version);
+        Assert.Equal(1, result.Attempts);
+
+        Snapshot reloaded = await new DeltaLog(_backend).LoadSnapshotAsync();
+        Assert.Equal(1L, reloaded.Version); // NOT v2
+        Assert.Equal("part-0.parquet", Assert.Single(reloaded.ActiveFiles).Path); // committed exactly once
+    }
+
+    [Fact]
+    public async Task CorruptWinnerDuringRebase_FailsClosed()
+    {
+        // A malformed winning commit encountered while classifying a lost race fails closed (the corrupt
+        // log surfaces as a precise protocol error rather than being silently skipped).
+        Snapshot snapshot = await SeedAndLoadAsync();
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, "{ this is not valid json");
+
+        await Assert.ThrowsAsync<DeltaProtocolException>(() =>
+            new DeltaCommitter(_backend).CommitAsync(
+                snapshot, new DeltaAction[] { Add("late.parquet") }, DeltaReadScope.BlindAppend));
+    }
+
+    [Fact]
+    public async Task CorruptCommitDuringAmbiguousReGet_FailsClosedWithUnknownState()
+    {
+        // The re-GET during ambiguous recovery reads a malformed commit at the target version: it cannot be
+        // classified, so recovery fails closed with unknown-state rather than mis-resolving.
+        Snapshot snapshot = await SeedAndLoadAsync();
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, "{ this is not valid json");
+        var faulty = new FaultInjectingBackend(_backend) { AmbiguousOnPutCall = 0, PerformPutBeforeAmbiguous = false };
+
+        await Assert.ThrowsAsync<DeltaCommitUnknownStateException>(() =>
+            new DeltaCommitter(faulty).CommitAsync(
+                snapshot, new DeltaAction[] { Add("late.parquet") }, DeltaReadScope.BlindAppend));
     }
 }

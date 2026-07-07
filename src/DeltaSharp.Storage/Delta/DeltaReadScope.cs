@@ -13,10 +13,14 @@ namespace DeltaSharp.Storage.Delta;
 ///
 /// <para><b>v1 scope.</b> Three shapes are modeled: <see cref="BlindAppend"/> (empty read set),
 /// <see cref="WholeTable"/> (depends on every active file — a full overwrite or unpartitioned delete), and
-/// <see cref="ReadFiles"/> (depends on a named file set — a targeted delete/merge). Predicate/partition-
-/// precise scopes (conflict only when a winner touches an overlapping partition <i>predicate</i>) are a
-/// tracked refinement (design §2.11.2 conditional cells); the modeled scopes are deliberately <b>no less
-/// conservative</b> than Delta, so they never miss a real conflict.</para>
+/// <see cref="ReadFiles"/> (depends on a named file set — a targeted delete). <see cref="BlindAppend"/> and
+/// <see cref="WholeTable"/> are <b>no less conservative</b> than Delta for their cells, so they never miss a
+/// real conflict. <see cref="ReadFiles"/> flags a concurrent <c>remove</c>/re-<c>add</c> of an <b>exact read
+/// path</b> only; it does <b>not</b> flag a concurrent append of a <i>new</i> file that would match a
+/// read <i>predicate</i> — so it is sound for a snapshot-isolated <c>DELETE</c> (which acts on its snapshot),
+/// but is <b>not</b> sufficient for a <c>MERGE</c> that must observe predicate-matching inserts. Scope
+/// <see cref="ReadFiles"/> to snapshot-isolated deletes until predicate/partition-precise scopes (design
+/// §2.11.2 conditional cells) land as a tracked refinement.</para>
 /// </summary>
 internal abstract record DeltaReadScope
 {
@@ -25,15 +29,20 @@ internal abstract record DeltaReadScope
     }
 
     /// <summary>An empty read set — a streaming or plain <c>append</c> that read no existing data, so it
-    /// conflicts <b>only</b> with a concurrent metadata/protocol change (the load-bearing fast path).</summary>
+    /// conflicts <b>only</b> with a concurrent metadata/protocol change (the load-bearing fast path).
+    /// <b>Precondition:</b> a <see cref="BlindAppend"/> commit must be append-only (contain no
+    /// <c>remove</c>), because it performs no data-conflict detection; a commit that removes files must use
+    /// <see cref="WholeTable"/> or <see cref="ReadFiles"/> (enforced by the committer).</summary>
     public static DeltaReadScope BlindAppend { get; } = new BlindAppendScope();
 
     /// <summary>A commit that depends on the entire active file set (a full overwrite or an unpartitioned
     /// delete): it conflicts with any concurrent <c>add</c> or <c>remove</c>.</summary>
     public static DeltaReadScope WholeTable { get; } = new WholeTableScope();
 
-    /// <summary>A commit that read a specific set of files (a targeted delete/merge): it conflicts with a
-    /// concurrent <c>remove</c> or re-<c>add</c> of any file in <paramref name="paths"/>.</summary>
+    /// <summary>A commit that read a specific set of files (a snapshot-isolated targeted delete): it
+    /// conflicts with a concurrent <c>remove</c> or re-<c>add</c> of any file in <paramref name="paths"/>.
+    /// It does not observe predicate-matching inserts, so it is not sufficient for a <c>MERGE</c> (see the
+    /// type remarks).</summary>
     public static DeltaReadScope ReadFiles(IEnumerable<string> paths)
     {
         ArgumentNullException.ThrowIfNull(paths);
