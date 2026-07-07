@@ -282,9 +282,10 @@ internal sealed class DeltaCommitter
     /// and decide whether this writer's own commit landed (nonce match), the slot is still free, or another
     /// writer won it. Correctness of the <see cref="AmbiguousResolution.SlotFree"/> verdict depends on the
     /// backend being read-after-write consistent for this key versus the ambiguous put (a re-GET must see a
-    /// just-durable commit); a residual lag is caught anyway by the definite-conflict self-check on the
-    /// subsequent retry (<see cref="CommittedByUsAsync"/>). Transient read failures are retried; a persistent
-    /// failure fails closed as unknown-state.</summary>
+    /// just-durable commit); a residual lag is caught anyway on the subsequent retry, where the
+    /// definite-conflict path nonce-checks the winners it reads (<see cref="ReadWinnersAsync"/>) and returns
+    /// idempotent success rather than rebasing past our own commit. Transient read failures are retried; a
+    /// persistent failure fails closed as unknown-state.</summary>
     private async Task<AmbiguousResolution> ResolveAmbiguousAsync(
         long version, string nonce, CancellationToken cancellationToken)
     {
