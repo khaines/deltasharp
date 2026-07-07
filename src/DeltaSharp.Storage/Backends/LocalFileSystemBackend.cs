@@ -231,6 +231,11 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
     public ValueTask<Stream> OpenWriteAsync(string path, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        if (!OperatingSystem.IsWindows())
+        {
+            return OpenWriteConfinedUnix(path);
+        }
+
         string full = Resolve(path);
         string directory = Path.GetDirectoryName(full) ?? _root;
 
@@ -250,6 +255,43 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
 
         Stream stream = new StagedWriteStream(inner, temp, full, directory, path, _redactDelegate);
         return ValueTask.FromResult(stream);
+    }
+
+    // POSIX race-free staged write: stage a private temp in the CONFINED parent descriptor; the returned
+    // stream publishes it with linkat into that same descriptor on CompleteAsync (issue #474).
+    private ValueTask<Stream> OpenWriteConfinedUnix(string path)
+    {
+        string full = Resolve(path); // defense-in-depth pre-check
+        string directory = Path.GetDirectoryName(full) ?? _root;
+
+        SafeFileHandle? parent = null;
+        try
+        {
+            Directory.CreateDirectory(directory);
+            string rel = ResolveRelative(path);
+            string[] components = ConfinedFileSystem.SplitConfinedComponents(rel);
+            parent = ConfinedFileSystem.TryOpenParent(
+                _rootHandle!, components, out string destName, out ConfinedFileSystem.WalkError werr);
+            if (parent is null)
+            {
+                throw MapWalkError(werr, path);
+            }
+
+            (SafeFileHandle tempHandle, string tempName) = CreateConfinedTemp((int)parent.DangerousGetHandle(), destName);
+            var inner = new FileStream(tempHandle, FileAccess.Write, bufferSize: 4096, isAsync: false);
+            Stream stream = new StagedWriteStream(inner, parent, tempName, destName, directory, path, _redactDelegate);
+            return ValueTask.FromResult(stream);
+        }
+        catch (DeltaStorageException)
+        {
+            parent?.Dispose();
+            throw;
+        }
+        catch (Exception ex)
+        {
+            parent?.Dispose();
+            throw SurfaceFailure("Opening a staged write for", path, ex);
+        }
     }
 
     /// <inheritdoc/>
@@ -508,27 +550,59 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
                 continue;
             }
 
-            StorageObjectInfo entry;
-            try
+            StorageObjectInfo? entry = ReadListEntryMetadata(realFile);
+            if (entry is null)
             {
-                Func<string, Exception?>? faultHook = IoFaultHook;
-                if (faultHook?.Invoke("list-meta") is { } fault)
-                {
-                    throw fault;
-                }
-
-                var info = new FileInfo(realFile);
-                entry = new StorageObjectInfo(
-                    ToRelativeReal(realFile), info.Length, info.LastWriteTimeUtc, MakeETag(info));
-            }
-            catch (Exception ex) when (ex is FileNotFoundException or IOException or UnauthorizedAccessException)
-            {
-                // S3: the object vanished between enumeration and this metadata read (a delete race), so
-                // its FileInfo throws FileNotFoundException; skip it rather than leak a raw path.
                 continue;
             }
 
             yield return entry;
+        }
+    }
+
+    // Reads a confirmed-confined list entry's metadata. On POSIX this is race-free: the metadata is read
+    // from a descriptor reached by an openat + O_NOFOLLOW walk, so a symlink swapped in between the
+    // confinement check above and this read cannot leak an out-of-root Length/mtime (it fails the walk and
+    // the entry is skipped). On Windows the FileInfo stat is retained. Returns null to skip a vanished or
+    // now-unconfined entry rather than aborting the listing.
+    private StorageObjectInfo? ReadListEntryMetadata(string realFile)
+    {
+        try
+        {
+            Func<string, Exception?>? faultHook = IoFaultHook;
+            if (faultHook?.Invoke("list-meta") is { } fault)
+            {
+                throw fault;
+            }
+
+            if (OperatingSystem.IsWindows())
+            {
+                var info = new FileInfo(realFile);
+                return new StorageObjectInfo(
+                    ToRelativeReal(realFile), info.Length, info.LastWriteTimeUtc, MakeETag(info));
+            }
+
+            string relKey = ToRelativeReal(realFile);
+            string[] components = ConfinedFileSystem.SplitConfinedComponents(relKey);
+            SafeFileHandle? handle = ConfinedFileSystem.TryOpenLeaf(
+                _rootHandle!, components, PosixInterop.O_RDONLY, 0, out _);
+            if (handle is null)
+            {
+                return null; // vanished or became a symlink between confinement and this read — skip
+            }
+
+            using (handle)
+            {
+                long length = RandomAccess.GetLength(handle);
+                DateTime mtime = ConfinedFileSystem.GetLastModifiedUtc(handle, length);
+                return new StorageObjectInfo(relKey, length, mtime, MakeETagFromParts(length, mtime));
+            }
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or IOException or UnauthorizedAccessException or DeltaStorageException)
+        {
+            // S3: the object vanished (delete race) or its metadata read failed; skip it rather than leak
+            // a raw path or abort the listing.
+            return null;
         }
     }
 
@@ -1352,6 +1426,14 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         private readonly string _destinationDirectory;
         private readonly string _displayPath;
         private readonly Func<string, string> _redact;
+
+        // POSIX race-free publish (issue #474): when set, publication uses linkat into this CONFINED parent
+        // descriptor (not a re-resolvable string path). The stream owns the descriptor for its lifetime and
+        // disposes it. Null on Windows, which keeps the string-path TryAtomicPublish.
+        private readonly SafeFileHandle? _confinedParent;
+        private readonly string _tempName;
+        private readonly string _destName;
+
         private bool _completed;
         private bool _disposed;
 
@@ -1368,6 +1450,25 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             _displayPath = displayPath;
             _redact = redact;
             _inner = inner;
+            _confinedParent = null;
+            _tempName = string.Empty;
+            _destName = string.Empty;
+        }
+
+        // POSIX race-free constructor: publish via linkat into the confined parent descriptor.
+        public StagedWriteStream(
+            FileStream inner, SafeFileHandle confinedParent, string tempName, string destName,
+            string destinationDirectory, string displayPath, Func<string, string> redact)
+        {
+            _inner = inner;
+            _confinedParent = confinedParent;
+            _tempName = tempName;
+            _destName = destName;
+            _destinationDirectory = destinationDirectory;
+            _displayPath = displayPath;
+            _redact = redact;
+            _tempPath = string.Empty;
+            _destinationPath = string.Empty;
         }
 
         // RF-8b: a staged-stream write/flush failure (mid-write ENOSPC/EDQUOT/EIO) surfaces ONLY the
@@ -1562,6 +1663,8 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             {
                 CleanupTemp();
             }
+
+            _confinedParent?.Dispose();
         }
 
         protected override void Dispose(bool disposing)
@@ -1580,6 +1683,8 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
                 {
                     CleanupTemp();
                 }
+
+                _confinedParent?.Dispose();
             }
 
             base.Dispose(disposing);
@@ -1632,6 +1737,12 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
 
         private void Publish()
         {
+            if (_confinedParent is not null)
+            {
+                PublishConfined();
+                return;
+            }
+
             bool won;
             try
             {
@@ -1677,6 +1788,56 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             }
         }
 
-        private void CleanupTemp() => TryDelete(_tempPath);
+        private void CleanupTemp()
+        {
+            if (_confinedParent is not null)
+            {
+                UnlinkTemp((int)_confinedParent.DangerousGetHandle(), _tempName);
+            }
+            else
+            {
+                TryDelete(_tempPath);
+            }
+        }
+
+        // POSIX race-free publish: linkat the staged temp into the confined parent descriptor (single-
+        // winner, EEXIST -> AlreadyExists), then fsync the parent descriptor for durability and drop the
+        // temp alias. Mirrors the string-path Publish() semantics (ambiguous-durability, probes, cleanup).
+        private void PublishConfined()
+        {
+            int parentFd = (int)_confinedParent!.DangerousGetHandle();
+            bool won;
+            try
+            {
+                won = TryAtomicPublishAt(parentFd, _tempName, _destName);
+            }
+            catch (Exception ex) when (ex is not DeltaStorageException)
+            {
+                UnlinkTemp(parentFd, _tempName);
+                string detail = string.Create(
+                    CultureInfo.InvariantCulture, $"{ex.GetType().Name}: {_redact(ex.Message)}");
+                throw DeltaStorageException.RetryUnsafeAmbiguous(
+                    string.Create(CultureInfo.InvariantCulture, $"Publishing staged write to '{_displayPath}' failed ambiguously: {detail}"),
+                    new IOException(detail));
+            }
+
+            if (!won)
+            {
+                UnlinkTemp(parentFd, _tempName);
+                throw DeltaStorageException.AlreadyExists(
+                    $"Cannot publish staged write: destination '{_displayPath}' already exists.");
+            }
+
+            CommitStepProbe?.Invoke("publish");
+            CommitStepProbe?.Invoke("dir-fsync");
+            bool durable = FsyncDirFd(parentFd, _destinationDirectory);
+            UnlinkTemp(parentFd, _tempName);
+            if (!durable)
+            {
+                throw DeltaStorageException.RetryUnsafeAmbiguous(
+                    $"Staged write to '{_displayPath}' published but the directory entry could not be "
+                    + "made durable; the outcome is ambiguous and must be re-resolved.");
+            }
+        }
     }
 }

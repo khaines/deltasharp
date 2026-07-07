@@ -209,7 +209,8 @@ internal static class ConfinedFileSystem
         }
 
         long mtimeSeconds = BinaryPrimitives.ReadInt64LittleEndian(buffer.Slice(PosixInterop.StatMtimeSecOffset, 8));
-        return DateTimeOffset.FromUnixTimeSeconds(mtimeSeconds).UtcDateTime;
+        long mtimeNanoseconds = BinaryPrimitives.ReadInt64LittleEndian(buffer.Slice(PosixInterop.StatMtimeNsecOffset, 8));
+        return DateTimeOffset.FromUnixTimeSeconds(mtimeSeconds).UtcDateTime.AddTicks(mtimeNanoseconds / 100);
     }
 
     /// <summary>Enumerates the entry <b>names</b> of a confined directory descriptor via

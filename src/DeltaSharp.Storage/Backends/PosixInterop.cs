@@ -131,6 +131,12 @@ internal static partial class PosixInterop
     /// <c>struct stat</c>. macOS <c>48</c>; Linux (glibc x86-64/arm64) <c>88</c>.</summary>
     internal static readonly int StatMtimeSecOffset = IsMac ? 48 : 88;
 
+    /// <summary>Byte offset of <c>st_mtim(e)spec.tv_nsec</c> (an <see cref="long"/>) within
+    /// <c>struct stat</c> — the nanoseconds field immediately follows <c>tv_sec</c> in a 64-bit
+    /// <c>timespec</c>, so it is <see cref="StatMtimeSecOffset"/> + 8 on both platforms. Included so the
+    /// reported mtime matches <see cref="System.IO.FileInfo.LastWriteTimeUtc"/> to sub-second precision.</summary>
+    internal static readonly int StatMtimeNsecOffset = (IsMac ? 48 : 88) + 8;
+
     /// <summary>Size of the <c>struct stat</c> receive buffer — over-allocated (160) to cover macOS
     /// (144) and both Linux ABIs (x86-64 144, arm64 128) so <c>fstat</c> never writes out of bounds.</summary>
     internal const int StatBufferSize = 160;
