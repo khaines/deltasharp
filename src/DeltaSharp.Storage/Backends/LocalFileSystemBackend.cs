@@ -285,11 +285,10 @@ internal sealed class LocalFileSystemBackend : IStorageBackend, IDisposable
         SafeFileHandle? parent = null;
         try
         {
-            Directory.CreateDirectory(directory);
             string rel = ResolveRelative(path);
             ConfinementRaceProbe?.Invoke();
             string[] components = ConfinedFileSystem.SplitConfinedComponents(rel);
-            parent = ConfinedFileSystem.TryOpenParent(
+            parent = ConfinedFileSystem.OpenOrCreateParent(
                 _rootHandle!, components, out string destName, out ConfinedFileSystem.WalkError werr);
             if (parent is null)
             {
@@ -1112,19 +1111,10 @@ internal sealed class LocalFileSystemBackend : IStorageBackend, IDisposable
     {
         string full = Resolve(path); // defense-in-depth pre-check
         string directory = Path.GetDirectoryName(full) ?? _root;
-        try
-        {
-            Directory.CreateDirectory(directory);
-        }
-        catch (Exception ex)
-        {
-            throw SurfaceFailure("Staging conditional-create of", path, ex);
-        }
-
         string rel = ResolveRelative(path);
         ConfinementRaceProbe?.Invoke();
         string[] components = ConfinedFileSystem.SplitConfinedComponents(rel);
-        SafeFileHandle? parent = ConfinedFileSystem.TryOpenParent(
+        SafeFileHandle? parent = ConfinedFileSystem.OpenOrCreateParent(
             _rootHandle!, components, out string destName, out ConfinedFileSystem.WalkError werr);
         if (parent is null)
         {

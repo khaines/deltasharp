@@ -187,6 +187,85 @@ internal static class ConfinedFileSystem
         return new SafeFileHandle((nint)dirfd, ownsHandle: true);
     }
 
+    /// <summary>Like <see cref="TryOpenParent"/>, but <b>creates</b> any missing intermediate directory
+    /// with <c>mkdirat</c> on the confined parent descriptor as it walks (issue #474, S1) — so directory
+    /// creation for a staged/put write is uniformly root-descriptor-relative and can never materialize a
+    /// directory <b>through</b> a symlinked ancestor swapped into the check-to-use window (that component
+    /// fails <c>openat</c>+<see cref="PosixInterop.O_NOFOLLOW"/> with <c>ELOOP</c> →
+    /// <see cref="WalkError.NotConfined"/>, before any out-of-root <c>mkdirat</c>). A concurrent creator
+    /// (<c>EEXIST</c>) is tolerated.</summary>
+    internal static SafeFileHandle? OpenOrCreateParent(
+        SafeFileHandle rootHandle, string[] components, out string leafName, out WalkError error)
+    {
+        leafName = components.Length == 0 ? string.Empty : components[^1];
+        if (components.Length == 0)
+        {
+            error = WalkError.NotConfined;
+            return null;
+        }
+
+        if (components.Length == 1)
+        {
+            error = WalkError.None;
+            return DuplicateAsDirectory(rootHandle, out error);
+        }
+
+        int walkFlags = PosixInterop.O_RDONLY | PosixInterop.O_DIRECTORY | PosixInterop.O_NOFOLLOW | PosixInterop.O_CLOEXEC;
+        int dirfd = (int)rootHandle.DangerousGetHandle();
+        bool ownsDir = false;
+        for (int i = 0; i < components.Length - 1; i++)
+        {
+            int next = PosixInterop.OpenAt(dirfd, components[i], walkFlags, 0);
+            if (next < 0)
+            {
+                int errno = Marshal.GetLastPInvokeError();
+                if (errno == PosixInterop.ENOENT)
+                {
+                    // Create the missing component IN the confined parent descriptor (0777 & umask), then
+                    // open it. mkdirat's mode is non-variadic so it marshals correctly on every platform.
+                    if (PosixInterop.MkdirAt(dirfd, components[i], 0x1FF) != 0)
+                    {
+                        int mkErrno = Marshal.GetLastPInvokeError();
+                        if (mkErrno != PosixInterop.EEXIST)
+                        {
+                            error = ClassifyOpenError(mkErrno);
+                            if (ownsDir)
+                            {
+                                _ = PosixInterop.Close(dirfd);
+                            }
+
+                            return null;
+                        }
+                    }
+
+                    next = PosixInterop.OpenAt(dirfd, components[i], walkFlags, 0);
+                }
+
+                if (next < 0)
+                {
+                    error = ClassifyOpenError(Marshal.GetLastPInvokeError());
+                    if (ownsDir)
+                    {
+                        _ = PosixInterop.Close(dirfd);
+                    }
+
+                    return null;
+                }
+            }
+
+            if (ownsDir)
+            {
+                _ = PosixInterop.Close(dirfd);
+            }
+
+            dirfd = next;
+            ownsDir = true;
+        }
+
+        error = WalkError.None;
+        return new SafeFileHandle((nint)dirfd, ownsHandle: true);
+    }
+
     /// <summary>Reads the last-modified time of an open descriptor via <c>fstat</c>, cross-checking the
     /// decoded <c>st_size</c> against <see cref="RandomAccess.GetLength"/> so a wrong <c>struct stat</c>
     /// layout on an unexpected platform/arch fails closed (throws) instead of returning a garbage time.</summary>
@@ -215,6 +294,11 @@ internal static class ConfinedFileSystem
 
     private static WalkError ClassifyOpenError(int errno)
     {
+        // A symlink component under O_NOFOLLOW is a confinement-escape attempt → not confined. Its errno is
+        // ELOOP when opened WITHOUT O_DIRECTORY (leaf reads), but ENOTDIR when opened WITH O_DIRECTORY (an
+        // intermediate walk component on macOS — the un-followed symlink "is not a directory"), so BOTH map
+        // to NotConfined. A genuine non-symlink file used as an intermediate directory also yields ENOTDIR
+        // and is (indistinguishably, and correctly) rejected fail-closed as not-confined.
         if (errno == PosixInterop.ELOOP || errno == PosixInterop.ENOTDIR)
         {
             return WalkError.NotConfined;

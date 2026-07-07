@@ -182,4 +182,10 @@ internal static partial class PosixInterop
     /// single-winner publish primitive, now anchored to a confined parent descriptor).</summary>
     [LibraryImport("libc", EntryPoint = "linkat", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
     internal static partial int LinkAt(int oldDirfd, string oldPath, int newDirfd, string newPath, int flags);
+
+    /// <summary><c>mkdirat(2)</c> — create directory <paramref name="path"/> relative to
+    /// <paramref name="dirfd"/>. <c>mode</c> is a <b>fixed</b> (non-variadic) argument here, so unlike
+    /// <see cref="OpenAt"/> it marshals correctly on every platform (Apple-silicon included).</summary>
+    [LibraryImport("libc", EntryPoint = "mkdirat", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
+    internal static partial int MkdirAt(int dirfd, string path, uint mode);
 }

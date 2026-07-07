@@ -815,17 +815,17 @@ public sealed class LocalFileSystemBackendTests : IDisposable
     [Fact]
     public async Task StagingSetupFailure_ThroughFileWhereDirectoryExpected_DoesNotLeakAbsolutePath()
     {
-        // RF-8b: a staging-SETUP failure whose framework exception carries the absolute path — here a path
-        // component ("collide") is a FILE, so Directory.CreateDirectory of the parent throws a root-bearing
-        // IOException — must surface ONLY the relative object path, in BOTH .Message and .ToString() (inner
-        // chain). Deterministic + cross-platform + root-safe (NOT permission-based). This exercises the
-        // CreateDirectory-inside-the-catch move AND makes Redact() non-vacuous (ex.Message here really does
-        // contain the root, unlike the create-temp path which is already clean at source).
+        // A staging-SETUP failure where a path component ("collide") is a FILE must surface a CLASSIFIED
+        // error whose .Message and .ToString() (inner chain) exclude the absolute root. On POSIX the
+        // confined openat+O_NOFOLLOW walk opens the intermediate component with O_DIRECTORY, so a non-
+        // directory component fails ENOTDIR — indistinguishable at the syscall level from an un-followed
+        // symlink swapped into that slot — and is rejected fail-closed as PathNotConfined with a
+        // relative-only message (never leaking the root). Deterministic, cross-platform, root-safe.
         await _backend.PutIfAbsentAsync("collide", new byte[] { 1 }, CancellationToken.None); // now a FILE
 
         DeltaStorageException putError = await Assert.ThrowsAsync<DeltaStorageException>(
             () => _backend.PutIfAbsentAsync("collide/obj.json", new byte[] { 2 }, CancellationToken.None).AsTask());
-        Assert.Equal(StorageErrorKind.Transient, putError.Kind);
+        Assert.Equal(StorageErrorKind.PathNotConfined, putError.Kind);
         Assert.DoesNotContain(_root, putError.Message, StringComparison.Ordinal);
         Assert.DoesNotContain(_root, putError.ToString(), StringComparison.Ordinal);
 
@@ -1624,6 +1624,61 @@ public sealed class LocalFileSystemBackendTests : IDisposable
         {
             LocalFileSystemBackend.ConfinementRaceProbe = null;
             try { Directory.Delete(pPath); } catch (IOException) { }
+            Directory.Delete(outsideDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task MkdiratThroughSwappedAncestor_CreatesNoDirectoryOutOfRoot()
+    {
+        // #474 S1: intermediate directory creation for a put/staged write is done via confined mkdirat on
+        // the openat-walked parent descriptor, never Directory.CreateDirectory on a re-resolvable absolute
+        // string. If an in-root ancestor is swapped for an out-of-root symlink in the check-to-use window,
+        // the walk fails closed (PathNotConfined) BEFORE any mkdirat, so no directory is materialized
+        // THROUGH the symlink outside the root. Non-vacuous vs the pre-fix code, whose
+        // Directory.CreateDirectory(absolute) would create <outside>/newdir through the swapped symlink.
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        string outsideDir = Path.Combine(Path.GetDirectoryName(_root)!, $"{Path.GetFileName(_root)}-mkdirat-outside");
+        Directory.CreateDirectory(outsideDir);
+
+        try
+        {
+            string check = Path.Combine(_root, "__symcheck3");
+            Directory.CreateSymbolicLink(check, outsideDir);
+            Directory.Delete(check);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            Directory.Delete(outsideDir, recursive: true);
+            return;
+        }
+
+        string aPath = Path.Combine(_root, "a");
+        Directory.CreateDirectory(aPath); // in-root ancestor exists at pre-check time
+
+        LocalFileSystemBackend.ConfinementRaceProbe = () =>
+        {
+            LocalFileSystemBackend.ConfinementRaceProbe = null; // fire once
+            Directory.Delete(aPath, recursive: true);
+            Directory.CreateSymbolicLink(aPath, outsideDir); // 'a' is now an out-of-root symlink
+        };
+        try
+        {
+            DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+                () => _backend.PutIfAbsentAsync("a/newdir/obj.json", new byte[] { 1 }, CancellationToken.None).AsTask());
+            Assert.Equal(StorageErrorKind.PathNotConfined, error.Kind);
+            Assert.False(
+                Directory.Exists(Path.Combine(outsideDir, "newdir")),
+                "confined mkdirat must not create a directory through the swapped out-of-root symlink");
+        }
+        finally
+        {
+            LocalFileSystemBackend.ConfinementRaceProbe = null;
+            try { Directory.Delete(aPath); } catch (IOException) { }
             Directory.Delete(outsideDir, recursive: true);
         }
     }
