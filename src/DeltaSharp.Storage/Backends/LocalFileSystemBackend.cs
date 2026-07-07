@@ -257,6 +257,11 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         string path, ReadOnlyMemory<byte> content, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        if (!OperatingSystem.IsWindows())
+        {
+            return await PutIfAbsentConfinedUnix(path, content, cancellationToken).ConfigureAwait(false);
+        }
+
         string full = Resolve(path);
         string directory = Path.GetDirectoryName(full) ?? _root;
 
@@ -1000,6 +1005,204 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
     // A synthetic entity tag over size + mtime for descriptor-based Head/List (POSIX has no native ETag).
     private static string MakeETagFromParts(long length, DateTime lastWriteUtc) =>
         string.Create(CultureInfo.InvariantCulture, $"{length:x}-{lastWriteUtc.Ticks:x}");
+
+    // POSIX race-free PutIfAbsentAsync: stage a private temp in the CONFINED parent descriptor and publish
+    // it with linkat into that same descriptor, so neither the temp create nor the single-winner link can
+    // be redirected outside the root by a swapped ancestor (issue #474). Preserves the atomic single-winner
+    // (linkat EEXIST -> false), the ambiguous-durability contract (a linked destination whose directory
+    // entry cannot be made durable -> RetryUnsafeAmbiguous), and the CommitStepProbe / PublishFaultErrnoHook
+    // / FlushToDisk seams.
+    private async ValueTask<bool> PutIfAbsentConfinedUnix(
+        string path, ReadOnlyMemory<byte> content, CancellationToken cancellationToken)
+    {
+        string full = Resolve(path); // defense-in-depth pre-check
+        string directory = Path.GetDirectoryName(full) ?? _root;
+        try
+        {
+            Directory.CreateDirectory(directory);
+        }
+        catch (Exception ex)
+        {
+            throw SurfaceFailure("Staging conditional-create of", path, ex);
+        }
+
+        string rel = ResolveRelative(path);
+        string[] components = ConfinedFileSystem.SplitConfinedComponents(rel);
+        SafeFileHandle? parent = ConfinedFileSystem.TryOpenParent(
+            _rootHandle!, components, out string destName, out ConfinedFileSystem.WalkError werr);
+        if (parent is null)
+        {
+            throw MapWalkError(werr, path);
+        }
+
+        using (parent)
+        {
+            int parentFd = (int)parent.DangerousGetHandle();
+
+            SafeFileHandle tempHandle;
+            string tempName;
+            try
+            {
+                (tempHandle, tempName) = CreateConfinedTemp(parentFd, destName);
+            }
+            catch (Exception ex)
+            {
+                throw SurfaceFailure("Staging conditional-create of", path, ex);
+            }
+
+            try
+            {
+                await using (var staging = new FileStream(tempHandle, FileAccess.Write, bufferSize: 4096, isAsync: false))
+                {
+                    await staging.WriteAsync(content, cancellationToken).ConfigureAwait(false);
+                    FlushToDisk(staging);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                UnlinkTemp(parentFd, tempName);
+                throw;
+            }
+            catch (Exception ex)
+            {
+                UnlinkTemp(parentFd, tempName);
+                throw SurfaceFailure("Staging conditional-create of", path, ex);
+            }
+
+            bool won;
+            try
+            {
+                won = TryAtomicPublishAt(parentFd, tempName, destName);
+            }
+            catch (Exception ex)
+            {
+                UnlinkTemp(parentFd, tempName);
+                string detail = string.Create(CultureInfo.InvariantCulture, $"{ex.GetType().Name}: {Redact(ex.Message)}");
+                throw DeltaStorageException.RetryUnsafeAmbiguous(
+                    string.Create(CultureInfo.InvariantCulture, $"Conditional-create of '{path}' failed ambiguously: {detail}"),
+                    new IOException(detail));
+            }
+
+            if (!won)
+            {
+                UnlinkTemp(parentFd, tempName);
+                return false;
+            }
+
+            CommitStepProbe?.Invoke("publish");
+            CommitStepProbe?.Invoke("dir-fsync");
+            bool durable = FsyncDirFd(parentFd, directory);
+            UnlinkTemp(parentFd, tempName);
+            if (!durable)
+            {
+                throw DeltaStorageException.RetryUnsafeAmbiguous(
+                    $"Conditional-create of '{path}' linked its destination but the directory entry could not "
+                    + "be made durable; the outcome is ambiguous and must be re-resolved.");
+            }
+
+            return true;
+        }
+    }
+
+    // Creates a private staging temp in the confined parent descriptor via O_CREAT|O_EXCL|O_NOFOLLOW (mode
+    // 0600), retrying the ordinal on a name collision without ever deleting a foreign temp.
+    private static (SafeFileHandle Handle, string Name) CreateConfinedTemp(int parentFd, string destName)
+    {
+        for (int attempt = 0; attempt < MaxTempAttempts; attempt++)
+        {
+            string candidate = BuildTempName(destName, Interlocked.Increment(ref _tempCounter), ".put.tmp");
+            int flags = PosixInterop.O_CREAT | PosixInterop.O_EXCL | PosixInterop.O_WRONLY
+                | PosixInterop.O_NOFOLLOW | PosixInterop.O_CLOEXEC;
+            int fd = PosixInterop.OpenAt(parentFd, candidate, flags, 0x180 /* 0600 (unreliable when variadic) */);
+            if (fd >= 0)
+            {
+                // OpenAt's mode is a variadic arg and is unreliable on arm64 macOS, so set 0600 explicitly
+                // via the non-variadic fchmod before the temp is written or published.
+                var handle = new SafeFileHandle((nint)fd, ownsHandle: true);
+                if (PosixInterop.FChmod(fd, 0x180) != 0)
+                {
+                    int chmodErrno = Marshal.GetLastPInvokeError();
+                    handle.Dispose();
+                    _ = PosixInterop.UnlinkAt(parentFd, candidate, 0);
+                    throw new IOException(string.Create(
+                        CultureInfo.InvariantCulture, $"Could not set staging temp '{candidate}' mode (errno {chmodErrno})."));
+                }
+
+                return (handle, candidate);
+            }
+
+            int errno = Marshal.GetLastPInvokeError();
+            if (errno == PosixInterop.EEXIST && attempt < MaxTempAttempts - 1)
+            {
+                continue; // a foreign temp owns this name — retry with a fresh ordinal, never deleting it
+            }
+
+            throw new IOException(string.Create(
+                CultureInfo.InvariantCulture, $"Could not create staging temp '{candidate}' (errno {errno})."));
+        }
+
+        throw new IOException(string.Create(
+            CultureInfo.InvariantCulture,
+            $"Could not create a unique staging temp for '{destName}' after {MaxTempAttempts} attempts."));
+    }
+
+    // linkat single-winner publish anchored to the confined parent descriptor (EEXIST -> lost race), firing
+    // the same "publish" fault + PublishFaultErrnoHook seams as the string-path TryAtomicPublish.
+    private static bool TryAtomicPublishAt(int parentFd, string tempName, string destName)
+    {
+        if (IoFaultHook?.Invoke("publish") is { } injected)
+        {
+            throw injected;
+        }
+
+        int errno;
+        Func<int>? fault = PublishFaultErrnoHook;
+        if (fault is not null)
+        {
+            errno = fault();
+            if (errno == 0)
+            {
+                return true;
+            }
+        }
+        else
+        {
+            if (PosixInterop.LinkAt(parentFd, tempName, parentFd, destName, 0) == 0)
+            {
+                return true;
+            }
+
+            errno = Marshal.GetLastPInvokeError();
+        }
+
+        if (errno == PosixInterop.EEXIST)
+        {
+            return false;
+        }
+
+        throw new IOException(string.Create(
+            CultureInfo.InvariantCulture, $"linkat('{tempName}' -> '{destName}') failed with errno {errno}."));
+    }
+
+    // fsync the confined parent DESCRIPTOR for directory-entry durability, preserving the DirectoryFsync
+    // FsyncHook seam (keyed by directory path for tests) without re-opening a re-resolvable path.
+    private static bool FsyncDirFd(int dirFd, string directoryForHook)
+    {
+        Func<string, int>? hook = DirectoryFsync.FsyncHook;
+        if (hook is not null && hook(directoryForHook) != 0)
+        {
+            return false;
+        }
+
+        return PosixInterop.Fsync(dirFd) == 0;
+    }
+
+    private static void UnlinkTemp(int parentFd, string tempName)
+    {
+        // Best-effort cleanup of the temp alias; an orphan is reclaimed by VACUUM. On POSIX the published
+        // destination is a separate hard link to the same inode, so dropping the temp name never affects it.
+        _ = PosixInterop.UnlinkAt(parentFd, tempName, 0);
+    }
 
     // Canonicalizes an incoming path and confines it to the table root, rejecting fail-closed anything
     // that escapes (absolute-outside-root, ".." traversal, or a symlink whose real target leaves the

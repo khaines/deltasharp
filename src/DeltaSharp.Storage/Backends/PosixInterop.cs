@@ -163,6 +163,14 @@ internal static partial class PosixInterop
     [LibraryImport("libc", EntryPoint = "fstat", SetLastError = true)]
     internal static partial int FStat(int fd, Span<byte> statBuffer);
 
+    /// <summary><c>fchmod(2)</c> — set an open descriptor's permission bits. Used to fix a freshly-created
+    /// temp to 0600 <b>independently of</b> <see cref="OpenAt"/>'s <c>mode</c> argument, which is a
+    /// <b>variadic</b> parameter that a fixed P/Invoke signature cannot pass reliably on Apple-silicon
+    /// (arm64 macOS passes variadic args on the stack, so the register-placed mode is read as garbage).
+    /// <c>fchmod</c> is non-variadic, so its mode marshals correctly on every platform.</summary>
+    [LibraryImport("libc", EntryPoint = "fchmod", SetLastError = true)]
+    internal static partial int FChmod(int fd, uint mode);
+
     /// <summary><c>unlinkat(2)</c> — remove <paramref name="path"/> relative to <paramref name="dirfd"/>.</summary>
     [LibraryImport("libc", EntryPoint = "unlinkat", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
     internal static partial int UnlinkAt(int dirfd, string path, int flags);
