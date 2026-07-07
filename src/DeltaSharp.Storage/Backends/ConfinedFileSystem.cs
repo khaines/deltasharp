@@ -213,42 +213,6 @@ internal static class ConfinedFileSystem
         return DateTimeOffset.FromUnixTimeSeconds(mtimeSeconds).UtcDateTime.AddTicks(mtimeNanoseconds / 100);
     }
 
-    /// <summary>Enumerates the entry <b>names</b> of a confined directory descriptor via
-    /// <c>fdopendir</c>/<c>readdir</c> (reading only <c>d_name</c>), skipping <c>.</c> and <c>..</c>. The
-    /// <c>DIR*</c> takes ownership of the descriptor, so the caller must transfer (not dispose) the
-    /// handle it walked; this method closes it via <c>closedir</c>.</summary>
-    internal static List<string> ReadDirectoryNames(int dirFd)
-    {
-        var names = new List<string>();
-        nint dir = PosixInterop.FdOpenDir(dirFd);
-        if (dir == nint.Zero)
-        {
-            _ = PosixInterop.Close(dirFd);
-            throw DeltaStorageException.Transient($"fdopendir failed (errno {Marshal.GetLastPInvokeError()}).");
-        }
-
-        try
-        {
-            nint entry;
-            while ((entry = PosixInterop.ReadDir(dir)) != nint.Zero)
-            {
-                string name = Marshal.PtrToStringUTF8(entry + PosixInterop.DirentNameOffset) ?? string.Empty;
-                if (name.Length == 0 || name is "." or "..")
-                {
-                    continue;
-                }
-
-                names.Add(name);
-            }
-        }
-        finally
-        {
-            _ = PosixInterop.CloseDir(dir);
-        }
-
-        return names;
-    }
-
     private static WalkError ClassifyOpenError(int errno)
     {
         if (errno == PosixInterop.ELOOP || errno == PosixInterop.ENOTDIR)

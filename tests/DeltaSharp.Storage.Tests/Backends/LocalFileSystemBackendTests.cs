@@ -1495,6 +1495,67 @@ public sealed class LocalFileSystemBackendTests : IDisposable
     }
 
     [Fact]
+    public async Task SymlinkSwapInCheckToUseWindow_IsRejectedByOpenat_WithoutLeakingOutOfRoot()
+    {
+        // #474 (the load-bearing race-free enforcement): an adversary swaps an in-root directory for an
+        // out-of-root symlink in the check-to-use window — AFTER the confinement pre-check, BEFORE the
+        // open. The openat + O_NOFOLLOW walk (not the now-stale pre-check) must fail closed with
+        // PathNotConfined and never surface the out-of-root target's data. Non-vacuous: dropping O_NOFOLLOW
+        // would follow the swapped symlink and read the decoy (a cross-root leak) — the exact residual
+        // TOCTOU a canonicalize-then-open confinement leaves open.
+        if (OperatingSystem.IsWindows())
+        {
+            return; // openat/O_NOFOLLOW is the POSIX enforcement; Windows retains canonicalize confinement.
+        }
+
+        string outsideDir = Path.Combine(Path.GetDirectoryName(_root)!, $"{Path.GetFileName(_root)}-swap-outside");
+        Directory.CreateDirectory(outsideDir);
+        await File.WriteAllTextAsync(Path.Combine(outsideDir, "f"), "OUT-OF-ROOT-SECRET");
+
+        string dPath = Path.Combine(_root, "d");
+
+        // Verify symlink creation is permitted on this run; else the swap cannot be staged and the guard
+        // cannot be exercised here.
+        try
+        {
+            string probe = Path.Combine(_root, "__symcheck");
+            Directory.CreateSymbolicLink(probe, outsideDir);
+            Directory.Delete(probe);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            Directory.Delete(outsideDir, recursive: true);
+            return;
+        }
+
+        // In-root legit tree: d/ (a real directory) containing f (the requested object). The pre-check
+        // sees this legit state and passes; the swap then happens before the openat walk.
+        Directory.CreateDirectory(dPath);
+        await _backend.PutIfAbsentAsync("d/f", System.Text.Encoding.UTF8.GetBytes("in-root"), CancellationToken.None);
+
+        LocalFileSystemBackend.ConfinementRaceProbe = () =>
+        {
+            LocalFileSystemBackend.ConfinementRaceProbe = null; // fire once
+            Directory.Delete(dPath, recursive: true);
+            Directory.CreateSymbolicLink(dPath, outsideDir); // 'd' is now an out-of-root symlink
+        };
+        try
+        {
+            DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+                () => _backend.OpenReadAsync("d/f", CancellationToken.None).AsTask());
+            Assert.Equal(StorageErrorKind.PathNotConfined, error.Kind);
+            Assert.DoesNotContain(_root, error.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain("OUT-OF-ROOT-SECRET", error.ToString(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            LocalFileSystemBackend.ConfinementRaceProbe = null;
+            try { Directory.Delete(dPath); } catch (IOException) { } // remove the symlink entry
+            try { Directory.Delete(outsideDir, recursive: true); } catch (IOException) { }
+        }
+    }
+
+    [Fact]
     public async Task ReadOpenFault_ViaIoFaultHook_DoesNotLeakAbsolutePath()
     {
         // Q1 (Quality): the read-open sanitizer (OpenReadAsync / ReadRangeAsync open) is made non-vacuous

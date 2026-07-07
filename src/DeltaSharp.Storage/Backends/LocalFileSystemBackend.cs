@@ -8,30 +8,37 @@ namespace DeltaSharp.Storage.Backends;
 /// <summary>
 /// The PVC/POSIX (local file system) <see cref="IStorageBackend"/> (design §2.13.2 "PVC (POSIX)"
 /// column, STORY-05.1.3 / #182). Every operation is <b>confined to a configured table-root
-/// directory</b>: each user- or log-supplied path is canonicalized and any path that escapes the
-/// root — an absolute path outside it, a <c>..</c> traversal, or a <b>symlink whose real target
-/// leaves the root</b> — is rejected fail-closed with
-/// <see cref="StorageErrorKind.PathNotConfined"/> (design §5.5 C-SCOPE / LOG-E, checklist 14).
+/// directory</b>: each user- or log-supplied path is rejected fail-closed with
+/// <see cref="StorageErrorKind.PathNotConfined"/> if it escapes the root — an absolute path outside
+/// it, a <c>..</c> traversal, or a <b>symlink whose target leaves the root</b> (design §5.5 C-SCOPE /
+/// LOG-E, checklist 14). On POSIX the confinement is <b>race-free</b> (see remarks); on Windows it is
+/// the lexical + real-target (canonicalize-then-open) check.
 /// </summary>
 /// <remarks>
 /// <para>The commit primitive <see cref="PutIfAbsentAsync"/> stages content to a private temp file,
 /// <c>fsync</c>s it, then publishes it as the <b>atomic single-winner</b>: on POSIX via
-/// <c>link()</c> (which fails atomically with <c>EEXIST</c> when the destination exists), on Windows
-/// via <see cref="File.Move(string, string, bool)"/> with <c>overwrite: false</c>. Under a concurrent
-/// race exactly one caller wins; the losers get <see langword="false"/>, never an exception, and a
-/// failed/cancelled attempt can only ever leave an orphan temp file — never a partial destination
-/// (design §2.11.1, §2.13.2).</para>
+/// <c>linkat()</c> into the confined parent descriptor (which fails atomically with <c>EEXIST</c> when
+/// the destination exists), on Windows via <see cref="File.Move(string, string, bool)"/> with
+/// <c>overwrite: false</c>. Under a concurrent race exactly one caller wins; the losers get
+/// <see langword="false"/>, never an exception, and a failed/cancelled attempt can only ever leave an
+/// orphan temp file — never a partial destination (design §2.11.1, §2.13.2).</para>
 /// <para>Staged writes (<see cref="OpenWriteAsync"/>) write to a temporary file and publish it
 /// atomically <b>only when the caller signals success</b> via
 /// <see cref="ICompletableWriteStream.CompleteAsync"/>; disposing without completing discards the
 /// staged bytes and never publishes a torn destination (design §2.13.2).</para>
-/// <para><b>Residual TOCTOU:</b> symlink confinement resolves each path's real target at the moment
-/// it is checked. An adversary who can swap an in-root directory for an out-of-root symlink
-/// <i>between</i> the check and the subsequent <c>open</c> could still race the filesystem; a fully
-/// race-free guarantee requires <c>openat</c>/<c>O_NOFOLLOW</c> primitives that are a tracked
-/// follow-up. The lexical + real-target check closes the common log-supplied-path escape.</para>
+/// <para><b>Race-free confinement (POSIX, issue #474).</b> Every operation resolves its path by
+/// walking one component at a time with <c>openat(2)</c> + <see cref="PosixInterop.O_NOFOLLOW"/> from a
+/// long-lived table-root directory descriptor, and then operates on the returned <b>descriptor</b>
+/// (read/stat/list) or on a component name relative to a confined <b>parent</b> descriptor
+/// (create/link/unlink) — never on a re-resolvable path string. A component swapped for a symlink at
+/// any point (including in the check-to-use window an adversary would exploit) fails the open with
+/// <c>ELOOP</c>, so the previously-documented residual TOCTOU is <b>closed</b>: there is no
+/// check-to-use window for read/list/publish. A cheap lexical + canonicalize pre-check still runs first
+/// as defense-in-depth (fast classified reject + §5.5 sanitization), but the <c>openat</c> walk is the
+/// load-bearing enforcement. Windows retains the canonicalize-then-open confinement (no
+/// <c>openat</c>/<c>O_NOFOLLOW</c> equivalent; NTFS reparse-point semantics differ).</para>
 /// </remarks>
-internal sealed class LocalFileSystemBackend : IStorageBackend
+internal sealed class LocalFileSystemBackend : IStorageBackend, IDisposable
 {
     private readonly string _root;
     private readonly string _rootWithSeparator;
@@ -94,6 +101,12 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
     // exception flows into that site's EXISTING sanitizing catch.
     internal static volatile Func<string, Exception?>? IoFaultHook;
 
+    // Test-only seam (issue #474): fired AFTER the Resolve pre-check but BEFORE the race-free openat walk,
+    // so a test can swap an in-root directory for an out-of-root symlink in the exact check-to-use window
+    // and prove the openat + O_NOFOLLOW walk — not the (now-stale) pre-check — is what fails closed. Null
+    // and inert in production.
+    internal static volatile Action? ConfinementRaceProbe;
+
     /// <summary>Creates a backend confined to <paramref name="tableRoot"/>. The directory is created if
     /// it does not exist so the backend is usable immediately.</summary>
     /// <exception cref="ArgumentException"><paramref name="tableRoot"/> is null or empty.</exception>
@@ -123,6 +136,11 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         // PERF: bind Redact once for reuse by every staged write (see _redactDelegate).
         _redactDelegate = Redact;
     }
+
+    /// <summary>Releases the long-lived table-root directory descriptor used for POSIX race-free
+    /// confinement (null/no-op on Windows). The <see cref="SafeFileHandle"/> finalizer also reclaims it if
+    /// the backend is not disposed, so a missed dispose leaks no descriptor.</summary>
+    public void Dispose() => _rootHandle?.Dispose();
 
     /// <inheritdoc/>
     public async ValueTask<Stream> ReadRangeAsync(
@@ -926,6 +944,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         // the §5.5 LOG-E path-sanitization on the hot path; the openat + O_NOFOLLOW walk below is the
         // load-bearing RACE-FREE enforcement that also catches a component swapped in after this check.
         _ = Resolve(path);
+        ConfinementRaceProbe?.Invoke();
         string rel = ResolveRelative(path);
         string[] components = ConfinedFileSystem.SplitConfinedComponents(rel);
         SafeFileHandle? handle = ConfinedFileSystem.TryOpenLeaf(

@@ -141,11 +141,6 @@ internal static partial class PosixInterop
     /// (144) and both Linux ABIs (x86-64 144, arm64 128) so <c>fstat</c> never writes out of bounds.</summary>
     internal const int StatBufferSize = 160;
 
-    /// <summary>Byte offset of <c>d_name</c> within <c>struct dirent</c>. macOS <c>21</c>; Linux <c>19</c>.
-    /// <c>d_name</c> is a NUL-terminated name; only it is read (never the platform-variant numeric
-    /// fields).</summary>
-    internal static readonly int DirentNameOffset = IsMac ? 21 : 19;
-
     [LibraryImport("libc", EntryPoint = "open", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
     internal static partial int Open(string path, int flags);
 
@@ -187,18 +182,4 @@ internal static partial class PosixInterop
     /// single-winner publish primitive, now anchored to a confined parent descriptor).</summary>
     [LibraryImport("libc", EntryPoint = "linkat", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
     internal static partial int LinkAt(int oldDirfd, string oldPath, int newDirfd, string newPath, int flags);
-
-    /// <summary><c>fdopendir(3)</c> — turn a directory descriptor into a <c>DIR*</c> stream for
-    /// <see cref="ReadDir"/>. The stream owns the descriptor and closes it on <see cref="CloseDir"/>.</summary>
-    [LibraryImport("libc", EntryPoint = "fdopendir", SetLastError = true)]
-    internal static partial nint FdOpenDir(int fd);
-
-    /// <summary><c>readdir(3)</c> — next entry (a <c>struct dirent*</c>) from a <c>DIR*</c>, or
-    /// <see cref="nint.Zero"/> at end of stream. Only <c>d_name</c> is read.</summary>
-    [LibraryImport("libc", EntryPoint = "readdir", SetLastError = true)]
-    internal static partial nint ReadDir(nint dir);
-
-    /// <summary><c>closedir(3)</c> — close a <c>DIR*</c> and its underlying descriptor.</summary>
-    [LibraryImport("libc", EntryPoint = "closedir", SetLastError = true)]
-    internal static partial int CloseDir(nint dir);
 }
