@@ -255,6 +255,15 @@ public sealed class DeltaLogActionWriterTests
     }
 
     [Fact]
+    public void SerializeCommit_RejectsUnknownActionType()
+    {
+        // The action switch fails closed on an unmodeled DeltaAction subtype rather than emitting nothing.
+        var ex = Assert.Throws<ArgumentException>(() =>
+            DeltaLogActionWriter.SerializeCommit(new DeltaAction[] { new UnknownTestAction() }));
+        Assert.Contains("UnknownTestAction", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void SerializesOneActionPerLine_NewlineDelimited()
     {
         // Commit files are newline-delimited JSON, one action per line (design §2.10.2).
@@ -312,4 +321,6 @@ public sealed class DeltaLogActionWriterTests
         var parsedTxn = Assert.IsType<TxnAction>(actions[2]);
         Assert.Null(parsedTxn.LastUpdated);
     }
+
+    private sealed record UnknownTestAction : DeltaAction;
 }

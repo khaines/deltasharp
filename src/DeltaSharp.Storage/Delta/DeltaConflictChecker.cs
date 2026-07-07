@@ -68,26 +68,8 @@ internal static class DeltaConflictChecker
         // hard conflict, checked before any rebase so shared-appId blind appends never both commit).
         CheckConcurrentTransaction(loserActions, winnerActions);
 
-        // (4) Read-scope-driven data conflicts.
-        switch (readScope)
-        {
-            case DeltaReadScope.BlindAppendScope:
-                // Empty read set: no data conflict is possible (only the metadata/protocol/txn cases above).
-                return;
-
-            case DeltaReadScope.WholeTableScope:
-                CheckWholeTable(winnerActions);
-                return;
-
-            case DeltaReadScope.ReadFilesScope readFiles:
-                CheckReadFiles(readFiles, winnerActions);
-                return;
-
-            default:
-                // Defensive: an unmodeled scope must fail closed rather than silently allow a rebase.
-                throw new ConcurrentAppendException(
-                    $"Commit read scope '{readScope.GetType().Name}' is not recognized; failing closed on a concurrent commit.");
-        }
+        // (4) Read-scope-driven data conflicts — each scope owns its overlap rule (§2.11.2).
+        readScope.CheckDataConflict(winnerActions);
     }
 
     private static void CheckConcurrentTransaction(
@@ -113,45 +95,6 @@ internal static class DeltaConflictChecker
             {
                 throw new ConcurrentTransactionException(
                     $"A concurrent commit recorded a transaction for appId '{winnerTxn.AppId}' since this writer's read snapshot; the commit was aborted to preserve idempotency.");
-            }
-        }
-    }
-
-    private static void CheckWholeTable(IReadOnlyList<DeltaAction> winnerActions)
-    {
-        // A whole-table read (overwrite / unpartitioned delete) depends on every active file, so any
-        // concurrent add lands in scope and any concurrent remove deleted a file it read.
-        if (winnerActions.Any(a => a is AddFileAction))
-        {
-            throw new ConcurrentAppendException(
-                "A concurrent commit added files to the table since this overwrite/whole-table writer's read snapshot; the commit was aborted.");
-        }
-
-        if (winnerActions.Any(a => a is RemoveFileAction))
-        {
-            throw new ConcurrentDeleteReadException(
-                "A concurrent commit removed files this overwrite/whole-table writer read since its read snapshot; the commit was aborted.");
-        }
-    }
-
-    private static void CheckReadFiles(DeltaReadScope.ReadFilesScope readFiles, IReadOnlyList<DeltaAction> winnerActions)
-    {
-        // A targeted read (delete/merge over a named file set) conflicts when a winner removed a file it
-        // read (read-precedence ⇒ ConcurrentDeleteRead) or re-added one of those exact paths.
-        foreach (DeltaAction action in winnerActions)
-        {
-            switch (action)
-            {
-                case RemoveFileAction remove when readFiles.Paths.Contains(remove.Path):
-                    throw new ConcurrentDeleteReadException(
-                        $"A concurrent commit removed file '{remove.Path}', which this writer read, since its read snapshot; the commit was aborted.");
-
-                case AddFileAction add when readFiles.Paths.Contains(add.Path):
-                    throw new ConcurrentAppendException(
-                        $"A concurrent commit re-added file '{add.Path}', which this writer read, since its read snapshot; the commit was aborted.");
-
-                default:
-                    break;
             }
         }
     }
