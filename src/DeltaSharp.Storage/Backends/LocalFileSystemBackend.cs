@@ -1,41 +1,55 @@
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 
 namespace DeltaSharp.Storage.Backends;
 
 /// <summary>
 /// The PVC/POSIX (local file system) <see cref="IStorageBackend"/> (design §2.13.2 "PVC (POSIX)"
 /// column, STORY-05.1.3 / #182). Every operation is <b>confined to a configured table-root
-/// directory</b>: each user- or log-supplied path is canonicalized and any path that escapes the
-/// root — an absolute path outside it, a <c>..</c> traversal, or a <b>symlink whose real target
-/// leaves the root</b> — is rejected fail-closed with
-/// <see cref="StorageErrorKind.PathNotConfined"/> (design §5.5 C-SCOPE / LOG-E, checklist 14).
+/// directory</b>: each user- or log-supplied path is rejected fail-closed with
+/// <see cref="StorageErrorKind.PathNotConfined"/> if it escapes the root — an absolute path outside
+/// it, a <c>..</c> traversal, or a <b>symlink whose target leaves the root</b> (design §5.5 C-SCOPE /
+/// LOG-E, checklist 14). On POSIX the confinement is <b>race-free</b> (see remarks); on Windows it is
+/// the lexical + real-target (canonicalize-then-open) check.
 /// </summary>
 /// <remarks>
 /// <para>The commit primitive <see cref="PutIfAbsentAsync"/> stages content to a private temp file,
 /// <c>fsync</c>s it, then publishes it as the <b>atomic single-winner</b>: on POSIX via
-/// <c>link()</c> (which fails atomically with <c>EEXIST</c> when the destination exists), on Windows
-/// via <see cref="File.Move(string, string, bool)"/> with <c>overwrite: false</c>. Under a concurrent
-/// race exactly one caller wins; the losers get <see langword="false"/>, never an exception, and a
-/// failed/cancelled attempt can only ever leave an orphan temp file — never a partial destination
-/// (design §2.11.1, §2.13.2).</para>
+/// <c>linkat()</c> into the confined parent descriptor (which fails atomically with <c>EEXIST</c> when
+/// the destination exists), on Windows via <see cref="File.Move(string, string, bool)"/> with
+/// <c>overwrite: false</c>. Under a concurrent race exactly one caller wins; the losers get
+/// <see langword="false"/>, never an exception, and a failed/cancelled attempt can only ever leave an
+/// orphan temp file — never a partial destination (design §2.11.1, §2.13.2).</para>
 /// <para>Staged writes (<see cref="OpenWriteAsync"/>) write to a temporary file and publish it
 /// atomically <b>only when the caller signals success</b> via
 /// <see cref="ICompletableWriteStream.CompleteAsync"/>; disposing without completing discards the
 /// staged bytes and never publishes a torn destination (design §2.13.2).</para>
-/// <para><b>Residual TOCTOU:</b> symlink confinement resolves each path's real target at the moment
-/// it is checked. An adversary who can swap an in-root directory for an out-of-root symlink
-/// <i>between</i> the check and the subsequent <c>open</c> could still race the filesystem; a fully
-/// race-free guarantee requires <c>openat</c>/<c>O_NOFOLLOW</c> primitives that are a tracked
-/// follow-up. The lexical + real-target check closes the common log-supplied-path escape.</para>
+/// <para><b>Race-free confinement (POSIX, issue #474).</b> Every operation resolves its path by
+/// walking one component at a time with <c>openat(2)</c> + <see cref="PosixInterop.O_NOFOLLOW"/> from a
+/// long-lived table-root directory descriptor, and then operates on the returned <b>descriptor</b>
+/// (read/stat/list) or on a component name relative to a confined <b>parent</b> descriptor
+/// (create/link/unlink) — never on a re-resolvable path string. A component swapped for a symlink at
+/// any point (including in the check-to-use window an adversary would exploit) fails the open with
+/// <c>ELOOP</c>, so the previously-documented residual TOCTOU is <b>closed</b>: there is no
+/// check-to-use window for read/list/publish. A cheap lexical + canonicalize pre-check still runs first
+/// as defense-in-depth (fast classified reject + §5.5 sanitization), but the <c>openat</c> walk is the
+/// load-bearing enforcement. Windows retains the canonicalize-then-open confinement (no
+/// <c>openat</c>/<c>O_NOFOLLOW</c> equivalent; NTFS reparse-point semantics differ).</para>
 /// </remarks>
-internal sealed class LocalFileSystemBackend : IStorageBackend
+internal sealed class LocalFileSystemBackend : IStorageBackend, IDisposable
 {
     private readonly string _root;
     private readonly string _rootWithSeparator;
     private readonly string _realRoot;
     private readonly string _realRootWithSeparator;
+
+    // The long-lived table-root directory descriptor for the race-free (openat + O_NOFOLLOW) confinement
+    // walk on POSIX (issue #474). Null on Windows, which retains the canonicalize-then-open confinement.
+    // The root is trusted (established + canonicalized once at construction), so opening it by absolute
+    // path is not a TOCTOU surface; every subsequent path is resolved relative to this descriptor.
+    private readonly SafeFileHandle? _rootHandle;
 
     // PERF: Redact is handed to every StagedWriteStream; binding the instance method once avoids
     // allocating a fresh method-group delegate on each OpenWriteAsync call.
@@ -87,6 +101,12 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
     // exception flows into that site's EXISTING sanitizing catch.
     internal static volatile Func<string, Exception?>? IoFaultHook;
 
+    // Test-only seam (issue #474): fired AFTER the Resolve pre-check but BEFORE the race-free openat walk,
+    // so a test can swap an in-root directory for an out-of-root symlink in the exact check-to-use window
+    // and prove the openat + O_NOFOLLOW walk — not the (now-stale) pre-check — is what fails closed. Null
+    // and inert in production.
+    internal static volatile Action? ConfinementRaceProbe;
+
     /// <summary>Creates a backend confined to <paramref name="tableRoot"/>. The directory is created if
     /// it does not exist so the backend is usable immediately.</summary>
     /// <exception cref="ArgumentException"><paramref name="tableRoot"/> is null or empty.</exception>
@@ -107,9 +127,20 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         _realRoot = CanonicalizeExisting(_root);
         _realRootWithSeparator = _realRoot + Path.DirectorySeparatorChar;
 
+        // On POSIX, pin the real root as a directory descriptor for race-free confinement (issue #474).
+        if (!OperatingSystem.IsWindows())
+        {
+            _rootHandle = ConfinedFileSystem.OpenRoot(_realRoot);
+        }
+
         // PERF: bind Redact once for reuse by every staged write (see _redactDelegate).
         _redactDelegate = Redact;
     }
+
+    /// <summary>Releases the long-lived table-root directory descriptor used for POSIX race-free
+    /// confinement (null/no-op on Windows). The <see cref="SafeFileHandle"/> finalizer also reclaims it if
+    /// the backend is not disposed, so a missed dispose leaks no descriptor.</summary>
+    public void Dispose() => _rootHandle?.Dispose();
 
     /// <inheritdoc/>
     public async ValueTask<Stream> ReadRangeAsync(
@@ -117,11 +148,6 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
     {
         ArgumentOutOfRangeException.ThrowIfNegative(offset);
         ArgumentOutOfRangeException.ThrowIfNegative(length);
-        string full = Resolve(path);
-        if (!File.Exists(full))
-        {
-            throw DeltaStorageException.NotFound($"Object '{path}' does not exist.");
-        }
 
         FileStream source;
         try
@@ -132,8 +158,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
                 throw fault;
             }
 
-            source = new FileStream(
-                full, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 4096, useAsync: true);
+            source = OpenConfinedRead(path);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -202,12 +227,6 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
     public ValueTask<Stream> OpenReadAsync(string path, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        string full = Resolve(path);
-        if (!File.Exists(full))
-        {
-            throw DeltaStorageException.NotFound($"Object '{path}' does not exist.");
-        }
-
         try
         {
             Func<string, Exception?>? faultHook = IoFaultHook;
@@ -216,8 +235,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
                 throw fault;
             }
 
-            Stream stream = new FileStream(
-                full, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 4096, useAsync: true);
+            Stream stream = OpenConfinedRead(path);
             return ValueTask.FromResult(stream);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -231,6 +249,11 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
     public ValueTask<Stream> OpenWriteAsync(string path, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        if (!OperatingSystem.IsWindows())
+        {
+            return OpenWriteConfinedUnix(path);
+        }
+
         string full = Resolve(path);
         string directory = Path.GetDirectoryName(full) ?? _root;
 
@@ -252,11 +275,53 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         return ValueTask.FromResult(stream);
     }
 
+    // POSIX race-free staged write: stage a private temp in the CONFINED parent descriptor; the returned
+    // stream publishes it with linkat into that same descriptor on CompleteAsync (issue #474).
+    private ValueTask<Stream> OpenWriteConfinedUnix(string path)
+    {
+        string full = Resolve(path); // defense-in-depth pre-check
+        string directory = Path.GetDirectoryName(full) ?? _root;
+
+        SafeFileHandle? parent = null;
+        try
+        {
+            string rel = ResolveRelative(path);
+            ConfinementRaceProbe?.Invoke();
+            string[] components = ConfinedFileSystem.SplitConfinedComponents(rel);
+            parent = ConfinedFileSystem.OpenOrCreateParent(
+                _rootHandle!, components, out string destName, out ConfinedFileSystem.WalkError werr);
+            if (parent is null)
+            {
+                throw MapWalkError(werr, path);
+            }
+
+            (SafeFileHandle tempHandle, string tempName) = CreateConfinedTemp((int)parent.DangerousGetHandle(), destName);
+            var inner = new FileStream(tempHandle, FileAccess.Write, bufferSize: 4096, isAsync: false);
+            Stream stream = new StagedWriteStream(inner, parent, tempName, destName, directory, path, _redactDelegate);
+            return ValueTask.FromResult(stream);
+        }
+        catch (DeltaStorageException)
+        {
+            parent?.Dispose();
+            throw;
+        }
+        catch (Exception ex)
+        {
+            parent?.Dispose();
+            throw SurfaceFailure("Opening a staged write for", path, ex);
+        }
+    }
+
     /// <inheritdoc/>
     public async ValueTask<bool> PutIfAbsentAsync(
         string path, ReadOnlyMemory<byte> content, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        if (!OperatingSystem.IsWindows())
+        {
+            return await PutIfAbsentConfinedUnix(path, content, cancellationToken).ConfigureAwait(false);
+        }
+
         string full = Resolve(path);
         string directory = Path.GetDirectoryName(full) ?? _root;
 
@@ -503,23 +568,9 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
                 continue;
             }
 
-            StorageObjectInfo entry;
-            try
+            StorageObjectInfo? entry = ReadListEntryMetadata(realFile);
+            if (entry is null)
             {
-                Func<string, Exception?>? faultHook = IoFaultHook;
-                if (faultHook?.Invoke("list-meta") is { } fault)
-                {
-                    throw fault;
-                }
-
-                var info = new FileInfo(realFile);
-                entry = new StorageObjectInfo(
-                    ToRelativeReal(realFile), info.Length, info.LastWriteTimeUtc, MakeETag(info));
-            }
-            catch (Exception ex) when (ex is FileNotFoundException or IOException or UnauthorizedAccessException)
-            {
-                // S3: the object vanished between enumeration and this metadata read (a delete race), so
-                // its FileInfo throws FileNotFoundException; skip it rather than leak a raw path.
                 continue;
             }
 
@@ -527,10 +578,61 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         }
     }
 
+    // Reads a confirmed-confined list entry's metadata. On POSIX this is race-free: the metadata is read
+    // from a descriptor reached by an openat + O_NOFOLLOW walk, so a symlink swapped in between the
+    // confinement check above and this read cannot leak an out-of-root Length/mtime (it fails the walk and
+    // the entry is skipped). On Windows the FileInfo stat is retained. Returns null to skip a vanished or
+    // now-unconfined entry rather than aborting the listing.
+    private StorageObjectInfo? ReadListEntryMetadata(string realFile)
+    {
+        try
+        {
+            Func<string, Exception?>? faultHook = IoFaultHook;
+            if (faultHook?.Invoke("list-meta") is { } fault)
+            {
+                throw fault;
+            }
+
+            if (OperatingSystem.IsWindows())
+            {
+                var info = new FileInfo(realFile);
+                return new StorageObjectInfo(
+                    ToRelativeReal(realFile), info.Length, info.LastWriteTimeUtc, MakeETag(info));
+            }
+
+            string relKey = ToRelativeReal(realFile);
+            string[] components = ConfinedFileSystem.SplitConfinedComponents(relKey);
+            SafeFileHandle? handle = ConfinedFileSystem.TryOpenLeaf(
+                _rootHandle!, components, PosixInterop.O_RDONLY, 0, out _);
+            if (handle is null)
+            {
+                return null; // vanished or became a symlink between confinement and this read — skip
+            }
+
+            using (handle)
+            {
+                long length = RandomAccess.GetLength(handle);
+                DateTime mtime = ConfinedFileSystem.GetLastModifiedUtc(handle, length);
+                return new StorageObjectInfo(relKey, length, mtime, MakeETagFromParts(length, mtime));
+            }
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or IOException or UnauthorizedAccessException or DeltaStorageException)
+        {
+            // S3: the object vanished (delete race) or its metadata read failed; skip it rather than leak
+            // a raw path or abort the listing.
+            return null;
+        }
+    }
+
     /// <inheritdoc/>
     public ValueTask DeleteAsync(string path, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        if (!OperatingSystem.IsWindows())
+        {
+            return DeleteConfinedUnix(path);
+        }
+
         string full = Resolve(path);
         try
         {
@@ -560,6 +662,11 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
     public ValueTask<StorageObjectInfo?> HeadAsync(string path, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        if (!OperatingSystem.IsWindows())
+        {
+            return HeadConfinedUnix(path);
+        }
+
         string full = Resolve(path);
         if (!File.Exists(full))
         {
@@ -798,6 +905,391 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             new IOException(detail));
     }
 
+    // Resolves a path to its root-relative form using the cheap lexical gate only (reject absolute-
+    // outside-root and ".." traversal). On POSIX the symlink/real-target gate that Resolve performs is
+    // REPLACED by the race-free openat + O_NOFOLLOW walk (strictly stronger — it closes the check-to-use
+    // window), so only the lexical portion is needed here to derive the components to walk.
+    private string ResolveRelative(string path, bool allowRoot = false)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        string combined = Path.IsPathFullyQualified(path) ? path : Path.Combine(_root, path);
+        string full = Path.TrimEndingDirectorySeparator(Path.GetFullPath(combined));
+
+        bool isRoot = string.Equals(full, _root, StringComparison.Ordinal);
+        bool isUnderRoot = full.StartsWith(_rootWithSeparator, StringComparison.Ordinal);
+        if (!isUnderRoot && !(allowRoot && isRoot))
+        {
+            throw DeltaStorageException.PathNotConfined(
+                $"Path '{path}' escapes the confined table root and is rejected.");
+        }
+
+        return isRoot ? string.Empty : full[_rootWithSeparator.Length..];
+    }
+
+    // Maps a confinement-walk failure to the deterministic storage error the backend contract promises.
+    private static DeltaStorageException MapWalkError(ConfinedFileSystem.WalkError error, string path) => error switch
+    {
+        ConfinedFileSystem.WalkError.NotFound => DeltaStorageException.NotFound($"Object '{path}' does not exist."),
+        ConfinedFileSystem.WalkError.NotConfined => DeltaStorageException.PathNotConfined(
+            $"Path '{path}' resolves through a symlink to a location outside the confined table root and is rejected."),
+        _ => DeltaStorageException.Transient($"Resolving '{path}' failed."),
+    };
+
+    // Race-free confined open of a leaf (POSIX): walks each component with openat + O_NOFOLLOW from the
+    // root descriptor and returns the leaf descriptor, mapping ELOOP/ENOTDIR (a symlink swap) to
+    // PathNotConfined and ENOENT to NotFound. Caller must be on the non-Windows path.
+    private SafeFileHandle OpenConfinedLeaf(string path, int leafFlags, uint mode = 0)
+    {
+        // Defense-in-depth: the lexical + canonicalize pre-check rejects obvious escapes early and keeps
+        // the §5.5 LOG-E path-sanitization on the hot path; the openat + O_NOFOLLOW walk below is the
+        // load-bearing RACE-FREE enforcement that also catches a component swapped in after this check.
+        _ = Resolve(path);
+        ConfinementRaceProbe?.Invoke();
+        string rel = ResolveRelative(path);
+        string[] components = ConfinedFileSystem.SplitConfinedComponents(rel);
+        SafeFileHandle? handle = ConfinedFileSystem.TryOpenLeaf(
+            _rootHandle!, components, leafFlags, mode, out ConfinedFileSystem.WalkError error);
+        return handle ?? throw MapWalkError(error, path);
+    }
+
+    // Opens a confined read stream over an existing object. On POSIX this is race-free (openat +
+    // O_NOFOLLOW component walk from the root descriptor), so a symlink swapped in after any check still
+    // cannot redirect the open outside the root (issue #474). On Windows the existing canonicalize-then-
+    // open confinement is retained. Throws NotFound for a missing object and PathNotConfined for an escape.
+    private FileStream OpenConfinedRead(string path)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            string full = Resolve(path);
+            if (!File.Exists(full))
+            {
+                throw DeltaStorageException.NotFound($"Object '{path}' does not exist.");
+            }
+
+            return new FileStream(
+                full, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 4096, useAsync: true);
+        }
+
+        SafeFileHandle handle = OpenConfinedLeaf(path, PosixInterop.O_RDONLY);
+        return new FileStream(handle, FileAccess.Read, bufferSize: 4096, isAsync: false);
+    }
+
+    // POSIX race-free HeadAsync: reach the leaf by an openat + O_NOFOLLOW walk, then read size (via the
+    // descriptor, not a re-resolvable path) and mtime (fstat, size-cross-checked). A missing object is
+    // reported as null; a symlink-swap escape as PathNotConfined.
+    private ValueTask<StorageObjectInfo?> HeadConfinedUnix(string path)
+    {
+        try
+        {
+            Func<string, Exception?>? faultHook = IoFaultHook;
+            if (faultHook?.Invoke("head-meta") is { } injected)
+            {
+                throw injected;
+            }
+
+            // Defense-in-depth pre-check (see OpenConfinedLeaf); openat below is the race-free enforcement.
+            _ = Resolve(path);
+            string rel = ResolveRelative(path);
+            string[] components = ConfinedFileSystem.SplitConfinedComponents(rel);
+            SafeFileHandle? handle = ConfinedFileSystem.TryOpenLeaf(
+                _rootHandle!, components, PosixInterop.O_RDONLY, 0, out ConfinedFileSystem.WalkError error);
+            if (handle is null)
+            {
+                return error == ConfinedFileSystem.WalkError.NotFound
+                    ? ValueTask.FromResult<StorageObjectInfo?>(null)
+                    : throw MapWalkError(error, path);
+            }
+
+            using (handle)
+            {
+                long length = RandomAccess.GetLength(handle);
+                DateTime lastWriteUtc = ConfinedFileSystem.GetLastModifiedUtc(handle, length);
+                return ValueTask.FromResult<StorageObjectInfo?>(
+                    new StorageObjectInfo(rel, length, lastWriteUtc, MakeETagFromParts(length, lastWriteUtc)));
+            }
+        }
+        catch (FileNotFoundException)
+        {
+            // Parity with the Windows path: a vanished object (e.g. an injected head-meta fault modelling a
+            // delete race) is reported as "not found" (null), not surfaced.
+            return ValueTask.FromResult<StorageObjectInfo?>(null);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw SurfaceFailure("Reading metadata for", path, ex);
+        }
+    }
+
+    // POSIX race-free DeleteAsync: reach the leaf's confined PARENT descriptor by an openat + O_NOFOLLOW
+    // walk, then unlinkat the leaf name relative to it. Idempotent: a missing leaf or missing parent is a
+    // no-op; a symlink-swap escape is PathNotConfined.
+    private ValueTask DeleteConfinedUnix(string path)
+    {
+        try
+        {
+            Func<string, Exception?>? faultHook = IoFaultHook;
+            if (faultHook?.Invoke("delete") is { } fault)
+            {
+                throw fault;
+            }
+
+            // Defense-in-depth pre-check (see OpenConfinedLeaf); openat below is the race-free enforcement.
+            _ = Resolve(path);
+            ConfinementRaceProbe?.Invoke();
+            string rel = ResolveRelative(path);
+            string[] components = ConfinedFileSystem.SplitConfinedComponents(rel);
+            SafeFileHandle? parent = ConfinedFileSystem.TryOpenParent(
+                _rootHandle!, components, out string leafName, out ConfinedFileSystem.WalkError error);
+            if (parent is null)
+            {
+                // A missing parent means the object is already gone — idempotent no-op.
+                return error == ConfinedFileSystem.WalkError.NotFound
+                    ? ValueTask.CompletedTask
+                    : throw MapWalkError(error, path);
+            }
+
+            using (parent)
+            {
+                int parentFd = (int)parent.DangerousGetHandle();
+
+                // Reject a symlink leaf, uniform with read/head (O_NOFOLLOW): operating on a symlink is an
+                // escape attempt. unlinkat itself never follows a symlink, so this probe only enforces that
+                // policy — a swapped-in symlink would at worst have its in-root entry removed, never an
+                // out-of-root target, so confinement holds regardless of the probe→unlink window.
+                int probe = PosixInterop.OpenAt(
+                    parentFd, leafName, PosixInterop.O_RDONLY | PosixInterop.O_NOFOLLOW | PosixInterop.O_CLOEXEC, 0);
+                if (probe < 0)
+                {
+                    int probeErrno = Marshal.GetLastPInvokeError();
+                    if (probeErrno == PosixInterop.ENOENT)
+                    {
+                        return ValueTask.CompletedTask; // idempotent
+                    }
+
+                    if (probeErrno == PosixInterop.ELOOP || probeErrno == PosixInterop.ENOTDIR)
+                    {
+                        throw MapWalkError(ConfinedFileSystem.WalkError.NotConfined, path);
+                    }
+
+                    throw SurfaceFailure("Deleting", path, new IOException($"openat failed (errno {probeErrno})."));
+                }
+
+                _ = PosixInterop.Close(probe);
+
+                if (PosixInterop.UnlinkAt(parentFd, leafName, 0) != 0)
+                {
+                    int errno = Marshal.GetLastPInvokeError();
+                    if (errno == PosixInterop.ENOENT)
+                    {
+                        return ValueTask.CompletedTask; // idempotent
+                    }
+
+                    throw SurfaceFailure("Deleting", path, new IOException($"unlinkat failed (errno {errno})."));
+                }
+            }
+
+            return ValueTask.CompletedTask;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw SurfaceFailure("Deleting", path, ex);
+        }
+    }
+
+    // A synthetic entity tag over size + mtime for descriptor-based Head/List (POSIX has no native ETag).
+    private static string MakeETagFromParts(long length, DateTime lastWriteUtc) =>
+        string.Create(CultureInfo.InvariantCulture, $"{length:x}-{lastWriteUtc.Ticks:x}");
+
+    // POSIX race-free PutIfAbsentAsync: stage a private temp in the CONFINED parent descriptor and publish
+    // it with linkat into that same descriptor, so neither the temp create nor the single-winner link can
+    // be redirected outside the root by a swapped ancestor (issue #474). Preserves the atomic single-winner
+    // (linkat EEXIST -> false), the ambiguous-durability contract (a linked destination whose directory
+    // entry cannot be made durable -> RetryUnsafeAmbiguous), and the CommitStepProbe / PublishFaultErrnoHook
+    // / FlushToDisk seams.
+    private async ValueTask<bool> PutIfAbsentConfinedUnix(
+        string path, ReadOnlyMemory<byte> content, CancellationToken cancellationToken)
+    {
+        string full = Resolve(path); // defense-in-depth pre-check
+        string directory = Path.GetDirectoryName(full) ?? _root;
+        string rel = ResolveRelative(path);
+        ConfinementRaceProbe?.Invoke();
+        string[] components = ConfinedFileSystem.SplitConfinedComponents(rel);
+        SafeFileHandle? parent = ConfinedFileSystem.OpenOrCreateParent(
+            _rootHandle!, components, out string destName, out ConfinedFileSystem.WalkError werr);
+        if (parent is null)
+        {
+            throw MapWalkError(werr, path);
+        }
+
+        using (parent)
+        {
+            int parentFd = (int)parent.DangerousGetHandle();
+
+            SafeFileHandle tempHandle;
+            string tempName;
+            try
+            {
+                (tempHandle, tempName) = CreateConfinedTemp(parentFd, destName);
+            }
+            catch (Exception ex)
+            {
+                throw SurfaceFailure("Staging conditional-create of", path, ex);
+            }
+
+            try
+            {
+                await using (var staging = new FileStream(tempHandle, FileAccess.Write, bufferSize: 4096, isAsync: false))
+                {
+                    await staging.WriteAsync(content, cancellationToken).ConfigureAwait(false);
+                    FlushToDisk(staging);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                UnlinkTemp(parentFd, tempName);
+                throw;
+            }
+            catch (Exception ex)
+            {
+                UnlinkTemp(parentFd, tempName);
+                throw SurfaceFailure("Staging conditional-create of", path, ex);
+            }
+
+            bool won;
+            try
+            {
+                won = TryAtomicPublishAt(parentFd, tempName, destName);
+            }
+            catch (Exception ex)
+            {
+                UnlinkTemp(parentFd, tempName);
+                string detail = string.Create(CultureInfo.InvariantCulture, $"{ex.GetType().Name}: {Redact(ex.Message)}");
+                throw DeltaStorageException.RetryUnsafeAmbiguous(
+                    string.Create(CultureInfo.InvariantCulture, $"Conditional-create of '{path}' failed ambiguously: {detail}"),
+                    new IOException(detail));
+            }
+
+            if (!won)
+            {
+                UnlinkTemp(parentFd, tempName);
+                return false;
+            }
+
+            CommitStepProbe?.Invoke("publish");
+            CommitStepProbe?.Invoke("dir-fsync");
+            bool durable = FsyncDirFd(parentFd, directory);
+            UnlinkTemp(parentFd, tempName);
+            if (!durable)
+            {
+                throw DeltaStorageException.RetryUnsafeAmbiguous(
+                    $"Conditional-create of '{path}' linked its destination but the directory entry could not "
+                    + "be made durable; the outcome is ambiguous and must be re-resolved.");
+            }
+
+            return true;
+        }
+    }
+
+    // Creates a private staging temp in the confined parent descriptor via O_CREAT|O_EXCL|O_NOFOLLOW (mode
+    // 0600), retrying the ordinal on a name collision without ever deleting a foreign temp.
+    private static (SafeFileHandle Handle, string Name) CreateConfinedTemp(int parentFd, string destName)
+    {
+        for (int attempt = 0; attempt < MaxTempAttempts; attempt++)
+        {
+            string candidate = BuildTempName(destName, Interlocked.Increment(ref _tempCounter), ".put.tmp");
+            int flags = PosixInterop.O_CREAT | PosixInterop.O_EXCL | PosixInterop.O_WRONLY
+                | PosixInterop.O_NOFOLLOW | PosixInterop.O_CLOEXEC;
+            int fd = PosixInterop.OpenAt(parentFd, candidate, flags, 0x180 /* 0600 (unreliable when variadic) */);
+            if (fd >= 0)
+            {
+                // OpenAt's mode is a variadic arg and is unreliable on arm64 macOS, so set 0600 explicitly
+                // via the non-variadic fchmod before the temp is written or published.
+                var handle = new SafeFileHandle((nint)fd, ownsHandle: true);
+                if (PosixInterop.FChmod(fd, 0x180) != 0)
+                {
+                    int chmodErrno = Marshal.GetLastPInvokeError();
+                    handle.Dispose();
+                    _ = PosixInterop.UnlinkAt(parentFd, candidate, 0);
+                    throw new IOException(string.Create(
+                        CultureInfo.InvariantCulture, $"Could not set staging temp '{candidate}' mode (errno {chmodErrno})."));
+                }
+
+                return (handle, candidate);
+            }
+
+            int errno = Marshal.GetLastPInvokeError();
+            if (errno == PosixInterop.EEXIST && attempt < MaxTempAttempts - 1)
+            {
+                continue; // a foreign temp owns this name — retry with a fresh ordinal, never deleting it
+            }
+
+            throw new IOException(string.Create(
+                CultureInfo.InvariantCulture, $"Could not create staging temp '{candidate}' (errno {errno})."));
+        }
+
+        throw new IOException(string.Create(
+            CultureInfo.InvariantCulture,
+            $"Could not create a unique staging temp for '{destName}' after {MaxTempAttempts} attempts."));
+    }
+
+    // linkat single-winner publish anchored to the confined parent descriptor (EEXIST -> lost race), firing
+    // the same "publish" fault + PublishFaultErrnoHook seams as the string-path TryAtomicPublish.
+    private static bool TryAtomicPublishAt(int parentFd, string tempName, string destName)
+    {
+        if (IoFaultHook?.Invoke("publish") is { } injected)
+        {
+            throw injected;
+        }
+
+        int errno;
+        Func<int>? fault = PublishFaultErrnoHook;
+        if (fault is not null)
+        {
+            errno = fault();
+            if (errno == 0)
+            {
+                return true;
+            }
+        }
+        else
+        {
+            if (PosixInterop.LinkAt(parentFd, tempName, parentFd, destName, 0) == 0)
+            {
+                return true;
+            }
+
+            errno = Marshal.GetLastPInvokeError();
+        }
+
+        if (errno == PosixInterop.EEXIST)
+        {
+            return false;
+        }
+
+        throw new IOException(string.Create(
+            CultureInfo.InvariantCulture, $"linkat('{tempName}' -> '{destName}') failed with errno {errno}."));
+    }
+
+    // fsync the confined parent DESCRIPTOR for directory-entry durability, preserving the DirectoryFsync
+    // FsyncHook seam (keyed by directory path for tests) without re-opening a re-resolvable path.
+    private static bool FsyncDirFd(int dirFd, string directoryForHook)
+    {
+        Func<string, int>? hook = DirectoryFsync.FsyncHook;
+        if (hook is not null && hook(directoryForHook) != 0)
+        {
+            return false;
+        }
+
+        return PosixInterop.Fsync(dirFd) == 0;
+    }
+
+    private static void UnlinkTemp(int parentFd, string tempName)
+    {
+        // Best-effort cleanup of the temp alias; an orphan is reclaimed by VACUUM. On POSIX the published
+        // destination is a separate hard link to the same inode, so dropping the temp name never affects it.
+        _ = PosixInterop.UnlinkAt(parentFd, tempName, 0);
+    }
+
     // Canonicalizes an incoming path and confines it to the table root, rejecting fail-closed anything
     // that escapes (absolute-outside-root, ".." traversal, or a symlink whose real target leaves the
     // root). This is the LOG-E control (§5.5): it runs for EVERY path, whether user- or log-supplied.
@@ -946,6 +1438,14 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
         private readonly string _destinationDirectory;
         private readonly string _displayPath;
         private readonly Func<string, string> _redact;
+
+        // POSIX race-free publish (issue #474): when set, publication uses linkat into this CONFINED parent
+        // descriptor (not a re-resolvable string path). The stream owns the descriptor for its lifetime and
+        // disposes it. Null on Windows, which keeps the string-path TryAtomicPublish.
+        private readonly SafeFileHandle? _confinedParent;
+        private readonly string _tempName;
+        private readonly string _destName;
+
         private bool _completed;
         private bool _disposed;
 
@@ -962,6 +1462,25 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             _displayPath = displayPath;
             _redact = redact;
             _inner = inner;
+            _confinedParent = null;
+            _tempName = string.Empty;
+            _destName = string.Empty;
+        }
+
+        // POSIX race-free constructor: publish via linkat into the confined parent descriptor.
+        public StagedWriteStream(
+            FileStream inner, SafeFileHandle confinedParent, string tempName, string destName,
+            string destinationDirectory, string displayPath, Func<string, string> redact)
+        {
+            _inner = inner;
+            _confinedParent = confinedParent;
+            _tempName = tempName;
+            _destName = destName;
+            _destinationDirectory = destinationDirectory;
+            _displayPath = displayPath;
+            _redact = redact;
+            _tempPath = string.Empty;
+            _destinationPath = string.Empty;
         }
 
         // RF-8b: a staged-stream write/flush failure (mid-write ENOSPC/EDQUOT/EIO) surfaces ONLY the
@@ -1156,6 +1675,8 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             {
                 CleanupTemp();
             }
+
+            _confinedParent?.Dispose();
         }
 
         protected override void Dispose(bool disposing)
@@ -1174,6 +1695,8 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
                 {
                     CleanupTemp();
                 }
+
+                _confinedParent?.Dispose();
             }
 
             base.Dispose(disposing);
@@ -1226,6 +1749,12 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
 
         private void Publish()
         {
+            if (_confinedParent is not null)
+            {
+                PublishConfined();
+                return;
+            }
+
             bool won;
             try
             {
@@ -1271,6 +1800,56 @@ internal sealed class LocalFileSystemBackend : IStorageBackend
             }
         }
 
-        private void CleanupTemp() => TryDelete(_tempPath);
+        private void CleanupTemp()
+        {
+            if (_confinedParent is not null)
+            {
+                UnlinkTemp((int)_confinedParent.DangerousGetHandle(), _tempName);
+            }
+            else
+            {
+                TryDelete(_tempPath);
+            }
+        }
+
+        // POSIX race-free publish: linkat the staged temp into the confined parent descriptor (single-
+        // winner, EEXIST -> AlreadyExists), then fsync the parent descriptor for durability and drop the
+        // temp alias. Mirrors the string-path Publish() semantics (ambiguous-durability, probes, cleanup).
+        private void PublishConfined()
+        {
+            int parentFd = (int)_confinedParent!.DangerousGetHandle();
+            bool won;
+            try
+            {
+                won = TryAtomicPublishAt(parentFd, _tempName, _destName);
+            }
+            catch (Exception ex) when (ex is not DeltaStorageException)
+            {
+                UnlinkTemp(parentFd, _tempName);
+                string detail = string.Create(
+                    CultureInfo.InvariantCulture, $"{ex.GetType().Name}: {_redact(ex.Message)}");
+                throw DeltaStorageException.RetryUnsafeAmbiguous(
+                    string.Create(CultureInfo.InvariantCulture, $"Publishing staged write to '{_displayPath}' failed ambiguously: {detail}"),
+                    new IOException(detail));
+            }
+
+            if (!won)
+            {
+                UnlinkTemp(parentFd, _tempName);
+                throw DeltaStorageException.AlreadyExists(
+                    $"Cannot publish staged write: destination '{_displayPath}' already exists.");
+            }
+
+            CommitStepProbe?.Invoke("publish");
+            CommitStepProbe?.Invoke("dir-fsync");
+            bool durable = FsyncDirFd(parentFd, _destinationDirectory);
+            UnlinkTemp(parentFd, _tempName);
+            if (!durable)
+            {
+                throw DeltaStorageException.RetryUnsafeAmbiguous(
+                    $"Staged write to '{_displayPath}' published but the directory entry could not be "
+                    + "made durable; the outcome is ambiguous and must be re-resolved.");
+            }
+        }
     }
 }
