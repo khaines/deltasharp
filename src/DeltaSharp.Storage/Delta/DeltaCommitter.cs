@@ -191,18 +191,19 @@ internal sealed class DeltaCommitter
                 return new DeltaCommitResult(target, attempt + 1);
             }
 
-            // Idempotent self-check (§2.11.6 "after commit, before ack"): our own durable-but-unacknowledged
-            // commit can surface as a lost race — a lost ack routed here as LostToOther, or a HEAD that lagged
-            // the durable put and drove a SlotFree retry that now loses. If <target> is OUR commit, succeed
-            // idempotently; never rebase past our own commit (which would double-commit at target+1).
-            if (await CommittedByUsAsync(target, nonce, cancellationToken).ConfigureAwait(false))
+            // Definite conflict: read the winners over (baseVersion, M], classify, then rebase or abort. The
+            // read (not a separate existence probe) also nonce-checks each winner: if our own durable-but-
+            // unacknowledged commit surfaced here as a "winner" (a lost ack, or a HEAD/GET that lagged the
+            // durable put), succeed idempotently rather than rebasing past it — which would double-commit at
+            // target+1 (§2.11.6). Doing the check on the SAME read that classifies winners makes it robust to
+            // an intra-attempt visibility flap (no two disagreeing existence probes).
+            (long latest, IReadOnlyList<DeltaAction> winners, long? ownCommitVersion) =
+                await ReadWinnersAsync(baseVersion, nonce, cancellationToken).ConfigureAwait(false);
+            if (ownCommitVersion is { } ourVersion)
             {
-                return new DeltaCommitResult(target, attempt + 1);
+                return new DeltaCommitResult(ourVersion, attempt + 1);
             }
 
-            // Definite conflict: read the winners over (baseVersion, M], classify, then rebase or abort.
-            (long latest, IReadOnlyList<DeltaAction> winners) =
-                await ReadWinnersAsync(baseVersion, cancellationToken).ConfigureAwait(false);
             DeltaConflictChecker.Check(actions, readScope, winners); // throws on a logical conflict
             baseVersion = latest; // safe: rebase onto M and retry with the same nonce-stable bytes.
         }
@@ -216,18 +217,27 @@ internal sealed class DeltaCommitter
             $"The commit did not converge within {_maxAttempts} attempts under sustained concurrent writers; it did not land — retry from a fresh snapshot.");
     }
 
-    /// <summary>Reads and concatenates the actions of every commit over <c>(afterExclusive, M]</c> — the
-    /// winners since the read snapshot — returning the latest version <c>M</c> and their actions. The walk
-    /// terminates at the first absent version; it is bounded in practice by the backend's finite, monotonic
-    /// commit log (the same contract that makes the log the source of truth).</summary>
-    private async Task<(long Latest, IReadOnlyList<DeltaAction> Winners)> ReadWinnersAsync(
-        long afterExclusive, CancellationToken cancellationToken)
+    /// <summary>Reads the actions of every commit over <c>(afterExclusive, M]</c> — the winners since the
+    /// read snapshot — returning the latest version <c>M</c>, their concatenated actions, and the version
+    /// that carries <paramref name="nonce"/> if <b>our own</b> commit is among them (a durable-but-
+    /// unacknowledged commit surfacing as a winner, §2.11.6). Nonce-checking here — on the same read that
+    /// classifies winners — is robust to an intra-attempt visibility flap. The walk terminates at the first
+    /// absent version; it is bounded in practice by the backend's finite, monotonic commit log.</summary>
+    private async Task<(long Latest, IReadOnlyList<DeltaAction> Winners, long? OwnCommitVersion)> ReadWinnersAsync(
+        long afterExclusive, string nonce, CancellationToken cancellationToken)
     {
         var winners = new List<DeltaAction>();
+        long? ownCommitVersion = null;
         long version = afterExclusive + 1;
         while (await CommitVisibleAsync(version, cancellationToken).ConfigureAwait(false))
         {
-            winners.AddRange(await ReadCommitAsync(version, cancellationToken).ConfigureAwait(false));
+            IReadOnlyList<DeltaAction> commit = await ReadCommitAsync(version, cancellationToken).ConfigureAwait(false);
+            if (ownCommitVersion is null && CommitCarriesNonce(commit, nonce))
+            {
+                ownCommitVersion = version;
+            }
+
+            winners.AddRange(commit);
             version++;
         }
 
@@ -241,21 +251,7 @@ internal sealed class DeltaCommitter
                 $"The commit at version {afterExclusive + 1} was rejected as already-existing, but no commit at that version is visible.");
         }
 
-        return (latest, winners);
-    }
-
-    /// <summary>Whether the commit at <paramref name="version"/> exists and carries this attempt's
-    /// <paramref name="nonce"/> — i.e. it is <b>our own</b> durable commit surfacing as a lost race
-    /// (§2.11.6). Fails closed (propagates) if the version cannot be read after transient retries.</summary>
-    private async Task<bool> CommittedByUsAsync(long version, string nonce, CancellationToken cancellationToken)
-    {
-        if (!await CommitVisibleAsync(version, cancellationToken).ConfigureAwait(false))
-        {
-            return false;
-        }
-
-        IReadOnlyList<DeltaAction> committed = await ReadCommitAsync(version, cancellationToken).ConfigureAwait(false);
-        return CommitCarriesNonce(committed, nonce);
+        return (latest, winners, ownCommitVersion);
     }
 
     private Task<bool> CommitVisibleAsync(long version, CancellationToken cancellationToken) =>

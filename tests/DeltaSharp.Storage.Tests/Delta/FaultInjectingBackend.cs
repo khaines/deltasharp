@@ -13,6 +13,7 @@ internal sealed class FaultInjectingBackend : IStorageBackend
     private readonly IStorageBackend _inner;
     private int _putCalls;
     private int _transientPutsThrown;
+    private int _flapHeadsDone;
     private bool _failHead;
     private bool _failRead;
 
@@ -46,6 +47,11 @@ internal sealed class FaultInjectingBackend : IStorageBackend
     /// <summary>The number of leading put-if-absent invocations that raise a transient failure before any
     /// real put (drives the §2.11.3 bounded transient-retry path).</summary>
     public int TransientPutCalls { get; init; }
+
+    /// <summary>The number of leading <c>Head</c> calls that report the object <b>absent</b> even when it
+    /// exists — a read-after-write visibility flap. Combined with <see cref="PerformPutBeforeLie"/> this
+    /// models a durable-but-invisible own commit (the intra-attempt visibility flap the red-team found).</summary>
+    public int FlapHeadCalls { get; init; }
 
     public async ValueTask<bool> PutIfAbsentAsync(string path, ReadOnlyMemory<byte> content, CancellationToken cancellationToken)
     {
@@ -94,6 +100,12 @@ internal sealed class FaultInjectingBackend : IStorageBackend
         if (_failHead)
         {
             throw new DeltaStorageException(StorageErrorKind.Transient, "injected persistent re-GET head failure.");
+        }
+
+        if (_flapHeadsDone < FlapHeadCalls)
+        {
+            _flapHeadsDone++;
+            return ValueTask.FromResult<StorageObjectInfo?>(null); // visibility flap: exists, but reported absent.
         }
 
         return _inner.HeadAsync(path, cancellationToken);

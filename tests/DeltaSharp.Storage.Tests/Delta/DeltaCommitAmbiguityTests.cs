@@ -119,6 +119,31 @@ public sealed class DeltaCommitAmbiguityTests : IDisposable
     }
 
     [Fact]
+    public async Task IntraAttemptVisibilityFlap_NeverDoubleCommits()
+    {
+        // The red-team's CRITICAL: our commit lands but the put reports lost, AND a HEAD flaps to "absent"
+        // just after (a read-after-write violation). The winners read now nonce-checks its own content on the
+        // SAME read that classifies winners, so the flap can never surface our commit as a foreign winner and
+        // rebase past it. The outcome is fail-closed (unknown-state) — NEVER a double-commit at v2.
+        Snapshot snapshot = await SeedAndLoadAsync();
+        var faulty = new FaultInjectingBackend(_backend)
+        {
+            LieLostOnPutCall = 0,
+            PerformPutBeforeLie = true, // our commit lands at v1...
+            FlapHeadCalls = 1, // ...but the first HEAD reports it absent (flap)
+        };
+
+        await Assert.ThrowsAsync<DeltaCommitUnknownStateException>(() =>
+            new DeltaCommitter(faulty, DeltaCommitter.DefaultMaxAttempts, nonceFactory: null, transientBackoff: NoBackoff)
+                .CommitAsync(snapshot, new DeltaAction[] { Add("part-0.parquet") }, DeltaReadScope.BlindAppend));
+
+        // The crucial invariant: our commit is present exactly once (v1) — it was NOT re-published at v2.
+        Snapshot reloaded = await new DeltaLog(_backend).LoadSnapshotAsync();
+        Assert.Equal(1L, reloaded.Version);
+        Assert.Equal("part-0.parquet", Assert.Single(reloaded.ActiveFiles).Path);
+    }
+
+    [Fact]
     public async Task OwnDurableCommitReportedLost_ResolvesAsSuccess_WithoutDoubleCommit()
     {
         // §2.11.6 "after commit, before ack": our own durable commit surfaces as a *lost race* (put reports
