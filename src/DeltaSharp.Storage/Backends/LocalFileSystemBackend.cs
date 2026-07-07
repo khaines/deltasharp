@@ -287,6 +287,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend, IDisposable
         {
             Directory.CreateDirectory(directory);
             string rel = ResolveRelative(path);
+            ConfinementRaceProbe?.Invoke();
             string[] components = ConfinedFileSystem.SplitConfinedComponents(rel);
             parent = ConfinedFileSystem.TryOpenParent(
                 _rootHandle!, components, out string destName, out ConfinedFileSystem.WalkError werr);
@@ -1035,6 +1036,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend, IDisposable
 
             // Defense-in-depth pre-check (see OpenConfinedLeaf); openat below is the race-free enforcement.
             _ = Resolve(path);
+            ConfinementRaceProbe?.Invoke();
             string rel = ResolveRelative(path);
             string[] components = ConfinedFileSystem.SplitConfinedComponents(rel);
             SafeFileHandle? parent = ConfinedFileSystem.TryOpenParent(
@@ -1120,6 +1122,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend, IDisposable
         }
 
         string rel = ResolveRelative(path);
+        ConfinementRaceProbe?.Invoke();
         string[] components = ConfinedFileSystem.SplitConfinedComponents(rel);
         SafeFileHandle? parent = ConfinedFileSystem.TryOpenParent(
             _rootHandle!, components, out string destName, out ConfinedFileSystem.WalkError werr);

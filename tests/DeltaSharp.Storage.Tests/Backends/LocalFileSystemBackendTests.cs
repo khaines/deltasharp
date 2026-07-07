@@ -42,6 +42,7 @@ public sealed class LocalFileSystemBackendTests : IDisposable
 
     public void Dispose()
     {
+        _backend.Dispose();
         try
         {
             if (Directory.Exists(_root))
@@ -1552,6 +1553,78 @@ public sealed class LocalFileSystemBackendTests : IDisposable
             LocalFileSystemBackend.ConfinementRaceProbe = null;
             try { Directory.Delete(dPath); } catch (IOException) { } // remove the symlink entry
             try { Directory.Delete(outsideDir, recursive: true); } catch (IOException) { }
+        }
+    }
+
+    [Fact]
+    public async Task ParentDirSymlinkSwapInCheckToUseWindow_MutatingOps_RejectedByOpenat()
+    {
+        // #474 (parent-walk enforcement — the mutating ops): the check-to-use race must be closed for the
+        // PARENT walk (TryOpenParent), not just the leaf walk. An adversary swaps an in-root parent
+        // directory 'p' for an out-of-root symlink after the pre-check; Delete/PutIfAbsent/OpenWrite must
+        // fail closed with PathNotConfined so no create/link/unlink lands through the symlink outside the
+        // root. Non-vacuous: dropping O_NOFOLLOW from TryOpenParent's walk lets these ops act through the
+        // symlink (Quality R1 proved the mutation otherwise survived every test).
+        if (OperatingSystem.IsWindows())
+        {
+            return; // openat/O_NOFOLLOW is the POSIX enforcement.
+        }
+
+        string outsideDir = Path.Combine(Path.GetDirectoryName(_root)!, $"{Path.GetFileName(_root)}-parent-outside");
+        Directory.CreateDirectory(outsideDir);
+        await File.WriteAllTextAsync(Path.Combine(outsideDir, "f"), "OUT-OF-ROOT-SECRET");
+
+        try
+        {
+            string check = Path.Combine(_root, "__symcheck2");
+            Directory.CreateSymbolicLink(check, outsideDir);
+            Directory.Delete(check);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            Directory.Delete(outsideDir, recursive: true);
+            return;
+        }
+
+        string pPath = Path.Combine(_root, "p");
+
+        async Task AssertParentSwapRejectedAsync(Func<Task> op)
+        {
+            if (File.Exists(pPath) || Directory.Exists(pPath))
+            {
+                try { Directory.Delete(pPath, recursive: true); } catch (IOException) { File.Delete(pPath); }
+            }
+
+            Directory.CreateDirectory(pPath);
+            await _backend.PutIfAbsentAsync("p/f", new byte[] { 1 }, CancellationToken.None);
+
+            LocalFileSystemBackend.ConfinementRaceProbe = () =>
+            {
+                LocalFileSystemBackend.ConfinementRaceProbe = null; // fire once
+                try { Directory.Delete(pPath, recursive: true); } catch (IOException) { File.Delete(pPath); }
+                Directory.CreateSymbolicLink(pPath, outsideDir); // 'p' is now an out-of-root symlink
+            };
+
+            DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(op);
+            Assert.Equal(StorageErrorKind.PathNotConfined, error.Kind);
+            Assert.DoesNotContain("OUT-OF-ROOT-SECRET", error.ToString(), StringComparison.Ordinal);
+            try { Directory.Delete(pPath); } catch (IOException) { } // remove the symlink entry
+        }
+
+        try
+        {
+            await AssertParentSwapRejectedAsync(() => _backend.DeleteAsync("p/f", CancellationToken.None).AsTask());
+            await AssertParentSwapRejectedAsync(() => _backend.PutIfAbsentAsync("p/g", new byte[] { 2 }, CancellationToken.None).AsTask());
+            await AssertParentSwapRejectedAsync(() => _backend.OpenWriteAsync("p/h", CancellationToken.None).AsTask());
+
+            // The out-of-root secret was never unlinked/overwritten/linked-over by any op.
+            Assert.Equal("OUT-OF-ROOT-SECRET", await File.ReadAllTextAsync(Path.Combine(outsideDir, "f")));
+        }
+        finally
+        {
+            LocalFileSystemBackend.ConfinementRaceProbe = null;
+            try { Directory.Delete(pPath); } catch (IOException) { }
+            Directory.Delete(outsideDir, recursive: true);
         }
     }
 

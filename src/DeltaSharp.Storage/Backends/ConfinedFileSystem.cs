@@ -165,12 +165,12 @@ internal static class ConfinedFileSystem
             int next = PosixInterop.OpenAt(dirfd, components[i], walkFlags, 0);
             if (next < 0)
             {
+                error = ClassifyOpenError(Marshal.GetLastPInvokeError());
                 if (ownsDir)
                 {
                     _ = PosixInterop.Close(dirfd);
                 }
 
-                error = ClassifyOpenError(Marshal.GetLastPInvokeError());
                 return null;
             }
 
