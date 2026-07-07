@@ -1716,6 +1716,63 @@ public sealed class LocalFileSystemBackendTests : IDisposable
     }
 
     [Fact]
+    public async Task LeafSymlinkSwapInCheckToUseWindow_IsRejectedByOpenat_WithoutLeakingOutOfRoot()
+    {
+        // #474 (LEAF enforcement — red-team R4): the check-to-use race must be closed for the LEAF
+        // component too, not just intermediates. An adversary swaps the in-root leaf FILE for an out-of-
+        // root symlink after the pre-check; TryOpenLeaf's final openat + O_NOFOLLOW must fail closed with
+        // PathNotConfined and never read the out-of-root target. Non-vacuous: dropping O_NOFOLLOW from the
+        // leaf openat lets OpenRead follow the swapped symlink and read the out-of-root secret. (The
+        // existing symlink-escape tests are caught by the Resolve pre-check, so they do NOT exercise the
+        // leaf openat — only this in-window leaf swap does.)
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        string outsideDir = Path.Combine(Path.GetDirectoryName(_root)!, $"{Path.GetFileName(_root)}-leaf-outside");
+        Directory.CreateDirectory(outsideDir);
+        string secretPath = Path.Combine(outsideDir, "secret.txt");
+        await File.WriteAllTextAsync(secretPath, "OUT-OF-ROOT-SECRET");
+
+        try
+        {
+            string check = Path.Combine(_root, "__symcheck4");
+            File.CreateSymbolicLink(check, secretPath);
+            File.Delete(check);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            Directory.Delete(outsideDir, recursive: true);
+            return;
+        }
+
+        string leafPath = Path.Combine(_root, "leaftarget");
+        await _backend.PutIfAbsentAsync("leaftarget", System.Text.Encoding.UTF8.GetBytes("in-root"), CancellationToken.None);
+
+        LocalFileSystemBackend.ConfinementRaceProbe = () =>
+        {
+            LocalFileSystemBackend.ConfinementRaceProbe = null; // fire once
+            File.Delete(leafPath);
+            File.CreateSymbolicLink(leafPath, secretPath); // leaf is now an out-of-root symlink
+        };
+        try
+        {
+            DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+                () => _backend.OpenReadAsync("leaftarget", CancellationToken.None).AsTask());
+            Assert.Equal(StorageErrorKind.PathNotConfined, error.Kind);
+            Assert.DoesNotContain("OUT-OF-ROOT-SECRET", error.ToString(), StringComparison.Ordinal);
+            Assert.Equal("OUT-OF-ROOT-SECRET", await File.ReadAllTextAsync(secretPath)); // untouched
+        }
+        finally
+        {
+            LocalFileSystemBackend.ConfinementRaceProbe = null;
+            try { File.Delete(leafPath); } catch (IOException) { }
+            Directory.Delete(outsideDir, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task ReadOpenFault_ViaIoFaultHook_DoesNotLeakAbsolutePath()
     {
         // Q1 (Quality): the read-open sanitizer (OpenReadAsync / ReadRangeAsync open) is made non-vacuous
