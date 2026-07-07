@@ -1684,6 +1684,38 @@ public sealed class LocalFileSystemBackendTests : IDisposable
     }
 
     [Fact]
+    public async Task OpenOrCreateParent_MkdiratFailure_SurfacesClassifiedErrorWithoutLeak()
+    {
+        // #474 (Quality R3): the confined mkdirat's non-EEXIST failure arm — a directory create denied by
+        // EACCES/ENOSPC/EROFS on the confined parent — must surface a CLASSIFIED, non-root-leaking error.
+        // Driven deterministically via the MkdirAtErrnoHook seam (EACCES = 13) so it does not depend on
+        // filesystem permissions or the process uid (root would bypass a real EACCES).
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        ConfinedFileSystem.MkdirAtErrnoHook = () => 13; // EACCES
+        try
+        {
+            DeltaStorageException putError = await Assert.ThrowsAsync<DeltaStorageException>(
+                () => _backend.PutIfAbsentAsync("newparent/obj.json", new byte[] { 1 }, CancellationToken.None).AsTask());
+            Assert.Equal(StorageErrorKind.Transient, putError.Kind);
+            Assert.DoesNotContain(_root, putError.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(_root, putError.ToString(), StringComparison.Ordinal);
+
+            DeltaStorageException openError = await Assert.ThrowsAsync<DeltaStorageException>(
+                () => _backend.OpenWriteAsync("newparent2/obj.parquet", CancellationToken.None).AsTask());
+            Assert.Equal(StorageErrorKind.Transient, openError.Kind);
+            Assert.DoesNotContain(_root, openError.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            ConfinedFileSystem.MkdirAtErrnoHook = null;
+        }
+    }
+
+    [Fact]
     public async Task ReadOpenFault_ViaIoFaultHook_DoesNotLeakAbsolutePath()
     {
         // Q1 (Quality): the read-open sanitizer (OpenReadAsync / ReadRangeAsync open) is made non-vacuous

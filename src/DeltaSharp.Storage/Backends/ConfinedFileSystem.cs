@@ -43,6 +43,12 @@ internal static class ConfinedFileSystem
         Io,
     }
 
+    /// <summary>Test-only seam (mirrors the backend's <c>PublishFaultErrnoHook</c>): when non-null, its
+    /// return value <b>replaces</b> the <c>mkdirat</c> result errno in <see cref="OpenOrCreateParent"/> (0 =
+    /// success) so a test can drive the otherwise hard-to-reach non-<c>EEXIST</c> directory-create failure
+    /// arm (e.g. <c>EACCES</c>) deterministically, on any platform/uid. Null and inert in production.</summary>
+    internal static volatile Func<int>? MkdirAtErrnoHook;
+
     /// <summary>Opens the trusted table-root directory as a long-lived descriptor
     /// (<c>O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC</c>). The root itself is established and canonicalized once at
     /// backend construction, so opening it by absolute path is not a TOCTOU surface; every subsequent
@@ -223,19 +229,28 @@ internal static class ConfinedFileSystem
                 {
                     // Create the missing component IN the confined parent descriptor (0777 & umask), then
                     // open it. mkdirat's mode is non-variadic so it marshals correctly on every platform.
-                    if (PosixInterop.MkdirAt(dirfd, components[i], 0x1FF) != 0)
+                    Func<int>? mkHook = MkdirAtErrnoHook;
+                    int mkErrno;
+                    if (mkHook is not null)
                     {
-                        int mkErrno = Marshal.GetLastPInvokeError();
-                        if (mkErrno != PosixInterop.EEXIST)
-                        {
-                            error = ClassifyOpenError(mkErrno);
-                            if (ownsDir)
-                            {
-                                _ = PosixInterop.Close(dirfd);
-                            }
+                        mkErrno = mkHook(); // test-only: force a mkdirat outcome without touching the filesystem
+                    }
+                    else
+                    {
+                        mkErrno = PosixInterop.MkdirAt(dirfd, components[i], 0x1FF) == 0
+                            ? 0
+                            : Marshal.GetLastPInvokeError();
+                    }
 
-                            return null;
+                    if (mkErrno != 0 && mkErrno != PosixInterop.EEXIST)
+                    {
+                        error = ClassifyOpenError(mkErrno);
+                        if (ownsDir)
+                        {
+                            _ = PosixInterop.Close(dirfd);
                         }
+
+                        return null;
                     }
 
                     next = PosixInterop.OpenAt(dirfd, components[i], walkFlags, 0);
