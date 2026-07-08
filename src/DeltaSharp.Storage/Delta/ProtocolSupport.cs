@@ -38,6 +38,64 @@ internal static class ProtocolSupport
     /// <summary>The advanced reader features this build implements — none, in the v1 baseline.</summary>
     public static readonly ImmutableHashSet<string> SupportedReaderFeatures = ImmutableHashSet<string>.Empty;
 
+    /// <summary>The absolute basic writer protocol version (no writer features).</summary>
+    public const int BasicWriterVersion = 1;
+
+    /// <summary>The highest legacy (non-table-features) writer protocol version this build will write to.
+    /// Writer version 2 gates <c>appendOnly</c> + column <c>invariants</c>; a commit writer that only ever
+    /// <b>adds</b> files trivially satisfies <c>appendOnly</c>, and invariant/constraint enforcement is a
+    /// later story (schema enforcement, #190) that raises this as it lands.</summary>
+    public const int MaxBasicWriterVersion = 2;
+
+    /// <summary>The "table features" writer protocol version (features enumerated in <c>writerFeatures</c>).</summary>
+    public const int TableFeaturesWriterVersion = 7;
+
+    /// <summary>The advanced writer features this build implements — none, in the v1 baseline (so a
+    /// table-features table is writable only when it requires <b>no</b> writer feature).</summary>
+    public static readonly ImmutableHashSet<string> SupportedWriterFeatures = ImmutableHashSet<string>.Empty;
+
+    /// <summary>
+    /// Verifies the table's <paramref name="protocol"/> is <b>writable</b> by this build before a commit is
+    /// published, else throws a precise <see cref="DeltaProtocolException"/> (kind
+    /// <see cref="DeltaProtocolErrorKind.UnsupportedProtocol"/>). This is the writer half of protocol
+    /// negotiation (design §2.11 / §2.14 P3): a commit must never proceed against a
+    /// <c>minWriterVersion</c> or named <c>writerFeatures</c> whose write-time semantics this build does not
+    /// enforce (for example generated columns, constraints, change-data-feed, column mapping) — doing so
+    /// risks silently corrupting the table (checklist <c>ACID</c> bullet 6; anti-pattern: never write past
+    /// an unsupported writer feature).
+    ///
+    /// <para><b>v1 baseline.</b> Writer versions 1–2 (basic + <c>appendOnly</c>/invariants era) are writable,
+    /// and writer version 7 ("table features") is writable only when it requires <b>no</b> writer feature;
+    /// every other writer version and any named writer feature fails closed. This mirrors the reader
+    /// baseline (<see cref="EnsureReadable"/>) and is deliberately conservative — being <i>stricter</i> than
+    /// Delta on an unimplemented feature never yields a wrong write.</para>
+    /// </summary>
+    /// <exception cref="DeltaProtocolException">The writer version is unsupported, or a required writer
+    /// feature is not implemented (fail closed).</exception>
+    public static void EnsureWritable(ProtocolAction protocol)
+    {
+        ArgumentNullException.ThrowIfNull(protocol);
+
+        int version = protocol.MinWriterVersion;
+        if (version == TableFeaturesWriterVersion)
+        {
+            ImmutableArray<string> unsupported = protocol.WriterFeatures
+                .Where(feature => !SupportedWriterFeatures.Contains(feature))
+                .ToImmutableArray();
+            if (unsupported.Length > 0)
+            {
+                throw DeltaProtocolException.UnsupportedFeatures("writer", unsupported);
+            }
+
+            return;
+        }
+
+        if (version is < BasicWriterVersion or > MaxBasicWriterVersion)
+        {
+            throw DeltaProtocolException.UnsupportedVersion("writer", version, MaxBasicWriterVersion);
+        }
+    }
+
     /// <summary>
     /// Verifies the table's <paramref name="protocol"/> is readable by this build, else throws a precise
     /// <see cref="DeltaProtocolException"/> (kind <see cref="DeltaProtocolErrorKind.UnsupportedProtocol"/>).

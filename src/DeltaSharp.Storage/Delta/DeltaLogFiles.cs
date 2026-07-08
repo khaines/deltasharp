@@ -14,6 +14,19 @@ internal static class DeltaLogFiles
 {
     internal const int VersionDigits = 20;
 
+    /// <summary>The <c>_delta_log/</c> prefix under a table root where commit files and checkpoints live.</summary>
+    internal const string LogPrefix = "_delta_log/";
+
+    /// <summary>The zero-padded 20-digit version string Delta uses for log file names (e.g. version 7 ⇒
+    /// <c>00000000000000000007</c>).</summary>
+    public static string FormatVersion(long version) =>
+        version.ToString(CultureInfo.InvariantCulture).PadLeft(VersionDigits, '0');
+
+    /// <summary>The backend-relative path of the JSON commit file for <paramref name="version"/>
+    /// (<c>_delta_log/&lt;20-digit&gt;.json</c>) — the object the commit primitive conditionally creates
+    /// (design §2.11.1).</summary>
+    public static string CommitPath(long version) => LogPrefix + FormatVersion(version) + ".json";
+
     public static DeltaLogFile Classify(string fileName)
     {
         // Commit: <20-digit>.json
