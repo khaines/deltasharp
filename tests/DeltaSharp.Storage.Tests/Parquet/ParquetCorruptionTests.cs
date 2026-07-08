@@ -233,6 +233,69 @@ public sealed class ParquetCorruptionTests
     }
 
     [Fact]
+    public void DecodeCeiling_RejectsFootprintZeroChunk_MetadataStrippedFooter()
+    {
+        // §5.4 footprint-0 guard: a stripped footer declaring ZERO decompressed bytes while the chunk has
+        // real compressed pages (which Parquet.Net would still decode by offset) is rejected — the declared
+        // ceiling cannot bound it. Non-vacuous: the guard is the only control that fires (ratio/absolute/
+        // row-count all pass a zero-uncompressed chunk).
+        DeltaStorageException error = Assert.Throws<DeltaStorageException>(
+            () => ParquetFileReader.EnsureDecodeCeiling(
+                rowCount: 1024,
+                Footprints(new ParquetFileReader.ColumnChunkFootprint(
+                    CompressedBytes: 32, UncompressedBytes: 0, ElementBytes: 8)),
+                group: 0));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+        Assert.Contains("zero decompressed bytes", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void DecodeCeiling_RejectsFootprintZeroChunk_FullyAbsentMetadata()
+    {
+        // An absent/missing-metadata chunk (both sizes zero) for a non-empty row group is likewise rejected
+        // fail-closed rather than passed through as a "harmless" zero footprint.
+        DeltaStorageException error = Assert.Throws<DeltaStorageException>(
+            () => ParquetFileReader.EnsureDecodeCeiling(
+                rowCount: 8,
+                Footprints(new ParquetFileReader.ColumnChunkFootprint(
+                    CompressedBytes: 0, UncompressedBytes: 0, ElementBytes: 8)),
+                group: 0));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+    }
+
+    [Fact]
+    public void DecodeCeiling_AllowsFootprintZero_WhenRowGroupIsEmpty()
+    {
+        // A genuinely empty row group (zero rows) has nothing to decode, so a zero footprint is fine — the
+        // guard is scoped to rowCount > 0 and must NOT reject an empty group.
+        ParquetFileReader.EnsureDecodeCeiling(
+            rowCount: 0,
+            Footprints(new ParquetFileReader.ColumnChunkFootprint(
+                CompressedBytes: 0, UncompressedBytes: 0, ElementBytes: 8)),
+            group: 0);
+    }
+
+    [Fact]
+    public void DecodeCeiling_RejectsFootprintZeroChunk_AmongNonZeroProjectedColumns()
+    {
+        // The guard is inside the per-chunk loop, so a zero-footprint chunk mixed among legitimate
+        // non-zero columns still rejects (the whole row group fails closed, not just an isolated chunk).
+        DeltaStorageException error = Assert.Throws<DeltaStorageException>(
+            () => ParquetFileReader.EnsureDecodeCeiling(
+                rowCount: 1024,
+                Footprints(
+                    new ParquetFileReader.ColumnChunkFootprint(
+                        CompressedBytes: 500, UncompressedBytes: 4000, ElementBytes: 8),
+                    new ParquetFileReader.ColumnChunkFootprint(
+                        CompressedBytes: 32, UncompressedBytes: 0, ElementBytes: 8),
+                    new ParquetFileReader.ColumnChunkFootprint(
+                        CompressedBytes: 500, UncompressedBytes: 4000, ElementBytes: 8)),
+                group: 0));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+        Assert.Contains("zero decompressed bytes", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void IsParquetDefect_MapsEagerAllocationFailuresToCorruptData()
     {
         // RF-4b/ADR-0013: an OutOfMemoryException or OverflowException from the eager decode allocation is
