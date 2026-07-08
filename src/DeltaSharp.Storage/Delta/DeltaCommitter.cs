@@ -7,8 +7,11 @@ namespace DeltaSharp.Storage.Delta;
 
 /// <summary>The outcome of a successful commit: the <see cref="Version"/> that became visible and the
 /// number of put-if-absent <see cref="Attempts"/> it took (1 ⇒ won on the first try; &gt;1 ⇒ the writer
-/// observed a retryable conflict, rebased onto a newer version, and retried).</summary>
-internal readonly record struct DeltaCommitResult(long Version, int Attempts);
+/// observed a retryable conflict, rebased onto a newer version, and retried). <see cref="Skipped"/> is
+/// <see langword="true"/> when the commit was <b>idempotently skipped</b> because its application
+/// transaction was already committed (§2.11.4) — no new version was written, and <see cref="Version"/> is
+/// a version at/after the prior commit.</summary>
+internal readonly record struct DeltaCommitResult(long Version, int Attempts, bool Skipped = false);
 
 /// <summary>
 /// Publishes a Delta commit with optimistic concurrency (design §2.11): it conditionally creates
@@ -152,6 +155,15 @@ internal sealed class DeltaCommitter
             }
         }
 
+        // Idempotency via txn (§2.11.4): if this commit records an application transaction whose version the
+        // read snapshot already reflects (snapshot.txn[appId] >= version), the batch already committed —
+        // report success without re-writing, so a streaming/micro-batch retry that re-reads a fresh snapshot
+        // (or a cross-restart retry) never duplicates rows.
+        if (TryFindAlreadyCommittedTxn(actions, readSnapshot.Transactions))
+        {
+            return new DeltaCommitResult(readSnapshot.Version, Attempts: 0, Skipped: true);
+        }
+
         (IReadOnlyList<DeltaAction> payload, string nonce) = BuildPayload(actions, _nonceFactory());
         byte[] bytes = DeltaLogActionWriter.SerializeCommit(payload);
 
@@ -202,6 +214,15 @@ internal sealed class DeltaCommitter
             if (ownCommitVersion is { } ourVersion)
             {
                 return new DeltaCommitResult(ourVersion, attempt + 1);
+            }
+
+            // Idempotency via txn on the conflict path (§2.11.4): if a winner already recorded this commit's
+            // application transaction (a stale-snapshot or racing retry of the same appId whose prior attempt
+            // landed — the in-memory nonce differs across attempts, so the own-commit check above misses it),
+            // succeed idempotently rather than rebasing or raising ConcurrentTransactionException.
+            if (TryFindAlreadyCommittedTxn(actions, TxnStateOf(winners)))
+            {
+                return new DeltaCommitResult(latest, attempt + 1, Skipped: true);
             }
 
             DeltaConflictChecker.Check(actions, readScope, winners); // throws on a logical conflict
@@ -366,6 +387,45 @@ internal sealed class DeltaCommitter
         }
 
         return false;
+    }
+
+    /// <summary>Whether any application transaction in <paramref name="actions"/> is <b>already committed</b>
+    /// per <paramref name="txnState"/> (appId → last committed version): a <c>txn{appId, version}</c> whose
+    /// <paramref name="txnState"/>[appId] ≥ version means the batch already landed and must be idempotently
+    /// skipped (§2.11.4). A commit normally carries a single <c>txn</c>; if it carries several, any
+    /// already-committed one marks the batch a duplicate.</summary>
+    private static bool TryFindAlreadyCommittedTxn(
+        IReadOnlyList<DeltaAction> actions, ImmutableSortedDictionary<string, long> txnState)
+    {
+        foreach (DeltaAction action in actions)
+        {
+            if (action is TxnAction txn
+                && txnState.TryGetValue(txn.AppId, out long committedVersion)
+                && committedVersion >= txn.Version)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>Builds the per-appId last-committed transaction version map from a set of winning commit
+    /// actions (appId → max version), so the conflict path can recognize an already-recorded transaction.</summary>
+    private static ImmutableSortedDictionary<string, long> TxnStateOf(IReadOnlyList<DeltaAction> winners)
+    {
+        var builder = ImmutableSortedDictionary.CreateBuilder<string, long>(StringComparer.Ordinal);
+        foreach (DeltaAction action in winners)
+        {
+            if (action is TxnAction txn)
+            {
+                builder[txn.AppId] = builder.TryGetValue(txn.AppId, out long existing)
+                    ? Math.Max(existing, txn.Version)
+                    : txn.Version;
+            }
+        }
+
+        return builder.ToImmutable();
     }
 
     private enum AmbiguousResolution
