@@ -111,6 +111,40 @@ internal sealed class DeltaLog
         return snapshot;
     }
 
+    /// <summary>The highest JSON-commit version currently visible in <c>_delta_log</c> (ignoring
+    /// checkpoints), or <see langword="null"/> if the table has no commits. Used by the commit engine to
+    /// find the latest committed version <c>M</c> after a lost put-if-absent race (design §2.11.2).</summary>
+    internal async Task<long?> GetLatestCommitVersionAsync(CancellationToken cancellationToken)
+    {
+        long? latest = null;
+        await foreach (StorageObjectInfo info in _backend.ListAsync(LogPrefix, cancellationToken).ConfigureAwait(false))
+        {
+            DeltaLogFile file = DeltaLogFiles.Classify(FileName(info.Path));
+            if (file.Kind == DeltaLogFileKind.Commit)
+            {
+                latest = Max(latest, file.Version);
+            }
+        }
+
+        return latest;
+    }
+
+    /// <summary>Whether the JSON commit file for <paramref name="version"/> exists (the existence probe used
+    /// to walk the winning commits <c>(R, M]</c> and to re-resolve an ambiguous commit put, §2.11.3).</summary>
+    internal async Task<bool> CommitExistsAsync(long version, CancellationToken cancellationToken) =>
+        await _backend.HeadAsync(DeltaLogFiles.CommitPath(version), cancellationToken).ConfigureAwait(false) is not null;
+
+    /// <summary>Reads and parses the actions of the single JSON commit at <paramref name="version"/>. Used by
+    /// the commit engine to classify a lost race and to identify its own commit during ambiguous-ack
+    /// recovery (design §2.11.2/§2.11.3).</summary>
+    /// <exception cref="DeltaStorageException">The commit object does not exist.</exception>
+    /// <exception cref="DeltaProtocolException">The commit is malformed or exceeds the read ceiling.</exception>
+    internal async Task<IReadOnlyList<DeltaAction>> ReadCommitActionsAsync(long version, CancellationToken cancellationToken)
+    {
+        ReadOnlyMemory<byte> content = await ReadAllAsync(DeltaLogFiles.CommitPath(version), cancellationToken).ConfigureAwait(false);
+        return DeltaLogActionReader.ParseCommit(content, version);
+    }
+
     /// <summary>Seeds <paramref name="state"/> from the selected checkpoint's parts, returning its version,
     /// or <see langword="null"/> if the checkpoint is corrupt/partial (the caller then replays from 0).</summary>
     private async Task<long?> TrySeedFromCheckpointAsync(
