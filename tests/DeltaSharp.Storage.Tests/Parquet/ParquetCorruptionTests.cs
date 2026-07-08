@@ -276,6 +276,26 @@ public sealed class ParquetCorruptionTests
     }
 
     [Fact]
+    public void DecodeCeiling_RejectsFootprintZeroChunk_AmongNonZeroProjectedColumns()
+    {
+        // The guard is inside the per-chunk loop, so a zero-footprint chunk mixed among legitimate
+        // non-zero columns still rejects (the whole row group fails closed, not just an isolated chunk).
+        DeltaStorageException error = Assert.Throws<DeltaStorageException>(
+            () => ParquetFileReader.EnsureDecodeCeiling(
+                rowCount: 1024,
+                Footprints(
+                    new ParquetFileReader.ColumnChunkFootprint(
+                        CompressedBytes: 500, UncompressedBytes: 4000, ElementBytes: 8),
+                    new ParquetFileReader.ColumnChunkFootprint(
+                        CompressedBytes: 32, UncompressedBytes: 0, ElementBytes: 8),
+                    new ParquetFileReader.ColumnChunkFootprint(
+                        CompressedBytes: 500, UncompressedBytes: 4000, ElementBytes: 8)),
+                group: 0));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+        Assert.Contains("zero decompressed bytes", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void IsParquetDefect_MapsEagerAllocationFailuresToCorruptData()
     {
         // RF-4b/ADR-0013: an OutOfMemoryException or OverflowException from the eager decode allocation is

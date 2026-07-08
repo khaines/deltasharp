@@ -170,14 +170,16 @@ internal sealed class ParquetFileReader
             }
 
             // (0) Metadata-stripped-footer / footprint-0 guard (design §5.4 C-DECODE). A projected column
-            // chunk that declares ZERO decompressed bytes while the row group has rows is malformed: a
-            // legitimate present column with rows always declares a positive decompressed size (at least its
-            // definition-level bytes), so a zero here is a stripped/absent/missing-metadata footer. Its real
-            // data pages would still decode — Parquet.Net reads pages by offset and decompresses each to its
-            // page-header size — so the declared-size ceiling below cannot bound it. Fail closed rather than
-            // hand an unbounded chunk to the decoder. (A per-PAGE declared-vs-produced control that also
-            // catches a page-header-inflated size WITHIN a non-zero footer needs page-level streaming decode,
-            // which Parquet.Net's public API does not expose — tracked in #472.)
+            // chunk that declares ZERO decompressed bytes while the row group has rows is malformed: the
+            // Parquet spec defines TotalUncompressedSize as the size of all pages *including page headers*,
+            // so any present column with rows has >= 1 page and therefore declares a strictly positive size
+            // (this holds for required columns with no definition levels too). A zero is thus a
+            // stripped/absent/missing-metadata footer. Its real data pages would still decode — Parquet.Net
+            // reads pages by offset and decompresses each to its page-header size — so the declared-size
+            // ceiling below cannot bound it. Fail closed rather than hand an unbounded chunk to the decoder.
+            // (A per-PAGE declared-vs-produced control that also catches a page-header-inflated size WITHIN a
+            // non-zero footer needs page-level streaming decode, which Parquet.Net's public API does not
+            // expose — tracked in #472.)
             if (rowCount > 0 && chunk.UncompressedBytes == 0)
             {
                 throw DeltaStorageException.CorruptData(
