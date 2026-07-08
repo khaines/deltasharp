@@ -131,7 +131,9 @@ internal sealed class ParquetFileReader
     /// <summary>Fails closed when a row group's declared metadata would exceed this reader's
     /// <b>eager-decode</b> memory ceiling (design §5.4 C-DECODE), so neither a crafted footer nor a
     /// genuinely oversized row group can drive an out-of-memory allocation. Over the projected column
-    /// chunks it enforces: (i) a per-chunk decompression-<b>ratio</b> ceiling
+    /// chunks it enforces: (0) a <b>footprint-0 guard</b> — a projected chunk declaring zero decompressed
+    /// bytes for a non-empty row group is a stripped/absent footer whose real pages would still decode
+    /// unbounded, so it is rejected; (i) a per-chunk decompression-<b>ratio</b> ceiling
     /// (<see cref="MaxDecompressionRatio"/>); (ii) an <b>absolute</b> decompressed-size ceiling
     /// (<see cref="MaxRowGroupDecodedBytes"/>); and (iii) a <b>row-count</b> bound — the bytes the declared
     /// <paramref name="rowCount"/> would eagerly materialize, at the column's <b>actual</b> allocated
@@ -139,7 +141,9 @@ internal sealed class ParquetFileReader
     /// ceiling. A negative row count or a negative declared size is likewise rejected. These declared-size
     /// bounds are sound where a physical rows/byte proxy is not: legitimately compressible data
     /// (constant/RLE/all-null columns, which encode millions of rows in a few hundred bytes) passes, while
-    /// an inflated decompressed size or row count is caught.</summary>
+    /// an inflated decompressed size or row count is caught. A <b>page-header-inflated</b> size within a
+    /// non-zero footer is <i>not</i> caught here — that needs page-level streaming decode (Parquet.Net's
+    /// public API does not expose it), tracked in #472.</summary>
     /// <exception cref="ArgumentNullException"><paramref name="projectedChunks"/> is null.</exception>
     /// <exception cref="DeltaStorageException">A declared value is negative, or a ceiling is exceeded
     /// (<see cref="StorageErrorKind.CorruptData"/>).</exception>
@@ -163,6 +167,23 @@ internal sealed class ParquetFileReader
                 throw DeltaStorageException.CorruptData(
                     $"Row group {group} declares a negative column-chunk size (compressed "
                     + $"{chunk.CompressedBytes}, decompressed {chunk.UncompressedBytes}).");
+            }
+
+            // (0) Metadata-stripped-footer / footprint-0 guard (design §5.4 C-DECODE). A projected column
+            // chunk that declares ZERO decompressed bytes while the row group has rows is malformed: a
+            // legitimate present column with rows always declares a positive decompressed size (at least its
+            // definition-level bytes), so a zero here is a stripped/absent/missing-metadata footer. Its real
+            // data pages would still decode — Parquet.Net reads pages by offset and decompresses each to its
+            // page-header size — so the declared-size ceiling below cannot bound it. Fail closed rather than
+            // hand an unbounded chunk to the decoder. (A per-PAGE declared-vs-produced control that also
+            // catches a page-header-inflated size WITHIN a non-zero footer needs page-level streaming decode,
+            // which Parquet.Net's public API does not expose — tracked in #472.)
+            if (rowCount > 0 && chunk.UncompressedBytes == 0)
+            {
+                throw DeltaStorageException.CorruptData(
+                    $"Row group {group} projects a column chunk that declares zero decompressed bytes for "
+                    + $"{rowCount} rows (a metadata-stripped or absent footer); the reader cannot bound its "
+                    + "decode and fails closed.");
             }
 
             // (i) Decompression-ratio ceiling: a chunk claiming far more decompressed than compressed
@@ -206,8 +227,10 @@ internal sealed class ParquetFileReader
     private static long SaturatingAdd(long a, long b) => b > long.MaxValue - a ? long.MaxValue : a + b;
 
     // The declared footprint the reader will decode/materialize for each projected column, pulled from
-    // the row group's Parquet metadata (CF-1). Missing/encrypted chunk metadata contributes a zero
-    // footprint (harmless: the subsequent read surfaces any real defect via IsParquetDefect).
+    // the row group's Parquet metadata (CF-1). An absent chunk or missing/encrypted chunk metadata
+    // contributes a zero decompressed footprint, which EnsureDecodeCeiling now rejects fail-closed for a
+    // non-empty row group (guard (0)): a present column with rows always declares a positive decompressed
+    // size, so a zero is a stripped/absent footer whose real pages would still decode unbounded (§5.4).
     private static List<ColumnChunkFootprint> ProjectedFootprints(
         ParquetRowGroupReader rowGroup, StructType requested, DataField[] fileFields)
     {
