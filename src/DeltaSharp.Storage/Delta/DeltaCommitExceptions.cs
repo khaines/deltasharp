@@ -116,6 +116,7 @@ internal sealed class PartialTransactionException : Exception
 
 /// <summary>
 /// The commit outcome could <b>not</b> be resolved to committed-or-not (design §2.11.3 "ambiguous success"
+/// that recovery could not classify, §2.11.6). Raised only after the writer re-read <c>&lt;N&gt;.json</c>
 /// and still could not prove whether its own commit landed — never a silent success or a blind retry that
 /// could double-commit. This is a <b>non-retryable, precise unknown-state</b> error (STORY-05.3.1 AC4): the
 /// caller must reconcile out of band, not guess.

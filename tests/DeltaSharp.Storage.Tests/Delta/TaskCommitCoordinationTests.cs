@@ -127,31 +127,33 @@ public sealed class TaskCommitCoordinationTests
     }
 
     [Fact]
-    public void UnparseableAttemptNumber_TreatedAsZero()
+    public void UnparseableAttemptNumber_TreatedAsZero_LosesToHigherAttempt()
     {
-        // A malformed (non-numeric) delta.attemptNumber defaults to attempt 0, so it ties an explicit
-        // attempt 0 (both are the winning attempt) and both files are kept — pins the parse-failure branch.
+        // A malformed (non-numeric) delta.attemptNumber defaults to attempt 0 FOR ITS TASK, so it loses to
+        // an explicit attempt 1 of the same task and is DROPPED. The drop (not pass-through) proves it is
+        // treated as a task output coerced to attempt 0 — not as an untagged add, which would be kept.
         IReadOnlyList<AddFileAction> selected = TaskCommitCoordination.SelectWinningOutputs(new[]
         {
             AddRawAttempt("t0-garbage.parquet", taskId: "t0", rawAttempt: "not-a-number"),
-            Add("t0-a0.parquet", taskId: "t0", attempt: 0),
+            Add("t0-a1.parquet", taskId: "t0", attempt: 1),
         });
 
-        Assert.Equal(new[] { "t0-a0.parquet", "t0-garbage.parquet" }, Paths(selected).OrderBy(p => p).ToArray());
+        Assert.Equal(new[] { "t0-a1.parquet" }, Paths(selected)); // garbage dropped as the attempt-0 loser
     }
 
     [Fact]
-    public void NegativeAttemptNumber_TreatedAsZero()
+    public void NegativeAttemptNumber_TreatedAsZero_LosesToHigherAttempt()
     {
-        // A negative attempt number is rejected (guard `parsed >= 0`) and coerced to attempt 0 — it ties an
-        // explicit attempt 0, so both are kept. Documents the coercion contract for malformed negative tags.
+        // A negative attempt number is rejected (guard `parsed >= 0`) and coerced to attempt 0 FOR ITS TASK,
+        // so it loses to an explicit attempt 1 and is DROPPED — proving the coercion keeps it a task output
+        // (a negative value is not silently accepted as a huge/low attempt, nor treated as untagged).
         IReadOnlyList<AddFileAction> selected = TaskCommitCoordination.SelectWinningOutputs(new[]
         {
             Add("t0-neg.parquet", taskId: "t0", attempt: -1),
-            Add("t0-a0.parquet", taskId: "t0", attempt: 0),
+            Add("t0-a1.parquet", taskId: "t0", attempt: 1),
         });
 
-        Assert.Equal(new[] { "t0-a0.parquet", "t0-neg.parquet" }, Paths(selected).OrderBy(p => p).ToArray());
+        Assert.Equal(new[] { "t0-a1.parquet" }, Paths(selected)); // negative dropped as the attempt-0 loser
     }
 
     [Fact]

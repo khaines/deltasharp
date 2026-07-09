@@ -200,6 +200,65 @@ public sealed class DeltaCommitTxnIdempotencyTests : IDisposable
                 stale,
                 new DeltaAction[] { Txn("stream-a", 5), Txn("stream-b", 3), Add("would-be-lost.parquet") },
                 DeltaReadScope.BlindAppend));
+
+        Snapshot reloaded = await LoadAsync();
+        Assert.Equal(1L, reloaded.Version); // no partial commit published on the conflict path
+        Assert.DoesNotContain("would-be-lost.parquet", reloaded.ActiveFiles.Select(a => a.Path));
+    }
+
+    [Fact]
+    public async Task DuplicateAppIdsAtDifferentVersions_PartiallyCovered_FailsClosed()
+    {
+        // A malformed batch reusing one appId at two versions [txn a@5, txn a@6] against a snapshot at a@5 is
+        // partially covered (a@5 covered, a@6 not) → fail closed, not skip.
+        await SeedAsync();
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Txn("a", 5), DeltaTestHarness.Add("a5.parquet"));
+        Snapshot snapshot = await LoadAsync(); // txn[a]=5
+
+        await Assert.ThrowsAsync<PartialTransactionException>(() =>
+            new DeltaCommitter(_backend).CommitAsync(
+                snapshot,
+                new DeltaAction[] { Txn("a", 5), Txn("a", 6), Add("would-be-lost.parquet") },
+                DeltaReadScope.BlindAppend));
+    }
+
+    [Fact]
+    public async Task DuplicateAppIdsAtDifferentVersions_AllCovered_SkipsIdempotently()
+    {
+        // The same duplicate-appId batch [txn a@5, txn a@6] against a snapshot at a@6 is fully covered
+        // (a@6 covers both 5 and 6) → idempotent skip.
+        await SeedAsync();
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Txn("a", 6), DeltaTestHarness.Add("a6.parquet"));
+        Snapshot snapshot = await LoadAsync(); // txn[a]=6
+
+        DeltaCommitResult result = await new DeltaCommitter(_backend).CommitAsync(
+            snapshot,
+            new DeltaAction[] { Txn("a", 5), Txn("a", 6), Add("retry.parquet") },
+            DeltaReadScope.BlindAppend);
+
+        Assert.True(result.Skipped);
+        Assert.DoesNotContain("retry.parquet", (await LoadAsync()).ActiveFiles.Select(a => a.Path));
+    }
+
+    [Fact]
+    public async Task AllCovered_BundledWithNewFiles_IsSkipped_IdempotencyKeyIsTheBatchIdentity()
+    {
+        // Contract documentation: the txn is the batch's idempotency identity. Reusing a committed txn key
+        // while bundling genuinely NEW files is caller misuse (an idempotency-key collision) — the engine
+        // treats the batch as an exact replay and skips it, so the new files are NOT published. This is the
+        // same behavior as Delta and is intentional, not a silent-drop bug (the loud-failure case is the
+        // PARTIAL overlap, covered above).
+        await SeedAsync();
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Txn("stream", 5), DeltaTestHarness.Add("committed.parquet"));
+        Snapshot snapshot = await LoadAsync(); // txn[stream]=5
+
+        DeltaCommitResult result = await new DeltaCommitter(_backend).CommitAsync(
+            snapshot,
+            new DeltaAction[] { Txn("stream", 5), Add("new-data.parquet") },
+            DeltaReadScope.BlindAppend);
+
+        Assert.True(result.Skipped);
+        Assert.DoesNotContain("new-data.parquet", (await LoadAsync()).ActiveFiles.Select(a => a.Path));
     }
 
     [Fact]

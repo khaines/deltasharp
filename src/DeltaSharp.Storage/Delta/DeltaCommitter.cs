@@ -161,12 +161,14 @@ internal sealed class DeltaCommitter
         // (or a cross-restart retry) never duplicates rows. Idempotency is all-or-nothing for the atomic
         // batch: skip only if EVERY txn is covered; fail closed on a partial overlap (some covered, some not)
         // rather than silently dropping the uncommitted transactions and their data.
-        switch (ClassifyTxnCoverage(actions, readSnapshot.Transactions, out int coveredUpFront, out int totalUpFront))
+        switch (ClassifyTxnCoverage(actions, readSnapshot.Transactions))
         {
             case TxnCoverage.All:
                 return new DeltaCommitResult(readSnapshot.Version, Attempts: 0, Skipped: true);
             case TxnCoverage.Partial:
-                throw PartialTxn(coveredUpFront, totalUpFront);
+                throw PartialTxn(actions, readSnapshot.Transactions);
+            case TxnCoverage.None:
+                break; // no idempotency key covered — proceed to write.
         }
 
         (IReadOnlyList<DeltaAction> payload, string nonce) = BuildPayload(actions, _nonceFactory());
@@ -233,12 +235,15 @@ internal sealed class DeltaCommitter
             // is the exact failure a txn idempotency key exists to absorb. A NON-covering same-appId winner
             // (a genuine concurrent writer, lower version) does NOT match and still fails loud below. All-or-
             // nothing: a partial overlap fails closed (never a silent drop of the uncommitted transactions).
-            switch (ClassifyTxnCoverage(actions, TxnStateOf(winners), out int coveredOnConflict, out int totalOnConflict))
+            ImmutableSortedDictionary<string, long> winnerTxns = TxnStateOf(winners);
+            switch (ClassifyTxnCoverage(actions, winnerTxns))
             {
                 case TxnCoverage.All:
                     return new DeltaCommitResult(latest, attempt + 1, Skipped: true);
                 case TxnCoverage.Partial:
-                    throw PartialTxn(coveredOnConflict, totalOnConflict);
+                    throw PartialTxn(actions, winnerTxns);
+                case TxnCoverage.None:
+                    break; // no winner covered our txn — fall through to conflict classification.
             }
 
             DeltaConflictChecker.Check(actions, readScope, winners); // throws on a logical conflict
@@ -424,17 +429,16 @@ internal sealed class DeltaCommitter
     /// and cannot be idempotently resolved (§2.11.4) — the caller must not bundle unrelated/non-monotonic
     /// transactions into one commit. A normal single-<c>txn</c> commit only ever yields None or All.</summary>
     private static TxnCoverage ClassifyTxnCoverage(
-        IReadOnlyList<DeltaAction> actions, ImmutableSortedDictionary<string, long> txnState,
-        out int covered, out int total)
+        IReadOnlyList<DeltaAction> actions, ImmutableSortedDictionary<string, long> txnState)
     {
-        total = 0;
-        covered = 0;
+        int total = 0;
+        int covered = 0;
         foreach (DeltaAction action in actions)
         {
             if (action is TxnAction txn)
             {
                 total++;
-                if (txnState.TryGetValue(txn.AppId, out long committedVersion) && committedVersion >= txn.Version)
+                if (IsTxnCovered(txn, txnState))
                 {
                     covered++;
                 }
@@ -449,11 +453,33 @@ internal sealed class DeltaCommitter
         return covered == total ? TxnCoverage.All : TxnCoverage.Partial;
     }
 
-    private static PartialTransactionException PartialTxn(int covered, int total) =>
-        new($"This commit carries {total} application transactions of which {covered} are already committed; "
-            + "idempotency for an atomic batch is all-or-nothing, so a partially-committed batch is failed "
-            + "closed rather than skipped (which would drop the uncommitted transactions and their data). "
-            + "Do not bundle unrelated or non-monotonic application transactions into a single commit (§2.11.4).");
+    private static bool IsTxnCovered(TxnAction txn, ImmutableSortedDictionary<string, long> txnState) =>
+        txnState.TryGetValue(txn.AppId, out long committedVersion) && committedVersion >= txn.Version;
+
+    /// <summary>Builds the fail-closed exception for a partially-committed atomic batch, naming which
+    /// application transactions are already committed and which are not (so an operator can reconcile).</summary>
+    private static PartialTransactionException PartialTxn(
+        IReadOnlyList<DeltaAction> actions, ImmutableSortedDictionary<string, long> txnState)
+    {
+        var committed = new List<string>();
+        var uncommitted = new List<string>();
+        foreach (DeltaAction action in actions)
+        {
+            if (action is TxnAction txn)
+            {
+                (IsTxnCovered(txn, txnState) ? committed : uncommitted).Add($"{txn.AppId}@{txn.Version}");
+            }
+        }
+
+        return new PartialTransactionException(
+            $"This commit carries {committed.Count + uncommitted.Count} application transactions of which "
+            + $"{committed.Count} are already committed [{string.Join(", ", committed)}] and "
+            + $"{uncommitted.Count} are not [{string.Join(", ", uncommitted)}]; idempotency for an atomic "
+            + "batch is all-or-nothing, so a partially-committed batch is failed closed rather than skipped "
+            + "(which would drop the uncommitted transactions and their data) or committed (which would "
+            + "double-apply the committed ones). Do not bundle unrelated or non-monotonic application "
+            + "transactions into a single commit (§2.11.4).");
+    }
 
     /// <summary>Builds the per-appId last-committed transaction version map from a set of winning commit
     /// actions (appId → max version), so the conflict path can recognize an already-recorded transaction.</summary>
