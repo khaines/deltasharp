@@ -483,18 +483,74 @@ Acknowledged commits remain durable across driver restart, executor loss, storag
 
 #### 2.12.2 Schema enforcement & evolution
 
-**Enforcement (reject before commit):** the writer validates the incoming batch schema against the table's current `metaData` schema **before any `add` is committed** — by-name field resolution, nullability, and exact type match — the storage-side analog of the write-door's equal-schema check (`write-door.md`, `SinkRegistry.cs`). A mismatch aborts with no staged file becoming active (checklist *Schema* bullet 1).
+Implemented by `DeltaSchemaEnforcer` (a pure, deterministic, side-effect-free rule engine over Abstractions
+`StructType`) wired into `DeltaTableWriter` (STORY-05.4.2 / #190). The writer exposes schema-aware overloads
+that take the **incoming write schema** and a `SchemaEvolutionMode`, keeping the prior signatures working
+(they delegate with `writeSchema = readSnapshot.Schema` and `SchemaEvolutionMode.None`, a no-op enforcement):
 
-**Evolution rules** (explicit; checklist *Schema* bullet 2):
+```csharp
+Task<DeltaCommitResult> AppendAsync(
+    Snapshot readSnapshot, StructType writeSchema, IReadOnlyList<StagedDataFile> files,
+    SchemaEvolutionMode evolutionMode = SchemaEvolutionMode.None, CancellationToken ct = default);
+
+Task<DeltaCommitResult> OverwriteAsync(
+    Snapshot readSnapshot, StructType writeSchema, IReadOnlyList<StagedDataFile> files,
+    PartitionOverwriteMode partitionMode = PartitionOverwriteMode.Static,
+    SchemaEvolutionMode evolutionMode = SchemaEvolutionMode.None, CancellationToken ct = default);
+```
+
+`SchemaEvolutionMode` is a `[Flags]` enum: `None` (strict), `AddNewColumns` (Spark `mergeSchema`), `WidenTypes`,
+and `MergeSchema = AddNewColumns | WidenTypes`.
+
+**Enforcement (reject before commit — HP-09, AC1).** `DeltaSchemaEnforcer.Reconcile(tableSchema, writeSchema,
+mode)` runs at the **top** of every enforcing write, **before** any `add`/`metaData` action is built or committed
+(mirroring the fail-closed `ValidatePartitionCoverage` guard). An incompatible write throws
+`DeltaSchemaMismatchException` — carrying a classified `Kind` and the dotted column `Path` — so **no** staged file
+becomes active and the table is left completely unchanged. `Reconcile` returns `null` when the write is
+compatible and needs no schema change (the writer commits adds only), or the **merged** schema when `mode`
+permitted an additive change.
+
+**Deterministic compatibility rules (AC3).** Fields are matched **by name, case-sensitively / ordinally**
+(matching `StructType`'s ordinal lookup), so column reordering is *not* a change and `Id` ≠ `id` are distinct
+columns. The rules are total and applied recursively to nested `struct` fields, `array` elements, and `map`
+keys/values:
 
 | Dimension | Rule |
 |---|---|
-| Nullability | May relax `required → nullable`; tightening `nullable → required` is rejected (existing rows may hold null). |
-| Type widening | Allowed set only (`int→long`, `float→double`, decimal precision/scale widening, …), **gated by the `typeWidening` writer feature** (§2.14); narrowing rejected. |
-| Nested fields | Add struct fields; evolve array/map element types under the same rules; positional identity preserved via column mapping (§2.12.3). |
-| Case sensitivity | Default case-insensitive resolution (Spark default); a name that collides after case-fold is rejected. |
+| Type equality | Equal types are accepted unchanged. |
+| Type widening | Accepted **only** under `WidenTypes`, from the permitted lossless set: integral `byte→short→int→long`, `float→double`, `date→timestamp`, and `decimal(p,s)→decimal(p',s')` iff `s'≥s ∧ (p'−s')≥(p−s)` (scale and integer-digit range both grow). Every other type change — narrowing, a shrinking decimal, or an unrelated type — is **always** rejected (`IncompatibleType`); Delta never silently downcasts. A permitted widening attempted **without** `WidenTypes` is rejected distinctly (`TypeWideningNotEnabled`) so the message can say "safe, just enable it". |
+| Nullability | The table's nullability is **authoritative and never changed by a write**. Writing a non-null value into a nullable column is fine; writing a nullable value into a required column (or relaxing a required column to nullable) is **always** rejected (`NullabilityViolation`). `array.containsNull` / `map.valueContainsNull` follow the same rule. |
+| Presence (table column omitted) | Accepted only if the column is nullable (new rows carry `null`); omitting a **required** column is rejected (`MissingRequiredColumn`). |
+| Presence (new write column) | Rejected (`NewColumnNotAllowed`) unless `AddNewColumns` is enabled, and then only if the column is **nullable** (`NewColumnMustBeNullable` otherwise, since existing rows have no value for it). New columns are **appended** after the existing (table-ordered) columns; recurses into new nested `struct` fields. |
 | Partition columns | Cannot be changed by evolution (requires rewrite); adding *data* columns is allowed. |
-| `mergeSchema` | Opt-in (writer option / recognized reader option, [read-door.md](read-door.md) §"Reader-option diagnostics"): union new columns into the table schema, committed as a `metaData` action **in the same transaction** as the data. |
+
+**Atomic evolution (HP-09, AC2).** When `Reconcile` returns a merged schema, the writer builds a new `metaData`
+action (`readSnapshot.Metadata with { SchemaString = SchemaJson.ToJson(merged) }`, preserving id/format/partition
+columns/configuration) and **prepends it to the same action list** as the data adds (and removes, for an
+overwrite), committed in a **single** `DeltaCommitter.CommitAsync` call — so the metadata change and file changes
+publish as **one version**, never a torn intermediate state.
+
+**Stale-schema conflict (AC4).** A schema change is carried in `metaData`, and `DeltaConflictChecker` treats **any**
+concurrent `metaData` as a hard conflict: (1) a winner's schema change aborts **every** concurrent loser — both an
+evolution write *and* a plain append validated against the now-stale schema — with `MetadataChangedException`; and
+(2) an evolution write (which emits `metaData`) requires exclusive access, so it also aborts against a concurrent
+data-only append. Either way a stale-schema write must **refresh** onto the latest snapshot and retry. The table
+schema is thus effectively part of the write's read dependency; no stale-schema write can slip through.
+
+**Deferred (out of scope for #190 — file tracking issues):**
+- **`typeWidening` table feature (§2.14).** Widening here changes the *logical* schema atomically but does **not**
+  yet register Delta's `typeWidening` writer/reader feature or the per-field widening metadata that lets *other*
+  engines read pre-widening Parquet files back at the widened type. Cross-engine read-back of a widened column is
+  therefore not yet guaranteed; widening is gated by the `WidenTypes` writer option, not the protocol feature.
+- **Integral→floating widening** (`int→double`, `long→double`, `long→float`) is deliberately **excluded** from the
+  permitted set (a conservative subset) to avoid the lossy `long→double` mantissa trap; these reject as
+  `IncompatibleType`. Revisit once per-field widening metadata records the source type.
+- **Automatic `required → nullable` relaxation** is **not** performed — the table's declared nullability is
+  preserved as-is. A deliberate nullability change is a separate `ALTER TABLE`-style metadata operation.
+- **Case-insensitive name resolution** (Spark's default) is a higher-layer name-resolution concern, not a
+  storage-layer type-compatibility rule; the enforcer is intentionally case-sensitive/ordinal.
+- **Column mapping / typed field metadata** (§2.12.3): field metadata is carried through unchanged; typed
+  (numeric/bool) metadata values remain blocked on the `SchemaJson`/`FieldMetadata` extension (§9.1 D-6).
 
 #### 2.12.3 Column mapping (id / name mode)
 

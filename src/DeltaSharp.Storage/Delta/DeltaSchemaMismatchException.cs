@@ -1,0 +1,106 @@
+namespace DeltaSharp.Storage.Delta;
+
+/// <summary>
+/// The deterministic reason a Delta write's schema was rejected by <see cref="DeltaSchemaEnforcer"/> before
+/// any action was committed (STORY-05.4.2 AC1). Callers and tests branch on
+/// <see cref="DeltaSchemaMismatchException.Kind"/> rather than parsing the message (mirroring
+/// <see cref="DeltaProtocolErrorKind"/>/<see cref="StorageErrorKind"/>).
+/// </summary>
+internal enum DeltaSchemaMismatchKind
+{
+    /// <summary>The table has a required (non-nullable) column that the write schema does not provide;
+    /// committing would write <c>null</c> into a column that forbids it. Always rejected.</summary>
+    MissingRequiredColumn,
+
+    /// <summary>The write schema introduces a column the table does not have, but
+    /// <see cref="SchemaEvolutionMode.AddNewColumns"/> was not enabled (strict enforcement).</summary>
+    NewColumnNotAllowed,
+
+    /// <summary>Evolution would add a new column, but the write declares it non-nullable; a column added to a
+    /// table that already has rows must be nullable (existing rows have no value for it). Always rejected.</summary>
+    NewColumnMustBeNullable,
+
+    /// <summary>The write would carry <c>null</c>-bearing data into a required (non-nullable) column,
+    /// array element, or map value — i.e. the write relaxes a nullability constraint the table enforces.
+    /// Tightening a nullable column to required is the symmetric, always-rejected case. Always rejected.</summary>
+    NullabilityViolation,
+
+    /// <summary>The write changes a column's type to one that is neither equal nor a permitted lossless
+    /// widening — a narrowing or an unrelated type (for example <c>long→int</c> or <c>string↔long</c>).
+    /// Delta never silently downcasts. Always rejected.</summary>
+    IncompatibleType,
+
+    /// <summary>The write requires a permitted type widening, but <see cref="SchemaEvolutionMode.WidenTypes"/>
+    /// was not enabled (strict enforcement). Distinct from <see cref="IncompatibleType"/> so the message can
+    /// tell the caller the change is safe and only needs evolution turned on.</summary>
+    TypeWideningNotEnabled,
+}
+
+/// <summary>
+/// Thrown by <see cref="DeltaSchemaEnforcer"/> when an incoming write's schema is incompatible with the
+/// table schema, or requires a schema change the active <see cref="SchemaEvolutionMode"/> does not permit
+/// (STORY-05.4.2 AC1; design §2.12.2). It is raised <b>before</b> any <c>add</c>/<c>metaData</c> action is
+/// built or committed, so a rejected write leaves the table completely unchanged (fail-closed, mirroring
+/// <c>DeltaTableWriter</c>'s partition-coverage guard). The message names the offending column
+/// <see cref="Path"/> (dotted, with <c>element</c>/<c>key</c>/<c>value</c> segments for nested types) and
+/// the concrete disagreement so the failure is actionable.
+/// </summary>
+internal sealed class DeltaSchemaMismatchException : Exception
+{
+    private DeltaSchemaMismatchException(DeltaSchemaMismatchKind kind, string path, string message)
+        : base(message)
+    {
+        Kind = kind;
+        Path = path;
+    }
+
+    /// <summary>The classified reason the schema was rejected.</summary>
+    public DeltaSchemaMismatchKind Kind { get; }
+
+    /// <summary>The dotted path to the offending column/field (e.g. <c>address.zip</c>,
+    /// <c>tags.element</c>, <c>lookup.value</c>).</summary>
+    public string Path { get; }
+
+    public static DeltaSchemaMismatchException MissingRequiredColumn(string path) =>
+        new(
+            DeltaSchemaMismatchKind.MissingRequiredColumn,
+            path,
+            $"The write is missing required (non-nullable) column '{path}'; a write must provide every " +
+            "non-nullable column, or the column must first be made nullable.");
+
+    public static DeltaSchemaMismatchException NewColumnNotAllowed(string path) =>
+        new(
+            DeltaSchemaMismatchKind.NewColumnNotAllowed,
+            path,
+            $"The write introduces column '{path}', which is not in the table schema. Enable schema " +
+            "evolution (SchemaEvolutionMode.AddNewColumns / MergeSchema) to add new columns.");
+
+    public static DeltaSchemaMismatchException NewColumnMustBeNullable(string path) =>
+        new(
+            DeltaSchemaMismatchKind.NewColumnMustBeNullable,
+            path,
+            $"The write adds new column '{path}' as non-nullable; a column added to a table that already " +
+            "has data must be nullable because existing rows carry no value for it.");
+
+    public static DeltaSchemaMismatchException NullabilityViolation(string path) =>
+        new(
+            DeltaSchemaMismatchKind.NullabilityViolation,
+            path,
+            $"The write declares '{path}' nullable but the table requires it to be non-nullable; " +
+            "null-bearing data cannot be written into a required column, and a required column cannot be " +
+            "relaxed to nullable by a write.");
+
+    public static DeltaSchemaMismatchException IncompatibleType(string path, string tableType, string writeType) =>
+        new(
+            DeltaSchemaMismatchKind.IncompatibleType,
+            path,
+            $"The write type '{writeType}' for column '{path}' is not compatible with the table type " +
+            $"'{tableType}'; only lossless type widening is permitted (never a narrowing or an unrelated type).");
+
+    public static DeltaSchemaMismatchException TypeWideningNotEnabled(string path, string tableType, string writeType) =>
+        new(
+            DeltaSchemaMismatchKind.TypeWideningNotEnabled,
+            path,
+            $"The write widens column '{path}' from '{tableType}' to '{writeType}', a permitted widening, but " +
+            "type-widening evolution is not enabled. Enable SchemaEvolutionMode.WidenTypes / MergeSchema to allow it.");
+}
