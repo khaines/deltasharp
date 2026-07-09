@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Globalization;
 
 namespace DeltaSharp.Storage.Delta;
@@ -65,4 +66,109 @@ internal sealed record RetentionPolicy
     /// <summary>The minimum retention a VACUUM caller may request without enabling the unsafe override; a
     /// shorter window is rejected fail-closed (STORY-05.6.2 AC2).</summary>
     internal TimeSpan SafetyThreshold { get; }
+
+    /// <summary>The Delta table property naming the deleted-file retention window a no-argument VACUUM must
+    /// honor (design §2.14; Delta <c>delta.deletedFileRetentionDuration</c>). Read from
+    /// <see cref="MetadataAction.Configuration"/> so a table configured for (say) 30 days does not silently
+    /// lose history after the 7-day process default.</summary>
+    internal const string DeletedFileRetentionDurationKey = "delta.deletedFileRetentionDuration";
+
+    /// <summary>
+    /// Resolves the effective retention for a no-argument VACUUM from a table's
+    /// <see cref="MetadataAction.Configuration"/>: the parsed <see cref="DeletedFileRetentionDurationKey"/>
+    /// when present and valid, else this policy's <see cref="DefaultRetention"/>. Fail-closed: a property
+    /// that is present but <b>unparseable</b> (or expresses a calendar unit — months/years — whose length is
+    /// not fixed) throws rather than silently falling back to a shorter default and under-retaining history.
+    /// </summary>
+    /// <exception cref="ArgumentNullException"><paramref name="configuration"/> is null.</exception>
+    /// <exception cref="FormatException">The property is present but cannot be parsed to a fixed duration.</exception>
+    internal TimeSpan ResolveTableRetention(ImmutableSortedDictionary<string, string> configuration)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+        if (!configuration.TryGetValue(DeletedFileRetentionDurationKey, out string? raw))
+        {
+            return DefaultRetention;
+        }
+
+        if (!TryParseRetentionInterval(raw, out TimeSpan configured))
+        {
+            throw new FormatException(string.Create(
+                CultureInfo.InvariantCulture,
+                $"Table property '{DeletedFileRetentionDurationKey}' value '{raw}' is not a parseable fixed-length " +
+                $"retention duration; VACUUM fails closed rather than under-retaining deleted-file history."));
+        }
+
+        return configured;
+    }
+
+    /// <summary>
+    /// Parses a Delta <c>CalendarInterval</c>/duration string (e.g. <c>"interval 30 days"</c>,
+    /// <c>"7 days"</c>, <c>"interval 1 weeks 12 hours"</c>) into a fixed <see cref="TimeSpan"/>. Accepts an
+    /// optional leading <c>interval</c> keyword followed by one or more <c>&lt;number&gt; &lt;unit&gt;</c>
+    /// pairs. Calendar units whose length is not fixed (<c>month</c>/<c>year</c>) are <b>rejected</b>
+    /// (returns <see langword="false"/>) — mirroring Delta's <c>getMilliSeconds</c>, which asserts zero
+    /// months — so VACUUM never derives a retention from an ambiguous-length unit.
+    /// </summary>
+    internal static bool TryParseRetentionInterval(string? value, out TimeSpan retention)
+    {
+        retention = TimeSpan.Zero;
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        string[] tokens = value.Trim().ToLowerInvariant()
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        int i = 0;
+        if (tokens.Length > 0 && string.Equals(tokens[0], "interval", StringComparison.Ordinal))
+        {
+            i = 1;
+        }
+
+        if (i >= tokens.Length || (tokens.Length - i) % 2 != 0)
+        {
+            return false; // no value/unit pairs, or a dangling token.
+        }
+
+        TimeSpan total = TimeSpan.Zero;
+        for (; i < tokens.Length; i += 2)
+        {
+            if (!long.TryParse(tokens[i], NumberStyles.Integer, CultureInfo.InvariantCulture, out long count)
+                || count < 0)
+            {
+                return false;
+            }
+
+            if (!TryUnitToTimeSpan(tokens[i + 1], count, out TimeSpan part))
+            {
+                return false;
+            }
+
+            total += part;
+        }
+
+        retention = total;
+        return true;
+    }
+
+    private static bool TryUnitToTimeSpan(string unit, long count, out TimeSpan value)
+    {
+        // Trim a trailing plural 's' so "day"/"days" both match. Reject calendar-ambiguous units.
+        string singular = unit.Length > 1 && unit[^1] == 's' ? unit[..^1] : unit;
+        value = singular switch
+        {
+            "week" => TimeSpan.FromDays(7 * count),
+            "day" => TimeSpan.FromDays(count),
+            "hour" => TimeSpan.FromHours(count),
+            "minute" => TimeSpan.FromMinutes(count),
+            "min" => TimeSpan.FromMinutes(count),
+            "second" => TimeSpan.FromSeconds(count),
+            "sec" => TimeSpan.FromSeconds(count),
+            "millisecond" => TimeSpan.FromMilliseconds(count),
+            "microsecond" => TimeSpan.FromMicroseconds(count),
+            _ => TimeSpan.MinValue,
+        };
+
+        return value != TimeSpan.MinValue;
+    }
 }

@@ -106,6 +106,23 @@ internal sealed class DeltaVacuum
     private readonly DeltaStorageTelemetry _telemetry;
     private readonly TimeProvider _timeProvider;
 
+    /// <summary>Fires once (per process) when a policy with a weak safety threshold is first observed, so the
+    /// "guard effectively disabled" warning is not repeated on every VACUUM.</summary>
+    private static int s_weakThresholdWarned;
+
+    /// <summary>Test seam (null/inert in production): awaited immediately <b>before</b> the candidate LIST,
+    /// so a test can deterministically commit a racing writer in the list/load window. Because listing now
+    /// precedes snapshot load (the TOCTOU fix), a file committed here is either seen by the list (and then
+    /// present in the later-loaded snapshot, so protected) or not — never listed-but-missing-from-snapshot.
+    /// On the pre-fix (load-before-list) ordering this same seam fires after the snapshot load, reproducing
+    /// the data-loss race.</summary>
+    internal volatile Func<CancellationToken, Task>? BeforeListProbe;
+
+    /// <summary>Test seam (null/inert in production): awaited once after candidate selection and immediately
+    /// <b>before</b> any delete, so a test can delete a selected candidate out-of-band to exercise the
+    /// idempotent delete-on-missing path (AC4).</summary>
+    internal volatile Func<CancellationToken, Task>? BeforeDeleteProbe;
+
     /// <summary>Creates a VACUUM over <paramref name="backend"/> (rooted at the Delta table directory) with
     /// the default 168-hour retention policy.</summary>
     public DeltaVacuum(IStorageBackend backend)
@@ -131,6 +148,28 @@ internal sealed class DeltaVacuum
         _logger = logger ?? NullLogger<DeltaVacuum>.Instance;
         _telemetry = telemetry ?? DeltaStorageTelemetry.Shared;
         _timeProvider = timeProvider ?? TimeProvider.System;
+
+        WarnIfWeakSafetyThreshold();
+    }
+
+    /// <summary>Emits a one-time Warning when the policy's <see cref="RetentionPolicy.SafetyThreshold"/> is
+    /// below Delta's 168-hour default (including a zero threshold), because that disables the
+    /// sub-threshold-retention guard (AC2) and a too-short VACUUM could reclaim files a stale reader or a
+    /// recent tombstone still needs.</summary>
+    private void WarnIfWeakSafetyThreshold()
+    {
+        if (_policy.SafetyThreshold >= RetentionPolicy.DefaultRetentionWindow)
+        {
+            return;
+        }
+
+        if (Interlocked.Exchange(ref s_weakThresholdWarned, 1) == 0)
+        {
+            DeltaVacuumLog.VacuumWeakSafetyThreshold(
+                _logger,
+                _policy.SafetyThreshold.TotalHours,
+                RetentionPolicy.DefaultRetentionWindow.TotalHours);
+        }
     }
 
     /// <summary>
@@ -151,29 +190,39 @@ internal sealed class DeltaVacuum
         bool unsafeOverride = false,
         CancellationToken cancellationToken = default)
     {
-        TimeSpan effective = retention ?? _policy.DefaultRetention;
-        if (effective < TimeSpan.Zero)
+        if (retention is { } requested && requested < TimeSpan.Zero)
         {
-            throw new ArgumentOutOfRangeException(nameof(retention), effective, "Retention must be non-negative.");
+            throw new ArgumentOutOfRangeException(nameof(retention), requested, "Retention must be non-negative.");
         }
 
         using IDisposable? logScope = _logger.BeginScope(VacuumLogScope);
 
         // AC2: enforce the safety threshold BEFORE loading the snapshot, listing, or selecting anything —
-        // a rejected VACUUM must never touch the store or leak a candidate listing.
-        if (effective < _policy.SafetyThreshold && !unsafeOverride)
+        // a rejected VACUUM must never touch the store or leak a candidate listing. The pre-I/O gate uses
+        // the value knowable without a snapshot: an explicit request, else the policy default (which the
+        // policy validates is at or above the threshold). When no explicit retention is given, the table's
+        // configured retention (read after load, AFTER listing) can only RAISE the effective window, so a
+        // no-argument VACUUM is re-checked post-load below — never under-retained past this gate.
+        TimeSpan preCheck = retention ?? _policy.DefaultRetention;
+        if (preCheck < _policy.SafetyThreshold && !unsafeOverride)
         {
             DeltaVacuumLog.VacuumRejectedRetention(
-                _logger, effective.TotalHours, _policy.SafetyThreshold.TotalHours);
+                _logger, preCheck.TotalHours, _policy.SafetyThreshold.TotalHours);
             _telemetry.RecordVacuumTerminal(VacuumOutcome.RejectedUnsafeRetention, durationSeconds: 0);
-            throw new VacuumRetentionSafetyException(effective, _policy.SafetyThreshold);
+            throw new VacuumRetentionSafetyException(preCheck, _policy.SafetyThreshold);
         }
+
+        // Architect: emit the Started line at accepted-request time — after the gate, before any snapshot
+        // load — so a load (or listing) failure still leaves a Started breadcrumb. The snapshot version and
+        // the effective (possibly table-configured) retention are reported on the Completed line.
+        DeltaVacuumLog.VacuumStarted(
+            _logger, _backend.Kind.ToLabel(), preCheck.TotalHours, dryRun, unsafeOverride);
 
         long startTimestamp = Stopwatch.GetTimestamp();
         using Activity? activity = _telemetry.StartVacuumActivity(_backend.Kind);
         try
         {
-            VacuumResult result = await RunAsync(effective, dryRun, unsafeOverride, cancellationToken)
+            VacuumResult result = await RunAsync(retention, dryRun, unsafeOverride, cancellationToken)
                 .ConfigureAwait(false);
 
             double seconds = Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds;
@@ -181,12 +230,22 @@ internal sealed class DeltaVacuum
             SetOutcomeTag(activity, dryRun ? VacuumOutcome.DryRun : VacuumOutcome.Completed);
             DeltaVacuumLog.VacuumCompleted(
                 _logger,
+                result.Version,
                 result.Audit.Length,
                 result.DeletablePaths.Length,
                 result.DeletedPaths.Length,
                 dryRun,
                 seconds * 1000);
             return result;
+        }
+        catch (VacuumRetentionSafetyException)
+        {
+            // A post-load rejection (the table's configured retention is itself sub-threshold, AC2 + MEDIUM):
+            // record the fail-closed terminal, not a generic failure. The rejection Warning was already logged.
+            _telemetry.RecordVacuumTerminal(
+                VacuumOutcome.RejectedUnsafeRetention, Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds);
+            SetOutcomeTag(activity, VacuumOutcome.RejectedUnsafeRetention);
+            throw;
         }
         catch (OperationCanceledException)
         {
@@ -208,20 +267,29 @@ internal sealed class DeltaVacuum
     }
 
     private async Task<VacuumResult> RunAsync(
-        TimeSpan retention, bool dryRun, bool unsafeOverride, CancellationToken cancellationToken)
+        TimeSpan? requestedRetention, bool dryRun, bool unsafeOverride, CancellationToken cancellationToken)
     {
-        Snapshot snapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
-
-        long nowMillis = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
-        long cutoffMillis = nowMillis - (long)retention.TotalMilliseconds;
-
-        DeltaVacuumLog.VacuumStarted(
-            _logger, _backend.Kind.ToLabel(), snapshot.Version, retention.TotalHours, dryRun, unsafeOverride);
+        // CRITICAL-2 (TOCTOU): LIST BEFORE LOAD SNAPSHOT. Delta requires listing files before reading the
+        // log so the snapshot is at least as new as the listing: any file the listing shows that is active
+        // is then guaranteed to appear in the later-loaded snapshot (and is protected), while any file
+        // committed after the load was written after the list and is not a candidate at all. Loading first
+        // would let a file committed in the load→list window appear in the listing but not the (older)
+        // snapshot — with an mtime below the cutoff (clock skew / preserved-timestamp move / long copy) it
+        // would bypass the recency fail-safe and be deleted. Listing first closes that window.
+        //
+        // NOTE (tracked): candidate discovery + the protected set assume every referenced file is an
+        // add.path/remove.path. Deletion-vector (.bin) and Change-Data-Feed (_change_data/) files are
+        // referenced by other fields; when those features land their paths MUST be protected here (see
+        // OrphanCleanup remarks) — until then this VACUUM must not run on a table using them.
+        if (BeforeListProbe is { } beforeList)
+        {
+            await beforeList(cancellationToken).ConfigureAwait(false);
+        }
 
         // Candidate discovery: list the table directory and keep every object except the _delta_log (the
         // log is metadata truth, never a reclamation target). Active files are deliberately NOT excluded
-        // here — passing them through SelectDeletable lets the contract exclude them AND lets the audit
-        // record an "active" decision for each, so the audit covers every discovered candidate (AC3).
+        // here — passing them through the contract lets it exclude them AND lets the audit record an
+        // "active" decision for each, so the audit covers every discovered candidate (AC3).
         var candidates = new List<OrphanCandidate>();
         await foreach (StorageObjectInfo info in _backend.ListAsync(prefix: string.Empty, cancellationToken)
             .ConfigureAwait(false))
@@ -234,16 +302,34 @@ internal sealed class DeltaVacuum
             candidates.Add(new OrphanCandidate(info.Path, ToEpochMillis(info.LastModifiedUtc)));
         }
 
-        // The single source of the deletion decision (design §2.11.5): active files, retention-protected
-        // tombstones, and recently-staged files are excluded fail-safe by the contract — VACUUM never
-        // re-implements or widens this.
-        IReadOnlyList<string> deletable =
-            OrphanCleanup.SelectDeletable(snapshot, candidates, cutoffMillis);
-        var deletableSet = deletable.ToImmutableHashSet(StringComparer.Ordinal);
+        Snapshot snapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
 
-        (ImmutableArray<string> deletedPaths, ImmutableArray<VacuumAuditEntry> audit) =
-            await ApplyAndAuditAsync(snapshot, candidates, deletableSet, cutoffMillis, dryRun, cancellationToken)
-                .ConfigureAwait(false);
+        // MEDIUM: resolve the effective retention. When the caller named no explicit window, honor the
+        // table's delta.deletedFileRetentionDuration (from Metadata.Configuration) so a table configured for
+        // e.g. 30 days does not silently lose history after the 7-day process default. An explicit request
+        // always wins. Reading the property requires the loaded snapshot, so re-check the safety threshold
+        // against the EFFECTIVE retention here (fail-closed) — the pre-load gate only knew the process
+        // default. A property that is present but unparseable throws (fail-closed) via ResolveTableRetention.
+        TimeSpan retention = requestedRetention ?? _policy.ResolveTableRetention(snapshot.Metadata.Configuration);
+        if (retention < _policy.SafetyThreshold && !unsafeOverride)
+        {
+            DeltaVacuumLog.VacuumRejectedRetention(
+                _logger, retention.TotalHours, _policy.SafetyThreshold.TotalHours);
+            throw new VacuumRetentionSafetyException(retention, _policy.SafetyThreshold);
+        }
+
+        long nowMillis = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
+        long cutoffMillis = nowMillis - (long)retention.TotalMilliseconds;
+
+        // The single source of the deletion decision AND the audit reason (design §2.11.5): active files,
+        // retention-protected tombstones, and recently-staged files are excluded fail-safe by the contract
+        // (encoding-robust) — VACUUM never re-implements or widens this.
+        IReadOnlyList<OrphanDecision> classified =
+            OrphanCleanup.Classify(snapshot, candidates, cutoffMillis);
+
+        (ImmutableArray<string> deletablePaths, ImmutableArray<string> deletedPaths,
+            ImmutableArray<VacuumAuditEntry> audit) =
+            await ApplyAndAuditAsync(classified, dryRun, cancellationToken).ConfigureAwait(false);
 
         RecordDecisionCounts(audit);
 
@@ -252,85 +338,65 @@ internal sealed class DeltaVacuum
             dryRun,
             retention,
             cutoffMillis,
-            deletable.ToImmutableArray(),
+            deletablePaths,
             deletedPaths,
             audit);
     }
 
-    /// <summary>Deletes the eligible candidates (idempotently, AC4) unless <paramref name="dryRun"/>, and
-    /// builds the per-candidate audit (AC3). The deletion set is authoritative (<paramref name="deletableSet"/>
-    /// is <see cref="OrphanCleanup.SelectDeletable"/>'s output); the kept-reason is derived only to annotate
-    /// <i>why</i> a retained file was kept.</summary>
-    private async Task<(ImmutableArray<string> Deleted, ImmutableArray<VacuumAuditEntry> Audit)> ApplyAndAuditAsync(
-        Snapshot snapshot,
-        IReadOnlyList<OrphanCandidate> candidates,
-        ImmutableHashSet<string> deletableSet,
-        long cutoffMillis,
+    /// <summary>Deletes the <see cref="OrphanClassification.Deletable"/> candidates (idempotently, AC4)
+    /// unless <paramref name="dryRun"/>, and builds the per-candidate audit (AC3) from the same
+    /// classification — a single source of truth, so the deletion set never diverges from the audit reason.</summary>
+    private async Task<(ImmutableArray<string> Deletable, ImmutableArray<string> Deleted, ImmutableArray<VacuumAuditEntry> Audit)> ApplyAndAuditAsync(
+        IReadOnlyList<OrphanDecision> classified,
         bool dryRun,
         CancellationToken cancellationToken)
     {
-        ImmutableHashSet<string> active = snapshot.ActiveFiles
-            .Select(add => add.Path)
-            .ToImmutableHashSet(StringComparer.Ordinal);
-        ImmutableHashSet<string> protectedTombstones = snapshot.Tombstones
-            .Where(remove => (remove.DeletionTimestamp ?? long.MaxValue) >= cutoffMillis)
-            .Select(remove => remove.Path)
-            .ToImmutableHashSet(StringComparer.Ordinal);
-
-        var deleted = ImmutableArray.CreateBuilder<string>();
-        var audit = ImmutableArray.CreateBuilder<VacuumAuditEntry>(candidates.Count);
-        foreach (OrphanCandidate candidate in candidates)
+        if (BeforeDeleteProbe is { } beforeDelete)
         {
-            bool eligible = deletableSet.Contains(candidate.Path);
-            VacuumDecision decision = eligible
-                ? VacuumDecision.Deletable
-                : ClassifyKept(candidate, active, protectedTombstones, cutoffMillis);
+            await beforeDelete(cancellationToken).ConfigureAwait(false);
+        }
+
+        var deletable = ImmutableArray.CreateBuilder<string>();
+        var deleted = ImmutableArray.CreateBuilder<string>();
+        var audit = ImmutableArray.CreateBuilder<VacuumAuditEntry>(classified.Count);
+        foreach (OrphanDecision decision in classified)
+        {
+            bool eligible = decision.Classification == OrphanClassification.Deletable;
+            if (eligible)
+            {
+                deletable.Add(decision.Path);
+            }
 
             bool wasDeleted = false;
             if (eligible && !dryRun)
             {
-                // DeleteAsync is idempotent: a missing object (already reclaimed by a prior partial run) is
-                // a no-op success, so a VACUUM retry after a crash mid-delete converges (AC4).
-                await _backend.DeleteAsync(candidate.Path, cancellationToken).ConfigureAwait(false);
-                deleted.Add(candidate.Path);
+                // DeleteAsync is idempotent: a missing object (already reclaimed by a prior partial run, or
+                // removed out-of-band between selection and delete) is a no-op success, so a VACUUM retry
+                // after a crash mid-delete converges (AC4).
+                await _backend.DeleteAsync(decision.Path, cancellationToken).ConfigureAwait(false);
+                deleted.Add(decision.Path);
                 wasDeleted = true;
             }
 
-            audit.Add(new VacuumAuditEntry(candidate.Path, decision, wasDeleted));
+            VacuumDecision auditDecision = ToVacuumDecision(decision.Classification);
+            audit.Add(new VacuumAuditEntry(decision.Path, auditDecision, wasDeleted));
             DeltaVacuumLog.VacuumCandidateDecision(
-                _logger, candidate.Path, DeltaStorageTelemetry.ToLabel(decision), wasDeleted);
+                _logger, decision.Path, DeltaStorageTelemetry.ToLabel(auditDecision), wasDeleted);
         }
 
-        return (deleted.ToImmutable(), audit.ToImmutable());
+        return (deletable.ToImmutable(), deleted.ToImmutable(), audit.ToImmutable());
     }
 
-    /// <summary>Annotates <i>why</i> a non-deletable candidate was retained, mirroring the exclusion order in
-    /// <see cref="OrphanCleanup.SelectDeletable"/> (active → protected tombstone → recently staged). This is a
-    /// diagnostic label only; the deletion decision is never made here.</summary>
-    private static VacuumDecision ClassifyKept(
-        OrphanCandidate candidate,
-        ImmutableHashSet<string> active,
-        ImmutableHashSet<string> protectedTombstones,
-        long cutoffMillis)
+    /// <summary>Maps the contract's <see cref="OrphanClassification"/> to the bounded telemetry/audit
+    /// <see cref="VacuumDecision"/> label. The two enums are intentionally parallel: the contract owns the
+    /// reason, telemetry owns its rendering.</summary>
+    private static VacuumDecision ToVacuumDecision(OrphanClassification classification) => classification switch
     {
-        if (active.Contains(candidate.Path))
-        {
-            return VacuumDecision.Active;
-        }
-
-        if (protectedTombstones.Contains(candidate.Path))
-        {
-            return VacuumDecision.RetentionProtectedTombstone;
-        }
-
-        if (candidate.ModificationTimeMillis >= cutoffMillis)
-        {
-            return VacuumDecision.RecentlyStaged;
-        }
-
-        // Unreachable in practice: a candidate that is none of the above is deletable and never routed here.
-        return VacuumDecision.RecentlyStaged;
-    }
+        OrphanClassification.Deletable => VacuumDecision.Deletable,
+        OrphanClassification.Active => VacuumDecision.Active,
+        OrphanClassification.RetentionProtectedTombstone => VacuumDecision.RetentionProtectedTombstone,
+        _ => VacuumDecision.RecentlyStaged,
+    };
 
     private void RecordDecisionCounts(ImmutableArray<VacuumAuditEntry> audit)
     {

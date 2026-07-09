@@ -24,9 +24,9 @@ namespace DeltaSharp.Storage.Diagnostics;
 internal static partial class DeltaVacuumLog
 {
     [LoggerMessage(EventId = 4100, EventName = "DeltaVacuumStarted", Level = LogLevel.Information,
-        Message = "Delta VACUUM started on backend {Backend}: snapshot version {Version}, retention {RetentionHours} h, dryRun={DryRun}, unsafeOverride={UnsafeOverride}.")]
+        Message = "Delta VACUUM started on backend {Backend}: retention {RetentionHours} h, dryRun={DryRun}, unsafeOverride={UnsafeOverride}.")]
     internal static partial void VacuumStarted(
-        ILogger logger, string backend, long version, double retentionHours, bool dryRun, bool unsafeOverride);
+        ILogger logger, string backend, double retentionHours, bool dryRun, bool unsafeOverride);
 
     [LoggerMessage(EventId = 4101, EventName = "DeltaVacuumRejectedRetention", Level = LogLevel.Warning,
         Message = "Delta VACUUM rejected (fail-closed): requested retention {RequestedHours} h is below the {ThresholdHours} h safety threshold and the unsafe override was not enabled.")]
@@ -37,9 +37,9 @@ internal static partial class DeltaVacuumLog
     internal static partial void VacuumCandidateDecision(ILogger logger, string path, string decision, bool deleted);
 
     [LoggerMessage(EventId = 4103, EventName = "DeltaVacuumCompleted", Level = LogLevel.Information,
-        Message = "Delta VACUUM completed: {CandidateCount} candidate(s) examined, {DeletableCount} deletion-eligible, {DeletedCount} deleted (dryRun={DryRun}) in {DurationMs} ms.")]
+        Message = "Delta VACUUM completed on snapshot version {Version}: {CandidateCount} candidate(s) examined, {DeletableCount} deletion-eligible, {DeletedCount} deleted (dryRun={DryRun}) in {DurationMs} ms.")]
     internal static partial void VacuumCompleted(
-        ILogger logger, int candidateCount, int deletableCount, int deletedCount, bool dryRun, double durationMs);
+        ILogger logger, long version, int candidateCount, int deletableCount, int deletedCount, bool dryRun, double durationMs);
 
     [LoggerMessage(EventId = 4104, EventName = "DeltaVacuumCanceled", Level = LogLevel.Information,
         Message = "Delta VACUUM canceled before completion; no terminal outcome was reached (not a failure).")]
@@ -48,4 +48,8 @@ internal static partial class DeltaVacuumLog
     [LoggerMessage(EventId = 4105, EventName = "DeltaVacuumFailed", Level = LogLevel.Error,
         Message = "Delta VACUUM failed: {ExceptionType} (fail-closed; no retained or active file is deleted).")]
     internal static partial void VacuumFailed(ILogger logger, string exceptionType);
+
+    [LoggerMessage(EventId = 4106, EventName = "DeltaVacuumWeakSafetyThreshold", Level = LogLevel.Warning,
+        Message = "Delta VACUUM retention policy has a weak safety threshold {ThresholdHours} h (below Delta's {DefaultHours} h default): the sub-threshold-retention guard is effectively disabled and a too-short retention can reclaim files a stale reader or recent tombstone still needs.")]
+    internal static partial void VacuumWeakSafetyThreshold(ILogger logger, double thresholdHours, double defaultHours);
 }
