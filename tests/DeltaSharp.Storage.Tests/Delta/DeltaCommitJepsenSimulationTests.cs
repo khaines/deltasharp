@@ -252,12 +252,14 @@ public sealed class DeltaCommitJepsenSimulationTests
     [InlineData(0x0DE17A5D)]
     [InlineData(0x1234ABCD)]
     [InlineData(0x5EEDF00D)]
+    [InlineData(unchecked((int)0x7FFFFFFF))]
+    [InlineData(0x2A)]
     public async Task DisablingSingleWinner_IsCaughtBy_JepsenChecker(int seed)
     {
         var specs = new List<WriterSpec> { BlindAppender(0, "w0.parquet"), BlindAppender(1, "w1.parquet") };
 
         SimulationResult result = await CommitSimulationRunner.RunAsync(
-            seed, nameof(DisablingSingleWinner_IsCaughtBy_JepsenChecker), specs, disableSingleWinner: true);
+            seed, nameof(DisablingSingleWinner_IsCaughtBy_JepsenChecker), specs, disableSingleWinner: true, contended: true);
 
         HistoryCheckResult check = await JepsenHistoryChecker.CheckAsync(result.History, result.Backend, result.BackgroundVersions);
 
@@ -267,5 +269,307 @@ public sealed class DeltaCommitJepsenSimulationTests
 
         Assert.False(check.IsLegal, "Broken single-winner CAS must be caught by the checker, but no violation was reported.");
         Assert.Contains("I2", check.ViolatedInvariants, StringComparison.Ordinal);
+    }
+
+    // ===================================================================================================
+    // PER-INVARIANT FAULT-INJECTION EFFICACY (the core value): every checked invariant has a matching fault
+    // knob + test proving it is falsifiable. No-op'ing the corresponding checker predicate makes at least one
+    // of these tests fail — the mechanical proof that the oracle has teeth (no silent false-negatives).
+    // ===================================================================================================
+
+    private static async Task<HistoryCheckResult> CheckAsync(SimulationResult result) =>
+        await JepsenHistoryChecker.CheckAsync(result.History, result.Backend, result.BackgroundVersions);
+
+    private void Dump(SimulationResult result, HistoryCheckResult check)
+    {
+        _output.WriteLine(result.Bundle.Render());
+        _output.WriteLine("VIOLATIONS (expected):");
+        _output.WriteLine(check.Describe());
+    }
+
+    // ---- I1 (CheckMonotonicity): a version-chain gap must be reported, not crash the checker. ----------
+    [Theory]
+    [InlineData(0x0DE17A5D)]
+    [InlineData(0x1234ABCD)]
+    [InlineData(unchecked((int)0x7FFFFFFF))]
+    public async Task VersionGap_IsCaughtBy_JepsenChecker(int seed)
+    {
+        var specs = Enumerable.Range(0, 4).Select(i => BlindAppender(i, $"w{i}.parquet")).ToList();
+        SimulationResult result = await CommitSimulationRunner.RunAsync(seed, nameof(VersionGap_IsCaughtBy_JepsenChecker), specs);
+
+        // Drop a committed middle version to punch a hole in the chain (a fault the checker must survive).
+        result.Backend.DropObject(DeltaLogFiles.CommitPath(2));
+
+        HistoryCheckResult check = await CheckAsync(result);
+        Dump(result, check);
+
+        Assert.False(check.IsLegal, "A version-chain gap must be caught (I1), not silently accepted or thrown.");
+        Assert.Contains("I1", check.ViolatedInvariants, StringComparison.Ordinal);
+    }
+
+    // ---- I4 (CheckSnapshotIsolationAsync): a committing writer whose read-set diverges from its pinned ----
+    // snapshot (a read that leaked a ghost file across the pin) must be caught — the red-team false-negative.
+    [Theory]
+    [InlineData(0x0DE17A5D)]
+    [InlineData(0x1234ABCD)]
+    [InlineData(unchecked((int)0x7FFFFFFF))]
+    public async Task CommitWithGhostReadSet_IsCaughtBy_JepsenChecker(int seed)
+    {
+        var preCommits = new List<IReadOnlyList<string>> { new[] { DeltaTestHarness.Add("base.parquet") } };
+        var writer = new WriterSpec
+        {
+            Id = 0,
+            Actions = ImmutableArray.Create<DeltaAction>(Add("over.parquet")),
+            Scope = DeltaReadScope.WholeTable,
+            WholeTableReadsAllActive = true,
+            ReadSetGhosts = ImmutableArray.Create("ghost.parquet"),
+        };
+
+        SimulationResult result = await CommitSimulationRunner.RunAsync(
+            seed, nameof(CommitWithGhostReadSet_IsCaughtBy_JepsenChecker), new[] { writer }, preCommits: preCommits);
+
+        HistoryCheckResult check = await CheckAsync(result);
+        Dump(result, check);
+
+        Assert.False(check.IsLegal, "A commit whose read-set diverges from its pinned snapshot must be caught (I4).");
+        Assert.Contains("I4", check.ViolatedInvariants, StringComparison.Ordinal);
+    }
+
+    // ---- I5 (CheckReadYourWritesAsync): under a broken CAS an overwritten winner's file is not visible ----
+    // at its own acknowledged version — a read-your-writes break.
+    [Theory]
+    [InlineData(0x0DE17A5D)]
+    [InlineData(0x1234ABCD)]
+    [InlineData(unchecked((int)0x7FFFFFFF))]
+    public async Task LostUpdate_UnderBrokenCas_FiresReadYourWrites(int seed)
+    {
+        var specs = new List<WriterSpec> { BlindAppender(0, "w0.parquet"), BlindAppender(1, "w1.parquet") };
+
+        SimulationResult result = await CommitSimulationRunner.RunAsync(
+            seed, nameof(LostUpdate_UnderBrokenCas_FiresReadYourWrites), specs, disableSingleWinner: true, contended: true);
+
+        HistoryCheckResult check = await CheckAsync(result);
+        Dump(result, check);
+
+        Assert.False(check.IsLegal);
+        Assert.Contains("I5", check.ViolatedInvariants, StringComparison.Ordinal);
+    }
+
+    // ---- I6 (CheckIdempotentPublication): the SAME file published in two versions is a double-publish. ----
+    [Theory]
+    [InlineData(0x0DE17A5D)]
+    [InlineData(0x1234ABCD)]
+    [InlineData(unchecked((int)0x7FFFFFFF))]
+    public async Task DoublePublishedFile_IsCaughtBy_JepsenChecker(int seed)
+    {
+        var specs = new List<WriterSpec> { BlindAppender(0, "dup.parquet"), BlindAppender(1, "dup.parquet") };
+
+        SimulationResult result = await CommitSimulationRunner.RunAsync(
+            seed, nameof(DoublePublishedFile_IsCaughtBy_JepsenChecker), specs, contended: true);
+
+        HistoryCheckResult check = await CheckAsync(result);
+        Dump(result, check);
+
+        Assert.False(check.IsLegal);
+        Assert.Contains("I6", check.ViolatedInvariants, StringComparison.Ordinal);
+    }
+
+    // ---- I6 (CheckIdempotentPublication): the SAME idempotency nonce in two versions is a double-publish. ----
+    [Theory]
+    [InlineData(0x0DE17A5D)]
+    [InlineData(0x1234ABCD)]
+    [InlineData(unchecked((int)0x7FFFFFFF))]
+    public async Task DoublePublishedNonce_IsCaughtBy_JepsenChecker(int seed)
+    {
+        WriterSpec Writer(int id, string path, int? dependsOn) => new()
+        {
+            Id = id,
+            Actions = ImmutableArray.Create<DeltaAction>(Add(path)),
+            Scope = DeltaReadScope.BlindAppend,
+            NonceOverride = "shared-nonce",
+            DependsOnWriterId = dependsOn,
+        };
+
+        // Sequential (not racing) writers so neither rebases and re-encounters the shared nonce as its own
+        // durable commit — each simply lands the same nonce at a distinct version, a true double-publish.
+        var specs = new List<WriterSpec> { Writer(0, "a.parquet", null), Writer(1, "b.parquet", 0) };
+
+        SimulationResult result = await CommitSimulationRunner.RunAsync(
+            seed, nameof(DoublePublishedNonce_IsCaughtBy_JepsenChecker), specs);
+
+        HistoryCheckResult check = await CheckAsync(result);
+        Dump(result, check);
+
+        Assert.False(check.IsLegal);
+        Assert.Contains("I6", check.ViolatedInvariants, StringComparison.Ordinal);
+    }
+
+    // ---- I8 (CheckNoAnomalies): a torn write — a committed add whose backing data was never written — ----
+    // leaves a phantom/dangling active file in the final snapshot.
+    [Theory]
+    [InlineData(0x0DE17A5D)]
+    [InlineData(0x1234ABCD)]
+    [InlineData(unchecked((int)0x7FFFFFFF))]
+    public async Task TornWrite_IsCaughtBy_JepsenChecker(int seed)
+    {
+        var writer = new WriterSpec
+        {
+            Id = 0,
+            Actions = ImmutableArray.Create<DeltaAction>(Add("torn.parquet")),
+            Scope = DeltaReadScope.BlindAppend,
+            SkipDataWrite = true,
+        };
+
+        SimulationResult result = await CommitSimulationRunner.RunAsync(
+            seed, nameof(TornWrite_IsCaughtBy_JepsenChecker), new[] { writer });
+
+        HistoryCheckResult check = await CheckAsync(result);
+        Dump(result, check);
+
+        Assert.False(check.IsLegal, "A committed add with no backing data object must be caught (I8 phantom).");
+        Assert.Contains("I8", check.ViolatedInvariants, StringComparison.Ordinal);
+    }
+
+    // ---- SI (CheckConflictClassificationAsync): the checker uses the COMPUTED blind-append flag, so a ----
+    // writer that misreports it (over a non-empty table) is flagged.
+    [Theory]
+    [InlineData(0x0DE17A5D)]
+    [InlineData(0x1234ABCD)]
+    [InlineData(unchecked((int)0x7FFFFFFF))]
+    public async Task MisreportedBlindAppend_IsCaughtBy_JepsenChecker(int seed)
+    {
+        var preCommits = new List<IReadOnlyList<string>> { new[] { DeltaTestHarness.Add("seed.parquet") } };
+        var writer = new WriterSpec
+        {
+            Id = 0,
+            Actions = ImmutableArray.Create<DeltaAction>(Add("app.parquet")),
+            Scope = DeltaReadScope.BlindAppend,
+            ReportedBlindOverride = false, // lies: claims non-blind though its read-set is empty.
+        };
+
+        SimulationResult result = await CommitSimulationRunner.RunAsync(
+            seed, nameof(MisreportedBlindAppend_IsCaughtBy_JepsenChecker), new[] { writer }, preCommits: preCommits);
+
+        HistoryCheckResult check = await CheckAsync(result);
+        Dump(result, check);
+
+        Assert.False(check.IsLegal);
+        Assert.Contains("SI", check.ViolatedInvariants, StringComparison.Ordinal);
+    }
+
+    // ---- Conflict-class (CheckConflictClassificationAsync): a writer that reports a WRONG conflict class ----
+    // for the winner it actually raced is flagged. Built on a real reconstructed log with a concurrent add.
+    [Fact]
+    public async Task WrongConflictClass_IsCaughtBy_JepsenChecker()
+    {
+        var preCommits = new List<IReadOnlyList<string>> { new[] { DeltaTestHarness.Add("base.parquet") } };
+        var appender = BlindAppender(0, "app.parquet"); // commits an add at v2 → a concurrent append after v1.
+
+        SimulationResult result = await CommitSimulationRunner.RunAsync(
+            0x0DE17A5D, nameof(WrongConflictClass_IsCaughtBy_JepsenChecker), new[] { appender }, preCommits: preCommits);
+
+        // Inject a non-blind writer that read v1 (read-set {base}, consistent with the snapshot) and aborted,
+        // but reported the WRONG conflict class for the concurrent append it raced at v2.
+        var manifest = new ActionManifest(
+            ReadFileSet: ImmutableArray.Create("base.parquet"),
+            Adds: ImmutableArray<ManifestFile>.Empty,
+            Removes: ImmutableArray<ManifestFile>.Empty,
+            HasMetadataChange: false,
+            HasProtocolChange: false,
+            Txn: null,
+            ActionSetDigest: "synthetic-conflict",
+            SutReportedBlindAppend: false);
+
+        var synthetic = new HistoryEvent
+        {
+            ProcessId = 9,
+            OpType = "commit target 2",
+            InvokeTime = 1_000,
+            OkTime = 1_001,
+            SnapshotReadVersion = 1,
+            Manifest = manifest,
+            Outcome = CommitOutcome.Conflict,
+            ConflictClass = "BogusConflictException",
+            ObservedLatestVersion = 2,
+            Attempts = -1,
+        };
+
+        HistoryCheckResult check = await JepsenHistoryChecker.CheckAsync(
+            result.History.Add(synthetic), result.Backend, result.BackgroundVersions);
+        Dump(result, check);
+
+        Assert.False(check.IsLegal, "A wrong conflict class for the raced winner must be caught.");
+        Assert.Contains("I8", check.ViolatedInvariants, StringComparison.Ordinal);
+    }
+
+    // ===================================================================================================
+    // SOUNDNESS: legal histories must NOT be false-flagged (the I8 false-positive + empty-table SI fixes).
+    // ===================================================================================================
+
+    // A file W0 adds is LEGALLY removed by a later, different writer W1 — this is NOT a lost update (I8).
+    [Theory]
+    [InlineData(0x0DE17A5D)]
+    [InlineData(0x1234ABCD)]
+    [InlineData(unchecked((int)0x7FFFFFFF))]
+    public async Task CrossWriterLegalRemove_IsNotFalseFlaggedAsLostUpdate(int seed)
+    {
+        var w0 = new WriterSpec
+        {
+            Id = 0,
+            Actions = ImmutableArray.Create<DeltaAction>(Add("shared.parquet")),
+            Scope = DeltaReadScope.BlindAppend,
+        };
+        var w1 = new WriterSpec
+        {
+            Id = 1,
+            Actions = ImmutableArray.Create<DeltaAction>(Remove("shared.parquet")),
+            Scope = DeltaReadScope.ReadFiles(new[] { "shared.parquet" }),
+            ReadFileSet = ImmutableArray.Create("shared.parquet"),
+            DependsOnWriterId = 0, // read after W0 committed, so its remove targets a live file.
+        };
+
+        SimulationResult result = await CommitSimulationRunner.RunAsync(
+            seed, nameof(CrossWriterLegalRemove_IsNotFalseFlaggedAsLostUpdate), new[] { w0, w1 });
+
+        HistoryCheckResult check = await CheckAsync(result);
+        _output.WriteLine(result.Bundle.ReproductionLine);
+        if (!check.IsLegal)
+        {
+            _output.WriteLine(check.Describe());
+        }
+
+        Assert.True(check.IsLegal, "A later legal cross-writer remove must NOT be flagged as a lost update:" + Environment.NewLine + check.Describe());
+
+        Snapshot final = await new DeltaLog(result.Backend).LoadSnapshotAsync();
+        Assert.DoesNotContain("shared.parquet", final.ActiveFiles.Select(a => a.Path));
+    }
+
+    // A whole-table overwrite of an EMPTY table has an empty read-set — it must NOT be false-flagged as a
+    // blind-append mismatch (the computed-vs-reported SI cross-check is suppressed when the table was empty).
+    [Theory]
+    [InlineData(0x0DE17A5D)]
+    [InlineData(0x1234ABCD)]
+    [InlineData(unchecked((int)0x7FFFFFFF))]
+    public async Task WholeTableOverwrite_OfEmptyTable_IsLegal(int seed)
+    {
+        var writer = new WriterSpec
+        {
+            Id = 0,
+            Actions = ImmutableArray.Create<DeltaAction>(Add("first.parquet")),
+            Scope = DeltaReadScope.WholeTable,
+            WholeTableReadsAllActive = true,
+        };
+
+        SimulationResult result = await CommitSimulationRunner.RunAsync(
+            seed, nameof(WholeTableOverwrite_OfEmptyTable_IsLegal), new[] { writer });
+
+        HistoryCheckResult check = await CheckAsync(result);
+        _output.WriteLine(result.Bundle.ReproductionLine);
+        if (!check.IsLegal)
+        {
+            _output.WriteLine(check.Describe());
+        }
+
+        Assert.True(check.IsLegal, "Whole-table overwrite of an empty table must be legal (no spurious SI):" + Environment.NewLine + check.Describe());
     }
 }
