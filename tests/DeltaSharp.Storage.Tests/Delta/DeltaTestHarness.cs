@@ -37,6 +37,18 @@ internal static class DeltaTestHarness
             .Replace("__S__", EmptySchema, StringComparison.Ordinal)
             .Replace("__P__", partitionColumns is null ? "" : string.Join(",", partitionColumns.Select(p => $"\"{p}\"")), StringComparison.Ordinal);
 
+    /// <summary>A <c>metaData</c> line carrying an arbitrary table <c>configuration</c> map (e.g.
+    /// <c>delta.deletedFileRetentionDuration</c>), used to test VACUUM honoring the table-configured
+    /// retention property.</summary>
+    public static string MetadataWithConfig(params (string Key, string Value)[] configuration)
+    {
+        string config = "{" + string.Join(
+            ",", configuration.Select(kv => $"\"{kv.Key}\":\"{kv.Value}\"")) + "}";
+        return """{"metaData":{"id":"t","format":{"provider":"parquet","options":{}},"schemaString":"__S__","partitionColumns":[],"configuration":__C__}}"""
+            .Replace("__S__", EmptySchema, StringComparison.Ordinal)
+            .Replace("__C__", config, StringComparison.Ordinal);
+    }
+
     public static string Add(string path, string? stats = null, (string Key, string Value)[]? partitionValues = null)
     {
         string pv = partitionValues is null

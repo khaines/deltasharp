@@ -376,6 +376,7 @@ boundary.
 | Scan volume / memory | Counter / Histogram | `deltasharp.scan.bytes`, `deltasharp.exec.memory.peak` | `By` | `ExecutionMetrics.BytesScanned`/`PeakMemoryBytes`/`SpilledBytes` | dotnet-runtime-performance-engineer |
 | Storage I/O | Counter / Histogram | `deltasharp.storage.io.bytes` (`direction`, `backend` tags), `deltasharp.storage.io.duration` | `By`, `s` | future storage layer | delta-storage-format-engineer |
 | Delta commit | Counter / Histogram | `deltasharp.delta.commit.count` (`deltasharp.outcome` tag), `deltasharp.delta.commit.duration`, `deltasharp.delta.commit.attempts` (`deltasharp.outcome` tag), `deltasharp.delta.commit.conflicts` (`deltasharp.conflict.class` tag), `deltasharp.delta.commit.transient_retries` | `{commit}`, `s`, `{attempt}`, `{conflict}`, `{retry}` | Delta log (#479) | delta-storage-format-engineer |
+| Delta VACUUM | Counter / Histogram | `deltasharp.delta.vacuum.count` (`deltasharp.outcome` tag), `deltasharp.delta.vacuum.duration` (`deltasharp.outcome` tag), `deltasharp.delta.vacuum.files` (`deltasharp.vacuum.decision` tag) | `{vacuum}`, `s`, `{file}` | Delta maintenance (#196) | delta-storage-format-engineer |
 | Shuffle | Counter / Histogram | `deltasharp.shuffle.bytes`, `deltasharp.shuffle.fetch.duration`, `deltasharp.shuffle.reresolve.count` | `By`, `s`, `{operation}` | future shuffle ([ADR-0004](../../adr/0004-shuffle-architecture.md)) | dotnet-distributed-execution-engineer |
 | Saturation / USE | UpDownCounter / ObservableGauge | `deltasharp.executor.active`, `deltasharp.exec.queue.depth`, `deltasharp.rpc.inflight`, `deltasharp.exec.memory.reserved` | `{executor}`, `{task}`, `{operation}`, `By` | future driver/executor + shuffle | cloud-native-site-reliability-engineer |
 | Runtime / GC | EventCounters | allocation rate, GC pause, thread-pool queue (`dotnet-counters`) | varies | .NET runtime | dotnet-runtime-performance-engineer |
@@ -402,7 +403,10 @@ executor, and operator unless the instrument name identifies the viewpoint.
 
 Labels use the **metric-label-safe** set only — today the six bounded `DeltaSharpTelemetry` keys
 (`deltasharp.component`, `deltasharp.operation`, `deltasharp.outcome`, `deltasharp.stage`, plus
-`deltasharp.backend` and `deltasharp.conflict.class`, minted by the Delta commit path in #479). The
+`deltasharp.backend` and `deltasharp.conflict.class`, minted by the Delta commit path in #479), and the
+bounded `deltasharp.vacuum.decision` key (a closed four-value set — `deletable`, `active`,
+`retention_protected_tombstone`, `recently_staged` — minted by the Delta VACUUM path in #196; a candidate
+object path is **never** a metric tag and appears only on the audit log). The
 remaining storage, error-classification, and propagation instruments add their own bounded labels (a
 storage-I/O `direction` — `read`/`write` —, a sanitized error class, and a wire `protocol`), **documented
 here but not yet minted** in `DeltaSharpTelemetry` and added as `deltasharp.`-prefixed (or adopted OpenTelemetry

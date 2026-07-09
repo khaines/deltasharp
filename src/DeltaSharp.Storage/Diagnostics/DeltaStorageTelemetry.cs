@@ -65,6 +65,57 @@ internal enum CommitRetryReason
 }
 
 /// <summary>
+/// The bounded terminal outcome of a Delta VACUUM (design §2.14, STORY-05.6.2) behind the shared
+/// <see cref="DeltaSharpTelemetry.OutcomeKey"/> label — so a dry-run, a real reclamation, a fail-closed
+/// sub-threshold rejection, a cancellation, and an unexpected failure are never collapsed into one
+/// ambiguous count (design §7.1/§7.3, checklist 09b). A closed value set, safe as a metric label.
+/// </summary>
+internal enum VacuumOutcome
+{
+    /// <summary>A dry-run listed the deletion-eligible paths without deleting anything (AC1).</summary>
+    DryRun,
+
+    /// <summary>A real VACUUM reclaimed the deletion-eligible files (idempotently, AC4).</summary>
+    Completed,
+
+    /// <summary>The requested retention was below the safety threshold and the unsafe override was not
+    /// enabled, so VACUUM was rejected fail-closed before any selection (AC2).</summary>
+    RejectedUnsafeRetention,
+
+    /// <summary>VACUUM was cancelled via its <see cref="System.Threading.CancellationToken"/> before a
+    /// terminal outcome. A cancellation is <b>not</b> a failure.</summary>
+    Cancelled,
+
+    /// <summary>An unexpected/unclassified failure (fail-closed; nothing protected is deleted).</summary>
+    Failure,
+}
+
+/// <summary>
+/// The bounded per-candidate VACUUM decision (design §2.11.5 / §2.14, STORY-05.6.2 AC3): why a discovered
+/// candidate file was kept or is deletion-eligible. The <b>deletion</b> decision itself is always the
+/// <see cref="DeltaSharp.Storage.Delta.OrphanCleanup.SelectDeletable"/> contract's output; the three kept
+/// reasons annotate <i>why</i> the contract retained a file, for the audit trail. A closed, low-cardinality
+/// set — safe as the <see cref="DeltaStorageTelemetry.VacuumDecisionKey"/> metric label (a candidate path is
+/// never a metric tag).
+/// </summary>
+internal enum VacuumDecision
+{
+    /// <summary>Retention-expired and unreferenced: the contract selected it for deletion.</summary>
+    Deletable,
+
+    /// <summary>An active file in the current snapshot — never an orphan, always protected.</summary>
+    Active,
+
+    /// <summary>A tombstone removed within the retention window (or with an unknown deletion time, treated
+    /// as <c>+∞</c>) — a stale reader pinned to an older snapshot may still read it.</summary>
+    RetentionProtectedTombstone,
+
+    /// <summary>Modified within the retention window (<c>mtime &gt;= cutoff</c>, inclusive) — it may belong
+    /// to an in-flight commit, so it is protected against listing lag / a torn view.</summary>
+    RecentlyStaged,
+}
+
+/// <summary>
 /// The commit-path telemetry surface for <c>DeltaSharp.Storage</c> — the two <see cref="Meter"/>s and two
 /// <see cref="ActivitySource"/>s the storage layer owns (named <c>DeltaSharp.Storage</c> and
 /// <c>DeltaSharp.Delta</c> per design §7.3/§7.4), plus the Delta <b>commit</b> instruments, built on the
@@ -116,6 +167,18 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     /// (no abort). Part of the design's closed <c>conflict.class</c> value set.</summary>
     internal const string ConcurrentWriteClass = "concurrent_write";
 
+    /// <summary>The bounded <c>deltasharp.operation=vacuum</c> value for the VACUUM maintenance path.</summary>
+    internal const string VacuumOperation = "vacuum";
+
+    /// <summary>The stable VACUUM span name (design §7.4): variables live in bounded attributes.</summary>
+    internal const string VacuumActivityName = DeltaName + ".Vacuum";
+
+    /// <summary>The bounded <c>deltasharp.vacuum.decision</c> metric label key sub-classifying a VACUUM
+    /// candidate file count by its retention decision (<c>deletable</c>, <c>active</c>,
+    /// <c>retention_protected_tombstone</c>, <c>recently_staged</c>). A closed value set (metric-label-safe);
+    /// the candidate <i>path</i> is never a metric tag (unbounded — it lives only on the audit log).</summary>
+    internal const string VacuumDecisionKey = "deltasharp.vacuum.decision";
+
     private static readonly string AssemblyVersion =
         typeof(DeltaStorageTelemetry).Assembly.GetName().Version?.ToString() ?? "0.0.0";
 
@@ -129,6 +192,9 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     private readonly Histogram<int> _commitAttempts;
     private readonly Counter<long> _commitConflicts;
     private readonly Counter<long> _commitTransientRetries;
+    private readonly Histogram<double> _vacuumDuration;
+    private readonly Counter<long> _vacuumCount;
+    private readonly Counter<long> _vacuumFiles;
 
     internal DeltaStorageTelemetry()
     {
@@ -152,6 +218,15 @@ internal sealed class DeltaStorageTelemetry : IDisposable
         _commitTransientRetries = _deltaMeter.CreateCounter<long>(
             "deltasharp.delta.commit.transient_retries", unit: "{retry}",
             description: "Transient storage-failure retries within a commit's put-if-absent attempts (degradation signal).");
+        _vacuumDuration = _deltaMeter.CreateHistogram<double>(
+            "deltasharp.delta.vacuum.duration", unit: "s",
+            description: "Elapsed (monotonic) duration of a Delta VACUUM, by terminal outcome.");
+        _vacuumCount = _deltaMeter.CreateCounter<long>(
+            "deltasharp.delta.vacuum.count", unit: "{vacuum}",
+            description: "Terminal Delta VACUUM outcomes (dry-run, completed, rejected, cancelled, failure).");
+        _vacuumFiles = _deltaMeter.CreateCounter<long>(
+            "deltasharp.delta.vacuum.files", unit: "{file}",
+            description: "VACUUM candidate files by retention decision (deletable / active / retention-protected / recently-staged).");
     }
 
     /// <summary>The <c>DeltaSharp.Delta</c> meter (commit instruments). Exposed for reference-identity
@@ -212,6 +287,63 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     /// transient-degraded-but-successful commit records &gt;0, so an SRE can distinguish the two even though
     /// both terminate as <c>outcome=success</c> with <c>attempts=1</c>.</summary>
     internal void RecordTransientRetry() => _commitTransientRetries.Add(1);
+
+    /// <summary>Starts the VACUUM span if a listener samples the Delta source; returns <see langword="null"/>
+    /// (a cheap no-op) otherwise. The caller sets low-cardinality attributes and status.</summary>
+    internal Activity? StartVacuumActivity(StorageBackendKind backend)
+    {
+        Activity? activity = DeltaActivitySource.StartActivity(VacuumActivityName, ActivityKind.Internal);
+        if (activity is not null)
+        {
+            activity.SetTag(DeltaSharpTelemetry.ComponentKey, DeltaComponent);
+            activity.SetTag(DeltaSharpTelemetry.OperationKey, VacuumOperation);
+            activity.SetTag(BackendKey, backend.ToLabel());
+        }
+
+        return activity;
+    }
+
+    /// <summary>Records the terminal signals for one VACUUM: the duration histogram and the outcome counter,
+    /// tagged with the bounded <see cref="DeltaSharpTelemetry.OutcomeKey"/>. A single measurement per VACUUM
+    /// (never per candidate), so it is allocation-light and export-safe.</summary>
+    internal void RecordVacuumTerminal(VacuumOutcome outcome, double durationSeconds)
+    {
+        var outcomeTag = new KeyValuePair<string, object?>(DeltaSharpTelemetry.OutcomeKey, ToLabel(outcome));
+        _vacuumDuration.Record(durationSeconds, outcomeTag);
+        _vacuumCount.Add(1, outcomeTag);
+    }
+
+    /// <summary>Adds <paramref name="count"/> VACUUM candidate files to the per-decision counter, tagged
+    /// with the bounded <see cref="VacuumDecisionKey"/>. One measurement per decision bucket (never per
+    /// file), so an SRE can chart the deletion-eligible vs. protected split without any unbounded path tag.</summary>
+    internal void RecordVacuumFiles(VacuumDecision decision, long count)
+    {
+        if (count <= 0)
+        {
+            return;
+        }
+
+        _vacuumFiles.Add(count, new KeyValuePair<string, object?>(VacuumDecisionKey, ToLabel(decision)));
+    }
+
+    /// <summary>The bounded <c>deltasharp.outcome</c> string for a <see cref="VacuumOutcome"/>.</summary>
+    internal static string ToLabel(VacuumOutcome outcome) => outcome switch
+    {
+        VacuumOutcome.DryRun => "dry_run",
+        VacuumOutcome.Completed => "completed",
+        VacuumOutcome.RejectedUnsafeRetention => "rejected_unsafe_retention",
+        VacuumOutcome.Cancelled => "cancelled",
+        _ => "failure",
+    };
+
+    /// <summary>The bounded <c>deltasharp.vacuum.decision</c> string for a <see cref="VacuumDecision"/>.</summary>
+    internal static string ToLabel(VacuumDecision decision) => decision switch
+    {
+        VacuumDecision.Deletable => "deletable",
+        VacuumDecision.Active => "active",
+        VacuumDecision.RetentionProtectedTombstone => "retention_protected_tombstone",
+        _ => "recently_staged",
+    };
 
     /// <summary>The bounded <c>deltasharp.outcome</c> string for a <see cref="CommitOutcome"/>.</summary>
     internal static string ToLabel(CommitOutcome outcome) => outcome switch

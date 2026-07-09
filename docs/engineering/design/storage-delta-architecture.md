@@ -563,6 +563,22 @@ Fault injection for partial uploads, eventual listing, throttling, and retry-aft
 
 **Why 05.6 before 05.5.** Write-time statistics/data-skipping (#197) feed the CBO/AQE contracts ([ADR-0006](../../adr/0006-scheduler-aqe-cbo.md)) and the query engine needs them early; OPTIMIZE/VACUUM stabilize the table before advanced features add on-read complexity. The advanced features (05.5) raise reader/writer requirements and reduce cross-engine interop, so they are protocol-gated and land last.
 
+#### VACUUM & retention safety (#196, STORY-05.6.2)
+
+VACUUM reclaims data files no longer referenced by the table and older than a retention window, and is the reclamation half of the orphan-cleanup contract (§2.11.5). `DeltaVacuum` (`src/DeltaSharp.Storage/Delta/DeltaVacuum.cs`) never re-implements the deletion decision: it discovers candidates (list the table directory, exclude `_delta_log/**`, stamp each with its `LastModified` epoch-millis) and routes **every** candidate through `OrphanCleanup.SelectDeletable(snapshot, candidates, cutoff)`, whose output *is* the deletion-eligible set. The retention cutoff is `now − retention` (`now` from an injected `TimeProvider` for deterministic tests).
+
+**Retention config (`RetentionPolicy`).** Two independent windows, both defaulting to Delta's 7-day (168 h) deleted-file retention:
+
+- **Default retention** — applied when a caller does not name an explicit window.
+- **Safety threshold** — the *minimum* retention VACUUM will honor. A request **below** the threshold is **rejected fail-closed** with `VacuumRetentionSafetyException` **before** the snapshot is loaded or any candidate is selected (AC2), unless the caller sets an explicit **unsafe override** (`unsafeOverride: true`), accepting the stale-reader/time-travel data-loss risk. A too-short retention is the highest-severity data-loss class (§3.6 oracle), so the guard rejects rather than trusting the caller.
+
+**Dry-run & audit (AC1/AC3).** `VacuumAsync(retention, dryRun, unsafeOverride, ct)` returns a structured `VacuumResult` — the deletion-eligible paths, the paths actually deleted (empty for a dry-run), and a per-candidate **audit** (`VacuumAuditEntry{ path, decision, deleted }`) recording *why* each file was kept or deleted (`deletable` / `active` / `retention_protected_tombstone` / `recently_staged`). The same decisions are emitted as bounded `DeltaVacuumLog` audit logs (EventIds 4100–4199) and a `deltasharp.delta.vacuum.*` metric family (see [observability-conventions](observability-conventions.md)); a candidate path is audit-log evidence only, never a metric tag.
+
+**Fail-safe under listing lag / concurrent readers (AC3).** A stale `LIST` that omits a just-written file yields no candidate for it — VACUUM never deletes what it does not see. A file modified within the window (`mtime >= cutoff`, inclusive), a tombstone removed within the window (or with an unknown deletion time ⇒ `+∞`), and any active file are all retained by the contract, so a lagging/torn view can only ever keep *more*, never delete more.
+
+**Idempotent retry (AC4).** Deletes go through `IStorageBackend.DeleteAsync`, which treats a missing object as a no-op success, so a VACUUM retry after a crash mid-delete re-issues deletes for already-gone files without error and a subsequent run converges to nothing left to reclaim.
+
+
 **Advanced-feature gating and "unsupported fails closed"** (checklist *Schema/advanced* bullets 4–8; *Delta log protocol* bullet 2). Before any read/write, negotiation compares the table's `readerFeatures`/`writerFeatures` against DeltaSharp's implemented set; any gap throws a precise protocol error naming the feature and never proceeds (anti-pattern: "silently reading … unsupported table features"):
 
 | Advanced feature (issue) | Reader/writer feature flag | Fail-closed behavior |

@@ -8,6 +8,30 @@ namespace DeltaSharp.Storage.Delta;
 /// window.</summary>
 internal readonly record struct OrphanCandidate(string Path, long ModificationTimeMillis);
 
+/// <summary>The bounded reason the <see cref="OrphanCleanup"/> contract assigned to a discovered candidate —
+/// the single source of truth for both the deletion decision and the audit annotation. Only
+/// <see cref="Deletable"/> candidates are ever reclaimed; the other three are fail-safe protections.</summary>
+internal enum OrphanClassification
+{
+    /// <summary>Retention-expired and unreferenced by the log: safe to reclaim.</summary>
+    Deletable,
+
+    /// <summary>Referenced by an active <c>add</c> in the current snapshot — never an orphan.</summary>
+    Active,
+
+    /// <summary>Referenced by a tombstone removed within the retention window (or with an unknown deletion
+    /// time) — a stale reader pinned to an older snapshot may still read it.</summary>
+    RetentionProtectedTombstone,
+
+    /// <summary>Modified within the retention window (<c>mtime &gt;= cutoff</c>) — it may belong to an
+    /// in-flight commit, so it is protected against listing lag / a torn view.</summary>
+    RecentlyStaged,
+}
+
+/// <summary>A single candidate's classification: the object <see cref="Path"/> (the raw, unencoded disk key
+/// as listed) and the fail-safe <see cref="Classification"/> the contract assigned it.</summary>
+internal readonly record struct OrphanDecision(string Path, OrphanClassification Classification);
+
 /// <summary>
 /// The <b>orphan-file cleanup contract</b> (design §2.11.5, STORY-05.3.2 AC2/AC4). Files staged but never
 /// committed — a crash before commit, or a lost commit later rebased away — are orphans: not referenced by
@@ -22,6 +46,24 @@ internal readonly record struct OrphanCandidate(string Path, long ModificationTi
 /// stale reader pinned to an older snapshot may still read it); and (c) not itself modified at or after the
 /// cutoff (a just-staged file may belong to an in-flight commit). Everything else is retained — the contract
 /// is <b>fail-safe</b>: an unknown deletion time or a boundary case is treated as protected, never deleted.</para>
+///
+/// <para><b>Path-encoding robustness (data-loss critical).</b> Delta's protocol URI-encodes the file paths
+/// stored in the log (<c>add.path</c>/<c>remove.path</c>): a file literally named <c>a b.parquet</c> on disk
+/// is recorded as <c>a%20b.parquet</c> in the log. DeltaSharp writes unencoded paths (its own tables
+/// round-trip), but a Spark-written / Delta-protocol table has encoded log paths, while a directory listing
+/// always yields the raw disk key. Matching a raw candidate against only the raw log path would classify the
+/// still-active <c>a b.parquet</c> as an orphan and delete it. The protected sets are therefore the
+/// <b>union</b> of each log path and its <see cref="Uri.UnescapeDataString(string)"/> decoding, and the raw
+/// candidate key is tested against that union. This protects both DeltaSharp-unencoded and Spark-encoded
+/// tables; it can only ever <i>over</i>-protect (a rare filename containing a literal <c>%</c> sequence that
+/// happens to decode to another candidate's name), never over-delete.</para>
+///
+/// <para><b>Referenced-path assumption (tracked, not yet handled).</b> The protected sets are built from
+/// <c>add.path</c> and <c>remove.path</c> only. Deletion-vector sidecars (<c>.bin</c>, referenced by
+/// <c>add.deletionVector</c>) and Change-Data-Feed files (under <c>_change_data/</c>) are referenced by
+/// <b>non-<c>add.path</c></b> fields; once those features ship their referenced paths MUST be added to the
+/// protected union here or VACUUM would wrongly reclaim a still-referenced file. A tracking issue is filed;
+/// do not attempt DV/CDF handling before it lands.</para>
 /// </summary>
 internal static class OrphanCleanup
 {
@@ -29,47 +71,105 @@ internal static class OrphanCleanup
     /// Returns the subset of <paramref name="candidates"/> that is safe to delete given
     /// <paramref name="snapshot"/> and a <paramref name="retentionCutoffMillis"/> (epoch millis; a file
     /// protected iff it was removed/modified at or after the cutoff). Active files and retention-protected
-    /// files are always excluded.
+    /// files are always excluded. This is the deletable projection of <see cref="Classify"/> — the single
+    /// source of truth — so the deletion set never diverges from the audit classification.
     /// </summary>
     /// <exception cref="ArgumentNullException"><paramref name="snapshot"/> or <paramref name="candidates"/> is null.</exception>
     public static IReadOnlyList<string> SelectDeletable(
         Snapshot snapshot, IEnumerable<OrphanCandidate> candidates, long retentionCutoffMillis)
     {
-        ArgumentNullException.ThrowIfNull(snapshot);
-        ArgumentNullException.ThrowIfNull(candidates);
-
-        ImmutableHashSet<string> active = snapshot.ActiveFiles
-            .Select(add => add.Path)
-            .ToImmutableHashSet(StringComparer.Ordinal);
-
-        // A tombstone is retention-protected while a stale reader might still need it: removed at/after the
-        // cutoff, OR with an unknown deletion time (fail safe — never delete on missing provenance).
-        ImmutableHashSet<string> protectedTombstones = snapshot.Tombstones
-            .Where(remove => (remove.DeletionTimestamp ?? long.MaxValue) >= retentionCutoffMillis)
-            .Select(remove => remove.Path)
-            .ToImmutableHashSet(StringComparer.Ordinal);
-
         var deletable = new List<string>();
-        foreach (OrphanCandidate candidate in candidates)
+        foreach (OrphanDecision decision in Classify(snapshot, candidates, retentionCutoffMillis))
         {
-            if (active.Contains(candidate.Path))
+            if (decision.Classification == OrphanClassification.Deletable)
             {
-                continue; // an active data file is never an orphan.
+                deletable.Add(decision.Path);
             }
-
-            if (protectedTombstones.Contains(candidate.Path))
-            {
-                continue; // removed within the retention window — a stale reader may still read it.
-            }
-
-            if (candidate.ModificationTimeMillis >= retentionCutoffMillis)
-            {
-                continue; // staged within the retention window — may belong to an in-flight commit.
-            }
-
-            deletable.Add(candidate.Path);
         }
 
         return deletable;
+    }
+
+    /// <summary>
+    /// Classifies <b>every</b> candidate with the single fail-safe reason (active / retention-protected
+    /// tombstone / recently staged / deletable) VACUUM consumes for both its deletion set (the
+    /// <see cref="OrphanClassification.Deletable"/> subset) and its per-candidate audit. Centralizing the
+    /// reason here means the encoding-robust matching and the exclusion order live in exactly one place.
+    /// </summary>
+    /// <exception cref="ArgumentNullException"><paramref name="snapshot"/> or <paramref name="candidates"/> is null.</exception>
+    public static IReadOnlyList<OrphanDecision> Classify(
+        Snapshot snapshot, IEnumerable<OrphanCandidate> candidates, long retentionCutoffMillis)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        ArgumentNullException.ThrowIfNull(candidates);
+
+        // Encoding-robust protected sets: a raw disk key matches a log path under raw-equality OR
+        // URI-decoded-equality, so both DeltaSharp-unencoded and Spark-encoded (e.g. "a%20b.parquet")
+        // tables protect the same real file. Building the log side as {raw} ∪ {UnescapeDataString(raw)}
+        // and comparing the raw candidate key against it can only over-protect, never over-delete.
+        ImmutableHashSet<string> active = BuildEncodingRobustSet(
+            snapshot.ActiveFiles.Select(add => add.Path));
+
+        // A tombstone is retention-protected while a stale reader might still need it: removed at/after the
+        // cutoff, OR with an unknown deletion time (fail safe — never delete on missing provenance).
+        ImmutableHashSet<string> protectedTombstones = BuildEncodingRobustSet(
+            snapshot.Tombstones
+                .Where(remove => (remove.DeletionTimestamp ?? long.MaxValue) >= retentionCutoffMillis)
+                .Select(remove => remove.Path));
+
+        var decisions = new List<OrphanDecision>();
+        foreach (OrphanCandidate candidate in candidates)
+        {
+            decisions.Add(new OrphanDecision(candidate.Path, ClassifyOne(
+                candidate, active, protectedTombstones, retentionCutoffMillis)));
+        }
+
+        return decisions;
+    }
+
+    private static OrphanClassification ClassifyOne(
+        OrphanCandidate candidate,
+        ImmutableHashSet<string> active,
+        ImmutableHashSet<string> protectedTombstones,
+        long retentionCutoffMillis)
+    {
+        if (active.Contains(candidate.Path))
+        {
+            return OrphanClassification.Active; // an active data file is never an orphan.
+        }
+
+        if (protectedTombstones.Contains(candidate.Path))
+        {
+            // removed within the retention window — a stale reader may still read it.
+            return OrphanClassification.RetentionProtectedTombstone;
+        }
+
+        if (candidate.ModificationTimeMillis >= retentionCutoffMillis)
+        {
+            // staged within the retention window — may belong to an in-flight commit.
+            return OrphanClassification.RecentlyStaged;
+        }
+
+        return OrphanClassification.Deletable;
+    }
+
+    /// <summary>Builds the protection set as the union of each log path and its URI-decoded form, so a raw
+    /// (unencoded) disk key is matched whether the log stored the path encoded (Spark/Delta protocol) or
+    /// unencoded (DeltaSharp). <see cref="StringComparer.Ordinal"/> is preserved (paths are byte-exact keys,
+    /// never culture-folded).</summary>
+    private static ImmutableHashSet<string> BuildEncodingRobustSet(IEnumerable<string> logPaths)
+    {
+        var builder = ImmutableHashSet.CreateBuilder<string>(StringComparer.Ordinal);
+        foreach (string logPath in logPaths)
+        {
+            builder.Add(logPath);
+            string decoded = Uri.UnescapeDataString(logPath);
+            if (!string.Equals(decoded, logPath, StringComparison.Ordinal))
+            {
+                builder.Add(decoded);
+            }
+        }
+
+        return builder.ToImmutable();
     }
 }

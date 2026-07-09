@@ -151,4 +151,40 @@ public sealed class OrphanCleanupTests : IDisposable
             new[] { "old-orphan.parquet", "removed.parquet" },
             deletable.OrderBy(p => p, StringComparer.Ordinal).ToArray());
     }
+
+    [Fact]
+    public async Task EncodedActiveLogPath_ProtectsUnencodedDiskCandidate()
+    {
+        // CRITICAL-1 (data-loss): a Spark/Delta-protocol table URI-encodes log paths — the active file
+        // literally named "spark active.parquet" on disk is recorded as "spark%20active.parquet" in the
+        // log. A directory listing yields the RAW disk key ("spark active.parquet"). Matching only the raw
+        // log path would classify the still-active file as an orphan and delete it. The contract must treat
+        // the candidate as REFERENCED via the raw ∪ URI-decoded union of the log path.
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Add("spark%20active.parquet"));
+        Snapshot snapshot = await new DeltaLog(_backend).LoadSnapshotAsync();
+
+        // mtime 0 is well below the cutoff, so absent the encoding fix this would be classified deletable.
+        Assert.Empty(OrphanCleanup.SelectDeletable(
+            snapshot,
+            new[] { new OrphanCandidate("spark active.parquet", ModificationTimeMillis: 0) },
+            retentionCutoffMillis: 1000));
+    }
+
+    [Fact]
+    public async Task EncodedTombstoneWithinRetention_ProtectsUnencodedDiskCandidate()
+    {
+        // CRITICAL-1 companion: an encoded tombstone path within the retention window must protect the
+        // raw-keyed disk candidate too (a stale reader may still read it), via the same raw ∪ decoded union.
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Add("enc%20removed.parquet"));
+        await DeltaTestHarness.WriteCommitAsync(_backend, 2, DeltaTestHarness.Remove("enc%20removed.parquet"));
+        Snapshot snapshot = await new DeltaLog(_backend).LoadSnapshotAsync();
+
+        // Tombstone deletionTimestamp = 1 (harness); cutoff 1 → (1 >= 1) within retention → protected.
+        Assert.Empty(OrphanCleanup.SelectDeletable(
+            snapshot,
+            new[] { new OrphanCandidate("enc removed.parquet", ModificationTimeMillis: 0) },
+            retentionCutoffMillis: 1));
+    }
 }
