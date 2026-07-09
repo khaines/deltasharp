@@ -195,6 +195,127 @@ public sealed class DeltaVacuumTests : IDisposable
             () => _vacuum.VacuumAsync(TimeSpan.FromHours(-1)));
     }
 
+    [Fact]
+    public async Task EncodedActiveLogPath_UnencodedDiskFile_IsNeverDeleted()
+    {
+        // CRITICAL-1 (data-loss, end-to-end): a Spark/Delta-protocol table URI-encodes log paths. The active
+        // file literally named "a b.parquet" on disk is recorded as "a%20b.parquet" in the log, but the
+        // directory listing yields the RAW disk key "a b.parquet". Absent the encoding-robust matching the
+        // raw candidate would not match the encoded active path → classified orphan → DELETED. VACUUM must
+        // protect it. (This test FAILS on the pre-fix ordinal-only matching and PASSES after the fix.)
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Add("a%20b.parquet"));
+        await WriteDataFileAsync("a b.parquet", Old); // raw disk key, old mtime → deletable but for the log ref
+
+        VacuumResult result = await _vacuum.VacuumAsync(Retention);
+
+        Assert.DoesNotContain("a b.parquet", result.DeletedPaths);
+        Assert.Empty(result.DeletablePaths);
+        Assert.NotNull(await _backend.HeadAsync("a b.parquet", CancellationToken.None));
+        Assert.Equal(VacuumDecision.Active, result.Audit.Single(e => e.Path == "a b.parquet").Decision);
+    }
+
+    [Fact]
+    public async Task ConcurrentlyCommittedActiveFile_InListLoadWindow_IsNeverDeleted()
+    {
+        // CRITICAL-2 (TOCTOU): a writer that commits an active file in the list/snapshot-load window must not
+        // be deleted. The BeforeListProbe fires immediately before candidate listing; because listing now
+        // precedes snapshot load, the raced file is either not yet listed (not a candidate) or already
+        // active in the later-loaded snapshot (protected). On the pre-fix load-before-list ordering the same
+        // probe fires AFTER the (older) snapshot load, so the file is listed-but-not-in-snapshot with an old
+        // mtime → DELETED. (FAILS pre-fix, PASSES after the reorder.)
+        await WriteLogAsync(new[] { DeltaTestHarness.Add("active.parquet") });
+        await WriteDataFileAsync("active.parquet", Old);
+
+        _vacuum.BeforeListProbe = async ct =>
+        {
+            // A concurrent writer commits a new active file (v2) and stages it on disk with an mtime BELOW
+            // the cutoff (clock skew / preserved-timestamp move) — the recency fail-safe alone would not
+            // save it; only the list-before-load ordering does.
+            await DeltaTestHarness.WriteCommitAsync(_backend, 2, DeltaTestHarness.Add("raced-active.parquet"));
+            await WriteDataFileAsync("raced-active.parquet", Old);
+        };
+
+        VacuumResult result = await _vacuum.VacuumAsync(Retention);
+
+        Assert.DoesNotContain("raced-active.parquet", result.DeletedPaths);
+        Assert.NotNull(await _backend.HeadAsync("raced-active.parquet", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task TableConfiguredRetention_IsHonored_OnNoArgVacuum()
+    {
+        // MEDIUM: a no-argument VACUUM must honor the table's delta.deletedFileRetentionDuration (30 days),
+        // not the 7-day process default — otherwise a 10-day-old orphan (still within the configured window)
+        // would be wrongly reclaimed. A 60-day orphan (past the window) is still deletable.
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 0, DeltaTestHarness.Protocol(),
+            DeltaTestHarness.MetadataWithConfig(("delta.deletedFileRetentionDuration", "interval 30 days")));
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Add("active.parquet"));
+        await WriteDataFileAsync("active.parquet", Old);
+        await WriteDataFileAsync("orphan-10d.parquet", Now.AddDays(-10).UtcDateTime); // within 30 d → protected
+        await WriteDataFileAsync("orphan-60d.parquet", Old);                          // past 30 d → deletable
+
+        VacuumResult result = await _vacuum.VacuumAsync();
+
+        Assert.Equal(TimeSpan.FromDays(30), result.Retention);
+        Assert.Equal(new[] { "orphan-60d.parquet" }, result.DeletedPaths.ToArray());
+        Assert.NotNull(await _backend.HeadAsync("orphan-10d.parquet", CancellationToken.None));
+        Assert.Equal(
+            VacuumDecision.RecentlyStaged, result.Audit.Single(e => e.Path == "orphan-10d.parquet").Decision);
+    }
+
+    [Fact]
+    public async Task DeleteOnMissingCandidate_IsIdempotent_AndSucceeds()
+    {
+        // HIGH (AC4 efficacy): force DeleteAsync on an ALREADY-DELETED candidate by removing it out-of-band
+        // between selection and delete (the BeforeDeleteProbe). VACUUM must still succeed (idempotent no-op).
+        // Mutating the backend's DeleteAsync-on-missing to throw would fail this test.
+        await WriteLogAsync(new[] { DeltaTestHarness.Add("active.parquet") });
+        await WriteDataFileAsync("old-orphan.parquet", Old);
+
+        _vacuum.BeforeDeleteProbe = ct => _backend.DeleteAsync("old-orphan.parquet", ct).AsTask();
+
+        VacuumResult result = await _vacuum.VacuumAsync(Retention);
+
+        // It was selected (present at LIST time), and the delete of the now-missing file is a no-op success.
+        Assert.Contains("old-orphan.parquet", result.DeletablePaths);
+        Assert.Contains("old-orphan.parquet", result.DeletedPaths);
+        Assert.Null(await _backend.HeadAsync("old-orphan.parquet", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task StaleListing_WithLaggingMtime_NeverDeletesProtectedFiles()
+    {
+        // HIGH (AC3 efficacy): inject a torn LIST via a fault backend. An ACTIVE file is reported with a
+        // lagging (old) mtime AND a protected file is omitted from the listing entirely. The active file is
+        // protected by the active set regardless of its listed mtime; the omitted file is never a candidate.
+        // Only the genuine orphan is reclaimed. (Mutating the active-set protection to trust the listed mtime
+        // would delete "active.parquet" and fail this test.)
+        var stale = new StaleListingBackend(
+            _backend,
+            omittedFromList: new[] { "hidden-active.parquet" },
+            mtimeOverrides: new Dictionary<string, DateTime>(StringComparer.Ordinal)
+            {
+                ["active.parquet"] = Old, // torn view: an active file looks retention-expired.
+            });
+        var vacuum = new DeltaVacuum(
+            stale, policy: null, logger: null, telemetry: null, timeProvider: new FixedTimeProvider(Now));
+
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 1, DeltaTestHarness.Add("active.parquet"), DeltaTestHarness.Add("hidden-active.parquet"));
+        await WriteDataFileAsync("active.parquet", Recent.UtcDateTime);
+        await WriteDataFileAsync("hidden-active.parquet", Old);
+        await WriteDataFileAsync("old-orphan.parquet", Old);
+
+        VacuumResult result = await vacuum.VacuumAsync(Retention);
+
+        Assert.Equal(new[] { "old-orphan.parquet" }, result.DeletedPaths.ToArray());
+        Assert.NotNull(await _backend.HeadAsync("active.parquet", CancellationToken.None));
+        Assert.NotNull(await _backend.HeadAsync("hidden-active.parquet", CancellationToken.None));
+    }
+
     // ---- helpers ----
 
     private static DateTime Old => Now.AddDays(-60).UtcDateTime;    // well before any tested cutoff → deletable
