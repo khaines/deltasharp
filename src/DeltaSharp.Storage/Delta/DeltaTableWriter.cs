@@ -1,6 +1,5 @@
 using System.Collections.Immutable;
 using System.Globalization;
-using System.Linq;
 using System.Text;
 using DeltaSharp.Storage.Backends;
 
@@ -25,8 +24,16 @@ internal enum PartitionOverwriteMode
 /// <summary>
 /// A data file already written out to storage (its bytes exist), described by the facts a Delta
 /// <c>add</c> action needs: the table-relative <see cref="Path"/>, its <see cref="PartitionValues"/>
-/// (empty for an unpartitioned table), byte <see cref="Size"/>, <see cref="ModificationTime"/>, and
-/// optional per-file <see cref="Stats"/>.
+/// (a value — possibly null — for <b>every</b> partition column of a partitioned table; empty for an
+/// unpartitioned table), byte <see cref="Size"/>, <see cref="ModificationTime"/>, and optional per-file
+/// <see cref="Stats"/>.
+///
+/// <para><b>Partition-coverage contract.</b> For a partitioned table each <see cref="PartitionValues"/>
+/// must carry a key for every partition column (the value may be null for the null partition). A staged
+/// file missing a partition column is rejected fail-closed by <see cref="DeltaTableWriter"/>: silently
+/// coercing a missing key to the null partition would land data in the wrong partition and, for a file
+/// already in the log, is the malformed state that makes a read-oriented pruner over-select it for
+/// removal during a dynamic overwrite.</para>
 ///
 /// <para><b>Write-time statistics boundary (#197).</b> Generating rich min/max/nullCount statistics from
 /// the file's rows is STORY-05.3.4 / #197's responsibility. STORY-05.3.3 (#188) commits the adds with the
@@ -57,8 +64,11 @@ internal sealed record StagedDataFile(
 /// <item><b>Dynamic partition overwrite</b> (<see cref="OverwriteAsync"/> with
 /// <see cref="PartitionOverwriteMode.Dynamic"/>): <c>remove</c> of only the prior active files in the
 /// touched partitions plus the new <c>add</c>s, scoped with
-/// <see cref="DeltaReadScope.ReadFiles(IEnumerable{string})"/> to those prior files so a concurrent change
-/// to a touched partition aborts it while an append to an untouched partition rebases (AC3).</item>
+/// <see cref="DeltaReadScope.ReadFiles(IEnumerable{string})"/> to those prior files so a concurrent
+/// remove/re-add of one of them aborts it while an append to an untouched partition rebases. A concurrent
+/// new-file append <i>into</i> a touched partition is not detected (it needs a partition-predicate read
+/// scope) — tracked in #488. For an unpartitioned table a dynamic overwrite is a full-table overwrite and
+/// is routed to the <see cref="PartitionOverwriteMode.Static"/> path (WholeTable) (AC3).</item>
 /// </list>
 ///
 /// <para><b>Layering.</b> This type lives in the storage layer and takes the <i>staged</i> data files as
@@ -119,6 +129,8 @@ internal sealed class DeltaTableWriter
             throw new ArgumentException("An append must stage at least one data file.", nameof(files));
         }
 
+        ValidatePartitionCoverage(files, readSnapshot.Metadata.PartitionColumns);
+
         var actions = new List<DeltaAction>(files.Count);
         AppendAddActions(actions, files);
         return _committer.CommitAsync(readSnapshot, actions, DeltaReadScope.BlindAppend, cancellationToken);
@@ -141,8 +153,10 @@ internal sealed class DeltaTableWriter
     /// <see cref="PartitionOverwriteMode.Dynamic"/> it removes only the prior active files whose partition
     /// values match a partition the new write touches, under a
     /// <see cref="DeltaReadScope.ReadFiles(IEnumerable{string})"/> scope over exactly those files so a
-    /// concurrent change to a touched partition is rejected while an append to an untouched partition
-    /// rebases.
+    /// concurrent remove/re-add of one of them is rejected while an append to an untouched partition
+    /// rebases (a concurrent new-file append into a touched partition is not rejected — tracked in #488).
+    /// An unpartitioned table has a single partition, so a dynamic overwrite is routed to the full-overwrite
+    /// (<see cref="DeltaReadScope.WholeTable"/>) path.
     /// </summary>
     public Task<DeltaCommitResult> OverwriteAsync(
         Snapshot readSnapshot,
@@ -157,6 +171,8 @@ internal sealed class DeltaTableWriter
             // An empty overwrite (truncate) is a distinct operation; STORY-05.3.3 overwrites with new data.
             throw new ArgumentException("An overwrite must stage at least one data file.", nameof(files));
         }
+
+        ValidatePartitionCoverage(files, readSnapshot.Metadata.PartitionColumns);
 
         return mode switch
         {
@@ -183,47 +199,62 @@ internal sealed class DeltaTableWriter
     }
 
     // AC3: remove only the prior active files in the touched partitions + add the new files, scoped to
-    // exactly those prior files (ReadFiles) so a concurrent change to a touched partition is rejected while
-    // an append to an untouched partition rebases. Partition selection reuses the snapshot's partition
-    // pruning (FilePruningRequest.ForPartitions + Snapshot.PruneFiles), the same sound selector scans use.
+    // exactly those prior files (ReadFiles) so a concurrent remove/re-add of a touched-partition file is
+    // rejected while an append to an untouched partition rebases.
+    //
+    // Removal selection is an EXACT partition-key match against the snapshot's active files — deliberately
+    // NOT Snapshot.PruneFiles. PruneFiles is a *sound over-approximation* built for scans: it keeps any file
+    // it cannot prove non-matching (e.g. one missing a partition-column key). Over-selecting is harmless for
+    // a read (later filtered) but for a destructive overwrite it would tombstone a file in an UNTOUCHED
+    // partition — silent, unrecoverable data loss (council #486 R1: red-team Critical / Security F1).
+    // Matching each active file's canonical PartitionKey against the touched set is exact in both
+    // directions: no over-select (data loss) and no under-select (stale duplicate data).
     private Task<DeltaCommitResult> DynamicPartitionOverwriteAsync(
         Snapshot readSnapshot, IReadOnlyList<StagedDataFile> files, CancellationToken cancellationToken)
     {
         ImmutableArray<string> partitionColumns = readSnapshot.Metadata.PartitionColumns;
 
-        // Distinct partitions the staged files touch (keyed canonically because ImmutableSortedDictionary
-        // record equality is reference-based). For an unpartitioned table this collapses to the single
-        // empty partition, so a dynamic overwrite degenerates to a full overwrite — the Spark semantic.
-        var touchedByKey = new Dictionary<string, ImmutableSortedDictionary<string, string?>>(StringComparer.Ordinal);
-        foreach (StagedDataFile file in files)
+        // An unpartitioned table is a single partition, so a dynamic overwrite replaces the whole table —
+        // identical to a static overwrite. Route it to the full-overwrite path so it also gets the stronger
+        // WholeTable isolation (a concurrent append aborts), not merely the same action set.
+        if (partitionColumns.IsDefaultOrEmpty)
         {
-            touchedByKey.TryAdd(PartitionKey(file.PartitionValues, partitionColumns), file.PartitionValues);
+            return FullOverwriteAsync(readSnapshot, files, cancellationToken);
         }
 
-        // Select the prior active files in each touched partition via the sound partition pruner, unioned
-        // across the touched partitions (a file is selected once even if listed for multiple filters).
-        var priorInTouched = new Dictionary<string, AddFileAction>(StringComparer.Ordinal);
-        foreach (ImmutableSortedDictionary<string, string?> partition in touchedByKey.Values)
+        // The distinct partition keys the staged files touch. The SAME injective key matches prior files
+        // below, so removal selection is an exact set-membership test.
+        var touchedKeys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (StagedDataFile file in files)
         {
-            FilePruningRequest request = PartitionRequest(partition, partitionColumns);
-            foreach (AddFileAction candidate in readSnapshot.PruneFiles(request).Candidates)
+            touchedKeys.Add(PartitionKey(file.PartitionValues, partitionColumns));
+        }
+
+        // A prior active file is removed IFF its partition key exactly equals a touched partition key.
+        var priorInTouched = new List<AddFileAction>();
+        foreach (AddFileAction prior in readSnapshot.ActiveFiles)
+        {
+            if (touchedKeys.Contains(PartitionKey(prior.PartitionValues, partitionColumns)))
             {
-                priorInTouched.TryAdd(candidate.Path, candidate);
+                priorInTouched.Add(prior);
             }
         }
 
         long deletionTimestamp = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
         var actions = new List<DeltaAction>(priorInTouched.Count + files.Count);
-        foreach (AddFileAction prior in priorInTouched.Values)
+        foreach (AddFileAction prior in priorInTouched)
         {
             actions.Add(ToRemove(prior, deletionTimestamp));
         }
 
         AppendAddActions(actions, files);
 
+        // ReadFiles over exactly the removed priors: a concurrent remove/re-add of one aborts us; an append
+        // to an untouched partition rebases. A concurrent NEW-file append into a touched partition is NOT
+        // caught (it needs a partition-predicate read scope) — tracked in #488.
         DeltaReadScope scope = priorInTouched.Count == 0
             ? DeltaReadScope.BlindAppend // no prior files in the touched partitions ⇒ effectively an append.
-            : DeltaReadScope.ReadFiles(priorInTouched.Keys);
+            : DeltaReadScope.ReadFiles(priorInTouched.Select(prior => prior.Path));
 
         return _committer.CommitAsync(readSnapshot, actions, scope, cancellationToken);
     }
@@ -254,24 +285,34 @@ internal sealed class DeltaTableWriter
             add.PartitionValues,
             add.Size);
 
-    private static FilePruningRequest PartitionRequest(
-        ImmutableSortedDictionary<string, string?> partition, ImmutableArray<string> partitionColumns)
+    // Fail-closed precondition: a partitioned write must specify a value (possibly null) for EVERY partition
+    // column of each staged file, so the add lands in a well-formed partition and the exact-key remove
+    // selection is unambiguous. A missing key would otherwise be silently coerced to the null partition —
+    // and, for a file already in the log, is the malformed state that would make a read-oriented pruner
+    // over-select it for removal (council #486 R1). For an unpartitioned table this is a no-op.
+    private static void ValidatePartitionCoverage(
+        IReadOnlyList<StagedDataFile> files, ImmutableArray<string> partitionColumns)
     {
         if (partitionColumns.IsDefaultOrEmpty)
         {
-            // Unpartitioned: nothing to filter on, so every active file is "in" the single empty partition.
-            return FilePruningRequest.Empty;
+            return;
         }
 
-        var filters = new PartitionEqualityFilter[partitionColumns.Length];
-        for (int i = 0; i < partitionColumns.Length; i++)
+        foreach (StagedDataFile file in files)
         {
-            string column = partitionColumns[i];
-            partition.TryGetValue(column, out string? value);
-            filters[i] = new PartitionEqualityFilter(column, value);
+            foreach (string column in partitionColumns)
+            {
+                if (!file.PartitionValues.ContainsKey(column))
+                {
+                    throw new ArgumentException(
+                        string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"Staged file '{file.Path}' is missing partition column '{column}'; a partitioned " +
+                            $"write must specify a value (possibly null) for every partition column."),
+                        nameof(files));
+                }
+            }
         }
-
-        return FilePruningRequest.ForPartitions(filters);
     }
 
     // A stable, injective key for a partition's values over the table's partition columns, so two files in

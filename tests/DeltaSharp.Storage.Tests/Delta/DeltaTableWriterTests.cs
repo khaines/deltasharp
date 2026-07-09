@@ -258,4 +258,162 @@ public sealed class DeltaTableWriterTests : IDisposable
         // A fresh read sees the new state — proving the pinned view was genuinely isolated.
         Assert.Equal(new[] { "a.parquet", "b.parquet" }, ActivePaths(await LoadAsync()));
     }
+
+    // ------------------------------------- #486 R1: data-loss hardening + coverage -------------------------------------
+
+    [Fact]
+    public async Task DynamicOverwrite_DoesNotRemove_PriorFileMissingPartitionColumn_InUntouchedPartition()
+    {
+        // #486 R1 CRITICAL (red-team / Security F1) regression: a prior active file that is MISSING a
+        // partition-column key (a malformed/foreign-written add, committed here via the raw log to bypass the
+        // writer's own coverage guard) lives in a DIFFERENT partition than the one the overwrite touches. The
+        // old code selected removals via the read-oriented pruner, which never excludes a file missing the
+        // filter column → it over-selected and tombstoned this file from an untouched partition (silent data
+        // loss). Exact partition-key matching must leave it intact.
+        await SeedTableAsync(partitionColumns: new[] { "region" });
+        await CommitRawAsync(1, DeltaTestHarness.Add("mal.parquet")); // partitionValues {} — no "region" key
+        await CommitRawAsync(2, DeltaTestHarness.Add("us1.parquet", partitionValues: new[] { ("region", "US") }));
+
+        await Writer().OverwriteAsync(
+            new[] { Staged("us2.parquet", Partition(("region", "US"))) },
+            PartitionOverwriteMode.Dynamic);
+
+        // us1 (region=US, touched) is replaced; mal.parquet (region absent ⇒ NOT the US partition) survives.
+        Assert.Equal(new[] { "mal.parquet", "us2.parquet" }, ActivePaths(await LoadAsync()));
+    }
+
+    [Fact]
+    public async Task Append_OnPartitionedTable_RejectsStagedFileMissingPartitionColumn()
+    {
+        // #486 R1 (Balanced L2 / Security write-path): fail-closed — a partitioned write must specify every
+        // partition column, else the add would land in the wrong (null) partition and later mis-select.
+        await SeedTableAsync(partitionColumns: new[] { "region" });
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            Writer().AppendAsync(new[] { Staged("nopart.parquet") })); // NoPartition ⇒ missing "region"
+    }
+
+    [Fact]
+    public async Task Overwrite_OnPartitionedTable_RejectsStagedFileMissingPartitionColumn()
+    {
+        // #486 R1: the same fail-closed coverage guard applies to overwrites (both modes go through it).
+        await SeedTableAsync(partitionColumns: new[] { "region" });
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            Writer().OverwriteAsync(
+                new[] { Staged("nopart.parquet") }, PartitionOverwriteMode.Dynamic));
+    }
+
+    [Fact]
+    public async Task DynamicOverwrite_OnUnpartitionedTable_ReplacesEntireTable()
+    {
+        // #486 R1 (Quality High): an unpartitioned table is a single partition, so a dynamic overwrite is a
+        // full-table overwrite — every prior active file is removed and the new files added.
+        await SeedTableAsync();
+        await Writer().AppendAsync(new[] { Staged("a.parquet"), Staged("b.parquet") });
+
+        await Writer().OverwriteAsync(new[] { Staged("c.parquet") }, PartitionOverwriteMode.Dynamic);
+
+        Assert.Equal(new[] { "c.parquet" }, ActivePaths(await LoadAsync()));
+    }
+
+    [Fact]
+    public async Task DynamicOverwrite_OnUnpartitionedTable_AbortsOnConcurrentAppend()
+    {
+        // #486 R1 (Architect L1 / Delta LOW-1 / Security F2): an unpartitioned dynamic overwrite must be
+        // routed to the full-overwrite (WholeTable) path so it has the SAME strong isolation as a static
+        // overwrite. If it were left on the ReadFiles(all-priors) scope, this concurrent NEW-file append
+        // (which touches no prior) would rebase and survive instead of aborting.
+        await SeedTableAsync();
+        await Writer().AppendAsync(new[] { Staged("a.parquet") });
+        Snapshot readSnapshot = await LoadAsync();
+        await CommitRawAsync(readSnapshot.Version + 1, DeltaTestHarness.Add("winner.parquet"));
+
+        await Assert.ThrowsAsync<ConcurrentAppendException>(() =>
+            Writer().OverwriteAsync(
+                readSnapshot, new[] { Staged("c.parquet") }, PartitionOverwriteMode.Dynamic));
+    }
+
+    [Fact]
+    public async Task DynamicOverwrite_DistinguishesNaivelyCollidingPartitions()
+    {
+        // #486 R1 (Quality High): PartitionKey must be injective. Two multi-column partitions that would
+        // collide under naive concatenation — (a="x", b="yz") vs (a="xy", b="z") — must map to distinct
+        // touched sets. Overwriting the first must leave a prior file in the second untouched. A constant/
+        // non-injective key would remove both.
+        await SeedTableAsync(partitionColumns: new[] { "a", "b" });
+        await Writer().AppendAsync(new[]
+        {
+            Staged("p1.parquet", Partition(("a", "x"), ("b", "yz"))),
+            Staged("p2.parquet", Partition(("a", "xy"), ("b", "z"))),
+        });
+
+        await Writer().OverwriteAsync(
+            new[] { Staged("p1b.parquet", Partition(("a", "x"), ("b", "yz"))) },
+            PartitionOverwriteMode.Dynamic);
+
+        // Only (x,yz) is replaced; the naively-colliding (xy,z) partition is untouched.
+        Assert.Equal(new[] { "p1b.parquet", "p2.parquet" }, ActivePaths(await LoadAsync()));
+    }
+
+    [Fact]
+    public async Task FullOverwrite_StampsTombstone_WithInjectedClock()
+    {
+        // #486 R1 (Balanced M1 / Chaos): the writer's tombstone DeletionTimestamp comes from the injected
+        // TimeProvider (determinism, no wall-clock). Exercise the internal ctor and assert the exact instant.
+        await SeedTableAsync();
+        await Writer().AppendAsync(new[] { Staged("a.parquet") });
+        var instant = new DateTimeOffset(2031, 5, 6, 7, 8, 9, TimeSpan.Zero);
+        var writer = new DeltaTableWriter(new DeltaLog(_backend), new DeltaCommitter(_backend), new FixedTimeProvider(instant));
+
+        DeltaCommitResult result = await writer.OverwriteAsync(new[] { Staged("b.parquet") });
+
+        IReadOnlyList<DeltaAction> committed = await Log().ReadCommitActionsAsync(result.Version, CancellationToken.None);
+        RemoveFileAction removed = Assert.Single(committed.OfType<RemoveFileAction>());
+        Assert.Equal(instant.ToUnixTimeMilliseconds(), removed.DeletionTimestamp);
+    }
+
+    [Fact]
+    public async Task FullOverwrite_AbortsOnConcurrentRemove()
+    {
+        // #486 R1 (Chaos): AC2 depends on the whole active set, so a concurrent REMOVE (not just an append)
+        // of a prior file must abort the overwrite — the WholeTable delete-conflict branch.
+        await SeedTableAsync();
+        await Writer().AppendAsync(new[] { Staged("a.parquet"), Staged("b.parquet") });
+        Snapshot readSnapshot = await LoadAsync();
+        await CommitRawAsync(readSnapshot.Version + 1, DeltaTestHarness.Remove("a.parquet"));
+
+        await Assert.ThrowsAsync<ConcurrentDeleteReadException>(() =>
+            Writer().OverwriteAsync(readSnapshot, new[] { Staged("c.parquet") }));
+    }
+
+    [Fact]
+    public async Task DynamicOverwrite_DoesNotAbortOnConcurrentNewFileAppendToTouchedPartition_Tracked488()
+    {
+        // #486 R1 (Chaos nit): CHARACTERIZATION of the tracked #488 gap — the ReadFiles(prior-paths) scope
+        // does NOT catch a concurrent NEW-file append into a touched partition (its path is not in the read
+        // set), so that file rebases and survives the overwrite. This pins the current (deferred) behavior so
+        // an accidental change surfaces before #488's partition-predicate scope lands.
+        await SeedTableAsync(partitionColumns: new[] { "region" });
+        await Writer().AppendAsync(new[] { Staged("us1.parquet", Partition(("region", "US"))) });
+        Snapshot readSnapshot = await LoadAsync();
+        // Concurrent winner appends a NEW file into the SAME touched (US) partition.
+        await CommitRawAsync(
+            readSnapshot.Version + 1,
+            DeltaTestHarness.Add("us_concurrent.parquet", partitionValues: new[] { ("region", "US") }));
+
+        DeltaCommitResult result = await Writer().OverwriteAsync(
+            readSnapshot,
+            new[] { Staged("us2.parquet", Partition(("region", "US"))) },
+            PartitionOverwriteMode.Dynamic);
+
+        // #488 gap: us_concurrent survives (real Delta would reject via a partition read-predicate).
+        Assert.Equal(readSnapshot.Version + 2, result.Version);
+        Assert.Equal(new[] { "us2.parquet", "us_concurrent.parquet" }, ActivePaths(await LoadAsync()));
+    }
+
+    private sealed class FixedTimeProvider(DateTimeOffset now) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => now;
+    }
 }
