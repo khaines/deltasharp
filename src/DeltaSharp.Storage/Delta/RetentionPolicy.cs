@@ -131,20 +131,30 @@ internal sealed record RetentionPolicy
         }
 
         TimeSpan total = TimeSpan.Zero;
-        for (; i < tokens.Length; i += 2)
+        try
         {
-            if (!long.TryParse(tokens[i], NumberStyles.Integer, CultureInfo.InvariantCulture, out long count)
-                || count < 0)
+            for (; i < tokens.Length; i += 2)
             {
-                return false;
-            }
+                if (!long.TryParse(tokens[i], NumberStyles.Integer, CultureInfo.InvariantCulture, out long count)
+                    || count < 0)
+                {
+                    return false;
+                }
 
-            if (!TryUnitToTimeSpan(tokens[i + 1], count, out TimeSpan part))
-            {
-                return false;
-            }
+                if (!TryUnitToTimeSpan(tokens[i + 1], count, out TimeSpan part))
+                {
+                    return false;
+                }
 
-            total += part;
+                total += part;
+            }
+        }
+        catch (OverflowException)
+        {
+            // An absurd magnitude (e.g. "interval 10000000 weeks") exceeds the TimeSpan range. Fail closed as
+            // "unparseable" (ResolveTableRetention then throws FormatException and VACUUM aborts) rather than
+            // letting an OverflowException escape a Try* method.
+            return false;
         }
 
         retention = total;
@@ -153,19 +163,21 @@ internal sealed record RetentionPolicy
 
     private static bool TryUnitToTimeSpan(string unit, long count, out TimeSpan value)
     {
-        // Trim a trailing plural 's' so "day"/"days" both match. Reject calendar-ambiguous units.
+        // Trim a trailing plural 's' so "day"/"days" both match. Reject calendar-ambiguous units. Arithmetic
+        // uses double operands so an out-of-range magnitude throws OverflowException (caught by the caller and
+        // failed closed) instead of silently wrapping a long multiply to a negative window.
         string singular = unit.Length > 1 && unit[^1] == 's' ? unit[..^1] : unit;
         value = singular switch
         {
-            "week" => TimeSpan.FromDays(7 * count),
-            "day" => TimeSpan.FromDays(count),
-            "hour" => TimeSpan.FromHours(count),
-            "minute" => TimeSpan.FromMinutes(count),
-            "min" => TimeSpan.FromMinutes(count),
-            "second" => TimeSpan.FromSeconds(count),
-            "sec" => TimeSpan.FromSeconds(count),
-            "millisecond" => TimeSpan.FromMilliseconds(count),
-            "microsecond" => TimeSpan.FromMicroseconds(count),
+            "week" => TimeSpan.FromDays(7d * count),
+            "day" => TimeSpan.FromDays((double)count),
+            "hour" => TimeSpan.FromHours((double)count),
+            "minute" => TimeSpan.FromMinutes((double)count),
+            "min" => TimeSpan.FromMinutes((double)count),
+            "second" => TimeSpan.FromSeconds((double)count),
+            "sec" => TimeSpan.FromSeconds((double)count),
+            "millisecond" => TimeSpan.FromMilliseconds((double)count),
+            "microsecond" => TimeSpan.FromMicroseconds((double)count),
             _ => TimeSpan.MinValue,
         };
 

@@ -46,6 +46,8 @@ public sealed class RetentionPolicyTests
     [InlineData("interval -3 days")]   // negative count → rejected
     [InlineData("interval three days")]
     [InlineData("interval 5 fortnights")]
+    [InlineData("interval 10000000 weeks")]              // 70M days > TimeSpan.MaxValue → overflow, fail closed
+    [InlineData("interval 9999999999999999999 days")]    // magnitude > long.MaxValue → parse fails, fail closed
     public void TryParseRetentionInterval_RejectsUnparseableOrAmbiguous(string value)
     {
         Assert.False(RetentionPolicy.TryParseRetentionInterval(value, out _));

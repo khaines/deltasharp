@@ -266,6 +266,31 @@ public sealed class DeltaVacuumTests : IDisposable
     }
 
     [Fact]
+    public async Task TableConfiguredRetention_SubThreshold_IsRejected_PostLoad()
+    {
+        // MEDIUM (AC2 post-load, red-team R2): a no-argument VACUUM clears the PRE-load gate (which uses the
+        // 168-h DEFAULT), then resolves the table's delta.deletedFileRetentionDuration. When THAT configured
+        // window is itself below the safety threshold, only the POST-load guard stands between it and a
+        // premature reclaim. It must reject fail-closed and delete nothing. Neutering the post-load
+        // `retention < SafetyThreshold` check must fail this test (previously it killed no test).
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 0, DeltaTestHarness.Protocol(),
+            DeltaTestHarness.MetadataWithConfig(("delta.deletedFileRetentionDuration", "interval 1 hours")));
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Add("active.parquet"));
+        await WriteDataFileAsync("active.parquet", Old);
+        await WriteDataFileAsync("old-orphan.parquet", Old); // a 1-h window would delete it; the guard must not
+
+        VacuumRetentionSafetyException ex =
+            await Assert.ThrowsAsync<VacuumRetentionSafetyException>(() => _vacuum.VacuumAsync());
+
+        Assert.Equal(TimeSpan.FromHours(1), ex.RequestedRetention);
+        Assert.Equal(Retention, ex.SafetyThreshold);
+        // Fail-closed: nothing was reclaimed — the sub-threshold table config never reaches deletion.
+        Assert.NotNull(await _backend.HeadAsync("old-orphan.parquet", CancellationToken.None));
+        Assert.NotNull(await _backend.HeadAsync("active.parquet", CancellationToken.None));
+    }
+
+    [Fact]
     public async Task DeleteOnMissingCandidate_IsIdempotent_AndSucceeds()
     {
         // HIGH (AC4 efficacy): force DeleteAsync on an ALREADY-DELETED candidate by removing it out-of-band
