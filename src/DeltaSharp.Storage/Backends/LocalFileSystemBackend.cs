@@ -142,6 +142,9 @@ internal sealed class LocalFileSystemBackend : IStorageBackend, IDisposable
     /// the backend is not disposed, so a missed dispose leaks no descriptor.</summary>
     public void Dispose() => _rootHandle?.Dispose();
 
+    /// <summary>The PVC/POSIX backend family — the <c>deltasharp.backend=pvc</c> telemetry identity.</summary>
+    public StorageBackendKind Kind => StorageBackendKind.Pvc;
+
     /// <inheritdoc/>
     public async ValueTask<Stream> ReadRangeAsync(
         string path, long offset, long length, CancellationToken cancellationToken)

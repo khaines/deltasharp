@@ -19,6 +19,9 @@ internal sealed class FaultInjectingBackend : IStorageBackend
 
     public FaultInjectingBackend(IStorageBackend inner) => _inner = inner;
 
+    /// <summary>Forwards the wrapped backend's kind so telemetry reflects the real store under injection.</summary>
+    public StorageBackendKind Kind => _inner.Kind;
+
     /// <summary>The 0-based put-if-absent call index that raises an ambiguous outcome (-1 = never).</summary>
     public int AmbiguousOnPutCall { get; init; } = -1;
 

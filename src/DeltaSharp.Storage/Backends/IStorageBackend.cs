@@ -15,6 +15,12 @@ namespace DeltaSharp.Storage.Backends;
 /// </remarks>
 internal interface IStorageBackend
 {
+    /// <summary>The bounded, low-cardinality <see cref="StorageBackendKind"/> this adapter targets — the
+    /// object-store family used as the <c>deltasharp.backend</c> telemetry attribute on commit/read spans
+    /// and I/O metrics (design §7.3/§7.4). A closed set, safe as a metric label; a decorator forwards its
+    /// inner backend's kind so instrumentation reflects the real store.</summary>
+    StorageBackendKind Kind { get; }
+
     /// <summary>Opens a read stream over <c>[offset, offset + length)</c> of <paramref name="path"/> —
     /// the range GET used for Parquet footers and selective row-group reads (design §2.9.1).</summary>
     /// <exception cref="DeltaStorageException">The path escapes the root
