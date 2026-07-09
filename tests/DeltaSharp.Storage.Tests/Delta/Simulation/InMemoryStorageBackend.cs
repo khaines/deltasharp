@@ -41,6 +41,11 @@ internal sealed class InMemoryStorageBackend : IStorageBackend
         _faults = faults ?? NoFaults.Instance;
     }
 
+    /// <summary>Identifies as <see cref="StorageBackendKind.Pvc"/> (a local POSIX-like store) — the same
+    /// kind <see cref="LocalFileSystemBackend"/> reports. Only feeds the <c>deltasharp.backend</c> telemetry
+    /// label; the simulation asserts on the reconstructed log, not on this value.</summary>
+    public StorageBackendKind Kind => StorageBackendKind.Pvc;
+
     /// <summary>When set, the CAS single-winner guarantee is <b>disabled</b> — every put "wins" and
     /// overwrites — to prove the Jepsen checker detects the resulting I2 (single-winner) violation.</summary>
     public bool DisableSingleWinner { get; set; }
