@@ -25,15 +25,31 @@ internal enum DeltaSchemaMismatchKind
     /// Tightening a nullable column to required is the symmetric, always-rejected case. Always rejected.</summary>
     NullabilityViolation,
 
-    /// <summary>The write changes a column's type to one that is neither equal nor a permitted lossless
-    /// widening — a narrowing or an unrelated type (for example <c>long→int</c> or <c>string↔long</c>).
-    /// Delta never silently downcasts. Always rejected.</summary>
+    /// <summary>The write changes a column's type to one that is neither equal nor a lossless widening — a
+    /// narrowing or an unrelated type (for example <c>long→int</c> or <c>string↔long</c>). Delta never
+    /// silently downcasts. Always rejected.</summary>
     IncompatibleType,
 
-    /// <summary>The write requires a permitted type widening, but <see cref="SchemaEvolutionMode.WidenTypes"/>
-    /// was not enabled (strict enforcement). Distinct from <see cref="IncompatibleType"/> so the message can
-    /// tell the caller the change is safe and only needs evolution turned on.</summary>
-    TypeWideningNotEnabled,
+    /// <summary>The write changes a column's type to one that <i>would</i> be a lossless widening
+    /// (<c>int→long</c>, <c>float→double</c>, <c>date→timestamp</c>, a growing <c>decimal</c>), but type
+    /// widening is <b>not supported</b> here: widening the logical schema without Delta's <c>typeWidening</c>
+    /// table feature makes the existing Parquet files unreadable even by DeltaSharp (the reader does an exact
+    /// physical-type match). Fail-closed until the feature lands (tracked in #495). Distinct from
+    /// <see cref="IncompatibleType"/> so the message can name the deferred feature.</summary>
+    TypeWideningUnsupported,
+
+    /// <summary>Evolution would produce a merged schema containing two columns whose names are equal under
+    /// case-insensitive comparison (e.g. table <c>id</c> + a new write column <c>ID</c>). Delta/Spark treat
+    /// column-name uniqueness as case-insensitive at the storage/protocol level, so such a schema is
+    /// invalid. Always rejected. (Matching remains case-sensitive/ordinal; only the merged result is
+    /// checked for a case-fold collision.)</summary>
+    CaseInsensitiveDuplicateColumn,
+
+    /// <summary>The write would change the type of a <b>partition</b> column. A partition column's type is
+    /// physically encoded in the directory layout and cannot be evolved in place (it requires a full table
+    /// rewrite), so it is always rejected — an explicit, clearer reason than the generic type-change
+    /// classification.</summary>
+    PartitionColumnEvolutionUnsupported,
 }
 
 /// <summary>
@@ -95,12 +111,29 @@ internal sealed class DeltaSchemaMismatchException : Exception
             DeltaSchemaMismatchKind.IncompatibleType,
             path,
             $"The write type '{writeType}' for column '{path}' is not compatible with the table type " +
-            $"'{tableType}'; only lossless type widening is permitted (never a narrowing or an unrelated type).");
+            $"'{tableType}'; an existing column's type cannot be changed by a write (never a narrowing or an " +
+            "unrelated type).");
 
-    public static DeltaSchemaMismatchException TypeWideningNotEnabled(string path, string tableType, string writeType) =>
+    public static DeltaSchemaMismatchException TypeWideningUnsupported(string path, string tableType, string writeType) =>
         new(
-            DeltaSchemaMismatchKind.TypeWideningNotEnabled,
+            DeltaSchemaMismatchKind.TypeWideningUnsupported,
             path,
-            $"The write widens column '{path}' from '{tableType}' to '{writeType}', a permitted widening, but " +
-            "type-widening evolution is not enabled. Enable SchemaEvolutionMode.WidenTypes / MergeSchema to allow it.");
+            $"The type change '{tableType}'→'{writeType}' for column '{path}' requires the Delta " +
+            "typeWidening table feature, which is not yet supported (tracked in #495). Widening the logical " +
+            "schema without it would make the table's existing Parquet files unreadable, so it is rejected.");
+
+    public static DeltaSchemaMismatchException CaseInsensitiveDuplicateColumn(string path, string other) =>
+        new(
+            DeltaSchemaMismatchKind.CaseInsensitiveDuplicateColumn,
+            path,
+            $"Evolving the schema would add column '{path}', which collides case-insensitively with existing " +
+            $"column '{other}'. Delta requires column names to be unique ignoring case, so this write is rejected.");
+
+    public static DeltaSchemaMismatchException PartitionColumnEvolution(string path, string tableType, string writeType) =>
+        new(
+            DeltaSchemaMismatchKind.PartitionColumnEvolutionUnsupported,
+            path,
+            $"The write changes the type of partition column '{path}' from '{tableType}' to '{writeType}'; a " +
+            "partition column's type is encoded in the table layout and cannot be evolved (it requires a full " +
+            "table rewrite). Rejected.");
 }

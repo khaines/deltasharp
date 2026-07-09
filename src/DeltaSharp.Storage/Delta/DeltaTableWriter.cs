@@ -55,7 +55,7 @@ internal sealed record StagedDataFile(
 /// design §2.11). It is the storage-side AC-bearing core for the three ACID write shapes:
 ///
 /// <list type="bullet">
-/// <item><b>Append</b> (<see cref="AppendAsync(Snapshot, IReadOnlyList{StagedDataFile}, CancellationToken)"/>):
+/// <item><b>Append</b> (<see cref="AppendAsync(Snapshot, StructType, IReadOnlyList{StagedDataFile}, SchemaEvolutionMode, CancellationToken)"/>):
 /// only <c>add</c> actions under <see cref="DeltaReadScope.BlindAppend"/>; prior active files stay active
 /// and the write rebases past concurrent appends (AC1).</item>
 /// <item><b>Full overwrite</b> (<see cref="OverwriteAsync"/> with
@@ -77,6 +77,13 @@ internal sealed record StagedDataFile(
 /// <c>SaveMode</c> → operation mapping (Append→append; Overwrite→<see cref="OverwriteAsync"/> per
 /// the partition-overwrite mode; Ignore/ErrorIfExists→their existing existence semantics) is applied by
 /// the executor/write-door seam that calls this type — see the STORY-05.3.3 end-to-end wiring note.</para>
+///
+/// <para><b>Schema declaration is mandatory.</b> Every write entry point <b>requires</b> the incoming
+/// <c>writeSchema</c>; schema enforcement (<see cref="DeltaSchemaEnforcer"/>) <b>always</b> runs before any
+/// action is built. There is deliberately no "trust the table schema" overload: one would let a caller
+/// commit schema-incompatible data with no enforcement at all (a silent bypass). The production write-door
+/// (#487) supplies the true schema of the staged Parquet; validating that the staged files physically match
+/// that declared schema is that write-door's / the read path's responsibility (#497).</para>
 /// </summary>
 internal sealed class DeltaTableWriter
 {
@@ -104,28 +111,23 @@ internal sealed class DeltaTableWriter
         _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
-    /// <summary>Loads the latest snapshot and appends <paramref name="files"/> to it (AC1 convenience).</summary>
-    public async Task<DeltaCommitResult> AppendAsync(
-        IReadOnlyList<StagedDataFile> files, CancellationToken cancellationToken = default)
-    {
-        Snapshot readSnapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
-        return await AppendAsync(readSnapshot, files, cancellationToken).ConfigureAwait(false);
-    }
-
     /// <summary>
-    /// Appends <paramref name="files"/> as new <c>add</c> actions against <paramref name="readSnapshot"/>
-    /// (STORY-05.3.3 AC1), validating the write against the table's <b>own</b> schema (a trivially-compatible,
-    /// no-op enforcement — no schema change). Emits <b>only</b> adds — no removes — so every prior active file
-    /// remains active, and commits under <see cref="DeltaReadScope.BlindAppend"/>, the read-nothing scope that
-    /// conflicts only with a concurrent metadata/protocol change and rebases past concurrent appends.
+    /// Loads the latest snapshot and appends <paramref name="files"/> to it, enforcing/evolving the incoming
+    /// <paramref name="writeSchema"/> against the table schema (STORY-05.4.2 AC1/AC2 convenience). Schema
+    /// declaration is mandatory (there is no no-schema overload — that would bypass enforcement); pass the
+    /// table's own schema to express "this write conforms to the current schema".
     /// </summary>
-    public Task<DeltaCommitResult> AppendAsync(
-        Snapshot readSnapshot,
+    /// <exception cref="DeltaSchemaMismatchException">The write is incompatible with the table schema, or
+    /// requires a schema change <paramref name="evolutionMode"/> does not permit.</exception>
+    public async Task<DeltaCommitResult> AppendAsync(
+        StructType writeSchema,
         IReadOnlyList<StagedDataFile> files,
+        SchemaEvolutionMode evolutionMode = SchemaEvolutionMode.None,
         CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(readSnapshot);
-        return AppendAsync(readSnapshot, readSnapshot.Schema, files, SchemaEvolutionMode.None, cancellationToken);
+        ArgumentNullException.ThrowIfNull(writeSchema);
+        Snapshot readSnapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
+        return await AppendAsync(readSnapshot, writeSchema, files, evolutionMode, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -135,11 +137,11 @@ internal sealed class DeltaTableWriter
     /// a missing required (non-nullable) column, a nullability violation, or a change
     /// <paramref name="evolutionMode"/> does not permit throws <see cref="DeltaSchemaMismatchException"/>
     /// here, so the table is left completely unchanged (reject-before-commit). When
-    /// <paramref name="evolutionMode"/> allows an additive change (new nullable columns / permitted type
-    /// widening) the merged schema is committed as a <c>metaData</c> action in the <b>same</b> version as the
-    /// new adds (atomic evolution). Commits under <see cref="DeltaReadScope.BlindAppend"/>; an evolution
-    /// append additionally carries metadata, so any concurrent commit aborts it (a schema change needs a
-    /// fresh snapshot — AC4).
+    /// <paramref name="evolutionMode"/> allows an additive change (a new nullable column) the merged schema
+    /// is committed as a <c>metaData</c> action in the <b>same</b> version as the new adds (atomic
+    /// evolution). No existing column's type is ever changed — type widening is fail-closed (#495). Commits
+    /// under <see cref="DeltaReadScope.BlindAppend"/>; an evolution append additionally carries metadata, so
+    /// any concurrent commit aborts it (a schema change needs a fresh snapshot — AC4).
     /// </summary>
     /// <exception cref="DeltaSchemaMismatchException">The write is incompatible with the table schema, or
     /// requires a schema change <paramref name="evolutionMode"/> does not permit.</exception>
@@ -172,37 +174,25 @@ internal sealed class DeltaTableWriter
         return _committer.CommitAsync(readSnapshot, actions, DeltaReadScope.BlindAppend, cancellationToken);
     }
 
-    /// <summary>Loads the latest snapshot and overwrites it with <paramref name="files"/> (convenience).</summary>
-    public async Task<DeltaCommitResult> OverwriteAsync(
-        IReadOnlyList<StagedDataFile> files,
-        PartitionOverwriteMode mode = PartitionOverwriteMode.Static,
-        CancellationToken cancellationToken = default)
-    {
-        Snapshot readSnapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
-        return await OverwriteAsync(readSnapshot, files, mode, cancellationToken).ConfigureAwait(false);
-    }
-
     /// <summary>
-    /// Overwrites <paramref name="readSnapshot"/> with <paramref name="files"/> (STORY-05.3.3 AC2/AC3),
-    /// validating the write against the table's <b>own</b> schema (a no-op enforcement — no schema change).
-    /// In <see cref="PartitionOverwriteMode.Static"/> (full overwrite) it removes <b>every</b> prior active
-    /// file in the same atomic version as the new adds, under <see cref="DeltaReadScope.WholeTable"/>. In
-    /// <see cref="PartitionOverwriteMode.Dynamic"/> it removes only the prior active files whose partition
-    /// values match a partition the new write touches, under a
-    /// <see cref="DeltaReadScope.ReadFiles(IEnumerable{string})"/> scope over exactly those files so a
-    /// concurrent remove/re-add of one of them is rejected while an append to an untouched partition
-    /// rebases (a concurrent new-file append into a touched partition is not rejected — tracked in #488).
-    /// An unpartitioned table has a single partition, so a dynamic overwrite is routed to the full-overwrite
-    /// (<see cref="DeltaReadScope.WholeTable"/>) path.
+    /// Loads the latest snapshot and overwrites it with <paramref name="files"/>, enforcing/evolving the
+    /// incoming <paramref name="writeSchema"/> against the table schema (convenience). Schema declaration is
+    /// mandatory (there is no no-schema overload — that would bypass enforcement); pass the table's own
+    /// schema to express "this write conforms to the current schema".
     /// </summary>
-    public Task<DeltaCommitResult> OverwriteAsync(
-        Snapshot readSnapshot,
+    /// <exception cref="DeltaSchemaMismatchException">The write is incompatible with the table schema, or
+    /// requires a schema change <paramref name="evolutionMode"/> does not permit.</exception>
+    public async Task<DeltaCommitResult> OverwriteAsync(
+        StructType writeSchema,
         IReadOnlyList<StagedDataFile> files,
-        PartitionOverwriteMode mode = PartitionOverwriteMode.Static,
+        PartitionOverwriteMode partitionMode = PartitionOverwriteMode.Static,
+        SchemaEvolutionMode evolutionMode = SchemaEvolutionMode.None,
         CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(readSnapshot);
-        return OverwriteAsync(readSnapshot, readSnapshot.Schema, files, mode, SchemaEvolutionMode.None, cancellationToken);
+        ArgumentNullException.ThrowIfNull(writeSchema);
+        Snapshot readSnapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
+        return await OverwriteAsync(
+            readSnapshot, writeSchema, files, partitionMode, evolutionMode, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -253,12 +243,17 @@ internal sealed class DeltaTableWriter
     // Runs schema enforcement/evolution against the table's current schema BEFORE any action is built
     // (STORY-05.4.2 AC1/AC2). Returns null when the write is compatible and needs no schema change, or the
     // metaData action carrying the merged schema (all other fields copied from the current metadata) that
-    // the caller commits in the SAME version as the data actions. Throws DeltaSchemaMismatchException, fail-
+    // the caller commits in the SAME version as the data actions. Threads the table's partition columns so a
+    // partition-column type change is rejected with a clear reason. Throws DeltaSchemaMismatchException, fail-
     // closed, if the write is incompatible or needs an evolution the mode forbids.
     private static MetadataAction? ReconcileSchema(
         Snapshot readSnapshot, StructType writeSchema, SchemaEvolutionMode evolutionMode)
     {
-        StructType? mergedSchema = DeltaSchemaEnforcer.Reconcile(readSnapshot.Schema, writeSchema, evolutionMode);
+        IReadOnlyCollection<string>? partitionColumns = readSnapshot.Metadata.PartitionColumns.IsDefaultOrEmpty
+            ? null
+            : readSnapshot.Metadata.PartitionColumns;
+        StructType? mergedSchema = DeltaSchemaEnforcer.Reconcile(
+            readSnapshot.Schema, writeSchema, evolutionMode, partitionColumns);
         return mergedSchema is null
             ? null
             : readSnapshot.Metadata with { SchemaString = SchemaJson.ToJson(mergedSchema) };

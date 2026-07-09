@@ -192,25 +192,23 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
     }
 
     [Fact]
-    public async Task Append_WidenType_CommitsMetadataAndAdd_InOneVersion()
+    public async Task Append_WidenType_IsRejectedBeforeAnyCommit()
     {
-        // AC2: a type-widening append (int → long) commits the widened schema + the add atomically.
+        // FIX 1: a type-widening append (int → long) is fail-closed at the write path — rejected before any
+        // version is written, because widening the logical schema without the typeWidening feature would make
+        // the table's existing Parquet files unreadable even by DeltaSharp (#495).
         await SeedSchemaTableAsync(Struct(F("value", DataTypes.IntegerType, nullable: true)));
         Snapshot readSnapshot = await LoadAsync();
 
-        DeltaCommitResult result = await Writer().AppendAsync(
-            readSnapshot,
-            Struct(F("value", DataTypes.LongType, nullable: true)),
-            new[] { Staged("a.parquet") },
-            SchemaEvolutionMode.WidenTypes);
+        DeltaSchemaMismatchException ex = await Assert.ThrowsAsync<DeltaSchemaMismatchException>(() =>
+            Writer().AppendAsync(
+                readSnapshot,
+                Struct(F("value", DataTypes.LongType, nullable: true)),
+                new[] { Staged("a.parquet") },
+                SchemaEvolutionMode.MergeSchema));
 
-        Assert.Equal(readSnapshot.Version + 1, result.Version);
-        IReadOnlyList<DeltaAction> committed = await Log().ReadCommitActionsAsync(result.Version, CancellationToken.None);
-        Assert.Single(committed.OfType<MetadataAction>());
-        Assert.Single(committed.OfType<AddFileAction>());
-
-        StructType evolved = (await LoadAsync()).Schema;
-        Assert.IsType<LongType>(evolved[0].DataType);
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+        Assert.Equal(0L, (await LoadAsync()).Version); // nothing published
     }
 
     [Fact]
@@ -302,7 +300,7 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
         // The loser's write is itself compatible (mode None, same schema) — it emits NO metadata — yet it
         // still conflicts with the winner's schema change.
         await Assert.ThrowsAsync<MetadataChangedException>(() =>
-            Writer().AppendAsync(readSnapshot, new[] { Staged("a.parquet") }));
+            Writer().AppendAsync(readSnapshot, readSnapshot.Schema, new[] { Staged("a.parquet") }));
     }
 
     [Fact]
