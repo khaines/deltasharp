@@ -11,15 +11,35 @@ namespace DeltaSharp.Storage.Tests.Delta.Simulation;
 /// <see cref="HistoryEvent"/> log and the reconstructed <c>_delta_log</c> (reloaded via
 /// <see cref="DeltaLog.LoadSnapshotAsync"/>), it validates the safety invariants the issue enumerates —
 /// <b>I1</b> version monotonicity, <b>I2</b> single-winner, <b>I4</b> snapshot isolation, <b>I5</b>
-/// read-your-writes, <b>I6</b> idempotent publication, and <b>I8</b> absence of illegal anomalies — plus
-/// snapshot isolation explicitly. DeltaSharp targets snapshot isolation (not serializability), so the
-/// legal-history predicate encodes SI, not global serial order.
+/// read-your-writes, <b>I6</b> idempotent publication, and <b>I8</b> absence of illegal anomalies (a lost
+/// update or a phantom/dangling active file) — plus snapshot isolation explicitly. DeltaSharp targets
+/// snapshot isolation (not serializability), so the legal-history predicate encodes SI, not global serial
+/// order.
 ///
 /// <para><b>It trusts nothing the SUT self-reports.</b> Per §3.3.5 the blind-append property is
 /// <b>recomputed</b> from the manifest's read-file-set (<see cref="ActionManifest.IsBlindAppend"/>), never
 /// read from a flag; any <see cref="ActionManifest.SutReportedBlindAppend"/> is cross-checked against the
 /// computed value. Ownership of each committed version is verified against the version's actual committed
 /// content, so a writer that claims a version it did not durably own is caught.</para>
+///
+/// <para><b>Enforced invariants (each is falsifiable — a matching fault knob + efficacy test proves teeth):</b>
+/// <list type="bullet">
+/// <item><b>I1</b> (<see cref="CheckMonotonicity"/>): versions are contiguous <c>0..latest</c>. Contiguity is
+/// probed BEFORE reconstruction so a version-chain gap is reported as I1 rather than crashing the loader.</item>
+/// <item><b>I2</b> (<see cref="CheckSingleWinner"/>): exactly one writer owns each version and its bytes are
+/// the committed content.</item>
+/// <item><b>I4</b> (<see cref="CheckSnapshotIsolationAsync"/>): every real read — a pure read AND a non-blind
+/// committing writer's read — observed exactly the snapshot at its pinned version.</item>
+/// <item><b>I5</b> (<see cref="CheckReadYourWritesAsync"/>): an acknowledged file is visible at its commit
+/// version.</item>
+/// <item><b>I6</b> (<see cref="CheckIdempotentPublication"/>): no file — and no idempotency nonce — is
+/// published in two versions.</item>
+/// <item><b>I8</b> (<see cref="CheckReadYourWritesAsync"/> + <see cref="CheckNoAnomalies"/>): no acknowledged
+/// file is lost (absent from the final snapshot without a later committed remove by ANY writer), and every
+/// active file has a backing data object (no torn/dangling reference).</item>
+/// <item><b>SI</b> (<see cref="CheckConflictClassificationAsync"/>): the §2.11.2 conflict class is re-derived
+/// from the winners a writer actually raced <c>(R, M]</c> and cross-checked against what it reported.</item>
+/// </list></para>
 /// </summary>
 internal static class JepsenHistoryChecker
 {
@@ -35,43 +55,66 @@ internal static class JepsenHistoryChecker
         var violations = new List<HistoryViolation>();
         var log = new DeltaLog(backend);
 
+        // ---- I1 (part 1): probe the version chain for a gap BEFORE any full reconstruction ----------------
+        // GetLatestCommitVersionAsync lists commit objects and never throws on a gap, unlike
+        // LoadSnapshotAsync (which raises DeltaProtocolException on a hole). We therefore determine the latest
+        // and verify 0..latest are all present FIRST, so a gap is reported as a first-class I1 violation and
+        // reconstruction — which cannot proceed past a hole — is skipped rather than crashing the checker.
+        long? latestOpt = await log.GetLatestCommitVersionAsync(cancellationToken).ConfigureAwait(false);
+        if (latestOpt is not { } latest)
+        {
+            violations.Add(new HistoryViolation("I1", "the table has no commit objects at all — version 0 is missing."));
+            return new HistoryCheckResult(violations.ToImmutableArray());
+        }
+
+        var present = new HashSet<long>();
+        for (long v = 0; v <= latest; v++)
+        {
+            if (await log.CommitExistsAsync(v, cancellationToken).ConfigureAwait(false))
+            {
+                present.Add(v);
+            }
+        }
+
+        CheckMonotonicity(present, latest, violations);
+        if (present.Count != latest + 1)
+        {
+            // A hole exists: the snapshot cannot be reconstructed past it, so stop after reporting I1 rather
+            // than letting LoadSnapshotAsync throw an unhandled DeltaProtocolException.
+            return new HistoryCheckResult(violations.ToImmutableArray());
+        }
+
         Snapshot final = await log.LoadSnapshotAsync(cancellationToken: cancellationToken).ConfigureAwait(false);
-        long latest = final.Version;
 
         // Read every committed version's actions once (0 is the seed protocol/metadata commit).
         var commits = new Dictionary<long, CommittedVersion>();
         for (long v = 0; v <= latest; v++)
         {
-            if (!await log.CommitExistsAsync(v, cancellationToken).ConfigureAwait(false))
-            {
-                violations.Add(new HistoryViolation("I1", $"version chain has a gap: commit {v} is missing (latest={latest})."));
-                continue;
-            }
-
             IReadOnlyList<DeltaAction> actions = await log.ReadCommitActionsAsync(v, cancellationToken).ConfigureAwait(false);
             commits[v] = CommittedVersion.From(v, actions);
         }
 
-        CheckMonotonicity(commits, latest, violations);
+        var snapshots = new SnapshotCache(log);
+
         CheckSingleWinner(history, commits, backgroundVersions, latest, violations);
-        await CheckSnapshotIsolationAsync(history, log, violations, cancellationToken).ConfigureAwait(false);
-        await CheckReadYourWritesAsync(history, log, final, violations, cancellationToken).ConfigureAwait(false);
+        await CheckSnapshotIsolationAsync(history, snapshots, violations, cancellationToken).ConfigureAwait(false);
+        await CheckReadYourWritesAsync(history, snapshots, commits, final, latest, violations, cancellationToken).ConfigureAwait(false);
         CheckIdempotentPublication(commits, latest, violations);
-        CheckNoAnomalies(commits, final, latest, violations);
-        CheckConflictClassification(history, commits, backgroundVersions, latest, violations);
+        CheckNoAnomalies(final, backend, violations);
+        await CheckConflictClassificationAsync(history, commits, latest, snapshots, violations, cancellationToken).ConfigureAwait(false);
 
         return new HistoryCheckResult(violations.ToImmutableArray());
     }
 
     // ---- I1: contiguous versions 0..latest, one commit object per version ----
-    private static void CheckMonotonicity(
-        IReadOnlyDictionary<long, CommittedVersion> commits, long latest, List<HistoryViolation> violations)
+    private static void CheckMonotonicity(ISet<long> present, long latest, List<HistoryViolation> violations)
     {
         for (long v = 0; v <= latest; v++)
         {
-            if (!commits.ContainsKey(v))
+            if (!present.Contains(v))
             {
-                violations.Add(new HistoryViolation("I1", $"missing commit object for version {v}; versions must be contiguous 0..{latest}."));
+                violations.Add(new HistoryViolation(
+                    "I1", $"version chain has a gap: commit object for version {v} is missing; versions must be contiguous 0..{latest}."));
             }
         }
     }
@@ -142,36 +185,79 @@ internal static class JepsenHistoryChecker
 
     // ---- I4 / snapshot isolation: a read pinned at R reflects exactly the state at R, nothing from >R ----
     private static async Task CheckSnapshotIsolationAsync(
-        ImmutableArray<HistoryEvent> history, DeltaLog log, List<HistoryViolation> violations, CancellationToken cancellationToken)
+        ImmutableArray<HistoryEvent> history, SnapshotCache snapshots, List<HistoryViolation> violations, CancellationToken cancellationToken)
     {
-        foreach (HistoryEvent read in history.Where(e => e.Outcome is null))
+        foreach (HistoryEvent e in history)
         {
-            long r = read.SnapshotReadVersion;
-            Snapshot pinned = await log.LoadSnapshotAsync(r, cancellationToken).ConfigureAwait(false);
+            // Validate every event that performed a REAL read: a pure read (Outcome null) AND a committing
+            // writer whose read-set is non-empty (a non-blind commit). The blind-append flag is COMPUTED from
+            // the read-set (never the SUT flag): a blind append reads nothing by design, so there is nothing
+            // to validate — comparing its empty read-set to the snapshot would false-positive.
+            ImmutableArray<string> observed;
+            if (e.Outcome is null)
+            {
+                observed = e.ObservedReadFiles;
+            }
+            else if (e.Manifest is { } m && !m.IsBlindAppend)
+            {
+                observed = m.ReadFileSet.OrderBy(p => p, StringComparer.Ordinal).ToImmutableArray();
+            }
+            else
+            {
+                continue;
+            }
+
+            long r = e.SnapshotReadVersion;
+            Snapshot pinned = await snapshots.GetAsync(r, cancellationToken).ConfigureAwait(false);
             var expected = pinned.ActiveFiles.Select(a => a.Path).OrderBy(p => p, StringComparer.Ordinal).ToImmutableArray();
 
-            if (!expected.SequenceEqual(read.ObservedReadFiles, StringComparer.Ordinal))
+            if (!expected.SequenceEqual(observed, StringComparer.Ordinal))
             {
+                string kind = e.Outcome is null ? "read" : "committing writer's read";
                 violations.Add(new HistoryViolation(
-                    "I4", $"writer w{read.ProcessId} read pinned@{r} observed [{string.Join(", ", read.ObservedReadFiles)}] but the reconstructed snapshot at {r} is [{string.Join(", ", expected)}] — a read leaked/omitted actions across the pin (snapshot isolation violated)."));
+                    "I4", $"writer w{e.ProcessId} {kind} pinned@{r} observed [{string.Join(", ", observed)}] but the reconstructed snapshot at {r} is [{string.Join(", ", expected)}] — a read leaked/omitted actions across the pin (snapshot isolation violated)."));
             }
         }
     }
 
-    // ---- I5: after an acknowledged commit at N, a reader at >= N sees the writer's rows ----
+    // ---- I5 / I8: an acknowledged commit at N is visible at N and is not lost from the final snapshot ----
     private static async Task CheckReadYourWritesAsync(
         ImmutableArray<HistoryEvent> history,
-        DeltaLog log,
+        SnapshotCache snapshots,
+        IReadOnlyDictionary<long, CommittedVersion> commits,
         Snapshot final,
+        long latest,
         List<HistoryViolation> violations,
         CancellationToken cancellationToken)
     {
         var finalActive = final.ActiveFiles.Select(a => a.Path).ToImmutableHashSet(StringComparer.Ordinal);
 
+        // Build a GLOBAL path -> versions-removed map from every commit's removes (across ALL writers), so a
+        // legal delete of a file by a later, different writer is not misread as a lost update (§2.11.2).
+        var removedIn = new Dictionary<string, List<long>>(StringComparer.Ordinal);
+        for (long v = 1; v <= latest; v++)
+        {
+            if (!commits.TryGetValue(v, out CommittedVersion c))
+            {
+                continue;
+            }
+
+            foreach (string path in c.RemovePaths)
+            {
+                if (!removedIn.TryGetValue(path, out List<long>? versions))
+                {
+                    versions = new List<long>();
+                    removedIn[path] = versions;
+                }
+
+                versions.Add(v);
+            }
+        }
+
         foreach (HistoryEvent e in history.Where(e => e.Outcome == CommitOutcome.Committed && e.CommittedVersion is not null && e.Manifest is not null))
         {
             long n = e.CommittedVersion!.Value;
-            Snapshot atN = await log.LoadSnapshotAsync(n, cancellationToken).ConfigureAwait(false);
+            Snapshot atN = await snapshots.GetAsync(n, cancellationToken).ConfigureAwait(false);
             var activeAtN = atN.ActiveFiles.Select(a => a.Path).ToImmutableHashSet(StringComparer.Ordinal);
 
             foreach (ManifestFile add in e.Manifest!.Adds)
@@ -182,22 +268,29 @@ internal static class JepsenHistoryChecker
                         "I5", $"writer w{e.ProcessId} committed '{add.Path}' at version {n} but a reader at {n} does not see it (read-your-writes violated)."));
                 }
 
-                // No later remove in this append-only model ⇒ it must also survive to the final snapshot.
-                bool removedLater = e.Manifest.Removes.Any(r => string.Equals(r.Path, add.Path, StringComparison.Ordinal));
-                if (!removedLater && !finalActive.Contains(add.Path))
+                // A file is "lost" only if it is absent from the final snapshot AND no committed remove for
+                // that path exists in any version after N (in ANY writer's commit). A later legal delete is
+                // NOT a lost update.
+                if (!finalActive.Contains(add.Path))
                 {
-                    violations.Add(new HistoryViolation(
-                        "I8", $"writer w{e.ProcessId}'s acknowledged file '{add.Path}' (committed at {n}) is absent from the final snapshot — a lost update."));
+                    bool removedLater = removedIn.TryGetValue(add.Path, out List<long>? removeVersions)
+                        && removeVersions.Any(rv => rv > n);
+                    if (!removedLater)
+                    {
+                        violations.Add(new HistoryViolation(
+                            "I8", $"writer w{e.ProcessId}'s acknowledged file '{add.Path}' (committed at {n}) is absent from the final snapshot and was never removed by a later commit — a lost update."));
+                    }
                 }
             }
         }
     }
 
-    // ---- I6: no committed file appears in two versions (a retry never duplicates rows/files) ----
+    // ---- I6: no committed file — and no idempotency nonce — appears in two versions (a retry never dupes) ----
     private static void CheckIdempotentPublication(
         IReadOnlyDictionary<long, CommittedVersion> commits, long latest, List<HistoryViolation> violations)
     {
-        var seen = new Dictionary<string, long>(StringComparer.Ordinal);
+        var seenFile = new Dictionary<string, long>(StringComparer.Ordinal);
+        var seenNonce = new Dictionary<string, long>(StringComparer.Ordinal);
         for (long v = 1; v <= latest; v++)
         {
             if (!commits.TryGetValue(v, out CommittedVersion c))
@@ -207,100 +300,152 @@ internal static class JepsenHistoryChecker
 
             foreach (string path in c.AddPaths)
             {
-                if (seen.TryGetValue(path, out long first))
+                if (seenFile.TryGetValue(path, out long first))
                 {
                     violations.Add(new HistoryViolation(
                         "I6", $"file '{path}' was published at both version {first} and version {v} — duplicated commit (idempotent publication violated)."));
                 }
                 else
                 {
-                    seen[path] = v;
+                    seenFile[path] = v;
+                }
+            }
+
+            // A commit nonce (Delta txnId) is the writer's exactly-once token; the same nonce landing in two
+            // versions is a true double-publish (a retry that committed twice), so nonces must be unique.
+            if (c.Nonce is { } nonce)
+            {
+                if (seenNonce.TryGetValue(nonce, out long firstNonce))
+                {
+                    violations.Add(new HistoryViolation(
+                        "I6", $"commit nonce '{nonce}' was published at both version {firstNonce} and version {v} — the same commit landed twice (idempotent publication violated)."));
+                }
+                else
+                {
+                    seenNonce[nonce] = v;
                 }
             }
         }
     }
 
-    // ---- I8: every active file traces to a committed add; no phantom active files ----
-    private static void CheckNoAnomalies(
-        IReadOnlyDictionary<long, CommittedVersion> commits, Snapshot final, long latest, List<HistoryViolation> violations)
+    // ---- I8: every active file has a backing data object; none is a phantom/dangling reference ----
+    private static void CheckNoAnomalies(Snapshot final, IStorageBackend backend, List<HistoryViolation> violations)
     {
-        var everAdded = new HashSet<string>(StringComparer.Ordinal);
-        for (long v = 1; v <= latest; v++)
+        // A phantom active file is one the final snapshot lists as active but whose backing data object was
+        // never durably written (a torn write: the commit's add references data that does not exist). The
+        // in-memory backend stages a backing object for every add at write time, so a missing object here is
+        // a genuine dangling reference. (Only enforced against the simulation's own backend, which records
+        // staged data objects.)
+        if (backend is not InMemoryStorageBackend sim)
         {
-            if (commits.TryGetValue(v, out CommittedVersion c))
-            {
-                foreach (string path in c.AddPaths)
-                {
-                    everAdded.Add(path);
-                }
-            }
+            return;
         }
 
         foreach (AddFileAction active in final.ActiveFiles)
         {
-            if (!everAdded.Contains(active.Path))
+            if (!sim.HasObject(active.Path))
             {
                 violations.Add(new HistoryViolation(
-                    "I8", $"active file '{active.Path}' in the final snapshot was never committed via an add — a phantom active file."));
+                    "I8", $"active file '{active.Path}' in the final snapshot has no backing data object — a phantom/dangling reference (torn write)."));
             }
         }
     }
 
     // ---- §3.3.5: recompute isBlindAppend from the read-set; re-derive the expected conflict class ----
-    private static void CheckConflictClassification(
+    private static async Task CheckConflictClassificationAsync(
         ImmutableArray<HistoryEvent> history,
         IReadOnlyDictionary<long, CommittedVersion> commits,
-        ISet<long> backgroundVersions,
         long latest,
-        List<HistoryViolation> violations)
+        SnapshotCache snapshots,
+        List<HistoryViolation> violations,
+        CancellationToken cancellationToken)
     {
         foreach (HistoryEvent e in history.Where(e => e.Manifest is not null && e.Outcome is not null))
         {
             ActionManifest manifest = e.Manifest!;
             bool computedBlind = manifest.IsBlindAppend;
 
-            // Cross-check any SUT-reported flag against the computed value (never trust it — §3.3.5).
+            // Cross-check any SUT-reported flag against the computed value (never trust it — §3.3.5). A
+            // whole-table read over an EMPTY table has an empty read-set too, so computedBlind is spuriously
+            // true there; suppress the mismatch when the table was empty at the read version (there is no way
+            // to distinguish a true blind append from a whole-table scan of nothing).
             if (manifest.SutReportedBlindAppend is { } reported && reported != computedBlind)
             {
-                violations.Add(new HistoryViolation(
-                    "SI", $"writer w{e.ProcessId} reported isBlindAppend={reported} but the read-file-set implies {computedBlind} — the checker uses the computed value."));
+                Snapshot pinned = await snapshots.GetAsync(e.SnapshotReadVersion, cancellationToken).ConfigureAwait(false);
+                bool emptyAtRead = pinned.ActiveFiles.IsEmpty;
+                if (!(computedBlind && emptyAtRead))
+                {
+                    violations.Add(new HistoryViolation(
+                        "SI", $"writer w{e.ProcessId} reported isBlindAppend={reported} but the read-file-set implies {computedBlind} — the checker uses the computed value."));
+                }
             }
 
-            // The winners this writer raced: committed versions after its read it does not own.
-            long upper = e.Outcome == CommitOutcome.Committed && e.CommittedVersion is { } own ? own - 1 : latest;
+            // The winners this writer raced: committed versions in (R, M] it does not own, where M is the
+            // writer's observed latest-at-abort (design §2.11.2). Bounding to M rather than the log's final
+            // latest avoids attributing versions committed AFTER this writer aborted as ones it raced.
+            long own = e.Outcome == CommitOutcome.Committed && e.CommittedVersion is { } committed ? committed : -1;
+            long m = e.ObservedLatestVersion ?? latest;
+            long upper = own >= 0 ? own - 1 : m;
+
             bool concurrentAdd = false;
             bool concurrentRemoveOrMeta = false;
+            bool concurrentSameTxn = false;
             for (long v = e.SnapshotReadVersion + 1; v <= upper; v++)
             {
-                if (e.CommittedVersion == v || !commits.TryGetValue(v, out CommittedVersion c))
+                if (v == own || !commits.TryGetValue(v, out CommittedVersion c))
                 {
                     continue;
                 }
 
                 concurrentAdd |= c.AddPaths.Count > 0;
                 concurrentRemoveOrMeta |= c.RemovePaths.Count > 0 || c.HasMetadata || c.HasProtocol;
+                if (manifest.Txn is { } txn && c.AppIds.Contains(txn.AppId))
+                {
+                    concurrentSameTxn = true;
+                }
             }
+
+            bool classIsTxn = e.ConflictClass?.Contains("ConcurrentTransaction", StringComparison.Ordinal) == true;
+            bool classIsAppend = e.ConflictClass?.Contains("ConcurrentAppend", StringComparison.Ordinal) == true;
 
             if (computedBlind)
             {
-                // A blind append reads nothing, so a concurrent append can never conflict with it — it must
-                // rebase and succeed (Committed) or idempotently skip, never abort with a data conflict.
+                // A blind append reads nothing, so it can only legitimately conflict with a concurrent
+                // metadata/protocol change or a same-appId txn (ConcurrentTransaction) — never with a
+                // concurrent append (it must rebase past those).
                 if (e.Outcome == CommitOutcome.Conflict)
                 {
-                    violations.Add(new HistoryViolation(
-                        "I2", $"writer w{e.ProcessId} is a blind append (empty read-set) yet was aborted with conflict '{e.ConflictClass}' — a blind append must rebase past concurrent appends, not conflict."));
+                    if (concurrentSameTxn)
+                    {
+                        if (!classIsTxn)
+                        {
+                            violations.Add(new HistoryViolation(
+                                "I8", $"writer w{e.ProcessId} raced a concurrent txn on its appId but reported conflict class '{e.ConflictClass}' (expected ConcurrentTransactionException)."));
+                        }
+                    }
+                    else if (!concurrentRemoveOrMeta)
+                    {
+                        violations.Add(new HistoryViolation(
+                            "I2", $"writer w{e.ProcessId} is a blind append (empty read-set) yet was aborted with conflict '{e.ConflictClass}' — a blind append must rebase past concurrent appends, not conflict."));
+                    }
                 }
             }
             else if (e.Outcome == CommitOutcome.Conflict)
             {
                 // A non-blind writer that conflicted must have raced a real concurrent change, and the class
-                // must match: a concurrent add ⇒ ConcurrentAppend; a concurrent remove/meta ⇒ delete/read.
-                if (!concurrentAdd && !concurrentRemoveOrMeta)
+                // must match: a same-appId txn ⇒ ConcurrentTransaction; a concurrent add ⇒ ConcurrentAppend;
+                // a concurrent remove/meta ⇒ delete/read.
+                if (!concurrentAdd && !concurrentRemoveOrMeta && !concurrentSameTxn)
                 {
                     violations.Add(new HistoryViolation(
-                        "I8", $"writer w{e.ProcessId} aborted with '{e.ConflictClass}' but no concurrent change is present in the log after version {e.SnapshotReadVersion} — a spurious conflict."));
+                        "I8", $"writer w{e.ProcessId} aborted with '{e.ConflictClass}' but no concurrent change is present in the log in (version {e.SnapshotReadVersion}, {m}] — a spurious conflict."));
                 }
-                else if (concurrentAdd && e.ConflictClass?.Contains("ConcurrentAppend", StringComparison.Ordinal) != true)
+                else if (concurrentSameTxn && !classIsTxn)
+                {
+                    violations.Add(new HistoryViolation(
+                        "I8", $"writer w{e.ProcessId} raced a concurrent txn on its appId but reported conflict class '{e.ConflictClass}' (expected ConcurrentTransactionException)."));
+                }
+                else if (concurrentAdd && !classIsAppend && !concurrentSameTxn)
                 {
                     violations.Add(new HistoryViolation(
                         "I8", $"writer w{e.ProcessId} raced a concurrent append but reported conflict class '{e.ConflictClass}' (expected ConcurrentAppendException)."));
@@ -309,10 +454,32 @@ internal static class JepsenHistoryChecker
         }
     }
 
+    /// <summary>A small memoizing loader so each version's pinned snapshot is reconstructed at most once
+    /// across the SI and conflict-class checks.</summary>
+    private sealed class SnapshotCache
+    {
+        private readonly DeltaLog _log;
+        private readonly Dictionary<long, Snapshot> _cache = new();
+
+        public SnapshotCache(DeltaLog log) => _log = log;
+
+        public async Task<Snapshot> GetAsync(long version, CancellationToken cancellationToken)
+        {
+            if (!_cache.TryGetValue(version, out Snapshot? snapshot))
+            {
+                snapshot = await _log.LoadSnapshotAsync(version, cancellationToken).ConfigureAwait(false);
+                _cache[version] = snapshot;
+            }
+
+            return snapshot;
+        }
+    }
+
     private readonly record struct CommittedVersion(
         long Version,
         ImmutableHashSet<string> AddPaths,
         ImmutableHashSet<string> RemovePaths,
+        ImmutableHashSet<string> AppIds,
         bool HasMetadata,
         bool HasProtocol,
         string? Nonce)
@@ -321,6 +488,7 @@ internal static class JepsenHistoryChecker
         {
             var adds = ImmutableHashSet.CreateBuilder<string>(StringComparer.Ordinal);
             var removes = ImmutableHashSet.CreateBuilder<string>(StringComparer.Ordinal);
+            var appIds = ImmutableHashSet.CreateBuilder<string>(StringComparer.Ordinal);
             bool hasMetadata = false;
             bool hasProtocol = false;
             string? nonce = null;
@@ -341,6 +509,9 @@ internal static class JepsenHistoryChecker
                     case ProtocolAction:
                         hasProtocol = true;
                         break;
+                    case TxnAction txn:
+                        appIds.Add(txn.AppId);
+                        break;
                     case CommitInfoAction info when info.Entries.TryGetValue(DeltaCommitter.CommitNonceKey, out string? value):
                         nonce = value;
                         break;
@@ -349,7 +520,7 @@ internal static class JepsenHistoryChecker
                 }
             }
 
-            return new CommittedVersion(version, adds.ToImmutable(), removes.ToImmutable(), hasMetadata, hasProtocol, nonce);
+            return new CommittedVersion(version, adds.ToImmutable(), removes.ToImmutable(), appIds.ToImmutable(), hasMetadata, hasProtocol, nonce);
         }
     }
 }
