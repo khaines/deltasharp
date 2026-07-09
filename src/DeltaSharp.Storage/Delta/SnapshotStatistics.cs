@@ -30,6 +30,21 @@ internal enum StatisticColumnState
     /// present-but-unusable for range pruning.</summary>
     AbsentNonTightBounds,
 
+    /// <summary>The column is <b>indexed with a lower bound only</b>: a tight <c>min</c> is present but the
+    /// <c>max</c> was legitimately omitted because the column's true max has no JSON-number encoding — a
+    /// <c>NaN</c> or <c>+Infinity</c> value (<c>NaN</c> is Spark's greatest value), or a truncated string.
+    /// The column retains one-sided skip capability for lower-bound predicates (<c>&lt;</c>/<c>&lt;=</c>,
+    /// and the lower half of <c>=</c>); the upper side cannot be pruned. Advisory only — the optimizer
+    /// learns the column has partial (not absent) skip capability.</summary>
+    AbsentUpperBound,
+
+    /// <summary>The column is <b>indexed with an upper bound only</b>: a tight <c>max</c> is present but the
+    /// <c>min</c> was legitimately omitted because the column's true min has no JSON-number encoding — a
+    /// <c>-Infinity</c> value. The column retains one-sided skip capability for upper-bound predicates
+    /// (<c>&gt;</c>/<c>&gt;=</c>, and the upper half of <c>=</c>); the lower side cannot be pruned. Advisory
+    /// only — the optimizer learns the column has partial (not absent) skip capability.</summary>
+    AbsentLowerBound,
+
     /// <summary>The column is a nested/complex type (struct/array/map) and is never indexed.</summary>
     OmittedNestedType,
 
@@ -153,18 +168,40 @@ internal static class SnapshotStatisticsReporter
 
         bool hasMin = stats.MinValues.ContainsKey(field.Name);
         bool hasMax = stats.MaxValues.ContainsKey(field.Name);
-        if (hasMin && hasMax)
+
+        // A non-tight file's bounds are present-but-unusable for range pruning (a truncated string sets the
+        // file-wide flag false), matching FilePruner's boundsUsable gate — report that whenever any bound is
+        // present, whether one or both survive.
+        if ((hasMin || hasMax) && stats.TightBounds == false)
         {
-            // Present bounds are usable only when the file's bounds are tight (a truncated string sets the
-            // file-wide flag false, matching FilePruner's boundsUsable gate).
-            return stats.TightBounds == false
-                ? StatisticColumnState.AbsentNonTightBounds
-                : StatisticColumnState.Available;
+            return StatisticColumnState.AbsentNonTightBounds;
         }
 
-        // No min/max: distinguish an all-null column (legitimate omission) from an un-indexed one. This
-        // classification (like FilePruner's all-null skip) is sound ONLY while nullCount and numRecords are
-        // EXACT counts; revisit when deletion vectors, which over-count, land.
+        if (hasMin && hasMax)
+        {
+            return StatisticColumnState.Available;
+        }
+
+        // Exactly one tight bound present (partial / one-sided skip capability). The counterpart was
+        // legitimately omitted because its true value has no JSON-number encoding: a NaN/+Infinity raises
+        // the true max beyond encoding (finite min kept → lower-only, AbsentUpperBound) and a -Infinity min
+        // is unencodable (finite max kept → upper-only, AbsentLowerBound). (A truncated string also drops
+        // its max but sets tightBounds=false, handled above.) Reporting the one-sided state — rather than
+        // AbsentNotIndexed — tells the optimizer the column still has lower-only / upper-only skip
+        // capability, mirroring FilePruner's per-bound pruning.
+        if (hasMin)
+        {
+            return StatisticColumnState.AbsentUpperBound;
+        }
+
+        if (hasMax)
+        {
+            return StatisticColumnState.AbsentLowerBound;
+        }
+
+        // No min/max at all: distinguish an all-null column (legitimate omission) from an un-indexed one.
+        // This classification (like FilePruner's all-null skip) is sound ONLY while nullCount and numRecords
+        // are EXACT counts; revisit when deletion vectors, which over-count, land.
         if (stats.NumRecords is { } records && records > 0
             && stats.NullCount.TryGetValue(field.Name, out long nulls) && nulls == records)
         {

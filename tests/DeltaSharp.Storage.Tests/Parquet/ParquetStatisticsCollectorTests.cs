@@ -480,6 +480,50 @@ public sealed class ParquetStatisticsCollectorTests
         Assert.Empty(result.Skipped);
     }
 
+    [Fact]
+    public void NaNBearingDouble_CollectorToPruner_RecoversLowerBoundSkip_ButKeepsUpperAndEqual()
+    {
+        // End-to-end per-bound recovery (round-3): the collector emits [5.0, NaN] as a finite min (5.0) with
+        // the max OMITTED. The pruner must now RECOVER the min-only skip for `< 4.0` (no value is < 4.0 —
+        // 5.0 isn't and NaN, being Spark-greatest, isn't either) while still KEEPING the file for `> 6.0`
+        // and `= 5.0` (the omitted max means the NaN row's upper-side match can never be ruled out). This
+        // skip FAILS on the previous require-both-bounds pruner, which forfeited it.
+        StructType schema = Schema("v", DataTypes.DoubleType);
+        MutableColumnVector v = ColumnVectors.Create(DataTypes.DoubleType, 2);
+        v.AppendValue(5.0d);
+        v.AppendValue(double.NaN);
+
+        FileStatistics stats = Collect(schema, Batch(schema, v));
+        Assert.Equal(DeltaStatValue.OfDouble(5.0d), stats.MinValues["v"]);
+        Assert.False(stats.MaxValues.ContainsKey("v")); // max omitted (NaN is greatest)
+
+        ImmutableSortedDictionary<string, string?> noPartitions =
+            ImmutableSortedDictionary<string, string?>.Empty.WithComparers(StringComparer.Ordinal);
+        ImmutableSortedDictionary<string, string> noTags =
+            ImmutableSortedDictionary<string, string>.Empty.WithComparers(StringComparer.Ordinal);
+        var file = new AddFileAction(
+            "f.parquet", noPartitions, Size: 1, ModificationTime: 0, DataChange: true, stats, noTags);
+
+        FilePruningResult belowMin = FilePruner.Prune(
+            [file],
+            FilePruningRequest.ForData(
+                new ColumnRangeFilter("v", DeltaPredicateOp.LessThan, DeltaStatValue.OfDouble(4.0d))));
+        Assert.Empty(belowMin.Candidates); // recovered: no value < 4.0 (finite min 5.0; NaN is not < 4.0)
+        Assert.Equal(1, belowMin.PrunedByStatistics);
+
+        // The NaN row still may match `> 6.0`/`= 5.0`, and the omitted max cannot rule it out → KEEP.
+        foreach (ColumnRangeFilter keep in new[]
+                 {
+                     new ColumnRangeFilter("v", DeltaPredicateOp.GreaterThan, DeltaStatValue.OfDouble(6.0d)),
+                     new ColumnRangeFilter("v", DeltaPredicateOp.Equal, DeltaStatValue.OfDouble(5.0d)),
+                 })
+        {
+            FilePruningResult kept = FilePruner.Prune([file], FilePruningRequest.ForData(keep));
+            Assert.Single(kept.Candidates);
+            Assert.Empty(kept.Skipped);
+        }
+    }
+
     // ---------------------------------------------------------------- StatisticsPolicy
 
     [Fact]

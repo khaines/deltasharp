@@ -57,6 +57,43 @@ public sealed class FilePruningTests
         return new FileStatistics(numRecords, min.ToImmutable(), max.ToImmutable(), nulls.ToImmutable(), tightBounds);
     }
 
+    private static readonly ImmutableSortedDictionary<string, DeltaStatValue> EmptyStatValues =
+        ImmutableSortedDictionary<string, DeltaStatValue>.Empty.WithComparers(StringComparer.Ordinal);
+
+    // A single-column FileStatistics where EITHER numeric bound may be omitted — exactly what
+    // ParquetStatisticsCollector emits when a column's true max is unencodable (a NaN/+Infinity value ->
+    // finite min only) or its true min is unencodable (a -Infinity value -> finite max only). Tight by
+    // default so the surviving bound is usable for range pruning.
+    private static FileStatistics PartialDoubleStats(
+        string column, long numRecords, double? min, double? max, long nulls = 0, bool? tightBounds = true)
+    {
+        ImmutableSortedDictionary<string, DeltaStatValue> minValues = min is double lo
+            ? Singleton(column, DeltaStatValue.OfDouble(lo))
+            : EmptyStatValues;
+        ImmutableSortedDictionary<string, DeltaStatValue> maxValues = max is double hi
+            ? Singleton(column, DeltaStatValue.OfDouble(hi))
+            : EmptyStatValues;
+        return new FileStatistics(numRecords, minValues, maxValues, Singleton(column, nulls), tightBounds);
+    }
+
+    private static void AssertSkipped(FileStatistics stats, DeltaPredicateOp op, double value)
+    {
+        FilePruningResult result = Prune(
+            [File("f.parquet", stats: stats)],
+            FilePruningRequest.ForData(new ColumnRangeFilter("v", op, DeltaStatValue.OfDouble(value))));
+        Assert.Empty(result.Candidates);
+        Assert.Equal(1, result.PrunedByStatistics);
+    }
+
+    private static void AssertKept(FileStatistics stats, DeltaPredicateOp op, double value)
+    {
+        FilePruningResult result = Prune(
+            [File("f.parquet", stats: stats)],
+            FilePruningRequest.ForData(new ColumnRangeFilter("v", op, DeltaStatValue.OfDouble(value))));
+        Assert.Single(result.Candidates);
+        Assert.Empty(result.Skipped);
+    }
+
     private static FilePruningResult Prune(ImmutableArray<AddFileAction> files, FilePruningRequest request) =>
         FilePruner.Prune(files, request);
 
@@ -243,6 +280,149 @@ public sealed class FilePruningTests
             {
                 Assert.False(anyRowMatches,
                     $"Unsound prune: op={op} value={value} rows=[{string.Join(",", present)}] nulls={nulls}");
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- per-bound (one-sided) pruning
+
+    [Fact]
+    public void DataFilter_MinPresentMaxAbsent_RecoversLowerBoundSkip_KeepsUpperAndEqual()
+    {
+        // A NaN-bearing numeric column [5.0, NaN]: the collector keeps the finite min (5.0) but OMITS the
+        // max (NaN is Spark's GREATEST value, so the true max is NaN and unencodable). Per-bound pruning
+        // must RECOVER the min-only skip for lower-bound predicates (this whole test FAILS on the previous
+        // require-both-bounds code, which kept the file) while staying sound on the upper/equality side.
+        FileStatistics stats = PartialDoubleStats("v", numRecords: 2, min: 5.0, max: null);
+
+        // Lower-bound predicates use MIN only → recovered skips.
+        AssertSkipped(stats, DeltaPredicateOp.LessThan, 4.0);          // min 5.0 >= 4.0 → no value < 4.0
+        AssertSkipped(stats, DeltaPredicateOp.LessThan, 5.0);          // min 5.0 >= 5.0 → no value < 5.0
+        AssertSkipped(stats, DeltaPredicateOp.LessThanOrEqual, 4.0);   // min 5.0 > 4.0 → no value <= 4.0
+        AssertSkipped(stats, DeltaPredicateOp.Equal, 4.0);             // 4.0 < min → cannot equal
+
+        // Lower-bound predicates the min does NOT prove disjoint → KEEP.
+        AssertKept(stats, DeltaPredicateOp.LessThan, 6.0);             // 5.0 < 6.0 matches
+        AssertKept(stats, DeltaPredicateOp.LessThanOrEqual, 5.0);      // 5.0 <= 5.0 matches
+
+        // Upper-bound / equality predicates need MAX (absent) → KEEP (the NaN row may match `>`/`>=`/`=`).
+        AssertKept(stats, DeltaPredicateOp.GreaterThan, 6.0);
+        AssertKept(stats, DeltaPredicateOp.GreaterThan, 4.0);
+        AssertKept(stats, DeltaPredicateOp.GreaterThanOrEqual, 6.0);
+        AssertKept(stats, DeltaPredicateOp.Equal, 6.0);
+        AssertKept(stats, DeltaPredicateOp.Equal, 5.0);
+    }
+
+    [Fact]
+    public void DataFilter_MaxPresentMinAbsent_RecoversUpperBoundSkip_KeepsLowerAndEqual()
+    {
+        // The symmetric case — a -Infinity-bearing column [-Infinity, 5.0]: the collector keeps the finite
+        // max (5.0) but OMITS the min (-Infinity has no JSON-number encoding). Per-bound pruning recovers
+        // the max-only skip for upper-bound predicates while staying sound on the lower/equality side.
+        FileStatistics stats = PartialDoubleStats("v", numRecords: 2, min: null, max: 5.0);
+
+        // Upper-bound predicates use MAX only → recovered skips.
+        AssertSkipped(stats, DeltaPredicateOp.GreaterThan, 6.0);          // max 5.0 <= 6.0 → no value > 6.0
+        AssertSkipped(stats, DeltaPredicateOp.GreaterThan, 5.0);          // max 5.0 <= 5.0 → no value > 5.0
+        AssertSkipped(stats, DeltaPredicateOp.GreaterThanOrEqual, 6.0);   // max 5.0 < 6.0 → no value >= 6.0
+        AssertSkipped(stats, DeltaPredicateOp.Equal, 6.0);               // 6.0 > max → cannot equal
+
+        // Upper-bound predicates the max does NOT prove disjoint → KEEP.
+        AssertKept(stats, DeltaPredicateOp.GreaterThan, 4.0);            // 5.0 > 4.0 matches
+        AssertKept(stats, DeltaPredicateOp.GreaterThanOrEqual, 5.0);     // 5.0 >= 5.0 matches
+
+        // Lower-bound / equality-below predicates need MIN (absent) → KEEP (a -Infinity row may match).
+        AssertKept(stats, DeltaPredicateOp.LessThan, 4.0);
+        AssertKept(stats, DeltaPredicateOp.LessThanOrEqual, -100.0);
+        AssertKept(stats, DeltaPredicateOp.Equal, 4.0);
+        AssertKept(stats, DeltaPredicateOp.Equal, 5.0);
+    }
+
+    [Fact]
+    public void NaNColumn_KeptForGreaterThanFinite_ButSkippedForLessThanMin()
+    {
+        // The exact round-2 soundness property (PRESERVED) plus the round-3 recovery, on one column: a
+        // NaN-bearing column [5.0, NaN] (finite min 5.0 present, max omitted) MUST be KEPT for `> finite`
+        // (NaN is Spark's greatest value, so the NaN row satisfies `> 6.0`) AND is now SKIPPED for
+        // `< min` via the surviving finite min — a valid optimization the require-both code forfeited.
+        FileStatistics stats = PartialDoubleStats("v", numRecords: 2, min: 5.0, max: null);
+
+        AssertKept(stats, DeltaPredicateOp.GreaterThan, 6.0);          // NaN > 6.0 is TRUE under Spark order
+        AssertKept(stats, DeltaPredicateOp.GreaterThanOrEqual, 6.0);   // NaN >= 6.0 is TRUE
+        AssertKept(stats, DeltaPredicateOp.Equal, 5.0);                // 5.0 = 5.0 matches
+
+        AssertSkipped(stats, DeltaPredicateOp.LessThan, 4.0);          // no value < 4.0 (min 5.0, NaN not <)
+    }
+
+    [Fact]
+    public void DataFilter_Equality_PerBound_SkipsOnEitherBoundElseKeeps()
+    {
+        // `= X` can be proven disjoint by EITHER bound alone: X below min (min side) or X above max (max
+        // side). An in-range or unprovable value is kept.
+        FileStatistics minOnly = PartialDoubleStats("v", numRecords: 2, min: 5.0, max: null);
+        AssertSkipped(minOnly, DeltaPredicateOp.Equal, 4.0);   // 4.0 < min 5.0 → skip on the MIN side
+        AssertKept(minOnly, DeltaPredicateOp.Equal, 6.0);      // 6.0 >= min, max absent → unprovable → keep
+
+        FileStatistics maxOnly = PartialDoubleStats("v", numRecords: 2, min: null, max: 5.0);
+        AssertSkipped(maxOnly, DeltaPredicateOp.Equal, 6.0);   // 6.0 > max 5.0 → skip on the MAX side
+        AssertKept(maxOnly, DeltaPredicateOp.Equal, 4.0);      // 4.0 <= max, min absent → unprovable → keep
+
+        FileStatistics both = PartialDoubleStats("v", numRecords: 3, min: 10.0, max: 20.0);
+        AssertKept(both, DeltaPredicateOp.Equal, 15.0);        // 10 <= 15 <= 20 → in range → keep
+        AssertSkipped(both, DeltaPredicateOp.Equal, 5.0);      // below min → skip (min side)
+        AssertSkipped(both, DeltaPredicateOp.Equal, 25.0);     // above max → skip (max side)
+    }
+
+    [Fact]
+    public void Pruning_IsSound_WithPartialBounds_UnderRandomizedData()
+    {
+        // Extends the soundness fuzzer to PARTIAL-bound columns — ParquetStatisticsCollector omits the max
+        // for a NaN/+Infinity column (finite min only) and the min for a -Infinity column (finite max
+        // only). Every pruned file must still genuinely contain no row matching the predicate under Spark's
+        // float TOTAL ORDER (NaN is the GREATEST value). Seeded → deterministic; no wall-clock/unseeded RNG.
+        var random = new Random(20260709);
+        for (int iteration = 0; iteration < 2000; iteration++)
+        {
+            int rowCount = random.Next(1, 8);
+            var rows = new double?[rowCount];
+            for (int r = 0; r < rowCount; r++)
+            {
+                rows[r] = random.Next(0, 6) switch
+                {
+                    0 => null,                     // SQL null
+                    1 => double.NaN,               // omits max (NaN is greatest)
+                    2 => double.PositiveInfinity,  // omits max (+Infinity unencodable)
+                    3 => double.NegativeInfinity,  // omits min (-Infinity unencodable)
+                    _ => random.Next(-20, 20),     // finite
+                };
+            }
+
+            double[] present = rows.Where(v => v.HasValue).Select(v => v!.Value).ToArray();
+            long nulls = rowCount - present.Length;
+
+            // Replicate ParquetStatisticsCollector.CollectDouble exactly: a NaN never enters min/max but
+            // omits the max; min/max are computed over the non-NaN values; a non-finite (±Infinity) bound is
+            // omitted. tightBounds stays true (only string truncation clears it).
+            bool sawNaN = present.Any(double.IsNaN);
+            double[] nonNaN = present.Where(v => !double.IsNaN(v)).ToArray();
+            bool any = nonNaN.Length > 0;
+            double lo = any ? nonNaN.Min() : 0.0;
+            double hi = any ? nonNaN.Max() : 0.0;
+            double? min = any && double.IsFinite(lo) ? lo : null;
+            double? max = any && !sawNaN && double.IsFinite(hi) ? hi : null;
+
+            FileStatistics stats = PartialDoubleStats("v", rowCount, min, max, nulls);
+
+            var op = (DeltaPredicateOp)random.Next(0, 5);
+            double value = random.Next(-22, 22);
+            FilePruningResult result = Prune(
+                [File("f.parquet", stats: stats)],
+                FilePruningRequest.ForData(new ColumnRangeFilter("v", op, DeltaStatValue.OfDouble(value))));
+
+            if (result.Candidates.IsEmpty)
+            {
+                Assert.False(present.Any(v => SatisfiesSparkDouble(op, v, value)),
+                    $"Unsound partial-bound prune: op={op} value={value} rows=[{string.Join(",", present)}] nulls={nulls}");
             }
         }
     }
@@ -445,6 +625,28 @@ public sealed class FilePruningTests
         DeltaPredicateOp.GreaterThanOrEqual => rowValue >= predicateValue,
         _ => false,
     };
+
+    // The soundness oracle for double columns under Spark's float TOTAL ORDER, where NaN is the GREATEST
+    // value (engine KernelScalars.CompareDouble). C#'s IEEE operators return false for every NaN
+    // comparison, so NaN's ordering is applied explicitly; ±Infinity order matches IEEE. The predicate
+    // literal is always finite in the generator.
+    private static bool SatisfiesSparkDouble(DeltaPredicateOp op, double rowValue, double predicateValue)
+    {
+        if (double.IsNaN(rowValue))
+        {
+            return op is DeltaPredicateOp.GreaterThan or DeltaPredicateOp.GreaterThanOrEqual;
+        }
+
+        return op switch
+        {
+            DeltaPredicateOp.Equal => rowValue == predicateValue,
+            DeltaPredicateOp.LessThan => rowValue < predicateValue,
+            DeltaPredicateOp.LessThanOrEqual => rowValue <= predicateValue,
+            DeltaPredicateOp.GreaterThan => rowValue > predicateValue,
+            DeltaPredicateOp.GreaterThanOrEqual => rowValue >= predicateValue,
+            _ => false,
+        };
+    }
 
     private static ImmutableSortedDictionary<string, T> Singleton<T>(string key, T value) =>
         ImmutableSortedDictionary<string, T>.Empty.WithComparers(StringComparer.Ordinal).Add(key, value);

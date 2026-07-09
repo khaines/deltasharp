@@ -195,6 +195,53 @@ public sealed class SnapshotStatisticsTests
     }
 
     [Fact]
+    public void GetStatistics_MinPresentMaxAbsent_YieldsAbsentUpperBound()
+    {
+        // A NaN/+Infinity-bearing column: the collector keeps the finite min but OMITS the max (its true
+        // max is unencodable — NaN is Spark's greatest value). The column is INDEXED with one-sided
+        // (lower-only) skip capability, so it must report AbsentUpperBound — never AbsentNotIndexed, which
+        // would misreport a partially-usable column as unindexed to the optimizer.
+        FileStatistics stats = Stats(
+            numRecords: 5,
+            mins: new[] { ("id", DeltaStatValue.OfLong(1)) },
+            nulls: new[] { ("id", 0L) });
+        FileStatisticsReport file = OnlyFile(Report(1, RichSchema, File("f.parquet", 1, stats)));
+
+        Assert.Equal(StatisticColumnState.AbsentUpperBound, file.StateOf("id"));
+    }
+
+    [Fact]
+    public void GetStatistics_MaxPresentMinAbsent_YieldsAbsentLowerBound()
+    {
+        // The symmetric case — a -Infinity-bearing column: the collector keeps the finite max but OMITS the
+        // min (-Infinity is unencodable). The column is INDEXED with one-sided (upper-only) skip capability,
+        // so it must report AbsentLowerBound.
+        FileStatistics stats = Stats(
+            numRecords: 5,
+            maxs: new[] { ("id", DeltaStatValue.OfLong(9)) },
+            nulls: new[] { ("id", 0L) });
+        FileStatisticsReport file = OnlyFile(Report(1, RichSchema, File("f.parquet", 1, stats)));
+
+        Assert.Equal(StatisticColumnState.AbsentLowerBound, file.StateOf("id"));
+    }
+
+    [Fact]
+    public void GetStatistics_PartialBoundsNonTight_YieldsAbsentNonTightBounds()
+    {
+        // A single surviving bound in a NON-tight file is present-but-unusable for range pruning (mirrors
+        // FilePruner's boundsUsable gate, which disables ALL range pruning when tightBounds == false), so it
+        // reports AbsentNonTightBounds rather than a one-sided state.
+        FileStatistics stats = Stats(
+            numRecords: 5,
+            mins: new[] { ("id", DeltaStatValue.OfLong(1)) },
+            nulls: new[] { ("id", 0L) },
+            tightBounds: false);
+        FileStatisticsReport file = OnlyFile(Report(1, RichSchema, File("f.parquet", 1, stats)));
+
+        Assert.Equal(StatisticColumnState.AbsentNonTightBounds, file.StateOf("id"));
+    }
+
+    [Fact]
     public void FileReport_StateOf_DefaultsToAbsentForUnknownColumn()
     {
         FileStatisticsReport file = OnlyFile(Report(1, RichSchema, File("f.parquet", 1, Stats(1))));
