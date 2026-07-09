@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Delta;
 using DeltaSharp.Storage.Parquet;
@@ -133,22 +134,43 @@ public sealed class ParquetStatisticsCollectorTests
     }
 
     [Fact]
-    public void Double_StoresDoubleKind_ExcludesNaN_CanonicalizesNegativeZero()
+    public void Double_StoresDoubleKind_CanonicalizesNegativeZero()
     {
         StructType schema = Schema("d", DataTypes.DoubleType);
-        MutableColumnVector v = ColumnVectors.Create(DataTypes.DoubleType, 4);
+        MutableColumnVector v = ColumnVectors.Create(DataTypes.DoubleType, 3);
         v.AppendValue(1.5d);
-        v.AppendValue(double.NaN);
         v.AppendValue(3.0d);
         v.AppendValue(-0.0d);
 
         FileStatistics stats = Collect(schema, Batch(schema, v));
 
-        // NaN is excluded from the bounds; -0.0 canonicalizes to +0.0 so the min encodes as "0".
+        // -0.0 canonicalizes to +0.0 so the min encodes as "0".
         Assert.Equal(DeltaStatValue.OfDouble(0.0d), stats.MinValues["d"]);
         Assert.Equal(DeltaStatValue.OfDouble(3.0d), stats.MaxValues["d"]);
         Assert.Equal(DeltaStatKind.Double, stats.MinValues["d"].Kind);
         Assert.Equal("0", stats.MinValues["d"].Raw);
+    }
+
+    [Fact]
+    public void Double_NaNPresent_OmitsMax_KeepsFiniteMin()
+    {
+        // Under Spark's float total order NaN is the GREATEST value (engine KernelScalars.CompareDouble
+        // returns +1 for NaN vs any finite), so a NaN row raises the column's true max to NaN — which has
+        // no JSON-number encoding. Emitting the finite max (7.0) would be an INVALID (too-small) upper
+        // bound that lets the pruner unsoundly skip a file whose NaN matches `>`/`>=`/`=`. The max is
+        // therefore omitted; the finite min (unaffected by NaN) is kept as an exact lower bound.
+        StructType schema = Schema("d", DataTypes.DoubleType);
+        MutableColumnVector v = ColumnVectors.Create(DataTypes.DoubleType, 3);
+        v.AppendValue(5.0d);
+        v.AppendValue(double.NaN);
+        v.AppendValue(7.0d);
+
+        FileStatistics stats = Collect(schema, Batch(schema, v));
+
+        Assert.Equal(3L, stats.NumRecords);
+        Assert.Equal(DeltaStatValue.OfDouble(5.0d), stats.MinValues["d"]);
+        Assert.False(stats.MaxValues.ContainsKey("d")); // NaN is greatest -> a finite max would be unsound
+        Assert.Equal(0L, stats.NullCount["d"]);
     }
 
     [Fact]
@@ -263,7 +285,7 @@ public sealed class ParquetStatisticsCollectorTests
     // ---------------------------------------------------------------- AC2: omit / bound rules
 
     [Fact]
-    public void String_LongValue_IsTruncated_AndDisablesTightBounds()
+    public void String_LongValue_IsTruncated_OmitsMax_AndDisablesTightBounds()
     {
         var policy = new StatisticsPolicy(stringTruncationLength: 5);
         StructType schema = Schema("s", DataTypes.StringType);
@@ -273,9 +295,34 @@ public sealed class ParquetStatisticsCollectorTests
 
         FileStatistics stats = Collect(schema, Batch(schema, v), policy);
 
-        Assert.Equal("abcde", stats.MinValues["s"].Raw); // prefix-truncated to 5 chars
-        Assert.Equal("zzzzz", stats.MaxValues["s"].Raw);
+        // The min prefix ("abcde") is a valid loose lower bound (prefix <= true min) and is kept; the
+        // truncated max ("zzzzz" < the true max "zzzzzzzz") would be an invalid upper bound and is OMITTED
+        // — a prefix is never emitted as a max.
+        Assert.Equal("abcde", stats.MinValues["s"].Raw);
+        Assert.True(string.CompareOrdinal(stats.MinValues["s"].Raw, "abcdefgh") <= 0); // <= true min
+        Assert.False(stats.MaxValues.ContainsKey("s"));
         Assert.False(stats.TightBounds!.Value); // truncation forfeits tight bounds for the whole file
+    }
+
+    [Fact]
+    public void String_ValueBeyondDefaultTruncation_OmitsMax_KeepsLooseMin()
+    {
+        // Default 32-code-unit horizon. Two 40-unit values sharing their first 32 units: truncating the
+        // max would clamp it to a 32-unit prefix strictly LESS than the true max — an invalid upper bound
+        // a cross-engine (Spark) reader could unsoundly skip on. The max must be omitted, never a prefix.
+        StructType schema = Schema("s", DataTypes.StringType);
+        string trueMin = new string('a', 40);
+        string trueMax = new string('a', 32) + new string('z', 8);
+        MutableColumnVector v = ColumnVectors.Create(DataTypes.StringType, 2);
+        v.AppendBytes(System.Text.Encoding.UTF8.GetBytes(trueMin));
+        v.AppendBytes(System.Text.Encoding.UTF8.GetBytes(trueMax));
+
+        FileStatistics stats = Collect(schema, Batch(schema, v));
+
+        Assert.False(stats.MaxValues.ContainsKey("s")); // no invalid (too-narrow) max is ever written
+        Assert.True(stats.MinValues.ContainsKey("s"));
+        Assert.True(string.CompareOrdinal(stats.MinValues["s"].Raw, trueMin) <= 0); // loose lower bound
+        Assert.False(stats.TightBounds!.Value);
     }
 
     [Fact]
@@ -392,6 +439,45 @@ public sealed class ParquetStatisticsCollectorTests
         Assert.Equal(2L, stats.NumRecords);
         Assert.Equal(DeltaStatValue.OfLong(10L), stats.MinValues["id"]);
         Assert.Equal(DeltaStatValue.OfLong(20L), stats.MaxValues["id"]);
+    }
+
+    // ---------------------------------------------------------------- collector -> pruner soundness
+
+    [Fact]
+    public void NaNBearingDouble_CollectorToPruner_KeepsFileFor_GreaterThanFinite()
+    {
+        // End-to-end soundness (FIX): the engine scans `col > finite` under Spark's total order where NaN
+        // is GREATEST (KernelScalars.CompareDouble), so the NaN row satisfies `> 6.0`. The collector must
+        // therefore NOT emit a finite max the pruner could skip on. Collect stats for [5.0, NaN] (whose
+        // pre-fix finite max 5.0 would exclude the file), then prune with `> 6.0` and assert the file is
+        // KEPT — never skipped — and the emitted max is omitted.
+        StructType schema = Schema("v", DataTypes.DoubleType);
+        MutableColumnVector v = ColumnVectors.Create(DataTypes.DoubleType, 2);
+        v.AppendValue(5.0d);
+        v.AppendValue(double.NaN);
+
+        FileStatistics stats = Collect(schema, Batch(schema, v));
+
+        // The max is omitted (NaN is greatest -> a finite max would be an unsound upper bound).
+        Assert.False(stats.MaxValues.ContainsKey("v"));
+        Assert.Equal(DeltaStatValue.OfDouble(5.0d), stats.MinValues["v"]);
+
+        ImmutableSortedDictionary<string, string?> noPartitions =
+            ImmutableSortedDictionary<string, string?>.Empty.WithComparers(StringComparer.Ordinal);
+        ImmutableSortedDictionary<string, string> noTags =
+            ImmutableSortedDictionary<string, string>.Empty.WithComparers(StringComparer.Ordinal);
+        var file = new AddFileAction(
+            "f.parquet", noPartitions, Size: 1, ModificationTime: 0, DataChange: true, stats, noTags);
+
+        FilePruningResult result = FilePruner.Prune(
+            [file],
+            FilePruningRequest.ForData(
+                new ColumnRangeFilter("v", DeltaPredicateOp.GreaterThan, DeltaStatValue.OfDouble(6.0d))));
+
+        // The NaN row matches `> 6.0` under Spark's NaN-greatest order, so the file MUST be a candidate.
+        AddFileAction candidate = Assert.Single(result.Candidates);
+        Assert.Equal("f.parquet", candidate.Path);
+        Assert.Empty(result.Skipped);
     }
 
     // ---------------------------------------------------------------- StatisticsPolicy

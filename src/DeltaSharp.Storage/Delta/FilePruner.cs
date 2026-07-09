@@ -70,7 +70,9 @@ internal static class FilePruner
 
         foreach (ColumnRangeFilter filter in filters)
         {
-            // An all-null column cannot satisfy any concrete comparison (NULL is never <, >, or =).
+            // An all-null column cannot satisfy any concrete comparison (NULL is never <, >, or =). This
+            // skip (and the SnapshotStatistics AbsentAllNull equivalent) is sound ONLY while nullCount and
+            // numRecords are EXACT counts; revisit when deletion vectors, which over-count, land.
             if (stats.NumRecords is { } rows && rows > 0
                 && stats.NullCount.TryGetValue(filter.Column, out long nulls) && nulls == rows)
             {

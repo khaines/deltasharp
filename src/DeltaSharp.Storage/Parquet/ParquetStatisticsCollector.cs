@@ -142,6 +142,7 @@ internal static class ParquetStatisticsCollector
     {
         long nulls = 0;
         bool any = false;
+        bool sawNaN = false;
         double min = 0;
         double max = 0;
         foreach (ColumnBatch batch in batches)
@@ -158,11 +159,18 @@ internal static class ParquetStatisticsCollector
 
                 double value = read(vector, r);
 
-                // NaN never satisfies an ordered/equality comparison, so excluding it from the bounds
-                // keeps pruning sound while avoiding a NaN-poisoned (unusable) bound. -0.0 canonicalizes
-                // to +0.0 so the encoded bound is stable.
+                // Under Spark's float TOTAL ORDER NaN is the GREATEST value — the engine's scalar filter
+                // uses DeltaSharp.Engine.Columnar.KernelScalars.CompareDouble, which returns +1 for NaN vs
+                // any finite, so `col > finite`/`>=`/`= NaN` is TRUE for a NaN row. A NaN therefore raises
+                // the column's true max to NaN, which has no JSON-number encoding. We must not write a
+                // finite max in its place: that would be an INVALID (too-small) upper bound that lets the
+                // pruner unsoundly skip a file whose NaN row matches an upper-range predicate. So we record
+                // that a NaN was seen and omit the max below (fail-open on the upper side). NaN never
+                // lowers the min (it is greatest), so the finite min stays an exact lower bound and `<`/
+                // `<=` skips remain sound. -0.0 canonicalizes to +0.0 so the encoded bound is stable.
                 if (double.IsNaN(value))
                 {
+                    sawNaN = true;
                     continue;
                 }
 
@@ -192,9 +200,11 @@ internal static class ParquetStatisticsCollector
             }
         }
 
-        // A ±Infinity bound has no JSON-number encoding, so omit it (forfeits that bound, stays sound).
+        // A ±Infinity bound has no JSON-number encoding, so omit it (forfeits that bound, stays sound). The
+        // max is additionally omitted whenever any NaN was seen: NaN is the greatest value, so the true max
+        // is NaN and any finite max would be an unsound upper bound. The finite min is unaffected by NaN.
         DeltaStatValue? minValue = any && double.IsFinite(min) ? DeltaStatValue.OfDouble(min) : null;
-        DeltaStatValue? maxValue = any && double.IsFinite(max) ? DeltaStatValue.OfDouble(max) : null;
+        DeltaStatValue? maxValue = any && !sawNaN && double.IsFinite(max) ? DeltaStatValue.OfDouble(max) : null;
         return new ColumnStat(minValue, maxValue, nulls, Truncated: false);
     }
 
@@ -326,15 +336,27 @@ internal static class ParquetStatisticsCollector
 
         (string minText, bool minTruncated) = TruncateUtf8(min, truncationLength);
         (string maxText, bool maxTruncated) = TruncateUtf8(max, truncationLength);
+
+        // A byte-prefix sorts at or before the full value (prefix <= value), so a truncated min is a valid
+        // (if loose) LOWER bound — prefix <= true min <= every value — and we keep it. But a truncated max
+        // prefix is strictly LESS than the true max, i.e. an INVALID (too-narrow) upper bound: Delta
+        // requires max >= every value even when tightBounds=false, and a cross-engine reader (Spark) would
+        // use it to unsoundly skip. So we NEVER emit a prefix as a max — a truncated max is omitted
+        // entirely. (Restoring a valid, tight-ish max via Delta's min-down/max-up increment, which would
+        // re-enable string range skipping, is the deferred optimization tracked in #493.) Any truncation
+        // still marks the file's bounds not-tight (the surviving min is loose).
+        DeltaStatValue minValue = DeltaStatValue.OfString(minText);
+        DeltaStatValue? maxValue = maxTruncated ? null : DeltaStatValue.OfString(maxText);
         return new ColumnStat(
-            DeltaStatValue.OfString(minText),
-            DeltaStatValue.OfString(maxText),
+            minValue,
+            maxValue,
             nulls,
             Truncated: minTruncated || maxTruncated);
     }
 
-    // Decode UTF-8 bytes to a string and prefix-truncate to at most `maxChars` Unicode characters without
-    // splitting a surrogate pair. Returns whether truncation removed any character.
+    // Decode UTF-8 bytes to a string and prefix-truncate to at most `maxChars` UTF-16 code units (the unit
+    // string.Length measures) without splitting a surrogate pair. Returns whether truncation removed any
+    // code unit.
     private static (string Text, bool Truncated) TruncateUtf8(byte[] utf8, int maxChars)
     {
         string text = System.Text.Encoding.UTF8.GetString(utf8);

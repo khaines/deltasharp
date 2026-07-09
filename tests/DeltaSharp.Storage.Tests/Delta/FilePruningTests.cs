@@ -328,6 +328,36 @@ public sealed class FilePruningTests
     }
 
     [Fact]
+    public void StatsPresent_ButPredicateColumnMinMaxOmitted_AreAlwaysKept_ForEveryOp()
+    {
+        // AC3 fail-open: the file HAS statistics (a record count and another indexed column), but the
+        // predicate column's min/max are omitted — e.g. it lies beyond the 32-column indexing horizon or
+        // is an omitted type. With no bound to prove non-matching, the file must be kept (scanned) for
+        // every predicate; a missing min/max must NEVER make the file skip-eligible.
+        var min = ImmutableSortedDictionary.CreateBuilder<string, DeltaStatValue>(StringComparer.Ordinal);
+        var max = ImmutableSortedDictionary.CreateBuilder<string, DeltaStatValue>(StringComparer.Ordinal);
+        var nulls = ImmutableSortedDictionary.CreateBuilder<string, long>(StringComparer.Ordinal);
+        min["indexed"] = DeltaStatValue.OfLong(0);
+        max["indexed"] = DeltaStatValue.OfLong(100);
+        nulls["indexed"] = 0;
+        var stats = new FileStatistics(
+            10, min.ToImmutable(), max.ToImmutable(), nulls.ToImmutable(), TightBounds: true);
+        ImmutableArray<AddFileAction> files = [File("f.parquet", stats: stats)];
+
+        foreach (DeltaPredicateOp op in AllOps)
+        {
+            foreach (long value in new long[] { -1000, 0, 50, 1000 })
+            {
+                FilePruningResult result = Prune(
+                    files, FilePruningRequest.ForData(new ColumnRangeFilter("id", op, DeltaStatValue.OfLong(value))));
+
+                Assert.Single(result.Candidates);
+                Assert.Empty(result.Skipped);
+            }
+        }
+    }
+
+    [Fact]
     public void CandidatesAndSkipped_ExactlyPartitionTheInput()
     {
         // AC3: every file is accounted for as either a scan candidate or a reported skip — nothing is

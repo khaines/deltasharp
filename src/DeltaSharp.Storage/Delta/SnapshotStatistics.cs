@@ -162,7 +162,9 @@ internal static class SnapshotStatisticsReporter
                 : StatisticColumnState.Available;
         }
 
-        // No min/max: distinguish an all-null column (legitimate omission) from an un-indexed one.
+        // No min/max: distinguish an all-null column (legitimate omission) from an un-indexed one. This
+        // classification (like FilePruner's all-null skip) is sound ONLY while nullCount and numRecords are
+        // EXACT counts; revisit when deletion vectors, which over-count, land.
         if (stats.NumRecords is { } records && records > 0
             && stats.NullCount.TryGetValue(field.Name, out long nulls) && nulls == records)
         {

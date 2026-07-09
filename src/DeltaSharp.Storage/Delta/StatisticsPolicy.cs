@@ -21,16 +21,21 @@ namespace DeltaSharp.Storage.Delta;
 /// statistics; nested (struct/array/map), <c>void</c>, binary, and out-of-range decimal columns are
 /// written but <b>omitted</b> from statistics entirely.</item>
 /// <item><b>String truncation.</b> A string <c>min</c>/<c>max</c> is prefix-truncated to
-/// <see cref="StringTruncationLength"/> Unicode characters (Delta default 32). Because a truncated
-/// <c>max</c> prefix is <i>not</i> a true upper bound, any truncation marks the whole file's bounds as
-/// <b>not tight</b> (<c>tightBounds=false</c>), which disables <c>min</c>/<c>max</c> range pruning for
-/// the file — matching the pruner's existing rule that string bounds are never used for range skipping
-/// (Delta may truncate them). This is deliberately conservative; a Delta-faithful <c>max</c>-rounded-up
-/// tie-break that preserves <c>tightBounds</c> for the other columns is a tracked follow-up.</item>
+/// <see cref="StringTruncationLength"/> UTF-16 code units (Delta default 32). A byte-prefix sorts at or
+/// before the full value, so a truncated <c>min</c> is a valid (loose) lower bound and is kept; but a
+/// truncated <c>max</c> prefix is strictly <i>less</i> than the true max — an invalid upper bound — so a
+/// truncated <c>max</c> is <b>omitted entirely</b> (a prefix is never emitted as a <c>max</c>). Any
+/// truncation also marks the whole file's bounds as <b>not tight</b> (<c>tightBounds=false</c>), which
+/// disables <c>min</c>/<c>max</c> range pruning for the file — matching the pruner's existing rule that
+/// string bounds are never used for range skipping (Delta may truncate them). This is deliberately
+/// conservative; Delta's per-value <c>min</c>-down/<c>max</c>-up increment (which would restore a valid,
+/// tight-ish <c>max</c> and re-enable string skipping) is the deferred optimization tracked in #493.</item>
 /// <item><b>All-null / empty columns.</b> A column with no non-null value records its <c>nullCount</c>
 /// but omits <c>min</c>/<c>max</c> (there is no representative bound).</item>
-/// <item><b>Non-finite floats.</b> <c>NaN</c> is excluded from bounds (it never satisfies a comparison,
-/// so excluding it stays sound), <c>-0.0</c> is canonicalized to <c>+0.0</c>, and a <c>±Infinity</c>
+/// <item><b>Non-finite floats.</b> Under Spark's float total order <c>NaN</c> is the <i>greatest</i>
+/// value (engine <c>KernelScalars.CompareDouble</c>), so a <c>NaN</c>-bearing column's true max is
+/// <c>NaN</c> — which has no JSON-number encoding — and the <c>max</c> is <b>omitted</b> (the finite min
+/// is unaffected and kept). <c>-0.0</c> is canonicalized to <c>+0.0</c>, and a <c>±Infinity</c>
 /// bound is omitted (it has no JSON-number encoding).</item>
 /// </list>
 ///
@@ -40,7 +45,7 @@ namespace DeltaSharp.Storage.Delta;
 /// </summary>
 internal sealed class StatisticsPolicy
 {
-    /// <summary>The default per-string <c>min</c>/<c>max</c> truncation horizon in Unicode characters
+    /// <summary>The default per-string <c>min</c>/<c>max</c> truncation horizon in UTF-16 code units
     /// (Delta <c>DATA_SKIPPING_STRING_PREFIX_LENGTH</c>).</summary>
     public const int DefaultStringTruncationLength = 32;
 
@@ -63,7 +68,7 @@ internal sealed class StatisticsPolicy
         MaxIndexedColumns = maxIndexedColumns;
     }
 
-    /// <summary>The maximum number of Unicode characters retained in a string <c>min</c>/<c>max</c>.</summary>
+    /// <summary>The maximum number of UTF-16 code units retained in a string <c>min</c>/<c>max</c>.</summary>
     public int StringTruncationLength { get; }
 
     /// <summary>The number of leading top-level columns for which statistics are collected.</summary>
