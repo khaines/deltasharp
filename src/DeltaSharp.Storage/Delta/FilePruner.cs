@@ -17,27 +17,26 @@ internal static class FilePruner
         ArgumentNullException.ThrowIfNull(request);
 
         ImmutableArray<AddFileAction>.Builder candidates = ImmutableArray.CreateBuilder<AddFileAction>();
-        int prunedByPartition = 0;
-        int prunedByStatistics = 0;
+        ImmutableArray<SkippedFile>.Builder skipped = ImmutableArray.CreateBuilder<SkippedFile>();
 
         foreach (AddFileAction file in files)
         {
             if (PartitionExcludes(file, request.PartitionFilters))
             {
-                prunedByPartition++;
+                skipped.Add(new SkippedFile(file, FileSkipReason.PartitionMismatch));
                 continue;
             }
 
             if (StatisticsExclude(file, request.DataFilters))
             {
-                prunedByStatistics++;
+                skipped.Add(new SkippedFile(file, FileSkipReason.StatisticsDisjoint));
                 continue;
             }
 
             candidates.Add(file);
         }
 
-        return new FilePruningResult(candidates.ToImmutable(), files.Length, prunedByPartition, prunedByStatistics);
+        return new FilePruningResult(candidates.ToImmutable(), files.Length, skipped.ToImmutable());
     }
 
     /// <summary>True only if a partition filter proves this file's partition cannot match (its exact,

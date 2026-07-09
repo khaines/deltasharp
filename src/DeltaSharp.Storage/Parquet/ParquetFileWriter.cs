@@ -1,4 +1,5 @@
 using DeltaSharp.Engine.Columnar;
+using DeltaSharp.Storage.Delta;
 using DeltaSharp.Types;
 using Parquet;
 using Parquet.Schema;
@@ -12,6 +13,11 @@ namespace DeltaSharp.Storage.Parquet;
 /// into row groups of at most <see cref="RowGroupRowLimit"/> rows; the footer carries the Spark/Delta
 /// schema JSON in <c>key_value_metadata</c>, and per-column <c>Statistics</c> (min/max/null) are
 /// produced automatically by Parquet.Net from the written values (checklist 17 statistics bullets).
+///
+/// <para><see cref="WriteWithStatisticsAsync"/> additionally returns the write-time Delta
+/// <see cref="FileStatistics"/> (record count + per-column min/max/nullCount) the caller records on the
+/// <c>add</c> action (STORY-05.6.3 AC1), collected by <see cref="ParquetStatisticsCollector"/> under a
+/// <see cref="StatisticsPolicy"/>.</para>
 /// </summary>
 internal sealed class ParquetFileWriter
 {
@@ -120,6 +126,43 @@ internal sealed class ParquetFileWriter
 
             emitted += size;
         }
+    }
+
+    /// <summary>
+    /// Writes <paramref name="batches"/> as one Parquet file (as <see cref="WriteAsync"/>) and returns the
+    /// facts a Delta <c>add</c> action needs: the byte size, record count, and the write-time
+    /// <see cref="FileStatistics"/> collected under <paramref name="policy"/> (STORY-05.6.3 AC1). The
+    /// statistics describe exactly the rows written; the caller records them on the staged file so the
+    /// commit carries <c>add.stats</c>.
+    /// </summary>
+    /// <remarks><see cref="WriteResult.ByteSize"/> is measured from <paramref name="output"/>'s advanced
+    /// position and is <c>0</c> for a non-seekable stream (the caller measures bytes itself in that case);
+    /// byte size and partition values are otherwise carried by the staged file, not this result.</remarks>
+    /// <exception cref="ArgumentNullException">An argument is null.</exception>
+    /// <exception cref="ArgumentException">A batch's schema does not match <paramref name="schema"/>.</exception>
+    /// <exception cref="DeltaStorageException">A column's type has no supported Parquet mapping
+    /// (<see cref="StorageErrorKind.UnsupportedFeature"/>), or a non-nullable column holds a null
+    /// (<see cref="StorageErrorKind.CorruptData"/>).</exception>
+    public async Task<WriteResult> WriteWithStatisticsAsync(
+        Stream output,
+        StructType schema,
+        IReadOnlyList<ColumnBatch> batches,
+        StatisticsPolicy policy,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(output);
+        ArgumentNullException.ThrowIfNull(schema);
+        ArgumentNullException.ThrowIfNull(batches);
+        ArgumentNullException.ThrowIfNull(policy);
+
+        long startPosition = output.CanSeek ? output.Position : 0L;
+
+        // Write first: a failing write (e.g. a non-nullable null) never yields a spurious statistics pass.
+        await WriteAsync(output, schema, batches, cancellationToken).ConfigureAwait(false);
+
+        long byteSize = output.CanSeek ? output.Position - startPosition : 0L;
+        FileStatistics statistics = ParquetStatisticsCollector.Collect(schema, batches, policy);
+        return new WriteResult(byteSize, statistics.NumRecords ?? 0L, statistics);
     }
 
     // Advance the (batch, row) cursor by exactly `size` logical rows, recording the contiguous
@@ -424,6 +467,11 @@ internal sealed class ParquetFileWriter
                 $"Non-nullable column '{field.Name}' holds a null at row {row}.");
         }
     }
+
+    /// <summary>The result of <see cref="WriteWithStatisticsAsync"/>: the file's byte
+    /// <see cref="ByteSize"/> (0 for a non-seekable output), its <see cref="RowCount"/>, and the
+    /// write-time <see cref="Statistics"/> to record on the Delta <c>add</c> action.</summary>
+    public readonly record struct WriteResult(long ByteSize, long RowCount, FileStatistics Statistics);
 
     // A contiguous run of logical rows within a single input batch that a row group covers.
     private readonly struct Segment
