@@ -24,6 +24,8 @@ public class DeltaSharpTelemetryTests
         ["ComponentKey"] = "deltasharp.component",
         ["OperationKey"] = "deltasharp.operation",
         ["OutcomeKey"] = "deltasharp.outcome",
+        ["BackendKey"] = "deltasharp.backend",
+        ["ConflictClassKey"] = "deltasharp.conflict.class",
         ["JobIdKey"] = "deltasharp.job.id",
         ["StageKey"] = "deltasharp.stage",
         ["TaskIdKey"] = "deltasharp.task.id",
@@ -49,6 +51,8 @@ public class DeltaSharpTelemetryTests
         Assert.Equal("deltasharp.component", DeltaSharpTelemetry.ComponentKey);
         Assert.Equal("deltasharp.operation", DeltaSharpTelemetry.OperationKey);
         Assert.Equal("deltasharp.outcome", DeltaSharpTelemetry.OutcomeKey);
+        Assert.Equal("deltasharp.backend", DeltaSharpTelemetry.BackendKey);
+        Assert.Equal("deltasharp.conflict.class", DeltaSharpTelemetry.ConflictClassKey);
         Assert.Equal("deltasharp.job.id", DeltaSharpTelemetry.JobIdKey);
         Assert.Equal("deltasharp.stage", DeltaSharpTelemetry.StageKey);
         Assert.Equal("deltasharp.task.id", DeltaSharpTelemetry.TaskIdKey);
