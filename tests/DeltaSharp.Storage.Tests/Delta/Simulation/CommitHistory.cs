@@ -96,7 +96,15 @@ internal sealed record HistoryEvent
     /// <summary>The version that became visible for a <see cref="CommitOutcome.Committed"/>/<see cref="CommitOutcome.Skipped"/>.</summary>
     public long? CommittedVersion { get; init; }
 
-    /// <summary>The number of put-if-absent attempts the commit took (1 ⇒ won first try).</summary>
+    /// <summary>The writer's <b>observed latest-at-abort</b> version <c>M</c> — the highest committed
+    /// version durable when this operation resolved. For a conflicted/contended/unknown outcome it bounds
+    /// the winners this writer actually raced to <c>(SnapshotReadVersion, M]</c> (design §2.11.2), so the
+    /// conflict-class re-derivation never scans versions committed <i>after</i> the writer aborted. Null for
+    /// a pure read record or when unavailable (the checker then falls back to the log's latest).</summary>
+    public long? ObservedLatestVersion { get; init; }
+
+    /// <summary>The number of put-if-absent attempts the commit took (1 ⇒ won first try). <c>-1</c> means the
+    /// attempt count was not available (an aborted/contended/unknown-state outcome carries no honest count).</summary>
     public int Attempts { get; init; }
 
     /// <summary>The classified conflict type name for a <see cref="CommitOutcome.Conflict"/> outcome.</summary>
@@ -149,7 +157,8 @@ internal sealed class HistoryRecorder
         int attempts,
         string? conflictClass,
         long invokeTime,
-        string expectedPostState)
+        string expectedPostState,
+        long? observedLatestVersion = null)
     {
         string opType = manifest.Txn is { } txn
             ? "retry(" + txn + ")"
@@ -165,6 +174,7 @@ internal sealed class HistoryRecorder
             Manifest = manifest,
             Outcome = outcome,
             CommittedVersion = committedVersion,
+            ObservedLatestVersion = observedLatestVersion,
             Attempts = attempts,
             ConflictClass = conflictClass,
             ExpectedPostState = expectedPostState,

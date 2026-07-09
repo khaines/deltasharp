@@ -52,6 +52,13 @@ internal sealed class CooperativeScheduler
     public string InterleavingSummary =>
         string.Join(",", _decisions.Select(d => "w" + d.WriterId.ToString(CultureInfo.InvariantCulture)));
 
+    /// <summary>Whether the logical writer <paramref name="writerId"/> has run to completion. Used by a
+    /// writer body that must observe another writer's committed effect (a scripted <b>happens-before</b>),
+    /// by spin-yielding until the dependency completes — deterministically, since the scheduler advances one
+    /// writer at a time.</summary>
+    public bool IsCompleted(int writerId) =>
+        writerId >= 0 && writerId < _writers.Length && _writers[writerId].Completed;
+
     /// <summary>
     /// Awaited by the in-memory backend and by the commit probe at each interleaving point. Parks the
     /// <b>currently running</b> writer on a fresh gate and returns its (incomplete) task, so control
@@ -157,6 +164,19 @@ internal sealed class CooperativeScheduler
             _running = chosen;
             gate.SetResult(); // resumes 'chosen' INLINE until it parks again or completes.
             _running = null;
+
+            // Self-check (design §3.4.3 determinism guard): a resumed writer must, by the time SetResult
+            // unwinds, be EITHER re-parked at a fresh interleaving point OR completed. If it is neither, its
+            // continuation escaped inline resumption — an un-instrumented await reached the thread pool — so
+            // the interleaving is no longer under the scheduler's control. Fail fast rather than let a future
+            // committer change silently corrupt determinism.
+            if (!chosen.Completed && !chosen.Parked)
+            {
+                throw new InvalidOperationException(
+                    $"Cooperative scheduler lost control of writer w{chosen.Id}: after resume it is neither re-parked "
+                    + "nor completed, so its continuation escaped inline resumption (an un-instrumented await hit the "
+                    + $"thread pool). Last reason={chosen.Reason}, steps={chosen.Steps}, decisions={_decisions.Count}.");
+            }
         }
 
         // Every launch has completed inline by now; surface an escaping body exception as a genuine defect.

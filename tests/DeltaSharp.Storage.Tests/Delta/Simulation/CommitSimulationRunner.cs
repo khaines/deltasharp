@@ -29,6 +29,40 @@ internal sealed record WriterSpec
     public bool WholeTableReadsAllActive { get; init; }
 
     public TxnKey? Txn { get; init; }
+
+    // ---- Fault-injection knobs (efficacy demos; design §3.4.1). Each falsifies exactly one invariant. ----
+
+    /// <summary>Ghost paths appended to the recorded <b>read-file-set</b> that are NOT in the snapshot the
+    /// writer actually pinned — a "read leaked across the pin" fault. Makes the writer's read diverge from
+    /// the reconstructed snapshot at its read version, so the checker's <b>I4</b> snapshot-isolation
+    /// predicate fires. Empty ⇒ no leak.</summary>
+    public ImmutableArray<string> ReadSetGhosts { get; init; } = ImmutableArray<string>.Empty;
+
+    /// <summary>When true, the writer commits its log <c>add</c> entries but does <b>not</b> stage the
+    /// backing data objects — a <b>torn write</b> (a committed reference to data that was never durably
+    /// written). The checker's <b>I8</b> phantom-active predicate fires when such a file is active in the
+    /// final snapshot.</summary>
+    public bool SkipDataWrite { get; init; }
+
+    /// <summary>Forces every commit attempt of this writer to embed a fixed idempotency nonce instead of a
+    /// per-attempt-unique one. Two writers sharing an override land the same nonce in two versions, so the
+    /// checker's <b>I6</b> nonce-uniqueness predicate fires. Null ⇒ the default unique per-writer nonce.</summary>
+    public string? NonceOverride { get; init; }
+
+    /// <summary>Overrides the SUT-reported <c>isBlindAppend</c> flag recorded in the manifest (normally
+    /// derived from <see cref="Scope"/>). Setting it to contradict the checker's <b>computed</b> value (empty
+    /// read-set) makes the §3.3.5 blind-append cross-check fire. Null ⇒ the honest scope-derived value.</summary>
+    public bool? ReportedBlindOverride { get; init; }
+
+    /// <summary>If set, this writer spin-yields until writer <see cref="DependsOnWriterId"/> has completed
+    /// before it reads — a scripted <b>happens-before</b> so it observes that writer's committed effect
+    /// deterministically (e.g. to read a file a prior writer added, then legally remove it).</summary>
+    public int? DependsOnWriterId { get; init; }
+
+    /// <summary>Forces the recorded <see cref="HistoryEvent.ConflictClass"/> for an aborted commit to a wrong
+    /// value, so the checker's conflict-class re-derivation flags the mismatch. Null ⇒ the honest exception
+    /// type name.</summary>
+    public string? ConflictClassOverride { get; init; }
 }
 
 /// <summary>The outcome of a full simulation run: the recorded history, the backend to reload the log from,
@@ -59,7 +93,8 @@ internal static class CommitSimulationRunner
         Func<int, IBackendFaultSchedule>? faultFactory = null,
         bool disableSingleWinner = false,
         IReadOnlyList<IReadOnlyList<string>>? preCommits = null,
-        int minWriter = 2)
+        int minWriter = 2,
+        bool contended = false)
     {
         ArgumentNullException.ThrowIfNull(writers);
 
@@ -75,6 +110,7 @@ internal static class CommitSimulationRunner
         var scheduler = new CooperativeScheduler(effectiveSeed);
         IBackendFaultSchedule faults = faultFactory?.Invoke(effectiveSeed) ?? NoFaults.Instance;
         var backend = new InMemoryStorageBackend(scheduler.YieldAsync, faults) { DisableSingleWinner = disableSingleWinner };
+        var log = new DeltaLog(backend);
 
         // Seed v0 (protocol + metadata) out-of-band: the scheduler is not running, so the backend does not
         // interleave — this establishes the table before the concurrent phase.
@@ -92,16 +128,36 @@ internal static class CommitSimulationRunner
             }
         }
 
+        // Stage backing data objects for every file the background (trusted) setup committed, modelling
+        // "the data files were written before the log referenced them". Sim writers stage their own on a
+        // successful commit; together this lets the I8 phantom-active predicate assert every active file has
+        // a backing object (a torn write leaves one absent). Done out-of-band (scheduler idle) so it never
+        // perturbs the interleaving.
+        foreach (long version in background)
+        {
+            foreach (DeltaAction action in await log.ReadCommitActionsAsync(version, default).ConfigureAwait(false))
+            {
+                if (action is AddFileAction add)
+                {
+                    backend.StageDataFileDirect(add.Path);
+                }
+            }
+        }
+
         var recorder = new HistoryRecorder();
-        var log = new DeltaLog(backend);
         var manifestLines = new string[writers.Count];
+
+        // A read barrier makes contention deterministic (design §3.4.3): when enabled, no writer proceeds to
+        // its commit (put-if-absent) until EVERY writer has completed its read, so all reads observe the same
+        // base version regardless of seed — a guaranteed same-version race, not a seed-dependent one.
+        ReadBarrier? barrier = contended ? new ReadBarrier(writers.Count, scheduler.YieldAsync) : null;
 
         var bodies = new List<Func<Task>>(writers.Count);
         foreach (WriterSpec spec in writers)
         {
             WriterSpec writer = spec;
             manifestLines[writer.Id] = DescribeManifest(writer);
-            bodies.Add(() => RunWriterAsync(writer, scheduler, backend, log, recorder));
+            bodies.Add(() => RunWriterAsync(writer, scheduler, backend, log, recorder, barrier));
         }
 
         // Faults are inert during out-of-band seeding above; arm them only for the interleaved phase.
@@ -137,26 +193,61 @@ internal static class CommitSimulationRunner
         CooperativeScheduler scheduler,
         InMemoryStorageBackend backend,
         DeltaLog log,
-        HistoryRecorder recorder)
+        HistoryRecorder recorder,
+        ReadBarrier? barrier)
     {
+        // Scripted happens-before: wait for a prior writer's committed effect before reading (design §3.4.3).
+        if (spec.DependsOnWriterId is { } dep)
+        {
+            while (!scheduler.IsCompleted(dep))
+            {
+                await scheduler.YieldAsync("await-dep:w" + spec.Id.ToString(CultureInfo.InvariantCulture)).ConfigureAwait(false);
+            }
+        }
+
         long invoke = recorder.Tick();
         Snapshot snapshot = await log.LoadSnapshotAsync().ConfigureAwait(false);
         var observed = snapshot.ActiveFiles.Select(a => a.Path).ToArray();
         recorder.RecordRead(spec.Id, snapshot.Version, observed, invoke);
 
+        // Contention barrier: block here until every writer has read, so the ensuing put-if-absent race is a
+        // guaranteed same-version race independent of the seed.
+        if (barrier is not null)
+        {
+            await barrier.ArriveAndWaitAsync(spec.Id).ConfigureAwait(false);
+        }
+
         ImmutableArray<string> readFileSet = spec.WholeTableReadsAllActive
             ? observed.ToImmutableArray()
             : spec.ReadFileSet;
 
+        // Fault knob: leak ghost paths into the recorded read-set so it diverges from the pinned snapshot (I4).
+        if (!spec.ReadSetGhosts.IsEmpty)
+        {
+            readFileSet = readFileSet.AddRange(spec.ReadSetGhosts);
+        }
+
         ActionManifest manifest = BuildManifest(spec, readFileSet);
+
+        // Fault knob: model the writer's data files being written before the commit (unless SkipDataWrite,
+        // which leaves a torn write — a committed add referencing data that was never durably staged, I8).
+        if (!spec.SkipDataWrite)
+        {
+            foreach (ManifestFile add in manifest.Adds)
+            {
+                backend.StageDataFileDirect(add.Path);
+            }
+        }
 
         // A deterministic nonce per writer/attempt (single-threaded ⇒ the counter is reproducible), and a
         // transient backoff that yields to the scheduler instead of sleeping (interleaving point 5, no clock).
+        // A NonceOverride forces a fixed nonce so two writers can land the same nonce in two versions (I6).
         int nonceCounter = 0;
         var committer = new DeltaCommitter(
             backend,
             DeltaCommitter.DefaultMaxAttempts,
-            nonceFactory: () => "w" + spec.Id.ToString(CultureInfo.InvariantCulture) + "-" + (nonceCounter++).ToString(CultureInfo.InvariantCulture),
+            nonceFactory: () => spec.NonceOverride
+                ?? ("w" + spec.Id.ToString(CultureInfo.InvariantCulture) + "-" + (nonceCounter++).ToString(CultureInfo.InvariantCulture)),
             transientBackoff: (_, _) => scheduler.YieldAsync("backoff:w" + spec.Id.ToString(CultureInfo.InvariantCulture)))
         {
             // The one existing production seam: yield right before every put-if-absent so the scheduler can
@@ -176,17 +267,23 @@ internal static class CommitSimulationRunner
         }
         catch (DeltaConcurrentModificationException ex)
         {
-            recorder.RecordCommit(spec.Id, snapshot.Version, manifest, CommitOutcome.Conflict, committedVersion: null, attempts: 0, ex.GetType().Name, commitInvoke, "unchanged (aborted: " + ex.GetType().Name + ")");
+            // Capture the observed latest-at-abort M (no yield) so the checker bounds the winner scan to (R, M];
+            // -1 attempts honestly records "no successful attempt count" (design: honest history records).
+            recorder.RecordCommit(spec.Id, snapshot.Version, manifest, CommitOutcome.Conflict, committedVersion: null, attempts: -1, ClassifyConflict(spec, ex), commitInvoke, "unchanged (aborted: " + ex.GetType().Name + ")", backend.LatestCommittedVersion);
         }
         catch (DeltaCommitContentionException)
         {
-            recorder.RecordCommit(spec.Id, snapshot.Version, manifest, CommitOutcome.Contention, committedVersion: null, attempts: 0, conflictClass: null, commitInvoke, "unchanged (contention)");
+            recorder.RecordCommit(spec.Id, snapshot.Version, manifest, CommitOutcome.Contention, committedVersion: null, attempts: -1, conflictClass: null, commitInvoke, "unchanged (contention)", backend.LatestCommittedVersion);
         }
         catch (DeltaCommitUnknownStateException)
         {
-            recorder.RecordCommit(spec.Id, snapshot.Version, manifest, CommitOutcome.UnknownState, committedVersion: null, attempts: 0, conflictClass: null, commitInvoke, "unknown state");
+            recorder.RecordCommit(spec.Id, snapshot.Version, manifest, CommitOutcome.UnknownState, committedVersion: null, attempts: -1, conflictClass: null, commitInvoke, "unknown state", backend.LatestCommittedVersion);
         }
     }
+
+    // Fault knob: force a wrong reported conflict class so the checker's conflict-class re-derivation fires.
+    private static string ClassifyConflict(WriterSpec spec, DeltaConcurrentModificationException ex) =>
+        spec.ConflictClassOverride ?? ex.GetType().Name;
 
     private static ActionManifest BuildManifest(WriterSpec spec, ImmutableArray<string> readFileSet)
     {
@@ -232,7 +329,7 @@ internal static class CommitSimulationRunner
             hasProtocol,
             txn,
             digest,
-            SutReportedBlindAppend: spec.Scope is DeltaReadScope.BlindAppendScope);
+            SutReportedBlindAppend: spec.ReportedBlindOverride ?? (spec.Scope is DeltaReadScope.BlindAppendScope));
     }
 
     private static string DescribeManifest(WriterSpec spec)
@@ -246,5 +343,34 @@ internal static class CommitSimulationRunner
         };
         string txn = spec.Txn is { } t ? " txn=" + t : string.Empty;
         return string.Format(CultureInfo.InvariantCulture, "w{0}: scope={1} adds=[{2}]{3}", spec.Id, scope, string.Join(",", adds), txn);
+    }
+}
+
+/// <summary>
+/// A cooperative-scheduler-aware barrier that releases only once every participant has arrived. Because the
+/// scheduler advances exactly one logical writer at a time, a waiting writer spin-yields (parking on the
+/// scheduler's interleaving point) until the last arrival lifts the gate — so "all writers have read before
+/// any commits" holds deterministically, regardless of the seed. It performs no real blocking and no
+/// wall-clock waiting.
+/// </summary>
+internal sealed class ReadBarrier
+{
+    private readonly int _target;
+    private readonly Func<string, Task> _yield;
+    private int _arrived;
+
+    public ReadBarrier(int target, Func<string, Task> yield)
+    {
+        _target = target;
+        _yield = yield;
+    }
+
+    public async Task ArriveAndWaitAsync(int writerId)
+    {
+        _arrived++;
+        while (_arrived < _target)
+        {
+            await _yield("read-barrier:w" + writerId.ToString(CultureInfo.InvariantCulture)).ConfigureAwait(false);
+        }
     }
 }

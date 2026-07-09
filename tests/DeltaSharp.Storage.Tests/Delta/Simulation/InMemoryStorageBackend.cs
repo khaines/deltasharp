@@ -1,5 +1,6 @@
 using DeltaSharp.Storage;
 using DeltaSharp.Storage.Backends;
+using DeltaSharp.Storage.Delta;
 
 namespace DeltaSharp.Storage.Tests.Delta.Simulation;
 
@@ -171,6 +172,53 @@ internal sealed class InMemoryStorageBackend : IStorageBackend
         _yield is { } yield
             ? yield(op.ToString() + ":" + path)
             : Task.CompletedTask;
+
+    // ---- Test-only fault/inspection knobs (no scheduler yield; safe to call out-of-band) --------------
+
+    /// <summary>Deletes a stored object directly (no interleaving). Used to inject a <b>version-chain
+    /// gap</b> — dropping a committed <c>&lt;n&gt;.json</c> — so the checker's I1 contiguity predicate is
+    /// exercised (the phantom-active/gap fault knobs of design §3.4.1).</summary>
+    internal void DropObject(string path) => _store.Remove(path);
+
+    /// <summary>Stages a backing <b>data object</b> (a modeled Parquet file) at <paramref name="path"/>
+    /// directly, without a scheduler yield — modelling "the writer wrote its data files, then committed the
+    /// log entry that references them". The commit log lives under <c>_delta_log/</c>; a data object never
+    /// does, so this never perturbs log reconstruction. The checker's I8 phantom predicate asserts every
+    /// active file has a backing object here, so a <b>torn write</b> (a committed add whose data was never
+    /// staged) is caught.</summary>
+    internal void StageDataFileDirect(string path) => _store.TryAdd(path, DataObjectPlaceholder);
+
+    /// <summary>Whether a stored object exists at <paramref name="path"/> (a non-yielding inspection used by
+    /// the checker after the run completes).</summary>
+    internal bool HasObject(string path) => _store.ContainsKey(path);
+
+    /// <summary>The highest committed Delta version currently durable in the store (scans the
+    /// <c>_delta_log/</c> commit objects; no yield). Captured at a writer's abort as its observed
+    /// latest-at-abort <c>M</c> so the checker bounds the conflict-class winner scan to <c>(R, M]</c>.</summary>
+    internal long LatestCommittedVersion
+    {
+        get
+        {
+            long latest = -1;
+            foreach (string key in _store.Keys)
+            {
+                if (!key.StartsWith(DeltaLogFiles.LogPrefix, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                DeltaLogFile file = DeltaLogFiles.Classify(key.Substring(DeltaLogFiles.LogPrefix.Length));
+                if (file.Kind == DeltaLogFileKind.Commit && file.Version > latest)
+                {
+                    latest = file.Version;
+                }
+            }
+
+            return latest;
+        }
+    }
+
+    private static readonly byte[] DataObjectPlaceholder = { 0x50, 0x41, 0x52, 0x31 }; // "PAR1" (a modeled data file).
 
     private void Publish(string path, byte[] content) => _store[path] = content;
 
