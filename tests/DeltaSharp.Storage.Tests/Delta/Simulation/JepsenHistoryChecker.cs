@@ -38,7 +38,10 @@ namespace DeltaSharp.Storage.Tests.Delta.Simulation;
 /// file is lost (absent from the final snapshot without a later committed remove by ANY writer), and every
 /// active file has a backing data object (no torn/dangling reference).</item>
 /// <item><b>SI</b> (<see cref="CheckConflictClassificationAsync"/>): the §2.11.2 conflict class is re-derived
-/// from the winners a writer actually raced <c>(R, M]</c> and cross-checked against what it reported.</item>
+/// from the winners a writer actually raced <c>(R, M]</c> and cross-checked against what it reported. The
+/// computed-vs-reported blind-append cross-check is tagged <b>SI</b>; a mis-derived conflict <i>class</i>
+/// (e.g. a blind append aborting on a concurrent remove, or a remove-only race reported as an append) is
+/// tagged <b>CC</b> so it is never confused with an I8 lost-update/phantom.</item>
 /// </list></para>
 /// </summary>
 internal static class JepsenHistoryChecker
@@ -97,7 +100,7 @@ internal static class JepsenHistoryChecker
         var snapshots = new SnapshotCache(log);
 
         CheckSingleWinner(history, commits, backgroundVersions, latest, violations);
-        await CheckSnapshotIsolationAsync(history, snapshots, violations, cancellationToken).ConfigureAwait(false);
+        await CheckSnapshotIsolationAsync(history, snapshots, commits, latest, violations, cancellationToken).ConfigureAwait(false);
         await CheckReadYourWritesAsync(history, snapshots, commits, final, latest, violations, cancellationToken).ConfigureAwait(false);
         CheckIdempotentPublication(commits, latest, violations);
         CheckNoAnomalies(final, backend, violations);
@@ -185,8 +188,33 @@ internal static class JepsenHistoryChecker
 
     // ---- I4 / snapshot isolation: a read pinned at R reflects exactly the state at R, nothing from >R ----
     private static async Task CheckSnapshotIsolationAsync(
-        ImmutableArray<HistoryEvent> history, SnapshotCache snapshots, List<HistoryViolation> violations, CancellationToken cancellationToken)
+        ImmutableArray<HistoryEvent> history,
+        SnapshotCache snapshots,
+        IReadOnlyDictionary<long, CommittedVersion> commits,
+        long latest,
+        List<HistoryViolation> violations,
+        CancellationToken cancellationToken)
     {
+        // The first version each path was ever added, across ALL commits — the raw material for the
+        // partial-read "no leaked-from-the-future file" check. A file whose first add is at a version > R
+        // cannot legally appear in a read pinned at R.
+        var firstAddedAt = new Dictionary<string, long>(StringComparer.Ordinal);
+        for (long v = 0; v <= latest; v++)
+        {
+            if (!commits.TryGetValue(v, out CommittedVersion c))
+            {
+                continue;
+            }
+
+            foreach (string path in c.AddPaths)
+            {
+                if (!firstAddedAt.ContainsKey(path))
+                {
+                    firstAddedAt[path] = v;
+                }
+            }
+        }
+
         foreach (HistoryEvent e in history)
         {
             // Validate every event that performed a REAL read: a pure read (Outcome null) AND a committing
@@ -194,13 +222,18 @@ internal static class JepsenHistoryChecker
             // the read-set (never the SUT flag): a blind append reads nothing by design, so there is nothing
             // to validate — comparing its empty read-set to the snapshot would false-positive.
             ImmutableArray<string> observed;
+            bool wholeTableRead;
             if (e.Outcome is null)
             {
+                // A pure read observes the ENTIRE active file set at its pin, so it is a whole-table read and
+                // must equal the snapshot exactly.
                 observed = e.ObservedReadFiles;
+                wholeTableRead = true;
             }
             else if (e.Manifest is { } m && !m.IsBlindAppend)
             {
                 observed = m.ReadFileSet.OrderBy(p => p, StringComparer.Ordinal).ToImmutableArray();
+                wholeTableRead = m.ReadScope != ManifestReadScope.ReadFiles;
             }
             else
             {
@@ -209,13 +242,35 @@ internal static class JepsenHistoryChecker
 
             long r = e.SnapshotReadVersion;
             Snapshot pinned = await snapshots.GetAsync(r, cancellationToken).ConfigureAwait(false);
-            var expected = pinned.ActiveFiles.Select(a => a.Path).OrderBy(p => p, StringComparer.Ordinal).ToImmutableArray();
+            var activeAtR = pinned.ActiveFiles.Select(a => a.Path).ToImmutableHashSet(StringComparer.Ordinal);
+            var expected = activeAtR.OrderBy(p => p, StringComparer.Ordinal).ToImmutableArray();
+            string kind = e.Outcome is null ? "read" : "committing writer's read";
 
-            if (!expected.SequenceEqual(observed, StringComparer.Ordinal))
+            if (wholeTableRead)
             {
-                string kind = e.Outcome is null ? "read" : "committing writer's read";
-                violations.Add(new HistoryViolation(
-                    "I4", $"writer w{e.ProcessId} {kind} pinned@{r} observed [{string.Join(", ", observed)}] but the reconstructed snapshot at {r} is [{string.Join(", ", expected)}] — a read leaked/omitted actions across the pin (snapshot isolation violated)."));
+                // A whole-table read depends on every active file, so a reader that missed (or invented) any
+                // active file across the pin IS a snapshot-isolation violation — require exact equality.
+                if (!expected.SequenceEqual(observed, StringComparer.Ordinal))
+                {
+                    violations.Add(new HistoryViolation(
+                        "I4", $"writer w{e.ProcessId} whole-table {kind} pinned@{r} observed [{string.Join(", ", observed)}] but the reconstructed snapshot at {r} is [{string.Join(", ", expected)}] — a read leaked/omitted actions across the pin (snapshot isolation violated)."));
+                }
+            }
+            else
+            {
+                // A read-files (partial) read depends only on a NAMED subset, so a strict subset of the pinned
+                // snapshot is legal. It is a violation only if it observed a file that is NOT in the snapshot
+                // at R (a ghost) or that was first added at a version > R (a file leaked from the future).
+                var leaked = observed.Where(p => !activeAtR.Contains(p)).ToList();
+                var fromFuture = observed
+                    .Where(p => firstAddedAt.TryGetValue(p, out long added) && added > r)
+                    .ToList();
+                if (leaked.Count > 0 || fromFuture.Count > 0)
+                {
+                    var offenders = leaked.Concat(fromFuture).Distinct(StringComparer.Ordinal).OrderBy(p => p, StringComparer.Ordinal);
+                    violations.Add(new HistoryViolation(
+                        "I4", $"writer w{e.ProcessId} read-files {kind} pinned@{r} observed [{string.Join(", ", observed)}] which is not a subset of the reconstructed snapshot at {r} = [{string.Join(", ", expected)}]: [{string.Join(", ", offenders)}] is a ghost or leaked-from-the-future file (snapshot isolation violated)."));
+                }
             }
         }
     }
@@ -387,9 +442,19 @@ internal static class JepsenHistoryChecker
             long m = e.ObservedLatestVersion ?? latest;
             long upper = own >= 0 ? own - 1 : m;
 
-            bool concurrentAdd = false;
-            bool concurrentRemoveOrMeta = false;
+            // Re-derive each concurrent-change class SEPARATELY (never bundled): the real DeltaConflictChecker
+            // ranks winner protocol > winner metadata > loser protocol > loser metadata > same-appId txn >
+            // read-scope data conflict (add/remove). Bundling remove with metadata (as an earlier revision
+            // did) both let a blind append illegitimately abort on a concurrent remove AND masked a
+            // remove-only race misreported as the wrong class.
+            var readSet = manifest.ReadFileSet.ToImmutableHashSet(StringComparer.Ordinal);
+            bool winnerAdd = false;
+            bool winnerRemove = false;
+            bool winnerMeta = false;
+            bool winnerProtocol = false;
             bool concurrentSameTxn = false;
+            bool readPathRemoved = false;
+            bool readPathReadded = false;
             for (long v = e.SnapshotReadVersion + 1; v <= upper; v++)
             {
                 if (v == own || !commits.TryGetValue(v, out CommittedVersion c))
@@ -397,59 +462,88 @@ internal static class JepsenHistoryChecker
                     continue;
                 }
 
-                concurrentAdd |= c.AddPaths.Count > 0;
-                concurrentRemoveOrMeta |= c.RemovePaths.Count > 0 || c.HasMetadata || c.HasProtocol;
+                winnerAdd |= c.AddPaths.Count > 0;
+                winnerRemove |= c.RemovePaths.Count > 0;
+                winnerMeta |= c.HasMetadata;
+                winnerProtocol |= c.HasProtocol;
+                readPathRemoved |= c.RemovePaths.Overlaps(readSet);
+                readPathReadded |= c.AddPaths.Overlaps(readSet);
                 if (manifest.Txn is { } txn && c.AppIds.Contains(txn.AppId))
                 {
                     concurrentSameTxn = true;
                 }
             }
 
-            bool classIsTxn = e.ConflictClass?.Contains("ConcurrentTransaction", StringComparison.Ordinal) == true;
-            bool classIsAppend = e.ConflictClass?.Contains("ConcurrentAppend", StringComparison.Ordinal) == true;
-
-            if (computedBlind)
+            if (e.Outcome != CommitOutcome.Conflict)
             {
-                // A blind append reads nothing, so it can only legitimately conflict with a concurrent
-                // metadata/protocol change or a same-appId txn (ConcurrentTransaction) — never with a
-                // concurrent append (it must rebase past those).
-                if (e.Outcome == CommitOutcome.Conflict)
+                continue;
+            }
+
+            // The set of conflict-class tokens the real committer could legitimately have raised for this
+            // race, following the precedence above. An EMPTY set means no legitimate conflict exists — the
+            // writer should have rebased, so an abort here is spurious.
+            var acceptable = new List<string>();
+            if (winnerProtocol || manifest.HasProtocolChange)
+            {
+                acceptable.Add("ProtocolChanged");
+            }
+            else if (winnerMeta || manifest.HasMetadataChange)
+            {
+                acceptable.Add("MetadataChanged");
+            }
+            else if (concurrentSameTxn)
+            {
+                acceptable.Add("ConcurrentTransaction");
+            }
+            else if (!computedBlind)
+            {
+                // A non-blind data conflict: a whole-table read conflicts with any concurrent add (checked
+                // first by the real scope) else any concurrent remove; a read-files read conflicts only where
+                // a winner touched one of its READ paths (a concurrent add/remove of an unread file is not a
+                // conflict for it — it must rebase).
+                if (manifest.ReadScope == ManifestReadScope.WholeTable)
                 {
-                    if (concurrentSameTxn)
+                    if (winnerAdd)
                     {
-                        if (!classIsTxn)
-                        {
-                            violations.Add(new HistoryViolation(
-                                "I8", $"writer w{e.ProcessId} raced a concurrent txn on its appId but reported conflict class '{e.ConflictClass}' (expected ConcurrentTransactionException)."));
-                        }
+                        acceptable.Add("ConcurrentAppend");
                     }
-                    else if (!concurrentRemoveOrMeta)
+                    else if (winnerRemove)
                     {
-                        violations.Add(new HistoryViolation(
-                            "I2", $"writer w{e.ProcessId} is a blind append (empty read-set) yet was aborted with conflict '{e.ConflictClass}' — a blind append must rebase past concurrent appends, not conflict."));
+                        acceptable.Add("ConcurrentDeleteRead");
+                    }
+                }
+                else
+                {
+                    if (readPathRemoved)
+                    {
+                        acceptable.Add("ConcurrentDeleteRead");
+                    }
+
+                    if (readPathReadded)
+                    {
+                        acceptable.Add("ConcurrentAppend");
                     }
                 }
             }
-            else if (e.Outcome == CommitOutcome.Conflict)
+
+            if (acceptable.Count == 0)
             {
-                // A non-blind writer that conflicted must have raced a real concurrent change, and the class
-                // must match: a same-appId txn ⇒ ConcurrentTransaction; a concurrent add ⇒ ConcurrentAppend;
-                // a concurrent remove/meta ⇒ delete/read.
-                if (!concurrentAdd && !concurrentRemoveOrMeta && !concurrentSameTxn)
+                // No legitimate concurrent conflict: the writer must have rebased-and-retried, not aborted.
+                if (computedBlind)
                 {
                     violations.Add(new HistoryViolation(
-                        "I8", $"writer w{e.ProcessId} aborted with '{e.ConflictClass}' but no concurrent change is present in the log in (version {e.SnapshotReadVersion}, {m}] — a spurious conflict."));
+                        "CC", $"writer w{e.ProcessId} is a blind append (empty read-set) yet aborted with conflict '{e.ConflictClass}' — a blind append must rebase past a concurrent append/remove (only a metadata/protocol change or a same-appId txn may abort it)."));
                 }
-                else if (concurrentSameTxn && !classIsTxn)
+                else
                 {
                     violations.Add(new HistoryViolation(
-                        "I8", $"writer w{e.ProcessId} raced a concurrent txn on its appId but reported conflict class '{e.ConflictClass}' (expected ConcurrentTransactionException)."));
+                        "CC", $"writer w{e.ProcessId} aborted with '{e.ConflictClass}' but no legitimate concurrent conflict exists for its read scope ({manifest.ReadScope}) in (version {e.SnapshotReadVersion}, {m}] — a spurious conflict (it should have rebased)."));
                 }
-                else if (concurrentAdd && !classIsAppend && !concurrentSameTxn)
-                {
-                    violations.Add(new HistoryViolation(
-                        "I8", $"writer w{e.ProcessId} raced a concurrent append but reported conflict class '{e.ConflictClass}' (expected ConcurrentAppendException)."));
-                }
+            }
+            else if (!acceptable.Any(token => e.ConflictClass?.Contains(token, StringComparison.Ordinal) == true))
+            {
+                violations.Add(new HistoryViolation(
+                    "CC", $"writer w{e.ProcessId} aborted reporting conflict class '{e.ConflictClass}', but the race it lost in (version {e.SnapshotReadVersion}, {m}] re-derives to [{string.Join(" | ", acceptable)}] (expected exception name to contain one of those)."));
             }
         }
     }
@@ -526,7 +620,7 @@ internal static class JepsenHistoryChecker
 }
 
 /// <summary>A single violated invariant discovered by the checker: its catalogue <see cref="Invariant"/>
-/// id (I1/I2/I4/I5/I6/I8/SI) and a human-readable <see cref="Detail"/>.</summary>
+/// id (I1/I2/I4/I5/I6/I8/SI/CC) and a human-readable <see cref="Detail"/>.</summary>
 internal readonly record struct HistoryViolation(string Invariant, string Detail)
 {
     public override string ToString() =>

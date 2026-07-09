@@ -20,7 +20,8 @@ internal sealed record ActionManifest(
     bool HasProtocolChange,
     TxnKey? Txn,
     string ActionSetDigest,
-    bool? SutReportedBlindAppend = null)
+    bool? SutReportedBlindAppend = null,
+    ManifestReadScope ReadScope = ManifestReadScope.WholeTable)
 {
     /// <summary>Computed from the read-file-set (§3.3.5): a blind append read nothing, so it can only
     /// conflict with a concurrent metadata/protocol change — never with a concurrent append.</summary>
@@ -28,6 +29,29 @@ internal sealed record ActionManifest(
 
     /// <summary>The partition scope of the write (here always whole-table for the unpartitioned model).</summary>
     public string PartitionScope => "whole-table";
+}
+
+/// <summary>
+/// The <see cref="DeltaReadScope"/> <b>kind</b> a committing writer read under, threaded through the manifest
+/// so the Jepsen checker can apply the correct snapshot-isolation predicate (design §2.11.2). A
+/// <see cref="WholeTable"/> read depends on <i>every</i> active file, so its observed read-set must EQUAL the
+/// pinned snapshot; a <see cref="ReadFiles"/> read depends on a named subset, so its observed read-set must be
+/// a <i>subset</i> of the pinned snapshot (a strict subset is legal — flagging it would reject a legal
+/// targeted read). <see cref="BlindAppend"/> reads nothing and is not SI-checked. This is derived from the
+/// scope the runner passed to <c>DeltaCommitter.CommitAsync</c>, never self-reported by the writer.
+/// </summary>
+internal enum ManifestReadScope
+{
+    /// <summary>An empty read set (a plain append): not snapshot-isolation-checked.</summary>
+    BlindAppend,
+
+    /// <summary>A read over the entire active file set (overwrite / unpartitioned delete): the observed
+    /// read-set must EQUAL the pinned snapshot.</summary>
+    WholeTable,
+
+    /// <summary>A read over a named subset of files (targeted delete): the observed read-set must be a SUBSET
+    /// of the pinned snapshot (a strict subset is legal).</summary>
+    ReadFiles,
 }
 
 /// <summary>A single <c>add</c>/<c>remove</c> in a manifest: its <see cref="Path"/> digest and

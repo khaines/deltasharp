@@ -98,6 +98,23 @@ internal static class CommitSimulationRunner
     {
         ArgumentNullException.ThrowIfNull(writers);
 
+        // Livelock guard (design §3.4.3): the contention ReadBarrier holds EVERY writer at its post-read gate
+        // until all writers have read, while a DependsOnWriterId writer spin-yields before its read until its
+        // dependency has COMPLETED (committed). Combining the two deadlocks the interleaving — the barrier
+        // will not release until the dependent reads, but the dependent will not read until its dependency
+        // completes, which cannot happen because the dependency is itself parked at the barrier. Every writer
+        // stays runnable, so the stall detector never fires; reject the combination up front with a clear
+        // message rather than hang.
+        if (contended && writers.Any(w => w.DependsOnWriterId is not null))
+        {
+            throw new ArgumentException(
+                "A contended run (ReadBarrier) cannot be combined with a DependsOnWriterId writer: the barrier "
+                + "holds every writer until all have read, but a dependent writer will not read until its "
+                + "dependency completes — a livelock the stall detector cannot observe (all writers stay "
+                + "runnable). Use either the contention barrier or a scripted happens-before dependency, not both.",
+                nameof(writers));
+        }
+
         // Honor DELTASHARP_TEST_SEED for byte-for-byte replay (design §3.0): an explicitly set, valid seed
         // overrides the matrix seed so the reproduction line forces a specific failing interleaving; when
         // unset we keep the per-row matrix seed (not TestSeed.Default) so coverage stays broad.
@@ -329,7 +346,13 @@ internal static class CommitSimulationRunner
             hasProtocol,
             txn,
             digest,
-            SutReportedBlindAppend: spec.ReportedBlindOverride ?? (spec.Scope is DeltaReadScope.BlindAppendScope));
+            SutReportedBlindAppend: spec.ReportedBlindOverride ?? (spec.Scope is DeltaReadScope.BlindAppendScope),
+            ReadScope: spec.Scope switch
+            {
+                DeltaReadScope.BlindAppendScope => ManifestReadScope.BlindAppend,
+                DeltaReadScope.ReadFilesScope => ManifestReadScope.ReadFiles,
+                _ => ManifestReadScope.WholeTable,
+            });
     }
 
     private static string DescribeManifest(WriterSpec spec)

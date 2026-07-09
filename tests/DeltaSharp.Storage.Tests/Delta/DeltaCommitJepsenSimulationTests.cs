@@ -458,48 +458,218 @@ public sealed class DeltaCommitJepsenSimulationTests
     }
 
     // ---- Conflict-class (CheckConflictClassificationAsync): a writer that reports a WRONG conflict class ----
-    // for the winner it actually raced is flagged. Built on a real reconstructed log with a concurrent add.
-    [Fact]
-    public async Task WrongConflictClass_IsCaughtBy_JepsenChecker()
+    // for the winner it actually raced is flagged [CC]. Drives the REAL committer path via the
+    // ConflictClassOverride knob (no synthetic HistoryEvent): two whole-table overwrites race the same base,
+    // so exactly one loses the single-winner CAS and really raises ConcurrentAppend, but reports a bogus
+    // class. Seed-robust — regardless of the interleaving exactly one writer aborts and mis-reports.
+    [Theory]
+    [InlineData(0x0DE17A5D)]
+    [InlineData(0x1234ABCD)]
+    [InlineData(unchecked((int)0x7FFFFFFF))]
+    public async Task WrongConflictClass_IsCaughtBy_JepsenChecker(int seed)
     {
         var preCommits = new List<IReadOnlyList<string>> { new[] { DeltaTestHarness.Add("base.parquet") } };
-        var appender = BlindAppender(0, "app.parquet"); // commits an add at v2 → a concurrent append after v1.
+        WriterSpec Overwriter(int id, string path) => new()
+        {
+            Id = id,
+            Actions = ImmutableArray.Create<DeltaAction>(Remove("base.parquet"), Add(path)),
+            Scope = DeltaReadScope.WholeTable,
+            WholeTableReadsAllActive = true,
+            ConflictClassOverride = "BogusConflictException", // the aborted writer mis-reports its class.
+        };
 
         SimulationResult result = await CommitSimulationRunner.RunAsync(
-            0x0DE17A5D, nameof(WrongConflictClass_IsCaughtBy_JepsenChecker), new[] { appender }, preCommits: preCommits);
+            seed,
+            nameof(WrongConflictClass_IsCaughtBy_JepsenChecker),
+            new[] { Overwriter(0, "over0.parquet"), Overwriter(1, "over1.parquet") },
+            preCommits: preCommits,
+            contended: true);
 
-        // Inject a non-blind writer that read v1 (read-set {base}, consistent with the snapshot) and aborted,
-        // but reported the WRONG conflict class for the concurrent append it raced at v2.
-        var manifest = new ActionManifest(
-            ReadFileSet: ImmutableArray.Create("base.parquet"),
-            Adds: ImmutableArray<ManifestFile>.Empty,
-            Removes: ImmutableArray<ManifestFile>.Empty,
-            HasMetadataChange: false,
-            HasProtocolChange: false,
-            Txn: null,
-            ActionSetDigest: "synthetic-conflict",
-            SutReportedBlindAppend: false);
+        HistoryCheckResult check = await CheckAsync(result);
+        Dump(result, check);
 
-        var synthetic = new HistoryEvent
+        // Exactly one writer really aborted (single-winner) and it reported a bogus conflict class → [CC].
+        Assert.Contains(result.History, e => e.Outcome == CommitOutcome.Conflict);
+        Assert.False(check.IsLegal, "A wrong conflict class for the raced winner must be caught (CC).");
+        Assert.Contains("CC", check.ViolatedInvariants, StringComparison.Ordinal);
+    }
+
+    // ---- Conflict-class (CheckConflictClassificationAsync): a blind append aborted SOLELY by a concurrent ----
+    // remove is a spurious conflict — a blind append must rebase past a remove too (only metadata/protocol or
+    // a same-appId txn may abort it). Pins the remove-vs-meta/protocol un-bundling fix (FIX 2).
+    [Theory]
+    [InlineData(0x0DE17A5D)]
+    [InlineData(0x1234ABCD)]
+    [InlineData(unchecked((int)0x7FFFFFFF))]
+    public async Task BlindAppendAbortedByConcurrentRemove_IsCaughtBy_JepsenChecker(int seed)
+    {
+        var preCommits = new List<IReadOnlyList<string>> { new[] { DeltaTestHarness.Add("base.parquet") } };
+        var remover = new WriterSpec
         {
-            ProcessId = 9,
-            OpType = "commit target 2",
-            InvokeTime = 1_000,
-            OkTime = 1_001,
-            SnapshotReadVersion = 1,
-            Manifest = manifest,
-            Outcome = CommitOutcome.Conflict,
-            ConflictClass = "BogusConflictException",
-            ObservedLatestVersion = 2,
-            Attempts = -1,
+            Id = 0,
+            Actions = ImmutableArray.Create<DeltaAction>(Remove("base.parquet")),
+            Scope = DeltaReadScope.ReadFiles(new[] { "base.parquet" }),
+            ReadFileSet = ImmutableArray.Create("base.parquet"),
         };
+
+        SimulationResult result = await CommitSimulationRunner.RunAsync(
+            seed, nameof(BlindAppendAbortedByConcurrentRemove_IsCaughtBy_JepsenChecker), new[] { remover }, preCommits: preCommits);
+
+        // The remover committed the remove at v2. Inject a blind append that read v1 (EMPTY read-set) and
+        // aborted claiming a conflict, though its only concurrent winner is that remove — it must rebase.
+        var synthetic = SyntheticConflict(
+            processId: 9,
+            readVersion: 1,
+            observedLatest: 2,
+            readFileSet: ImmutableArray<string>.Empty,
+            scope: ManifestReadScope.BlindAppend,
+            reportedClass: "ConcurrentDeleteReadException");
 
         HistoryCheckResult check = await JepsenHistoryChecker.CheckAsync(
             result.History.Add(synthetic), result.Backend, result.BackgroundVersions);
         Dump(result, check);
 
-        Assert.False(check.IsLegal, "A wrong conflict class for the raced winner must be caught.");
-        Assert.Contains("I8", check.ViolatedInvariants, StringComparison.Ordinal);
+        Assert.False(check.IsLegal, "A blind append aborted solely by a concurrent remove must be caught (CC).");
+        Assert.Contains("CC", check.ViolatedInvariants, StringComparison.Ordinal);
+    }
+
+    // ---- Conflict-class (CheckConflictClassificationAsync): a remove-only race MIS-reported as a concurrent ----
+    // append is flagged [CC] — strengthens the positive class checks beyond ConcurrentAppend/Transaction (FIX 3).
+    [Theory]
+    [InlineData(0x0DE17A5D)]
+    [InlineData(0x1234ABCD)]
+    [InlineData(unchecked((int)0x7FFFFFFF))]
+    public async Task RemoveOnlyRace_MisreportedAsAppend_IsCaughtBy_JepsenChecker(int seed)
+    {
+        var preCommits = new List<IReadOnlyList<string>>
+        {
+            new[] { DeltaTestHarness.Add("base.parquet") },
+            new[] { DeltaTestHarness.Remove("base.parquet") }, // v2 is a remove-only winner.
+        };
+
+        SimulationResult result = await CommitSimulationRunner.RunAsync(
+            seed, nameof(RemoveOnlyRace_MisreportedAsAppend_IsCaughtBy_JepsenChecker), Array.Empty<WriterSpec>(), preCommits: preCommits);
+
+        var synthetic = SyntheticConflict(
+            processId: 9,
+            readVersion: 1,
+            observedLatest: 2,
+            readFileSet: ImmutableArray.Create("base.parquet"),
+            scope: ManifestReadScope.WholeTable,
+            reportedClass: "ConcurrentAppendException"); // wrong: expected ConcurrentDeleteRead.
+
+        HistoryCheckResult check = await JepsenHistoryChecker.CheckAsync(
+            result.History.Add(synthetic), result.Backend, result.BackgroundVersions);
+        Dump(result, check);
+
+        Assert.False(check.IsLegal, "A remove-only race reported as ConcurrentAppend must be caught (CC).");
+        Assert.Contains("CC", check.ViolatedInvariants, StringComparison.Ordinal);
+    }
+
+    // ---- Conflict-class (CheckConflictClassificationAsync): a metadata race MIS-reported as a concurrent ----
+    // append is flagged [CC] — metadata/protocol classes are now positively validated (FIX 3).
+    [Theory]
+    [InlineData(0x0DE17A5D)]
+    [InlineData(0x1234ABCD)]
+    [InlineData(unchecked((int)0x7FFFFFFF))]
+    public async Task MetadataRace_MisreportedAsAppend_IsCaughtBy_JepsenChecker(int seed)
+    {
+        var preCommits = new List<IReadOnlyList<string>>
+        {
+            new[] { DeltaTestHarness.Add("base.parquet") },
+            new[] { DeltaTestHarness.Metadata() }, // v2 is a metadata-change winner.
+        };
+
+        SimulationResult result = await CommitSimulationRunner.RunAsync(
+            seed, nameof(MetadataRace_MisreportedAsAppend_IsCaughtBy_JepsenChecker), Array.Empty<WriterSpec>(), preCommits: preCommits);
+
+        var synthetic = SyntheticConflict(
+            processId: 9,
+            readVersion: 1,
+            observedLatest: 2,
+            readFileSet: ImmutableArray.Create("base.parquet"),
+            scope: ManifestReadScope.WholeTable,
+            reportedClass: "ConcurrentAppendException"); // wrong: expected MetadataChanged.
+
+        HistoryCheckResult check = await JepsenHistoryChecker.CheckAsync(
+            result.History.Add(synthetic), result.Backend, result.BackgroundVersions);
+        Dump(result, check);
+
+        Assert.False(check.IsLegal, "A metadata race reported as ConcurrentAppend must be caught (CC).");
+        Assert.Contains("CC", check.ViolatedInvariants, StringComparison.Ordinal);
+    }
+
+    // ---- Conflict-class precedence SOUNDNESS (FIX 3): a winner that BOTH changes metadata AND shares the ----
+    // loser's appId is MetadataChanged in reality (metadata/protocol outranks txn). A loser that correctly
+    // reports MetadataChanged must NOT be flagged — the checker must not demand ConcurrentTransaction.
+    [Theory]
+    [InlineData(0x0DE17A5D)]
+    [InlineData(0x1234ABCD)]
+    [InlineData(unchecked((int)0x7FFFFFFF))]
+    public async Task MetadataAndSameTxnWinner_ReportedMetadata_IsNotFalseFlagged(int seed)
+    {
+        var preCommits = new List<IReadOnlyList<string>>
+        {
+            new[] { DeltaTestHarness.Add("base.parquet") },
+            new[] { DeltaTestHarness.Metadata(), DeltaTestHarness.Txn("stream", 7) }, // metadata AND same appId.
+        };
+
+        SimulationResult result = await CommitSimulationRunner.RunAsync(
+            seed, nameof(MetadataAndSameTxnWinner_ReportedMetadata_IsNotFalseFlagged), Array.Empty<WriterSpec>(), preCommits: preCommits);
+
+        var synthetic = SyntheticConflict(
+            processId: 9,
+            readVersion: 1,
+            observedLatest: 2,
+            readFileSet: ImmutableArray.Create("base.parquet"),
+            scope: ManifestReadScope.WholeTable,
+            reportedClass: "MetadataChangedException", // correct by precedence (metadata outranks txn).
+            txn: new TxnKey("stream", 7));
+
+        HistoryCheckResult check = await JepsenHistoryChecker.CheckAsync(
+            result.History.Add(synthetic), result.Backend, result.BackgroundVersions);
+        _output.WriteLine(result.Bundle.ReproductionLine);
+        if (!check.IsLegal)
+        {
+            _output.WriteLine(check.Describe());
+        }
+
+        Assert.True(check.IsLegal, "A metadata+txn winner correctly reported as MetadataChanged must NOT be flagged:" + Environment.NewLine + check.Describe());
+    }
+
+    private static HistoryEvent SyntheticConflict(
+        int processId,
+        long readVersion,
+        long observedLatest,
+        ImmutableArray<string> readFileSet,
+        ManifestReadScope scope,
+        string reportedClass,
+        TxnKey? txn = null)
+    {
+        var manifest = new ActionManifest(
+            ReadFileSet: readFileSet,
+            Adds: ImmutableArray<ManifestFile>.Empty,
+            Removes: ImmutableArray<ManifestFile>.Empty,
+            HasMetadataChange: false,
+            HasProtocolChange: false,
+            Txn: txn,
+            ActionSetDigest: "synthetic-conflict",
+            SutReportedBlindAppend: readFileSet.IsEmpty,
+            ReadScope: scope);
+
+        return new HistoryEvent
+        {
+            ProcessId = processId,
+            OpType = "commit target " + (readVersion + 1),
+            InvokeTime = 1_000,
+            OkTime = 1_001,
+            SnapshotReadVersion = readVersion,
+            Manifest = manifest,
+            Outcome = CommitOutcome.Conflict,
+            ConflictClass = reportedClass,
+            ObservedLatestVersion = observedLatest,
+            Attempts = -1,
+        };
     }
 
     // ===================================================================================================
@@ -571,5 +741,98 @@ public sealed class DeltaCommitJepsenSimulationTests
         }
 
         Assert.True(check.IsLegal, "Whole-table overwrite of an empty table must be legal (no spurious SI):" + Environment.NewLine + check.Describe());
+    }
+
+    // A read-files writer that reads a STRICT SUBSET of the active set is LEGAL — the SI check must NOT
+    // require whole-table equality for a partial (targeted) read (the I4 partial-read false-positive fix).
+    [Theory]
+    [InlineData(0x0DE17A5D)]
+    [InlineData(0x1234ABCD)]
+    [InlineData(unchecked((int)0x7FFFFFFF))]
+    public async Task ReadFilesStrictSubset_IsNotFalseFlaggedAsSnapshotIsolation(int seed)
+    {
+        var preCommits = new List<IReadOnlyList<string>>
+        {
+            new[] { DeltaTestHarness.Add("a.parquet"), DeltaTestHarness.Add("b.parquet") },
+        };
+        var writer = new WriterSpec
+        {
+            Id = 0,
+            Actions = ImmutableArray.Create<DeltaAction>(Remove("a.parquet")),
+            Scope = DeltaReadScope.ReadFiles(new[] { "a.parquet" }),
+            ReadFileSet = ImmutableArray.Create("a.parquet"), // a STRICT subset of the active set {a, b}.
+        };
+
+        SimulationResult result = await CommitSimulationRunner.RunAsync(
+            seed, nameof(ReadFilesStrictSubset_IsNotFalseFlaggedAsSnapshotIsolation), new[] { writer }, preCommits: preCommits);
+
+        HistoryCheckResult check = await CheckAsync(result);
+        _output.WriteLine(result.Bundle.ReproductionLine);
+        if (!check.IsLegal)
+        {
+            _output.WriteLine(check.Describe());
+        }
+
+        Assert.True(check.IsLegal, "A read-files writer reading a strict subset of active files must be legal (no false I4):" + Environment.NewLine + check.Describe());
+
+        Snapshot final = await new DeltaLog(result.Backend).LoadSnapshotAsync();
+        Assert.DoesNotContain("a.parquet", final.ActiveFiles.Select(a => a.Path));
+        Assert.Contains("b.parquet", final.ActiveFiles.Select(a => a.Path));
+    }
+
+    // A WHOLE-TABLE read that OMITTED an active file across its pin IS a snapshot-isolation violation — the
+    // equality branch must keep its teeth for whole-table reads (pins the I4 equality path post-fix).
+    [Theory]
+    [InlineData(0x0DE17A5D)]
+    [InlineData(0x1234ABCD)]
+    [InlineData(unchecked((int)0x7FFFFFFF))]
+    public async Task WholeTableReadOmittingActiveFile_IsCaughtBy_JepsenChecker(int seed)
+    {
+        var preCommits = new List<IReadOnlyList<string>>
+        {
+            new[] { DeltaTestHarness.Add("a.parquet"), DeltaTestHarness.Add("b.parquet") },
+        };
+        var writer = new WriterSpec
+        {
+            Id = 0,
+            Actions = ImmutableArray.Create<DeltaAction>(Add("over.parquet")),
+            Scope = DeltaReadScope.WholeTable,
+            ReadFileSet = ImmutableArray.Create("a.parquet"), // omits active b.parquet from a whole-table read.
+            // WholeTableReadsAllActive left false so the recorded read-set is the (deficient) subset.
+        };
+
+        SimulationResult result = await CommitSimulationRunner.RunAsync(
+            seed, nameof(WholeTableReadOmittingActiveFile_IsCaughtBy_JepsenChecker), new[] { writer }, preCommits: preCommits);
+
+        HistoryCheckResult check = await CheckAsync(result);
+        Dump(result, check);
+
+        Assert.False(check.IsLegal, "A whole-table read that omitted an active file must be caught (I4).");
+        Assert.Contains("I4", check.ViolatedInvariants, StringComparison.Ordinal);
+    }
+
+    // Livelock guard (FIX 5): a contended (ReadBarrier) run combined with a DependsOnWriterId writer would
+    // deadlock the interleaving invisibly to the stall detector (every writer stays runnable) — the runner
+    // must reject the combination up front with a clear message rather than hang.
+    [Fact]
+    public async Task ContendedRun_WithDependency_IsRejected()
+    {
+        var specs = new List<WriterSpec>
+        {
+            BlindAppender(0, "w0.parquet"),
+            new()
+            {
+                Id = 1,
+                Actions = ImmutableArray.Create<DeltaAction>(Add("w1.parquet")),
+                Scope = DeltaReadScope.BlindAppend,
+                DependsOnWriterId = 0,
+            },
+        };
+
+        ArgumentException ex = await Assert.ThrowsAsync<ArgumentException>(
+            () => CommitSimulationRunner.RunAsync(
+                0x0DE17A5D, nameof(ContendedRun_WithDependency_IsRejected), specs, contended: true));
+
+        Assert.Contains("livelock", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 }
