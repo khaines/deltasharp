@@ -37,6 +37,16 @@
          sca-policy `expectedProjects` already covers DeltaSharp.Storage, so they are scanned by the
          supply-chain gate. -->
     <PackageVersion Include="Parquet.Net" Version="6.0.3" />
+    <!-- STORY-05.3 observability (#479): Microsoft.Extensions.Logging.Abstractions supplies
+         ILogger<T>, the [LoggerMessage] source generator (allocation-free structured logging,
+         checklist 09a), EventId, and LogLevel for DeltaSharp.Storage's commit-path telemetry.
+         It is abstractions-only (no concrete provider, no collector) so instrumentation is a
+         safe no-op until a host configures a logging provider — matching the exporter-agnostic
+         model in docs/engineering/design/storage-delta-architecture.md §7. Pinned to the .NET 10
+         GA baseline (10.0.0) so locked-mode restore stays reproducible across SDK patches
+         (same rationale as the ILLink pin in Directory.Build.props). Meter/ActivitySource live
+         in the shared framework (System.Diagnostics.DiagnosticSource) and need no package. -->
+    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
   </ItemGroup>
 
   <ItemGroup>

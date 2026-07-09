@@ -100,8 +100,15 @@ correlation key on a metric is a cardinality bomb:
 | --- | --- | --- | --- |
 | `ComponentKey` | `deltasharp.component` | Emitting subsystem (`engine`, `executor`, `catalog`) | bounded set |
 | `OperationKey` | `deltasharp.operation` | Logical operation (`collect`, `plan`, `commit`) | bounded set |
-| `OutcomeKey` | `deltasharp.outcome` | Terminal outcome (`success`, `cancelled`, `timeout`, `conflict`, `failure`) | bounded set (5) |
+| `OutcomeKey` | `deltasharp.outcome` | Terminal outcome (`success`, `cancelled`, `timeout`, `conflict`, `failure`) | bounded set |
 | `StageKey` | `deltasharp.stage` | Pipeline stage (`QueryExecutionStage`, lowercased) | bounded enum |
+| `BackendKey` | `deltasharp.backend` | Storage/adapter identity (`s3`, `adls`, `gcs`, `pvc`) | bounded set |
+| `ConflictClassKey` | `deltasharp.conflict.class` | Sub-classifies `outcome=conflict` (`concurrent_append`, `metadata_changed`, `concurrent_write`, …) | bounded set |
+
+The `deltasharp.outcome` value set is **per-operation** (a closed set for each operation, never free text). The
+Delta **commit** path (`deltasharp.operation=commit`) uses the closed superset `success`, `skipped`,
+`conflict`, `contention`, `unknown_state`, `partial_transaction`, `cancelled`, `failure` — so a cancellation
+never inflates the failure SLI, and a fail-closed/unresolved outcome is never collapsed into `success`.
 
 **Correlation / exemplar-only keys** — valid on **logs, span attributes, and metric exemplars**, but
 **never** a metric label, because each is unbounded over a run's or table's lifetime and would multiply a
@@ -146,11 +153,12 @@ The `where applicable` qualifier from STORY-00.4.1 is deliberate: `task.id`, `ex
 distributed executor and the Delta layer), and are omitted rather than faked in M1's single-node, tableless
 paths.
 
-**Cardinality rule.** Every **metric-label** key names a **bounded** set — today the four metric-label-safe
-keys above. Future storage, error-classification, and propagation instruments will add their own bounded
-labels (a storage `backend`, a storage-I/O `direction` — `read`/`write` —, a sanitized error class, and a
-wire `protocol`); these are **documented here but not yet minted** in `DeltaSharpTelemetry` (exactly like the
-Resource keys above), and will be added as `deltasharp.`-prefixed keys — or adopted OpenTelemetry
+**Cardinality rule.** Every **metric-label** key names a **bounded** set — today the six metric-label-safe
+keys above (`component`, `operation`, `outcome`, `stage`, `backend`, `conflict.class`; the last two minted
+by the Delta commit path, #479). The remaining storage, error-classification, and propagation instruments
+will add their own bounded labels (a storage-I/O `direction` — `read`/`write` —, a sanitized error class,
+and a wire `protocol`); these are **documented here but not yet minted** in `DeltaSharpTelemetry` (exactly
+like the Resource keys above), and will be added as `deltasharp.`-prefixed keys — or adopted OpenTelemetry
 semantic-convention keys such as `error.type` — in the same PR as the instrument that first emits them. Values that are unbounded or credential-bearing
 — raw storage paths, SQL text, plan text, row/cell values, user or tenant identity, pod UIDs, object keys,
 shuffle block IDs — are **never** a metric label or attribute **value**, and secrets/PII/SQL literals/row
@@ -367,7 +375,7 @@ boundary.
 | Throughput | Counter | `deltasharp.action.rows`, `deltasharp.action.batches` (`deltasharp.outcome` tag) | `{row}`, `{batch}` | `ExecutionMetrics.OutputRows`/`OutputBatches` | query-execution-engine-engineer |
 | Scan volume / memory | Counter / Histogram | `deltasharp.scan.bytes`, `deltasharp.exec.memory.peak` | `By` | `ExecutionMetrics.BytesScanned`/`PeakMemoryBytes`/`SpilledBytes` | dotnet-runtime-performance-engineer |
 | Storage I/O | Counter / Histogram | `deltasharp.storage.io.bytes` (`direction`, `backend` tags), `deltasharp.storage.io.duration` | `By`, `s` | future storage layer | delta-storage-format-engineer |
-| Delta commit | Counter / Histogram | `deltasharp.delta.commit.count` (`deltasharp.outcome` tag), `deltasharp.delta.commit.duration` | `{commit}`, `s` | future Delta log | delta-storage-format-engineer |
+| Delta commit | Counter / Histogram | `deltasharp.delta.commit.count` (`deltasharp.outcome` tag), `deltasharp.delta.commit.duration`, `deltasharp.delta.commit.attempts` (`deltasharp.outcome` tag), `deltasharp.delta.commit.conflicts` (`deltasharp.conflict.class` tag), `deltasharp.delta.commit.transient_retries` | `{commit}`, `s`, `{attempt}`, `{conflict}`, `{retry}` | Delta log (#479) | delta-storage-format-engineer |
 | Shuffle | Counter / Histogram | `deltasharp.shuffle.bytes`, `deltasharp.shuffle.fetch.duration`, `deltasharp.shuffle.reresolve.count` | `By`, `s`, `{operation}` | future shuffle ([ADR-0004](../../adr/0004-shuffle-architecture.md)) | dotnet-distributed-execution-engineer |
 | Saturation / USE | UpDownCounter / ObservableGauge | `deltasharp.executor.active`, `deltasharp.exec.queue.depth`, `deltasharp.rpc.inflight`, `deltasharp.exec.memory.reserved` | `{executor}`, `{task}`, `{operation}`, `By` | future driver/executor + shuffle | cloud-native-site-reliability-engineer |
 | Runtime / GC | EventCounters | allocation rate, GC pause, thread-pool queue (`dotnet-counters`) | varies | .NET runtime | dotnet-runtime-performance-engineer |
@@ -392,9 +400,10 @@ executor, and operator unless the instrument name identifies the viewpoint.
 
 ### Labels and cardinality limits
 
-Labels use the **metric-label-safe** set only — today the four bounded `DeltaSharpTelemetry` keys
-(`deltasharp.component`, `deltasharp.operation`, `deltasharp.outcome`, `deltasharp.stage`). Future storage,
-error-classification, and propagation instruments add their own bounded labels (a storage `backend`, a
+Labels use the **metric-label-safe** set only — today the six bounded `DeltaSharpTelemetry` keys
+(`deltasharp.component`, `deltasharp.operation`, `deltasharp.outcome`, `deltasharp.stage`, plus
+`deltasharp.backend` and `deltasharp.conflict.class`, minted by the Delta commit path in #479). The
+remaining storage, error-classification, and propagation instruments add their own bounded labels (a
 storage-I/O `direction` — `read`/`write` —, a sanitized error class, and a wire `protocol`), **documented
 here but not yet minted** in `DeltaSharpTelemetry` and added as `deltasharp.`-prefixed (or adopted OpenTelemetry
 semantic-convention) keys when those instruments land. The **correlation/exemplar-only** keys (`deltasharp.job.id`,

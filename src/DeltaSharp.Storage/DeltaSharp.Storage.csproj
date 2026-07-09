@@ -33,6 +33,9 @@
 
   <ItemGroup>
     <PackageReference Include="Parquet.Net" />
+    <!-- #479: ILogger<T> + [LoggerMessage] source-gen for commit-path structured logs (design §7.2).
+         Abstractions-only — a safe no-op until a host installs a logging provider. -->
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
   </ItemGroup>
 
   <ItemGroup>

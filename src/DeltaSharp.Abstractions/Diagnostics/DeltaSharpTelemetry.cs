@@ -65,6 +65,18 @@ internal static class DeltaSharpTelemetry
     /// never collapsed into one ambiguous count (checklist <c>09b</c>).</summary>
     internal const string OutcomeKey = "deltasharp.outcome";
 
+    /// <summary>Bounded storage/adapter identity a signal concerns (for example <c>s3</c>, <c>adls</c>,
+    /// <c>gcs</c>, <c>pvc</c>) — the closed set the storage layer mints. A <b>metric-label-safe</b> key:
+    /// valid as a metric tag, an <c>Activity</c> tag, and an <c>ILogger</c> scope key. Never a raw,
+    /// credential-bearing endpoint or bucket name.</summary>
+    internal const string BackendKey = "deltasharp.backend";
+
+    /// <summary>Bounded conflict sub-classification of an <c>outcome=conflict</c> (for example
+    /// <c>concurrent_append</c>, <c>metadata_changed</c>, <c>concurrent_write</c>) — the closed set the
+    /// Delta commit path mints. A <b>metric-label-safe</b> key drawn from a fixed vocabulary, never free
+    /// text or a raw exception message.</summary>
+    internal const string ConflictClassKey = "deltasharp.conflict.class";
+
     /// <summary>Correlates every signal for one logical job/application. An opaque identifier — never a
     /// user, tenant, or path value. A <b>correlation/exemplar-only</b> field: valid on structured logs, span
     /// attributes, and metric exemplars, but <b>never</b> a metric label — job ids are unbounded across runs

@@ -1191,7 +1191,7 @@ Per the SRE operating rule, SLIs precede dashboards and alerts. These are the us
 
 | SLI | Definition (from instruments in §7.3) | Lands with | SLO target |
 | --- | --- | --- | --- |
-| Commit success | `commit.count{outcome=success}` ÷ all terminal commit attempts (excluding retryable `conflict`, which is expected) | FEAT-05.3 | `<!-- TBD: needs baseline -->` |
+| Commit success | `commit.count{outcome=success}` ÷ all terminal commit attempts (excluding retryable `conflict`/`contention` and caller-driven `cancelled`, which are expected/non-failures) | FEAT-05.3 | `<!-- TBD: needs baseline -->` |
 | Commit latency | `delta.commit.duration{outcome=success}` p95/p99 | FEAT-05.3 | `<!-- TBD -->` |
 | Snapshot open latency | `delta.snapshot.load.duration{outcome=success}` p95 | FEAT-05.2 | `<!-- TBD -->` |
 | Read file-plan availability | file-plan requests that return a snapshot without a storage/protocol failure | FEAT-05.2 | `<!-- TBD -->` |
@@ -1237,7 +1237,7 @@ Storage and the Delta log own reserved `EventId` range **4000–4999** (conventi
 
 | Level | Example events (4000–4999) |
 | --- | --- |
-| `Information` (lifecycle) | `DeltaCommitCompleted`, `SnapshotReconstructed`, `CheckpointWritten`, `VacuumCompleted`, `TableProtocolNegotiated` |
+| `Information` (lifecycle) | `DeltaCommitCompleted`, `DeltaCommitCanceled` (caller-driven, not a failure), `SnapshotReconstructed`, `CheckpointWritten`, `VacuumCompleted`, `TableProtocolNegotiated` |
 | `Warning` (degraded-but-recoverable) | `DeltaCommitConflict` (+`attempt`), `StorageAdapterThrottled`, `CheckpointLagging`, `SmallFileThresholdExceeded` |
 | `Error` (needs remediation) | `DeltaCommitFailed`, `CorruptCheckpointRejected`, `UnsupportedProtocolFeature` (fail-closed), `StorageAdapterUnrecoverable` |
 | `Critical` (integrity/durability) | `VacuumSafetyViolationBlocked`, `CommitAtomicityPrimitiveUnavailable` (backend named) |
@@ -1265,7 +1265,8 @@ Two `Meter`s, named per convention and versioned to the owning assembly: **`Delt
 | `deltasharp.delta.commit.duration` | Histogram | `s` | `outcome` | commit latency → 05.3 |
 | `deltasharp.delta.commit.count` | Counter | `{commit}` | `outcome` | commit throughput/success → 05.3 |
 | `deltasharp.delta.commit.attempts` | Histogram | `{attempt}` | `outcome` | OCC retry depth per commit → 05.3 |
-| `deltasharp.delta.commit.conflicts` | Counter | `{commit}` | `conflict.class` | retries/conflicts by conflict class → 05.3 |
+| `deltasharp.delta.commit.conflicts` | Counter | `{conflict}` | `conflict.class` | retries/conflicts by conflict class → 05.3 |
+| `deltasharp.delta.commit.transient_retries` | Counter | `{retry}` | — | transient storage-failure retries within a commit (degradation signal) → 05.3 |
 | `deltasharp.delta.snapshot.load.duration` | Histogram | `s` | `outcome` | snapshot reconstruction time → 05.2 |
 | `deltasharp.delta.snapshot.replay.depth` | Histogram | `{commit}` | — | JSON-replay depth past checkpoint → 05.2 |
 | `deltasharp.delta.snapshot.active_files` | Histogram | `{file}` | — | active-file count **as a distribution** → 05.2 |
@@ -1323,7 +1324,7 @@ Alert rules (checklist 09b — each page-worthy alert maps to symptom, owner, se
 
 | Alert | Symptom / user impact | Signal | Trigger (window) | Severity | Escalate to | Runbook |
 | --- | --- | --- | --- | --- | --- | --- |
-| Commit-conflict storm | Writers livelock; write throughput collapses | **retry exhaustion** (`commit.count{outcome=failure}` after max attempts) + write-throughput burn; `commit.attempts` p95 as a diagnostic panel | retry-exhaustion rate over baseline **or** the **Commit-success / Commit-latency SLO burning** (§7.1) (`<!-- TBD -->`) | **SEV-2** (page) | `delta-storage-format-engineer` | `docs/runbooks/delta-commit-conflict-storm.md` `<!-- TBD -->` |
+| Commit-conflict storm | Writers livelock; write throughput collapses | **retry exhaustion** (`commit.count{outcome=contention}` after max attempts) + write-throughput burn; `commit.attempts` p95 as a diagnostic panel | retry-exhaustion rate over baseline **or** the **Commit-success / Commit-latency SLO burning** (§7.1) (`<!-- TBD -->`) | **SEV-2** (page) | `delta-storage-format-engineer` | `docs/runbooks/delta-commit-conflict-storm.md` `<!-- TBD -->` |
 | Commit latency SLO breach | Slow writes; freshness lag | `commit.duration{outcome=success}` burn-rate | multi-window burn (2%/1h **and** 5%/6h) `<!-- TBD -->` | **SEV-2** (page) | `delta-storage-format-engineer` | `<!-- TBD -->` |
 | Checkpoint lag / replay-depth runaway | Snapshot opens slow down; memory pressure on load | `checkpoint.age` and `snapshot.replay.depth` p95 | age or replay-depth over threshold, sustained (`<!-- TBD -->`) | **SEV-3** → SEV-2 if snapshot-load SLO also burning | `delta-storage-format-engineer` | `<!-- TBD -->` |
 | Small-file explosion | Scan amplification; object-store request/cost blowup | `snapshot.small_files` distribution rising; `storage.io.errors{error.type=throttle}` co-moving | small-file share over threshold, trend (`<!-- TBD -->`) | **SEV-3** (ticket) | `delta-storage-format-engineer`; cost to `compute-storage-finops-engineer` | `<!-- TBD -->` |
@@ -1332,6 +1333,8 @@ Alert rules (checklist 09b — each page-worthy alert maps to symptom, owner, se
 | Snapshot-replay-depth runaway (no checkpoints) | Table becomes un-openable within memory limits | `snapshot.replay.depth` p99 with `checkpoint.age` climbing (checkpointer stuck) | replay-depth over hard bound (`<!-- TBD -->`) | **SEV-2** (page) | `delta-storage-format-engineer` | `<!-- TBD -->` |
 
 Alerts fire on symptoms (user impact) first; the `commit.conflicts`, `files.skipped`, and `checkpoint.age` counters are diagnostic panels that page only when they predict a burning SLI (checklist 09b — "Alerts avoid paging on purely diagnostic or ticket-only counters unless they predict user impact"). Data-integrity alerts (VACUUM) page on a single occurrence because their blast radius is irreversible.
+
+> **`outcome=contention` vs `outcome=failure` (#479).** The commit-conflict-storm (livelock) alert keys on `commit.count{outcome=contention}` — retry-exhaustion under sustained concurrency, where the commit **provably did not land** and is safely retryable (§2.11.3). `outcome=failure` is reserved for the **hard-failure** terminal: a persistent/unclassified storage error, an unsupported writer protocol, or another non-transient exception that escaped the in-core terminals (a cancellation is a distinct, non-failure `outcome=cancelled`). Keeping the two separate stops a livelock from being read as a hard failure — and vice versa — on the dashboards.
 
 ---
 

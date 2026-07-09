@@ -1,7 +1,12 @@
 using System.Collections.Immutable;
+using System.Diagnostics;
 using System.Linq;
 using System.Security.Cryptography;
+using DeltaSharp.Diagnostics;
 using DeltaSharp.Storage.Backends;
+using DeltaSharp.Storage.Diagnostics;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace DeltaSharp.Storage.Delta;
 
@@ -61,6 +66,18 @@ internal sealed class DeltaCommitter
     private readonly int _maxAttempts;
     private readonly Func<string> _nonceFactory;
     private readonly Func<int, CancellationToken, Task> _transientBackoff;
+    private readonly ILogger<DeltaCommitter> _logger;
+    private readonly DeltaStorageTelemetry _telemetry;
+    private readonly Func<int, CancellationToken, Task>? _rebaseJitter;
+
+    /// <summary>The shared <c>deltasharp.component</c>/<c>deltasharp.operation</c> correlation scope attached
+    /// to every commit log line (design §7.2.1). Cached so <see cref="ILogger.BeginScope"/> allocates no new
+    /// state array per commit.</summary>
+    private static readonly KeyValuePair<string, object?>[] CommitLogScope =
+    {
+        new(DeltaSharpTelemetry.ComponentKey, DeltaStorageTelemetry.DeltaComponent),
+        new(DeltaSharpTelemetry.OperationKey, DeltaStorageTelemetry.CommitOperation),
+    };
 
     /// <summary>Test seam (null/inert in production): awaited immediately before each put-if-absent with
     /// <c>(attemptIndex, targetVersion)</c>, so a test can deterministically interleave a racing writer.</summary>
@@ -71,11 +88,18 @@ internal sealed class DeltaCommitter
     {
     }
 
+    /// <param name="rebaseJitter">Optional, <b>off by default</b> (null ⇒ current zero-delay behavior): when
+    /// supplied, it is awaited after a safe rebase and before the next put-if-absent, spreading colliding
+    /// writers in time to reduce livelock under contention (visible via the conflict metric). A deterministic
+    /// delegate is injected in tests so it never perturbs the existing seams or timing.</param>
     internal DeltaCommitter(
         IStorageBackend backend,
         int maxAttempts,
         Func<string>? nonceFactory,
-        Func<int, CancellationToken, Task>? transientBackoff = null)
+        Func<int, CancellationToken, Task>? transientBackoff = null,
+        ILogger<DeltaCommitter>? logger = null,
+        DeltaStorageTelemetry? telemetry = null,
+        Func<int, CancellationToken, Task>? rebaseJitter = null)
     {
         ArgumentNullException.ThrowIfNull(backend);
         if (maxAttempts < 1)
@@ -88,6 +112,19 @@ internal sealed class DeltaCommitter
         _maxAttempts = maxAttempts;
         _nonceFactory = nonceFactory ?? DefaultNonceFactory;
         _transientBackoff = transientBackoff ?? DefaultTransientBackoffAsync;
+        _logger = logger ?? NullLogger<DeltaCommitter>.Instance;
+        _telemetry = telemetry ?? DeltaStorageTelemetry.Shared;
+        _rebaseJitter = rebaseJitter;
+    }
+
+    /// <summary>A bounded, deterministic-friendly rebase jitter suitable for the <c>rebaseJitter</c> seam:
+    /// full-jitter over <c>[0, cap)</c> milliseconds using the crypto RNG (never the banned
+    /// <c>System.Random</c>). Off in production by default; a host/story opts in explicitly.</summary>
+    internal static Task DefaultRebaseJitterAsync(int attempt, CancellationToken cancellationToken)
+    {
+        int capMs = Math.Min(50, 2 * (1 << Math.Min(attempt, 4)));
+        int delayMs = RandomNumberGenerator.GetInt32(0, capMs + 1);
+        return delayMs == 0 ? Task.CompletedTask : Task.Delay(delayMs, cancellationToken);
     }
 
     /// <summary>The production idempotency-nonce source: 128 bits from a cryptographic RNG, hex-encoded.
@@ -140,6 +177,69 @@ internal sealed class DeltaCommitter
                 nameof(actions));
         }
 
+        // Observability wrapper (design §7, #479): spans/metrics/logs are side-effect-free on commit
+        // semantics — the inner core is byte-for-byte the prior control flow. The stopwatch is monotonic
+        // (never the wall clock, checklist 09b) and the span is a null no-op until a listener samples it.
+        long startTimestamp = Stopwatch.GetTimestamp();
+        using Activity? activity = _telemetry.StartCommitActivity(_backend.Kind);
+        using IDisposable? logScope = _logger.BeginScope(CommitLogScope);
+        int attempts = 0;
+        try
+        {
+            return await CommitCoreAsync(
+                readSnapshot, actions, readScope, activity, startTimestamp, a => attempts = a, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (DeltaCommitUnknownStateException ex)
+        {
+            // Thrown deep in ambiguous/winner recovery; record + log the terminal here where the exception
+            // carries the version. (Conflict/contention/partial-txn are recorded at their in-core sites,
+            // where the attempt/class context is richer.)
+            RecordTerminal(activity, startTimestamp, CommitOutcome.UnknownState, ex.Version, attempts);
+            DeltaCommitLog.CommitUnknownState(_logger, ex.Version);
+            throw;
+        }
+        catch (DeltaProtocolException)
+        {
+            // Fail-closed protocol rejection before any write: no version was attempted, so pass version:-1
+            // (the pre-write span omits a version tag) and emit an Error terminal log (Architect Low #2).
+            RecordTerminal(activity, startTimestamp, CommitOutcome.Failure, version: -1, attempts);
+            DeltaCommitLog.CommitFailed(_logger, -1, attempts, nameof(DeltaProtocolException));
+            throw;
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancellation is not a commit failure: record a distinct terminal (Ok/Unset status, not Error) and propagate.
+            RecordTerminal(activity, startTimestamp, CommitOutcome.Cancelled, readSnapshot.Version + 1, attempts);
+            DeltaCommitLog.CommitCanceled(_logger, readSnapshot.Version + 1, attempts);
+            throw;
+        }
+        catch (Exception ex) when (ex is not PartialTransactionException and not DeltaConcurrentModificationException and not DeltaCommitContentionException)
+        {
+            // Unclassified/persistent failure — no in-core terminal recorded — the highest-value on-call
+            // signal. The three excluded types already recorded their terminal in-core, so excluding them
+            // prevents a double count. (DeltaCommitUnknownStateException/DeltaProtocolException are caught by
+            // the earlier specific blocks, so they never reach here.)
+            RecordTerminal(activity, startTimestamp, CommitOutcome.Failure, readSnapshot.Version + 1, attempts);
+            DeltaCommitLog.CommitFailed(_logger, readSnapshot.Version + 1, attempts, ex.GetType().Name);
+            throw;
+        }
+    }
+
+    /// <summary>The commit control flow (unchanged semantics); the surrounding <see cref="CommitAsync"/>
+    /// owns the span/stopwatch and the terminal recording for the deep-recovery exceptions. Each in-core
+    /// terminal (success, idempotent skip, conflict abort, partial-txn, contention) records its own metric,
+    /// span status, and log before returning/throwing, because that is where the attempt count and conflict
+    /// class are known.</summary>
+    private async Task<DeltaCommitResult> CommitCoreAsync(
+        Snapshot readSnapshot,
+        IReadOnlyList<DeltaAction> actions,
+        DeltaReadScope readScope,
+        Activity? activity,
+        long startTimestamp,
+        Action<int> reportAttempts,
+        CancellationToken cancellationToken)
+    {
         // Writer protocol negotiation: fail closed before any write if the table requires a writer
         // version/feature this build does not enforce (design §2.11 / §2.14 P3). Validate both the current
         // table protocol and any protocol this commit itself installs (an installed protocol must not raise
@@ -164,9 +264,9 @@ internal sealed class DeltaCommitter
         switch (ClassifyTxnCoverage(actions, readSnapshot.Transactions))
         {
             case TxnCoverage.All:
-                return new DeltaCommitResult(readSnapshot.Version, Attempts: 0, Skipped: true);
+                return Succeed(activity, startTimestamp, new DeltaCommitResult(readSnapshot.Version, Attempts: 0, Skipped: true));
             case TxnCoverage.Partial:
-                throw PartialTxn(actions, readSnapshot.Transactions);
+                throw PartialConflict(activity, startTimestamp, actions, readSnapshot.Transactions, attempts: 0);
             case TxnCoverage.None:
                 break; // no idempotency key covered — proceed to write.
         }
@@ -174,9 +274,13 @@ internal sealed class DeltaCommitter
         (IReadOnlyList<DeltaAction> payload, string nonce) = BuildPayload(actions, _nonceFactory());
         byte[] bytes = DeltaLogActionWriter.SerializeCommit(payload);
 
+        DeltaCommitLog.CommitStarted(_logger, readSnapshot.Version + 1, _backend.Kind.ToLabel());
+
         long baseVersion = readSnapshot.Version; // R — rebased forward on each safe retry.
+        int rebaseCount = 0;
         for (int attempt = 0; attempt < _maxAttempts; attempt++)
         {
+            reportAttempts(attempt + 1);
             long target = baseVersion + 1; // N
             string path = DeltaLogFiles.CommitPath(target);
 
@@ -196,8 +300,11 @@ internal sealed class DeltaCommitter
                 switch (await ResolveAmbiguousAsync(target, nonce, cancellationToken).ConfigureAwait(false))
                 {
                     case AmbiguousResolution.OursCommitted:
-                        return new DeltaCommitResult(target, attempt + 1); // ack was lost but the write landed.
+                        return Succeed(activity, startTimestamp, new DeltaCommitResult(target, attempt + 1)); // ack lost, write landed.
                     case AmbiguousResolution.SlotFree:
+                        DeltaCommitLog.CommitRetry(
+                            _logger, attempt + 1, target, DeltaStorageTelemetry.ToLabel(CommitRetryReason.AmbiguousSlotFree), rebaseCount);
+                        activity?.AddEvent(new ActivityEvent("retry.ambiguous_slot_free"));
                         continue; // our put did not land; the slot is unclaimed — retry the same version.
                     default: // LostToOther: <N>.json exists but is not ours → resolve as a definite conflict.
                         won = false;
@@ -207,7 +314,7 @@ internal sealed class DeltaCommitter
 
             if (won)
             {
-                return new DeltaCommitResult(target, attempt + 1);
+                return Succeed(activity, startTimestamp, new DeltaCommitResult(target, attempt + 1));
             }
 
             // Definite conflict: read the winners over (baseVersion, M], classify, then rebase or abort. The
@@ -220,7 +327,7 @@ internal sealed class DeltaCommitter
                 await ReadWinnersAsync(baseVersion, nonce, cancellationToken).ConfigureAwait(false);
             if (ownCommitVersion is { } ourVersion)
             {
-                return new DeltaCommitResult(ourVersion, attempt + 1);
+                return Succeed(activity, startTimestamp, new DeltaCommitResult(ourVersion, attempt + 1));
             }
 
             // Idempotency via txn on the conflict path (§2.11.4): if the winners already recorded this
@@ -239,24 +346,117 @@ internal sealed class DeltaCommitter
             switch (ClassifyTxnCoverage(actions, winnerTxns))
             {
                 case TxnCoverage.All:
-                    return new DeltaCommitResult(latest, attempt + 1, Skipped: true);
+                    return Succeed(activity, startTimestamp, new DeltaCommitResult(latest, attempt + 1, Skipped: true));
                 case TxnCoverage.Partial:
-                    throw PartialTxn(actions, winnerTxns);
+                    throw PartialConflict(activity, startTimestamp, actions, winnerTxns, attempts: attempt + 1);
                 case TxnCoverage.None:
                     break; // no winner covered our txn — fall through to conflict classification.
             }
 
-            DeltaConflictChecker.Check(actions, readScope, winners); // throws on a logical conflict
+            try
+            {
+                DeltaConflictChecker.Check(actions, readScope, winners); // throws on a logical conflict
+            }
+            catch (DeltaConcurrentModificationException ex)
+            {
+                // A definite, non-rebasable conflict: a domain outcome (Warning, outcome=conflict), not a
+                // runtime error (§7.2.3). Record the conflict class + terminal, then propagate unchanged.
+                string conflictClass = DeltaStorageTelemetry.ToConflictClass(ex.Kind);
+                _telemetry.RecordConflict(ex.Kind);
+                DeltaCommitLog.CommitConflict(_logger, attempt + 1, target, conflictClass);
+                activity?.AddEvent(new ActivityEvent("conflict.detected",
+                    tags: new ActivityTagsCollection { { DeltaStorageTelemetry.ConflictClassKey, conflictClass } }));
+                RecordTerminal(activity, startTimestamp, CommitOutcome.Conflict, target, attempt + 1);
+                throw;
+            }
+
+            // Safe rebase: a concurrent write we can rebase past (counted as a conflict we recovered from).
+            rebaseCount++;
+            _telemetry.RecordConflict(null); // null ⇒ concurrent_write (a safe rebase, not an aborting kind)
+            DeltaCommitLog.CommitRetry(
+                _logger, attempt + 1, target, DeltaStorageTelemetry.ToLabel(CommitRetryReason.ConflictRebase), rebaseCount);
+            activity?.AddEvent(new ActivityEvent("retry.conflict_rebase",
+                tags: new ActivityTagsCollection { { DeltaSharpTelemetry.TableVersionKey, latest } }));
+
+            // Optional, off-by-default rebase jitter (#479 nice-to-have): spread colliding writers in time so
+            // sustained contention is less likely to livelock. Null in production and in every existing test.
+            if (_rebaseJitter is { } jitter)
+            {
+                await jitter(attempt, cancellationToken).ConfigureAwait(false);
+            }
+
             baseVersion = latest; // safe: rebase onto M and retry with the same nonce-stable bytes.
         }
 
         // Budget exhausted under sustained contention: the commit provably did NOT land (every attempt ended
         // in a lost race or a safe rebase), so this is a known, retryable outcome — distinct from the genuine
         // unknown-state paths (§2.11.3).
+        long contendedVersion = baseVersion + 1;
+        RecordTerminal(activity, startTimestamp, CommitOutcome.Contention, contendedVersion, _maxAttempts);
+        DeltaCommitLog.CommitContentionExhausted(_logger, contendedVersion, _maxAttempts);
         throw new DeltaCommitContentionException(
-            baseVersion + 1,
+            contendedVersion,
             _maxAttempts,
             $"The commit did not converge within {_maxAttempts} attempts under sustained concurrent writers; it did not land — retry from a fresh snapshot.");
+    }
+
+    /// <summary>Records the success/skip terminal signals (metric, span status, log) and returns the result
+    /// so a call site reads <c>return Succeed(...)</c>.</summary>
+    private DeltaCommitResult Succeed(Activity? activity, long startTimestamp, DeltaCommitResult result)
+    {
+        CommitOutcome outcome = result.Skipped ? CommitOutcome.Skipped : CommitOutcome.Success;
+        RecordTerminal(activity, startTimestamp, outcome, result.Version, result.Attempts);
+        if (result.Skipped)
+        {
+            DeltaCommitLog.CommitSkipped(_logger, result.Version, "idempotent-txn");
+        }
+        else
+        {
+            DeltaCommitLog.CommitCompleted(
+                _logger, result.Version, result.Attempts, Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds);
+        }
+
+        return result;
+    }
+
+    /// <summary>Records the partial-transaction terminal (fail-closed) and builds the exception to throw so a
+    /// call site reads <c>throw PartialConflict(...)</c>.</summary>
+    private PartialTransactionException PartialConflict(
+        Activity? activity, long startTimestamp, IReadOnlyList<DeltaAction> actions, ImmutableSortedDictionary<string, long> txnState, int attempts)
+    {
+        (int committed, int uncommitted) = CountTxnCoverage(actions, txnState);
+        RecordTerminal(activity, startTimestamp, CommitOutcome.PartialTransaction, version: -1, attempts);
+        DeltaCommitLog.CommitPartialTransaction(_logger, committed, uncommitted);
+        return PartialTxn(actions, txnState);
+    }
+
+    /// <summary>Records the terminal metric measurement (duration, outcome count, attempt depth) and stamps
+    /// the span with the outcome, table version, attempt, and status. A single call per commit.</summary>
+    private void RecordTerminal(Activity? activity, long startTimestamp, CommitOutcome outcome, long version, int attempts)
+    {
+        double seconds = Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds;
+        _telemetry.RecordCommitTerminal(outcome, seconds, attempts);
+        if (activity is not null)
+        {
+            activity.SetTag(DeltaSharpTelemetry.OutcomeKey, DeltaStorageTelemetry.ToLabel(outcome));
+            if (version >= 0)
+            {
+                activity.SetTag(DeltaSharpTelemetry.TableVersionKey, version);
+            }
+
+            activity.SetTag(DeltaSharpTelemetry.AttemptKey, attempts);
+
+            // Success/Skipped are Ok; a Cancelled commit is left Unset (a cancel is not a failure); every
+            // other terminal (Failure/Conflict/Contention/UnknownState/PartialTransaction) is Error.
+            if (outcome is CommitOutcome.Success or CommitOutcome.Skipped)
+            {
+                activity.SetStatus(ActivityStatusCode.Ok);
+            }
+            else if (outcome is not CommitOutcome.Cancelled)
+            {
+                activity.SetStatus(ActivityStatusCode.Error);
+            }
+        }
     }
 
     /// <summary>Reads the actions of every commit over <c>(afterExclusive, M]</c> — the winners since the
@@ -315,6 +515,13 @@ internal sealed class DeltaCommitter
             }
             catch (DeltaStorageException ex) when (ex.Kind == StorageErrorKind.Transient && retry < MaxTransientRetries)
             {
+                // A transient retry keeps the terminal outcome clean (attempts=1 success), so surface it as
+                // its own measurable signal: a counter increment + a span event let an SRE distinguish a
+                // clean commit from a transient-degraded one (Quality Med). The commit span is the ambient
+                // current activity.
+                DeltaCommitLog.CommitTransientRetry(_logger, retry);
+                _telemetry.RecordTransientRetry();
+                Activity.Current?.AddEvent(new ActivityEvent("retry.transient"));
                 await _transientBackoff(retry, cancellationToken).ConfigureAwait(false);
             }
         }
@@ -455,6 +662,31 @@ internal sealed class DeltaCommitter
 
     private static bool IsTxnCovered(TxnAction txn, ImmutableSortedDictionary<string, long> txnState) =>
         txnState.TryGetValue(txn.AppId, out long committedVersion) && committedVersion >= txn.Version;
+
+    /// <summary>Counts how many of this commit's application transactions are already committed versus not
+    /// (for the fail-closed partial-transaction telemetry), without allocating the diagnostic name lists.</summary>
+    private static (int Committed, int Uncommitted) CountTxnCoverage(
+        IReadOnlyList<DeltaAction> actions, ImmutableSortedDictionary<string, long> txnState)
+    {
+        int committed = 0;
+        int uncommitted = 0;
+        foreach (DeltaAction action in actions)
+        {
+            if (action is TxnAction txn)
+            {
+                if (IsTxnCovered(txn, txnState))
+                {
+                    committed++;
+                }
+                else
+                {
+                    uncommitted++;
+                }
+            }
+        }
+
+        return (committed, uncommitted);
+    }
 
     /// <summary>Builds the fail-closed exception for a partially-committed atomic batch, naming which
     /// application transactions are already committed and which are not (so an operator can reconcile).</summary>
