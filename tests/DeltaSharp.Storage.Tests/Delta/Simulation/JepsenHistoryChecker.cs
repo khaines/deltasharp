@@ -483,11 +483,19 @@ internal static class JepsenHistoryChecker
             // race, following the precedence above. An EMPTY set means no legitimate conflict exists — the
             // writer should have rebased, so an abort here is spurious.
             var acceptable = new List<string>();
-            if (winnerProtocol || manifest.HasProtocolChange)
+            if (winnerProtocol)
             {
                 acceptable.Add("ProtocolChanged");
             }
-            else if (winnerMeta || manifest.HasMetadataChange)
+            else if (winnerMeta)
+            {
+                acceptable.Add("MetadataChanged");
+            }
+            else if (manifest.HasProtocolChange)
+            {
+                acceptable.Add("ProtocolChanged");
+            }
+            else if (manifest.HasMetadataChange)
             {
                 acceptable.Add("MetadataChanged");
             }

@@ -335,6 +335,67 @@ public sealed class DeltaCommitJepsenSimulationTests
         Assert.Contains("I4", check.ViolatedInvariants, StringComparison.Ordinal);
     }
 
+    // ---- I4 partial-read TEETH (round-4): a ReadFiles-scope commit whose recorded read-set contains a ----
+    // file NOT in the pinned snapshot (a ghost) must be caught by the SUBSET branch (observed ⊄ active@R) —
+    // pinning the partial-read predicate the round-3 whole-table teeth did not exercise.
+    [Theory]
+    [InlineData(0x0DE17A5D)]
+    [InlineData(0x1234ABCD)]
+    [InlineData(unchecked((int)0x7FFFFFFF))]
+    public async Task ReadFilesScope_GhostReadSet_IsCaughtBy_JepsenChecker(int seed)
+    {
+        var preCommits = new List<IReadOnlyList<string>> { new[] { DeltaTestHarness.Add("base.parquet") } };
+        var writer = new WriterSpec
+        {
+            Id = 0,
+            Actions = ImmutableArray.Create<DeltaAction>(Add("over.parquet")),
+            Scope = DeltaReadScope.ReadFiles(new[] { "base.parquet" }),
+            ReadFileSet = ImmutableArray.Create("base.parquet"),
+            ReadSetGhosts = ImmutableArray.Create("ghost.parquet"), // a file never active at the pin.
+        };
+
+        SimulationResult result = await CommitSimulationRunner.RunAsync(
+            seed, nameof(ReadFilesScope_GhostReadSet_IsCaughtBy_JepsenChecker), new[] { writer }, preCommits: preCommits);
+
+        HistoryCheckResult check = await CheckAsync(result);
+        Dump(result, check);
+
+        Assert.False(check.IsLegal, "A ReadFiles-scope read-set containing a ghost (⊄ snapshot@R) must be caught (I4 subset branch).");
+        Assert.Contains("I4", check.ViolatedInvariants, StringComparison.Ordinal);
+    }
+
+    // ---- A legal ReadFiles-scope STRICT SUBSET read (round-3 fix): reading fewer than all active files is ----
+    // NOT a snapshot-isolation violation — it must not be false-flagged. (Complements the ghost teeth above.)
+    [Theory]
+    [InlineData(0x0DE17A5D)]
+    [InlineData(0x1234ABCD)]
+    [InlineData(unchecked((int)0x7FFFFFFF))]
+    public async Task ReadFilesScope_StrictSubset_IsNotFalseFlagged(int seed)
+    {
+        var preCommits = new List<IReadOnlyList<string>>
+        {
+            new[] { DeltaTestHarness.Add("a.parquet"), DeltaTestHarness.Add("b.parquet") },
+        };
+        var writer = new WriterSpec
+        {
+            Id = 0,
+            Actions = ImmutableArray.Create<DeltaAction>(Add("c.parquet")),
+            Scope = DeltaReadScope.ReadFiles(new[] { "a.parquet" }),
+            ReadFileSet = ImmutableArray.Create("a.parquet"), // a strict subset of active {a, b} — legal.
+        };
+
+        SimulationResult result = await CommitSimulationRunner.RunAsync(
+            seed, nameof(ReadFilesScope_StrictSubset_IsNotFalseFlagged), new[] { writer }, preCommits: preCommits);
+
+        HistoryCheckResult check = await CheckAsync(result);
+        if (!check.IsLegal)
+        {
+            _output.WriteLine(check.Describe());
+        }
+
+        Assert.True(check.IsLegal, "A ReadFiles-scope strict-subset read is legal and must NOT be flagged I4:" + Environment.NewLine + check.Describe());
+    }
+
     // ---- I5 (CheckReadYourWritesAsync): under a broken CAS an overwritten winner's file is not visible ----
     // at its own acknowledged version — a read-your-writes break.
     [Theory]
@@ -637,6 +698,81 @@ public sealed class DeltaCommitJepsenSimulationTests
         Assert.True(check.IsLegal, "A metadata+txn winner correctly reported as MetadataChanged must NOT be flagged:" + Environment.NewLine + check.Describe());
     }
 
+    // ---- Conflict-class precedence SOUNDNESS (round-4): the real DeltaConflictChecker ranks a WINNER's ----
+    // metadata change (step 2) ABOVE a LOSER's own protocol change (step 3). A loser that itself changes
+    // protocol while racing a metadata-only winner correctly reports MetadataChangedException, so the checker
+    // must accept it — not demand ProtocolChanged. (Before the 4-level precedence split this was a latent
+    // false-positive: winner-metadata and loser-protocol were mis-ordered.)
+    [Theory]
+    [InlineData(0x0DE17A5D)]
+    [InlineData(0x1234ABCD)]
+    [InlineData(unchecked((int)0x7FFFFFFF))]
+    public async Task MetadataWinner_ProtocolChangingLoser_ReportedMetadata_IsNotFalseFlagged(int seed)
+    {
+        var preCommits = new List<IReadOnlyList<string>>
+        {
+            new[] { DeltaTestHarness.Add("base.parquet") },
+            new[] { DeltaTestHarness.Metadata() }, // v2 winner = metadata only (NOT protocol).
+        };
+
+        SimulationResult result = await CommitSimulationRunner.RunAsync(
+            seed, nameof(MetadataWinner_ProtocolChangingLoser_ReportedMetadata_IsNotFalseFlagged), Array.Empty<WriterSpec>(), preCommits: preCommits);
+
+        var synthetic = SyntheticConflict(
+            processId: 9,
+            readVersion: 1,
+            observedLatest: 2,
+            readFileSet: ImmutableArray.Create("base.parquet"),
+            scope: ManifestReadScope.WholeTable,
+            reportedClass: "MetadataChangedException", // correct: winner-metadata (step 2) outranks loser-protocol (step 3).
+            hasProtocolChange: true); // the LOSER itself installs a protocol change.
+
+        HistoryCheckResult check = await JepsenHistoryChecker.CheckAsync(
+            result.History.Add(synthetic), result.Backend, result.BackgroundVersions);
+        _output.WriteLine(result.Bundle.ReproductionLine);
+        if (!check.IsLegal)
+        {
+            _output.WriteLine(check.Describe());
+        }
+
+        Assert.True(check.IsLegal, "Winner-metadata outranks loser-protocol: a MetadataChanged report must NOT be flagged:" + Environment.NewLine + check.Describe());
+    }
+
+    // ---- Conflict-class TEETH for the loser-protocol branch (round-4): a loser that itself changes ----
+    // protocol takes the table exclusively (step 3, above data conflicts), so it must report ProtocolChanged.
+    // Misreporting it as ConcurrentAppend must be caught — pins the newly-split loser-protocol branch.
+    [Theory]
+    [InlineData(0x0DE17A5D)]
+    [InlineData(0x1234ABCD)]
+    [InlineData(unchecked((int)0x7FFFFFFF))]
+    public async Task LoserProtocolChange_MisreportedAsAppend_IsCaughtBy_JepsenChecker(int seed)
+    {
+        var preCommits = new List<IReadOnlyList<string>>
+        {
+            new[] { DeltaTestHarness.Add("base.parquet") },
+            new[] { DeltaTestHarness.Add("winner.parquet") }, // v2 winner = a plain concurrent add (no meta/protocol).
+        };
+
+        SimulationResult result = await CommitSimulationRunner.RunAsync(
+            seed, nameof(LoserProtocolChange_MisreportedAsAppend_IsCaughtBy_JepsenChecker), Array.Empty<WriterSpec>(), preCommits: preCommits);
+
+        var synthetic = SyntheticConflict(
+            processId: 9,
+            readVersion: 1,
+            observedLatest: 2,
+            readFileSet: ImmutableArray.Create("base.parquet"),
+            scope: ManifestReadScope.WholeTable,
+            reportedClass: "ConcurrentAppendException", // wrong: the loser changed protocol ⇒ expected ProtocolChanged.
+            hasProtocolChange: true);
+
+        HistoryCheckResult check = await JepsenHistoryChecker.CheckAsync(
+            result.History.Add(synthetic), result.Backend, result.BackgroundVersions);
+        Dump(result, check);
+
+        Assert.False(check.IsLegal, "A loser that changed protocol but reported ConcurrentAppend must be caught (CC).");
+        Assert.Contains("CC", check.ViolatedInvariants, StringComparison.Ordinal);
+    }
+
     private static HistoryEvent SyntheticConflict(
         int processId,
         long readVersion,
@@ -644,14 +780,16 @@ public sealed class DeltaCommitJepsenSimulationTests
         ImmutableArray<string> readFileSet,
         ManifestReadScope scope,
         string reportedClass,
-        TxnKey? txn = null)
+        TxnKey? txn = null,
+        bool hasProtocolChange = false,
+        bool hasMetadataChange = false)
     {
         var manifest = new ActionManifest(
             ReadFileSet: readFileSet,
             Adds: ImmutableArray<ManifestFile>.Empty,
             Removes: ImmutableArray<ManifestFile>.Empty,
-            HasMetadataChange: false,
-            HasProtocolChange: false,
+            HasMetadataChange: hasMetadataChange,
+            HasProtocolChange: hasProtocolChange,
             Txn: txn,
             ActionSetDigest: "synthetic-conflict",
             SutReportedBlindAppend: readFileSet.IsEmpty,
