@@ -341,6 +341,51 @@ public sealed class DeltaSchemaEnforcerTests
         Assert.Equal("city", mergedInner[1].Name);
     }
 
+    [Fact]
+    public void Reconcile_NewFieldInArrayElementStruct_WithEvolution_IsAdded()
+    {
+        // AC3: additive evolution recurses through an array element's struct, so a merged (changed) element
+        // type flows back out as a new ArrayType (preserving the table's containsNull).
+        StructType tableElement = Schema(Field("a", DataTypes.IntegerType, nullable: true));
+        StructType writeElement = Schema(
+            Field("a", DataTypes.IntegerType, nullable: true),
+            Field("b", DataTypes.StringType, nullable: true));
+        StructType table = Schema(Field("items", DataTypes.CreateArrayType(tableElement, containsNull: false), nullable: true));
+        StructType write = Schema(Field("items", DataTypes.CreateArrayType(writeElement, containsNull: false), nullable: true));
+
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.AddNewColumns);
+
+        Assert.NotNull(merged);
+        ArrayType mergedArray = Assert.IsType<ArrayType>(merged![0].DataType);
+        Assert.False(mergedArray.ContainsNull);
+        StructType mergedElement = Assert.IsType<StructType>(mergedArray.ElementType);
+        Assert.Equal(2, mergedElement.Count);
+        Assert.Equal("b", mergedElement[1].Name);
+    }
+
+    [Fact]
+    public void Reconcile_NewFieldInMapValueStruct_WithEvolution_IsAdded()
+    {
+        // AC3: additive evolution recurses through a map value's struct, so a merged (changed) value type
+        // flows back out as a new MapType (preserving the key type and valueContainsNull).
+        StructType tableValue = Schema(Field("a", DataTypes.IntegerType, nullable: true));
+        StructType writeValue = Schema(
+            Field("a", DataTypes.IntegerType, nullable: true),
+            Field("b", DataTypes.StringType, nullable: true));
+        StructType table = Schema(Field("lookup", DataTypes.CreateMapType(DataTypes.StringType, tableValue, valueContainsNull: false), nullable: true));
+        StructType write = Schema(Field("lookup", DataTypes.CreateMapType(DataTypes.StringType, writeValue, valueContainsNull: false), nullable: true));
+
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.AddNewColumns);
+
+        Assert.NotNull(merged);
+        MapType mergedMap = Assert.IsType<MapType>(merged![0].DataType);
+        Assert.False(mergedMap.ValueContainsNull);
+        Assert.IsType<StringType>(mergedMap.KeyType);
+        StructType mergedValue = Assert.IsType<StructType>(mergedMap.ValueType);
+        Assert.Equal(2, mergedValue.Count);
+        Assert.Equal("b", mergedValue[1].Name);
+    }
+
     // ---- AC3: array / map element compatibility -------------------------------------------------------
 
     [Fact]
