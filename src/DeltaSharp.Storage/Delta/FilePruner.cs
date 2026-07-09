@@ -106,7 +106,7 @@ internal static class FilePruner
     /// Whether the present per-file bounds <b>prove</b> that no non-null value can satisfy
     /// <c>column OP value</c>, so the file may be soundly skipped. Each bound is used <b>independently</b>
     /// and only when present, so a file that carries just one bound (its counterpart omitted for a
-    /// NaN/±Infinity/truncated extreme) is still prunable on the side it does have:
+    /// NaN/±Infinity extreme) is still prunable on the side it does have:
     /// <list type="bullet">
     /// <item><c>&lt;</c> / <c>&lt;=</c> use only <c>min</c>: skip iff every value is at/above
     /// <paramref name="value"/> (<c>min &gt;= value</c> for <c>&lt;</c>, <c>min &gt; value</c> for
