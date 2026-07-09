@@ -37,6 +37,18 @@
                excluded at the file/member level, never repo-wide. -->
           <ExcludeByAttribute>Obsolete,GeneratedCodeAttribute,CompilerGeneratedAttribute,ExcludeFromCodeCoverageAttribute</ExcludeByAttribute>
 
+          <!-- Also exclude generated sources by FILE. Attribute exclusion zeroes a generated
+               member's hits but coverlet still lists the generated file in the report; under a
+               deterministic CI build (ContinuousIntegrationBuild=true) a source-generator output
+               under obj/ (e.g. the [LoggerMessage] LoggerMessage.g.cs) carries a normalized
+               '/_/…/obj/…' source path whose root differs from the checked-out sources. That lone
+               foreign-rooted path collapses coverlet's common-source-prefix to '/', making one
+               assembly's report use absolute filenames while the others stay repo-relative — which
+               breaks the coverage gate's (package, filename, line) de-duplication and double-counts
+               every assembly shared across reports. Excluding generated sources by file keeps the
+               report's paths uniformly repo-relative (and never counts un-authored generated code). -->
+          <ExcludeByFile>**/obj/**/*.cs,**/*.g.cs,**/*.g.i.cs</ExcludeByFile>
+
           <!-- Trivial auto-property get/set bodies are not meaningful coverage targets;
                skipping them keeps the metric on real logic and keeps the number stable. -->
           <SkipAutoProps>true</SkipAutoProps>
