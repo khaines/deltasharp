@@ -449,9 +449,15 @@ Every commit attempt resolves to exactly one class (checklist *ACID* bullet 3):
 
 A streaming/micro-batch writer records `txn{appId, version}`. Before committing it checks the latest snapshot's `txn` map: if `snapshot.txn[appId] ≥ version` the batch already committed → **skip** (no duplicate rows). This makes retries and micro-batch commits idempotent (checklist *ACID* bullet 5) and yields `ConcurrentTransactionException` on a genuine concurrent same-`appId` commit.
 
+The skip is enforced at **two** points (STORY-05.3.2 AC1): **up-front** against the read snapshot's `txn` map (a retry that re-reads a fresh snapshot), and on the **conflict path** against the winners of a lost race — folding each winning `txn` into an appId → **max** committed version and skipping if it covers this commit's `txn`. The conflict-path skip is an **intentional divergence** from stock Delta, which fails *any* same-`appId` conflict loud with `ConcurrentTransactionException`: a winner that is this appId's **own** prior landed attempt (a lost-ack or stale-snapshot retry — the exact case a `txn` idempotency key exists to absorb) is treated as proof the batch already committed and skipped, whereas a **non-covering** same-`appId` winner (a genuine concurrent writer at a *lower* version) does not match and still fails loud. The `txn` is the commit's **atomic idempotency identity**, not a per-action one: a covering match skips the *whole* commit including any sibling actions, so callers must not bundle unrelated non-idempotent actions under an already-committed key.
+
 #### 2.11.5 Orphan-file cleanup
 
 Files staged but never committed (crash before commit, or a lost commit later rebased away) are **orphans**: not referenced by any committed `add`, therefore invisible to readers (the log is truth). They are never treated as committed data (checklist *ACID* bullet 8; anti-pattern #2). Reclamation is VACUUM's job (§2.14 / checklist *Maintenance*), governed by retention and stale-reader safety — never an eager delete on the commit path.
+
+The selection contract (STORY-05.3.2 AC2/AC4) is **fail-safe**: a candidate is deletable only when it is *all* of (a) not active, (b) not a retention-protected tombstone — removed at/after the cutoff, **or with an unknown deletion time** (a null `deletionTimestamp` is treated as `+∞`, i.e. always protected), and (c) not itself modified at/after the cutoff (boundary is inclusive — `mtime == cutoff` is protected as possibly in-flight). Any boundary or unknown-provenance case is retained, never deleted.
+
+Under speculative execution the commit coordinator publishes **exactly one attempt's output per task** (STORY-05.3.2 AC3): staged outputs are tagged with producing task/attempt, and only the **highest-attempt** file set per task is committed. This is a deterministic, order-independent pure rule over the candidate set — a **divergence** from Spark's `OutputCommitCoordinator` (first-committer-wins via a coordinator round-trip); both guarantee one-output-per-task, but the pure rule replays cleanly into a single atomic Delta commit.
 
 #### 2.11.6 Crash-point behavior
 

@@ -15,6 +15,14 @@ namespace DeltaSharp.Storage.Delta;
 /// task tag is not a speculative task output and passes through unchanged. The executor-side tagging that
 /// produces these tags lands with distributed execution; this contract is the commit-side counterpart the
 /// coordinator applies before building the action set.</para>
+///
+/// <para><b>Divergence from Spark (intentional):</b> Spark's <c>OutputCommitCoordinator</c> authorizes the
+/// <b>first</b> attempt that requests commit (first-committer-wins) and rejects later ones. DeltaSharp
+/// selects deterministically at commit build time from the full staged set, keeping the <b>highest</b>
+/// attempt number per task. Both guarantee exactly-one-output-per-task; the pure highest-attempt rule is a
+/// total function of the candidate set (no coordinator round-trip, order-independent, replayable), which
+/// suits building a single atomic Delta commit. It assumes each attempt stages a self-contained output —
+/// which the executor tagging guarantees.</para>
 /// </summary>
 internal static class TaskCommitCoordination
 {

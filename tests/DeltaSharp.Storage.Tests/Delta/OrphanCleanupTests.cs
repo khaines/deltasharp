@@ -45,6 +45,48 @@ public sealed class OrphanCleanupTests : IDisposable
     }
 
     [Fact]
+    public async Task NullDeletionTimestampTombstone_IsAlwaysProtected()
+    {
+        // Fail-safe: a tombstone with an UNKNOWN deletion time (§2.11.5) is never deletable — protected at
+        // any cutoff, including the maximum. Uses a raw remove line with no deletionTimestamp so the parsed
+        // RemoveFileAction.DeletionTimestamp is null.
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Add("x.parquet"));
+        await DeltaTestHarness.WriteCommitAsync(_backend, 2, """{"remove":{"path":"x.parquet","dataChange":true}}""");
+        Snapshot snapshot = await new DeltaLog(_backend).LoadSnapshotAsync();
+
+        Assert.Empty(OrphanCleanup.SelectDeletable(
+            snapshot, new[] { new OrphanCandidate("x.parquet", ModificationTimeMillis: 0) }, retentionCutoffMillis: long.MaxValue));
+    }
+
+    [Fact]
+    public async Task StagedFileExactlyAtCutoff_IsProtected()
+    {
+        // Boundary: a candidate whose modification time equals the cutoff is within the retention window
+        // (>= cutoff) and must be protected — it may belong to an in-flight commit.
+        Snapshot snapshot = await BuildSnapshotAsync();
+
+        Assert.Empty(OrphanCleanup.SelectDeletable(
+            snapshot, new[] { new OrphanCandidate("edge.parquet", ModificationTimeMillis: 100) }, retentionCutoffMillis: 100));
+    }
+
+    [Fact]
+    public async Task FileBothActiveAndTombstoned_IsProtected()
+    {
+        // A file removed then re-added is active again (and also carries a tombstone). Active-first ordering
+        // must protect it regardless of the tombstone.
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Add("readd.parquet"));
+        await DeltaTestHarness.WriteCommitAsync(_backend, 2, DeltaTestHarness.Remove("readd.parquet"));
+        await DeltaTestHarness.WriteCommitAsync(_backend, 3, DeltaTestHarness.Add("readd.parquet"));
+        Snapshot snapshot = await new DeltaLog(_backend).LoadSnapshotAsync();
+
+        Assert.Contains("readd.parquet", snapshot.ActiveFiles.Select(a => a.Path)); // active again
+        Assert.Empty(OrphanCleanup.SelectDeletable(
+            snapshot, new[] { new OrphanCandidate("readd.parquet", ModificationTimeMillis: 0) }, retentionCutoffMillis: 1000));
+    }
+
+    [Fact]
     public async Task ActiveFile_IsNeverDeletable()
     {
         Snapshot snapshot = await BuildSnapshotAsync();

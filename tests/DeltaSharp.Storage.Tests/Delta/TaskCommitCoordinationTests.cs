@@ -97,6 +97,26 @@ public sealed class TaskCommitCoordinationTests
     }
 
     [Fact]
+    public void PreservesInputOrder_OfKeptFiles()
+    {
+        // The contract promises stable order: kept files (winners + untagged) appear in their original
+        // relative input order. Asserted WITHOUT sorting so a regrouping/reordering regression is caught.
+        IReadOnlyList<AddFileAction> selected = TaskCommitCoordination.SelectWinningOutputs(new[]
+        {
+            Add("z-plain.parquet"),                          // untagged → kept
+            Add("t1-a2.parquet", taskId: "t1", attempt: 2),  // t1 winner
+            Add("t0-a1.parquet", taskId: "t0", attempt: 1),  // t0 winner
+            Add("t1-a0.parquet", taskId: "t1", attempt: 0),  // t1 superseded → dropped
+            Add("a-plain.parquet"),                          // untagged → kept
+            Add("t0-a0.parquet", taskId: "t0", attempt: 0),  // t0 superseded → dropped
+        });
+
+        Assert.Equal(
+            new[] { "z-plain.parquet", "t1-a2.parquet", "t0-a1.parquet", "a-plain.parquet" },
+            Paths(selected));
+    }
+
+    [Fact]
     public void MissingAttemptNumber_TreatedAsZero()
     {
         // A tagged output with no attempt number defaults to attempt 0, so an explicit attempt 1 wins.

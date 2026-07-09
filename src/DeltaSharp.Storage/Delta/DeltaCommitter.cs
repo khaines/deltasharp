@@ -220,6 +220,13 @@ internal sealed class DeltaCommitter
             // application transaction (a stale-snapshot or racing retry of the same appId whose prior attempt
             // landed — the in-memory nonce differs across attempts, so the own-commit check above misses it),
             // succeed idempotently rather than rebasing or raising ConcurrentTransactionException.
+            //
+            // DIVERGENCE (intentional): stock Delta fails a same-appId conflict LOUD with
+            // ConcurrentTransactionException even when the winner is this appId's OWN prior landed attempt.
+            // DeltaSharp instead treats a covering winner (txnState[appId] >= our version) as proof our batch
+            // already committed and skips — strictly more robust for a lost-ack / stale-snapshot retry, which
+            // is the exact failure a txn idempotency key exists to absorb. A NON-covering same-appId winner
+            // (a genuine concurrent writer, lower version) does NOT match here and still fails loud below.
             if (TryFindAlreadyCommittedTxn(actions, TxnStateOf(winners)))
             {
                 return new DeltaCommitResult(latest, attempt + 1, Skipped: true);
@@ -393,7 +400,13 @@ internal sealed class DeltaCommitter
     /// per <paramref name="txnState"/> (appId → last committed version): a <c>txn{appId, version}</c> whose
     /// <paramref name="txnState"/>[appId] ≥ version means the batch already landed and must be idempotently
     /// skipped (§2.11.4). A commit normally carries a single <c>txn</c>; if it carries several, any
-    /// already-committed one marks the batch a duplicate.</summary>
+    /// already-committed one marks the batch a duplicate.
+    /// <para><b>Caveat (atomic-batch assumption):</b> a match skips the <b>entire</b> commit, including any
+    /// sibling actions bundled with the transaction. This is correct for the streaming/micro-batch model a
+    /// <c>txn</c> is designed for — the batch's <c>txn</c> and its <c>add</c>s are one atomic unit, so an
+    /// already-committed <c>txn</c> means the whole batch already landed. Callers must therefore not bundle
+    /// unrelated non-idempotent actions under an already-committed idempotency key; the <c>txn</c> is the
+    /// commit's idempotency identity, not a per-action one.</para></summary>
     private static bool TryFindAlreadyCommittedTxn(
         IReadOnlyList<DeltaAction> actions, ImmutableSortedDictionary<string, long> txnState)
     {

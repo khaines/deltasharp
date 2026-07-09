@@ -109,6 +109,42 @@ public sealed class DeltaCommitTxnIdempotencyTests : IDisposable
     }
 
     [Fact]
+    public async Task ConflictPathSkip_UsesMaxWinnerVersion_AcrossMultipleSameAppTxns()
+    {
+        // A stale-snapshot retry loses the race and reads MULTIPLE winner commits for the same appId; the
+        // conflict-path skip keys on the MAX recorded version, so a retry at that version is covered and
+        // skipped. (Pins TxnStateOf's Math.Max reduction — a Min reduction would use v3, miss the v5 retry,
+        // and raise ConcurrentTransactionException.)
+        await SeedAsync();
+        Snapshot stale = await LoadAsync(); // v0
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Txn("stream", 3), DeltaTestHarness.Add("batch3.parquet"));
+        await DeltaTestHarness.WriteCommitAsync(_backend, 2, DeltaTestHarness.Txn("stream", 5), DeltaTestHarness.Add("batch5.parquet"));
+
+        DeltaCommitResult result = await new DeltaCommitter(_backend).CommitAsync(
+            stale, new DeltaAction[] { Txn("stream", 5), Add("retry-batch5.parquet") }, DeltaReadScope.BlindAppend);
+
+        Assert.True(result.Skipped);
+        Snapshot reloaded = await LoadAsync();
+        Assert.Equal(2L, reloaded.Version); // no v3 published
+        Assert.Equal(new[] { "batch3.parquet", "batch5.parquet" }, reloaded.ActiveFiles.Select(a => a.Path).OrderBy(p => p).ToArray());
+    }
+
+    [Fact]
+    public async Task GenuineConcurrentSameAppId_LowerWinnerVersion_ThrowsConcurrentTransaction()
+    {
+        // A genuine concurrent writer sharing the appId at a NON-covering (lower) version is not our retry:
+        // the conflict-path skip does not fire (winner v3 < our v5) and the commit aborts with
+        // ConcurrentTransactionException end-to-end through CommitAsync.
+        await SeedAsync();
+        Snapshot stale = await LoadAsync(); // v0
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Txn("stream", 3), DeltaTestHarness.Add("other.parquet"));
+
+        await Assert.ThrowsAsync<ConcurrentTransactionException>(() =>
+            new DeltaCommitter(_backend).CommitAsync(
+                stale, new DeltaAction[] { Txn("stream", 5), Add("mine.parquet") }, DeltaReadScope.BlindAppend));
+    }
+
+    [Fact]
     public async Task CommitWithoutTxn_IsNeverSkipped()
     {
         // A plain append with no txn has no idempotency key and always commits.
