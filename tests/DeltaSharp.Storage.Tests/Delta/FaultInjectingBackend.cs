@@ -51,6 +51,12 @@ internal sealed class FaultInjectingBackend : IStorageBackend
     /// real put (drives the §2.11.3 bounded transient-retry path).</summary>
     public int TransientPutCalls { get; init; }
 
+    /// <summary>When <see langword="true"/>, every put-if-absent raises a <b>persistent</b> (non-transient,
+    /// non-ambiguous) <see cref="DeltaStorageException"/> so the failure escapes the bounded transient-retry
+    /// budget and surfaces as an unclassified hard-failure terminal (drives the #479 <c>outcome=failure</c>
+    /// path). Applied only after any <see cref="TransientPutCalls"/> are exhausted.</summary>
+    public bool PersistentPutFailure { get; init; }
+
     /// <summary>The number of leading <c>Head</c> calls that report the object <b>absent</b> even when it
     /// exists — a read-after-write visibility flap. Combined with <see cref="PerformPutBeforeLie"/> this
     /// models a durable-but-invisible own commit (the intra-attempt visibility flap the red-team found).</summary>
@@ -62,6 +68,11 @@ internal sealed class FaultInjectingBackend : IStorageBackend
         {
             _transientPutsThrown++;
             throw new DeltaStorageException(StorageErrorKind.Transient, "injected transient put-if-absent failure.");
+        }
+
+        if (PersistentPutFailure)
+        {
+            throw new DeltaStorageException(StorageErrorKind.NotFound, "injected persistent put-if-absent failure.");
         }
 
         int call = _putCalls++;

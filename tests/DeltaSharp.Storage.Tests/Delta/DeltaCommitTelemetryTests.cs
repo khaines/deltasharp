@@ -4,6 +4,7 @@ using DeltaSharp.Storage;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
 using DeltaSharp.Storage.Diagnostics;
+using Microsoft.Extensions.Logging;
 using Xunit;
 
 namespace DeltaSharp.Storage.Tests.Delta;
@@ -30,6 +31,7 @@ public sealed class DeltaCommitTelemetryTests : IDisposable
     private const string CountInstrument = "deltasharp.delta.commit.count";
     private const string AttemptsInstrument = "deltasharp.delta.commit.attempts";
     private const string ConflictsInstrument = "deltasharp.delta.commit.conflicts";
+    private const string TransientRetriesInstrument = "deltasharp.delta.commit.transient_retries";
 
     private readonly string _root;
     private readonly LocalFileSystemBackend _backend;
@@ -171,7 +173,12 @@ public sealed class DeltaCommitTelemetryTests : IDisposable
 
         Activity activity = SingleCommitActivity(activities);
         Assert.Equal("success", activity.GetTagItem(OutcomeKey));
-        Assert.Contains(activity.Events, e => e.Name == "retry.conflict_rebase");
+        ActivityEvent rebaseEvent = Assert.Single(activity.Events, e => e.Name == "retry.conflict_rebase");
+        // The rebase event must carry the rebased-onto table version tag (the latest observed winner, v1),
+        // not just exist — deleting the tag must fail this assertion (red-team vacuity fix).
+        KeyValuePair<string, object?> versionTag =
+            Assert.Single(rebaseEvent.Tags, t => t.Key == TableVersionKey);
+        Assert.Equal(1L, versionTag.Value);
     }
 
     [Fact]
@@ -198,7 +205,12 @@ public sealed class DeltaCommitTelemetryTests : IDisposable
         Activity activity = SingleCommitActivity(activities);
         Assert.Equal("conflict", activity.GetTagItem(OutcomeKey));
         Assert.Equal(ActivityStatusCode.Error, activity.Status);
-        Assert.Contains(activity.Events, e => e.Name == "conflict.detected");
+        ActivityEvent conflictEvent = Assert.Single(activity.Events, e => e.Name == "conflict.detected");
+        // The conflict event must carry the bounded conflict.class tag (not just exist) — deleting the tag
+        // must fail this assertion (red-team vacuity fix).
+        KeyValuePair<string, object?> classTag =
+            Assert.Single(conflictEvent.Tags, t => t.Key == DeltaStorageTelemetry.ConflictClassKey);
+        Assert.Equal("metadata_changed", classTag.Value);
     }
 
     [Fact]
@@ -282,8 +294,20 @@ public sealed class DeltaCommitTelemetryTests : IDisposable
         RecordingLogger<DeltaCommitter>.Entry retry = logger.Single("DeltaCommitRetry");
         Assert.Equal("ambiguous_slot_free", retry.Field("Reason"));
 
+        // Terminal metrics must be recorded (not vacuous): one success count + a 2-attempt depth + a
+        // duration measurement, all tagged outcome=success. (Deleting the RecordTerminal emit would fail here.)
+        MeterCapture.Measurement count = Assert.Single(meters.ForInstrument(CountInstrument));
+        Assert.Equal(1d, count.Value);
+        Assert.Equal("success", count.Tags[OutcomeKey]);
+        MeterCapture.Measurement attempts = Assert.Single(meters.ForInstrument(AttemptsInstrument));
+        Assert.Equal(2d, attempts.Value);
+        Assert.Equal("success", attempts.Tags[OutcomeKey]);
+        Assert.Equal("success", Assert.Single(meters.ForInstrument(DurationInstrument)).Tags[OutcomeKey]);
+
         Activity activity = SingleCommitActivity(activities);
         Assert.Equal("success", activity.GetTagItem(OutcomeKey));
+        Assert.Equal(2, activity.GetTagItem(AttemptKey));
+        Assert.Equal(ActivityStatusCode.Ok, activity.Status);
         Assert.Contains(activity.Events, e => e.Name == "retry.ambiguous_slot_free");
     }
 
@@ -366,7 +390,7 @@ public sealed class DeltaCommitTelemetryTests : IDisposable
     }
 
     [Fact]
-    public async Task NoListeners_CommitIsAZeroCostNoOp()
+    public async Task NoListeners_CommitEmitsNothingObservable()
     {
         // The production defaults (Shared telemetry + NullLogger) emit through a surface with no subscriber:
         // no Activity is created (StartActivity returns null → Activity.Current stays null) and the commit
@@ -403,6 +427,38 @@ public sealed class DeltaCommitTelemetryTests : IDisposable
     }
 
     [Fact]
+    public async Task TransientPutFailure_IncrementsRetryCounter_AndEmitsSpanEvent()
+    {
+        // Quality Med: a transient-then-success commit terminates as a clean attempts=1 success, so the only
+        // way to distinguish it from a truly clean commit is the transient_retries counter + the
+        // retry.transient span event. Assert both so a degradation signal is measurable (not just a Debug log).
+        Snapshot snapshot = await SeedAndLoadAsync();
+        var faulty = new FaultInjectingBackend(_backend) { TransientPutCalls = 2 };
+        using var telemetry = new DeltaStorageTelemetry();
+        var logger = new RecordingLogger<DeltaCommitter>();
+        using var meters = new MeterCapture(telemetry.DeltaMeter, telemetry.StorageMeter);
+        using var activities = new ActivityCapture(telemetry.DeltaActivitySource);
+
+        DeltaCommitResult result = await Committer(faulty, logger, telemetry)
+            .CommitAsync(snapshot, new DeltaAction[] { Add("part-0.parquet") }, DeltaReadScope.BlindAppend);
+
+        Assert.Equal(1L, result.Version);
+        Assert.Equal(1, result.Attempts); // still a clean single put-if-absent attempt
+
+        // Counter: two transient retries recorded (matches the two injected transient put failures).
+        IReadOnlyList<MeterCapture.Measurement> retries = meters.ForInstrument(TransientRetriesInstrument).ToArray();
+        Assert.Equal(2, retries.Count);
+        Assert.All(retries, m => Assert.Equal(1d, m.Value));
+
+        // The terminal is still a clean success at v1 on attempt 1.
+        Assert.Equal("success", Assert.Single(meters.ForInstrument(CountInstrument)).Tags[OutcomeKey]);
+
+        // Span events: one retry.transient per transient retry, on the ambient commit span.
+        Activity activity = SingleCommitActivity(activities);
+        Assert.Equal(2, activity.Events.Count(e => e.Name == "retry.transient"));
+    }
+
+    [Fact]
     public async Task WholeTableOverwrite_ConcurrentAppend_ClassifiesConcurrentAppend()
     {
         // A whole-table overwrite conflicts with a concurrent append (design §2.11): the conflict counter is
@@ -419,6 +475,105 @@ public sealed class DeltaCommitTelemetryTests : IDisposable
 
         Assert.Equal("concurrent_append", Assert.Single(meters.ForInstrument(ConflictsInstrument)).Tags[DeltaStorageTelemetry.ConflictClassKey]);
         Assert.Equal("concurrent_append", logger.Single("DeltaCommitConflict").Field("ConflictClass"));
+    }
+
+    [Fact]
+    public async Task PersistentPutFailure_EmitsFailedTerminal_ErrorLog_AndErrorSpan()
+    {
+        // BLOCKING FIX (Architect/Balanced/SRE/red-team): a persistent, unclassified storage failure
+        // previously escaped the wrapper with NO terminal metric, NO error log, and an Unset span — silently
+        // inflating the commit-success SLI. The general catch now records exactly one outcome=failure
+        // terminal + a DeltaCommitFailed (4009) Error log + an Error span.
+        Snapshot snapshot = await SeedAndLoadAsync();
+        var faulty = new FaultInjectingBackend(_backend) { PersistentPutFailure = true };
+        using var telemetry = new DeltaStorageTelemetry();
+        var logger = new RecordingLogger<DeltaCommitter>();
+        using var meters = new MeterCapture(telemetry.DeltaMeter, telemetry.StorageMeter);
+        using var activities = new ActivityCapture(telemetry.DeltaActivitySource);
+
+        await Assert.ThrowsAsync<DeltaStorageException>(() =>
+            Committer(faulty, logger, telemetry)
+                .CommitAsync(snapshot, new DeltaAction[] { Add("part-0.parquet") }, DeltaReadScope.BlindAppend));
+
+        RecordingLogger<DeltaCommitter>.Entry failed = logger.Single("DeltaCommitFailed");
+        Assert.Equal(4009, failed.EventId.Id);
+        Assert.Equal(LogLevel.Error, failed.Level);
+        Assert.Equal(1L, failed.Field("Version"));
+        Assert.Equal(nameof(DeltaStorageException), failed.Field("ExceptionType"));
+
+        MeterCapture.Measurement count = Assert.Single(meters.ForInstrument(CountInstrument));
+        Assert.Equal(1d, count.Value);
+        Assert.Equal("failure", count.Tags[OutcomeKey]);
+        Assert.Equal("failure", Assert.Single(meters.ForInstrument(DurationInstrument)).Tags[OutcomeKey]);
+
+        Activity activity = SingleCommitActivity(activities);
+        Assert.Equal("failure", activity.GetTagItem(OutcomeKey));
+        Assert.Equal(ActivityStatusCode.Error, activity.Status);
+
+        // Redaction: the data-file path is never rendered in the failure log message (§7.2.2).
+        Assert.DoesNotContain(logger.Entries, e => e.Message.Contains("part-0.parquet", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Canceled_RecordsCancelledTerminal_InfoLog_AndSpanNotError()
+    {
+        // BLOCKING FIX: cancellation is NOT a commit failure. The wrapper records a distinct outcome=cancelled
+        // terminal + a DeltaCommitCanceled (4010) Information log, and must NOT mark the span Error, so a
+        // cancel never inflates the failure SLI.
+        Snapshot snapshot = await SeedAndLoadAsync();
+        using var telemetry = new DeltaStorageTelemetry();
+        var logger = new RecordingLogger<DeltaCommitter>();
+        using var meters = new MeterCapture(telemetry.DeltaMeter, telemetry.StorageMeter);
+        using var activities = new ActivityCapture(telemetry.DeltaActivitySource);
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        DeltaCommitter committer = Committer(_backend, logger, telemetry);
+        committer.BeforePutProbe = (attempt, target, ct) =>
+        {
+            ct.ThrowIfCancellationRequested();
+            return Task.CompletedTask;
+        };
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() =>
+            committer.CommitAsync(
+                snapshot, new DeltaAction[] { Add("part-0.parquet") }, DeltaReadScope.BlindAppend, cts.Token));
+
+        RecordingLogger<DeltaCommitter>.Entry canceled = logger.Single("DeltaCommitCanceled");
+        Assert.Equal(4010, canceled.EventId.Id);
+        Assert.Equal(LogLevel.Information, canceled.Level);
+
+        MeterCapture.Measurement count = Assert.Single(meters.ForInstrument(CountInstrument));
+        Assert.Equal(1d, count.Value);
+        Assert.Equal("cancelled", count.Tags[OutcomeKey]);
+
+        Activity activity = SingleCommitActivity(activities);
+        Assert.Equal("cancelled", activity.GetTagItem(OutcomeKey));
+        Assert.NotEqual(ActivityStatusCode.Error, activity.Status); // a cancel is not a failure
+    }
+
+    [Fact]
+    public async Task ConflictAbort_RecordsExactlyOneTerminal_NoDoubleCount()
+    {
+        // Double-count regression: the conflict abort records its terminal in-core, and the wrapper's general
+        // catch EXCLUDES DeltaConcurrentModificationException, so exactly ONE commit.count terminal is
+        // recorded (outcome=conflict) — the general catch must not add a second failure count.
+        Snapshot snapshot = await SeedAndLoadAsync();
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Metadata(id: "changed")); // aborts a blind append
+        using var telemetry = new DeltaStorageTelemetry();
+        var logger = new RecordingLogger<DeltaCommitter>();
+        using var meters = new MeterCapture(telemetry.DeltaMeter, telemetry.StorageMeter);
+
+        await Assert.ThrowsAsync<MetadataChangedException>(() =>
+            Committer(_backend, logger, telemetry)
+                .CommitAsync(snapshot, new DeltaAction[] { Add("late.parquet") }, DeltaReadScope.BlindAppend));
+
+        MeterCapture.Measurement terminal = Assert.Single(meters.ForInstrument(CountInstrument));
+        Assert.Equal(1d, terminal.Value);
+        Assert.Equal("conflict", terminal.Tags[OutcomeKey]);
+        // No stray failure terminal added by the general catch, and no DeltaCommitFailed log.
+        Assert.DoesNotContain(meters.ForInstrument(CountInstrument), m => Equals(m.Tags[OutcomeKey], "failure"));
+        Assert.False(logger.Has("DeltaCommitFailed"));
     }
 
     [Fact]
