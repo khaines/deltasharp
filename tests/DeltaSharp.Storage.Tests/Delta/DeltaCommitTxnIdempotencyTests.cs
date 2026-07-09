@@ -176,11 +176,16 @@ public sealed class DeltaCommitTxnIdempotencyTests : IDisposable
         await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Txn("stream-a", 5), DeltaTestHarness.Add("a5.parquet"));
         Snapshot snapshot = await LoadAsync(); // txn[stream-a]=5 only
 
-        await Assert.ThrowsAsync<PartialTransactionException>(() =>
+        PartialTransactionException ex = await Assert.ThrowsAsync<PartialTransactionException>(() =>
             new DeltaCommitter(_backend).CommitAsync(
                 snapshot,
                 new DeltaAction[] { Txn("stream-a", 5), Txn("stream-b", 3), Add("would-be-lost.parquet") },
                 DeltaReadScope.BlindAppend));
+
+        // The message names the covered vs uncovered transactions in the CORRECT sections (pins the
+        // committed/uncommitted partition so an inverted ternary is caught, not just that it threw).
+        Assert.Contains("already committed [stream-a@5]", ex.Message);
+        Assert.Contains("are not [stream-b@3]", ex.Message);
 
         Snapshot reloaded = await LoadAsync();
         Assert.DoesNotContain("would-be-lost.parquet", reloaded.ActiveFiles.Select(a => a.Path)); // nothing partial published

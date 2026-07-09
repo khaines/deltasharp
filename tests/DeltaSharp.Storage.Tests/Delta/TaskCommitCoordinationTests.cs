@@ -157,6 +157,22 @@ public sealed class TaskCommitCoordinationTests
     }
 
     [Fact]
+    public void NegativeAttemptNumber_CoercedToZero_TiesExplicitZero()
+    {
+        // Pins the `parsed >= 0` sign guard itself: a negative attempt is coerced to 0, so it TIES an
+        // explicit attempt 0 and both files are kept. If the guard were removed (a negative value accepted
+        // verbatim), max(-1, 0) = 0 would make the explicit-0 file the sole winner and DROP the negative one
+        // — so asserting BOTH are kept catches guard removal (which the loses-to-attempt-1 test cannot).
+        IReadOnlyList<AddFileAction> selected = TaskCommitCoordination.SelectWinningOutputs(new[]
+        {
+            Add("t0-neg.parquet", taskId: "t0", attempt: -1),
+            Add("t0-a0.parquet", taskId: "t0", attempt: 0),
+        });
+
+        Assert.Equal(new[] { "t0-a0.parquet", "t0-neg.parquet" }, Paths(selected).OrderBy(p => p).ToArray());
+    }
+
+    [Fact]
     public void MissingAttemptNumber_TreatedAsZero()
     {
         // A tagged output with no attempt number defaults to attempt 0, so an explicit attempt 1 wins.
