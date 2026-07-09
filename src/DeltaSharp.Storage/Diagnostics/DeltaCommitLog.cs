@@ -9,7 +9,9 @@ namespace DeltaSharp.Storage.Diagnostics;
 /// <see cref="EventId.Name"/> for alert triage. Levels follow §7.2.3: <c>Information</c> for commit
 /// lifecycle, <c>Debug</c> for expected retries, <c>Warning</c> for a recoverable OCC conflict (a Delta
 /// conflict is a domain outcome, <b>not</b> an unhandled runtime error), and <c>Error</c> for a
-/// contention/unknown-state/partial-transaction failure that needs remediation.
+/// contention/unknown-state/partial-transaction/hard-failure outcome that needs remediation. A
+/// <b>cancellation</b> is logged at <c>Information</c> (it is an expected control-flow outcome, not a
+/// failure).
 /// </summary>
 /// <remarks>
 /// Messages name only low-cardinality, non-sensitive values — the target/committed <b>version</b> (an
@@ -56,4 +58,12 @@ internal static partial class DeltaCommitLog
     [LoggerMessage(EventId = 4008, EventName = "DeltaCommitTransientRetry", Level = LogLevel.Debug,
         Message = "Delta commit retrying a transient storage failure (transient retry {Retry}).")]
     internal static partial void CommitTransientRetry(ILogger logger, int retry);
+
+    [LoggerMessage(EventId = 4009, EventName = "DeltaCommitFailed", Level = LogLevel.Error,
+        Message = "Delta commit failed at version {Version} after {Attempts} attempt(s): {ExceptionType} (fail-closed).")]
+    internal static partial void CommitFailed(ILogger logger, long version, int attempts, string exceptionType);
+
+    [LoggerMessage(EventId = 4010, EventName = "DeltaCommitCanceled", Level = LogLevel.Information,
+        Message = "Delta commit canceled at version {Version} after {Attempts} attempt(s); no terminal outcome was reached (not a failure).")]
+    internal static partial void CommitCanceled(ILogger logger, long version, int attempts);
 }

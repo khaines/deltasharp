@@ -34,6 +34,7 @@ public sealed class DeltaStorageTelemetryMappingTests
         Assert.Equal("contention", DeltaStorageTelemetry.ToLabel(CommitOutcome.Contention));
         Assert.Equal("unknown_state", DeltaStorageTelemetry.ToLabel(CommitOutcome.UnknownState));
         Assert.Equal("partial_transaction", DeltaStorageTelemetry.ToLabel(CommitOutcome.PartialTransaction));
+        Assert.Equal("cancelled", DeltaStorageTelemetry.ToLabel(CommitOutcome.Cancelled));
         Assert.Equal("failure", DeltaStorageTelemetry.ToLabel(CommitOutcome.Failure));
         Assert.Equal("failure", DeltaStorageTelemetry.ToLabel((CommitOutcome)999));
     }

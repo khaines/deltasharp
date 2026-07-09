@@ -39,6 +39,11 @@ internal enum CommitOutcome
 
     /// <summary>An unexpected/unclassified failure (for example an unsupported writer protocol).</summary>
     Failure,
+
+    /// <summary>The commit was cancelled via its <see cref="System.Threading.CancellationToken"/> before a
+    /// terminal outcome was reached. A cancellation is <b>not</b> a commit failure (it does not inflate the
+    /// failure SLI and does not mark the span <c>Error</c>).</summary>
+    Cancelled,
 }
 
 /// <summary>
@@ -87,12 +92,16 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     /// <summary>The <c>DeltaSharp.Storage</c> meter/source name (adapter + Parquet I/O).</summary>
     internal const string StorageName = DeltaSharpTelemetry.RootName + ".Storage";
 
-    /// <summary>The bounded <c>deltasharp.backend</c> attribute key (design §7.3 minted label).</summary>
-    internal const string BackendKey = "deltasharp.backend";
+    /// <summary>The bounded <c>deltasharp.backend</c> attribute key — re-exported from the shared vocabulary
+    /// (<see cref="DeltaSharpTelemetry.BackendKey"/>) so the storage layer and its tests bind one source of
+    /// truth (design §7.3 minted label).</summary>
+    internal const string BackendKey = DeltaSharpTelemetry.BackendKey;
 
     /// <summary>The bounded <c>deltasharp.conflict.class</c> label key sub-classifying an
-    /// <c>outcome=conflict</c> (design §7.3 minted label).</summary>
-    internal const string ConflictClassKey = "deltasharp.conflict.class";
+    /// <c>outcome=conflict</c> — re-exported from the shared vocabulary
+    /// (<see cref="DeltaSharpTelemetry.ConflictClassKey"/>) so the registry stays the single source of truth
+    /// (design §7.3 minted label).</summary>
+    internal const string ConflictClassKey = DeltaSharpTelemetry.ConflictClassKey;
 
     /// <summary>The stable commit span name (design §7.4): variables live in bounded attributes.</summary>
     internal const string CommitActivityName = DeltaName + ".Commit";
@@ -119,6 +128,7 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     private readonly Counter<long> _commitCount;
     private readonly Histogram<int> _commitAttempts;
     private readonly Counter<long> _commitConflicts;
+    private readonly Counter<long> _commitTransientRetries;
 
     internal DeltaStorageTelemetry()
     {
@@ -129,7 +139,7 @@ internal sealed class DeltaStorageTelemetry : IDisposable
 
         _commitDuration = _deltaMeter.CreateHistogram<double>(
             "deltasharp.delta.commit.duration", unit: "s",
-            description: "Wall-clock duration of a Delta commit, by terminal outcome.");
+            description: "Elapsed (monotonic) duration of a Delta commit, by terminal outcome.");
         _commitCount = _deltaMeter.CreateCounter<long>(
             "deltasharp.delta.commit.count", unit: "{commit}",
             description: "Terminal Delta commit outcomes (committed-version and failure-classification count).");
@@ -137,8 +147,11 @@ internal sealed class DeltaStorageTelemetry : IDisposable
             "deltasharp.delta.commit.attempts", unit: "{attempt}",
             description: "Optimistic-concurrency put-if-absent attempts per commit (retry depth), by outcome.");
         _commitConflicts = _deltaMeter.CreateCounter<long>(
-            "deltasharp.delta.commit.conflicts", unit: "{commit}",
+            "deltasharp.delta.commit.conflicts", unit: "{conflict}",
             description: "Detected commit conflicts (aborted or safely rebased), by conflict class.");
+        _commitTransientRetries = _deltaMeter.CreateCounter<long>(
+            "deltasharp.delta.commit.transient_retries", unit: "{retry}",
+            description: "Transient storage-failure retries within a commit's put-if-absent attempts (degradation signal).");
     }
 
     /// <summary>The <c>DeltaSharp.Delta</c> meter (commit instruments). Exposed for reference-identity
@@ -184,10 +197,21 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     }
 
     /// <summary>Increments the conflict counter for one detected conflict, tagged with the bounded
-    /// <see cref="ConflictClassKey"/> — an aborted conflict names the winner-driven class; a safely rebased
-    /// conflict uses <see cref="ConcurrentWriteClass"/>.</summary>
-    internal void RecordConflict(string conflictClass) =>
+    /// <see cref="ConflictClassKey"/>. The input is a bounded <see cref="DeltaConflictKind"/> (never a raw
+    /// string, so no unbounded/free-text value can reach the metric tag): an aborted conflict passes the
+    /// winner-driven <c>ex.Kind</c>; a safely rebased conflict passes <see langword="null"/>, which maps to
+    /// <see cref="ConcurrentWriteClass"/>.</summary>
+    internal void RecordConflict(DeltaConflictKind? kind)
+    {
+        string conflictClass = kind is { } value ? ToConflictClass(value) : ConcurrentWriteClass;
         _commitConflicts.Add(1, new KeyValuePair<string, object?>(ConflictClassKey, conflictClass));
+    }
+
+    /// <summary>Increments the transient-retry counter for one bounded transient storage-failure retry
+    /// within a commit's put-if-absent attempts (design §2.11.3). A clean commit records zero; a
+    /// transient-degraded-but-successful commit records &gt;0, so an SRE can distinguish the two even though
+    /// both terminate as <c>outcome=success</c> with <c>attempts=1</c>.</summary>
+    internal void RecordTransientRetry() => _commitTransientRetries.Add(1);
 
     /// <summary>The bounded <c>deltasharp.outcome</c> string for a <see cref="CommitOutcome"/>.</summary>
     internal static string ToLabel(CommitOutcome outcome) => outcome switch
@@ -198,6 +222,7 @@ internal sealed class DeltaStorageTelemetry : IDisposable
         CommitOutcome.Contention => "contention",
         CommitOutcome.UnknownState => "unknown_state",
         CommitOutcome.PartialTransaction => "partial_transaction",
+        CommitOutcome.Cancelled => "cancelled",
         _ => "failure",
     };
 
