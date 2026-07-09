@@ -32,7 +32,7 @@ internal enum StatisticColumnState
 
     /// <summary>The column is <b>indexed with a lower bound only</b>: a tight <c>min</c> is present but the
     /// <c>max</c> was legitimately omitted because the column's true max has no JSON-number encoding — a
-    /// <c>NaN</c> or <c>+Infinity</c> value (<c>NaN</c> is Spark's greatest value), or a truncated string.
+    /// <c>NaN</c> or <c>+Infinity</c> value (<c>NaN</c> is Spark's greatest value).
     /// The column retains one-sided skip capability for lower-bound predicates (<c>&lt;</c>/<c>&lt;=</c>,
     /// and the lower half of <c>=</c>); the upper side cannot be pruned. Advisory only — the optimizer
     /// learns the column has partial (not absent) skip capability.</summary>

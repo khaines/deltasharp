@@ -86,7 +86,7 @@ internal static class FilePruner
 
             // Per-bound skipping: min and max are consulted INDEPENDENTLY and only when present. A bound
             // omitted for an unencodable extreme — a NaN/+Infinity max (finite min kept) or a -Infinity min
-            // (finite max kept), or a truncated string max — still lets the OTHER bound prove a skip on its
+            // (finite max kept) — still lets the OTHER bound prove a skip on its
             // side, while a needed-but-absent bound merely forfeits that skip (fail-open, KEEP). Passing a
             // possibly-null bound is sound: RangeProvesNoMatch reads a null bound as "no constraint on that
             // side", so it can never manufacture a skip from a missing bound.
