@@ -231,6 +231,12 @@ internal sealed class DeltaTableWriter
         }
 
         // A prior active file is removed IFF its partition key exactly equals a touched partition key.
+        // Null-partition semantics: an active file MISSING a partition-column key (a malformed/foreign-
+        // written add — the writer's own ValidatePartitionCoverage forbids authoring one) coerces that
+        // column to null via PartitionKey, so it belongs to the null partition. It is therefore left intact
+        // by any overwrite of a non-null partition, and is removed only by an overwrite that explicitly
+        // targets the null partition — the same "absent value ≡ null/default partition" semantics Hive/Delta
+        // use, and a bounded, deterministic behavior (never the untouched-partition data loss of #486 R1).
         var priorInTouched = new List<AddFileAction>();
         foreach (AddFileAction prior in readSnapshot.ActiveFiles)
         {
