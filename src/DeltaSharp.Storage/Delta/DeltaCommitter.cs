@@ -155,13 +155,18 @@ internal sealed class DeltaCommitter
             }
         }
 
-        // Idempotency via txn (§2.11.4): if this commit records an application transaction whose version the
+        // Idempotency via txn (§2.11.4): if this commit records application transactions whose versions the
         // read snapshot already reflects (snapshot.txn[appId] >= version), the batch already committed —
         // report success without re-writing, so a streaming/micro-batch retry that re-reads a fresh snapshot
-        // (or a cross-restart retry) never duplicates rows.
-        if (TryFindAlreadyCommittedTxn(actions, readSnapshot.Transactions))
+        // (or a cross-restart retry) never duplicates rows. Idempotency is all-or-nothing for the atomic
+        // batch: skip only if EVERY txn is covered; fail closed on a partial overlap (some covered, some not)
+        // rather than silently dropping the uncommitted transactions and their data.
+        switch (ClassifyTxnCoverage(actions, readSnapshot.Transactions, out int coveredUpFront, out int totalUpFront))
         {
-            return new DeltaCommitResult(readSnapshot.Version, Attempts: 0, Skipped: true);
+            case TxnCoverage.All:
+                return new DeltaCommitResult(readSnapshot.Version, Attempts: 0, Skipped: true);
+            case TxnCoverage.Partial:
+                throw PartialTxn(coveredUpFront, totalUpFront);
         }
 
         (IReadOnlyList<DeltaAction> payload, string nonce) = BuildPayload(actions, _nonceFactory());
@@ -216,20 +221,24 @@ internal sealed class DeltaCommitter
                 return new DeltaCommitResult(ourVersion, attempt + 1);
             }
 
-            // Idempotency via txn on the conflict path (§2.11.4): if a winner already recorded this commit's
-            // application transaction (a stale-snapshot or racing retry of the same appId whose prior attempt
-            // landed — the in-memory nonce differs across attempts, so the own-commit check above misses it),
-            // succeed idempotently rather than rebasing or raising ConcurrentTransactionException.
+            // Idempotency via txn on the conflict path (§2.11.4): if the winners already recorded this
+            // commit's application transactions (a stale-snapshot or racing retry of the same appId whose
+            // prior attempt landed — the in-memory nonce differs across attempts, so the own-commit check
+            // above misses it), succeed idempotently rather than rebasing or raising ConcurrentTransactionException.
             //
             // DIVERGENCE (intentional): stock Delta fails a same-appId conflict LOUD with
             // ConcurrentTransactionException even when the winner is this appId's OWN prior landed attempt.
             // DeltaSharp instead treats a covering winner (txnState[appId] >= our version) as proof our batch
             // already committed and skips — strictly more robust for a lost-ack / stale-snapshot retry, which
             // is the exact failure a txn idempotency key exists to absorb. A NON-covering same-appId winner
-            // (a genuine concurrent writer, lower version) does NOT match here and still fails loud below.
-            if (TryFindAlreadyCommittedTxn(actions, TxnStateOf(winners)))
+            // (a genuine concurrent writer, lower version) does NOT match and still fails loud below. All-or-
+            // nothing: a partial overlap fails closed (never a silent drop of the uncommitted transactions).
+            switch (ClassifyTxnCoverage(actions, TxnStateOf(winners), out int coveredOnConflict, out int totalOnConflict))
             {
-                return new DeltaCommitResult(latest, attempt + 1, Skipped: true);
+                case TxnCoverage.All:
+                    return new DeltaCommitResult(latest, attempt + 1, Skipped: true);
+                case TxnCoverage.Partial:
+                    throw PartialTxn(coveredOnConflict, totalOnConflict);
             }
 
             DeltaConflictChecker.Check(actions, readScope, winners); // throws on a logical conflict
@@ -396,32 +405,55 @@ internal sealed class DeltaCommitter
         return false;
     }
 
-    /// <summary>Whether any application transaction in <paramref name="actions"/> is <b>already committed</b>
-    /// per <paramref name="txnState"/> (appId → last committed version): a <c>txn{appId, version}</c> whose
-    /// <paramref name="txnState"/>[appId] ≥ version means the batch already landed and must be idempotently
-    /// skipped (§2.11.4). A commit normally carries a single <c>txn</c>; if it carries several, any
-    /// already-committed one marks the batch a duplicate.
-    /// <para><b>Caveat (atomic-batch assumption):</b> a match skips the <b>entire</b> commit, including any
-    /// sibling actions bundled with the transaction. This is correct for the streaming/micro-batch model a
-    /// <c>txn</c> is designed for — the batch's <c>txn</c> and its <c>add</c>s are one atomic unit, so an
-    /// already-committed <c>txn</c> means the whole batch already landed. Callers must therefore not bundle
-    /// unrelated non-idempotent actions under an already-committed idempotency key; the <c>txn</c> is the
-    /// commit's idempotency identity, not a per-action one.</para></summary>
-    private static bool TryFindAlreadyCommittedTxn(
-        IReadOnlyList<DeltaAction> actions, ImmutableSortedDictionary<string, long> txnState)
+    /// <summary>How a commit's application transactions (<c>txn</c>) relate to what is already committed
+    /// (design §2.11.4): <see cref="None"/> — no <c>txn</c>, or none already committed (proceed);
+    /// <see cref="All"/> — every <c>txn</c> already committed (idempotent skip); <see cref="Partial"/> —
+    /// some committed and some not (an inconsistent atomic batch — fail closed).</summary>
+    private enum TxnCoverage
     {
+        None,
+        All,
+        Partial,
+    }
+
+    /// <summary>Classifies whether this commit's application transactions are already committed per
+    /// <paramref name="txnState"/> (appId → last committed version). Idempotency for the atomic batch is
+    /// all-or-nothing: a <c>txn{appId, version}</c> is covered iff <paramref name="txnState"/>[appId] ≥
+    /// version. <see cref="TxnCoverage.All"/> ⇒ the whole batch already landed (skip); <see cref="TxnCoverage.None"/>
+    /// ⇒ proceed; <see cref="TxnCoverage.Partial"/> ⇒ the batch mixes committed and uncommitted transactions
+    /// and cannot be idempotently resolved (§2.11.4) — the caller must not bundle unrelated/non-monotonic
+    /// transactions into one commit. A normal single-<c>txn</c> commit only ever yields None or All.</summary>
+    private static TxnCoverage ClassifyTxnCoverage(
+        IReadOnlyList<DeltaAction> actions, ImmutableSortedDictionary<string, long> txnState,
+        out int covered, out int total)
+    {
+        total = 0;
+        covered = 0;
         foreach (DeltaAction action in actions)
         {
-            if (action is TxnAction txn
-                && txnState.TryGetValue(txn.AppId, out long committedVersion)
-                && committedVersion >= txn.Version)
+            if (action is TxnAction txn)
             {
-                return true;
+                total++;
+                if (txnState.TryGetValue(txn.AppId, out long committedVersion) && committedVersion >= txn.Version)
+                {
+                    covered++;
+                }
             }
         }
 
-        return false;
+        if (covered == 0)
+        {
+            return TxnCoverage.None; // no txn at all, or none already committed.
+        }
+
+        return covered == total ? TxnCoverage.All : TxnCoverage.Partial;
     }
+
+    private static PartialTransactionException PartialTxn(int covered, int total) =>
+        new($"This commit carries {total} application transactions of which {covered} are already committed; "
+            + "idempotency for an atomic batch is all-or-nothing, so a partially-committed batch is failed "
+            + "closed rather than skipped (which would drop the uncommitted transactions and their data). "
+            + "Do not bundle unrelated or non-monotonic application transactions into a single commit (§2.11.4).");
 
     /// <summary>Builds the per-appId last-committed transaction version map from a set of winning commit
     /// actions (appId → max version), so the conflict path can recognize an already-recorded transaction.</summary>

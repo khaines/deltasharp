@@ -145,6 +145,64 @@ public sealed class DeltaCommitTxnIdempotencyTests : IDisposable
     }
 
     [Fact]
+    public async Task MultiTxnBatch_AllCovered_SkipsIdempotently()
+    {
+        // All-or-nothing: a batch carrying several txns is idempotently skipped only when EVERY txn is
+        // already committed. Here both stream-a@5 and stream-b@3 already landed, so the retry skips.
+        await SeedAsync();
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Txn("stream-a", 5), DeltaTestHarness.Add("a5.parquet"));
+        await DeltaTestHarness.WriteCommitAsync(_backend, 2, DeltaTestHarness.Txn("stream-b", 3), DeltaTestHarness.Add("b3.parquet"));
+        Snapshot snapshot = await LoadAsync(); // txn[stream-a]=5, txn[stream-b]=3
+
+        DeltaCommitResult result = await new DeltaCommitter(_backend).CommitAsync(
+            snapshot,
+            new DeltaAction[] { Txn("stream-a", 5), Txn("stream-b", 3), Add("retry.parquet") },
+            DeltaReadScope.BlindAppend);
+
+        Assert.True(result.Skipped);
+        Snapshot reloaded = await LoadAsync();
+        Assert.Equal(2L, reloaded.Version); // nothing new published
+        Assert.DoesNotContain("retry.parquet", reloaded.ActiveFiles.Select(a => a.Path));
+    }
+
+    [Fact]
+    public async Task MultiTxnBatch_PartiallyCovered_FailsClosed_NoSilentDrop()
+    {
+        // A multi-txn batch where only SOME txns are already committed is an inconsistent atomic batch: it
+        // must fail closed with PartialTransactionException rather than skip (which would silently drop the
+        // uncommitted txn + its data) or double-commit the covered one. stream-a@5 is committed; stream-b@3
+        // is not — so the batch [txn a@5, txn b@3, add] is refused, not skipped.
+        await SeedAsync();
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Txn("stream-a", 5), DeltaTestHarness.Add("a5.parquet"));
+        Snapshot snapshot = await LoadAsync(); // txn[stream-a]=5 only
+
+        await Assert.ThrowsAsync<PartialTransactionException>(() =>
+            new DeltaCommitter(_backend).CommitAsync(
+                snapshot,
+                new DeltaAction[] { Txn("stream-a", 5), Txn("stream-b", 3), Add("would-be-lost.parquet") },
+                DeltaReadScope.BlindAppend));
+
+        Snapshot reloaded = await LoadAsync();
+        Assert.DoesNotContain("would-be-lost.parquet", reloaded.ActiveFiles.Select(a => a.Path)); // nothing partial published
+    }
+
+    [Fact]
+    public async Task MultiTxnBatch_PartiallyCovered_OnConflictPath_FailsClosed()
+    {
+        // Same all-or-nothing guarantee on the conflict path: a stale-snapshot batch loses the race, and the
+        // winners cover only ONE of its two txns — it must fail closed, never skip-and-drop the other.
+        await SeedAsync();
+        Snapshot stale = await LoadAsync(); // v0
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Txn("stream-a", 5), DeltaTestHarness.Add("a5.parquet"));
+
+        await Assert.ThrowsAsync<PartialTransactionException>(() =>
+            new DeltaCommitter(_backend).CommitAsync(
+                stale,
+                new DeltaAction[] { Txn("stream-a", 5), Txn("stream-b", 3), Add("would-be-lost.parquet") },
+                DeltaReadScope.BlindAppend));
+    }
+
+    [Fact]
     public async Task CommitWithoutTxn_IsNeverSkipped()
     {
         // A plain append with no txn has no idempotency key and always commits.

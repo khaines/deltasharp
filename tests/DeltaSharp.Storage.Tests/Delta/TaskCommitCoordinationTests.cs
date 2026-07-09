@@ -29,6 +29,16 @@ public sealed class TaskCommitCoordinationTests
         return new AddFileAction(path, NoPartition, 1L, 1L, DataChange: true, Stats: null, Tags: tags.ToImmutable());
     }
 
+    // A task output whose delta.attemptNumber tag is an arbitrary raw string (to exercise the parse path
+    // with malformed / non-numeric values).
+    private static AddFileAction AddRawAttempt(string path, string taskId, string rawAttempt)
+    {
+        var tags = ImmutableSortedDictionary.CreateBuilder<string, string>(StringComparer.Ordinal);
+        tags[TaskCommitCoordination.TaskIdTag] = taskId;
+        tags[TaskCommitCoordination.AttemptNumberTag] = rawAttempt;
+        return new AddFileAction(path, NoPartition, 1L, 1L, DataChange: true, Stats: null, Tags: tags.ToImmutable());
+    }
+
     private static string[] Paths(IReadOnlyList<AddFileAction> adds) => adds.Select(a => a.Path).ToArray();
 
     [Fact]
@@ -114,6 +124,34 @@ public sealed class TaskCommitCoordinationTests
         Assert.Equal(
             new[] { "z-plain.parquet", "t1-a2.parquet", "t0-a1.parquet", "a-plain.parquet" },
             Paths(selected));
+    }
+
+    [Fact]
+    public void UnparseableAttemptNumber_TreatedAsZero()
+    {
+        // A malformed (non-numeric) delta.attemptNumber defaults to attempt 0, so it ties an explicit
+        // attempt 0 (both are the winning attempt) and both files are kept — pins the parse-failure branch.
+        IReadOnlyList<AddFileAction> selected = TaskCommitCoordination.SelectWinningOutputs(new[]
+        {
+            AddRawAttempt("t0-garbage.parquet", taskId: "t0", rawAttempt: "not-a-number"),
+            Add("t0-a0.parquet", taskId: "t0", attempt: 0),
+        });
+
+        Assert.Equal(new[] { "t0-a0.parquet", "t0-garbage.parquet" }, Paths(selected).OrderBy(p => p).ToArray());
+    }
+
+    [Fact]
+    public void NegativeAttemptNumber_TreatedAsZero()
+    {
+        // A negative attempt number is rejected (guard `parsed >= 0`) and coerced to attempt 0 — it ties an
+        // explicit attempt 0, so both are kept. Documents the coercion contract for malformed negative tags.
+        IReadOnlyList<AddFileAction> selected = TaskCommitCoordination.SelectWinningOutputs(new[]
+        {
+            Add("t0-neg.parquet", taskId: "t0", attempt: -1),
+            Add("t0-a0.parquet", taskId: "t0", attempt: 0),
+        });
+
+        Assert.Equal(new[] { "t0-a0.parquet", "t0-neg.parquet" }, Paths(selected).OrderBy(p => p).ToArray());
     }
 
     [Fact]

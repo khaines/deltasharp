@@ -96,8 +96,26 @@ internal sealed class ConcurrentTransactionException : DeltaConcurrentModificati
 }
 
 /// <summary>
+/// A single atomic commit carried <b>multiple</b> application transactions (<c>txn{appId,version}</c>) whose
+/// idempotency state is <b>inconsistent</b>: some are already committed and some are not (design §2.11.4).
+/// Idempotency for an atomic batch is all-or-nothing — either the whole batch already landed (every <c>txn</c>
+/// covered ⇒ idempotent skip) or none of it did (proceed). A <b>partial</b> overlap cannot be resolved
+/// without either silently dropping the uncommitted work or double-committing the committed work, so the
+/// commit is <b>failed closed</b> rather than skipped. This signals caller misuse — bundling several
+/// application transactions with divergent, non-monotonic versions into one commit, or reusing an
+/// <c>appId</c> across unrelated writers — and is <b>non-retryable</b> as-is: the caller must reconcile the
+/// batch (a normal single-<c>txn</c> streaming commit never hits this path).
+/// </summary>
+internal sealed class PartialTransactionException : Exception
+{
+    public PartialTransactionException(string message)
+        : base(message)
+    {
+    }
+}
+
+/// <summary>
 /// The commit outcome could <b>not</b> be resolved to committed-or-not (design §2.11.3 "ambiguous success"
-/// that recovery could not classify, §2.11.6). Raised only after the writer re-read <c>&lt;N&gt;.json</c>
 /// and still could not prove whether its own commit landed — never a silent success or a blind retry that
 /// could double-commit. This is a <b>non-retryable, precise unknown-state</b> error (STORY-05.3.1 AC4): the
 /// caller must reconcile out of band, not guess.
