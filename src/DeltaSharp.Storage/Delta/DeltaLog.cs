@@ -18,6 +18,14 @@ namespace DeltaSharp.Storage.Delta;
 /// JSON replay from version 0</b> (design §2.10.3, STORY-05.2.2 AC2) — the reconstructed state is
 /// identical either way (checkpoint-vs-JSON-replay parity, AC3). V2/UUID checkpoints are skipped here and
 /// gated by protocol negotiation (§2.10.5).</para>
+///
+/// <para><b>Time travel (STORY-05.4.1, design §2.12.1).</b> <see cref="LoadSnapshotAsync(long?, CancellationToken)"/>
+/// reconstructs the state at an <b>exact version</b> (<c>versionAsOf</c>); <see cref="LoadSnapshotAsOfTimestampAsync"/>
+/// resolves a <b>timestamp</b> (<c>timestampAsOf</c>) to the latest version whose commit timestamp is at or
+/// before it and reports the resolved version. Both fail closed on a target older than the earliest retained
+/// log (<see cref="DeltaProtocolErrorKind.RetentionGap"/>) rather than returning current data, and both bound
+/// checkpoint selection to <c>≤ target</c> so a <b>later</b> checkpoint/commit can never mutate historical
+/// state (AC4).</para>
 /// </summary>
 internal sealed class DeltaLog
 {
@@ -49,30 +57,177 @@ internal sealed class DeltaLog
     }
 
     /// <summary>
-    /// Loads the snapshot at <paramref name="version"/> (default: the latest committed version).
+    /// Loads the snapshot at <paramref name="version"/> (default: the latest committed version) —
+    /// Spark-parity <c>versionAsOf</c> time travel (design §2.12.1; STORY-05.4.1 AC1).
     /// </summary>
     /// <exception cref="DeltaProtocolException">The log is empty (not a Delta table), the requested
-    /// version does not exist, the version chain has a gap, a commit is malformed, or the reconstructed
-    /// state is missing a protocol/metaData action.</exception>
+    /// version is out of the <c>[0, latest]</c> range, the version chain has a gap, a commit is malformed,
+    /// or the reconstructed state is missing a protocol/metaData action
+    /// (<see cref="DeltaProtocolErrorKind.InconsistentLog"/>); or the requested version is below the earliest
+    /// retained version because its log files were removed by log cleanup
+    /// (<see cref="DeltaProtocolErrorKind.RetentionGap"/>, AC3).</exception>
     public async Task<Snapshot> LoadSnapshotAsync(long? version = null, CancellationToken cancellationToken = default)
     {
         long start = Stopwatch.GetTimestamp();
         LogListing listing = await ListLogAsync(cancellationToken).ConfigureAwait(false);
+        long latest = RequireLatest(listing);
+        long target = ResolveExplicitVersionTarget(listing, latest, version);
+        return await ReconstructAsync(listing, target, start, cancellationToken).ConfigureAwait(false);
+    }
 
-        if (listing.LatestVersion is not { } latest)
+    /// <summary>
+    /// Loads the snapshot as of <paramref name="asOf"/> — Spark-parity <c>timestampAsOf</c> time travel
+    /// (design §2.12.1; STORY-05.4.1 AC2) — resolving the timestamp to a version and reporting it in the
+    /// returned <see cref="TimeTravelResult"/>.
+    ///
+    /// <para><b>Resolution rule (Delta parity).</b> The selected version is the <b>latest</b> version whose
+    /// effective commit timestamp is at or before <paramref name="asOf"/>. The commit timestamp for version
+    /// <c>N</c> is the modification time of its <c>&lt;N&gt;.json</c> object
+    /// (<see cref="StorageObjectInfo.LastModifiedUtc"/> from <see cref="IStorageBackend.ListAsync"/>),
+    /// adjusted to be <b>strictly monotonic</b> — <c>eff(N) = max(mtime(N), eff(N-1) + 1ms)</c> — so equal or
+    /// out-of-order file mtimes still resolve deterministically. This mirrors Delta's
+    /// <c>DeltaHistoryManager.getActiveCommitAtTime</c> (which lists the delta files, adjusts monotonically,
+    /// and picks the last commit ≤ the timestamp). Timestamps are compared in UTC.</para>
+    ///
+    /// <para>An <paramref name="asOf"/> before the earliest retained commit's effective timestamp fails
+    /// closed with <see cref="DeltaProtocolErrorKind.RetentionGap"/> (AC3) rather than returning the earliest
+    /// state; an <paramref name="asOf"/> at or after the latest commit resolves to the latest version.</para>
+    /// </summary>
+    /// <exception cref="DeltaProtocolException">The log is empty (not a Delta table); the timestamp predates
+    /// the earliest retained commit (<see cref="DeltaProtocolErrorKind.RetentionGap"/>, AC3); or the resolved
+    /// version cannot be reconstructed (malformed/gap/missing protocol — <see cref="DeltaProtocolErrorKind.InconsistentLog"/>).</exception>
+    public async Task<TimeTravelResult> LoadSnapshotAsOfTimestampAsync(
+        DateTimeOffset asOf, CancellationToken cancellationToken = default)
+    {
+        long start = Stopwatch.GetTimestamp();
+        LogListing listing = await ListLogAsync(cancellationToken).ConfigureAwait(false);
+        _ = RequireLatest(listing);
+        long resolved = ResolveTimestampTarget(listing, asOf);
+        Snapshot snapshot = await ReconstructAsync(listing, resolved, start, cancellationToken).ConfigureAwait(false);
+        return new TimeTravelResult(snapshot, resolved);
+    }
+
+    /// <summary>The latest reconstructable version, or a fail-closed "not a Delta table" error when the log
+    /// has no commits or checkpoints.</summary>
+    private static long RequireLatest(LogListing listing) =>
+        listing.LatestVersion
+        ?? throw DeltaProtocolException.Inconsistent(
+            "No Delta commit files or checkpoints were found under _delta_log; the path is not a Delta table.");
+
+    /// <summary>Validates and resolves an explicit <c>versionAsOf</c> request against the discovered log:
+    /// <see langword="null"/> ⇒ latest; a negative version or one <b>above</b> <paramref name="latest"/> is
+    /// an out-of-range error; a version <b>below</b> the earliest retained version is a retention gap (AC3).</summary>
+    private static long ResolveExplicitVersionTarget(LogListing listing, long latest, long? version)
+    {
+        if (version is not { } requested)
         {
-            throw DeltaProtocolException.Inconsistent(
-                "No Delta commit files or checkpoints were found under _delta_log; the path is not a Delta table.");
+            return latest;
         }
 
-        long target = version ?? latest;
-        if (version is { } requested && (requested < 0 || requested > latest))
+        if (requested < 0 || requested > latest)
         {
             throw DeltaProtocolException.Inconsistent(string.Create(
                 CultureInfo.InvariantCulture,
                 $"Requested Delta version {requested} does not exist; the table has versions 0 through {latest}."));
         }
 
+        long earliest = EarliestReconstructableVersion(listing);
+        if (requested < earliest)
+        {
+            throw DeltaProtocolException.VersionNoLongerRetained(requested, earliest);
+        }
+
+        return requested;
+    }
+
+    /// <summary>Resolves a <c>timestampAsOf</c> request to the latest version whose <b>effective</b> commit
+    /// timestamp (monotonic-adjusted <c>&lt;N&gt;.json</c> mtime) is at or before <paramref name="asOf"/>.
+    /// Candidates are the retained commit files at or above the earliest reconstructable version, so the
+    /// resolved version is always reconstructable. A timestamp before the earliest candidate fails closed
+    /// with a retention gap (AC3); the effective timestamps are strictly increasing so the last qualifying
+    /// version is the answer.</summary>
+    private static long ResolveTimestampTarget(LogListing listing, DateTimeOffset asOf)
+    {
+        long floor = EarliestReconstructableVersion(listing);
+        long[] candidates = listing.Commits.Where(v => v >= floor).OrderBy(v => v).ToArray();
+        if (candidates.Length == 0)
+        {
+            throw DeltaProtocolException.RetentionGap(
+                "No retained Delta commit files carry a timestamp; timestamp time travel is unavailable "
+                + "(the JSON commits required to resolve a timestamp were removed by log cleanup).");
+        }
+
+        long asOfMillis = asOf.ToUnixTimeMilliseconds();
+        long resolved = -1;
+        long effectivePrevious = long.MinValue;
+        long earliestEffective = 0;
+        for (int i = 0; i < candidates.Length; i++)
+        {
+            long v = candidates[i];
+            long mtime = ToEpochMillis(listing.CommitTimestamps[v]);
+            // Delta monotonicity: force each commit strictly later than its predecessor so equal / out-of-order
+            // file mtimes still yield a deterministic, strictly-increasing timeline.
+            long effective = i == 0 ? mtime : Math.Max(mtime, effectivePrevious + 1);
+            if (i == 0)
+            {
+                earliestEffective = effective;
+            }
+
+            if (effective > asOfMillis)
+            {
+                // Effective timestamps are strictly increasing, so no later version can qualify either.
+                break;
+            }
+
+            resolved = v;
+            effectivePrevious = effective;
+        }
+
+        if (resolved < 0)
+        {
+            throw DeltaProtocolException.TimestampBeforeRetention(
+                asOf, candidates[0], DateTimeOffset.FromUnixTimeMilliseconds(earliestEffective));
+        }
+
+        return resolved;
+    }
+
+    /// <summary>The earliest version whose snapshot can still be reconstructed from the retained log: version
+    /// <c>0</c> when its commit survives, else the oldest complete classic checkpoint (a self-contained seed).
+    /// Below this floor the required <c>&lt;N&gt;.json</c>/checkpoints were log-cleaned, so a request there is a
+    /// retention gap (AC3) rather than a silent fallback to current data.</summary>
+    private static long EarliestReconstructableVersion(LogListing listing)
+    {
+        if (listing.Commits.Contains(0))
+        {
+            return 0;
+        }
+
+        long? earliestCheckpoint = null;
+        foreach (KeyValuePair<long, CheckpointGroup> entry in listing.Checkpoints)
+        {
+            if (entry.Value.IsComplete)
+            {
+                earliestCheckpoint = earliestCheckpoint is { } current ? Math.Min(current, entry.Key) : entry.Key;
+            }
+        }
+
+        if (earliestCheckpoint is { } checkpoint)
+        {
+            return checkpoint;
+        }
+
+        // No surviving version 0 and no complete checkpoint: nothing below the earliest present commit is
+        // reconstructable. Use it as the floor; reconstruction fails closed (gap) if the log is truly broken.
+        return listing.Commits.Count > 0 ? listing.Commits.Min : (listing.LatestVersion ?? 0);
+    }
+
+    /// <summary>Reconstructs the immutable snapshot at <paramref name="target"/>: seed from the newest usable
+    /// checkpoint <c>≤ target</c> (never a later one — AC4), replay JSON commits up to <paramref name="target"/>,
+    /// materialize, and fail closed on an unsupported protocol before serving.</summary>
+    private async Task<Snapshot> ReconstructAsync(
+        LogListing listing, long target, long startTimestamp, CancellationToken cancellationToken)
+    {
         IReadOnlyList<CheckpointSelection> checkpoints =
             await SelectCheckpointsAsync(listing, target, cancellationToken).ConfigureAwait(false);
 
@@ -101,7 +256,7 @@ internal sealed class DeltaLog
             CheckpointVersion: checkpointVersion,
             ReplayedCommitCount: replayed,
             ActiveFileCount: 0,
-            LoadDuration: Stopwatch.GetElapsedTime(start));
+            LoadDuration: Stopwatch.GetElapsedTime(startTimestamp));
 
         Snapshot snapshot = state.ToSnapshot(target, metrics);
 
@@ -247,6 +402,7 @@ internal sealed class DeltaLog
     private async Task<LogListing> ListLogAsync(CancellationToken cancellationToken)
     {
         var commits = new SortedSet<long>();
+        var commitTimestamps = new Dictionary<long, DateTime>();
         var checkpoints = new Dictionary<long, CheckpointGroup>();
         long? latest = null;
         bool hasHint = false;
@@ -265,6 +421,9 @@ internal sealed class DeltaLog
             {
                 case DeltaLogFileKind.Commit:
                     commits.Add(file.Version);
+                    // The <N>.json object modification time is the commit-timestamp source for timestamp
+                    // time travel (design §2.12.1); capture it here where the listing is the single I/O pass.
+                    commitTimestamps[file.Version] = info.LastModifiedUtc;
                     latest = Max(latest, file.Version);
                     break;
 
@@ -290,11 +449,16 @@ internal sealed class DeltaLog
             }
         }
 
-        return new LogListing(commits, checkpoints, latest, hasHint);
+        return new LogListing(commits, commitTimestamps, checkpoints, latest, hasHint);
     }
 
     private static long? Max(long? current, long candidate) =>
         current is { } value ? Math.Max(value, candidate) : candidate;
+
+    /// <summary>The UTC modification time of a <c>&lt;N&gt;.json</c> object as Delta epoch milliseconds — the
+    /// unit timestamp resolution and the monotonicity adjustment work in (mirrors VACUUM's stamping).</summary>
+    private static long ToEpochMillis(DateTime lastModifiedUtc) =>
+        new DateTimeOffset(DateTime.SpecifyKind(lastModifiedUtc, DateTimeKind.Utc)).ToUnixTimeMilliseconds();
 
     private async Task<ReadOnlyMemory<byte>> ReadAllAsync(string path, CancellationToken cancellationToken)
     {
@@ -378,10 +542,12 @@ internal sealed class DeltaLog
     /// <summary>A resolved checkpoint to seed from: its <see cref="Version"/> and ordered part paths.</summary>
     private sealed record CheckpointSelection(long Version, IReadOnlyList<string> PartPaths);
 
-    /// <summary>The discovered <c>_delta_log</c> contents: commit versions, classic checkpoint groups, the
-    /// latest reconstructable version, and whether a <c>_last_checkpoint</c> hint is present.</summary>
+    /// <summary>The discovered <c>_delta_log</c> contents: commit versions, each commit object's modification
+    /// time (the timestamp-time-travel source, design §2.12.1), classic checkpoint groups, the latest
+    /// reconstructable version, and whether a <c>_last_checkpoint</c> hint is present.</summary>
     private sealed record LogListing(
         SortedSet<long> Commits,
+        IReadOnlyDictionary<long, DateTime> CommitTimestamps,
         Dictionary<long, CheckpointGroup> Checkpoints,
         long? LatestVersion,
         bool HasHint);
