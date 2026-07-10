@@ -17,27 +17,26 @@ internal static class FilePruner
         ArgumentNullException.ThrowIfNull(request);
 
         ImmutableArray<AddFileAction>.Builder candidates = ImmutableArray.CreateBuilder<AddFileAction>();
-        int prunedByPartition = 0;
-        int prunedByStatistics = 0;
+        ImmutableArray<SkippedFile>.Builder skipped = ImmutableArray.CreateBuilder<SkippedFile>();
 
         foreach (AddFileAction file in files)
         {
             if (PartitionExcludes(file, request.PartitionFilters))
             {
-                prunedByPartition++;
+                skipped.Add(new SkippedFile(file, FileSkipReason.PartitionMismatch));
                 continue;
             }
 
             if (StatisticsExclude(file, request.DataFilters))
             {
-                prunedByStatistics++;
+                skipped.Add(new SkippedFile(file, FileSkipReason.StatisticsDisjoint));
                 continue;
             }
 
             candidates.Add(file);
         }
 
-        return new FilePruningResult(candidates.ToImmutable(), files.Length, prunedByPartition, prunedByStatistics);
+        return new FilePruningResult(candidates.ToImmutable(), files.Length, skipped.ToImmutable());
     }
 
     /// <summary>True only if a partition filter proves this file's partition cannot match (its exact,
@@ -71,21 +70,30 @@ internal static class FilePruner
 
         foreach (ColumnRangeFilter filter in filters)
         {
-            // An all-null column cannot satisfy any concrete comparison (NULL is never <, >, or =).
+            // An all-null column cannot satisfy any concrete comparison (NULL is never <, >, or =). This
+            // skip (and the SnapshotStatistics AbsentAllNull equivalent) is sound ONLY while nullCount and
+            // numRecords are EXACT counts; revisit when deletion vectors, which over-count, land.
             if (stats.NumRecords is { } rows && rows > 0
                 && stats.NullCount.TryGetValue(filter.Column, out long nulls) && nulls == rows)
             {
                 return true;
             }
 
-            if (!boundsUsable
-                || !stats.MinValues.TryGetValue(filter.Column, out DeltaStatValue? min)
-                || !stats.MaxValues.TryGetValue(filter.Column, out DeltaStatValue? max))
+            if (!boundsUsable)
             {
                 continue;
             }
 
-            if (!MightMatch(filter.Op, min, max, filter.Value))
+            // Per-bound skipping: min and max are consulted INDEPENDENTLY and only when present. A bound
+            // omitted for an unencodable extreme — a NaN/+Infinity max (finite min kept) or a -Infinity min
+            // (finite max kept) — still lets the OTHER bound prove a skip on its
+            // side, while a needed-but-absent bound merely forfeits that skip (fail-open, KEEP). Passing a
+            // possibly-null bound is sound: RangeProvesNoMatch reads a null bound as "no constraint on that
+            // side", so it can never manufacture a skip from a missing bound.
+            stats.MinValues.TryGetValue(filter.Column, out DeltaStatValue? min);
+            stats.MaxValues.TryGetValue(filter.Column, out DeltaStatValue? max);
+
+            if (RangeProvesNoMatch(filter.Op, min, max, filter.Value))
             {
                 return true;
             }
@@ -95,27 +103,54 @@ internal static class FilePruner
     }
 
     /// <summary>
-    /// Whether <c>column OP value</c> <b>might</b> be satisfied by some value in the closed range
-    /// <c>[min, max]</c>. Conservative: returns <see langword="true"/> (keep the file) whenever the values
-    /// cannot be compared (mismatched or non-numeric statistic kinds), so pruning stays sound; only a
-    /// provably-disjoint range returns <see langword="false"/>.
+    /// Whether the present per-file bounds <b>prove</b> that no non-null value can satisfy
+    /// <c>column OP value</c>, so the file may be soundly skipped. Each bound is used <b>independently</b>
+    /// and only when present, so a file that carries just one bound (its counterpart omitted for a
+    /// NaN/±Infinity extreme) is still prunable on the side it does have:
+    /// <list type="bullet">
+    /// <item><c>&lt;</c> / <c>&lt;=</c> use only <c>min</c>: skip iff every value is at/above
+    /// <paramref name="value"/> (<c>min &gt;= value</c> for <c>&lt;</c>, <c>min &gt; value</c> for
+    /// <c>&lt;=</c>).</item>
+    /// <item><c>&gt;</c> / <c>&gt;=</c> use only <c>max</c>: skip iff every value is at/below
+    /// <paramref name="value"/> (<c>max &lt;= value</c> for <c>&gt;</c>, <c>max &lt; value</c> for
+    /// <c>&gt;=</c>).</item>
+    /// <item><c>=</c> uses either bound: skip iff <paramref name="value"/> is below <c>min</c> or above
+    /// <c>max</c> — either alone proves the equality cannot hold.</item>
+    /// </list>
+    /// Conservative on every other axis: an absent needed bound, a non-numeric
+    /// (<see cref="DeltaStatKind.String"/>/<see cref="DeltaStatKind.Boolean"/>) bound, or any un-comparable
+    /// kind yields <see langword="false"/> (keep) — pruning only ever forfeits an opportunity, never drops a
+    /// matching row. Because <c>NaN</c> is Spark's <i>greatest</i> value its column omits <c>max</c>, so
+    /// <c>&gt;</c>/<c>&gt;=</c>/<c>=</c> against a finite literal correctly keep the file (the <c>NaN</c> row
+    /// may match), while <c>&lt;</c>/<c>&lt;=</c> can still skip via the surviving finite <c>min</c>.
     /// </summary>
-    private static bool MightMatch(DeltaPredicateOp op, DeltaStatValue min, DeltaStatValue max, DeltaStatValue value)
+    private static bool RangeProvesNoMatch(DeltaPredicateOp op, DeltaStatValue? min, DeltaStatValue? max, DeltaStatValue value)
     {
-        if (!TryCompare(value, min, out int vsMin) || !TryCompare(value, max, out int vsMax))
+        switch (op)
         {
-            return true;
-        }
+            case DeltaPredicateOp.LessThan:
+                // Matches iff some value < X ⟺ min < X. Skip iff min present and min >= X (X <= min).
+                return min is not null && TryCompare(value, min, out int lt) && lt <= 0;
+            case DeltaPredicateOp.LessThanOrEqual:
+                // Matches iff min <= X. Skip iff min present and min > X (X < min).
+                return min is not null && TryCompare(value, min, out int le) && le < 0;
+            case DeltaPredicateOp.GreaterThan:
+                // Matches iff some value > X ⟺ max > X. Skip iff max present and max <= X (X >= max).
+                return max is not null && TryCompare(value, max, out int gt) && gt >= 0;
+            case DeltaPredicateOp.GreaterThanOrEqual:
+                // Matches iff max >= X. Skip iff max present and max < X (X > max).
+                return max is not null && TryCompare(value, max, out int ge) && ge > 0;
+            case DeltaPredicateOp.Equal:
+                // Matches iff min <= X <= max. Either bound alone can prove a skip: X below min or above max.
+                if (min is not null && TryCompare(value, min, out int eqMin) && eqMin < 0)
+                {
+                    return true; // X < min
+                }
 
-        return op switch
-        {
-            DeltaPredicateOp.Equal => vsMin >= 0 && vsMax <= 0,        // min <= value <= max
-            DeltaPredicateOp.LessThan => vsMin > 0,                    // min < value
-            DeltaPredicateOp.LessThanOrEqual => vsMin >= 0,            // min <= value
-            DeltaPredicateOp.GreaterThan => vsMax < 0,                 // value < max
-            DeltaPredicateOp.GreaterThanOrEqual => vsMax <= 0,         // value <= max
-            _ => true,
-        };
+                return max is not null && TryCompare(value, max, out int eqMax) && eqMax > 0; // X > max
+            default:
+                return false;
+        }
     }
 
     /// <summary>Numerically compares two statistic values, returning <see langword="false"/> unless both are
