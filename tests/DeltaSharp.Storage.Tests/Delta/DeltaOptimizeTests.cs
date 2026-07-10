@@ -1,8 +1,10 @@
 using System.Collections.Immutable;
+using System.Security.Cryptography;
 using System.Text;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
+using DeltaSharp.Storage.Diagnostics;
 using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Types;
 using Xunit;
@@ -47,6 +49,15 @@ public sealed class DeltaOptimizeTests : IDisposable
         new StructField("region", DataTypes.StringType, nullable: true),
         new StructField("id", DataTypes.LongType, nullable: false),
         new StructField("value", DataTypes.StringType, nullable: true),
+    });
+
+    // The DATA schema after an additive schema evolution (#190) adds an "extra" column: files written under
+    // DataSchema ([id,value]) are physically narrower than this, so OPTIMIZE must fail closed (#497).
+    private static readonly StructType EvolvedSchema = new(new[]
+    {
+        new StructField("id", DataTypes.LongType, nullable: false),
+        new StructField("value", DataTypes.StringType, nullable: true),
+        new StructField("extra", DataTypes.StringType, nullable: true),
     });
 
     private static readonly ImmutableSortedDictionary<string, string?> NoPartition =
@@ -342,24 +353,367 @@ public sealed class DeltaOptimizeTests : IDisposable
         Assert.Null(result.CommittedVersion);
         Assert.Equal(2, result.FilesRemoved);
         Assert.Equal(1, result.FilesAdded);
-        Assert.Equal(2, result.RowCount); // best-effort from add.stats record counts.
+        // FIX 5 (dual fidelity): a dry run measures nothing, so the MEASURED RowCount is 0; the advisory
+        // EstimatedRowCount carries the best-effort plan estimate from the inputs' add.stats record counts.
+        Assert.Equal(0, result.RowCount);
+        Assert.Equal(2, result.EstimatedRowCount);
+        OptimizePartitionSummary dryPartition = Assert.Single(result.Partitions);
+        Assert.Equal(0, dryPartition.RowCount);
+        Assert.Equal(2, dryPartition.EstimatedRowCount);
 
         Snapshot after = await Log().LoadSnapshotAsync();
         Assert.Equal(before.Version, after.Version); // nothing committed.
         Assert.Equal(new[] { "a.parquet", "b.parquet" }, ActivePaths(after));
     }
 
+    // ---------------------------------------------------------------- FIX 1: schema-evolution guard (#497)
+
+    [Fact]
+    public async Task Optimize_OnSchemaEvolvedTable_FailsClosed_WithClearError()
+    {
+        // A narrow table [id,value] with two small files, then an additive schema evolution (#190) adds an
+        // "extra" column so the pre-evolution files are physically narrower than the current data schema.
+        // OPTIMIZE cannot compact them yet (read-side null-fill is #497) and must fail CLOSED with a clear,
+        // actionable error — never the misleading raw "column not present" corruption text — leaving the
+        // table unchanged.
+        StagedDataFile a = await WriteDataFileAsync("a.parquet", Batch((1, "a")));
+        StagedDataFile b = await WriteDataFileAsync("b.parquet", Batch((2, "b")));
+        await SeedAsync(DataSchema, partitionColumns: null, a, b); // v0 metadata, v1 append
+
+        await EvolveSchemaAsync(version: 2, EvolvedSchema); // metadata-only add-column evolution at v2
+        Snapshot before = await Log().LoadSnapshotAsync();
+        Assert.Equal(2, before.Version);
+
+        OptimizeSchemaEvolutionException ex = await Assert.ThrowsAsync<OptimizeSchemaEvolutionException>(
+            () => Optimize().OptimizeAsync());
+
+        // The clear error references #497 / an older schema and does NOT surface the raw reader defect text.
+        Assert.Contains("#497", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("older", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("not present in the Parquet file schema", ex.Message, StringComparison.Ordinal);
+
+        // Fail-closed / orphan-safe: the table is unchanged — same version and same active files.
+        Snapshot after = await Log().LoadSnapshotAsync();
+        Assert.Equal(before.Version, after.Version);
+        Assert.Equal(ActivePaths(before), ActivePaths(after));
+    }
+
+    // ---------------------------------------------------------------- FIX 3: AC3 byte-identity of untouched files
+
+    [Fact]
+    public async Task Optimize_DoesNotRewriteUnselectedFiles_ByteIdentityPreserved()
+    {
+        // a,b are small candidates; c is already >= target so it is never selected. After OPTIMIZE, c must
+        // still be active AND its bytes must be byte-for-byte identical (proving OPTIMIZE only rewrites the
+        // selected files and never touches the rest).
+        StagedDataFile a = await WriteDataFileAsync("a.parquet", Batch((1, "a")), declaredSize: 100);
+        StagedDataFile b = await WriteDataFileAsync("b.parquet", Batch((2, "b")), declaredSize: 100);
+        StagedDataFile c = await WriteDataFileAsync("c.parquet", Batch((3, "c")), declaredSize: 10_000);
+        await SeedAsync(DataSchema, partitionColumns: null, a, b, c);
+
+        string cHashBefore = await Sha256Async("c.parquet");
+
+        OptimizeResult result = await Optimize().OptimizeAsync(targetFileSize: 500);
+        Assert.Equal(2, result.FilesRemoved);
+        Assert.Equal(1, result.FilesAdded);
+
+        Snapshot after = await Log().LoadSnapshotAsync();
+        string[] active = ActivePaths(after);
+        Assert.Contains("c.parquet", active);       // the unselected file is still active by path...
+        Assert.DoesNotContain("a.parquet", active);
+        Assert.DoesNotContain("b.parquet", active);
+
+        string cHashAfter = await Sha256Async("c.parquet");
+        Assert.Equal(cHashBefore, cHashAfter);       // ... and its bytes are unchanged (never rewritten).
+    }
+
+    // ---------------------------------------------------------------- FIX 2: operation-level telemetry
+
+    [Fact]
+    public async Task Optimize_CompletedRun_EmitsSpan_Metrics_AndLogs_NoDataLeakage()
+    {
+        StagedDataFile a = await WriteDataFileAsync("a.parquet", Batch((1, "a")));
+        StagedDataFile b = await WriteDataFileAsync("b.parquet", Batch((2, "b")));
+        await SeedAsync(DataSchema, partitionColumns: null, a, b);
+
+        using var telemetry = new DeltaStorageTelemetry();
+        var logger = new RecordingLogger<DeltaOptimize>();
+        using var meters = new MeterCapture(telemetry.DeltaMeter, telemetry.StorageMeter);
+        using var activities = new ActivityCapture(telemetry.DeltaActivitySource);
+
+        OptimizeResult result = await Optimize(logger: logger, telemetry: telemetry).OptimizeAsync();
+        Assert.NotNull(result.CommittedVersion);
+
+        // Metrics: one terminal count tagged outcome=completed, plus files-removed / files-added counters.
+        MeterCapture.Measurement count = Assert.Single(meters.ForInstrument("deltasharp.delta.optimize.count"));
+        Assert.Equal(1d, count.Value);
+        Assert.Equal("completed", count.Tags["deltasharp.outcome"]);
+        Assert.Equal(2d, Assert.Single(meters.ForInstrument("deltasharp.delta.optimize.files_removed")).Value);
+        Assert.Equal(1d, Assert.Single(meters.ForInstrument("deltasharp.delta.optimize.files_added")).Value);
+        Assert.Single(meters.ForInstrument("deltasharp.delta.optimize.duration"));
+
+        // Logs: started + completed lifecycle events.
+        Assert.True(logger.Has("DeltaOptimizeStarted"));
+        Assert.True(logger.Has("DeltaOptimizeCompleted"));
+
+        // Span: the OPTIMIZE span carries the bounded outcome tag.
+        System.Diagnostics.Activity activity = Assert.Single(activities.Stopped);
+        Assert.Equal(DeltaStorageTelemetry.OptimizeActivityName, activity.OperationName);
+        Assert.Equal("completed", activity.GetTagItem("deltasharp.outcome"));
+
+        // No data leakage: no row value or column value ever appears in a log message.
+        Assert.DoesNotContain(logger.Entries, e => e.Message.Contains("part-", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Optimize_Abort_EmitsAbortedOutcome()
+    {
+        // A concurrent writer removes an input → OPTIMIZE aborts fail-closed. The terminal metric records
+        // outcome=aborted (not a generic failure) and the aborted log line fires.
+        StagedDataFile a = await WriteDataFileAsync("a.parquet", Batch((1, "a")));
+        StagedDataFile b = await WriteDataFileAsync("b.parquet", Batch((2, "b")));
+        StagedDataFile c = await WriteDataFileAsync("c.parquet", Batch((3, "c")));
+        await SeedAsync(DataSchema, partitionColumns: null, a, b, c);
+
+        Snapshot readSnapshot = await Log().LoadSnapshotAsync();
+        await CommitRawAsync(readSnapshot.Version + 1, DeltaTestHarness.Remove("a.parquet"));
+
+        using var telemetry = new DeltaStorageTelemetry();
+        var logger = new RecordingLogger<DeltaOptimize>();
+        using var meters = new MeterCapture(telemetry.DeltaMeter, telemetry.StorageMeter);
+
+        await Assert.ThrowsAsync<ConcurrentDeleteReadException>(
+            () => Optimize(logger: logger, telemetry: telemetry).OptimizeAsync(readSnapshot));
+
+        MeterCapture.Measurement count = Assert.Single(meters.ForInstrument("deltasharp.delta.optimize.count"));
+        Assert.Equal("aborted", count.Tags["deltasharp.outcome"]);
+        Assert.True(logger.Has("DeltaOptimizeAborted"));
+    }
+
+    // ---------------------------------------------------------------- FIX 7: coverage gaps
+
+    [Fact]
+    public async Task Optimize_TwoConcurrentRunsOverOverlappingGroup_LoserAborts_AllRowsSurviveOnce()
+    {
+        // Two OPTIMIZE runs planned against the SAME read snapshot over the SAME (overlapping) group: the
+        // winner commits; the loser's inputs were removed underneath it, so its ReadFiles scope aborts it
+        // with ConcurrentDeleteReadException. Every row must survive exactly once.
+        StagedDataFile a = await WriteDataFileAsync("a.parquet", Batch((1, "a")));
+        StagedDataFile b = await WriteDataFileAsync("b.parquet", Batch((2, "b")));
+        StagedDataFile c = await WriteDataFileAsync("c.parquet", Batch((3, "c")));
+        StagedDataFile d = await WriteDataFileAsync("d.parquet", Batch((4, "d")));
+        await SeedAsync(DataSchema, partitionColumns: null, a, b, c, d);
+
+        Snapshot readSnapshot = await Log().LoadSnapshotAsync();
+        List<(long, string?)> before =
+            Sorted(await ReadRowsAsync(new[] { "a.parquet", "b.parquet", "c.parquet", "d.parquet" }));
+        Assert.Equal(4, before.Count);
+
+        OptimizeResult winner = await Optimize(nameFactory: () => "WIN").OptimizeAsync(readSnapshot);
+        Assert.Equal(readSnapshot.Version + 1, winner.CommittedVersion);
+
+        await Assert.ThrowsAsync<ConcurrentDeleteReadException>(
+            () => Optimize(nameFactory: () => "LOSE").OptimizeAsync(readSnapshot));
+
+        Snapshot after = await Log().LoadSnapshotAsync();
+        Assert.Equal(readSnapshot.Version + 1, after.Version); // only the winner advanced the table.
+        Assert.Equal(before, Sorted(await ReadRowsAsync(ActivePaths(after))));
+    }
+
+    [Fact]
+    public async Task Optimize_MultiPartition_Unfiltered_CompactsEachPartitionIndependently()
+    {
+        // No filter: both partitions are compacted, independently (no cross-partition mixing). The Partitions
+        // breakdown has >1 entry and each partition compacts its two files into one.
+        StagedDataFile us1 = await WriteDataFileAsync("region=US/us1.parquet", Batch((1, "a")), Partition(("region", "US")));
+        StagedDataFile us2 = await WriteDataFileAsync("region=US/us2.parquet", Batch((2, "b")), Partition(("region", "US")));
+        StagedDataFile eu1 = await WriteDataFileAsync("region=EU/eu1.parquet", Batch((3, "c")), Partition(("region", "EU")));
+        StagedDataFile eu2 = await WriteDataFileAsync("region=EU/eu2.parquet", Batch((4, "d")), Partition(("region", "EU")));
+        await SeedAsync(PartitionedSchema, partitionColumns: new[] { "region" }, us1, us2, eu1, eu2);
+
+        List<(long, string?)> before = Sorted(await ReadRowsAsync(new[]
+        {
+            "region=US/us1.parquet", "region=US/us2.parquet", "region=EU/eu1.parquet", "region=EU/eu2.parquet",
+        }));
+
+        OptimizeResult result = await Optimize().OptimizeAsync();
+
+        Assert.Equal(4, result.FilesRemoved);
+        Assert.Equal(2, result.FilesAdded);
+        Assert.True(result.Partitions.Length > 1);
+        Assert.Equal(2, result.Partitions.Length);
+        Assert.All(result.Partitions, p =>
+        {
+            Assert.Equal(2, p.FilesRemoved);
+            Assert.Equal(1, p.FilesAdded);
+        });
+
+        Snapshot after = await Log().LoadSnapshotAsync();
+        Assert.Equal(2, after.ActiveFiles.Length);
+        foreach (AddFileAction output in after.ActiveFiles)
+        {
+            string region = output.PartitionValues["region"]!;
+            Assert.StartsWith($"region={region}/", output.Path, StringComparison.Ordinal);
+            long[] expectedIds = region == "US" ? new long[] { 1, 2 } : new long[] { 3, 4 };
+            List<(long Id, string? Value)> rows = await ReadRowsAsync(new[] { output.Path });
+            Assert.All(rows, r => Assert.Contains(r.Id, expectedIds)); // no cross-partition mixing.
+        }
+
+        Assert.Equal(before, Sorted(await ReadRowsAsync(ActivePaths(after))));
+    }
+
+    [Fact]
+    public async Task Optimize_NonPositiveTargetFileSize_Throws_AndCommitsNothing()
+    {
+        StagedDataFile a = await WriteDataFileAsync("a.parquet", Batch((1, "a")));
+        StagedDataFile b = await WriteDataFileAsync("b.parquet", Batch((2, "b")));
+        await SeedAsync(DataSchema, partitionColumns: null, a, b);
+
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => Optimize().OptimizeAsync(targetFileSize: 0));
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => Optimize().OptimizeAsync(targetFileSize: -1));
+
+        Snapshot after = await Log().LoadSnapshotAsync();
+        Assert.Equal(1, after.Version); // the guard is fail-closed: nothing committed.
+    }
+
+    [Fact]
+    public async Task Optimize_CompactsAcrossRowGroupBoundaries_PreservingRows()
+    {
+        // Each input is written with a small row-group limit so it spans multiple Parquet row groups; the
+        // full-read + rewrite path must reassemble every row across those boundaries.
+        StagedDataFile a = await WriteDataFileAsync("a.parquet", BatchRange(0, 150), rowGroupRowLimit: 40);
+        StagedDataFile b = await WriteDataFileAsync("b.parquet", BatchRange(150, 150), rowGroupRowLimit: 40);
+        await SeedAsync(DataSchema, partitionColumns: null, a, b);
+
+        List<(long, string?)> before = Sorted(await ReadRowsAsync(new[] { "a.parquet", "b.parquet" }));
+        Assert.Equal(300, before.Count);
+
+        OptimizeResult result = await Optimize().OptimizeAsync();
+        Assert.Equal(2, result.FilesRemoved);
+        Assert.Equal(1, result.FilesAdded);
+        Assert.Equal(300, result.RowCount);
+
+        Snapshot after = await Log().LoadSnapshotAsync();
+        AddFileAction output = Assert.Single(after.ActiveFiles);
+        Assert.Equal(before, Sorted(await ReadRowsAsync(new[] { output.Path })));
+    }
+
+    [Fact]
+    public async Task Optimize_SecondRunOnCompactedTable_IsNoOp()
+    {
+        // Idempotency: after compaction each partition holds a single file, so a second OPTIMIZE finds only
+        // single-file groups (skipped) — a no-op with no commit and an unchanged version.
+        StagedDataFile a = await WriteDataFileAsync("a.parquet", Batch((1, "a")));
+        StagedDataFile b = await WriteDataFileAsync("b.parquet", Batch((2, "b")));
+        StagedDataFile c = await WriteDataFileAsync("c.parquet", Batch((3, "c")));
+        StagedDataFile d = await WriteDataFileAsync("d.parquet", Batch((4, "d")));
+        await SeedAsync(DataSchema, partitionColumns: null, a, b, c, d);
+
+        OptimizeResult first = await Optimize().OptimizeAsync();
+        Assert.NotNull(first.CommittedVersion);
+        Snapshot afterFirst = await Log().LoadSnapshotAsync();
+
+        OptimizeResult second = await Optimize().OptimizeAsync();
+        Assert.Null(second.CommittedVersion);
+        Assert.Equal(0, second.FilesRemoved);
+        Assert.Equal(0, second.FilesAdded);
+
+        Snapshot afterSecond = await Log().LoadSnapshotAsync();
+        Assert.Equal(afterFirst.Version, afterSecond.Version); // no commit on the second run.
+        Assert.Equal(ActivePaths(afterFirst), ActivePaths(afterSecond));
+    }
+
+    [Fact]
+    public async Task Optimize_GroupExactlyAtTargetBoundary_PacksAndSkipsLoneFile()
+    {
+        // Sizes 250,250,250 with target 500: next-fit packs {a,b} at EXACTLY the boundary (250+250 == 500 is
+        // not > target), then c would overflow (500+250 > 500) so it closes into a lone bin that is skipped.
+        StagedDataFile a = await WriteDataFileAsync("a.parquet", Batch((1, "a")), declaredSize: 250);
+        StagedDataFile b = await WriteDataFileAsync("b.parquet", Batch((2, "b")), declaredSize: 250);
+        StagedDataFile c = await WriteDataFileAsync("c.parquet", Batch((3, "c")), declaredSize: 250);
+        await SeedAsync(DataSchema, partitionColumns: null, a, b, c);
+
+        OptimizeResult result = await Optimize().OptimizeAsync(targetFileSize: 500);
+        Assert.Equal(2, result.FilesRemoved); // {a,b} packed at the boundary.
+        Assert.Equal(1, result.FilesAdded);
+
+        Snapshot after = await Log().LoadSnapshotAsync();
+        string[] active = ActivePaths(after);
+        Assert.Contains("c.parquet", active);        // the lone bin is skipped, so c is untouched.
+        Assert.DoesNotContain("a.parquet", active);
+        Assert.DoesNotContain("b.parquet", active);
+    }
+
+    [Fact]
+    public async Task Optimize_EmptyTable_IsNoOp()
+    {
+        await SeedEmptyAsync(DataSchema);
+        Snapshot before = await Log().LoadSnapshotAsync();
+
+        OptimizeResult result = await Optimize().OptimizeAsync();
+
+        Assert.Null(result.CommittedVersion);
+        Assert.Equal(0, result.FilesRemoved);
+        Assert.Equal(0, result.FilesAdded);
+        Assert.Empty(result.Partitions);
+
+        Snapshot after = await Log().LoadSnapshotAsync();
+        Assert.Equal(before.Version, after.Version);
+        Assert.Empty(after.ActiveFiles);
+    }
+
+    [Fact]
+    public async Task Optimize_MultiGroup_PreCommitFailure_LeavesAllInputsActive_AndOrphansAllOutputs()
+    {
+        // AC4 across >1 group: target 250 packs four size-100 files into two groups {a,b} and {c,d}. A
+        // pre-commit failure fired AFTER both outputs are written must leave ALL four inputs active and BOTH
+        // outputs orphaned — never a partial commit.
+        StagedDataFile a = await WriteDataFileAsync("a.parquet", Batch((1, "a")), declaredSize: 100);
+        StagedDataFile b = await WriteDataFileAsync("b.parquet", Batch((2, "b")), declaredSize: 100);
+        StagedDataFile c = await WriteDataFileAsync("c.parquet", Batch((3, "c")), declaredSize: 100);
+        StagedDataFile d = await WriteDataFileAsync("d.parquet", Batch((4, "d")), declaredSize: 100);
+        await SeedAsync(DataSchema, partitionColumns: null, a, b, c, d);
+        Snapshot before = await Log().LoadSnapshotAsync();
+
+        int n = 0;
+        DeltaOptimize optimize = Optimize(
+            nameFactory: () => "ORPH" + (n++).ToString(System.Globalization.CultureInfo.InvariantCulture));
+        optimize.BeforeCommitProbe = _ => throw new InvalidOperationException("injected pre-commit failure");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => optimize.OptimizeAsync(targetFileSize: 250));
+
+        // Unchanged: all four inputs still active, version not advanced.
+        Snapshot after = await Log().LoadSnapshotAsync();
+        Assert.Equal(before.Version, after.Version);
+        Assert.Equal(new[] { "a.parquet", "b.parquet", "c.parquet", "d.parquet" }, ActivePaths(after));
+
+        // Both compacted outputs were durably written but are referenced by nothing — pure orphans.
+        foreach (string orphan in new[] { "part-ORPH0.parquet", "part-ORPH1.parquet" })
+        {
+            Assert.NotNull(await _backend.HeadAsync(orphan, CancellationToken.None));
+            Assert.DoesNotContain(orphan, ActivePaths(after));
+        }
+    }
+
     // ---------------------------------------------------------------- helpers
 
     private DeltaLog Log() => new(_backend);
 
-    private DeltaOptimize Optimize(TimeProvider? timeProvider = null, Func<string>? nameFactory = null) =>
+    private DeltaOptimize Optimize(
+        TimeProvider? timeProvider = null,
+        Func<string>? nameFactory = null,
+        ParquetFileWriter? writer = null,
+        Microsoft.Extensions.Logging.ILogger<DeltaOptimize>? logger = null,
+        DeltaStorageTelemetry? telemetry = null) =>
         new(
             _backend,
             new DeltaLog(_backend),
             new DeltaCommitter(_backend),
             timeProvider: timeProvider ?? new FixedTimeProvider(Now),
-            compactedFileNameFactory: nameFactory);
+            writer: writer,
+            compactedFileNameFactory: nameFactory,
+            logger: logger,
+            telemetry: telemetry);
 
     private static ImmutableSortedDictionary<string, string?> Partition(params (string Key, string? Value)[] values)
     {
@@ -393,18 +747,39 @@ public sealed class DeltaOptimizeTests : IDisposable
         return new ManagedColumnBatch(DataSchema, new ColumnVector[] { id, value }, rows.Length);
     }
 
+    // Builds a batch of <paramref name="count"/> sequential rows (id = start..start+count-1, value = "v<id>"),
+    // used to exercise multi-row-group / batch-straddling compaction with more than the 1–2 rows other tests
+    // use.
+    private static ColumnBatch BatchRange(long start, int count)
+    {
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, count);
+        MutableColumnVector value = ColumnVectors.Create(DataTypes.StringType, count);
+        for (int i = 0; i < count; i++)
+        {
+            long rowId = start + i;
+            id.AppendValue(rowId);
+            value.AppendBytes(Encoding.UTF8.GetBytes("v" + rowId.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+        }
+
+        return new ManagedColumnBatch(DataSchema, new ColumnVector[] { id, value }, count);
+    }
+
     // Writes a real Parquet data file (the DATA schema — never the partition column) to the backend at
     // <paramref name="path"/> and returns the corresponding staged add. An explicit <paramref name="declaredSize"/>
     // lets a test drive the bin-packing plan independently of the (tiny) real byte size; by default the add
-    // records the real measured size.
+    // records the real measured size. An explicit <paramref name="rowGroupRowLimit"/> forces the writer to
+    // split the batch across multiple Parquet row groups (so the read/rewrite path is exercised across
+    // row-group boundaries).
     private async Task<StagedDataFile> WriteDataFileAsync(
         string path,
         ColumnBatch batch,
         ImmutableSortedDictionary<string, string?>? partition = null,
-        long? declaredSize = null)
+        long? declaredSize = null,
+        int? rowGroupRowLimit = null)
     {
         using var buffer = new MemoryStream();
-        ParquetFileWriter.WriteResult result = await new ParquetFileWriter().WriteWithStatisticsAsync(
+        var writer = rowGroupRowLimit is int limit ? new ParquetFileWriter(limit) : new ParquetFileWriter();
+        ParquetFileWriter.WriteResult result = await writer.WriteWithStatisticsAsync(
             buffer, DataSchema, new[] { batch }, StatisticsPolicy.Default, CancellationToken.None);
         await _backend.PutIfAbsentAsync(path, buffer.ToArray(), CancellationToken.None);
         return new StagedDataFile(
@@ -419,6 +794,30 @@ public sealed class DeltaOptimizeTests : IDisposable
             DeltaTestHarness.MetadataWithSchema(tableSchema, partitionColumns: partitionColumns));
         Snapshot snapshot = await Log().LoadSnapshotAsync();
         await new DeltaTableWriter(_backend).AppendAsync(snapshot, snapshot.Schema, files);
+    }
+
+    // Seeds an empty table: v0 protocol + metadata only, no data files (no active files).
+    private async Task SeedEmptyAsync(StructType tableSchema) =>
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 0, DeltaTestHarness.Protocol(minReader: 1, minWriter: 2),
+            DeltaTestHarness.MetadataWithSchema(tableSchema));
+
+    // Commits a metadata-only evolution at the given version, replacing the table schema in place.
+    private async Task EvolveSchemaAsync(long version, StructType evolvedSchema) =>
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, version, DeltaTestHarness.MetadataWithSchema(evolvedSchema));
+
+    // Reads a data file's raw bytes and returns their SHA-256 (proves byte-identity of files OPTIMIZE never
+    // rewrote, AC3).
+    private async Task<string> Sha256Async(string path)
+    {
+        Stream stream = await _backend.OpenReadAsync(path, CancellationToken.None);
+        await using (stream)
+        {
+            using var buffer = new MemoryStream();
+            await stream.CopyToAsync(buffer, CancellationToken.None);
+            return Convert.ToHexString(SHA256.HashData(buffer.ToArray()));
+        }
     }
 
     private async Task CommitRawAsync(long version, params string[] lines) =>

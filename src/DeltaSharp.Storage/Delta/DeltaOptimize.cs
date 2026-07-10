@@ -1,21 +1,53 @@
 using System.Collections.Immutable;
+using System.Diagnostics;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using DeltaSharp.Diagnostics;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Backends;
+using DeltaSharp.Storage.Diagnostics;
 using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Types;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace DeltaSharp.Storage.Delta;
+
+/// <summary>
+/// Thrown when OPTIMIZE encounters a compaction input that was written under an <b>older</b> table schema
+/// (an additively schema-evolved table, #190) so the file is physically narrower than the current snapshot
+/// data schema. Compacting such a file requires read-side null-fill of the absent, later-added columns,
+/// which is not yet implemented (issue <b>#497</b> — "Evolved-column read null-fill"). Rather than surface
+/// the misleading raw <see cref="DeltaStorageException"/> ("column … not present in the Parquet file
+/// schema", which reads like file corruption), OPTIMIZE fails <b>closed</b> with this clear, actionable
+/// error: it is thrown <b>before</b> any commit, so the inputs stay active, the version is unchanged, and
+/// any already-written outputs are ignorable orphans (never a partial commit).
+/// </summary>
+internal sealed class OptimizeSchemaEvolutionException : Exception
+{
+    internal OptimizeSchemaEvolutionException(string filePath, Exception innerException)
+        : base(
+            $"OPTIMIZE cannot compact file '{filePath}' because it was written under an older table schema " +
+            "and read-side null-fill for the later-added column(s) is not yet implemented (issue #497). " +
+            "OPTIMIZE fails closed rather than compacting a file written under an older schema; the table is " +
+            "left unchanged. Re-run OPTIMIZE once #497 (evolved-column read null-fill) lands.",
+            innerException) => FilePath = filePath;
+
+    /// <summary>The compaction input whose physical schema is narrower than the current data schema.</summary>
+    internal string FilePath { get; }
+}
 
 /// <summary>
 /// One partition's contribution to an <see cref="DeltaOptimize.OptimizeAsync(System.Func{System.Collections.Generic.IReadOnlyDictionary{string, string?}, bool}?, long?, bool, System.Threading.CancellationToken)"/>
 /// run (STORY-05.6.1 AC3): the canonical <see cref="PartitionValues"/> (empty for an unpartitioned table),
 /// how many small input files were <see cref="FilesRemoved"/> and how many compacted files were
-/// <see cref="FilesAdded"/> in their place, and the before/after byte totals plus the preserved
-/// <see cref="RowCount"/>. For a dry run <see cref="BytesAfter"/> is <c>0</c> (nothing is written) and
-/// <see cref="RowCount"/> is the best-effort sum of the inputs' recorded record counts.
+/// <see cref="FilesAdded"/> in their place, and the before/after byte totals plus the row counts.
+/// <see cref="RowCount"/> is the <b>measured</b> compacted row count on a real run and <c>0</c> on a dry run
+/// (nothing is written or measured); <see cref="EstimatedRowCount"/> is the best-effort advisory sum of the
+/// inputs' recorded record counts (a stats-less input contributes <c>0</c>), populated on both a dry run and
+/// a real run so a caller can compare the plan estimate to the measured actual. For a dry run
+/// <see cref="BytesAfter"/> is also <c>0</c> (nothing is written).
 /// </summary>
 internal sealed record OptimizePartitionSummary(
     ImmutableSortedDictionary<string, string?> PartitionValues,
@@ -23,14 +55,26 @@ internal sealed record OptimizePartitionSummary(
     int FilesAdded,
     long BytesBefore,
     long BytesAfter,
-    long RowCount);
+    long RowCount,
+    long EstimatedRowCount);
 
 /// <summary>
 /// The structured outcome of a <see cref="DeltaOptimize.OptimizeAsync(System.Func{System.Collections.Generic.IReadOnlyDictionary{string, string?}, bool}?, long?, bool, System.Threading.CancellationToken)"/>
 /// run: the <see cref="ReadVersion"/> the plan was computed against, the <see cref="CommittedVersion"/> the
 /// compaction became visible at (<see langword="null"/> for a dry run or a no-op — nothing to compact), the
 /// effective <see cref="TargetFileSize"/>, the total files removed/added and bytes before/after, the
-/// preserved <see cref="RowCount"/> (AC1), and the per-partition <see cref="Partitions"/> summary (AC3).
+/// <see cref="RowCount"/>/<see cref="EstimatedRowCount"/> (see below), and the per-partition
+/// <see cref="Partitions"/> summary (AC3).
+///
+/// <para><b>Row counts — two distinct fidelities.</b> <see cref="RowCount"/> is the <b>measured</b> row
+/// count actually read and rewritten by a real compaction run (AC1 row-count equivalence); it is <c>0</c> on
+/// a dry run or a no-op, where nothing is written or measured. <see cref="EstimatedRowCount"/> is the
+/// best-effort <b>advisory</b> plan estimate — the sum of the selected inputs' recorded
+/// <see cref="FileStatistics.NumRecords"/> (a stats-less input contributes <c>0</c>, so a stats-less table's
+/// estimate can under-report). It is populated on a dry run (so a dry-run caller still gets a row-count
+/// signal) <b>and</b> on a real run (so a caller can compare the plan estimate to the measured actual). Read
+/// <see cref="RowCount"/> for the ground truth of a committed run; read <see cref="EstimatedRowCount"/> for a
+/// dry-run advisory.</para>
 /// </summary>
 internal sealed record OptimizeResult(
     long ReadVersion,
@@ -42,17 +86,21 @@ internal sealed record OptimizeResult(
     long BytesBefore,
     long BytesAfter,
     long RowCount,
+    long EstimatedRowCount,
     ImmutableArray<OptimizePartitionSummary> Partitions);
 
 /// <summary>
 /// Delta <b>OPTIMIZE</b> / small-file compaction (design §2.9.2/§2.11.2, STORY-05.6.1 / #195). It rewrites
 /// a table's many small active files into fewer, larger ones <b>without changing the data</b> — the row
-/// content is byte-for-byte preserved, only its physical file layout is rearranged. The whole operation
-/// publishes as <b>one</b> Delta commit that <c>remove</c>s every compacted input and <c>add</c>s the
-/// compacted outputs, and both sides carry <c>dataChange=false</c> (§2.11.2). It mirrors the shape of
-/// <see cref="DeltaVacuum"/> (constructed over an <see cref="IStorageBackend"/> with an injected log,
-/// committer and <see cref="TimeProvider"/>) and reuses the exact write/commit machinery of
-/// <see cref="DeltaTableWriter"/> rather than reinventing it.
+/// <b>multiset</b> is preserved exactly (every row appears once, unchanged), only its physical file layout
+/// is rearranged. Row <i>order</i> is <b>not</b> a contract: within a compacted output rows appear in the
+/// group's packing order (input-by-input), not the table's logical order, so correctness is asserted as a
+/// sorted-multiset content oracle, never a positional one. The whole operation publishes as <b>one</b> Delta
+/// commit that <c>remove</c>s every compacted input and <c>add</c>s the compacted outputs, and both sides
+/// carry <c>dataChange=false</c> (§2.11.2). It mirrors the shape of <see cref="DeltaVacuum"/> (constructed
+/// over an <see cref="IStorageBackend"/> with an injected log, committer, <see cref="TimeProvider"/>, logger,
+/// and telemetry) and reuses the exact write/commit machinery of <see cref="DeltaTableWriter"/> rather than
+/// reinventing it.
 ///
 /// <para><b>Why <c>dataChange=false</c> (the correctness core).</b> Compaction only relocates existing
 /// rows, so its <c>add</c>/<c>remove</c> actions are marked <c>dataChange=false</c>. This is precisely what
@@ -75,6 +123,14 @@ internal sealed record OptimizeResult(
 /// is at most the target; a group of a single file is skipped (rewriting one file into one file gains
 /// nothing).</para>
 ///
+/// <para><b>Schema-evolution limitation (fails closed).</b> OPTIMIZE reads every input under the
+/// <i>current</i> snapshot data schema. On an additively schema-evolved table (#190) a pre-evolution Parquet
+/// file is physically narrower than that schema; compacting it needs read-side null-fill of the later-added
+/// columns, which is not yet implemented (issue <b>#497</b>). Until #497 lands, OPTIMIZE detects the narrow
+/// input and fails closed with a clear <see cref="OptimizeSchemaEvolutionException"/> (thrown before any
+/// commit — the table is unchanged) rather than compacting or surfacing a misleading "column not present"
+/// corruption error.</para>
+///
 /// <para><b>Orphan-safe failure (AC4).</b> Compacted files are written to storage <b>before</b> the commit.
 /// If the commit fails (a conflict, a crash, or the injected <see cref="BeforeCommitProbe"/>), the table's
 /// state is unchanged — the inputs stay active and the written-but-uncommitted outputs are simply orphans,
@@ -82,9 +138,15 @@ internal sealed record OptimizeResult(
 /// <see cref="OrphanCleanup"/> like any other staged-but-never-committed file. No special rollback hook is
 /// needed.</para>
 ///
-/// <para><b>Bounded memory (v1).</b> A compaction group's input rows are materialized in memory before the
-/// output is written, so a group is bounded by the target file size (≈128&#160;MiB). Streaming rewrite and
-/// clustering-aware/Z-order compaction are tracked follow-ups.</para>
+/// <para><b>Memory (eager materialization, v1).</b> A compaction group is materialized <b>decompressed</b>
+/// in memory (a <c>List&lt;ColumnBatch&gt;</c> of every input's decoded rows) <i>and</i> re-serialized into
+/// an in-memory output <see cref="System.IO.MemoryStream"/> before being published. The <b>decoded</b> peak
+/// is therefore not bounded by the ≈128&#160;MiB target file-size knob — that knob bounds the packed
+/// <i>compressed</i> input size, and highly compressible data decodes far larger, so a group's transient
+/// footprint can exceed the target. It is bounded <b>per group</b> (each group's batches and output buffer
+/// are group-local and released for GC each loop iteration), never accumulated across the whole run.
+/// Streaming (chunked) rewrite that removes the eager full-group materialization, plus clustering-aware /
+/// Z-order compaction, are tracked follow-ups.</para>
 /// </summary>
 internal sealed class DeltaOptimize
 {
@@ -111,6 +173,16 @@ internal sealed class DeltaOptimize
     private readonly ParquetFileReader _reader;
     private readonly ParquetFileWriter _writer;
     private readonly Func<string> _fileNameFactory;
+    private readonly ILogger<DeltaOptimize> _logger;
+    private readonly DeltaStorageTelemetry _telemetry;
+
+    /// <summary>The shared correlation scope attached to every OPTIMIZE log line (design §7.2.1), cached so
+    /// <see cref="ILogger.BeginScope"/> allocates no new state array per run.</summary>
+    private static readonly KeyValuePair<string, object?>[] OptimizeLogScope =
+    {
+        new(DeltaSharpTelemetry.ComponentKey, DeltaStorageTelemetry.DeltaComponent),
+        new(DeltaSharpTelemetry.OperationKey, DeltaStorageTelemetry.OptimizeOperation),
+    };
 
     /// <summary>Test seam (null/inert in production): awaited once after every compacted file has been
     /// written to storage and <b>before</b> the single Delta commit, so a test can inject a pre-commit
@@ -126,7 +198,9 @@ internal sealed class DeltaOptimize
 
     /// <summary>Creates an OPTIMIZE over an explicit reader + committer (tests inject a committer with a
     /// race probe, a deterministic clock for tombstone/modification timestamps, and a deterministic
-    /// compacted-file name factory so output paths are predictable).</summary>
+    /// compacted-file name factory so output paths are predictable), plus an optional injected
+    /// <paramref name="logger"/> / <paramref name="telemetry"/> so a test can subscribe to the OPTIMIZE
+    /// span and metrics in isolation (mirroring <see cref="DeltaVacuum"/>).</summary>
     internal DeltaOptimize(
         IStorageBackend backend,
         DeltaLog log,
@@ -135,7 +209,9 @@ internal sealed class DeltaOptimize
         StatisticsPolicy? statisticsPolicy = null,
         ParquetFileReader? reader = null,
         ParquetFileWriter? writer = null,
-        Func<string>? compactedFileNameFactory = null)
+        Func<string>? compactedFileNameFactory = null,
+        ILogger<DeltaOptimize>? logger = null,
+        DeltaStorageTelemetry? telemetry = null)
     {
         ArgumentNullException.ThrowIfNull(backend);
         ArgumentNullException.ThrowIfNull(log);
@@ -148,6 +224,8 @@ internal sealed class DeltaOptimize
         _reader = reader ?? new ParquetFileReader();
         _writer = writer ?? new ParquetFileWriter();
         _fileNameFactory = compactedFileNameFactory ?? DefaultFileNameFactory;
+        _logger = logger ?? NullLogger<DeltaOptimize>.Instance;
+        _telemetry = telemetry ?? DeltaStorageTelemetry.Shared;
     }
 
     /// <summary>The production compacted-file name source: 128 bits from a cryptographic RNG, hex-encoded
@@ -200,6 +278,79 @@ internal sealed class DeltaOptimize
             throw new ArgumentOutOfRangeException(nameof(targetFileSize), target, "Target file size must be positive.");
         }
 
+        using IDisposable? logScope = _logger.BeginScope(OptimizeLogScope);
+        DeltaOptimizeLog.OptimizeStarted(_logger, _backend.Kind.ToLabel(), target, dryRun);
+
+        long startTimestamp = Stopwatch.GetTimestamp();
+        using Activity? activity = _telemetry.StartOptimizeActivity(_backend.Kind);
+        try
+        {
+            OptimizeResult result = await RunOptimizeAsync(
+                readSnapshot, partitionFilter, target, dryRun, cancellationToken).ConfigureAwait(false);
+
+            double seconds = Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds;
+            OptimizeOutcome outcome = result.DryRun
+                ? OptimizeOutcome.DryRun
+                : result.CommittedVersion is null ? OptimizeOutcome.NoOp : OptimizeOutcome.Completed;
+            _telemetry.RecordOptimizeTerminal(
+                outcome, seconds, result.FilesRemoved, result.FilesAdded, result.BytesBefore);
+            SetOutcomeTag(activity, outcome);
+            if (outcome == OptimizeOutcome.NoOp)
+            {
+                DeltaOptimizeLog.OptimizeNoOp(_logger, result.ReadVersion, seconds * 1000);
+            }
+            else
+            {
+                DeltaOptimizeLog.OptimizeCompleted(
+                    _logger,
+                    result.ReadVersion,
+                    result.CommittedVersion ?? result.ReadVersion,
+                    result.FilesRemoved,
+                    result.FilesAdded,
+                    result.DryRun,
+                    seconds * 1000);
+            }
+
+            return result;
+        }
+        catch (DeltaConcurrentModificationException ex)
+        {
+            // AC2 fail-closed abort: a concurrent commit changed one of the compaction inputs. The inputs
+            // stay active and any written outputs are orphans — a domain outcome (Warning), not a failure.
+            _telemetry.RecordOptimizeTerminal(
+                OptimizeOutcome.Aborted, Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds, 0, 0, 0);
+            SetOutcomeTag(activity, OptimizeOutcome.Aborted);
+            DeltaOptimizeLog.OptimizeAborted(_logger, ex.GetType().Name);
+            throw;
+        }
+        catch (OperationCanceledException)
+        {
+            _telemetry.RecordOptimizeTerminal(
+                OptimizeOutcome.Cancelled, Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds, 0, 0, 0);
+            SetOutcomeTag(activity, OptimizeOutcome.Cancelled);
+            DeltaOptimizeLog.OptimizeCanceled(_logger);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // Any other pre-commit failure (a schema-evolution guard, a torn read, a pre-commit probe): the
+            // table is unchanged and any written outputs are orphaned (AC4). Fail-closed (Error).
+            _telemetry.RecordOptimizeTerminal(
+                OptimizeOutcome.Failure, Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds, 0, 0, 0);
+            SetOutcomeTag(activity, OptimizeOutcome.Failure);
+            activity?.SetStatus(ActivityStatusCode.Error);
+            DeltaOptimizeLog.OptimizeFailed(_logger, ex.GetType().Name);
+            throw;
+        }
+    }
+
+    private async Task<OptimizeResult> RunOptimizeAsync(
+        Snapshot readSnapshot,
+        Func<IReadOnlyDictionary<string, string?>, bool>? partitionFilter,
+        long target,
+        bool dryRun,
+        CancellationToken cancellationToken)
+    {
         ImmutableArray<string> partitionColumns = readSnapshot.Metadata.PartitionColumns;
         IReadOnlyList<CompactionGroup> groups = PlanCompaction(readSnapshot, partitionColumns, partitionFilter, target);
 
@@ -227,6 +378,21 @@ internal sealed class DeltaOptimize
                 .ConfigureAwait(false);
             CompactedOutput output = await WriteCompactedFileAsync(outputPath, dataSchema, batches, cancellationToken)
                 .ConfigureAwait(false);
+
+            // Security defense-in-depth (debug-only, never a release throw): the rows actually read into this
+            // group's batches must equal the rows written to (and recorded on) its single output. This catches
+            // a read/write mismatch (a dropped batch, a truncated write) directly from measured data, not from
+            // the inputs' add.stats (which may be absent). The real teeth are the AC1 content/row-count oracle.
+            long groupRowsRead = 0;
+            foreach (ColumnBatch batch in batches)
+            {
+                groupRowsRead += batch.LogicalRowCount;
+            }
+
+            Debug.Assert(
+                output.RowCount == groupRowsRead && (output.Statistics.NumRecords ?? -1L) == groupRowsRead,
+                $"OPTIMIZE row-count cross-check failed: read {groupRowsRead} row(s) but wrote " +
+                $"{output.RowCount} (add.stats NumRecords {output.Statistics.NumRecords?.ToString(CultureInfo.InvariantCulture) ?? "∅"}).");
 
             foreach (AddFileAction input in group.Inputs)
             {
@@ -260,6 +426,11 @@ internal sealed class DeltaOptimize
 
         return BuildCommittedResult(readSnapshot.Version, commit.Version, target, partitionColumns, summaries);
     }
+
+    /// <summary>Sets the bounded <c>deltasharp.outcome</c> tag on the OPTIMIZE span (a no-op when no listener
+    /// sampled it), mirroring <see cref="DeltaVacuum"/>.</summary>
+    private static void SetOutcomeTag(Activity? activity, OptimizeOutcome outcome) =>
+        activity?.SetTag(DeltaSharpTelemetry.OutcomeKey, DeltaStorageTelemetry.ToLabel(outcome));
 
     // Groups the eligible small active files by canonical partition key and bin-packs each partition's small
     // files into compaction groups of combined size <= target, skipping any single-file group (nothing to
@@ -357,9 +528,18 @@ internal sealed class DeltaOptimize
     }
 
     // Reads every input file of a compaction group into ColumnBatches, in the group's (packing) order, so
-    // the rewritten file preserves row content (AC1 row-count/checksum equivalence). The read projects the
-    // table's DATA schema (partition columns are not stored in the Parquet files; their values ride on the
-    // add action), which is exactly what the compacted file is written with.
+    // the rewritten file preserves the row multiset (AC1 row-count / content equivalence; order is the
+    // group's packing order, not the table's logical order). The read projects the table's CURRENT DATA
+    // schema (partition columns are not stored in the Parquet files; their values ride on the add action),
+    // which is exactly what the compacted file is written with.
+    //
+    // FIX #195/#497 (schema evolution, fails closed): an input written under an older schema (#190) is
+    // physically narrower than the current data schema, so ParquetFileReader.ResolveFileFields raises a
+    // "column '<x>' is not present in the Parquet file schema" DeltaStorageException that reads like
+    // corruption. Read-side null-fill of the absent columns is issue #497 and out of scope here; until it
+    // lands, translate that specific defect into a clear, actionable OptimizeSchemaEvolutionException. It is
+    // thrown BEFORE any commit (nothing has been committed yet), so OPTIMIZE fails closed: inputs stay
+    // active, the version is unchanged, any written outputs are orphans.
     private async Task<List<ColumnBatch>> ReadGroupBatchesAsync(
         CompactionGroup group, StructType dataSchema, CancellationToken cancellationToken)
     {
@@ -369,17 +549,32 @@ internal sealed class DeltaOptimize
             Stream stream = await _backend.OpenReadAsync(input.Path, cancellationToken).ConfigureAwait(false);
             await using (stream.ConfigureAwait(false))
             {
-                await foreach (ColumnBatch batch in _reader
-                    .ReadAsync(stream, dataSchema, keepRowGroup: null, cancellationToken)
-                    .ConfigureAwait(false))
+                try
                 {
-                    batches.Add(batch);
+                    await foreach (ColumnBatch batch in _reader
+                        .ReadAsync(stream, dataSchema, keepRowGroup: null, cancellationToken)
+                        .ConfigureAwait(false))
+                    {
+                        batches.Add(batch);
+                    }
+                }
+                catch (DeltaStorageException ex) when (IsNarrowSchemaEvolutionInput(ex))
+                {
+                    throw new OptimizeSchemaEvolutionException(input.Path, ex);
                 }
             }
         }
 
         return batches;
     }
+
+    // True iff the read failed because the input Parquet file is missing a column the current data schema
+    // requests — the additive schema-evolution (#190) narrow-file case that needs read-side null-fill (#497).
+    // A genuine byte-level corruption or a real type mismatch does NOT match (it carries a different message
+    // / kind), so it is not masked by the OPTIMIZE-specific schema-evolution error.
+    private static bool IsNarrowSchemaEvolutionInput(DeltaStorageException ex) =>
+        ex.Kind == StorageErrorKind.CorruptData
+        && ex.Message.Contains("is not present in the Parquet file schema", StringComparison.Ordinal);
 
     // Writes the group's batches into one compacted Parquet file with write-time statistics. The bytes are
     // first serialized to a seekable buffer (Parquet writes a trailing footer and the byte size is measured
@@ -498,7 +693,8 @@ internal sealed class DeltaOptimize
         accumulator.FilesAdded += 1;
         accumulator.BytesBefore += group.InputBytes;
         accumulator.BytesAfter += output.ByteSize;
-        accumulator.RowCount += output.RowCount;
+        accumulator.RowCount += output.RowCount;                 // measured (ground truth).
+        accumulator.EstimatedRowCount += group.InputRecordCount; // advisory (input add.stats, may be 0).
     }
 
     private OptimizeResult BuildCommittedResult(
@@ -513,6 +709,7 @@ internal sealed class DeltaOptimize
         long bytesBefore = 0;
         long bytesAfter = 0;
         long rowCount = 0;
+        long estimatedRowCount = 0;
         var partitions = ImmutableArray.CreateBuilder<OptimizePartitionSummary>(summaries.Count);
         foreach (PartitionAccumulator accumulator in summaries.Values.OrderBy(a => a.SortKey, StringComparer.Ordinal))
         {
@@ -521,13 +718,15 @@ internal sealed class DeltaOptimize
             bytesBefore += accumulator.BytesBefore;
             bytesAfter += accumulator.BytesAfter;
             rowCount += accumulator.RowCount;
+            estimatedRowCount += accumulator.EstimatedRowCount;
             partitions.Add(new OptimizePartitionSummary(
                 CanonicalPartitionValues(accumulator.PartitionValues, partitionColumns),
                 accumulator.FilesRemoved,
                 accumulator.FilesAdded,
                 accumulator.BytesBefore,
                 accumulator.BytesAfter,
-                accumulator.RowCount));
+                accumulator.RowCount,
+                accumulator.EstimatedRowCount));
         }
 
         return new OptimizeResult(
@@ -540,12 +739,14 @@ internal sealed class DeltaOptimize
             bytesBefore,
             bytesAfter,
             rowCount,
+            estimatedRowCount,
             partitions.ToImmutable());
     }
 
     // Reports the plan for a dry run (or a no-op when no partition has more than one small file). Nothing is
-    // written or committed, so BytesAfter is 0 and the reported RowCount is the best-effort sum of the
-    // inputs' recorded record counts (an input without add.stats contributes 0).
+    // written or committed, so BytesAfter is 0 and the MEASURED RowCount is 0 (nothing was read/written);
+    // the advisory EstimatedRowCount is the best-effort sum of the inputs' recorded record counts (an input
+    // without add.stats contributes 0). See OptimizeResult's remarks on the two row-count fidelities.
     private OptimizeResult BuildDryRunOrEmptyResult(
         long readVersion,
         bool dryRun,
@@ -565,27 +766,28 @@ internal sealed class DeltaOptimize
             accumulator.FilesRemoved += group.Inputs.Length;
             accumulator.FilesAdded += 1; // one predicted output file per group.
             accumulator.BytesBefore += group.InputBytes;
-            accumulator.RowCount += group.InputRecordCount;
+            accumulator.EstimatedRowCount += group.InputRecordCount; // advisory only; measured RowCount stays 0.
         }
 
         int filesRemoved = 0;
         int filesAdded = 0;
         long bytesBefore = 0;
-        long rowCount = 0;
+        long estimatedRowCount = 0;
         var partitions = ImmutableArray.CreateBuilder<OptimizePartitionSummary>(summaries.Count);
         foreach (PartitionAccumulator accumulator in summaries.Values.OrderBy(a => a.SortKey, StringComparer.Ordinal))
         {
             filesRemoved += accumulator.FilesRemoved;
             filesAdded += accumulator.FilesAdded;
             bytesBefore += accumulator.BytesBefore;
-            rowCount += accumulator.RowCount;
+            estimatedRowCount += accumulator.EstimatedRowCount;
             partitions.Add(new OptimizePartitionSummary(
                 CanonicalPartitionValues(accumulator.PartitionValues, partitionColumns),
                 accumulator.FilesRemoved,
                 accumulator.FilesAdded,
                 accumulator.BytesBefore,
                 BytesAfter: 0,
-                accumulator.RowCount));
+                RowCount: 0,
+                accumulator.EstimatedRowCount));
         }
 
         return new OptimizeResult(
@@ -597,7 +799,8 @@ internal sealed class DeltaOptimize
             filesAdded,
             bytesBefore,
             BytesAfter: 0,
-            rowCount,
+            RowCount: 0,
+            estimatedRowCount,
             partitions.ToImmutable());
     }
 
@@ -665,5 +868,7 @@ internal sealed class DeltaOptimize
         public long BytesAfter { get; set; }
 
         public long RowCount { get; set; }
+
+        public long EstimatedRowCount { get; set; }
     }
 }
