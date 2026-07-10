@@ -89,6 +89,16 @@ internal sealed class Snapshot
     /// </summary>
     public FilePruningResult PruneFiles(FilePruningRequest request) => FilePruner.Prune(ActiveFiles, request);
 
+    /// <summary>
+    /// Builds the read-only, side-effect-free <see cref="TableStatisticsReport"/> an optimizer requests
+    /// for cost-based planning (STORY-05.6.3 AC4): the table aggregates, a freshness/version token (this
+    /// snapshot's <see cref="Version"/>), and per-file/column statistic availability with explicit absence
+    /// reasons. It reads only the already-parsed snapshot state under <paramref name="policy"/> (defaults
+    /// to <see cref="StatisticsPolicy.Default"/>) and never re-reads data files.
+    /// </summary>
+    public TableStatisticsReport GetStatistics(StatisticsPolicy? policy = null) =>
+        SnapshotStatisticsReporter.Build(Version, Schema, ActiveFiles, policy ?? StatisticsPolicy.Default);
+
     private StructType ParseSchema()
     {
         DataType parsed;
