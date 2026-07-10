@@ -1,6 +1,5 @@
 using System.Collections.Immutable;
 using System.Globalization;
-using System.Text;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Types;
 
@@ -319,7 +318,7 @@ internal sealed class DeltaTableWriter
         var touchedKeys = new HashSet<string>(StringComparer.Ordinal);
         foreach (StagedDataFile file in files)
         {
-            touchedKeys.Add(PartitionKey(file.PartitionValues, partitionColumns));
+            touchedKeys.Add(PartitionKeyBuilder.Build(file.PartitionValues, partitionColumns));
         }
 
         // A prior active file is removed IFF its partition key exactly equals a touched partition key.
@@ -332,7 +331,7 @@ internal sealed class DeltaTableWriter
         var priorInTouched = new List<AddFileAction>();
         foreach (AddFileAction prior in readSnapshot.ActiveFiles)
         {
-            if (touchedKeys.Contains(PartitionKey(prior.PartitionValues, partitionColumns)))
+            if (touchedKeys.Contains(PartitionKeyBuilder.Build(prior.PartitionValues, partitionColumns)))
             {
                 priorInTouched.Add(prior);
             }
@@ -417,28 +416,5 @@ internal sealed class DeltaTableWriter
                 }
             }
         }
-    }
-
-    // A stable, injective key for a partition's values over the table's partition columns, so two files in
-    // the same partition map to the same key regardless of dictionary identity. NUL separators keep values
-    // that concatenate ambiguously (e.g. "a","b" vs "ab") distinct, and a null value is a distinct sentinel.
-    private static string PartitionKey(
-        ImmutableSortedDictionary<string, string?> partitionValues, ImmutableArray<string> partitionColumns)
-    {
-        if (partitionColumns.IsDefaultOrEmpty)
-        {
-            return string.Empty;
-        }
-
-        var sb = new StringBuilder();
-        foreach (string column in partitionColumns.OrderBy(c => c, StringComparer.Ordinal))
-        {
-            partitionValues.TryGetValue(column, out string? value);
-            sb.Append(column.Length.ToString(CultureInfo.InvariantCulture)).Append(':').Append(column).Append('\u0000');
-            sb.Append(value is null ? "\u0001null" : value.Length.ToString(CultureInfo.InvariantCulture) + ":" + value);
-            sb.Append('\u0000');
-        }
-
-        return sb.ToString();
     }
 }
