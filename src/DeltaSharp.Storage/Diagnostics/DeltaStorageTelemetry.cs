@@ -109,9 +109,10 @@ internal enum OptimizeOutcome
     /// was made — a benign no-op, distinct from a real completion.</summary>
     NoOp,
 
-    /// <summary>OPTIMIZE aborted fail-closed before publishing: a concurrent commit changed one of the
-    /// compaction inputs, or a pre-commit failure fired. The inputs stay active and any written outputs are
-    /// ignorable orphans — the table is unchanged (AC4).</summary>
+    /// <summary>OPTIMIZE aborted fail-closed before publishing because a concurrent commit changed one of
+    /// the compaction inputs (an OCC conflict, <see cref="DeltaConcurrentModificationException"/>). The inputs
+    /// stay active and any written outputs are ignorable orphans — the table is unchanged (AC4). A non-conflict
+    /// pre-commit failure is reported as <see cref="Failure"/>, not this outcome.</summary>
     Aborted,
 
     /// <summary>OPTIMIZE was cancelled via its <see cref="System.Threading.CancellationToken"/> before a
@@ -278,13 +279,13 @@ internal sealed class DeltaStorageTelemetry : IDisposable
             description: "Terminal Delta OPTIMIZE outcomes (dry-run, completed, no-op, aborted, cancelled, failure).");
         _optimizeFilesRemoved = _deltaMeter.CreateCounter<long>(
             "deltasharp.delta.optimize.files_removed", unit: "{file}",
-            description: "Small input files compacted away by a completed OPTIMIZE, by outcome.");
+            description: "Small input files compacted away by OPTIMIZE (planned counts under the dry_run outcome), by outcome.");
         _optimizeFilesAdded = _deltaMeter.CreateCounter<long>(
             "deltasharp.delta.optimize.files_added", unit: "{file}",
-            description: "Compacted output files added by a completed OPTIMIZE, by outcome.");
+            description: "Compacted output files added by OPTIMIZE (planned counts under the dry_run outcome), by outcome.");
         _optimizeBytes = _deltaMeter.CreateCounter<long>(
             "deltasharp.delta.optimize.bytes", unit: "By",
-            description: "Total input bytes rewritten by a completed OPTIMIZE, by outcome.");
+            description: "Total input bytes rewritten by OPTIMIZE (planned counts under the dry_run outcome), by outcome.");
     }
 
     /// <summary>The <c>DeltaSharp.Delta</c> meter (commit instruments). Exposed for reference-identity
