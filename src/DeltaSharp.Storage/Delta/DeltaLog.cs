@@ -91,18 +91,35 @@ internal sealed class DeltaLog
     ///
     /// <para>An <paramref name="asOf"/> before the earliest retained commit's effective timestamp fails
     /// closed with <see cref="DeltaProtocolErrorKind.RetentionGap"/> (AC3) rather than returning the earliest
-    /// state; an <paramref name="asOf"/> at or after the latest commit resolves to the latest version.</para>
+    /// state. An <paramref name="asOf"/> at (inclusive) or between commit timestamps resolves to the latest
+    /// version at or before it; an <paramref name="asOf"/> <b>strictly after the latest commit's</b> effective
+    /// timestamp is out of range and, when <paramref name="canReturnLatest"/> is <see langword="false"/> (the
+    /// default, matching Delta batch reads' <c>canReturnLastCommit=false</c>), fails closed with
+    /// <see cref="DeltaProtocolErrorKind.TimestampAfterLatest"/> rather than silently clamping to current data.
+    /// Pass <paramref name="canReturnLatest"/> <see langword="true"/> to opt into clamping a future timestamp
+    /// to the latest version instead.</para>
+    ///
+    /// <para><b>Only retained <c>&lt;N&gt;.json</c> commits are timestamp-addressable</b> (mirroring Delta,
+    /// which resolves against the listed delta json files): a version reachable only through a checkpoint —
+    /// with no surviving commit file — carries no commit timestamp and cannot be selected by
+    /// <c>timestampAsOf</c>.</para>
     /// </summary>
+    /// <param name="asOf">The instant to resolve to a version (compared in UTC).</param>
+    /// <param name="canReturnLatest">When <see langword="false"/> (default), a timestamp strictly after the
+    /// latest commit fails closed; when <see langword="true"/>, it clamps to the latest version.</param>
+    /// <param name="cancellationToken">Cancels the log listing and reconstruction I/O.</param>
     /// <exception cref="DeltaProtocolException">The log is empty (not a Delta table); the timestamp predates
-    /// the earliest retained commit (<see cref="DeltaProtocolErrorKind.RetentionGap"/>, AC3); or the resolved
-    /// version cannot be reconstructed (malformed/gap/missing protocol — <see cref="DeltaProtocolErrorKind.InconsistentLog"/>).</exception>
+    /// the earliest retained commit (<see cref="DeltaProtocolErrorKind.RetentionGap"/>, AC3); the timestamp is
+    /// strictly after the latest commit and <paramref name="canReturnLatest"/> is <see langword="false"/>
+    /// (<see cref="DeltaProtocolErrorKind.TimestampAfterLatest"/>); or the resolved version cannot be
+    /// reconstructed (malformed/gap/missing protocol — <see cref="DeltaProtocolErrorKind.InconsistentLog"/>).</exception>
     public async Task<TimeTravelResult> LoadSnapshotAsOfTimestampAsync(
-        DateTimeOffset asOf, CancellationToken cancellationToken = default)
+        DateTimeOffset asOf, bool canReturnLatest = false, CancellationToken cancellationToken = default)
     {
         long start = Stopwatch.GetTimestamp();
         LogListing listing = await ListLogAsync(cancellationToken).ConfigureAwait(false);
         _ = RequireLatest(listing);
-        long resolved = ResolveTimestampTarget(listing, asOf);
+        long resolved = ResolveTimestampTarget(listing, asOf, canReturnLatest);
         Snapshot snapshot = await ReconstructAsync(listing, resolved, start, cancellationToken).ConfigureAwait(false);
         return new TimeTravelResult(snapshot, resolved);
     }
@@ -116,7 +133,8 @@ internal sealed class DeltaLog
 
     /// <summary>Validates and resolves an explicit <c>versionAsOf</c> request against the discovered log:
     /// <see langword="null"/> ⇒ latest; a negative version or one <b>above</b> <paramref name="latest"/> is
-    /// an out-of-range error; a version <b>below</b> the earliest retained version is a retention gap (AC3).</summary>
+    /// an out-of-range error naming the available <c>[earliest, latest]</c> range; a version <b>below</b> the
+    /// earliest retained version is a retention gap (AC3).</summary>
     private static long ResolveExplicitVersionTarget(LogListing listing, long latest, long? version)
     {
         if (version is not { } requested)
@@ -124,14 +142,16 @@ internal sealed class DeltaLog
             return latest;
         }
 
+        long earliest = EarliestReconstructableVersion(listing);
         if (requested < 0 || requested > latest)
         {
+            // Delta versionNotFound reports the actually-available range (not always 0-based), so a
+            // log-cleaned table names its earliest retained version rather than an unreconstructable 0.
             throw DeltaProtocolException.Inconsistent(string.Create(
                 CultureInfo.InvariantCulture,
-                $"Requested Delta version {requested} does not exist; the table has versions 0 through {latest}."));
+                $"Requested Delta version {requested} does not exist; the table has versions {earliest} through {latest}."));
         }
 
-        long earliest = EarliestReconstructableVersion(listing);
         if (requested < earliest)
         {
             throw DeltaProtocolException.VersionNoLongerRetained(requested, earliest);
@@ -140,16 +160,25 @@ internal sealed class DeltaLog
         return requested;
     }
 
+    /// <summary>The strict-monotonicity step (in milliseconds) each Delta commit's effective timestamp is
+    /// forced past its predecessor's, so equal / out-of-order file mtimes still yield a strictly-increasing
+    /// timeline (mirrors Delta's <c>DeltaHistoryManager</c> monotonic adjustment).</summary>
+    private const long MonotonicStepMillis = 1;
+
     /// <summary>Resolves a <c>timestampAsOf</c> request to the latest version whose <b>effective</b> commit
     /// timestamp (monotonic-adjusted <c>&lt;N&gt;.json</c> mtime) is at or before <paramref name="asOf"/>.
     /// Candidates are the retained commit files at or above the earliest reconstructable version, so the
-    /// resolved version is always reconstructable. A timestamp before the earliest candidate fails closed
-    /// with a retention gap (AC3); the effective timestamps are strictly increasing so the last qualifying
+    /// resolved version is always reconstructable; a version reachable only through a checkpoint (no surviving
+    /// <c>&lt;N&gt;.json</c>) carries no timestamp and is <b>not</b> timestamp-addressable, matching Delta.
+    /// A timestamp before the earliest candidate fails closed (retention gap, or a first-commit error when the
+    /// earliest candidate is version 0); a timestamp <b>strictly after the latest</b> commit fails closed with
+    /// <see cref="DeltaProtocolErrorKind.TimestampAfterLatest"/> unless <paramref name="canReturnLatest"/> is
+    /// set (then it clamps to latest). The effective timestamps are strictly increasing so the last qualifying
     /// version is the answer.</summary>
-    private static long ResolveTimestampTarget(LogListing listing, DateTimeOffset asOf)
+    private static long ResolveTimestampTarget(LogListing listing, DateTimeOffset asOf, bool canReturnLatest)
     {
         long floor = EarliestReconstructableVersion(listing);
-        long[] candidates = listing.Commits.Where(v => v >= floor).OrderBy(v => v).ToArray();
+        long[] candidates = listing.Commits.Where(v => v >= floor).ToArray();
         if (candidates.Length == 0)
         {
             throw DeltaProtocolException.RetentionGap(
@@ -164,10 +193,10 @@ internal sealed class DeltaLog
         for (int i = 0; i < candidates.Length; i++)
         {
             long v = candidates[i];
-            long mtime = ToEpochMillis(listing.CommitTimestamps[v]);
+            long mtime = DeltaTimestamps.ToEpochMillis(listing.CommitTimestamps[v]);
             // Delta monotonicity: force each commit strictly later than its predecessor so equal / out-of-order
             // file mtimes still yield a deterministic, strictly-increasing timeline.
-            long effective = i == 0 ? mtime : Math.Max(mtime, effectivePrevious + 1);
+            long effective = i == 0 ? mtime : Math.Max(mtime, effectivePrevious + MonotonicStepMillis);
             if (i == 0)
             {
                 earliestEffective = effective;
@@ -185,8 +214,23 @@ internal sealed class DeltaLog
 
         if (resolved < 0)
         {
-            throw DeltaProtocolException.TimestampBeforeRetention(
-                asOf, candidates[0], DateTimeOffset.FromUnixTimeMilliseconds(earliestEffective));
+            long earliestCandidate = candidates[0];
+            DateTimeOffset earliestTs = DateTimeOffset.FromUnixTimeMilliseconds(earliestEffective);
+            throw earliestCandidate == 0
+                // v0 is retained: the timestamp is simply before the table's first commit, not log-cleaned.
+                ? DeltaProtocolException.TimestampBeforeFirstCommit(asOf, earliestTs)
+                // v0 was log-cleaned (earliest candidate > 0): earlier history was removed by log cleanup.
+                : DeltaProtocolException.TimestampBeforeRetention(asOf, earliestCandidate, earliestTs);
+        }
+
+        // When the request is strictly after the latest commit's effective timestamp, `resolved` is the latest
+        // candidate and `effectivePrevious` is that commit's effective timestamp. Delta batch reads
+        // (canReturnLastCommit=false) throw rather than silently clamp; keep parity unless the caller opts in.
+        long latestVersion = candidates[^1];
+        if (resolved == latestVersion && asOfMillis > effectivePrevious && !canReturnLatest)
+        {
+            throw DeltaProtocolException.TimestampAfterLatest(
+                asOf, latestVersion, DateTimeOffset.FromUnixTimeMilliseconds(effectivePrevious));
         }
 
         return resolved;
@@ -454,11 +498,6 @@ internal sealed class DeltaLog
 
     private static long? Max(long? current, long candidate) =>
         current is { } value ? Math.Max(value, candidate) : candidate;
-
-    /// <summary>The UTC modification time of a <c>&lt;N&gt;.json</c> object as Delta epoch milliseconds — the
-    /// unit timestamp resolution and the monotonicity adjustment work in (mirrors VACUUM's stamping).</summary>
-    private static long ToEpochMillis(DateTime lastModifiedUtc) =>
-        new DateTimeOffset(DateTime.SpecifyKind(lastModifiedUtc, DateTimeKind.Utc)).ToUnixTimeMilliseconds();
 
     private async Task<ReadOnlyMemory<byte>> ReadAllAsync(string path, CancellationToken cancellationToken)
     {

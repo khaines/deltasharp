@@ -127,8 +127,7 @@ public sealed class TimeTravelTests : IDisposable
     [InlineData(3_600_000, 1)]     // exactly t1 → v1 (boundary)
     [InlineData(5_400_000, 1)]     // between t1 and t2 → v1
     [InlineData(7_200_000, 2)]     // exactly t2 → v2
-    [InlineData(10_800_000, 3)]    // exactly t3 (latest) → v3
-    [InlineData(999_999_000, 3)]   // far after latest → clamps to latest (v3)
+    [InlineData(10_800_000, 3)]    // exactly t3 (latest) → v3 (inclusive boundary at latest — must NOT throw)
     public async Task LoadAsOfTimestamp_ResolvesToLatestVersionAtOrBefore_AndReportsIt(long asOfOffsetMillis, long expected)
     {
         DeltaLog log = await BuildLinearTimedTableAsync(
@@ -145,12 +144,58 @@ public sealed class TimeTravelTests : IDisposable
         Assert.Equal(DeltaTestHarness.Describe(byVersion), DeltaTestHarness.Describe(result.Snapshot));
     }
 
+    [Fact]
+    public async Task LoadAsOfTimestamp_StrictlyAfterLatestCommit_FailsClosed_ByDefault()
+    {
+        // FIX 1 (future-timestamp parity): a timestamp strictly after the latest commit's effective timestamp
+        // is out of range. Delta batch reads (canReturnLastCommit=false) throw timestampGreaterThanLatestCommit
+        // rather than silently clamping to current data; DeltaSharp matches by default.
+        DeltaLog log = await BuildLinearTimedTableAsync(
+            Origin, Origin.AddHours(1), Origin.AddHours(2), Origin.AddHours(3));
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => log.LoadSnapshotAsOfTimestampAsync(Origin.AddHours(3).AddMilliseconds(1)));
+
+        Assert.Equal(DeltaProtocolErrorKind.TimestampAfterLatest, ex.Kind);
+        Assert.Contains("after the latest Delta commit", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("version 3", ex.Message, StringComparison.Ordinal); // names the latest version
+    }
+
+    [Fact]
+    public async Task LoadAsOfTimestamp_StrictlyAfterLatestCommit_ClampsToLatest_WhenCanReturnLatest()
+    {
+        // FIX 1 opt-in: canReturnLatest:true restores the streaming-friendly clamp (return the latest version)
+        // for a future timestamp — the inverse of the fail-closed default above.
+        DeltaLog log = await BuildLinearTimedTableAsync(
+            Origin, Origin.AddHours(1), Origin.AddHours(2), Origin.AddHours(3));
+
+        TimeTravelResult result = await log.LoadSnapshotAsOfTimestampAsync(
+            Origin.AddMilliseconds(999_999_000), canReturnLatest: true);
+
+        Assert.Equal(3, result.ResolvedVersion);
+        Assert.Equal(3, result.Snapshot.Version);
+        Assert.Equal(4, result.Snapshot.ActiveFiles.Length); // {f0..f3}
+    }
+
+    [Fact]
+    public async Task LoadAsOfTimestamp_AtLatestCommitEffectiveTimestamp_ResolvesToLatest_NotFutureError()
+    {
+        // FIX 1 boundary: the inclusive instant equal to the latest commit's effective timestamp legitimately
+        // resolves to the latest version and must NOT be treated as a future timestamp.
+        DeltaLog log = await BuildLinearTimedTableAsync(
+            Origin, Origin.AddHours(1), Origin.AddHours(2), Origin.AddHours(3));
+
+        TimeTravelResult result = await log.LoadSnapshotAsOfTimestampAsync(Origin.AddHours(3));
+
+        Assert.Equal(3, result.ResolvedVersion);
+        Assert.Equal(3, result.Snapshot.Version);
+    }
+
     [Theory]
     [InlineData(0, 0)]   // eff(v0)=t0
     [InlineData(1, 1)]   // eff(v1)=t0+1ms (monotonicity forces strictly later than equal mtime)
     [InlineData(2, 2)]   // eff(v2)=t0+2ms
-    [InlineData(3, 3)]   // eff(v3)=t0+3ms
-    [InlineData(50, 3)]  // after the whole (compressed) timeline → latest
+    [InlineData(3, 3)]   // eff(v3)=t0+3ms (latest, inclusive boundary)
     public async Task LoadAsOfTimestamp_WithEqualMtimes_ResolvesViaStrictMonotonicity(long asOfOffsetMillis, long expected)
     {
         // All four commit files share one mtime; the reader must still produce a deterministic, strictly
@@ -184,17 +229,19 @@ public sealed class TimeTravelTests : IDisposable
     }
 
     [Fact]
-    public async Task LoadAsOfTimestamp_BeforeFirstCommit_FailsClosed_WithRetentionGap()
+    public async Task LoadAsOfTimestamp_BeforeFirstCommit_FailsClosed_WithFirstCommitMessage()
     {
-        // AC3 (timestamp before earliest): no commit has a timestamp at or before the instant → fail closed,
-        // never return the earliest/current state.
+        // AC3 (timestamp before earliest) + FIX 3b (creation branch): version 0 is retained, so a timestamp
+        // before the table existed is a first-commit error (not "removed by log cleanup"); still fail closed.
         DeltaLog log = await BuildLinearTimedTableAsync(Origin, Origin.AddHours(1), Origin.AddHours(2));
 
         DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
             () => log.LoadSnapshotAsOfTimestampAsync(Origin.AddMilliseconds(-1)));
 
         Assert.Equal(DeltaProtocolErrorKind.RetentionGap, ex.Kind);
+        Assert.Contains("before the table's first commit", ex.Message, StringComparison.Ordinal);
         Assert.Contains("version 0", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("log cleanup", ex.Message, StringComparison.Ordinal);
     }
 
     // ---- AC3: retention-aware errors (fail closed, distinguished from out-of-range future) ----
@@ -266,6 +313,107 @@ public sealed class TimeTravelTests : IDisposable
             () => new DeltaLog(backend).LoadSnapshotAsOfTimestampAsync(Origin));
         Assert.Equal(DeltaProtocolErrorKind.RetentionGap, ex.Kind);
         Assert.Contains("version 2", ex.Message, StringComparison.Ordinal);
+        // FIX 3b (retention branch): v0 was log-cleaned, so the message names log cleanup, not table creation.
+        Assert.Contains("log cleanup", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("first commit", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task LoadAsOfTimestamp_CheckpointOnlyTable_FailsClosed_TimestampUnavailable()
+    {
+        // FIX 4: a table whose only retained log artifact is a checkpoint (no <N>.json commit survives at or
+        // above the floor) has zero timestamp candidates — timestamp time travel is unavailable (fail closed).
+        IStorageBackend backend = NewBackend();
+        await DeltaTestHarness.WriteCheckpointAsync(backend, 2, new CheckpointFixture()
+            .Protocol(1, 2)
+            .Metadata(id: "t", schemaString: EmptySchemaUnescaped)
+            .Add("a.parquet", size: 1, modificationTime: 1)
+            .Add("b.parquet", size: 1, modificationTime: 1));
+        await DeltaTestHarness.WriteLastCheckpointAsync(backend, 2);
+        var log = new DeltaLog(backend);
+
+        // Sanity: the checkpoint-only table is still readable at the latest version by version travel.
+        Snapshot latest = await log.LoadSnapshotAsync();
+        Assert.Equal(2, latest.Version);
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => log.LoadSnapshotAsOfTimestampAsync(Origin.AddHours(1)));
+        Assert.Equal(DeltaProtocolErrorKind.RetentionGap, ex.Kind);
+        Assert.Contains("timestamp time travel is unavailable", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task LoadAsOfTimestamp_EmptyLog_FailsClosed_NotADeltaTable()
+    {
+        // FIX 4: the timestamp entry point must exercise the RequireLatest guard — an empty _delta_log is not
+        // a Delta table (InconsistentLog), never a silent empty snapshot.
+        IStorageBackend backend = NewBackend();
+        var log = new DeltaLog(backend);
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => log.LoadSnapshotAsOfTimestampAsync(Origin));
+        Assert.Equal(DeltaProtocolErrorKind.InconsistentLog, ex.Kind);
+        Assert.Contains("not a Delta table", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task LoadAsOfTimestamp_SingleCommitTable_ExactBoundaryResolvesToV0_StrictlyBeforeThrows()
+    {
+        // FIX 4: single-commit table. The exact (inclusive) commit instant resolves to v0; anything strictly
+        // before is a first-commit error (FIX 3b creation wording, v0 retained).
+        DeltaLog log = await BuildLinearTimedTableAsync(Origin.AddHours(5));
+
+        TimeTravelResult atBoundary = await log.LoadSnapshotAsOfTimestampAsync(Origin.AddHours(5));
+        Assert.Equal(0, atBoundary.ResolvedVersion);
+        Assert.Equal(0, atBoundary.Snapshot.Version);
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => log.LoadSnapshotAsOfTimestampAsync(Origin.AddHours(5).AddMilliseconds(-1)));
+        Assert.Equal(DeltaProtocolErrorKind.RetentionGap, ex.Kind);
+        Assert.Contains("before the table's first commit", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(300, 0)]   // eff(v0)=t0+300
+    [InlineData(301, 1)]   // eff(v1)=max(t0+200, eff0+1)=t0+301
+    [InlineData(302, 2)]   // eff(v2)=max(t0+100, eff1+1)=t0+302
+    [InlineData(303, 3)]   // eff(v3)=max(t0+50,  eff2+1)=t0+303 (latest, inclusive)
+    public async Task LoadAsOfTimestamp_WithStrictlyDecreasingMtimes_ResolvesDeterministically(
+        long asOfOffsetMillis, long expected)
+    {
+        // FIX 4: four strictly-DECREASING file mtimes. Strict monotonicity (eff(N)=max(mtime,eff(N-1)+1ms))
+        // still yields a strictly-increasing timeline (t0+300, +301, +302, +303) with a deterministic answer
+        // at every 1ms boundary.
+        DeltaLog log = await BuildLinearTimedTableAsync(
+            Origin.AddMilliseconds(300), Origin.AddMilliseconds(200),
+            Origin.AddMilliseconds(100), Origin.AddMilliseconds(50));
+
+        TimeTravelResult result = await log.LoadSnapshotAsOfTimestampAsync(Origin.AddMilliseconds(asOfOffsetMillis));
+
+        Assert.Equal(expected, result.ResolvedVersion);
+        Assert.Equal(expected, result.Snapshot.Version);
+    }
+
+    [Fact]
+    public async Task LoadVersion_AboveLatest_OnLogCleanedTable_NamesEarliestRetained_NotZero()
+    {
+        // FIX 3a: on a LOG-CLEANED table (earliest retained > 0), an out-of-range future version names the
+        // actual available range "{earliest} through {latest}", not a 0 that can no longer be reconstructed.
+        IStorageBackend backend = NewBackend();
+        await DeltaTestHarness.WriteCheckpointAsync(backend, 2, new CheckpointFixture()
+            .Protocol(1, 2)
+            .Metadata(id: "t", schemaString: EmptySchemaUnescaped)
+            .Add("a.parquet", size: 1, modificationTime: 1)
+            .Add("b.parquet", size: 1, modificationTime: 1));
+        await DeltaTestHarness.WriteLastCheckpointAsync(backend, 2);
+        await DeltaTestHarness.WriteCommitAsync(backend, 3, DeltaTestHarness.Add("c.parquet"));
+        var log = new DeltaLog(backend);
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => log.LoadSnapshotAsync(version: 9));
+        Assert.Equal(DeltaProtocolErrorKind.InconsistentLog, ex.Kind);
+        Assert.Contains("versions 2 through 3", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("versions 0 through", ex.Message, StringComparison.Ordinal);
     }
 
     // ---- AC4: a later checkpoint/commit never mutates historical state ----
