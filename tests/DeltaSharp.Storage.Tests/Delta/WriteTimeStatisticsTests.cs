@@ -135,7 +135,9 @@ public sealed class WriteTimeStatisticsTests : IDisposable
         var staged = new StagedDataFile(
             "region=eu/part-0.parquet", partition, result.ByteSize, 1L, result.Statistics);
 
-        DeltaCommitResult commit = await new DeltaTableWriter(_backend).AppendAsync(new[] { staged });
+        Snapshot writeSnapshot = await new DeltaLog(_backend).LoadSnapshotAsync();
+        DeltaCommitResult commit = await new DeltaTableWriter(_backend)
+            .AppendAsync(writeSnapshot, writeSnapshot.Schema, new[] { staged });
         Assert.Equal(1L, commit.Version);
 
         Snapshot reloaded = await new DeltaLog(_backend).LoadSnapshotAsync();
@@ -165,7 +167,9 @@ public sealed class WriteTimeStatisticsTests : IDisposable
             stream, Schema, new[] { SampleBatch() }, StatisticsPolicy.Default, CancellationToken.None);
         var staged = new StagedDataFile("part-0.parquet", NoPartition, result.ByteSize, 1L, result.Statistics);
 
-        DeltaCommitResult commit = await new DeltaTableWriter(_backend).AppendAsync(new[] { staged });
+        Snapshot writeSnapshot = await new DeltaLog(_backend).LoadSnapshotAsync();
+        DeltaCommitResult commit = await new DeltaTableWriter(_backend)
+            .AppendAsync(writeSnapshot, writeSnapshot.Schema, new[] { staged });
         Snapshot reloaded = await new DeltaLog(_backend).LoadSnapshotAsync();
 
         TableStatisticsReport report = reloaded.GetStatistics();
