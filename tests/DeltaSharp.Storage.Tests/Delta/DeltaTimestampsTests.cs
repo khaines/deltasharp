@@ -90,4 +90,70 @@ public sealed class DeltaTimestampsTests
         long actual = DeltaTimestamps.ToEpochMillis(gap, dstZone);
         Assert.Equal(expected, actual);
     }
+
+    [Fact]
+    public void ToEpochMillis_LocalKind_DstAmbiguousFallBackTime_ResolvesToStandardTime()
+    {
+        // Quality r4 (Low): cover the fall-back AMBIGUOUS hour on the valid path. When clocks fall back
+        // (daylight 02:00 -> standard 01:00), local times in [01:00, 02:00) occur twice. DateTime.ToUniversalTime()
+        // (and TimeZoneInfo.GetUtcOffset) resolve an ambiguous time to STANDARD time. This test injects a custom
+        // DST-observing zone so the ambiguity is deterministic on every host, and asserts the helper picks the
+        // standard-time (ToUniversalTime-consistent) instant.
+        var springForward = TimeZoneInfo.TransitionTime.CreateFixedDateRule(new DateTime(1, 1, 1, 2, 0, 0), 3, 10);
+        var fallBack = TimeZoneInfo.TransitionTime.CreateFixedDateRule(new DateTime(1, 1, 1, 2, 0, 0), 11, 3);
+        var rule = TimeZoneInfo.AdjustmentRule.CreateAdjustmentRule(
+            DateTime.MinValue.Date, DateTime.MaxValue.Date, TimeSpan.FromHours(1), springForward, fallBack);
+        var dstZone = TimeZoneInfo.CreateCustomTimeZone(
+            "deltasharp-test-dst-amb", TimeSpan.FromHours(-8), "Test DST", "Test Standard", "Test Daylight", new[] { rule });
+
+        // 01:30 on the fall-back day occurs twice (daylight 02:00 -> standard 01:00).
+        var ambiguous = new DateTime(2024, 11, 3, 1, 30, 0, DateTimeKind.Local);
+        Assert.True(dstZone.IsAmbiguousTime(DateTime.SpecifyKind(ambiguous, DateTimeKind.Unspecified)));
+
+        // ToUniversalTime()/GetUtcOffset resolve ambiguity to the standard (-08:00) offset => 09:30 UTC.
+        long expected = new DateTimeOffset(new DateTime(2024, 11, 3, 9, 30, 0, DateTimeKind.Utc)).ToUnixTimeMilliseconds();
+
+        Assert.Equal(expected, DeltaTimestamps.ToEpochMillis(ambiguous, dstZone));
+    }
+
+    [Fact]
+    public void ToEpochMillis_LocalKind_HistoricalBaseOffsetShift_UsesHistoricalOffset_NotCurrentBase()
+    {
+        // Round-4 resolved DST-invalid gap times with TimeZoneInfo.BaseUtcOffset, which is the zone's CURRENT
+        // base offset. Zones that historically SHIFTED their base offset (e.g. Pacific/Apia's end-2011
+        // International Date Line skip: -11:00 -> +13:00) therefore resolved a PRE-shift invalid-gap time with
+        // the WRONG offset — up to a 24h discrepancy vs the original DateTime.ToUniversalTime(), which consults
+        // the zone's FULL historical adjustment rules via GetUtcOffset. This regression test builds a custom zone
+        // whose current base is +13:00 but whose older era (2000..2009) had an effective base of +02:00 (a -11h
+        // baseUtcOffsetDelta, mirroring Apia's dateline shift), with a spring-forward gap in that older era. It
+        // proves the helper resolves the pre-shift gap with the HISTORICAL (+02:00) offset — matching
+        // ToUniversalTime() — NOT the current +13:00 base that BaseUtcOffset would (wrongly) apply.
+        var oldEraSpringForward = TimeZoneInfo.TransitionTime.CreateFixedDateRule(new DateTime(1, 1, 1, 2, 0, 0), 9, 26);
+        var oldEraFallBack = TimeZoneInfo.TransitionTime.CreateFixedDateRule(new DateTime(1, 1, 1, 3, 0, 0), 4, 4);
+        var oldRule = TimeZoneInfo.AdjustmentRule.CreateAdjustmentRule(
+            new DateTime(2000, 1, 1), new DateTime(2009, 12, 31),
+            TimeSpan.FromHours(1),        // daylightDelta
+            oldEraSpringForward, oldEraFallBack,
+            TimeSpan.FromHours(-11));     // baseUtcOffsetDelta => effective base +13-11 = +02:00 in this era
+        var shiftZone = TimeZoneInfo.CreateCustomTimeZone(
+            "deltasharp-test-hist-shift", TimeSpan.FromHours(13), "Hist Shift", "Hist Standard", "Hist Daylight",
+            new[] { oldRule });
+
+        // 02:30 on the old-era spring-forward day never existed (clocks jump 02:00 -> 03:00).
+        var oldGap = new DateTime(2005, 9, 26, 2, 30, 0, DateTimeKind.Local);
+        var oldGapUnspec = DateTime.SpecifyKind(oldGap, DateTimeKind.Unspecified);
+        Assert.True(shiftZone.IsInvalidTime(oldGapUnspec));
+        // Sanity: the historical (+02:00) and current-base (+13:00) offsets genuinely differ (by 11h here).
+        Assert.NotEqual(shiftZone.BaseUtcOffset, shiftZone.GetUtcOffset(oldGapUnspec));
+
+        // Historical (+02:00) offset => 00:30 UTC. This is what ToUniversalTime()/GetUtcOffset produce.
+        long expected = new DateTimeOffset(new DateTime(2005, 9, 26, 0, 30, 0, DateTimeKind.Utc)).ToUnixTimeMilliseconds();
+        // The round-4 BaseUtcOffset (+13:00) bug would instead yield the prior day 13:30 UTC — assert we DON'T.
+        long buggyBaseOffset = new DateTimeOffset(
+            DateTime.SpecifyKind(oldGapUnspec - shiftZone.BaseUtcOffset, DateTimeKind.Utc)).ToUnixTimeMilliseconds();
+
+        long actual = DeltaTimestamps.ToEpochMillis(oldGap, shiftZone);
+        Assert.Equal(expected, actual);
+        Assert.NotEqual(buggyBaseOffset, actual);
+    }
 }

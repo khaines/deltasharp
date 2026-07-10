@@ -7,11 +7,13 @@ namespace DeltaSharp.Storage.Delta;
 /// <para><b>Backend contract.</b> <see cref="Backends.StorageObjectInfo.LastModifiedUtc"/> must carry the
 /// modification instant in <b>UTC</b> (a <see cref="DateTimeKind.Utc"/> value); an <see cref="DateTimeKind.Unspecified"/>
 /// value is treated as already-UTC per that contract. A <see cref="DateTimeKind.Local"/> value (a
-/// non-conforming backend) is <b>converted</b> to UTC via <see cref="TimeZoneInfo.ConvertTimeToUtc(DateTime, TimeZoneInfo)"/>
-/// — never silently reinterpreted — so a backend whose listing returns a local-kind time cannot shift timestamp
-/// resolution by the machine's timezone offset. DST-invalid local times (the spring-forward gap) are resolved
-/// gracefully with the pre-transition (standard) offset — matching the prior <c>DateTime.ToUniversalTime()</c>
-/// behavior byte-for-byte — so they never throw.</para>
+/// non-conforming backend) is <b>converted</b> to UTC by reproducing <see cref="DateTime.ToUniversalTime()"/>
+/// via <see cref="TimeZoneInfo.GetUtcOffset(DateTime)"/> — never silently reinterpreted — so a backend whose
+/// listing returns a local-kind time cannot shift timestamp resolution by the machine's timezone offset.
+/// <see cref="TimeZoneInfo.GetUtcOffset(DateTime)"/> consults the zone's full historical adjustment rules, so
+/// the conversion is historically accurate (even for zones that shifted their base offset) and, for a
+/// DST-invalid spring-forward gap time, uses the pre-transition offset — so it never throws and matches the
+/// prior <c>DateTime.ToUniversalTime()</c> behavior byte-for-byte.</para>
 /// </summary>
 internal static class DeltaTimestamps
 {
@@ -27,10 +29,11 @@ internal static class DeltaTimestamps
     /// <b>converted</b> to UTC using <paramref name="localZone"/> rather than reinterpreted. The
     /// <paramref name="localZone"/> parameter is injectable so tests can exercise the conversion
     /// deterministically regardless of the host's ambient timezone; production callers pass
-    /// <see cref="TimeZoneInfo.Local"/>. A DST-invalid local instant (the spring-forward gap, where
-    /// <see cref="TimeZoneInfo.ConvertTimeToUtc(DateTime, TimeZoneInfo)"/> would throw) is resolved with the
-    /// pre-transition (standard) offset — matching the prior <c>DateTime.ToUniversalTime()</c> result exactly —
-    /// so this method never throws.</summary>
+    /// <see cref="TimeZoneInfo.Local"/>. The conversion reproduces <c>DateTime.ToUniversalTime()</c> via
+    /// <see cref="TimeZoneInfo.GetUtcOffset(DateTime)"/> (which consults the zone's full historical adjustment
+    /// rules), so it is historically accurate and, for a DST-invalid spring-forward gap instant, uses the
+    /// pre-transition offset — matching the prior <c>DateTime.ToUniversalTime()</c> result exactly — so this
+    /// method never throws.</summary>
     internal static long ToEpochMillis(DateTime lastModified, TimeZoneInfo localZone)
     {
         DateTime utc = lastModified.Kind switch
@@ -43,26 +46,22 @@ internal static class DeltaTimestamps
     }
 
     /// <summary>Converts a <see cref="DateTimeKind.Local"/> instant to UTC via <paramref name="localZone"/>,
-    /// converting (never reinterpreting) so the machine's timezone offset cannot shift resolution. A DST-invalid
-    /// spring-forward instant — for which <see cref="TimeZoneInfo.ConvertTimeToUtc(DateTime, TimeZoneInfo)"/> throws —
-    /// is instead resolved with the zone's standard (pre-transition) offset. This reproduces the previous
-    /// <c>DateTime.ToUniversalTime()</c> instant byte-for-byte (verified across a full-year, multi-zone sweep) while
-    /// still converting valid times through the injected zone so a reinterpret regression remains detectable.</summary>
+    /// reproducing <c>DateTime.ToUniversalTime()</c> exactly. <see cref="DateTime.ToUniversalTime()"/> internally
+    /// computes <c>local - TimeZoneInfo.Local.GetUtcOffset(local)</c>, and
+    /// <see cref="TimeZoneInfo.GetUtcOffset(DateTime)"/> consults the zone's <b>full historical adjustment rules</b>
+    /// (and, for a DST-invalid spring-forward gap time, returns the pre-transition offset). Computing the instant
+    /// uniformly as <c>unspecified - GetUtcOffset(unspecified)</c> therefore (a) never throws, (b) is historically
+    /// accurate — correct even for zones that shifted their <i>base</i> offset (e.g. <c>Pacific/Apia</c>'s 2011
+    /// International Date Line skip, which <see cref="TimeZoneInfo.BaseUtcOffset"/> would resolve with the wrong,
+    /// current base offset), (c) exactly reproduces <c>ToUniversalTime()</c> for the ambient zone, and (d) still
+    /// converts (never reinterprets) through the injected zone so a reinterpret regression remains detectable
+    /// (a fixed -7 zone yields <c>GetUtcOffset = -7</c> for all times, so the result differs from a
+    /// <c>SpecifyKind(dt, Utc)</c> reinterpret by 7h).</summary>
     private static DateTime LocalToUtc(DateTime lastModified, TimeZoneInfo localZone)
     {
-        // SpecifyKind to Unspecified first: ConvertTimeToUtc throws for a Local-kind DateTime paired with a
-        // non-Local zone (and IsInvalidTime/IsAmbiguousTime expect a non-UTC/non-Local kind for the target zone).
+        // SpecifyKind to Unspecified first: GetUtcOffset resolves a Local-kind DateTime against TimeZoneInfo.Local
+        // rather than the injected zone, so normalize the Kind before consulting the target zone's rules.
         DateTime unspecified = DateTime.SpecifyKind(lastModified, DateTimeKind.Unspecified);
-
-        // Spring-forward gap: this wall-clock time never existed, so ConvertTimeToUtc would throw. The prior
-        // ToUniversalTime() resolved it gracefully using the pre-transition (standard) offset; reproduce that.
-        if (localZone.IsInvalidTime(unspecified))
-        {
-            return DateTime.SpecifyKind(unspecified - localZone.BaseUtcOffset, DateTimeKind.Utc);
-        }
-
-        // Valid (incl. fall-back ambiguous) times: convert through the injected zone. ConvertTimeToUtc resolves
-        // ambiguous times to standard time — identical to the prior ToUniversalTime() — so no special-casing.
-        return TimeZoneInfo.ConvertTimeToUtc(unspecified, localZone);
+        return DateTime.SpecifyKind(unspecified - localZone.GetUtcOffset(unspecified), DateTimeKind.Utc);
     }
 }
