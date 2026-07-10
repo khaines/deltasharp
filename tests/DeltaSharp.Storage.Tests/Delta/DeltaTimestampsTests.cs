@@ -156,4 +156,39 @@ public sealed class DeltaTimestampsTests
         Assert.Equal(expected, actual);
         Assert.NotEqual(buggyBaseOffset, actual);
     }
+
+    [Fact]
+    public void ToEpochMillis_LocalKind_DateTimeRangeBoundaries_ClampWithoutThrowing_LikeToUniversalTime()
+    {
+        // Red-team (High) + Chaos (Low): a uniform `unspecified - GetUtcOffset(unspecified)` subtraction THROWS
+        // ArgumentOutOfRangeException at the DateTime range boundaries — DateTime.MaxValue minus a WEST (negative)
+        // offset overflows past DateTime.MaxValue, and DateTime.MinValue minus an EAST (positive) offset underflows
+        // past DateTime.MinValue (even a 1-minute offset). DateTime.ToUniversalTime() does NOT throw there: it
+        // SATURATES (clamps) at DateTime.Min/MaxValue.Ticks. The helper must reproduce that clamp byte-for-byte.
+        // Fixed-offset custom zones make this host-independent.
+        var westZone = TimeZoneInfo.CreateCustomTimeZone(
+            "deltasharp-test-west", TimeSpan.FromHours(-8), "Test West", "Test West");
+        var eastZone = TimeZoneInfo.CreateCustomTimeZone(
+            "deltasharp-test-east", TimeSpan.FromHours(9), "Test East", "Test East");
+
+        // MaxValue as Local + a west offset would push ticks past DateTime.MaxValue.Ticks: expect a clamp to
+        // DateTime.MaxValue UTC, matching ToUniversalTime()'s saturation, and NO throw.
+        var max = DateTime.SpecifyKind(DateTime.MaxValue, DateTimeKind.Local);
+        long expectedMax = new DateTimeOffset(
+            new DateTime(DateTime.MaxValue.Ticks, DateTimeKind.Utc)).ToUnixTimeMilliseconds();
+        long actualMax = 0;
+        var maxEx = Record.Exception(() => actualMax = DeltaTimestamps.ToEpochMillis(max, westZone));
+        Assert.Null(maxEx);
+        Assert.Equal(expectedMax, actualMax);
+
+        // MinValue as Local + an east offset would push ticks below DateTime.MinValue.Ticks: expect a clamp to
+        // DateTime.MinValue UTC, matching ToUniversalTime()'s saturation, and NO throw.
+        var min = DateTime.SpecifyKind(DateTime.MinValue, DateTimeKind.Local);
+        long expectedMin = new DateTimeOffset(
+            new DateTime(DateTime.MinValue.Ticks, DateTimeKind.Utc)).ToUnixTimeMilliseconds();
+        long actualMin = 0;
+        var minEx = Record.Exception(() => actualMin = DeltaTimestamps.ToEpochMillis(min, eastZone));
+        Assert.Null(minEx);
+        Assert.Equal(expectedMin, actualMin);
+    }
 }
