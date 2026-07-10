@@ -62,4 +62,32 @@ public sealed class DeltaTimestampsTests
         // Local DateTime — so the ambient path remains covered.
         Assert.Equal(new DateTimeOffset(local).ToUnixTimeMilliseconds(), DeltaTimestamps.ToEpochMillis(local));
     }
+
+    [Fact]
+    public void ToEpochMillis_LocalKind_DstInvalidGapTime_ResolvesGracefully_WithoutThrowing()
+    {
+        // Round-3 converted the Local arm to TimeZoneInfo.ConvertTimeToUtc, which THROWS ArgumentException for a
+        // DST spring-forward "invalid" wall-clock time (the ~1h gap that never existed). The prior
+        // DateTime.ToUniversalTime() resolved such times gracefully using the pre-transition (standard) offset.
+        // This regression test injects a custom DST-observing zone with an explicit spring-forward rule so a known
+        // local time is invalid on EVERY host (including a UTC CI host with no ambient DST), and asserts the helper
+        // no longer throws and returns the pre-transition-offset epoch that ToUniversalTime() produced.
+        var springForward = TimeZoneInfo.TransitionTime.CreateFixedDateRule(new DateTime(1, 1, 1, 2, 0, 0), 3, 10);
+        var fallBack = TimeZoneInfo.TransitionTime.CreateFixedDateRule(new DateTime(1, 1, 1, 2, 0, 0), 11, 3);
+        var rule = TimeZoneInfo.AdjustmentRule.CreateAdjustmentRule(
+            DateTime.MinValue.Date, DateTime.MaxValue.Date, TimeSpan.FromHours(1), springForward, fallBack);
+        var dstZone = TimeZoneInfo.CreateCustomTimeZone(
+            "deltasharp-test-dst", TimeSpan.FromHours(-8), "Test DST", "Test Standard", "Test Daylight", new[] { rule });
+
+        // 02:30 on the spring-forward day never existed in this zone (clocks jump 02:00 -> 03:00).
+        var gap = new DateTime(2024, 3, 10, 2, 30, 0, DateTimeKind.Local);
+        Assert.True(dstZone.IsInvalidTime(DateTime.SpecifyKind(gap, DateTimeKind.Unspecified)));
+
+        // Old ToUniversalTime() resolved the gap with the standard (pre-transition) -08:00 offset => 10:30 UTC.
+        long expected = new DateTimeOffset(new DateTime(2024, 3, 10, 10, 30, 0, DateTimeKind.Utc)).ToUnixTimeMilliseconds();
+
+        // Must NOT throw and must equal the graceful pre-transition-offset epoch.
+        long actual = DeltaTimestamps.ToEpochMillis(gap, dstZone);
+        Assert.Equal(expected, actual);
+    }
 }
