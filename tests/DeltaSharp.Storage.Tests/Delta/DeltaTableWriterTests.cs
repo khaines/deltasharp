@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
+using DeltaSharp.Types;
 using Xunit;
 
 namespace DeltaSharp.Storage.Tests.Delta;
@@ -13,6 +14,12 @@ namespace DeltaSharp.Storage.Tests.Delta;
 /// rejects a concurrent change to a touched partition while rebasing past an append to an untouched one
 /// (AC3); and a reader pinned to an old snapshot keeps its old active-file set (AC4). Mirrors
 /// <see cref="DeltaCommitterTests"/> + <see cref="DeltaTestHarness"/>.
+///
+/// <para>Every write entry point requires the incoming write schema (schema declaration is mandatory — the
+/// no-schema overloads that would bypass enforcement were removed, #190/FIX-4). These tables carry the empty
+/// schema, so passing <see cref="TableSchema"/> (or <c>readSnapshot.Schema</c>) expresses "this write
+/// conforms to the current table schema" — a no-op enforcement. Schema enforcement/evolution behavior is
+/// covered by <see cref="DeltaSchemaEvolutionWriterTests"/>.</para>
 /// </summary>
 public sealed class DeltaTableWriterTests : IDisposable
 {
@@ -36,6 +43,10 @@ public sealed class DeltaTableWriterTests : IDisposable
         {
         }
     }
+
+    // The tables seeded here carry the empty schema (DeltaTestHarness.Metadata → EmptySchema); passing it as
+    // the required writeSchema is a trivially-compatible, no-op enforcement.
+    private static readonly StructType TableSchema = StructType.Empty;
 
     private static readonly ImmutableSortedDictionary<string, string?> NoPartition =
         ImmutableSortedDictionary<string, string?>.Empty.WithComparers(StringComparer.Ordinal);
@@ -82,9 +93,9 @@ public sealed class DeltaTableWriterTests : IDisposable
     {
         // AC1: a committed append adds new `add` actions; every prior active file remains active.
         await SeedTableAsync();
-        await Writer().AppendAsync(new[] { Staged("a.parquet") });
+        await Writer().AppendAsync(TableSchema, new[] { Staged("a.parquet") });
 
-        DeltaCommitResult result = await Writer().AppendAsync(new[] { Staged("b.parquet") });
+        DeltaCommitResult result = await Writer().AppendAsync(TableSchema, new[] { Staged("b.parquet") });
 
         Assert.Equal(2L, result.Version);
         Snapshot reloaded = await LoadAsync();
@@ -96,9 +107,9 @@ public sealed class DeltaTableWriterTests : IDisposable
     {
         // AC1: the append's commit contains only `add` actions (no removes) — prior state is untouched.
         await SeedTableAsync();
-        await Writer().AppendAsync(new[] { Staged("a.parquet") });
+        await Writer().AppendAsync(TableSchema, new[] { Staged("a.parquet") });
 
-        DeltaCommitResult result = await Writer().AppendAsync(new[] { Staged("b.parquet"), Staged("c.parquet") });
+        DeltaCommitResult result = await Writer().AppendAsync(TableSchema, new[] { Staged("b.parquet"), Staged("c.parquet") });
 
         IReadOnlyList<DeltaAction> committed = await Log().ReadCommitActionsAsync(result.Version, CancellationToken.None);
         Assert.Equal(2, committed.OfType<AddFileAction>().Count());
@@ -113,7 +124,7 @@ public sealed class DeltaTableWriterTests : IDisposable
         await SeedTableAsync();
         FileStatistics stats = FileStatistics.Empty with { NumRecords = 42 };
 
-        await Writer().AppendAsync(new[] { Staged("a.parquet", stats: stats) });
+        await Writer().AppendAsync(TableSchema, new[] { Staged("a.parquet", stats: stats) });
 
         Snapshot reloaded = await LoadAsync();
         AddFileAction add = Assert.Single(reloaded.ActiveFiles);
@@ -129,7 +140,7 @@ public sealed class DeltaTableWriterTests : IDisposable
         Snapshot readSnapshot = await LoadAsync();
         await CommitRawAsync(1, DeltaTestHarness.Add("winner.parquet")); // concurrent winner at v1
 
-        DeltaCommitResult result = await Writer().AppendAsync(readSnapshot, new[] { Staged("mine.parquet") });
+        DeltaCommitResult result = await Writer().AppendAsync(readSnapshot, readSnapshot.Schema, new[] { Staged("mine.parquet") });
 
         Assert.Equal(2L, result.Version);
         Assert.Equal(new[] { "mine.parquet", "winner.parquet" }, ActivePaths(await LoadAsync()));
@@ -142,9 +153,9 @@ public sealed class DeltaTableWriterTests : IDisposable
     {
         // AC2: a full-table overwrite removes EVERY prior active file in the SAME version as the new adds.
         await SeedTableAsync();
-        await Writer().AppendAsync(new[] { Staged("a.parquet"), Staged("b.parquet") });
+        await Writer().AppendAsync(TableSchema, new[] { Staged("a.parquet"), Staged("b.parquet") });
 
-        DeltaCommitResult result = await Writer().OverwriteAsync(new[] { Staged("c.parquet") });
+        DeltaCommitResult result = await Writer().OverwriteAsync(TableSchema, new[] { Staged("c.parquet") });
 
         // Exactly one version advanced, and that single commit carried both removes AND the new add.
         IReadOnlyList<DeltaAction> committed = await Log().ReadCommitActionsAsync(result.Version, CancellationToken.None);
@@ -162,12 +173,12 @@ public sealed class DeltaTableWriterTests : IDisposable
     {
         // AC2 isolation: a full overwrite depends on the whole active set, so a concurrent append aborts it.
         await SeedTableAsync();
-        await Writer().AppendAsync(new[] { Staged("a.parquet") });
+        await Writer().AppendAsync(TableSchema, new[] { Staged("a.parquet") });
         Snapshot readSnapshot = await LoadAsync();
         await CommitRawAsync(readSnapshot.Version + 1, DeltaTestHarness.Add("winner.parquet"));
 
         await Assert.ThrowsAsync<ConcurrentAppendException>(() =>
-            Writer().OverwriteAsync(readSnapshot, new[] { Staged("c.parquet") }));
+            Writer().OverwriteAsync(readSnapshot, readSnapshot.Schema, new[] { Staged("c.parquet") }));
     }
 
     // ---------------------------------------------------------------- AC3: dynamic partition overwrite
@@ -178,13 +189,14 @@ public sealed class DeltaTableWriterTests : IDisposable
         // AC3 (happy path): a dynamic overwrite of region=US removes only US's prior files and adds the new
         // US file; the untouched region=EU partition is left entirely intact.
         await SeedTableAsync(partitionColumns: new[] { "region" });
-        await Writer().AppendAsync(new[]
+        await Writer().AppendAsync(TableSchema, new[]
         {
             Staged("us1.parquet", Partition(("region", "US"))),
             Staged("eu1.parquet", Partition(("region", "EU"))),
         });
 
         await Writer().OverwriteAsync(
+            TableSchema,
             new[] { Staged("us2.parquet", Partition(("region", "US"))) },
             PartitionOverwriteMode.Dynamic);
 
@@ -197,7 +209,7 @@ public sealed class DeltaTableWriterTests : IDisposable
         // AC3: when a concurrent commit changes a partition this overwrite touches (here it removes a prior
         // US file the overwrite read), conflict detection rejects the unsafe overwrite.
         await SeedTableAsync(partitionColumns: new[] { "region" });
-        await Writer().AppendAsync(new[]
+        await Writer().AppendAsync(TableSchema, new[]
         {
             Staged("us1.parquet", Partition(("region", "US"))),
             Staged("eu1.parquet", Partition(("region", "EU"))),
@@ -209,6 +221,7 @@ public sealed class DeltaTableWriterTests : IDisposable
         await Assert.ThrowsAsync<ConcurrentDeleteReadException>(() =>
             Writer().OverwriteAsync(
                 readSnapshot,
+                readSnapshot.Schema,
                 new[] { Staged("us2.parquet", Partition(("region", "US"))) },
                 PartitionOverwriteMode.Dynamic));
     }
@@ -219,7 +232,7 @@ public sealed class DeltaTableWriterTests : IDisposable
         // AC3 (the "dynamic" guarantee): a dynamic overwrite of US does NOT conflict with a concurrent
         // append to the untouched EU partition — it rebases and commits, so US is replaced and EU grows.
         await SeedTableAsync(partitionColumns: new[] { "region" });
-        await Writer().AppendAsync(new[]
+        await Writer().AppendAsync(TableSchema, new[]
         {
             Staged("us1.parquet", Partition(("region", "US"))),
             Staged("eu1.parquet", Partition(("region", "EU"))),
@@ -232,6 +245,7 @@ public sealed class DeltaTableWriterTests : IDisposable
 
         DeltaCommitResult result = await Writer().OverwriteAsync(
             readSnapshot,
+            readSnapshot.Schema,
             new[] { Staged("us2.parquet", Partition(("region", "US"))) },
             PartitionOverwriteMode.Dynamic);
 
@@ -247,10 +261,10 @@ public sealed class DeltaTableWriterTests : IDisposable
         // AC4: a reader pinned to an old snapshot keeps seeing its old active-file set until it refreshes,
         // even though a later append changed the table.
         await SeedTableAsync();
-        await Writer().AppendAsync(new[] { Staged("a.parquet") });
+        await Writer().AppendAsync(TableSchema, new[] { Staged("a.parquet") });
         Snapshot pinned = await LoadAsync(); // pinned at v1: {a}
 
-        await Writer().AppendAsync(new[] { Staged("b.parquet") }); // advances the table to v2
+        await Writer().AppendAsync(TableSchema, new[] { Staged("b.parquet") }); // advances the table to v2
 
         // The pinned snapshot is immutable: its version and active-file set are unchanged.
         Assert.Equal(1L, pinned.Version);
@@ -275,6 +289,7 @@ public sealed class DeltaTableWriterTests : IDisposable
         await CommitRawAsync(2, DeltaTestHarness.Add("us1.parquet", partitionValues: new[] { ("region", "US") }));
 
         await Writer().OverwriteAsync(
+            TableSchema,
             new[] { Staged("us2.parquet", Partition(("region", "US"))) },
             PartitionOverwriteMode.Dynamic);
 
@@ -290,7 +305,7 @@ public sealed class DeltaTableWriterTests : IDisposable
         await SeedTableAsync(partitionColumns: new[] { "region" });
 
         await Assert.ThrowsAsync<ArgumentException>(() =>
-            Writer().AppendAsync(new[] { Staged("nopart.parquet") })); // NoPartition ⇒ missing "region"
+            Writer().AppendAsync(TableSchema, new[] { Staged("nopart.parquet") })); // NoPartition ⇒ missing "region"
     }
 
     [Fact]
@@ -301,7 +316,7 @@ public sealed class DeltaTableWriterTests : IDisposable
 
         await Assert.ThrowsAsync<ArgumentException>(() =>
             Writer().OverwriteAsync(
-                new[] { Staged("nopart.parquet") }, PartitionOverwriteMode.Dynamic));
+                TableSchema, new[] { Staged("nopart.parquet") }, PartitionOverwriteMode.Dynamic));
     }
 
     [Fact]
@@ -310,9 +325,9 @@ public sealed class DeltaTableWriterTests : IDisposable
         // #486 R1 (Quality High): an unpartitioned table is a single partition, so a dynamic overwrite is a
         // full-table overwrite — every prior active file is removed and the new files added.
         await SeedTableAsync();
-        await Writer().AppendAsync(new[] { Staged("a.parquet"), Staged("b.parquet") });
+        await Writer().AppendAsync(TableSchema, new[] { Staged("a.parquet"), Staged("b.parquet") });
 
-        await Writer().OverwriteAsync(new[] { Staged("c.parquet") }, PartitionOverwriteMode.Dynamic);
+        await Writer().OverwriteAsync(TableSchema, new[] { Staged("c.parquet") }, PartitionOverwriteMode.Dynamic);
 
         Assert.Equal(new[] { "c.parquet" }, ActivePaths(await LoadAsync()));
     }
@@ -325,13 +340,13 @@ public sealed class DeltaTableWriterTests : IDisposable
         // overwrite. If it were left on the ReadFiles(all-priors) scope, this concurrent NEW-file append
         // (which touches no prior) would rebase and survive instead of aborting.
         await SeedTableAsync();
-        await Writer().AppendAsync(new[] { Staged("a.parquet") });
+        await Writer().AppendAsync(TableSchema, new[] { Staged("a.parquet") });
         Snapshot readSnapshot = await LoadAsync();
         await CommitRawAsync(readSnapshot.Version + 1, DeltaTestHarness.Add("winner.parquet"));
 
         await Assert.ThrowsAsync<ConcurrentAppendException>(() =>
             Writer().OverwriteAsync(
-                readSnapshot, new[] { Staged("c.parquet") }, PartitionOverwriteMode.Dynamic));
+                readSnapshot, readSnapshot.Schema, new[] { Staged("c.parquet") }, PartitionOverwriteMode.Dynamic));
     }
 
     [Fact]
@@ -342,13 +357,14 @@ public sealed class DeltaTableWriterTests : IDisposable
         // touched sets. Overwriting the first must leave a prior file in the second untouched. A constant/
         // non-injective key would remove both.
         await SeedTableAsync(partitionColumns: new[] { "a", "b" });
-        await Writer().AppendAsync(new[]
+        await Writer().AppendAsync(TableSchema, new[]
         {
             Staged("p1.parquet", Partition(("a", "x"), ("b", "yz"))),
             Staged("p2.parquet", Partition(("a", "xy"), ("b", "z"))),
         });
 
         await Writer().OverwriteAsync(
+            TableSchema,
             new[] { Staged("p1b.parquet", Partition(("a", "x"), ("b", "yz"))) },
             PartitionOverwriteMode.Dynamic);
 
@@ -362,11 +378,11 @@ public sealed class DeltaTableWriterTests : IDisposable
         // #486 R1 (Balanced M1 / Chaos): the writer's tombstone DeletionTimestamp comes from the injected
         // TimeProvider (determinism, no wall-clock). Exercise the internal ctor and assert the exact instant.
         await SeedTableAsync();
-        await Writer().AppendAsync(new[] { Staged("a.parquet") });
+        await Writer().AppendAsync(TableSchema, new[] { Staged("a.parquet") });
         var instant = new DateTimeOffset(2031, 5, 6, 7, 8, 9, TimeSpan.Zero);
         var writer = new DeltaTableWriter(new DeltaLog(_backend), new DeltaCommitter(_backend), new FixedTimeProvider(instant));
 
-        DeltaCommitResult result = await writer.OverwriteAsync(new[] { Staged("b.parquet") });
+        DeltaCommitResult result = await writer.OverwriteAsync(TableSchema, new[] { Staged("b.parquet") });
 
         IReadOnlyList<DeltaAction> committed = await Log().ReadCommitActionsAsync(result.Version, CancellationToken.None);
         RemoveFileAction removed = Assert.Single(committed.OfType<RemoveFileAction>());
@@ -379,12 +395,12 @@ public sealed class DeltaTableWriterTests : IDisposable
         // #486 R1 (Chaos): AC2 depends on the whole active set, so a concurrent REMOVE (not just an append)
         // of a prior file must abort the overwrite — the WholeTable delete-conflict branch.
         await SeedTableAsync();
-        await Writer().AppendAsync(new[] { Staged("a.parquet"), Staged("b.parquet") });
+        await Writer().AppendAsync(TableSchema, new[] { Staged("a.parquet"), Staged("b.parquet") });
         Snapshot readSnapshot = await LoadAsync();
         await CommitRawAsync(readSnapshot.Version + 1, DeltaTestHarness.Remove("a.parquet"));
 
         await Assert.ThrowsAsync<ConcurrentDeleteReadException>(() =>
-            Writer().OverwriteAsync(readSnapshot, new[] { Staged("c.parquet") }));
+            Writer().OverwriteAsync(readSnapshot, readSnapshot.Schema, new[] { Staged("c.parquet") }));
     }
 
     [Fact]
@@ -395,7 +411,7 @@ public sealed class DeltaTableWriterTests : IDisposable
         // set), so that file rebases and survives the overwrite. This pins the current (deferred) behavior so
         // an accidental change surfaces before #488's partition-predicate scope lands.
         await SeedTableAsync(partitionColumns: new[] { "region" });
-        await Writer().AppendAsync(new[] { Staged("us1.parquet", Partition(("region", "US"))) });
+        await Writer().AppendAsync(TableSchema, new[] { Staged("us1.parquet", Partition(("region", "US"))) });
         Snapshot readSnapshot = await LoadAsync();
         // Concurrent winner appends a NEW file into the SAME touched (US) partition.
         await CommitRawAsync(
@@ -404,6 +420,7 @@ public sealed class DeltaTableWriterTests : IDisposable
 
         DeltaCommitResult result = await Writer().OverwriteAsync(
             readSnapshot,
+            readSnapshot.Schema,
             new[] { Staged("us2.parquet", Partition(("region", "US"))) },
             PartitionOverwriteMode.Dynamic);
 
