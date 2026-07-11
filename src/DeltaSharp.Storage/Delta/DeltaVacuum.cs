@@ -299,7 +299,7 @@ internal sealed class DeltaVacuum
                 continue;
             }
 
-            candidates.Add(new OrphanCandidate(info.Path, ToEpochMillis(info.LastModifiedUtc)));
+            candidates.Add(new OrphanCandidate(info.Path, DeltaTimestamps.ToEpochMillis(info.LastModifiedUtc)));
         }
 
         Snapshot snapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
@@ -432,7 +432,4 @@ internal sealed class DeltaVacuum
     private static bool IsLogObject(string path) =>
         path.StartsWith(LogDirectoryPrefix, StringComparison.Ordinal) ||
         string.Equals(path, "_delta_log", StringComparison.Ordinal);
-
-    private static long ToEpochMillis(DateTime lastModifiedUtc) =>
-        new DateTimeOffset(DateTime.SpecifyKind(lastModifiedUtc, DateTimeKind.Utc)).ToUnixTimeMilliseconds();
 }
