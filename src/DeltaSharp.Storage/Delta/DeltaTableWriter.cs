@@ -601,36 +601,46 @@ internal sealed class DeltaTableWriter
             return;
         }
 
+        // Validate coverage with OUR OWN ordinal sets, INDEPENDENT of each dict's own key comparer. The
+        // guard must never delegate the ordinal-equality decision to the caller's `PartitionValues`
+        // comparer: a StagedDataFile built with StringComparer.OrdinalIgnoreCase would let a case-variant
+        // key (e.g. "REGION" for a declared "region") satisfy ContainsKey("region") AND keep an exact Count,
+        // silently authoring an `add` whose partitionValues keys do not ordinally match the table's declared
+        // partitionColumns. Building explicit Ordinal HashSets closes that case-variant bypass — for both the
+        // stray-key and the missing-column checks — regardless of the incoming dictionary's comparer
+        // (council #487 round-4 red-team, defense-in-depth). partitionColumns is duplicate-free table metadata.
+        var declared = new HashSet<string>(partitionColumns, StringComparer.Ordinal);
         foreach (StagedDataFile file in files)
         {
-            foreach (string column in partitionColumns)
+            // Reject stray keys: a staged file must carry NO partition value beyond the declared columns
+            // (measured ordinally), else a malformed partitionValues entry (a key the table's partition
+            // layout does not declare) would commit into the _delta_log. Name the offending key(s).
+            List<string> stray = file.PartitionValues.Keys
+                .Where(key => !declared.Contains(key)).ToList();
+            if (stray.Count > 0)
             {
-                if (!file.PartitionValues.ContainsKey(column))
-                {
-                    throw new DeltaStorageException(
-                        StorageErrorKind.SchemaMismatch,
-                        string.Create(
-                            CultureInfo.InvariantCulture,
-                            $"Staged file '{file.Path}' is missing partition column '{column}'; a partitioned " +
-                            $"write must specify a value (possibly null) for every partition column."));
-                }
-            }
-
-            // Reject stray keys: a staged file must carry NO partition value beyond the declared columns,
-            // else a malformed partitionValues entry (a key the table's partition layout does not declare)
-            // would commit into the _delta_log. All declared columns are confirmed present above, so an
-            // exact count check is sufficient; enumerate to name the offending key(s) fail-closed.
-            if (file.PartitionValues.Count != partitionColumns.Length)
-            {
-                IEnumerable<string> strayKeys = file.PartitionValues.Keys
-                    .Where(key => !partitionColumns.Contains(key, StringComparer.Ordinal));
                 throw new DeltaStorageException(
                     StorageErrorKind.SchemaMismatch,
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Staged file '{file.Path}' carries partition value(s) [{string.Join(", ", strayKeys)}] " +
+                        $"Staged file '{file.Path}' carries partition value(s) [{string.Join(", ", stray)}] " +
                         $"not declared by the table's partition columns [{string.Join(", ", partitionColumns)}]; " +
                         $"a partitioned write must not specify any partition value beyond the declared columns."));
+            }
+
+            // Reject missing columns: every declared column must be ordinally present among the file's keys.
+            var fileKeys = new HashSet<string>(file.PartitionValues.Keys, StringComparer.Ordinal);
+            List<string> missing = partitionColumns
+                .Where(column => !fileKeys.Contains(column)).ToList();
+            if (missing.Count > 0)
+            {
+                throw new DeltaStorageException(
+                    StorageErrorKind.SchemaMismatch,
+                    string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"Staged file '{file.Path}' is missing partition column(s) " +
+                        $"[{string.Join(", ", missing)}]; a partitioned write must specify a value " +
+                        $"(possibly null) for every partition column."));
             }
         }
     }

@@ -346,6 +346,36 @@ public sealed class DeltaTableWriterTests : IDisposable
     }
 
     [Fact]
+    public async Task Append_OnPartitionedTable_RejectsCaseVariantPartitionKey_ViaOrdinalGuard()
+    {
+        // HIGH (red-team, #487 round-4): the partitioned coverage guard must decide key equality with OUR
+        // OWN ordinal comparison, NOT the incoming dictionary's key comparer. A StagedDataFile whose
+        // PartitionValues is built with StringComparer.OrdinalIgnoreCase carrying a case-variant key
+        // ("REGION" for a declared "region") would, under a ContainsKey/Count guard, case-insensitively
+        // satisfy ContainsKey("region") AND keep an exact Count — silently authoring an `add` whose
+        // partitionValues keys do not ordinally match the table's declared partitionColumns. Building
+        // explicit Ordinal sets rejects "REGION" as a stray key. This test FAILS if the guard reverts to
+        // ContainsKey/Count (no exception thrown). Reachability today: StagedDataFile is internal and the
+        // sole real write path (ColumnBatchPartitioner.BuildPartitionValues) builds PartitionValues with
+        // StringComparer.Ordinal, so this is a latent guard-correctness / defense-in-depth gap, not a
+        // public-door bypass — but the guard must not trust the caller's comparer.
+        await SeedTableAsync(partitionColumns: new[] { "region" });
+
+        ImmutableSortedDictionary<string, string?>.Builder builder =
+            ImmutableSortedDictionary.CreateBuilder<string, string?>(StringComparer.OrdinalIgnoreCase);
+        builder["REGION"] = "US"; // case-variant of declared "region"
+        ImmutableSortedDictionary<string, string?> caseVariant = builder.ToImmutable();
+
+        // Sanity: the dict's own comparer would (wrongly) claim the declared "region" key is present.
+        Assert.True(caseVariant.ContainsKey("region"));
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(() =>
+            Writer().AppendAsync(TableSchema, new[] { Staged("casevariant.parquet", caseVariant) }));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+        Assert.Contains("REGION", ex.Message, StringComparison.Ordinal); // names REGION as stray, not accepted
+    }
+
+    [Fact]
     public async Task Append_OnUnpartitionedTable_RejectsStagedFileCarryingPartitionValues()
     {
         // HIGH (red-team, #487 round-2): the coverage guard must ALSO fail-closed on an UNPARTITIONED table.
