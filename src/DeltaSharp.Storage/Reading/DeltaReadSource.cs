@@ -115,7 +115,9 @@ public sealed class DeltaReadSource : IDisposable
     /// <param name="version">The exact version to read (as returned by <see cref="LoadSnapshotAsync"/>).</param>
     /// <param name="cancellationToken">Cancels the log reconstruction and per-file Parquet reads.</param>
     /// <returns>The active data as full-schema batches (an empty list for an empty snapshot).</returns>
-    /// <exception cref="DeltaReadException">The version cannot be reconstructed (out of range/gap/malformed).</exception>
+    /// <exception cref="DeltaReadException">The version cannot be reconstructed (out of range/gap/malformed),
+    /// or an active file could not be read at execution — a between-phase missing/deleted file or a poisoned
+    /// <c>add.path</c> confinement rejection — wrapped as this one typed, documented read failure.</exception>
     /// <exception cref="DeltaReadSchemaEvolutionException">An active file is physically narrower than the
     /// snapshot schema (an evolved file needing #497 read-side null-fill) — fails closed.</exception>
     public async Task<IReadOnlyList<ColumnBatch>> ReadBatchesAsync(
@@ -137,11 +139,25 @@ public sealed class DeltaReadSource : IDisposable
         int[] dataOrdinalByField = MapDataOrdinals(tableSchema, dataSchema);
 
         var batches = new List<ColumnBatch>();
-        foreach (AddFileAction add in snapshot.ActiveFiles)
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            await ReadFileAsync(add, tableSchema, dataSchema, dataOrdinalByField, batches, cancellationToken)
-                .ConfigureAwait(false);
+            foreach (AddFileAction add in snapshot.ActiveFiles)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                await ReadFileAsync(add, tableSchema, dataSchema, dataOrdinalByField, batches, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+        }
+        catch (DeltaStorageException ex)
+        {
+            // A between-phase missing/deleted active file (NotFound) or a poisoned add.path confinement
+            // rejection (PathNotConfined) — or any other internal storage fault raised while reading a file
+            // — surfaces the storage layer's internal DeltaStorageException. Wrap it as the facade's
+            // documented DeltaReadException so the pinned-version-vanished / poisoned-path window has ONE
+            // typed, catchable failure mode across the seam (its message is already free of raw storage
+            // detail — the backend discloses only the confined path). The #497 schema-evolution case is a
+            // distinct DeltaReadSchemaEvolutionException (not a DeltaStorageException) and escapes this catch.
+            throw new DeltaReadException(ex.Message, ex);
         }
 
         return batches;
@@ -240,6 +256,10 @@ public sealed class DeltaReadSource : IDisposable
     // True iff the read failed because the input Parquet file is missing a column the current data schema
     // requests — the additive schema-evolution (#190) narrow-file case that needs read-side null-fill (#497).
     // A genuine corruption or a real type mismatch carries a different message/kind and does NOT match.
+    // TRACKED DEFERRAL (#513): this classification is string-coupled to ParquetFileReader's "is not present
+    // in the Parquet file schema" message (the same coupling exists at OPTIMIZE's guard site in
+    // DeltaOptimize.IsNarrowSchemaEvolutionInput). A shared, message-independent error-kind that both guard
+    // sites match on is #513.
     private static bool IsNarrowSchemaEvolutionInput(DeltaStorageException ex) =>
         ex.Kind == StorageErrorKind.CorruptData
         && ex.Message.Contains("is not present in the Parquet file schema", StringComparison.Ordinal);

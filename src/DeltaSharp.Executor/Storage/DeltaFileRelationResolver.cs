@@ -33,6 +33,9 @@ internal sealed class DeltaFileRelationResolver : IFileRelationResolver
 
         try
         {
+            // NOTE (#499, Delta parity): request.UserSchema is intentionally NOT consulted. A Delta table's
+            // schema is authoritative from its log, so — exactly like Spark — a read-time `.schema(...)` is a
+            // documented no-op for `delta`; the resolved schema always comes from the pinned snapshot below.
             // TRACKED DEFERRAL (#508 sync-over-async): the analyzer's resolve seam is synchronous, so the
             // async facade is driven via .GetAwaiter().GetResult(). This is a bounded metadata read (list the
             // log, reconstruct one snapshot's header) — no data-plane I/O — so the sync bridge is cheap.

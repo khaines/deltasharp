@@ -110,7 +110,7 @@ internal sealed class PhysicalPlanner
 
     private PhysicalPlan PlanScan(LogicalResolvedRelation relation)
     {
-        if (!_scanSource.TryGetBatches(relation, out var batches))
+        if (!_scanSource.TryGetBatches(relation, out var batchFactory))
         {
             throw new UnsupportedPlanException(
                 QueryExecutionStage.Scan,
@@ -121,7 +121,9 @@ internal sealed class PhysicalPlanner
         // The relation schema is authoritative for the leaf's batches; the derived attributes (carrying
         // the ExprIds downstream expression resolution binds against) are memoized in `outputs` by
         // LogicalOutput.Derive during the initial traversal, so no per-scan derivation is needed here.
-        return new ScanPlan(relation.Schema, batches);
+        // The scan-source yields a DEFERRED batch factory the ScanPlan runs on first Execute (under the
+        // run's token/budget), so planning — and #179 Explain — performs NO data-plane I/O.
+        return new ScanPlan(relation.Schema, batchFactory);
     }
 
     private static PhysicalPlan PlanLocalRelation(LogicalLocalRelation relation)

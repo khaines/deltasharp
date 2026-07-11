@@ -275,6 +275,96 @@ public sealed class DeltaReadSourceTests : IDisposable
         Assert.Contains("#497", ex.Message);
     }
 
+    // ---------------------------------------------------------------- pinning: no analysis→execution TOCTOU
+
+    [Fact]
+    public async Task PinnedBaseVersion_SurvivesConcurrentCommit_ReadsPinnedNotLatest()
+    {
+        // The headline architectural claim (#499): the version is resolved ONCE (LoadSnapshotAsync, at
+        // "analysis") and the data is read at that EXACT pinned version (ReadBatchesAsync, at "execution"),
+        // so a concurrent commit that lands BETWEEN the two can never shift the data a base read returns.
+        using (DeltaWriteTarget target = WriteTarget())
+        {
+            await target.AppendAsync(FlatSchema, Array.Empty<string>(), new[] { FlatBatch((1, "alice")) }); // v0
+        }
+
+        // Resolve/pin latest (=0) — the analysis-time act.
+        long pinnedVersion;
+        using (DeltaReadSource pin = ReadSource())
+        {
+            DeltaSnapshotInfo pinned = await pin.LoadSnapshotAsync(null, null);
+            pinnedVersion = pinned.Version;
+        }
+
+        Assert.Equal(0L, pinnedVersion);
+
+        // A concurrent writer commits v1 AFTER the pin.
+        using (DeltaWriteTarget concurrent = WriteTarget())
+        {
+            await concurrent.AppendAsync(FlatSchema, Array.Empty<string>(), new[] { FlatBatch((2, "bob")) }); // v1
+        }
+
+        // Executing the PINNED read returns EXACTLY v0's data — not v1's — even though latest is now v1.
+        using DeltaReadSource read = ReadSource();
+        Assert.Equal(1L, (await read.LoadSnapshotAsync(null, null)).Version); // sanity: latest DID advance
+        List<(long, string?)> rows = await ReadFlatAsync(read, pinnedVersion);
+        Assert.Equal(new (long, string?)[] { (1L, "alice") }, rows);
+    }
+
+    // ---------------------------------------------------------------- larger / multi-batch read
+
+    [Fact]
+    public async Task ReadLatest_LargeRowCount_RoundTripsEveryRow()
+    {
+        // Beyond the tiny fixtures: a few thousand rows exercises the full write→read path (Parquet encode,
+        // batch assembly, full-schema materialization) and proves every row round-trips — not just the
+        // first handful.
+        const int rowCount = 5_000;
+        var rows = new (long Id, string? Name)[rowCount];
+        for (int i = 0; i < rowCount; i++)
+        {
+            rows[i] = (i, i % 7 == 0 ? null : "n" + i);
+        }
+
+        using (DeltaWriteTarget target = WriteTarget())
+        {
+            await target.AppendAsync(FlatSchema, Array.Empty<string>(), new[] { FlatBatch(rows) });
+        }
+
+        using DeltaReadSource source = ReadSource();
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        List<(long Id, string? Name)> read = await ReadFlatAsync(source, info.Version);
+
+        Assert.Equal(rowCount, read.Count);
+        Assert.Equal(
+            rows.OrderBy(r => r.Id).ToList(),
+            read.OrderBy(r => r.Id).ToList());
+    }
+
+    // ---------------------------------------------------------------- read-time fault wrapping (uniform type)
+
+    [Fact]
+    public async Task PinnedFileDeletedBetweenPhases_FailsClosed_AsDeltaReadException()
+    {
+        // A between-phase missing/deleted active file (the pinned-version-vanished window) must surface as
+        // the facade's ONE typed, documented DeltaReadException — not an unwrapped internal storage fault.
+        using (DeltaWriteTarget target = WriteTarget())
+        {
+            await target.AppendAsync(FlatSchema, Array.Empty<string>(), new[] { FlatBatch((1, "alice")) });
+        }
+
+        using DeltaReadSource source = ReadSource();
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+
+        // Delete the active data file AFTER the snapshot was pinned but BEFORE the read.
+        foreach (string file in Directory.EnumerateFiles(_root, "*.parquet", SearchOption.AllDirectories))
+        {
+            File.Delete(file);
+        }
+
+        await Assert.ThrowsAsync<DeltaReadException>(() => source.ReadBatchesAsync(info.Version));
+    }
+
     // ---------------------------------------------------------------- helpers
 
     private void SetCommitTimestamp(long version, DateTimeOffset timestamp)

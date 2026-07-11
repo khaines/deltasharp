@@ -268,7 +268,95 @@ public sealed class DeltaReadDoorEndToEndTests : IDisposable
         Assert.Equal(new[] { "bob", "carol" }, names);
     }
 
+    // ---------------------------------------------------------------- lazy scan: Explain does NO data I/O
+
+    [Fact]
+    public void Explain_DeltaRead_PlansPhysically_WithoutReadingDataFiles()
+    {
+        string table = Table("explain-no-io");
+        WritePeople(table, "append", (1, "alice"), (2, "bob"));
+
+        // Delete every data (.parquet) file but KEEP the _delta_log. If physical PLANNING read data files
+        // (the lazy/eager violation), Explain's physical section could not open them and would render the
+        // "<cannot plan physically: …>" diagnostic instead of a real Scan node. The lazy ScanPlan thunk
+        // defers all data-plane I/O to execution, so planning renders the physical Scan without touching a
+        // single Parquet byte (analysis reads only the still-present log metadata).
+        DeleteDataFiles(table);
+
+        using SparkSession spark = NewSession();
+        DataFrame df = spark.Read.Format("delta").Load(table);
+
+        string explain = df.ToExplainString(ExplainMode.Extended);
+
+        Assert.Contains("Scan", explain);
+        Assert.DoesNotContain("cannot plan physically", explain);
+
+        // And the read genuinely IS deferred to execution: collecting now DOES touch the (deleted) files
+        // and fails — proving Explain above did no data I/O.
+        Assert.ThrowsAny<Exception>(() => df.Collect());
+    }
+
+    // ---------------------------------------------------------------- ResolveDeltaReadVersion single-leaf
+
+    [Fact]
+    public void ResolveDeltaReadVersion_MultipleDeltaLeaves_Throws()
+    {
+        string left = Table("multi-left");
+        string right = Table("multi-right");
+        WritePeople(left, "append", (1, "alice"));
+        WritePeople(right, "append", (2, "bob"));
+
+        using SparkSession spark = NewSession();
+        DataFrame combined = spark.Read.Format("delta").Load(left)
+            .Union(spark.Read.Format("delta").Load(right));
+
+        // A union of two Delta reads has TWO pinned-version leaves and therefore no single resolved
+        // version; the invariant is enforced (not "first match wins").
+        InvalidOperationException ex =
+            Assert.Throws<InvalidOperationException>(() => combined.ResolveDeltaReadVersion());
+        Assert.Contains("more than one Delta read leaf", ex.Message);
+    }
+
+    // ---------------------------------------------------------------- null partition round-trip (write→read)
+
+    [Fact]
+    public void NullPartitionValue_RoundTripsThroughWriteAndReadDoors()
+    {
+        string table = Table("null-partition");
+        using (SparkSession write = NewSession())
+        {
+            write.CreateDataFrame(Regional((1, "alice", "US"), (2, "bob", null)), RegionSchema)
+                .Write.Format("delta").Mode("append").PartitionBy("region").Save(table);
+        }
+
+        using SparkSession read = NewSession();
+        List<(int, string?, string?)> rows = read.Read.Format("delta").Load(table).Collect()
+            .Select(r => (
+                r.GetAs<int>("id"),
+                r.IsNullAt(r.Schema.IndexOf("name")) ? null : r.GetAs<string>("name"),
+                r.IsNullAt(r.Schema.IndexOf("region")) ? null : r.GetAs<string>("region")))
+            .OrderBy(r => r.Item1)
+            .ToList();
+
+        Assert.Equal(
+            new (int, string?, string?)[] { (1, "alice", "US"), (2, "bob", (string?)null) },
+            rows);
+    }
+
     // ---------------------------------------------------------------- helpers
+
+    private static void DeleteDataFiles(string table)
+    {
+        foreach (string file in Directory.EnumerateFiles(table, "*.parquet", SearchOption.AllDirectories))
+        {
+            // Data files live outside _delta_log; checkpoint .parquet files (if any) live inside it and are
+            // metadata, not data — never touched by a base read, so leaving them is fine either way.
+            if (!file.Contains(Path.Combine("_delta_log"), StringComparison.Ordinal))
+            {
+                File.Delete(file);
+            }
+        }
+    }
 
     private static void SetCommitTimestamp(string table, long version, DateTimeOffset timestamp)
     {

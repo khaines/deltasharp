@@ -153,7 +153,10 @@ internal sealed class Analyzer
     /// the Executor's Delta scan-source consumes. A <c>parquet</c> (or any other) scan stays deferred to
     /// EPIC-05; a <c>delta</c> read in a process with no storage backend registered (no Executor) fails
     /// closed with a clear diagnostic. Time-travel parsing (and the both-specified error) runs first, so a
-    /// bad spec is rejected before any I/O.</summary>
+    /// bad spec is rejected before any I/O. A user-supplied read <c>schema</c>
+    /// (<see cref="FileRelationResolutionRequest.UserSchema"/>) is deliberately <b>ignored</b> for <c>delta</c>
+    /// (Delta parity — the schema is authoritative from the snapshot, exactly as Spark ignores a read-time
+    /// schema on a Delta table); the resolved schema always comes from the pinned snapshot.</summary>
     private LogicalPlan ResolveFileRelation(UnresolvedFileRelation file, ExprIdGenerator idGenerator)
     {
         if (!string.Equals(file.Format, DeltaReadRelation.DeltaFormat, StringComparison.OrdinalIgnoreCase))

@@ -228,16 +228,74 @@ public sealed class DeltaReadDoorTests
     }
 
     [Fact]
-    public void Analyzer_DeltaScan_VersionOptionAndPathVersionSuffix_Throws()
+    public void Analyzer_DeltaScan_VersionOption_MakesPathLiteral_ReadsRealAtVSuffixTable()
     {
+        // Escape hatch (#499 HIGH): an explicit versionAsOf option makes the load path LITERAL, so a real
+        // table whose directory legitimately ends in '@v1' is readable — the option wins, the '@v2' suffix
+        // is NOT parsed off the path, and there is NO false path-vs-option conflict.
+        using SparkSession spark = NewSession();
+        var resolver = new StubResolver(PeopleSchema, resolvedVersion: 1);
+        LogicalPlan plan = spark.Read.Format("delta").Option("versionAsOf", "1").Load("/tables/people@v2").Plan;
+
+        _ = new Analyzer(new LocalCatalog(), resolver).Resolve(plan);
+
+        Assert.Equal("/tables/people@v2", resolver.LastRequest!.Value.Path);
+        Assert.Equal(1L, resolver.LastRequest.Value.VersionAsOf);
+        Assert.Null(resolver.LastRequest.Value.TimestampAsOf);
+    }
+
+    [Fact]
+    public void Analyzer_DeltaScan_TimestampOption_MakesPathLiteral_KeepsAtVSuffix()
+    {
+        // The same escape hatch for a timestampAsOf option: the '@v3' suffix stays part of the literal path.
         using SparkSession spark = NewSession();
         var resolver = new StubResolver(PeopleSchema, resolvedVersion: 0);
-        LogicalPlan plan = spark.Read.Format("delta").Option("versionAsOf", "1").Load("/t@v2").Plan;
+        LogicalPlan plan = spark.Read
+            .Format("delta").Option("timestampAsOf", "2021-06-15 12:30:00").Load("/tables/t@v3").Plan;
+
+        _ = new Analyzer(new LocalCatalog(), resolver).Resolve(plan);
+
+        Assert.Equal("/tables/t@v3", resolver.LastRequest!.Value.Path);
+        Assert.NotNull(resolver.LastRequest.Value.TimestampAsOf);
+        Assert.Null(resolver.LastRequest.Value.VersionAsOf);
+    }
+
+    [Theory]
+    [InlineData("/t@v")]
+    [InlineData("/t@v-1")]
+    [InlineData("/t@vabc")]
+    [InlineData("/t@voverflow")]
+    [InlineData("/t@v99999999999999999999999999")]
+    public void Analyzer_DeltaScan_MalformedVersionSuffix_NoOption_Throws(string path)
+    {
+        // F3 (fail closed): a last '@'-segment that BEGINS like a version suffix ('@v…') but is not a valid
+        // non-negative version is a mistyped time-travel intent — reject it (naming the bad suffix) rather
+        // than silently degrading to a literal path that reads latest.
+        using SparkSession spark = NewSession();
+        var resolver = new StubResolver(PeopleSchema, resolvedVersion: 0);
+        LogicalPlan plan = spark.Read.Format("delta").Load(path).Plan;
 
         AnalysisException ex = Assert.Throws<AnalysisException>(
             () => new Analyzer(new LocalCatalog(), resolver).Resolve(plan));
 
         Assert.Equal(AnalysisErrorKind.InvalidTimeTravelSpec, ex.Kind);
+        Assert.Null(resolver.LastRequest); // rejected before any resolution I/O
+    }
+
+    [Fact]
+    public void Analyzer_DeltaScan_GenuineAtInPath_NoSuffixIntent_TreatedAsLiteral()
+    {
+        // A last '@'-segment that neither begins with 'v'/'V' nor is a valid compact timestamp is genuine
+        // path text (no time-travel intent) and stays literal — no strip, no error, no time travel.
+        using SparkSession spark = NewSession();
+        var resolver = new StubResolver(PeopleSchema, resolvedVersion: 0);
+        LogicalPlan plan = spark.Read.Format("delta").Load("/data/my@table").Plan;
+
+        _ = new Analyzer(new LocalCatalog(), resolver).Resolve(plan);
+
+        Assert.Equal("/data/my@table", resolver.LastRequest!.Value.Path);
+        Assert.Null(resolver.LastRequest.Value.VersionAsOf);
+        Assert.Null(resolver.LastRequest.Value.TimestampAsOf);
     }
 
     [Fact]

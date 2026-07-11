@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text;
 using DeltaSharp.Engine.Columnar;
+using DeltaSharp.Storage.Writing;
 using DeltaSharp.Types;
 
 namespace DeltaSharp.Storage.Reading;
@@ -13,8 +14,9 @@ namespace DeltaSharp.Storage.Reading;
 /// column back into the output batch from this string — the exact inverse of
 /// <see cref="DeltaSharp.Storage.Writing.DeltaWriteEncoding.FormatPartitionValue"/>, honoring the ADR-0008
 /// lane storage (Date is an epoch-day int, Timestamp an epoch-microsecond long, compact/wide decimals the
-/// unscaled integer). A <see langword="null"/> partition value fills the whole column with nulls.
-/// </summary>
+/// unscaled integer). A <see langword="null"/> partition value — or the Hive default-partition sentinel
+/// string (<see cref="DeltaSharp.Storage.Writing.DeltaWriteEncoding.HiveDefaultPartition"/>, which a
+/// non-canonical/foreign writer may record literally) — fills the whole column with nulls.</summary>
 internal static class DeltaReadEncoding
 {
     private static readonly DateOnly UnixEpochDate = new(1970, 1, 1);
@@ -34,7 +36,16 @@ internal static class DeltaReadEncoding
         ArgumentOutOfRangeException.ThrowIfNegative(rowCount);
 
         MutableColumnVector vector = ColumnVectors.Create(type, Math.Max(rowCount, 1));
-        if (value is null)
+
+        // A JSON null OR the Hive default-partition sentinel string (`__HIVE_DEFAULT_PARTITION__`, the
+        // shared const from DeltaWriteEncoding) both denote a NULL partition value. #507's write door stores
+        // a real JSON null in `add.partitionValues`, so this is not a #507 round-trip break; but a
+        // non-canonical / foreign writer (or a future directory-derived read) can record the sentinel
+        // literally, and treating it as NULL — rather than trying to parse it into a typed lane — is the
+        // unambiguous cross-engine read behavior (Spark/Delta parity), so a typed (int/long/date) partition
+        // never crashes on the sentinel.
+        if (value is null
+            || string.Equals(value, DeltaWriteEncoding.HiveDefaultPartition, StringComparison.Ordinal))
         {
             for (int r = 0; r < rowCount; r++)
             {

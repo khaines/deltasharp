@@ -30,18 +30,20 @@ internal sealed class CompositeScanSource : IScanSource
     }
 
     /// <inheritdoc/>
-    public bool TryGetBatches(ResolvedRelation relation, [NotNullWhen(true)] out IReadOnlyList<ColumnBatch>? batches)
+    public bool TryGetBatches(
+        ResolvedRelation relation,
+        [NotNullWhen(true)] out Func<CancellationToken, IReadOnlyList<ColumnBatch>>? batchFactory)
     {
         ArgumentNullException.ThrowIfNull(relation);
         foreach (IScanSource source in _sources)
         {
-            if (source.TryGetBatches(relation, out batches))
+            if (source.TryGetBatches(relation, out batchFactory))
             {
                 return true;
             }
         }
 
-        batches = null;
+        batchFactory = null;
         return false;
     }
 }

@@ -898,7 +898,8 @@ public sealed class DataFrame
     /// </summary>
     /// <returns>The pinned Delta snapshot version.</returns>
     /// <exception cref="InvalidOperationException">This frame is not a Delta file read (no resolved Delta
-    /// relation in its analyzed plan).</exception>
+    /// relation in its analyzed plan), or it contains more than one Delta read leaf (a join/union of Delta
+    /// reads has no single pinned version).</exception>
     /// <exception cref="Analysis.AnalysisException">Resolution failed (bad time-travel spec, not a Delta
     /// table, out-of-range/retention-gap version, or timestamp after the latest commit).</exception>
     internal long ResolveDeltaReadVersion()
@@ -916,26 +917,45 @@ public sealed class DataFrame
     }
 
     // Walks the analyzed plan for the resolved Delta scan and reads its pinned version out of the reserved
-    // read-door options (the Core↔Executor seam DeltaReadRelation threads the version through). A read plan
-    // has exactly one such leaf; the first match wins.
+    // read-door options (the Core↔Executor seam DeltaReadRelation threads the version through). A single
+    // Delta file read has exactly one such leaf; a multi-leaf plan (a join/union of Delta reads) has no
+    // single pinned version, so the invariant is ENFORCED (not assumed) — >1 leaf throws rather than
+    // silently letting the first match win.
     private static bool TryFindDeltaReadVersion(LogicalPlan node, out long version)
     {
-        if (node is Plans.Logical.ResolvedRelation relation
-            && Plans.Logical.DeltaReadRelation.TryGet(relation.Options, out _, out version))
+        long? found = null;
+        CollectDeltaReadVersion(node, ref found);
+        if (found is { } single)
         {
+            version = single;
             return true;
-        }
-
-        foreach (LogicalPlan child in node.Children)
-        {
-            if (TryFindDeltaReadVersion(child, out version))
-            {
-                return true;
-            }
         }
 
         version = 0;
         return false;
+    }
+
+    private static void CollectDeltaReadVersion(LogicalPlan node, ref long? found)
+    {
+        if (node is Plans.Logical.ResolvedRelation relation
+            && Plans.Logical.DeltaReadRelation.TryGet(relation.Options, out _, out long version))
+        {
+            if (found is not null)
+            {
+                throw new InvalidOperationException(
+                    "ResolveDeltaReadVersion() requires a single Delta file read, but the analyzed plan "
+                    + "contains more than one Delta read leaf (for example a join or union of Delta reads), "
+                    + "which has no single pinned version. Resolve each Delta read's version from its own "
+                    + "DataFrame.");
+            }
+
+            found = version;
+        }
+
+        foreach (LogicalPlan child in node.Children)
+        {
+            CollectDeltaReadVersion(child, ref found);
+        }
     }
 
     /// <summary>

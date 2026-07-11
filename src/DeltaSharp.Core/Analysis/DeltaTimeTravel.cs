@@ -13,10 +13,26 @@ namespace DeltaSharp.Analysis;
 /// the storage seam only maps a valid spec onto a snapshot.
 /// </summary>
 /// <remarks>
+/// <para><b>Option wins; path is literal (escape hatch).</b> When an explicit <c>versionAsOf</c> or
+/// <c>timestampAsOf</c> <i>option</i> is present, the load path is treated <b>literally</b> — no
+/// <c>@v&lt;n&gt;</c>/<c>@ts</c> suffix is parsed from it (Spark-faithful: the option is authoritative).
+/// This makes a real table path that legitimately ends in <c>@v1</c> readable (pass an explicit option),
+/// and removes any false path-vs-option conflict. Only when <b>no</b> time-travel option is given is a
+/// path suffix parsed.</para>
+///
 /// <para><b>Both-specified rule (fail closed).</b> Spark disallows specifying both a version and a
-/// timestamp. DeltaSharp additionally rejects specifying the <i>same</i> dimension twice (an option and the
-/// path suffix), so any redundant/conflicting time-travel spec is a deterministic
-/// <see cref="AnalysisException"/> — never a silently-ignored option.</para>
+/// timestamp. Supplying <i>both</i> the <c>versionAsOf</c> and <c>timestampAsOf</c> options is a
+/// deterministic <see cref="AnalysisException"/> (<see cref="AnalysisErrorKind.InvalidTimeTravelSpec"/>),
+/// never a silently-ignored option.</para>
+///
+/// <para><b>Malformed <c>@v</c> path suffix (fail closed).</b> When no option is present and the last
+/// <c>@</c>-segment begins with <c>@v</c> but is not a valid non-negative version (<c>@v</c>, <c>@v-1</c>,
+/// <c>@vabc</c>, an overflowing <c>@v99…9</c>), it is treated as a <i>mistyped</i> time-travel suffix and
+/// rejected with <see cref="AnalysisException.InvalidTimeTravelValue"/> naming the bad suffix — rather than
+/// silently degrading to a literal path that reads latest. A table whose path must literally begin its last
+/// segment with <c>@v</c> reads through the explicit-option escape hatch above. A last <c>@</c>-segment that
+/// does not look like a version suffix (does not begin with <c>v</c>/<c>V</c>) and is not a valid compact
+/// timestamp stays part of the literal path.</para>
 ///
 /// <para><b>Timestamp timezone.</b> Timestamps (both the option string and the path suffix) are interpreted
 /// as <b>UTC</b> and compared in UTC by the storage layer. Spark resolves <c>timestampAsOf</c> in the
@@ -52,40 +68,53 @@ internal static class DeltaTimeTravel
     };
 
     /// <summary>Parses <paramref name="path"/> + <paramref name="options"/> into a normalized time-travel spec.</summary>
-    /// <param name="path">The load path, possibly carrying a <c>@v…</c>/<c>@…</c> suffix.</param>
+    /// <param name="path">The load path, possibly carrying a <c>@v…</c>/<c>@…</c> suffix (only parsed when no
+    /// time-travel option is present — an explicit option makes the path literal).</param>
     /// <param name="options">The reader options (may hold <c>versionAsOf</c>/<c>timestampAsOf</c>).</param>
     /// <returns>The stripped path and the pinned version XOR timestamp (both null for a base read).</returns>
-    /// <exception cref="AnalysisException">Time travel was specified more than one way, or a value is
-    /// unparseable.</exception>
+    /// <exception cref="AnalysisException">Both the versionAsOf and timestampAsOf options were specified, a
+    /// value is unparseable, or the path carries a malformed <c>@v</c> suffix.</exception>
     public static DeltaTimeTravelSpec Parse(string path, IReadOnlyDictionary<string, string> options)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
         ArgumentNullException.ThrowIfNull(options);
 
-        (string strippedPath, long? pathVersion, DateTimeOffset? pathTimestamp) = ParsePathSuffix(path);
-
         long? optionVersion = ParseOptionVersion(options);
         DateTimeOffset? optionTimestamp = ParseOptionTimestamp(options);
 
-        long? version = Combine(
-            path, "version", pathVersion, optionVersion,
-            "the path '@v<n>' suffix and the versionAsOf option both pin a version");
-        DateTimeOffset? timestamp = Combine(
-            path, "timestamp", pathTimestamp, optionTimestamp,
-            "the path timestamp suffix and the timestampAsOf option both pin a timestamp");
-
-        if (version is not null && timestamp is not null)
+        // An explicit time-travel OPTION wins and makes the load path LITERAL: we do NOT parse a
+        // `@v<n>`/`@ts` suffix from the path (Spark-faithful — the option is authoritative). This is the
+        // escape hatch that keeps a real table path legitimately ending in `@v1` readable, and it removes
+        // the false path-vs-option conflict entirely. Only a base read (no option) inspects the path suffix.
+        if (optionVersion is not null || optionTimestamp is not null)
         {
-            throw AnalysisException.ConflictingTimeTravel(
-                path, "a version and a timestamp were both specified");
+            if (optionVersion is not null && optionTimestamp is not null)
+            {
+                throw AnalysisException.ConflictingTimeTravel(
+                    path, "the versionAsOf and timestampAsOf options both pin time travel");
+            }
+
+            return new DeltaTimeTravelSpec(path, optionVersion, optionTimestamp);
         }
 
-        return new DeltaTimeTravelSpec(strippedPath, version, timestamp);
+        (string strippedPath, long? pathVersion, DateTimeOffset? pathTimestamp) = ParsePathSuffix(path);
+
+        // A single last `@`-segment yields at most one dimension, so a pure-path version+timestamp conflict
+        // cannot arise here; this guard defends that invariant (fail closed) should the parser ever change.
+        if (pathVersion is not null && pathTimestamp is not null)
+        {
+            throw AnalysisException.ConflictingTimeTravel(
+                path, "the path suffix pins both a version and a timestamp");
+        }
+
+        return new DeltaTimeTravelSpec(strippedPath, pathVersion, pathTimestamp);
     }
 
     // A path-suffix `@v<digits>` pins a version; `@<14-or-17 digits>` pins a UTC timestamp; any other `@…`
     // (or no `@`) is part of the path. Only the LAST `@` segment is considered (a path may legitimately
-    // contain earlier `@`s, e.g. userinfo), matching Delta's suffix parsing.
+    // contain earlier `@`s, e.g. userinfo), matching Delta's suffix parsing. Called only for a base read
+    // (no time-travel option): a `@v`-prefixed but malformed suffix is a mistyped time-travel intent and
+    // fails closed rather than silently reading latest.
     private static (string Path, long? Version, DateTimeOffset? Timestamp) ParsePathSuffix(string path)
     {
         int at = path.LastIndexOf('@');
@@ -110,7 +139,13 @@ internal static class DeltaTimeTravel
                 return (prefix, version, null);
             }
 
-            return (path, null, null);
+            // Begins like a version suffix (`@v…`) but is not a valid non-negative version: a mistyped
+            // time-travel suffix, not a silent literal-path-that-reads-latest. Fail closed and name it.
+            throw AnalysisException.InvalidTimeTravelValue(
+                "path version suffix",
+                "@" + suffix,
+                "expected '@v<non-negative-integer>'; to read a table whose path literally ends this way, "
+                + "pass an explicit versionAsOf/timestampAsOf option (which makes the path literal)");
         }
 
         if (IsAllDigits(suffix)
@@ -168,19 +203,6 @@ internal static class DeltaTimeTravel
             TimestampAsOfOption, raw,
             "expected a timestamp like 'yyyy-MM-dd', 'yyyy-MM-dd HH:mm:ss[.fff]', or an ISO-8601 instant "
             + "(interpreted as UTC when no offset is given)");
-    }
-
-    private static T? Combine<T>(
-        string path, string dimension, T? fromPath, T? fromOption, string detail)
-        where T : struct
-    {
-        if (fromPath is not null && fromOption is not null)
-        {
-            throw AnalysisException.ConflictingTimeTravel(path, detail);
-        }
-
-        _ = dimension;
-        return fromPath ?? fromOption;
     }
 
     private static bool TryGetOption(
