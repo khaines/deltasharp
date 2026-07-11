@@ -263,6 +263,53 @@ public sealed class DeltaWriteTargetTests : IDisposable
     }
 
     [Fact]
+    public async Task StaticOverwrite_Empty_OnAlreadyEmptyTable_IsNoOp_VersionUnchanged()
+    {
+        // MEDIUM (Architect, #487 round-3): a STATIC empty overwrite of an ALREADY-empty table (same schema)
+        // is an idempotent no-op — Spark treats it as benign. It must NOT build a 0-remove/0-add/0-metadata
+        // action list (which DeltaCommitter rejects as an empty commit with an internal ArgumentException).
+        // Repro: create the empty schema'd table at v0, then overwrite-empty again over that empty table.
+        using DeltaWriteTarget target = Target();
+        DeltaWriteResult created = await target.OverwriteAsync(
+            FlatSchema, Array.Empty<string>(), Array.Empty<ColumnBatch>(), DeltaPartitionOverwriteMode.Static);
+        Assert.Equal(0L, created.Version); // fresh path ⇒ empty table at v0
+
+        // Second empty static overwrite over the now-empty table: idempotent no-op, no throw.
+        DeltaWriteResult result = await target.OverwriteAsync(
+            FlatSchema, Array.Empty<string>(), Array.Empty<ColumnBatch>(), DeltaPartitionOverwriteMode.Static);
+
+        Assert.Equal(0L, result.Version);      // version UNCHANGED (no new commit)
+        Assert.Equal(0, result.FilesWritten);  // 0 adds
+        Snapshot snapshot = await LoadSnapshotAsync();
+        Assert.Equal(0L, snapshot.Version);    // still v0 — nothing was committed
+        Assert.Empty(snapshot.ActiveFiles);    // still empty
+        Assert.Empty(await ReadFlatAsync());
+    }
+
+    [Fact]
+    public async Task StaticOverwrite_Empty_TwiceOnTruncatedTable_IsNoOp_VersionUnchanged()
+    {
+        // MEDIUM (Architect, #487 round-3): re-running an empty overwrite must be idempotent. First empty
+        // overwrite over a NON-empty table truncates (a real commit); a SECOND empty overwrite over the now-
+        // empty table is a no-op (version unchanged, no 0-action ArgumentException).
+        using DeltaWriteTarget target = Target();
+        await target.AppendAsync(FlatSchema, Array.Empty<string>(), new[] { FlatBatch((1, "a"), (2, "b")) });
+
+        DeltaWriteResult truncate = await target.OverwriteAsync(
+            FlatSchema, Array.Empty<string>(), Array.Empty<ColumnBatch>(), DeltaPartitionOverwriteMode.Static);
+        Assert.Equal(1L, truncate.Version);    // real truncate committed at v1
+
+        DeltaWriteResult again = await target.OverwriteAsync(
+            FlatSchema, Array.Empty<string>(), Array.Empty<ColumnBatch>(), DeltaPartitionOverwriteMode.Static);
+
+        Assert.Equal(1L, again.Version);       // version UNCHANGED — idempotent no-op
+        Snapshot snapshot = await LoadSnapshotAsync();
+        Assert.Equal(1L, snapshot.Version);
+        Assert.Empty(snapshot.ActiveFiles);
+        Assert.Empty(await ReadFlatAsync());
+    }
+
+    [Fact]
     public async Task DynamicOverwrite_Empty_IsNoOp_LeavesTableUnchanged()
     {
         // CRITICAL (red-team, #487 round-2): a DYNAMIC overwrite of an EMPTY DataFrame is a genuine no-op —

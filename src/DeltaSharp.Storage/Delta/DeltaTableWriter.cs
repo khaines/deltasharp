@@ -333,6 +333,18 @@ internal sealed class DeltaTableWriter
             // incompatible schema; a compatible same-schema truncate carries no metaData change.
             MetadataAction? truncateEvolution =
                 ReconcileSchema(readSnapshot, writeSchema, SchemaEvolutionMode.None);
+
+            // Idempotent no-op guard: if the active set is ALREADY empty AND the schema is unchanged
+            // (no metaData/schema evolution), a "truncate" would build a 0-remove/0-add/0-metadata action
+            // list — which DeltaCommitter rejects as an empty commit. Spark treats an empty overwrite of an
+            // already-empty table as a benign no-op, so short-circuit to Skipped (version unchanged) rather
+            // than let that internal invariant escape the deterministic storage contract. A non-empty active
+            // set still truncates for real below.
+            if (readSnapshot.ActiveFiles.IsEmpty && truncateEvolution is null)
+            {
+                return new DeltaCommitResult(readSnapshot.Version, Attempts: 0, Skipped: true);
+            }
+
             return await FullOverwriteAsync(readSnapshot, files, truncateEvolution, cancellationToken)
                 .ConfigureAwait(false);
         }
@@ -595,13 +607,30 @@ internal sealed class DeltaTableWriter
             {
                 if (!file.PartitionValues.ContainsKey(column))
                 {
-                    throw new ArgumentException(
+                    throw new DeltaStorageException(
+                        StorageErrorKind.SchemaMismatch,
                         string.Create(
                             CultureInfo.InvariantCulture,
                             $"Staged file '{file.Path}' is missing partition column '{column}'; a partitioned " +
-                            $"write must specify a value (possibly null) for every partition column."),
-                        nameof(files));
+                            $"write must specify a value (possibly null) for every partition column."));
                 }
+            }
+
+            // Reject stray keys: a staged file must carry NO partition value beyond the declared columns,
+            // else a malformed partitionValues entry (a key the table's partition layout does not declare)
+            // would commit into the _delta_log. All declared columns are confirmed present above, so an
+            // exact count check is sufficient; enumerate to name the offending key(s) fail-closed.
+            if (file.PartitionValues.Count != partitionColumns.Length)
+            {
+                IEnumerable<string> strayKeys = file.PartitionValues.Keys
+                    .Where(key => !partitionColumns.Contains(key, StringComparer.Ordinal));
+                throw new DeltaStorageException(
+                    StorageErrorKind.SchemaMismatch,
+                    string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"Staged file '{file.Path}' carries partition value(s) [{string.Join(", ", strayKeys)}] " +
+                        $"not declared by the table's partition columns [{string.Join(", ", partitionColumns)}]; " +
+                        $"a partitioned write must not specify any partition value beyond the declared columns."));
             }
         }
     }

@@ -303,21 +303,46 @@ public sealed class DeltaTableWriterTests : IDisposable
     {
         // #486 R1 (Balanced L2 / Security write-path): fail-closed — a partitioned write must specify every
         // partition column, else the add would land in the wrong (null) partition and later mis-select.
+        // #487 round-3 (red-team): unified on DeltaStorageException(SchemaMismatch) for a consistent
+        // fail-closed storage-exception contract (was ArgumentException).
         await SeedTableAsync(partitionColumns: new[] { "region" });
 
-        await Assert.ThrowsAsync<ArgumentException>(() =>
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(() =>
             Writer().AppendAsync(TableSchema, new[] { Staged("nopart.parquet") })); // NoPartition ⇒ missing "region"
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+        Assert.Contains("region", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
     public async Task Overwrite_OnPartitionedTable_RejectsStagedFileMissingPartitionColumn()
     {
         // #486 R1: the same fail-closed coverage guard applies to overwrites (both modes go through it).
+        // #487 round-3: DeltaStorageException(SchemaMismatch), unified with the unpartitioned branch.
         await SeedTableAsync(partitionColumns: new[] { "region" });
 
-        await Assert.ThrowsAsync<ArgumentException>(() =>
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(() =>
             Writer().OverwriteAsync(
                 TableSchema, new[] { Staged("nopart.parquet") }, PartitionOverwriteMode.Dynamic));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+    }
+
+    [Fact]
+    public async Task Append_OnPartitionedTable_RejectsStagedFileCarryingStrayPartitionKey()
+    {
+        // HIGH (red-team, #487 round-3): the partitioned coverage guard must ALSO reject a staged file that
+        // carries an EXTRA partition key beyond the declared columns. Before the fix the guard only asserted
+        // every DECLARED column was present and never checked for stray keys, so a file with an unexpected
+        // partition value would commit a malformed `partitionValues` into the _delta_log. It must be
+        // rejected fail-closed, naming the stray key.
+        await SeedTableAsync(partitionColumns: new[] { "region" });
+
+        // All declared columns present (region) PLUS a stray "zone" key.
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(() =>
+            Writer().AppendAsync(
+                TableSchema,
+                new[] { Staged("stray.parquet", Partition(("region", "US"), ("zone", "az1"))) }));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+        Assert.Contains("zone", ex.Message, StringComparison.Ordinal); // names the stray key
     }
 
     [Fact]
