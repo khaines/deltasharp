@@ -96,12 +96,11 @@ internal abstract class PhysicalPlan
     };
 }
 
-/// <summary>A leaf scan over in-memory batches. The batches are supplied either eagerly (a pre-materialized
-/// batch list) or via a <b>lazy thunk</b> evaluated on first <see cref="Execute"/> — the latter is how every
-/// <see cref="IScanSource"/> scan (a <c>LocalRelation</c>, an in-memory catalog fixture, or a real Delta
-/// file read) defers row→batch encoding / data-plane I/O out of physical planning so
-/// <see cref="PhysicalPlanner.Plan"/> (and thus #179 <c>Explain</c>) performs no enumeration or I/O
-/// (STORY-04.1.2 / #158).</summary>
+/// <summary>A leaf scan over in-memory batches supplied via a <b>lazy thunk</b> evaluated on first
+/// <see cref="Execute"/> — this is how every <see cref="IScanSource"/> scan (a <c>LocalRelation</c>, an
+/// in-memory catalog fixture, or a real Delta file read) defers row→batch encoding / data-plane I/O out of
+/// physical planning so <see cref="PhysicalPlanner.Plan"/> (and thus #179 <c>Explain</c>) performs no
+/// enumeration or I/O (STORY-04.1.2 / #158).</summary>
 internal sealed class ScanPlan : PhysicalPlan
 {
     private readonly Func<CancellationToken, IReadOnlyList<ColumnBatch>> _batchesFactory;
