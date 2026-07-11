@@ -156,6 +156,25 @@ internal static class DeltaTestHarness
         await backend.PutIfAbsentAsync("_delta_log/_last_checkpoint", Encoding.UTF8.GetBytes(json), CancellationToken.None);
     }
 
+    /// <summary>
+    /// Wraps <paramref name="inner"/> so the <c>&lt;version&gt;.json</c> commit objects report the given
+    /// <b>deterministic</b> modification times through <see cref="IStorageBackend.ListAsync"/> — the exact seam
+    /// <see cref="DeltaLog"/> reads commit timestamps from for <c>timestampAsOf</c> resolution (design §2.12.1).
+    /// Threading commit timestamps through this seam keeps time-travel tests independent of wall-clock write
+    /// time and filesystem mtime resolution (it reuses the mtime-override mechanism of
+    /// <see cref="StaleListingBackend"/>); pass equal or out-of-order timestamps to exercise the reader's
+    /// strict-monotonicity adjustment.
+    /// </summary>
+    public static IStorageBackend WithCommitTimestamps(
+        IStorageBackend inner, params (long Version, DateTimeOffset Timestamp)[] timestamps)
+    {
+        Dictionary<string, DateTime> overrides = timestamps.ToDictionary(
+            t => LogPath(Pad20(t.Version) + ".json"),
+            t => t.Timestamp.UtcDateTime,
+            StringComparer.Ordinal);
+        return new StaleListingBackend(inner, mtimeOverrides: overrides);
+    }
+
     // ---- canonical snapshot description (content, not reference, equality) ----
 
     public static string Describe(Snapshot snapshot)

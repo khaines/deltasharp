@@ -21,6 +21,22 @@ internal enum DeltaProtocolErrorKind
     /// referenced a version out of range, a required <c>metaData</c>/<c>protocol</c> was missing, or a
     /// checkpoint disagreed with JSON replay) — the reader refuses to invent table state.</summary>
     InconsistentLog,
+
+    /// <summary>A time-travel request (by version or timestamp) targets history <b>older than the earliest
+    /// retained log</b>: the required <c>&lt;N&gt;.json</c>/checkpoints were removed by log cleanup, so the
+    /// state can no longer be reconstructed. Distinct from <see cref="InconsistentLog"/> (an out-of-range
+    /// <i>future</i> version, or a genuine gap <i>above</i> the retention floor) — the reader fails closed
+    /// with the earliest still-available version rather than silently returning current data (design
+    /// §2.12.1; STORY-05.4.1 AC3).</summary>
+    RetentionGap,
+
+    /// <summary>A <c>timestampAsOf</c> request targets an instant <b>strictly after the latest commit's</b>
+    /// effective timestamp — no such snapshot exists. Mirrors Delta batch reads
+    /// (<c>DeltaHistoryManager.getActiveCommitAtTime</c> with <c>canReturnLastCommit=false</c>), which throw
+    /// <c>timestampGreaterThanLatestCommit</c> rather than clamping to current data. Kept distinct from
+    /// <see cref="RetentionGap"/> (a timestamp before the earliest retained commit); callers may opt into
+    /// clamping via <c>canReturnLatest</c> (design §2.12.1).</summary>
+    TimestampAfterLatest,
 }
 
 /// <summary>
@@ -66,4 +82,50 @@ internal sealed class DeltaProtocolException : Exception
     /// <summary>An internally inconsistent reconstructed log.</summary>
     public static DeltaProtocolException Inconsistent(string message, Exception? innerException = null) =>
         new(DeltaProtocolErrorKind.InconsistentLog, message, innerException);
+
+    /// <summary>A time-travel target older than the earliest retained log (a log-cleanup retention gap).</summary>
+    public static DeltaProtocolException RetentionGap(string message) =>
+        new(DeltaProtocolErrorKind.RetentionGap, message, innerException: null);
+
+    /// <summary>Builds a <see cref="DeltaProtocolErrorKind.RetentionGap"/> error for a requested <b>version</b>
+    /// that is below the earliest retained version — its <c>&lt;N&gt;.json</c>/checkpoints were log-cleaned, so
+    /// the reader fails closed with the earliest version still reconstructable (STORY-05.4.1 AC3).</summary>
+    public static DeltaProtocolException VersionNoLongerRetained(long requested, long earliestAvailable) =>
+        RetentionGap(string.Create(
+            CultureInfo.InvariantCulture,
+            $"Delta version {requested} is no longer retained; the earliest available version is {earliestAvailable}. "
+            + $"Its log files were removed by log cleanup and the snapshot can no longer be reconstructed."));
+
+    /// <summary>Builds a <see cref="DeltaProtocolErrorKind.RetentionGap"/> error for a requested <b>timestamp</b>
+    /// that predates the earliest retained commit — no version's commit timestamp is at or before it, so the
+    /// reader fails closed rather than returning the earliest/current state (STORY-05.4.1 AC3).</summary>
+    public static DeltaProtocolException TimestampBeforeRetention(
+        DateTimeOffset requested, long earliestVersion, DateTimeOffset earliestTimestamp) =>
+        RetentionGap(string.Create(
+            CultureInfo.InvariantCulture,
+            $"The requested timestamp {requested:O} is before the earliest retained Delta commit "
+            + $"(version {earliestVersion} at {earliestTimestamp:O}); earlier history was removed by log cleanup "
+            + $"and is no longer available for time travel."));
+
+    /// <summary>Builds a <see cref="DeltaProtocolErrorKind.RetentionGap"/> error for a requested <b>timestamp</b>
+    /// that predates the table's <b>first commit</b> (version 0 is still retained, so this is genuine table
+    /// creation — not log cleanup). Mirrors Delta's <c>timestampEarlierThanTableFirstCommit</c>; kept fail
+    /// closed (the reader never returns the earliest/current state).</summary>
+    public static DeltaProtocolException TimestampBeforeFirstCommit(
+        DateTimeOffset requested, DateTimeOffset firstCommitTimestamp) =>
+        RetentionGap(string.Create(
+            CultureInfo.InvariantCulture,
+            $"The requested timestamp {requested:O} is before the table's first commit "
+            + $"(version 0 at {firstCommitTimestamp:O}); no such snapshot exists."));
+
+    /// <summary>Builds a <see cref="DeltaProtocolErrorKind.TimestampAfterLatest"/> error for a requested
+    /// <b>timestamp</b> strictly after the latest commit's effective timestamp — no such snapshot exists.
+    /// Mirrors Delta batch reads (<c>canReturnLastCommit=false</c>), which throw rather than clamp; the caller
+    /// can opt into clamping to the latest version via <c>canReturnLatest</c> (STORY-05.4.1, design §2.12.1).</summary>
+    public static DeltaProtocolException TimestampAfterLatest(
+        DateTimeOffset requested, long latestVersion, DateTimeOffset latestTimestamp) =>
+        new(DeltaProtocolErrorKind.TimestampAfterLatest, string.Create(
+            CultureInfo.InvariantCulture,
+            $"The requested timestamp {requested:O} is after the latest Delta commit "
+            + $"(version {latestVersion} at {latestTimestamp:O}); no such snapshot exists."), innerException: null);
 }
