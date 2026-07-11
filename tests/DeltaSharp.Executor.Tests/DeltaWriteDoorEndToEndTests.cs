@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Text.Json;
 using DeltaSharp.Types;
+using Parquet;
 using Xunit;
 
 namespace DeltaSharp.Executor.Tests;
@@ -258,9 +259,14 @@ public sealed class DeltaWriteDoorEndToEndTests : IDisposable
             DataFrame df = spark.CreateDataFrame(
                 new[] { new Row(PeopleSchema, 7, "x") }, PeopleSchema);
 
-            // The default mode is ErrorIfExists; onto an existing table it must throw.
-            Exception? ex = Record.Exception(() => df.Write.Format("delta").Save(table));
-            Assert.NotNull(ex);
+            // The default mode is ErrorIfExists; onto an existing table it must throw the stage-attributed
+            // QueryExecutionException (a random NRE would no longer pass — assert the type, the Backend
+            // stage, and the conflict message so a vacuous Assert.NotNull can't hide a wrong failure).
+            QueryExecutionException ex = Assert.Throws<QueryExecutionException>(
+                () => df.Write.Format("delta").Save(table));
+            Assert.Equal(QueryExecutionStage.Backend, ex.Stage);
+            Assert.Contains("already exists", ex.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("ErrorIfExists", ex.Message, StringComparison.OrdinalIgnoreCase);
         }
 
         // The existing table is unchanged (still v0 / 3 rows; no partial commit).
@@ -279,6 +285,155 @@ public sealed class DeltaWriteDoorEndToEndTests : IDisposable
         AddRecord add = Assert.Single(ActiveAdds(table));
         Assert.DoesNotContain('/', add.Path); // no partition directory
         Assert.True(File.Exists(Path.Combine(table, add.Path)));
+    }
+
+    // ---------------------------------------------------------------- value oracle (real row VALUES)
+    // Quality M1: the tests above assert only counts / log shape, so a mutation corrupting every `name`
+    // value passed all of them. These read the committed Parquet data file(s) back through Parquet.Net's
+    // low-level DataColumn API on the PUBLIC-API write path and assert the EXACT row multiset, so a
+    // value-corruption mutation now FAILS an executor E2E test.
+
+    [Fact]
+    public void Delta_Append_Unpartitioned_DataFileRowValues_ExactMultiset()
+    {
+        using SparkSession spark = NewSession();
+        string table = Table("value-append-flat");
+
+        spark.CreateDataFrame(People(), PeopleSchema).Write.Format("delta").Mode("append").Save(table);
+
+        Assert.Equal(
+            new (int, string?, string?)[] { (1, "alice", null), (2, "bob", null), (3, null, null) },
+            AllRowValues(table, partitionColumn: null));
+    }
+
+    [Fact]
+    public void Delta_StaticOverwrite_Unpartitioned_DataFileRowValues_ExactMultiset()
+    {
+        string table = Table("value-overwrite-flat");
+
+        using (SparkSession spark = NewSession())
+        {
+            spark.CreateDataFrame(People(), PeopleSchema).Write.Format("delta").Mode("append").Save(table);
+        }
+
+        using (SparkSession spark = NewSession())
+        {
+            spark.CreateDataFrame(new[] { new Row(PeopleSchema, 99, "zoe") }, PeopleSchema)
+                .Write.Format("delta").Mode("overwrite").Save(table);
+        }
+
+        // Full static overwrite: only the replacement row remains.
+        Assert.Equal(
+            new (int, string?, string?)[] { (99, "zoe", null) },
+            AllRowValues(table, partitionColumn: null));
+    }
+
+    [Fact]
+    public void Delta_PartitionedAppend_DataFileRowValues_ExactMultiset()
+    {
+        using SparkSession spark = NewSession();
+        string table = Table("value-append-part");
+
+        spark.CreateDataFrame(Regional((1, "a", "US"), (2, "b", "EU"), (3, "c", "US")), RegionSchema)
+            .Write.Format("delta").PartitionBy("region").Mode("append").Save(table);
+
+        // Partition value is reconstructed from the Hive dir path; (id, name) come from the data file.
+        Assert.Equal(
+            new (int, string?, string?)[] { (1, "a", "US"), (2, "b", "EU"), (3, "c", "US") },
+            AllRowValues(table, partitionColumn: "region"));
+    }
+
+    [Fact]
+    public void Delta_PartitionedStaticOverwrite_DataFileRowValues_ExactMultiset()
+    {
+        string table = Table("value-overwrite-part");
+
+        using (SparkSession spark = NewSession())
+        {
+            spark.CreateDataFrame(Regional((1, "a", "US"), (2, "b", "EU")), RegionSchema)
+                .Write.Format("delta").PartitionBy("region").Mode("append").Save(table);
+        }
+
+        using (SparkSession spark = NewSession())
+        {
+            spark.CreateDataFrame(Regional((9, "z", "US")), RegionSchema)
+                .Write.Format("delta").PartitionBy("region").Mode("overwrite").Save(table);
+        }
+
+        // Static overwrite replaces the WHOLE table (EU dropped too): only the replacement row remains.
+        Assert.Equal(
+            new (int, string?, string?)[] { (9, "z", "US") },
+            AllRowValues(table, partitionColumn: "region"));
+    }
+
+    // Reads every active data file's (id, name) rows back through Parquet.Net's low-level DataColumn API,
+    // reconstructs the partition value from the Hive `col=value` directory path (partition columns are NOT
+    // stored in the data file), and returns the exact row multiset ordered by id for a deterministic compare.
+    private static List<(int Id, string? Name, string? Partition)> AllRowValues(string table, string? partitionColumn)
+    {
+        var rows = new List<(int, string?, string?)>();
+        foreach (AddRecord add in ActiveAdds(table))
+        {
+            string? partition = partitionColumn is null ? null : PartitionFromHivePath(add.Path, partitionColumn);
+            foreach ((int id, string? name) in ReadDataFileRows(Path.Combine(table, add.Path)))
+            {
+                rows.Add((id, name, partition));
+            }
+        }
+
+        return rows.OrderBy(r => r.Item1).ToList();
+    }
+
+    // The (id, name) rows physically stored in one Parquet data file, via Parquet.Net's low-level column
+    // reader (the executor layer cannot see Storage's internal ParquetFileReader).
+    private static List<(int Id, string? Name)> ReadDataFileRows(string absolutePath)
+    {
+        using FileStream fs = File.OpenRead(absolutePath);
+        ParquetReader reader = ParquetReader.CreateAsync(fs).GetAwaiter().GetResult();
+        try
+        {
+            var fields = reader.Schema.GetDataFields();
+            var idField = fields.Single(f => f.Name == "id");
+            var nameField = fields.Single(f => f.Name == "name");
+            var rows = new List<(int, string?)>();
+            for (int rg = 0; rg < reader.RowGroupCount; rg++)
+            {
+                using var group = reader.OpenRowGroupReader(rg);
+                int rowCount = checked((int)group.RowCount);
+                var ids = new int[rowCount];
+                group.ReadAsync(idField, new Memory<int>(ids), null, default)
+                    .AsTask().GetAwaiter().GetResult();
+                var names = new string?[rowCount];
+                group.ReadAsync(nameField, new Memory<string?>(names), null, default)
+                    .AsTask().GetAwaiter().GetResult();
+                for (int i = 0; i < rowCount; i++)
+                {
+                    rows.Add((ids[i], names[i]));
+                }
+            }
+
+            return rows;
+        }
+        finally
+        {
+            reader.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
+
+    // Reconstructs a partition value from a Hive-style `col=value/...` data-file path (null for the
+    // __HIVE_DEFAULT_PARTITION__ sentinel), URL-decoding the encoded segment.
+    private static string? PartitionFromHivePath(string relativePath, string column)
+    {
+        foreach (string segment in relativePath.Split('/'))
+        {
+            if (segment.StartsWith(column + "=", StringComparison.Ordinal))
+            {
+                string encoded = segment[(column.Length + 1)..];
+                return encoded == "__HIVE_DEFAULT_PARTITION__" ? null : Uri.UnescapeDataString(encoded);
+            }
+        }
+
+        return null;
     }
 
     // ---------------------------------------------------------------- _delta_log readers (off disk)

@@ -15,6 +15,10 @@ namespace DeltaSharp.Storage.Writing;
 /// </summary>
 internal static class ColumnBatchPartitioner
 {
+    // Poll cancellation every 1024 rows in the sync partition loop (mask 1023), matching
+    // LocalRelationBatches.Build / RowMaterializer so the write-staging path is bounded the same way.
+    private const int CancellationPollMask = 1023;
+
     /// <summary>A partitioned slice of the input: the (possibly-null) value of every partition column, and
     /// the data-column-only batches that belong to that partition.</summary>
     internal sealed record PartitionGroup(
@@ -27,9 +31,14 @@ internal static class ColumnBatchPartitioner
     /// <param name="partitionColumns">The partition column names, in declaration order (a subset of
     /// <paramref name="fullSchema"/>).</param>
     /// <param name="batches">The full-schema batches to split.</param>
+    /// <param name="cancellationToken">Cancels this sync CPU loop; polled every ~1024 rows so a large
+    /// staging batch honors cancel/timeout (matching <c>LocalRelationBatches.Build</c>).</param>
     /// <returns>One group per non-empty partition (an empty result when the input has no rows).</returns>
     public static IReadOnlyList<PartitionGroup> Partition(
-        StructType fullSchema, IReadOnlyList<string> partitionColumns, IReadOnlyList<ColumnBatch> batches)
+        StructType fullSchema,
+        IReadOnlyList<string> partitionColumns,
+        IReadOnlyList<ColumnBatch> batches,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(fullSchema);
         ArgumentNullException.ThrowIfNull(partitionColumns);
@@ -65,10 +74,17 @@ internal static class ColumnBatchPartitioner
 
         var dataSchema = new StructType(dataFields);
 
+        // Hoist the per-batch/per-row invariants OUT of the hot loops: the partition-column array (was
+        // re-allocated via ToImmutableArray() inside the per-row loop) and its ordinal-sorted order (so
+        // PartitionKeyBuilder does not re-OrderBy per row). Both are fixed for the whole call.
+        ImmutableArray<string> partitionColumnArray = partitionColumns.ToImmutableArray();
+        ImmutableArray<string> sortedPartitionColumns = PartitionKeyBuilder.SortColumns(partitionColumnArray);
+
         // Preserve first-seen partition order for deterministic output.
         var groups = new Dictionary<string, GroupBuilder>(StringComparer.Ordinal);
         var order = new List<string>();
 
+        long processedRows = 0;
         foreach (ColumnBatch batch in batches)
         {
             int rows = batch.LogicalRowCount;
@@ -91,10 +107,14 @@ internal static class ColumnBatchPartitioner
 
             for (int r = 0; r < rows; r++)
             {
+                if ((processedRows++ & CancellationPollMask) == 0)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+
                 ImmutableSortedDictionary<string, string?> partitionValues =
                     BuildPartitionValues(partitionColumns, partitionColumnViews, r);
-                string key = PartitionKeyBuilder.Build(
-                    partitionValues, partitionColumns.ToImmutableArray());
+                string key = PartitionKeyBuilder.BuildSorted(partitionValues, sortedPartitionColumns);
 
                 if (!groups.TryGetValue(key, out GroupBuilder? builder))
                 {

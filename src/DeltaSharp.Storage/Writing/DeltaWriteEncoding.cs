@@ -119,9 +119,27 @@ internal static class DeltaWriteEncoding
         return utc.ToString("yyyy-MM-dd HH:mm:ss.ffffff", CultureInfo.InvariantCulture);
     }
 
+    // System.Decimal spans an unscaled magnitude of at most decimal.MaxValue (~7.9e28, 29 digits); an
+    // Int128 unscaled value from a precision-38 Delta decimal can exceed that. Precompute the inclusive
+    // bounds once so FormatDecimal can range-check instead of letting the `(decimal)` cast throw a raw
+    // OverflowException (which would escape the storage layer's deterministic exception contract).
+    private static readonly Int128 MaxDecimalUnscaled = (Int128)decimal.MaxValue;
+    private static readonly Int128 MinDecimalUnscaled = (Int128)decimal.MinValue;
+
     private static string FormatDecimal(ColumnVector source, int row, DecimalType type)
     {
         Int128 unscaled = type.IsCompact ? source.GetValue<long>(row) : source.GetValue<Int128>(row);
+        if (unscaled < MinDecimalUnscaled || unscaled > MaxDecimalUnscaled)
+        {
+            throw new DeltaStorageException(
+                StorageErrorKind.UnsupportedFeature,
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"Decimal partition value (precision {type.Precision}, scale {type.Scale}) has an " +
+                    $"unscaled magnitude that exceeds System.Decimal's range and cannot be formatted as a " +
+                    $"Delta partition value."));
+        }
+
         decimal value = (decimal)unscaled;
         for (int i = 0; i < type.Scale; i++)
         {

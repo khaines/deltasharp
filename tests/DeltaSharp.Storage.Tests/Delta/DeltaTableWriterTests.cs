@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using DeltaSharp.Storage;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
 using DeltaSharp.Types;
@@ -317,6 +318,20 @@ public sealed class DeltaTableWriterTests : IDisposable
         await Assert.ThrowsAsync<ArgumentException>(() =>
             Writer().OverwriteAsync(
                 TableSchema, new[] { Staged("nopart.parquet") }, PartitionOverwriteMode.Dynamic));
+    }
+
+    [Fact]
+    public async Task Append_OnUnpartitionedTable_RejectsStagedFileCarryingPartitionValues()
+    {
+        // HIGH (red-team, #487 round-2): the coverage guard must ALSO fail-closed on an UNPARTITIONED table.
+        // Before the fix ValidatePartitionCoverage returned early for an unpartitioned table, so a staged
+        // file carrying stray partition values could land in the log as an `add` the table's (empty)
+        // partition layout does not declare. It must be rejected fail-closed, not silently committed.
+        await SeedTableAsync(); // unpartitioned
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(() =>
+            Writer().AppendAsync(TableSchema, new[] { Staged("stray.parquet", Partition(("region", "US"))) }));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
     }
 
     [Fact]

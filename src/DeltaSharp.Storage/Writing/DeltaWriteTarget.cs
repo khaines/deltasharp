@@ -129,8 +129,12 @@ public sealed class DeltaWriteTarget : IDisposable
         ArgumentNullException.ThrowIfNull(batches);
 
         IReadOnlyList<ColumnBatchPartitioner.PartitionGroup> groups =
-            ColumnBatchPartitioner.Partition(writeSchema, partitionColumns, batches);
+            ColumnBatchPartitioner.Partition(writeSchema, partitionColumns, batches, cancellationToken);
 
+        // TRACKED DEFERRAL (#442 unbounded materialization; columnar sink-contract #443): this stages the
+        // whole write in memory — rows→ColumnBatch (upstream), then per-partition ColumnBatches here, then a
+        // per-file MemoryStream + ToArray() below — a triple materialization with no spill/streaming bound.
+        // A streaming/columnar sink contract that writes each partition file incrementally is #442/#443.
         var files = new List<StagedDataFile>(groups.Count);
         long totalRows = 0;
         long modificationTime = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();

@@ -280,9 +280,22 @@ internal sealed class DeltaTableWriter
     /// <summary>
     /// The write-door overwrite entry (#487): overwrites the latest snapshot with <paramref name="files"/>
     /// per <paramref name="partitionMode"/>, or — when the table does not yet exist — <b>creates</b> it
-    /// exactly as <see cref="CreateOrAppendAsync"/> does (there is nothing to overwrite). An empty overwrite
-    /// (no files) against a fresh path creates the empty table; against an existing table it is treated as a
-    /// no-op here (a truncate-overwrite is a distinct operation, deferred).
+    /// exactly as <see cref="CreateOrAppendAsync"/> does (there is nothing to overwrite).
+    ///
+    /// <para><b>Empty overwrite (Spark parity).</b> An overwrite REPLACES prior data, so an empty write is
+    /// NOT a no-op the way an empty append is. The behavior is mode-aware, matching Spark's
+    /// <c>df.write.mode("overwrite").save()</c> of an empty DataFrame:</para>
+    /// <list type="bullet">
+    /// <item><b>Static overwrite + empty + existing table</b> ⇒ <b>TRUNCATE</b>: every prior active file is
+    /// removed in a new atomic version that adds 0 files, so a subsequent read is empty (a static overwrite
+    /// is a full-table replacement — replacing with nothing leaves nothing).</item>
+    /// <item><b>Dynamic overwrite + empty</b> ⇒ <b>no-op</b>: dynamic overwrite replaces only the partitions
+    /// the new data touches, and empty data touches no partitions, so nothing is removed and the version is
+    /// unchanged (<see cref="DeltaCommitResult.Skipped"/>).</item>
+    /// <item><b>Overwrite + empty + fresh path</b> (either mode) ⇒ create the schema'd <b>empty table at
+    /// v0</b> (<c>protocol</c> + <c>metaData</c>, 0 adds), exactly as Spark creates an empty table on a
+    /// first empty write.</item>
+    /// </list>
     /// </summary>
     public async Task<DeltaCommitResult> CreateOrOverwriteAsync(
         StructType writeSchema,
@@ -304,9 +317,24 @@ internal sealed class DeltaTableWriter
         Snapshot readSnapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
         if (files.Count == 0)
         {
-            // A truncate-overwrite (replace all data with nothing) is out of scope for the write door; leave
-            // the table unchanged rather than silently dropping data. Report the current version.
-            return new DeltaCommitResult(readSnapshot.Version, Attempts: 0, Skipped: true);
+            // Spark parity: an overwrite REPLACES prior data, so an empty overwrite is NOT a no-op the way an
+            // empty append is — it is mode-aware.
+            if (partitionMode == PartitionOverwriteMode.Dynamic)
+            {
+                // Dynamic overwrite replaces only the partitions the new data touches. Empty data touches NO
+                // partitions, so nothing is removed: a genuine no-op (version unchanged). Report the current
+                // version.
+                return new DeltaCommitResult(readSnapshot.Version, Attempts: 0, Skipped: true);
+            }
+
+            // Static overwrite of an existing table with empty data ⇒ TRUNCATE: remove EVERY prior active
+            // file in one atomic version that adds 0 files, so a subsequent read is empty. Reconcile the
+            // declared schema first (fail-closed, no evolution) so the truncate cannot silently accept an
+            // incompatible schema; a compatible same-schema truncate carries no metaData change.
+            MetadataAction? truncateEvolution =
+                ReconcileSchema(readSnapshot, writeSchema, SchemaEvolutionMode.None);
+            return await FullOverwriteAsync(readSnapshot, files, truncateEvolution, cancellationToken)
+                .ConfigureAwait(false);
         }
 
         return await OverwriteAsync(readSnapshot, writeSchema, files, partitionMode, SchemaEvolutionMode.None, cancellationToken)
@@ -315,8 +343,10 @@ internal sealed class DeltaTableWriter
 
     // Commits version 0 = protocol + metaData (schema + partition columns) + the new adds against a synthetic
     // empty snapshot (version -1), so a fresh path becomes a well-formed Delta table in a single atomic
-    // commit. A create is append-only (no removes) so it commits under BlindAppend; a concurrent create loses
-    // the version 0 race and rebases its adds forward (Append semantics), never double-committing.
+    // commit. A create is append-only (no removes) so it commits under BlindAppend; a concurrent create that
+    // loses the version-0 race does NOT rebase — its commit carries protocol + metaData, so the committer's
+    // pre-write gates observe the winner's version-0 protocol/metadata and ABORT it via
+    // ProtocolChangedException/MetadataChangedException (a second table-creation is not a blind append).
     private Task<DeltaCommitResult> CreateTableAsync(
         StructType writeSchema,
         IReadOnlyList<string> partitionColumns,
@@ -534,12 +564,28 @@ internal sealed class DeltaTableWriter
     // column of each staged file, so the add lands in a well-formed partition and the exact-key remove
     // selection is unambiguous. A missing key would otherwise be silently coerced to the null partition —
     // and, for a file already in the log, is the malformed state that would make a read-oriented pruner
-    // over-select it for removal (council #486 R1). For an unpartitioned table this is a no-op.
+    // over-select it for removal (council #486 R1). For an UNPARTITIONED table the mirror invariant holds: no
+    // staged file may carry ANY partition value, else a stray partition key would land in the log as an add
+    // the table's (empty) partition layout does not declare — a malformed action rejected fail-closed here.
     private static void ValidatePartitionCoverage(
         IReadOnlyList<StagedDataFile> files, ImmutableArray<string> partitionColumns)
     {
         if (partitionColumns.IsDefaultOrEmpty)
         {
+            foreach (StagedDataFile file in files)
+            {
+                if (!file.PartitionValues.IsEmpty)
+                {
+                    throw new DeltaStorageException(
+                        StorageErrorKind.SchemaMismatch,
+                        string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"Staged file '{file.Path}' carries partition value(s) " +
+                            $"[{string.Join(", ", file.PartitionValues.Keys)}] but the table is unpartitioned; " +
+                            $"an unpartitioned write must not specify any partition value."));
+                }
+            }
+
             return;
         }
 

@@ -4,7 +4,9 @@ using DeltaSharp.Storage;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
 using DeltaSharp.Storage.Parquet;
+using DeltaSharp.Storage.Writing;
 using DeltaSharp.Types;
+using Parquet;
 using Xunit;
 
 namespace DeltaSharp.Storage.Tests.Writing;
@@ -220,6 +222,128 @@ public sealed class DeltaWriteTargetTests : IDisposable
 
         List<(long, string?)> rows = await ReadFlatAsync();
         Assert.Equal(new (long, string?)[] { (5L, "e") }, rows);
+    }
+
+    // ---------------------------------------------------------------- multi-batch (Quality M2)
+
+    [Fact]
+    public async Task Append_MultipleBatchesInOneAppend_RoundTripsAllRows()
+    {
+        // Quality M2: one Append with MULTIPLE ColumnBatches must stage them all — every row from every
+        // batch must round-trip (a facade that only wrote the first batch would silently lose data).
+        using DeltaWriteTarget target = Target();
+        await target.AppendAsync(
+            FlatSchema, Array.Empty<string>(),
+            new[] { FlatBatch((1, "a"), (2, "b")), FlatBatch((3, "c"), (4, null)) });
+
+        List<(long, string?)> rows = await ReadFlatAsync();
+        Assert.Equal(
+            new (long, string?)[] { (1L, "a"), (2L, "b"), (3L, "c"), (4L, (string?)null) }, rows);
+    }
+
+    // ---------------------------------------------------------------- empty overwrite (truncate) — Spark parity
+
+    [Fact]
+    public async Task StaticOverwrite_Empty_OnExistingTable_TruncatesToEmpty()
+    {
+        // CRITICAL (red-team, #487 round-2): a STATIC overwrite of an EMPTY DataFrame TRUNCATES an existing
+        // table (Spark parity — overwrite replaces prior data; replacing with nothing leaves nothing). It is
+        // NOT the silent no-op the pre-fix code implemented (which preserved stale data).
+        using DeltaWriteTarget target = Target();
+        await target.AppendAsync(FlatSchema, Array.Empty<string>(), new[] { FlatBatch((1, "a"), (2, "b")) });
+
+        DeltaWriteResult result = await target.OverwriteAsync(
+            FlatSchema, Array.Empty<string>(), Array.Empty<ColumnBatch>(), DeltaPartitionOverwriteMode.Static);
+
+        Assert.Equal(1L, result.Version);      // a new version was committed (truncate is a real commit)
+        Assert.Equal(0, result.FilesWritten);  // 0 adds
+        Snapshot snapshot = await LoadSnapshotAsync();
+        Assert.Empty(snapshot.ActiveFiles);    // every prior active file was removed
+        Assert.Empty(await ReadFlatAsync());   // reads back empty
+    }
+
+    [Fact]
+    public async Task DynamicOverwrite_Empty_IsNoOp_LeavesTableUnchanged()
+    {
+        // CRITICAL (red-team, #487 round-2): a DYNAMIC overwrite of an EMPTY DataFrame is a genuine no-op —
+        // empty data touches no partitions, so nothing is removed and the version is unchanged.
+        using DeltaWriteTarget target = Target();
+        await target.AppendAsync(
+            PartitionedSchema, new[] { "region" },
+            new[] { PartitionedBatch(("US", 1, "alice"), ("EU", 2, "bob")) });
+
+        DeltaWriteResult result = await target.OverwriteAsync(
+            PartitionedSchema, new[] { "region" }, Array.Empty<ColumnBatch>(), DeltaPartitionOverwriteMode.Dynamic);
+
+        Assert.Equal(0L, result.Version);      // version UNCHANGED (still v0)
+        List<(string?, long, string?)> rows = await ReadPartitionedAsync();
+        Assert.Equal(
+            new (string?, long, string?)[] { ("EU", 2L, "bob"), ("US", 1L, "alice") },
+            Sorted(rows));                      // both partitions preserved
+    }
+
+    [Fact]
+    public async Task Overwrite_Empty_OnFreshPath_CreatesEmptySchemadTableAtV0()
+    {
+        // CRITICAL (red-team, #487 round-2): an empty overwrite against a FRESH path creates the schema'd
+        // empty table at v0 (protocol + metaData, 0 adds) — Spark creates the empty table.
+        using DeltaWriteTarget target = Target();
+        DeltaWriteResult result = await target.OverwriteAsync(
+            FlatSchema, Array.Empty<string>(), Array.Empty<ColumnBatch>(), DeltaPartitionOverwriteMode.Static);
+
+        Assert.Equal(0L, result.Version);
+        Assert.True(await target.TableExistsAsync());
+        Snapshot snapshot = await LoadSnapshotAsync();
+        Assert.Empty(snapshot.ActiveFiles);                                   // an empty table
+        Assert.Equal(FlatSchema.SimpleString, snapshot.Schema.SimpleString);  // carrying the declared schema
+        Assert.Empty(await ReadFlatAsync());
+    }
+
+    // ---------------------------------------------------------------- null partition + schema split (Quality Low)
+
+    [Fact]
+    public async Task Append_NullPartitionValue_HiveDefaultDir_NullInPartitionValues_AndSchemaSplit()
+    {
+        // Quality Low: a NULL partition value uses the __HIVE_DEFAULT_PARTITION__ directory in the physical
+        // path but records a REAL null in add.partitionValues. The metadata (full) schema keeps the partition
+        // column; the on-disk data-file schema excludes it (partition columns live only in partitionValues +
+        // the directory path, never in the Parquet data file).
+        using DeltaWriteTarget target = Target();
+        await target.AppendAsync(
+            PartitionedSchema, new[] { "region" }, new[] { PartitionedBatch((null, 1, "alice")) });
+
+        Snapshot snapshot = await LoadSnapshotAsync();
+        AddFileAction add = Assert.Single(snapshot.ActiveFiles);
+        Assert.True(add.PartitionValues.ContainsKey("region"));
+        Assert.Null(add.PartitionValues["region"]);                            // a real null in partitionValues
+        Assert.Contains(DeltaWriteEncoding.HiveDefaultPartition, add.Path);    // sentinel dir in the path
+
+        // Metadata (full) schema INCLUDES the partition column...
+        Assert.Contains(snapshot.Schema.Fields, f => f.Name == "region");
+        // ...while the on-disk DATA-file schema EXCLUDES it.
+        IReadOnlyList<string> dataFileColumns = DataFileColumnNames(add.Path);
+        Assert.DoesNotContain("region", dataFileColumns);
+        Assert.Contains("id", dataFileColumns);
+        Assert.Contains("name", dataFileColumns);
+
+        List<(string?, long, string?)> rows = await ReadPartitionedAsync();
+        Assert.Equal(new (string?, long, string?)[] { (null, 1L, "alice") }, rows);
+    }
+
+    // The physical Parquet data file's column names, read via Parquet.Net's schema (proves the partition
+    // column is NOT stored in the data file).
+    private IReadOnlyList<string> DataFileColumnNames(string relativePath)
+    {
+        using FileStream fs = File.OpenRead(Path.Combine(_root, relativePath));
+        ParquetReader reader = ParquetReader.CreateAsync(fs).GetAwaiter().GetResult();
+        try
+        {
+            return reader.Schema.GetDataFields().Select(f => f.Name).ToList();
+        }
+        finally
+        {
+            reader.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
     }
 
     // ---------------------------------------------------------------- existence check

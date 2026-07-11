@@ -9,7 +9,9 @@ namespace DeltaSharp.Executor;
 /// of delegate factories, returning the first sink one creates. This is the composition point of the M1
 /// write door's data-out seam: the in-memory <see cref="InMemorySinkRegistry"/> for the <c>memory</c>
 /// format and the Storage↔Executor Delta sink for the <c>delta</c> format (#487) are registered side by
-/// side, and a future read provider (#499) can register alongside them without restructuring. Order is the
+/// side. This is a WRITE seam only; the future Delta read provider (#499) does NOT register here — reads
+/// flow through the <see cref="IScanSource"/> data-in seam (a sibling scan-source property on
+/// <see cref="DeltaStorageAdapter"/>), so the read path never restructures this factory. Order is the
 /// registration order; a factory that does not recognize the format returns <see langword="false"/> and the
 /// next is tried, so no format is claimed by more than one factory.
 /// </summary>

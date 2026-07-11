@@ -11,8 +11,9 @@ namespace DeltaSharp.Executor;
 /// <c>delta</c> write format to a <see cref="DeltaLocalSink"/> driving the storage layer's public
 /// <see cref="DeltaWriteTarget"/> facade (Parquet data files + <c>_delta_log</c> commit). It is the mirror
 /// of <see cref="InMemorySinkRegistry"/> for a real, durable table. The base <c>delta</c> <b>read</b>
-/// provider is #499's responsibility and registers alongside this factory through the same
-/// <see cref="DeltaStorageAdapter"/> composition seam, so wiring the read path never restructures the write
+/// provider is #499's responsibility and is a SEPARATE seam — the <see cref="IScanSource"/> data-in path,
+/// wired as a sibling scan-source property on <see cref="DeltaStorageAdapter"/>, NOT another entry in the
+/// write-side <see cref="CompositeSinkFactory"/> — so wiring the read path never restructures the write
 /// path.
 /// </summary>
 internal sealed class DeltaSinkFactory : ILocalSinkFactory
@@ -68,7 +69,16 @@ internal sealed class DeltaLocalSink : ILocalSink
         ArgumentNullException.ThrowIfNull(schema);
         ArgumentNullException.ThrowIfNull(rows);
 
+        // TRACKED DEFERRAL (#508): ILocalSink.Commit is synchronous, so the async DeltaWriteTarget facade is
+        // driven here (and in RunAppend/TableExists) via .GetAwaiter().GetResult() — a sync-over-async bridge
+        // that also drops the run's CancellationToken (none is threaded through Commit). An async sink
+        // contract that flows the token into staging + the log commit is #508.
         string path = ResolvePath();
+
+        // TRACKED DEFERRAL (#442 unbounded materialization; columnar sink-contract #443): the write is
+        // already fully materialized to rows here, then re-materialized rows→ColumnBatch, and again into
+        // per-partition batches + a per-file MemoryStream inside the facade — a triple materialization with
+        // no spill bound. A columnar/streaming sink contract that avoids the rows→batch round-trip is #443.
         IReadOnlyList<ColumnBatch> batches = LocalRelationBatches.Build(schema, rows);
         IReadOnlyList<string> partitionColumns = _descriptor.PartitionColumns;
 
@@ -158,28 +168,13 @@ internal sealed class DeltaLocalSink : ILocalSink
         };
     }
 
-    // The delta sink writes to a real storage path; a path is mandatory. The DataFrameWriter reconciles a
-    // `path` option into the descriptor path, but resolve one here too (case-insensitively) so a descriptor
-    // built without that reconciliation still routes correctly.
-    private string ResolvePath()
-    {
-        if (!string.IsNullOrEmpty(_descriptor.Path))
-        {
-            return _descriptor.Path;
-        }
-
-        foreach (KeyValuePair<string, string> option in _descriptor.Options)
-        {
-            if (string.Equals(option.Key, "path", StringComparison.OrdinalIgnoreCase)
-                && !string.IsNullOrEmpty(option.Value))
-            {
-                return option.Value;
-            }
-        }
-
-        throw new InvalidOperationException(
+    // The delta sink writes to a real storage path; a path is mandatory. Resolution (descriptor path or a
+    // case-insensitive `path` option) is shared with InMemorySinkRegistry via SinkDescriptorPaths so the two
+    // sinks never drift; only the "no path" outcome differs (the delta sink cannot default a target).
+    private string ResolvePath() =>
+        SinkDescriptorPaths.ResolvePath(_descriptor)
+        ?? throw new InvalidOperationException(
             "A delta write requires an output path (df.write.format(\"delta\").save(path)).");
-    }
 
     private static InvalidOperationException ErrorIfExistsConflict(string path) =>
         new($"Cannot write to '{SecretRedaction.RedactPath(path)}': it already exists and the save mode is "
