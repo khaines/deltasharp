@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using System.Globalization;
+using System.Security.Cryptography;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Types;
 
@@ -237,6 +238,147 @@ internal sealed class DeltaTableWriter
             _ => throw new ArgumentOutOfRangeException(
                 nameof(partitionMode), partitionMode, "Unknown partition overwrite mode."),
         };
+    }
+
+    /// <summary>
+    /// The write-door entry (#487): appends <paramref name="files"/> to the latest snapshot, or — when the
+    /// table does not yet exist — <b>creates</b> it, committing the <c>protocol</c> + <c>metaData</c> (the
+    /// declared <paramref name="writeSchema"/> and <paramref name="partitionColumns"/>) together with the new
+    /// <c>add</c>s as version 0 in a single atomic commit (Spark's first-write-creates-the-table semantics).
+    /// An empty write (no files) against a fresh path still creates the (empty) table; against an existing
+    /// table it is a no-op (append adds nothing).
+    /// </summary>
+    /// <exception cref="DeltaSchemaMismatchException">An append to an existing table is incompatible with its
+    /// schema (schema evolution is <see cref="SchemaEvolutionMode.None"/> here — evolution is #495/#496).</exception>
+    public async Task<DeltaCommitResult> CreateOrAppendAsync(
+        StructType writeSchema,
+        IReadOnlyList<string> partitionColumns,
+        IReadOnlyList<StagedDataFile> files,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(writeSchema);
+        ArgumentNullException.ThrowIfNull(partitionColumns);
+        ArgumentNullException.ThrowIfNull(files);
+
+        long? latest = await _log.GetLatestCommitVersionAsync(cancellationToken).ConfigureAwait(false);
+        if (latest is null)
+        {
+            return await CreateTableAsync(writeSchema, partitionColumns, files, cancellationToken).ConfigureAwait(false);
+        }
+
+        Snapshot readSnapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
+        if (files.Count == 0)
+        {
+            // Append of nothing to an existing table: no new version, report the current one.
+            return new DeltaCommitResult(readSnapshot.Version, Attempts: 0, Skipped: true);
+        }
+
+        return await AppendAsync(readSnapshot, writeSchema, files, SchemaEvolutionMode.None, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The write-door overwrite entry (#487): overwrites the latest snapshot with <paramref name="files"/>
+    /// per <paramref name="partitionMode"/>, or — when the table does not yet exist — <b>creates</b> it
+    /// exactly as <see cref="CreateOrAppendAsync"/> does (there is nothing to overwrite). An empty overwrite
+    /// (no files) against a fresh path creates the empty table; against an existing table it is treated as a
+    /// no-op here (a truncate-overwrite is a distinct operation, deferred).
+    /// </summary>
+    public async Task<DeltaCommitResult> CreateOrOverwriteAsync(
+        StructType writeSchema,
+        IReadOnlyList<string> partitionColumns,
+        IReadOnlyList<StagedDataFile> files,
+        PartitionOverwriteMode partitionMode = PartitionOverwriteMode.Static,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(writeSchema);
+        ArgumentNullException.ThrowIfNull(partitionColumns);
+        ArgumentNullException.ThrowIfNull(files);
+
+        long? latest = await _log.GetLatestCommitVersionAsync(cancellationToken).ConfigureAwait(false);
+        if (latest is null)
+        {
+            return await CreateTableAsync(writeSchema, partitionColumns, files, cancellationToken).ConfigureAwait(false);
+        }
+
+        Snapshot readSnapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
+        if (files.Count == 0)
+        {
+            // A truncate-overwrite (replace all data with nothing) is out of scope for the write door; leave
+            // the table unchanged rather than silently dropping data. Report the current version.
+            return new DeltaCommitResult(readSnapshot.Version, Attempts: 0, Skipped: true);
+        }
+
+        return await OverwriteAsync(readSnapshot, writeSchema, files, partitionMode, SchemaEvolutionMode.None, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    // Commits version 0 = protocol + metaData (schema + partition columns) + the new adds against a synthetic
+    // empty snapshot (version -1), so a fresh path becomes a well-formed Delta table in a single atomic
+    // commit. A create is append-only (no removes) so it commits under BlindAppend; a concurrent create loses
+    // the version 0 race and rebases its adds forward (Append semantics), never double-committing.
+    private Task<DeltaCommitResult> CreateTableAsync(
+        StructType writeSchema,
+        IReadOnlyList<string> partitionColumns,
+        IReadOnlyList<StagedDataFile> files,
+        CancellationToken cancellationToken)
+    {
+        ImmutableArray<string> partitionArray = partitionColumns.ToImmutableArray();
+        ValidatePartitionCoverage(files, partitionArray);
+
+        long createdTime = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
+        var metadata = new MetadataAction(
+            Id: new Guid(RandomNumberGenerator.GetBytes(16)).ToString(),
+            Name: null,
+            Description: null,
+            Format: new TableFormat("parquet", EmptyStringMap),
+            SchemaString: SchemaJson.ToJson(writeSchema),
+            PartitionColumns: partitionArray,
+            Configuration: EmptyStringMap,
+            CreatedTime: createdTime);
+        var protocol = new ProtocolAction(
+            ProtocolSupport.BasicReaderVersion,
+            ProtocolSupport.MaxBasicWriterVersion,
+            ImmutableArray<string>.Empty,
+            ImmutableArray<string>.Empty);
+
+        var actions = new List<DeltaAction>(2 + files.Count) { protocol, metadata };
+        AppendAddActions(actions, files);
+        return _committer.CommitAsync(EmptySnapshot(), actions, DeltaReadScope.BlindAppend, cancellationToken);
+    }
+
+    private static readonly ImmutableSortedDictionary<string, string> EmptyStringMap =
+        ImmutableSortedDictionary<string, string>.Empty.WithComparers(StringComparer.Ordinal);
+
+    // A synthetic snapshot for a table that does not yet exist: version -1 (so the committer targets version
+    // 0), a supported basic protocol (so the pre-write protocol gate passes), an empty schema/metadata, and
+    // no active files or transactions. Its metadata/schema are never load-bearing for a create commit (the
+    // create builds the real protocol+metaData actions itself); it exists only to drive the committer's
+    // version arithmetic and pre-write gates.
+    private static Snapshot EmptySnapshot()
+    {
+        var protocol = new ProtocolAction(
+            ProtocolSupport.BasicReaderVersion,
+            ProtocolSupport.MaxBasicWriterVersion,
+            ImmutableArray<string>.Empty,
+            ImmutableArray<string>.Empty);
+        var metadata = new MetadataAction(
+            Id: "00000000-0000-0000-0000-000000000000",
+            Name: null,
+            Description: null,
+            Format: new TableFormat("parquet", EmptyStringMap),
+            SchemaString: SchemaJson.ToJson(StructType.Empty),
+            PartitionColumns: ImmutableArray<string>.Empty,
+            Configuration: EmptyStringMap,
+            CreatedTime: null);
+        return new Snapshot(
+            version: -1L,
+            protocol,
+            metadata,
+            ImmutableArray<AddFileAction>.Empty,
+            ImmutableArray<RemoveFileAction>.Empty,
+            ImmutableSortedDictionary<string, long>.Empty.WithComparers(StringComparer.Ordinal),
+            SnapshotLoadMetrics.Empty);
     }
 
     // Runs schema enforcement/evolution against the table's current schema BEFORE any action is built
