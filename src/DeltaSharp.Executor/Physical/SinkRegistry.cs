@@ -222,31 +222,14 @@ internal sealed class InMemorySinkRegistry : ILocalSinkFactory
             + "mode is ErrorIfExists. Use Overwrite, Append, or Ignore to write to an existing target.");
 
     // A write is keyed by its path (the common case), then a table identifier, then a stable default for a
-    // path-less memory Save. Callers in M1 always supply a path, so collisions on the default are a
-    // test-only concern handled by using unique keys. The DataFrameWriter reconciles a `path` option into
-    // descriptor.Path, but resolve a `path` option here too (case-insensitively, matching the writer's
-    // OrdinalIgnoreCase option contract) so a descriptor built without that reconciliation still routes to
-    // the intended target rather than "memory://default" (Architect/DevEx).
-    private static string TargetKey(SinkDescriptor descriptor)
-    {
-        if (!string.IsNullOrEmpty(descriptor.Path))
-        {
-            return descriptor.Path;
-        }
-
-        foreach (KeyValuePair<string, string> option in descriptor.Options)
-        {
-            if (string.Equals(option.Key, "path", StringComparison.OrdinalIgnoreCase)
-                && !string.IsNullOrEmpty(option.Value))
-            {
-                return option.Value;
-            }
-        }
-
-        return descriptor.TableIdentifier is { Count: > 0 } identifier
+    // path-less memory Save. Path discovery (descriptor.Path or a case-insensitive `path` option) is shared
+    // with DeltaLocalSink via SinkDescriptorPaths so the two sinks never drift; the memory registry adds a
+    // TableIdentifier / "memory://default" fallback the delta sink does not have.
+    private static string TargetKey(SinkDescriptor descriptor) =>
+        SinkDescriptorPaths.ResolvePath(descriptor)
+        ?? (descriptor.TableIdentifier is { Count: > 0 } identifier
             ? string.Join('.', identifier)
-            : "memory://default";
-    }
+            : "memory://default");
 
     private sealed record CommittedTable(StructType Schema, IReadOnlyList<Row> Rows);
 

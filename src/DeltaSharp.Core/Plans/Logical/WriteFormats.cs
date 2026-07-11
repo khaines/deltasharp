@@ -23,15 +23,31 @@ internal static class WriteFormats
     /// to the EPIC-05 deferral (AC4), matching Spark's default while keeping storage out of this story.</summary>
     public const string Default = "parquet";
 
+    /// <summary>Spark's Delta Lake write source — a real, storage-backed sink wired end-to-end by
+    /// STORY-05.3.3 follow-up (#487): the analyzer accepts it, and the Executor resolves it through the
+    /// Storage↔Executor sink adapter (a DeltaSharp.Storage write facade over the Delta transaction
+    /// log + Parquet). Unlike <see cref="Memory"/>, its rows land in a real Delta table
+    /// (Parquet data files + <c>_delta_log</c>), not an in-process registry.</summary>
+    public const string Delta = "delta";
+
     private static readonly FrozenSet<string> LocalFormats =
         new HashSet<string>(StringComparer.OrdinalIgnoreCase) { Memory }
             .ToFrozenSet(StringComparer.OrdinalIgnoreCase);
 
-    // Formats DeltaSharp intends to write but whose writer is delivered by EPIC-05 (Delta/Parquet
-    // storage), not this story. They resolve to a deterministic EPIC-05 diagnostic (AC4) rather than an
-    // "unsupported format" one, so a user targeting Delta/Parquet learns ownership, not that it is invalid.
+    // Storage-backed formats the analyzer accepts (they pass through to physical planning, where the
+    // Executor's sink adapter resolves a real writer). `delta` is wired end-to-end by #487; the in-memory
+    // `memory` sink is a distinct LOCAL format. These are the write formats whose sink is NOT the in-process
+    // memory registry but a durable table on the configured storage backend.
+    private static readonly FrozenSet<string> StorageFormats =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase) { Delta }
+            .ToFrozenSet(StringComparer.OrdinalIgnoreCase);
+
+    // Formats DeltaSharp intends to write but whose writer is not yet wired. `parquet` (Spark's default
+    // write source) still routes to a deterministic EPIC-05 deferral diagnostic (AC4) rather than an
+    // "unsupported format" one, so a user targeting it learns ownership, not that it is invalid. (`delta`
+    // graduated out of this set in #487.)
     private static readonly FrozenSet<string> DeferredFormats =
-        new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "delta", "parquet" }
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "parquet" }
             .ToFrozenSet(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Classifies <paramref name="format"/> into its M1 write disposition.</summary>
@@ -45,14 +61,23 @@ internal static class WriteFormats
             return WriteFormatKind.Local;
         }
 
+        if (StorageFormats.Contains(format))
+        {
+            return WriteFormatKind.StorageBacked;
+        }
+
         return DeferredFormats.Contains(format)
             ? WriteFormatKind.DeferredToEpic05
             : WriteFormatKind.Unsupported;
     }
 
-    /// <summary>The recognized local sink formats, ordered, for a diagnostic's "supported formats" list.</summary>
+    /// <summary>The write formats the analyzer accepts, ordered, for a diagnostic's "supported formats"
+    /// list (the in-memory <see cref="Memory"/> local sink plus every storage-backed format such as
+    /// <see cref="Delta"/>).</summary>
     public static IReadOnlyList<string> LocalFormatNames =>
-        LocalFormats.OrderBy(f => f, StringComparer.OrdinalIgnoreCase).ToArray();
+        LocalFormats.Concat(StorageFormats)
+            .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
 
     /// <summary>The EPIC-05-deferred formats, ordered, for a diagnostic's "deferred formats" list.</summary>
     public static IReadOnlyList<string> DeferredFormatNames =>
@@ -64,6 +89,10 @@ internal enum WriteFormatKind
 {
     /// <summary>An engine-backed local sink that executes end-to-end in M1 (AC1).</summary>
     Local,
+
+    /// <summary>A storage-backed write format (for example <see cref="WriteFormats.Delta"/>) the analyzer
+    /// accepts and the Executor resolves to a real durable sink over the configured storage backend (#487).</summary>
+    StorageBacked,
 
     /// <summary>A format whose writer is owned by EPIC-05 (Delta/Parquet storage); deferred here (AC4).</summary>
     DeferredToEpic05,

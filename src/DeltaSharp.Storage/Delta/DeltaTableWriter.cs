@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using System.Globalization;
+using System.Security.Cryptography;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Types;
 
@@ -239,6 +240,189 @@ internal sealed class DeltaTableWriter
         };
     }
 
+    /// <summary>
+    /// The write-door entry (#487): appends <paramref name="files"/> to the latest snapshot, or — when the
+    /// table does not yet exist — <b>creates</b> it, committing the <c>protocol</c> + <c>metaData</c> (the
+    /// declared <paramref name="writeSchema"/> and <paramref name="partitionColumns"/>) together with the new
+    /// <c>add</c>s as version 0 in a single atomic commit (Spark's first-write-creates-the-table semantics).
+    /// An empty write (no files) against a fresh path still creates the (empty) table; against an existing
+    /// table it is a no-op (append adds nothing).
+    /// </summary>
+    /// <exception cref="DeltaSchemaMismatchException">An append to an existing table is incompatible with its
+    /// schema (schema evolution is <see cref="SchemaEvolutionMode.None"/> here — evolution is #495/#496).</exception>
+    public async Task<DeltaCommitResult> CreateOrAppendAsync(
+        StructType writeSchema,
+        IReadOnlyList<string> partitionColumns,
+        IReadOnlyList<StagedDataFile> files,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(writeSchema);
+        ArgumentNullException.ThrowIfNull(partitionColumns);
+        ArgumentNullException.ThrowIfNull(files);
+
+        long? latest = await _log.GetLatestCommitVersionAsync(cancellationToken).ConfigureAwait(false);
+        if (latest is null)
+        {
+            return await CreateTableAsync(writeSchema, partitionColumns, files, cancellationToken).ConfigureAwait(false);
+        }
+
+        Snapshot readSnapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
+        if (files.Count == 0)
+        {
+            // Append of nothing to an existing table: no new version, report the current one.
+            return new DeltaCommitResult(readSnapshot.Version, Attempts: 0, Skipped: true);
+        }
+
+        return await AppendAsync(readSnapshot, writeSchema, files, SchemaEvolutionMode.None, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The write-door overwrite entry (#487): overwrites the latest snapshot with <paramref name="files"/>
+    /// per <paramref name="partitionMode"/>, or — when the table does not yet exist — <b>creates</b> it
+    /// exactly as <see cref="CreateOrAppendAsync"/> does (there is nothing to overwrite).
+    ///
+    /// <para><b>Empty overwrite (Spark parity).</b> An overwrite REPLACES prior data, so an empty write is
+    /// NOT a no-op the way an empty append is. The behavior is mode-aware, matching Spark's
+    /// <c>df.write.mode("overwrite").save()</c> of an empty DataFrame:</para>
+    /// <list type="bullet">
+    /// <item><b>Static overwrite + empty + existing table</b> ⇒ <b>TRUNCATE</b>: every prior active file is
+    /// removed in a new atomic version that adds 0 files, so a subsequent read is empty (a static overwrite
+    /// is a full-table replacement — replacing with nothing leaves nothing).</item>
+    /// <item><b>Dynamic overwrite + empty</b> ⇒ <b>no-op</b>: dynamic overwrite replaces only the partitions
+    /// the new data touches, and empty data touches no partitions, so nothing is removed and the version is
+    /// unchanged (<see cref="DeltaCommitResult.Skipped"/>).</item>
+    /// <item><b>Overwrite + empty + fresh path</b> (either mode) ⇒ create the schema'd <b>empty table at
+    /// v0</b> (<c>protocol</c> + <c>metaData</c>, 0 adds), exactly as Spark creates an empty table on a
+    /// first empty write.</item>
+    /// </list>
+    /// </summary>
+    public async Task<DeltaCommitResult> CreateOrOverwriteAsync(
+        StructType writeSchema,
+        IReadOnlyList<string> partitionColumns,
+        IReadOnlyList<StagedDataFile> files,
+        PartitionOverwriteMode partitionMode = PartitionOverwriteMode.Static,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(writeSchema);
+        ArgumentNullException.ThrowIfNull(partitionColumns);
+        ArgumentNullException.ThrowIfNull(files);
+
+        long? latest = await _log.GetLatestCommitVersionAsync(cancellationToken).ConfigureAwait(false);
+        if (latest is null)
+        {
+            return await CreateTableAsync(writeSchema, partitionColumns, files, cancellationToken).ConfigureAwait(false);
+        }
+
+        Snapshot readSnapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
+        if (files.Count == 0)
+        {
+            // Spark parity: an overwrite REPLACES prior data, so an empty overwrite is NOT a no-op the way an
+            // empty append is — it is mode-aware.
+            if (partitionMode == PartitionOverwriteMode.Dynamic)
+            {
+                // Dynamic overwrite replaces only the partitions the new data touches. Empty data touches NO
+                // partitions, so nothing is removed: a genuine no-op (version unchanged). Report the current
+                // version.
+                return new DeltaCommitResult(readSnapshot.Version, Attempts: 0, Skipped: true);
+            }
+
+            // Static overwrite of an existing table with empty data ⇒ TRUNCATE: remove EVERY prior active
+            // file in one atomic version that adds 0 files, so a subsequent read is empty. Reconcile the
+            // declared schema first (fail-closed, no evolution) so the truncate cannot silently accept an
+            // incompatible schema; a compatible same-schema truncate carries no metaData change.
+            MetadataAction? truncateEvolution =
+                ReconcileSchema(readSnapshot, writeSchema, SchemaEvolutionMode.None);
+
+            // Idempotent no-op guard: if the active set is ALREADY empty AND the schema is unchanged
+            // (no metaData/schema evolution), a "truncate" would build a 0-remove/0-add/0-metadata action
+            // list — which DeltaCommitter rejects as an empty commit. Spark treats an empty overwrite of an
+            // already-empty table as a benign no-op, so short-circuit to Skipped (version unchanged) rather
+            // than let that internal invariant escape the deterministic storage contract. A non-empty active
+            // set still truncates for real below.
+            if (readSnapshot.ActiveFiles.IsEmpty && truncateEvolution is null)
+            {
+                return new DeltaCommitResult(readSnapshot.Version, Attempts: 0, Skipped: true);
+            }
+
+            return await FullOverwriteAsync(readSnapshot, files, truncateEvolution, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        return await OverwriteAsync(readSnapshot, writeSchema, files, partitionMode, SchemaEvolutionMode.None, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    // Commits version 0 = protocol + metaData (schema + partition columns) + the new adds against a synthetic
+    // empty snapshot (version -1), so a fresh path becomes a well-formed Delta table in a single atomic
+    // commit. A create is append-only (no removes) so it commits under BlindAppend; a concurrent create that
+    // loses the version-0 race does NOT rebase — its commit carries protocol + metaData, so the committer's
+    // pre-write gates observe the winner's version-0 protocol/metadata and ABORT it via
+    // ProtocolChangedException/MetadataChangedException (a second table-creation is not a blind append).
+    private Task<DeltaCommitResult> CreateTableAsync(
+        StructType writeSchema,
+        IReadOnlyList<string> partitionColumns,
+        IReadOnlyList<StagedDataFile> files,
+        CancellationToken cancellationToken)
+    {
+        ImmutableArray<string> partitionArray = partitionColumns.ToImmutableArray();
+        ValidatePartitionCoverage(files, partitionArray);
+
+        long createdTime = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
+        var metadata = new MetadataAction(
+            Id: new Guid(RandomNumberGenerator.GetBytes(16)).ToString(),
+            Name: null,
+            Description: null,
+            Format: new TableFormat("parquet", EmptyStringMap),
+            SchemaString: SchemaJson.ToJson(writeSchema),
+            PartitionColumns: partitionArray,
+            Configuration: EmptyStringMap,
+            CreatedTime: createdTime);
+        var protocol = new ProtocolAction(
+            ProtocolSupport.BasicReaderVersion,
+            ProtocolSupport.MaxBasicWriterVersion,
+            ImmutableArray<string>.Empty,
+            ImmutableArray<string>.Empty);
+
+        var actions = new List<DeltaAction>(2 + files.Count) { protocol, metadata };
+        AppendAddActions(actions, files);
+        return _committer.CommitAsync(EmptySnapshot(), actions, DeltaReadScope.BlindAppend, cancellationToken);
+    }
+
+    private static readonly ImmutableSortedDictionary<string, string> EmptyStringMap =
+        ImmutableSortedDictionary<string, string>.Empty.WithComparers(StringComparer.Ordinal);
+
+    // A synthetic snapshot for a table that does not yet exist: version -1 (so the committer targets version
+    // 0), a supported basic protocol (so the pre-write protocol gate passes), an empty schema/metadata, and
+    // no active files or transactions. Its metadata/schema are never load-bearing for a create commit (the
+    // create builds the real protocol+metaData actions itself); it exists only to drive the committer's
+    // version arithmetic and pre-write gates.
+    private static Snapshot EmptySnapshot()
+    {
+        var protocol = new ProtocolAction(
+            ProtocolSupport.BasicReaderVersion,
+            ProtocolSupport.MaxBasicWriterVersion,
+            ImmutableArray<string>.Empty,
+            ImmutableArray<string>.Empty);
+        var metadata = new MetadataAction(
+            Id: "00000000-0000-0000-0000-000000000000",
+            Name: null,
+            Description: null,
+            Format: new TableFormat("parquet", EmptyStringMap),
+            SchemaString: SchemaJson.ToJson(StructType.Empty),
+            PartitionColumns: ImmutableArray<string>.Empty,
+            Configuration: EmptyStringMap,
+            CreatedTime: null);
+        return new Snapshot(
+            version: -1L,
+            protocol,
+            metadata,
+            ImmutableArray<AddFileAction>.Empty,
+            ImmutableArray<RemoveFileAction>.Empty,
+            ImmutableSortedDictionary<string, long>.Empty.WithComparers(StringComparer.Ordinal),
+            SnapshotLoadMetrics.Empty);
+    }
+
     // Runs schema enforcement/evolution against the table's current schema BEFORE any action is built
     // (STORY-05.4.2 AC1/AC2). Returns null when the write is compatible and needs no schema change, or the
     // metaData action carrying the merged schema (all other fields copied from the current metadata) that
@@ -392,28 +576,71 @@ internal sealed class DeltaTableWriter
     // column of each staged file, so the add lands in a well-formed partition and the exact-key remove
     // selection is unambiguous. A missing key would otherwise be silently coerced to the null partition —
     // and, for a file already in the log, is the malformed state that would make a read-oriented pruner
-    // over-select it for removal (council #486 R1). For an unpartitioned table this is a no-op.
+    // over-select it for removal (council #486 R1). For an UNPARTITIONED table the mirror invariant holds: no
+    // staged file may carry ANY partition value, else a stray partition key would land in the log as an add
+    // the table's (empty) partition layout does not declare — a malformed action rejected fail-closed here.
     private static void ValidatePartitionCoverage(
         IReadOnlyList<StagedDataFile> files, ImmutableArray<string> partitionColumns)
     {
         if (partitionColumns.IsDefaultOrEmpty)
         {
+            foreach (StagedDataFile file in files)
+            {
+                if (!file.PartitionValues.IsEmpty)
+                {
+                    throw new DeltaStorageException(
+                        StorageErrorKind.SchemaMismatch,
+                        string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"Staged file '{file.Path}' carries partition value(s) " +
+                            $"[{string.Join(", ", file.PartitionValues.Keys)}] but the table is unpartitioned; " +
+                            $"an unpartitioned write must not specify any partition value."));
+                }
+            }
+
             return;
         }
 
+        // Validate coverage with OUR OWN ordinal sets, INDEPENDENT of each dict's own key comparer. The
+        // guard must never delegate the ordinal-equality decision to the caller's `PartitionValues`
+        // comparer: a StagedDataFile built with StringComparer.OrdinalIgnoreCase would let a case-variant
+        // key (e.g. "REGION" for a declared "region") satisfy ContainsKey("region") AND keep an exact Count,
+        // silently authoring an `add` whose partitionValues keys do not ordinally match the table's declared
+        // partitionColumns. Building explicit Ordinal HashSets closes that case-variant bypass — for both the
+        // stray-key and the missing-column checks — regardless of the incoming dictionary's comparer
+        // (council #487 round-4 red-team, defense-in-depth). partitionColumns is duplicate-free table metadata.
+        var declared = new HashSet<string>(partitionColumns, StringComparer.Ordinal);
         foreach (StagedDataFile file in files)
         {
-            foreach (string column in partitionColumns)
+            // Reject stray keys: a staged file must carry NO partition value beyond the declared columns
+            // (measured ordinally), else a malformed partitionValues entry (a key the table's partition
+            // layout does not declare) would commit into the _delta_log. Name the offending key(s).
+            List<string> stray = file.PartitionValues.Keys
+                .Where(key => !declared.Contains(key)).ToList();
+            if (stray.Count > 0)
             {
-                if (!file.PartitionValues.ContainsKey(column))
-                {
-                    throw new ArgumentException(
-                        string.Create(
-                            CultureInfo.InvariantCulture,
-                            $"Staged file '{file.Path}' is missing partition column '{column}'; a partitioned " +
-                            $"write must specify a value (possibly null) for every partition column."),
-                        nameof(files));
-                }
+                throw new DeltaStorageException(
+                    StorageErrorKind.SchemaMismatch,
+                    string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"Staged file '{file.Path}' carries partition value(s) [{string.Join(", ", stray)}] " +
+                        $"not declared by the table's partition columns [{string.Join(", ", partitionColumns)}]; " +
+                        $"a partitioned write must not specify any partition value beyond the declared columns."));
+            }
+
+            // Reject missing columns: every declared column must be ordinally present among the file's keys.
+            var fileKeys = new HashSet<string>(file.PartitionValues.Keys, StringComparer.Ordinal);
+            List<string> missing = partitionColumns
+                .Where(column => !fileKeys.Contains(column)).ToList();
+            if (missing.Count > 0)
+            {
+                throw new DeltaStorageException(
+                    StorageErrorKind.SchemaMismatch,
+                    string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"Staged file '{file.Path}' is missing partition column(s) " +
+                        $"[{string.Join(", ", missing)}]; a partitioned write must specify a value " +
+                        $"(possibly null) for every partition column."));
             }
         }
     }
