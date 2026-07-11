@@ -37,9 +37,10 @@ internal sealed class DeltaScanSource : IScanSource
 
         // LAZY SCAN (#499 F1): defer the data-plane read into the factory the ScanPlan invokes at
         // Execute — NOT at plan time. This keeps the lazy/eager invariant (Plan/Explain do NO file I/O),
-        // and, because the factory runs under the runtime, the read is bounded by the run's memory/byte
-        // budget and driven with the run's CancellationToken (threaded into ReadBatchesAsync below,
-        // resolving the dropped-token deferral for the scan path). The facade opened here is per-scan and
+        // and, because the factory runs under the runtime, the read is cancellable via the run's
+        // CancellationToken (threaded into ReadBatchesAsync below, resolving the dropped-token deferral for
+        // the scan path) and its bytes are counted against the run's accounting — post-materialization, not
+        // bounded pre-materialization (see the #442 deferral below). The facade opened here is per-scan and
         // short-lived. The closure is a plain delegate (no reflection/codegen), so it stays NativeAOT-safe.
         //
         // TRACKED DEFERRAL (#508 sync-over-async; #442 unbounded materialization): the async facade is

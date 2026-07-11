@@ -407,8 +407,10 @@ internal sealed class AnalysisException : Exception
         string.Join(", ", types.Select(t => t.SimpleString));
 
     /// <summary>Builds an <see cref="AnalysisErrorKind.InvalidTimeTravelSpec"/> failure for a read that
-    /// pins time travel more than one way (#499): a version and a timestamp together, or the same dimension
-    /// via both an option and the path suffix. The (redacted) path is named; the value is never rendered.</summary>
+    /// pins both a version and a timestamp (#499): the <c>versionAsOf</c> and <c>timestampAsOf</c> options
+    /// together, or (defensively) a path suffix that resolves to both. An explicit option makes the load
+    /// path literal, so an option and a path suffix never conflict. The (redacted) path is named; the value
+    /// is never rendered.</summary>
     /// <param name="path">The load path (redacted in the message).</param>
     /// <param name="detail">A short description of the conflict.</param>
     public static AnalysisException ConflictingTimeTravel(string path, string detail)
@@ -418,8 +420,9 @@ internal sealed class AnalysisException : Exception
         string safePath = SecretRedaction.RedactPath(path);
         return new AnalysisException(
             $"Cannot time travel Delta table '{safePath}' using both a version and a timestamp: {detail}. "
-            + "Specify at most one of versionAsOf / timestampAsOf (via an option or the path "
-            + "'@v<n>' / '@yyyyMMddHHmmssSSS' suffix), never both.",
+            + "Pin at most one of versionAsOf / timestampAsOf — as an option (which takes precedence and "
+            + "makes the path literal) or a '@v<n>' / '@yyyyMMddHHmmssSSS' path suffix — never both a "
+            + "version and a timestamp.",
             AnalysisErrorKind.InvalidTimeTravelSpec,
             safePath,
             Array.Empty<string>());

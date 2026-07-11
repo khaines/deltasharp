@@ -107,14 +107,6 @@ internal sealed class ScanPlan : PhysicalPlan
     private readonly Func<CancellationToken, IReadOnlyList<ColumnBatch>> _batchesFactory;
     private IReadOnlyList<ColumnBatch>? _batches;
 
-    /// <summary>Creates a scan over already-materialized <paramref name="batches"/>.</summary>
-    public ScanPlan(StructType outputSchema, IReadOnlyList<ColumnBatch> batches)
-        : base(outputSchema)
-    {
-        _batches = batches ?? throw new ArgumentNullException(nameof(batches));
-        _batchesFactory = static _ => throw new InvalidOperationException("Batches are already materialized.");
-    }
-
     /// <summary>Creates a scan whose batches are produced lazily by <paramref name="batchesFactory"/> on
     /// first <see cref="Execute"/> (no enumeration/encoding happens at planning time). The factory receives
     /// the run's effective cancellation token so a slow/large deferred source can be cancelled/timed out
