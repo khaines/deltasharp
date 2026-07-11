@@ -25,10 +25,11 @@
          so this lock file does not drift under locked-mode restore across SDK patches. -->
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
     <!-- OQ-1 / empirical codec-AOT gate (design §2.7 B-F1): Parquet.Net's LOW-LEVEL DataColumn API
-         is used (not the reflection class serializer). DeltaSharp.Storage is NOT yet reachable from
-         the NativeAOT Executor image (the scan/sink wiring lands in a later story), so its codec
-         AOT-cleanliness is verified empirically here rather than asserted. Any trim/AOT-analyzer
-         diagnostic from the codec boundary is scoped locally with a documented justification. -->
+         is used (not the reflection class serializer). As of #487 (the write-door e2e story) DeltaSharp.Storage
+         IS referenced by the NativeAOT Executor image, but its Parquet.Net WRITE path is currently trimmed /
+         not exercised by any AOT smoke test, so its codec AOT-safety remains UNVERIFIED (an AOT smoke over the
+         write path is tracked in #509). Any trim/AOT-analyzer diagnostic from the codec boundary is scoped
+         locally with a documented justification. -->
   </PropertyGroup>
 
   <ItemGroup>

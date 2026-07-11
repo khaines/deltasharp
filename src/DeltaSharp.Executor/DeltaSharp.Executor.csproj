@@ -24,6 +24,10 @@
          engine's operators, so the Executor references BOTH Core and Engine. Executor (net10.0)
          consuming Core (net8.0;net10.0) is an allowed direction; Core never references the Engine. -->
     <ProjectReference Include="../DeltaSharp.Core/DeltaSharp.Core.csproj" />
+    <!-- STORY-05.3.3 follow-up (#487): the Delta write door resolves its real sink through the storage
+         layer's public write facade (DeltaWriteTarget). Executor → Storage → Engine is the allowed
+         direction (Storage never references Core/Executor). -->
+    <ProjectReference Include="../DeltaSharp.Storage/DeltaSharp.Storage.csproj" />
   </ItemGroup>
 
 </Project>

@@ -254,8 +254,9 @@ public sealed class WriteDoorTests
 
     // ---------------- AC4: recognized-but-deferred format routes to EPIC-05 ----------------
 
+    // NOTE: `delta` is no longer deferred — it is a real storage-backed write source (#487). Only `parquet`
+    // remains deferred to a later EPIC-05 story; delta's accepted behavior is asserted separately below.
     [Theory]
-    [InlineData("delta")]
     [InlineData("parquet")]
     public void Save_DeferredFormat_RoutesToDeterministicEpic05Diagnostic(string format)
     {
@@ -297,12 +298,56 @@ public sealed class WriteDoorTests
         (SparkSession spark, DataFrame df) = NewBoundFrame(executor);
         using (spark)
         {
+            // `parquet` is still deferred, so its diagnostic path must be redacted; delta now reaches the
+            // executor seam (see Save_DeltaFormat_IsAccepted_AndCrossesTheExecutorSeam).
             AnalysisException ex = Assert.Throws<AnalysisException>(() => df.Write
-                .Format("delta")
+                .Format("parquet")
                 .Save("abfss://c@a.dfs.core.windows.net/t?sig=DEADBEEFSECRET"));
 
             Assert.DoesNotContain("DEADBEEFSECRET", ex.Message);
             Assert.Contains("<redacted>", ex.Message);
+        }
+    }
+
+    // ---------------- #487: `delta` is a real storage-backed write source (no longer deferred) --------
+
+    [Fact]
+    public void Save_DeltaFormat_IsAccepted_AndCrossesTheExecutorSeam()
+    {
+        var executor = new FakeQueryExecutor(Array.Empty<Row>());
+        (SparkSession spark, DataFrame df) = NewBoundFrame(executor);
+        using (spark)
+        {
+            // No AnalysisException: delta passes analysis and eagerly crosses the write seam exactly once.
+            df.Write.Format("delta").Mode(SaveMode.Append).Save("/tmp/delta-t");
+
+            Assert.Equal(1, executor.WriteCallCount);
+            var write = Assert.IsType<WriteToSource>(executor.LastPlan);
+            Assert.True(write.Child.Resolved);
+            Assert.Equal("delta", write.Sink.Format);
+            Assert.Equal(SaveMode.Append, write.Sink.Mode);
+            Assert.Equal("/tmp/delta-t", write.Sink.Path);
+        }
+    }
+
+    [Fact]
+    public void Save_DeltaFormat_PartitionByAndOptions_FlowThroughTheSinkDescriptor()
+    {
+        var executor = new FakeQueryExecutor(Array.Empty<Row>());
+        (SparkSession spark, DataFrame df) = NewBoundFrame(executor);
+        using (spark)
+        {
+            df.Write.Format("delta")
+                .PartitionBy("name")
+                .Option("spark.sql.sources.partitionOverwriteMode", "dynamic")
+                .Mode(SaveMode.Overwrite)
+                .Save("/tmp/delta-parts");
+
+            var write = Assert.IsType<WriteToSource>(executor.LastPlan);
+            Assert.Equal("delta", write.Sink.Format);
+            Assert.Equal(SaveMode.Overwrite, write.Sink.Mode);
+            Assert.Contains("name", write.Sink.PartitionColumns);
+            Assert.Equal("dynamic", write.Sink.Options["spark.sql.sources.partitionOverwriteMode"]);
         }
     }
 

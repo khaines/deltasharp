@@ -146,6 +146,12 @@ internal sealed class Analyzer
         switch (WriteFormats.Classify(sink.Format))
         {
             case WriteFormatKind.Local:
+            case WriteFormatKind.StorageBacked:
+                // A storage-backed format (e.g. delta, #487) passes analysis just like the in-memory local
+                // sink: its child is already resolved bottom-up, and physical planning resolves the concrete
+                // writer through the Executor's Storage↔Executor sink adapter. Partition-column existence is
+                // validated fail-closed at execution by the Storage write facade (analysis-time partitionBy
+                // validation is deferred to #444).
                 return write;
 
             case WriteFormatKind.DeferredToEpic05:

@@ -40,13 +40,14 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
     /// <param name="scanSource">The data-in seam resolving scans to in-memory batches.</param>
     /// <param name="backendOptions">The backend selection options.</param>
     public LocalQueryExecutor(IScanSource scanSource, ExecutionBackendOptions backendOptions)
-        : this(scanSource, backendOptions, InMemorySinkRegistry.Default)
+        : this(scanSource, backendOptions, DeltaStorageAdapter.DefaultSinkFactory)
     {
     }
 
     /// <summary>Creates an executor with explicit backend options and an explicit sink factory (the write
     /// door's data-out seam, STORY-04.6.3). Tests supply a fresh <see cref="InMemorySinkRegistry"/> for
-    /// isolation; the production paths use the process-wide <see cref="InMemorySinkRegistry.Default"/>.</summary>
+    /// isolation; the production paths use the process-wide <see cref="DeltaStorageAdapter.DefaultSinkFactory"/>
+    /// (the in-memory sink composed with the Delta write sink, #487).</summary>
     /// <param name="scanSource">The data-in seam resolving scans to in-memory batches.</param>
     /// <param name="backendOptions">The backend selection options.</param>
     /// <param name="sinkFactory">The data-out seam resolving a write intent to a local sink.</param>

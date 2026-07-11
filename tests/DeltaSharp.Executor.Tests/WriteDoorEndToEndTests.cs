@@ -156,8 +156,9 @@ public class WriteDoorEndToEndTests
         Assert.False(InMemorySinkRegistry.Default.TryRead(target, out _, out _));
     }
 
+    // NOTE: `delta` is no longer deferred (#487) — it is a real storage-backed write source exercised by
+    // the Delta_* end-to-end tests below. Only `parquet` remains deferred to a later EPIC-05 story.
     [Theory]
-    [InlineData("delta")]
     [InlineData("parquet")]
     public void Save_DeferredFormat_FailsWithDeterministicEpic05Diagnostic_BeforeAnyOutput(string format)
     {
@@ -211,7 +212,7 @@ public class WriteDoorEndToEndTests
         const string secretPath = "abfss://c@a.dfs.core.windows.net/t?sig=DEADBEEFSECRET";
         DataFrame df = spark.CreateDataFrame(Rows(), PeopleSchema);
 
-        Exception? ex = Record.Exception(() => df.Write.Format("delta").Save(secretPath));
+        Exception? ex = Record.Exception(() => df.Write.Format("parquet").Save(secretPath));
 
         Assert.NotNull(ex);
         Assert.DoesNotContain("DEADBEEFSECRET", ex!.Message);

@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using DeltaSharp.Storage;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
 using DeltaSharp.Types;
@@ -302,21 +303,90 @@ public sealed class DeltaTableWriterTests : IDisposable
     {
         // #486 R1 (Balanced L2 / Security write-path): fail-closed — a partitioned write must specify every
         // partition column, else the add would land in the wrong (null) partition and later mis-select.
+        // #487 round-3 (red-team): unified on DeltaStorageException(SchemaMismatch) for a consistent
+        // fail-closed storage-exception contract (was ArgumentException).
         await SeedTableAsync(partitionColumns: new[] { "region" });
 
-        await Assert.ThrowsAsync<ArgumentException>(() =>
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(() =>
             Writer().AppendAsync(TableSchema, new[] { Staged("nopart.parquet") })); // NoPartition ⇒ missing "region"
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+        Assert.Contains("region", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
     public async Task Overwrite_OnPartitionedTable_RejectsStagedFileMissingPartitionColumn()
     {
         // #486 R1: the same fail-closed coverage guard applies to overwrites (both modes go through it).
+        // #487 round-3: DeltaStorageException(SchemaMismatch), unified with the unpartitioned branch.
         await SeedTableAsync(partitionColumns: new[] { "region" });
 
-        await Assert.ThrowsAsync<ArgumentException>(() =>
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(() =>
             Writer().OverwriteAsync(
                 TableSchema, new[] { Staged("nopart.parquet") }, PartitionOverwriteMode.Dynamic));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+    }
+
+    [Fact]
+    public async Task Append_OnPartitionedTable_RejectsStagedFileCarryingStrayPartitionKey()
+    {
+        // HIGH (red-team, #487 round-3): the partitioned coverage guard must ALSO reject a staged file that
+        // carries an EXTRA partition key beyond the declared columns. Before the fix the guard only asserted
+        // every DECLARED column was present and never checked for stray keys, so a file with an unexpected
+        // partition value would commit a malformed `partitionValues` into the _delta_log. It must be
+        // rejected fail-closed, naming the stray key.
+        await SeedTableAsync(partitionColumns: new[] { "region" });
+
+        // All declared columns present (region) PLUS a stray "zone" key.
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(() =>
+            Writer().AppendAsync(
+                TableSchema,
+                new[] { Staged("stray.parquet", Partition(("region", "US"), ("zone", "az1"))) }));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+        Assert.Contains("zone", ex.Message, StringComparison.Ordinal); // names the stray key
+    }
+
+    [Fact]
+    public async Task Append_OnPartitionedTable_RejectsCaseVariantPartitionKey_ViaOrdinalGuard()
+    {
+        // HIGH (red-team, #487 round-4): the partitioned coverage guard must decide key equality with OUR
+        // OWN ordinal comparison, NOT the incoming dictionary's key comparer. A StagedDataFile whose
+        // PartitionValues is built with StringComparer.OrdinalIgnoreCase carrying a case-variant key
+        // ("REGION" for a declared "region") would, under a ContainsKey/Count guard, case-insensitively
+        // satisfy ContainsKey("region") AND keep an exact Count — silently authoring an `add` whose
+        // partitionValues keys do not ordinally match the table's declared partitionColumns. Building
+        // explicit Ordinal sets rejects "REGION" as a stray key. This test FAILS if the guard reverts to
+        // ContainsKey/Count (no exception thrown). Reachability today: StagedDataFile is internal and the
+        // sole real write path (ColumnBatchPartitioner.BuildPartitionValues) builds PartitionValues with
+        // StringComparer.Ordinal, so this is a latent guard-correctness / defense-in-depth gap, not a
+        // public-door bypass — but the guard must not trust the caller's comparer.
+        await SeedTableAsync(partitionColumns: new[] { "region" });
+
+        ImmutableSortedDictionary<string, string?>.Builder builder =
+            ImmutableSortedDictionary.CreateBuilder<string, string?>(StringComparer.OrdinalIgnoreCase);
+        builder["REGION"] = "US"; // case-variant of declared "region"
+        ImmutableSortedDictionary<string, string?> caseVariant = builder.ToImmutable();
+
+        // Sanity: the dict's own comparer would (wrongly) claim the declared "region" key is present.
+        Assert.True(caseVariant.ContainsKey("region"));
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(() =>
+            Writer().AppendAsync(TableSchema, new[] { Staged("casevariant.parquet", caseVariant) }));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+        Assert.Contains("REGION", ex.Message, StringComparison.Ordinal); // names REGION as stray, not accepted
+    }
+
+    [Fact]
+    public async Task Append_OnUnpartitionedTable_RejectsStagedFileCarryingPartitionValues()
+    {
+        // HIGH (red-team, #487 round-2): the coverage guard must ALSO fail-closed on an UNPARTITIONED table.
+        // Before the fix ValidatePartitionCoverage returned early for an unpartitioned table, so a staged
+        // file carrying stray partition values could land in the log as an `add` the table's (empty)
+        // partition layout does not declare. It must be rejected fail-closed, not silently committed.
+        await SeedTableAsync(); // unpartitioned
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(() =>
+            Writer().AppendAsync(TableSchema, new[] { Staged("stray.parquet", Partition(("region", "US"))) }));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
     }
 
     [Fact]
