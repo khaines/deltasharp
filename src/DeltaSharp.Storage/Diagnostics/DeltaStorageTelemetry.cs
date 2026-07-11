@@ -91,6 +91,39 @@ internal enum VacuumOutcome
 }
 
 /// <summary>
+/// The bounded terminal outcome of a Delta OPTIMIZE / small-file compaction (design §2.11.7,
+/// STORY-05.6.1 / #195) behind the shared <see cref="DeltaSharpTelemetry.OutcomeKey"/> label — so a dry-run
+/// plan, a real compaction, a no-op (nothing to compact), a fail-closed abort (a concurrent change to an
+/// input, or a pre-commit failure), a cancellation, and an unexpected failure are never collapsed into one
+/// ambiguous count (design §7.1/§7.3, checklist 09b). A closed value set, safe as a metric label.
+/// </summary>
+internal enum OptimizeOutcome
+{
+    /// <summary>A dry-run reported the compaction plan without writing or committing anything.</summary>
+    DryRun,
+
+    /// <summary>A real OPTIMIZE published the single compaction commit (inputs removed, outputs added).</summary>
+    Completed,
+
+    /// <summary>Nothing was eligible to compact (no partition had more than one small file), so no commit
+    /// was made — a benign no-op, distinct from a real completion.</summary>
+    NoOp,
+
+    /// <summary>OPTIMIZE aborted fail-closed before publishing because a concurrent commit changed one of
+    /// the compaction inputs (an OCC conflict, <see cref="DeltaConcurrentModificationException"/>). The inputs
+    /// stay active and any written outputs are ignorable orphans — the table is unchanged (AC4). A non-conflict
+    /// pre-commit failure is reported as <see cref="Failure"/>, not this outcome.</summary>
+    Aborted,
+
+    /// <summary>OPTIMIZE was cancelled via its <see cref="System.Threading.CancellationToken"/> before a
+    /// terminal outcome. A cancellation is <b>not</b> a failure.</summary>
+    Cancelled,
+
+    /// <summary>An unexpected/unclassified failure (fail-closed; the table is unchanged).</summary>
+    Failure,
+}
+
+/// <summary>
 /// The bounded per-candidate VACUUM decision (design §2.11.5 / §2.14, STORY-05.6.2 AC3): why a discovered
 /// candidate file was kept or is deletion-eligible. The <b>deletion</b> decision itself is always the
 /// <see cref="DeltaSharp.Storage.Delta.OrphanCleanup.SelectDeletable"/> contract's output; the three kept
@@ -170,6 +203,12 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     /// <summary>The bounded <c>deltasharp.operation=vacuum</c> value for the VACUUM maintenance path.</summary>
     internal const string VacuumOperation = "vacuum";
 
+    /// <summary>The bounded <c>deltasharp.operation=optimize</c> value for the OPTIMIZE maintenance path.</summary>
+    internal const string OptimizeOperation = "optimize";
+
+    /// <summary>The stable OPTIMIZE span name (design §7.4): variables live in bounded attributes.</summary>
+    internal const string OptimizeActivityName = DeltaName + ".Optimize";
+
     /// <summary>The stable VACUUM span name (design §7.4): variables live in bounded attributes.</summary>
     internal const string VacuumActivityName = DeltaName + ".Vacuum";
 
@@ -195,6 +234,11 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     private readonly Histogram<double> _vacuumDuration;
     private readonly Counter<long> _vacuumCount;
     private readonly Counter<long> _vacuumFiles;
+    private readonly Histogram<double> _optimizeDuration;
+    private readonly Counter<long> _optimizeCount;
+    private readonly Counter<long> _optimizeFilesRemoved;
+    private readonly Counter<long> _optimizeFilesAdded;
+    private readonly Counter<long> _optimizeBytes;
 
     internal DeltaStorageTelemetry()
     {
@@ -227,6 +271,21 @@ internal sealed class DeltaStorageTelemetry : IDisposable
         _vacuumFiles = _deltaMeter.CreateCounter<long>(
             "deltasharp.delta.vacuum.files", unit: "{file}",
             description: "VACUUM candidate files by retention decision (deletable / active / retention-protected / recently-staged).");
+        _optimizeDuration = _deltaMeter.CreateHistogram<double>(
+            "deltasharp.delta.optimize.duration", unit: "s",
+            description: "Elapsed (monotonic) duration of a Delta OPTIMIZE, by terminal outcome.");
+        _optimizeCount = _deltaMeter.CreateCounter<long>(
+            "deltasharp.delta.optimize.count", unit: "{optimize}",
+            description: "Terminal Delta OPTIMIZE outcomes (dry-run, completed, no-op, aborted, cancelled, failure).");
+        _optimizeFilesRemoved = _deltaMeter.CreateCounter<long>(
+            "deltasharp.delta.optimize.files_removed", unit: "{file}",
+            description: "Small input files compacted away by OPTIMIZE (planned counts under the dry_run outcome), by outcome.");
+        _optimizeFilesAdded = _deltaMeter.CreateCounter<long>(
+            "deltasharp.delta.optimize.files_added", unit: "{file}",
+            description: "Compacted output files added by OPTIMIZE (planned counts under the dry_run outcome), by outcome.");
+        _optimizeBytes = _deltaMeter.CreateCounter<long>(
+            "deltasharp.delta.optimize.bytes", unit: "By",
+            description: "Total input bytes rewritten by OPTIMIZE (planned counts under the dry_run outcome), by outcome.");
     }
 
     /// <summary>The <c>DeltaSharp.Delta</c> meter (commit instruments). Exposed for reference-identity
@@ -325,6 +384,60 @@ internal sealed class DeltaStorageTelemetry : IDisposable
 
         _vacuumFiles.Add(count, new KeyValuePair<string, object?>(VacuumDecisionKey, ToLabel(decision)));
     }
+
+    /// <summary>Starts the OPTIMIZE span if a listener samples the Delta source; returns
+    /// <see langword="null"/> (a cheap no-op) otherwise. The caller sets low-cardinality attributes and
+    /// status — never row data, column values, or a file path (checklist 09b redaction-by-omission).</summary>
+    internal Activity? StartOptimizeActivity(StorageBackendKind backend)
+    {
+        Activity? activity = DeltaActivitySource.StartActivity(OptimizeActivityName, ActivityKind.Internal);
+        if (activity is not null)
+        {
+            activity.SetTag(DeltaSharpTelemetry.ComponentKey, DeltaComponent);
+            activity.SetTag(DeltaSharpTelemetry.OperationKey, OptimizeOperation);
+            activity.SetTag(BackendKey, backend.ToLabel());
+        }
+
+        return activity;
+    }
+
+    /// <summary>Records the terminal signals for one OPTIMIZE: the duration histogram and the outcome
+    /// counter, plus the files-removed / files-added / input-bytes counters, all tagged with the bounded
+    /// <see cref="DeltaSharpTelemetry.OutcomeKey"/>. A single measurement per OPTIMIZE (never per row, batch,
+    /// or file), so it is allocation-light and export-safe; no raw row data or column value is ever
+    /// emitted.</summary>
+    internal void RecordOptimizeTerminal(
+        OptimizeOutcome outcome, double durationSeconds, int filesRemoved, int filesAdded, long bytesCompacted)
+    {
+        var outcomeTag = new KeyValuePair<string, object?>(DeltaSharpTelemetry.OutcomeKey, ToLabel(outcome));
+        _optimizeDuration.Record(durationSeconds, outcomeTag);
+        _optimizeCount.Add(1, outcomeTag);
+        if (filesRemoved > 0)
+        {
+            _optimizeFilesRemoved.Add(filesRemoved, outcomeTag);
+        }
+
+        if (filesAdded > 0)
+        {
+            _optimizeFilesAdded.Add(filesAdded, outcomeTag);
+        }
+
+        if (bytesCompacted > 0)
+        {
+            _optimizeBytes.Add(bytesCompacted, outcomeTag);
+        }
+    }
+
+    /// <summary>The bounded <c>deltasharp.outcome</c> string for an <see cref="OptimizeOutcome"/>.</summary>
+    internal static string ToLabel(OptimizeOutcome outcome) => outcome switch
+    {
+        OptimizeOutcome.DryRun => "dry_run",
+        OptimizeOutcome.Completed => "completed",
+        OptimizeOutcome.NoOp => "no_op",
+        OptimizeOutcome.Aborted => "aborted",
+        OptimizeOutcome.Cancelled => "cancelled",
+        _ => "failure",
+    };
 
     /// <summary>The bounded <c>deltasharp.outcome</c> string for a <see cref="VacuumOutcome"/>.</summary>
     internal static string ToLabel(VacuumOutcome outcome) => outcome switch
