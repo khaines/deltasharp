@@ -77,6 +77,14 @@ public sealed class SparkSession : IDisposable
     /// </summary>
     private static volatile Func<SparkSession, IQueryExecutor>? _queryExecutorFactory;
 
+    /// <summary>
+    /// The process-wide read-door resolver the executor lane installs via
+    /// <see cref="RegisterFileRelationResolver"/> so the analyzer can bind a <c>delta</c> path scan to its
+    /// schema + pinned snapshot version (#499). It is <see langword="null"/> until the Executor lane (or a
+    /// test) registers one, in which case a <c>delta</c> read fails closed with a clear diagnostic.
+    /// </summary>
+    private static volatile IFileRelationResolver? _fileRelationResolver;
+
     private static readonly ThreadLocal<SparkSession?> _activeSession = new(() => null);
 
     private readonly RuntimeConfig _conf;
@@ -191,6 +199,22 @@ public sealed class SparkSession : IDisposable
     /// unsupported default.</param>
     internal static void RegisterQueryExecutorFactory(Func<SparkSession, IQueryExecutor>? factory) =>
         _queryExecutorFactory = factory;
+
+    /// <summary>The read-door resolver (#499) the analyzer resolves a <c>delta</c> path scan through, or
+    /// <see langword="null"/> when no storage backend is registered (a Core-only process).</summary>
+    internal IFileRelationResolver? FileRelationResolver => _fileRelationResolver;
+
+    /// <summary>
+    /// Registers (or clears, when <paramref name="resolver"/> is <see langword="null"/>) the process-wide
+    /// <see cref="IFileRelationResolver"/> the analyzer resolves <c>delta</c> path scans through (#499). The
+    /// Executor lane calls this once at startup (alongside <see cref="RegisterQueryExecutorFactory"/>) so a
+    /// <c>read.format("delta").load(path)</c> binds against a real Delta log; tests use it to install a
+    /// double. Affects every subsequent analyze pass.
+    /// </summary>
+    /// <param name="resolver">The resolver to install, or <see langword="null"/> to reset (a Core-only
+    /// process where a delta read fails closed).</param>
+    internal static void RegisterFileRelationResolver(IFileRelationResolver? resolver) =>
+        _fileRelationResolver = resolver;
 
     /// <summary>
     /// Gets a <see cref="DataFrameReader"/> for reading data into a <see cref="DataFrame"/> (Spark's

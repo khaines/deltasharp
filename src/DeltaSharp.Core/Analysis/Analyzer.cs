@@ -34,13 +34,26 @@ namespace DeltaSharp.Analysis;
 internal sealed class Analyzer
 {
     private readonly ICatalog _catalog;
+    private readonly IFileRelationResolver? _fileRelationResolver;
 
     /// <summary>Creates an analyzer bound to <paramref name="catalog"/>.</summary>
     /// <exception cref="ArgumentNullException"><paramref name="catalog"/> is null.</exception>
     public Analyzer(ICatalog catalog)
+        : this(catalog, fileRelationResolver: null)
+    {
+    }
+
+    /// <summary>Creates an analyzer bound to <paramref name="catalog"/> and an optional
+    /// <paramref name="fileRelationResolver"/> — the read-door seam (#499) through which a <c>delta</c>
+    /// path scan is bound to its schema + pinned snapshot version. When it is <see langword="null"/> (a
+    /// Core-only process with no storage backend registered), a <c>delta</c> read fails closed with a clear
+    /// diagnostic instead of resolving.</summary>
+    /// <exception cref="ArgumentNullException"><paramref name="catalog"/> is null.</exception>
+    public Analyzer(ICatalog catalog, IFileRelationResolver? fileRelationResolver)
     {
         ArgumentNullException.ThrowIfNull(catalog);
         _catalog = catalog;
+        _fileRelationResolver = fileRelationResolver;
     }
 
     /// <summary>
@@ -121,18 +134,77 @@ internal sealed class Analyzer
     }
 
     /// <summary>ResolveRelations: bind every <see cref="UnresolvedRelation"/> via the catalog, mint the
-    /// output of every in-memory <see cref="LocalRelation"/> (#158), and reject an unresolved
-    /// file-format scan (<see cref="UnresolvedFileRelation"/>) whose reader is EPIC-05.</summary>
+    /// output of every in-memory <see cref="LocalRelation"/> (#158), resolve a <c>delta</c> file-format
+    /// scan (<see cref="UnresolvedFileRelation"/>) through the read-door resolver (#499), and reject any
+    /// other file-format scan whose reader is EPIC-05.</summary>
     private LogicalPlan ResolveRelations(LogicalPlan plan, ExprIdGenerator idGenerator) =>
         plan.TransformUp(node => node switch
         {
             UnresolvedRelation relation => BindRelation(relation, idGenerator),
             LocalRelation { Resolved: false } local => BindLocalRelation(local, idGenerator),
-            UnresolvedFileRelation file =>
-                throw AnalysisException.UnsupportedDataSource(file.Format, file.Path),
+            UnresolvedFileRelation file => ResolveFileRelation(file, idGenerator),
             WriteToSource write => ValidateWriteSink(write),
             _ => node,
         });
+
+    /// <summary>Resolves a path-based file-format scan (#499). Only <c>delta</c> reads are wired: the
+    /// resolver reads the Delta log to bind the schema and pin the snapshot version (honoring the parsed
+    /// <c>versionAsOf</c>/<c>timestampAsOf</c> time-travel spec), yielding a <see cref="ResolvedRelation"/>
+    /// the Executor's Delta scan-source consumes. A <c>parquet</c> (or any other) scan stays deferred to
+    /// EPIC-05; a <c>delta</c> read in a process with no storage backend registered (no Executor) fails
+    /// closed with a clear diagnostic. Time-travel parsing (and the both-specified error) runs first, so a
+    /// bad spec is rejected before any I/O.</summary>
+    private LogicalPlan ResolveFileRelation(UnresolvedFileRelation file, ExprIdGenerator idGenerator)
+    {
+        if (!string.Equals(file.Format, DeltaReadRelation.DeltaFormat, StringComparison.OrdinalIgnoreCase))
+        {
+            throw AnalysisException.UnsupportedDataSource(file.Format, file.Path);
+        }
+
+        DeltaTimeTravelSpec spec = DeltaTimeTravel.Parse(file.Path, file.Options);
+
+        if (_fileRelationResolver is null)
+        {
+            throw AnalysisException.FileSourceResolutionFailed(
+                file.Format,
+                spec.Path,
+                "no storage backend is registered. Reference the DeltaSharp.Executor assembly and call "
+                + "DeltaSharp.Executor.DeltaSharpExecutor.Enable() once at startup.");
+        }
+
+        var request = new FileRelationResolutionRequest(
+            file.Format, spec.Path, spec.Version, spec.Timestamp, file.UserSchema);
+        if (!_fileRelationResolver.TryResolve(request, out FileRelationResolution resolution))
+        {
+            // The resolver declined this format (it handles only delta today) — defer like any other
+            // file-format reader whose provider is not wired.
+            throw AnalysisException.UnsupportedDataSource(file.Format, spec.Path);
+        }
+
+        return BindFileRelation(spec.Path, resolution, idGenerator);
+    }
+
+    /// <summary>Mints a resolved Delta file scan: derives output attributes from the resolved schema (with
+    /// stable per-pass ids, exactly like a catalog relation), renders the identifier as the <b>redacted</b>
+    /// path (so a plan string cannot leak a credential-bearing path — #431), and carries the real path +
+    /// pinned version in the reserved <see cref="DeltaReadRelation"/> options the scan-source reads.</summary>
+    private static ResolvedRelation BindFileRelation(
+        string path, FileRelationResolution resolution, ExprIdGenerator idGenerator)
+    {
+        StructType schema = resolution.Schema;
+        var output = new AttributeReference[schema.Count];
+        for (int i = 0; i < schema.Count; i++)
+        {
+            StructField field = schema[i];
+            output[i] = new AttributeReference(
+                field.Name, field.DataType, field.Nullable, idGenerator.Next());
+        }
+
+        IReadOnlyList<string> identifier = new[] { SecretRedaction.RedactPath(path) };
+        IReadOnlyDictionary<string, string> options =
+            DeltaReadRelation.BuildOptions(path, resolution.ResolvedVersion);
+        return new ResolvedRelation(identifier, schema, output, options);
+    }
 
     /// <summary>Rejects a <see cref="WriteToSource"/> whose sink <b>format</b> has no M1 write mapping —
     /// an EPIC-05-deferred writer (Delta/Parquet — AC4) or an unsupported format (AC3) — with a

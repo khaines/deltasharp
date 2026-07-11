@@ -884,7 +884,59 @@ public sealed class DataFrame
     /// materialize the output schema — the collect/count contract needs only the executor's rows.
     /// </summary>
     private static LogicalPlan AnalyzeForExecution(SparkSession session, LogicalPlan plan) =>
-        Optimize(new Analyzer(session.Catalog).Resolve(plan));
+        Optimize(new Analyzer(session.Catalog, session.FileRelationResolver).Resolve(plan));
+
+    /// <summary>
+    /// Resolves this frame's plan and reports the <b>pinned Delta snapshot version</b> a Delta read
+    /// (<c>spark.read.format("delta").load(path)</c>, optionally with <c>versionAsOf</c>/<c>timestampAsOf</c>
+    /// or the <c>@v…</c>/<c>@…</c> path syntax) will scan (#499 AC). This is the read door's resolved-version
+    /// surface: it runs the eager analyze pass (the same one an action runs), which reads the Delta log and
+    /// pins the version — the exact version for <c>versionAsOf</c>, the resolved version for
+    /// <c>timestampAsOf</c>, or the latest committed version for a base read. Two calls can differ only if a
+    /// concurrent commit changed <i>latest</i> between them (Spark parity: each read re-resolves latest);
+    /// a pinned version/timestamp is deterministic.
+    /// </summary>
+    /// <returns>The pinned Delta snapshot version.</returns>
+    /// <exception cref="InvalidOperationException">This frame is not a Delta file read (no resolved Delta
+    /// relation in its analyzed plan).</exception>
+    /// <exception cref="Analysis.AnalysisException">Resolution failed (bad time-travel spec, not a Delta
+    /// table, out-of-range/retention-gap version, or timestamp after the latest commit).</exception>
+    internal long ResolveDeltaReadVersion()
+    {
+        SparkSession session = RequireSession(nameof(ResolveDeltaReadVersion));
+        LogicalPlan analyzed = AnalyzeForExecution(session, Plan);
+        if (!TryFindDeltaReadVersion(analyzed, out long version))
+        {
+            throw new InvalidOperationException(
+                "This DataFrame is not a Delta file read, so it has no resolved Delta version. "
+                + "ResolveDeltaReadVersion() applies to spark.read.format(\"delta\").load(path).");
+        }
+
+        return version;
+    }
+
+    // Walks the analyzed plan for the resolved Delta scan and reads its pinned version out of the reserved
+    // read-door options (the Core↔Executor seam DeltaReadRelation threads the version through). A read plan
+    // has exactly one such leaf; the first match wins.
+    private static bool TryFindDeltaReadVersion(LogicalPlan node, out long version)
+    {
+        if (node is Plans.Logical.ResolvedRelation relation
+            && Plans.Logical.DeltaReadRelation.TryGet(relation.Options, out _, out version))
+        {
+            return true;
+        }
+
+        foreach (LogicalPlan child in node.Children)
+        {
+            if (TryFindDeltaReadVersion(child, out version))
+            {
+                return true;
+            }
+        }
+
+        version = 0;
+        return false;
+    }
 
     /// <summary>
     /// The eager write action shared by <see cref="DataFrameWriter.Save()"/> (STORY-04.6.3 / #175): it
@@ -919,7 +971,7 @@ public sealed class DataFrame
         SparkSession session,
         LogicalPlan plan,
         out IReadOnlyList<(string Name, DataType Type, bool Nullable)> outputColumns) =>
-        Optimize(new Analyzer(session.Catalog).Resolve(plan, out outputColumns));
+        Optimize(new Analyzer(session.Catalog, session.FileRelationResolver).Resolve(plan, out outputColumns));
 
     /// <summary>
     /// The optimizer seam. The standalone rule-based <c>Optimizer</c> (STORY-04.5.3 / #172) is already
@@ -1010,7 +1062,7 @@ public sealed class DataFrame
     {
         try
         {
-            analyzed = new Analyzer(session.Catalog).Resolve(Plan);
+            analyzed = new Analyzer(session.Catalog, session.FileRelationResolver).Resolve(Plan);
             diagnostic = null;
             return true;
         }
