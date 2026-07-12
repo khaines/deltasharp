@@ -34,12 +34,13 @@ DeltaSharp.Types.FieldMetadata
 DeltaSharp.Types.FieldMetadata.ContainsKey(string! key) -> bool
 DeltaSharp.Types.FieldMetadata.Count.get -> int
 DeltaSharp.Types.FieldMetadata.Equals(DeltaSharp.Types.FieldMetadata? other) -> bool
-DeltaSharp.Types.FieldMetadata.GetEnumerator() -> System.Collections.Generic.IEnumerator<System.Collections.Generic.KeyValuePair<string!, string!>>!
+DeltaSharp.Types.FieldMetadata.GetEnumerator() -> System.Collections.Generic.IEnumerator<System.Collections.Generic.KeyValuePair<string!, DeltaSharp.Types.MetadataValue!>>!
 DeltaSharp.Types.FieldMetadata.IsEmpty.get -> bool
 DeltaSharp.Types.FieldMetadata.Keys.get -> System.Collections.Generic.IEnumerable<string!>!
-DeltaSharp.Types.FieldMetadata.TryGetValue(string! key, out string! value) -> bool
-DeltaSharp.Types.FieldMetadata.Values.get -> System.Collections.Generic.IEnumerable<string!>!
-DeltaSharp.Types.FieldMetadata.this[string! key].get -> string!
+DeltaSharp.Types.FieldMetadata.TryGetString(string! key, out string! value) -> bool
+DeltaSharp.Types.FieldMetadata.TryGetValue(string! key, out DeltaSharp.Types.MetadataValue! value) -> bool
+DeltaSharp.Types.FieldMetadata.Values.get -> System.Collections.Generic.IEnumerable<DeltaSharp.Types.MetadataValue!>!
+DeltaSharp.Types.FieldMetadata.this[string! key].get -> DeltaSharp.Types.MetadataValue!
 DeltaSharp.Types.FloatType
 DeltaSharp.Types.IntegerType
 DeltaSharp.Types.LongType
@@ -48,6 +49,24 @@ DeltaSharp.Types.MapType.KeyType.get -> DeltaSharp.Types.DataType!
 DeltaSharp.Types.MapType.MapType(DeltaSharp.Types.DataType! keyType, DeltaSharp.Types.DataType! valueType, bool valueContainsNull = true) -> void
 DeltaSharp.Types.MapType.ValueContainsNull.get -> bool
 DeltaSharp.Types.MapType.ValueType.get -> DeltaSharp.Types.DataType!
+DeltaSharp.Types.MetadataValue
+DeltaSharp.Types.MetadataValue.AsArray() -> System.Collections.Generic.IReadOnlyList<DeltaSharp.Types.MetadataValue!>!
+DeltaSharp.Types.MetadataValue.AsBoolean() -> bool
+DeltaSharp.Types.MetadataValue.AsDouble() -> double
+DeltaSharp.Types.MetadataValue.AsLong() -> long
+DeltaSharp.Types.MetadataValue.AsNested() -> DeltaSharp.Types.FieldMetadata!
+DeltaSharp.Types.MetadataValue.AsString() -> string!
+DeltaSharp.Types.MetadataValue.Equals(DeltaSharp.Types.MetadataValue? other) -> bool
+DeltaSharp.Types.MetadataValue.Kind.get -> DeltaSharp.Types.MetadataValueKind
+DeltaSharp.Types.MetadataValue.TryGetString(out string! value) -> bool
+DeltaSharp.Types.MetadataValueKind
+DeltaSharp.Types.MetadataValueKind.Array = 5 -> DeltaSharp.Types.MetadataValueKind
+DeltaSharp.Types.MetadataValueKind.Boolean = 4 -> DeltaSharp.Types.MetadataValueKind
+DeltaSharp.Types.MetadataValueKind.Double = 3 -> DeltaSharp.Types.MetadataValueKind
+DeltaSharp.Types.MetadataValueKind.Long = 2 -> DeltaSharp.Types.MetadataValueKind
+DeltaSharp.Types.MetadataValueKind.Nested = 6 -> DeltaSharp.Types.MetadataValueKind
+DeltaSharp.Types.MetadataValueKind.Null = 0 -> DeltaSharp.Types.MetadataValueKind
+DeltaSharp.Types.MetadataValueKind.String = 1 -> DeltaSharp.Types.MetadataValueKind
 DeltaSharp.Types.NullType
 DeltaSharp.Types.SchemaValidationException
 DeltaSharp.Types.SchemaValidationException.SchemaValidationException() -> void
@@ -122,6 +141,8 @@ override DeltaSharp.Types.MapType.Equals(DeltaSharp.Types.DataType? other) -> bo
 override DeltaSharp.Types.MapType.GetHashCode() -> int
 override DeltaSharp.Types.MapType.SimpleString.get -> string!
 override DeltaSharp.Types.MapType.TypeName.get -> string!
+override DeltaSharp.Types.MetadataValue.Equals(object? obj) -> bool
+override DeltaSharp.Types.MetadataValue.GetHashCode() -> int
 override DeltaSharp.Types.NullType.SimpleString.get -> string!
 override DeltaSharp.Types.NullType.TypeName.get -> string!
 override DeltaSharp.Types.ShortType.SimpleString.get -> string!
@@ -172,9 +193,17 @@ static DeltaSharp.Types.DecimalArithmetic.SystemDefault.get -> DeltaSharp.Types.
 static DeltaSharp.Types.DoubleType.Instance.get -> DeltaSharp.Types.DoubleType!
 static DeltaSharp.Types.FieldMetadata.Empty.get -> DeltaSharp.Types.FieldMetadata!
 static DeltaSharp.Types.FieldMetadata.FromEntries(System.Collections.Generic.IEnumerable<System.Collections.Generic.KeyValuePair<string!, string!>>! entries) -> DeltaSharp.Types.FieldMetadata!
+static DeltaSharp.Types.FieldMetadata.FromValues(System.Collections.Generic.IEnumerable<System.Collections.Generic.KeyValuePair<string!, DeltaSharp.Types.MetadataValue!>>! entries) -> DeltaSharp.Types.FieldMetadata!
 static DeltaSharp.Types.FloatType.Instance.get -> DeltaSharp.Types.FloatType!
 static DeltaSharp.Types.IntegerType.Instance.get -> DeltaSharp.Types.IntegerType!
 static DeltaSharp.Types.LongType.Instance.get -> DeltaSharp.Types.LongType!
+static DeltaSharp.Types.MetadataValue.Array(System.Collections.Generic.IReadOnlyList<DeltaSharp.Types.MetadataValue!>! values) -> DeltaSharp.Types.MetadataValue!
+static DeltaSharp.Types.MetadataValue.Boolean(bool value) -> DeltaSharp.Types.MetadataValue!
+static DeltaSharp.Types.MetadataValue.Double(double value) -> DeltaSharp.Types.MetadataValue!
+static DeltaSharp.Types.MetadataValue.Long(long value) -> DeltaSharp.Types.MetadataValue!
+static DeltaSharp.Types.MetadataValue.Nested(DeltaSharp.Types.FieldMetadata! value) -> DeltaSharp.Types.MetadataValue!
+static DeltaSharp.Types.MetadataValue.Null.get -> DeltaSharp.Types.MetadataValue!
+static DeltaSharp.Types.MetadataValue.String(string! value) -> DeltaSharp.Types.MetadataValue!
 static DeltaSharp.Types.NullType.Instance.get -> DeltaSharp.Types.NullType!
 static DeltaSharp.Types.ShortType.Instance.get -> DeltaSharp.Types.ShortType!
 static DeltaSharp.Types.StringType.Instance.get -> DeltaSharp.Types.StringType!

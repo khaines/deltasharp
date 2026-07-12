@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using DeltaSharp.Types;
@@ -58,22 +59,82 @@ internal static class DeltaSchemaJson
         writer.WriteEndObject();
     }
 
-    // Faithful copy of DeltaSharp.Engine's SchemaJson.WriteMetadata (M7): each field-metadata entry
-    // is emitted as a string key/value in FieldMetadata's key-sorted order, so a schema carrying field
-    // metadata serializes byte-for-byte like the engine (a previous always-empty object dropped it).
-    // D-6 relocation follow-up: once SchemaJson is shared/relocated out of the Engine assembly, delete
-    // this copy and call the engine serializer directly.
+    // Faithful copy of DeltaSharp.Abstractions' SchemaJson.WriteMetadata (M7): each field-metadata
+    // entry is emitted in FieldMetadata's key-sorted order with a typed value, so a schema carrying
+    // field metadata serializes byte-for-byte like the engine — including numeric column-mapping ids
+    // and identity booleans, which MUST stay unquoted JSON numbers/booleans for Delta interop (#330).
+    // D-6 relocation follow-up: once SchemaJson is shared out of Abstractions, delete this copy and
+    // call the shared serializer directly.
     private static void WriteMetadata(Utf8JsonWriter writer, FieldMetadata metadata)
     {
         writer.WriteStartObject();
-        foreach (KeyValuePair<string, string> entry in metadata)
+        foreach (KeyValuePair<string, MetadataValue> entry in metadata)
         {
             // FieldMetadata enumerates in sorted key order => deterministic output.
-            writer.WriteString(entry.Key, entry.Value);
+            writer.WritePropertyName(entry.Key);
+            WriteMetadataValue(writer, entry.Value);
         }
 
         writer.WriteEndObject();
     }
+
+    // Mirrors SchemaJson.WriteMetadataValue byte-for-byte (string/long/double/bool/null/array/nested).
+    private static void WriteMetadataValue(Utf8JsonWriter writer, MetadataValue value)
+    {
+        switch (value.Kind)
+        {
+            case MetadataValueKind.Null:
+                writer.WriteNullValue();
+                break;
+            case MetadataValueKind.String:
+                writer.WriteStringValue(value.AsString());
+                break;
+            case MetadataValueKind.Long:
+                writer.WriteNumberValue(value.AsLong());
+                break;
+            case MetadataValueKind.Double:
+                WriteDouble(writer, value.AsDouble());
+                break;
+            case MetadataValueKind.Boolean:
+                writer.WriteBooleanValue(value.AsBoolean());
+                break;
+            case MetadataValueKind.Array:
+                writer.WriteStartArray();
+                foreach (MetadataValue element in value.AsArray())
+                {
+                    WriteMetadataValue(writer, element);
+                }
+
+                writer.WriteEndArray();
+                break;
+            case MetadataValueKind.Nested:
+                WriteMetadata(writer, value.AsNested());
+                break;
+            default:
+                throw new SchemaValidationException($"Cannot serialize metadata value kind '{value.Kind}'.");
+        }
+    }
+
+    // Mirrors SchemaJson.WriteDouble: round-trippable ("R") with a forced fractional part when
+    // integral so a double never collapses to a bare integer literal.
+    private static void WriteDouble(Utf8JsonWriter writer, double value)
+    {
+        if (!double.IsFinite(value))
+        {
+            writer.WriteNumberValue(value);
+            return;
+        }
+
+        string text = value.ToString("R", CultureInfo.InvariantCulture);
+        if (text.IndexOfAny(FractionOrExponent) < 0)
+        {
+            text += ".0";
+        }
+
+        writer.WriteRawValue(text);
+    }
+
+    private static readonly char[] FractionOrExponent = ['.', 'e', 'E'];
 
     private static void WriteType(Utf8JsonWriter writer, DataType type)
     {

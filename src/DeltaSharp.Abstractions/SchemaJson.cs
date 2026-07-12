@@ -115,14 +115,78 @@ internal static class SchemaJson
     private static void WriteMetadata(Utf8JsonWriter writer, FieldMetadata metadata)
     {
         writer.WriteStartObject();
-        foreach (KeyValuePair<string, string> entry in metadata)
+        foreach (KeyValuePair<string, MetadataValue> entry in metadata)
         {
             // FieldMetadata enumerates in sorted key order => deterministic output.
-            writer.WriteString(entry.Key, entry.Value);
+            writer.WritePropertyName(entry.Key);
+            WriteMetadataValue(writer, entry.Value);
         }
 
         writer.WriteEndObject();
     }
+
+    // Writes a typed metadata value (string/long/double/bool/null/array/nested-object). Numbers
+    // are emitted so an integer stays an unquoted integer and a double keeps a fractional/exponent
+    // form (so it re-reads as a Double, not a Long) — the Delta-log interop contract (#330).
+    // Shared byte-for-byte with DeltaSharp.Storage's DeltaSchemaJson.WriteMetadataValue.
+    internal static void WriteMetadataValue(Utf8JsonWriter writer, MetadataValue value)
+    {
+        switch (value.Kind)
+        {
+            case MetadataValueKind.Null:
+                writer.WriteNullValue();
+                break;
+            case MetadataValueKind.String:
+                writer.WriteStringValue(value.AsString());
+                break;
+            case MetadataValueKind.Long:
+                writer.WriteNumberValue(value.AsLong());
+                break;
+            case MetadataValueKind.Double:
+                WriteDouble(writer, value.AsDouble());
+                break;
+            case MetadataValueKind.Boolean:
+                writer.WriteBooleanValue(value.AsBoolean());
+                break;
+            case MetadataValueKind.Array:
+                writer.WriteStartArray();
+                foreach (MetadataValue element in value.AsArray())
+                {
+                    WriteMetadataValue(writer, element);
+                }
+
+                writer.WriteEndArray();
+                break;
+            case MetadataValueKind.Nested:
+                WriteMetadata(writer, value.AsNested());
+                break;
+            default:
+                throw new SchemaValidationException($"Cannot serialize metadata value kind '{value.Kind}'.");
+        }
+    }
+
+    // Writes a double with a round-trippable ("R") representation, forcing a fractional part when
+    // the value is integral so it never collapses to a bare integer literal (which would re-read as
+    // a Long). NaN/Infinity are not representable in JSON, so they fall through to WriteNumberValue,
+    // which throws the standard ArgumentException.
+    private static void WriteDouble(Utf8JsonWriter writer, double value)
+    {
+        if (!double.IsFinite(value))
+        {
+            writer.WriteNumberValue(value);
+            return;
+        }
+
+        string text = value.ToString("R", CultureInfo.InvariantCulture);
+        if (text.IndexOfAny(FractionOrExponent) < 0)
+        {
+            text += ".0";
+        }
+
+        writer.WriteRawValue(text);
+    }
+
+    private static readonly char[] FractionOrExponent = ['.', 'e', 'E'];
 
     private static DataType ReadType(JsonElement element)
     {
@@ -254,25 +318,65 @@ internal static class SchemaJson
             return FieldMetadata.Empty;
         }
 
+        return ReadMetadataObject(metadata);
+    }
+
+    // Parses a metadata JSON object into typed FieldMetadata. Recurses through nested objects and
+    // arrays; a JSON number is discriminated Long-vs-Double the same way Spark/Jackson does.
+    private static FieldMetadata ReadMetadataObject(JsonElement metadata)
+    {
         if (metadata.ValueKind != JsonValueKind.Object)
         {
             throw new SchemaValidationException("Field 'metadata' must be a JSON object.");
         }
 
-        var entries = new List<KeyValuePair<string, string>>();
+        var entries = new List<KeyValuePair<string, MetadataValue>>();
         foreach (JsonProperty property in metadata.EnumerateObject())
         {
-            if (property.Value.ValueKind != JsonValueKind.String)
-            {
-                throw new SchemaValidationException(
-                    $"Unsupported metadata value for key '{property.Name}': "
-                    + "v1 supports string metadata values only.");
-            }
-
-            entries.Add(new KeyValuePair<string, string>(property.Name, property.Value.GetString()!));
+            entries.Add(new KeyValuePair<string, MetadataValue>(
+                property.Name, ReadMetadataValue(property.Value)));
         }
 
-        return FieldMetadata.FromEntries(entries);
+        return FieldMetadata.FromValues(entries);
+    }
+
+    private static MetadataValue ReadMetadataValue(JsonElement element)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.String:
+                return MetadataValue.String(element.GetString()!);
+
+            case JsonValueKind.Number:
+                // An integral number that fits in Int64 is a Long (e.g. delta.columnMapping.id);
+                // anything else (fractional, exponent, or out-of-range) is a Double — Spark parity.
+                return element.TryGetInt64(out long longValue)
+                    ? MetadataValue.Long(longValue)
+                    : MetadataValue.Double(element.GetDouble());
+
+            case JsonValueKind.True:
+            case JsonValueKind.False:
+                return MetadataValue.Boolean(element.GetBoolean());
+
+            case JsonValueKind.Null:
+                return MetadataValue.Null;
+
+            case JsonValueKind.Array:
+                var elements = new List<MetadataValue>();
+                foreach (JsonElement item in element.EnumerateArray())
+                {
+                    elements.Add(ReadMetadataValue(item));
+                }
+
+                return MetadataValue.Array(elements);
+
+            case JsonValueKind.Object:
+                return MetadataValue.Nested(ReadMetadataObject(element));
+
+            default:
+                throw new SchemaValidationException(
+                    $"Unsupported metadata value token '{element.ValueKind}'.");
+        }
     }
 
     private static JsonElement GetRequired(JsonElement element, string propertyName)

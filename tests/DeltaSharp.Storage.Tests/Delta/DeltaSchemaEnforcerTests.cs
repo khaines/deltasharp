@@ -252,7 +252,8 @@ public sealed class DeltaSchemaEnforcerTests
         StructType? merged = DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.AddNewColumns);
 
         Assert.NotNull(merged);
-        Assert.Equal("the amount", merged![0].Metadata["comment"]);
+        Assert.True(merged![0].Metadata.TryGetString("comment", out string? comment));
+        Assert.Equal("the amount", comment);
     }
 
     // ---- AC2/AC3: decimal precision/scale compatibility ------------------------------------------------
