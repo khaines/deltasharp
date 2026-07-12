@@ -134,9 +134,17 @@ public sealed class DeltaReadSource : IDisposable
         }
 
         StructType tableSchema = snapshot.Schema;
+        ColumnMappingMode mappingMode = ColumnMapping.ResolveMode(snapshot.Metadata.Configuration);
         ImmutableArray<string> partitionColumns = snapshot.Metadata.PartitionColumns;
-        StructType dataSchema = BuildDataSchema(tableSchema, partitionColumns);
-        int[] dataOrdinalByField = MapDataOrdinals(tableSchema, dataSchema);
+
+        // Column-mapping resolution (§2.12.3; STORY-05.4.3 AC1). In name mode a table's Parquet columns are
+        // stored under their PHYSICAL names and add.partitionValues are keyed by physical name, so we read by
+        // physical name and relabel the result to the LOGICAL schema for the caller. In none mode the
+        // physical name IS the logical name, so this is exactly the prior behavior. (id mode never reaches
+        // here — it is rejected fail-closed at snapshot load, deferred to #523.)
+        string[] physicalNames = ResolvePhysicalNames(tableSchema, mappingMode);
+        StructType dataSchema = BuildDataSchema(tableSchema, physicalNames, partitionColumns);
+        int[] dataOrdinalByField = MapDataOrdinals(physicalNames, dataSchema);
 
         var batches = new List<ColumnBatch>();
         try
@@ -144,7 +152,8 @@ public sealed class DeltaReadSource : IDisposable
             foreach (AddFileAction add in snapshot.ActiveFiles)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                await ReadFileAsync(add, tableSchema, dataSchema, dataOrdinalByField, batches, cancellationToken)
+                await ReadFileAsync(
+                        add, tableSchema, physicalNames, dataSchema, dataOrdinalByField, batches, cancellationToken)
                     .ConfigureAwait(false);
             }
         }
@@ -166,6 +175,7 @@ public sealed class DeltaReadSource : IDisposable
     private async Task ReadFileAsync(
         AddFileAction add,
         StructType tableSchema,
+        string[] physicalNames,
         StructType dataSchema,
         int[] dataOrdinalByField,
         List<ColumnBatch> batches,
@@ -180,7 +190,7 @@ public sealed class DeltaReadSource : IDisposable
                     .ReadAsync(stream, dataSchema, keepRowGroup: null, cancellationToken)
                     .ConfigureAwait(false))
                 {
-                    batches.Add(BuildFullBatch(add, tableSchema, dataOrdinalByField, dataBatch));
+                    batches.Add(BuildFullBatch(add, tableSchema, physicalNames, dataOrdinalByField, dataBatch));
                 }
             }
             catch (DeltaStorageException ex) when (IsNarrowSchemaEvolutionInput(ex))
@@ -194,11 +204,18 @@ public sealed class DeltaReadSource : IDisposable
         }
     }
 
-    // Assembles one output batch in table-schema order: partition columns are const/null-filled from the
-    // add's partitionValues (they are NOT in the physical file), data columns are taken from the projected
-    // Parquet batch. Column vectors are reused (no copy); the const columns are freshly built.
+    // Assembles one output batch in table-schema order, RELABELED to the LOGICAL schema: partition columns
+    // are const/null-filled from the add's partitionValues (keyed by the column's PHYSICAL name; they are NOT
+    // in the physical file), data columns are taken from the projected physical-name Parquet batch. Column
+    // vectors are reused (no copy); the const columns are freshly built. The output batch carries the LOGICAL
+    // table schema, so a column whose physical name differs from its logical name (a renamed column) reads
+    // through under its new logical name from UNCHANGED Parquet data (STORY-05.4.3 AC1).
     private static ColumnBatch BuildFullBatch(
-        AddFileAction add, StructType tableSchema, int[] dataOrdinalByField, ColumnBatch dataBatch)
+        AddFileAction add,
+        StructType tableSchema,
+        string[] physicalNames,
+        int[] dataOrdinalByField,
+        ColumnBatch dataBatch)
     {
         int rowCount = dataBatch.RowCount;
         var columns = new ColumnVector[tableSchema.Count];
@@ -212,42 +229,60 @@ public sealed class DeltaReadSource : IDisposable
             }
 
             StructField field = tableSchema[i];
-            add.PartitionValues.TryGetValue(field.Name, out string? value);
+            add.PartitionValues.TryGetValue(physicalNames[i], out string? value);
             columns[i] = DeltaReadEncoding.BuildConstantColumn(field.DataType, value, rowCount);
         }
 
         return new ManagedColumnBatch(tableSchema, columns, rowCount);
     }
 
-    // The table schema minus the partition columns (order-preserving) — the exact shape a Delta Parquet
-    // data file stores. For an unpartitioned table this is the full schema.
-    private static StructType BuildDataSchema(StructType tableSchema, ImmutableArray<string> partitionColumns)
+    // The PHYSICAL name of each table-schema field (in field order): the declared
+    // delta.columnMapping.physicalName in name mode, the field's own name in none mode.
+    private static string[] ResolvePhysicalNames(StructType tableSchema, ColumnMappingMode mode)
     {
-        if (partitionColumns.IsDefaultOrEmpty)
+        var names = new string[tableSchema.Count];
+        for (int i = 0; i < tableSchema.Count; i++)
         {
-            return tableSchema;
+            names[i] = ColumnMapping.PhysicalName(tableSchema[i], mode);
         }
 
-        var partitionSet = partitionColumns.ToImmutableHashSet(StringComparer.Ordinal);
+        return names;
+    }
+
+    // The PHYSICAL data schema: the table schema minus the partition columns, with each remaining field named
+    // by its physical name (order-preserving) — the exact shape a Delta Parquet data file stores. In none
+    // mode this is the plain data schema; partitionColumns are compared as physical names (which equal the
+    // logical names in none mode, and are stored physically in name mode).
+    private static StructType BuildDataSchema(
+        StructType tableSchema, string[] physicalNames, ImmutableArray<string> partitionColumns)
+    {
+        var partitionSet = partitionColumns.IsDefaultOrEmpty
+            ? null
+            : partitionColumns.ToImmutableHashSet(StringComparer.Ordinal);
+
         var dataFields = new List<StructField>(tableSchema.Count);
-        foreach (StructField field in tableSchema)
+        for (int i = 0; i < tableSchema.Count; i++)
         {
-            if (!partitionSet.Contains(field.Name))
+            if (partitionSet is not null && partitionSet.Contains(physicalNames[i]))
             {
-                dataFields.Add(field);
+                continue;
             }
+
+            StructField field = tableSchema[i];
+            dataFields.Add(new StructField(physicalNames[i], field.DataType, field.Nullable));
         }
 
         return new StructType(dataFields);
     }
 
-    // For each table-schema field, its ordinal in the data (Parquet) schema, or -1 for a partition column.
-    private static int[] MapDataOrdinals(StructType tableSchema, StructType dataSchema)
+    // For each table-schema field, its ordinal in the physical (Parquet) data schema, or -1 for a partition
+    // column, matched by the field's PHYSICAL name.
+    private static int[] MapDataOrdinals(string[] physicalNames, StructType dataSchema)
     {
-        var map = new int[tableSchema.Count];
-        for (int i = 0; i < tableSchema.Count; i++)
+        var map = new int[physicalNames.Length];
+        for (int i = 0; i < physicalNames.Length; i++)
         {
-            map[i] = dataSchema.IndexOf(tableSchema[i].Name);
+            map[i] = dataSchema.IndexOf(physicalNames[i]);
         }
 
         return map;

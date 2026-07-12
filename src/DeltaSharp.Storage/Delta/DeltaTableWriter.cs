@@ -353,15 +353,62 @@ internal sealed class DeltaTableWriter
             .ConfigureAwait(false);
     }
 
-    // Commits version 0 = protocol + metaData (schema + partition columns) + the new adds against a synthetic
-    // empty snapshot (version -1), so a fresh path becomes a well-formed Delta table in a single atomic
-    // commit. A create is append-only (no removes) so it commits under BlindAppend; a concurrent create that
-    // loses the version-0 race does NOT rebase — its commit carries protocol + metaData, so the committer's
-    // pre-write gates observe the winner's version-0 protocol/metadata and ABORT it via
-    // ProtocolChangedException/MetadataChangedException (a second table-creation is not a blind append).
+    // Creates a fresh (non-column-mapped) table: basic protocol (reader 1 / writer 2), empty configuration.
+    // Delegates the version-0 atomic commit to CreateTableCoreAsync.
     private Task<DeltaCommitResult> CreateTableAsync(
         StructType writeSchema,
         IReadOnlyList<string> partitionColumns,
+        IReadOnlyList<StagedDataFile> files,
+        CancellationToken cancellationToken)
+    {
+        var protocol = new ProtocolAction(
+            ProtocolSupport.BasicReaderVersion,
+            ProtocolSupport.MaxBasicWriterVersion,
+            ImmutableArray<string>.Empty,
+            ImmutableArray<string>.Empty);
+        return CreateTableCoreAsync(
+            writeSchema, partitionColumns, EmptyStringMap, protocol, files, cancellationToken);
+    }
+
+    /// <summary>
+    /// Creates a fresh Delta table with an explicit <paramref name="configuration"/> and
+    /// <paramref name="protocol"/> — the enablement path for column mapping (STORY-05.4.3 / #191). The
+    /// <paramref name="writeSchema"/> is the mapped LOGICAL schema (each field carrying its
+    /// <c>delta.columnMapping.id</c> / <c>delta.columnMapping.physicalName</c>); <paramref name="partitionColumns"/>
+    /// are the PHYSICAL partition-column names; and <paramref name="files"/> must already be staged as
+    /// physical-name Parquet with <c>partitionValues</c> keyed by physical name (Delta protocol writer
+    /// requirement). Enablement is scoped to a fresh table so every data file is written under physical names
+    /// from version 0 — read-through is guaranteed without rewriting existing data.
+    /// </summary>
+    internal Task<DeltaCommitResult> CreateMappedTableAsync(
+        StructType writeSchema,
+        IReadOnlyList<string> partitionColumns,
+        ImmutableSortedDictionary<string, string> configuration,
+        ProtocolAction protocol,
+        IReadOnlyList<StagedDataFile> files,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(writeSchema);
+        ArgumentNullException.ThrowIfNull(partitionColumns);
+        ArgumentNullException.ThrowIfNull(configuration);
+        ArgumentNullException.ThrowIfNull(protocol);
+        ArgumentNullException.ThrowIfNull(files);
+        return CreateTableCoreAsync(
+            writeSchema, partitionColumns, configuration, protocol, files, cancellationToken);
+    }
+
+    // Commits version 0 = protocol + metaData (schema + partition columns + configuration) + the new adds
+    // against a synthetic empty snapshot (version -1), so a fresh path becomes a well-formed Delta table in a
+    // single atomic commit. A create is append-only (no removes) so it commits under BlindAppend; a
+    // concurrent create that loses the version-0 race does NOT rebase — its commit carries protocol +
+    // metaData, so the committer's pre-write gates observe the winner's version-0 protocol/metadata and ABORT
+    // it via ProtocolChangedException/MetadataChangedException (a second table-creation is not a blind
+    // append).
+    private Task<DeltaCommitResult> CreateTableCoreAsync(
+        StructType writeSchema,
+        IReadOnlyList<string> partitionColumns,
+        ImmutableSortedDictionary<string, string> configuration,
+        ProtocolAction protocol,
         IReadOnlyList<StagedDataFile> files,
         CancellationToken cancellationToken)
     {
@@ -376,17 +423,118 @@ internal sealed class DeltaTableWriter
             Format: new TableFormat("parquet", EmptyStringMap),
             SchemaString: SchemaJson.ToJson(writeSchema),
             PartitionColumns: partitionArray,
-            Configuration: EmptyStringMap,
+            Configuration: configuration,
             CreatedTime: createdTime);
-        var protocol = new ProtocolAction(
-            ProtocolSupport.BasicReaderVersion,
-            ProtocolSupport.MaxBasicWriterVersion,
-            ImmutableArray<string>.Empty,
-            ImmutableArray<string>.Empty);
 
         var actions = new List<DeltaAction>(2 + files.Count) { protocol, metadata };
         AppendAddActions(actions, files);
         return _committer.CommitAsync(EmptySnapshot(), actions, DeltaReadScope.BlindAppend, cancellationToken);
+    }
+
+    /// <summary>
+    /// Renames a column in a name-mode column-mapping table (STORY-05.4.3 AC1) — a <b>metadata-only</b>
+    /// operation. The field's <c>delta.columnMapping.physicalName</c> and <c>id</c> are unchanged (so no data
+    /// file is rewritten and existing rows read through under the new logical name); only the logical/display
+    /// name changes. Commits a lone <c>metaData</c> action (all other metadata fields copied) under
+    /// <see cref="DeltaReadScope.WholeTable"/>, so any concurrent commit aborts the rename (a schema change
+    /// needs a fresh snapshot).
+    /// </summary>
+    /// <exception cref="InvalidOperationException">The table does not use column mapping <c>name</c> mode, the
+    /// source column is absent, or the target name collides with an existing column.</exception>
+    internal async Task<DeltaCommitResult> RenameColumnAsync(
+        string fromName, string toName, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(fromName);
+        ArgumentException.ThrowIfNullOrEmpty(toName);
+        Snapshot snapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
+        RequireNameMode(snapshot);
+
+        StructType schema = snapshot.Schema;
+        if (!schema.TryGetField(fromName, out StructField target))
+        {
+            throw new InvalidOperationException(
+                $"Cannot rename column '{fromName}': no such column in the table schema.");
+        }
+
+        if (!string.Equals(fromName, toName, StringComparison.Ordinal) && schema.IndexOf(toName) >= 0)
+        {
+            throw new InvalidOperationException(
+                $"Cannot rename column '{fromName}' to '{toName}': a column named '{toName}' already exists.");
+        }
+
+        var fields = new List<StructField>(schema.Count);
+        foreach (StructField field in schema)
+        {
+            fields.Add(
+                ReferenceEquals(field, target)
+                    ? new StructField(toName, field.DataType, field.Nullable, field.Metadata)
+                    : field);
+        }
+
+        return await CommitSchemaChangeAsync(snapshot, new StructType(fields), cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Drops a column from a name-mode column-mapping table (STORY-05.4.3 AC2) — a <b>logical-only</b>
+    /// operation. The field is removed from the LOGICAL schema; the physical column remains unreferenced in
+    /// existing data files (no rewrite), and <c>delta.columnMapping.maxColumnId</c> is unchanged (a dropped
+    /// id is never reused). Old snapshots (time travel) still expose the dropped column and its data per their
+    /// version. Commits a lone <c>metaData</c> action under <see cref="DeltaReadScope.WholeTable"/>.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">The table does not use column mapping <c>name</c> mode, the
+    /// column is absent, or dropping it would be a partition column (out of scope here).</exception>
+    internal async Task<DeltaCommitResult> DropColumnAsync(
+        string name, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(name);
+        Snapshot snapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
+        RequireNameMode(snapshot);
+
+        StructType schema = snapshot.Schema;
+        if (!schema.TryGetField(name, out StructField target))
+        {
+            throw new InvalidOperationException(
+                $"Cannot drop column '{name}': no such column in the table schema.");
+        }
+
+        string physicalName = ColumnMapping.PhysicalName(target, ColumnMappingMode.Name);
+        if (snapshot.Metadata.PartitionColumns.Contains(physicalName, StringComparer.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Cannot drop partition column '{name}'; dropping a partition column is out of scope.");
+        }
+
+        var fields = new List<StructField>(schema.Count - 1);
+        foreach (StructField field in schema)
+        {
+            if (!ReferenceEquals(field, target))
+            {
+                fields.Add(field);
+            }
+        }
+
+        return await CommitSchemaChangeAsync(snapshot, new StructType(fields), cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private static void RequireNameMode(Snapshot snapshot)
+    {
+        ColumnMappingMode mode = ColumnMapping.ResolveMode(snapshot.Metadata.Configuration);
+        if (mode != ColumnMappingMode.Name)
+        {
+            throw new InvalidOperationException(
+                "Column rename/drop as a metadata-only operation requires column mapping 'name' mode; "
+                + $"the table's mode is '{mode}'.");
+        }
+    }
+
+    private Task<DeltaCommitResult> CommitSchemaChangeAsync(
+        Snapshot snapshot, StructType newSchema, CancellationToken cancellationToken)
+    {
+        MetadataAction metadata = snapshot.Metadata with { SchemaString = SchemaJson.ToJson(newSchema) };
+        return _committer.CommitAsync(
+            snapshot, new DeltaAction[] { metadata }, DeltaReadScope.WholeTable, cancellationToken);
     }
 
     private static readonly ImmutableSortedDictionary<string, string> EmptyStringMap =
