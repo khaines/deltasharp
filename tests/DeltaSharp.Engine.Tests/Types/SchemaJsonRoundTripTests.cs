@@ -79,7 +79,8 @@ public class SchemaJsonRoundTripTests
 
         Assert.Equal(schema, roundTripped);
         Assert.False(roundTripped["id"].Nullable);
-        Assert.Equal("primary key", roundTripped["id"].Metadata["comment"]);
+        Assert.True(roundTripped["id"].Metadata.TryGetString("comment", out string? comment));
+        Assert.Equal("primary key", comment);
         Assert.True(roundTripped["name"].Nullable);
         Assert.True(roundTripped["name"].Metadata.IsEmpty);
     }
@@ -195,15 +196,19 @@ public class SchemaJsonRoundTripTests
     }
 
     [Fact]
-    public void FromJson_RejectsNonStringMetadataValue()
+    public void FromJson_AcceptsNumericMetadataValue_AsLong()
     {
+        // Typed field metadata (issue #330): a JSON-integer metadata value now round-trips as Long
+        // rather than being rejected — the prerequisite for column-mapping/identity tables.
         const string json =
             "{\"type\":\"struct\",\"fields\":[" +
             "{\"name\":\"a\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{\"weight\":3}}]}";
 
-        SchemaValidationException ex =
-            Assert.Throws<SchemaValidationException>(() => SchemaJson.FromJson(json));
-        Assert.Contains("metadata", ex.Message, StringComparison.OrdinalIgnoreCase);
+        var parsed = (StructType)SchemaJson.FromJson(json);
+        MetadataValue weight = parsed["a"].Metadata["weight"];
+        Assert.Equal(MetadataValueKind.Long, weight.Kind);
+        Assert.Equal(3L, weight.AsLong());
+        Assert.Equal(json, SchemaJson.ToJson(parsed));
     }
 
     [Fact]
