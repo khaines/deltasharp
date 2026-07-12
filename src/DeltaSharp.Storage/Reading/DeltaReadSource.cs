@@ -124,27 +124,38 @@ public sealed class DeltaReadSource : IDisposable
         long version, CancellationToken cancellationToken = default)
     {
         Snapshot snapshot;
+        StructType tableSchema;
+        string[] physicalNames;
+        StructType dataSchema;
+        int[] dataOrdinalByField;
         try
         {
             snapshot = await _log.LoadSnapshotAsync(version, cancellationToken).ConfigureAwait(false);
+
+            // Column-mapping resolution (§2.12.3; STORY-05.4.3 AC1). In name mode a table's Parquet columns
+            // are stored under their PHYSICAL names and add.partitionValues are keyed by physical name, so we
+            // read by physical name and relabel the result to the LOGICAL schema for the caller. In none mode
+            // the physical name IS the logical name, so this is exactly the prior behavior. (id mode never
+            // reaches here — it is rejected fail-closed at snapshot load, deferred to #523.) FIX #6: these
+            // mapping/BuildDataSchema calls run INSIDE the try so a name-mode resolution fault
+            // (DeltaProtocolException from ColumnMapping, or a SchemaValidationException from a malformed
+            // physical data schema) surfaces as the documented DeltaReadException — never leaks un-normalized
+            // past the facade. The #497 DeltaReadSchemaEvolutionException stays distinct (thrown per-file below).
+            tableSchema = snapshot.Schema;
+            ColumnMappingMode mappingMode = ColumnMapping.ResolveMode(snapshot.Metadata.Configuration);
+            ImmutableArray<string> partitionColumns = snapshot.Metadata.PartitionColumns;
+            physicalNames = ResolvePhysicalNames(tableSchema, mappingMode);
+            dataSchema = BuildDataSchema(tableSchema, physicalNames, partitionColumns);
+            dataOrdinalByField = MapDataOrdinals(physicalNames, dataSchema);
         }
         catch (DeltaProtocolException ex)
         {
             throw new DeltaReadException(ex.Message, ex);
         }
-
-        StructType tableSchema = snapshot.Schema;
-        ColumnMappingMode mappingMode = ColumnMapping.ResolveMode(snapshot.Metadata.Configuration);
-        ImmutableArray<string> partitionColumns = snapshot.Metadata.PartitionColumns;
-
-        // Column-mapping resolution (§2.12.3; STORY-05.4.3 AC1). In name mode a table's Parquet columns are
-        // stored under their PHYSICAL names and add.partitionValues are keyed by physical name, so we read by
-        // physical name and relabel the result to the LOGICAL schema for the caller. In none mode the
-        // physical name IS the logical name, so this is exactly the prior behavior. (id mode never reaches
-        // here — it is rejected fail-closed at snapshot load, deferred to #523.)
-        string[] physicalNames = ResolvePhysicalNames(tableSchema, mappingMode);
-        StructType dataSchema = BuildDataSchema(tableSchema, physicalNames, partitionColumns);
-        int[] dataOrdinalByField = MapDataOrdinals(physicalNames, dataSchema);
+        catch (SchemaValidationException ex)
+        {
+            throw new DeltaReadException(ex.Message, ex);
+        }
 
         var batches = new List<ColumnBatch>();
         try
@@ -237,22 +248,37 @@ public sealed class DeltaReadSource : IDisposable
     }
 
     // The PHYSICAL name of each table-schema field (in field order): the declared
-    // delta.columnMapping.physicalName in name mode, the field's own name in none mode.
+    // delta.columnMapping.physicalName in name mode, the field's own name in none mode. FIX #9: a nested
+    // top-level column is rejected with a precise "nested column mapping unsupported" error here (name mode
+    // only maps leaf columns in this build), rather than failing downstream in the Parquet reader.
     private static string[] ResolvePhysicalNames(StructType tableSchema, ColumnMappingMode mode)
     {
         var names = new string[tableSchema.Count];
         for (int i = 0; i < tableSchema.Count; i++)
         {
-            names[i] = ColumnMapping.PhysicalName(tableSchema[i], mode);
+            StructField field = tableSchema[i];
+            if (mode == ColumnMappingMode.Name && field.DataType is StructType or ArrayType or MapType)
+            {
+                throw DeltaProtocolException.Unsupported(
+                    string.Create(
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        $"Column '{field.Name}' is a nested ({field.DataType.TypeName}) type; nested column "
+                        + $"mapping is unsupported in this build (design §2.9/§2.12.3). Only top-level (leaf) "
+                        + $"columns are supported in column mapping 'name' mode."));
+            }
+
+            names[i] = ColumnMapping.PhysicalName(field, mode);
         }
 
         return names;
     }
 
     // The PHYSICAL data schema: the table schema minus the partition columns, with each remaining field named
-    // by its physical name (order-preserving) — the exact shape a Delta Parquet data file stores. In none
-    // mode this is the plain data schema; partitionColumns are compared as physical names (which equal the
-    // logical names in none mode, and are stored physically in name mode).
+    // by its physical name (order-preserving) — the exact shape a Delta Parquet data file stores. FIX #1:
+    // partition MEMBERSHIP is decided by the LOGICAL field name against metaData.partitionColumns (which holds
+    // LOGICAL names under name mode — verified against the Spark golden `dv-with-columnmapping`), decoupled
+    // from the partition VALUE KEY, which stays PHYSICAL (looked up from add.partitionValues in
+    // BuildFullBatch). In none mode logical == physical, so this is exactly the prior behavior.
     private static StructType BuildDataSchema(
         StructType tableSchema, string[] physicalNames, ImmutableArray<string> partitionColumns)
     {
@@ -263,12 +289,12 @@ public sealed class DeltaReadSource : IDisposable
         var dataFields = new List<StructField>(tableSchema.Count);
         for (int i = 0; i < tableSchema.Count; i++)
         {
-            if (partitionSet is not null && partitionSet.Contains(physicalNames[i]))
+            StructField field = tableSchema[i];
+            if (partitionSet is not null && partitionSet.Contains(field.Name))
             {
                 continue;
             }
 
-            StructField field = tableSchema[i];
             dataFields.Add(new StructField(physicalNames[i], field.DataType, field.Nullable));
         }
 

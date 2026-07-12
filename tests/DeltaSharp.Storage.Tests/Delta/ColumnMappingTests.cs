@@ -9,6 +9,17 @@ using Xunit;
 
 namespace DeltaSharp.Storage.Tests.Delta;
 
+/// <summary>Marks the non-parallel xUnit collection the column-mapping tests run in (FIX #7): a
+/// fail-closed SAFETY test must never flake red in CI, so these raw-write / shared-temp-filesystem tests
+/// are serialized rather than run in the default parallel collection.</summary>
+[CollectionDefinition(Name, DisableParallelization = true)]
+public sealed class ColumnMappingTestCollection
+{
+    /// <summary>The collection name shared by <see cref="CollectionDefinitionAttribute"/> and
+    /// <see cref="CollectionAttribute"/>.</summary>
+    public const string Name = "ColumnMapping raw-write (non-parallel)";
+}
+
 /// <summary>
 /// End-to-end tests for Delta column mapping <c>name</c> mode (STORY-05.4.3 / #191, design §2.12.3).
 /// Covers the four acceptance criteria against a real <see cref="LocalFileSystemBackend"/> table:
@@ -25,6 +36,14 @@ namespace DeltaSharp.Storage.Tests.Delta;
 /// </list>
 /// The physical names are minted by a deterministic seeded source so the AC3 assertions are golden.
 /// </summary>
+/// <remarks>
+/// FIX #7 (flaky-safety-test isolation): these tests are placed in a NON-parallel xUnit collection. The
+/// fail-closed safety tests (e.g. <see cref="IdMode_IsRejectedFailClosed_DeferredTo523"/>) must never present
+/// red in CI, and a raw-write column-mapping test flaked once under xUnit parallel execution on the shared
+/// temp filesystem. Disabling parallelization for this collection removes that harness race while keeping
+/// each test's per-instance temp directory.
+/// </remarks>
+[Collection(ColumnMappingTestCollection.Name)]
 public sealed class ColumnMappingTests : IDisposable
 {
     private const string Seed = "story-05.4.3-name-mode";
@@ -209,11 +228,26 @@ public sealed class ColumnMappingTests : IDisposable
         Snapshot snapshot = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
         string physicalRegion = ColumnMapping.PhysicalName(snapshot.Schema[0], ColumnMappingMode.Name);
 
-        // metaData.partitionColumns + add.partitionValues are BOTH keyed by the PHYSICAL name (Delta writer
-        // requirement: partition values tracked by physical name), not the logical "region".
-        Assert.Equal(new[] { physicalRegion }, snapshot.Metadata.PartitionColumns.ToArray());
+        // FIX #1 (Spark golden dv-with-columnmapping): metaData.partitionColumns holds the LOGICAL name
+        // ("region"), while add.partitionValues keys are PHYSICAL (partition IDENTITY logical, partition VALUE
+        // KEY physical). physicalRegion is the seeded col-<uuid>, never the logical "region".
+        Assert.Equal(new[] { "region" }, snapshot.Metadata.PartitionColumns.ToArray());
+        Assert.NotEqual("region", physicalRegion);
         Assert.All(snapshot.ActiveFiles, add => Assert.True(add.PartitionValues.ContainsKey(physicalRegion)));
         Assert.DoesNotContain(snapshot.ActiveFiles, add => add.PartitionValues.ContainsKey("region"));
+
+        // FIX #4: assert the EXACT committed schemaString — logical field names, per-field id (unquoted int)
+        // + golden physicalName, matching the Spark name-mode shape byte-for-byte (region=counter0=PhysId,
+        // id=counter1=PhysScore under the deterministic seed). A swap/misroute of any field would break this.
+        Assert.Equal(PhysId, physicalRegion);
+        string schemaJson = await ReadCommittedSchemaStringAsync();
+        Assert.Equal(
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{"
+            + $"\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"{PhysId}\"}}}},"
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":{"
+            + $"\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"{PhysScore}\"}}}}]}}",
+            schemaJson);
 
         // The read facade relabels back to logical: region reads its partition value; id reads its data.
         using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
@@ -300,6 +334,266 @@ public sealed class ColumnMappingTests : IDisposable
         using var backend = new LocalFileSystemBackend(_root);
         var writer = new DeltaTableWriter(backend);
         await Assert.ThrowsAsync<InvalidOperationException>(() => writer.RenameColumnAsync("id", "identifier"));
+    }
+
+    // ---------------------------------------------------------------- HIGH: swap read-through
+
+    [Fact]
+    public async Task ColumnSwap_ByRename_EachLogicalColumnReadsThroughToItsPhysicalData()
+    {
+        // Distinct per-column values so a misroute corrupts loudly: id={1,2}, score={100,200}.
+        await CreateNameMappedAsync((1L, 100L, "alice"), (2L, 200L, "bob"));
+
+        using var backend = new LocalFileSystemBackend(_root);
+        var writer = new DeltaTableWriter(backend);
+
+        // Swap the LOGICAL names id<->score via the temp-name 3-step. Each rename is metadata-only, so the
+        // PHYSICAL columns (and their data) never move; only the labels swap. After the swap logical "id"
+        // resolves to score's physical column and logical "score" to id's.
+        await writer.RenameColumnAsync("id", "__tmp");
+        await writer.RenameColumnAsync("score", "id");
+        await writer.RenameColumnAsync("__tmp", "score");
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+
+        int idIdx = info.Schema.IndexOf("id");
+        int scoreIdx = info.Schema.IndexOf("score");
+        int nameIdx = info.Schema.IndexOf("name");
+        Assert.True(idIdx >= 0 && scoreIdx >= 0 && nameIdx >= 0);
+
+        var byName = new Dictionary<string, (long IdVal, long ScoreVal)>(StringComparer.Ordinal);
+        foreach (ColumnBatch batch in await source.ReadBatchesAsync(info.Version))
+        {
+            ColumnVector idCol = batch.SelectedColumn(idIdx);
+            ColumnVector scoreCol = batch.SelectedColumn(scoreIdx);
+            ColumnVector nameCol = batch.SelectedColumn(nameIdx);
+            for (int r = 0; r < batch.LogicalRowCount; r++)
+            {
+                byName[Encoding.UTF8.GetString(nameCol.GetBytes(r))] =
+                    (idCol.GetValue<long>(r), scoreCol.GetValue<long>(r));
+            }
+        }
+
+        // alice originally had id=1, score=100 → after the swap logical "id"=100, "score"=1 (and symmetric
+        // for bob). A broken physical-name resolution (positional/name misread) would yield the ORIGINAL
+        // unswapped values (id=1) and fail here.
+        Assert.Equal((100L, 1L), byName["alice"]);
+        Assert.Equal((200L, 2L), byName["bob"]);
+    }
+
+    // ---------------------------------------------------------------- HIGH #3: poisoned physical-name collision
+
+    [Fact]
+    public async Task PoisonedPhysicalNameCollision_IsRejected_NotMisread()
+    {
+        // A name-mode table (protocol supports columnMapping) whose PARTITION column 'part' and DATA column
+        // 'col1' share the SAME physicalName 'col-dup'. Without the uniqueness gate the read would serve the
+        // partition CONSTANT under col1's logical name (wrong data, no exception). It must fail closed.
+        const string dupPhysical = "col-dup00000000000000000000000000000000";
+        string schema =
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"part\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + $"{{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"{dupPhysical}\"}}}},"
+            + "{\"name\":\"col1\",\"type\":\"long\",\"nullable\":true,\"metadata\":"
+            + $"{{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"{dupPhysical}\"}}}}]}}";
+        await WriteRawTableAsync(
+            protocol: ProtocolFeatureLine(),
+            metadata: NameModeMetadataLine(
+                schema,
+                partitionColumns: new[] { "part" },
+                ("delta.columnMapping.mode", "name"),
+                ("delta.columnMapping.maxColumnId", "2")));
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            () => source.LoadSnapshotAsync(null, null));
+        Assert.Contains("physical name", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(dupPhysical, ex.Message, StringComparison.Ordinal);
+    }
+
+    // ---------------------------------------------------------------- HIGH #2: append/overwrite fail-closed
+
+    [Fact]
+    public async Task AppendToNameModeTable_IsRejectedFailClosed()
+    {
+        await CreateNameMappedAsync((1L, 100L, "alice"));
+
+        using var backend = new LocalFileSystemBackend(_root);
+        var writer = new DeltaTableWriter(backend);
+
+        // Stage a lone data file (partition-free) and try to CreateOrAppend into the existing name-mode
+        // table: must be rejected with a typed DeltaProtocolException (a silent, corrupt commit is the bug).
+        var staged = new[]
+        {
+            new StagedDataFile(
+                "part-appended.parquet",
+                System.Collections.Immutable.ImmutableSortedDictionary<string, string?>.Empty,
+                Size: 1,
+                ModificationTime: 0,
+                Stats: null),
+        };
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => writer.CreateOrAppendAsync(FlatSchema, Array.Empty<string>(), staged));
+        Assert.Contains("525", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("name-mode", ex.Message, StringComparison.OrdinalIgnoreCase);
+
+        // The corrupt append must NOT have committed: the table is still at v0 with its original single row.
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        Assert.Equal(0L, info.Version);
+    }
+
+    // ---------------------------------------------------------------- MEDIUM #4/#5: partition rename/drop
+
+    [Fact]
+    public async Task PartitionColumnRename_UpdatesLogicalPartitionColumns_AndReadsThrough()
+    {
+        var schema = new StructType(new[]
+        {
+            new StructField("region", DataTypes.StringType, nullable: true),
+            new StructField("id", DataTypes.LongType, nullable: false),
+        });
+
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), FileNames()))
+        {
+            MutableColumnVector region = ColumnVectors.Create(DataTypes.StringType, 1);
+            MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, 1);
+            region.AppendBytes(Encoding.UTF8.GetBytes("us"));
+            id.AppendValue(7L);
+            var batch = new ManagedColumnBatch(schema, new ColumnVector[] { region, id }, 1);
+            await target.CreateNameMappedTableAsync(
+                schema, new[] { "region" }, new[] { batch }, new SeededPhysicalNameSource(Seed));
+        }
+
+        using var backend = new LocalFileSystemBackend(_root);
+        var writer = new DeltaTableWriter(backend);
+        string physicalRegion =
+            ColumnMapping.PhysicalName((await new DeltaLog(backend).LoadSnapshotAsync(null)).Schema[0], ColumnMappingMode.Name);
+
+        // Rename the PARTITION column region -> zone: metaData.partitionColumns must update to the new LOGICAL
+        // name, while add.partitionValues keys stay PHYSICAL (existing files still resolve).
+        await writer.RenameColumnAsync("region", "zone");
+
+        Snapshot after = await new DeltaLog(backend).LoadSnapshotAsync(null);
+        Assert.Equal(new[] { "zone" }, after.Metadata.PartitionColumns.ToArray());
+        Assert.All(after.ActiveFiles, add => Assert.True(add.PartitionValues.ContainsKey(physicalRegion)));
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        Assert.Equal(new[] { "zone", "id" }, info.Schema.Select(f => f.Name).ToArray());
+
+        var rows = new List<(string?, long)>();
+        foreach (ColumnBatch b in await source.ReadBatchesAsync(info.Version))
+        {
+            for (int r = 0; r < b.LogicalRowCount; r++)
+            {
+                ColumnVector zc = b.SelectedColumn(0);
+                ColumnVector ic = b.SelectedColumn(1);
+                rows.Add((zc.IsNull(r) ? null : Encoding.UTF8.GetString(zc.GetBytes(r)), ic.GetValue<long>(r)));
+            }
+        }
+
+        Assert.Equal(new (string?, long)[] { ("us", 7L) }, rows);
+    }
+
+    [Fact]
+    public async Task PartitionColumnDrop_IsRejected_ByLogicalGuard()
+    {
+        var schema = new StructType(new[]
+        {
+            new StructField("region", DataTypes.StringType, nullable: true),
+            new StructField("id", DataTypes.LongType, nullable: false),
+        });
+
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), FileNames()))
+        {
+            MutableColumnVector region = ColumnVectors.Create(DataTypes.StringType, 1);
+            MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, 1);
+            region.AppendBytes(Encoding.UTF8.GetBytes("us"));
+            id.AppendValue(7L);
+            var batch = new ManagedColumnBatch(schema, new ColumnVector[] { region, id }, 1);
+            await target.CreateNameMappedTableAsync(
+                schema, new[] { "region" }, new[] { batch }, new SeededPhysicalNameSource(Seed));
+        }
+
+        using var backend = new LocalFileSystemBackend(_root);
+        var writer = new DeltaTableWriter(backend);
+
+        // The guard checks the LOGICAL name "region" against metaData.partitionColumns (now logical).
+        InvalidOperationException ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => writer.DropColumnAsync("region"));
+        Assert.Contains("partition column", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // ---------------------------------------------------------------- cheap edges
+
+    [Fact]
+    public async Task RenameThenDropThenRead_PreservesRemainingColumnIdentity()
+    {
+        await CreateNameMappedAsync((1L, 100L, "alice"), (2L, 200L, "bob"));
+
+        using var backend = new LocalFileSystemBackend(_root);
+        var writer = new DeltaTableWriter(backend);
+        await writer.RenameColumnAsync("score", "points");
+        await writer.DropColumnAsync("points");
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        Assert.Equal(new[] { "id", "name" }, info.Schema.Select(f => f.Name).ToArray());
+
+        var rows = new List<(long, string?)>();
+        foreach (ColumnBatch b in await source.ReadBatchesAsync(info.Version))
+        {
+            for (int r = 0; r < b.LogicalRowCount; r++)
+            {
+                ColumnVector idc = b.SelectedColumn(0);
+                ColumnVector namec = b.SelectedColumn(1);
+                rows.Add((idc.GetValue<long>(r), namec.IsNull(r) ? null : Encoding.UTF8.GetString(namec.GetBytes(r))));
+            }
+        }
+
+        Assert.Equal(
+            new (long, string?)[] { (1L, "alice"), (2L, "bob") },
+            rows.OrderBy(r => r.Item1).ToList());
+    }
+
+    [Fact]
+    public async Task SequentialRenames_PreserveColumnIdentity()
+    {
+        await CreateNameMappedAsync((1L, 100L, "alice"));
+
+        using var backend = new LocalFileSystemBackend(_root);
+        var writer = new DeltaTableWriter(backend);
+
+        string physicalScore =
+            ColumnMapping.PhysicalName((await new DeltaLog(backend).LoadSnapshotAsync(null)).Schema[1], ColumnMappingMode.Name);
+
+        // score -> B -> C: the physicalName/id are invariant across the chain (identity preserved).
+        await writer.RenameColumnAsync("score", "B");
+        await writer.RenameColumnAsync("B", "C");
+
+        Snapshot after = await new DeltaLog(backend).LoadSnapshotAsync(null);
+        Assert.Equal("C", after.Schema[1].Name);
+        Assert.Equal(physicalScore, ColumnMapping.PhysicalName(after.Schema[1], ColumnMappingMode.Name));
+        Assert.True(ColumnMapping.TryGetId(after.Schema[1], out long id));
+        Assert.Equal(2L, id);
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        List<(long Id, long? Score, string? Name)> read = await ReadRowsAsync(source, info.Version);
+        Assert.Equal(new (long, long?, string?)[] { (1L, 100L, "alice") }, read);
+    }
+
+    [Fact]
+    public void EmptySchemaMapping_AssignsNoColumns_MaxIdZero()
+    {
+        (StructType schema, long maxColumnId) =
+            ColumnMapping.AssignFreshMapping(StructType.Empty, new SeededPhysicalNameSource(Seed));
+        Assert.Empty(schema);
+        Assert.Equal(0L, maxColumnId);
     }
 
     // ---------------------------------------------------------------- helpers
@@ -437,6 +731,20 @@ public sealed class ColumnMappingTests : IDisposable
         const string emptySchema = "{\\\"type\\\":\\\"struct\\\",\\\"fields\\\":[]}";
         return "{\"metaData\":{\"id\":\"t\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
             + "\"schemaString\":\"" + emptySchema + "\",\"partitionColumns\":[],\"configuration\":" + config + "}}";
+    }
+
+    // Builds a raw metaData commit line for a name-mode table from a plaintext (unescaped) schema JSON. The
+    // schemaString is a JSON-string-encoded copy of the schema (System.Text.Json handles the escaping), and
+    // partitionColumns hold the LOGICAL names — the exact shape a poisoned/malformed name-mode table has.
+    private static string NameModeMetadataLine(
+        string schemaJson, string[] partitionColumns, params (string Key, string Value)[] configuration)
+    {
+        string escapedSchema = System.Text.Json.JsonSerializer.Serialize(schemaJson);
+        string config = "{" + string.Join(",", configuration.Select(kv => $"\"{kv.Key}\":\"{kv.Value}\"")) + "}";
+        string parts = "[" + string.Join(",", partitionColumns.Select(p => $"\"{p}\"")) + "]";
+        return "{\"metaData\":{\"id\":\"t\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
+            + "\"schemaString\":" + escapedSchema + ",\"partitionColumns\":" + parts
+            + ",\"configuration\":" + config + "}}";
     }
 
     private sealed class FixedTimeProvider(DateTimeOffset now) : TimeProvider

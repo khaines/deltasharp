@@ -131,8 +131,10 @@ public sealed class DeltaWriteTarget : IDisposable
     /// Creates a fresh Delta table with column mapping <c>name</c> mode enabled (STORY-05.4.3 / #191). Each
     /// top-level column is assigned a stable physical name (<c>col-&lt;uuid&gt;</c> from
     /// <paramref name="physicalNameSource"/>) and id; the Parquet data files are written under those
-    /// <b>physical</b> names, <c>add.partitionValues</c> are keyed by physical name, and the committed
-    /// <c>metaData</c> carries the logical schema (with per-field id/physicalName), the
+    /// <b>physical</b> names, <c>add.partitionValues</c> are keyed by physical name, the data-file path is
+    /// physical, and the committed <c>metaData</c> carries the logical schema (with per-field id/physicalName),
+    /// the <b>LOGICAL</b> <c>partitionColumns</c> (matching the Spark golden <c>dv-with-columnmapping</c>: name
+    /// mode records partition IDENTITY logically while partition VALUE KEYS stay physical), the
     /// <c>delta.columnMapping.mode=name</c> / <c>maxColumnId</c> configuration, and the table-features
     /// protocol declaring the <c>columnMapping</c> feature. Enablement is scoped to a fresh table (there is
     /// nothing to read through), so every file is physical-named from version 0.
@@ -162,8 +164,8 @@ public sealed class DeltaWriteTarget : IDisposable
             ColumnMapping.AssignFreshMapping(logicalSchema, physicalNameSource);
 
         // Route the staging into PHYSICAL name space: renaming the write schema + partition columns to their
-        // physical names makes the existing partitioner/Parquet writer emit files with physical column names
-        // and physical-keyed partition values — no new staging path needed.
+        // physical names makes the existing partitioner/Parquet writer emit files with physical column names,
+        // physical-keyed partition values, and a physical data-file path — no new staging path needed.
         StructType physicalSchema = ColumnMapping.ToPhysicalSchema(mappedSchema, ColumnMappingMode.Name);
         IReadOnlyList<string> physicalPartitions =
             ColumnMapping.PhysicalPartitionColumns(mappedSchema, partitionColumns, ColumnMappingMode.Name);
@@ -171,9 +173,13 @@ public sealed class DeltaWriteTarget : IDisposable
         (IReadOnlyList<StagedDataFile> files, long rows) =
             await StageAsync(physicalSchema, physicalPartitions, batches, cancellationToken).ConfigureAwait(false);
 
+        // metaData.partitionColumns are the LOGICAL names (HIGH#1 / Spark golden); the staged files carry
+        // PHYSICAL partition-value keys, so CreateMappedTableAsync validates coverage against the physical
+        // set while committing the logical names into the metaData.
         DeltaCommitResult commit = await _writer
             .CreateMappedTableAsync(
                 mappedSchema,
+                partitionColumns,
                 physicalPartitions,
                 ColumnMapping.NameModeConfiguration(maxColumnId),
                 ColumnMapping.NameModeProtocol(),

@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using System.Globalization;
 using System.Security.Cryptography;
+using System.Text;
 using DeltaSharp.Types;
 
 namespace DeltaSharp.Storage.Delta;
@@ -53,7 +54,9 @@ internal sealed class RandomPhysicalNameSource : IColumnPhysicalNameSource
 
 /// <summary>A <b>deterministic</b> physical-name source: it derives each <c>col-&lt;uuid&gt;</c> name
 /// from a caller-supplied seed and a monotonically increasing counter via SHA-256, so a golden name-mode
-/// fixture assigns byte-for-byte reproducible physical names (no ambient state, no banned symbols).</summary>
+/// fixture assigns byte-for-byte reproducible physical names (no ambient state, no banned symbols).
+/// <para><b>Not thread-safe:</b> the internal counter is mutated without synchronization, so a single
+/// instance must be driven by one thread (each name-mode table creation uses its own instance).</para></summary>
 internal sealed class SeededPhysicalNameSource : IColumnPhysicalNameSource
 {
     private readonly string _seed;
@@ -71,9 +74,9 @@ internal sealed class SeededPhysicalNameSource : IColumnPhysicalNameSource
     {
         int index = _counter++;
         byte[] digest = SHA256.HashData(
-            System.Text.Encoding.UTF8.GetBytes(
+            Encoding.UTF8.GetBytes(
                 string.Create(CultureInfo.InvariantCulture, $"{_seed}:{index}")));
-        return "col-" + new Guid(digest.AsSpan(0, 16).ToArray());
+        return "col-" + new Guid(digest.AsSpan(0, 16));
     }
 }
 
@@ -135,9 +138,30 @@ internal static class ColumnMapping
             _ => throw DeltaProtocolException.Unsupported(
                 string.Create(
                     CultureInfo.InvariantCulture,
-                    $"Unrecognized '{ModeKey}' value '{raw}'; expected one of 'none', 'name', or 'id'. "
-                    + $"The table cannot be read safely.")),
+                    $"Unrecognized '{ModeKey}' value '{SanitizeEchoedToken(raw)}'; expected one of 'none', "
+                    + $"'name', or 'id'. The table cannot be read safely.")),
         };
+    }
+
+    /// <summary>The maximum length of an untrusted configuration token echoed into a diagnostic.</summary>
+    private const int MaxEchoedTokenLength = 64;
+
+    // Bounds and redacts an untrusted configuration value (e.g. delta.columnMapping.mode) before it is
+    // interpolated into an exception message (#516 log-injection hardening): caps the length and replaces
+    // control characters with U+FFFD, so a poisoned table property cannot inject newlines/control sequences
+    // into a log line or blow up a diagnostic with an unbounded string.
+    private static string SanitizeEchoedToken(string raw)
+    {
+        string capped = raw.Length <= MaxEchoedTokenLength
+            ? raw
+            : string.Concat(raw.AsSpan(0, MaxEchoedTokenLength), "…");
+        var builder = new StringBuilder(capped.Length);
+        foreach (char c in capped)
+        {
+            builder.Append(char.IsControl(c) ? '\uFFFD' : c);
+        }
+
+        return builder.ToString();
     }
 
     /// <summary>
@@ -202,6 +226,99 @@ internal static class ColumnMapping
                 + "silently mis-associate columns, so the table is rejected fail-closed. Only column "
                 + "mapping mode 'name' (and 'none') is supported.");
         }
+    }
+
+    /// <summary>
+    /// The <b>resolution-time uniqueness invariant</b> for a name-mode table, enforced at the single
+    /// snapshot-load choke point BEFORE any column is resolved (design §2.12.3; Delta protocol name-mode
+    /// reader). A name-mode schema resolves every data column, partition value, and statistic by its
+    /// <c>delta.columnMapping.physicalName</c>, so a duplicate physical name (a poisoned/malformed table)
+    /// would let one field's value be served under another field's logical name — a <b>silent misread</b>
+    /// with no exception. This gate rejects such a table fail-closed instead:
+    /// <list type="number">
+    /// <item>the set of <c>physicalName</c> across <b>all</b> top-level fields (data + partition) is globally
+    /// unique;</item>
+    /// <item>every field carries a <c>delta.columnMapping.id</c>, the ids are unique, and each id is
+    /// ≤ the table's <c>delta.columnMapping.maxColumnId</c> (a monotonic writer invariant).</item>
+    /// </list>
+    /// A non-name mode is a no-op. This is deliberately an explicit choke point (not an incidental
+    /// <see cref="StructType"/> ctor throw), so the guarantee holds regardless of how the schema is built.
+    /// </summary>
+    /// <exception cref="DeltaProtocolException">A duplicate physical name or id, a missing id, or an id above
+    /// <c>maxColumnId</c> — the schema is inconsistent and cannot be resolved safely.</exception>
+    public static void ValidateNameModeSchema(
+        ColumnMappingMode mode, StructType schema, IReadOnlyDictionary<string, string> configuration)
+    {
+        ArgumentNullException.ThrowIfNull(schema);
+        ArgumentNullException.ThrowIfNull(configuration);
+        if (mode != ColumnMappingMode.Name)
+        {
+            return;
+        }
+
+        long maxColumnId = ReadMaxColumnId(configuration);
+
+        var physicalNames = new HashSet<string>(StringComparer.Ordinal);
+        var ids = new HashSet<long>();
+        foreach (StructField field in schema)
+        {
+            string physical = PhysicalName(field, mode);
+            if (!physicalNames.Add(physical))
+            {
+                throw DeltaProtocolException.Inconsistent(
+                    string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"Column mapping physical name '{physical}' is assigned to more than one column; "
+                        + $"under name mode every top-level field (data and partition) MUST have a unique "
+                        + $"'{PhysicalNameKey}'. The schema is inconsistent and cannot be read safely."));
+            }
+
+            if (!TryGetId(field, out long id))
+            {
+                throw DeltaProtocolException.Inconsistent(
+                    string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"Column '{field.Name}' has no '{IdKey}' but the table uses column mapping mode "
+                        + $"'name'; the schema is inconsistent and cannot be read safely."));
+            }
+
+            if (!ids.Add(id))
+            {
+                throw DeltaProtocolException.Inconsistent(
+                    string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"Column mapping id {id} is assigned to more than one column; under name mode every "
+                        + $"'{IdKey}' MUST be unique. The schema is inconsistent and cannot be read safely."));
+            }
+
+            if (id > maxColumnId)
+            {
+                throw DeltaProtocolException.Inconsistent(
+                    string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"Column '{field.Name}' has '{IdKey}'={id} which exceeds the tracked "
+                        + $"'{MaxColumnIdKey}'={maxColumnId}; the schema is inconsistent and cannot be read "
+                        + $"safely."));
+            }
+        }
+    }
+
+    // Reads the tracked maxColumnId from a name-mode table's configuration. It is a monotonic writer
+    // invariant that MUST be present and parseable for a name-mode table; a missing/malformed value is an
+    // inconsistent table property rejected fail-closed (never guessed).
+    private static long ReadMaxColumnId(IReadOnlyDictionary<string, string> configuration)
+    {
+        if (!configuration.TryGetValue(MaxColumnIdKey, out string? raw)
+            || !long.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out long maxColumnId))
+        {
+            throw DeltaProtocolException.Inconsistent(
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"The table uses column mapping mode 'name' but its '{MaxColumnIdKey}' is missing or "
+                    + $"not an integer; the schema is inconsistent and cannot be read safely."));
+        }
+
+        return maxColumnId;
     }
 
     /// <summary>The physical Parquet name of <paramref name="field"/> under <paramref name="mode"/>: the

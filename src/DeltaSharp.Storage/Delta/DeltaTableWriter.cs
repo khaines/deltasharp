@@ -160,6 +160,8 @@ internal sealed class DeltaTableWriter
             throw new ArgumentException("An append must stage at least one data file.", nameof(files));
         }
 
+        RejectExistingNameModeMutation(readSnapshot);
+
         MetadataAction? schemaEvolution = ReconcileSchema(readSnapshot, writeSchema, evolutionMode);
 
         ValidatePartitionCoverage(files, readSnapshot.Metadata.PartitionColumns);
@@ -225,6 +227,8 @@ internal sealed class DeltaTableWriter
             throw new ArgumentException("An overwrite must stage at least one data file.", nameof(files));
         }
 
+        RejectExistingNameModeMutation(readSnapshot);
+
         MetadataAction? schemaEvolution = ReconcileSchema(readSnapshot, writeSchema, evolutionMode);
 
         ValidatePartitionCoverage(files, readSnapshot.Metadata.PartitionColumns);
@@ -267,6 +271,7 @@ internal sealed class DeltaTableWriter
         }
 
         Snapshot readSnapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
+        RejectExistingNameModeMutation(readSnapshot);
         if (files.Count == 0)
         {
             // Append of nothing to an existing table: no new version, report the current one.
@@ -315,6 +320,7 @@ internal sealed class DeltaTableWriter
         }
 
         Snapshot readSnapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
+        RejectExistingNameModeMutation(readSnapshot);
         if (files.Count == 0)
         {
             // Spark parity: an overwrite REPLACES prior data, so an empty overwrite is NOT a no-op the way an
@@ -367,34 +373,38 @@ internal sealed class DeltaTableWriter
             ImmutableArray<string>.Empty,
             ImmutableArray<string>.Empty);
         return CreateTableCoreAsync(
-            writeSchema, partitionColumns, EmptyStringMap, protocol, files, cancellationToken);
+            writeSchema, partitionColumns, partitionColumns, EmptyStringMap, protocol, files, cancellationToken);
     }
 
     /// <summary>
     /// Creates a fresh Delta table with an explicit <paramref name="configuration"/> and
     /// <paramref name="protocol"/> — the enablement path for column mapping (STORY-05.4.3 / #191). The
     /// <paramref name="writeSchema"/> is the mapped LOGICAL schema (each field carrying its
-    /// <c>delta.columnMapping.id</c> / <c>delta.columnMapping.physicalName</c>); <paramref name="partitionColumns"/>
-    /// are the PHYSICAL partition-column names; and <paramref name="files"/> must already be staged as
-    /// physical-name Parquet with <c>partitionValues</c> keyed by physical name (Delta protocol writer
-    /// requirement). Enablement is scoped to a fresh table so every data file is written under physical names
-    /// from version 0 — read-through is guaranteed without rewriting existing data.
+    /// <c>delta.columnMapping.id</c> / <c>delta.columnMapping.physicalName</c>);
+    /// <paramref name="logicalPartitionColumns"/> are the LOGICAL partition-column names recorded in
+    /// <c>metaData.partitionColumns</c> (HIGH#1 / Spark golden <c>dv-with-columnmapping</c>); and
+    /// <paramref name="physicalPartitionColumns"/> are the PHYSICAL partition-column names the staged
+    /// <paramref name="files"/> key their <c>partitionValues</c> by (Delta protocol writer requirement), used
+    /// to validate partition coverage. Enablement is scoped to a fresh table so every data file is written
+    /// under physical names from version 0 — read-through is guaranteed without rewriting existing data.
     /// </summary>
     internal Task<DeltaCommitResult> CreateMappedTableAsync(
         StructType writeSchema,
-        IReadOnlyList<string> partitionColumns,
+        IReadOnlyList<string> logicalPartitionColumns,
+        IReadOnlyList<string> physicalPartitionColumns,
         ImmutableSortedDictionary<string, string> configuration,
         ProtocolAction protocol,
         IReadOnlyList<StagedDataFile> files,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(writeSchema);
-        ArgumentNullException.ThrowIfNull(partitionColumns);
+        ArgumentNullException.ThrowIfNull(logicalPartitionColumns);
+        ArgumentNullException.ThrowIfNull(physicalPartitionColumns);
         ArgumentNullException.ThrowIfNull(configuration);
         ArgumentNullException.ThrowIfNull(protocol);
         ArgumentNullException.ThrowIfNull(files);
         return CreateTableCoreAsync(
-            writeSchema, partitionColumns, configuration, protocol, files, cancellationToken);
+            writeSchema, logicalPartitionColumns, physicalPartitionColumns, configuration, protocol, files, cancellationToken);
     }
 
     // Commits version 0 = protocol + metaData (schema + partition columns + configuration) + the new adds
@@ -403,17 +413,20 @@ internal sealed class DeltaTableWriter
     // concurrent create that loses the version-0 race does NOT rebase — its commit carries protocol +
     // metaData, so the committer's pre-write gates observe the winner's version-0 protocol/metadata and ABORT
     // it via ProtocolChangedException/MetadataChangedException (a second table-creation is not a blind
-    // append).
+    // append). metaData.partitionColumns records the LOGICAL (metadataPartitionColumns) names, while coverage
+    // is validated against the staged files' actual partition-value keys (validationPartitionColumns) — the
+    // two differ under column mapping name mode (logical vs. physical); they are identical otherwise.
     private Task<DeltaCommitResult> CreateTableCoreAsync(
         StructType writeSchema,
-        IReadOnlyList<string> partitionColumns,
+        IReadOnlyList<string> metadataPartitionColumns,
+        IReadOnlyList<string> validationPartitionColumns,
         ImmutableSortedDictionary<string, string> configuration,
         ProtocolAction protocol,
         IReadOnlyList<StagedDataFile> files,
         CancellationToken cancellationToken)
     {
-        ImmutableArray<string> partitionArray = partitionColumns.ToImmutableArray();
-        ValidatePartitionCoverage(files, partitionArray);
+        ImmutableArray<string> metadataPartitionArray = metadataPartitionColumns.ToImmutableArray();
+        ValidatePartitionCoverage(files, validationPartitionColumns.ToImmutableArray());
 
         long createdTime = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
         var metadata = new MetadataAction(
@@ -422,7 +435,7 @@ internal sealed class DeltaTableWriter
             Description: null,
             Format: new TableFormat("parquet", EmptyStringMap),
             SchemaString: SchemaJson.ToJson(writeSchema),
-            PartitionColumns: partitionArray,
+            PartitionColumns: metadataPartitionArray,
             Configuration: configuration,
             CreatedTime: createdTime);
 
@@ -465,13 +478,26 @@ internal sealed class DeltaTableWriter
         var fields = new List<StructField>(schema.Count);
         foreach (StructField field in schema)
         {
+            // ReferenceEquals invariant: TryGetField/schema enumeration return the SAME StructField instance
+            // for the matched column, so identity comparison uniquely selects the target (no name re-match).
             fields.Add(
                 ReferenceEquals(field, target)
                     ? new StructField(toName, field.DataType, field.Nullable, field.Metadata)
                     : field);
         }
 
-        return await CommitSchemaChangeAsync(snapshot, new StructType(fields), cancellationToken)
+        // MEDIUM#4: metaData.partitionColumns holds LOGICAL names (HIGH#1), so renaming a PARTITION column
+        // must update its logical entry there too. physicalName/id are unchanged, and add.partitionValues
+        // stay keyed by physical name, so existing data files still resolve — this is metadata-only.
+        ImmutableArray<string>? updatedPartitions = null;
+        if (snapshot.Metadata.PartitionColumns.Contains(fromName, StringComparer.Ordinal))
+        {
+            updatedPartitions = snapshot.Metadata.PartitionColumns
+                .Select(p => string.Equals(p, fromName, StringComparison.Ordinal) ? toName : p)
+                .ToImmutableArray();
+        }
+
+        return await CommitSchemaChangeAsync(snapshot, new StructType(fields), updatedPartitions, cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -498,8 +524,9 @@ internal sealed class DeltaTableWriter
                 $"Cannot drop column '{name}': no such column in the table schema.");
         }
 
-        string physicalName = ColumnMapping.PhysicalName(target, ColumnMappingMode.Name);
-        if (snapshot.Metadata.PartitionColumns.Contains(physicalName, StringComparer.Ordinal))
+        // MEDIUM#5: the partition-column guard checks the LOGICAL name against metaData.partitionColumns
+        // (which holds LOGICAL names under name mode — HIGH#1), not the physical name.
+        if (snapshot.Metadata.PartitionColumns.Contains(name, StringComparer.Ordinal))
         {
             throw new InvalidOperationException(
                 $"Cannot drop partition column '{name}'; dropping a partition column is out of scope.");
@@ -508,13 +535,15 @@ internal sealed class DeltaTableWriter
         var fields = new List<StructField>(schema.Count - 1);
         foreach (StructField field in schema)
         {
+            // ReferenceEquals invariant: TryGetField returns the SAME StructField instance as the matched
+            // column, so identity comparison uniquely excludes exactly the target (no name re-match).
             if (!ReferenceEquals(field, target))
             {
                 fields.Add(field);
             }
         }
 
-        return await CommitSchemaChangeAsync(snapshot, new StructType(fields), cancellationToken)
+        return await CommitSchemaChangeAsync(snapshot, new StructType(fields), partitionColumns: null, cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -529,10 +558,35 @@ internal sealed class DeltaTableWriter
         }
     }
 
+    // TRACKED DEFERRAL (#525): a data append/overwrite/truncate to an EXISTING name-mode column-mapping table
+    // is fail-closed. This build's staging path (DeltaWriteTarget.StageAsync) writes Parquet under the write
+    // schema's LOGICAL column names; dropping a logical-named file into a physical-name table produces a
+    // corrupt, cross-engine-unreadable commit (a subsequent read then throws a misleading
+    // DeltaReadSchemaEvolutionException, #497). Only fresh-table creation (CreateNameMappedTableAsync writes
+    // PHYSICAL-named data) and metadata-only rename/drop are supported today. Append/overwrite to a name-mode
+    // table needs the writer to map incoming logical columns to physical before staging — deferred to #525.
+    // This mirrors the id-mode / rename-on-none fail-closed pattern.
+    private static void RejectExistingNameModeMutation(Snapshot snapshot)
+    {
+        if (ColumnMapping.ResolveMode(snapshot.Metadata.Configuration) == ColumnMappingMode.Name)
+        {
+            throw DeltaProtocolException.Unsupported(
+                "append/overwrite to a name-mode column-mapping table is not yet supported (#525): this build "
+                + "would stage Parquet under logical column names into a physical-name table, producing a "
+                + "corrupt, cross-engine-unreadable commit. Only fresh-table creation and metadata-only "
+                + "rename/drop are supported for column mapping in this build. The write is rejected fail-closed.");
+        }
+    }
+
     private Task<DeltaCommitResult> CommitSchemaChangeAsync(
-        Snapshot snapshot, StructType newSchema, CancellationToken cancellationToken)
+        Snapshot snapshot, StructType newSchema, ImmutableArray<string>? partitionColumns, CancellationToken cancellationToken)
     {
         MetadataAction metadata = snapshot.Metadata with { SchemaString = SchemaJson.ToJson(newSchema) };
+        if (partitionColumns is { } updated)
+        {
+            metadata = metadata with { PartitionColumns = updated };
+        }
+
         return _committer.CommitAsync(
             snapshot, new DeltaAction[] { metadata }, DeltaReadScope.WholeTable, cancellationToken);
     }
