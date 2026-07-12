@@ -58,6 +58,66 @@ public sealed class ParquetReaderTests
     }
 
     [Fact]
+    public async Task Projection_ResolvesRequestedColumnsByName_NotByFilePosition()
+    {
+        // A file whose three long columns carry DISTINCT per-column values so any positional misread is
+        // loud: a=10s, b=20s, c=30s. The by-name contract in ParquetFileReader.ResolveFileFields must map
+        // each REQUESTED column to the FILE column of the SAME NAME, regardless of the requested order.
+        var fileSchema = new StructType(new[]
+        {
+            new StructField("a", DataTypes.LongType, nullable: false),
+            new StructField("b", DataTypes.LongType, nullable: false),
+            new StructField("c", DataTypes.LongType, nullable: false),
+        });
+        ColumnBatch source = BuildLongColumns(
+            fileSchema,
+            ("a", new long[] { 10, 11, 12 }),
+            ("b", new long[] { 20, 21, 22 }),
+            ("c", new long[] { 30, 31, 32 }));
+
+        using var stream = new MemoryStream();
+        await new ParquetFileWriter().WriteAsync(stream, fileSchema, new[] { source }, CancellationToken.None);
+        byte[] fileBytes = stream.ToArray();
+
+        // Request a DIFFERENT order than the file: [c, a]. A positional regression (assigning file column 0
+        // to requested position 0) would return a's values (10s) under 'c' and b's values (20s) under 'a'.
+        var projection = new StructType(new[]
+        {
+            new StructField("c", DataTypes.LongType, nullable: false),
+            new StructField("a", DataTypes.LongType, nullable: false),
+        });
+        var batches = new List<ColumnBatch>();
+        await foreach (ColumnBatch batch in new ParquetFileReader().ReadAsync(new MemoryStream(fileBytes), projection, keepRowGroup: null, CancellationToken.None))
+        {
+            batches.Add(batch);
+        }
+
+        ColumnBatch result = Assert.Single(batches);
+
+        // result.Schema mirrors the REQUESTED order, not the file order.
+        Assert.Equal(projection, result.Schema);
+        Assert.Equal(2, result.ColumnCount);
+
+        // Each requested column carries ITS OWN values: c -> 30s at position 0, a -> 10s at position 1.
+        ColumnVector cCol = result.SelectedColumn(0);
+        ColumnVector aCol = result.SelectedColumn(1);
+        Assert.Equal(new long[] { 30, 31, 32 }, ReadLongs(cCol, result.LogicalRowCount));
+        Assert.Equal(new long[] { 10, 11, 12 }, ReadLongs(aCol, result.LogicalRowCount));
+
+        // A lone middle-column projection must also resolve by name (not fall back to file position 0).
+        var middle = new StructType(new[] { new StructField("b", DataTypes.LongType, nullable: false) });
+        var middleBatches = new List<ColumnBatch>();
+        await foreach (ColumnBatch batch in new ParquetFileReader().ReadAsync(new MemoryStream(fileBytes), middle, keepRowGroup: null, CancellationToken.None))
+        {
+            middleBatches.Add(batch);
+        }
+
+        ColumnBatch middleResult = Assert.Single(middleBatches);
+        Assert.Equal(middle, middleResult.Schema);
+        Assert.Equal(new long[] { 20, 21, 22 }, ReadLongs(middleResult.SelectedColumn(0), middleResult.LogicalRowCount));
+    }
+
+    [Fact]
     public async Task RowGroupPruning_SkipsNonMatchingGroups()
     {
         // Two row groups: ids [1..3] then [100..102]; a predicate that keeps only groups whose max id
@@ -157,5 +217,36 @@ public sealed class ParquetReaderTests
         }
 
         return new ManagedColumnBatch(schema, new ColumnVector[] { vector }, values.Length);
+    }
+
+    // Builds a multi-column long batch from (name -> values) pairs, in the given schema's column order. All
+    // columns must share the same row count.
+    private static ColumnBatch BuildLongColumns(StructType schema, params (string Name, long[] Values)[] columns)
+    {
+        int rowCount = columns[0].Values.Length;
+        var vectors = new ColumnVector[columns.Length];
+        for (int c = 0; c < columns.Length; c++)
+        {
+            MutableColumnVector vector = ColumnVectors.Create(DataTypes.LongType, rowCount);
+            foreach (long value in columns[c].Values)
+            {
+                vector.AppendValue(value);
+            }
+
+            vectors[c] = vector;
+        }
+
+        return new ManagedColumnBatch(schema, vectors, rowCount);
+    }
+
+    private static long[] ReadLongs(ColumnVector column, int rowCount)
+    {
+        var values = new long[rowCount];
+        for (int r = 0; r < rowCount; r++)
+        {
+            values[r] = column.GetValue<long>(r);
+        }
+
+        return values;
     }
 }

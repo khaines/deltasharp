@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Globalization;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
@@ -261,7 +262,7 @@ public sealed class DeltaReadSource : IDisposable
             {
                 throw DeltaProtocolException.Unsupported(
                     string.Create(
-                        System.Globalization.CultureInfo.InvariantCulture,
+                        CultureInfo.InvariantCulture,
                         $"Column '{field.Name}' is a nested ({field.DataType.TypeName}) type; nested column "
                         + $"mapping is unsupported in this build (design §2.9/§2.12.3). Only top-level (leaf) "
                         + $"columns are supported in column mapping 'name' mode."));

@@ -3,6 +3,7 @@ using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
+using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Types;
 using Parquet;
 using Xunit;
@@ -112,14 +113,20 @@ public sealed class ColumnMappingTests : IDisposable
         Assert.True(snapshot.Metadata.PartitionColumns.IsDefaultOrEmpty);
 
         // --- The decoded metaData.schemaString stores id as an UNQUOTED integer (typed interop, #330) and
-        // physicalName as the golden string ---
+        // physicalName as the golden string. Assert the EXACT committed schemaString (logical field names,
+        // per-field id unquoted int + seeded golden physicalName), matching the byte-for-byte shape the
+        // partitioned golden (NameMode_PartitionValues_AreKeyedByPhysicalName_AndReadBack) asserts. A swap or
+        // misroute of any field's id/physicalName/type/nullability breaks this exactly. ---
         string schemaJson = await ReadCommittedSchemaStringAsync();
-        Assert.Contains("\"delta.columnMapping.id\":1", schemaJson, StringComparison.Ordinal);
-        Assert.Contains("\"delta.columnMapping.id\":2", schemaJson, StringComparison.Ordinal);
-        Assert.Contains("\"delta.columnMapping.id\":3", schemaJson, StringComparison.Ordinal);
-        Assert.Contains($"\"delta.columnMapping.physicalName\":\"{PhysId}\"", schemaJson, StringComparison.Ordinal);
-        Assert.Contains($"\"delta.columnMapping.physicalName\":\"{PhysScore}\"", schemaJson, StringComparison.Ordinal);
-        Assert.Contains($"\"delta.columnMapping.physicalName\":\"{PhysName}\"", schemaJson, StringComparison.Ordinal);
+        Assert.Equal(
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":{"
+            + $"\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"{PhysId}\"}}}},"
+            + "{\"name\":\"score\",\"type\":\"long\",\"nullable\":true,\"metadata\":{"
+            + $"\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"{PhysScore}\"}}}},"
+            + "{\"name\":\"name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{"
+            + $"\"delta.columnMapping.id\":3,\"delta.columnMapping.physicalName\":\"{PhysName}\"}}}}]}}",
+            schemaJson);
 
         // --- The Parquet footer stores the PHYSICAL column names (not the logical display names) ---
         string[] parquetColumns = await ReadParquetColumnNamesAsync(snapshot.ActiveFiles[0].Path);
@@ -382,6 +389,96 @@ public sealed class ColumnMappingTests : IDisposable
         Assert.Equal((200L, 2L), byName["bob"]);
     }
 
+    // ---------------------------------------------------------------- HIGH: reordered physical file read-through
+
+    [Fact]
+    public async Task NameMode_ReadsThroughReorderedPhysicalFile_ByName_NotByPosition()
+    {
+        // The direct closer for the mapping layer (GAP 1b): a NAME-mode table whose underlying Parquet data
+        // file stores its PHYSICAL columns in a NON-logical order (physical file order = [name, score, id],
+        // i.e. the REVERSE of the logical id/score/name order). This is exactly the shape an interop table
+        // gets when a Spark writer emits physical columns in an order that differs from the current logical
+        // schema. The name-mode read door must resolve each LOGICAL column to its OWN physical data BY NAME
+        // (ParquetFileReader.ResolveFileFields), never by file position: a positional-assembly regression
+        // would mis-route id<->name (loud type mismatch) and id<->score (loud value swap), so it CANNOT pass
+        // this even though the constructed dataSchema is logical-ordered.
+        //
+        // DeltaSharp's own writer always stages physical columns in logical order, so a reordered physical
+        // file is not reachable via the normal write door; we author the physical Parquet file directly (with
+        // the physical StructType reversed) and hand-assemble the version-0 _delta_log (name-mode metaData +
+        // an add pointing at that file), reusing this fixture's raw-write helpers.
+        const string relativePath = "reversed-physical.parquet";
+
+        // Physical file: columns in REVERSED order, each carrying its OWN distinct values.
+        var physicalSchemaReversed = new StructType(new[]
+        {
+            new StructField(PhysName, DataTypes.StringType, nullable: true),
+            new StructField(PhysScore, DataTypes.LongType, nullable: true),
+            new StructField(PhysId, DataTypes.LongType, nullable: false),
+        });
+        MutableColumnVector name = ColumnVectors.Create(DataTypes.StringType, 2);
+        MutableColumnVector score = ColumnVectors.Create(DataTypes.LongType, 2);
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, 2);
+        name.AppendBytes(Encoding.UTF8.GetBytes("alice"));
+        score.AppendValue(100L);
+        id.AppendValue(1L);
+        name.AppendBytes(Encoding.UTF8.GetBytes("bob"));
+        score.AppendValue(200L);
+        id.AppendValue(2L);
+        var physicalBatch = new ManagedColumnBatch(
+            physicalSchemaReversed, new ColumnVector[] { name, score, id }, 2);
+
+        byte[] parquetBytes;
+        using (var buffer = new MemoryStream())
+        {
+            await new ParquetFileWriter().WriteAsync(
+                buffer, physicalSchemaReversed, new[] { physicalBatch }, CancellationToken.None);
+            parquetBytes = buffer.ToArray();
+        }
+
+        // Confirm the on-disk file really is in reversed physical order (guards the test's own premise).
+        Assert.Equal(new[] { PhysName, PhysScore, PhysId }, await ParquetColumnNamesAsync(parquetBytes));
+
+        // The name-mode metaData: LOGICAL schema id/score/name, each field carrying its golden id +
+        // physicalName; the physical Parquet file above stores those physical columns REVERSED.
+        string schemaJson =
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
+            + $"{{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"{PhysId}\"}}}},"
+            + "{\"name\":\"score\",\"type\":\"long\",\"nullable\":true,\"metadata\":"
+            + $"{{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"{PhysScore}\"}}}},"
+            + "{\"name\":\"name\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + $"{{\"delta.columnMapping.id\":3,\"delta.columnMapping.physicalName\":\"{PhysName}\"}}}}]}}";
+
+        using (var backend = new LocalFileSystemBackend(_root))
+        {
+            await backend.PutIfAbsentAsync(relativePath, parquetBytes, CancellationToken.None);
+            string addLine =
+                $"{{\"add\":{{\"path\":\"{relativePath}\",\"partitionValues\":{{}},"
+                + $"\"size\":{parquetBytes.Length},\"modificationTime\":0,\"dataChange\":true}}}}";
+            byte[] commit = Encoding.UTF8.GetBytes(
+                ProtocolFeatureLine() + "\n"
+                + NameModeMetadataLine(
+                    schemaJson,
+                    partitionColumns: Array.Empty<string>(),
+                    ("delta.columnMapping.mode", "name"),
+                    ("delta.columnMapping.maxColumnId", "3")) + "\n"
+                + addLine + "\n");
+            await backend.PutIfAbsentAsync(
+                "_delta_log/00000000000000000000.json", commit, CancellationToken.None);
+        }
+
+        // Read via the name-mode read door: each LOGICAL column must return its OWN physical data.
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        Assert.Equal(new[] { "id", "score", "name" }, info.Schema.Select(f => f.Name).ToArray());
+
+        List<(long Id, long? Score, string? Name)> rows = await ReadRowsAsync(source, info.Version);
+        Assert.Equal(
+            new (long, long?, string?)[] { (1L, 100L, "alice"), (2L, 200L, "bob") },
+            rows.OrderBy(r => r.Id).ToList());
+    }
+
     // ---------------------------------------------------------------- HIGH #3: poisoned physical-name collision
 
     [Fact]
@@ -414,16 +511,25 @@ public sealed class ColumnMappingTests : IDisposable
 
     // ---------------------------------------------------------------- HIGH #2: append/overwrite fail-closed
 
-    [Fact]
-    public async Task AppendToNameModeTable_IsRejectedFailClosed()
+    // RejectExistingNameModeMutation guards FOUR write entry points on DeltaTableWriter (AppendAsync,
+    // OverwriteAsync, CreateOrAppendAsync, CreateOrOverwriteAsync). Each MUST fail closed with a typed
+    // DeltaProtocolException (citing #525) and leave the table at its prior version (no corrupt commit);
+    // parametrizing gives every entry point its own oracle, so a targeted removal from any single path
+    // (e.g. just the overwrite door) turns THIS test red rather than shipping green.
+    [Theory]
+    [InlineData("Append")]
+    [InlineData("Overwrite")]
+    [InlineData("CreateOrAppend")]
+    [InlineData("CreateOrOverwrite")]
+    public async Task WriteToNameModeTable_IsRejectedFailClosed(string entryPoint)
     {
         await CreateNameMappedAsync((1L, 100L, "alice"));
 
         using var backend = new LocalFileSystemBackend(_root);
         var writer = new DeltaTableWriter(backend);
 
-        // Stage a lone data file (partition-free) and try to CreateOrAppend into the existing name-mode
-        // table: must be rejected with a typed DeltaProtocolException (a silent, corrupt commit is the bug).
+        // Stage a lone data file (partition-free) and try to mutate the existing name-mode table via the
+        // entry point under test: each must be rejected fail-closed (a silent, corrupt commit is the bug).
         var staged = new[]
         {
             new StagedDataFile(
@@ -433,12 +539,21 @@ public sealed class ColumnMappingTests : IDisposable
                 ModificationTime: 0,
                 Stats: null),
         };
-        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
-            () => writer.CreateOrAppendAsync(FlatSchema, Array.Empty<string>(), staged));
+
+        Task<DeltaCommitResult> Attempt() => entryPoint switch
+        {
+            "Append" => writer.AppendAsync(FlatSchema, staged),
+            "Overwrite" => writer.OverwriteAsync(FlatSchema, staged),
+            "CreateOrAppend" => writer.CreateOrAppendAsync(FlatSchema, Array.Empty<string>(), staged),
+            "CreateOrOverwrite" => writer.CreateOrOverwriteAsync(FlatSchema, Array.Empty<string>(), staged),
+            _ => throw new Xunit.Sdk.XunitException($"Unknown entry point '{entryPoint}'."),
+        };
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(Attempt);
         Assert.Contains("525", ex.Message, StringComparison.Ordinal);
         Assert.Contains("name-mode", ex.Message, StringComparison.OrdinalIgnoreCase);
 
-        // The corrupt append must NOT have committed: the table is still at v0 with its original single row.
+        // The rejected mutation must NOT have committed: the table is still at v0 with its original row.
         using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
         DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
         Assert.Equal(0L, info.Version);
@@ -704,6 +819,15 @@ public sealed class ColumnMappingTests : IDisposable
     private async Task<string[]> ReadParquetColumnNamesAsync(string relativePath)
     {
         await using FileStream stream = File.OpenRead(Path.Combine(_root, relativePath));
+        await using ParquetReader reader = await ParquetReader.CreateAsync(stream);
+        return reader.Schema.DataFields.Select(f => f.Name).ToArray();
+    }
+
+    // The physical (footer) column names of an in-memory Parquet file, in file order — used to confirm the
+    // 1b reorder test's own premise (that the authored file really is in reversed physical order).
+    private static async Task<string[]> ParquetColumnNamesAsync(byte[] parquetBytes)
+    {
+        using var stream = new MemoryStream(parquetBytes);
         await using ParquetReader reader = await ParquetReader.CreateAsync(stream);
         return reader.Schema.DataFields.Select(f => f.Name).ToArray();
     }
