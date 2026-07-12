@@ -37,6 +37,9 @@ DeltaSharp.Types.FieldMetadata.Equals(DeltaSharp.Types.FieldMetadata? other) -> 
 DeltaSharp.Types.FieldMetadata.GetEnumerator() -> System.Collections.Generic.IEnumerator<System.Collections.Generic.KeyValuePair<string!, DeltaSharp.Types.MetadataValue!>>!
 DeltaSharp.Types.FieldMetadata.IsEmpty.get -> bool
 DeltaSharp.Types.FieldMetadata.Keys.get -> System.Collections.Generic.IEnumerable<string!>!
+DeltaSharp.Types.FieldMetadata.TryGetBoolean(string! key, out bool value) -> bool
+DeltaSharp.Types.FieldMetadata.TryGetDouble(string! key, out double value) -> bool
+DeltaSharp.Types.FieldMetadata.TryGetLong(string! key, out long value) -> bool
 DeltaSharp.Types.FieldMetadata.TryGetString(string! key, out string! value) -> bool
 DeltaSharp.Types.FieldMetadata.TryGetValue(string! key, out DeltaSharp.Types.MetadataValue! value) -> bool
 DeltaSharp.Types.FieldMetadata.Values.get -> System.Collections.Generic.IEnumerable<DeltaSharp.Types.MetadataValue!>!

@@ -113,9 +113,12 @@ public class SchemaValidationTests
     [Fact]
     public void Metadata_RejectsNullKeyOrValue()
     {
-        Assert.Throws<ArgumentException>(() =>
+        // A null key/value is an ArgumentNullException (consistent with MetadataValue.Array and
+        // BCL dictionary null-key handling); ArgumentNullException derives from ArgumentException,
+        // so callers catching the base type are unaffected.
+        Assert.Throws<ArgumentNullException>(() =>
             FieldMetadata.FromEntries(new[] { new KeyValuePair<string, string>(null!, "v") }));
-        Assert.Throws<ArgumentException>(() =>
+        Assert.Throws<ArgumentNullException>(() =>
             FieldMetadata.FromEntries(new[] { new KeyValuePair<string, string>("k", null!) }));
     }
 }

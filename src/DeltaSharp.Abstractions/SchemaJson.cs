@@ -364,8 +364,12 @@ internal static class SchemaJson
                 double doubleValue = element.GetDouble();
                 if (!double.IsFinite(doubleValue))
                 {
+                    // Bound the echoed literal: a poisoned schema could carry a multi-KB numeric
+                    // literal, and while its charset is injection-safe (JSON number tokens are
+                    // [0-9+-.eE] only), echoing it in full is needless. A short prefix suffices.
                     throw new SchemaValidationException(
-                        $"Metadata number '{element.GetRawText()}' is not finite and cannot be represented as JSON.");
+                        $"Metadata number '{Truncate(element.GetRawText(), 32)}' is not finite "
+                        + "and cannot be represented as JSON.");
                 }
 
                 return MetadataValue.Double(doubleValue);
@@ -426,4 +430,9 @@ internal static class SchemaJson
 
         return value.GetBoolean();
     }
+
+    /// <summary>Returns <paramref name="text"/> capped to <paramref name="max"/> characters, adding
+    /// an ellipsis when truncated, so a diagnostic never echoes an unbounded attacker-supplied token.</summary>
+    private static string Truncate(string text, int max) =>
+        text.Length <= max ? text : string.Concat(text.AsSpan(0, max), "…");
 }

@@ -29,8 +29,8 @@ public sealed class FieldMetadata : IReadOnlyDictionary<string, MetadataValue>, 
     /// duplicate key the last value wins. Returns <see cref="Empty"/> for an empty input. For the
     /// common all-string case, prefer <see cref="FromEntries"/>, which wraps raw strings for you.
     /// </summary>
-    /// <exception cref="ArgumentNullException"><paramref name="entries"/> is null.</exception>
-    /// <exception cref="ArgumentException">A key or value is null.</exception>
+    /// <exception cref="ArgumentNullException"><paramref name="entries"/>, or a key or value in it,
+    /// is null.</exception>
     public static FieldMetadata FromValues(IEnumerable<KeyValuePair<string, MetadataValue>> entries)
     {
         ArgumentNullException.ThrowIfNull(entries);
@@ -40,13 +40,13 @@ public sealed class FieldMetadata : IReadOnlyDictionary<string, MetadataValue>, 
         {
             if (entry.Key is null)
             {
-                throw new ArgumentException("Metadata key cannot be null.", nameof(entries));
+                throw new ArgumentNullException(nameof(entries), "Metadata key cannot be null.");
             }
 
             if (entry.Value is null)
             {
-                throw new ArgumentException(
-                    $"Metadata value for key '{entry.Key}' cannot be null.", nameof(entries));
+                throw new ArgumentNullException(
+                    nameof(entries), $"Metadata value for key '{entry.Key}' cannot be null.");
             }
 
             map[entry.Key] = entry.Value;
@@ -62,8 +62,8 @@ public sealed class FieldMetadata : IReadOnlyDictionary<string, MetadataValue>, 
     /// input. For typed values (numeric ids, identity booleans, nested objects, arrays), use
     /// <see cref="FromValues"/> instead.
     /// </summary>
-    /// <exception cref="ArgumentNullException"><paramref name="entries"/> is null.</exception>
-    /// <exception cref="ArgumentException">A key or value is null.</exception>
+    /// <exception cref="ArgumentNullException"><paramref name="entries"/>, or a key or value in it,
+    /// is null.</exception>
     public static FieldMetadata FromEntries(IEnumerable<KeyValuePair<string, string>> entries)
     {
         ArgumentNullException.ThrowIfNull(entries);
@@ -73,13 +73,13 @@ public sealed class FieldMetadata : IReadOnlyDictionary<string, MetadataValue>, 
         {
             if (entry.Key is null)
             {
-                throw new ArgumentException("Metadata key cannot be null.", nameof(entries));
+                throw new ArgumentNullException(nameof(entries), "Metadata key cannot be null.");
             }
 
             if (entry.Value is null)
             {
-                throw new ArgumentException(
-                    $"Metadata value for key '{entry.Key}' cannot be null.", nameof(entries));
+                throw new ArgumentNullException(
+                    nameof(entries), $"Metadata value for key '{entry.Key}' cannot be null.");
             }
 
             map[entry.Key] = MetadataValue.String(entry.Value);
@@ -123,6 +123,56 @@ public sealed class FieldMetadata : IReadOnlyDictionary<string, MetadataValue>, 
         }
 
         value = null;
+        return false;
+    }
+
+    /// <summary>
+    /// Gets the value for <paramref name="key"/> when it is present <b>and</b> an integral value —
+    /// the ergonomic one-call path for numeric metadata such as <c>delta.columnMapping.id</c> or
+    /// <c>delta.identity.start</c>/<c>.step</c> (mirrors Spark's <c>Metadata.getLong</c>).
+    /// </summary>
+    public bool TryGetLong(string key, out long value)
+    {
+        if (_entries.TryGetValue(key, out MetadataValue? entry) && entry.TryGetLong(out long longValue))
+        {
+            value = longValue;
+            return true;
+        }
+
+        value = 0L;
+        return false;
+    }
+
+    /// <summary>
+    /// Gets the value for <paramref name="key"/> when it is present <b>and</b> a floating-point
+    /// value (mirrors Spark's <c>Metadata.getDouble</c>).
+    /// </summary>
+    public bool TryGetDouble(string key, out double value)
+    {
+        if (_entries.TryGetValue(key, out MetadataValue? entry) && entry.TryGetDouble(out double doubleValue))
+        {
+            value = doubleValue;
+            return true;
+        }
+
+        value = 0d;
+        return false;
+    }
+
+    /// <summary>
+    /// Gets the value for <paramref name="key"/> when it is present <b>and</b> a boolean value —
+    /// the ergonomic one-call path for flags such as <c>delta.identity.allowExplicitInsert</c>
+    /// (mirrors Spark's <c>Metadata.getBoolean</c>).
+    /// </summary>
+    public bool TryGetBoolean(string key, out bool value)
+    {
+        if (_entries.TryGetValue(key, out MetadataValue? entry) && entry.TryGetBoolean(out bool booleanValue))
+        {
+            value = booleanValue;
+            return true;
+        }
+
+        value = false;
         return false;
     }
 

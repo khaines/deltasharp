@@ -85,6 +85,9 @@ public sealed class TypedFieldMetadataTests
         MetadataValue id = structType["id"].Metadata["delta.columnMapping.id"];
         Assert.Equal(MetadataValueKind.Long, id.Kind);
         Assert.Equal(5L, id.AsLong());
+        // The key-based typed getter is the ergonomic one-call read for a numeric id.
+        Assert.True(structType["id"].Metadata.TryGetLong("delta.columnMapping.id", out long idViaKey));
+        Assert.Equal(5L, idViaKey);
         Assert.True(structType["id"].Metadata.TryGetString("delta.columnMapping.physicalName", out string? physical));
         Assert.Equal("col-9f2c1e77-3b4a-4d21-8f0e-1a2b3c4d5e6f", physical);
     }
@@ -303,5 +306,72 @@ public sealed class TypedFieldMetadataTests
         Assert.Throws<SchemaValidationException>(() =>
             SchemaJson.FromJson("{\"type\":\"struct\",\"fields\":[{\"name\":\"f\",\"type\":\"long\","
                 + "\"nullable\":true,\"metadata\":\"not-an-object\"}]}"));
+    }
+
+    // ---- FieldMetadata key-based typed getters (Spark Metadata parity) -----------------------------
+
+    [Fact]
+    public void FieldMetadata_KeyGetters_ReturnTypedValue_WhenKindMatches()
+    {
+        FieldMetadata metadata = FieldMetadata.FromValues(new[]
+        {
+            new KeyValuePair<string, MetadataValue>("delta.columnMapping.id", MetadataValue.Long(7)),
+            new KeyValuePair<string, MetadataValue>("delta.identity.step", MetadataValue.Double(1.5)),
+            new KeyValuePair<string, MetadataValue>("delta.identity.allowExplicitInsert", MetadataValue.Boolean(true)),
+            new KeyValuePair<string, MetadataValue>("comment", MetadataValue.String("hi")),
+        });
+
+        Assert.True(metadata.TryGetLong("delta.columnMapping.id", out long id));
+        Assert.Equal(7L, id);
+        Assert.True(metadata.TryGetDouble("delta.identity.step", out double step));
+        Assert.Equal(1.5, step);
+        Assert.True(metadata.TryGetBoolean("delta.identity.allowExplicitInsert", out bool allow));
+        Assert.True(allow);
+        Assert.True(metadata.TryGetString("comment", out string? comment));
+        Assert.Equal("hi", comment);
+    }
+
+    [Fact]
+    public void FieldMetadata_KeyGetters_ReturnFalse_OnMissingKeyOrWrongKind()
+    {
+        FieldMetadata metadata = FieldMetadata.FromValues(new[]
+        {
+            new KeyValuePair<string, MetadataValue>("id", MetadataValue.Long(7)),
+        });
+
+        Assert.False(metadata.TryGetLong("absent", out long missing));
+        Assert.Equal(0L, missing);
+        // Present but wrong kind: a Long is not a Boolean/Double/String.
+        Assert.False(metadata.TryGetBoolean("id", out bool wrongKind));
+        Assert.False(wrongKind);
+        Assert.False(metadata.TryGetString("id", out string? notString));
+        Assert.Null(notString);
+    }
+
+    [Fact]
+    public void FieldMetadata_FromValues_NullValue_ThrowsArgumentNullException()
+    {
+        // Convention: a null key/value/array-element is an ArgumentNullException across the type
+        // (consistent with MetadataValue.Array and BCL dictionary null-key handling).
+        Assert.Throws<ArgumentNullException>(() =>
+            FieldMetadata.FromValues(new[]
+            {
+                new KeyValuePair<string, MetadataValue>("k", null!),
+            }));
+    }
+
+    [Fact]
+    public void FromJson_NonFiniteMetadataNumber_TruncatesEchoedLiteral()
+    {
+        // A pathological multi-KB numeric literal is bounded in the diagnostic, not echoed whole.
+        string hugeLiteral = "1" + new string('0', 5000) + "e9"; // overflows to +Infinity
+        string json = "{\"type\":\"struct\",\"fields\":[{\"name\":\"f\",\"type\":\"long\","
+            + "\"nullable\":true,\"metadata\":{\"k\":" + hugeLiteral + "}}]}";
+
+        var ex = Assert.Throws<SchemaValidationException>(() => SchemaJson.FromJson(json));
+        Assert.Contains("is not finite", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("…", ex.Message, StringComparison.Ordinal);
+        // The full 5000-digit literal must not be echoed.
+        Assert.True(ex.Message.Length < 200, $"message unexpectedly long: {ex.Message.Length}");
     }
 }
