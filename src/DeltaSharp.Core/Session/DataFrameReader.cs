@@ -11,23 +11,32 @@ namespace DeltaSharp;
 /// An entry point for reading data into a <see cref="DataFrame"/>, equivalent to Apache Spark's
 /// <c>DataFrameReader</c> obtained from <c>spark.read</c>. It is a <b>mutable fluent builder</b>
 /// (Spark parity): <see cref="Schema(StructType)"/> and the <c>Option</c> overloads stage read
-/// configuration and return the same reader, and a terminal load method — <see cref="Parquet(string)"/>
-/// in M1 — returns a <see cref="DataFrame"/>.
+/// configuration and return the same reader, and a terminal load method returns a <see cref="DataFrame"/>.
+/// The format-generic terminal loader is <see cref="Load(string)"/> (used with <see cref="Format(string)"/>,
+/// e.g. <c>Format("delta").Load(path)</c>); <see cref="Parquet(string)"/> is the Parquet-format shortcut.
 /// </summary>
 /// <remarks>
 /// <para>
-/// Building a reader and staging options does <b>no</b> work; <see cref="Parquet(string)"/> records an
-/// <b>unresolved</b> Parquet scan in the plan and opens <b>no</b> file (STORY-04.1.2 / #158, AC2). The
-/// Parquet <i>reader</i> itself is EPIC-05 (Delta/Parquet storage): an action that analyzes a Parquet
-/// scan fails with a deterministic diagnostic naming EPIC-05 ownership. Instances are created by
+/// Building a reader and staging options does <b>no</b> work; the terminal <see cref="Load(string)"/>
+/// (or <see cref="Parquet(string)"/>) records an <b>unresolved</b> file scan in the plan and opens
+/// <b>no</b> file (STORY-04.1.2 / #158, AC2). For a <c>delta</c> read the eager Delta-log metadata read
+/// that binds the schema and pins the snapshot version happens at analysis (an action). The Parquet
+/// <i>reader</i> itself is EPIC-05 (Delta/Parquet storage): an action that analyzes a Parquet scan fails
+/// with a deterministic diagnostic naming EPIC-05 ownership. Instances are created by
 /// <see cref="SparkSession.Read"/> (a fresh reader per access), so the constructor is non-public. See
 /// <c>docs/engineering/design/read-door.md</c>.
 /// </para>
 /// <para>
 /// <b>Option-key validation is finalize-time.</b> <see cref="Option(string, string)"/> and its
 /// overloads only stage keys; whether a key is a recognized read option is checked at the terminal
-/// <see cref="Parquet(string)"/> call (Spark parity: options are validated when the read is finalized),
-/// so options may be staged in any order.
+/// load call (<see cref="Load(string)"/>/<see cref="Parquet(string)"/>) — Spark parity: options are
+/// validated when the read is finalized — so options may be staged in any order.
+/// </para>
+/// <para>
+/// <b><see cref="Schema(StructType)"/> is a no-op for <c>delta</c> (Delta parity).</b> A Delta table's
+/// schema is authoritative from its log, so — like Spark — a read-time <c>.schema(…)</c> is <b>ignored</b>
+/// for the <c>delta</c> format: the resolved schema always comes from the pinned snapshot. It is retained
+/// for the EPIC-05 Parquet reader (schema-on-read, avoiding inference).
 /// </para>
 /// </remarks>
 public sealed class DataFrameReader
@@ -47,18 +56,95 @@ public sealed class DataFrameReader
             "int96RebaseMode",
         }.ToFrozenSet(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>The Delta read options DeltaSharp recognizes at <see cref="Load(string)"/> time and records
+    /// onto the scan for the read door (#499) to honor: the two time-travel dimensions
+    /// (<c>versionAsOf</c>/<c>timestampAsOf</c>, mutually exclusive — the analyzer rejects both). Any other
+    /// key is rejected at <see cref="Load(string)"/> time (Spark parity). Case-insensitive.</summary>
+    private static readonly FrozenSet<string> RecognizedDeltaOptions =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "versionAsOf",
+            "timestampAsOf",
+        }.ToFrozenSet(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Spark's Delta source name — the one file-format read the read door (#499) resolves
+    /// end-to-end (base + time travel). Any other <see cref="Format(string)"/> stays deferred to EPIC-05.</summary>
+    private const string DeltaFormat = "delta";
+
+    /// <summary>Spark's default read source (<c>spark.sql.sources.default</c>): a <see cref="Load(string)"/>
+    /// with no <see cref="Format(string)"/> reads <c>parquet</c>, which in M1 routes to the EPIC-05 deferral,
+    /// matching Spark's default while keeping the Parquet reader out of #499.</summary>
+    private const string DefaultFormat = "parquet";
+
     private readonly SparkSession _session;
     private readonly Dictionary<string, string> _options = new(StringComparer.OrdinalIgnoreCase);
     private StructType? _userSchema;
+    private string _format = DefaultFormat;
 
     internal DataFrameReader(SparkSession session) =>
         _session = session ?? throw new ArgumentNullException(nameof(session));
 
     /// <summary>
+    /// Specifies the input data-source format, mirroring Spark's <c>DataFrameReader.format(source)</c>
+    /// (for example <c>"delta"</c>). The format is recorded for the terminal <see cref="Load(string)"/>;
+    /// only <c>delta</c> is resolved end-to-end in #499 (base + time-travel reads), while any other format
+    /// (including the default <c>parquet</c>) stays deferred to EPIC-05. Returns this reader for chaining.
+    /// </summary>
+    /// <param name="source">The format name (case-insensitive; recorded as given).</param>
+    /// <returns>This reader.</returns>
+    /// <exception cref="ArgumentException"><paramref name="source"/> is <see langword="null"/> or empty.</exception>
+    public DataFrameReader Format(string source)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(source);
+        _format = source;
+        return this;
+    }
+
+    /// <summary>
+    /// Loads a path with the configured <see cref="Format(string)"/>, mirroring Spark's
+    /// <c>DataFrameReader.load(path)</c>. This is the read door's format-generic <b>finalizer</b>: it
+    /// validates the staged options and returns a <see cref="DataFrame"/> backed by an <b>unresolved</b>
+    /// file scan. It opens <b>no</b> file and reads <b>no</b> log (the lazy invariant); the eager Delta-log
+    /// metadata read that binds the schema and pins the snapshot version happens at analysis (an action).
+    /// </summary>
+    /// <remarks>
+    /// For <c>delta</c> the recognized options are the time-travel dimensions <c>versionAsOf</c> and
+    /// <c>timestampAsOf</c> (mutually exclusive; the analyzer rejects supplying both options). An explicit
+    /// time-travel option makes the <paramref name="path"/> <b>literal</b> — the <c>@v&lt;n&gt;</c> /
+    /// <c>@yyyyMMddHHmmssSSS</c> suffix is only parsed when no time-travel option is given (so a table path
+    /// legitimately ending in <c>@v1</c> stays readable by passing an explicit option). Any read-time
+    /// <see cref="Schema(StructType)"/> is a <b>no-op for <c>delta</c></b> (the schema comes from the pinned
+    /// snapshot, Delta parity). For any other format the recognized set is the Parquet read options, but the
+    /// scan stays deferred to EPIC-05 at analysis.
+    /// </remarks>
+    /// <param name="path">The source path (may carry a <c>@v&lt;n&gt;</c>/<c>@…</c> time-travel suffix for delta).</param>
+    /// <returns>A <see cref="DataFrame"/> over the unresolved file scan.</returns>
+    /// <exception cref="ArgumentException"><paramref name="path"/> is null/empty, or a staged option is not
+    /// recognized for the configured format.</exception>
+    /// <exception cref="SessionStoppedException">The owning session has been stopped or disposed.</exception>
+    public DataFrame Load(string path)
+    {
+        _session.EnsureNotStopped(nameof(Load));
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        bool isDelta = string.Equals(_format, DeltaFormat, StringComparison.OrdinalIgnoreCase);
+        FrozenSet<string> recognized = isDelta ? RecognizedDeltaOptions : RecognizedParquetOptions;
+        IReadOnlyDictionary<string, string> options = CanonicalizeOptions(recognized, _format);
+        return new DataFrame(
+            _session,
+            new UnresolvedFileRelation(_format, path, options, _userSchema));
+    }
+
+    /// <summary>
     /// Specifies the read schema, mirroring Spark's <c>DataFrameReader.schema(StructType)</c>. The
-    /// schema is recorded for the EPIC-05 reader to honor (avoiding schema inference). Returns this
+    /// schema is recorded for the EPIC-05 Parquet reader to honor (avoiding schema inference). Returns this
     /// reader for chaining.
     /// </summary>
+    /// <remarks>
+    /// <b>No-op for <c>delta</c> (Delta parity).</b> A Delta table's schema is authoritative from its log,
+    /// so — exactly like Spark — a read-time schema is <b>ignored</b> for the <c>delta</c> format: the
+    /// resolved schema always comes from the pinned snapshot (the <c>delta</c> resolver never consults this
+    /// value). This is a deliberate, documented no-op rather than a silent discard.
+    /// </remarks>
     /// <param name="schema">The read schema.</param>
     /// <returns>This reader.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="schema"/> is <see langword="null"/>.</exception>
@@ -128,7 +214,7 @@ public sealed class DataFrameReader
     {
         _session.EnsureNotStopped(nameof(Parquet));
         ArgumentException.ThrowIfNullOrEmpty(path);
-        IReadOnlyDictionary<string, string> options = CanonicalizeOptions(RecognizedParquetOptions);
+        IReadOnlyDictionary<string, string> options = CanonicalizeOptions(RecognizedParquetOptions, "Parquet");
         return new DataFrame(
             _session,
             new UnresolvedFileRelation("parquet", path, options, _userSchema));
@@ -138,7 +224,7 @@ public sealed class DataFrameReader
     /// options keyed by their canonical recognized spelling, so option handling is case-insensitive
     /// (Spark parity) yet the scan node carries deterministic keys. An unrecognized key raises a
     /// deterministic diagnostic naming the offending option and the documented alternative (AC3).</summary>
-    private IReadOnlyDictionary<string, string> CanonicalizeOptions(FrozenSet<string> recognized)
+    private IReadOnlyDictionary<string, string> CanonicalizeOptions(FrozenSet<string> recognized, string format)
     {
         var canonical = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (KeyValuePair<string, string> option in _options)
@@ -151,8 +237,8 @@ public sealed class DataFrameReader
                 string supported = string.Join(
                     ", ", recognized.OrderBy(o => o, StringComparer.OrdinalIgnoreCase));
                 throw new ArgumentException(
-                    $"Unsupported Parquet reader option '{option.Key}'. DeltaSharp M1 recognizes these "
-                    + $"Parquet read options: [{supported}]. To fix a read schema, call "
+                    $"Unsupported {format} reader option '{option.Key}'. DeltaSharp M1 recognizes these "
+                    + $"{format} read options: [{supported}]. To fix a read schema, call "
                     + "DataFrameReader.Schema(StructType) instead of an option.");
             }
 

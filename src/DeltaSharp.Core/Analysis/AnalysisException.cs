@@ -69,6 +69,20 @@ internal enum AnalysisErrorKind
     /// format with no M1 write mapping at all (AC3). The <see cref="WriteToSource"/> node builds fine;
     /// only its <i>resolution</i> is rejected, before any output is committed.</summary>
     UnsupportedDataSink,
+
+    /// <summary>A Delta read's time-travel intent is invalid (#499): a version and a timestamp were both
+    /// specified (or the same dimension was specified twice via an option and the path suffix), or a
+    /// <c>versionAsOf</c>/<c>timestampAsOf</c> value could not be parsed. Spark disallows specifying both
+    /// a version and a timestamp; DeltaSharp additionally rejects a redundant/conflicting spec fail-closed
+    /// rather than silently ignoring one.</summary>
+    InvalidTimeTravelSpec,
+
+    /// <summary>A path-based file-format read (#499, currently <c>delta</c>) was recognized but could not
+    /// be resolved: it is not a Delta table, the requested version is out of range or has been vacuumed,
+    /// the timestamp is out of range, the log is malformed, or no storage backend is registered. The
+    /// <see cref="UnresolvedFileRelation"/> builds fine; only its <i>resolution</i> failed, during analysis,
+    /// before any execution backend is reached.</summary>
+    FileSourceResolutionFailed,
 }
 
 /// <summary>
@@ -391,4 +405,62 @@ internal sealed class AnalysisException : Exception
 
     private static string RenderTypes(IReadOnlyList<DataType> types) =>
         string.Join(", ", types.Select(t => t.SimpleString));
+
+    /// <summary>Builds an <see cref="AnalysisErrorKind.InvalidTimeTravelSpec"/> failure for a read that
+    /// pins both a version and a timestamp (#499): the <c>versionAsOf</c> and <c>timestampAsOf</c> options
+    /// together, or (defensively) a path suffix that resolves to both. An explicit option makes the load
+    /// path literal, so an option and a path suffix never conflict. The (redacted) path is named; the value
+    /// is never rendered.</summary>
+    /// <param name="path">The load path (redacted in the message).</param>
+    /// <param name="detail">A short description of the conflict.</param>
+    public static AnalysisException ConflictingTimeTravel(string path, string detail)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        ArgumentException.ThrowIfNullOrEmpty(detail);
+        string safePath = SecretRedaction.RedactPath(path);
+        return new AnalysisException(
+            $"Cannot time travel Delta table '{safePath}' using both a version and a timestamp: {detail}. "
+            + "Pin at most one of versionAsOf / timestampAsOf — as an option (which takes precedence and "
+            + "makes the path literal) or a '@v<n>' / '@yyyyMMddHHmmssSSS' path suffix — never both a "
+            + "version and a timestamp.",
+            AnalysisErrorKind.InvalidTimeTravelSpec,
+            safePath,
+            Array.Empty<string>());
+    }
+
+    /// <summary>Builds an <see cref="AnalysisErrorKind.InvalidTimeTravelSpec"/> failure for an unparseable
+    /// <c>versionAsOf</c>/<c>timestampAsOf</c> value (#499).</summary>
+    /// <param name="dimension">The time-travel dimension (versionAsOf / timestampAsOf).</param>
+    /// <param name="value">The offending value (rendered — a time-travel value is not credential-bearing).</param>
+    /// <param name="reason">A short parse-failure reason.</param>
+    public static AnalysisException InvalidTimeTravelValue(string dimension, string value, string reason)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(dimension);
+        ArgumentNullException.ThrowIfNull(value);
+        return new AnalysisException(
+            $"Invalid {dimension} value '{value}': {reason}.",
+            AnalysisErrorKind.InvalidTimeTravelSpec,
+            dimension,
+            Array.Empty<string>());
+    }
+
+    /// <summary>Builds an <see cref="AnalysisErrorKind.FileSourceResolutionFailed"/> failure for a Delta
+    /// (path-based) read whose resolution failed (#499): not a Delta table, an out-of-range/vacuumed
+    /// version, a timestamp out of range, a malformed log, or no registered storage backend. The
+    /// (redacted) path is named; the storage-side reason is appended.</summary>
+    /// <param name="format">The data-source format (for example <c>delta</c>).</param>
+    /// <param name="path">The load path (redacted in the message).</param>
+    /// <param name="reason">The storage-side failure reason.</param>
+    public static AnalysisException FileSourceResolutionFailed(string format, string path, string reason)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(format);
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        ArgumentException.ThrowIfNullOrEmpty(reason);
+        string safePath = SecretRedaction.RedactPath(path);
+        return new AnalysisException(
+            $"Cannot read '{format}' source at '{safePath}': {reason}",
+            AnalysisErrorKind.FileSourceResolutionFailed,
+            safePath,
+            Array.Empty<string>());
+    }
 }

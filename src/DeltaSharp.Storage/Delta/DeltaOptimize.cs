@@ -572,6 +572,10 @@ internal sealed class DeltaOptimize
     // requests — the additive schema-evolution (#190) narrow-file case that needs read-side null-fill (#497).
     // A genuine byte-level corruption or a real type mismatch does NOT match (it carries a different message
     // / kind), so it is not masked by the OPTIMIZE-specific schema-evolution error.
+    // TRACKED DEFERRAL (#513): this classification is string-coupled to ParquetFileReader's "is not present
+    // in the Parquet file schema" message (the same coupling exists at the read guard site in
+    // DeltaReadSource.IsNarrowSchemaEvolutionInput). A shared, message-independent error-kind that both
+    // guard sites match on is #513.
     private static bool IsNarrowSchemaEvolutionInput(DeltaStorageException ex) =>
         ex.Kind == StorageErrorKind.CorruptData
         && ex.Message.Contains("is not present in the Parquet file schema", StringComparison.Ordinal);

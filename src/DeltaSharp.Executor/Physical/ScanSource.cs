@@ -7,18 +7,29 @@ using DeltaSharp.Types;
 namespace DeltaSharp.Executor;
 
 /// <summary>
-/// Resolves a scanned <see cref="ResolvedRelation"/> to the in-memory batches the physical planner
-/// builds a leaf scan over. It is the M1 data-in seam: the public read-door
-/// (<c>createDataFrame</c>/file scans) is STORY-04.1.2 (#158) and will register batches (or a real
-/// reader) through this same shape.
+/// Resolves a scanned <see cref="ResolvedRelation"/> to a <b>deferred</b> batch factory the physical
+/// planner builds a leaf scan over. It is the M1 data-in seam: the public read-door
+/// (<c>createDataFrame</c>/file scans) is STORY-04.1.2 (#158) and registers batches (or a real reader)
+/// through this same shape.
 /// </summary>
+/// <remarks>
+/// A source yields a <see cref="Func{T, TResult}">Func&lt;CancellationToken, IReadOnlyList&lt;ColumnBatch&gt;&gt;</see>
+/// rather than materialized batches so the read stays <b>lazy</b>: the factory is invoked only at
+/// <see cref="ScanPlan.Execute"/> (under the run's cancellation token and memory/byte budget), so
+/// <see cref="PhysicalPlanner.Plan"/> — and thus #179 <c>Explain</c> — performs NO data-plane I/O. An
+/// already-materialized source wraps its batches in a trivial thunk; a real reader (the Delta scan-source)
+/// defers the file reads into the thunk. The factory shape stays reflection-free (NativeAOT-safe).
+/// </remarks>
 internal interface IScanSource
 {
-    /// <summary>Tries to resolve <paramref name="relation"/> to its source batches.</summary>
+    /// <summary>Tries to resolve <paramref name="relation"/> to a deferred factory producing its source batches.</summary>
     /// <param name="relation">The scanned relation.</param>
-    /// <param name="batches">The resolved batches when found.</param>
+    /// <param name="batchFactory">The deferred batch factory when found; invoked at execution with the run's
+    /// cancellation token.</param>
     /// <returns><see langword="true"/> if the relation is registered; otherwise <see langword="false"/>.</returns>
-    bool TryGetBatches(ResolvedRelation relation, [NotNullWhen(true)] out IReadOnlyList<ColumnBatch>? batches);
+    bool TryGetBatches(
+        ResolvedRelation relation,
+        [NotNullWhen(true)] out Func<CancellationToken, IReadOnlyList<ColumnBatch>>? batchFactory);
 }
 
 /// <summary>
@@ -61,10 +72,21 @@ internal sealed class InMemoryScanSource : IScanSource
     }
 
     /// <inheritdoc />
-    public bool TryGetBatches(ResolvedRelation relation, [NotNullWhen(true)] out IReadOnlyList<ColumnBatch>? batches)
+    public bool TryGetBatches(
+        ResolvedRelation relation,
+        [NotNullWhen(true)] out Func<CancellationToken, IReadOnlyList<ColumnBatch>>? batchFactory)
     {
         ArgumentNullException.ThrowIfNull(relation);
-        return _byIdentifier.TryGetValue(Key(relation.Identifier), out batches);
+        if (_byIdentifier.TryGetValue(Key(relation.Identifier), out IReadOnlyList<ColumnBatch>? batches))
+        {
+            // The batches are already materialized; wrap them in a trivial thunk so the leaf scan honors
+            // the deferred-factory contract uniformly (nothing to defer, no I/O).
+            batchFactory = _ => batches;
+            return true;
+        }
+
+        batchFactory = null;
+        return false;
     }
 
     private static string Key(IReadOnlyList<string> identifier) => string.Join('.', identifier);
