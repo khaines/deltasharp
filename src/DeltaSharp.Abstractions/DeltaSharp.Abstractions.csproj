@@ -69,6 +69,11 @@
          Abstractions PublicAPI baseline is unchanged. -->
     <InternalsVisibleTo Include="DeltaSharp.Storage" />
     <InternalsVisibleTo Include="DeltaSharp.Engine.Tests" />
+    <!-- #330 round-1 council fix: the Storage-side DeltaSchemaJson metadata parity test asserts
+         SchemaJson.ToJson (this assembly, internal) and DeltaSchemaJson.ToJson emit byte-identical
+         metadata, so it must observe the internal SchemaJson serializer directly. The seam stays
+         internal — the Abstractions PublicAPI baseline is unchanged. -->
+    <InternalsVisibleTo Include="DeltaSharp.Storage.Tests" />
   </ItemGroup>
 
 </Project>
