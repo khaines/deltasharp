@@ -8,9 +8,10 @@ namespace DeltaSharp.Storage.Tests;
 /// <summary>
 /// Typed field-metadata interop (issue #330): the Storage-side <see cref="DeltaSchemaJson"/> writer
 /// must serialize typed metadata (numeric column-mapping ids, identity numbers/booleans) exactly like
-/// the engine's <c>SchemaJson</c>. The golden strings below are duplicated byte-for-byte from
-/// Engine.Tests' <c>TypedFieldMetadataTests</c> (the two projects cannot see each other's internal
-/// serializer), so asserting both writers reproduce the same literal proves they stay consistent.
+/// the engine's <c>SchemaJson</c>. Since #330's round-1 fix, both writers call the SAME shared
+/// <c>SchemaJson.WriteMetadataValue</c> in <c>DeltaSharp.Abstractions</c>, so the parity is
+/// structural rather than a coincidence of two duplicated literals — asserted directly in
+/// <see cref="BothWriters_EmitByteIdenticalMetadata_ForEveryValueKind"/>.
 /// </summary>
 public sealed class DeltaSchemaJsonTypedMetadataTests
 {
@@ -18,7 +19,8 @@ public sealed class DeltaSchemaJsonTypedMetadataTests
     private const string ColumnMappingGolden =
         "{\"type\":\"struct\",\"fields\":[" +
         "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":{" +
-        "\"delta.columnMapping.id\":5,\"delta.columnMapping.physicalName\":\"col-a1b2c3\"}}]}";
+        "\"delta.columnMapping.id\":5,\"delta.columnMapping.physicalName\":" +
+        "\"col-9f2c1e77-3b4a-4d21-8f0e-1a2b3c4d5e6f\"}}]}";
 
     private const string IdentityGolden =
         "{\"type\":\"struct\",\"fields\":[" +
@@ -38,7 +40,8 @@ public sealed class DeltaSchemaJsonTypedMetadataTests
                 {
                     new KeyValuePair<string, MetadataValue>("delta.columnMapping.id", MetadataValue.Long(5)),
                     new KeyValuePair<string, MetadataValue>(
-                        "delta.columnMapping.physicalName", MetadataValue.String("col-a1b2c3")),
+                        "delta.columnMapping.physicalName",
+                        MetadataValue.String("col-9f2c1e77-3b4a-4d21-8f0e-1a2b3c4d5e6f")),
                 })),
         });
 
@@ -81,5 +84,53 @@ public sealed class DeltaSchemaJsonTypedMetadataTests
         });
 
         Assert.Contains("\"k\":5.0", DeltaSchemaJson.ToJson(schema), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BothWriters_EmitByteIdenticalMetadata_ForEveryValueKind()
+    {
+        // DIRECT parity: the engine's internal SchemaJson (visible here via InternalsVisibleTo) and
+        // the Storage DeltaSchemaJson must emit byte-identical output for a schema whose metadata
+        // exercises every MetadataValueKind — string, long, double, bool, null, array, and nested
+        // object. This proves the shared-writer collapse (no drift) rather than trusting a copied
+        // literal. Field types stay atomic/struct so DeltaSchemaJson.WriteType's tracked complex-type
+        // deferral (#518) does not enter the comparison.
+        var nested = FieldMetadata.FromValues(new[]
+        {
+            new KeyValuePair<string, MetadataValue>("inner.long", MetadataValue.Long(42)),
+            new KeyValuePair<string, MetadataValue>("inner.str", MetadataValue.String("nested")),
+        });
+
+        var array = MetadataValue.Array(new[]
+        {
+            MetadataValue.Long(1),
+            MetadataValue.Double(2.5),
+            MetadataValue.Boolean(true),
+            MetadataValue.String("s"),
+            MetadataValue.Null,
+        });
+
+        var schema = new StructType(new[]
+        {
+            new StructField(
+                "everything",
+                DataTypes.LongType,
+                nullable: false,
+                FieldMetadata.FromValues(new[]
+                {
+                    new KeyValuePair<string, MetadataValue>("k.arr", array),
+                    new KeyValuePair<string, MetadataValue>("k.bool", MetadataValue.Boolean(false)),
+                    new KeyValuePair<string, MetadataValue>("k.double", MetadataValue.Double(3.0)),
+                    new KeyValuePair<string, MetadataValue>("k.long", MetadataValue.Long(7)),
+                    new KeyValuePair<string, MetadataValue>("k.nested", MetadataValue.Nested(nested)),
+                    new KeyValuePair<string, MetadataValue>("k.null", MetadataValue.Null),
+                    new KeyValuePair<string, MetadataValue>("k.string", MetadataValue.String("text")),
+                })),
+        });
+
+        string engineJson = SchemaJson.ToJson(schema);
+        string storageJson = DeltaSchemaJson.ToJson(schema);
+
+        Assert.Equal(engineJson, storageJson);
     }
 }

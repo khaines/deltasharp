@@ -58,6 +58,11 @@ DeltaSharp.Types.MetadataValue.AsNested() -> DeltaSharp.Types.FieldMetadata!
 DeltaSharp.Types.MetadataValue.AsString() -> string!
 DeltaSharp.Types.MetadataValue.Equals(DeltaSharp.Types.MetadataValue? other) -> bool
 DeltaSharp.Types.MetadataValue.Kind.get -> DeltaSharp.Types.MetadataValueKind
+DeltaSharp.Types.MetadataValue.TryGetArray(out System.Collections.Generic.IReadOnlyList<DeltaSharp.Types.MetadataValue!>! value) -> bool
+DeltaSharp.Types.MetadataValue.TryGetBoolean(out bool value) -> bool
+DeltaSharp.Types.MetadataValue.TryGetDouble(out double value) -> bool
+DeltaSharp.Types.MetadataValue.TryGetLong(out long value) -> bool
+DeltaSharp.Types.MetadataValue.TryGetNested(out DeltaSharp.Types.FieldMetadata! value) -> bool
 DeltaSharp.Types.MetadataValue.TryGetString(out string! value) -> bool
 DeltaSharp.Types.MetadataValueKind
 DeltaSharp.Types.MetadataValueKind.Array = 5 -> DeltaSharp.Types.MetadataValueKind

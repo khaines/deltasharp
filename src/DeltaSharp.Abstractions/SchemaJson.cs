@@ -44,7 +44,10 @@ internal static class SchemaJson
         ArgumentNullException.ThrowIfNull(json);
         try
         {
-            using JsonDocument document = JsonDocument.Parse(json);
+            // Pin the parse depth bound explicitly (JsonDocument's default is 64) so deeply nested
+            // metadata objects fail closed at the untrusted read boundary rather than relying on an
+            // implicit default that a future runtime could change.
+            using JsonDocument document = JsonDocument.Parse(json, new JsonDocumentOptions { MaxDepth = 64 });
             return ReadType(document.RootElement);
         }
         catch (JsonException ex)
@@ -349,10 +352,23 @@ internal static class SchemaJson
 
             case JsonValueKind.Number:
                 // An integral number that fits in Int64 is a Long (e.g. delta.columnMapping.id);
-                // anything else (fractional, exponent, or out-of-range) is a Double — Spark parity.
-                return element.TryGetInt64(out long longValue)
-                    ? MetadataValue.Long(longValue)
-                    : MetadataValue.Double(element.GetDouble());
+                // anything else (fractional, exponent, or out-of-range) is a Double. A non-finite
+                // parse result (e.g. an overflowing 1e400 literal → ±Infinity) is not representable
+                // in JSON, so fail closed here at the untrusted read boundary rather than accepting
+                // a value that would throw an untyped ArgumentException on re-serialize.
+                if (element.TryGetInt64(out long longValue))
+                {
+                    return MetadataValue.Long(longValue);
+                }
+
+                double doubleValue = element.GetDouble();
+                if (!double.IsFinite(doubleValue))
+                {
+                    throw new SchemaValidationException(
+                        $"Metadata number '{element.GetRawText()}' is not finite and cannot be represented as JSON.");
+                }
+
+                return MetadataValue.Double(doubleValue);
 
             case JsonValueKind.True:
             case JsonValueKind.False:

@@ -1,5 +1,4 @@
 using System.Buffers;
-using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using DeltaSharp.Types;
@@ -8,10 +7,12 @@ namespace DeltaSharp.Storage.Parquet;
 
 /// <summary>
 /// Serializes a <see cref="StructType"/> schema to the Spark/Delta-compatible schema JSON that the
-/// Parquet footer <c>key_value_metadata</c> carries (design §2.9.2 "footer metadata"). It mirrors
-/// the engine's <c>SchemaJson</c> format for the atomic/decimal types this layer supports; a
-/// standalone copy lives here because <c>SchemaJson</c> is <c>internal</c> to
-/// <c>DeltaSharp.Engine</c> (design §2.10.1 handoff note: relocate/grant is a later story).
+/// Parquet footer <c>key_value_metadata</c> carries (design §2.9.2 "footer metadata"). Field
+/// metadata is serialized via the shared <c>SchemaJson.WriteMetadataValue</c> in
+/// <c>DeltaSharp.Abstractions</c> (visible here through the <c>InternalsVisibleTo</c> grant), so
+/// numeric column-mapping ids and identity numbers/booleans stay byte-for-byte identical to the
+/// engine's serializer. Only <see cref="WriteType"/> differs — this layer stringifies complex
+/// types (see the tracked deferral there).
 /// </summary>
 /// <remarks>Uses the reflection-free <see cref="Utf8JsonWriter"/> so the layer stays trim/AOT-clean
 /// (ADR-0014).</remarks>
@@ -59,12 +60,11 @@ internal static class DeltaSchemaJson
         writer.WriteEndObject();
     }
 
-    // Faithful copy of DeltaSharp.Abstractions' SchemaJson.WriteMetadata (M7): each field-metadata
-    // entry is emitted in FieldMetadata's key-sorted order with a typed value, so a schema carrying
-    // field metadata serializes byte-for-byte like the engine — including numeric column-mapping ids
-    // and identity booleans, which MUST stay unquoted JSON numbers/booleans for Delta interop (#330).
-    // D-6 relocation follow-up: once SchemaJson is shared out of Abstractions, delete this copy and
-    // call the shared serializer directly.
+    // Emits each field-metadata entry in FieldMetadata's key-sorted order with a typed value, so a
+    // schema carrying field metadata serializes byte-for-byte like the engine — including numeric
+    // column-mapping ids and identity booleans, which MUST stay unquoted JSON numbers/booleans for
+    // Delta interop (#330). The per-value writer is the shared SchemaJson.WriteMetadataValue in
+    // DeltaSharp.Abstractions (no local copy) so the two serializers cannot drift.
     private static void WriteMetadata(Utf8JsonWriter writer, FieldMetadata metadata)
     {
         writer.WriteStartObject();
@@ -72,69 +72,11 @@ internal static class DeltaSchemaJson
         {
             // FieldMetadata enumerates in sorted key order => deterministic output.
             writer.WritePropertyName(entry.Key);
-            WriteMetadataValue(writer, entry.Value);
+            SchemaJson.WriteMetadataValue(writer, entry.Value);
         }
 
         writer.WriteEndObject();
     }
-
-    // Mirrors SchemaJson.WriteMetadataValue byte-for-byte (string/long/double/bool/null/array/nested).
-    private static void WriteMetadataValue(Utf8JsonWriter writer, MetadataValue value)
-    {
-        switch (value.Kind)
-        {
-            case MetadataValueKind.Null:
-                writer.WriteNullValue();
-                break;
-            case MetadataValueKind.String:
-                writer.WriteStringValue(value.AsString());
-                break;
-            case MetadataValueKind.Long:
-                writer.WriteNumberValue(value.AsLong());
-                break;
-            case MetadataValueKind.Double:
-                WriteDouble(writer, value.AsDouble());
-                break;
-            case MetadataValueKind.Boolean:
-                writer.WriteBooleanValue(value.AsBoolean());
-                break;
-            case MetadataValueKind.Array:
-                writer.WriteStartArray();
-                foreach (MetadataValue element in value.AsArray())
-                {
-                    WriteMetadataValue(writer, element);
-                }
-
-                writer.WriteEndArray();
-                break;
-            case MetadataValueKind.Nested:
-                WriteMetadata(writer, value.AsNested());
-                break;
-            default:
-                throw new SchemaValidationException($"Cannot serialize metadata value kind '{value.Kind}'.");
-        }
-    }
-
-    // Mirrors SchemaJson.WriteDouble: round-trippable ("R") with a forced fractional part when
-    // integral so a double never collapses to a bare integer literal.
-    private static void WriteDouble(Utf8JsonWriter writer, double value)
-    {
-        if (!double.IsFinite(value))
-        {
-            writer.WriteNumberValue(value);
-            return;
-        }
-
-        string text = value.ToString("R", CultureInfo.InvariantCulture);
-        if (text.IndexOfAny(FractionOrExponent) < 0)
-        {
-            text += ".0";
-        }
-
-        writer.WriteRawValue(text);
-    }
-
-    private static readonly char[] FractionOrExponent = ['.', 'e', 'E'];
 
     private static void WriteType(Utf8JsonWriter writer, DataType type)
     {
@@ -144,7 +86,11 @@ internal static class DeltaSchemaJson
             return;
         }
 
-        // Atomic and decimal types serialize as their Spark type-name string.
+        // TRACKED DEFERRAL (#518): unlike the engine's SchemaJson.WriteType, this layer stringifies
+        // ALL non-struct types (including Array/Map) to their TypeName rather than emitting the
+        // nested elementType/keyType/valueType object shape. That footer complex-type gap is
+        // pre-existing and out of scope for #330; #191 will need the full shape. Until then this
+        // is intentionally NOT shared with SchemaJson.WriteType.
         writer.WriteStringValue(type.TypeName);
     }
 }

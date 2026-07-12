@@ -1,3 +1,4 @@
+using System.Collections.ObjectModel;
 using System.Diagnostics.CodeAnalysis;
 
 namespace DeltaSharp.Types;
@@ -84,6 +85,11 @@ public sealed class MetadataValue : IEquatable<MetadataValue>
     private static MetadataValue False { get; } = new(MetadataValueKind.Boolean, booleanValue: false);
 
     /// <summary>Creates a string metadata value.</summary>
+    /// <remarks>
+    /// A string is distinct from a numeric value: <c>String("5")</c> never equals
+    /// <see cref="Long(long)"/> <c>Long(5)</c> nor <see cref="Double(double)"/> <c>Double(5.0)</c>.
+    /// See the class remarks for the Long-vs-Double JSON-number discrimination rule.
+    /// </remarks>
     /// <exception cref="ArgumentNullException"><paramref name="value"/> is null.</exception>
     public static MetadataValue String(string value)
     {
@@ -92,15 +98,35 @@ public sealed class MetadataValue : IEquatable<MetadataValue>
     }
 
     /// <summary>Creates an integral (long) metadata value.</summary>
+    /// <remarks>
+    /// Use this for JSON integers such as <c>delta.columnMapping.id</c> and
+    /// <c>delta.identity.start</c>/<c>.step</c>: an integral value serializes as an unquoted
+    /// integer and re-reads as <see cref="MetadataValueKind.Long"/>. A value that must keep a
+    /// fractional/exponent JSON form belongs in <see cref="Double(double)"/> — see the class
+    /// remarks for the full Long-vs-Double discrimination rule.
+    /// </remarks>
     public static MetadataValue Long(long value) => new(MetadataValueKind.Long, longValue: value);
 
     /// <summary>Creates a floating-point (double) metadata value.</summary>
+    /// <remarks>
+    /// A double always serializes with a fractional/exponent form (e.g. <c>5.0</c>, never <c>5</c>)
+    /// so it re-reads as <see cref="MetadataValueKind.Double"/> rather than
+    /// <see cref="Long(long)"/>. Equality is exact-bitwise: <c>+0.0</c> and <c>-0.0</c> are
+    /// distinct and distinct NaN bit-patterns are distinct — consistent with
+    /// <see cref="GetHashCode"/>. See the class remarks for the full discrimination rule.
+    /// </remarks>
     public static MetadataValue Double(double value) => new(MetadataValueKind.Double, doubleValue: value);
 
     /// <summary>Creates a boolean metadata value.</summary>
     public static MetadataValue Boolean(bool value) => value ? True : False;
 
     /// <summary>Creates an ordered array metadata value. The list is snapshotted defensively.</summary>
+    /// <remarks>
+    /// This constructor is permissive: it accepts a heterogeneously-typed array (mixed kinds).
+    /// Spark/Delta arrays are homogeneously typed, so a heterogeneous array is <b>not</b>
+    /// Spark-writable — it round-trips through this engine but a reference Delta reader may reject
+    /// it. Callers writing Delta-log metadata should keep array elements of a single kind.
+    /// </remarks>
     /// <exception cref="ArgumentNullException"><paramref name="values"/> or any element is null.</exception>
     public static MetadataValue Array(IReadOnlyList<MetadataValue> values)
     {
@@ -109,10 +135,11 @@ public sealed class MetadataValue : IEquatable<MetadataValue>
         for (int i = 0; i < values.Count; i++)
         {
             copy[i] = values[i]
-                ?? throw new ArgumentException("Metadata array element cannot be null.", nameof(values));
+                ?? throw new ArgumentNullException(nameof(values), "Metadata array element cannot be null.");
         }
 
-        return new MetadataValue(MetadataValueKind.Array, arrayValue: copy);
+        // Wrap the defensive copy once so AsArray() cannot be downcast to a mutable array/IList.
+        return new MetadataValue(MetadataValueKind.Array, arrayValue: new ReadOnlyCollection<MetadataValue>(copy));
     }
 
     /// <summary>Creates a nested metadata-object value.</summary>
@@ -166,6 +193,71 @@ public sealed class MetadataValue : IEquatable<MetadataValue>
         return false;
     }
 
+    /// <summary>Gets the integral value when this is a <see cref="MetadataValueKind.Long"/>.</summary>
+    public bool TryGetLong(out long value)
+    {
+        if (Kind == MetadataValueKind.Long)
+        {
+            value = _long;
+            return true;
+        }
+
+        value = 0L;
+        return false;
+    }
+
+    /// <summary>Gets the floating-point value when this is a <see cref="MetadataValueKind.Double"/>.</summary>
+    public bool TryGetDouble(out double value)
+    {
+        if (Kind == MetadataValueKind.Double)
+        {
+            value = _double;
+            return true;
+        }
+
+        value = 0d;
+        return false;
+    }
+
+    /// <summary>Gets the boolean value when this is a <see cref="MetadataValueKind.Boolean"/>.</summary>
+    public bool TryGetBoolean(out bool value)
+    {
+        if (Kind == MetadataValueKind.Boolean)
+        {
+            value = _boolean;
+            return true;
+        }
+
+        value = false;
+        return false;
+    }
+
+    /// <summary>Gets the nested metadata object when this is a <see cref="MetadataValueKind.Nested"/>.</summary>
+    public bool TryGetNested([MaybeNullWhen(false)] out FieldMetadata value)
+    {
+        if (Kind == MetadataValueKind.Nested)
+        {
+            value = _nested!;
+            return true;
+        }
+
+        value = null;
+        return false;
+    }
+
+    /// <summary>Gets the array elements when this is a <see cref="MetadataValueKind.Array"/>.</summary>
+    public bool TryGetArray([MaybeNullWhen(false)] out IReadOnlyList<MetadataValue> value)
+    {
+        if (Kind == MetadataValueKind.Array)
+        {
+            value = _array!;
+            return true;
+        }
+
+        value = null;
+        return false;
+    }
+
     /// <inheritdoc/>
     public bool Equals(MetadataValue? other)
     {
@@ -189,8 +281,12 @@ public sealed class MetadataValue : IEquatable<MetadataValue>
             MetadataValueKind.Null => true,
             MetadataValueKind.String => string.Equals(_string, other._string, StringComparison.Ordinal),
             MetadataValueKind.Long => _long == other._long,
-            // Bitwise equality is consistent with the bit-based hash (NaN == NaN, -0.0 != 0.0).
-            MetadataValueKind.Double => _double.Equals(other._double),
+            // Exact-bitwise equality, consistent with the bit-based GetHashCode: canonical NaN
+            // equals canonical NaN (same payload), distinct NaN payloads are distinct, and
+            // -0.0 != 0.0. System.Double.Equals would collapse ±0.0 and all NaN payloads, breaking
+            // the IEquatable/GetHashCode contract (a Dictionary/HashSet corruption hazard).
+            MetadataValueKind.Double =>
+                BitConverter.DoubleToInt64Bits(_double) == BitConverter.DoubleToInt64Bits(other._double),
             MetadataValueKind.Boolean => _boolean == other._boolean,
             MetadataValueKind.Array => ArraysEqual(_array!, other._array!),
             MetadataValueKind.Nested => _nested!.Equals(other._nested),

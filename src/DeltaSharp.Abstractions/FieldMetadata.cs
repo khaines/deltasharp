@@ -26,7 +26,8 @@ public sealed class FieldMetadata : IReadOnlyDictionary<string, MetadataValue>, 
 
     /// <summary>
     /// Builds metadata from typed <paramref name="entries"/>. Keys are compared ordinally; on a
-    /// duplicate key the last value wins. Returns <see cref="Empty"/> for an empty input.
+    /// duplicate key the last value wins. Returns <see cref="Empty"/> for an empty input. For the
+    /// common all-string case, prefer <see cref="FromEntries"/>, which wraps raw strings for you.
     /// </summary>
     /// <exception cref="ArgumentNullException"><paramref name="entries"/> is null.</exception>
     /// <exception cref="ArgumentException">A key or value is null.</exception>
@@ -58,7 +59,8 @@ public sealed class FieldMetadata : IReadOnlyDictionary<string, MetadataValue>, 
     /// Builds metadata from string <paramref name="entries"/>, the common column-comment case.
     /// Each value is wrapped as a <see cref="MetadataValue.String(string)"/>. Keys are compared
     /// ordinally; on a duplicate key the last value wins. Returns <see cref="Empty"/> for an empty
-    /// input.
+    /// input. For typed values (numeric ids, identity booleans, nested objects, arrays), use
+    /// <see cref="FromValues"/> instead.
     /// </summary>
     /// <exception cref="ArgumentNullException"><paramref name="entries"/> is null.</exception>
     /// <exception cref="ArgumentException">A key or value is null.</exception>
