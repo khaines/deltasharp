@@ -334,18 +334,43 @@ public sealed class TypedFieldMetadataTests
     [Fact]
     public void FieldMetadata_KeyGetters_ReturnFalse_OnMissingKeyOrWrongKind()
     {
+        // One entry of each kind so every getter can be exercised against a present-but-wrong-kind
+        // value (not just a missing key) — a getter that skipped its kind check would leak the
+        // wrong-typed value here.
         FieldMetadata metadata = FieldMetadata.FromValues(new[]
         {
-            new KeyValuePair<string, MetadataValue>("id", MetadataValue.Long(7)),
+            new KeyValuePair<string, MetadataValue>("long", MetadataValue.Long(7)),
+            new KeyValuePair<string, MetadataValue>("double", MetadataValue.Double(1.5)),
+            new KeyValuePair<string, MetadataValue>("bool", MetadataValue.Boolean(true)),
+            new KeyValuePair<string, MetadataValue>("string", MetadataValue.String("hi")),
         });
 
-        Assert.False(metadata.TryGetLong("absent", out long missing));
-        Assert.Equal(0L, missing);
-        // Present but wrong kind: a Long is not a Boolean/Double/String.
-        Assert.False(metadata.TryGetBoolean("id", out bool wrongKind));
-        Assert.False(wrongKind);
-        Assert.False(metadata.TryGetString("id", out string? notString));
-        Assert.Null(notString);
+        // Missing key: every getter returns false with the type default.
+        Assert.False(metadata.TryGetLong("absent", out long absentLong));
+        Assert.Equal(0L, absentLong);
+        Assert.False(metadata.TryGetDouble("absent", out double absentDouble));
+        Assert.Equal(0d, absentDouble);
+        Assert.False(metadata.TryGetBoolean("absent", out bool absentBool));
+        Assert.False(absentBool);
+        Assert.False(metadata.TryGetString("absent", out string? absentString));
+        Assert.Null(absentString);
+
+        // Present but wrong kind: TryGetLong only matches a Long, TryGetDouble only a Double, etc.
+        Assert.False(metadata.TryGetLong("double", out long longFromDouble));
+        Assert.Equal(0L, longFromDouble);
+        Assert.False(metadata.TryGetLong("string", out long longFromString));
+        Assert.Equal(0L, longFromString);
+
+        Assert.False(metadata.TryGetDouble("long", out double doubleFromLong));
+        Assert.Equal(0d, doubleFromLong);
+        Assert.False(metadata.TryGetDouble("bool", out double doubleFromBool));
+        Assert.Equal(0d, doubleFromBool);
+
+        Assert.False(metadata.TryGetBoolean("long", out bool boolFromLong));
+        Assert.False(boolFromLong);
+
+        Assert.False(metadata.TryGetString("long", out string? stringFromLong));
+        Assert.Null(stringFromLong);
     }
 
     [Fact]
