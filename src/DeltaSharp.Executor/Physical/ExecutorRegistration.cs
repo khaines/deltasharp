@@ -20,7 +20,13 @@ internal static class ExecutorRegistration
 {
     /// <summary>Registers the local executor factory on <see cref="SparkSession"/> (idempotent).</summary>
     [ModuleInitializer]
-    public static void Register() =>
+    public static void Register()
+    {
+        // Read door (#499): bind the analyzer's delta path-scan resolver BEFORE the executor factory, so any
+        // session the factory builds already resolves `read.format("delta").load(path)` (and versionAsOf /
+        // timestampAsOf / @v / @ts) against a real Delta log.
+        SparkSession.RegisterFileRelationResolver(DeltaStorageAdapter.FileRelationResolver);
         SparkSession.RegisterQueryExecutorFactory(
-            static session => new LocalQueryExecutor(InMemoryScanSource.Default, session));
+            static session => new LocalQueryExecutor(DeltaStorageAdapter.DefaultScanSource, session));
+    }
 }

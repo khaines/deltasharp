@@ -28,11 +28,13 @@ internal sealed class ExecutionSentinelScanSource : IScanSource
     public int BatchAccessCount => _batches.AccessCount;
 
     /// <inheritdoc />
-    public bool TryGetBatches(ResolvedRelation relation, [NotNullWhen(true)] out IReadOnlyList<ColumnBatch>? batches)
+    public bool TryGetBatches(
+        ResolvedRelation relation,
+        [NotNullWhen(true)] out Func<CancellationToken, IReadOnlyList<ColumnBatch>>? batchFactory)
     {
-        // Resolving a relation to its batch REFERENCE is a planning-time act and must not count as a read;
-        // only touching the list's contents (execution) arms the sentinel.
-        batches = _batches;
+        // Resolving a relation to its batch FACTORY is a planning-time act and must not count as a read;
+        // only invoking the factory and touching the list's contents (execution) arms the sentinel.
+        batchFactory = _ => _batches;
         return true;
     }
 

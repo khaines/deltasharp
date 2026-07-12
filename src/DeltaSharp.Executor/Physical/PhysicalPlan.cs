@@ -96,23 +96,15 @@ internal abstract class PhysicalPlan
     };
 }
 
-/// <summary>A leaf scan over in-memory batches. The batches are supplied either eagerly (an
-/// <see cref="IScanSource"/> catalog scan already holds them) or via a <b>lazy thunk</b> evaluated on
-/// first <see cref="Execute"/> — the latter lets a <c>LocalRelation</c> defer row→batch encoding out of
+/// <summary>A leaf scan over in-memory batches supplied via a <b>lazy thunk</b> evaluated on first
+/// <see cref="Execute"/> — this is how every <see cref="IScanSource"/> scan (a <c>LocalRelation</c>, an
+/// in-memory catalog fixture, or a real Delta file read) defers row→batch encoding / data-plane I/O out of
 /// physical planning so <see cref="PhysicalPlanner.Plan"/> (and thus #179 <c>Explain</c>) performs no
 /// enumeration or I/O (STORY-04.1.2 / #158).</summary>
 internal sealed class ScanPlan : PhysicalPlan
 {
     private readonly Func<CancellationToken, IReadOnlyList<ColumnBatch>> _batchesFactory;
     private IReadOnlyList<ColumnBatch>? _batches;
-
-    /// <summary>Creates a scan over already-materialized <paramref name="batches"/>.</summary>
-    public ScanPlan(StructType outputSchema, IReadOnlyList<ColumnBatch> batches)
-        : base(outputSchema)
-    {
-        _batches = batches ?? throw new ArgumentNullException(nameof(batches));
-        _batchesFactory = static _ => throw new InvalidOperationException("Batches are already materialized.");
-    }
 
     /// <summary>Creates a scan whose batches are produced lazily by <paramref name="batchesFactory"/> on
     /// first <see cref="Execute"/> (no enumeration/encoding happens at planning time). The factory receives

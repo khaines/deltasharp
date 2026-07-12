@@ -38,11 +38,14 @@ internal sealed class CancellationTriggerScanSource : IScanSource
     public int AccessCount => _batches.AccessCount;
 
     /// <inheritdoc />
-    public bool TryGetBatches(ResolvedRelation relation, [NotNullWhen(true)] out IReadOnlyList<ColumnBatch>? batches)
+    public bool TryGetBatches(
+        ResolvedRelation relation,
+        [NotNullWhen(true)] out Func<CancellationToken, IReadOnlyList<ColumnBatch>>? batchFactory)
     {
-        // Resolving the batch REFERENCE is a planning-time act and must not trip; only reading the list's
-        // contents (execution) cancels and throws.
-        batches = _batches;
+        // Resolving the batch factory is a planning-time act and must not trip; only reading the list's
+        // contents (execution, when the ScanPlan invokes the factory and the operator enumerates) cancels
+        // and throws.
+        batchFactory = _ => _batches;
         return true;
     }
 

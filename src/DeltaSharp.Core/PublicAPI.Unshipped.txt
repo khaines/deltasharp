@@ -35,6 +35,8 @@ DeltaSharp.DataFrame.WithColumn(string! colName, DeltaSharp.Column! col) -> Delt
 DeltaSharp.DataFrameReader
 DeltaSharp.DataFrameReader.Option(string! key, bool value) -> DeltaSharp.DataFrameReader!
 DeltaSharp.DataFrameReader.Option(string! key, double value) -> DeltaSharp.DataFrameReader!
+DeltaSharp.DataFrameReader.Format(string! source) -> DeltaSharp.DataFrameReader!
+DeltaSharp.DataFrameReader.Load(string! path) -> DeltaSharp.DataFrame!
 DeltaSharp.DataFrameReader.Option(string! key, long value) -> DeltaSharp.DataFrameReader!
 DeltaSharp.DataFrameReader.Option(string! key, string! value) -> DeltaSharp.DataFrameReader!
 DeltaSharp.DataFrameReader.Parquet(string! path) -> DeltaSharp.DataFrame!

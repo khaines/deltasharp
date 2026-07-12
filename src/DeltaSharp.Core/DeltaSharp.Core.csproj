@@ -45,6 +45,10 @@
        (Directory.Build.props already auto-injects the DeltaSharp.Core.Tests grant.) -->
   <ItemGroup>
     <InternalsVisibleTo Include="DeltaSharp.Executor" />
+    <!-- The Executor's end-to-end read-door tests (#499) assert the pinned resolved Delta version through
+         the internal DataFrame.ResolveDeltaReadVersion() surface, so grant them internals visibility too.
+         Like the DeltaSharp.Executor grant above this does NOT widen Core's public API. -->
+    <InternalsVisibleTo Include="DeltaSharp.Executor.Tests" />
   </ItemGroup>
 
 </Project>
