@@ -3,6 +3,7 @@ using System.Globalization;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
+using DeltaSharp.Storage.Delta.DeletionVectors;
 using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Storage.Reading;
 using DeltaSharp.Types;
@@ -193,6 +194,45 @@ public sealed class DeltaReadSource : IDisposable
         List<ColumnBatch> batches,
         CancellationToken cancellationToken)
     {
+        // Load the committed deletion vector (if any) BEFORE reading data, so a poisoned/malformed DV fails
+        // the read closed here rather than after emitting rows (the cardinal DV safety rule: never return a
+        // row a DV invalidated because the DV failed to decode). The DV's row positions are PHYSICAL,
+        // file-relative ordinals, so we validate them against the file's PHYSICAL record count — the residual
+        // stats.numRecords (records visible after the DV) PLUS the DV cardinality (records removed).
+        DeletionVectorPositions? deletionVector = null;
+        if (add.DeletionVector is { } descriptor)
+        {
+            long? residual = add.Stats?.NumRecords;
+            if (residual is not { } residualRecords)
+            {
+                // A DV-carrying add MUST record numRecords in stats (Delta writer requirement). Without the
+                // physical record count we cannot bound-check the DV positions, so fail closed.
+                throw new DeltaReadException(
+                    $"Active file '{add.Path}' carries a deletion vector but its add action has no "
+                    + "stats.numRecords, so the deleted row positions cannot be validated. The read fails "
+                    + "closed rather than risk returning rows a deletion vector invalidated.");
+            }
+
+            long physicalRecords = checked(residualRecords + descriptor.Cardinality);
+            long[] positions;
+            try
+            {
+                positions = await DeletionVectorStore
+                    .LoadAsync(_backend, descriptor, physicalRecords, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (DeltaStorageException ex)
+            {
+                // A malformed/oversized bitmap, bad magic/version, CRC/size/cardinality mismatch, out-of-range
+                // position, invalid Z85, or an out-of-file .bin offset/length — all surface as a typed
+                // storage fault. Fail the read closed (never silently ignore the DV and return deleted rows).
+                throw new DeltaReadException(ex.Message, ex);
+            }
+
+            deletionVector = new DeletionVectorPositions(positions, physicalRecords);
+        }
+
+        long fileRowOffset = 0;
         Stream stream = await _backend.OpenReadAsync(add.Path, cancellationToken).ConfigureAwait(false);
         await using (stream.ConfigureAwait(false))
         {
@@ -202,7 +242,21 @@ public sealed class DeltaReadSource : IDisposable
                     .ReadAsync(stream, dataSchema, keepRowGroup: null, cancellationToken)
                     .ConfigureAwait(false))
                 {
-                    batches.Add(BuildFullBatch(add, tableSchema, physicalNames, dataOrdinalByField, dataBatch));
+                    ColumnBatch fullBatch =
+                        BuildFullBatch(add, tableSchema, physicalNames, dataOrdinalByField, dataBatch);
+
+                    if (deletionVector is null)
+                    {
+                        batches.Add(fullBatch);
+                    }
+                    else if (ApplyDeletionVector(fullBatch, deletionVector, fileRowOffset) is { } survived)
+                    {
+                        // A fully-deleted batch (every physical row invalidated) contributes no rows, so it
+                        // is dropped rather than added as an empty batch.
+                        batches.Add(survived);
+                    }
+
+                    fileRowOffset = checked(fileRowOffset + dataBatch.RowCount);
                 }
             }
             catch (DeltaStorageException ex) when (IsNarrowSchemaEvolutionInput(ex))
@@ -214,6 +268,80 @@ public sealed class DeltaReadSource : IDisposable
                 throw new DeltaReadSchemaEvolutionException(add.Path, ex);
             }
         }
+
+        if (deletionVector is not null)
+        {
+            deletionVector.EnsureFullyConsumed(fileRowOffset, add.Path);
+        }
+    }
+
+    // The decoded deletion-vector positions for one active file: a set of PHYSICAL, file-relative row
+    // ordinals to exclude, plus the file's declared physical record count for a post-read consistency check.
+    private sealed class DeletionVectorPositions
+    {
+        private readonly HashSet<long> _deleted;
+
+        public DeletionVectorPositions(long[] positions, long physicalRecords)
+        {
+            _deleted = new HashSet<long>(positions.Length);
+            foreach (long position in positions)
+            {
+                _deleted.Add(position);
+            }
+
+            PhysicalRecords = physicalRecords;
+        }
+
+        public long PhysicalRecords { get; }
+
+        public int Cardinality => _deleted.Count;
+
+        public bool IsDeleted(long filePosition) => _deleted.Contains(filePosition);
+
+        // The Parquet file's actual physical row count (summed across row groups) must match the record count
+        // the DV was validated against — a mismatch means the add's stats.numRecords + cardinality disagree
+        // with the physical file, so the DV positions cannot be trusted to map to the right rows. Fail closed.
+        public void EnsureFullyConsumed(long physicalRowsRead, string path)
+        {
+            if (physicalRowsRead != PhysicalRecords)
+            {
+                throw new DeltaReadException(
+                    $"Active file '{path}' carries a deletion vector validated against {PhysicalRecords} "
+                    + $"physical records, but the Parquet file contains {physicalRowsRead}. The stats.numRecords "
+                    + "and deletion-vector cardinality disagree with the data file, so the read fails closed.");
+            }
+        }
+    }
+
+    // Applies a deletion vector to one full-schema batch by building a SelectionVector of the surviving
+    // physical rows (those whose file-relative ordinal `fileRowOffset + r` is NOT in the DV). Returns null
+    // when every row in the batch is deleted (the caller drops it). The DV positions are file-relative, so
+    // the running `fileRowOffset` maps this batch's physical rows [0, RowCount) onto the file ordinal space.
+    private static ColumnBatch? ApplyDeletionVector(
+        ColumnBatch batch, DeletionVectorPositions deletionVector, long fileRowOffset)
+    {
+        int rowCount = batch.RowCount;
+        var survivors = new List<int>(rowCount);
+        for (int r = 0; r < rowCount; r++)
+        {
+            if (!deletionVector.IsDeleted(fileRowOffset + r))
+            {
+                survivors.Add(r);
+            }
+        }
+
+        if (survivors.Count == rowCount)
+        {
+            // No row in this batch was deleted — return it unchanged (identity selection is pure overhead).
+            return batch;
+        }
+
+        if (survivors.Count == 0)
+        {
+            return null;
+        }
+
+        return batch.WithSelection(new SelectionVector(survivors.ToArray()));
     }
 
     // Assembles one output batch in table-schema order, RELABELED to the LOGICAL schema: partition columns

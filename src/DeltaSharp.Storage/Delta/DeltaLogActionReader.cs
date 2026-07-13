@@ -191,7 +191,8 @@ internal static class DeltaLogActionReader
             GetOptionalInt64(body, "modificationTime", "add", version, line) ?? 0L,
             GetOptionalBool(body, "dataChange", "add", version, line) ?? true,
             ParseStats(body, version, line),
-            GetStringMap(body, "tags", "add", version, line));
+            GetStringMap(body, "tags", "add", version, line),
+            DeletionVectors.DeletionVectorDescriptor.Parse(body, "add", version, line));
     }
 
     private static RemoveFileAction ParseRemove(JsonElement body, long version, int line)
@@ -203,7 +204,8 @@ internal static class DeltaLogActionReader
             GetOptionalBool(body, "dataChange", "remove", version, line) ?? true,
             GetOptionalBool(body, "extendedFileMetadata", "remove", version, line) ?? false,
             GetNullableStringMap(body, "partitionValues", "remove", version, line),
-            GetOptionalInt64(body, "size", "remove", version, line));
+            GetOptionalInt64(body, "size", "remove", version, line),
+            DeletionVectors.DeletionVectorDescriptor.Parse(body, "remove", version, line));
     }
 
     private static TxnAction ParseTxn(JsonElement body, long version, int line)

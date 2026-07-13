@@ -16,9 +16,9 @@ namespace DeltaSharp.Storage.Delta;
 /// <list type="bullet">
 /// <item>reader version 1 tables are served;</item>
 /// <item>reader version 2 tables (legacy column mapping) fail closed — column mapping is not implemented;</item>
-/// <item>reader version 3 tables are served only when they require <b>no</b> reader features; any listed
-/// reader feature (<c>columnMapping</c>, <c>deletionVectors</c>, <c>v2Checkpoint</c>, <c>timestampNtz</c>,
-/// …) fails closed;</item>
+/// <item>reader version 3 tables are served only when they require <b>no</b> reader features beyond those
+/// this build implements (<c>columnMapping</c>, <c>deletionVectors</c>); any other listed reader feature
+/// (<c>v2Checkpoint</c>, <c>timestampNtz</c>, …) fails closed;</item>
 /// <item>any other reader version fails closed.</item>
 /// </list>
 /// This is exactly what lets FEAT-05.2 fully serve baseline (string-only-metadata) tables while deferring
@@ -42,7 +42,7 @@ internal static class ProtocolSupport
     /// <see cref="EnsureReadable"/>) — this build serves column mapping only through the table-features
     /// (reader v3) representation.</summary>
     public static readonly ImmutableHashSet<string> SupportedReaderFeatures =
-        ImmutableHashSet.Create(StringComparer.Ordinal, ColumnMapping.Feature);
+        ImmutableHashSet.Create(StringComparer.Ordinal, ColumnMapping.Feature, DeletionVectors.DeletionVectorsFeature.Feature);
 
     /// <summary>The absolute basic writer protocol version (no writer features).</summary>
     public const int BasicWriterVersion = 1;
@@ -60,7 +60,7 @@ internal static class ProtocolSupport
     /// <c>name</c> mode (STORY-05.4.3 / #191); an <c>id</c>-mode write is rejected fail-closed downstream
     /// (<see cref="ColumnMapping.EnsureReadWriteSupported"/>, deferred to #523).</summary>
     public static readonly ImmutableHashSet<string> SupportedWriterFeatures =
-        ImmutableHashSet.Create(StringComparer.Ordinal, ColumnMapping.Feature);
+        ImmutableHashSet.Create(StringComparer.Ordinal, ColumnMapping.Feature, DeletionVectors.DeletionVectorsFeature.Feature);
 
     /// <summary>
     /// Verifies the table's <paramref name="protocol"/> is <b>writable</b> by this build before a commit is

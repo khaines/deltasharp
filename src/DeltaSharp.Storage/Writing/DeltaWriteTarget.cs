@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
+using DeltaSharp.Storage.Delta.DeletionVectors;
 using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Storage.Writing;
 using DeltaSharp.Types;
@@ -183,6 +184,48 @@ public sealed class DeltaWriteTarget : IDisposable
                 physicalPartitions,
                 ColumnMapping.NameModeConfiguration(maxColumnId),
                 ColumnMapping.NameModeProtocol(),
+                files,
+                cancellationToken)
+            .ConfigureAwait(false);
+        return new DeltaWriteResult(commit.Version, files.Count, rows);
+    }
+
+    /// <summary>
+    /// Creates a fresh Delta table with <b>deletion vectors enabled</b> (STORY-05.5.1 / #192): the committed
+    /// <c>protocol</c> declares the <c>deletionVectors</c> table feature (reader v3 / writer v7) and the
+    /// <c>metaData.configuration</c> sets <c>delta.enableDeletionVectors=true</c>, so a subsequent
+    /// <see cref="DeltaDelete"/> passes the protocol gate. Data files are written normally (no column
+    /// mapping); this is the write-side enablement seam the AC2/AC3/AC4 tests build a table with.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">A table already exists at this path (enabling deletion
+    /// vectors on an existing table is out of scope in this build).</exception>
+    internal async Task<DeltaWriteResult> CreateDeletionVectorTableAsync(
+        StructType writeSchema,
+        IReadOnlyList<string> partitionColumns,
+        IReadOnlyList<ColumnBatch> batches,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(writeSchema);
+        ArgumentNullException.ThrowIfNull(partitionColumns);
+        ArgumentNullException.ThrowIfNull(batches);
+
+        if (await TableExistsAsync(cancellationToken).ConfigureAwait(false))
+        {
+            throw new InvalidOperationException(
+                "Enabling deletion vectors on an existing table is out of scope in this build; deletion "
+                + "vectors can only be enabled on a fresh table (first write).");
+        }
+
+        (IReadOnlyList<StagedDataFile> files, long rows) =
+            await StageAsync(writeSchema, partitionColumns, batches, cancellationToken).ConfigureAwait(false);
+
+        DeltaCommitResult commit = await _writer
+            .CreateMappedTableAsync(
+                writeSchema,
+                partitionColumns,
+                partitionColumns,
+                DeletionVectorsFeature.EnabledConfiguration(),
+                DeletionVectorsFeature.Protocol(),
                 files,
                 cancellationToken)
             .ConfigureAwait(false);

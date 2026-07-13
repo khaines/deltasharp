@@ -76,6 +76,20 @@ internal sealed class CheckpointSchema
         StructField? protocol = Struct(schema, "protocol");
         StructField? txn = Struct(schema, "txn");
 
+        // Fail closed (→ JSON-replay fallback) if this checkpoint carries deletion vectors. This build parses
+        // a DV descriptor from the JSON commit log (STORY-05.5.1) but not yet from the nested checkpoint
+        // struct column, and silently dropping a DV would resurrect deleted rows — the cardinal DV safety
+        // violation. A DeltaProtocolException here is caught by DeltaLog, which discards the checkpoint seed
+        // and reconstructs the snapshot from JSON commits, preserving every DV (tracked follow-up: parse the
+        // deletionVector column from checkpoints to restore the checkpoint fast path for DV tables).
+        if ((add is not null && Child(add, "deletionVector") is not null)
+            || (remove is not null && Child(remove, "deletionVector") is not null))
+        {
+            throw DeltaProtocolException.Unsupported(
+                "This Delta checkpoint carries deletion vectors, which this build does not yet decode from a "
+                + "checkpoint; falling back to JSON-commit replay so no deletion vector is silently dropped.");
+        }
+
         return new CheckpointSchema
         {
             AddPath = Scalar(add, "path"),
