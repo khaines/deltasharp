@@ -320,20 +320,45 @@ internal sealed class DeltaTableWriter
         IReadOnlyList<string> partitionColumns,
         IReadOnlyList<StagedDataFile> files,
         PartitionOverwriteMode partitionMode = PartitionOverwriteMode.Static,
+        bool overwriteSchema = false,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(writeSchema);
         ArgumentNullException.ThrowIfNull(partitionColumns);
         ArgumentNullException.ThrowIfNull(files);
 
+        // #496: overwriteSchema (destructive wholesale replacement) is legal ONLY for a Static/full overwrite,
+        // because a full overwrite rewrites every file. Under Dynamic partition overwrite, files in the
+        // UNTOUCHED partitions survive and still conform to the OLD schema, so replacing the schema wholesale
+        // would leave them unreadable under the new schema — silent corruption. Reject the combination fail-
+        // closed (Spark raises an AnalysisException for overwriteSchema with dynamic partitionOverwriteMode).
+        if (overwriteSchema && partitionMode == PartitionOverwriteMode.Dynamic)
+        {
+            throw new ArgumentException(
+                "overwriteSchema is only supported for a full (Static) overwrite: a dynamic partition "
+                + "overwrite preserves files in untouched partitions that still conform to the old schema, so "
+                + "a wholesale schema replacement would leave them unreadable. Use Static partition overwrite "
+                + "mode, or an additive SchemaEvolutionMode instead.",
+                nameof(overwriteSchema));
+        }
+
         long? latest = await _log.GetLatestCommitVersionAsync(cancellationToken).ConfigureAwait(false);
         if (latest is null)
         {
+            // A fresh table's create sets the schema outright, so overwriteSchema is moot (there is nothing to
+            // replace); the write's declared schema/partitioning becomes version 0.
             return await CreateTableAsync(writeSchema, partitionColumns, files, cancellationToken).ConfigureAwait(false);
         }
 
         Snapshot readSnapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
         RejectExistingNameModeMutation(readSnapshot);
+
+        if (overwriteSchema)
+        {
+            return await OverwriteReplaceSchemaAsync(
+                readSnapshot, writeSchema, partitionColumns, files, cancellationToken).ConfigureAwait(false);
+        }
+
         if (files.Count == 0)
         {
             // Spark parity: an overwrite REPLACES prior data, so an empty overwrite is NOT a no-op the way an
@@ -697,6 +722,53 @@ internal sealed class DeltaTableWriter
 
         AppendAddActions(actions, files);
         return _committer.CommitAsync(readSnapshot, actions, DeltaReadScope.WholeTable, cancellationToken);
+    }
+
+    // #496: a Static/full overwrite with overwriteSchema=true REPLACES the table schema (and partition
+    // columns) wholesale — drop, narrow, reorder, add, or change a column's type — because every prior file
+    // is removed in the same version, so no surviving data must conform to the old schema. This deliberately
+    // BYPASSES the additive DeltaSchemaEnforcer.Reconcile (which forbids drop/narrow/type-change): the
+    // destructive replacement is legal precisely because the overwrite rewrites all data. The new metaData
+    // carries the write's declared schema + partition columns (all other metadata fields — id, format,
+    // configuration, createdTime — are preserved). The staged files are still gated against the NEW schema by
+    // ValidateStagedWriteSchema (#497 footer check), and partition coverage is validated against the NEW
+    // partition columns, so the committed metaData provably matches the real written bytes. Committed under
+    // WholeTable scope (like every full overwrite) so any concurrent add/remove/metaData aborts it.
+    private Task<DeltaCommitResult> OverwriteReplaceSchemaAsync(
+        Snapshot readSnapshot,
+        StructType writeSchema,
+        IReadOnlyList<string> partitionColumns,
+        IReadOnlyList<StagedDataFile> files,
+        CancellationToken cancellationToken)
+    {
+        ImmutableArray<string> partitionArray = partitionColumns.ToImmutableArray();
+
+        // Gate the real staged bytes against the NEW schema (#497) and validate coverage against the NEW
+        // partition columns — both BEFORE any action is built, so a rejected replacement leaves the table
+        // unchanged (fail-closed).
+        ValidateStagedWriteSchema(writeSchema, partitionColumns, files);
+        ValidatePartitionCoverage(files, partitionArray);
+
+        var replacement = readSnapshot.Metadata with
+        {
+            SchemaString = SchemaJson.ToJson(writeSchema),
+            PartitionColumns = partitionArray,
+        };
+
+        // Idempotent no-op: an empty overwriteSchema against an already-empty table whose schema + partition
+        // columns are unchanged would build a 0-remove/0-add/0-metadata action list (the metaData equals the
+        // current one), which DeltaCommitter rejects as an empty commit — short-circuit to Skipped, mirroring
+        // the plain empty-static-overwrite guard.
+        if (files.Count == 0
+            && readSnapshot.ActiveFiles.IsEmpty
+            && replacement.SchemaString == readSnapshot.Metadata.SchemaString
+            && partitionArray.SequenceEqual(readSnapshot.Metadata.PartitionColumns))
+        {
+            return Task.FromResult(new DeltaCommitResult(readSnapshot.Version, Attempts: 0, Skipped: true));
+        }
+
+        // Remove EVERY prior active file + add the new files + the replacement metaData, one atomic version.
+        return FullOverwriteAsync(readSnapshot, files, replacement, cancellationToken);
     }
 
     // AC3: remove only the prior active files in the touched partitions + add the new files, scoped to

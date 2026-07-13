@@ -113,18 +113,28 @@ public sealed class DeltaWriteTarget : IDisposable
 
     /// <summary>Overwrites the table with <paramref name="batches"/> (creating it on first write), replacing
     /// either the whole table (<see cref="DeltaPartitionOverwriteMode.Static"/>) or only the touched
-    /// partitions (<see cref="DeltaPartitionOverwriteMode.Dynamic"/>).</summary>
+    /// partitions (<see cref="DeltaPartitionOverwriteMode.Dynamic"/>).
+    /// <para>When <paramref name="overwriteSchema"/> is <see langword="true"/> (the connector's
+    /// <c>overwriteSchema</c> option, #496) a full (Static) overwrite <b>replaces the table schema wholesale</b>
+    /// — it may drop, narrow, reorder, add, or change the type of columns, and change the partition columns —
+    /// because every prior file is rewritten. It is rejected for a Dynamic partition overwrite (files in
+    /// untouched partitions would still carry the old schema). The staged files are gated against the new
+    /// schema, so the committed metadata matches the real bytes.</para></summary>
+    /// <exception cref="ArgumentException"><paramref name="overwriteSchema"/> is combined with
+    /// <see cref="DeltaPartitionOverwriteMode.Dynamic"/> (only a full/Static overwrite may replace the schema).</exception>
     public async Task<DeltaWriteResult> OverwriteAsync(
         StructType writeSchema,
         IReadOnlyList<string> partitionColumns,
         IReadOnlyList<ColumnBatch> batches,
         DeltaPartitionOverwriteMode partitionOverwriteMode,
+        bool overwriteSchema = false,
         CancellationToken cancellationToken = default)
     {
         (IReadOnlyList<StagedDataFile> files, long rows) =
             await StageAsync(writeSchema, partitionColumns, batches, cancellationToken).ConfigureAwait(false);
         DeltaCommitResult commit = await _writer
-            .CreateOrOverwriteAsync(writeSchema, partitionColumns, files, Map(partitionOverwriteMode), cancellationToken)
+            .CreateOrOverwriteAsync(
+                writeSchema, partitionColumns, files, Map(partitionOverwriteMode), overwriteSchema, cancellationToken)
             .ConfigureAwait(false);
         return new DeltaWriteResult(commit.Version, files.Count, rows);
     }

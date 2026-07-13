@@ -185,6 +185,95 @@ public sealed class DeltaWriteDoorEndToEndTests : IDisposable
         }
     }
 
+    // ---------------------------------------------------------------- overwriteSchema (#496)
+
+    [Fact]
+    public void Delta_OverwriteSchema_Option_ReplacesSchema_ChangeType()
+    {
+        // The connector `overwriteSchema` option (#496) maps to the write-door: a full overwrite with
+        // overwriteSchema=true changes `id` from int to long (a type change is illegal additively —
+        // TypeWideningUnsupported) and commits the new schema.
+        string table = Table("overwrite-schema-type");
+
+        using (SparkSession spark = NewSession())
+        {
+            spark.CreateDataFrame(People(), PeopleSchema) // id: integer
+                .Write.Format("delta").Mode("append").Save(table);
+        }
+
+        Assert.Contains("\"integer\"", ReadMetadataSchemaString(table, 0), StringComparison.Ordinal);
+
+        var wideId = new StructType(new[]
+        {
+            new StructField("id", LongType.Instance, nullable: false),
+            new StructField("name", StringType.Instance, nullable: true),
+        });
+        using (SparkSession spark = NewSession())
+        {
+            spark.CreateDataFrame(new[] { new Row(wideId, 7L, "z") }, wideId)
+                .Write.Format("delta")
+                .Option("overwriteSchema", "true")
+                .Mode("overwrite")
+                .Save(table);
+        }
+
+        Assert.True(File.Exists(CommitFile(table, 1)));
+        Assert.True(HasRemove(table, 1)); // full overwrite removed the v0 file
+        string schemaJson = ReadMetadataSchemaString(table, 1);
+        Assert.Contains("\"long\"", schemaJson, StringComparison.Ordinal); // id widened to long
+        Assert.DoesNotContain("\"integer\"", schemaJson, StringComparison.Ordinal);
+        AddRecord add = Assert.Single(ActiveAdds(table));
+        Assert.Equal(1, add.NumRecords);
+    }
+
+    [Fact]
+    public void Delta_Overwrite_WithoutOverwriteSchema_ChangeType_FailsAndLeavesTableUnchanged()
+    {
+        // Without the option, a type change via overwrite is rejected (additive enforcement); the table stays
+        // at v0 with its original int schema.
+        string table = Table("overwrite-noschema-type");
+
+        using (SparkSession spark = NewSession())
+        {
+            spark.CreateDataFrame(People(), PeopleSchema)
+                .Write.Format("delta").Mode("append").Save(table);
+        }
+
+        var wideId = new StructType(new[]
+        {
+            new StructField("id", LongType.Instance, nullable: false),
+            new StructField("name", StringType.Instance, nullable: true),
+        });
+        using (SparkSession spark = NewSession())
+        {
+            DataFrame df = spark.CreateDataFrame(new[] { new Row(wideId, 7L, "z") }, wideId);
+            Assert.ThrowsAny<Exception>(() =>
+                df.Write.Format("delta").Mode("overwrite").Save(table));
+        }
+
+        Assert.False(File.Exists(CommitFile(table, 1))); // no new commit
+    }
+
+    [Fact]
+    public void Delta_OverwriteSchema_InvalidOptionValue_Throws()
+    {
+        string table = Table("overwrite-schema-bad");
+        using (SparkSession spark = NewSession())
+        {
+            spark.CreateDataFrame(People(), PeopleSchema)
+                .Write.Format("delta").Mode("append").Save(table);
+        }
+
+        using (SparkSession spark = NewSession())
+        {
+            DataFrame df = spark.CreateDataFrame(People(), PeopleSchema);
+            Assert.ThrowsAny<Exception>(() =>
+                df.Write.Format("delta").Option("overwriteSchema", "notabool").Mode("overwrite").Save(table));
+        }
+
+        Assert.False(File.Exists(CommitFile(table, 1)));
+    }
+
     // ---------------------------------------------------------------- partitioned append layout
 
     [Fact]
@@ -493,6 +582,28 @@ public sealed class DeltaWriteDoorEndToEndTests : IDisposable
         }
 
         return false;
+    }
+
+    // Reads the metaData action's schemaString (the Spark schema JSON) from a specific commit — used to
+    // assert an overwriteSchema replacement committed the new schema (#496).
+    private static string ReadMetadataSchemaString(string table, long version)
+    {
+        foreach (string line in File.ReadLines(CommitFile(table, version)))
+        {
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                continue;
+            }
+
+            using JsonDocument doc = JsonDocument.Parse(line);
+            if (doc.RootElement.TryGetProperty("metaData", out JsonElement metaData)
+                && metaData.TryGetProperty("schemaString", out JsonElement schemaString))
+            {
+                return schemaString.GetString()!;
+            }
+        }
+
+        throw new InvalidOperationException($"No metaData action found in commit {version} of '{table}'.");
     }
 
     private static IEnumerable<string> CommitFiles(string table)
