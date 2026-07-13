@@ -313,6 +313,128 @@ public sealed class DeltaLogCheckpointTests : IDisposable
         Assert.Equal(DeltaTestHarness.Describe(fromJson), DeltaTestHarness.Describe(snapshot));
     }
 
+    // ---- issue #527: deletion vectors reconstructed directly from a checkpoint ----
+
+    // A well-formed relative-path ('u') DV shared by the JSON history and the oracle checkpoint, so both
+    // reconstruction paths must surface the SAME descriptor.
+    private const string DvPathOrInline = "0123456789abcdefghij";
+    private const int DvOffset = 4;
+    private const int DvSizeInBytes = 40;
+    private const long DvCardinality = 3;
+
+    /// <summary>DV JSON history — v0: protocol(DV)+metadata+add(a,DV)+add(b); v1: add(c); v2: add(d)+txn.</summary>
+    private static async Task WriteDvJsonHistoryAsync(IStorageBackend backend)
+    {
+        await DeltaTestHarness.WriteCommitAsync(backend, 0,
+            DeltaTestHarness.ProtocolWithReaderFeature("deletionVectors"),
+            DeltaTestHarness.Metadata(id: "dv-table"),
+            DeltaTestHarness.AddWithDeletionVector("a.parquet", "u", DvPathOrInline, DvOffset, DvSizeInBytes, DvCardinality),
+            DeltaTestHarness.Add("b.parquet"));
+        await DeltaTestHarness.WriteCommitAsync(backend, 1,
+            DeltaTestHarness.Add("c.parquet"));
+        await DeltaTestHarness.WriteCommitAsync(backend, 2,
+            DeltaTestHarness.Add("d.parquet"),
+            DeltaTestHarness.Txn("app-dv", 1));
+    }
+
+    /// <summary>The hand-computed surviving state at version 1 (protocol, metadata, add(a,DV), add(b),
+    /// add(c)) as a checkpoint — an oracle independent of production replay.</summary>
+    private static CheckpointFixture DvCheckpointAtV1() =>
+        new CheckpointFixture()
+            .Protocol(3, 7, readerFeatures: ["deletionVectors"], writerFeatures: ["deletionVectors"])
+            .Metadata(id: "dv-table", schemaString: EmptySchemaUnescaped)
+            .Add("a.parquet", size: 1, modificationTime: 1,
+                deletionVector: CheckpointFixture.DvColumns.Uuid(DvPathOrInline, DvOffset, DvSizeInBytes, DvCardinality))
+            .Add("b.parquet", size: 1, modificationTime: 1)
+            .Add("c.parquet", size: 1, modificationTime: 1);
+
+    [Fact]
+    public async Task CheckpointDvSeededReconstruction_EqualsJsonReplay()
+    {
+        // Parity oracle for issue #527: reconstructing a DV table from a checkpoint must equal the JSON
+        // replay, DV included (Describe now captures the deletionVector so a dropped DV diverges here).
+        IStorageBackend jsonOnly = NewBackend();
+        await WriteDvJsonHistoryAsync(jsonOnly);
+        Snapshot fromJson = await new DeltaLog(jsonOnly).LoadSnapshotAsync();
+
+        IStorageBackend withCheckpoint = NewBackend();
+        await WriteDvJsonHistoryAsync(withCheckpoint);
+        await DeltaTestHarness.WriteCheckpointAsync(withCheckpoint, 1, DvCheckpointAtV1());
+        await DeltaTestHarness.WriteLastCheckpointAsync(withCheckpoint, 1);
+        Snapshot fromCheckpoint = await new DeltaLog(withCheckpoint).LoadSnapshotAsync();
+
+        Assert.Equal(DeltaTestHarness.Describe(fromJson), DeltaTestHarness.Describe(fromCheckpoint));
+        Assert.Equal(1, fromCheckpoint.Metrics.CheckpointVersion); // took the fast path
+
+        // And explicitly: the checkpoint-seeded active file carries the exact DV descriptor.
+        AddFileAction a = Assert.Single(fromCheckpoint.ActiveFiles, f => f.Path == "a.parquet");
+        Assert.NotNull(a.DeletionVector);
+        Assert.Equal("u", a.DeletionVector!.StorageType);
+        Assert.Equal(DvPathOrInline, a.DeletionVector.PathOrInlineDv);
+        Assert.Equal(DvOffset, a.DeletionVector.Offset);
+        Assert.Equal(DvSizeInBytes, a.DeletionVector.SizeInBytes);
+        Assert.Equal(DvCardinality, a.DeletionVector.Cardinality);
+    }
+
+    [Fact]
+    public async Task CheckpointOnlyDv_WithCleanedEarlyCommits_Reconstructs()
+    {
+        // The exact scenario #527 fixes: an aged Spark-DV table whose early *.json commits are log-cleaned.
+        // Reconstruction must succeed from the checkpoint alone with the DV intact (previously the checkpoint
+        // was rejected → JSON replay from 0 → unreadable once early commits are gone).
+        IStorageBackend full = NewBackend();
+        await WriteDvJsonHistoryAsync(full);
+        Snapshot fromJson = await new DeltaLog(full).LoadSnapshotAsync(version: 2);
+
+        IStorageBackend cleaned = NewBackend();
+        await DeltaTestHarness.WriteCheckpointAsync(cleaned, 1, DvCheckpointAtV1());
+        await DeltaTestHarness.WriteLastCheckpointAsync(cleaned, 1);
+        await DeltaTestHarness.WriteCommitAsync(cleaned, 2,
+            DeltaTestHarness.Add("d.parquet"),
+            DeltaTestHarness.Txn("app-dv", 1));
+
+        Snapshot fromCheckpoint = await new DeltaLog(cleaned).LoadSnapshotAsync();
+
+        Assert.Equal(2, fromCheckpoint.Version);
+        Assert.Equal(1, fromCheckpoint.Metrics.CheckpointVersion); // seeded from checkpoint, not JSON-from-0
+        Assert.Equal(DeltaTestHarness.Describe(fromJson), DeltaTestHarness.Describe(fromCheckpoint));
+
+        // The DV-bearing file's deleted rows stay excluded: its DV survives checkpoint-only reconstruction.
+        AddFileAction a = Assert.Single(fromCheckpoint.ActiveFiles, f => f.Path == "a.parquet");
+        Assert.NotNull(a.DeletionVector);
+        Assert.Equal(DvCardinality, a.DeletionVector!.Cardinality);
+    }
+
+    [Fact]
+    public async Task MalformedCheckpointDv_FallsBackToJsonReplay()
+    {
+        // A malformed DV struct in the checkpoint (storageType present, sizeInBytes omitted) fails closed in
+        // the reader → DeltaLog discards the checkpoint seed and replays JSON from 0 (never dropping the DV).
+        IStorageBackend jsonOnly = NewBackend();
+        await WriteDvJsonHistoryAsync(jsonOnly);
+        Snapshot fromJson = await new DeltaLog(jsonOnly).LoadSnapshotAsync();
+
+        IStorageBackend backend = NewBackend();
+        await WriteDvJsonHistoryAsync(backend);
+        CheckpointFixture malformed = new CheckpointFixture()
+            .Protocol(3, 7, readerFeatures: ["deletionVectors"], writerFeatures: ["deletionVectors"])
+            .Metadata(id: "dv-table", schemaString: EmptySchemaUnescaped)
+            .Add("a.parquet", size: 1, modificationTime: 1,
+                deletionVector: new CheckpointFixture.DvColumns("u", DvPathOrInline, Offset: DvOffset, SizeInBytes: null, Cardinality: DvCardinality))
+            .Add("b.parquet", size: 1, modificationTime: 1)
+            .Add("c.parquet", size: 1, modificationTime: 1);
+        await DeltaTestHarness.WriteCheckpointAsync(backend, 1, malformed);
+        await DeltaTestHarness.WriteLastCheckpointAsync(backend, 1);
+
+        Snapshot fromCheckpoint = await new DeltaLog(backend).LoadSnapshotAsync();
+
+        // Fell back to JSON replay (no checkpoint claimed) and the DV is still intact from the JSON path.
+        Assert.Null(fromCheckpoint.Metrics.CheckpointVersion);
+        Assert.Equal(DeltaTestHarness.Describe(fromJson), DeltaTestHarness.Describe(fromCheckpoint));
+        AddFileAction a = Assert.Single(fromCheckpoint.ActiveFiles, f => f.Path == "a.parquet");
+        Assert.NotNull(a.DeletionVector);
+    }
+
     // The metaData.schemaString stored inside a checkpoint column is the raw (unescaped) JSON string,
     // whereas the JSON-commit form is a JSON-encoded string; both must parse to the same schema.
     private const string EmptySchemaUnescaped = """{"type":"struct","fields":[]}""";

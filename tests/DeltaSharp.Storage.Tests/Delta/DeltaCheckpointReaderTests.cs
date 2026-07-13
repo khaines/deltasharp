@@ -297,5 +297,152 @@ public sealed class DeltaCheckpointReaderTests
         Assert.Contains("ceiling", ex.Message, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task Reads_AddDeletionVector_RoundTrips_DescriptorExactly()
+    {
+        // Issue #527: a checkpoint whose add carries a nested deletionVector struct must reconstruct the
+        // EXACT descriptor (storageType/pathOrInlineDv/offset/sizeInBytes/cardinality) — silently dropping
+        // it would resurrect deleted rows.
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(3, 7, readerFeatures: ["deletionVectors"], writerFeatures: ["deletionVectors"])
+            .Metadata("t", EmptySchema)
+            .Add("dv-file.parquet", size: 100,
+                deletionVector: CheckpointFixture.DvColumns.Uuid("0123456789abcdefghij", offset: 4, sizeInBytes: 40, cardinality: 3))
+            .ToParquetAsync();
+
+        IReadOnlyList<DeltaAction> actions = await DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default);
+
+        AddFileAction add = Assert.Single(actions.OfType<AddFileAction>());
+        Assert.NotNull(add.DeletionVector);
+        Assert.Equal("u", add.DeletionVector!.StorageType);
+        Assert.Equal("0123456789abcdefghij", add.DeletionVector.PathOrInlineDv);
+        Assert.Equal(4, add.DeletionVector.Offset);
+        Assert.Equal(40, add.DeletionVector.SizeInBytes);
+        Assert.Equal(3, add.DeletionVector.Cardinality);
+    }
+
+    [Fact]
+    public async Task Reads_InlineAddDeletionVector_WithoutOffset_RoundTrips()
+    {
+        // An inline ('i') DV carries no offset; the reader must round-trip a null Offset (not fabricate one).
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(3, 7, readerFeatures: ["deletionVectors"])
+            .Metadata("t", EmptySchema)
+            .Add("inline-dv.parquet", size: 10,
+                deletionVector: new CheckpointFixture.DvColumns("i", "wxyz0123456789ABCDEF", Offset: null, SizeInBytes: 8, Cardinality: 2))
+            .ToParquetAsync();
+
+        IReadOnlyList<DeltaAction> actions = await DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default);
+
+        AddFileAction add = Assert.Single(actions.OfType<AddFileAction>());
+        Assert.NotNull(add.DeletionVector);
+        Assert.Equal("i", add.DeletionVector!.StorageType);
+        Assert.Null(add.DeletionVector.Offset);
+        Assert.Equal(8, add.DeletionVector.SizeInBytes);
+    }
+
+    [Fact]
+    public async Task Reads_RemoveDeletionVector_RoundTrips()
+    {
+        // A tombstone's DV is part of the removed logical file's identity; it must round-trip too.
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(3, 7, readerFeatures: ["deletionVectors"])
+            .Metadata("t", EmptySchema)
+            .Add("live.parquet", size: 1)
+            .Remove("dead.parquet", deletionTimestamp: 9, size: 5,
+                deletionVector: CheckpointFixture.DvColumns.Uuid("removedvremovedvremov", offset: 1, sizeInBytes: 20, cardinality: 7))
+            .ToParquetAsync();
+
+        IReadOnlyList<DeltaAction> actions = await DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default);
+
+        RemoveFileAction remove = Assert.Single(actions.OfType<RemoveFileAction>());
+        Assert.NotNull(remove.DeletionVector);
+        Assert.Equal("removedvremovedvremov", remove.DeletionVector!.PathOrInlineDv);
+        Assert.Equal(7, remove.DeletionVector.Cardinality);
+
+        // The DV struct is present in the schema but the plain add carries no DV → null (no regression).
+        AddFileAction add = Assert.Single(actions.OfType<AddFileAction>());
+        Assert.Null(add.DeletionVector);
+    }
+
+    [Fact]
+    public async Task Reads_AddWithoutDeletionVector_WhenSchemaHasDvColumn_NullDescriptor()
+    {
+        // With the deletionVector struct present in the checkpoint schema (because a sibling row carries a
+        // DV), a DV-free add must still read back a NULL descriptor — no phantom DV, no regression.
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(3, 7, readerFeatures: ["deletionVectors"])
+            .Metadata("t", EmptySchema)
+            .Add("plain.parquet", size: 1)
+            .Add("dv.parquet", size: 2,
+                deletionVector: CheckpointFixture.DvColumns.Uuid("aaaaaaaaaaaaaaaaaaaa", offset: 0, sizeInBytes: 4, cardinality: 1))
+            .ToParquetAsync();
+
+        IReadOnlyList<DeltaAction> actions = await DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default);
+
+        AddFileAction plain = Assert.Single(actions.OfType<AddFileAction>(), a => a.Path == "plain.parquet");
+        Assert.Null(plain.DeletionVector);
+        AddFileAction dv = Assert.Single(actions.OfType<AddFileAction>(), a => a.Path == "dv.parquet");
+        Assert.NotNull(dv.DeletionVector);
+    }
+
+    [Fact]
+    public async Task MalformedDeletionVector_MissingSizeInBytes_FailsClosed()
+    {
+        // A DV struct present (storageType set) but missing a required sub-column (sizeInBytes) is a corrupt
+        // DV: it MUST fail closed (→ JSON replay), never yield a partial descriptor or drop the DV.
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(3, 7, readerFeatures: ["deletionVectors"])
+            .Metadata("t", EmptySchema)
+            .Add("dv.parquet", size: 1,
+                deletionVector: new CheckpointFixture.DvColumns("u", "0123456789abcdefghij", Offset: 4, SizeInBytes: null, Cardinality: 3))
+            .ToParquetAsync();
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default));
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.Contains("deletionVector", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("sizeInBytes", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task MalformedDeletionVector_StructPresentButStorageTypeNull_FailsClosed_NotSilentlyDropped()
+    {
+        // The subtle DV-drop hazard: a DV struct is PRESENT (its other sub-columns are set) but its required
+        // storageType leaf is null. Presence MUST be detected from ANY DV leaf (not storageType alone), so
+        // this fails closed (→ JSON replay) rather than being mistaken for "no DV" and SILENTLY DROPPED —
+        // which would resurrect the rows the DV deletes (the cardinal DV safety violation). This mirrors the
+        // JSON parser, where the presence of the deletionVector object (not its storageType) triggers
+        // required-field validation.
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(3, 7, readerFeatures: ["deletionVectors"])
+            .Metadata("t", EmptySchema)
+            .Add("dv.parquet", size: 1,
+                deletionVector: new CheckpointFixture.DvColumns(
+                    StorageType: null, PathOrInlineDv: "0123456789abcdefghij", Offset: 4, SizeInBytes: 34, Cardinality: 3))
+            .ToParquetAsync();
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default));
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.Contains("storageType", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task MalformedDeletionVector_BadStorageType_FailsClosed()
+    {
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(3, 7, readerFeatures: ["deletionVectors"])
+            .Metadata("t", EmptySchema)
+            .Add("dv.parquet", size: 1,
+                deletionVector: new CheckpointFixture.DvColumns("x", "0123456789abcdefghij", Offset: 4, SizeInBytes: 40, Cardinality: 3))
+            .ToParquetAsync();
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default));
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.Contains("storageType", ex.Message, StringComparison.Ordinal);
+    }
+
     private const string EmptySchema = """{"type":"struct","fields":[]}""";
 }

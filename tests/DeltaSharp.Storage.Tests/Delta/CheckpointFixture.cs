@@ -16,6 +16,58 @@ namespace DeltaSharp.Storage.Tests.Delta;
 internal sealed class CheckpointFixture
 {
     private readonly List<IDictionary<string, object?>> _rows = [];
+    private bool _withDeletionVector;
+
+    /// <summary>A nested <c>deletionVector</c> struct's column values for a checkpoint <c>add</c>/
+    /// <c>remove</c> (issue #527). Each field is independently nullable so a test can model a valid DV
+    /// (all present) or a MALFORMED one (e.g. <see cref="StorageType"/> present but
+    /// <see cref="SizeInBytes"/> omitted) that must fail closed on read.</summary>
+    public readonly record struct DvColumns(
+        string? StorageType,
+        string? PathOrInlineDv,
+        int? Offset,
+        int? SizeInBytes,
+        long? Cardinality)
+    {
+        /// <summary>A well-formed relative-path ('u') DV descriptor for round-trip/parity tests.</summary>
+        public static DvColumns Uuid(
+            string pathOrInlineDv, int offset, int sizeInBytes, long cardinality) =>
+            new("u", pathOrInlineDv, offset, sizeInBytes, cardinality);
+
+        internal Dictionary<string, object?> ToStruct()
+        {
+            var dv = new Dictionary<string, object?>();
+
+            // Each present field is set; an omitted (null) field is left out entirely so the reader sees a
+            // null leaf — the mechanism a malformed-DV test uses to drop a required sub-column.
+            if (StorageType is not null)
+            {
+                dv["storageType"] = StorageType;
+            }
+
+            if (PathOrInlineDv is not null)
+            {
+                dv["pathOrInlineDv"] = PathOrInlineDv;
+            }
+
+            if (Offset is not null)
+            {
+                dv["offset"] = Offset.Value;
+            }
+
+            if (SizeInBytes is not null)
+            {
+                dv["sizeInBytes"] = SizeInBytes.Value;
+            }
+
+            if (Cardinality is not null)
+            {
+                dv["cardinality"] = Cardinality.Value;
+            }
+
+            return dv;
+        }
+    }
 
     public CheckpointFixture Protocol(
         int minReaderVersion, int minWriterVersion, string[]? readerFeatures = null, string[]? writerFeatures = null)
@@ -79,7 +131,8 @@ internal sealed class CheckpointFixture
         string? stats = null,
         long? modificationTime = 0,
         bool? dataChange = true,
-        (string Key, string Value)[]? tags = null)
+        (string Key, string Value)[]? tags = null,
+        DvColumns? deletionVector = null)
     {
         var add = new Dictionary<string, object?>
         {
@@ -106,6 +159,12 @@ internal sealed class CheckpointFixture
             add["stats"] = stats;
         }
 
+        if (deletionVector is not null)
+        {
+            _withDeletionVector = true;
+            add["deletionVector"] = deletionVector.Value.ToStruct();
+        }
+
         return Row("add", add);
     }
 
@@ -115,7 +174,8 @@ internal sealed class CheckpointFixture
         bool dataChange = false,
         bool extendedFileMetadata = false,
         (string Key, string? Value)[]? partitionValues = null,
-        long? size = null)
+        long? size = null,
+        DvColumns? deletionVector = null)
     {
         var remove = new Dictionary<string, object?>
         {
@@ -136,6 +196,12 @@ internal sealed class CheckpointFixture
         if (size is not null)
         {
             remove["size"] = size.Value;
+        }
+
+        if (deletionVector is not null)
+        {
+            _withDeletionVector = true;
+            remove["deletionVector"] = deletionVector.Value.ToStruct();
         }
 
         return Row("remove", remove);
@@ -219,30 +285,48 @@ internal sealed class CheckpointFixture
         return map;
     }
 
-    /// <summary>The standard Delta classic-checkpoint Parquet schema (all v1-baseline action columns).</summary>
-    public static ParquetSchema BuildSchema()
+    /// <summary>The standard Delta classic-checkpoint Parquet schema (all v1-baseline action columns), plus
+    /// the nested <c>deletionVector</c> struct on <c>add</c>/<c>remove</c> when a DV-bearing action was added
+    /// (issue #527) — so existing DV-free checkpoints keep their exact baseline schema.</summary>
+    public ParquetSchema BuildSchema()
     {
         var txn = new StructField("txn",
             NullableString("appId"),
             new DataField<long?>("version"),
             new DataField<long?>("lastUpdated"));
 
-        var add = new StructField("add",
+        var addFields = new List<Field>
+        {
             NullableString("path"),
             StringMap("partitionValues"),
             new DataField<long?>("size"),
             new DataField<long?>("modificationTime"),
             new DataField<bool?>("dataChange"),
             NullableString("stats"),
-            StringMap("tags"));
+            StringMap("tags"),
+        };
+        if (_withDeletionVector)
+        {
+            addFields.Add(DeletionVectorStruct());
+        }
 
-        var remove = new StructField("remove",
+        var add = new StructField("add", addFields.ToArray());
+
+        var removeFields = new List<Field>
+        {
             NullableString("path"),
             new DataField<long?>("deletionTimestamp"),
             new DataField<bool?>("dataChange"),
             new DataField<bool?>("extendedFileMetadata"),
             StringMap("partitionValues"),
-            new DataField<long?>("size"));
+            new DataField<long?>("size"),
+        };
+        if (_withDeletionVector)
+        {
+            removeFields.Add(DeletionVectorStruct());
+        }
+
+        var remove = new StructField("remove", removeFields.ToArray());
 
         var format = new StructField("format",
             NullableString("provider"),
@@ -266,6 +350,16 @@ internal sealed class CheckpointFixture
 
         return new ParquetSchema(txn, add, remove, metaData, protocol);
     }
+
+    /// <summary>The nested <c>deletionVector</c> struct schema. All sub-fields are nullable so a test can
+    /// omit a required one to model a malformed DV (fail-closed on read).</summary>
+    private static StructField DeletionVectorStruct() =>
+        new("deletionVector",
+            NullableString("storageType"),
+            NullableString("pathOrInlineDv"),
+            new DataField<int?>("offset"),
+            new DataField<int?>("sizeInBytes"),
+            new DataField<long?>("cardinality"));
 
     private static DataField NullableString(string name) => new DataField<string?>(name);
 

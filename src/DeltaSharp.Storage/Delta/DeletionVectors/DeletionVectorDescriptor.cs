@@ -127,6 +127,64 @@ internal sealed record DeletionVectorDescriptor(
     }
 
     /// <summary>
+    /// Validates the five already-extracted descriptor fields (from a JSON commit <b>or</b> a checkpoint's
+    /// Parquet columns) and builds a descriptor, throwing via <paramref name="malformed"/> — with a
+    /// field-level detail message — on any missing-required or invalid field. This is the <b>single source of
+    /// truth</b> for DV-descriptor validation, shared by <see cref="Parse"/> (JSON commit log) and the
+    /// checkpoint-column reader (#527), so the two decode paths cannot diverge and accept a DV the other
+    /// would reject. Fail-closed by construction: a present-but-invalid DV throws rather than yielding a
+    /// partial descriptor (silently dropping a DV would resurrect deleted rows).
+    /// </summary>
+    /// <exception cref="DeltaProtocolException">A required field is missing or a field is invalid (thrown by
+    /// <paramref name="malformed"/>).</exception>
+    internal static DeletionVectorDescriptor Create(
+        string? storageType,
+        string? pathOrInlineDv,
+        int? offset,
+        int? sizeInBytes,
+        long? cardinality,
+        Func<string, DeltaProtocolException> malformed)
+    {
+        ArgumentNullException.ThrowIfNull(malformed);
+
+        if (storageType is null)
+        {
+            throw malformed("deletionVector.storageType is missing");
+        }
+
+        if (storageType is not (StorageTypeUuidRelative or StorageTypeInline or StorageTypeAbsolutePath))
+        {
+            throw malformed($"deletionVector.storageType '{storageType}' is not one of 'u','i','p'");
+        }
+
+        string path = pathOrInlineDv ?? throw malformed("deletionVector.pathOrInlineDv is missing");
+        int size = sizeInBytes ?? throw malformed("deletionVector.sizeInBytes is missing");
+        long card = cardinality ?? throw malformed("deletionVector.cardinality is missing");
+
+        if (size < 0)
+        {
+            throw malformed("deletionVector.sizeInBytes is negative");
+        }
+
+        if (card < 0)
+        {
+            throw malformed("deletionVector.cardinality is negative");
+        }
+
+        if (storageType == StorageTypeInline && offset is not null)
+        {
+            throw malformed("an inline ('i') deletionVector must not carry an offset");
+        }
+
+        if (offset is { } o && o < 0)
+        {
+            throw malformed("deletionVector.offset is negative");
+        }
+
+        return new DeletionVectorDescriptor(storageType, path, offset, size, card);
+    }
+
+    /// <summary>
     /// Parses a <c>deletionVector</c> JSON object into a validated descriptor (fail closed on any malformed
     /// field), or returns <see langword="null"/> when the property is absent/JSON-null — an <c>add</c>/
     /// <c>remove</c> without a DV.
@@ -144,38 +202,17 @@ internal sealed record DeletionVectorDescriptor(
             throw Malformed(action, version, line, "deletionVector must be a JSON object");
         }
 
+        // Extract with JSON type-safety (RequireXxx throw on a wrong-typed or missing required field), then
+        // delegate the SEMANTIC validation to the shared Create factory so JSON and checkpoint decode agree.
         string storageType = RequireString(dv, "storageType", action, version, line);
-        if (storageType is not (StorageTypeUuidRelative or StorageTypeInline or StorageTypeAbsolutePath))
-        {
-            throw Malformed(action, version, line, $"deletionVector.storageType '{storageType}' is not one of 'u','i','p'");
-        }
-
         string pathOrInlineDv = RequireString(dv, "pathOrInlineDv", action, version, line);
         int sizeInBytes = RequireInt32(dv, "sizeInBytes", action, version, line);
         long cardinality = RequireInt64(dv, "cardinality", action, version, line);
         int? offset = OptionalInt32(dv, "offset", action, version, line);
 
-        if (sizeInBytes < 0)
-        {
-            throw Malformed(action, version, line, "deletionVector.sizeInBytes is negative");
-        }
-
-        if (cardinality < 0)
-        {
-            throw Malformed(action, version, line, "deletionVector.cardinality is negative");
-        }
-
-        if (storageType == StorageTypeInline && offset is not null)
-        {
-            throw Malformed(action, version, line, "an inline ('i') deletionVector must not carry an offset");
-        }
-
-        if (offset is { } o && o < 0)
-        {
-            throw Malformed(action, version, line, "deletionVector.offset is negative");
-        }
-
-        return new DeletionVectorDescriptor(storageType, pathOrInlineDv, offset, sizeInBytes, cardinality);
+        return Create(
+            storageType, pathOrInlineDv, offset, sizeInBytes, cardinality,
+            detail => Malformed(action, version, line, detail));
     }
 
     /// <summary>Writes this descriptor as the <c>deletionVector</c> object on the currently-open action.</summary>

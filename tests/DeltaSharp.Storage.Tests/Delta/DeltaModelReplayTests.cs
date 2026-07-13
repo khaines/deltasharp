@@ -182,7 +182,7 @@ public sealed class DeltaModelReplayTests : IDisposable
             {
                 sb.Append("add path=").Append(path).Append(" size=").Append(size)
                     .Append(" mtime=1 dc=True")
-                    .Append(" pv={year=").Append(year).Append("} tags={} stats=∅\n");
+                    .Append(" pv={year=").Append(year).Append("} tags={} stats=∅ dv=∅\n");
             }
 
             return sb.ToString();

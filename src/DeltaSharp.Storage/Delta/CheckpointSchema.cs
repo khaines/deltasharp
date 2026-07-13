@@ -33,6 +33,7 @@ internal sealed class CheckpointSchema
     public DataField? AddStats { get; private init; }
     public MapLeaves? AddPartitionValues { get; private init; }
     public MapLeaves? AddTags { get; private init; }
+    public DeletionVectorLeaves? AddDeletionVector { get; private init; }
 
     // remove
     public DataField? RemovePath { get; private init; }
@@ -41,6 +42,7 @@ internal sealed class CheckpointSchema
     public DataField? RemoveExtendedFileMetadata { get; private init; }
     public DataField? RemoveSize { get; private init; }
     public MapLeaves? RemovePartitionValues { get; private init; }
+    public DeletionVectorLeaves? RemoveDeletionVector { get; private init; }
 
     // metaData
     public DataField? MetaId { get; private init; }
@@ -67,6 +69,18 @@ internal sealed class CheckpointSchema
     /// <summary>A map's required-key and optional-value leaf columns.</summary>
     public sealed record MapLeaves(DataField Key, DataField Value);
 
+    /// <summary>The leaf columns of an <c>add</c>/<c>remove</c> nested <c>deletionVector</c> struct (protocol
+    /// "Deletion Vector Descriptor Schema"). Every leaf is resolved independently and may be null when a
+    /// writer omits a sub-column, but <see cref="StorageType"/> is the presence signal: a row carries a DV
+    /// iff its <see cref="StorageType"/> is non-null. Silently dropping any present DV would resurrect
+    /// deleted rows, so <see cref="CheckpointColumns"/> fails closed on a present-but-incomplete DV.</summary>
+    public sealed record DeletionVectorLeaves(
+        DataField? StorageType,
+        DataField? PathOrInlineDv,
+        DataField? Offset,
+        DataField? SizeInBytes,
+        DataField? Cardinality);
+
     public static CheckpointSchema Resolve(ParquetSchema schema)
     {
         StructField? add = Struct(schema, "add");
@@ -76,19 +90,13 @@ internal sealed class CheckpointSchema
         StructField? protocol = Struct(schema, "protocol");
         StructField? txn = Struct(schema, "txn");
 
-        // Fail closed (→ JSON-replay fallback) if this checkpoint carries deletion vectors. This build parses
-        // a DV descriptor from the JSON commit log (STORY-05.5.1) but not yet from the nested checkpoint
-        // struct column, and silently dropping a DV would resurrect deleted rows — the cardinal DV safety
-        // violation. A DeltaProtocolException here is caught by DeltaLog, which discards the checkpoint seed
-        // and reconstructs the snapshot from JSON commits, preserving every DV (tracked follow-up: parse the
-        // deletionVector column from checkpoints to restore the checkpoint fast path for DV tables).
-        if ((add is not null && Child(add, "deletionVector") is not null)
-            || (remove is not null && Child(remove, "deletionVector") is not null))
-        {
-            throw DeltaProtocolException.Unsupported(
-                "This Delta checkpoint carries deletion vectors, which this build does not yet decode from a "
-                + "checkpoint; falling back to JSON-commit replay so no deletion vector is silently dropped.");
-        }
+        // A DV-carrying checkpoint is now decoded directly (issue #527): the nested add.deletionVector /
+        // remove.deletionVector struct columns are resolved to their leaf DataFields below and reconstructed
+        // into a DeletionVectorDescriptor per row (fail-closed on a present-but-incomplete DV — never
+        // silently dropped, which would resurrect deleted rows). This restores the checkpoint fast path for
+        // aged Spark-DV tables whose early *.json commits have been log-cleaned.
+        StructField? addDv = add is null ? null : Child(add, "deletionVector") as StructField;
+        StructField? removeDv = remove is null ? null : Child(remove, "deletionVector") as StructField;
 
         return new CheckpointSchema
         {
@@ -99,6 +107,7 @@ internal sealed class CheckpointSchema
             AddStats = Scalar(add, "stats"),
             AddPartitionValues = Map(add, "partitionValues"),
             AddTags = Map(add, "tags"),
+            AddDeletionVector = DeletionVector(addDv),
 
             RemovePath = Scalar(remove, "path"),
             RemoveDeletionTimestamp = Scalar(remove, "deletionTimestamp"),
@@ -106,6 +115,7 @@ internal sealed class CheckpointSchema
             RemoveExtendedFileMetadata = Scalar(remove, "extendedFileMetadata"),
             RemoveSize = Scalar(remove, "size"),
             RemovePartitionValues = Map(remove, "partitionValues"),
+            RemoveDeletionVector = DeletionVector(removeDv),
 
             MetaId = Scalar(metaData, "id"),
             MetaName = Scalar(metaData, "name"),
@@ -151,10 +161,22 @@ internal sealed class CheckpointSchema
             }
         }
 
+        void AddDv(DeletionVectorLeaves? dv)
+        {
+            if (dv is not null)
+            {
+                Add(dv.StorageType);
+                Add(dv.PathOrInlineDv);
+                Add(dv.Offset);
+                Add(dv.SizeInBytes);
+                Add(dv.Cardinality);
+            }
+        }
+
         Add(AddPath); Add(AddSize); Add(AddModificationTime); Add(AddDataChange); Add(AddStats);
-        AddMap(AddPartitionValues); AddMap(AddTags);
+        AddMap(AddPartitionValues); AddMap(AddTags); AddDv(AddDeletionVector);
         Add(RemovePath); Add(RemoveDeletionTimestamp); Add(RemoveDataChange); Add(RemoveExtendedFileMetadata);
-        Add(RemoveSize); AddMap(RemovePartitionValues);
+        Add(RemoveSize); AddMap(RemovePartitionValues); AddDv(RemoveDeletionVector);
         Add(MetaId); Add(MetaName); Add(MetaDescription); Add(MetaSchemaString); Add(MetaCreatedTime);
         Add(FormatProvider); AddMap(FormatOptions); Add(MetaPartitionColumns); AddMap(MetaConfiguration);
         Add(ProtocolMinReaderVersion); Add(ProtocolMinWriterVersion); Add(ProtocolReaderFeatures);
@@ -200,6 +222,25 @@ internal sealed class CheckpointSchema
         }
 
         return map is { Key: DataField key, Value: DataField value } ? new MapLeaves(key, value) : null;
+    }
+
+    /// <summary>Resolves the leaf <see cref="DataField"/>s of an <c>add</c>/<c>remove</c> nested
+    /// <c>deletionVector</c> struct (issue #527). Returns null when the action has no DV struct; each leaf is
+    /// resolved independently so a writer that omits an optional sub-column (e.g. <c>offset</c>) still
+    /// resolves the rest. <see cref="DeletionVectorLeaves.StorageType"/> is the per-row presence signal.</summary>
+    private static DeletionVectorLeaves? DeletionVector(StructField? deletionVector)
+    {
+        if (deletionVector is null)
+        {
+            return null;
+        }
+
+        return new DeletionVectorLeaves(
+            Scalar(deletionVector, "storageType"),
+            Scalar(deletionVector, "pathOrInlineDv"),
+            Scalar(deletionVector, "offset"),
+            Scalar(deletionVector, "sizeInBytes"),
+            Scalar(deletionVector, "cardinality"));
     }
 
     private static DataField? ListElement(StructField? parent, string name)
