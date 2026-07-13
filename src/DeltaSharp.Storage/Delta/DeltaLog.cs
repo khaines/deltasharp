@@ -307,6 +307,21 @@ internal sealed class DeltaLog
         // Protocol negotiation (§2.10.5): fail closed on an unsupported reader version/feature BEFORE the
         // snapshot is served to a scan — never read past a feature this build does not implement.
         ProtocolSupport.EnsureReadable(snapshot.Protocol);
+
+        // Column-mapping mode gate (§2.12.3; STORY-05.4.3 AC4). The protocol feature gate above opens for a
+        // column-mapped (name OR id) table; this build serves 'name' mode but (1) rejects a mode declared
+        // without protocol support (protocol-upgrade error) and (2) rejects 'id' mode fail-closed (id
+        // resolves columns by Parquet field_id — not implemented, deferred to #523). This is the single
+        // read-side choke point, so EVERY load (including time travel) of an unsupported column-mapping table
+        // is rejected before any data column is resolved — never a positional/name misread.
+        ColumnMappingMode mode = ColumnMapping.ResolveMode(snapshot.Metadata.Configuration);
+        ColumnMapping.EnsureModeGate(mode, snapshot.Protocol);
+
+        // Name-mode resolution invariant (STORY-05.4.3 / #191 HIGH). Reject a poisoned/malformed name-mode
+        // table (duplicate physicalName across data+partition fields, duplicate/missing/out-of-range id)
+        // fail-closed at this single choke point — a duplicate physical name would otherwise let one column's
+        // value be served under another column's logical name with NO exception (a silent misread).
+        ColumnMapping.ValidateNameModeSchema(mode, snapshot.Schema, snapshot.Metadata.Configuration);
         return snapshot;
     }
 
