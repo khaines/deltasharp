@@ -3,6 +3,7 @@ using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
 using DeltaSharp.Storage.Delta.DeletionVectors;
+using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Storage.Reading;
 using DeltaSharp.Storage.Writing;
 using DeltaSharp.Types;
@@ -77,7 +78,7 @@ public sealed class DeletionVectorReadWriteTests : IDisposable
     }
 
     [Fact]
-    public async Task Delete_UpdatesResidualNumRecords_OnTheDvCarryingAdd()
+    public async Task Delete_KeepsPhysicalNumRecords_OnTheDvCarryingAdd()
     {
         await CreateDeletionVectorTableAsync(Batch((10, "x"), (20, "y"), (30, "z"), (40, "w")));
 
@@ -85,12 +86,20 @@ public sealed class DeletionVectorReadWriteTests : IDisposable
         var delete = new DeltaDelete(backend);
         await delete.DeleteAsync(WhereId(id => id == 20));
 
-        // Writer requirement: the DV-carrying add reports the residual physical count (4 − 1 = 3) in stats.
+        // Writer requirement (matching Spark): the DV-carrying add reports the PHYSICAL data-file row count
+        // (4 — the total rows in the Parquet file, NOT the residual 4−1=3) in stats.numRecords; the residual
+        // logical count is numRecords − cardinality. TightBounds is cleared.
         Snapshot snapshot = await new DeltaLog(backend).LoadSnapshotAsync();
         AddFileAction dvAdd = Assert.Single(snapshot.ActiveFiles.Where(a => a.DeletionVector is not null));
         Assert.NotNull(dvAdd.Stats);
-        Assert.Equal(3L, dvAdd.Stats!.NumRecords);
+        Assert.Equal(4L, dvAdd.Stats!.NumRecords);
+        Assert.False(dvAdd.Stats!.TightBounds);
         Assert.Equal(1L, dvAdd.DeletionVector!.Cardinality);
+
+        // The scan still excludes exactly id 20 (survivors by value), so physical numRecords did not leak a row.
+        Assert.Equal(
+            new (long, string?)[] { (10L, "x"), (30L, "z"), (40L, "w") },
+            (await ReadLatestAsync()).OrderBy(r => r.Item1).ToList());
     }
 
     // ------------------------------------------------------------------ AC2 edge: whole-file delete
@@ -213,7 +222,7 @@ public sealed class DeletionVectorReadWriteTests : IDisposable
             add.PartitionValues, add.Size, DeletionVector: null);
         var residualAdd = new AddFileAction(
             add.Path, add.PartitionValues, add.Size, ModificationTime: 1, DataChange: true,
-            add.Stats! with { NumRecords = 3 }, add.Tags, inline);
+            add.Stats! with { NumRecords = 5 }, add.Tags, inline); // physical count (5), matching Spark
 
         var committer = new DeltaCommitter(backend);
         await committer.CommitAsync(
@@ -249,17 +258,137 @@ public sealed class DeletionVectorReadWriteTests : IDisposable
             add.PartitionValues, add.Size, DeletionVector: null);
         var poisonedAdd = new AddFileAction(
             add.Path, add.PartitionValues, add.Size, ModificationTime: 1, DataChange: true,
-            add.Stats! with { NumRecords = 3 }, add.Tags, poisoned);
+            add.Stats! with { NumRecords = 5 }, add.Tags, poisoned); // honest physical count (5); the DV lies
 
         await new DeltaCommitter(backend).CommitAsync(
             readSnapshot,
             new DeltaAction[] { remove, poisonedAdd },
             DeltaReadScope.ReadFiles(new[] { add.Path }));
 
-        await Assert.ThrowsAsync<DeltaReadException>(() => ReadLatestAsync());
+        // The read fails closed (position 99 ≥ the file's 5 physical rows) with a TYPED read fault, and no
+        // rows leak — a "DV silently ignored" mutant would instead return the survivors and fail this test.
+        var ex = await Assert.ThrowsAsync<DeltaReadException>(() => ReadLatestAsync());
+        Assert.Contains("deletion vector", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // ------------------------------------------------------------------ reliability: delete-twice DV union
+
+    [Fact]
+    public async Task Delete_Twice_UnionsDeletionVectors_NoResurrection()
+    {
+        await CreateDeletionVectorTableAsync(Batch((1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")));
+        var backend = new LocalFileSystemBackend(_root);
+
+        // First DELETE removes id 2 (physical position 1) → DV {1}, cardinality 1, physical numRecords 5.
+        DeleteResult r1 = await NewDelete(backend, "dv-first").DeleteAsync(WhereId(id => id == 2));
+        Assert.Equal(1, r1.RowsDeleted);
+        Assert.Equal(1, r1.FilesWithDeletionVector);
+
+        // Second DELETE removes id 4 (physical position 3). It must read the prior DV back through the
+        // physical-numRecords semantics (numRecords IS the physical count 5, so a "numRecords + cardinality"
+        // reader would over-count the file and throw) and UNION with it — never resurrecting id 2.
+        DeleteResult r2 = await NewDelete(backend, "dv-second").DeleteAsync(WhereId(id => id == 4));
+        Assert.Equal(1, r2.RowsDeleted);              // only the NEW row counts toward RowsDeleted
+        Assert.Equal(1, r2.FilesWithDeletionVector);
+
+        Snapshot snap = await new DeltaLog(backend).LoadSnapshotAsync();
+        AddFileAction dvAdd = Assert.Single(snap.ActiveFiles);         // single active file (never rewritten)
+        Assert.NotNull(dvAdd.DeletionVector);
+        Assert.Equal(2L, dvAdd.DeletionVector!.Cardinality);          // the UNION {1,3}, not a lone {3}
+        Assert.Equal(5L, dvAdd.Stats!.NumRecords);                    // physical count unchanged by DV growth
+
+        // Survivors: ids 1, 3, 5 — id 2 stays deleted (no resurrection), id 4 now deleted.
+        Assert.Equal(
+            new (long, string?)[] { (1L, "a"), (3L, "c"), (5L, "e") },
+            (await ReadLatestAsync()).OrderBy(r => r.Item1).ToList());
+    }
+
+    // ------------------------------------------------------------------ reliability: row-group boundary
+
+    [Fact]
+    public async Task Delete_PositionsStraddlingRowGroupBoundary_ExactSurvivorsOnRead()
+    {
+        await CreateDeletionVectorTableAsync(
+            Batch((1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e"), (6, "f")));
+
+        var backend = new LocalFileSystemBackend(_root);
+        AddFileAction add = Assert.Single((await new DeltaLog(backend).LoadSnapshotAsync()).ActiveFiles);
+
+        // Re-lay the SAME six rows into 2-row row groups (3 groups) so the reader yields 3 batches and the
+        // deleted positions {1,2} straddle the group-0/group-1 boundary — exercising the running fileRowOffset
+        // arithmetic in BOTH the DELETE writer's plan and the read-path exclusion. Row VALUES are unchanged,
+        // so the physical row count (6) still matches stats.numRecords.
+        await RewriteWithRowGroupsAsync(
+            add.Path, rowGroupRowLimit: 2,
+            Batch((1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e"), (6, "f")));
+
+        DeleteResult result = await NewDelete(backend, "straddle").DeleteAsync(WhereId(id => id is 2 or 3));
+        Assert.Equal(2, result.RowsDeleted);
+        Assert.Equal(1, result.FilesWithDeletionVector);
+
+        // Positions 1 and 2 deleted → survivors sit at positions 0,3,4,5 = ids 1,4,5,6.
+        Assert.Equal(
+            new (long, string?)[] { (1L, "a"), (4L, "d"), (5L, "e"), (6L, "f") },
+            (await ReadLatestAsync()).OrderBy(r => r.Item1).ToList());
+    }
+
+    // ------------------------------------------------------------------ quality edges: none / last-row
+
+    [Fact]
+    public async Task Delete_NoRowMatches_IsNoOp_WritesNoDeletionVector()
+    {
+        long v0 = await CreateDeletionVectorTableAsync(Batch((1, "a"), (2, "b"), (3, "c")));
+        var backend = new LocalFileSystemBackend(_root);
+
+        DeleteResult result = await NewDelete(backend, "none").DeleteAsync(WhereId(id => id == 999));
+
+        // An empty predicate match is a pure no-op: no commit, no DV file, no version bump.
+        Assert.Null(result.CommittedVersion);
+        Assert.Equal(0, result.RowsDeleted);
+        Assert.Equal(0, result.FilesWithDeletionVector);
+        Assert.Equal(0, CountFiles("*.bin"));
+        Assert.Equal(v0, (await new DeltaLog(backend).LoadSnapshotAsync()).Version);
+
+        Assert.Equal(
+            new (long, string?)[] { (1L, "a"), (2L, "b"), (3L, "c") },
+            (await ReadLatestAsync()).OrderBy(r => r.Item1).ToList());
+    }
+
+    [Fact]
+    public async Task Delete_LastRowInFile_ExcludesOnlyThatRow()
+    {
+        await CreateDeletionVectorTableAsync(Batch((1, "a"), (2, "b"), (3, "c")));
+        var backend = new LocalFileSystemBackend(_root);
+
+        // Deleting the final physical position (2) must exclude exactly that row on read (offset arithmetic
+        // must not run off the end of the last batch).
+        DeleteResult result = await NewDelete(backend, "last").DeleteAsync(WhereId(id => id == 3));
+        Assert.Equal(1, result.RowsDeleted);
+        Assert.Equal(1, result.FilesWithDeletionVector);
+
+        Snapshot snap = await new DeltaLog(backend).LoadSnapshotAsync();
+        AddFileAction dvAdd = Assert.Single(snap.ActiveFiles);
+        Assert.Equal(1L, dvAdd.DeletionVector!.Cardinality);
+        Assert.Equal(3L, dvAdd.Stats!.NumRecords);
+
+        Assert.Equal(
+            new (long, string?)[] { (1L, "a"), (2L, "b") },
+            (await ReadLatestAsync()).OrderBy(r => r.Item1).ToList());
     }
 
     // ------------------------------------------------------------------ helpers
+
+    private static DeltaDelete NewDelete(LocalFileSystemBackend backend, string idSeed) =>
+        new(backend, new DeltaLog(backend), new DeltaCommitter(backend),
+            idSource: new SeededDeletionVectorIdSource(idSeed));
+
+    private async Task RewriteWithRowGroupsAsync(string relativePath, int rowGroupRowLimit, ColumnBatch batch)
+    {
+        var writer = new ParquetFileWriter(rowGroupRowLimit);
+        using var buffer = new MemoryStream();
+        await writer.WriteAsync(buffer, FlatSchema, new[] { batch }, CancellationToken.None);
+        await File.WriteAllBytesAsync(Path.Combine(_root, relativePath), buffer.ToArray());
+    }
 
     private async Task<long> CreateDeletionVectorTableAsync(params ColumnBatch[] batches)
     {

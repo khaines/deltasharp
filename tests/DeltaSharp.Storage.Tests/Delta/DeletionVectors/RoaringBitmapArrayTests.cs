@@ -38,29 +38,83 @@ public sealed class RoaringBitmapArrayTests
     }
 
     [Fact]
-    public void Serialize_MatchesSparkNativeBytes_ForProtocolExample3()
+    public void Serialize_MatchesRealSparkGoldenPayload_ForPositionZero()
     {
-        // Writer interop oracle: serializing the protocol inline Example 3 row set MUST reproduce the exact
-        // 40-byte native RoaringBitmapArray payload that Delta/Spark embeds in that example (the Base85-decoded
-        // bytes of "wi5b=000010000siXQKl0rr91000f55c8Xg0@@D72lkbi5=-{L"). This proves our writer is
-        // byte-identical to Spark's, not merely round-trippable through our own reader. Layout: big-endian
-        // framing (magic 6439D3D0, numberOfBitmaps 00000001, bitmapSize 0000001C) + little-endian 32-bit
-        // roaring (cookie 303A NO_RUN, size 1, key/card 0000 0005, offset 00000010, values 3,4,7,11,18,29).
-        byte[] serialized = RoaringBitmapArray.Serialize(new long[] { 3, 4, 7, 11, 18, 29 });
-        string hex = Convert.ToHexString(serialized).ToLowerInvariant();
+        // Byte-identical interop oracle (verified against the REAL Spark golden
+        // deletion_vector_10ffbe3a-…​.bin, whose 34-byte RoaringBitmapArray payload deletes exactly {0}).
+        // Reproducing these exact bytes proves a Spark/Databricks reader can consume this build's output.
+        // Layout: portable magic 0x6439D3D1 (LE d1 d3 39 64), 8-byte LE numBuckets=1, 4-byte LE key=0, then a
+        // little-endian 32-bit roaring (cookie 303A NO_RUN, size 1, key/card 0000/0000, offset 00000010,
+        // value 0000).
+        byte[] serialized = RoaringBitmapArray.Serialize(new long[] { 0 });
         Assert.Equal(
-            "6439d3d0000000010000001c3a3000000100000000000500100000000300040007000b0012001d00",
-            hex);
+            "d1d339640100000000000000000000003a3000000100000000000000100000000000",
+            Convert.ToHexString(serialized).ToLowerInvariant());
+    }
+
+    [Fact]
+    public void Deserialize_RealSparkGoldenPayload_DecodesPositionZero()
+    {
+        // The same 34-byte real Spark payload, decoded through the production path → deletes exactly {0}
+        // (cardinality 1) in a 3-row physical file (the golden's data file has numRecords=3).
+        byte[] payload = Convert.FromHexString(
+            "d1d339640100000000000000000000003a3000000100000000000000100000000000");
+        long[] decoded = RoaringBitmapArray.Deserialize(payload, numRecords: 3, expectedCardinality: 1);
+        Assert.Equal(new long[] { 0 }, decoded);
+    }
+
+    [Fact]
+    public void Serialize_MatchesPortableBytes_ForProtocolExample3RowSet()
+    {
+        // The protocol inline "Example 3" row set {3,4,7,11,18,29}, serialized in this build's ONE format —
+        // the portable little-endian RoaringBitmapArray. (The protocol's inline example illustrates the
+        // DEPRECATED native/big-endian serializer, which real Spark does not persist and which this build
+        // neither reads nor writes; this pins our portable output byte-for-byte.)
+        byte[] serialized = RoaringBitmapArray.Serialize(new long[] { 3, 4, 7, 11, 18, 29 });
+        Assert.Equal(
+            "d1d339640100000000000000000000003a3000000100000000000500100000000300040007000b0012001d00",
+            Convert.ToHexString(serialized).ToLowerInvariant());
+    }
+
+    [Fact]
+    public void RoundTrip_MultiBucketMultiContainer_IsByteStableAndDecodes()
+    {
+        // A real-ish multi-container / multi-bucket case: {0,5} and 999999 live in the SAME high-32 bucket
+        // (key 0) but DIFFERENT 16-bit containers (0 and 15), while 2^32+10 opens a SECOND bucket (key 1).
+        // Assert both byte-stability (the exact portable-LE layout: numBuckets=2, two per-bucket keys) and an
+        // exact round-trip decode.
+        long[] positions = { 0, 5, 999999, (1L << 32) + 10 };
+        byte[] serialized = RoaringBitmapArray.Serialize(positions);
+        Assert.Equal(
+            "d1d339640200000000000000000000003a30000002000000000001000f000000180000001c00000000000"
+            + "5003f42010000003a3000000100000000000000100000000a00",
+            Convert.ToHexString(serialized).ToLowerInvariant());
+
+        long[] decoded = RoaringBitmapArray.Deserialize(
+            serialized, numRecords: (1L << 32) + 11, expectedCardinality: positions.Length);
+        Assert.Equal(positions, decoded);
     }
 
     [Fact]
     public void Deserialize_BadMagic_FailsClosed()
     {
         byte[] serialized = RoaringBitmapArray.Serialize(new long[] { 1, 2, 3 });
-        serialized[0] ^= 0xFF; // corrupt the big-endian magic number
+        serialized[0] ^= 0xFF; // corrupt the low byte of the little-endian portable magic number
 
-        Assert.Throws<DeltaStorageException>(
+        var ex = Assert.Throws<DeltaStorageException>(
             () => RoaringBitmapArray.Deserialize(serialized, numRecords: 100, expectedCardinality: 3));
+        Assert.Equal(StorageErrorKind.CorruptData, ex.Kind);
+    }
+
+    [Fact]
+    public void Deserialize_NegativeCardinality_FailsClosedTyped()
+    {
+        // A descriptor-supplied negative cardinality is untrusted input and must fail closed as a TYPED
+        // storage fault (never an untyped ArgumentOutOfRangeException leaking from the decode edge).
+        byte[] serialized = RoaringBitmapArray.Serialize(new long[] { 1 });
+        var ex = Assert.Throws<DeltaStorageException>(
+            () => RoaringBitmapArray.Deserialize(serialized, numRecords: 100, expectedCardinality: -1));
+        Assert.Equal(StorageErrorKind.CorruptData, ex.Kind);
     }
 
     [Fact]

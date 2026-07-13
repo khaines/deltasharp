@@ -67,9 +67,32 @@ internal static class DeletionVectorStore
         string relativePath = descriptor.ResolveRelativePath();
         int offset = descriptor.Offset ?? 0;
         long frameLength = (long)descriptor.SizeInBytes + DataSizeLength + ChecksumLength;
+
+        // FIX (typed decode contract): validate the descriptor's byte range against the ACTUAL object length
+        // before reading, so an offset-past-EOF or an offset+frameLength that runs past the .bin file fails
+        // closed as a typed DeltaStorageException (the file's convention) rather than an untyped
+        // ArgumentOutOfRangeException leaking from the backend's range read.
+        StorageObjectInfo? head = await backend.HeadAsync(relativePath, cancellationToken).ConfigureAwait(false);
+        if (head is not { } info)
+        {
+            throw DeltaStorageException.CorruptData(
+                "A Delta deletion vector file referenced by its descriptor does not exist; the DV is corrupt.");
+        }
+
+        if (offset < 0 || frameLength < 0 || (long)offset + frameLength > info.Length)
+        {
+            throw DeltaStorageException.CorruptData(
+                "A Delta deletion vector's descriptor offset+size runs past the end of (or before the start of) "
+                + "its .bin file; the DV is corrupt.");
+        }
+
         byte[] frame = await ReadRangeAsync(backend, relativePath, offset, frameLength, cancellationToken)
             .ConfigureAwait(false);
 
+        // FIX (integrity — DO NOT RELAX): the on-disk dataSize must EXACTLY equal the descriptor's sizeInBytes.
+        // Verified against real Spark goldens: a descriptor's sizeInBytes always equals its own .bin's dataSize
+        // (34→34 and 36→36), and dataSize == filesize − 9 (version byte + 4-byte dataSize + 4-byte CRC-32). A
+        // disagreement is a corrupt/mis-paired descriptor; relaxing this equality would weaken integrity.
         int dataSize = BinaryPrimitives.ReadInt32BigEndian(frame.AsSpan(0, DataSizeLength));
         if (dataSize != descriptor.SizeInBytes)
         {

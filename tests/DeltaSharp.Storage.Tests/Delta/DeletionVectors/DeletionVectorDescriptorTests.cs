@@ -5,40 +5,47 @@ using Xunit;
 namespace DeltaSharp.Storage.Tests.Delta.DeletionVectors;
 
 /// <summary>
-/// Tests for <see cref="DeletionVectorDescriptor"/> parse/serialize, derived fields, and — most importantly
-/// — the <b>interop oracle</b>: the Delta protocol's "JSON Example 3 — Inline" DV
-/// (<c>pathOrInlineDv = "wi5b=000010000siXQKl0rr91000f55c8Xg0@@D72lkbi5=-{L"</c>, <c>sizeInBytes = 40</c>,
-/// <c>cardinality = 6</c>) MUST decode to the row indexes {3, 4, 7, 11, 18, 29} the protocol states. This
-/// is a hand-verified, spec-provided vector (not a self-round-trip), so it proves the Z85 +
-/// RoaringBitmapArray pipeline reads bytes a Spark/Databricks writer produced.
+/// Tests for <see cref="DeletionVectorDescriptor"/> parse/serialize, derived fields, and the inline Z85 +
+/// <see cref="RoaringBitmapArray"/> decode pipeline. The definitive external interop oracle lives in
+/// <c>DeletionVectorStoreTests</c>/<c>RoaringBitmapArrayTests</c> (real Spark on-disk <c>.bin</c> goldens);
+/// here we pin the inline (<c>'i'</c>) storage path on the format this build actually reads and writes — the
+/// <b>portable little-endian</b> RoaringBitmapArray. (The Delta protocol's inline "JSON Example 3" prints the
+/// DEPRECATED native/big-endian serialization, which real Spark does not persist and which this build neither
+/// reads nor writes; the portable serialization of the same row set {3,4,7,11,18,29} is 44 bytes, not 40.)
 /// </summary>
 public sealed class DeletionVectorDescriptorTests
 {
-    // The Delta protocol "Deletion Vectors" §"JSON Example 3 — Inline" oracle.
-    private const string ProtocolInlineExample3 = "wi5b=000010000siXQKl0rr91000f55c8Xg0@@D72lkbi5=-{L";
+    // Portable-LE inline oracle for the row set {3,4,7,11,18,29}: the Z85 encoding of this build's 44-byte
+    // portable RoaringBitmapArray (independently computed; cross-checked here against DeltaSharp's Z85 encode
+    // and decode). sizeInBytes = 44, cardinality = 6.
+    private const string PortableInlineRowSet = "^Bg9^0rr910000000000iXQKl0rr91000f55c8Xg0@@D72lkbi5=-{L";
 
     [Fact]
-    public void ProtocolInlineExample3_DecodesToDocumentedRowIndexes()
+    public void Inline_PortableRowSet_DecodesToDocumentedRowIndexes()
     {
-        var descriptor = new DeletionVectorDescriptor(
-            DeletionVectorDescriptor.StorageTypeInline,
-            ProtocolInlineExample3,
-            Offset: null,
-            SizeInBytes: 40,
-            Cardinality: 6);
+        // Build an inline descriptor from this build's portable serialization and prove the whole inline
+        // pipeline (Z85 encode → descriptor → Z85 decode → RoaringBitmapArray decode) reconstructs the exact
+        // documented row indexes. The Z85 string is also pinned to the independently-computed oracle, so a
+        // regression in DeltaSharp's Z85 encoder would fail here too.
+        byte[] raw = RoaringBitmapArray.Serialize(new long[] { 3, 4, 7, 11, 18, 29 });
+        var descriptor = DeletionVectorDescriptor.ForInline(raw, cardinality: 6);
 
-        byte[] raw = descriptor.DecodeInlineBytes();
-        Assert.Equal(40, raw.Length);
+        Assert.Equal(44, descriptor.SizeInBytes);
+        Assert.Equal(PortableInlineRowSet, descriptor.PathOrInlineDv);
 
-        long[] positions = RoaringBitmapArray.Deserialize(raw, numRecords: 100, expectedCardinality: 6);
+        long[] positions = RoaringBitmapArray.Deserialize(
+            descriptor.DecodeInlineBytes(), numRecords: 100, expectedCardinality: 6);
         Assert.Equal(new long[] { 3, 4, 7, 11, 18, 29 }, positions);
     }
 
     [Fact]
-    public void Parse_InlineExample3Json_RoundTripsThroughDescriptor()
+    public void Parse_InlinePortableJson_RoundTripsThroughDescriptor()
     {
+        // A committed 'i' (inline) DV action carrying the portable-LE bytes: parse it exactly as the log
+        // reader would, then decode through the production path. Uses the independently-computed Z85 oracle
+        // string, so this cross-verifies DeltaSharp's Z85 DECODER against an external encoder.
         const string json = """
-            {"deletionVector":{"storageType":"i","pathOrInlineDv":"wi5b=000010000siXQKl0rr91000f55c8Xg0@@D72lkbi5=-{L","sizeInBytes":40,"cardinality":6}}
+            {"deletionVector":{"storageType":"i","pathOrInlineDv":"^Bg9^0rr910000000000iXQKl0rr91000f55c8Xg0@@D72lkbi5=-{L","sizeInBytes":44,"cardinality":6}}
             """;
         using JsonDocument doc = JsonDocument.Parse(json);
 
@@ -48,6 +55,7 @@ public sealed class DeletionVectorDescriptorTests
         Assert.NotNull(descriptor);
         Assert.True(descriptor!.IsInline);
         Assert.Equal(6, descriptor.Cardinality);
+        Assert.Equal(44, descriptor.SizeInBytes);
         long[] positions = RoaringBitmapArray.Deserialize(
             descriptor.DecodeInlineBytes(), numRecords: 100, expectedCardinality: 6);
         Assert.Equal(new long[] { 3, 4, 7, 11, 18, 29 }, positions);

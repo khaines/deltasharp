@@ -37,13 +37,14 @@ public readonly record struct DeltaSnapshotInfo(long Version, StructType Schema)
 /// <see cref="ReadBatchesAsync"/> (at execution), so a concurrent commit between the two can never shift
 /// the data read.</para>
 ///
-/// <para><b>Scope (#499).</b> Base + time-travel reads of non-evolved / current-schema files. An active
+/// <para><b>Scope (#499).</b> Base + time-travel reads of non-evolved / current-schema files, including
+/// committed <b>deletion vectors</b> (#192): an active file's DV is decoded and its deleted physical row
+/// positions are excluded on read (both inline and on-disk <c>.bin</c> forms). An active
 /// file physically narrower than the snapshot schema (additive schema evolution, #190) needs read-side
 /// null-fill (#497), which is not implemented here: such a file fails <b>closed</b> with a clear
 /// <see cref="DeltaReadSchemaEvolutionException"/> (mirroring OPTIMIZE's schema-evolution guard) rather
 /// than fabricating values. Predicate/column pushdown into the scan, <c>commitInfo.timestamp</c>
-/// resolution (#500), path authorization (#431), and CDF/deletion-vector reads (#192/#193) are out of
-/// scope.</para>
+/// resolution (#500), path authorization (#431), and CDF reads (#193) are out of scope.</para>
 /// </summary>
 public sealed class DeltaReadSource : IDisposable
 {
@@ -197,23 +198,51 @@ public sealed class DeltaReadSource : IDisposable
         // Load the committed deletion vector (if any) BEFORE reading data, so a poisoned/malformed DV fails
         // the read closed here rather than after emitting rows (the cardinal DV safety rule: never return a
         // row a DV invalidated because the DV failed to decode). The DV's row positions are PHYSICAL,
-        // file-relative ordinals, so we validate them against the file's PHYSICAL record count — the residual
-        // stats.numRecords (records visible after the DV) PLUS the DV cardinality (records removed).
+        // file-relative ordinals validated against the file's PHYSICAL record count.
         DeletionVectorPositions? deletionVector = null;
         if (add.DeletionVector is { } descriptor)
         {
-            long? residual = add.Stats?.NumRecords;
-            if (residual is not { } residualRecords)
+            long? declared = add.Stats?.NumRecords;
+            if (declared is not { } declaredPhysicalRecords)
             {
                 // A DV-carrying add MUST record numRecords in stats (Delta writer requirement). Without the
-                // physical record count we cannot bound-check the DV positions, so fail closed.
+                // physical record count we cannot cross-check the file, so fail closed.
                 throw new DeltaReadException(
                     $"Active file '{add.Path}' carries a deletion vector but its add action has no "
                     + "stats.numRecords, so the deleted row positions cannot be validated. The read fails "
                     + "closed rather than risk returning rows a deletion vector invalidated.");
             }
 
-            long physicalRecords = checked(residualRecords + descriptor.Cardinality);
+            // FIX #4 (DoS): bound the DV decode by the file's REAL physical row count — read from the Parquet
+            // footer (metadata only, no page decode), never the attacker-controlled descriptor/stats. A
+            // malicious 512 MiB .bin can no longer force an allocation: the ceiling is the true row count, so
+            // any oversized declared size / out-of-range position / over-large cardinality fails closed first.
+            long physicalRecords;
+            try
+            {
+                Stream metaStream = await _backend.OpenReadAsync(add.Path, cancellationToken).ConfigureAwait(false);
+                await using (metaStream.ConfigureAwait(false))
+                {
+                    physicalRecords = await _reader.GetRowCountAsync(metaStream, cancellationToken).ConfigureAwait(false);
+                }
+            }
+            catch (DeltaStorageException ex)
+            {
+                throw new DeltaReadException(ex.Message, ex);
+            }
+
+            // FIX #2 (numRecords semantics): on a DV-carrying add, stats.numRecords IS the PHYSICAL data-file
+            // row count (matching Spark), NOT the residual (post-deletion) count. It must therefore equal the
+            // file's real row count; a disagreement is a corrupt/lying stat → fail closed. (The residual
+            // logical count, if ever needed, is numRecords − cardinality.)
+            if (declaredPhysicalRecords != physicalRecords)
+            {
+                throw new DeltaReadException(
+                    $"Active file '{add.Path}' declares stats.numRecords={declaredPhysicalRecords} but its "
+                    + $"Parquet file contains {physicalRecords} physical row(s); a DV-carrying add's numRecords "
+                    + "must equal the physical row count, so the read fails closed.");
+            }
+
             long[] positions;
             try
             {
@@ -275,40 +304,37 @@ public sealed class DeltaReadSource : IDisposable
         }
     }
 
-    // The decoded deletion-vector positions for one active file: a set of PHYSICAL, file-relative row
-    // ordinals to exclude, plus the file's declared physical record count for a post-read consistency check.
+    // The decoded deletion-vector positions for one active file: the sorted, distinct set of PHYSICAL,
+    // file-relative row ordinals to exclude, plus the file's physical record count for a post-read
+    // consistency check. FIX #4: a SINGLE materialization — the sorted long[] the decoder already produced —
+    // with binary-search membership, so the read path never holds both a long[] AND a HashSet of the set.
     private sealed class DeletionVectorPositions
     {
-        private readonly HashSet<long> _deleted;
+        private readonly long[] _deleted;
 
-        public DeletionVectorPositions(long[] positions, long physicalRecords)
+        public DeletionVectorPositions(long[] sortedDistinctPositions, long physicalRecords)
         {
-            _deleted = new HashSet<long>(positions.Length);
-            foreach (long position in positions)
-            {
-                _deleted.Add(position);
-            }
-
+            // RoaringBitmapArray.Deserialize guarantees ascending, distinct positions, so the array is a
+            // ready-made sorted-set membership structure (Array.BinarySearch) with no second copy.
+            _deleted = sortedDistinctPositions;
             PhysicalRecords = physicalRecords;
         }
 
         public long PhysicalRecords { get; }
 
-        public int Cardinality => _deleted.Count;
-
-        public bool IsDeleted(long filePosition) => _deleted.Contains(filePosition);
+        public bool IsDeleted(long filePosition) => Array.BinarySearch(_deleted, filePosition) >= 0;
 
         // The Parquet file's actual physical row count (summed across row groups) must match the record count
-        // the DV was validated against — a mismatch means the add's stats.numRecords + cardinality disagree
-        // with the physical file, so the DV positions cannot be trusted to map to the right rows. Fail closed.
+        // the DV was validated against — a mismatch means the file changed under the DV, so the positions
+        // cannot be trusted to map to the right rows. Fail closed.
         public void EnsureFullyConsumed(long physicalRowsRead, string path)
         {
             if (physicalRowsRead != PhysicalRecords)
             {
                 throw new DeltaReadException(
                     $"Active file '{path}' carries a deletion vector validated against {PhysicalRecords} "
-                    + $"physical records, but the Parquet file contains {physicalRowsRead}. The stats.numRecords "
-                    + "and deletion-vector cardinality disagree with the data file, so the read fails closed.");
+                    + $"physical records, but the Parquet file produced {physicalRowsRead} on read. The "
+                    + "deletion vector disagrees with the data file, so the read fails closed.");
             }
         }
     }

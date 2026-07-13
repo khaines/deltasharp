@@ -43,11 +43,78 @@ public sealed class DeletionVectorStoreTests : IDisposable
         return (descriptor.ResolveRelativePath(), descriptor);
     }
 
+    // Deterministic DV-file UUIDs for tests (src/ bans Guid.NewGuid for DV-id generation; tests prefer the
+    // seeded source). The UUID only names the on-disk .bin, so a fixed seed keeps runs reproducible.
+    private static Guid SeededUuid(string seed) => new SeededDeletionVectorIdSource(seed).NextId();
+
+    // Real Spark on-disk deletion-vector .bin golden — verified byte-for-byte against Spark's
+    // dv-with-columnmapping/deletion_vector_10ffbe3a-...bin. Full 43-byte single-DV frame that deletes EXACTLY
+    // physical row {0} (cardinality 1): version 0x01, big-endian dataSize 0x00000022 (34), then a 34-byte
+    // portable-LE RoaringBitmapArray, then big-endian CRC-32 0xf7a6b4b5. Embedded inline so the interop test
+    // is hermetic/offline (filesize == 9 + dataSize).
+    private const string RealSparkGoldenBinHex =
+        "0100000022d1d339640100000000000000000000003a3000000100000000000000100000000000f7a6b4b5";
+
+    // The CRC-covered payload (golden bytes 5..38): the serialized RoaringBitmapArray Spark writes for {0}.
+    // magic d1 d3 39 64 = 1681511377 read little-endian; numBuckets = 1 (8B LE); bucket key = 0 (4B LE);
+    // then a standard little-endian 32-bit RoaringBitmap (cookie 0x303a) holding the single value 0.
+    private const string RealSparkGoldenPayloadHex =
+        "d1d339640100000000000000000000003a3000000100000000000000100000000000";
+
+    [Fact]
+    public async Task Load_RealSparkGoldenBin_DecodesExactlyPositionZero()
+    {
+        using LocalFileSystemBackend backend = Backend();
+        Guid uuid = SeededUuid("golden-load");
+        (string relativePath, _) = DescribeFor(uuid, 1, 34, 1);
+
+        // Land the REAL Spark bytes on disk verbatim (no DeltaSharp writer involved), then decode them through
+        // the production read path — proving DeltaSharp reads genuine Spark deletion vectors.
+        byte[] golden = Convert.FromHexString(RealSparkGoldenBinHex);
+        Assert.Equal(43, golden.Length); // filesize == 9 + dataSize(34)
+        Assert.True(await backend.PutIfAbsentAsync(relativePath, golden, CancellationToken.None));
+
+        DeletionVectorDescriptor descriptor =
+            DeletionVectorDescriptor.ForRelativePath(
+                DeletionVectorDescriptor.BuildRelativePathOrInlineDv(string.Empty, uuid),
+                offset: 1, sizeInBytes: 34, cardinality: 1);
+
+        long[] decoded = await DeletionVectorStore.LoadAsync(
+            backend, descriptor, numRecords: 3, CancellationToken.None);
+
+        // Ground truth: this DV deletes exactly physical row 0, cardinality 1 — and en route the strict
+        // dataSize(34)==sizeInBytes(34) equality and the CRC-32 0xf7a6b4b5 both validated.
+        Assert.Equal(new long[] { 0 }, decoded);
+    }
+
+    [Fact]
+    public async Task WriteOnDisk_PositionZero_IsByteIdenticalToRealSparkGolden()
+    {
+        using LocalFileSystemBackend backend = Backend();
+        Guid uuid = SeededUuid("golden-write");
+        (string relativePath, _) = DescribeFor(uuid, 1, 0, 0);
+
+        (int offset, int sizeInBytes) = await DeletionVectorStore.WriteOnDiskAsync(
+            backend, relativePath, new long[] { 0 }, CancellationToken.None);
+
+        Assert.Equal(1, offset);
+        Assert.Equal(34, sizeInBytes); // matches the real Spark descriptor's sizeInBytes
+
+        // The bytes DeltaSharp put on disk must be byte-for-byte the real Spark golden — the proof that Spark
+        // (and any conformant Delta reader) can read DeltaSharp's deletion vectors.
+        byte[] onDisk = await File.ReadAllBytesAsync(Path.Combine(_root, relativePath));
+        Assert.Equal(Convert.FromHexString(RealSparkGoldenBinHex), onDisk);
+
+        // And the CRC-covered payload (bytes 5..38) equals Spark's serialized RoaringBitmapArray exactly.
+        Assert.Equal(Convert.FromHexString(RealSparkGoldenPayloadHex), onDisk[5..39]);
+    }
+
+
     [Fact]
     public async Task WriteThenLoad_ReconstructsExactPositions_OffsetIsOne()
     {
         using LocalFileSystemBackend backend = Backend();
-        var uuid = Guid.NewGuid();
+        var uuid = SeededUuid("write-then-load");
         string pathOrInlineDv = DeletionVectorDescriptor.BuildRelativePathOrInlineDv(string.Empty, uuid);
         string relativePath =
             DeletionVectorDescriptor.ForRelativePath(pathOrInlineDv, 1, 0, 0).ResolveRelativePath();
@@ -71,7 +138,7 @@ public sealed class DeletionVectorStoreTests : IDisposable
     public async Task Load_CorruptedBitmapByte_FailsChecksumClosed()
     {
         using LocalFileSystemBackend backend = Backend();
-        var uuid = Guid.NewGuid();
+        var uuid = SeededUuid("corrupt-bitmap");
         (string relativePath, DeletionVectorDescriptor stub) = DescribeFor(uuid, 1, 0, 0);
 
         long[] positions = { 2, 5, 9 };
@@ -99,7 +166,7 @@ public sealed class DeletionVectorStoreTests : IDisposable
     public async Task Load_DeclaredSizeDisagreesWithFile_FailsClosed()
     {
         using LocalFileSystemBackend backend = Backend();
-        var uuid = Guid.NewGuid();
+        var uuid = SeededUuid("declared-size-disagrees");
         (string relativePath, _) = DescribeFor(uuid, 1, 0, 0);
 
         long[] positions = { 1, 2, 3 };
@@ -120,7 +187,7 @@ public sealed class DeletionVectorStoreTests : IDisposable
     public async Task Load_PositionAtOrAboveNumRecords_FailsClosed()
     {
         using LocalFileSystemBackend backend = Backend();
-        var uuid = Guid.NewGuid();
+        var uuid = SeededUuid("position-out-of-range");
         (string relativePath, _) = DescribeFor(uuid, 1, 0, 0);
 
         long[] positions = { 3, 99 };
@@ -142,7 +209,7 @@ public sealed class DeletionVectorStoreTests : IDisposable
     public async Task Load_OversizedDeclaredSize_FailsClosedBeforeAllocation()
     {
         using LocalFileSystemBackend backend = Backend();
-        var uuid = Guid.NewGuid();
+        var uuid = SeededUuid("oversized-declared-size");
         (string relativePath, _) = DescribeFor(uuid, 1, 0, 0);
         _ = await DeletionVectorStore.WriteOnDiskAsync(
             backend, relativePath, new long[] { 1 }, CancellationToken.None);

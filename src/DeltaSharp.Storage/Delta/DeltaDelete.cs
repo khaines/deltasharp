@@ -55,9 +55,10 @@ internal sealed record DeleteResult(
 /// <see cref="DeltaDeletePredicate"/> matches by writing a <b>deletion vector</b> per affected data file —
 /// the data file is <b>never rewritten</b>. Each affected file's prior <c>add</c> is superseded in ONE
 /// commit by a <c>remove</c> (carrying the file's PRIOR deletion vector, so it tombstones the exact prior
-/// logical file) plus a fresh <c>add</c> on the SAME path carrying the NEW deletion vector and a residual
-/// <c>stats.numRecords</c> (physical records minus the DV cardinality — the Delta writer requirement). A
-/// file whose every row is deleted is <c>remove</c>d outright (no residual add, no wasted DV).
+/// logical file) plus a fresh <c>add</c> on the SAME path carrying the NEW deletion vector and a
+/// <c>stats.numRecords</c> that stays the <b>physical</b> data-file row count (matching Spark — the total
+/// rows in the Parquet file, NOT the residual; the residual logical count is <c>numRecords − cardinality</c>).
+/// A file whose every row is deleted is <c>remove</c>d outright (no residual add, no wasted DV).
 ///
 /// <para><b>Protocol gate (AC3).</b> The DELETE fails closed via
 /// <see cref="DeletionVectorsFeature.EnsureWriteEnabled"/> unless the table protocol declares the
@@ -278,14 +279,17 @@ internal sealed class DeltaDelete
                 plan.AllDeletedPositions, cardinality, cancellationToken).ConfigureAwait(false);
             filesWithDeletionVector++;
 
-            long residual = plan.PhysicalRecords - cardinality;
+            // FIX (numRecords semantics): a DV-carrying add's stats.numRecords is the PHYSICAL data-file row
+            // count (the total rows in the Parquet file), matching Spark — NOT the residual (post-deletion)
+            // count. The residual logical count is derivable as numRecords − cardinality. TightBounds stays
+            // false (a delete only removes rows, so the prior min/max remain valid but loose).
             actions.Add(new AddFileAction(
                 add.Path,
                 add.PartitionValues,
                 add.Size,
                 timestamp,
                 DataChange: true,
-                BuildResidualStatistics(add.Stats, residual),
+                BuildPhysicalStatistics(add.Stats, plan.PhysicalRecords),
                 add.Tags,
                 descriptor));
         }
@@ -326,26 +330,24 @@ internal sealed class DeltaDelete
         // Seed with the file's existing DV positions (a prior delete on the same file), so a second delete
         // superseding it never resurrects the earlier deletes.
         var deleted = new SortedSet<long>();
-        long existingCardinality = 0;
         if (add.DeletionVector is { } existing)
         {
-            long? residual = add.Stats?.NumRecords;
-            if (residual is not { } residualRecords)
+            long? declared = add.Stats?.NumRecords;
+            if (declared is not { } physicalRecords)
             {
                 throw DeltaStorageException.CorruptData(
                     $"Active file '{add.Path}' carries a deletion vector but its add has no stats.numRecords; "
                     + "the DELETE cannot compute the file's physical record count, so it fails closed.");
             }
 
-            long physical = checked(residualRecords + existing.Cardinality);
+            // A DV-carrying add's stats.numRecords IS the physical row count (matching Spark), so the DV's
+            // positions are validated directly against it — never numRecords + cardinality.
             long[] existingPositions = await DeletionVectorStore
-                .LoadAsync(_backend, existing, physical, cancellationToken).ConfigureAwait(false);
+                .LoadAsync(_backend, existing, physicalRecords, cancellationToken).ConfigureAwait(false);
             foreach (long position in existingPositions)
             {
                 deleted.Add(position);
             }
-
-            existingCardinality = existing.Cardinality;
         }
 
         long newlyDeleted = 0;
@@ -375,18 +377,14 @@ internal sealed class DeltaDelete
         }
 
         // The authoritative physical record count is what we actually read; cross-check the file's declared
-        // stats.numRecords (+ existing DV cardinality) against it so a lying stat fails closed rather than
-        // producing a residual count that disagrees with the data.
-        if (add.Stats?.NumRecords is { } declaredResidual)
+        // stats.numRecords (now the PHYSICAL count, matching Spark) against it so a lying stat fails closed
+        // rather than writing a count that disagrees with the data.
+        if (add.Stats?.NumRecords is { } declaredPhysical && declaredPhysical != fileRowOffset)
         {
-            long declaredPhysical = checked(declaredResidual + existingCardinality);
-            if (declaredPhysical != fileRowOffset)
-            {
-                throw DeltaStorageException.CorruptData(
-                    $"Active file '{add.Path}' declares {declaredPhysical} physical record(s) (stats.numRecords "
-                    + $"+ deletion-vector cardinality) but the Parquet file contains {fileRowOffset}; the DELETE "
-                    + "fails closed rather than write a residual count that disagrees with the data.");
-            }
+            throw DeltaStorageException.CorruptData(
+                $"Active file '{add.Path}' declares stats.numRecords={declaredPhysical} but the Parquet file "
+                + $"contains {fileRowOffset} physical record(s); the DELETE fails closed rather than write a "
+                + "count that disagrees with the data.");
         }
 
         long[] all = new long[deleted.Count];
@@ -451,19 +449,20 @@ internal sealed class DeltaDelete
             input.Size,
             input.DeletionVector);
 
-    // The residual stats for a DV-carrying add: the residual row count is authoritative (Delta writer
-    // requirement); the prior min/max are kept as still-valid LOOSE bounds (a delete only removes rows, so
-    // they remain conservative for pruning) with tightBounds=false; null counts are cleared (now stale).
-    private static FileStatistics BuildResidualStatistics(FileStatistics? prior, long residual)
+    // The stats for a DV-carrying add: numRecords is the PHYSICAL data-file row count (matching Spark — the
+    // total rows in the Parquet file, NOT the residual), which is authoritative; the prior min/max are kept
+    // as still-valid LOOSE bounds (a delete only removes rows, so they remain conservative for pruning) with
+    // tightBounds=false; null counts are cleared (now stale).
+    private static FileStatistics BuildPhysicalStatistics(FileStatistics? prior, long physicalRecords)
     {
         if (prior is null)
         {
-            return FileStatistics.Empty with { NumRecords = residual, TightBounds = false };
+            return FileStatistics.Empty with { NumRecords = physicalRecords, TightBounds = false };
         }
 
         return prior with
         {
-            NumRecords = residual,
+            NumRecords = physicalRecords,
             NullCount = EmptyNullCount,
             TightBounds = false,
         };
