@@ -153,6 +153,7 @@ internal static class DeltaLogActionWriter
         }
 
         WriteStringMapIfAny(writer, "tags", add.Tags);
+        add.DeletionVector?.Write(writer);
         writer.WriteEndObject();
         writer.WriteEndObject();
     }
@@ -182,6 +183,7 @@ internal static class DeltaLogActionWriter
             writer.WriteNumber("size", size);
         }
 
+        remove.DeletionVector?.Write(writer);
         writer.WriteEndObject();
         writer.WriteEndObject();
     }

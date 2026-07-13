@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using System.Linq;
+using DeltaSharp.Storage.Delta.DeletionVectors;
 
 namespace DeltaSharp.Storage.Delta;
 
@@ -107,15 +108,22 @@ internal static class OrphanCleanup
         // URI-decoded-equality, so both DeltaSharp-unencoded and Spark-encoded (e.g. "a%20b.parquet")
         // tables protect the same real file. Building the log side as {raw} ∪ {UnescapeDataString(raw)}
         // and comparing the raw candidate key against it can only over-protect, never over-delete.
+        //
+        // STORY-05.5.1: a deletion vector's on-disk `.bin` sidecar (a `'u'` DV) is referenced by
+        // add.deletionVector, NOT add.path, so it must be protected explicitly or VACUUM would reclaim a live
+        // DV file and resurrect deleted rows. Both active-file DVs and retention-protected-tombstone DVs are
+        // protected (a stale reader of a within-window tombstone still needs its DV).
         ImmutableHashSet<string> active = BuildEncodingRobustSet(
-            snapshot.ActiveFiles.Select(add => add.Path));
+            snapshot.ActiveFiles.Select(add => add.Path)
+                .Concat(DeletionVectorSidecarPaths(snapshot.ActiveFiles.Select(add => add.DeletionVector))));
 
         // A tombstone is retention-protected while a stale reader might still need it: removed at/after the
         // cutoff, OR with an unknown deletion time (fail safe — never delete on missing provenance).
+        IEnumerable<RemoveFileAction> protectedRemoves = snapshot.Tombstones
+            .Where(remove => (remove.DeletionTimestamp ?? long.MaxValue) >= retentionCutoffMillis);
         ImmutableHashSet<string> protectedTombstones = BuildEncodingRobustSet(
-            snapshot.Tombstones
-                .Where(remove => (remove.DeletionTimestamp ?? long.MaxValue) >= retentionCutoffMillis)
-                .Select(remove => remove.Path));
+            protectedRemoves.Select(remove => remove.Path)
+                .Concat(DeletionVectorSidecarPaths(protectedRemoves.Select(remove => remove.DeletionVector))));
 
         var decisions = new List<OrphanDecision>();
         foreach (OrphanCandidate candidate in candidates)
@@ -151,6 +159,36 @@ internal static class OrphanCleanup
         }
 
         return OrphanClassification.Deletable;
+    }
+
+    // The table-root-relative `.bin` sidecar path of every on-disk relative-path ('u') deletion vector in the
+    // sequence (inline 'i' DVs have no sidecar; absolute 'p' DVs are out of scope for VACUUM protection and
+    // fall to the tracked-deferral note). A malformed descriptor is skipped here (it fails the READ path
+    // elsewhere) rather than aborting VACUUM's protected-set construction.
+    private static IEnumerable<string> DeletionVectorSidecarPaths(IEnumerable<DeletionVectorDescriptor?> descriptors)
+    {
+        foreach (DeletionVectorDescriptor? descriptor in descriptors)
+        {
+            if (descriptor is null || descriptor.StorageType != DeletionVectorDescriptor.StorageTypeUuidRelative)
+            {
+                continue;
+            }
+
+            string? path = null;
+            try
+            {
+                path = descriptor.ResolveRelativePath();
+            }
+            catch (DeltaStorageException)
+            {
+                // A corrupt DV descriptor: skip protection here (the read path fails closed on it separately).
+            }
+
+            if (path is not null)
+            {
+                yield return path;
+            }
+        }
     }
 
     /// <summary>Builds the protection set as the union of each log path and its URI-decoded form, so a raw
