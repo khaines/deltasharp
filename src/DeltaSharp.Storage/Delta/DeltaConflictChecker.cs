@@ -68,8 +68,58 @@ internal static class DeltaConflictChecker
         // hard conflict, checked before any rebase so shared-appId blind appends never both commit).
         CheckConcurrentTransaction(loserActions, winnerActions);
 
+        // (3.5) Deletion-vector exclusivity (STORY-05.5.1 AC2). A merge-on-read DELETE commits an add that
+        // carries a deletionVector for a file whose DV it just rewrote (plus a remove of that file's prior
+        // add). If a concurrent winner already added OR removed that EXACT file — its own DELETE, OPTIMIZE,
+        // or overwrite touched the same physical file — then rebasing this DV over the winner would either
+        // silently DROP the winner's deletes (union computed against a stale physical layout) or resurrect
+        // already-deleted rows, so the loser MUST abort rather than rebase. This is a scope-independent
+        // safety net narrowly gated on a DV-bearing add, so a normal append (no DV) is never disturbed even
+        // when it shares no read scope. The DELETE also commits under ReadFiles, which catches the same race;
+        // this rule guarantees the invariant "a concurrent DV update to the same file never loses a delete"
+        // holds regardless of the scope a future caller supplies.
+        CheckDeletionVectorConflict(loserActions, winnerActions);
+
         // (4) Read-scope-driven data conflicts — each scope owns its overlap rule (§2.11.2).
         readScope.CheckDataConflict(winnerActions);
+    }
+
+    // Aborts the loser when it attaches/updates a deletion vector on a file a concurrent winner also added or
+    // removed. Only a loser add carrying a non-null deletionVector participates (a plain append is ignored),
+    // so this never fires on ordinary concurrent appends.
+    private static void CheckDeletionVectorConflict(
+        IReadOnlyList<DeltaAction> loserActions, IReadOnlyList<DeltaAction> winnerActions)
+    {
+        HashSet<string>? deletionVectorPaths = null;
+        foreach (DeltaAction action in loserActions)
+        {
+            if (action is AddFileAction add && add.DeletionVector is not null)
+            {
+                (deletionVectorPaths ??= new HashSet<string>(StringComparer.Ordinal)).Add(add.Path);
+            }
+        }
+
+        if (deletionVectorPaths is null)
+        {
+            return;
+        }
+
+        foreach (DeltaAction action in winnerActions)
+        {
+            string? path = action switch
+            {
+                AddFileAction winnerAdd when deletionVectorPaths.Contains(winnerAdd.Path) => winnerAdd.Path,
+                RemoveFileAction winnerRemove when deletionVectorPaths.Contains(winnerRemove.Path) => winnerRemove.Path,
+                _ => null,
+            };
+
+            if (path is not null)
+            {
+                throw new ConcurrentDeleteReadException(
+                    $"A concurrent commit changed file '{path}', for which this writer is committing a deletion "
+                    + "vector, since its read snapshot; the commit was aborted to avoid losing a concurrent delete.");
+            }
+        }
     }
 
     private static void CheckConcurrentTransaction(

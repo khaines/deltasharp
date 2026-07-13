@@ -54,9 +54,9 @@ public sealed class ProtocolNegotiationTests : IDisposable
     public void EnsureReadable_RejectsUnsupportedReaderFeature()
     {
         DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
-            () => ProtocolSupport.EnsureReadable(new ProtocolAction(3, 7, ["deletionVectors"], [])));
+            () => ProtocolSupport.EnsureReadable(new ProtocolAction(3, 7, ["timestampNtz"], [])));
         Assert.Equal(DeltaProtocolErrorKind.UnsupportedProtocol, ex.Kind);
-        Assert.Contains("deletionVectors", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("timestampNtz", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -72,14 +72,14 @@ public sealed class ProtocolNegotiationTests : IDisposable
     public async Task LoadSnapshot_FailsClosed_OnUnsupportedReaderFeature()
     {
         await DeltaTestHarness.WriteCommitAsync(_backend, 0,
-            DeltaTestHarness.ProtocolWithReaderFeature("deletionVectors"),
+            DeltaTestHarness.ProtocolWithReaderFeature("timestampNtz"),
             DeltaTestHarness.Metadata(),
             DeltaTestHarness.Add("a.parquet"));
 
         DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
             () => new DeltaLog(_backend).LoadSnapshotAsync());
         Assert.Equal(DeltaProtocolErrorKind.UnsupportedProtocol, ex.Kind);
-        Assert.Contains("deletionVectors", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("timestampNtz", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -98,14 +98,14 @@ public sealed class ProtocolNegotiationTests : IDisposable
     public async Task LoadSnapshot_FailsClosed_WhenFeatureAppearsInLaterCommit()
     {
         // A table upgraded mid-history to require an unsupported reader feature must fail closed at the
-        // latest snapshot. (columnMapping is now supported — STORY-05.4.3 — so this uses deletionVectors,
+        // latest snapshot. (columnMapping and deletionVectors are now supported, so this uses timestampNtz,
         // which remains unimplemented.)
         await DeltaTestHarness.WriteCommitAsync(_backend, 0,
             DeltaTestHarness.Protocol(),
             DeltaTestHarness.Metadata(),
             DeltaTestHarness.Add("a.parquet"));
         await DeltaTestHarness.WriteCommitAsync(_backend, 1,
-            DeltaTestHarness.ProtocolWithReaderFeature("deletionVectors"));
+            DeltaTestHarness.ProtocolWithReaderFeature("timestampNtz"));
 
         await Assert.ThrowsAsync<DeltaProtocolException>(() => new DeltaLog(_backend).LoadSnapshotAsync());
 

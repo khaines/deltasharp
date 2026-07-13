@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using DeltaSharp.Storage.Delta.DeletionVectors;
 
 namespace DeltaSharp.Storage.Delta;
 
@@ -42,7 +43,10 @@ internal sealed record MetadataAction(
 /// <summary>
 /// <c>add</c> — a data file that becomes active table state only via this committed action (never a
 /// directory listing; §2.10.4 anti-pattern #1). Carries partition values, size/mtime, the
-/// <c>dataChange</c> flag, optional parsed <see cref="Stats"/>, and tags (design §2.10.1).
+/// <c>dataChange</c> flag, optional parsed <see cref="Stats"/>, tags, and an optional
+/// <see cref="DeletionVector"/> (STORY-05.5.1): when present, the rows it names are physically in the file
+/// but logically deleted and MUST be excluded from scans. A DV rides on the <c>add</c> so it participates in
+/// snapshot reconstruction and time travel by version (design §2.10.1; Delta protocol "Deletion Vectors").
 /// </summary>
 internal sealed record AddFileAction(
     string Path,
@@ -51,12 +55,15 @@ internal sealed record AddFileAction(
     long ModificationTime,
     bool DataChange,
     FileStatistics? Stats,
-    ImmutableSortedDictionary<string, string> Tags) : DeltaAction;
+    ImmutableSortedDictionary<string, string> Tags,
+    DeletionVectorDescriptor? DeletionVector = null) : DeltaAction;
 
 /// <summary>
 /// <c>remove</c> — a tombstone deleting a previously-<c>add</c>ed <see cref="Path"/> from the active
 /// set. Retained for time travel + VACUUM; when <see cref="ExtendedFileMetadata"/> is true it round-trips
-/// <c>partitionValues</c>/<c>size</c> for checkpoint fidelity (design §2.10.1).
+/// <c>partitionValues</c>/<c>size</c> for checkpoint fidelity (design §2.10.1). An optional
+/// <see cref="DeletionVector"/> records the DV the removed logical file carried, so the DV forms part of the
+/// logical file's identity when a merge-on-read delete supersedes it with a new DV on the same path.
 /// </summary>
 internal sealed record RemoveFileAction(
     string Path,
@@ -64,7 +71,8 @@ internal sealed record RemoveFileAction(
     bool DataChange,
     bool ExtendedFileMetadata,
     ImmutableSortedDictionary<string, string?> PartitionValues,
-    long? Size) : DeltaAction;
+    long? Size,
+    DeletionVectorDescriptor? DeletionVector = null) : DeltaAction;
 
 /// <summary>
 /// <c>txn</c> — an application transaction marker (<c>appId</c> → last committed <c>version</c>) used

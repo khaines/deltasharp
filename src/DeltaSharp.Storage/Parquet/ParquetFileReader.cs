@@ -121,6 +121,40 @@ internal sealed class ParquetFileReader
         }
     }
 
+    /// <summary>
+    /// Reads only the Parquet footer and returns the file's total PHYSICAL row count (summed across row
+    /// groups) — decoding no data pages. This is the file's real row count, used to bound a deletion vector's
+    /// decoded positions by the truth on disk (never an attacker-controlled descriptor/stats field), so a
+    /// poisoned DV can neither reference a row beyond the file nor force an oversized allocation.
+    /// </summary>
+    /// <exception cref="DeltaStorageException">The Parquet footer is malformed/truncated, or a row group
+    /// declares a negative row count (fail closed).</exception>
+    public async Task<long> GetRowCountAsync(Stream input, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+
+        ParquetReader reader = await OpenAsync(input, cancellationToken).ConfigureAwait(false);
+        await using (reader.ConfigureAwait(false))
+        {
+            long total = 0;
+            for (int group = 0; group < reader.RowGroupCount; group++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                using ParquetRowGroupReader rowGroup = reader.OpenRowGroupReader(group);
+                long rows = rowGroup.RowCount;
+                if (rows < 0)
+                {
+                    throw DeltaStorageException.CorruptData(
+                        $"Row group {group} declares a negative row count ({rows}).");
+                }
+
+                total = checked(total + rows);
+            }
+
+            return total;
+        }
+    }
+
     /// <summary>The declared compressed/decompressed footprint of one projected column chunk, plus the
     /// per-row width of the read buffer the reader will eagerly allocate for it (including any
     /// <see cref="Nullable{T}"/> overhead) — the inputs to <see cref="EnsureDecodeCeiling"/>.

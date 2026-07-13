@@ -124,7 +124,33 @@ internal enum OptimizeOutcome
 }
 
 /// <summary>
-/// The bounded per-candidate VACUUM decision (design §2.11.5 / §2.14, STORY-05.6.2 AC3): why a discovered
+/// The bounded terminal outcome of a Delta merge-on-read DELETE (STORY-05.5.1 / #192) behind the shared
+/// <see cref="DeltaSharpTelemetry.OutcomeKey"/> label — so a no-op (predicate matched nothing), a real
+/// deletion-vector commit, a fail-closed OCC abort (a concurrent DV update to the same file), a
+/// cancellation, and an unexpected failure are never collapsed into one ambiguous count. A closed value
+/// set, safe as a metric label.
+/// </summary>
+internal enum DeleteOutcome
+{
+    /// <summary>The delete predicate matched no rows, so no deletion vector was written and no commit was
+    /// made — a benign no-op.</summary>
+    NoOp,
+
+    /// <summary>A real DELETE published the merge-on-read commit (deletion vectors written; add-with-DV +
+    /// remove committed; no data file rewritten).</summary>
+    Completed,
+
+    /// <summary>DELETE aborted fail-closed because a concurrent commit changed one of the files it was
+    /// deleting from (an OCC conflict). No delete was lost — the table is unchanged and the caller retries.</summary>
+    Aborted,
+
+    /// <summary>DELETE was cancelled via its <see cref="System.Threading.CancellationToken"/> before a
+    /// terminal outcome. A cancellation is <b>not</b> a failure.</summary>
+    Cancelled,
+
+    /// <summary>An unexpected/unclassified failure (fail-closed; the table is unchanged).</summary>
+    Failure,
+}
 /// candidate file was kept or is deletion-eligible. The <b>deletion</b> decision itself is always the
 /// <see cref="DeltaSharp.Storage.Delta.OrphanCleanup.SelectDeletable"/> contract's output; the three kept
 /// reasons annotate <i>why</i> the contract retained a file, for the audit trail. A closed, low-cardinality
@@ -206,6 +232,12 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     /// <summary>The bounded <c>deltasharp.operation=optimize</c> value for the OPTIMIZE maintenance path.</summary>
     internal const string OptimizeOperation = "optimize";
 
+    /// <summary>The bounded <c>deltasharp.operation=delete</c> value for the merge-on-read DELETE path.</summary>
+    internal const string DeleteOperation = "delete";
+
+    /// <summary>The stable DELETE span name (design §7.4): variables live in bounded attributes.</summary>
+    internal const string DeleteActivityName = DeltaName + ".Delete";
+
     /// <summary>The stable OPTIMIZE span name (design §7.4): variables live in bounded attributes.</summary>
     internal const string OptimizeActivityName = DeltaName + ".Optimize";
 
@@ -239,6 +271,10 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     private readonly Counter<long> _optimizeFilesRemoved;
     private readonly Counter<long> _optimizeFilesAdded;
     private readonly Counter<long> _optimizeBytes;
+    private readonly Histogram<double> _deleteDuration;
+    private readonly Counter<long> _deleteCount;
+    private readonly Counter<long> _deleteFiles;
+    private readonly Counter<long> _deleteRows;
 
     internal DeltaStorageTelemetry()
     {
@@ -286,6 +322,18 @@ internal sealed class DeltaStorageTelemetry : IDisposable
         _optimizeBytes = _deltaMeter.CreateCounter<long>(
             "deltasharp.delta.optimize.bytes", unit: "By",
             description: "Total input bytes rewritten by OPTIMIZE (planned counts under the dry_run outcome), by outcome.");
+        _deleteDuration = _deltaMeter.CreateHistogram<double>(
+            "deltasharp.delta.delete.duration", unit: "s",
+            description: "Elapsed (monotonic) duration of a Delta merge-on-read DELETE, by terminal outcome.");
+        _deleteCount = _deltaMeter.CreateCounter<long>(
+            "deltasharp.delta.delete.count", unit: "{delete}",
+            description: "Terminal Delta DELETE outcomes (no-op, completed, aborted, cancelled, failure).");
+        _deleteFiles = _deltaMeter.CreateCounter<long>(
+            "deltasharp.delta.delete.files", unit: "{file}",
+            description: "Files given a new/updated deletion vector by DELETE (no data file rewritten), by outcome.");
+        _deleteRows = _deltaMeter.CreateCounter<long>(
+            "deltasharp.delta.delete.rows", unit: "{row}",
+            description: "Rows logically deleted by DELETE via deletion vectors, by outcome.");
     }
 
     /// <summary>The <c>DeltaSharp.Delta</c> meter (commit instruments). Exposed for reference-identity
@@ -428,6 +476,43 @@ internal sealed class DeltaStorageTelemetry : IDisposable
         }
     }
 
+    /// <summary>Starts the DELETE span if a listener samples the Delta source; returns
+    /// <see langword="null"/> (a cheap no-op) otherwise. The caller sets low-cardinality attributes and
+    /// status — never row data, a predicate value, or a file path (redaction-by-omission).</summary>
+    internal Activity? StartDeleteActivity(StorageBackendKind backend)
+    {
+        Activity? activity = DeltaActivitySource.StartActivity(DeleteActivityName, ActivityKind.Internal);
+        if (activity is not null)
+        {
+            activity.SetTag(DeltaSharpTelemetry.ComponentKey, DeltaComponent);
+            activity.SetTag(DeltaSharpTelemetry.OperationKey, DeleteOperation);
+            activity.SetTag(BackendKey, backend.ToLabel());
+        }
+
+        return activity;
+    }
+
+    /// <summary>Records the terminal signals for one DELETE: the duration histogram, the outcome counter,
+    /// and the files-with-DV / rows-deleted counters, all tagged with the bounded
+    /// <see cref="DeltaSharpTelemetry.OutcomeKey"/>. A single measurement per DELETE (never per row/file), so
+    /// it is allocation-light and export-safe; no raw row data or column value is ever emitted.</summary>
+    internal void RecordDeleteTerminal(
+        DeleteOutcome outcome, double durationSeconds, int filesWithDeletionVector, long rowsDeleted)
+    {
+        var outcomeTag = new KeyValuePair<string, object?>(DeltaSharpTelemetry.OutcomeKey, ToLabel(outcome));
+        _deleteDuration.Record(durationSeconds, outcomeTag);
+        _deleteCount.Add(1, outcomeTag);
+        if (filesWithDeletionVector > 0)
+        {
+            _deleteFiles.Add(filesWithDeletionVector, outcomeTag);
+        }
+
+        if (rowsDeleted > 0)
+        {
+            _deleteRows.Add(rowsDeleted, outcomeTag);
+        }
+    }
+
     /// <summary>The bounded <c>deltasharp.outcome</c> string for an <see cref="OptimizeOutcome"/>.</summary>
     internal static string ToLabel(OptimizeOutcome outcome) => outcome switch
     {
@@ -436,6 +521,16 @@ internal sealed class DeltaStorageTelemetry : IDisposable
         OptimizeOutcome.NoOp => "no_op",
         OptimizeOutcome.Aborted => "aborted",
         OptimizeOutcome.Cancelled => "cancelled",
+        _ => "failure",
+    };
+
+    /// <summary>The bounded <c>deltasharp.outcome</c> string for a <see cref="DeleteOutcome"/>.</summary>
+    internal static string ToLabel(DeleteOutcome outcome) => outcome switch
+    {
+        DeleteOutcome.NoOp => "no_op",
+        DeleteOutcome.Completed => "completed",
+        DeleteOutcome.Aborted => "aborted",
+        DeleteOutcome.Cancelled => "cancelled",
         _ => "failure",
     };
 

@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using DeltaSharp.Storage.Delta;
+using DeltaSharp.Storage.Delta.DeletionVectors;
 using Xunit;
 
 namespace DeltaSharp.Storage.Tests.Delta;
@@ -20,6 +21,10 @@ public sealed class DeltaConflictCheckerTests
 
     private static AddFileAction Add(string path) =>
         new(path, NoPartition, 1L, 1L, DataChange: true, Stats: null, Tags: NoTags);
+
+    private static AddFileAction AddWithDv(string path) =>
+        new(path, NoPartition, 1L, 1L, DataChange: true, Stats: null, Tags: NoTags,
+            DeletionVector: DeletionVectorDescriptor.ForInline(RoaringBitmapArray.Serialize(new long[] { 0 }), 1));
 
     private static RemoveFileAction Remove(string path) =>
         new(path, DeletionTimestamp: 1L, DataChange: true, ExtendedFileMetadata: false, NoPartition, Size: null);
@@ -104,6 +109,54 @@ public sealed class DeltaConflictCheckerTests
     {
         // Only a concurrent txn for a different appId — no data overlap, no metadata/protocol change.
         Check(new DeltaAction[] { Add("o.parquet") }, DeltaReadScope.WholeTable, new DeltaAction[] { Txn("other", 1L) });
+    }
+
+    // ---- Deletion-vector exclusivity: the scope-independent DV safety net (STORY-05.5.1 AC2) ----
+    // These deliberately use DeltaReadScope.BlindAppend, whose data-conflict rule REBASES past concurrent
+    // adds/removes (proven by BlindAppend_RebasesPastConcurrentDelete). Under that scope nothing but the
+    // dedicated CheckDeletionVectorConflict rule can abort — so if a mutation neuters that rule, BlindAppend
+    // masks the race and these tests fail. (A ReadFiles-scoped version would keep passing even with the rule
+    // removed, because ReadFiles independently catches the same-file delete/read race — which is exactly why
+    // the existing 818-test suite let a mutant of this rule survive.)
+
+    [Fact]
+    public void DeletionVectorExclusivity_BlindAppend_AbortsWhenWinnerRemovesTheDvFile()
+    {
+        // The loser is a merge-on-read DELETE: it commits a DV-bearing add for "f" plus a remove of f's prior
+        // add. A concurrent winner already REMOVED "f". Rebasing the DV over the winner would lose the
+        // winner's delete (or resurrect rows), so the loser MUST abort — even though BlindAppend by itself
+        // would happily rebase past a plain remove.
+        var ex = Assert.Throws<ConcurrentDeleteReadException>(() =>
+            Check(
+                new DeltaAction[] { AddWithDv("f.parquet"), Remove("f.parquet") },
+                DeltaReadScope.BlindAppend,
+                new DeltaAction[] { Remove("f.parquet") }));
+        Assert.Equal(DeltaConflictKind.ConcurrentDeleteRead, ex.Kind);
+    }
+
+    [Fact]
+    public void DeletionVectorExclusivity_BlindAppend_AbortsWhenWinnerAddsTheDvFile()
+    {
+        // Same rule when the concurrent winner re-ADDED the same physical file (an OPTIMIZE/overwrite that
+        // rewrote f's bytes): the loser's DV was computed against a now-stale physical layout → abort.
+        var ex = Assert.Throws<ConcurrentDeleteReadException>(() =>
+            Check(
+                new DeltaAction[] { AddWithDv("f.parquet") },
+                DeltaReadScope.BlindAppend,
+                new DeltaAction[] { Add("f.parquet") }));
+        Assert.Equal(DeltaConflictKind.ConcurrentDeleteRead, ex.Kind);
+    }
+
+    [Fact]
+    public void DeletionVectorExclusivity_BlindAppend_RebasesWhenWinnerTouchesADifferentFile()
+    {
+        // Narrow gating (and proof the abort above is attributable ONLY to the DV rule): a DV-add for "f"
+        // rebases past a winner that touched OTHER files "g"/"h". BlindAppend rebases the plain parts, and the
+        // DV rule does not fire because no winner touched "f".
+        Check(
+            new DeltaAction[] { AddWithDv("f.parquet") },
+            DeltaReadScope.BlindAppend,
+            new DeltaAction[] { Add("g.parquet"), Remove("h.parquet") });
     }
 
     // ---- Read-files (targeted delete/merge): row 3 ----

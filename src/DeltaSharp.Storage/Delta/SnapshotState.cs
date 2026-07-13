@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using DeltaSharp.Storage.Delta.DeletionVectors;
 
 namespace DeltaSharp.Storage.Delta;
 
@@ -17,6 +18,16 @@ internal sealed class SnapshotState
     private readonly Dictionary<string, RemoveFileAction> _tombstones = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> _transactions = new(StringComparer.Ordinal);
 
+    // The active-file identity is (path, deletionVector.uniqueId) — NOT the path alone (Delta protocol
+    // "Derived Fields": uniqueId "is used for snapshot reconstruction to differentiate the same file with
+    // different DVs in successive versions"). A merge-on-read DELETE commits remove(path, oldDv) + add(path,
+    // newDv); keying by the composite makes the fold ORDER-INDEPENDENT within the commit (the remove clears
+    // the old logical file's key, the add installs the new one, whatever order they appear), so the file
+    // stays active with exactly its new DV. For a table with no DVs the DV segment is empty and the key is
+    // the path — byte-for-byte the prior behavior.
+    private static string FileKey(string path, DeletionVectorDescriptor? deletionVector) =>
+        deletionVector is null ? path : path + "\u0001" + deletionVector.UniqueId;
+
     /// <summary>The most recent <c>protocol</c> action seen, or null if none yet.</summary>
     public ProtocolAction? Protocol { get; private set; }
 
@@ -29,15 +40,17 @@ internal sealed class SnapshotState
         switch (action)
         {
             case AddFileAction add:
-                // An add makes the file active; it also supersedes any prior tombstone for the same path
-                // (a re-add of a previously-removed path).
-                _activeAdds[add.Path] = add;
-                _tombstones.Remove(add.Path);
+                // An add makes the (path, dvId) logical file active; it also supersedes any prior tombstone
+                // for that same logical file (a re-add of a previously-removed logical file).
+                string addKey = FileKey(add.Path, add.DeletionVector);
+                _activeAdds[addKey] = add;
+                _tombstones.Remove(addKey);
                 break;
 
             case RemoveFileAction remove:
-                _activeAdds.Remove(remove.Path);
-                _tombstones[remove.Path] = remove;
+                string removeKey = FileKey(remove.Path, remove.DeletionVector);
+                _activeAdds.Remove(removeKey);
+                _tombstones[removeKey] = remove;
                 break;
 
             case MetadataAction metadata:
