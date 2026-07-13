@@ -38,7 +38,7 @@ public sealed class ParquetReaderTests
 
         var projection = new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) });
         var batches = new List<ColumnBatch>();
-        await foreach (ColumnBatch batch in new ParquetFileReader().ReadAsync(stream, projection, keepRowGroup: null, CancellationToken.None))
+        await foreach (ColumnBatch batch in new ParquetFileReader().ReadAsync(stream, projection, keepRowGroup: null, nullFillMissingColumns: false, CancellationToken.None))
         {
             batches.Add(batch);
         }
@@ -87,7 +87,7 @@ public sealed class ParquetReaderTests
             new StructField("a", DataTypes.LongType, nullable: false),
         });
         var batches = new List<ColumnBatch>();
-        await foreach (ColumnBatch batch in new ParquetFileReader().ReadAsync(new MemoryStream(fileBytes), projection, keepRowGroup: null, CancellationToken.None))
+        await foreach (ColumnBatch batch in new ParquetFileReader().ReadAsync(new MemoryStream(fileBytes), projection, keepRowGroup: null, nullFillMissingColumns: false, CancellationToken.None))
         {
             batches.Add(batch);
         }
@@ -107,7 +107,7 @@ public sealed class ParquetReaderTests
         // A lone middle-column projection must also resolve by name (not fall back to file position 0).
         var middle = new StructType(new[] { new StructField("b", DataTypes.LongType, nullable: false) });
         var middleBatches = new List<ColumnBatch>();
-        await foreach (ColumnBatch batch in new ParquetFileReader().ReadAsync(new MemoryStream(fileBytes), middle, keepRowGroup: null, CancellationToken.None))
+        await foreach (ColumnBatch batch in new ParquetFileReader().ReadAsync(new MemoryStream(fileBytes), middle, keepRowGroup: null, nullFillMissingColumns: false, CancellationToken.None))
         {
             middleBatches.Add(batch);
         }
@@ -134,6 +134,7 @@ public sealed class ParquetReaderTests
             stream,
             schema,
             keepRowGroup: stats => stats.Max("id") is long max && max >= 100,
+            nullFillMissingColumns: false,
             CancellationToken.None))
         {
             ColumnVector column = result.SelectedColumn(0);
@@ -160,7 +161,7 @@ public sealed class ParquetReaderTests
 
         DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(async () =>
         {
-            await foreach (ColumnBatch _ in new ParquetFileReader().ReadAsync(stream, schema, keepRowGroup: null, CancellationToken.None))
+            await foreach (ColumnBatch _ in new ParquetFileReader().ReadAsync(stream, schema, keepRowGroup: null, nullFillMissingColumns: false, CancellationToken.None))
             {
             }
         });
@@ -177,7 +178,7 @@ public sealed class ParquetReaderTests
 
         DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(async () =>
         {
-            await foreach (ColumnBatch _ in new ParquetFileReader().ReadAsync(stream, schema, keepRowGroup: null, CancellationToken.None))
+            await foreach (ColumnBatch _ in new ParquetFileReader().ReadAsync(stream, schema, keepRowGroup: null, nullFillMissingColumns: false, CancellationToken.None))
             {
             }
         });
@@ -201,11 +202,100 @@ public sealed class ParquetReaderTests
 
         DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(async () =>
         {
-            await foreach (ColumnBatch _ in new ParquetFileReader().ReadAsync(stream, nested, keepRowGroup: null, CancellationToken.None))
+            await foreach (ColumnBatch _ in new ParquetFileReader().ReadAsync(stream, nested, keepRowGroup: null, nullFillMissingColumns: false, CancellationToken.None))
             {
             }
         });
         Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+    }
+
+    // ---------------------------------------------------------------- #497 read-side null-fill
+
+    [Fact]
+    public async Task NullFill_AbsentNullableColumn_MaterializedAsNull()
+    {
+        // A file physically written under a NARROW schema {id} read back through a WIDER projection
+        // {id, name?, score?}: with nullFillMissingColumns enabled, the absent nullable columns come back
+        // as all-null rather than throwing (#497 evolved-column read null-fill).
+        var narrow = new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) });
+        ColumnBatch batch = BuildLongBatch(narrow, new long[] { 7, 8, 9 });
+        using var stream = new MemoryStream();
+        await new ParquetFileWriter().WriteAsync(stream, narrow, new[] { batch }, CancellationToken.None);
+        stream.Position = 0;
+
+        var batches = new List<ColumnBatch>();
+        await foreach (ColumnBatch b in new ParquetFileReader().ReadAsync(
+            stream, FullSchema, keepRowGroup: null, nullFillMissingColumns: true, CancellationToken.None))
+        {
+            batches.Add(b);
+        }
+
+        ColumnBatch result = Assert.Single(batches);
+        Assert.Equal(FullSchema, result.Schema);
+        Assert.Equal(3, result.LogicalRowCount);
+
+        ColumnVector id = result.SelectedColumn(0);
+        ColumnVector name = result.SelectedColumn(1);
+        ColumnVector score = result.SelectedColumn(2);
+        for (int r = 0; r < result.LogicalRowCount; r++)
+        {
+            Assert.False(id.IsNull(r)); // present column keeps its real value
+            Assert.True(name.IsNull(r)); // absent nullable column is null-filled
+            Assert.True(score.IsNull(r));
+        }
+
+        Assert.Equal(new long[] { 7, 8, 9 }, ReadLongs(id, result.LogicalRowCount));
+    }
+
+    [Fact]
+    public async Task NullFill_AbsentNonNullableColumn_StillFailsClosed()
+    {
+        // Null-fill only applies to NULLABLE absent columns. An absent REQUIRED (non-nullable) column cannot
+        // carry null, so it still fails closed even with null-fill enabled (a required lane is never
+        // fabricated).
+        var narrow = new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) });
+        ColumnBatch batch = BuildLongBatch(narrow, new long[] { 1, 2 });
+        using var stream = new MemoryStream();
+        await new ParquetFileWriter().WriteAsync(stream, narrow, new[] { batch }, CancellationToken.None);
+        stream.Position = 0;
+
+        var wider = new StructType(new[]
+        {
+            new StructField("id", DataTypes.LongType, nullable: false),
+            new StructField("required", DataTypes.LongType, nullable: false),
+        });
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(async () =>
+        {
+            await foreach (ColumnBatch _ in new ParquetFileReader().ReadAsync(
+                stream, wider, keepRowGroup: null, nullFillMissingColumns: true, CancellationToken.None))
+            {
+            }
+        });
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+        Assert.Contains("is not present", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task NullFillDisabled_AbsentNullableColumn_FailsClosed()
+    {
+        // With null-fill DISABLED (the general reader default), an absent column of ANY nullability fails
+        // closed — the strict projection contract other callers (OPTIMIZE/DELETE) rely on is preserved.
+        var narrow = new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) });
+        ColumnBatch batch = BuildLongBatch(narrow, new long[] { 1, 2 });
+        using var stream = new MemoryStream();
+        await new ParquetFileWriter().WriteAsync(stream, narrow, new[] { batch }, CancellationToken.None);
+        stream.Position = 0;
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(async () =>
+        {
+            await foreach (ColumnBatch _ in new ParquetFileReader().ReadAsync(
+                stream, FullSchema, keepRowGroup: null, nullFillMissingColumns: false, CancellationToken.None))
+            {
+            }
+        });
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+        Assert.Contains("is not present", error.Message, StringComparison.Ordinal);
     }
 
     private static ColumnBatch BuildLongBatch(StructType schema, long[] values)

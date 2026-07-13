@@ -324,6 +324,108 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
                 SchemaEvolutionMode.AddNewColumns));
     }
 
+    // ------------------------------------------------------- #497: physical write-schema validation
+
+    private StagedDataFile StagedWith(string path, StructType dataSchema) =>
+        new(path, NoPartition, Size: 1L, ModificationTime: 1L, Stats: null, DataSchema: dataSchema);
+
+    [Fact]
+    public async Task Append_StagedFileMissingColumn_IsRejectedBeforeAnyCommit()
+    {
+        // #497: the declared write schema says {id, name} but the staged file was physically written with
+        // only {id}. Enforcement gates the REAL bytes, so this divergence is rejected before any commit —
+        // a caller cannot slip an incompatible file past enforcement by declaring a conforming schema.
+        StructType schema = Struct(
+            F("id", DataTypes.LongType, nullable: false),
+            F("name", DataTypes.StringType, nullable: true));
+        await SeedSchemaTableAsync(schema);
+        Snapshot readSnapshot = await LoadAsync();
+
+        DeltaSchemaMismatchException ex = await Assert.ThrowsAsync<DeltaSchemaMismatchException>(() =>
+            Writer().AppendAsync(
+                readSnapshot,
+                schema,
+                new[] { StagedWith("a.parquet", Struct(F("id", DataTypes.LongType, nullable: false))) }));
+
+        Assert.Equal(DeltaSchemaMismatchKind.PhysicalWriteSchemaMismatch, ex.Kind);
+        Assert.Contains("a.parquet", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0L, (await LoadAsync()).Version); // nothing published
+    }
+
+    [Fact]
+    public async Task Append_StagedFileWrongColumnType_IsRejectedBeforeAnyCommit()
+    {
+        // #497: the declared write schema says id:long but the staged file physically stores id:string. The
+        // physical schema disagrees with the declaration, so enforcement rejects it (a declared-vs-real-bytes
+        // type lie is caught before the enforcer even runs its logical rules).
+        StructType schema = Struct(F("id", DataTypes.LongType, nullable: false));
+        await SeedSchemaTableAsync(schema);
+        Snapshot readSnapshot = await LoadAsync();
+
+        DeltaSchemaMismatchException ex = await Assert.ThrowsAsync<DeltaSchemaMismatchException>(() =>
+            Writer().AppendAsync(
+                readSnapshot,
+                schema,
+                new[] { StagedWith("a.parquet", Struct(F("id", DataTypes.StringType, nullable: false))) }));
+
+        Assert.Equal(DeltaSchemaMismatchKind.PhysicalWriteSchemaMismatch, ex.Kind);
+        Assert.Equal(0L, (await LoadAsync()).Version);
+    }
+
+    [Fact]
+    public async Task Append_StagedFileSchemaMatchesDeclared_IsAccepted()
+    {
+        // #497: when the staged file's physical data schema MATCHES the declared write schema's data columns,
+        // the validation is transparent — the append commits normally (v1). This is the production write-door
+        // shape (DeltaWriteTarget records the true written schema, which equals what it declares).
+        StructType schema = Struct(
+            F("id", DataTypes.LongType, nullable: false),
+            F("name", DataTypes.StringType, nullable: true));
+        await SeedSchemaTableAsync(schema);
+        Snapshot readSnapshot = await LoadAsync();
+
+        DeltaCommitResult result = await Writer().AppendAsync(
+            readSnapshot, schema, new[] { StagedWith("a.parquet", schema) });
+
+        Assert.Equal(1L, result.Version);
+        Assert.Equal(1L, (await LoadAsync()).Version);
+    }
+
+    [Fact]
+    public async Task CreateOrAppend_CreateWithDivergentStagedSchema_IsRejected()
+    {
+        // #497: the version-0 metaData schema is gated on the real staged bytes too — a fresh create whose
+        // declared schema {id, name} disagrees with the staged file's physical {id} is rejected, and no table
+        // is created (the path stays empty).
+        StructType declared = Struct(
+            F("id", DataTypes.LongType, nullable: false),
+            F("name", DataTypes.StringType, nullable: true));
+
+        DeltaSchemaMismatchException ex = await Assert.ThrowsAsync<DeltaSchemaMismatchException>(() =>
+            Writer().CreateOrAppendAsync(
+                declared,
+                Array.Empty<string>(),
+                new[] { StagedWith("a.parquet", Struct(F("id", DataTypes.LongType, nullable: false))) }));
+
+        Assert.Equal(DeltaSchemaMismatchKind.PhysicalWriteSchemaMismatch, ex.Kind);
+        Assert.Null(await Log().GetLatestCommitVersionAsync(CancellationToken.None)); // no table created
+    }
+
+    [Fact]
+    public async Task Append_StagedFileWithoutDataSchema_SkipsValidation()
+    {
+        // Back-compat: a StagedDataFile that does NOT carry a DataSchema (a caller that does not supply it)
+        // skips the physical cross-check — the append proceeds on the declared schema exactly as before #497.
+        StructType schema = Struct(F("id", DataTypes.LongType, nullable: false));
+        await SeedSchemaTableAsync(schema);
+        Snapshot readSnapshot = await LoadAsync();
+
+        DeltaCommitResult result = await Writer().AppendAsync(
+            readSnapshot, schema, new[] { Staged("a.parquet") });
+
+        Assert.Equal(1L, result.Version);
+    }
+
     private static string[] ActivePaths(Snapshot snapshot) =>
         snapshot.ActiveFiles.Select(a => a.Path).OrderBy(p => p, StringComparer.Ordinal).ToArray();
 }

@@ -35,7 +35,7 @@ internal static class ParquetTestHelpers
         using var stream = new MemoryStream(bytes, writable: false);
         var batches = new List<ColumnBatch>();
         await foreach (ColumnBatch batch in new ParquetFileReader().ReadAsync(
-            stream, readSchema, keepRowGroup, CancellationToken.None))
+            stream, readSchema, keepRowGroup, nullFillMissingColumns: false, CancellationToken.None))
         {
             batches.Add(batch);
         }

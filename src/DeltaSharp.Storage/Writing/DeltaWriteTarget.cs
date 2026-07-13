@@ -272,7 +272,8 @@ public sealed class DeltaWriteTarget : IDisposable
                 group.PartitionValues,
                 Size: bytes.LongLength,
                 ModificationTime: modificationTime,
-                Stats: result.Statistics));
+                Stats: result.Statistics,
+                DataSchema: group.DataSchema));
             totalRows += result.RowCount;
         }
 

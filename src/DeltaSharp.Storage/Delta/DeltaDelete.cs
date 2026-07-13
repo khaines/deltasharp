@@ -356,7 +356,7 @@ internal sealed class DeltaDelete
         await using (stream.ConfigureAwait(false))
         {
             await foreach (ColumnBatch dataBatch in _reader
-                .ReadAsync(stream, dataSchema, keepRowGroup: null, cancellationToken)
+                .ReadAsync(stream, dataSchema, keepRowGroup: null, nullFillMissingColumns: false, cancellationToken)
                 .ConfigureAwait(false))
             {
                 ColumnBatch fullBatch = BuildFullBatch(add, tableSchema, dataOrdinalByField, dataBatch);
