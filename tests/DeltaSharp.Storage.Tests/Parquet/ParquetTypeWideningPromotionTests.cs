@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using DeltaSharp.Engine.Columnar;
+using DeltaSharp.Storage;
 using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Types;
 using Xunit;
@@ -31,7 +32,7 @@ public sealed class ParquetTypeWideningPromotionTests
         byte[] bytes = await ParquetTestHelpers.WriteToBytesAsync(writeSchema, new[] { batch });
 
         var readSchema = new StructType(new[] { new StructField("v", wide, nullable: true) });
-        List<ColumnBatch> read = await ParquetTestHelpers.ReadAllAsync(bytes, readSchema);
+        List<ColumnBatch> read = await ParquetTestHelpers.ReadAllAsync(bytes, readSchema, allowTypeWideningPromotion: true);
         ColumnVector vector = read.Single().Column(0);
         Assert.Equal(wide, vector.Type);
         return vector;
@@ -40,25 +41,27 @@ public sealed class ParquetTypeWideningPromotionTests
     [Fact]
     public async Task Byte_To_Short()
     {
+        // Includes NEGATIVE bytes: a masked/unsigned sign-extension regression (e.g. treating sbyte as byte)
+        // would read -1 as 255 and -128 as 128, so these samples pin the signed upcast.
         ColumnVector v = await PromoteAsync(DataTypes.ByteType, DataTypes.ShortType,
-            c => { c.AppendValue((byte)1); c.AppendValue((byte)127); }, 2);
-        Assert.Equal(new short[] { 1, 127 }, v.GetValues<short>().ToArray());
+            c => { c.AppendValue((byte)1); c.AppendValue((byte)127); c.AppendValue(unchecked((byte)(sbyte)-1)); c.AppendValue(unchecked((byte)(sbyte)-128)); }, 4);
+        Assert.Equal(new short[] { 1, 127, -1, -128 }, v.GetValues<short>().ToArray());
     }
 
     [Fact]
     public async Task Byte_To_Int()
     {
         ColumnVector v = await PromoteAsync(DataTypes.ByteType, DataTypes.IntegerType,
-            c => { c.AppendValue((byte)1); c.AppendValue((byte)127); }, 2);
-        Assert.Equal(new[] { 1, 127 }, v.GetValues<int>().ToArray());
+            c => { c.AppendValue((byte)1); c.AppendValue((byte)127); c.AppendValue(unchecked((byte)(sbyte)-1)); c.AppendValue(unchecked((byte)(sbyte)-128)); }, 4);
+        Assert.Equal(new[] { 1, 127, -1, -128 }, v.GetValues<int>().ToArray());
     }
 
     [Fact]
     public async Task Byte_To_Long()
     {
         ColumnVector v = await PromoteAsync(DataTypes.ByteType, DataTypes.LongType,
-            c => { c.AppendValue((byte)1); c.AppendValue((byte)127); }, 2);
-        Assert.Equal(new long[] { 1L, 127L }, v.GetValues<long>().ToArray());
+            c => { c.AppendValue((byte)1); c.AppendValue((byte)127); c.AppendValue(unchecked((byte)(sbyte)-1)); c.AppendValue(unchecked((byte)(sbyte)-128)); }, 4);
+        Assert.Equal(new long[] { 1L, 127L, -1L, -128L }, v.GetValues<long>().ToArray());
     }
 
     [Fact]
@@ -121,6 +124,39 @@ public sealed class ParquetTypeWideningPromotionTests
     }
 
     [Fact]
+    public async Task NarrowFile_WideSchema_WithoutPromotionGate_FailsClosed_NotSilentlyPromoted()
+    {
+        // FIX 1 (fail-close): an OLD Int32 file read under a WIDE `long` schema. The physical→requested type
+        // is a sanctioned widening, but the read-side promotion gate is CLOSED (allowTypeWideningPromotion:
+        // false) — as it is for a table whose protocol does NOT declare the `typeWidening` feature (a
+        // tampered/malformed external log). The read must FAIL CLOSED as SchemaMismatch, never silently
+        // "repair" the narrow file into the wide type.
+        var writeSchema = new StructType(new[] { new StructField("v", DataTypes.IntegerType, nullable: true) });
+        ManagedColumnBatch batch = OneColumn(DataTypes.IntegerType, c => { c.AppendValue(1); c.AppendValue(2); }, 2);
+        byte[] bytes = await ParquetTestHelpers.WriteToBytesAsync(writeSchema, new[] { batch });
+
+        var readSchema = new StructType(new[] { new StructField("v", DataTypes.LongType, nullable: true) });
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(bytes, readSchema, keepRowGroup: null, allowTypeWideningPromotion: false));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+    }
+
+    [Fact]
+    public async Task NarrowFile_WideSchema_WithPromotionGate_Promotes()
+    {
+        // The SAME narrow file + wide schema, but with the promotion gate OPEN (as for a table whose protocol
+        // declares `typeWidening`) → the reader promotes int→long. This pins the enabled/disabled asymmetry.
+        var writeSchema = new StructType(new[] { new StructField("v", DataTypes.IntegerType, nullable: true) });
+        ManagedColumnBatch batch = OneColumn(DataTypes.IntegerType, c => { c.AppendValue(1); c.AppendValue(2); }, 2);
+        byte[] bytes = await ParquetTestHelpers.WriteToBytesAsync(writeSchema, new[] { batch });
+
+        var readSchema = new StructType(new[] { new StructField("v", DataTypes.LongType, nullable: true) });
+        List<ColumnBatch> read = await ParquetTestHelpers.ReadAllAsync(bytes, readSchema, keepRowGroup: null, allowTypeWideningPromotion: true);
+        Assert.Equal(new long[] { 1L, 2L }, read.Single().Column(0).GetValues<long>().ToArray());
+    }
+
+    [Fact]
     public async Task Int_To_Long_ComposesWithNullFillMissingColumn()
     {
         // OLD file: single Int32 column "v". CURRENT schema: widened `long v` PLUS a brand-new column "added"
@@ -139,7 +175,7 @@ public sealed class ParquetTypeWideningPromotionTests
         using var stream = new System.IO.MemoryStream(bytes, writable: false);
         var batches = new List<ColumnBatch>();
         await foreach (ColumnBatch b in new ParquetFileReader().ReadAsync(
-            stream, readSchema, keepRowGroup: null, nullFillMissingColumns: true, System.Threading.CancellationToken.None))
+            stream, readSchema, keepRowGroup: null, nullFillMissingColumns: true, allowTypeWideningPromotion: true, System.Threading.CancellationToken.None))
         {
             batches.Add(b);
         }

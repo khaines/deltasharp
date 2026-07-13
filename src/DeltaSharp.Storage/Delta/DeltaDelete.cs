@@ -239,6 +239,12 @@ internal sealed class DeltaDelete
         int[] dataOrdinalByField = MapDataOrdinals(tableSchema, dataSchema, partitionColumns);
         long timestamp = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
 
+        // Read-side type-widening promotion gate (#495): a narrow-physical file is promoted into the current
+        // (widened) schema only when the snapshot's protocol declares the `typeWidening` feature. We know the
+        // protocol here, so we pass it to the reader; without the feature a narrow file fails closed rather
+        // than being silently promoted.
+        bool allowTypeWideningPromotion = TypeWideningFeature.Supports(readSnapshot.Protocol);
+
         var actions = new List<DeltaAction>();
         var inputPaths = new List<string>();
         int filesWithDeletionVector = 0;
@@ -250,7 +256,7 @@ internal sealed class DeltaDelete
             cancellationToken.ThrowIfCancellationRequested();
 
             FileDeletionPlan plan = await PlanFileDeletionAsync(
-                add, tableSchema, dataSchema, dataOrdinalByField, predicate, cancellationToken)
+                add, tableSchema, dataSchema, dataOrdinalByField, predicate, allowTypeWideningPromotion, cancellationToken)
                 .ConfigureAwait(false);
 
             if (plan.NewlyDeletedCount == 0)
@@ -325,6 +331,7 @@ internal sealed class DeltaDelete
         StructType dataSchema,
         int[] dataOrdinalByField,
         DeltaDeletePredicate predicate,
+        bool allowTypeWideningPromotion,
         CancellationToken cancellationToken)
     {
         // Seed with the file's existing DV positions (a prior delete on the same file), so a second delete
@@ -356,7 +363,7 @@ internal sealed class DeltaDelete
         await using (stream.ConfigureAwait(false))
         {
             await foreach (ColumnBatch dataBatch in _reader
-                .ReadAsync(stream, dataSchema, keepRowGroup: null, nullFillMissingColumns: false, cancellationToken)
+                .ReadAsync(stream, dataSchema, keepRowGroup: null, nullFillMissingColumns: false, allowTypeWideningPromotion, cancellationToken)
                 .ConfigureAwait(false))
             {
                 ColumnBatch fullBatch = BuildFullBatch(add, tableSchema, dataOrdinalByField, dataBatch);

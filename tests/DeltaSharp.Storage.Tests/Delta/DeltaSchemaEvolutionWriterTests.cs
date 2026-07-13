@@ -562,8 +562,9 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
         Assert.Equal("integer", from);
         Assert.Equal("long", to);
 
-        // The OLD Int32 v0 file is still readable under the now-wide `long` schema: promotion on read.
-        List<ColumnBatch> promoted = await ParquetTestHelpers.ReadAllAsync(oldFile, evolved);
+        // The OLD Int32 v0 file is still readable under the now-wide `long` schema: promotion on read (the
+        // committed table declares the typeWidening feature, so the read-side promotion gate is open).
+        List<ColumnBatch> promoted = await ParquetTestHelpers.ReadAllAsync(oldFile, evolved, keepRowGroup: null, allowTypeWideningPromotion: true);
         Assert.Equal(new long[] { 1L, 2L, 3L }, promoted.Single().Column(0).GetValues<long>().ToArray());
     }
 }

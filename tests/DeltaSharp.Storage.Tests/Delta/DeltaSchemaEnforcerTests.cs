@@ -189,7 +189,9 @@ public sealed class DeltaSchemaEnforcerTests
     public static TheoryData<DataType, DataType> WouldBeWidenings() => new()
     {
         { DataTypes.ByteType, DataTypes.ShortType },
+        { DataTypes.ByteType, DataTypes.IntegerType },
         { DataTypes.ShortType, DataTypes.IntegerType },
+        { DataTypes.ShortType, DataTypes.LongType },
         { DataTypes.IntegerType, DataTypes.LongType },
         { DataTypes.ByteType, DataTypes.LongType },
         { DataTypes.FloatType, DataTypes.DoubleType },
@@ -583,8 +585,11 @@ public sealed class DeltaSchemaEnforcerTests
 
     [Theory]
     [MemberData(nameof(RejectedPromotions))]
-    public void Reconcile_IntegralToFloatingPromotion_IsRejected(DataType from, DataType to)
+    public void Reconcile_LossyFloatingPromotion_IsRejectedAsIncompatible(DataType from, DataType to)
     {
+        // These are NOT Delta-sanctioned widenings (int→float and long→float lose precision; long→double is
+        // lossy), so they are the generic IncompatibleType — distinct from the cross-family SANCTIONED
+        // widenings (int→double, int/long→decimal) which are TypeWideningUnsupported/deferred #535 below.
         StructType table = Schema(Field("value", from, nullable: true));
         StructType write = Schema(Field("value", to, nullable: true));
 
@@ -596,11 +601,56 @@ public sealed class DeltaSchemaEnforcerTests
 
     public static TheoryData<DataType, DataType> RejectedPromotions() => new()
     {
-        { DataTypes.IntegerType, DataTypes.DoubleType },
         { DataTypes.LongType, DataTypes.DoubleType },
         { DataTypes.LongType, DataTypes.FloatType },
         { DataTypes.IntegerType, DataTypes.FloatType },
     };
+
+    // ---- FIX 3 (#535): cross-family SANCTIONED widenings are deferred, distinct from IncompatibleType ----
+
+    [Theory]
+    [MemberData(nameof(CrossFamilyDeferredWidenings))]
+    public void Reconcile_CrossFamilyWidening_IsDeferred_AsTypeWideningUnsupported(DataType from, DataType to, bool enabled)
+    {
+        // int→double / long→decimal etc. ARE Delta-sanctioned but this build DEFERS them (#535). They are
+        // surfaced DISTINCTLY as TypeWideningUnsupported (naming #535), NOT the generic IncompatibleType a
+        // string→int gets — even when the feature is enabled (cross-family deferral is enablement-independent).
+        StructType table = Schema(Field("value", from, nullable: true));
+        StructType write = Schema(Field("value", to, nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: enabled));
+
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+        Assert.Contains("#535", ex.Message, System.StringComparison.Ordinal);
+    }
+
+    public static TheoryData<DataType, DataType, bool> CrossFamilyDeferredWidenings() => new()
+    {
+        { DataTypes.IntegerType, DataTypes.DoubleType, true },
+        { DataTypes.IntegerType, DataTypes.DoubleType, false },
+        { DataTypes.ByteType, DataTypes.DoubleType, true },
+        { DataTypes.ShortType, DataTypes.DoubleType, true },
+        { DataTypes.LongType, DataTypes.CreateDecimalType(20, 0), true },
+        { DataTypes.IntegerType, DataTypes.CreateDecimalType(12, 2), true },
+        { DataTypes.ByteType, DataTypes.CreateDecimalType(5, 0), false },
+    };
+
+    [Fact]
+    public void Reconcile_UnrelatedChange_IsIncompatible_DistinctFromCrossFamilyDeferred()
+    {
+        // string→int is NOT a Delta-sanctioned change at all → the generic IncompatibleType, distinct from
+        // the cross-family SANCTIONED-but-deferred widenings above.
+        StructType table = Schema(Field("value", DataTypes.StringType, nullable: true));
+        StructType write = Schema(Field("value", DataTypes.IntegerType, nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+
+        Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
+    }
 
     // ---- Determinism / totality ------------------------------------------------------------------------
 
@@ -736,6 +786,22 @@ public sealed class DeltaSchemaEnforcerTests
     }
 
     [Fact]
+    public void Reconcile_LongToDouble_WhenEnabled_IsRejectedAsIncompatible()
+    {
+        // long→double is LOSSY (a 64-bit integer exceeds double's 53-bit mantissa) and NOT Delta-sanctioned —
+        // it is neither an applied widening nor a cross-family deferral, so it stays IncompatibleType even
+        // when the feature is enabled (fail-closed).
+        StructType table = Schema(Field("value", DataTypes.LongType, nullable: true));
+        StructType write = Schema(Field("value", DataTypes.DoubleType, nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+
+        Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
+    }
+
+    [Fact]
     public void Reconcile_UnrelatedChange_WhenEnabled_IsRejectedAsIncompatible()
     {
         // int→string is not a sanctioned widening: IncompatibleType even with the feature enabled.
@@ -764,12 +830,31 @@ public sealed class DeltaSchemaEnforcerTests
     }
 
     [Fact]
-    public void Reconcile_PartitionColumnWidening_WhenEnabled_IsStillRejected()
+    public void Reconcile_PartitionColumnWidening_WhenEnabled_IsDeferred_NotRewriteClaim()
     {
-        // A partition column's type is encoded in the physical layout, so widening it is rejected even with
-        // the feature enabled (PartitionColumnEvolutionUnsupported).
+        // FIX 2 (#537): a partition-column WIDENING is Delta-sanctioned WITHOUT a rewrite (partition values
+        // are strings), so it is NOT the factually-wrong "requires a full table rewrite" case. This build
+        // DEFERS it (#537): still rejected, but classified DISTINCTLY as TypeWideningUnsupported with an
+        // honest message naming #537 — never PartitionColumnEvolutionUnsupported.
         StructType table = Schema(Field("part", DataTypes.IntegerType, nullable: true));
         StructType write = Schema(Field("part", DataTypes.LongType, nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: new[] { "part" }, typeWideningEnabled: true));
+
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+        Assert.Equal("part", ex.Path);
+        Assert.Contains("#537", ex.Message, System.StringComparison.Ordinal);
+        Assert.DoesNotContain("requires a full table rewrite", ex.Message, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Reconcile_PartitionColumnNonWideningChange_IsRejectedAsPartitionColumnEvolution()
+    {
+        // A NON-widening partition-column type change (int→string) keeps the existing classification.
+        StructType table = Schema(Field("part", DataTypes.IntegerType, nullable: true));
+        StructType write = Schema(Field("part", DataTypes.StringType, nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(

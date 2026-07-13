@@ -38,7 +38,7 @@ public sealed class DeltaSchemaWideningReadBackTests
         // Reading the SAME file under a widened `long` schema (what int->long evolution installs as the table
         // schema) now SUCCEEDS: the reader reads the narrow Int32 values and promotes them into a long vector.
         var widenedSchema = new StructType(new[] { new StructField("value", DataTypes.LongType, nullable: false) });
-        List<ColumnBatch> promoted = await ParquetTestHelpers.ReadAllAsync(bytes, widenedSchema);
+        List<ColumnBatch> promoted = await ParquetTestHelpers.ReadAllAsync(bytes, widenedSchema, keepRowGroup: null, allowTypeWideningPromotion: true);
 
         ColumnVector vector = promoted.Single().Column(0);
         Assert.Equal(DataTypes.LongType, vector.Type);

@@ -83,6 +83,45 @@ internal static class TypeWidening
         return from is DateType && to is TimestampType;
     }
 
+    /// <summary>
+    /// Whether <paramref name="from"/> → <paramref name="to"/> is a <b>cross-family</b> widening that Delta
+    /// sanctions (Delta PROTOCOL.md "Type Widening" → "supported type changes") but this build <b>defers</b>
+    /// (keeps fail-closed), tracked in <b>#535</b>: the integral-to-floating and integral-to-decimal
+    /// promotions the read path does not yet materialize —
+    /// <list type="bullet">
+    /// <item><c>byte</c>/<c>short</c>/<c>int</c> → <c>double</c> (Delta sanctions integral→double up to
+    /// <c>int</c>; <c>long → double</c> is <b>lossy</b> and is NOT sanctioned, so it stays
+    /// <see cref="DeltaSchemaMismatchKind.IncompatibleType"/>);</item>
+    /// <item><c>byte</c>/<c>short</c>/<c>int</c>/<c>long</c> → <c>decimal</c>.</item>
+    /// </list>
+    /// Recognized here so the enforcer surfaces them <b>distinctly</b> (as
+    /// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>, naming the #535 deferral) rather than as
+    /// the generic <see cref="DeltaSchemaMismatchKind.IncompatibleType"/> a <c>string→int</c> gets — they ARE
+    /// Delta-sanctioned, just not applied yet. Symmetric to the <see cref="IsDeferredWidening">date→timestamp</see>
+    /// (#533) deferral. Independent of enablement: a cross-family widening is deferred even when the table
+    /// enables type widening.
+    /// </summary>
+    public static bool IsDeferredCrossFamilyWidening(DataType from, DataType to)
+    {
+        ArgumentNullException.ThrowIfNull(from);
+        ArgumentNullException.ThrowIfNull(to);
+
+        int fromRank = IntegralRank(from);
+        if (fromRank < 0)
+        {
+            return false;
+        }
+
+        // byte/short/int → double (rank 0..2); long → double is lossy and NOT sanctioned.
+        if (to is DoubleType)
+        {
+            return fromRank <= 2;
+        }
+
+        // byte/short/int/long → decimal.
+        return to is DecimalType;
+    }
+
     private static int IntegralRank(DataType type) => type switch
     {
         ByteType => 0,

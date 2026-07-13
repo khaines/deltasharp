@@ -68,6 +68,14 @@ public sealed class TypeWideningProtocolTests : IDisposable
     }
 
     [Fact]
+    public void EnsureWritable_AllowsPreviewSpelling_OnWrite()
+    {
+        // Mirror of EnsureReadable_AllowsPreviewSpelling_OnRead: the older `typeWidening-preview` spelling is
+        // also accepted on the write-side protocol gate (it is in SupportedWriterFeatures for interop).
+        ProtocolSupport.EnsureWritable(new ProtocolAction(3, 7, ["typeWidening-preview"], ["typeWidening-preview"]));
+    }
+
+    [Fact]
     public void TypeWideningFeature_Protocol_CommitsV3V7WithFeatureInBothLists()
     {
         ProtocolAction protocol = TypeWideningFeature.Protocol();

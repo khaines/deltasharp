@@ -150,7 +150,10 @@ internal sealed class DeltaTableWriter
     /// here, so the table is left completely unchanged (reject-before-commit). When
     /// <paramref name="evolutionMode"/> allows an additive change (a new nullable column) the merged schema
     /// is committed as a <c>metaData</c> action in the <b>same</b> version as the new adds (atomic
-    /// evolution). No existing column's type is ever changed — type widening is fail-closed (#495). Commits
+    /// evolution). An existing column's type is changed only by an <b>applied Delta-sanctioned type widening</b>
+    /// (#495) — and only when the table enables it (the <c>typeWidening</c> table feature is present AND
+    /// <c>delta.enableTypeWidening=true</c>); otherwise a would-be widening stays fail-closed
+    /// (<see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>). Commits
     /// under <see cref="DeltaReadScope.BlindAppend"/>; an evolution append additionally carries metadata, so
     /// any concurrent commit aborts it (a schema change needs a fresh snapshot — AC4).
     /// </summary>

@@ -11,8 +11,9 @@ namespace DeltaSharp.Storage.Delta;
 /// never silently read an unsupported table feature).
 ///
 /// <para><b>v1 baseline.</b> This reader implements the <i>basic</i> reader (protocol reader version 1) and
-/// understands the reader-version-3 "table features" protocol, but implements <b>no advanced reader
-/// features</b> (<see cref="SupportedReaderFeatures"/> is empty). Consequently:
+/// understands the reader-version-3 "table features" protocol, implementing the advanced reader features
+/// <c>columnMapping</c> (name mode), <c>deletionVectors</c>, and <c>typeWidening</c>
+/// (<see cref="SupportedReaderFeatures"/>). Consequently:
 /// <list type="bullet">
 /// <item>reader version 1 tables are served;</item>
 /// <item>reader version 2 tables (legacy column mapping) fail closed — column mapping is not implemented;</item>
@@ -83,8 +84,10 @@ internal static class ProtocolSupport
     /// an unsupported writer feature).
     ///
     /// <para><b>v1 baseline.</b> Writer versions 1–2 (basic + <c>appendOnly</c>/invariants era) are writable,
-    /// and writer version 7 ("table features") is writable only when it requires <b>no</b> writer feature;
-    /// every other writer version and any named writer feature fails closed. This mirrors the reader
+    /// and writer version 7 ("table features") is writable only when every named <c>writerFeatures</c> entry
+    /// is one this build implements (<c>columnMapping</c>, <c>deletionVectors</c>, <c>typeWidening</c> —
+    /// <see cref="SupportedWriterFeatures"/>); every other writer version and any unimplemented named writer
+    /// feature fails closed. This mirrors the reader
     /// baseline (<see cref="EnsureReadable"/>) and is deliberately conservative — being <i>stricter</i> than
     /// Delta on an unimplemented feature never yields a wrong write.</para>
     /// </summary>

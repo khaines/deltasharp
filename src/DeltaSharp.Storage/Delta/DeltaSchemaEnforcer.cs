@@ -27,6 +27,9 @@ namespace DeltaSharp.Storage.Delta;
 /// scale both non-decreasing). When the table does <b>not</b> enable type widening, such a change is rejected
 /// distinctly as <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> (naming the enablement
 /// requirement); every other differing type is <see cref="DeltaSchemaMismatchKind.IncompatibleType"/>.
+/// The <b>cross-family</b> sanctioned widenings (integral→<c>double</c>, integral→<c>decimal</c>) are DEFERRED
+/// (#535) — rejected distinctly as <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> (naming #535),
+/// never the generic <see cref="DeltaSchemaMismatchKind.IncompatibleType"/>, because they ARE Delta-sanctioned.
 /// <c>date→timestamp</c> is always rejected (as <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>):
 /// Delta only sanctions <c>date→timestamp_ntz</c>, which needs a not-yet-existing NTZ type. Widening inside an
 /// array element / map key/value is not applied (it would need a <c>fieldPath</c> and the Parquet read path
@@ -42,8 +45,10 @@ namespace DeltaSharp.Storage.Delta;
 /// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>); any other differing type is rejected —
 /// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> for a would-be/deferred widening,
 /// <see cref="DeltaSchemaMismatchKind.IncompatibleType"/> for anything else. A differing <b>partition</b>
-/// column's type is rejected earlier and more clearly as
-/// <see cref="DeltaSchemaMismatchKind.PartitionColumnEvolutionUnsupported"/>.</item>
+/// column's type is rejected earlier and more clearly: a non-widening change as
+/// <see cref="DeltaSchemaMismatchKind.PartitionColumnEvolutionUnsupported"/>; a would-be Delta-sanctioned
+/// widening (which Delta allows without a rewrite — partition values are strings — but this build defers,
+/// #537) distinctly as <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>.</item>
 /// <item><b>Nullability.</b> The table's nullability is authoritative and never tightened: writing a
 /// non-null value into a nullable column is fine. Writing a nullable value into a required column — or
 /// relaxing a required column to nullable — is <b>always</b> rejected
@@ -88,8 +93,11 @@ internal static class DeltaSchemaEnforcer
     /// <param name="writeSchema">The incoming write's schema.</param>
     /// <param name="mode">Which additive evolution (if any) is permitted.</param>
     /// <param name="partitionColumns">The table's partition columns (top-level names). A differing partition
-    /// column type is rejected with a clear <see cref="DeltaSchemaMismatchKind.PartitionColumnEvolutionUnsupported"/>
-    /// reason. May be <see langword="null"/>/empty for an unpartitioned table.</param>
+    /// column type is rejected: a non-widening change with a clear
+    /// <see cref="DeltaSchemaMismatchKind.PartitionColumnEvolutionUnsupported"/> reason, a would-be
+    /// Delta-sanctioned widening (deferred #537) distinctly as
+    /// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>. May be <see langword="null"/>/empty for
+    /// an unpartitioned table.</param>
     /// <param name="typeWideningEnabled">Whether the table enables applying Delta-sanctioned type widenings
     /// (the <c>typeWidening</c> table feature is present AND <c>delta.enableTypeWidening</c> is set — see
     /// <see cref="TypeWideningFeature.IsWriteEnabled"/>). When <see langword="false"/> a would-be widening is
@@ -134,14 +142,28 @@ internal static class DeltaSchemaEnforcer
             string path = Combine(parentPath, tableField.Name);
             if (writeStruct.TryGetField(tableField.Name, out StructField writeField))
             {
-                // A partition column's type cannot be evolved (it is encoded in the table layout) — reject a
-                // differing type here, before the generic type classification, for a clearer reason, and even
-                // when it WOULD be a sanctioned widening (the widening is not applicable to a partition
-                // column). Partition columns are top-level, so this only applies at parentPath == null.
+                // A partition column's type change is rejected here, before the generic type classification,
+                // for a clearer reason. Two distinct honest cases:
+                //   (a) The change WOULD be a Delta-sanctioned widening AND type widening is enabled: Delta
+                //       DOES sanction partition-column widening WITHOUT a rewrite (partition values are stored
+                //       as strings in the log / directory names — verified vs Delta's golden
+                //       TypeWideningAlterTableSuite), but this build DEFERS it (#537). It stays fail-closed,
+                //       classified distinctly (TypeWideningUnsupported) with an HONEST message — not the
+                //       factually-wrong "requires a full table rewrite" reason.
+                //   (b) Any other partition-column type change (a non-widening, or widening not enabled) keeps
+                //       the existing PartitionColumnEvolutionUnsupported classification.
+                // Partition columns are top-level, so this only applies at parentPath == null.
                 if (partitionColumns is not null
                     && partitionColumns.Contains(tableField.Name)
                     && !tableField.DataType.Equals(writeField.DataType))
                 {
+                    if (typeWideningEnabled
+                        && TypeWidening.IsSanctionedWidening(tableField.DataType, writeField.DataType))
+                    {
+                        throw DeltaSchemaMismatchException.PartitionColumnWideningDeferred(
+                            path, tableField.DataType.SimpleString, writeField.DataType.SimpleString);
+                    }
+
                     throw DeltaSchemaMismatchException.PartitionColumnEvolution(
                         path, tableField.DataType.SimpleString, writeField.DataType.SimpleString);
                 }
@@ -277,6 +299,16 @@ internal static class DeltaSchemaEnforcer
                 if (allowWidenApply && typeWideningEnabled && TypeWidening.IsSanctionedWidening(tableType, writeType))
                 {
                     return writeType;
+                }
+
+                // Cross-family sanctioned widenings (integral→double, integral→decimal) are DEFERRED (#535)
+                // even when enabled — surfaced distinctly (TypeWideningUnsupported, naming #535) rather than
+                // as the generic IncompatibleType a truly-unrelated change (string→int) gets, because they
+                // ARE Delta-sanctioned, just not applied yet. Independent of enablement.
+                if (TypeWidening.IsDeferredCrossFamilyWidening(tableType, writeType))
+                {
+                    throw DeltaSchemaMismatchException.TypeWideningCrossFamilyDeferred(
+                        path, tableType.SimpleString, writeType.SimpleString);
                 }
 
                 if (TypeWidening.IsSanctionedWidening(tableType, writeType)
