@@ -58,7 +58,7 @@ public sealed class DeletionVectorReadWriteTests : IDisposable
 
         int parquetBefore = CountFiles("*.parquet");
 
-        var delete = new DeltaDelete(new LocalFileSystemBackend(_root));
+        var delete = NewDelete(new LocalFileSystemBackend(_root), "excludes-deleted-rows");
         DeleteResult result = await delete.DeleteAsync(WhereId(id => id == 2 || id == 4));
 
         Assert.NotNull(result.CommittedVersion);
@@ -83,7 +83,7 @@ public sealed class DeletionVectorReadWriteTests : IDisposable
         await CreateDeletionVectorTableAsync(Batch((10, "x"), (20, "y"), (30, "z"), (40, "w")));
 
         var backend = new LocalFileSystemBackend(_root);
-        var delete = new DeltaDelete(backend);
+        var delete = NewDelete(backend, "keeps-physical-numrecords");
         await delete.DeleteAsync(WhereId(id => id == 20));
 
         // Writer requirement (matching Spark): the DV-carrying add reports the PHYSICAL data-file row count
@@ -110,7 +110,7 @@ public sealed class DeletionVectorReadWriteTests : IDisposable
         await CreateDeletionVectorTableAsync(Batch((1, "a"), (2, "b"), (3, "c")));
 
         var backend = new LocalFileSystemBackend(_root);
-        var delete = new DeltaDelete(backend);
+        var delete = NewDelete(backend, "every-row-removes-file");
         DeleteResult result = await delete.DeleteAsync(WhereId(_ => true));
 
         Assert.Equal(3, result.RowsDeleted);
@@ -129,7 +129,7 @@ public sealed class DeletionVectorReadWriteTests : IDisposable
     {
         long v0 = await CreateDeletionVectorTableAsync(Batch((1, "a"), (2, "b"), (3, "c"), (4, "d")));
 
-        var delete = new DeltaDelete(new LocalFileSystemBackend(_root));
+        var delete = NewDelete(new LocalFileSystemBackend(_root), "time-travel");
         DeleteResult result = await delete.DeleteAsync(WhereId(id => id == 1 || id == 3));
         long v1 = result.CommittedVersion!.Value;
         Assert.True(v1 > v0);
@@ -155,8 +155,8 @@ public sealed class DeletionVectorReadWriteTests : IDisposable
         var backend = new LocalFileSystemBackend(_root);
         Snapshot readSnapshot = await new DeltaLog(backend).LoadSnapshotAsync();
 
-        var winner = new DeltaDelete(backend);
-        var loser = new DeltaDelete(backend);
+        var winner = NewDelete(backend, "concurrent-winner");
+        var loser = NewDelete(backend, "concurrent-loser");
 
         // The loser reads the same snapshot, but just before it commits, the winner commits a DELETE of a
         // different row from the SAME file. The loser's ReadFiles scope over that path then detects the
@@ -183,7 +183,7 @@ public sealed class DeletionVectorReadWriteTests : IDisposable
             await target.AppendAsync(FlatSchema, Array.Empty<string>(), new[] { Batch((1, "a"), (2, "b")) });
         }
 
-        var delete = new DeltaDelete(new LocalFileSystemBackend(_root));
+        var delete = NewDelete(new LocalFileSystemBackend(_root), "fail-closed-no-dv-support");
 
         // The DELETE must fail closed (never silently ignore the request and leave deleted rows readable).
         await Assert.ThrowsAsync<DeltaProtocolException>(

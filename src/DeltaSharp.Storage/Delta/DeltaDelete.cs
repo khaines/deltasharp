@@ -400,9 +400,7 @@ internal sealed class DeltaDelete
     {
         Guid uuid = _idSource.NextId();
         string pathOrInlineDv = DeletionVectorDescriptor.BuildRelativePathOrInlineDv(string.Empty, uuid);
-        string relativePath = DeletionVectorDescriptor
-            .ForRelativePath(pathOrInlineDv, offset: 1, sizeInBytes: 0, cardinality)
-            .ResolveRelativePath();
+        string relativePath = DeletionVectorDescriptor.ResolveRelativePath(pathOrInlineDv);
 
         (int offset, int sizeInBytes) = await DeletionVectorStore
             .WriteOnDiskAsync(_backend, relativePath, sortedDistinctPositions, cancellationToken)

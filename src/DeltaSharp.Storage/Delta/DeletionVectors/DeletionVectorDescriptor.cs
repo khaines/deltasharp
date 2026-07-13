@@ -67,15 +67,29 @@ internal sealed record DeletionVectorDescriptor(
                 "A relative on-disk path can only be derived for a 'u' (relative-path-via-UUID) deletion vector.");
         }
 
-        if (PathOrInlineDv.Length < Z85.EncodedUuidLength)
+        return ResolveRelativePath(PathOrInlineDv);
+    }
+
+    /// <summary>
+    /// Derives the table-root-relative on-disk <c>.bin</c> path from a <c>'u'</c> DV's
+    /// <c>&lt;random prefix&gt;&lt;20-char Z85 uuid&gt;</c> value (protocol "Derived Fields"), without
+    /// materializing a descriptor instance. The last 20 characters are the Z85-encoded UUID; anything
+    /// before them is the directory prefix.
+    /// </summary>
+    /// <exception cref="DeltaStorageException">The encoded UUID is malformed (fail closed).</exception>
+    public static string ResolveRelativePath(string pathOrInlineDv)
+    {
+        ArgumentNullException.ThrowIfNull(pathOrInlineDv);
+
+        if (pathOrInlineDv.Length < Z85.EncodedUuidLength)
         {
             throw DeltaStorageException.CorruptData(
                 "A Delta deletion vector's relative path is shorter than the 20-character encoded UUID; the descriptor is corrupt.");
         }
 
-        int prefixLength = PathOrInlineDv.Length - Z85.EncodedUuidLength;
-        string prefix = PathOrInlineDv[..prefixLength];
-        string encodedUuid = PathOrInlineDv[prefixLength..];
+        int prefixLength = pathOrInlineDv.Length - Z85.EncodedUuidLength;
+        string prefix = pathOrInlineDv[..prefixLength];
+        string encodedUuid = pathOrInlineDv[prefixLength..];
         Guid uuid = Z85.DecodeUuid(encodedUuid);
         string fileName = RelativeFileNamePrefix + uuid.ToString("D", CultureInfo.InvariantCulture) + BinExtension;
         return prefix.Length == 0 ? fileName : prefix + "/" + fileName;
