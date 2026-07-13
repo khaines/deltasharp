@@ -171,6 +171,27 @@ internal sealed class ParquetFileReader
         }
     }
 
+    /// <summary>
+    /// Reads only the Parquet footer and reconstructs the file's <b>actual physical data schema</b> (field
+    /// names + DeltaSharp types via <see cref="ParquetTypeMapping.ToDataSchema"/>), decoding no data pages.
+    /// The write-door records this on each staged file so schema enforcement gates the <b>real written
+    /// bytes</b>, not the caller's declared write schema (#497). Nullability is the footer's view (Parquet
+    /// models string/binary as nullable); callers compare the returned schema by name + type only.
+    /// </summary>
+    /// <exception cref="DeltaStorageException">The footer is malformed/truncated
+    /// (<see cref="StorageErrorKind.CorruptData"/>), or a footer field has no supported DeltaSharp type
+    /// mapping (<see cref="StorageErrorKind.UnsupportedFeature"/>).</exception>
+    public async Task<StructType> ReadDataSchemaAsync(Stream input, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+
+        ParquetReader reader = await OpenAsync(input, cancellationToken).ConfigureAwait(false);
+        await using (reader.ConfigureAwait(false))
+        {
+            return ParquetTypeMapping.ToDataSchema(reader.Schema);
+        }
+    }
+
     /// <summary>The declared compressed/decompressed footprint of one projected column chunk, plus the
     /// per-row width of the read buffer the reader will eagerly allocate for it (including any
     /// <see cref="Nullable{T}"/> overhead) — the inputs to <see cref="EnsureDecodeCeiling"/>.

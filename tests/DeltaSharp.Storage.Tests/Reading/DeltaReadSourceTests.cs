@@ -4,6 +4,7 @@ using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
+using DeltaSharp.Storage.Delta.DeletionVectors;
 using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Storage.Reading;
 using DeltaSharp.Storage.Writing;
@@ -316,6 +317,58 @@ public sealed class DeltaReadSourceTests : IDisposable
             () => source.ReadBatchesAsync(info.Version));
         Assert.Equal("part-narrow.parquet", ex.FilePath);
         Assert.Contains("required", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task EvolvedNarrowFile_WithDeletionVector_NullFillsAndAppliesDv_Issue497()
+    {
+        // The DV × null-fill composition (QueryExec/Delta council ask): a narrow {id} DV-enabled file gets a
+        // row deleted (DV), THEN the table is additively evolved to {id, name}. Reading the latest snapshot
+        // must both NULL-FILL the later-added `name` on the narrow file AND apply its DV (exclude the deleted
+        // physical row) — the null-fill materializes exactly rowCount rows so the DV's physical-ordinal
+        // alignment is preserved.
+        var narrow = new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) });
+        StructType wide = FlatSchema;
+
+        var backend = new LocalFileSystemBackend(_root);
+        try
+        {
+            // v0: DV-enabled narrow table with rows 10, 11, 12.
+            using (DeltaWriteTarget target = WriteTarget())
+            {
+                await target.CreateDeletionVectorTableAsync(narrow, Array.Empty<string>(), new[] { NarrowBatch(10, 11, 12) });
+            }
+
+            // v1: DELETE id==11 → a deletion vector over the narrow file (DELETE reads {id} strictly).
+            var delete = new DeltaDelete(
+                backend, new DeltaLog(backend), new DeltaCommitter(backend),
+                idSource: new SeededDeletionVectorIdSource("dv-nullfill"));
+            DeleteResult deleted = await delete.DeleteAsync(
+                DeltaDeletePredicate.FromRowPredicate((b, r) => b.SelectedColumn(0).GetValue<long>(r) == 11));
+            Assert.Equal(1, deleted.RowsDeleted);
+
+            // v2: additively evolve to {id, name} with a wide file (AddNewColumns).
+            Snapshot afterDelete = await new DeltaLog(backend).LoadSnapshotAsync();
+            StagedDataFile wideFile = await StageAsync(
+                backend, new ParquetFileWriter(), "part-wide.parquet", wide, FlatBatch((20, "twenty")));
+            await new DeltaTableWriter(backend).AppendAsync(
+                afterDelete, wide, new[] { wideFile }, SchemaEvolutionMode.AddNewColumns);
+        }
+        finally
+        {
+            backend.Dispose();
+        }
+
+        using DeltaReadSource source = ReadSource();
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        List<(long Id, string? Name)> rows = await ReadFlatAsync(source, info.Version);
+
+        // Row 11 excluded by the DV; 10 and 12 survive with `name` null-filled; the wide row carries its value.
+        Assert.Equal(3, rows.Count);
+        Assert.Contains((10L, (string?)null), rows);
+        Assert.Contains((12L, (string?)null), rows);
+        Assert.Contains((20L, "twenty"), rows);
+        Assert.DoesNotContain(rows, r => r.Id == 11);
     }
 
     // ---------------------------------------------------------------- pinning: no analysis→execution TOCTOU

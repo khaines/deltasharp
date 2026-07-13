@@ -1,6 +1,8 @@
 using System.Collections.Immutable;
+using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
+using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Types;
 using Xunit;
 using StructField = DeltaSharp.Types.StructField;
@@ -424,6 +426,57 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
             readSnapshot, schema, new[] { Staged("a.parquet") });
 
         Assert.Equal(1L, result.Version);
+    }
+
+    [Fact]
+    public async Task Append_FooterDerivedSchemaDivergesFromDeclared_IsRejected_GatesRealBytes()
+    {
+        // #497 (the core anti-bypass proof): write a REAL Parquet file with schema {id} only, derive its
+        // DataSchema from the ACTUAL footer (ReadDataSchemaAsync), then commit declaring the wider schema
+        // {id, name}. Because DataSchema comes from the real bytes — not the declaration — the commit-time
+        // cross-check catches the divergence and rejects it. This is what makes the check gate the real
+        // bytes rather than re-validating the declaration against itself.
+        StructType declared = Struct(
+            F("id", DataTypes.LongType, nullable: false),
+            F("name", DataTypes.StringType, nullable: true));
+        await SeedSchemaTableAsync(declared);
+        Snapshot readSnapshot = await LoadAsync();
+
+        StagedDataFile realFile = await StageRealFileAsync(
+            "real.parquet", Struct(F("id", DataTypes.LongType, nullable: false)), new long[] { 1, 2, 3 });
+        // The footer-derived DataSchema reflects the real narrow bytes, not the wide declaration.
+        Assert.NotNull(realFile.DataSchema);
+        Assert.Single(realFile.DataSchema!);
+        Assert.Equal("id", realFile.DataSchema![0].Name);
+
+        DeltaSchemaMismatchException ex = await Assert.ThrowsAsync<DeltaSchemaMismatchException>(() =>
+            Writer().AppendAsync(readSnapshot, declared, new[] { realFile }));
+
+        Assert.Equal(DeltaSchemaMismatchKind.PhysicalWriteSchemaMismatch, ex.Kind);
+        Assert.Contains("real.parquet", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0L, (await LoadAsync()).Version); // nothing published
+    }
+
+    // Writes a REAL Parquet file (id:long column) to the backend under an arbitrary declared schema, then
+    // records a StagedDataFile whose DataSchema is derived from the ACTUAL written footer (mirroring the
+    // production write-door), so a test can prove the commit-time check gates real bytes.
+    private async Task<StagedDataFile> StageRealFileAsync(string path, StructType writeSchema, long[] ids)
+    {
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, ids.Length);
+        foreach (long value in ids)
+        {
+            id.AppendValue(value);
+        }
+
+        var batch = new ManagedColumnBatch(writeSchema, new ColumnVector[] { id }, ids.Length);
+        using var buffer = new MemoryStream();
+        await new ParquetFileWriter().WriteAsync(buffer, writeSchema, new[] { batch }, CancellationToken.None);
+        byte[] bytes = buffer.ToArray();
+        await _backend.PutIfAbsentAsync(path, bytes, CancellationToken.None);
+
+        using var footer = new MemoryStream(bytes, writable: false);
+        StructType actual = await new ParquetFileReader().ReadDataSchemaAsync(footer, CancellationToken.None);
+        return new StagedDataFile(path, NoPartition, Size: bytes.LongLength, ModificationTime: 1L, Stats: null, DataSchema: actual);
     }
 
     private static string[] ActivePaths(Snapshot snapshot) =>

@@ -298,6 +298,115 @@ public sealed class ParquetReaderTests
         Assert.Contains("is not present", error.Message, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task NullFill_PresentColumnWrongType_StillFailsClosed_WithFlagOn()
+    {
+        // Null-fill NEVER masks a genuine incompatibility: a column PRESENT in the file with a disagreeing
+        // physical type is still rejected as SchemaMismatch even with nullFillMissingColumns: true (it is not
+        // silently null-filled or coerced) — the "never masks a mismatch" promise, verified with the flag ON.
+        var writeSchema = new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) });
+        ColumnBatch batch = BuildLongBatch(writeSchema, new long[] { 1, 2 });
+        using var stream = new MemoryStream();
+        await new ParquetFileWriter().WriteAsync(stream, writeSchema, new[] { batch }, CancellationToken.None);
+        stream.Position = 0;
+
+        // Request `id` as a STRING (present in the file, but as long) — a real type mismatch, not absence.
+        var mistyped = new StructType(new[] { new StructField("id", DataTypes.StringType, nullable: true) });
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(async () =>
+        {
+            await foreach (ColumnBatch _ in new ParquetFileReader().ReadAsync(
+                stream, mistyped, keepRowGroup: null, nullFillMissingColumns: true, CancellationToken.None))
+            {
+            }
+        });
+        Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
+    }
+
+    [Fact]
+    public async Task NullFill_MultiRowGroup_AbsentColumn_AllNullAcrossGroups()
+    {
+        // The per-group AppendNull loop must null-fill the absent column in EVERY row group. Force 3 row
+        // groups (rowGroupRowLimit: 2 over 6 rows) so the loop runs per-group, not once.
+        var narrow = new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) });
+        ColumnBatch batch = BuildLongBatch(narrow, new long[] { 1, 2, 3, 4, 5, 6 });
+        using var stream = new MemoryStream();
+        await new ParquetFileWriter(rowGroupRowLimit: 2).WriteAsync(stream, narrow, new[] { batch }, CancellationToken.None);
+        stream.Position = 0;
+
+        long total = 0;
+        await foreach (ColumnBatch b in new ParquetFileReader().ReadAsync(
+            stream, FullSchema, keepRowGroup: null, nullFillMissingColumns: true, CancellationToken.None))
+        {
+            ColumnVector name = b.SelectedColumn(1);
+            for (int r = 0; r < b.LogicalRowCount; r++)
+            {
+                Assert.True(name.IsNull(r));
+            }
+
+            total += b.LogicalRowCount;
+        }
+
+        Assert.Equal(6, total); // three groups × two rows, every `name` null-filled
+    }
+
+    [Fact]
+    public async Task NullFill_EmptyFile_AbsentColumn_YieldsNoRows()
+    {
+        // A file with zero rows yields zero row groups (ParquetFileWriter's pre-test loop), so a wider
+        // null-fill projection simply produces no batches — the null-fill path handles the empty case.
+        var narrow = new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) });
+        ColumnBatch empty = BuildLongBatch(narrow, Array.Empty<long>());
+        using var stream = new MemoryStream();
+        await new ParquetFileWriter().WriteAsync(stream, narrow, new[] { empty }, CancellationToken.None);
+        stream.Position = 0;
+
+        var batches = new List<ColumnBatch>();
+        await foreach (ColumnBatch b in new ParquetFileReader().ReadAsync(
+            stream, FullSchema, keepRowGroup: null, nullFillMissingColumns: true, CancellationToken.None))
+        {
+            batches.Add(b);
+        }
+
+        Assert.Empty(batches);
+    }
+
+    [Fact]
+    public async Task ReadDataSchemaAsync_ReconstructsWrittenSchema_FromFooter()
+    {
+        // #497 write-schema validation depends on ReadDataSchemaAsync reconstructing the ACTUAL physical
+        // schema from the footer (the inverse of ParquetTypeMapping.CreateField). Round-trip every supported
+        // atomic type and assert the reconstructed name + logical type match (nullability/metadata are not
+        // footer-faithful and are not asserted).
+        var schema = new StructType(new[]
+        {
+            new StructField("b", DataTypes.BooleanType, nullable: false),
+            new StructField("tiny", DataTypes.ByteType, nullable: true),
+            new StructField("sml", DataTypes.ShortType, nullable: true),
+            new StructField("i", DataTypes.IntegerType, nullable: false),
+            new StructField("l", DataTypes.LongType, nullable: false),
+            new StructField("f", DataTypes.FloatType, nullable: true),
+            new StructField("d", DataTypes.DoubleType, nullable: true),
+            new StructField("s", DataTypes.StringType, nullable: true),
+            new StructField("bin", DataTypes.BinaryType, nullable: true),
+            new StructField("dt", DataTypes.DateType, nullable: true),
+            new StructField("ts", DataTypes.TimestampType, nullable: true),
+            new StructField("amt", DataTypes.CreateDecimalType(12, 3), nullable: true),
+        });
+        ColumnBatch batch = TestData.RandomBatch(schema, rowCount: 4, _random);
+        using var stream = new MemoryStream();
+        await new ParquetFileWriter().WriteAsync(stream, schema, new[] { batch }, CancellationToken.None);
+        stream.Position = 0;
+
+        StructType reconstructed = await new ParquetFileReader().ReadDataSchemaAsync(stream, CancellationToken.None);
+
+        Assert.Equal(schema.Count, reconstructed.Count);
+        for (int i = 0; i < schema.Count; i++)
+        {
+            Assert.Equal(schema[i].Name, reconstructed[i].Name);
+            Assert.Equal(schema[i].DataType, reconstructed[i].DataType); // logical type round-trips through the footer
+        }
+    }
+
     private static ColumnBatch BuildLongBatch(StructType schema, long[] values)
     {
         MutableColumnVector vector = ColumnVectors.Create(DataTypes.LongType, values.Length);
