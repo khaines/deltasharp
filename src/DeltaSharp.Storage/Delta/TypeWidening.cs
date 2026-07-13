@@ -122,6 +122,22 @@ internal static class TypeWidening
         return to is DecimalType;
     }
 
+    /// <summary>
+    /// Whether <paramref name="from"/> → <paramref name="to"/> is a Delta-sanctioned widening in <b>any</b> of
+    /// this build's recognized families — the applied allowlist (<see cref="IsSanctionedWidening"/>), the
+    /// cross-family deferral (<see cref="IsDeferredCrossFamilyWidening"/>, #535), or the date→timestamp_ntz
+    /// deferral (<see cref="IsDeferredWidening"/>, #533). This is the single <b>union</b> predicate the
+    /// <see cref="DeltaSchemaEnforcer"/> partition-column guard uses so a partition-column type change is
+    /// classified as an honest rewrite-free widening deferral (#537) for <b>every</b> sanctioned family, and
+    /// so a future family added to any classifier is covered automatically without editing the guard (the
+    /// drift the partition guard and the scalar <c>default:</c> arm are otherwise only kept in step by their
+    /// co-located tests). Independent of enablement (mirrors the two deferral classifiers).
+    /// </summary>
+    public static bool IsAnySanctionedWidening(DataType from, DataType to) =>
+        IsSanctionedWidening(from, to)
+        || IsDeferredCrossFamilyWidening(from, to)
+        || IsDeferredWidening(from, to);
+
     private static int IntegralRank(DataType type) => type switch
     {
         ByteType => 0,

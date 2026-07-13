@@ -83,11 +83,11 @@ internal static class DeltaSchemaEnforcer
     /// <summary>
     /// Validates <paramref name="writeSchema"/> against <paramref name="tableSchema"/> under
     /// <paramref name="mode"/>. Returns <see langword="null"/> when the write is compatible and requires no
-    /// schema change (the writer commits adds only), or the <b>merged</b> table schema when
-    /// <paramref name="mode"/> permitted an additive change (a new nullable column — the writer commits a
-    /// <c>metaData</c> carrying it in the same version as the adds). The merged schema never changes any
-    /// existing column's type. Throws before returning if the write is incompatible or needs a change
-    /// <paramref name="mode"/> does not allow.
+    /// schema change (the writer commits adds only), or the <b>merged</b> table schema when an additive
+    /// change was permitted (a new nullable column under <paramref name="mode"/>) or the table enables type
+    /// widening and a Delta-sanctioned widening of an existing column was applied — the writer commits a
+    /// <c>metaData</c> carrying the merged schema in the same version as the adds. Throws before returning if
+    /// the write is incompatible or needs a change <paramref name="mode"/> does not allow.
     /// </summary>
     /// <param name="tableSchema">The table's current schema.</param>
     /// <param name="writeSchema">The incoming write's schema.</param>
@@ -163,9 +163,7 @@ internal static class DeltaSchemaEnforcer
                     && partitionColumns.Contains(tableField.Name)
                     && !tableField.DataType.Equals(writeField.DataType))
                 {
-                    if (TypeWidening.IsSanctionedWidening(tableField.DataType, writeField.DataType)
-                        || TypeWidening.IsDeferredCrossFamilyWidening(tableField.DataType, writeField.DataType)
-                        || TypeWidening.IsDeferredWidening(tableField.DataType, writeField.DataType))
+                    if (TypeWidening.IsAnySanctionedWidening(tableField.DataType, writeField.DataType))
                     {
                         throw DeltaSchemaMismatchException.PartitionColumnWideningDeferred(
                             path, tableField.DataType.SimpleString, writeField.DataType.SimpleString);
