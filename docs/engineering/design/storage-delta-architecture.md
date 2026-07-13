@@ -614,7 +614,8 @@ schema is thus effectively part of the write's read dependency; no stale-schema 
   **fail-closed for a dynamic partition overwrite** (`overwriteSchema` + `Dynamic` is rejected: files in
   untouched partitions still carry the old schema, so a wholesale replacement would leave them unreadable).
   With `overwriteSchema=false` (the default) a static overwrite keeps the additive/strict enforcement (may not
-  drop/narrow/reorder).
+  drop, narrow, or change a column's type — reordering is not a schema change under name-based matching, so it
+  is always allowed).
 - **Read-side null-fill + physical write-schema validation (#497) — implemented.** Reading an
   additively schema-evolved table now fills `null` for a later-added column when reading older files that
   predate it: the scan/read path (`DeltaReadSource`) requests the current data schema with

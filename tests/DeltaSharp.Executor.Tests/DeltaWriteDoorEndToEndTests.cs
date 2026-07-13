@@ -274,6 +274,37 @@ public sealed class DeltaWriteDoorEndToEndTests : IDisposable
         Assert.False(File.Exists(CommitFile(table, 1)));
     }
 
+    [Fact]
+    public void Delta_OverwriteSchema_OptionFalseOrEmpty_KeepsStrictEnforcement()
+    {
+        // The connector option resolves false for "false" and "" (and absent), so a type change is still
+        // rejected — the destructive path is opt-in only.
+        foreach (string optionValue in new[] { "false", "" })
+        {
+            string table = Table("overwrite-schema-off-" + (optionValue.Length == 0 ? "empty" : optionValue));
+
+            using (SparkSession spark = NewSession())
+            {
+                spark.CreateDataFrame(People(), PeopleSchema)
+                    .Write.Format("delta").Mode("append").Save(table);
+            }
+
+            var wideId = new StructType(new[]
+            {
+                new StructField("id", LongType.Instance, nullable: false),
+                new StructField("name", StringType.Instance, nullable: true),
+            });
+            using (SparkSession spark = NewSession())
+            {
+                DataFrame df = spark.CreateDataFrame(new[] { new Row(wideId, 7L, "z") }, wideId);
+                Assert.ThrowsAny<Exception>(() =>
+                    df.Write.Format("delta").Option("overwriteSchema", optionValue).Mode("overwrite").Save(table));
+            }
+
+            Assert.False(File.Exists(CommitFile(table, 1))); // no new commit — strict enforcement held
+        }
+    }
+
     // ---------------------------------------------------------------- partitioned append layout
 
     [Fact]

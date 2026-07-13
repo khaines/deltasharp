@@ -337,8 +337,8 @@ internal sealed class DeltaTableWriter
             throw new ArgumentException(
                 "overwriteSchema is only supported for a full (Static) overwrite: a dynamic partition "
                 + "overwrite preserves files in untouched partitions that still conform to the old schema, so "
-                + "a wholesale schema replacement would leave them unreadable. Use Static partition overwrite "
-                + "mode, or an additive SchemaEvolutionMode instead.",
+                + "a wholesale schema replacement would leave them unreadable. Use a Static (full) overwrite to "
+                + "replace the schema.",
                 nameof(overwriteSchema));
         }
 
@@ -698,21 +698,21 @@ internal sealed class DeltaTableWriter
     }
 
     // AC2: remove EVERY prior active file + add the new files in one atomic version, scoped WholeTable so
-    // any concurrent add/remove aborts the overwrite (it depends on the entire active set). A schema
-    // evolution (STORY-05.4.2) rides in the SAME action list so metadata + removes + adds publish as one
-    // version.
+    // any concurrent add/remove aborts the overwrite (it depends on the entire active set). The optional
+    // metaData change (an additive schema evolution, STORY-05.4.2; or a wholesale overwriteSchema
+    // replacement, #496) rides in the SAME action list so metadata + removes + adds publish as one version.
     private Task<DeltaCommitResult> FullOverwriteAsync(
         Snapshot readSnapshot,
         IReadOnlyList<StagedDataFile> files,
-        MetadataAction? schemaEvolution,
+        MetadataAction? metaDataToCommit,
         CancellationToken cancellationToken)
     {
         long deletionTimestamp = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
         var actions = new List<DeltaAction>(
-            (schemaEvolution is null ? 0 : 1) + readSnapshot.ActiveFiles.Length + files.Count);
-        if (schemaEvolution is not null)
+            (metaDataToCommit is null ? 0 : 1) + readSnapshot.ActiveFiles.Length + files.Count);
+        if (metaDataToCommit is not null)
         {
-            actions.Add(schemaEvolution);
+            actions.Add(metaDataToCommit);
         }
 
         foreach (AddFileAction prior in readSnapshot.ActiveFiles)
@@ -749,6 +749,13 @@ internal sealed class DeltaTableWriter
         ValidateStagedWriteSchema(writeSchema, partitionColumns, files);
         ValidatePartitionCoverage(files, partitionArray);
 
+        // The replacement metaData carries the NEW schema + partition columns; all other metadata fields
+        // (id, format, configuration, createdTime) are structurally preserved by `with`, so the table's
+        // identity (id) is stable across the overwriteSchema (never re-minted). FORWARD NOTE (#523/#525):
+        // once column-mapping WRITE support relaxes the RejectExistingNameModeMutation gate above, the
+        // preserved Configuration carries columnMapping.maxColumnId / per-field physical-name+id metadata that
+        // would desync from a wholesale-replaced schema — this method must then reconcile column ids (or the
+        // name-mode gate must keep rejecting it). Today the gate masks this fail-closed.
         var replacement = readSnapshot.Metadata with
         {
             SchemaString = SchemaJson.ToJson(writeSchema),

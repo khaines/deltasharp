@@ -237,6 +237,177 @@ public sealed class DeltaOverwriteSchemaTests : IDisposable
         Assert.Equal(5L, Assert.Single(await ReadRowsAsync(source, info))[0]);
     }
 
+    [Fact]
+    public async Task StaticOverwriteSchema_AddColumn_ReplacesSchema()
+    {
+        // overwriteSchema can also ADD a column (via the destructive path) — asserted distinctly from the
+        // additive AddNewColumns path.
+        var narrow = new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) });
+        var wide = new StructType(new[]
+        {
+            new StructField("id", DataTypes.LongType, nullable: false),
+            new StructField("added", DataTypes.StringType, nullable: true),
+        });
+
+        using (DeltaWriteTarget target = Target())
+        {
+            await target.AppendAsync(narrow, Array.Empty<string>(), new[] { Batch(narrow, ("id", new long[] { 1 })) });
+
+            DeltaWriteResult result = await target.OverwriteAsync(
+                wide, Array.Empty<string>(),
+                new[] { Batch(wide, ("id", new long[] { 9 }), ("added", new[] { "hello" })) },
+                DeltaPartitionOverwriteMode.Static,
+                overwriteSchema: true);
+            Assert.Equal(1L, result.Version);
+        }
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        Assert.Equal(new[] { "id", "added" }, info.Schema.Fields.Select(f => f.Name).ToArray());
+        IReadOnlyList<object?> row = Assert.Single(await ReadRowsAsync(source, info));
+        Assert.Equal(9L, row[0]);
+        Assert.Equal("hello", row[1]);
+    }
+
+    [Fact]
+    public async Task EmptyOverwriteSchema_TruncatesToNewSchema()
+    {
+        // An EMPTY overwriteSchema against a table WITH data replaces the schema AND truncates: every prior
+        // file is removed, the new (narrower) schema is committed, and the read is empty under the new schema.
+        var wide = new StructType(new[]
+        {
+            new StructField("id", DataTypes.LongType, nullable: false),
+            new StructField("name", DataTypes.StringType, nullable: true),
+        });
+        var narrow = new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) });
+
+        using (DeltaWriteTarget target = Target())
+        {
+            await target.AppendAsync(wide, Array.Empty<string>(), new[] { Batch(wide, ("id", new long[] { 1, 2 }), ("name", new[] { "a", "b" })) });
+
+            DeltaWriteResult result = await target.OverwriteAsync(
+                narrow, Array.Empty<string>(), Array.Empty<ColumnBatch>(),
+                DeltaPartitionOverwriteMode.Static, overwriteSchema: true);
+            Assert.Equal(1L, result.Version);      // a real commit (truncate + schema replace)
+            Assert.Equal(0, result.FilesWritten);  // 0 adds
+        }
+
+        var backend = new LocalFileSystemBackend(_root);
+        try
+        {
+            Snapshot snapshot = await new DeltaLog(backend).LoadSnapshotAsync();
+            Assert.Empty(snapshot.ActiveFiles);                    // every prior file removed
+            Assert.Equal(new[] { "id" }, snapshot.Schema.Fields.Select(f => f.Name).ToArray()); // narrowed schema
+        }
+        finally
+        {
+            backend.Dispose();
+        }
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        Assert.Empty(await ReadRowsAsync(source, info)); // reads back empty under the new schema
+    }
+
+    [Fact]
+    public async Task EmptyOverwriteSchema_OnAlreadyEmptySameSchema_IsNoOp_VersionUnchanged()
+    {
+        // The idempotent no-op short-circuit: an empty overwriteSchema against an already-empty table whose
+        // schema + partition columns are unchanged is a benign no-op (version unchanged, not an empty commit).
+        var schema = new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) });
+        using DeltaWriteTarget target = Target();
+
+        // Create an empty schema'd table at v0 (empty overwrite on a fresh path).
+        DeltaWriteResult created = await target.OverwriteAsync(
+            schema, Array.Empty<string>(), Array.Empty<ColumnBatch>(),
+            DeltaPartitionOverwriteMode.Static, overwriteSchema: true);
+        Assert.Equal(0L, created.Version);
+
+        // Empty overwriteSchema, same schema, already-empty ⇒ no-op.
+        DeltaWriteResult again = await target.OverwriteAsync(
+            schema, Array.Empty<string>(), Array.Empty<ColumnBatch>(),
+            DeltaPartitionOverwriteMode.Static, overwriteSchema: true);
+        Assert.Equal(0L, again.Version); // version unchanged (Skipped)
+
+        var backend = new LocalFileSystemBackend(_root);
+        try
+        {
+            Assert.Equal(0L, (await new DeltaLog(backend).LoadSnapshotAsync()).Version);
+        }
+        finally
+        {
+            backend.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task StaticOverwriteSchema_PreservesTableIdAndCreatedTime()
+    {
+        // Delta identity invariant: an overwriteSchema mutates the existing metaData in place — the table
+        // `id` (and createdTime) MUST be stable, never re-minted (regenerating id breaks table identity).
+        var schemaA = new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) });
+        var schemaB = new StructType(new[] { new StructField("v", DataTypes.LongType, nullable: false) });
+
+        var backend = new LocalFileSystemBackend(_root);
+        try
+        {
+            using (DeltaWriteTarget target = Target())
+            {
+                await target.AppendAsync(schemaA, Array.Empty<string>(), new[] { Batch(schemaA, ("id", new long[] { 1 })) });
+            }
+
+            MetadataAction before = (await new DeltaLog(backend).LoadSnapshotAsync()).Metadata;
+
+            using (DeltaWriteTarget target = Target())
+            {
+                await target.OverwriteAsync(
+                    schemaB, Array.Empty<string>(), new[] { Batch(schemaB, ("v", new long[] { 2 })) },
+                    DeltaPartitionOverwriteMode.Static, overwriteSchema: true);
+            }
+
+            MetadataAction after = (await new DeltaLog(backend).LoadSnapshotAsync()).Metadata;
+            Assert.Equal(before.Id, after.Id);                   // stable table identity
+            Assert.Equal(before.CreatedTime, after.CreatedTime); // createdTime preserved
+            Assert.True(after.PartitionColumns.IsDefaultOrEmpty); // still unpartitioned
+            Assert.Contains("\"v\"", after.SchemaString, StringComparison.Ordinal);   // schema replaced to {v}
+            Assert.DoesNotContain("\"id\"", after.SchemaString, StringComparison.Ordinal); // old column gone
+        }
+        finally
+        {
+            backend.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task TimeTravel_ReadsOldSchema_BeforeOverwriteSchemaReplacement()
+    {
+        // Per-version schema isolation: after an int/long-style schema replacement, reading the OLD version
+        // (versionAsOf) still returns the old rows under the OLD schema — the replacement lives only in v1.
+        var longSchema = new StructType(new[] { new StructField("v", DataTypes.LongType, nullable: false) });
+        var intSchema = new StructType(new[] { new StructField("v", DataTypes.IntegerType, nullable: false) });
+
+        using (DeltaWriteTarget target = Target())
+        {
+            await target.AppendAsync(longSchema, Array.Empty<string>(), new[] { Batch(longSchema, ("v", new long[] { 100, 200 })) });
+            await target.OverwriteAsync(
+                intSchema, Array.Empty<string>(), new[] { IntBatch(intSchema, "v", new[] { 7 }) },
+                DeltaPartitionOverwriteMode.Static, overwriteSchema: true);
+        }
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+
+        // v0: the OLD long schema + original two rows.
+        DeltaSnapshotInfo v0 = await source.LoadSnapshotAsync(0L, null);
+        Assert.IsType<LongType>(v0.Schema["v"].DataType);
+        List<IReadOnlyList<object?>> v0Rows = await ReadRowsAsync(source, v0);
+        Assert.Equal(new object?[] { 100L, 200L }, v0Rows.Select(r => r[0]).OrderBy(x => (long)x!).ToArray());
+
+        // v1 (latest): the NEW int schema + the single replacement row.
+        DeltaSnapshotInfo v1 = await source.LoadSnapshotAsync(null, null);
+        Assert.IsType<IntegerType>(v1.Schema["v"].DataType);
+        Assert.Equal(7, Assert.Single(await ReadRowsAsync(source, v1))[0]);
+    }
+
     // ---- helpers ----
 
     // Reads all rows as boxed object?[] in schema order (long -> long, int -> int, string -> string/null).
