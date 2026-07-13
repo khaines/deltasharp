@@ -35,8 +35,14 @@ internal static class ProtocolSupport
     /// <summary>The "table features" reader protocol version (features enumerated in <c>readerFeatures</c>).</summary>
     public const int TableFeaturesReaderVersion = 3;
 
-    /// <summary>The advanced reader features this build implements — none, in the v1 baseline.</summary>
-    public static readonly ImmutableHashSet<string> SupportedReaderFeatures = ImmutableHashSet<string>.Empty;
+    /// <summary>The advanced reader features this build implements. <c>columnMapping</c> is served in
+    /// <c>name</c> mode (STORY-05.4.3 / #191): the feature gate opens for a column-mapped table, then the
+    /// <c>id</c> mode is rejected fail-closed downstream by <see cref="ColumnMapping.EnsureReadWriteSupported"/>
+    /// (deferred to #523). A legacy reader-version-2 column-mapping table still fails closed (see
+    /// <see cref="EnsureReadable"/>) — this build serves column mapping only through the table-features
+    /// (reader v3) representation.</summary>
+    public static readonly ImmutableHashSet<string> SupportedReaderFeatures =
+        ImmutableHashSet.Create(StringComparer.Ordinal, ColumnMapping.Feature);
 
     /// <summary>The absolute basic writer protocol version (no writer features).</summary>
     public const int BasicWriterVersion = 1;
@@ -50,9 +56,11 @@ internal static class ProtocolSupport
     /// <summary>The "table features" writer protocol version (features enumerated in <c>writerFeatures</c>).</summary>
     public const int TableFeaturesWriterVersion = 7;
 
-    /// <summary>The advanced writer features this build implements — none, in the v1 baseline (so a
-    /// table-features table is writable only when it requires <b>no</b> writer feature).</summary>
-    public static readonly ImmutableHashSet<string> SupportedWriterFeatures = ImmutableHashSet<string>.Empty;
+    /// <summary>The advanced writer features this build implements. <c>columnMapping</c> is written in
+    /// <c>name</c> mode (STORY-05.4.3 / #191); an <c>id</c>-mode write is rejected fail-closed downstream
+    /// (<see cref="ColumnMapping.EnsureReadWriteSupported"/>, deferred to #523).</summary>
+    public static readonly ImmutableHashSet<string> SupportedWriterFeatures =
+        ImmutableHashSet.Create(StringComparer.Ordinal, ColumnMapping.Feature);
 
     /// <summary>
     /// Verifies the table's <paramref name="protocol"/> is <b>writable</b> by this build before a commit is

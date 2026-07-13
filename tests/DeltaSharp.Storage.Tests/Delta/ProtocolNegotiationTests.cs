@@ -97,13 +97,15 @@ public sealed class ProtocolNegotiationTests : IDisposable
     [Fact]
     public async Task LoadSnapshot_FailsClosed_WhenFeatureAppearsInLaterCommit()
     {
-        // A table upgraded mid-history to require a reader feature must fail closed at the latest snapshot.
+        // A table upgraded mid-history to require an unsupported reader feature must fail closed at the
+        // latest snapshot. (columnMapping is now supported — STORY-05.4.3 — so this uses deletionVectors,
+        // which remains unimplemented.)
         await DeltaTestHarness.WriteCommitAsync(_backend, 0,
             DeltaTestHarness.Protocol(),
             DeltaTestHarness.Metadata(),
             DeltaTestHarness.Add("a.parquet"));
         await DeltaTestHarness.WriteCommitAsync(_backend, 1,
-            DeltaTestHarness.ProtocolWithReaderFeature("columnMapping"));
+            DeltaTestHarness.ProtocolWithReaderFeature("deletionVectors"));
 
         await Assert.ThrowsAsync<DeltaProtocolException>(() => new DeltaLog(_backend).LoadSnapshotAsync());
 
