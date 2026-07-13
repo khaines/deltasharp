@@ -143,22 +143,29 @@ internal static class DeltaSchemaEnforcer
             if (writeStruct.TryGetField(tableField.Name, out StructField writeField))
             {
                 // A partition column's type change is rejected here, before the generic type classification,
-                // for a clearer reason. Two distinct honest cases:
-                //   (a) The change WOULD be a Delta-sanctioned widening AND type widening is enabled: Delta
-                //       DOES sanction partition-column widening WITHOUT a rewrite (partition values are stored
-                //       as strings in the log / directory names — verified vs Delta's golden
-                //       TypeWideningAlterTableSuite), but this build DEFERS it (#537). It stays fail-closed,
-                //       classified distinctly (TypeWideningUnsupported) with an HONEST message — not the
-                //       factually-wrong "requires a full table rewrite" reason.
-                //   (b) Any other partition-column type change (a non-widening, or widening not enabled) keeps
-                //       the existing PartitionColumnEvolutionUnsupported classification.
-                // Partition columns are top-level, so this only applies at parentPath == null.
+                // for a clearer reason. ANY Delta-sanctioned widening of a partition column is rewrite-FREE
+                // (partition values are stored as strings in the log / directory names, so no data file is
+                // rewritten — verified vs Delta's golden TypeWideningAlterTableSuite), across all three
+                // sanctioned families:
+                //   - intra-family                (IsSanctionedWidening:          byte→…→long, float→double, grow-only decimal)
+                //   - cross-family integral→float/decimal (IsDeferredCrossFamilyWidening, #535)
+                //   - date→timestamp_ntz          (IsDeferredWidening,             #533)
+                // This build DEFERS partition-column widening (#537), so every one of them is rejected
+                // fail-closed but classified DISTINCTLY (TypeWideningUnsupported) with an HONEST message —
+                // never the factually-wrong "requires a full table rewrite" reason. The classification does
+                // NOT depend on typeWideningEnabled: whether or not the feature is enabled, the change is a
+                // rewrite-free widening this build defers, so "requires a rewrite" would be a lie in every
+                // case (a disabled feature is a feature-enablement gap, not a layout rewrite). Only a
+                // genuinely NON-widening partition-column type change (e.g. int→string, or a narrowing) keeps
+                // the PartitionColumnEvolutionUnsupported classification. Partition columns are top-level, so
+                // this only applies at parentPath == null.
                 if (partitionColumns is not null
                     && partitionColumns.Contains(tableField.Name)
                     && !tableField.DataType.Equals(writeField.DataType))
                 {
-                    if (typeWideningEnabled
-                        && TypeWidening.IsSanctionedWidening(tableField.DataType, writeField.DataType))
+                    if (TypeWidening.IsSanctionedWidening(tableField.DataType, writeField.DataType)
+                        || TypeWidening.IsDeferredCrossFamilyWidening(tableField.DataType, writeField.DataType)
+                        || TypeWidening.IsDeferredWidening(tableField.DataType, writeField.DataType))
                     {
                         throw DeltaSchemaMismatchException.PartitionColumnWideningDeferred(
                             path, tableField.DataType.SimpleString, writeField.DataType.SimpleString);

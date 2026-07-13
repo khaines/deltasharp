@@ -544,8 +544,11 @@ public sealed class DeltaSchemaEnforcerTests
     [Fact]
     public void Reconcile_PartitionColumnTypeChange_IsRejectedDistinctly()
     {
-        // FIX 3: a partition column's type cannot be evolved (it is encoded in the table layout). Even though
-        // int→long is a would-be widening, a partition column gets the clearer, distinct rejection.
+        // FIX 3 + red-team #536 (case 2): int→long IS a Delta-sanctioned widening and, on a partition column,
+        // is rewrite-FREE (partition values are strings) — so even with type widening NOT enabled it is
+        // DEFERRED (#537), classified distinctly as TypeWideningUnsupported with an honest message. It must
+        // NEVER carry the factually-wrong "requires a full table rewrite" reason just because the feature is
+        // disabled (a feature-enablement gap, not a layout rewrite).
         StructType table = Schema(
             Field("id", DataTypes.LongType, nullable: false),
             Field("region", DataTypes.IntegerType, nullable: true));
@@ -557,8 +560,10 @@ public sealed class DeltaSchemaEnforcerTests
             () => DeltaSchemaEnforcer.Reconcile(
                 table, write, SchemaEvolutionMode.MergeSchema, new[] { "region" }));
 
-        Assert.Equal(DeltaSchemaMismatchKind.PartitionColumnEvolutionUnsupported, ex.Kind);
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
         Assert.Equal("region", ex.Path);
+        Assert.Contains("#537", ex.Message, System.StringComparison.Ordinal);
+        Assert.DoesNotContain("requires a full table rewrite", ex.Message, System.StringComparison.Ordinal);
     }
 
     [Fact]
@@ -861,6 +866,27 @@ public sealed class DeltaSchemaEnforcerTests
                 table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: new[] { "part" }, typeWideningEnabled: true));
 
         Assert.Equal(DeltaSchemaMismatchKind.PartitionColumnEvolutionUnsupported, ex.Kind);
+    }
+
+    [Fact]
+    public void Reconcile_PartitionColumnCrossFamilyWidening_IsDeferred_NotRewriteClaim()
+    {
+        // Red-team #536 (case 1): a CROSS-FAMILY partition-column widening (int→double) is Delta-sanctioned
+        // and rewrite-FREE (partition values are strings), just deferred in this build. IsSanctionedWidening
+        // is false for it (it is tracked by the cross-family classifier, #535), so it must still route to the
+        // honest partition-widening deferral (#537, TypeWideningUnsupported) — never to the factually-wrong
+        // "requires a full table rewrite" PartitionColumnEvolution case — even with type widening enabled.
+        StructType table = Schema(Field("part", DataTypes.IntegerType, nullable: true));
+        StructType write = Schema(Field("part", DataTypes.DoubleType, nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: new[] { "part" }, typeWideningEnabled: true));
+
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+        Assert.Equal("part", ex.Path);
+        Assert.Contains("#537", ex.Message, System.StringComparison.Ordinal);
+        Assert.DoesNotContain("requires a full table rewrite", ex.Message, System.StringComparison.Ordinal);
     }
 
     [Fact]
