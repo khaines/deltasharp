@@ -890,6 +890,28 @@ public sealed class DeltaSchemaEnforcerTests
     }
 
     [Fact]
+    public void Reconcile_PartitionColumnDateToTimestampWidening_IsDeferred_NotRewriteClaim()
+    {
+        // Pins the THIRD arm of TypeWidening.IsAnySanctionedWidening on the partition guard: date→timestamp
+        // (the #533 deferral). Delta sanctions date→timestamp_ntz and, on a partition column, it is rewrite-
+        // free (partition values are strings), so it must route to the honest #537 deferral
+        // (TypeWideningUnsupported) — never PartitionColumnEvolution's "requires a full table rewrite". Without
+        // this test the date arm of the union predicate is unpinned at the partition guard (existing
+        // date→timestamp tests take the scalar, non-partition path).
+        StructType table = Schema(Field("part", DataTypes.DateType, nullable: true));
+        StructType write = Schema(Field("part", DataTypes.TimestampType, nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: new[] { "part" }, typeWideningEnabled: true));
+
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+        Assert.Equal("part", ex.Path);
+        Assert.Contains("#537", ex.Message, System.StringComparison.Ordinal);
+        Assert.DoesNotContain("requires a full table rewrite", ex.Message, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Reconcile_Widening_PreservesPriorTypeChangeHistory_OldestFirst()
     {
         // A field already widened once (short→int, recorded in delta.typeChanges) is widened again (int→long):
