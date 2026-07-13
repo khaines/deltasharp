@@ -457,6 +457,26 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
         Assert.Equal(0L, (await LoadAsync()).Version); // nothing published
     }
 
+    [Fact]
+    public async Task Append_StagedFileColumnRenamed_SameCountAndTypes_IsRejected()
+    {
+        // #497: DataColumnsMatch compares NAME and type. A staged file with the same column count and types
+        // but a DIFFERENT column name than declared (a rename divergence) must still be rejected — the name
+        // half of the comparison, distinct from the count/type cases.
+        StructType declared = Struct(F("id", DataTypes.LongType, nullable: false));
+        await SeedSchemaTableAsync(declared);
+        Snapshot readSnapshot = await LoadAsync();
+
+        DeltaSchemaMismatchException ex = await Assert.ThrowsAsync<DeltaSchemaMismatchException>(() =>
+            Writer().AppendAsync(
+                readSnapshot,
+                declared,
+                new[] { StagedWith("a.parquet", Struct(F("identifier", DataTypes.LongType, nullable: false))) }));
+
+        Assert.Equal(DeltaSchemaMismatchKind.PhysicalWriteSchemaMismatch, ex.Kind);
+        Assert.Equal(0L, (await LoadAsync()).Version);
+    }
+
     // Writes a REAL Parquet file (id:long column) to the backend under an arbitrary declared schema, then
     // records a StagedDataFile whose DataSchema is derived from the ACTUAL written footer (mirroring the
     // production write-door), so a test can prove the commit-time check gates real bytes.

@@ -228,7 +228,10 @@ public sealed class DeltaWriteTarget : IDisposable
                 DeletionVectorsFeature.EnabledConfiguration(),
                 DeletionVectorsFeature.Protocol(),
                 files,
-                cancellationToken)
+                cancellationToken,
+                // #497: the DV-create path is logical==physical (no column mapping), so gate the version-0
+                // metaData schema on the real staged bytes' footer schema too.
+                validatePhysicalWriteSchema: true)
             .ConfigureAwait(false);
         return new DeltaWriteResult(commit.Version, files.Count, rows);
     }

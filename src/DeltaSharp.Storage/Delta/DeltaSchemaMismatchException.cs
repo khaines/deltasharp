@@ -53,10 +53,13 @@ internal enum DeltaSchemaMismatchKind
 
     /// <summary>A staged Parquet data file's <b>actual physical data schema</b> does not match the data
     /// columns of the <b>declared</b> write schema (#497). The write-door records each staged file's true
-    /// written schema (<c>StagedDataFile.DataSchema</c>); the enforcing write path cross-checks it so schema
-    /// enforcement gates the real bytes rather than trusting the caller's declaration. A divergence — a
-    /// caller (or a defect) staging bytes whose columns/types/nullability differ from what it declared — is
-    /// rejected fail-closed <b>before</b> any action is committed. Always rejected.</summary>
+    /// written schema, read back from the Parquet footer (<c>StagedDataFile.DataSchema</c>); the enforcing
+    /// write path cross-checks it so schema enforcement gates the real bytes rather than trusting the
+    /// caller's declaration. A divergence — a caller (or a defect) staging bytes whose column <b>names or
+    /// logical types</b> differ from what it declared — is rejected fail-closed <b>before</b> any action is
+    /// committed. The comparison is name + logical type only; nullability and field metadata are not
+    /// compared (a Parquet footer does not faithfully carry Spark nullability for string/binary, nor field
+    /// metadata). Always rejected.</summary>
     PhysicalWriteSchemaMismatch,
 }
 

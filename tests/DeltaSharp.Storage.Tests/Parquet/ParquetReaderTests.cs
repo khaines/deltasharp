@@ -407,6 +407,33 @@ public sealed class ParquetReaderTests
         }
     }
 
+    [Fact]
+    public async Task ReadDataSchemaAsync_MalformedFooter_ThrowsCorruptData()
+    {
+        // ReadDataSchemaAsync must fail closed (deterministic CorruptData) on a malformed/truncated footer,
+        // not surface a raw Parquet.Net defect (mirrors ReadAsync's OpenAsync contract).
+        var garbage = new byte[256];
+        _random.NextBytes(garbage);
+        using var stream = new MemoryStream(garbage);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new ParquetFileReader().ReadDataSchemaAsync(stream, CancellationToken.None));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+    }
+
+    [Fact]
+    public void ToDataType_UnmappedFooterField_ThrowsUnsupportedFeature()
+    {
+        // A footer field whose physical CLR type has no DeltaSharp mapping must fail closed (a foreign file
+        // can only enter via a direct footer, never the trusted writer) — never silently reconstruct a wrong
+        // type. `DateTime` is the annotated-subtype's raw CLR type, so a plain DataField<DateTime> (no
+        // DateTimeDataField annotation) is unmapped.
+        var unmapped = new global::Parquet.Schema.DataField<DateTime>("when");
+        DeltaStorageException error = Assert.Throws<DeltaStorageException>(
+            () => ParquetTypeMapping.ToDataType(unmapped));
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+    }
+
     private static ColumnBatch BuildLongBatch(StructType schema, long[] values)
     {
         MutableColumnVector vector = ColumnVectors.Create(DataTypes.LongType, values.Length);

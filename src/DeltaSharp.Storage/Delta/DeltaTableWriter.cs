@@ -412,7 +412,8 @@ internal sealed class DeltaTableWriter
         ImmutableSortedDictionary<string, string> configuration,
         ProtocolAction protocol,
         IReadOnlyList<StagedDataFile> files,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool validatePhysicalWriteSchema = false)
     {
         ArgumentNullException.ThrowIfNull(writeSchema);
         ArgumentNullException.ThrowIfNull(logicalPartitionColumns);
@@ -420,6 +421,16 @@ internal sealed class DeltaTableWriter
         ArgumentNullException.ThrowIfNull(configuration);
         ArgumentNullException.ThrowIfNull(protocol);
         ArgumentNullException.ThrowIfNull(files);
+
+        // #497: gate the version-0 metaData schema on the real staged bytes when the caller is
+        // logical==physical (the deletion-vector create path passes true; the actual column-mapping name-mode
+        // create passes false because its footer schema is physical-named while writeSchema is logical —
+        // physical≠logical staged-schema validation is deferred to #525).
+        if (validatePhysicalWriteSchema)
+        {
+            ValidateStagedWriteSchema(writeSchema, physicalPartitionColumns, files);
+        }
+
         return CreateTableCoreAsync(
             writeSchema, logicalPartitionColumns, physicalPartitionColumns, configuration, protocol, files, cancellationToken);
     }
