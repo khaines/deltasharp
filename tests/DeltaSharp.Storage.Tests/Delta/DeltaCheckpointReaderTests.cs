@@ -337,8 +337,12 @@ public sealed class DeltaCheckpointReaderTests
         AddFileAction add = Assert.Single(actions.OfType<AddFileAction>());
         Assert.NotNull(add.DeletionVector);
         Assert.Equal("i", add.DeletionVector!.StorageType);
+        Assert.Equal("wxyz0123456789ABCDEF", add.DeletionVector.PathOrInlineDv);
         Assert.Null(add.DeletionVector.Offset);
         Assert.Equal(8, add.DeletionVector.SizeInBytes);
+        Assert.Equal(2, add.DeletionVector.Cardinality);
+        // UniqueId of an inline (offset-less) DV is storageType+pathOrInlineDv — pin the derived identity too.
+        Assert.Equal("iwxyz0123456789ABCDEF", add.DeletionVector.UniqueId);
     }
 
     [Fact]
@@ -357,8 +361,13 @@ public sealed class DeltaCheckpointReaderTests
 
         RemoveFileAction remove = Assert.Single(actions.OfType<RemoveFileAction>());
         Assert.NotNull(remove.DeletionVector);
-        Assert.Equal("removedvremovedvremov", remove.DeletionVector!.PathOrInlineDv);
+        Assert.Equal("u", remove.DeletionVector!.StorageType);
+        Assert.Equal("removedvremovedvremov", remove.DeletionVector.PathOrInlineDv);
+        Assert.Equal(1, remove.DeletionVector.Offset);
+        Assert.Equal(20, remove.DeletionVector.SizeInBytes);
         Assert.Equal(7, remove.DeletionVector.Cardinality);
+        // The removed logical file's identity (path + DV uniqueId) must round-trip exactly.
+        Assert.Equal("uremovedvremovedvremov@1", remove.DeletionVector.UniqueId);
 
         // The DV struct is present in the schema but the plain add carries no DV → null (no regression).
         AddFileAction add = Assert.Single(actions.OfType<AddFileAction>());
@@ -442,6 +451,96 @@ public sealed class DeltaCheckpointReaderTests
             () => DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default));
         Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
         Assert.Contains("storageType", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task InterleavedDeletionVectors_AcrossRowGroupBoundaries_LandOnCorrectAdd()
+    {
+        // DURABLE cross-row-group DV-alignment regression (issue #527): a checkpoint whose adds span MORE
+        // than one Parquet row group, with DV / no-DV adds INTERLEAVED (every 3rd add carries a DV with a
+        // DISTINCT path + cardinality). The per-row-group Dremel decode must land each DV on the EXACT add
+        // that carried it (1:1) with NO off-by-one across the row-group boundary — the highest-value DV
+        // correctness property, pinned permanently.
+        const int addCount = 20;
+        var fixture = new CheckpointFixture()
+            .Protocol(3, 7, readerFeatures: ["deletionVectors"], writerFeatures: ["deletionVectors"])
+            .Metadata("t", EmptySchema);
+        for (int i = 0; i < addCount; i++)
+        {
+            CheckpointFixture.DvColumns? dv = i % 3 == 0
+                ? CheckpointFixture.DvColumns.Uuid(DvPath(i), offset: i, sizeInBytes: 8 + i, cardinality: 100 + i)
+                : null;
+            fixture.Add(FileName(i), size: 1, modificationTime: i, deletionVector: dv);
+        }
+
+        // rowGroupSize small enough that the 22 rows (protocol + metadata + 20 adds) span several row groups,
+        // so the DV column is decoded per-group and the alignment is exercised across every boundary.
+        byte[] parquet = await fixture.ToParquetAsync(rowGroupSize: 4);
+
+        // Pin the "spans >1 row group" precondition — otherwise the test could silently degrade to a single
+        // group and stop covering the boundary.
+        await using (var reader = await global::Parquet.ParquetReader.CreateAsync(new MemoryStream(parquet)))
+        {
+            Assert.True(reader.RowGroupCount > 1, "fixture must produce a multi-row-group checkpoint part.");
+        }
+        IReadOnlyList<DeltaAction> actions = await DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default);
+        List<AddFileAction> adds = actions.OfType<AddFileAction>().ToList();
+        Assert.Equal(addCount, adds.Count);
+
+        for (int i = 0; i < addCount; i++)
+        {
+            AddFileAction add = Assert.Single(adds, a => a.Path == FileName(i));
+            if (i % 3 == 0)
+            {
+                Assert.NotNull(add.DeletionVector);
+                Assert.Equal("u", add.DeletionVector!.StorageType);
+                Assert.Equal(DvPath(i), add.DeletionVector.PathOrInlineDv); // the DV's OWN distinct path
+                Assert.Equal(i, add.DeletionVector.Offset);
+                Assert.Equal(8 + i, add.DeletionVector.SizeInBytes);
+                Assert.Equal(100 + i, add.DeletionVector.Cardinality); // distinct cardinality → no cross-add smear
+            }
+            else
+            {
+                Assert.Null(add.DeletionVector); // a no-DV add between DV adds must stay null (no bleed)
+            }
+        }
+
+        static string FileName(int i) => "f" + i.ToString("D2", System.Globalization.CultureInfo.InvariantCulture) + ".parquet";
+        // A 20-char Z85-safe relative pathOrInlineDv unique per add, so a misaligned DV would surface as a
+        // path mismatch, not just a cardinality one.
+        static string DvPath(int i) => "dv" + i.ToString("D2", System.Globalization.CultureInfo.InvariantCulture) + "0123456789abcd";
+    }
+
+    [Fact]
+    public async Task Reads_AddDeletionVector_WithRequiredLeaves_RoundTrips()
+    {
+        // Real Spark marks storageType/pathOrInlineDv/sizeInBytes/cardinality REQUIRED within the OPTIONAL
+        // deletionVector struct (leaf MaxDefinitionLevel=2), whereas the fixture defaults to all-optional
+        // leaves (MaxDefinitionLevel=3). The reader is parametric on per-field max-def, so the required-leaf
+        // shape Spark actually writes must round-trip identically (issue #527 parity hardening).
+        byte[] parquet = await new CheckpointFixture()
+            .WithRequiredDvLeaves()
+            .Protocol(3, 7, readerFeatures: ["deletionVectors"], writerFeatures: ["deletionVectors"])
+            .Metadata("t", EmptySchema)
+            .Add("plain.parquet", size: 1) // a DV-free add coexists (null struct under required leaves)
+            .Add("dv-required.parquet", size: 100,
+                deletionVector: CheckpointFixture.DvColumns.Uuid("0123456789abcdefghij", offset: 4, sizeInBytes: 40, cardinality: 3))
+            .ToParquetAsync();
+
+        IReadOnlyList<DeltaAction> actions = await DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default);
+
+        AddFileAction dv = Assert.Single(actions.OfType<AddFileAction>(), a => a.Path == "dv-required.parquet");
+        Assert.NotNull(dv.DeletionVector);
+        Assert.Equal("u", dv.DeletionVector!.StorageType);
+        Assert.Equal("0123456789abcdefghij", dv.DeletionVector.PathOrInlineDv);
+        Assert.Equal(4, dv.DeletionVector.Offset);
+        Assert.Equal(40, dv.DeletionVector.SizeInBytes);
+        Assert.Equal(3, dv.DeletionVector.Cardinality);
+        Assert.Equal("u0123456789abcdefghij@4", dv.DeletionVector.UniqueId);
+
+        // The DV-free sibling still reads back a null descriptor under the depth-2 (required-leaf) shape.
+        AddFileAction plain = Assert.Single(actions.OfType<AddFileAction>(), a => a.Path == "plain.parquet");
+        Assert.Null(plain.DeletionVector);
     }
 
     private const string EmptySchema = """{"type":"struct","fields":[]}""";

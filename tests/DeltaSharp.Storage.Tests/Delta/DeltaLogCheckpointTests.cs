@@ -55,14 +55,18 @@ public sealed class DeltaLogCheckpointTests : IDisposable
             DeltaTestHarness.Txn("app-1", 5));
     }
 
-    /// <summary>The hand-computed surviving state at version 1 (protocol, metadata, add(b), add(c)) as a
-    /// checkpoint — independent of the production replay, so it is a true oracle.</summary>
+    /// <summary>The hand-computed surviving state at version 1 (protocol, metadata, add(b), add(c)) plus the
+    /// retained tombstone for the removed a.parquet — as a checkpoint independent of the production replay,
+    /// so it is a true oracle. The tombstone mirrors what a real Spark checkpoint retains for a recent
+    /// remove, keeping checkpoint-seeded state at parity with the JSON replay (which also keeps the
+    /// tombstone).</summary>
     private static CheckpointFixture CheckpointAtV1() =>
         new CheckpointFixture()
             .Protocol(1, 2)
             .Metadata(id: "table-1", schemaString: EmptySchemaUnescaped, partitionColumns: ["year"])
             .Add("b.parquet", size: 1, stats: StatsB, modificationTime: 1)
-            .Add("c.parquet", size: 1, partitionValues: [("year", "2026")], modificationTime: 1);
+            .Add("c.parquet", size: 1, partitionValues: [("year", "2026")], modificationTime: 1)
+            .Remove("a.parquet", deletionTimestamp: 1);
 
     [Fact]
     public async Task CheckpointSeededReconstruction_EqualsJsonReplay()
@@ -433,6 +437,62 @@ public sealed class DeltaLogCheckpointTests : IDisposable
         Assert.Equal(DeltaTestHarness.Describe(fromJson), DeltaTestHarness.Describe(fromCheckpoint));
         AddFileAction a = Assert.Single(fromCheckpoint.ActiveFiles, f => f.Path == "a.parquet");
         Assert.NotNull(a.DeletionVector);
+    }
+
+    /// <summary>DV-tombstone JSON history — v0: protocol(DV)+metadata+add(a,DV)+add(b); v1: remove(a,DV)+add(c).
+    /// The remove carries the SAME DV the add held, so a.parquet becomes a tombstone whose identity includes
+    /// its DV.</summary>
+    private static async Task WriteDvTombstoneJsonHistoryAsync(IStorageBackend backend)
+    {
+        await DeltaTestHarness.WriteCommitAsync(backend, 0,
+            DeltaTestHarness.ProtocolWithReaderFeature("deletionVectors"),
+            DeltaTestHarness.Metadata(id: "dv-table"),
+            DeltaTestHarness.AddWithDeletionVector("a.parquet", "u", DvPathOrInline, DvOffset, DvSizeInBytes, DvCardinality),
+            DeltaTestHarness.Add("b.parquet"));
+        await DeltaTestHarness.WriteCommitAsync(backend, 1,
+            DeltaTestHarness.RemoveWithDeletionVector("a.parquet", "u", DvPathOrInline, DvOffset, DvSizeInBytes, DvCardinality),
+            DeltaTestHarness.Add("c.parquet"));
+    }
+
+    /// <summary>The hand-computed surviving state at version 1 (protocol, metadata, add(b), add(c)) plus the
+    /// retained tombstone for a.parquet carrying its DV — an oracle independent of production replay.</summary>
+    private static CheckpointFixture DvTombstoneCheckpointAtV1() =>
+        new CheckpointFixture()
+            .Protocol(3, 7, readerFeatures: ["deletionVectors"], writerFeatures: ["deletionVectors"])
+            .Metadata(id: "dv-table", schemaString: EmptySchemaUnescaped)
+            .Add("b.parquet", size: 1, modificationTime: 1)
+            .Add("c.parquet", size: 1, modificationTime: 1)
+            .Remove("a.parquet", deletionTimestamp: 1,
+                deletionVector: CheckpointFixture.DvColumns.Uuid(DvPathOrInline, DvOffset, DvSizeInBytes, DvCardinality));
+
+    [Fact]
+    public async Task CheckpointDvTombstoneReconstruction_EqualsJsonReplay()
+    {
+        // Parity oracle for a REMOVE-DV (issue #527): the checkpoint's nested remove.deletionVector struct
+        // must reconstruct the tombstone's DV bit-identically. Describe now renders tombstone DVs, so a
+        // dropped/misaligned remove-DV would diverge here (it previously escaped the add-only oracle).
+        IStorageBackend jsonOnly = NewBackend();
+        await WriteDvTombstoneJsonHistoryAsync(jsonOnly);
+        Snapshot fromJson = await new DeltaLog(jsonOnly).LoadSnapshotAsync();
+
+        IStorageBackend withCheckpoint = NewBackend();
+        await WriteDvTombstoneJsonHistoryAsync(withCheckpoint);
+        await DeltaTestHarness.WriteCheckpointAsync(withCheckpoint, 1, DvTombstoneCheckpointAtV1());
+        await DeltaTestHarness.WriteLastCheckpointAsync(withCheckpoint, 1);
+        Snapshot fromCheckpoint = await new DeltaLog(withCheckpoint).LoadSnapshotAsync();
+
+        Assert.Equal(DeltaTestHarness.Describe(fromJson), DeltaTestHarness.Describe(fromCheckpoint));
+        Assert.Equal(1, fromCheckpoint.Metrics.CheckpointVersion); // took the fast path
+
+        // And explicitly: the checkpoint-seeded tombstone carries the exact remove-DV descriptor.
+        RemoveFileAction tombstone = Assert.Single(fromCheckpoint.Tombstones, r => r.Path == "a.parquet");
+        Assert.NotNull(tombstone.DeletionVector);
+        Assert.Equal("u", tombstone.DeletionVector!.StorageType);
+        Assert.Equal(DvPathOrInline, tombstone.DeletionVector.PathOrInlineDv);
+        Assert.Equal(DvOffset, tombstone.DeletionVector.Offset);
+        Assert.Equal(DvSizeInBytes, tombstone.DeletionVector.SizeInBytes);
+        Assert.Equal(DvCardinality, tombstone.DeletionVector.Cardinality);
+        Assert.Equal(["b.parquet", "c.parquet"], fromCheckpoint.ActiveFiles.Select(f => f.Path));
     }
 
     // The metaData.schemaString stored inside a checkpoint column is the raw (unescaped) JSON string,

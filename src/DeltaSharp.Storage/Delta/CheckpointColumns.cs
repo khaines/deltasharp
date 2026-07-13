@@ -383,8 +383,9 @@ internal sealed class CheckpointColumns
     /// <c>sizeInBytes</c>/<c>cardinality</c>) is a Parquet <see cref="DataField"/> with a multi-part path
     /// under the optional action struct and the optional DV struct, so its per-row definition level is
     /// <c>MaxDefinitionLevel</c> exactly where the DV is present — the same row-alignment the scalar readers
-    /// use. <c>storageType</c> being non-null is the presence signal; a present-but-incomplete DV fails
-    /// closed in <see cref="DeletionVectorColumns.Build"/> (never silently dropped).</summary>
+    /// use. Per-row DV presence is the <b>any-leaf-non-null</b> rule (see
+    /// <see cref="DeletionVectorColumns.IsPresent"/>), not a storageType-only signal; a present-but-incomplete
+    /// DV fails closed in <see cref="DeletionVectorColumns.Build"/> (never silently dropped).</summary>
     private static async Task<DeletionVectorColumns> ReadDeletionVectorAsync(
         ParquetRowGroupReader rowGroup, CheckpointSchema.DeletionVectorLeaves? leaves, int rowCount,
         CancellationToken cancellationToken)

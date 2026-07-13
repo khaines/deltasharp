@@ -71,9 +71,20 @@ internal sealed class CheckpointSchema
 
     /// <summary>The leaf columns of an <c>add</c>/<c>remove</c> nested <c>deletionVector</c> struct (protocol
     /// "Deletion Vector Descriptor Schema"). Every leaf is resolved independently and may be null when a
-    /// writer omits a sub-column, but <see cref="StorageType"/> is the presence signal: a row carries a DV
-    /// iff its <see cref="StorageType"/> is non-null. Silently dropping any present DV would resurrect
-    /// deleted rows, so <see cref="CheckpointColumns"/> fails closed on a present-but-incomplete DV.</summary>
+    /// writer omits a sub-column.
+    ///
+    /// <para><b>Presence contract (do NOT narrow this).</b> A row carries a DV iff <b>any</b> of its DV leaf
+    /// columns is non-null — NOT merely when <see cref="StorageType"/> is non-null. Presence is decided by
+    /// <c>CheckpointColumns.DeletionVectorColumns.IsPresent</c>; whatever a present row's storageType leaf
+    /// happens to hold, a present-but-incomplete DV (e.g. required <c>storageType</c> absent while
+    /// <c>cardinality</c> is set) is DETECTED there and fails closed in <c>Build</c> via the shared
+    /// <c>DeletionVectorDescriptor.Create</c> validator, rather than being mistaken for "no DV" and silently
+    /// dropped — which would resurrect the deleted rows the DV names (the cardinal DV-safety violation). A
+    /// future maintainer MUST NOT "optimize" the presence test back to a storageType-only check: that
+    /// reintroduces the silent-DV-drop / row-resurrection hazard.</para>
+    ///
+    /// <para>A hypothetical all-leaves-null but structurally-present DV struct is treated as no-DV, which is
+    /// SAFE: an empty DV struct names zero deletions, so there is nothing to resurrect.</para></summary>
     public sealed record DeletionVectorLeaves(
         DataField? StorageType,
         DataField? PathOrInlineDv,
@@ -227,7 +238,13 @@ internal sealed class CheckpointSchema
     /// <summary>Resolves the leaf <see cref="DataField"/>s of an <c>add</c>/<c>remove</c> nested
     /// <c>deletionVector</c> struct (issue #527). Returns null when the action has no DV struct; each leaf is
     /// resolved independently so a writer that omits an optional sub-column (e.g. <c>offset</c>) still
-    /// resolves the rest. <see cref="DeletionVectorLeaves.StorageType"/> is the per-row presence signal.</summary>
+    /// resolves the rest.
+    ///
+    /// <para>Resolution does NOT decide per-row DV presence. Presence is an <b>any-leaf-non-null</b> rule
+    /// applied at decode time (<c>CheckpointColumns.DeletionVectorColumns.IsPresent</c>): a row carries a DV
+    /// iff any DV leaf is non-null, so a present-but-incomplete DV fails closed instead of being silently
+    /// dropped and resurrecting deleted rows. An all-leaves-null present struct is treated as no-DV, which is
+    /// safe (it names zero deletions). Do NOT reintroduce a storageType-only presence shortcut here.</para></summary>
     private static DeletionVectorLeaves? DeletionVector(StructField? deletionVector)
     {
         if (deletionVector is null)

@@ -17,6 +17,7 @@ internal sealed class CheckpointFixture
 {
     private readonly List<IDictionary<string, object?>> _rows = [];
     private bool _withDeletionVector;
+    private bool _dvLeavesRequired;
 
     /// <summary>A nested <c>deletionVector</c> struct's column values for a checkpoint <c>add</c>/
     /// <c>remove</c> (issue #527). Each field is independently nullable so a test can model a valid DV
@@ -67,6 +68,19 @@ internal sealed class CheckpointFixture
 
             return dv;
         }
+    }
+
+    /// <summary>Emits the DV struct's <c>storageType</c>/<c>pathOrInlineDv</c>/<c>sizeInBytes</c>/
+    /// <c>cardinality</c> leaves as REQUIRED (non-nullable) <b>within the optional</b> <c>deletionVector</c>
+    /// struct — the depth-2 definition-level shape real Spark writes (leaf MaxDefinitionLevel=2), versus the
+    /// fixture's default all-optional leaves (MaxDefinitionLevel=3). <c>offset</c> stays optional (inline DVs
+    /// carry none). The reader is parametric on per-field max-def, so a required-leaf round trip hardens the
+    /// parity claim against the exact shape Spark emits (issue #527). Must be set before serialization; a
+    /// malformed-DV fixture (which omits a required leaf) cannot use this variant.</summary>
+    public CheckpointFixture WithRequiredDvLeaves()
+    {
+        _dvLeavesRequired = true;
+        return this;
     }
 
     public CheckpointFixture Protocol(
@@ -230,6 +244,17 @@ internal sealed class CheckpointFixture
         return stream.ToArray();
     }
 
+    /// <summary>Serializes all accumulated rows to a single checkpoint Parquet part whose row groups hold at
+    /// most <paramref name="rowGroupSize"/> rows, forcing a MULTI-row-group part so a checkpoint-reader test
+    /// can exercise the per-row-group Dremel decode across a row-group boundary (issue #527 DV alignment).</summary>
+    public async Task<byte[]> ToParquetAsync(int rowGroupSize)
+    {
+        using var stream = new MemoryStream();
+        await ParquetSerializer.SerializeUntypedAsync(
+            _rows, BuildSchema(), stream, new ParquetOptions { RowGroupSize = rowGroupSize });
+        return stream.ToArray();
+    }
+
     /// <summary>Splits the accumulated rows across <paramref name="parts"/> checkpoint Parquet files
     /// (round-robin) to model a multi-part classic checkpoint.</summary>
     public async Task<byte[][]> ToPartsAsync(int parts)
@@ -351,15 +376,25 @@ internal sealed class CheckpointFixture
         return new ParquetSchema(txn, add, remove, metaData, protocol);
     }
 
-    /// <summary>The nested <c>deletionVector</c> struct schema. All sub-fields are nullable so a test can
-    /// omit a required one to model a malformed DV (fail-closed on read).</summary>
-    private static StructField DeletionVectorStruct() =>
-        new("deletionVector",
-            NullableString("storageType"),
-            NullableString("pathOrInlineDv"),
-            new DataField<int?>("offset"),
-            new DataField<int?>("sizeInBytes"),
-            new DataField<long?>("cardinality"));
+    /// <summary>The nested <c>deletionVector</c> struct schema. By default all sub-fields are nullable so a
+    /// test can omit a required one to model a malformed DV (fail-closed on read). When
+    /// <see cref="WithRequiredDvLeaves"/> is set, <c>storageType</c>/<c>pathOrInlineDv</c>/<c>sizeInBytes</c>/
+    /// <c>cardinality</c> are REQUIRED within the still-optional struct (Spark's depth-2 shape); <c>offset</c>
+    /// stays optional either way.</summary>
+    private StructField DeletionVectorStruct() =>
+        _dvLeavesRequired
+            ? new StructField("deletionVector",
+                new DataField<string>("storageType", nullable: false),
+                new DataField<string>("pathOrInlineDv", nullable: false),
+                new DataField<int?>("offset"),
+                new DataField<int>("sizeInBytes"),
+                new DataField<long>("cardinality"))
+            : new StructField("deletionVector",
+                NullableString("storageType"),
+                NullableString("pathOrInlineDv"),
+                new DataField<int?>("offset"),
+                new DataField<int?>("sizeInBytes"),
+                new DataField<long?>("cardinality"));
 
     private static DataField NullableString(string name) => new DataField<string?>(name);
 
