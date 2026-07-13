@@ -555,7 +555,8 @@ columns/types, not merely the caller's declaration.
 `SchemaEvolutionMode` is a `[Flags]` enum with just two bits: `None` (strict) and `AddNewColumns` (Spark
 `mergeSchema` — add new **nullable** columns). `MergeSchema` is kept only as a **documented alias equal to
 `AddNewColumns`** for Spark familiarity; it enables **no** type change. There is deliberately **no** `WidenTypes`
-mode — type widening is fail-closed (see the *Type widening* row and *Deferred* notes below).
+mode — type widening is instead gated by the `typeWidening` **table feature** + `delta.enableTypeWidening`
+property (see the *Type widening* row and the #495 note below), not by a `SchemaEvolutionMode` bit.
 
 **Enforcement (reject before commit — HP-09, AC1).** `DeltaSchemaEnforcer.Reconcile(tableSchema, writeSchema,
 mode)` runs at the **top** of every enforcing write, **before** any `add`/`metaData` action is built or committed
@@ -573,7 +574,7 @@ keys/values:
 | Dimension | Rule |
 |---|---|
 | Type equality | Equal types are accepted unchanged. |
-| Type widening | **Deferred and fail-closed (#495).** No existing column's type is ever changed by a write — `Reconcile` never returns a schema whose column types differ from the table. Widening the *logical* schema (integral `byte→short→int→long`, `float→double`, `date→timestamp`, or a growing `decimal`) **without** registering Delta's `typeWidening` table feature would make already-written Parquet files **unreadable even by DeltaSharp**: `ParquetFileReader` binds a requested column to the file's exact physical CLR type, so an `Int32` file read under a widened `long` schema throws `SchemaMismatch` (proven regression) — silent, whole-column data corruption. So a differing type is **always** rejected: a pair that *would* be a lossless widening throws the distinct `TypeWideningUnsupported` (message: "…requires the Delta typeWidening table feature (tracked in #495)"); every other differing type throws `IncompatibleType`. `date→timestamp` is also rejected — Delta only sanctions `date→timestamp_ntz`, which needs a not-yet-existing NTZ type (#495). |
+| Type widening | **Implemented (#495) — applied in-place when the `typeWidening` table feature is enabled; otherwise fail-closed.** When the table registers Delta's `typeWidening` reader+writer feature (reader v3 / writer v7) **and** sets `delta.enableTypeWidening=true`, a **Delta-sanctioned** widening of an existing column's *scalar* type is **applied**: `Reconcile` returns a merged schema carrying the **wide** type plus a per-field `delta.typeChanges` metadata entry (`[{"fromType":<old>,"toType":<new>}]`, oldest change first). The applied allowlist is exactly: integral `byte→short→int→long` (any wider rank), `float→double`, and **grow-only** `decimal(p,s)→decimal(p',s')` (both the integer-digit range `p−s` **and** the scale `s` non-decreasing). Read-side promotion (`ParquetFileReader`) reads an **older** file's narrow physical values and widens them into the requested wide vector, so pre-widening files stay readable. **Without** the feature enabled, a would-be widening is still fail-closed with the distinct `TypeWideningUnsupported` (never silently applied), and every non-widening type difference throws `IncompatibleType` (including all narrowings and lossy/unrelated changes). `date→timestamp` stays **fail-closed even when enabled** (`TypeWideningUnsupported`): Delta only sanctions `date→timestamp_ntz`, which needs a not-yet-existing `TimestampNtzType` (deferred). Widening is applied only at a `StructField`'s own scalar leaf — an array-element/map-key/value widening is **not** applied (it would need a `fieldPath` in `delta.typeChanges` and the reader does not promote nested types). |
 | Case sensitivity | Matching is case-**sensitive**/ordinal (so `Id` ≠ `id` are distinct columns and reordering is not a change), **but** the *merged* schema must never contain two field names equal under `OrdinalIgnoreCase` — a case-insensitive collision (e.g. table `{id}` + a new `{ID}` under `AddNewColumns`) is a storage/protocol invariant Delta/Spark reject, so it is rejected here (`CaseInsensitiveDuplicateColumn`, carrying the dotted path). Applied recursively to nested structs. |
 | Nullability | The table's nullability is **authoritative and never changed by a write**. Writing a non-null value into a nullable column is fine; writing a nullable value into a required column (or relaxing a required column to nullable) is **always** rejected (`NullabilityViolation`). `array.containsNull` / `map.valueContainsNull` follow the same rule. |
 | Presence (table column omitted) | Accepted only if the column is nullable (new rows carry `null`); omitting a **required** column is rejected (`MissingRequiredColumn`). |
@@ -593,15 +594,21 @@ evolution write *and* a plain append validated against the now-stale schema — 
 data-only append. Either way a stale-schema write must **refresh** onto the latest snapshot and retry. The table
 schema is thus effectively part of the write's read dependency; no stale-schema write can slip through.
 
-**Deferred (out of scope for #190 — file tracking issues):**
-- **`typeWidening` table feature → widening is fail-closed (#495).** Type widening is **not** performed at all here
-  (see the *Type widening* row): widening the *logical* schema without registering Delta's `typeWidening`
-  writer/reader feature (and its per-field widening metadata) would break **same-engine** read-back — `DeltaSharp`'s
-  own `ParquetFileReader` binds to the file's exact physical type, so a pre-widening `Int32` file becomes unreadable
-  under a widened `long` schema (proven regression) — i.e. silent data corruption. Widening therefore stays
-  fail-closed until #495 lands the feature + metadata; a would-be widening is surfaced distinctly as
-  `TypeWideningUnsupported`. This also covers `date→timestamp` (Delta only sanctions `date→timestamp_ntz`, which
-  needs a not-yet-existing NTZ type — #495).
+**Schema-evolution scope (implemented feature-gates + deferred sub-parts):**
+- **`typeWidening` table feature → in-place widening (#495).** When the table registers Delta's `typeWidening`
+  reader+writer feature (reader v3 / writer v7) and sets `delta.enableTypeWidening=true`, a Delta-sanctioned
+  scalar widening is **applied** in place: `DeltaSchemaEnforcer.Reconcile` returns a merged schema carrying the
+  wide type plus a per-field `delta.typeChanges` metadata entry, and `ParquetFileReader` **promotes** older
+  narrow-physical files into the requested wide type on read (so no data rewrite is needed — the additive
+  counterpart to the destructive `overwriteSchema` path below). Applied allowlist: integral
+  `byte→short→int→long`, `float→double`, and grow-only `decimal` (integer range **and** scale both
+  non-decreasing). Enablement is **create-time** (feature declared in `protocol` + property set at table
+  creation), mirroring `columnMapping`/`deletionVectors`; auto-upgrading an unprepared table's protocol on a
+  widening write is **deferred** (**#534** — a widening against a non-enabled table still fails closed as
+  `TypeWideningUnsupported`). `date→timestamp` remains **deferred/fail-closed even when enabled** because Delta
+  only sanctions `date→timestamp_ntz` and no `TimestampNtzType` exists in this build yet (**#533**). The
+  cross-family (`int→double`, `int/long→decimal`) and nested (array-element/map-key/value) widenings the
+  protocol also sanctions are **not applied** here — fail-closed, tracked in **#535**.
 - **`overwriteSchema` (destructive schema replacement) — implemented (#496).** A full (**Static**) overwrite
   with `overwriteSchema=true` (the connector `overwriteSchema` write option, resolved by `DeltaSinkFactory`)
   **replaces the table schema wholesale** — drop, narrow, reorder, add, or change a column's type, and change

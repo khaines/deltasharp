@@ -51,6 +51,22 @@ internal static class DeltaTestHarness
             .Replace("__C__", config, StringComparison.Ordinal);
     }
 
+    /// <summary>A <c>metaData</c> line carrying both a real (non-empty) schema and a table
+    /// <c>configuration</c> map — used to seed a table that both declares a schema and enables a feature
+    /// property (e.g. <c>delta.enableTypeWidening=true</c> for #495).</summary>
+    public static string MetadataWithSchemaAndConfig(
+        StructType schema, (string Key, string Value)[] configuration, string id = "t", string[]? partitionColumns = null)
+    {
+        string escapedSchema = EscapeForJsonString(DeltaSchemaJson.ToJson(schema));
+        string config = "{" + string.Join(
+            ",", configuration.Select(kv => $"\"{kv.Key}\":\"{kv.Value}\"")) + "}";
+        return """{"metaData":{"id":"__ID__","format":{"provider":"parquet","options":{}},"schemaString":"__S__","partitionColumns":[__P__],"configuration":__C__}}"""
+            .Replace("__ID__", id, StringComparison.Ordinal)
+            .Replace("__S__", escapedSchema, StringComparison.Ordinal)
+            .Replace("__P__", partitionColumns is null ? "" : string.Join(",", partitionColumns.Select(p => $"\"{p}\"")), StringComparison.Ordinal)
+            .Replace("__C__", config, StringComparison.Ordinal);
+    }
+
     /// <summary>A <c>metaData</c> line carrying a real (non-empty) table schema, serialized with the
     /// writer-side <see cref="DeltaSchemaJson"/> and JSON-escaped for embedding, so schema-enforcement
     /// tests can seed a table whose <see cref="Snapshot.Schema"/> parses back to <paramref name="schema"/>

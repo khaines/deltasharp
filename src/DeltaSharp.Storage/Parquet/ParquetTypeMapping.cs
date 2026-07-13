@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Types;
 using Parquet.Schema;
@@ -83,6 +84,25 @@ internal static class ParquetTypeMapping
     public static DataType ToDataType(DataField field)
     {
         ArgumentNullException.ThrowIfNull(field);
+        if (TryToDataType(field, out DataType? type))
+        {
+            return type;
+        }
+
+        throw DeltaStorageException.UnsupportedFeature(
+            $"Parquet footer column '{field.Name}' has physical CLR type '{field.ClrType.Name}', which has no "
+            + "supported DeltaSharp type mapping.");
+    }
+
+    /// <summary>
+    /// The non-throwing form of <see cref="ToDataType"/>: reconstructs the DeltaSharp <see cref="DataType"/> a
+    /// footer <see cref="DataField"/> encodes, returning <see langword="false"/> (rather than throwing) when
+    /// the physical type has no supported mapping. Used by the read path's type-widening promotion to probe a
+    /// file column's <b>physical</b> type without forcing an exception for an unmappable column.
+    /// </summary>
+    public static bool TryToDataType(DataField field, [NotNullWhen(true)] out DataType? type)
+    {
+        ArgumentNullException.ThrowIfNull(field);
 
         // The annotated subtypes must be matched BEFORE the raw CLR switch: a DateTimeDataField's ClrType is
         // DateTime and a DecimalDataField's is decimal, so the temporal/decimal annotation carries the real
@@ -90,62 +110,28 @@ internal static class ParquetTypeMapping
         switch (field)
         {
             case DateTimeDataField dateTime:
-                return dateTime.DateTimeFormat == DateTimeFormat.Date
+                type = dateTime.DateTimeFormat == DateTimeFormat.Date
                     ? DataTypes.DateType
                     : DataTypes.TimestampType;
+                return true;
             case DecimalDataField decimalField:
-                return DataTypes.CreateDecimalType(decimalField.Precision, decimalField.Scale);
+                type = DataTypes.CreateDecimalType(decimalField.Precision, decimalField.Scale);
+                return true;
         }
 
         Type clr = field.ClrType;
-        if (clr == typeof(bool))
-        {
-            return DataTypes.BooleanType;
-        }
-
-        if (clr == typeof(sbyte))
-        {
-            return DataTypes.ByteType;
-        }
-
-        if (clr == typeof(short))
-        {
-            return DataTypes.ShortType;
-        }
-
-        if (clr == typeof(int))
-        {
-            return DataTypes.IntegerType;
-        }
-
-        if (clr == typeof(long))
-        {
-            return DataTypes.LongType;
-        }
-
-        if (clr == typeof(float))
-        {
-            return DataTypes.FloatType;
-        }
-
-        if (clr == typeof(double))
-        {
-            return DataTypes.DoubleType;
-        }
-
-        if (clr == typeof(string))
-        {
-            return DataTypes.StringType;
-        }
-
-        if (clr == typeof(byte[]))
-        {
-            return DataTypes.BinaryType;
-        }
-
-        throw DeltaStorageException.UnsupportedFeature(
-            $"Parquet footer column '{field.Name}' has physical CLR type '{clr.Name}', which has no "
-            + "supported DeltaSharp type mapping.");
+        type =
+            clr == typeof(bool) ? DataTypes.BooleanType
+            : clr == typeof(sbyte) ? DataTypes.ByteType
+            : clr == typeof(short) ? DataTypes.ShortType
+            : clr == typeof(int) ? DataTypes.IntegerType
+            : clr == typeof(long) ? DataTypes.LongType
+            : clr == typeof(float) ? DataTypes.FloatType
+            : clr == typeof(double) ? DataTypes.DoubleType
+            : clr == typeof(string) ? DataTypes.StringType
+            : clr == typeof(byte[]) ? DataTypes.BinaryType
+            : null;
+        return type is not null;
     }
 
     /// <summary>

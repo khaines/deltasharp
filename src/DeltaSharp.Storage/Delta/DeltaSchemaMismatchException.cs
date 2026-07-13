@@ -30,12 +30,15 @@ internal enum DeltaSchemaMismatchKind
     /// silently downcasts. Always rejected.</summary>
     IncompatibleType,
 
-    /// <summary>The write changes a column's type to one that <i>would</i> be a lossless widening
-    /// (<c>int→long</c>, <c>float→double</c>, <c>date→timestamp</c>, a growing <c>decimal</c>), but type
-    /// widening is <b>not supported</b> here: widening the logical schema without Delta's <c>typeWidening</c>
-    /// table feature makes the existing Parquet files unreadable even by DeltaSharp (the reader does an exact
-    /// physical-type match). Fail-closed until the feature lands (tracked in #495). Distinct from
-    /// <see cref="IncompatibleType"/> so the message can name the deferred feature.</summary>
+    /// <summary>The write changes a column's type to a Delta-sanctioned widening
+    /// (<c>int→long</c>, <c>float→double</c>, a growing <c>decimal</c>) or a deferred one
+    /// (<c>date→timestamp</c>), but type widening is <b>not applied</b> here: the table has not enabled it
+    /// (the <c>typeWidening</c> table feature must be present AND <c>delta.enableTypeWidening=true</c>), or
+    /// the widening is deferred (needs a not-yet-existing <c>timestamp_ntz</c> type). Applying a widening
+    /// without the read-side promotion + <c>delta.typeChanges</c> in place would make existing Parquet files
+    /// unreadable, so it is fail-closed. Distinct from <see cref="IncompatibleType"/> so the message can name
+    /// the enablement/deferral reason. When the table <i>is</i> enabled, a sanctioned widening is applied and
+    /// this is not raised.</summary>
     TypeWideningUnsupported,
 
     /// <summary>Evolution would produce a merged schema containing two columns whose names are equal under
@@ -132,9 +135,12 @@ internal sealed class DeltaSchemaMismatchException : Exception
         new(
             DeltaSchemaMismatchKind.TypeWideningUnsupported,
             path,
-            $"The type change '{tableType}'→'{writeType}' for column '{path}' requires the Delta " +
-            "typeWidening table feature, which is not yet supported (tracked in #495). Widening the logical " +
-            "schema without it would make the table's existing Parquet files unreadable, so it is rejected.");
+            $"The type change '{tableType}'→'{writeType}' for column '{path}' is a Delta-sanctioned widening " +
+            "but is not applied here: the table has not enabled type widening (the 'typeWidening' table " +
+            "feature must be present AND the 'delta.enableTypeWidening' property set to 'true'), or the change " +
+            "is a deferred widening this build cannot represent (date→timestamp needs a timestamp_ntz type). " +
+            "Widening the logical schema without enablement would make the table's existing Parquet files " +
+            "unreadable, so it is rejected fail-closed.");
 
     public static DeltaSchemaMismatchException CaseInsensitiveDuplicateColumn(string path, string other) =>
         new(

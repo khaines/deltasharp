@@ -648,4 +648,201 @@ public sealed class DeltaSchemaEnforcerTests
         Assert.NotNull(second);
         Assert.Equal(first, second);
     }
+
+    // ---- #495: type widening APPLIED when the feature is enabled --------------------------------------
+
+    [Theory]
+    [MemberData(nameof(WouldBeWidenings))]
+    public void Reconcile_Widening_WhenEnabled_AppliesAndRecordsTypeChange(DataType from, DataType to)
+    {
+        // With typeWidening enabled, each sanctioned integral/float widening is APPLIED: the merged schema
+        // carries the WIDE type and a delta.typeChanges entry {fromType,toType} (Delta PROTOCOL.md
+        // "Type Change Metadata").
+        StructType table = Schema(Field("value", from, nullable: true));
+        StructType write = Schema(Field("value", to, nullable: true));
+
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(
+            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+
+        Assert.NotNull(merged);
+        StructField field = merged!["value"];
+        Assert.Equal(to, field.DataType);
+        AssertSingleTypeChange(field.Metadata, from.TypeName, to.TypeName);
+    }
+
+    [Theory]
+    [InlineData(10, 2, 12, 2)] // integer range grows, scale equal
+    [InlineData(10, 2, 12, 4)] // both grow, integer range unchanged
+    [InlineData(10, 2, 13, 3)] // both grow
+    public void Reconcile_DecimalGrowOnlyWidening_WhenEnabled_Applies(int fromP, int fromS, int toP, int toS)
+    {
+        DecimalType from = DataTypes.CreateDecimalType(fromP, fromS);
+        DecimalType to = DataTypes.CreateDecimalType(toP, toS);
+        StructType table = Schema(Field("amount", from, nullable: true));
+        StructType write = Schema(Field("amount", to, nullable: true));
+
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(
+            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+
+        Assert.NotNull(merged);
+        StructField field = merged!["amount"];
+        Assert.Equal(to, field.DataType);
+        AssertSingleTypeChange(field.Metadata, from.TypeName, to.TypeName);
+    }
+
+    [Theory]
+    [InlineData(10, 2, 10, 1)] // scale shrinks
+    [InlineData(10, 2, 11, 4)] // integer range shrinks
+    [InlineData(10, 2, 9, 2)]  // precision shrinks
+    public void Reconcile_DecimalNarrowing_WhenEnabled_IsStillRejected(int fromP, int fromS, int toP, int toS)
+    {
+        StructType table = Schema(Field("amount", DataTypes.CreateDecimalType(fromP, fromS), nullable: true));
+        StructType write = Schema(Field("amount", DataTypes.CreateDecimalType(toP, toS), nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+
+        Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
+    }
+
+    [Fact]
+    public void Reconcile_DateToTimestamp_WhenEnabled_IsStillRejectedAsTypeWideningUnsupported()
+    {
+        // date→timestamp is DEFERRED even with the feature enabled: Delta only sanctions date→timestamp_ntz,
+        // and no NTZ type exists in this build, so it stays fail-closed.
+        StructType table = Schema(Field("ts", DataTypes.DateType, nullable: true));
+        StructType write = Schema(Field("ts", DataTypes.TimestampType, nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+    }
+
+    [Fact]
+    public void Reconcile_LossyChange_WhenEnabled_IsRejectedAsIncompatible()
+    {
+        // long→int (narrowing) is not a widening at all: still IncompatibleType even with the feature enabled.
+        StructType table = Schema(Field("value", DataTypes.LongType, nullable: true));
+        StructType write = Schema(Field("value", DataTypes.IntegerType, nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+
+        Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
+    }
+
+    [Fact]
+    public void Reconcile_UnrelatedChange_WhenEnabled_IsRejectedAsIncompatible()
+    {
+        // int→string is not a sanctioned widening: IncompatibleType even with the feature enabled.
+        StructType table = Schema(Field("value", DataTypes.IntegerType, nullable: true));
+        StructType write = Schema(Field("value", DataTypes.StringType, nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+
+        Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
+    }
+
+    [Fact]
+    public void Reconcile_Widening_WithoutEnablement_IsRejectedAsTypeWideningUnsupported()
+    {
+        // The same int→long that applies when enabled stays fail-closed when the feature is NOT enabled.
+        StructType table = Schema(Field("value", DataTypes.IntegerType, nullable: true));
+        StructType write = Schema(Field("value", DataTypes.LongType, nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: false));
+
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+    }
+
+    [Fact]
+    public void Reconcile_PartitionColumnWidening_WhenEnabled_IsStillRejected()
+    {
+        // A partition column's type is encoded in the physical layout, so widening it is rejected even with
+        // the feature enabled (PartitionColumnEvolutionUnsupported).
+        StructType table = Schema(Field("part", DataTypes.IntegerType, nullable: true));
+        StructType write = Schema(Field("part", DataTypes.LongType, nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: new[] { "part" }, typeWideningEnabled: true));
+
+        Assert.Equal(DeltaSchemaMismatchKind.PartitionColumnEvolutionUnsupported, ex.Kind);
+    }
+
+    [Fact]
+    public void Reconcile_Widening_PreservesPriorTypeChangeHistory_OldestFirst()
+    {
+        // A field already widened once (short→int, recorded in delta.typeChanges) is widened again (int→long):
+        // the new change appends to the history, oldest first (Delta requires the full history).
+        FieldMetadata priorHistory = FieldMetadata.FromValues(new[]
+        {
+            new KeyValuePair<string, MetadataValue>(
+                "delta.typeChanges",
+                MetadataValue.Array(new[]
+                {
+                    MetadataValue.Nested(FieldMetadata.FromEntries(new[]
+                    {
+                        new KeyValuePair<string, string>("fromType", "short"),
+                        new KeyValuePair<string, string>("toType", "integer"),
+                    })),
+                })),
+        });
+        StructType table = Schema(new StructField("value", DataTypes.IntegerType, nullable: true, priorHistory));
+        StructType write = Schema(Field("value", DataTypes.LongType, nullable: true));
+
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(
+            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+
+        Assert.NotNull(merged);
+        StructField field = merged!["value"];
+        Assert.Equal(DataTypes.LongType, field.DataType);
+        Assert.True(field.Metadata.TryGetValue("delta.typeChanges", out MetadataValue? changes));
+        Assert.True(changes!.TryGetArray(out IReadOnlyList<MetadataValue>? entries));
+        Assert.Equal(2, entries!.Count);
+        AssertTypeChangeEntry(entries[0], "short", "integer");
+        AssertTypeChangeEntry(entries[1], "integer", "long");
+    }
+
+    [Fact]
+    public void Reconcile_WideningInsideArrayElement_IsNotApplied_EvenWhenEnabled()
+    {
+        // Applied widening is confined to a StructField's own scalar type; an array element widening is not
+        // applied (it would need a fieldPath in delta.typeChanges and the reader can't promote nested types).
+        var tableArray = new ArrayType(DataTypes.IntegerType, containsNull: true);
+        var writeArray = new ArrayType(DataTypes.LongType, containsNull: true);
+        StructType table = Schema(Field("nums", tableArray, nullable: true));
+        StructType write = Schema(Field("nums", writeArray, nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+    }
+
+    private static void AssertSingleTypeChange(FieldMetadata metadata, string fromType, string toType)
+    {
+        Assert.True(metadata.TryGetValue("delta.typeChanges", out MetadataValue? changes));
+        Assert.True(changes!.TryGetArray(out IReadOnlyList<MetadataValue>? entries));
+        MetadataValue only = Assert.Single(entries!);
+        AssertTypeChangeEntry(only, fromType, toType);
+    }
+
+    private static void AssertTypeChangeEntry(MetadataValue entry, string fromType, string toType)
+    {
+        Assert.True(entry.TryGetNested(out FieldMetadata? nested));
+        Assert.True(nested!.TryGetString("fromType", out string? actualFrom));
+        Assert.True(nested.TryGetString("toType", out string? actualTo));
+        Assert.Equal(fromType, actualFrom);
+        Assert.Equal(toType, actualTo);
+    }
 }

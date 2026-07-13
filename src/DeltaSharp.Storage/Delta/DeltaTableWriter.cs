@@ -690,8 +690,15 @@ internal sealed class DeltaTableWriter
         IReadOnlyCollection<string>? partitionColumns = readSnapshot.Metadata.PartitionColumns.IsDefaultOrEmpty
             ? null
             : readSnapshot.Metadata.PartitionColumns;
+
+        // Type widening is applied only when the table has enabled it: the `typeWidening` table feature is in
+        // the protocol AND `delta.enableTypeWidening` is set (Delta PROTOCOL.md "Type Widening"). Otherwise a
+        // would-be widening stays fail-closed (TypeWideningUnsupported). This build enables type widening at
+        // table-create time (mirroring column mapping / deletion vectors) and never silently upgrades an
+        // unprepared table's protocol on a widening write.
+        bool typeWideningEnabled = TypeWideningFeature.IsWriteEnabled(readSnapshot);
         StructType? mergedSchema = DeltaSchemaEnforcer.Reconcile(
-            readSnapshot.Schema, writeSchema, evolutionMode, partitionColumns);
+            readSnapshot.Schema, writeSchema, evolutionMode, partitionColumns, typeWideningEnabled);
         return mergedSchema is null
             ? null
             : readSnapshot.Metadata with { SchemaString = SchemaJson.ToJson(mergedSchema) };
