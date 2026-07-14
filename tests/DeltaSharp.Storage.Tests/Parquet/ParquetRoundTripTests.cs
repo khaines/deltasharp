@@ -114,7 +114,7 @@ public sealed class ParquetRoundTripTests
         stream.Position = 0;
         var reader = new ParquetFileReader();
         var batches = new List<ColumnBatch>();
-        await foreach (ColumnBatch batch in reader.ReadAsync(stream, readSchema, keepRowGroup: null, CancellationToken.None))
+        await foreach (ColumnBatch batch in reader.ReadAsync(stream, readSchema, keepRowGroup: null, nullFillMissingColumns: false, CancellationToken.None))
         {
             batches.Add(batch);
         }

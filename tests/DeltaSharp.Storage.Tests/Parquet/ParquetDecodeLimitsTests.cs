@@ -25,6 +25,39 @@ public sealed class ParquetDecodeLimitsTests
         long compressed, long uncompressed, int elementBytes) =>
         [new ParquetFileReader.ColumnChunkFootprint(compressed, uncompressed, elementBytes)];
 
+    // #497: an ABSENT (null-filled) column footprint declares no bytes but keeps its element width so the
+    // null-fill allocation is still bounded by the (iii) row-count ceiling.
+    private static IReadOnlyList<ParquetFileReader.ColumnChunkFootprint> AbsentFootprint(int elementBytes) =>
+        [new ParquetFileReader.ColumnChunkFootprint(0, 0, elementBytes, Absent: true)];
+
+    [Fact]
+    public void AbsentColumn_HugeRowCount_ExceedsCeiling_FailsClosed()
+    {
+        // #497: the null-fill of an absent column skips the decompression guards (it declares no bytes) but
+        // MUST still honor the (iii) row-count/element-width bound, so an attacker-sized rowCount cannot
+        // drive an unbounded all-null allocation. 100000 rows × 8-byte element = 800 KB ≫ a 1000-byte ceiling.
+        DeltaStorageException ex = Assert.Throws<DeltaStorageException>(() =>
+            ParquetFileReader.EnsureDecodeCeiling(
+                rowCount: 100_000,
+                AbsentFootprint(elementBytes: 8),
+                group: 0,
+                new ParquetDecodeLimits(maxRowGroupDecodedBytes: 1000)));
+        Assert.Equal(StorageErrorKind.CorruptData, ex.Kind);
+        Assert.Contains("null-fill of an absent column", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AbsentColumn_ModestRowCount_WithinCeiling_Accepted()
+    {
+        // The same absent-column path passes for a legitimate row count under the ceiling (no false reject):
+        // an absent chunk declares zero decompressed bytes, so only its (iii) allocation bound applies.
+        ParquetFileReader.EnsureDecodeCeiling(
+            rowCount: 100,
+            AbsentFootprint(elementBytes: 8),
+            group: 0,
+            new ParquetDecodeLimits(maxRowGroupDecodedBytes: 1000));
+    }
+
     [Fact]
     public void Default_UsesSafeConstants()
     {
@@ -147,14 +180,14 @@ public sealed class ParquetDecodeLimitsTests
         var tiny = new ParquetFileReader(new ParquetDecodeLimits(maxRowGroupDecodedBytes: 1));
         await Assert.ThrowsAsync<DeltaStorageException>(async () =>
         {
-            await foreach (ColumnBatch _ in tiny.ReadAsync(new MemoryStream(parquet), schema, keepRowGroup: null, CancellationToken.None))
+            await foreach (ColumnBatch _ in tiny.ReadAsync(new MemoryStream(parquet), schema, keepRowGroup: null, nullFillMissingColumns: false, CancellationToken.None))
             {
             }
         });
 
         // The same file reads cleanly under the default limits.
         var read = new List<ColumnBatch>();
-        await foreach (ColumnBatch b in new ParquetFileReader().ReadAsync(new MemoryStream(parquet), schema, keepRowGroup: null, CancellationToken.None))
+        await foreach (ColumnBatch b in new ParquetFileReader().ReadAsync(new MemoryStream(parquet), schema, keepRowGroup: null, nullFillMissingColumns: false, CancellationToken.None))
         {
             read.Add(b);
         }

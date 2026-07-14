@@ -497,7 +497,7 @@ Acknowledged commits remain durable across driver restart, executor loss, storag
 - **One commit, `dataChange=false` (the correctness core).** The whole OPTIMIZE publishes as **one** Delta commit that `remove`s every compacted input and `add`s every compacted output, **both sides `dataChange=false`** (§2.11.2) — compaction rearranges bytes, not data. This is exactly what lets OPTIMIZE run concurrently with a blind append (the Compaction row of the §2.11.2 matrix: the append's new files can never be in compaction's remove/read set, so the two rebase past each other).
 - **Conflict scope (AC2).** The commit is scoped `DeltaReadScope.ReadFiles(inputPaths)` over exactly the compaction inputs, so a concurrent `remove`/re-`add` of any input aborts (`ConcurrentDeleteReadException` / `ConcurrentAppendException`) while the committer rebases past unrelated appends.
 - **Orphan-safe failure (AC4).** Compacted files are written **before** the commit; a failure before/at the commit leaves the inputs active and the written outputs as ignorable orphans (invisible to readers, reclaimable by VACUUM / §2.11.5) — no special rollback hook is needed.
-- **Schema-evolution limitation (fails closed, #497).** OPTIMIZE reads inputs under the **current** snapshot data schema, so on an additively schema-evolved table (#190) a pre-evolution (physically narrow) Parquet file needs read-side null-fill of the later-added columns — which is not yet implemented (**#497**). Until #497 lands, OPTIMIZE **fails closed with a clear error** (`OptimizeSchemaEvolutionException`, naming the file and referencing #497), thrown **before** any commit (inputs stay active, version unchanged, outputs orphaned), rather than compacting or surfacing a misleading "column not present" corruption error.
+- **Schema-evolution limitation (fails closed, #530).** OPTIMIZE reads inputs under the **current** snapshot data schema, so on an additively schema-evolved table (#190) a pre-evolution (physically narrow) Parquet file needs null-fill of the later-added columns in the widened compacted output. The read-side null-fill capability landed with #497, but OPTIMIZE does **not** yet apply it during compaction (tracked in **#530**). Until #530 lands, OPTIMIZE **fails closed with a clear error** (`OptimizeSchemaEvolutionException`, naming the file and referencing #530), thrown **before** any commit (inputs stay active, version unchanged, outputs orphaned), rather than compacting or surfacing a misleading "column not present" corruption error.
 - **Observability.** OPTIMIZE self-instruments like `DeltaVacuum`/`DeltaCommitter`: an OpenTelemetry span, `Information`/`Warning`/`Error` structured logs (started / completed / no-op / aborted / canceled / failed), and terminal metrics (files removed/added, input bytes, duration) tagged by bounded `outcome` (`dry_run` / `completed` / `no_op` / `aborted` / `cancelled` / `failure`). No row or column value is ever emitted (redaction-by-omission). Rich in-log `commitInfo.operationMetrics` (`numFilesAdded`/`numFilesRemoved`/`numRows`) is **not** emitted — `commitInfo` is provenance-only here — and is tracked as a follow-up (**#506**).
 - **Dry-run** reports the plan (which files *would* be compacted) without writing or committing; its `EstimatedRowCount` (advisory, from input `add.stats`) is populated while the measured `RowCount` is `0`. **Memory (eager materialization, v1):** a group is materialized **decompressed** (`List<ColumnBatch>`) **plus** its re-serialized output `MemoryStream` before publishing, so the **decoded** peak is **not** bounded by the ≈128 MiB target (that knob bounds packed *compressed* input; highly compressible data decodes far larger). It is bounded **per group** (batches + output buffer are group-local and GC'd each iteration), never across the run. Streaming (chunked) rewrite and clustering-aware / Z-order compaction are tracked follow-ups.
 
@@ -548,7 +548,9 @@ Task<DeltaCommitResult> OverwriteAsync(
 ```
 
 Schema enforcement **always** runs (there is no way to opt out); the production write-door (#487) supplies the
-true write schema, and physical write-schema validation is tracked in #497.
+true write schema, and — since #497 — the write path also **validates that schema against the real staged
+bytes** (`StagedDataFile.DataSchema`, recorded by the write-door), so enforcement gates the *actual* written
+columns/types, not merely the caller's declaration.
 
 `SchemaEvolutionMode` is a `[Flags]` enum with just two bits: `None` (strict) and `AddNewColumns` (Spark
 `mergeSchema` — add new **nullable** columns). `MergeSchema` is kept only as a **documented alias equal to
@@ -603,10 +605,20 @@ schema is thus effectively part of the write's read dependency; no stale-schema 
 - **`overwriteSchema` (destructive schema replacement) is NOT supported (#496).** A static overwrite here keeps the
   existing schema (or applies an additive `AddNewColumns` evolution); it may **not** drop, narrow, or reorder
   columns via an `overwriteSchema`-style replacement. That destructive path is tracked in #496.
-- **Read-side null-fill + physical write-schema validation (#497).** Filling `null` for an evolved (newly added)
-  column when reading older files that predate it, and validating that each staged Parquet file's *physical* schema
-  actually matches the declared write schema, are the read-path / production write-door (#487) responsibility —
-  tracked in #497. The enforcer operates on declared logical schemas only.
+- **Read-side null-fill + physical write-schema validation (#497) — implemented.** Reading an
+  additively schema-evolved table now fills `null` for a later-added column when reading older files that
+  predate it: the scan/read path (`DeltaReadSource`) requests the current data schema with
+  `nullFillMissingColumns` enabled, so `ParquetFileReader` materializes an absent **nullable** column as an
+  all-null column rather than failing. A genuinely incompatible mismatch still fails closed — an absent
+  **required (non-nullable)** column cannot be null-filled (surfaced as `DeltaReadSchemaEvolutionException`),
+  and a *present* column whose physical type/nullability disagrees is still a distinct `SchemaMismatch`. On
+  the write side, `StagedDataFile` now carries the file's actual physical `DataSchema` (recorded by the
+  write-door), and the enforcing/creating write paths validate the declared write schema against it
+  (`DeltaSchemaMismatchKind.PhysicalWriteSchemaMismatch`), so a staged file whose real bytes diverge from the
+  declaration is rejected before any commit. The enforcer itself still operates on declared logical schemas.
+  *Out of scope / separate follow-up:* OPTIMIZE compaction still reads its inputs strictly (fail-closed on a
+  narrow input) — compaction-time null-fill (rewriting an evolved table's older files with the added columns
+  materialized) is tracked separately (see the OPTIMIZE note above).
 - **Automatic `required → nullable` relaxation** is **not** performed — the table's declared nullability is
   preserved as-is. A deliberate nullability change is a separate `ALTER TABLE`-style metadata operation.
 - **Case-insensitive name *resolution*** (Spark's default for *matching* a write column to a table column) is a

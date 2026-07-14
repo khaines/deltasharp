@@ -37,14 +37,16 @@ public readonly record struct DeltaSnapshotInfo(long Version, StructType Schema)
 /// <see cref="ReadBatchesAsync"/> (at execution), so a concurrent commit between the two can never shift
 /// the data read.</para>
 ///
-/// <para><b>Scope (#499).</b> Base + time-travel reads of non-evolved / current-schema files, including
-/// committed <b>deletion vectors</b> (#192): an active file's DV is decoded and its deleted physical row
-/// positions are excluded on read (both inline and on-disk <c>.bin</c> forms). An active
-/// file physically narrower than the snapshot schema (additive schema evolution, #190) needs read-side
-/// null-fill (#497), which is not implemented here: such a file fails <b>closed</b> with a clear
-/// <see cref="DeltaReadSchemaEvolutionException"/> (mirroring OPTIMIZE's schema-evolution guard) rather
-/// than fabricating values. Predicate/column pushdown into the scan, <c>commitInfo.timestamp</c>
-/// resolution (#500), path authorization (#431), and CDF reads (#193) are out of scope.</para>
+/// <para><b>Scope (#499).</b> Base + time-travel reads of current-schema and <b>additively schema-evolved</b>
+/// files (#190/#497), including committed <b>deletion vectors</b> (#192): an active file's DV is decoded and
+/// its deleted physical row positions are excluded on read (both inline and on-disk <c>.bin</c> forms). An
+/// active file physically narrower than the snapshot schema (a pre-evolution file that predates a later-added
+/// column) is read back with the absent, later-added <b>nullable</b> columns <b>null-filled</b> (read-side
+/// null-fill, #497). A genuinely incompatible mismatch still fails <b>closed</b>: an absent <i>non-nullable</i>
+/// (required) column cannot be null-filled and surfaces a clear <see cref="DeltaReadSchemaEvolutionException"/>
+/// (mirroring OPTIMIZE's schema-evolution guard) rather than fabricating values. Predicate/column pushdown
+/// into the scan, <c>commitInfo.timestamp</c> resolution (#500), path authorization (#431), and CDF reads
+/// (#193) are out of scope.</para>
 /// </summary>
 public sealed class DeltaReadSource : IDisposable
 {
@@ -121,8 +123,9 @@ public sealed class DeltaReadSource : IDisposable
     /// <exception cref="DeltaReadException">The version cannot be reconstructed (out of range/gap/malformed),
     /// or an active file could not be read at execution — a between-phase missing/deleted file or a poisoned
     /// <c>add.path</c> confinement rejection — wrapped as this one typed, documented read failure.</exception>
-    /// <exception cref="DeltaReadSchemaEvolutionException">An active file is physically narrower than the
-    /// snapshot schema (an evolved file needing #497 read-side null-fill) — fails closed.</exception>
+    /// <exception cref="DeltaReadSchemaEvolutionException">An active file is missing a <b>required</b>
+    /// (non-nullable) column the snapshot schema requests — a genuine incompatibility that read-side null-fill
+    /// cannot satisfy (only absent nullable columns are null-filled, #497) — fails closed.</exception>
     public async Task<IReadOnlyList<ColumnBatch>> ReadBatchesAsync(
         long version, CancellationToken cancellationToken = default)
     {
@@ -268,7 +271,7 @@ public sealed class DeltaReadSource : IDisposable
             try
             {
                 await foreach (ColumnBatch dataBatch in _reader
-                    .ReadAsync(stream, dataSchema, keepRowGroup: null, cancellationToken)
+                    .ReadAsync(stream, dataSchema, keepRowGroup: null, nullFillMissingColumns: true, cancellationToken)
                     .ConfigureAwait(false))
                 {
                     ColumnBatch fullBatch =
@@ -290,10 +293,13 @@ public sealed class DeltaReadSource : IDisposable
             }
             catch (DeltaStorageException ex) when (IsNarrowSchemaEvolutionInput(ex))
             {
-                // FIX #497 (fails closed): the file was written under an older, narrower schema, so a
-                // current-schema data column is absent. Read-side null-fill is #497 and out of scope here;
-                // translate the misleading "column not present" corruption error into a clear, actionable
-                // schema-evolution error (mirrors OPTIMIZE's OptimizeSchemaEvolutionException).
+                // #497: absent NULLABLE columns are null-filled by the reader (nullFillMissingColumns: true
+                // above), so this only fires when a file is missing a REQUIRED (non-nullable) column the
+                // current schema demands — a genuine incompatibility read-side null-fill cannot satisfy (a
+                // required lane cannot carry null). Translate the low-level "column not present" corruption
+                // error into a clear, actionable schema-evolution error (mirrors OPTIMIZE's
+                // OptimizeSchemaEvolutionException) rather than fabricating values or leaking a misleading
+                // corruption message.
                 throw new DeltaReadSchemaEvolutionException(add.Path, ex);
             }
         }

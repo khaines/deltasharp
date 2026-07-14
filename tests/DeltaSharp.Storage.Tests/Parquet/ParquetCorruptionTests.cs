@@ -93,7 +93,7 @@ public sealed class ParquetCorruptionTests
 
         using var stream = new MemoryStream(poisoned, writable: false);
         IAsyncEnumerator<ColumnBatch> enumerator = new ParquetFileReader()
-            .ReadAsync(stream, schema, keepRowGroup: null, CancellationToken.None)
+            .ReadAsync(stream, schema, keepRowGroup: null, nullFillMissingColumns: false, CancellationToken.None)
             .GetAsyncEnumerator();
 
         try

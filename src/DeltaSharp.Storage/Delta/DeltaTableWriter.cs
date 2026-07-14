@@ -26,8 +26,13 @@ internal enum PartitionOverwriteMode
 /// A data file already written out to storage (its bytes exist), described by the facts a Delta
 /// <c>add</c> action needs: the table-relative <see cref="Path"/>, its <see cref="PartitionValues"/>
 /// (a value — possibly null — for <b>every</b> partition column of a partitioned table; empty for an
-/// unpartitioned table), byte <see cref="Size"/>, <see cref="ModificationTime"/>, and optional per-file
-/// <see cref="Stats"/>.
+/// unpartitioned table), byte <see cref="Size"/>, <see cref="ModificationTime"/>, optional per-file
+/// <see cref="Stats"/>, and — when the producing write-door supplies it (#497) — the
+/// <see cref="DataSchema"/>: the file's <b>actual physical data schema read back from its Parquet
+/// footer</b>. When present it is cross-checked against the declared write schema by
+/// <see cref="DeltaTableWriter"/> so schema enforcement gates the <i>real written bytes</i>, not merely the
+/// caller's declaration; a <see langword="null"/> <see cref="DataSchema"/> (a caller that does not supply
+/// it) skips that cross-check.
 ///
 /// <para><b>Partition-coverage contract.</b> For a partitioned table each <see cref="PartitionValues"/>
 /// must carry a key for every partition column (the value may be null for the null partition). A staged
@@ -41,13 +46,19 @@ internal enum PartitionOverwriteMode
 /// size/row-count the caller already has and leaves <see cref="Stats"/> as <see langword="null"/> (or a
 /// minimal stat) when the extractor is not yet wired — pruning simply forfeits the opportunity, never
 /// correctness (statistics are advisory, design §2.10.5).</para>
+///
+/// <para><b>Physical write-schema validation (#497).</b> <see cref="DataSchema"/> is the file's real
+/// footer-derived data schema (physical-named under column mapping). The commit-time cross-check compares
+/// it by name + logical type only, because Parquet.Net models string/binary as nullable and a footer does
+/// not carry Spark field metadata — neither is footer-faithful.</para>
 /// </summary>
 internal sealed record StagedDataFile(
     string Path,
     ImmutableSortedDictionary<string, string?> PartitionValues,
     long Size,
     long ModificationTime,
-    FileStatistics? Stats = null);
+    FileStatistics? Stats = null,
+    StructType? DataSchema = null);
 
 /// <summary>
 /// Builds the correct <see cref="DeltaAction"/> set and <see cref="DeltaReadScope"/> for a Delta write
@@ -162,6 +173,7 @@ internal sealed class DeltaTableWriter
 
         RejectExistingNameModeMutation(readSnapshot);
 
+        ValidateStagedWriteSchema(writeSchema, readSnapshot.Metadata.PartitionColumns, files);
         MetadataAction? schemaEvolution = ReconcileSchema(readSnapshot, writeSchema, evolutionMode);
 
         ValidatePartitionCoverage(files, readSnapshot.Metadata.PartitionColumns);
@@ -229,6 +241,7 @@ internal sealed class DeltaTableWriter
 
         RejectExistingNameModeMutation(readSnapshot);
 
+        ValidateStagedWriteSchema(writeSchema, readSnapshot.Metadata.PartitionColumns, files);
         MetadataAction? schemaEvolution = ReconcileSchema(readSnapshot, writeSchema, evolutionMode);
 
         ValidatePartitionCoverage(files, readSnapshot.Metadata.PartitionColumns);
@@ -367,6 +380,10 @@ internal sealed class DeltaTableWriter
         IReadOnlyList<StagedDataFile> files,
         CancellationToken cancellationToken)
     {
+        // #497: a non-mapped create is logical==physical, so gate the version-0 metaData schema on the real
+        // staged bytes too (defense-in-depth: the recorded schema must match the files it describes).
+        ValidateStagedWriteSchema(writeSchema, partitionColumns, files);
+
         var protocol = new ProtocolAction(
             ProtocolSupport.BasicReaderVersion,
             ProtocolSupport.MaxBasicWriterVersion,
@@ -395,7 +412,8 @@ internal sealed class DeltaTableWriter
         ImmutableSortedDictionary<string, string> configuration,
         ProtocolAction protocol,
         IReadOnlyList<StagedDataFile> files,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool validatePhysicalWriteSchema = false)
     {
         ArgumentNullException.ThrowIfNull(writeSchema);
         ArgumentNullException.ThrowIfNull(logicalPartitionColumns);
@@ -403,6 +421,16 @@ internal sealed class DeltaTableWriter
         ArgumentNullException.ThrowIfNull(configuration);
         ArgumentNullException.ThrowIfNull(protocol);
         ArgumentNullException.ThrowIfNull(files);
+
+        // #497: gate the version-0 metaData schema on the real staged bytes when the caller is
+        // logical==physical (the deletion-vector create path passes true; the actual column-mapping name-mode
+        // create passes false because its footer schema is physical-named while writeSchema is logical —
+        // physical≠logical staged-schema validation is deferred to #525).
+        if (validatePhysicalWriteSchema)
+        {
+            ValidateStagedWriteSchema(writeSchema, physicalPartitionColumns, files);
+        }
+
         return CreateTableCoreAsync(
             writeSchema, logicalPartitionColumns, physicalPartitionColumns, configuration, protocol, files, cancellationToken);
     }
@@ -845,5 +873,67 @@ internal sealed class DeltaTableWriter
                         $"(possibly null) for every partition column."));
             }
         }
+    }
+
+    // #497: cross-check that every staged file's ACTUAL physical data schema — read back from the written
+    // Parquet FOOTER by the write-door (DeltaWriteTarget.StageAsync via ParquetFileReader.ReadDataSchemaAsync)
+    // and recorded on StagedDataFile.DataSchema — matches the DATA columns of the DECLARED writeSchema
+    // (writeSchema minus its partition columns, in schema order: exactly the shape ColumnBatchPartitioner
+    // writes and a Delta Parquet data file physically stores). Because DataSchema is derived from the real
+    // bytes, this genuinely gates the written columns/types rather than re-validating the declaration against
+    // itself: a staged file whose footer diverges from the committed declaration (a foreign producer, or a
+    // staging-vs-commit schema mismatch) is rejected fail-closed BEFORE any action is built or committed
+    // (mirroring ValidatePartitionCoverage). Comparison is by NAME + logical TYPE only — Parquet.Net models
+    // string/binary as always-nullable and a footer does not carry Spark field metadata, so nullability and
+    // metadata are NOT footer-faithful and must not be compared (comparing them would false-reject a valid
+    // required-string write). A file whose DataSchema is null (a caller that does not supply it) is skipped —
+    // the cross-check binds only when the producing write-door supplies the true written schema. Callers pass
+    // logical==physical names (the enforcing append/overwrite paths reject name-mode tables; the non-mapped
+    // create path is logical==physical), so the comparison is like-for-like; mapped-schema (physical≠logical)
+    // validation is out of scope here (#525).
+    private static void ValidateStagedWriteSchema(
+        StructType writeSchema, IEnumerable<string> partitionColumns, IReadOnlyList<StagedDataFile> files)
+    {
+        var partitionSet = new HashSet<string>(partitionColumns, StringComparer.Ordinal);
+        var dataFields = new List<StructField>(writeSchema.Count);
+        for (int i = 0; i < writeSchema.Count; i++)
+        {
+            if (!partitionSet.Contains(writeSchema[i].Name))
+            {
+                dataFields.Add(writeSchema[i]);
+            }
+        }
+
+        var expected = new StructType(dataFields);
+        foreach (StagedDataFile file in files)
+        {
+            if (file.DataSchema is { } actual && !DataColumnsMatch(expected, actual))
+            {
+                throw DeltaSchemaMismatchException.PhysicalWriteSchemaMismatch(
+                    file.Path, expected.SimpleString, actual.SimpleString);
+            }
+        }
+    }
+
+    // Structural equality of two data schemas by NAME (ordinal) + logical TYPE, in order — deliberately
+    // ignoring nullability and field metadata (see ValidateStagedWriteSchema: neither is footer-faithful, so
+    // comparing them against a footer-derived schema would false-reject a valid write).
+    private static bool DataColumnsMatch(StructType expected, StructType actual)
+    {
+        if (expected.Count != actual.Count)
+        {
+            return false;
+        }
+
+        for (int i = 0; i < expected.Count; i++)
+        {
+            if (!string.Equals(expected[i].Name, actual[i].Name, StringComparison.Ordinal)
+                || !expected[i].DataType.Equals(actual[i].DataType))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 }
