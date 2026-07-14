@@ -45,10 +45,13 @@ namespace DeltaSharp.Storage.Delta;
 /// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>); any other differing type is rejected —
 /// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> for a would-be/deferred widening,
 /// <see cref="DeltaSchemaMismatchKind.IncompatibleType"/> for anything else. A differing <b>partition</b>
-/// column's type is rejected earlier and more clearly: a non-widening change as
-/// <see cref="DeltaSchemaMismatchKind.PartitionColumnEvolutionUnsupported"/>; a would-be Delta-sanctioned
-/// widening (which Delta allows without a rewrite — partition values are strings — but this build defers,
-/// #537) distinctly as <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>.</item>
+/// column's type is handled specially (partition values are strings — Delta widens them without a data-file
+/// rewrite): an <b>intra-family</b> Delta-sanctioned widening (<see cref="TypeWidening.IsSanctionedWidening"/>)
+/// is <b>applied</b> exactly like a non-partition column (widened type + <c>delta.typeChanges</c>, or rejected
+/// as <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> when the feature is disabled), #537; a
+/// cross-family (#535) or <c>date→timestamp</c> (#533) sanctioned widening stays deferred distinctly as
+/// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>; a non-widening change as
+/// <see cref="DeltaSchemaMismatchKind.PartitionColumnEvolutionUnsupported"/>.</item>
 /// <item><b>Nullability.</b> The table's nullability is authoritative and never tightened: writing a
 /// non-null value into a nullable column is fine. Writing a nullable value into a required column — or
 /// relaxing a required column to nullable — is <b>always</b> rejected
@@ -93,11 +96,12 @@ internal static class DeltaSchemaEnforcer
     /// <param name="writeSchema">The incoming write's schema.</param>
     /// <param name="mode">Which additive evolution (if any) is permitted.</param>
     /// <param name="partitionColumns">The table's partition columns (top-level names). A differing partition
-    /// column type is rejected: a non-widening change with a clear
-    /// <see cref="DeltaSchemaMismatchKind.PartitionColumnEvolutionUnsupported"/> reason, a would-be
-    /// Delta-sanctioned widening (deferred #537) distinctly as
-    /// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>. May be <see langword="null"/>/empty for
-    /// an unpartitioned table.</param>
+    /// column type: an intra-family Delta-sanctioned widening is APPLIED (metadata-only, rewrite-free; #537)
+    /// when <paramref name="typeWideningEnabled"/>; a cross-family (#535) or date→timestamp (#533) sanctioned
+    /// widening is deferred distinctly as <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>; a
+    /// non-widening change is rejected with a clear
+    /// <see cref="DeltaSchemaMismatchKind.PartitionColumnEvolutionUnsupported"/> reason. May be
+    /// <see langword="null"/>/empty for an unpartitioned table.</param>
     /// <param name="typeWideningEnabled">Whether the table enables applying Delta-sanctioned type widenings
     /// (the <c>typeWidening</c> table feature is present AND <c>delta.enableTypeWidening</c> is set — see
     /// <see cref="TypeWideningFeature.IsWriteEnabled"/>). When <see langword="false"/> a would-be widening is
@@ -142,26 +146,31 @@ internal static class DeltaSchemaEnforcer
             string path = Combine(parentPath, tableField.Name);
             if (writeStruct.TryGetField(tableField.Name, out StructField writeField))
             {
-                // A partition column's type change is rejected here, before the generic type classification,
-                // for a clearer reason. ANY Delta-sanctioned widening of a partition column is rewrite-FREE
-                // (partition values are stored as strings in the log / directory names, so no data file is
-                // rewritten — verified vs Delta's golden TypeWideningAlterTableSuite), across all three
-                // sanctioned families:
+                // A partition column's type change is handled here, before the generic type classification.
+                // EVERY Delta-sanctioned widening of a partition column is rewrite-FREE — partition values are
+                // stored as strings in the log / directory names, never in the Parquet data file, so no data
+                // file is rewritten (verified vs Delta's golden TypeWideningAlterTableSuite) — across all
+                // three sanctioned families:
                 //   - intra-family                (IsSanctionedWidening:          byte→…→long, float→double, grow-only decimal)
                 //   - cross-family integral→float/decimal (IsDeferredCrossFamilyWidening, #535)
                 //   - date→timestamp_ntz          (IsDeferredWidening,             #533)
-                // This build DEFERS partition-column widening (#537), so every one of them is rejected
-                // fail-closed but classified DISTINCTLY (TypeWideningUnsupported) with an HONEST message —
-                // never the factually-wrong "requires a full table rewrite" reason. The classification does
-                // NOT depend on typeWideningEnabled: whether or not the feature is enabled, the change is a
-                // rewrite-free widening this build defers, so "requires a rewrite" would be a lie in every
-                // case (a disabled feature is a feature-enablement gap, not a layout rewrite). Only a
-                // genuinely NON-widening partition-column type change (e.g. int→string, or a narrowing) keeps
-                // the PartitionColumnEvolutionUnsupported classification. Partition columns are top-level, so
-                // this only applies at parentPath == null.
+                // The intra-family case (IsSanctionedWidening) is now APPLIED (#537): it falls through to
+                // MergeField below, which — EXACTLY like a non-partition column — applies the widening when
+                // the feature is enabled (emitting `delta.typeChanges` on the field so the read door const-
+                // fills the partition value STRING under the widened type) or rejects it fail-closed as
+                // TypeWideningUnsupported when it is not. metaData.partitionColumns keeps the logical name
+                // unchanged; add.partitionValues keys stay physical/unchanged; no data file is rewritten.
+                // The remaining two families STAY DEFERRED (still rewrite-free, but the read path cannot yet
+                // promote across a type family / to timestamp_ntz): cross-family (#535) and date→timestamp
+                // (#533) are rejected DISTINCTLY as TypeWideningUnsupported via PartitionColumnWideningDeferred
+                // — never the factually-wrong "requires a full table rewrite" reason. Only a genuinely
+                // NON-widening partition-column type change (e.g. int→string, or a narrowing) keeps the
+                // PartitionColumnEvolutionUnsupported classification. Partition columns are top-level, so this
+                // only applies at parentPath == null.
                 if (partitionColumns is not null
                     && partitionColumns.Contains(tableField.Name)
-                    && !tableField.DataType.Equals(writeField.DataType))
+                    && !tableField.DataType.Equals(writeField.DataType)
+                    && !TypeWidening.IsSanctionedWidening(tableField.DataType, writeField.DataType))
                 {
                     if (TypeWidening.IsAnySanctionedWidening(tableField.DataType, writeField.DataType))
                     {

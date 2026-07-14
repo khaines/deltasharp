@@ -55,6 +55,24 @@ public sealed class DeltaReadEncodingTests
     }
 
     [Fact]
+    public void BuildConstantColumn_IntPartitionValue_UnderWidenedLongType_ParsesAsLong_Issue537()
+    {
+        // #537: an intra-family partition-column widening (int→long) is metadata-only — the partition value
+        // stays the SAME canonical STRING ("5") in add.partitionValues, and the read door const-fills it
+        // under the field's now-WIDENED type (LongType). Older rows written when the column was int therefore
+        // read back promoted to long, WITHOUT any data-file rewrite. This pins that BuildConstantColumn
+        // parses the (unchanged) int-era partition string "5" correctly into a long lane.
+        ColumnVector column = DeltaReadEncoding.BuildConstantColumn(LongType.Instance, "5", rowCount: 3);
+
+        Assert.Equal(LongType.Instance, column.Type);
+        Assert.False(column.HasNulls);
+        for (int r = 0; r < 3; r++)
+        {
+            Assert.Equal(5L, column.GetValue<long>(r));
+        }
+    }
+
+    [Fact]
     public void BuildConstantColumn_NormalStringValue_MatchingSentinelText_IsNull_ButOtherStringParses()
     {
         // A genuine (non-sentinel) string value round-trips as data...
