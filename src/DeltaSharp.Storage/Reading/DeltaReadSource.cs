@@ -1,5 +1,4 @@
 using System.Collections.Immutable;
-using System.Globalization;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
@@ -150,9 +149,9 @@ public sealed class DeltaReadSource : IDisposable
             tableSchema = snapshot.Schema;
             ColumnMappingMode mappingMode = ColumnMapping.ResolveMode(snapshot.Metadata.Configuration);
             ImmutableArray<string> partitionColumns = snapshot.Metadata.PartitionColumns;
-            physicalNames = ResolvePhysicalNames(tableSchema, mappingMode);
-            dataSchema = BuildDataSchema(tableSchema, physicalNames, partitionColumns);
-            dataOrdinalByField = MapDataOrdinals(physicalNames, dataSchema);
+            physicalNames = ColumnMappingProjection.ResolvePhysicalNames(tableSchema, mappingMode);
+            dataSchema = ColumnMappingProjection.BuildDataSchema(tableSchema, physicalNames, partitionColumns);
+            dataOrdinalByField = ColumnMappingProjection.MapDataOrdinals(physicalNames, dataSchema);
         }
         catch (DeltaProtocolException ex)
         {
@@ -281,8 +280,8 @@ public sealed class DeltaReadSource : IDisposable
                     .ReadAsync(stream, dataSchema, keepRowGroup: null, nullFillMissingColumns: true, allowTypeWideningPromotion, cancellationToken)
                     .ConfigureAwait(false))
                 {
-                    ColumnBatch fullBatch =
-                        BuildFullBatch(add, tableSchema, physicalNames, dataOrdinalByField, dataBatch);
+                    ColumnBatch fullBatch = ColumnMappingProjection.BuildFullBatch(
+                        add, tableSchema, physicalNames, dataOrdinalByField, dataBatch);
 
                     if (deletionVector is null)
                     {
@@ -381,105 +380,6 @@ public sealed class DeltaReadSource : IDisposable
         }
 
         return batch.WithSelection(new SelectionVector(survivors.ToArray()));
-    }
-
-    // Assembles one output batch in table-schema order, RELABELED to the LOGICAL schema: partition columns
-    // are const/null-filled from the add's partitionValues (keyed by the column's PHYSICAL name; they are NOT
-    // in the physical file), data columns are taken from the projected physical-name Parquet batch. Column
-    // vectors are reused (no copy); the const columns are freshly built. The output batch carries the LOGICAL
-    // table schema, so a column whose physical name differs from its logical name (a renamed column) reads
-    // through under its new logical name from UNCHANGED Parquet data (STORY-05.4.3 AC1).
-    private static ColumnBatch BuildFullBatch(
-        AddFileAction add,
-        StructType tableSchema,
-        string[] physicalNames,
-        int[] dataOrdinalByField,
-        ColumnBatch dataBatch)
-    {
-        int rowCount = dataBatch.RowCount;
-        var columns = new ColumnVector[tableSchema.Count];
-        for (int i = 0; i < tableSchema.Count; i++)
-        {
-            int dataOrdinal = dataOrdinalByField[i];
-            if (dataOrdinal >= 0)
-            {
-                columns[i] = dataBatch.Column(dataOrdinal);
-                continue;
-            }
-
-            StructField field = tableSchema[i];
-            add.PartitionValues.TryGetValue(physicalNames[i], out string? value);
-            columns[i] = DeltaReadEncoding.BuildConstantColumn(field.DataType, value, rowCount);
-        }
-
-        return new ManagedColumnBatch(tableSchema, columns, rowCount);
-    }
-
-    // The PHYSICAL name of each table-schema field (in field order): the declared
-    // delta.columnMapping.physicalName in name mode, the field's own name in none mode. FIX #9: a nested
-    // top-level column is rejected with a precise "nested column mapping unsupported" error here (name mode
-    // only maps leaf columns in this build), rather than failing downstream in the Parquet reader.
-    private static string[] ResolvePhysicalNames(StructType tableSchema, ColumnMappingMode mode)
-    {
-        var names = new string[tableSchema.Count];
-        for (int i = 0; i < tableSchema.Count; i++)
-        {
-            StructField field = tableSchema[i];
-            if (mode == ColumnMappingMode.Name && field.DataType is StructType or ArrayType or MapType)
-            {
-                throw DeltaProtocolException.Unsupported(
-                    string.Create(
-                        CultureInfo.InvariantCulture,
-                        $"Column '{field.Name}' is a nested ({field.DataType.TypeName}) type; nested column "
-                        + $"mapping is unsupported in this build (design §2.9/§2.12.3). Only top-level (leaf) "
-                        + $"columns are supported in column mapping 'name' mode."));
-            }
-
-            names[i] = ColumnMapping.PhysicalName(field, mode);
-        }
-
-        return names;
-    }
-
-    // The PHYSICAL data schema: the table schema minus the partition columns, with each remaining field named
-    // by its physical name (order-preserving) — the exact shape a Delta Parquet data file stores. FIX #1:
-    // partition MEMBERSHIP is decided by the LOGICAL field name against metaData.partitionColumns (which holds
-    // LOGICAL names under name mode — verified against the Spark golden `dv-with-columnmapping`), decoupled
-    // from the partition VALUE KEY, which stays PHYSICAL (looked up from add.partitionValues in
-    // BuildFullBatch). In none mode logical == physical, so this is exactly the prior behavior.
-    private static StructType BuildDataSchema(
-        StructType tableSchema, string[] physicalNames, ImmutableArray<string> partitionColumns)
-    {
-        var partitionSet = partitionColumns.IsDefaultOrEmpty
-            ? null
-            : partitionColumns.ToImmutableHashSet(StringComparer.Ordinal);
-
-        var dataFields = new List<StructField>(tableSchema.Count);
-        for (int i = 0; i < tableSchema.Count; i++)
-        {
-            StructField field = tableSchema[i];
-            if (partitionSet is not null && partitionSet.Contains(field.Name))
-            {
-                continue;
-            }
-
-            dataFields.Add(new StructField(physicalNames[i], field.DataType, field.Nullable));
-        }
-
-        return new StructType(dataFields);
-    }
-
-    // For each table-schema field, its ordinal in the physical (Parquet) data schema, or -1 for a partition
-    // column, matched by the field's PHYSICAL name.
-    private static int[] MapDataOrdinals(string[] physicalNames, StructType dataSchema)
-    {
-        var map = new int[physicalNames.Length];
-        for (int i = 0; i < physicalNames.Length; i++)
-        {
-            map[i] = dataSchema.IndexOf(physicalNames[i]);
-        }
-
-        return map;
     }
 
     // True iff the read failed because the input Parquet file is missing a column the current data schema

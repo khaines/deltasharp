@@ -1,6 +1,5 @@
 using System.Collections.Immutable;
 using System.Diagnostics;
-using System.Globalization;
 using DeltaSharp.Diagnostics;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Backends;
@@ -70,11 +69,13 @@ internal sealed record DeleteResult(
 /// aborts this DELETE (no lost delete). <see cref="DeltaConflictChecker"/> additionally enforces a
 /// scope-independent deletion-vector exclusivity rule for defense in depth.</para>
 ///
-/// <para><b>Scope (v1).</b> Column mapping is out of scope for the WRITE path: a DELETE against a
-/// column-mapped table fails closed (the READ path honors DVs on a column-mapped table — that is the Spark
-/// <c>dv-with-columnmapping</c> golden oracle). On-disk (<c>'u'</c>) deletion vectors are written; the
-/// bin-packing/inlining policy for tiny DVs is a follow-up. Predicate/partition pushdown to prune scanned
-/// files is a follow-up — every active file is scanned.</para>
+/// <para><b>Scope.</b> Column mapping is resolved on the WRITE path for <c>name</c> mode (#529): the
+/// physically-named data is read and relabeled to the LOGICAL schema so the predicate sees logical column
+/// names/values, while the emitted deletion vector stays POSITIONAL over the PHYSICAL data file (column
+/// mapping never changes a row's physical position). <c>id</c> mode stays fail-closed (#523) and a nested
+/// (struct/array/map) top-level mapped column fails closed rather than risk a wrong delete. On-disk
+/// (<c>'u'</c>) deletion vectors are written; the bin-packing/inlining policy for tiny DVs is a follow-up.
+/// Predicate/partition pushdown to prune scanned files is a follow-up — every active file is scanned.</para>
 /// </summary>
 internal sealed class DeltaDelete
 {
@@ -222,21 +223,28 @@ internal sealed class DeltaDelete
         // AC3 protocol gate: fail closed unless the table declares AND enables deletion vectors.
         DeletionVectorsFeature.EnsureWriteEnabled(readSnapshot);
 
-        // v1 scope: the WRITE path does not resolve column mapping (the READ path does). Fail closed on a
-        // column-mapped table rather than write a DV against physically-named data we did not relabel.
+        // Column-mapping resolution for the WRITE path (#529). `id` mode STAYS fail-closed (#523): the
+        // name-based Parquet reader cannot resolve field ids, so a DELETE could mis-associate columns and
+        // delete wrong rows. The PRIMARY, tested choke point is snapshot load — DeltaLog rejects an id-mode
+        // table via ColumnMapping.EnsureModeGate before any snapshot reaches here, so `readSnapshot` is
+        // already name/none. The EnsureReadWriteSupported call below is intentional DEFENSE-IN-DEPTH (a
+        // future caller that constructs/passes a snapshot NOT loaded through that gate — e.g. the internal
+        // test seam — must still fail closed); it is pinned independently by
+        // Delta_IdMode_FailsClosed_AtDeleteLocalGuard. `name` mode is resolved by relabeling
+        // physical<->logical EXACTLY as the READ path does — through the shared ColumnMappingProjection seam,
+        // so DELETE and DeltaReadSource resolve identically — while the emitted deletion vector stays
+        // POSITIONAL over the PHYSICAL data file (column mapping never changes a row's physical position — the
+        // DV row-index semantics are unaffected). `none` mode is unchanged (physical name == logical name). A
+        // nested (struct/array/map) top-level column under name mapping is rejected fail-closed in
+        // ColumnMappingProjection.ResolvePhysicalNames rather than risk a wrong delete.
         ColumnMappingMode mappingMode = ColumnMapping.ResolveMode(readSnapshot.Metadata.Configuration);
-        if (mappingMode != ColumnMappingMode.None)
-        {
-            throw DeltaProtocolException.Unsupported(
-                "A merge-on-read DELETE against a column-mapped table is not supported in this build; the "
-                + "operation fails closed. (Reading a column-mapped table's committed deletion vectors IS "
-                + "supported.)");
-        }
+        ColumnMapping.EnsureReadWriteSupported(mappingMode);
 
         StructType tableSchema = readSnapshot.Schema;
         ImmutableArray<string> partitionColumns = readSnapshot.Metadata.PartitionColumns;
-        StructType dataSchema = BuildDataSchema(tableSchema, partitionColumns);
-        int[] dataOrdinalByField = MapDataOrdinals(tableSchema, dataSchema, partitionColumns);
+        string[] physicalNames = ColumnMappingProjection.ResolvePhysicalNames(tableSchema, mappingMode);
+        StructType dataSchema = ColumnMappingProjection.BuildDataSchema(tableSchema, physicalNames, partitionColumns);
+        int[] dataOrdinalByField = ColumnMappingProjection.MapDataOrdinals(physicalNames, dataSchema);
         long timestamp = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
 
         // Read-side type-widening promotion gate (#495): a narrow-physical file is promoted into the current
@@ -256,7 +264,7 @@ internal sealed class DeltaDelete
             cancellationToken.ThrowIfCancellationRequested();
 
             FileDeletionPlan plan = await PlanFileDeletionAsync(
-                add, tableSchema, dataSchema, dataOrdinalByField, predicate, allowTypeWideningPromotion, cancellationToken)
+                add, tableSchema, physicalNames, dataSchema, dataOrdinalByField, predicate, allowTypeWideningPromotion, cancellationToken)
                 .ConfigureAwait(false);
 
             if (plan.NewlyDeletedCount == 0)
@@ -328,6 +336,7 @@ internal sealed class DeltaDelete
     private async Task<FileDeletionPlan> PlanFileDeletionAsync(
         AddFileAction add,
         StructType tableSchema,
+        string[] physicalNames,
         StructType dataSchema,
         int[] dataOrdinalByField,
         DeltaDeletePredicate predicate,
@@ -366,7 +375,8 @@ internal sealed class DeltaDelete
                 .ReadAsync(stream, dataSchema, keepRowGroup: null, nullFillMissingColumns: false, allowTypeWideningPromotion, cancellationToken)
                 .ConfigureAwait(false))
             {
-                ColumnBatch fullBatch = BuildFullBatch(add, tableSchema, dataOrdinalByField, dataBatch);
+                ColumnBatch fullBatch = ColumnMappingProjection.BuildFullBatch(
+                    add, tableSchema, physicalNames, dataOrdinalByField, dataBatch);
                 for (int row = 0; row < fullBatch.RowCount; row++)
                 {
                     if (predicate.Matches(fullBatch, row))
@@ -416,31 +426,6 @@ internal sealed class DeltaDelete
         return DeletionVectorDescriptor.ForRelativePath(pathOrInlineDv, offset, sizeInBytes, cardinality);
     }
 
-    // Assembles one full-schema logical batch (partition columns const/null-filled from the add's
-    // partitionValues, data columns taken from the physical Parquet batch). none-mode only: physical name ==
-    // logical name, so a table-field's data ordinal is its name's ordinal in the data schema.
-    private static ColumnBatch BuildFullBatch(
-        AddFileAction add, StructType tableSchema, int[] dataOrdinalByField, ColumnBatch dataBatch)
-    {
-        int rowCount = dataBatch.RowCount;
-        var columns = new ColumnVector[tableSchema.Count];
-        for (int i = 0; i < tableSchema.Count; i++)
-        {
-            int dataOrdinal = dataOrdinalByField[i];
-            if (dataOrdinal >= 0)
-            {
-                columns[i] = dataBatch.Column(dataOrdinal);
-                continue;
-            }
-
-            StructField field = tableSchema[i];
-            add.PartitionValues.TryGetValue(field.Name, out string? value);
-            columns[i] = DeltaReadEncoding.BuildConstantColumn(field.DataType, value, rowCount);
-        }
-
-        return new ManagedColumnBatch(tableSchema, columns, rowCount);
-    }
-
     // Tombstone the prior logical file, carrying its PRIOR deletion vector so the remove's identity key
     // matches the active add's (SnapshotState keys by path + DV uniqueId). dataChange=true (a delete changes
     // visible data); ExtendedFileMetadata=true round-trips partitionValues/size for checkpoint fidelity.
@@ -471,45 +456,6 @@ internal sealed class DeltaDelete
             NullCount = EmptyNullCount,
             TightBounds = false,
         };
-    }
-
-    // The table's DATA schema: the full schema minus the partition columns (partition values live on the add
-    // action, never inside the Parquet file).
-    private static StructType BuildDataSchema(StructType tableSchema, ImmutableArray<string> partitionColumns)
-    {
-        if (partitionColumns.IsDefaultOrEmpty)
-        {
-            return tableSchema;
-        }
-
-        var partitionSet = partitionColumns.ToImmutableHashSet(StringComparer.Ordinal);
-        var dataFields = new List<StructField>(tableSchema.Count);
-        foreach (StructField field in tableSchema)
-        {
-            if (!partitionSet.Contains(field.Name))
-            {
-                dataFields.Add(field);
-            }
-        }
-
-        return new StructType(dataFields);
-    }
-
-    // For each table-schema field: its ordinal in the data schema (by name; none-mode ⇒ logical == physical),
-    // or -1 when it is a partition column (const/null-filled from the add's partitionValues).
-    private static int[] MapDataOrdinals(
-        StructType tableSchema, StructType dataSchema, ImmutableArray<string> partitionColumns)
-    {
-        var partitionSet = partitionColumns.IsDefaultOrEmpty
-            ? ImmutableHashSet<string>.Empty
-            : partitionColumns.ToImmutableHashSet(StringComparer.Ordinal);
-        var ordinals = new int[tableSchema.Count];
-        for (int i = 0; i < tableSchema.Count; i++)
-        {
-            ordinals[i] = partitionSet.Contains(tableSchema[i].Name) ? -1 : dataSchema.IndexOf(tableSchema[i].Name);
-        }
-
-        return ordinals;
     }
 
     private static void SetOutcomeTag(Activity? activity, DeleteOutcome outcome) =>
