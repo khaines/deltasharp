@@ -64,14 +64,17 @@ after the remote is deleted on merge), recompute the true divergence commit inst
 forkpoint=$(git merge-base {parent_branch} {branch})   # child's real fork commit
 ```
 
-Guard before rebasing — the fork point MUST be an ancestor of this branch (by construction it is), and
-`forkpoint..{branch}` must equal exactly this item's own commit count:
+Guard before rebasing — **halt hard** (not just print) if the fork point is not an ancestor of this
+branch (by construction it is; a mismatch means a stale/wrong `fork_sha`):
 
 ```bash
-git merge-base --is-ancestor "$forkpoint" {branch} \
-  && echo "ok: fork point is an ancestor" \
-  || echo "STOP — not an ancestor; do NOT rebase. Recover fork_sha from Phase 2.1 / reflog first."
-git rev-list --count "$forkpoint..{branch}"            # sanity: == this item's own commit count
+if ! git merge-base --is-ancestor "$forkpoint" {branch}; then
+  echo "STOP — fork point is not an ancestor of {branch}; do NOT rebase."
+  echo "Recover the recorded fork_sha (Phase 2.1) or the reflog, then retry."
+  exit 1
+fi
+own=$(git rev-list --count "$forkpoint..{branch}")     # this item's own commit count
+echo "fork point OK; {branch} has $own own commits — verify against the stack record before rebasing"
 ```
 
 > **Why not the *current* parent tip?** A parent branch can **advance** after a child forks from it
@@ -82,7 +85,11 @@ git rev-list --count "$forkpoint..{branch}"            # sanity: == this item's 
 
 #### N.2 — Rebase onto `main`
 
+Save a recovery point **first** — a rebase rewrites the branch, and a *completed* rebase cannot be
+`git rebase --abort`ed (that only unwinds an in-progress/conflicted rebase):
+
 ```bash
+pre_rebase=$(git rev-parse HEAD)                        # recovery anchor for N.3
 git rebase --onto origin/main "$forkpoint" {branch}
 ```
 
@@ -92,9 +99,14 @@ result is scoped.)
 
 #### N.3 — Verify the diff is scoped (before pushing)
 
-The `origin/main..HEAD` diff must contain **only this item's files** — if the parent's changes leak in,
-the fork point was wrong: `git rebase --abort`, recover the recorded `fork_sha` (do **not** blindly
-re-run a derivation), and redo N.1.
+The `origin/main..HEAD` diff must contain **only this item's files**. If the parent's changes leak in,
+the fork point was wrong — **recover, then redo N.1**:
+
+```bash
+git rebase --abort 2>/dev/null || git reset --hard "$pre_rebase"   # abort if mid-conflict, else undo the completed rebase
+```
+
+Then recover the recorded `fork_sha` (Phase 2.1 — do **not** blindly re-run a derivation) and redo N.1.
 
 ```bash
 git diff --stat origin/main..HEAD          # expect ONLY this PR's files
