@@ -69,6 +69,105 @@ internal static class ParquetTypeMapping
         };
     }
 
+    /// <summary>
+    /// Reconstructs the DeltaSharp <see cref="DataType"/> a Parquet footer <see cref="DataField"/> encodes —
+    /// the inverse of <see cref="CreateField"/>. Used by the write-door to derive the <b>actual physical data
+    /// schema a staged file was written with</b> (read back from its footer) so schema enforcement gates the
+    /// real bytes, not the caller's declaration (#497). Nullability is deliberately <b>not</b> reconstructed
+    /// as authoritative here: Parquet.Net models string/binary as always-nullable and a footer does not
+    /// faithfully carry Spark nullability, so a footer-derived schema is compared by name + type only.
+    /// </summary>
+    /// <exception cref="DeltaStorageException">The footer field's physical type has no supported DeltaSharp
+    /// mapping (<see cref="StorageErrorKind.UnsupportedFeature"/>) — the inverse of the deferrals in
+    /// <see cref="CreateField"/>.</exception>
+    public static DataType ToDataType(DataField field)
+    {
+        ArgumentNullException.ThrowIfNull(field);
+
+        // The annotated subtypes must be matched BEFORE the raw CLR switch: a DateTimeDataField's ClrType is
+        // DateTime and a DecimalDataField's is decimal, so the temporal/decimal annotation carries the real
+        // logical type.
+        switch (field)
+        {
+            case DateTimeDataField dateTime:
+                return dateTime.DateTimeFormat == DateTimeFormat.Date
+                    ? DataTypes.DateType
+                    : DataTypes.TimestampType;
+            case DecimalDataField decimalField:
+                return DataTypes.CreateDecimalType(decimalField.Precision, decimalField.Scale);
+        }
+
+        Type clr = field.ClrType;
+        if (clr == typeof(bool))
+        {
+            return DataTypes.BooleanType;
+        }
+
+        if (clr == typeof(sbyte))
+        {
+            return DataTypes.ByteType;
+        }
+
+        if (clr == typeof(short))
+        {
+            return DataTypes.ShortType;
+        }
+
+        if (clr == typeof(int))
+        {
+            return DataTypes.IntegerType;
+        }
+
+        if (clr == typeof(long))
+        {
+            return DataTypes.LongType;
+        }
+
+        if (clr == typeof(float))
+        {
+            return DataTypes.FloatType;
+        }
+
+        if (clr == typeof(double))
+        {
+            return DataTypes.DoubleType;
+        }
+
+        if (clr == typeof(string))
+        {
+            return DataTypes.StringType;
+        }
+
+        if (clr == typeof(byte[]))
+        {
+            return DataTypes.BinaryType;
+        }
+
+        throw DeltaStorageException.UnsupportedFeature(
+            $"Parquet footer column '{field.Name}' has physical CLR type '{clr.Name}', which has no "
+            + "supported DeltaSharp type mapping.");
+    }
+
+    /// <summary>
+    /// Reconstructs the DeltaSharp data <see cref="StructType"/> a written Parquet footer encodes (each
+    /// <see cref="ParquetSchema.DataFields"/> mapped via <see cref="ToDataType"/>, in footer order). This is
+    /// the ACTUAL physical schema of the bytes on disk, used by the write-door for #497 physical
+    /// write-schema validation. Compared by name + type only (nullability/metadata are not footer-faithful).
+    /// </summary>
+    /// <exception cref="DeltaStorageException">A footer field has no supported DeltaSharp mapping
+    /// (<see cref="StorageErrorKind.UnsupportedFeature"/>).</exception>
+    public static StructType ToDataSchema(ParquetSchema schema)
+    {
+        ArgumentNullException.ThrowIfNull(schema);
+        var fields = new List<StructField>();
+        foreach (DataField field in schema.DataFields)
+        {
+            fields.Add(new StructField(field.Name, ToDataType(field), field.IsNullable));
+        }
+
+        return new StructType(fields);
+    }
+
     private static DataField Value<T>(string name, bool nullable)
         where T : unmanaged =>
         nullable ? new DataField<T?>(name) : new DataField<T>(name);

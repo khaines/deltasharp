@@ -4,6 +4,7 @@ using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
+using DeltaSharp.Storage.Delta.DeletionVectors;
 using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Storage.Reading;
 using DeltaSharp.Storage.Writing;
@@ -19,9 +20,9 @@ namespace DeltaSharp.Storage.Tests.Reading;
 /// facade and asserts the resolved version, schema, row multiset, and partition-filled columns for a base
 /// (latest) read, a <c>versionAsOf</c> read, and a <c>timestampAsOf</c> read (partitioned + unpartitioned).
 /// It also covers the fail-closed diagnostics: both-dimensions, out-of-range version, not-a-Delta-table,
-/// timestamp out of range, and the #497 schema-evolution guard (an active file physically narrower than the
-/// snapshot schema fails closed with <see cref="DeltaReadSchemaEvolutionException"/> — read-side null-fill is
-/// #497, not implemented here).
+/// timestamp out of range, and the #497 read-side null-fill (an active file physically narrower than the
+/// snapshot schema reads back with its absent, later-added <b>nullable</b> columns null-filled; an absent
+/// <b>required</b> column still fails closed with <see cref="DeltaReadSchemaEvolutionException"/>).
 /// </summary>
 public sealed class DeltaReadSourceTests : IDisposable
 {
@@ -230,17 +231,17 @@ public sealed class DeltaReadSourceTests : IDisposable
         await Assert.ThrowsAsync<DeltaReadException>(() => source.LoadSnapshotAsync(null, null));
     }
 
-    // ---------------------------------------------------------------- #497 schema-evolution guard (fail closed)
+    // ---------------------------------------------------------------- #497 read-side null-fill
 
     [Fact]
-    public async Task EvolvedNarrowFile_FailsClosed_NamingIssue497()
+    public async Task EvolvedNarrowFile_ReadsBack_WithNullFilledColumns_Issue497()
     {
-        // Manufacture an ADDITIVELY-EVOLVED table the PUBLIC write door cannot create (it writes with
-        // SchemaEvolutionMode.None): commit a NARROW file {id} at v0, then evolve the metadata to {id, name}
-        // at v1 with a WIDE file — leaving the v0 file physically narrower than the snapshot schema. Reading
-        // the latest snapshot then requests `name` from the narrow v0 file, which ParquetFileReader cannot
-        // satisfy (read-side null-fill is #497, not implemented). The facade must fail CLOSED with a clear
-        // schema-evolution error rather than a misleading "column not present" corruption error.
+        // Manufacture an ADDITIVELY-EVOLVED table the PUBLIC write door cannot create in one step (it writes
+        // with SchemaEvolutionMode.None): commit a NARROW file {id} at v0, then evolve the metadata to
+        // {id, name} at v1 with a WIDE file — leaving the v0 file physically narrower than the snapshot
+        // schema. Reading the latest snapshot requests `name` from the narrow v0 file; read-side null-fill
+        // (#497) materializes the absent, later-added NULLABLE column as null for those older rows rather
+        // than failing closed with a "column not present" corruption error.
         var narrow = new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) });
         StructType wide = FlatSchema;
 
@@ -270,9 +271,104 @@ public sealed class DeltaReadSourceTests : IDisposable
         Assert.Equal(1L, info.Version);
         Assert.Contains("name", info.Schema.Fields.Select(f => f.Name)); // schema evolved to wide
 
+        List<(long Id, string? Name)> rows = await ReadFlatAsync(source, info.Version);
+        Assert.Equal(3, rows.Count);
+        // v0 narrow-file rows read back with the later-added `name` column NULL-FILLED (#497).
+        Assert.Contains((10L, (string?)null), rows);
+        Assert.Contains((11L, (string?)null), rows);
+        // v1 wide-file row carries its real value — the null-fill is per-file, not table-wide.
+        Assert.Contains((20L, "twenty"), rows);
+    }
+
+    [Fact]
+    public async Task MissingRequiredColumn_FailsClosed_Issue497()
+    {
+        // The reverse of the null-fill case: a file physically {id} under a table whose CURRENT schema
+        // requires a non-nullable `code` column absent from that file. Read-side null-fill only fills
+        // NULLABLE columns (#497), so a missing REQUIRED column cannot be fabricated — the read fails closed
+        // with a clear DeltaReadSchemaEvolutionException rather than a misleading corruption error.
+        var narrow = new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) });
+        var requiredWide = new StructType(new[]
+        {
+            new StructField("id", DataTypes.LongType, nullable: false),
+            new StructField("code", DataTypes.LongType, nullable: false),
+        });
+
+        var backend = new LocalFileSystemBackend(_root);
+        try
+        {
+            var writer = new DeltaTableWriter(backend);
+            var parquet = new ParquetFileWriter();
+            // The staged file physically has only {id}; the test StageAsync helper does not supply a
+            // DataSchema, so the write-door's physical cross-check is skipped — this manufactures the
+            // required-column-absent state the public write door cannot legally create.
+            StagedDataFile narrowFile = await StageAsync(
+                backend, parquet, "part-narrow.parquet", narrow, NarrowBatch(1, 2));
+            await writer.CreateOrAppendAsync(requiredWide, Array.Empty<string>(), new[] { narrowFile });
+        }
+        finally
+        {
+            backend.Dispose();
+        }
+
+        using DeltaReadSource source = ReadSource();
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
         DeltaReadSchemaEvolutionException ex = await Assert.ThrowsAsync<DeltaReadSchemaEvolutionException>(
             () => source.ReadBatchesAsync(info.Version));
-        Assert.Contains("#497", ex.Message);
+        Assert.Equal("part-narrow.parquet", ex.FilePath);
+        Assert.Contains("required", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task EvolvedNarrowFile_WithDeletionVector_NullFillsAndAppliesDv_Issue497()
+    {
+        // The DV × null-fill composition (QueryExec/Delta council ask): a narrow {id} DV-enabled file gets a
+        // row deleted (DV), THEN the table is additively evolved to {id, name}. Reading the latest snapshot
+        // must both NULL-FILL the later-added `name` on the narrow file AND apply its DV (exclude the deleted
+        // physical row) — the null-fill materializes exactly rowCount rows so the DV's physical-ordinal
+        // alignment is preserved.
+        var narrow = new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) });
+        StructType wide = FlatSchema;
+
+        var backend = new LocalFileSystemBackend(_root);
+        try
+        {
+            // v0: DV-enabled narrow table with rows 10, 11, 12.
+            using (DeltaWriteTarget target = WriteTarget())
+            {
+                await target.CreateDeletionVectorTableAsync(narrow, Array.Empty<string>(), new[] { NarrowBatch(10, 11, 12) });
+            }
+
+            // v1: DELETE id==11 → a deletion vector over the narrow file (DELETE reads {id} strictly).
+            var delete = new DeltaDelete(
+                backend, new DeltaLog(backend), new DeltaCommitter(backend),
+                idSource: new SeededDeletionVectorIdSource("dv-nullfill"));
+            DeleteResult deleted = await delete.DeleteAsync(
+                DeltaDeletePredicate.FromRowPredicate((b, r) => b.SelectedColumn(0).GetValue<long>(r) == 11));
+            Assert.Equal(1, deleted.RowsDeleted);
+
+            // v2: additively evolve to {id, name} with a wide file (AddNewColumns).
+            Snapshot afterDelete = await new DeltaLog(backend).LoadSnapshotAsync();
+            StagedDataFile wideFile = await StageAsync(
+                backend, new ParquetFileWriter(), "part-wide.parquet", wide, FlatBatch((20, "twenty")));
+            await new DeltaTableWriter(backend).AppendAsync(
+                afterDelete, wide, new[] { wideFile }, SchemaEvolutionMode.AddNewColumns);
+        }
+        finally
+        {
+            backend.Dispose();
+        }
+
+        using DeltaReadSource source = ReadSource();
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        List<(long Id, string? Name)> rows = await ReadFlatAsync(source, info.Version);
+
+        // Row 11 excluded by the DV; 10 and 12 survive with `name` null-filled; the wide row carries its value.
+        Assert.Equal(3, rows.Count);
+        Assert.Contains((10L, (string?)null), rows);
+        Assert.Contains((12L, (string?)null), rows);
+        Assert.Contains((20L, "twenty"), rows);
+        Assert.DoesNotContain(rows, r => r.Id == 11);
     }
 
     // ---------------------------------------------------------------- pinning: no analysis→execution TOCTOU

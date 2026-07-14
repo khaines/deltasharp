@@ -50,6 +50,7 @@ public sealed class DeltaWriteTarget : IDisposable
     private readonly DeltaLog _log;
     private readonly DeltaTableWriter _writer;
     private readonly ParquetFileWriter _parquetWriter = new();
+    private readonly ParquetFileReader _reader = new();
     private readonly TimeProvider _timeProvider;
     private readonly Func<string> _fileNameFactory;
 
@@ -227,7 +228,10 @@ public sealed class DeltaWriteTarget : IDisposable
                 DeletionVectorsFeature.EnabledConfiguration(),
                 DeletionVectorsFeature.Protocol(),
                 files,
-                cancellationToken)
+                cancellationToken,
+                // #497: the DV-create path is logical==physical (no column mapping), so gate the version-0
+                // metaData schema on the real staged bytes' footer schema too.
+                validatePhysicalWriteSchema: true)
             .ConfigureAwait(false);
         return new DeltaWriteResult(commit.Version, files.Count, rows);
     }
@@ -265,6 +269,20 @@ public sealed class DeltaWriteTarget : IDisposable
                 .WriteWithStatisticsAsync(buffer, group.DataSchema, group.Batches, StatisticsPolicy.Default, cancellationToken)
                 .ConfigureAwait(false);
             byte[] bytes = buffer.ToArray();
+
+            // #497: derive the ACTUAL physical data schema from the file we just wrote by reading its footer
+            // back — NOT the declared group.DataSchema. Recording the real bytes' schema makes the commit-time
+            // enforcement (DeltaTableWriter.ValidateStagedWriteSchema) gate the true written columns/types
+            // rather than trusting the caller's declaration, closing the trusted-declaration gap flagged on
+            // #492/#190. (The footer parse decodes no data pages.) In column-mapping name mode this is the
+            // PHYSICAL-named schema — correct, and unvalidated because the mapped create path deliberately
+            // does not call ValidateStagedWriteSchema (deferred to #525).
+            StructType writtenSchema;
+            using (var footer = new MemoryStream(bytes, writable: false))
+            {
+                writtenSchema = await _reader.ReadDataSchemaAsync(footer, cancellationToken).ConfigureAwait(false);
+            }
+
             await _backend.PutIfAbsentAsync(relativePath, bytes, cancellationToken).ConfigureAwait(false);
 
             files.Add(new StagedDataFile(
@@ -272,7 +290,8 @@ public sealed class DeltaWriteTarget : IDisposable
                 group.PartitionValues,
                 Size: bytes.LongLength,
                 ModificationTime: modificationTime,
-                Stats: result.Statistics));
+                Stats: result.Statistics,
+                DataSchema: writtenSchema));
             totalRows += result.RowCount;
         }
 

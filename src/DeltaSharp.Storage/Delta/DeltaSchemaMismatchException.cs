@@ -50,16 +50,30 @@ internal enum DeltaSchemaMismatchKind
     /// rewrite), so it is always rejected — an explicit, clearer reason than the generic type-change
     /// classification.</summary>
     PartitionColumnEvolutionUnsupported,
+
+    /// <summary>A staged Parquet data file's <b>actual physical data schema</b> does not match the data
+    /// columns of the <b>declared</b> write schema (#497). The write-door records each staged file's true
+    /// written schema, read back from the Parquet footer (<c>StagedDataFile.DataSchema</c>); the enforcing
+    /// write path cross-checks it so schema enforcement gates the real bytes rather than trusting the
+    /// caller's declaration. A divergence — a caller (or a defect) staging bytes whose column <b>names or
+    /// logical types</b> differ from what it declared — is rejected fail-closed <b>before</b> any action is
+    /// committed. The comparison is name + logical type only; nullability and field metadata are not
+    /// compared (a Parquet footer does not faithfully carry Spark nullability for string/binary, nor field
+    /// metadata). Always rejected.</summary>
+    PhysicalWriteSchemaMismatch,
 }
 
 /// <summary>
-/// Thrown by <see cref="DeltaSchemaEnforcer"/> when an incoming write's schema is incompatible with the
-/// table schema, or requires a schema change the active <see cref="SchemaEvolutionMode"/> does not permit
-/// (STORY-05.4.2 AC1; design §2.12.2). It is raised <b>before</b> any <c>add</c>/<c>metaData</c> action is
-/// built or committed, so a rejected write leaves the table completely unchanged (fail-closed, mirroring
-/// <c>DeltaTableWriter</c>'s partition-coverage guard). The message names the offending column
-/// <see cref="Path"/> (dotted, with <c>element</c>/<c>key</c>/<c>value</c> segments for nested types) and
-/// the concrete disagreement so the failure is actionable.
+/// Thrown when an incoming write's schema is rejected before any action is committed — either by
+/// <see cref="DeltaSchemaEnforcer"/> (the incoming <i>logical</i> write schema is incompatible with the
+/// table schema, or requires a change the active <see cref="SchemaEvolutionMode"/> does not permit;
+/// STORY-05.4.2 AC1) or by the write-door's <b>physical write-schema validation</b> (a staged Parquet
+/// file's actual data schema diverges from the declared write schema — <see cref="DeltaSchemaMismatchKind.PhysicalWriteSchemaMismatch"/>,
+/// #497). It is raised <b>before</b> any <c>add</c>/<c>metaData</c> action is built or committed, so a
+/// rejected write leaves the table completely unchanged (fail-closed, mirroring <c>DeltaTableWriter</c>'s
+/// partition-coverage guard). The message names the offending column <see cref="Path"/> (dotted, with
+/// <c>element</c>/<c>key</c>/<c>value</c> segments for nested types; empty for a whole-file schema
+/// divergence) and the concrete disagreement so the failure is actionable.
 /// </summary>
 internal sealed class DeltaSchemaMismatchException : Exception
 {
@@ -136,4 +150,12 @@ internal sealed class DeltaSchemaMismatchException : Exception
             $"The write changes the type of partition column '{path}' from '{tableType}' to '{writeType}'; a " +
             "partition column's type is encoded in the table layout and cannot be evolved (it requires a full " +
             "table rewrite). Rejected.");
+
+    public static DeltaSchemaMismatchException PhysicalWriteSchemaMismatch(string filePath, string declared, string actual) =>
+        new(
+            DeltaSchemaMismatchKind.PhysicalWriteSchemaMismatch,
+            path: string.Empty,
+            $"Staged file '{filePath}' was written with physical data schema '{actual}', which does not " +
+            $"match the declared write schema's data columns '{declared}'. Schema enforcement gates the real " +
+            "written bytes (#497), so a write whose staged files diverge from its declared schema is rejected.");
 }

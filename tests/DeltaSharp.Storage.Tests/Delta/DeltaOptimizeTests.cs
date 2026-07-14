@@ -52,7 +52,7 @@ public sealed class DeltaOptimizeTests : IDisposable
     });
 
     // The DATA schema after an additive schema evolution (#190) adds an "extra" column: files written under
-    // DataSchema ([id,value]) are physically narrower than this, so OPTIMIZE must fail closed (#497).
+    // DataSchema ([id,value]) are physically narrower than this, so OPTIMIZE must fail closed (#530).
     private static readonly StructType EvolvedSchema = new(new[]
     {
         new StructField("id", DataTypes.LongType, nullable: false),
@@ -366,16 +366,16 @@ public sealed class DeltaOptimizeTests : IDisposable
         Assert.Equal(new[] { "a.parquet", "b.parquet" }, ActivePaths(after));
     }
 
-    // ---------------------------------------------------------------- FIX 1: schema-evolution guard (#497)
+    // ---------------------------------------------------------------- FIX 1: schema-evolution guard (#530)
 
     [Fact]
     public async Task Optimize_OnSchemaEvolvedTable_FailsClosed_WithClearError()
     {
         // A narrow table [id,value] with two small files, then an additive schema evolution (#190) adds an
         // "extra" column so the pre-evolution files are physically narrower than the current data schema.
-        // OPTIMIZE cannot compact them yet (read-side null-fill is #497) and must fail CLOSED with a clear,
-        // actionable error — never the misleading raw "column not present" corruption text — leaving the
-        // table unchanged.
+        // The read-side null-fill capability exists (#497) but OPTIMIZE compaction does not apply it yet
+        // (#530), so OPTIMIZE must fail CLOSED with a clear, actionable error — never the misleading raw
+        // "column not present" corruption text — leaving the table unchanged.
         StagedDataFile a = await WriteDataFileAsync("a.parquet", Batch((1, "a")));
         StagedDataFile b = await WriteDataFileAsync("b.parquet", Batch((2, "b")));
         await SeedAsync(DataSchema, partitionColumns: null, a, b); // v0 metadata, v1 append
@@ -387,8 +387,8 @@ public sealed class DeltaOptimizeTests : IDisposable
         OptimizeSchemaEvolutionException ex = await Assert.ThrowsAsync<OptimizeSchemaEvolutionException>(
             () => Optimize().OptimizeAsync());
 
-        // The clear error references #497 / an older schema and does NOT surface the raw reader defect text.
-        Assert.Contains("#497", ex.Message, StringComparison.Ordinal);
+        // The clear error references #530 / an older schema and does NOT surface the raw reader defect text.
+        Assert.Contains("#530", ex.Message, StringComparison.Ordinal);
         Assert.Contains("older", ex.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("not present in the Parquet file schema", ex.Message, StringComparison.Ordinal);
 
@@ -837,7 +837,7 @@ public sealed class DeltaOptimizeTests : IDisposable
             Stream stream = await _backend.OpenReadAsync(path, CancellationToken.None);
             await using (stream)
             {
-                await foreach (ColumnBatch batch in reader.ReadAsync(stream, DataSchema, null, CancellationToken.None))
+                await foreach (ColumnBatch batch in reader.ReadAsync(stream, DataSchema, null, nullFillMissingColumns: false, CancellationToken.None))
                 {
                     ColumnVector idColumn = batch.SelectedColumn(0);
                     ColumnVector valueColumn = batch.SelectedColumn(1);

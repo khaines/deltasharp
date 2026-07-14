@@ -78,17 +78,32 @@ internal sealed class ParquetFileReader
     /// <summary>Reads <paramref name="input"/>, projecting to <paramref name="requested"/> (a subset of
     /// the file schema by field name) and optionally skipping row groups via
     /// <paramref name="keepRowGroup"/>.</summary>
+    /// <param name="input">The Parquet byte stream.</param>
+    /// <param name="requested">The projection: the columns to read, by field name, in output order.</param>
+    /// <param name="keepRowGroup">An optional row-group pruning hint (see <see cref="RowGroupPredicate"/>).</param>
+    /// <param name="nullFillMissingColumns">When <see langword="true"/>, a <paramref name="requested"/> column
+    /// that is <b>absent</b> from the file <i>and</i> <b>nullable</b> is materialized as an all-<c>null</c>
+    /// column instead of failing — the additive schema-evolution (#190) read-side null-fill (#497): a file
+    /// written under an older, narrower schema reads back through the current schema with the later-added
+    /// columns null-filled. It never masks a genuine incompatibility: an absent <b>non-nullable</b> requested
+    /// column still fails closed (a required column cannot be null-filled), and a <i>present</i> column whose
+    /// physical type/nullability disagrees with the request is still rejected as a
+    /// <see cref="StorageErrorKind.SchemaMismatch"/>. When <see langword="false"/> (the default for the
+    /// general reader), an absent column of any nullability fails closed, preserving the reader's strict
+    /// projection contract for callers that must not silently null-fill.</param>
+    /// <param name="cancellationToken">Cancels the read.</param>
     /// <exception cref="ArgumentNullException">An argument is null.</exception>
     /// <exception cref="DeltaStorageException">A requested column type is unsupported
     /// (<see cref="StorageErrorKind.UnsupportedFeature"/>); the resolved file column's physical type or
     /// nullability does not match the requested engine type
     /// (<see cref="StorageErrorKind.SchemaMismatch"/>); or the file is malformed/truncated, a requested
-    /// column is absent, or a row group's declared size exceeds the decode ceiling
-    /// (<see cref="StorageErrorKind.CorruptData"/>).</exception>
+    /// column is absent (and not null-filled per <paramref name="nullFillMissingColumns"/>), or a row group's
+    /// declared size exceeds the decode ceiling (<see cref="StorageErrorKind.CorruptData"/>).</exception>
     public async IAsyncEnumerable<ColumnBatch> ReadAsync(
         Stream input,
         StructType requested,
         RowGroupPredicate? keepRowGroup,
+        bool nullFillMissingColumns,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(input);
@@ -105,8 +120,9 @@ internal sealed class ParquetFileReader
         await using (reader.ConfigureAwait(false))
         {
             // Structural validation happens here (footer read at open) — schema/type mismatches fail
-            // before any batch is yielded (H3).
-            DataField[] fileFields = ResolveFileFields(reader.Schema, requested);
+            // before any batch is yielded (H3). A null slot marks a requested column absent from the file
+            // that will be null-filled (nullFillMissingColumns; #497).
+            DataField?[] fileFields = ResolveFileFields(reader.Schema, requested, nullFillMissingColumns);
             for (int group = 0; group < reader.RowGroupCount; group++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -155,12 +171,36 @@ internal sealed class ParquetFileReader
         }
     }
 
+    /// <summary>
+    /// Reads only the Parquet footer and reconstructs the file's <b>actual physical data schema</b> (field
+    /// names + DeltaSharp types via <see cref="ParquetTypeMapping.ToDataSchema"/>), decoding no data pages.
+    /// The write-door records this on each staged file so schema enforcement gates the <b>real written
+    /// bytes</b>, not the caller's declared write schema (#497). Nullability is the footer's view (Parquet
+    /// models string/binary as nullable); callers compare the returned schema by name + type only.
+    /// </summary>
+    /// <exception cref="DeltaStorageException">The footer is malformed/truncated
+    /// (<see cref="StorageErrorKind.CorruptData"/>), or a footer field has no supported DeltaSharp type
+    /// mapping (<see cref="StorageErrorKind.UnsupportedFeature"/>).</exception>
+    public async Task<StructType> ReadDataSchemaAsync(Stream input, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+
+        ParquetReader reader = await OpenAsync(input, cancellationToken).ConfigureAwait(false);
+        await using (reader.ConfigureAwait(false))
+        {
+            return ParquetTypeMapping.ToDataSchema(reader.Schema);
+        }
+    }
+
     /// <summary>The declared compressed/decompressed footprint of one projected column chunk, plus the
     /// per-row width of the read buffer the reader will eagerly allocate for it (including any
     /// <see cref="Nullable{T}"/> overhead) — the inputs to <see cref="EnsureDecodeCeiling"/>.
+    /// <paramref name="Absent"/> marks a column that is <b>not present</b> in the file and will be
+    /// null-filled (#497): it declares no compressed/decompressed bytes (nothing is decoded) but still
+    /// carries its element width so the null-fill allocation is bounded by the same row-count ceiling.
     /// </summary>
     internal readonly record struct ColumnChunkFootprint(
-        long CompressedBytes, long UncompressedBytes, int ElementBytes);
+        long CompressedBytes, long UncompressedBytes, int ElementBytes, bool Absent = false);
 
     /// <summary>Fails closed when a row group's declared metadata would exceed this reader's
     /// <b>eager-decode</b> memory ceiling (design §5.4 C-DECODE), so neither a crafted footer nor a
@@ -196,6 +236,23 @@ internal sealed class ParquetFileReader
         for (int c = 0; c < projectedChunks.Count; c++)
         {
             ColumnChunkFootprint chunk = projectedChunks[c];
+
+            // A null-filled absent column (#497) is never decoded: it declares no bytes and skips the
+            // decompression guards (0)/(i)/(ii) below, but still applies the (iii) row-count element-width
+            // bound further down so its all-null materialization stays inside the same eager-decode ceiling.
+            if (chunk.Absent)
+            {
+                if (chunk.ElementBytes > 0 && rowCount > limits.MaxRowGroupDecodedBytes / chunk.ElementBytes)
+                {
+                    throw DeltaStorageException.CorruptData(
+                        $"Row group {group} declares {rowCount} rows, whose null-fill of an absent column would "
+                        + $"eagerly materialize more than the {limits.MaxRowGroupDecodedBytes}-byte eager-decode "
+                        + $"ceiling for a {chunk.ElementBytes}-byte column.");
+                }
+
+                continue;
+            }
+
             if (chunk.CompressedBytes < 0 || chunk.UncompressedBytes < 0)
             {
                 throw DeltaStorageException.CorruptData(
@@ -263,21 +320,34 @@ internal sealed class ParquetFileReader
     private static long SaturatingAdd(long a, long b) => b > long.MaxValue - a ? long.MaxValue : a + b;
 
     // The declared footprint the reader will decode/materialize for each projected column, pulled from
-    // the row group's Parquet metadata (CF-1). An absent chunk or missing/encrypted chunk metadata
-    // contributes a zero decompressed footprint, which EnsureDecodeCeiling now rejects fail-closed for a
+    // the row group's Parquet metadata (CF-1). A PRESENT chunk with missing/encrypted chunk metadata
+    // contributes a zero decompressed footprint, which EnsureDecodeCeiling rejects fail-closed for a
     // non-empty row group (guard (0)): a present column with rows always declares a positive decompressed
-    // size, so a zero is a stripped/absent footer whose real pages would still decode unbounded (§5.4).
+    // size, so a zero is a stripped/absent footer whose real pages would still decode unbounded (§5.4). A
+    // requested column ABSENT from the file (null slot; #497 null-fill) is marked Absent so it skips the
+    // decompression guards but keeps its element width for the (iii) null-fill allocation bound.
     private static List<ColumnChunkFootprint> ProjectedFootprints(
-        ParquetRowGroupReader rowGroup, StructType requested, DataField[] fileFields)
+        ParquetRowGroupReader rowGroup, StructType requested, DataField?[] fileFields)
     {
         var footprints = new List<ColumnChunkFootprint>(requested.Count);
         for (int c = 0; c < requested.Count; c++)
         {
+            if (fileFields[c] is not { } fileField)
+            {
+                footprints.Add(
+                    new ColumnChunkFootprint(
+                        CompressedBytes: 0,
+                        UncompressedBytes: 0,
+                        AllocatedElementByteWidth(requested[c].DataType, nullable: true),
+                        Absent: true));
+                continue;
+            }
+
             long compressed = 0;
             long uncompressed = 0;
-            if (rowGroup.ColumnExists(fileFields[c]))
+            if (rowGroup.ColumnExists(fileField))
             {
-                global::Parquet.Meta.ColumnMetaData? meta = rowGroup.GetMetadata(fileFields[c])?.MetaData;
+                global::Parquet.Meta.ColumnMetaData? meta = rowGroup.GetMetadata(fileField)?.MetaData;
                 if (meta is not null)
                 {
                     compressed = meta.TotalCompressedSize;
@@ -289,7 +359,7 @@ internal sealed class ParquetFileReader
                 new ColumnChunkFootprint(
                     compressed,
                     uncompressed,
-                    AllocatedElementByteWidth(requested[c].DataType, fileFields[c].IsNullable)));
+                    AllocatedElementByteWidth(requested[c].DataType, fileField.IsNullable)));
         }
 
         return footprints;
@@ -329,7 +399,17 @@ internal sealed class ParquetFileReader
         }
     }
 
-    private static DataField[] ResolveFileFields(ParquetSchema fileSchema, StructType requested)
+    // Resolves each requested column to the matching file DataField (validating physical type/nullability),
+    // or a null slot for a column ABSENT from the file when it may be null-filled (#497). A null slot is
+    // produced ONLY when nullFillMissingColumns is set AND the requested column is nullable: an
+    // additively-added column (#190) is always nullable, and older files written before it lack it, so it
+    // reads back as all-null. An absent NON-nullable column can never be null-filled (a required lane cannot
+    // carry null), and an absent column with null-fill disabled preserves the strict projection contract —
+    // both fail closed with the same "is not present" CorruptData message the OPTIMIZE/DELETE guards match
+    // on (#513). A PRESENT column with a disagreeing physical type/nullability is still rejected by
+    // ValidateFileField as a distinct SchemaMismatch (never silently coerced or null-filled).
+    private static DataField?[] ResolveFileFields(
+        ParquetSchema fileSchema, StructType requested, bool nullFillMissingColumns)
     {
         var byName = new Dictionary<string, DataField>(StringComparer.Ordinal);
         foreach (DataField field in fileSchema.DataFields)
@@ -337,13 +417,21 @@ internal sealed class ParquetFileReader
             byName[field.Name] = field;
         }
 
-        var resolved = new DataField[requested.Count];
+        var resolved = new DataField?[requested.Count];
         for (int c = 0; c < requested.Count; c++)
         {
             StructField requestedField = requested[c];
             string name = requestedField.Name;
             if (!byName.TryGetValue(name, out DataField? field))
             {
+                if (nullFillMissingColumns && requestedField.Nullable)
+                {
+                    // Absent + nullable + null-fill enabled: a null slot the read path materializes as an
+                    // all-null column (evolved-column read null-fill, #497).
+                    resolved[c] = null;
+                    continue;
+                }
+
                 throw DeltaStorageException.CorruptData(
                     $"Requested column '{name}' is not present in the Parquet file schema.");
             }
@@ -427,7 +515,7 @@ internal sealed class ParquetFileReader
         ParquetReader reader,
         int group,
         StructType requested,
-        DataField[] fileFields,
+        DataField?[] fileFields,
         RowGroupPredicate? keepRowGroup,
         ParquetDecodeLimits limits,
         CancellationToken cancellationToken)
@@ -466,8 +554,22 @@ internal sealed class ParquetFileReader
             for (int c = 0; c < requested.Count; c++)
             {
                 MutableColumnVector vector = ColumnVectors.Create(requested[c].DataType, Math.Max(rowCount, 1));
-                await ReadColumnAsync(rowGroup, fileFields[c], requested[c], vector, rowCount, cancellationToken)
-                    .ConfigureAwait(false);
+                if (fileFields[c] is { } fileField)
+                {
+                    await ReadColumnAsync(rowGroup, fileField, requested[c], vector, rowCount, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    // The requested column is absent from this (older, narrower) file: materialize it as an
+                    // all-null column (evolved-column read null-fill, #497). Only nullable columns reach here
+                    // (ResolveFileFields fails closed on an absent non-nullable column).
+                    for (int r = 0; r < rowCount; r++)
+                    {
+                        vector.AppendNull();
+                    }
+                }
+
                 columns[c] = vector;
             }
         }
@@ -719,14 +821,18 @@ internal sealed class ParquetFileReader
     {
         private readonly Dictionary<string, ColumnEntry> _byColumn;
 
-        internal RowGroupStatistics(ParquetRowGroupReader rowGroup, StructType requested, DataField[] fileFields)
+        internal RowGroupStatistics(ParquetRowGroupReader rowGroup, StructType requested, DataField?[] fileFields)
         {
             RowCount = rowGroup.RowCount;
             _byColumn = new Dictionary<string, ColumnEntry>(StringComparer.Ordinal);
             for (int c = 0; c < requested.Count; c++)
             {
+                // A column absent from the file (null slot; #497 null-fill) carries no statistics, so pruning
+                // on it always returns "cannot prune" — an all-null column has no useful bounds anyway.
                 DataColumnStatistics? statistics =
-                    rowGroup.ColumnExists(fileFields[c]) ? rowGroup.GetStatistics(fileFields[c]) : null;
+                    fileFields[c] is { } fileField && rowGroup.ColumnExists(fileField)
+                        ? rowGroup.GetStatistics(fileField)
+                        : null;
                 _byColumn[requested[c].Name] = new ColumnEntry(requested[c].DataType, statistics);
             }
         }
