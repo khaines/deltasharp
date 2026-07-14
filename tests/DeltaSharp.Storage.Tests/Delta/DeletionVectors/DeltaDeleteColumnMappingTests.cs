@@ -225,10 +225,15 @@ public sealed class DeltaDeleteColumnMappingTests : IDisposable
             "array" => new ArrayType(DataTypes.LongType),
             _ => new MapType(DataTypes.StringType, DataTypes.LongType),
         };
+        // Give BOTH fields valid name-mode physicalName metadata so the ONLY reason ResolvePhysicalNames can
+        // throw is the nested-type guard: if that guard were removed, PhysicalName would resolve every field
+        // successfully (no incidental "missing physicalName" throw), so this oracle stays load-bearing even if
+        // the message assertions below were ever loosened. `payload` is FIRST so the nested check fires before
+        // any PhysicalName call.
         var schema = new StructType(new[]
         {
-            new StructField("payload", nested, nullable: true),
-            new StructField("id", DataTypes.LongType, nullable: false),
+            NameMapped("payload", nested, nullable: true),
+            NameMapped("id", DataTypes.LongType, nullable: false),
         });
 
         DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
@@ -350,6 +355,13 @@ public sealed class DeltaDeleteColumnMappingTests : IDisposable
             ImmutableSortedDictionary<string, long>.Empty,
             SnapshotLoadMetrics.Empty);
     }
+
+    // A leaf field carrying valid name-mode column-mapping metadata (delta.columnMapping.physicalName), so
+    // ColumnMapping.PhysicalName(field, Name) resolves it without throwing — used to isolate the nested-type
+    // reject as the sole failure cause.
+    private static StructField NameMapped(string name, DataType type, bool nullable) =>
+        new(name, type, nullable, FieldMetadata.FromEntries(
+            new[] { new KeyValuePair<string, string>("delta.columnMapping.physicalName", "col-" + name) }));
 
     private static DeltaDeletePredicate WhereId(Func<long, bool> match) =>
         DeltaDeletePredicate.FromRowPredicate((batch, row) => match(batch.SelectedColumn(0).GetValue<long>(row)));

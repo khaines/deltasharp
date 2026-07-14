@@ -1,6 +1,5 @@
 using System.Collections.Immutable;
 using System.Diagnostics;
-using System.Globalization;
 using DeltaSharp.Diagnostics;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Backends;
