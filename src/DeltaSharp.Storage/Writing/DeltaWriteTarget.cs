@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Security.Cryptography;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Backends;
@@ -206,6 +207,69 @@ public sealed class DeltaWriteTarget : IDisposable
                 physicalPartitions,
                 ColumnMapping.NameModeConfiguration(maxColumnId),
                 ColumnMapping.NameModeProtocol(),
+                files,
+                cancellationToken)
+            .ConfigureAwait(false);
+        return new DeltaWriteResult(commit.Version, files.Count, rows);
+    }
+
+    /// <summary>
+    /// Creates a fresh Delta table that BOTH uses column mapping <c>name</c> mode AND enables deletion
+    /// vectors (#529 test seam): each top-level column is assigned a stable physical name / id (like
+    /// <see cref="CreateNameMappedTableAsync"/>) and the committed <c>protocol</c>/<c>configuration</c>
+    /// additionally declare the <c>deletionVectors</c> feature (reader v3 / writer v7) and set
+    /// <c>delta.enableDeletionVectors=true</c>, so a subsequent <see cref="DeltaDelete"/> passes the
+    /// protocol gate and exercises the WRITE-path column-mapping relabel. Data files are written under the
+    /// PHYSICAL names; <c>metaData.partitionColumns</c> carry the LOGICAL names and the staged partition
+    /// values are physical-keyed — identical to the pure name-mode create.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">A table already exists at this path.</exception>
+    internal async Task<DeltaWriteResult> CreateNameMappedDeletionVectorTableAsync(
+        StructType logicalSchema,
+        IReadOnlyList<string> partitionColumns,
+        IReadOnlyList<ColumnBatch> batches,
+        IColumnPhysicalNameSource physicalNameSource,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(logicalSchema);
+        ArgumentNullException.ThrowIfNull(partitionColumns);
+        ArgumentNullException.ThrowIfNull(batches);
+        ArgumentNullException.ThrowIfNull(physicalNameSource);
+
+        if (await TableExistsAsync(cancellationToken).ConfigureAwait(false))
+        {
+            throw new InvalidOperationException(
+                "Enabling column mapping + deletion vectors on an existing table is out of scope in this "
+                + "build; both can only be enabled on a fresh table (first write).");
+        }
+
+        (StructType mappedSchema, long maxColumnId) =
+            ColumnMapping.AssignFreshMapping(logicalSchema, physicalNameSource);
+
+        StructType physicalSchema = ColumnMapping.ToPhysicalSchema(mappedSchema, ColumnMappingMode.Name);
+        IReadOnlyList<string> physicalPartitions =
+            ColumnMapping.PhysicalPartitionColumns(mappedSchema, partitionColumns, ColumnMappingMode.Name);
+
+        (IReadOnlyList<StagedDataFile> files, long rows) =
+            await StageAsync(physicalSchema, physicalPartitions, batches, cancellationToken).ConfigureAwait(false);
+
+        // Merge the name-mode and deletion-vector enablement into ONE protocol (reader v3 / writer v7 with
+        // BOTH features declared) and ONE configuration (columnMapping mode/maxColumnId + enableDeletionVectors).
+        ImmutableSortedDictionary<string, string> configuration = ColumnMapping.NameModeConfiguration(maxColumnId)
+            .Add(DeletionVectorsFeature.EnablePropertyKey, "true");
+        var protocol = new ProtocolAction(
+            DeletionVectorsFeature.ReaderVersion,
+            DeletionVectorsFeature.WriterVersion,
+            ImmutableArray.Create(ColumnMapping.Feature, DeletionVectorsFeature.Feature),
+            ImmutableArray.Create(ColumnMapping.Feature, DeletionVectorsFeature.Feature));
+
+        DeltaCommitResult commit = await _writer
+            .CreateMappedTableAsync(
+                mappedSchema,
+                partitionColumns,
+                physicalPartitions,
+                configuration,
+                protocol,
                 files,
                 cancellationToken)
             .ConfigureAwait(false);
