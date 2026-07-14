@@ -389,6 +389,8 @@ Each version *N* is one object `_delta_log/<N-zero-padded-to-20-digits>.json` (e
 
 Checkpoints must round-trip **all** active actions needed to reconstruct the same snapshot as JSON replay (checklist bullet 7).
 
+- **Deletion vectors in classic checkpoints (issue #527):** `DeltaCheckpointReader` decodes the nested `add.deletionVector`/`remove.deletionVector` struct columns (`storageType`, `pathOrInlineDv`, `offset?`, `sizeInBytes`, `cardinality`) directly into the `DeletionVectorDescriptor` that rides on the reconstructed `add`/`remove`, so an aged Spark-DV table stays readable from a checkpoint alone once its early `*.json` commits are log-cleaned. A DV is reconstructed **only** where `storageType` is present; a present-but-incomplete/invalid DV **fails closed** (`DeltaProtocolException` → JSON replay) — a DV is never silently dropped, since dropping one resurrects logically-deleted rows. Reconstruction is bit-identical to JSON replay (parity oracle) because the checkpoint path applies the same descriptor validation as `DeletionVectorDescriptor.Parse`.
+
 #### 2.10.4 Snapshot reconstruction
 
 The reconstruction algorithm for a requested version *V* (default = latest):
