@@ -103,8 +103,14 @@ public sealed class DeltaWriteTarget : IDisposable
         IReadOnlyList<ColumnBatch> batches,
         CancellationToken cancellationToken = default)
     {
+        // #525: for an EXISTING name-mode column-mapped table, stage under the table's PHYSICAL schema so the
+        // appended Parquet files carry the col-<uuid> names + physical-keyed partitionValues (matching the
+        // create path). For a fresh path / `none`-mode table this returns the logical schema unchanged.
+        (StructType stagingSchema, IReadOnlyList<string> stagingPartitions) =
+            await ResolvePhysicalStagingAsync(writeSchema, partitionColumns, cancellationToken).ConfigureAwait(false);
+
         (IReadOnlyList<StagedDataFile> files, long rows) =
-            await StageAsync(writeSchema, partitionColumns, batches, cancellationToken).ConfigureAwait(false);
+            await StageAsync(stagingSchema, stagingPartitions, batches, cancellationToken).ConfigureAwait(false);
         DeltaCommitResult commit = await _writer
             .CreateOrAppendAsync(writeSchema, partitionColumns, files, cancellationToken)
             .ConfigureAwait(false);
@@ -130,8 +136,13 @@ public sealed class DeltaWriteTarget : IDisposable
         bool overwriteSchema = false,
         CancellationToken cancellationToken = default)
     {
+        // #525: stage under the table's PHYSICAL schema for an EXISTING name-mode table (see AppendAsync).
+        // overwriteSchema on a column-mapped table is rejected fail-closed downstream (CreateOrOverwriteAsync).
+        (StructType stagingSchema, IReadOnlyList<string> stagingPartitions) =
+            await ResolvePhysicalStagingAsync(writeSchema, partitionColumns, cancellationToken).ConfigureAwait(false);
+
         (IReadOnlyList<StagedDataFile> files, long rows) =
-            await StageAsync(writeSchema, partitionColumns, batches, cancellationToken).ConfigureAwait(false);
+            await StageAsync(stagingSchema, stagingPartitions, batches, cancellationToken).ConfigureAwait(false);
         DeltaCommitResult commit = await _writer
             .CreateOrOverwriteAsync(
                 writeSchema, partitionColumns, files, Map(partitionOverwriteMode), overwriteSchema, cancellationToken)
@@ -244,6 +255,41 @@ public sealed class DeltaWriteTarget : IDisposable
                 validatePhysicalWriteSchema: true)
             .ConfigureAwait(false);
         return new DeltaWriteResult(commit.Version, files.Count, rows);
+    }
+
+    // #525: for an EXISTING name-mode column-mapped table, resolve the PHYSICAL schema + partition columns
+    // the staged Parquet must physically carry (so an append/overwrite writes col-<uuid> names + physical-
+    // keyed partitionValues, IDENTICAL to the fresh-create path). The physical names are the table's EXISTING
+    // per-field delta.columnMapping.physicalName — reused verbatim, NEVER re-minted. For a fresh path (create
+    // door) or a `none`-mode table this is logical==physical, so the caller's write schema / partition columns
+    // pass through unchanged (byte-for-byte identical staging to prior behavior). `id` mode is fail-closed at
+    // snapshot load (#523). This is a STAGING concern only — the commit call still passes the LOGICAL write
+    // schema to DeltaTableWriter, which re-derives the physical form for its own commit-time validation.
+    private async Task<(StructType StagingSchema, IReadOnlyList<string> StagingPartitions)>
+        ResolvePhysicalStagingAsync(
+            StructType writeSchema, IReadOnlyList<string> partitionColumns, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(writeSchema);
+        ArgumentNullException.ThrowIfNull(partitionColumns);
+
+        if (await _log.GetLatestCommitVersionAsync(cancellationToken).ConfigureAwait(false) is null)
+        {
+            // Fresh path: the write creates the table (logical==physical for a plain create; a name-mode
+            // create goes through CreateNameMappedTableAsync, not this facade path).
+            return (writeSchema, partitionColumns);
+        }
+
+        Snapshot snapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
+        ColumnMappingMode mode = ColumnMapping.ResolveMode(snapshot.Metadata.Configuration);
+        if (mode != ColumnMappingMode.Name)
+        {
+            return (writeSchema, partitionColumns);
+        }
+
+        StructType physicalSchema = ColumnMapping.MapWriteSchemaToPhysical(writeSchema, snapshot.Schema, mode);
+        IReadOnlyList<string> physicalPartitions =
+            ColumnMapping.PhysicalPartitionColumns(snapshot.Schema, partitionColumns, mode);
+        return (physicalSchema, physicalPartitions);
     }
 
     // Partition the batches, write one Parquet data file per non-empty partition (data columns only), and

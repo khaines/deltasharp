@@ -416,6 +416,48 @@ internal static class ColumnMapping
         return new StructType(physical);
     }
 
+    /// <summary>
+    /// Maps an incoming <paramref name="writeSchema"/> (LOGICAL column names, in write order) to the PHYSICAL
+    /// schema the staged Parquet file must physically carry for an append/overwrite to an <b>existing</b>
+    /// name-mode table (#525). Each write field is renamed to the physical name the table's
+    /// <paramref name="tableMappedSchema"/> already assigned that logical column, <b>preserving the write
+    /// order</b> and the write field's own type/nullability (so the staged bytes line up exactly with the
+    /// partitioner's output). The table's existing <c>delta.columnMapping.id</c> / <c>physicalName</c> are
+    /// REUSED verbatim — never re-minted — so an append never assigns a fresh physical name to an existing
+    /// logical column. A write column absent from the table schema has no physical name to stage under (schema
+    /// enforcement should have rejected it first) and fails closed.
+    /// </summary>
+    /// <exception cref="DeltaProtocolException">A write column is absent from the name-mode table schema, or a
+    /// mapped field carries no physical name.</exception>
+    public static StructType MapWriteSchemaToPhysical(
+        StructType writeSchema, StructType tableMappedSchema, ColumnMappingMode mode)
+    {
+        ArgumentNullException.ThrowIfNull(writeSchema);
+        ArgumentNullException.ThrowIfNull(tableMappedSchema);
+        if (mode != ColumnMappingMode.Name)
+        {
+            return writeSchema;
+        }
+
+        var fields = new List<StructField>(writeSchema.Count);
+        foreach (StructField field in writeSchema)
+        {
+            EnsureLeaf(field);
+            if (!tableMappedSchema.TryGetField(field.Name, out StructField tableField))
+            {
+                throw DeltaProtocolException.Inconsistent(
+                    string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"Write column '{field.Name}' is not present in the name-mode table schema, so it has "
+                        + $"no '{PhysicalNameKey}' to stage under; the write is rejected fail-closed."));
+            }
+
+            fields.Add(new StructField(PhysicalName(tableField, mode), field.DataType, field.Nullable));
+        }
+
+        return new StructType(fields);
+    }
+
     /// <summary>Maps the table's logical <paramref name="partitionColumns"/> to their physical names, the
     /// form Delta records them (and their <c>add.partitionValues</c> keys) in the log under column mapping
     /// (Delta protocol writer requirement: partition values tracked by physical name).</summary>
