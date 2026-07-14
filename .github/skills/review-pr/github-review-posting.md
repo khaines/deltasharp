@@ -25,7 +25,7 @@ review with `event: COMMENT`**. The rating and the APPROVE/REQUEST_CHANGES *reco
 > ```bash
 > me=$(gh api user --jq .login)
 > author=$(gh pr view {pr} --json author --jq .author.login)
-> # if [ "$me" = "$author" ]; then event=COMMENT; else event per rating-rubric §9.1; fi
+> # if [ "$me" = "$author" ]; then event=COMMENT; else event per review-pr §9.1; fi
 > ```
 
 ## Constraint 2 — inline comments create threads that gate merge
@@ -42,28 +42,35 @@ Each inline review comment starts a thread, so posting inline findings adds a re
 
 ## Posting a review with inline comments (one API call)
 
-Build a JSON payload and submit it in a single `POST …/reviews` call so the body + all inline
-comments land as one review. Use a scratch file **outside the worktree** and delete it after.
+Submit the body + all inline comments as one `POST …/reviews` call. **Build the JSON payload with
+`jq`, never by splicing finding/EVIDENCE text into a raw heredoc** — EVIDENCE quotes attacker-controlled
+diff snippets, so an unescaped `"`, `\`, or newline would `422` the call, and a crafted snippet could
+**inject JSON structure** (close the string early to forge an extra comment or rewrite the body).
+`jq --arg` / `--rawfile` always encodes. Use a scratch file **outside the worktree** and delete it after.
 
 ```bash
-owner=khaines; repo=deltasharp; pr={pr}
+owner=khaines; repo=deltasharp; pr={pr}; head={HEAD_SHA}
 f=$(mktemp -t rfl-review.XXXXXX.json)
-cat > "$f" <<'JSON'
-{
-  "event": "COMMENT",
-  "commit_id": "{HEAD_SHA}",
-  "body": "…review summary markdown (rating, info findings, recommendation)…",
-  "comments": [
-    { "path": "src/DeltaSharp.Storage/Delta/Foo.cs", "line": 42, "side": "RIGHT",
-      "body": "**🟠 High (Architect R1):** <finding>.\n\n**Recommendation:** <fix>.\n\nEVIDENCE: …" },
-    { "path": "src/DeltaSharp.Storage/Delta/Bar.cs", "start_line": 10, "line": 14, "side": "RIGHT",
-      "body": "**🟡 Medium (Quality R1):** <finding for a multi-line range>." }
-  ]
-}
-JSON
+
+# Build the comments[] array — one jq object per anchored finding, so every body (quotes, backticks,
+# newlines, diff-quoted EVIDENCE) is JSON-encoded. Read each finding body from a file via --rawfile.
+comments=$(jq -n '[]')
+comments=$(printf '%s' "$comments" | jq \
+  --arg path "src/DeltaSharp.Storage/Delta/Foo.cs" --argjson line 42 --arg side "RIGHT" \
+  --rawfile body finding-1.md '. + [{path:$path, line:$line, side:$side, body:$body}]')
+# …repeat per finding; for a multi-line range add --argjson start_line 10 and include it in the object…
+
+# Assemble the review; the summary body is encoded via --rawfile too.
+jq -n --arg commit "$head" --rawfile body review-summary.md --argjson comments "$comments" \
+  '{event:"COMMENT", commit_id:$commit, body:$body, comments:$comments}' > "$f"
+
 gh api -X POST "/repos/$owner/$repo/pulls/$pr/reviews" --input "$f"
 rm -f "$f"
 ```
+
+`event: COMMENT` is required for self-authored PRs (Constraint 1). **Scrub secrets from EVIDENCE before
+posting** — EVIDENCE may quote captured command output; never publish a token/credential in a review
+body or comment (the C7 no-ambient-credentials isolation in `red-team.md` is the first line of defense).
 
 - **`commit_id`** — pin to the HEAD SHA reviewed so comments anchor to the intended revision.
 - **`line` / `side`** — `line` is the line number in the file at that side of the diff; `side:
@@ -97,7 +104,7 @@ When a fixer resolves an inline finding, reply to the thread with what was fixed
 so the thread does not block merge. Threads are a GraphQL concept:
 
 ```bash
-# 1) list open threads (id + first comment's path/body to match the finding)
+# 1) list open threads (thread id + first comment's path/body to match the finding)
 gh api graphql -f query='
   query($owner:String!,$repo:String!,$pr:Int!){
     repository(owner:$owner,name:$repo){ pullRequest(number:$pr){
@@ -105,14 +112,18 @@ gh api graphql -f query='
         comments(first:1){ nodes{ path body } } } } } } }' \
   -F owner=khaines -F repo=deltasharp -F pr={pr}
 
-# 2) reply to the matched thread's first comment id (optional but preferred — leaves an audit trail)
-gh api -X POST "/repos/khaines/deltasharp/pulls/{pr}/comments/{comment_id}/replies" \
-  -f body="Fixed in {fix_sha}: <what changed>."
+# 2) reply to the matched thread — pure GraphQL, using the THREAD id from step 1 (no comment id needed).
+#    Pass the body with -f (single-quoted) so quotes/backticks/$(...) are NOT shell-expanded or forgeable.
+gh api graphql -f query='
+  mutation($tid:ID!,$body:String!){
+    addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$tid, body:$body}){
+      comment{ id } } }' \
+  -f tid={thread_id} -f body='Fixed in {fix_sha}: what changed.'
 
 # 3) resolve the thread
 gh api graphql -f query='
   mutation($id:ID!){ resolveReviewThread(input:{threadId:$id}){ thread{ isResolved } } }' \
-  -F id={thread_id}
+  -f id={thread_id}
 ```
 
 At loop termination, assert **zero unresolved threads remain for fixed findings** — an unresolved
@@ -142,8 +153,9 @@ gh pr view {pr} --json reviews --jq '.reviews[]
   | { state, submittedAt, body_preview: (.body[0:300]) }'
 ```
 
-If missing/invalid, re-render to a scratch path outside the worktree, repost with
-`gh pr review {pr} --comment --body-file …`, re-verify, then delete the scratch file.
+If missing/invalid, re-render to the project-relative `.rfl-report-{pr}.md` (gitignored), repost with
+`gh pr review {pr} --comment --body-file .rfl-report-{pr}.md`, re-verify, then delete it — matching the
+`review-fix-loop` §6.4 re-render convention.
 
 ## Avoiding duplicate comments (`review-pr` §9.3)
 

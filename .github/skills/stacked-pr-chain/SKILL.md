@@ -2,11 +2,11 @@
 name: stacked-pr-chain
 description: >-
   Executes an ordered set of GitHub issues as a stack of dependent pull requests: each item branches
-  off the previous item's tip (item 1 off main), opens a PR scoped with `--base <parent branch>`, and
-  is driven to the PASS bar via the review-fix-loop skill — then left **OPEN, not merged**. main stays
-  put for the whole build. After human sign-off, a bottom-up merge loop rebases each stacked PR onto
-  main and requires green CI before each squash-merge. Produces a morning-review stack summary. Use for
-  a prioritized backlog of related follow-ups where each item builds on the previous one.
+  off the previous item's tip (item 1 off main), opens a PR scoped to its parent branch, and is driven
+  to the PASS bar via the review-fix-loop skill — then left open, not merged. main stays put for the
+  whole build. After human sign-off, a bottom-up merge loop rebases each stacked PR onto main and
+  requires green CI before each squash-merge. Produces a morning-review stack summary. Use for a
+  prioritized backlog of related follow-ups where each item builds on the previous one.
 ---
 
 # Stacked-PR Chain Skill — Orchestration Instructions
@@ -28,7 +28,7 @@ them bottom-up. Read all supporting files before beginning:
 ## The one hard rule — STACK, don't merge
 
 **Each item branches off the previous item's branch tip; item 1 branches off `main`.** Open each PR
-with `--base <parent branch>` so its diff is scoped to just that item. Drive it to PASS, then **leave
+with `--base {parent_branch}` so its diff is scoped to just that item. Drive it to PASS, then **leave
 it OPEN and branch the next item off its tip.** `main` does not move for the entire build phase. Only
 after explicit human sign-off does Phase 4 merge the stack.
 
@@ -44,7 +44,7 @@ after explicit human sign-off does Phase 4 merge the stack.
 |-----------|---------|-------------|
 | `items` | — | Ordered list of issues (highest priority first). Item N depends on item N−1. |
 | `base` | `main` | The base of item 1. The stack root; stays fixed through the build. |
-| `pass_bar` | unanimous 5/5 + red-team `NO-MISS-CERTIFIED` | Per-PR gate (`review-fix-loop` / `rating-rubric.md`). |
+| `pass_bar` | unanimous 5/5 + red-team `NO-MISS-CERTIFIED` | Per-PR gate (`review-fix-loop` / `rating-rubric.md`). "PASS bar" is the target; the "PASS gate" in `rating-rubric.md` is its enforcement — same criterion. |
 | `max_worktrees` | 3 | Max concurrent lane worktrees (independent items can build in parallel). |
 | `merge` | **manual** | Phase 4 runs **only** after explicit human sign-off. |
 
@@ -55,7 +55,7 @@ after explicit human sign-off does Phase 4 merge the stack.
 1. **Order the items.** Confirm the dependency order (top-down priority; each item builds on the
    previous). Record it; this order is the stack from bottom (item 1, off `main`) to top.
 2. **Resolve the root.** Capture the current `main` SHA (`git rev-parse origin/main`). Every "main
-   stays at `<sha>`" assertion in the summary references it.
+   stays at `{root_sha}`" assertion in the summary references it.
 3. **Create the state table** (see "State tracking" below) with one row per item.
 4. **Per-item design check.** For each item, confirm a governing design doc / issue scope exists. If
    an item needs a design doc, the per-item `implement-work-item` run will chain `design-doc` first.
@@ -71,11 +71,16 @@ For each item in order, do **not** merge — build on the previous tip and leave
 
 ### 2.1 Branch off the parent tip
 
-- **Item 1:** branch off `main` — `git worktree add ../deltasharp-<item> -b <branch> origin/main`.
-- **Item N (N>1):** branch off **item N−1's branch tip** — `git worktree add ../deltasharp-<item> -b
-  <branch> <parent-branch>`. The parent branch must already be at its PASS tip.
+- **Item 1:** branch off `main` — `git worktree add ../deltasharp-{item} -b {branch} origin/main`.
+- **Item N (N>1):** branch off **item N−1's branch tip** — `git worktree add ../deltasharp-{item} -b
+  {branch} {parent_branch}`. The parent branch must already be at its PASS tip.
 
-Use the branch convention `khaines/<type>-<issue>-<slug>` (author-prefixed; see repo memory). One
+**Record the fork point now**, while the parent branch is exactly where you fork from: capture
+`fork_sha = $(git rev-parse {parent_branch})` (for item 1, `origin/main`) into `stack.fork_sha`.
+Phase 4's rebase depends on this recorded value — it **cannot** be reliably reverse-engineered after the
+parent squash-merges (see `merge-loop.md` N.1).
+
+Use the branch convention `khaines/{type}-{issue}-{slug}` (author-prefixed; see repo memory). One
 worktree per lane (sibling dir), so lanes don't collide.
 
 ### 2.2 Implement the item
@@ -97,10 +102,10 @@ Every item must pass the full repo bar locally (CI won't run on a stacked PR —
 ### 2.4 Open the PR scoped to its parent
 
 ```bash
-gh pr create --base <parent branch> --head <branch> --title "…" --body "…"
+gh pr create --base {parent_branch} --head {branch} --title "…" --body "…"
 ```
 
-`--base <parent branch>` is what keeps the PR's diff scoped to **only this item** (not the whole
+`--base {parent_branch}` is what keeps the PR's diff scoped to **only this item** (not the whole
 stack). Item 1's base is `main`.
 
 ### 2.5 Drive to PASS — then STOP (do not merge)
@@ -123,10 +128,10 @@ this tip (2.1).
 
 1. **Every deferral is a filed, verified issue.** Before marking any item PASS, audit its in-code
    fail-closed guards for untracked deferrals; file a GitHub tracking issue for each deferred finding
-   and verify it (`gh issue view <n>` → open, scope-matching). An un-tracked deferral blocks that
+   and verify it (`gh issue view {n}` → open, scope-matching). An un-tracked deferral blocks that
    item's PASS (`rating-rubric.md` → PASS gate).
 2. **Write the morning-review summary** — a top-level artifact the human reads first. One row per
-   item: `issue → branch → PR# → PASS status → base`, plus the fixed `main @ <root sha>` line and the
+   item: `issue → branch → PR# → PASS status → base`, plus the fixed `main @ {root_sha}` line and the
    list of OPEN deferral issues. Persist it to the session files dir (not committed).
 
 Example:
@@ -149,10 +154,11 @@ time, each behind green CI, following [`merge-loop.md`](merge-loop.md). The esse
 
 1. **Merge item 1** (base is already `main`) once its 14/14 CI is green.
 2. **For each subsequent item:** when its parent merges, GitHub **auto-retargets** its base to `main`
-   (the parent branch is deleted). **Rebase it onto `main`** with the *fork-point* trick
-   (`merge-loop.md` — the fork point is the **parent of the branch's first commit**, NOT the old
-   parent tip), verify the `origin/main..HEAD` diff is scoped, build+test locally, `--force-with-lease`
-   push, then **wait for 14/14 CI green** before squash-merge.
+   (the parent branch is deleted). **Rebase it onto `main`** using the **recorded `fork_sha`**
+   (`merge-loop.md` N.1 — never derive the fork point from `origin/main..{branch}`, which under
+   squash-only merges replays the parent's orphaned commits and conflicts), verify the
+   `origin/main..HEAD` diff is scoped, build+test locally, `--force-with-lease` push, then **wait for
+   14/14 CI green** before squash-merge.
 3. Repeat to the top of the stack.
 
 > **The rebased-stacked-PR rule:** a stacked PR that has been rebased onto `main` **must pass all CI
@@ -174,6 +180,7 @@ CREATE TABLE IF NOT EXISTS stack (
   branch    TEXT,
   pr        INTEGER,
   base      TEXT,                  -- parent branch (or "main" for item 1)
+  fork_sha  TEXT,                  -- parent-branch tip at fork time (captured in Phase 2.1; the Phase 4 rebase base)
   head_sha  TEXT,
   pass_status TEXT,                -- "" | "PASS: unanimous 5/5 + red-team NO-MISS + …"
   merge_state TEXT DEFAULT 'open'  -- open | rebased | ci-green | merged

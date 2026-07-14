@@ -165,7 +165,9 @@ Dispatch **4 parallel reviews** using the `task` tool. Each slot has a fixed **r
 
 **Specialist seats (scout-selected, ≤3).** In addition to the 4 fixed lenses, dispatch each
 domain specialist from the scout's Review Package as an **additional voting seat** on a frontier
-model (`agent_type` = the specialist persona; model = a top-tier family, e.g. `claude-opus-4.8`),
+model (`agent_type` = the specialist persona; model = a **voting-spine family (Claude or Gemini),
+never GPT** — so the red-team's GPT-family decorrelation stays *structurally* guaranteed; a specialist
+on GPT would silently degrade the gate to provisional; e.g. `claude-opus-4.8`),
 scoped to its owned files + checklist IDs. The 4 lenses are the spine; specialists add depth for
 the domains the diff actually touches (Delta storage, query execution, operator, connectors, …).
 

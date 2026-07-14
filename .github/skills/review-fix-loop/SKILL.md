@@ -376,7 +376,9 @@ gh pr review {pr_number} --comment --body-file {report_file}
 
 The orchestrator MUST not claim the loop terminated successfully until it has verified, on GitHub, that the progression report review exists on the PR.
 
-Verification procedure:
+Verification procedure (query/post mechanics are canonical in
+[`../review-pr/github-review-posting.md`](../review-pr/github-review-posting.md) → "Verifying the posted
+review"; keep the two in lockstep):
 
 1. Use the Run Identity captured in §1.5.
 2. Query for this run's report by run-identity marker (the report is now a **review**, so read
@@ -458,7 +460,7 @@ commit per-run scratch logs to the repo — that is itself a C6 hygiene miss.)
 3. Triage verification completed for any round with 5+ dismissals or any dismissed findings in protected domains.
 4. Dismissed findings audited and real items tracked as backlog issues.
 5. **Every deferred finding has a GitHub tracking issue the orchestrator verified exists** (`gh issue view <n>` → open, scope matches the finding), with its number recorded in the report. **No un-filed deferral may PASS**; any `inherent/won't-fix` residual instead carries a durable in-code/in-PR rationale.
-6. Full progression report posted as a PR comment with council composition audit and verified URL.
+6. Full progression report posted as a **`COMMENT` review** with council composition audit and verified URL.
 7. Restore/build/format/test validation green for .NET changes.
 8. CI green on all required checks when remote checks exist.
 
