@@ -133,4 +133,57 @@ public sealed class DeltaSchemaJsonTypedMetadataTests
 
         Assert.Equal(engineJson, storageJson);
     }
+
+    [Fact]
+    public void TypeChangesMetadata_RoundTripsThroughSchemaJson()
+    {
+        // #495: a widened field carries delta.typeChanges (a JSON array of {fromType,toType} objects). It
+        // must serialize AND parse back with the exact array-of-nested shape and key/value strings so a
+        // reader can promote (Delta PROTOCOL.md "Type Change Metadata").
+        var typeChanges = MetadataValue.Array(new[]
+        {
+            MetadataValue.Nested(FieldMetadata.FromEntries(new[]
+            {
+                new KeyValuePair<string, string>("fromType", "short"),
+                new KeyValuePair<string, string>("toType", "integer"),
+            })),
+            MetadataValue.Nested(FieldMetadata.FromEntries(new[]
+            {
+                new KeyValuePair<string, string>("fromType", "integer"),
+                new KeyValuePair<string, string>("toType", "long"),
+            })),
+        });
+        var schema = new StructType(new[]
+        {
+            new StructField(
+                "value",
+                DataTypes.LongType,
+                nullable: true,
+                FieldMetadata.FromValues(new[]
+                {
+                    new KeyValuePair<string, MetadataValue>("delta.typeChanges", typeChanges),
+                })),
+        });
+
+        string json = DeltaSchemaJson.ToJson(schema);
+        Assert.Contains("\"delta.typeChanges\":[{\"fromType\":\"short\",\"toType\":\"integer\"},{\"fromType\":\"integer\",\"toType\":\"long\"}]", json, StringComparison.Ordinal);
+
+        var parsed = (StructType)SchemaJson.FromJson(json);
+        StructField field = parsed["value"];
+        Assert.True(field.Metadata.TryGetValue("delta.typeChanges", out MetadataValue? changes));
+        Assert.True(changes!.TryGetArray(out IReadOnlyList<MetadataValue>? entries));
+        Assert.Equal(2, entries!.Count);
+
+        Assert.True(entries[0].TryGetNested(out FieldMetadata? first));
+        Assert.True(first!.TryGetString("fromType", out string? f0));
+        Assert.True(first.TryGetString("toType", out string? t0));
+        Assert.Equal("short", f0);
+        Assert.Equal("integer", t0);
+
+        Assert.True(entries[1].TryGetNested(out FieldMetadata? second));
+        Assert.True(second!.TryGetString("fromType", out string? f1));
+        Assert.True(second.TryGetString("toType", out string? t1));
+        Assert.Equal("integer", f1);
+        Assert.Equal("long", t1);
+    }
 }

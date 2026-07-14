@@ -38,7 +38,7 @@ public sealed class ParquetReaderTests
 
         var projection = new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) });
         var batches = new List<ColumnBatch>();
-        await foreach (ColumnBatch batch in new ParquetFileReader().ReadAsync(stream, projection, keepRowGroup: null, nullFillMissingColumns: false, CancellationToken.None))
+        await foreach (ColumnBatch batch in new ParquetFileReader().ReadAsync(stream, projection, keepRowGroup: null, nullFillMissingColumns: false, allowTypeWideningPromotion: false, CancellationToken.None))
         {
             batches.Add(batch);
         }
@@ -87,7 +87,7 @@ public sealed class ParquetReaderTests
             new StructField("a", DataTypes.LongType, nullable: false),
         });
         var batches = new List<ColumnBatch>();
-        await foreach (ColumnBatch batch in new ParquetFileReader().ReadAsync(new MemoryStream(fileBytes), projection, keepRowGroup: null, nullFillMissingColumns: false, CancellationToken.None))
+        await foreach (ColumnBatch batch in new ParquetFileReader().ReadAsync(new MemoryStream(fileBytes), projection, keepRowGroup: null, nullFillMissingColumns: false, allowTypeWideningPromotion: false, CancellationToken.None))
         {
             batches.Add(batch);
         }
@@ -107,7 +107,7 @@ public sealed class ParquetReaderTests
         // A lone middle-column projection must also resolve by name (not fall back to file position 0).
         var middle = new StructType(new[] { new StructField("b", DataTypes.LongType, nullable: false) });
         var middleBatches = new List<ColumnBatch>();
-        await foreach (ColumnBatch batch in new ParquetFileReader().ReadAsync(new MemoryStream(fileBytes), middle, keepRowGroup: null, nullFillMissingColumns: false, CancellationToken.None))
+        await foreach (ColumnBatch batch in new ParquetFileReader().ReadAsync(new MemoryStream(fileBytes), middle, keepRowGroup: null, nullFillMissingColumns: false, allowTypeWideningPromotion: false, CancellationToken.None))
         {
             middleBatches.Add(batch);
         }
@@ -135,6 +135,7 @@ public sealed class ParquetReaderTests
             schema,
             keepRowGroup: stats => stats.Max("id") is long max && max >= 100,
             nullFillMissingColumns: false,
+            allowTypeWideningPromotion: false,
             CancellationToken.None))
         {
             ColumnVector column = result.SelectedColumn(0);
@@ -161,7 +162,7 @@ public sealed class ParquetReaderTests
 
         DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(async () =>
         {
-            await foreach (ColumnBatch _ in new ParquetFileReader().ReadAsync(stream, schema, keepRowGroup: null, nullFillMissingColumns: false, CancellationToken.None))
+            await foreach (ColumnBatch _ in new ParquetFileReader().ReadAsync(stream, schema, keepRowGroup: null, nullFillMissingColumns: false, allowTypeWideningPromotion: false, CancellationToken.None))
             {
             }
         });
@@ -178,7 +179,7 @@ public sealed class ParquetReaderTests
 
         DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(async () =>
         {
-            await foreach (ColumnBatch _ in new ParquetFileReader().ReadAsync(stream, schema, keepRowGroup: null, nullFillMissingColumns: false, CancellationToken.None))
+            await foreach (ColumnBatch _ in new ParquetFileReader().ReadAsync(stream, schema, keepRowGroup: null, nullFillMissingColumns: false, allowTypeWideningPromotion: false, CancellationToken.None))
             {
             }
         });
@@ -202,7 +203,7 @@ public sealed class ParquetReaderTests
 
         DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(async () =>
         {
-            await foreach (ColumnBatch _ in new ParquetFileReader().ReadAsync(stream, nested, keepRowGroup: null, nullFillMissingColumns: false, CancellationToken.None))
+            await foreach (ColumnBatch _ in new ParquetFileReader().ReadAsync(stream, nested, keepRowGroup: null, nullFillMissingColumns: false, allowTypeWideningPromotion: false, CancellationToken.None))
             {
             }
         });
@@ -225,7 +226,7 @@ public sealed class ParquetReaderTests
 
         var batches = new List<ColumnBatch>();
         await foreach (ColumnBatch b in new ParquetFileReader().ReadAsync(
-            stream, FullSchema, keepRowGroup: null, nullFillMissingColumns: true, CancellationToken.None))
+            stream, FullSchema, keepRowGroup: null, nullFillMissingColumns: true, allowTypeWideningPromotion: false, CancellationToken.None))
         {
             batches.Add(b);
         }
@@ -268,7 +269,7 @@ public sealed class ParquetReaderTests
         DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(async () =>
         {
             await foreach (ColumnBatch _ in new ParquetFileReader().ReadAsync(
-                stream, wider, keepRowGroup: null, nullFillMissingColumns: true, CancellationToken.None))
+                stream, wider, keepRowGroup: null, nullFillMissingColumns: true, allowTypeWideningPromotion: false, CancellationToken.None))
             {
             }
         });
@@ -290,7 +291,7 @@ public sealed class ParquetReaderTests
         DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(async () =>
         {
             await foreach (ColumnBatch _ in new ParquetFileReader().ReadAsync(
-                stream, FullSchema, keepRowGroup: null, nullFillMissingColumns: false, CancellationToken.None))
+                stream, FullSchema, keepRowGroup: null, nullFillMissingColumns: false, allowTypeWideningPromotion: false, CancellationToken.None))
             {
             }
         });
@@ -315,7 +316,7 @@ public sealed class ParquetReaderTests
         DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(async () =>
         {
             await foreach (ColumnBatch _ in new ParquetFileReader().ReadAsync(
-                stream, mistyped, keepRowGroup: null, nullFillMissingColumns: true, CancellationToken.None))
+                stream, mistyped, keepRowGroup: null, nullFillMissingColumns: true, allowTypeWideningPromotion: false, CancellationToken.None))
             {
             }
         });
@@ -335,7 +336,7 @@ public sealed class ParquetReaderTests
 
         long total = 0;
         await foreach (ColumnBatch b in new ParquetFileReader().ReadAsync(
-            stream, FullSchema, keepRowGroup: null, nullFillMissingColumns: true, CancellationToken.None))
+            stream, FullSchema, keepRowGroup: null, nullFillMissingColumns: true, allowTypeWideningPromotion: false, CancellationToken.None))
         {
             ColumnVector name = b.SelectedColumn(1);
             for (int r = 0; r < b.LogicalRowCount; r++)
@@ -362,7 +363,7 @@ public sealed class ParquetReaderTests
 
         var batches = new List<ColumnBatch>();
         await foreach (ColumnBatch b in new ParquetFileReader().ReadAsync(
-            stream, FullSchema, keepRowGroup: null, nullFillMissingColumns: true, CancellationToken.None))
+            stream, FullSchema, keepRowGroup: null, nullFillMissingColumns: true, allowTypeWideningPromotion: false, CancellationToken.None))
         {
             batches.Add(b);
         }

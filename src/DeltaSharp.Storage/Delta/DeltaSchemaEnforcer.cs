@@ -11,35 +11,44 @@ namespace DeltaSharp.Storage.Delta;
 /// publishes state (AC1 reject-before-commit) and an accepted evolution produces the merged schema the
 /// writer folds into a single atomic <c>metaData</c>+adds commit (AC2).
 ///
-/// <para><b>The only evolution is additive.</b> <c>Reconcile</c> <b>never</b> returns a schema whose column
-/// types differ from the table's — the only merged schema it ever produces adds a <b>new nullable column</b>
-/// (top-level or nested) under <see cref="SchemaEvolutionMode.AddNewColumns"/>. Every other difference is
-/// either a no-op (returns <see langword="null"/>) or a rejection. This is fail-closed: no accepted write
-/// can leave the table in a state its own reader cannot read back.</para>
+/// <para><b>The only additive evolution is a new column; type widening is <i>applied</i> only when the
+/// table enables it.</b> Under <see cref="SchemaEvolutionMode.AddNewColumns"/> a new <b>nullable column</b>
+/// (top-level or nested) may be added. Separately, when the table has the Delta <c>typeWidening</c> table
+/// feature <b>and</b> the <c>delta.enableTypeWidening</c> property set (threaded as
+/// <c>typeWideningEnabled</c>), a <b>Delta-sanctioned widening</b> of an existing column's scalar type is
+/// <b>applied</b> — the merged schema carries the wider type and a <c>delta.typeChanges</c> metadata entry so
+/// readers promote pre-widening files. Every other difference is either a no-op (returns <see langword="null"/>)
+/// or a rejection. This is fail-closed: no accepted write can leave the table in a state its own reader
+/// cannot read back.</para>
 ///
-/// <para><b>Type widening is fail-closed (deferred, #495).</b> Widening the <i>logical</i> schema
-/// (<c>int→long</c>, <c>float→double</c>, <c>date→timestamp</c>, growing a <c>decimal</c>) without also
-/// registering Delta's <c>typeWidening</c> table feature and its per-field widening metadata makes the
-/// table's existing Parquet files <b>unreadable even by DeltaSharp</b>:
-/// <c>ParquetFileReader.ValidateFileField</c> does an exact physical-type match, so an <c>Int32</c> file
-/// read under a widened <c>long</c> schema throws <c>SchemaMismatch</c>. So <b>no</b> type change is ever
-/// applied. The <see cref="IsPermittedWidening"/> classifier is retained only to produce a better error: a
-/// differing type pair that <i>would</i> be a lossless widening is rejected as
-/// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> (naming the deferred feature), and every
-/// other differing type as <see cref="DeltaSchemaMismatchKind.IncompatibleType"/>. (<c>date→timestamp</c> is
-/// likewise rejected: Delta only sanctions <c>date→timestamp_ntz</c>, which needs a not-yet-existing NTZ
-/// type — #495.)</para>
+/// <para><b>Type widening (Delta PROTOCOL.md "Type Widening").</b> The applied allowlist
+/// (<see cref="TypeWidening.IsSanctionedWidening"/>) is: integral <c>byte→short→int→long</c> (any wider
+/// rank), <c>float→double</c>, and <c>decimal(p,s)→decimal(p',s')</c> grow-only (integer-digit range and
+/// scale both non-decreasing). When the table does <b>not</b> enable type widening, such a change is rejected
+/// distinctly as <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> (naming the enablement
+/// requirement); every other differing type is <see cref="DeltaSchemaMismatchKind.IncompatibleType"/>.
+/// The <b>cross-family</b> sanctioned widenings (integral→<c>double</c>, integral→<c>decimal</c>) are DEFERRED
+/// (#535) — rejected distinctly as <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> (naming #535),
+/// never the generic <see cref="DeltaSchemaMismatchKind.IncompatibleType"/>, because they ARE Delta-sanctioned.
+/// <c>date→timestamp</c> is always rejected (as <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>):
+/// Delta only sanctions <c>date→timestamp_ntz</c>, which needs a not-yet-existing NTZ type. Widening inside an
+/// array element / map key/value is not applied (it would need a <c>fieldPath</c> and the Parquet read path
+/// does not read nested types) — it stays fail-closed.</para>
 ///
 /// <para><b>Compatibility rules (deterministic, total, case-sensitive; AC3).</b> Fields are matched
 /// <b>by name</b> (case-sensitive / ordinal, matching <see cref="StructType"/>), so column reordering is
 /// not a change. For each matched column and, recursively, each nested <c>struct</c> field,
 /// <c>array</c> element, and <c>map</c> key/value:</para>
 /// <list type="bullet">
-/// <item><b>Type.</b> Equal types are accepted unchanged. Any differing type is rejected —
-/// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> for a would-be lossless widening,
+/// <item><b>Type.</b> Equal types are accepted unchanged. A Delta-sanctioned widening of a scalar type is
+/// <b>applied</b> when the table enables type widening (else rejected as
+/// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>); any other differing type is rejected —
+/// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> for a would-be/deferred widening,
 /// <see cref="DeltaSchemaMismatchKind.IncompatibleType"/> for anything else. A differing <b>partition</b>
-/// column's type is rejected earlier and more clearly as
-/// <see cref="DeltaSchemaMismatchKind.PartitionColumnEvolutionUnsupported"/>.</item>
+/// column's type is rejected earlier and more clearly: a non-widening change as
+/// <see cref="DeltaSchemaMismatchKind.PartitionColumnEvolutionUnsupported"/>; a would-be Delta-sanctioned
+/// widening (which Delta allows without a rewrite — partition values are strings — but this build defers,
+/// #537) distinctly as <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>.</item>
 /// <item><b>Nullability.</b> The table's nullability is authoritative and never tightened: writing a
 /// non-null value into a nullable column is fine. Writing a nullable value into a required column — or
 /// relaxing a required column to nullable — is <b>always</b> rejected
@@ -74,25 +83,34 @@ internal static class DeltaSchemaEnforcer
     /// <summary>
     /// Validates <paramref name="writeSchema"/> against <paramref name="tableSchema"/> under
     /// <paramref name="mode"/>. Returns <see langword="null"/> when the write is compatible and requires no
-    /// schema change (the writer commits adds only), or the <b>merged</b> table schema when
-    /// <paramref name="mode"/> permitted an additive change (a new nullable column — the writer commits a
-    /// <c>metaData</c> carrying it in the same version as the adds). The merged schema never changes any
-    /// existing column's type. Throws before returning if the write is incompatible or needs a change
-    /// <paramref name="mode"/> does not allow.
+    /// schema change (the writer commits adds only), or the <b>merged</b> table schema when an additive
+    /// change was permitted (a new nullable column under <paramref name="mode"/>) or the table enables type
+    /// widening and a Delta-sanctioned widening of an existing column was applied — the writer commits a
+    /// <c>metaData</c> carrying the merged schema in the same version as the adds. Throws before returning if
+    /// the write is incompatible or needs a change <paramref name="mode"/> does not allow.
     /// </summary>
     /// <param name="tableSchema">The table's current schema.</param>
     /// <param name="writeSchema">The incoming write's schema.</param>
     /// <param name="mode">Which additive evolution (if any) is permitted.</param>
     /// <param name="partitionColumns">The table's partition columns (top-level names). A differing partition
-    /// column type is rejected with a clear <see cref="DeltaSchemaMismatchKind.PartitionColumnEvolutionUnsupported"/>
-    /// reason. May be <see langword="null"/>/empty for an unpartitioned table.</param>
+    /// column type is rejected: a non-widening change with a clear
+    /// <see cref="DeltaSchemaMismatchKind.PartitionColumnEvolutionUnsupported"/> reason, a would-be
+    /// Delta-sanctioned widening (deferred #537) distinctly as
+    /// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>. May be <see langword="null"/>/empty for
+    /// an unpartitioned table.</param>
+    /// <param name="typeWideningEnabled">Whether the table enables applying Delta-sanctioned type widenings
+    /// (the <c>typeWidening</c> table feature is present AND <c>delta.enableTypeWidening</c> is set — see
+    /// <see cref="TypeWideningFeature.IsWriteEnabled"/>). When <see langword="false"/> a would-be widening is
+    /// rejected as <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>; when <see langword="true"/>
+    /// a sanctioned scalar widening is applied and recorded in the field's <c>delta.typeChanges</c> metadata.</param>
     /// <exception cref="DeltaSchemaMismatchException">The write is incompatible with the table schema, or
     /// requires a schema change not permitted by <paramref name="mode"/>.</exception>
     public static StructType? Reconcile(
         StructType tableSchema,
         StructType writeSchema,
         SchemaEvolutionMode mode,
-        IReadOnlyCollection<string>? partitionColumns = null)
+        IReadOnlyCollection<string>? partitionColumns = null,
+        bool typeWideningEnabled = false)
     {
         ArgumentNullException.ThrowIfNull(tableSchema);
         ArgumentNullException.ThrowIfNull(writeSchema);
@@ -101,7 +119,7 @@ internal static class DeltaSchemaEnforcer
             ? new HashSet<string>(partitionColumns, StringComparer.Ordinal)
             : null;
 
-        StructType merged = MergeStruct(tableSchema, writeSchema, mode, parentPath: null, partitions);
+        StructType merged = MergeStruct(tableSchema, writeSchema, mode, parentPath: null, partitions, typeWideningEnabled);
 
         // Value-equality: reordering columns or omitting nullable ones yields a schema equal to the table's,
         // so no metadata change is emitted. Only a genuine additive change returns a non-null merged schema.
@@ -113,7 +131,8 @@ internal static class DeltaSchemaEnforcer
         StructType writeStruct,
         SchemaEvolutionMode mode,
         string? parentPath,
-        IReadOnlySet<string>? partitionColumns)
+        IReadOnlySet<string>? partitionColumns,
+        bool typeWideningEnabled)
     {
         var mergedFields = new List<StructField>(tableStruct.Count);
 
@@ -123,18 +142,38 @@ internal static class DeltaSchemaEnforcer
             string path = Combine(parentPath, tableField.Name);
             if (writeStruct.TryGetField(tableField.Name, out StructField writeField))
             {
-                // A partition column's type cannot be evolved (it is encoded in the table layout). Reject a
-                // differing type here, before the generic type classification, for a clearer reason. Partition
-                // columns are top-level, so this only applies at parentPath == null.
+                // A partition column's type change is rejected here, before the generic type classification,
+                // for a clearer reason. ANY Delta-sanctioned widening of a partition column is rewrite-FREE
+                // (partition values are stored as strings in the log / directory names, so no data file is
+                // rewritten — verified vs Delta's golden TypeWideningAlterTableSuite), across all three
+                // sanctioned families:
+                //   - intra-family                (IsSanctionedWidening:          byte→…→long, float→double, grow-only decimal)
+                //   - cross-family integral→float/decimal (IsDeferredCrossFamilyWidening, #535)
+                //   - date→timestamp_ntz          (IsDeferredWidening,             #533)
+                // This build DEFERS partition-column widening (#537), so every one of them is rejected
+                // fail-closed but classified DISTINCTLY (TypeWideningUnsupported) with an HONEST message —
+                // never the factually-wrong "requires a full table rewrite" reason. The classification does
+                // NOT depend on typeWideningEnabled: whether or not the feature is enabled, the change is a
+                // rewrite-free widening this build defers, so "requires a rewrite" would be a lie in every
+                // case (a disabled feature is a feature-enablement gap, not a layout rewrite). Only a
+                // genuinely NON-widening partition-column type change (e.g. int→string, or a narrowing) keeps
+                // the PartitionColumnEvolutionUnsupported classification. Partition columns are top-level, so
+                // this only applies at parentPath == null.
                 if (partitionColumns is not null
                     && partitionColumns.Contains(tableField.Name)
                     && !tableField.DataType.Equals(writeField.DataType))
                 {
+                    if (TypeWidening.IsAnySanctionedWidening(tableField.DataType, writeField.DataType))
+                    {
+                        throw DeltaSchemaMismatchException.PartitionColumnWideningDeferred(
+                            path, tableField.DataType.SimpleString, writeField.DataType.SimpleString);
+                    }
+
                     throw DeltaSchemaMismatchException.PartitionColumnEvolution(
                         path, tableField.DataType.SimpleString, writeField.DataType.SimpleString);
                 }
 
-                mergedFields.Add(MergeField(tableField, writeField, mode, path));
+                mergedFields.Add(MergeField(tableField, writeField, mode, path, typeWideningEnabled));
             }
             else
             {
@@ -178,7 +217,7 @@ internal static class DeltaSchemaEnforcer
     }
 
     private static StructField MergeField(
-        StructField tableField, StructField writeField, SchemaEvolutionMode mode, string path)
+        StructField tableField, StructField writeField, SchemaEvolutionMode mode, string path, bool typeWideningEnabled)
     {
         // Nullability: the table's constraint is authoritative and never tightened or relaxed by a write.
         // A nullable write into a required table column would carry null into a column that forbids it.
@@ -187,15 +226,35 @@ internal static class DeltaSchemaEnforcer
             throw DeltaSchemaMismatchException.NullabilityViolation(path);
         }
 
-        DataType mergedType = MergeType(tableField.DataType, writeField.DataType, mode, path);
+        DataType mergedType = MergeType(
+            tableField.DataType, writeField.DataType, mode, path, typeWideningEnabled, allowWidenApply: true);
 
-        // Preserve the table field's declared nullability and metadata (field metadata is not evolved here).
-        return tableField.DataType.Equals(mergedType)
-            ? tableField
-            : new StructField(tableField.Name, mergedType, tableField.Nullable, tableField.Metadata);
+        if (tableField.DataType.Equals(mergedType))
+        {
+            // No type change: preserve the table field (declared nullability + metadata) exactly.
+            return tableField;
+        }
+
+        // The type changed. A change at THIS field's own scalar type is an applied type widening (§2.12.2):
+        // record it in the field's `delta.typeChanges` metadata (Delta PROTOCOL.md "Type Change Metadata") so
+        // readers promote pre-widening files. A non-scalar change (a nested struct field widening) attaches
+        // its `delta.typeChanges` to the inner StructField via recursion, not here.
+        FieldMetadata metadata = tableField.Metadata;
+        if (IsScalar(tableField.DataType) && IsScalar(mergedType))
+        {
+            metadata = AppendTypeChange(metadata, tableField.DataType, mergedType);
+        }
+
+        return new StructField(tableField.Name, mergedType, tableField.Nullable, metadata);
     }
 
-    private static DataType MergeType(DataType tableType, DataType writeType, SchemaEvolutionMode mode, string path)
+    private static DataType MergeType(
+        DataType tableType,
+        DataType writeType,
+        SchemaEvolutionMode mode,
+        string path,
+        bool typeWideningEnabled,
+        bool allowWidenApply)
     {
         if (tableType.Equals(writeType))
         {
@@ -205,8 +264,9 @@ internal static class DeltaSchemaEnforcer
         switch (tableType, writeType)
         {
             case (StructType tableStruct, StructType writeStruct):
-                // Nested structs recurse; partition columns are only top-level, so pass none here.
-                return MergeStruct(tableStruct, writeStruct, mode, path, partitionColumns: null);
+                // Nested structs recurse; partition columns are only top-level, so pass none here. Each inner
+                // field re-enters MergeField, which re-enables applied widening for its own scalar type.
+                return MergeStruct(tableStruct, writeStruct, mode, path, partitionColumns: null, typeWideningEnabled);
 
             case (ArrayType tableArray, ArrayType writeArray):
                 if (!tableArray.ContainsNull && writeArray.ContainsNull)
@@ -214,25 +274,50 @@ internal static class DeltaSchemaEnforcer
                     throw DeltaSchemaMismatchException.NullabilityViolation(path + ".element");
                 }
 
-                DataType mergedElement = MergeType(tableArray.ElementType, writeArray.ElementType, mode, path + ".element");
+                // A widening of an array element / map key/value is NOT applied here: its `delta.typeChanges`
+                // would need a `fieldPath` on the enclosing StructField, and the Parquet read path does not
+                // read nested types at all — so nested-collection widening stays fail-closed (allowWidenApply
+                // is false, so a differing element scalar is classified/rejected, never silently applied).
+                DataType mergedElement = MergeType(
+                    tableArray.ElementType, writeArray.ElementType, mode, path + ".element",
+                    typeWideningEnabled, allowWidenApply: false);
                 return new ArrayType(mergedElement, tableArray.ContainsNull);
 
             case (MapType tableMap, MapType writeMap):
-                DataType mergedKey = MergeType(tableMap.KeyType, writeMap.KeyType, mode, path + ".key");
+                DataType mergedKey = MergeType(
+                    tableMap.KeyType, writeMap.KeyType, mode, path + ".key", typeWideningEnabled, allowWidenApply: false);
                 if (!tableMap.ValueContainsNull && writeMap.ValueContainsNull)
                 {
                     throw DeltaSchemaMismatchException.NullabilityViolation(path + ".value");
                 }
 
-                DataType mergedValue = MergeType(tableMap.ValueType, writeMap.ValueType, mode, path + ".value");
+                DataType mergedValue = MergeType(
+                    tableMap.ValueType, writeMap.ValueType, mode, path + ".value", typeWideningEnabled, allowWidenApply: false);
                 return new MapType(mergedKey, mergedValue, tableMap.ValueContainsNull);
 
             default:
-                // No type change is ever applied (fail-closed). Classify the rejection so the caller learns
-                // whether the change would have been a lossless widening (deferred, #495) or is outright
-                // incompatible. Delta never silently downcasts, and DeltaSharp never widens the logical schema
-                // out from under its own reader.
-                if (IsPermittedWidening(tableType, writeType))
+                // A differing scalar type. APPLY the change only when it is a Delta-sanctioned widening AND
+                // the table has type widening enabled (feature + `delta.enableTypeWidening`) AND we are at a
+                // promotable position (a StructField's own scalar, not an array/map element). Otherwise
+                // classify the rejection: a would-be sanctioned/deferred widening surfaces distinctly as
+                // TypeWideningUnsupported; anything else (a narrowing or unrelated type) as IncompatibleType.
+                if (allowWidenApply && typeWideningEnabled && TypeWidening.IsSanctionedWidening(tableType, writeType))
+                {
+                    return writeType;
+                }
+
+                // Cross-family sanctioned widenings (integral→double, integral→decimal) are DEFERRED (#535)
+                // even when enabled — surfaced distinctly (TypeWideningUnsupported, naming #535) rather than
+                // as the generic IncompatibleType a truly-unrelated change (string→int) gets, because they
+                // ARE Delta-sanctioned, just not applied yet. Independent of enablement.
+                if (TypeWidening.IsDeferredCrossFamilyWidening(tableType, writeType))
+                {
+                    throw DeltaSchemaMismatchException.TypeWideningCrossFamilyDeferred(
+                        path, tableType.SimpleString, writeType.SimpleString);
+                }
+
+                if (TypeWidening.IsSanctionedWidening(tableType, writeType)
+                    || TypeWidening.IsDeferredWidening(tableType, writeType))
                 {
                     throw DeltaSchemaMismatchException.TypeWideningUnsupported(
                         path, tableType.SimpleString, writeType.SimpleString);
@@ -262,55 +347,46 @@ internal static class DeltaSchemaEnforcer
         }
     }
 
-    /// <summary>
-    /// Whether <paramref name="writeType"/> is a strictly wider, lossless widening of <paramref name="tableType"/>
-    /// from the recognized atomic/decimal set. Retained <b>only</b> to classify a rejection as
-    /// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> (deferred, #495) versus
-    /// <see cref="DeltaSchemaMismatchKind.IncompatibleType"/> — no widening is ever applied. Deliberately
-    /// stricter than <see cref="TypeCoercion"/>'s generic common-type search: only these total, unambiguous
-    /// cases count, so a lossy promotion (e.g. <c>long→double</c>) is not treated as a would-be widening.
-    /// </summary>
-    private static bool IsPermittedWidening(DataType tableType, DataType writeType)
+    /// <summary>The metadata key recording a field's applied type-change history (Delta PROTOCOL.md "Type
+    /// Change Metadata"). The value is a JSON list of <c>{ "fromType", "toType" }</c> objects, oldest first.</summary>
+    private const string TypeChangesKey = "delta.typeChanges";
+
+    private static bool IsScalar(DataType type) => type is AtomicType or DecimalType;
+
+    // Appends a `{ "fromType": <old>, "toType": <new> }` entry to the field's `delta.typeChanges` metadata,
+    // preserving any earlier changes (Delta requires the full history, oldest first — see the two-change
+    // example in PROTOCOL.md). The type names are the Delta-log type strings (DataType.TypeName), matching
+    // what SchemaJson serializes for the field's own type. `fieldPath` is omitted: this build only applies a
+    // widening to a StructField's own scalar type (never a map key/value or array element), which per the
+    // protocol carries no `fieldPath`.
+    private static FieldMetadata AppendTypeChange(FieldMetadata existing, DataType fromType, DataType toType)
     {
-        // Integral widening: byte → short → int → long.
-        int tableRank = IntegralRank(tableType);
-        int writeRank = IntegralRank(writeType);
-        if (tableRank >= 0 && writeRank >= 0)
+        MetadataValue change = MetadataValue.Nested(FieldMetadata.FromEntries(new[]
         {
-            return writeRank > tableRank;
+            new KeyValuePair<string, string>("fromType", fromType.TypeName),
+            new KeyValuePair<string, string>("toType", toType.TypeName),
+        }));
+
+        var changes = new List<MetadataValue>();
+        if (existing.TryGetValue(TypeChangesKey, out MetadataValue? current) && current.TryGetArray(out var prior))
+        {
+            changes.AddRange(prior);
         }
 
-        // float → double.
-        if (tableType is FloatType && writeType is DoubleType)
+        changes.Add(change);
+
+        var entries = new List<KeyValuePair<string, MetadataValue>>(existing.Count + 1);
+        foreach (KeyValuePair<string, MetadataValue> entry in existing)
         {
-            return true;
+            if (!string.Equals(entry.Key, TypeChangesKey, StringComparison.Ordinal))
+            {
+                entries.Add(entry);
+            }
         }
 
-        // date → timestamp.
-        if (tableType is DateType && writeType is TimestampType)
-        {
-            return true;
-        }
-
-        // decimal(p,s) → decimal(p',s') when both the integer-digit range and the scale grow (or one grows
-        // and the other is unchanged), so every representable value is preserved with no rounding.
-        if (tableType is DecimalType from && writeType is DecimalType to)
-        {
-            return to.Scale >= from.Scale
-                && (to.Precision - to.Scale) >= (from.Precision - from.Scale);
-        }
-
-        return false;
+        entries.Add(new KeyValuePair<string, MetadataValue>(TypeChangesKey, MetadataValue.Array(changes)));
+        return FieldMetadata.FromValues(entries);
     }
-
-    private static int IntegralRank(DataType type) => type switch
-    {
-        ByteType => 0,
-        ShortType => 1,
-        IntegerType => 2,
-        LongType => 3,
-        _ => -1,
-    };
 
     private static string Combine(string? parentPath, string name) =>
         parentPath is null ? name : parentPath + "." + name;

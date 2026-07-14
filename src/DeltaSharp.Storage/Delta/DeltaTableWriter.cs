@@ -150,7 +150,10 @@ internal sealed class DeltaTableWriter
     /// here, so the table is left completely unchanged (reject-before-commit). When
     /// <paramref name="evolutionMode"/> allows an additive change (a new nullable column) the merged schema
     /// is committed as a <c>metaData</c> action in the <b>same</b> version as the new adds (atomic
-    /// evolution). No existing column's type is ever changed — type widening is fail-closed (#495). Commits
+    /// evolution). An existing column's type is changed only by an <b>applied Delta-sanctioned type widening</b>
+    /// (#495) — and only when the table enables it (the <c>typeWidening</c> table feature is present AND
+    /// <c>delta.enableTypeWidening=true</c>); otherwise a would-be widening stays fail-closed
+    /// (<see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>). Commits
     /// under <see cref="DeltaReadScope.BlindAppend"/>; an evolution append additionally carries metadata, so
     /// any concurrent commit aborts it (a schema change needs a fresh snapshot — AC4).
     /// </summary>
@@ -690,8 +693,15 @@ internal sealed class DeltaTableWriter
         IReadOnlyCollection<string>? partitionColumns = readSnapshot.Metadata.PartitionColumns.IsDefaultOrEmpty
             ? null
             : readSnapshot.Metadata.PartitionColumns;
+
+        // Type widening is applied only when the table has enabled it: the `typeWidening` table feature is in
+        // the protocol AND `delta.enableTypeWidening` is set (Delta PROTOCOL.md "Type Widening"). Otherwise a
+        // would-be widening stays fail-closed (TypeWideningUnsupported). This build enables type widening at
+        // table-create time (mirroring column mapping / deletion vectors) and never silently upgrades an
+        // unprepared table's protocol on a widening write.
+        bool typeWideningEnabled = TypeWideningFeature.IsWriteEnabled(readSnapshot);
         StructType? mergedSchema = DeltaSchemaEnforcer.Reconcile(
-            readSnapshot.Schema, writeSchema, evolutionMode, partitionColumns);
+            readSnapshot.Schema, writeSchema, evolutionMode, partitionColumns, typeWideningEnabled);
         return mergedSchema is null
             ? null
             : readSnapshot.Metadata with { SchemaString = SchemaJson.ToJson(mergedSchema) };

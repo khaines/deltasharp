@@ -85,14 +85,16 @@ public sealed class ParquetSchemaMappingTests
     }
 
     [Fact]
-    public async Task ReadWithWrongPhysicalType_ThrowsSchemaMismatch()
+    public async Task ReadWithNarrowingPhysicalType_ThrowsSchemaMismatch()
     {
-        // File has an INT32 column; requesting it as LONG is a physical-type disagreement.
-        var writeSchema = new StructType(new[] { new StructField("v", DataTypes.IntegerType, nullable: false) });
+        // File has a LONG column; requesting it as INT is a NARROWING physical-type disagreement (not a
+        // sanctioned widening), so it stays fail-closed. (The reverse — an INT32 file read as LONG — is a
+        // sanctioned type-widening promotion and is covered by the promotion tests, #495.)
+        var writeSchema = new StructType(new[] { new StructField("v", DataTypes.LongType, nullable: false) });
         ColumnBatch batch = TestData.RandomBatch(writeSchema, rowCount: 4, _random);
         byte[] file = await ParquetTestHelpers.WriteToBytesAsync(writeSchema, new[] { batch });
 
-        var readSchema = new StructType(new[] { new StructField("v", DataTypes.LongType, nullable: false) });
+        var readSchema = new StructType(new[] { new StructField("v", DataTypes.IntegerType, nullable: false) });
         DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
             () => ParquetTestHelpers.ReadAllAsync(file, readSchema));
         Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);

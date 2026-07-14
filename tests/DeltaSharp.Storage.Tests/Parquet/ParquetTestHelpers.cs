@@ -30,12 +30,13 @@ internal static class ParquetTestHelpers
     public static async Task<List<ColumnBatch>> ReadAllAsync(
         byte[] bytes,
         StructType readSchema,
-        ParquetFileReader.RowGroupPredicate? keepRowGroup = null)
+        ParquetFileReader.RowGroupPredicate? keepRowGroup = null,
+        bool allowTypeWideningPromotion = false)
     {
         using var stream = new MemoryStream(bytes, writable: false);
         var batches = new List<ColumnBatch>();
         await foreach (ColumnBatch batch in new ParquetFileReader().ReadAsync(
-            stream, readSchema, keepRowGroup, nullFillMissingColumns: false, CancellationToken.None))
+            stream, readSchema, keepRowGroup, nullFillMissingColumns: false, allowTypeWideningPromotion, CancellationToken.None))
         {
             batches.Add(batch);
         }

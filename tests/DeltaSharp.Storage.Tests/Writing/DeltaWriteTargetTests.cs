@@ -435,7 +435,7 @@ public sealed class DeltaWriteTargetTests : IDisposable
                 Stream stream = await backend.OpenReadAsync(add.Path, CancellationToken.None);
                 await using (stream)
                 {
-                    await foreach (ColumnBatch batch in reader.ReadAsync(stream, DataSchema, null, nullFillMissingColumns: false, CancellationToken.None))
+                    await foreach (ColumnBatch batch in reader.ReadAsync(stream, DataSchema, null, nullFillMissingColumns: false, allowTypeWideningPromotion: false, CancellationToken.None))
                     {
                         ColumnVector id = batch.SelectedColumn(0);
                         ColumnVector name = batch.SelectedColumn(1);
@@ -469,7 +469,7 @@ public sealed class DeltaWriteTargetTests : IDisposable
                 Stream stream = await backend.OpenReadAsync(add.Path, CancellationToken.None);
                 await using (stream)
                 {
-                    await foreach (ColumnBatch batch in reader.ReadAsync(stream, FlatSchema, null, nullFillMissingColumns: false, CancellationToken.None))
+                    await foreach (ColumnBatch batch in reader.ReadAsync(stream, FlatSchema, null, nullFillMissingColumns: false, allowTypeWideningPromotion: false, CancellationToken.None))
                     {
                         ColumnVector id = batch.SelectedColumn(0);
                         ColumnVector name = batch.SelectedColumn(1);

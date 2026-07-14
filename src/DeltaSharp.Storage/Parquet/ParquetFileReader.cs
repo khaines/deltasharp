@@ -1,6 +1,7 @@
 using System.Runtime.CompilerServices;
 using System.Text;
 using DeltaSharp.Engine.Columnar;
+using DeltaSharp.Storage.Delta;
 using DeltaSharp.Types;
 using Parquet;
 using Parquet.Data;
@@ -91,6 +92,17 @@ internal sealed class ParquetFileReader
     /// <see cref="StorageErrorKind.SchemaMismatch"/>. When <see langword="false"/> (the default for the
     /// general reader), an absent column of any nullability fails closed, preserving the reader's strict
     /// projection contract for callers that must not silently null-fill.</param>
+    /// <param name="allowTypeWideningPromotion">When <see langword="true"/>, a <paramref name="requested"/>
+    /// column whose physical (file) type is a NARROWER Delta-sanctioned widening of the requested type is
+    /// PROMOTED into the requested wide type on read (Delta PROTOCOL.md "Reader Requirements for Type
+    /// Widening", #495). When <see langword="false"/> (the strict default), a narrower physical type is NOT
+    /// promotable — the exact physical/engine type mismatch fails closed as
+    /// <see cref="StorageErrorKind.SchemaMismatch"/>. This gate is the READ-side counterpart to the write-side
+    /// enablement check: only a caller that KNOWS the table declares the <c>typeWidening</c> feature in its
+    /// snapshot protocol may pass <see langword="true"/>, so a tampered/malformed external log (a wide schema
+    /// over narrow files with NO <c>typeWidening</c> feature) fails closed rather than being silently
+    /// "repaired". Promotion trusts this caller-supplied gate: the scan layer knows the protocol, the
+    /// stream-level reader does not.</param>
     /// <param name="cancellationToken">Cancels the read.</param>
     /// <exception cref="ArgumentNullException">An argument is null.</exception>
     /// <exception cref="DeltaStorageException">A requested column type is unsupported
@@ -104,6 +116,7 @@ internal sealed class ParquetFileReader
         StructType requested,
         RowGroupPredicate? keepRowGroup,
         bool nullFillMissingColumns,
+        bool allowTypeWideningPromotion,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(input);
@@ -122,12 +135,12 @@ internal sealed class ParquetFileReader
             // Structural validation happens here (footer read at open) — schema/type mismatches fail
             // before any batch is yielded (H3). A null slot marks a requested column absent from the file
             // that will be null-filled (nullFillMissingColumns; #497).
-            DataField?[] fileFields = ResolveFileFields(reader.Schema, requested, nullFillMissingColumns);
+            DataField?[] fileFields = ResolveFileFields(reader.Schema, requested, nullFillMissingColumns, allowTypeWideningPromotion);
             for (int group = 0; group < reader.RowGroupCount; group++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 ColumnBatch? batch = await ReadRowGroupAsync(
-                    reader, group, requested, fileFields, keepRowGroup, _limits, cancellationToken)
+                    reader, group, requested, fileFields, keepRowGroup, _limits, allowTypeWideningPromotion, cancellationToken)
                     .ConfigureAwait(false);
                 if (batch is not null)
                 {
@@ -359,6 +372,11 @@ internal sealed class ParquetFileReader
                 new ColumnChunkFootprint(
                     compressed,
                     uncompressed,
+                    // For a type-widening promotion (#495) the file column is physically NARROWER than the
+                    // requested (wide) type, yet the reader materializes the WIDE vector (ColumnVectors.Create
+                    // over the requested type) — so the requested width is the dominant eager allocation and a
+                    // safe (never under-counting) bound. The physical narrow read buffer is smaller and
+                    // additive; the requested width upper-bounds the transient either way.
                     AllocatedElementByteWidth(requested[c].DataType, fileField.IsNullable)));
         }
 
@@ -409,7 +427,7 @@ internal sealed class ParquetFileReader
     // on (#513). A PRESENT column with a disagreeing physical type/nullability is still rejected by
     // ValidateFileField as a distinct SchemaMismatch (never silently coerced or null-filled).
     private static DataField?[] ResolveFileFields(
-        ParquetSchema fileSchema, StructType requested, bool nullFillMissingColumns)
+        ParquetSchema fileSchema, StructType requested, bool nullFillMissingColumns, bool allowTypeWideningPromotion)
     {
         var byName = new Dictionary<string, DataField>(StringComparer.Ordinal);
         foreach (DataField field in fileSchema.DataFields)
@@ -436,7 +454,7 @@ internal sealed class ParquetFileReader
                     $"Requested column '{name}' is not present in the Parquet file schema.");
             }
 
-            ValidateFileField(field, requestedField);
+            ValidateFileField(field, requestedField, allowTypeWideningPromotion);
             resolved[c] = field;
         }
 
@@ -447,11 +465,34 @@ internal sealed class ParquetFileReader
     // precision/scale, and nullability against the requested engine type. A mismatch is a DISTINCT
     // SchemaMismatch error (not a generic "malformed" one), so a schema-evolution/type surprise is
     // never silently coerced or masked as corruption.
-    private static void ValidateFileField(DataField fileField, StructField requestedField)
+    //
+    // Type-widening promotion (Delta PROTOCOL.md "Reader Requirements for Type Widening", #495): an OLDER
+    // file physically stores a NARROWER type than the current (widened) requested type — e.g. an Int32 file
+    // read under a widened `long` schema, or a decimal(6,2) file under a widened decimal(10,4) schema. When
+    // the file's physical type is a Delta-SANCTIONED widening OF the requested type
+    // (TypeWidening.IsSanctionedWidening) AND the caller opened this promotion gate
+    // (allowTypeWideningPromotion — the scan layer proved the table's protocol declares the `typeWidening`
+    // feature; the stream-level reader cannot see the protocol, so it TRUSTS this flag), accept it: the read
+    // path (ReadColumnAsync/ReadPromotedColumnAsync) reads the narrow physical values and PROMOTES them into
+    // the requested wide vector. When the gate is closed (allowTypeWideningPromotion == false) a narrower
+    // physical type is NOT promotable — the exact-type mismatch below fires and the read fails closed
+    // (SchemaMismatch), so a tampered/malformed log (wide schema, narrow files, no `typeWidening` feature) is
+    // never silently "repaired". Any OTHER physical divergence (a narrowing on read, an unrelated type) is
+    // still rejected fail-closed.
+    private static void ValidateFileField(DataField fileField, StructField requestedField, bool allowTypeWideningPromotion)
     {
         DataField expected = ParquetTypeMapping.CreateField(requestedField);
 
-        if (fileField.ClrType != expected.ClrType)
+        // Read-side promotion gate: a narrower physical type that is a sanctioned widening of the request is
+        // accepted (the values are widened on read) ONLY when the caller opened the promotion gate. This is
+        // lossless and matches what the writer recorded in `delta.typeChanges`. Nullability is still checked
+        // below against the physical column.
+        bool promotable = allowTypeWideningPromotion
+            && ParquetTypeMapping.TryToDataType(fileField, out DataType? physicalType)
+            && !physicalType.Equals(requestedField.DataType)
+            && TypeWidening.IsSanctionedWidening(physicalType, requestedField.DataType);
+
+        if (!promotable && fileField.ClrType != expected.ClrType)
         {
             throw DeltaStorageException.SchemaMismatch(
                 $"Column '{requestedField.Name}': file physical type '{fileField.ClrType.Name}' does not "
@@ -469,6 +510,14 @@ internal sealed class ParquetFileReader
             throw DeltaStorageException.SchemaMismatch(
                 $"Column '{requestedField.Name}': the file column is nullable but the requested engine "
                 + "type is non-nullable.");
+        }
+
+        // A promoted (narrower physical) column has already been validated as a sanctioned widening; its
+        // physical decimal/temporal annotation legitimately differs from the requested wide type, so skip the
+        // exact annotation cross-checks below (which assume physical == requested).
+        if (promotable)
+        {
+            return;
         }
 
         switch (requestedField.DataType)
@@ -518,6 +567,7 @@ internal sealed class ParquetFileReader
         DataField?[] fileFields,
         RowGroupPredicate? keepRowGroup,
         ParquetDecodeLimits limits,
+        bool allowTypeWideningPromotion,
         CancellationToken cancellationToken)
     {
         using ParquetRowGroupReader rowGroup = reader.OpenRowGroupReader(group);
@@ -556,7 +606,7 @@ internal sealed class ParquetFileReader
                 MutableColumnVector vector = ColumnVectors.Create(requested[c].DataType, Math.Max(rowCount, 1));
                 if (fileFields[c] is { } fileField)
                 {
-                    await ReadColumnAsync(rowGroup, fileField, requested[c], vector, rowCount, cancellationToken)
+                    await ReadColumnAsync(rowGroup, fileField, requested[c], vector, rowCount, allowTypeWideningPromotion, cancellationToken)
                         .ConfigureAwait(false);
                 }
                 else
@@ -592,8 +642,25 @@ internal sealed class ParquetFileReader
         StructField requestedField,
         MutableColumnVector vector,
         int rowCount,
+        bool allowTypeWideningPromotion,
         CancellationToken cancellationToken)
     {
+        // Type-widening promotion (#495): when the file column's physical type is a NARROWER sanctioned
+        // widening of the requested type, read the file's physical values and widen them into the requested
+        // (wide) vector. ValidateFileField has already proven this is a sanctioned widening AND that the
+        // caller opened the promotion gate; here we re-check the gate before dispatching the physical read +
+        // upcast (defense-in-depth — with the gate closed a mismatched field never reaches here). A physical
+        // type equal to the request takes the normal path below.
+        if (allowTypeWideningPromotion
+            && ParquetTypeMapping.TryToDataType(fileField, out DataType? physicalType)
+            && !physicalType.Equals(requestedField.DataType))
+        {
+            await ReadPromotedColumnAsync(
+                rowGroup, fileField, physicalType, requestedField, vector, rowCount, cancellationToken)
+                .ConfigureAwait(false);
+            return;
+        }
+
         switch (requestedField.DataType)
         {
             case BooleanType:
@@ -653,6 +720,70 @@ internal sealed class ParquetFileReader
                 throw DeltaStorageException.UnsupportedFeature(
                     $"Parquet read for column '{requestedField.Name}' of type "
                     + $"'{requestedField.DataType.SimpleString}' is not supported.");
+        }
+    }
+
+    // Type-widening read promotion (#495 / Delta PROTOCOL.md "Reader Requirements for Type Widening"): reads
+    // the file's NARROW physical values and widens each into the requested WIDE vector. The dispatch is by
+    // (physical, requested) — ValidateFileField already proved the pair is a sanctioned widening, so every
+    // arm here is a lossless upcast: an integral sign-extend (byte/short/int → wider integral), float→double,
+    // or a decimal rescale (ReadDecimalAsync reads at the file's precision/scale and AppendDecimal rescales to
+    // the requested grow-only decimal). Every append targets the requested vector's storage width (short/int/
+    // long/double), and each lambda is `static` (non-capturing) so no per-column-chunk delegate is allocated.
+    private static Task ReadPromotedColumnAsync(
+        ParquetRowGroupReader rowGroup,
+        DataField fileField,
+        DataType physicalType,
+        StructField requestedField,
+        MutableColumnVector vector,
+        int rowCount,
+        CancellationToken cancellationToken)
+    {
+        // decimal(p,s) → decimal(p',s') grow-only: read at the file's scale, rescale to the requested type.
+        if (requestedField.DataType is DecimalType requestedDecimal)
+        {
+            return ReadDecimalAsync(rowGroup, fileField, vector, rowCount, requestedDecimal, cancellationToken);
+        }
+
+        // float → double.
+        if (physicalType is FloatType && requestedField.DataType is DoubleType)
+        {
+            return ReadValueAsync<float>(rowGroup, fileField, vector, rowCount,
+                static (v, value) => v.AppendValue((double)value), cancellationToken);
+        }
+
+        // Integral widening: byte(sbyte) → short → int → long. The requested vector's storage width is the
+        // target of the upcast; the file's physical width is the read buffer's element type.
+        switch (requestedField.DataType)
+        {
+            case ShortType:
+                // Only byte → short reaches here (a sanctioned narrower integral).
+                return ReadValueAsync<sbyte>(rowGroup, fileField, vector, rowCount,
+                    static (v, value) => v.AppendValue((short)value), cancellationToken);
+
+            case IntegerType:
+                return physicalType is ByteType
+                    ? ReadValueAsync<sbyte>(rowGroup, fileField, vector, rowCount,
+                        static (v, value) => v.AppendValue((int)value), cancellationToken)
+                    : ReadValueAsync<short>(rowGroup, fileField, vector, rowCount,
+                        static (v, value) => v.AppendValue((int)value), cancellationToken);
+
+            case LongType:
+                return physicalType switch
+                {
+                    ByteType => ReadValueAsync<sbyte>(rowGroup, fileField, vector, rowCount,
+                        static (v, value) => v.AppendValue((long)value), cancellationToken),
+                    ShortType => ReadValueAsync<short>(rowGroup, fileField, vector, rowCount,
+                        static (v, value) => v.AppendValue((long)value), cancellationToken),
+                    _ => ReadValueAsync<int>(rowGroup, fileField, vector, rowCount,
+                        static (v, value) => v.AppendValue((long)value), cancellationToken),
+                };
+
+            default:
+                // Unreachable: ValidateFileField only admits the sanctioned widenings handled above.
+                throw DeltaStorageException.SchemaMismatch(
+                    $"Column '{requestedField.Name}': cannot promote physical type "
+                    + $"'{physicalType.SimpleString}' to requested '{requestedField.DataType.SimpleString}'.");
         }
     }
 
