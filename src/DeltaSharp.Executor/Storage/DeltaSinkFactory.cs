@@ -54,6 +54,10 @@ internal sealed class DeltaLocalSink : ILocalSink
     private const string PartitionOverwriteModeOption = "partitionOverwriteMode";
     private const string PartitionOverwriteModeConf = "spark.sql.sources.partitionOverwriteMode";
 
+    // Spark's DataFrameWriter option enabling a destructive schema replacement on overwrite (#496): a full
+    // (Static) overwrite with overwriteSchema=true replaces the table schema wholesale.
+    private const string OverwriteSchemaOption = "overwriteSchema";
+
     private readonly SinkDescriptor _descriptor;
     private readonly StructType _schema;
 
@@ -90,7 +94,8 @@ internal sealed class DeltaLocalSink : ILocalSink
 
             case SaveMode.Overwrite:
                 return target
-                    .OverwriteAsync(schema, partitionColumns, batches, ResolvePartitionOverwriteMode())
+                    .OverwriteAsync(
+                        schema, partitionColumns, batches, ResolvePartitionOverwriteMode(), ResolveOverwriteSchema())
                     .GetAwaiter().GetResult().RowsWritten;
 
             case SaveMode.Ignore:
@@ -165,6 +170,25 @@ internal sealed class DeltaLocalSink : ILocalSink
             _ => throw new InvalidOperationException(
                 $"Unsupported '{PartitionOverwriteModeOption}' value '{value}'. DeltaSharp recognizes "
                 + "'static' and 'dynamic'."),
+        };
+    }
+
+    // Resolves the connector `overwriteSchema` write option (#496). Absent/empty/false ⇒ additive enforcement
+    // (the default); true ⇒ a full (Static) overwrite replaces the table schema wholesale. Combined with a
+    // dynamic partition overwrite it is rejected downstream by the write-door (fail-closed).
+    private bool ResolveOverwriteSchema()
+    {
+        if (!_descriptor.Options.TryGetValue(OverwriteSchemaOption, out string? value))
+        {
+            return false;
+        }
+
+        return value?.Trim().ToLowerInvariant() switch
+        {
+            null or "" or "false" => false,
+            "true" => true,
+            _ => throw new InvalidOperationException(
+                $"Unsupported '{OverwriteSchemaOption}' value '{value}'. DeltaSharp recognizes 'true' and 'false'."),
         };
     }
 
