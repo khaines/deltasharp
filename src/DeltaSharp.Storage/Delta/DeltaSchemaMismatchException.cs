@@ -159,20 +159,6 @@ internal sealed class DeltaSchemaMismatchException : Exception
             "data file needs rewriting), but partition-column type widening is DEFERRED in this build " +
             "(tracked in #537). It is rejected fail-closed until that lands.");
 
-    /// <summary>The write would apply a <b>cross-family</b> Delta-sanctioned widening (integral→double or
-    /// integral→decimal) that this build DEFERS (#535). Classified as
-    /// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> (fail-closed) with a message naming the
-    /// #535 deferral — symmetric to the date→timestamp (#533) deferral — so it is HONEST that the change IS
-    /// Delta-sanctioned (unlike a generic <see cref="IncompatibleType"/> for, e.g., <c>string→int</c>).</summary>
-    public static DeltaSchemaMismatchException TypeWideningCrossFamilyDeferred(string path, string tableType, string writeType) =>
-        new(
-            DeltaSchemaMismatchKind.TypeWideningUnsupported,
-            path,
-            $"The type change '{tableType}'→'{writeType}' for column '{path}' is a Delta-sanctioned " +
-            "cross-family widening (integral→double or integral→decimal), but this build DEFERS cross-family " +
-            "and nested widenings (tracked in #535): the read path cannot yet promote pre-widening files " +
-            "across type families. It is rejected fail-closed until that lands.");
-
     public static DeltaSchemaMismatchException CaseInsensitiveDuplicateColumn(string path, string other) =>
         new(
             DeltaSchemaMismatchKind.CaseInsensitiveDuplicateColumn,

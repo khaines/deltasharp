@@ -723,13 +723,15 @@ internal sealed class ParquetFileReader
         }
     }
 
-    // Type-widening read promotion (#495 / Delta PROTOCOL.md "Reader Requirements for Type Widening"): reads
-    // the file's NARROW physical values and widens each into the requested WIDE vector. The dispatch is by
-    // (physical, requested) — ValidateFileField already proved the pair is a sanctioned widening, so every
-    // arm here is a lossless upcast: an integral sign-extend (byte/short/int → wider integral), float→double,
-    // or a decimal rescale (ReadDecimalAsync reads at the file's precision/scale and AppendDecimal rescales to
-    // the requested grow-only decimal). Every append targets the requested vector's storage width (short/int/
-    // long/double), and each lambda is `static` (non-capturing) so no per-column-chunk delegate is allocated.
+    // Type-widening read promotion (#495, #535 / Delta PROTOCOL.md "Reader Requirements for Type Widening"):
+    // reads the file's NARROW physical values and widens each into the requested WIDE vector. The dispatch is
+    // by (physical, requested) — ValidateFileField already proved the pair is a sanctioned widening, so every
+    // arm here is a lossless promotion: an integral sign-extend (byte/short/int → wider integral), float→
+    // double, a decimal rescale (grow-only decimal), or a cross-family integral→double / integral→decimal
+    // (#535) computed in managed code (Parquet.Net stores the file value as the physical integral, so we read
+    // the integral and convert — no Parquet.Net cross-type coercion is required). Every append targets the
+    // requested vector's storage width, and each lambda is `static` (non-capturing) so no per-column-chunk
+    // delegate is allocated.
     private static Task ReadPromotedColumnAsync(
         ParquetRowGroupReader rowGroup,
         DataField fileField,
@@ -739,17 +741,42 @@ internal sealed class ParquetFileReader
         int rowCount,
         CancellationToken cancellationToken)
     {
-        // decimal(p,s) → decimal(p',s') grow-only: read at the file's scale, rescale to the requested type.
         if (requestedField.DataType is DecimalType requestedDecimal)
         {
-            return ReadDecimalAsync(rowGroup, fileField, vector, rowCount, requestedDecimal, cancellationToken);
+            // decimal(p,s) → decimal(p',s') grow-only (#495): read at the file's scale, rescale to the
+            // requested type.
+            if (physicalType is DecimalType)
+            {
+                return ReadDecimalAsync(rowGroup, fileField, vector, rowCount, requestedDecimal, cancellationToken);
+            }
+
+            // Cross-family integral → decimal (#535): read the narrow integral physical values and widen each
+            // into the requested decimal lane. ValidateFileField proved the decimal holds the full integral
+            // range (its integer-digit capacity p − s ≥ the source's digits), so AppendDecimal never truncates.
+            return ReadIntegralAsDecimalAsync(
+                rowGroup, fileField, physicalType, vector, rowCount, requestedDecimal, cancellationToken);
         }
 
-        // float → double.
-        if (physicalType is FloatType && requestedField.DataType is DoubleType)
+        if (requestedField.DataType is DoubleType)
         {
-            return ReadValueAsync<float>(rowGroup, fileField, vector, rowCount,
-                static (v, value) => v.AppendValue((double)value), cancellationToken);
+            // float → double (#495).
+            if (physicalType is FloatType)
+            {
+                return ReadValueAsync<float>(rowGroup, fileField, vector, rowCount,
+                    static (v, value) => v.AppendValue((double)value), cancellationToken);
+            }
+
+            // Cross-family byte/short/int → double (#535). long → double is lossy and NOT sanctioned, so it
+            // never reaches here; the physical is byte/short/int only.
+            return physicalType switch
+            {
+                ByteType => ReadValueAsync<sbyte>(rowGroup, fileField, vector, rowCount,
+                    static (v, value) => v.AppendValue((double)value), cancellationToken),
+                ShortType => ReadValueAsync<short>(rowGroup, fileField, vector, rowCount,
+                    static (v, value) => v.AppendValue((double)value), cancellationToken),
+                _ => ReadValueAsync<int>(rowGroup, fileField, vector, rowCount,
+                    static (v, value) => v.AppendValue((double)value), cancellationToken),
+            };
         }
 
         // Integral widening: byte(sbyte) → short → int → long. The requested vector's storage width is the
@@ -784,6 +811,74 @@ internal sealed class ParquetFileReader
                 throw DeltaStorageException.SchemaMismatch(
                     $"Column '{requestedField.Name}': cannot promote physical type "
                     + $"'{physicalType.SimpleString}' to requested '{requestedField.DataType.SimpleString}'.");
+        }
+    }
+
+    // Cross-family integral → decimal read promotion (#535): reads the file's NARROW integral physical values
+    // (byte/short/int/long) and widens each into the requested decimal lane. The scale factors are hoisted
+    // ONCE per column chunk (like ReadDecimalAsync). ValidateFileField already proved the requested decimal's
+    // integer-digit capacity (precision − scale) holds the full source range, so AppendDecimal's over-precision
+    // guard never trips for an in-range integral value.
+    private static Task ReadIntegralAsDecimalAsync(
+        ParquetRowGroupReader rowGroup,
+        DataField fileField,
+        DataType physicalType,
+        MutableColumnVector vector,
+        int rowCount,
+        DecimalType requestedDecimal,
+        CancellationToken cancellationToken)
+    {
+        ParquetTypeMapping.DecimalScaleFactors factors = ParquetTypeMapping.DecimalScaleFactors.For(requestedDecimal);
+        return physicalType switch
+        {
+            ByteType => ReadDecimalFromIntegralAsync<sbyte>(
+                rowGroup, fileField, vector, rowCount, requestedDecimal, factors, static v => v, cancellationToken),
+            ShortType => ReadDecimalFromIntegralAsync<short>(
+                rowGroup, fileField, vector, rowCount, requestedDecimal, factors, static v => v, cancellationToken),
+            IntegerType => ReadDecimalFromIntegralAsync<int>(
+                rowGroup, fileField, vector, rowCount, requestedDecimal, factors, static v => v, cancellationToken),
+            _ => ReadDecimalFromIntegralAsync<long>(
+                rowGroup, fileField, vector, rowCount, requestedDecimal, factors, static v => v, cancellationToken),
+        };
+    }
+
+    private static async Task ReadDecimalFromIntegralAsync<T>(
+        ParquetRowGroupReader rowGroup,
+        DataField fileField,
+        MutableColumnVector vector,
+        int rowCount,
+        DecimalType requestedDecimal,
+        ParquetTypeMapping.DecimalScaleFactors factors,
+        Func<T, decimal> toDecimal,
+        CancellationToken cancellationToken)
+        where T : unmanaged
+    {
+        if (fileField.IsNullable)
+        {
+            var buffer = new T?[rowCount];
+            await rowGroup.ReadAsync<T>(fileField, new Memory<T?>(buffer), null, cancellationToken)
+                .ConfigureAwait(false);
+            for (int i = 0; i < rowCount; i++)
+            {
+                if (buffer[i] is { } value)
+                {
+                    ParquetTypeMapping.AppendDecimal(vector, requestedDecimal, toDecimal(value), factors);
+                }
+                else
+                {
+                    vector.AppendNull();
+                }
+            }
+        }
+        else
+        {
+            var buffer = new T[rowCount];
+            await rowGroup.ReadAsync<T>(fileField, new Memory<T>(buffer), null, cancellationToken)
+                .ConfigureAwait(false);
+            for (int i = 0; i < rowCount; i++)
+            {
+                ParquetTypeMapping.AppendDecimal(vector, requestedDecimal, toDecimal(buffer[i]), factors);
+            }
         }
     }
 
