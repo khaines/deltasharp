@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using System.Globalization;
+using DeltaSharp.Storage.Delta.DeletionVectors;
 using Parquet;
 using Parquet.Data;
 using Parquet.Schema;
@@ -30,6 +31,7 @@ internal sealed class CheckpointColumns
     private string?[] _addStats = [];
     private ImmutableSortedDictionary<string, string?>[] _addPartitionValues = [];
     private ImmutableSortedDictionary<string, string>[] _addTags = [];
+    private DeletionVectorColumns _addDeletionVector = DeletionVectorColumns.Empty;
 
     // remove
     private string?[] _removePath = [];
@@ -38,6 +40,7 @@ internal sealed class CheckpointColumns
     private bool?[] _removeExtendedFileMetadata = [];
     private long?[] _removeSize = [];
     private ImmutableSortedDictionary<string, string?>[] _removePartitionValues = [];
+    private DeletionVectorColumns _removeDeletionVector = DeletionVectorColumns.Empty;
 
     // metaData
     private string?[] _metaId = [];
@@ -97,6 +100,7 @@ internal sealed class CheckpointColumns
             _addStats = await ReadStringScalarAsync(rowGroup, schema.AddStats, rowCount, cancellationToken).ConfigureAwait(false),
             _addPartitionValues = await ReadNullableMapAsync(rowGroup, schema.AddPartitionValues, rowCount, cancellationToken).ConfigureAwait(false),
             _addTags = await ReadStringMapAsync(rowGroup, schema.AddTags, rowCount, cancellationToken).ConfigureAwait(false),
+            _addDeletionVector = await ReadDeletionVectorAsync(rowGroup, schema.AddDeletionVector, rowCount, cancellationToken).ConfigureAwait(false),
 
             _removePath = await ReadStringScalarAsync(rowGroup, schema.RemovePath, rowCount, cancellationToken, removePresent).ConfigureAwait(false),
             _removeDeletionTimestamp = await ReadLongScalarAsync(rowGroup, schema.RemoveDeletionTimestamp, rowCount, cancellationToken).ConfigureAwait(false),
@@ -104,6 +108,7 @@ internal sealed class CheckpointColumns
             _removeExtendedFileMetadata = await ReadBoolScalarAsync(rowGroup, schema.RemoveExtendedFileMetadata, rowCount, cancellationToken).ConfigureAwait(false),
             _removeSize = await ReadLongScalarAsync(rowGroup, schema.RemoveSize, rowCount, cancellationToken).ConfigureAwait(false),
             _removePartitionValues = await ReadNullableMapAsync(rowGroup, schema.RemovePartitionValues, rowCount, cancellationToken).ConfigureAwait(false),
+            _removeDeletionVector = await ReadDeletionVectorAsync(rowGroup, schema.RemoveDeletionVector, rowCount, cancellationToken).ConfigureAwait(false),
 
             _metaId = await ReadStringScalarAsync(rowGroup, schema.MetaId, rowCount, cancellationToken, metaPresent).ConfigureAwait(false),
             _metaName = await ReadStringScalarAsync(rowGroup, schema.MetaName, rowCount, cancellationToken).ConfigureAwait(false),
@@ -157,12 +162,13 @@ internal sealed class CheckpointColumns
         RequireKeyIfPresent(!isAdd, "add", "path", row, group,
             _addPresent[row]
             || _addSize[row] is not null || _addModificationTime[row] is not null || _addDataChange[row] is not null
-            || _addStats[row] is not null || _addPartitionValues[row].Count > 0 || _addTags[row].Count > 0);
+            || _addStats[row] is not null || _addPartitionValues[row].Count > 0 || _addTags[row].Count > 0
+            || _addDeletionVector.IsPresent(row));
         RequireKeyIfPresent(!isRemove, "remove", "path", row, group,
             _removePresent[row]
             || _removeDeletionTimestamp[row] is not null || _removeDataChange[row] is not null
             || _removeExtendedFileMetadata[row] is not null || _removeSize[row] is not null
-            || _removePartitionValues[row].Count > 0);
+            || _removePartitionValues[row].Count > 0 || _removeDeletionVector.IsPresent(row));
         RequireKeyIfPresent(!isMeta, "metaData", "id", row, group,
             _metaPresent[row]
             || _metaName[row] is not null || _metaDescription[row] is not null || _metaSchemaString[row] is not null
@@ -186,7 +192,8 @@ internal sealed class CheckpointColumns
                 _addModificationTime[row] ?? 0L,
                 _addDataChange[row] ?? true,
                 DeltaLogActionReader.ParseStatsString(_addStats[row]),
-                _addTags[row]);
+                _addTags[row],
+                _addDeletionVector.Build(row, "add", group));
         }
 
         if (isRemove)
@@ -197,7 +204,8 @@ internal sealed class CheckpointColumns
                 _removeDataChange[row] ?? true,
                 _removeExtendedFileMetadata[row] ?? false,
                 _removePartitionValues[row],
-                _removeSize[row]);
+                _removeSize[row],
+                _removeDeletionVector.Build(row, "remove", group));
         }
 
         if (isMeta)
@@ -366,6 +374,98 @@ internal sealed class CheckpointColumns
                 structPresent[r] = col.Definition[r] >= 1;
             }
         }
+    }
+
+    // ---- deletion-vector nested-struct column reader (issue #527) ----
+
+    /// <summary>Reads an <c>add</c>/<c>remove</c> nested <c>deletionVector</c> struct's leaf columns into
+    /// row-aligned nullable arrays. Each leaf (<c>storageType</c>/<c>pathOrInlineDv</c>/<c>offset</c>/
+    /// <c>sizeInBytes</c>/<c>cardinality</c>) is a Parquet <see cref="DataField"/> with a multi-part path
+    /// under the optional action struct and the optional DV struct, so its per-row definition level is
+    /// <c>MaxDefinitionLevel</c> exactly where the DV is present — the same row-alignment the scalar readers
+    /// use. Per-row DV presence is the <b>any-leaf-non-null</b> rule (see
+    /// <see cref="DeletionVectorColumns.IsPresent"/>), not a storageType-only signal; a present-but-incomplete
+    /// DV fails closed in <see cref="DeletionVectorColumns.Build"/> (never silently dropped).</summary>
+    private static async Task<DeletionVectorColumns> ReadDeletionVectorAsync(
+        ParquetRowGroupReader rowGroup, CheckpointSchema.DeletionVectorLeaves? leaves, int rowCount,
+        CancellationToken cancellationToken)
+    {
+        if (leaves is null)
+        {
+            return DeletionVectorColumns.Empty;
+        }
+
+        return new DeletionVectorColumns(
+            await ReadStringScalarAsync(rowGroup, leaves.StorageType, rowCount, cancellationToken).ConfigureAwait(false),
+            await ReadStringScalarAsync(rowGroup, leaves.PathOrInlineDv, rowCount, cancellationToken).ConfigureAwait(false),
+            await ReadIntScalarAsync(rowGroup, leaves.Offset, rowCount, cancellationToken).ConfigureAwait(false),
+            await ReadIntScalarAsync(rowGroup, leaves.SizeInBytes, rowCount, cancellationToken).ConfigureAwait(false),
+            await ReadLongScalarAsync(rowGroup, leaves.Cardinality, rowCount, cancellationToken).ConfigureAwait(false));
+    }
+
+    /// <summary>Row-aligned decoded columns of a nested <c>deletionVector</c> struct. <see cref="Empty"/>
+    /// models an action without a DV struct (every row's DV is null).</summary>
+    private readonly struct DeletionVectorColumns
+    {
+        public static readonly DeletionVectorColumns Empty = new([], [], [], [], []);
+
+        private readonly string?[] _storageType;
+        private readonly string?[] _pathOrInlineDv;
+        private readonly int?[] _offset;
+        private readonly int?[] _sizeInBytes;
+        private readonly long?[] _cardinality;
+
+        public DeletionVectorColumns(
+            string?[] storageType, string?[] pathOrInlineDv, int?[] offset, int?[] sizeInBytes, long?[] cardinality)
+        {
+            _storageType = storageType;
+            _pathOrInlineDv = pathOrInlineDv;
+            _offset = offset;
+            _sizeInBytes = sizeInBytes;
+            _cardinality = cardinality;
+        }
+
+        /// <summary>True when this row carries a DV — signalled by <b>any</b> of the DV struct's leaf columns
+        /// being non-null. Using any-leaf (not just <c>storageType</c>) means a present-but-incomplete DV —
+        /// e.g. a struct whose required <c>storageType</c> is absent while another field is set — is DETECTED
+        /// here and fails closed in <see cref="Build"/>, rather than being mistaken for "no DV" and silently
+        /// dropped (which would resurrect deleted rows). A DV-free action has every DV leaf null → not present.
+        /// This matches the JSON parser, where the presence of the <c>deletionVector</c> object (not its
+        /// storageType) is what triggers required-field validation.</summary>
+        public bool IsPresent(int row) =>
+            (row < _storageType.Length && _storageType[row] is not null)
+            || (row < _pathOrInlineDv.Length && _pathOrInlineDv[row] is not null)
+            || (row < _offset.Length && _offset[row] is not null)
+            || (row < _sizeInBytes.Length && _sizeInBytes[row] is not null)
+            || (row < _cardinality.Length && _cardinality[row] is not null);
+
+        /// <summary>Builds the row's <see cref="DeletionVectorDescriptor"/>, or null when the row has no DV.
+        /// A present-but-incomplete or invalid DV fails closed (→ JSON replay) via the <b>shared</b>
+        /// <see cref="DeletionVectorDescriptor.Create"/> validator — the same one the JSON-commit parser
+        /// (<see cref="DeletionVectorDescriptor.Parse"/>) uses — so a checkpoint-seeded snapshot is
+        /// bit-identical to a JSON-replayed one and no present DV is ever silently dropped (the cardinal DV
+        /// safety violation: silently dropping a DV would resurrect deleted rows).</summary>
+        /// <exception cref="DeltaProtocolException">The DV struct is present but malformed.</exception>
+        public DeletionVectorDescriptor? Build(int row, string action, int group)
+        {
+            if (!IsPresent(row))
+            {
+                return null;
+            }
+
+            return DeletionVectorDescriptor.Create(
+                row < _storageType.Length ? _storageType[row] : null,
+                row < _pathOrInlineDv.Length ? _pathOrInlineDv[row] : null,
+                row < _offset.Length ? _offset[row] : null,
+                row < _sizeInBytes.Length ? _sizeInBytes[row] : null,
+                row < _cardinality.Length ? _cardinality[row] : null,
+                detail => DvMalformed(action, row, group, detail));
+        }
+
+        private static DeltaProtocolException DvMalformed(string action, int row, int group, string detail) =>
+            DeltaProtocolException.Malformed(string.Create(
+                CultureInfo.InvariantCulture,
+                $"Checkpoint '{action}' at row {row} (group {group}) has a malformed deletionVector: {detail}."));
     }
 
     // ---- map / list column readers (per-row reconstruction from Dremel levels) ----

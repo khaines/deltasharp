@@ -98,9 +98,48 @@ internal static class DeltaTestHarness
             .Replace("__STATS__", statsField, StringComparison.Ordinal);
     }
 
+    /// <summary>An <c>add</c> commit line carrying a relative-path ('u') <c>deletionVector</c> — the JSON
+    /// form the checkpoint's nested DV struct must reconstruct bit-identically (issue #527).</summary>
+    public static string AddWithDeletionVector(
+        string path, string storageType, string pathOrInlineDv, int? offset, int sizeInBytes, long cardinality)
+    {
+        string offsetField = offset is { } o
+            ? ",\"offset\":" + o.ToString(CultureInfo.InvariantCulture)
+            : "";
+        string dv = """{"storageType":"__ST__","pathOrInlineDv":"__POI__"__OFF__,"sizeInBytes":__SZ__,"cardinality":__CARD__}"""
+            .Replace("__ST__", storageType, StringComparison.Ordinal)
+            .Replace("__POI__", pathOrInlineDv, StringComparison.Ordinal)
+            .Replace("__OFF__", offsetField, StringComparison.Ordinal)
+            .Replace("__SZ__", sizeInBytes.ToString(CultureInfo.InvariantCulture), StringComparison.Ordinal)
+            .Replace("__CARD__", cardinality.ToString(CultureInfo.InvariantCulture), StringComparison.Ordinal);
+        return """{"add":{"path":"__PATH__","partitionValues":{},"size":1,"modificationTime":1,"dataChange":true,"deletionVector":__DV__}}"""
+            .Replace("__PATH__", path, StringComparison.Ordinal)
+            .Replace("__DV__", dv, StringComparison.Ordinal);
+    }
+
     public static string Remove(string path) =>
         """{"remove":{"path":"__P__","deletionTimestamp":1,"dataChange":true}}"""
             .Replace("__P__", path, StringComparison.Ordinal);
+
+    /// <summary>A <c>remove</c> commit line carrying a relative-path ('u') <c>deletionVector</c> — the DV the
+    /// removed logical file carried, which is part of its identity and which the checkpoint's nested DV
+    /// struct must reconstruct bit-identically on a tombstone (issue #527).</summary>
+    public static string RemoveWithDeletionVector(
+        string path, string storageType, string pathOrInlineDv, int? offset, int sizeInBytes, long cardinality)
+    {
+        string offsetField = offset is { } o
+            ? ",\"offset\":" + o.ToString(CultureInfo.InvariantCulture)
+            : "";
+        string dv = """{"storageType":"__ST__","pathOrInlineDv":"__POI__"__OFF__,"sizeInBytes":__SZ__,"cardinality":__CARD__}"""
+            .Replace("__ST__", storageType, StringComparison.Ordinal)
+            .Replace("__POI__", pathOrInlineDv, StringComparison.Ordinal)
+            .Replace("__OFF__", offsetField, StringComparison.Ordinal)
+            .Replace("__SZ__", sizeInBytes.ToString(CultureInfo.InvariantCulture), StringComparison.Ordinal)
+            .Replace("__CARD__", cardinality.ToString(CultureInfo.InvariantCulture), StringComparison.Ordinal);
+        return """{"remove":{"path":"__PATH__","deletionTimestamp":1,"dataChange":true,"deletionVector":__DV__}}"""
+            .Replace("__PATH__", path, StringComparison.Ordinal)
+            .Replace("__DV__", dv, StringComparison.Ordinal);
+    }
 
     public static string Txn(string appId, long version) =>
         """{"txn":{"appId":"__APP__","version":__V__}}"""
@@ -225,6 +264,20 @@ internal static class DeltaTestHarness
                 .Append(" pv=").Append(DescribeNullableMap(add.PartitionValues))
                 .Append(" tags=").Append(DescribeMap(add.Tags))
                 .Append(" stats=").Append(DescribeStats(add.Stats))
+                .Append(" dv=").Append(DescribeDeletionVector(add.DeletionVector))
+                .Append('\n');
+        }
+
+        // Tombstones (removes) participate in the parity oracle so a dropped/misaligned REMOVE-DV diverges
+        // here (issue #527). Rendered path-ordered for determinism, with only the identity-bearing fields
+        // that survive both JSON replay and checkpoint reconstruction (path, deletionTimestamp, size, DV);
+        // dataChange/extendedFileMetadata are not load-bearing for the removed logical file's identity.
+        foreach (RemoveFileAction remove in snapshot.Tombstones.OrderBy(r => r.Path, StringComparer.Ordinal))
+        {
+            sb.Append("remove path=").Append(remove.Path)
+                .Append(" dts=").Append(remove.DeletionTimestamp?.ToString(CultureInfo.InvariantCulture) ?? "∅")
+                .Append(" size=").Append(remove.Size?.ToString(CultureInfo.InvariantCulture) ?? "∅")
+                .Append(" dv=").Append(DescribeDeletionVector(remove.DeletionVector))
                 .Append('\n');
         }
 
@@ -248,6 +301,22 @@ internal static class DeltaTestHarness
         string max = string.Join(",", stats.MaxValues.Select(kv => kv.Key + ":" + kv.Value.Raw));
         string nulls = string.Join(",", stats.NullCount.Select(kv => kv.Key + ":" + kv.Value));
         return $"n={stats.NumRecords} min={{{min}}} max={{{max}}} nc={{{nulls}}} tb={stats.TightBounds}";
+    }
+
+    /// <summary>Canonicalizes an add's <c>deletionVector</c> into the snapshot description so the
+    /// checkpoint-vs-JSON parity oracle actually captures the DV (issue #527) — a DV silently dropped on
+    /// either path would diverge here.</summary>
+    private static string DescribeDeletionVector(DeltaSharp.Storage.Delta.DeletionVectors.DeletionVectorDescriptor? dv)
+    {
+        if (dv is null)
+        {
+            return "∅";
+        }
+
+        string offset = dv.Offset is { } o ? o.ToString(CultureInfo.InvariantCulture) : "∅";
+        return string.Create(
+            CultureInfo.InvariantCulture,
+            $"st={dv.StorageType} poi={dv.PathOrInlineDv} off={offset} sz={dv.SizeInBytes} card={dv.Cardinality}");
     }
 
     private static string LogPath(string fileName) => "_delta_log/" + fileName;

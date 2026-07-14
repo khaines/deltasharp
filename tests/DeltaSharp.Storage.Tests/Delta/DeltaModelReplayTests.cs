@@ -101,6 +101,7 @@ public sealed class DeltaModelReplayTests : IDisposable
     private sealed class DeltaModel
     {
         private readonly SortedDictionary<string, (long Size, string Year)> _active = new(StringComparer.Ordinal);
+        private readonly SortedDictionary<string, long> _tombstones = new(StringComparer.Ordinal);
         private readonly SortedDictionary<string, long> _txns = new(StringComparer.Ordinal);
         private int _nextFile;
 
@@ -113,13 +114,14 @@ public sealed class DeltaModelReplayTests : IDisposable
                 lines.Add(DeltaTestHarness.Metadata(id: "model-table", partitionColumns: ["year"]));
             }
 
-            // Overwrite: remove a random subset of active files.
+            // Overwrite: remove a random subset of active files (each removed file becomes a tombstone).
             if (_active.Count > 0 && random.Next(0, 3) == 0)
             {
                 foreach (string path in _active.Keys.Where(_ => random.Next(0, 2) == 0).ToArray())
                 {
                     lines.Add(DeltaTestHarness.Remove(path));
                     _active.Remove(path);
+                    _tombstones[path] = 1; // DeltaTestHarness.Remove writes deletionTimestamp=1
                 }
             }
 
@@ -156,6 +158,13 @@ public sealed class DeltaModelReplayTests : IDisposable
                 fixture.Add(path, size: size, partitionValues: [("year", year)], modificationTime: 1);
             }
 
+            // A real Spark checkpoint retains recent tombstones; emit them so the checkpoint-seeded snapshot
+            // stays at parity with the JSON replay (both keep the removes as tombstones).
+            foreach ((string path, long _) in _tombstones)
+            {
+                fixture.Remove(path, deletionTimestamp: 1);
+            }
+
             foreach ((string appId, long version) in _txns)
             {
                 fixture.Txn(appId, version);
@@ -182,7 +191,14 @@ public sealed class DeltaModelReplayTests : IDisposable
             {
                 sb.Append("add path=").Append(path).Append(" size=").Append(size)
                     .Append(" mtime=1 dc=True")
-                    .Append(" pv={year=").Append(year).Append("} tags={} stats=∅\n");
+                    .Append(" pv={year=").Append(year).Append("} tags={} stats=∅ dv=∅\n");
+            }
+
+            // Tombstones rendered independently of DeltaTestHarness.Describe (same format, own builder):
+            // path-ordered, deletionTimestamp=1, no size, no DV — matching a DeltaTestHarness.Remove(path).
+            foreach ((string path, long _) in _tombstones)
+            {
+                sb.Append("remove path=").Append(path).Append(" dts=1 size=∅ dv=∅\n");
             }
 
             return sb.ToString();
