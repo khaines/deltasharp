@@ -602,9 +602,20 @@ schema is thus effectively part of the write's read dependency; no stale-schema 
   fail-closed until #495 lands the feature + metadata; a would-be widening is surfaced distinctly as
   `TypeWideningUnsupported`. This also covers `date→timestamp` (Delta only sanctions `date→timestamp_ntz`, which
   needs a not-yet-existing NTZ type — #495).
-- **`overwriteSchema` (destructive schema replacement) is NOT supported (#496).** A static overwrite here keeps the
-  existing schema (or applies an additive `AddNewColumns` evolution); it may **not** drop, narrow, or reorder
-  columns via an `overwriteSchema`-style replacement. That destructive path is tracked in #496.
+- **`overwriteSchema` (destructive schema replacement) — implemented (#496).** A full (**Static**) overwrite
+  with `overwriteSchema=true` (the connector `overwriteSchema` write option, resolved by `DeltaSinkFactory`)
+  **replaces the table schema wholesale** — drop, narrow, reorder, add, or change a column's type, and change
+  the partition columns — because every prior file is removed in the same version, so no surviving data must
+  conform to the old schema. It deliberately **bypasses** the additive `DeltaSchemaEnforcer.Reconcile`
+  (`DeltaTableWriter.OverwriteReplaceSchemaAsync`): the new `metaData` carries the write's declared schema +
+  partition columns (other metadata fields preserved), the staged files are still gated against the **new**
+  schema by `ValidateStagedWriteSchema` (#497 footer check), and partition coverage is validated against the
+  new partition columns — so the committed metadata provably matches the real written bytes. It is
+  **fail-closed for a dynamic partition overwrite** (`overwriteSchema` + `Dynamic` is rejected: files in
+  untouched partitions still carry the old schema, so a wholesale replacement would leave them unreadable).
+  With `overwriteSchema=false` (the default) a static overwrite keeps the additive/strict enforcement (may not
+  drop, narrow, or change a column's type — reordering is not a schema change under name-based matching, so it
+  is always allowed).
 - **Read-side null-fill + physical write-schema validation (#497) — implemented.** Reading an
   additively schema-evolved table now fills `null` for a later-added column when reading older files that
   predate it: the scan/read path (`DeltaReadSource`) requests the current data schema with
