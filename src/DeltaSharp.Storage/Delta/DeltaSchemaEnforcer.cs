@@ -44,7 +44,7 @@ namespace DeltaSharp.Storage.Delta;
 /// <b>applied</b> when the table enables type widening (else rejected as
 /// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>); any other differing type is rejected —
 /// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> for a would-be/deferred widening,
-/// /// <see cref="DeltaSchemaMismatchKind.IncompatibleType"/> for anything else. A differing <b>partition</b>
+/// <see cref="DeltaSchemaMismatchKind.IncompatibleType"/> for anything else. A differing <b>partition</b>
 /// column's type is handled specially (partition values are strings — Delta widens them without a data-file
 /// rewrite): an <b>intra-family</b> Delta-sanctioned widening (<see cref="TypeWidening.IsSanctionedWidening"/>)
 /// is <b>applied</b> exactly like a non-partition column (widened type + <c>delta.typeChanges</c>, or rejected
