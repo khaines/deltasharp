@@ -174,12 +174,18 @@ internal sealed class DeltaTableWriter
             throw new ArgumentException("An append must stage at least one data file.", nameof(files));
         }
 
-        RejectExistingNameModeMutation(readSnapshot);
+        // #525: an append to a column-mapped table stages Parquet under the table's PHYSICAL column names
+        // (name mode); `none` is logical==physical; `id` stays fail-closed (#523, rejected at snapshot load).
+        ColumnMappingMode mode = ColumnMapping.ResolveMode(readSnapshot.Metadata.Configuration);
+        ColumnMapping.EnsureReadWriteSupported(mode);
+        (StructType physicalWriteSchema, ImmutableArray<string> physicalPartitionColumns) =
+            ResolvePhysicalStaging(readSnapshot, writeSchema, mode);
 
-        ValidateStagedWriteSchema(writeSchema, readSnapshot.Metadata.PartitionColumns, files);
+        ValidateStagedWriteSchema(physicalWriteSchema, physicalPartitionColumns, files);
         MetadataAction? schemaEvolution = ReconcileSchema(readSnapshot, writeSchema, evolutionMode);
+        RejectNameModeSchemaEvolution(mode, schemaEvolution);
 
-        ValidatePartitionCoverage(files, readSnapshot.Metadata.PartitionColumns);
+        ValidatePartitionCoverage(files, physicalPartitionColumns);
 
         var actions = new List<DeltaAction>((schemaEvolution is null ? 0 : 1) + files.Count);
         if (schemaEvolution is not null)
@@ -242,19 +248,27 @@ internal sealed class DeltaTableWriter
             throw new ArgumentException("An overwrite must stage at least one data file.", nameof(files));
         }
 
-        RejectExistingNameModeMutation(readSnapshot);
+        // #525: mirror AppendAsync — stage under PHYSICAL names for a name-mode table; `none` is
+        // logical==physical; `id` stays fail-closed (#523). Physical partition columns key both the staged
+        // files' partitionValues and the dynamic-overwrite removal selection.
+        ColumnMappingMode mode = ColumnMapping.ResolveMode(readSnapshot.Metadata.Configuration);
+        ColumnMapping.EnsureReadWriteSupported(mode);
+        (StructType physicalWriteSchema, ImmutableArray<string> physicalPartitionColumns) =
+            ResolvePhysicalStaging(readSnapshot, writeSchema, mode);
 
-        ValidateStagedWriteSchema(writeSchema, readSnapshot.Metadata.PartitionColumns, files);
+        ValidateStagedWriteSchema(physicalWriteSchema, physicalPartitionColumns, files);
         MetadataAction? schemaEvolution = ReconcileSchema(readSnapshot, writeSchema, evolutionMode);
+        RejectNameModeSchemaEvolution(mode, schemaEvolution);
 
-        ValidatePartitionCoverage(files, readSnapshot.Metadata.PartitionColumns);
+        ValidatePartitionCoverage(files, physicalPartitionColumns);
 
         return partitionMode switch
         {
             PartitionOverwriteMode.Static =>
                 FullOverwriteAsync(readSnapshot, files, schemaEvolution, cancellationToken),
             PartitionOverwriteMode.Dynamic =>
-                DynamicPartitionOverwriteAsync(readSnapshot, files, schemaEvolution, cancellationToken),
+                DynamicPartitionOverwriteAsync(
+                    readSnapshot, files, physicalPartitionColumns, schemaEvolution, cancellationToken),
             _ => throw new ArgumentOutOfRangeException(
                 nameof(partitionMode), partitionMode, "Unknown partition overwrite mode."),
         };
@@ -287,10 +301,11 @@ internal sealed class DeltaTableWriter
         }
 
         Snapshot readSnapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
-        RejectExistingNameModeMutation(readSnapshot);
         if (files.Count == 0)
         {
-            // Append of nothing to an existing table: no new version, report the current one.
+            // Append of nothing to an existing table: no new version, report the current one. (No staging, so
+            // there is no logical→physical mapping concern for a name-mode table; AppendAsync handles the
+            // physical staging for a non-empty append.)
             return new DeltaCommitResult(readSnapshot.Version, Attempts: 0, Skipped: true);
         }
 
@@ -354,7 +369,14 @@ internal sealed class DeltaTableWriter
         }
 
         Snapshot readSnapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
-        RejectExistingNameModeMutation(readSnapshot);
+
+        // #525: a name-mode append/overwrite is now supported (physical-name staging), but `overwriteSchema`
+        // (wholesale schema replacement) stays fail-closed for a column-mapped table: replacing the logical
+        // schema wholesale would desync the preserved `columnMapping.maxColumnId` / per-field id+physicalName
+        // configuration from the new schema (drop/reorder/re-type changes column identity), so it is rejected
+        // rather than commit a mapped table whose metaData and configuration disagree. `id` mode is already
+        // fail-closed at snapshot load (#523); `none` is unaffected.
+        RejectColumnMappedOverwriteSchema(readSnapshot, overwriteSchema);
 
         if (overwriteSchema)
         {
@@ -614,23 +636,72 @@ internal sealed class DeltaTableWriter
         }
     }
 
-    // TRACKED DEFERRAL (#525): a data append/overwrite/truncate to an EXISTING name-mode column-mapping table
-    // is fail-closed. This build's staging path (DeltaWriteTarget.StageAsync) writes Parquet under the write
-    // schema's LOGICAL column names; dropping a logical-named file into a physical-name table produces a
-    // corrupt, cross-engine-unreadable commit (a subsequent read then throws a misleading
-    // DeltaReadSchemaEvolutionException, #497). Only fresh-table creation (CreateNameMappedTableAsync writes
-    // PHYSICAL-named data) and metadata-only rename/drop are supported today. Append/overwrite to a name-mode
-    // table needs the writer to map incoming logical columns to physical before staging — deferred to #525.
-    // This mirrors the id-mode / rename-on-none fail-closed pattern.
-    private static void RejectExistingNameModeMutation(Snapshot snapshot)
+    // #525: an append/overwrite to an EXISTING column-mapped table stages Parquet under the table's PHYSICAL
+    // column names (name mode) — IDENTICAL to what the fresh-create path (CreateNameMappedTableAsync) writes
+    // — so the appended files physically carry the `col-<uuid>` names and physical-keyed partitionValues. The
+    // logical→physical mapping REUSES the table's existing per-field id/physicalName (never re-mints), keeping
+    // maxColumnId and every existing column's identity unchanged. `none` mode is logical==physical (unchanged
+    // behavior); `id` mode is rejected fail-closed at snapshot load (#523). Returns the write schema whose
+    // DATA columns the staged files physically carry, and the partition columns their partitionValues key by.
+    private static (StructType PhysicalWriteSchema, ImmutableArray<string> PhysicalPartitionColumns)
+        ResolvePhysicalStaging(Snapshot readSnapshot, StructType writeSchema, ColumnMappingMode mode)
     {
-        if (ColumnMapping.ResolveMode(snapshot.Metadata.Configuration) == ColumnMappingMode.Name)
+        ImmutableArray<string> logicalPartitions = readSnapshot.Metadata.PartitionColumns.IsDefault
+            ? ImmutableArray<string>.Empty
+            : readSnapshot.Metadata.PartitionColumns;
+
+        if (mode != ColumnMappingMode.Name)
+        {
+            // none (and any non-name) mode: logical==physical, so the caller's write schema and the table's
+            // logical partition columns ARE the physical staging shape — behavior is byte-for-byte unchanged.
+            return (writeSchema, logicalPartitions);
+        }
+
+        // name mode: rename each write column to the physical name the table already assigned it, and map the
+        // logical partition columns to their physical names (add.partitionValues + stats keyed by physical
+        // name — Delta PROTOCOL.md "Writer Requirements for Column Mapping").
+        StructType physicalWriteSchema =
+            ColumnMapping.MapWriteSchemaToPhysical(writeSchema, readSnapshot.Schema, mode);
+        ImmutableArray<string> physicalPartitions =
+            ColumnMapping.PhysicalPartitionColumns(readSnapshot.Schema, logicalPartitions, mode).ToImmutableArray();
+        return (physicalWriteSchema, physicalPartitions);
+    }
+
+    // #525 residual fail-closed: evolving the LOGICAL schema of a name-mode table (an additive column, or an
+    // applied Delta type widening) would need to MINT a fresh delta.columnMapping.physicalName and bump
+    // delta.columnMapping.maxColumnId for the changed column, then re-emit the mapped metaData. Append/
+    // overwrite deliberately REUSE the existing physical mapping (never re-mint), so a would-be evolution is
+    // out of scope here and stays fail-closed — no unmapped/desynced column is ever committed. A plain
+    // (compatible, same-schema) append/overwrite has schemaEvolution == null and proceeds.
+    private static void RejectNameModeSchemaEvolution(ColumnMappingMode mode, MetadataAction? schemaEvolution)
+    {
+        if (mode == ColumnMappingMode.Name && schemaEvolution is not null)
         {
             throw DeltaProtocolException.Unsupported(
-                "append/overwrite to a name-mode column-mapping table is not yet supported (#525): this build "
-                + "would stage Parquet under logical column names into a physical-name table, producing a "
-                + "corrupt, cross-engine-unreadable commit. Only fresh-table creation and metadata-only "
-                + "rename/drop are supported for column mapping in this build. The write is rejected fail-closed.");
+                "schema evolution (an additive column or an applied type widening) on a name-mode column-"
+                + "mapping table is not yet supported (#525): it would require minting a fresh "
+                + "'delta.columnMapping.physicalName' and bumping 'delta.columnMapping.maxColumnId' for the "
+                + "changed column, which append/overwrite (reusing the existing physical mapping) do not do. "
+                + "The write is rejected fail-closed to avoid committing an unmapped column.");
+        }
+    }
+
+    // #525: `overwriteSchema` (wholesale schema replacement, #496) stays fail-closed for a column-mapped
+    // table. A destructive replacement can drop/reorder/re-type columns, desyncing the preserved
+    // columnMapping.maxColumnId / per-field id+physicalName configuration from the replaced schema — a mapped
+    // table whose metaData schema and configuration disagree. Rather than reconcile column ids here, the
+    // combination is rejected (name-mode APPEND/OVERWRITE without overwriteSchema is fully supported). `id`
+    // mode is already fail-closed at snapshot load (#523); `none` is unaffected.
+    private static void RejectColumnMappedOverwriteSchema(Snapshot snapshot, bool overwriteSchema)
+    {
+        if (overwriteSchema
+            && ColumnMapping.ResolveMode(snapshot.Metadata.Configuration) != ColumnMappingMode.None)
+        {
+            throw DeltaProtocolException.Unsupported(
+                "overwriteSchema (wholesale schema replacement) on a column-mapping table is not supported "
+                + "(#525): a destructive replacement would desync the table's 'delta.columnMapping.maxColumnId' "
+                + "and per-field id/physicalName configuration from the replaced schema. Append/overwrite "
+                + "WITHOUT overwriteSchema is supported for a name-mode table. The write is rejected fail-closed.");
         }
     }
 
@@ -761,11 +832,11 @@ internal sealed class DeltaTableWriter
 
         // The replacement metaData carries the NEW schema + partition columns; all other metadata fields
         // (id, format, configuration, createdTime) are structurally preserved by `with`, so the table's
-        // identity (id) is stable across the overwriteSchema (never re-minted). FORWARD NOTE (#523/#525):
-        // once column-mapping WRITE support relaxes the RejectExistingNameModeMutation gate above, the
-        // preserved Configuration carries columnMapping.maxColumnId / per-field physical-name+id metadata that
-        // would desync from a wholesale-replaced schema — this method must then reconcile column ids (or the
-        // name-mode gate must keep rejecting it). Today the gate masks this fail-closed.
+        // identity (id) is stable across the overwriteSchema (never re-minted). NOTE (#525): overwriteSchema
+        // on a COLUMN-MAPPED table is rejected fail-closed BEFORE reaching here (RejectColumnMappedOverwriteSchema
+        // in CreateOrOverwriteAsync) — the preserved Configuration carries columnMapping.maxColumnId / per-field
+        // physical-name+id metadata that a wholesale-replaced schema would desync, and reconciling column ids
+        // is out of scope. This method therefore only ever runs for a `none`-mode table (logical==physical).
         var replacement = readSnapshot.Metadata with
         {
             SchemaString = SchemaJson.ToJson(writeSchema),
@@ -803,10 +874,14 @@ internal sealed class DeltaTableWriter
     private Task<DeltaCommitResult> DynamicPartitionOverwriteAsync(
         Snapshot readSnapshot,
         IReadOnlyList<StagedDataFile> files,
+        ImmutableArray<string> partitionColumns,
         MetadataAction? schemaEvolution,
         CancellationToken cancellationToken)
     {
-        ImmutableArray<string> partitionColumns = readSnapshot.Metadata.PartitionColumns;
+        // #525: partitionColumns are the PHYSICAL partition-column names (name mode) — the form BOTH the
+        // staged files' partitionValues AND the prior active files' partitionValues are keyed by, so the
+        // touched-key match below is exact in physical-name space. For a `none` table these ARE the logical
+        // metaData partition columns (logical==physical), so behavior is unchanged.
 
         // An unpartitioned table is a single partition, so a dynamic overwrite replaces the whole table —
         // identical to a static overwrite. Route it to the full-overwrite path so it also gets the stronger
@@ -976,10 +1051,12 @@ internal sealed class DeltaTableWriter
     // string/binary as always-nullable and a footer does not carry Spark field metadata, so nullability and
     // metadata are NOT footer-faithful and must not be compared (comparing them would false-reject a valid
     // required-string write). A file whose DataSchema is null (a caller that does not supply it) is skipped —
-    // the cross-check binds only when the producing write-door supplies the true written schema. Callers pass
-    // logical==physical names (the enforcing append/overwrite paths reject name-mode tables; the non-mapped
-    // create path is logical==physical), so the comparison is like-for-like; mapped-schema (physical≠logical)
-    // validation is out of scope here (#525).
+    // the cross-check binds only when the producing write-door supplies the true written schema. The
+    // `writeSchema`/`partitionColumns` passed here are the PHYSICAL forms for a name-mode table (#525:
+    // ResolvePhysicalStaging maps the logical write columns to their physicalName before this call) and the
+    // logical forms for a `none`-mode / non-mapped create (logical==physical). Either way the comparison is
+    // like-for-like against the file's PHYSICAL footer schema — a logical-named file staged into a physical-
+    // name table (the corruption case) mismatches and is rejected fail-closed.
     private static void ValidateStagedWriteSchema(
         StructType writeSchema, IEnumerable<string> partitionColumns, IReadOnlyList<StagedDataFile> files)
     {

@@ -509,54 +509,280 @@ public sealed class ColumnMappingTests : IDisposable
         Assert.Contains(dupPhysical, ex.Message, StringComparison.Ordinal);
     }
 
-    // ---------------------------------------------------------------- HIGH #2: append/overwrite fail-closed
+    // ---------------------------------------------------------------- HIGH #2 (#525): append/overwrite ENABLED
 
-    // RejectExistingNameModeMutation guards FOUR write entry points on DeltaTableWriter (AppendAsync,
-    // OverwriteAsync, CreateOrAppendAsync, CreateOrOverwriteAsync). Each MUST fail closed with a typed
-    // DeltaProtocolException (citing #525) and leave the table at its prior version (no corrupt commit);
-    // parametrizing gives every entry point its own oracle, so a targeted removal from any single path
-    // (e.g. just the overwrite door) turns THIS test red rather than shipping green.
-    [Theory]
-    [InlineData("Append")]
-    [InlineData("Overwrite")]
-    [InlineData("CreateOrAppend")]
-    [InlineData("CreateOrOverwrite")]
-    public async Task WriteToNameModeTable_IsRejectedFailClosed(string entryPoint)
+    // #525 round-trip: create a name-mode table, APPEND more rows through the facade, and read back ALL rows
+    // by LOGICAL names. The appended file physically carries the col-<uuid> PHYSICAL names (the reader
+    // resolves by physicalName), so a positional/name misroute would corrupt the read.
+    [Fact]
+    public async Task NameMode_Append_ReadsBackAllRows_AndAppendedFileCarriesPhysicalNames()
+    {
+        // A single shared deterministic file-name counter across create + append so the two writes never
+        // collide on the same physical path (create ⇒ part-file0, append ⇒ part-file1).
+        Func<string> names = FileNames();
+
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names))
+        {
+            await target.CreateNameMappedTableAsync(
+                FlatSchema, Array.Empty<string>(),
+                new[] { FlatBatch(new[] { (1L, 100L, (string?)"alice") }) },
+                new SeededPhysicalNameSource(Seed));
+        }
+
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names))
+        {
+            DeltaWriteResult result = await target.AppendAsync(
+                FlatSchema, Array.Empty<string>(),
+                new[] { FlatBatch(new[] { (2L, 200L, (string?)"bob"), (3L, 300L, (string?)null) }) });
+            Assert.Equal(1L, result.Version);
+        }
+
+        using var backend = new LocalFileSystemBackend(_root);
+        Snapshot snapshot = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
+
+        // The teeth: EVERY active data file (the original AND the appended one) physically stores the
+        // col-<uuid> PHYSICAL names — a corrupt append would land a logical-named file here.
+        Assert.Equal(2, snapshot.ActiveFiles.Length);
+        foreach (AddFileAction add in snapshot.ActiveFiles)
+        {
+            string[] physical = await ReadParquetColumnNamesAsync(add.Path);
+            Assert.Equal(new[] { PhysId, PhysScore, PhysName }, physical);
+        }
+
+        // Read back through the facade by LOGICAL names: all three rows, correctly associated.
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        List<(long Id, long? Score, string? Name)> rows = await ReadRowsAsync(source, info.Version);
+        Assert.Equal(
+            new (long, long?, string?)[] { (1L, 100L, "alice"), (2L, 200L, "bob"), (3L, 300L, null) },
+            rows.OrderBy(r => r.Id).ToList());
+    }
+
+    // #525 partitioned append: the appended file's add.partitionValues are keyed by the PHYSICAL partition
+    // name (matching the create path / Delta writer requirement), and read-back resolves by logical name.
+    [Fact]
+    public async Task NameMode_PartitionedAppend_PartitionValuesKeyedByPhysicalName_AndReadBack()
+    {
+        var schema = new StructType(new[]
+        {
+            new StructField("region", DataTypes.StringType, nullable: true),
+            new StructField("id", DataTypes.LongType, nullable: false),
+        });
+        Func<string> names = FileNames();
+
+        static ManagedColumnBatch Batch(StructType s, string region, long id)
+        {
+            MutableColumnVector r = ColumnVectors.Create(DataTypes.StringType, 1);
+            MutableColumnVector i = ColumnVectors.Create(DataTypes.LongType, 1);
+            r.AppendBytes(Encoding.UTF8.GetBytes(region));
+            i.AppendValue(id);
+            return new ManagedColumnBatch(s, new ColumnVector[] { r, i }, 1);
+        }
+
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names))
+        {
+            await target.CreateNameMappedTableAsync(
+                schema, new[] { "region" }, new[] { Batch(schema, "us", 1L) }, new SeededPhysicalNameSource(Seed));
+        }
+
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names))
+        {
+            await target.AppendAsync(schema, new[] { "region" }, new[] { Batch(schema, "eu", 2L) });
+        }
+
+        using var backend = new LocalFileSystemBackend(_root);
+        Snapshot snapshot = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
+        string physicalRegion = ColumnMapping.PhysicalName(snapshot.Schema[0], ColumnMappingMode.Name);
+
+        // metaData.partitionColumns stay LOGICAL; every add (create + append) keys partitionValues PHYSICALLY.
+        Assert.Equal(new[] { "region" }, snapshot.Metadata.PartitionColumns.ToArray());
+        Assert.Equal(2, snapshot.ActiveFiles.Length);
+        Assert.All(snapshot.ActiveFiles, add => Assert.True(add.PartitionValues.ContainsKey(physicalRegion)));
+        Assert.DoesNotContain(snapshot.ActiveFiles, add => add.PartitionValues.ContainsKey("region"));
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        var rows = new List<(string?, long)>();
+        foreach (ColumnBatch b in await source.ReadBatchesAsync(info.Version))
+        {
+            for (int r = 0; r < b.LogicalRowCount; r++)
+            {
+                ColumnVector rc = b.SelectedColumn(0);
+                ColumnVector ic = b.SelectedColumn(1);
+                rows.Add((rc.IsNull(r) ? null : Encoding.UTF8.GetString(rc.GetBytes(r)), ic.GetValue<long>(r)));
+            }
+        }
+
+        Assert.Equal(
+            new (string?, long)[] { ("eu", 2L), ("us", 1L) },
+            rows.OrderBy(r => r.Item1, StringComparer.Ordinal).ToList());
+    }
+
+    // #525: OVERWRITE an existing name-mode table replaces its rows; the new file carries PHYSICAL names and
+    // read-back returns only the new rows.
+    [Fact]
+    public async Task NameMode_Overwrite_ReadsBackNewRows()
+    {
+        Func<string> names = FileNames();
+
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names))
+        {
+            await target.CreateNameMappedTableAsync(
+                FlatSchema, Array.Empty<string>(),
+                new[] { FlatBatch(new[] { (1L, 100L, (string?)"alice"), (2L, 200L, (string?)"bob") }) },
+                new SeededPhysicalNameSource(Seed));
+        }
+
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names))
+        {
+            DeltaWriteResult result = await target.OverwriteAsync(
+                FlatSchema, Array.Empty<string>(),
+                new[] { FlatBatch(new[] { (9L, 900L, (string?)"zoe") }) },
+                DeltaPartitionOverwriteMode.Static);
+            Assert.Equal(1L, result.Version);
+        }
+
+        using var backend = new LocalFileSystemBackend(_root);
+        Snapshot snapshot = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
+        Assert.Single(snapshot.ActiveFiles);
+        Assert.Equal(new[] { PhysId, PhysScore, PhysName }, await ReadParquetColumnNamesAsync(snapshot.ActiveFiles[0].Path));
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        List<(long Id, long? Score, string? Name)> rows = await ReadRowsAsync(source, info.Version);
+        Assert.Equal(new (long, long?, string?)[] { (9L, 900L, "zoe") }, rows);
+    }
+
+    // #525 identity preservation: an append must REUSE the table's existing per-field id/physicalName and
+    // leave delta.columnMapping.maxColumnId untouched — never re-mint a physical name for an existing column.
+    [Fact]
+    public async Task NameMode_Append_PreservesColumnIdentityAndMaxColumnId()
+    {
+        Func<string> names = FileNames();
+
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names))
+        {
+            await target.CreateNameMappedTableAsync(
+                FlatSchema, Array.Empty<string>(),
+                new[] { FlatBatch(new[] { (1L, 100L, (string?)"alice") }) },
+                new SeededPhysicalNameSource(Seed));
+        }
+
+        using var backend = new LocalFileSystemBackend(_root);
+        Snapshot before = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
+        string maxIdBefore = before.Metadata.Configuration[ColumnMapping.MaxColumnIdKey];
+        string schemaBefore = before.Metadata.SchemaString;
+
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names))
+        {
+            await target.AppendAsync(
+                FlatSchema, Array.Empty<string>(),
+                new[] { FlatBatch(new[] { (2L, 200L, (string?)"bob") }) });
+        }
+
+        Snapshot after = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
+
+        // The mapped schema (per-field id + physicalName) and maxColumnId are byte-for-byte unchanged — a
+        // metadata-free data append never re-mints or bumps the mapping.
+        Assert.Equal(schemaBefore, after.Metadata.SchemaString);
+        Assert.Equal(maxIdBefore, after.Metadata.Configuration[ColumnMapping.MaxColumnIdKey]);
+        AssertMapping(after.Schema[0], "id", 1L, PhysId);
+        AssertMapping(after.Schema[1], "score", 2L, PhysScore);
+        AssertMapping(after.Schema[2], "name", 3L, PhysName);
+    }
+
+    // #525 corruption-guard TEETH (writer level): staging a LOGICAL-named file into a name-mode table is
+    // rejected fail-closed by the #497 physical write-schema validation (footer schema derived from the real
+    // bytes ≠ the table's PHYSICAL expected schema). This is the last-line defense that makes the write
+    // fail-closed if anything ever staged logical names into a physical-name table.
+    [Fact]
+    public async Task NameModeAppend_WithLogicalNamedFile_IsRejectedFailClosed()
     {
         await CreateNameMappedAsync((1L, 100L, "alice"));
 
         using var backend = new LocalFileSystemBackend(_root);
         var writer = new DeltaTableWriter(backend);
 
-        // Stage a lone data file (partition-free) and try to mutate the existing name-mode table via the
-        // entry point under test: each must be rejected fail-closed (a silent, corrupt commit is the bug).
+        // A staged file whose footer (DataSchema) carries the LOGICAL names id/score/name — exactly the
+        // corrupt shape a non-mapping-aware staging path would produce.
         var staged = new[]
         {
             new StagedDataFile(
-                "part-appended.parquet",
+                "part-logical.parquet",
                 System.Collections.Immutable.ImmutableSortedDictionary<string, string?>.Empty,
                 Size: 1,
                 ModificationTime: 0,
-                Stats: null),
+                Stats: null,
+                DataSchema: FlatSchema),
         };
 
-        Task<DeltaCommitResult> Attempt() => entryPoint switch
-        {
-            "Append" => writer.AppendAsync(FlatSchema, staged),
-            "Overwrite" => writer.OverwriteAsync(FlatSchema, staged),
-            "CreateOrAppend" => writer.CreateOrAppendAsync(FlatSchema, Array.Empty<string>(), staged),
-            "CreateOrOverwrite" => writer.CreateOrOverwriteAsync(FlatSchema, Array.Empty<string>(), staged),
-            _ => throw new Xunit.Sdk.XunitException($"Unknown entry point '{entryPoint}'."),
-        };
+        await Assert.ThrowsAsync<DeltaSchemaMismatchException>(() => writer.AppendAsync(FlatSchema, staged));
 
-        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(Attempt);
-        Assert.Contains("525", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("name-mode", ex.Message, StringComparison.OrdinalIgnoreCase);
-
-        // The rejected mutation must NOT have committed: the table is still at v0 with its original row.
+        // The rejected write did not commit: the table is still at v0.
         using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
         DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
         Assert.Equal(0L, info.Version);
+    }
+
+    // #525: overwriteSchema (wholesale schema replacement) stays fail-closed for a name-mode table (it would
+    // desync the columnMapping id/maxColumnId configuration from the replaced schema).
+    [Fact]
+    public async Task OverwriteSchema_OnNameModeTable_IsRejectedFailClosed()
+    {
+        Func<string> names = FileNames();
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names))
+        {
+            await target.CreateNameMappedTableAsync(
+                FlatSchema, Array.Empty<string>(),
+                new[] { FlatBatch(new[] { (1L, 100L, (string?)"alice") }) },
+                new SeededPhysicalNameSource(Seed));
+        }
+
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names))
+        {
+            DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+                () => target.OverwriteAsync(
+                    FlatSchema, Array.Empty<string>(),
+                    new[] { FlatBatch(new[] { (9L, 900L, (string?)"zoe") }) },
+                    DeltaPartitionOverwriteMode.Static,
+                    overwriteSchema: true));
+            Assert.Contains("525", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("overwriteSchema", ex.Message, StringComparison.Ordinal);
+        }
+
+        // Fail-closed: the table is unchanged at v0.
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        Assert.Equal(0L, (await source.LoadSnapshotAsync(null, null)).Version);
+    }
+
+    // #525 regression: `id` mode stays fail-closed on the WRITE path too (it is rejected at snapshot load —
+    // #523 is a separate, dependency-blocked issue). Only `name` mode append/overwrite is newly enabled.
+    [Fact]
+    public async Task IdModeAppend_IsRejectedFailClosed_DeferredTo523()
+    {
+        // A protocol-supported columnMapping table declaring mode = id (raw commit, empty schema).
+        await WriteRawTableAsync(
+            protocol: ProtocolFeatureLine(),
+            metadata: MetadataLine(("delta.columnMapping.mode", "id"), ("delta.columnMapping.maxColumnId", "2")));
+
+        using DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), FileNames());
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => target.AppendAsync(
+                FlatSchema, Array.Empty<string>(),
+                new[] { FlatBatch(new[] { (1L, 100L, (string?)"alice") }) }));
+        Assert.Contains("'id'", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("523", ex.Message, StringComparison.Ordinal);
     }
 
     // ---------------------------------------------------------------- MEDIUM #4/#5: partition rename/drop
