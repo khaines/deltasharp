@@ -1,6 +1,9 @@
+using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.Linq;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
+using DeltaSharp.Types;
 using Xunit;
 
 namespace DeltaSharp.Storage.Tests.Delta;
@@ -150,5 +153,69 @@ public sealed class TypeWideningProtocolTests : IDisposable
 
         Assert.Equal(new[] { "typeWidening-preview" }, upgraded.ReaderFeatures.ToArray());
         Assert.Equal(new[] { "typeWidening-preview" }, upgraded.WriterFeatures.ToArray());
+    }
+
+    // ---- #534/#549: EnsureUpgradeable — refuse dropping an active legacy feature ----
+
+    [Fact]
+    public void EnsureUpgradeable_LegacyCleanTable_IsAllowed()
+    {
+        // A plain legacy (writer 2) table with no active appendOnly / constraint / invariant is upgradeable.
+        TypeWideningFeature.EnsureUpgradeable(
+            new ProtocolAction(1, 2, [], []),
+            new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) }),
+            ImmutableDictionary<string, string>.Empty);
+    }
+
+    [Fact]
+    public void EnsureUpgradeable_TableFeaturesTable_WithAppendOnlyConfig_IsAllowed()
+    {
+        // A table already on writer 7 has all active features explicitly enumerated (and UpgradeProtocol
+        // preserves them), so it is always upgradeable — even if delta.appendOnly is set (that feature would
+        // already be in writerFeatures on such a table).
+        TypeWideningFeature.EnsureUpgradeable(
+            new ProtocolAction(3, 7, ["appendOnly"], ["appendOnly"]),
+            new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) }),
+            new Dictionary<string, string> { ["delta.appendOnly"] = "true" });
+    }
+
+    [Fact]
+    public void EnsureUpgradeable_LegacyAppendOnlyTable_Throws()
+    {
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() =>
+            TypeWideningFeature.EnsureUpgradeable(
+                new ProtocolAction(1, 2, [], []),
+                new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) }),
+                new Dictionary<string, string> { ["delta.appendOnly"] = "true" }));
+        Assert.Contains("#549", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void EnsureUpgradeable_LegacyTableWithCheckConstraint_Throws()
+    {
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() =>
+            TypeWideningFeature.EnsureUpgradeable(
+                new ProtocolAction(1, 2, [], []),
+                new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) }),
+                new Dictionary<string, string> { ["delta.constraints.ck"] = "id > 0" }));
+        Assert.Contains("#549", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void EnsureUpgradeable_LegacyTableWithColumnInvariant_Throws()
+    {
+        var invariantField = new StructField(
+            "id", DataTypes.LongType, nullable: false,
+            FieldMetadata.FromEntries(new[]
+            {
+                new KeyValuePair<string, string>("delta.invariants", "{\"expression\":{\"expression\":\"id > 0\"}}"),
+            }));
+
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() =>
+            TypeWideningFeature.EnsureUpgradeable(
+                new ProtocolAction(1, 2, [], []),
+                new StructType(new[] { invariantField }),
+                ImmutableDictionary<string, string>.Empty));
+        Assert.Contains("#549", ex.Message, StringComparison.Ordinal);
     }
 }

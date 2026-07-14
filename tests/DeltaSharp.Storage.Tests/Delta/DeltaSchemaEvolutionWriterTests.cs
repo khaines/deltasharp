@@ -674,11 +674,18 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
     [Fact]
     public async Task EnableTypeWidening_OnPlainTable_UpgradesProtocolAndSetsProperty_MetadataOnly()
     {
-        // A plain table (reader 1 / writer 2, no features, type widening NOT enabled). #534: enabling type
-        // widening commits a METADATA-ONLY protocol + metaData upgrade — reader→3 / writer→7 with
-        // `typeWidening` in BOTH feature lists and `delta.enableTypeWidening=true` — with no data file added
-        // or removed.
-        await SeedSchemaTableAsync(Struct(F("value", DataTypes.IntegerType, nullable: true)));
+        // A plain table (reader 1 / writer 2, no features, type widening NOT enabled) WITH an active data
+        // file. #534: enabling type widening commits a METADATA-ONLY protocol + metaData upgrade — reader→3 /
+        // writer→7 with `typeWidening` in BOTH feature lists and `delta.enableTypeWidening=true` — that adds
+        // no data file and, critically, does NOT echo the table's existing active `add` into the upgrade
+        // commit (seeding a v0 data file makes the zero-add/zero-remove assertions non-vacuous).
+        var initial = Struct(F("value", DataTypes.IntegerType, nullable: true));
+        await WriteNarrowIntFileAsync("v0.parquet", new[] { 1, 2, 3 });
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 0,
+            DeltaTestHarness.Protocol(minReader: 1, minWriter: 2),
+            DeltaTestHarness.MetadataWithSchema(initial),
+            DeltaTestHarness.Add("v0.parquet"));
 
         DeltaCommitResult result = await Writer().EnableTypeWideningAsync();
         Assert.False(result.Skipped);
@@ -691,8 +698,11 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
         Assert.Contains(TypeWideningFeature.Feature, after.Protocol.ReaderFeatures);
         Assert.Contains(TypeWideningFeature.Feature, after.Protocol.WriterFeatures);
         Assert.Equal("true", after.Metadata.Configuration[TypeWideningFeature.EnablePropertyKey]);
+        // The prior data file stays active (metadata-only upgrade never rewrites/removes data).
+        Assert.Equal(new[] { "v0.parquet" }, ActivePaths(after));
 
-        // Metadata-only: the upgrade commit carries exactly one protocol + one metaData, no add/remove.
+        // Metadata-only: the upgrade commit (version 1) carries exactly one protocol + one metaData, and does
+        // NOT echo the table's existing active `add` (v0, committed at version 0) — no add/remove at all.
         IReadOnlyList<DeltaAction> committed = await Log().ReadCommitActionsAsync(result.Version, CancellationToken.None);
         Assert.Single(committed.OfType<ProtocolAction>());
         Assert.Single(committed.OfType<MetadataAction>());
@@ -706,10 +716,10 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
         // Enable-on-existing THEN widen: a plain int table with a data file, enable type widening, then append
         // a `long`-typed column — the same-family widening int→long is now APPLIED (merged schema carries
         // `long` + a delta.typeChanges entry), where before enablement it fails closed (see
-        // Append_WidenIntToDouble_WhenFeatureDisabled and #495's disabled-path tests). The old int file is not
-        // rewritten.
+        // Append_WidenIntToDouble_WhenFeatureDisabled and #495's disabled-path tests). The old int file is NOT
+        // rewritten — it stays active and reads back promoted into the widened `long` type.
         var initial = Struct(F("value", DataTypes.IntegerType, nullable: true));
-        await WriteNarrowIntFileAsync("v0.parquet", new[] { 1, 2, 3 });
+        byte[] oldFile = await WriteNarrowIntFileAsync("v0.parquet", new[] { 1, 2, 3 });
         await DeltaTestHarness.WriteCommitAsync(
             _backend, 0,
             DeltaTestHarness.Protocol(minReader: 1, minWriter: 2),
@@ -724,9 +734,16 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
             new[] { Staged("v1.parquet") },
             SchemaEvolutionMode.MergeSchema);
 
-        StructField field = (await LoadAsync()).Schema["value"];
+        Snapshot after = await LoadAsync();
+        StructType evolved = after.Schema;
+        StructField field = evolved["value"];
         Assert.Equal(DataTypes.LongType, field.DataType);
         Assert.True(field.Metadata.TryGetValue("delta.typeChanges", out _));
+        // The old narrow int file is not rewritten — still active — and reads back promoted into `long`.
+        Assert.Contains("v0.parquet", ActivePaths(after));
+        List<ColumnBatch> promoted = await ParquetTestHelpers.ReadAllAsync(
+            oldFile, evolved, keepRowGroup: null, allowTypeWideningPromotion: true);
+        Assert.Equal(new[] { 1L, 2L, 3L }, promoted.Single().Column(0).GetValues<long>().ToArray());
     }
 
     [Fact]
@@ -767,6 +784,73 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
         Assert.Contains(TypeWideningFeature.Feature, after.Protocol.ReaderFeatures);
         Assert.Contains(TypeWideningFeature.Feature, after.Protocol.WriterFeatures);
         Assert.True(TypeWideningFeature.IsWriteEnabled(after));
+    }
+
+    [Fact]
+    public async Task EnableTypeWidening_WhenFeaturePresentButPropertyUnset_SetsPropertyOnly()
+    {
+        // Partial state: a table declares the `typeWidening` feature (reader 3 / writer 7) but has NOT set
+        // `delta.enableTypeWidening`. IsWriteEnabled is false (both are required), so EnableTypeWideningAsync
+        // completes the enablement by setting the property; the protocol is already at the floor with the
+        // feature present, so it converges to a supported+enabled table.
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 0,
+            DeltaTestHarness.ProtocolWithReaderFeature("typeWidening"),
+            DeltaTestHarness.MetadataWithSchema(Struct(F("value", DataTypes.IntegerType, nullable: true))));
+
+        DeltaCommitResult result = await Writer().EnableTypeWideningAsync();
+
+        Assert.False(result.Skipped);
+        Snapshot after = await LoadAsync();
+        Assert.True(TypeWideningFeature.IsWriteEnabled(after));
+        Assert.Equal("true", after.Metadata.Configuration[TypeWideningFeature.EnablePropertyKey]);
+    }
+
+    [Fact]
+    public async Task EnableTypeWidening_WhenPropertySetButFeatureAbsent_AddsFeatureAndUpgrades()
+    {
+        // Malformed state: a legacy table (reader 1 / writer 2) has `delta.enableTypeWidening=true` in its
+        // config but does NOT declare the feature. IsWriteEnabled is false (Supports() is false), so
+        // EnableTypeWideningAsync adds the feature and upgrades the protocol — converging to a supported +
+        // enabled table.
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 0,
+            DeltaTestHarness.Protocol(minReader: 1, minWriter: 2),
+            DeltaTestHarness.MetadataWithSchemaAndConfig(
+                Struct(F("value", DataTypes.IntegerType, nullable: true)),
+                new[] { ("delta.enableTypeWidening", "true") }));
+
+        DeltaCommitResult result = await Writer().EnableTypeWideningAsync();
+
+        Assert.False(result.Skipped);
+        Snapshot after = await LoadAsync();
+        Assert.True(TypeWideningFeature.IsWriteEnabled(after));
+        Assert.Contains(TypeWideningFeature.Feature, after.Protocol.WriterFeatures);
+        Assert.Equal(ProtocolSupport.TableFeaturesWriterVersion, after.Protocol.MinWriterVersion);
+    }
+
+    [Theory]
+    [InlineData("delta.appendOnly", "true")]      // active append-only (implicit legacy feature)
+    [InlineData("delta.constraints.ck", "id > 0")] // a CHECK constraint (legacy invariants feature)
+    public async Task EnableTypeWidening_OnLegacyTableWithActiveConstraint_IsRefusedFailClosed(
+        string configKey, string configValue)
+    {
+        // #549: a FOREIGN legacy (writer < 7) table that currently declares an ACTIVE appendOnly / CHECK
+        // constraint cannot be upgraded to the table-features protocol by this build without silently
+        // deactivating that feature (this build cannot enumerate it as a table feature). EnableTypeWideningAsync
+        // refuses fail-closed and writes NO new version, rather than corrupt another engine's guarantees.
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 0,
+            DeltaTestHarness.Protocol(minReader: 1, minWriter: 2),
+            DeltaTestHarness.MetadataWithSchemaAndConfig(
+                Struct(F("value", DataTypes.IntegerType, nullable: true)),
+                new[] { (configKey, configValue) }));
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => Writer().EnableTypeWideningAsync());
+
+        Assert.Contains("#549", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0L, (await LoadAsync()).Version); // no new version published
     }
 
     [Fact]

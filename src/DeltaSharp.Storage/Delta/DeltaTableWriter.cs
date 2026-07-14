@@ -647,6 +647,11 @@ internal sealed class DeltaTableWriter
             return new DeltaCommitResult(snapshot.Version, Attempts: 0, Skipped: true);
         }
 
+        // Interop safety (#549): refuse fail-closed rather than silently deactivate a legacy (writer < 7)
+        // appendOnly / invariant / CHECK constraint this build cannot carry as an explicit table feature
+        // through the table-features upgrade.
+        TypeWideningFeature.EnsureUpgradeable(snapshot.Protocol, snapshot.Schema, snapshot.Metadata.Configuration);
+
         // The upgraded protocol (adds typeWidening, preserving existing features + raising the version floors)
         // and the metaData carrying delta.enableTypeWidening=true. Both are needed: the protocol makes the
         // feature SUPPORTED, the property makes a widening APPLIED (Delta "Writer Requirements for Type
