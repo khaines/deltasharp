@@ -224,24 +224,28 @@ internal sealed class DeltaDelete
         // AC3 protocol gate: fail closed unless the table declares AND enables deletion vectors.
         DeletionVectorsFeature.EnsureWriteEnabled(readSnapshot);
 
-        // Column-mapping resolution for the WRITE path (#529). `id` mode STAYS fail-closed (#523:
-        // EnsureReadWriteSupported rejects it — the name-based Parquet reader cannot resolve field ids, so a
-        // DELETE could mis-associate columns and delete wrong rows). `name` mode is resolved by relabeling
-        // physical<->logical EXACTLY as the READ path (DeltaReadSource) does: the physically-named Parquet
-        // data is read under its physical schema and presented to the predicate under the LOGICAL table
-        // schema, while the emitted deletion vector stays POSITIONAL over the PHYSICAL data file (column
-        // mapping never changes a row's physical position — the DV row-index semantics are unaffected).
-        // `none` mode is unchanged (physical name == logical name). A nested (struct/array/map) top-level
-        // column under name mapping is rejected fail-closed in ResolvePhysicalNames (nested column mapping is
-        // unsupported) rather than risk a wrong delete.
+        // Column-mapping resolution for the WRITE path (#529). `id` mode STAYS fail-closed (#523): the
+        // name-based Parquet reader cannot resolve field ids, so a DELETE could mis-associate columns and
+        // delete wrong rows. The PRIMARY, tested choke point is snapshot load — DeltaLog rejects an id-mode
+        // table via ColumnMapping.EnsureModeGate before any snapshot reaches here, so `readSnapshot` is
+        // already name/none. The EnsureReadWriteSupported call below is intentional DEFENSE-IN-DEPTH (a
+        // future caller that constructs/passes a snapshot NOT loaded through that gate — e.g. the internal
+        // test seam — must still fail closed); it is pinned independently by
+        // Delta_IdMode_FailsClosed_AtDeleteLocalGuard. `name` mode is resolved by relabeling
+        // physical<->logical EXACTLY as the READ path does — through the shared ColumnMappingProjection seam,
+        // so DELETE and DeltaReadSource resolve identically — while the emitted deletion vector stays
+        // POSITIONAL over the PHYSICAL data file (column mapping never changes a row's physical position — the
+        // DV row-index semantics are unaffected). `none` mode is unchanged (physical name == logical name). A
+        // nested (struct/array/map) top-level column under name mapping is rejected fail-closed in
+        // ColumnMappingProjection.ResolvePhysicalNames rather than risk a wrong delete.
         ColumnMappingMode mappingMode = ColumnMapping.ResolveMode(readSnapshot.Metadata.Configuration);
         ColumnMapping.EnsureReadWriteSupported(mappingMode);
 
         StructType tableSchema = readSnapshot.Schema;
         ImmutableArray<string> partitionColumns = readSnapshot.Metadata.PartitionColumns;
-        string[] physicalNames = ResolvePhysicalNames(tableSchema, mappingMode);
-        StructType dataSchema = BuildDataSchema(tableSchema, physicalNames, partitionColumns);
-        int[] dataOrdinalByField = MapDataOrdinals(physicalNames, dataSchema);
+        string[] physicalNames = ColumnMappingProjection.ResolvePhysicalNames(tableSchema, mappingMode);
+        StructType dataSchema = ColumnMappingProjection.BuildDataSchema(tableSchema, physicalNames, partitionColumns);
+        int[] dataOrdinalByField = ColumnMappingProjection.MapDataOrdinals(physicalNames, dataSchema);
         long timestamp = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
 
         // Read-side type-widening promotion gate (#495): a narrow-physical file is promoted into the current
@@ -372,7 +376,8 @@ internal sealed class DeltaDelete
                 .ReadAsync(stream, dataSchema, keepRowGroup: null, nullFillMissingColumns: false, allowTypeWideningPromotion, cancellationToken)
                 .ConfigureAwait(false))
             {
-                ColumnBatch fullBatch = BuildFullBatch(add, tableSchema, physicalNames, dataOrdinalByField, dataBatch);
+                ColumnBatch fullBatch = ColumnMappingProjection.BuildFullBatch(
+                    add, tableSchema, physicalNames, dataOrdinalByField, dataBatch);
                 for (int row = 0; row < fullBatch.RowCount; row++)
                 {
                     if (predicate.Matches(fullBatch, row))
@@ -422,35 +427,6 @@ internal sealed class DeltaDelete
         return DeletionVectorDescriptor.ForRelativePath(pathOrInlineDv, offset, sizeInBytes, cardinality);
     }
 
-    // Assembles one full-schema LOGICAL batch, RELABELED from the physical Parquet data exactly as the READ
-    // path (DeltaReadSource.BuildFullBatch) does: partition columns are const/null-filled from the add's
-    // partitionValues (keyed by the column's PHYSICAL name — that is how Delta records partition-value keys
-    // under column mapping), data columns are taken from the projected physical-name Parquet batch. The
-    // output batch carries the LOGICAL table schema, so the predicate always sees LOGICAL column names/values
-    // even when a column's physical name differs (name mode). In none mode physical == logical, so this is
-    // exactly the prior behavior.
-    private static ColumnBatch BuildFullBatch(
-        AddFileAction add, StructType tableSchema, string[] physicalNames, int[] dataOrdinalByField, ColumnBatch dataBatch)
-    {
-        int rowCount = dataBatch.RowCount;
-        var columns = new ColumnVector[tableSchema.Count];
-        for (int i = 0; i < tableSchema.Count; i++)
-        {
-            int dataOrdinal = dataOrdinalByField[i];
-            if (dataOrdinal >= 0)
-            {
-                columns[i] = dataBatch.Column(dataOrdinal);
-                continue;
-            }
-
-            StructField field = tableSchema[i];
-            add.PartitionValues.TryGetValue(physicalNames[i], out string? value);
-            columns[i] = DeltaReadEncoding.BuildConstantColumn(field.DataType, value, rowCount);
-        }
-
-        return new ManagedColumnBatch(tableSchema, columns, rowCount);
-    }
-
     // Tombstone the prior logical file, carrying its PRIOR deletion vector so the remove's identity key
     // matches the active add's (SnapshotState keys by path + DV uniqueId). dataChange=true (a delete changes
     // visible data); ExtendedFileMetadata=true round-trips partitionValues/size for checkpoint fidelity.
@@ -481,76 +457,6 @@ internal sealed class DeltaDelete
             NullCount = EmptyNullCount,
             TightBounds = false,
         };
-    }
-
-    // The PHYSICAL name of each table-schema field (in field order): the declared
-    // delta.columnMapping.physicalName in name mode, the field's own name in none mode — mirroring
-    // DeltaReadSource.ResolvePhysicalNames so the DELETE reads/relabels IDENTICALLY to the reader. A nested
-    // (struct/array/map) top-level column under name mapping is rejected fail-closed (nested column mapping is
-    // unsupported in this build) rather than risk mis-associating columns and deleting the wrong rows.
-    private static string[] ResolvePhysicalNames(StructType tableSchema, ColumnMappingMode mode)
-    {
-        var names = new string[tableSchema.Count];
-        for (int i = 0; i < tableSchema.Count; i++)
-        {
-            StructField field = tableSchema[i];
-            if (mode == ColumnMappingMode.Name && field.DataType is StructType or ArrayType or MapType)
-            {
-                throw DeltaProtocolException.Unsupported(
-                    string.Create(
-                        CultureInfo.InvariantCulture,
-                        $"Column '{field.Name}' is a nested ({field.DataType.TypeName}) type; nested column "
-                        + $"mapping is unsupported in this build. A merge-on-read DELETE against it fails "
-                        + $"closed rather than risk deleting the wrong rows. Only top-level (leaf) columns are "
-                        + $"supported in column mapping 'name' mode."));
-            }
-
-            names[i] = ColumnMapping.PhysicalName(field, mode);
-        }
-
-        return names;
-    }
-
-    // The table's DATA schema: the full schema minus the partition columns (partition values live on the add
-    // action, never inside the Parquet file), with each remaining field named by its PHYSICAL name — the
-    // exact shape a name-mode Parquet data file stores (mirrors DeltaReadSource.BuildDataSchema). Partition
-    // MEMBERSHIP is decided by the LOGICAL field name against metaData.partitionColumns (which holds LOGICAL
-    // names under name mode); the partition VALUE KEY stays PHYSICAL (looked up in BuildFullBatch). In none
-    // mode logical == physical, so this is exactly the prior behavior.
-    private static StructType BuildDataSchema(
-        StructType tableSchema, string[] physicalNames, ImmutableArray<string> partitionColumns)
-    {
-        var partitionSet = partitionColumns.IsDefaultOrEmpty
-            ? null
-            : partitionColumns.ToImmutableHashSet(StringComparer.Ordinal);
-
-        var dataFields = new List<StructField>(tableSchema.Count);
-        for (int i = 0; i < tableSchema.Count; i++)
-        {
-            StructField field = tableSchema[i];
-            if (partitionSet is not null && partitionSet.Contains(field.Name))
-            {
-                continue;
-            }
-
-            dataFields.Add(new StructField(physicalNames[i], field.DataType, field.Nullable));
-        }
-
-        return new StructType(dataFields);
-    }
-
-    // For each table-schema field, its ordinal in the physical (Parquet) data schema matched by the field's
-    // PHYSICAL name, or -1 for a partition column (const/null-filled from the add's partitionValues) — mirrors
-    // DeltaReadSource.MapDataOrdinals.
-    private static int[] MapDataOrdinals(string[] physicalNames, StructType dataSchema)
-    {
-        var map = new int[physicalNames.Length];
-        for (int i = 0; i < physicalNames.Length; i++)
-        {
-            map[i] = dataSchema.IndexOf(physicalNames[i]);
-        }
-
-        return map;
     }
 
     private static void SetOutcomeTag(Activity? activity, DeleteOutcome outcome) =>

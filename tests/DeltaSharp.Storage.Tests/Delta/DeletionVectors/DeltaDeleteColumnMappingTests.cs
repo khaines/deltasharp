@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Text;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage;
@@ -165,9 +166,12 @@ public sealed class DeltaDeleteColumnMappingTests : IDisposable
     [Fact]
     public async Task Delete_IdMode_FailsClosed_DeferredTo523()
     {
-        // A raw id-mode table declaring the deletionVectors + columnMapping features. A DELETE must fail
-        // closed (id mode resolves columns by Parquet field_id — not implemented; a wrong relabel would
-        // delete the wrong rows), never write a DV.
+        // END-TO-END fail-closed: a raw id-mode table declaring the deletionVectors + columnMapping features.
+        // A DELETE via the public path loads the snapshot through DeltaLog, whose column-mapping gate
+        // (ColumnMapping.EnsureModeGate -> EnsureReadWriteSupported) is the PRIMARY choke point and rejects
+        // id mode at LOAD, before any file is scanned or DV written (id mode resolves columns by Parquet
+        // field_id — not implemented; a wrong relabel would delete the wrong rows). The DELETE-local guard is
+        // pinned separately/independently by Delete_IdMode_FailsClosed_AtDeleteLocalGuard_Independent.
         await WriteRawIdModeTableAsync();
 
         var delete = NewDelete("id-mode-fail-closed");
@@ -177,6 +181,80 @@ public sealed class DeltaDeleteColumnMappingTests : IDisposable
 
         // The table is untouched: no DV .bin was written.
         Assert.Equal(0, CountFiles("*.bin"));
+    }
+
+    [Fact]
+    public async Task Delete_IdMode_FailsClosed_AtDeleteLocalGuard_Independent()
+    {
+        // Reliability oracle (#529): the DELETE-local fail-closed guard
+        // (ColumnMapping.EnsureReadWriteSupported in DeltaDelete.RunDeleteAsync) is DEFENSE-IN-DEPTH,
+        // secondary to the primary snapshot-load gate that Delete_IdMode_FailsClosed_DeferredTo523 exercises.
+        // Pin it INDEPENDENTLY: hand-build an id-mode snapshot that never passed through DeltaLog's
+        // EnsureModeGate, feed it to the internal read-snapshot seam, and require the DELETE to STILL fail
+        // closed at its own guard (never fall through to a field-id-blind name/positional read that could
+        // delete the wrong rows). If the DELETE-local guard were removed, this DELETE would proceed (empty
+        // active files -> silent no-op) and NOT throw — so this test makes that guard independently
+        // load-bearing.
+        Snapshot idModeSnapshot = BuildUngatedColumnMappingSnapshot(
+            mode: "id", schemaString: "{\"type\":\"struct\",\"fields\":[]}");
+
+        var delete = NewDelete("id-mode-local-guard");
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => delete.DeleteAsync(idModeSnapshot, WhereId(id => id == 1)));
+
+        Assert.Contains("column mapping mode 'id'", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, CountFiles("*.bin"));
+    }
+
+    // ----------------------------------------------------- name mode: nested top-level column fails closed
+
+    [Theory]
+    [InlineData("struct")]
+    [InlineData("array")]
+    [InlineData("map")]
+    public void ResolvePhysicalNames_NameMode_RejectsNestedTopLevelColumn(string kind)
+    {
+        // Security/QueryExec nit (#529): the DELETE (and read) path resolves physical names through the shared
+        // ColumnMappingProjection, which fails closed on a nested (struct/array/map) top-level column under
+        // name mapping — nested column mapping is unsupported in this build — rather than risk mis-associating
+        // columns and deleting the wrong rows. Pin that guard directly for each nested kind.
+        DataType nested = kind switch
+        {
+            "struct" => new StructType(new[] { new StructField("x", DataTypes.LongType, nullable: true) }),
+            "array" => new ArrayType(DataTypes.LongType),
+            _ => new MapType(DataTypes.StringType, DataTypes.LongType),
+        };
+        var schema = new StructType(new[]
+        {
+            new StructField("payload", nested, nullable: true),
+            new StructField("id", DataTypes.LongType, nullable: false),
+        });
+
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
+            () => ColumnMappingProjection.ResolvePhysicalNames(schema, ColumnMappingMode.Name));
+
+        Assert.Contains("nested", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("payload", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ResolvePhysicalNames_NoneMode_AllowsNestedTopLevelColumn()
+    {
+        // The nested-column rejection is NAME-mode specific: in none mode physical == logical (no relabel), so
+        // a nested column is NOT rejected here — it is served exactly as before column mapping. Guards against
+        // over-broad rejection that would regress plain (non-column-mapped) nested-schema tables.
+        var schema = new StructType(new[]
+        {
+            new StructField("id", DataTypes.LongType, nullable: false),
+            new StructField(
+                "payload", new StructType(new[] { new StructField("x", DataTypes.LongType, nullable: true) }),
+                nullable: true),
+        });
+
+        string[] names = ColumnMappingProjection.ResolvePhysicalNames(schema, ColumnMappingMode.None);
+
+        Assert.Equal(new[] { "id", "payload" }, names);
     }
 
     // ------------------------------------------------------------------ none mode: regression (unchanged)
@@ -238,6 +316,39 @@ public sealed class DeltaDeleteColumnMappingTests : IDisposable
         byte[] content = Encoding.UTF8.GetBytes(protocol + "\n" + metadata + "\n");
         await backend.PutIfAbsentAsync(
             "_delta_log/00000000000000000000.json", content, CancellationToken.None);
+    }
+
+    // A column-mapped, DV-enabled snapshot constructed DIRECTLY (not via DeltaLog.LoadSnapshotAsync), so it
+    // deliberately BYPASSES the snapshot-load column-mapping gate (ColumnMapping.EnsureModeGate). This lets a
+    // test reach DeltaDelete's OWN defense-in-depth guard with a mode the primary gate would otherwise have
+    // rejected at load. No data files are needed — the DELETE fails closed before any file is scanned.
+    private static Snapshot BuildUngatedColumnMappingSnapshot(string mode, string schemaString)
+    {
+        var protocol = new ProtocolAction(
+            3, 7,
+            ImmutableArray.Create("columnMapping", "deletionVectors"),
+            ImmutableArray.Create("columnMapping", "deletionVectors"));
+        ImmutableSortedDictionary<string, string> configuration = ImmutableSortedDictionary<string, string>.Empty
+            .Add("delta.columnMapping.mode", mode)
+            .Add("delta.columnMapping.maxColumnId", "8")
+            .Add("delta.enableDeletionVectors", "true");
+        var metadata = new MetadataAction(
+            Id: "ungated-colmap",
+            Name: null,
+            Description: null,
+            Format: new TableFormat("parquet", ImmutableSortedDictionary<string, string>.Empty),
+            SchemaString: schemaString,
+            PartitionColumns: ImmutableArray<string>.Empty,
+            Configuration: configuration,
+            CreatedTime: null);
+        return new Snapshot(
+            version: 0,
+            protocol,
+            metadata,
+            ImmutableArray<AddFileAction>.Empty,
+            ImmutableArray<RemoveFileAction>.Empty,
+            ImmutableSortedDictionary<string, long>.Empty,
+            SnapshotLoadMetrics.Empty);
     }
 
     private static DeltaDeletePredicate WhereId(Func<long, bool> match) =>
