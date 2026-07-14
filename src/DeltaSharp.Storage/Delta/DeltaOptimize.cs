@@ -15,29 +15,30 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace DeltaSharp.Storage.Delta;
 
 /// <summary>
-/// Thrown when OPTIMIZE encounters a compaction input that was written under an <b>older</b> table schema
-/// (an additively schema-evolved table, #190) so the file is physically narrower than the current snapshot
-/// data schema. Compacting such a file requires reading its inputs with null-fill of the absent, later-added
-/// columns and rewriting a widened compacted file; the read-side null-fill capability landed with #497 but
-/// OPTIMIZE deliberately still reads its inputs strictly (compaction-time null-fill is tracked separately in
-/// <b>#530</b>). Rather than surface the misleading raw <see cref="DeltaStorageException"/> ("column … not
-/// present in the Parquet file schema", which reads like file corruption), OPTIMIZE fails <b>closed</b> with
-/// this clear, actionable error: it is thrown <b>before</b> any commit, so the inputs stay active, the
-/// version is unchanged, and
-/// any already-written outputs are ignorable orphans (never a partial commit).
+/// Thrown when OPTIMIZE encounters a compaction input that is physically narrower than the current snapshot
+/// data schema in a way that <b>cannot be null-filled</b> — the current schema declares a <b>REQUIRED</b>
+/// (non-nullable) column that is absent from the older file. OPTIMIZE reads its inputs with read-side
+/// null-fill (#497/#530), so an additively-added <b>NULLABLE</b> column absent from an older file is
+/// null-filled and compacts normally; but a required lane cannot carry null, so an absent required column is
+/// genuinely unreadable under the current schema. ParquetFileReader surfaces this as a raw
+/// <see cref="DeltaStorageException"/> ("column … not present in the Parquet file schema", which reads like
+/// file corruption); rather than surface that misleading text, OPTIMIZE fails <b>closed</b> with this clear,
+/// actionable error. It is thrown <b>before</b> any commit, so the inputs stay active, the version is
+/// unchanged, and any already-written outputs are ignorable orphans (never a partial commit).
 /// </summary>
 internal sealed class OptimizeSchemaEvolutionException : Exception
 {
     internal OptimizeSchemaEvolutionException(string filePath, Exception innerException)
         : base(
-            $"OPTIMIZE cannot compact file '{filePath}' because it was written under an older table schema " +
-            "and OPTIMIZE compaction-time null-fill for the later-added column(s) is not yet implemented " +
-            "(issue #530; the read-path null-fill from #497 is not applied by OPTIMIZE). OPTIMIZE fails " +
-            "closed rather than compacting a file written under an older schema; the table is left " +
-            "unchanged. Re-run OPTIMIZE once #530 (OPTIMIZE compaction-time null-fill) lands.",
+            $"OPTIMIZE cannot compact file '{filePath}' because it is missing a REQUIRED (non-nullable) " +
+            "column that the current table schema declares, and a required column cannot be null-filled " +
+            "when compacting a file written under an older schema. OPTIMIZE fails closed rather than " +
+            "compacting such a file; the table is left unchanged. (Additively-added NULLABLE columns ARE " +
+            "compacted via read-side null-fill; #530.)",
             innerException) => FilePath = filePath;
 
-    /// <summary>The compaction input whose physical schema is narrower than the current data schema.</summary>
+    /// <summary>The compaction input whose physical schema is narrower than the current data schema in a
+    /// way that cannot be null-filled (an absent required column).</summary>
     internal string FilePath { get; }
 }
 
@@ -126,14 +127,17 @@ internal sealed record OptimizeResult(
 /// is at most the target; a group of a single file is skipped (rewriting one file into one file gains
 /// nothing).</para>
 ///
-/// <para><b>Schema-evolution limitation (fails closed).</b> OPTIMIZE reads every input under the
-/// <i>current</i> snapshot data schema. On an additively schema-evolved table (#190) a pre-evolution Parquet
-/// file is physically narrower than that schema; compacting it needs null-fill of the later-added columns in
-/// the widened output. The read-side null-fill capability landed with #497 but OPTIMIZE does not yet apply it
-/// (compaction-time null-fill is tracked in <b>#530</b>). Until #530 lands, OPTIMIZE detects the narrow
-/// input and fails closed with a clear <see cref="OptimizeSchemaEvolutionException"/> (thrown before any
-/// commit — the table is unchanged) rather than compacting or surfacing a misleading "column not present"
-/// corruption error.</para>
+/// <para><b>Additive schema evolution (compacts via read-side null-fill).</b> OPTIMIZE reads every input
+/// under the <i>current</i> snapshot data schema. On an additively schema-evolved table (#190) a
+/// pre-evolution Parquet file is physically narrower than that schema; OPTIMIZE reads it with read-side
+/// null-fill (<c>nullFillMissingColumns: true</c>, #497/#530) so a later-added <b>nullable</b> column absent
+/// from the older file is materialized as all-null and the compacted output physically carries the current
+/// data schema (statistics recomputed over the null-filled batches). A genuinely-unfillable input still fails
+/// closed: an absent <b>required</b> (non-nullable) column cannot be null-filled, so OPTIMIZE surfaces a
+/// clear <see cref="OptimizeSchemaEvolutionException"/> (thrown before any commit — the table is unchanged)
+/// rather than the misleading raw "column not present" corruption error. A file that still carries a
+/// deletion vector is <b>skipped</b> (never compacted by reading its raw Parquet, which would resurrect the
+/// deleted rows).</para>
 ///
 /// <para><b>Orphan-safe failure (AC4).</b> Compacted files are written to storage <b>before</b> the commit.
 /// If the commit fails (a conflict, a crash, or the injected <see cref="BeforeCommitProbe"/>), the table's
@@ -469,6 +473,19 @@ internal sealed class DeltaOptimize
                 continue; // already large enough — not a small-file candidate.
             }
 
+            if (file.DeletionVector is not null)
+            {
+                // DV-interaction safety (#192/#530): OPTIMIZE reads its inputs' RAW Parquet (it does not
+                // route through DeltaReadSource's merge-on-read DV filter), so compacting a DV'd file by
+                // reading it raw would RESURRECT the logically-deleted rows the DV excludes. OPTIMIZE
+                // therefore SKIPS a file that still carries a deletion vector — it is left active, unchanged,
+                // and correct — rather than materializing the DV during compaction (a larger capability
+                // tracked separately). This is the conservative "skip, don't materialize" side of the
+                // materialize-vs-skip choice: correctness first, at the cost of not shrinking a DV'd small
+                // file. A file whose DV has been purged (physically rewritten) is a normal candidate again.
+                continue;
+            }
+
             string key = PartitionKeyBuilder.Build(file.PartitionValues, partitionColumns);
             if (!byPartition.TryGetValue(key, out List<AddFileAction>? bucket))
             {
@@ -543,13 +560,19 @@ internal sealed class DeltaOptimize
     // schema (partition columns are not stored in the Parquet files; their values ride on the add action),
     // which is exactly what the compacted file is written with.
     //
-    // FIX #195/#497 (schema evolution, fails closed): an input written under an older schema (#190) is
-    // physically narrower than the current data schema, so ParquetFileReader.ResolveFileFields raises a
-    // "column '<x>' is not present in the Parquet file schema" DeltaStorageException that reads like
-    // corruption. The reader CAN null-fill (nullFillMissingColumns, #497), but OPTIMIZE reads strictly here
-    // (false) — compaction-time null-fill is #530 and out of scope; until it lands, translate that specific
-    // defect into a clear, actionable OptimizeSchemaEvolutionException. It is thrown BEFORE any commit
-    // (nothing has been committed yet), so OPTIMIZE fails closed: inputs stay
+    // FIX #530 (schema evolution, additive columns now compact): an input written under an older schema
+    // (#190) is physically narrower than the current data schema. OPTIMIZE reads its inputs with
+    // nullFillMissingColumns=true (the read-side null-fill capability from #497), so a later-added NULLABLE
+    // column absent from an older file is materialized as an all-null column and the widened compacted file
+    // physically carries the current data schema (older rows' later-added columns = null). Statistics are
+    // recomputed over these materialized (null-filled) batches by WriteWithStatisticsAsync, so the output's
+    // add.stats/footer null_count reflects the older rows.
+    //
+    // Still fails closed on a genuinely-unfillable input: an absent NON-nullable (REQUIRED) column can never
+    // be null-filled (a required lane cannot carry null), so ParquetFileReader.ResolveFileFields still raises
+    // the "column '<x>' is not present in the Parquet file schema" DeltaStorageException for it. That case
+    // reads like corruption, so OPTIMIZE translates it into a clear, actionable OptimizeSchemaEvolutionException.
+    // It is thrown BEFORE any commit (nothing has been committed yet), so OPTIMIZE fails closed: inputs stay
     // active, the version is unchanged, any written outputs are orphans.
     private async Task<List<ColumnBatch>> ReadGroupBatchesAsync(
         CompactionGroup group, StructType dataSchema, bool allowTypeWideningPromotion, CancellationToken cancellationToken)
@@ -563,13 +586,13 @@ internal sealed class DeltaOptimize
                 try
                 {
                     await foreach (ColumnBatch batch in _reader
-                        .ReadAsync(stream, dataSchema, keepRowGroup: null, nullFillMissingColumns: false, allowTypeWideningPromotion, cancellationToken)
+                        .ReadAsync(stream, dataSchema, keepRowGroup: null, nullFillMissingColumns: true, allowTypeWideningPromotion, cancellationToken)
                         .ConfigureAwait(false))
                     {
                         batches.Add(batch);
                     }
                 }
-                catch (DeltaStorageException ex) when (IsNarrowSchemaEvolutionInput(ex))
+                catch (DeltaStorageException ex) when (IsUnfillableSchemaEvolutionInput(ex))
                 {
                     throw new OptimizeSchemaEvolutionException(input.Path, ex);
                 }
@@ -579,16 +602,18 @@ internal sealed class DeltaOptimize
         return batches;
     }
 
-    // True iff the read failed because the input Parquet file is missing a column the current data schema
-    // requests — the additive schema-evolution (#190) narrow-file case OPTIMIZE compaction cannot yet
-    // null-fill (#530; the read-path capability exists in ParquetFileReader per #497 but OPTIMIZE reads
-    // strictly). A genuine byte-level corruption or a real type mismatch does NOT match (it carries a
-    // different message / kind), so it is not masked by the OPTIMIZE-specific schema-evolution error.
+    // True iff the read failed because the input Parquet file is missing a NON-nullable column the current
+    // data schema requests — a genuinely-unfillable input OPTIMIZE cannot compact (a required lane cannot be
+    // null-filled). With nullFillMissingColumns=true (#530), an absent NULLABLE column is null-filled by the
+    // reader and never reaches here; only an absent REQUIRED column (or a still-strict projection) surfaces
+    // the "is not present in the Parquet file schema" defect. A genuine byte-level corruption or a real type
+    // mismatch does NOT match (it carries a different message / kind), so it is not masked by the
+    // OPTIMIZE-specific schema-evolution error.
     // TRACKED DEFERRAL (#513): this classification is string-coupled to ParquetFileReader's "is not present
     // in the Parquet file schema" message (the same coupling exists at the read guard site in
     // DeltaReadSource.IsNarrowSchemaEvolutionInput). A shared, message-independent error-kind that both
     // guard sites match on is #513.
-    private static bool IsNarrowSchemaEvolutionInput(DeltaStorageException ex) =>
+    private static bool IsUnfillableSchemaEvolutionInput(DeltaStorageException ex) =>
         ex.Kind == StorageErrorKind.CorruptData
         && ex.Message.Contains("is not present in the Parquet file schema", StringComparison.Ordinal);
 

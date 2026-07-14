@@ -4,8 +4,10 @@ using System.Text;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
+using DeltaSharp.Storage.Delta.DeletionVectors;
 using DeltaSharp.Storage.Diagnostics;
 using DeltaSharp.Storage.Parquet;
+using DeltaSharp.Storage.Reading;
 using DeltaSharp.Types;
 using Xunit;
 using StructField = DeltaSharp.Types.StructField;
@@ -51,13 +53,24 @@ public sealed class DeltaOptimizeTests : IDisposable
         new StructField("value", DataTypes.StringType, nullable: true),
     });
 
-    // The DATA schema after an additive schema evolution (#190) adds an "extra" column: files written under
-    // DataSchema ([id,value]) are physically narrower than this, so OPTIMIZE must fail closed (#530).
+    // The DATA schema after an additive schema evolution (#190) adds a NULLABLE "extra" column: files
+    // written under DataSchema ([id,value]) are physically narrower than this, so OPTIMIZE reads them with
+    // read-side null-fill (#497/#530) and rewrites a widened compacted file carrying [id,value,extra] with
+    // "extra" NULL for the older rows.
     private static readonly StructType EvolvedSchema = new(new[]
     {
         new StructField("id", DataTypes.LongType, nullable: false),
         new StructField("value", DataTypes.StringType, nullable: true),
         new StructField("extra", DataTypes.StringType, nullable: true),
+    });
+
+    // A (malformed / non-additive) evolution that adds a REQUIRED (non-nullable) "req" column absent from the
+    // older files: a required lane can never be null-filled, so OPTIMIZE must still FAIL CLOSED on it (#530).
+    private static readonly StructType RequiredColumnEvolvedSchema = new(new[]
+    {
+        new StructField("id", DataTypes.LongType, nullable: false),
+        new StructField("value", DataTypes.StringType, nullable: true),
+        new StructField("req", DataTypes.StringType, nullable: false),
     });
 
     private static readonly ImmutableSortedDictionary<string, string?> NoPartition =
@@ -366,16 +379,16 @@ public sealed class DeltaOptimizeTests : IDisposable
         Assert.Equal(new[] { "a.parquet", "b.parquet" }, ActivePaths(after));
     }
 
-    // ---------------------------------------------------------------- FIX 1: schema-evolution guard (#530)
+    // ------------------------------------------------------------ FIX 1: additive schema evolution (#530)
 
     [Fact]
-    public async Task Optimize_OnSchemaEvolvedTable_FailsClosed_WithClearError()
+    public async Task Optimize_OnAdditivelyEvolvedTable_Compacts_NullFillingLaterColumns()
     {
-        // A narrow table [id,value] with two small files, then an additive schema evolution (#190) adds an
-        // "extra" column so the pre-evolution files are physically narrower than the current data schema.
-        // The read-side null-fill capability exists (#497) but OPTIMIZE compaction does not apply it yet
-        // (#530), so OPTIMIZE must fail CLOSED with a clear, actionable error — never the misleading raw
-        // "column not present" corruption text — leaving the table unchanged.
+        // A narrow table [id,value] with two small files, then an additive schema evolution (#190) adds a
+        // NULLABLE "extra" column so the pre-evolution files are physically narrower than the current data
+        // schema. OPTIMIZE now reads them with read-side null-fill (#497/#530) and compacts them into one
+        // widened output physically carrying [id,value,extra] — the older rows' "extra" is NULL — with
+        // recomputed statistics reflecting that null_count.
         StagedDataFile a = await WriteDataFileAsync("a.parquet", Batch((1, "a")));
         StagedDataFile b = await WriteDataFileAsync("b.parquet", Batch((2, "b")));
         await SeedAsync(DataSchema, partitionColumns: null, a, b); // v0 metadata, v1 append
@@ -384,12 +397,55 @@ public sealed class DeltaOptimizeTests : IDisposable
         Snapshot before = await Log().LoadSnapshotAsync();
         Assert.Equal(2, before.Version);
 
+        OptimizeResult result = await Optimize().OptimizeAsync();
+
+        // ONE commit at read + 1, two narrow inputs removed, one widened output added, both rows preserved.
+        Assert.Equal(result.ReadVersion + 1, result.CommittedVersion);
+        Assert.Equal(2, result.FilesRemoved);
+        Assert.Equal(1, result.FilesAdded);
+        Assert.Equal(2, result.RowCount);
+
+        Snapshot after = await Log().LoadSnapshotAsync();
+        AddFileAction output = Assert.Single(after.ActiveFiles);
+        Assert.False(output.DataChange);
+        Assert.NotNull(output.Stats);
+
+        // Statistics are recomputed over the WIDENED, null-filled batches: numRecords=2 and the later-added
+        // "extra" column's null_count is 2 (both older rows are null-filled). id/value carry no nulls.
+        Assert.Equal(2L, output.Stats!.NumRecords);
+        Assert.Equal(2L, output.Stats.NullCount["extra"]);
+        Assert.Equal(0L, output.Stats.NullCount["id"]);
+        Assert.Equal(0L, output.Stats.NullCount["value"]);
+
+        // The compacted output PHYSICALLY carries [id,value,extra]: read it back under the evolved schema
+        // WITHOUT null-fill (every column must be present in the file) — the older rows' "extra" is NULL.
+        List<(long, string?, string?)> compacted = await ReadEvolvedRowsAsync(new[] { output.Path }, nullFill: false);
+        Assert.Equal(
+            new (long, string?, string?)[] { (1L, "a", null), (2L, "b", null) },
+            compacted.OrderBy(r => r.Item1).ToList());
+    }
+
+    [Fact]
+    public async Task Optimize_WhenCurrentSchemaAddsRequiredColumn_FailsClosed_WithClearError()
+    {
+        // A required (non-nullable) lane can never be null-filled, so a pre-evolution file missing a column
+        // the current schema declares NON-nullable is genuinely unreadable under the current schema: OPTIMIZE
+        // must still FAIL CLOSED with a clear, actionable error (never the misleading raw "column not present"
+        // corruption text), leaving the table unchanged.
+        StagedDataFile a = await WriteDataFileAsync("a.parquet", Batch((1, "a")));
+        StagedDataFile b = await WriteDataFileAsync("b.parquet", Batch((2, "b")));
+        await SeedAsync(DataSchema, partitionColumns: null, a, b);
+
+        await EvolveSchemaAsync(version: 2, RequiredColumnEvolvedSchema);
+        Snapshot before = await Log().LoadSnapshotAsync();
+        Assert.Equal(2, before.Version);
+
         OptimizeSchemaEvolutionException ex = await Assert.ThrowsAsync<OptimizeSchemaEvolutionException>(
             () => Optimize().OptimizeAsync());
 
-        // The clear error references #530 / an older schema and does NOT surface the raw reader defect text.
-        Assert.Contains("#530", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("older", ex.Message, StringComparison.Ordinal);
+        // The clear error names the file and the required-column cause, and does NOT surface the raw defect.
+        Assert.Contains("a.parquet", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("REQUIRED", ex.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("not present in the Parquet file schema", ex.Message, StringComparison.Ordinal);
 
         // Fail-closed / orphan-safe: the table is unchanged — same version and same active files.
@@ -397,6 +453,46 @@ public sealed class DeltaOptimizeTests : IDisposable
         Assert.Equal(before.Version, after.Version);
         Assert.Equal(ActivePaths(before), ActivePaths(after));
     }
+
+    [Fact]
+    public async Task Optimize_SkipsFilesCarryingDeletionVectors_NoResurrection()
+    {
+        // OPTIMIZE reads its inputs' RAW Parquet (it does not route through the merge-on-read DV filter), so
+        // compacting a DV'd file by reading it raw would RESURRECT the logically-deleted rows. OPTIMIZE
+        // therefore SKIPS any file that still carries a deletion vector (#192/#530). Two small DV'd files
+        // that would otherwise bin-pack together are left untouched, so no deleted row can resurrect and the
+        // survivors stay exactly what the DVs allow.
+        StagedDataFile a = await WriteDataFileAsync("a.parquet", Batch((10, "j"), (20, "k"), (30, "l")));
+        StagedDataFile b = await WriteDataFileAsync("b.parquet", Batch((40, "m"), (50, "n"), (60, "o")));
+        await SeedDvCapableAsync(DataSchema, a, b);
+
+        // Apply an inline DV to each file excluding physical position 1 (ids 20 and 50).
+        Snapshot seeded = await Log().LoadSnapshotAsync();
+        Snapshot dvApplied = await ApplyInlineDvAsync(seeded, deletedPositionPerFile: 1, physicalRecords: 3);
+        AddFileAction[] dvAdds = dvApplied.ActiveFiles.Where(f => f.DeletionVector is not null).ToArray();
+        Assert.Equal(2, dvAdds.Length);
+
+        OptimizeResult result = await Optimize().OptimizeAsync(dvApplied);
+
+        // No-op: both candidates were skipped (they carry DVs), nothing removed/added, no commit.
+        Assert.Equal(0, result.FilesRemoved);
+        Assert.Equal(0, result.FilesAdded);
+        Assert.Null(result.CommittedVersion);
+
+        // The DV'd files are still active with their DVs intact (untouched → survivors trivially exact).
+        Snapshot after = await Log().LoadSnapshotAsync();
+        Assert.Equal(dvApplied.Version, after.Version);
+        Assert.Equal(2, after.ActiveFiles.Count(f => f.DeletionVector is not null));
+        Assert.All(after.ActiveFiles, f => Assert.Equal(1L, f.DeletionVector!.Cardinality));
+
+        // Survivors, by value, through the merge-on-read read path: the DV-excluded rows stay excluded.
+        List<(long, string?)> survivors = Sorted(await ReadSurvivorsAsync(after));
+        Assert.Equal(
+            new (long, string?)[] { (10L, "j"), (30L, "l"), (40L, "m"), (60L, "o") },
+            survivors);
+    }
+
+    // ------------------------------------------------------------------ orphan-safety / regressions
 
     // ---------------------------------------------------------------- FIX 3: AC3 byte-identity of untouched files
 
@@ -806,6 +902,99 @@ public sealed class DeltaOptimizeTests : IDisposable
     private async Task EvolveSchemaAsync(long version, StructType evolvedSchema) =>
         await DeltaTestHarness.WriteCommitAsync(
             _backend, version, DeltaTestHarness.MetadataWithSchema(evolvedSchema));
+
+    // Seeds a DELETION-VECTOR-capable table (reader v3 / writer v7 declaring the `deletionVectors` feature)
+    // so an add can legally carry a DV descriptor and the read path applies it, then commits all files as one
+    // append at v1.
+    private async Task SeedDvCapableAsync(StructType tableSchema, params StagedDataFile[] files)
+    {
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 0, DeltaTestHarness.ProtocolWithReaderFeature("deletionVectors", minReader: 3, minWriter: 7),
+            DeltaTestHarness.MetadataWithSchema(tableSchema));
+        Snapshot snapshot = await Log().LoadSnapshotAsync();
+        await new DeltaTableWriter(_backend).AppendAsync(snapshot, snapshot.Schema, files);
+    }
+
+    // Applies an INLINE deletion vector to EVERY active file, each excluding the single physical position
+    // <paramref name="deletedPositionPerFile"/> (cardinality 1). Commits one remove(prior add) +
+    // add(same path, inline DV, physical numRecords) per file in a single commit, and returns the resulting
+    // snapshot. Mirrors the inline-DV pattern in DeletionVectorReadWriteTests.
+    private async Task<Snapshot> ApplyInlineDvAsync(Snapshot seeded, int deletedPositionPerFile, long physicalRecords)
+    {
+        byte[] rawBitmap = RoaringBitmapArray.Serialize(new long[] { deletedPositionPerFile });
+        DeletionVectorDescriptor inline = DeletionVectorDescriptor.ForInline(rawBitmap, cardinality: 1);
+
+        var actions = new List<DeltaAction>();
+        foreach (AddFileAction add in seeded.ActiveFiles)
+        {
+            actions.Add(new RemoveFileAction(
+                add.Path, DeletionTimestamp: 1, DataChange: true, ExtendedFileMetadata: true,
+                add.PartitionValues, add.Size, DeletionVector: null));
+            actions.Add(new AddFileAction(
+                add.Path, add.PartitionValues, add.Size, ModificationTime: 1, DataChange: true,
+                add.Stats! with { NumRecords = physicalRecords }, add.Tags, inline));
+        }
+
+        await new DeltaCommitter(_backend).CommitAsync(
+            seeded, actions, DeltaReadScope.ReadFiles(seeded.ActiveFiles.Select(a => a.Path)));
+        return await Log().LoadSnapshotAsync();
+    }
+
+    // Reads every survivor row of the current snapshot through the merge-on-read read path (DeltaReadSource
+    // applies each active file's deletion vector), returning (id, value) tuples so a test can assert the
+    // DV-excluded rows stay excluded.
+    private async Task<List<(long Id, string? Value)>> ReadSurvivorsAsync(Snapshot snapshot)
+    {
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        var rows = new List<(long, string?)>();
+        foreach (ColumnBatch batch in await source.ReadBatchesAsync(snapshot.Version))
+        {
+            ColumnVector idColumn = batch.SelectedColumn(0);
+            ColumnVector valueColumn = batch.SelectedColumn(1);
+            for (int r = 0; r < batch.LogicalRowCount; r++)
+            {
+                long id = idColumn.GetValue<long>(r);
+                string? value = valueColumn.IsNull(r) ? null : Encoding.UTF8.GetString(valueColumn.GetBytes(r));
+                rows.Add((id, value));
+            }
+        }
+
+        return rows;
+    }
+
+    // A content oracle for a WIDENED (schema-evolved) file: reads every row under EvolvedSchema into
+    // (id, value, extra) tuples. With <paramref name="nullFill"/> false every requested column MUST be
+    // physically present (proves the compacted output carries the current schema); with true, an absent
+    // NULLABLE column reads back as all-null (#497).
+    private async Task<List<(long Id, string? Value, string? Extra)>> ReadEvolvedRowsAsync(
+        IEnumerable<string> paths, bool nullFill)
+    {
+        var reader = new ParquetFileReader();
+        var rows = new List<(long, string?, string?)>();
+        foreach (string path in paths)
+        {
+            Stream stream = await _backend.OpenReadAsync(path, CancellationToken.None);
+            await using (stream)
+            {
+                await foreach (ColumnBatch batch in reader.ReadAsync(
+                    stream, EvolvedSchema, null, nullFillMissingColumns: nullFill, allowTypeWideningPromotion: false, CancellationToken.None))
+                {
+                    ColumnVector idColumn = batch.SelectedColumn(0);
+                    ColumnVector valueColumn = batch.SelectedColumn(1);
+                    ColumnVector extraColumn = batch.SelectedColumn(2);
+                    for (int r = 0; r < batch.LogicalRowCount; r++)
+                    {
+                        long id = idColumn.GetValue<long>(r);
+                        string? value = valueColumn.IsNull(r) ? null : Encoding.UTF8.GetString(valueColumn.GetBytes(r));
+                        string? extra = extraColumn.IsNull(r) ? null : Encoding.UTF8.GetString(extraColumn.GetBytes(r));
+                        rows.Add((id, value, extra));
+                    }
+                }
+            }
+        }
+
+        return rows;
+    }
 
     // Reads a data file's raw bytes and returns their SHA-256 (proves byte-identity of files OPTIMIZE never
     // rewrote, AC3).
