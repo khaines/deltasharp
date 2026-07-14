@@ -39,7 +39,8 @@ internal static class TypeWideningFeature
     /// <summary>The table property that activates the legacy <c>appendOnly</c> writer feature.</summary>
     private const string AppendOnlyKey = "delta.appendOnly";
 
-    /// <summary>The configuration-key prefix for a named CHECK constraint (legacy <c>invariants</c> feature).</summary>
+    /// <summary>The configuration-key prefix for a named CHECK constraint (the <c>checkConstraints</c> feature,
+    /// distinct from the column-<c>invariants</c> feature).</summary>
     private const string ConstraintKeyPrefix = "delta.constraints.";
 
     /// <summary>The field-metadata key for a column invariant (legacy <c>invariants</c> feature).</summary>
@@ -192,18 +193,16 @@ internal static class TypeWideningFeature
             + "Features'), so the operation is refused fail-closed. Enabling type widening on a table with an "
             + "active appendOnly / invariant / CHECK constraint is tracked in #549.");
 
-    // True when any field in the schema (recursively) carries a column invariant in its metadata — the legacy
-    // `invariants` feature this build cannot enumerate as a table feature on upgrade.
+    // True when any field in the schema carries a column invariant in its metadata — the legacy `invariants`
+    // feature this build cannot enumerate as a table feature on upgrade. Recurses through EVERY nesting a
+    // Delta invariant can be reachable under (Spark collects invariants through struct fields AND
+    // array-element / map key/value structs), so an invariant inside e.g. `array<struct<x>>` or
+    // `map<string, struct<y>>` is not silently missed.
     private static bool SchemaHasInvariant(StructType schema)
     {
         foreach (StructField field in schema)
         {
-            if (field.Metadata.TryGetValue(InvariantKey, out _))
-            {
-                return true;
-            }
-
-            if (field.DataType is StructType nested && SchemaHasInvariant(nested))
+            if (field.Metadata.TryGetValue(InvariantKey, out _) || TypeHasInvariant(field.DataType))
             {
                 return true;
             }
@@ -211,6 +210,16 @@ internal static class TypeWideningFeature
 
         return false;
     }
+
+    // Descends a field's DATA TYPE looking for a nested struct field that carries a column invariant, through
+    // struct fields, array elements, and map keys/values.
+    private static bool TypeHasInvariant(DataType type) => type switch
+    {
+        StructType structType => SchemaHasInvariant(structType),
+        ArrayType arrayType => TypeHasInvariant(arrayType.ElementType),
+        MapType mapType => TypeHasInvariant(mapType.KeyType) || TypeHasInvariant(mapType.ValueType),
+        _ => false,
+    };
 
     private static bool HasFeature(ImmutableArray<string> features) =>
         !features.IsDefault

@@ -218,4 +218,37 @@ public sealed class TypeWideningProtocolTests : IDisposable
                 ImmutableDictionary<string, string>.Empty));
         Assert.Contains("#549", ex.Message, StringComparison.Ordinal);
     }
+
+    [Theory]
+    [InlineData("struct")]      // struct< x:invariant >
+    [InlineData("array")]       // array< struct< x:invariant > >
+    [InlineData("map-value")]   // map< string, struct< x:invariant > >
+    [InlineData("map-key")]     // map< struct< x:invariant >, long >
+    public void EnsureUpgradeable_LegacyTableWithNestedColumnInvariant_Throws(string nesting)
+    {
+        // A column invariant reachable through a struct field, an array element, or a map key/value struct is
+        // a valid Delta construct (Spark collects/enforces invariants through array/map elements). The guard
+        // must recurse through ALL of these so such a foreign table is refused rather than silently
+        // deactivated on upgrade to writer 7.
+        var invariantLeaf = new StructField(
+            "x", DataTypes.LongType, nullable: true,
+            FieldMetadata.FromEntries(new[]
+            {
+                new KeyValuePair<string, string>("delta.invariants", "{\"expression\":{\"expression\":\"x > 0\"}}"),
+            }));
+        var inner = new StructType(new[] { invariantLeaf });
+        DataType nested = nesting switch
+        {
+            "struct" => inner,
+            "array" => new ArrayType(inner),
+            "map-value" => new MapType(DataTypes.StringType, inner),
+            _ => new MapType(inner, DataTypes.LongType),
+        };
+        var schema = new StructType(new[] { new StructField("payload", nested, nullable: true) });
+
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() =>
+            TypeWideningFeature.EnsureUpgradeable(
+                new ProtocolAction(1, 2, [], []), schema, ImmutableDictionary<string, string>.Empty));
+        Assert.Contains("#549", ex.Message, StringComparison.Ordinal);
+    }
 }
