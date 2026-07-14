@@ -89,6 +89,40 @@ internal static class TypeWideningFeature
             .WithComparers(StringComparer.Ordinal)
             .Add(EnablePropertyKey, "true");
 
+    /// <summary>
+    /// The upgraded <c>protocol</c> for enabling type widening on an EXISTING table (#534): the table-features
+    /// reader (≥ <see cref="ReaderVersion"/>) and writer (≥ <see cref="WriterVersion"/>) versions with the
+    /// stable <c>typeWidening</c> feature added to <b>both</b> feature lists, PRESERVING every feature the
+    /// table already declares (e.g. <c>columnMapping</c>, <c>deletionVectors</c>, or the preview spelling).
+    /// Matches the create-time shape (<see cref="Protocol"/>) and <see cref="ColumnMapping.NameModeProtocol"/>:
+    /// a feature table lists only its named features — this build never enumerates the implicit v1–v2
+    /// <c>appendOnly</c>/<c>invariants</c> baseline (it neither sets nor enforces those, so they stay inactive
+    /// and need no entry). Idempotent in shape: if the feature is already present (stable OR preview spelling)
+    /// the feature lists are returned unchanged; the version floors are already met on any table declaring it.
+    /// </summary>
+    public static ProtocolAction UpgradeProtocol(ProtocolAction existing)
+    {
+        ArgumentNullException.ThrowIfNull(existing);
+        return new ProtocolAction(
+            Math.Max(existing.MinReaderVersion, ReaderVersion),
+            Math.Max(existing.MinWriterVersion, WriterVersion),
+            WithFeature(existing.ReaderFeatures),
+            WithFeature(existing.WriterFeatures));
+    }
+
+    // Adds the stable typeWidening feature to a feature list unless it is already present (stable OR preview
+    // spelling — so an already-supported table's list is left unchanged rather than carrying a duplicate). A
+    // default (uninitialized) array is treated as empty.
+    private static ImmutableArray<string> WithFeature(ImmutableArray<string> features)
+    {
+        if (HasFeature(features))
+        {
+            return features;
+        }
+
+        return (features.IsDefault ? ImmutableArray<string>.Empty : features).Add(Feature);
+    }
+
     private static bool HasFeature(ImmutableArray<string> features) =>
         !features.IsDefault
         && (features.Contains(Feature, StringComparer.Ordinal)
