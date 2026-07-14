@@ -625,6 +625,48 @@ internal sealed class DeltaTableWriter
             .ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Enables type widening on an EXISTING table (#534): commits a <b>metadata-only</b> <c>protocol</c> +
+    /// <c>metaData</c> upgrade that adds the <c>typeWidening</c> table feature (reader → v3 / writer → v7,
+    /// preserving every existing feature) and sets <c>delta.enableTypeWidening=true</c>, so a subsequent
+    /// <see cref="AppendAsync(Snapshot, StructType, IReadOnlyList{StagedDataFile}, SchemaEvolutionMode, CancellationToken)"/>
+    /// with a wider-typed column may apply a Delta-sanctioned widening (before this, such a write fails closed
+    /// as <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>). No data file is written or removed —
+    /// every pre-widening file stays active and is promoted at read time. Commits a lone <c>protocol</c> + a
+    /// lone <c>metaData</c> action under <see cref="DeltaReadScope.WholeTable"/>, so any concurrent commit
+    /// aborts (a protocol/metadata change must rebase on a fresh snapshot). Idempotent: if the table already
+    /// supports AND enables type widening, no version is written and the current version is reported.
+    /// </summary>
+    internal async Task<DeltaCommitResult> EnableTypeWideningAsync(CancellationToken cancellationToken = default)
+    {
+        Snapshot snapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
+
+        // Idempotent: the table already declares the feature AND sets the property → nothing to do.
+        if (TypeWideningFeature.IsWriteEnabled(snapshot))
+        {
+            return new DeltaCommitResult(snapshot.Version, Attempts: 0, Skipped: true);
+        }
+
+        // Interop safety (#549): refuse fail-closed rather than silently deactivate a legacy (writer < 7)
+        // appendOnly / invariant / CHECK constraint this build cannot carry as an explicit table feature
+        // through the table-features upgrade.
+        TypeWideningFeature.EnsureUpgradeable(snapshot.Protocol, snapshot.Schema, snapshot.Metadata.Configuration);
+
+        // The upgraded protocol (adds typeWidening, preserving existing features + raising the version floors)
+        // and the metaData carrying delta.enableTypeWidening=true. Both are needed: the protocol makes the
+        // feature SUPPORTED, the property makes a widening APPLIED (Delta "Writer Requirements for Type
+        // Widening"). The committer re-validates any installed protocol (EnsureWritable/EnsureReadable), so it
+        // never publishes a protocol this build could not itself read or write back.
+        ProtocolAction upgraded = TypeWideningFeature.UpgradeProtocol(snapshot.Protocol);
+        ImmutableSortedDictionary<string, string> configuration =
+            snapshot.Metadata.Configuration.SetItem(TypeWideningFeature.EnablePropertyKey, "true");
+        MetadataAction metadata = snapshot.Metadata with { Configuration = configuration };
+
+        return await _committer.CommitAsync(
+            snapshot, new DeltaAction[] { upgraded, metadata }, DeltaReadScope.WholeTable, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
     private static void RequireNameMode(Snapshot snapshot)
     {
         ColumnMappingMode mode = ColumnMapping.ResolveMode(snapshot.Metadata.Configuration);
