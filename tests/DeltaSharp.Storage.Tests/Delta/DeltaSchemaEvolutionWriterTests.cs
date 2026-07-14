@@ -575,6 +575,174 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
         Assert.Equal(new long[] { 1L, 2L, 3L }, promoted.Single().Column(0).GetValues<long>().ToArray());
     }
 
+    // Writes a REAL single-column Int64 Parquet file to the backend, so a #535 cross-family end-to-end test
+    // can widen long→decimal over the OLD narrow file and read it back promoted.
+    private async Task<byte[]> WriteNarrowLongFileAsync(string path, long[] values)
+    {
+        var schema = new StructType(new[] { new StructField("value", DataTypes.LongType, nullable: true) });
+        MutableColumnVector column = ColumnVectors.Create(DataTypes.LongType, values.Length);
+        foreach (long value in values)
+        {
+            column.AppendValue(value);
+        }
+
+        var batch = new ManagedColumnBatch(schema, new ColumnVector[] { column }, values.Length);
+        using var buffer = new MemoryStream();
+        await new ParquetFileWriter().WriteAsync(buffer, schema, new[] { batch }, CancellationToken.None);
+        byte[] bytes = buffer.ToArray();
+        await _backend.PutIfAbsentAsync(path, bytes, CancellationToken.None);
+        return bytes;
+    }
+
+    // ------------------------------------------------------- #535: cross-family type widening end-to-end
+
+    [Fact]
+    public async Task Append_WidenIntToDouble_WhenFeatureEnabled_CommitsWidenedSchemaAndTypeChanges_AndPromotesOnRead_NoRewrite()
+    {
+        // #535: seed a typeWidening-ENABLED table whose v0 holds a real Int32 data file, then widen the column
+        // CROSS-FAMILY int→double. This is metadata-only: the widened metaData + delta.typeChanges commit with
+        // the new add in one version; the OLD narrow Int32 file is NOT rewritten and stays active, promoted at
+        // READ time (Delta PROTOCOL.md "Type Widening" → "Supported Type Changes": integer→double).
+        var initial = Struct(F("value", DataTypes.IntegerType, nullable: true));
+        byte[] oldFile = await WriteNarrowIntFileAsync("v0.parquet", new[] { 1, 2, 3 });
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 0,
+            DeltaTestHarness.ProtocolWithReaderFeature("typeWidening"),
+            DeltaTestHarness.MetadataWithSchemaAndConfig(initial, new[] { ("delta.enableTypeWidening", "true") }),
+            DeltaTestHarness.Add("v0.parquet"));
+
+        Snapshot readSnapshot = await LoadAsync();
+        DeltaCommitResult result = await Writer().AppendAsync(
+            readSnapshot,
+            Struct(F("value", DataTypes.DoubleType, nullable: true)),
+            new[] { Staged("v1.parquet") },
+            SchemaEvolutionMode.MergeSchema);
+
+        IReadOnlyList<DeltaAction> committed = await Log().ReadCommitActionsAsync(result.Version, CancellationToken.None);
+        Assert.Single(committed.OfType<MetadataAction>());
+        // The only add is the NEW file; v0 is neither rewritten nor removed (no RemoveFileAction).
+        Assert.Contains(committed.OfType<AddFileAction>(), a => a.Path == "v1.parquet");
+        Assert.Empty(committed.OfType<RemoveFileAction>());
+
+        Snapshot after = await LoadAsync();
+        Assert.Contains("v0.parquet", ActivePaths(after));
+        StructType evolved = after.Schema;
+        StructField field = evolved["value"];
+        Assert.Equal(DataTypes.DoubleType, field.DataType);
+        Assert.True(field.Metadata.TryGetValue("delta.typeChanges", out MetadataValue? changes));
+        Assert.True(changes!.TryGetArray(out IReadOnlyList<MetadataValue>? entries));
+        MetadataValue only = Assert.Single(entries!);
+        Assert.True(only.TryGetNested(out FieldMetadata? nested));
+        Assert.True(nested!.TryGetString("fromType", out string? from));
+        Assert.True(nested.TryGetString("toType", out string? to));
+        Assert.Equal("integer", from);
+        Assert.Equal("double", to);
+        // Top-level type change carries NO fieldPath (scalar widening, Delta PROTOCOL.md "Type Change Metadata").
+        Assert.False(nested.TryGetString("fieldPath", out _));
+
+        // The OLD Int32 v0 file reads back promoted into the wide `double` schema.
+        List<ColumnBatch> promoted = await ParquetTestHelpers.ReadAllAsync(oldFile, evolved, keepRowGroup: null, allowTypeWideningPromotion: true);
+        Assert.Equal(new[] { 1d, 2d, 3d }, promoted.Single().Column(0).GetValues<double>().ToArray());
+    }
+
+    [Fact]
+    public async Task Append_WidenLongToDecimal_WhenFeatureEnabled_CommitsWidenedSchemaAndTypeChanges_AndPromotesOnRead()
+    {
+        // #535: cross-family long→decimal(20,0). p−s = 20 ≥ 19 long digits, so the target holds the full long
+        // range losslessly (Delta PROTOCOL.md "Type Widening" → "Supported Type Changes": long→decimal). The
+        // OLD Int64 file is promoted into the decimal lane at read time; no data file is rewritten.
+        var wide = DataTypes.CreateDecimalType(20, 0);
+        var initial = Struct(F("value", DataTypes.LongType, nullable: true));
+        byte[] oldFile = await WriteNarrowLongFileAsync("v0.parquet", new[] { 10L, -7L, long.MaxValue });
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 0,
+            DeltaTestHarness.ProtocolWithReaderFeature("typeWidening"),
+            DeltaTestHarness.MetadataWithSchemaAndConfig(initial, new[] { ("delta.enableTypeWidening", "true") }),
+            DeltaTestHarness.Add("v0.parquet"));
+
+        Snapshot readSnapshot = await LoadAsync();
+        DeltaCommitResult result = await Writer().AppendAsync(
+            readSnapshot,
+            Struct(F("value", wide, nullable: true)),
+            new[] { Staged("v1.parquet") },
+            SchemaEvolutionMode.MergeSchema);
+
+        IReadOnlyList<DeltaAction> committed = await Log().ReadCommitActionsAsync(result.Version, CancellationToken.None);
+        Assert.Single(committed.OfType<MetadataAction>());
+        Assert.Empty(committed.OfType<RemoveFileAction>());
+
+        StructType evolved = (await LoadAsync()).Schema;
+        StructField field = evolved["value"];
+        Assert.Equal(wide, field.DataType);
+        Assert.True(field.Metadata.TryGetValue("delta.typeChanges", out MetadataValue? changes));
+        Assert.True(changes!.TryGetArray(out IReadOnlyList<MetadataValue>? entries));
+        MetadataValue only = Assert.Single(entries!);
+        Assert.True(only.TryGetNested(out FieldMetadata? nested));
+        Assert.True(nested!.TryGetString("fromType", out string? from));
+        Assert.True(nested.TryGetString("toType", out string? to));
+        Assert.Equal("long", from);
+        Assert.Equal("decimal(20,0)", to);
+
+        List<ColumnBatch> promoted = await ParquetTestHelpers.ReadAllAsync(oldFile, evolved, keepRowGroup: null, allowTypeWideningPromotion: true);
+        ColumnVector v = promoted.Single().Column(0);
+        Assert.Equal(10m, ParquetTypeMapping.ReadDecimal(v, wide, 0));
+        Assert.Equal(-7m, ParquetTypeMapping.ReadDecimal(v, wide, 1));
+        Assert.Equal(9223372036854775807m, ParquetTypeMapping.ReadDecimal(v, wide, 2));
+    }
+
+    [Fact]
+    public async Task Append_WidenIntToDouble_WhenFeatureDisabled_IsRejectedBeforeAnyCommit()
+    {
+        // AC3: with the feature DISABLED (no delta.enableTypeWidening), a cross-family widening is REJECTED
+        // fail-closed as TypeWideningUnsupported and NO version is written.
+        var initial = Struct(F("value", DataTypes.IntegerType, nullable: true));
+        await WriteNarrowIntFileAsync("v0.parquet", new[] { 1, 2, 3 });
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 0,
+            DeltaTestHarness.Protocol(minReader: 1, minWriter: 2),
+            DeltaTestHarness.MetadataWithSchema(initial),
+            DeltaTestHarness.Add("v0.parquet"));
+
+        Snapshot readSnapshot = await LoadAsync();
+        DeltaSchemaMismatchException ex = await Assert.ThrowsAsync<DeltaSchemaMismatchException>(
+            () => Writer().AppendAsync(
+                readSnapshot,
+                Struct(F("value", DataTypes.DoubleType, nullable: true)),
+                new[] { Staged("v1.parquet") },
+                SchemaEvolutionMode.MergeSchema));
+
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+        // No new version committed: the log tip is still v0.
+        Snapshot after = await LoadAsync();
+        Assert.Equal(0L, after.Version);
+    }
+
+    [Fact]
+    public async Task Append_WidenIntToTooNarrowDecimal_WhenFeatureEnabled_IsRejectedAsIncompatible_NoCommit()
+    {
+        // AC5: int→decimal(9,0) cannot hold int's 10-digit range → NOT a sanctioned widening (would truncate).
+        // Rejected fail-closed as IncompatibleType even with the feature enabled; no version is written.
+        var initial = Struct(F("value", DataTypes.IntegerType, nullable: true));
+        await WriteNarrowIntFileAsync("v0.parquet", new[] { 1 });
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 0,
+            DeltaTestHarness.ProtocolWithReaderFeature("typeWidening"),
+            DeltaTestHarness.MetadataWithSchemaAndConfig(initial, new[] { ("delta.enableTypeWidening", "true") }),
+            DeltaTestHarness.Add("v0.parquet"));
+
+        Snapshot readSnapshot = await LoadAsync();
+        DeltaSchemaMismatchException ex = await Assert.ThrowsAsync<DeltaSchemaMismatchException>(
+            () => Writer().AppendAsync(
+                readSnapshot,
+                Struct(F("value", DataTypes.CreateDecimalType(9, 0), nullable: true)),
+                new[] { Staged("v1.parquet") },
+                SchemaEvolutionMode.MergeSchema));
+
+        Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
+        Snapshot after = await LoadAsync();
+        Assert.Equal(0L, after.Version);
+    }
+
     [Fact]
     public async Task Append_WidenPartitionColumn_WhenFeatureEnabled_CommitsWidenedSchemaAndTypeChanges_KeepsPartitionColumnsLogical()
     {

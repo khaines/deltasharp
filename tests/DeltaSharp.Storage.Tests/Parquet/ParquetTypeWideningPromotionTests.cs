@@ -157,6 +157,96 @@ public sealed class ParquetTypeWideningPromotionTests
     }
 
     [Fact]
+    public async Task Byte_To_Double_CrossFamily()
+    {
+        // #535: cross-family byte→double. Includes NEGATIVE bytes to pin the signed upcast (not unsigned).
+        ColumnVector v = await PromoteAsync(DataTypes.ByteType, DataTypes.DoubleType,
+            c => { c.AppendValue((byte)1); c.AppendValue((byte)127); c.AppendValue(unchecked((byte)(sbyte)-128)); }, 3);
+        Assert.Equal(new[] { 1d, 127d, -128d }, v.GetValues<double>().ToArray());
+    }
+
+    [Fact]
+    public async Task Short_To_Double_CrossFamily()
+    {
+        ColumnVector v = await PromoteAsync(DataTypes.ShortType, DataTypes.DoubleType,
+            c => { c.AppendValue((short)-5); c.AppendValue((short)30000); }, 2);
+        Assert.Equal(new[] { -5d, 30000d }, v.GetValues<double>().ToArray());
+    }
+
+    [Fact]
+    public async Task Int_To_Double_CrossFamily()
+    {
+        // #535: int→double. 2147483647 (int.MaxValue) is representable exactly in a double (< 2^53).
+        ColumnVector v = await PromoteAsync(DataTypes.IntegerType, DataTypes.DoubleType,
+            c => { c.AppendValue(1); c.AppendValue(-2_000_000_000); c.AppendValue(int.MaxValue); }, 3);
+        Assert.Equal(new[] { 1d, -2_000_000_000d, 2147483647d }, v.GetValues<double>().ToArray());
+    }
+
+    [Fact]
+    public async Task Int_To_Double_CrossFamily_WithNulls_PromotesAndPreservesNulls()
+    {
+        ColumnVector v = await PromoteAsync(DataTypes.IntegerType, DataTypes.DoubleType,
+            c => { c.AppendValue(7); c.AppendNull(); c.AppendValue(9); }, 3);
+        Assert.False(v.IsNull(0));
+        Assert.True(v.IsNull(1));
+        Assert.False(v.IsNull(2));
+        Assert.Equal(7d, v.GetValue<double>(0));
+        Assert.Equal(9d, v.GetValue<double>(2));
+    }
+
+    [Fact]
+    public async Task Int_To_Decimal_CrossFamily()
+    {
+        // #535: int→decimal(12,2). The narrow physical int is read then widened into the decimal lane; the
+        // integer value V becomes V.00 (scaled by 10^scale). decimal(12,2) has p−s = 10 ≥ 10 int digits.
+        var wide = DataTypes.CreateDecimalType(12, 2);
+        ColumnVector v = await PromoteAsync(DataTypes.IntegerType, wide,
+            c => { c.AppendValue(5); c.AppendValue(-3); c.AppendValue(int.MaxValue); }, 3);
+        Assert.Equal(5.00m, ParquetTypeMapping.ReadDecimal(v, wide, 0));
+        Assert.Equal(-3.00m, ParquetTypeMapping.ReadDecimal(v, wide, 1));
+        Assert.Equal(2147483647.00m, ParquetTypeMapping.ReadDecimal(v, wide, 2));
+    }
+
+    [Fact]
+    public async Task Long_To_Decimal_CrossFamily()
+    {
+        // #535: long→decimal(20,0). p−s = 20 ≥ 19 long digits, so long.MaxValue/MinValue promote losslessly.
+        var wide = DataTypes.CreateDecimalType(20, 0);
+        ColumnVector v = await PromoteAsync(DataTypes.LongType, wide,
+            c => { c.AppendValue(long.MaxValue); c.AppendValue(long.MinValue); c.AppendValue(0L); }, 3);
+        Assert.Equal(9223372036854775807m, ParquetTypeMapping.ReadDecimal(v, wide, 0));
+        Assert.Equal(-9223372036854775808m, ParquetTypeMapping.ReadDecimal(v, wide, 1));
+        Assert.Equal(0m, ParquetTypeMapping.ReadDecimal(v, wide, 2));
+    }
+
+    [Fact]
+    public async Task Byte_To_Decimal_CrossFamily_WithNulls()
+    {
+        var wide = DataTypes.CreateDecimalType(5, 0);
+        ColumnVector v = await PromoteAsync(DataTypes.ByteType, wide,
+            c => { c.AppendValue((byte)7); c.AppendNull(); c.AppendValue(unchecked((byte)(sbyte)-1)); }, 3);
+        Assert.Equal(7m, ParquetTypeMapping.ReadDecimal(v, wide, 0));
+        Assert.True(v.IsNull(1));
+        Assert.Equal(-1m, ParquetTypeMapping.ReadDecimal(v, wide, 2));
+    }
+
+    [Fact]
+    public async Task CrossFamily_Int_To_Double_WithoutPromotionGate_FailsClosed()
+    {
+        // A narrow Int32 file read under a WIDE `double` schema with the promotion gate CLOSED (no
+        // `typeWidening` feature) must FAIL CLOSED as SchemaMismatch — never silently promoted.
+        var writeSchema = new StructType(new[] { new StructField("v", DataTypes.IntegerType, nullable: true) });
+        ManagedColumnBatch batch = OneColumn(DataTypes.IntegerType, c => { c.AppendValue(1); c.AppendValue(2); }, 2);
+        byte[] bytes = await ParquetTestHelpers.WriteToBytesAsync(writeSchema, new[] { batch });
+
+        var readSchema = new StructType(new[] { new StructField("v", DataTypes.DoubleType, nullable: true) });
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(bytes, readSchema, keepRowGroup: null, allowTypeWideningPromotion: false));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+    }
+
+    [Fact]
     public async Task Int_To_Long_ComposesWithNullFillMissingColumn()
     {
         // OLD file: single Int32 column "v". CURRENT schema: widened `long v` PLUS a brand-new column "added"
