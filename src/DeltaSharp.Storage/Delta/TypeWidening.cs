@@ -19,10 +19,11 @@ namespace DeltaSharp.Storage.Delta;
 /// <item><b>Cross family</b> (<see cref="IsCrossFamilyWidening"/>, #535): <c>byte</c>/<c>short</c>/<c>int</c>
 /// → <c>double</c> — Delta sanctions integral→double only up to <c>int</c> because a 64-bit <c>long</c>
 /// exceeds <c>double</c>'s 53-bit mantissa (so <c>long → double</c> is <b>lossy</b> and NOT sanctioned); and
-/// <c>byte</c>/<c>short</c>/<c>int</c>/<c>long</c> → <c>decimal(p,s)</c> — but only when the target decimal
-/// can represent the <b>full integral range</b> losslessly (its integer-digit capacity <c>p − s</c> is at
-/// least the number of digits the widest source value needs). A decimal too narrow to hold the source range
-/// is NOT a sanctioned widening (it would truncate) and stays fail-closed.</item>
+/// <c>byte</c>/<c>short</c>/<c>int</c>/<c>long</c> → <c>decimal(p,s)</c> — but only when the target decimal's
+/// integer-digit capacity <c>p − s</c> meets Delta's threshold, which is keyed to the source's <b>Parquet
+/// physical type</b> (NOT its value range): <c>byte</c>/<c>short</c>/<c>int</c> are all stored as
+/// <c>INT32</c> ⇒ <c>p − s ≥ 10</c>; <c>long</c> is <c>INT64</c> ⇒ <c>p − s ≥ 20</c>. A decimal narrower than
+/// that threshold is NOT a sanctioned widening and stays fail-closed.</item>
 /// </list></para>
 ///
 /// <para><b>Deliberately NOT applied</b> (protocol-sanctioned but out of this build's scope, kept
@@ -177,7 +178,7 @@ internal static class TypeWidening
     // The minimum decimal integer-digit capacity (precision − scale) Delta requires for an integral→decimal
     // widening. Delta keys this to the source's Parquet PHYSICAL storage type, NOT its value-range digit
     // count: byte/short/int are all stored as INT32 → the Parquet reader supports INT32 → Decimal(10,0) and
-    // wider, so p − s ≥ 10; long is INT64 → INT64 → Decimal(20,0) and wider, so p − s ≥ 20. (Spark models
+    // wider, so p − s ≥ 10; long is INT64 → Decimal(20,0) and wider, so p − s ≥ 20. (Spark models
     // these as DecimalType.forType(Int) = Decimal(10,0) and forType(Long) = Decimal(20,0); Delta's
     // isTypeChangeSupported requires d.isWiderThan(IntegerType) / d.isWiderThan(LongType) respectively —
     // delta-io/delta TypeWidening.scala + DecimalType.scala. NB: 10/20 exceed the mathematical digit counts
