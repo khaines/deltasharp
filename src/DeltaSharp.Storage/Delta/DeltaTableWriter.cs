@@ -679,7 +679,7 @@ internal sealed class DeltaTableWriter
         {
             throw DeltaProtocolException.Unsupported(
                 "schema evolution (an additive column or an applied type widening) on a name-mode column-"
-                + "mapping table is not yet supported (#525): it would require minting a fresh "
+                + "mapping table is not yet supported (#541): it would require minting a fresh "
                 + "'delta.columnMapping.physicalName' and bumping 'delta.columnMapping.maxColumnId' for the "
                 + "changed column, which append/overwrite (reusing the existing physical mapping) do not do. "
                 + "The write is rejected fail-closed to avoid committing an unmapped column.");
@@ -699,7 +699,7 @@ internal sealed class DeltaTableWriter
         {
             throw DeltaProtocolException.Unsupported(
                 "overwriteSchema (wholesale schema replacement) on a column-mapping table is not supported "
-                + "(#525): a destructive replacement would desync the table's 'delta.columnMapping.maxColumnId' "
+                + "(#542): a destructive replacement would desync the table's 'delta.columnMapping.maxColumnId' "
                 + "and per-field id/physicalName configuration from the replaced schema. Append/overwrite "
                 + "WITHOUT overwriteSchema is supported for a name-mode table. The write is rejected fail-closed.");
         }

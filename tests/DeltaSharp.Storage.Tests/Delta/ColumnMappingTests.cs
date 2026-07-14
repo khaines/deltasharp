@@ -756,7 +756,7 @@ public sealed class ColumnMappingTests : IDisposable
                     new[] { FlatBatch(new[] { (9L, 900L, (string?)"zoe") }) },
                     DeltaPartitionOverwriteMode.Static,
                     overwriteSchema: true));
-            Assert.Contains("525", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("542", ex.Message, StringComparison.Ordinal);
             Assert.Contains("overwriteSchema", ex.Message, StringComparison.Ordinal);
         }
 
