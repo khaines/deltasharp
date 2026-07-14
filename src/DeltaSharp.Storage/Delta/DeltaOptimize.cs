@@ -366,6 +366,12 @@ internal sealed class DeltaOptimize
         StructType dataSchema = BuildDataSchema(readSnapshot.Schema, partitionColumns);
         long timestamp = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
 
+        // Read-side type-widening promotion gate (#495): a narrow-physical input file is promoted into the
+        // current (widened) data schema only when the snapshot's protocol declares the `typeWidening` feature.
+        // We know the protocol here, so we pass it to the reader; without the feature a narrow input fails
+        // closed rather than being silently promoted.
+        bool allowTypeWideningPromotion = TypeWideningFeature.Supports(readSnapshot.Protocol);
+
         var actions = new List<DeltaAction>();
         var inputPaths = new List<string>();
         var summaries = new Dictionary<string, PartitionAccumulator>(StringComparer.Ordinal);
@@ -378,7 +384,7 @@ internal sealed class DeltaOptimize
                 CanonicalPartitionValues(group.PartitionValues, partitionColumns);
             string outputPath = BuildOutputPath(outputPartition, partitionColumns);
 
-            List<ColumnBatch> batches = await ReadGroupBatchesAsync(group, dataSchema, cancellationToken)
+            List<ColumnBatch> batches = await ReadGroupBatchesAsync(group, dataSchema, allowTypeWideningPromotion, cancellationToken)
                 .ConfigureAwait(false);
             CompactedOutput output = await WriteCompactedFileAsync(outputPath, dataSchema, batches, cancellationToken)
                 .ConfigureAwait(false);
@@ -546,7 +552,7 @@ internal sealed class DeltaOptimize
     // (nothing has been committed yet), so OPTIMIZE fails closed: inputs stay
     // active, the version is unchanged, any written outputs are orphans.
     private async Task<List<ColumnBatch>> ReadGroupBatchesAsync(
-        CompactionGroup group, StructType dataSchema, CancellationToken cancellationToken)
+        CompactionGroup group, StructType dataSchema, bool allowTypeWideningPromotion, CancellationToken cancellationToken)
     {
         var batches = new List<ColumnBatch>();
         foreach (AddFileAction input in group.Inputs)
@@ -557,7 +563,7 @@ internal sealed class DeltaOptimize
                 try
                 {
                     await foreach (ColumnBatch batch in _reader
-                        .ReadAsync(stream, dataSchema, keepRowGroup: null, nullFillMissingColumns: false, cancellationToken)
+                        .ReadAsync(stream, dataSchema, keepRowGroup: null, nullFillMissingColumns: false, allowTypeWideningPromotion, cancellationToken)
                         .ConfigureAwait(false))
                     {
                         batches.Add(batch);

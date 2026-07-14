@@ -30,12 +30,15 @@ internal enum DeltaSchemaMismatchKind
     /// silently downcasts. Always rejected.</summary>
     IncompatibleType,
 
-    /// <summary>The write changes a column's type to one that <i>would</i> be a lossless widening
-    /// (<c>int→long</c>, <c>float→double</c>, <c>date→timestamp</c>, a growing <c>decimal</c>), but type
-    /// widening is <b>not supported</b> here: widening the logical schema without Delta's <c>typeWidening</c>
-    /// table feature makes the existing Parquet files unreadable even by DeltaSharp (the reader does an exact
-    /// physical-type match). Fail-closed until the feature lands (tracked in #495). Distinct from
-    /// <see cref="IncompatibleType"/> so the message can name the deferred feature.</summary>
+    /// <summary>The write changes a column's type to a Delta-sanctioned widening
+    /// (<c>int→long</c>, <c>float→double</c>, a growing <c>decimal</c>) or a deferred one
+    /// (<c>date→timestamp</c>), but type widening is <b>not applied</b> here: the table has not enabled it
+    /// (the <c>typeWidening</c> table feature must be present AND <c>delta.enableTypeWidening=true</c>), or
+    /// the widening is deferred (needs a not-yet-existing <c>timestamp_ntz</c> type). Applying a widening
+    /// without the read-side promotion + <c>delta.typeChanges</c> in place would make existing Parquet files
+    /// unreadable, so it is fail-closed. Distinct from <see cref="IncompatibleType"/> so the message can name
+    /// the enablement/deferral reason. When the table <i>is</i> enabled, a sanctioned widening is applied and
+    /// this is not raised.</summary>
     TypeWideningUnsupported,
 
     /// <summary>Evolution would produce a merged schema containing two columns whose names are equal under
@@ -45,10 +48,13 @@ internal enum DeltaSchemaMismatchKind
     /// checked for a case-fold collision.)</summary>
     CaseInsensitiveDuplicateColumn,
 
-    /// <summary>The write would change the type of a <b>partition</b> column. A partition column's type is
-    /// physically encoded in the directory layout and cannot be evolved in place (it requires a full table
-    /// rewrite), so it is always rejected — an explicit, clearer reason than the generic type-change
-    /// classification.</summary>
+    /// <summary>The write would change the type of a <b>partition</b> column to a <b>non-widening</b>
+    /// (incompatible) type — a narrowing or an unrelated type — which cannot be evolved in place. Rejected
+    /// with an explicit, clearer reason than the generic type-change classification. (A partition-column
+    /// change that WOULD be a Delta-sanctioned <i>widening</i> is different: Delta sanctions it without a
+    /// rewrite because partition values are stored as strings, but this build DEFERS it — surfaced distinctly
+    /// as <see cref="TypeWideningUnsupported"/> via <see cref="DeltaSchemaMismatchException.PartitionColumnWideningDeferred"/>,
+    /// tracked in #537 — never as this kind.)</summary>
     PartitionColumnEvolutionUnsupported,
 
     /// <summary>A staged Parquet data file's <b>actual physical data schema</b> does not match the data
@@ -132,9 +138,40 @@ internal sealed class DeltaSchemaMismatchException : Exception
         new(
             DeltaSchemaMismatchKind.TypeWideningUnsupported,
             path,
-            $"The type change '{tableType}'→'{writeType}' for column '{path}' requires the Delta " +
-            "typeWidening table feature, which is not yet supported (tracked in #495). Widening the logical " +
-            "schema without it would make the table's existing Parquet files unreadable, so it is rejected.");
+            $"The type change '{tableType}'→'{writeType}' for column '{path}' is a Delta-sanctioned widening " +
+            "but is not applied here: the table has not enabled type widening (the 'typeWidening' table " +
+            "feature must be present AND the 'delta.enableTypeWidening' property set to 'true'), or the change " +
+            "is a deferred widening this build cannot represent (date→timestamp needs a timestamp_ntz type). " +
+            "Widening the logical schema without enablement would make the table's existing Parquet files " +
+            "unreadable, so it is rejected fail-closed.");
+
+    /// <summary>The write would widen a <b>partition</b> column's type, which Delta <i>does</i> sanction
+    /// WITHOUT a table rewrite (partition values are stored as strings in the log / directory names), but this
+    /// build DEFERS partition-column widening (#537). Classified as <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>
+    /// (fail-closed) with an HONEST message — deliberately NOT the factually-wrong "requires a full table
+    /// rewrite" reason the non-widening <see cref="PartitionColumnEvolution"/> case carries.</summary>
+    public static DeltaSchemaMismatchException PartitionColumnWideningDeferred(string path, string tableType, string writeType) =>
+        new(
+            DeltaSchemaMismatchKind.TypeWideningUnsupported,
+            path,
+            $"The type change '{tableType}'→'{writeType}' for partition column '{path}' is a Delta-sanctioned " +
+            "widening that does NOT require a table rewrite (partition values are stored as strings, so no " +
+            "data file needs rewriting), but partition-column type widening is DEFERRED in this build " +
+            "(tracked in #537). It is rejected fail-closed until that lands.");
+
+    /// <summary>The write would apply a <b>cross-family</b> Delta-sanctioned widening (integral→double or
+    /// integral→decimal) that this build DEFERS (#535). Classified as
+    /// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> (fail-closed) with a message naming the
+    /// #535 deferral — symmetric to the date→timestamp (#533) deferral — so it is HONEST that the change IS
+    /// Delta-sanctioned (unlike a generic <see cref="IncompatibleType"/> for, e.g., <c>string→int</c>).</summary>
+    public static DeltaSchemaMismatchException TypeWideningCrossFamilyDeferred(string path, string tableType, string writeType) =>
+        new(
+            DeltaSchemaMismatchKind.TypeWideningUnsupported,
+            path,
+            $"The type change '{tableType}'→'{writeType}' for column '{path}' is a Delta-sanctioned " +
+            "cross-family widening (integral→double or integral→decimal), but this build DEFERS cross-family " +
+            "and nested widenings (tracked in #535): the read path cannot yet promote pre-widening files " +
+            "across type families. It is rejected fail-closed until that lands.");
 
     public static DeltaSchemaMismatchException CaseInsensitiveDuplicateColumn(string path, string other) =>
         new(

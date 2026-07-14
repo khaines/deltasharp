@@ -164,13 +164,19 @@ public sealed class DeltaReadSource : IDisposable
         }
 
         var batches = new List<ColumnBatch>();
+        // Read-side type-widening promotion gate (#495): only when the snapshot's protocol declares the
+        // `typeWidening` feature may the reader promote a narrow-physical file into the current (widened)
+        // schema. We know the protocol here (the scan layer), so we pass it explicitly; the stream-level
+        // ParquetFileReader cannot see the protocol and trusts this gate. A wide schema over narrow files
+        // WITHOUT the feature (a tampered/malformed log) fails closed rather than being silently promoted.
+        bool allowTypeWideningPromotion = TypeWideningFeature.Supports(snapshot.Protocol);
         try
         {
             foreach (AddFileAction add in snapshot.ActiveFiles)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 await ReadFileAsync(
-                        add, tableSchema, physicalNames, dataSchema, dataOrdinalByField, batches, cancellationToken)
+                        add, tableSchema, physicalNames, dataSchema, dataOrdinalByField, batches, allowTypeWideningPromotion, cancellationToken)
                     .ConfigureAwait(false);
             }
         }
@@ -196,6 +202,7 @@ public sealed class DeltaReadSource : IDisposable
         StructType dataSchema,
         int[] dataOrdinalByField,
         List<ColumnBatch> batches,
+        bool allowTypeWideningPromotion,
         CancellationToken cancellationToken)
     {
         // Load the committed deletion vector (if any) BEFORE reading data, so a poisoned/malformed DV fails
@@ -271,7 +278,7 @@ public sealed class DeltaReadSource : IDisposable
             try
             {
                 await foreach (ColumnBatch dataBatch in _reader
-                    .ReadAsync(stream, dataSchema, keepRowGroup: null, nullFillMissingColumns: true, cancellationToken)
+                    .ReadAsync(stream, dataSchema, keepRowGroup: null, nullFillMissingColumns: true, allowTypeWideningPromotion, cancellationToken)
                     .ConfigureAwait(false))
                 {
                     ColumnBatch fullBatch =

@@ -837,7 +837,7 @@ public sealed class DeltaOptimizeTests : IDisposable
             Stream stream = await _backend.OpenReadAsync(path, CancellationToken.None);
             await using (stream)
             {
-                await foreach (ColumnBatch batch in reader.ReadAsync(stream, DataSchema, null, nullFillMissingColumns: false, CancellationToken.None))
+                await foreach (ColumnBatch batch in reader.ReadAsync(stream, DataSchema, null, nullFillMissingColumns: false, allowTypeWideningPromotion: false, CancellationToken.None))
                 {
                     ColumnVector idColumn = batch.SelectedColumn(0);
                     ColumnVector valueColumn = batch.SelectedColumn(1);

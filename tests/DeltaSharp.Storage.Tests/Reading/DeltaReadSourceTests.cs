@@ -7,6 +7,7 @@ using DeltaSharp.Storage.Delta;
 using DeltaSharp.Storage.Delta.DeletionVectors;
 using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Storage.Reading;
+using DeltaSharp.Storage.Tests.Delta;
 using DeltaSharp.Storage.Writing;
 using DeltaSharp.Types;
 using Xunit;
@@ -371,6 +372,86 @@ public sealed class DeltaReadSourceTests : IDisposable
         Assert.DoesNotContain(rows, r => r.Id == 11);
     }
 
+    // ---------------------------------------------------------------- #495 read-side type-widening promotion
+    //                                                                   gate (DeltaReadSource, protocol-derived)
+
+    [Fact]
+    public async Task WidenedTable_WithTypeWideningFeature_PromotesNarrowFile_ThroughReadSource_Issue495()
+    {
+        // The read facade DERIVES the promotion gate from the SNAPSHOT PROTOCOL:
+        //   allowTypeWideningPromotion = TypeWideningFeature.Supports(snapshot.Protocol)  (DeltaReadSource).
+        // The per-width promotion mechanics are unit-tested at the reader (ParquetTypeWideningPromotionTests);
+        // THIS pins the facade-level gate WIRING end-to-end. Seed a typeWidening-ENABLED table (protocol v3/v7
+        // declaring the reader/writer feature + delta.enableTypeWidening) whose committed schema is `long`,
+        // over a physical file still written as narrow `int`. Reading through DeltaReadSource must PROMOTE the
+        // int values into the long vector (gate derived TRUE from the protocol).
+        var longSchema = new StructType(new[] { new StructField("value", DataTypes.LongType, nullable: false) });
+        string intFile = await WriteIntValueFileAsync("value-int.parquet", 1, 2, 3);
+        var backend = new LocalFileSystemBackend(_root);
+        try
+        {
+            await DeltaTestHarness.WriteCommitAsync(
+                backend, 0,
+                DeltaTestHarness.ProtocolWithReaderFeature("typeWidening"),
+                DeltaTestHarness.MetadataWithSchemaAndConfig(longSchema, new[] { ("delta.enableTypeWidening", "true") }),
+                DeltaTestHarness.Add(intFile));
+        }
+        finally
+        {
+            backend.Dispose();
+        }
+
+        using DeltaReadSource source = ReadSource();
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        Assert.Equal(DataTypes.LongType, info.Schema["value"].DataType);
+
+        var values = new List<long>();
+        foreach (ColumnBatch batch in await source.ReadBatchesAsync(info.Version))
+        {
+            ColumnVector value = batch.SelectedColumn(0);
+            Assert.Equal(DataTypes.LongType, value.Type); // promoted, not the physical int
+            for (int r = 0; r < batch.LogicalRowCount; r++)
+            {
+                values.Add(value.GetValue<long>(r));
+            }
+        }
+
+        Assert.Equal(new long[] { 1L, 2L, 3L }, values.OrderBy(v => v).ToArray());
+    }
+
+    [Fact]
+    public async Task WidenedSchema_WithoutTypeWideningFeature_FailsClosed_ThroughReadSource_Issue495()
+    {
+        // The negative gate: the SAME wide `long` schema over the SAME narrow `int` file, but a plain protocol
+        // that does NOT declare the typeWidening feature (a tampered/malformed log — a widened logical schema
+        // without the feature that sanctions it). DeltaReadSource derives allowTypeWideningPromotion = FALSE,
+        // so the reader binds the exact physical type and FAILS CLOSED (SchemaMismatch) rather than silently
+        // promoting — surfaced across the facade seam as the typed DeltaReadException. This proves the gate is
+        // driven by the protocol, not unconditionally open.
+        var longSchema = new StructType(new[] { new StructField("value", DataTypes.LongType, nullable: false) });
+        string intFile = await WriteIntValueFileAsync("value-int.parquet", 1, 2, 3);
+        var backend = new LocalFileSystemBackend(_root);
+        try
+        {
+            await DeltaTestHarness.WriteCommitAsync(
+                backend, 0,
+                DeltaTestHarness.Protocol(), // plain 1/2, NO typeWidening feature
+                DeltaTestHarness.MetadataWithSchema(longSchema),
+                DeltaTestHarness.Add(intFile));
+        }
+        finally
+        {
+            backend.Dispose();
+        }
+
+        using DeltaReadSource source = ReadSource();
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        Assert.Equal(DataTypes.LongType, info.Schema["value"].DataType); // schema IS widened…
+
+        // …but without the feature the narrow int file is NOT promoted — the read fails closed.
+        await Assert.ThrowsAsync<DeltaReadException>(() => source.ReadBatchesAsync(info.Version));
+    }
+
     // ---------------------------------------------------------------- pinning: no analysis→execution TOCTOU
 
     [Fact]
@@ -470,6 +551,32 @@ public sealed class DeltaReadSourceTests : IDisposable
             "_delta_log",
             version.ToString("D20", System.Globalization.CultureInfo.InvariantCulture) + ".json");
         File.SetLastWriteTimeUtc(commit, timestamp.UtcDateTime);
+    }
+
+    private async Task<string> WriteIntValueFileAsync(string relativePath, params int[] values)
+    {
+        var schema = new StructType(new[] { new StructField("value", DataTypes.IntegerType, nullable: false) });
+        MutableColumnVector col = ColumnVectors.Create(DataTypes.IntegerType, values.Length);
+        foreach (int v in values)
+        {
+            col.AppendValue(v);
+        }
+
+        var batch = new ManagedColumnBatch(schema, new ColumnVector[] { col }, values.Length);
+        using var buffer = new MemoryStream();
+        await new ParquetFileWriter().WriteWithStatisticsAsync(
+            buffer, schema, new[] { batch }, StatisticsPolicy.Default, CancellationToken.None);
+        var backend = new LocalFileSystemBackend(_root);
+        try
+        {
+            await backend.PutIfAbsentAsync(relativePath, buffer.ToArray(), CancellationToken.None);
+        }
+        finally
+        {
+            backend.Dispose();
+        }
+
+        return relativePath;
     }
 
     private static async Task<StagedDataFile> StageAsync(

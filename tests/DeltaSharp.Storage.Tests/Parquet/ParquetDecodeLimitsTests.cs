@@ -180,14 +180,14 @@ public sealed class ParquetDecodeLimitsTests
         var tiny = new ParquetFileReader(new ParquetDecodeLimits(maxRowGroupDecodedBytes: 1));
         await Assert.ThrowsAsync<DeltaStorageException>(async () =>
         {
-            await foreach (ColumnBatch _ in tiny.ReadAsync(new MemoryStream(parquet), schema, keepRowGroup: null, nullFillMissingColumns: false, CancellationToken.None))
+            await foreach (ColumnBatch _ in tiny.ReadAsync(new MemoryStream(parquet), schema, keepRowGroup: null, nullFillMissingColumns: false, allowTypeWideningPromotion: false, CancellationToken.None))
             {
             }
         });
 
         // The same file reads cleanly under the default limits.
         var read = new List<ColumnBatch>();
-        await foreach (ColumnBatch b in new ParquetFileReader().ReadAsync(new MemoryStream(parquet), schema, keepRowGroup: null, nullFillMissingColumns: false, CancellationToken.None))
+        await foreach (ColumnBatch b in new ParquetFileReader().ReadAsync(new MemoryStream(parquet), schema, keepRowGroup: null, nullFillMissingColumns: false, allowTypeWideningPromotion: false, CancellationToken.None))
         {
             read.Add(b);
         }
