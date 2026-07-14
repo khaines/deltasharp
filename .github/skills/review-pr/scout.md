@@ -11,8 +11,10 @@ Run the scout with the `task` tool as a **cheap but capable frontier** model (it
 reads/classifies — no deep reasoning needed):
 
 - Preferred models: `gemini-3.5-flash`, `gpt-5-mini`, or `claude-haiku-4.5`. (These are real
-  `task`-tool model IDs; Gemini **flash** and **pro** tiers version independently — the scout's
-  `gemini-3.5-flash` and the red-team's `gemini-3.1-pro-preview` are both current, not a typo.)
+  `task`-tool model IDs. The scout only **routes** — it never scores or gates — so its family is
+  immaterial to council decorrelation. Note Gemini **flash** and **pro** tiers version
+  independently: the scout's `gemini-3.5-flash` and the Quality voting seat's
+  `gemini-3.1-pro-preview` are both current, not a typo.)
 - `agent_type`: `explore` (read/grep/glob/bash) or `general-purpose`.
 - Always run the scout, even for small PRs — its Review Package is the audit record of
   *why* each seat was (or was not) selected. For a trivial 1–2 file docs-only change the

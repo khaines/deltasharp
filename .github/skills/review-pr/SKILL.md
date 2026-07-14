@@ -3,9 +3,10 @@ name: review-pr
 description: >-
   Orchestrates world-class pull request reviews using specialist agent personas and engineering checklists.
   Use this when asked to review a PR, review code changes, or assess PR quality.
-  A cheap scout triages and routes; a multi-frontier council (Claude Opus 4.8 + GPT-5.5) reviews
-  complex changes with up to 3 scout-selected domain specialists; a decorrelated red-team executes
-  repros (C7) and gates. Posts findings as GitHub PR comments for remote PRs.
+  A cheap scout triages and routes; a multi-frontier council (Claude Opus 4.8 + Gemini 3.1 Pro)
+  reviews complex changes with up to 3 scout-selected domain specialists; a decorrelated GPT-5.6 Sol
+  red-team executes repros (C7) and gates. Posts findings as GitHub PR code reviews (inline comments
+  + review summary) for remote PRs.
 ---
 
 # PR Review Skill — Orchestration Instructions
@@ -150,19 +151,23 @@ Dispatch **4 parallel reviews** using the `task` tool. Each slot has a fixed **r
 |---|---|---|---|
 | **Architect** | Deep reasoning — architecture implications, subtle bugs, design flaws | `claude-opus-4.8` (effort high/max) | `general-purpose`, `cloud-native-distributed-systems-architect`, `query-execution-engine-engineer`, `delta-storage-format-engineer`, `data-platform-connectors-engineer` |
 | **Balanced** | Code quality, patterns, maintainability, operational pragmatism | `claude-opus-4.8` (effort high/max) | `general-purpose`, `dotnet-framework-runtime-engineer`, `cloud-native-site-reliability-engineer`, `developer-experience-api-engineer` |
-| **Quality** | Testability, measurability, reliability, alternative pattern recognition | `gpt-5.5` (effort high) | `general-purpose`, `reliability-test-chaos-engineer`, `performance-benchmarking-engineer`, `technical-writer` |
+| **Quality** | Testability, measurability, reliability, alternative pattern recognition | `gemini-3.1-pro-preview` (effort high) | `general-purpose`, `reliability-test-chaos-engineer`, `performance-benchmarking-engineer`, `technical-writer` |
 | **Security** | Tenant isolation, auth bypass, injection, supply-chain, cryptographic correctness, privacy/compliance | `claude-opus-4.8` (effort high/max) | `cloud-native-security-sme`, `privacy-compliance-grc-lead`, `general-purpose` |
 
 > **Models track the newest top-tier of each family** — currently Claude **Opus 4.8** (in place
-> of older Opus 4.7 / Sonnet 4.6) for the deep / balanced / security lenses, and **GPT-5.5** for
-> Quality. Update these as families advance. The red-team (Phase 8) runs on a family **distinct
-> from the majority spine and ideally used by no voting seat** (here: Gemini) — see Phase 8.
+> of older Opus 4.7 / Sonnet 4.6) for the deep / balanced / security lenses, and **Gemini 3.1 Pro**
+> (`gemini-3.1-pro-preview`) for Quality — a non-Claude voting perspective. Update these as families
+> advance. The council spans **three frontier families**: Claude (spine), Gemini (Quality), and GPT
+> (the Phase 8 red-team, `gpt-5.6-sol` / GPT-5.6 Sol) — so the red-team gate is **decorrelated from
+> every voting seat** (no voting seat uses GPT). See Phase 8.
 
 **Models are fixed per slot.** Diverse pattern recognition across the council comes from the model mix; domain specialization comes from the per-slot `agent_type` choice.
 
 **Specialist seats (scout-selected, ≤3).** In addition to the 4 fixed lenses, dispatch each
 domain specialist from the scout's Review Package as an **additional voting seat** on a frontier
-model (`agent_type` = the specialist persona; model = a top-tier family, e.g. `claude-opus-4.8`),
+model (`agent_type` = the specialist persona; model = a **voting-spine family (Claude or Gemini),
+never GPT** — so the red-team's GPT-family decorrelation stays *structurally* guaranteed; a specialist
+on GPT would silently degrade the gate to provisional; e.g. `claude-opus-4.8`),
 scoped to its owned files + checklist IDs. The 4 lenses are the spine; specialists add depth for
 the domains the diff actually touches (Delta storage, query execution, operator, connectors, …).
 
@@ -414,8 +419,10 @@ Complex changes** and for any change touching a protected domain.
 
 After the rating, dispatch the **red-team** (`.github/skills/review-pr/red-team.md`) — the council's
 gate-keeper. It runs **last**, **shell-capable** (`agent_type: general-purpose`), on a frontier
-family **distinct from the majority voting spine and ideally used by no voting seat** (if the spine
-is Opus + GPT, use `gemini-3.1-pro-preview`; do not reuse a voting seat's family such as `gpt-5.5`).
+family **distinct from the majority voting spine and ideally used by no voting seat**. With the
+current council (Claude spine + Gemini Quality), use **`gpt-5.6-sol`** (GPT-5.6 Sol) — the GPT family
+is used by no voting seat; do not reuse a voting seat's family (`claude-opus-4.8` or
+`gemini-3.1-pro-preview`) as the red-team.
 
 Give it the diff, the Review Package, and **every voting seat's full verdict + findings**. It
 assumes the PR is broken, tries to falsify the seats' approvals, hunts the council's historical
@@ -463,13 +470,23 @@ merge-ready (see `rating-rubric.md` → PASS gate).**
 
 ### 9.2 Post the Review
 
-Use GitHub tools to submit the review:
+Post the council output as a **GitHub PR review** — a summary body plus inline `file:line` comments —
+following the mechanics in [`github-review-posting.md`](github-review-posting.md). Key rules:
 
-1. Submit the overall review with the recommendation.
-2. Post every finding that has a file and line reference as an inline review comment.
-3. Format each inline comment with severity badge, finding description, and recommendation.
-4. Info findings remain in the review body only.
-5. If a finding references a file but not a specific line, post it as a file-level review comment when supported.
+1. **Submit one review** (`POST …/pulls/{n}/reviews` with body + `comments[]` in a single call). The
+   summary body carries the rating, info findings, and the recommendation.
+2. **Self-authored PRs use `event: COMMENT`.** When the acting identity is the PR author (the normal
+   case here), GitHub rejects `APPROVE`/`REQUEST_CHANGES` on your own PR — submit `event: COMMENT` and
+   put the APPROVE/COMMENT/REQUEST_CHANGES recommendation (§9.1) in the body text.
+3. **Post every actionable finding with a `file:line` as an inline comment**, formatted with the
+   severity badge, description, recommendation, and EVIDENCE. Anchor only to lines in the PR diff; for
+   an un-anchorable line, fall back to a file-level comment (`subject_type: file`) or the review body
+   (see `github-review-posting.md` → "Line-anchoring & fallback").
+4. **Info findings** remain in the review body only (no thread).
+5. **Threads gate merge.** Each inline comment opens a review thread, and
+   `required_conversation_resolution` blocks merge until every thread is resolved — so post inline
+   comments only for **actionable** findings the loop will fix, and let `review-fix-loop` §5.3 resolve
+   each thread when the fix lands. Never post an inline comment you do not intend to resolve.
 
 ### 9.3 Avoid Duplicates
 
@@ -490,7 +507,7 @@ and fix it. This applies whenever a repository is available, including local-onl
 
 ## Important Notes
 
-- **Always read supporting files first.** Load `scout.md`, `agent-map.md`, `checklist-map.md`, `rating-rubric.md`, `rigor-battery.md`, and `red-team.md` before starting the pipeline.
+- **Always read supporting files first.** Load `scout.md`, `agent-map.md`, `checklist-map.md`, `rating-rubric.md`, `rigor-battery.md`, `red-team.md`, and `github-review-posting.md` before starting the pipeline.
 - **Scout first, red-team last.** Every Complex review is bracketed by a cheap scout (routing) and a decorrelated red-team (adversarial gate). The scout selects ≤3 specialist seats; the red-team must execute C7 repros and certify (`NO-MISS-CERTIFIED`) before the gate can PASS.
 - **Execution over reading (C7).** Seats and the red-team must RUN execution-eligible claims; dispatch any executing seat shell-capable (`general-purpose`), never a file-view-only persona.
 - **Decorrelate the red-team.** Run it on a frontier family distinct from the majority voting spine; same-family certification is provisional for protected-domain changes.

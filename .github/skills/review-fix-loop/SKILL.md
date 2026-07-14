@@ -18,6 +18,7 @@ Read all supporting files before beginning:
 - `.github/skills/review-pr/agent-map.md` — file → agent mapping
 - `.github/skills/review-pr/checklist-map.md` — file → checklist mapping
 - `.github/skills/review-pr/rating-rubric.md` — severity and rating definitions
+- `.github/skills/review-pr/github-review-posting.md` — how council output is published as a GitHub code review (inline comments + review summary), self-review + thread-resolution rules
 - `.github/skills/review-fix-loop/dismissal-rules.md` — when to dismiss vs. fix findings
 
 ---
@@ -275,10 +276,17 @@ git push origin {branch_name}
 
 ### 5.3 Resolve PR Comments
 
-If the review-pr skill posted inline comments on the PR for findings that have now been fixed:
+If the review-pr skill posted inline comments on the PR for findings that have now been fixed, resolve
+their threads so `required_conversation_resolution` does not block merge (see
+[`../review-pr/github-review-posting.md`](../review-pr/github-review-posting.md) → "Resolving
+threads"):
 
-- Check for existing review threads on the PR.
-- For each fixed finding, if a matching inline comment exists, post a reply indicating what was fixed and resolve the thread.
+- List open review threads (`reviewThreads` via GraphQL) and match each to a fixed finding by its
+  first comment's `path` + body.
+- For each fixed finding, **reply** to the thread with the fix (`… /replies` with the fix SHA) and
+  **resolve** it (`resolveReviewThread` mutation).
+- At termination, assert **zero unresolved threads remain for fixed findings** — an unresolved thread
+  on an addressed finding is a merge blocker, not PASS.
 
 ### 5.4 Loop Back
 
@@ -351,26 +359,40 @@ durable in-code/in-PR rationale that records the decision. Not a substitute for 
 
 ### 6.3 Post Final Summary
 
-If the PR is on GitHub, post the progression report as a PR comment (not a review) so it serves as a permanent record of the review-fix process.
+If the PR is on GitHub, post the progression report as a **`COMMENT` review** (summary body, no inline
+threads) so it lands in the PR's **Reviews** timeline as the permanent record of the review-fix
+process:
+
+```bash
+gh pr review {pr_number} --comment --body-file {report_file}
+```
+
+`--comment` is allowed on a self-authored PR and creates no thread, so it never trips the
+`required_conversation_resolution` gate (see
+[`../review-pr/github-review-posting.md`](../review-pr/github-review-posting.md)). Keep the
+`<!-- deltasharp-rfl-report … -->` marker in the body for §6.4.
 
 ### 6.4 Verify the Final Report Was Posted (MANDATORY)
 
-The orchestrator MUST not claim the loop terminated successfully until it has verified, on GitHub, that the progression report comment exists on the PR.
+The orchestrator MUST not claim the loop terminated successfully until it has verified, on GitHub, that the progression report review exists on the PR.
 
-Verification procedure:
+Verification procedure (query/post mechanics are canonical in
+[`../review-pr/github-review-posting.md`](../review-pr/github-review-posting.md) → "Verifying the posted
+review"; keep the two in lockstep):
 
 1. Use the Run Identity captured in §1.5.
-2. Query for this run's report by run-identity marker:
+2. Query for this run's report by run-identity marker (the report is now a **review**, so read
+   `.reviews[]`, not issue `.comments[]`):
 
    ```bash
-   gh pr view {pr_number} --json comments --jq '.comments[]
+   gh pr view {pr_number} --json reviews --jq '.reviews[]
      | select(.body | contains("<!-- deltasharp-rfl-report pr={pr_number} head={final_head_sha} rounds={final_round_count} "))
-     | {url: .url, createdAt: .createdAt, body_preview: (.body[0:300])}'
+     | {state: .state, submittedAt: .submittedAt, body_preview: (.body[0:300])}'
    ```
 
-3. Validate the matched comment body contains the report heading, progression table, final rating field, council composition audit, and is newer than `LOOP_START_UTC`.
-4. On missing or invalid comment, re-render the report to a project-relative scratch path such as `.rfl-report-{PR_NUMBER}.md`, repost with `gh pr comment {PR_NUMBER} --body-file .rfl-report-{PR_NUMBER}.md`, re-verify, then delete the file after success.
-5. Capture the verified comment URL and include it in the final response as `RFL Report: <url>`.
+3. Validate the matched review body contains the report heading, progression table, final rating field, council composition audit, and is newer than `LOOP_START_UTC`.
+4. On missing or invalid review, re-render the report to a project-relative scratch path such as `.rfl-report-{PR_NUMBER}.md`, repost with `gh pr review {PR_NUMBER} --comment --body-file .rfl-report-{PR_NUMBER}.md`, re-verify, then delete the file after success.
+5. Capture the verified review URL and include it in the final response as `RFL Report: <url>`.
 
 ### 6.5 Council Composition Audit (MANDATORY)
 
@@ -438,7 +460,7 @@ commit per-run scratch logs to the repo — that is itself a C6 hygiene miss.)
 3. Triage verification completed for any round with 5+ dismissals or any dismissed findings in protected domains.
 4. Dismissed findings audited and real items tracked as backlog issues.
 5. **Every deferred finding has a GitHub tracking issue the orchestrator verified exists** (`gh issue view <n>` → open, scope matches the finding), with its number recorded in the report. **No un-filed deferral may PASS**; any `inherent/won't-fix` residual instead carries a durable in-code/in-PR rationale.
-6. Full progression report posted as a PR comment with council composition audit and verified URL.
+6. Full progression report posted as a **`COMMENT` review** with council composition audit and verified URL.
 7. Restore/build/format/test validation green for .NET changes.
 8. CI green on all required checks when remote checks exist.
 
