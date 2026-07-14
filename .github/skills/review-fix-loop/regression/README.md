@@ -30,7 +30,7 @@ Optionally, when running locally, the orchestrator may append one JSON line per 
 ```
 {"ts":"…","pr":323,"round":2,"complexity":"Complex","seats":["architect","balanced","quality","security"],
  "specialists":[],"findings":{"critical":0,"high":0,"medium":0,"low":0,"info":0},"redteam":"NO-MISS-CERTIFIED",
- "redteam_catches":1,"redteam_model":"gpt-5.5","gate":"PASS",
+ "redteam_catches":1,"redteam_model":"gpt-5.6-sol","gate":"PASS",
  "miss_classes":["C2-parity","fixer-diff"]}
 ```
 

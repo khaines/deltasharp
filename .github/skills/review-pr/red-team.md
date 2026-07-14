@@ -17,9 +17,11 @@ manufactures the independent, adversarial error-checking that constructive revie
 
 - **Different frontier family.** Run the red-team on a frontier family **distinct from the
   majority of the voting seats, and ideally a family no voting seat uses at all** — so it does
-  not share their blind spots. If the spine is Opus + GPT (the Quality lens is `gpt-5.5`), use
-  **`gemini-3.1-pro-preview`**; do **not** reuse a voting seat's family (e.g. `gpt-5.5`) as the
-  red-team. Record which model gated. A red-team on the *same* family as the majority spine is
+  not share their blind spots. The current council is Claude (spine: Architect/Balanced/Security
+  + specialists) + Gemini (the Quality lens is `gemini-3.1-pro-preview`), so run the red-team on
+  **`gpt-5.6-sol`** (GPT-5.6 Sol) — the GPT family no voting seat uses; do **not** reuse a voting
+  seat's family (e.g. `claude-opus-4.8` or `gemini-3.1-pro-preview`) as the red-team. Record which
+  model gated. A red-team on the *same* family as a voting seat (or the majority spine) is
   **provisional** and does **not** satisfy the gate for protected-domain changes — say so and
   require a decorrelated re-run or a documented human waiver.
 - **Shell-capable, always.** The red-team MUST hold a real shell to run C7 repros. Dispatch
