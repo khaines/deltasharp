@@ -611,26 +611,29 @@ public sealed class DeltaSchemaEnforcerTests
         { DataTypes.IntegerType, DataTypes.FloatType },
     };
 
-    // ---- #535: cross-family SANCTIONED widenings are APPLIED when enabled, else fail-closed ----
+    // ---- #535: cross-family SANCTIONED widenings are READ-PROMOTABLE but NOT applied on write ----
 
     [Theory]
     [MemberData(nameof(CrossFamilyWidenings))]
-    public void Reconcile_CrossFamilyWidening_WhenEnabled_AppliesAndRecordsTypeChange(DataType from, DataType to)
+    public void Reconcile_CrossFamilyWidening_WhenEnabled_IsRejectedAsTypeWideningUnsupported_ReadOnly(
+        DataType from, DataType to)
     {
         // int→double, byte/short→double, and int/long→decimal (that fits the range) ARE Delta-sanctioned
-        // cross-family widenings (Delta PROTOCOL.md "Type Widening" → "Supported Type Changes"). #535 now
-        // APPLIES them: the merged schema carries the WIDE type and a delta.typeChanges entry {fromType,toType}
-        // (top-level, no fieldPath). No data file is rewritten — the narrow Parquet is promoted at READ time.
+        // widenings for READ + explicit ALTER TABLE (Delta `TypeWidening.isTypeChangeSupported`), but they are
+        // NOT eligible for automatic SCHEMA EVOLUTION (`isTypeChangeSupportedForSchemaEvolution` excludes
+        // int→double and integral→decimal). DeltaSharp applies widenings only on the append/reconcile path
+        // (schema evolution), so — matching Spark — a cross-family widening is REJECTED fail-closed as
+        // TypeWideningUnsupported EVEN WHEN the feature is enabled. #535 supports these ONLY on READ
+        // (ParquetFileReader.ReadPromotedColumnAsync) for interop with a Spark/delta-rs table that recorded the
+        // change via ALTER TABLE; DeltaSharp never auto-applies them on write.
         StructType table = Schema(Field("value", from, nullable: true));
         StructType write = Schema(Field("value", to, nullable: true));
 
-        StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
 
-        Assert.NotNull(merged);
-        StructField field = merged!["value"];
-        Assert.Equal(to, field.DataType);
-        AssertSingleTypeChange(field.Metadata, from.TypeName, to.TypeName);
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
     }
 
     [Theory]
@@ -639,7 +642,7 @@ public sealed class DeltaSchemaEnforcerTests
     {
         // With the feature DISABLED, a cross-family sanctioned widening is REJECTED fail-closed as
         // TypeWideningUnsupported (naming the enablement requirement) — NOT the generic IncompatibleType a
-        // string→int gets — because it IS Delta-sanctioned, just not enabled.
+        // string→int gets — because it IS Delta-sanctioned, just not applied on write.
         StructType table = Schema(Field("value", from, nullable: true));
         StructType write = Schema(Field("value", to, nullable: true));
 

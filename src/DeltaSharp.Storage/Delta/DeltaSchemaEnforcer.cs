@@ -315,15 +315,18 @@ internal static class DeltaSchemaEnforcer
                 return new MapType(mergedKey, mergedValue, tableMap.ValueContainsNull);
 
             default:
-                // A differing scalar type. APPLY the change only when it is a Delta-sanctioned widening AND
-                // the table has type widening enabled (feature + `delta.enableTypeWidening`) AND we are at a
-                // promotable position (a StructField's own scalar, not an array/map element). IsSanctionedWidening
-                // now spans BOTH the same-family cases (#495) and the cross-family integral→double /
-                // integral→decimal cases (#535) — the read path (ReadPromotedColumnAsync) promotes every one.
-                // Otherwise classify the rejection: a would-be sanctioned/deferred widening surfaces distinctly
-                // as TypeWideningUnsupported; anything else (a narrowing, a too-narrow decimal target that
-                // cannot hold the integral range, or an unrelated type) as IncompatibleType.
-                if (allowWidenApply && typeWideningEnabled && TypeWidening.IsSanctionedWidening(tableType, writeType))
+                // A differing scalar type. APPLY the widening on write ONLY when it is a Delta
+                // SCHEMA-EVOLUTION-eligible widening (IsSameFamilyWidening: integral byte→…→long, float→double,
+                // grow-only decimal) AND type widening is enabled AND we are at a promotable scalar position.
+                // This mirrors Spark's `TypeWidening.isTypeChangeSupportedForSchemaEvolution` (the SUBSET auto-
+                // applied when a wider-typed write evolves the schema) — deliberately NARROWER than the full
+                // `IsSanctionedWidening` set. CROSS-FAMILY widenings (integral→double / integral→decimal, #535)
+                // are Delta-`isTypeChangeSupported` (readable, and applicable by Spark via an explicit ALTER
+                // TABLE CHANGE COLUMN TYPE) but are NOT schema-evolution-eligible, so DeltaSharp does NOT apply
+                // them on append — it only PROMOTES them on READ (ReadPromotedColumnAsync) for interop with a
+                // Spark/delta-rs table that recorded such a change. They therefore fall through to the reject
+                // block below (fail-closed as TypeWideningUnsupported), same as when the feature is disabled.
+                if (allowWidenApply && typeWideningEnabled && TypeWidening.IsSameFamilyWidening(tableType, writeType))
                 {
                     return writeType;
                 }
@@ -331,12 +334,14 @@ internal static class DeltaSchemaEnforcer
                 if (TypeWidening.IsSanctionedWidening(tableType, writeType)
                     || TypeWidening.IsDeferredWidening(tableType, writeType))
                 {
-                    // A Delta-sanctioned widening that is NOT applied here: the feature is disabled, or this is
-                    // a nested (array-element/map key/value) position where allowWidenApply is false — nested
-                    // widening is DEFERRED (it would need a `fieldPath` in `delta.typeChanges` and the Parquet
-                    // read path does not read nested types at all; tracked as the #535 follow-up, #546) — or
-                    // the date→timestamp_ntz deferral (#533). Surfaced distinctly as TypeWideningUnsupported
-                    // (fail-closed) rather than the generic IncompatibleType a truly-unrelated change gets.
+                    // A Delta-sanctioned widening that is NOT applied here: the feature is disabled; or this is
+                    // a CROSS-FAMILY widening (#535) — read-promotable but not schema-evolution-eligible, so
+                    // never auto-applied on write; or a nested (array-element/map key/value) position where
+                    // allowWidenApply is false — nested widening is DEFERRED (it would need a `fieldPath` in
+                    // `delta.typeChanges` and the Parquet read path does not read nested types at all; tracked
+                    // as the #535 follow-up, #546) — or the date→timestamp_ntz deferral (#533). Surfaced
+                    // distinctly as TypeWideningUnsupported (fail-closed) rather than the generic
+                    // IncompatibleType a truly-unrelated change gets.
                     throw DeltaSchemaMismatchException.TypeWideningUnsupported(
                         path, tableType.SimpleString, writeType.SimpleString);
                 }
