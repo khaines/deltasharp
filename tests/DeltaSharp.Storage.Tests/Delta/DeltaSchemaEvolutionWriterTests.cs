@@ -52,6 +52,13 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
     private static StagedDataFile Staged(string path) =>
         new(path, NoPartition, Size: 1L, ModificationTime: 1L, Stats: null);
 
+    private static StagedDataFile StagedPartitioned(string path, params (string Key, string? Value)[] partitionValues)
+    {
+        ImmutableSortedDictionary<string, string?> pv = ImmutableSortedDictionary
+            .CreateRange(StringComparer.Ordinal, partitionValues.Select(kv => new KeyValuePair<string, string?>(kv.Key, kv.Value)));
+        return new StagedDataFile(path, pv, Size: 1L, ModificationTime: 1L, Stats: null);
+    }
+
     private DeltaTableWriter Writer() => new(_backend);
 
     private DeltaLog Log() => new(_backend);
@@ -566,5 +573,86 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
         // committed table declares the typeWidening feature, so the read-side promotion gate is open).
         List<ColumnBatch> promoted = await ParquetTestHelpers.ReadAllAsync(oldFile, evolved, keepRowGroup: null, allowTypeWideningPromotion: true);
         Assert.Equal(new long[] { 1L, 2L, 3L }, promoted.Single().Column(0).GetValues<long>().ToArray());
+    }
+
+    [Fact]
+    public async Task Append_WidenPartitionColumn_WhenFeatureEnabled_CommitsWidenedSchemaAndTypeChanges_KeepsPartitionColumnsLogical()
+    {
+        // #537: seed a typeWidening-ENABLED, PARTITIONED table whose partition column `part` is int and whose
+        // v0 add records the partition value as the canonical STRING "5" (Delta stores partition values as
+        // strings in the log / directory names, never in the Parquet data file). Widening the partition
+        // column int→long is metadata-only: NO data file is rewritten — the widening is applied purely by
+        // emitting delta.typeChanges + re-interpreting the (unchanged) partition string under the wide type.
+        var initial = Struct(
+            F("id", DataTypes.LongType, nullable: false),
+            F("part", DataTypes.IntegerType, nullable: true));
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 0,
+            DeltaTestHarness.ProtocolWithReaderFeature("typeWidening"),
+            DeltaTestHarness.MetadataWithSchemaAndConfig(
+                initial, new[] { ("delta.enableTypeWidening", "true") }, partitionColumns: new[] { "part" }),
+            DeltaTestHarness.Add("v0.parquet", partitionValues: new[] { ("part", "5") }));
+
+        // A widening append (int → long on the PARTITION column) is APPLIED: it commits the widened metaData
+        // atomically with the new add, in one version — exactly like a non-partition widening (#495).
+        Snapshot readSnapshot = await LoadAsync();
+        DeltaCommitResult result = await Writer().AppendAsync(
+            readSnapshot,
+            Struct(F("id", DataTypes.LongType, nullable: false), F("part", DataTypes.LongType, nullable: true)),
+            new[] { StagedPartitioned("v1.parquet", ("part", "10")) },
+            SchemaEvolutionMode.MergeSchema);
+
+        IReadOnlyList<DeltaAction> committed = await Log().ReadCommitActionsAsync(result.Version, CancellationToken.None);
+        MetadataAction meta = Assert.Single(committed.OfType<MetadataAction>());
+
+        // GOLDEN SHAPE 1: metaData.partitionColumns keeps the LOGICAL name, unchanged by the widening.
+        Assert.Equal(new[] { "part" }, meta.PartitionColumns);
+
+        // GOLDEN SHAPE 2: the committed schema's partition field widened to `long` and carries a
+        // delta.typeChanges {fromType:"integer",toType:"long"} on the partition StructField.
+        Snapshot evolved = await LoadAsync();
+        StructField part = evolved.Schema["part"];
+        Assert.Equal(DataTypes.LongType, part.DataType);
+        Assert.True(part.Metadata.TryGetValue("delta.typeChanges", out MetadataValue? changes));
+        Assert.True(changes!.TryGetArray(out IReadOnlyList<MetadataValue>? entries));
+        MetadataValue only = Assert.Single(entries!);
+        Assert.True(only.TryGetNested(out FieldMetadata? nested));
+        Assert.True(nested!.TryGetString("fromType", out string? from));
+        Assert.True(nested.TryGetString("toType", out string? to));
+        Assert.Equal("integer", from);
+        Assert.Equal("long", to);
+
+        // GOLDEN SHAPE 3: NO data file was rewritten — the OLD v0 add is still active and its
+        // add.partitionValues string is UNCHANGED ("5", physical/logical identical, un-mapped). The read door
+        // const-fills that string under the widened `long` type at read time; the bytes on disk are untouched.
+        AddFileAction v0 = Assert.Single(evolved.ActiveFiles.Where(a => a.Path == "v0.parquet"));
+        Assert.Equal("5", v0.PartitionValues["part"]);
+    }
+
+    [Fact]
+    public async Task Append_WidenPartitionColumn_WithoutFeatureEnabled_IsRejectedBeforeAnyCommit()
+    {
+        // Feature-disabled fails closed: the SAME int→long partition widening that applies when enabled stays
+        // rejected (TypeWideningUnsupported) when the table has NOT enabled type widening, and no version is
+        // published (the table's latest version is unchanged).
+        var initial = Struct(
+            F("id", DataTypes.LongType, nullable: false),
+            F("part", DataTypes.IntegerType, nullable: true));
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 0,
+            DeltaTestHarness.Protocol(minReader: 1, minWriter: 2),
+            DeltaTestHarness.MetadataWithSchema(initial, partitionColumns: new[] { "part" }),
+            DeltaTestHarness.Add("v0.parquet", partitionValues: new[] { ("part", "5") }));
+
+        Snapshot readSnapshot = await LoadAsync();
+        DeltaSchemaMismatchException ex = await Assert.ThrowsAsync<DeltaSchemaMismatchException>(
+            () => Writer().AppendAsync(
+                readSnapshot,
+                Struct(F("id", DataTypes.LongType, nullable: false), F("part", DataTypes.LongType, nullable: true)),
+                new[] { StagedPartitioned("v1.parquet", ("part", "10")) },
+                SchemaEvolutionMode.MergeSchema));
+
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+        Assert.Equal(0L, (await LoadAsync()).Version);
     }
 }
