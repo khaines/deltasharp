@@ -27,8 +27,9 @@ namespace DeltaSharp.Storage.Delta;
 /// <c>float→double</c>, and <c>decimal(p,s)→decimal(p',s')</c> grow-only (integer-digit range and scale both
 /// non-decreasing) — and <b>cross-family</b> (<see cref="TypeWidening.IsCrossFamilyWidening"/>, #535) —
 /// <c>byte/short/int→double</c> (NOT <c>long→double</c>, which is lossy) and
-/// <c>byte/short/int/long→decimal(p,s)</c> when the decimal's integer-digit capacity <c>p−s</c> holds the
-/// full integral range. The read path (<c>ParquetFileReader.ReadPromotedColumnAsync</c>) promotes a
+/// <c>byte/short/int/long→decimal(p,s)</c> when the decimal's integer-digit capacity <c>p−s</c> meets Delta's
+/// Parquet-physical-type threshold (<c>≥ 10</c> for the INT32-stored <c>byte/short/int</c>, <c>≥ 20</c> for
+/// INT64-stored <c>long</c>). The read path (<c>ParquetFileReader.ReadPromotedColumnAsync</c>) promotes a
 /// pre-widening (narrow) Parquet file to the widened type at READ time, so no data file is rewritten.
 /// When the table does <b>not</b> enable type widening, such a change is rejected distinctly as
 /// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> (naming the enablement requirement); every

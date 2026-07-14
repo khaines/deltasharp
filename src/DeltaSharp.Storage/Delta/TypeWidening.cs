@@ -98,10 +98,13 @@ internal static class TypeWidening
     /// <c>int</c>; <c>long → double</c> is <b>lossy</b> — a 64-bit integer exceeds double's 53-bit mantissa —
     /// so it is NOT sanctioned);</item>
     /// <item><c>byte</c>/<c>short</c>/<c>int</c>/<c>long</c> → <c>decimal(p,s)</c>, but ONLY when the target
-    /// decimal can represent the <b>full integral range</b> losslessly — its integer-digit capacity
-    /// (<c>p − s</c>) must be at least the digits the widest source value needs (byte 3, short 5, int 10,
-    /// long 19). A decimal too narrow to hold the source is NOT a sanctioned widening (it would truncate) and
-    /// stays fail-closed.</item>
+    /// decimal meets Delta's threshold, which is keyed to the source's <b>Parquet physical type</b> (NOT its
+    /// value-range digit count): <c>byte</c>/<c>short</c>/<c>int</c> are all stored as <c>INT32</c> → the
+    /// reader supports <c>INT32 → Decimal(10,0)</c> and wider, so <c>p − s ≥ 10</c>; <c>long</c> is
+    /// <c>INT64</c> → <c>Decimal(20,0)</c> and wider, so <c>p − s ≥ 20</c> (Spark
+    /// <c>DecimalType.forType(Int)=Decimal(10,0)</c>/<c>forType(Long)=Decimal(20,0)</c>; Delta
+    /// <c>d.isWiderThan(IntegerType)</c>/<c>isWiderThan(LongType)</c>). A decimal narrower than that threshold
+    /// is NOT a sanctioned widening and stays fail-closed.</item>
     /// </list>
     /// </summary>
     public static bool IsCrossFamilyWidening(DataType from, DataType to)
@@ -121,11 +124,12 @@ internal static class TypeWidening
             return fromRank <= 2;
         }
 
-        // byte/short/int/long → decimal, but only when the decimal's integer-digit capacity (p − s) can hold
-        // every value of the source integral type without truncation.
+        // byte/short/int/long → decimal, but only when the decimal's integer-digit capacity (p − s) meets
+        // Delta's Parquet-physical-type threshold (INT32 sources → ≥ 10, INT64 → ≥ 20). See
+        // MinDecimalIntegerDigits.
         if (to is DecimalType decimalType)
         {
-            return (decimalType.Precision - decimalType.Scale) >= IntegralDigits(fromRank);
+            return (decimalType.Precision - decimalType.Scale) >= MinDecimalIntegerDigits(fromRank);
         }
 
         return false;
@@ -170,17 +174,13 @@ internal static class TypeWidening
         _ => -1,
     };
 
-    // The number of base-10 integer digits the widest magnitude of an integral rank needs, so a decimal's
-    // integer-digit capacity (precision − scale) must be at least this to hold the full range losslessly:
-    //   byte  [-128, 127]                    → 3   (128)
-    //   short [-32768, 32767]                → 5   (32768)
-    //   int   [-2147483648, 2147483647]      → 10  (2147483648)
-    //   long  [-9223372036854775808, …5807]  → 19  (9223372036854775808)
-    private static int IntegralDigits(int rank) => rank switch
-    {
-        0 => 3,
-        1 => 5,
-        2 => 10,
-        _ => 19,
-    };
+    // The minimum decimal integer-digit capacity (precision − scale) Delta requires for an integral→decimal
+    // widening. Delta keys this to the source's Parquet PHYSICAL storage type, NOT its value-range digit
+    // count: byte/short/int are all stored as INT32 → the Parquet reader supports INT32 → Decimal(10,0) and
+    // wider, so p − s ≥ 10; long is INT64 → INT64 → Decimal(20,0) and wider, so p − s ≥ 20. (Spark models
+    // these as DecimalType.forType(Int) = Decimal(10,0) and forType(Long) = Decimal(20,0); Delta's
+    // isTypeChangeSupported requires d.isWiderThan(IntegerType) / d.isWiderThan(LongType) respectively —
+    // delta-io/delta TypeWidening.scala + DecimalType.scala. NB: 10/20 exceed the mathematical digit counts
+    // 10/19, so e.g. long → decimal(19,0) — lossless by value but keyed to INT64 — is NOT sanctioned.)
+    private static int MinDecimalIntegerDigits(int rank) => rank <= 2 ? 10 : 20;
 }

@@ -210,7 +210,8 @@ public sealed class ParquetTypeWideningPromotionTests
     [Fact]
     public async Task Long_To_Decimal_CrossFamily()
     {
-        // #535: long→decimal(20,0). p−s = 20 ≥ 19 long digits, so long.MaxValue/MinValue promote losslessly.
+        // #535: long→decimal(20,0). long is INT64 → the threshold is p−s ≥ 20; long.MaxValue/MinValue promote
+        // losslessly.
         var wide = DataTypes.CreateDecimalType(20, 0);
         ColumnVector v = await PromoteAsync(DataTypes.LongType, wide,
             c => { c.AppendValue(long.MaxValue); c.AppendValue(long.MinValue); c.AppendValue(0L); }, 3);
@@ -222,12 +223,26 @@ public sealed class ParquetTypeWideningPromotionTests
     [Fact]
     public async Task Byte_To_Decimal_CrossFamily_WithNulls()
     {
-        var wide = DataTypes.CreateDecimalType(5, 0);
+        // byte is stored as INT32, so the Delta threshold is decimal(10,0)+ (p−s ≥ 10), not the byte value
+        // range; nulls preserved through the promotion.
+        var wide = DataTypes.CreateDecimalType(10, 0);
         ColumnVector v = await PromoteAsync(DataTypes.ByteType, wide,
             c => { c.AppendValue((byte)7); c.AppendNull(); c.AppendValue(unchecked((byte)(sbyte)-1)); }, 3);
         Assert.Equal(7m, ParquetTypeMapping.ReadDecimal(v, wide, 0));
         Assert.True(v.IsNull(1));
         Assert.Equal(-1m, ParquetTypeMapping.ReadDecimal(v, wide, 2));
+    }
+
+    [Fact]
+    public async Task Short_To_Decimal_CrossFamily()
+    {
+        // short (INT32 physical) → decimal(10,0) — covers the short→decimal read lane incl. boundary values.
+        var wide = DataTypes.CreateDecimalType(10, 0);
+        ColumnVector v = await PromoteAsync(DataTypes.ShortType, wide,
+            c => { c.AppendValue((short)32767); c.AppendValue((short)-32768); c.AppendValue((short)0); }, 3);
+        Assert.Equal(32767m, ParquetTypeMapping.ReadDecimal(v, wide, 0));
+        Assert.Equal(-32768m, ParquetTypeMapping.ReadDecimal(v, wide, 1));
+        Assert.Equal(0m, ParquetTypeMapping.ReadDecimal(v, wide, 2));
     }
 
     [Fact]

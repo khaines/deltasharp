@@ -47,19 +47,25 @@ public sealed class TypeWideningClassifierTests
     }
 
     [Theory]
-    // Cross-family integral→decimal (#535) — true only when the decimal's integer-digit capacity (p−s) holds
-    // the full integral range: byte 3, short 5, int 10, long 19 digits.
-    [InlineData(nameof(DataTypes.ByteType), 3, 0, true)]   // decimal(3,0) holds byte [-128,127]
-    [InlineData(nameof(DataTypes.ByteType), 2, 0, false)]  // decimal(2,0) cannot hold 127
-    [InlineData(nameof(DataTypes.ShortType), 5, 0, true)]  // decimal(5,0) holds short
-    [InlineData(nameof(DataTypes.ShortType), 4, 0, false)] // decimal(4,0) cannot hold 32767
-    [InlineData(nameof(DataTypes.IntegerType), 10, 0, true)]  // decimal(10,0) holds int
-    [InlineData(nameof(DataTypes.IntegerType), 9, 0, false)]  // decimal(9,0) cannot hold 2147483647
-    [InlineData(nameof(DataTypes.IntegerType), 12, 2, true)]  // p−s = 10 ≥ 10 → holds int
-    [InlineData(nameof(DataTypes.IntegerType), 11, 2, false)] // p−s = 9 < 10 → too narrow
-    [InlineData(nameof(DataTypes.LongType), 19, 0, true)]  // decimal(19,0) holds long
-    [InlineData(nameof(DataTypes.LongType), 18, 0, false)] // decimal(18,0) cannot hold long
-    [InlineData(nameof(DataTypes.LongType), 20, 0, true)]  // wider decimal also holds long
+    // Cross-family integral→decimal (#535) — Delta keys the min integer-digit capacity (p−s) to the source's
+    // Parquet PHYSICAL type, NOT its value-range digit count: byte/short/int are all INT32 → decimal(10,0)+
+    // (Spark d.isWiderThan(IntegerType), p−s ≥ 10); long is INT64 → decimal(20,0)+ (isWiderThan(LongType),
+    // p−s ≥ 20). So a decimal that would hold the value range but is narrower than the physical threshold
+    // (e.g. byte→decimal(3,0), long→decimal(19,0)) is NOT sanctioned.
+    [InlineData(nameof(DataTypes.ByteType), 10, 0, true)]     // INT32 source → needs decimal(10,0)+
+    [InlineData(nameof(DataTypes.ByteType), 9, 0, false)]     // p−s = 9 < 10
+    [InlineData(nameof(DataTypes.ByteType), 3, 0, false)]     // holds byte by value, but < INT32 threshold 10
+    [InlineData(nameof(DataTypes.ShortType), 10, 0, true)]    // INT32 source → needs decimal(10,0)+
+    [InlineData(nameof(DataTypes.ShortType), 9, 0, false)]    // p−s = 9 < 10
+    [InlineData(nameof(DataTypes.ShortType), 5, 0, false)]    // holds short by value, but < 10
+    [InlineData(nameof(DataTypes.IntegerType), 10, 0, true)]  // decimal(10,0) holds int (INT32 threshold)
+    [InlineData(nameof(DataTypes.IntegerType), 9, 0, false)]  // p−s = 9 < 10
+    [InlineData(nameof(DataTypes.IntegerType), 12, 2, true)]  // p−s = 10 ≥ 10
+    [InlineData(nameof(DataTypes.IntegerType), 11, 2, false)] // p−s = 9 < 10
+    [InlineData(nameof(DataTypes.LongType), 20, 0, true)]     // INT64 source → needs decimal(20,0)+
+    [InlineData(nameof(DataTypes.LongType), 19, 0, false)]    // lossless by value, but < INT64 threshold 20
+    [InlineData(nameof(DataTypes.LongType), 22, 2, true)]     // p−s = 20 ≥ 20
+    [InlineData(nameof(DataTypes.LongType), 21, 2, false)]    // p−s = 19 < 20
     public void IsSanctionedWidening_IntegralToDecimal(string from, int toP, int toS, bool expected)
     {
         DataType to = DataTypes.CreateDecimalType(toP, toS);

@@ -658,7 +658,8 @@ public sealed class DeltaSchemaEnforcerTests
         { DataTypes.ByteType, DataTypes.DoubleType },
         { DataTypes.ShortType, DataTypes.DoubleType },
         { DataTypes.IntegerType, DataTypes.DoubleType },
-        { DataTypes.ByteType, DataTypes.CreateDecimalType(5, 0) },
+        { DataTypes.ByteType, DataTypes.CreateDecimalType(10, 0) },
+        { DataTypes.ShortType, DataTypes.CreateDecimalType(10, 0) },
         { DataTypes.IntegerType, DataTypes.CreateDecimalType(12, 2) },
         { DataTypes.LongType, DataTypes.CreateDecimalType(20, 0) },
     };
@@ -682,10 +683,15 @@ public sealed class DeltaSchemaEnforcerTests
 
     public static TheoryData<DataType, int, int> TooNarrowDecimalTargets() => new()
     {
-        { DataTypes.IntegerType, 9, 0 },  // int needs 10 integer digits; decimal(9,0) truncates
+        // Delta keys the threshold to the Parquet PHYSICAL type: byte/short/int (INT32) need p−s ≥ 10, long
+        // (INT64) needs p−s ≥ 20 — NOT the value-range digit count. A decimal below that threshold is not a
+        // sanctioned widening (falls through to IncompatibleType), even one that would hold the value range.
+        { DataTypes.ByteType, 9, 0 },     // INT32 source needs decimal(10,0)+; (9,0) below threshold
+        { DataTypes.ShortType, 9, 0 },    // INT32 source needs decimal(10,0)+
+        { DataTypes.IntegerType, 9, 0 },  // int (INT32) needs p−s ≥ 10; decimal(9,0) truncates
         { DataTypes.IntegerType, 11, 2 }, // p−s = 9 < 10
-        { DataTypes.LongType, 18, 0 },    // long needs 19 integer digits
-        { DataTypes.ByteType, 2, 0 },     // byte 127 needs 3 digits
+        { DataTypes.LongType, 19, 0 },    // long (INT64) needs p−s ≥ 20; (19,0) below threshold (lossless by value)
+        { DataTypes.LongType, 18, 0 },    // p−s = 18 < 20
     };
 
     [Fact]
