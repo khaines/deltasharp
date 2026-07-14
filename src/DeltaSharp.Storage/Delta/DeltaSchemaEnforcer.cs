@@ -22,18 +22,25 @@ namespace DeltaSharp.Storage.Delta;
 /// cannot read back.</para>
 ///
 /// <para><b>Type widening (Delta PROTOCOL.md "Type Widening").</b> The applied allowlist
-/// (<see cref="TypeWidening.IsSanctionedWidening"/>) is: integral <c>byte→short→int→long</c> (any wider
-/// rank), <c>float→double</c>, and <c>decimal(p,s)→decimal(p',s')</c> grow-only (integer-digit range and
-/// scale both non-decreasing). When the table does <b>not</b> enable type widening, such a change is rejected
-/// distinctly as <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> (naming the enablement
-/// requirement); every other differing type is <see cref="DeltaSchemaMismatchKind.IncompatibleType"/>.
-/// The <b>cross-family</b> sanctioned widenings (integral→<c>double</c>, integral→<c>decimal</c>) are DEFERRED
-/// (#535) — rejected distinctly as <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> (naming #535),
-/// never the generic <see cref="DeltaSchemaMismatchKind.IncompatibleType"/>, because they ARE Delta-sanctioned.
-/// <c>date→timestamp</c> is always rejected (as <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>):
-/// Delta only sanctions <c>date→timestamp_ntz</c>, which needs a not-yet-existing NTZ type. Widening inside an
-/// array element / map key/value is not applied (it would need a <c>fieldPath</c> and the Parquet read path
-/// does not read nested types) — it stays fail-closed.</para>
+/// (<see cref="TypeWidening.IsSanctionedWidening"/>) spans two families: <b>same-family</b>
+/// (<see cref="TypeWidening.IsSameFamilyWidening"/>) — integral <c>byte→short→int→long</c> (any wider rank),
+/// <c>float→double</c>, and <c>decimal(p,s)→decimal(p',s')</c> grow-only (integer-digit range and scale both
+/// non-decreasing) — and <b>cross-family</b> (<see cref="TypeWidening.IsCrossFamilyWidening"/>, #535) —
+/// <c>byte/short/int→double</c> (NOT <c>long→double</c>, which is lossy) and
+/// <c>byte/short/int/long→decimal(p,s)</c> when the decimal's integer-digit capacity <c>p−s</c> meets Delta's
+/// Parquet-physical-type threshold (<c>≥ 10</c> for the INT32-stored <c>byte/short/int</c>, <c>≥ 20</c> for
+/// INT64-stored <c>long</c>). The read path (<c>ParquetFileReader.ReadPromotedColumnAsync</c>) promotes a
+/// pre-widening (narrow) Parquet file to the widened type at READ time, so no data file is rewritten.
+/// When the table does <b>not</b> enable type widening, such a change is rejected distinctly as
+/// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> (naming the enablement requirement); every
+/// other differing type is <see cref="DeltaSchemaMismatchKind.IncompatibleType"/> — including a
+/// <c>decimal</c> target too narrow to represent the integral source range (it would truncate, so it is not a
+/// sanctioned widening). <c>date→timestamp</c> is always rejected (as
+/// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>): Delta only sanctions
+/// <c>date→timestamp_ntz</c>, which needs a not-yet-existing NTZ type. Widening inside an array element / map
+/// key/value is NOT applied (it would need a <c>fieldPath</c> in <c>delta.typeChanges</c> and the Parquet read
+/// path does not read nested types at all) — it stays fail-closed as
+/// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>, tracked as the #535 follow-up (#546).</para>
 ///
 /// <para><b>Compatibility rules (deterministic, total, case-sensitive; AC3).</b> Fields are matched
 /// <b>by name</b> (case-sensitive / ordinal, matching <see cref="StructType"/>), so column reordering is
@@ -46,7 +53,7 @@ namespace DeltaSharp.Storage.Delta;
 /// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> for a would-be/deferred widening,
 /// <see cref="DeltaSchemaMismatchKind.IncompatibleType"/> for anything else. A differing <b>partition</b>
 /// column's type is handled specially (partition values are strings — Delta widens them without a data-file
-/// rewrite): an <b>intra-family</b> Delta-sanctioned widening (<see cref="TypeWidening.IsSanctionedWidening"/>)
+/// rewrite): a <b>same-family</b> Delta-sanctioned widening (<see cref="TypeWidening.IsSameFamilyWidening"/>)
 /// is <b>applied</b> exactly like a non-partition column (widened type + <c>delta.typeChanges</c>, or rejected
 /// as <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> when the feature is disabled), #537; a
 /// cross-family (#535) or <c>date→timestamp</c> (#533) sanctioned widening stays deferred distinctly as
@@ -151,26 +158,28 @@ internal static class DeltaSchemaEnforcer
                 // stored as strings in the log / directory names, never in the Parquet data file, so no data
                 // file is rewritten (verified vs Delta's golden TypeWideningAlterTableSuite) — across all
                 // three sanctioned families:
-                //   - intra-family                (IsSanctionedWidening:          byte→…→long, float→double, grow-only decimal)
-                //   - cross-family integral→float/decimal (IsDeferredCrossFamilyWidening, #535)
-                //   - date→timestamp_ntz          (IsDeferredWidening,             #533)
-                // The intra-family case (IsSanctionedWidening) is now APPLIED (#537): it falls through to
+                //   - same-family                 (IsSameFamilyWidening:  byte→…→long, float→double, grow-only decimal)
+                //   - cross-family integral→float/decimal (IsCrossFamilyWidening, #535)
+                //   - date→timestamp_ntz          (IsDeferredWidening,     #533)
+                // The SAME-FAMILY case (IsSameFamilyWidening) is APPLIED (#537): it falls through to
                 // MergeField below, which — EXACTLY like a non-partition column — applies the widening when
                 // the feature is enabled (emitting `delta.typeChanges` on the field so the read door const-
                 // fills the partition value STRING under the widened type) or rejects it fail-closed as
                 // TypeWideningUnsupported when it is not. metaData.partitionColumns keeps the logical name
                 // unchanged; add.partitionValues keys stay physical/unchanged; no data file is rewritten.
-                // The remaining two families STAY DEFERRED (still rewrite-free, but the read path cannot yet
-                // promote across a type family / to timestamp_ntz): cross-family (#535) and date→timestamp
-                // (#533) are rejected DISTINCTLY as TypeWideningUnsupported via PartitionColumnWideningDeferred
-                // — never the factually-wrong "requires a full table rewrite" reason. Only a genuinely
-                // NON-widening partition-column type change (e.g. int→string, or a narrowing) keeps the
-                // PartitionColumnEvolutionUnsupported classification. Partition columns are top-level, so this
-                // only applies at parentPath == null.
+                // The remaining two families STAY DEFERRED for PARTITION columns even though #535 now applies
+                // cross-family widening to DATA columns: a partition column has no data-file value to promote,
+                // so applying it would need the read door to parse the partition-value STRING into the widened
+                // double/decimal lane — a distinct path #537 deferred and #535 does not open. So a partition
+                // cross-family (#535) or date→timestamp (#533) widening is rejected DISTINCTLY as
+                // TypeWideningUnsupported via PartitionColumnWideningDeferred — never the factually-wrong
+                // "requires a full table rewrite" reason. Only a genuinely NON-widening partition-column type
+                // change (e.g. int→string, or a narrowing) keeps the PartitionColumnEvolutionUnsupported
+                // classification. Partition columns are top-level, so this only applies at parentPath == null.
                 if (partitionColumns is not null
                     && partitionColumns.Contains(tableField.Name)
                     && !tableField.DataType.Equals(writeField.DataType)
-                    && !TypeWidening.IsSanctionedWidening(tableField.DataType, writeField.DataType))
+                    && !TypeWidening.IsSameFamilyWidening(tableField.DataType, writeField.DataType))
                 {
                     if (TypeWidening.IsAnySanctionedWidening(tableField.DataType, writeField.DataType))
                     {
@@ -286,7 +295,9 @@ internal static class DeltaSchemaEnforcer
                 // A widening of an array element / map key/value is NOT applied here: its `delta.typeChanges`
                 // would need a `fieldPath` on the enclosing StructField, and the Parquet read path does not
                 // read nested types at all — so nested-collection widening stays fail-closed (allowWidenApply
-                // is false, so a differing element scalar is classified/rejected, never silently applied).
+                // is false, so a differing element scalar is classified/rejected as TypeWideningUnsupported,
+                // never silently applied). Nested widening is the #535 follow-up, tracked in #546 (see the
+                // TypeWidening remarks).
                 DataType mergedElement = MergeType(
                     tableArray.ElementType, writeArray.ElementType, mode, path + ".element",
                     typeWideningEnabled, allowWidenApply: false);
@@ -305,29 +316,33 @@ internal static class DeltaSchemaEnforcer
                 return new MapType(mergedKey, mergedValue, tableMap.ValueContainsNull);
 
             default:
-                // A differing scalar type. APPLY the change only when it is a Delta-sanctioned widening AND
-                // the table has type widening enabled (feature + `delta.enableTypeWidening`) AND we are at a
-                // promotable position (a StructField's own scalar, not an array/map element). Otherwise
-                // classify the rejection: a would-be sanctioned/deferred widening surfaces distinctly as
-                // TypeWideningUnsupported; anything else (a narrowing or unrelated type) as IncompatibleType.
-                if (allowWidenApply && typeWideningEnabled && TypeWidening.IsSanctionedWidening(tableType, writeType))
+                // A differing scalar type. APPLY the widening on write ONLY when it is a Delta
+                // SCHEMA-EVOLUTION-eligible widening (IsSameFamilyWidening: integral byte→…→long, float→double,
+                // grow-only decimal) AND type widening is enabled AND we are at a promotable scalar position.
+                // This mirrors Spark's `TypeWidening.isTypeChangeSupportedForSchemaEvolution` (the SUBSET auto-
+                // applied when a wider-typed write evolves the schema) — deliberately NARROWER than the full
+                // `IsSanctionedWidening` set. CROSS-FAMILY widenings (integral→double / integral→decimal, #535)
+                // are Delta-`isTypeChangeSupported` (readable, and applicable by Spark via an explicit ALTER
+                // TABLE CHANGE COLUMN TYPE) but are NOT schema-evolution-eligible, so DeltaSharp does NOT apply
+                // them on append — it only PROMOTES them on READ (ReadPromotedColumnAsync) for interop with a
+                // Spark/delta-rs table that recorded such a change. They therefore fall through to the reject
+                // block below (fail-closed as TypeWideningUnsupported), same as when the feature is disabled.
+                if (allowWidenApply && typeWideningEnabled && TypeWidening.IsSameFamilyWidening(tableType, writeType))
                 {
                     return writeType;
-                }
-
-                // Cross-family sanctioned widenings (integral→double, integral→decimal) are DEFERRED (#535)
-                // even when enabled — surfaced distinctly (TypeWideningUnsupported, naming #535) rather than
-                // as the generic IncompatibleType a truly-unrelated change (string→int) gets, because they
-                // ARE Delta-sanctioned, just not applied yet. Independent of enablement.
-                if (TypeWidening.IsDeferredCrossFamilyWidening(tableType, writeType))
-                {
-                    throw DeltaSchemaMismatchException.TypeWideningCrossFamilyDeferred(
-                        path, tableType.SimpleString, writeType.SimpleString);
                 }
 
                 if (TypeWidening.IsSanctionedWidening(tableType, writeType)
                     || TypeWidening.IsDeferredWidening(tableType, writeType))
                 {
+                    // A Delta-sanctioned widening that is NOT applied here: the feature is disabled; or this is
+                    // a CROSS-FAMILY widening (#535) — read-promotable but not schema-evolution-eligible, so
+                    // never auto-applied on write; or a nested (array-element/map key/value) position where
+                    // allowWidenApply is false — nested widening is DEFERRED (it would need a `fieldPath` in
+                    // `delta.typeChanges` and the Parquet read path does not read nested types at all; tracked
+                    // as the #535 follow-up, #546) — or the date→timestamp_ntz deferral (#533). Surfaced
+                    // distinctly as TypeWideningUnsupported (fail-closed) rather than the generic
+                    // IncompatibleType a truly-unrelated change gets.
                     throw DeltaSchemaMismatchException.TypeWideningUnsupported(
                         path, tableType.SimpleString, writeType.SimpleString);
                 }
