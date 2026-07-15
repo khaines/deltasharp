@@ -423,8 +423,8 @@ internal sealed class ParquetFileReader
     // additively-added column (#190) is always nullable, and older files written before it lack it, so it
     // reads back as all-null. An absent NON-nullable column can never be null-filled (a required lane cannot
     // carry null), and an absent column with null-fill disabled preserves the strict projection contract —
-    // both fail closed with the same "is not present" CorruptData message the OPTIMIZE/DELETE guards match
-    // on (#513). A PRESENT column with a disagreeing physical type/nullability is still rejected by
+    // both fail closed with the dedicated ColumnNotPresentInFile kind the OPTIMIZE/read guards match on
+    // (#513). A PRESENT column with a disagreeing physical type/nullability is still rejected by
     // ValidateFileField as a distinct SchemaMismatch (never silently coerced or null-filled).
     private static DataField?[] ResolveFileFields(
         ParquetSchema fileSchema, StructType requested, bool nullFillMissingColumns, bool allowTypeWideningPromotion)
@@ -450,8 +450,7 @@ internal sealed class ParquetFileReader
                     continue;
                 }
 
-                throw DeltaStorageException.CorruptData(
-                    $"Requested column '{name}' is not present in the Parquet file schema.");
+                throw DeltaStorageException.ColumnNotPresentInFile(name);
             }
 
             ValidateFileField(field, requestedField, allowTypeWideningPromotion);
