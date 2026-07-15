@@ -152,6 +152,24 @@ public sealed class DeltaWriteTargetTests : IDisposable
             snapshot.ActiveFiles.Select(a => a.PartitionValues["region"]).OrderBy(v => v, StringComparer.Ordinal));
     }
 
+    [Fact]
+    public async Task Append_Empty_OnExistingTable_IsNoOp()
+    {
+        // #556: an empty append (no rows) to an existing table adds nothing — a benign no-op that creates no
+        // new version (Spark parity), mirroring DeltaTableWriter.CreateOrAppendAsync's 0-file skip.
+        using DeltaWriteTarget target = Target();
+        await target.AppendAsync(FlatSchema, Array.Empty<string>(), new[] { FlatBatch((1L, "alice")) });
+
+        DeltaWriteResult result = await target.AppendAsync(
+            FlatSchema, Array.Empty<string>(), Array.Empty<ColumnBatch>());
+
+        Assert.Equal(0L, result.Version);
+        Assert.Equal(0, result.FilesWritten);
+        Assert.Equal(0L, result.RowsWritten);
+        Assert.Equal(0L, (await LoadSnapshotAsync()).Version); // still v0 — no empty commit
+    }
+
+
     // ---------------------------------------------------------------- static overwrite
 
     [Fact]

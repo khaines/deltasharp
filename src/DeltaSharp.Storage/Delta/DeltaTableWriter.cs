@@ -1040,10 +1040,17 @@ internal sealed class DeltaTableWriter
         // equals the current one), which DeltaCommitter rejects as an empty commit — short-circuit to Skipped,
         // mirroring the plain empty-static-overwrite guard. In name mode EvolveNameModeMapping reproduces the
         // current mapping verbatim for an unchanged schema, so the SchemaString comparison still holds.
+        //
+        // Compare the LOGICAL partition columns on BOTH sides: `replacement.PartitionColumns` carries the
+        // caller's logical partition names (PlanOverwriteReplaceSchema sets it from the write's declared
+        // partitionColumns), and `metaData.partitionColumns` is logical too. Using the plan's PHYSICAL
+        // partition names here would compare physical-vs-logical and never fire for a partitioned name-mode
+        // table (physical `col-<uuid>` != logical name), spuriously committing a redundant metaData-only
+        // version (#556 council: Architect/DeltaStorage R1).
         if (files.Count == 0
             && readSnapshot.ActiveFiles.IsEmpty
             && replacement.SchemaString == readSnapshot.Metadata.SchemaString
-            && plan.PhysicalPartitionColumns.SequenceEqual(readSnapshot.Metadata.PartitionColumns))
+            && replacement.PartitionColumns.SequenceEqual(readSnapshot.Metadata.PartitionColumns))
         {
             return Task.FromResult(new DeltaCommitResult(readSnapshot.Version, Attempts: 0, Skipped: true));
         }

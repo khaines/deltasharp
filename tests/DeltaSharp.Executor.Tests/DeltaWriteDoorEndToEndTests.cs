@@ -392,6 +392,28 @@ public sealed class DeltaWriteDoorEndToEndTests : IDisposable
         Assert.False(File.Exists(CommitFile(table, 1)));
     }
 
+    [Fact]
+    public void Delta_MergeSchema_WithOverwrite_IsRejected()
+    {
+        // `mergeSchema` is an append-family option; combined with an overwrite it is rejected fail-loud
+        // (a schema change on overwrite uses `overwriteSchema`) rather than silently ignored (#556 council).
+        string table = Table("merge-schema-overwrite");
+        using (SparkSession spark = NewSession())
+        {
+            spark.CreateDataFrame(People(), PeopleSchema)
+                .Write.Format("delta").Mode("append").Save(table);
+        }
+
+        using (SparkSession spark = NewSession())
+        {
+            DataFrame df = spark.CreateDataFrame(People(), PeopleSchema);
+            Assert.ThrowsAny<Exception>(() =>
+                df.Write.Format("delta").Option("mergeSchema", "true").Mode("overwrite").Save(table));
+        }
+
+        Assert.False(File.Exists(CommitFile(table, 1))); // rejected — no overwrite committed
+    }
+
     // ---------------------------------------------------------------- partitioned append layout
 
     [Fact]

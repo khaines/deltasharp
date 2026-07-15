@@ -113,6 +113,21 @@ public sealed class DeltaWriteTarget : IDisposable
     // Guid.NewGuid), so two concurrent writers never stage the same physical path (mirrors DeltaOptimize).
     private static string DefaultFileNameFactory() => Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
 
+    // Whether any batch carries at least one logical row — the write actually has data to stage. An
+    // empty append (no batches, or only zero-row batches) is a benign no-op on an existing table.
+    private static bool HasRows(IReadOnlyList<ColumnBatch> batches)
+    {
+        foreach (ColumnBatch batch in batches)
+        {
+            if (batch.LogicalRowCount > 0)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     /// <summary>Whether a Delta table already exists at this path (any committed version). Used to honor
     /// Ignore/ErrorIfExists before the write query executes.</summary>
     public async Task<bool> TableExistsAsync(CancellationToken cancellationToken = default) =>
@@ -160,17 +175,21 @@ public sealed class DeltaWriteTarget : IDisposable
         // column's physical identity (no independent door-vs-committer mint). For a `none`-mode table or a
         // compatible (same-schema) write this reduces to the pre-#556 staging behavior.
         Snapshot snapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
+
+        // An empty append to an existing table adds nothing — a benign no-op (Spark parity), mirroring
+        // DeltaTableWriter.CreateOrAppendAsync (whose 0-file branch returns Skipped BEFORE any schema
+        // enforcement). Short-circuit BEFORE planning so an empty append neither runs enforcement nor mints
+        // (an empty write carries no rows to define a new column) — #556 council: Architect/Reliability R1.
+        if (!HasRows(batches))
+        {
+            return new DeltaWriteResult(snapshot.Version, 0, 0L);
+        }
+
         DeltaWritePlan plan = _writer.PlanAppend(snapshot, writeSchema, evolutionMode);
 
         (IReadOnlyList<StagedDataFile> files, long rows) =
             await StageAsync(plan.PhysicalWriteSchema, plan.PhysicalPartitionColumns, batches, cancellationToken)
                 .ConfigureAwait(false);
-        if (files.Count == 0)
-        {
-            // An empty append to an existing table adds nothing — a benign no-op (Spark parity), mirroring
-            // DeltaTableWriter.CreateOrAppendAsync. Report the current version without a new commit.
-            return new DeltaWriteResult(snapshot.Version, 0, 0L);
-        }
 
         DeltaCommitResult commit = await _writer
             .CommitAppendAsync(snapshot, plan, files, cancellationToken).ConfigureAwait(false);

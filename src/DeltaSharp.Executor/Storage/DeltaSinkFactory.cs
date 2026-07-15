@@ -100,6 +100,20 @@ internal sealed class DeltaLocalSink : ILocalSink
                 return RunAppend(target, schema, partitionColumns, batches, mergeSchema);
 
             case SaveMode.Overwrite:
+                // `mergeSchema` governs ADDITIVE evolution on the append family only. A schema change on an
+                // overwrite is expressed via `overwriteSchema` (a destructive wholesale replacement), so a
+                // `mergeSchema`+overwrite combination is rejected fail-loud rather than silently ignored — it
+                // would otherwise mislead a caller into thinking their columns were merged (#556 council:
+                // Balanced/Quality R1). Additive-merge-on-overwrite (Spark's mergeSchema-on-overwrite) is a
+                // separate, unimplemented concern.
+                if (mergeSchema)
+                {
+                    throw new InvalidOperationException(
+                        "The 'mergeSchema' option is not supported with an overwrite. Use 'overwriteSchema' "
+                        + "to replace the table schema on a full overwrite, or append with 'mergeSchema' to "
+                        + "add columns additively.");
+                }
+
                 return target
                     .OverwriteAsync(
                         schema, partitionColumns, batches, ResolvePartitionOverwriteMode(), ResolveOverwriteSchema())
