@@ -1300,10 +1300,15 @@ public sealed class ColumnMappingTests : IDisposable
             new DeltaLog(backend), new DeltaCommitter(backend),
             new FixedTimeProvider(DateTimeOffset.UnixEpoch), new SeededPhysicalNameSource("unused-no-new-columns"));
         Snapshot readSnapshot = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
+
+        // Stage a REAL widened file whose footer DataSchema is the retained physical column as `long`, so the
+        // #497 write-door cross-check runs against the writer's evolved physical schema. A bug that staged the
+        // widened bytes under the LOGICAL name (or re-mapped the retained physical name) fails closed here.
+        StagedDataFile staged = await StageSingleLongColumnAsync(backend, "v1.parquet", ValuePhysical, 100L, 200L);
         await writer.AppendAsync(
             readSnapshot,
             new StructType(new[] { new StructField("value", DataTypes.LongType, nullable: true) }),
-            new[] { StagedNoSchema("v1.parquet") },
+            new[] { staged },
             SchemaEvolutionMode.MergeSchema);
 
         Snapshot evolved = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
@@ -1312,6 +1317,55 @@ public sealed class ColumnMappingTests : IDisposable
         AssertMapping(value, "value", 1, ValuePhysical); // identity preserved (id + physicalName)
         Assert.True(value.Metadata.TryGetValue("delta.typeChanges", out _)); // widening recorded
         Assert.Equal("1", evolved.Metadata.Configuration[ColumnMapping.MaxColumnIdKey]); // no new column ⇒ unchanged
+
+        // Read back through the name-mode read door by LOGICAL name: the widened rows resolve from the retained
+        // PHYSICAL column, proving the bytes landed under it (a logical/mis-mapped landing would have failed the
+        // #497 gate above, or read back nothing here).
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        Assert.Equal(new[] { "value" }, info.Schema.Select(f => f.Name).ToArray());
+        var readBack = new List<long>();
+        foreach (ColumnBatch b in await source.ReadBatchesAsync(info.Version))
+        {
+            ColumnVector v = b.SelectedColumn(0);
+            for (int r = 0; r < b.LogicalRowCount; r++)
+            {
+                readBack.Add(v.GetValue<long>(r));
+            }
+        }
+
+        Assert.Equal(new[] { 100L, 200L }, readBack.OrderBy(x => x).ToArray());
+    }
+
+    // Writes a single-column Parquet file (the given physical name, LONG) and returns a staged add carrying
+    // that footer DataSchema, so the #497 write-door cross-check binds.
+    private static async Task<StagedDataFile> StageSingleLongColumnAsync(
+        LocalFileSystemBackend backend, string path, string physicalName, params long[] values)
+    {
+        var physicalSchema = new StructType(new[] { new StructField(physicalName, DataTypes.LongType, nullable: true) });
+        MutableColumnVector col = ColumnVectors.Create(DataTypes.LongType, values.Length);
+        foreach (long v in values)
+        {
+            col.AppendValue(v);
+        }
+
+        var batch = new ManagedColumnBatch(physicalSchema, new ColumnVector[] { col }, values.Length);
+        byte[] bytes;
+        using (var buffer = new MemoryStream())
+        {
+            await new ParquetFileWriter().WriteAsync(buffer, physicalSchema, new[] { batch }, CancellationToken.None);
+            bytes = buffer.ToArray();
+        }
+
+        await backend.PutIfAbsentAsync(path, bytes, CancellationToken.None);
+        return new StagedDataFile(
+            path,
+            System.Collections.Immutable.ImmutableSortedDictionary<string, string?>.Empty
+                .WithComparers(StringComparer.Ordinal),
+            Size: bytes.LongLength,
+            ModificationTime: 0L,
+            Stats: null,
+            DataSchema: physicalSchema);
     }
 
     [Fact]
