@@ -710,10 +710,7 @@ internal sealed class DeltaTableWriter
             // none (and any non-name) mode: logical==physical, so the caller's write schema and the table's
             // logical partition columns ARE the physical staging shape; the evolution (if any) carries the
             // merged logical schema — byte-for-byte unchanged behavior.
-            MetadataAction? noneEvolution = mergedSchema is null
-                ? null
-                : readSnapshot.Metadata with { SchemaString = SchemaJson.ToJson(mergedSchema) };
-            return (writeSchema, logicalPartitions, noneEvolution);
+            return (writeSchema, logicalPartitions, LogicalEvolution(readSnapshot.Metadata, mergedSchema));
         }
 
         if (mergedSchema is null)
@@ -842,11 +839,14 @@ internal sealed class DeltaTableWriter
     private static MetadataAction? ReconcileSchema(
         Snapshot readSnapshot, StructType writeSchema, SchemaEvolutionMode evolutionMode)
     {
-        StructType? mergedSchema = MergeSchema(readSnapshot, writeSchema, evolutionMode);
-        return mergedSchema is null
-            ? null
-            : readSnapshot.Metadata with { SchemaString = SchemaJson.ToJson(mergedSchema) };
+        return LogicalEvolution(readSnapshot.Metadata, MergeSchema(readSnapshot, writeSchema, evolutionMode));
     }
+
+    // The metaData action that commits a logical-schema evolution in NONE mode (and the truncate path): the
+    // merged logical schema, all other metadata fields preserved; null when there is no evolution. Name-mode
+    // evolution instead re-emits a MAPPED schema + bumped maxColumnId config (ResolveWrite's #541 branch).
+    private static MetadataAction? LogicalEvolution(MetadataAction metadata, StructType? mergedSchema) =>
+        mergedSchema is null ? null : metadata with { SchemaString = SchemaJson.ToJson(mergedSchema) };
 
     // AC2: remove EVERY prior active file + add the new files in one atomic version, scoped WholeTable so
     // any concurrent add/remove aborts the overwrite (it depends on the entire active set). The optional
@@ -1122,10 +1122,10 @@ internal sealed class DeltaTableWriter
     // metadata are NOT footer-faithful and must not be compared (comparing them would false-reject a valid
     // required-string write). A file whose DataSchema is null (a caller that does not supply it) is skipped —
     // the cross-check binds only when the producing write-door supplies the true written schema. The
-    // `writeSchema`/`partitionColumns` passed here are the PHYSICAL forms for a name-mode table (#525:
-    // ResolvePhysicalStaging maps the logical write columns to their physicalName before this call) and the
-    // logical forms for a `none`-mode / non-mapped create (logical==physical). Either way the comparison is
-    // like-for-like against the file's PHYSICAL footer schema — a logical-named file staged into a physical-
+    // `writeSchema`/`partitionColumns` passed here are the PHYSICAL forms for a name-mode table (#525/#541:
+    // ResolveWrite maps the logical write columns to their physicalName — reusing the existing mapping, or the
+    // freshly-minted one for an additive/widening evolution — before this call) and the logical forms for a
+    // `none`-mode / non-mapped create (logical==physical). Either way the comparison is like-for-like against the file's PHYSICAL footer schema — a logical-named file staged into a physical-
     // name table (the corruption case) mismatches and is rejected fail-closed.
     private static void ValidateStagedWriteSchema(
         StructType writeSchema, IEnumerable<string> partitionColumns, IReadOnlyList<StagedDataFile> files)
