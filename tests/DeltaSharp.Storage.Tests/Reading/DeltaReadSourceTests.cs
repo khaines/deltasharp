@@ -542,6 +542,56 @@ public sealed class DeltaReadSourceTests : IDisposable
     }
 
     [Fact]
+    public async Task WidenedTable_DateToTimestampNtz_MixedFiles_ThroughReadSource()
+    {
+        // The full date→timestamp_ntz widening (#533) read lifecycle end-to-end. Seed a typeWidening-ENABLED
+        // table whose committed schema is `timestamp_ntz`, over BOTH:
+        //   (a) an OLD physical `date` file (INT32 epoch-day) — written before the widening; and
+        //   (b) a NEW native `timestamp_ntz` file (INT64 micros) — written after the schema evolved.
+        // Reading through the public read door must PROMOTE the date file to midnight-of-date micros AND
+        // IDENTITY-read the native ntz file into the same ntz lane — pinning that a widened table with mixed
+        // historical + post-widening files reads consistently (gate derived TRUE from the protocol).
+        const long microsPerDay = 86_400L * 1_000_000L;
+        var ntzSchema = new StructType(new[] { new StructField("value", DataTypes.TimestampNtzType, nullable: false) });
+        string dateFile = await WriteDateValueFileAsync("value-date.parquet", 0, 3);            // → 0, 3×microsPerDay
+        string ntzFile = await WriteNtzValueFileAsync("value-ntz.parquet", 42L, -7L);           // native, identity
+        var backend = new LocalFileSystemBackend(_root);
+        try
+        {
+            await DeltaTestHarness.WriteCommitAsync(
+                backend, 0,
+                DeltaTestHarness.ProtocolWithReaderFeature("typeWidening"),
+                DeltaTestHarness.MetadataWithSchemaAndConfig(ntzSchema, new[] { ("delta.enableTypeWidening", "true") }),
+                DeltaTestHarness.Add(dateFile),
+                DeltaTestHarness.Add(ntzFile));
+        }
+        finally
+        {
+            backend.Dispose();
+        }
+
+        using DeltaReadSource source = ReadSource();
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        Assert.Equal(DataTypes.TimestampNtzType, info.Schema["value"].DataType);
+
+        var values = new List<long>();
+        foreach (ColumnBatch batch in await source.ReadBatchesAsync(info.Version))
+        {
+            ColumnVector value = batch.SelectedColumn(0);
+            Assert.Equal(DataTypes.TimestampNtzType, value.Type); // promoted date + native ntz, same lane
+            for (int r = 0; r < batch.LogicalRowCount; r++)
+            {
+                values.Add(value.GetValue<long>(r));
+            }
+        }
+
+        // 0 (1970-01-01 midnight), 3×microsPerDay (1970-01-04 midnight), + the two native micros — all in one lane.
+        Assert.Equal(
+            new[] { -7L, 0L, 42L, 3L * microsPerDay },
+            values.OrderBy(v => v).ToArray());
+    }
+
+    [Fact]
     public async Task WidenedSchema_WithoutTypeWideningFeature_FailsClosed_ThroughReadSource_Issue495()
     {
         // The negative gate: the SAME wide `long` schema over the SAME narrow `int` file, but a plain protocol
@@ -699,6 +749,48 @@ public sealed class DeltaReadSourceTests : IDisposable
         }
 
         return relativePath;
+    }
+
+    private async Task<string> WriteSingleColumnFileAsync(string relativePath, DataType type, MutableColumnVector col)
+    {
+        var schema = new StructType(new[] { new StructField("value", type, nullable: false) });
+        var batch = new ManagedColumnBatch(schema, new ColumnVector[] { col }, col.Length);
+        using var buffer = new MemoryStream();
+        await new ParquetFileWriter().WriteWithStatisticsAsync(
+            buffer, schema, new[] { batch }, StatisticsPolicy.Default, CancellationToken.None);
+        var backend = new LocalFileSystemBackend(_root);
+        try
+        {
+            await backend.PutIfAbsentAsync(relativePath, buffer.ToArray(), CancellationToken.None);
+        }
+        finally
+        {
+            backend.Dispose();
+        }
+
+        return relativePath;
+    }
+
+    private async Task<string> WriteDateValueFileAsync(string relativePath, params int[] epochDays)
+    {
+        MutableColumnVector col = ColumnVectors.Create(DataTypes.DateType, epochDays.Length);
+        foreach (int d in epochDays)
+        {
+            col.AppendValue(d);
+        }
+
+        return await WriteSingleColumnFileAsync(relativePath, DataTypes.DateType, col);
+    }
+
+    private async Task<string> WriteNtzValueFileAsync(string relativePath, params long[] micros)
+    {
+        MutableColumnVector col = ColumnVectors.Create(DataTypes.TimestampNtzType, micros.Length);
+        foreach (long m in micros)
+        {
+            col.AppendValue(m);
+        }
+
+        return await WriteSingleColumnFileAsync(relativePath, DataTypes.TimestampNtzType, col);
     }
 
     private static async Task<StagedDataFile> StageAsync(

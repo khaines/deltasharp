@@ -13,13 +13,14 @@ namespace DeltaSharp.Storage.Tests.Delta;
 
 /// <summary>
 /// Storage-layer correctness for the <see cref="TimestampNtzType"/> (timestamp without timezone, #533). This
-/// build supports timestamp_ntz as a <b>read-side</b> type (the Delta schema is authoritative for the logical
-/// type; the INT64 epoch-micros are read into the ntz lane) and the <c>date → timestamp_ntz</c> read-promotion
-/// (covered in <c>ParquetTypeWideningPromotionTests</c>). <b>Native timestamp_ntz writes are fail-closed</b>:
-/// Parquet.Net 6.0.3 cannot persist the <c>TIMESTAMP(isAdjustedToUTC=false)</c> annotation (it emits a legacy
-/// UTC <c>TIMESTAMP_MICROS</c> ConvertedType), so a written column would be a protocol-non-conformant LTZ file.
-/// These tests pin the schema-JSON round-trip, the fail-closed write, the schema-authoritative read, and the
-/// partition-value round-trip.
+/// build supports timestamp_ntz as a <b>native read+write</b> type: writes emit a conformant modern
+/// <c>TIMESTAMP(isAdjustedToUTC=false, MICROS)</c> LogicalType (via Parquet.Net's <c>DateTimeFormat.Timestamp</c>);
+/// the read is schema-authoritative (the Delta schema selects the lane) and Kind-agnostic (the stored INT64
+/// epoch-micros are read raw, with no host-timezone shift); and <c>date → timestamp_ntz</c> is a sanctioned
+/// widening — read-promoted (covered in <c>ParquetTypeWideningPromotionTests</c>) and applied on append.
+/// These tests pin the schema-JSON round-trip, the conformant-annotation native write + value round-trip, the
+/// schema-authoritative read, the Kind-agnostic (timezone-independent) decode, and the partition-value
+/// round-trip.
 /// </summary>
 public sealed class TimestampNtzStorageTests
 {
@@ -45,16 +46,23 @@ public sealed class TimestampNtzStorageTests
     [Fact]
     public async Task NativeTimestampNtz_WritesConformantAnnotation_AndRoundTrips()
     {
-        // #557 prototype: a native timestamp_ntz column now writes a conformant modern
-        // LogicalType.TIMESTAMP{isAdjustedToUTC=false, MICROS} (via DateTimeFormat.Timestamp), NOT the legacy
-        // UTC TIMESTAMP_MICROS ConvertedType — and its INT64 micros round-trip exactly.
-        long[] micros = { 0L, 1_609_459_200_123_456L, -5_000_000L };
+        // A native timestamp_ntz column writes a conformant modern LogicalType.TIMESTAMP{isAdjustedToUTC=false,
+        // MICROS} (via DateTimeFormat.Timestamp), NOT the legacy UTC TIMESTAMP_MICROS ConvertedType — and its
+        // INT64 micros (including a null) round-trip exactly.
+        long?[] micros = { 0L, null, 1_609_459_200_123_456L, -5_000_000L };
         var schema = new StructType(new[] { new StructField("v", DataTypes.TimestampNtzType, nullable: true) });
         ManagedColumnBatch batch = OneColumn(DataTypes.TimestampNtzType, c =>
         {
-            foreach (long m in micros)
+            foreach (long? m in micros)
             {
-                c.AppendValue(m);
+                if (m is long l)
+                {
+                    c.AppendValue(l);
+                }
+                else
+                {
+                    c.AppendNull();
+                }
             }
         }, micros.Length);
         byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
@@ -76,7 +84,10 @@ public sealed class TimestampNtzStorageTests
         List<ColumnBatch> read = await ParquetTestHelpers.ReadAllAsync(file, schema);
         ColumnVector v = read.Single().Column(0);
         Assert.Equal(DataTypes.TimestampNtzType, v.Type);
-        Assert.Equal(micros, v.GetValues<long>().ToArray());
+        Assert.Equal(0L, v.GetValue<long>(0));
+        Assert.True(v.IsNull(1), "the null cell must round-trip as null");
+        Assert.Equal(1_609_459_200_123_456L, v.GetValue<long>(2));
+        Assert.Equal(-5_000_000L, v.GetValue<long>(3));
     }
 
     [Fact]
@@ -99,7 +110,8 @@ public sealed class TimestampNtzStorageTests
     public async Task MicrosFile_ReadAsTimestampNtz_IsSchemaAuthoritative()
     {
         // The Delta schema is authoritative for timestamp vs timestamp_ntz. A physical INT64-micros file (here
-        // written via TimestampType, since native ntz write is fail-closed) requested under a timestamp_ntz
+        // written via TimestampType to exercise a same-physical micros file whose footer annotation differs
+        // from the requested ntz type) requested under a timestamp_ntz
         // schema is read into the ntz lane and the stored micros round-trip exactly — the read path selects the
         // lane from the REQUESTED type, not the (unreliable) Parquet isAdjustedToUTC annotation. Read with the
         // promotion gate OPEN (allowTypeWideningPromotion: true), which is how production DeltaReadSource always
@@ -213,20 +225,73 @@ public sealed class TimestampNtzStorageTests
     }
 
     [Fact]
-    public void DateTimeToEpochMicros_DoesNotApplyTimezoneConversion_HostIndependent()
+    public void TryToDataType_LegacyDateAndTimeMicrosField_MapsToTimestampType()
     {
-        // Deterministic guard independent of the host time zone: compute what a ToUniversalTime()-based reader
-        // WOULD produce for a Local value under a fixed −8h zone, confirm that zone genuinely shifts, then
-        // assert the actual (Kind-agnostic) reader returns the RAW-ticks value, not the shifted one. Fails on
-        // ANY host if the raw-ticks read is replaced by a Kind-sensitive ToUniversalTime().
-        var minus8 = System.TimeZoneInfo.CreateCustomTimeZone("t-8", System.TimeSpan.FromHours(-8), "t-8", "t-8");
-        var local = new System.DateTime(2021, 1, 1, 12, 30, 15, System.DateTimeKind.Local);
-        long rawTicksMicros = (local.Ticks - System.DateTime.UnixEpoch.Ticks) / System.TimeSpan.TicksPerMicrosecond;
-        long shiftedMicros =
-            (System.TimeZoneInfo.ConvertTimeToUtc(System.DateTime.SpecifyKind(local, System.DateTimeKind.Unspecified), minus8).Ticks
-                - System.DateTime.UnixEpoch.Ticks) / System.TimeSpan.TicksPerMicrosecond;
+        // Backward-compat: a legacy DeltaSharp file (written with the old DateTimeFormat.DateAndTimeMicros /
+        // ConvertedType.TIMESTAMP_MICROS, which Parquet.Net reads back as isAdjustedToUTC=true) must map to
+        // TimestampType (LTZ), NOT timestamp_ntz — so existing tables keep reading as timestamp.
+        var legacy = new global::Parquet.Schema.DateTimeDataField(
+            "v", global::Parquet.Schema.DateTimeFormat.DateAndTimeMicros, isAdjustedToUTC: true, isNullable: false);
+        Assert.True(ParquetTypeMapping.TryToDataType(legacy, out DataType? mapped));
+        Assert.Equal(DataTypes.TimestampType, mapped);
 
-        Assert.NotEqual(shiftedMicros, rawTicksMicros); // the −8h zone genuinely shifts, so the guard is meaningful
-        Assert.Equal(rawTicksMicros, ParquetTypeMapping.DateTimeToEpochMicros(local));
+        // And a modern isAdjustedToUTC=false field maps to timestamp_ntz.
+        var ntz = new global::Parquet.Schema.DateTimeDataField(
+            "v", global::Parquet.Schema.DateTimeFormat.Timestamp, isAdjustedToUTC: false,
+            unit: global::Parquet.Schema.DateTimeTimeUnit.Micros, isNullable: false);
+        Assert.True(ParquetTypeMapping.TryToDataType(ntz, out DataType? mappedNtz));
+        Assert.Equal(DataTypes.TimestampNtzType, mappedNtz);
     }
+}
+
+/// <summary>
+/// Timezone-regression guard for the Kind-agnostic Parquet timestamp reader (#533/#557), isolated in a
+/// non-parallel collection because it mutates process-wide <see cref="System.TimeZoneInfo"/> state.
+/// </summary>
+[Collection("ProcessTimeZoneMutation")]
+public sealed class TimestampNtzTimeZoneRegressionTests
+{
+    [Fact]
+    public void DateTimeToEpochMicros_UnderForcedNonUtcTimeZone_ReadsRawTicks_CatchesToUniversalTimeRegression()
+    {
+        // Parquet.Net hands a timestamp_ntz decode back as DateTimeKind.Local; the reader must read its RAW
+        // ticks and NOT apply value.ToUniversalTime(). A ToUniversalTime() regression is only observable under
+        // a NON-UTC local zone, so this test FORCES America/Los_Angeles for its duration (TZ env var +
+        // TimeZoneInfo.ClearCachedData(), honored on the Linux CI runner) — making the guard effective even on
+        // a UTC host (where the earlier "host-independent" assertion silently passed the bug). Runs in a
+        // non-parallel collection so the transient process-wide zone change cannot perturb sibling tests.
+        string? original = System.Environment.GetEnvironmentVariable("TZ");
+        try
+        {
+            System.Environment.SetEnvironmentVariable("TZ", "America/Los_Angeles");
+            System.TimeZoneInfo.ClearCachedData();
+            if (System.TimeZoneInfo.Local.BaseUtcOffset == System.TimeSpan.Zero)
+            {
+                // Platform did not honor the TZ override (e.g. Windows / missing tz database). The regression
+                // this guards is only observable under a non-UTC local zone; skip rather than assert a false
+                // pass. The Linux CI runner honors TZ, so the guard is effective there.
+                return;
+            }
+
+            var local = new System.DateTime(2021, 1, 1, 12, 30, 15, System.DateTimeKind.Local);
+            long rawTicksMicros = (local.Ticks - System.DateTime.UnixEpoch.Ticks) / System.TimeSpan.TicksPerMicrosecond;
+            long wouldBeShifted =
+                (local.ToUniversalTime().Ticks - System.DateTime.UnixEpoch.Ticks) / System.TimeSpan.TicksPerMicrosecond;
+
+            // The forced zone genuinely shifts, so the guard is meaningful, AND the reader returns raw ticks.
+            Assert.NotEqual(rawTicksMicros, wouldBeShifted);
+            Assert.Equal(rawTicksMicros, ParquetTypeMapping.DateTimeToEpochMicros(local));
+        }
+        finally
+        {
+            System.Environment.SetEnvironmentVariable("TZ", original);
+            System.TimeZoneInfo.ClearCachedData();
+        }
+    }
+}
+
+/// <summary>Serializes tests that mutate process-wide <see cref="System.TimeZoneInfo"/> state.</summary>
+[CollectionDefinition("ProcessTimeZoneMutation", DisableParallelization = true)]
+public sealed class ProcessTimeZoneMutationCollection
+{
 }

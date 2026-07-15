@@ -58,9 +58,16 @@ internal static class ParquetTypeMapping
             StringType => new DataField<string>(field.Name),
             BinaryType => new DataField<byte[]>(field.Name),
             DateType => new DateTimeDataField(field.Name, DateTimeFormat.Date, isNullable: nullable),
+            // Both timestamp lanes use DateTimeFormat.Timestamp + Micros, which emits the modern
+            // LogicalType.TIMESTAMP{isAdjustedToUTC, unit=MICROS} (Parquet.Net's Timestamp format writes ONLY
+            // the LogicalType, not a companion legacy ConvertedType). LogicalType is authoritative per the
+            // Parquet spec and read by Spark/delta-rs/pyarrow/DuckDB; the only interop floor is a pre-2018
+            // ConvertedType-only reader, which would see a bare INT64 (and for which no timestamp_ntz encoding
+            // exists anyway). Older DeltaSharp files written with the legacy DateAndTimeMicros ConvertedType
+            // still read back correctly (isAdjustedToUTC defaults true → TimestampType).
             TimestampType => new DateTimeDataField(
                 field.Name, DateTimeFormat.Timestamp, isAdjustedToUTC: true, unit: DateTimeTimeUnit.Micros, isNullable: nullable),
-            // timestamp_ntz (#533/#557): DateTimeFormat.Timestamp + Micros emits a conformant modern
+            // timestamp_ntz (#533): DateTimeFormat.Timestamp + Micros emits a conformant modern
             // LogicalType.TIMESTAMP{isAdjustedToUTC=false, unit=MICROS}. (The legacy DateAndTimeMicros format
             // instead hard-codes ConvertedType.TIMESTAMP_MICROS and drops isAdjustedToUTC — which is why it
             // could only ever express UTC.) The stored INT64 micros are byte-identical to the LTZ timestamp.
@@ -200,7 +207,7 @@ internal static class ParquetTypeMapping
         catch (Exception ex) when (ex is OverflowException or ArgumentOutOfRangeException)
         {
             throw DeltaStorageException.CorruptData(
-                $"date epoch-day value {epochDay} is outside the representable DateTime range.", ex);
+                "a date epoch-day value is outside the representable DateTime range.", ex);
         }
     }
 
@@ -223,7 +230,7 @@ internal static class ParquetTypeMapping
         catch (Exception ex) when (ex is OverflowException or ArgumentOutOfRangeException)
         {
             throw DeltaStorageException.CorruptData(
-                $"timestamp epoch-microsecond value {micros} is outside the representable DateTime range.", ex);
+                "a timestamp epoch-microsecond value is outside the representable DateTime range.", ex);
         }
     }
 

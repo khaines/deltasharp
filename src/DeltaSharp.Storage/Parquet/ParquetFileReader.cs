@@ -539,11 +539,11 @@ internal sealed class ParquetFileReader
             case TimestampType:
             case TimestampNtzType:
                 // Both timestamp (LTZ) and timestamp_ntz accept a non-DATE micros DateTimeDataField. The
-                // isAdjustedToUTC annotation is deliberately NOT checked: Parquet.Net 6.0.3 cannot faithfully
-                // round-trip isAdjustedToUTC=false, so it cannot distinguish the two on the wire. The Delta
-                // table SCHEMA is authoritative — the REQUESTED type (this case) selects the lane, and the
-                // stored INT64 micros are read into it. (timestamp_ntz is currently read-only; native writes
-                // are fail-closed at ParquetTypeMapping.CreateField.)
+                // isAdjustedToUTC annotation is deliberately NOT checked here: the read is SCHEMA-AUTHORITATIVE
+                // — the Delta table schema (the REQUESTED type, this case) selects the lane, and the stored
+                // INT64 micros are read into it. This keeps cross-engine reads robust: a native timestamp_ntz
+                // file requested under an LTZ schema (or vice versa) is a pure raw-micros passthrough (no
+                // timezone shift), which the schema-authoritative-passthrough test pins.
                 if (fileField is not DateTimeDataField timestampField
                     || timestampField.DateTimeFormat == DateTimeFormat.Date)
                 {
