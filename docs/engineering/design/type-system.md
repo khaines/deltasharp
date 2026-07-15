@@ -232,12 +232,12 @@ The **null type widens to any peer** and every coercion-sensitive op propagates 
 
 - **In scope:** the type matrix above; equality/validation/serialization; the physical-layout
   query; coercion/decimal/timestamp/ANSI rules (above, STORY-02.5.2).
-- **Deferred (tracked elsewhere):** richer **typed metadata** for Delta-log interop (v1 is
-  string-valued; tracked in **#330**); decimal **divide/modulo value rounding** — result *types* are
+- **Deferred (tracked elsewhere):** decimal **divide/modulo value rounding** — result *types* are
   defined now and scale-reducing casts already round HALF_UP, but quotient/remainder rounding stays
   deferred. `TimestampType` is a UTC-normalized instant (microseconds since epoch); `TimestampNtzType`
   is its timezone-less wall-clock peer (#533/#558) — temporal **function-library** breadth over
-  `timestamp_ntz` (e.g. `date_add`/`date_trunc`) is the remaining follow-up.
+  `timestamp_ntz` (e.g. `date_add`/`date_trunc`) and `string↔timestamp_ntz` casts are the remaining
+  follow-ups (**#563**).
 
 ## References
 
