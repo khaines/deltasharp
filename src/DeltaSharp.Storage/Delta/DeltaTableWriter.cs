@@ -61,6 +61,33 @@ internal sealed record StagedDataFile(
     StructType? DataSchema = null);
 
 /// <summary>
+/// The resolved PHYSICAL write shape for an append/overwrite, computed <b>once</b> so the write door
+/// (<c>DeltaWriteTarget</c>) can stage the Parquet data files under the exact physical column names the
+/// commit will record — closing the door↔committer double-mint gap (#556). Under column-mapping name mode a
+/// schema-evolving write (an additive column, an applied widening, or a wholesale <c>overwriteSchema</c>
+/// replacement) MINTS a fresh <c>physicalName</c>+<c>id</c> for each new column; that minting must happen
+/// exactly once, because the physical names chosen at staging time MUST equal the ones recorded in the
+/// committed <c>metaData</c> (a second, independent mint would stage bytes under one <c>col-&lt;uuid&gt;</c>
+/// while the log records another — silently unreadable data). The door obtains this plan from
+/// <see cref="DeltaTableWriter.PlanAppend"/> / <see cref="DeltaTableWriter.PlanOverwriteReplaceSchema"/>,
+/// stages under <see cref="PhysicalWriteSchema"/> / <see cref="PhysicalPartitionColumns"/>, then commits it
+/// through <see cref="DeltaTableWriter.CommitAppendAsync"/> /
+/// <see cref="DeltaTableWriter.CommitOverwriteReplaceSchemaAsync"/> — which re-uses the SAME
+/// <see cref="SchemaChange"/> mapping rather than re-resolving it.
+/// </summary>
+/// <param name="PhysicalWriteSchema">The physical (name-mapped) schema the staged Parquet files must carry,
+/// in write order; equals the logical write schema for a <c>none</c>-mode table.</param>
+/// <param name="PhysicalPartitionColumns">The physical partition-column names keying the staged files'
+/// <c>partitionValues</c>; equal to the logical names for a <c>none</c>-mode table.</param>
+/// <param name="SchemaChange">The schema-change <c>metaData</c> to commit (an additive/widening evolution, or
+/// a wholesale <c>overwriteSchema</c> replacement carrying the reconciled mapping + bumped
+/// <c>maxColumnId</c>), or <see langword="null"/> when the write conforms to the current schema.</param>
+internal readonly record struct DeltaWritePlan(
+    StructType PhysicalWriteSchema,
+    ImmutableArray<string> PhysicalPartitionColumns,
+    MetadataAction? SchemaChange);
+
+/// <summary>
 /// Builds the correct <see cref="DeltaAction"/> set and <see cref="DeltaReadScope"/> for a Delta write
 /// operation and publishes it atomically through <see cref="DeltaCommitter.CommitAsync"/> (STORY-05.3.3,
 /// design §2.11). It is the storage-side AC-bearing core for the three ACID write shapes:
@@ -182,6 +209,29 @@ internal sealed class DeltaTableWriter
             throw new ArgumentException("An append must stage at least one data file.", nameof(files));
         }
 
+        // #525/#541/#556: resolve the physical write shape (minting a name-mode additive/widening column
+        // ONCE) and commit it. The plan/commit split is what lets the public write door
+        // (DeltaWriteTarget) stage under the SAME minted physical names the commit records — this
+        // convenience overload keeps the pre-#556 one-shot behavior.
+        DeltaWritePlan plan = PlanAppend(readSnapshot, writeSchema, evolutionMode);
+        return CommitAppendAsync(readSnapshot, plan, files, cancellationToken);
+    }
+
+    /// <summary>
+    /// Resolves — but does NOT commit — the PHYSICAL append shape (<see cref="DeltaWritePlan"/>) for
+    /// <paramref name="writeSchema"/> against <paramref name="readSnapshot"/>, minting a name-mode additive
+    /// column / applied widening EXACTLY ONCE (#556). The write door calls this before staging so the Parquet
+    /// files land under the physical names the matching <see cref="CommitAppendAsync"/> will record; a second
+    /// independent mint (door vs. committer) is what this seam eliminates.
+    /// </summary>
+    /// <exception cref="DeltaSchemaMismatchException">The write is incompatible with the table schema, or
+    /// requires a schema change <paramref name="evolutionMode"/> does not permit.</exception>
+    internal DeltaWritePlan PlanAppend(
+        Snapshot readSnapshot, StructType writeSchema, SchemaEvolutionMode evolutionMode)
+    {
+        ArgumentNullException.ThrowIfNull(readSnapshot);
+        ArgumentNullException.ThrowIfNull(writeSchema);
+
         // #525/#541: an append to a column-mapped table stages Parquet under the table's PHYSICAL column
         // names (name mode). A same-logical-schema write reuses the existing mapping (#525); an additive
         // column / applied widening MINTS a fresh physicalName+id and bumps maxColumnId (#541). `none` is
@@ -190,14 +240,36 @@ internal sealed class DeltaTableWriter
         ColumnMapping.EnsureReadWriteSupported(mode);
         (StructType physicalWriteSchema, ImmutableArray<string> physicalPartitionColumns,
             MetadataAction? schemaEvolution) = ResolveWrite(readSnapshot, writeSchema, evolutionMode, mode);
+        return new DeltaWritePlan(physicalWriteSchema, physicalPartitionColumns, schemaEvolution);
+    }
 
-        ValidateStagedWriteSchema(physicalWriteSchema, physicalPartitionColumns, files);
-        ValidatePartitionCoverage(files, physicalPartitionColumns);
-
-        var actions = new List<DeltaAction>((schemaEvolution is null ? 0 : 1) + files.Count);
-        if (schemaEvolution is not null)
+    /// <summary>
+    /// Commits a previously-resolved append <paramref name="plan"/> (from <see cref="PlanAppend"/>) plus its
+    /// staged <paramref name="files"/> against <paramref name="readSnapshot"/> — the second half of the
+    /// #556 plan/commit split. Gates the staged bytes against the plan's physical schema/partitions
+    /// (fail-closed BEFORE any action is built), then publishes the optional schema-evolution
+    /// <c>metaData</c> atomically with the new adds under <see cref="DeltaReadScope.BlindAppend"/>.
+    /// </summary>
+    internal Task<DeltaCommitResult> CommitAppendAsync(
+        Snapshot readSnapshot,
+        DeltaWritePlan plan,
+        IReadOnlyList<StagedDataFile> files,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(readSnapshot);
+        ArgumentNullException.ThrowIfNull(files);
+        if (files.Count == 0)
         {
-            actions.Add(schemaEvolution);
+            throw new ArgumentException("An append must stage at least one data file.", nameof(files));
+        }
+
+        ValidateStagedWriteSchema(plan.PhysicalWriteSchema, plan.PhysicalPartitionColumns, files);
+        ValidatePartitionCoverage(files, plan.PhysicalPartitionColumns);
+
+        var actions = new List<DeltaAction>((plan.SchemaChange is null ? 0 : 1) + files.Count);
+        if (plan.SchemaChange is not null)
+        {
+            actions.Add(plan.SchemaChange);
         }
 
         AppendAddActions(actions, files);
@@ -873,6 +945,30 @@ internal sealed class DeltaTableWriter
         IReadOnlyList<StagedDataFile> files,
         CancellationToken cancellationToken)
     {
+        // One-shot convenience (the direct committer callers): resolve the replacement plan (minting a
+        // name-mode new column ONCE) then commit the caller-staged files against it. The public write door
+        // (#556) instead calls PlanOverwriteReplaceSchema, stages under the plan's physical names, and
+        // commits with CommitOverwriteReplaceSchemaAsync — so door and committer never mint independently.
+        DeltaWritePlan plan = PlanOverwriteReplaceSchema(readSnapshot, writeSchema, partitionColumns);
+        return CommitOverwriteReplaceSchemaAsync(readSnapshot, plan, files, cancellationToken);
+    }
+
+    /// <summary>
+    /// Resolves — but does NOT commit — the wholesale <c>overwriteSchema</c> replacement plan
+    /// (<see cref="DeltaWritePlan"/>) for <paramref name="writeSchema"/> against
+    /// <paramref name="readSnapshot"/> (#542/#556). Under name mode it reconciles the columnMapping onto the
+    /// replaced schema — surviving columns keep their id+physicalName, a new column MINTS a fresh
+    /// physicalName+id, <c>maxColumnId</c> bumps monotonically — so the write door can stage under the SAME
+    /// physical names the commit records. The plan's <see cref="DeltaWritePlan.SchemaChange"/> is the
+    /// replacement <c>metaData</c> (always non-null).
+    /// </summary>
+    internal DeltaWritePlan PlanOverwriteReplaceSchema(
+        Snapshot readSnapshot, StructType writeSchema, IReadOnlyList<string> partitionColumns)
+    {
+        ArgumentNullException.ThrowIfNull(readSnapshot);
+        ArgumentNullException.ThrowIfNull(writeSchema);
+        ArgumentNullException.ThrowIfNull(partitionColumns);
+
         ImmutableArray<string> partitionArray = partitionColumns.ToImmutableArray();
         ColumnMappingMode mode = ColumnMapping.ResolveMode(readSnapshot.Metadata.Configuration);
         ColumnMapping.EnsureReadWriteSupported(mode); // defense-in-depth: id mode is already gated at load
@@ -909,11 +1005,35 @@ internal sealed class DeltaTableWriter
             };
         }
 
+        return new DeltaWritePlan(stagingSchema, stagingPartitions, replacement);
+    }
+
+    /// <summary>
+    /// Commits a previously-resolved <c>overwriteSchema</c> <paramref name="plan"/> (from
+    /// <see cref="PlanOverwriteReplaceSchema"/>) plus its staged <paramref name="files"/> — the second half
+    /// of the #556 plan/commit split. Gates the staged bytes against the plan's NEW physical schema/partitions
+    /// (fail-closed BEFORE any action is built), then removes EVERY prior active file, adds the new files, and
+    /// publishes the replacement <c>metaData</c> as one atomic version.
+    /// </summary>
+    internal Task<DeltaCommitResult> CommitOverwriteReplaceSchemaAsync(
+        Snapshot readSnapshot,
+        DeltaWritePlan plan,
+        IReadOnlyList<StagedDataFile> files,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(readSnapshot);
+        ArgumentNullException.ThrowIfNull(files);
+
+        // #542/#556: the replacement metaData is always resolved by PlanOverwriteReplaceSchema.
+        MetadataAction replacement = plan.SchemaChange
+            ?? throw new InvalidOperationException(
+                "An overwriteSchema plan must carry a replacement metaData.");
+
         // Gate the real staged bytes against the NEW PHYSICAL schema (#497) and validate coverage against the
         // NEW physical partition columns — both BEFORE any action is built, so a rejected replacement leaves
         // the table unchanged (fail-closed).
-        ValidateStagedWriteSchema(stagingSchema, stagingPartitions, files);
-        ValidatePartitionCoverage(files, stagingPartitions);
+        ValidateStagedWriteSchema(plan.PhysicalWriteSchema, plan.PhysicalPartitionColumns, files);
+        ValidatePartitionCoverage(files, plan.PhysicalPartitionColumns);
 
         // Idempotent no-op: an empty overwriteSchema against an already-empty table whose (mapped) schema +
         // partition columns are unchanged would build a 0-remove/0-add/0-metadata action list (the metaData
@@ -923,7 +1043,7 @@ internal sealed class DeltaTableWriter
         if (files.Count == 0
             && readSnapshot.ActiveFiles.IsEmpty
             && replacement.SchemaString == readSnapshot.Metadata.SchemaString
-            && partitionArray.SequenceEqual(readSnapshot.Metadata.PartitionColumns))
+            && plan.PhysicalPartitionColumns.SequenceEqual(readSnapshot.Metadata.PartitionColumns))
         {
             return Task.FromResult(new DeltaCommitResult(readSnapshot.Version, Attempts: 0, Skipped: true));
         }

@@ -58,6 +58,12 @@ internal sealed class DeltaLocalSink : ILocalSink
     // (Static) overwrite with overwriteSchema=true replaces the table schema wholesale.
     private const string OverwriteSchemaOption = "overwriteSchema";
 
+    // Spark's DataFrameWriter option enabling ADDITIVE schema evolution on append (#556): mergeSchema=true
+    // lets an append add a new nullable column (or apply a sanctioned type widening the table enables)
+    // instead of being rejected by strict enforcement. Distinct from overwriteSchema (a destructive full
+    // replacement) — mergeSchema only ever ADDS.
+    private const string MergeSchemaOption = "mergeSchema";
+
     private readonly SinkDescriptor _descriptor;
     private readonly StructType _schema;
 
@@ -85,12 +91,13 @@ internal sealed class DeltaLocalSink : ILocalSink
         // no spill bound. A columnar/streaming sink contract that avoids the rows→batch round-trip is #443.
         IReadOnlyList<ColumnBatch> batches = LocalRelationBatches.Build(schema, rows);
         IReadOnlyList<string> partitionColumns = _descriptor.PartitionColumns;
+        bool mergeSchema = ResolveMergeSchema();
 
         using DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(path);
         switch (_descriptor.Mode)
         {
             case SaveMode.Append:
-                return RunAppend(target, schema, partitionColumns, batches);
+                return RunAppend(target, schema, partitionColumns, batches, mergeSchema);
 
             case SaveMode.Overwrite:
                 return target
@@ -106,7 +113,7 @@ internal sealed class DeltaLocalSink : ILocalSink
                     return 0;
                 }
 
-                return RunAppend(target, schema, partitionColumns, batches);
+                return RunAppend(target, schema, partitionColumns, batches, mergeSchema);
 
             case SaveMode.ErrorIfExists:
                 if (TableExists(target))
@@ -114,7 +121,7 @@ internal sealed class DeltaLocalSink : ILocalSink
                     throw ErrorIfExistsConflict(path);
                 }
 
-                return RunAppend(target, schema, partitionColumns, batches);
+                return RunAppend(target, schema, partitionColumns, batches, mergeSchema);
 
             default:
                 throw new InvalidOperationException($"Unknown save mode '{_descriptor.Mode}'.");
@@ -145,8 +152,9 @@ internal sealed class DeltaLocalSink : ILocalSink
     }
 
     private static long RunAppend(
-        DeltaWriteTarget target, StructType schema, IReadOnlyList<string> partitionColumns, IReadOnlyList<ColumnBatch> batches) =>
-        target.AppendAsync(schema, partitionColumns, batches).GetAwaiter().GetResult().RowsWritten;
+        DeltaWriteTarget target, StructType schema, IReadOnlyList<string> partitionColumns,
+        IReadOnlyList<ColumnBatch> batches, bool mergeSchema) =>
+        target.AppendAsync(schema, partitionColumns, batches, mergeSchema).GetAwaiter().GetResult().RowsWritten;
 
     private static bool TableExists(DeltaWriteTarget target) =>
         target.TableExistsAsync().GetAwaiter().GetResult();
@@ -170,6 +178,25 @@ internal sealed class DeltaLocalSink : ILocalSink
             _ => throw new InvalidOperationException(
                 $"Unsupported '{PartitionOverwriteModeOption}' value '{value}'. DeltaSharp recognizes "
                 + "'static' and 'dynamic'."),
+        };
+    }
+
+    // Resolves the connector `mergeSchema` write option (#556). Absent/empty/false ⇒ strict enforcement (the
+    // default); true ⇒ an append may ADD a new nullable column (or apply a sanctioned widening the table
+    // enables), evolving the schema. Mirrors ResolveOverwriteSchema.
+    private bool ResolveMergeSchema()
+    {
+        if (!_descriptor.Options.TryGetValue(MergeSchemaOption, out string? value))
+        {
+            return false;
+        }
+
+        return value?.Trim().ToLowerInvariant() switch
+        {
+            null or "" or "false" => false,
+            "true" => true,
+            _ => throw new InvalidOperationException(
+                $"Unsupported '{MergeSchemaOption}' value '{value}'. DeltaSharp recognizes 'true' and 'false'."),
         };
     }
 

@@ -305,6 +305,93 @@ public sealed class DeltaWriteDoorEndToEndTests : IDisposable
         }
     }
 
+    // ---------------------------------------------------------------- mergeSchema (#556)
+
+    [Fact]
+    public void Delta_MergeSchema_Option_AddsNullableColumn_OnAppend()
+    {
+        // The connector `mergeSchema` option (#556) maps to the append write-door: an append whose schema
+        // adds a new nullable column EVOLVES the table schema (instead of strict-rejecting) and commits the
+        // merged metaData atomically with the new add — no prior file removed.
+        string table = Table("merge-schema-add");
+
+        using (SparkSession spark = NewSession())
+        {
+            spark.CreateDataFrame(People(), PeopleSchema) // (id, name)
+                .Write.Format("delta").Mode("append").Save(table);
+        }
+
+        Assert.DoesNotContain("\"extra\"", ReadMetadataSchemaString(table, 0), StringComparison.Ordinal);
+
+        var evolved = new StructType(new[]
+        {
+            new StructField("id", IntegerType.Instance, nullable: false),
+            new StructField("name", StringType.Instance, nullable: true),
+            new StructField("extra", StringType.Instance, nullable: true),
+        });
+        using (SparkSession spark = NewSession())
+        {
+            spark.CreateDataFrame(new[] { new Row(evolved, 7, "z", "x7") }, evolved)
+                .Write.Format("delta")
+                .Option("mergeSchema", "true")
+                .Mode("append")
+                .Save(table);
+        }
+
+        Assert.True(File.Exists(CommitFile(table, 1)));
+        Assert.False(HasRemove(table, 1)); // additive append — no files removed
+        Assert.Contains("\"extra\"", ReadMetadataSchemaString(table, 1), StringComparison.Ordinal); // column added
+        Assert.Equal(4, ActiveAdds(table).Sum(a => a.NumRecords)); // v0's 3 rows + the appended 1
+    }
+
+    [Fact]
+    public void Delta_Append_WithoutMergeSchema_AddColumn_FailsAndLeavesTableUnchanged()
+    {
+        // Without the option, an append that adds a column is rejected by strict enforcement (the default);
+        // the table stays at v0 with its original schema.
+        string table = Table("merge-schema-off");
+        using (SparkSession spark = NewSession())
+        {
+            spark.CreateDataFrame(People(), PeopleSchema)
+                .Write.Format("delta").Mode("append").Save(table);
+        }
+
+        var evolved = new StructType(new[]
+        {
+            new StructField("id", IntegerType.Instance, nullable: false),
+            new StructField("name", StringType.Instance, nullable: true),
+            new StructField("extra", StringType.Instance, nullable: true),
+        });
+        using (SparkSession spark = NewSession())
+        {
+            DataFrame df = spark.CreateDataFrame(new[] { new Row(evolved, 7, "z", "x7") }, evolved);
+            Assert.ThrowsAny<Exception>(() =>
+                df.Write.Format("delta").Mode("append").Save(table));
+        }
+
+        Assert.False(File.Exists(CommitFile(table, 1))); // no new commit — strict enforcement held
+    }
+
+    [Fact]
+    public void Delta_MergeSchema_InvalidOptionValue_Throws()
+    {
+        string table = Table("merge-schema-bad");
+        using (SparkSession spark = NewSession())
+        {
+            spark.CreateDataFrame(People(), PeopleSchema)
+                .Write.Format("delta").Mode("append").Save(table);
+        }
+
+        using (SparkSession spark = NewSession())
+        {
+            DataFrame df = spark.CreateDataFrame(People(), PeopleSchema);
+            Assert.ThrowsAny<Exception>(() =>
+                df.Write.Format("delta").Option("mergeSchema", "notabool").Mode("append").Save(table));
+        }
+
+        Assert.False(File.Exists(CommitFile(table, 1)));
+    }
+
     // ---------------------------------------------------------------- partitioned append layout
 
     [Fact]

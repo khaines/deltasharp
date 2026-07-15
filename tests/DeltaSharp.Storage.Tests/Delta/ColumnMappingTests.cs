@@ -735,9 +735,8 @@ public sealed class ColumnMappingTests : IDisposable
     // #542: overwriteSchema (wholesale schema replacement) is now SUPPORTED for a name-mode table — a
     // same-schema overwriteSchema through the public door replaces the data and preserves the columnMapping
     // (every column keeps its id + physicalName; maxColumnId unchanged). (Schema-CHANGING overwriteSchema —
-    // drop / add-with-mint / retype — is exercised via the DeltaTableWriter mechanism tests below. The public
-    // door can drop/reorder/retype but cannot stage a brand-new minted column, so add-through-the-door is
-    // tracked in #556 — the same door limitation as additive evolution #541.)
+    // drop / add-with-mint / retype — is exercised via the DeltaTableWriter mechanism tests below and, for
+    // add-through-the-door, by OverwriteSchema_OnNameModeTable_AddColumn_ThroughPublicDoor_MintsAndReadsBack_Issue556.)
     [Fact]
     public async Task OverwriteSchema_OnNameModeTable_SameSchema_ReplacesData_AndPreservesMapping_Issue542()
     {
@@ -778,12 +777,13 @@ public sealed class ColumnMappingTests : IDisposable
     }
 
     [Fact]
-    public async Task OverwriteSchema_OnNameModeTable_AddColumn_ThroughPublicDoor_FailsClosed_Issue556()
+    public async Task OverwriteSchema_OnNameModeTable_AddColumn_ThroughPublicDoor_MintsAndReadsBack_Issue556()
     {
-        // Documents the tracked public-door limitation (#556): the DeltaWriteTarget door stages against the
-        // EXISTING mapping, so an overwriteSchema that ADDS a brand-new column (no existing physicalName to
-        // stage under) fails closed here — never a silent partial/unmapped write. (Add-column overwriteSchema
-        // IS supported at the DeltaTableWriter mechanism level — see Overwrite_NameMode_AddColumn_*.)
+        // #556: an overwriteSchema that ADDS a brand-new column now succeeds THROUGH THE PUBLIC DOOR. The door
+        // reconciles the columnMapping (minting the new column's physicalName+id ONCE), stages the Parquet
+        // file under that minted physical name, and commits the SAME mapping — so the staged bytes and the
+        // committed metaData agree (no independent door-vs-committer mint). Previously this failed closed (the
+        // door staged against the existing mapping and could not stage a brand-new physical column).
         Func<string> names = FileNames();
         using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
             _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names))
@@ -794,17 +794,105 @@ public sealed class ColumnMappingTests : IDisposable
                 new SeededPhysicalNameSource(Seed));
         }
 
-        using DeltaWriteTarget overwrite = DeltaWriteTarget.ForLocalPath(
-            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names);
-        await Assert.ThrowsAsync<DeltaProtocolException>(() => overwrite.OverwriteAsync(
-            EvolvedFlatSchema, Array.Empty<string>(),
-            new[] { EvolvedFlatBatch((2L, 200L, "bob", "x2")) },
-            DeltaPartitionOverwriteMode.Static,
-            overwriteSchema: true));
+        // The door's committer mints from a SEPARATE seeded source, so "extra" mints EvolveSeed's first name.
+        string mintedExtra = new SeededPhysicalNameSource(EvolveSeed).NextPhysicalName();
+        using (DeltaWriteTarget overwrite = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names, new SeededPhysicalNameSource(EvolveSeed)))
+        {
+            DeltaWriteResult result = await overwrite.OverwriteAsync(
+                EvolvedFlatSchema, Array.Empty<string>(),
+                new[] { EvolvedFlatBatch((2L, 200L, "bob", "x2")) },
+                DeltaPartitionOverwriteMode.Static,
+                overwriteSchema: true);
+            Assert.Equal(1L, result.Version);
+        }
 
-        // Fail-closed: the table is unchanged at v0.
+        using var backend = new LocalFileSystemBackend(_root);
+        Snapshot snapshot = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
+
+        // Existing columns keep identity; "extra" mints id 4 + the golden EvolveSeed physical name; maxColumnId → 4.
+        AssertMapping(snapshot.Schema["id"], "id", 1, PhysId);
+        AssertMapping(snapshot.Schema["score"], "score", 2, PhysScore);
+        AssertMapping(snapshot.Schema["name"], "name", 3, PhysName);
+        AssertMapping(snapshot.Schema["extra"], "extra", 4, mintedExtra);
+        Assert.Equal("4", snapshot.Metadata.Configuration[ColumnMapping.MaxColumnIdKey]);
+
+        // The teeth (anti-double-mint): the DOOR-staged file physically carries the SAME minted col-<uuid> the
+        // COMMIT recorded for "extra" — a second, independent mint would land a different physical name here.
+        AddFileAction added = Assert.Single(snapshot.ActiveFiles);
+        Assert.Equal(
+            new[] { PhysId, PhysScore, PhysName, mintedExtra }, await ReadParquetColumnNamesAsync(added.Path));
+
+        // Prior data is replaced; the new row (incl. the added column's value) round-trips through the read
+        // door — had the door staged "extra" under a different physical name than the metaData records, it
+        // would read back NULL, not "x2".
         using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
-        Assert.Equal(0L, (await source.LoadSnapshotAsync(null, null)).Version);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        List<(long Id, long? Score, string? Name, string? Extra)> rows =
+            await ReadEvolvedRowsAsync(source, info.Version);
+        Assert.Equal(new (long, long?, string?, string?)[] { (2L, 200L, "bob", "x2") }, rows);
+    }
+
+    [Fact]
+    public async Task NameMode_Append_AddColumn_ThroughPublicDoor_MintsAndReadsBack_Issue556()
+    {
+        // #556: an APPEND with mergeSchema:true that adds a nullable column now succeeds THROUGH THE PUBLIC
+        // DOOR (symmetric with the overwriteSchema-add case). The door mints the new column's physicalName+id
+        // ONCE, stages the appended Parquet under it, and commits the evolved mapping atomically with the add —
+        // the added file and the committed metaData agree on the physical identity.
+        Func<string> names = FileNames();
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names))
+        {
+            await target.CreateNameMappedTableAsync(
+                FlatSchema, Array.Empty<string>(),
+                new[] { FlatBatch(new[] { (1L, 100L, (string?)"alice") }) },
+                new SeededPhysicalNameSource(Seed));
+        }
+
+        string mintedExtra = new SeededPhysicalNameSource(EvolveSeed).NextPhysicalName();
+        using (DeltaWriteTarget append = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names, new SeededPhysicalNameSource(EvolveSeed)))
+        {
+            DeltaWriteResult result = await append.AppendAsync(
+                EvolvedFlatSchema, Array.Empty<string>(),
+                new[] { EvolvedFlatBatch((2L, 200L, "bob", "x2")) },
+                mergeSchema: true);
+            Assert.Equal(1L, result.Version);
+        }
+
+        using var backend = new LocalFileSystemBackend(_root);
+        Snapshot snapshot = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
+
+        // Existing columns keep identity; "extra" mints id 4; maxColumnId → 4.
+        AssertMapping(snapshot.Schema["id"], "id", 1, PhysId);
+        AssertMapping(snapshot.Schema["score"], "score", 2, PhysScore);
+        AssertMapping(snapshot.Schema["name"], "name", 3, PhysName);
+        AssertMapping(snapshot.Schema["extra"], "extra", 4, mintedExtra);
+        Assert.Equal("4", snapshot.Metadata.Configuration[ColumnMapping.MaxColumnIdKey]);
+
+        // Both files remain; the v0 file carries the original 3 physical names, the APPENDED file carries all
+        // 4 (incl. the minted "extra") — proving the door staged the new column under the committed physical
+        // name (a double-mint would land a different name in the appended file).
+        Assert.Equal(2, snapshot.ActiveFiles.Length);
+        var fileColumns = new List<string[]>();
+        foreach (AddFileAction add in snapshot.ActiveFiles)
+        {
+            fileColumns.Add(await ReadParquetColumnNamesAsync(add.Path));
+        }
+
+        Assert.Contains(fileColumns, c => c.SequenceEqual(new[] { PhysId, PhysScore, PhysName }));
+        Assert.Contains(fileColumns, c => c.SequenceEqual(new[] { PhysId, PhysScore, PhysName, mintedExtra }));
+
+        // Union of the original row (extra null-filled — its physical column is absent from the v0 file) and
+        // the appended row (extra = "x2", round-tripped through the read door).
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        List<(long Id, long? Score, string? Name, string? Extra)> rows =
+            await ReadEvolvedRowsAsync(source, info.Version);
+        Assert.Equal(
+            new (long, long?, string?, string?)[] { (1L, 100L, "alice", null), (2L, 200L, "bob", "x2") },
+            rows.OrderBy(r => r.Id).ToList());
     }
 
     // #525 regression: `id` mode stays fail-closed on the WRITE path too (it is rejected at snapshot load —
