@@ -396,17 +396,19 @@ internal static class ColumnMapping
     }
 
     /// <summary>
-    /// Evolves a name-mode table's column mapping onto an additively-evolved logical
-    /// <paramref name="evolvedSchema"/> (#541). Each field already present in
-    /// <paramref name="currentMappedSchema"/> (matched by <b>logical</b> name) REUSES its existing
-    /// <c>delta.columnMapping.id</c> + <c>delta.columnMapping.physicalName</c> verbatim — an <b>applied type
-    /// widening</b> keeps the column's identity, only its type changes — while each <b>new</b> field mints a
-    /// fresh physical name from <paramref name="nameSource"/> plus a fresh monotonically increasing id
-    /// (<c>maxColumnId + 1, …</c>). Every other per-field metadata carried on the evolved field (e.g. a
-    /// <c>delta.typeChanges</c> entry from an applied widening, a column comment) is preserved. Returns the
-    /// mapped evolved schema and the configuration with the bumped <c>maxColumnId</c> (all other configuration
-    /// entries preserved). Mirrors the create-path minting (<see cref="AssignFreshMapping"/>) but never
-    /// re-mints an existing column's identity.
+    /// Reconciles a name-mode table's column mapping onto a target logical <paramref name="evolvedSchema"/> —
+    /// an additive append/overwrite evolution (#541) or a wholesale <c>overwriteSchema</c> replacement (#542).
+    /// Each field already present in <paramref name="currentMappedSchema"/> (matched by <b>logical</b> name)
+    /// REUSES its existing <c>delta.columnMapping.id</c> + <c>delta.columnMapping.physicalName</c> verbatim —
+    /// an <b>applied type widening</b> (or any type change under a destructive replace) keeps the column's
+    /// identity, only its type changes — while each <b>new</b> field mints a fresh physical name from
+    /// <paramref name="nameSource"/> plus a fresh monotonically increasing id (<c>maxColumnId + 1, …</c>). A
+    /// column present in the current schema but ABSENT from the target (a <c>overwriteSchema</c> drop) is
+    /// simply not emitted; its id is <b>retired</b>, never reused, because <c>maxColumnId</c> only ever
+    /// increases. Every other per-field metadata carried on the target field (e.g. a <c>delta.typeChanges</c>
+    /// entry, a column comment) is preserved. Returns the mapped schema and the configuration with the bumped
+    /// <c>maxColumnId</c> (all other configuration entries preserved). Mirrors the create-path minting
+    /// (<see cref="AssignFreshMapping"/>) but never re-mints an existing column's identity.
     /// </summary>
     /// <exception cref="DeltaProtocolException">The current schema's <c>maxColumnId</c> is missing/malformed,
     /// a retained name-mode column carries no id, or an evolved field is a nested type.</exception>
