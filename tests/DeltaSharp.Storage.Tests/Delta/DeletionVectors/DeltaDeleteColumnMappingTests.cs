@@ -265,14 +265,15 @@ public sealed class DeltaDeleteColumnMappingTests : IDisposable
     [Fact]
     public void BuildDataSchema_CarriesFieldMetadataThroughToRewriteSchema_Issue545()
     {
-        // #545 fold regression: OPTIMIZE compaction (and DELETE copy-on-write) build their rewrite/read schema
-        // through the shared ColumnMappingProjection.BuildDataSchema, and that schema is re-serialized into the
-        // rewritten data file's footer schema JSON (org.apache.spark.sql.parquet.row.metadata). The seam must
-        // carry each retained field's Metadata through — only the NAME is relabeled to physical — otherwise a
-        // None-mode table with column comments / generated-column config would emit a metadata-stripped footer,
-        // silently losing self-describing fidelity vs. the source files (the divergence that made the OPTIMIZE
-        // fold NOT behavior-identical before this fix). Reconstruction drops Metadata by default, so this is
-        // the load-bearing oracle.
+        // #545 fold regression: the shared ColumnMappingProjection.BuildDataSchema feeds three consumers — the
+        // DeltaReadSource scan and the merge-on-read DELETE predicate projection (both read-only; a DELETE
+        // writes a deletion vector, NOT a rewritten data file), and OPTIMIZE compaction, which re-serializes
+        // this schema into the compacted data file's footer schema JSON (org.apache.spark.sql.parquet.row.metadata).
+        // The seam must carry each retained field's Metadata through — only the NAME is relabeled to physical —
+        // otherwise OPTIMIZE would emit a metadata-stripped footer for a None-mode table with column comments /
+        // generated-column config, silently losing self-describing fidelity vs. the source files (the divergence
+        // that made the OPTIMIZE fold NOT behavior-identical before this fix). Reconstruction drops Metadata by
+        // default (3-arg ctor), so this is the load-bearing oracle.
         FieldMetadata comment = FieldMetadata.FromEntries(
             new[] { new KeyValuePair<string, string>("comment", "the primary key") });
         var schema = new StructType(new[]

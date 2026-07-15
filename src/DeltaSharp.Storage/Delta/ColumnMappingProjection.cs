@@ -63,10 +63,12 @@ internal static class ColumnMappingProjection
     /// Spark golden <c>dv-with-columnmapping</c>), decoupled from the partition VALUE KEY which stays PHYSICAL
     /// (looked up from <c>add.partitionValues</c> in <see cref="BuildFullBatch"/>). In none mode logical ==
     /// physical, so this is exactly the prior behavior. Each retained field carries its original
-    /// <see cref="StructField.Metadata"/> through (only the name is relabeled to physical), so a rewrite path
-    /// that re-serializes this schema into a data-file footer (OPTIMIZE compaction / DELETE copy-on-write)
-    /// preserves per-field metadata (column comments, generated/identity config); the read path never consults
-    /// that metadata, so carrying it is inert there.
+    /// <see cref="StructField.Metadata"/> through (only the name is relabeled to physical), so the OPTIMIZE
+    /// compaction path — the one consumer that re-serializes this schema into a written data-file footer
+    /// (<c>org.apache.spark.sql.parquet.row.metadata</c>) — preserves per-field metadata (column comments,
+    /// generated/identity config). The read-side consumers (the <c>DeltaReadSource</c> scan and the
+    /// merge-on-read DELETE predicate projection, which writes a deletion vector rather than a rewritten data
+    /// file) never consult that metadata, so carrying it is inert there.
     /// </summary>
     public static StructType BuildDataSchema(
         StructType tableSchema, string[] physicalNames, ImmutableArray<string> partitionColumns)
