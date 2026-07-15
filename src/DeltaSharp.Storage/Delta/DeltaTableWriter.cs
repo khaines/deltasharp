@@ -375,14 +375,11 @@ internal sealed class DeltaTableWriter
 
         Snapshot readSnapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
 
-        // #525: a name-mode append/overwrite is now supported (physical-name staging), but `overwriteSchema`
-        // (wholesale schema replacement) stays fail-closed for a column-mapped table: replacing the logical
-        // schema wholesale would desync the preserved `columnMapping.maxColumnId` / per-field id+physicalName
-        // configuration from the new schema (drop/reorder/re-type changes column identity), so it is rejected
-        // rather than commit a mapped table whose metaData and configuration disagree. `id` mode is already
-        // fail-closed at snapshot load (#523); `none` is unaffected.
-        RejectColumnMappedOverwriteSchema(readSnapshot, overwriteSchema);
-
+        // #542: overwriteSchema (wholesale schema replacement, #496) is now supported for a NAME-mode
+        // column-mapped table — OverwriteReplaceSchemaAsync reconciles the columnMapping config with the
+        // replaced schema (surviving columns keep their id+physicalName, new columns mint fresh identity,
+        // maxColumnId bumps monotonically). `id` mode is fail-closed at snapshot load (#523, EnsureModeGate in
+        // DeltaLog), so it never reaches here; `none` is unaffected (logical==physical).
         if (overwriteSchema)
         {
             return await OverwriteReplaceSchemaAsync(
@@ -763,25 +760,6 @@ internal sealed class DeltaTableWriter
             readSnapshot.Schema, writeSchema, evolutionMode, partitionColumns, typeWideningEnabled);
     }
 
-    // #542: `overwriteSchema` (wholesale schema replacement, #496) stays fail-closed for a column-mapped
-    // table. A destructive replacement can drop/reorder/re-type columns, desyncing the preserved
-    // columnMapping.maxColumnId / per-field id+physicalName configuration from the replaced schema — a mapped
-    // table whose metaData schema and configuration disagree. Rather than reconcile column ids here, the
-    // combination is rejected (name-mode APPEND/OVERWRITE without overwriteSchema is fully supported). `id`
-    // mode is already fail-closed at snapshot load (#523); `none` is unaffected.
-    private static void RejectColumnMappedOverwriteSchema(Snapshot snapshot, bool overwriteSchema)
-    {
-        if (overwriteSchema
-            && ColumnMapping.ResolveMode(snapshot.Metadata.Configuration) != ColumnMappingMode.None)
-        {
-            throw DeltaProtocolException.Unsupported(
-                "overwriteSchema (wholesale schema replacement) on a column-mapping table is not supported "
-                + "(#542): a destructive replacement would desync the table's 'delta.columnMapping.maxColumnId' "
-                + "and per-field id/physicalName configuration from the replaced schema. Append/overwrite "
-                + "WITHOUT overwriteSchema is supported for a name-mode table. The write is rejected fail-closed.");
-        }
-    }
-
     private Task<DeltaCommitResult> CommitSchemaChangeAsync(
         Snapshot snapshot, StructType newSchema, ImmutableArray<string>? partitionColumns, CancellationToken cancellationToken)
     {
@@ -875,16 +853,19 @@ internal sealed class DeltaTableWriter
         return _committer.CommitAsync(readSnapshot, actions, DeltaReadScope.WholeTable, cancellationToken);
     }
 
-    // #496: a Static/full overwrite with overwriteSchema=true REPLACES the table schema (and partition
+    // #496/#542: a Static/full overwrite with overwriteSchema=true REPLACES the table schema (and partition
     // columns) wholesale — drop, narrow, reorder, add, or change a column's type — because every prior file
     // is removed in the same version, so no surviving data must conform to the old schema. This deliberately
     // BYPASSES the additive DeltaSchemaEnforcer.Reconcile (which forbids drop/narrow/type-change): the
-    // destructive replacement is legal precisely because the overwrite rewrites all data. The new metaData
-    // carries the write's declared schema + partition columns (all other metadata fields — id, format,
-    // configuration, createdTime — are preserved). The staged files are still gated against the NEW schema by
-    // ValidateStagedWriteSchema (#497 footer check), and partition coverage is validated against the NEW
-    // partition columns, so the committed metaData provably matches the real written bytes. Committed under
-    // WholeTable scope (like every full overwrite) so any concurrent add/remove/metaData aborts it.
+    // destructive replacement is legal precisely because the overwrite rewrites all data. For a `none`-mode
+    // table (logical==physical) the new metaData simply carries the write's declared schema (#496). For a
+    // NAME-mode table (#542) the columnMapping config is RECONCILED with the replaced schema: a surviving
+    // column (matched by logical name) keeps its id+physicalName, a new column mints a fresh physicalName+id,
+    // maxColumnId bumps monotonically (a dropped column's id is retired, never reused), and the staged files
+    // are gated against the NEW PHYSICAL schema. All other metadata fields (id, format, createdTime) are
+    // preserved by `with`, so the table identity is stable. `id` mode is fail-closed at snapshot load (#523,
+    // EnsureModeGate in DeltaLog) and never reaches here. Committed under WholeTable scope (like every full
+    // overwrite) so any concurrent add/remove/metaData aborts it.
     private Task<DeltaCommitResult> OverwriteReplaceSchemaAsync(
         Snapshot readSnapshot,
         StructType writeSchema,
@@ -893,30 +874,52 @@ internal sealed class DeltaTableWriter
         CancellationToken cancellationToken)
     {
         ImmutableArray<string> partitionArray = partitionColumns.ToImmutableArray();
+        ColumnMappingMode mode = ColumnMapping.ResolveMode(readSnapshot.Metadata.Configuration);
+        ColumnMapping.EnsureReadWriteSupported(mode); // defense-in-depth: id mode is already gated at load
 
-        // Gate the real staged bytes against the NEW schema (#497) and validate coverage against the NEW
-        // partition columns — both BEFORE any action is built, so a rejected replacement leaves the table
-        // unchanged (fail-closed).
-        ValidateStagedWriteSchema(writeSchema, partitionColumns, files);
-        ValidatePartitionCoverage(files, partitionArray);
-
-        // The replacement metaData carries the NEW schema + partition columns; all other metadata fields
-        // (id, format, configuration, createdTime) are structurally preserved by `with`, so the table's
-        // identity (id) is stable across the overwriteSchema (never re-minted). NOTE (#525): overwriteSchema
-        // on a COLUMN-MAPPED table is rejected fail-closed BEFORE reaching here (RejectColumnMappedOverwriteSchema
-        // in CreateOrOverwriteAsync) — the preserved Configuration carries columnMapping.maxColumnId / per-field
-        // physical-name+id metadata that a wholesale-replaced schema would desync, and reconciling column ids
-        // is out of scope. This method therefore only ever runs for a `none`-mode table (logical==physical).
-        var replacement = readSnapshot.Metadata with
+        StructType stagingSchema;
+        ImmutableArray<string> stagingPartitions;
+        MetadataAction replacement;
+        if (mode == ColumnMappingMode.Name)
         {
-            SchemaString = SchemaJson.ToJson(writeSchema),
-            PartitionColumns = partitionArray,
-        };
+            // #542: reconcile the columnMapping onto the wholesale-replaced schema (reuse-by-name / mint-new /
+            // bump-maxColumnId), stage under the NEW physical names, and record LOGICAL partition columns.
+            (StructType mappedNewSchema, ImmutableSortedDictionary<string, string> newConfiguration) =
+                ColumnMapping.EvolveNameModeMapping(
+                    writeSchema, readSnapshot.Schema, readSnapshot.Metadata.Configuration, _nameSource);
+            stagingSchema = ColumnMapping.MapWriteSchemaToPhysical(writeSchema, mappedNewSchema, mode);
+            stagingPartitions =
+                ColumnMapping.PhysicalPartitionColumns(mappedNewSchema, partitionColumns, mode).ToImmutableArray();
+            replacement = readSnapshot.Metadata with
+            {
+                SchemaString = SchemaJson.ToJson(mappedNewSchema),
+                PartitionColumns = partitionArray,
+                Configuration = newConfiguration,
+            };
+        }
+        else
+        {
+            // none mode: logical==physical — the write's declared schema/partitions ARE the physical shape.
+            stagingSchema = writeSchema;
+            stagingPartitions = partitionArray;
+            replacement = readSnapshot.Metadata with
+            {
+                SchemaString = SchemaJson.ToJson(writeSchema),
+                PartitionColumns = partitionArray,
+            };
+        }
 
-        // Idempotent no-op: an empty overwriteSchema against an already-empty table whose schema + partition
-        // columns are unchanged would build a 0-remove/0-add/0-metadata action list (the metaData equals the
-        // current one), which DeltaCommitter rejects as an empty commit — short-circuit to Skipped, mirroring
-        // the plain empty-static-overwrite guard.
+        // Gate the real staged bytes against the NEW PHYSICAL schema (#497) and validate coverage against the
+        // NEW physical partition columns — both BEFORE any action is built, so a rejected replacement leaves
+        // the table unchanged (fail-closed).
+        ValidateStagedWriteSchema(stagingSchema, stagingPartitions, files);
+        ValidatePartitionCoverage(files, stagingPartitions);
+
+        // Idempotent no-op: an empty overwriteSchema against an already-empty table whose (mapped) schema +
+        // partition columns are unchanged would build a 0-remove/0-add/0-metadata action list (the metaData
+        // equals the current one), which DeltaCommitter rejects as an empty commit — short-circuit to Skipped,
+        // mirroring the plain empty-static-overwrite guard. In name mode EvolveNameModeMapping reproduces the
+        // current mapping verbatim for an unchanged schema, so the SchemaString comparison still holds.
         if (files.Count == 0
             && readSnapshot.ActiveFiles.IsEmpty
             && replacement.SchemaString == readSnapshot.Metadata.SchemaString
