@@ -370,9 +370,11 @@ internal sealed class DeltaOptimize
         // Fold onto the shared column-mapping projection seam (#545). OPTIMIZE reads and rewrites RAW Parquet
         // and does not (yet) support column mapping, so it resolves physical names under ColumnMappingMode.None
         // — where physical name == logical name, making ResolvePhysicalNames an identity and BuildDataSchema
-        // behavior-identical to the former DeltaOptimize-local copy. A name-mode table's data files carry
-        // physical (col-<uuid>) names absent from this logical data schema, so such an input still fails closed
-        // on read (never silently mis-compacted); name-mode-aware OPTIMIZE is a separate concern.
+        // behavior-identical to the former DeltaOptimize-local copy (the seam carries each field's Metadata
+        // through, so the compacted file's footer schema JSON is byte-identical, not just row/stats-identical).
+        // A name-mode table's data files carry physical (col-<uuid>) names absent from this logical data
+        // schema, so such an input still fails closed on read (never silently mis-compacted); name-mode-aware
+        // OPTIMIZE is a separate concern.
         string[] physicalNames = ColumnMappingProjection.ResolvePhysicalNames(readSnapshot.Schema, ColumnMappingMode.None);
         StructType dataSchema = ColumnMappingProjection.BuildDataSchema(readSnapshot.Schema, physicalNames, partitionColumns);
         long timestamp = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
