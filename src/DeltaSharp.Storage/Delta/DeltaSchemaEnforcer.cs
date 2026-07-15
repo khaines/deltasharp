@@ -36,12 +36,12 @@ namespace DeltaSharp.Storage.Delta;
 /// other differing type is <see cref="DeltaSchemaMismatchKind.IncompatibleType"/> — including a
 /// <c>decimal</c> target too narrow to represent the integral source range (it would truncate, so it is not a
 /// sanctioned widening). <c>date→timestamp_ntz</c> IS a Delta-sanctioned widening (#533) that DeltaSharp
-/// <b>read-promotes</b> (INT32 epoch-day → INT64 midnight-of-date micros) but does <b>not</b> apply on
-/// append: it cannot write a native <c>timestamp_ntz</c> Parquet column (Parquet.Net 6.0.3 cannot persist
-/// <c>isAdjustedToUTC=false</c>), so native ntz writes are fail-closed and an append widening is rejected as
-/// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> whether or not the feature is enabled (like
-/// the read-only cross-family #535 cases). <c>date→timestamp</c> with a timezone (LTZ) is NOT sanctioned by
-/// Delta at all, so it is rejected as a plain <see cref="DeltaSchemaMismatchKind.IncompatibleType"/>. Widening
+/// <b>applies on a wider-typed append/overwrite</b> when type widening is enabled (the table schema evolves to
+/// <c>timestamp_ntz</c> and new rows write native <c>timestamp_ntz</c>; existing <c>date</c> files are
+/// read-promoted INT32 epoch-day → INT64 midnight-of-date micros) — else, when the feature is disabled,
+/// rejected as <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>. <c>date→timestamp</c> with a
+/// timezone (LTZ) is NOT sanctioned by Delta at all, so it is rejected as a plain
+/// <see cref="DeltaSchemaMismatchKind.IncompatibleType"/>. Widening
 /// inside an array element / map key/value is NOT applied (it would need a <c>fieldPath</c> in
 /// <c>delta.typeChanges</c> and the Parquet read
 /// path does not read nested types at all) — it stays fail-closed as
@@ -324,16 +324,14 @@ internal static class DeltaSchemaEnforcer
             default:
                 // A differing scalar type. APPLY the widening on write ONLY when it is a Delta
                 // SCHEMA-EVOLUTION-eligible widening AND type widening is enabled AND we are at a promotable
-                // scalar position. This build applies only the SAME-FAMILY subset (IsSameFamilyWidening:
-                // integral byte→…→long, float→double, grow-only decimal), mirroring the appliable core of
-                // Spark's `TypeWidening.isTypeChangeSupportedForSchemaEvolution`. The CROSS-FAMILY (#535) and
-                // TEMPORAL date→timestamp_ntz (#533) cases are Delta-`isTypeChangeSupported` (readable, and
-                // read-PROMOTED on the scan path) but are NOT auto-applied on append here: cross-family is not
-                // schema-evolution-eligible, and date→timestamp_ntz cannot be WRITTEN natively (Parquet.Net
-                // 6.0.3 cannot persist isAdjustedToUTC=false, so a written column would be a non-conformant LTZ
-                // file — native timestamp_ntz writes are fail-closed). Both therefore fall through to the reject
-                // block below (fail-closed as TypeWideningUnsupported), same as when the feature is disabled.
-                if (allowWidenApply && typeWideningEnabled && TypeWidening.IsSameFamilyWidening(tableType, writeType))
+                // scalar position. The applied subset (IsSchemaEvolutionWidening) is the SAME-FAMILY cases
+                // (integral byte→…→long, float→double, grow-only decimal) PLUS date→timestamp_ntz (#533),
+                // mirroring Spark's `TypeWidening.isTypeChangeSupportedForSchemaEvolution`. The CROSS-FAMILY
+                // (#535) cases are Delta-`isTypeChangeSupported` (readable, and read-PROMOTED on the scan path)
+                // but are NOT schema-evolution-eligible, so they are NOT auto-applied on append — they fall
+                // through to the reject block below (fail-closed as TypeWideningUnsupported), same as when the
+                // feature is disabled.
+                if (allowWidenApply && typeWideningEnabled && TypeWidening.IsSchemaEvolutionWidening(tableType, writeType))
                 {
                     return writeType;
                 }
@@ -341,9 +339,8 @@ internal static class DeltaSchemaEnforcer
                 if (TypeWidening.IsSanctionedWidening(tableType, writeType))
                 {
                     // A Delta-sanctioned widening that is NOT applied here: the feature is disabled; or this is
-                    // a CROSS-FAMILY widening (#535) or a date→timestamp_ntz temporal widening (#533) —
-                    // read-promotable but not applied on write (cross-family is not schema-evolution-eligible;
-                    // temporal cannot be written natively); or a nested (array-element/map key/value) position
+                    // a CROSS-FAMILY widening (#535) — read-promotable but not schema-evolution-eligible, so
+                    // never auto-applied on write; or a nested (array-element/map key/value) position
                     // where allowWidenApply is false — nested widening is DEFERRED (it would need a `fieldPath`
                     // in `delta.typeChanges` and the Parquet read path does not read nested types at all;
                     // tracked as the #535 follow-up, #546). Surfaced distinctly as TypeWideningUnsupported

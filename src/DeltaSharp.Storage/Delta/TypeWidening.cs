@@ -26,9 +26,10 @@ namespace DeltaSharp.Storage.Delta;
 /// that threshold is NOT a sanctioned widening and stays fail-closed.</item>
 /// <item><b>Temporal</b> (<see cref="IsTemporalWidening"/>, #533): <c>date → timestamp_ntz</c> — Delta
 /// widens <c>date</c> to <c>timestamp without timezone</c> (INT64 epoch-micros); a narrow <c>date</c>
-/// (INT32 epoch-day) file is promoted to midnight-of-date micros on read. <b>Read-promote-only</b> (like the
-/// cross-family cases): NOT auto-applied on append, because this build cannot yet WRITE a native
-/// <c>timestamp_ntz</c> Parquet column (Parquet.Net 6.0.3 cannot persist <c>isAdjustedToUTC=false</c>).</item>
+/// (INT32 epoch-day) file is promoted to midnight-of-date micros on read, and it is
+/// schema-evolution-eligible (<see cref="IsSchemaEvolutionWidening"/>) so a wider-typed append evolves the
+/// table to <c>timestamp_ntz</c> and writes native <c>timestamp_ntz</c> (Parquet
+/// <c>TIMESTAMP(isAdjustedToUTC=false)</c>).</item>
 /// </list></para>
 ///
 /// <para><b>Deliberately NOT applied</b> (protocol-sanctioned but out of this build's scope, kept
@@ -143,27 +144,38 @@ internal static class TypeWidening
 
     /// <summary>
     /// Whether <paramref name="from"/> → <paramref name="to"/> is the Delta-sanctioned <b>temporal</b>
-    /// widening this build <b>read-promotes</b>: <c>date → timestamp_ntz</c> (#533). Delta widens
+    /// widening this build applies and read-promotes: <c>date → timestamp_ntz</c> (#533). Delta widens
     /// <c>date</c> to <c>timestamp without timezone</c> (<see cref="TimestampNtzType"/>), the timezone-<i>less</i>
     /// INT64 epoch-micros type — <b>not</b> to the timezone-adjusted <see cref="TimestampType"/> (a
     /// <c>date → timestamp</c> LTZ change is NOT sanctioned and is rejected as a plain incompatible type). On
     /// read, a narrow <c>date</c> (INT32 epoch-day) file is promoted to <c>timestamp_ntz</c> (INT64 epoch-micros
-    /// at midnight of the date, no session offset).
-    ///
-    /// <para><b>Read-promote-only</b> (like the cross-family #535 cases): although Delta lists this change as
-    /// schema-evolution-eligible, DeltaSharp does <b>not</b> auto-apply it on append, because it cannot yet
-    /// <b>write</b> a native <c>timestamp_ntz</c> Parquet column — Parquet.Net 6.0.3 collapses the
-    /// <c>isAdjustedToUTC=false</c> annotation to <c>true</c> on write (a legacy <c>TIMESTAMP_MICROS</c>
-    /// ConvertedType, no <c>LogicalType</c>), so a written column would be a protocol-non-conformant LTZ file.
-    /// Native <c>timestamp_ntz</c> writes are therefore fail-closed (tracked in #557); this classifier
-    /// exists so DeltaSharp can READ a Spark/delta-rs table that recorded a <c>date → timestamp_ntz</c> change
-    /// over old <c>date</c> files, promoting them on read.</para>
+    /// at midnight of the date, no session offset); on a wider-typed append it is schema-evolution-eligible
+    /// (<see cref="IsSchemaEvolutionWidening"/>), so the table schema evolves to <c>timestamp_ntz</c> and new
+    /// rows are written as native <c>timestamp_ntz</c> (Parquet <c>TIMESTAMP(isAdjustedToUTC=false)</c> via
+    /// <c>DateTimeFormat.Timestamp</c>).
     /// </summary>
     public static bool IsTemporalWidening(DataType from, DataType to)
     {
         ArgumentNullException.ThrowIfNull(from);
         ArgumentNullException.ThrowIfNull(to);
         return from is DateType && to is TimestampNtzType;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="from"/> → <paramref name="to"/> is a widening this build <b>auto-applies when a
+    /// wider-typed write evolves the table schema</b> (an append/overwrite whose column is wider than the
+    /// table's) — the mirror of Spark's <c>TypeWidening.isTypeChangeSupportedForSchemaEvolution</c>, a
+    /// deliberate <b>subset</b> of the full <see cref="IsSanctionedWidening"/> allowlist: the same-family cases
+    /// (<see cref="IsSameFamilyWidening"/>: integral <c>byte→…→long</c>, <c>float→double</c>, grow-only decimal)
+    /// plus <c>date → timestamp_ntz</c> (<see cref="IsTemporalWidening"/>, #533). The cross-family cases
+    /// (<see cref="IsCrossFamilyWidening"/>, #535) are read-promotable and ALTER-applicable but NOT
+    /// schema-evolution-eligible, so they are excluded here and stay read-only.
+    /// </summary>
+    public static bool IsSchemaEvolutionWidening(DataType from, DataType to)
+    {
+        ArgumentNullException.ThrowIfNull(from);
+        ArgumentNullException.ThrowIfNull(to);
+        return IsSameFamilyWidening(from, to) || IsTemporalWidening(from, to);
     }
 
     /// <summary>

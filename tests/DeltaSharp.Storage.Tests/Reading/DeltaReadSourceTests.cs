@@ -83,6 +83,55 @@ public sealed class DeltaReadSourceTests : IDisposable
     }
 
     [Fact]
+    public async Task ReadLatest_TimestampNtz_RoundTripsThroughPublicDoor()
+    {
+        // #557 prototype: a native timestamp_ntz column written through the PUBLIC Delta write door (which
+        // re-reads the staged file's footer for the #497 schema check) and read back through the public read
+        // door. Proves the metaData schema records timestamp_ntz, the write-door footer check accepts the
+        // conformant ntz Parquet, and the INT64 micros round-trip exactly (no host-timezone shift).
+        var schema = new StructType(new[]
+        {
+            new StructField("id", DataTypes.LongType, nullable: false),
+            new StructField("ts", DataTypes.TimestampNtzType, nullable: true),
+        });
+        long[] micros = { 0L, 1_609_459_200_123_456L, -5_000_000L };
+
+        using (DeltaWriteTarget target = WriteTarget())
+        {
+            MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, micros.Length);
+            MutableColumnVector ts = ColumnVectors.Create(DataTypes.TimestampNtzType, micros.Length);
+            for (int i = 0; i < micros.Length; i++)
+            {
+                id.AppendValue((long)i);
+                ts.AppendValue(micros[i]);
+            }
+
+            var batch = new ManagedColumnBatch(schema, new ColumnVector[] { id, ts }, micros.Length);
+            await target.AppendAsync(schema, Array.Empty<string>(), new[] { batch });
+        }
+
+        using DeltaReadSource source = ReadSource();
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        Assert.Contains("timestamp_ntz", info.Schema.SimpleString, System.StringComparison.Ordinal);
+
+        var readBack = new List<(long Id, long Ts)>();
+        foreach (ColumnBatch batch in await source.ReadBatchesAsync(info.Version))
+        {
+            ColumnVector id = batch.SelectedColumn(0);
+            ColumnVector ts = batch.SelectedColumn(1);
+            Assert.Equal(DataTypes.TimestampNtzType, ts.Type);
+            for (int r = 0; r < batch.LogicalRowCount; r++)
+            {
+                readBack.Add((id.GetValue<long>(r), ts.GetValue<long>(r)));
+            }
+        }
+
+        Assert.Equal(
+            new[] { (0L, 0L), (1L, 1_609_459_200_123_456L), (2L, -5_000_000L) },
+            readBack.OrderBy(r => r.Id).ToList());
+    }
+
+    [Fact]
     public async Task ReadLatest_Partitioned_ReDerivesPartitionColumnFromAddAction()
     {
         using (DeltaWriteTarget target = WriteTarget())

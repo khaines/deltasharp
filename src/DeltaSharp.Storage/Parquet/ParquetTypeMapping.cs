@@ -59,14 +59,13 @@ internal static class ParquetTypeMapping
             BinaryType => new DataField<byte[]>(field.Name),
             DateType => new DateTimeDataField(field.Name, DateTimeFormat.Date, isNullable: nullable),
             TimestampType => new DateTimeDataField(
-                field.Name, DateTimeFormat.DateAndTimeMicros, isAdjustedToUTC: true, isNullable: nullable),
-            // timestamp_ntz maps to a micros DateTimeDataField for the READ path's pre-validation (a requested
-            // ntz column must map to a supported Parquet type). NOTE: Parquet.Net 6.0.3 cannot persist
-            // isAdjustedToUTC=false (it emits a legacy UTC TIMESTAMP_MICROS ConvertedType), so a native ntz
-            // WRITE would be a protocol-non-conformant LTZ file — native ntz writes are fail-closed in
-            // ParquetFileWriter.WriteAsync (this field is never used to write an ntz column).
+                field.Name, DateTimeFormat.Timestamp, isAdjustedToUTC: true, unit: DateTimeTimeUnit.Micros, isNullable: nullable),
+            // timestamp_ntz (#533/#557): DateTimeFormat.Timestamp + Micros emits a conformant modern
+            // LogicalType.TIMESTAMP{isAdjustedToUTC=false, unit=MICROS}. (The legacy DateAndTimeMicros format
+            // instead hard-codes ConvertedType.TIMESTAMP_MICROS and drops isAdjustedToUTC — which is why it
+            // could only ever express UTC.) The stored INT64 micros are byte-identical to the LTZ timestamp.
             TimestampNtzType => new DateTimeDataField(
-                field.Name, DateTimeFormat.DateAndTimeMicros, isAdjustedToUTC: false, isNullable: nullable),
+                field.Name, DateTimeFormat.Timestamp, isAdjustedToUTC: false, unit: DateTimeTimeUnit.Micros, isNullable: nullable),
             DecimalType decimalType => CreateDecimalField(field.Name, decimalType, nullable),
             ArrayType or MapType or StructType => throw DeltaStorageException.UnsupportedFeature(
                 $"Parquet mapping for column '{field.Name}': nested types (phased, design §2.9) — "
@@ -117,14 +116,16 @@ internal static class ParquetTypeMapping
         switch (field)
         {
             case DateTimeDataField dateTime:
-                // NOTE: a micros DateTimeDataField maps back to TimestampType regardless of the requested
-                // logical type — Parquet.Net 6.0.3 cannot faithfully round-trip isAdjustedToUTC=false, so the
-                // footer cannot distinguish timestamp from timestamp_ntz. The Delta table SCHEMA is the
-                // authoritative source of the logical type; the read path selects the timestamp/timestamp_ntz
-                // lane from the REQUESTED type, not this footer-derived type (see ParquetFileReader validate).
+                // With DateTimeFormat.Timestamp the footer now carries a faithful LogicalType.TIMESTAMP
+                // (isAdjustedToUTC preserved), so a micros column maps back to its true logical type:
+                // isAdjustedToUTC=true → timestamp (LTZ), false → timestamp_ntz (#533/#557). A DATE-format
+                // column maps to DateType. (Legacy files written with the old DateAndTimeMicros ConvertedType
+                // read back as isAdjustedToUTC=true → timestamp, which is correct for those UTC files.)
                 type = dateTime.DateTimeFormat == DateTimeFormat.Date
                     ? DataTypes.DateType
-                    : DataTypes.TimestampType;
+                    : dateTime.IsAdjustedToUTC
+                        ? DataTypes.TimestampType
+                        : DataTypes.TimestampNtzType;
                 return true;
             case DecimalDataField decimalField:
                 type = DataTypes.CreateDecimalType(decimalField.Precision, decimalField.Scale);
@@ -226,14 +227,16 @@ internal static class ParquetTypeMapping
         }
     }
 
-    /// <summary>Converts a Parquet micros TIMESTAMP <see cref="DateTime"/> back to the DeltaSharp
-    /// epoch-microsecond instant. A local instant is normalized to UTC (mirrors
-    /// <c>LocalRelationBatches.EncodeTimestamp</c>).</summary>
-    public static long DateTimeToEpochMicros(DateTime value)
-    {
-        DateTime utc = value.Kind == DateTimeKind.Local ? value.ToUniversalTime() : value;
-        return (utc.Ticks - DateTime.UnixEpoch.Ticks) / TimeSpan.TicksPerMicrosecond;
-    }
+    /// <summary>Converts a Parquet micros TIMESTAMP <see cref="DateTime"/> (as decoded by Parquet.Net) back to
+    /// the DeltaSharp epoch-microsecond instant. Reads the raw ticks <b>Kind-agnostically</b> — Parquet.Net's
+    /// reader labels a decoded value <see cref="DateTimeKind.Utc"/> for an <c>isAdjustedToUTC=true</c> column
+    /// and <see cref="DateTimeKind.Local"/> for an <c>isAdjustedToUTC=false</c> (<c>timestamp_ntz</c>) column,
+    /// but that <see cref="DateTimeKind"/> is a <i>semantic label</i>, NOT an instruction to shift: the stored
+    /// micros are already the value DeltaSharp wants (the UTC instant for LTZ, the wall-clock for ntz). A
+    /// <see cref="DateTime.ToUniversalTime"/> here would wrongly offset an ntz value by the host time zone
+    /// (#533/#557).</summary>
+    public static long DateTimeToEpochMicros(DateTime value) =>
+        (value.Ticks - DateTime.UnixEpoch.Ticks) / TimeSpan.TicksPerMicrosecond;
 
     // ----- Decimal conversions -----
 

@@ -846,20 +846,21 @@ public sealed class DeltaSchemaEnforcerTests
     }
 
     [Fact]
-    public void Reconcile_DateToTimestampNtz_WhenEnabled_IsRejectedAsTypeWideningUnsupported()
+    public void Reconcile_DateToTimestampNtz_WhenEnabled_Applies()
     {
-        // date→timestamp_ntz is a Delta-sanctioned widening (#533) that DeltaSharp READ-PROMOTES but does NOT
-        // apply on append — it cannot write a native timestamp_ntz Parquet column (Parquet.Net 6.0.3 cannot
-        // persist isAdjustedToUTC=false). So even with the feature enabled it is fail-closed, distinctly, as
-        // TypeWideningUnsupported (like the read-only cross-family #535 cases) — never silently applied.
+        // date→timestamp_ntz is schema-evolution-eligible (#533): with the feature enabled the merged schema
+        // carries timestamp_ntz and a delta.typeChanges {date, timestamp_ntz} entry. Existing date files are
+        // read-promoted to midnight-of-date micros; new rows write native timestamp_ntz.
         StructType table = Schema(Field("ts", DataTypes.DateType, nullable: true));
         StructType write = Schema(Field("ts", DataTypes.TimestampNtzType, nullable: true));
 
-        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(
+            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
 
-        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+        Assert.NotNull(merged);
+        StructField field = merged!["ts"];
+        Assert.Equal(DataTypes.TimestampNtzType, field.DataType);
+        AssertSingleTypeChange(field.Metadata, DataTypes.DateType.TypeName, DataTypes.TimestampNtzType.TypeName);
     }
 
     [Fact]

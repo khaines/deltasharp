@@ -43,17 +43,56 @@ public sealed class TimestampNtzStorageTests
     }
 
     [Fact]
-    public async Task NativeTimestampNtzWrite_IsFailClosed()
+    public async Task NativeTimestampNtz_WritesConformantAnnotation_AndRoundTrips()
     {
-        // Writing a native timestamp_ntz column is fail-closed (Parquet.Net cannot persist isAdjustedToUTC=false).
+        // #557 prototype: a native timestamp_ntz column now writes a conformant modern
+        // LogicalType.TIMESTAMP{isAdjustedToUTC=false, MICROS} (via DateTimeFormat.Timestamp), NOT the legacy
+        // UTC TIMESTAMP_MICROS ConvertedType — and its INT64 micros round-trip exactly.
+        long[] micros = { 0L, 1_609_459_200_123_456L, -5_000_000L };
         var schema = new StructType(new[] { new StructField("v", DataTypes.TimestampNtzType, nullable: true) });
-        ManagedColumnBatch batch = OneColumn(DataTypes.TimestampNtzType, c => { c.AppendValue(1_000_000L); }, 1);
+        ManagedColumnBatch batch = OneColumn(DataTypes.TimestampNtzType, c =>
+        {
+            foreach (long m in micros)
+            {
+                c.AppendValue(m);
+            }
+        }, micros.Length);
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
 
-        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
-            () => ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch }));
-        Assert.Equal(StorageErrorKind.UnsupportedFeature, ex.Kind);
-        Assert.Contains("timestamp_ntz", ex.Message, System.StringComparison.Ordinal);
-        Assert.Contains("isAdjustedToUTC=false", ex.Message, System.StringComparison.Ordinal);
+        using (var stream = new System.IO.MemoryStream(file, writable: false))
+        {
+            global::Parquet.ParquetReader reader = await global::Parquet.ParquetReader.CreateAsync(
+                stream, null, false, System.Threading.CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                var f = Assert.IsType<global::Parquet.Schema.DateTimeDataField>(
+                    System.Array.Find(reader.Schema.DataFields, x => x.Name == "v"));
+                Assert.Equal(global::Parquet.Schema.DateTimeFormat.Timestamp, f.DateTimeFormat);
+                Assert.Equal(global::Parquet.Schema.DateTimeTimeUnit.Micros, f.Unit);
+                Assert.False(f.IsAdjustedToUTC, "timestamp_ntz must write isAdjustedToUTC=false");
+            }
+        }
+
+        List<ColumnBatch> read = await ParquetTestHelpers.ReadAllAsync(file, schema);
+        ColumnVector v = read.Single().Column(0);
+        Assert.Equal(DataTypes.TimestampNtzType, v.Type);
+        Assert.Equal(micros, v.GetValues<long>().ToArray());
+    }
+
+    [Fact]
+    public async Task NativeTimestampNtzFile_ReadAsTimestampLtz_IsSchemaAuthoritativePassthrough()
+    {
+        // The read remains schema-authoritative: even though the annotation is now faithful, a native
+        // timestamp_ntz file read under a TimestampType (LTZ) schema still returns the same stored micros —
+        // the requested type selects the lane and the value is a pure long passthrough (no timezone shift),
+        // matching the interop-robust design.
+        var ntzSchema = new StructType(new[] { new StructField("v", DataTypes.TimestampNtzType, nullable: true) });
+        ManagedColumnBatch batch = OneColumn(DataTypes.TimestampNtzType, c => { c.AppendValue(5L); c.AppendValue(6L); }, 2);
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(ntzSchema, new[] { batch });
+
+        var ltzSchema = new StructType(new[] { new StructField("v", DataTypes.TimestampType, nullable: true) });
+        List<ColumnBatch> read = await ParquetTestHelpers.ReadAllAsync(file, ltzSchema);
+        Assert.Equal(new[] { 5L, 6L }, read.Single().Column(0).GetValues<long>().ToArray());
     }
 
     [Fact]
@@ -155,5 +194,39 @@ public sealed class TimestampNtzStorageTests
     {
         Assert.Equal(DataTypes.TimestampNtzType, TypeCoercion.FindTightestCommonType(DataTypes.DateType, DataTypes.TimestampNtzType));
         Assert.Equal(DataTypes.TimestampNtzType, TypeCoercion.FindTightestCommonType(DataTypes.TimestampNtzType, DataTypes.DateType));
+    }
+
+    [Fact]
+    public void DateTimeToEpochMicros_ReadsRawTicks_KindAgnostic_NoTimezoneShift()
+    {
+        // Regression (#533/#557): the Parquet timestamp reader converts a decoded DateTime → epoch-micros by
+        // reading its RAW ticks, regardless of DateTimeKind. Parquet.Net labels a timestamp_ntz decode
+        // DateTimeKind.Local and a timestamp decode DateTimeKind.Utc, but that Kind is a SEMANTIC label, not a
+        // conversion instruction — a ToUniversalTime() here would offset a timestamp_ntz value by the host time
+        // zone (the +8h shift the prototype's naive format swap first produced on a PST host).
+        long ticks = new System.DateTime(2021, 1, 1, 12, 30, 15).Ticks;
+        long expected = (ticks - System.DateTime.UnixEpoch.Ticks) / System.TimeSpan.TicksPerMicrosecond;
+
+        Assert.Equal(expected, ParquetTypeMapping.DateTimeToEpochMicros(new System.DateTime(ticks, System.DateTimeKind.Utc)));
+        Assert.Equal(expected, ParquetTypeMapping.DateTimeToEpochMicros(new System.DateTime(ticks, System.DateTimeKind.Local)));
+        Assert.Equal(expected, ParquetTypeMapping.DateTimeToEpochMicros(new System.DateTime(ticks, System.DateTimeKind.Unspecified)));
+    }
+
+    [Fact]
+    public void DateTimeToEpochMicros_DoesNotApplyTimezoneConversion_HostIndependent()
+    {
+        // Deterministic guard independent of the host time zone: compute what a ToUniversalTime()-based reader
+        // WOULD produce for a Local value under a fixed −8h zone, confirm that zone genuinely shifts, then
+        // assert the actual (Kind-agnostic) reader returns the RAW-ticks value, not the shifted one. Fails on
+        // ANY host if the raw-ticks read is replaced by a Kind-sensitive ToUniversalTime().
+        var minus8 = System.TimeZoneInfo.CreateCustomTimeZone("t-8", System.TimeSpan.FromHours(-8), "t-8", "t-8");
+        var local = new System.DateTime(2021, 1, 1, 12, 30, 15, System.DateTimeKind.Local);
+        long rawTicksMicros = (local.Ticks - System.DateTime.UnixEpoch.Ticks) / System.TimeSpan.TicksPerMicrosecond;
+        long shiftedMicros =
+            (System.TimeZoneInfo.ConvertTimeToUtc(System.DateTime.SpecifyKind(local, System.DateTimeKind.Unspecified), minus8).Ticks
+                - System.DateTime.UnixEpoch.Ticks) / System.TimeSpan.TicksPerMicrosecond;
+
+        Assert.NotEqual(shiftedMicros, rawTicksMicros); // the −8h zone genuinely shifts, so the guard is meaningful
+        Assert.Equal(rawTicksMicros, ParquetTypeMapping.DateTimeToEpochMicros(local));
     }
 }

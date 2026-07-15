@@ -99,6 +99,19 @@ public sealed class TypeWideningClassifierTests
     }
 
     [Theory]
+    // The schema-evolution-eligible (auto-applied-on-append) subset = same-family PLUS date→timestamp_ntz
+    // (#533), but EXCLUDES the read-only cross-family cases (#535).
+    [InlineData(nameof(DataTypes.IntegerType), nameof(DataTypes.LongType), true)]        // same-family integral
+    [InlineData(nameof(DataTypes.FloatType), nameof(DataTypes.DoubleType), true)]        // same-family float
+    [InlineData(nameof(DataTypes.DateType), nameof(DataTypes.TimestampNtzType), true)]   // temporal (#533)
+    [InlineData(nameof(DataTypes.IntegerType), nameof(DataTypes.DoubleType), false)]     // cross-family: read-only
+    [InlineData(nameof(DataTypes.DateType), nameof(DataTypes.TimestampType), false)]     // date→ts LTZ: not sanctioned
+    public void IsSchemaEvolutionWidening_SameFamilyPlusTemporal(string from, string to, bool expected)
+    {
+        Assert.Equal(expected, TypeWidening.IsSchemaEvolutionWidening(Resolve(from), Resolve(to)));
+    }
+
+    [Theory]
     // decimal grow-only (integer-range AND scale both non-decreasing) → true.
     [InlineData(10, 2, 12, 2, true)]  // integer range grows, scale equal
     [InlineData(10, 2, 12, 4, true)]  // both grow, integer range unchanged
