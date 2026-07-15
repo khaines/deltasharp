@@ -4,6 +4,7 @@ using DeltaSharp.Storage;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
 using DeltaSharp.Storage.Parquet;
+using DeltaSharp.Storage.Tests.Delta;
 using DeltaSharp.Storage.Writing;
 using DeltaSharp.Types;
 using Parquet;
@@ -19,6 +20,14 @@ namespace DeltaSharp.Storage.Tests.Writing;
 /// actions (version, <c>add</c> actions, <c>dataChange</c>). Covers create+append (v0→v1), static
 /// overwrite, dynamic partition overwrite (only touched partitions replaced), and unpartitioned tables.
 /// </summary>
+/// <remarks>
+/// Runs in the shared non-parallel <see cref="ColumnMappingTestCollection"/>: these are raw-write /
+/// shared-temp-filesystem door tests, so serializing them with the column-mapping door tests (rather than
+/// letting the two collections run in parallel) removes a cross-collection temp-filesystem interleaving that
+/// once produced a one-off flake in a name-mode empty-overwriteSchema no-op assertion (#556 council:
+/// Reliability R2 defense-in-depth).
+/// </remarks>
+[Collection(ColumnMappingTestCollection.Name)]
 public sealed class DeltaWriteTargetTests : IDisposable
 {
     private readonly string _root;
@@ -150,6 +159,23 @@ public sealed class DeltaWriteTargetTests : IDisposable
         Assert.Equal(
             new[] { "EU", "US" },
             snapshot.ActiveFiles.Select(a => a.PartitionValues["region"]).OrderBy(v => v, StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public async Task Append_Empty_OnExistingTable_IsNoOp()
+    {
+        // #556: an empty append (no rows) to an existing table adds nothing — a benign no-op that creates no
+        // new version (Spark parity), mirroring DeltaTableWriter.CreateOrAppendAsync's 0-file skip.
+        using DeltaWriteTarget target = Target();
+        await target.AppendAsync(FlatSchema, Array.Empty<string>(), new[] { FlatBatch((1L, "alice")) });
+
+        DeltaWriteResult result = await target.AppendAsync(
+            FlatSchema, Array.Empty<string>(), Array.Empty<ColumnBatch>());
+
+        Assert.Equal(0L, result.Version);
+        Assert.Equal(0, result.FilesWritten);
+        Assert.Equal(0L, result.RowsWritten);
+        Assert.Equal(0L, (await LoadSnapshotAsync()).Version); // still v0 — no empty commit
     }
 
     // ---------------------------------------------------------------- static overwrite
