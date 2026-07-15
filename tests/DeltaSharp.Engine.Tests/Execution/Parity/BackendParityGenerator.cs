@@ -56,6 +56,7 @@ internal static class BackendParityGenerator
         new("i2", DataTypes.IntegerType, false),   // 10 (non-nullable: exercises the no-null fast path)
         new("sh0", DataTypes.ShortType, true),     // 11
         new("by0", DataTypes.ByteType, true),      // 12 (signed tinyint)
+        new("tsn0", DataTypes.TimestampNtzType, true), // 13 (timezone-less wall-clock, #558)
     ];
 
     /// <summary>Numeric, non-decimal column ordinals usable as arithmetic operands and comparison operands.</summary>
@@ -93,7 +94,9 @@ internal static class BackendParityGenerator
             {
                 0 => new ColumnReference(0, DataTypes.BooleanType, true),                       // b0
                 1 => Comparison(rng, GenComparable(rng, depth - 1), GenComparable(rng, depth - 1)), // numeric/decimal compare
-                2 => Comparison(rng, GenTemporal(rng), GenTemporal(rng)),                       // date/timestamp compare
+                2 => rng.NextBool()
+                    ? Comparison(rng, GenTemporal(rng), GenTemporal(rng))                       // date/timestamp (LTZ) compare
+                    : Comparison(rng, GenTemporalNtz(rng), GenTemporalNtz(rng)),                // timestamp_ntz compare
                 3 => new IsNullExpression(GenLeafForNullCheck(rng), negated: rng.NextBool()),   // is[not]null
                 _ => new CastExpression(GenNumeric(rng, depth - 1), DataTypes.BooleanType, AnsiMode.Legacy), // numeric -> bool
             };
@@ -140,20 +143,36 @@ internal static class BackendParityGenerator
     private static PhysicalExpression GenComparable(DeterministicRng rng, int depth) =>
         rng.Next(4) == 0 ? GenDecimalLeaf(rng) : GenNumeric(rng, depth);
 
-    private static PhysicalExpression GenLeafForNullCheck(DeterministicRng rng) => rng.Next(4) switch
+    private static PhysicalExpression GenLeafForNullCheck(DeterministicRng rng) => rng.Next(5) switch
     {
         0 => new ColumnReference(0, DataTypes.BooleanType, true),
         1 => GenNumeric(rng, depth: 1),
         2 => GenTemporal(rng),
+        3 => new ColumnReference(13, DataTypes.TimestampNtzType, true),
         _ => GenDecimalLeaf(rng),
     };
 
-    private static PhysicalExpression GenTemporal(DeterministicRng rng) => rng.Next(4) switch
+    // A date/timestamp (LTZ family) operand: a bare date/timestamp column, a date<->timestamp cast, or a
+    // timestamp_ntz cast INTO the LTZ family (ntz->timestamp / ntz->date). Every arm yields a date- or
+    // timestamp-typed value, all of which mix safely under the kernel's date-vs-timestamp promotion.
+    private static PhysicalExpression GenTemporal(DeterministicRng rng) => rng.Next(6) switch
     {
         0 => new ColumnReference(8, DataTypes.DateType, true),       // dt0
         1 => new ColumnReference(9, DataTypes.TimestampType, true),  // ts0
         2 => new CastExpression(new ColumnReference(8, DataTypes.DateType, true), DataTypes.TimestampType, AnsiMode.Legacy),
-        _ => new CastExpression(new ColumnReference(9, DataTypes.TimestampType, true), DataTypes.DateType, AnsiMode.Legacy),
+        3 => new CastExpression(new ColumnReference(9, DataTypes.TimestampType, true), DataTypes.DateType, AnsiMode.Legacy),
+        4 => new CastExpression(new ColumnReference(13, DataTypes.TimestampNtzType, true), DataTypes.TimestampType, AnsiMode.Legacy),
+        _ => new CastExpression(new ColumnReference(13, DataTypes.TimestampNtzType, true), DataTypes.DateType, AnsiMode.Legacy),
+    };
+
+    // A timestamp_ntz operand: a bare ntz column or a date/timestamp cast INTO timestamp_ntz. Every arm
+    // yields a timestamp_ntz value, so Comparison(GenTemporalNtz, GenTemporalNtz) is always ntz-vs-ntz — a
+    // raw date/timestamp-vs-ntz pair has no kernel promotion and is resolved by coercion, not this generator.
+    private static PhysicalExpression GenTemporalNtz(DeterministicRng rng) => rng.Next(3) switch
+    {
+        0 => new ColumnReference(13, DataTypes.TimestampNtzType, true), // tsn0
+        1 => new CastExpression(new ColumnReference(8, DataTypes.DateType, true), DataTypes.TimestampNtzType, AnsiMode.Legacy),
+        _ => new CastExpression(new ColumnReference(9, DataTypes.TimestampType, true), DataTypes.TimestampNtzType, AnsiMode.Legacy),
     };
 
     private static ColumnReference NumericColumn(DeterministicRng rng)
@@ -256,6 +275,9 @@ internal static class BackendParityGenerator
                 break;
             case TimestampType:
                 v.AppendValue(rng.NextLong(-2_000_000_000_000L, 2_000_000_000_000L)); // epoch micros
+                break;
+            case TimestampNtzType:
+                v.AppendValue(rng.NextLong(-2_000_000_000_000L, 2_000_000_000_000L)); // epoch micros (timezone-less wall-clock)
                 break;
             case DecimalType:
                 v.AppendValue(rng.NextLong(-99_999_999L, 99_999_999L)); // compact decimal(10,2) unscaled

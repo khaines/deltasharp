@@ -13,9 +13,13 @@ namespace DeltaSharp.Engine.Execution.Expressions;
 /// <remarks>
 /// v1 matrix: identity; the numeric/boolean core
 /// {boolean, byte, short, int, long, float, double, decimal} in all directions (boolean as 0/1, target
-/// boolean as <c>!= 0</c>); and <c>date↔timestamp</c>. Deferred to later stories (and rejected at build
-/// by <see cref="IsSupported"/>): any string/binary cast, numeric↔temporal beyond <c>date↔timestamp</c>,
-/// and <c>float/double→decimal</c>.
+/// boolean as <c>!= 0</c>); and the temporal casts <c>date↔timestamp</c>, <c>date↔timestamp_ntz</c>, and
+/// <c>timestamp↔timestamp_ntz</c>. The <c>timestamp_ntz</c> casts are <b>timezone-less</b> (#558): a
+/// <c>date→timestamp_ntz</c> is the midnight wall-clock instant and a <c>timestamp↔timestamp_ntz</c>
+/// reinterprets the same epoch-microsecond lane with no session-zone shift (DeltaSharp has no session
+/// zone, so the two directions are an identity on the stored long). Deferred to later stories (and
+/// rejected at build by <see cref="IsSupported"/>): any string/binary cast, numeric↔temporal, and
+/// <c>float/double→decimal</c>.
 /// </remarks>
 internal sealed class CastEvaluator : ExpressionEvaluator
 {
@@ -65,8 +69,9 @@ internal sealed class CastEvaluator : ExpressionEvaluator
             ByteType or ShortType or IntegerType or LongType => IsCore(source),
             FloatType or DoubleType => IsCore(source),
             DecimalType => source is BooleanType or ByteType or ShortType or IntegerType or LongType or DecimalType,
-            DateType => source is TimestampType,
-            TimestampType => source is DateType,
+            DateType => source is TimestampType or TimestampNtzType,
+            TimestampType => source is DateType or TimestampNtzType,
+            TimestampNtzType => source is DateType or TimestampType,
             _ => false,
         };
     }
@@ -148,11 +153,38 @@ internal sealed class CastEvaluator : ExpressionEvaluator
                 break;
 
             case DateType:
+                // Both timestamp and timestamp_ntz store an epoch-microsecond long; flooring to the day is
+                // identical for either source (there is no session zone), so the same read serves both.
                 AppendNullable(result, TemporalValues.TimestampToDate(ScalarReader.ReadInt64(child, i), _mode));
                 break;
 
             case TimestampType:
-                AppendNullable(result, TemporalValues.DateToTimestamp((int)ScalarReader.ReadInt64(child, i), _mode));
+                if (_source is TimestampNtzType)
+                {
+                    // timestamp_ntz -> timestamp reinterprets the same epoch-microsecond lane with no
+                    // session-zone shift (DeltaSharp has no session zone), so it is an identity on the long.
+                    result.AppendValue(ScalarReader.ReadInt64(child, i));
+                }
+                else
+                {
+                    AppendNullable(result, TemporalValues.DateToTimestamp((int)ScalarReader.ReadInt64(child, i), _mode));
+                }
+
+                break;
+
+            case TimestampNtzType:
+                if (_source is DateType)
+                {
+                    // date -> timestamp_ntz is the midnight wall-clock instant (same epoch math as
+                    // date->timestamp; a timezone-less value, never shifted).
+                    AppendNullable(result, TemporalValues.DateToTimestamp((int)ScalarReader.ReadInt64(child, i), _mode));
+                }
+                else
+                {
+                    // timestamp -> timestamp_ntz reinterprets the same epoch-microsecond lane with no shift.
+                    result.AppendValue(ScalarReader.ReadInt64(child, i));
+                }
+
                 break;
 
             default:

@@ -50,8 +50,7 @@ internal static class ArrowSchemaMapper
     private static DataType MapTimestamp(ArrowTypes.TimestampType timestamp)
     {
         // DeltaSharp v1 stores timestamps as microseconds since the epoch; any other Arrow unit would
-        // silently rescale, so it is an explicit gap (mirrors ArrowColumnVector.Wrap). The timezone
-        // string is not modeled by the v1 TimestampType (UTC-normalized instant) and is dropped.
+        // silently rescale, so it is an explicit gap (mirrors ArrowColumnVector.Wrap).
         if (timestamp.Unit != ArrowTypes.TimeUnit.Microsecond)
         {
             throw new UnsupportedTypeException(
@@ -59,7 +58,9 @@ internal static class ArrowSchemaMapper
                 + "only microsecond timestamps are supported.");
         }
 
-        return TimestampType.Instance;
+        // A null/empty zone is a timezone-less wall-clock (timestamp_ntz, #558); any concrete zone (e.g.
+        // "UTC") is a UTC-normalized instant (timestamp). The zone string itself is not otherwise modeled.
+        return string.IsNullOrEmpty(timestamp.Timezone) ? TimestampNtzType.Instance : TimestampType.Instance;
     }
 
     private static DecimalType MapDecimal(ArrowTypes.Decimal128Type decimal128)

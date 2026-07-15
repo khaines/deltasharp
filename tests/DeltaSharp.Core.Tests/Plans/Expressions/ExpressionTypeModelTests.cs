@@ -24,6 +24,7 @@ public class ExpressionTypeModelTests
         AssertLiteral(Literal.OfString("hi"), StringType.Instance, "hi");
         AssertLiteral(Literal.OfDate(19000), DateType.Instance, 19000);          // epoch-day (int)
         AssertLiteral(Literal.OfTimestamp(1_700_000_000_000_000L), TimestampType.Instance, 1_700_000_000_000_000L); // epoch-micros (long)
+        AssertLiteral(Literal.OfTimestampNtz(1_700_000_000_000_000L), TimestampNtzType.Instance, 1_700_000_000_000_000L); // wall-clock epoch-micros (long)
     }
 
     [Fact]

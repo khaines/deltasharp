@@ -209,10 +209,17 @@ but `Apply` rejects them so no truncated/wrapped value escapes (see deferrals be
 v1 fixes these and `TemporalValues` enforces them exactly (integer arithmetic, no rounding):
 
 - **`timestamp`** = UTC-normalized **microseconds** since epoch; **no session time zone** in v1.
+- **`timestamp_ntz`** = a **timezone-less wall-clock** microsecond value (same epoch-micros `long`
+  lane as `timestamp`), **never shifted by any time zone** (#533/#558). There is no session offset,
+  so authoring is wall-clock-as-is: `CreateDataFrame` stores a CLR `DateTime` by its raw ticks (no
+  `Local→UTC`, unlike `timestamp`), it materializes back as `DateTimeKind.Unspecified`, and it maps
+  to an Arrow micros timestamp with **`timezone=null`** (a concrete zone such as `"UTC"` is
+  `timestamp`). `date↔timestamp_ntz` uses the same integer epoch math as `date↔timestamp`, and
+  `timestamp↔timestamp_ntz` reinterprets the same stored `long` (identity, round-trip-safe) because
+  v1 has no session zone.
 - **`date`** = UTC **days** since epoch. `date→timestamp` is UTC midnight (`day × 86_400_000_000`);
   `timestamp→date` floors toward −∞. Comparisons are integer compares in those units.
-- Bounds: `0001-01-01` … `9999-12-31` (`MinEpochDay/Micros`, `MaxEpochDay/Micros`). The
-  `TimestampNtz` variant remains deferred (EPIC-02 open question).
+- Bounds: `0001-01-01` … `9999-12-31` (`MinEpochDay/Micros`, `MaxEpochDay/Micros`).
 
 ### Nested coercion errors + null propagation (AC4/AC5)
 
@@ -225,11 +232,12 @@ The **null type widens to any peer** and every coercion-sensitive op propagates 
 
 - **In scope:** the type matrix above; equality/validation/serialization; the physical-layout
   query; coercion/decimal/timestamp/ANSI rules (above, STORY-02.5.2).
-- **Deferred (tracked elsewhere):** a session-local **`TimestampNtz`** variant (EPIC-02 open
-  question); richer **typed metadata** for Delta-log interop (v1 is string-valued; tracked in
-  **#330**); decimal **divide/modulo value rounding** — result *types* are defined now and
-  scale-reducing casts already round HALF_UP, but quotient/remainder rounding stays deferred.
-  `TimestampType` is a UTC-normalized instant (microseconds since epoch).
+- **Deferred (tracked elsewhere):** richer **typed metadata** for Delta-log interop (v1 is
+  string-valued; tracked in **#330**); decimal **divide/modulo value rounding** — result *types* are
+  defined now and scale-reducing casts already round HALF_UP, but quotient/remainder rounding stays
+  deferred. `TimestampType` is a UTC-normalized instant (microseconds since epoch); `TimestampNtzType`
+  is its timezone-less wall-clock peer (#533/#558) — temporal **function-library** breadth over
+  `timestamp_ntz` (e.g. `date_add`/`date_trunc`) is the remaining follow-up.
 
 ## References
 

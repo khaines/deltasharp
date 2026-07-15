@@ -3,6 +3,7 @@ using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Engine.Columnar.Arrow;
 using DeltaSharp.Types;
 using Xunit;
+using ArrowTimestampType = Apache.Arrow.Types.TimestampType;
 using ArrowTimeUnit = Apache.Arrow.Types.TimeUnit;
 using Decimal128Type = Apache.Arrow.Types.Decimal128Type;
 
@@ -116,10 +117,21 @@ public class ArrowColumnVectorTests
     }
 
     [Fact]
-    public void Wrap_MicrosecondTimestamp_MapsToTimestampType()
+    public void Wrap_MicrosecondTimestamp_WithZone_MapsToTimestampType()
     {
-        var arrow = new TimestampArray.Builder(ArrowTimeUnit.Microsecond).Append(DateTimeOffset.UnixEpoch).Build();
+        // A concrete Arrow zone (e.g. "UTC") marks a UTC-normalized instant -> timestamp (LTZ).
+        var arrow = new TimestampArray.Builder(new ArrowTimestampType(ArrowTimeUnit.Microsecond, "UTC"))
+            .Append(DateTimeOffset.UnixEpoch).Build();
         Assert.Equal(TimestampType.Instance, ArrowColumnVector.Wrap(arrow).Type);
+    }
+
+    [Fact]
+    public void Wrap_MicrosecondTimestamp_NoTimezone_MapsToTimestampNtz()
+    {
+        // A null/empty Arrow zone marks a timezone-less wall-clock -> timestamp_ntz (#558). The default
+        // TimestampArray.Builder leaves the zone null.
+        var arrow = new TimestampArray.Builder(ArrowTimeUnit.Microsecond).Append(DateTimeOffset.UnixEpoch).Build();
+        Assert.Equal(TimestampNtzType.Instance, ArrowColumnVector.Wrap(arrow).Type);
     }
 
     [Fact]

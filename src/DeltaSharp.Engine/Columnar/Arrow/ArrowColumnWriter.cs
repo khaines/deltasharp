@@ -24,6 +24,11 @@ internal static class ArrowColumnWriter
     private static readonly ArrowTypes.TimestampType TimestampMicrosUtc =
         new(ArrowTypes.TimeUnit.Microsecond, "UTC");
 
+    // timestamp_ntz is timezone-LESS (#558): it exports as an Arrow micros timestamp with a NULL zone,
+    // the round-trip inverse of ArrowColumnVector.Wrap/ArrowSchemaMapper (null/empty zone -> timestamp_ntz).
+    private static readonly ArrowTypes.TimestampType TimestampMicrosNtz =
+        new(ArrowTypes.TimeUnit.Microsecond, (string?)null);
+
     /// <summary>Builds the Arrow array for the logical rows of <paramref name="column"/>.</summary>
     /// <exception cref="UnsupportedTypeException">
     /// The column's logical type has no v1 Arrow export path (a nested column, which the converter
@@ -39,6 +44,7 @@ internal static class ArrowColumnWriter
             DateType => BuildFixed<int>(column, ArrowTypes.Date32Type.Default),
             LongType => BuildFixed<long>(column, ArrowTypes.Int64Type.Default),
             TimestampType => BuildFixed<long>(column, TimestampMicrosUtc),
+            TimestampNtzType => BuildFixed<long>(column, TimestampMicrosNtz),
             FloatType => BuildFixed<float>(column, ArrowTypes.FloatType.Default),
             DoubleType => BuildFixed<double>(column, ArrowTypes.DoubleType.Default),
             DecimalType d => BuildDecimal(column, d),

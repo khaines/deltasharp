@@ -53,6 +53,8 @@ public class InterpretedExpressionEvaluatorTests
 
     private static ColumnVector TimestampCol(params long?[] values) => Build(DataTypes.TimestampType, values, (v, x) => v.AppendValue(x));
 
+    private static ColumnVector TimestampNtzCol(params long?[] values) => Build(DataTypes.TimestampNtzType, values, (v, x) => v.AppendValue(x));
+
     // Signed tinyint: stored as a CLR byte but interpreted as sbyte (Spark tinyint is signed).
     private static ColumnVector ByteCol(params int?[] signedValues)
         => Build(DataTypes.ByteType, signedValues, (v, x) => v.AppendValue(unchecked((byte)(sbyte)x)));
@@ -592,6 +594,77 @@ public class InterpretedExpressionEvaluatorTests
         ColumnBatch tsBatch = Batch(tsSchema, TimestampCol((epochDay * microsPerDay) + 500));
         ColumnVector toDate = Eval(new CastExpression(Ref(0, DataTypes.TimestampType), DataTypes.DateType), tsSchema, tsBatch);
         Assert.Equal(new int?[] { epochDay }, Ints(toDate)); // floor to whole days
+    }
+
+    [Fact]
+    public void Cast_DateToTimestampNtz_IsMidnightWallClock()
+    {
+        // date -> timestamp_ntz is the midnight WALL-CLOCK instant: identical epoch math to date->timestamp
+        // (micros/day), but a timezone-LESS value that is never shifted by a session/host zone (#558).
+        const long microsPerDay = 86_400_000_000L;
+        const int epochDay = 19_000; // ~2022, well inside [Min,Max]EpochDay
+
+        StructType schema = Schema(F("d", DataTypes.DateType, false));
+        ColumnBatch batch = Batch(schema, DateCol(epochDay));
+        ColumnVector toNtz = Eval(new CastExpression(Ref(0, DataTypes.DateType), DataTypes.TimestampNtzType), schema, batch);
+
+        Assert.Equal(DataTypes.TimestampNtzType, toNtz.Type);
+        Assert.Equal(new long?[] { epochDay * microsPerDay }, Longs(toNtz));
+    }
+
+    [Fact]
+    public void Cast_TimestampNtzToDate_FloorsToWholeDays()
+    {
+        const long microsPerDay = 86_400_000_000L;
+        const int epochDay = 19_000;
+
+        StructType schema = Schema(F("n", DataTypes.TimestampNtzType, false));
+        ColumnBatch batch = Batch(schema, TimestampNtzCol((epochDay * microsPerDay) + 500));
+        ColumnVector toDate = Eval(new CastExpression(Ref(0, DataTypes.TimestampNtzType), DataTypes.DateType), schema, batch);
+
+        Assert.Equal(DataTypes.DateType, toDate.Type);
+        Assert.Equal(new int?[] { epochDay }, Ints(toDate)); // floor to whole days
+    }
+
+    [Fact]
+    public void Cast_TimestampTimestampNtz_IsIdentityOnTheLong_AndRoundTrips()
+    {
+        // timestamp <-> timestamp_ntz reinterprets the SAME epoch-microsecond lane with NO session-zone
+        // shift (DeltaSharp has no session zone), so the stored long is preserved bit-for-bit in both
+        // directions and a ts -> ntz -> ts round-trip is the identity (#558). Endpoints include the epoch,
+        // a modern instant, and the [Min,Max] supported bounds plus a null.
+        var samples = new long?[] { 0L, 1_700_000_000_000_000L, -62_135_596_800_000_000L, 253_402_300_799_999_999L, null };
+
+        StructType tsSchema = Schema(F("t", DataTypes.TimestampType, true));
+        ColumnBatch tsBatch = Batch(tsSchema, TimestampCol(samples));
+        ColumnVector toNtz = Eval(new CastExpression(Ref(0, DataTypes.TimestampType, true), DataTypes.TimestampNtzType), tsSchema, tsBatch);
+        Assert.Equal(DataTypes.TimestampNtzType, toNtz.Type);
+        Assert.Equal(samples, Longs(toNtz));
+
+        StructType ntzSchema = Schema(F("n", DataTypes.TimestampNtzType, true));
+        ColumnBatch ntzBatch = Batch(ntzSchema, TimestampNtzCol(samples));
+        ColumnVector backToTs = Eval(new CastExpression(Ref(0, DataTypes.TimestampNtzType, true), DataTypes.TimestampType), ntzSchema, ntzBatch);
+        Assert.Equal(DataTypes.TimestampType, backToTs.Type);
+        Assert.Equal(samples, Longs(backToTs));
+
+        // The chained round-trip cast(cast(t AS timestamp_ntz) AS timestamp) reproduces the input exactly.
+        var roundTrip = new CastExpression(
+            new CastExpression(Ref(0, DataTypes.TimestampType, true), DataTypes.TimestampNtzType), DataTypes.TimestampType);
+        Assert.Equal(samples, Longs(Eval(roundTrip, tsSchema, tsBatch)));
+    }
+
+    [Fact]
+    public void Literal_TimestampNtz_BroadcastsWallClockMicros()
+    {
+        // #558: Literal.OfTimestampNtz broadcasts a timezone-less wall-clock micros constant as a
+        // timestamp_ntz column (mirrors Literal.OfTimestamp, distinct logical type).
+        StructType schema = Schema(F("a", DataTypes.IntegerType, false));
+        ColumnBatch batch = Batch(schema, IntCol(10, 20, 30));
+
+        ColumnVector broadcast = Eval(Literal.OfTimestampNtz(1_700_000_000_000_000L), schema, batch);
+
+        Assert.Equal(DataTypes.TimestampNtzType, broadcast.Type);
+        Assert.Equal(new long?[] { 1_700_000_000_000_000L, 1_700_000_000_000_000L, 1_700_000_000_000_000L }, Longs(broadcast));
     }
 
     [Fact]
