@@ -367,7 +367,14 @@ internal sealed class DeltaOptimize
             return BuildDryRunOrEmptyResult(readSnapshot.Version, dryRun, target, partitionColumns, groups);
         }
 
-        StructType dataSchema = BuildDataSchema(readSnapshot.Schema, partitionColumns);
+        // Fold onto the shared column-mapping projection seam (#545). OPTIMIZE reads and rewrites RAW Parquet
+        // and does not (yet) support column mapping, so it resolves physical names under ColumnMappingMode.None
+        // — where physical name == logical name, making ResolvePhysicalNames an identity and BuildDataSchema
+        // behavior-identical to the former DeltaOptimize-local copy. A name-mode table's data files carry
+        // physical (col-<uuid>) names absent from this logical data schema, so such an input still fails closed
+        // on read (never silently mis-compacted); name-mode-aware OPTIMIZE is a separate concern.
+        string[] physicalNames = ColumnMappingProjection.ResolvePhysicalNames(readSnapshot.Schema, ColumnMappingMode.None);
+        StructType dataSchema = ColumnMappingProjection.BuildDataSchema(readSnapshot.Schema, physicalNames, partitionColumns);
         long timestamp = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
 
         // Read-side type-widening promotion gate (#495): a narrow-physical input file is promoted into the
@@ -649,29 +656,6 @@ internal sealed class DeltaOptimize
             ExtendedFileMetadata: true,
             input.PartitionValues,
             input.Size);
-
-    // The table's DATA schema: the full schema minus the partition columns (Delta does not store partition
-    // columns in the Parquet data files — their values live on the add action). For an unpartitioned table
-    // this is the full schema.
-    private static StructType BuildDataSchema(StructType tableSchema, ImmutableArray<string> partitionColumns)
-    {
-        if (partitionColumns.IsDefaultOrEmpty)
-        {
-            return tableSchema;
-        }
-
-        var partitionSet = partitionColumns.ToImmutableHashSet(StringComparer.Ordinal);
-        var dataFields = new List<StructField>(tableSchema.Count);
-        foreach (StructField field in tableSchema)
-        {
-            if (!partitionSet.Contains(field.Name))
-            {
-                dataFields.Add(field);
-            }
-        }
-
-        return new StructType(dataFields);
-    }
 
     // The canonical partition values for a compacted output: a value (possibly null) for EVERY partition
     // column, so the add satisfies the partition-coverage contract. All inputs in a group share the same
