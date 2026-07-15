@@ -53,6 +53,7 @@ internal static class ArrowConverterTestSupport
                     break;
                 case LongType:
                 case TimestampType:
+                case TimestampNtzType:
                     Assert.Equal(expected.GetValue<long>(i), actual.GetValue<long>(i));
                     break;
                 case FloatType:

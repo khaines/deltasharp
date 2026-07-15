@@ -221,6 +221,7 @@ internal sealed class PhysicalExpressionTranslator
             DoubleType => EngineLiteral.OfDouble((double)value),
             DateType => EngineLiteral.OfDate((int)value),
             TimestampType => EngineLiteral.OfTimestamp((long)value),
+            TimestampNtzType => EngineLiteral.OfTimestampNtz((long)value),
             StringType => EngineLiteral.OfString((string)value),
             BinaryType => EngineLiteral.OfBinary((byte[])value),
             DecimalType decimalType => EngineLiteral.OfDecimal((Int128)value, decimalType),

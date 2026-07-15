@@ -259,7 +259,7 @@ internal static class BackendParityOracle
         ByteType => a.GetValue<byte>(i) == b.GetValue<byte>(i),
         ShortType => a.GetValue<short>(i) == b.GetValue<short>(i),
         IntegerType or DateType => a.GetValue<int>(i) == b.GetValue<int>(i),
-        LongType or TimestampType => a.GetValue<long>(i) == b.GetValue<long>(i),
+        LongType or TimestampType or TimestampNtzType => a.GetValue<long>(i) == b.GetValue<long>(i),
         // Bit-exact so -0.0 and NaN payloads are held identical, not merely numerically equal.
         FloatType => BitConverter.SingleToInt32Bits(a.GetValue<float>(i)) == BitConverter.SingleToInt32Bits(b.GetValue<float>(i)),
         DoubleType => BitConverter.DoubleToInt64Bits(a.GetValue<double>(i)) == BitConverter.DoubleToInt64Bits(b.GetValue<double>(i)),
@@ -291,7 +291,7 @@ internal static class BackendParityOracle
             ByteType => ((sbyte)v.GetValue<byte>(i)).ToString(CultureInfo.InvariantCulture),
             ShortType => v.GetValue<short>(i).ToString(CultureInfo.InvariantCulture),
             IntegerType or DateType => v.GetValue<int>(i).ToString(CultureInfo.InvariantCulture),
-            LongType or TimestampType => v.GetValue<long>(i).ToString(CultureInfo.InvariantCulture),
+            LongType or TimestampType or TimestampNtzType => v.GetValue<long>(i).ToString(CultureInfo.InvariantCulture),
             FloatType => $"{v.GetValue<float>(i):R} (bits 0x{BitConverter.SingleToInt32Bits(v.GetValue<float>(i)):X8})",
             DoubleType => $"{v.GetValue<double>(i):R} (bits 0x{BitConverter.DoubleToInt64Bits(v.GetValue<double>(i)):X16})",
             DecimalType d => d.IsCompact

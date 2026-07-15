@@ -106,7 +106,7 @@ public sealed class CompiledExpressionFusionTests
                 case IntegerType or DateType:
                     Assert.Equal(expected.GetValue<int>(i), actual.GetValue<int>(i));
                     break;
-                case LongType or TimestampType:
+                case LongType or TimestampType or TimestampNtzType:
                     Assert.Equal(expected.GetValue<long>(i), actual.GetValue<long>(i));
                     break;
                 case FloatType:
@@ -886,6 +886,23 @@ public sealed class CompiledExpressionFusionTests
             Add("cast_date_to_timestamp", new CastExpression(Ref(0, DataTypes.DateType, true), DataTypes.TimestampType), schema, batch);
             Add("cast_timestamp_to_date", new CastExpression(Ref(1, DataTypes.TimestampType, true), DataTypes.DateType), schema, batch);
         }
+        {
+            // timestamp_ntz casts (#558): timezone-less, so date->ntz is midnight wall-clock and
+            // timestamp<->ntz is an identity on the epoch-microsecond lane. Both tiers must agree.
+            StructType schema = Schema(
+                F("d", DataTypes.DateType, true),
+                F("t", DataTypes.TimestampType, true),
+                F("n", DataTypes.TimestampNtzType, true));
+            ColumnBatch batch = Batch(
+                schema,
+                DateCol(1, 2, null),
+                TimestampCol(86_400_000_000L, 0L, null),
+                TimestampNtzCol(86_400_000_500L, -500L, null));
+            Add("cast_date_to_timestamp_ntz", new CastExpression(Ref(0, DataTypes.DateType, true), DataTypes.TimestampNtzType), schema, batch);
+            Add("cast_timestamp_ntz_to_date", new CastExpression(Ref(2, DataTypes.TimestampNtzType, true), DataTypes.DateType), schema, batch);
+            Add("cast_timestamp_to_timestamp_ntz", new CastExpression(Ref(1, DataTypes.TimestampType, true), DataTypes.TimestampNtzType), schema, batch);
+            Add("cast_timestamp_ntz_to_timestamp", new CastExpression(Ref(2, DataTypes.TimestampNtzType, true), DataTypes.TimestampType), schema, batch);
+        }
 
         // ---- null-check (IsNull / IsNotNull) ----
         {
@@ -957,6 +974,8 @@ public sealed class CompiledExpressionFusionTests
     private static ColumnVector DateCol(params int?[] values) => BuildCol(DataTypes.DateType, values, static (v, x) => v.AppendValue(x));
 
     private static ColumnVector TimestampCol(params long?[] values) => BuildCol(DataTypes.TimestampType, values, static (v, x) => v.AppendValue(x));
+
+    private static ColumnVector TimestampNtzCol(params long?[] values) => BuildCol(DataTypes.TimestampNtzType, values, static (v, x) => v.AppendValue(x));
 
     // Signed tinyint: stored as a CLR byte but interpreted as sbyte (Spark tinyint is signed).
     private static ColumnVector ByteCol(params int?[] signedValues)

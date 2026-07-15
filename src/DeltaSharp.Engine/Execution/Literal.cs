@@ -13,7 +13,7 @@ namespace DeltaSharp.Engine.Execution;
 /// <remarks>
 /// The value is stored once in its natural CLR storage shape for the logical type (for example
 /// <see cref="int"/> for <see cref="IntegerType"/>/<see cref="DateType"/>, <see cref="long"/> for
-/// <see cref="LongType"/>/<see cref="TimestampType"/>, an unscaled <see cref="Int128"/> for
+/// <see cref="LongType"/>/<see cref="TimestampType"/>/<see cref="TimestampNtzType"/>, an unscaled <see cref="Int128"/> for
 /// <see cref="DecimalType"/>, a UTF-8 <see cref="string"/> for <see cref="StringType"/>). It is read
 /// exactly once per batch and broadcast without per-row boxing, so building the node and holding the
 /// value performs no row work (the lazy/eager invariant). The node is immutable.
@@ -83,6 +83,12 @@ public sealed class Literal : PhysicalExpression
 
     /// <summary>A <see cref="TimestampType"/> literal as a UTC microsecond instant.</summary>
     public static Literal OfTimestamp(long epochMicros) => new(TimestampType.Instance, epochMicros, false);
+
+    /// <summary>
+    /// A <see cref="TimestampNtzType"/> literal as a timezone-less wall-clock microsecond value. Unlike
+    /// <see cref="OfTimestamp"/>, this instant is never shifted by a time zone (#558).
+    /// </summary>
+    public static Literal OfTimestampNtz(long epochMicros) => new(TimestampNtzType.Instance, epochMicros, false);
 
     /// <summary>
     /// A <see cref="DecimalType"/> literal from an unscaled mantissa interpreted at

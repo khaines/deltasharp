@@ -91,6 +91,11 @@ internal sealed class Literal : Expression
     public static Literal OfTimestamp(long epochMicros) =>
         new(TimestampType.Instance, epochMicros, false);
 
+    /// <summary>A <see cref="TimestampNtzType"/> literal as a timezone-less wall-clock microsecond value
+    /// (never shifted by a time zone, #558).</summary>
+    public static Literal OfTimestampNtz(long epochMicros) =>
+        new(TimestampNtzType.Instance, epochMicros, false);
+
     /// <summary>A <see cref="DecimalType"/> literal from an unscaled mantissa at
     /// <paramref name="type"/>'s scale.</summary>
     /// <exception cref="ArgumentNullException"><paramref name="type"/> is null.</exception>

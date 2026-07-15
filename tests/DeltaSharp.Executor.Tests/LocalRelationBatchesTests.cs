@@ -120,4 +120,24 @@ public sealed class LocalRelationBatchesTests
         Row row = Assert.Single(materialized);
         Assert.True(row.IsNullAt(0));
     }
+
+    [Fact]
+    public void TimestampNtz_EncodesWallClockAsIs_AndRoundTripsUnshifted()
+    {
+        // #558: the createDataFrame encode path (EncodeTimestampNtz) stores a timestamp_ntz DateTime as its
+        // wall-clock value with NO Local->UTC shift, and it round-trips (via RowMaterializer.ReadTimestampNtz)
+        // as the SAME wall-clock, tagged Unspecified. This is host-independent (timestamp_ntz never touches a
+        // time zone); the forced-TZ contrast against TimestampType lives in the serialized regression test.
+        StructType schema = Schema(new StructField("n", TimestampNtzType.Instance, nullable: false));
+        var wall = new DateTime(2024, 6, 15, 13, 30, 45, DateTimeKind.Unspecified);
+        var rows = new[] { new Row(schema, wall) };
+
+        IReadOnlyList<Row> materialized = RowMaterializer.Materialize(
+            new BatchResult(schema, LocalRelationBatches.Build(schema, rows)), maxRows: null, maxBytes: null, default);
+
+        Row row = Assert.Single(materialized);
+        DateTime got = row.GetAs<DateTime>(0);
+        Assert.Equal(wall, got);
+        Assert.Equal(DateTimeKind.Unspecified, got.Kind);
+    }
 }

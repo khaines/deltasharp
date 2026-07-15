@@ -629,13 +629,15 @@ internal static class ComparisonKernels
         }
 
         // A date paired with a timezone-less timestamp_ntz would need a distinct promotion (epoch-day → ntz
-        // epoch-micros) this vector kernel does not implement; fail closed rather than silently comparing
-        // epoch-days against micros. Query-authoring date↔timestamp_ntz coercion is deferred (#558).
+        // epoch-micros) this vector kernel does not implement. Query-authoring date-vs-timestamp_ntz
+        // comparisons are instead resolved by analyzer coercion, which inserts a cast(date → timestamp_ntz)
+        // so both operands reach the kernel as timestamp_ntz (#558); this raw mixed pair therefore stays a
+        // fail-closed guard rather than silently comparing epoch-days against micros.
         if ((left is DateType && right is TimestampNtzType) || (left is TimestampNtzType && right is DateType))
         {
             throw new NotSupportedException(
                 $"Comparison kernel does not support mixed temporal operands '{left.SimpleString}' and "
-                + $"'{right.SimpleString}' (date↔timestamp_ntz promotion is deferred, #558).");
+                + $"'{right.SimpleString}' (date↔timestamp_ntz is resolved via cast coercion, #558).");
         }
 
         return CmpKind.Int64;

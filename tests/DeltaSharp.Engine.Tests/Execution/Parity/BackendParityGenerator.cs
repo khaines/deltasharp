@@ -7,7 +7,8 @@ namespace DeltaSharp.Engine.Tests.Execution.Parity;
 /// <summary>
 /// A reproducible parity case: the fixed input <see cref="Schema"/>, a seeded <see cref="Batch"/>, and a
 /// seeded <see cref="Expression"/> tree to differentially evaluate. <see cref="RootForm"/> records
-/// whether the root produced a boolean predicate or a numeric value (for diagnostics / coverage).
+/// whether the root produced a boolean predicate, a numeric value, or a timestamp_ntz cast value (for
+/// diagnostics / coverage).
 /// </summary>
 internal sealed record GeneratedCase(
     StructType Schema, ColumnBatch Batch, PhysicalExpression Expression, string RootForm, int Rows);
@@ -56,6 +57,7 @@ internal static class BackendParityGenerator
         new("i2", DataTypes.IntegerType, false),   // 10 (non-nullable: exercises the no-null fast path)
         new("sh0", DataTypes.ShortType, true),     // 11
         new("by0", DataTypes.ByteType, true),      // 12 (signed tinyint)
+        new("tsn0", DataTypes.TimestampNtzType, true), // 13 (timezone-less wall-clock, #558)
     ];
 
     /// <summary>Numeric, non-decimal column ordinals usable as arithmetic operands and comparison operands.</summary>
@@ -77,11 +79,29 @@ internal static class BackendParityGenerator
         ColumnBatch batch = BuildBatch(rng, rows);
 
         // Draw the expression AFTER the batch so the row count does not perturb the tree shape's seed
-        // stream in a way that hides bugs; both are pure functions of the same seed regardless.
-        bool predicate = rng.NextBool();
-        PhysicalExpression expr = predicate ? GenBoolean(rng, depth: 3) : GenNumeric(rng, depth: 3);
-        return new GeneratedCase(Schema, batch, expr, predicate ? "predicate(boolean)" : "value(numeric)", rows);
+        // stream in a way that hides bugs; both are pure functions of the same seed regardless. The root
+        // is one of three value-carrying forms so the differential pins BOTH a boolean predicate, a
+        // numeric value, AND a bare timestamp_ntz cast VALUE (the last is the #558 seam: a uniform +N
+        // epoch-micros offset in a compiled ntz cast is invisible through an order-preserving comparison
+        // but is caught element-wise when the ntz cast is projected as a top-level output).
+        (PhysicalExpression expr, string rootForm) = rng.Next(3) switch
+        {
+            0 => (GenBoolean(rng, depth: 3), "predicate(boolean)"),
+            1 => (GenNumeric(rng, depth: 3), "value(numeric)"),
+            _ => (GenTemporalNtzValue(rng), "value(timestamp_ntz)"),
+        };
+        return new GeneratedCase(Schema, batch, expr, rootForm, rows);
     }
+
+    // A timestamp_ntz cast projected as a TOP-LEVEL output VALUE — the ntz long is compared element-wise
+    // by the differential oracle, NOT sunk into an order-preserving Comparison/IsNull. This is the #558
+    // correctness seam: a uniform +N epoch-micros offset in a compiled ntz cast is invisible through
+    // </=/> (it preserves ordering and equality against another equally-offset operand) but shows up
+    // immediately as a per-row value mismatch here. Both the date->ntz (midnight wall-clock) and the
+    // timestamp->ntz (identity on the epoch-micros lane) casts are drawn so both lowering arms are pinned.
+    private static PhysicalExpression GenTemporalNtzValue(DeterministicRng rng) => rng.NextBool()
+        ? new CastExpression(new ColumnReference(9, DataTypes.TimestampType, true), DataTypes.TimestampNtzType, AnsiMode.Legacy)
+        : new CastExpression(new ColumnReference(8, DataTypes.DateType, true), DataTypes.TimestampNtzType, AnsiMode.Legacy);
 
     // ===== expression grammar (type-directed; every tree satisfies CompiledExpressionEvaluators.CanFuse) =====
 
@@ -93,7 +113,9 @@ internal static class BackendParityGenerator
             {
                 0 => new ColumnReference(0, DataTypes.BooleanType, true),                       // b0
                 1 => Comparison(rng, GenComparable(rng, depth - 1), GenComparable(rng, depth - 1)), // numeric/decimal compare
-                2 => Comparison(rng, GenTemporal(rng), GenTemporal(rng)),                       // date/timestamp compare
+                2 => rng.NextBool()
+                    ? Comparison(rng, GenTemporal(rng), GenTemporal(rng))                       // date/timestamp (LTZ) compare
+                    : Comparison(rng, GenTemporalNtz(rng), GenTemporalNtz(rng)),                // timestamp_ntz compare
                 3 => new IsNullExpression(GenLeafForNullCheck(rng), negated: rng.NextBool()),   // is[not]null
                 _ => new CastExpression(GenNumeric(rng, depth - 1), DataTypes.BooleanType, AnsiMode.Legacy), // numeric -> bool
             };
@@ -140,20 +162,36 @@ internal static class BackendParityGenerator
     private static PhysicalExpression GenComparable(DeterministicRng rng, int depth) =>
         rng.Next(4) == 0 ? GenDecimalLeaf(rng) : GenNumeric(rng, depth);
 
-    private static PhysicalExpression GenLeafForNullCheck(DeterministicRng rng) => rng.Next(4) switch
+    private static PhysicalExpression GenLeafForNullCheck(DeterministicRng rng) => rng.Next(5) switch
     {
         0 => new ColumnReference(0, DataTypes.BooleanType, true),
         1 => GenNumeric(rng, depth: 1),
         2 => GenTemporal(rng),
+        3 => new ColumnReference(13, DataTypes.TimestampNtzType, true),
         _ => GenDecimalLeaf(rng),
     };
 
-    private static PhysicalExpression GenTemporal(DeterministicRng rng) => rng.Next(4) switch
+    // A date/timestamp (LTZ family) operand: a bare date/timestamp column, a date<->timestamp cast, or a
+    // timestamp_ntz cast INTO the LTZ family (ntz->timestamp / ntz->date). Every arm yields a date- or
+    // timestamp-typed value, all of which mix safely under the kernel's date-vs-timestamp promotion.
+    private static PhysicalExpression GenTemporal(DeterministicRng rng) => rng.Next(6) switch
     {
         0 => new ColumnReference(8, DataTypes.DateType, true),       // dt0
         1 => new ColumnReference(9, DataTypes.TimestampType, true),  // ts0
         2 => new CastExpression(new ColumnReference(8, DataTypes.DateType, true), DataTypes.TimestampType, AnsiMode.Legacy),
-        _ => new CastExpression(new ColumnReference(9, DataTypes.TimestampType, true), DataTypes.DateType, AnsiMode.Legacy),
+        3 => new CastExpression(new ColumnReference(9, DataTypes.TimestampType, true), DataTypes.DateType, AnsiMode.Legacy),
+        4 => new CastExpression(new ColumnReference(13, DataTypes.TimestampNtzType, true), DataTypes.TimestampType, AnsiMode.Legacy),
+        _ => new CastExpression(new ColumnReference(13, DataTypes.TimestampNtzType, true), DataTypes.DateType, AnsiMode.Legacy),
+    };
+
+    // A timestamp_ntz operand: a bare ntz column or a date/timestamp cast INTO timestamp_ntz. Every arm
+    // yields a timestamp_ntz value, so Comparison(GenTemporalNtz, GenTemporalNtz) is always ntz-vs-ntz — a
+    // raw date/timestamp-vs-ntz pair has no kernel promotion and is resolved by coercion, not this generator.
+    private static PhysicalExpression GenTemporalNtz(DeterministicRng rng) => rng.Next(3) switch
+    {
+        0 => new ColumnReference(13, DataTypes.TimestampNtzType, true), // tsn0
+        1 => new CastExpression(new ColumnReference(8, DataTypes.DateType, true), DataTypes.TimestampNtzType, AnsiMode.Legacy),
+        _ => new CastExpression(new ColumnReference(9, DataTypes.TimestampType, true), DataTypes.TimestampNtzType, AnsiMode.Legacy),
     };
 
     private static ColumnReference NumericColumn(DeterministicRng rng)
@@ -256,6 +294,9 @@ internal static class BackendParityGenerator
                 break;
             case TimestampType:
                 v.AppendValue(rng.NextLong(-2_000_000_000_000L, 2_000_000_000_000L)); // epoch micros
+                break;
+            case TimestampNtzType:
+                v.AppendValue(rng.NextLong(-2_000_000_000_000L, 2_000_000_000_000L)); // epoch micros (timezone-less wall-clock)
                 break;
             case DecimalType:
                 v.AppendValue(rng.NextLong(-99_999_999L, 99_999_999L)); // compact decimal(10,2) unscaled

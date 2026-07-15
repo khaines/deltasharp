@@ -280,6 +280,11 @@ internal static class CompiledExpressionLowering
         return new Lowered(isNull, value, node.Type);
     }
 
+    /// <summary>
+    /// Lowers a fused cast. The <c>timestamp ↔ timestamp_ntz</c> arms are an identity on the
+    /// epoch-microsecond long under the <see cref="TemporalValues.SessionZoneIsUtc"/> assumption (no
+    /// session-zone shift); mirrors <see cref="CastEvaluator"/> so both backends agree bit-for-bit.
+    /// </summary>
     private static Expression ComputeCast(CastExpression node, Lowered child, ParameterExpression isNull, ParameterExpression value)
     {
         DataType source = node.Child.Type;
@@ -318,6 +323,8 @@ internal static class CompiledExpressionLowering
 
             case DateType:
                 {
+                    // Both timestamp and timestamp_ntz store an epoch-microsecond long; flooring to the day
+                    // is identical for either source (there is no session zone).
                     Expression call = Expression.Call(
                         TimestampToDateMethod, Expression.Convert(AsInt64(child), typeof(long?)), Expression.Constant(node.Mode));
                     return FallibleAssign(
@@ -326,19 +333,36 @@ internal static class CompiledExpressionLowering
                 }
 
             case TimestampType:
-                {
-                    Expression call = Expression.Call(
-                        DateToTimestampMethod,
-                        Expression.Convert(Expression.Convert(AsInt64(child), typeof(int)), typeof(int?)),
-                        Expression.Constant(node.Mode));
-                    return FallibleAssign(
-                        call, typeof(long?), CompiledScalarOps.HasValueInt64Method, CompiledScalarOps.UnwrapInt64Method,
-                        unwrapped => unwrapped, isNull, value);
-                }
+                // SESSION-ZONE-ASSUMPTION (TemporalValues.SessionZoneIsUtc): timestamp_ntz -> timestamp
+                // reinterprets the same epoch-microsecond lane with no session-zone shift (identity on the
+                // long); date -> timestamp is the midnight instant.
+                return source is TimestampNtzType
+                    ? Expression.Assign(value, AsInt64(child))
+                    : DateToTimestampAssign(node, child, isNull, value);
+
+            case TimestampNtzType:
+                // date -> timestamp_ntz is the midnight wall-clock instant; timestamp -> timestamp_ntz is an
+                // identity on the epoch-microsecond lane under SESSION-ZONE-ASSUMPTION
+                // (TemporalValues.SessionZoneIsUtc): timezone-less, never shifted.
+                return source is DateType
+                    ? DateToTimestampAssign(node, child, isNull, value)
+                    : Expression.Assign(value, AsInt64(child));
 
             default:
                 throw new InvalidOperationException($"CanFuse should have rejected cast to '{target.SimpleString}'.");
         }
+    }
+
+    private static Expression DateToTimestampAssign(
+        CastExpression node, Lowered child, ParameterExpression isNull, ParameterExpression value)
+    {
+        Expression call = Expression.Call(
+            DateToTimestampMethod,
+            Expression.Convert(Expression.Convert(AsInt64(child), typeof(int)), typeof(int?)),
+            Expression.Constant(node.Mode));
+        return FallibleAssign(
+            call, typeof(long?), CompiledScalarOps.HasValueInt64Method, CompiledScalarOps.UnwrapInt64Method,
+            unwrapped => unwrapped, isNull, value);
     }
 
     private static Expression CastToIntegral(

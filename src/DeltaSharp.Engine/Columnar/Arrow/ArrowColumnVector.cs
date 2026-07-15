@@ -64,8 +64,8 @@ public abstract class ArrowColumnVector : ColumnVector
 
     private static ColumnVector WrapTimestamp(TimestampArray array)
     {
-        // DeltaSharp v1 stores timestamps as microseconds since the epoch (TimestampType). Any other
-        // Arrow unit (s/ms/ns) would silently rescale, so it is an explicit unsupported gap.
+        // DeltaSharp v1 stores timestamps as microseconds since the epoch. Any other Arrow unit (s/ms/ns)
+        // would silently rescale, so it is an explicit unsupported gap.
         var arrowType = (ArrowTimestampType)array.Data.DataType;
         if (arrowType.Unit != Apache.Arrow.Types.TimeUnit.Microsecond)
         {
@@ -74,7 +74,11 @@ public abstract class ArrowColumnVector : ColumnVector
                 + "only microsecond timestamps are supported.");
         }
 
-        return new ArrowFixedWidthColumnVector<long>(TimestampType.Instance, typeof(long), array);
+        // The Arrow zone field distinguishes the two DeltaSharp temporal families (both share the
+        // epoch-microsecond long lane): a null/empty zone is a timezone-less wall-clock (timestamp_ntz,
+        // #558); any concrete zone (e.g. "UTC") is a UTC-normalized instant (timestamp).
+        DataType type = string.IsNullOrEmpty(arrowType.Timezone) ? TimestampNtzType.Instance : TimestampType.Instance;
+        return new ArrowFixedWidthColumnVector<long>(type, typeof(long), array);
     }
 
     private static UnsupportedTypeException Unsupported(IArrowArray array)

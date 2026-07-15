@@ -183,6 +183,10 @@ internal static class LocalRelationBatches
                 vector.AppendValue(EncodeTimestamp(Expect<DateTime>(field, value)));
                 break;
 
+            case TimestampNtzType:
+                vector.AppendValue(EncodeTimestampNtz(Expect<DateTime>(field, value)));
+                break;
+
             case DecimalType decimalType:
                 AppendDecimal(vector, field, decimalType, Expect<decimal>(field, value));
                 break;
@@ -227,6 +231,18 @@ internal static class LocalRelationBatches
     {
         DateTime utc = value.Kind == DateTimeKind.Local ? value.ToUniversalTime() : value;
         long ticksFromEpoch = utc.Ticks - DateTime.UnixEpoch.Ticks;
+        return ticksFromEpoch / TimeSpan.TicksPerMicrosecond;
+    }
+
+    // A TimestampNtzType lane stores the Spark epoch-microsecond WALL-CLOCK value as a long — the inverse of
+    // RowMaterializer.ReadTimestampNtz (which yields an Unspecified-kind DateTime). Unlike EncodeTimestamp,
+    // the DateTime is taken AS-IS: a Local kind is deliberately NOT converted to UTC, because timestamp_ntz is
+    // timezone-less (#558) and applying value.ToUniversalTime() here would shift the stored value by the host
+    // offset and make read-back off by that offset. Sub-microsecond ticks are truncated (Spark timestamps
+    // carry microsecond precision).
+    private static long EncodeTimestampNtz(DateTime value)
+    {
+        long ticksFromEpoch = value.Ticks - DateTime.UnixEpoch.Ticks;
         return ticksFromEpoch / TimeSpan.TicksPerMicrosecond;
     }
 
