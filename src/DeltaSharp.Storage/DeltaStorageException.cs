@@ -20,6 +20,14 @@ internal enum StorageErrorKind
     /// disagreement is not conflated with byte-level corruption; the message names the mismatch.</summary>
     SchemaMismatch,
 
+    /// <summary>A column the current data schema requests is <b>absent</b> from a Parquet file's schema and
+    /// cannot be read-side null-filled (an absent REQUIRED column, or a strict projection). This is the
+    /// additive schema-evolution (#190/#497) narrow-file signal: distinct from <see cref="CorruptData"/> so
+    /// the read (<c>DeltaReadSource</c>) and OPTIMIZE (<c>DeltaOptimize</c>) guards can classify it on the
+    /// <see cref="DeltaStorageException.Kind"/> rather than string-matching the message (#513). The message
+    /// names the absent column.</summary>
+    ColumnNotPresentInFile,
+
     /// <summary>A required object (file/path) does not exist.</summary>
     NotFound,
 
@@ -73,6 +81,13 @@ internal sealed class DeltaStorageException : Exception
     /// <summary>Creates a <see cref="StorageErrorKind.SchemaMismatch"/> error naming the mismatch.</summary>
     public static DeltaStorageException SchemaMismatch(string message) =>
         new(StorageErrorKind.SchemaMismatch, message);
+
+    /// <summary>Creates a <see cref="StorageErrorKind.ColumnNotPresentInFile"/> error: a requested column is
+    /// absent from the Parquet file schema and cannot be read-side null-filled. Carries a dedicated kind so
+    /// the read/OPTIMIZE schema-evolution guards classify it without string-matching the message (#513).</summary>
+    public static DeltaStorageException ColumnNotPresentInFile(string columnName) =>
+        new(StorageErrorKind.ColumnNotPresentInFile,
+            $"Requested column '{columnName}' is not present in the Parquet file schema.");
 
     /// <summary>Creates a <see cref="StorageErrorKind.Transient"/> error (a retryable I/O condition).</summary>
     // NOTE (#113): when the object-store backends (S3/ADLS/GCS) land, any URI/credential embedded in a

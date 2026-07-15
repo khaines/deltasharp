@@ -606,16 +606,14 @@ internal sealed class DeltaOptimize
     // data schema requests — a genuinely-unfillable input OPTIMIZE cannot compact (a required lane cannot be
     // null-filled). With nullFillMissingColumns=true (#530), an absent NULLABLE column is null-filled by the
     // reader and never reaches here; only an absent REQUIRED column (or a still-strict projection) surfaces
-    // the "is not present in the Parquet file schema" defect. A genuine byte-level corruption or a real type
-    // mismatch does NOT match (it carries a different message / kind), so it is not masked by the
-    // OPTIMIZE-specific schema-evolution error.
-    // TRACKED DEFERRAL (#513): this classification is string-coupled to ParquetFileReader's "is not present
-    // in the Parquet file schema" message (the same coupling exists at the read guard site in
-    // DeltaReadSource.IsNarrowSchemaEvolutionInput). A shared, message-independent error-kind that both
-    // guard sites match on is #513.
+    // the dedicated StorageErrorKind.ColumnNotPresentInFile signal. A genuine byte-level corruption or a real
+    // type mismatch carries a different kind and does NOT match, so it is not masked by the OPTIMIZE-specific
+    // schema-evolution error.
+    // The classification keys on StorageErrorKind.ColumnNotPresentInFile (#513), so it is decoupled from
+    // ParquetFileReader's message text (the same kind-based guard exists at the read site in
+    // DeltaReadSource.IsNarrowSchemaEvolutionInput).
     private static bool IsUnfillableSchemaEvolutionInput(DeltaStorageException ex) =>
-        ex.Kind == StorageErrorKind.CorruptData
-        && ex.Message.Contains("is not present in the Parquet file schema", StringComparison.Ordinal);
+        ex.Kind == StorageErrorKind.ColumnNotPresentInFile;
 
     // Writes the group's batches into one compacted Parquet file with write-time statistics. The bytes are
     // first serialized to a seekable buffer (Parquet writes a trailing footer and the byte size is measured

@@ -321,6 +321,79 @@ public sealed class DeltaReadSourceTests : IDisposable
     }
 
     [Fact]
+    public async Task GenuineCorruption_IsNotMaskedAsSchemaEvolution_Issue513()
+    {
+        // #513 specificity oracle (read guard): IsNarrowSchemaEvolutionInput matches ONLY the dedicated
+        // StorageErrorKind.ColumnNotPresentInFile sentinel, so a genuine byte-level corruption (a real
+        // CorruptData) must NOT be misclassified as additive schema evolution. It must fail closed as the
+        // facade's DeltaReadException carrying the raw CorruptData — never a benign
+        // DeltaReadSchemaEvolutionException that would present a corrupt file as a routine evolution. Locks
+        // the negative half of the guard against a future broadening regression.
+        using (DeltaWriteTarget target = WriteTarget())
+        {
+            await target.AppendAsync(FlatSchema, Array.Empty<string>(), new[] { FlatBatch((1, "alice")) });
+        }
+
+        using DeltaReadSource source = ReadSource();
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+
+        // Overwrite the active data file with non-Parquet garbage AFTER the snapshot is pinned.
+        foreach (string file in Directory.EnumerateFiles(_root, "*.parquet", SearchOption.AllDirectories))
+        {
+            await File.WriteAllBytesAsync(file, Encoding.ASCII.GetBytes("not a parquet file -- genuine corruption"));
+        }
+
+        // ThrowsAsync is an EXACT type match: DeltaReadSchemaEvolutionException is a sibling (not a subtype)
+        // of DeltaReadException, so this passing proves the corruption is NOT masked as schema evolution.
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            () => source.ReadBatchesAsync(info.Version));
+        DeltaStorageException inner = Assert.IsType<DeltaStorageException>(ex.InnerException);
+        Assert.Equal(StorageErrorKind.CorruptData, inner.Kind);
+    }
+
+    [Fact]
+    public async Task PresentButMistypedColumn_IsNotMaskedAsSchemaEvolution_Issue513()
+    {
+        // #513 specificity oracle (read guard): a column PRESENT in the file but with a disagreeing physical
+        // type is a SchemaMismatch (via ValidateFileField), NOT an absent-column ColumnNotPresentInFile, so
+        // it must NOT be masked as additive schema evolution. It fails closed as DeltaReadException carrying
+        // the raw SchemaMismatch, never DeltaReadSchemaEvolutionException.
+        var mistyped = new StructType(new[]
+        {
+            new StructField("id", DataTypes.StringType, nullable: false), // the table declares id LONG
+            new StructField("name", DataTypes.StringType, nullable: true),
+        });
+        MutableColumnVector idCol = ColumnVectors.Create(DataTypes.StringType, 1);
+        idCol.AppendBytes(Encoding.UTF8.GetBytes("1"));
+        MutableColumnVector nameCol = ColumnVectors.Create(DataTypes.StringType, 1);
+        nameCol.AppendBytes(Encoding.UTF8.GetBytes("alice"));
+        var mistypedBatch = new ManagedColumnBatch(mistyped, new ColumnVector[] { idCol, nameCol }, 1);
+
+        var backend = new LocalFileSystemBackend(_root);
+        try
+        {
+            var writer = new DeltaTableWriter(backend);
+            var parquet = new ParquetFileWriter();
+            // StageAsync supplies no DataSchema, so the write-door physical cross-check is skipped — this
+            // manufactures the present-but-mistyped state the public write door cannot legally create.
+            StagedDataFile mistypedFile = await StageAsync(
+                backend, parquet, "part-mistyped.parquet", mistyped, mistypedBatch);
+            await writer.CreateOrAppendAsync(FlatSchema, Array.Empty<string>(), new[] { mistypedFile });
+        }
+        finally
+        {
+            backend.Dispose();
+        }
+
+        using DeltaReadSource source = ReadSource();
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            () => source.ReadBatchesAsync(info.Version));
+        DeltaStorageException inner = Assert.IsType<DeltaStorageException>(ex.InnerException);
+        Assert.Equal(StorageErrorKind.SchemaMismatch, inner.Kind);
+    }
+
+    [Fact]
     public async Task EvolvedNarrowFile_WithDeletionVector_NullFillsAndAppliesDv_Issue497()
     {
         // The DV × null-fill composition (QueryExec/Delta council ask): a narrow {id} DV-enabled file gets a

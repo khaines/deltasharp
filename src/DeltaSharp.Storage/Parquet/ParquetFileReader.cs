@@ -108,9 +108,10 @@ internal sealed class ParquetFileReader
     /// <exception cref="DeltaStorageException">A requested column type is unsupported
     /// (<see cref="StorageErrorKind.UnsupportedFeature"/>); the resolved file column's physical type or
     /// nullability does not match the requested engine type
-    /// (<see cref="StorageErrorKind.SchemaMismatch"/>); or the file is malformed/truncated, a requested
-    /// column is absent (and not null-filled per <paramref name="nullFillMissingColumns"/>), or a row group's
-    /// declared size exceeds the decode ceiling (<see cref="StorageErrorKind.CorruptData"/>).</exception>
+    /// (<see cref="StorageErrorKind.SchemaMismatch"/>); a requested column is absent from the file and not
+    /// null-filled (per <paramref name="nullFillMissingColumns"/>)
+    /// (<see cref="StorageErrorKind.ColumnNotPresentInFile"/>); or the file is malformed/truncated or a row
+    /// group's declared size exceeds the decode ceiling (<see cref="StorageErrorKind.CorruptData"/>).</exception>
     public async IAsyncEnumerable<ColumnBatch> ReadAsync(
         Stream input,
         StructType requested,
@@ -423,8 +424,8 @@ internal sealed class ParquetFileReader
     // additively-added column (#190) is always nullable, and older files written before it lack it, so it
     // reads back as all-null. An absent NON-nullable column can never be null-filled (a required lane cannot
     // carry null), and an absent column with null-fill disabled preserves the strict projection contract —
-    // both fail closed with the same "is not present" CorruptData message the OPTIMIZE/DELETE guards match
-    // on (#513). A PRESENT column with a disagreeing physical type/nullability is still rejected by
+    // both fail closed with the dedicated ColumnNotPresentInFile kind the OPTIMIZE/read guards match on
+    // (#513). A PRESENT column with a disagreeing physical type/nullability is still rejected by
     // ValidateFileField as a distinct SchemaMismatch (never silently coerced or null-filled).
     private static DataField?[] ResolveFileFields(
         ParquetSchema fileSchema, StructType requested, bool nullFillMissingColumns, bool allowTypeWideningPromotion)
@@ -450,8 +451,7 @@ internal sealed class ParquetFileReader
                     continue;
                 }
 
-                throw DeltaStorageException.CorruptData(
-                    $"Requested column '{name}' is not present in the Parquet file schema.");
+                throw DeltaStorageException.ColumnNotPresentInFile(name);
             }
 
             ValidateFileField(field, requestedField, allowTypeWideningPromotion);

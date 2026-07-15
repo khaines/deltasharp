@@ -273,7 +273,7 @@ public sealed class ParquetReaderTests
             {
             }
         });
-        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+        Assert.Equal(StorageErrorKind.ColumnNotPresentInFile, error.Kind);
         Assert.Contains("is not present", error.Message, StringComparison.Ordinal);
     }
 
@@ -295,7 +295,7 @@ public sealed class ParquetReaderTests
             {
             }
         });
-        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+        Assert.Equal(StorageErrorKind.ColumnNotPresentInFile, error.Kind);
         Assert.Contains("is not present", error.Message, StringComparison.Ordinal);
     }
 
