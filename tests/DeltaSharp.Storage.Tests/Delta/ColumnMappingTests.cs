@@ -937,6 +937,527 @@ public sealed class ColumnMappingTests : IDisposable
         Assert.Equal(0L, maxColumnId);
     }
 
+    // ------------------------------------------------- #541: name-mode schema evolution (append/overwrite)
+
+    // A deterministic seed for the MINTED physical name of a new column, DISTINCT from the create-path Seed so
+    // the minted name can never collide with an existing column's physical name.
+    private const string EvolveSeed = "story-05.4.4-name-mode-evolve";
+
+    [Fact]
+    public void EvolveNameModeMapping_AddsColumn_MintsFreshIdentity_AndBumpsMaxColumnId()
+    {
+        // #541 minting: an additive name-mode evolution REUSES every existing column's id + physicalName
+        // verbatim (never re-mints) and mints a fresh physicalName + a fresh monotonic id for the NEW column,
+        // bumping maxColumnId.
+        (StructType current, long maxColumnId) =
+            ColumnMapping.AssignFreshMapping(FlatSchema, new SeededPhysicalNameSource(Seed));
+        Assert.Equal(3, maxColumnId);
+        System.Collections.Immutable.ImmutableSortedDictionary<string, string> configuration =
+            ColumnMapping.NameModeConfiguration(maxColumnId);
+
+        // The evolved LOGICAL schema (no mapping metadata on the existing columns — mirrors the general
+        // DeltaSchemaEnforcer.Reconcile output being re-mapped) adds a nullable "extra".
+        var evolvedLogical = new StructType(new[]
+        {
+            new StructField("id", DataTypes.LongType, nullable: false),
+            new StructField("score", DataTypes.LongType, nullable: true),
+            new StructField("name", DataTypes.StringType, nullable: true),
+            new StructField("extra", DataTypes.StringType, nullable: true),
+        });
+        string expectedExtraPhysical = new SeededPhysicalNameSource(EvolveSeed).NextPhysicalName();
+
+        (StructType mapped, System.Collections.Immutable.ImmutableSortedDictionary<string, string> evolvedConfig) =
+            ColumnMapping.EvolveNameModeMapping(
+                evolvedLogical, current, configuration, new SeededPhysicalNameSource(EvolveSeed));
+
+        // Existing columns keep their identity verbatim (golden physical names + ids 1..3).
+        AssertMapping(mapped["id"], "id", 1, PhysId);
+        AssertMapping(mapped["score"], "score", 2, PhysScore);
+        AssertMapping(mapped["name"], "name", 3, PhysName);
+
+        // New column: a minted (deterministic, distinct) physicalName + id = maxColumnId + 1 = 4.
+        AssertMapping(mapped["extra"], "extra", 4, expectedExtraPhysical);
+        Assert.NotEqual(PhysId, expectedExtraPhysical);
+        Assert.NotEqual(PhysScore, expectedExtraPhysical);
+        Assert.NotEqual(PhysName, expectedExtraPhysical);
+
+        // Configuration maxColumnId bumped to 4; mode preserved.
+        Assert.Equal("4", evolvedConfig[ColumnMapping.MaxColumnIdKey]);
+        Assert.Equal("name", evolvedConfig[ColumnMapping.ModeKey]);
+    }
+
+    [Fact]
+    public void EvolveNameModeMapping_WidenedColumn_KeepsIdentity_AndPreservesMetadata()
+    {
+        // #541: an APPLIED type widening changes an existing column's type but NOT its identity — its id +
+        // physicalName are reused, any delta.typeChanges / comment metadata the merged field carries is
+        // preserved, and maxColumnId is unchanged (no new column is minted).
+        var logical = new StructType(new[] { new StructField("value", DataTypes.IntegerType, nullable: true) });
+        (StructType current, long maxColumnId) =
+            ColumnMapping.AssignFreshMapping(logical, new SeededPhysicalNameSource(Seed));
+        string valuePhysical = ColumnMapping.PhysicalName(current["value"], ColumnMappingMode.Name);
+        System.Collections.Immutable.ImmutableSortedDictionary<string, string> configuration =
+            ColumnMapping.NameModeConfiguration(maxColumnId);
+
+        // The merged field carries the WIDER type + a comment (standing in for the delta.typeChanges an
+        // applied widening records) — none of which the evolution mapping may drop.
+        FieldMetadata comment = FieldMetadata.FromEntries(
+            new[] { new KeyValuePair<string, string>("comment", "widened") });
+        var merged = new StructType(new[] { new StructField("value", DataTypes.LongType, nullable: true, comment) });
+
+        (StructType mapped, System.Collections.Immutable.ImmutableSortedDictionary<string, string> evolvedConfig) =
+            ColumnMapping.EvolveNameModeMapping(
+                merged, current, configuration, new SeededPhysicalNameSource("unused-no-new-columns"));
+
+        AssertMapping(mapped["value"], "value", 1, valuePhysical); // identity preserved
+        Assert.Equal(DataTypes.LongType, mapped["value"].DataType); // type widened
+        Assert.True(mapped["value"].Metadata.TryGetString("comment", out string? c) && c == "widened");
+        Assert.Equal("1", evolvedConfig[ColumnMapping.MaxColumnIdKey]); // no new column ⇒ unchanged
+    }
+
+    [Fact]
+    public async Task NameMode_Append_AddNewColumn_MintsAndCommitsEvolvedMapping_Issue541()
+    {
+        // #541 end-to-end (write path): appending an additive nullable column to a name-mode table with
+        // SchemaEvolutionMode.AddNewColumns mints a fresh physicalName+id for the new column, bumps
+        // maxColumnId, and commits the evolved mapped metaData atomically with the add. The subsequent snapshot
+        // LOAD runs ValidateNameModeSchema, so a successful load proves the evolved schema is a CONSISTENT
+        // name-mode schema (unique physical names, every id ≤ maxColumnId).
+        await CreateNameMappedAsync((1L, 100L, "alice"), (2L, 200L, "bob"));
+        string expectedExtraPhysical = new SeededPhysicalNameSource(EvolveSeed).NextPhysicalName();
+
+        using var backend = new LocalFileSystemBackend(_root);
+        var writer = new DeltaTableWriter(
+            new DeltaLog(backend), new DeltaCommitter(backend),
+            new FixedTimeProvider(DateTimeOffset.UnixEpoch), new SeededPhysicalNameSource(EvolveSeed));
+        Snapshot readSnapshot = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
+
+        DeltaCommitResult result = await writer.AppendAsync(
+            readSnapshot,
+            EvolvedFlatSchema,
+            new[] { StagedNoSchema("part-extra.parquet") },
+            SchemaEvolutionMode.AddNewColumns);
+        Assert.Equal(readSnapshot.Version + 1, result.Version);
+
+        // The evolved metaData + add commit in ONE version.
+        IReadOnlyList<DeltaAction> committed =
+            await new DeltaLog(backend).ReadCommitActionsAsync(result.Version, CancellationToken.None);
+        Assert.Single(committed.OfType<MetadataAction>());
+        Assert.Equal("part-extra.parquet", Assert.Single(committed.OfType<AddFileAction>()).Path);
+
+        // Reload (ValidateNameModeSchema runs on load): existing columns keep identity; the new column carries
+        // a minted physicalName + id 4; maxColumnId bumped to 4.
+        Snapshot evolved = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
+        Assert.Equal(4, evolved.Schema.Count);
+        AssertMapping(evolved.Schema["id"], "id", 1, PhysId);
+        AssertMapping(evolved.Schema["score"], "score", 2, PhysScore);
+        AssertMapping(evolved.Schema["name"], "name", 3, PhysName);
+        AssertMapping(evolved.Schema["extra"], "extra", 4, expectedExtraPhysical);
+        Assert.True(evolved.Schema["extra"].Nullable);
+        Assert.Equal("4", evolved.Metadata.Configuration[ColumnMapping.MaxColumnIdKey]);
+        Assert.Equal("name", evolved.Metadata.Configuration[ColumnMapping.ModeKey]);
+    }
+
+    [Fact]
+    public async Task NameMode_Overwrite_AddNewColumn_MintsAndCommitsEvolvedMapping_Issue541()
+    {
+        // #541 end-to-end (overwrite path): mirrors the append case — a name-mode Static overwrite that adds a
+        // nullable column mints a fresh physicalName+id, bumps maxColumnId, and commits the evolved mapped
+        // metaData (removing prior files) in one version; the reload proves a consistent name-mode schema.
+        await CreateNameMappedAsync((1L, 100L, "alice"), (2L, 200L, "bob"));
+        string expectedExtraPhysical = new SeededPhysicalNameSource(EvolveSeed).NextPhysicalName();
+
+        using var backend = new LocalFileSystemBackend(_root);
+        var writer = new DeltaTableWriter(
+            new DeltaLog(backend), new DeltaCommitter(backend),
+            new FixedTimeProvider(DateTimeOffset.UnixEpoch), new SeededPhysicalNameSource(EvolveSeed));
+        Snapshot readSnapshot = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
+
+        DeltaCommitResult result = await writer.OverwriteAsync(
+            readSnapshot,
+            EvolvedFlatSchema,
+            new[] { StagedNoSchema("part-extra-ovr.parquet") },
+            PartitionOverwriteMode.Static,
+            SchemaEvolutionMode.AddNewColumns);
+        Assert.Equal(readSnapshot.Version + 1, result.Version);
+
+        Snapshot evolved = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
+        Assert.Equal(4, evolved.Schema.Count);
+        AssertMapping(evolved.Schema["extra"], "extra", 4, expectedExtraPhysical);
+        Assert.Equal("4", evolved.Metadata.Configuration[ColumnMapping.MaxColumnIdKey]);
+        // The overwrite removed the prior files and added the new one (schema evolution rode in the same version).
+        Assert.Single(evolved.ActiveFiles);
+        Assert.Equal("part-extra-ovr.parquet", evolved.ActiveFiles[0].Path);
+    }
+
+    // FlatSchema (id, score, name) additively evolved with a nullable "extra" data column (#541).
+    private static readonly StructType EvolvedFlatSchema = new(new[]
+    {
+        new StructField("id", DataTypes.LongType, nullable: false),
+        new StructField("score", DataTypes.LongType, nullable: true),
+        new StructField("name", DataTypes.StringType, nullable: true),
+        new StructField("extra", DataTypes.StringType, nullable: true),
+    });
+
+    // A staged data file with NO footer DataSchema, so the write-door physical cross-check is skipped — the
+    // #541 tests assert the committed metaData/mapping, not the physical bytes (mirrors DeltaSchemaEvolution
+    // writer tests' Staged helper).
+    private static StagedDataFile StagedNoSchema(string path) =>
+        new(
+            path,
+            System.Collections.Immutable.ImmutableSortedDictionary<string, string?>.Empty
+                .WithComparers(StringComparer.Ordinal),
+            Size: 1L,
+            ModificationTime: 0L,
+            Stats: null);
+
+    // A second deterministic seed for a SECOND consecutive evolution's minted name (distinct from EvolveSeed).
+    private const string EvolveSeed2 = "story-05.4.4-name-mode-evolve-2";
+
+    [Fact]
+    public async Task NameMode_Append_AddNewColumn_StagesUnderMintedPhysicalName_AndReadsBack_Issue541()
+    {
+        // The core data-integrity promise: the new column's REAL Parquet bytes land under its MINTED physical
+        // name (proven because the staged file carries a footer DataSchema, so the #497 write-door cross-check
+        // runs against the writer's evolved physical schema — a wrong minted name would fail closed here), and
+        // reading the evolved snapshot returns the new column's value for new rows and NULL for the
+        // pre-evolution rows (#497 null-fill through the name-mode physical read path).
+        await CreateNameMappedAsync((1L, 100L, "alice"), (2L, 200L, "bob"));
+        string mintedExtra = new SeededPhysicalNameSource(EvolveSeed).NextPhysicalName();
+
+        var evolvedPhysical = new StructType(new[]
+        {
+            new StructField(PhysId, DataTypes.LongType, nullable: false),
+            new StructField(PhysScore, DataTypes.LongType, nullable: true),
+            new StructField(PhysName, DataTypes.StringType, nullable: true),
+            new StructField(mintedExtra, DataTypes.StringType, nullable: true),
+        });
+
+        using var backend = new LocalFileSystemBackend(_root);
+        StagedDataFile staged = await StagePhysicalEvolvedAsync(
+            backend, "part-extra-real.parquet", evolvedPhysical, (3L, 300L, "carol", "x3"));
+
+        var writer = new DeltaTableWriter(
+            new DeltaLog(backend), new DeltaCommitter(backend),
+            new FixedTimeProvider(DateTimeOffset.UnixEpoch), new SeededPhysicalNameSource(EvolveSeed));
+        Snapshot readSnapshot = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
+        await writer.AppendAsync(
+            readSnapshot, EvolvedFlatSchema, new[] { staged }, SchemaEvolutionMode.AddNewColumns);
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        Assert.Equal(new[] { "id", "score", "name", "extra" }, info.Schema.Select(f => f.Name).ToArray());
+
+        List<(long Id, long? Score, string? Name, string? Extra)> rows =
+            await ReadEvolvedRowsAsync(source, info.Version);
+        Assert.Equal(
+            new (long, long?, string?, string?)[]
+            {
+                (1L, 100L, "alice", null), // pre-evolution row: new column null-filled (#497)
+                (2L, 200L, "bob", null),
+                (3L, 300L, "carol", "x3"), // new row carries the new column under its minted physical name
+            },
+            rows.OrderBy(r => r.Id).ToList());
+    }
+
+    [Fact]
+    public async Task NameMode_Append_ConsecutiveEvolutions_BumpMaxColumnIdMonotonically_Issue541()
+    {
+        // #541 monotonicity across commits: two successive additive evolutions (extra id 4, then extra2 id 5)
+        // each reuse all prior identities, mint a distinct physical name, and bump maxColumnId monotonically
+        // (3 → 4 → 5). Each reload runs ValidateNameModeSchema, so a stale-maxColumnId or duplicate-name bug
+        // fails closed.
+        await CreateNameMappedAsync((1L, 100L, "alice"));
+        string mintedExtra = new SeededPhysicalNameSource(EvolveSeed).NextPhysicalName();
+        string mintedExtra2 = new SeededPhysicalNameSource(EvolveSeed2).NextPhysicalName();
+
+        using var backend = new LocalFileSystemBackend(_root);
+
+        var writer1 = new DeltaTableWriter(
+            new DeltaLog(backend), new DeltaCommitter(backend),
+            new FixedTimeProvider(DateTimeOffset.UnixEpoch), new SeededPhysicalNameSource(EvolveSeed));
+        await writer1.AppendAsync(
+            await new DeltaLog(backend).LoadSnapshotAsync(version: null),
+            EvolvedFlatSchema, new[] { StagedNoSchema("v2.parquet") }, SchemaEvolutionMode.AddNewColumns);
+
+        var twiceEvolved = new StructType(new[]
+        {
+            new StructField("id", DataTypes.LongType, nullable: false),
+            new StructField("score", DataTypes.LongType, nullable: true),
+            new StructField("name", DataTypes.StringType, nullable: true),
+            new StructField("extra", DataTypes.StringType, nullable: true),
+            new StructField("extra2", DataTypes.StringType, nullable: true),
+        });
+        var writer2 = new DeltaTableWriter(
+            new DeltaLog(backend), new DeltaCommitter(backend),
+            new FixedTimeProvider(DateTimeOffset.UnixEpoch), new SeededPhysicalNameSource(EvolveSeed2));
+        await writer2.AppendAsync(
+            await new DeltaLog(backend).LoadSnapshotAsync(version: null),
+            twiceEvolved, new[] { StagedNoSchema("v3.parquet") }, SchemaEvolutionMode.AddNewColumns);
+
+        Snapshot evolved = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
+        Assert.Equal(5, evolved.Schema.Count);
+        AssertMapping(evolved.Schema["id"], "id", 1, PhysId);
+        AssertMapping(evolved.Schema["score"], "score", 2, PhysScore);
+        AssertMapping(evolved.Schema["name"], "name", 3, PhysName);
+        AssertMapping(evolved.Schema["extra"], "extra", 4, mintedExtra);
+        AssertMapping(evolved.Schema["extra2"], "extra2", 5, mintedExtra2);
+        Assert.NotEqual(mintedExtra, mintedExtra2);
+        Assert.Equal("5", evolved.Metadata.Configuration[ColumnMapping.MaxColumnIdKey]);
+    }
+
+    [Fact]
+    public void EvolveNameModeMapping_RetainedColumnWithoutId_FailsClosed_Issue541()
+    {
+        // A retained name-mode column carrying a physicalName but no id is an inconsistent table — the
+        // evolution fails closed (never guesses an id).
+        var noId = new StructType(new[]
+        {
+            new StructField(
+                "value", DataTypes.LongType, nullable: true,
+                FieldMetadata.FromEntries(new[]
+                {
+                    new KeyValuePair<string, string>(ColumnMapping.PhysicalNameKey, "col-x"),
+                })),
+        });
+        System.Collections.Immutable.ImmutableSortedDictionary<string, string> config =
+            ColumnMapping.NameModeConfiguration(1);
+
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
+            () => ColumnMapping.EvolveNameModeMapping(noId, noId, config, new SeededPhysicalNameSource("unused")));
+        Assert.Contains(ColumnMapping.IdKey, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void EvolveNameModeMapping_MissingMaxColumnId_FailsClosed_Issue541()
+    {
+        // A name-mode configuration missing maxColumnId is inconsistent — the evolution cannot mint a fresh id
+        // safely and fails closed.
+        (StructType current, _) =
+            ColumnMapping.AssignFreshMapping(FlatSchema, new SeededPhysicalNameSource(Seed));
+        System.Collections.Immutable.ImmutableSortedDictionary<string, string> noMax =
+            System.Collections.Immutable.ImmutableSortedDictionary<string, string>.Empty
+                .WithComparers(StringComparer.Ordinal)
+                .Add(ColumnMapping.ModeKey, "name");
+
+        Assert.Throws<DeltaProtocolException>(
+            () => ColumnMapping.EvolveNameModeMapping(
+                FlatSchema, current, noMax, new SeededPhysicalNameSource("unused")));
+    }
+
+    [Fact]
+    public void EvolveNameModeMapping_NestedNewColumn_FailsClosed_Issue541()
+    {
+        // Nested column mapping is unsupported in this build, so an evolved schema whose NEW column is a nested
+        // (struct/array/map) type is rejected fail-closed rather than minted.
+        (StructType current, long maxColumnId) =
+            ColumnMapping.AssignFreshMapping(FlatSchema, new SeededPhysicalNameSource(Seed));
+        System.Collections.Immutable.ImmutableSortedDictionary<string, string> config =
+            ColumnMapping.NameModeConfiguration(maxColumnId);
+        var nestedEvolved = new StructType(new[]
+        {
+            new StructField("id", DataTypes.LongType, nullable: false),
+            new StructField("score", DataTypes.LongType, nullable: true),
+            new StructField("name", DataTypes.StringType, nullable: true),
+            new StructField(
+                "payload", new StructType(new[] { new StructField("x", DataTypes.LongType, nullable: true) }),
+                nullable: true),
+        });
+
+        Assert.Throws<DeltaProtocolException>(
+            () => ColumnMapping.EvolveNameModeMapping(
+                nestedEvolved, current, config, new SeededPhysicalNameSource(EvolveSeed)));
+    }
+
+    [Fact]
+    public async Task NameMode_Append_WidenColumn_KeepsIdentity_AndRecordsTypeChanges_Issue541()
+    {
+        // #541 applied widening at the WRITE path: on a name-mode + typeWidening-enabled table, widening an
+        // existing column (int → long) keeps its id + physicalName (never re-mints), records delta.typeChanges,
+        // and leaves maxColumnId unchanged (no new column). Committed metaData is proven consistent on reload.
+        const string ValuePhysical = "col-11111111-2222-3333-4444-555555555555";
+        string schemaJson =
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":"
+            + $"{{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"{ValuePhysical}\"}}}}]}}";
+        const string ColumnMappingAndTypeWideningProtocol =
+            "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,"
+            + "\"readerFeatures\":[\"columnMapping\",\"typeWidening\"],"
+            + "\"writerFeatures\":[\"columnMapping\",\"typeWidening\"]}}";
+
+        using var backend = new LocalFileSystemBackend(_root);
+        byte[] commit = Encoding.UTF8.GetBytes(
+            ColumnMappingAndTypeWideningProtocol + "\n"
+            + NameModeMetadataLine(
+                schemaJson,
+                Array.Empty<string>(),
+                ("delta.columnMapping.mode", "name"),
+                ("delta.columnMapping.maxColumnId", "1"),
+                ("delta.enableTypeWidening", "true")) + "\n");
+        await backend.PutIfAbsentAsync("_delta_log/00000000000000000000.json", commit, CancellationToken.None);
+
+        var writer = new DeltaTableWriter(
+            new DeltaLog(backend), new DeltaCommitter(backend),
+            new FixedTimeProvider(DateTimeOffset.UnixEpoch), new SeededPhysicalNameSource("unused-no-new-columns"));
+        Snapshot readSnapshot = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
+
+        // Stage a REAL widened file whose footer DataSchema is the retained physical column as `long`, so the
+        // #497 write-door cross-check runs against the writer's evolved physical schema. A bug that staged the
+        // widened bytes under the LOGICAL name (or re-mapped the retained physical name) fails closed here.
+        StagedDataFile staged = await StageSingleLongColumnAsync(backend, "v1.parquet", ValuePhysical, 100L, 200L);
+        await writer.AppendAsync(
+            readSnapshot,
+            new StructType(new[] { new StructField("value", DataTypes.LongType, nullable: true) }),
+            new[] { staged },
+            SchemaEvolutionMode.MergeSchema);
+
+        Snapshot evolved = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
+        StructField value = evolved.Schema["value"];
+        Assert.Equal(DataTypes.LongType, value.DataType); // widened
+        AssertMapping(value, "value", 1, ValuePhysical); // identity preserved (id + physicalName)
+        Assert.True(value.Metadata.TryGetValue("delta.typeChanges", out _)); // widening recorded
+        Assert.Equal("1", evolved.Metadata.Configuration[ColumnMapping.MaxColumnIdKey]); // no new column ⇒ unchanged
+
+        // Read back through the name-mode read door by LOGICAL name: the widened rows resolve from the retained
+        // PHYSICAL column, proving the bytes landed under it (a logical/mis-mapped landing would have failed the
+        // #497 gate above, or read back nothing here).
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        Assert.Equal(new[] { "value" }, info.Schema.Select(f => f.Name).ToArray());
+        var readBack = new List<long>();
+        foreach (ColumnBatch b in await source.ReadBatchesAsync(info.Version))
+        {
+            ColumnVector v = b.SelectedColumn(0);
+            for (int r = 0; r < b.LogicalRowCount; r++)
+            {
+                readBack.Add(v.GetValue<long>(r));
+            }
+        }
+
+        Assert.Equal(new[] { 100L, 200L }, readBack.OrderBy(x => x).ToArray());
+    }
+
+    // Writes a single-column Parquet file (the given physical name, LONG) and returns a staged add carrying
+    // that footer DataSchema, so the #497 write-door cross-check binds.
+    private static async Task<StagedDataFile> StageSingleLongColumnAsync(
+        LocalFileSystemBackend backend, string path, string physicalName, params long[] values)
+    {
+        var physicalSchema = new StructType(new[] { new StructField(physicalName, DataTypes.LongType, nullable: true) });
+        MutableColumnVector col = ColumnVectors.Create(DataTypes.LongType, values.Length);
+        foreach (long v in values)
+        {
+            col.AppendValue(v);
+        }
+
+        var batch = new ManagedColumnBatch(physicalSchema, new ColumnVector[] { col }, values.Length);
+        byte[] bytes;
+        using (var buffer = new MemoryStream())
+        {
+            await new ParquetFileWriter().WriteAsync(buffer, physicalSchema, new[] { batch }, CancellationToken.None);
+            bytes = buffer.ToArray();
+        }
+
+        await backend.PutIfAbsentAsync(path, bytes, CancellationToken.None);
+        return new StagedDataFile(
+            path,
+            System.Collections.Immutable.ImmutableSortedDictionary<string, string?>.Empty
+                .WithComparers(StringComparer.Ordinal),
+            Size: bytes.LongLength,
+            ModificationTime: 0L,
+            Stats: null,
+            DataSchema: physicalSchema);
+    }
+
+    [Fact]
+    public async Task NameMode_Append_WidenColumn_WithoutTypeWideningFeature_FailsClosed_Issue541()
+    {
+        // A widening write to a name-mode table that has NOT enabled type widening stays fail-closed (the
+        // feature gate is independent of column mapping) — never a silent partial-widen or unmapped column.
+        const string ValuePhysical = "col-99999999-8888-7777-6666-555555555555";
+        string schemaJson =
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":"
+            + $"{{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"{ValuePhysical}\"}}}}]}}";
+
+        using var backend = new LocalFileSystemBackend(_root);
+        byte[] commit = Encoding.UTF8.GetBytes(
+            ProtocolFeatureLine() + "\n" // columnMapping only — no typeWidening feature/enablement
+            + NameModeMetadataLine(
+                schemaJson,
+                Array.Empty<string>(),
+                ("delta.columnMapping.mode", "name"),
+                ("delta.columnMapping.maxColumnId", "1")) + "\n");
+        await backend.PutIfAbsentAsync("_delta_log/00000000000000000000.json", commit, CancellationToken.None);
+
+        var writer = new DeltaTableWriter(backend);
+        Snapshot readSnapshot = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
+        await Assert.ThrowsAsync<DeltaSchemaMismatchException>(() => writer.AppendAsync(
+            readSnapshot,
+            new StructType(new[] { new StructField("value", DataTypes.LongType, nullable: true) }),
+            new[] { StagedNoSchema("v1.parquet") },
+            SchemaEvolutionMode.MergeSchema));
+
+        // Fail-closed: the table is unchanged at v0.
+        Assert.Equal(0L, (await new DeltaLog(backend).LoadSnapshotAsync(version: null)).Version);
+    }
+
+    // Writes a REAL Parquet data file under the evolved PHYSICAL schema (existing physical names + the minted
+    // one) and returns a staged add carrying that footer DataSchema, so the #497 write-door cross-check runs.
+    private static async Task<StagedDataFile> StagePhysicalEvolvedAsync(
+        LocalFileSystemBackend backend, string path, StructType evolvedPhysical,
+        (long Id, long Score, string? Name, string? Extra) row)
+    {
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, 1);
+        MutableColumnVector score = ColumnVectors.Create(DataTypes.LongType, 1);
+        MutableColumnVector name = ColumnVectors.Create(DataTypes.StringType, 1);
+        MutableColumnVector extra = ColumnVectors.Create(DataTypes.StringType, 1);
+        id.AppendValue(row.Id);
+        score.AppendValue(row.Score);
+        name.AppendBytes(Encoding.UTF8.GetBytes(row.Name!));
+        extra.AppendBytes(Encoding.UTF8.GetBytes(row.Extra!));
+        var batch = new ManagedColumnBatch(evolvedPhysical, new ColumnVector[] { id, score, name, extra }, 1);
+
+        byte[] bytes;
+        using (var buffer = new MemoryStream())
+        {
+            await new ParquetFileWriter().WriteAsync(buffer, evolvedPhysical, new[] { batch }, CancellationToken.None);
+            bytes = buffer.ToArray();
+        }
+
+        await backend.PutIfAbsentAsync(path, bytes, CancellationToken.None);
+        return new StagedDataFile(
+            path,
+            System.Collections.Immutable.ImmutableSortedDictionary<string, string?>.Empty
+                .WithComparers(StringComparer.Ordinal),
+            Size: bytes.LongLength,
+            ModificationTime: 0L,
+            Stats: null,
+            DataSchema: evolvedPhysical);
+    }
+
+    private static async Task<List<(long Id, long? Score, string? Name, string? Extra)>> ReadEvolvedRowsAsync(
+        DeltaReadSource source, long version)
+    {
+        var rows = new List<(long, long?, string?, string?)>();
+        foreach (ColumnBatch batch in await source.ReadBatchesAsync(version))
+        {
+            ColumnVector id = batch.SelectedColumn(0);
+            ColumnVector score = batch.SelectedColumn(1);
+            ColumnVector name = batch.SelectedColumn(2);
+            ColumnVector extra = batch.SelectedColumn(3);
+            for (int r = 0; r < batch.LogicalRowCount; r++)
+            {
+                rows.Add((
+                    id.GetValue<long>(r),
+                    score.IsNull(r) ? null : score.GetValue<long>(r),
+                    name.IsNull(r) ? null : Encoding.UTF8.GetString(name.GetBytes(r)),
+                    extra.IsNull(r) ? null : Encoding.UTF8.GetString(extra.GetBytes(r))));
+            }
+        }
+
+        return rows;
+    }
+
     // ---------------------------------------------------------------- helpers
 
     private static void AssertMapping(StructField field, string logicalName, long id, string physicalName)
