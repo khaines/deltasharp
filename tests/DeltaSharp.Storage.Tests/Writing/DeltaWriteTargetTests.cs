@@ -4,6 +4,7 @@ using DeltaSharp.Storage;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
 using DeltaSharp.Storage.Parquet;
+using DeltaSharp.Storage.Tests.Delta;
 using DeltaSharp.Storage.Writing;
 using DeltaSharp.Types;
 using Parquet;
@@ -19,6 +20,14 @@ namespace DeltaSharp.Storage.Tests.Writing;
 /// actions (version, <c>add</c> actions, <c>dataChange</c>). Covers create+append (v0→v1), static
 /// overwrite, dynamic partition overwrite (only touched partitions replaced), and unpartitioned tables.
 /// </summary>
+/// <remarks>
+/// Runs in the shared non-parallel <see cref="ColumnMappingTestCollection"/>: these are raw-write /
+/// shared-temp-filesystem door tests, so serializing them with the column-mapping door tests (rather than
+/// letting the two collections run in parallel) removes a cross-collection temp-filesystem interleaving that
+/// once produced a one-off flake in a name-mode empty-overwriteSchema no-op assertion (#556 council:
+/// Reliability R2 defense-in-depth).
+/// </remarks>
+[Collection(ColumnMappingTestCollection.Name)]
 public sealed class DeltaWriteTargetTests : IDisposable
 {
     private readonly string _root;
@@ -168,7 +177,6 @@ public sealed class DeltaWriteTargetTests : IDisposable
         Assert.Equal(0L, result.RowsWritten);
         Assert.Equal(0L, (await LoadSnapshotAsync()).Version); // still v0 — no empty commit
     }
-
 
     // ---------------------------------------------------------------- static overwrite
 
