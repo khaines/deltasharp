@@ -104,6 +104,7 @@ internal sealed class DeltaTableWriter
     private readonly DeltaLog _log;
     private readonly DeltaCommitter _committer;
     private readonly TimeProvider _timeProvider;
+    private readonly IColumnPhysicalNameSource _nameSource;
 
     /// <summary>Creates a writer over <paramref name="backend"/> (constructs its own log reader + committer).</summary>
     public DeltaTableWriter(IStorageBackend backend)
@@ -112,14 +113,21 @@ internal sealed class DeltaTableWriter
     }
 
     /// <summary>Creates a writer over an explicit reader + committer (tests inject a committer with a
-    /// race probe / bounded retries, and a deterministic clock for tombstone timestamps).</summary>
-    internal DeltaTableWriter(DeltaLog log, DeltaCommitter committer, TimeProvider? timeProvider = null)
+    /// race probe / bounded retries, and a deterministic clock for tombstone timestamps). An explicit
+    /// <paramref name="nameSource"/> supplies deterministic <c>col-&lt;uuid&gt;</c> physical names when a
+    /// name-mode append/overwrite mints a new column (#541); production defaults to the crypto RNG source.</summary>
+    internal DeltaTableWriter(
+        DeltaLog log,
+        DeltaCommitter committer,
+        TimeProvider? timeProvider = null,
+        IColumnPhysicalNameSource? nameSource = null)
     {
         ArgumentNullException.ThrowIfNull(log);
         ArgumentNullException.ThrowIfNull(committer);
         _log = log;
         _committer = committer;
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _nameSource = nameSource ?? RandomPhysicalNameSource.Instance;
     }
 
     /// <summary>
@@ -174,17 +182,16 @@ internal sealed class DeltaTableWriter
             throw new ArgumentException("An append must stage at least one data file.", nameof(files));
         }
 
-        // #525: an append to a column-mapped table stages Parquet under the table's PHYSICAL column names
-        // (name mode); `none` is logical==physical; `id` stays fail-closed (#523, rejected at snapshot load).
+        // #525/#541: an append to a column-mapped table stages Parquet under the table's PHYSICAL column
+        // names (name mode). A same-logical-schema write reuses the existing mapping (#525); an additive
+        // column / applied widening MINTS a fresh physicalName+id and bumps maxColumnId (#541). `none` is
+        // logical==physical; `id` stays fail-closed (#523, rejected at snapshot load).
         ColumnMappingMode mode = ColumnMapping.ResolveMode(readSnapshot.Metadata.Configuration);
         ColumnMapping.EnsureReadWriteSupported(mode);
-        (StructType physicalWriteSchema, ImmutableArray<string> physicalPartitionColumns) =
-            ResolvePhysicalStaging(readSnapshot, writeSchema, mode);
+        (StructType physicalWriteSchema, ImmutableArray<string> physicalPartitionColumns,
+            MetadataAction? schemaEvolution) = ResolveWrite(readSnapshot, writeSchema, evolutionMode, mode);
 
         ValidateStagedWriteSchema(physicalWriteSchema, physicalPartitionColumns, files);
-        MetadataAction? schemaEvolution = ReconcileSchema(readSnapshot, writeSchema, evolutionMode);
-        RejectNameModeSchemaEvolution(mode, schemaEvolution);
-
         ValidatePartitionCoverage(files, physicalPartitionColumns);
 
         var actions = new List<DeltaAction>((schemaEvolution is null ? 0 : 1) + files.Count);
@@ -248,18 +255,16 @@ internal sealed class DeltaTableWriter
             throw new ArgumentException("An overwrite must stage at least one data file.", nameof(files));
         }
 
-        // #525: mirror AppendAsync — stage under PHYSICAL names for a name-mode table; `none` is
+        // #525/#541: mirror AppendAsync — stage under PHYSICAL names for a name-mode table, minting a fresh
+        // physicalName+id (and bumping maxColumnId) for an additive column / applied widening; `none` is
         // logical==physical; `id` stays fail-closed (#523). Physical partition columns key both the staged
         // files' partitionValues and the dynamic-overwrite removal selection.
         ColumnMappingMode mode = ColumnMapping.ResolveMode(readSnapshot.Metadata.Configuration);
         ColumnMapping.EnsureReadWriteSupported(mode);
-        (StructType physicalWriteSchema, ImmutableArray<string> physicalPartitionColumns) =
-            ResolvePhysicalStaging(readSnapshot, writeSchema, mode);
+        (StructType physicalWriteSchema, ImmutableArray<string> physicalPartitionColumns,
+            MetadataAction? schemaEvolution) = ResolveWrite(readSnapshot, writeSchema, evolutionMode, mode);
 
         ValidateStagedWriteSchema(physicalWriteSchema, physicalPartitionColumns, files);
-        MetadataAction? schemaEvolution = ReconcileSchema(readSnapshot, writeSchema, evolutionMode);
-        RejectNameModeSchemaEvolution(mode, schemaEvolution);
-
         ValidatePartitionCoverage(files, physicalPartitionColumns);
 
         return partitionMode switch
@@ -678,57 +683,90 @@ internal sealed class DeltaTableWriter
         }
     }
 
-    // #525: an append/overwrite to an EXISTING column-mapped table stages Parquet under the table's PHYSICAL
-    // column names (name mode) — IDENTICAL to what the fresh-create path (CreateNameMappedTableAsync) writes
-    // — so the appended files physically carry the `col-<uuid>` names and physical-keyed partitionValues. The
-    // logical→physical mapping REUSES the table's existing per-field id/physicalName (never re-mints), keeping
-    // maxColumnId and every existing column's identity unchanged. `none` mode is logical==physical (unchanged
-    // behavior); `id` mode is rejected fail-closed at snapshot load (#523). Returns the write schema whose
-    // DATA columns the staged files physically carry, and the partition columns their partitionValues key by.
-    private static (StructType PhysicalWriteSchema, ImmutableArray<string> PhysicalPartitionColumns)
-        ResolvePhysicalStaging(Snapshot readSnapshot, StructType writeSchema, ColumnMappingMode mode)
+    // #525/#541: resolves the PHYSICAL staging shape + the optional schema-evolution metaData for an
+    // append/overwrite, handling column mapping. It first reconciles the incoming write schema against the
+    // table schema (an additive column / applied widening yields a merged schema; a compatible write yields
+    // null). Then, by mode:
+    //   * `none` (logical==physical): stage under the write schema; the evolution metaData (if any) carries
+    //     the merged LOGICAL schema — behavior byte-for-byte unchanged from the pre-#541 path.
+    //   * `name`, no evolution (#525): stage under the table's EXISTING physical mapping (never re-mint).
+    //   * `name`, evolution (#541): MINT a fresh physicalName+id for each new column (an applied widening
+    //     keeps its identity), bump maxColumnId, stage the write columns (existing + new) under the EVOLVED
+    //     mapping, and re-emit the mapped metaData (mapped schema + bumped maxColumnId config).
+    // `id` mode is already rejected fail-closed at snapshot load (#523) and never reaches here.
+    private (StructType PhysicalWriteSchema, ImmutableArray<string> PhysicalPartitionColumns,
+        MetadataAction? SchemaEvolution)
+        ResolveWrite(
+            Snapshot readSnapshot, StructType writeSchema, SchemaEvolutionMode evolutionMode, ColumnMappingMode mode)
     {
         ImmutableArray<string> logicalPartitions = readSnapshot.Metadata.PartitionColumns.IsDefault
             ? ImmutableArray<string>.Empty
             : readSnapshot.Metadata.PartitionColumns;
 
+        StructType? mergedSchema = MergeSchema(readSnapshot, writeSchema, evolutionMode);
+
         if (mode != ColumnMappingMode.Name)
         {
             // none (and any non-name) mode: logical==physical, so the caller's write schema and the table's
-            // logical partition columns ARE the physical staging shape — behavior is byte-for-byte unchanged.
-            return (writeSchema, logicalPartitions);
+            // logical partition columns ARE the physical staging shape; the evolution (if any) carries the
+            // merged logical schema — byte-for-byte unchanged behavior.
+            MetadataAction? noneEvolution = mergedSchema is null
+                ? null
+                : readSnapshot.Metadata with { SchemaString = SchemaJson.ToJson(mergedSchema) };
+            return (writeSchema, logicalPartitions, noneEvolution);
         }
 
-        // name mode: rename each write column to the physical name the table already assigned it, and map the
-        // logical partition columns to their physical names (add.partitionValues + stats keyed by physical
-        // name — Delta PROTOCOL.md "Writer Requirements for Column Mapping").
-        StructType physicalWriteSchema =
-            ColumnMapping.MapWriteSchemaToPhysical(writeSchema, readSnapshot.Schema, mode);
-        ImmutableArray<string> physicalPartitions =
-            ColumnMapping.PhysicalPartitionColumns(readSnapshot.Schema, logicalPartitions, mode).ToImmutableArray();
-        return (physicalWriteSchema, physicalPartitions);
-    }
-
-    // #525 residual fail-closed: evolving the LOGICAL schema of a name-mode table (an additive column, or an
-    // applied Delta type widening) would need to MINT a fresh delta.columnMapping.physicalName and bump
-    // delta.columnMapping.maxColumnId for the changed column, then re-emit the mapped metaData. Append/
-    // overwrite deliberately REUSE the existing physical mapping (never re-mint), so a would-be evolution is
-    // out of scope here and stays fail-closed — no unmapped/desynced column is ever committed. A plain
-    // (compatible, same-schema) append/overwrite has schemaEvolution == null and proceeds.
-    private static void RejectNameModeSchemaEvolution(ColumnMappingMode mode, MetadataAction? schemaEvolution)
-    {
-        if (mode == ColumnMappingMode.Name && schemaEvolution is not null)
+        if (mergedSchema is null)
         {
-            throw DeltaProtocolException.Unsupported(
-                "schema evolution (an additive column or an applied type widening) on a name-mode column-"
-                + "mapping table is not yet supported (#541): it would require minting a fresh "
-                + "'delta.columnMapping.physicalName' and bumping 'delta.columnMapping.maxColumnId' for the "
-                + "changed column, which append/overwrite (reusing the existing physical mapping) do not do. "
-                + "The write is rejected fail-closed to avoid committing an unmapped column.");
+            // name mode, compatible (same-logical-schema) write (#525): reuse the existing physical mapping,
+            // never re-mint — maxColumnId and every existing column's identity are unchanged.
+            StructType physical = ColumnMapping.MapWriteSchemaToPhysical(writeSchema, readSnapshot.Schema, mode);
+            ImmutableArray<string> physicalParts =
+                ColumnMapping.PhysicalPartitionColumns(readSnapshot.Schema, logicalPartitions, mode)
+                    .ToImmutableArray();
+            return (physical, physicalParts, null);
         }
+
+        // name mode, schema evolution (#541): mint a fresh physicalName+id for each NEW column (an applied
+        // widening keeps its identity), bump maxColumnId, and re-emit the mapped metaData. Stage the write
+        // columns (existing + new) under the EVOLVED mapping so a new column lands under its minted physical
+        // name; partition columns stay physical-keyed.
+        (StructType mappedEvolvedSchema, ImmutableSortedDictionary<string, string> evolvedConfiguration) =
+            ColumnMapping.EvolveNameModeMapping(
+                mergedSchema, readSnapshot.Schema, readSnapshot.Metadata.Configuration, _nameSource);
+
+        StructType evolvedPhysical =
+            ColumnMapping.MapWriteSchemaToPhysical(writeSchema, mappedEvolvedSchema, mode);
+        ImmutableArray<string> evolvedPhysicalParts =
+            ColumnMapping.PhysicalPartitionColumns(mappedEvolvedSchema, logicalPartitions, mode)
+                .ToImmutableArray();
+        MetadataAction evolution = readSnapshot.Metadata with
+        {
+            SchemaString = SchemaJson.ToJson(mappedEvolvedSchema),
+            Configuration = evolvedConfiguration,
+        };
+        return (evolvedPhysical, evolvedPhysicalParts, evolution);
     }
 
-    // #525: `overwriteSchema` (wholesale schema replacement, #496) stays fail-closed for a column-mapped
+    // Merges the incoming write schema against the table's current schema (an additive nullable column, or an
+    // applied Delta type widening), returning the merged LOGICAL schema, or null when the write is compatible
+    // and needs no schema change. Type widening is applied only when the table enabled it (`typeWidening`
+    // feature + `delta.enableTypeWidening`); otherwise a would-be widening stays fail-closed. Threads the
+    // partition columns so a partition-column type change is rejected with a clear reason. Throws
+    // DeltaSchemaMismatchException, fail-closed, if the write is incompatible or needs an evolution the mode
+    // forbids.
+    private static StructType? MergeSchema(
+        Snapshot readSnapshot, StructType writeSchema, SchemaEvolutionMode evolutionMode)
+    {
+        IReadOnlyCollection<string>? partitionColumns = readSnapshot.Metadata.PartitionColumns.IsDefaultOrEmpty
+            ? null
+            : readSnapshot.Metadata.PartitionColumns;
+        bool typeWideningEnabled = TypeWideningFeature.IsWriteEnabled(readSnapshot);
+        return DeltaSchemaEnforcer.Reconcile(
+            readSnapshot.Schema, writeSchema, evolutionMode, partitionColumns, typeWideningEnabled);
+    }
+
+    // #542: `overwriteSchema` (wholesale schema replacement, #496) stays fail-closed for a column-mapped
     // table. A destructive replacement can drop/reorder/re-type columns, desyncing the preserved
     // columnMapping.maxColumnId / per-field id+physicalName configuration from the replaced schema — a mapped
     // table whose metaData schema and configuration disagree. Rather than reconcile column ids here, the
@@ -797,24 +835,14 @@ internal sealed class DeltaTableWriter
     // Runs schema enforcement/evolution against the table's current schema BEFORE any action is built
     // (STORY-05.4.2 AC1/AC2). Returns null when the write is compatible and needs no schema change, or the
     // metaData action carrying the merged schema (all other fields copied from the current metadata) that
-    // the caller commits in the SAME version as the data actions. Threads the table's partition columns so a
-    // partition-column type change is rejected with a clear reason. Throws DeltaSchemaMismatchException, fail-
-    // closed, if the write is incompatible or needs an evolution the mode forbids.
+    // the caller commits in the SAME version as the data actions. Used by the empty-static-overwrite
+    // (truncate) path, which passes SchemaEvolutionMode.None (a would-be evolution is rejected fail-closed, so
+    // the returned metaData is always null there — the call is a compatibility gate). Throws
+    // DeltaSchemaMismatchException, fail-closed, if the write is incompatible.
     private static MetadataAction? ReconcileSchema(
         Snapshot readSnapshot, StructType writeSchema, SchemaEvolutionMode evolutionMode)
     {
-        IReadOnlyCollection<string>? partitionColumns = readSnapshot.Metadata.PartitionColumns.IsDefaultOrEmpty
-            ? null
-            : readSnapshot.Metadata.PartitionColumns;
-
-        // Type widening is applied only when the table has enabled it: the `typeWidening` table feature is in
-        // the protocol AND `delta.enableTypeWidening` is set (Delta PROTOCOL.md "Type Widening"). Otherwise a
-        // would-be widening stays fail-closed (TypeWideningUnsupported). This build enables type widening at
-        // table-create time (mirroring column mapping / deletion vectors) and never silently upgrades an
-        // unprepared table's protocol on a widening write.
-        bool typeWideningEnabled = TypeWideningFeature.IsWriteEnabled(readSnapshot);
-        StructType? mergedSchema = DeltaSchemaEnforcer.Reconcile(
-            readSnapshot.Schema, writeSchema, evolutionMode, partitionColumns, typeWideningEnabled);
+        StructType? mergedSchema = MergeSchema(readSnapshot, writeSchema, evolutionMode);
         return mergedSchema is null
             ? null
             : readSnapshot.Metadata with { SchemaString = SchemaJson.ToJson(mergedSchema) };

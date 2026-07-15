@@ -395,6 +395,86 @@ internal static class ColumnMapping
         return (new StructType(mapped), nextId);
     }
 
+    /// <summary>
+    /// Evolves a name-mode table's column mapping onto an additively-evolved logical
+    /// <paramref name="evolvedSchema"/> (#541). Each field already present in
+    /// <paramref name="currentMappedSchema"/> (matched by <b>logical</b> name) REUSES its existing
+    /// <c>delta.columnMapping.id</c> + <c>delta.columnMapping.physicalName</c> verbatim — an <b>applied type
+    /// widening</b> keeps the column's identity, only its type changes — while each <b>new</b> field mints a
+    /// fresh physical name from <paramref name="nameSource"/> plus a fresh monotonically increasing id
+    /// (<c>maxColumnId + 1, …</c>). Every other per-field metadata carried on the evolved field (e.g. a
+    /// <c>delta.typeChanges</c> entry from an applied widening, a column comment) is preserved. Returns the
+    /// mapped evolved schema and the configuration with the bumped <c>maxColumnId</c> (all other configuration
+    /// entries preserved). Mirrors the create-path minting (<see cref="AssignFreshMapping"/>) but never
+    /// re-mints an existing column's identity.
+    /// </summary>
+    /// <exception cref="DeltaProtocolException">The current schema's <c>maxColumnId</c> is missing/malformed,
+    /// a retained name-mode column carries no id, or an evolved field is a nested type.</exception>
+    public static (StructType Schema, ImmutableSortedDictionary<string, string> Configuration) EvolveNameModeMapping(
+        StructType evolvedSchema,
+        StructType currentMappedSchema,
+        ImmutableSortedDictionary<string, string> currentConfiguration,
+        IColumnPhysicalNameSource nameSource)
+    {
+        ArgumentNullException.ThrowIfNull(evolvedSchema);
+        ArgumentNullException.ThrowIfNull(currentMappedSchema);
+        ArgumentNullException.ThrowIfNull(currentConfiguration);
+        ArgumentNullException.ThrowIfNull(nameSource);
+
+        long nextId = ReadMaxColumnId(currentConfiguration);
+        var mapped = new List<StructField>(evolvedSchema.Count);
+        foreach (StructField field in evolvedSchema)
+        {
+            EnsureLeaf(field);
+
+            long id;
+            string physicalName;
+            if (currentMappedSchema.TryGetField(field.Name, out StructField existing))
+            {
+                // Existing (or applied-widened) column: reuse its identity verbatim — never re-mint, so
+                // committed data files under the prior physical name still resolve.
+                physicalName = PhysicalName(existing, ColumnMappingMode.Name);
+                if (!TryGetId(existing, out id))
+                {
+                    throw DeltaProtocolException.Inconsistent(
+                        string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"Name-mode column '{field.Name}' has no '{IdKey}'; the table schema is "
+                            + $"inconsistent and cannot be evolved."));
+                }
+            }
+            else
+            {
+                // New column (#541): mint a fresh physical name + a fresh monotonic id, bumping maxColumnId.
+                id = ++nextId;
+                physicalName = nameSource.NextPhysicalName();
+            }
+
+            // Preserve every non-mapping metadata entry (e.g. delta.typeChanges, a column comment) the merged
+            // field carries, then set the authoritative id + physicalName.
+            var entries = new List<KeyValuePair<string, MetadataValue>>(field.Metadata.Count + 2);
+            foreach (KeyValuePair<string, MetadataValue> entry in field.Metadata)
+            {
+                if (!string.Equals(entry.Key, IdKey, StringComparison.Ordinal)
+                    && !string.Equals(entry.Key, PhysicalNameKey, StringComparison.Ordinal))
+                {
+                    entries.Add(entry);
+                }
+            }
+
+            entries.Add(new KeyValuePair<string, MetadataValue>(IdKey, MetadataValue.Long(id)));
+            entries.Add(new KeyValuePair<string, MetadataValue>(
+                PhysicalNameKey, MetadataValue.String(physicalName)));
+
+            mapped.Add(new StructField(
+                field.Name, field.DataType, field.Nullable, FieldMetadata.FromValues(entries)));
+        }
+
+        ImmutableSortedDictionary<string, string> configuration =
+            currentConfiguration.SetItem(MaxColumnIdKey, nextId.ToString(CultureInfo.InvariantCulture));
+        return (new StructType(mapped), configuration);
+    }
+
     /// <summary>The <b>physical</b> schema for a mapped logical <paramref name="schema"/>: the same field
     /// order and types, but each field renamed to its physical name with the column-mapping metadata
     /// stripped — the exact shape a name-mode Parquet data file stores and is read by.</summary>
