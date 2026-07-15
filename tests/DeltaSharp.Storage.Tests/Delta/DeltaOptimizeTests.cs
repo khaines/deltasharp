@@ -1255,9 +1255,54 @@ public sealed class DeltaOptimizeTests : IDisposable
         Assert.Contains("'id'", ex.Message, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task Optimize_OnIdModeSnapshot_ThroughInternalSeam_IsRejectedFailClosed_Issue553()
+    {
+        // id mode is rejected at snapshot LOAD (EnsureModeGate, deferred to #523), so the public OPTIMIZE
+        // path never carries an id-mode snapshot. But the internal OptimizeAsync(Snapshot,…) seam accepts an
+        // explicit snapshot, so the guard's id branch must itself reject a hand-built (load-gate-bypassing)
+        // id-mode snapshot fail-closed — the exact defense a name-only guard (`== Name`) would silently drop.
+        Snapshot idMode = BuildUngatedIdModeSnapshot();
+
+        OptimizeColumnMappingUnsupportedException ex =
+            await Assert.ThrowsAsync<OptimizeColumnMappingUnsupportedException>(() => Optimize().OptimizeAsync(idMode));
+        Assert.Equal(ColumnMappingMode.Id, ex.Mode);
+    }
+
     // ---------------------------------------------------------------- helpers
 
     private DeltaLog Log() => new(_backend);
+
+    // A column-mapped (id-mode) snapshot constructed DIRECTLY (not via DeltaLog.LoadSnapshotAsync), so it
+    // deliberately BYPASSES the load-time gate (ColumnMapping.EnsureModeGate) and reaches DeltaOptimize's OWN
+    // defense-in-depth guard with a mode the primary gate would otherwise reject at load. No data files are
+    // needed — OPTIMIZE fails closed at the top before any file is planned or read. (Mirrors
+    // DeltaDeleteColumnMappingTests.BuildUngatedColumnMappingSnapshot.)
+    private static Snapshot BuildUngatedIdModeSnapshot()
+    {
+        var protocol = new ProtocolAction(
+            3, 7, ImmutableArray.Create("columnMapping"), ImmutableArray.Create("columnMapping"));
+        ImmutableSortedDictionary<string, string> configuration = ImmutableSortedDictionary<string, string>.Empty
+            .Add("delta.columnMapping.mode", "id")
+            .Add("delta.columnMapping.maxColumnId", "1");
+        var metadata = new MetadataAction(
+            Id: "ungated-id-mode",
+            Name: null,
+            Description: null,
+            Format: new TableFormat("parquet", ImmutableSortedDictionary<string, string>.Empty),
+            SchemaString: "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}",
+            PartitionColumns: ImmutableArray<string>.Empty,
+            Configuration: configuration,
+            CreatedTime: null);
+        return new Snapshot(
+            version: 0,
+            protocol,
+            metadata,
+            ImmutableArray<AddFileAction>.Empty,
+            ImmutableArray<RemoveFileAction>.Empty,
+            ImmutableSortedDictionary<string, long>.Empty,
+            SnapshotLoadMetrics.Empty);
+    }
 
     private DeltaOptimize Optimize(
         TimeProvider? timeProvider = null,
