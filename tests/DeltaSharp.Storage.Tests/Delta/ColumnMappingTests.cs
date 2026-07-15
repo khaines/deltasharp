@@ -1508,6 +1508,176 @@ public sealed class ColumnMappingTests : IDisposable
         Assert.Equal("3", snapshot.Metadata.Configuration[ColumnMapping.MaxColumnIdKey]); // no new column
     }
 
+    [Fact]
+    public async Task Overwrite_NameMode_Partitioned_OverwriteSchema_KeysPhysical_MetaDataLogical_Issue542()
+    {
+        // #542 partitioned: a same-schema overwriteSchema on a PARTITIONED name-mode table replaces the data,
+        // keeps metaData.partitionColumns LOGICAL, keys add.partitionValues PHYSICALLY, and reads back only the
+        // new rows — exercising the logical-vs-physical partition seam through the overwriteSchema path.
+        var schema = new StructType(new[]
+        {
+            new StructField("region", DataTypes.StringType, nullable: true),
+            new StructField("id", DataTypes.LongType, nullable: false),
+        });
+        static ManagedColumnBatch Batch(StructType s, string region, long id)
+        {
+            MutableColumnVector r = ColumnVectors.Create(DataTypes.StringType, 1);
+            MutableColumnVector i = ColumnVectors.Create(DataTypes.LongType, 1);
+            r.AppendBytes(Encoding.UTF8.GetBytes(region));
+            i.AppendValue(id);
+            return new ManagedColumnBatch(s, new ColumnVector[] { r, i }, 1);
+        }
+
+        Func<string> names = FileNames();
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names))
+        {
+            await target.CreateNameMappedTableAsync(
+                schema, new[] { "region" }, new[] { Batch(schema, "us", 1L) }, new SeededPhysicalNameSource(Seed));
+        }
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names))
+        {
+            DeltaWriteResult result = await target.OverwriteAsync(
+                schema, new[] { "region" }, new[] { Batch(schema, "eu", 2L) },
+                DeltaPartitionOverwriteMode.Static, overwriteSchema: true);
+            Assert.Equal(1L, result.Version);
+        }
+
+        using var backend = new LocalFileSystemBackend(_root);
+        Snapshot snapshot = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
+        string physicalRegion = ColumnMapping.PhysicalName(snapshot.Schema[0], ColumnMappingMode.Name);
+        Assert.Equal(new[] { "region" }, snapshot.Metadata.PartitionColumns.ToArray()); // LOGICAL
+        Assert.Single(snapshot.ActiveFiles); // prior partition replaced
+        Assert.True(snapshot.ActiveFiles[0].PartitionValues.ContainsKey(physicalRegion)); // PHYSICAL key
+        Assert.False(snapshot.ActiveFiles[0].PartitionValues.ContainsKey("region"));
+        Assert.NotEqual("region", physicalRegion);
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        var rows = new List<(string?, long)>();
+        foreach (ColumnBatch b in await source.ReadBatchesAsync(info.Version))
+        {
+            for (int r = 0; r < b.LogicalRowCount; r++)
+            {
+                ColumnVector rc = b.SelectedColumn(0);
+                ColumnVector ic = b.SelectedColumn(1);
+                rows.Add((rc.IsNull(r) ? null : Encoding.UTF8.GetString(rc.GetBytes(r)), ic.GetValue<long>(r)));
+            }
+        }
+
+        Assert.Equal(new (string?, long)[] { ("eu", 2L) }, rows); // only the replacement row
+    }
+
+    [Fact]
+    public async Task Overwrite_NameMode_DropThenAdd_DoesNotReuseRetiredId_Issue542()
+    {
+        // #542 cross-commit id retirement: dropping "name" (id 3) via overwriteSchema retires id 3; a LATER
+        // overwriteSchema that adds a column must mint id 4 — NEVER the retired 3 (id reuse is a Delta
+        // corruption class). maxColumnId is monotonic across commits.
+        await CreateNameMappedAsync((1L, 100L, "alice")); // {id,score,name} maxColumnId=3
+
+        using var backend = new LocalFileSystemBackend(_root);
+
+        // Commit 1: overwriteSchema DROP name → {id,score}, maxColumnId stays 3 (id 3 retired).
+        var writer1 = new DeltaTableWriter(
+            new DeltaLog(backend), new DeltaCommitter(backend),
+            new FixedTimeProvider(DateTimeOffset.UnixEpoch), new SeededPhysicalNameSource(EvolveSeed));
+        await writer1.CreateOrOverwriteAsync(
+            new StructType(new[]
+            {
+                new StructField("id", DataTypes.LongType, nullable: false),
+                new StructField("score", DataTypes.LongType, nullable: true),
+            }),
+            Array.Empty<string>(), new[] { StagedNoSchema("d1.parquet") },
+            PartitionOverwriteMode.Static, overwriteSchema: true, CancellationToken.None);
+        Assert.Equal("3", (await new DeltaLog(backend).LoadSnapshotAsync(version: null))
+            .Metadata.Configuration[ColumnMapping.MaxColumnIdKey]);
+
+        // Commit 2: overwriteSchema ADD fresh → {id,score,fresh}; "fresh" mints id 4 (not the retired 3).
+        var writer2 = new DeltaTableWriter(
+            new DeltaLog(backend), new DeltaCommitter(backend),
+            new FixedTimeProvider(DateTimeOffset.UnixEpoch), new SeededPhysicalNameSource(EvolveSeed2));
+        string mintedFresh = new SeededPhysicalNameSource(EvolveSeed2).NextPhysicalName();
+        await writer2.CreateOrOverwriteAsync(
+            new StructType(new[]
+            {
+                new StructField("id", DataTypes.LongType, nullable: false),
+                new StructField("score", DataTypes.LongType, nullable: true),
+                new StructField("fresh", DataTypes.StringType, nullable: true),
+            }),
+            Array.Empty<string>(), new[] { StagedNoSchema("d2.parquet") },
+            PartitionOverwriteMode.Static, overwriteSchema: true, CancellationToken.None);
+
+        Snapshot snapshot = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
+        AssertMapping(snapshot.Schema["id"], "id", 1, PhysId);
+        AssertMapping(snapshot.Schema["score"], "score", 2, PhysScore);
+        AssertMapping(snapshot.Schema["fresh"], "fresh", 4, mintedFresh); // id 4, NOT the retired 3
+        Assert.NotEqual(PhysName, mintedFresh); // and not the retired physical name
+        Assert.Equal("4", snapshot.Metadata.Configuration[ColumnMapping.MaxColumnIdKey]);
+    }
+
+    [Fact]
+    public async Task Overwrite_NameMode_Reorder_PreservesIdentityByName_Issue542()
+    {
+        // #542 reorder: an overwriteSchema that REORDERS columns keeps each column's id + physicalName pinned
+        // by LOGICAL name (the canonical column-mapping guarantee), independent of the new field order.
+        await CreateNameMappedAsync((1L, 100L, "alice")); // {id,score,name} ids 1..3
+
+        using var backend = new LocalFileSystemBackend(_root);
+        var writer = new DeltaTableWriter(
+            new DeltaLog(backend), new DeltaCommitter(backend),
+            new FixedTimeProvider(DateTimeOffset.UnixEpoch), new SeededPhysicalNameSource(EvolveSeed));
+        await writer.CreateOrOverwriteAsync(
+            new StructType(new[]
+            {
+                new StructField("name", DataTypes.StringType, nullable: true),
+                new StructField("id", DataTypes.LongType, nullable: false),
+                new StructField("score", DataTypes.LongType, nullable: true),
+            }),
+            Array.Empty<string>(), new[] { StagedNoSchema("reorder.parquet") },
+            PartitionOverwriteMode.Static, overwriteSchema: true, CancellationToken.None);
+
+        Snapshot snapshot = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
+        // New field ORDER is name, id, score; identities stay pinned by name (name=3, id=1, score=2).
+        Assert.Equal(new[] { "name", "id", "score" }, snapshot.Schema.Select(f => f.Name).ToArray());
+        AssertMapping(snapshot.Schema["name"], "name", 3, PhysName);
+        AssertMapping(snapshot.Schema["id"], "id", 1, PhysId);
+        AssertMapping(snapshot.Schema["score"], "score", 2, PhysScore);
+        Assert.Equal("3", snapshot.Metadata.Configuration[ColumnMapping.MaxColumnIdKey]); // no new column
+    }
+
+    [Fact]
+    public async Task Overwrite_NameMode_EmptySameSchema_OnEmptyTable_IsNoOp_Issue542()
+    {
+        // #542 idempotent no-op guard: an empty overwriteSchema (0 files) against an ALREADY-EMPTY name-mode
+        // table whose (reconciled) schema is unchanged must short-circuit to Skipped (version unchanged),
+        // never a 0-remove/0-add empty commit.
+        const string ValuePhysical = "col-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        string schemaJson =
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"value\",\"type\":\"long\",\"nullable\":true,\"metadata\":"
+            + $"{{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"{ValuePhysical}\"}}}}]}}";
+
+        using var backend = new LocalFileSystemBackend(_root);
+        byte[] commit = Encoding.UTF8.GetBytes(
+            ProtocolFeatureLine() + "\n"
+            + NameModeMetadataLine(
+                schemaJson, Array.Empty<string>(),
+                ("delta.columnMapping.mode", "name"),
+                ("delta.columnMapping.maxColumnId", "1")) + "\n");
+        await backend.PutIfAbsentAsync("_delta_log/00000000000000000000.json", commit, CancellationToken.None);
+
+        var writer = new DeltaTableWriter(backend);
+        DeltaCommitResult result = await writer.CreateOrOverwriteAsync(
+            new StructType(new[] { new StructField("value", DataTypes.LongType, nullable: true) }),
+            Array.Empty<string>(), Array.Empty<StagedDataFile>(),
+            PartitionOverwriteMode.Static, overwriteSchema: true, CancellationToken.None);
+
+        Assert.True(result.Skipped);
+        Assert.Equal(0L, (await new DeltaLog(backend).LoadSnapshotAsync(version: null)).Version);
+    }
+
     // Writes a REAL Parquet data file under the evolved PHYSICAL schema (existing physical names + the minted
     // one) and returns a staged add carrying that footer DataSchema, so the #497 write-door cross-check runs.
     private static async Task<StagedDataFile> StagePhysicalEvolvedAsync(
