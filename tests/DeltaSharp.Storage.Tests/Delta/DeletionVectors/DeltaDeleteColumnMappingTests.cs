@@ -262,6 +262,42 @@ public sealed class DeltaDeleteColumnMappingTests : IDisposable
         Assert.Equal(new[] { "id", "payload" }, names);
     }
 
+    [Fact]
+    public void BuildDataSchema_CarriesFieldMetadataThroughToRewriteSchema_Issue545()
+    {
+        // #545 fold regression: the shared ColumnMappingProjection.BuildDataSchema feeds three consumers — the
+        // DeltaReadSource scan and the merge-on-read DELETE predicate projection (both read-only; a DELETE
+        // writes a deletion vector, NOT a rewritten data file), and OPTIMIZE compaction, which re-serializes
+        // this schema into the compacted data file's footer schema JSON (org.apache.spark.sql.parquet.row.metadata).
+        // The seam must carry each retained field's Metadata through — only the NAME is relabeled to physical —
+        // otherwise OPTIMIZE would emit a metadata-stripped footer for a None-mode table with column comments /
+        // generated-column config, silently losing self-describing fidelity vs. the source files (the divergence
+        // that made the OPTIMIZE fold NOT behavior-identical before this fix). Reconstruction drops Metadata by
+        // default (3-arg ctor), so this is the load-bearing oracle.
+        FieldMetadata comment = FieldMetadata.FromEntries(
+            new[] { new KeyValuePair<string, string>("comment", "the primary key") });
+        var schema = new StructType(new[]
+        {
+            new StructField("region", DataTypes.StringType, nullable: true),
+            new StructField("id", DataTypes.LongType, nullable: false, comment),
+            new StructField("value", DataTypes.StringType, nullable: true),
+        });
+        string[] physicalNames = ColumnMappingProjection.ResolvePhysicalNames(schema, ColumnMappingMode.None);
+
+        // Unpartitioned: every field retained; the metadata-bearing field keeps its metadata (not FieldMetadata.Empty).
+        StructType unpartitioned = ColumnMappingProjection.BuildDataSchema(
+            schema, physicalNames, ImmutableArray<string>.Empty);
+        Assert.Equal(3, unpartitioned.Count);
+        Assert.Equal(comment, unpartitioned["id"].Metadata);
+        Assert.False(unpartitioned["id"].Metadata.IsEmpty);
+
+        // Partitioned (exclude "region"): the surviving metadata-bearing data field still carries its metadata.
+        StructType partitioned = ColumnMappingProjection.BuildDataSchema(
+            schema, physicalNames, ImmutableArray.Create("region"));
+        Assert.Equal(new[] { "id", "value" }, new[] { partitioned[0].Name, partitioned[1].Name });
+        Assert.Equal(comment, partitioned["id"].Metadata);
+    }
+
     // ------------------------------------------------------------------ none mode: regression (unchanged)
 
     [Fact]
