@@ -35,7 +35,7 @@ internal static class ByteSortableEncoding
     public static bool IsSupportedKeyType(DataType type) => type switch
     {
         BooleanType or ByteType or ShortType or IntegerType or LongType
-            or FloatType or DoubleType or DateType or TimestampType
+            or FloatType or DoubleType or DateType or TimestampType or TimestampNtzType
             or DecimalType or StringType or BinaryType => true,
         _ => false,
     };
@@ -52,7 +52,7 @@ internal static class ByteSortableEncoding
         ByteType => 1,
         ShortType => 2,
         IntegerType or DateType => 4,
-        LongType or TimestampType => 8,
+        LongType or TimestampType or TimestampNtzType => 8,
         FloatType => 4,
         DoubleType => 8,
         DecimalType => 16,
@@ -75,7 +75,7 @@ internal static class ByteSortableEncoding
             ByteType => WriteSByte(Cast<sbyte>(value, type), destination),
             ShortType => WriteInt16(Cast<short>(value, type), destination),
             IntegerType or DateType => WriteInt32(Cast<int>(value, type), destination),
-            LongType or TimestampType => WriteInt64(Cast<long>(value, type), destination),
+            LongType or TimestampType or TimestampNtzType => WriteInt64(Cast<long>(value, type), destination),
             FloatType => WriteSingle(Cast<float>(value, type), destination),
             DoubleType => WriteDouble(Cast<double>(value, type), destination),
             DecimalType => WriteInt128(Cast<Int128>(value, type), destination),

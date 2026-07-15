@@ -70,7 +70,7 @@ public sealed class ParquetSchemaMappingTests
             Assert.Equal(DateTimeFormat.Date, date.DateTimeFormat);
 
             var ts = Assert.IsType<DateTimeDataField>(Field("ts"));
-            Assert.Equal(DateTimeFormat.DateAndTimeMicros, ts.DateTimeFormat);
+            Assert.Equal(DateTimeFormat.Timestamp, ts.DateTimeFormat);
             Assert.Equal(DateTimeTimeUnit.Micros, ts.Unit);
             Assert.True(ts.IsAdjustedToUTC);
 

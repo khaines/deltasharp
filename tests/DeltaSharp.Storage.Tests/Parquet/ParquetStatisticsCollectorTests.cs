@@ -61,6 +61,28 @@ public sealed class ParquetStatisticsCollectorTests
     }
 
     [Fact]
+    public void TimestampNtz_RecordsLongMinMaxNullCount_CollectorMatchesPolicy()
+    {
+        // #533: timestamp_ntz is advertised by StatisticsPolicy.IsSupportedForStatistics, so the collector
+        // MUST have a matching arm — not fall to the default that returns null min/max + NullCount:0 (which
+        // would let a reader wrongly prune on IS NULL). Pins policy↔collector agreement on the long lane.
+        Assert.True(StatisticsPolicy.Default.IsSupportedForStatistics(DataTypes.TimestampNtzType));
+
+        StructType schema = Schema("ts", DataTypes.TimestampNtzType);
+        MutableColumnVector v = ColumnVectors.Create(DataTypes.TimestampNtzType, 4);
+        v.AppendValue(1_000_000L);
+        v.AppendNull();
+        v.AppendValue(-2_000_000L);
+        v.AppendValue(5_000_000L);
+        FileStatistics stats = Collect(schema, Batch(schema, v));
+
+        Assert.Equal(DeltaStatValue.OfLong(-2_000_000L), stats.MinValues["ts"]);
+        Assert.Equal(DeltaStatValue.OfLong(5_000_000L), stats.MaxValues["ts"]);
+        Assert.Equal(1L, stats.NullCount["ts"]);
+        Assert.Equal(DeltaStatKind.Long, stats.MinValues["ts"].Kind);
+    }
+
+    [Fact]
     public void Byte_ComparesAsSignedTinyint()
     {
         StructType schema = Schema("b", DataTypes.ByteType);

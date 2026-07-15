@@ -241,6 +241,7 @@ internal static class SchemaJson
             "binary" => BinaryType.Instance,
             "date" => DateType.Instance,
             "timestamp" => TimestampType.Instance,
+            "timestamp_ntz" => TimestampNtzType.Instance,
             "void" or "null" => NullType.Instance,
             _ => throw new SchemaValidationException($"Unknown type name '{name}'."),
         };

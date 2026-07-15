@@ -106,6 +106,10 @@ internal static class TestData
     public static ColumnVector Timestamps(params long?[] epochMicros) =>
         Fixed(TimestampType.Instance, epochMicros, static (v, x) => v.AppendValue(x));
 
+    // A timestamp_ntz lane stores the same epoch-micros long as timestamp but is timezone-less (#533).
+    public static ColumnVector TimestampsNtz(params long?[] epochMicros) =>
+        Fixed(TimestampNtzType.Instance, epochMicros, static (v, x) => v.AppendValue(x));
+
     // A compact decimal(p<=18, s) lane stores the unscaled value as a long.
     public static ColumnVector DecimalsCompact(DecimalType type, params long?[] unscaled) =>
         Fixed(type, unscaled, static (v, x) => v.AppendValue(x));

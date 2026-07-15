@@ -88,7 +88,7 @@ internal static class DeltaReadEncoding
             case DateType:
                 Fill(vector, ParseDate(value), rowCount);
                 break;
-            case TimestampType:
+            case TimestampType or TimestampNtzType:
                 Fill(vector, ParseTimestamp(value), rowCount);
                 break;
             case DecimalType decimalType:

@@ -88,6 +88,7 @@ internal static class ParquetStatisticsCollector
             LongType => CollectInteger(batches, columnIndex, static (vector, row) => vector.GetValue<long>(row)),
             DateType => CollectInteger(batches, columnIndex, static (vector, row) => vector.GetValue<int>(row)),
             TimestampType => CollectInteger(batches, columnIndex, static (vector, row) => vector.GetValue<long>(row)),
+            TimestampNtzType => CollectInteger(batches, columnIndex, static (vector, row) => vector.GetValue<long>(row)),
             FloatType => CollectDouble(batches, columnIndex, static (vector, row) => vector.GetValue<float>(row)),
             DoubleType => CollectDouble(batches, columnIndex, static (vector, row) => vector.GetValue<double>(row)),
             DecimalType decimalType => CollectDecimal(batches, columnIndex, decimalType),

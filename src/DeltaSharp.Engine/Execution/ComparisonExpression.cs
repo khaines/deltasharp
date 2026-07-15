@@ -125,6 +125,7 @@ public sealed class ComparisonExpression : PhysicalExpression
             (BinaryType, BinaryType) => ComparisonEvalKind.Binary,
             (DateType, DateType) => ComparisonEvalKind.Date,
             (TimestampType, TimestampType) => ComparisonEvalKind.Timestamp,
+            (TimestampNtzType, TimestampNtzType) => ComparisonEvalKind.Timestamp,
             (DateType, TimestampType) or (TimestampType, DateType) => ComparisonEvalKind.DateTimestamp,
             _ => throw new ArgumentException(
                 $"Comparison '{op}' is not defined for operands '{l.SimpleString}' and '{r.SimpleString}'."),

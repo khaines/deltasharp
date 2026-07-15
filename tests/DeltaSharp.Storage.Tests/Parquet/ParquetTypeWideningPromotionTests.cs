@@ -262,6 +262,64 @@ public sealed class ParquetTypeWideningPromotionTests
     }
 
     [Fact]
+    public async Task Date_To_TimestampNtz()
+    {
+        // date (epoch-day INT32) → timestamp_ntz (epoch-micros INT64 at MIDNIGHT of the date, no session
+        // offset). #533. A real DATE file is written and read back under the widened timestamp_ntz schema; the
+        // promoted values are asserted to the exact midnight-micros, so a wrong scale/offset fails.
+        const long microsPerDay = 86_400L * 1_000_000L;
+        ColumnVector v = await PromoteAsync(DataTypes.DateType, DataTypes.TimestampNtzType,
+            c => { c.AppendValue(0); c.AppendValue(1); c.AppendValue(-1); c.AppendValue(18_000); }, 4);
+        Assert.Equal(
+            new[] { 0L, microsPerDay, -microsPerDay, 18_000L * microsPerDay },
+            v.GetValues<long>().ToArray());
+    }
+
+    [Fact]
+    public async Task Date_To_TimestampNtz_WithNulls_PromotesAndPreservesNulls()
+    {
+        const long microsPerDay = 86_400L * 1_000_000L;
+        ColumnVector v = await PromoteAsync(DataTypes.DateType, DataTypes.TimestampNtzType,
+            c => { c.AppendValue(2); c.AppendNull(); c.AppendValue(-3); }, 3);
+        Assert.Equal(2L * microsPerDay, v.GetValue<long>(0));
+        Assert.True(v.IsNull(1));
+        Assert.Equal(-3L * microsPerDay, v.GetValue<long>(2));
+    }
+
+    [Fact]
+    public async Task Date_To_TimestampNtz_WithoutPromotionGate_FailsClosed()
+    {
+        // A DATE file read under a WIDE `timestamp_ntz` schema with the promotion gate CLOSED (no
+        // `typeWidening` feature) must FAIL CLOSED as SchemaMismatch — never silently promoted.
+        var writeSchema = new StructType(new[] { new StructField("v", DataTypes.DateType, nullable: true) });
+        ManagedColumnBatch batch = OneColumn(DataTypes.DateType, c => { c.AppendValue(0); c.AppendValue(1); }, 2);
+        byte[] bytes = await ParquetTestHelpers.WriteToBytesAsync(writeSchema, new[] { batch });
+
+        var readSchema = new StructType(new[] { new StructField("v", DataTypes.TimestampNtzType, nullable: true) });
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(bytes, readSchema, keepRowGroup: null, allowTypeWideningPromotion: false));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+    }
+
+    [Fact]
+    public async Task Date_To_TimestampLtz_IsNotPromotable_FailsClosedEvenWithGate()
+    {
+        // date→timestamp with a timezone (LTZ) is NOT a sanctioned widening (only date→timestamp_ntz is), so
+        // even with the promotion gate OPEN it must fail closed — the reader never silently reinterprets a
+        // DATE file as an LTZ timestamp.
+        var writeSchema = new StructType(new[] { new StructField("v", DataTypes.DateType, nullable: true) });
+        ManagedColumnBatch batch = OneColumn(DataTypes.DateType, c => { c.AppendValue(0); c.AppendValue(1); }, 2);
+        byte[] bytes = await ParquetTestHelpers.WriteToBytesAsync(writeSchema, new[] { batch });
+
+        var readSchema = new StructType(new[] { new StructField("v", DataTypes.TimestampType, nullable: true) });
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(bytes, readSchema, keepRowGroup: null, allowTypeWideningPromotion: true));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+    }
+
+    [Fact]
     public async Task Int_To_Long_ComposesWithNullFillMissingColumn()
     {
         // OLD file: single Int32 column "v". CURRENT schema: widened `long v` PLUS a brand-new column "added"

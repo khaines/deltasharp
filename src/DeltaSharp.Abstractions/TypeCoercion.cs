@@ -33,7 +33,8 @@ public static class TypeCoercion
 
     /// <summary>
     /// The tightest common type without lossy promotion (Spark <c>findTightestCommonType</c>):
-    /// equal types, null promotion, integer widening, exact decimals, and <c>date→timestamp</c>.
+    /// equal types, null promotion, integer widening, exact decimals, and the temporal promotions
+    /// <c>date→timestamp</c> and <c>date→timestamp_ntz</c>.
     /// An integer promotes to a decimal only when that decimal losslessly holds it (Spark
     /// <c>DecimalType.isWiderThan</c>); a narrower decimal has no tightest common type (returns
     /// null). Returns null when there is no lossless common type.
@@ -78,6 +79,11 @@ public static class TypeCoercion
         if ((left is DateType && right is TimestampType) || (left is TimestampType && right is DateType))
         {
             return TimestampType.Instance;
+        }
+
+        if ((left is DateType && right is TimestampNtzType) || (left is TimestampNtzType && right is DateType))
+        {
+            return TimestampNtzType.Instance;
         }
 
         return null;

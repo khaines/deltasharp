@@ -60,7 +60,7 @@ internal static class DeltaWriteEncoding
             case DateType:
                 destination.AppendValue(source.GetValue<int>(row));
                 break;
-            case TimestampType:
+            case TimestampType or TimestampNtzType:
                 destination.AppendValue(source.GetValue<long>(row));
                 break;
             case DecimalType decimalType:
@@ -105,7 +105,7 @@ internal static class DeltaWriteEncoding
             DoubleType => source.GetValue<double>(row).ToString("R", CultureInfo.InvariantCulture),
             StringType => Encoding.UTF8.GetString(source.GetBytes(row)),
             DateType => UnixEpochDate.AddDays(source.GetValue<int>(row)).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
-            TimestampType => FormatTimestamp(source.GetValue<long>(row)),
+            TimestampType or TimestampNtzType => FormatTimestamp(source.GetValue<long>(row)),
             DecimalType decimalType => FormatDecimal(source, row, decimalType),
             _ => throw new DeltaStorageException(
                 StorageErrorKind.UnsupportedFeature,

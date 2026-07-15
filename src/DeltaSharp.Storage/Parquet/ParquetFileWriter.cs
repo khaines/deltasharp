@@ -247,7 +247,10 @@ internal sealed class ParquetFileWriter
                     static (vector, row) => ParquetTypeMapping.EpochDayToDateTime(vector.GetValue<int>(row)),
                     cancellationToken).ConfigureAwait(false);
                 break;
-            case TimestampType:
+            case TimestampType or TimestampNtzType:
+                // Both TIMESTAMP (LTZ) and TIMESTAMP_NTZ store INT64 epoch-micros; the isAdjustedToUTC
+                // annotation (set by ParquetTypeMapping.CreateField from the DataType) is the only wire
+                // difference. The stored long is identical for both lanes (#533/#557).
                 await WriteValueAsync<DateTime>(rowGroup, field, nullable, selectedColumns, columnIndex, segments, size,
                     static (vector, row) => ParquetTypeMapping.EpochMicrosToDateTime(vector.GetValue<long>(row)),
                     cancellationToken).ConfigureAwait(false);

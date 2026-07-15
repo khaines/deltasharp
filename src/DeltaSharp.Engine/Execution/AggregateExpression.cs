@@ -163,6 +163,6 @@ public sealed class AggregateExpression : PhysicalExpression
     /// </summary>
     private static bool IsOrderable(DataType type) =>
         type is BooleanType or ByteType or ShortType or IntegerType or LongType
-            or FloatType or DoubleType or DecimalType or DateType or TimestampType
+            or FloatType or DoubleType or DecimalType or DateType or TimestampType or TimestampNtzType
             or StringType or BinaryType;
 }
