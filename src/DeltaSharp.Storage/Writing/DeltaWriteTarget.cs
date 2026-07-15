@@ -55,11 +55,22 @@ public sealed class DeltaWriteTarget : IDisposable
     private readonly TimeProvider _timeProvider;
     private readonly Func<string> _fileNameFactory;
 
-    private DeltaWriteTarget(LocalFileSystemBackend backend, TimeProvider timeProvider, Func<string> fileNameFactory)
+    private DeltaWriteTarget(
+        LocalFileSystemBackend backend,
+        TimeProvider timeProvider,
+        Func<string> fileNameFactory,
+        IColumnPhysicalNameSource? nameSource = null)
     {
         _backend = backend;
         _log = new DeltaLog(backend);
-        _writer = new DeltaTableWriter(backend);
+
+        // Construct the committer with an optional injectable physical-name source (null ⇒ the production
+        // crypto RNG). This is byte-for-byte equivalent to `new DeltaTableWriter(backend)` when nameSource is
+        // null; a test injects a deterministic source so a name-mode evolution (#556) mints golden physical
+        // names. TimeProvider.System matches the pre-#556 committer clock (the door's own _timeProvider drives
+        // only staged-file mtime).
+        _writer = new DeltaTableWriter(
+            new DeltaLog(backend), new DeltaCommitter(backend), TimeProvider.System, nameSource);
         _timeProvider = timeProvider;
         _fileNameFactory = fileNameFactory;
     }
@@ -84,9 +95,38 @@ public sealed class DeltaWriteTarget : IDisposable
         return new DeltaWriteTarget(new LocalFileSystemBackend(tablePath), timeProvider, fileNameFactory);
     }
 
+    // A deterministic test factory that ALSO injects the committer's physical-name source, so a name-mode
+    // schema-evolution / overwriteSchema-add through the door (#556) mints golden physical names. Sharing one
+    // seeded source instance across the create call and this writer keeps the minted col-<uuid> sequence
+    // monotonic (no collision between the create-time and evolution-time mints).
+    internal static DeltaWriteTarget ForLocalPath(
+        string tablePath, TimeProvider timeProvider, Func<string> fileNameFactory, IColumnPhysicalNameSource nameSource)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(tablePath);
+        ArgumentNullException.ThrowIfNull(timeProvider);
+        ArgumentNullException.ThrowIfNull(fileNameFactory);
+        ArgumentNullException.ThrowIfNull(nameSource);
+        return new DeltaWriteTarget(new LocalFileSystemBackend(tablePath), timeProvider, fileNameFactory, nameSource);
+    }
+
     // A collision-resistant data-file name from the sanctioned deterministic RNG (never the banned
     // Guid.NewGuid), so two concurrent writers never stage the same physical path (mirrors DeltaOptimize).
     private static string DefaultFileNameFactory() => Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
+
+    // Whether any batch carries at least one logical row — the write actually has data to stage. An
+    // empty append (no batches, or only zero-row batches) is a benign no-op on an existing table.
+    private static bool HasRows(IReadOnlyList<ColumnBatch> batches)
+    {
+        foreach (ColumnBatch batch in batches)
+        {
+            if (batch.LogicalRowCount > 0)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 
     /// <summary>Whether a Delta table already exists at this path (any committed version). Used to honor
     /// Ignore/ErrorIfExists before the write query executes.</summary>
@@ -97,24 +137,62 @@ public sealed class DeltaWriteTarget : IDisposable
     /// <param name="writeSchema">The full write schema (partition + data columns).</param>
     /// <param name="partitionColumns">The partition column names, in order (a subset of the schema).</param>
     /// <param name="batches">The full-schema batches to write.</param>
+    /// <param name="mergeSchema">Whether an incompatible-but-additive write may EVOLVE the schema (Spark's
+    /// <c>mergeSchema</c> write option — add a new nullable column / apply a sanctioned type widening the
+    /// table enables) or must strictly conform to it (<see langword="false"/>, the default). Under
+    /// column-mapping name mode a new column is minted a fresh physical name ONCE and staged under it, so the
+    /// door and the commit agree on the physical identity (#556).</param>
     /// <param name="cancellationToken">Cancels staging and the commit.</param>
     public async Task<DeltaWriteResult> AppendAsync(
         StructType writeSchema,
         IReadOnlyList<string> partitionColumns,
         IReadOnlyList<ColumnBatch> batches,
+        bool mergeSchema = false,
         CancellationToken cancellationToken = default)
     {
-        // #525: for an EXISTING name-mode column-mapped table, stage under the table's PHYSICAL schema so the
-        // appended Parquet files carry the col-<uuid> names + physical-keyed partitionValues (matching the
-        // create path). For a fresh path / `none`-mode table this returns the logical schema unchanged.
-        (StructType stagingSchema, IReadOnlyList<string> stagingPartitions) =
-            await ResolvePhysicalStagingAsync(writeSchema, partitionColumns, cancellationToken).ConfigureAwait(false);
+        ArgumentNullException.ThrowIfNull(writeSchema);
+        ArgumentNullException.ThrowIfNull(partitionColumns);
+        ArgumentNullException.ThrowIfNull(batches);
+
+        SchemaEvolutionMode evolutionMode = mergeSchema ? SchemaEvolutionMode.MergeSchema : SchemaEvolutionMode.None;
+
+        if (await _log.GetLatestCommitVersionAsync(cancellationToken).ConfigureAwait(false) is null)
+        {
+            // Fresh path: the write CREATES a plain (none-mode) table — logical==physical, nothing to mint,
+            // and evolutionMode is moot (the declared schema becomes version 0). A name-mode table is created
+            // via CreateNameMappedTableAsync, not this facade path.
+            (IReadOnlyList<StagedDataFile> createFiles, long createRows) =
+                await StageAsync(writeSchema, partitionColumns, batches, cancellationToken).ConfigureAwait(false);
+            DeltaCommitResult created = await _writer
+                .CreateOrAppendAsync(writeSchema, partitionColumns, createFiles, cancellationToken)
+                .ConfigureAwait(false);
+            return new DeltaWriteResult(created.Version, createFiles.Count, createRows);
+        }
+
+        // #525/#541/#556: resolve the physical staging shape against the loaded snapshot, minting a name-mode
+        // additive/widening column's physicalName+id EXACTLY ONCE, then stage under those physical names and
+        // commit the SAME plan — so the appended Parquet bytes and the committed metaData never disagree on a
+        // column's physical identity (no independent door-vs-committer mint). For a `none`-mode table or a
+        // compatible (same-schema) write this reduces to the pre-#556 staging behavior.
+        Snapshot snapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
+
+        // An empty append to an existing table adds nothing — a benign no-op (Spark parity), mirroring
+        // DeltaTableWriter.CreateOrAppendAsync (whose 0-file branch returns Skipped BEFORE any schema
+        // enforcement). Short-circuit BEFORE planning so an empty append neither runs enforcement nor mints
+        // (an empty write carries no rows to define a new column) — #556 council: Architect/Reliability R1.
+        if (!HasRows(batches))
+        {
+            return new DeltaWriteResult(snapshot.Version, 0, 0L);
+        }
+
+        DeltaWritePlan plan = _writer.PlanAppend(snapshot, writeSchema, evolutionMode);
 
         (IReadOnlyList<StagedDataFile> files, long rows) =
-            await StageAsync(stagingSchema, stagingPartitions, batches, cancellationToken).ConfigureAwait(false);
+            await StageAsync(plan.PhysicalWriteSchema, plan.PhysicalPartitionColumns, batches, cancellationToken)
+                .ConfigureAwait(false);
+
         DeltaCommitResult commit = await _writer
-            .CreateOrAppendAsync(writeSchema, partitionColumns, files, cancellationToken)
-            .ConfigureAwait(false);
+            .CommitAppendAsync(snapshot, plan, files, cancellationToken).ConfigureAwait(false);
         return new DeltaWriteResult(commit.Version, files.Count, rows);
     }
 
@@ -128,11 +206,11 @@ public sealed class DeltaWriteTarget : IDisposable
     /// untouched partitions would still carry the old schema). The staged files are gated against the new
     /// schema, so the committed metadata matches the real bytes.</para>
     /// <para>For a <b>name-mode column-mapped</b> table, this door supports an <c>overwriteSchema</c> that
-    /// keeps the same columns or drops / reorders / retypes them (the reconcile is handled by
-    /// <c>DeltaTableWriter.OverwriteReplaceSchemaAsync</c>, #542); ADDING a new column through this door is not
-    /// yet supported (the door stages against the existing mapping and cannot stage a brand-new minted
-    /// physical column), so it fails closed — the same door limitation as additive/widening evolution (#541).
-    /// Exposing add-through-the-door is tracked in #556.</para></summary>
+    /// keeps the same columns, drops / reorders / retypes them, <b>or ADDS a new column</b> (#556): the door
+    /// reconciles the columnMapping (minting a new column's physical name+id ONCE), stages the Parquet files
+    /// under the resulting physical names, and commits that same mapping — so the staged bytes and the
+    /// committed <c>metaData</c> agree on every column's physical identity. <c>id</c> mode stays fail-closed
+    /// (#523, rejected at snapshot load).</para></summary>
     /// <exception cref="ArgumentException"><paramref name="overwriteSchema"/> is combined with
     /// <see cref="DeltaPartitionOverwriteMode.Dynamic"/> (only a full/Static overwrite may replace the schema).</exception>
     public async Task<DeltaWriteResult> OverwriteAsync(
@@ -143,8 +221,34 @@ public sealed class DeltaWriteTarget : IDisposable
         bool overwriteSchema = false,
         CancellationToken cancellationToken = default)
     {
-        // #525: stage under the table's PHYSICAL schema for an EXISTING name-mode table (see AppendAsync).
-        // overwriteSchema on a column-mapped table is rejected fail-closed downstream (CreateOrOverwriteAsync).
+        ArgumentNullException.ThrowIfNull(writeSchema);
+        ArgumentNullException.ThrowIfNull(partitionColumns);
+        ArgumentNullException.ThrowIfNull(batches);
+
+        // #556: a wholesale overwriteSchema replacement on an EXISTING table (Static/full overwrite only)
+        // routes through the plan/commit split so a name-mode ADD mints the new column's physical name+id
+        // ONCE and stages under it. A fresh path, a `none`-mode drop/retype/reorder, and — crucially — the
+        // dynamic+overwriteSchema REJECT all keep the pre-#556 route below (CreateOrOverwriteAsync validates
+        // overwriteSchema, including throwing for a dynamic partition overwrite).
+        if (overwriteSchema
+            && partitionOverwriteMode == DeltaPartitionOverwriteMode.Static
+            && await _log.GetLatestCommitVersionAsync(cancellationToken).ConfigureAwait(false) is not null)
+        {
+            Snapshot snapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
+            DeltaWritePlan plan = _writer.PlanOverwriteReplaceSchema(snapshot, writeSchema, partitionColumns);
+
+            (IReadOnlyList<StagedDataFile> replaceFiles, long replaceRows) =
+                await StageAsync(plan.PhysicalWriteSchema, plan.PhysicalPartitionColumns, batches, cancellationToken)
+                    .ConfigureAwait(false);
+            DeltaCommitResult replaced = await _writer
+                .CommitOverwriteReplaceSchemaAsync(snapshot, plan, replaceFiles, cancellationToken)
+                .ConfigureAwait(false);
+            return new DeltaWriteResult(replaced.Version, replaceFiles.Count, replaceRows);
+        }
+
+        // #525: stage under the table's PHYSICAL schema for an EXISTING name-mode table (see AppendAsync); a
+        // fresh path or a `none`-mode table returns the logical schema unchanged. The mode-aware overwrite
+        // (incl. the dynamic+overwriteSchema reject and fresh-create) is applied by CreateOrOverwriteAsync.
         (StructType stagingSchema, IReadOnlyList<string> stagingPartitions) =
             await ResolvePhysicalStagingAsync(writeSchema, partitionColumns, cancellationToken).ConfigureAwait(false);
 
