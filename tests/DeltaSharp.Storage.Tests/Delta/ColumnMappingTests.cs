@@ -735,8 +735,9 @@ public sealed class ColumnMappingTests : IDisposable
     // #542: overwriteSchema (wholesale schema replacement) is now SUPPORTED for a name-mode table — a
     // same-schema overwriteSchema through the public door replaces the data and preserves the columnMapping
     // (every column keeps its id + physicalName; maxColumnId unchanged). (Schema-CHANGING overwriteSchema —
-    // drop / add-with-mint / retype — is exercised via the DeltaTableWriter mechanism tests below, since the
-    // public door stages against the existing mapping and cannot stage a brand-new column.)
+    // drop / add-with-mint / retype — is exercised via the DeltaTableWriter mechanism tests below. The public
+    // door can drop/reorder/retype but cannot stage a brand-new minted column, so add-through-the-door is
+    // tracked in #556 — the same door limitation as additive evolution #541.)
     [Fact]
     public async Task OverwriteSchema_OnNameModeTable_SameSchema_ReplacesData_AndPreservesMapping_Issue542()
     {
@@ -774,6 +775,36 @@ public sealed class ColumnMappingTests : IDisposable
         DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
         List<(long Id, long? Score, string? Name)> rows = await ReadRowsAsync(source, info.Version);
         Assert.Equal(new (long, long?, string?)[] { (9L, 900L, "zoe") }, rows);
+    }
+
+    [Fact]
+    public async Task OverwriteSchema_OnNameModeTable_AddColumn_ThroughPublicDoor_FailsClosed_Issue556()
+    {
+        // Documents the tracked public-door limitation (#556): the DeltaWriteTarget door stages against the
+        // EXISTING mapping, so an overwriteSchema that ADDS a brand-new column (no existing physicalName to
+        // stage under) fails closed here — never a silent partial/unmapped write. (Add-column overwriteSchema
+        // IS supported at the DeltaTableWriter mechanism level — see Overwrite_NameMode_AddColumn_*.)
+        Func<string> names = FileNames();
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names))
+        {
+            await target.CreateNameMappedTableAsync(
+                FlatSchema, Array.Empty<string>(),
+                new[] { FlatBatch(new[] { (1L, 100L, (string?)"alice") }) },
+                new SeededPhysicalNameSource(Seed));
+        }
+
+        using DeltaWriteTarget overwrite = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names);
+        await Assert.ThrowsAsync<DeltaProtocolException>(() => overwrite.OverwriteAsync(
+            EvolvedFlatSchema, Array.Empty<string>(),
+            new[] { EvolvedFlatBatch((2L, 200L, "bob", "x2")) },
+            DeltaPartitionOverwriteMode.Static,
+            overwriteSchema: true));
+
+        // Fail-closed: the table is unchanged at v0.
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        Assert.Equal(0L, (await source.LoadSnapshotAsync(null, null)).Version);
     }
 
     // #525 regression: `id` mode stays fail-closed on the WRITE path too (it is rejected at snapshot load —
@@ -1109,6 +1140,32 @@ public sealed class ColumnMappingTests : IDisposable
         new StructField("name", DataTypes.StringType, nullable: true),
         new StructField("extra", DataTypes.StringType, nullable: true),
     });
+
+    // A single-row LOGICAL batch for EvolvedFlatSchema (id, score, name, extra).
+    private static ColumnBatch EvolvedFlatBatch((long Id, long Score, string? Name, string? Extra) row)
+    {
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, 1);
+        MutableColumnVector score = ColumnVectors.Create(DataTypes.LongType, 1);
+        MutableColumnVector name = ColumnVectors.Create(DataTypes.StringType, 1);
+        MutableColumnVector extra = ColumnVectors.Create(DataTypes.StringType, 1);
+        id.AppendValue(row.Id);
+        score.AppendValue(row.Score);
+        AppendNullableString(name, row.Name);
+        AppendNullableString(extra, row.Extra);
+        return new ManagedColumnBatch(EvolvedFlatSchema, new ColumnVector[] { id, score, name, extra }, 1);
+
+        static void AppendNullableString(MutableColumnVector v, string? s)
+        {
+            if (s is null)
+            {
+                v.AppendNull();
+            }
+            else
+            {
+                v.AppendBytes(Encoding.UTF8.GetBytes(s));
+            }
+        }
+    }
 
     // A staged data file with NO footer DataSchema, so the write-door physical cross-check is skipped — the
     // #541 tests assert the committed metaData/mapping, not the physical bytes (mirrors DeltaSchemaEvolution

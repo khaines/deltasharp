@@ -126,7 +126,13 @@ public sealed class DeltaWriteTarget : IDisposable
     /// — it may drop, narrow, reorder, add, or change the type of columns, and change the partition columns —
     /// because every prior file is rewritten. It is rejected for a Dynamic partition overwrite (files in
     /// untouched partitions would still carry the old schema). The staged files are gated against the new
-    /// schema, so the committed metadata matches the real bytes.</para></summary>
+    /// schema, so the committed metadata matches the real bytes.</para>
+    /// <para>For a <b>name-mode column-mapped</b> table, this door supports an <c>overwriteSchema</c> that
+    /// keeps the same columns or drops / reorders / retypes them (the reconcile is handled by
+    /// <c>DeltaTableWriter.OverwriteReplaceSchemaAsync</c>, #542); ADDING a new column through this door is not
+    /// yet supported (the door stages against the existing mapping and cannot stage a brand-new minted
+    /// physical column), so it fails closed — the same door limitation as additive/widening evolution (#541).
+    /// Exposing add-through-the-door is tracked in #556.</para></summary>
     /// <exception cref="ArgumentException"><paramref name="overwriteSchema"/> is combined with
     /// <see cref="DeltaPartitionOverwriteMode.Dynamic"/> (only a full/Static overwrite may replace the schema).</exception>
     public async Task<DeltaWriteResult> OverwriteAsync(
