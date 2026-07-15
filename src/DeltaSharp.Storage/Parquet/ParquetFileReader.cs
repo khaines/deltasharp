@@ -108,9 +108,10 @@ internal sealed class ParquetFileReader
     /// <exception cref="DeltaStorageException">A requested column type is unsupported
     /// (<see cref="StorageErrorKind.UnsupportedFeature"/>); the resolved file column's physical type or
     /// nullability does not match the requested engine type
-    /// (<see cref="StorageErrorKind.SchemaMismatch"/>); or the file is malformed/truncated, a requested
-    /// column is absent (and not null-filled per <paramref name="nullFillMissingColumns"/>), or a row group's
-    /// declared size exceeds the decode ceiling (<see cref="StorageErrorKind.CorruptData"/>).</exception>
+    /// (<see cref="StorageErrorKind.SchemaMismatch"/>); a requested column is absent from the file and not
+    /// null-filled (per <paramref name="nullFillMissingColumns"/>)
+    /// (<see cref="StorageErrorKind.ColumnNotPresentInFile"/>); or the file is malformed/truncated or a row
+    /// group's declared size exceeds the decode ceiling (<see cref="StorageErrorKind.CorruptData"/>).</exception>
     public async IAsyncEnumerable<ColumnBatch> ReadAsync(
         Stream input,
         StructType requested,
