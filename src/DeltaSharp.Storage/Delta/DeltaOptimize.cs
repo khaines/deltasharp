@@ -43,6 +43,39 @@ internal sealed class OptimizeSchemaEvolutionException : Exception
 }
 
 /// <summary>
+/// Thrown fail-closed when OPTIMIZE is invoked on a column-mapped (name- or id-mode) table (#553). OPTIMIZE
+/// reads and rewrites RAW Parquet and does not (yet) support column mapping: it resolves the data schema
+/// under <see cref="ColumnMappingMode.None"/> (LOGICAL names), but a name-mode table's data files store
+/// PHYSICAL (<c>col-&lt;uuid&gt;</c>) names, so every logical column is absent from the files. For a schema
+/// with at least one required column that fails closed on read; but for an <b>all-nullable</b> schema the
+/// read-side null-fill (<c>nullFillMissingColumns: true</c>) would materialize every column as all-null and
+/// commit an <b>all-null compacted output</b>, silently dropping data. This guard rejects OPTIMIZE on any
+/// column-mapped table up front — independent of column nullability and dry-run — leaving the table
+/// unchanged. Full name-mode-aware OPTIMIZE (read/rewrite by physical name) is tracked separately.
+/// </summary>
+internal sealed class OptimizeColumnMappingUnsupportedException : Exception
+{
+    internal OptimizeColumnMappingUnsupportedException(ColumnMappingMode mode)
+        : base(
+            $"OPTIMIZE does not support a column-mapped table (delta.columnMapping.mode='{Label(mode)}'). " +
+            "Compacting it would read RAW Parquet under LOGICAL column names that are absent from the " +
+            "PHYSICAL (col-<uuid>) data files; for an all-nullable schema the read-side null-fill would " +
+            "otherwise produce an all-null compacted output, silently dropping data. OPTIMIZE fails closed " +
+            "and leaves the table unchanged. Name-mode-aware OPTIMIZE is tracked as a separate follow-up.") =>
+        Mode = mode;
+
+    /// <summary>The column-mapping mode that caused the rejection (<c>name</c> or <c>id</c>).</summary>
+    internal ColumnMappingMode Mode { get; }
+
+    private static string Label(ColumnMappingMode mode) => mode switch
+    {
+        ColumnMappingMode.Name => "name",
+        ColumnMappingMode.Id => "id",
+        _ => mode.ToString(),
+    };
+}
+
+/// <summary>
 /// One partition's contribution to an <see cref="DeltaOptimize.OptimizeAsync(System.Func{System.Collections.Generic.IReadOnlyDictionary{string, string?}, bool}?, long?, bool, System.Threading.CancellationToken)"/>
 /// run (STORY-05.6.1 AC3): the canonical <see cref="PartitionValues"/> (empty for an unpartitioned table),
 /// how many small input files were <see cref="FilesRemoved"/> and how many compacted files were
@@ -359,6 +392,21 @@ internal sealed class DeltaOptimize
         bool dryRun,
         CancellationToken cancellationToken)
     {
+        // #553: OPTIMIZE does not support column mapping. It reads/rewrites RAW Parquet and resolves the data
+        // schema under ColumnMappingMode.None (LOGICAL names) below, but a name-mode table's data files store
+        // PHYSICAL (col-<uuid>) names — so OPTIMIZE would request absent columns. For an ALL-NULLABLE name-mode
+        // schema the read-side null-fill (nullFillMissingColumns: true) would materialize every column as
+        // all-null and commit an all-null compacted output, silently dropping data. Reject fail-closed at the
+        // TOP — independent of column nullability AND of dry-run (the compaction plan itself is meaningless
+        // for physical-named files) — leaving the table unchanged. (`id` mode is already rejected at snapshot
+        // load; this is defense-in-depth for the internal readSnapshot seam.) Full name-mode-aware OPTIMIZE is
+        // a tracked follow-up.
+        ColumnMappingMode columnMappingMode = ColumnMapping.ResolveMode(readSnapshot.Metadata.Configuration);
+        if (columnMappingMode != ColumnMappingMode.None)
+        {
+            throw new OptimizeColumnMappingUnsupportedException(columnMappingMode);
+        }
+
         ImmutableArray<string> partitionColumns = readSnapshot.Metadata.PartitionColumns;
         IReadOnlyList<CompactionGroup> groups = PlanCompaction(readSnapshot, partitionColumns, partitionFilter, target);
 

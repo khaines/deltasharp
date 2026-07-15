@@ -1109,6 +1109,100 @@ public sealed class DeltaOptimizeTests : IDisposable
         }
     }
 
+    // ---------------------------------------------------------------- #553: column-mapping guard
+
+    [Fact]
+    public async Task Optimize_OnNameModeTable_IsRejectedFailClosed_Issue553()
+    {
+        // #553: OPTIMIZE does not support column mapping. A name-mode table's data files store PHYSICAL
+        // (col-<uuid>) names, but OPTIMIZE resolves the data schema under ColumnMappingMode.None (LOGICAL
+        // names), so it must fail closed up front rather than request absent columns. Two small files would
+        // otherwise be compaction candidates.
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(_root))
+        {
+            await target.CreateNameMappedTableAsync(
+                DataSchema, Array.Empty<string>(), new[] { Batch((1, "a")) }, RandomPhysicalNameSource.Instance);
+            await target.AppendAsync(DataSchema, Array.Empty<string>(), new[] { Batch((2, "b")) });
+        }
+
+        Snapshot before = await Log().LoadSnapshotAsync();
+        Assert.Equal(2, before.ActiveFiles.Length); // two compaction-candidate small files
+
+        OptimizeColumnMappingUnsupportedException ex =
+            await Assert.ThrowsAsync<OptimizeColumnMappingUnsupportedException>(() => Optimize().OptimizeAsync());
+        Assert.Equal(ColumnMappingMode.Name, ex.Mode);
+
+        // Fail-closed: the table is unchanged (same version, same active files) — no compacted commit.
+        Snapshot after = await Log().LoadSnapshotAsync();
+        Assert.Equal(before.Version, after.Version);
+        Assert.Equal(before.ActiveFiles.Length, after.ActiveFiles.Length);
+    }
+
+    [Fact]
+    public async Task Optimize_OnNameModeTable_DryRun_IsAlsoRejectedFailClosed_Issue553()
+    {
+        // The guard is independent of dry-run: the compaction plan is meaningless for physical-named files, so
+        // even a dry run is rejected (never reports a plan it could not actually execute).
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(_root))
+        {
+            await target.CreateNameMappedTableAsync(
+                DataSchema, Array.Empty<string>(), new[] { Batch((1, "a")) }, RandomPhysicalNameSource.Instance);
+            await target.AppendAsync(DataSchema, Array.Empty<string>(), new[] { Batch((2, "b")) });
+        }
+
+        await Assert.ThrowsAsync<OptimizeColumnMappingUnsupportedException>(
+            () => Optimize().OptimizeAsync(dryRun: true));
+    }
+
+    [Fact]
+    public async Task Optimize_OnAllNullableNameModeTable_DoesNotNullFillAndCommit_Issue553()
+    {
+        // #553 DATA-LOSS regression: for an ALL-NULLABLE name-mode schema every logical column is
+        // "absent + nullable + null-fill enabled" in the physical files, so WITHOUT the guard OPTIMIZE would
+        // null-fill all columns and commit an all-null compacted output — silently dropping the real rows.
+        // The guard rejects fail-closed, so the real (non-null) data remains intact and readable. (Reverting
+        // the guard makes the read-back below return all-null, so this is a matched-pair oracle.)
+        var allNullable = new StructType(new[]
+        {
+            new StructField("id", DataTypes.LongType, nullable: true),
+            new StructField("value", DataTypes.StringType, nullable: true),
+        });
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(_root))
+        {
+            await target.CreateNameMappedTableAsync(
+                allNullable, Array.Empty<string>(),
+                new[] { NullableBatch(allNullable, (1, "a")) }, RandomPhysicalNameSource.Instance);
+            await target.AppendAsync(allNullable, Array.Empty<string>(), new[] { NullableBatch(allNullable, (2, "b")) });
+        }
+
+        Snapshot before = await Log().LoadSnapshotAsync();
+
+        OptimizeColumnMappingUnsupportedException ex =
+            await Assert.ThrowsAsync<OptimizeColumnMappingUnsupportedException>(() => Optimize().OptimizeAsync());
+        Assert.Equal(ColumnMappingMode.Name, ex.Mode);
+
+        // The table is unchanged and the real rows still read back through the name-mode read door — NOT
+        // dropped to all-null (which is what an unguarded null-fill compaction would have committed).
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        Assert.Equal(before.Version, info.Version);
+
+        var rows = new List<(long?, string?)>();
+        foreach (ColumnBatch b in await source.ReadBatchesAsync(info.Version))
+        {
+            for (int r = 0; r < b.LogicalRowCount; r++)
+            {
+                ColumnVector idc = b.SelectedColumn(0);
+                ColumnVector valc = b.SelectedColumn(1);
+                rows.Add((
+                    idc.IsNull(r) ? (long?)null : idc.GetValue<long>(r),
+                    valc.IsNull(r) ? null : Encoding.UTF8.GetString(valc.GetBytes(r))));
+            }
+        }
+
+        Assert.Equal(new (long?, string?)[] { (1L, "a"), (2L, "b") }, rows.OrderBy(r => r.Item1).ToList());
+    }
+
     // ---------------------------------------------------------------- helpers
 
     private DeltaLog Log() => new(_backend);
@@ -1161,7 +1255,28 @@ public sealed class DeltaOptimizeTests : IDisposable
         return new ManagedColumnBatch(DataSchema, new ColumnVector[] { id, value }, rows.Length);
     }
 
-    // Builds a batch of <paramref name="count"/> sequential rows (id = start..start+count-1, value = "v<id>"),
+    // Builds a batch under an explicit (e.g. all-nullable) [id: long, value: string] schema — used by the
+    // #553 all-nullable name-mode guard regression, where the batch schema's nullability differs from the
+    // fixed DataSchema.
+    private static ColumnBatch NullableBatch(StructType schema, params (long Id, string? Value)[] rows)
+    {
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, rows.Length);
+        MutableColumnVector value = ColumnVectors.Create(DataTypes.StringType, rows.Length);
+        foreach ((long rowId, string? rowValue) in rows)
+        {
+            id.AppendValue(rowId);
+            if (rowValue is null)
+            {
+                value.AppendNull();
+            }
+            else
+            {
+                value.AppendBytes(Encoding.UTF8.GetBytes(rowValue));
+            }
+        }
+
+        return new ManagedColumnBatch(schema, new ColumnVector[] { id, value }, rows.Length);
+    }
     // used to exercise multi-row-group / batch-straddling compaction with more than the 1–2 rows other tests
     // use.
     private static ColumnBatch BatchRange(long start, int count)
