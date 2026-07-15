@@ -67,6 +67,10 @@ internal sealed class ParquetFileReader
 
     private readonly ParquetDecodeLimits _limits;
 
+    // Micros per calendar day (86_400 s × 1_000_000 µs), for the date→timestamp_ntz read-promotion
+    // (midnight-of-date epoch-micros). #533.
+    private const long MicrosPerDay = 86_400L * 1_000_000L;
+
     /// <summary>Creates a reader whose eager-decode guard uses <paramref name="limits"/> (or the safe
     /// <see cref="ParquetDecodeLimits.Default"/> when unset).</summary>
     public ParquetFileReader(ParquetDecodeLimits? limits = null) => _limits = limits ?? ParquetDecodeLimits.Default;
@@ -655,12 +659,16 @@ internal sealed class ParquetFileReader
         // Type-widening promotion (#495): when the file column's physical type is a NARROWER sanctioned
         // widening of the requested type, read the file's physical values and widen them into the requested
         // (wide) vector. ValidateFileField has already proven this is a sanctioned widening AND that the
-        // caller opened the promotion gate; here we re-check the gate before dispatching the physical read +
-        // upcast (defense-in-depth — with the gate closed a mismatched field never reaches here). A physical
-        // type equal to the request takes the normal path below.
+        // caller opened the promotion gate; here we re-check BOTH (defense-in-depth, and — critically — the
+        // sanctioned-widening check disambiguates a same-physical pair whose logical types differ but is NOT a
+        // widening: a native micros file read as `timestamp_ntz` has physical `timestamp` ≠ requested
+        // `timestamp_ntz` yet must take the identity micros read, not promotion, since Parquet.Net cannot
+        // distinguish the two on the wire — #533). A physical type equal to the request, or a differing pair
+        // that is not a sanctioned widening, takes the normal path below.
         if (allowTypeWideningPromotion
             && ParquetTypeMapping.TryToDataType(fileField, out DataType? physicalType)
-            && !physicalType.Equals(requestedField.DataType))
+            && !physicalType.Equals(requestedField.DataType)
+            && TypeWidening.IsSanctionedWidening(physicalType, requestedField.DataType))
         {
             await ReadPromotedColumnAsync(
                 rowGroup, fileField, physicalType, requestedField, vector, rowCount, cancellationToken)
@@ -789,11 +797,15 @@ internal sealed class ParquetFileReader
         if (requestedField.DataType is TimestampNtzType && physicalType is DateType)
         {
             // date → timestamp_ntz (#533): read the narrow epoch-day physical values and promote each to
-            // epoch-micros at midnight of the date (days × 86_400 × 1_000_000). Timezone-less, so no session
-            // offset is applied — the promoted instant is wall-clock midnight, matching Delta/Spark semantics.
+            // epoch-micros at midnight of the date (days × MicrosPerDay). Timezone-less, so no session offset
+            // is applied — the promoted instant is wall-clock midnight, matching Delta/Spark semantics. The
+            // multiply is `checked`: for any epoch-day a Parquet DATE can materialize (bounded by DateTime's
+            // range, ±~2.9e6) the product is ≤ 2.5e17 ≪ long.MaxValue, so it never throws in practice, but a
+            // future path feeding a raw out-of-range epoch-day fails loud as OverflowException (→ CorruptData
+            // via IsParquetDefect) rather than silently wrapping.
             return ReadValueAsync<DateTime>(rowGroup, fileField, vector, rowCount,
                 static (v, value) => v.AppendValue(
-                    (long)ParquetTypeMapping.DateTimeToEpochDay(value) * 86_400L * 1_000_000L), cancellationToken);
+                    checked((long)ParquetTypeMapping.DateTimeToEpochDay(value) * MicrosPerDay)), cancellationToken);
         }
 
         // Integral widening: byte(sbyte) → short → int → long. The requested vector's storage width is the
@@ -908,32 +920,48 @@ internal sealed class ParquetFileReader
         CancellationToken cancellationToken)
         where T : unmanaged
     {
-        if (fileField.IsNullable)
+        try
         {
-            var buffer = new T?[rowCount];
-            await rowGroup.ReadAsync<T>(fileField, new Memory<T?>(buffer), null, cancellationToken)
-                .ConfigureAwait(false);
-            for (int i = 0; i < rowCount; i++)
+            if (fileField.IsNullable)
             {
-                if (buffer[i] is { } value)
+                var buffer = new T?[rowCount];
+                await rowGroup.ReadAsync<T>(fileField, new Memory<T?>(buffer), null, cancellationToken)
+                    .ConfigureAwait(false);
+                for (int i = 0; i < rowCount; i++)
                 {
-                    append(vector, value);
+                    if (buffer[i] is { } value)
+                    {
+                        append(vector, value);
+                    }
+                    else
+                    {
+                        vector.AppendNull();
+                    }
                 }
-                else
+            }
+            else
+            {
+                var buffer = new T[rowCount];
+                await rowGroup.ReadAsync<T>(fileField, new Memory<T>(buffer), null, cancellationToken)
+                    .ConfigureAwait(false);
+                for (int i = 0; i < rowCount; i++)
                 {
-                    vector.AppendNull();
+                    append(vector, buffer[i]);
                 }
             }
         }
-        else
+        catch (ArgumentOutOfRangeException ex)
         {
-            var buffer = new T[rowCount];
-            await rowGroup.ReadAsync<T>(fileField, new Memory<T>(buffer), null, cancellationToken)
-                .ConfigureAwait(false);
-            for (int i = 0; i < rowCount; i++)
-            {
-                append(vector, buffer[i]);
-            }
+            // Parquet.Net raises ArgumentOutOfRangeException from its DATE/TIMESTAMP decode
+            // (DateTime.AddDays/AddTicks) when a physical INT32/INT64 value is outside the representable
+            // DateTime range — a corrupt/hostile file, not a bug in our own code (ReadValueAsync's only
+            // ArgumentOutOfRangeException source is the Parquet.Net decode above; the append delegate is
+            // range-safe arithmetic). IsParquetDefect deliberately excludes ArgumentException (to surface our
+            // own bugs), so map this specific decode fault to the deterministic CorruptData contract
+            // (ADR-0013) rather than leaking a raw BCL exception. The message names only the column (no cell
+            // value — #176/#8).
+            throw DeltaStorageException.CorruptData(
+                $"Column '{fileField.Name}': a physical value is outside the representable date/time range.", ex);
         }
     }
 

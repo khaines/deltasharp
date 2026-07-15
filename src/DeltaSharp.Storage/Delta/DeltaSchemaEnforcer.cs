@@ -35,12 +35,15 @@ namespace DeltaSharp.Storage.Delta;
 /// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> (naming the enablement requirement); every
 /// other differing type is <see cref="DeltaSchemaMismatchKind.IncompatibleType"/> — including a
 /// <c>decimal</c> target too narrow to represent the integral source range (it would truncate, so it is not a
-/// sanctioned widening). <c>date→timestamp_ntz</c> IS a sanctioned widening (#533) — applied on a wider-typed
-/// append/overwrite (else rejected as <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> when the
-/// feature is disabled), and promoted at READ time (INT32 epoch-day → INT64 midnight-of-date micros). But
-/// <c>date→timestamp</c> with a timezone (LTZ) is NOT sanctioned by Delta at all, so it is rejected as a plain
-/// <see cref="DeltaSchemaMismatchKind.IncompatibleType"/>. Widening inside an array element / map
-/// key/value is NOT applied (it would need a <c>fieldPath</c> in <c>delta.typeChanges</c> and the Parquet read
+/// sanctioned widening). <c>date→timestamp_ntz</c> IS a Delta-sanctioned widening (#533) that DeltaSharp
+/// <b>read-promotes</b> (INT32 epoch-day → INT64 midnight-of-date micros) but does <b>not</b> apply on
+/// append: it cannot write a native <c>timestamp_ntz</c> Parquet column (Parquet.Net 6.0.3 cannot persist
+/// <c>isAdjustedToUTC=false</c>), so native ntz writes are fail-closed and an append widening is rejected as
+/// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> whether or not the feature is enabled (like
+/// the read-only cross-family #535 cases). <c>date→timestamp</c> with a timezone (LTZ) is NOT sanctioned by
+/// Delta at all, so it is rejected as a plain <see cref="DeltaSchemaMismatchKind.IncompatibleType"/>. Widening
+/// inside an array element / map key/value is NOT applied (it would need a <c>fieldPath</c> in
+/// <c>delta.typeChanges</c> and the Parquet read
 /// path does not read nested types at all) — it stays fail-closed as
 /// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>, tracked as the #535 follow-up (#546).</para>
 ///

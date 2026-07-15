@@ -62,7 +62,10 @@ public sealed class TimestampNtzStorageTests
         // The Delta schema is authoritative for timestamp vs timestamp_ntz. A physical INT64-micros file (here
         // written via TimestampType, since native ntz write is fail-closed) requested under a timestamp_ntz
         // schema is read into the ntz lane and the stored micros round-trip exactly — the read path selects the
-        // lane from the REQUESTED type, not the (unreliable) Parquet isAdjustedToUTC annotation.
+        // lane from the REQUESTED type, not the (unreliable) Parquet isAdjustedToUTC annotation. Read with the
+        // promotion gate OPEN (allowTypeWideningPromotion: true), which is how production DeltaReadSource always
+        // reads a typeWidening-enabled table: a same-physical micros→ntz pair must take the IDENTITY read, not
+        // mis-route into promotion (#533 gate-asymmetry regression).
         long[] micros = { 0L, 1_609_459_200_000_000L, 1_609_459_200_123_456L, -5_000_000L };
         var writeSchema = new StructType(new[] { new StructField("v", DataTypes.TimestampType, nullable: true) });
         ManagedColumnBatch batch = OneColumn(DataTypes.TimestampType, c =>
@@ -75,11 +78,41 @@ public sealed class TimestampNtzStorageTests
         byte[] file = await ParquetTestHelpers.WriteToBytesAsync(writeSchema, new[] { batch });
 
         var readSchema = new StructType(new[] { new StructField("v", DataTypes.TimestampNtzType, nullable: true) });
-        List<ColumnBatch> read = await ParquetTestHelpers.ReadAllAsync(file, readSchema);
+        List<ColumnBatch> read = await ParquetTestHelpers.ReadAllAsync(
+            file, readSchema, keepRowGroup: null, allowTypeWideningPromotion: true);
 
         ColumnVector v = read.Single().Column(0);
         Assert.Equal(DataTypes.TimestampNtzType, v.Type);
         Assert.Equal(micros, v.GetValues<long>().ToArray());
+    }
+
+    [Fact]
+    public async Task MixedDateAndMicrosFiles_ReadAsTimestampNtz_WithGateOpen()
+    {
+        // A table that widened date→timestamp_ntz has BOTH old DATE files (promoted on read) AND native
+        // micros files (identity read). With the promotion gate open (production state), both must read
+        // correctly into the ntz lane: the DATE file promotes to midnight-of-date micros, the micros file
+        // reads its stored micros unchanged. Pins that the gate-asymmetry fix keeps them distinct (#533).
+        const long microsPerDay = 86_400L * 1_000_000L;
+        var readSchema = new StructType(new[] { new StructField("v", DataTypes.TimestampNtzType, nullable: true) });
+
+        // Old DATE file (INT32 epoch-day) → promoted.
+        var dateSchema = new StructType(new[] { new StructField("v", DataTypes.DateType, nullable: true) });
+        byte[] dateFile = await ParquetTestHelpers.WriteToBytesAsync(
+            dateSchema, new[] { OneColumn(DataTypes.DateType, c => { c.AppendValue(0); c.AppendValue(3); }, 2) });
+        ColumnVector promoted = (await ParquetTestHelpers.ReadAllAsync(
+            dateFile, readSchema, keepRowGroup: null, allowTypeWideningPromotion: true)).Single().Column(0);
+        Assert.Equal(DataTypes.TimestampNtzType, promoted.Type);
+        Assert.Equal(new[] { 0L, 3L * microsPerDay }, promoted.GetValues<long>().ToArray());
+
+        // Native micros file (INT64) → identity read (NOT mis-routed into promotion).
+        var microsSchema = new StructType(new[] { new StructField("v", DataTypes.TimestampType, nullable: true) });
+        byte[] microsFile = await ParquetTestHelpers.WriteToBytesAsync(
+            microsSchema, new[] { OneColumn(DataTypes.TimestampType, c => { c.AppendValue(42L); c.AppendValue(-7L); }, 2) });
+        ColumnVector identity = (await ParquetTestHelpers.ReadAllAsync(
+            microsFile, readSchema, keepRowGroup: null, allowTypeWideningPromotion: true)).Single().Column(0);
+        Assert.Equal(DataTypes.TimestampNtzType, identity.Type);
+        Assert.Equal(new[] { 42L, -7L }, identity.GetValues<long>().ToArray());
     }
 
     [Fact]

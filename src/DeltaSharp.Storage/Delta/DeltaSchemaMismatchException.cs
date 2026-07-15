@@ -31,14 +31,18 @@ internal enum DeltaSchemaMismatchKind
     IncompatibleType,
 
     /// <summary>The write changes a column's type to a Delta-sanctioned widening
-    /// (<c>int→long</c>, <c>float→double</c>, a growing <c>decimal</c>) or a deferred one
-    /// (<c>date→timestamp</c>), but type widening is <b>not applied</b> here: the table has not enabled it
-    /// (the <c>typeWidening</c> table feature must be present AND <c>delta.enableTypeWidening=true</c>), or
-    /// the widening is deferred (needs a not-yet-existing <c>timestamp_ntz</c> type). Applying a widening
+    /// (<c>int→long</c>, <c>float→double</c>, a growing <c>decimal</c>, a cross-family
+    /// <c>int→double</c>/<c>int→decimal</c>, or <c>date→timestamp_ntz</c>), but the widening is <b>not
+    /// applied</b> here: either the table has not enabled type widening (the <c>typeWidening</c> table feature
+    /// must be present AND <c>delta.enableTypeWidening=true</c>), or it is a read-promote-only widening that is
+    /// never applied on append — the cross-family cases (#535) are not schema-evolution-eligible, and
+    /// <c>date→timestamp_ntz</c> (#533) cannot be written natively (Parquet.Net cannot persist
+    /// <c>isAdjustedToUTC=false</c>), so native <c>timestamp_ntz</c> writes are fail-closed. Applying a widening
     /// without the read-side promotion + <c>delta.typeChanges</c> in place would make existing Parquet files
     /// unreadable, so it is fail-closed. Distinct from <see cref="IncompatibleType"/> so the message can name
-    /// the enablement/deferral reason. When the table <i>is</i> enabled, a sanctioned widening is applied and
-    /// this is not raised.</summary>
+    /// the enablement/read-only reason. (A <c>date→timestamp</c> LTZ change is NOT sanctioned at all and is
+    /// <see cref="IncompatibleType"/>, not this.) When the table <i>is</i> enabled, a schema-evolution-eligible
+    /// widening is applied and this is not raised.</summary>
     TypeWideningUnsupported,
 
     /// <summary>Evolution would produce a merged schema containing two columns whose names are equal under
@@ -141,9 +145,10 @@ internal sealed class DeltaSchemaMismatchException : Exception
             $"The type change '{tableType}'→'{writeType}' for column '{path}' is a Delta-sanctioned widening " +
             "but is not applied here: the table has not enabled type widening (the 'typeWidening' table " +
             "feature must be present AND the 'delta.enableTypeWidening' property set to 'true'), or the change " +
-            "is a deferred widening this build cannot represent (date→timestamp needs a timestamp_ntz type). " +
-            "Widening the logical schema without enablement would make the table's existing Parquet files " +
-            "unreadable, so it is rejected fail-closed.");
+            "is a read-promote-only widening this build never applies on append (a cross-family widening, or " +
+            "date→timestamp_ntz which cannot be written natively — Parquet.Net cannot persist " +
+            "isAdjustedToUTC=false). Widening the logical schema without enablement would make the table's " +
+            "existing Parquet files unreadable, so it is rejected fail-closed.");
 
     /// <summary>The write would widen a <b>partition</b> column's type, which Delta <i>does</i> sanction
     /// WITHOUT a table rewrite (partition values are stored as strings in the log / directory names), but this

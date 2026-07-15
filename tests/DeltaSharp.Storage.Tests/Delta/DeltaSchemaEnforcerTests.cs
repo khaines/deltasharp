@@ -1005,8 +1005,9 @@ public sealed class DeltaSchemaEnforcerTests
         // date→timestamp_ntz (the #533 widening). Delta sanctions it and, on a partition column, it is rewrite-
         // free (partition values are strings), so it must route to the honest #537 deferral
         // (TypeWideningUnsupported) — never PartitionColumnEvolution's "requires a full table rewrite". Without
-        // this test the temporal arm of the union predicate is unpinned at the partition guard (the scalar,
-        // non-partition date→timestamp_ntz path is APPLIED, so it does not cover the partition deferral).
+        // this test the temporal arm is unpinned at the partition guard: the scalar, non-partition
+        // date→timestamp_ntz path rejects via the general IsSanctionedWidening branch, a DIFFERENT reject
+        // branch than the partition guard's PartitionColumnWideningDeferred.
         StructType table = Schema(Field("part", DataTypes.DateType, nullable: true));
         StructType write = Schema(Field("part", DataTypes.TimestampNtzType, nullable: true));
 
