@@ -140,7 +140,7 @@ public sealed class RowOrderingComparer : IComparer<RowData>
         ByteType => Cast<sbyte>(a, type).CompareTo(Cast<sbyte>(b, type)),
         ShortType => Cast<short>(a, type).CompareTo(Cast<short>(b, type)),
         IntegerType or DateType => Cast<int>(a, type).CompareTo(Cast<int>(b, type)),
-        LongType or TimestampType => Cast<long>(a, type).CompareTo(Cast<long>(b, type)),
+        LongType or TimestampType or TimestampNtzType => Cast<long>(a, type).CompareTo(Cast<long>(b, type)),
         FloatType => CompareSingle(Cast<float>(a, type), Cast<float>(b, type)),
         DoubleType => CompareDouble(Cast<double>(a, type), Cast<double>(b, type)),
         DecimalType => Cast<Int128>(a, type).CompareTo(Cast<Int128>(b, type)),

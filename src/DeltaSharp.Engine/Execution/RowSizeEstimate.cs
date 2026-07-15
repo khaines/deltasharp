@@ -87,7 +87,7 @@ internal static class RowSizeEstimate
         BooleanType or ByteType => 1,
         ShortType => 2,
         IntegerType or DateType or FloatType => 4,
-        LongType or TimestampType or DoubleType => 8,
+        LongType or TimestampType or TimestampNtzType or DoubleType => 8,
         DecimalType { IsCompact: true } => 8,
         DecimalType => 16,
         _ => 16,

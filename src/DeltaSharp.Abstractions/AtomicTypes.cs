@@ -220,6 +220,31 @@ public sealed class TimestampType : AtomicType
 }
 
 /// <summary>
+/// The Spark <c>timestamp_ntz</c> type: a timezone-<b>less</b> ("no time zone") local timestamp stored as
+/// microseconds from the Unix epoch, with NO UTC/session-timezone adjustment. Physical layout: 8 bytes (a
+/// 64-bit microsecond count) — the same lane as <see cref="TimestampType"/>, but its instant is a wall-clock
+/// value that is never shifted by a time zone. Delta sanctions <c>date → timestamp_ntz</c> (NOT
+/// <c>date → timestamp</c>) as a type widening (#533). Parquet stores it as an INT64 with the
+/// <c>TIMESTAMP(MICROS, isAdjustedToUTC=false)</c> annotation (vs. <see cref="TimestampType"/>'s
+/// <c>isAdjustedToUTC=true</c>).
+/// </summary>
+public sealed class TimestampNtzType : AtomicType
+{
+    private TimestampNtzType()
+    {
+    }
+
+    /// <summary>The singleton instance.</summary>
+    public static TimestampNtzType Instance { get; } = new();
+
+    /// <inheritdoc/>
+    public override string TypeName => "timestamp_ntz";
+
+    /// <inheritdoc/>
+    public override string SimpleString => "timestamp_ntz";
+}
+
+/// <summary>
 /// The Spark <c>void</c> (null) type — the type of a bare <c>NULL</c> literal. It is a valid
 /// member of the type system (it participates in equality, validation, and serialization)
 /// but has <b>no physical representation</b> — the concrete case behind STORY-02.5.1 AC4's

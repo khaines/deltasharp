@@ -41,6 +41,9 @@ public static class DataTypes
     /// <summary>The <see cref="Types.TimestampType"/> singleton.</summary>
     public static TimestampType TimestampType => global::DeltaSharp.Types.TimestampType.Instance;
 
+    /// <summary>The <see cref="Types.TimestampNtzType"/> singleton (the timezone-less <c>timestamp_ntz</c>).</summary>
+    public static TimestampNtzType TimestampNtzType => global::DeltaSharp.Types.TimestampNtzType.Instance;
+
     /// <summary>The <see cref="Types.NullType"/> singleton (the <c>void</c> type).</summary>
     public static NullType NullType => global::DeltaSharp.Types.NullType.Instance;
 

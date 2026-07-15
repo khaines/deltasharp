@@ -60,6 +60,13 @@ internal static class ParquetTypeMapping
             DateType => new DateTimeDataField(field.Name, DateTimeFormat.Date, isNullable: nullable),
             TimestampType => new DateTimeDataField(
                 field.Name, DateTimeFormat.DateAndTimeMicros, isAdjustedToUTC: true, isNullable: nullable),
+            // timestamp_ntz maps to a micros DateTimeDataField for the READ path's pre-validation (a requested
+            // ntz column must map to a supported Parquet type). NOTE: Parquet.Net 6.0.3 cannot persist
+            // isAdjustedToUTC=false (it emits a legacy UTC TIMESTAMP_MICROS ConvertedType), so a native ntz
+            // WRITE would be a protocol-non-conformant LTZ file — native ntz writes are fail-closed in
+            // ParquetFileWriter.WriteAsync (this field is never used to write an ntz column).
+            TimestampNtzType => new DateTimeDataField(
+                field.Name, DateTimeFormat.DateAndTimeMicros, isAdjustedToUTC: false, isNullable: nullable),
             DecimalType decimalType => CreateDecimalField(field.Name, decimalType, nullable),
             ArrayType or MapType or StructType => throw DeltaStorageException.UnsupportedFeature(
                 $"Parquet mapping for column '{field.Name}': nested types (phased, design §2.9) — "
@@ -110,6 +117,11 @@ internal static class ParquetTypeMapping
         switch (field)
         {
             case DateTimeDataField dateTime:
+                // NOTE: a micros DateTimeDataField maps back to TimestampType regardless of the requested
+                // logical type — Parquet.Net 6.0.3 cannot faithfully round-trip isAdjustedToUTC=false, so the
+                // footer cannot distinguish timestamp from timestamp_ntz. The Delta table SCHEMA is the
+                // authoritative source of the logical type; the read path selects the timestamp/timestamp_ntz
+                // lane from the REQUESTED type, not this footer-derived type (see ParquetFileReader validate).
                 type = dateTime.DateTimeFormat == DateTimeFormat.Date
                     ? DataTypes.DateType
                     : DataTypes.TimestampType;

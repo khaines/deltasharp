@@ -84,7 +84,9 @@ internal static class TestData
                 vector.AppendValue(random.Next(-100_000, 100_000));
                 break;
             case TimestampType:
-                // Epoch micros within a safe multi-century window around the epoch.
+            case TimestampNtzType:
+                // Epoch micros within a safe multi-century window around the epoch. timestamp_ntz shares the
+                // same long lane as timestamp (only the wire isAdjustedToUTC annotation differs).
                 vector.AppendValue(((long)random.Next(-500_000, 500_000) * TimeSpan.TicksPerMillisecond) + random.Next());
                 break;
             case DecimalType decimalType:
@@ -182,7 +184,7 @@ internal static class TestData
         DecimalType { IsCompact: true } => column.GetValue<long>(row),
         DecimalType => column.GetValue<Int128>(row),
         DateType => column.GetValue<int>(row),
-        TimestampType => column.GetValue<long>(row),
+        TimestampType or TimestampNtzType => column.GetValue<long>(row),
         StringType => Encoding.UTF8.GetString(column.GetBytes(row)),
         BinaryType => column.GetBytes(row).ToArray(),
         _ => throw new NotSupportedException($"No cell reader for '{type.SimpleString}'."),

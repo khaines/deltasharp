@@ -198,12 +198,28 @@ public sealed class DeltaSchemaEnforcerTests
     };
 
     [Fact]
-    public void Reconcile_DateToTimestampWidening_IsRejectedAsTypeWideningUnsupported()
+    public void Reconcile_DateToTimestampLtz_IsRejectedAsIncompatibleType()
     {
-        // FIX 1: date→timestamp is a would-be widening but is fail-closed here (Delta only sanctions
-        // date→timestamp_ntz, which needs a not-yet-existing NTZ type — #495).
+        // date→timestamp with a timezone (LTZ) is NOT a Delta-sanctioned widening at all — Delta only widens
+        // date→timestamp_ntz (#533). So it is a plain incompatible type change, not a deferred widening.
         StructType table = Schema(Field("ts", DataTypes.DateType, nullable: true));
         StructType write = Schema(Field("ts", DataTypes.TimestampType, nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema));
+
+        Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
+        Assert.Equal("ts", ex.Path);
+    }
+
+    [Fact]
+    public void Reconcile_DateToTimestampNtz_WhenDisabled_IsRejectedAsTypeWideningUnsupported()
+    {
+        // date→timestamp_ntz IS a sanctioned widening (#533), but with the feature disabled it is fail-closed
+        // and surfaced distinctly as TypeWideningUnsupported (naming the enablement requirement), not the
+        // generic IncompatibleType.
+        StructType table = Schema(Field("ts", DataTypes.DateType, nullable: true));
+        StructType write = Schema(Field("ts", DataTypes.TimestampNtzType, nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema));
@@ -830,10 +846,27 @@ public sealed class DeltaSchemaEnforcerTests
     }
 
     [Fact]
-    public void Reconcile_DateToTimestamp_WhenEnabled_IsStillRejectedAsTypeWideningUnsupported()
+    public void Reconcile_DateToTimestampNtz_WhenEnabled_IsRejectedAsTypeWideningUnsupported()
     {
-        // date→timestamp is DEFERRED even with the feature enabled: Delta only sanctions date→timestamp_ntz,
-        // and no NTZ type exists in this build, so it stays fail-closed.
+        // date→timestamp_ntz is a Delta-sanctioned widening (#533) that DeltaSharp READ-PROMOTES but does NOT
+        // apply on append — it cannot write a native timestamp_ntz Parquet column (Parquet.Net 6.0.3 cannot
+        // persist isAdjustedToUTC=false). So even with the feature enabled it is fail-closed, distinctly, as
+        // TypeWideningUnsupported (like the read-only cross-family #535 cases) — never silently applied.
+        StructType table = Schema(Field("ts", DataTypes.DateType, nullable: true));
+        StructType write = Schema(Field("ts", DataTypes.TimestampNtzType, nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+    }
+
+    [Fact]
+    public void Reconcile_DateToTimestampLtz_WhenEnabled_IsRejectedAsIncompatibleType()
+    {
+        // date→timestamp with a timezone (LTZ) stays a plain incompatible change even with the feature
+        // enabled — Delta never widens date→timestamp (only date→timestamp_ntz).
         StructType table = Schema(Field("ts", DataTypes.DateType, nullable: true));
         StructType write = Schema(Field("ts", DataTypes.TimestampType, nullable: true));
 
@@ -841,7 +874,7 @@ public sealed class DeltaSchemaEnforcerTests
             () => DeltaSchemaEnforcer.Reconcile(
                 table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
 
-        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+        Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
     }
 
     [Fact]
@@ -966,16 +999,16 @@ public sealed class DeltaSchemaEnforcerTests
     }
 
     [Fact]
-    public void Reconcile_PartitionColumnDateToTimestampWidening_IsDeferred_NotRewriteClaim()
+    public void Reconcile_PartitionColumnDateToTimestampNtzWidening_IsDeferred_NotRewriteClaim()
     {
-        // Pins the THIRD arm of TypeWidening.IsAnySanctionedWidening on the partition guard: date→timestamp
-        // (the #533 deferral). Delta sanctions date→timestamp_ntz and, on a partition column, it is rewrite-
+        // Pins the temporal arm of TypeWidening.IsAnySanctionedWidening on the partition guard:
+        // date→timestamp_ntz (the #533 widening). Delta sanctions it and, on a partition column, it is rewrite-
         // free (partition values are strings), so it must route to the honest #537 deferral
         // (TypeWideningUnsupported) — never PartitionColumnEvolution's "requires a full table rewrite". Without
-        // this test the date arm of the union predicate is unpinned at the partition guard (existing
-        // date→timestamp tests take the scalar, non-partition path).
+        // this test the temporal arm of the union predicate is unpinned at the partition guard (the scalar,
+        // non-partition date→timestamp_ntz path is APPLIED, so it does not cover the partition deferral).
         StructType table = Schema(Field("part", DataTypes.DateType, nullable: true));
-        StructType write = Schema(Field("part", DataTypes.TimestampType, nullable: true));
+        StructType write = Schema(Field("part", DataTypes.TimestampNtzType, nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
@@ -985,6 +1018,23 @@ public sealed class DeltaSchemaEnforcerTests
         Assert.Equal("part", ex.Path);
         Assert.Contains("#537", ex.Message, System.StringComparison.Ordinal);
         Assert.DoesNotContain("requires a full table rewrite", ex.Message, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Reconcile_PartitionColumnDateToTimestampLtz_IsPartitionColumnEvolution()
+    {
+        // date→timestamp with a timezone (LTZ) is NOT a sanctioned widening at all, so on a partition column it
+        // is a genuine non-widening evolution — PartitionColumnEvolutionUnsupported, NOT the #537 rewrite-free
+        // widening deferral (which is reserved for actually-sanctioned families).
+        StructType table = Schema(Field("part", DataTypes.DateType, nullable: true));
+        StructType write = Schema(Field("part", DataTypes.TimestampType, nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: new[] { "part" }, typeWideningEnabled: true));
+
+        Assert.Equal(DeltaSchemaMismatchKind.PartitionColumnEvolutionUnsupported, ex.Kind);
+        Assert.Equal("part", ex.Path);
     }
 
     [Fact]

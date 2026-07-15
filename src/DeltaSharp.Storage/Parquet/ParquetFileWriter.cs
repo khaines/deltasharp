@@ -64,6 +64,21 @@ internal sealed class ParquetFileWriter
         var fields = new DataField[columnCount];
         for (int c = 0; c < columnCount; c++)
         {
+            // Fail-close a native timestamp_ntz write: Parquet.Net 6.0.3 cannot persist the
+            // TIMESTAMP(isAdjustedToUTC=false) annotation (it emits a legacy UTC TIMESTAMP_MICROS
+            // ConvertedType), so a written column would be a protocol-non-conformant LTZ file that a strict
+            // Spark reader could misinterpret. timestamp_ntz is currently READ-only (Spark/delta-rs tables and
+            // date→timestamp_ntz read-promotion); native writes are deferred until the Parquet writer can emit
+            // isAdjustedToUTC=false (Parquet.Net patch / Thrift footer surgery follow-up, #557).
+            if (schema[c].DataType is TimestampNtzType)
+            {
+                throw DeltaStorageException.UnsupportedFeature(
+                    $"Writing a native timestamp_ntz column ('{schema[c].Name}') is not yet supported: "
+                    + "Parquet.Net 6.0.3 cannot persist the TIMESTAMP(isAdjustedToUTC=false) annotation, so a "
+                    + "written column would be a protocol-non-conformant LTZ file. timestamp_ntz is currently "
+                    + "read-only (Spark/delta-rs tables and date→timestamp_ntz read-promotion).");
+            }
+
             fields[c] = ParquetTypeMapping.CreateField(schema[c]);
         }
 

@@ -109,7 +109,7 @@ internal sealed class RowSpillCodec
             case IntegerType or DateType:
                 dest.AppendValue((int)value);
                 break;
-            case LongType or TimestampType:
+            case LongType or TimestampType or TimestampNtzType:
                 dest.AppendValue((long)value);
                 break;
             case FloatType:

@@ -80,6 +80,11 @@ public static class TypeCoercion
             return TimestampType.Instance;
         }
 
+        if ((left is DateType && right is TimestampNtzType) || (left is TimestampNtzType && right is DateType))
+        {
+            return TimestampNtzType.Instance;
+        }
+
         return null;
     }
 

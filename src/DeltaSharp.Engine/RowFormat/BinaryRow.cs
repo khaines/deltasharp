@@ -138,7 +138,7 @@ internal static class RowDecoder
                 ByteType => (sbyte)slot[0],
                 ShortType => BinaryPrimitives.ReadInt16LittleEndian(slot),
                 IntegerType or DateType => BinaryPrimitives.ReadInt32LittleEndian(slot),
-                LongType or TimestampType => BinaryPrimitives.ReadInt64LittleEndian(slot),
+                LongType or TimestampType or TimestampNtzType => BinaryPrimitives.ReadInt64LittleEndian(slot),
                 FloatType => BinaryPrimitives.ReadSingleLittleEndian(slot),
                 DoubleType => BinaryPrimitives.ReadDoubleLittleEndian(slot),
                 DecimalType => (Int128)BinaryPrimitives.ReadInt64LittleEndian(slot),

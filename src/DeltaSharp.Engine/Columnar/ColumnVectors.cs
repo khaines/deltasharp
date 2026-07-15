@@ -27,7 +27,7 @@ public static class ColumnVectors
             ByteType => new ManagedFixedWidthColumnVector<byte>(type, capacity),
             ShortType => new ManagedFixedWidthColumnVector<short>(type, capacity),
             IntegerType or DateType => new ManagedFixedWidthColumnVector<int>(type, capacity),
-            LongType or TimestampType => new ManagedFixedWidthColumnVector<long>(type, capacity),
+            LongType or TimestampType or TimestampNtzType => new ManagedFixedWidthColumnVector<long>(type, capacity),
             FloatType => new ManagedFixedWidthColumnVector<float>(type, capacity),
             DoubleType => new ManagedFixedWidthColumnVector<double>(type, capacity),
             DecimalType { IsCompact: true } => new ManagedFixedWidthColumnVector<long>(type, capacity),

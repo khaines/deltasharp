@@ -116,6 +116,7 @@ internal static class RowMaterializer
             DecimalType decimalType => ReadDecimal(column, decimalType, index),
             DateType => ReadDate(column, field, index),
             TimestampType => ReadTimestamp(column, field, index),
+            TimestampNtzType => ReadTimestampNtz(column, field, index),
             StringType => Encoding.UTF8.GetString(column.GetBytes(index)),
             BinaryType => column.GetBytes(index).ToArray(),
             _ => throw new UnsupportedPlanException(
@@ -178,7 +179,7 @@ internal static class RowMaterializer
         BooleanType or ByteType => 1,
         ShortType => 2,
         IntegerType or FloatType or DateType => 4,
-        LongType or DoubleType or TimestampType => 8,
+        LongType or DoubleType or TimestampType or TimestampNtzType => 8,
         DecimalType decimalType => decimalType.IsCompact ? 8 : 16,
         _ => 8,
     };
@@ -216,7 +217,16 @@ internal static class RowMaterializer
     // A micros value whose ticks overflow long, or whose instant falls outside DateTime's range, is a
     // deterministic UnsupportedPlanException (mirrors the decimal path) rather than a raw
     // ArgumentOutOfRangeException or a silent mis-decode.
-    private static DateTime ReadTimestamp(ColumnVector column, StructField field, int index)
+    private static DateTime ReadTimestamp(ColumnVector column, StructField field, int index) =>
+        ReadTimestampInstant(column, field, index, DateTimeKind.Utc);
+
+    // A TimestampNtzType lane stores the same epoch-microsecond long but is timezone-LESS (#533): surface
+    // it as a DateTime of kind Unspecified — a wall-clock instant with no offset — so Collect()/Show renders
+    // the stored local-datetime, never a UTC-adjusted one. Range handling is identical to ReadTimestamp.
+    private static DateTime ReadTimestampNtz(ColumnVector column, StructField field, int index) =>
+        ReadTimestampInstant(column, field, index, DateTimeKind.Unspecified);
+
+    private static DateTime ReadTimestampInstant(ColumnVector column, StructField field, int index, DateTimeKind kind)
     {
         long micros = column.GetValue<long>(index);
         long ticks;
@@ -235,7 +245,7 @@ internal static class RowMaterializer
             throw OutOfRangeTimestamp(field);
         }
 
-        return new DateTime(ticks, DateTimeKind.Utc);
+        return new DateTime(ticks, kind);
     }
 
     // Names the offending column and type but deliberately does NOT embed the raw epoch-microsecond cell

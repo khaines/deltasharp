@@ -81,7 +81,7 @@ internal sealed class LiteralEvaluator : ExpressionEvaluator
             case IntegerType or DateType:
                 AppendRepeated(result, (int)_literal.Value!, rows);
                 break;
-            case LongType or TimestampType:
+            case LongType or TimestampType or TimestampNtzType:
                 AppendRepeated(result, (long)_literal.Value!, rows);
                 break;
             case FloatType:

@@ -399,7 +399,7 @@ internal sealed class ParquetFileReader
         LongType => nullable ? Unsafe.SizeOf<long?>() : Unsafe.SizeOf<long>(),
         FloatType => nullable ? Unsafe.SizeOf<float?>() : Unsafe.SizeOf<float>(),
         DoubleType => nullable ? Unsafe.SizeOf<double?>() : Unsafe.SizeOf<double>(),
-        DateType or TimestampType => nullable ? Unsafe.SizeOf<DateTime?>() : Unsafe.SizeOf<DateTime>(),
+        DateType or TimestampType or TimestampNtzType => nullable ? Unsafe.SizeOf<DateTime?>() : Unsafe.SizeOf<DateTime>(),
         DecimalType => nullable ? Unsafe.SizeOf<decimal?>() : Unsafe.SizeOf<decimal>(),
         StringType or BinaryType => IntPtr.Size,
         _ => IntPtr.Size,
@@ -533,12 +533,19 @@ internal sealed class ParquetFileReader
                 break;
 
             case TimestampType:
+            case TimestampNtzType:
+                // Both timestamp (LTZ) and timestamp_ntz accept a non-DATE micros DateTimeDataField. The
+                // isAdjustedToUTC annotation is deliberately NOT checked: Parquet.Net 6.0.3 cannot faithfully
+                // round-trip isAdjustedToUTC=false, so it cannot distinguish the two on the wire. The Delta
+                // table SCHEMA is authoritative — the REQUESTED type (this case) selects the lane, and the
+                // stored INT64 micros are read into it. (timestamp_ntz is currently read-only; native writes
+                // are fail-closed at ParquetTypeMapping.CreateField.)
                 if (fileField is not DateTimeDataField timestampField
                     || timestampField.DateTimeFormat == DateTimeFormat.Date)
                 {
                     throw DeltaStorageException.SchemaMismatch(
-                        $"Column '{requestedField.Name}': expected a TIMESTAMP column but the file "
-                        + "annotation is DATE or not a temporal type.");
+                        $"Column '{requestedField.Name}': expected a {requestedField.DataType.SimpleString} "
+                        + "column but the file annotation is DATE or not a temporal type.");
                 }
 
                 break;
@@ -697,7 +704,7 @@ internal sealed class ParquetFileReader
                     static (v, value) => v.AppendValue(ParquetTypeMapping.DateTimeToEpochDay(value)),
                     cancellationToken).ConfigureAwait(false);
                 break;
-            case TimestampType:
+            case TimestampType or TimestampNtzType:
                 await ReadValueAsync<DateTime>(rowGroup, fileField, vector, rowCount,
                     static (v, value) => v.AppendValue(ParquetTypeMapping.DateTimeToEpochMicros(value)),
                     cancellationToken).ConfigureAwait(false);
@@ -777,6 +784,16 @@ internal sealed class ParquetFileReader
                 _ => ReadValueAsync<int>(rowGroup, fileField, vector, rowCount,
                     static (v, value) => v.AppendValue((double)value), cancellationToken),
             };
+        }
+
+        if (requestedField.DataType is TimestampNtzType && physicalType is DateType)
+        {
+            // date → timestamp_ntz (#533): read the narrow epoch-day physical values and promote each to
+            // epoch-micros at midnight of the date (days × 86_400 × 1_000_000). Timezone-less, so no session
+            // offset is applied — the promoted instant is wall-clock midnight, matching Delta/Spark semantics.
+            return ReadValueAsync<DateTime>(rowGroup, fileField, vector, rowCount,
+                static (v, value) => v.AppendValue(
+                    (long)ParquetTypeMapping.DateTimeToEpochDay(value) * 86_400L * 1_000_000L), cancellationToken);
         }
 
         // Integral widening: byte(sbyte) → short → int → long. The requested vector's storage width is the

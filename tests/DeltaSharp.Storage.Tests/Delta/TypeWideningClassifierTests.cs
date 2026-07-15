@@ -8,9 +8,9 @@ namespace DeltaSharp.Storage.Tests;
 /// Direct unit tests of the <see cref="TypeWidening.IsSanctionedWidening"/> classifier — the single
 /// authoritative allowlist shared by the write-side enforcer and the read-side promoter (#495, #535). These
 /// pin the exact boundary (identity/same-rank → not a change; each sanctioned widening → true; narrowings and
-/// deferred date→timestamp → false; decimal grow-only vs shrink; the cross-family integral→double /
-/// integral→decimal cases #535, including the decimal-fit boundary) so the two call sites can never diverge
-/// from the classifier's contract.
+/// the unsanctioned date→timestamp LTZ change → false; the sanctioned date→timestamp_ntz temporal widening
+/// #533 → true; decimal grow-only vs shrink; the cross-family integral→double / integral→decimal cases #535,
+/// including the decimal-fit boundary) so the two call sites can never diverge from the classifier's contract.
 /// </summary>
 public sealed class TypeWideningClassifierTests
 {
@@ -39,8 +39,13 @@ public sealed class TypeWideningClassifierTests
     [InlineData(nameof(DataTypes.IntegerType), nameof(DataTypes.DoubleType), true)]
     // long → double is LOSSY (64-bit int exceeds double's 53-bit mantissa) and NOT Delta-sanctioned → false.
     [InlineData(nameof(DataTypes.LongType), nameof(DataTypes.DoubleType), false)]
-    // Deferred date→timestamp (#533) is NOT a sanctioned APPLIED widening → false.
+    // date → timestamp_ntz (#533) IS a Delta-sanctioned APPLIED/read-promoted widening → true.
+    [InlineData(nameof(DataTypes.DateType), nameof(DataTypes.TimestampNtzType), true)]
+    // date → timestamp (LTZ) is NOT sanctioned by Delta (only date→timestamp_ntz is) → false.
     [InlineData(nameof(DataTypes.DateType), nameof(DataTypes.TimestampType), false)]
+    // timestamp_ntz → timestamp (and the reverse) is NOT a widening → false.
+    [InlineData(nameof(DataTypes.TimestampNtzType), nameof(DataTypes.TimestampType), false)]
+    [InlineData(nameof(DataTypes.TimestampType), nameof(DataTypes.TimestampNtzType), false)]
     public void IsSanctionedWidening_ScalarPairs(string from, string to, bool expected)
     {
         Assert.Equal(expected, TypeWidening.IsSanctionedWidening(Resolve(from), Resolve(to)));
@@ -121,6 +126,7 @@ public sealed class TypeWideningClassifierTests
         nameof(DataTypes.DoubleType) => DataTypes.DoubleType,
         nameof(DataTypes.DateType) => DataTypes.DateType,
         nameof(DataTypes.TimestampType) => DataTypes.TimestampType,
+        nameof(DataTypes.TimestampNtzType) => DataTypes.TimestampNtzType,
         _ => throw new System.ArgumentOutOfRangeException(nameof(name), name, "Unhandled type name."),
     };
 }

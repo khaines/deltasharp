@@ -91,7 +91,7 @@ internal sealed class StatisticsPolicy
         return type switch
         {
             BooleanType or ByteType or ShortType or IntegerType or LongType
-                or FloatType or DoubleType or DateType or TimestampType or StringType => true,
+                or FloatType or DoubleType or DateType or TimestampType or TimestampNtzType or StringType => true,
             DecimalType decimalType => decimalType.Precision <= ParquetTypeMapping.MaxSupportedDecimalPrecision,
             _ => false,
         };

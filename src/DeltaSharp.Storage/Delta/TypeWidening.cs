@@ -24,16 +24,19 @@ namespace DeltaSharp.Storage.Delta;
 /// physical type</b> (NOT its value range): <c>byte</c>/<c>short</c>/<c>int</c> are all stored as
 /// <c>INT32</c> ⇒ <c>p − s ≥ 10</c>; <c>long</c> is <c>INT64</c> ⇒ <c>p − s ≥ 20</c>. A decimal narrower than
 /// that threshold is NOT a sanctioned widening and stays fail-closed.</item>
+/// <item><b>Temporal</b> (<see cref="IsTemporalWidening"/>, #533): <c>date → timestamp_ntz</c> — Delta
+/// widens <c>date</c> to <c>timestamp without timezone</c> (INT64 epoch-micros); a narrow <c>date</c>
+/// (INT32 epoch-day) file is promoted to midnight-of-date micros on read. <b>Read-promote-only</b> (like the
+/// cross-family cases): NOT auto-applied on append, because this build cannot yet WRITE a native
+/// <c>timestamp_ntz</c> Parquet column (Parquet.Net 6.0.3 cannot persist <c>isAdjustedToUTC=false</c>).</item>
 /// </list></para>
 ///
 /// <para><b>Deliberately NOT applied</b> (protocol-sanctioned but out of this build's scope, kept
 /// fail-closed): nested (array-element/map-key/value) widening — it would need a <c>fieldPath</c> in
 /// <c>delta.typeChanges</c> and the Parquet read path does not read nested types at all (tracked as the #535
-/// follow-up, #546). Also <c>date</c> → <c>timestamp without timezone</c>: the
-/// <see cref="IsDeferredWidening">deferred</see> case (<b>#533</b>) because Delta only sanctions
-/// <c>date → timestamp_ntz</c> (NOT <c>date → timestamp</c> with a timezone), and this build has no
-/// <c>TimestampNtzType</c>, so applying it against the sole (timezone-adjusted) <c>timestamp</c> would be a
-/// semantically wrong promotion. It stays rejected until an NTZ type lands.</para>
+/// follow-up, #546). Note <c>date → timestamp</c> with a timezone (LTZ <see cref="TimestampType"/>) is NOT a
+/// sanctioned widening at all — Delta only widens <c>date → timestamp_ntz</c> — so a <c>date → timestamp</c>
+/// change is rejected as a plain incompatible type, not a deferred widening.</para>
 /// </summary>
 internal static class TypeWidening
 {
@@ -50,7 +53,9 @@ internal static class TypeWidening
     {
         ArgumentNullException.ThrowIfNull(from);
         ArgumentNullException.ThrowIfNull(to);
-        return IsSameFamilyWidening(from, to) || IsCrossFamilyWidening(from, to);
+        return IsSameFamilyWidening(from, to)
+            || IsCrossFamilyWidening(from, to)
+            || IsTemporalWidening(from, to);
     }
 
     /// <summary>
@@ -137,34 +142,42 @@ internal static class TypeWidening
     }
 
     /// <summary>
-    /// Whether <paramref name="from"/> → <paramref name="to"/> is a would-be widening that Delta sanctions
-    /// but this build <b>defers</b> (keeps fail-closed): today only <c>date → timestamp</c>. Delta widens
-    /// <c>date</c> to <c>timestamp_ntz</c> (timezone-<i>less</i>), which this build cannot represent (no
-    /// <c>TimestampNtzType</c>); the only <c>timestamp</c> here is timezone-adjusted, so the change is not
-    /// applied. Surfaced distinctly (as <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>) so the
-    /// error names the NTZ deferral rather than the generic incompatible-type reason. Tracked in <b>#533</b>.
+    /// Whether <paramref name="from"/> → <paramref name="to"/> is the Delta-sanctioned <b>temporal</b>
+    /// widening this build <b>read-promotes</b>: <c>date → timestamp_ntz</c> (#533). Delta widens
+    /// <c>date</c> to <c>timestamp without timezone</c> (<see cref="TimestampNtzType"/>), the timezone-<i>less</i>
+    /// INT64 epoch-micros type — <b>not</b> to the timezone-adjusted <see cref="TimestampType"/> (a
+    /// <c>date → timestamp</c> LTZ change is NOT sanctioned and is rejected as a plain incompatible type). On
+    /// read, a narrow <c>date</c> (INT32 epoch-day) file is promoted to <c>timestamp_ntz</c> (INT64 epoch-micros
+    /// at midnight of the date, no session offset).
+    ///
+    /// <para><b>Read-promote-only</b> (like the cross-family #535 cases): although Delta lists this change as
+    /// schema-evolution-eligible, DeltaSharp does <b>not</b> auto-apply it on append, because it cannot yet
+    /// <b>write</b> a native <c>timestamp_ntz</c> Parquet column — Parquet.Net 6.0.3 collapses the
+    /// <c>isAdjustedToUTC=false</c> annotation to <c>true</c> on write (a legacy <c>TIMESTAMP_MICROS</c>
+    /// ConvertedType, no <c>LogicalType</c>), so a written column would be a protocol-non-conformant LTZ file.
+    /// Native <c>timestamp_ntz</c> writes are therefore fail-closed (tracked in #557); this classifier
+    /// exists so DeltaSharp can READ a Spark/delta-rs table that recorded a <c>date → timestamp_ntz</c> change
+    /// over old <c>date</c> files, promoting them on read.</para>
     /// </summary>
-    public static bool IsDeferredWidening(DataType from, DataType to)
+    public static bool IsTemporalWidening(DataType from, DataType to)
     {
         ArgumentNullException.ThrowIfNull(from);
         ArgumentNullException.ThrowIfNull(to);
-        return from is DateType && to is TimestampType;
+        return from is DateType && to is TimestampNtzType;
     }
 
     /// <summary>
     /// Whether <paramref name="from"/> → <paramref name="to"/> is a Delta-sanctioned widening in <b>any</b> of
-    /// this build's recognized families — the applied allowlist (<see cref="IsSanctionedWidening"/>, which now
-    /// spans both same-family and cross-family #535) or the date→timestamp_ntz deferral
-    /// (<see cref="IsDeferredWidening"/>, #533). This is the single <b>union</b> predicate the
-    /// <see cref="DeltaSchemaEnforcer"/> partition-column guard uses so a partition-column type change is
-    /// classified as an honest rewrite-free widening deferral (#537) for <b>every</b> sanctioned family — even
-    /// the ones the partition guard defers (cross-family and date→timestamp) — and so a future family added to
-    /// any classifier is covered automatically without editing the guard. Independent of enablement (mirrors
-    /// the deferral classifier).
+    /// this build's recognized families — the full applied allowlist (<see cref="IsSanctionedWidening"/>, which
+    /// spans same-family, cross-family #535, and the temporal <c>date→timestamp_ntz</c> #533 cases). This is the
+    /// single <b>union</b> predicate the <see cref="DeltaSchemaEnforcer"/> partition-column guard uses so a
+    /// partition-column type change is classified as an honest rewrite-free widening deferral (#537) for
+    /// <b>every</b> sanctioned family — even the ones the partition guard defers (cross-family and
+    /// date→timestamp_ntz) — and so a future family added to any classifier is covered automatically without
+    /// editing the guard. Independent of enablement.
     /// </summary>
     public static bool IsAnySanctionedWidening(DataType from, DataType to) =>
-        IsSanctionedWidening(from, to)
-        || IsDeferredWidening(from, to);
+        IsSanctionedWidening(from, to);
 
     private static int IntegralRank(DataType type) => type switch
     {

@@ -174,7 +174,7 @@ internal static class ComparisonKernels
     public static int Compare(ComparisonOp op, ColumnVector left, long scalar, Span<byte> resultValues, Span<byte> resultValidity)
     {
         ArgumentNullException.ThrowIfNull(left);
-        if (left.Type is not (BooleanType or ByteType or ShortType or IntegerType or LongType or DateType or TimestampType))
+        if (left.Type is not (BooleanType or ByteType or ShortType or IntegerType or LongType or DateType or TimestampType or TimestampNtzType))
         {
             throw new NotSupportedException(
                 $"Scalar bigint comparison requires an integral/temporal column but got '{left.Type.SimpleString}'.");
@@ -193,7 +193,7 @@ internal static class ComparisonKernels
                 return 0;
             }
 
-            if (left.Type is LongType or TimestampType)
+            if (left.Type is LongType or TimestampType or TimestampNtzType)
             {
                 CompareInt64(op, left.GetValues<long>(), scalar, resultValues);
                 return 0;
@@ -634,7 +634,7 @@ internal static class ComparisonKernels
     private static void RequireComparable(DataType type)
     {
         if (type is not (BooleanType or ByteType or ShortType or IntegerType or LongType
-            or FloatType or DoubleType or DecimalType or DateType or TimestampType))
+            or FloatType or DoubleType or DecimalType or DateType or TimestampType or TimestampNtzType))
         {
             throw new NotSupportedException(
                 $"Comparison kernel does not support operand type '{type.SimpleString}'. String/binary comparisons "
