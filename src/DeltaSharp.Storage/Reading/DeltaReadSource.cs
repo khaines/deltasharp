@@ -384,14 +384,12 @@ public sealed class DeltaReadSource : IDisposable
 
     // True iff the read failed because the input Parquet file is missing a column the current data schema
     // requests — the additive schema-evolution (#190) narrow-file case that needs read-side null-fill (#497).
-    // A genuine corruption or a real type mismatch carries a different message/kind and does NOT match.
-    // TRACKED DEFERRAL (#513): this classification is string-coupled to ParquetFileReader's "is not present
-    // in the Parquet file schema" message (the same coupling exists at OPTIMIZE's guard site in
-    // DeltaOptimize.IsNarrowSchemaEvolutionInput). A shared, message-independent error-kind that both guard
-    // sites match on is #513.
+    // A genuine corruption or a real type mismatch carries a different kind and does NOT match. The signal is
+    // the dedicated StorageErrorKind.ColumnNotPresentInFile (#513), so this classification is decoupled from
+    // ParquetFileReader's message text (the same kind-based guard exists at OPTIMIZE's site in
+    // DeltaOptimize.IsUnfillableSchemaEvolutionInput).
     private static bool IsNarrowSchemaEvolutionInput(DeltaStorageException ex) =>
-        ex.Kind == StorageErrorKind.CorruptData
-        && ex.Message.Contains("is not present in the Parquet file schema", StringComparison.Ordinal);
+        ex.Kind == StorageErrorKind.ColumnNotPresentInFile;
 
     /// <inheritdoc/>
     public void Dispose() => _backend.Dispose();

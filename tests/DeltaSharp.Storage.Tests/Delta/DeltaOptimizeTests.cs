@@ -2,6 +2,7 @@ using System.Collections.Immutable;
 using System.Security.Cryptography;
 using System.Text;
 using DeltaSharp.Engine.Columnar;
+using DeltaSharp.Storage;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
 using DeltaSharp.Storage.Delta.DeletionVectors;
@@ -94,6 +95,16 @@ public sealed class DeltaOptimizeTests : IDisposable
         new StructField("id", DataTypes.LongType, nullable: false),
         new StructField("value", DataTypes.StringType, nullable: true),
         new StructField("req", DataTypes.StringType, nullable: false),
+    });
+
+    // A (non-widening) TYPE change of an existing column: "value" string -> long. Older files physically
+    // carry "value" as a string, so reading them under this schema is a present-but-mistyped SchemaMismatch
+    // (NOT an absent-column ColumnNotPresentInFile) -- used by the #513 specificity oracle to prove OPTIMIZE
+    // does not mask a genuine type mismatch as additive schema evolution.
+    private static readonly StructType TypeMismatchEvolvedSchema = new(new[]
+    {
+        new StructField("id", DataTypes.LongType, nullable: false),
+        new StructField("value", DataTypes.LongType, nullable: true),
     });
 
     private static readonly ImmutableSortedDictionary<string, string?> NoPartition =
@@ -487,6 +498,62 @@ public sealed class DeltaOptimizeTests : IDisposable
         Assert.DoesNotContain("not present in the Parquet file schema", ex.Message, StringComparison.Ordinal);
 
         // Fail-closed / orphan-safe: the table is unchanged — same version and same active files.
+        Snapshot after = await Log().LoadSnapshotAsync();
+        Assert.Equal(before.Version, after.Version);
+        Assert.Equal(ActivePaths(before), ActivePaths(after));
+    }
+
+    [Fact]
+    public async Task Optimize_GenuineCorruption_IsNotMaskedAsSchemaEvolution_Issue513()
+    {
+        // #513 specificity oracle (OPTIMIZE guard): IsUnfillableSchemaEvolutionInput matches ONLY the
+        // dedicated StorageErrorKind.ColumnNotPresentInFile sentinel, so a genuinely corrupt input (real
+        // byte corruption) must NOT be misclassified as additive schema evolution. OPTIMIZE must fail closed
+        // with the raw CorruptData storage fault — never a benign OptimizeSchemaEvolutionException that would
+        // present a corrupt file as compactable — leaving the table unchanged.
+        StagedDataFile a = await WriteDataFileAsync("a.parquet", Batch((1, "a")));
+        StagedDataFile b = await WriteDataFileAsync("b.parquet", Batch((2, "b")));
+        await SeedAsync(DataSchema, partitionColumns: null, a, b);
+        Snapshot before = await Log().LoadSnapshotAsync();
+
+        // Corrupt one input on disk AFTER seeding (non-Parquet garbage).
+        await File.WriteAllBytesAsync(
+            Path.Combine(_root, "a.parquet"),
+            Encoding.ASCII.GetBytes("not a parquet file -- genuine corruption"));
+
+        // DeltaStorageException is a sibling (not a supertype) of OptimizeSchemaEvolutionException, so an
+        // exact-type ThrowsAsync<DeltaStorageException> passing proves the corruption is NOT masked.
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => Optimize().OptimizeAsync());
+        Assert.Equal(StorageErrorKind.CorruptData, ex.Kind);
+
+        // Fail-closed / orphan-safe: the table is unchanged.
+        Snapshot after = await Log().LoadSnapshotAsync();
+        Assert.Equal(before.Version, after.Version);
+        Assert.Equal(ActivePaths(before), ActivePaths(after));
+    }
+
+    [Fact]
+    public async Task Optimize_PresentButMistypedColumn_IsNotMaskedAsSchemaEvolution_Issue513()
+    {
+        // #513 specificity oracle (OPTIMIZE guard): a present-but-mistyped column (SchemaMismatch, NOT an
+        // absent-column ColumnNotPresentInFile) must NOT be masked as additive schema evolution. Evolve
+        // "value" string -> long (a non-widening type change); OPTIMIZE reading the older string files under
+        // the long schema must fail closed with the raw SchemaMismatch fault, never
+        // OptimizeSchemaEvolutionException, leaving the table unchanged.
+        StagedDataFile a = await WriteDataFileAsync("a.parquet", Batch((1, "a")));
+        StagedDataFile b = await WriteDataFileAsync("b.parquet", Batch((2, "b")));
+        await SeedAsync(DataSchema, partitionColumns: null, a, b);
+
+        await EvolveSchemaAsync(version: 2, TypeMismatchEvolvedSchema);
+        Snapshot before = await Log().LoadSnapshotAsync();
+        Assert.Equal(2, before.Version);
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => Optimize().OptimizeAsync());
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+
+        // Fail-closed / orphan-safe: the table is unchanged.
         Snapshot after = await Log().LoadSnapshotAsync();
         Assert.Equal(before.Version, after.Version);
         Assert.Equal(ActivePaths(before), ActivePaths(after));
