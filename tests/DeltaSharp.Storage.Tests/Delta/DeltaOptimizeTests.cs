@@ -1203,6 +1203,58 @@ public sealed class DeltaOptimizeTests : IDisposable
         Assert.Equal(new (long?, string?)[] { (1L, "a"), (2L, "b") }, rows.OrderBy(r => r.Item1).ToList());
     }
 
+    [Fact]
+    public async Task Optimize_OnPartitionedNameModeTable_IsRejectedFailClosed_Issue553()
+    {
+        // The guard is partition-agnostic — it fires ABOVE PlanCompaction / partition resolution. A
+        // partitioned name-mode table with two small files in one partition is still rejected fail-closed.
+        // (Locks the guard's top-of-method placement against a future refactor that moved it below planning.)
+        var schema = new StructType(new[]
+        {
+            new StructField("region", DataTypes.StringType, nullable: true), // partition
+            new StructField("id", DataTypes.LongType, nullable: false),
+        });
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(_root))
+        {
+            await target.CreateNameMappedTableAsync(
+                schema, new[] { "region" }, new[] { RegionBatch(schema, "us", 1L) }, RandomPhysicalNameSource.Instance);
+            await target.AppendAsync(schema, new[] { "region" }, new[] { RegionBatch(schema, "us", 2L) });
+        }
+
+        Snapshot before = await Log().LoadSnapshotAsync();
+        OptimizeColumnMappingUnsupportedException ex =
+            await Assert.ThrowsAsync<OptimizeColumnMappingUnsupportedException>(() => Optimize().OptimizeAsync());
+        Assert.Equal(ColumnMappingMode.Name, ex.Mode);
+        Assert.Equal(before.Version, (await Log().LoadSnapshotAsync()).Version); // unchanged
+    }
+
+    [Fact]
+    public async Task Optimize_OnSingleFileNameModeTable_IsRejectedFailClosed_Issue553()
+    {
+        // Even a single-file name-mode table (not a compaction candidate) is rejected by the top-of-method
+        // guard — OPTIMIZE never quietly returns an empty no-op plan for a column-mapped table.
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(_root))
+        {
+            await target.CreateNameMappedTableAsync(
+                DataSchema, Array.Empty<string>(), new[] { Batch((1, "a")) }, RandomPhysicalNameSource.Instance);
+        }
+
+        OptimizeColumnMappingUnsupportedException ex =
+            await Assert.ThrowsAsync<OptimizeColumnMappingUnsupportedException>(() => Optimize().OptimizeAsync());
+        Assert.Equal(ColumnMappingMode.Name, ex.Mode);
+    }
+
+    [Fact]
+    public void OptimizeColumnMappingUnsupportedException_IdMode_CarriesModeAndLabel_Issue553()
+    {
+        // `id` mode is rejected at snapshot load (deferred to #523), so the guard's id branch is
+        // defense-in-depth reachable only via the internal explicit-snapshot seam. Unit-cover the exception's
+        // id path directly: it carries ColumnMappingMode.Id and labels the message 'id'.
+        var ex = new OptimizeColumnMappingUnsupportedException(ColumnMappingMode.Id);
+        Assert.Equal(ColumnMappingMode.Id, ex.Mode);
+        Assert.Contains("'id'", ex.Message, StringComparison.Ordinal);
+    }
+
     // ---------------------------------------------------------------- helpers
 
     private DeltaLog Log() => new(_backend);
@@ -1277,6 +1329,19 @@ public sealed class DeltaOptimizeTests : IDisposable
 
         return new ManagedColumnBatch(schema, new ColumnVector[] { id, value }, rows.Length);
     }
+
+    // Builds a single-row [region: string (partition), id: long] batch — used by the #553 partitioned
+    // name-mode guard test.
+    private static ColumnBatch RegionBatch(StructType schema, string region, long id)
+    {
+        MutableColumnVector regionCol = ColumnVectors.Create(DataTypes.StringType, 1);
+        MutableColumnVector idCol = ColumnVectors.Create(DataTypes.LongType, 1);
+        regionCol.AppendBytes(Encoding.UTF8.GetBytes(region));
+        idCol.AppendValue(id);
+        return new ManagedColumnBatch(schema, new ColumnVector[] { regionCol, idCol }, 1);
+    }
+
+    // Builds a batch of <paramref name="count"/> sequential rows (id = start..start+count-1, value = "v<id>"),
     // used to exercise multi-row-group / batch-straddling compaction with more than the 1–2 rows other tests
     // use.
     private static ColumnBatch BatchRange(long start, int count)
