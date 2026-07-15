@@ -9,6 +9,18 @@ namespace DeltaSharp.Types;
 /// </summary>
 public static class TemporalValues
 {
+    /// <summary>
+    /// The v1 <b>session-zone assumption</b> — the single, greppable anchor a future session-time-zone
+    /// feature must revisit. v1 has <b>no session time zone</b> (the class remarks above), so a
+    /// <see cref="TimestampType"/> (a UTC instant) and a <see cref="TimestampNtzType"/> (a timezone-less
+    /// wall-clock) share one epoch-microsecond long lane and the <c>timestamp ↔ timestamp_ntz</c> cast is
+    /// an <b>identity on that long</b> — never a zone shift; equivalently, the effective session zone is
+    /// UTC. The cast sites that rely on this (<c>CastEvaluator</c> and <c>CompiledExpressionLowering</c>)
+    /// tag their identity arms with a <c>SESSION-ZONE-ASSUMPTION</c> comment naming this member, so
+    /// introducing a session zone has exactly one anchor to reconsider. Always <see langword="true"/> in v1.
+    /// </summary>
+    public const bool SessionZoneIsUtc = true;
+
     /// <summary>Microseconds in one UTC day (24 × 60 × 60 × 1_000_000).</summary>
     public const long MicrosPerDay = 86_400_000_000L;
 

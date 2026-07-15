@@ -280,6 +280,11 @@ internal static class CompiledExpressionLowering
         return new Lowered(isNull, value, node.Type);
     }
 
+    /// <summary>
+    /// Lowers a fused cast. The <c>timestamp ↔ timestamp_ntz</c> arms are an identity on the
+    /// epoch-microsecond long under the <see cref="TemporalValues.SessionZoneIsUtc"/> assumption (no
+    /// session-zone shift); mirrors <see cref="CastEvaluator"/> so both backends agree bit-for-bit.
+    /// </summary>
     private static Expression ComputeCast(CastExpression node, Lowered child, ParameterExpression isNull, ParameterExpression value)
     {
         DataType source = node.Child.Type;
@@ -328,15 +333,17 @@ internal static class CompiledExpressionLowering
                 }
 
             case TimestampType:
-                // timestamp_ntz -> timestamp reinterprets the same epoch-microsecond lane with no session-zone
-                // shift (identity on the long); date -> timestamp is the midnight instant.
+                // SESSION-ZONE-ASSUMPTION (TemporalValues.SessionZoneIsUtc): timestamp_ntz -> timestamp
+                // reinterprets the same epoch-microsecond lane with no session-zone shift (identity on the
+                // long); date -> timestamp is the midnight instant.
                 return source is TimestampNtzType
                     ? Expression.Assign(value, AsInt64(child))
                     : DateToTimestampAssign(node, child, isNull, value);
 
             case TimestampNtzType:
                 // date -> timestamp_ntz is the midnight wall-clock instant; timestamp -> timestamp_ntz is an
-                // identity on the epoch-microsecond lane (timezone-less, never shifted).
+                // identity on the epoch-microsecond lane under SESSION-ZONE-ASSUMPTION
+                // (TemporalValues.SessionZoneIsUtc): timezone-less, never shifted.
                 return source is DateType
                     ? DateToTimestampAssign(node, child, isNull, value)
                     : Expression.Assign(value, AsInt64(child));

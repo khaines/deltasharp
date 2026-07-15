@@ -7,7 +7,8 @@ namespace DeltaSharp.Engine.Tests.Execution.Parity;
 /// <summary>
 /// A reproducible parity case: the fixed input <see cref="Schema"/>, a seeded <see cref="Batch"/>, and a
 /// seeded <see cref="Expression"/> tree to differentially evaluate. <see cref="RootForm"/> records
-/// whether the root produced a boolean predicate or a numeric value (for diagnostics / coverage).
+/// whether the root produced a boolean predicate, a numeric value, or a timestamp_ntz cast value (for
+/// diagnostics / coverage).
 /// </summary>
 internal sealed record GeneratedCase(
     StructType Schema, ColumnBatch Batch, PhysicalExpression Expression, string RootForm, int Rows);
@@ -78,11 +79,29 @@ internal static class BackendParityGenerator
         ColumnBatch batch = BuildBatch(rng, rows);
 
         // Draw the expression AFTER the batch so the row count does not perturb the tree shape's seed
-        // stream in a way that hides bugs; both are pure functions of the same seed regardless.
-        bool predicate = rng.NextBool();
-        PhysicalExpression expr = predicate ? GenBoolean(rng, depth: 3) : GenNumeric(rng, depth: 3);
-        return new GeneratedCase(Schema, batch, expr, predicate ? "predicate(boolean)" : "value(numeric)", rows);
+        // stream in a way that hides bugs; both are pure functions of the same seed regardless. The root
+        // is one of three value-carrying forms so the differential pins BOTH a boolean predicate, a
+        // numeric value, AND a bare timestamp_ntz cast VALUE (the last is the #558 seam: a uniform +N
+        // epoch-micros offset in a compiled ntz cast is invisible through an order-preserving comparison
+        // but is caught element-wise when the ntz cast is projected as a top-level output).
+        (PhysicalExpression expr, string rootForm) = rng.Next(3) switch
+        {
+            0 => (GenBoolean(rng, depth: 3), "predicate(boolean)"),
+            1 => (GenNumeric(rng, depth: 3), "value(numeric)"),
+            _ => (GenTemporalNtzValue(rng), "value(timestamp_ntz)"),
+        };
+        return new GeneratedCase(Schema, batch, expr, rootForm, rows);
     }
+
+    // A timestamp_ntz cast projected as a TOP-LEVEL output VALUE — the ntz long is compared element-wise
+    // by the differential oracle, NOT sunk into an order-preserving Comparison/IsNull. This is the #558
+    // correctness seam: a uniform +N epoch-micros offset in a compiled ntz cast is invisible through
+    // </=/> (it preserves ordering and equality against another equally-offset operand) but shows up
+    // immediately as a per-row value mismatch here. Both the date->ntz (midnight wall-clock) and the
+    // timestamp->ntz (identity on the epoch-micros lane) casts are drawn so both lowering arms are pinned.
+    private static PhysicalExpression GenTemporalNtzValue(DeterministicRng rng) => rng.NextBool()
+        ? new CastExpression(new ColumnReference(9, DataTypes.TimestampType, true), DataTypes.TimestampNtzType, AnsiMode.Legacy)
+        : new CastExpression(new ColumnReference(8, DataTypes.DateType, true), DataTypes.TimestampNtzType, AnsiMode.Legacy);
 
     // ===== expression grammar (type-directed; every tree satisfies CompiledExpressionEvaluators.CanFuse) =====
 

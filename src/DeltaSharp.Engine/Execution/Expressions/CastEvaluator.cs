@@ -17,7 +17,8 @@ namespace DeltaSharp.Engine.Execution.Expressions;
 /// <c>timestamp↔timestamp_ntz</c>. The <c>timestamp_ntz</c> casts are <b>timezone-less</b> (#558): a
 /// <c>date→timestamp_ntz</c> is the midnight wall-clock instant and a <c>timestamp↔timestamp_ntz</c>
 /// reinterprets the same epoch-microsecond lane with no session-zone shift (DeltaSharp has no session
-/// zone, so the two directions are an identity on the stored long). Deferred to later stories (and
+/// zone, so the two directions are an identity on the stored long — see the
+/// <see cref="TemporalValues.SessionZoneIsUtc"/> anchor). Deferred to later stories (and
 /// rejected at build by <see cref="IsSupported"/>): any string/binary cast, numeric↔temporal, and
 /// <c>float/double→decimal</c>.
 /// </remarks>
@@ -161,8 +162,9 @@ internal sealed class CastEvaluator : ExpressionEvaluator
             case TimestampType:
                 if (_source is TimestampNtzType)
                 {
-                    // timestamp_ntz -> timestamp reinterprets the same epoch-microsecond lane with no
-                    // session-zone shift (DeltaSharp has no session zone), so it is an identity on the long.
+                    // SESSION-ZONE-ASSUMPTION (TemporalValues.SessionZoneIsUtc): timestamp_ntz -> timestamp
+                    // reinterprets the same epoch-microsecond lane with no session-zone shift (DeltaSharp has
+                    // no session zone), so it is an identity on the long.
                     result.AppendValue(ScalarReader.ReadInt64(child, i));
                 }
                 else
@@ -181,7 +183,8 @@ internal sealed class CastEvaluator : ExpressionEvaluator
                 }
                 else
                 {
-                    // timestamp -> timestamp_ntz reinterprets the same epoch-microsecond lane with no shift.
+                    // SESSION-ZONE-ASSUMPTION (TemporalValues.SessionZoneIsUtc): timestamp -> timestamp_ntz
+                    // reinterprets the same epoch-microsecond lane with no shift (timezone-less, never shifted).
                     result.AppendValue(ScalarReader.ReadInt64(child, i));
                 }
 
