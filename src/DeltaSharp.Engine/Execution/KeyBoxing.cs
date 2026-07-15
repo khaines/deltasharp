@@ -28,7 +28,7 @@ internal static class KeyBoxing
             ByteType => (sbyte)vector.GetValue<byte>(row),
             ShortType => vector.GetValue<short>(row),
             IntegerType or DateType => vector.GetValue<int>(row),
-            LongType or TimestampType => vector.GetValue<long>(row),
+            LongType or TimestampType or TimestampNtzType => vector.GetValue<long>(row),
             FloatType => vector.GetValue<float>(row),
             DoubleType => vector.GetValue<double>(row),
             DecimalType { IsCompact: true } => (Int128)vector.GetValue<long>(row),

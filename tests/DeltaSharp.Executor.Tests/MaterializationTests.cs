@@ -182,6 +182,26 @@ public class MaterializationTests
     }
 
     [Fact]
+    public void TimestampNtz_MaterializesAsUnspecifiedKindWallClock()
+    {
+        // #533: a timestamp_ntz column materializes as a DateTime of kind Unspecified (a wall-clock instant,
+        // NOT UTC-tagged like TimestampType), and the stored wall-clock micros round-trip exactly. This is the
+        // read→collect path (RowMaterializer.ReadTimestampNtz); the batch is pre-encoded, so it does not go
+        // through the in-memory createDataFrame authoring path (deferred).
+        var fixture = new InMemoryRelationFixture();
+        StructType schema = TestData.Schema(TestData.Field("ts", TimestampNtzType.Instance, nullable: false));
+        var wall = new DateTime(2024, 1, 1, 12, 30, 15, DateTimeKind.Unspecified);
+        long micros = EpochMicros(DateTime.SpecifyKind(wall, DateTimeKind.Utc));
+
+        DataFrame df = fixture.Relation("ntz", schema, TestData.Batch(schema, TestData.TimestampsNtz(micros)));
+
+        Row row = Assert.Single(fixture.Collect(df));
+        DateTime got = row.GetAs<DateTime>("ts");
+        Assert.Equal(DateTimeKind.Unspecified, got.Kind);
+        Assert.Equal(wall, got);
+    }
+
+    [Fact]
     public void Timestamp_OutOfDateTimeRange_ThrowsDeterministicUnsupported()
     {
         var fixture = new InMemoryRelationFixture();

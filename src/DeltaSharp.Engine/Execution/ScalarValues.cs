@@ -23,7 +23,7 @@ internal static class ScalarValues
         ByteType => vector.GetValue<byte>(row),
         ShortType => vector.GetValue<short>(row),
         IntegerType or DateType => vector.GetValue<int>(row),
-        LongType or TimestampType => vector.GetValue<long>(row),
+        LongType or TimestampType or TimestampNtzType => vector.GetValue<long>(row),
         FloatType => vector.GetValue<float>(row),
         DoubleType => vector.GetValue<double>(row),
         DecimalType { IsCompact: true } => vector.GetValue<long>(row),
@@ -50,7 +50,7 @@ internal static class ScalarValues
             case IntegerType or DateType:
                 dest.AppendValue((int)boxed);
                 break;
-            case LongType or TimestampType:
+            case LongType or TimestampType or TimestampNtzType:
                 dest.AppendValue((long)boxed);
                 break;
             case FloatType:
@@ -86,7 +86,7 @@ internal static class ScalarValues
         ByteType => ((sbyte)(byte)a).CompareTo((sbyte)(byte)b),
         ShortType => ((short)a).CompareTo((short)b),
         IntegerType or DateType => ((int)a).CompareTo((int)b),
-        LongType or TimestampType => ((long)a).CompareTo((long)b),
+        LongType or TimestampType or TimestampNtzType => ((long)a).CompareTo((long)b),
         FloatType => ScalarReader.CompareDouble((float)a, (float)b),
         DoubleType => ScalarReader.CompareDouble((double)a, (double)b),
         DecimalType { IsCompact: true } d => ScalarReader.CompareDecimal(

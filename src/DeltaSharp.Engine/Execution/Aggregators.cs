@@ -635,7 +635,7 @@ internal sealed class MinMaxAggregator : Aggregator
             case ByteType: writer.WriteByte((byte)value); break;
             case ShortType: writer.WriteShort((short)value); break;
             case IntegerType or DateType: writer.WriteInt((int)value); break;
-            case LongType or TimestampType: writer.WriteLong((long)value); break;
+            case LongType or TimestampType or TimestampNtzType: writer.WriteLong((long)value); break;
             case FloatType: writer.WriteSingle((float)value); break;
             case DoubleType: writer.WriteDouble((double)value); break;
             case DecimalType { IsCompact: true }: writer.WriteLong((long)value); break;
@@ -651,7 +651,7 @@ internal sealed class MinMaxAggregator : Aggregator
         ByteType => reader.ReadByte(),
         ShortType => reader.ReadShort(),
         IntegerType or DateType => reader.ReadInt(),
-        LongType or TimestampType => reader.ReadLong(),
+        LongType or TimestampType or TimestampNtzType => reader.ReadLong(),
         FloatType => reader.ReadSingle(),
         DoubleType => reader.ReadDouble(),
         DecimalType { IsCompact: true } => reader.ReadLong(),

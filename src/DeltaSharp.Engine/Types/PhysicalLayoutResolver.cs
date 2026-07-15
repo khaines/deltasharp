@@ -77,6 +77,7 @@ internal static class PhysicalLayoutResolver
             case LongType:
             case DoubleType:
             case TimestampType:
+            case TimestampNtzType:
                 layout = PhysicalLayout.FixedWidth(8);
                 return true;
             case StringType:

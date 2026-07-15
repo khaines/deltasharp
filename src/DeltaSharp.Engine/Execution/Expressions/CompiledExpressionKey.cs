@@ -95,7 +95,7 @@ internal static class CompiledExpressionKey
             ByteType => ((sbyte)literal.Value!).ToString(CultureInfo.InvariantCulture),
             ShortType => ((short)literal.Value!).ToString(CultureInfo.InvariantCulture),
             IntegerType or DateType => ((int)literal.Value!).ToString(CultureInfo.InvariantCulture),
-            LongType or TimestampType => ((long)literal.Value!).ToString(CultureInfo.InvariantCulture),
+            LongType or TimestampType or TimestampNtzType => ((long)literal.Value!).ToString(CultureInfo.InvariantCulture),
 
             // Bit patterns distinguish -0.0/+0.0 and NaN payloads (which lower to distinct constants).
             FloatType => BitConverter.SingleToInt32Bits((float)literal.Value!).ToString(CultureInfo.InvariantCulture),

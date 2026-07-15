@@ -137,7 +137,7 @@ public sealed class BinaryRowEncoder
             case ByteType: slot[0] = (byte)Cast<sbyte>(value, type, field); break;
             case ShortType: BinaryPrimitives.WriteInt16LittleEndian(slot, Cast<short>(value, type, field)); break;
             case IntegerType or DateType: BinaryPrimitives.WriteInt32LittleEndian(slot, Cast<int>(value, type, field)); break;
-            case LongType or TimestampType: BinaryPrimitives.WriteInt64LittleEndian(slot, Cast<long>(value, type, field)); break;
+            case LongType or TimestampType or TimestampNtzType: BinaryPrimitives.WriteInt64LittleEndian(slot, Cast<long>(value, type, field)); break;
             case FloatType: BinaryPrimitives.WriteSingleLittleEndian(slot, Cast<float>(value, type, field)); break;
             case DoubleType: BinaryPrimitives.WriteDoubleLittleEndian(slot, Cast<double>(value, type, field)); break;
             case DecimalType: BinaryPrimitives.WriteInt64LittleEndian(slot, (long)Cast<Int128>(value, type, field)); break;

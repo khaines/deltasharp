@@ -613,7 +613,7 @@ internal static class AggregateKernels
                 case IntegerType or DateType:
                     ReadOnlySpan<int> i32 = vector.GetValues<int>();
                     return max ? MaxInt32(i32) : MinInt32(i32);
-                case LongType or TimestampType:
+                case LongType or TimestampType or TimestampNtzType:
                     ReadOnlySpan<long> i64 = vector.GetValues<long>();
                     return max ? MaxInt64(i64) : MinInt64(i64);
             }
@@ -805,7 +805,7 @@ internal static class AggregateKernels
 
     private static void RequireIntegralOrTemporal(DataType type, string aggregate)
     {
-        if (type is not (ByteType or ShortType or IntegerType or LongType or DateType or TimestampType))
+        if (type is not (ByteType or ShortType or IntegerType or LongType or DateType or TimestampType or TimestampNtzType))
         {
             throw new InvalidOperationException(
                 $"{aggregate}(bigint) requires an integral/temporal column but got '{type.SimpleString}'.");

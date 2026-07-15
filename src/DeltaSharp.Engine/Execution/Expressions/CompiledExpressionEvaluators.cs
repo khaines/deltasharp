@@ -113,7 +113,7 @@ internal static class CompiledExpressionEvaluators
     private static bool IsFusableType(DataType type) => type switch
     {
         BooleanType or ByteType or ShortType or IntegerType or LongType
-            or FloatType or DoubleType or DateType or TimestampType or DecimalType => true,
+            or FloatType or DoubleType or DateType or TimestampType or TimestampNtzType or DecimalType => true,
         _ => false, // string, binary, and any future variable-width type
     };
 

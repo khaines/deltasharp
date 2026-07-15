@@ -98,6 +98,7 @@ DeltaSharp.Types.StructType.StructType(System.Collections.Generic.IEnumerable<De
 DeltaSharp.Types.StructType.TryGetField(string! name, out DeltaSharp.Types.StructField! field) -> bool
 DeltaSharp.Types.StructType.this[int index].get -> DeltaSharp.Types.StructField!
 DeltaSharp.Types.StructType.this[string! name].get -> DeltaSharp.Types.StructField!
+DeltaSharp.Types.TimestampNtzType
 DeltaSharp.Types.TimestampType
 DeltaSharp.Types.TypeCoercion
 DeltaSharp.Types.TypeCoercionException
@@ -164,6 +165,8 @@ override DeltaSharp.Types.StructType.Equals(DeltaSharp.Types.DataType? other) ->
 override DeltaSharp.Types.StructType.GetHashCode() -> int
 override DeltaSharp.Types.StructType.SimpleString.get -> string!
 override DeltaSharp.Types.StructType.TypeName.get -> string!
+override DeltaSharp.Types.TimestampNtzType.SimpleString.get -> string!
+override DeltaSharp.Types.TimestampNtzType.TypeName.get -> string!
 override DeltaSharp.Types.TimestampType.SimpleString.get -> string!
 override DeltaSharp.Types.TimestampType.TypeName.get -> string!
 override abstract DeltaSharp.Types.DataType.GetHashCode() -> int
@@ -192,6 +195,7 @@ static DeltaSharp.Types.DataTypes.LongType.get -> DeltaSharp.Types.LongType!
 static DeltaSharp.Types.DataTypes.NullType.get -> DeltaSharp.Types.NullType!
 static DeltaSharp.Types.DataTypes.ShortType.get -> DeltaSharp.Types.ShortType!
 static DeltaSharp.Types.DataTypes.StringType.get -> DeltaSharp.Types.StringType!
+static DeltaSharp.Types.DataTypes.TimestampNtzType.get -> DeltaSharp.Types.TimestampNtzType!
 static DeltaSharp.Types.DataTypes.TimestampType.get -> DeltaSharp.Types.TimestampType!
 static DeltaSharp.Types.DateType.Instance.get -> DeltaSharp.Types.DateType!
 static DeltaSharp.Types.DecimalArithmetic.Bounded(int precision, int scale) -> DeltaSharp.Types.DecimalType!
@@ -216,6 +220,7 @@ static DeltaSharp.Types.NullType.Instance.get -> DeltaSharp.Types.NullType!
 static DeltaSharp.Types.ShortType.Instance.get -> DeltaSharp.Types.ShortType!
 static DeltaSharp.Types.StringType.Instance.get -> DeltaSharp.Types.StringType!
 static DeltaSharp.Types.StructType.Empty.get -> DeltaSharp.Types.StructType!
+static DeltaSharp.Types.TimestampNtzType.Instance.get -> DeltaSharp.Types.TimestampNtzType!
 static DeltaSharp.Types.TimestampType.Instance.get -> DeltaSharp.Types.TimestampType!
 static DeltaSharp.Types.TypeCoercion.CanCoerce(DeltaSharp.Types.DataType! source, DeltaSharp.Types.DataType! target) -> bool
 static DeltaSharp.Types.TypeCoercion.EnsureCoercible(DeltaSharp.Types.DataType! source, DeltaSharp.Types.DataType! target, string! path = "value") -> void

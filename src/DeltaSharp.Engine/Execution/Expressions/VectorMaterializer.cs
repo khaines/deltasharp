@@ -51,7 +51,7 @@ internal static class VectorMaterializer
             case IntegerType or DateType:
                 dest.AppendValue(source.GetValue<int>(index));
                 break;
-            case LongType or TimestampType:
+            case LongType or TimestampType or TimestampNtzType:
                 dest.AppendValue(source.GetValue<long>(index));
                 break;
             case FloatType:

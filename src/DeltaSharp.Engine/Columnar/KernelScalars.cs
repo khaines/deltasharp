@@ -37,7 +37,7 @@ internal static class KernelScalars
         ByteType => (sbyte)vector.GetValue<byte>(index),
         ShortType => vector.GetValue<short>(index),
         IntegerType or DateType => vector.GetValue<int>(index),
-        LongType or TimestampType => vector.GetValue<long>(index),
+        LongType or TimestampType or TimestampNtzType => vector.GetValue<long>(index),
         _ => throw new InvalidOperationException(
             $"Column of type '{vector.Type.SimpleString}' cannot be read as a 64-bit integer."),
     };

@@ -432,7 +432,7 @@ internal static class CompiledExpressionLowering
         BooleanType => BoolToInt64(operand),
         ByteType => Expression.Convert(Expression.Convert(operand.Value, typeof(sbyte)), typeof(long)), // (long)(sbyte)b
         ShortType or IntegerType or DateType => Expression.Convert(operand.Value, typeof(long)),
-        LongType or TimestampType => operand.Value,
+        LongType or TimestampType or TimestampNtzType => operand.Value,
         _ => throw new InvalidOperationException($"'{operand.Type.SimpleString}' cannot be read as a 64-bit integer."),
     };
 
@@ -475,7 +475,7 @@ internal static class CompiledExpressionLowering
         ByteType => Expression.Call(CompiledVectorAccess.ReadByteMethod, vector, row),
         ShortType => Expression.Call(CompiledVectorAccess.ReadInt16Method, vector, row),
         IntegerType or DateType => Expression.Call(CompiledVectorAccess.ReadInt32Method, vector, row),
-        LongType or TimestampType => Expression.Call(CompiledVectorAccess.ReadInt64Method, vector, row),
+        LongType or TimestampType or TimestampNtzType => Expression.Call(CompiledVectorAccess.ReadInt64Method, vector, row),
         FloatType => Expression.Call(CompiledVectorAccess.ReadSingleMethod, vector, row),
         DoubleType => Expression.Call(CompiledVectorAccess.ReadDoubleMethod, vector, row),
         DecimalType { IsCompact: true } compact => Expression.Call(
@@ -493,7 +493,7 @@ internal static class CompiledExpressionLowering
         ByteType => Expression.Constant(unchecked((byte)(sbyte)literal.Value!), typeof(byte)),
         ShortType => Expression.Constant((short)literal.Value!, typeof(short)),
         IntegerType or DateType => Expression.Constant((int)literal.Value!, typeof(int)),
-        LongType or TimestampType => Expression.Constant((long)literal.Value!, typeof(long)),
+        LongType or TimestampType or TimestampNtzType => Expression.Constant((long)literal.Value!, typeof(long)),
         FloatType => Expression.Constant((float)literal.Value!, typeof(float)),
         DoubleType => Expression.Constant((double)literal.Value!, typeof(double)),
         DecimalType decimalType => Expression.Constant(
@@ -509,7 +509,7 @@ internal static class CompiledExpressionLowering
             ByteType => CompiledVectorAccess.AppendByteMethod,
             ShortType => CompiledVectorAccess.AppendInt16Method,
             IntegerType or DateType => CompiledVectorAccess.AppendInt32Method,
-            LongType or TimestampType => CompiledVectorAccess.AppendInt64Method,
+            LongType or TimestampType or TimestampNtzType => CompiledVectorAccess.AppendInt64Method,
             FloatType => CompiledVectorAccess.AppendSingleMethod,
             DoubleType => CompiledVectorAccess.AppendDoubleMethod,
             DecimalType => CompiledVectorAccess.AppendDecimalMethod,
@@ -524,7 +524,7 @@ internal static class CompiledExpressionLowering
         ByteType => typeof(byte),
         ShortType => typeof(short),
         IntegerType or DateType => typeof(int),
-        LongType or TimestampType => typeof(long),
+        LongType or TimestampType or TimestampNtzType => typeof(long),
         FloatType => typeof(float),
         DoubleType => typeof(double),
         DecimalType => typeof(DecimalValue),
