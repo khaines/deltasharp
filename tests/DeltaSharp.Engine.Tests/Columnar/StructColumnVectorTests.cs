@@ -215,4 +215,68 @@ public class StructColumnVectorTests
         Assert.Throws<ArgumentOutOfRangeException>(() => s.Child(2));
         Assert.Throws<KeyNotFoundException>(() => s.Child("missing"));
     }
+
+    [Fact]
+    public void FromChildren_RejectsNullFirstChild()
+    {
+        // A null field-0 child must fail-closed with the documented ArgumentNullException naming the field,
+        // not an opaque NullReferenceException from peeking children[0].Length before the null guard.
+        ArgumentNullException ex = Assert.Throws<ArgumentNullException>(() =>
+            new StructColumnVector(PersonType, new ColumnVector[] { null!, Ints(1) }));
+        Assert.Contains("field 0", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Constructor_RejectsNegativeCapacity() =>
+        Assert.Throws<ArgumentOutOfRangeException>(() => new StructColumnVector(PersonType, capacity: -1));
+
+    [Fact]
+    public void EndStruct_RejectsChildAdvancedByMoreThanOne()
+    {
+        // Over-advance: a field child advanced by 2 while committing one row must fail-closed (the alignment
+        // guard is "!= _length + 1", not merely "< _length + 1").
+        var s = new StructColumnVector(PersonType, capacity: 4);
+        var id = (MutableColumnVector)s.Child(0);
+        var name = (MutableColumnVector)s.Child(1);
+        id.AppendValue(1);
+        id.AppendValue(2);
+        name.AppendBytes("a"u8);
+        Assert.Throws<InvalidOperationException>(() => s.EndStruct());
+    }
+
+    [Fact]
+    public void EndStruct_AfterSlice_IsRejected()
+    {
+        // Slicing a live builder seals it; a subsequent row-commit must throw rather than resize buffers
+        // out from under the returned view (anti-aliasing).
+        var s = new StructColumnVector(PersonType, capacity: 4);
+        ((MutableColumnVector)s.Child(0)).AppendValue(1);
+        ((MutableColumnVector)s.Child(1)).AppendBytes("a"u8);
+        s.EndStruct();
+        _ = s.Slice(0, 1);
+        ((MutableColumnVector)s.Child(0)).AppendValue(2);
+        ((MutableColumnVector)s.Child(1)).AppendBytes("b"u8);
+        Assert.Throws<InvalidOperationException>(() => s.EndStruct());
+    }
+
+    [Fact]
+    public void Slice_OverflowingRange_IsRejected()
+    {
+        // offset+length overflows int on a 0-length struct; the (long) bound must still reject it (a plain
+        // int add wraps negative and would fail open, returning an invalid view).
+        var empty = new StructColumnVector(PersonType, capacity: 1);
+        Assert.Throws<ArgumentOutOfRangeException>(() => empty.Slice(int.MaxValue, 1));
+    }
+
+    [Fact]
+    public void ZeroFieldStruct_BuildsRows()
+    {
+        var s = new StructColumnVector(StructType.Empty, capacity: 2);
+        s.EndStruct();
+        s.AppendNull();
+        Assert.Equal(2, s.Length);
+        Assert.False(s.IsNull(0));
+        Assert.True(s.IsNull(1));
+        Assert.Equal(StructType.Empty, s.Type);
+    }
 }

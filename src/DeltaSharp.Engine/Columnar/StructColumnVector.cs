@@ -95,7 +95,9 @@ public sealed class StructColumnVector : MutableColumnVector
                 + "were supplied.", nameof(children));
         }
 
-        int length = children.Count > 0 ? children[0].Length : nulls.Length;
+        int length = children.Count > 0
+            ? (children[0] ?? throw new ArgumentNullException(nameof(children), "Child vector for field 0 is null.")).Length
+            : nulls.Length;
         var copy = new ColumnVector[children.Count];
         for (int i = 0; i < children.Count; i++)
         {
@@ -215,8 +217,11 @@ public sealed class StructColumnVector : MutableColumnVector
     {
         CheckRange(offset, length);
 
-        // Zero-copy: share the children and validity buffer; the window re-bases logical row 0 via
-        // _offset. Sealing keeps the shared buffers safe against post-slice appends on this builder.
+        // Zero-copy: share the children and validity buffer; the window re-bases logical row 0 via _offset.
+        // Sealing this builder blocks further row commits (EndStruct/AppendNull) so the parent's validity
+        // buffer is not resized under the view. NOTE: the shared child vectors are NOT sealed — a caller that
+        // retained a mutable child reference from Child(i) BEFORE slicing could still mutate it and desync
+        // this view; the contract is "build fully before slicing" (child-seal propagation tracked in #575).
         _sealed = true;
 
         int absoluteOffset = _offset + offset;
@@ -357,10 +362,10 @@ public sealed class StructColumnVector : MutableColumnVector
     {
         ArgumentOutOfRangeException.ThrowIfNegative(offset);
         ArgumentOutOfRangeException.ThrowIfNegative(length);
-        if (offset + length > _length)
+        if ((long)offset + length > _length)
         {
             throw new ArgumentOutOfRangeException(
-                nameof(length), length, $"Slice [{offset}, {offset + length}) exceeds length {_length}.");
+                nameof(length), length, $"Slice [{offset}, {(long)offset + length}) exceeds length {_length}.");
         }
     }
 }

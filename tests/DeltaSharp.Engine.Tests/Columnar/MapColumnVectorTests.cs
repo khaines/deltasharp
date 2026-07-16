@@ -203,4 +203,52 @@ public class MapColumnVectorTests
         Assert.Throws<ArgumentOutOfRangeException>(() => map.KeysAt(-1));
         Assert.Throws<ArgumentOutOfRangeException>(() => map.ValuesAt(4));
     }
+
+    [Fact]
+    public void FromChildren_RejectsValueTypeMismatch()
+    {
+        // The value child's type must match the declared value type. Keys are correct (string); the value
+        // child is string where int is declared -> fail-closed (the mirror of the key-type guard).
+        Assert.Throws<ArgumentException>(() =>
+            new MapColumnVector(StringToInt, Keys("k"), Keys("v"), new[] { 0, 1 }));
+    }
+
+    [Fact]
+    public void Constructor_RejectsNegativeCapacity() =>
+        Assert.Throws<ArgumentOutOfRangeException>(() => new MapColumnVector(StringToInt, capacity: -1));
+
+    [Fact]
+    public void EndMap_RejectsMoreValuesThanKeys()
+    {
+        // Per-row parallelism: keys and values must advance equally. One extra value -> fail-closed.
+        var map = new MapColumnVector(StringToInt, capacity: 4);
+        var keys = (MutableColumnVector)map.Keys;
+        var values = (MutableColumnVector)map.Values;
+        keys.AppendBytes("k"u8);
+        values.AppendValue(1);
+        values.AppendValue(2);
+        Assert.Throws<InvalidOperationException>(() => map.EndMap());
+    }
+
+    [Fact]
+    public void EndMap_AfterSlice_IsRejected()
+    {
+        var map = new MapColumnVector(StringToInt, capacity: 4);
+        var keys = (MutableColumnVector)map.Keys;
+        var values = (MutableColumnVector)map.Values;
+        keys.AppendBytes("k"u8);
+        values.AppendValue(1);
+        map.EndMap();
+        _ = map.Slice(0, 1);
+        keys.AppendBytes("k2"u8);
+        values.AppendValue(2);
+        Assert.Throws<InvalidOperationException>(() => map.EndMap());
+    }
+
+    [Fact]
+    public void Slice_OverflowingRange_IsRejected()
+    {
+        var empty = new MapColumnVector(StringToInt, capacity: 1);
+        Assert.Throws<ArgumentOutOfRangeException>(() => empty.Slice(int.MaxValue, 1));
+    }
 }

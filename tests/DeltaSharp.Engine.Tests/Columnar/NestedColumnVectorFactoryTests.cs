@@ -189,4 +189,21 @@ public class NestedColumnVectorFactoryTests
 
         return v;
     }
+
+    [Fact]
+    public void Create_RecursesThreeLevelsDeep()
+    {
+        // struct<entries: array<map<string,int>>> — factory recursion must reach the 3rd-level leaf types
+        // without misalignment or stack issues (schema-bounded depth).
+        var schema = new StructType(new[]
+        {
+            new StructField("entries",
+                new ArrayType(new MapType(StringType.Instance, IntegerType.Instance))),
+        });
+        var s = Assert.IsType<StructColumnVector>(ColumnVectors.Create(schema, 2));
+        var list = Assert.IsType<ListColumnVector>(s.Child(0));
+        var map = Assert.IsType<MapColumnVector>(list.Elements);
+        Assert.Equal(StringType.Instance, map.Keys.Type);
+        Assert.Equal(IntegerType.Instance, map.Values.Type);
+    }
 }

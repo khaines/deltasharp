@@ -377,10 +377,10 @@ public sealed class MapColumnVector : MutableColumnVector
     {
         ArgumentOutOfRangeException.ThrowIfNegative(offset);
         ArgumentOutOfRangeException.ThrowIfNegative(length);
-        if (offset + length > _length)
+        if ((long)offset + length > _length)
         {
             throw new ArgumentOutOfRangeException(
-                nameof(length), length, $"Slice [{offset}, {offset + length}) exceeds length {_length}.");
+                nameof(length), length, $"Slice [{offset}, {(long)offset + length}) exceeds length {_length}.");
         }
     }
 }

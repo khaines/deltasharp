@@ -46,6 +46,26 @@ internal static class LocalRelationBatches
         ArgumentNullException.ThrowIfNull(schema);
         ArgumentNullException.ThrowIfNull(data);
 
+        // Nested types (struct/array/map) have a columnar REPRESENTATION (#570) but no CreateDataFrame
+        // materialization yet (decode/build wiring is #571). Reject a nested column here fail-closed and
+        // UNIFORMLY — before any column vector is built — so every case is consistently "not yet supported":
+        // without this, an all-null nested column would build a null nested vector and succeed, while a
+        // non-null one fails later at the Append switch, and a nested column merely carried past a filter
+        // would surface an internal Select-not-supported error. This keeps CreateDataFrame's nested behavior
+        // a single clear rejection until #571 lands materialization.
+        for (int c = 0; c < schema.Count; c++)
+        {
+            DataType columnType = schema[c].DataType;
+            if (columnType is StructType or ArrayType or MapType)
+            {
+                throw new UnsupportedPlanException(
+                    QueryExecutionStage.Scan,
+                    $"CreateDataFrame does not yet support nested column '{schema[c].Name}' of type "
+                    + $"'{columnType.SimpleString}' (the nested columnar representation landed in #570; "
+                    + "row materialization is tracked in #571).");
+            }
+        }
+
         IReadOnlyList<Row> rows = Drain(data, cancellationToken);
 
         int rowCount = rows.Count;

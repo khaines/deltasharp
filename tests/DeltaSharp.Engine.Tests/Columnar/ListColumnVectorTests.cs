@@ -184,4 +184,50 @@ public class ListColumnVectorTests
         Assert.Throws<ArgumentOutOfRangeException>(() => list.IsNull(4));
         Assert.Throws<ArgumentOutOfRangeException>(() => list.Slice(2, 3));
     }
+
+    [Fact]
+    public void FromChildAndOffsets_RejectsNegativeFirstOffset()
+    {
+        // offsets[0] < 0 must fail-closed: a negative first offset with a monotonic tail would otherwise
+        // slip construction and drive a negative child slice on read.
+        ArgumentException ex = Assert.Throws<ArgumentException>(() =>
+            new ListColumnVector(IntList, Ints(1, 2), new[] { -1, 2 }));
+        Assert.Contains("non-negative", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Constructor_RejectsNegativeCapacity() =>
+        Assert.Throws<ArgumentOutOfRangeException>(() => new ListColumnVector(IntList, capacity: -1));
+
+    [Fact]
+    public void EndList_AfterSlice_IsRejected()
+    {
+        var list = new ListColumnVector(IntList, capacity: 4);
+        var elements = (MutableColumnVector)list.Elements;
+        elements.AppendValue(10);
+        list.EndList();
+        _ = list.Slice(0, 1);
+        elements.AppendValue(20);
+        Assert.Throws<InvalidOperationException>(() => list.EndList());
+    }
+
+    [Fact]
+    public void Slice_OverflowingRange_IsRejected()
+    {
+        var empty = new ListColumnVector(IntList, capacity: 1);
+        Assert.Throws<ArgumentOutOfRangeException>(() => empty.Slice(int.MaxValue, 1));
+    }
+
+    [Fact]
+    public void FromChildAndOffsets_NonZeroFirstOffset_ReadsFromOffset()
+    {
+        // A positive offsets[0] is allowed (Arrow sliced-array semantics): the leading child element is
+        // unreferenced and row 0 reads from offsets[0].
+        var list = new ListColumnVector(IntList, Ints(99, 10, 20), new[] { 1, 3 });
+        Assert.Equal(1, list.Length);
+        Assert.Equal(2, list.ElementLength(0));
+        ColumnVector e = list.ElementsAt(0);
+        Assert.Equal(10, e.GetValue<int>(0));
+        Assert.Equal(20, e.GetValue<int>(1));
+    }
 }
