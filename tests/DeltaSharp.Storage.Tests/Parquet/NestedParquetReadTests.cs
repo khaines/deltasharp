@@ -408,6 +408,49 @@ public sealed class NestedParquetReadTests
     }
 
     [Fact]
+    public void ValidateParallelDefinition_RejectsEntryPresenceDisagreement_CorruptData()
+    {
+        // R6 (Critical, red-team): the DEFINITION-level analog of the R4 map rep-parity guard. A crafted map
+        // where key and value DEF disagree on which slots are present entries — passing rep-parity and
+        // level-range — must fail closed, never silently mis-pair values. mapMaxDef = 2 (key required, its max
+        // def == the map's own level): keyDef=[2,1] says slot0 is a present entry and slot1 an empty-map
+        // placeholder; valueDef=[1,2] says the opposite. Front-filling the value child from slot1 would then
+        // pair value(slot1) with key(slot0). This crafted stream is not authorable via the released
+        // Parquet.Net write door (definition levels are derived from value nullability), so the guard is pinned
+        // by a direct unit test of the now-internal helper.
+        DeltaStorageException mismatch = Assert.Throws<DeltaStorageException>(() =>
+            NestedParquetColumnReader.ValidateParallelDefinition(
+                keyDef: new[] { 2, 1 }, valueDef: new[] { 1, 2 }, mapMaxDef: 2, "col"));
+        Assert.Equal(StorageErrorKind.CorruptData, mismatch.Kind);
+        Assert.Contains("disagree on entry presence", mismatch.Message, StringComparison.Ordinal);
+
+        // A length disagreement (key and value declare different slot counts) also fails closed.
+        DeltaStorageException lengths = Assert.Throws<DeltaStorageException>(() =>
+            NestedParquetColumnReader.ValidateParallelDefinition(
+                keyDef: new[] { 2, 2 }, valueDef: new[] { 2 }, mapMaxDef: 2, "col"));
+        Assert.Equal(StorageErrorKind.CorruptData, lengths.Kind);
+    }
+
+    [Fact]
+    public void ValidateParallelDefinition_AcceptsWellFormedStreams_NoOverRejection()
+    {
+        // R6 no-over-rejection: every VALID key/value definition combination still passes. A present value may
+        // carry a HIGHER def than the required key (a nullable value: def 3 present vs def 2 null, both >=
+        // mapMaxDef 2), and empty-map (def 1) / null-map (def 0) placeholders agree on both leaves.
+        // Two present entries, the second value present-but-null (valueDef 2, still an entry).
+        NestedParquetColumnReader.ValidateParallelDefinition(
+            keyDef: new[] { 2, 2 }, valueDef: new[] { 3, 2 }, mapMaxDef: 2, "col");
+        // Empty map (both placeholders at def 1) and null map (both at def 0).
+        NestedParquetColumnReader.ValidateParallelDefinition(new[] { 1 }, new[] { 1 }, mapMaxDef: 2, "col");
+        NestedParquetColumnReader.ValidateParallelDefinition(new[] { 0 }, new[] { 0 }, mapMaxDef: 2, "col");
+        // Mixed rows — present entry, empty map, null map — all agreeing slot-by-slot.
+        NestedParquetColumnReader.ValidateParallelDefinition(
+            keyDef: new[] { 2, 1, 0 }, valueDef: new[] { 3, 1, 0 }, mapMaxDef: 2, "col");
+        // Null level arrays are vacuously parallel (defensive; real map leaves always carry def streams).
+        NestedParquetColumnReader.ValidateParallelDefinition(null, null, mapMaxDef: 2, "col");
+    }
+
+    [Fact]
     public async Task NestedLeafDecodeCeiling_FoldsReconstructedChild_FailsClosed()
     {
         // F2 (High, red-team): the eager-decode ceiling must bound the RAW leaf decode PLUS the reconstructed

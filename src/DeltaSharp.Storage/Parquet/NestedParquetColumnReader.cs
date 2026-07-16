@@ -32,6 +32,38 @@ namespace DeltaSharp.Storage.Parquet;
 /// <see cref="ParquetDecodeLimits"/> BEFORE the transient value/level buffers are allocated, so a crafted
 /// footer cannot drive an out-of-memory allocation (mirrors <see cref="ParquetFileReader.EnsureDecodeCeiling"/>
 /// for the flat path, which additionally aggregates these leaves' declared bytes).</para>
+/// <para><b>Structural def/rep validation (the complete enforced invariant set).</b> Because Parquet.Net
+/// exposes only the raw Dremel levels, the reader treats them as UNTRUSTED and validates every structural
+/// invariant a well-formed stream must satisfy, failing closed with <see cref="StorageErrorKind.CorruptData"/>
+/// so no crafted def/rep stream can silently mis-decode (produce wrong-but-plausible values) for the three
+/// shapes. The enforced set:
+/// <list type="bullet">
+///   <item><description><b>Every leaf.</b> Each reconstructed definition level lies in <c>[0, leaf max def]</c>
+///   and each repetition level in <c>[0, leaf max rep]</c> (<see cref="ValidateLevelRange"/>, covering BOTH
+///   streams); the declared value count is ceiling-bounded and non-negative; the def and rep arrays are
+///   allocated to the leaf's own value count, so they are equal-length and value-count-aligned by
+///   construction.</description></item>
+///   <item><description><b>List.</b> Both level streams are present; the first slot opens a row (repetition
+///   0); a row opened as an empty or null list admits no continuation, and every continuation (repetition
+///   &gt; 0) slot is a genuine element occurrence (state-transition legality); the reconstructed row count
+///   equals the row group's; the reassembled element count equals the element child's length; and the
+///   element-slot count is at least the row count (defense in depth).</description></item>
+///   <item><description><b>Struct.</b> Every field declares exactly one value per row (so all fields share
+///   the row count and therefore one another's length); and all fields agree, per row, on whether the struct
+///   is null (cross-field definition parity — a field claiming "present" under a null-struct row is
+///   rejected).</description></item>
+///   <item><description><b>Map.</b> The key is required/non-null; the key and value leaves share an IDENTICAL
+///   repetition stream (<see cref="ValidateParallelRepetition"/>) AND agree slot-by-slot on entry presence
+///   (<see cref="ValidateParallelDefinition"/> — the value's def-entry level matches the key's), so the value
+///   child pairs positionally with the key-driven entries; the shared entry structure obeys the list
+///   state-transition rules (the key stream drives <see cref="BuildRepeatedStructure"/>); the key and value
+///   child lengths match; the reassembled entry count equals the key child length; and the entry-slot count
+///   is at least the row count.</description></item>
+/// </list>
+/// With this set the three shapes are fully validated against structurally-invalid def/rep streams: the
+/// value/element/entry reconstruction is a pure positional consequence of levels that are all range-checked,
+/// length-aligned, cross-leaf-consistent (map), cross-field-consistent (struct), and state-transition-legal
+/// (list/map) — leaving no residual class that decodes to silent wrong data.</para>
 /// </remarks>
 internal static class NestedParquetColumnReader
 {
@@ -331,10 +363,11 @@ internal static class NestedParquetColumnReader
             .ConfigureAwait(false);
 
         // The value child is parallel to the key child: driven by the SAME present floor, its own definition
-        // levels distinguish a present-but-null value from a real value. Capture the value repetition stream
-        // (F1): a well-formed 3-level map nests the key and value in the SAME repeated key_value group, so
-        // their repetition levels are identical element-by-element.
-        (MutableColumnVector values, _, int[]? valueRep, _) = await ReadScalarLeafAsync(
+        // levels distinguish a present-but-null value from a real value. Capture the value repetition AND
+        // definition streams (F1 rep, R6 def): a well-formed 3-level map nests the key and value in the SAME
+        // repeated key_value group, so their repetition levels are identical AND they agree, slot-by-slot, on
+        // whether an entry is present.
+        (MutableColumnVector values, int[]? valueDef, int[]? valueRep, _) = await ReadScalarLeafAsync(
             rowGroup, valueLeaf, requested.ValueType, presentFloor: mapMaxDef, limits, cancellationToken)
             .ConfigureAwait(false);
 
@@ -342,10 +375,17 @@ internal static class NestedParquetColumnReader
         // below come from the key leaf alone). If a crafted/corrupt file gave the value a divergent per-entry
         // distribution — a different repetition stream at the SAME total count — the positional pairing would
         // silently mis-assign values across rows/keys (a WRONG, not merely failed, read). Reject any rep
-        // divergence BEFORE reconstructing. Only REP is validated: definition levels legitimately differ (a
-        // value may be null where the required key is present), and the value's own def still distinguishes
-        // null values during the leaf's own reconstruction.
+        // divergence BEFORE reconstructing.
         ValidateParallelRepetition(keyRep, valueRep, columnName);
+
+        // R6: the value's DEFINITION levels are the second half of the cross-leaf contract. The value child is
+        // front-filled from the slots where valueDef >= mapMaxDef and paired positionally against the entries
+        // the KEY structure marks present (keyDef >= mapMaxDef). A crafted stream where key and value disagree
+        // on entry presence at a slot — passing rep-parity and level-range — would mis-pair values across the
+        // map. Validate ENTRY-PRESENCE parity (not raw def equality: a present value legitimately has a HIGHER
+        // def than the required key, distinguishing null vs non-null above the map's own level). Only REP is
+        // shared identically; the value's own def still distinguishes null values during its leaf reconstruction.
+        ValidateParallelDefinition(keyDef, valueDef, mapMaxDef, columnName);
 
         if (keys.Length != values.Length)
         {
@@ -701,7 +741,47 @@ internal static class NestedParquetColumnReader
         }
     }
 
-    // The leaf's declared value count, bounded against the eager-decode ceiling BEFORE the values/level
+    // Validates that a map's key and value leaves AGREE, slot-by-slot, on whether each key_value slot is a
+    // PRESENT entry — the DEFINITION-level analog of ValidateParallelRepetition (R6). A well-formed 3-level map
+    // emits, for every slot, a key and value definition level that both sit at/above the map's own level (a
+    // present entry) or both below it (an empty-map / null-map placeholder). The reader front-fills the value
+    // child from the slots where valueDef >= mapMaxDef and pairs it positionally against the KEY-driven entry
+    // structure, so a crafted stream where key and value disagree on entry presence (e.g. keyDef=[2,1] /
+    // valueDef=[1,2]) — which passes rep-parity and level-range — would silently mis-pair values across the
+    // map. Compare ENTRY-PRESENCE (>= mapMaxDef), NOT raw equality: a present value legitimately has a HIGHER
+    // def than the required key (a nullable value distinguishes null vs non-null above the map's own level).
+    // Fail closed on any length or presence disagreement, BEFORE reconstruction. Internal so the guard can be
+    // pinned by a direct unit test (the released Parquet.Net write door derives definition levels from value
+    // nullability, so a key/value entry-presence divergence is not authorable end-to-end).
+    internal static void ValidateParallelDefinition(int[]? keyDef, int[]? valueDef, int mapMaxDef, string columnName)
+    {
+        int keyLen = keyDef?.Length ?? 0;
+        int valueLen = valueDef?.Length ?? 0;
+        if (keyLen != valueLen)
+        {
+            throw DeltaStorageException.CorruptData(
+                $"Map column '{columnName}' key and value leaves carry {keyLen} and {valueLen} definition "
+                + "level(s); a well-formed map shares one key_value group, so they must be equal.");
+        }
+
+        if (keyDef is null || valueDef is null)
+        {
+            // Both null (a degenerate non-optional map, impossible for a real MapField whose leaves have a max
+            // definition level >= the map's own level >= 1) — vacuously parallel.
+            return;
+        }
+
+        for (int i = 0; i < keyLen; i++)
+        {
+            if ((keyDef[i] >= mapMaxDef) != (valueDef[i] >= mapMaxDef))
+            {
+                throw DeltaStorageException.CorruptData(
+                    $"Map column '{columnName}' key and value definition levels disagree on entry presence at "
+                    + $"slot {i} (key {keyDef[i]}, value {valueDef[i]}, map level {mapMaxDef}); the value stream "
+                    + "would mis-pair entries across the map.");
+            }
+        }
+    }
     // buffers are allocated so a crafted NumValues cannot drive an out-of-memory allocation. Unlike the flat
     // path (one value per row, bounded by the row count), a repeated leaf can declare more values than rows,
     // so this bounds the ACTUAL transient (values + definition + repetition buffers) by the leaf's own count.
