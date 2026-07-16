@@ -177,6 +177,16 @@ internal sealed class DeltaCommitter
                 nameof(actions));
         }
 
+        // Append-only enforcement (Delta "Append-only Tables"; #549). Orthogonal to the BlindAppend check
+        // above (that is concurrency-conflict safety, keyed on read scope): this rejects a commit that would
+        // DELETE OR CHANGE committed data (a remove with dataChange=true — DELETE / OVERWRITE) on a table with
+        // delta.appendOnly=true, regardless of read scope. Keyed off the table's own metadata (Spark's
+        // IS_APPEND_ONLY.fromMetaData) so it covers both a legacy writer-2 appendOnly table and a writer-7
+        // table that enumerates the feature; compaction removes (dataChange=false, e.g. OPTIMIZE) are allowed,
+        // matching Spark's `if (removes.exists(_.dataChange)) assertRemovable(snapshot)`. Thrown before any
+        // write, so the DeltaProtocolException catch below records a fail-closed terminal (no version).
+        AppendOnlyFeature.EnsureCommitAllowed(readSnapshot.Metadata.Configuration, actions);
+
         // Observability wrapper (design §7, #479): spans/metrics/logs are side-effect-free on commit
         // semantics — the inner core is byte-for-byte the prior control flow. The stopwatch is monotonic
         // (never the wall clock, checklist 09b) and the span is a null no-op until a listener samples it.

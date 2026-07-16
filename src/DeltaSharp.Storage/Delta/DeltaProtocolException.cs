@@ -37,6 +37,12 @@ internal enum DeltaProtocolErrorKind
     /// <see cref="RetentionGap"/> (a timestamp before the earliest retained commit); callers may opt into
     /// clamping via <c>canReturnLatest</c> (design §2.12.1).</summary>
     TimestampAfterLatest,
+
+    /// <summary>A commit would delete or change committed data (a <c>remove</c> with <c>dataChange=true</c>,
+    /// e.g. DELETE / OVERWRITE) on a table configured append-only (<c>delta.appendOnly=true</c>). Refused
+    /// fail-closed (Delta "Append-only Tables"; #549). Distinct from <see cref="UnsupportedProtocol"/> — the
+    /// feature IS supported, but the requested operation violates the table's append-only guarantee.</summary>
+    AppendOnlyViolation,
 }
 
 /// <summary>
@@ -63,6 +69,11 @@ internal sealed class DeltaProtocolException : Exception
     /// <summary>An unsupported reader/writer protocol version or named table feature (fail closed).</summary>
     public static DeltaProtocolException Unsupported(string message) =>
         new(DeltaProtocolErrorKind.UnsupportedProtocol, message, innerException: null);
+
+    /// <summary>A commit that changes committed data on an append-only table (<c>delta.appendOnly=true</c>),
+    /// refused fail-closed (#549).</summary>
+    public static DeltaProtocolException AppendOnly(string message) =>
+        new(DeltaProtocolErrorKind.AppendOnlyViolation, message, innerException: null);
 
     /// <summary>Builds an <see cref="DeltaProtocolErrorKind.UnsupportedProtocol"/> error naming the
     /// unsupported reader/writer version (design §2.10.5 protocol negotiation).</summary>
