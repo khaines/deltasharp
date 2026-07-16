@@ -40,7 +40,7 @@ public sealed class ColumnMappingTestCollection
 /// </summary>
 /// <remarks>
 /// FIX #7 (flaky-safety-test isolation): these tests are placed in a NON-parallel xUnit collection. The
-/// fail-closed safety tests (e.g. <see cref="IdMode_IsRejectedFailClosed_DeferredTo523"/>) must never present
+/// fail-closed safety tests (e.g. <see cref="IdModeAppend_IsRejectedFailClosed_Since523"/>) must never present
 /// red in CI, and a raw-write column-mapping test flaked once under xUnit parallel execution on the shared
 /// temp filesystem. Disabling parallelization for this collection removes that harness race while keeping
 /// each test's per-instance temp directory.
@@ -688,10 +688,12 @@ public sealed class ColumnMappingTests : IDisposable
     public async Task IdMode_RequestedIdAboveInt32Max_IsRejectedFailClosed()
     {
         // LOW fix (Reliability F4): a requested delta.columnMapping.id > int.MaxValue is outside the Parquet
-        // footer field_id (int32) domain. It is rejected FAIL-CLOSED at ParquetTypeMapping.CreateField (which
-        // guards the long->int32 cast) — never silently truncated to int32. Here id = 2^32 + 1 casts to
-        // (int)1, which WOULD collide with the file's real field_id = 1 if the cast were left unguarded; the
-        // guard rejects it loudly instead of misresolving "evil" onto column "id"'s data.
+        // footer field_id (int32) domain. It is rejected FAIL-CLOSED at ParquetTypeMapping.CreateField (the
+        // FIRST-reached guard of the long->int32 cast) — never silently truncated to int32. Here id = 2^32 + 1
+        // would unchecked-cast to (int)1, numerically the file's real field_id = 1: only if BOTH this cast
+        // guard AND the redundant int-range bound in ParquetFileReader.ResolveFileFields were removed would
+        // "evil" misresolve onto column "id"'s data (with just the reader bound, an oversized id null-fills).
+        // CreateField fires first and rejects it loudly instead — the conservative fail-closed contract.
         const long overflowId = 4294967297L; // 2^32 + 1  =>  unchecked (int)overflowId == 1
         string schemaJson = "{\"type\":\"struct\",\"fields\":["
             + IdField("id", "long", false, 1, PhysId) + "," + IdField("evil", "long", true, overflowId, PhysScore) + "]}";
@@ -1521,10 +1523,11 @@ public sealed class ColumnMappingTests : IDisposable
         Assert.Equal(new[] { 100L, 200L }, readBack.OrderBy(x => x).ToArray());
     }
 
-    // #525 regression: `id` mode stays fail-closed on the WRITE path too (it is rejected at snapshot load —
-    // #523 is a separate, dependency-blocked issue). Only `name` mode append/overwrite is newly enabled.
+    // #525 regression: `id` mode stays fail-closed on the WRITE path (an id-mode append is rejected at the
+    // id-write gate). Since #523 an id-mode table is READABLE; id-mode WRITE is deferred to #572. Only `name`
+    // mode append/overwrite is newly enabled.
     [Fact]
-    public async Task IdModeAppend_IsRejectedFailClosed_DeferredTo523()
+    public async Task IdModeAppend_IsRejectedFailClosed_Since523()
     {
         // A protocol-supported columnMapping table declaring mode = id (raw commit, empty schema).
         await WriteRawTableAsync(
