@@ -428,15 +428,22 @@ internal sealed class ParquetFileReader
             {
                 var leaves = new List<DataField>();
                 NestedParquetColumnReader.CollectLeafFields(nestedField, leaves);
-                foreach (DataField leaf in leaves)
-                {
-                    (long leafCompressed, long leafUncompressed) = ChunkBytes(rowGroup, leaf);
 
-                    // ElementBytes 0 skips the (iii) per-row width bound (a repeated leaf can hold more values
-                    // than there are rows, so that bound does not apply); the leaf's transient allocation is
-                    // bounded by its declared value count in NestedParquetColumnReader instead. The declared
-                    // bytes still feed the (0)/(i)/(ii) decompression/absolute guards.
-                    footprints.Add(new ColumnChunkFootprint(leafCompressed, leafUncompressed, ElementBytes: 0));
+                // A1 (DoS): the container's OWN reconstructed structure — a list/map's per-row offsets plus
+                // per-row null flags, or a struct's per-row null flags — is a rowCount-scaled allocation with
+                // no backing column chunk, so the leaves' declared bytes do not cover it. Fold its per-row
+                // width into the FIRST leaf's (iii) row-count bound so an implausible declared rowCount (e.g. a
+                // forged footer NumRows) is rejected in EnsureDecodeCeiling BEFORE ReadRowGroupAsync allocates
+                // the offsets/nulls arrays. The leaves' own value/level buffers are bounded separately (by
+                // their declared value count) in NestedParquetColumnReader.LeafNumValues; ElementBytes 0 on the
+                // remaining leaves keeps them off the per-row bound (a repeated leaf can hold more values than
+                // there are rows, so that bound does not apply to them).
+                int structuralWidth = NestedContainerStructuralWidth(requested[c].DataType);
+                for (int leafIndex = 0; leafIndex < leaves.Count; leafIndex++)
+                {
+                    (long leafCompressed, long leafUncompressed) = ChunkBytes(rowGroup, leaves[leafIndex]);
+                    footprints.Add(new ColumnChunkFootprint(
+                        leafCompressed, leafUncompressed, ElementBytes: leafIndex == 0 ? structuralWidth : 0));
                 }
 
                 continue;
@@ -458,6 +465,16 @@ internal sealed class ParquetFileReader
 
         return footprints;
     }
+
+    // The per-row byte cost of a nested container's OWN reconstructed structure (independent of its leaf
+    // values): a list/map allocates a per-row offset (int) plus a per-row null flag (bool); a struct allocates
+    // only a per-row null flag. Feeds the (iii) row-count decode bound (A1) so a forged/implausible rowCount is
+    // rejected before that rowCount-scaled structure is allocated.
+    private static int NestedContainerStructuralWidth(DataType nested) => nested switch
+    {
+        ArrayType or MapType => sizeof(int) + sizeof(bool),
+        _ => sizeof(bool),
+    };
 
     // The declared (compressed, decompressed) bytes of a column chunk, or (0, 0) when the chunk is absent or
     // its metadata is missing/encrypted — a zero the (0) guard rejects fail-closed for a non-empty row group.
@@ -525,8 +542,6 @@ internal sealed class ParquetFileReader
         internal Field? Nested { get; }
 
         internal bool IsAbsent { get; }
-
-        internal bool IsNested => Nested is not null;
 
         internal static ResolvedColumn ForScalar(DataField field) => new(field, null, absent: false);
 

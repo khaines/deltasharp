@@ -106,6 +106,36 @@ internal static class ParquetTestHelpers
         return forged.ToArray();
     }
 
+    /// <summary>Rewrites the footer so that <paramref name="rowGroup"/>'s <c>NumRows</c> declares
+    /// <paramref name="forgedNumRows"/> instead of its true row count — an attacker-controlled footer field
+    /// (the physical data pages are untouched). The file reopens cleanly through Parquet.Net, so a
+    /// <see cref="ParquetFileReader"/> read must reject the implausible row count via its eager-decode ceiling
+    /// (A1) BEFORE any rowCount-scaled allocation, rather than materializing a giant offsets/nulls buffer.
+    /// Mirrors <see cref="ForgeColumnUncompressedSizeAsync"/>, mutating only the row group's NumRows.</summary>
+    public static async Task<byte[]> ForgeRowGroupNumRowsAsync(byte[] bytes, int rowGroup, long forgedNumRows)
+    {
+        byte[] newFooter;
+        using (var stream = new MemoryStream(bytes, writable: false))
+        {
+            ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                global::Parquet.Meta.FileMetaData metadata = reader.Metadata!;
+                metadata.RowGroups[rowGroup].NumRows = forgedNumRows;
+                newFooter = SerializeFooter(metadata);
+            }
+        }
+
+        int originalFooterLength = BitConverter.ToInt32(bytes, bytes.Length - 8);
+        int footerStart = bytes.Length - 8 - originalFooterLength;
+        using var forged = new MemoryStream();
+        forged.Write(bytes, 0, footerStart);
+        forged.Write(newFooter, 0, newFooter.Length);
+        forged.Write(BitConverter.GetBytes(newFooter.Length), 0, 4);
+        forged.Write("PAR1"u8);
+        return forged.ToArray();
+    }
+
     private static byte[] SerializeFooter(global::Parquet.Meta.FileMetaData metadata)
     {
         Assembly parquet = typeof(ParquetReader).Assembly;

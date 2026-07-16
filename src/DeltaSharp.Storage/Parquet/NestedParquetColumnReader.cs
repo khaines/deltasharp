@@ -55,6 +55,14 @@ internal static class NestedParquetColumnReader
                         $"Column '{columnName}': requested a struct but the file column is not a struct.");
                 }
 
+                if (structType.Count == 0)
+                {
+                    // Defensive parity with EnsureReadSupported: a zero-field struct has no leaf to drive the
+                    // row count and would reconstruct a length-0 vector — fail closed on the contract.
+                    throw DeltaStorageException.UnsupportedFeature(
+                        $"Parquet nested read for struct column '{columnName}': a zero-field struct is not supported.");
+                }
+
                 foreach (StructField field in structType)
                 {
                     _ = ResolveStructField(fileStruct, field, columnName);
@@ -218,6 +226,17 @@ internal static class NestedParquetColumnReader
             rowGroup, elementLeaf, requested.ElementType, presentFloor: listMaxDef, limits, cancellationToken)
             .ConfigureAwait(false);
 
+        // A1 (defense in depth): every top-level row emits at least one element-level slot (a real element, or
+        // a placeholder for a null/empty list), so the element leaf's declared value count is >= the row count.
+        // A smaller count cannot describe rowCount rows — reject BEFORE allocating the rowCount-scaled
+        // offsets/nulls (this also transitively bounds that allocation, since numValues is ceiling-bounded).
+        if (numValues < rowCount)
+        {
+            throw DeltaStorageException.CorruptData(
+                $"Array column '{columnName}' declares {numValues} element slot(s) for a {rowCount}-row group, "
+                + "but a repeated column emits at least one level slot per row.");
+        }
+
         var offsets = new int[checked(rowCount + 1)];
         var nulls = new bool[rowCount];
         int total = BuildRepeatedStructure(def, rep, numValues, listMaxDef, rowCount, offsets, nulls, columnName);
@@ -264,6 +283,17 @@ internal static class NestedParquetColumnReader
             throw DeltaStorageException.CorruptData(
                 $"Map column '{columnName}' reassembled {keys.Length} key(s) but {values.Length} value(s); a "
                 + "map's key and value children must be parallel.");
+        }
+
+        // A1 (defense in depth): the key leaf drives the entry structure and emits at least one level slot per
+        // row (a placeholder for a null/empty map), so its declared value count is >= the row count. Reject a
+        // smaller count BEFORE allocating the rowCount-scaled offsets/nulls (bounding that allocation, since
+        // keyNumValues is ceiling-bounded).
+        if (keyNumValues < rowCount)
+        {
+            throw DeltaStorageException.CorruptData(
+                $"Map column '{columnName}' declares {keyNumValues} entry slot(s) for a {rowCount}-row group, "
+                + "but a repeated column emits at least one level slot per row.");
         }
 
         var offsets = new int[checked(rowCount + 1)];
@@ -403,7 +433,17 @@ internal static class NestedParquetColumnReader
                     (v, x) => ParquetTypeMapping.AppendDecimal(v, decimalType, x, factors), cancellationToken);
             case StringType:
                 return ReadLeafAsync<ReadOnlyMemory<char>>(rowGroup, leaf, scalarType, presentFloor, limits,
-                    static (v, x) => v.AppendBytes(Encoding.UTF8.GetBytes(new string(x.Span))), cancellationToken);
+                    static (v, x) =>
+                    {
+                        // Encode straight from the source chars into a single right-sized buffer — no
+                        // intermediate string allocation per element (balanced F2). The 2-arg span overload
+                        // is the only ReadOnlySpan<char> form the framework exposes (there is no byte[]-
+                        // returning single-arg overload), and AppendBytes copies into the vector's own store.
+                        ReadOnlySpan<char> chars = x.Span;
+                        byte[] bytes = new byte[Encoding.UTF8.GetByteCount(chars)];
+                        Encoding.UTF8.GetBytes(chars, bytes);
+                        v.AppendBytes(bytes);
+                    }, cancellationToken);
             case BinaryType:
                 return ReadLeafAsync<ReadOnlyMemory<byte>>(rowGroup, leaf, scalarType, presentFloor, limits,
                     static (v, x) => v.AppendBytes(x.Span), cancellationToken);
@@ -454,10 +494,19 @@ internal static class NestedParquetColumnReader
         {
             // Parquet.Net's DATE/TIMESTAMP decode throws ArgumentOutOfRangeException for a physical value
             // outside the representable DateTime range — a corrupt/hostile file, mapped to the deterministic
-            // CorruptData contract (mirrors the flat reader's ReadValueAsync).
+            // CorruptData contract (mirrors the flat reader's ReadValueAsync). Named by the requested leaf type
+            // so the message is accurate for whichever leaf raised it (not hard-coded to date/time).
             throw DeltaStorageException.CorruptData(
-                $"Nested leaf '{leaf.Path}': a physical value is outside the representable date/time range.", ex);
+                $"Nested leaf '{leaf.Path}' of type '{elementType.SimpleString}' has a physical value outside "
+                + "its representable range.", ex);
         }
+
+        // A5: reject any reconstructed Dremel level outside its declared range BEFORE interpreting it. A
+        // crafted level would otherwise be silently coerced — a definition level above the field max reads as a
+        // spurious present-null, a repetition level above the max mis-nests a row — a WRONG (not merely failed)
+        // read. The value/structure passes below can then trust the levels.
+        ValidateLevelRange(def, leaf.MaxDefinitionLevel, leaf.Path.ToString(), "definition");
+        ValidateLevelRange(rep, leaf.MaxRepetitionLevel, leaf.Path.ToString(), "repetition");
 
         var child = ColumnVectors.Create(elementType, Math.Max(numValues, 1));
         int fieldMaxDef = leaf.MaxDefinitionLevel;
@@ -496,6 +545,29 @@ internal static class NestedParquetColumnReader
         }
 
         return (child, def, rep, numValues);
+    }
+
+    // Validates that every reconstructed Dremel level in <paramref name="levels"/> falls in the closed range
+    // [0, <paramref name="maxLevel"/>] declared by the leaf's schema — a level outside it is a corrupt or
+    // hostile page, failed closed rather than silently coerced (A5). Internal so the guard can be pinned by a
+    // direct unit test (an out-of-range level cannot be produced by any conforming Parquet writer, so this is
+    // otherwise unreachable through the public read door). The unsigned compare rejects negatives too.
+    internal static void ValidateLevelRange(int[]? levels, int maxLevel, string leafPath, string kind)
+    {
+        if (levels is null)
+        {
+            return;
+        }
+
+        for (int i = 0; i < levels.Length; i++)
+        {
+            if ((uint)levels[i] > (uint)maxLevel)
+            {
+                throw DeltaStorageException.CorruptData(
+                    $"Nested leaf '{leafPath}' has a {kind} level {levels[i]} outside the valid range "
+                    + $"[0, {maxLevel}].");
+            }
+        }
     }
 
     // The leaf's declared value count, bounded against the eager-decode ceiling BEFORE the values/level
@@ -552,8 +624,11 @@ internal static class NestedParquetColumnReader
 
     private static void EnsureRequiredMapKey(PqMapField fileMap, string columnName)
     {
-        // A standard MapType key is required (its max definition level equals the map's own level). A file map
-        // with an OPTIONAL key could carry a null key, which MapType forbids — fail closed rather than risk it.
+        // Defensive parity, guaranteed unreachable through the public read door: Parquet.Net's MapField
+        // constructor itself throws ("map's key cannot be nullable"), so a MapField loaded from any file
+        // always has a required key (its max definition level equals the map's own level). The guard is kept
+        // as an explicit local invariant so a future decode path — or a library change — that produced a
+        // nullable key would still fail closed rather than risk a null MapType key.
         if (fileMap.Key.MaxDefinitionLevel != fileMap.MaxDefinitionLevel)
         {
             throw DeltaStorageException.SchemaMismatch(

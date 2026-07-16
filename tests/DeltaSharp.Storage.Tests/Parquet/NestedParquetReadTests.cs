@@ -4,6 +4,7 @@ using DeltaSharp.Storage;
 using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Types;
 using Parquet.Serialization;
+using Parquet.Serialization.Attributes;
 using Xunit;
 using StructField = DeltaSharp.Types.StructField;
 
@@ -76,6 +77,47 @@ public sealed class NestedParquetReadTests
         public int Id { get; set; }
 
         public Dictionary<string, string?>? Sm { get; set; }
+    }
+
+    // A file column that is array<struct> (a nested type within a nested type), for the A8 decode-path guard.
+    private sealed class NestedListRow
+    {
+        public int Id { get; set; }
+
+        public List<Inner>? Items { get; set; }
+    }
+
+    // All-nullable struct fields, so a PRESENT struct can have every field null — distinct from a NULL struct.
+    private sealed class AllNullableInner
+    {
+        public int? A { get; set; }
+
+        public string? B { get; set; }
+    }
+
+    private sealed class AllNullableRow
+    {
+        public int Id { get; set; }
+
+        public AllNullableInner? S { get; set; }
+    }
+
+    // DATE / TIMESTAMP / DECIMAL leaves inside a struct (highest-value untested nested-leaf conversions).
+    private sealed class DateInner
+    {
+        public DateOnly D { get; set; }
+
+        public DateTime Ts { get; set; }
+
+        [ParquetDecimal(18, 4)]
+        public decimal Dec { get; set; }
+    }
+
+    private sealed class DateRow
+    {
+        public int Id { get; set; }
+
+        public DateInner? S { get; set; }
     }
 
     [Fact]
@@ -340,12 +382,422 @@ public sealed class NestedParquetReadTests
         Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
     }
 
+    [Fact]
+    public async Task ListRow_ForgedNumRows_FailsClosed_BeforeOverCeilingAllocation()
+    {
+        // A1 (HIGH DoS): a forged footer NumRows must be rejected by the eager-decode ceiling BEFORE the
+        // rowCount-scaled offsets/nulls arrays are allocated. The nested container's per-row structural width
+        // (int offset + bool null = 5 bytes) is folded into the first leaf's row-count bound, so a tiny file
+        // claiming 50,000,000 rows fails closed without the ~250 MB allocation.
+        byte[] bytes = await WriteAsync(new List<ListRow>
+        {
+            new() { Id = 1, Arr = new List<int?> { 1, 2 } },
+            new() { Id = 2, Arr = new List<int?> { 3 } },
+        });
+        byte[] forged = await ParquetTestHelpers.ForgeRowGroupNumRowsAsync(bytes, rowGroup: 0, forgedNumRows: 50_000_000);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Arr", DataTypes.CreateArrayType(DataTypes.IntegerType, containsNull: true), nullable: true),
+        });
+        // A 4 MiB ceiling: 50,000,000 rows × 5 structural bytes = 250 MB ≫ ceiling, so the row-count bound
+        // rejects it. The default 4 GiB ceiling only rejects rowCount > ~858M, so real row groups are unaffected.
+        var reader = new ParquetFileReader(new ParquetDecodeLimits(maxRowGroupDecodedBytes: 4L * 1024 * 1024));
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => EnumerateAsync(reader, forged, requested));
+
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+        // The ceiling message (from EnsureDecodeCeiling, which runs BEFORE any per-column decode/allocation)
+        // proves the rejection is PRE-allocation — not the post-allocation cross-check, which would also throw
+        // CorruptData but only after the 250 MB offsets buffer had already been allocated.
+        Assert.Contains("eager-decode ceiling", error.Message, StringComparison.Ordinal);
+        Assert.Contains("5-byte column", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task MapRow_ForgedNumRows_FailsClosed_BeforeOverCeilingAllocation()
+    {
+        // A1 (HIGH DoS), map variant: the key leaf drives the entry structure and carries the folded 5-byte
+        // structural width, so a forged NumRows is rejected before the map's offsets/nulls allocation.
+        byte[] bytes = await WriteAsync(new List<MapRow>
+        {
+            new() { Id = 1, M = new Dictionary<string, int?>(StringComparer.Ordinal) { ["k1"] = 1, ["k2"] = 2 } },
+        });
+        byte[] forged = await ParquetTestHelpers.ForgeRowGroupNumRowsAsync(bytes, rowGroup: 0, forgedNumRows: 50_000_000);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "M",
+                DataTypes.CreateMapType(DataTypes.StringType, DataTypes.IntegerType, valueContainsNull: true),
+                nullable: true),
+        });
+        var reader = new ParquetFileReader(new ParquetDecodeLimits(maxRowGroupDecodedBytes: 4L * 1024 * 1024));
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => EnumerateAsync(reader, forged, requested));
+
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+        Assert.Contains("eager-decode ceiling", error.Message, StringComparison.Ordinal);
+        Assert.Contains("5-byte column", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Nested_UnderIdMode_FailsClosed_UnsupportedFeature()
+    {
+        // A2: a nested column under column-mapping id mode is not supported (BuildFieldIdMap is flat/leaf-only).
+        // Without the guard, the nested column would silently resolve BY NAME under id mode — a wrong read.
+        byte[] bytes = await WriteAsync(new List<ListRow> { new() { Id = 1, Arr = new List<int?> { 1, 2 } } });
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Arr", DataTypes.CreateArrayType(DataTypes.IntegerType, containsNull: true), nullable: true),
+        });
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(async () =>
+        {
+            using var stream = new MemoryStream(bytes, writable: false);
+            await foreach (ColumnBatch _ in new ParquetFileReader().ReadAsync(
+                stream, requested, null, nullFillMissingColumns: false, allowTypeWideningPromotion: false,
+                resolveByFieldId: true, CancellationToken.None))
+            {
+            }
+        });
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+    }
+
+    [Fact]
+    public async Task NestedLeafDecodeCeiling_FailsClosed_CorruptData()
+    {
+        // A3: the per-leaf eager-decode ceiling bounds a nested leaf's declared value count independently of
+        // the row count. 20,000 element slots under a 120,000-byte ceiling clears the container's row-count
+        // bound but must trip the leaf guard (the "Nested leaf" message confirms which guard fired).
+        byte[] bytes = await WriteAsync(new List<ListRow>
+        {
+            new() { Id = 1, Arr = Enumerable.Range(0, 20_000).Select(i => (int?)i).ToList() },
+        });
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Arr", DataTypes.CreateArrayType(DataTypes.IntegerType, containsNull: true), nullable: true),
+        });
+        var reader = new ParquetFileReader(new ParquetDecodeLimits(maxRowGroupDecodedBytes: 120_000));
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => EnumerateAsync(reader, bytes, requested));
+
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+        Assert.Contains("Nested leaf", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task NestedLeafTypeMismatch_FailsClosed_SchemaMismatch()
+    {
+        // A4: a nested leaf whose physical type disagrees with the requested type must fail closed (no widening
+        // for nested leaves — that is #546). File 'A' is int32; requesting it as long is a SchemaMismatch.
+        byte[] bytes = await WriteAsync(new List<StructRow> { new() { Id = 1, S = new Inner { A = 10, B = "x" } } });
+        StructType wrong = DataTypes.CreateStructType(new[]
+        {
+            DataTypes.CreateStructField("A", DataTypes.LongType, nullable: false),
+            DataTypes.CreateStructField("B", DataTypes.StringType, nullable: true),
+        });
+        var requested = new StructType(new[] { new StructField("S", wrong, nullable: true) });
+
+        DeltaStorageException error =
+            await Assert.ThrowsAsync<DeltaStorageException>(() => ReadSingleAsync(bytes, requested));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
+    }
+
+    [Fact]
+    public async Task NestedLeafDateTimestampConfusion_FailsClosed_SchemaMismatch()
+    {
+        // A4 (silent-corruption case): DATE and TIMESTAMP both decode as a CLR DateTime, so mis-reading one as
+        // the other would land in the wrong epoch lane (day vs micros) with NO exception unless the physical-
+        // type guard distinguishes the logical annotations. Both directions must fail closed.
+        byte[] bytes = await WriteAsync(new List<DateRow>
+        {
+            new()
+            {
+                Id = 1,
+                S = new DateInner
+                {
+                    D = new DateOnly(2024, 1, 2),
+                    Ts = new DateTime(2024, 1, 2, 3, 4, 5, DateTimeKind.Utc),
+                    Dec = 1.5m,
+                },
+            },
+        });
+
+        // File 'D' is a DATE leaf; requesting it as TIMESTAMP must be rejected.
+        var dateAsTimestamp = new StructType(new[]
+        {
+            new StructField(
+                "S",
+                DataTypes.CreateStructType(new[]
+                    { DataTypes.CreateStructField("D", DataTypes.TimestampType, nullable: false) }),
+                nullable: true),
+        });
+        DeltaStorageException e1 =
+            await Assert.ThrowsAsync<DeltaStorageException>(() => ReadSingleAsync(bytes, dateAsTimestamp));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, e1.Kind);
+
+        // File 'Ts' is a TIMESTAMP leaf; requesting it as DATE must be rejected.
+        var timestampAsDate = new StructType(new[]
+        {
+            new StructField(
+                "S",
+                DataTypes.CreateStructType(new[]
+                    { DataTypes.CreateStructField("Ts", DataTypes.DateType, nullable: false) }),
+                nullable: true),
+        });
+        DeltaStorageException e2 =
+            await Assert.ThrowsAsync<DeltaStorageException>(() => ReadSingleAsync(bytes, timestampAsDate));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, e2.Kind);
+    }
+
+    [Fact]
+    public void ValidateLevelRange_RejectsOutOfRangeLevel_CorruptData()
+    {
+        // A5: an out-of-range Dremel level cannot be produced by a conforming writer, so the guard is unit-
+        // tested directly. A def level above the leaf max would otherwise be silently coerced to a spurious
+        // present-null (a WRONG read), so it must fail closed.
+        DeltaStorageException over = Assert.Throws<DeltaStorageException>(
+            () => NestedParquetColumnReader.ValidateLevelRange(new[] { 0, 1, 5 }, maxLevel: 3, "col.leaf", "definition"));
+        Assert.Equal(StorageErrorKind.CorruptData, over.Kind);
+        Assert.Contains("definition level 5", over.Message, StringComparison.Ordinal);
+
+        // The unsigned compare also rejects a negative level.
+        DeltaStorageException negative = Assert.Throws<DeltaStorageException>(
+            () => NestedParquetColumnReader.ValidateLevelRange(new[] { -1 }, maxLevel: 2, "col.leaf", "repetition"));
+        Assert.Equal(StorageErrorKind.CorruptData, negative.Kind);
+
+        // In-range levels (including exactly maxLevel) and a null array are accepted with no throw.
+        NestedParquetColumnReader.ValidateLevelRange(new[] { 0, 1, 2, 3 }, maxLevel: 3, "col.leaf", "definition");
+        NestedParquetColumnReader.ValidateLevelRange(null, maxLevel: 3, "col.leaf", "definition");
+    }
+
+    [Fact]
+    public async Task ZeroFieldStruct_FailsClosed_UnsupportedFeature()
+    {
+        // A6: a zero-field struct reconstructs a length-0 vector and (pre-fix) surfaced a raw ArgumentException
+        // from the batch ctor rather than the DeltaStorageException contract. Reject it fail-closed.
+        byte[] bytes = await WriteAsync(new List<StructRow> { new() { Id = 1, S = new Inner { A = 1, B = "x" } } });
+        var requested = new StructType(new[]
+        {
+            new StructField("S", DataTypes.CreateStructType(Array.Empty<StructField>()), nullable: true),
+        });
+
+        DeltaStorageException error =
+            await Assert.ThrowsAsync<DeltaStorageException>(() => ReadSingleAsync(bytes, requested));
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+    }
+
+    [Fact]
+    public async Task Array_EmptyListAdjacentToNullElementList_DisambiguatesLevels()
+    {
+        // arch adjacency trap: an EMPTY list [] immediately followed by a list holding a single NULL element
+        // [null] must decode to distinct shapes — 0 elements vs 1 present-but-null element — even though a
+        // naive length delta would conflate them.
+        var rows = new List<ListRow>
+        {
+            new() { Id = 1, Arr = new List<int?>() },
+            new() { Id = 2, Arr = new List<int?> { null } },
+            new() { Id = 3, Arr = new List<int?> { 7 } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Arr", DataTypes.CreateArrayType(DataTypes.IntegerType, containsNull: true), nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSingleAsync(bytes, requested);
+        var arr = Assert.IsType<ListColumnVector>(batch.Column("Arr"));
+
+        Assert.False(arr.IsNull(0));
+        Assert.Equal(0, arr.ElementLength(0)); // [] — empty, not null
+
+        Assert.False(arr.IsNull(1));
+        Assert.Equal(1, arr.ElementLength(1)); // [null] — one present-but-null element
+        Assert.True(arr.ElementsAt(1).IsNull(0));
+
+        Assert.Equal(1, arr.ElementLength(2));
+        Assert.Equal(7, arr.ElementsAt(2).GetValue<int>(0));
+    }
+
+    [Fact]
+    public async Task Struct_NullStructAdjacentToPresentAllNullFields_Disambiguated()
+    {
+        // arch adjacency trap: a NULL struct (the whole struct absent) vs a PRESENT struct whose every field is
+        // null must decode to distinct struct-level null masks — IsNull(struct) true vs false — even though both
+        // leave all child leaves null.
+        var rows = new List<AllNullableRow>
+        {
+            new() { Id = 1, S = null },
+            new() { Id = 2, S = new AllNullableInner { A = null, B = null } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+        StructType st = DataTypes.CreateStructType(new[]
+        {
+            DataTypes.CreateStructField("A", DataTypes.IntegerType, nullable: true),
+            DataTypes.CreateStructField("B", DataTypes.StringType, nullable: true),
+        });
+        var requested = new StructType(new[] { new StructField("S", st, nullable: true) });
+
+        ColumnBatch batch = await ReadSingleAsync(bytes, requested);
+        var s = Assert.IsType<StructColumnVector>(batch.Column("S"));
+
+        Assert.True(s.IsNull(0)); // null struct
+        Assert.True(s.Child("A").IsNull(0));
+        Assert.True(s.Child("B").IsNull(0));
+
+        Assert.False(s.IsNull(1)); // present struct with all-null fields
+        Assert.True(s.Child("A").IsNull(1));
+        Assert.True(s.Child("B").IsNull(1));
+    }
+
+    [Fact]
+    public async Task ZeroRowFile_NestedColumn_YieldsNoRows()
+    {
+        // quality zero-row-file edge: a nested column in a file with no rows must decode to zero rows without
+        // error (no batch, or an empty batch — both acceptable).
+        byte[] bytes = await WriteAsync(new List<ListRow>());
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Arr", DataTypes.CreateArrayType(DataTypes.IntegerType, containsNull: true), nullable: true),
+        });
+
+        using var stream = new MemoryStream(bytes, writable: false);
+        var batches = new List<ColumnBatch>();
+        await foreach (ColumnBatch batch in new ParquetFileReader().ReadAsync(
+            stream, requested, null, nullFillMissingColumns: false, allowTypeWideningPromotion: false,
+            CancellationToken.None))
+        {
+            batches.Add(batch);
+        }
+
+        Assert.Equal(0, batches.Sum(b => b.RowCount));
+        foreach (ColumnBatch batch in batches)
+        {
+            Assert.Equal(0, Assert.IsType<ListColumnVector>(batch.Column("Arr")).Length);
+        }
+    }
+
+    [Fact]
+    public async Task AllNullListColumn_DecodesAllNull()
+    {
+        // quality all-null-column edge: every row's list is null. The column decodes to all-null with zero
+        // elements — distinct from all-empty (asserted elsewhere).
+        var rows = new List<ListRow>
+        {
+            new() { Id = 1, Arr = null },
+            new() { Id = 2, Arr = null },
+            new() { Id = 3, Arr = null },
+        };
+        byte[] bytes = await WriteAsync(rows);
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Arr", DataTypes.CreateArrayType(DataTypes.IntegerType, containsNull: true), nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSingleAsync(bytes, requested);
+        var arr = Assert.IsType<ListColumnVector>(batch.Column("Arr"));
+
+        Assert.Equal(3, arr.Length);
+        for (int i = 0; i < 3; i++)
+        {
+            Assert.True(arr.IsNull(i));
+            Assert.Equal(0, arr.ElementLength(i));
+        }
+
+        Assert.Equal(0, arr.ElementsAt(0).Length); // no elements materialized at all
+    }
+
+    [Fact]
+    public async Task Struct_DecodesDateTimestampDecimalLeaves()
+    {
+        // A7: nested-leaf coverage for the highest-value untested conversions — DATE (epoch-day int lane),
+        // TIMESTAMP (epoch-micros long lane), and DECIMAL (unscaled reconstruction) — plus a null struct row.
+        var date = new DateOnly(2024, 1, 2);
+        var timestamp = new DateTime(2024, 1, 2, 3, 4, 5, DateTimeKind.Utc);
+        var rows = new List<DateRow>
+        {
+            new() { Id = 1, S = new DateInner { D = date, Ts = timestamp, Dec = 12.3400m } },
+            new() { Id = 2, S = null },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        DecimalType decimalType = DataTypes.CreateDecimalType(18, 4);
+        StructType st = DataTypes.CreateStructType(new[]
+        {
+            DataTypes.CreateStructField("D", DataTypes.DateType, nullable: false),
+            DataTypes.CreateStructField("Ts", DataTypes.TimestampType, nullable: false),
+            DataTypes.CreateStructField("Dec", decimalType, nullable: false),
+        });
+        var requested = new StructType(new[] { new StructField("S", st, nullable: true) });
+
+        ColumnBatch batch = await ReadSingleAsync(bytes, requested);
+        var s = Assert.IsType<StructColumnVector>(batch.Column("S"));
+
+        int expectedEpochDay = date.DayNumber - new DateOnly(1970, 1, 1).DayNumber;
+        Assert.Equal(expectedEpochDay, s.Child("D").GetValue<int>(0));
+
+        long expectedMicros = (timestamp.Ticks - DateTime.UnixEpoch.Ticks) / TimeSpan.TicksPerMicrosecond;
+        Assert.Equal(expectedMicros, s.Child("Ts").GetValue<long>(0));
+
+        Assert.Equal(12.3400m, ParquetTypeMapping.ReadDecimal(s.Child("Dec"), decimalType, 0));
+
+        Assert.True(s.IsNull(1)); // null struct → all leaves null
+        Assert.True(s.Child("D").IsNull(1));
+        Assert.True(s.Child("Ts").IsNull(1));
+        Assert.True(s.Child("Dec").IsNull(1));
+    }
+
+    [Fact]
+    public async Task NestedWithinNested_PresentColumn_FailsClosed_DecodePathGuard()
+    {
+        // A8: request a PRESENT array<int> against a file column that is actually array<struct>. The requested
+        // scalar-element array clears the front-line EnsureReadSupported, so the rejection comes from the
+        // decode-path shape guard ("the file column is itself nested") — proving that guard is exercised, not
+        // shadowed by the front line (as the absent-column ArrayOfStruct_FailsClosed case is).
+        var rows = new List<NestedListRow>
+        {
+            new() { Id = 1, Items = new List<Inner> { new() { A = 1, B = "x" } } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Items", DataTypes.CreateArrayType(DataTypes.IntegerType, containsNull: true), nullable: true),
+        });
+
+        DeltaStorageException error =
+            await Assert.ThrowsAsync<DeltaStorageException>(() => ReadSingleAsync(bytes, requested));
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("file column is itself nested", error.Message, StringComparison.Ordinal);
+    }
+
     private static async Task<byte[]> WriteAsync<T>(IReadOnlyList<T> rows)
         where T : class, new()
     {
         using var stream = new MemoryStream();
         await ParquetSerializer.SerializeAsync(rows, stream, cancellationToken: CancellationToken.None);
         return stream.ToArray();
+    }
+
+    private static async Task EnumerateAsync(ParquetFileReader reader, byte[] bytes, StructType requested)
+    {
+        using var stream = new MemoryStream(bytes, writable: false);
+        await foreach (ColumnBatch _ in reader.ReadAsync(
+            stream, requested, null, nullFillMissingColumns: false, allowTypeWideningPromotion: false,
+            CancellationToken.None))
+        {
+        }
     }
 
     private static async Task<ColumnBatch> ReadSingleAsync(byte[] bytes, StructType requested)

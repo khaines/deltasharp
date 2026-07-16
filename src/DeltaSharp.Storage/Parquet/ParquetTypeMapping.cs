@@ -131,6 +131,16 @@ internal static class ParquetTypeMapping
                 EnsureScalarReadable(map.ValueType, $"map column '{field.Name}' value");
                 break;
             case StructType structType:
+                if (structType.Count == 0)
+                {
+                    // A zero-field struct has no leaf to drive the row count, so it would reconstruct a
+                    // length-0 vector for a non-empty row group and trip a raw ArgumentException in the batch
+                    // ctor — fail closed on the DeltaStorageException contract instead (parity with the prior
+                    // CreateField reject of all nested types).
+                    throw DeltaStorageException.UnsupportedFeature(
+                        $"Parquet read for struct column '{field.Name}': a zero-field struct is not supported.");
+                }
+
                 foreach (StructField nested in structType)
                 {
                     EnsureScalarReadable(nested.DataType, $"struct column '{field.Name}' field '{nested.Name}'");
