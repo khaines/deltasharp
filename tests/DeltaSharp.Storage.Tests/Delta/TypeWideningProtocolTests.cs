@@ -246,6 +246,21 @@ public sealed class TypeWideningProtocolTests : IDisposable
     }
 
     [Fact]
+    public void UpgradeProtocol_MalformedAppendOnlyValue_FailsClosed()
+    {
+        // #549 (Architect/Balanced/Reliability): a legacy table carrying a non-boolean delta.appendOnly value
+        // fails CLOSED on upgrade (MalformedAction) rather than silently NOT enumerating the feature — the
+        // upgrade must not drop an ambiguous append-only guarantee. Mirrors AppendOnlyFeature.IsEnabled's
+        // golden (Scala String.toBoolean) throw, reached transitively through UpgradeProtocol.
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() =>
+            TypeWideningFeature.UpgradeProtocol(
+                new ProtocolAction(1, 2, [], []),
+                new Dictionary<string, string> { ["delta.appendOnly"] = "garbage" }));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+    }
+
+    [Fact]
     public void EnsureUpgradeable_TableFeaturesTable_WithAppendOnlyConfig_IsAllowed()
     {
         // A table already on writer 7 has all active features explicitly enumerated (and UpgradeProtocol
