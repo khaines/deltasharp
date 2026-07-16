@@ -1247,9 +1247,9 @@ public sealed class DeltaOptimizeTests : IDisposable
     [Fact]
     public void OptimizeColumnMappingUnsupportedException_IdMode_CarriesModeAndLabel_Issue553()
     {
-        // `id` mode is rejected at snapshot load (deferred to #523), so the guard's id branch is
-        // defense-in-depth reachable only via the internal explicit-snapshot seam. Unit-cover the exception's
-        // id path directly: it carries ColumnMappingMode.Id and labels the message 'id'.
+        // Since #523 an id-mode snapshot LOADS (id is readable); OPTIMIZE rejects it fail-closed at its own
+        // guard, reachable via the internal explicit-snapshot seam. Unit-cover the exception's id path
+        // directly: it carries ColumnMappingMode.Id and labels the message 'id'.
         var ex = new OptimizeColumnMappingUnsupportedException(ColumnMappingMode.Id);
         Assert.Equal(ColumnMappingMode.Id, ex.Mode);
         Assert.Contains("'id'", ex.Message, StringComparison.Ordinal);
@@ -1258,10 +1258,11 @@ public sealed class DeltaOptimizeTests : IDisposable
     [Fact]
     public async Task Optimize_OnIdModeSnapshot_ThroughInternalSeam_IsRejectedFailClosed_Issue553()
     {
-        // id mode is rejected at snapshot LOAD (EnsureModeGate, deferred to #523), so the public OPTIMIZE
-        // path never carries an id-mode snapshot. But the internal OptimizeAsync(Snapshot,…) seam accepts an
-        // explicit snapshot, so the guard's id branch must itself reject a hand-built (load-gate-bypassing)
-        // id-mode snapshot fail-closed — the exact defense a name-only guard (`== Name`) would silently drop.
+        // Since #523 an id-mode snapshot is READABLE and LOADS, so the public OPTIMIZE path CAN now carry an
+        // id-mode snapshot. OPTIMIZE (a data-rewriting maintenance op) cannot compact id-mode files, so its
+        // OWN guard must reject id fail-closed. The internal OptimizeAsync(Snapshot,…) seam accepts an explicit
+        // snapshot, so the guard's id branch is pinned directly here against a hand-built id-mode snapshot
+        // fail-closed — the exact defense a name-only guard (`== Name`) would silently drop.
         Snapshot idMode = BuildUngatedIdModeSnapshot();
 
         OptimizeColumnMappingUnsupportedException ex =

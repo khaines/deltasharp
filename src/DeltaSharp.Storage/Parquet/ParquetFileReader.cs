@@ -116,12 +116,31 @@ internal sealed class ParquetFileReader
     /// null-filled (per <paramref name="nullFillMissingColumns"/>)
     /// (<see cref="StorageErrorKind.ColumnNotPresentInFile"/>); or the file is malformed/truncated or a row
     /// group's declared size exceeds the decode ceiling (<see cref="StorageErrorKind.CorruptData"/>).</exception>
+    public IAsyncEnumerable<ColumnBatch> ReadAsync(
+        Stream input,
+        StructType requested,
+        RowGroupPredicate? keepRowGroup,
+        bool nullFillMissingColumns,
+        bool allowTypeWideningPromotion,
+        CancellationToken cancellationToken)
+        => ReadAsync(input, requested, keepRowGroup, nullFillMissingColumns, allowTypeWideningPromotion,
+            resolveByFieldId: false, cancellationToken);
+
+    /// <summary>
+    /// As <see cref="ReadAsync(Stream, StructType, RowGroupPredicate?, bool, bool, CancellationToken)"/>, but
+    /// when <paramref name="resolveByFieldId"/> is <see langword="true"/> each requested column is resolved to
+    /// a file column by its <c>delta.columnMapping.id</c> matched against the Parquet footer's
+    /// <c>SchemaElement.field_id</c> (Delta column-mapping <b>id</b> mode, #523), instead of by physical name.
+    /// The requested columns must carry the id metadata; the file's field_ids come from the Thrift footer via
+    /// <see cref="ParquetReader.Metadata"/> (the high-level <c>DataField.FieldId</c> is not populated on decode).
+    /// </summary>
     public async IAsyncEnumerable<ColumnBatch> ReadAsync(
         Stream input,
         StructType requested,
         RowGroupPredicate? keepRowGroup,
         bool nullFillMissingColumns,
         bool allowTypeWideningPromotion,
+        bool resolveByFieldId,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(input);
@@ -140,7 +159,9 @@ internal sealed class ParquetFileReader
             // Structural validation happens here (footer read at open) — schema/type mismatches fail
             // before any batch is yielded (H3). A null slot marks a requested column absent from the file
             // that will be null-filled (nullFillMissingColumns; #497).
-            DataField?[] fileFields = ResolveFileFields(reader.Schema, requested, nullFillMissingColumns, allowTypeWideningPromotion);
+            IReadOnlyDictionary<int, DataField>? byFieldId = resolveByFieldId ? BuildFieldIdMap(reader) : null;
+            DataField?[] fileFields = ResolveFileFields(
+                reader.Schema, requested, nullFillMissingColumns, allowTypeWideningPromotion, byFieldId);
             for (int group = 0; group < reader.RowGroupCount; group++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -153,6 +174,41 @@ internal sealed class ParquetFileReader
                 }
             }
         }
+    }
+
+    // Column-mapping id mode (#523): correlates the Parquet footer's field_ids with the file's leaf data
+    // fields. The footer SchemaElements (reader.Metadata.Schema) carry field_id but not the decoded values;
+    // reader.Schema.DataFields carry the values but always read FieldId == -1 (Parquet.Net's high-level decode
+    // never copies the footer field_id onto DataField). Correlating the two by physical name (a DeltaSharp
+    // file is flat) yields the field_id → DataField map an id-mode reader resolves against. A duplicate
+    // field_id in a foreign footer is rejected fail-closed rather than silently taking the last writer.
+    private static IReadOnlyDictionary<int, DataField> BuildFieldIdMap(ParquetReader reader)
+    {
+        var byName = new Dictionary<string, DataField>(StringComparer.Ordinal);
+        foreach (DataField dataField in reader.Schema.DataFields)
+        {
+            byName[dataField.Name] = dataField;
+        }
+
+        var byFieldId = new Dictionary<int, DataField>();
+        IReadOnlyList<global::Parquet.Meta.SchemaElement>? footer = reader.Metadata?.Schema;
+        if (footer is not null)
+        {
+            foreach (global::Parquet.Meta.SchemaElement element in footer)
+            {
+                if (element.FieldId is int fieldId && byName.TryGetValue(element.Name, out DataField? dataField))
+                {
+                    if (!byFieldId.TryAdd(fieldId, dataField!))
+                    {
+                        throw DeltaStorageException.SchemaMismatch(
+                            $"The Parquet file declares duplicate field_id {fieldId} — a column-mapping id-mode "
+                            + "table must assign each column a unique field_id.");
+                    }
+                }
+            }
+        }
+
+        return byFieldId;
     }
 
     /// <summary>
@@ -432,7 +488,8 @@ internal sealed class ParquetFileReader
     // (#513). A PRESENT column with a disagreeing physical type/nullability is still rejected by
     // ValidateFileField as a distinct SchemaMismatch (never silently coerced or null-filled).
     private static DataField?[] ResolveFileFields(
-        ParquetSchema fileSchema, StructType requested, bool nullFillMissingColumns, bool allowTypeWideningPromotion)
+        ParquetSchema fileSchema, StructType requested, bool nullFillMissingColumns, bool allowTypeWideningPromotion,
+        IReadOnlyDictionary<int, DataField>? byFieldId)
     {
         var byName = new Dictionary<string, DataField>(StringComparer.Ordinal);
         foreach (DataField field in fileSchema.DataFields)
@@ -445,7 +502,24 @@ internal sealed class ParquetFileReader
         {
             StructField requestedField = requested[c];
             string name = requestedField.Name;
-            if (!byName.TryGetValue(name, out DataField? field))
+
+            // id mode (#523): resolve by the requested column's delta.columnMapping.id against the file's
+            // footer field_ids (BuildFieldIdMap), not by physical name — so a logical rename that never
+            // rewrites the Parquet still reads through. Absence is keyed on the id, not the name.
+            DataField? field = null;
+            bool present;
+            if (byFieldId is not null)
+            {
+                present = ColumnMapping.TryGetId(requestedField, out long id)
+                    && id is >= 0 and <= int.MaxValue
+                    && byFieldId.TryGetValue((int)id, out field);
+            }
+            else
+            {
+                present = byName.TryGetValue(name, out field);
+            }
+
+            if (!present)
             {
                 if (nullFillMissingColumns && requestedField.Nullable)
                 {
@@ -458,7 +532,7 @@ internal sealed class ParquetFileReader
                 throw DeltaStorageException.ColumnNotPresentInFile(name);
             }
 
-            ValidateFileField(field, requestedField, allowTypeWideningPromotion);
+            ValidateFileField(field!, requestedField, allowTypeWideningPromotion);
             resolved[c] = field;
         }
 

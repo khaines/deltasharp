@@ -78,6 +78,42 @@ public sealed class DeltaCommitterTests : IDisposable
     }
 
     [Fact]
+    public async Task RejectsCommit_AuthoringIdModeMetadata_EvenWhenReadSnapshotIsNoneMode()
+    {
+        // Red-team (#573): the id-write gate must be TWO-SIDED. A commit whose metaData action AUTHORS an
+        // id-mode table (a none/name -> id transition) must be rejected fail-closed even though the READ
+        // snapshot is still none mode — otherwise the "universal choke point" is bypassable by a metadata
+        // transition. No production path authors id-mode metaData today; this fail-closes a hypothetical
+        // future one, before any commit JSON is published.
+        await SeedTableAsync();                 // v0 none-mode table
+        Snapshot snapshot = await LoadAsync();  // read snapshot: none mode (passes the read-snapshot check)
+        Assert.Equal(ColumnMappingMode.None, ColumnMapping.ResolveMode(snapshot.Metadata.Configuration));
+
+        ImmutableSortedDictionary<string, string> idModeConfig =
+            ImmutableSortedDictionary<string, string>.Empty.WithComparers(StringComparer.Ordinal)
+                .Add("delta.columnMapping.mode", "id")
+                .Add("delta.columnMapping.maxColumnId", "1");
+        var idMetadata = new MetadataAction(
+            Id: "t",
+            Name: null,
+            Description: null,
+            Format: new TableFormat("parquet", ImmutableSortedDictionary<string, string>.Empty),
+            SchemaString: "{\"type\":\"struct\",\"fields\":[]}",
+            PartitionColumns: ImmutableArray<string>.Empty,
+            Configuration: idModeConfig,
+            CreatedTime: null);
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => new DeltaCommitter(_backend).CommitAsync(
+                snapshot, new DeltaAction[] { idMetadata, Add("part-0.parquet") }, DeltaReadScope.WholeTable));
+        Assert.Contains("'id'", ex.Message, StringComparison.Ordinal);
+
+        // Fail-closed BEFORE publishing: the table is untouched at v0.
+        Snapshot after = await LoadAsync();
+        Assert.Equal(0L, after.Version);
+    }
+
+    [Fact]
     public async Task ConcurrentBlindAppends_ExactlyOneWinsEachVersion_WithoutDuplication()
     {
         // AC1 + AC3: two blind appends race for the same next version; one wins v1, the loser observes a

@@ -133,6 +133,7 @@ public sealed class DeltaReadSource : IDisposable
         string[] physicalNames;
         StructType dataSchema;
         int[] dataOrdinalByField;
+        bool resolveByFieldId;
         try
         {
             snapshot = await _log.LoadSnapshotAsync(version, cancellationToken).ConfigureAwait(false);
@@ -140,14 +141,18 @@ public sealed class DeltaReadSource : IDisposable
             // Column-mapping resolution (§2.12.3; STORY-05.4.3 AC1). In name mode a table's Parquet columns
             // are stored under their PHYSICAL names and add.partitionValues are keyed by physical name, so we
             // read by physical name and relabel the result to the LOGICAL schema for the caller. In none mode
-            // the physical name IS the logical name, so this is exactly the prior behavior. (id mode never
-            // reaches here — it is rejected fail-closed at snapshot load, deferred to #523.) FIX #6: these
-            // mapping/BuildDataSchema calls run INSIDE the try so a name-mode resolution fault
-            // (DeltaProtocolException from ColumnMapping, or a SchemaValidationException from a malformed
-            // physical data schema) surfaces as the documented DeltaReadException — never leaks un-normalized
-            // past the facade. The #497 DeltaReadSchemaEvolutionException stays distinct (thrown per-file below).
+            // the physical name IS the logical name, so this is exactly the prior behavior. In id mode (#523)
+            // columns are resolved by the Parquet field_id (delta.columnMapping.id), NOT by name — so we set
+            // resolveByFieldId and the ParquetFileReader matches each dataSchema field's id (preserved by
+            // BuildDataSchema) against the file's footer field_ids; the physical NAMES are irrelevant to id
+            // resolution, and the result is relabeled to the LOGICAL schema exactly as in name mode. FIX #6:
+            // these mapping/BuildDataSchema calls run INSIDE the try so a resolution fault (DeltaProtocolException
+            // from ColumnMapping, or a SchemaValidationException from a malformed physical data schema) surfaces
+            // as the documented DeltaReadException — never leaks un-normalized past the facade. The #497
+            // DeltaReadSchemaEvolutionException stays distinct (thrown per-file below).
             tableSchema = snapshot.Schema;
             ColumnMappingMode mappingMode = ColumnMapping.ResolveMode(snapshot.Metadata.Configuration);
+            resolveByFieldId = mappingMode == ColumnMappingMode.Id;
             ImmutableArray<string> partitionColumns = snapshot.Metadata.PartitionColumns;
             physicalNames = ColumnMappingProjection.ResolvePhysicalNames(tableSchema, mappingMode);
             dataSchema = ColumnMappingProjection.BuildDataSchema(tableSchema, physicalNames, partitionColumns);
@@ -175,7 +180,7 @@ public sealed class DeltaReadSource : IDisposable
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 await ReadFileAsync(
-                        add, tableSchema, physicalNames, dataSchema, dataOrdinalByField, batches, allowTypeWideningPromotion, cancellationToken)
+                        add, tableSchema, physicalNames, dataSchema, dataOrdinalByField, batches, allowTypeWideningPromotion, resolveByFieldId, cancellationToken)
                     .ConfigureAwait(false);
             }
         }
@@ -202,6 +207,7 @@ public sealed class DeltaReadSource : IDisposable
         int[] dataOrdinalByField,
         List<ColumnBatch> batches,
         bool allowTypeWideningPromotion,
+        bool resolveByFieldId,
         CancellationToken cancellationToken)
     {
         // Load the committed deletion vector (if any) BEFORE reading data, so a poisoned/malformed DV fails
@@ -277,7 +283,7 @@ public sealed class DeltaReadSource : IDisposable
             try
             {
                 await foreach (ColumnBatch dataBatch in _reader
-                    .ReadAsync(stream, dataSchema, keepRowGroup: null, nullFillMissingColumns: true, allowTypeWideningPromotion, cancellationToken)
+                    .ReadAsync(stream, dataSchema, keepRowGroup: null, nullFillMissingColumns: true, allowTypeWideningPromotion, resolveByFieldId, cancellationToken)
                     .ConfigureAwait(false))
                 {
                     ColumnBatch fullBatch = ColumnMappingProjection.BuildFullBatch(

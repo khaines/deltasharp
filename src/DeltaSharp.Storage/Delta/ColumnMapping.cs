@@ -25,8 +25,9 @@ internal enum ColumnMappingMode
     Name,
 
     /// <summary><c>id</c> mode: readers resolve columns by the Parquet <c>field_id</c> given by
-    /// <c>delta.columnMapping.id</c>. <b>Not implemented</b> in this build — deferred to #523 and gated
-    /// fail-closed by <see cref="ColumnMapping.EnsureReadWriteSupported"/>.</summary>
+    /// <c>delta.columnMapping.id</c>. This build <b>reads</b> id-mode tables (#523); <b>writing</b> an id-mode
+    /// table is gated fail-closed by <see cref="ColumnMapping.EnsureWriteSupported"/> (id-mode write deferred,
+    /// #572).</summary>
     Id,
 }
 
@@ -165,15 +166,19 @@ internal static class ColumnMapping
     }
 
     /// <summary>
-    /// The full column-mapping gate applied when a snapshot is loaded (design §2.12.3; STORY-05.4.3 AC4):
-    /// (1) a table declaring any column-mapping mode MUST have a <paramref name="protocol"/> that supports the
+    /// The column-mapping gate applied when a snapshot is loaded (design §2.12.3; STORY-05.4.3 AC4):
+    /// a table declaring any column-mapping mode MUST have a <paramref name="protocol"/> that supports the
     /// <c>columnMapping</c> feature — the Delta protocol says the <c>delta.columnMapping.mode</c> property is
     /// only honored when the protocol supports it, so a mode set without protocol support is rejected with a
-    /// protocol-upgrade error rather than silently ignored; (2) <c>id</c> mode is rejected fail-closed
-    /// (deferred to #523). <see cref="ColumnMappingMode.None"/> is a no-op.
+    /// protocol-upgrade error rather than silently ignored. <see cref="ColumnMappingMode.None"/> is a no-op.
+    ///
+    /// <para>All three modes (<c>none</c>/<c>name</c>/<c>id</c>) are <b>readable</b> — id-mode read resolves
+    /// columns by the Parquet <c>field_id</c> (#523), so this LOAD gate no longer rejects id. WRITING a
+    /// column-mapped table is a separate concern: <see cref="EnsureWriteSupported"/> — enforced centrally at
+    /// the <c>DeltaCommitter</c> commit choke point (plus per-write-path guards) — still rejects <c>id</c> mode
+    /// fail-closed (this build reads, but does not write, id-mode tables).</para>
     /// </summary>
-    /// <exception cref="DeltaProtocolException">A column-mapping mode is set without protocol support, or the
-    /// mode is <see cref="ColumnMappingMode.Id"/>.</exception>
+    /// <exception cref="DeltaProtocolException">A column-mapping mode is set without protocol support.</exception>
     public static void EnsureModeGate(ColumnMappingMode mode, ProtocolAction protocol)
     {
         ArgumentNullException.ThrowIfNull(protocol);
@@ -202,56 +207,60 @@ internal static class ColumnMapping
                     + $"safely."));
         }
 
-        EnsureReadWriteSupported(mode);
+        // Note: id mode is NOT rejected here — it is readable (#523). Write-time rejection of id mode is
+        // enforced by EnsureWriteSupported on the commit paths, which is the correct place for it: this build
+        // does not create/modify id-mode tables, but it reads them.
     }
 
     /// <summary>
-    /// The fail-closed gate for read/write of a column-mapped table: this build supports
-    /// <see cref="ColumnMappingMode.None"/> and <see cref="ColumnMappingMode.Name"/> only.
+    /// The fail-closed gate for <b>writing</b> a column-mapped table: this build writes
+    /// <see cref="ColumnMappingMode.None"/> and <see cref="ColumnMappingMode.Name"/> only. <c>id</c> mode is
+    /// <b>readable</b> (#523, resolved by Parquet <c>field_id</c>) but this build does not create or commit to
+    /// an id-mode table, so every commit path calls this to refuse an id-mode write fail-closed — never falling
+    /// back to a name/positional write that would mis-associate columns. (READS are gated at load by
+    /// <see cref="EnsureModeGate"/>, which permits all three modes.)
     /// </summary>
     /// <exception cref="DeltaProtocolException"><paramref name="mode"/> is
-    /// <see cref="ColumnMappingMode.Id"/> — rejected fail-closed.</exception>
-    public static void EnsureReadWriteSupported(ColumnMappingMode mode)
+    /// <see cref="ColumnMappingMode.Id"/> — writing is rejected fail-closed.</exception>
+    public static void EnsureWriteSupported(ColumnMappingMode mode)
     {
-        // TRACKED DEFERRAL (#523): 'id' mode resolves columns by the Parquet field_id
-        // (delta.columnMapping.id). The name-based Parquet reader (ParquetFileReader.ResolveFileFields)
-        // has no field-id resolution, so an id-mode table MUST be rejected here — never fall back to a
-        // positional or name-based read, which would silently mis-associate columns. id-mode support is
-        // #523 (OPEN); until then this is the single fail-closed choke point.
         if (mode == ColumnMappingMode.Id)
         {
             throw DeltaProtocolException.Unsupported(
-                "The table uses Delta column mapping mode 'id', which resolves columns by the Parquet "
-                + "field_id and is not implemented by this build (tracked in #523). Reading it could "
-                + "silently mis-associate columns, so the table is rejected fail-closed. Only column "
-                + "mapping mode 'name' (and 'none') is supported.");
+                "The table uses Delta column mapping mode 'id'. This build can READ id-mode tables (resolving "
+                + "columns by the Parquet field_id, #523) but does not WRITE them — creating or committing to "
+                + "an id-mode table is refused fail-closed rather than falling back to a name/positional write "
+                + "that could silently mis-associate columns. Only 'name' (and 'none') mode is writable.");
         }
     }
 
     /// <summary>
-    /// The <b>resolution-time uniqueness invariant</b> for a name-mode table, enforced at the single
-    /// snapshot-load choke point BEFORE any column is resolved (design §2.12.3; Delta protocol name-mode
-    /// reader). A name-mode schema resolves every data column, partition value, and statistic by its
-    /// <c>delta.columnMapping.physicalName</c>, so a duplicate physical name (a poisoned/malformed table)
-    /// would let one field's value be served under another field's logical name — a <b>silent misread</b>
-    /// with no exception. This gate rejects such a table fail-closed instead:
+    /// The <b>resolution-time uniqueness invariant</b> for a column-mapped (<c>name</c> or <c>id</c>) table,
+    /// enforced at the single snapshot-load choke point BEFORE any column is resolved (design §2.12.3; Delta
+    /// protocol column-mapping reader). A column-mapped schema resolves partition values and statistics — and,
+    /// in name mode, data columns — by <c>delta.columnMapping.physicalName</c>, and resolves id-mode data
+    /// columns by <c>delta.columnMapping.id</c>; so a duplicate physical name or a duplicate/missing id (a
+    /// poisoned/malformed or foreign table) would let one field's value be served under another field's logical
+    /// name, or two logical columns map to one file column — a <b>silent misread</b> with no exception. This
+    /// gate rejects such a table fail-closed instead (#523 extended it to id mode — a foreign id-mode table is
+    /// exactly the untrusted input this guards):
     /// <list type="number">
     /// <item>the set of <c>physicalName</c> across <b>all</b> top-level fields (data + partition) is globally
     /// unique;</item>
     /// <item>every field carries a <c>delta.columnMapping.id</c>, the ids are unique, and each id is
     /// ≤ the table's <c>delta.columnMapping.maxColumnId</c> (a monotonic writer invariant).</item>
     /// </list>
-    /// A non-name mode is a no-op. This is deliberately an explicit choke point (not an incidental
+    /// <c>none</c> mode is a no-op. This is deliberately an explicit choke point (not an incidental
     /// <see cref="StructType"/> ctor throw), so the guarantee holds regardless of how the schema is built.
     /// </summary>
     /// <exception cref="DeltaProtocolException">A duplicate physical name or id, a missing id, or an id above
     /// <c>maxColumnId</c> — the schema is inconsistent and cannot be resolved safely.</exception>
-    public static void ValidateNameModeSchema(
+    public static void ValidateColumnMappingSchema(
         ColumnMappingMode mode, StructType schema, IReadOnlyDictionary<string, string> configuration)
     {
         ArgumentNullException.ThrowIfNull(schema);
         ArgumentNullException.ThrowIfNull(configuration);
-        if (mode != ColumnMappingMode.Name)
+        if (mode == ColumnMappingMode.None)
         {
             return;
         }
@@ -269,7 +278,7 @@ internal static class ColumnMapping
                     string.Create(
                         CultureInfo.InvariantCulture,
                         $"Column mapping physical name '{physical}' is assigned to more than one column; "
-                        + $"under name mode every top-level field (data and partition) MUST have a unique "
+                        + $"under column mapping every top-level field (data and partition) MUST have a unique "
                         + $"'{PhysicalNameKey}'. The schema is inconsistent and cannot be read safely."));
             }
 
@@ -278,8 +287,7 @@ internal static class ColumnMapping
                 throw DeltaProtocolException.Inconsistent(
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Column '{field.Name}' has no '{IdKey}' but the table uses column mapping mode "
-                        + $"'name'; the schema is inconsistent and cannot be read safely."));
+                        $"Column '{field.Name}' has no '{IdKey}' but the table uses column mapping; the schema is inconsistent and cannot be read safely."));
             }
 
             if (!ids.Add(id))
@@ -287,8 +295,7 @@ internal static class ColumnMapping
                 throw DeltaProtocolException.Inconsistent(
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Column mapping id {id} is assigned to more than one column; under name mode every "
-                        + $"'{IdKey}' MUST be unique. The schema is inconsistent and cannot be read safely."));
+                        $"Column mapping id {id} is assigned to more than one column; under column mapping every '{IdKey}' MUST be unique. The schema is inconsistent and cannot be read safely."));
             }
 
             if (id > maxColumnId)
@@ -303,9 +310,9 @@ internal static class ColumnMapping
         }
     }
 
-    // Reads the tracked maxColumnId from a name-mode table's configuration. It is a monotonic writer
-    // invariant that MUST be present and parseable for a name-mode table; a missing/malformed value is an
-    // inconsistent table property rejected fail-closed (never guessed).
+    // Reads the tracked maxColumnId from a column-mapped (name or id) table's configuration. It is a
+    // monotonic writer invariant that MUST be present and parseable for any column-mapped table; a
+    // missing/malformed value is an inconsistent table property rejected fail-closed (never guessed).
     private static long ReadMaxColumnId(IReadOnlyDictionary<string, string> configuration)
     {
         if (!configuration.TryGetValue(MaxColumnIdKey, out string? raw)
@@ -314,7 +321,7 @@ internal static class ColumnMapping
             throw DeltaProtocolException.Inconsistent(
                 string.Create(
                     CultureInfo.InvariantCulture,
-                    $"The table uses column mapping mode 'name' but its '{MaxColumnIdKey}' is missing or "
+                    $"The table uses column mapping but its '{MaxColumnIdKey}' is missing or "
                     + $"not an integer; the schema is inconsistent and cannot be read safely."));
         }
 
@@ -322,17 +329,24 @@ internal static class ColumnMapping
     }
 
     /// <summary>The physical Parquet name of <paramref name="field"/> under <paramref name="mode"/>: the
-    /// declared <c>delta.columnMapping.physicalName</c> in name mode, else the field's own (logical) name.
-    /// A name-mode field missing a physical name is an inconsistent schema — fail closed.</summary>
-    /// <exception cref="DeltaProtocolException">A name-mode field carries no physical name.</exception>
+    /// declared <c>delta.columnMapping.physicalName</c> in <b>both</b> <c>name</c> and <c>id</c> mode, else
+    /// (<c>none</c> mode) the field's own (logical) name. A column-mapped field (name or id) missing a physical
+    /// name is an inconsistent schema — fail closed. (In id mode, DATA columns resolve by <c>field_id</c>, but
+    /// partition-value keys and statistics are still keyed by the physical name.)</summary>
+    /// <exception cref="DeltaProtocolException">A column-mapped field carries no physical name.</exception>
     public static string PhysicalName(StructField field, ColumnMappingMode mode)
     {
         ArgumentNullException.ThrowIfNull(field);
-        if (mode != ColumnMappingMode.Name)
+        if (mode == ColumnMappingMode.None)
         {
             return field.Name;
         }
 
+        // Both `name` AND `id` modes assign a physical name (Delta PROTOCOL.md "Column Mapping"). In name mode
+        // the reader resolves DATA columns by it; in BOTH modes partition-value keys and statistics are keyed
+        // by the physical name (a column-mapped table's add.partitionValues use physical names). id mode
+        // additionally resolves DATA columns by field_id, but its partition-value keys are STILL physical —
+        // returning the LOGICAL name here (#523's original bug) silently produced all-null partition columns.
         if (field.Metadata.TryGetString(PhysicalNameKey, out string? physical) && physical.Length > 0)
         {
             return physical;
@@ -341,8 +355,8 @@ internal static class ColumnMapping
         throw DeltaProtocolException.Inconsistent(
             string.Create(
                 CultureInfo.InvariantCulture,
-                $"Column '{field.Name}' has no '{PhysicalNameKey}' but the table uses column mapping mode "
-                + $"'name'; the schema is inconsistent and cannot be read safely."));
+                $"Column '{field.Name}' has no '{PhysicalNameKey}' but the table uses column mapping; the "
+                + $"schema is inconsistent and cannot be read safely."));
     }
 
     /// <summary>Reads a field's assigned column id, if present.</summary>

@@ -437,7 +437,8 @@ public sealed class DeltaWriteTarget : IDisposable
     // per-field delta.columnMapping.physicalName — reused verbatim, NEVER re-minted. For a fresh path (create
     // door) or a `none`-mode table this is logical==physical, so the caller's write schema / partition columns
     // pass through unchanged (byte-for-byte identical staging to prior behavior). `id` mode is fail-closed at
-    // snapshot load (#523). This is a STAGING concern only — the commit call still passes the LOGICAL write
+    // the id-write gate (EnsureWriteSupported / the centralized DeltaCommitter gate — #523), so a write never
+    // reaches this staging path. This is a STAGING concern only — the commit call still passes the LOGICAL write
     // schema to DeltaTableWriter, which re-derives the physical form for its own commit-time validation.
     private async Task<(StructType StagingSchema, IReadOnlyList<string> StagingPartitions)>
         ResolvePhysicalStagingAsync(
