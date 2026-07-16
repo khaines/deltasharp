@@ -445,6 +445,38 @@ public sealed class NestedParquetReadTests
     }
 
     [Fact]
+    public async Task StructRow_ForgedNumRows_FailsClosed_BeforeOverCeilingAllocation()
+    {
+        // A1 (HIGH DoS), struct variant: a struct's per-row structural width is 1 byte (the null mask only —
+        // no offsets), folded into the first field leaf's row-count bound. This pins the struct arm of
+        // NestedContainerStructuralWidth (list/map assert "5-byte column"; struct must assert "1-byte column"),
+        // which the list/map-only forge tests leave unexercised.
+        byte[] bytes = await WriteAsync(new List<StructRow>
+        {
+            new() { Id = 1, S = new Inner { A = 1, B = "x" } },
+            new() { Id = 2, S = new Inner { A = 2, B = "y" } },
+        });
+        byte[] forged = await ParquetTestHelpers.ForgeRowGroupNumRowsAsync(bytes, rowGroup: 0, forgedNumRows: 50_000_000);
+
+        StructType inner = DataTypes.CreateStructType(new[]
+        {
+            DataTypes.CreateStructField("A", DataTypes.IntegerType, nullable: false),
+            DataTypes.CreateStructField("B", DataTypes.StringType, nullable: true),
+        });
+        var requested = new StructType(new[] { new StructField("S", inner, nullable: true) });
+        var reader = new ParquetFileReader(new ParquetDecodeLimits(maxRowGroupDecodedBytes: 4L * 1024 * 1024));
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => EnumerateAsync(reader, forged, requested));
+
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+        // Pre-allocation ceiling rejection (EnsureDecodeCeiling); "1-byte column" proves it is the struct
+        // structural-width fold that fired, not a list/map path.
+        Assert.Contains("eager-decode ceiling", error.Message, StringComparison.Ordinal);
+        Assert.Contains("1-byte column", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Nested_UnderIdMode_FailsClosed_UnsupportedFeature()
     {
         // A2: a nested column under column-mapping id mode is not supported (BuildFieldIdMap is flat/leaf-only).
