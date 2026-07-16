@@ -109,6 +109,13 @@ public sealed class MapColumnVector : MutableColumnVector
                 + "value children must be parallel.", nameof(values));
         }
 
+        if (keys.NullCount != 0)
+        {
+            throw new ArgumentException(
+                $"Map keys must not be null (MapType keys are always non-null), but the key child has "
+                + $"{keys.NullCount} null(s).", nameof(keys));
+        }
+
         _offsets = NestedValidity.CopyValidatedOffsets(offsets, keys.Length, nameof(offsets));
         int length = _offsets.Length - 1;
         (_validity, _nullCount) = NestedValidity.Build(nulls, length);
@@ -163,15 +170,15 @@ public sealed class MapColumnVector : MutableColumnVector
 
     /// <summary>
     /// The number of entries in logical row <paramref name="index"/> (<c>offsets[i + 1] -
-    /// offsets[i]</c>). A null map typically reports <c>0</c>; use <see cref="IsNull"/> to tell a null
-    /// map from an empty one.
+    /// offsets[i]</c>). A null map reports <c>0</c> (a null map has no entries); use
+    /// <see cref="IsNull"/> to tell a null map from an empty one.
     /// </summary>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="index"/> is outside <c>[0, Length)</c>.</exception>
     public int EntryLength(int index)
     {
         CheckIndex(index);
         int physical = _offset + index;
-        return _offsets[physical + 1] - _offsets[physical];
+        return Bitmap.Get(_validity, physical) ? _offsets[physical + 1] - _offsets[physical] : 0;
     }
 
     /// <summary>
@@ -315,7 +322,10 @@ public sealed class MapColumnVector : MutableColumnVector
         CheckIndex(index);
         int physical = _offset + index;
         int start = _offsets[physical];
-        return child.Slice(start, _offsets[physical + 1] - start);
+        // A null map row yields an empty view regardless of its physical offset span (masked entries are
+        // never surfaced); IsNull distinguishes a null map from an empty one.
+        int length = Bitmap.Get(_validity, physical) ? _offsets[physical + 1] - start : 0;
+        return child.Slice(start, length);
     }
 
     private void CommitRow(bool isNull)
@@ -326,6 +336,12 @@ public sealed class MapColumnVector : MutableColumnVector
             throw new InvalidOperationException(
                 $"Key child has {_keys.Length} entry(ies) but value child has {_values.Length}; append one value "
                 + "per key before committing a map row.");
+        }
+
+        if (_keys.NullCount != 0)
+        {
+            throw new InvalidOperationException(
+                "Map keys must not be null (MapType keys are always non-null); a null key was appended.");
         }
 
         EnsureRowCapacity(_length + 1);

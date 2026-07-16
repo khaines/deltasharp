@@ -251,4 +251,38 @@ public class MapColumnVectorTests
         var empty = new MapColumnVector(StringToInt, capacity: 1);
         Assert.Throws<ArgumentOutOfRangeException>(() => empty.Slice(int.MaxValue, 1));
     }
+
+    [Fact]
+    public void FromChildren_RejectsNullKey()
+    {
+        // MapType keys are always non-null; a null in the key child must fail-closed at the wrap ctor.
+        MutableColumnVector nullableKeys = ColumnVectors.Create(StringType.Instance, 1);
+        nullableKeys.AppendNull();
+        ArgumentException ex = Assert.Throws<ArgumentException>(() =>
+            new MapColumnVector(StringToInt, nullableKeys, Ints(1), new[] { 0, 1 }));
+        Assert.Contains("keys must not be null", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void EndMap_RejectsNullKey()
+    {
+        var map = new MapColumnVector(StringToInt, capacity: 2);
+        var keys = (MutableColumnVector)map.Keys;
+        var values = (MutableColumnVector)map.Values;
+        keys.AppendNull();
+        values.AppendValue(1);
+        Assert.Throws<InvalidOperationException>(() => map.EndMap());
+    }
+
+    [Fact]
+    public void NullMapRow_WithMaskedEntries_ReadsEmpty()
+    {
+        // A wrap-ctor null map row whose offsets physically span entries must surface as EMPTY (masked
+        // entries never leak); IsNull distinguishes it from an empty map.
+        var map = new MapColumnVector(StringToInt, Keys("a", "b"), Ints(1, 2), new[] { 0, 2 }, new[] { true });
+        Assert.True(map.IsNull(0));
+        Assert.Equal(0, map.EntryLength(0));
+        Assert.Equal(0, map.KeysAt(0).Length);
+        Assert.Equal(0, map.ValuesAt(0).Length);
+    }
 }

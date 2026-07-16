@@ -147,15 +147,15 @@ public sealed class ListColumnVector : MutableColumnVector
 
     /// <summary>
     /// The number of elements in logical row <paramref name="index"/> (<c>offsets[i + 1] -
-    /// offsets[i]</c>). A null list typically reports <c>0</c>; use <see cref="IsNull"/> to tell a
-    /// null list from an empty one.
+    /// offsets[i]</c>). A null list reports <c>0</c> (a null list has no elements); use
+    /// <see cref="IsNull"/> to tell a null list from an empty one.
     /// </summary>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="index"/> is outside <c>[0, Length)</c>.</exception>
     public int ElementLength(int index)
     {
         CheckIndex(index);
         int physical = _offset + index;
-        return _offsets[physical + 1] - _offsets[physical];
+        return Bitmap.Get(_validity, physical) ? _offsets[physical + 1] - _offsets[physical] : 0;
     }
 
     /// <summary>
@@ -170,7 +170,10 @@ public sealed class ListColumnVector : MutableColumnVector
         CheckIndex(index);
         int physical = _offset + index;
         int start = _offsets[physical];
-        return _child.Slice(start, _offsets[physical + 1] - start);
+        // A null list row yields an empty view regardless of its physical offset span (masked elements are
+        // never surfaced); IsNull distinguishes a null list from an empty one.
+        int length = Bitmap.Get(_validity, physical) ? _offsets[physical + 1] - start : 0;
+        return _child.Slice(start, length);
     }
 
     /// <inheritdoc/>

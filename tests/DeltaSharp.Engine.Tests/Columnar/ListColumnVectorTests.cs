@@ -230,4 +230,16 @@ public class ListColumnVectorTests
         Assert.Equal(10, e.GetValue<int>(0));
         Assert.Equal(20, e.GetValue<int>(1));
     }
+
+    [Fact]
+    public void NullListRow_WithMaskedElements_ReadsEmpty()
+    {
+        // Red-team #574: a wrap-ctor null list row whose offsets physically span elements must surface as
+        // EMPTY (masked elements never leak) — ElementsAt/ElementLength are authoritative on IsNull, matching
+        // the documented contract. IsNull distinguishes a null list from an empty one.
+        var list = new ListColumnVector(IntList, Ints(10, 20), new[] { 0, 2 }, new[] { true });
+        Assert.True(list.IsNull(0));
+        Assert.Equal(0, list.ElementLength(0));
+        Assert.Equal(0, list.ElementsAt(0).Length);
+    }
 }
