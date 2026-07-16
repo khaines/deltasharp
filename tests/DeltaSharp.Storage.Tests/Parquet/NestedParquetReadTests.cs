@@ -432,18 +432,46 @@ public sealed class NestedParquetReadTests
     }
 
     [Fact]
+    public void ValidateParallelDefinition_RejectsContainerStateDisagreement_CorruptData()
+    {
+        // R7 (Critical, red-team): the container-state sub-case of the map def contract. When BOTH key and
+        // value def sit BELOW mapMaxDef the slot is a non-entry placeholder — but the SPECIFIC state must still
+        // agree: null-map (def 0) vs empty-map (def 1). Entry-presence parity passes (both "not present"), yet
+        // the file is self-contradictory (key says empty, value says null). A decoder of untrusted input must
+        // fail closed here rather than silently resolve it to the key's authoritative view. mapMaxDef = 2.
+        DeltaStorageException emptyVsNull = Assert.Throws<DeltaStorageException>(() =>
+            NestedParquetColumnReader.ValidateParallelDefinition(
+                keyDef: new[] { 1 }, valueDef: new[] { 0 }, mapMaxDef: 2, "col")); // key empty, value null
+        Assert.Equal(StorageErrorKind.CorruptData, emptyVsNull.Kind);
+        Assert.Contains("disagree on container state", emptyVsNull.Message, StringComparison.Ordinal);
+
+        DeltaStorageException nullVsEmpty = Assert.Throws<DeltaStorageException>(() =>
+            NestedParquetColumnReader.ValidateParallelDefinition(
+                keyDef: new[] { 0 }, valueDef: new[] { 1 }, mapMaxDef: 2, "col")); // key null, value empty
+        Assert.Equal(StorageErrorKind.CorruptData, nullVsEmpty.Kind);
+        Assert.Contains("disagree on container state", nullVsEmpty.Message, StringComparison.Ordinal);
+
+        // Mixed: a valid present entry followed by a contradictory non-entry slot still fails closed.
+        DeltaStorageException mixed = Assert.Throws<DeltaStorageException>(() =>
+            NestedParquetColumnReader.ValidateParallelDefinition(
+                keyDef: new[] { 2, 1 }, valueDef: new[] { 2, 0 }, mapMaxDef: 2, "col"));
+        Assert.Equal(StorageErrorKind.CorruptData, mixed.Kind);
+        Assert.Contains("container state", mixed.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void ValidateParallelDefinition_AcceptsWellFormedStreams_NoOverRejection()
     {
-        // R6 no-over-rejection: every VALID key/value definition combination still passes. A present value may
-        // carry a HIGHER def than the required key (a nullable value: def 3 present vs def 2 null, both >=
-        // mapMaxDef 2), and empty-map (def 1) / null-map (def 0) placeholders agree on both leaves.
+        // R6/R7 no-over-rejection: every VALID key/value definition combination still passes. A present value
+        // may carry a HIGHER def than the required key (a nullable value: def 3 present vs def 2 null, both >=
+        // mapMaxDef 2), and empty-map (def 1) / null-map (def 0) placeholders agree EXACTLY on both leaves.
         // Two present entries, the second value present-but-null (valueDef 2, still an entry).
         NestedParquetColumnReader.ValidateParallelDefinition(
             keyDef: new[] { 2, 2 }, valueDef: new[] { 3, 2 }, mapMaxDef: 2, "col");
-        // Empty map (both placeholders at def 1) and null map (both at def 0).
+        // Empty map (both placeholders at def 1) and null map (both at def 0) — container states match exactly.
         NestedParquetColumnReader.ValidateParallelDefinition(new[] { 1 }, new[] { 1 }, mapMaxDef: 2, "col");
         NestedParquetColumnReader.ValidateParallelDefinition(new[] { 0 }, new[] { 0 }, mapMaxDef: 2, "col");
-        // Mixed rows — present entry, empty map, null map — all agreeing slot-by-slot.
+        // Mixed rows — present entry, empty map, null map — all agreeing slot-by-slot on presence AND state.
         NestedParquetColumnReader.ValidateParallelDefinition(
             keyDef: new[] { 2, 1, 0 }, valueDef: new[] { 3, 1, 0 }, mapMaxDef: 2, "col");
         // Null level arrays are vacuously parallel (defensive; real map leaves always carry def streams).

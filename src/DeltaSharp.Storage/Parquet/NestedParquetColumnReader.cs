@@ -53,12 +53,14 @@ namespace DeltaSharp.Storage.Parquet;
 ///   is null (cross-field definition parity — a field claiming "present" under a null-struct row is
 ///   rejected).</description></item>
 ///   <item><description><b>Map.</b> The key is required/non-null; the key and value leaves share an IDENTICAL
-///   repetition stream (<see cref="ValidateParallelRepetition"/>) AND agree slot-by-slot on entry presence
-///   (<see cref="ValidateParallelDefinition"/> — the value's def-entry level matches the key's), so the value
-///   child pairs positionally with the key-driven entries; the shared entry structure obeys the list
-///   state-transition rules (the key stream drives <see cref="BuildRepeatedStructure"/>); the key and value
-///   child lengths match; the reassembled entry count equals the key child length; and the entry-slot count
-///   is at least the row count.</description></item>
+///   repetition stream (<see cref="ValidateParallelRepetition"/>) AND their definition streams agree,
+///   slot-by-slot, on BOTH co-indexed dimensions (<see cref="ValidateParallelDefinition"/>): entry presence
+///   (both at/above the map's own level, or both below) so the value child pairs positionally with the
+///   key-driven entries, AND — for a non-entry slot — the specific container state (null map vs empty map)
+///   so a self-contradictory placeholder fails closed rather than resolving to the key's view; the shared
+///   entry structure obeys the list state-transition rules (the key stream drives
+///   <see cref="BuildRepeatedStructure"/>); the key and value child lengths match; the reassembled entry
+///   count equals the key child length; and the entry-slot count is at least the row count.</description></item>
 /// </list>
 /// With this set the three shapes are fully validated against structurally-invalid def/rep streams: the
 /// value/element/entry reconstruction is a pure positional consequence of levels that are all range-checked,
@@ -743,16 +745,25 @@ internal static class NestedParquetColumnReader
 
     // Validates that a map's key and value leaves AGREE, slot-by-slot, on whether each key_value slot is a
     // PRESENT entry — the DEFINITION-level analog of ValidateParallelRepetition (R6). A well-formed 3-level map
-    // emits, for every slot, a key and value definition level that both sit at/above the map's own level (a
-    // present entry) or both below it (an empty-map / null-map placeholder). The reader front-fills the value
-    // child from the slots where valueDef >= mapMaxDef and pairs it positionally against the KEY-driven entry
-    // structure, so a crafted stream where key and value disagree on entry presence (e.g. keyDef=[2,1] /
-    // valueDef=[1,2]) — which passes rep-parity and level-range — would silently mis-pair values across the
-    // map. Compare ENTRY-PRESENCE (>= mapMaxDef), NOT raw equality: a present value legitimately has a HIGHER
-    // def than the required key (a nullable value distinguishes null vs non-null above the map's own level).
-    // Fail closed on any length or presence disagreement, BEFORE reconstruction. Internal so the guard can be
-    // pinned by a direct unit test (the released Parquet.Net write door derives definition levels from value
-    // nullability, so a key/value entry-presence divergence is not authorable end-to-end).
+    // Validates that a map's key and value leaves AGREE, slot-by-slot, on their DEFINITION-level state — the
+    // definition-level analog of ValidateParallelRepetition (R6/R7). A well-formed 3-level map emits, for every
+    // slot, key and value definition levels that agree on the slot's meaning. There are two co-indexed
+    // dimensions:
+    //   1. Entry-presence (R6): both leaves must sit at/above the map's own level (a present entry) or both
+    //      below it (a non-entry placeholder). Compare presence (>= mapMaxDef), NOT raw equality, because a
+    //      present-but-null value legitimately carries a HIGHER def than the required key (distinguishing null
+    //      vs non-null above the map's own level). The reader front-fills the value child from the slots where
+    //      valueDef >= mapMaxDef and pairs it positionally against the KEY-driven entry structure, so a stream
+    //      where the leaves disagree on presence (e.g. keyDef=[2,1] / valueDef=[1,2]) would mis-pair values.
+    //   2. Container-state (R7): when BOTH sit below mapMaxDef the slot is a non-entry placeholder whose
+    //      SPECIFIC state must still agree — null-map (def 0) vs empty-map (def 1). A crafted stream where the
+    //      key says empty and the value says null (keyDef=[1] / valueDef=[0]) is self-contradictory; fail
+    //      closed rather than silently resolve it to the key's (authoritative) view.
+    // Together with ValidateParallelRepetition (identical rep streams) these fully constrain the two co-indexed
+    // map leaves: both the entry set AND the non-entry container state must agree at every slot. Fail closed on
+    // any length, presence, or container-state disagreement, BEFORE reconstruction. Internal so the guard can
+    // be pinned by a direct unit test (the released Parquet.Net write door derives definition levels from value
+    // nullability, so a key/value definition divergence is not authorable end-to-end).
     internal static void ValidateParallelDefinition(int[]? keyDef, int[]? valueDef, int mapMaxDef, string columnName)
     {
         int keyLen = keyDef?.Length ?? 0;
@@ -773,12 +784,26 @@ internal static class NestedParquetColumnReader
 
         for (int i = 0; i < keyLen; i++)
         {
-            if ((keyDef[i] >= mapMaxDef) != (valueDef[i] >= mapMaxDef))
+            bool keyEntry = keyDef[i] >= mapMaxDef;
+            bool valueEntry = valueDef[i] >= mapMaxDef;
+            if (keyEntry != valueEntry)
             {
                 throw DeltaStorageException.CorruptData(
                     $"Map column '{columnName}' key and value definition levels disagree on entry presence at "
                     + $"slot {i} (key {keyDef[i]}, value {valueDef[i]}, map level {mapMaxDef}); the value stream "
                     + "would mis-pair entries across the map.");
+            }
+
+            // R7 container-state parity: when BOTH sit below the map's own level the slot is a non-entry
+            // placeholder, but the SPECIFIC state must still agree — null-map (def 0) vs empty-map (def 1). A
+            // crafted stream where the key says empty and the value says null (or vice-versa) is
+            // self-contradictory; fail closed rather than silently resolve it to the key's authoritative view.
+            if (!keyEntry && keyDef[i] != valueDef[i])
+            {
+                throw DeltaStorageException.CorruptData(
+                    $"Map column '{columnName}' key and value definition levels disagree on container state at "
+                    + $"slot {i} (key {keyDef[i]}, value {valueDef[i]}, map level {mapMaxDef}); a non-entry row "
+                    + "(null map vs empty map) must be identical on both leaves.");
             }
         }
     }
