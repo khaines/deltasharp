@@ -223,13 +223,11 @@ internal sealed class DeltaDelete
         // AC3 protocol gate: fail closed unless the table declares AND enables deletion vectors.
         DeletionVectorsFeature.EnsureWriteEnabled(readSnapshot);
 
-        // Column-mapping resolution for the WRITE path (#529). `id` mode STAYS fail-closed (#523): the
-        // name-based Parquet reader cannot resolve field ids, so a DELETE could mis-associate columns and
-        // delete wrong rows. The PRIMARY, tested choke point is snapshot load — DeltaLog rejects an id-mode
-        // table via ColumnMapping.EnsureModeGate before any snapshot reaches here, so `readSnapshot` is
-        // already name/none. The EnsureReadWriteSupported call below is intentional DEFENSE-IN-DEPTH (a
-        // future caller that constructs/passes a snapshot NOT loaded through that gate — e.g. the internal
-        // test seam — must still fail closed); it is pinned independently by
+        // Column-mapping resolution for the WRITE path (#529). `id` mode STAYS fail-closed for DELETE (#523):
+        // the name-based Parquet reader cannot resolve field ids, so a DELETE could mis-associate columns and
+        // delete wrong rows. Since #523, id mode is READABLE at snapshot load (DeltaReadSource resolves by
+        // field_id), so `readSnapshot` may now be id-mode — the EnsureWriteSupported call below is the
+        // PRIMARY, tested id-write choke point for DELETE (it refuses id fail-closed), pinned by
         // Delta_IdMode_FailsClosed_AtDeleteLocalGuard. `name` mode is resolved by relabeling
         // physical<->logical EXACTLY as the READ path does — through the shared ColumnMappingProjection seam,
         // so DELETE and DeltaReadSource resolve identically — while the emitted deletion vector stays
@@ -238,7 +236,7 @@ internal sealed class DeltaDelete
         // nested (struct/array/map) top-level column under name mapping is rejected fail-closed in
         // ColumnMappingProjection.ResolvePhysicalNames rather than risk a wrong delete.
         ColumnMappingMode mappingMode = ColumnMapping.ResolveMode(readSnapshot.Metadata.Configuration);
-        ColumnMapping.EnsureReadWriteSupported(mappingMode);
+        ColumnMapping.EnsureWriteSupported(mappingMode);
 
         StructType tableSchema = readSnapshot.Schema;
         ImmutableArray<string> partitionColumns = readSnapshot.Metadata.PartitionColumns;

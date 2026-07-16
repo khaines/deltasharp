@@ -280,20 +280,145 @@ public sealed class ColumnMappingTests : IDisposable
     // ---------------------------------------------------------------- AC4: fail-closed (EE-09)
 
     [Fact]
-    public async Task IdMode_IsRejectedFailClosed_DeferredTo523()
+    public async Task IdMode_EmptyTable_LoadsSuccessfully_Since523()
     {
-        // A table-features table declaring columnMapping (protocol supports it) but mode = id.
+        // Since #523 an id-mode table is READABLE (columns resolved by Parquet field_id), so an id-mode
+        // table now LOADS instead of failing closed at snapshot load (contrast: writing one still fails
+        // closed — see EnsureWriteSupported_IdMode_ThrowsFailClosed and the DELETE/OPTIMIZE id-mode tests).
         await WriteRawTableAsync(
             protocol: ProtocolFeatureLine(),
             metadata: MetadataLine(("delta.columnMapping.mode", "id"), ("delta.columnMapping.maxColumnId", "2")));
 
         using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
-        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
-            () => source.LoadSnapshotAsync(null, null));
-        Assert.Contains("'id'", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("not implemented", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("523", ex.Message, StringComparison.Ordinal);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null); // no throw
+        Assert.Equal(0L, info.Version);
     }
+
+    [Fact]
+    public async Task IdMode_ReadsByFieldId_IgnoringPhysicalNameAndPosition()
+    {
+        // #523 — the direct closer for id mode: each LOGICAL column resolves to a Parquet column by its
+        // delta.columnMapping.id matched against the file's field_id — NEVER by physical name and NEVER by
+        // position. The authored physical Parquet (a) stores its columns in REVERSED order and (b) names them
+        // "x0"/"x1" — names that do NOT match the metaData physicalNames — but each is stamped with the
+        // correct field_id. A positional read would swap id<->score; a name-based read would not find the
+        // physicalNames at all. Only field_id resolution returns the right values.
+        const string relativePath = "idmode-data.parquet";
+
+        // Physical file, reversed: [x0 (field_id=2 = logical "score", 100/200), x1 (field_id=1 = logical
+        // "id", 10/20)].
+        var physicalSchema = new StructType(new[]
+        {
+            PhysFieldWithId("x0", DataTypes.LongType, nullable: true, id: 2),
+            PhysFieldWithId("x1", DataTypes.LongType, nullable: false, id: 1),
+        });
+        MutableColumnVector x0 = ColumnVectors.Create(DataTypes.LongType, 2);
+        MutableColumnVector x1 = ColumnVectors.Create(DataTypes.LongType, 2);
+        x0.AppendValue(100L);
+        x1.AppendValue(10L);
+        x0.AppendValue(200L);
+        x1.AppendValue(20L);
+        var physicalBatch = new ManagedColumnBatch(physicalSchema, new ColumnVector[] { x0, x1 }, 2);
+
+        byte[] parquetBytes;
+        using (var buffer = new MemoryStream())
+        {
+            await new ParquetFileWriter().WriteAsync(
+                buffer, physicalSchema, new[] { physicalBatch }, CancellationToken.None);
+            parquetBytes = buffer.ToArray();
+        }
+
+        // Guard the premise: the on-disk file really has field_ids in the reversed order [2, 1].
+        Assert.Equal(new[] { "x0", "x1" }, await ParquetColumnNamesAsync(parquetBytes));
+
+        // id-mode metaData: logical id(id=1)/score(id=2); physicalNames are col-uuids that DO NOT match the
+        // Parquet column names, so a name-based read could not resolve them — only field_id works.
+        string schemaJson =
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
+            + $"{{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"{PhysId}\"}}}},"
+            + "{\"name\":\"score\",\"type\":\"long\",\"nullable\":true,\"metadata\":"
+            + $"{{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"{PhysScore}\"}}}}]}}";
+
+        using (var backend = new LocalFileSystemBackend(_root))
+        {
+            await backend.PutIfAbsentAsync(relativePath, parquetBytes, CancellationToken.None);
+            string addLine =
+                $"{{\"add\":{{\"path\":\"{relativePath}\",\"partitionValues\":{{}},"
+                + $"\"size\":{parquetBytes.Length},\"modificationTime\":0,\"dataChange\":true}}}}";
+            byte[] commit = Encoding.UTF8.GetBytes(
+                ProtocolFeatureLine() + "\n"
+                + NameModeMetadataLine(
+                    schemaJson,
+                    partitionColumns: Array.Empty<string>(),
+                    ("delta.columnMapping.mode", "id"),
+                    ("delta.columnMapping.maxColumnId", "2")) + "\n"
+                + addLine + "\n");
+            await backend.PutIfAbsentAsync(
+                "_delta_log/00000000000000000000.json", commit, CancellationToken.None);
+        }
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        Assert.Equal(new[] { "id", "score" }, info.Schema.Select(f => f.Name).ToArray());
+
+        int idIdx = info.Schema.IndexOf("id");
+        int scoreIdx = info.Schema.IndexOf("score");
+        var rows = new List<(long Id, long Score)>();
+        foreach (ColumnBatch batch in await source.ReadBatchesAsync(info.Version))
+        {
+            ColumnVector idCol = batch.SelectedColumn(idIdx);
+            ColumnVector scoreCol = batch.SelectedColumn(scoreIdx);
+            for (int r = 0; r < batch.LogicalRowCount; r++)
+            {
+                rows.Add((idCol.GetValue<long>(r), scoreCol.GetValue<long>(r)));
+            }
+        }
+
+        // logical "id" ← field_id=1 (10/20); logical "score" ← field_id=2 (100/200). A positional/name misread
+        // would swap these or fail to resolve.
+        Assert.Equal(new[] { (10L, 100L), (20L, 200L) }, rows.OrderBy(r => r.Id).ToArray());
+    }
+
+    [Fact]
+    public void EnsureWriteSupported_IdMode_ThrowsFailClosed()
+    {
+        // Reads are enabled (#523) but WRITES to an id-mode table are refused fail-closed at every commit path
+        // (append/overwrite: DeltaTableWriter; delete: DeltaDelete; OPTIMIZE rejects all mapping). This pins
+        // the shared write gate directly; the integration coverage is the DELETE/OPTIMIZE id-mode tests.
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
+            () => ColumnMapping.EnsureWriteSupported(ColumnMappingMode.Id));
+        Assert.Contains("'id'", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("does not WRITE", ex.Message, StringComparison.Ordinal);
+
+        // None/Name remain writable (no throw).
+        ColumnMapping.EnsureWriteSupported(ColumnMappingMode.None);
+        ColumnMapping.EnsureWriteSupported(ColumnMappingMode.Name);
+    }
+
+    [Fact]
+    public void CreateField_StampsParquetFieldId_FromColumnMappingId()
+    {
+        // Writer half of #523: a StructField carrying delta.columnMapping.id yields a Parquet DataField whose
+        // FieldId is stamped (persisted to the Thrift footer). A field WITHOUT the id metadata is left at the
+        // Parquet default (-1) — so name/none-mode writes (whose physical schema drops the id) stay
+        // byte-unchanged.
+        global::Parquet.Schema.DataField stamped =
+            ParquetTypeMapping.CreateField(PhysFieldWithId("x", DataTypes.LongType, nullable: false, id: 7));
+        Assert.Equal(7, stamped.FieldId);
+
+        global::Parquet.Schema.DataField plain =
+            ParquetTypeMapping.CreateField(new StructField("x", DataTypes.LongType, nullable: false));
+        Assert.Equal(-1, plain.FieldId);
+    }
+
+    // A physical StructField carrying a delta.columnMapping.id (as a long MetadataValue) — the shape the
+    // id-mode writer stamps into the Parquet field_id.
+    private static StructField PhysFieldWithId(string name, DataType type, bool nullable, long id) =>
+        new(name, type, nullable, FieldMetadata.FromValues(new[]
+        {
+            new KeyValuePair<string, MetadataValue>(ColumnMapping.IdKey, MetadataValue.Long(id)),
+        }));
 
     [Fact]
     public async Task LegacyReaderV2_ColumnMappingTable_IsRejectedFailClosed()

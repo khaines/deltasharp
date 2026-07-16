@@ -235,9 +235,9 @@ internal sealed class DeltaTableWriter
         // #525/#541: an append to a column-mapped table stages Parquet under the table's PHYSICAL column
         // names (name mode). A same-logical-schema write reuses the existing mapping (#525); an additive
         // column / applied widening MINTS a fresh physicalName+id and bumps maxColumnId (#541). `none` is
-        // logical==physical; `id` stays fail-closed (#523, rejected at snapshot load).
+        // logical==physical; `id` write stays fail-closed (#523) via EnsureWriteSupported below.
         ColumnMappingMode mode = ColumnMapping.ResolveMode(readSnapshot.Metadata.Configuration);
-        ColumnMapping.EnsureReadWriteSupported(mode);
+        ColumnMapping.EnsureWriteSupported(mode);
         (StructType physicalWriteSchema, ImmutableArray<string> physicalPartitionColumns,
             MetadataAction? schemaEvolution) = ResolveWrite(readSnapshot, writeSchema, evolutionMode, mode);
         return new DeltaWritePlan(physicalWriteSchema, physicalPartitionColumns, schemaEvolution);
@@ -332,7 +332,7 @@ internal sealed class DeltaTableWriter
         // logical==physical; `id` stays fail-closed (#523). Physical partition columns key both the staged
         // files' partitionValues and the dynamic-overwrite removal selection.
         ColumnMappingMode mode = ColumnMapping.ResolveMode(readSnapshot.Metadata.Configuration);
-        ColumnMapping.EnsureReadWriteSupported(mode);
+        ColumnMapping.EnsureWriteSupported(mode);
         (StructType physicalWriteSchema, ImmutableArray<string> physicalPartitionColumns,
             MetadataAction? schemaEvolution) = ResolveWrite(readSnapshot, writeSchema, evolutionMode, mode);
 
@@ -450,8 +450,8 @@ internal sealed class DeltaTableWriter
         // #542: overwriteSchema (wholesale schema replacement, #496) is now supported for a NAME-mode
         // column-mapped table — OverwriteReplaceSchemaAsync reconciles the columnMapping config with the
         // replaced schema (surviving columns keep their id+physicalName, new columns mint fresh identity,
-        // maxColumnId bumps monotonically). `id` mode is fail-closed at snapshot load (#523, EnsureModeGate in
-        // DeltaLog), so it never reaches here; `none` is unaffected (logical==physical).
+        // maxColumnId bumps monotonically). `id` mode is rejected fail-closed by EnsureWriteSupported (#523) at the append/overwrite
+        // entry, so it never reaches here; `none` is unaffected (logical==physical).
         if (overwriteSchema)
         {
             return await OverwriteReplaceSchemaAsync(
@@ -762,7 +762,7 @@ internal sealed class DeltaTableWriter
     //   * `name`, evolution (#541): MINT a fresh physicalName+id for each new column (an applied widening
     //     keeps its identity), bump maxColumnId, stage the write columns (existing + new) under the EVOLVED
     //     mapping, and re-emit the mapped metaData (mapped schema + bumped maxColumnId config).
-    // `id` mode is already rejected fail-closed at snapshot load (#523) and never reaches here.
+    // `id` mode is rejected fail-closed by EnsureWriteSupported (#523) at the commit-path entry and never reaches here.
     private (StructType PhysicalWriteSchema, ImmutableArray<string> PhysicalPartitionColumns,
         MetadataAction? SchemaEvolution)
         ResolveWrite(
@@ -935,8 +935,7 @@ internal sealed class DeltaTableWriter
     // column (matched by logical name) keeps its id+physicalName, a new column mints a fresh physicalName+id,
     // maxColumnId bumps monotonically (a dropped column's id is retired, never reused), and the staged files
     // are gated against the NEW PHYSICAL schema. All other metadata fields (id, format, createdTime) are
-    // preserved by `with`, so the table identity is stable. `id` mode is fail-closed at snapshot load (#523,
-    // EnsureModeGate in DeltaLog) and never reaches here. Committed under WholeTable scope (like every full
+    // preserved by `with`, so the table identity is stable. `id` mode is rejected fail-closed by EnsureWriteSupported (#523) at the commit-path entry and never reaches here. Committed under WholeTable scope (like every full
     // overwrite) so any concurrent add/remove/metaData aborts it.
     private Task<DeltaCommitResult> OverwriteReplaceSchemaAsync(
         Snapshot readSnapshot,
@@ -971,7 +970,7 @@ internal sealed class DeltaTableWriter
 
         ImmutableArray<string> partitionArray = partitionColumns.ToImmutableArray();
         ColumnMappingMode mode = ColumnMapping.ResolveMode(readSnapshot.Metadata.Configuration);
-        ColumnMapping.EnsureReadWriteSupported(mode); // defense-in-depth: id mode is already gated at load
+        ColumnMapping.EnsureWriteSupported(mode); // id-mode WRITES are refused fail-closed here (#523): id mode is readable at load but not writable
 
         StructType stagingSchema;
         ImmutableArray<string> stagingPartitions;

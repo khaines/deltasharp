@@ -38,7 +38,7 @@ internal static class ProtocolSupport
 
     /// <summary>The advanced reader features this build implements. <c>columnMapping</c> is served in
     /// <c>name</c> mode (STORY-05.4.3 / #191): the feature gate opens for a column-mapped table, then the
-    /// <c>id</c> mode is rejected fail-closed downstream by <see cref="ColumnMapping.EnsureReadWriteSupported"/>
+    /// <c>id</c> mode is rejected fail-closed downstream by <see cref="ColumnMapping.EnsureWriteSupported"/>
     /// (deferred to #523). A legacy reader-version-2 column-mapping table still fails closed (see
     /// <see cref="EnsureReadable"/>) — this build serves column mapping only through the table-features
     /// (reader v3) representation.</summary>
@@ -64,7 +64,7 @@ internal static class ProtocolSupport
 
     /// <summary>The advanced writer features this build implements. <c>columnMapping</c> is written in
     /// <c>name</c> mode (STORY-05.4.3 / #191); an <c>id</c>-mode write is rejected fail-closed downstream
-    /// (<see cref="ColumnMapping.EnsureReadWriteSupported"/>, deferred to #523).</summary>
+    /// (<see cref="ColumnMapping.EnsureWriteSupported"/>, deferred to #523).</summary>
     public static readonly ImmutableHashSet<string> SupportedWriterFeatures =
         ImmutableHashSet.Create(
             StringComparer.Ordinal,

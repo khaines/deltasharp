@@ -26,7 +26,7 @@ internal enum ColumnMappingMode
 
     /// <summary><c>id</c> mode: readers resolve columns by the Parquet <c>field_id</c> given by
     /// <c>delta.columnMapping.id</c>. <b>Not implemented</b> in this build — deferred to #523 and gated
-    /// fail-closed by <see cref="ColumnMapping.EnsureReadWriteSupported"/>.</summary>
+    /// fail-closed by <see cref="ColumnMapping.EnsureWriteSupported"/>.</summary>
     Id,
 }
 
@@ -165,15 +165,18 @@ internal static class ColumnMapping
     }
 
     /// <summary>
-    /// The full column-mapping gate applied when a snapshot is loaded (design §2.12.3; STORY-05.4.3 AC4):
-    /// (1) a table declaring any column-mapping mode MUST have a <paramref name="protocol"/> that supports the
+    /// The column-mapping gate applied when a snapshot is loaded (design §2.12.3; STORY-05.4.3 AC4):
+    /// a table declaring any column-mapping mode MUST have a <paramref name="protocol"/> that supports the
     /// <c>columnMapping</c> feature — the Delta protocol says the <c>delta.columnMapping.mode</c> property is
     /// only honored when the protocol supports it, so a mode set without protocol support is rejected with a
-    /// protocol-upgrade error rather than silently ignored; (2) <c>id</c> mode is rejected fail-closed
-    /// (deferred to #523). <see cref="ColumnMappingMode.None"/> is a no-op.
+    /// protocol-upgrade error rather than silently ignored. <see cref="ColumnMappingMode.None"/> is a no-op.
+    ///
+    /// <para>All three modes (<c>none</c>/<c>name</c>/<c>id</c>) are <b>readable</b> — id-mode read resolves
+    /// columns by the Parquet <c>field_id</c> (#523), so this LOAD gate no longer rejects id. WRITING a
+    /// column-mapped table is a separate concern: <see cref="EnsureWriteSupported"/> (called on every commit
+    /// path) still rejects <c>id</c> mode fail-closed (this build reads, but does not write, id-mode tables).</para>
     /// </summary>
-    /// <exception cref="DeltaProtocolException">A column-mapping mode is set without protocol support, or the
-    /// mode is <see cref="ColumnMappingMode.Id"/>.</exception>
+    /// <exception cref="DeltaProtocolException">A column-mapping mode is set without protocol support.</exception>
     public static void EnsureModeGate(ColumnMappingMode mode, ProtocolAction protocol)
     {
         ArgumentNullException.ThrowIfNull(protocol);
@@ -202,29 +205,30 @@ internal static class ColumnMapping
                     + $"safely."));
         }
 
-        EnsureReadWriteSupported(mode);
+        // Note: id mode is NOT rejected here — it is readable (#523). Write-time rejection of id mode is
+        // enforced by EnsureWriteSupported on the commit paths, which is the correct place for it: this build
+        // does not create/modify id-mode tables, but it reads them.
     }
 
     /// <summary>
-    /// The fail-closed gate for read/write of a column-mapped table: this build supports
-    /// <see cref="ColumnMappingMode.None"/> and <see cref="ColumnMappingMode.Name"/> only.
+    /// The fail-closed gate for <b>writing</b> a column-mapped table: this build writes
+    /// <see cref="ColumnMappingMode.None"/> and <see cref="ColumnMappingMode.Name"/> only. <c>id</c> mode is
+    /// <b>readable</b> (#523, resolved by Parquet <c>field_id</c>) but this build does not create or commit to
+    /// an id-mode table, so every commit path calls this to refuse an id-mode write fail-closed — never falling
+    /// back to a name/positional write that would mis-associate columns. (READS are gated at load by
+    /// <see cref="EnsureModeGate"/>, which permits all three modes.)
     /// </summary>
     /// <exception cref="DeltaProtocolException"><paramref name="mode"/> is
-    /// <see cref="ColumnMappingMode.Id"/> — rejected fail-closed.</exception>
-    public static void EnsureReadWriteSupported(ColumnMappingMode mode)
+    /// <see cref="ColumnMappingMode.Id"/> — writing is rejected fail-closed.</exception>
+    public static void EnsureWriteSupported(ColumnMappingMode mode)
     {
-        // TRACKED DEFERRAL (#523): 'id' mode resolves columns by the Parquet field_id
-        // (delta.columnMapping.id). The name-based Parquet reader (ParquetFileReader.ResolveFileFields)
-        // has no field-id resolution, so an id-mode table MUST be rejected here — never fall back to a
-        // positional or name-based read, which would silently mis-associate columns. id-mode support is
-        // #523 (OPEN); until then this is the single fail-closed choke point.
         if (mode == ColumnMappingMode.Id)
         {
             throw DeltaProtocolException.Unsupported(
-                "The table uses Delta column mapping mode 'id', which resolves columns by the Parquet "
-                + "field_id and is not implemented by this build (tracked in #523). Reading it could "
-                + "silently mis-associate columns, so the table is rejected fail-closed. Only column "
-                + "mapping mode 'name' (and 'none') is supported.");
+                "The table uses Delta column mapping mode 'id'. This build can READ id-mode tables (resolving "
+                + "columns by the Parquet field_id, #523) but does not WRITE them — creating or committing to "
+                + "an id-mode table is refused fail-closed rather than falling back to a name/positional write "
+                + "that could silently mis-associate columns. Only 'name' (and 'none') mode is writable.");
         }
     }
 
