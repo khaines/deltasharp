@@ -131,6 +131,19 @@ public class SelectionViewTests
     }
 
     [Fact]
+    public void Slice_OverflowingRange_IsRejected()
+    {
+        // #576 (extended per #578 review): offset+length overflows int on a selection view too.
+        // Assert the guard's OWN contract message ("exceeds length"), not just the exception type —
+        // a regression to plain-int arithmetic wraps negative, bypasses the guard, and the operation
+        // is only backstopped by ReadOnlySpan.Slice, which throws the same AOoRE with a generic message.
+        ColumnVector view = BuildInts(4).Select(new SelectionVector(new[] { 0, 1, 2 }));
+        ArgumentOutOfRangeException ex =
+            Assert.Throws<ArgumentOutOfRangeException>(() => view.Slice(int.MaxValue, 1));
+        Assert.Contains("exceeds length", ex.Message);
+    }
+
+    [Fact]
     public void AllSelected_PreservesOrder_PartialSubsetsInSelectionOrder()
     {
         MutableColumnVector v = BuildInts(4); // 0,10,20,30

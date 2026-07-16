@@ -100,10 +100,10 @@ public sealed class SelectedColumnVector : ColumnVector
     {
         ArgumentOutOfRangeException.ThrowIfNegative(offset);
         ArgumentOutOfRangeException.ThrowIfNegative(length);
-        if (offset + length > _selection.Count)
+        if ((long)offset + length > _selection.Count)
         {
             throw new ArgumentOutOfRangeException(
-                nameof(length), length, $"Slice [{offset}, {offset + length}) exceeds length {_selection.Count}.");
+                nameof(length), length, $"Slice [{offset}, {(long)offset + length}) exceeds length {_selection.Count}.");
         }
 
         // Sub-range the selection in place — still a zero-copy view over the same parent buffers.

@@ -241,8 +241,10 @@ public class MapColumnVectorTests
         values.AppendValue(1);
         map.EndMap();
         _ = map.Slice(0, 1);
-        Assert.Throws<InvalidOperationException>(() => keys.AppendBytes("k2"u8));  // #575: child sealed
-        Assert.Throws<InvalidOperationException>(() => map.EndMap());              // parent sealed
+        Assert.Throws<InvalidOperationException>(() => keys.AppendBytes("k2"u8));   // #575: key child sealed
+        Assert.Throws<InvalidOperationException>(() => values.AppendValue(2));      // #575: value child sealed
+        Assert.Throws<InvalidOperationException>(() => values.SetValue(0, 999));    // #575: in-range value corruption blocked
+        Assert.Throws<InvalidOperationException>(() => map.EndMap());               // parent sealed
     }
 
     [Fact]
