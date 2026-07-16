@@ -4,6 +4,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
+using DeltaSharp.Types;
 using Xunit;
 
 namespace DeltaSharp.Storage.Tests.Delta;
@@ -78,12 +79,26 @@ public sealed class AppendOnlyEnforcementTests : IDisposable
     [InlineData("true", true)]
     [InlineData("TRUE", true)]
     [InlineData("false", false)]
-    [InlineData("", false)]
-    [InlineData("yes", false)]
-    public void IsEnabled_ParsesPropertyCaseInsensitively(string value, bool expected)
+    [InlineData("False", false)]
+    public void IsEnabled_ParsesCanonicalBooleanCaseInsensitively(string value, bool expected)
     {
         Assert.Equal(expected, AppendOnlyFeature.IsEnabled(
             new Dictionary<string, string> { ["delta.appendOnly"] = value }));
+    }
+
+    [Theory]
+    [InlineData("yes")]
+    [InlineData("1")]
+    [InlineData("on")]
+    [InlineData("")]
+    public void IsEnabled_MalformedValue_ThrowsFailClosed(string value)
+    {
+        // #549 (Architect/Delta-Specialist): the Delta golden parses delta.appendOnly via Scala's
+        // String.toBoolean, which THROWS on any non-{true,false} value. A malformed value must NOT silently
+        // coerce to false (fail OPEN) — that would drop a data-protection guarantee — so we fail CLOSED.
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() =>
+            AppendOnlyFeature.IsEnabled(new Dictionary<string, string> { ["delta.appendOnly"] = value }));
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
     }
 
     [Fact]
@@ -158,6 +173,29 @@ public sealed class AppendOnlyEnforcementTests : IDisposable
                 }));
 
         Assert.Equal(DeltaProtocolErrorKind.AppendOnlyViolation, ex.Kind);
+    }
+
+    [Fact]
+    public void EnsureCommitAllowed_MalformedAppendOnly_WithDataChangeRemove_ThrowsFailClosed()
+    {
+        // A data-changing remove forces evaluation of delta.appendOnly; a malformed value fails CLOSED
+        // (MalformedAction) rather than silently permitting the remove.
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() =>
+            AppendOnlyFeature.EnsureCommitAllowed(
+                new Dictionary<string, string> { ["delta.appendOnly"] = "yes" },
+                new DeltaAction[] { Remove("old.parquet", dataChange: true) }));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+    }
+
+    [Fact]
+    public void EnsureCommitAllowed_MalformedAppendOnly_PureAppend_IsAllowed()
+    {
+        // Gate-first (golden parity): with no data-changing remove, delta.appendOnly is never parsed, so a
+        // malformed value does not block a pure append (Spark evaluates the property only in assertRemovable).
+        AppendOnlyFeature.EnsureCommitAllowed(
+            new Dictionary<string, string> { ["delta.appendOnly"] = "yes" },
+            new DeltaAction[] { Add("new.parquet") });
     }
 
     // ---- DeltaCommitter seam (real loaded snapshot) ----
@@ -262,5 +300,69 @@ public sealed class AppendOnlyEnforcementTests : IDisposable
 
         Assert.Equal(1L, result.Version);
         Assert.Empty((await LoadAsync()).ActiveFiles);
+    }
+
+    [Fact]
+    public async Task CommitAsync_AppendOnlyTable_AllowsMetadataOnlyCommit()
+    {
+        // A metadata-only commit (e.g. ALTER TABLE SET TBLPROPERTIES('delta.appendOnly'='false')) has no
+        // data-changing remove, so it is allowed on an append-only table — the third valid commit class
+        // alongside pure appends and compaction.
+        await SeedLegacyAppendOnlyAsync();
+        Snapshot snapshot = await LoadAsync();
+
+        MetadataAction disabled = snapshot.Metadata with
+        {
+            Configuration = snapshot.Metadata.Configuration.SetItem(AppendOnlyFeature.PropertyKey, "false"),
+        };
+
+        DeltaCommitResult result = await new DeltaCommitter(_backend).CommitAsync(
+            snapshot, new DeltaAction[] { disabled }, DeltaReadScope.WholeTable);
+
+        Assert.Equal(1L, result.Version);
+        Assert.False(AppendOnlyFeature.IsEnabled((await LoadAsync()).Metadata.Configuration));
+    }
+
+    [Fact]
+    public async Task CommitAsync_AppendOnlyTable_SameCommitDisablePlusDelete_IsStillRejected()
+    {
+        // Read-snapshot-scoped (Spark parity): a commit that BOTH disables appendOnly AND deletes in the same
+        // commit is judged against the pre-commit (still append-only) snapshot → rejected. delta.appendOnly
+        // must be disabled in a PRIOR commit before a delete is allowed.
+        await SeedLegacyAppendOnlyAsync();
+        Snapshot snapshot = await LoadAsync();
+
+        MetadataAction disabled = snapshot.Metadata with
+        {
+            Configuration = snapshot.Metadata.Configuration.SetItem(AppendOnlyFeature.PropertyKey, "false"),
+        };
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(() =>
+            new DeltaCommitter(_backend).CommitAsync(
+                snapshot,
+                new DeltaAction[] { disabled, Remove("seed.parquet", dataChange: true) },
+                DeltaReadScope.WholeTable));
+
+        Assert.Equal(DeltaProtocolErrorKind.AppendOnlyViolation, ex.Kind);
+        Assert.Equal(0L, (await LoadAsync()).Version);
+    }
+
+    // ---- End-to-end: the real public operation path funnels through enforcement ----
+
+    [Fact]
+    public async Task OverwriteAsync_OnAppendOnlyTable_IsRejected_EndToEnd()
+    {
+        // Tripwire (Architect/Security/Reliability): drive the REAL public OverwriteAsync API against an
+        // append-only table. A full overwrite tombstones the prior active file (dataChange=true), so it must
+        // be refused fail-closed — proving the operation → enforcement coupling, not just the seam.
+        await SeedLegacyAppendOnlyAsync();
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(() =>
+            new DeltaTableWriter(_backend).OverwriteAsync(
+                StructType.Empty,
+                new[] { new StagedDataFile("over.parquet", NoPartition, Size: 1L, ModificationTime: 1L, Stats: null) }));
+
+        Assert.Equal(DeltaProtocolErrorKind.AppendOnlyViolation, ex.Kind);
+        Assert.Equal(0L, (await LoadAsync()).Version); // no new version published
     }
 }

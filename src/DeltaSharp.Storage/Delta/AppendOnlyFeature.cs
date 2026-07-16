@@ -1,5 +1,4 @@
 using System.Collections.Immutable;
-using System.Linq;
 
 namespace DeltaSharp.Storage.Delta;
 
@@ -37,14 +36,37 @@ internal static class AppendOnlyFeature
     /// are refused.</summary>
     public const string PropertyKey = "delta.appendOnly";
 
-    /// <summary>True when the table property <c>delta.appendOnly</c> is set to <c>true</c>
-    /// (case-insensitive) — the activation signal Delta's <c>IS_APPEND_ONLY.fromMetaData</c> reads.</summary>
+    /// <summary>
+    /// Whether the table is append-only: <c>true</c> when <c>delta.appendOnly</c> is present and
+    /// case-insensitively <c>"true"</c>, <c>false</c> when absent or <c>"false"</c>. A present but
+    /// non-boolean value throws a fail-closed <see cref="DeltaProtocolException"/> — mirroring the Delta
+    /// golden, where <c>IS_APPEND_ONLY.fromMetaData</c> parses via Scala's <c>String.toBoolean</c>, which
+    /// THROWS on any value other than <c>true</c>/<c>false</c> (Spark also rejects a malformed value at SET
+    /// time). This is deliberately STRICTER than the <c>bool.TryParse ⇒ false</c> convention used by the
+    /// optional <b>enable-gate</b> features (<see cref="TypeWideningFeature.IsEnabled"/>,
+    /// <c>DeletionVectorsFeature.IsEnabled</c>): for those an unparseable value safely leaves an OPTIONAL
+    /// feature OFF, but here silently coercing a malformed value to <c>false</c> would DROP a data-protection
+    /// guarantee (fail <b>open</b>) on a table a foreign engine relies on — the unsafe direction — so a
+    /// malformed value fails <b>closed</b> instead.
+    /// </summary>
+    /// <exception cref="DeltaProtocolException"><c>delta.appendOnly</c> is present but not a valid boolean.</exception>
     public static bool IsEnabled(IReadOnlyDictionary<string, string> configuration)
     {
         ArgumentNullException.ThrowIfNull(configuration);
-        return configuration.TryGetValue(PropertyKey, out string? value)
-            && bool.TryParse(value, out bool enabled)
-            && enabled;
+        if (!configuration.TryGetValue(PropertyKey, out string? value))
+        {
+            return false;
+        }
+
+        if (bool.TryParse(value, out bool enabled))
+        {
+            return enabled;
+        }
+
+        throw DeltaProtocolException.Malformed(
+            $"Table property '{PropertyKey}' has a non-boolean value '{value}'; it must be 'true' or 'false'. "
+            + "Refusing fail-closed rather than silently treating the table as not append-only (a malformed "
+            + "value must not drop the append-only guarantee).");
     }
 
     /// <summary>
@@ -64,27 +86,35 @@ internal static class AppendOnlyFeature
     }
 
     /// <summary>
-    /// Enforces append-only on a commit: throws a fail-closed <see cref="DeltaProtocolException"/> (kind
-    /// <see cref="DeltaProtocolErrorKind.AppendOnlyViolation"/>) when <paramref name="configuration"/> has
-    /// <c>delta.appendOnly=true</c> AND <paramref name="actions"/> contains a <c>remove</c> with
-    /// <c>dataChange=true</c> (a DELETE / OVERWRITE that deletes or changes committed data). A commit with
-    /// only appends, or whose removes are all <c>dataChange=false</c> (OPTIMIZE compaction), is allowed —
-    /// matching Delta's <c>if (removes.exists(_.dataChange)) assertRemovable(snapshot)</c>.
+    /// Enforces append-only on a commit, matching the Delta golden
+    /// <c>if (removes.exists(_.dataChange)) assertRemovable(snapshot)</c>: only when
+    /// <paramref name="actions"/> contains a <c>remove</c> with <c>dataChange=true</c> (a DELETE / OVERWRITE
+    /// that deletes or changes committed data) is the table's append-only status evaluated; if the table is
+    /// then append-only (<see cref="IsEnabled"/>), the commit is refused fail-closed
+    /// (<see cref="DeltaProtocolErrorKind.AppendOnlyViolation"/>). A commit with only appends, or whose
+    /// removes are all <c>dataChange=false</c> (OPTIMIZE compaction), is allowed and does NOT evaluate the
+    /// property — so a malformed <c>delta.appendOnly</c> value surfaces (as <see cref="IsEnabled"/>'s
+    /// fail-closed throw) only on a data-changing commit, exactly as the golden's <c>assertRemovable</c>
+    /// gate does.
     /// </summary>
-    /// <exception cref="DeltaProtocolException">The table is append-only and the commit changes committed
-    /// data.</exception>
+    /// <exception cref="DeltaProtocolException">The commit changes committed data and the table is
+    /// append-only, or it carries a malformed <c>delta.appendOnly</c> value.</exception>
     public static void EnsureCommitAllowed(
         IReadOnlyDictionary<string, string> configuration, IReadOnlyList<DeltaAction> actions)
     {
         ArgumentNullException.ThrowIfNull(configuration);
         ArgumentNullException.ThrowIfNull(actions);
 
-        if (!IsEnabled(configuration))
+        // Golden gate: only a data-changing remove (DELETE / OVERWRITE) can violate append-only; a pure
+        // append or an all-dataChange=false compaction (OPTIMIZE) never evaluates the property — mirroring
+        // Spark, which calls assertRemovable (and thus parses delta.appendOnly) only when
+        // removes.exists(_.dataChange).
+        if (!actions.Any(action => action is RemoveFileAction { DataChange: true }))
         {
             return;
         }
 
-        if (actions.Any(action => action is RemoveFileAction { DataChange: true }))
+        if (IsEnabled(configuration))
         {
             throw DeltaProtocolException.AppendOnly(
                 "This table is configured to only allow appends ('delta.appendOnly'='true'), so a commit that "

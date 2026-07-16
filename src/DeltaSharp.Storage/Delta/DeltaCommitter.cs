@@ -145,7 +145,8 @@ internal sealed class DeltaCommitter
     /// Commits <paramref name="actions"/> against <paramref name="readSnapshot"/> under
     /// <paramref name="readScope"/>, returning the version that became visible.
     /// </summary>
-    /// <exception cref="DeltaProtocolException">The table's writer protocol is unsupported (fail closed).</exception>
+    /// <exception cref="DeltaProtocolException">The table's writer protocol is unsupported, or the table is
+    /// append-only (<c>delta.appendOnly=true</c>) and the commit changes committed data (fail closed).</exception>
     /// <exception cref="DeltaConcurrentModificationException">A concurrent commit logically conflicts with
     /// this one (aborted, not rebased).</exception>
     /// <exception cref="DeltaCommitContentionException">The commit did not converge within the rebase-retry
@@ -176,16 +177,6 @@ internal sealed class DeltaCommitter
                 "A BlindAppend commit must be append-only (it contains no read set to detect a concurrent delete); a commit that removes files must use DeltaReadScope.WholeTable or DeltaReadScope.ReadFiles.",
                 nameof(actions));
         }
-
-        // Append-only enforcement (Delta "Append-only Tables"; #549). Orthogonal to the BlindAppend check
-        // above (that is concurrency-conflict safety, keyed on read scope): this rejects a commit that would
-        // DELETE OR CHANGE committed data (a remove with dataChange=true — DELETE / OVERWRITE) on a table with
-        // delta.appendOnly=true, regardless of read scope. Keyed off the table's own metadata (Spark's
-        // IS_APPEND_ONLY.fromMetaData) so it covers both a legacy writer-2 appendOnly table and a writer-7
-        // table that enumerates the feature; compaction removes (dataChange=false, e.g. OPTIMIZE) are allowed,
-        // matching Spark's `if (removes.exists(_.dataChange)) assertRemovable(snapshot)`. Thrown before any
-        // write, so the DeltaProtocolException catch below records a fail-closed terminal (no version).
-        AppendOnlyFeature.EnsureCommitAllowed(readSnapshot.Metadata.Configuration, actions);
 
         // Observability wrapper (design §7, #479): spans/metrics/logs are side-effect-free on commit
         // semantics — the inner core is byte-for-byte the prior control flow. The stopwatch is monotonic
@@ -264,6 +255,20 @@ internal sealed class DeltaCommitter
                 ProtocolSupport.EnsureReadable(committedProtocol);
             }
         }
+
+        // Append-only enforcement (Delta "Append-only Tables"; #549), evaluated here — after protocol
+        // negotiation and inside CommitAsync's telemetry try — so an append-only rejection records a
+        // fail-closed terminal (the DeltaProtocolException catch) exactly like the sibling EnsureWritable
+        // rejection, and protocol errors still take precedence. Orthogonal to the BlindAppend-remove check in
+        // CommitAsync (that is concurrency-conflict safety keyed on read scope): this refuses a commit that
+        // DELETEs OR CHANGEs committed data (a remove with dataChange=true — DELETE/OVERWRITE) on a table with
+        // delta.appendOnly=true, regardless of read scope. Keyed off the read snapshot's own metadata (Spark's
+        // IS_APPEND_ONLY.fromMetaData) so it covers a legacy writer-2 appendOnly table and a writer-7 table
+        // that enumerates the feature alike; compaction removes (dataChange=false, e.g. OPTIMIZE) are allowed,
+        // matching Spark's `if (removes.exists(_.dataChange)) assertRemovable(snapshot)`. Fail-closed before
+        // any write (mirrors EnsureWritable's placement) — a concurrent delta.appendOnly toggle aborts this
+        // commit via MetadataChanged, so a single pre-loop evaluation on the read snapshot is sufficient.
+        AppendOnlyFeature.EnsureCommitAllowed(readSnapshot.Metadata.Configuration, actions);
 
         // Idempotency via txn (§2.11.4): if this commit records application transactions whose versions the
         // read snapshot already reflects (snapshot.txn[appId] >= version), the batch already committed —

@@ -515,6 +515,43 @@ public sealed class DeltaCommitTelemetryTests : IDisposable
     }
 
     [Fact]
+    public async Task AppendOnlyViolation_EmitsFailedTerminal_ErrorLog_AndErrorSpan()
+    {
+        // #549 (Balanced): an append-only rejection is a DeltaProtocolException thrown INSIDE CommitCoreAsync
+        // (after EnsureWritable, within CommitAsync's telemetry try), so it flows through the same fail-closed
+        // terminal as an unsupported-protocol rejection — a failure metric + DeltaCommitFailed (Error) log +
+        // Error span (version:-1, no write attempted) — rather than escaping the wrapper with zero telemetry.
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 0, DeltaTestHarness.Protocol(minReader: 1, minWriter: 2),
+            DeltaTestHarness.MetadataWithConfig(("delta.appendOnly", "true")), DeltaTestHarness.Add("seed.parquet"));
+        Snapshot snapshot = await LoadAsync();
+        using var telemetry = new DeltaStorageTelemetry();
+        var logger = new RecordingLogger<DeltaCommitter>();
+        using var meters = new MeterCapture(telemetry.DeltaMeter, telemetry.StorageMeter);
+        using var activities = new ActivityCapture(telemetry.DeltaActivitySource);
+
+        var remove = new RemoveFileAction(
+            "seed.parquet", DeletionTimestamp: 1L, DataChange: true, ExtendedFileMetadata: false, NoPartition, Size: null);
+        await Assert.ThrowsAsync<DeltaProtocolException>(() =>
+            Committer(_backend, logger, telemetry)
+                .CommitAsync(snapshot, new DeltaAction[] { remove }, DeltaReadScope.WholeTable));
+
+        RecordingLogger<DeltaCommitter>.Entry failed = logger.Single("DeltaCommitFailed");
+        Assert.Equal(LogLevel.Error, failed.Level);
+        Assert.Equal(-1L, failed.Field("Version")); // fail-closed before any write ⇒ no version attempted
+        Assert.Equal(nameof(DeltaProtocolException), failed.Field("ExceptionType"));
+
+        MeterCapture.Measurement count = Assert.Single(meters.ForInstrument(CountInstrument));
+        Assert.Equal(1d, count.Value);
+        Assert.Equal("failure", count.Tags[OutcomeKey]);
+        Assert.Equal("failure", Assert.Single(meters.ForInstrument(DurationInstrument)).Tags[OutcomeKey]);
+
+        Activity activity = SingleCommitActivity(activities);
+        Assert.Equal("failure", activity.GetTagItem(OutcomeKey));
+        Assert.Equal(ActivityStatusCode.Error, activity.Status);
+    }
+
+    [Fact]
     public async Task Canceled_RecordsCancelledTerminal_InfoLog_AndSpanNotError()
     {
         // BLOCKING FIX: cancellation is NOT a commit failure. The wrapper records a distinct outcome=cancelled
