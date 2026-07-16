@@ -15,8 +15,14 @@ public static class ColumnVectors
     /// </summary>
     /// <exception cref="ArgumentNullException"><paramref name="type"/> is null.</exception>
     /// <exception cref="UnsupportedTypeException">
-    /// The type has no managed vector representation (nested types and <see cref="NullType"/>).
+    /// The type has no managed vector representation (<see cref="NullType"/>).
     /// </exception>
+    /// <remarks>
+    /// Nested types build the reference nested vectors (<see cref="StructColumnVector"/>,
+    /// <see cref="ListColumnVector"/>, <see cref="MapColumnVector"/>), recursing through this factory
+    /// for each child. The returned vector is an empty mutable builder; append nested rows through the
+    /// concrete type's row-commit API (<c>EndStruct</c>/<c>EndList</c>/<c>EndMap</c>/<c>AppendNull</c>).
+    /// </remarks>
     public static MutableColumnVector Create(DataType type, int capacity)
     {
         ArgumentNullException.ThrowIfNull(type);
@@ -33,6 +39,9 @@ public static class ColumnVectors
             DecimalType { IsCompact: true } => new ManagedFixedWidthColumnVector<long>(type, capacity),
             DecimalType => new ManagedFixedWidthColumnVector<Int128>(type, capacity),
             StringType or BinaryType => new ManagedVariableWidthColumnVector(type, capacity),
+            StructType structType => new StructColumnVector(structType, capacity),
+            ArrayType arrayType => new ListColumnVector(arrayType, capacity),
+            MapType mapType => new MapColumnVector(mapType, capacity),
             _ => throw new UnsupportedTypeException(
                 $"No managed column vector is defined for type '{type.SimpleString}'."),
         };

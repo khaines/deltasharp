@@ -145,7 +145,8 @@ internal sealed class DeltaCommitter
     /// Commits <paramref name="actions"/> against <paramref name="readSnapshot"/> under
     /// <paramref name="readScope"/>, returning the version that became visible.
     /// </summary>
-    /// <exception cref="DeltaProtocolException">The table's writer protocol is unsupported (fail closed).</exception>
+    /// <exception cref="DeltaProtocolException">The table's writer protocol is unsupported, or the table is
+    /// append-only (<c>delta.appendOnly=true</c>) and the commit changes committed data (fail closed).</exception>
     /// <exception cref="DeltaConcurrentModificationException">A concurrent commit logically conflicts with
     /// this one (aborted, not rebased).</exception>
     /// <exception cref="DeltaCommitContentionException">The commit did not converge within the rebase-retry
@@ -282,11 +283,27 @@ internal sealed class DeltaCommitter
         switch (ClassifyTxnCoverage(actions, readSnapshot.Transactions))
         {
             case TxnCoverage.All:
+                // Already-committed idempotent retry — a no-op skip. Must NOT re-evaluate append-only: the
+                // batch already landed (legitimately, when it was accepted), so a table that has SINCE become
+                // append-only must still skip the replay, not raise AppendOnlyViolation (§2.11.4 idempotency).
                 return Succeed(activity, startTimestamp, new DeltaCommitResult(readSnapshot.Version, Attempts: 0, Skipped: true));
             case TxnCoverage.Partial:
                 throw PartialConflict(activity, startTimestamp, actions, readSnapshot.Transactions, attempts: 0);
             case TxnCoverage.None:
-                break; // no idempotency key covered — proceed to write.
+                // A genuinely new commit (no idempotency key covered). Append-only enforcement (Delta
+                // "Append-only Tables"; #549) runs HERE — after protocol negotiation (EnsureWritable keeps
+                // precedence) and the idempotency skip, but before any write, and inside CommitAsync's
+                // telemetry try so a rejection records the fail-closed terminal (the DeltaProtocolException
+                // catch) like the sibling EnsureWritable rejection. It refuses a commit that DELETEs OR CHANGEs
+                // committed data (a remove with dataChange=true — DELETE/OVERWRITE) on a delta.appendOnly=true
+                // table, regardless of read scope; compaction removes (dataChange=false, e.g. OPTIMIZE) are
+                // allowed, matching Spark's `if (removes.exists(_.dataChange)) assertRemovable(snapshot)`.
+                // Keyed off the read snapshot's own metadata (Spark's IS_APPEND_ONLY.fromMetaData), covering a
+                // legacy writer-2 appendOnly table and a writer-7 table that enumerates the feature alike. A
+                // concurrent delta.appendOnly toggle aborts this commit via MetadataChanged, so a single
+                // evaluation on the read snapshot is sufficient.
+                AppendOnlyFeature.EnsureCommitAllowed(readSnapshot.Metadata.Configuration, actions);
+                break;
         }
 
         (IReadOnlyList<DeltaAction> payload, string nonce) = BuildPayload(actions, _nonceFactory());

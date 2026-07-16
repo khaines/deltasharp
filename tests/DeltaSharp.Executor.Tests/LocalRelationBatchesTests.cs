@@ -140,4 +140,44 @@ public sealed class LocalRelationBatchesTests
         Assert.Equal(wall, got);
         Assert.Equal(DateTimeKind.Unspecified, got.Kind);
     }
+
+    [Fact]
+    public void NestedArrayColumn_IsRejectedFailClosed_BeforeAnyRowIsRead()
+    {
+        // The nested-schema gate is schema-only and fires before any row is drained: nested types have a
+        // columnar representation (#570) but no CreateDataFrame materialization yet (#571). Pre-gate, an
+        // all-null nested column would build a null nested vector and succeed; now it is rejected uniformly.
+        StructType schema = Schema(new StructField("xs", new ArrayType(IntegerType.Instance), nullable: true));
+
+        UnsupportedPlanException ex = Assert.Throws<UnsupportedPlanException>(
+            () => LocalRelationBatches.Build(schema, Array.Empty<Row>()));
+        Assert.Contains("nested column 'xs'", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("#571", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void NestedStructColumn_AllNullRows_IsRejectedFailClosed()
+    {
+        StructType inner = Schema(new StructField("a", IntegerType.Instance, nullable: true));
+        StructType schema = Schema(new StructField("s", inner, nullable: true));
+        var rows = new[] { new Row(schema, (object?)null), new Row(schema, (object?)null) };
+
+        UnsupportedPlanException ex = Assert.Throws<UnsupportedPlanException>(
+            () => LocalRelationBatches.Build(schema, rows));
+        Assert.Contains("nested column 's'", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void NestedMapColumnCarriedAlongsideScalar_IsRejectedFailClosed()
+    {
+        // A nested column merely carried next to a scalar must be rejected at the schema gate, not surface
+        // an internal Select-not-supported error further down the plan.
+        StructType schema = Schema(
+            new StructField("m", new MapType(StringType.Instance, IntegerType.Instance), nullable: true),
+            new StructField("k", IntegerType.Instance, nullable: false));
+
+        UnsupportedPlanException ex = Assert.Throws<UnsupportedPlanException>(
+            () => LocalRelationBatches.Build(schema, Array.Empty<Row>()));
+        Assert.Contains("nested column 'm'", ex.Message, StringComparison.Ordinal);
+    }
 }

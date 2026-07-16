@@ -722,17 +722,20 @@ internal sealed class DeltaTableWriter
             return new DeltaCommitResult(snapshot.Version, Attempts: 0, Skipped: true);
         }
 
-        // Interop safety (#549): refuse fail-closed rather than silently deactivate a legacy (writer < 7)
-        // appendOnly / invariant / CHECK constraint this build cannot carry as an explicit table feature
-        // through the table-features upgrade.
+        // Interop safety: refuse fail-closed rather than silently deactivate a legacy (writer < 7) invariant /
+        // CHECK constraint this build cannot yet carry as an explicit table feature through the table-features
+        // upgrade (#568, overlaps #190). An active delta.appendOnly=true no longer blocks the upgrade — it is
+        // enumerated + enforced (#549).
         TypeWideningFeature.EnsureUpgradeable(snapshot.Protocol, snapshot.Schema, snapshot.Metadata.Configuration);
 
-        // The upgraded protocol (adds typeWidening, preserving existing features + raising the version floors)
-        // and the metaData carrying delta.enableTypeWidening=true. Both are needed: the protocol makes the
-        // feature SUPPORTED, the property makes a widening APPLIED (Delta "Writer Requirements for Type
-        // Widening"). The committer re-validates any installed protocol (EnsureWritable/EnsureReadable), so it
-        // never publishes a protocol this build could not itself read or write back.
-        ProtocolAction upgraded = TypeWideningFeature.UpgradeProtocol(snapshot.Protocol);
+        // The upgraded protocol (adds typeWidening, enumerates an active appendOnly, preserving existing
+        // features + raising the version floors) and the metaData carrying delta.enableTypeWidening=true. Both
+        // are needed: the protocol makes the feature SUPPORTED, the property makes a widening APPLIED (Delta
+        // "Writer Requirements for Type Widening"). The committer re-validates any installed protocol
+        // (EnsureWritable/EnsureReadable), so it never publishes a protocol this build could not itself read
+        // or write back.
+        ProtocolAction upgraded = TypeWideningFeature.UpgradeProtocol(
+            snapshot.Protocol, snapshot.Metadata.Configuration);
         ImmutableSortedDictionary<string, string> configuration =
             snapshot.Metadata.Configuration.SetItem(TypeWideningFeature.EnablePropertyKey, "true");
         MetadataAction metadata = snapshot.Metadata with { Configuration = configuration };

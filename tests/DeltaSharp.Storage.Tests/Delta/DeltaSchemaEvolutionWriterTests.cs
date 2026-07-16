@@ -830,15 +830,15 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
     }
 
     [Theory]
-    [InlineData("delta.appendOnly", "true")]      // active append-only (implicit legacy feature)
-    [InlineData("delta.constraints.ck", "id > 0")] // a CHECK constraint (legacy invariants feature)
+    [InlineData("delta.constraints.ck", "id > 0")] // a CHECK constraint (legacy checkConstraints feature)
     public async Task EnableTypeWidening_OnLegacyTableWithActiveConstraint_IsRefusedFailClosed(
         string configKey, string configValue)
     {
-        // #549: a FOREIGN legacy (writer < 7) table that currently declares an ACTIVE appendOnly / CHECK
-        // constraint cannot be upgraded to the table-features protocol by this build without silently
-        // deactivating that feature (this build cannot enumerate it as a table feature). EnableTypeWideningAsync
-        // refuses fail-closed and writes NO new version, rather than corrupt another engine's guarantees.
+        // #568: a FOREIGN legacy (writer < 7) table that currently declares an ACTIVE CHECK constraint (or
+        // column invariant) cannot be upgraded to the table-features protocol by this build without silently
+        // deactivating that feature (this build has no per-row expression enforcement — overlaps #190).
+        // EnableTypeWideningAsync refuses fail-closed and writes NO new version. (An active delta.appendOnly is
+        // now enumerated + enforced instead — see EnableTypeWidening_OnLegacyAppendOnlyTable_* below, #549.)
         await DeltaTestHarness.WriteCommitAsync(
             _backend, 0,
             DeltaTestHarness.Protocol(minReader: 1, minWriter: 2),
@@ -849,8 +849,60 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
         DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
             () => Writer().EnableTypeWideningAsync());
 
-        Assert.Contains("#549", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("#568", ex.Message, StringComparison.Ordinal);
         Assert.Equal(0L, (await LoadAsync()).Version); // no new version published
+    }
+
+    [Fact]
+    public async Task EnableTypeWidening_OnLegacyAppendOnlyTable_UpgradesAndEnumeratesAppendOnly()
+    {
+        // #549: a legacy (writer 2) table with an ACTIVE delta.appendOnly=true is now upgradeable — the upgrade
+        // enumerates the appendOnly writer feature (writer-only) so append-only stays ACTIVE across the
+        // table-features upgrade (Delta "Active Features"), and delta.appendOnly=true is preserved in config.
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 0,
+            DeltaTestHarness.Protocol(minReader: 1, minWriter: 2),
+            DeltaTestHarness.MetadataWithSchemaAndConfig(
+                Struct(F("value", DataTypes.IntegerType, nullable: true)),
+                new[] { ("delta.appendOnly", "true") }));
+
+        DeltaCommitResult result = await Writer().EnableTypeWideningAsync();
+
+        Assert.False(result.Skipped);
+        Snapshot after = await LoadAsync();
+        Assert.Equal(ProtocolSupport.TableFeaturesWriterVersion, after.Protocol.MinWriterVersion);
+        Assert.Contains(TypeWideningFeature.Feature, after.Protocol.WriterFeatures);
+        Assert.Contains(AppendOnlyFeature.Feature, after.Protocol.WriterFeatures);
+        Assert.DoesNotContain(AppendOnlyFeature.Feature, after.Protocol.ReaderFeatures); // writer-only
+        Assert.Equal("true", after.Metadata.Configuration[AppendOnlyFeature.PropertyKey]);
+        Assert.True(TypeWideningFeature.IsWriteEnabled(after));
+    }
+
+    [Fact]
+    public async Task EnableTypeWidening_OnLegacyAppendOnlyTable_EnforcementPersistsAfterUpgrade()
+    {
+        // After the upgrade, append-only enforcement is still active on the upgraded (writer 7) snapshot: a
+        // data-changing remove (DELETE / OVERWRITE) against it is refused fail-closed.
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 0,
+            DeltaTestHarness.Protocol(minReader: 1, minWriter: 2),
+            DeltaTestHarness.MetadataWithSchemaAndConfig(
+                Struct(F("value", DataTypes.IntegerType, nullable: true)),
+                new[] { ("delta.appendOnly", "true") }),
+            DeltaTestHarness.Add("seed.parquet"));
+
+        await Writer().EnableTypeWideningAsync();
+        Snapshot upgraded = await LoadAsync();
+
+        var remove = new RemoveFileAction(
+            "seed.parquet", DeletionTimestamp: 1L, DataChange: true, ExtendedFileMetadata: false,
+            NoPartition, Size: null);
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(() =>
+            new DeltaCommitter(_backend).CommitAsync(
+                upgraded, new DeltaAction[] { remove }, DeltaReadScope.WholeTable));
+
+        Assert.Equal(DeltaProtocolErrorKind.AppendOnlyViolation, ex.Kind);
     }
 
     [Fact]
