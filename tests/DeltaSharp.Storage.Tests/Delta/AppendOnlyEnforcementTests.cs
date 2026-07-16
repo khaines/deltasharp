@@ -91,11 +91,15 @@ public sealed class AppendOnlyEnforcementTests : IDisposable
     [InlineData("1")]
     [InlineData("on")]
     [InlineData("")]
+    [InlineData(" true ")]  // whitespace-padded: bool.TryParse would accept (fail-open); exact match rejects
+    [InlineData(" false ")]
+    [InlineData("\ttrue")]
     public void IsEnabled_MalformedValue_ThrowsFailClosed(string value)
     {
-        // #549 (Architect/Delta-Specialist): the Delta golden parses delta.appendOnly via Scala's
-        // String.toBoolean, which THROWS on any non-{true,false} value. A malformed value must NOT silently
-        // coerce to false (fail OPEN) — that would drop a data-protection guarantee — so we fail CLOSED.
+        // #549 (Architect/Delta-Specialist + red-team): the Delta golden parses delta.appendOnly via Scala's
+        // String.toBoolean, which matches only the exact tokens true/false (no trimming) and THROWS otherwise.
+        // A malformed value — including a whitespace-padded " false " that bool.TryParse would coerce to false
+        // — must NOT silently drop the append-only guarantee (fail open); it fails CLOSED.
         DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() =>
             AppendOnlyFeature.IsEnabled(new Dictionary<string, string> { ["delta.appendOnly"] = value }));
         Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
@@ -364,5 +368,42 @@ public sealed class AppendOnlyEnforcementTests : IDisposable
 
         Assert.Equal(DeltaProtocolErrorKind.AppendOnlyViolation, ex.Kind);
         Assert.Equal(0L, (await LoadAsync()).Version); // no new version published
+    }
+
+    [Fact]
+    public async Task CommitAsync_IdempotentRetryOfCommittedRemove_AfterAppendOnlyEnabled_IsSkippedNotRejected()
+    {
+        // Red-team regression (#549): a data-changing remove carrying a txn commits on a NON-append-only
+        // table; the table is THEN made append-only; an idempotent retry of the same txn must be SKIPPED
+        // (§2.11.4 idempotency), NOT raise AppendOnlyViolation. Enforcement must run AFTER the txn-coverage
+        // gate (only for a genuinely new commit), never before it — otherwise a replay of an already-landed
+        // batch fails spuriously once the table becomes append-only.
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 0, DeltaTestHarness.Protocol(minReader: 1, minWriter: 2),
+            DeltaTestHarness.Metadata(), DeltaTestHarness.Add("seed.parquet"));
+
+        // 1) commit a data-changing remove + a txn (appId=app1, version=5) — allowed (not append-only yet).
+        var txn = new TxnAction("app1", 5L, LastUpdated: null);
+        Snapshot v0 = await LoadAsync();
+        await new DeltaCommitter(_backend).CommitAsync(
+            v0, new DeltaAction[] { Remove("seed.parquet", dataChange: true), txn }, DeltaReadScope.WholeTable);
+
+        // 2) enable append-only via a metadata-only commit.
+        Snapshot v1 = await LoadAsync();
+        MetadataAction appendOnly = v1.Metadata with
+        {
+            Configuration = v1.Metadata.Configuration.SetItem(AppendOnlyFeature.PropertyKey, "true"),
+        };
+        await new DeltaCommitter(_backend).CommitAsync(v1, new DeltaAction[] { appendOnly }, DeltaReadScope.WholeTable);
+
+        // 3) idempotent retry of the SAME txn against the now-append-only snapshot → SKIPPED, not rejected.
+        Snapshot v2 = await LoadAsync();
+        Assert.True(AppendOnlyFeature.IsEnabled(v2.Metadata.Configuration));
+
+        DeltaCommitResult result = await new DeltaCommitter(_backend).CommitAsync(
+            v2, new DeltaAction[] { Remove("seed.parquet", dataChange: true), txn }, DeltaReadScope.WholeTable);
+
+        Assert.True(result.Skipped);
+        Assert.Equal(v2.Version, result.Version);
     }
 }

@@ -256,20 +256,6 @@ internal sealed class DeltaCommitter
             }
         }
 
-        // Append-only enforcement (Delta "Append-only Tables"; #549), evaluated here — after protocol
-        // negotiation and inside CommitAsync's telemetry try — so an append-only rejection records a
-        // fail-closed terminal (the DeltaProtocolException catch) exactly like the sibling EnsureWritable
-        // rejection, and protocol errors still take precedence. Orthogonal to the BlindAppend-remove check in
-        // CommitAsync (that is concurrency-conflict safety keyed on read scope): this refuses a commit that
-        // DELETEs OR CHANGEs committed data (a remove with dataChange=true — DELETE/OVERWRITE) on a table with
-        // delta.appendOnly=true, regardless of read scope. Keyed off the read snapshot's own metadata (Spark's
-        // IS_APPEND_ONLY.fromMetaData) so it covers a legacy writer-2 appendOnly table and a writer-7 table
-        // that enumerates the feature alike; compaction removes (dataChange=false, e.g. OPTIMIZE) are allowed,
-        // matching Spark's `if (removes.exists(_.dataChange)) assertRemovable(snapshot)`. Fail-closed before
-        // any write (mirrors EnsureWritable's placement) — a concurrent delta.appendOnly toggle aborts this
-        // commit via MetadataChanged, so a single pre-loop evaluation on the read snapshot is sufficient.
-        AppendOnlyFeature.EnsureCommitAllowed(readSnapshot.Metadata.Configuration, actions);
-
         // Idempotency via txn (§2.11.4): if this commit records application transactions whose versions the
         // read snapshot already reflects (snapshot.txn[appId] >= version), the batch already committed —
         // report success without re-writing, so a streaming/micro-batch retry that re-reads a fresh snapshot
@@ -279,11 +265,27 @@ internal sealed class DeltaCommitter
         switch (ClassifyTxnCoverage(actions, readSnapshot.Transactions))
         {
             case TxnCoverage.All:
+                // Already-committed idempotent retry — a no-op skip. Must NOT re-evaluate append-only: the
+                // batch already landed (legitimately, when it was accepted), so a table that has SINCE become
+                // append-only must still skip the replay, not raise AppendOnlyViolation (§2.11.4 idempotency).
                 return Succeed(activity, startTimestamp, new DeltaCommitResult(readSnapshot.Version, Attempts: 0, Skipped: true));
             case TxnCoverage.Partial:
                 throw PartialConflict(activity, startTimestamp, actions, readSnapshot.Transactions, attempts: 0);
             case TxnCoverage.None:
-                break; // no idempotency key covered — proceed to write.
+                // A genuinely new commit (no idempotency key covered). Append-only enforcement (Delta
+                // "Append-only Tables"; #549) runs HERE — after protocol negotiation (EnsureWritable keeps
+                // precedence) and the idempotency skip, but before any write, and inside CommitAsync's
+                // telemetry try so a rejection records the fail-closed terminal (the DeltaProtocolException
+                // catch) like the sibling EnsureWritable rejection. It refuses a commit that DELETEs OR CHANGEs
+                // committed data (a remove with dataChange=true — DELETE/OVERWRITE) on a delta.appendOnly=true
+                // table, regardless of read scope; compaction removes (dataChange=false, e.g. OPTIMIZE) are
+                // allowed, matching Spark's `if (removes.exists(_.dataChange)) assertRemovable(snapshot)`.
+                // Keyed off the read snapshot's own metadata (Spark's IS_APPEND_ONLY.fromMetaData), covering a
+                // legacy writer-2 appendOnly table and a writer-7 table that enumerates the feature alike. A
+                // concurrent delta.appendOnly toggle aborts this commit via MetadataChanged, so a single
+                // evaluation on the read snapshot is sufficient.
+                AppendOnlyFeature.EnsureCommitAllowed(readSnapshot.Metadata.Configuration, actions);
+                break;
         }
 
         (IReadOnlyList<DeltaAction> payload, string nonce) = BuildPayload(actions, _nonceFactory());

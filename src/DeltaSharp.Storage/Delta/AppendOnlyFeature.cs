@@ -38,18 +38,21 @@ internal static class AppendOnlyFeature
 
     /// <summary>
     /// Whether the table is append-only: <c>true</c> when <c>delta.appendOnly</c> is present and
-    /// case-insensitively <c>"true"</c>, <c>false</c> when absent or <c>"false"</c>. A present but
-    /// non-boolean value throws a fail-closed <see cref="DeltaProtocolException"/> — mirroring the Delta
-    /// golden, where <c>IS_APPEND_ONLY.fromMetaData</c> parses via Scala's <c>String.toBoolean</c>, which
-    /// THROWS on any value other than <c>true</c>/<c>false</c> (Spark also rejects a malformed value at SET
-    /// time). This is deliberately STRICTER than the <c>bool.TryParse ⇒ false</c> convention used by the
-    /// optional <b>enable-gate</b> features (<see cref="TypeWideningFeature.IsEnabled"/>,
+    /// case-insensitively exactly <c>"true"</c>, <c>false</c> when absent or exactly <c>"false"</c>. A present
+    /// value that is anything else — including a whitespace-padded <c>" true "</c>/<c>" false "</c> — throws a
+    /// fail-closed <see cref="DeltaProtocolException"/>, mirroring the Delta golden where
+    /// <c>IS_APPEND_ONLY.fromMetaData</c> parses via Scala's <c>String.toBoolean</c>, which matches only the
+    /// exact tokens <c>true</c>/<c>false</c> (no trimming) and THROWS otherwise (Spark also rejects a
+    /// malformed value at SET time). This is deliberately STRICTER than the <c>bool.TryParse ⇒ false</c>
+    /// convention used by the optional <b>enable-gate</b> features (<see cref="TypeWideningFeature.IsEnabled"/>,
     /// <c>DeletionVectorsFeature.IsEnabled</c>): for those an unparseable value safely leaves an OPTIONAL
     /// feature OFF, but here silently coercing a malformed value to <c>false</c> would DROP a data-protection
     /// guarantee (fail <b>open</b>) on a table a foreign engine relies on — the unsafe direction — so a
-    /// malformed value fails <b>closed</b> instead.
+    /// malformed value fails <b>closed</b> instead. (<c>bool.TryParse</c> is NOT used precisely because it
+    /// trims surrounding whitespace, which would fail open on <c>" false "</c>.)
     /// </summary>
-    /// <exception cref="DeltaProtocolException"><c>delta.appendOnly</c> is present but not a valid boolean.</exception>
+    /// <exception cref="DeltaProtocolException"><c>delta.appendOnly</c> is present but not exactly
+    /// <c>"true"</c>/<c>"false"</c> (case-insensitive, untrimmed).</exception>
     public static bool IsEnabled(IReadOnlyDictionary<string, string> configuration)
     {
         ArgumentNullException.ThrowIfNull(configuration);
@@ -58,15 +61,22 @@ internal static class AppendOnlyFeature
             return false;
         }
 
-        if (bool.TryParse(value, out bool enabled))
+        // Exact case-insensitive match (no trimming) — mirrors Scala String.toBoolean, and deliberately
+        // avoids bool.TryParse, which trims and would fail OPEN on a whitespace-padded " false ".
+        if (string.Equals(value, "true", StringComparison.OrdinalIgnoreCase))
         {
-            return enabled;
+            return true;
+        }
+
+        if (string.Equals(value, "false", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
         }
 
         throw DeltaProtocolException.Malformed(
-            $"Table property '{PropertyKey}' has a non-boolean value '{value}'; it must be 'true' or 'false'. "
-            + "Refusing fail-closed rather than silently treating the table as not append-only (a malformed "
-            + "value must not drop the append-only guarantee).");
+            $"Table property '{PropertyKey}' has a non-boolean value '{value}'; it must be exactly 'true' or "
+            + "'false' (case-insensitive, no surrounding whitespace). Refusing fail-closed rather than silently "
+            + "treating the table as not append-only (a malformed value must not drop the append-only guarantee).");
     }
 
     /// <summary>
