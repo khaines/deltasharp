@@ -169,10 +169,19 @@ internal sealed class DeltaCommitter
         // Parquet field_id) but must NEVER write one. Enforce it HERE — the single choke point every commit
         // funnels through — rather than only per-operation, so no commit path (append / overwrite / empty-
         // static-overwrite TRUNCATE / delete / protocol-metadata upgrade, current or future) can bypass it.
-        // Keyed on the read snapshot's own column-mapping mode; DeltaSharp only ever creates name/none tables,
-        // so a legitimate commit is never id mode. Per-operation EnsureWriteSupported calls remain for earlier,
-        // operation-specific error locality; this is the universal backstop.
+        // Two-sided: reject id mode on (a) the read snapshot (writing INTO an existing id-mode table) and
+        // (b) any committed metaData action (AUTHORING an id-mode table via a none/name -> id transition) —
+        // (b) would otherwise slip past (a), whose snapshot is still none/name. DeltaSharp only ever creates
+        // name/none tables, so a legitimate commit is never id mode; this fail-closes a hypothetical future
+        // path. Per-operation EnsureWriteSupported calls remain for earlier, operation-specific error locality.
         ColumnMapping.EnsureWriteSupported(ColumnMapping.ResolveMode(readSnapshot.Metadata.Configuration));
+        foreach (DeltaAction action in actions)
+        {
+            if (action is MetadataAction metadataAction)
+            {
+                ColumnMapping.EnsureWriteSupported(ColumnMapping.ResolveMode(metadataAction.Configuration));
+            }
+        }
 
         // A BlindAppend read scope registers no read set, so it performs no data-conflict detection; a
         // commit that *removes* files (a delete/overwrite) must therefore use WholeTable or ReadFiles so a
