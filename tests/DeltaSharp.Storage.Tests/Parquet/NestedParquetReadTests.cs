@@ -347,6 +347,96 @@ public sealed class NestedParquetReadTests
     }
 
     [Fact]
+    public async Task Map_MismatchedValueRepetition_FailsClosed_CorruptData()
+    {
+        // F1 (Critical, red-team): a crafted 3-level map whose VALUE repetition stream disagrees with the
+        // KEY's — same TOTAL entry count (4), different per-row distribution — must fail closed, never
+        // silently mis-pair values across rows/keys. The reader consumes the value child positionally against
+        // the key-driven offsets, so before the fix this decoded WITHOUT error as {10:100,20:200},{30:300,
+        // 40:400} even though the value stream [0,1,1,0] declares row0=3 values / row1=1 value.
+        //   key   rep [0,1,0,1] => row0{k10,k20}, row1{k30,k40}
+        //   value rep [0,1,1,0] => row0 3 values, row1 1 value  (DIVERGENT, equal total)
+        byte[] bytes = await ParquetTestHelpers.WriteIntMapWithRepLevelsAsync(
+            ids: new int?[] { 1, 2 },
+            keys: new int?[] { 10, 20, 30, 40 }, keyRep: new[] { 0, 1, 0, 1 },
+            values: new int?[] { 100, 200, 300, 400 }, valueRep: new[] { 0, 1, 1, 0 });
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "M",
+                DataTypes.CreateMapType(DataTypes.IntegerType, DataTypes.IntegerType, valueContainsNull: true),
+                nullable: true),
+        });
+
+        DeltaStorageException error =
+            await Assert.ThrowsAsync<DeltaStorageException>(() => ReadSingleAsync(bytes, requested));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+        Assert.Contains("repetition levels diverge", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Map_MatchingValueRepetition_DecodesCorrectly()
+    {
+        // F1 regression: a well-formed low-level-authored map (matching key/value reps [0,1,0,1], INCLUDING a
+        // null value) must still decode — the rep-equality guard accepts a valid shared-group repetition
+        // stream, proving it does not false-positive on the same low-level authoring door the crafted test
+        // uses. (Empty-map / null-map coverage is in Map_ReadsEntries_WithEmptyNullMapAndNullValue.)
+        byte[] bytes = await ParquetTestHelpers.WriteIntMapWithRepLevelsAsync(
+            ids: new int?[] { 1, 2 },
+            keys: new int?[] { 10, 20, 30, 40 }, keyRep: new[] { 0, 1, 0, 1 },
+            values: new int?[] { 100, null, 300, 400 }, valueRep: new[] { 0, 1, 0, 1 });
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "M",
+                DataTypes.CreateMapType(DataTypes.IntegerType, DataTypes.IntegerType, valueContainsNull: true),
+                nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSingleAsync(bytes, requested);
+        var m = Assert.IsType<MapColumnVector>(batch.Column("M"));
+
+        Assert.Equal(2, m.EntryLength(0));
+        Assert.Equal(2, m.EntryLength(1));
+
+        Assert.Equal(100, ReadIntMapEntry(m, row: 0, key: 10));
+        Assert.Null(ReadIntMapEntry(m, row: 0, key: 20)); // present key, null value
+        Assert.Equal(300, ReadIntMapEntry(m, row: 1, key: 30));
+        Assert.Equal(400, ReadIntMapEntry(m, row: 1, key: 40));
+    }
+
+    [Fact]
+    public async Task NestedLeafDecodeCeiling_FoldsReconstructedChild_FailsClosed()
+    {
+        // F2 (High, red-team): the eager-decode ceiling must bound the RAW leaf decode PLUS the reconstructed
+        // #570 child ColumnVector, not the raw buffers alone. A list of 7000 nullable ints has an int element
+        // leaf whose raw decode is 7000*(4 value + 4 def + 4 rep) = 84,000 bytes (< the 100,000-byte ceiling)
+        // but whose raw+child is 7000*(12 + 4 value + 1 null-mask) = 119,000 bytes (> the ceiling). Without the
+        // reconstruction fold it would pass; with it, the leaf is rejected before allocation.
+        byte[] bytes = await WriteAsync(new List<ListRow>
+        {
+            new() { Id = 1, Arr = Enumerable.Range(0, 7000).Select(i => (int?)i).ToList() },
+        });
+
+        var requested = new StructType(new[]
+        {
+            new StructField("Arr", DataTypes.CreateArrayType(DataTypes.IntegerType, containsNull: true), nullable: true),
+        });
+        var reader = new ParquetFileReader(new ParquetDecodeLimits(maxRowGroupDecodedBytes: 100_000));
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => EnumerateAsync(reader, bytes, requested));
+
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+        // The LeafNumValues (per-leaf) guard fired — not the flat EnsureDecodeCeiling — proving the fold is in
+        // the leaf ceiling: its message names the leaf and the raw+reconstruction overrun.
+        Assert.Contains("Nested leaf", error.Message, StringComparison.Ordinal);
+        Assert.Contains("eager decode would exceed", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task ArrayOfStruct_FailsClosed_UnsupportedFeature()
     {
         // A nested type within a nested type (array-of-struct) is out of scope for #571: it must be rejected
@@ -859,6 +949,24 @@ public sealed class NestedParquetReadTests
         }
 
         return result;
+    }
+
+    // Reads the value for <paramref name="key"/> in an int→int map row (null when the value cell is null),
+    // asserting the key is present. Map entry ordering is not part of the contract, so the entry is located
+    // by key rather than by position.
+    private static int? ReadIntMapEntry(MapColumnVector map, int row, int key)
+    {
+        ColumnVector keys = map.KeysAt(row);
+        ColumnVector values = map.ValuesAt(row);
+        for (int i = 0; i < map.EntryLength(row); i++)
+        {
+            if (keys.GetValue<int>(i) == key)
+            {
+                return values.IsNull(i) ? null : values.GetValue<int>(i);
+            }
+        }
+
+        throw new KeyNotFoundException($"key {key} not found in map row {row}");
     }
 
     private static string Utf8(ColumnVector vector, int index) => Encoding.UTF8.GetString(vector.GetBytes(index));

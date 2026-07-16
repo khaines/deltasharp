@@ -26,6 +26,37 @@ internal static class ParquetTestHelpers
         return stream.ToArray();
     }
 
+    /// <summary>Authors an int→int map Parquet file at the LOW level, writing the key and value leaves with
+    /// caller-supplied repetition levels — the only way to forge a map whose value repetition stream diverges
+    /// from the key's (same total entry count, different per-row distribution), which the typed
+    /// <c>ParquetSerializer</c> can never emit (it shares the one <c>key_value</c> group, so key/value reps are
+    /// always identical). Definition levels are DERIVED from the nullable value arrays (present vs null), so
+    /// this helper authors only maps whose every row has ≥1 present entry (no empty/null-map rows — those are
+    /// covered by the serializer-based tests). Used to prove the reader rejects a cross-row value mis-pairing
+    /// (F1) yet still accepts a well-formed matching stream.</summary>
+    public static async Task<byte[]> WriteIntMapWithRepLevelsAsync(
+        int?[] ids, int?[] keys, int[] keyRep, int?[] values, int[] valueRep)
+    {
+        var mapField = new global::Parquet.Schema.MapField(
+            "M",
+            new global::Parquet.Schema.DataField<int>("key"),
+            new global::Parquet.Schema.DataField<int?>("value"));
+        var schema = new global::Parquet.Schema.ParquetSchema(
+            new global::Parquet.Schema.DataField<int>("Id"), mapField);
+        global::Parquet.Schema.DataField[] leaves = schema.GetDataFields();
+
+        using var stream = new MemoryStream();
+        await using (ParquetWriter writer = await ParquetWriter.CreateAsync(schema, stream))
+        {
+            using ParquetRowGroupWriter rowGroup = writer.CreateRowGroup();
+            await rowGroup.WriteAsync<int>(leaves[0], new ReadOnlyMemory<int?>(ids), null, null, CancellationToken.None);
+            await rowGroup.WriteAsync<int>(leaves[1], new ReadOnlyMemory<int?>(keys), keyRep, null, CancellationToken.None);
+            await rowGroup.WriteAsync<int>(leaves[2], new ReadOnlyMemory<int?>(values), valueRep, null, CancellationToken.None);
+        }
+
+        return stream.ToArray();
+    }
+
     /// <summary>Reads all row-group batches through <see cref="ParquetFileReader"/>.</summary>
     public static async Task<List<ColumnBatch>> ReadAllAsync(
         byte[] bytes,

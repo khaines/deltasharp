@@ -274,10 +274,22 @@ internal static class NestedParquetColumnReader
             .ConfigureAwait(false);
 
         // The value child is parallel to the key child: driven by the SAME present floor, its own definition
-        // levels distinguish a present-but-null value from a real value.
-        (MutableColumnVector values, _, _, _) = await ReadScalarLeafAsync(
+        // levels distinguish a present-but-null value from a real value. Capture the value repetition stream
+        // (F1): a well-formed 3-level map nests the key and value in the SAME repeated key_value group, so
+        // their repetition levels are identical element-by-element.
+        (MutableColumnVector values, _, int[]? valueRep, _) = await ReadScalarLeafAsync(
             rowGroup, valueLeaf, requested.ValueType, presentFloor: mapMaxDef, limits, cancellationToken)
             .ConfigureAwait(false);
+
+        // F1: the value child is consumed positionally against the KEY-driven entry structure (offsets/nulls
+        // below come from the key leaf alone). If a crafted/corrupt file gave the value a divergent per-entry
+        // distribution — a different repetition stream at the SAME total count — the positional pairing would
+        // silently mis-assign values across rows/keys (a WRONG, not merely failed, read). Reject any rep
+        // divergence BEFORE reconstructing. Only REP is validated: definition levels legitimately differ (a
+        // value may be null where the required key is present), and the value's own def still distinguishes
+        // null values during the leaf's own reconstruction.
+        ValidateParallelRepetition(keyRep, valueRep, columnName);
+
         if (keys.Length != values.Length)
         {
             throw DeltaStorageException.CorruptData(
@@ -570,6 +582,42 @@ internal static class NestedParquetColumnReader
         }
     }
 
+    // Validates that a map's key and value leaves share an IDENTICAL repetition-level stream — the structural
+    // contract of a well-formed 3-level Parquet map, whose key and value live in the SAME repeated key_value
+    // group and therefore repeat in lockstep. The reader consumes the value child positionally against the
+    // key-driven entry structure, so a value stream with a different per-entry distribution (even at the same
+    // total count) would silently mis-pair values across rows/keys — fail closed instead (F1). Only REPETITION
+    // is compared: definition levels legitimately differ (an optional value may be null where the required key
+    // is present). Internal so the guard can be pinned by a direct unit test as well as through the read door.
+    internal static void ValidateParallelRepetition(int[]? keyRep, int[]? valueRep, string columnName)
+    {
+        int keyLen = keyRep?.Length ?? 0;
+        int valueLen = valueRep?.Length ?? 0;
+        if (keyLen != valueLen)
+        {
+            throw DeltaStorageException.CorruptData(
+                $"Map column '{columnName}' key and value leaves carry {keyLen} and {valueLen} repetition "
+                + "level(s); a well-formed map shares one repeated group, so they must be equal.");
+        }
+
+        if (keyRep is null || valueRep is null)
+        {
+            // Both null (a degenerate non-repeated map, impossible for a real MapField whose leaves have a
+            // max repetition level >= 1) — vacuously parallel.
+            return;
+        }
+
+        for (int i = 0; i < keyLen; i++)
+        {
+            if (keyRep[i] != valueRep[i])
+            {
+                throw DeltaStorageException.CorruptData(
+                    $"Map column '{columnName}' key and value repetition levels diverge at slot {i} "
+                    + $"({keyRep[i]} vs {valueRep[i]}); the value stream would mis-pair entries across rows.");
+            }
+        }
+    }
+
     // The leaf's declared value count, bounded against the eager-decode ceiling BEFORE the values/level
     // buffers are allocated so a crafted NumValues cannot drive an out-of-memory allocation. Unlike the flat
     // path (one value per row, bounded by the row count), a repeated leaf can declare more values than rows,
@@ -588,7 +636,14 @@ internal static class NestedParquetColumnReader
 
         long perSlotBytes = elementWidth
             + (leaf.MaxDefinitionLevel > 0 ? sizeof(int) : 0)
-            + (leaf.MaxRepetitionLevel > 0 ? sizeof(int) : 0);
+            + (leaf.MaxRepetitionLevel > 0 ? sizeof(int) : 0)
+            // F2: fold in the reconstructed #570 child ColumnVector each leaf materializes AFTER the raw
+            // decode — it holds up to numValues values (elementWidth each) plus a per-value null-mask slot.
+            // Without this term a leaf whose RAW decode fits the ceiling could still overshoot it by
+            // ~elementWidth per value during reconstruction, so the ceiling would not bound the true peak.
+            // Charge a full null-mask byte per value (>= the bitmap's actual per-value bit) to never
+            // under-count; the default 4 GiB ceiling stays harmless for real row groups.
+            + elementWidth + 1;
         if (perSlotBytes > 0 && numValues > limits.MaxRowGroupDecodedBytes / perSlotBytes)
         {
             throw DeltaStorageException.CorruptData(
