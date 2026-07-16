@@ -69,8 +69,12 @@ public abstract class ColumnBatch
     /// Kernels enumerate it over <c>[0, LogicalRowCount)</c> without selection bookkeeping. Each
     /// call rebuilds a fresh selected view (a small allocation plus a one-time null count), so a
     /// kernel that touches one column repeatedly should hoist the view once, not re-call per row.
+    /// A <b>nested</b> column (struct/list/map) does not yet support row gather, so with a selection
+    /// present this throws <see cref="NotSupportedException"/> (#570 defers gathered nested Select to
+    /// #546) rather than returning a partial view; slice a contiguous sub-range instead.
     /// </summary>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="ordinal"/> is outside <c>[0, ColumnCount)</c>.</exception>
+    /// <exception cref="NotSupportedException">A <see cref="Selection"/> is present and the column is a nested (struct/list/map) vector.</exception>
     public ColumnVector SelectedColumn(int ordinal) =>
         Selection is { } selection ? Column(ordinal).Select(selection) : Column(ordinal);
 }

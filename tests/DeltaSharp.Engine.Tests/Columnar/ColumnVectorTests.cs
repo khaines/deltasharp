@@ -121,10 +121,17 @@ public class ColumnVectorTests
     }
 
     [Fact]
-    public void NullType_AndNestedTypes_HaveNoManagedVector()
+    public void NullType_HasNoManagedVector_ButNestedTypesDo()
     {
+        // NullType remains unrepresentable; nested types now build the reference nested vectors
+        // (#570) instead of throwing.
         Assert.Throws<UnsupportedTypeException>(() => ColumnVectors.Create(NullType.Instance, 1));
-        Assert.Throws<UnsupportedTypeException>(() => ColumnVectors.Create(new ArrayType(IntegerType.Instance), 1));
+
+        Assert.IsType<ListColumnVector>(ColumnVectors.Create(new ArrayType(IntegerType.Instance), 1));
+        Assert.IsType<StructColumnVector>(ColumnVectors.Create(
+            new StructType(new[] { new StructField("f", IntegerType.Instance) }), 1));
+        Assert.IsType<MapColumnVector>(ColumnVectors.Create(
+            new MapType(StringType.Instance, IntegerType.Instance), 1));
     }
 
     [Fact]
