@@ -146,21 +146,24 @@ internal sealed class ParquetFileReader
         ArgumentNullException.ThrowIfNull(input);
         ArgumentNullException.ThrowIfNull(requested);
 
-        // Validate every requested column maps to a supported Parquet type BEFORE any decode, so an
-        // unsupported/nested projection fails deterministically without materializing a partial batch.
+        // Validate every requested column maps to a supported Parquet read shape BEFORE any decode, so an
+        // unsupported projection fails deterministically without materializing a partial batch. Beyond the
+        // scalar mappings, the reader decodes the three single-level nested shapes (#571: struct-of-scalar,
+        // array-of-scalar, map-of-scalar); anything nested further fails closed here.
         for (int c = 0; c < requested.Count; c++)
         {
-            _ = ParquetTypeMapping.CreateField(requested[c]);
+            ParquetTypeMapping.EnsureReadSupported(requested[c]);
         }
 
         ParquetReader reader = await OpenAsync(input, cancellationToken).ConfigureAwait(false);
         await using (reader.ConfigureAwait(false))
         {
             // Structural validation happens here (footer read at open) — schema/type mismatches fail
-            // before any batch is yielded (H3). A null slot marks a requested column absent from the file
-            // that will be null-filled (nullFillMissingColumns; #497).
+            // before any batch is yielded (H3). An Absent slot marks a requested column not present in the
+            // file that will be null-filled (nullFillMissingColumns; #497); a Nested slot carries the
+            // resolved nested Field graph (#571).
             IReadOnlyDictionary<int, DataField>? byFieldId = resolveByFieldId ? BuildFieldIdMap(reader) : null;
-            DataField?[] fileFields = ResolveFileFields(
+            ResolvedColumn[] fileFields = ResolveFileFields(
                 reader.Schema, requested, nullFillMissingColumns, allowTypeWideningPromotion, byFieldId);
             for (int group = 0; group < reader.RowGroupCount; group++)
             {
@@ -398,15 +401,19 @@ internal sealed class ParquetFileReader
     // contributes a zero decompressed footprint, which EnsureDecodeCeiling rejects fail-closed for a
     // non-empty row group (guard (0)): a present column with rows always declares a positive decompressed
     // size, so a zero is a stripped/absent footer whose real pages would still decode unbounded (§5.4). A
-    // requested column ABSENT from the file (null slot; #497 null-fill) is marked Absent so it skips the
-    // decompression guards but keeps its element width for the (iii) null-fill allocation bound.
+    // requested column ABSENT from the file (#497 null-fill) is marked Absent so it skips the decompression
+    // guards but keeps its element width for the (iii) null-fill allocation bound. A NESTED column (#571)
+    // contributes one footprint per leaf: each leaf's declared compressed/decompressed bytes feed the
+    // decompression-ratio and absolute-size guards; the eager per-leaf allocation itself is bounded
+    // separately (by the leaf's declared value count) inside NestedParquetColumnReader.
     private static List<ColumnChunkFootprint> ProjectedFootprints(
-        ParquetRowGroupReader rowGroup, StructType requested, DataField?[] fileFields)
+        ParquetRowGroupReader rowGroup, StructType requested, ResolvedColumn[] fileFields)
     {
         var footprints = new List<ColumnChunkFootprint>(requested.Count);
         for (int c = 0; c < requested.Count; c++)
         {
-            if (fileFields[c] is not { } fileField)
+            ResolvedColumn resolved = fileFields[c];
+            if (resolved.IsAbsent)
             {
                 footprints.Add(
                     new ColumnChunkFootprint(
@@ -417,18 +424,26 @@ internal sealed class ParquetFileReader
                 continue;
             }
 
-            long compressed = 0;
-            long uncompressed = 0;
-            if (rowGroup.ColumnExists(fileField))
+            if (resolved.Nested is { } nestedField)
             {
-                global::Parquet.Meta.ColumnMetaData? meta = rowGroup.GetMetadata(fileField)?.MetaData;
-                if (meta is not null)
+                var leaves = new List<DataField>();
+                NestedParquetColumnReader.CollectLeafFields(nestedField, leaves);
+                foreach (DataField leaf in leaves)
                 {
-                    compressed = meta.TotalCompressedSize;
-                    uncompressed = meta.TotalUncompressedSize;
+                    (long leafCompressed, long leafUncompressed) = ChunkBytes(rowGroup, leaf);
+
+                    // ElementBytes 0 skips the (iii) per-row width bound (a repeated leaf can hold more values
+                    // than there are rows, so that bound does not apply); the leaf's transient allocation is
+                    // bounded by its declared value count in NestedParquetColumnReader instead. The declared
+                    // bytes still feed the (0)/(i)/(ii) decompression/absolute guards.
+                    footprints.Add(new ColumnChunkFootprint(leafCompressed, leafUncompressed, ElementBytes: 0));
                 }
+
+                continue;
             }
 
+            DataField fileField = resolved.Scalar!;
+            (long compressed, long uncompressed) = ChunkBytes(rowGroup, fileField);
             footprints.Add(
                 new ColumnChunkFootprint(
                     compressed,
@@ -442,6 +457,22 @@ internal sealed class ParquetFileReader
         }
 
         return footprints;
+    }
+
+    // The declared (compressed, decompressed) bytes of a column chunk, or (0, 0) when the chunk is absent or
+    // its metadata is missing/encrypted — a zero the (0) guard rejects fail-closed for a non-empty row group.
+    private static (long Compressed, long Uncompressed) ChunkBytes(ParquetRowGroupReader rowGroup, DataField field)
+    {
+        if (rowGroup.ColumnExists(field))
+        {
+            global::Parquet.Meta.ColumnMetaData? meta = rowGroup.GetMetadata(field)?.MetaData;
+            if (meta is not null)
+            {
+                return (meta.TotalCompressedSize, meta.TotalUncompressedSize);
+            }
+        }
+
+        return (0, 0);
     }
 
     // The per-row byte width of the read buffer the reader eagerly allocates for a column — used only to
@@ -478,30 +509,83 @@ internal sealed class ParquetFileReader
         }
     }
 
-    // Resolves each requested column to the matching file DataField (validating physical type/nullability),
-    // or a null slot for a column ABSENT from the file when it may be null-filled (#497). A null slot is
-    // produced ONLY when nullFillMissingColumns is set AND the requested column is nullable: an
-    // additively-added column (#190) is always nullable, and older files written before it lack it, so it
-    // reads back as all-null. An absent NON-nullable column can never be null-filled (a required lane cannot
-    // carry null), and an absent column with null-fill disabled preserves the strict projection contract —
-    // both fail closed with the dedicated ColumnNotPresentInFile kind the OPTIMIZE/read guards match on
-    // (#513). A PRESENT column with a disagreeing physical type/nullability is still rejected by
-    // ValidateFileField as a distinct SchemaMismatch (never silently coerced or null-filled).
-    private static DataField?[] ResolveFileFields(
+    // One requested column resolved against the file: a present scalar leaf (Scalar), a present nested Field
+    // graph (Nested; #571), or Absent (not in the file, to be null-filled per #497). Exactly one state holds.
+    internal readonly struct ResolvedColumn
+    {
+        private ResolvedColumn(DataField? scalar, Field? nested, bool absent)
+        {
+            Scalar = scalar;
+            Nested = nested;
+            IsAbsent = absent;
+        }
+
+        internal DataField? Scalar { get; }
+
+        internal Field? Nested { get; }
+
+        internal bool IsAbsent { get; }
+
+        internal bool IsNested => Nested is not null;
+
+        internal static ResolvedColumn ForScalar(DataField field) => new(field, null, absent: false);
+
+        internal static ResolvedColumn ForNested(Field field) => new(null, field, absent: false);
+
+        internal static ResolvedColumn Missing() => new(null, null, absent: true);
+    }
+
+    // Resolves each requested column to the matching file field (validating physical type/nullability for a
+    // scalar, or the container shape for a nested column; #571), or an Absent slot for a column not present in
+    // the file when it may be null-filled (#497). An Absent slot is produced ONLY when nullFillMissingColumns
+    // is set AND the requested column is nullable: an additively-added column (#190) is always nullable, and
+    // older files written before it lack it, so it reads back as all-null. An absent NON-nullable column can
+    // never be null-filled (a required lane cannot carry null), and an absent column with null-fill disabled
+    // preserves the strict projection contract — both fail closed with the dedicated ColumnNotPresentInFile
+    // kind the OPTIMIZE/read guards match on (#513). A PRESENT column with a disagreeing physical
+    // type/nullability/shape is still rejected (ValidateFileField / NestedParquetColumnReader.ValidateShape)
+    // as a distinct SchemaMismatch (never silently coerced or null-filled).
+    //
+    // The by-name map is built from the file schema's TOP-LEVEL fields (not the flattened leaves), so a nested
+    // column resolves to its container Field. For a flat file the top-level fields ARE the leaf DataFields, so
+    // the scalar path is unchanged. Nested columns are not (yet) supported under column-mapping id mode or
+    // null-fill: both fail closed rather than risk a wrong read.
+    private static ResolvedColumn[] ResolveFileFields(
         ParquetSchema fileSchema, StructType requested, bool nullFillMissingColumns, bool allowTypeWideningPromotion,
         IReadOnlyDictionary<int, DataField>? byFieldId)
     {
-        var byName = new Dictionary<string, DataField>(StringComparer.Ordinal);
-        foreach (DataField field in fileSchema.DataFields)
+        var byName = new Dictionary<string, Field>(StringComparer.Ordinal);
+        foreach (Field field in fileSchema.Fields)
         {
             byName[field.Name] = field;
         }
 
-        var resolved = new DataField?[requested.Count];
+        var resolved = new ResolvedColumn[requested.Count];
         for (int c = 0; c < requested.Count; c++)
         {
             StructField requestedField = requested[c];
             string name = requestedField.Name;
+
+            if (requestedField.DataType is ArrayType or MapType or StructType)
+            {
+                // Nested column (#571). Not supported under id mode (BuildFieldIdMap is flat/leaf-only) — fail
+                // closed rather than resolve a nested container by an ambiguous leaf field_id.
+                if (byFieldId is not null)
+                {
+                    throw DeltaStorageException.UnsupportedFeature(
+                        $"Column '{name}': reading a nested column under column-mapping id mode is not supported.");
+                }
+
+                if (!byName.TryGetValue(name, out Field? nestedField))
+                {
+                    // A nested column absent from the file is not null-filled in this increment (fail closed).
+                    throw DeltaStorageException.ColumnNotPresentInFile(name);
+                }
+
+                NestedParquetColumnReader.ValidateShape(nestedField, requestedField.DataType, name);
+                resolved[c] = ResolvedColumn.ForNested(nestedField);
+                continue;
+            }
 
             // id mode (#523): resolve by the requested column's delta.columnMapping.id against the file's
             // footer field_ids (BuildFieldIdMap), not by physical name — so a logical rename that never
@@ -514,18 +598,28 @@ internal sealed class ParquetFileReader
                     && id is >= 0 and <= int.MaxValue
                     && byFieldId.TryGetValue((int)id, out field);
             }
+            else if (byName.TryGetValue(name, out Field? candidate))
+            {
+                // A scalar column resolves to a leaf DataField. If the file column with this name is itself
+                // nested, the requested scalar type genuinely disagrees with the file — a SchemaMismatch.
+                field = candidate as DataField
+                    ?? throw DeltaStorageException.SchemaMismatch(
+                        $"Column '{name}': the requested type '{requestedField.DataType.SimpleString}' is scalar "
+                        + "but the file column is nested.");
+                present = true;
+            }
             else
             {
-                present = byName.TryGetValue(name, out field);
+                present = false;
             }
 
             if (!present)
             {
                 if (nullFillMissingColumns && requestedField.Nullable)
                 {
-                    // Absent + nullable + null-fill enabled: a null slot the read path materializes as an
+                    // Absent + nullable + null-fill enabled: an Absent slot the read path materializes as an
                     // all-null column (evolved-column read null-fill, #497).
-                    resolved[c] = null;
+                    resolved[c] = ResolvedColumn.Missing();
                     continue;
                 }
 
@@ -533,7 +627,7 @@ internal sealed class ParquetFileReader
             }
 
             ValidateFileField(field!, requestedField, allowTypeWideningPromotion);
-            resolved[c] = field;
+            resolved[c] = ResolvedColumn.ForScalar(field!);
         }
 
         return resolved;
@@ -649,7 +743,7 @@ internal sealed class ParquetFileReader
         ParquetReader reader,
         int group,
         StructType requested,
-        DataField?[] fileFields,
+        ResolvedColumn[] fileFields,
         RowGroupPredicate? keepRowGroup,
         ParquetDecodeLimits limits,
         bool allowTypeWideningPromotion,
@@ -688,8 +782,19 @@ internal sealed class ParquetFileReader
         {
             for (int c = 0; c < requested.Count; c++)
             {
+                ResolvedColumn resolved = fileFields[c];
+                if (resolved.Nested is { } nestedField)
+                {
+                    // Nested column (#571): reconstruct an immutable nested vector from the raw Dremel levels.
+                    // NestedParquetColumnReader owns its own allocation ceiling and null-correct reassembly.
+                    columns[c] = await NestedParquetColumnReader.ReadAsync(
+                        rowGroup, nestedField, requested[c].DataType, rowCount, requested[c].Name, limits, cancellationToken)
+                        .ConfigureAwait(false);
+                    continue;
+                }
+
                 MutableColumnVector vector = ColumnVectors.Create(requested[c].DataType, Math.Max(rowCount, 1));
-                if (fileFields[c] is { } fileField)
+                if (resolved.Scalar is { } fileField)
                 {
                     await ReadColumnAsync(rowGroup, fileField, requested[c], vector, rowCount, allowTypeWideningPromotion, cancellationToken)
                         .ConfigureAwait(false);
@@ -1166,16 +1271,17 @@ internal sealed class ParquetFileReader
     {
         private readonly Dictionary<string, ColumnEntry> _byColumn;
 
-        internal RowGroupStatistics(ParquetRowGroupReader rowGroup, StructType requested, DataField?[] fileFields)
+        internal RowGroupStatistics(ParquetRowGroupReader rowGroup, StructType requested, ResolvedColumn[] fileFields)
         {
             RowCount = rowGroup.RowCount;
             _byColumn = new Dictionary<string, ColumnEntry>(StringComparer.Ordinal);
             for (int c = 0; c < requested.Count; c++)
             {
-                // A column absent from the file (null slot; #497 null-fill) carries no statistics, so pruning
-                // on it always returns "cannot prune" — an all-null column has no useful bounds anyway.
+                // A column absent from the file (#497 null-fill) or NESTED (#571) carries no scalar statistics
+                // here, so pruning on it always returns "cannot prune" — an all-null column has no useful
+                // bounds, and nested min/max pruning is not modeled in this increment.
                 DataColumnStatistics? statistics =
-                    fileFields[c] is { } fileField && rowGroup.ColumnExists(fileField)
+                    fileFields[c].Scalar is { } fileField && rowGroup.ColumnExists(fileField)
                         ? rowGroup.GetStatistics(fileField)
                         : null;
                 _byColumn[requested[c].Name] = new ColumnEntry(requested[c].DataType, statistics);

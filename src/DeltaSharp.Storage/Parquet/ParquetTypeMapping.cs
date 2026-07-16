@@ -106,6 +106,63 @@ internal static class ParquetTypeMapping
     }
 
     /// <summary>
+    /// Validates that a requested read column is a shape the <see cref="ParquetFileReader"/> can decode,
+    /// throwing <see cref="StorageErrorKind.UnsupportedFeature"/> otherwise — BEFORE any row group is
+    /// decoded, so an unsupported projection fails deterministically without materializing a partial batch.
+    /// Beyond the scalar mappings <see cref="CreateField"/> accepts, the reader also decodes the three
+    /// single-level nested shapes (#571): a <b>struct of scalars</b>, an <b>array of a scalar</b>, and a
+    /// <b>map of scalar→scalar</b>. Any nested type nested WITHIN one of those (array-of-struct, struct-of-
+    /// list, map-of-map, …) is deliberately <b>not</b> in this increment and fails closed here rather than
+    /// producing a partial/wrong read — Spark-parity fail-closed behavior. This does not widen the
+    /// <b>writer</b>: <see cref="CreateField"/> still rejects every nested type (the writer stays scalar-only).
+    /// </summary>
+    /// <exception cref="DeltaStorageException">The requested column's type (or a nested leaf type) has no
+    /// supported Parquet read mapping (<see cref="StorageErrorKind.UnsupportedFeature"/>).</exception>
+    public static void EnsureReadSupported(StructField field)
+    {
+        ArgumentNullException.ThrowIfNull(field);
+        switch (field.DataType)
+        {
+            case ArrayType array:
+                EnsureScalarReadable(array.ElementType, $"array column '{field.Name}' element");
+                break;
+            case MapType map:
+                EnsureScalarReadable(map.KeyType, $"map column '{field.Name}' key");
+                EnsureScalarReadable(map.ValueType, $"map column '{field.Name}' value");
+                break;
+            case StructType structType:
+                foreach (StructField nested in structType)
+                {
+                    EnsureScalarReadable(nested.DataType, $"struct column '{field.Name}' field '{nested.Name}'");
+                }
+
+                break;
+            default:
+                // Scalar (or unsupported scalar/void/decimal>28): the exact same validation the write path
+                // uses. A nested type never reaches here (handled above), so this only rejects unsupported
+                // scalars. Also stamps/validates any column-mapping id, preserving the prior read behavior.
+                _ = CreateField(field);
+                break;
+        }
+    }
+
+    // A requested nested LEAF type (array element, map key/value, or struct field) must itself be a supported
+    // SCALAR — a nested-within-nested leaf fails closed (#571 scopes only single-level nesting). Reuses
+    // CreateField's scalar validation (rejecting void and decimal precision > 28) so the read path accepts
+    // exactly the scalars the write path can round-trip.
+    private static void EnsureScalarReadable(DataType type, string context)
+    {
+        if (type is ArrayType or MapType or StructType)
+        {
+            throw DeltaStorageException.UnsupportedFeature(
+                $"Parquet read for {context}: a nested type within a nested type ('{type.SimpleString}') is "
+                + "not supported.");
+        }
+
+        _ = CreateField(new StructField("_leaf", type, nullable: true));
+    }
+
+    /// <summary>
     /// Reconstructs the DeltaSharp <see cref="DataType"/> a Parquet footer <see cref="DataField"/> encodes —
     /// the inverse of <see cref="CreateField"/>. Used by the write-door to derive the <b>actual physical data
     /// schema a staged file was written with</b> (read back from its footer) so schema enforcement gates the
