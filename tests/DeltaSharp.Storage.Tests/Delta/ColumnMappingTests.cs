@@ -523,7 +523,7 @@ public sealed class ColumnMappingTests : IDisposable
         using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
             _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), FileNames()))
         {
-            await Assert.ThrowsAnyAsync<Exception>(() => target.OverwriteAsync(
+            await Assert.ThrowsAsync<DeltaProtocolException>(() => target.OverwriteAsync(
                 logical, Array.Empty<string>(), Array.Empty<ColumnBatch>(),
                 DeltaPartitionOverwriteMode.Static, overwriteSchema: false, CancellationToken.None));
         }
@@ -682,6 +682,30 @@ public sealed class ColumnMappingTests : IDisposable
         using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
         DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
         await Assert.ThrowsAnyAsync<Exception>(() => source.ReadBatchesAsync(info.Version));
+    }
+
+    [Fact]
+    public async Task IdMode_RequestedIdAboveInt32Max_IsRejectedFailClosed()
+    {
+        // LOW fix (Reliability F4): a requested delta.columnMapping.id > int.MaxValue is outside the Parquet
+        // footer field_id (int32) domain. It is rejected FAIL-CLOSED at ParquetTypeMapping.CreateField (which
+        // guards the long->int32 cast) — never silently truncated to int32. Here id = 2^32 + 1 casts to
+        // (int)1, which WOULD collide with the file's real field_id = 1 if the cast were left unguarded; the
+        // guard rejects it loudly instead of misresolving "evil" onto column "id"'s data.
+        const long overflowId = 4294967297L; // 2^32 + 1  =>  unchecked (int)overflowId == 1
+        string schemaJson = "{\"type\":\"struct\",\"fields\":["
+            + IdField("id", "long", false, 1, PhysId) + "," + IdField("evil", "long", true, overflowId, PhysScore) + "]}";
+        var physicalSchema = new StructType(new[] { PhysFieldWithId("d", DataTypes.LongType, nullable: false, id: 1) });
+        MutableColumnVector d = ColumnVectors.Create(DataTypes.LongType, 1);
+        d.AppendValue(5L);
+        var batch = new ManagedColumnBatch(physicalSchema, new ColumnVector[] { d }, 1);
+        await SeedIdModeTableAsync(schemaJson, maxColumnId: overflowId, physicalSchema, batch);
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            () => source.ReadBatchesAsync(info.Version));
+        Assert.Contains("outside the Parquet field_id range", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]

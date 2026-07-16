@@ -164,7 +164,7 @@ public sealed class DeltaDeleteColumnMappingTests : IDisposable
     // ------------------------------------------------------------------ id mode: fail closed (#523)
 
     [Fact]
-    public async Task Delete_IdMode_FailsClosed_DeferredTo523()
+    public async Task Delete_IdMode_FailsClosed_Since523()
     {
         // END-TO-END fail-closed: a raw id-mode table declaring the deletionVectors + columnMapping features.
         // Since #523 an id-mode table is READABLE (columns resolved by Parquet field_id), so it LOADS; a DELETE
@@ -339,8 +339,9 @@ public sealed class DeltaDeleteColumnMappingTests : IDisposable
             schema, partitionColumns, batches, new SeededPhysicalNameSource(Seed));
     }
 
-    // Writes a raw version-0 log for an id-mode column-mapped, DV-enabled table (no data files needed — the
-    // DELETE must fail closed at/near snapshot load before any file is scanned).
+    // Writes a raw version-0 log for an id-mode column-mapped, DV-enabled table (no data files needed — since
+    // #523 the id-mode table LOADS, so the DELETE must fail closed at the id-write gate before any file is
+    // scanned).
     private async Task WriteRawIdModeTableAsync()
     {
         using var backend = new LocalFileSystemBackend(_root);
@@ -360,9 +361,10 @@ public sealed class DeltaDeleteColumnMappingTests : IDisposable
     }
 
     // A column-mapped, DV-enabled snapshot constructed DIRECTLY (not via DeltaLog.LoadSnapshotAsync), so it
-    // deliberately BYPASSES the snapshot-load column-mapping gate (ColumnMapping.EnsureModeGate). This lets a
-    // test reach DeltaDelete's OWN defense-in-depth guard with a mode the primary gate would otherwise have
-    // rejected at load. No data files are needed — the DELETE fails closed before any file is scanned.
+    // deliberately BYPASSES the snapshot-load path (ColumnMapping.EnsureModeGate). For id mode the load gate
+    // now PERMITS the table (id is readable since #523), so DeltaDelete's OWN write guard is the primary
+    // refusal; this seam pins that guard directly. No data files are needed — the DELETE fails closed before
+    // any file is scanned.
     private static Snapshot BuildUngatedColumnMappingSnapshot(string mode, string schemaString)
     {
         var protocol = new ProtocolAction(

@@ -310,9 +310,9 @@ internal static class ColumnMapping
         }
     }
 
-    // Reads the tracked maxColumnId from a name-mode table's configuration. It is a monotonic writer
-    // invariant that MUST be present and parseable for a name-mode table; a missing/malformed value is an
-    // inconsistent table property rejected fail-closed (never guessed).
+    // Reads the tracked maxColumnId from a column-mapped (name or id) table's configuration. It is a
+    // monotonic writer invariant that MUST be present and parseable for any column-mapped table; a
+    // missing/malformed value is an inconsistent table property rejected fail-closed (never guessed).
     private static long ReadMaxColumnId(IReadOnlyDictionary<string, string> configuration)
     {
         if (!configuration.TryGetValue(MaxColumnIdKey, out string? raw)
@@ -321,7 +321,7 @@ internal static class ColumnMapping
             throw DeltaProtocolException.Inconsistent(
                 string.Create(
                     CultureInfo.InvariantCulture,
-                    $"The table uses column mapping mode 'name' but its '{MaxColumnIdKey}' is missing or "
+                    $"The table uses column mapping but its '{MaxColumnIdKey}' is missing or "
                     + $"not an integer; the schema is inconsistent and cannot be read safely."));
         }
 
@@ -329,9 +329,11 @@ internal static class ColumnMapping
     }
 
     /// <summary>The physical Parquet name of <paramref name="field"/> under <paramref name="mode"/>: the
-    /// declared <c>delta.columnMapping.physicalName</c> in name mode, else the field's own (logical) name.
-    /// A name-mode field missing a physical name is an inconsistent schema — fail closed.</summary>
-    /// <exception cref="DeltaProtocolException">A name-mode field carries no physical name.</exception>
+    /// declared <c>delta.columnMapping.physicalName</c> in <b>both</b> <c>name</c> and <c>id</c> mode, else
+    /// (<c>none</c> mode) the field's own (logical) name. A column-mapped field (name or id) missing a physical
+    /// name is an inconsistent schema — fail closed. (In id mode, DATA columns resolve by <c>field_id</c>, but
+    /// partition-value keys and statistics are still keyed by the physical name.)</summary>
+    /// <exception cref="DeltaProtocolException">A column-mapped field carries no physical name.</exception>
     public static string PhysicalName(StructField field, ColumnMappingMode mode)
     {
         ArgumentNullException.ThrowIfNull(field);
