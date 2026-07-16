@@ -68,6 +68,22 @@ Adopt an **Arrow-compatible custom format, sequenced "Arrow-first":**
   open decision; Arrow's default off-heap 64-byte-aligned allocator is the early
   baseline.
 
+### Nullability enforcement in nested vectors (#570 / #577 — decided)
+
+The nested reference vectors (`StructColumnVector`, `ListColumnVector`, `MapColumnVector`)
+enforce only **structural** type invariants; **flag-based** nullability is treated as
+**advisory**, consistent with DeltaSharp's Spark-parity convention (a null in a non-nullable
+field is *represented*, not rejected — see `LocalRelationBatches`, which encodes a null in a
+non-nullable field as SQL NULL).
+
+- **Enforced (structural):** `MapType` keys are always non-null — the type has no key-null
+  flag — so a null key in the *referenced* offset range fails closed at construction.
+- **Advisory (not enforced):** `MapType.ValueContainsNull=false`, `ArrayType.ContainsNull=false`,
+  and non-nullable struct fields. A null in such a position is represented faithfully. Turning
+  these into hard fail-closed constraints would be a deliberate, **uniform** future change
+  (applied across nested *and* the flat / `createDataFrame` ingestion path), not something the
+  representation layer imposes unilaterally.
+
 ## Alternatives considered
 
 - **Pure Arrow C# as the engine format:** fastest start + best interop, but

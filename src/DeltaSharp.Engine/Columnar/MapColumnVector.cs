@@ -248,10 +248,10 @@ public sealed class MapColumnVector : MutableColumnVector
         CheckRange(offset, length);
 
         // Zero-copy: share both children, offsets, and validity; the window re-bases logical row 0 via
-        // _offset (offsets stay absolute into the shared children). Sealing this builder blocks further
-        // row commits (EndMap/AppendNull) so its offsets/validity are not resized under the view. NOTE:
-        // the shared key/value children are NOT sealed — build fully before slicing (child-seal tracked in #575).
-        _sealed = true;
+        // _offset (offsets stay absolute into the shared children). SealForView() blocks further row
+        // commits (EndMap/AppendNull) so offsets/validity are not resized under the view, AND propagates
+        // the seal to the shared key/value children (#575) so a retained mutable child ref cannot desync it.
+        SealForView();
 
         int absoluteOffset = _offset + offset;
         int nulls = Bitmap.CountNulls(_validity, absoluteOffset, length);
@@ -272,8 +272,14 @@ public sealed class MapColumnVector : MutableColumnVector
             + "representation increment (#570); gathered/late-materialized nested Select is a follow-up (#546). "
             + "Use Slice for a contiguous sub-range or materialize the column.");
 
-    /// <summary>Seals the owner so a selection/slice view shares the buffers safely.</summary>
-    protected override void SealForView() => _sealed = true;
+    /// <summary>Seals this owner and, recursively, its key and value children (#575) so a slice/selection
+    /// view shares the buffers safely — a retained mutable child reference cannot be mutated afterward.</summary>
+    protected override void SealForView()
+    {
+        _sealed = true;
+        _keys.Seal();
+        _values.Seal();
+    }
 
     /// <summary>Not supported: a map has no flat scalar value. Append into <see cref="Keys"/>/<see cref="Values"/>, then <see cref="EndMap"/>.</summary>
     /// <exception cref="InvalidOperationException">Always.</exception>

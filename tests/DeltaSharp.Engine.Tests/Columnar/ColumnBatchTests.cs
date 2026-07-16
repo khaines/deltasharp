@@ -80,4 +80,13 @@ public class ColumnBatchTests
         Assert.Throws<ArgumentException>(() =>
             new ManagedColumnBatch(single, new ColumnVector[] { only }, rowCount: 5)); // length mismatch
     }
+
+    [Fact]
+    public void Slice_OverflowingRange_IsRejected()
+    {
+        // #576: offset+length overflows int; the (long) guard must reject rather than wrap-and-fail-open.
+        (StructType schema, MutableColumnVector ids, MutableColumnVector flags) = BuildColumns(1);
+        var batch = new ManagedColumnBatch(schema, new ColumnVector[] { ids, flags }, rowCount: 1);
+        Assert.Throws<ArgumentOutOfRangeException>(() => batch.Slice(int.MaxValue, 1));
+    }
 }

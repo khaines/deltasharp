@@ -201,10 +201,10 @@ public sealed class ListColumnVector : MutableColumnVector
         CheckRange(offset, length);
 
         // Zero-copy: share the element child, offsets, and validity; the window re-bases logical row 0
-        // via _offset (offsets stay absolute into the shared child). Sealing this builder blocks further
-        // row commits (EndList/AppendNull) so its offsets/validity are not resized under the view. NOTE:
-        // the shared element child is NOT sealed — build fully before slicing (child-seal tracked in #575).
-        _sealed = true;
+        // via _offset (offsets stay absolute into the shared child). SealForView() blocks further row
+        // commits (EndList/AppendNull) so offsets/validity are not resized under the view, AND propagates
+        // the seal to the shared element child (#575) so a retained mutable child ref cannot desync it.
+        SealForView();
 
         int absoluteOffset = _offset + offset;
         int nulls = Bitmap.CountNulls(_validity, absoluteOffset, length);
@@ -225,8 +225,13 @@ public sealed class ListColumnVector : MutableColumnVector
             + "representation increment (#570); gathered/late-materialized nested Select is a follow-up (#546). "
             + "Use Slice for a contiguous sub-range or materialize the column.");
 
-    /// <summary>Seals the owner so a selection/slice view shares the buffers safely.</summary>
-    protected override void SealForView() => _sealed = true;
+    /// <summary>Seals this owner and, recursively, its element child (#575) so a slice/selection view shares
+    /// the buffers safely — a retained mutable child reference cannot be mutated after a view is taken.</summary>
+    protected override void SealForView()
+    {
+        _sealed = true;
+        _child.Seal();
+    }
 
     /// <summary>Not supported: a list has no flat scalar value. Append elements into <see cref="Elements"/>, then <see cref="EndList"/>.</summary>
     /// <exception cref="InvalidOperationException">Always.</exception>
