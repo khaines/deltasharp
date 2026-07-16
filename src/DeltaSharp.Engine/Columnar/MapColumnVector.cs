@@ -215,8 +215,9 @@ public sealed class MapColumnVector : MutableColumnVector
         CheckRange(offset, length);
 
         // Zero-copy: share both children, offsets, and validity; the window re-bases logical row 0 via
-        // _offset (offsets stay absolute into the shared children). Sealing keeps the shared buffers
-        // safe against post-slice appends on this builder.
+        // _offset (offsets stay absolute into the shared children). Sealing this builder blocks further
+        // row commits (EndMap/AppendNull) so its offsets/validity are not resized under the view. NOTE:
+        // the shared key/value children are NOT sealed — build fully before slicing (child-seal tracked in #575).
         _sealed = true;
 
         int absoluteOffset = _offset + offset;

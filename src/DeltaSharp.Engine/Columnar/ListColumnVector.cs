@@ -198,8 +198,9 @@ public sealed class ListColumnVector : MutableColumnVector
         CheckRange(offset, length);
 
         // Zero-copy: share the element child, offsets, and validity; the window re-bases logical row 0
-        // via _offset (offsets stay absolute into the shared child). Sealing keeps the shared buffers
-        // safe against post-slice appends on this builder.
+        // via _offset (offsets stay absolute into the shared child). Sealing this builder blocks further
+        // row commits (EndList/AppendNull) so its offsets/validity are not resized under the view. NOTE:
+        // the shared element child is NOT sealed — build fully before slicing (child-seal tracked in #575).
         _sealed = true;
 
         int absoluteOffset = _offset + offset;

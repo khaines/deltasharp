@@ -231,6 +231,12 @@ public class StructColumnVectorTests
         Assert.Throws<ArgumentOutOfRangeException>(() => new StructColumnVector(PersonType, capacity: -1));
 
     [Fact]
+    public void ZeroFieldStruct_RejectsNegativeCapacity() =>
+        // For a zero-field struct there are no children to re-throw, so the ctor's ThrowIfNegative(capacity)
+        // is the sole (non-equivalent) guard — pin it directly.
+        Assert.Throws<ArgumentOutOfRangeException>(() => new StructColumnVector(StructType.Empty, capacity: -1));
+
+    [Fact]
     public void EndStruct_RejectsChildAdvancedByMoreThanOne()
     {
         // Over-advance: a field child advanced by 2 while committing one row must fail-closed (the alignment
