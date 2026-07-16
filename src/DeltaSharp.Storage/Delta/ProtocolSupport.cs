@@ -64,14 +64,18 @@ internal static class ProtocolSupport
 
     /// <summary>The advanced writer features this build implements. <c>columnMapping</c> is written in
     /// <c>name</c> mode (STORY-05.4.3 / #191); an <c>id</c>-mode write is rejected fail-closed downstream
-    /// (<see cref="ColumnMapping.EnsureReadWriteSupported"/>, deferred to #523).</summary>
+    /// (<see cref="ColumnMapping.EnsureReadWriteSupported"/>, deferred to #523). <c>appendOnly</c> is a
+    /// <b>writer-only</b> legacy feature (never in <see cref="SupportedReaderFeatures"/>): this build enforces
+    /// it at commit (<see cref="AppendOnlyFeature.EnsureCommitAllowed"/>) and enumerates it on the
+    /// legacy → table-features upgrade (<see cref="TypeWideningFeature.UpgradeProtocol"/>, #549).</summary>
     public static readonly ImmutableHashSet<string> SupportedWriterFeatures =
         ImmutableHashSet.Create(
             StringComparer.Ordinal,
             ColumnMapping.Feature,
             DeletionVectors.DeletionVectorsFeature.Feature,
             TypeWideningFeature.Feature,
-            TypeWideningFeature.FeaturePreview);
+            TypeWideningFeature.FeaturePreview,
+            AppendOnlyFeature.Feature);
 
     /// <summary>
     /// Verifies the table's <paramref name="protocol"/> is <b>writable</b> by this build before a commit is
@@ -85,9 +89,9 @@ internal static class ProtocolSupport
     ///
     /// <para><b>v1 baseline.</b> Writer versions 1–2 (basic + <c>appendOnly</c>/invariants era) are writable,
     /// and writer version 7 ("table features") is writable only when every named <c>writerFeatures</c> entry
-    /// is one this build implements (<c>columnMapping</c>, <c>deletionVectors</c>, <c>typeWidening</c> —
-    /// <see cref="SupportedWriterFeatures"/>); every other writer version and any unimplemented named writer
-    /// feature fails closed. This mirrors the reader
+    /// is one this build implements (<c>columnMapping</c>, <c>deletionVectors</c>, <c>typeWidening</c>,
+    /// <c>appendOnly</c> — <see cref="SupportedWriterFeatures"/>); every other writer version and any
+    /// unimplemented named writer feature fails closed. This mirrors the reader
     /// baseline (<see cref="EnsureReadable"/>) and is deliberately conservative — being <i>stricter</i> than
     /// Delta on an unimplemented feature never yields a wrong write.</para>
     /// </summary>
