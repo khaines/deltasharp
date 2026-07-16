@@ -15,8 +15,12 @@ namespace DeltaSharp.Engine.Columnar;
 /// <para>
 /// A null logical row is a <b>null map</b>, distinct from an <b>empty map</b>: both may report
 /// <see cref="EntryLength"/> <c>0</c>, but a null map has <see cref="IsNull"/> <c>true</c> while an
-/// empty map has <see cref="IsNull"/> <c>false</c>. Per <see cref="MapType"/>, keys are non-null; this
-/// vector stores them in a key child but does not itself enforce key non-nullness.
+/// empty map has <see cref="IsNull"/> <c>false</c>. Per <see cref="MapType"/>, keys are non-null (a
+/// structural invariant — <see cref="MapType"/> has no key-null flag); this vector <b>enforces</b> it
+/// fail-closed over the <b>referenced</b> key range (a non-zero <c>offsets[0]</c> or a dangling tail
+/// leaves some keys unreferenced and unchecked). <b>Value</b> nullability follows
+/// <see cref="MapType.ValueContainsNull"/> <i>advisorily</i> and is <b>not</b> enforced here — matching
+/// the codebase's advisory-nullability convention (Spark parity; a conscious future change per #577).
 /// </para>
 /// <para>
 /// <b>Building.</b> The mutable builder (<see cref="ColumnVectors.Create(DataType,int)"/> or the
@@ -109,14 +113,22 @@ public sealed class MapColumnVector : MutableColumnVector
                 + "value children must be parallel.", nameof(values));
         }
 
-        if (keys.NullCount != 0)
+        _offsets = NestedValidity.CopyValidatedOffsets(offsets, keys.Length, nameof(offsets));
+
+        // MapType keys are always non-null (a structural invariant — MapType has no key-null flag). Reject a
+        // null key WITHIN the referenced range only: a non-zero offsets[0] or a dangling tail leaves some keys
+        // unreferenced (Arrow sliced-array semantics), and an unreferenced key belongs to no row, so its
+        // nullness is irrelevant. (Value nullability is advisory per the codebase convention, not enforced.)
+        for (int i = _offsets[0]; i < _offsets[^1]; i++)
         {
-            throw new ArgumentException(
-                $"Map keys must not be null (MapType keys are always non-null), but the key child has "
-                + $"{keys.NullCount} null(s).", nameof(keys));
+            if (keys.IsNull(i))
+            {
+                throw new ArgumentException(
+                    "Map keys must not be null (MapType keys are always non-null), but the key child has a null "
+                    + $"at referenced index {i}.", nameof(keys));
+            }
         }
 
-        _offsets = NestedValidity.CopyValidatedOffsets(offsets, keys.Length, nameof(offsets));
         int length = _offsets.Length - 1;
         (_validity, _nullCount) = NestedValidity.Build(nulls, length);
         _keys = keys;

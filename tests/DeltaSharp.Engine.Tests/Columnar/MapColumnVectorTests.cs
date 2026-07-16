@@ -285,4 +285,30 @@ public class MapColumnVectorTests
         Assert.Equal(0, map.KeysAt(0).Length);
         Assert.Equal(0, map.ValuesAt(0).Length);
     }
+
+    [Fact]
+    public void FromChildren_AllowsNullKeyOutsideReferencedRange()
+    {
+        // A non-zero offsets[0] leaves leading keys unreferenced (Arrow sliced semantics); an unreferenced
+        // null key belongs to no row and must NOT reject the map — the key-null check is scoped to the
+        // referenced range [offsets[0], offsets[^1]).
+        MutableColumnVector keys = ColumnVectors.Create(StringType.Instance, 2);
+        keys.AppendNull();       // index 0 — unreferenced
+        keys.AppendBytes("k"u8); // index 1 — referenced by row 0
+        var map = new MapColumnVector(StringToInt, keys, Ints(0, 1), new[] { 1, 2 });
+        Assert.Equal(1, map.Length);
+        Assert.Equal("k", Utf8(map.KeysAt(0).GetBytes(0)));
+    }
+
+    [Fact]
+    public void FromChildren_AllowsNullValue_WhenValueContainsNull()
+    {
+        // Value nullability is advisory (Spark parity, codebase convention): a null value is accepted; only
+        // KEYS are structurally non-null. (Enforcing ValueContainsNull=false is a conscious future change, #577.)
+        MutableColumnVector values = ColumnVectors.Create(IntegerType.Instance, 1);
+        values.AppendNull();
+        var map = new MapColumnVector(StringToInt, Keys("k"), values, new[] { 0, 1 });
+        Assert.Equal(1, map.Length);
+        Assert.True(map.ValuesAt(0).IsNull(0));
+    }
 }
