@@ -437,6 +437,68 @@ public sealed class NestedParquetReadTests
     }
 
     [Fact]
+    public async Task NestedLeafDecodeCeiling_FoldsVariableWidthChildPayload_FailsClosed()
+    {
+        // R5-F1 (High, red-team): for a VARIABLE-width leaf (string/binary) the reconstructed #570 child copies
+        // the actual UTF-8 payload, not just the per-value handle — so the leaf ceiling must budget that
+        // payload too. A 1000-element list of UNIQUE ~61-byte strings has an element leaf whose:
+        //   raw + fixed-handle = 1000 * (16 handle + 4 def + 4 rep + 16 child-handle + 1 null-mask) = 41,000
+        //     (< the 100,000-byte ceiling — WITHOUT the payload term the leaf passes),
+        //   TotalUncompressedSize U ~= 65,000, so the child byte store (doubling) is budgeted at 2*U ~= 130,000
+        //     (> the ceiling on its own) — WITH the payload term the leaf is rejected before allocation.
+        // The flat EnsureDecodeCeiling (sum of leaf U ~= 65,000) still passes, so the LeafNumValues guard is
+        // the gate (its "Nested leaf" message confirms which guard fired). Strings are unique so U reflects the
+        // real payload (a dictionary-encoded repeat column is a separate, reader-wide residual).
+        byte[] bytes = await WriteAsync(new List<StrListRow>
+        {
+            new()
+            {
+                Id = 1,
+                Names = Enumerable.Range(0, 1000)
+                    .Select(i => (string?)$"str-{i:D6}-{new string('x', 50)}").ToList(),
+            },
+        });
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Names", DataTypes.CreateArrayType(DataTypes.StringType, containsNull: true), nullable: true),
+        });
+        var reader = new ParquetFileReader(new ParquetDecodeLimits(maxRowGroupDecodedBytes: 100_000));
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => EnumerateAsync(reader, bytes, requested));
+
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+        Assert.Contains("Nested leaf", error.Message, StringComparison.Ordinal);
+        Assert.Contains("eager decode would exceed", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task NestedLeafDecodeCeiling_FixedWidthUnaffectedByPayloadTerm_Decodes()
+    {
+        // R5-F1 regression: the variable-width payload term must NOT change fixed-width behavior. The same
+        // 1000-element int list — raw+child = 1000 * (4 + 4 + 4 + 4 + 1) = 17,000 — decodes cleanly under the
+        // very ceiling that rejects the string list above, proving the payload budget is variable-width only.
+        byte[] bytes = await WriteAsync(new List<ListRow>
+        {
+            new() { Id = 1, Arr = Enumerable.Range(0, 1000).Select(i => (int?)i).ToList() },
+        });
+
+        var requested = new StructType(new[]
+        {
+            new StructField("Arr", DataTypes.CreateArrayType(DataTypes.IntegerType, containsNull: true), nullable: true),
+        });
+        var reader = new ParquetFileReader(new ParquetDecodeLimits(maxRowGroupDecodedBytes: 100_000));
+
+        ColumnBatch batch = await ReadSingleAsync(reader, bytes, requested);
+        var arr = Assert.IsType<ListColumnVector>(batch.Column("Arr"));
+        Assert.Equal(1000, arr.ElementLength(0));
+        Assert.Equal(0, arr.ElementsAt(0).GetValue<int>(0));
+        Assert.Equal(999, arr.ElementsAt(0).GetValue<int>(999));
+    }
+
+    [Fact]
     public async Task ArrayOfStruct_FailsClosed_UnsupportedFeature()
     {
         // A nested type within a nested type (array-of-struct) is out of scope for #571: it must be rejected
@@ -702,6 +764,128 @@ public sealed class NestedParquetReadTests
     }
 
     [Fact]
+    public void BuildRepeatedStructure_RejectsInvalidStateTransitions_CorruptData()
+    {
+        // R5-F2 (Critical, red-team): a structurally-invalid list Dremel stream that passes ValidateLevelRange
+        // must fail closed rather than decode a phantom element. containerMaxDef = 2 for a standard optional
+        // list-of-optional-element (element leaf maxDef 3): def 0 = null list, 1 = empty list, 2 = null
+        // element, 3 = present element. These crafted streams cannot be authored via the released Parquet.Net
+        // write door (definition levels are derived from value nullability, never below the element's own null
+        // level), so the guard is pinned by a direct unit test of BuildRepeatedStructure.
+
+        // Empty-list marker (def=1, rep=0 opening row0) then a continuation (rep=1) of that same row: a row
+        // whose container is empty has NO element occurrence and must never be continued.
+        DeltaStorageException emptyThenContinue = Assert.Throws<DeltaStorageException>(() =>
+            NestedParquetColumnReader.BuildRepeatedStructure(
+                def: new[] { 1, 2 }, rep: new[] { 0, 1 }, numValues: 2, containerMaxDef: 2, rowCount: 1,
+                offsets: new int[2], nulls: new bool[1], columnName: "col"));
+        Assert.Equal(StorageErrorKind.CorruptData, emptyThenContinue.Kind);
+        Assert.Contains("has no continuation", emptyThenContinue.Message, StringComparison.Ordinal);
+
+        // Present opener (def=3) then a continuation slot that is itself a sub-container placeholder (def=1 <
+        // containerMaxDef) — a continuation must be a real element occurrence, not an empty/null marker.
+        DeltaStorageException continuationIsMarker = Assert.Throws<DeltaStorageException>(() =>
+            NestedParquetColumnReader.BuildRepeatedStructure(
+                def: new[] { 3, 1 }, rep: new[] { 0, 1 }, numValues: 2, containerMaxDef: 2, rowCount: 1,
+                offsets: new int[2], nulls: new bool[1], columnName: "col"));
+        Assert.Equal(StorageErrorKind.CorruptData, continuationIsMarker.Kind);
+
+        // A leading non-zero repetition level cannot open a row.
+        DeltaStorageException leadingRep = Assert.Throws<DeltaStorageException>(() =>
+            NestedParquetColumnReader.BuildRepeatedStructure(
+                def: new[] { 3 }, rep: new[] { 1 }, numValues: 1, containerMaxDef: 2, rowCount: 1,
+                offsets: new int[2], nulls: new bool[1], columnName: "col"));
+        Assert.Equal(StorageErrorKind.CorruptData, leadingRep.Kind);
+    }
+
+    [Fact]
+    public void BuildRepeatedStructure_AcceptsAllValidPermutations_NoOverRejection()
+    {
+        // R5-F2 no-over-rejection: every VALID single-level list permutation must still decode unchanged. The
+        // guard rejects only genuine state-transition contradictions, not any well-formed null/empty/present
+        // stream (containerMaxDef = 2).
+        AssertRepeated(def: new[] { 3 }, rep: new[] { 0 }, rowCount: 1,
+            expectedOffsets: new[] { 0, 1 }, expectedNulls: new[] { false }); // [42]
+        AssertRepeated(def: new[] { 1 }, rep: new[] { 0 }, rowCount: 1,
+            expectedOffsets: new[] { 0, 0 }, expectedNulls: new[] { false }); // [] empty
+        AssertRepeated(def: new[] { 0 }, rep: new[] { 0 }, rowCount: 1,
+            expectedOffsets: new[] { 0, 0 }, expectedNulls: new[] { true }); // null list
+        AssertRepeated(def: new[] { 2 }, rep: new[] { 0 }, rowCount: 1,
+            expectedOffsets: new[] { 0, 1 }, expectedNulls: new[] { false }); // [null] one null element
+        AssertRepeated(def: new[] { 3, 3 }, rep: new[] { 0, 1 }, rowCount: 1,
+            expectedOffsets: new[] { 0, 2 }, expectedNulls: new[] { false }); // [10,20]
+        AssertRepeated(def: new[] { 3, 2 }, rep: new[] { 0, 1 }, rowCount: 1,
+            expectedOffsets: new[] { 0, 2 }, expectedNulls: new[] { false }); // [10,null]
+        AssertRepeated(def: new[] { 3, 1 }, rep: new[] { 0, 0 }, rowCount: 2,
+            expectedOffsets: new[] { 0, 1, 1 }, expectedNulls: new[] { false, false }); // [10],[]
+        AssertRepeated(def: new[] { 1, 3 }, rep: new[] { 0, 0 }, rowCount: 2,
+            expectedOffsets: new[] { 0, 0, 1 }, expectedNulls: new[] { false, false }); // [],[10] (rowComplete reset)
+        AssertRepeated(def: new[] { 0, 3, 1 }, rep: new[] { 0, 0, 0 }, rowCount: 3,
+            expectedOffsets: new[] { 0, 0, 1, 1 }, expectedNulls: new[] { true, false, false }); // null,[10],[]
+    }
+
+    private static void AssertRepeated(
+        int[] def, int[] rep, int rowCount, int[] expectedOffsets, bool[] expectedNulls)
+    {
+        var offsets = new int[rowCount + 1];
+        var nulls = new bool[rowCount];
+        int total = NestedParquetColumnReader.BuildRepeatedStructure(
+            def, rep, def.Length, containerMaxDef: 2, rowCount, offsets, nulls, "col");
+        Assert.Equal(expectedOffsets, offsets);
+        Assert.Equal(expectedNulls, nulls);
+        Assert.Equal(expectedOffsets[^1], total);
+    }
+
+    [Fact]
+    public void BuildStructNullMask_RejectsCrossFieldDefDivergence_CorruptData()
+    {
+        // R5-F2 (Critical, red-team): a crafted struct Dremel stream where fields DISAGREE on the struct's
+        // presence at the same row must fail closed rather than decode a phantom field under a null struct.
+        // structMaxDef = 1 (optional struct; required field A maxDef 1, optional field B maxDef 2): field def
+        // < 1 means the struct is absent. Such divergent streams cannot be authored via the released write door
+        // (definition levels are derived from value nullability), so the guard is pinned by a direct unit test.
+
+        // Field A says "null struct" (def 0) while field B says "present" (def 1) at the same row.
+        int[]?[] aNullBPresent = { new[] { 0 }, new[] { 1 } };
+        DeltaStorageException e1 = Assert.Throws<DeltaStorageException>(() =>
+            NestedParquetColumnReader.BuildStructNullMask(aNullBPresent, structMaxDef: 1, rowCount: 1, "col"));
+        Assert.Equal(StorageErrorKind.CorruptData, e1.Kind);
+        Assert.Contains("disagree on the struct's presence", e1.Message, StringComparison.Ordinal);
+
+        // The reverse divergence (A present, B null-struct) is caught either driving direction.
+        int[]?[] aPresentBNull = { new[] { 1 }, new[] { 0 } };
+        DeltaStorageException e2 = Assert.Throws<DeltaStorageException>(() =>
+            NestedParquetColumnReader.BuildStructNullMask(aPresentBNull, structMaxDef: 1, rowCount: 1, "col"));
+        Assert.Equal(StorageErrorKind.CorruptData, e2.Kind);
+    }
+
+    [Fact]
+    public void BuildStructNullMask_AcceptsAgreeingFields_NoOverRejection()
+    {
+        // R5-F2 no-over-rejection: every VALID struct permutation still yields the correct null mask. The guard
+        // rejects only genuine cross-field divergence, not a present struct with a null field.
+        // Null struct (both fields def 0).
+        Assert.Equal(new[] { true }, NestedParquetColumnReader.BuildStructNullMask(
+            new int[]?[] { new[] { 0 }, new[] { 0 } }, structMaxDef: 1, rowCount: 1, "col"));
+
+        // Present struct, field B null (A def 1 present, B def 1 struct-present-field-null) — fields agree.
+        Assert.Equal(new[] { false }, NestedParquetColumnReader.BuildStructNullMask(
+            new int[]?[] { new[] { 1 }, new[] { 1 } }, structMaxDef: 1, rowCount: 1, "col"));
+
+        // Present struct, both fields present (A def 1, B def 2).
+        Assert.Equal(new[] { false }, NestedParquetColumnReader.BuildStructNullMask(
+            new int[]?[] { new[] { 1 }, new[] { 2 } }, structMaxDef: 1, rowCount: 1, "col"));
+
+        // Multi-row: row0 present (A 1, B 2), row1 null (A 0, B 0) — per-row agreement.
+        Assert.Equal(new[] { false, true }, NestedParquetColumnReader.BuildStructNullMask(
+            new int[]?[] { new[] { 1, 0 }, new[] { 2, 0 } }, structMaxDef: 1, rowCount: 2, "col"));
+
+        // A required struct (structMaxDef 0) has no null mask.
+        Assert.Null(NestedParquetColumnReader.BuildStructNullMask(
+            new int[]?[] { new[] { 0 } }, structMaxDef: 0, rowCount: 1, "col"));
+    }
+
+    [Fact]
     public async Task ZeroFieldStruct_FailsClosed_UnsupportedFeature()
     {
         // A6: a zero-field struct reconstructs a length-0 vector and (pre-fix) surfaced a raw ArgumentException
@@ -922,11 +1106,15 @@ public sealed class NestedParquetReadTests
         }
     }
 
-    private static async Task<ColumnBatch> ReadSingleAsync(byte[] bytes, StructType requested)
+    private static async Task<ColumnBatch> ReadSingleAsync(byte[] bytes, StructType requested) =>
+        await ReadSingleAsync(new ParquetFileReader(), bytes, requested);
+
+    private static async Task<ColumnBatch> ReadSingleAsync(
+        ParquetFileReader reader, byte[] bytes, StructType requested)
     {
         using var stream = new MemoryStream(bytes, writable: false);
         ColumnBatch? only = null;
-        await foreach (ColumnBatch batch in new ParquetFileReader().ReadAsync(
+        await foreach (ColumnBatch batch in reader.ReadAsync(
             stream, requested, null, nullFillMissingColumns: false, allowTypeWideningPromotion: false,
             CancellationToken.None))
         {

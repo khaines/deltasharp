@@ -169,7 +169,7 @@ internal static class NestedParquetColumnReader
         // (vs a present struct with a null field, whose level sits at/above this but below the field's max).
         int structMaxDef = fileStruct.MaxDefinitionLevel;
         var children = new ColumnVector[requested.Count];
-        int[]? drivingDef = null;
+        int[]?[] fieldDefs = new int[requested.Count][]; // each field's definition-level stream (null if required)
         for (int i = 0; i < requested.Count; i++)
         {
             StructField field = requested[i];
@@ -188,22 +188,79 @@ internal static class NestedParquetColumnReader
             }
 
             children[i] = child;
-            drivingDef ??= def;
+            fieldDefs[i] = def;
         }
 
-        bool[]? nulls = null;
-        if (structMaxDef > 0 && drivingDef is not null)
+        bool[]? nulls = BuildStructNullMask(fieldDefs, structMaxDef, rowCount, columnName);
+        return new StructColumnVector(requested, children, nulls is null ? default : nulls.AsSpan());
+    }
+
+    // Builds an optional struct's per-row null mask from its fields' definition-level streams, validating that
+    // every field AGREES on the struct's presence at each row (F2). A well-formed optional struct emits, for
+    // each field, a definition level below the struct's own level IFF the struct is absent — so a crafted
+    // stream where one field says "null struct" (def < structMaxDef) while another says "present" at the SAME
+    // row would otherwise decode a PHANTOM field value under a null struct. Returns null when the struct is
+    // required (no null mask) or carries no definition streams. Internal so a direct unit test can pin the
+    // cross-field parity guard with crafted field-def streams that the released Parquet.Net write door (which
+    // derives definition levels from value nullability, never below the field's own null level) cannot author.
+    internal static bool[]? BuildStructNullMask(
+        int[]?[] fieldDefs, int structMaxDef, int rowCount, string columnName)
+    {
+        if (structMaxDef <= 0)
         {
-            // A nullable struct: every child path runs through the optional struct, so any field's definition
-            // levels distinguish the null-struct rows (definition level < the struct's own level).
-            nulls = new bool[rowCount];
-            for (int r = 0; r < rowCount; r++)
+            // A required struct: no null mask (every row is present).
+            return null;
+        }
+
+        // A nullable struct: every field child runs through the optional struct, so a field's definition level
+        // below the struct's own level marks a NULL-struct row. Drive the null mask from any field that
+        // carries a definition stream.
+        int[]? drivingDef = null;
+        foreach (int[]? d in fieldDefs)
+        {
+            if (d is not null)
             {
-                nulls[r] = drivingDef[r] < structMaxDef;
+                drivingDef = d;
+                break;
             }
         }
 
-        return new StructColumnVector(requested, children, nulls is null ? default : nulls.AsSpan());
+        if (drivingDef is null)
+        {
+            return null;
+        }
+
+        var nulls = new bool[rowCount];
+        for (int r = 0; r < rowCount; r++)
+        {
+            bool structNull = drivingDef[r] < structMaxDef;
+
+            // F2 (crafted-Dremel): validate the cross-field parity and fail closed rather than trust a single
+            // driving field — every field must agree with the struct's null-ness at this row.
+            for (int f = 0; f < fieldDefs.Length; f++)
+            {
+                int[]? fieldDef = fieldDefs[f];
+                if (fieldDef is null)
+                {
+                    // A field inside a nullable struct always carries a definition stream (its max def >=
+                    // structMaxDef >= 1); a null stream would need a max def of 0, impossible under an optional
+                    // parent — so there is nothing to cross-check.
+                    continue;
+                }
+
+                if ((fieldDef[r] < structMaxDef) != structNull)
+                {
+                    throw DeltaStorageException.CorruptData(
+                        $"Struct column '{columnName}' fields disagree on the struct's presence at row "
+                        + $"{r} (a corrupt/crafted definition stream): all fields of an optional struct "
+                        + "must agree on whether the struct is null.");
+                }
+            }
+
+            nulls[r] = structNull;
+        }
+
+        return nulls;
     }
 
     // ----- array (3-level LIST) -----
@@ -325,8 +382,11 @@ internal static class NestedParquetColumnReader
     // Returns the total number of PRESENT child cells (== offsets[^1]), so the caller can cross-check the
     // reassembled child length. A repetition level of 0 opens a new top-level row; a definition level at or
     // above the container's own level counts a present child cell; one below the container-minus-one level
-    // (i.e., not even the empty-container placeholder) marks a NULL container.
-    private static int BuildRepeatedStructure(
+    // (i.e., not even the empty-container placeholder) marks a NULL container. Internal so a direct unit test
+    // can pin the F2 state-transition guard with crafted def/rep streams that the released Parquet.Net write
+    // door (which derives definition levels from value nullability, never below the element's own null level)
+    // cannot author.
+    internal static int BuildRepeatedStructure(
         int[]? def, int[]? rep, int numValues, int containerMaxDef, int rowCount, int[] offsets, bool[] nulls,
         string columnName)
     {
@@ -342,9 +402,11 @@ internal static class NestedParquetColumnReader
         int emptyContainerDef = containerMaxDef - 1;
         int row = -1;
         int elements = 0;
+        bool rowComplete = false; // F2: the current row opened as an empty/null container -> no continuation
         offsets[0] = 0;
         for (int i = 0; i < numValues; i++)
         {
+            int d = def[i];
             if (rep[i] == 0)
             {
                 // A new top-level row: close the previous row's offset window, then open this row (assumed
@@ -362,16 +424,36 @@ internal static class NestedParquetColumnReader
                 }
 
                 nulls[row] = false;
-            }
 
-            if (row < 0)
+                // F2: an empty or null container occupies a SINGLE level slot with no element occurrence
+                // (definition level below the container's own level), so it admits no continuation.
+                rowComplete = d < containerMaxDef;
+            }
+            else
             {
-                // The first level slot must open a row (repetition level 0); a leading non-zero is corrupt.
-                throw DeltaStorageException.CorruptData(
-                    $"Nested column '{columnName}' begins with a non-zero repetition level (corrupt levels).");
+                // A continuation slot (repetition level > 0) of the current row.
+                if (row < 0)
+                {
+                    // The first level slot must open a row (repetition level 0); a leading non-zero is corrupt.
+                    throw DeltaStorageException.CorruptData(
+                        $"Nested column '{columnName}' begins with a non-zero repetition level (corrupt levels).");
+                }
+
+                // F2 (crafted-Dremel): a continuation is legal only when the row is an active element-bearing
+                // container (its opening slot was an element) AND this slot is itself an element occurrence
+                // (definition level at/above the container's own level). Continuing a row whose container was
+                // empty/null — e.g. def=[1,2]/rep=[0,1], an empty-list marker then a continuation — or a
+                // placeholder masquerading as a continuation would otherwise reconstruct a PHANTOM element
+                // into an empty/null container. Fail closed rather than silently decode wrong-but-plausible data.
+                if (rowComplete || d < containerMaxDef)
+                {
+                    throw DeltaStorageException.CorruptData(
+                        $"Nested column '{columnName}' continues row {row} (repetition level {rep[i]}) after an "
+                        + $"empty/null-container marker (definition level {d}); an empty or null repeated "
+                        + "container has no continuation.");
+                }
             }
 
-            int d = def[i];
             if (d >= containerMaxDef)
             {
                 elements++;
@@ -475,7 +557,8 @@ internal static class NestedParquetColumnReader
         CancellationToken cancellationToken)
         where T : struct
     {
-        int numValues = LeafNumValues(rowGroup, leaf, limits, Unsafe.SizeOf<T>());
+        int numValues = LeafNumValues(
+            rowGroup, leaf, limits, Unsafe.SizeOf<T>(), variableWidth: elementType is StringType or BinaryType);
         var values = new T[numValues];
         int[]? def = null;
         int[]? rep = null;
@@ -622,12 +705,13 @@ internal static class NestedParquetColumnReader
     // buffers are allocated so a crafted NumValues cannot drive an out-of-memory allocation. Unlike the flat
     // path (one value per row, bounded by the row count), a repeated leaf can declare more values than rows,
     // so this bounds the ACTUAL transient (values + definition + repetition buffers) by the leaf's own count.
-    private static int LeafNumValues(ParquetRowGroupReader rowGroup, DataField leaf, ParquetDecodeLimits limits, int elementWidth)
+    private static int LeafNumValues(
+        ParquetRowGroupReader rowGroup, DataField leaf, ParquetDecodeLimits limits, int elementWidth, bool variableWidth)
     {
-        global::Parquet.Meta.ColumnChunk? chunk = rowGroup.GetMetadata(leaf);
-        long numValues = chunk?.MetaData?.NumValues
+        global::Parquet.Meta.ColumnMetaData meta = rowGroup.GetMetadata(leaf)?.MetaData
             ?? throw DeltaStorageException.CorruptData(
                 $"Nested leaf '{leaf.Path}' has no column-chunk metadata (a stripped/absent footer).");
+        long numValues = meta.NumValues;
         if (numValues < 0)
         {
             throw DeltaStorageException.CorruptData(
@@ -644,7 +728,30 @@ internal static class NestedParquetColumnReader
             // Charge a full null-mask byte per value (>= the bitmap's actual per-value bit) to never
             // under-count; the default 4 GiB ceiling stays harmless for real row groups.
             + elementWidth + 1;
-        if (perSlotBytes > 0 && numValues > limits.MaxRowGroupDecodedBytes / perSlotBytes)
+
+        // R5-F1: for a VARIABLE-width leaf (string/binary) elementWidth is only the child's per-value HANDLE
+        // (offset/length) — the reconstructed child ALSO copies the decoded UTF-8/byte payload into a byte
+        // store that grows by DOUBLING (ManagedVariableWidthColumnVector: newCapacity = max(required,
+        // _data.Length * 2)), so its peak is up to 2x the copied payload. TotalUncompressedSize upper-bounds
+        // that payload (it also carries per-value length prefixes + level/page-header overhead), so 2x it
+        // conservatively bounds the byte-store peak. Fixed-width leaves budget nothing here (their value
+        // already fits in elementWidth). (Residual, shared with the flat reader and pre-existing: a
+        // dictionary-encoded column whose values REPEAT can materialize more child bytes than its
+        // TotalUncompressedSize; a general per-value payload bound needs page-level decode, out of scope here.)
+        long payloadBytes = 0;
+        if (variableWidth)
+        {
+            long uncompressed = Math.Max(meta.TotalUncompressedSize, 0);
+            // Saturate the doubling so a hostile footer's enormous TotalUncompressedSize cannot overflow the
+            // 64-bit budget (it breaches the ceiling either way, via the negative-remaining branch below).
+            payloadBytes = uncompressed > long.MaxValue / 2 ? long.MaxValue : 2 * uncompressed;
+        }
+
+        // The eager transient is (numValues * perSlotBytes) + payloadBytes. Check overflow-safely: reject if
+        // the payload budget alone breaches the ceiling (remaining < 0), else if the per-slot transient
+        // breaches the REMAINING budget.
+        long remaining = limits.MaxRowGroupDecodedBytes - payloadBytes;
+        if (remaining < 0 || (perSlotBytes > 0 && numValues > remaining / perSlotBytes))
         {
             throw DeltaStorageException.CorruptData(
                 $"Nested leaf '{leaf.Path}' declares {numValues} values, whose eager decode would exceed the "
