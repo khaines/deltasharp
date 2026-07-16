@@ -165,6 +165,15 @@ internal sealed class DeltaCommitter
             throw new ArgumentException("A commit must contain at least one action.", nameof(actions));
         }
 
+        // Column-mapping id-mode WRITE gate (#523). This build READS id-mode tables (columns resolved by the
+        // Parquet field_id) but must NEVER write one. Enforce it HERE — the single choke point every commit
+        // funnels through — rather than only per-operation, so no commit path (append / overwrite / empty-
+        // static-overwrite TRUNCATE / delete / protocol-metadata upgrade, current or future) can bypass it.
+        // Keyed on the read snapshot's own column-mapping mode; DeltaSharp only ever creates name/none tables,
+        // so a legitimate commit is never id mode. Per-operation EnsureWriteSupported calls remain for earlier,
+        // operation-specific error locality; this is the universal backstop.
+        ColumnMapping.EnsureWriteSupported(ColumnMapping.ResolveMode(readSnapshot.Metadata.Configuration));
+
         // A BlindAppend read scope registers no read set, so it performs no data-conflict detection; a
         // commit that *removes* files (a delete/overwrite) must therefore use WholeTable or ReadFiles so a
         // concurrent delete/overwrite is caught. Reject a remove-bearing blind append up front rather than

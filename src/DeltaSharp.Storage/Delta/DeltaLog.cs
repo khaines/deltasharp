@@ -309,11 +309,12 @@ internal sealed class DeltaLog
         ProtocolSupport.EnsureReadable(snapshot.Protocol);
 
         // Column-mapping mode gate (§2.12.3; STORY-05.4.3 AC4). The protocol feature gate above opens for a
-        // column-mapped (name OR id) table; this build serves 'name' mode but (1) rejects a mode declared
-        // without protocol support (protocol-upgrade error) and (2) rejects 'id' mode fail-closed (id
-        // resolves columns by Parquet field_id — not implemented, deferred to #523). This is the single
-        // read-side choke point, so EVERY load (including time travel) of an unsupported column-mapping table
-        // is rejected before any data column is resolved — never a positional/name misread.
+        // column-mapped (name OR id) table; this build serves BOTH 'name' and 'id' mode reads (id-mode read
+        // resolves columns by Parquet field_id — #523) but rejects a mode declared without protocol support
+        // (protocol-upgrade error). This is the single read-side choke point, so EVERY load (including time
+        // travel) of a column-mapping table declared without protocol support is rejected before any data
+        // column is resolved — never a positional/name misread. WRITING an id-mode table stays fail-closed
+        // (EnsureWriteSupported / the centralized DeltaCommitter gate), independent of this read gate.
         ColumnMappingMode mode = ColumnMapping.ResolveMode(snapshot.Metadata.Configuration);
         ColumnMapping.EnsureModeGate(mode, snapshot.Protocol);
 
@@ -321,7 +322,7 @@ internal sealed class DeltaLog
         // table (duplicate physicalName across data+partition fields, duplicate/missing/out-of-range id)
         // fail-closed at this single choke point — a duplicate physical name would otherwise let one column's
         // value be served under another column's logical name with NO exception (a silent misread).
-        ColumnMapping.ValidateNameModeSchema(mode, snapshot.Schema, snapshot.Metadata.Configuration);
+        ColumnMapping.ValidateColumnMappingSchema(mode, snapshot.Schema, snapshot.Metadata.Configuration);
         return snapshot;
     }
 

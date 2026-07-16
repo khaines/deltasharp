@@ -32,8 +32,9 @@ public sealed class ColumnMappingTestCollection
 /// <item><b>AC3</b> (OR-a/OR-b) — a name-mode write emits <b>consistent</b> physical/logical metadata: the
 /// committed <c>metaData</c> schema carries per-field id + physicalName (typed JSON), the configuration/
 /// protocol declare column mapping, and the Parquet footer stores the <b>physical</b> column names.</item>
-/// <item><b>AC4</b> (EE-09) — column mapping without protocol support, a legacy reader-v2 table, and
-/// <c>id</c> mode are each rejected fail-closed with a typed error (id mode deferred to #523).</item>
+/// <item><b>AC4</b> (EE-09) — column mapping without protocol support and a legacy reader-v2 table are
+/// rejected fail-closed with a typed error; an <c>id</c>-mode <b>write</b> is rejected fail-closed (id-mode
+/// <b>read</b> is supported — #523).</item>
 /// </list>
 /// The physical names are minted by a deterministic seeded source so the AC3 assertions are golden.
 /// </summary>
@@ -419,6 +420,269 @@ public sealed class ColumnMappingTests : IDisposable
         {
             new KeyValuePair<string, MetadataValue>(ColumnMapping.IdKey, MetadataValue.Long(id)),
         }));
+
+    // Writes a raw id-mode table (version-0 _delta_log + a physical Parquet data file) with the given logical
+    // schemaString, maxColumnId, partition columns, and add.partitionValues — the shape a foreign engine
+    // produces (DeltaSharp cannot CREATE id-mode tables). Returns the Parquet byte length.
+    private async Task SeedIdModeTableAsync(
+        string schemaJson,
+        long maxColumnId,
+        StructType physicalSchema,
+        ManagedColumnBatch dataBatch,
+        string[]? partitionColumns = null,
+        (string PhysicalName, string Value)[]? partitionValues = null,
+        string relativePath = "idmode.parquet")
+    {
+        byte[] parquetBytes;
+        using (var buffer = new MemoryStream())
+        {
+            await new ParquetFileWriter().WriteAsync(
+                buffer, physicalSchema, new[] { dataBatch }, CancellationToken.None);
+            parquetBytes = buffer.ToArray();
+        }
+
+        using var backend = new LocalFileSystemBackend(_root);
+        await backend.PutIfAbsentAsync(relativePath, parquetBytes, CancellationToken.None);
+        string pv = partitionValues is null
+            ? "{}"
+            : "{" + string.Join(",", partitionValues.Select(p => $"\"{p.PhysicalName}\":\"{p.Value}\"")) + "}";
+        string addLine =
+            $"{{\"add\":{{\"path\":\"{relativePath}\",\"partitionValues\":{pv},"
+            + $"\"size\":{parquetBytes.Length},\"modificationTime\":0,\"dataChange\":true}}}}";
+        byte[] commit = Encoding.UTF8.GetBytes(
+            ProtocolFeatureLine() + "\n"
+            + NameModeMetadataLine(
+                schemaJson,
+                partitionColumns ?? Array.Empty<string>(),
+                ("delta.columnMapping.mode", "id"),
+                ("delta.columnMapping.maxColumnId", maxColumnId.ToString(System.Globalization.CultureInfo.InvariantCulture))) + "\n"
+            + addLine + "\n");
+        await backend.PutIfAbsentAsync("_delta_log/00000000000000000000.json", commit, CancellationToken.None);
+    }
+
+    private static string IdField(string name, string type, bool nullable, long id, string physicalName) =>
+        $"{{\"name\":\"{name}\",\"type\":\"{type}\",\"nullable\":{(nullable ? "true" : "false")},\"metadata\":"
+        + $"{{\"delta.columnMapping.id\":{id},\"delta.columnMapping.physicalName\":\"{physicalName}\"}}}}";
+
+    // ---- #523 round-2: fault-branch + partition fail-closed coverage (council R1) ----
+
+    [Fact]
+    public async Task IdMode_PartitionValues_ResolvedByPhysicalName_NotNull()
+    {
+        // CRITICAL fix (Architect/Delta-Specialist): id-mode PARTITION values are keyed by PHYSICAL name in
+        // the log (PROTOCOL.md:1021); resolving them by the LOGICAL name returned all-null partition columns.
+        // A partitioned id-mode table's partition column must read its real value.
+        string schemaJson = "{\"type\":\"struct\",\"fields\":["
+            + IdField("region", "string", true, 1, PhysId) + ","
+            + IdField("id", "long", false, 2, PhysScore) + "]}";
+        // Physical Parquet holds only the DATA column (id), stamped field_id=2; partition column is NOT in
+        // the file (its value rides on add.partitionValues, keyed by the PHYSICAL name PhysId).
+        var physicalSchema = new StructType(new[] { PhysFieldWithId("d", DataTypes.LongType, nullable: false, id: 2) });
+        MutableColumnVector d = ColumnVectors.Create(DataTypes.LongType, 1);
+        d.AppendValue(42L);
+        var batch = new ManagedColumnBatch(physicalSchema, new ColumnVector[] { d }, 1);
+        await SeedIdModeTableAsync(
+            schemaJson, maxColumnId: 2, physicalSchema, batch,
+            partitionColumns: new[] { "region" },
+            partitionValues: new[] { (PhysId, "us") });
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        int regionIdx = info.Schema.IndexOf("region");
+        int idIdx = info.Schema.IndexOf("id");
+
+        var rows = new List<(string? Region, long Id)>();
+        foreach (ColumnBatch b in await source.ReadBatchesAsync(info.Version))
+        {
+            ColumnVector rc = b.SelectedColumn(regionIdx);
+            ColumnVector ic = b.SelectedColumn(idIdx);
+            for (int r = 0; r < b.LogicalRowCount; r++)
+            {
+                rows.Add((rc.IsNull(r) ? null : Encoding.UTF8.GetString(rc.GetBytes(r)), ic.GetValue<long>(r)));
+            }
+        }
+
+        // region must be "us" (from add.partitionValues[PhysId]), NOT null.
+        Assert.Equal(new (string?, long)[] { ("us", 42L) }, rows.ToArray());
+    }
+
+    [Fact]
+    public async Task IdMode_EmptyStaticOverwrite_IsRejectedFailClosed_AndTableUntouched()
+    {
+        // CRITICAL/HIGH fix (Architect/Security/Reliability, executed): an empty static overwrite (TRUNCATE)
+        // of an id-mode table previously bypassed EnsureWriteSupported and committed a destructive remove-all.
+        // The centralized DeltaCommitter gate now refuses ANY id-mode commit fail-closed; the table is untouched.
+        string schemaJson = "{\"type\":\"struct\",\"fields\":[" + IdField("id", "long", false, 1, PhysId) + "]}";
+        var physicalSchema = new StructType(new[] { PhysFieldWithId("d", DataTypes.LongType, nullable: false, id: 1) });
+        MutableColumnVector d = ColumnVectors.Create(DataTypes.LongType, 1);
+        d.AppendValue(7L);
+        var batch = new ManagedColumnBatch(physicalSchema, new ColumnVector[] { d }, 1);
+        await SeedIdModeTableAsync(schemaJson, maxColumnId: 1, physicalSchema, batch);
+
+        var logical = new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) });
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), FileNames()))
+        {
+            await Assert.ThrowsAnyAsync<Exception>(() => target.OverwriteAsync(
+                logical, Array.Empty<string>(), Array.Empty<ColumnBatch>(),
+                DeltaPartitionOverwriteMode.Static, overwriteSchema: false, CancellationToken.None));
+        }
+
+        // The id-mode table is UNCHANGED — still at v0 with its one data file.
+        using var backend = new LocalFileSystemBackend(_root);
+        Snapshot after = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
+        Assert.Equal(0L, after.Version);
+        Assert.Single(after.ActiveFiles);
+    }
+
+    [Fact]
+    public async Task IdMode_DuplicateColumnMappingId_IsRejectedFailClosed()
+    {
+        // CRITICAL fix (Quality/Architect): id-mode schema validation now runs at load — two fields sharing
+        // delta.columnMapping.id would resolve both logical columns to one file column (silent mis-read).
+        await WriteRawTableAsync(
+            protocol: ProtocolFeatureLine(),
+            metadata: NameModeMetadataLine(
+                "{\"type\":\"struct\",\"fields\":["
+                + IdField("id", "long", false, 1, PhysId) + ","
+                + IdField("score", "long", true, 1, PhysScore) + "]}",  // duplicate id=1
+                partitionColumns: Array.Empty<string>(),
+                ("delta.columnMapping.mode", "id"),
+                ("delta.columnMapping.maxColumnId", "2")));
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(() => source.LoadSnapshotAsync(null, null));
+        Assert.Contains("id 1 is assigned to more than one column", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task IdMode_MissingColumnMappingId_IsRejectedFailClosed()
+    {
+        await WriteRawTableAsync(
+            protocol: ProtocolFeatureLine(),
+            metadata: NameModeMetadataLine(
+                "{\"type\":\"struct\",\"fields\":["
+                + IdField("id", "long", false, 1, PhysId) + ","
+                + "{\"name\":\"score\",\"type\":\"long\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.physicalName\":\"" + PhysScore + "\"}}]}",  // no id
+                partitionColumns: Array.Empty<string>(),
+                ("delta.columnMapping.mode", "id"),
+                ("delta.columnMapping.maxColumnId", "1")));
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(() => source.LoadSnapshotAsync(null, null));
+        Assert.Contains("has no 'delta.columnMapping.id'", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task IdMode_IdAboveMaxColumnId_IsRejectedFailClosed()
+    {
+        await WriteRawTableAsync(
+            protocol: ProtocolFeatureLine(),
+            metadata: NameModeMetadataLine(
+                "{\"type\":\"struct\",\"fields\":[" + IdField("id", "long", false, 9, PhysId) + "]}",  // id=9 > max
+                partitionColumns: Array.Empty<string>(),
+                ("delta.columnMapping.mode", "id"),
+                ("delta.columnMapping.maxColumnId", "1")));
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(() => source.LoadSnapshotAsync(null, null));
+        Assert.Contains("exceeds the tracked", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task IdMode_NestedColumn_IsRejectedFailClosed()
+    {
+        // MINOR fix (Delta-Specialist): the nested-top-level-column guard now covers id mode too (BuildFieldIdMap
+        // is flat-only; a nested id-mode column must fail closed at the projection choke point, not null-fill).
+        await WriteRawTableAsync(
+            protocol: ProtocolFeatureLine(),
+            metadata: NameModeMetadataLine(
+                "{\"type\":\"struct\",\"fields\":["
+                + "{\"name\":\"nested\",\"type\":{\"type\":\"array\",\"elementType\":\"long\",\"containsNull\":true},"
+                + "\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"" + PhysId + "\"}}]}",
+                partitionColumns: Array.Empty<string>(),
+                ("delta.columnMapping.mode", "id"),
+                ("delta.columnMapping.maxColumnId", "1")));
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(() => source.ReadBatchesAsync(0L));
+        Assert.Contains("nested", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task IdMode_DuplicateFileFieldId_IsRejectedFailClosed()
+    {
+        // MEDIUM fix (Reliability): a foreign Parquet footer with two columns sharing a field_id must fail
+        // closed (BuildFieldIdMap), never silently taking the last writer (which would mis-resolve a column).
+        string schemaJson = "{\"type\":\"struct\",\"fields\":["
+            + IdField("id", "long", false, 1, PhysId) + "," + IdField("score", "long", true, 2, PhysScore) + "]}";
+        // Physical file: BOTH columns stamped field_id=1 (a poisoned/foreign footer).
+        var physicalSchema = new StructType(new[]
+        {
+            PhysFieldWithId("a", DataTypes.LongType, nullable: false, id: 1),
+            PhysFieldWithId("b", DataTypes.LongType, nullable: true, id: 1),
+        });
+        MutableColumnVector a = ColumnVectors.Create(DataTypes.LongType, 1);
+        MutableColumnVector b = ColumnVectors.Create(DataTypes.LongType, 1);
+        a.AppendValue(1L);
+        b.AppendValue(2L);
+        var batch = new ManagedColumnBatch(physicalSchema, new ColumnVector[] { a, b }, 1);
+        await SeedIdModeTableAsync(schemaJson, maxColumnId: 2, physicalSchema, batch);
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(() => source.ReadBatchesAsync(info.Version));
+        Assert.Contains("duplicate field_id", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task IdMode_RequestedIdAbsentFromFile_NullFillsNullable()
+    {
+        // MEDIUM fix (Reliability): a nullable logical column whose id is not in the file (schema evolution:
+        // metadata carries a column the older file predates) null-fills — keyed on the ID, not the name.
+        string schemaJson = "{\"type\":\"struct\",\"fields\":["
+            + IdField("id", "long", false, 1, PhysId) + "," + IdField("added", "long", true, 2, PhysScore) + "]}";
+        // File has ONLY field_id=1 ("added" / id=2 is absent).
+        var physicalSchema = new StructType(new[] { PhysFieldWithId("d", DataTypes.LongType, nullable: false, id: 1) });
+        MutableColumnVector d = ColumnVectors.Create(DataTypes.LongType, 1);
+        d.AppendValue(5L);
+        var batch = new ManagedColumnBatch(physicalSchema, new ColumnVector[] { d }, 1);
+        await SeedIdModeTableAsync(schemaJson, maxColumnId: 2, physicalSchema, batch);
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        int addedIdx = info.Schema.IndexOf("added");
+        var results = new List<(long Id, bool AddedNull)>();
+        foreach (ColumnBatch b in await source.ReadBatchesAsync(info.Version))
+        {
+            ColumnVector idc = b.SelectedColumn(info.Schema.IndexOf("id"));
+            ColumnVector addedc = b.SelectedColumn(addedIdx);
+            for (int r = 0; r < b.LogicalRowCount; r++)
+            {
+                results.Add((idc.GetValue<long>(r), addedc.IsNull(r)));
+            }
+        }
+
+        Assert.Equal(new[] { (5L, true) }, results.ToArray()); // "added" null-filled
+    }
+
+    [Fact]
+    public async Task IdMode_RequestedIdAbsentFromFile_NonNullable_Throws()
+    {
+        // MEDIUM fix (Reliability): a NON-nullable logical column whose id is absent from the file fails closed
+        // (ColumnNotPresent), never a silent null-fill.
+        string schemaJson = "{\"type\":\"struct\",\"fields\":["
+            + IdField("id", "long", false, 1, PhysId) + "," + IdField("required", "long", false, 2, PhysScore) + "]}";
+        var physicalSchema = new StructType(new[] { PhysFieldWithId("d", DataTypes.LongType, nullable: false, id: 1) });
+        MutableColumnVector d = ColumnVectors.Create(DataTypes.LongType, 1);
+        d.AppendValue(5L);
+        var batch = new ManagedColumnBatch(physicalSchema, new ColumnVector[] { d }, 1);
+        await SeedIdModeTableAsync(schemaJson, maxColumnId: 2, physicalSchema, batch);
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        await Assert.ThrowsAnyAsync<Exception>(() => source.ReadBatchesAsync(info.Version));
+    }
 
     [Fact]
     public async Task LegacyReaderV2_ColumnMappingTable_IsRejectedFailClosed()
@@ -1489,7 +1753,7 @@ public sealed class ColumnMappingTests : IDisposable
         // #541 end-to-end (write path): appending an additive nullable column to a name-mode table with
         // SchemaEvolutionMode.AddNewColumns mints a fresh physicalName+id for the new column, bumps
         // maxColumnId, and commits the evolved mapped metaData atomically with the add. The subsequent snapshot
-        // LOAD runs ValidateNameModeSchema, so a successful load proves the evolved schema is a CONSISTENT
+        // LOAD runs ValidateColumnMappingSchema, so a successful load proves the evolved schema is a CONSISTENT
         // name-mode schema (unique physical names, every id ≤ maxColumnId).
         await CreateNameMappedAsync((1L, 100L, "alice"), (2L, 200L, "bob"));
         string expectedExtraPhysical = new SeededPhysicalNameSource(EvolveSeed).NextPhysicalName();
@@ -1513,7 +1777,7 @@ public sealed class ColumnMappingTests : IDisposable
         Assert.Single(committed.OfType<MetadataAction>());
         Assert.Equal("part-extra.parquet", Assert.Single(committed.OfType<AddFileAction>()).Path);
 
-        // Reload (ValidateNameModeSchema runs on load): existing columns keep identity; the new column carries
+        // Reload (ValidateColumnMappingSchema runs on load): existing columns keep identity; the new column carries
         // a minted physicalName + id 4; maxColumnId bumped to 4.
         Snapshot evolved = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
         Assert.Equal(4, evolved.Schema.Count);
@@ -1659,7 +1923,7 @@ public sealed class ColumnMappingTests : IDisposable
     {
         // #541 monotonicity across commits: two successive additive evolutions (extra id 4, then extra2 id 5)
         // each reuse all prior identities, mint a distinct physical name, and bump maxColumnId monotonically
-        // (3 → 4 → 5). Each reload runs ValidateNameModeSchema, so a stale-maxColumnId or duplicate-name bug
+        // (3 → 4 → 5). Each reload runs ValidateColumnMappingSchema, so a stale-maxColumnId or duplicate-name bug
         // fails closed.
         await CreateNameMappedAsync((1L, 100L, "alice"));
         string mintedExtra = new SeededPhysicalNameSource(EvolveSeed).NextPhysicalName();

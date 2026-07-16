@@ -38,14 +38,14 @@ internal static class ColumnMappingProjection
         for (int i = 0; i < tableSchema.Count; i++)
         {
             StructField field = tableSchema[i];
-            if (mode == ColumnMappingMode.Name && field.DataType is StructType or ArrayType or MapType)
+            if (mode != ColumnMappingMode.None && field.DataType is StructType or ArrayType or MapType)
             {
                 throw DeltaProtocolException.Unsupported(
                     string.Create(
                         CultureInfo.InvariantCulture,
                         $"Column '{field.Name}' is a nested ({field.DataType.TypeName}) type; nested column "
                         + $"mapping is unsupported in this build (design §2.9/§2.12.3). Only top-level (leaf) "
-                        + $"columns are supported in column mapping 'name' mode."));
+                        + $"columns are supported under column mapping (name or id mode)."));
             }
 
             names[i] = ColumnMapping.PhysicalName(field, mode);

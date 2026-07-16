@@ -228,7 +228,7 @@ internal sealed class DeltaDelete
         // delete wrong rows. Since #523, id mode is READABLE at snapshot load (DeltaReadSource resolves by
         // field_id), so `readSnapshot` may now be id-mode — the EnsureWriteSupported call below is the
         // PRIMARY, tested id-write choke point for DELETE (it refuses id fail-closed), pinned by
-        // Delta_IdMode_FailsClosed_AtDeleteLocalGuard. `name` mode is resolved by relabeling
+        // Delete_IdMode_FailsClosed_AtDeleteLocalGuard_Independent. `name` mode is resolved by relabeling
         // physical<->logical EXACTLY as the READ path does — through the shared ColumnMappingProjection seam,
         // so DELETE and DeltaReadSource resolve identically — while the emitted deletion vector stays
         // POSITIONAL over the PHYSICAL data file (column mapping never changes a row's physical position — the

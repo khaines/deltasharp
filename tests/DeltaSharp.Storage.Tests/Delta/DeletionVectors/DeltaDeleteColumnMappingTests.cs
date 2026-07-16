@@ -167,11 +167,11 @@ public sealed class DeltaDeleteColumnMappingTests : IDisposable
     public async Task Delete_IdMode_FailsClosed_DeferredTo523()
     {
         // END-TO-END fail-closed: a raw id-mode table declaring the deletionVectors + columnMapping features.
-        // A DELETE via the public path loads the snapshot through DeltaLog, whose column-mapping gate
-        // (ColumnMapping.EnsureModeGate -> EnsureReadWriteSupported) is the PRIMARY choke point and rejects
-        // id mode at LOAD, before any file is scanned or DV written (id mode resolves columns by Parquet
-        // field_id — not implemented; a wrong relabel would delete the wrong rows). The DELETE-local guard is
-        // pinned separately/independently by Delete_IdMode_FailsClosed_AtDeleteLocalGuard_Independent.
+        // Since #523 an id-mode table is READABLE (columns resolved by Parquet field_id), so it LOADS; a DELETE
+        // (a WRITE) is then refused fail-closed by ColumnMapping.EnsureWriteSupported in DeltaDelete — and, as a
+        // universal backstop, by the centralized id-write gate in DeltaCommitter.CommitAsync — before any file
+        // is scanned or DV written (a field-id-blind name/positional relabel would delete the wrong rows). The
+        // DELETE-local guard is pinned independently by Delete_IdMode_FailsClosed_AtDeleteLocalGuard_Independent.
         await WriteRawIdModeTableAsync();
 
         var delete = NewDelete("id-mode-fail-closed");
@@ -187,14 +187,14 @@ public sealed class DeltaDeleteColumnMappingTests : IDisposable
     public async Task Delete_IdMode_FailsClosed_AtDeleteLocalGuard_Independent()
     {
         // Reliability oracle (#529): the DELETE-local fail-closed guard
-        // (ColumnMapping.EnsureReadWriteSupported in DeltaDelete.RunDeleteAsync) is DEFENSE-IN-DEPTH,
-        // secondary to the primary snapshot-load gate that Delete_IdMode_FailsClosed_DeferredTo523 exercises.
-        // Pin it INDEPENDENTLY: hand-build an id-mode snapshot that never passed through DeltaLog's
-        // EnsureModeGate, feed it to the internal read-snapshot seam, and require the DELETE to STILL fail
-        // closed at its own guard (never fall through to a field-id-blind name/positional read that could
-        // delete the wrong rows). If the DELETE-local guard were removed, this DELETE would proceed (empty
-        // active files -> silent no-op) and NOT throw — so this test makes that guard independently
-        // load-bearing.
+        // (ColumnMapping.EnsureWriteSupported in DeltaDelete.RunDeleteAsync). Since #523 an id-mode table LOADS
+        // (id is readable), so the DELETE-local guard is a PRIMARY id-write choke point (no longer secondary to
+        // a load-time rejection — DeltaLog's EnsureModeGate now PERMITS id). Pin it INDEPENDENTLY: hand-build an
+        // id-mode snapshot and feed it to the internal read-snapshot seam, requiring the DELETE to STILL fail
+        // closed at its own guard (never fall through to a field-id-blind name/positional read that could delete
+        // the wrong rows). If the DELETE-local guard were removed, this DELETE would proceed (empty active
+        // files -> silent no-op) and NOT throw — so this test makes that guard independently load-bearing.
+        // (The centralized DeltaCommitter gate is a further backstop, but this seam pins the local guard.)
         Snapshot idModeSnapshot = BuildUngatedColumnMappingSnapshot(
             mode: "id", schemaString: "{\"type\":\"struct\",\"fields\":[]}");
 

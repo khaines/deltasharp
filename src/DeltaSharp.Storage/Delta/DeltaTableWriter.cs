@@ -450,8 +450,9 @@ internal sealed class DeltaTableWriter
         // #542: overwriteSchema (wholesale schema replacement, #496) is now supported for a NAME-mode
         // column-mapped table — OverwriteReplaceSchemaAsync reconciles the columnMapping config with the
         // replaced schema (surviving columns keep their id+physicalName, new columns mint fresh identity,
-        // maxColumnId bumps monotonically). `id` mode is rejected fail-closed by EnsureWriteSupported (#523) at the append/overwrite
-        // entry, so it never reaches here; `none` is unaffected (logical==physical).
+        // maxColumnId bumps monotonically). `id` mode is rejected fail-closed by the centralized id-write gate
+        // (DeltaCommitter.CommitAsync) and by EnsureWriteSupported at the append/overwrite entry, so it never
+        // reaches here; `none` is unaffected (logical==physical).
         if (overwriteSchema)
         {
             return await OverwriteReplaceSchemaAsync(
@@ -935,7 +936,9 @@ internal sealed class DeltaTableWriter
     // column (matched by logical name) keeps its id+physicalName, a new column mints a fresh physicalName+id,
     // maxColumnId bumps monotonically (a dropped column's id is retired, never reused), and the staged files
     // are gated against the NEW PHYSICAL schema. All other metadata fields (id, format, createdTime) are
-    // preserved by `with`, so the table identity is stable. `id` mode is rejected fail-closed by EnsureWriteSupported (#523) at the commit-path entry and never reaches here. Committed under WholeTable scope (like every full
+    // preserved by `with`, so the table identity is stable. `id` mode is rejected fail-closed by the
+    // centralized id-write gate (DeltaCommitter.CommitAsync) and by EnsureWriteSupported at the commit-path
+    // entry, so it never reaches here. Committed under WholeTable scope (like every full
     // overwrite) so any concurrent add/remove/metaData aborts it.
     private Task<DeltaCommitResult> OverwriteReplaceSchemaAsync(
         Snapshot readSnapshot,

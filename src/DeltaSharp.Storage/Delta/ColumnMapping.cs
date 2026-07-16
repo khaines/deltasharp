@@ -25,8 +25,9 @@ internal enum ColumnMappingMode
     Name,
 
     /// <summary><c>id</c> mode: readers resolve columns by the Parquet <c>field_id</c> given by
-    /// <c>delta.columnMapping.id</c>. <b>Not implemented</b> in this build — deferred to #523 and gated
-    /// fail-closed by <see cref="ColumnMapping.EnsureWriteSupported"/>.</summary>
+    /// <c>delta.columnMapping.id</c>. This build <b>reads</b> id-mode tables (#523); <b>writing</b> an id-mode
+    /// table is gated fail-closed by <see cref="ColumnMapping.EnsureWriteSupported"/> (id-mode write deferred,
+    /// #572).</summary>
     Id,
 }
 
@@ -173,8 +174,9 @@ internal static class ColumnMapping
     ///
     /// <para>All three modes (<c>none</c>/<c>name</c>/<c>id</c>) are <b>readable</b> — id-mode read resolves
     /// columns by the Parquet <c>field_id</c> (#523), so this LOAD gate no longer rejects id. WRITING a
-    /// column-mapped table is a separate concern: <see cref="EnsureWriteSupported"/> (called on every commit
-    /// path) still rejects <c>id</c> mode fail-closed (this build reads, but does not write, id-mode tables).</para>
+    /// column-mapped table is a separate concern: <see cref="EnsureWriteSupported"/> — enforced centrally at
+    /// the <c>DeltaCommitter</c> commit choke point (plus per-write-path guards) — still rejects <c>id</c> mode
+    /// fail-closed (this build reads, but does not write, id-mode tables).</para>
     /// </summary>
     /// <exception cref="DeltaProtocolException">A column-mapping mode is set without protocol support.</exception>
     public static void EnsureModeGate(ColumnMappingMode mode, ProtocolAction protocol)
@@ -233,29 +235,32 @@ internal static class ColumnMapping
     }
 
     /// <summary>
-    /// The <b>resolution-time uniqueness invariant</b> for a name-mode table, enforced at the single
-    /// snapshot-load choke point BEFORE any column is resolved (design §2.12.3; Delta protocol name-mode
-    /// reader). A name-mode schema resolves every data column, partition value, and statistic by its
-    /// <c>delta.columnMapping.physicalName</c>, so a duplicate physical name (a poisoned/malformed table)
-    /// would let one field's value be served under another field's logical name — a <b>silent misread</b>
-    /// with no exception. This gate rejects such a table fail-closed instead:
+    /// The <b>resolution-time uniqueness invariant</b> for a column-mapped (<c>name</c> or <c>id</c>) table,
+    /// enforced at the single snapshot-load choke point BEFORE any column is resolved (design §2.12.3; Delta
+    /// protocol column-mapping reader). A column-mapped schema resolves partition values and statistics — and,
+    /// in name mode, data columns — by <c>delta.columnMapping.physicalName</c>, and resolves id-mode data
+    /// columns by <c>delta.columnMapping.id</c>; so a duplicate physical name or a duplicate/missing id (a
+    /// poisoned/malformed or foreign table) would let one field's value be served under another field's logical
+    /// name, or two logical columns map to one file column — a <b>silent misread</b> with no exception. This
+    /// gate rejects such a table fail-closed instead (#523 extended it to id mode — a foreign id-mode table is
+    /// exactly the untrusted input this guards):
     /// <list type="number">
     /// <item>the set of <c>physicalName</c> across <b>all</b> top-level fields (data + partition) is globally
     /// unique;</item>
     /// <item>every field carries a <c>delta.columnMapping.id</c>, the ids are unique, and each id is
     /// ≤ the table's <c>delta.columnMapping.maxColumnId</c> (a monotonic writer invariant).</item>
     /// </list>
-    /// A non-name mode is a no-op. This is deliberately an explicit choke point (not an incidental
+    /// <c>none</c> mode is a no-op. This is deliberately an explicit choke point (not an incidental
     /// <see cref="StructType"/> ctor throw), so the guarantee holds regardless of how the schema is built.
     /// </summary>
     /// <exception cref="DeltaProtocolException">A duplicate physical name or id, a missing id, or an id above
     /// <c>maxColumnId</c> — the schema is inconsistent and cannot be resolved safely.</exception>
-    public static void ValidateNameModeSchema(
+    public static void ValidateColumnMappingSchema(
         ColumnMappingMode mode, StructType schema, IReadOnlyDictionary<string, string> configuration)
     {
         ArgumentNullException.ThrowIfNull(schema);
         ArgumentNullException.ThrowIfNull(configuration);
-        if (mode != ColumnMappingMode.Name)
+        if (mode == ColumnMappingMode.None)
         {
             return;
         }
@@ -273,7 +278,7 @@ internal static class ColumnMapping
                     string.Create(
                         CultureInfo.InvariantCulture,
                         $"Column mapping physical name '{physical}' is assigned to more than one column; "
-                        + $"under name mode every top-level field (data and partition) MUST have a unique "
+                        + $"under column mapping every top-level field (data and partition) MUST have a unique "
                         + $"'{PhysicalNameKey}'. The schema is inconsistent and cannot be read safely."));
             }
 
@@ -282,8 +287,7 @@ internal static class ColumnMapping
                 throw DeltaProtocolException.Inconsistent(
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Column '{field.Name}' has no '{IdKey}' but the table uses column mapping mode "
-                        + $"'name'; the schema is inconsistent and cannot be read safely."));
+                        $"Column '{field.Name}' has no '{IdKey}' but the table uses column mapping; the schema is inconsistent and cannot be read safely."));
             }
 
             if (!ids.Add(id))
@@ -291,8 +295,7 @@ internal static class ColumnMapping
                 throw DeltaProtocolException.Inconsistent(
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Column mapping id {id} is assigned to more than one column; under name mode every "
-                        + $"'{IdKey}' MUST be unique. The schema is inconsistent and cannot be read safely."));
+                        $"Column mapping id {id} is assigned to more than one column; under column mapping every '{IdKey}' MUST be unique. The schema is inconsistent and cannot be read safely."));
             }
 
             if (id > maxColumnId)
@@ -332,11 +335,16 @@ internal static class ColumnMapping
     public static string PhysicalName(StructField field, ColumnMappingMode mode)
     {
         ArgumentNullException.ThrowIfNull(field);
-        if (mode != ColumnMappingMode.Name)
+        if (mode == ColumnMappingMode.None)
         {
             return field.Name;
         }
 
+        // Both `name` AND `id` modes assign a physical name (Delta PROTOCOL.md "Column Mapping"). In name mode
+        // the reader resolves DATA columns by it; in BOTH modes partition-value keys and statistics are keyed
+        // by the physical name (a column-mapped table's add.partitionValues use physical names). id mode
+        // additionally resolves DATA columns by field_id, but its partition-value keys are STILL physical —
+        // returning the LOGICAL name here (#523's original bug) silently produced all-null partition columns.
         if (field.Metadata.TryGetString(PhysicalNameKey, out string? physical) && physical.Length > 0)
         {
             return physical;
@@ -345,8 +353,8 @@ internal static class ColumnMapping
         throw DeltaProtocolException.Inconsistent(
             string.Create(
                 CultureInfo.InvariantCulture,
-                $"Column '{field.Name}' has no '{PhysicalNameKey}' but the table uses column mapping mode "
-                + $"'name'; the schema is inconsistent and cannot be read safely."));
+                $"Column '{field.Name}' has no '{PhysicalNameKey}' but the table uses column mapping; the "
+                + $"schema is inconsistent and cannot be read safely."));
     }
 
     /// <summary>Reads a field's assigned column id, if present.</summary>
