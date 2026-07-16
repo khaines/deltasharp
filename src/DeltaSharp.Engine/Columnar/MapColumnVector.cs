@@ -119,13 +119,27 @@ public sealed class MapColumnVector : MutableColumnVector
         // null key WITHIN the referenced range only: a non-zero offsets[0] or a dangling tail leaves some keys
         // unreferenced (Arrow sliced-array semantics), and an unreferenced key belongs to no row, so its
         // nullness is irrelevant. (Value nullability is advisory per the codebase convention, not enforced.)
-        for (int i = _offsets[0]; i < _offsets[^1]; i++)
+        if (_offsets[0] == 0 && _offsets[^1] == keys.Length)
         {
-            if (keys.IsNull(i))
+            // Fast path (the common decoder output): every key is referenced, so the O(1) child null count
+            // is exactly the referenced-range check.
+            if (keys.NullCount != 0)
             {
                 throw new ArgumentException(
-                    "Map keys must not be null (MapType keys are always non-null), but the key child has a null "
-                    + $"at referenced index {i}.", nameof(keys));
+                    "Map keys must not be null (MapType keys are always non-null), but the key child has "
+                    + $"{keys.NullCount} null(s).", nameof(keys));
+            }
+        }
+        else
+        {
+            for (int i = _offsets[0]; i < _offsets[^1]; i++)
+            {
+                if (keys.IsNull(i))
+                {
+                    throw new ArgumentException(
+                        "Map keys must not be null (MapType keys are always non-null), but the key child has a "
+                        + $"null at referenced index {i}.", nameof(keys));
+                }
             }
         }
 

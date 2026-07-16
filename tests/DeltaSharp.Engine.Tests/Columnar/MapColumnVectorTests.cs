@@ -311,4 +311,17 @@ public class MapColumnVectorTests
         Assert.Equal(1, map.Length);
         Assert.True(map.ValuesAt(0).IsNull(0));
     }
+
+    [Fact]
+    public void FromChildren_AllowsNullKeyInDanglingTail()
+    {
+        // Dangling tail: offsets[^1] < keys.Length leaves trailing keys unreferenced (Arrow sliced semantics);
+        // a null in that tail must NOT reject the map. Pins the scoped loop's UPPER bound (offsets[^1]).
+        MutableColumnVector keys = ColumnVectors.Create(StringType.Instance, 2);
+        keys.AppendBytes("k"u8); // index 0 — referenced by row 0
+        keys.AppendNull();       // index 1 — unreferenced dangling tail
+        var map = new MapColumnVector(StringToInt, keys, Ints(1, 0), new[] { 0, 1 });
+        Assert.Equal(1, map.Length);
+        Assert.Equal("k", Utf8(map.KeysAt(0).GetBytes(0)));
+    }
 }
