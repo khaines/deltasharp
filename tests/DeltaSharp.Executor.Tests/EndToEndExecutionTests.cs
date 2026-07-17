@@ -67,6 +67,31 @@ public class EndToEndExecutionTests
     }
 
     [Fact]
+    public void TwoFiltersThenProjectNestedField_ComposedSelection_ExtractsCorrectly()
+    {
+        // Two filters compose a selection over the batch; nested field access downstream must extract
+        // over the unselected physical rows and gather through the COMPOSED selection.
+        var fixture = new InMemoryRelationFixture();
+        StructType addr = TestData.Schema(TestData.Field("zip", IntegerType.Instance, nullable: false));
+        StructType schema = TestData.Schema(
+            TestData.Field("id", IntegerType.Instance, nullable: false),
+            TestData.Field("addr", addr, nullable: true));
+        var addrColumn = new StructColumnVector(
+            addr, new[] { TestData.Ints(10, 20, 30, 40, 50) }, new[] { false, false, true, false, false });
+        DataFrame people = fixture.Relation("people", schema, TestData.Batch(
+            schema, TestData.Ints(1, 2, 3, 4, 5), addrColumn));
+
+        // id>1 keeps {2,3,4,5}; then id<5 keeps {2,3,4}; project addr.zip → [20, null(id=3 null struct), 40].
+        IReadOnlyList<Row> rows = fixture.Collect(
+            people.Filter(Col("id").Gt(1)).Filter(Col("id").Lt(5)).Select(Col("addr.zip")));
+
+        Assert.Equal(3, rows.Count);
+        Assert.Equal(20, rows[0].GetAs<int>(0));
+        Assert.True(rows[1].IsNullAt(0)); // id=3 → null struct
+        Assert.Equal(40, rows[2].GetAs<int>(0));
+    }
+
+    [Fact]
     public void GroupByAgg_SumsSalaryPerDept_NullExcluded()
     {
         (InMemoryRelationFixture fixture, DataFrame people) = NewPeople();

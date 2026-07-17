@@ -90,6 +90,28 @@ public class PhysicalPlanShapeTests
     }
 
     [Fact]
+    public void Project_SameNamedFieldFromTwoStructs_FailsClosed_TrackedBy419()
+    {
+        // #580 leaf auto-naming makes `select(a.id, b.id)` (same field name from two structs) produce
+        // two output columns named `id`. DeltaSharp fails closed on duplicate output names (Spark
+        // accepts them; full parity is tracked in #419) — pin the current deterministic behavior.
+        StructType a = TestData.Schema(TestData.Field("id", IntegerType.Instance, nullable: false));
+        StructType b = TestData.Schema(TestData.Field("id", IntegerType.Instance, nullable: false));
+        StructType schema = TestData.Schema(
+            TestData.Field("a", a, nullable: true),
+            TestData.Field("b", b, nullable: true));
+        var fixture = new InMemoryRelationFixture();
+        DataFrame rel = fixture.Relation("t", schema, TestData.Batch(
+            schema,
+            new StructColumnVector(a, new[] { TestData.Ints(1) }),
+            new StructColumnVector(b, new[] { TestData.Ints(2) })));
+
+        UnsupportedPlanException ex = Assert.Throws<UnsupportedPlanException>(
+            () => fixture.Plan(rel.Select(Col("a.id"), Col("b.id"))));
+        Assert.Contains("#419", ex.Message);
+    }
+
+    [Fact]
     public void Project_MapsTo_ProjectOperator_OverScan()
     {
         (InMemoryRelationFixture fixture, DataFrame people) = NewPeople();
