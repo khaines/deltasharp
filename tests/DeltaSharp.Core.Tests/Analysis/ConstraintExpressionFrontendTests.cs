@@ -114,19 +114,32 @@ public sealed class ConstraintExpressionFrontendTests
     }
 
     [Fact]
-    public void ParseAndResolve_MultipartReference_ThrowsSqlParseException()
+    public void ParseAndResolve_NestedReference_ResolvesToStructField()
     {
-        // Red-team #587 finding: nested field access (#580) is not landed, so a multipart reference `s.f`
-        // currently RESOLVES to a TOP-LEVEL column `f` — silently enforcing the WRONG constraint — when the
-        // schema has both a struct `s` (with field `f`) AND a top-level `f`. Must be rejected fail-closed.
+        // #580 nested field access is now merged, so a multipart reference `s.f` resolves to the STRUCT
+        // field `s.f` (a GetStructField) — not the top-level column `f` — enforcing the intended constraint.
         StructType structType = new(new[] { new StructField("f", IntegerType.Instance, nullable: true) });
         StructType schema = Schema(
             new StructField("s", structType, nullable: true),
             new StructField("f", IntegerType.Instance, nullable: true));
 
-        SqlParseException ex = Assert.Throws<SqlParseException>(
-            () => ConstraintExpressionFrontend.ParseAndResolve("s.f > 0", schema));
-        Assert.Contains("multipart reference", ex.Message, StringComparison.Ordinal);
+        Expression resolved = ConstraintExpressionFrontend.ParseAndResolve("s.f > 0", schema);
+
+        var comparison = Assert.IsType<BinaryComparison>(resolved);
+        var field = Assert.IsType<GetStructField>(comparison.Left);
+        Assert.Equal("f", field.FieldName);
+        Assert.Equal("s", Assert.IsType<AttributeReference>(field.Child).Name);
+    }
+
+    [Fact]
+    public void ParseAndResolve_NestedReferenceOnNonStruct_ThrowsAnalysisException()
+    {
+        // A nested reference whose base is not a struct fails closed (the analyzer rejects it), rather than
+        // mis-binding to a top-level column.
+        StructType schema = Schema(new StructField("id", IntegerType.Instance, nullable: false));
+
+        Assert.Throws<AnalysisException>(
+            () => ConstraintExpressionFrontend.ParseAndResolve("id.f > 0", schema));
     }
 
     [Fact]

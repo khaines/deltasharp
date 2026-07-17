@@ -1,8 +1,13 @@
 using System.Diagnostics.CodeAnalysis;
+using DeltaSharp.Analysis;
 using DeltaSharp.Engine.Columnar;
+using DeltaSharp.Engine.Execution;
 using DeltaSharp.Plans.Logical;
 using DeltaSharp.Storage;
 using DeltaSharp.Types;
+using CoreExpr = DeltaSharp.Plans.Expressions.Expression;
+using EnginePhysicalExpression = DeltaSharp.Engine.Execution.PhysicalExpression;
+using ExprAttributeReference = DeltaSharp.Plans.Expressions.AttributeReference;
 
 namespace DeltaSharp.Executor;
 
@@ -114,9 +119,11 @@ internal sealed class DeltaLocalSink : ILocalSink
                         + "add columns additively.");
                 }
 
+                EnforceConstraints(target, schema, batches);
                 return target
                     .OverwriteAsync(
-                        schema, partitionColumns, batches, ResolvePartitionOverwriteMode(), ResolveOverwriteSchema())
+                        schema, partitionColumns, batches,
+                        ResolvePartitionOverwriteMode(), ResolveOverwriteSchema())
                     .GetAwaiter().GetResult().RowsWritten;
 
             case SaveMode.Ignore:
@@ -167,8 +174,62 @@ internal sealed class DeltaLocalSink : ILocalSink
 
     private static long RunAppend(
         DeltaWriteTarget target, StructType schema, IReadOnlyList<string> partitionColumns,
-        IReadOnlyList<ColumnBatch> batches, bool mergeSchema) =>
-        target.AppendAsync(schema, partitionColumns, batches, mergeSchema).GetAwaiter().GetResult().RowsWritten;
+        IReadOnlyList<ColumnBatch> batches, bool mergeSchema)
+    {
+        EnforceConstraints(target, schema, batches);
+        return target.AppendAsync(schema, partitionColumns, batches, mergeSchema).GetAwaiter().GetResult().RowsWritten;
+    }
+
+    // The backend name attributed in any evaluator diagnostic raised while enforcing a constraint predicate.
+    private const string ConstraintBackendName = "delta-constraint-enforcement";
+
+    /// <summary>
+    /// Enforces the target table's active per-row constraints (column invariants + CHECK constraints, #581)
+    /// over the write batches BEFORE any Parquet file is staged. Each constraint is resolved against the
+    /// write schema (reusing the query path's parse/resolve/coerce via
+    /// <see cref="ConstraintExpressionFrontend"/>, so nested references and non-boolean predicates are handled
+    /// identically to <c>WHERE</c>), translated to a physical predicate, and evaluated over every batch. A row
+    /// is rejected fail-closed when the predicate does not evaluate to <c>true</c> (i.e. <c>false</c> OR
+    /// <c>null</c>), matching Delta's <c>CheckDeltaInvariant.assertRule</c>.
+    /// </summary>
+    /// <remarks>
+    /// TOCTOU: the constraints are read from the same snapshot the write plans against (the table's latest
+    /// committed version at write time). If a concurrent commit changes the table's constraints between this
+    /// read and the optimistic log commit, the committer's metadata-conflict detection rejects the commit, so
+    /// a stale constraint set can never silently publish a violating file. The constraint set is trusted table
+    /// metadata; the untrusted input (the batch rows) is what is validated here.
+    /// </remarks>
+    private static void EnforceConstraints(
+        DeltaWriteTarget target, StructType schema, IReadOnlyList<ColumnBatch> batches)
+    {
+        IReadOnlyList<DeltaTableConstraint> constraints =
+            target.LoadActiveConstraintsAsync().GetAwaiter().GetResult();
+        if (constraints.Count == 0)
+        {
+            return;
+        }
+
+        foreach (DeltaTableConstraint constraint in constraints)
+        {
+            (CoreExpr predicate, IReadOnlyList<ExprAttributeReference> input) =
+                ConstraintExpressionFrontend.ParseResolveWithInput(constraint.Expression, schema);
+            EnginePhysicalExpression physical =
+                PhysicalExpressionTranslator.For(input, AnsiMode.Ansi).Translate(predicate);
+            BatchPredicateEvaluator evaluator = BatchPredicateEvaluator.Build(physical, schema, ConstraintBackendName);
+
+            for (int batchIndex = 0; batchIndex < batches.Count; batchIndex++)
+            {
+                ColumnVector result = evaluator.Evaluate(batches[batchIndex], BoundedExecutionMemory.Unbounded);
+                for (int row = 0; row < result.Length; row++)
+                {
+                    if (result.IsNull(row) || !result.GetValue<bool>(row))
+                    {
+                        throw DeltaConstraintViolationException.ForRow(constraint, batchIndex, row);
+                    }
+                }
+            }
+        }
+    }
 
     private static bool TableExists(DeltaWriteTarget target) =>
         target.TableExistsAsync().GetAwaiter().GetResult();

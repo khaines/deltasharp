@@ -133,6 +133,26 @@ public sealed class DeltaWriteTarget : IDisposable
     public async Task<bool> TableExistsAsync(CancellationToken cancellationToken = default) =>
         await _log.GetLatestCommitVersionAsync(cancellationToken).ConfigureAwait(false) is not null;
 
+    /// <summary>
+    /// Loads the per-row write constraints (column <b>invariants</b> + named <b>CHECK</b> constraints, #581)
+    /// active on the table's latest snapshot — the set the Executor write seam resolves and evaluates over
+    /// each write batch before staging. Returns an empty list when the table does not yet exist (a fresh
+    /// create declares no active constraints to enforce against incoming rows).
+    /// </summary>
+    /// <param name="cancellationToken">Cancels the snapshot load.</param>
+    /// <returns>The active constraints, or an empty list.</returns>
+    public async Task<IReadOnlyList<DeltaTableConstraint>> LoadActiveConstraintsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        if (await _log.GetLatestCommitVersionAsync(cancellationToken).ConfigureAwait(false) is null)
+        {
+            return Array.Empty<DeltaTableConstraint>();
+        }
+
+        Snapshot snapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
+        return DeltaTableConstraints.Collect(snapshot);
+    }
+
     /// <summary>Appends <paramref name="batches"/> to the table (creating it on first write).</summary>
     /// <param name="writeSchema">The full write schema (partition + data columns).</param>
     /// <param name="partitionColumns">The partition column names, in order (a subset of the schema).</param>
