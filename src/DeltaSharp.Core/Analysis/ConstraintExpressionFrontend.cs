@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using DeltaSharp.Plans.Expressions;
 using DeltaSharp.Plans.Logical;
 using DeltaSharp.Sql;
@@ -38,8 +39,9 @@ internal static class ConstraintExpressionFrontend
     /// <param name="schema">The table schema the constraint's column references resolve against.</param>
     /// <returns>The resolved boolean <see cref="Expression"/> (attribute references bound to
     /// <paramref name="schema"/>), ready to evaluate against a matching batch.</returns>
-    /// <exception cref="SqlParseException">The constraint text is malformed, nests too deeply, or has
-    /// trailing tokens.</exception>
+    /// <exception cref="SqlParseException">The constraint text is malformed, has trailing tokens, nests too
+    /// deeply (either the parser's node-depth cap or the frontend's untrusted-constraint depth bound), or
+    /// contains a multipart / nested-field reference (<c>s.f</c>), which is not supported until #580.</exception>
     /// <exception cref="AnalysisException">A referenced column is unknown, a type does not match, or the
     /// predicate is not boolean.</exception>
     internal static Expression ParseAndResolve(string expression, StructType schema)
@@ -49,13 +51,64 @@ internal static class ConstraintExpressionFrontend
 
         Expression parsed = SqlParser.ParseConstraintExpression(expression);
 
+        // Pre-resolve validation (fail closed on UNTRUSTED constraint text before the analyzer touches it):
+        //  * reject MULTIPART references (`s.f`): nested field access is #580, and today the analyzer would
+        //    silently bind `s.f` to a TOP-LEVEL column `f` if one exists, enforcing the WRONG constraint;
+        //  * bound the expression DEPTH: a real CHECK constraint is a shallow predicate, but a hostile
+        //    deeply-nested constraint would drive the analyzer's recursive TransformUp deep enough to exhaust a
+        //    small worker-thread stack (an uncatchable StackOverflow). The whole transform infrastructure is
+        //    stack-size-sensitive at high depth (the node-depth cap is 1000; DeterminismTests exercises 900), so
+        //    rather than reach in there, bound the UNTRUSTED constraint to MaxConstraintExpressionDepth — 10x a
+        //    realistic constraint, well under the parser cap, and safe to resolve on a small (>=256 KB) stack.
+        // Walked ITERATIVELY (explicit stack) so the scan itself cannot overflow on a deep tree.
+        ValidateConstraintShape(parsed);
+
         // Resolve the bare predicate the SAME way WHERE is resolved: analyze Filter(expr, LocalRelation(schema)).
         // LocalRelation carries the schema inline (no catalog table lookup), so the empty catalog is never
         // consulted; the analyzer mints the relation's Output attributes from the schema and binds the
         // predicate's references + types against them, and RequireBooleanCondition rejects a non-boolean result.
         var plan = new Filter(parsed, new LocalRelation(schema, Array.Empty<Row>()));
         LogicalPlan resolved = new Analyzer(new LocalCatalog()).Resolve(plan);
-
         return ((Filter)resolved).Condition;
+    }
+
+    /// <summary>The maximum nesting depth a constraint expression may reach before resolution. A real Delta
+    /// CHECK constraint / invariant is a shallow predicate; this bound (10x a realistic constraint, well below
+    /// the parser's node-depth cap) keeps a hostile deeply-nested constraint from exhausting the analyzer's
+    /// recursive transform on a small worker-thread stack, while accepting every realistic constraint.</summary>
+    private const int MaxConstraintExpressionDepth = 100;
+
+    // Fail-closes an UNTRUSTED constraint BEFORE the analyzer sees it: rejects a multipart (dotted/qualified)
+    // reference (nested field access is #580; qualified table.column is meaningless for a bare single-schema
+    // constraint) and any expression nesting deeper than MaxConstraintExpressionDepth. Walked ITERATIVELY
+    // (explicit stack of (node, depth)) so a deep constraint cannot overflow this pre-resolve scan.
+    private static void ValidateConstraintShape(Expression root)
+    {
+        var pending = new Stack<(Expression Node, int Depth)>();
+        pending.Push((root, 1));
+        while (pending.Count > 0)
+        {
+            (Expression node, int depth) = pending.Pop();
+
+            if (node is UnresolvedAttribute attribute && attribute.NameParts.Count > 1)
+            {
+                throw new SqlParseException(
+                    $"Constraint references '{attribute.Name}' as a multipart reference; nested field access "
+                    + "(struct.field, array[i]) and qualified references are not supported yet (tracked as #580). "
+                    + "A constraint may reference only top-level columns by simple name.");
+            }
+
+            if (depth > MaxConstraintExpressionDepth)
+            {
+                throw new SqlParseException(
+                    $"Constraint expression nests deeper than {MaxConstraintExpressionDepth} levels; a CHECK "
+                    + "constraint must be a shallow predicate over the table's columns.");
+            }
+
+            foreach (Expression child in node.Children)
+            {
+                pending.Push((child, depth + 1));
+            }
+        }
     }
 }

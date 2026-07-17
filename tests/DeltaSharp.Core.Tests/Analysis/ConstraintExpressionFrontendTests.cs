@@ -1,3 +1,4 @@
+using System.Text;
 using System.Threading;
 using DeltaSharp.Analysis;
 using DeltaSharp.Plans.Expressions;
@@ -110,5 +111,61 @@ public sealed class ConstraintExpressionFrontendTests
         worker.Join();
 
         Assert.IsType<SqlParseException>(captured);
+    }
+
+    [Fact]
+    public void ParseAndResolve_MultipartReference_ThrowsSqlParseException()
+    {
+        // Red-team #587 finding: nested field access (#580) is not landed, so a multipart reference `s.f`
+        // currently RESOLVES to a TOP-LEVEL column `f` — silently enforcing the WRONG constraint — when the
+        // schema has both a struct `s` (with field `f`) AND a top-level `f`. Must be rejected fail-closed.
+        StructType structType = new(new[] { new StructField("f", IntegerType.Instance, nullable: true) });
+        StructType schema = Schema(
+            new StructField("s", structType, nullable: true),
+            new StructField("f", IntegerType.Instance, nullable: true));
+
+        SqlParseException ex = Assert.Throws<SqlParseException>(
+            () => ConstraintExpressionFrontend.ParseAndResolve("s.f > 0", schema));
+        Assert.Contains("multipart reference", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ParseAndResolve_ConstraintDeeperThanBound_ThrowsSqlParseException()
+    {
+        // Red-team #587 finding (Critical): a valid-depth-but-deeply-nested constraint (under the parser's 1000
+        // node-depth cap, so it PARSES) would drive the analyzer's recursive resolve deep enough to exhaust a
+        // small worker-thread stack — an uncatchable StackOverflow crash on hostile constraint metadata. A real
+        // CHECK constraint is shallow, so the frontend bounds untrusted constraint depth and rejects an
+        // over-deep one BEFORE resolve, deterministically on any stack (no reliance on stack-size behavior).
+        var sb = new StringBuilder("id");
+        for (int i = 0; i < 200; i++)
+        {
+            sb.Append(" + 1"); // ~depth 201, over the frontend's depth bound but well under the 1000 parser cap
+        }
+
+        sb.Append(" > 0");
+        StructType schema = Schema(new StructField("id", LongType.Instance, nullable: false));
+
+        SqlParseException ex = Assert.Throws<SqlParseException>(
+            () => ConstraintExpressionFrontend.ParseAndResolve(sb.ToString(), schema));
+        Assert.Contains("nests deeper than", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ParseAndResolve_ModeratelyDeepButWithinBound_Resolves()
+    {
+        // No over-reject: a constraint comfortably within the depth bound (a 40-term arithmetic predicate)
+        // resolves to a boolean. Proves the bound rejects only genuinely pathological nesting.
+        var sb = new StringBuilder("id");
+        for (int i = 0; i < 40; i++)
+        {
+            sb.Append(" + 1");
+        }
+
+        sb.Append(" > 0");
+        StructType schema = Schema(new StructField("id", LongType.Instance, nullable: false));
+
+        Expression resolved = ConstraintExpressionFrontend.ParseAndResolve(sb.ToString(), schema);
+        Assert.Equal(BooleanType.Instance, resolved.Type);
     }
 }
