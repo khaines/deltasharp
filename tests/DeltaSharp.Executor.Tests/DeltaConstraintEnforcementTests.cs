@@ -158,4 +158,54 @@ public sealed class DeltaConstraintEnforcementTests : IDisposable
             () => violating.Write.Format("delta").Mode("overwrite").Save(table));
         Assert.False(File.Exists(CommitFile(table, 2)));
     }
+
+    // A schema whose `amount` field declares a column invariant `amount > 0` (delta.invariants metadata).
+    private static readonly StructType InvariantSchema = new(new[]
+    {
+        new StructField("id", IntegerType.Instance, nullable: false),
+        new StructField(
+            "amount", IntegerType.Instance, nullable: true,
+            FieldMetadata.FromEntries(new[] { new KeyValuePair<string, string>(
+                "delta.invariants", "{\"expression\":{\"expression\":\"amount > 0\"}}") })),
+    });
+
+    private static IReadOnlyList<Row> InvariantRows(params int?[] amounts) =>
+        amounts.Select((a, i) => new Row(InvariantSchema, i + 1, a)).ToList();
+
+    [Fact]
+    public void ColumnInvariant_OnCreate_ViolatingRow_RejectedFailClosed()
+    {
+        // The write schema declares a column invariant; a fresh create must validate its OWN rows (no prior
+        // snapshot). A violating row (and a null, which is not-true) is rejected before any commit.
+        string table = Table("invariant-create");
+        using SparkSession spark = NewSession();
+
+        Assert.Throws<DeltaConstraintViolationException>(
+            () => spark.CreateDataFrame(InvariantRows(10, -5), InvariantSchema)
+                .Write.Format("delta").Mode("append").Save(table));
+        Assert.False(File.Exists(CommitFile(table, 0)));
+    }
+
+    [Fact]
+    public void ColumnInvariant_NullValue_RejectedAsNotTrue()
+    {
+        string table = Table("invariant-null");
+        using SparkSession spark = NewSession();
+
+        Assert.Throws<DeltaConstraintViolationException>(
+            () => spark.CreateDataFrame(InvariantRows(10, null), InvariantSchema)
+                .Write.Format("delta").Mode("append").Save(table));
+    }
+
+    [Fact]
+    public void ColumnInvariant_SatisfyingRows_Committed()
+    {
+        string table = Table("invariant-ok");
+        using SparkSession spark = NewSession();
+
+        spark.CreateDataFrame(InvariantRows(10, 20), InvariantSchema)
+            .Write.Format("delta").Mode("append").Save(table);
+
+        Assert.True(File.Exists(CommitFile(table, 0)));
+    }
 }

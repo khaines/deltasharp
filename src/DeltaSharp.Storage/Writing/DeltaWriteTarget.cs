@@ -135,22 +135,29 @@ public sealed class DeltaWriteTarget : IDisposable
 
     /// <summary>
     /// Loads the per-row write constraints (column <b>invariants</b> + named <b>CHECK</b> constraints, #581)
-    /// active on the table's latest snapshot — the set the Executor write seam resolves and evaluates over
-    /// each write batch before staging. Returns an empty list when the table does not yet exist (a fresh
-    /// create declares no active constraints to enforce against incoming rows).
+    /// a write with declared schema <paramref name="writeSchema"/> must enforce — the union of the table's
+    /// active constraints (from its latest snapshot) and any invariant declared on <paramref name="writeSchema"/>
+    /// itself (so a fresh create, or a mergeSchema append adding a constrained column, validates its own rows).
     /// </summary>
+    /// <param name="writeSchema">The declared write schema (its fields may carry <c>delta.invariants</c>).</param>
     /// <param name="cancellationToken">Cancels the snapshot load.</param>
     /// <returns>The active constraints, or an empty list.</returns>
+    /// <exception cref="DeltaProtocolException">A constraint is malformed, empty, or a nested-field invariant.</exception>
+    /// <remarks>
+    /// This reads the table's latest committed version <b>independently</b> of the subsequent commit path, so
+    /// under concurrency the constraint set and the commit's base snapshot can differ. Threading a single
+    /// snapshot through enforcement and the commit (so a concurrently-added constraint is a genuine commit
+    /// conflict) is tracked in <b>#596</b>.
+    /// </remarks>
     public async Task<IReadOnlyList<DeltaTableConstraint>> LoadActiveConstraintsAsync(
-        CancellationToken cancellationToken = default)
+        StructType writeSchema, bool includeExisting = true, CancellationToken cancellationToken = default)
     {
-        if (await _log.GetLatestCommitVersionAsync(cancellationToken).ConfigureAwait(false) is null)
-        {
-            return Array.Empty<DeltaTableConstraint>();
-        }
-
-        Snapshot snapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
-        return DeltaTableConstraints.Collect(snapshot);
+        ArgumentNullException.ThrowIfNull(writeSchema);
+        Snapshot? snapshot = !includeExisting
+            || await _log.GetLatestCommitVersionAsync(cancellationToken).ConfigureAwait(false) is null
+            ? null
+            : await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
+        return DeltaTableConstraints.CollectForWrite(snapshot, writeSchema);
     }
 
     /// <summary>Appends <paramref name="batches"/> to the table (creating it on first write).</summary>

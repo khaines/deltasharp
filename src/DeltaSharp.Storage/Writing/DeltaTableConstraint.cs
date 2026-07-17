@@ -32,55 +32,132 @@ public enum DeltaConstraintKind
 public sealed record DeltaTableConstraint(DeltaConstraintKind Kind, string Name, string Expression);
 
 /// <summary>
-/// Collects the <see cref="DeltaTableConstraint"/>s active on a <see cref="Snapshot"/> (#581): the named
-/// CHECK constraints from <c>metaData.configuration</c> (<c>delta.constraints.*</c>) and the column
-/// invariants from the schema fields' <c>delta.invariants</c> metadata. The write seam resolves and
-/// evaluates these over each write batch before staging.
+/// Collects the <see cref="DeltaTableConstraint"/>s a write must enforce (#581): named CHECK constraints
+/// from <c>metaData.configuration</c> (<c>delta.constraints.*</c>) and column invariants from the schema
+/// fields' <c>delta.invariants</c> metadata. Collection fails <b>closed</b> on any constraint this build
+/// cannot fully honor — an empty CHECK predicate, a malformed invariant value, or a <b>nested-field</b>
+/// invariant (per-row enforcement not wired yet, #595) — so a constraint is never silently dropped.
 /// </summary>
 internal static class DeltaTableConstraints
 {
     private const string CheckConstraintKeyPrefix = "delta.constraints.";
     private const string InvariantKey = "delta.invariants";
 
-    /// <summary>Collects the CHECK constraints and column invariants active on <paramref name="snapshot"/>.</summary>
-    /// <param name="snapshot">The target table snapshot the write lands against.</param>
-    /// <returns>The active constraints, or an empty list when the table declares none.</returns>
-    /// <exception cref="DeltaProtocolException">A <c>delta.invariants</c> metadata value is malformed.</exception>
+    /// <summary>
+    /// Collects the constraints a write to <paramref name="snapshot"/> with declared write schema
+    /// <paramref name="writeSchema"/> must enforce: the snapshot's CHECK constraints + column invariants,
+    /// unioned (deduplicated) with any invariant declared on the incoming <paramref name="writeSchema"/> (so a
+    /// fresh create, or a <c>mergeSchema</c> append that adds a constrained column, validates its own rows).
+    /// Deterministically ordered so the first reported violation is stable.
+    /// </summary>
+    /// <exception cref="DeltaProtocolException">A constraint is malformed, empty, or a nested-field invariant.</exception>
+    public static IReadOnlyList<DeltaTableConstraint> CollectForWrite(Snapshot? snapshot, StructType writeSchema)
+    {
+        ArgumentNullException.ThrowIfNull(writeSchema);
+
+        var seen = new HashSet<DeltaTableConstraint>();
+        var constraints = new List<DeltaTableConstraint>();
+
+        void Add(DeltaTableConstraint constraint)
+        {
+            if (seen.Add(constraint))
+            {
+                constraints.Add(constraint);
+            }
+        }
+
+        if (snapshot is not null)
+        {
+            CollectChecks(snapshot.Metadata.Configuration, Add);
+            CollectInvariants(snapshot.Schema, Add);
+        }
+
+        CollectInvariants(writeSchema, Add);
+
+        constraints.Sort(static (a, b) =>
+        {
+            int byKind = a.Kind.CompareTo(b.Kind);
+            return byKind != 0 ? byKind : string.CompareOrdinal(a.Name, b.Name);
+        });
+        return constraints;
+    }
+
+    /// <summary>Collects the CHECK constraints + column invariants active on <paramref name="snapshot"/>.</summary>
     public static IReadOnlyList<DeltaTableConstraint> Collect(Snapshot snapshot)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
+        return CollectForWrite(snapshot, snapshot.Schema);
+    }
 
-        List<DeltaTableConstraint>? constraints = null;
-
-        // Named CHECK constraints: delta.constraints.<name> = <boolean predicate>.
-        foreach (KeyValuePair<string, string> entry in snapshot.Metadata.Configuration)
+    private static void CollectChecks(
+        IReadOnlyDictionary<string, string> configuration, Action<DeltaTableConstraint> add)
+    {
+        foreach (KeyValuePair<string, string> entry in configuration)
         {
-            if (entry.Key.StartsWith(CheckConstraintKeyPrefix, StringComparison.Ordinal)
-                && !string.IsNullOrWhiteSpace(entry.Value))
+            if (!entry.Key.StartsWith(CheckConstraintKeyPrefix, StringComparison.Ordinal))
             {
-                (constraints ??= new List<DeltaTableConstraint>()).Add(new DeltaTableConstraint(
-                    DeltaConstraintKind.Check,
-                    entry.Key[CheckConstraintKeyPrefix.Length..],
-                    entry.Value));
+                continue;
             }
-        }
 
-        // Column invariants: a field's delta.invariants metadata carries a persisted boolean predicate.
-        foreach (StructField field in snapshot.Schema)
+            string name = entry.Key[CheckConstraintKeyPrefix.Length..];
+            if (string.IsNullOrWhiteSpace(entry.Value))
+            {
+                throw DeltaProtocolException.Unsupported(
+                    $"CHECK constraint '{name}' declares an empty predicate; the write is refused fail-closed "
+                    + "rather than silently skip a declared constraint.");
+            }
+
+            add(new DeltaTableConstraint(DeltaConstraintKind.Check, name, entry.Value));
+        }
+    }
+
+    private static void CollectInvariants(StructType schema, Action<DeltaTableConstraint> add)
+    {
+        foreach (StructField field in schema)
         {
             if (field.Metadata.TryGetString(InvariantKey, out string? persisted))
             {
-                (constraints ??= new List<DeltaTableConstraint>()).Add(new DeltaTableConstraint(
+                add(new DeltaTableConstraint(
                     DeltaConstraintKind.Invariant, field.Name, ParseInvariantExpression(field.Name, persisted)));
             }
-        }
 
-        return constraints ?? (IReadOnlyList<DeltaTableConstraint>)Array.Empty<DeltaTableConstraint>();
+            RejectNestedInvariant(field.Name, field.DataType);
+        }
     }
 
-    // A column invariant persists as a JSON PersistedExpression: {"expression":{"expression":"<sql>"}}
-    // (delta-io/delta Invariants.PersistedExpression). Extract the inner boolean predicate text, failing
-    // closed on a malformed value rather than silently dropping enforcement.
+    // Fail closed if an invariant is attached anywhere in a nested type (struct field / array element / map
+    // key or value) — enforcing it per row needs a nested field-path evaluator not yet wired (#595). Spark
+    // attaches an invariant to the field it guards, including nested fields, so a silent skip is a fail-open.
+    private static void RejectNestedInvariant(string path, DataType type)
+    {
+        switch (type)
+        {
+            case StructType nested:
+                foreach (StructField field in nested)
+                {
+                    string childPath = path + "." + field.Name;
+                    if (field.Metadata.TryGetString(InvariantKey, out _))
+                    {
+                        throw DeltaProtocolException.Unsupported(
+                            $"Column '{childPath}' declares a nested 'delta.invariants' column invariant; "
+                            + "per-row enforcement of a nested-field invariant is not supported yet (#595), so "
+                            + "the write is refused fail-closed rather than silently skip it.");
+                    }
+
+                    RejectNestedInvariant(childPath, field.DataType);
+                }
+
+                break;
+            case ArrayType array:
+                RejectNestedInvariant(path + ".element", array.ElementType);
+                break;
+            case MapType map:
+                RejectNestedInvariant(path + ".key", map.KeyType);
+                RejectNestedInvariant(path + ".value", map.ValueType);
+                break;
+        }
+    }
+
     private static string ParseInvariantExpression(string column, string persisted)
     {
         try
@@ -101,8 +178,8 @@ internal static class DeltaTableConstraints
         }
 
         throw DeltaProtocolException.Unsupported(
-            $"Column '{column}' declares a 'delta.invariants' value this build cannot parse as a "
-            + "'{{\"expression\":{{\"expression\":\"<predicate>\"}}}}' persisted expression; the write is "
+            $"Column '{column}' declares a 'delta.invariants' value this build cannot parse as a persisted "
+            + "expression of the form '{{\"expression\":{{\"expression\":\"<predicate>\"}}}}'; the write is "
             + "refused fail-closed rather than silently skip invariant enforcement.");
     }
 }

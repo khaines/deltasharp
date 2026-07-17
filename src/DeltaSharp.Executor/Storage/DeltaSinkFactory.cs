@@ -119,7 +119,7 @@ internal sealed class DeltaLocalSink : ILocalSink
                         + "add columns additively.");
                 }
 
-                EnforceConstraints(target, schema, batches);
+                EnforceConstraints(target, schema, batches, includeExisting: !ResolveOverwriteSchema());
                 return target
                     .OverwriteAsync(
                         schema, partitionColumns, batches,
@@ -176,7 +176,7 @@ internal sealed class DeltaLocalSink : ILocalSink
         DeltaWriteTarget target, StructType schema, IReadOnlyList<string> partitionColumns,
         IReadOnlyList<ColumnBatch> batches, bool mergeSchema)
     {
-        EnforceConstraints(target, schema, batches);
+        EnforceConstraints(target, schema, batches, includeExisting: true);
         return target.AppendAsync(schema, partitionColumns, batches, mergeSchema).GetAwaiter().GetResult().RowsWritten;
     }
 
@@ -184,26 +184,29 @@ internal sealed class DeltaLocalSink : ILocalSink
     private const string ConstraintBackendName = "delta-constraint-enforcement";
 
     /// <summary>
-    /// Enforces the target table's active per-row constraints (column invariants + CHECK constraints, #581)
-    /// over the write batches BEFORE any Parquet file is staged. Each constraint is resolved against the
-    /// write schema (reusing the query path's parse/resolve/coerce via
-    /// <see cref="ConstraintExpressionFrontend"/>, so nested references and non-boolean predicates are handled
-    /// identically to <c>WHERE</c>), translated to a physical predicate, and evaluated over every batch. A row
-    /// is rejected fail-closed when the predicate does not evaluate to <c>true</c> (i.e. <c>false</c> OR
-    /// <c>null</c>), matching Delta's <c>CheckDeltaInvariant.assertRule</c>.
+    /// Enforces the write's active per-row constraints (column invariants + CHECK constraints, #581) over the
+    /// write batches BEFORE any Parquet file is staged. The constraint set is the union of the target table's
+    /// active constraints and any invariant declared on the incoming write schema (so a fresh create, or a
+    /// mergeSchema append that adds a constrained column, validates its own rows). Each is resolved against the
+    /// write schema (reusing the query path's parse/resolve/coerce via <see cref="ConstraintExpressionFrontend"/>,
+    /// so nested references and non-boolean predicates are handled identically to <c>WHERE</c>), translated to a
+    /// physical predicate, and evaluated over every batch. A row is rejected fail-closed when the predicate does
+    /// not evaluate to <c>true</c> (i.e. <c>false</c> OR <c>null</c>), matching Delta's
+    /// <c>CheckDeltaInvariant.assertRule</c>. <paramref name="includeExisting"/> is false for an
+    /// overwrite that replaces the schema (<c>overwriteSchema=true</c>): the existing table's constraints are
+    /// dropped with the schema, so only the incoming schema's invariants apply.
     /// </summary>
     /// <remarks>
-    /// TOCTOU: the constraints are read from the same snapshot the write plans against (the table's latest
-    /// committed version at write time). If a concurrent commit changes the table's constraints between this
-    /// read and the optimistic log commit, the committer's metadata-conflict detection rejects the commit, so
-    /// a stale constraint set can never silently publish a violating file. The constraint set is trusted table
+    /// TOCTOU: the constraint set is read from the table's latest committed version, read independently of the
+    /// commit path — so under concurrency it and the commit's base snapshot can differ. Threading a single
+    /// snapshot through enforcement and the commit is tracked in #596. The constraint set is trusted table
     /// metadata; the untrusted input (the batch rows) is what is validated here.
     /// </remarks>
     private static void EnforceConstraints(
-        DeltaWriteTarget target, StructType schema, IReadOnlyList<ColumnBatch> batches)
+        DeltaWriteTarget target, StructType schema, IReadOnlyList<ColumnBatch> batches, bool includeExisting)
     {
         IReadOnlyList<DeltaTableConstraint> constraints =
-            target.LoadActiveConstraintsAsync().GetAwaiter().GetResult();
+            target.LoadActiveConstraintsAsync(schema, includeExisting).GetAwaiter().GetResult();
         if (constraints.Count == 0)
         {
             return;

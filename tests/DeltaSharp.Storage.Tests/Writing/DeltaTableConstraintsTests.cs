@@ -105,4 +105,53 @@ public sealed class DeltaTableConstraintsTests : System.IDisposable
 
         Assert.Throws<DeltaProtocolException>(() => DeltaTableConstraints.Collect(snapshot));
     }
+
+    [Fact]
+    public void CollectForWrite_WriteSchemaInvariant_NoSnapshot_IsReturned()
+    {
+        // A fresh create (no snapshot) still enforces an invariant declared on the incoming write schema.
+        DeltaTableConstraint constraint = Assert.Single(DeltaTableConstraints.CollectForWrite(
+            snapshot: null, SchemaWithInvariant("{\"expression\":{\"expression\":\"amount > 0\"}}")));
+
+        Assert.Equal(DeltaConstraintKind.Invariant, constraint.Kind);
+        Assert.Equal("amount > 0", constraint.Expression);
+    }
+
+    [Fact]
+    public void CollectForWrite_EmptyCheckConstraint_FailsClosed()
+    {
+        var schema = new StructType(new[] { new StructField("id", IntegerType.Instance, nullable: false) });
+        // A present delta.constraints.* key with an empty predicate must fail closed (not be silently skipped).
+        Assert.Throws<DeltaProtocolException>(() => DeltaTableConstraints.CollectForWrite(
+            SnapshotWithCheck(""), schema));
+    }
+
+    [Fact]
+    public async Task Collect_NestedFieldInvariant_FailsClosed()
+    {
+        // An invariant attached to a NESTED (struct) field is rejected fail-closed (#595) rather than silently
+        // unenforced — a nested-field invariant per-row evaluator is not wired yet.
+        var inner = new StructType(new[]
+        {
+            new StructField(
+                "f", IntegerType.Instance, nullable: true,
+                FieldMetadata.FromEntries(new[] { new System.Collections.Generic.KeyValuePair<string, string>(
+                    "delta.invariants", "{\"expression\":{\"expression\":\"f > 0\"}}") })),
+        });
+        var schema = new StructType(new[]
+        {
+            new StructField("id", IntegerType.Instance, nullable: false),
+            new StructField("s", inner, nullable: true),
+        });
+        Snapshot snapshot = await WriteAndLoadAsync(schema);
+
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() => DeltaTableConstraints.Collect(snapshot));
+        Assert.Contains("#595", ex.Message, System.StringComparison.Ordinal);
+    }
+
+    private Snapshot SnapshotWithCheck(string value)
+    {
+        var schema = new StructType(new[] { new StructField("id", IntegerType.Instance, nullable: false) });
+        return WriteAndLoadAsync(schema, ("delta.constraints.ck", value)).GetAwaiter().GetResult();
+    }
 }
