@@ -1,3 +1,4 @@
+using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Engine.Execution;
 using DeltaSharp.Types;
 using Xunit;
@@ -41,6 +42,30 @@ public class PhysicalPlanShapeTests
 
         FilterPlan filter = Assert.IsType<FilterPlan>(plan);
         Assert.IsType<ComparisonExpression>(filter.Predicate);
+        Assert.IsType<ScanPlan>(Assert.Single(filter.Children));
+    }
+
+    [Fact]
+    public void Filter_OnNestedField_MapsTo_StructFieldExpression_OverScan()
+    {
+        // #580: a multipart reference `addr.zip` resolves to a struct-field extraction and translates
+        // to an Engine StructFieldExpression (nested field access), wiring analyzer -> translator.
+        StructType addr = TestData.Schema(TestData.Field("zip", IntegerType.Instance, nullable: false));
+        StructType schema = TestData.Schema(
+            TestData.Field("id", IntegerType.Instance, nullable: false),
+            TestData.Field("addr", addr, nullable: true));
+        var fixture = new InMemoryRelationFixture();
+        DataFrame people = fixture.Relation("people", schema, TestData.Batch(
+            schema, TestData.Ints(1), new StructColumnVector(addr, new[] { TestData.Ints(90210) })));
+
+        PhysicalPlan plan = fixture.Plan(people.Filter(Col("addr.zip").Gt(0)));
+
+        FilterPlan filter = Assert.IsType<FilterPlan>(plan);
+        ComparisonExpression predicate = Assert.IsType<ComparisonExpression>(filter.Predicate);
+        StructFieldExpression field = Assert.IsType<StructFieldExpression>(predicate.Left);
+        Assert.Equal(0, field.Ordinal);
+        Assert.Equal(IntegerType.Instance, field.Type);
+        Assert.IsType<ColumnReference>(field.Child);
         Assert.IsType<ScanPlan>(Assert.Single(filter.Children));
     }
 

@@ -22,12 +22,14 @@ using EngineNullOrdering = DeltaSharp.Engine.Execution.NullOrdering;
 using EnginePhysicalExpression = DeltaSharp.Engine.Execution.PhysicalExpression;
 using EngineSortDirection = DeltaSharp.Engine.Execution.SortDirection;
 using EngineSortOrder = DeltaSharp.Engine.Execution.SortOrder;
+using EngineStructFieldExpression = DeltaSharp.Engine.Execution.StructFieldExpression;
 using ExprAlias = DeltaSharp.Plans.Expressions.Alias;
 using ExprAnd = DeltaSharp.Plans.Expressions.And;
 using ExprAttributeReference = DeltaSharp.Plans.Expressions.AttributeReference;
 using ExprBinaryArithmetic = DeltaSharp.Plans.Expressions.BinaryArithmetic;
 using ExprBinaryComparison = DeltaSharp.Plans.Expressions.BinaryComparison;
 using ExprCast = DeltaSharp.Plans.Expressions.Cast;
+using ExprGetStructField = DeltaSharp.Plans.Expressions.GetStructField;
 using ExprIsNotNull = DeltaSharp.Plans.Expressions.IsNotNull;
 using ExprIsNull = DeltaSharp.Plans.Expressions.IsNull;
 using ExprNot = DeltaSharp.Plans.Expressions.Not;
@@ -109,6 +111,14 @@ internal sealed class PhysicalExpressionTranslator
 
             case ExprCast cast:
                 return new EngineCastExpression(Translate(cast.Child), cast.TargetType, _mode);
+
+            case ExprGetStructField field:
+                return new EngineStructFieldExpression(
+                    Translate(field.Child),
+                    field.Ordinal,
+                    field.Type ?? throw UnsupportedPlanException.ForExpression(
+                        "GetStructField", "the nested field's type is unresolved (child is not a struct)"),
+                    field.Nullable);
 
             case ExprResolvedFunction function:
                 throw UnsupportedPlanException.ForExpression(

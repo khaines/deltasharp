@@ -124,6 +124,10 @@ internal static class ExpressionEvaluators
             case IsNullExpression isNull:
                 return new NullCheckEvaluator(isNull, Build(isNull.Child, inputSchema, backendName, kind));
 
+            case StructFieldExpression structField:
+                return new StructFieldEvaluator(
+                    structField, Build(structField.Child, inputSchema, backendName, kind));
+
             default:
                 throw new UnsupportedOperatorException(
                     kind,
