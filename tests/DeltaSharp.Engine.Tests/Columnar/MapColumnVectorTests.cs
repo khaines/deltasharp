@@ -233,6 +233,7 @@ public class MapColumnVectorTests
     [Fact]
     public void EndMap_AfterSlice_IsRejected()
     {
+        // #575: slicing seals the builder AND its shared key/value children.
         var map = new MapColumnVector(StringToInt, capacity: 4);
         var keys = (MutableColumnVector)map.Keys;
         var values = (MutableColumnVector)map.Values;
@@ -240,9 +241,10 @@ public class MapColumnVectorTests
         values.AppendValue(1);
         map.EndMap();
         _ = map.Slice(0, 1);
-        keys.AppendBytes("k2"u8);
-        values.AppendValue(2);
-        Assert.Throws<InvalidOperationException>(() => map.EndMap());
+        Assert.Throws<InvalidOperationException>(() => keys.AppendBytes("k2"u8));   // #575: key child sealed
+        Assert.Throws<InvalidOperationException>(() => values.AppendValue(2));      // #575: value child sealed
+        Assert.Throws<InvalidOperationException>(() => values.SetValue(0, 999));    // #575: in-range value corruption blocked
+        Assert.Throws<InvalidOperationException>(() => map.EndMap());               // parent sealed
     }
 
     [Fact]

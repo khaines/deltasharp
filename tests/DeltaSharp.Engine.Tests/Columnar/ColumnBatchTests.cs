@@ -80,4 +80,17 @@ public class ColumnBatchTests
         Assert.Throws<ArgumentException>(() =>
             new ManagedColumnBatch(single, new ColumnVector[] { only }, rowCount: 5)); // length mismatch
     }
+
+    [Fact]
+    public void Slice_OverflowingRange_IsRejected()
+    {
+        // #576: offset+length overflows int; the (long) guard must reject rather than wrap-and-fail-open.
+        // Use a ZERO-column batch so the batch's own (long) guard is the sole defense — a populated batch
+        // lets the per-column (long) guard mask a regression of the batch-level cast (#578 arch/relspec review).
+        var empty = new StructType(Array.Empty<StructField>());
+        var batch = new ManagedColumnBatch(empty, Array.Empty<ColumnVector>(), rowCount: 1);
+        ArgumentOutOfRangeException ex =
+            Assert.Throws<ArgumentOutOfRangeException>(() => batch.Slice(int.MaxValue, 1));
+        Assert.Contains("row count", ex.Message); // batch guard, not a child column's "exceeds length"
+    }
 }

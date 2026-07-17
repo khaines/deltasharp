@@ -160,4 +160,8 @@ public abstract class ColumnVector
     protected virtual void SealForView()
     {
     }
+
+    /// <summary>Assembly-internal seal entry point so a nested vector can propagate the seal to its shared
+    /// child vectors when it is sliced/viewed (#575); on a flat vector this just marks it sealed.</summary>
+    internal void Seal() => SealForView();
 }

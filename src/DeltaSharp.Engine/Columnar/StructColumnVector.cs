@@ -218,11 +218,10 @@ public sealed class StructColumnVector : MutableColumnVector
         CheckRange(offset, length);
 
         // Zero-copy: share the children and validity buffer; the window re-bases logical row 0 via _offset.
-        // Sealing this builder blocks further row commits (EndStruct/AppendNull) so the parent's validity
-        // buffer is not resized under the view. NOTE: the shared child vectors are NOT sealed — a caller that
-        // retained a mutable child reference from Child(i) BEFORE slicing could still mutate it and desync
-        // this view; the contract is "build fully before slicing" (child-seal propagation tracked in #575).
-        _sealed = true;
+        // SealForView() blocks further row commits (EndStruct/AppendNull) so the parent's validity buffer is
+        // not resized under the view, AND propagates the seal to the shared child vectors (#575) so a caller
+        // that retained a mutable child reference from Child(i) cannot mutate it and desync this view.
+        SealForView();
 
         int absoluteOffset = _offset + offset;
         int nulls = Bitmap.CountNulls(_validity, absoluteOffset, length);
@@ -242,8 +241,16 @@ public sealed class StructColumnVector : MutableColumnVector
             + "representation increment (#570); gathered/late-materialized nested Select is a follow-up (#546). "
             + "Use Slice for a contiguous sub-range or materialize the column.");
 
-    /// <summary>Seals the owner so a selection/slice view shares the buffers safely.</summary>
-    protected override void SealForView() => _sealed = true;
+    /// <summary>Seals this owner and, recursively, its child vectors (#575) so a slice/selection view shares
+    /// the buffers safely — a retained mutable child reference cannot be mutated after a view is taken.</summary>
+    protected override void SealForView()
+    {
+        _sealed = true;
+        foreach (ColumnVector child in _children)
+        {
+            child.Seal();
+        }
+    }
 
     /// <summary>Not supported: a struct has no flat scalar value. Append into each field child, then <see cref="EndStruct"/>.</summary>
     /// <exception cref="InvalidOperationException">Always.</exception>

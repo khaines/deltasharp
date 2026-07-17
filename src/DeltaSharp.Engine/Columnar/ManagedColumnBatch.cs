@@ -59,10 +59,10 @@ public sealed class ManagedColumnBatch : ColumnBatch
     {
         ArgumentOutOfRangeException.ThrowIfNegative(offset);
         ArgumentOutOfRangeException.ThrowIfNegative(length);
-        if (offset + length > _rowCount)
+        if ((long)offset + length > _rowCount)
         {
             throw new ArgumentOutOfRangeException(
-                nameof(length), length, $"Slice [{offset}, {offset + length}) exceeds row count {_rowCount}.");
+                nameof(length), length, $"Slice [{offset}, {(long)offset + length}) exceeds row count {_rowCount}.");
         }
 
         var sliced = new ColumnVector[_columns.Length];

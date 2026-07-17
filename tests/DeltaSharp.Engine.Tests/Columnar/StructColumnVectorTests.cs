@@ -253,16 +253,31 @@ public class StructColumnVectorTests
     [Fact]
     public void EndStruct_AfterSlice_IsRejected()
     {
-        // Slicing a live builder seals it; a subsequent row-commit must throw rather than resize buffers
-        // out from under the returned view (anti-aliasing).
+        // Slicing a live builder seals it AND its shared children (#575), so neither a retained mutable child
+        // ref nor a later row-commit can mutate buffers out from under the returned view (anti-aliasing).
         var s = new StructColumnVector(PersonType, capacity: 4);
-        ((MutableColumnVector)s.Child(0)).AppendValue(1);
+        var id = (MutableColumnVector)s.Child(0);
+        id.AppendValue(1);
         ((MutableColumnVector)s.Child(1)).AppendBytes("a"u8);
         s.EndStruct();
         _ = s.Slice(0, 1);
-        ((MutableColumnVector)s.Child(0)).AppendValue(2);
-        ((MutableColumnVector)s.Child(1)).AppendBytes("b"u8);
-        Assert.Throws<InvalidOperationException>(() => s.EndStruct());
+        Assert.Throws<InvalidOperationException>(() => id.AppendValue(2));   // #575: child sealed
+        Assert.Throws<InvalidOperationException>(() => s.EndStruct());       // parent sealed
+    }
+
+    [Fact]
+    public void Slice_SealsNestedGrandchildren()
+    {
+        // #575 recursion: slicing a struct<xs: array<int>> seals the list child AND its element grandchild.
+        var schema = new StructType(new[] { new StructField("xs", new ArrayType(IntegerType.Instance)) });
+        var s = (StructColumnVector)ColumnVectors.Create(schema, 2);
+        var list = (ListColumnVector)s.Child(0);
+        var elements = (MutableColumnVector)list.Elements;
+        elements.AppendValue(1);
+        list.EndList();
+        s.EndStruct();
+        _ = s.Slice(0, 1);
+        Assert.Throws<InvalidOperationException>(() => elements.AppendValue(2));
     }
 
     [Fact]
@@ -284,5 +299,18 @@ public class StructColumnVectorTests
         Assert.False(s.IsNull(0));
         Assert.True(s.IsNull(1));
         Assert.Equal(StructType.Empty, s.Type);
+    }
+
+    [Fact]
+    public void NullField_IsAllowed_NullabilityAdvisory()
+    {
+        // #577: struct field nullability is ADVISORY. A null value in a non-nullable field is represented,
+        // not rejected — consistent with DeltaSharp's Spark-parity advisory-nullability convention.
+        var schema = new StructType(new[] { new StructField("id", IntegerType.Instance, nullable: false) });
+        var s = new StructColumnVector(schema, capacity: 4);
+        ((MutableColumnVector)s.Child(0)).AppendNull();
+        s.EndStruct();
+        Assert.Equal(1, s.Length);
+        Assert.True(s.Child(0).IsNull(0));
     }
 }

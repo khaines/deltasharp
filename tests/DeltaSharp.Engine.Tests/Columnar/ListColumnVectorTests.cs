@@ -202,13 +202,14 @@ public class ListColumnVectorTests
     [Fact]
     public void EndList_AfterSlice_IsRejected()
     {
+        // #575: slicing seals the builder AND its shared element child.
         var list = new ListColumnVector(IntList, capacity: 4);
         var elements = (MutableColumnVector)list.Elements;
         elements.AppendValue(10);
         list.EndList();
         _ = list.Slice(0, 1);
-        elements.AppendValue(20);
-        Assert.Throws<InvalidOperationException>(() => list.EndList());
+        Assert.Throws<InvalidOperationException>(() => elements.AppendValue(20));  // #575: child sealed
+        Assert.Throws<InvalidOperationException>(() => list.EndList());            // parent sealed
     }
 
     [Fact]
@@ -241,5 +242,19 @@ public class ListColumnVectorTests
         Assert.True(list.IsNull(0));
         Assert.Equal(0, list.ElementLength(0));
         Assert.Equal(0, list.ElementsAt(0).Length);
+    }
+
+    [Fact]
+    public void NullElement_IsAllowed_ContainsNullAdvisory()
+    {
+        // #577: element nullability is ADVISORY. A null element in a containsNull=false list is represented,
+        // not rejected — consistent with DeltaSharp's Spark-parity advisory-nullability convention.
+        var noNullList = new ArrayType(IntegerType.Instance, containsNull: false);
+        var list = new ListColumnVector(noNullList, capacity: 4);
+        var elements = (MutableColumnVector)list.Elements;
+        elements.AppendNull();
+        list.EndList();
+        Assert.Equal(1, list.Length);
+        Assert.True(list.ElementsAt(0).IsNull(0));
     }
 }

@@ -91,4 +91,21 @@ public class SlicingTests
         Assert.Equal(1, sliced.Column(0).GetValue<int>(0));
         Assert.Equal("n2", Encoding.UTF8.GetString(sliced.Column(1).GetBytes(1)));
     }
+
+    [Fact]
+    public void FixedWidthSlice_OverflowingRange_IsRejected()
+    {
+        // #576: offset+length overflows int on a 0-length vector; the (long) guard must still reject it
+        // (a plain int add would wrap negative and fail open, returning an invalid view).
+        MutableColumnVector v = ColumnVectors.Create(IntegerType.Instance, capacity: 1); // 0 rows
+        Assert.Throws<ArgumentOutOfRangeException>(() => v.Slice(int.MaxValue, 1));
+    }
+
+    [Fact]
+    public void VariableWidthSlice_OverflowingRange_IsRejected()
+    {
+        // #576: same overflow guard on the variable-width lane.
+        MutableColumnVector v = ColumnVectors.Create(StringType.Instance, capacity: 1); // 0 rows
+        Assert.Throws<ArgumentOutOfRangeException>(() => v.Slice(int.MaxValue, 1));
+    }
 }
