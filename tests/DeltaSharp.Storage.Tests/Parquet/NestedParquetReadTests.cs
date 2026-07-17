@@ -51,6 +51,15 @@ public sealed class NestedParquetReadTests
         public Wide? W { get; set; }
     }
 
+    private sealed class TwoStructRow
+    {
+        public int Id { get; set; }
+
+        public Wide? A { get; set; }
+
+        public Wide? B { get; set; }
+    }
+
     private sealed class ListRow
     {
         public int Id { get; set; }
@@ -763,6 +772,118 @@ public sealed class NestedParquetReadTests
         Assert.Equal(0L, w.Child("L").GetValue<long>(0));
         Assert.Equal(1999L, w.Child("L").GetValue<long>(1999));
         Assert.Equal(1999 * 1.5, w.Child("D").GetValue<double>(1999));
+    }
+
+    [Fact]
+    public async Task NestedDecodeCeiling_ChargesListStructuralArrays_FailsClosed()
+    {
+        // R9 finding 1 (Critical, red-team): a list/map's OWN per-row structural arrays (offsets + null mask)
+        // must be charged to the reconstruction budget too, not just the element leaf. 10,000 single-element
+        // int lists have an element leaf budget of ~170,000 bytes (10,000 * 17) and a structural cost of
+        // ~50,000 (10,000 * (4 offset + 1 null)); each is individually under a 180,000-byte ceiling (so the
+        // element-leaf-only budget passes), but their combined ~220,000 exceeds it. The flat EnsureDecodeCeiling
+        // (raw U ~40,000, and its (iii) structural bound ~50,000) also passes, so only charging the structure
+        // to the shared budget catches the overrun.
+        var rows = new List<ListRow>(10_000);
+        for (int i = 0; i < 10_000; i++)
+        {
+            rows.Add(new ListRow { Id = i, Arr = new List<int?> { i } });
+        }
+
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField("Arr", DataTypes.CreateArrayType(DataTypes.IntegerType, containsNull: true), nullable: true),
+        });
+        var reader = new ParquetFileReader(new ParquetDecodeLimits(maxRowGroupDecodedBytes: 180_000));
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => EnumerateAsync(reader, bytes, requested));
+
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+        Assert.Contains("would exceed", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task NestedDecodeCeiling_SharesBudgetAcrossNestedColumns_FailsClosed()
+    {
+        // R9 finding 2 (Critical, red-team): the budget must be ONE per row-group read, shared across every
+        // nested column — not a fresh ceiling per column. Two struct<L,D,Flag> columns over 2000 rows each
+        // reconstruct ~98,000 bytes apiece; each is under a 110,000-byte ceiling (so a per-column budget passes
+        // both), but their combined ~196,000 exceeds it. The flat EnsureDecodeCeiling (raw U of all six leaves
+        // ~65,000) also passes, so only a shared row-group budget catches the combined overrun.
+        var rows = new List<TwoStructRow>(2000);
+        for (int i = 0; i < 2000; i++)
+        {
+            rows.Add(new TwoStructRow
+            {
+                Id = i,
+                A = new Wide { L = i, D = i * 1.5, Flag = (i & 1) == 0 },
+                B = new Wide { L = -i, D = i * 2.5, Flag = (i & 1) == 1 },
+            });
+        }
+
+        byte[] bytes = await WriteAsync(rows);
+
+        StructType wideType = DataTypes.CreateStructType(new[]
+        {
+            DataTypes.CreateStructField("L", DataTypes.LongType, nullable: false),
+            DataTypes.CreateStructField("D", DataTypes.DoubleType, nullable: false),
+            DataTypes.CreateStructField("Flag", DataTypes.BooleanType, nullable: false),
+        });
+        var requested = new StructType(new[]
+        {
+            new StructField("A", wideType, nullable: true),
+            new StructField("B", wideType, nullable: true),
+        });
+        var reader = new ParquetFileReader(new ParquetDecodeLimits(maxRowGroupDecodedBytes: 110_000));
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => EnumerateAsync(reader, bytes, requested));
+
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+        Assert.Contains("would exceed", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task NestedDecodeCeiling_TwoNestedColumnsWithinBudget_Decodes()
+    {
+        // R9 finding 2 regression (no over-reject): the SAME two struct columns over 2000 rows decode cleanly
+        // under a ceiling above their combined ~196,000-byte reconstruction peak — the shared budget rejects
+        // only a genuine combined overrun, never within-budget multi-column reads.
+        var rows = new List<TwoStructRow>(2000);
+        for (int i = 0; i < 2000; i++)
+        {
+            rows.Add(new TwoStructRow
+            {
+                Id = i,
+                A = new Wide { L = i, D = i * 1.5, Flag = (i & 1) == 0 },
+                B = new Wide { L = -i, D = i * 2.5, Flag = (i & 1) == 1 },
+            });
+        }
+
+        byte[] bytes = await WriteAsync(rows);
+
+        StructType wideType = DataTypes.CreateStructType(new[]
+        {
+            DataTypes.CreateStructField("L", DataTypes.LongType, nullable: false),
+            DataTypes.CreateStructField("D", DataTypes.DoubleType, nullable: false),
+            DataTypes.CreateStructField("Flag", DataTypes.BooleanType, nullable: false),
+        });
+        var requested = new StructType(new[]
+        {
+            new StructField("A", wideType, nullable: true),
+            new StructField("B", wideType, nullable: true),
+        });
+        var reader = new ParquetFileReader(new ParquetDecodeLimits(maxRowGroupDecodedBytes: 600_000));
+
+        ColumnBatch batch = await ReadSingleAsync(reader, bytes, requested);
+        Assert.Equal(2000, batch.RowCount);
+        var a = Assert.IsType<StructColumnVector>(batch.Column("A"));
+        var b = Assert.IsType<StructColumnVector>(batch.Column("B"));
+        Assert.Equal(0L, a.Child("L").GetValue<long>(0));
+        Assert.Equal(-1999L, b.Child("L").GetValue<long>(1999));
     }
 
     [Fact]

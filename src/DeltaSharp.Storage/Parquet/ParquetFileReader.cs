@@ -793,6 +793,12 @@ internal sealed class ParquetFileReader
         }
 
         var columns = new ColumnVector[requested.Count];
+        // One eager-decode budget for THIS row group's nested reconstruction, shared across every nested column
+        // (and every leaf + container structure within each), so their COMBINED peak — not each column
+        // independently — stays under the ceiling. The flat EnsureDecodeCeiling above already bounds the raw
+        // declared bytes cumulatively; this bounds the reconstruction overhead that aggregate does not model.
+        var nestedBudget = new NestedParquetColumnReader.NestedDecodeBudget(
+            (limits ?? ParquetDecodeLimits.Default).MaxRowGroupDecodedBytes);
         try
         {
             for (int c = 0; c < requested.Count; c++)
@@ -803,7 +809,7 @@ internal sealed class ParquetFileReader
                     // Nested column (#571): reconstruct an immutable nested vector from the raw Dremel levels.
                     // NestedParquetColumnReader owns its own allocation ceiling and null-correct reassembly.
                     columns[c] = await NestedParquetColumnReader.ReadAsync(
-                        rowGroup, nestedField, requested[c].DataType, rowCount, requested[c].Name, limits, cancellationToken)
+                        rowGroup, nestedField, requested[c].DataType, rowCount, requested[c].Name, nestedBudget, cancellationToken)
                         .ConfigureAwait(false);
                     continue;
                 }

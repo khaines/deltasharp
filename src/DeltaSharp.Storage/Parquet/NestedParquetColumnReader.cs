@@ -184,13 +184,9 @@ internal static class NestedParquetColumnReader
         DataType requestedType,
         int rowCount,
         string columnName,
-        ParquetDecodeLimits limits,
+        NestedDecodeBudget budget,
         CancellationToken cancellationToken)
     {
-        // One eager-decode budget shared across every leaf of THIS nested column, so the leaves' COMBINED
-        // reconstruction peak — not merely each leaf independently — stays within the ceiling (a K-field
-        // struct or a 2-leaf map would otherwise be allowed up to K x the ceiling).
-        var budget = new NestedDecodeBudget(limits.MaxRowGroupDecodedBytes);
         return requestedType switch
         {
             StructType structType => await ReadStructAsync(
@@ -219,6 +215,10 @@ internal static class NestedParquetColumnReader
         NestedDecodeBudget budget,
         CancellationToken cancellationToken)
     {
+        // Charge the struct's OWN per-row null mask (rowCount bools) against the shared row-group budget before
+        // its fields are read, so the struct structure + all its field children are cumulatively bounded.
+        budget.ChargeStructural(rowCount, sizeof(bool), $"struct column '{columnName}'");
+
         // A struct's own definition level: a row whose definition level is BELOW this marks a NULL struct
         // (vs a present struct with a null field, whose level sits at/above this but below the field's max).
         int structMaxDef = fileStruct.MaxDefinitionLevel;
@@ -328,6 +328,11 @@ internal static class NestedParquetColumnReader
         NestedDecodeBudget budget,
         CancellationToken cancellationToken)
     {
+        // Charge the list's OWN per-row structure (a rowCount offset int + null flag, matching
+        // ParquetFileReader.NestedContainerStructuralWidth) against the shared row-group budget before its
+        // element leaf is read, so the structure + element child are cumulatively bounded.
+        budget.ChargeStructural(rowCount, sizeof(int) + sizeof(bool), $"array column '{columnName}'");
+
         DataField elementLeaf = ExpectScalarLeaf(
             fileList.Item, requested.ElementType, fileList.MaxRepetitionLevel, fileList.MaxDefinitionLevel,
             $"array column '{columnName}' element");
@@ -374,6 +379,11 @@ internal static class NestedParquetColumnReader
         NestedDecodeBudget budget,
         CancellationToken cancellationToken)
     {
+        // Charge the map's OWN per-row structure (a rowCount offset int + null flag, matching
+        // ParquetFileReader.NestedContainerStructuralWidth) against the shared row-group budget before its
+        // key/value leaves are read, so the structure + both child leaves are cumulatively bounded.
+        budget.ChargeStructural(rowCount, sizeof(int) + sizeof(bool), $"map column '{columnName}'");
+
         EnsureRequiredMapKey(fileMap, columnName);
         DataField keyLeaf = ExpectScalarLeaf(
             fileMap.Key, requested.KeyType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel,
@@ -833,13 +843,16 @@ internal static class NestedParquetColumnReader
             }
         }
     }
-    // The COLUMN-WIDE eager-decode budget shared across every leaf of ONE nested-column read: the reader's
-    // MaxRowGroupDecodedBytes ceiling, drawn down by each leaf's reconstruction transient so the leaves'
-    // COMBINED peak stays bounded. The flat reader's EnsureDecodeCeiling sums the projected chunks' declared
-    // UncompressedBytes CUMULATIVELY; this mirrors that for the nested reconstruction overhead (the #570 child
-    // ColumnVector each leaf materializes) which the declared-bytes aggregate does not model. A per-leaf-only
-    // ceiling check would let a K-field struct (or a 2-leaf map) allocate up to K x the ceiling.
-    private sealed class NestedDecodeBudget
+    // The ROW-GROUP-WIDE eager-decode budget shared across EVERY nested column of one row-group read (and
+    // every leaf + container structure within each): the reader's MaxRowGroupDecodedBytes ceiling, drawn down
+    // by each leaf's reconstruction transient AND each container's own per-row structural arrays (list/map
+    // offsets + null masks, struct null masks), so the COMBINED reconstruction peak stays bounded. The flat
+    // reader's EnsureDecodeCeiling sums the projected chunks' declared UncompressedBytes CUMULATIVELY across
+    // all columns; this mirrors that for the nested reconstruction overhead (the #570 child ColumnVector each
+    // leaf materializes, plus the container structure) which the declared-bytes aggregate does not model.
+    // Per-leaf-only, or a fresh budget per column, would let a K-field struct — or K nested columns — allocate
+    // up to K x the ceiling. Created ONCE per row group by ParquetFileReader and passed to each ReadAsync.
+    internal sealed class NestedDecodeBudget
     {
         private long _remaining;
 
@@ -852,10 +865,10 @@ internal static class NestedParquetColumnReader
         public long Ceiling { get; }
 
         // Draws this leaf's transient (payloadBytes + numValues * perSlotBytes) down from the shared budget,
-        // failing closed if the CUMULATIVE total across the column's leaves breaches the ceiling. Overflow-safe:
-        // the payload is subtracted first (a saturated payload underflows to < 0 and is caught), then the
-        // per-slot product is bounded by division against what REMAINS, so the subsequent subtraction cannot
-        // drive _remaining below 0 or overflow (numValues * perSlotBytes <= _remaining <= Ceiling).
+        // failing closed if the CUMULATIVE total across the row group's nested columns breaches the ceiling.
+        // Overflow-safe: the payload is subtracted first (a saturated payload underflows to < 0 and is caught),
+        // then the per-slot product is bounded by division against what REMAINS, so the subsequent subtraction
+        // cannot drive _remaining below 0 or overflow (numValues * perSlotBytes <= _remaining <= Ceiling).
         public void Charge(long payloadBytes, long numValues, long perSlotBytes, DataField leaf)
         {
             _remaining -= payloadBytes;
@@ -867,6 +880,22 @@ internal static class NestedParquetColumnReader
             }
 
             _remaining -= numValues * perSlotBytes;
+        }
+
+        // Draws a nested container's OWN per-row reconstructed structure (a struct's per-row null mask; a
+        // list/map's per-row offset + null flag — mirroring ParquetFileReader.NestedContainerStructuralWidth)
+        // down from the shared budget, so this rowCount-scaled allocation is charged alongside the leaf values
+        // rather than escaping the ceiling. rowCount is already <= int.MaxValue and perRowBytes is a tiny
+        // constant, so the product cannot overflow; fails closed on breach.
+        public void ChargeStructural(int rowCount, long perRowBytes, string context)
+        {
+            _remaining -= rowCount * perRowBytes;
+            if (_remaining < 0)
+            {
+                throw DeltaStorageException.CorruptData(
+                    $"{context} reconstructs a {rowCount}-row structure whose eager decode would exceed the "
+                    + $"{Ceiling}-byte ceiling.");
+            }
         }
     }
 
