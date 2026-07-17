@@ -147,6 +147,13 @@ internal sealed class LogicalOutput
                 return new AttributeReference(
                     CoercionHelpers.PrettyReference(function), function.Type, function.Nullable, new ExprId(_nextId++));
 
+            case GetStructField field:
+                // A bare nested reference is auto-named after the extracted field (Spark parity):
+                // `select(col("s.f"))` exposes column `f` (#580). Mirrors the analyzer's ToAttribute.
+                DataType fieldType = field.Type
+                    ?? throw UnsupportedPlanException.ForExpression(field.NodeName, "nested field output type is unresolved");
+                return new AttributeReference(field.FieldName, fieldType, field.Nullable, new ExprId(_nextId++));
+
             default:
                 throw UnsupportedPlanException.ForExpression(
                     element.NodeName, "projection element is not a named output (expected an attribute, alias, or function)");

@@ -1,3 +1,4 @@
+using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Engine.Execution;
 using DeltaSharp.Types;
 using Xunit;
@@ -42,6 +43,72 @@ public class PhysicalPlanShapeTests
         FilterPlan filter = Assert.IsType<FilterPlan>(plan);
         Assert.IsType<ComparisonExpression>(filter.Predicate);
         Assert.IsType<ScanPlan>(Assert.Single(filter.Children));
+    }
+
+    [Fact]
+    public void Filter_OnNestedField_MapsTo_StructFieldExpression_OverScan()
+    {
+        // #580: a multipart reference `addr.zip` resolves to a struct-field extraction and translates
+        // to an Engine StructFieldExpression (nested field access), wiring analyzer -> translator.
+        StructType addr = TestData.Schema(TestData.Field("zip", IntegerType.Instance, nullable: false));
+        StructType schema = TestData.Schema(
+            TestData.Field("id", IntegerType.Instance, nullable: false),
+            TestData.Field("addr", addr, nullable: true));
+        var fixture = new InMemoryRelationFixture();
+        DataFrame people = fixture.Relation("people", schema, TestData.Batch(
+            schema, TestData.Ints(1), new StructColumnVector(addr, new[] { TestData.Ints(90210) })));
+
+        PhysicalPlan plan = fixture.Plan(people.Filter(Col("addr.zip").Gt(0)));
+
+        FilterPlan filter = Assert.IsType<FilterPlan>(plan);
+        ComparisonExpression predicate = Assert.IsType<ComparisonExpression>(filter.Predicate);
+        StructFieldExpression field = Assert.IsType<StructFieldExpression>(predicate.Left);
+        Assert.Equal(0, field.Ordinal);
+        Assert.Equal(IntegerType.Instance, field.Type);
+        Assert.IsType<ColumnReference>(field.Child);
+        Assert.IsType<ScanPlan>(Assert.Single(filter.Children));
+    }
+
+    [Fact]
+    public void Project_OnNestedField_IsAutoNamedAfterTheField()
+    {
+        // #580 Spark parity: `select(col("addr.zip"))` exposes an output column named `zip`, and the
+        // projection element translates to a StructFieldExpression.
+        StructType addr = TestData.Schema(TestData.Field("zip", IntegerType.Instance, nullable: false));
+        StructType schema = TestData.Schema(
+            TestData.Field("id", IntegerType.Instance, nullable: false),
+            TestData.Field("addr", addr, nullable: true));
+        var fixture = new InMemoryRelationFixture();
+        DataFrame people = fixture.Relation("people", schema, TestData.Batch(
+            schema, TestData.Ints(1), new StructColumnVector(addr, new[] { TestData.Ints(90210) })));
+
+        PhysicalPlan plan = fixture.Plan(people.Select(Col("addr.zip")));
+
+        ProjectPlan project = Assert.IsType<ProjectPlan>(plan);
+        Assert.Equal(new[] { "zip" }, project.OutputSchema.Select(f => f.Name));
+        Assert.IsType<StructFieldExpression>(Assert.Single(project.Projections));
+    }
+
+    [Fact]
+    public void Project_SameNamedFieldFromTwoStructs_FailsClosed_TrackedBy419()
+    {
+        // #580 leaf auto-naming makes `select(a.id, b.id)` (same field name from two structs) produce
+        // two output columns named `id`. DeltaSharp fails closed on duplicate output names (Spark
+        // accepts them; full parity is tracked in #419) — pin the current deterministic behavior.
+        StructType a = TestData.Schema(TestData.Field("id", IntegerType.Instance, nullable: false));
+        StructType b = TestData.Schema(TestData.Field("id", IntegerType.Instance, nullable: false));
+        StructType schema = TestData.Schema(
+            TestData.Field("a", a, nullable: true),
+            TestData.Field("b", b, nullable: true));
+        var fixture = new InMemoryRelationFixture();
+        DataFrame rel = fixture.Relation("t", schema, TestData.Batch(
+            schema,
+            new StructColumnVector(a, new[] { TestData.Ints(1) }),
+            new StructColumnVector(b, new[] { TestData.Ints(2) })));
+
+        UnsupportedPlanException ex = Assert.Throws<UnsupportedPlanException>(
+            () => fixture.Plan(rel.Select(Col("a.id"), Col("b.id"))));
+        Assert.Contains("#419", ex.Message);
     }
 
     [Fact]
