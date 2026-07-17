@@ -270,17 +270,53 @@ public class NestedFieldAccessEvaluatorTests
     }
 
     [Fact]
-    public void SelectionOverStruct_ThrowsNotSupported_HonoringTheGatherWall()
+    public void FlatFieldUnderSelection_ExtractsThenGathers()
     {
-        // #546 wall: a struct column does not support row gather, so evaluating a struct-typed child
-        // over a SELECTED batch throws NotSupportedException upstream — a clean, deterministic boundary,
-        // never a partial/mis-ordered result.
+        // A struct column cannot row-gather (#546), but a FLAT extracted field can: under a selection
+        // the field is extracted over the unselected rows and gathered through the selection, so
+        // `filter(...).select(s.f)` works. Selection {2,0} over struct rows [10,·null·,30] (struct row 1
+        // null): expect the gathered flat field [30, 10].
         StructType s = Struct(new StructField("f", DataTypes.IntegerType, nullable: false));
         StructType schema = Struct(new StructField("s", s, nullable: true));
-        var column = new StructColumnVector(s, new[] { IntCol(10, 20, 30) }, new[] { false, false, false });
+        var column = new StructColumnVector(s, new[] { IntCol(10, 999, 30) }, new[] { false, true, false });
         ColumnBatch selected = Batch(schema, column).WithSelection(new SelectionVector(new[] { 2, 0 }));
 
         var expr = new StructFieldExpression(new ColumnReference(0, s, nullable: true), 0, DataTypes.IntegerType, true);
+        ColumnVector result = Eval(expr, schema, selected);
+
+        Assert.Equal(new int?[] { 30, 10 }, Ints(result));
+    }
+
+    [Fact]
+    public void FlatFieldUnderSelection_MasksNullStructRow()
+    {
+        // Selection {1,2} lands on struct row 1 (null struct, non-null child slot 999) and row 2 (30):
+        // expect [null, 30] — the null-struct mask is applied before the gather.
+        StructType s = Struct(new StructField("f", DataTypes.IntegerType, nullable: false));
+        StructType schema = Struct(new StructField("s", s, nullable: true));
+        var column = new StructColumnVector(s, new[] { IntCol(10, 999, 30) }, new[] { false, true, false });
+        ColumnBatch selected = Batch(schema, column).WithSelection(new SelectionVector(new[] { 1, 2 }));
+
+        var expr = new StructFieldExpression(new ColumnReference(0, s, nullable: true), 0, DataTypes.IntegerType, true);
+        ColumnVector result = Eval(expr, schema, selected);
+
+        Assert.Equal(new int?[] { null, 30 }, Ints(result));
+    }
+
+    [Fact]
+    public void StructTypedFieldUnderSelection_StillHitsTheGatherWall()
+    {
+        // A struct-TYPED field downstream of a selection still hits the #546 wall (the gathered result
+        // is itself a struct, which cannot row-gather) — a clean, deterministic boundary.
+        StructType inner = Struct(new StructField("b", DataTypes.IntegerType, nullable: false));
+        StructType outer = Struct(new StructField("a", inner, nullable: true));
+        StructType schema = Struct(new StructField("s", outer, nullable: true));
+
+        var innerStruct = new StructColumnVector(inner, new[] { IntCol(1, 2, 3) });
+        var outerStruct = new StructColumnVector(outer, new ColumnVector[] { innerStruct }, new[] { false, false, false });
+        ColumnBatch selected = Batch(schema, outerStruct).WithSelection(new SelectionVector(new[] { 2, 0 }));
+
+        var expr = new StructFieldExpression(new ColumnReference(0, outer, nullable: true), 0, inner, true);
 
         Assert.Throws<NotSupportedException>(() => Eval(expr, schema, selected));
     }

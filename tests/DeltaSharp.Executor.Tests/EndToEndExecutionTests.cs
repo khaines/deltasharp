@@ -1,3 +1,4 @@
+using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Engine.Execution;
 using DeltaSharp.Types;
 using Xunit;
@@ -38,6 +39,31 @@ public class EndToEndExecutionTests
 
         Assert.Equal(new[] { "id" }, rows[0].Schema.Select(f => f.Name));
         Assert.Equal(new[] { 2, 3 }, rows.Select(r => r.GetAs<int>(0)));
+    }
+
+    [Fact]
+    public void FilterThenProjectNestedField_ExtractsUnderSelection()
+    {
+        // #580: `filter(...).select(col("addr.zip"))` — nested field access downstream of a Filter's
+        // selection. The struct cannot row-gather (#546), so the field is extracted over the unselected
+        // rows and gathered through the selection; a null struct row yields null.
+        var fixture = new InMemoryRelationFixture();
+        StructType addr = TestData.Schema(TestData.Field("zip", IntegerType.Instance, nullable: false));
+        StructType schema = TestData.Schema(
+            TestData.Field("id", IntegerType.Instance, nullable: false),
+            TestData.Field("addr", addr, nullable: true));
+        // Row id=2 has a null addr struct (child slot holds a sentinel 0 that must NOT surface).
+        var addrColumn = new StructColumnVector(
+            addr, new[] { TestData.Ints(90210, 0, 30301) }, new[] { false, true, false });
+        DataFrame people = fixture.Relation("people", schema, TestData.Batch(
+            schema, TestData.Ints(1, 2, 3), addrColumn));
+
+        IReadOnlyList<Row> rows = fixture.Collect(people.Filter(Col("id").Gt(1)).Select(Col("addr.zip")));
+
+        Assert.Equal(new[] { "zip" }, rows[0].Schema.Select(f => f.Name));
+        Assert.Equal(2, rows.Count);
+        Assert.True(rows[0].IsNullAt(0));            // id=2 → null struct → null zip (sentinel 0 not leaked)
+        Assert.Equal(30301, rows[1].GetAs<int>(0));  // id=3 → 30301
     }
 
     [Fact]

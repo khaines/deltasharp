@@ -656,8 +656,10 @@ internal sealed class Analyzer
             }
         }
 
-        // No part resolves to a column: bind the trailing part — a single-part reference, or the M1
-        // catalog-qualifier degenerate `db.table.col` where no leading part is a column — or fail.
+        // No part resolves to a column: bind a single-part reference here (the common `col` case, where
+        // the scan above is skipped), or fail. A multipart reference with no column part falls through
+        // to UnresolvedColumn (a column part, including the `db.table.col` degenerate, already bound and
+        // returned inside the scan loop above).
         return MatchColumn(parts[^1], input, attribute)
             ?? throw AnalysisException.UnresolvedColumn(attribute.Name, input);
     }

@@ -17,10 +17,11 @@ namespace DeltaSharp.Engine.Execution.Expressions;
 /// with the combined (struct-null OR field-null) validity; a struct field is re-wrapped over its own
 /// (shared) children with the combined validity. A nested <b>collection</b> (array/map) field is
 /// rejected at build time (see <see cref="ExpressionEvaluators.Build"/>) so behavior is deterministic
-/// rather than data-dependent on the presence of a null struct. Row gather over a struct is still a
-/// wall — with a batch <see cref="ColumnBatch.Selection"/> present, evaluating the struct-typed child
-/// throws <see cref="NotSupportedException"/> upstream (#546), so this evaluator only runs over
-/// unselected batches.
+/// rather than data-dependent on the presence of a null struct. Under a batch
+/// <see cref="ColumnBatch.Selection"/> the struct itself cannot row-gather (#546), so the field is
+/// extracted over the unselected physical rows and the (flat) result is gathered through the
+/// selection — a struct-<i>typed</i> field downstream of a selection still hits the #546 wall when the
+/// gathered result is itself a struct.
 /// </remarks>
 internal sealed class StructFieldEvaluator : ExpressionEvaluator
 {
@@ -40,6 +41,23 @@ internal sealed class StructFieldEvaluator : ExpressionEvaluator
         ArgumentNullException.ThrowIfNull(batch);
         ArgumentNullException.ThrowIfNull(memory);
 
+        // A struct column cannot row-gather under a selection (#546). Rather than fail a common shape
+        // (`df.Filter(...).Select(col("s.f"))`), extract the field over the batch's UNSELECTED rows —
+        // structs read in physical order — and gather the extracted result through the selection: the
+        // extracted flat field gathers fine even though the struct itself cannot. (A struct-TYPED field
+        // downstream of a selection still hits the #546 gather wall when the gathered result is a
+        // struct; that boundary stays deterministic.)
+        if (batch.Selection is { } selection)
+        {
+            ColumnVector fullField = ExtractField(Unselected(batch), memory, cancellationToken);
+            return fullField.Select(selection);
+        }
+
+        return ExtractField(batch, memory, cancellationToken);
+    }
+
+    private ColumnVector ExtractField(ColumnBatch batch, BatchEvaluationMemory memory, CancellationToken cancellationToken)
+    {
         ColumnVector childVector = _child.Evaluate(batch, memory, cancellationToken);
         if (childVector is not StructColumnVector structVector)
         {
@@ -61,6 +79,19 @@ internal sealed class StructFieldEvaluator : ExpressionEvaluator
         return field is StructColumnVector nestedStruct
             ? MaskNestedStruct(nestedStruct, structVector, memory, cancellationToken)
             : MaskFlatField(field, structVector, memory, cancellationToken);
+    }
+
+    // A selection-free view over the batch's physical rows (shared column vectors, no copy), so the
+    // struct-typed child is read in physical order rather than being asked to row-gather (#546).
+    private static ColumnBatch Unselected(ColumnBatch batch)
+    {
+        var columns = new ColumnVector[batch.ColumnCount];
+        for (int i = 0; i < columns.Length; i++)
+        {
+            columns[i] = batch.Column(i);
+        }
+
+        return new ManagedColumnBatch(batch.Schema, columns, batch.RowCount);
     }
 
     private ColumnVector MaskFlatField(
