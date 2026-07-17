@@ -1,9 +1,9 @@
+using System.Threading;
 using DeltaSharp.Analysis;
 using DeltaSharp.Plans.Expressions;
 using DeltaSharp.Sql;
 using DeltaSharp.Types;
 using Xunit;
-
 namespace DeltaSharp.Core.Tests.Analysis;
 
 // #579: the standalone constraint-expression frontend — parse a bare boolean Delta constraint and resolve it
@@ -64,5 +64,51 @@ public sealed class ConstraintExpressionFrontendTests
     public void ParseConstraintExpression_Malformed_ThrowsSqlParseException()
     {
         Assert.Throws<SqlParseException>(() => SqlParser.ParseConstraintExpression("id >"));
+    }
+
+    [Fact]
+    public void ParseConstraintExpression_PathologicalParenNesting_ThrowsSqlParseException()
+    {
+        // A constraint string is UNTRUSTED (it comes from a table's metaData). ~2000 nested parens each descend
+        // the parser's precedence ladder but build NO node, outrunning the node-depth counter — so
+        // RuntimeHelpers.EnsureSufficientExecutionStack must still deflect it into a CATCHABLE SqlParseException
+        // (mirroring Parse's hardening), never an (uncatchable) StackOverflowException that crashes the driver
+        // process. Mirrors SqlDoorTests.Sql_DeeplyNestedParentheses_ThrowsCaughtSqlParseException_NotStackOverflow.
+        const int depth = 2000;
+        string expr = new string('(', depth) + "id > 0" + new string(')', depth);
+
+        SqlParseException ex = Assert.Throws<SqlParseException>(() => SqlParser.ParseConstraintExpression(expr));
+        Assert.Contains("nesting too deep", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ParseConstraintExpression_DeepNestingOnSmallStack_TranslatesStackGuard_ToSqlParseException()
+    {
+        // The finding this pins: on a reduced-stack worker thread (constrained executor hosts run smaller than
+        // the ~1 MB default), a VALID-DEPTH but paren-heavy constraint (999 parens, UNDER the 1000 node-depth
+        // cap, so the node-depth counter can NOT catch it) trips the PHYSICAL stack guard
+        // (RuntimeHelpers.EnsureSufficientExecutionStack) first, throwing InsufficientExecutionStackException.
+        // ParseConstraintExpression must translate THAT to a catchable SqlParseException (mirroring Parse) — a
+        // caller catching SqlParseException must not see a leaked InsufficientExecutionStackException. Run on a
+        // 256 KB stack (matches the council's reproducing probe); the guard is catchable, so the host survives.
+        string expr = new string('(', 999) + "id > 0" + new string(')', 999);
+        Exception? captured = null;
+        var worker = new Thread(
+            () =>
+            {
+                try
+                {
+                    SqlParser.ParseConstraintExpression(expr);
+                }
+                catch (Exception ex)
+                {
+                    captured = ex;
+                }
+            },
+            maxStackSize: 256 * 1024);
+        worker.Start();
+        worker.Join();
+
+        Assert.IsType<SqlParseException>(captured);
     }
 }

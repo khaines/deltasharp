@@ -16,11 +16,17 @@ namespace DeltaSharp.Analysis;
 /// It composes the two pieces the write path lacked: <see cref="SqlParser.ParseConstraintExpression"/> (bare
 /// boolean parse) and the analyzer's reference/type resolution. Resolution is performed by wrapping the parsed
 /// predicate in a synthetic <c>Filter(expr, LocalRelation(schema))</c> and running the standard
-/// <see cref="Analyzer"/>: this reuses the exact name-resolution, function binding, implicit-coercion, and
+/// <see cref="Analyzer"/>: this reuses the exact name-resolution, implicit-coercion, and
 /// <c>RequireBooleanCondition</c> rules the query path uses, so an unknown column, a type mismatch, or a
 /// non-boolean predicate is rejected identically to <c>WHERE</c>. The returned expression references the
 /// schema's attributes and is ready for <c>ExpressionEvaluator</c> on the write seam (#581). Evaluating the
 /// resolved expression (per-row enforcement) and wiring it into the writer are out of scope here.
+/// <para><b>M1 grammar scope.</b> The parser accepts the M1 boolean-expression subset — comparisons,
+/// <c>AND</c>/<c>OR</c>/<c>NOT</c>, arithmetic, parentheses, and int/double/string/bool literals. Common Delta
+/// CHECK-constraint idioms OUTSIDE that subset — <c>IS [NOT] NULL</c>, <c>IN</c>, <c>BETWEEN</c>, <c>LIKE</c>,
+/// scalar function calls, unary minus — currently surface as a deterministic
+/// <see cref="SqlParseException"/> (<c>UnsupportedFeature</c>), never a crash; the fuller grammar lands with the
+/// ANTLR SQL frontend (EPIC-07), and #568 inherits exactly this initial surface until then.</para>
 /// </remarks>
 internal static class ConstraintExpressionFrontend
 {

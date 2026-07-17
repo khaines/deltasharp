@@ -124,6 +124,15 @@ internal sealed class SqlParser
         {
             throw new SqlParseException("Syntax error: expression nesting too deep to parse.", ex);
         }
+        catch (InsufficientExecutionStackException ex)
+        {
+            // Defense-in-depth (mirrors Parse): a constraint whose PHYSICAL call-stack cost outruns the
+            // node-depth counter — e.g. thousands of parentheses, each descending the full precedence ladder
+            // but building no node — trips RuntimeHelpers.EnsureSufficientExecutionStack() while there is still
+            // headroom, so it surfaces as a deterministic, catchable SqlParseException, never an uncatchable
+            // StackOverflowException that would crash the driver process on a hostile constraint string.
+            throw new SqlParseException("Syntax error: expression nesting too deep to parse.", ex);
+        }
     }
 
     private SqlToken Current => _tokens[_pos];
