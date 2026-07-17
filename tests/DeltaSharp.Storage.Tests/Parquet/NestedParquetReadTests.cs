@@ -806,6 +806,37 @@ public sealed class NestedParquetReadTests
     }
 
     [Fact]
+    public async Task NestedDecodeCeiling_ChargesListCopiedOffsetsAndBitmap_FailsClosed()
+    {
+        // R10 finding (Critical, red-team): the structural charge must cover the FULL live peak — the transient
+        // offsets+nulls the reconstruction builds AND the final copy ListColumnVector makes (CopyValidatedOffsets
+        // + NestedValidity.Build bitmap), which coexist at the copy. 10,000 single-element int lists have an
+        // element leaf budget of ~170,000; charging only the transient structure (~50,000) totals ~220,000, but
+        // the true peak with the copied offsets + bitmap (~100,000 structural) is ~270,000. A 240,000-byte
+        // ceiling therefore admits the transient-only charge yet must reject the full one — pinning that the
+        // budget charges the copied structural arrays, not just the transient ones.
+        var rows = new List<ListRow>(10_000);
+        for (int i = 0; i < 10_000; i++)
+        {
+            rows.Add(new ListRow { Id = i, Arr = new List<int?> { i } });
+        }
+
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField("Arr", DataTypes.CreateArrayType(DataTypes.IntegerType, containsNull: true), nullable: true),
+        });
+        var reader = new ParquetFileReader(new ParquetDecodeLimits(maxRowGroupDecodedBytes: 240_000));
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => EnumerateAsync(reader, bytes, requested));
+
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+        Assert.Contains("would exceed", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task NestedDecodeCeiling_SharesBudgetAcrossNestedColumns_FailsClosed()
     {
         // R9 finding 2 (Critical, red-team): the budget must be ONE per row-group read, shared across every

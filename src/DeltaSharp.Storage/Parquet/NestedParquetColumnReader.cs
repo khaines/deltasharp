@@ -215,9 +215,11 @@ internal static class NestedParquetColumnReader
         NestedDecodeBudget budget,
         CancellationToken cancellationToken)
     {
-        // Charge the struct's OWN per-row null mask (rowCount bools) against the shared row-group budget before
-        // its fields are read, so the struct structure + all its field children are cumulatively bounded.
-        budget.ChargeStructural(rowCount, sizeof(bool), $"struct column '{columnName}'");
+        // Charge the struct's OWN per-row null arrays against the shared row-group budget before its fields are
+        // read: the reconstruction builds a transient bool[rows] mask AND StructColumnVector copies it into a
+        // final validity bitmap (NestedValidity.Build), so charge 2 bytes/row (both live at the copy). The
+        // field children are charged separately as they are read — structure + fields stay cumulatively bounded.
+        budget.ChargeStructural(rowCount, 2 * sizeof(bool), $"struct column '{columnName}'");
 
         // A struct's own definition level: a row whose definition level is BELOW this marks a NULL struct
         // (vs a present struct with a null field, whose level sits at/above this but below the field's max).
@@ -328,10 +330,12 @@ internal static class NestedParquetColumnReader
         NestedDecodeBudget budget,
         CancellationToken cancellationToken)
     {
-        // Charge the list's OWN per-row structure (a rowCount offset int + null flag, matching
-        // ParquetFileReader.NestedContainerStructuralWidth) against the shared row-group budget before its
-        // element leaf is read, so the structure + element child are cumulatively bounded.
-        budget.ChargeStructural(rowCount, sizeof(int) + sizeof(bool), $"array column '{columnName}'");
+        // Charge the list's OWN per-row structural arrays against the shared row-group budget before its element
+        // leaf is read. The reconstruction builds a transient offsets int[rows+1] + nulls bool[rows], THEN
+        // ListColumnVector COPIES the offsets (NestedValidity.CopyValidatedOffsets) and builds a validity bitmap
+        // — transient + final coexist at the copy, so charge 2*(int+bool) = ~10 bytes/row (the complete per-row
+        // structural set; the element child is charged separately). Structure + child stay cumulatively bounded.
+        budget.ChargeStructural(rowCount, 2 * (sizeof(int) + sizeof(bool)), $"array column '{columnName}'");
 
         DataField elementLeaf = ExpectScalarLeaf(
             fileList.Item, requested.ElementType, fileList.MaxRepetitionLevel, fileList.MaxDefinitionLevel,
@@ -379,10 +383,12 @@ internal static class NestedParquetColumnReader
         NestedDecodeBudget budget,
         CancellationToken cancellationToken)
     {
-        // Charge the map's OWN per-row structure (a rowCount offset int + null flag, matching
-        // ParquetFileReader.NestedContainerStructuralWidth) against the shared row-group budget before its
-        // key/value leaves are read, so the structure + both child leaves are cumulatively bounded.
-        budget.ChargeStructural(rowCount, sizeof(int) + sizeof(bool), $"map column '{columnName}'");
+        // Charge the map's OWN per-row structural arrays against the shared row-group budget before its
+        // key/value leaves are read. Like a list, the reconstruction builds a transient entry-offsets int[rows+1]
+        // + nulls bool[rows], THEN MapColumnVector COPIES the offsets and builds a validity bitmap — transient +
+        // final coexist, so charge 2*(int+bool) = ~10 bytes/row (the complete per-row structural set; both child
+        // leaves are charged separately). Structure + children stay cumulatively bounded.
+        budget.ChargeStructural(rowCount, 2 * (sizeof(int) + sizeof(bool)), $"map column '{columnName}'");
 
         EnsureRequiredMapKey(fileMap, columnName);
         DataField keyLeaf = ExpectScalarLeaf(
@@ -882,11 +888,12 @@ internal static class NestedParquetColumnReader
             _remaining -= numValues * perSlotBytes;
         }
 
-        // Draws a nested container's OWN per-row reconstructed structure (a struct's per-row null mask; a
-        // list/map's per-row offset + null flag — mirroring ParquetFileReader.NestedContainerStructuralWidth)
-        // down from the shared budget, so this rowCount-scaled allocation is charged alongside the leaf values
-        // rather than escaping the ceiling. rowCount is already <= int.MaxValue and perRowBytes is a tiny
-        // constant, so the product cannot overflow; fails closed on breach.
+        // Draws a nested container's OWN per-row reconstructed structural arrays down from the shared budget so
+        // they are charged alongside the leaf values rather than escaping the ceiling. The caller passes the
+        // COMPLETE per-row structural width — for a list/map both the TRANSIENT offsets+nulls and the final
+        // copied offsets + validity bitmap the ColumnVector materializes (they coexist at the copy); for a
+        // struct the transient null mask + final validity bitmap. rowCount is already <= int.MaxValue and
+        // perRowBytes is a tiny constant, so the product cannot overflow; fails closed on breach.
         public void ChargeStructural(int rowCount, long perRowBytes, string context)
         {
             _remaining -= rowCount * perRowBytes;
