@@ -104,6 +104,13 @@ internal static class CompiledExpressionEvaluators
             case IsNullExpression isNull:
                 return CanFuse(isNull.Child);
 
+            case StructFieldExpression:
+                // #580 nested struct field access is interpreted-only in v1: the compiled tier has no
+                // lowering or cache key for it. Decline explicitly (rather than via the default) so a
+                // future fusion author sees the deliberate gap — add lowering + key support before
+                // fusing. Declining routes the whole enclosing tree to the interpreter (ADR-0001 oracle).
+                return false;
+
             default:
                 return false;
         }

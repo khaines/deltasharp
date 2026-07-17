@@ -70,6 +70,26 @@ public class PhysicalPlanShapeTests
     }
 
     [Fact]
+    public void Project_OnNestedField_IsAutoNamedAfterTheField()
+    {
+        // #580 Spark parity: `select(col("addr.zip"))` exposes an output column named `zip`, and the
+        // projection element translates to a StructFieldExpression.
+        StructType addr = TestData.Schema(TestData.Field("zip", IntegerType.Instance, nullable: false));
+        StructType schema = TestData.Schema(
+            TestData.Field("id", IntegerType.Instance, nullable: false),
+            TestData.Field("addr", addr, nullable: true));
+        var fixture = new InMemoryRelationFixture();
+        DataFrame people = fixture.Relation("people", schema, TestData.Batch(
+            schema, TestData.Ints(1), new StructColumnVector(addr, new[] { TestData.Ints(90210) })));
+
+        PhysicalPlan plan = fixture.Plan(people.Select(Col("addr.zip")));
+
+        ProjectPlan project = Assert.IsType<ProjectPlan>(plan);
+        Assert.Equal(new[] { "zip" }, project.OutputSchema.Select(f => f.Name));
+        Assert.IsType<StructFieldExpression>(Assert.Single(project.Projections));
+    }
+
+    [Fact]
     public void Project_MapsTo_ProjectOperator_OverScan()
     {
         (InMemoryRelationFixture fixture, DataFrame people) = NewPeople();

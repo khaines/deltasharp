@@ -15,10 +15,12 @@ namespace DeltaSharp.Engine.Execution.Expressions;
 /// the correct per-row validity, so it is returned <b>zero-copy</b> for any field type. Only when the
 /// struct carries nulls does the result materialize: a flat/primitive field is copied lane-by-lane
 /// with the combined (struct-null OR field-null) validity; a struct field is re-wrapped over its own
-/// (shared) children with the combined validity. Row gather over a struct is still a wall — with a
-/// batch <see cref="ColumnBatch.Selection"/> present, evaluating the struct-typed child throws
-/// <see cref="NotSupportedException"/> upstream (#546), so this evaluator only runs over unselected
-/// batches.
+/// (shared) children with the combined validity. A nested <b>collection</b> (array/map) field is
+/// rejected at build time (see <see cref="ExpressionEvaluators.Build"/>) so behavior is deterministic
+/// rather than data-dependent on the presence of a null struct. Row gather over a struct is still a
+/// wall — with a batch <see cref="ColumnBatch.Selection"/> present, evaluating the struct-typed child
+/// throws <see cref="NotSupportedException"/> upstream (#546), so this evaluator only runs over
+/// unselected batches.
 /// </remarks>
 internal sealed class StructFieldEvaluator : ExpressionEvaluator
 {
@@ -28,7 +30,6 @@ internal sealed class StructFieldEvaluator : ExpressionEvaluator
     public StructFieldEvaluator(StructFieldExpression expression, ExpressionEvaluator child)
         : base(expression.Type, expression.Nullable)
     {
-        ArgumentNullException.ThrowIfNull(expression);
         _child = child ?? throw new ArgumentNullException(nameof(child));
         _ordinal = expression.Ordinal;
     }
@@ -58,7 +59,7 @@ internal sealed class StructFieldEvaluator : ExpressionEvaluator
         // A null struct row makes the extracted field null, so combine the struct's validity with the
         // field's own before returning.
         return field is StructColumnVector nestedStruct
-            ? MaskNestedStruct(nestedStruct, structVector)
+            ? MaskNestedStruct(nestedStruct, structVector, memory, cancellationToken)
             : MaskFlatField(field, structVector, memory, cancellationToken);
     }
 
@@ -89,12 +90,18 @@ internal sealed class StructFieldEvaluator : ExpressionEvaluator
         return result;
     }
 
-    private static ColumnVector MaskNestedStruct(StructColumnVector field, StructColumnVector parent)
+    private ColumnVector MaskNestedStruct(
+        StructColumnVector field,
+        StructColumnVector parent,
+        BatchEvaluationMemory memory,
+        CancellationToken cancellationToken)
     {
         int rows = field.Length;
+        memory.ReserveVector(Type, rows);
         var nulls = new bool[rows];
         for (int i = 0; i < rows; i++)
         {
+            CancellationPolicy.Poll(cancellationToken, i);
             nulls[i] = parent.IsNull(i) || field.IsNull(i);
         }
 

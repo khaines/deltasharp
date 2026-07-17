@@ -90,4 +90,49 @@ public sealed class GetStructFieldResolutionTests
         var attr = Assert.IsType<AttributeReference>(Assert.IsType<BinaryComparison>(cond).Left);
         Assert.Equal("id", attr.Name);
     }
+
+    [Fact]
+    public void QualifiedNestedRef_ResolvesFromFirstColumnPart_NotTrailingColumn()
+    {
+        // `t.s.f`: `t` is an (unmodelled) relation qualifier, so resolution scans to the first part that
+        // IS a column (`s`) and extracts `f` from it — it must NOT silently bind the top-level `f`.
+        Expression cond = ResolveCondition(
+            SchemaWithStructAndTopLevelF,
+            new BinaryComparison(Ref("t", "s", "f"), Literal.OfInt(0), ComparisonOperator.GreaterThan));
+
+        var field = Assert.IsType<GetStructField>(Assert.IsType<BinaryComparison>(cond).Left);
+        Assert.Equal("f", field.FieldName);
+        Assert.Equal(0, field.Ordinal);
+        var structColumn = Assert.IsType<AttributeReference>(field.Child);
+        Assert.Equal("s", structColumn.Name); // the struct column, not the top-level `f`
+    }
+
+    [Fact]
+    public void MultipartRef_NoLeadingColumnPart_BindsTrailingColumn()
+    {
+        // `db.people.id`: neither `db` nor `people` is a column, so the M1 catalog-qualifier degenerate
+        // still binds the trailing column `id`.
+        Expression cond = ResolveCondition(
+            SchemaWithStructAndTopLevelF,
+            new BinaryComparison(Ref("db", "people", "id"), Literal.OfLong(0), ComparisonOperator.GreaterThan));
+
+        var attr = Assert.IsType<AttributeReference>(Assert.IsType<BinaryComparison>(cond).Left);
+        Assert.Equal("id", attr.Name);
+    }
+
+    [Fact]
+    public void BareNestedRef_InProjection_ResolvesWithoutThrowing()
+    {
+        // Pre-#580 a bare nested ref in a projection threw (no ToAttribute case). It must now resolve to
+        // a GetStructField; output auto-naming (`s.f` -> column `f`, Spark parity) is asserted end-to-end
+        // in the executor PhysicalPlanShapeTests (where the derived OutputSchema is exposed).
+        var catalog = new LocalCatalog();
+        catalog.Register("t", SchemaWithStructAndTopLevelF);
+        var plan = new Project(new Expression[] { Ref("s", "f") }, new UnresolvedRelation(new[] { "t" }));
+
+        var resolved = (Project)new Analyzer(catalog).Resolve(plan);
+
+        var field = Assert.IsType<GetStructField>(resolved.ProjectList[0]);
+        Assert.Equal("f", field.FieldName);
+    }
 }

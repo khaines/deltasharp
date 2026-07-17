@@ -199,4 +199,103 @@ public class NestedFieldAccessEvaluatorTests
         Assert.Equal(DataTypes.BooleanType, result.Type);
         Assert.Equal(new bool?[] { true, null, false }, Bools(result));
     }
+
+    [Fact]
+    public void SlicedStructParent_MasksCorrectly_RespectingOffset()
+    {
+        // A sliced (offset≠0) struct parent must still combine the struct's validity with the field's
+        // own at the right physical rows. Struct rows: [F,T,F,F]; child holds a non-null sentinel (999)
+        // at the null-struct row. Slice [1,3) -> logical rows {orig 1(null),2,3}.
+        StructType s = Struct(new StructField("f", DataTypes.IntegerType, nullable: false));
+        StructType schema = Struct(new StructField("s", s, nullable: true));
+        var full = new StructColumnVector(
+            s, new[] { IntCol(10, 999, 30, 40) }, new[] { false, true, false, false });
+        ColumnVector sliced = full.Slice(1, 3);
+        ColumnBatch batch = Batch(schema, sliced);
+
+        var expr = new StructFieldExpression(new ColumnReference(0, s, nullable: true), 0, DataTypes.IntegerType, true);
+        ColumnVector result = Eval(expr, schema, batch);
+
+        Assert.Equal(new int?[] { null, 30, 40 }, Ints(result));
+    }
+
+    [Fact]
+    public void AllNullStruct_YieldsAllNull_WithoutLeakingChildSlots()
+    {
+        StructType s = Struct(new StructField("f", DataTypes.IntegerType, nullable: false));
+        StructType schema = Struct(new StructField("s", s, nullable: true));
+        var column = new StructColumnVector(s, new[] { IntCol(1, 2, 3) }, new[] { true, true, true });
+        ColumnBatch batch = Batch(schema, column);
+
+        var expr = new StructFieldExpression(new ColumnReference(0, s, nullable: true), 0, DataTypes.IntegerType, true);
+        ColumnVector result = Eval(expr, schema, batch);
+
+        Assert.Equal(new int?[] { null, null, null }, Ints(result));
+    }
+
+    [Fact]
+    public void EmptyBatch_YieldsEmptyResult()
+    {
+        StructType s = Struct(new StructField("f", DataTypes.IntegerType, nullable: false));
+        StructType schema = Struct(new StructField("s", s, nullable: true));
+        var column = new StructColumnVector(s, new[] { IntCol() });
+        ColumnBatch batch = Batch(schema, column);
+
+        var expr = new StructFieldExpression(new ColumnReference(0, s, nullable: true), 0, DataTypes.IntegerType, true);
+        ColumnVector result = Eval(expr, schema, batch);
+
+        Assert.Equal(0, result.Length);
+    }
+
+    [Fact]
+    public void NestedStructField_UnderNullableOuterStruct_ReWrapsWithCombinedValidity()
+    {
+        // Extracting a STRUCT field `s.a` (not a leaf) from a nullable outer struct re-wraps the inner
+        // struct with the combined (outer-null OR inner-null) validity.
+        StructType inner = Struct(new StructField("b", DataTypes.IntegerType, nullable: false));
+        StructType outer = Struct(new StructField("a", inner, nullable: true));
+        StructType schema = Struct(new StructField("s", outer, nullable: true));
+
+        var innerStruct = new StructColumnVector(inner, new[] { IntCol(1, 2, 3) }, new[] { false, true, false });
+        var outerStruct = new StructColumnVector(outer, new ColumnVector[] { innerStruct }, new[] { false, false, true });
+        ColumnBatch batch = Batch(schema, outerStruct);
+
+        var expr = new StructFieldExpression(new ColumnReference(0, outer, nullable: true), 0, inner, true);
+        ColumnVector result = Eval(expr, schema, batch);
+
+        var resultStruct = Assert.IsType<StructColumnVector>(result);
+        Assert.False(resultStruct.IsNull(0)); // outer & inner both present
+        Assert.True(resultStruct.IsNull(1));  // inner `a` null
+        Assert.True(resultStruct.IsNull(2));  // outer `s` null
+    }
+
+    [Fact]
+    public void SelectionOverStruct_ThrowsNotSupported_HonoringTheGatherWall()
+    {
+        // #546 wall: a struct column does not support row gather, so evaluating a struct-typed child
+        // over a SELECTED batch throws NotSupportedException upstream — a clean, deterministic boundary,
+        // never a partial/mis-ordered result.
+        StructType s = Struct(new StructField("f", DataTypes.IntegerType, nullable: false));
+        StructType schema = Struct(new StructField("s", s, nullable: true));
+        var column = new StructColumnVector(s, new[] { IntCol(10, 20, 30) }, new[] { false, false, false });
+        ColumnBatch selected = Batch(schema, column).WithSelection(new SelectionVector(new[] { 2, 0 }));
+
+        var expr = new StructFieldExpression(new ColumnReference(0, s, nullable: true), 0, DataTypes.IntegerType, true);
+
+        Assert.Throws<NotSupportedException>(() => Eval(expr, schema, selected));
+    }
+
+    [Fact]
+    public void ArrayField_RejectedAtBuildTime_NotDataDependent()
+    {
+        // A nested collection (array) field is rejected at BUILD (Open) time — deterministic, never
+        // dependent on whether a batch happens to contain a null struct (#546 nested line).
+        StructType s = Struct(new StructField("arr", new ArrayType(DataTypes.IntegerType), nullable: true));
+        StructType schema = Struct(new StructField("s", s, nullable: true));
+        var expr = new StructFieldExpression(
+            new ColumnReference(0, s, nullable: true), 0, new ArrayType(DataTypes.IntegerType), true);
+
+        Assert.Throws<UnsupportedOperatorException>(() =>
+            ExpressionEvaluators.Build(expr, schema, BackendName, OperatorKind.Project));
+    }
 }

@@ -627,19 +627,27 @@ internal sealed class Analyzer
     {
         IReadOnlyList<string> parts = attribute.NameParts;
 
-        // A multipart reference is NESTED FIELD ACCESS when its LEADING part resolves to a column: the
-        // remaining parts extract struct fields (`s.a.b` -> GetStructField(GetStructField(s, …a), …b), #580).
-        // This takes precedence over the M1 trailing-part qualifier binding, so `s.f` reaches struct `s`'s
-        // field `f` even when a top-level column `f` also exists (the pre-#580 code silently bound the
-        // top-level `f`). Only when the leading part is NOT a column do we fall back to binding the trailing
-        // part — the `table.column` qualifier case (qualifiers are not otherwise modelled in M1).
+        // NESTED FIELD ACCESS: bind a base column, then extract a struct field per remaining part
+        // (`s.a.b` -> GetStructField(GetStructField(s, …a), …b), #580). Scan for the FIRST part that
+        // resolves to a column and treat every remaining part as a struct-field access:
+        //   - `s.f`       -> base `s` at index 0, extract `f`.
+        //   - `t.s.f`     -> `t` is an (unmodelled) relation qualifier, base `s` at index 1, extract `f`.
+        //   - `people.id` -> `people` is a qualifier, base `id` at index 1 (no remaining parts).
+        // Nested access takes precedence over the M1 trailing-part fallback, so `s.f` reaches struct
+        // `s`'s field `f` even when a top-level column `f` also exists, and `t.s.f` reaches `s.f`
+        // instead of silently binding a top-level `f` (the pre-#580 code bound only the trailing part).
         if (parts.Count > 1)
         {
-            AttributeReference? leading = MatchColumn(parts[0], input, attribute);
-            if (leading is not null)
+            for (int baseIndex = 0; baseIndex < parts.Count; baseIndex++)
             {
-                Expression current = leading;
-                for (int i = 1; i < parts.Count; i++)
+                AttributeReference? column = MatchColumn(parts[baseIndex], input, attribute);
+                if (column is null)
+                {
+                    continue;
+                }
+
+                Expression current = column;
+                for (int i = baseIndex + 1; i < parts.Count; i++)
                 {
                     current = ExtractStructField(current, parts[i], attribute);
                 }
@@ -648,6 +656,8 @@ internal sealed class Analyzer
             }
         }
 
+        // No part resolves to a column: bind the trailing part — a single-part reference, or the M1
+        // catalog-qualifier degenerate `db.table.col` where no leading part is a column — or fail.
         return MatchColumn(parts[^1], input, attribute)
             ?? throw AnalysisException.UnresolvedColumn(attribute.Name, input);
     }
@@ -830,6 +840,16 @@ internal sealed class Analyzer
                         CoercionHelpers.PrettyReference(function), "Aggregate");
                 return new AttributeReference(
                     SparkAutoName(function), functionType, function.Nullable, idGenerator.Next());
+
+            case GetStructField field:
+                // A bare nested reference in output position is auto-named after the extracted field,
+                // exactly like Spark: `select(col("s.f"))` exposes a column named `f` (#580). The field
+                // type is resolved at name resolution; a residual null type is a resolution gap reported
+                // symmetrically with the Alias/function cases.
+                DataType fieldType = field.Type
+                    ?? throw AnalysisException.UntypedResolvedExpression(
+                        CoercionHelpers.PrettyReference(field), "Project");
+                return new AttributeReference(field.FieldName, fieldType, field.Nullable, idGenerator.Next());
 
             case UnresolvedFunction function:
                 // Defensive invariant: function binding (ExpressionCoercion → FunctionRegistry.Bind)
