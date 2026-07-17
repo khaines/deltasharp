@@ -90,6 +90,51 @@ internal sealed class SqlParser
         }
     }
 
+    /// <summary>
+    /// Parses a <b>bare boolean expression</b> — a Delta CHECK constraint / column invariant such as
+    /// <c>id &gt; 0</c> or <c>amount &gt;= 0 AND amount &lt; 100</c>, with no surrounding
+    /// <c>SELECT … FROM …</c> — into an <b>unresolved</b> expression tree (#579, prereq for #568). Resolve
+    /// it against a table schema with <see cref="DeltaSharp.Analysis.ConstraintExpressionFrontend"/>. The whole
+    /// input must be a single expression; any trailing tokens are a syntax error (a constraint string is one
+    /// predicate, never a statement).
+    /// </summary>
+    /// <param name="expression">The bare boolean-expression text.</param>
+    /// <returns>The unresolved expression tree the text lowers to.</returns>
+    /// <exception cref="SqlParseException">The text is malformed, nests too deeply, or carries trailing tokens
+    /// after a complete expression.</exception>
+    public static Expression ParseConstraintExpression(string expression)
+    {
+        ArgumentNullException.ThrowIfNull(expression);
+        IReadOnlyList<SqlToken> tokens = SqlLexer.Tokenize(expression);
+        var parser = new SqlParser(tokens);
+        try
+        {
+            Expression parsed = parser.ParseExpression();
+            if (parser.Current.Kind != SqlTokenKind.EndOfInput)
+            {
+                throw SqlParseException.Syntax(
+                    $"unexpected trailing input '{parser.Current.Text}' after the constraint expression; a "
+                    + "constraint is a single boolean expression, not a statement",
+                    parser.Current.Position);
+            }
+
+            return parsed;
+        }
+        catch (PlanDepthExceededException ex)
+        {
+            throw new SqlParseException("Syntax error: expression nesting too deep to parse.", ex);
+        }
+        catch (InsufficientExecutionStackException ex)
+        {
+            // Defense-in-depth (mirrors Parse): a constraint whose PHYSICAL call-stack cost outruns the
+            // node-depth counter — e.g. thousands of parentheses, each descending the full precedence ladder
+            // but building no node — trips RuntimeHelpers.EnsureSufficientExecutionStack() while there is still
+            // headroom, so it surfaces as a deterministic, catchable SqlParseException, never an uncatchable
+            // StackOverflowException that would crash the driver process on a hostile constraint string.
+            throw new SqlParseException("Syntax error: expression nesting too deep to parse.", ex);
+        }
+    }
+
     private SqlToken Current => _tokens[_pos];
 
     private LogicalPlan ParseStatement()
