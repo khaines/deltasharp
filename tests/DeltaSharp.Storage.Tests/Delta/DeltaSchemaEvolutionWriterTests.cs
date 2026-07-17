@@ -831,14 +831,13 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
 
     [Theory]
     [InlineData("delta.constraints.ck", "id > 0")] // a CHECK constraint (legacy checkConstraints feature)
-    public async Task EnableTypeWidening_OnLegacyTableWithActiveConstraint_IsRefusedFailClosed(
+    public async Task EnableTypeWidening_OnLegacyTableWithActiveConstraint_EnumeratesTheFeature(
         string configKey, string configValue)
     {
-        // #568: a FOREIGN legacy (writer < 7) table that currently declares an ACTIVE CHECK constraint (or
-        // column invariant) cannot be upgraded to the table-features protocol by this build without silently
-        // deactivating that feature (this build has no per-row expression enforcement — overlaps #190).
-        // EnableTypeWideningAsync refuses fail-closed and writes NO new version. (An active delta.appendOnly is
-        // now enumerated + enforced instead — see EnableTypeWidening_OnLegacyAppendOnlyTable_* below, #549.)
+        // #568: a legacy (writer < 7) table that declares an ACTIVE CHECK constraint (or column invariant) is
+        // now upgraded to the table-features protocol with the feature ENUMERATED into writerFeatures (it is
+        // enforced per row at the write seam, #581), rather than being refused fail-closed. A new version is
+        // published carrying typeWidening + checkConstraints.
         await DeltaTestHarness.WriteCommitAsync(
             _backend, 0,
             DeltaTestHarness.Protocol(minReader: 1, minWriter: 2),
@@ -846,11 +845,14 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
                 Struct(F("value", DataTypes.IntegerType, nullable: true)),
                 new[] { (configKey, configValue) }));
 
-        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
-            () => Writer().EnableTypeWideningAsync());
+        await Writer().EnableTypeWideningAsync();
 
-        Assert.Contains("#568", ex.Message, StringComparison.Ordinal);
-        Assert.Equal(0L, (await LoadAsync()).Version); // no new version published
+        Snapshot after = await LoadAsync();
+        Assert.Equal(1L, after.Version); // upgrade committed
+        Assert.True(TypeWideningFeature.IsWriteEnabled(after));
+        Assert.Contains("checkConstraints", after.Protocol.WriterFeatures);
+        Assert.DoesNotContain("checkConstraints", after.Protocol.ReaderFeatures);
+        Assert.Equal(ProtocolSupport.TableFeaturesWriterVersion, after.Protocol.MinWriterVersion);
     }
 
     [Fact]
