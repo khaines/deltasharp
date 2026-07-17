@@ -622,13 +622,41 @@ internal sealed class Analyzer
         return new Project(expanded, project.Child);
     }
 
-    private static AttributeReference ResolveAttribute(
+    private static Expression ResolveAttribute(
         UnresolvedAttribute attribute, IReadOnlyList<AttributeReference> input)
     {
-        // M1: qualifiers are not modelled on resolved attributes, so a multipart reference binds on
-        // its trailing column part (`t.a` → `a`). Namespace-aware binding is a later story.
-        string columnName = attribute.NameParts[^1];
+        IReadOnlyList<string> parts = attribute.NameParts;
 
+        // A multipart reference is NESTED FIELD ACCESS when its LEADING part resolves to a column: the
+        // remaining parts extract struct fields (`s.a.b` -> GetStructField(GetStructField(s, …a), …b), #580).
+        // This takes precedence over the M1 trailing-part qualifier binding, so `s.f` reaches struct `s`'s
+        // field `f` even when a top-level column `f` also exists (the pre-#580 code silently bound the
+        // top-level `f`). Only when the leading part is NOT a column do we fall back to binding the trailing
+        // part — the `table.column` qualifier case (qualifiers are not otherwise modelled in M1).
+        if (parts.Count > 1)
+        {
+            AttributeReference? leading = MatchColumn(parts[0], input, attribute);
+            if (leading is not null)
+            {
+                Expression current = leading;
+                for (int i = 1; i < parts.Count; i++)
+                {
+                    current = ExtractStructField(current, parts[i], attribute);
+                }
+
+                return current;
+            }
+        }
+
+        return MatchColumn(parts[^1], input, attribute)
+            ?? throw AnalysisException.UnresolvedColumn(attribute.Name, input);
+    }
+
+    // Case-insensitively matches a single column name against the input attributes (Spark parity): returns
+    // null when absent, the sole match when unique, and throws on an ambiguous (multiple-match) name.
+    private static AttributeReference? MatchColumn(
+        string columnName, IReadOnlyList<AttributeReference> input, UnresolvedAttribute origin)
+    {
         AttributeReference? found = null;
         List<AttributeReference>? ambiguous = null;
         foreach (AttributeReference candidate in input)
@@ -651,10 +679,54 @@ internal sealed class Analyzer
 
         if (ambiguous is not null)
         {
-            throw AnalysisException.AmbiguousReference(attribute.Name, ambiguous);
+            throw AnalysisException.AmbiguousReference(origin.Name, ambiguous);
         }
 
-        return found ?? throw AnalysisException.UnresolvedColumn(attribute.Name, input);
+        return found;
+    }
+
+    // Builds a GetStructField extracting <paramref name="fieldName"/> from a struct-typed
+    // <paramref name="child"/> (case-insensitive field match, Spark parity), throwing a precise
+    // data-type-mismatch when the child is not a struct or the field is absent/ambiguous.
+    private static Expression ExtractStructField(
+        Expression child, string fieldName, UnresolvedAttribute origin)
+    {
+        if (child.Type is not StructType structType)
+        {
+            throw AnalysisException.DataTypeMismatch(
+                origin.Name,
+                $"cannot extract field '{fieldName}' from '{child.SimpleString}' of type "
+                + $"'{child.Type?.SimpleString ?? "unknown"}' — a nested field reference requires a struct");
+        }
+
+        int ordinal = -1;
+        string? actualName = null;
+        for (int i = 0; i < structType.Count; i++)
+        {
+            if (!string.Equals(structType[i].Name, fieldName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (ordinal >= 0)
+            {
+                throw AnalysisException.DataTypeMismatch(
+                    origin.Name,
+                    $"field '{fieldName}' is ambiguous in struct type '{structType.SimpleString}'");
+            }
+
+            ordinal = i;
+            actualName = structType[i].Name;
+        }
+
+        if (ordinal < 0)
+        {
+            throw AnalysisException.DataTypeMismatch(
+                origin.Name,
+                $"no such struct field '{fieldName}' in '{structType.SimpleString}'");
+        }
+
+        return new GetStructField(child, ordinal, actualName!);
     }
 
     /// <summary>Derives the output attribute list of a resolved node from its shape and its
