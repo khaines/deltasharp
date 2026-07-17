@@ -38,11 +38,19 @@ namespace DeltaSharp.Storage.Parquet;
 /// so no crafted def/rep stream can silently mis-decode (produce wrong-but-plausible values) for the three
 /// shapes. The enforced set:
 /// <list type="bullet">
-///   <item><description><b>Every leaf.</b> Each reconstructed definition level lies in <c>[0, leaf max def]</c>
-///   and each repetition level in <c>[0, leaf max rep]</c> (<see cref="ValidateLevelRange"/>, covering BOTH
-///   streams); the declared value count is ceiling-bounded and non-negative; the def and rep arrays are
-///   allocated to the leaf's own value count, so they are equal-length and value-count-aligned by
-///   construction.</description></item>
+///   <item><description><b>Leaf structural levels (schema, at shape resolution).</b> Before any stream is
+///   read, every leaf the reader navigates to is checked (<see cref="ValidateLeafStructuralLevels"/>) so its
+///   declared <c>MaxRepetitionLevel</c> equals its position's requirement (a struct scalar field 0; a list
+///   element / map key / map value 1) and its <c>MaxDefinitionLevel</c> sits in
+///   <c>[containerMaxDef, containerMaxDef + 1]</c> — closing the masquerade where a crafted footer declares a
+///   scalar leaf repeated (a repeated primitive posing as struct rows) or over-nested (a phantom optional
+///   level mis-classifying present vs null cells). Nullability stays advisory (both the required and optional
+///   definition level are accepted).</description></item>
+///   <item><description><b>Every leaf (streams).</b> Each reconstructed definition level lies in
+///   <c>[0, leaf max def]</c> and each repetition level in <c>[0, leaf max rep]</c>
+///   (<see cref="ValidateLevelRange"/>, covering BOTH streams); the declared value count is ceiling-bounded
+///   and non-negative; the def and rep arrays are allocated to the leaf's own value count, so they are
+///   equal-length and value-count-aligned by construction.</description></item>
 ///   <item><description><b>List.</b> Both level streams are present; the first slot opens a row (repetition
 ///   0); a row opened as an empty or null list admits no continuation, and every continuation (repetition
 ///   &gt; 0) slot is a genuine element occurrence (state-transition legality); the reconstructed row count
@@ -62,10 +70,12 @@ namespace DeltaSharp.Storage.Parquet;
 ///   <see cref="BuildRepeatedStructure"/>); the key and value child lengths match; the reassembled entry
 ///   count equals the key child length; and the entry-slot count is at least the row count.</description></item>
 /// </list>
-/// With this set the three shapes are fully validated against structurally-invalid def/rep streams: the
-/// value/element/entry reconstruction is a pure positional consequence of levels that are all range-checked,
-/// length-aligned, cross-leaf-consistent (map), cross-field-consistent (struct), and state-transition-legal
-/// (list/map) — leaving no residual class that decodes to silent wrong data.</para>
+/// With this set the three shapes are fully validated against both structurally-invalid SCHEMA levels (a
+/// crafted leaf whose declared max levels contradict its navigated position) and structurally-invalid def/rep
+/// STREAMS: the value/element/entry reconstruction is a pure positional consequence of levels that are all
+/// schema-consistent (leaf max levels match the shape), range-checked, length-aligned, cross-leaf-consistent
+/// (map), cross-field-consistent (struct), and state-transition-legal (list/map) — leaving no residual class
+/// that decodes to silent wrong data.</para>
 /// </remarks>
 internal static class NestedParquetColumnReader
 {
@@ -110,7 +120,9 @@ internal static class NestedParquetColumnReader
                         $"Column '{columnName}': requested an array but the file column is not a list.");
                 }
 
-                _ = ExpectScalarLeaf(fileList.Item, arrayType.ElementType, $"array column '{columnName}' element");
+                _ = ExpectScalarLeaf(
+                    fileList.Item, arrayType.ElementType, fileList.MaxRepetitionLevel, fileList.MaxDefinitionLevel,
+                    $"array column '{columnName}' element");
                 break;
             case MapType mapType:
                 if (fileField is not PqMapField fileMap)
@@ -120,8 +132,12 @@ internal static class NestedParquetColumnReader
                 }
 
                 EnsureRequiredMapKey(fileMap, columnName);
-                _ = ExpectScalarLeaf(fileMap.Key, mapType.KeyType, $"map column '{columnName}' key");
-                _ = ExpectScalarLeaf(fileMap.Value, mapType.ValueType, $"map column '{columnName}' value");
+                _ = ExpectScalarLeaf(
+                    fileMap.Key, mapType.KeyType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel,
+                    $"map column '{columnName}' key");
+                _ = ExpectScalarLeaf(
+                    fileMap.Value, mapType.ValueType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel,
+                    $"map column '{columnName}' value");
                 break;
             default:
                 throw DeltaStorageException.UnsupportedFeature(
@@ -308,7 +324,9 @@ internal static class NestedParquetColumnReader
         ParquetDecodeLimits limits,
         CancellationToken cancellationToken)
     {
-        DataField elementLeaf = ExpectScalarLeaf(fileList.Item, requested.ElementType, $"array column '{columnName}' element");
+        DataField elementLeaf = ExpectScalarLeaf(
+            fileList.Item, requested.ElementType, fileList.MaxRepetitionLevel, fileList.MaxDefinitionLevel,
+            $"array column '{columnName}' element");
         int listMaxDef = fileList.MaxDefinitionLevel;
 
         // The element child collects one cell per PRESENT element slot (a real value OR a null element),
@@ -353,8 +371,12 @@ internal static class NestedParquetColumnReader
         CancellationToken cancellationToken)
     {
         EnsureRequiredMapKey(fileMap, columnName);
-        DataField keyLeaf = ExpectScalarLeaf(fileMap.Key, requested.KeyType, $"map column '{columnName}' key");
-        DataField valueLeaf = ExpectScalarLeaf(fileMap.Value, requested.ValueType, $"map column '{columnName}' value");
+        DataField keyLeaf = ExpectScalarLeaf(
+            fileMap.Key, requested.KeyType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel,
+            $"map column '{columnName}' key");
+        DataField valueLeaf = ExpectScalarLeaf(
+            fileMap.Value, requested.ValueType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel,
+            $"map column '{columnName}' value");
         int mapMaxDef = fileMap.MaxDefinitionLevel;
 
         // Keys drive the entry structure. A required key's max definition level equals the map's own level
@@ -921,10 +943,13 @@ internal static class NestedParquetColumnReader
                 $"Struct column '{columnName}' is missing requested field '{requested.Name}' in the file.");
         }
 
-        return ExpectScalarLeaf(match, requested.DataType, $"struct column '{columnName}' field '{requested.Name}'");
+        return ExpectScalarLeaf(
+            match, requested.DataType, fileStruct.MaxRepetitionLevel, fileStruct.MaxDefinitionLevel,
+            $"struct column '{columnName}' field '{requested.Name}'");
     }
 
-    private static DataField ExpectScalarLeaf(Field fileField, DataType requestedScalar, string context)
+    private static DataField ExpectScalarLeaf(
+        Field fileField, DataType requestedScalar, int expectedMaxRepetition, int containerMaxDef, string context)
     {
         if (requestedScalar is ArrayType or MapType or StructType)
         {
@@ -940,7 +965,54 @@ internal static class NestedParquetColumnReader
         }
 
         ValidateLeafPhysicalType(leaf, requestedScalar, context);
+        ValidateLeafStructuralLevels(leaf, expectedMaxRepetition, containerMaxDef, context);
         return leaf;
+    }
+
+    // Validates that a scalar leaf's declared STRUCTURAL Dremel levels (max repetition, max definition) match
+    // what its position in the requested single-level shape structurally requires (R8). The reader navigates
+    // the FILE schema to each leaf and reconstructs positionally from the leaf's def/rep streams, but the
+    // reconstruction's row/entry/null thresholds are keyed off the CONTAINER's own levels — so a crafted file
+    // whose leaf declares max levels inconsistent with its navigated position can masquerade as a different
+    // shape and silently mis-decode. Two invariants, both derived from Dremel level propagation:
+    //   1. Max repetition: a scalar leaf directly under a single-level container carries EXACTLY the
+    //      container's repetition level (a struct field 0; a list element / map key / map value 1 — the one
+    //      repeated ancestor). A leaf declaring a HIGHER level is repeated where the shape is not (a repeated
+    //      primitive masquerading as a struct field — its rep stream, which ReadStructAsync does not honor,
+    //      would let N element occurrences pose as N rows) or nests further than supported (maxRep >= 2 =
+    //      nested-within-nested); a LOWER level is non-repeated where the shape requires repetition. Either
+    //      way the reconstruction would mis-count rows/entries -> silent wrong data.
+    //   2. Max definition: a scalar leaf carries the container's definition level plus AT MOST ONE (its own
+    //      optional level; a required leaf adds nothing). A leaf whose max definition sits BELOW the
+    //      container's (fewer optional/repeated ancestors than its own parent — impossible in a well-formed
+    //      tree) or ABOVE containerMaxDef + 1 (a phantom optional/repeated ancestor) shifts the def thresholds
+    //      the reconstruction uses to tell a present value from a null cell from a null container -> a present
+    //      value silently decodes as null (or vice-versa). Nullability itself stays ADVISORY per #570: BOTH a
+    //      required leaf (maxDef == containerMaxDef) and an optional leaf (maxDef == containerMaxDef + 1) are
+    //      accepted.
+    // Fail closed CorruptData on either mismatch, at shape resolution (BEFORE any reconstruction). Internal so
+    // the guard can be pinned by direct unit tests for the list/map positions, whose wrong-level leaves the
+    // released Parquet.Net write door cannot author (its ListField/MapField constructors force element/key/
+    // value maxRep = 1); the struct-field maxRep masquerade IS authorable end-to-end (a 1-level repeated
+    // primitive under a struct).
+    internal static void ValidateLeafStructuralLevels(
+        DataField leaf, int expectedMaxRepetition, int containerMaxDef, string context)
+    {
+        if (leaf.MaxRepetitionLevel != expectedMaxRepetition)
+        {
+            throw DeltaStorageException.CorruptData(
+                $"Parquet nested read for {context}: the file leaf declares max repetition level "
+                + $"{leaf.MaxRepetitionLevel}, but this position requires {expectedMaxRepetition} (a leaf whose "
+                + "repetition contradicts its shape would mis-count rows/entries).");
+        }
+
+        if (leaf.MaxDefinitionLevel < containerMaxDef || leaf.MaxDefinitionLevel > containerMaxDef + 1)
+        {
+            throw DeltaStorageException.CorruptData(
+                $"Parquet nested read for {context}: the file leaf declares max definition level "
+                + $"{leaf.MaxDefinitionLevel}, but this position requires {containerMaxDef} or {containerMaxDef + 1} "
+                + "(a leaf whose definition level contradicts its container would mis-classify present vs null cells).");
+        }
     }
 
     // An EXACT physical-type match (no type widening for nested leaves — that is #546's scope). Mirrors the

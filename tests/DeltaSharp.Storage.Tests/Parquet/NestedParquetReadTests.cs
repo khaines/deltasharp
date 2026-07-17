@@ -479,6 +479,136 @@ public sealed class NestedParquetReadTests
     }
 
     [Fact]
+    public async Task StructField_RepeatedScalarLeaf_FailsClosed_CorruptData()
+    {
+        // R8 (High, red-team): a struct whose scalar field 'A' is a 1-level repeated primitive — its FILE leaf
+        // declares MaxRepetitionLevel=1 (structurally an array), not 0. ReadStructAsync discards a field's
+        // repetition stream, so without the leaf-structural-level guard the leaf's two element occurrences
+        // [10,20] (one real row, rep [0,1]) would masquerade as two struct rows. The reader must reject the
+        // repeated leaf at shape resolution — BEFORE any reconstruction — as it contradicts the requested
+        // struct-scalar shape. Authorable end-to-end via the low-level writer (ParquetSerializer only emits
+        // 3-level lists, which are caught earlier as "file column is itself nested").
+        byte[] bytes = await ParquetTestHelpers.WriteStructWithRepeatedFieldAsync(
+            new int?[] { 1 }, new int?[] { 10, 20 }, new[] { 0, 1 });
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "S",
+                DataTypes.CreateStructType(new[] { DataTypes.CreateStructField("A", DataTypes.IntegerType, nullable: true) }),
+                nullable: true),
+        });
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadSingleAsync(bytes, requested));
+        Assert.Equal(StorageErrorKind.CorruptData, ex.Kind);
+        Assert.Contains("max repetition level", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task StructField_RepeatedScalarLeaf_ForgedRowCount_FailsClosed_CorruptData()
+    {
+        // R8: the full masquerade — the repeated leaf's two element values PLUS a footer NumRows forged from
+        // 1 to 2, so the flat "numValues == rowCount" struct-field check would otherwise pass and yield two
+        // phantom struct rows. The leaf-structural-level guard fires at shape resolution, BEFORE the row-count
+        // logic, closing the masquerade regardless of the forged count.
+        byte[] bytes = await ParquetTestHelpers.WriteStructWithRepeatedFieldAsync(
+            new int?[] { 1 }, new int?[] { 10, 20 }, new[] { 0, 1 });
+        byte[] forged = await ParquetTestHelpers.ForgeRowGroupNumRowsAsync(bytes, rowGroup: 0, forgedNumRows: 2);
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "S",
+                DataTypes.CreateStructType(new[] { DataTypes.CreateStructField("A", DataTypes.IntegerType, nullable: true) }),
+                nullable: true),
+        });
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadSingleAsync(forged, requested));
+        Assert.Equal(StorageErrorKind.CorruptData, ex.Kind);
+        Assert.Contains("max repetition level", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ValidateLeafStructuralLevels_RejectsWrongRepetition_CorruptData()
+    {
+        // R8 unit pin: a leaf whose MaxRepetitionLevel contradicts its navigated position fails closed. The
+        // list/map positions (expected maxRep 1) can't be authored with a wrong-maxRep leaf end-to-end
+        // (Parquet.Net's ListField/MapField ctors force element/key/value maxRep=1), so the guard is pinned
+        // directly. A repeated primitive (isArray -> maxRep 1) at a struct-field position (expects 0):
+        var repeatedLeaf = new global::Parquet.Schema.DataField("x", typeof(int), isArray: true); // maxRep 1
+        DeltaStorageException struApt = Assert.Throws<DeltaStorageException>(() =>
+            NestedParquetColumnReader.ValidateLeafStructuralLevels(
+                repeatedLeaf, expectedMaxRepetition: 0, containerMaxDef: 0, "struct field 'x'"));
+        Assert.Equal(StorageErrorKind.CorruptData, struApt.Kind);
+        Assert.Contains("max repetition level", struApt.Message, StringComparison.Ordinal);
+
+        // A non-repeated primitive (maxRep 0) at a list-element / map-key/value position (expects 1):
+        var scalarLeaf = new global::Parquet.Schema.DataField("x", typeof(int)); // maxRep 0
+        DeltaStorageException listApt = Assert.Throws<DeltaStorageException>(() =>
+            NestedParquetColumnReader.ValidateLeafStructuralLevels(
+                scalarLeaf, expectedMaxRepetition: 1, containerMaxDef: 0, "array column 'x' element"));
+        Assert.Equal(StorageErrorKind.CorruptData, listApt.Kind);
+        Assert.Contains("max repetition level", listApt.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ValidateLeafStructuralLevels_RejectsWrongDefinition_CorruptData()
+    {
+        // R8 unit pin: a leaf whose MaxDefinitionLevel sits outside [containerMaxDef, containerMaxDef+1] fails
+        // closed (a phantom optional/repeated ancestor, or fewer than its own container's) — it would shift
+        // the null-classification thresholds. Real leaves with known levels from a map schema: key (maxDef 2),
+        // value (maxDef 3), both maxRep 1.
+        global::Parquet.Schema.DataField[] mapLeaves = MapLeaves();
+        global::Parquet.Schema.DataField valueLeaf = mapLeaves[1]; // maxRep 1, maxDef 3
+
+        // maxDef 3 ABOVE a container whose own level is 1 (would allow at most 2): reject.
+        DeltaStorageException above = Assert.Throws<DeltaStorageException>(() =>
+            NestedParquetColumnReader.ValidateLeafStructuralLevels(
+                valueLeaf, expectedMaxRepetition: 1, containerMaxDef: 1, "array column 'x' element"));
+        Assert.Equal(StorageErrorKind.CorruptData, above.Kind);
+        Assert.Contains("max definition level", above.Message, StringComparison.Ordinal);
+
+        // maxDef 0 BELOW a container whose own level is 2 (impossible: a leaf can't have fewer levels than its
+        // parent): reject.
+        var scalarLeaf = new global::Parquet.Schema.DataField("x", typeof(int)); // maxRep 0, maxDef 0
+        DeltaStorageException below = Assert.Throws<DeltaStorageException>(() =>
+            NestedParquetColumnReader.ValidateLeafStructuralLevels(
+                scalarLeaf, expectedMaxRepetition: 0, containerMaxDef: 2, "struct field 'x'"));
+        Assert.Equal(StorageErrorKind.CorruptData, below.Kind);
+        Assert.Contains("max definition level", below.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ValidateLeafStructuralLevels_AcceptsValidPositions_NoOverRejection()
+    {
+        // R8 no-over-rejection: every VALID single-level position passes, with nullability advisory (both the
+        // required = containerMaxDef and optional = containerMaxDef+1 definition levels accepted).
+        global::Parquet.Schema.DataField[] mapLeaves = MapLeaves();
+        global::Parquet.Schema.DataField keyLeaf = mapLeaves[0];   // maxRep 1, maxDef 2 (required)
+        global::Parquet.Schema.DataField valueLeaf = mapLeaves[1]; // maxRep 1, maxDef 3 (optional)
+        var scalarLeaf = new global::Parquet.Schema.DataField("x", typeof(int)); // maxRep 0, maxDef 0
+
+        // Struct required scalar field: maxRep 0, maxDef 0 == containerMaxDef 0.
+        NestedParquetColumnReader.ValidateLeafStructuralLevels(scalarLeaf, 0, 0, "struct field 'x'");
+        // Map key (required): maxRep 1, maxDef 2 == containerMaxDef 2.
+        NestedParquetColumnReader.ValidateLeafStructuralLevels(keyLeaf, 1, 2, "map column 'x' key");
+        // Map value (optional): maxRep 1, maxDef 3 == containerMaxDef 2 + 1.
+        NestedParquetColumnReader.ValidateLeafStructuralLevels(valueLeaf, 1, 2, "map column 'x' value");
+        // A repeated leaf used as a required list element (maxDef == containerMaxDef): maxRep 1, maxDef 2.
+        NestedParquetColumnReader.ValidateLeafStructuralLevels(keyLeaf, 1, 2, "array column 'x' element");
+    }
+
+    private static global::Parquet.Schema.DataField[] MapLeaves()
+    {
+        var mapSchema = new global::Parquet.Schema.ParquetSchema(
+            new global::Parquet.Schema.MapField(
+                "M",
+                new global::Parquet.Schema.DataField<int>("key"),
+                new global::Parquet.Schema.DataField<int?>("value")));
+        return mapSchema.GetDataFields(); // [M/key (RL 1, DL 2), M/value (RL 1, DL 3)]
+    }
+
+    [Fact]
     public async Task NestedLeafDecodeCeiling_FoldsReconstructedChild_FailsClosed()
     {
         // F2 (High, red-team): the eager-decode ceiling must bound the RAW leaf decode PLUS the reconstructed

@@ -57,6 +57,35 @@ internal static class ParquetTestHelpers
         return stream.ToArray();
     }
 
+    /// <summary>Authors a struct whose scalar field is a 1-level LEGACY REPEATED primitive — a
+    /// <c>DataField</c> with <c>isArray=true</c>, which round-trips as a leaf <c>DataField</c> with
+    /// <c>MaxRepetitionLevel=1</c> directly under a struct. The typed <c>ParquetSerializer</c> never emits
+    /// this (it models a nested collection as a 3-level <c>ListField</c>, caught earlier as "file column is
+    /// itself nested"), so this low-level writer is the only way to author the R8 struct-field maxRep
+    /// masquerade: requesting this column as <c>struct&lt;A: scalar&gt;</c> navigates the reader to a scalar
+    /// struct field whose file leaf is repeated (its N element occurrences would pose as N struct rows if the
+    /// repetition stream were ignored). <paramref name="fieldRep"/> supplies the repeated field's repetition
+    /// levels (definition levels derive from the nullable value array).</summary>
+    public static async Task<byte[]> WriteStructWithRepeatedFieldAsync(int?[] ids, int?[] fieldValues, int[] fieldRep)
+    {
+        var repeatedField = new global::Parquet.Schema.DataField("A", typeof(int), isArray: true);
+        var structField = new global::Parquet.Schema.StructField("S", repeatedField);
+        var schema = new global::Parquet.Schema.ParquetSchema(
+            new global::Parquet.Schema.DataField<int>("Id"), structField);
+        global::Parquet.Schema.DataField[] leaves = schema.GetDataFields();
+
+        using var stream = new MemoryStream();
+        await using (ParquetWriter writer = await ParquetWriter.CreateAsync(schema, stream))
+        {
+            using ParquetRowGroupWriter rowGroup = writer.CreateRowGroup();
+            await rowGroup.WriteAsync<int>(leaves[0], new ReadOnlyMemory<int?>(ids), null, null, CancellationToken.None);
+            await rowGroup.WriteAsync<int>(
+                leaves[1], new ReadOnlyMemory<int?>(fieldValues), fieldRep, null, CancellationToken.None);
+        }
+
+        return stream.ToArray();
+    }
+
     /// <summary>Reads all row-group batches through <see cref="ParquetFileReader"/>.</summary>
     public static async Task<List<ColumnBatch>> ReadAllAsync(
         byte[] bytes,
