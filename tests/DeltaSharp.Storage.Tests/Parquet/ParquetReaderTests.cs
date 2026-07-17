@@ -187,9 +187,12 @@ public sealed class ParquetReaderTests
     }
 
     [Fact]
-    public async Task NestedRequestedType_ThrowsUnsupportedFeature()
+    public async Task NestedShape_ForScalarFileColumn_ThrowsSchemaMismatch()
     {
-        // Write a simple valid file, then request a nested (array) column, which the layer defers.
+        // #571: single-level nested shapes (array/map/struct of scalar) are now a SUPPORTED read shape, so
+        // requesting an array is no longer a blanket UnsupportedFeature. Here the file column 'id' is
+        // physically scalar, so requesting it as an array is a structural mismatch: the reader must fail
+        // closed with SchemaMismatch rather than mis-decode a scalar chunk as a repeated column.
         var writeSchema = new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) });
         ColumnBatch batch = BuildLongBatch(writeSchema, new long[] { 1, 2, 3 });
         using var stream = new MemoryStream();
@@ -207,7 +210,7 @@ public sealed class ParquetReaderTests
             {
             }
         });
-        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
     }
 
     // ---------------------------------------------------------------- #497 read-side null-fill
