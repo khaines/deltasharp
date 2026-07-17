@@ -700,6 +700,72 @@ public sealed class NestedParquetReadTests
     }
 
     [Fact]
+    public async Task NestedDecodeCeiling_AggregatesLeafBudgetsAcrossStructFields_FailsClosed()
+    {
+        // R8 (Critical, red-team): the eager-decode ceiling must bound a nested column's leaves CUMULATIVELY,
+        // not each leaf independently. A struct<L:long, D:double, Flag:bool> over 2000 present rows reconstructs
+        // three leaf children whose per-leaf raw+child budgets are ~42,000 / ~42,000 / ~14,000 bytes: each is
+        // individually under a 60,000-byte ceiling (so a PER-LEAF-only check passes all three), but their
+        // COMBINED peak (~98,000) exceeds it. The flat EnsureDecodeCeiling (sum of the leaves' raw
+        // UncompressedBytes, ~34,000) also passes, so only the shared NestedDecodeBudget catches the overrun —
+        // proving a wide struct can no longer allocate K x the ceiling.
+        var rows = new List<WideRow>(2000);
+        for (int i = 0; i < 2000; i++)
+        {
+            rows.Add(new WideRow { Id = i, W = new Wide { L = i, D = i * 1.5, Flag = (i & 1) == 0 } });
+        }
+
+        byte[] bytes = await WriteAsync(rows);
+
+        StructType wideType = DataTypes.CreateStructType(new[]
+        {
+            DataTypes.CreateStructField("L", DataTypes.LongType, nullable: false),
+            DataTypes.CreateStructField("D", DataTypes.DoubleType, nullable: false),
+            DataTypes.CreateStructField("Flag", DataTypes.BooleanType, nullable: false),
+        });
+        var requested = new StructType(new[] { new StructField("W", wideType, nullable: true) });
+        var reader = new ParquetFileReader(new ParquetDecodeLimits(maxRowGroupDecodedBytes: 60_000));
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => EnumerateAsync(reader, bytes, requested));
+
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+        Assert.Contains("Nested leaf", error.Message, StringComparison.Ordinal);
+        Assert.Contains("eager decode would exceed", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task NestedDecodeCeiling_StructWithinAggregateBudget_Decodes()
+    {
+        // R8 regression (no over-reject): the SAME struct<L,D,Flag> over 2000 rows decodes cleanly under a
+        // ceiling comfortably above its cumulative ~98,000-byte reconstruction peak — the shared budget only
+        // rejects the genuine aggregate overrun above, never a within-budget wide struct.
+        var rows = new List<WideRow>(2000);
+        for (int i = 0; i < 2000; i++)
+        {
+            rows.Add(new WideRow { Id = i, W = new Wide { L = i, D = i * 1.5, Flag = (i & 1) == 0 } });
+        }
+
+        byte[] bytes = await WriteAsync(rows);
+
+        StructType wideType = DataTypes.CreateStructType(new[]
+        {
+            DataTypes.CreateStructField("L", DataTypes.LongType, nullable: false),
+            DataTypes.CreateStructField("D", DataTypes.DoubleType, nullable: false),
+            DataTypes.CreateStructField("Flag", DataTypes.BooleanType, nullable: false),
+        });
+        var requested = new StructType(new[] { new StructField("W", wideType, nullable: true) });
+        var reader = new ParquetFileReader(new ParquetDecodeLimits(maxRowGroupDecodedBytes: 400_000));
+
+        ColumnBatch batch = await ReadSingleAsync(reader, bytes, requested);
+        var w = Assert.IsType<StructColumnVector>(batch.Column("W"));
+        Assert.Equal(2000, batch.RowCount);
+        Assert.Equal(0L, w.Child("L").GetValue<long>(0));
+        Assert.Equal(1999L, w.Child("L").GetValue<long>(1999));
+        Assert.Equal(1999 * 1.5, w.Child("D").GetValue<double>(1999));
+    }
+
+    [Fact]
     public async Task ArrayOfStruct_FailsClosed_UnsupportedFeature()
     {
         // A nested type within a nested type (array-of-struct) is out of scope for #571: it must be rejected

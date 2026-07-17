@@ -187,16 +187,20 @@ internal static class NestedParquetColumnReader
         ParquetDecodeLimits limits,
         CancellationToken cancellationToken)
     {
+        // One eager-decode budget shared across every leaf of THIS nested column, so the leaves' COMBINED
+        // reconstruction peak — not merely each leaf independently — stays within the ceiling (a K-field
+        // struct or a 2-leaf map would otherwise be allowed up to K x the ceiling).
+        var budget = new NestedDecodeBudget(limits.MaxRowGroupDecodedBytes);
         return requestedType switch
         {
             StructType structType => await ReadStructAsync(
-                rowGroup, ExpectStruct(fileField, columnName), structType, rowCount, columnName, limits, cancellationToken)
+                rowGroup, ExpectStruct(fileField, columnName), structType, rowCount, columnName, budget, cancellationToken)
                 .ConfigureAwait(false),
             ArrayType arrayType => await ReadListAsync(
-                rowGroup, ExpectList(fileField, columnName), arrayType, rowCount, columnName, limits, cancellationToken)
+                rowGroup, ExpectList(fileField, columnName), arrayType, rowCount, columnName, budget, cancellationToken)
                 .ConfigureAwait(false),
             MapType mapType => await ReadMapAsync(
-                rowGroup, ExpectMap(fileField, columnName), mapType, rowCount, columnName, limits, cancellationToken)
+                rowGroup, ExpectMap(fileField, columnName), mapType, rowCount, columnName, budget, cancellationToken)
                 .ConfigureAwait(false),
             _ => throw DeltaStorageException.UnsupportedFeature(
                 $"Parquet nested read for column '{columnName}' of type '{requestedType.SimpleString}' "
@@ -212,7 +216,7 @@ internal static class NestedParquetColumnReader
         StructType requested,
         int rowCount,
         string columnName,
-        ParquetDecodeLimits limits,
+        NestedDecodeBudget budget,
         CancellationToken cancellationToken)
     {
         // A struct's own definition level: a row whose definition level is BELOW this marks a NULL struct
@@ -229,7 +233,7 @@ internal static class NestedParquetColumnReader
             // rowCount values with definition levels aligned to rows — the field child is built with a present
             // floor of 0 (every row yields a cell: a value, a null field, or a null belonging to a null struct).
             (MutableColumnVector child, int[]? def, _, int numValues) = await ReadScalarLeafAsync(
-                rowGroup, leaf, field.DataType, presentFloor: 0, limits, cancellationToken).ConfigureAwait(false);
+                rowGroup, leaf, field.DataType, presentFloor: 0, budget, cancellationToken).ConfigureAwait(false);
             if (numValues != rowCount)
             {
                 throw DeltaStorageException.CorruptData(
@@ -321,7 +325,7 @@ internal static class NestedParquetColumnReader
         ArrayType requested,
         int rowCount,
         string columnName,
-        ParquetDecodeLimits limits,
+        NestedDecodeBudget budget,
         CancellationToken cancellationToken)
     {
         DataField elementLeaf = ExpectScalarLeaf(
@@ -332,7 +336,7 @@ internal static class NestedParquetColumnReader
         // The element child collects one cell per PRESENT element slot (a real value OR a null element),
         // skipping the placeholder slots a null/empty list emits (definition level below the list's own level).
         (MutableColumnVector elements, int[]? def, int[]? rep, int numValues) = await ReadScalarLeafAsync(
-            rowGroup, elementLeaf, requested.ElementType, presentFloor: listMaxDef, limits, cancellationToken)
+            rowGroup, elementLeaf, requested.ElementType, presentFloor: listMaxDef, budget, cancellationToken)
             .ConfigureAwait(false);
 
         // A1 (defense in depth): every top-level row emits at least one element-level slot (a real element, or
@@ -367,7 +371,7 @@ internal static class NestedParquetColumnReader
         MapType requested,
         int rowCount,
         string columnName,
-        ParquetDecodeLimits limits,
+        NestedDecodeBudget budget,
         CancellationToken cancellationToken)
     {
         EnsureRequiredMapKey(fileMap, columnName);
@@ -383,7 +387,7 @@ internal static class NestedParquetColumnReader
         // (enforced above), so every referenced key slot carries a real value — keys are never null, matching
         // MapType's structural invariant.
         (MutableColumnVector keys, int[]? keyDef, int[]? keyRep, int keyNumValues) = await ReadScalarLeafAsync(
-            rowGroup, keyLeaf, requested.KeyType, presentFloor: mapMaxDef, limits, cancellationToken)
+            rowGroup, keyLeaf, requested.KeyType, presentFloor: mapMaxDef, budget, cancellationToken)
             .ConfigureAwait(false);
 
         // The value child is parallel to the key child: driven by the SAME present floor, its own definition
@@ -392,7 +396,7 @@ internal static class NestedParquetColumnReader
         // repeated key_value group, so their repetition levels are identical AND they agree, slot-by-slot, on
         // whether an entry is present.
         (MutableColumnVector values, int[]? valueDef, int[]? valueRep, _) = await ReadScalarLeafAsync(
-            rowGroup, valueLeaf, requested.ValueType, presentFloor: mapMaxDef, limits, cancellationToken)
+            rowGroup, valueLeaf, requested.ValueType, presentFloor: mapMaxDef, budget, cancellationToken)
             .ConfigureAwait(false);
 
         // F1: the value child is consumed positionally against the KEY-driven entry structure (offsets/nulls
@@ -553,44 +557,44 @@ internal static class NestedParquetColumnReader
         DataField leaf,
         DataType scalarType,
         int presentFloor,
-        ParquetDecodeLimits limits,
+        NestedDecodeBudget budget,
         CancellationToken cancellationToken)
     {
         switch (scalarType)
         {
             case BooleanType:
-                return ReadLeafAsync<bool>(rowGroup, leaf, scalarType, presentFloor, limits,
+                return ReadLeafAsync<bool>(rowGroup, leaf, scalarType, presentFloor, budget,
                     static (v, x) => v.AppendValue(x), cancellationToken);
             case ByteType:
-                return ReadLeafAsync<sbyte>(rowGroup, leaf, scalarType, presentFloor, limits,
+                return ReadLeafAsync<sbyte>(rowGroup, leaf, scalarType, presentFloor, budget,
                     static (v, x) => v.AppendValue(unchecked((byte)x)), cancellationToken);
             case ShortType:
-                return ReadLeafAsync<short>(rowGroup, leaf, scalarType, presentFloor, limits,
+                return ReadLeafAsync<short>(rowGroup, leaf, scalarType, presentFloor, budget,
                     static (v, x) => v.AppendValue(x), cancellationToken);
             case IntegerType:
-                return ReadLeafAsync<int>(rowGroup, leaf, scalarType, presentFloor, limits,
+                return ReadLeafAsync<int>(rowGroup, leaf, scalarType, presentFloor, budget,
                     static (v, x) => v.AppendValue(x), cancellationToken);
             case LongType:
-                return ReadLeafAsync<long>(rowGroup, leaf, scalarType, presentFloor, limits,
+                return ReadLeafAsync<long>(rowGroup, leaf, scalarType, presentFloor, budget,
                     static (v, x) => v.AppendValue(x), cancellationToken);
             case FloatType:
-                return ReadLeafAsync<float>(rowGroup, leaf, scalarType, presentFloor, limits,
+                return ReadLeafAsync<float>(rowGroup, leaf, scalarType, presentFloor, budget,
                     static (v, x) => v.AppendValue(x), cancellationToken);
             case DoubleType:
-                return ReadLeafAsync<double>(rowGroup, leaf, scalarType, presentFloor, limits,
+                return ReadLeafAsync<double>(rowGroup, leaf, scalarType, presentFloor, budget,
                     static (v, x) => v.AppendValue(x), cancellationToken);
             case DateType:
-                return ReadLeafAsync<DateTime>(rowGroup, leaf, scalarType, presentFloor, limits,
+                return ReadLeafAsync<DateTime>(rowGroup, leaf, scalarType, presentFloor, budget,
                     static (v, x) => v.AppendValue(ParquetTypeMapping.DateTimeToEpochDay(x)), cancellationToken);
             case TimestampType or TimestampNtzType:
-                return ReadLeafAsync<DateTime>(rowGroup, leaf, scalarType, presentFloor, limits,
+                return ReadLeafAsync<DateTime>(rowGroup, leaf, scalarType, presentFloor, budget,
                     static (v, x) => v.AppendValue(ParquetTypeMapping.DateTimeToEpochMicros(x)), cancellationToken);
             case DecimalType decimalType:
                 ParquetTypeMapping.DecimalScaleFactors factors = ParquetTypeMapping.DecimalScaleFactors.For(decimalType);
-                return ReadLeafAsync<decimal>(rowGroup, leaf, scalarType, presentFloor, limits,
+                return ReadLeafAsync<decimal>(rowGroup, leaf, scalarType, presentFloor, budget,
                     (v, x) => ParquetTypeMapping.AppendDecimal(v, decimalType, x, factors), cancellationToken);
             case StringType:
-                return ReadLeafAsync<ReadOnlyMemory<char>>(rowGroup, leaf, scalarType, presentFloor, limits,
+                return ReadLeafAsync<ReadOnlyMemory<char>>(rowGroup, leaf, scalarType, presentFloor, budget,
                     static (v, x) =>
                     {
                         // Encode straight from the source chars into a single right-sized buffer — no
@@ -603,7 +607,7 @@ internal static class NestedParquetColumnReader
                         v.AppendBytes(bytes);
                     }, cancellationToken);
             case BinaryType:
-                return ReadLeafAsync<ReadOnlyMemory<byte>>(rowGroup, leaf, scalarType, presentFloor, limits,
+                return ReadLeafAsync<ReadOnlyMemory<byte>>(rowGroup, leaf, scalarType, presentFloor, budget,
                     static (v, x) => v.AppendBytes(x.Span), cancellationToken);
             default:
                 throw DeltaStorageException.UnsupportedFeature(
@@ -616,13 +620,13 @@ internal static class NestedParquetColumnReader
         DataField leaf,
         DataType elementType,
         int presentFloor,
-        ParquetDecodeLimits limits,
+        NestedDecodeBudget budget,
         Action<MutableColumnVector, T> append,
         CancellationToken cancellationToken)
         where T : struct
     {
         int numValues = LeafNumValues(
-            rowGroup, leaf, limits, Unsafe.SizeOf<T>(), variableWidth: elementType is StringType or BinaryType);
+            rowGroup, leaf, budget, Unsafe.SizeOf<T>(), variableWidth: elementType is StringType or BinaryType);
         var values = new T[numValues];
         int[]? def = null;
         int[]? rep = null;
@@ -829,11 +833,49 @@ internal static class NestedParquetColumnReader
             }
         }
     }
+    // The COLUMN-WIDE eager-decode budget shared across every leaf of ONE nested-column read: the reader's
+    // MaxRowGroupDecodedBytes ceiling, drawn down by each leaf's reconstruction transient so the leaves'
+    // COMBINED peak stays bounded. The flat reader's EnsureDecodeCeiling sums the projected chunks' declared
+    // UncompressedBytes CUMULATIVELY; this mirrors that for the nested reconstruction overhead (the #570 child
+    // ColumnVector each leaf materializes) which the declared-bytes aggregate does not model. A per-leaf-only
+    // ceiling check would let a K-field struct (or a 2-leaf map) allocate up to K x the ceiling.
+    private sealed class NestedDecodeBudget
+    {
+        private long _remaining;
+
+        public NestedDecodeBudget(long ceiling)
+        {
+            Ceiling = ceiling;
+            _remaining = ceiling;
+        }
+
+        public long Ceiling { get; }
+
+        // Draws this leaf's transient (payloadBytes + numValues * perSlotBytes) down from the shared budget,
+        // failing closed if the CUMULATIVE total across the column's leaves breaches the ceiling. Overflow-safe:
+        // the payload is subtracted first (a saturated payload underflows to < 0 and is caught), then the
+        // per-slot product is bounded by division against what REMAINS, so the subsequent subtraction cannot
+        // drive _remaining below 0 or overflow (numValues * perSlotBytes <= _remaining <= Ceiling).
+        public void Charge(long payloadBytes, long numValues, long perSlotBytes, DataField leaf)
+        {
+            _remaining -= payloadBytes;
+            if (_remaining < 0 || (perSlotBytes > 0 && numValues > _remaining / perSlotBytes))
+            {
+                throw DeltaStorageException.CorruptData(
+                    $"Nested leaf '{leaf.Path}' declares {numValues} values, whose eager decode would exceed the "
+                    + $"{Ceiling}-byte ceiling.");
+            }
+
+            _remaining -= numValues * perSlotBytes;
+        }
+    }
+
     // buffers are allocated so a crafted NumValues cannot drive an out-of-memory allocation. Unlike the flat
     // path (one value per row, bounded by the row count), a repeated leaf can declare more values than rows,
-    // so this bounds the ACTUAL transient (values + definition + repetition buffers) by the leaf's own count.
+    // so this bounds the ACTUAL transient (values + definition + repetition buffers) by the leaf's own count,
+    // charged against the COLUMN-WIDE budget so the leaves' COMBINED reconstruction peak stays under the ceiling.
     private static int LeafNumValues(
-        ParquetRowGroupReader rowGroup, DataField leaf, ParquetDecodeLimits limits, int elementWidth, bool variableWidth)
+        ParquetRowGroupReader rowGroup, DataField leaf, NestedDecodeBudget budget, int elementWidth, bool variableWidth)
     {
         global::Parquet.Meta.ColumnMetaData meta = rowGroup.GetMetadata(leaf)?.MetaData
             ?? throw DeltaStorageException.CorruptData(
@@ -874,16 +916,10 @@ internal static class NestedParquetColumnReader
             payloadBytes = uncompressed > long.MaxValue / 2 ? long.MaxValue : 2 * uncompressed;
         }
 
-        // The eager transient is (numValues * perSlotBytes) + payloadBytes. Check overflow-safely: reject if
-        // the payload budget alone breaches the ceiling (remaining < 0), else if the per-slot transient
-        // breaches the REMAINING budget.
-        long remaining = limits.MaxRowGroupDecodedBytes - payloadBytes;
-        if (remaining < 0 || (perSlotBytes > 0 && numValues > remaining / perSlotBytes))
-        {
-            throw DeltaStorageException.CorruptData(
-                $"Nested leaf '{leaf.Path}' declares {numValues} values, whose eager decode would exceed the "
-                + $"{limits.MaxRowGroupDecodedBytes}-byte ceiling.");
-        }
+        // The eager transient is (numValues * perSlotBytes) + payloadBytes. Draw it down from the COLUMN-WIDE
+        // budget (shared across this nested column's leaves) so their COMBINED peak — not merely each leaf
+        // independently — stays within the eager-decode ceiling; fails closed (overflow-safely) on breach.
+        budget.Charge(payloadBytes, numValues, perSlotBytes, leaf);
 
         if (numValues > int.MaxValue)
         {
