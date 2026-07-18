@@ -134,30 +134,56 @@ public sealed class DeltaWriteTarget : IDisposable
         await _log.GetLatestCommitVersionAsync(cancellationToken).ConfigureAwait(false) is not null;
 
     /// <summary>
-    /// Loads the per-row write constraints (column <b>invariants</b> + named <b>CHECK</b> constraints, #581)
-    /// a write with declared schema <paramref name="writeSchema"/> must enforce — the union of the table's
-    /// active constraints (from its latest snapshot) and any invariant declared on <paramref name="writeSchema"/>
-    /// itself (so a fresh create, or a mergeSchema append adding a constrained column, validates its own rows).
+    /// Enforces the write's active per-row constraints (column <b>invariants</b> + named <b>CHECK</b>
+    /// constraints, #581) over <paramref name="batches"/> BEFORE any Parquet file is staged. The constraint
+    /// set is collected from <paramref name="constraintSnapshot"/> (the SAME snapshot the commit bases on, or
+    /// <see langword="null"/> for a fresh create or a schema-replacing overwrite whose existing constraints are
+    /// dropped) unioned with any invariant declared on <paramref name="writeSchema"/> itself — so enforcement
+    /// and the commit share one snapshot (no read-vs-commit TOCTOU, #596). Called from inside the write
+    /// primitive so a non-sink caller of the public write door cannot bypass it.
     /// </summary>
-    /// <param name="writeSchema">The declared write schema (its fields may carry <c>delta.invariants</c>).</param>
-    /// <param name="cancellationToken">Cancels the snapshot load.</param>
-    /// <returns>The active constraints, or an empty list.</returns>
+    /// <param name="enforcer">The predicate evaluator (the executor's Delta sink); required when the write has
+    /// any active constraint (else the write is refused fail-closed rather than committed unvalidated).</param>
+    /// <param name="constraintSnapshot">The commit's base snapshot whose active constraints apply, or
+    /// <see langword="null"/> when no existing constraints apply (fresh create / <c>overwriteSchema</c>).</param>
+    /// <param name="writeSchema">The write's logical schema; the batches conform to it and its fields' own
+    /// <c>delta.invariants</c> are enforced too.</param>
+    /// <param name="batches">The write batches whose rows are validated.</param>
     /// <exception cref="DeltaProtocolException">A constraint is malformed, empty, or a nested-field invariant.</exception>
-    /// <remarks>
-    /// This reads the table's latest committed version <b>independently</b> of the subsequent commit path, so
-    /// under concurrency the constraint set and the commit's base snapshot can differ. Threading a single
-    /// snapshot through enforcement and the commit (so a concurrently-added constraint is a genuine commit
-    /// conflict) is tracked in <b>#596</b>.
-    /// </remarks>
-    public async Task<IReadOnlyList<DeltaTableConstraint>> LoadActiveConstraintsAsync(
-        StructType writeSchema, bool includeExisting = true, CancellationToken cancellationToken = default)
+    /// <exception cref="InvalidOperationException">The write has active constraints but no
+    /// <paramref name="enforcer"/> was provided — refused fail-closed.</exception>
+    /// <exception cref="DeltaConstraintViolationException">A row does not satisfy a constraint.</exception>
+    private static void EnforceWriteConstraints(
+        IWriteConstraintEnforcer? enforcer,
+        Snapshot? constraintSnapshot,
+        StructType writeSchema,
+        IReadOnlyList<ColumnBatch> batches)
     {
-        ArgumentNullException.ThrowIfNull(writeSchema);
-        Snapshot? snapshot = !includeExisting
-            || await _log.GetLatestCommitVersionAsync(cancellationToken).ConfigureAwait(false) is null
-            ? null
-            : await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
-        return DeltaTableConstraints.CollectForWrite(snapshot, writeSchema);
+        // An empty write carries no rows to validate, so there is nothing to enforce (and no unenforced data
+        // to protect against a bypass) — skip uniformly, keeping an empty create/append/overwrite a benign
+        // no-op that needs no enforcer (Spark parity; the existing-append path also short-circuits empty).
+        if (!HasRows(batches))
+        {
+            return;
+        }
+
+        IReadOnlyList<DeltaTableConstraint> constraints =
+            DeltaTableConstraints.CollectForWrite(constraintSnapshot, writeSchema);
+        if (constraints.Count == 0)
+        {
+            return;
+        }
+
+        if (enforcer is null)
+        {
+            throw new InvalidOperationException(
+                $"This write targets a table with {constraints.Count} active per-row constraint(s) "
+                + "(column invariant / CHECK) but no constraint enforcer was supplied to the write primitive; "
+                + "the write is refused fail-closed rather than committed without validating its rows. Route "
+                + "the write through the executor's Delta sink (which supplies the enforcer).");
+        }
+
+        enforcer.Enforce(writeSchema, constraints, batches);
     }
 
     /// <summary>Appends <paramref name="batches"/> to the table (creating it on first write).</summary>
@@ -169,12 +195,17 @@ public sealed class DeltaWriteTarget : IDisposable
     /// table enables) or must strictly conform to it (<see langword="false"/>, the default). Under
     /// column-mapping name mode a new column is minted a fresh physical name ONCE and staged under it, so the
     /// door and the commit agree on the physical identity (#556).</param>
+    /// <param name="enforcer">The per-row constraint enforcer (#581/#596). Enforcement runs inside this
+    /// primitive against the SAME snapshot the commit bases on, after the physical write shape is resolved.
+    /// It is required only when the table (or the write schema) declares an active constraint; an
+    /// unconstrained write needs none. A constrained write with no enforcer is refused fail-closed.</param>
     /// <param name="cancellationToken">Cancels staging and the commit.</param>
     public async Task<DeltaWriteResult> AppendAsync(
         StructType writeSchema,
         IReadOnlyList<string> partitionColumns,
         IReadOnlyList<ColumnBatch> batches,
         bool mergeSchema = false,
+        IWriteConstraintEnforcer? enforcer = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(writeSchema);
@@ -187,7 +218,9 @@ public sealed class DeltaWriteTarget : IDisposable
         {
             // Fresh path: the write CREATES a plain (none-mode) table — logical==physical, nothing to mint,
             // and evolutionMode is moot (the declared schema becomes version 0). A name-mode table is created
-            // via CreateNameMappedTableAsync, not this facade path.
+            // via CreateNameMappedTableAsync, not this facade path. There is no prior snapshot, so only the
+            // write schema's own invariants apply.
+            EnforceWriteConstraints(enforcer, constraintSnapshot: null, writeSchema, batches);
             (IReadOnlyList<StagedDataFile> createFiles, long createRows) =
                 await StageAsync(writeSchema, partitionColumns, batches, cancellationToken).ConfigureAwait(false);
             DeltaCommitResult created = await _writer
@@ -213,6 +246,11 @@ public sealed class DeltaWriteTarget : IDisposable
         }
 
         DeltaWritePlan plan = _writer.PlanAppend(snapshot, writeSchema, evolutionMode);
+
+        // #596: enforce inside the primitive, against the SAME `snapshot` the commit bases on and AFTER the
+        // write shape is planned (post-reconcile) — so the constraint set and the commit can never diverge
+        // (no TOCTOU) and the shape validated is the shape committed. Runs before any Parquet is staged.
+        EnforceWriteConstraints(enforcer, snapshot, writeSchema, batches);
 
         (IReadOnlyList<StagedDataFile> files, long rows) =
             await StageAsync(plan.PhysicalWriteSchema, plan.PhysicalPartitionColumns, batches, cancellationToken)
@@ -246,6 +284,7 @@ public sealed class DeltaWriteTarget : IDisposable
         IReadOnlyList<ColumnBatch> batches,
         DeltaPartitionOverwriteMode partitionOverwriteMode,
         bool overwriteSchema = false,
+        IWriteConstraintEnforcer? enforcer = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(writeSchema);
@@ -264,6 +303,11 @@ public sealed class DeltaWriteTarget : IDisposable
             Snapshot snapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
             DeltaWritePlan plan = _writer.PlanOverwriteReplaceSchema(snapshot, writeSchema, partitionColumns);
 
+            // #596: overwriteSchema replaces the table schema wholesale, so the EXISTING constraints are
+            // dropped with it — only the incoming schema's own invariants apply (constraintSnapshot: null).
+            // Enforced inside the primitive, after the replace shape is planned, before any Parquet is staged.
+            EnforceWriteConstraints(enforcer, constraintSnapshot: null, writeSchema, batches);
+
             (IReadOnlyList<StagedDataFile> replaceFiles, long replaceRows) =
                 await StageAsync(plan.PhysicalWriteSchema, plan.PhysicalPartitionColumns, batches, cancellationToken)
                     .ConfigureAwait(false);
@@ -273,17 +317,31 @@ public sealed class DeltaWriteTarget : IDisposable
             return new DeltaWriteResult(replaced.Version, replaceFiles.Count, replaceRows);
         }
 
+        // #596: load the base snapshot ONCE here (null on a fresh path) and thread it through enforcement,
+        // physical staging resolution, AND the commit — so the constraints enforced and the snapshot committed
+        // against can never diverge (no TOCTOU), and enforcement runs inside the primitive (no bypass).
+        Snapshot? baseSnapshot =
+            await _log.GetLatestCommitVersionAsync(cancellationToken).ConfigureAwait(false) is null
+                ? null
+                : await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
+
+        // A general (non-schema-replacing) overwrite keeps the table's schema and thus its active constraints,
+        // so the existing snapshot's constraints apply; overwriteSchema (reached here only fresh or, when it
+        // would be dynamic, rejected below) drops them. The incoming schema's own invariants always apply.
+        EnforceWriteConstraints(enforcer, overwriteSchema ? null : baseSnapshot, writeSchema, batches);
+
         // #525: stage under the table's PHYSICAL schema for an EXISTING name-mode table (see AppendAsync); a
         // fresh path or a `none`-mode table returns the logical schema unchanged. The mode-aware overwrite
         // (incl. the dynamic+overwriteSchema reject and fresh-create) is applied by CreateOrOverwriteAsync.
         (StructType stagingSchema, IReadOnlyList<string> stagingPartitions) =
-            await ResolvePhysicalStagingAsync(writeSchema, partitionColumns, cancellationToken).ConfigureAwait(false);
+            ResolvePhysicalStaging(baseSnapshot, writeSchema, partitionColumns);
 
         (IReadOnlyList<StagedDataFile> files, long rows) =
             await StageAsync(stagingSchema, stagingPartitions, batches, cancellationToken).ConfigureAwait(false);
         DeltaCommitResult commit = await _writer
             .CreateOrOverwriteAsync(
-                writeSchema, partitionColumns, files, Map(partitionOverwriteMode), overwriteSchema, cancellationToken)
+                baseSnapshot, writeSchema, partitionColumns, files, Map(partitionOverwriteMode), overwriteSchema,
+                cancellationToken)
             .ConfigureAwait(false);
         return new DeltaWriteResult(commit.Version, files.Count, rows);
     }
@@ -462,26 +520,27 @@ public sealed class DeltaWriteTarget : IDisposable
     // the staged Parquet must physically carry (so an append/overwrite writes col-<uuid> names + physical-
     // keyed partitionValues, IDENTICAL to the fresh-create path). The physical names are the table's EXISTING
     // per-field delta.columnMapping.physicalName — reused verbatim, NEVER re-minted. For a fresh path (create
-    // door) or a `none`-mode table this is logical==physical, so the caller's write schema / partition columns
-    // pass through unchanged (byte-for-byte identical staging to prior behavior). `id` mode is fail-closed at
-    // the id-write gate (EnsureWriteSupported / the centralized DeltaCommitter gate — #523), so a write never
-    // reaches this staging path. This is a STAGING concern only — the commit call still passes the LOGICAL write
-    // schema to DeltaTableWriter, which re-derives the physical form for its own commit-time validation.
-    private async Task<(StructType StagingSchema, IReadOnlyList<string> StagingPartitions)>
-        ResolvePhysicalStagingAsync(
-            StructType writeSchema, IReadOnlyList<string> partitionColumns, CancellationToken cancellationToken)
+    // door, `snapshot` null) or a `none`-mode table this is logical==physical, so the caller's write schema /
+    // partition columns pass through unchanged (byte-for-byte identical staging to prior behavior). `id` mode
+    // is fail-closed at the id-write gate (EnsureWriteSupported / the centralized DeltaCommitter gate — #523),
+    // so a write never reaches this staging path. This is a STAGING concern only — the commit call still
+    // passes the LOGICAL write schema to DeltaTableWriter, which re-derives the physical form for its own
+    // commit-time validation. #596: takes the caller's already-loaded base snapshot so overwrite loads the
+    // snapshot exactly ONCE (shared with enforcement + the commit) instead of re-reading the log here.
+    private static (StructType StagingSchema, IReadOnlyList<string> StagingPartitions)
+        ResolvePhysicalStaging(
+            Snapshot? snapshot, StructType writeSchema, IReadOnlyList<string> partitionColumns)
     {
         ArgumentNullException.ThrowIfNull(writeSchema);
         ArgumentNullException.ThrowIfNull(partitionColumns);
 
-        if (await _log.GetLatestCommitVersionAsync(cancellationToken).ConfigureAwait(false) is null)
+        if (snapshot is null)
         {
             // Fresh path: the write creates the table (logical==physical for a plain create; a name-mode
             // create goes through CreateNameMappedTableAsync, not this facade path).
             return (writeSchema, partitionColumns);
         }
 
-        Snapshot snapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
         ColumnMappingMode mode = ColumnMapping.ResolveMode(snapshot.Metadata.Configuration);
         if (mode != ColumnMappingMode.Name)
         {
