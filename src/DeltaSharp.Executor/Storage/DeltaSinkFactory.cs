@@ -1,8 +1,13 @@
 using System.Diagnostics.CodeAnalysis;
+using DeltaSharp.Analysis;
 using DeltaSharp.Engine.Columnar;
+using DeltaSharp.Engine.Execution;
 using DeltaSharp.Plans.Logical;
 using DeltaSharp.Storage;
 using DeltaSharp.Types;
+using CoreExpr = DeltaSharp.Plans.Expressions.Expression;
+using EnginePhysicalExpression = DeltaSharp.Engine.Execution.PhysicalExpression;
+using ExprAttributeReference = DeltaSharp.Plans.Expressions.AttributeReference;
 
 namespace DeltaSharp.Executor;
 
@@ -46,7 +51,7 @@ internal sealed class DeltaSinkFactory : ILocalSinkFactory
 /// The facade stages the Parquet files <b>before</b> the log commit, so a mode conflict or a concurrent-write
 /// abort leaves the staged files as VACUUM-reclaimable orphans — never a partial commit.
 /// </summary>
-internal sealed class DeltaLocalSink : ILocalSink
+internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
 {
     // Spark's DataFrameWriter option / SQL conf selecting how an overwrite replaces data. Both spellings are
     // accepted (case-insensitively) so `.option("partitionOverwriteMode", "dynamic")` and the fully-qualified
@@ -114,9 +119,12 @@ internal sealed class DeltaLocalSink : ILocalSink
                         + "add columns additively.");
                 }
 
+                // #596: enforcement now runs INSIDE the write primitive (against the commit's own snapshot,
+                // post-reconcile), so hand it the enforcer instead of pre-validating here.
                 return target
                     .OverwriteAsync(
-                        schema, partitionColumns, batches, ResolvePartitionOverwriteMode(), ResolveOverwriteSchema())
+                        schema, partitionColumns, batches,
+                        ResolvePartitionOverwriteMode(), ResolveOverwriteSchema(), enforcer: this)
                     .GetAwaiter().GetResult().RowsWritten;
 
             case SaveMode.Ignore:
@@ -165,10 +173,76 @@ internal sealed class DeltaLocalSink : ILocalSink
         throw ErrorIfExistsConflict(path);
     }
 
-    private static long RunAppend(
+    private long RunAppend(
         DeltaWriteTarget target, StructType schema, IReadOnlyList<string> partitionColumns,
-        IReadOnlyList<ColumnBatch> batches, bool mergeSchema) =>
-        target.AppendAsync(schema, partitionColumns, batches, mergeSchema).GetAwaiter().GetResult().RowsWritten;
+        IReadOnlyList<ColumnBatch> batches, bool mergeSchema)
+    {
+        // #596: enforcement runs INSIDE AppendAsync (sharing the commit's snapshot); pass the enforcer.
+        return target.AppendAsync(schema, partitionColumns, batches, mergeSchema, enforcer: this)
+            .GetAwaiter().GetResult().RowsWritten;
+    }
+
+    // The backend name attributed in any evaluator diagnostic raised while enforcing a constraint predicate.
+    private const string ConstraintBackendName = "delta-constraint-enforcement";
+
+    /// <summary>
+    /// The storage layer's <see cref="IWriteConstraintEnforcer"/> hook (#581/#596): evaluates each active
+    /// per-row constraint (column invariant / CHECK) the write primitive collected over the write batches.
+    /// The primitive calls this from inside <see cref="DeltaWriteTarget.AppendAsync"/> /
+    /// <see cref="DeltaWriteTarget.OverwriteAsync"/> — against the SAME snapshot the commit bases on and after
+    /// the physical write shape is resolved, BEFORE any Parquet file is staged — so enforcement and the commit
+    /// can never diverge (no TOCTOU) and the write door cannot be bypassed. Each predicate is resolved against
+    /// the write <paramref name="schema"/> (reusing the query path's parse/resolve/coerce via
+    /// <see cref="ConstraintExpressionFrontend"/>, so nested references and non-boolean predicates behave
+    /// exactly as in <c>WHERE</c>), translated to a physical predicate, and evaluated over every batch. A row
+    /// is rejected fail-closed when the predicate does not evaluate to <c>true</c> (i.e. <c>false</c> OR
+    /// <c>null</c>), matching Delta's <c>CheckDeltaInvariant.assertRule</c>.
+    /// </summary>
+    /// <remarks>
+    /// The constraint set is trusted table metadata; the untrusted input (the batch rows) is what is validated
+    /// here. The hardcoded <see cref="AnsiMode.Ansi"/> and unbounded evaluation memory are tracked in #597.
+    /// </remarks>
+    public void Enforce(
+        StructType schema,
+        IReadOnlyList<DeltaTableConstraint> constraints,
+        IReadOnlyList<ColumnBatch> batches)
+    {
+        ArgumentNullException.ThrowIfNull(schema);
+        ArgumentNullException.ThrowIfNull(constraints);
+        ArgumentNullException.ThrowIfNull(batches);
+
+        foreach (DeltaTableConstraint constraint in constraints)
+        {
+            (CoreExpr predicate, IReadOnlyList<ExprAttributeReference> input) =
+                ConstraintExpressionFrontend.ParseResolveWithInput(constraint.Expression, schema);
+            EnginePhysicalExpression physical =
+                PhysicalExpressionTranslator.For(input, AnsiMode.Ansi).Translate(predicate);
+            BatchPredicateEvaluator evaluator = BatchPredicateEvaluator.Build(physical, schema, ConstraintBackendName);
+
+            for (int batchIndex = 0; batchIndex < batches.Count; batchIndex++)
+            {
+                ColumnVector result = evaluator.Evaluate(batches[batchIndex], BoundedExecutionMemory.Unbounded);
+                for (int row = 0; row < result.Length; row++)
+                {
+                    if (RowRejected(result, row))
+                    {
+                        throw DeltaConstraintViolationException.ForRow(constraint, batchIndex, row);
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Whether the constraint-predicate result at logical <paramref name="row"/> REJECTS the row: a row is
+    /// rejected when the predicate is <b>not TRUE</b> — i.e. <c>null</c> OR <c>false</c> — matching Delta's
+    /// <c>CheckDeltaInvariant.assertRule</c>. The <see cref="ColumnVector.IsNull(int)"/> guard is
+    /// contract-mandated and load-bearing: a <see cref="ColumnVector"/> leaves the value lane UNSPECIFIED at a
+    /// null slot, so a null result must be rejected regardless of whatever the value lane happens to hold —
+    /// never derive the pass/reject decision from <see cref="ColumnVector.GetValue{T}(int)"/> at a null row.
+    /// </summary>
+    internal static bool RowRejected(ColumnVector result, int row) =>
+        result.IsNull(row) || !result.GetValue<bool>(row);
 
     private static bool TableExists(DeltaWriteTarget target) =>
         target.TableExistsAsync().GetAwaiter().GetResult();

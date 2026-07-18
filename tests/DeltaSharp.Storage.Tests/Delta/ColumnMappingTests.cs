@@ -525,7 +525,7 @@ public sealed class ColumnMappingTests : IDisposable
         {
             await Assert.ThrowsAsync<DeltaProtocolException>(() => target.OverwriteAsync(
                 logical, Array.Empty<string>(), Array.Empty<ColumnBatch>(),
-                DeltaPartitionOverwriteMode.Static, overwriteSchema: false, CancellationToken.None));
+                DeltaPartitionOverwriteMode.Static, overwriteSchema: false, cancellationToken: CancellationToken.None));
         }
 
         // The id-mode table is UNCHANGED — still at v0 with its one data file.

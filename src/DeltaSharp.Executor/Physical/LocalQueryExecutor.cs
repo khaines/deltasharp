@@ -273,6 +273,13 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
             {
                 throw;
             }
+            catch (DeltaSharp.Storage.DeltaConstraintViolationException)
+            {
+                // A per-row constraint violation (#581) is a user-data error, not a backend fault: surface it
+                // unwrapped (mirroring UnsupportedPlanException) so callers catch DeltaConstraintViolationException
+                // directly, as Spark surfaces DeltaInvariantViolationException.
+                throw;
+            }
             catch (Exception ex)
             {
                 throw new QueryExecutionException(

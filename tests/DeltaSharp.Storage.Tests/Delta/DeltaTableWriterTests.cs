@@ -104,6 +104,23 @@ public sealed class DeltaTableWriterTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateOrAppendAsync_NullSnapshot_ExistingTable_FailsClosed_NotBlindAppend()
+    {
+        // #596: the snapshot-accepting append core RESPECTS an explicit null base as "create the table at v0".
+        // If a table already exists (a concurrent writer won the create race since the door decided "fresh"),
+        // the v0 create CONFLICTS rather than silently downgrading to a blind, UNENFORCED append against that
+        // table's snapshot — the fail-closed behavior the fresh-append write door relies on so it can never
+        // bypass a concurrently-created table's constraints.
+        await SeedTableAsync(); // v0 already exists
+
+        await Assert.ThrowsAnyAsync<DeltaConcurrentModificationException>(() =>
+            Writer().CreateOrAppendAsync(
+                readSnapshot: null, TableSchema, Array.Empty<string>(), new[] { Staged("late.parquet") }));
+
+        Assert.Equal(0L, (await LoadAsync()).Version); // no v1 — the create did not become a blind append
+    }
+
+    [Fact]
     public async Task Append_CommitsAsAddOnly_WithNoRemoves()
     {
         // AC1: the append's commit contains only `add` actions (no removes) — prior state is untouched.

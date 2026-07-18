@@ -371,13 +371,45 @@ internal sealed class DeltaTableWriter
         ArgumentNullException.ThrowIfNull(partitionColumns);
         ArgumentNullException.ThrowIfNull(files);
 
-        long? latest = await _log.GetLatestCommitVersionAsync(cancellationToken).ConfigureAwait(false);
-        if (latest is null)
+        // Convenience: resolve the base snapshot ONCE (null on a fresh path) and delegate to the
+        // snapshot-accepting core. The public write door (DeltaWriteTarget) calls the core directly with the
+        // base it enforced constraints against, so enforcement and this commit share ONE snapshot (#596).
+        Snapshot? readSnapshot =
+            await _log.GetLatestCommitVersionAsync(cancellationToken).ConfigureAwait(false) is null
+                ? null
+                : await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
+        return await CreateOrAppendAsync(readSnapshot, writeSchema, partitionColumns, files, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The snapshot-accepting append core (#596): appends <paramref name="files"/> to
+    /// <paramref name="readSnapshot"/>, or — when <paramref name="readSnapshot"/> is <see langword="null"/>
+    /// (the caller decided the table does not yet exist) — <b>creates</b> it at version 0. The write door
+    /// (<see cref="DeltaWriteTarget"/>) passes the base snapshot it enforced constraints against so the
+    /// constraints and the commit can never diverge, and — crucially — passing an explicit <c>null</c> keeps
+    /// a fresh write a CREATE: if a table was created concurrently since the door's probe, the version-0
+    /// create conflicts (fail-closed) rather than silently becoming a blind, unenforced append against a table
+    /// whose constraints were never evaluated.
+    /// </summary>
+    /// <exception cref="DeltaSchemaMismatchException">An append to an existing table is incompatible with its
+    /// schema (schema evolution is <see cref="SchemaEvolutionMode.None"/> here — evolution is #495/#496).</exception>
+    internal async Task<DeltaCommitResult> CreateOrAppendAsync(
+        Snapshot? readSnapshot,
+        StructType writeSchema,
+        IReadOnlyList<string> partitionColumns,
+        IReadOnlyList<StagedDataFile> files,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(writeSchema);
+        ArgumentNullException.ThrowIfNull(partitionColumns);
+        ArgumentNullException.ThrowIfNull(files);
+
+        if (readSnapshot is null)
         {
             return await CreateTableAsync(writeSchema, partitionColumns, files, cancellationToken).ConfigureAwait(false);
         }
 
-        Snapshot readSnapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
         if (files.Count == 0)
         {
             // Append of nothing to an existing table: no new version, report the current one. (No staging, so
@@ -422,6 +454,40 @@ internal sealed class DeltaTableWriter
         ArgumentNullException.ThrowIfNull(partitionColumns);
         ArgumentNullException.ThrowIfNull(files);
 
+        // Convenience: load the base snapshot (null on a fresh path) and delegate to the snapshot-accepting
+        // core. The public write door (DeltaWriteTarget) instead loads the snapshot itself and calls the core
+        // directly, so per-row constraint enforcement and this commit share ONE snapshot (#596).
+        Snapshot? readSnapshot =
+            await _log.GetLatestCommitVersionAsync(cancellationToken).ConfigureAwait(false) is null
+                ? null
+                : await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
+        return await CreateOrOverwriteAsync(
+            readSnapshot, writeSchema, partitionColumns, files, partitionMode, overwriteSchema, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The snapshot-accepting overwrite core (#596): overwrites <paramref name="readSnapshot"/> with
+    /// <paramref name="files"/> per <paramref name="partitionMode"/>, or — when <paramref name="readSnapshot"/>
+    /// is <see langword="null"/> (the table does not yet exist) — <b>creates</b> it exactly as
+    /// <see cref="CreateOrAppendAsync"/> does. The write door (<see cref="DeltaWriteTarget"/>) loads the base
+    /// snapshot ONCE and passes it here so the constraints it enforced and the snapshot this commit bases on
+    /// can never diverge (no read-constraints-vs-commit TOCTOU); the empty-overwrite (truncate / no-op) and
+    /// fresh-create semantics are unchanged from the public convenience overload.
+    /// </summary>
+    internal async Task<DeltaCommitResult> CreateOrOverwriteAsync(
+        Snapshot? readSnapshot,
+        StructType writeSchema,
+        IReadOnlyList<string> partitionColumns,
+        IReadOnlyList<StagedDataFile> files,
+        PartitionOverwriteMode partitionMode = PartitionOverwriteMode.Static,
+        bool overwriteSchema = false,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(writeSchema);
+        ArgumentNullException.ThrowIfNull(partitionColumns);
+        ArgumentNullException.ThrowIfNull(files);
+
         // #496: overwriteSchema (destructive wholesale replacement) is legal ONLY for a Static/full overwrite,
         // because a full overwrite rewrites every file. Under Dynamic partition overwrite, files in the
         // UNTOUCHED partitions survive and still conform to the OLD schema, so replacing the schema wholesale
@@ -437,15 +503,12 @@ internal sealed class DeltaTableWriter
                 nameof(overwriteSchema));
         }
 
-        long? latest = await _log.GetLatestCommitVersionAsync(cancellationToken).ConfigureAwait(false);
-        if (latest is null)
+        if (readSnapshot is null)
         {
             // A fresh table's create sets the schema outright, so overwriteSchema is moot (there is nothing to
             // replace); the write's declared schema/partitioning becomes version 0.
             return await CreateTableAsync(writeSchema, partitionColumns, files, cancellationToken).ConfigureAwait(false);
         }
-
-        Snapshot readSnapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
 
         // #542: overwriteSchema (wholesale schema replacement, #496) is now supported for a NAME-mode
         // column-mapped table — OverwriteReplaceSchemaAsync reconciles the columnMapping config with the
