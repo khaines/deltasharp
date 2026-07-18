@@ -40,7 +40,8 @@ internal interface ILocalSink
     /// <returns>The number of rows written (0 when an <see cref="SaveMode.Ignore"/> skipped an existing target).</returns>
     /// <exception cref="InvalidOperationException">The mode conflicts with the target's current state
     /// (<see cref="SaveMode.ErrorIfExists"/> onto an existing target, or an <see cref="SaveMode.Append"/>
-    /// schema mismatch).</exception>
+    /// schema mismatch), or the target declares more active per-row constraints than the sink will enforce
+    /// in one write (#597).</exception>
     long Commit(StructType schema, IReadOnlyList<Row> rows, long? memoryBudgetBytes = null);
 
     /// <summary>
