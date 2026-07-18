@@ -26,14 +26,14 @@ internal sealed class CompositeSinkFactory : ILocalSinkFactory
     }
 
     /// <inheritdoc/>
-    public bool TryCreate(SinkDescriptor descriptor, StructType schema, [NotNullWhen(true)] out ILocalSink? sink)
+    public bool TryCreate(SinkDescriptor descriptor, StructType schema, AnsiMode ansiMode, [NotNullWhen(true)] out ILocalSink? sink)
     {
         ArgumentNullException.ThrowIfNull(descriptor);
         ArgumentNullException.ThrowIfNull(schema);
 
         foreach (ILocalSinkFactory factory in _factories)
         {
-            if (factory.TryCreate(descriptor, schema, out sink))
+            if (factory.TryCreate(descriptor, schema, ansiMode, out sink))
             {
                 return true;
             }

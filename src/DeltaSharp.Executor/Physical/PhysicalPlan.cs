@@ -556,7 +556,7 @@ internal sealed class WriteToSinkPlan : PhysicalPlan
         // fault-prone work afterwards, so a cancel/timeout in the post-commit window can never surface a
         // committed write as a failed Save (MUST-FIX: post-commit cancellation window).
         IReadOnlyList<Row> rows = RowMaterializer.Materialize(child, maxRows: null, maxBytes: null, runtime.CancellationToken);
-        CommittedRowCount = _sink.Commit(child.Schema, rows);
+        CommittedRowCount = _sink.Commit(child.Schema, rows, runtime.MemoryBudgetBytes);
 
         // Return the child result so the driver's finalize can read CommittedRowCount (no re-execution and
         // no post-commit row count that could re-poll the cancellation token).

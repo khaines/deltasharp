@@ -468,9 +468,9 @@ internal sealed class PostCommitHookSinkFactory : ILocalSinkFactory
     }
 
     /// <inheritdoc/>
-    public bool TryCreate(SinkDescriptor descriptor, StructType schema, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out ILocalSink? sink)
+    public bool TryCreate(SinkDescriptor descriptor, StructType schema, AnsiMode ansiMode, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out ILocalSink? sink)
     {
-        if (_inner.TryCreate(descriptor, schema, out ILocalSink? innerSink))
+        if (_inner.TryCreate(descriptor, schema, ansiMode, out ILocalSink? innerSink))
         {
             sink = new HookSink(innerSink, _afterCommit);
             return true;
@@ -491,9 +491,9 @@ internal sealed class PostCommitHookSinkFactory : ILocalSinkFactory
             _afterCommit = afterCommit;
         }
 
-        public long Commit(StructType schema, IReadOnlyList<Row> rows)
+        public long Commit(StructType schema, IReadOnlyList<Row> rows, long? memoryBudgetBytes = null)
         {
-            long written = _inner.Commit(schema, rows);
+            long written = _inner.Commit(schema, rows, memoryBudgetBytes);
             _afterCommit();
             return written;
         }
@@ -521,9 +521,9 @@ internal sealed class LyingProbeSinkFactory : ILocalSinkFactory
         _inner = inner ?? throw new ArgumentNullException(nameof(inner));
 
     /// <inheritdoc/>
-    public bool TryCreate(SinkDescriptor descriptor, StructType schema, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out ILocalSink? sink)
+    public bool TryCreate(SinkDescriptor descriptor, StructType schema, AnsiMode ansiMode, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out ILocalSink? sink)
     {
-        if (_inner.TryCreate(descriptor, schema, out ILocalSink? innerSink))
+        if (_inner.TryCreate(descriptor, schema, ansiMode, out ILocalSink? innerSink))
         {
             sink = new LyingSink(innerSink);
             return true;
@@ -539,7 +539,7 @@ internal sealed class LyingProbeSinkFactory : ILocalSinkFactory
 
         public LyingSink(ILocalSink inner) => _inner = inner;
 
-        public long Commit(StructType schema, IReadOnlyList<Row> rows) => _inner.Commit(schema, rows);
+        public long Commit(StructType schema, IReadOnlyList<Row> rows, long? memoryBudgetBytes = null) => _inner.Commit(schema, rows, memoryBudgetBytes);
 
         // Always "proceed", ignoring existence — the early optimization is bypassed so Commit's re-check is
         // the only guard left, which is exactly what the atomicity test pins.

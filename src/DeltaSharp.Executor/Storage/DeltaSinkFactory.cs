@@ -26,7 +26,7 @@ internal sealed class DeltaSinkFactory : ILocalSinkFactory
     public static DeltaSinkFactory Instance { get; } = new();
 
     /// <inheritdoc/>
-    public bool TryCreate(SinkDescriptor descriptor, StructType schema, [NotNullWhen(true)] out ILocalSink? sink)
+    public bool TryCreate(SinkDescriptor descriptor, StructType schema, AnsiMode ansiMode, [NotNullWhen(true)] out ILocalSink? sink)
     {
         ArgumentNullException.ThrowIfNull(descriptor);
         ArgumentNullException.ThrowIfNull(schema);
@@ -37,7 +37,7 @@ internal sealed class DeltaSinkFactory : ILocalSinkFactory
             return false;
         }
 
-        sink = new DeltaLocalSink(descriptor, schema);
+        sink = new DeltaLocalSink(descriptor, schema, ansiMode);
         return true;
     }
 }
@@ -69,20 +69,37 @@ internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
     // replacement) — mergeSchema only ever ADDS.
     private const string MergeSchemaOption = "mergeSchema";
 
+    // #597: an upper bound on how many active per-row constraints a single write will enforce. A real Delta
+    // table declares a handful of CHECK constraints / invariants; this cap (generously above any realistic
+    // table) fail-closes a write whose table metadata declares a pathological number of constraints rather
+    // than doing unbounded per-row resolve+evaluate work. Predicate DEPTH is separately bounded by the
+    // constraint frontend (MaxConstraintExpressionDepth), so count + depth together bound the enforcement work.
+    private const int MaxActiveConstraints = 1024;
+
     private readonly SinkDescriptor _descriptor;
     private readonly StructType _schema;
+    private readonly AnsiMode _ansiMode;
 
-    public DeltaLocalSink(SinkDescriptor descriptor, StructType schema)
+    // #597: the run's operator memory budget, captured from the Commit call (execute-time) and used to bound
+    // per-row constraint evaluation. Null (unbounded) until Commit sets it.
+    private long? _memoryBudgetBytes;
+
+    public DeltaLocalSink(SinkDescriptor descriptor, StructType schema, AnsiMode ansiMode)
     {
         _descriptor = descriptor ?? throw new ArgumentNullException(nameof(descriptor));
         _schema = schema ?? throw new ArgumentNullException(nameof(schema));
+        _ansiMode = ansiMode;
     }
 
     /// <inheritdoc/>
-    public long Commit(StructType schema, IReadOnlyList<Row> rows)
+    public long Commit(StructType schema, IReadOnlyList<Row> rows, long? memoryBudgetBytes = null)
     {
         ArgumentNullException.ThrowIfNull(schema);
         ArgumentNullException.ThrowIfNull(rows);
+
+        // #597: capture the run's memory budget so Enforce (invoked from inside the write primitive, below)
+        // bounds its per-row constraint evaluation by the same budget as the rest of the run.
+        _memoryBudgetBytes = memoryBudgetBytes;
 
         // TRACKED DEFERRAL (#508): ILocalSink.Commit is synchronous, so the async DeltaWriteTarget facade is
         // driven here (and in RunAppend/TableExists) via .GetAwaiter().GetResult() — a sync-over-async bridge
@@ -200,16 +217,44 @@ internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
     /// </summary>
     /// <remarks>
     /// The constraint set is trusted table metadata; the untrusted input (the batch rows) is what is validated
-    /// here. The hardcoded <see cref="AnsiMode.Ansi"/> and unbounded evaluation memory are tracked in #597.
+    /// here. The run's <see cref="AnsiMode"/> (so overflow/cast behavior inside a constraint predicate matches
+    /// the query path) and its operator memory budget (so per-row evaluation is bounded, not unbounded) are
+    /// threaded in from the sink's construction and <see cref="Commit"/> respectively; the number of active
+    /// constraints is bounded by <see cref="MaxActiveConstraints"/> and predicate depth by the constraint
+    /// frontend, so a pathological table cannot drive unbounded enforcement work (#597).
     /// </remarks>
     public void Enforce(
         StructType schema,
         IReadOnlyList<DeltaTableConstraint> constraints,
-        IReadOnlyList<ColumnBatch> batches)
+        IReadOnlyList<ColumnBatch> batches) =>
+        EnforceCore(schema, constraints, batches, _ansiMode, _memoryBudgetBytes);
+
+    /// <summary>
+    /// The ANSI-mode- and memory-budget-explicit core of <see cref="Enforce"/> (#597), so the mode and budget
+    /// the enforcement uses are unit-testable directly (the instance <see cref="Enforce"/> delegates here with
+    /// the run's threaded values). See <see cref="Enforce"/> for the enforcement contract.
+    /// </summary>
+    internal static void EnforceCore(
+        StructType schema,
+        IReadOnlyList<DeltaTableConstraint> constraints,
+        IReadOnlyList<ColumnBatch> batches,
+        AnsiMode ansiMode,
+        long? memoryBudgetBytes)
     {
         ArgumentNullException.ThrowIfNull(schema);
         ArgumentNullException.ThrowIfNull(constraints);
         ArgumentNullException.ThrowIfNull(batches);
+
+        // #597: bound the number of active per-row constraints a single write resolves + evaluates. A real
+        // table declares a handful; a pathological count is refused fail-closed rather than driving unbounded
+        // per-row work (predicate DEPTH is separately bounded by the constraint frontend).
+        if (constraints.Count > MaxActiveConstraints)
+        {
+            throw new InvalidOperationException(
+                $"This write targets a table with {constraints.Count} active per-row constraints, exceeding the "
+                + $"maximum {MaxActiveConstraints} DeltaSharp enforces in one write; the write is refused "
+                + "fail-closed rather than performing unbounded per-row constraint evaluation.");
+        }
 
         // Phase 1 — resolve every constraint against the write schema. A surviving named CHECK that no longer
         // resolves because the write schema DROPPED a top-level column it references (an overwriteSchema /
@@ -272,16 +317,18 @@ internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
         }
 
         // Phase 2 — evaluate every resolved predicate over every batch; reject fail-closed on the first row that
-        // is NOT TRUE (false OR null), matching Delta's CheckDeltaInvariant.assertRule.
+        // is NOT TRUE (false OR null), matching Delta's CheckDeltaInvariant.assertRule. The predicate is
+        // translated under the run's ANSI mode (#597), and each batch evaluation is bounded by the run's memory
+        // budget (#597) — unbounded only when the run itself is.
         foreach ((DeltaTableConstraint constraint, CoreExpr predicate, IReadOnlyList<ExprAttributeReference> input) in resolved)
         {
             EnginePhysicalExpression physical =
-                PhysicalExpressionTranslator.For(input, AnsiMode.Ansi).Translate(predicate);
+                PhysicalExpressionTranslator.For(input, ansiMode).Translate(predicate);
             BatchPredicateEvaluator evaluator = BatchPredicateEvaluator.Build(physical, schema, ConstraintBackendName);
 
             for (int batchIndex = 0; batchIndex < batches.Count; batchIndex++)
             {
-                ColumnVector result = evaluator.Evaluate(batches[batchIndex], BoundedExecutionMemory.Unbounded);
+                ColumnVector result = evaluator.Evaluate(batches[batchIndex], CreateEvaluationMemory(memoryBudgetBytes));
                 for (int row = 0; row < result.Length; row++)
                 {
                     if (RowRejected(result, row))
@@ -292,6 +339,14 @@ internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
             }
         }
     }
+
+    // #597: the memory a single constraint-batch evaluation is bounded by — the run's operator budget when
+    // configured, else unbounded (the pre-#597 behavior). A fresh instance per evaluation bounds each batch's
+    // peak scratch by the budget (matching the per-Evaluate semantics of the prior Unbounded singleton).
+    private static IExecutionMemory CreateEvaluationMemory(long? memoryBudgetBytes) =>
+        memoryBudgetBytes is { } budget
+            ? new BoundedExecutionMemory(budget)
+            : BoundedExecutionMemory.Unbounded;
 
     // The top-level column of a (possibly multipart) analyzer attribute reference: `amount` -> `amount`,
     // `s.f` -> `s` (a dropped struct column referenced via nested access). Delta names the top-level column

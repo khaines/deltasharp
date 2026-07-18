@@ -341,7 +341,7 @@ internal sealed class PhysicalPlanner
         // The analyzer has already validated the sink format is a supported LOCAL sink (a deferred or
         // unsupported format threw during analysis, before planning), so a factory miss here means the
         // sink seam was not wired — a deterministic Plan-stage diagnostic, never a silent no-op.
-        if (_sinkFactory is null || !_sinkFactory.TryCreate(write.Sink, child.OutputSchema, out ILocalSink? sink))
+        if (_sinkFactory is null || !_sinkFactory.TryCreate(write.Sink, child.OutputSchema, _mode, out ILocalSink? sink))
         {
             throw new UnsupportedPlanException(
                 QueryExecutionStage.Plan,
