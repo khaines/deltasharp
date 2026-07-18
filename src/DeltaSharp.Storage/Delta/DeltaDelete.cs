@@ -223,20 +223,18 @@ internal sealed class DeltaDelete
         // AC3 protocol gate: fail closed unless the table declares AND enables deletion vectors.
         DeletionVectorsFeature.EnsureWriteEnabled(readSnapshot);
 
-        // Column-mapping resolution for the WRITE path (#529). `id` mode STAYS fail-closed for DELETE (#523):
-        // the name-based Parquet reader cannot resolve field ids, so a DELETE could mis-associate columns and
-        // delete wrong rows. Since #523, id mode is READABLE at snapshot load (DeltaReadSource resolves by
-        // field_id), so `readSnapshot` may now be id-mode — the EnsureWriteSupported call below is the
-        // PRIMARY, tested id-write choke point for DELETE (it refuses id fail-closed), pinned by
-        // Delete_IdMode_FailsClosed_AtDeleteLocalGuard_Independent. `name` mode is resolved by relabeling
-        // physical<->logical EXACTLY as the READ path does — through the shared ColumnMappingProjection seam,
-        // so DELETE and DeltaReadSource resolve identically — while the emitted deletion vector stays
-        // POSITIONAL over the PHYSICAL data file (column mapping never changes a row's physical position — the
-        // DV row-index semantics are unaffected). `none` mode is unchanged (physical name == logical name). A
-        // nested (struct/array/map) top-level column under name mapping is rejected fail-closed in
-        // ColumnMappingProjection.ResolvePhysicalNames rather than risk a wrong delete.
+        // Column-mapping resolution for the WRITE path (#529/#572). All three modes (none/name/id) are
+        // resolved through the shared ColumnMappingProjection seam EXACTLY as the READ path does, so DELETE
+        // and DeltaReadSource resolve identically. In `id` mode DATA columns resolve by the Parquet field_id
+        // (resolveByFieldId below, #523) rather than by physical name — the file's field_ids are matched
+        // against each dataSchema field's delta.columnMapping.id (preserved by BuildDataSchema). In BOTH
+        // mapped modes the emitted deletion vector stays POSITIONAL over the PHYSICAL data file (column
+        // mapping never changes a row's physical position — the DV row-index semantics are unaffected), and
+        // partition values are const/null-filled by PHYSICAL name. `none` mode is unchanged (physical name ==
+        // logical name). A nested (struct/array/map) top-level column under column mapping is rejected
+        // fail-closed in ColumnMappingProjection.ResolvePhysicalNames rather than risk a wrong delete.
         ColumnMappingMode mappingMode = ColumnMapping.ResolveMode(readSnapshot.Metadata.Configuration);
-        ColumnMapping.EnsureWriteSupported(mappingMode);
+        bool resolveByFieldId = mappingMode == ColumnMappingMode.Id;
 
         StructType tableSchema = readSnapshot.Schema;
         ImmutableArray<string> partitionColumns = readSnapshot.Metadata.PartitionColumns;
@@ -262,7 +260,7 @@ internal sealed class DeltaDelete
             cancellationToken.ThrowIfCancellationRequested();
 
             FileDeletionPlan plan = await PlanFileDeletionAsync(
-                add, tableSchema, physicalNames, dataSchema, dataOrdinalByField, predicate, allowTypeWideningPromotion, cancellationToken)
+                add, tableSchema, physicalNames, dataSchema, dataOrdinalByField, resolveByFieldId, predicate, allowTypeWideningPromotion, cancellationToken)
                 .ConfigureAwait(false);
 
             if (plan.NewlyDeletedCount == 0)
@@ -337,6 +335,7 @@ internal sealed class DeltaDelete
         string[] physicalNames,
         StructType dataSchema,
         int[] dataOrdinalByField,
+        bool resolveByFieldId,
         DeltaDeletePredicate predicate,
         bool allowTypeWideningPromotion,
         CancellationToken cancellationToken)
@@ -370,7 +369,7 @@ internal sealed class DeltaDelete
         await using (stream.ConfigureAwait(false))
         {
             await foreach (ColumnBatch dataBatch in _reader
-                .ReadAsync(stream, dataSchema, keepRowGroup: null, nullFillMissingColumns: false, allowTypeWideningPromotion, cancellationToken)
+                .ReadAsync(stream, dataSchema, keepRowGroup: null, nullFillMissingColumns: false, allowTypeWideningPromotion, resolveByFieldId, cancellationToken)
                 .ConfigureAwait(false))
             {
                 ColumnBatch fullBatch = ColumnMappingProjection.BuildFullBatch(

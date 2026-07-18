@@ -361,6 +361,45 @@ public sealed class DeltaOptimizeTests : IDisposable
         Assert.Equal(usBefore, Sorted(await ReadRowsAsync(new[] { output.Path }))); // US rows preserved.
     }
 
+    // A partition value carrying reserved / traversal characters is percent-encoded (Uri.EscapeDataString)
+    // into a SINGLE safe directory segment on the compacted output path — IDENTICAL to the write path
+    // (DeltaWriteTarget.DataFilePath) — so OPTIMIZE neither escapes the confined table root nor fabricates
+    // spurious sub-directories, while the log keeps the value verbatim (partition truth). Red-team #583 R7:
+    // BuildOutputPath appended the raw value, so a value with '/', '=', whitespace, non-ASCII, or a '/../'
+    // traversal broke OPTIMIZE (traversal → fail-closed at the confined-root guard) or malformed its output.
+    [Theory]
+    [InlineData("/../evil")]   // '/../' traversal — raw path escapes the confined root (the R7 repro)
+    [InlineData("a b")]        // whitespace
+    [InlineData("a/b")]        // reserved '/' — raw fabricates a spurious sub-directory
+    [InlineData("x=y")]        // reserved '=' — the Hive name=value delimiter
+    [InlineData("caf\u00e9")]  // non-ASCII (multi-byte)
+    public async Task Optimize_PartitionValueWithReservedChars_PercentEncodesOutputPath_LikeWritePath(
+        string trickyValue)
+    {
+        StagedDataFile f1 = await WriteDataFileAsync("in1.parquet", Batch((1, "a")), Partition(("region", trickyValue)));
+        StagedDataFile f2 = await WriteDataFileAsync("in2.parquet", Batch((2, "b")), Partition(("region", trickyValue)));
+        await SeedAsync(PartitionedSchema, partitionColumns: new[] { "region" }, f1, f2);
+
+        OptimizeResult result = await Optimize().OptimizeAsync();
+
+        Assert.Equal(2, result.FilesRemoved);
+        Assert.Equal(1, result.FilesAdded);
+
+        Snapshot after = await Log().LoadSnapshotAsync();
+        AddFileAction output = Assert.Single(after.ActiveFiles);
+        // The value is preserved verbatim in the log (authoritative partition membership), independent of path.
+        Assert.Equal(trickyValue, output.PartitionValues["region"]);
+        // The output path uses the percent-encoded value as ONE segment (region=<encoded>/part-...), matching
+        // the write path exactly, with no bare ".." traversal segment.
+        string encoded = Uri.EscapeDataString(trickyValue);
+        Assert.StartsWith("region=" + encoded + "/", output.Path, StringComparison.Ordinal);
+        Assert.DoesNotContain("..", output.Path.Split('/'));
+        // Rows survive compaction and read back through the encoded path.
+        Assert.Equal(
+            Sorted(new List<(long, string?)> { (1L, "a"), (2L, "b") }),
+            Sorted(await ReadRowsAsync(new[] { output.Path })));
+    }
+
     // ---------------------------------------------------------------- AC4: pre-commit failure → orphans
 
     [Fact]
@@ -1277,8 +1316,7 @@ public sealed class DeltaOptimizeTests : IDisposable
     // A column-mapped (id-mode) snapshot constructed DIRECTLY (not via DeltaLog.LoadSnapshotAsync), so it
     // deliberately BYPASSES the load-time gate (ColumnMapping.EnsureModeGate) and reaches DeltaOptimize's OWN
     // defense-in-depth guard with a mode the primary gate would otherwise reject at load. No data files are
-    // needed — OPTIMIZE fails closed at the top before any file is planned or read. (Mirrors
-    // DeltaDeleteColumnMappingTests.BuildUngatedColumnMappingSnapshot.)
+    // needed — OPTIMIZE fails closed at the top before any file is planned or read.
     private static Snapshot BuildUngatedIdModeSnapshot()
     {
         var protocol = new ProtocolAction(

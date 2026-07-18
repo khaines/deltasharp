@@ -85,6 +85,21 @@ internal static class DeltaWriteEncoding
         }
     }
 
+    /// <summary>Whether <paramref name="type"/> is a supported Delta partition-column type: an atomic type —
+    /// exactly the arms of <see cref="FormatPartitionValue"/>. Nested types (struct/array/map) and binary are
+    /// NOT partition-encodable (a partition value must render to a single directory-segment string). Keep in
+    /// sync with <see cref="FormatPartitionValue"/> — a new supported arm there must be added here too.</summary>
+    public static bool IsSupportedPartitionType(DataType type)
+    {
+        ArgumentNullException.ThrowIfNull(type);
+        return type switch
+        {
+            BooleanType or ByteType or ShortType or IntegerType or LongType or FloatType or DoubleType
+                or StringType or DateType or TimestampType or TimestampNtzType or DecimalType => true,
+            _ => false,
+        };
+    }
+
     /// <summary>Formats the value at <paramref name="row"/> of a partition column <paramref name="source"/>
     /// into its canonical Delta partition-value string, or <see langword="null"/> for a null value.</summary>
     public static string? FormatPartitionValue(ColumnVector source, int row)

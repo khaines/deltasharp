@@ -398,9 +398,9 @@ internal sealed class DeltaOptimize
         // schema the read-side null-fill (nullFillMissingColumns: true) would materialize every column as
         // all-null and commit an all-null compacted output, silently dropping data. Reject fail-closed at the
         // TOP — independent of column nullability AND of dry-run (the compaction plan itself is meaningless
-        // for physical-named files) — leaving the table unchanged. (`id` mode is already rejected at snapshot
-        // load; this is defense-in-depth for the internal readSnapshot seam.) Full name-mode-aware OPTIMIZE is
-        // a tracked follow-up.
+        // for physical-named files) — leaving the table unchanged. (Both `name` AND `id` modes are rejected
+        // here: since #523/#572 an id-mode table is readable/writable, so THIS guard — not snapshot load — is
+        // what keeps OPTIMIZE fail-closed for id.) Full name-mode-aware OPTIMIZE is a tracked follow-up.
         ColumnMappingMode columnMappingMode = ColumnMapping.ResolveMode(readSnapshot.Metadata.Configuration);
         if (columnMappingMode != ColumnMappingMode.None)
         {
@@ -731,8 +731,12 @@ internal sealed class DeltaOptimize
 
     // Composes the compacted output's storage path: a unique "part-<nonce>.parquet" under the Hive-style
     // partition directory ("col=value/"), using Spark's __HIVE_DEFAULT_PARTITION__ sentinel for a null
-    // value. Partition membership is authoritative from the add action, not the path; the directory only
-    // keeps the object layout tidy and consistent with the write path.
+    // value. The non-null value is percent-encoded with Uri.EscapeDataString — IDENTICAL to the write
+    // path (DeltaWriteTarget.DataFilePath) — so a value containing '/', '=', whitespace, or other
+    // reserved characters becomes a single safe directory segment instead of escaping the confined table
+    // root or fabricating spurious sub-directories. Partition membership is authoritative from the add
+    // action, not the path; the directory only keeps the object layout tidy and consistent with the write
+    // path.
     private string BuildOutputPath(
         ImmutableSortedDictionary<string, string?> partitionValues, ImmutableArray<string> partitionColumns)
     {
@@ -746,7 +750,8 @@ internal sealed class DeltaOptimize
         foreach (string column in partitionColumns)
         {
             partitionValues.TryGetValue(column, out string? value);
-            sb.Append(column).Append('=').Append(value ?? HiveDefaultPartition).Append('/');
+            string encoded = value is null ? HiveDefaultPartition : Uri.EscapeDataString(value);
+            sb.Append(column).Append('=').Append(encoded).Append('/');
         }
 
         sb.Append(name);
