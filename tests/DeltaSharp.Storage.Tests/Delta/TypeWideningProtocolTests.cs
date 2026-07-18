@@ -19,6 +19,9 @@ public sealed class TypeWideningProtocolTests : IDisposable
     private readonly string _root;
     private readonly LocalFileSystemBackend _backend;
 
+    private static readonly StructType CleanSchema =
+        new(new[] { new StructField("id", DataTypes.LongType, nullable: false) });
+
     private static readonly IReadOnlyDictionary<string, string> NoConfig =
         ImmutableDictionary<string, string>.Empty;
 
@@ -130,7 +133,7 @@ public sealed class TypeWideningProtocolTests : IDisposable
     {
         // A plain (no-feature) reader-1 / writer-2 table upgrades to the table-features versions (3/7) with the
         // stable `typeWidening` feature added to both lists — matching the create-time shape (Protocol()).
-        ProtocolAction upgraded = TypeWideningFeature.UpgradeProtocol(new ProtocolAction(1, 2, [], []), NoConfig);
+        ProtocolAction upgraded = TypeWideningFeature.UpgradeProtocol(new ProtocolAction(1, 2, [], []), CleanSchema, NoConfig);
 
         Assert.Equal(ProtocolSupport.TableFeaturesReaderVersion, upgraded.MinReaderVersion);
         Assert.Equal(ProtocolSupport.TableFeaturesWriterVersion, upgraded.MinWriterVersion);
@@ -146,7 +149,7 @@ public sealed class TypeWideningProtocolTests : IDisposable
     {
         // An existing feature (columnMapping) is preserved and `typeWidening` is added — never dropped.
         ProtocolAction upgraded = TypeWideningFeature.UpgradeProtocol(
-            new ProtocolAction(3, 7, ["columnMapping"], ["columnMapping"]), NoConfig);
+            new ProtocolAction(3, 7, ["columnMapping"], ["columnMapping"]), CleanSchema, NoConfig);
 
         Assert.Contains("columnMapping", upgraded.ReaderFeatures);
         Assert.Contains("columnMapping", upgraded.WriterFeatures);
@@ -160,7 +163,7 @@ public sealed class TypeWideningProtocolTests : IDisposable
         // Idempotent in shape: a table already declaring `typeWidening` upgrades to an identical feature list
         // (no duplicate entry, versions already at the floor).
         ProtocolAction upgraded = TypeWideningFeature.UpgradeProtocol(
-            new ProtocolAction(3, 7, ["typeWidening"], ["typeWidening"]), NoConfig);
+            new ProtocolAction(3, 7, ["typeWidening"], ["typeWidening"]), CleanSchema, NoConfig);
 
         Assert.Equal(new[] { "typeWidening" }, upgraded.ReaderFeatures.ToArray());
         Assert.Equal(new[] { "typeWidening" }, upgraded.WriterFeatures.ToArray());
@@ -172,34 +175,47 @@ public sealed class TypeWideningProtocolTests : IDisposable
         // A table declaring the older `typeWidening-preview` spelling is already supported, so the upgrade
         // leaves its feature lists unchanged (never adds the stable name alongside the preview one).
         ProtocolAction upgraded = TypeWideningFeature.UpgradeProtocol(
-            new ProtocolAction(3, 7, ["typeWidening-preview"], ["typeWidening-preview"]), NoConfig);
+            new ProtocolAction(3, 7, ["typeWidening-preview"], ["typeWidening-preview"]), CleanSchema, NoConfig);
 
         Assert.Equal(new[] { "typeWidening-preview" }, upgraded.ReaderFeatures.ToArray());
         Assert.Equal(new[] { "typeWidening-preview" }, upgraded.WriterFeatures.ToArray());
     }
 
-    // ---- #534/#549: EnsureUpgradeable — refuse dropping an active legacy feature ----
+    // ---- #568: enumerate + register invariants / checkConstraints (enforced per row at the write seam) ----
 
     [Fact]
-    public void EnsureUpgradeable_LegacyCleanTable_IsAllowed()
+    public void CheckConstraints_And_Invariants_RegisteredAsWriterFeaturesOnly()
     {
-        // A plain legacy (writer 2) table with no active appendOnly / constraint / invariant is upgradeable.
-        TypeWideningFeature.EnsureUpgradeable(
-            new ProtocolAction(1, 2, [], []),
-            new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) }),
-            ImmutableDictionary<string, string>.Empty);
+        Assert.Contains("checkConstraints", ProtocolSupport.SupportedWriterFeatures);
+        Assert.Contains("invariants", ProtocolSupport.SupportedWriterFeatures);
+        Assert.DoesNotContain("checkConstraints", ProtocolSupport.SupportedReaderFeatures);
+        Assert.DoesNotContain("invariants", ProtocolSupport.SupportedReaderFeatures);
     }
 
     [Fact]
-    public void EnsureUpgradeable_LegacyAppendOnlyTable_IsAllowed()
+    public void UpgradeProtocol_LegacyTableWithCheckConstraint_EnumeratesCheckConstraints_WriterOnly()
     {
-        // #549: an active delta.appendOnly=true no longer blocks the upgrade — UpgradeProtocol enumerates the
-        // appendOnly writer feature and the committer enforces it, so append-only stays active. (Constraints /
-        // invariants still fail closed — see the *_Throws tests below and #568.)
-        TypeWideningFeature.EnsureUpgradeable(
+        // A legacy writer-2 table declaring a delta.constraints.* CHECK constraint keeps it ACTIVE across the
+        // upgrade: `checkConstraints` is enumerated into writerFeatures (never readerFeatures) and enforced
+        // per row (#581), rather than being silently dropped.
+        ProtocolAction upgraded = TypeWideningFeature.UpgradeProtocol(
             new ProtocolAction(1, 2, [], []),
-            new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) }),
-            new Dictionary<string, string> { ["delta.appendOnly"] = "true" });
+            CleanSchema,
+            new Dictionary<string, string> { ["delta.constraints.positive_id"] = "id > 0" });
+
+        Assert.Contains("checkConstraints", upgraded.WriterFeatures);
+        Assert.DoesNotContain("checkConstraints", upgraded.ReaderFeatures);
+        ProtocolSupport.EnsureWritable(upgraded); // the upgraded protocol is writable by this build
+    }
+
+    [Fact]
+    public void UpgradeProtocol_NoConstraintOrInvariant_DoesNotEnumerateEither()
+    {
+        ProtocolAction upgraded = TypeWideningFeature.UpgradeProtocol(
+            new ProtocolAction(1, 2, [], []), CleanSchema, NoConfig);
+
+        Assert.DoesNotContain("checkConstraints", upgraded.WriterFeatures);
+        Assert.DoesNotContain("invariants", upgraded.WriterFeatures);
     }
 
     [Fact]
@@ -209,7 +225,7 @@ public sealed class TypeWideningProtocolTests : IDisposable
         // `appendOnly` is enumerated into writerFeatures (Delta "Active Features"). It is a WRITER-only
         // feature, so it never appears in readerFeatures. `typeWidening` is still added to both.
         ProtocolAction upgraded = TypeWideningFeature.UpgradeProtocol(
-            new ProtocolAction(1, 2, [], []), AppendOnlyConfig);
+            new ProtocolAction(1, 2, [], []), CleanSchema, AppendOnlyConfig);
 
         Assert.Equal(ProtocolSupport.TableFeaturesReaderVersion, upgraded.MinReaderVersion);
         Assert.Equal(ProtocolSupport.TableFeaturesWriterVersion, upgraded.MinWriterVersion);
@@ -226,11 +242,11 @@ public sealed class TypeWideningProtocolTests : IDisposable
     public void UpgradeProtocol_NoActiveAppendOnly_DoesNotEnumerateAppendOnly()
     {
         // delta.appendOnly is absent (or false) → the feature is not active, so it is NOT enumerated.
-        ProtocolAction absent = TypeWideningFeature.UpgradeProtocol(new ProtocolAction(1, 2, [], []), NoConfig);
+        ProtocolAction absent = TypeWideningFeature.UpgradeProtocol(new ProtocolAction(1, 2, [], []), CleanSchema, NoConfig);
         Assert.DoesNotContain("appendOnly", absent.WriterFeatures);
 
         ProtocolAction disabled = TypeWideningFeature.UpgradeProtocol(
-            new ProtocolAction(1, 2, [], []),
+            new ProtocolAction(1, 2, [], []), CleanSchema,
             new Dictionary<string, string> { ["delta.appendOnly"] = "false" });
         Assert.DoesNotContain("appendOnly", disabled.WriterFeatures);
     }
@@ -240,7 +256,7 @@ public sealed class TypeWideningProtocolTests : IDisposable
     {
         // A writer-7 table that already names appendOnly upgrades to an identical writerFeatures list.
         ProtocolAction upgraded = TypeWideningFeature.UpgradeProtocol(
-            new ProtocolAction(3, 7, ["typeWidening"], ["typeWidening", "appendOnly"]), AppendOnlyConfig);
+            new ProtocolAction(3, 7, ["typeWidening"], ["typeWidening", "appendOnly"]), CleanSchema, AppendOnlyConfig);
 
         Assert.Equal(new[] { "typeWidening", "appendOnly" }, upgraded.WriterFeatures.ToArray());
     }
@@ -254,51 +270,10 @@ public sealed class TypeWideningProtocolTests : IDisposable
         // golden (Scala String.toBoolean) throw, reached transitively through UpgradeProtocol.
         DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() =>
             TypeWideningFeature.UpgradeProtocol(
-                new ProtocolAction(1, 2, [], []),
+                new ProtocolAction(1, 2, [], []), CleanSchema,
                 new Dictionary<string, string> { ["delta.appendOnly"] = "garbage" }));
 
         Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
-    }
-
-    [Fact]
-    public void EnsureUpgradeable_TableFeaturesTable_WithAppendOnlyConfig_IsAllowed()
-    {
-        // A table already on writer 7 has all active features explicitly enumerated (and UpgradeProtocol
-        // preserves them), so it is always upgradeable — even if delta.appendOnly is set (that feature would
-        // already be in writerFeatures on such a table).
-        TypeWideningFeature.EnsureUpgradeable(
-            new ProtocolAction(3, 7, ["appendOnly"], ["appendOnly"]),
-            new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) }),
-            new Dictionary<string, string> { ["delta.appendOnly"] = "true" });
-    }
-
-    [Fact]
-    public void EnsureUpgradeable_LegacyTableWithCheckConstraint_Throws()
-    {
-        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() =>
-            TypeWideningFeature.EnsureUpgradeable(
-                new ProtocolAction(1, 2, [], []),
-                new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) }),
-                new Dictionary<string, string> { ["delta.constraints.ck"] = "id > 0" }));
-        Assert.Contains("#568", ex.Message, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void EnsureUpgradeable_LegacyTableWithColumnInvariant_Throws()
-    {
-        var invariantField = new StructField(
-            "id", DataTypes.LongType, nullable: false,
-            FieldMetadata.FromEntries(new[]
-            {
-                new KeyValuePair<string, string>("delta.invariants", "{\"expression\":{\"expression\":\"id > 0\"}}"),
-            }));
-
-        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() =>
-            TypeWideningFeature.EnsureUpgradeable(
-                new ProtocolAction(1, 2, [], []),
-                new StructType(new[] { invariantField }),
-                ImmutableDictionary<string, string>.Empty));
-        Assert.Contains("#568", ex.Message, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -306,12 +281,12 @@ public sealed class TypeWideningProtocolTests : IDisposable
     [InlineData("array")]       // array< struct< x:invariant > >
     [InlineData("map-value")]   // map< string, struct< x:invariant > >
     [InlineData("map-key")]     // map< struct< x:invariant >, long >
-    public void EnsureUpgradeable_LegacyTableWithNestedColumnInvariant_Throws(string nesting)
+    public void UpgradeProtocol_LegacyTableWithNestedColumnInvariant_EnumeratesInvariants(string nesting)
     {
         // A column invariant reachable through a struct field, an array element, or a map key/value struct is
-        // a valid Delta construct (Spark collects/enforces invariants through array/map elements). The guard
-        // must recurse through ALL of these so such a foreign table is refused rather than silently
-        // deactivated on upgrade to writer 7.
+        // a valid Delta construct (Spark collects/enforces invariants through array/map elements). Upgrade
+        // must recurse through ALL of these and enumerate the `invariants` writer feature so it stays active,
+        // rather than silently deactivating it on upgrade to writer 7 (it is enforced per row, #581/#568).
         var invariantLeaf = new StructField(
             "x", DataTypes.LongType, nullable: true,
             FieldMetadata.FromEntries(new[]
@@ -328,9 +303,11 @@ public sealed class TypeWideningProtocolTests : IDisposable
         };
         var schema = new StructType(new[] { new StructField("payload", nested, nullable: true) });
 
-        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() =>
-            TypeWideningFeature.EnsureUpgradeable(
-                new ProtocolAction(1, 2, [], []), schema, ImmutableDictionary<string, string>.Empty));
-        Assert.Contains("#568", ex.Message, StringComparison.Ordinal);
+        ProtocolAction upgraded = TypeWideningFeature.UpgradeProtocol(
+            new ProtocolAction(1, 2, [], []), schema, ImmutableDictionary<string, string>.Empty);
+
+        Assert.Contains("invariants", upgraded.WriterFeatures);
+        Assert.DoesNotContain("invariants", upgraded.ReaderFeatures); // writer-only feature
+        ProtocolSupport.EnsureWritable(upgraded);
     }
 }

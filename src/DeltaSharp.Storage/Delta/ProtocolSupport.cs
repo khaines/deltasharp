@@ -77,7 +77,9 @@ internal static class ProtocolSupport
             DeletionVectors.DeletionVectorsFeature.Feature,
             TypeWideningFeature.Feature,
             TypeWideningFeature.FeaturePreview,
-            AppendOnlyFeature.Feature);
+            AppendOnlyFeature.Feature,
+            TypeWideningFeature.CheckConstraintsFeature,
+            TypeWideningFeature.InvariantsFeature);
 
     /// <summary>
     /// Verifies the table's <paramref name="protocol"/> is <b>writable</b> by this build before a commit is

@@ -785,20 +785,14 @@ internal sealed class DeltaTableWriter
             return new DeltaCommitResult(snapshot.Version, Attempts: 0, Skipped: true);
         }
 
-        // Interop safety: refuse fail-closed rather than silently deactivate a legacy (writer < 7) invariant /
-        // CHECK constraint this build cannot yet carry as an explicit table feature through the table-features
-        // upgrade (#568, overlaps #190). An active delta.appendOnly=true no longer blocks the upgrade — it is
-        // enumerated + enforced (#549).
-        TypeWideningFeature.EnsureUpgradeable(snapshot.Protocol, snapshot.Schema, snapshot.Metadata.Configuration);
-
-        // The upgraded protocol (adds typeWidening, enumerates an active appendOnly, preserving existing
-        // features + raising the version floors) and the metaData carrying delta.enableTypeWidening=true. Both
-        // are needed: the protocol makes the feature SUPPORTED, the property makes a widening APPLIED (Delta
-        // "Writer Requirements for Type Widening"). The committer re-validates any installed protocol
-        // (EnsureWritable/EnsureReadable), so it never publishes a protocol this build could not itself read
-        // or write back.
+        // Interop safety across the table-features upgrade (Delta PROTOCOL.md "Table Features for New and
+        // Existing Tables" + "Active Features"): every legacy writer feature this build implements is now
+        // ENUMERATED into writerFeatures by UpgradeProtocol so it stays active — appendOnly (#549) and the
+        // column invariants / CHECK constraints (#568), both enforced per row at the write seam (#581). The
+        // committer re-validates the installed protocol (EnsureWritable/EnsureReadable), so an upgrade that
+        // produced a feature this build could not read/write back would still be refused fail-closed there.
         ProtocolAction upgraded = TypeWideningFeature.UpgradeProtocol(
-            snapshot.Protocol, snapshot.Metadata.Configuration);
+            snapshot.Protocol, snapshot.Schema, snapshot.Metadata.Configuration);
         ImmutableSortedDictionary<string, string> configuration =
             snapshot.Metadata.Configuration.SetItem(TypeWideningFeature.EnablePropertyKey, "true");
         MetadataAction metadata = snapshot.Metadata with { Configuration = configuration };

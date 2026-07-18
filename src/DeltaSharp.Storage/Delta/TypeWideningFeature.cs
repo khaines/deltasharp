@@ -43,6 +43,14 @@ internal static class TypeWideningFeature
     /// <summary>The field-metadata key for a column invariant (legacy <c>invariants</c> feature).</summary>
     private const string InvariantKey = "delta.invariants";
 
+    /// <summary>The <c>writerFeatures</c> name for the named CHECK constraints feature (#568). A writer-only
+    /// legacy feature: this build enforces it per row at the write seam (#581).</summary>
+    public const string CheckConstraintsFeature = "checkConstraints";
+
+    /// <summary>The <c>writerFeatures</c> name for the column invariants feature (#568). A writer-only legacy
+    /// feature: this build enforces it per row at the write seam (#581).</summary>
+    public const string InvariantsFeature = "invariants";
+
     /// <summary>The reader protocol version type widening requires.</summary>
     public const int ReaderVersion = 3;
 
@@ -109,29 +117,40 @@ internal static class TypeWideningFeature
     /// so it stays active. This build enumerates the <c>appendOnly</c> writer feature (writer-only — added to
     /// <c>writerFeatures</c>, never <c>readerFeatures</c>) when the table currently has
     /// <c>delta.appendOnly=true</c>, and enforces it at commit
-    /// (<see cref="AppendOnlyFeature.EnsureCommitAllowed"/>). The other legacy features —
-    /// <c>invariants</c> / <c>checkConstraints</c> — need per-row expression enforcement this build does not
-    /// yet have (overlaps #190), so <see cref="EnsureUpgradeable"/> still refuses a legacy table carrying them
-    /// rather than silently deactivating them (tracked in #568).</para>
+    /// (<see cref="AppendOnlyFeature.EnsureCommitAllowed"/>). The <c>invariants</c> / <c>checkConstraints</c>
+    /// writer features are likewise enumerated when the table carries a column invariant or a
+    /// <c>delta.constraints.*</c> CHECK constraint; they are enforced per row at the write seam (#581/#568),
+    /// so upgrading preserves rather than silently deactivates them.</para>
     ///
     /// <para>Idempotent in shape: if a feature is already present (stable OR preview <c>typeWidening</c>
-    /// spelling, or <c>appendOnly</c>) the feature lists are returned unchanged; the version floors are
-    /// already met on any table declaring <c>typeWidening</c>.</para>
+    /// spelling, or an already-enumerated legacy feature) the feature lists are returned unchanged; the
+    /// version floors are already met on any table declaring <c>typeWidening</c>.</para>
     /// </summary>
     public static ProtocolAction UpgradeProtocol(
-        ProtocolAction existing, IReadOnlyDictionary<string, string> configuration)
+        ProtocolAction existing, StructType schema, IReadOnlyDictionary<string, string> configuration)
     {
         ArgumentNullException.ThrowIfNull(existing);
+        ArgumentNullException.ThrowIfNull(schema);
         ArgumentNullException.ThrowIfNull(configuration);
 
-        // Enumerate the implicitly-active legacy appendOnly writer feature so it stays ACTIVE across the
-        // table-features upgrade (Delta "Active Features": appendOnly active iff in writerFeatures AND
-        // delta.appendOnly=true). This build now enforces it; invariants/constraints are NOT enumerated (no
-        // per-row enforcement yet — EnsureUpgradeable refuses them fail-closed, #568).
+        // Enumerate the implicitly-active legacy writer features so they stay ACTIVE across the table-features
+        // upgrade (Delta "Active Features": a feature is active iff it is in writerFeatures AND its metadata
+        // marker is present). This build now ENFORCES each per row at the write seam (#549 appendOnly, #581
+        // invariants/CHECK constraints), so enumerating them is safe rather than silently deactivating them.
         ImmutableArray<string> writerFeatures = WithFeature(existing.WriterFeatures);
         if (AppendOnlyFeature.IsEnabled(configuration))
         {
             writerFeatures = AppendOnlyFeature.WithWriterFeature(writerFeatures);
+        }
+
+        if (HasCheckConstraint(configuration))
+        {
+            writerFeatures = WithWriterFeature(writerFeatures, CheckConstraintsFeature);
+        }
+
+        if (SchemaHasInvariant(schema))
+        {
+            writerFeatures = WithWriterFeature(writerFeatures, InvariantsFeature);
         }
 
         return new ProtocolAction(
@@ -139,6 +158,31 @@ internal static class TypeWideningFeature
             Math.Max(existing.MinWriterVersion, WriterVersion),
             WithFeature(existing.ReaderFeatures),
             writerFeatures);
+    }
+
+    // Adds a writer feature to a list unless already present (a default array is treated as empty).
+    private static ImmutableArray<string> WithWriterFeature(ImmutableArray<string> features, string feature)
+    {
+        if (!features.IsDefault && features.Contains(feature, StringComparer.Ordinal))
+        {
+            return features;
+        }
+
+        return (features.IsDefault ? ImmutableArray<string>.Empty : features).Add(feature);
+    }
+
+    // True when the table declares any named CHECK constraint (delta.constraints.*) in its configuration.
+    private static bool HasCheckConstraint(IReadOnlyDictionary<string, string> configuration)
+    {
+        foreach (string key in configuration.Keys)
+        {
+            if (key.StartsWith(ConstraintKeyPrefix, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     // Adds the stable typeWidening feature to a feature list unless it is already present (stable OR preview
@@ -154,65 +198,9 @@ internal static class TypeWideningFeature
         return (features.IsDefault ? ImmutableArray<string>.Empty : features).Add(Feature);
     }
 
-    /// <summary>
-    /// Guards enable-on-existing (<see cref="DeltaTableWriter.EnableTypeWideningAsync"/>) against silently
-    /// deactivating a legacy (writer &lt; <see cref="WriterVersion"/>) feature this build cannot carry as a
-    /// table feature. Per Delta PROTOCOL.md "Table Features for New and Existing Tables" + "Active Features",
-    /// upgrading to writer 7 must enumerate every ACTIVE feature the legacy protocol implicitly supported.
-    /// <see cref="UpgradeProtocol"/> now enumerates <c>appendOnly</c> (which this build enforces), so an
-    /// active <c>delta.appendOnly=true</c> is upgradeable. This build still cannot enumerate
-    /// <c>invariants</c>/<c>checkConstraints</c> (no per-row expression enforcement — overlaps #190), so if a
-    /// FOREIGN legacy table currently has an active such feature (a <c>delta.constraints.*</c> CHECK
-    /// constraint or a <c>delta.invariants</c> column invariant) the upgrade would leave the constraint in
-    /// <c>metaData</c> while dropping the feature from <c>writerFeatures</c> — silently deactivating
-    /// enforcement for every engine. Rather than corrupt another engine's guarantees, refuse fail-closed
-    /// (proper enumeration + enforcement tracked in #568). A table already at writer 7 keeps its
-    /// (already-enumerated) features, so it is always upgradeable.
-    /// </summary>
-    /// <exception cref="DeltaProtocolException">A legacy table declares an active CHECK constraint / column
-    /// invariant this build cannot preserve through the table-features upgrade.</exception>
-    public static void EnsureUpgradeable(
-        ProtocolAction protocol, StructType schema, IReadOnlyDictionary<string, string> configuration)
-    {
-        ArgumentNullException.ThrowIfNull(protocol);
-        ArgumentNullException.ThrowIfNull(schema);
-        ArgumentNullException.ThrowIfNull(configuration);
-
-        // A table already on the table-features writer version has every active feature explicitly named, and
-        // UpgradeProtocol preserves them — so it is always safe to upgrade.
-        if (protocol.MinWriterVersion >= WriterVersion)
-        {
-            return;
-        }
-
-        // appendOnly is now enumerated + enforced (#549) by UpgradeProtocol, so it no longer blocks the
-        // upgrade. invariants / CHECK constraints still fail closed until their per-row enforcement lands
-        // (#568, overlaps #190).
-        foreach (string key in configuration.Keys)
-        {
-            if (key.StartsWith(ConstraintKeyPrefix, StringComparison.Ordinal))
-            {
-                throw RefuseLegacyFeature($"a CHECK constraint ('{key}')");
-            }
-        }
-
-        if (SchemaHasInvariant(schema))
-        {
-            throw RefuseLegacyFeature($"a column invariant ('{InvariantKey}')");
-        }
-    }
-
-    private static DeltaProtocolException RefuseLegacyFeature(string activeFeature) =>
-        DeltaProtocolException.Unsupported(
-            $"Cannot enable type widening on this table: it is on a legacy writer protocol (version < "
-            + $"{WriterVersion}) and currently declares {activeFeature}, which this build cannot carry as an "
-            + "explicit table feature when upgrading to the table-features protocol (writer version "
-            + $"{WriterVersion}). Upgrading would silently deactivate it for other engines (Delta 'Active "
-            + "Features'), so the operation is refused fail-closed. Enabling type widening on a table with an "
-            + "active invariant / CHECK constraint is tracked in #568.");
 
     // True when any field in the schema carries a column invariant in its metadata — the legacy `invariants`
-    // feature this build cannot enumerate as a table feature on upgrade. Recurses through EVERY nesting a
+    // feature enumerated into writerFeatures on the table-features upgrade (#568). Recurses through EVERY nesting a
     // Delta invariant can be reachable under (Spark collects invariants through struct fields AND
     // array-element / map key/value structs), so an invariant inside e.g. `array<struct<x>>` or
     // `map<string, struct<y>>` is not silently missed.
