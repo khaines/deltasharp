@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using DeltaSharp.Engine.Columnar;
@@ -360,6 +361,79 @@ public sealed class WriteConstraintEnforcementTests : IDisposable
         DeltaTableConstraint seen = Assert.Single(enforcer.Constraints!);
         Assert.Equal(DeltaConstraintKind.Invariant, seen.Kind);
         Assert.Equal("amount", seen.Name);
+    }
+
+    [Fact]
+    public async Task Append_FreshDoor_ConcurrentlyCreatedTable_FailsClosed_NotBlindAppend()
+    {
+        // #596 facade wiring: the fresh-append door commits through the snapshot-RESPECTING core with an
+        // explicit null base. This pins that wiring end-to-end: if a table already exists but the door's
+        // existence probe reports "no table" (modelled by a backend that suppresses ListAsync — exactly the
+        // stale-probe a concurrent create produces between the door's probe and its commit), the fresh write
+        // must CONFLICT fail-closed, NOT silently blind-append UNENFORCED to that table (which is how a
+        // concurrently-added constrained table's constraints would otherwise be bypassed). A regression that
+        // reverts the door to the re-deriving CreateOrAppendAsync(writeSchema,…) overload turns this green→red.
+        await SeedTableAsync(IdSchema); // a real v0 table exists on disk at _root
+
+        using var real = new LocalFileSystemBackend(_root);
+        using DeltaWriteTarget door = DeltaWriteTarget.ForBackend(
+            new ListSuppressingBackend(real), TimeProvider.System, () => "part.parquet");
+
+        // The door's GetLatestCommitVersionAsync lists _delta_log → suppressed → null → it takes the fresh
+        // CREATE branch; the commit's PutIfAbsent(0.json) then hits the REAL, already-present v0 → conflict.
+        await Assert.ThrowsAnyAsync<DeltaConcurrentModificationException>(
+            () => door.AppendAsync(IdSchema, Array.Empty<string>(), new[] { IdBatch(5) }));
+
+        Assert.Equal(0L, await LatestVersionAsync()); // no blind-appended v1 — the table is untouched
+    }
+
+    // A backend decorator that behaves exactly like its inner backend EXCEPT the FIRST listing reports EMPTY —
+    // modelling the stale existence-probe a concurrent create produces: the door's own probe sees "no table",
+    // but a later re-probe (as the re-deriving CreateOrAppendAsync overload would issue) sees the real table.
+    // So this fault distinguishes the fixed door (one probe → null → fail-closed CREATE) from a regression to
+    // the re-deriving overload (second probe → real table → silent blind append). The commit path never lists.
+    private sealed class ListSuppressingBackend : IStorageBackend, IDisposable
+    {
+        private readonly IStorageBackend _inner;
+        private int _listCalls;
+
+        public ListSuppressingBackend(IStorageBackend inner) => _inner = inner;
+
+        public StorageBackendKind Kind => _inner.Kind;
+
+        public ValueTask<System.IO.Stream> ReadRangeAsync(string path, long offset, long length, CancellationToken cancellationToken) =>
+            _inner.ReadRangeAsync(path, offset, length, cancellationToken);
+
+        public ValueTask<System.IO.Stream> OpenReadAsync(string path, CancellationToken cancellationToken) =>
+            _inner.OpenReadAsync(path, cancellationToken);
+
+        public ValueTask<System.IO.Stream> OpenWriteAsync(string path, CancellationToken cancellationToken) =>
+            _inner.OpenWriteAsync(path, cancellationToken);
+
+        public ValueTask<bool> PutIfAbsentAsync(string path, ReadOnlyMemory<byte> content, CancellationToken cancellationToken) =>
+            _inner.PutIfAbsentAsync(path, content, cancellationToken);
+
+        public ValueTask DeleteAsync(string path, CancellationToken cancellationToken) =>
+            _inner.DeleteAsync(path, cancellationToken);
+
+        public ValueTask<StorageObjectInfo?> HeadAsync(string path, CancellationToken cancellationToken) =>
+            _inner.HeadAsync(path, cancellationToken);
+
+        public async IAsyncEnumerable<StorageObjectInfo> ListAsync(
+            string prefix, [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref _listCalls) == 1)
+            {
+                yield break; // first probe (the door's): report empty — the stale existence probe
+            }
+
+            await foreach (StorageObjectInfo info in _inner.ListAsync(prefix, cancellationToken).WithCancellation(cancellationToken))
+            {
+                yield return info;
+            }
+        }
+
+        public void Dispose() => (_inner as IDisposable)?.Dispose();
     }
 
     [Fact]

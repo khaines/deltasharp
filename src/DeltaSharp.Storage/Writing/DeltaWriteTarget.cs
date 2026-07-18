@@ -47,7 +47,7 @@ public readonly record struct DeltaWriteResult(long Version, int FilesWritten, l
 /// </summary>
 public sealed class DeltaWriteTarget : IDisposable
 {
-    private readonly LocalFileSystemBackend _backend;
+    private readonly IStorageBackend _backend;
     private readonly DeltaLog _log;
     private readonly DeltaTableWriter _writer;
     private readonly ParquetFileWriter _parquetWriter = new();
@@ -56,7 +56,7 @@ public sealed class DeltaWriteTarget : IDisposable
     private readonly Func<string> _fileNameFactory;
 
     private DeltaWriteTarget(
-        LocalFileSystemBackend backend,
+        IStorageBackend backend,
         TimeProvider timeProvider,
         Func<string> fileNameFactory,
         IColumnPhysicalNameSource? nameSource = null)
@@ -107,6 +107,20 @@ public sealed class DeltaWriteTarget : IDisposable
         ArgumentNullException.ThrowIfNull(fileNameFactory);
         ArgumentNullException.ThrowIfNull(nameSource);
         return new DeltaWriteTarget(new LocalFileSystemBackend(tablePath), timeProvider, fileNameFactory, nameSource);
+    }
+
+    // A test seam that injects a pre-built backend (e.g. a fault-injecting decorator over a real
+    // LocalFileSystemBackend) so a facade behavior that depends on the backend's responses — notably the
+    // fresh-vs-existing probe (GetLatestCommitVersionAsync) that decides the create-vs-append branch — can be
+    // exercised deterministically. Production callers use ForLocalPath; DeltaWriteTarget's logic never depends
+    // on the concrete backend type (only IStorageBackend + optional IDisposable).
+    internal static DeltaWriteTarget ForBackend(
+        IStorageBackend backend, TimeProvider timeProvider, Func<string> fileNameFactory)
+    {
+        ArgumentNullException.ThrowIfNull(backend);
+        ArgumentNullException.ThrowIfNull(timeProvider);
+        ArgumentNullException.ThrowIfNull(fileNameFactory);
+        return new DeltaWriteTarget(backend, timeProvider, fileNameFactory);
     }
 
     // A collision-resistant data-file name from the sanctioned deterministic RNG (never the banned
@@ -703,5 +717,5 @@ public sealed class DeltaWriteTarget : IDisposable
     };
 
     /// <inheritdoc/>
-    public void Dispose() => _backend.Dispose();
+    public void Dispose() => (_backend as IDisposable)?.Dispose();
 }
