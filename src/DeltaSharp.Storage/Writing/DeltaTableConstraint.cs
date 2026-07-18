@@ -45,13 +45,25 @@ internal static class DeltaTableConstraints
 
     /// <summary>
     /// Collects the constraints a write to <paramref name="snapshot"/> with declared write schema
-    /// <paramref name="writeSchema"/> must enforce: the snapshot's CHECK constraints + column invariants,
-    /// unioned (deduplicated) with any invariant declared on the incoming <paramref name="writeSchema"/> (so a
-    /// fresh create, or a <c>mergeSchema</c> append that adds a constrained column, validates its own rows).
-    /// Deterministically ordered so the first reported violation is stable.
+    /// <paramref name="writeSchema"/> must enforce: the snapshot's CHECK constraints (always) + the snapshot's
+    /// column invariants (when <paramref name="includeSnapshotInvariants"/>), unioned (deduplicated) with any
+    /// invariant declared on the incoming <paramref name="writeSchema"/> (so a fresh create, or a
+    /// <c>mergeSchema</c> append that adds a constrained column, validates its own rows). Deterministically
+    /// ordered so the first reported violation is stable.
     /// </summary>
+    /// <param name="snapshot">The table snapshot whose active constraints apply, or <see langword="null"/> for
+    /// a fresh create.</param>
+    /// <param name="writeSchema">The declared write schema; its fields' own <c>delta.invariants</c> are always
+    /// collected.</param>
+    /// <param name="includeSnapshotInvariants">Whether the snapshot's OWN field <c>delta.invariants</c> apply.
+    /// <see langword="true"/> for an append / same-schema write. <see langword="false"/> for an
+    /// <c>overwriteSchema</c> replacement: the snapshot's named CHECK constraints (<c>delta.constraints.*</c>
+    /// table config) survive the replacement and are still collected, but the OLD schema's field invariants
+    /// are replaced wholesale by <paramref name="writeSchema"/>'s and so must NOT be collected from the
+    /// snapshot.</param>
     /// <exception cref="DeltaProtocolException">A constraint is malformed, empty, or a nested-field invariant.</exception>
-    public static IReadOnlyList<DeltaTableConstraint> CollectForWrite(Snapshot? snapshot, StructType writeSchema)
+    public static IReadOnlyList<DeltaTableConstraint> CollectForWrite(
+        Snapshot? snapshot, StructType writeSchema, bool includeSnapshotInvariants = true)
     {
         ArgumentNullException.ThrowIfNull(writeSchema);
 
@@ -69,7 +81,10 @@ internal static class DeltaTableConstraints
         if (snapshot is not null)
         {
             CollectChecks(snapshot.Metadata.Configuration, Add);
-            CollectInvariants(snapshot.Schema, Add);
+            if (includeSnapshotInvariants)
+            {
+                CollectInvariants(snapshot.Schema, Add);
+            }
         }
 
         CollectInvariants(writeSchema, Add);

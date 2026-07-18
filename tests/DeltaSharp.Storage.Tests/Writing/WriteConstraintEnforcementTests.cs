@@ -108,6 +108,12 @@ public sealed class WriteConstraintEnforcementTests : IDisposable
         return await new DeltaLog(backend).GetLatestCommitVersionAsync(CancellationToken.None);
     }
 
+    private async Task<Snapshot> SnapshotAsync()
+    {
+        using var backend = new LocalFileSystemBackend(_root);
+        return await new DeltaLog(backend).LoadSnapshotAsync(version: null);
+    }
+
     // A fake enforcer that records exactly what the primitive handed it (and optionally rejects), so the
     // tests can assert the primitive collected the right constraint set from the commit's snapshot.
     private sealed class RecordingEnforcer : IWriteConstraintEnforcer
@@ -237,10 +243,12 @@ public sealed class WriteConstraintEnforcementTests : IDisposable
     }
 
     [Fact]
-    public async Task Overwrite_OverwriteSchema_DropsExistingConstraints_EnforcesOnlyNewSchemaInvariants()
+    public async Task Overwrite_OverwriteSchema_KeepsAndEnforcesSurvivingChecks_DropsOldSchemaInvariants()
     {
-        // overwriteSchema replaces the table schema wholesale, so the EXISTING CHECK is dropped with it — the
-        // enforcer must see ONLY the incoming schema's own invariant, never the old CHECK (includeExisting=false).
+        // Delta parity (#596 fix): overwriteSchema replaces the schema but the committed metaData KEEPS the
+        // table's named CHECK constraints, so they MUST still be enforced against the new rows — the enforcer
+        // sees the surviving CHECK. Only the OLD schema's field invariants are dropped (replaced by the new
+        // schema's), so the enforcer additionally sees the NEW schema's invariant, never an old one.
         await SeedTableAsync(IdSchema, ("delta.constraints.positive_id", "id > 0"));
         StructType newSchema = SchemaWithInvariant("{\"expression\":{\"expression\":\"amount > 0\"}}");
         var enforcer = new RecordingEnforcer();
@@ -251,10 +259,107 @@ public sealed class WriteConstraintEnforcementTests : IDisposable
             DeltaPartitionOverwriteMode.Static, overwriteSchema: true, enforcer: enforcer);
 
         Assert.Equal(1, enforcer.Calls);
+        Assert.Contains(enforcer.Constraints!, c => c.Kind == DeltaConstraintKind.Check && c.Name == "positive_id");
+        Assert.Contains(enforcer.Constraints!, c => c.Kind == DeltaConstraintKind.Invariant && c.Name == "amount");
+        Assert.Equal(2, enforcer.Constraints!.Count); // exactly: surviving CHECK + new-schema invariant
+
+        // The committed metaData STILL declares the CHECK active (it survived the replacement, so enforcing it
+        // above is what keeps the table honest — no fail-open, no dangling constraint).
+        Snapshot after = await SnapshotAsync();
+        Assert.True(after.Metadata.Configuration.ContainsKey("delta.constraints.positive_id"));
+    }
+
+    [Fact]
+    public async Task Overwrite_OverwriteSchema_DropsOldFieldInvariant_WhenNewSchemaOmitsIt()
+    {
+        // A field invariant is schema metadata: overwriteSchema replacing the field (without the invariant)
+        // drops it — the enforcer is never even called (no surviving CHECK, and the new schema declares none).
+        StructType oldSchema = SchemaWithInvariant("{\"expression\":{\"expression\":\"amount > 0\"}}");
+        await SeedTableAsync(oldSchema);
+        StructType newSchema = new(new[]
+        {
+            new StructField("id", IntegerType.Instance, nullable: false),
+            new StructField("amount", IntegerType.Instance, nullable: true), // no invariant now
+        });
+        var enforcer = new RecordingEnforcer();
+
+        using DeltaWriteTarget target = Target();
+        DeltaWriteResult result = await target.OverwriteAsync(
+            newSchema, Array.Empty<string>(), new[] { InvariantBatch(newSchema, (1, -9)) }, // -9 would violate the OLD invariant
+            DeltaPartitionOverwriteMode.Static, overwriteSchema: true, enforcer: enforcer);
+
+        Assert.Equal(0, enforcer.Calls); // old invariant dropped, no new constraint → enforcement skipped
+        Assert.Equal(1L, result.Version); // the -9 row commits (the dropped invariant no longer applies)
+    }
+
+    [Fact]
+    public async Task Overwrite_Dynamic_ConstrainedTable_WithEnforcer_InvokedWithSnapshotConstraints()
+    {
+        // A dynamic partition overwrite keeps the schema + constraints; the enforcer must see the surviving
+        // CHECK collected from the same base snapshot the dynamic overwrite commits against.
+        await SeedTableAsync(IdSchema, ("delta.constraints.positive_id", "id > 0"));
+        var enforcer = new RecordingEnforcer();
+
+        using DeltaWriteTarget target = Target();
+        await target.OverwriteAsync(
+            IdSchema, Array.Empty<string>(), new[] { IdBatch(7) },
+            DeltaPartitionOverwriteMode.Dynamic, enforcer: enforcer);
+
+        Assert.Equal(1, enforcer.Calls);
         DeltaTableConstraint seen = Assert.Single(enforcer.Constraints!);
-        Assert.Equal(DeltaConstraintKind.Invariant, seen.Kind); // the new schema's invariant only
+        Assert.Equal(DeltaConstraintKind.Check, seen.Kind);
+        Assert.Equal("positive_id", seen.Name);
+    }
+
+    [Fact]
+    public async Task Overwrite_DynamicWithOverwriteSchema_RejectedWithArgumentException_BeforeEnforcement()
+    {
+        // dynamic + overwriteSchema is an illegal combination; it must fail fast with ArgumentException — the
+        // argument check is hoisted ABOVE snapshot load + enforcement, so a constrained table with NO enforcer
+        // still surfaces the ArgumentException (not a fail-closed InvalidOperationException) for the real misuse.
+        await SeedTableAsync(IdSchema, ("delta.constraints.positive_id", "id > 0"));
+
+        using DeltaWriteTarget target = Target();
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => target.OverwriteAsync(
+                IdSchema, Array.Empty<string>(), new[] { IdBatch(5) },
+                DeltaPartitionOverwriteMode.Dynamic, overwriteSchema: true));
+
+        Assert.Equal(0L, await LatestVersionAsync()); // nothing committed
+    }
+
+    [Fact]
+    public async Task EmptyOverwrite_ConstrainedTable_NoEnforcer_DoesNotThrow()
+    {
+        // An empty overwrite carries no rows to validate, so it needs no enforcer even on a constrained table
+        // (a Static empty overwrite truncates; either way enforcement is skipped for 0 rows, no fail-closed).
+        await SeedTableAsync(IdSchema, ("delta.constraints.positive_id", "id > 0"));
+
+        using DeltaWriteTarget target = Target();
+        DeltaWriteResult result = await target.OverwriteAsync(
+            IdSchema, Array.Empty<string>(), Array.Empty<ColumnBatch>(), DeltaPartitionOverwriteMode.Static);
+
+        Assert.True(result.Version >= 0); // did not throw for a missing enforcer
+    }
+
+    [Fact]
+    public async Task Append_MergeSchema_NewColumnInvariant_SeenByEnforcer()
+    {
+        // A mergeSchema append that ADDS a constrained column must validate the new column's own rows: the
+        // enforcer sees the invariant the incoming (evolved) write schema declares on the added column.
+        await SeedTableAsync(IdSchema); // v0: {id}, unconstrained
+        StructType evolved = SchemaWithInvariant("{\"expression\":{\"expression\":\"amount > 0\"}}"); // {id, amount(inv)}
+        var enforcer = new RecordingEnforcer();
+
+        using DeltaWriteTarget target = Target();
+        await target.AppendAsync(
+            evolved, Array.Empty<string>(), new[] { InvariantBatch(evolved, (1, 10)) },
+            mergeSchema: true, enforcer: enforcer);
+
+        Assert.Equal(1, enforcer.Calls);
+        DeltaTableConstraint seen = Assert.Single(enforcer.Constraints!);
+        Assert.Equal(DeltaConstraintKind.Invariant, seen.Kind);
         Assert.Equal("amount", seen.Name);
-        Assert.DoesNotContain(enforcer.Constraints!, c => c.Kind == DeltaConstraintKind.Check);
     }
 
     [Fact]

@@ -208,4 +208,87 @@ public sealed class DeltaConstraintEnforcementTests : IDisposable
 
         Assert.True(File.Exists(CommitFile(table, 0)));
     }
+
+    [Fact]
+    public void OverwriteSchema_SurvivingCheck_ViolatingRow_RejectedFailClosed()
+    {
+        // #596 Delta parity: overwriteSchema replaces the schema but KEEPS the table's named CHECK constraints,
+        // so they are still enforced against the replacement rows — a row violating a surviving CHECK is
+        // rejected fail-closed, never committed as unvalidated data into a table that still declares the CHECK.
+        string table = Table("os-surviving-check");
+        Append(table, Amounts(10, 20)); // v0: {id, amount}
+        AddCheckConstraint(table, "positive_id", "id > 0"); // v1: CHECK id > 0 (survives overwriteSchema)
+
+        using SparkSession spark = NewSession();
+        // Replace the schema (drop `amount`, keep `id`) with a row that violates the surviving CHECK (-1 !> 0).
+        var idOnly = new StructType(new[] { new StructField("id", IntegerType.Instance, nullable: false) });
+        DataFrame df = spark.CreateDataFrame(new[] { new Row(idOnly, -1) }, idOnly);
+
+        Assert.Throws<DeltaConstraintViolationException>(
+            () => df.Write.Format("delta").Mode("overwrite").Option("overwriteSchema", "true").Save(table));
+        Assert.False(File.Exists(CommitFile(table, 2))); // rejected before any commit
+    }
+
+    [Fact]
+    public void OverwriteSchema_SurvivingCheck_SatisfyingRows_Committed()
+    {
+        // The dual of the above: an overwriteSchema whose rows satisfy the surviving CHECK commits normally.
+        string table = Table("os-surviving-ok");
+        Append(table, Amounts(10, 20)); // v0
+        AddCheckConstraint(table, "positive_id", "id > 0"); // v1
+
+        using SparkSession spark = NewSession();
+        var idOnly = new StructType(new[] { new StructField("id", IntegerType.Instance, nullable: false) });
+        spark.CreateDataFrame(new[] { new Row(idOnly, 7) }, idOnly)
+            .Write.Format("delta").Mode("overwrite").Option("overwriteSchema", "true").Save(table);
+
+        Assert.True(File.Exists(CommitFile(table, 2))); // the satisfying overwriteSchema committed
+    }
+
+    [Fact]
+    public void OverwriteSchema_DroppingConstrainedColumn_RejectedFailClosed_NoBrick()
+    {
+        // #596: an overwriteSchema that DROPS a column a surviving CHECK references must not leave a dangling
+        // CHECK (which would then brick every future write). The surviving CHECK cannot resolve against the new
+        // schema, so the write is refused fail-closed rather than committing self-inconsistent metadata.
+        string table = Table("os-drop-constrained");
+        Append(table, Amounts(10, 20)); // v0: {id, amount}
+        AddCheckConstraint(table, "positive_id", "id > 0"); // v1: CHECK references `id`
+
+        using SparkSession spark = NewSession();
+        var amountOnly = new StructType(new[] { new StructField("amount", IntegerType.Instance, nullable: true) });
+        DataFrame df = spark.CreateDataFrame(new[] { new Row(amountOnly, 5) }, amountOnly); // drops `id`
+
+        Assert.ThrowsAny<Exception>(
+            () => df.Write.Format("delta").Mode("overwrite").Option("overwriteSchema", "true").Save(table));
+        Assert.False(File.Exists(CommitFile(table, 2))); // no dangling-CHECK commit — table not bricked
+    }
+
+    [Fact]
+    public void MergeSchema_AppendAddingConstrainedColumn_EnforcesNewColumnInvariant()
+    {
+        // A mergeSchema append that ADDS a new column declaring a column invariant must validate the added
+        // column's own rows: a violating value for the new column is rejected fail-closed.
+        string table = Table("merge-invariant");
+        Append(table, Amounts(10, 20)); // v0: {id, amount} (unconstrained)
+
+        using SparkSession spark = NewSession();
+        // Evolve by ADDING `extra` (nullable) carrying an invariant `extra > 0`; the row's extra is -5.
+        var evolved = new StructType(new[]
+        {
+            new StructField("id", IntegerType.Instance, nullable: false),
+            new StructField("amount", IntegerType.Instance, nullable: true),
+            new StructField(
+                "extra", IntegerType.Instance, nullable: true,
+                FieldMetadata.FromEntries(new[]
+                {
+                    new KeyValuePair<string, string>("delta.invariants", "{\"expression\":{\"expression\":\"extra > 0\"}}"),
+                })),
+        });
+        DataFrame df = spark.CreateDataFrame(new[] { new Row(evolved, 1, 20, -5) }, evolved);
+
+        Assert.Throws<DeltaConstraintViolationException>(
+            () => df.Write.Format("delta").Mode("append").Option("mergeSchema", "true").Save(table));
+        Assert.False(File.Exists(CommitFile(table, 1)));
+    }
 }

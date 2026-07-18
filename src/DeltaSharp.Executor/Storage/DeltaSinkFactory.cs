@@ -224,7 +224,7 @@ internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
                 ColumnVector result = evaluator.Evaluate(batches[batchIndex], BoundedExecutionMemory.Unbounded);
                 for (int row = 0; row < result.Length; row++)
                 {
-                    if (result.IsNull(row) || !result.GetValue<bool>(row))
+                    if (RowRejected(result, row))
                     {
                         throw DeltaConstraintViolationException.ForRow(constraint, batchIndex, row);
                     }
@@ -232,6 +232,17 @@ internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
             }
         }
     }
+
+    /// <summary>
+    /// Whether the constraint-predicate result at logical <paramref name="row"/> REJECTS the row: a row is
+    /// rejected when the predicate is <b>not TRUE</b> — i.e. <c>null</c> OR <c>false</c> — matching Delta's
+    /// <c>CheckDeltaInvariant.assertRule</c>. The <see cref="ColumnVector.IsNull(int)"/> guard is
+    /// contract-mandated and load-bearing: a <see cref="ColumnVector"/> leaves the value lane UNSPECIFIED at a
+    /// null slot, so a null result must be rejected regardless of whatever the value lane happens to hold —
+    /// never derive the pass/reject decision from <see cref="ColumnVector.GetValue{T}(int)"/> at a null row.
+    /// </summary>
+    internal static bool RowRejected(ColumnVector result, int row) =>
+        result.IsNull(row) || !result.GetValue<bool>(row);
 
     private static bool TableExists(DeltaWriteTarget target) =>
         target.TableExistsAsync().GetAwaiter().GetResult();
