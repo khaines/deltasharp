@@ -526,6 +526,20 @@ public sealed class ColumnMappingTests : IDisposable
             rows.OrderBy(r => r.Id).ToList());
     }
 
+    // A FlatSchema variant whose `score` field declares a column invariant (delta.invariants), used to prove
+    // the internal fresh-create seams refuse fail-closed rather than create a constrained table unenforced.
+    private static StructType ConstrainedFlatSchema() => new(new[]
+    {
+        new StructField("id", DataTypes.LongType, nullable: false),
+        new StructField(
+            "score", DataTypes.LongType, nullable: true,
+            FieldMetadata.FromEntries(new[]
+            {
+                new KeyValuePair<string, string>("delta.invariants", "{\"expression\":{\"expression\":\"score > 0\"}}"),
+            })),
+        new StructField("name", DataTypes.StringType, nullable: true),
+    });
+
     // #572 blocking finding 2 (write-path constraint enforcement): the id-mode create seam is a NEW write
     // path, so — exactly like the name-mode / DV create seams (#581) — it must NOT be a per-row-constraint
     // enforcement bypass. A fresh id-mode create whose schema declares a column invariant, with no enforcer
@@ -533,26 +547,43 @@ public sealed class ColumnMappingTests : IDisposable
     [Fact]
     public async Task IdMode_CreateWithColumnInvariant_NoEnforcer_RefusedFailClosed()
     {
-        var constrained = new StructType(new[]
-        {
-            new StructField("id", DataTypes.LongType, nullable: false),
-            new StructField(
-                "score", DataTypes.LongType, nullable: true,
-                FieldMetadata.FromEntries(new[]
-                {
-                    new KeyValuePair<string, string>("delta.invariants", "{\"expression\":{\"expression\":\"score > 0\"}}"),
-                })),
-            new StructField("name", DataTypes.StringType, nullable: true),
-        });
-
         using DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
             _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), FileNames());
         await Assert.ThrowsAsync<InvalidOperationException>(() => target.CreateIdMappedTableAsync(
-            constrained, Array.Empty<string>(),
+            ConstrainedFlatSchema(), Array.Empty<string>(),
             new[] { FlatBatch(new[] { (1L, 100L, (string?)"alice") }) },
             new SeededPhysicalNameSource(Seed)));
 
         // Refused before staging: no version-0 commit was written.
+        Assert.False(File.Exists(Path.Combine(_root, "_delta_log", "00000000000000000000.json")));
+    }
+
+    // Every INTERNAL fresh-create seam bypasses the shared AppendAsync enforcement (it stages + commits
+    // directly to inject a mapped / deletion-vector protocol), so EACH must independently refuse fail-closed a
+    // constrained schema with no enforcer (#581 RejectUnenforceableCreate). Pins all five seams — name / id /
+    // name-DV / id-DV / DV — so a future regression that drops the guard from any one is caught (#572 council
+    // Quality/Security). The guard fires before TableExists staging, so all five run on one fresh root.
+    [Fact]
+    public async Task AllInternalCreateSeams_WithColumnInvariant_NoEnforcer_RefusedFailClosed()
+    {
+        StructType constrained = ConstrainedFlatSchema();
+        ColumnBatch[] Batch() => new[] { FlatBatch(new[] { (1L, 100L, (string?)"alice") }) };
+
+        using DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), FileNames());
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => target.CreateNameMappedTableAsync(
+            constrained, Array.Empty<string>(), Batch(), new SeededPhysicalNameSource(Seed)));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => target.CreateIdMappedTableAsync(
+            constrained, Array.Empty<string>(), Batch(), new SeededPhysicalNameSource(Seed)));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => target.CreateNameMappedDeletionVectorTableAsync(
+            constrained, Array.Empty<string>(), Batch(), new SeededPhysicalNameSource(Seed)));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => target.CreateIdMappedDeletionVectorTableAsync(
+            constrained, Array.Empty<string>(), Batch(), new SeededPhysicalNameSource(Seed)));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => target.CreateDeletionVectorTableAsync(
+            constrained, Array.Empty<string>(), Batch()));
+
+        // No seam committed a version-0 create for the constrained schema.
         Assert.False(File.Exists(Path.Combine(_root, "_delta_log", "00000000000000000000.json")));
     }
 
