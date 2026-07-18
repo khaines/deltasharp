@@ -213,8 +213,24 @@ internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
 
         foreach (DeltaTableConstraint constraint in constraints)
         {
-            (CoreExpr predicate, IReadOnlyList<ExprAttributeReference> input) =
-                ConstraintExpressionFrontend.ParseResolveWithInput(constraint.Expression, schema);
+            CoreExpr predicate;
+            IReadOnlyList<ExprAttributeReference> input;
+            try
+            {
+                (predicate, input) = ConstraintExpressionFrontend.ParseResolveWithInput(constraint.Expression, schema);
+            }
+            catch (AnalysisException ex) when (ex.Kind == AnalysisErrorKind.UnresolvedColumn && ex.Reference is not null)
+            {
+                // #598: a SURVIVING CHECK/invariant references a column the write schema no longer has — i.e. an
+                // overwriteSchema (or future ALTER) dropped/renamed a constraint-referenced column, so the
+                // predicate cannot resolve against the new schema. Surface Delta's parity
+                // DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE error (naming the column + the dependent constraint and
+                // the DROP-CONSTRAINT remedy) instead of the raw "cannot resolve column" resolution failure.
+                // Safety is unchanged: the write was already refused fail-closed at this seam (verified by
+                // OverwriteSchema_DroppingConstrainedColumn_*), before any Parquet file is staged.
+                throw DeltaConstraintDependentColumnException.ForColumnChange(constraint, ex.Reference);
+            }
+
             EnginePhysicalExpression physical =
                 PhysicalExpressionTranslator.For(input, AnsiMode.Ansi).Translate(predicate);
             BatchPredicateEvaluator evaluator = BatchPredicateEvaluator.Build(physical, schema, ConstraintBackendName);
