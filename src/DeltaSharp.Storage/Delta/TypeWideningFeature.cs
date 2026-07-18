@@ -163,7 +163,7 @@ internal static class TypeWideningFeature
     // Adds a writer feature to a list unless already present (a default array is treated as empty).
     private static ImmutableArray<string> WithWriterFeature(ImmutableArray<string> features, string feature)
     {
-        if (!features.IsDefault && features.Contains(feature))
+        if (!features.IsDefault && features.Contains(feature, StringComparer.Ordinal))
         {
             return features;
         }
