@@ -83,20 +83,23 @@ internal static class ParquetTypeMapping
                 + "is not supported."),
         };
 
-        // Column-mapping id mode (#523): stamp the Parquet field_id = delta.columnMapping.id so an id-mode
-        // reader can resolve this column by field_id (Parquet.Net persists DataField.FieldId to the Thrift
-        // footer field 9). Only reached when the (physical) StructField carries the id metadata: name-mode
-        // write schemas DROP it in ColumnMapping.ToPhysicalSchema, so name/none-mode Parquet output is
-        // byte-unchanged (issue #523 AC3). Delta ids are longs while Parquet field_id is an int32 — a table
-        // with an id outside the int range is not a real scenario, but guard the cast so a malformed id fails
-        // loud rather than silently truncating.
+        // Column-mapping id mode (#523/#572): stamp the Parquet field_id = delta.columnMapping.id so an
+        // id-mode reader can resolve this column by field_id (Parquet.Net persists DataField.FieldId to the
+        // Thrift footer field 9). Only reached when the (physical) StructField carries the id metadata:
+        // ColumnMapping.ToPhysicalSchema PRESERVES the id in id mode (so the id-mode create/append writer
+        // stamps field_id) but DROPS it in name mode, so name/none-mode Parquet output is byte-unchanged
+        // (issue #523 AC3). Delta ids are longs while Parquet field_id is an int32 — a table with an id
+        // outside the int range is not a real scenario, but guard the cast so a malformed id fails loud rather
+        // than silently truncating. Delta column-mapping ids start at 1 (AssignFreshMapping mints 1, 2, …), so
+        // 0 (and any non-positive id) is out of range too — reject it rather than stamp a field_id the spec
+        // never assigns (#572, deltaspec N1).
         if (ColumnMapping.TryGetId(field, out long fieldId))
         {
-            if (fieldId is < 0 or > int.MaxValue)
+            if (fieldId is <= 0 or > int.MaxValue)
             {
                 throw DeltaStorageException.UnsupportedFeature(
                     $"Column '{field.Name}' has a delta.columnMapping.id ({fieldId}) outside the Parquet "
-                    + "field_id range [0, int.MaxValue].");
+                    + "field_id range [1, int.MaxValue].");
             }
 
             dataField.FieldId = (int)fieldId;

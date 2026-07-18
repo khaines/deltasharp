@@ -309,19 +309,25 @@ internal sealed class DeltaLog
         ProtocolSupport.EnsureReadable(snapshot.Protocol);
 
         // Column-mapping mode gate (§2.12.3; STORY-05.4.3 AC4). The protocol feature gate above opens for a
-        // column-mapped (name OR id) table; this build serves BOTH 'name' and 'id' mode reads (id-mode read
-        // resolves columns by Parquet field_id — #523) but rejects a mode declared without protocol support
-        // (protocol-upgrade error). This is the single read-side choke point, so EVERY load (including time
-        // travel) of a column-mapping table declared without protocol support is rejected before any data
-        // column is resolved — never a positional/name misread. WRITING an id-mode table stays fail-closed
-        // (EnsureWriteSupported / the centralized DeltaCommitter gate), independent of this read gate.
+        // column-mapped (name OR id) table; this build serves BOTH 'name' and 'id' mode reads AND writes
+        // (id-mode read/write resolve columns by Parquet field_id — #523/#572) but rejects a mode declared
+        // without protocol support (protocol-upgrade error). This is the single read-side choke point, so
+        // EVERY load (including time travel) of a column-mapping table declared without protocol support is
+        // rejected before any data column is resolved — never a positional/name misread.
         ColumnMappingMode mode = ColumnMapping.ResolveMode(snapshot.Metadata.Configuration);
         ColumnMapping.EnsureModeGate(mode, snapshot.Protocol);
 
         // Name-mode resolution invariant (STORY-05.4.3 / #191 HIGH). Reject a poisoned/malformed name-mode
-        // table (duplicate physicalName across data+partition fields, duplicate/missing/out-of-range id)
-        // fail-closed at this single choke point — a duplicate physical name would otherwise let one column's
-        // value be served under another column's logical name with NO exception (a silent misread).
+        // table (duplicate physicalName across data+partition fields, duplicate/missing/out-of-range id) —
+        // and (#572 deltaspec N3/R4) a nested (non-leaf) mapped column or a non-positive id — fail-closed at
+        // this single choke point: a duplicate physical name would otherwise let one column's value be served
+        // under another column's logical name with NO exception (a silent misread).
+        //
+        // NOTE (#572 deltaspec N3/R4 finding #3, partitionColumns ⊆ schema): the all-mode partition-existence
+        // invariant is enforced at the COMMITTER (DeltaCommitter.CommitCoreAsync) rather than here — validating
+        // it at load is too broad, because a large corpus of hand-authored log/checkpoint fixtures uses a stub
+        // schema that deliberately omits partition columns (they exercise log mechanics only). The committer
+        // guarantees no NEW bad-partition metaData is published; a pre-existing raw-authored table still loads.
         ColumnMapping.ValidateColumnMappingSchema(mode, snapshot.Schema, snapshot.Metadata.Configuration);
         return snapshot;
     }

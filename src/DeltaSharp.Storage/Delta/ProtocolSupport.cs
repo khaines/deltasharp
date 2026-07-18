@@ -37,10 +37,9 @@ internal static class ProtocolSupport
     public const int TableFeaturesReaderVersion = 3;
 
     /// <summary>The advanced reader features this build implements. <c>columnMapping</c> is served in both
-    /// <c>name</c> and <c>id</c> mode for <b>reads</b> (STORY-05.4.3 / #191; id resolves columns by the Parquet
-    /// <c>field_id</c> — #523): the feature gate opens for a column-mapped table; an <c>id</c>-mode <b>write</b>
-    /// is rejected fail-closed downstream by <see cref="ColumnMapping.EnsureWriteSupported"/> (id-mode write
-    /// deferred, #572). A legacy reader-version-2 column-mapping table still fails closed (see
+    /// <c>name</c> and <c>id</c> mode for <b>reads AND writes</b> (STORY-05.4.3 / #191 name; #523 id read;
+    /// #572 id write — id resolves columns by the Parquet <c>field_id</c>): the feature gate opens for a
+    /// column-mapped table. A legacy reader-version-2 column-mapping table still fails closed (see
     /// <see cref="EnsureReadable"/>) — this build serves column mapping only through the table-features
     /// (reader v3) representation.</summary>
     public static readonly ImmutableHashSet<string> SupportedReaderFeatures =
@@ -63,10 +62,10 @@ internal static class ProtocolSupport
     /// <summary>The "table features" writer protocol version (features enumerated in <c>writerFeatures</c>).</summary>
     public const int TableFeaturesWriterVersion = 7;
 
-    /// <summary>The advanced writer features this build implements. <c>columnMapping</c> is written in
-    /// <c>name</c> mode (STORY-05.4.3 / #191); an <c>id</c>-mode write is rejected fail-closed downstream
-    /// (<see cref="ColumnMapping.EnsureWriteSupported"/>; id-mode write deferred, #572 — id-mode READ is
-    /// supported per #523). <c>appendOnly</c> is a <b>writer-only</b> legacy feature (never in
+    /// <summary>The advanced writer features this build implements. <c>columnMapping</c> is written in both
+    /// <c>name</c> mode (STORY-05.4.3 / #191) and <c>id</c> mode (#572 — id-mode READ per #523): a fresh
+    /// create mints per-field physicalName+id and stamps the Parquet <c>field_id</c> in id mode.
+    /// <c>appendOnly</c> is a <b>writer-only</b> legacy feature (never in
     /// <see cref="SupportedReaderFeatures"/>): this build enforces it at commit
     /// (<see cref="AppendOnlyFeature.EnsureCommitAllowed"/>) and enumerates it on the
     /// legacy → table-features upgrade (<see cref="TypeWideningFeature.UpgradeProtocol"/>, #549).</summary>
@@ -105,6 +104,18 @@ internal static class ProtocolSupport
     {
         ArgumentNullException.ThrowIfNull(protocol);
 
+        // Consistency (Delta protocol): a `writerFeatures` list is meaningful ONLY at the table-features writer
+        // version (7). A protocol that names writer features under a legacy minWriterVersion is malformed — a
+        // strict reader (Spark: "Mismatched minWriterVersion and writerFeatures") rejects it. Fail closed so
+        // DeltaSharp never authors or serves such a table (checked at commit and at load).
+        if (!protocol.WriterFeatures.IsDefaultOrEmpty && protocol.MinWriterVersion != TableFeaturesWriterVersion)
+        {
+            throw DeltaProtocolException.Malformed(
+                $"Protocol declares writerFeatures but minWriterVersion is {protocol.MinWriterVersion}, not "
+                + $"{TableFeaturesWriterVersion}; writerFeatures are only valid at the table-features writer "
+                + $"version ({TableFeaturesWriterVersion}).");
+        }
+
         int version = protocol.MinWriterVersion;
         if (version == TableFeaturesWriterVersion)
         {
@@ -134,6 +145,18 @@ internal static class ProtocolSupport
     public static void EnsureReadable(ProtocolAction protocol)
     {
         ArgumentNullException.ThrowIfNull(protocol);
+
+        // Consistency (Delta protocol): a `readerFeatures` list is meaningful ONLY at the table-features reader
+        // version (3). A protocol that names reader features under a legacy minReaderVersion is malformed — a
+        // strict reader (Spark: "Mismatched minReaderVersion and readerFeatures") rejects it. Fail closed so
+        // DeltaSharp never authors or serves such a table (checked at commit and at load).
+        if (!protocol.ReaderFeatures.IsDefaultOrEmpty && protocol.MinReaderVersion != TableFeaturesReaderVersion)
+        {
+            throw DeltaProtocolException.Malformed(
+                $"Protocol declares readerFeatures but minReaderVersion is {protocol.MinReaderVersion}, not "
+                + $"{TableFeaturesReaderVersion}; readerFeatures are only valid at the table-features reader "
+                + $"version ({TableFeaturesReaderVersion}).");
+        }
 
         int version = protocol.MinReaderVersion;
         switch (version)

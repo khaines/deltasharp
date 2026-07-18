@@ -306,12 +306,12 @@ public sealed class DeltaWriteTarget : IDisposable
     /// because every prior file is rewritten. It is rejected for a Dynamic partition overwrite (files in
     /// untouched partitions would still carry the old schema). The staged files are gated against the new
     /// schema, so the committed metadata matches the real bytes.</para>
-    /// <para>For a <b>name-mode column-mapped</b> table, this door supports an <c>overwriteSchema</c> that
-    /// keeps the same columns, drops / reorders / retypes them, <b>or ADDS a new column</b> (#556): the door
-    /// reconciles the columnMapping (minting a new column's physical name+id ONCE), stages the Parquet files
-    /// under the resulting physical names, and commits that same mapping — so the staged bytes and the
-    /// committed <c>metaData</c> agree on every column's physical identity. <c>id</c> mode stays fail-closed
-    /// (#523, rejected at snapshot load).</para></summary>
+    /// <para>For a <b>column-mapped</b> (name OR id) table, this door supports an <c>overwriteSchema</c> that
+    /// keeps the same columns, drops / reorders / retypes them, <b>or ADDS a new column</b> (#556/#572): the
+    /// door reconciles the columnMapping (minting a new column's physical name+id ONCE), stages the Parquet
+    /// files under the resulting physical names (stamping the field_id in id mode), and commits that same
+    /// mapping — so the staged bytes and the committed <c>metaData</c> agree on every column's physical
+    /// identity.</para></summary>
     /// <exception cref="ArgumentException"><paramref name="overwriteSchema"/> is combined with
     /// <see cref="DeltaPartitionOverwriteMode.Dynamic"/> (only a full/Static overwrite may replace the schema).</exception>
     public async Task<DeltaWriteResult> OverwriteAsync(
@@ -343,10 +343,10 @@ public sealed class DeltaWriteTarget : IDisposable
                 nameof(partitionOverwriteMode));
         }
 
-        // #556: a wholesale overwriteSchema replacement on an EXISTING table (Static/full overwrite only)
-        // routes through the plan/commit split so a name-mode ADD mints the new column's physical name+id
-        // ONCE and stages under it. A fresh path and a `none`-mode drop/retype/reorder keep the pre-#556 route
-        // below.
+        // #556/#572: a wholesale overwriteSchema replacement on an EXISTING table (Static/full overwrite only)
+        // routes through the plan/commit split so a name/id-mode ADD mints the new column's physical name+id
+        // ONCE and stages under it (stamping the field_id in id mode). A fresh path and a `none`-mode
+        // drop/retype/reorder keep the pre-#556 route below.
         if (overwriteSchema
             && partitionOverwriteMode == DeltaPartitionOverwriteMode.Static
             && await _log.GetLatestCommitVersionAsync(cancellationToken).ConfigureAwait(false) is not null)
@@ -469,6 +469,72 @@ public sealed class DeltaWriteTarget : IDisposable
     }
 
     /// <summary>
+    /// Creates a fresh Delta table with column mapping <c>id</c> mode enabled (#572). Mirrors
+    /// <see cref="CreateNameMappedTableAsync"/> exactly — each top-level column is assigned a stable physical
+    /// name (<c>col-&lt;uuid&gt;</c> from <paramref name="physicalNameSource"/>) and id, the Parquet data
+    /// files are written under those <b>physical</b> names, <c>add.partitionValues</c> are keyed by physical
+    /// name, the data-file path is physical, and <c>metaData.partitionColumns</c> carry the <b>LOGICAL</b>
+    /// names — with ONE behavioral difference: the staged physical schema PRESERVES each field's
+    /// <c>delta.columnMapping.id</c>, so <see cref="Parquet.ParquetTypeMapping.CreateField"/> stamps the
+    /// Parquet <c>field_id</c> into the footer (an id-mode reader resolves columns by that field_id, not by
+    /// physical name). The committed <c>metaData</c> declares <c>delta.columnMapping.mode=id</c> /
+    /// <c>maxColumnId</c> and the <c>protocol</c> declares the <c>columnMapping</c> reader+writer feature.
+    /// Enablement is scoped to a fresh table (there is nothing to read through), so every file is
+    /// physical-named with a stamped field_id from version 0.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">A table already exists at this path (enabling column
+    /// mapping on an existing non-empty table is out of scope in this build).</exception>
+    internal async Task<DeltaWriteResult> CreateIdMappedTableAsync(
+        StructType logicalSchema,
+        IReadOnlyList<string> partitionColumns,
+        IReadOnlyList<ColumnBatch> batches,
+        IColumnPhysicalNameSource physicalNameSource,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(logicalSchema);
+        ArgumentNullException.ThrowIfNull(partitionColumns);
+        ArgumentNullException.ThrowIfNull(batches);
+        ArgumentNullException.ThrowIfNull(physicalNameSource);
+
+        if (await TableExistsAsync(cancellationToken).ConfigureAwait(false))
+        {
+            throw new InvalidOperationException(
+                "Enabling column mapping on an existing table is out of scope in this build; column mapping "
+                + "'id' mode can only be enabled on a fresh table (first write).");
+        }
+
+        RejectUnenforceableCreate(logicalSchema, batches);
+
+        (StructType mappedSchema, long maxColumnId) =
+            ColumnMapping.AssignFreshMapping(logicalSchema, physicalNameSource);
+
+        // Route the staging into PHYSICAL name space (as name mode) but PRESERVE the per-field id metadata on
+        // the physical schema — ToPhysicalSchema(mappedSchema, Id) keeps delta.columnMapping.id so the Parquet
+        // writer stamps the footer field_id. Partition-value keys stay physical.
+        StructType physicalSchema = ColumnMapping.ToPhysicalSchema(mappedSchema, ColumnMappingMode.Id);
+        IReadOnlyList<string> physicalPartitions =
+            ColumnMapping.PhysicalPartitionColumns(mappedSchema, partitionColumns, ColumnMappingMode.Id);
+
+        (IReadOnlyList<StagedDataFile> files, long rows) =
+            await StageAsync(physicalSchema, physicalPartitions, batches, cancellationToken).ConfigureAwait(false);
+
+        // metaData.partitionColumns are the LOGICAL names; the staged files carry PHYSICAL partition-value
+        // keys, so CreateMappedTableAsync validates coverage against the physical set while committing the
+        // logical names into the metaData.
+        DeltaCommitResult commit = await _writer
+            .CreateMappedTableAsync(
+                mappedSchema,
+                partitionColumns,
+                physicalPartitions,
+                ColumnMapping.IdModeConfiguration(maxColumnId),
+                ColumnMapping.IdModeProtocol(),
+                files,
+                cancellationToken)
+            .ConfigureAwait(false);
+        return new DeltaWriteResult(commit.Version, files.Count, rows);
+    }
+
+    /// <summary>
     /// Creates a fresh Delta table that BOTH uses column mapping <c>name</c> mode AND enables deletion
     /// vectors (#529 test seam): each top-level column is assigned a stable physical name / id (like
     /// <see cref="CreateNameMappedTableAsync"/>) and the committed <c>protocol</c>/<c>configuration</c>
@@ -513,6 +579,70 @@ public sealed class DeltaWriteTarget : IDisposable
         // Merge the name-mode and deletion-vector enablement into ONE protocol (reader v3 / writer v7 with
         // BOTH features declared) and ONE configuration (columnMapping mode/maxColumnId + enableDeletionVectors).
         ImmutableSortedDictionary<string, string> configuration = ColumnMapping.NameModeConfiguration(maxColumnId)
+            .Add(DeletionVectorsFeature.EnablePropertyKey, "true");
+        var protocol = new ProtocolAction(
+            DeletionVectorsFeature.ReaderVersion,
+            DeletionVectorsFeature.WriterVersion,
+            ImmutableArray.Create(ColumnMapping.Feature, DeletionVectorsFeature.Feature),
+            ImmutableArray.Create(ColumnMapping.Feature, DeletionVectorsFeature.Feature));
+
+        DeltaCommitResult commit = await _writer
+            .CreateMappedTableAsync(
+                mappedSchema,
+                partitionColumns,
+                physicalPartitions,
+                configuration,
+                protocol,
+                files,
+                cancellationToken)
+            .ConfigureAwait(false);
+        return new DeltaWriteResult(commit.Version, files.Count, rows);
+    }
+
+    /// <summary>
+    /// Creates a fresh Delta table that BOTH uses column mapping <c>id</c> mode AND enables deletion vectors
+    /// (#572 DELETE test seam): the id-mode sibling of <see cref="CreateNameMappedDeletionVectorTableAsync"/>.
+    /// Data files are written under the PHYSICAL names WITH each field's <c>delta.columnMapping.id</c>
+    /// preserved (so the Parquet footer field_id is stamped); the committed <c>protocol</c>/<c>configuration</c>
+    /// declare BOTH the <c>columnMapping</c> (id mode) and <c>deletionVectors</c> features, so a subsequent
+    /// <see cref="DeltaDelete"/> passes the protocol gate and exercises the id-mode WRITE-path resolution
+    /// (columns resolved by field_id; the deletion vector stays POSITIONAL over the physical file).
+    /// </summary>
+    /// <exception cref="InvalidOperationException">A table already exists at this path.</exception>
+    internal async Task<DeltaWriteResult> CreateIdMappedDeletionVectorTableAsync(
+        StructType logicalSchema,
+        IReadOnlyList<string> partitionColumns,
+        IReadOnlyList<ColumnBatch> batches,
+        IColumnPhysicalNameSource physicalNameSource,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(logicalSchema);
+        ArgumentNullException.ThrowIfNull(partitionColumns);
+        ArgumentNullException.ThrowIfNull(batches);
+        ArgumentNullException.ThrowIfNull(physicalNameSource);
+
+        if (await TableExistsAsync(cancellationToken).ConfigureAwait(false))
+        {
+            throw new InvalidOperationException(
+                "Enabling column mapping + deletion vectors on an existing table is out of scope in this "
+                + "build; both can only be enabled on a fresh table (first write).");
+        }
+
+        RejectUnenforceableCreate(logicalSchema, batches);
+
+        (StructType mappedSchema, long maxColumnId) =
+            ColumnMapping.AssignFreshMapping(logicalSchema, physicalNameSource);
+
+        StructType physicalSchema = ColumnMapping.ToPhysicalSchema(mappedSchema, ColumnMappingMode.Id);
+        IReadOnlyList<string> physicalPartitions =
+            ColumnMapping.PhysicalPartitionColumns(mappedSchema, partitionColumns, ColumnMappingMode.Id);
+
+        (IReadOnlyList<StagedDataFile> files, long rows) =
+            await StageAsync(physicalSchema, physicalPartitions, batches, cancellationToken).ConfigureAwait(false);
+
+        // Merge the id-mode and deletion-vector enablement into ONE protocol (reader v3 / writer v7 with BOTH
+        // features declared) and ONE configuration (columnMapping mode=id/maxColumnId + enableDeletionVectors).
+        ImmutableSortedDictionary<string, string> configuration = ColumnMapping.IdModeConfiguration(maxColumnId)
             .Add(DeletionVectorsFeature.EnablePropertyKey, "true");
         var protocol = new ProtocolAction(
             DeletionVectorsFeature.ReaderVersion,
@@ -580,17 +710,18 @@ public sealed class DeltaWriteTarget : IDisposable
         return new DeltaWriteResult(commit.Version, files.Count, rows);
     }
 
-    // #525: for an EXISTING name-mode column-mapped table, resolve the PHYSICAL schema + partition columns
-    // the staged Parquet must physically carry (so an append/overwrite writes col-<uuid> names + physical-
-    // keyed partitionValues, IDENTICAL to the fresh-create path). The physical names are the table's EXISTING
-    // per-field delta.columnMapping.physicalName — reused verbatim, NEVER re-minted. For a fresh path (create
-    // door, `snapshot` null) or a `none`-mode table this is logical==physical, so the caller's write schema /
-    // partition columns pass through unchanged (byte-for-byte identical staging to prior behavior). `id` mode
-    // is fail-closed at the id-write gate (EnsureWriteSupported / the centralized DeltaCommitter gate — #523),
-    // so a write never reaches this staging path. This is a STAGING concern only — the commit call still
-    // passes the LOGICAL write schema to DeltaTableWriter, which re-derives the physical form for its own
-    // commit-time validation. #596: takes the caller's already-loaded base snapshot so overwrite loads the
-    // snapshot exactly ONCE (shared with enforcement + the commit) instead of re-reading the log here.
+    // #525/#572/#596: for an EXISTING column-mapped (name OR id) table, resolve the PHYSICAL schema +
+    // partition columns the staged Parquet must physically carry (so an append/overwrite writes col-<uuid>
+    // names + physical-keyed partitionValues, IDENTICAL to the fresh-create path). The physical names are the
+    // table's EXISTING per-field delta.columnMapping.physicalName — reused verbatim, NEVER re-minted. In id
+    // mode the physical schema additionally carries each field's delta.columnMapping.id, so the Parquet writer
+    // stamps the footer field_id (the id-mode reader resolves columns by that field_id). For a fresh path
+    // (create door, `snapshot` null) or a `none`-mode table this is logical==physical, so the caller's write
+    // schema / partition columns pass through unchanged (byte-for-byte identical staging to prior behavior).
+    // This is a STAGING concern only — the commit call still passes the LOGICAL write schema to
+    // DeltaTableWriter, which re-derives the physical form for its own commit-time validation. #596: takes the
+    // caller's already-loaded base snapshot so overwrite loads the snapshot exactly ONCE (shared with
+    // enforcement + the commit) instead of re-reading the log here.
     private static (StructType StagingSchema, IReadOnlyList<string> StagingPartitions)
         ResolvePhysicalStaging(
             Snapshot? snapshot, StructType writeSchema, IReadOnlyList<string> partitionColumns)
@@ -600,13 +731,13 @@ public sealed class DeltaWriteTarget : IDisposable
 
         if (snapshot is null)
         {
-            // Fresh path: the write creates the table (logical==physical for a plain create; a name-mode
-            // create goes through CreateNameMappedTableAsync, not this facade path).
+            // Fresh path: the write creates the table (logical==physical for a plain create; a name/id-mode
+            // create goes through CreateNameMappedTableAsync / CreateIdMappedTableAsync, not this facade path).
             return (writeSchema, partitionColumns);
         }
 
         ColumnMappingMode mode = ColumnMapping.ResolveMode(snapshot.Metadata.Configuration);
-        if (mode != ColumnMappingMode.Name)
+        if (mode == ColumnMappingMode.None)
         {
             return (writeSchema, partitionColumns);
         }

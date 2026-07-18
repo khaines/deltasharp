@@ -5,6 +5,7 @@ using DeltaSharp.Storage;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
 using DeltaSharp.Storage.Delta.DeletionVectors;
+using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Storage.Reading;
 using DeltaSharp.Types;
 using Xunit;
@@ -12,18 +13,22 @@ using Xunit;
 namespace DeltaSharp.Storage.Tests.Delta.DeletionVectors;
 
 /// <summary>
-/// WRITE-path column-mapping correctness for merge-on-read DELETE (#529). A DELETE against a column-mapped
-/// <c>name</c>-mode table must:
+/// WRITE-path column-mapping correctness for merge-on-read DELETE (#529 name / #572 id). A DELETE against a
+/// column-mapped table must:
 /// <list type="bullet">
-/// <item>read the physically-named Parquet data and relabel it to the LOGICAL schema so the predicate sees
+/// <item>read the physically-named Parquet data — by physical name in <c>name</c> mode, by the Parquet
+/// <c>field_id</c> in <c>id</c> mode (#572) — and relabel it to the LOGICAL schema so the predicate sees
 /// LOGICAL column names/values (proven by deleting on a NON-first logical column whose physical name
-/// differs — a relabel/ordinal bug would delete the wrong rows and fail the by-value survivor assertion);</item>
+/// differs — a relabel/ordinal bug would delete the wrong rows and fail the by-value survivor assertion;
+/// the id-mode field_id resolution is PINNED against a FOREIGN table whose physical column names/order do
+/// NOT match the metaData, so name/positional resolution cannot pass by coincidence);</item>
 /// <item>emit a deletion vector that is POSITIONAL over the PHYSICAL data file (column mapping never moves a
 /// row's physical position), so a read-back through <see cref="DeltaReadSource"/> excludes EXACTLY the
 /// predicate rows;</item>
-/// <item>stay fail-closed for <c>id</c> mode (#523) and leave <c>none</c> mode unchanged (regression).</item>
+/// <item>resolve partition values const/null-filled by PHYSICAL name, fail closed on an id-mode table that
+/// has NOT enabled deletion vectors, and leave <c>none</c> mode unchanged (regression).</item>
 /// </list>
-/// Serialized on the shared filesystem collection so the fail-closed safety assertion never flakes.
+/// Serialized on the shared filesystem collection so the safety assertions never flake.
 /// </summary>
 [Collection(DeletionVectorFileTestCollection.Name)]
 public sealed class DeltaDeleteColumnMappingTests : IDisposable
@@ -161,53 +166,134 @@ public sealed class DeltaDeleteColumnMappingTests : IDisposable
         Assert.Empty(await ReadLatestFlatAsync());
     }
 
-    // ------------------------------------------------------------------ id mode: fail closed (#523)
+    // ------------------------------------------------------------------ id mode: field-id-resolved DELETE (#572)
 
     [Fact]
-    public async Task Delete_IdMode_FailsClosed_Since523()
+    public async Task Delete_IdMode_OnLogicalColumn_ExcludesExactlyPredicateRows()
     {
-        // END-TO-END fail-closed: a raw id-mode table declaring the deletionVectors + columnMapping features.
-        // Since #523 an id-mode table is READABLE (columns resolved by Parquet field_id), so it LOADS; a DELETE
-        // (a WRITE) is then refused fail-closed by ColumnMapping.EnsureWriteSupported in DeltaDelete — and, as a
-        // universal backstop, by the centralized id-write gate in DeltaCommitter.CommitAsync — before any file
-        // is scanned or DV written (a field-id-blind name/positional relabel would delete the wrong rows). The
-        // DELETE-local guard is pinned independently by Delete_IdMode_FailsClosed_AtDeleteLocalGuard_Independent.
-        await WriteRawIdModeTableAsync();
+        // #572: id-mode DELETE mirrors name mode — the DELETE reads the physical Parquet by FIELD_ID (not by
+        // physical name), relabels to the LOGICAL schema so the predicate sees logical columns/values, and
+        // emits a POSITIONAL deletion vector over the physical file. Deleting on the non-first logical `score`
+        // column proves the field-id relabel: a mis-resolved ordinal/field_id would delete the wrong rows and
+        // fail the by-value survivor assertion.
+        await CreateIdMappedDeletionVectorTableAsync(
+            FlatSchema,
+            Array.Empty<string>(),
+            FlatBatch((1, 100, "a"), (2, 200, "b"), (3, 300, "c"), (4, 200, "d"), (5, 500, "e")));
 
-        var delete = NewDelete("id-mode-fail-closed");
+        int parquetBefore = CountFiles("*.parquet");
 
-        await Assert.ThrowsAsync<DeltaProtocolException>(
-            () => delete.DeleteAsync(WhereId(id => id == 1)));
+        var delete = NewDelete("id-mode-logical-predicate");
+        DeleteResult result = await delete.DeleteAsync(WhereScore(score => score == 200));
 
-        // The table is untouched: no DV .bin was written.
-        Assert.Equal(0, CountFiles("*.bin"));
+        Assert.NotNull(result.CommittedVersion);
+        Assert.Equal(2, result.RowsDeleted);
+        Assert.Equal(1, result.FilesWithDeletionVector);
+        Assert.Equal(0, result.FilesFullyDeleted);
+
+        // Merge-on-read: the physically-named data file is NOT rewritten; a positional DV .bin is added.
+        Assert.Equal(parquetBefore, CountFiles("*.parquet"));
+        Assert.True(CountFiles("*.bin") >= 1, "DELETE must have written a deletion-vector .bin file.");
+
+        // EXACTLY rows with score==200 (ids 2 and 4) are excluded — asserted by LOGICAL column VALUES.
+        List<(long, long?, string?)> survivors = await ReadLatestFlatAsync();
+        Assert.Equal(
+            new (long, long?, string?)[] { (1L, 100L, "a"), (3L, 300L, "c"), (5L, 500L, "e") },
+            survivors.OrderBy(r => r.Item1).ToList());
     }
 
     [Fact]
-    public async Task Delete_IdMode_FailsClosed_AtDeleteLocalGuard_Independent()
+    public async Task Delete_IdMode_Partitioned_ExcludesExactlyPredicateRows()
     {
-        // Reliability oracle (#529): the DELETE-local fail-closed guard
-        // (ColumnMapping.EnsureWriteSupported in DeltaDelete.RunDeleteAsync). Since #523 an id-mode table LOADS
-        // (id is readable), so the DELETE-local guard is a PRIMARY id-write choke point (no longer secondary to
-        // a load-time rejection — DeltaLog's EnsureModeGate now PERMITS id). Pin it INDEPENDENTLY: hand-build an
-        // id-mode snapshot and feed it to the internal read-snapshot seam, requiring the DELETE to STILL fail
-        // closed at its own guard (never fall through to a field-id-blind name/positional read that could delete
-        // the wrong rows). If the DELETE-local guard were removed, this DELETE would proceed (empty active
-        // files -> silent no-op) and NOT throw — so this test makes that guard independently load-bearing.
-        // (The centralized DeltaCommitter gate is a further backstop, but this seam pins the local guard.)
-        Snapshot idModeSnapshot = BuildUngatedColumnMappingSnapshot(
-            mode: "id", schemaString: "{\"type\":\"struct\",\"fields\":[]}");
+        // id-mode partitioned DELETE: the in-file DATA columns resolve by field_id while `region` is resolved
+        // const/null-filled from add.partitionValues by its PHYSICAL name (the partition value must survive
+        // the relabel so each survivor reports the correct region).
+        await CreateIdMappedDeletionVectorTableAsync(
+            PartitionedSchema,
+            new[] { "region" },
+            PartitionedBatch((1, "us", 100), (2, "us", 200), (3, "eu", 300), (4, "eu", 400)));
 
-        var delete = NewDelete("id-mode-local-guard");
+        var delete = NewDelete("id-mode-partitioned");
+        DeleteResult result = await delete.DeleteAsync(WhereVal(v => v == 200 || v == 300));
 
+        Assert.NotNull(result.CommittedVersion);
+        Assert.Equal(2, result.RowsDeleted);
+
+        List<(long, string?, long?)> survivors = await ReadLatestPartitionedAsync();
+        Assert.Equal(
+            new (long, string?, long?)[] { (1L, "us", 100L), (4L, "eu", 400L) },
+            survivors.OrderBy(r => r.Item1).ToList());
+    }
+
+    // -------------------------------------------- id mode: field_id resolution PINNED via a FOREIGN table (#572)
+
+    [Fact]
+    public async Task Delete_IdMode_ByFieldId_ForeignTable_IgnoringPhysicalNameAndPosition()
+    {
+        // B1 (council quality F1 / relspec M6): the DELETE sibling of the READ test
+        // IdMode_ReadsByFieldId_IgnoringPhysicalNameAndPosition — it PINS that id-mode DELETE resolves DATA
+        // columns by the Parquet FIELD_ID, never by physical name and never by position. Every DeltaSharp-
+        // authored id-mode table names its physical Parquet columns col-<uuid> == the metaData physicalName,
+        // so name-resolution and field_id-resolution are indistinguishable there (flipping resolveByFieldId to
+        // false survives ALL such tests). This FOREIGN table breaks that coincidence: the physical Parquet
+        // columns are named z0/z1/z2 (which do NOT match the metaData physicalNames col-A/col-B/col-C) and are
+        // stored in a DIFFERENT order than the logical schema, but each carries the correct footer field_id.
+        // `score` (field_id 2) sits at a NON-first physical position (physical index 2, logical index 1). A
+        // name-based read cannot find col-B; a positional read would target `name`, not `score`. Only field_id
+        // resolution deletes the right rows — so flipping DeltaDelete's resolveByFieldId to false turns this
+        // RED ("Requested column 'col-…' is not present in the Parquet file schema", or wrong survivors).
+        await SeedForeignIdModeDeletionVectorTableAsync();
+
+        int parquetBefore = CountFiles("*.parquet");
+
+        var delete = NewDelete("id-mode-foreign-fieldid");
+        DeleteResult result = await delete.DeleteAsync(WhereScore(score => score == 200));
+
+        Assert.NotNull(result.CommittedVersion);
+        Assert.Equal(2, result.RowsDeleted);            // ids 2 and 4 (score==200)
+        Assert.Equal(1, result.FilesWithDeletionVector);
+        Assert.Equal(0, result.FilesFullyDeleted);
+
+        // Merge-on-read: the physically-named data file is NOT rewritten; a positional DV .bin is added.
+        Assert.Equal(parquetBefore, CountFiles("*.parquet"));
+        Assert.True(CountFiles("*.bin") >= 1, "DELETE must have written a deletion-vector .bin file.");
+
+        // EXACTLY the score==200 rows (ids 2, 4) are excluded — asserted by LOGICAL column VALUES, so a wrong
+        // field_id / positional resolution that deleted the wrong rows fails here.
+        List<(long, long?, string?)> survivors = await ReadLatestFlatAsync();
+        Assert.Equal(
+            new (long, long?, string?)[] { (1L, 100L, "a"), (3L, 300L, "c"), (5L, 500L, "e") },
+            survivors.OrderBy(r => r.Item1).ToList());
+    }
+
+    // -------------------------------------------- id mode: DELETE without deletion vectors fails closed (#572)
+
+    [Fact]
+    public async Task Delete_IdMode_WithoutDeletionVectorsEnabled_FailsClosed()
+    {
+        // M3 (council hygiene): an in-filter killer for the DV protocol gate under id mode. A merge-on-read
+        // DELETE against an id-mode table that has NOT enabled deletion vectors must fail closed at
+        // DeletionVectorsFeature.EnsureWriteEnabled (the table's protocol declares columnMapping but NOT
+        // deletionVectors), NEVER silently upgrade the protocol or drop the delete. (The existing killer for
+        // this gate lives OUTSIDE this PR's ~ColumnMapping|~IdMode|~DeltaDeleteColumnMapping test filter; this
+        // id-mode-flavored sibling sits INSIDE it.)
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(_root))
+        {
+            await target.CreateIdMappedTableAsync(
+                FlatSchema,
+                Array.Empty<string>(),
+                new[] { FlatBatch((1, 100, "a"), (2, 200, "b"), (3, 300, "c")) },
+                new SeededPhysicalNameSource(Seed));
+        }
+
+        var delete = NewDelete("id-mode-no-dv");
         DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
-            () => delete.DeleteAsync(idModeSnapshot, WhereId(id => id == 1)));
+            () => delete.DeleteAsync(WhereScore(score => score == 200)));
+        Assert.Contains("deletionVectors", ex.Message, StringComparison.Ordinal);
 
-        Assert.Contains("column mapping mode 'id'", ex.Message, StringComparison.Ordinal);
-        Assert.Equal(0, CountFiles("*.bin"));
+        // Fail-closed left the table unchanged (no new version; all three rows intact).
+        Assert.Equal(3, (await ReadLatestFlatAsync()).Count);
     }
-
-    // ----------------------------------------------------- name mode: nested top-level column fails closed
 
     [Theory]
     [InlineData("struct")]
@@ -339,60 +425,100 @@ public sealed class DeltaDeleteColumnMappingTests : IDisposable
             schema, partitionColumns, batches, new SeededPhysicalNameSource(Seed));
     }
 
-    // Writes a raw version-0 log for an id-mode column-mapped, DV-enabled table (no data files needed — since
-    // #523 the id-mode table LOADS, so the DELETE must fail closed at the id-write gate before any file is
-    // scanned).
-    private async Task WriteRawIdModeTableAsync()
+    // #572: the id-mode sibling of CreateNameMappedDeletionVectorTableAsync — creates a fresh id-mode table
+    // with deletion vectors enabled (data files carry PHYSICAL names + stamped field_ids), so a subsequent
+    // DELETE exercises the id-mode field_id-resolved WRITE path.
+    private async Task CreateIdMappedDeletionVectorTableAsync(
+        StructType schema, IReadOnlyList<string> partitionColumns, params ColumnBatch[] batches)
     {
+        using DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(_root);
+        await target.CreateIdMappedDeletionVectorTableAsync(
+            schema, partitionColumns, batches, new SeededPhysicalNameSource(Seed));
+    }
+
+    // Authors a FOREIGN id-mode + deletionVectors-enabled table by hand (version-0 _delta_log + a physical
+    // Parquet data file) whose physical Parquet column NAMES (z0/z1/z2) do NOT match the metaData
+    // physicalNames (col-A/col-B/col-C) and are stored in a DIFFERENT order than the logical schema, but each
+    // carries the correct footer field_id — the shape a foreign engine produces (DeltaSharp always names a
+    // physical column == its physicalName, which is why only a foreign table can distinguish field_id
+    // resolution from name/positional resolution). Logical schema id(id 1)/score(id 2)/name(id 3); physical
+    // layout [z0=id(field_id 1), z1=name(field_id 3), z2=score(field_id 2)], so `score` (field_id 2) is at a
+    // NON-first physical position (physical index 2, logical index 1). Five rows, score==200 on ids 2 and 4.
+    private async Task SeedForeignIdModeDeletionVectorTableAsync()
+    {
+        var physicalSchema = new StructType(new[]
+        {
+            PhysFieldWithId("z0", DataTypes.LongType, nullable: false, id: 1),    // logical "id"
+            PhysFieldWithId("z1", DataTypes.StringType, nullable: true, id: 3),   // logical "name"
+            PhysFieldWithId("z2", DataTypes.LongType, nullable: true, id: 2),     // logical "score"
+        });
+
+        (long Id, string Name, long Score)[] rows =
+        {
+            (1, "a", 100), (2, "b", 200), (3, "c", 300), (4, "d", 200), (5, "e", 500),
+        };
+        MutableColumnVector z0 = ColumnVectors.Create(DataTypes.LongType, rows.Length);
+        MutableColumnVector z1 = ColumnVectors.Create(DataTypes.StringType, rows.Length);
+        MutableColumnVector z2 = ColumnVectors.Create(DataTypes.LongType, rows.Length);
+        foreach ((long id, string name, long score) in rows)
+        {
+            z0.AppendValue(id);
+            z1.AppendBytes(Encoding.UTF8.GetBytes(name));
+            z2.AppendValue(score);
+        }
+
+        var batch = new ManagedColumnBatch(physicalSchema, new ColumnVector[] { z0, z1, z2 }, rows.Length);
+
+        byte[] parquetBytes;
+        using (var buffer = new MemoryStream())
+        {
+            await new ParquetFileWriter().WriteAsync(
+                buffer, physicalSchema, new[] { batch }, CancellationToken.None);
+            parquetBytes = buffer.ToArray();
+        }
+
+        const string relativePath = "foreign-idmode.parquet";
         using var backend = new LocalFileSystemBackend(_root);
+        await backend.PutIfAbsentAsync(relativePath, parquetBytes, CancellationToken.None);
+
+        // Logical id/score/name with ids 1/2/3 and physicalNames col-A/col-B/col-C — names that do NOT match
+        // the Parquet z0/z1/z2, so a name-based read cannot resolve them; only field_id works.
+        const string schemaJson =
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
+            + "{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-A\"}},"
+            + "{\"name\":\"score\",\"type\":\"long\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"col-B\"}},"
+            + "{\"name\":\"name\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":3,\"delta.columnMapping.physicalName\":\"col-C\"}}]}";
+        string escapedSchema = System.Text.Json.JsonSerializer.Serialize(schemaJson);
+
+        // reader v3 / writer v7 declaring BOTH columnMapping AND deletionVectors; configuration enables id
+        // mode + deletion vectors so DeltaDelete passes DeletionVectorsFeature.EnsureWriteEnabled.
         const string protocol =
             "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,"
             + "\"readerFeatures\":[\"columnMapping\",\"deletionVectors\"],"
             + "\"writerFeatures\":[\"columnMapping\",\"deletionVectors\"]}}";
-        const string emptySchema = "{\\\"type\\\":\\\"struct\\\",\\\"fields\\\":[]}";
-        const string metadata =
+        string metadata =
             "{\"metaData\":{\"id\":\"t\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
-            + "\"schemaString\":\"" + emptySchema + "\",\"partitionColumns\":[],"
-            + "\"configuration\":{\"delta.columnMapping.mode\":\"id\",\"delta.columnMapping.maxColumnId\":\"3\","
+            + "\"schemaString\":" + escapedSchema + ",\"partitionColumns\":[],\"configuration\":{"
+            + "\"delta.columnMapping.mode\":\"id\",\"delta.columnMapping.maxColumnId\":\"3\","
             + "\"delta.enableDeletionVectors\":\"true\"}}}";
-        byte[] content = Encoding.UTF8.GetBytes(protocol + "\n" + metadata + "\n");
-        await backend.PutIfAbsentAsync(
-            "_delta_log/00000000000000000000.json", content, CancellationToken.None);
+        string addLine =
+            $"{{\"add\":{{\"path\":\"{relativePath}\",\"partitionValues\":{{}},"
+            + $"\"size\":{parquetBytes.Length},\"modificationTime\":0,\"dataChange\":true}}}}";
+
+        byte[] commit = Encoding.UTF8.GetBytes(protocol + "\n" + metadata + "\n" + addLine + "\n");
+        await backend.PutIfAbsentAsync("_delta_log/00000000000000000000.json", commit, CancellationToken.None);
     }
 
-    // A column-mapped, DV-enabled snapshot constructed DIRECTLY (not via DeltaLog.LoadSnapshotAsync), so it
-    // deliberately BYPASSES the snapshot-load path (ColumnMapping.EnsureModeGate). For id mode the load gate
-    // now PERMITS the table (id is readable since #523), so DeltaDelete's OWN write guard is the primary
-    // refusal; this seam pins that guard directly. No data files are needed — the DELETE fails closed before
-    // any file is scanned.
-    private static Snapshot BuildUngatedColumnMappingSnapshot(string mode, string schemaString)
-    {
-        var protocol = new ProtocolAction(
-            3, 7,
-            ImmutableArray.Create("columnMapping", "deletionVectors"),
-            ImmutableArray.Create("columnMapping", "deletionVectors"));
-        ImmutableSortedDictionary<string, string> configuration = ImmutableSortedDictionary<string, string>.Empty
-            .Add("delta.columnMapping.mode", mode)
-            .Add("delta.columnMapping.maxColumnId", "8")
-            .Add("delta.enableDeletionVectors", "true");
-        var metadata = new MetadataAction(
-            Id: "ungated-colmap",
-            Name: null,
-            Description: null,
-            Format: new TableFormat("parquet", ImmutableSortedDictionary<string, string>.Empty),
-            SchemaString: schemaString,
-            PartitionColumns: ImmutableArray<string>.Empty,
-            Configuration: configuration,
-            CreatedTime: null);
-        return new Snapshot(
-            version: 0,
-            protocol,
-            metadata,
-            ImmutableArray<AddFileAction>.Empty,
-            ImmutableArray<RemoveFileAction>.Empty,
-            ImmutableSortedDictionary<string, long>.Empty,
-            SnapshotLoadMetrics.Empty);
-    }
+    // A physical StructField carrying a delta.columnMapping.id (as a long MetadataValue) — the shape the
+    // id-mode writer stamps into the Parquet field_id, used to author a foreign id-mode data file by hand.
+    private static StructField PhysFieldWithId(string name, DataType type, bool nullable, long id) =>
+        new(name, type, nullable, FieldMetadata.FromValues(new[]
+        {
+            new KeyValuePair<string, MetadataValue>(ColumnMapping.IdKey, MetadataValue.Long(id)),
+        }));
 
     // A leaf field carrying valid name-mode column-mapping metadata (delta.columnMapping.physicalName), so
     // ColumnMapping.PhysicalName(field, Name) resolves it without throwing — used to isolate the nested-type

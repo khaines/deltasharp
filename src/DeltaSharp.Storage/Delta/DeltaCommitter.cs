@@ -5,6 +5,7 @@ using System.Security.Cryptography;
 using DeltaSharp.Diagnostics;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Diagnostics;
+using DeltaSharp.Types;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -166,23 +167,16 @@ internal sealed class DeltaCommitter
             throw new ArgumentException("A commit must contain at least one action.", nameof(actions));
         }
 
-        // Column-mapping id-mode WRITE gate (#523). This build READS id-mode tables (columns resolved by the
-        // Parquet field_id) but must NEVER write one. Enforce it HERE — the single choke point every commit
-        // funnels through — rather than only per-operation, so no commit path (append / overwrite / empty-
-        // static-overwrite TRUNCATE / delete / protocol-metadata upgrade, current or future) can bypass it.
-        // Two-sided: reject id mode on (a) the read snapshot (writing INTO an existing id-mode table) and
-        // (b) any committed metaData action (AUTHORING an id-mode table via a none/name -> id transition) —
-        // (b) would otherwise slip past (a), whose snapshot is still none/name. DeltaSharp only ever creates
-        // name/none tables, so a legitimate commit is never id mode; this fail-closes a hypothetical future
-        // path. Per-operation EnsureWriteSupported calls remain for earlier, operation-specific error locality.
-        ColumnMapping.EnsureWriteSupported(ColumnMapping.ResolveMode(readSnapshot.Metadata.Configuration));
-        foreach (DeltaAction action in actions)
-        {
-            if (action is MetadataAction metadataAction)
-            {
-                ColumnMapping.EnsureWriteSupported(ColumnMapping.ResolveMode(metadataAction.Configuration));
-            }
-        }
+        // Column mapping (#523 read / #572 write): all three modes (none/name/id) are now writable through
+        // this commit choke point. id-mode DATA columns resolve by the Parquet field_id — the write door
+        // stages the physical Parquet with the field_id stamped and commits the id-mode metaData/protocol
+        // exactly like name mode (ColumnMapping.ToPhysicalSchema / MapWriteSchemaToPhysical carry the id).
+        // The committer does NOT refuse id outright; the fail-closed invariants that remain (nested top-level
+        // columns, OPTIMIZE on a column-mapped table, DELETE without deletion-vector support) are enforced by
+        // their own dedicated guards. The ONE column-mapping invariant the committer itself asserts (in
+        // CommitCoreAsync) is that a committed metaData may not CHANGE an EXISTING table's column-mapping mode
+        // — a mode transition is sanctioned only on a fresh create — defense-in-depth behind the write door's
+        // TableExistsAsync guard.
 
         // A BlindAppend read scope registers no read set, so it performs no data-conflict detection; a
         // commit that *removes* files (a delete/overwrite) must therefore use WholeTable or ReadFiles so a
@@ -272,6 +266,107 @@ internal sealed class DeltaCommitter
                 ProtocolSupport.EnsureWritable(committedProtocol);
                 ProtocolSupport.EnsureReadable(committedProtocol);
             }
+        }
+
+        // #572 defense-in-depth: enabling or changing a table's column-mapping mode is sanctioned ONLY on a
+        // FRESH create — the write door commits the initial mode against the synthetic empty snapshot
+        // (version -1). On an EXISTING table (version >= 0) a committed metaData must NOT change the read
+        // snapshot's column-mapping mode. The write door already refuses this (DeltaWriteTarget.TableExistsAsync
+        // rejects enabling column mapping on an existing table); this committer-level assertion is the
+        // lower-level safety net that preserves the removed id-write gate's protection WITHOUT refusing a
+        // legitimate id-mode write — an append/overwrite/rename metaData preserves the mode key, so only an
+        // actual mode TRANSITION on an existing table trips this guard, before any bytes are published.
+        if (readSnapshot.Version >= 0)
+        {
+            ColumnMappingMode currentMode = ColumnMapping.ResolveMode(readSnapshot.Metadata.Configuration);
+            foreach (DeltaAction action in actions)
+            {
+                if (action is not MetadataAction committedMetadata)
+                {
+                    continue;
+                }
+
+                ColumnMappingMode committedMode = ColumnMapping.ResolveMode(committedMetadata.Configuration);
+                if (committedMode != currentMode)
+                {
+                    throw DeltaProtocolException.Unsupported(
+                        $"A committed metaData changes the table's column-mapping mode from "
+                        + $"'{ModeLabel(currentMode)}' to '{ModeLabel(committedMode)}' on an existing table. "
+                        + "Enabling or changing column mapping on an existing table is unsupported in this "
+                        + "build and fails closed; column mapping can only be enabled on a fresh table "
+                        + "(first write).");
+                }
+            }
+
+            static string ModeLabel(ColumnMappingMode mode) => mode switch
+            {
+                ColumnMappingMode.Name => "name",
+                ColumnMappingMode.Id => "id",
+                _ => "none",
+            };
+        }
+
+        // #572 / deltaspec N3 defense-in-depth (completes the B3 committer hardening): a committed metaData
+        // must be validated for the SAME schema invariants the snapshot-load choke point enforces, BEFORE its
+        // bytes are published (fail-closed at COMMIT, table unchanged, no version advanced — not silently
+        // committed to surface only on the NEXT load). The invariants, run for BOTH the sanctioned
+        // fresh-create (version -1) AND existing tables:
+        //   (1) ALL modes (none/name/id) — every logical partitionColumns entry names a column present in the
+        //       committed schema (deltaspec N3/R4 finding #3); and
+        //   (1b) none mode only — every LOGICAL partition column name is a safe path segment (char + length),
+        //       because with no physical mapping the logical name IS the partition-directory path segment
+        //       (deltaspec R7; name/id physical segments are covered by (2)); and
+        //   (2) mapped modes (name/id) only — the mapping is internally consistent
+        //       (ColumnMapping.ValidateColumnMappingSchema at DeltaLog.LoadSnapshotAsync): every field a LEAF
+        //       carrying a UNIQUE id in [1, int.MaxValue] and <= maxColumnId, with globally-unique physicalNames
+        //       that are safe path segments (char + length); a malformed mapped metaData (duplicate/missing/
+        //       out-of-range id, duplicate or unsafe physicalName, a nested mapped column, or an unparseable/
+        //       non-struct schema) fails closed here.
+        // The public write doors always construct a consistent, in-schema mapping, but the committer is a
+        // lower-level primitive (the central id-write gate is gone). Only metaData-bearing commits reach the
+        // body — a plain append/delete carries no metaData, so the hot path never parses a schema. O(columns).
+        foreach (DeltaAction action in actions)
+        {
+            if (action is not MetadataAction committedMetadata)
+            {
+                continue;
+            }
+
+            // Parse the committed schema once; both checks below validate against it (logical field names).
+            StructType committedSchema = ParseCommittedSchema(committedMetadata);
+
+            // (0) all-mode case-insensitive column-name uniqueness: DeltaSharp stores names case-sensitively,
+            // but a strict reader that resolves names case-insensitively (Spark's default) rejects a schema with
+            // e.g. `region` AND `REGION` (COLUMN_ALREADY_EXISTS). Enforced at the committer for every mode so no
+            // NEW case-colliding table is published; complements the evolution path's identical guard.
+            ColumnMapping.EnsureNoCaseInsensitiveDuplicateColumns(committedSchema);
+
+            // (0b) all-mode: a committed `delta.appendOnly` value must be a valid boolean. AppendOnlyFeature
+            // .IsEnabled throws Malformed on a non-boolean; validating the COMMITTED config here fails a
+            // malformed value closed at commit rather than at a later overwrite (which parses it via the same
+            // path and would otherwise be the first — surprising — point of failure).
+            _ = AppendOnlyFeature.IsEnabled(committedMetadata.Configuration);
+
+            // (1) all-mode partition existence: partitionColumns store LOGICAL names, compared against the
+            // logical StructType field names (never physical). Enforced at the committer (not at snapshot
+            // load — a load-side check is too broad for the stub-schema log/checkpoint fixture corpus), so no
+            // NEW bad-partition metaData is published; fails closed before publish, table unchanged.
+            ColumnMapping.EnsurePartitionColumnsInSchema(committedSchema, committedMetadata.PartitionColumns);
+
+            // (2) mapped-mode column-mapping consistency (none mode is a no-op for the mapping validator).
+            ColumnMappingMode committedMode = ColumnMapping.ResolveMode(committedMetadata.Configuration);
+            if (committedMode == ColumnMappingMode.None)
+            {
+                // none mode has no physical mapping, so the LOGICAL partition column names ARE the
+                // partition-directory path segments — validate their path-safety here (#572 deltaspec R7). In
+                // name/id mode the segment is the mapped physical name, validated by ValidateColumnMappingSchema
+                // below, and the logical name is decoupled from the path.
+                ColumnMapping.EnsureNoneModePartitionNamesSafe(committedMetadata.PartitionColumns);
+                continue;
+            }
+
+            ColumnMapping.ValidateColumnMappingSchema(
+                committedMode, committedSchema, committedMetadata.Configuration);
         }
 
         // Idempotency via txn (§2.11.4): if this commit records application transactions whose versions the
@@ -492,6 +587,33 @@ internal sealed class DeltaCommitter
                 activity.SetStatus(ActivityStatusCode.Error);
             }
         }
+    }
+
+    // Parses a committed metaData's schemaString into the StructType the column-mapping schema validator needs
+    // (#572 / N3), mirroring how the load path materializes snapshot.Schema (Snapshot.ParseSchema via
+    // SchemaJson.FromJson). A malformed/non-struct schemaString on a mapped-mode commit is itself an
+    // inconsistent metaData — surfaced as the same fail-closed DeltaProtocolException the load path raises, so
+    // it is refused at commit time rather than published and only rejected on the next load.
+    private static StructType ParseCommittedSchema(MetadataAction metadata)
+    {
+        DataType parsed;
+        try
+        {
+            parsed = SchemaJson.FromJson(metadata.SchemaString);
+        }
+        catch (SchemaValidationException ex)
+        {
+            throw DeltaProtocolException.Inconsistent(
+                "A committed metaData carrying a column-mapping mode has an unparseable schemaString.", ex);
+        }
+
+        if (parsed is not StructType structType)
+        {
+            throw DeltaProtocolException.Inconsistent(
+                "A committed metaData carrying a column-mapping mode has a schemaString that is not a struct.");
+        }
+
+        return structType;
     }
 
     /// <summary>Reads the actions of every commit over <c>(afterExclusive, M]</c> — the winners since the
