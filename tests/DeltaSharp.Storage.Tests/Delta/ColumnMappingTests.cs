@@ -526,6 +526,36 @@ public sealed class ColumnMappingTests : IDisposable
             rows.OrderBy(r => r.Id).ToList());
     }
 
+    // #572 blocking finding 2 (write-path constraint enforcement): the id-mode create seam is a NEW write
+    // path, so — exactly like the name-mode / DV create seams (#581) — it must NOT be a per-row-constraint
+    // enforcement bypass. A fresh id-mode create whose schema declares a column invariant, with no enforcer
+    // wired, is refused fail-closed (RejectUnenforceableCreate) rather than committing unvalidated rows.
+    [Fact]
+    public async Task IdMode_CreateWithColumnInvariant_NoEnforcer_RefusedFailClosed()
+    {
+        var constrained = new StructType(new[]
+        {
+            new StructField("id", DataTypes.LongType, nullable: false),
+            new StructField(
+                "score", DataTypes.LongType, nullable: true,
+                FieldMetadata.FromEntries(new[]
+                {
+                    new KeyValuePair<string, string>("delta.invariants", "{\"expression\":{\"expression\":\"score > 0\"}}"),
+                })),
+            new StructField("name", DataTypes.StringType, nullable: true),
+        });
+
+        using DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), FileNames());
+        await Assert.ThrowsAsync<InvalidOperationException>(() => target.CreateIdMappedTableAsync(
+            constrained, Array.Empty<string>(),
+            new[] { FlatBatch(new[] { (1L, 100L, (string?)"alice") }) },
+            new SeededPhysicalNameSource(Seed)));
+
+        // Refused before staging: no version-0 commit was written.
+        Assert.False(File.Exists(Path.Combine(_root, "_delta_log", "00000000000000000000.json")));
+    }
+
     // The id-mode sibling of NameMode_Overwrite_ReadsBackNewRows (#572): OVERWRITE (Static) an existing
     // id-mode table replaces its rows; the new file carries PHYSICAL names + stamped field_ids and read-back
     // returns only the new rows.
