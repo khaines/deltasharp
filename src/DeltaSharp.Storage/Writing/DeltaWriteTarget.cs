@@ -169,6 +169,12 @@ public sealed class DeltaWriteTarget : IDisposable
     /// constraints (<c>delta.constraints.*</c> config) survive the replacement and MUST still be enforced
     /// (Delta parity — the committed <c>metaData</c> keeps them), but the OLD schema's field invariants are
     /// replaced wholesale by the incoming <paramref name="writeSchema"/>'s, so only the latter apply.</param>
+    /// <param name="resolveConstraintsWhenEmpty">Whether to run the enforcer's <b>resolvability</b> pass even
+    /// when the write carries no rows. <see langword="false"/> (default) keeps an empty write a benign no-op.
+    /// <see langword="true"/> is set on the <c>overwriteSchema</c>-replace path (#601): that path commits its
+    /// new schema even at zero rows, so a surviving named CHECK that the replacement leaves referencing a
+    /// dropped column must still be validated (a schema-metadata check over the constraint set, independent of
+    /// row count) rather than skipped — otherwise the write would brick the table with a dangling CHECK.</param>
     /// <exception cref="DeltaProtocolException">A constraint is malformed, empty, or a nested-field invariant.</exception>
     /// <exception cref="InvalidOperationException">The write has active constraints but no
     /// <paramref name="enforcer"/> was provided — refused fail-closed.</exception>

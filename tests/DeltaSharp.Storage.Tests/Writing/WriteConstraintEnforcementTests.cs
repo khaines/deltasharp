@@ -294,6 +294,45 @@ public sealed class WriteConstraintEnforcementTests : IDisposable
     }
 
     [Fact]
+    public async Task Overwrite_OverwriteSchema_ZeroRows_StillInvokesEnforcerResolvability()
+    {
+        // #601: a 0-row overwriteSchema still replaces the schema and commits, so the resolvability pass MUST
+        // run (resolveConstraintsWhenEmpty) — the enforcer is invoked with the surviving CHECK even with NO
+        // batches, instead of the empty-write short-circuit skipping it (which would brick a dropped column).
+        await SeedTableAsync(IdSchema, ("delta.constraints.positive_id", "id > 0"));
+        var enforcer = new RecordingEnforcer();
+
+        using DeltaWriteTarget target = Target();
+        await target.OverwriteAsync(
+            IdSchema, Array.Empty<string>(), Array.Empty<ColumnBatch>(),
+            DeltaPartitionOverwriteMode.Static, overwriteSchema: true, enforcer: enforcer);
+
+        Assert.Equal(1, enforcer.Calls); // enforcer reached despite zero rows (short-circuit bypassed)
+        Assert.Contains(enforcer.Constraints!, c => c.Kind == DeltaConstraintKind.Check && c.Name == "positive_id");
+        Assert.Empty(enforcer.Batches!); // ...with the empty batch set — Phase-2 row eval is a no-op
+    }
+
+    [Fact]
+    public async Task Overwrite_OverwriteSchema_ZeroRows_EnforcerRejection_RefusedFailClosed_NoCommit()
+    {
+        // #601: the enforcer is genuinely REACHED at zero rows on the schema-replace path — a rejection there
+        // (a resolvability failure in practice) refuses the write fail-closed with no commit; the table stays
+        // at its seed version, not advanced by a dangling-schema replacement.
+        await SeedTableAsync(IdSchema, ("delta.constraints.positive_id", "id > 0"));
+        var enforcer = new RecordingEnforcer(reject: true);
+
+        using DeltaWriteTarget target = Target();
+        await Assert.ThrowsAsync<DeltaConstraintViolationException>(
+            () => target.OverwriteAsync(
+                IdSchema, Array.Empty<string>(), Array.Empty<ColumnBatch>(),
+                DeltaPartitionOverwriteMode.Static, overwriteSchema: true, enforcer: enforcer));
+
+        Assert.Equal(1, enforcer.Calls); // reached the enforcer at zero rows
+        Snapshot after = await SnapshotAsync();
+        Assert.Equal(0L, after.Version); // still at the seed commit — the overwrite was refused before commit
+    }
+
+    [Fact]
     public async Task Overwrite_Dynamic_ConstrainedTable_WithEnforcer_InvokedWithSnapshotConstraints()
     {
         // A dynamic partition overwrite keeps the schema + constraints; the enforcer must see the surviving
