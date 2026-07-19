@@ -169,33 +169,29 @@ public sealed class DeltaTableConstraintsTests : System.IDisposable
     }
 
     [Fact]
-    public void CollectForWrite_ArrayElementStructFieldInvariant_FailsClosed()
+    public void CollectForWrite_ArrayElementStructFieldInvariant_IsIgnored_DeltaParity()
     {
-        // #595/#606: an invariant reached THROUGH an array (an array-element struct field) needs per-element
-        // enforcement not yet available, so it is refused fail-closed (never silently unenforced).
+        // #606 (Delta parity): an invariant reached THROUGH an array (an array-element struct field) is IGNORED
+        // — Delta's Invariants.getFromSchema uses filterRecursively(checkComplexTypes=false), which never
+        // descends into an array element, so the invariant is never collected/enforced (no throw, no constraint).
         var element = new StructType(new[] { InvariantField("f", IntegerType.Instance, "f > 0") });
         var schema = new StructType(new[] { new StructField("arr", new ArrayType(element), nullable: true) });
 
-        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
-            () => DeltaTableConstraints.CollectForWrite(snapshot: null, schema));
-        Assert.Contains("#606", ex.Message, System.StringComparison.Ordinal);
-        Assert.Contains("arr.element.f", ex.Message, System.StringComparison.Ordinal);
+        Assert.Empty(DeltaTableConstraints.CollectForWrite(snapshot: null, schema));
     }
 
     [Fact]
-    public void CollectForWrite_MapValueStructFieldInvariant_FailsClosed()
+    public void CollectForWrite_MapValueStructFieldInvariant_IsIgnored_DeltaParity()
     {
-        // #595/#606: an invariant reached THROUGH a map value (a map-value struct field) is refused fail-closed.
+        // #606 (Delta parity): an invariant reached THROUGH a map value (or key) is IGNORED — checkComplexTypes
+        // = false does not descend into a map key/value.
         var valueStruct = new StructType(new[] { InvariantField("f", IntegerType.Instance, "f > 0") });
         var schema = new StructType(new[]
         {
             new StructField("m", new MapType(IntegerType.Instance, valueStruct), nullable: true),
         });
 
-        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
-            () => DeltaTableConstraints.CollectForWrite(snapshot: null, schema));
-        Assert.Contains("#606", ex.Message, System.StringComparison.Ordinal);
-        Assert.Contains("m.value.f", ex.Message, System.StringComparison.Ordinal);
+        Assert.Empty(DeltaTableConstraints.CollectForWrite(snapshot: null, schema));
     }
 
     [Fact]
@@ -218,20 +214,34 @@ public sealed class DeltaTableConstraintsTests : System.IDisposable
     }
 
     [Fact]
-    public void CollectForWrite_ArrayInArrayStructFieldInvariant_FailsClosed()
+    public void CollectForWrite_StructPathCollected_ButArrayPathIgnored_InSameSchema()
     {
-        // #595/#606 (council: Quality): the insideCollection flag must LATCH across multiple collection hops —
-        // an invariant inside array<array<struct{f}>> is refused fail-closed with the full path.
+        // #606: within one schema, an all-struct-path invariant (s.f) is collected while a sibling array-element
+        // invariant (arr.element.g) is ignored — Delta descends structs only.
+        var inner = new StructType(new[] { InvariantField("f", IntegerType.Instance, "s.f > 0") });
+        var element = new StructType(new[] { InvariantField("g", IntegerType.Instance, "g > 0") });
+        var schema = new StructType(new[]
+        {
+            new StructField("s", inner, nullable: true),
+            new StructField("arr", new ArrayType(element), nullable: true),
+        });
+
+        DeltaTableConstraint only = Assert.Single(DeltaTableConstraints.CollectForWrite(snapshot: null, schema));
+        Assert.Equal("s.f", only.Name);
+    }
+
+    [Fact]
+    public void CollectForWrite_ArrayInArrayStructFieldInvariant_IsIgnored_DeltaParity()
+    {
+        // #606 (Delta parity): an invariant inside array<array<struct{f}>> is IGNORED across every collection
+        // hop — checkComplexTypes=false stops at the first collection and never descends.
         var element = new StructType(new[] { InvariantField("f", IntegerType.Instance, "f > 0") });
         var schema = new StructType(new[]
         {
             new StructField("arr", new ArrayType(new ArrayType(element)), nullable: true),
         });
 
-        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
-            () => DeltaTableConstraints.CollectForWrite(snapshot: null, schema));
-        Assert.Contains("#606", ex.Message, System.StringComparison.Ordinal);
-        Assert.Contains("arr.element.element.f", ex.Message, System.StringComparison.Ordinal);
+        Assert.Empty(DeltaTableConstraints.CollectForWrite(snapshot: null, schema));
     }
 
     private Snapshot SnapshotWithCheck(string value)
