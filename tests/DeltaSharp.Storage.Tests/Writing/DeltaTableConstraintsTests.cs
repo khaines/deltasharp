@@ -126,27 +126,76 @@ public sealed class DeltaTableConstraintsTests : System.IDisposable
             SnapshotWithCheck(""), schema));
     }
 
-    [Fact]
-    public async Task Collect_NestedFieldInvariant_FailsClosed()
-    {
-        // An invariant attached to a NESTED (struct) field is rejected fail-closed (#595) rather than silently
-        // unenforced — a nested-field invariant per-row evaluator is not wired yet.
-        var inner = new StructType(new[]
+    // Builds a StructField carrying a delta.invariants column invariant with the given persisted expression.
+    private static StructField InvariantField(string name, DataType type, string sql) => new(
+        name, type, nullable: true,
+        FieldMetadata.FromEntries(new[]
         {
-            new StructField(
-                "f", IntegerType.Instance, nullable: true,
-                FieldMetadata.FromEntries(new[] { new System.Collections.Generic.KeyValuePair<string, string>(
-                    "delta.invariants", "{\"expression\":{\"expression\":\"f > 0\"}}") })),
-        });
+            new System.Collections.Generic.KeyValuePair<string, string>(
+                "delta.invariants", "{\"expression\":{\"expression\":\"" + sql + "\"}}"),
+        }));
+
+    [Fact]
+    public void CollectForWrite_NestedStructFieldInvariant_IsCollectedWithQualifiedPath()
+    {
+        // #595: an invariant on a struct field reached by an ALL-STRUCT path (`s.f`) is now COLLECTED (not
+        // rejected) with its fully-qualified path as the name; the predicate references that path and enforces
+        // via GetStructField (#580/#589). The collector keeps the raw expression — an enforceable invariant
+        // references the qualified path, matching Spark's data-schema resolution.
+        var inner = new StructType(new[] { InvariantField("f", IntegerType.Instance, "s.f > 0") });
         var schema = new StructType(new[]
         {
             new StructField("id", IntegerType.Instance, nullable: false),
             new StructField("s", inner, nullable: true),
         });
-        Snapshot snapshot = await WriteAndLoadAsync(schema);
 
-        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() => DeltaTableConstraints.Collect(snapshot));
-        Assert.Contains("#595", ex.Message, System.StringComparison.Ordinal);
+        DeltaTableConstraint constraint = Assert.Single(DeltaTableConstraints.CollectForWrite(snapshot: null, schema));
+        Assert.Equal(DeltaConstraintKind.Invariant, constraint.Kind);
+        Assert.Equal("s.f", constraint.Name);
+        Assert.Equal("s.f > 0", constraint.Expression);
+    }
+
+    [Fact]
+    public void CollectForWrite_DeeplyNestedStructFieldInvariant_IsCollected()
+    {
+        // #595: an all-struct path of arbitrary depth (`s.a.b`) is collected with its full path.
+        var b = new StructType(new[] { InvariantField("b", IntegerType.Instance, "s.a.b > 0") });
+        var a = new StructType(new[] { new StructField("a", b, nullable: true) });
+        var schema = new StructType(new[] { new StructField("s", a, nullable: true) });
+
+        DeltaTableConstraint constraint = Assert.Single(DeltaTableConstraints.CollectForWrite(snapshot: null, schema));
+        Assert.Equal("s.a.b", constraint.Name);
+        Assert.Equal("s.a.b > 0", constraint.Expression);
+    }
+
+    [Fact]
+    public void CollectForWrite_ArrayElementStructFieldInvariant_FailsClosed()
+    {
+        // #595/#606: an invariant reached THROUGH an array (an array-element struct field) needs per-element
+        // enforcement not yet available, so it is refused fail-closed (never silently unenforced).
+        var element = new StructType(new[] { InvariantField("f", IntegerType.Instance, "f > 0") });
+        var schema = new StructType(new[] { new StructField("arr", new ArrayType(element), nullable: true) });
+
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
+            () => DeltaTableConstraints.CollectForWrite(snapshot: null, schema));
+        Assert.Contains("#606", ex.Message, System.StringComparison.Ordinal);
+        Assert.Contains("arr.element.f", ex.Message, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void CollectForWrite_MapValueStructFieldInvariant_FailsClosed()
+    {
+        // #595/#606: an invariant reached THROUGH a map value (a map-value struct field) is refused fail-closed.
+        var valueStruct = new StructType(new[] { InvariantField("f", IntegerType.Instance, "f > 0") });
+        var schema = new StructType(new[]
+        {
+            new StructField("m", new MapType(IntegerType.Instance, valueStruct), nullable: true),
+        });
+
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
+            () => DeltaTableConstraints.CollectForWrite(snapshot: null, schema));
+        Assert.Contains("#606", ex.Message, System.StringComparison.Ordinal);
+        Assert.Contains("m.value.f", ex.Message, System.StringComparison.Ordinal);
     }
 
     private Snapshot SnapshotWithCheck(string value)
