@@ -152,6 +152,33 @@ public sealed class DataFrameBoundaryActionTests
     }
 
     [Fact]
+    public void Collect_DefaultSession_ThreadsAnsiMode()
+    {
+        // #603: unset spark.sql.ansi.enabled defaults to ANSI (the DeltaSharp default).
+        var executor = new FakeQueryExecutor(Array.Empty<Row>());
+        (SparkSession spark, DataFrame df) = NewBoundFrame(executor);
+        using (spark)
+        {
+            _ = df.Collect();
+            Assert.Equal(AnsiMode.Ansi, executor.LastOptions!.AnsiMode);
+        }
+    }
+
+    [Fact]
+    public void Collect_ThreadsLegacyAnsiModeFromSessionConfig()
+    {
+        // #603: spark.sql.ansi.enabled=false threads AnsiMode.Legacy into the executor's per-action options.
+        var executor = new FakeQueryExecutor(Array.Empty<Row>());
+        (SparkSession spark, DataFrame df) = NewBoundFrame(executor);
+        using (spark)
+        {
+            spark.Conf.Set("spark.sql.ansi.enabled", false);
+            _ = df.Collect();
+            Assert.Equal(AnsiMode.Legacy, executor.LastOptions!.AnsiMode);
+        }
+    }
+
+    [Fact]
     public void Collect_WithNonNumericBoundConfig_ThrowsBeforeExecution()
     {
         var executor = new FakeQueryExecutor(Array.Empty<Row>());
