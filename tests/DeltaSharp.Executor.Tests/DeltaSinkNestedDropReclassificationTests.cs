@@ -69,18 +69,38 @@ public sealed class DeltaSinkNestedDropReclassificationTests
     public void EnforceCore_MultipleChecksOnDroppedNestedField_AggregatedUnderTopLevelColumn()
     {
         // Multiple surviving CHECKs reading the dropped nested field `s.f` aggregate under the ONE top-level
-        // column `s` (mirroring Delta's foundViolatingConstraintsForColumnChange), listed in CollectForWrite's
-        // deterministic name order — proving the `s.f` → `s` normalisation feeds the per-column aggregation.
+        // column `s` (mirroring Delta's foundViolatingConstraintsForColumnChange). EnforceCore's Phase-1
+        // aggregation APPENDS in iteration order, so the reported list preserves the INPUT order it is handed —
+        // proven here by supplying them in non-alphabetical order (`sf_pos` before `sf_cap`) and getting that
+        // SAME order back (not re-sorted). Upstream, CollectForWrite supplies the set in deterministic
+        // Kind-then-name order; this test pins the aggregation's order-preservation, decoupled from that source.
         var survivingStruct = new StructType(new[] { new StructField("g", IntegerType.Instance, nullable: false) });
         var schema = new StructType(new[] { new StructField("s", survivingStruct, nullable: true) });
 
         var ex = Assert.Throws<DeltaConstraintDependentColumnException>(
             () => DeltaLocalSink.EnforceCore(
                 schema,
-                Checks(("sf_cap", "s.f < 100"), ("sf_pos", "s.f > 0")),
+                Checks(("sf_pos", "s.f > 0"), ("sf_cap", "s.f < 100")),
                 NoBatches, AnsiMode.Ansi, memoryBudgetBytes: null));
         Assert.Equal("s", ex.ColumnName);
-        Assert.Equal(new[] { "sf_cap", "sf_pos" }, ex.Constraints.Select(c => c.Name).ToArray());
+        Assert.Equal(new[] { "sf_pos", "sf_cap" }, ex.Constraints.Select(c => c.Name).ToArray());
+    }
+
+    [Fact]
+    public void EnforceCore_NestedBaseColumnCompletelyDropped_ReclassifiedAsDependentColumnChange()
+    {
+        // The base struct column `s` was dropped ENTIRELY (the write schema has neither `s` nor a top-level
+        // `f`), so the nested reference `s.f` binds NO base column and the analyzer's trailing-part fallback
+        // throws UnresolvedColumn (naming the full path `s.f`) — the pre-#600 kind the reclassifier already
+        // caught. Pinned here so BOTH the fully-dropped-base path (UnresolvedColumn) and the surviving-struct
+        // path (#600's UnresolvedStructField) are proven to normalise `s.f` → top-level `s` for the parity error.
+        var schema = new StructType(new[] { new StructField("other", IntegerType.Instance, nullable: false) });
+
+        var ex = Assert.Throws<DeltaConstraintDependentColumnException>(
+            () => DeltaLocalSink.EnforceCore(
+                schema, Checks(("chk_sf", "s.f > 0")), NoBatches, AnsiMode.Ansi, memoryBudgetBytes: null));
+        Assert.Equal("s", ex.ColumnName);
+        Assert.Equal("chk_sf", Assert.Single(ex.Constraints).Name);
     }
 
     [Fact]

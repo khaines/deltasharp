@@ -53,8 +53,14 @@ internal enum AnalysisErrorKind
 
     /// <summary>A nested field reference (a struct-field access such as <c>s.f</c>) could not be resolved
     /// because the base is not a struct or the struct has no such field — a <b>structural</b> absence (the
-    /// field was dropped/renamed, or the base column was retyped away from a struct), distinct from a general
-    /// <see cref="DataTypeMismatch"/> in a predicate's operands. Carries the full nested reference (e.g.
+    /// field was dropped/renamed, or the base column was retyped away from a struct). This coalesces Spark's
+    /// two <i>distinct</i> field-extraction error classes — <c>INVALID_EXTRACT_BASE_FIELD_TYPE</c> ("need a
+    /// complex type") for a non-struct base, and <c>FIELD_NOT_FOUND</c> for a missing field — <b>both</b> of
+    /// which Spark keeps SEPARATE from the operand-level <c>DATATYPE_MISMATCH</c>. DeltaSharp's flat taxonomy
+    /// coarsens the two into one kind while preserving that separation: it stays distinct from
+    /// <see cref="DataTypeMismatch"/> (a predicate-operand type error, e.g. <c>id &gt; 0</c> after a top-level
+    /// int→string retype) and from the AMBIGUOUS struct-field case (which stays <see cref="DataTypeMismatch"/> —
+    /// there the field exists, the path is merely under-specified). Carries the full nested reference (e.g.
     /// <c>s.f</c>) in <see cref="AnalysisException.Reference"/> so a caller can attribute the failure to the
     /// top-level column (#600).</summary>
     UnresolvedStructField,

@@ -87,6 +87,27 @@ public sealed class GetStructFieldResolutionTests
     }
 
     [Fact]
+    public void MultipartRef_AmbiguousStructField_StaysDataTypeMismatch()
+    {
+        // #600 GUARD (taxonomy boundary): a struct with two case-insensitively-equal fields (`f`, `F`) makes
+        // `s.f` AMBIGUOUS — the path DOES resolve to a struct and the field DOES exist (twice), so this is a
+        // genuine under-specified reference, NOT a structural absence. It must stay DataTypeMismatch (never
+        // UnresolvedStructField), so the survivor-CHECK reclassifier does NOT treat it as a dropped dependency.
+        // Locks in the asymmetry vs the non-struct-base / no-such-field cases the #600 split newly reclassifies.
+        var ambiguousStruct = new StructType(new[]
+        {
+            new StructField("f", IntegerType.Instance, nullable: true),
+            new StructField("F", IntegerType.Instance, nullable: true),
+        });
+        var schema = new StructType(new[] { new StructField("s", ambiguousStruct, nullable: true) });
+
+        var ex = Assert.Throws<AnalysisException>(() => ResolveCondition(
+            schema,
+            new BinaryComparison(Ref("s", "f"), Literal.OfInt(0), ComparisonOperator.GreaterThan)));
+        Assert.Equal(AnalysisErrorKind.DataTypeMismatch, ex.Kind);
+    }
+
+    [Fact]
     public void MultipartRef_NonColumnLeadingPart_FallsBackToTrailingPartBinding()
     {
         // `qualifier.id` where `qualifier` is not a column → M1 qualifier fallback binds the trailing `id`.

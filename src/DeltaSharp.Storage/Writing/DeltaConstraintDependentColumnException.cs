@@ -4,8 +4,9 @@ namespace DeltaSharp.Storage;
 
 /// <summary>
 /// Thrown by the Delta write seam (#598) when an <c>overwriteSchema</c> replacement (or a future
-/// <c>ALTER</c>) DROPS or RENAMES a column that one or more SURVIVING <c>delta.constraints.*</c> CHECK
-/// constraints still reference. The surviving predicate(s) can no longer resolve against the replacement
+/// <c>ALTER</c>) DROPS, RENAMES, or RETYPES a column (including retyping a struct column so a surviving CHECK
+/// can no longer read one of its nested fields, #600) that one or more SURVIVING <c>delta.constraints.*</c>
+/// CHECK constraints still reference. The surviving predicate(s) can no longer resolve against the replacement
 /// schema, so — rather than let the write fail with a raw "cannot resolve column" resolution error, or
 /// (worse) commit a table that still declares a CHECK over a column that no longer exists (a dangling-CHECK
 /// brick that would reject every future write) — the write is refused fail-closed with this Delta-parity
@@ -36,11 +37,12 @@ public sealed class DeltaConstraintDependentColumnException : Exception
         Constraints = constraints;
     }
 
-    /// <summary>The column the schema change drops/renames that the surviving CHECK constraint(s) reference.</summary>
+    /// <summary>The column the schema change drops, renames, or retypes that the surviving CHECK constraint(s)
+    /// reference.</summary>
     public string ColumnName { get; }
 
-    /// <summary>Every surviving CHECK constraint that depends on <see cref="ColumnName"/>, in deterministic
-    /// (name-sorted) order.</summary>
+    /// <summary>Every surviving CHECK constraint that depends on <see cref="ColumnName"/>, in the deterministic
+    /// order they were supplied (upstream, <c>CollectForWrite</c> emits them in Kind-then-name order).</summary>
     public IReadOnlyList<DeltaTableConstraint> Constraints { get; }
 
     /// <summary>
@@ -78,9 +80,10 @@ public sealed class DeltaConstraintDependentColumnException : Exception
             : "these surviving CHECK constraints still depend";
         string message =
             $"Cannot alter column '{columnName}' because this column is referenced by the following check "
-            + $"constraint(s):{listing}\nThe {operation} drops or renames '{columnName}', but {depends} on it; "
-            + "committing would leave a dangling constraint that rejects every future write. Drop the dependent "
-            + $"constraint(s) first (e.g. ALTER TABLE ... DROP CONSTRAINT), then change the column. [{ErrorClass}]";
+            + $"constraint(s):{listing}\nThe {operation} changes '{columnName}' (drops, renames, or retypes it), "
+            + $"but {depends} on it; committing would leave a dangling constraint that rejects every future "
+            + "write. Drop the dependent constraint(s) first (e.g. ALTER TABLE ... DROP CONSTRAINT), then change "
+            + $"the column. [{ErrorClass}]";
         return new DeltaConstraintDependentColumnException(message, columnName, dependents);
     }
 }
