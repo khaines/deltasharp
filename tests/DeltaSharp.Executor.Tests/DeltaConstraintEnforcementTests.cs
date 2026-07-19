@@ -75,6 +75,29 @@ public sealed class DeltaConstraintEnforcementTests : IDisposable
         File.WriteAllText(Path.Combine(logDir, $"{1:D20}.json"), root.ToJsonString() + "\n");
     }
 
+    // Seeds MULTIPLE CHECK constraints in a single v1 metadata commit (AddCheckConstraint hardcodes v1 from v0,
+    // so calling it twice would clobber the first constraint; this injects all pairs at once).
+    private static void AddCheckConstraints(string table, params (string Name, string Expression)[] constraints)
+    {
+        string logDir = Path.Combine(table, "_delta_log");
+        string metaLine = File.ReadAllLines(CommitFile(table, 0))
+            .First(line => line.Contains("\"metaData\"", StringComparison.Ordinal));
+        JsonNode root = JsonNode.Parse(metaLine)!;
+        JsonObject metadata = root["metaData"]!.AsObject();
+        if (metadata["configuration"] is not JsonObject configuration)
+        {
+            configuration = new JsonObject();
+            metadata["configuration"] = configuration;
+        }
+
+        foreach ((string name, string expression) in constraints)
+        {
+            configuration[$"delta.constraints.{name}"] = expression;
+        }
+
+        File.WriteAllText(Path.Combine(logDir, $"{1:D20}.json"), root.ToJsonString() + "\n");
+    }
+
     private static void Append(string table, IReadOnlyList<Row> rows)
     {
         using SparkSession spark = NewSession();
@@ -248,9 +271,11 @@ public sealed class DeltaConstraintEnforcementTests : IDisposable
     [Fact]
     public void OverwriteSchema_DroppingConstrainedColumn_RejectedFailClosed_NoBrick()
     {
-        // #596: an overwriteSchema that DROPS a column a surviving CHECK references must not leave a dangling
-        // CHECK (which would then brick every future write). The surviving CHECK cannot resolve against the new
-        // schema, so the write is refused fail-closed rather than committing self-inconsistent metadata.
+        // #596/#598: an overwriteSchema that DROPS a column a surviving CHECK references must not leave a
+        // dangling CHECK (which would then brick every future write). The surviving CHECK cannot resolve against
+        // the new schema, so the write is refused fail-closed — and (#598) with a clear Delta-parity
+        // DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE error naming the column + constraint, not a raw resolution
+        // failure.
         string table = Table("os-drop-constrained");
         Append(table, Amounts(10, 20)); // v0: {id, amount}
         AddCheckConstraint(table, "positive_id", "id > 0"); // v1: CHECK references `id`
@@ -259,9 +284,88 @@ public sealed class DeltaConstraintEnforcementTests : IDisposable
         var amountOnly = new StructType(new[] { new StructField("amount", IntegerType.Instance, nullable: true) });
         DataFrame df = spark.CreateDataFrame(new[] { new Row(amountOnly, 5) }, amountOnly); // drops `id`
 
-        Assert.ThrowsAny<Exception>(
+        var ex = Assert.Throws<DeltaConstraintDependentColumnException>(
             () => df.Write.Format("delta").Mode("overwrite").Option("overwriteSchema", "true").Save(table));
+        Assert.Equal("id", ex.ColumnName);
+        DeltaTableConstraint dependent = Assert.Single(ex.Constraints);
+        Assert.Equal("positive_id", dependent.Name);
+        Assert.Equal(DeltaConstraintKind.Check, dependent.Kind);
+        Assert.Contains("positive_id", ex.Message);
+        Assert.Contains("id", ex.Message);
+        Assert.Contains(DeltaConstraintDependentColumnException.ErrorClass, ex.Message);
         Assert.False(File.Exists(CommitFile(table, 2))); // no dangling-CHECK commit — table not bricked
+    }
+
+    [Fact]
+    public void OverwriteSchema_DroppingConstrainedColumn_ParityErrorNamesTheActualColumnAndConstraint()
+    {
+        // #598: the DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE parity error names the ACTUAL dropped column and
+        // dependent constraint (not a hardcoded pair) and echoes the surviving predicate: a CHECK `cap` on
+        // `amount` blocks dropping `amount`.
+        string table = Table("os-drop-amount");
+        Append(table, Amounts(10, 20)); // v0: {id, amount}
+        AddCheckConstraint(table, "cap", "amount < 100"); // CHECK references `amount`
+
+        using SparkSession spark = NewSession();
+        var idOnly = new StructType(new[] { new StructField("id", IntegerType.Instance, nullable: false) });
+        DataFrame df = spark.CreateDataFrame(new[] { new Row(idOnly, 7) }, idOnly); // drops `amount`
+
+        var ex = Assert.Throws<DeltaConstraintDependentColumnException>(
+            () => df.Write.Format("delta").Mode("overwrite").Option("overwriteSchema", "true").Save(table));
+        Assert.Equal("amount", ex.ColumnName);
+        Assert.Equal("cap", Assert.Single(ex.Constraints).Name);
+        Assert.Contains("amount < 100", ex.Message); // the surviving predicate is echoed for actionability
+        Assert.False(File.Exists(CommitFile(table, 2))); // no dangling-CHECK commit — table not bricked
+    }
+
+    [Fact]
+    public void OverwriteSchema_DroppingColumnWithMultipleDependentChecks_ListsAllDeterministically()
+    {
+        // #598 (council: Architect/Quality): when MULTIPLE surviving CHECK constraints reference the dropped
+        // column, the parity error aggregates ALL of them (mirroring Delta's foundViolatingConstraintsForColumn-
+        // Change), in the deterministic name-sorted order CollectForWrite guarantees.
+        string table = Table("os-drop-multi");
+        Append(table, Amounts(10, 20)); // v0: {id, amount}
+        AddCheckConstraints(table, ("amount_positive", "amount > 0"), ("amount_cap", "amount < 100")); // both ref `amount`
+
+        using SparkSession spark = NewSession();
+        var idOnly = new StructType(new[] { new StructField("id", IntegerType.Instance, nullable: false) });
+        DataFrame df = spark.CreateDataFrame(new[] { new Row(idOnly, 7) }, idOnly); // drops `amount`
+
+        var ex = Assert.Throws<DeltaConstraintDependentColumnException>(
+            () => df.Write.Format("delta").Mode("overwrite").Option("overwriteSchema", "true").Save(table));
+        Assert.Equal("amount", ex.ColumnName);
+        // Ordinal name sort: "amount_cap" < "amount_positive" ('c' < 'p'), regardless of injection order.
+        Assert.Equal(new[] { "amount_cap", "amount_positive" }, ex.Constraints.Select(c => c.Name).ToArray());
+        Assert.Contains("amount_cap -> amount < 100", ex.Message);
+        Assert.Contains("amount_positive -> amount > 0", ex.Message);
+        Assert.Contains("these surviving CHECK constraints still depend", ex.Message); // plural wording
+        Assert.False(File.Exists(CommitFile(table, 2))); // not bricked
+    }
+
+    [Fact]
+    public void OverwriteSchema_ChangingConstrainedColumnType_DoesNotReclassifyError()
+    {
+        // #598 (council: Quality false-positive guard): the reclassification is scoped to UnresolvedColumn (a
+        // DROPPED column). RETYPING a constrained column so a surviving CHECK no longer resolves yields a
+        // DataTypeMismatch, which must NOT be reclassified as DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE — the
+        // write still fails closed, just not with the dependent-column parity error.
+        string table = Table("os-retype-constrained");
+        Append(table, Amounts(10, 20)); // v0: {id int, amount int}
+        AddCheckConstraint(table, "positive_id", "id > 0"); // CHECK references `id`
+
+        using SparkSession spark = NewSession();
+        var idRetyped = new StructType(new[]
+        {
+            new StructField("id", StringType.Instance, nullable: false), // id int -> string (retype, not drop)
+            new StructField("amount", IntegerType.Instance, nullable: true),
+        });
+        DataFrame df = spark.CreateDataFrame(new[] { new Row(idRetyped, "x", 5) }, idRetyped);
+
+        Exception ex = Assert.ThrowsAny<Exception>(
+            () => df.Write.Format("delta").Mode("overwrite").Option("overwriteSchema", "true").Save(table));
+        Assert.IsNotType<DeltaConstraintDependentColumnException>(ex); // scoped: a retype is not a dropped-column change
+        Assert.False(File.Exists(CommitFile(table, 2))); // still fail-closed — no brick
     }
 
     [Fact]

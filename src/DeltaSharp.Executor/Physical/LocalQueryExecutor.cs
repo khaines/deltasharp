@@ -280,6 +280,14 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
                 // directly, as Spark surfaces DeltaInvariantViolationException.
                 throw;
             }
+            catch (DeltaSharp.Storage.DeltaConstraintDependentColumnException)
+            {
+                // #598: an overwriteSchema (or future ALTER) that drops/renames a column a surviving CHECK still
+                // references is a user-schema error (it would leave a dangling CHECK that bricks the table), not a
+                // backend fault — surface Delta's parity DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE unwrapped, like
+                // the row-violation above, so callers catch DeltaConstraintDependentColumnException directly.
+                throw;
+            }
             catch (Exception ex)
             {
                 throw new QueryExecutionException(

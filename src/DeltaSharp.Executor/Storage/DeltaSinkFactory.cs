@@ -211,10 +211,70 @@ internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
         ArgumentNullException.ThrowIfNull(constraints);
         ArgumentNullException.ThrowIfNull(batches);
 
+        // Phase 1 — resolve every constraint against the write schema. A surviving named CHECK that no longer
+        // resolves because the write schema DROPPED a top-level column it references (an overwriteSchema /
+        // future ALTER) is aggregated per dropped column and reported as Delta's parity error
+        // DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE (#598) BEFORE any row is evaluated — mirroring
+        // foundViolatingConstraintsForColumnChange, which lists ALL dependent constraints for the column so the
+        // caller can DROP them in one pass. Resolving up front (not interleaved with eval) keeps the reported
+        // error deterministic for a set that mixes an unresolvable CHECK with a violating row.
+        var resolved =
+            new List<(DeltaTableConstraint Constraint, CoreExpr Predicate, IReadOnlyList<ExprAttributeReference> Input)>(
+                constraints.Count);
+        Dictionary<string, List<DeltaTableConstraint>>? dependentsByColumn = null;
+        List<string>? droppedColumnOrder = null;
+
         foreach (DeltaTableConstraint constraint in constraints)
         {
-            (CoreExpr predicate, IReadOnlyList<ExprAttributeReference> input) =
-                ConstraintExpressionFrontend.ParseResolveWithInput(constraint.Expression, schema);
+            CoreExpr predicate;
+            IReadOnlyList<ExprAttributeReference> input;
+            try
+            {
+                (predicate, input) = ConstraintExpressionFrontend.ParseResolveWithInput(constraint.Expression, schema);
+            }
+            catch (AnalysisException ex)
+                when (constraint.Kind == DeltaConstraintKind.Check
+                    && ex.Kind == AnalysisErrorKind.UnresolvedColumn
+                    && ex.Reference is not null)
+            {
+                // A SURVIVING CHECK references a TOP-LEVEL column the write schema no longer has — an
+                // overwriteSchema (or future ALTER) dropped/renamed it. Collect it (aggregated per column,
+                // normalizing a dropped nested base `s.f` to its top-level column `s`) and surface the Delta
+                // parity error after the pass, instead of the raw "cannot resolve column" failure. Only named
+                // CHECK constraints are reported: a column invariant is attached to its own field and cannot be
+                // DROP CONSTRAINT'd, and a new write-schema invariant that fails to resolve is a different,
+                // non-reclassified error. A nested-field STRUCTURAL drop (struct survives, field dropped) or a
+                // column RETYPE surfaces as DataTypeMismatch (not UnresolvedColumn) and is intentionally NOT
+                // reclassified here — still fail-closed; tracked in #600.
+                string column = TopLevelColumn(ex.Reference);
+                dependentsByColumn ??= new Dictionary<string, List<DeltaTableConstraint>>(StringComparer.OrdinalIgnoreCase);
+                droppedColumnOrder ??= new List<string>();
+                if (!dependentsByColumn.TryGetValue(column, out List<DeltaTableConstraint>? dependents))
+                {
+                    dependents = new List<DeltaTableConstraint>();
+                    dependentsByColumn.Add(column, dependents);
+                    droppedColumnOrder.Add(column);
+                }
+
+                dependents.Add(constraint);
+                continue;
+            }
+
+            resolved.Add((constraint, predicate, input));
+        }
+
+        if (droppedColumnOrder is { Count: > 0 })
+        {
+            // Report the first dropped column deterministically (constraints arrive in CollectForWrite's stable
+            // Kind-then-name order), listing every CHECK that depends on it.
+            string column = droppedColumnOrder[0];
+            throw DeltaConstraintDependentColumnException.ForColumnChange(column, dependentsByColumn![column]);
+        }
+
+        // Phase 2 — evaluate every resolved predicate over every batch; reject fail-closed on the first row that
+        // is NOT TRUE (false OR null), matching Delta's CheckDeltaInvariant.assertRule.
+        foreach ((DeltaTableConstraint constraint, CoreExpr predicate, IReadOnlyList<ExprAttributeReference> input) in resolved)
+        {
             EnginePhysicalExpression physical =
                 PhysicalExpressionTranslator.For(input, AnsiMode.Ansi).Translate(predicate);
             BatchPredicateEvaluator evaluator = BatchPredicateEvaluator.Build(physical, schema, ConstraintBackendName);
@@ -231,6 +291,15 @@ internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
                 }
             }
         }
+    }
+
+    // The top-level column of a (possibly multipart) analyzer attribute reference: `amount` -> `amount`,
+    // `s.f` -> `s` (a dropped struct column referenced via nested access). Delta names the top-level column
+    // being altered in DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE.
+    private static string TopLevelColumn(string reference)
+    {
+        int dot = reference.IndexOf('.');
+        return dot < 0 ? reference : reference[..dot];
     }
 
     /// <summary>
