@@ -57,18 +57,88 @@ public sealed class DeltaSinkRetypeDependencyTests
     }
 
     [Fact]
-    public void EnforceCore_IncompatibleRetype_ReferencedColumn_ReclassifiedNotRawDataTypeMismatch()
+    public void EnforceCore_IncompatibleRetype_WithPriorSchema_StaysDataTypeMismatch_DeltaFaithful()
     {
-        // `id int -> string` under `id > 0`: without a prior schema this throws a raw comparison DataTypeMismatch
-        // (see the guard below). WITH a prior schema the pre-pass runs FIRST and reports the dependent-column
-        // parity error naming `id`, never reaching the comparison typecheck.
+        // `id int -> string` under `id > 0` is an INCOMPATIBLE retype: the predicate no longer type-resolves.
+        // Delta runs canChangeDataType FIRST and surfaces a TYPE error (not the dependent-column error) for a
+        // disallowed change, so the #619 pre-pass deliberately does NOT reclassify it — it falls through to
+        // Phase-1's raw DataTypeMismatch (still fail-closed). Only a COMPATIBLE retype is a dependency block.
         var prior = Schema(Field("id", IntegerType.Instance));
         var next = Schema(Field("id", StringType.Instance));
 
-        var ex = Assert.Throws<DeltaConstraintDependentColumnException>(
+        var ex = Assert.Throws<AnalysisException>(
             () => DeltaLocalSink.EnforceCore(
                 next, Checks(("pos_id", "id > 0")), NoBatches, AnsiMode.Ansi, memoryBudgetBytes: null, priorSchema: prior));
-        Assert.Equal("id", ex.ColumnName);
+        Assert.Equal(AnalysisErrorKind.DataTypeMismatch, ex.Kind);
+    }
+
+    [Fact]
+    public void EnforceCore_NestedSiblingRetype_NotReclassified_LeafPrecise()
+    {
+        // #619 leaf-precise (Delta parity: prefix/path-based dependency): retyping an UNREFERENCED sibling field
+        // `s.g` (int->bigint) while a CHECK reads only `s.f` (unchanged) is NOT a dependency break — Delta's
+        // path-precise check keys on `s.f`, not the whole struct `s`. No reclassification (zero rows → no throw).
+        var priorInner = new StructType(new[]
+        {
+            new StructField("f", IntegerType.Instance, nullable: true),
+            new StructField("g", IntegerType.Instance, nullable: true),
+        });
+        var nextInner = new StructType(new[]
+        {
+            new StructField("f", IntegerType.Instance, nullable: true),
+            new StructField("g", LongType.Instance, nullable: true), // sibling g retyped; f unchanged
+        });
+        var prior = Schema(new StructField("s", priorInner, nullable: true));
+        var next = Schema(new StructField("s", nextInner, nullable: true));
+
+        DeltaLocalSink.EnforceCore(
+            next, Checks(("sf_pos", "s.f > 0")), NoBatches, AnsiMode.Ansi, memoryBudgetBytes: null, priorSchema: prior);
+    }
+
+    [Fact]
+    public void EnforceCore_NullabilityOnlyChange_NotReclassified()
+    {
+        // A nullability-only change to a referenced column (same DataType, nullable flag flipped) is NOT a retype:
+        // Delta gates the dependency block on the field's dataType inequality only. The pre-pass compares the
+        // referenced leaf DataType (nullability is not part of it), so it is not flagged — consistent for both a
+        // top-level and a nested reference.
+        var priorNonNull = Schema(new StructField("id", IntegerType.Instance, nullable: false));
+        var nextNullable = Schema(new StructField("id", IntegerType.Instance, nullable: true));
+
+        DeltaLocalSink.EnforceCore(
+            nextNullable, Checks(("pos_id", "id > 0")), NoBatches, AnsiMode.Ansi, memoryBudgetBytes: null,
+            priorSchema: priorNonNull);
+    }
+
+    [Fact]
+    public void EnforceCore_QualifiedTopLevelDrop_AttributedToBoundColumnNotQualifier()
+    {
+        // #618/#619 attribution: a surviving CHECK with a QUALIFIED reference `t.y` (phantom table qualifier `t`)
+        // whose column `y` is DROPPED is attributed to the bound column `y` — not the qualifier `t`. The pre-pass
+        // resolves `t.y` against the prior schema (binding `y`), so the dropped path names `y`, avoiding Phase-1's
+        // flattened-string `parts[0]` mis-attribution.
+        var prior = Schema(Field("y", IntegerType.Instance));
+        var next = Schema(Field("z", IntegerType.Instance)); // y dropped/renamed away
+
+        var ex = Assert.Throws<DeltaConstraintDependentColumnException>(
+            () => DeltaLocalSink.EnforceCore(
+                next, Checks(("pos_y", "t.y > 0")), NoBatches, AnsiMode.Ansi, memoryBudgetBytes: null, priorSchema: prior));
+        Assert.Equal("y", ex.ColumnName); // the bound column, not the phantom qualifier `t`
+    }
+
+    [Fact]
+    public void EnforceCore_OneCheckReferencingTwoRetypedColumns_ReportsFirstDeterministically()
+    {
+        // A single CHECK referencing TWO compatibly-retyped columns reports the FIRST (by reference order),
+        // with that one throw carrying the dependent constraint — a deterministic single-column report.
+        var prior = Schema(Field("a", IntegerType.Instance), Field("b", IntegerType.Instance));
+        var next = Schema(Field("a", LongType.Instance), Field("b", LongType.Instance));
+
+        var ex = Assert.Throws<DeltaConstraintDependentColumnException>(
+            () => DeltaLocalSink.EnforceCore(
+                next, Checks(("ab", "a > 0 AND b > 0")), NoBatches, AnsiMode.Ansi, memoryBudgetBytes: null, priorSchema: prior));
+        Assert.Equal("a", ex.ColumnName); // first referenced retyped column
+        Assert.Equal("ab", Assert.Single(ex.Constraints).Name);
     }
 
     [Fact]
