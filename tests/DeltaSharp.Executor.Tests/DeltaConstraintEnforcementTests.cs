@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text.Json.Nodes;
+using DeltaSharp.Engine.Execution;
 using DeltaSharp.Storage;
 using DeltaSharp.Types;
 using Xunit;
@@ -394,5 +395,56 @@ public sealed class DeltaConstraintEnforcementTests : IDisposable
         Assert.Throws<DeltaConstraintViolationException>(
             () => df.Write.Format("delta").Mode("append").Option("mergeSchema", "true").Save(table));
         Assert.False(File.Exists(CommitFile(table, 1)));
+    }
+
+    [Fact]
+    public void MemoryBudget_TinyBudget_BoundsConstraintEnforcement_FailsClosed()
+    {
+        // #597 END-TO-END: the run's memory budget (spark.deltasharp.execution.memoryBudgetBytes) flows the
+        // whole pipeline — ExecutionOptions -> PhysicalRuntime -> WriteToSinkPlan -> ILocalSink.Commit ->
+        // DeltaLocalSink -> Enforce — and bounds per-row constraint evaluation. A 1-byte budget makes the
+        // constraint-predicate evaluator fail fail-closed (ExecutionMemoryException), committing nothing.
+        string table = Table("budget-constrained");
+        Append(table, Amounts(10)); // v0
+        AddCheckConstraint(table, "pos", "amount > 0"); // v1: active CHECK
+
+        using SparkSession spark = NewSession();
+        spark.Conf.Set("spark.deltasharp.execution.memoryBudgetBytes", "1");
+
+        Exception ex = Assert.ThrowsAny<Exception>(
+            () => spark.CreateDataFrame(Amounts(20), AmountSchema).Write.Format("delta").Mode("append").Save(table));
+        Assert.True(HasInnerOrSelf<ExecutionMemoryException>(ex)); // bounded by the run budget, not evaluated unbounded
+        Assert.False(File.Exists(CommitFile(table, 2))); // fail-closed: nothing committed
+    }
+
+    [Fact]
+    public void MemoryBudget_TinyBudget_DoesNotAffectUnconstrainedWrite_IsolatesEnforcement()
+    {
+        // Control isolating the previous test to constraint enforcement: the SAME 1-byte budget does NOT fail an
+        // UNCONSTRAINED write (a plain CreateDataFrame -> WriteToSink append has no per-row expression
+        // evaluation to bound), so the budget bite in the constrained case is specifically the enforcer's.
+        string table = Table("budget-unconstrained");
+        Append(table, Amounts(10)); // v0, no constraint
+
+        using SparkSession spark = NewSession();
+        spark.Conf.Set("spark.deltasharp.execution.memoryBudgetBytes", "1");
+
+        spark.CreateDataFrame(Amounts(20), AmountSchema).Write.Format("delta").Mode("append").Save(table);
+        Assert.True(File.Exists(CommitFile(table, 1))); // committed under budget=1 (no evaluation to bound)
+    }
+
+    // Whether <paramref name="e"/> or any exception in its InnerException chain is a <typeparamref name="T"/>.
+    private static bool HasInnerOrSelf<T>(Exception e)
+        where T : Exception
+    {
+        for (Exception? current = e; current is not null; current = current.InnerException)
+        {
+            if (current is T)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 }

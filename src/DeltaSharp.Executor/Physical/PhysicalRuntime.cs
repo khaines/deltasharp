@@ -31,6 +31,7 @@ internal sealed class PhysicalRuntime : IDisposable
     private readonly IExecutionBackend _backend;
     private readonly ExecutionContext _context;
     private readonly CancellationToken _cancellationToken;
+    private readonly long? _memoryBudgetBytes;
     private readonly HashSet<PhysicalOperator> _sourceScans = new(ReferenceEqualityComparer.Instance);
     private long _bytesScanned;
     private long _peakMemoryBytes;
@@ -50,6 +51,7 @@ internal sealed class PhysicalRuntime : IDisposable
         _backend = backend ?? throw new ArgumentNullException(nameof(backend));
         ArgumentNullException.ThrowIfNull(options);
         _cancellationToken = cancellationToken;
+        _memoryBudgetBytes = memoryBudgetBytes;
 
         // One shared context for the whole tree. A configured memory budget swaps the unbounded memory
         // for a BoundedExecutionMemory, so an operator that cannot reserve within it fails fast with a
@@ -62,6 +64,13 @@ internal sealed class PhysicalRuntime : IDisposable
 
     /// <summary>The aggregate estimated data-plane bytes scanned across every genuine source read (diagnostics).</summary>
     public long BytesScanned => _bytesScanned;
+
+    /// <summary>
+    /// The run's operator memory budget in bytes, or <see langword="null"/> for unbounded. Exposed so the
+    /// write door's constraint enforcement (the Delta sink) can bound its per-row predicate evaluation by the
+    /// same budget the rest of the run uses, instead of evaluating unbounded (#597).
+    /// </summary>
+    public long? MemoryBudgetBytes => _memoryBudgetBytes;
 
     /// <summary>
     /// The run's <b>effective</b> cancellation token (user cancellation linked with any timeout). Exposed so

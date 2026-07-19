@@ -17,9 +17,11 @@ internal interface ILocalSinkFactory
     /// <summary>Tries to create a sink for <paramref name="descriptor"/> writing rows of <paramref name="schema"/>.</summary>
     /// <param name="descriptor">The logical sink descriptor (format, mode, path, options).</param>
     /// <param name="schema">The schema of the rows the write will commit.</param>
+    /// <param name="ansiMode">The run's ANSI mode, threaded into any sink-side expression evaluation (e.g. the
+    /// Delta sink's per-row constraint enforcement) so its overflow/cast behavior matches the query path (#597).</param>
     /// <param name="sink">The resolved sink when the format is backed.</param>
     /// <returns><see langword="true"/> if a sink was created; otherwise <see langword="false"/>.</returns>
-    bool TryCreate(SinkDescriptor descriptor, StructType schema, [NotNullWhen(true)] out ILocalSink? sink);
+    bool TryCreate(SinkDescriptor descriptor, StructType schema, AnsiMode ansiMode, [NotNullWhen(true)] out ILocalSink? sink);
 }
 
 /// <summary>
@@ -32,11 +34,15 @@ internal interface ILocalSink
     /// <summary>Atomically commits <paramref name="rows"/> to the target, honoring the save mode.</summary>
     /// <param name="schema">The schema the committed rows conform to.</param>
     /// <param name="rows">The fully-materialized rows to commit.</param>
+    /// <param name="memoryBudgetBytes">The run's operator memory budget in bytes (or <see langword="null"/> for
+    /// unbounded), so a sink that evaluates expressions while committing (the Delta sink's per-row constraint
+    /// enforcement) can bound that work by the same budget as the rest of the run (#597).</param>
     /// <returns>The number of rows written (0 when an <see cref="SaveMode.Ignore"/> skipped an existing target).</returns>
     /// <exception cref="InvalidOperationException">The mode conflicts with the target's current state
     /// (<see cref="SaveMode.ErrorIfExists"/> onto an existing target, or an <see cref="SaveMode.Append"/>
-    /// schema mismatch).</exception>
-    long Commit(StructType schema, IReadOnlyList<Row> rows);
+    /// schema mismatch), or the target declares more active per-row constraints than the sink will enforce
+    /// in one write (#597).</exception>
+    long Commit(StructType schema, IReadOnlyList<Row> rows, long? memoryBudgetBytes = null);
 
     /// <summary>
     /// Cheaply decides — <b>before</b> the write input is executed/materialized — whether an
@@ -74,13 +80,13 @@ internal sealed class InMemorySinkRegistry : ILocalSinkFactory
     public static InMemorySinkRegistry Default { get; } = new();
 
     /// <inheritdoc/>
-    public bool TryCreate(SinkDescriptor descriptor, StructType schema, [NotNullWhen(true)] out ILocalSink? sink)
+    public bool TryCreate(SinkDescriptor descriptor, StructType schema, AnsiMode ansiMode, [NotNullWhen(true)] out ILocalSink? sink)
     {
         ArgumentNullException.ThrowIfNull(descriptor);
         ArgumentNullException.ThrowIfNull(schema);
 
-        // Defense-in-depth: only the "memory" local format is engine-backed in M1. The analyzer already
-        // rejects every other format, so a mismatch here means a bypassed analyzer — fail (no sink).
+        // The in-memory sink commits materialized rows verbatim (no expression evaluation), so the run's
+        // ansiMode is not consumed here; it is threaded for parity with the Delta sink (#597).
         if (!string.Equals(descriptor.Format, WriteFormats.Memory, StringComparison.OrdinalIgnoreCase))
         {
             sink = null;
@@ -246,10 +252,13 @@ internal sealed class InMemorySinkRegistry : ILocalSinkFactory
             _mode = mode;
         }
 
-        public long Commit(StructType schema, IReadOnlyList<Row> rows)
+        public long Commit(StructType schema, IReadOnlyList<Row> rows, long? memoryBudgetBytes = null)
         {
             ArgumentNullException.ThrowIfNull(schema);
             ArgumentNullException.ThrowIfNull(rows);
+
+            // The in-memory sink commits rows verbatim; there is no per-row expression evaluation to bound, so
+            // memoryBudgetBytes is accepted for contract parity with the Delta sink (#597) and not consumed.
             return _registry.Commit(_target, _mode, schema, rows);
         }
 
