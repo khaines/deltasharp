@@ -150,7 +150,7 @@ internal static class DeltaTableConstraints
     // array-element or map key/value struct field) needs per-element enforcement not yet available and is
     // refused fail-closed (#606), never silently skipped (Spark attaches the invariant to the field it guards;
     // a skip is a fail-open). NOTE: enforcement is currently unreachable END-TO-END because CreateDataFrame /
-    // LocalRelationBatches rejects nested columns (#571) before enforcement runs; #595 wires + unit-tests the
+    // LocalRelationBatches rejects nested columns (#608) before enforcement runs; #595 wires + unit-tests the
     // mechanism so it enforces as soon as nested-column writes land.
     private static void CollectNestedInvariants(
         string path, DataType type, bool insideCollection, Action<DeltaTableConstraint> add)
@@ -167,9 +167,9 @@ internal static class DeltaTableConstraints
                         {
                             throw DeltaProtocolException.Unsupported(
                                 $"Column '{childPath}' declares a 'delta.invariants' invariant reached through an "
-                                + "array/map; per-row enforcement of an array-element or map-value field invariant "
-                                + "needs a per-element evaluator not yet available (#606), so the write is refused "
-                                + "fail-closed rather than silently skip it.");
+                                + "array/map; per-row enforcement of an array-element or map key/value field "
+                                + "invariant needs a per-element evaluator not yet available (#606), so the write "
+                                + "is refused fail-closed rather than silently skip it.");
                         }
 
                         add(new DeltaTableConstraint(

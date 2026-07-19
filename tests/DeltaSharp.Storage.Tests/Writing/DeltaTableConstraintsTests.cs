@@ -198,6 +198,42 @@ public sealed class DeltaTableConstraintsTests : System.IDisposable
         Assert.Contains("m.value.f", ex.Message, System.StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void CollectForWrite_MixedTopLevelAndNestedInvariants_AreBothCollected()
+    {
+        // #595 (council: Quality): a top-level invariant AND a nested struct-field invariant on the same schema
+        // are BOTH collected — the struct recursion neither short-circuits nor overwrites the top-level one.
+        var inner = new StructType(new[] { InvariantField("f", IntegerType.Instance, "s.f > 0") });
+        var schema = new StructType(new[]
+        {
+            InvariantField("id", IntegerType.Instance, "id > 0"), // top-level invariant
+            new StructField("s", inner, nullable: true),          // nested invariant on s.f
+        });
+
+        System.Collections.Generic.IReadOnlyList<DeltaTableConstraint> constraints =
+            DeltaTableConstraints.CollectForWrite(snapshot: null, schema);
+        Assert.Equal(2, constraints.Count);
+        Assert.Contains(constraints, c => c.Name == "id" && c.Expression == "id > 0");
+        Assert.Contains(constraints, c => c.Name == "s.f" && c.Expression == "s.f > 0");
+    }
+
+    [Fact]
+    public void CollectForWrite_ArrayInArrayStructFieldInvariant_FailsClosed()
+    {
+        // #595/#606 (council: Quality): the insideCollection flag must LATCH across multiple collection hops —
+        // an invariant inside array<array<struct{f}>> is refused fail-closed with the full path.
+        var element = new StructType(new[] { InvariantField("f", IntegerType.Instance, "f > 0") });
+        var schema = new StructType(new[]
+        {
+            new StructField("arr", new ArrayType(new ArrayType(element)), nullable: true),
+        });
+
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
+            () => DeltaTableConstraints.CollectForWrite(snapshot: null, schema));
+        Assert.Contains("#606", ex.Message, System.StringComparison.Ordinal);
+        Assert.Contains("arr.element.element.f", ex.Message, System.StringComparison.Ordinal);
+    }
+
     private Snapshot SnapshotWithCheck(string value)
     {
         var schema = new StructType(new[] { new StructField("id", IntegerType.Instance, nullable: false) });

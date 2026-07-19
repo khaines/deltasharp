@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using DeltaSharp.Analysis;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage;
 using DeltaSharp.Types;
@@ -98,5 +99,74 @@ public sealed class DeltaNestedInvariantEnforcementTests
             () => DeltaLocalSink.EnforceCore(
                 Schema, Invariant("s.f", "s.f > 0"), new[] { StructBatch(5, null) }, AnsiMode.Ansi, memoryBudgetBytes: null));
         Assert.Equal("s.f", ex.Constraint.Name);
+    }
+
+    [Fact]
+    public void EnforceCore_UnqualifiedLeafExpression_FailsClosed()
+    {
+        // #595 (council: Quality): an invariant whose expression uses a bare LEAF name (`f`) instead of the
+        // qualified path (`s.f`) does not resolve against the write schema (there is no top-level `f`), so it
+        // fails CLOSED with an AnalysisException — never silently passes a misconfigured/legacy leaf expression.
+        var ex = Assert.Throws<AnalysisException>(
+            () => DeltaLocalSink.EnforceCore(
+                Schema, Invariant("s.f", "f > 0"), new[] { StructBatch(5) }, AnsiMode.Ansi, memoryBudgetBytes: null));
+        Assert.Contains("resolve column", ex.Message, System.StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void EnforceCore_TopLevelAndNestedInvariants_NestedIsEnforcedAlongside()
+    {
+        // #595 (council: Quality): a top-level invariant and a nested one enforced in the same pass do not
+        // cross-pollinate — with both `id > 0` and `s.f > 0` active and id satisfied, a violating `s.f` is still
+        // caught (proving the nested invariant is genuinely enforced beside the top-level one).
+        var inner = new StructType(new[] { new StructField("f", IntegerType.Instance, nullable: false) });
+        var schema = new StructType(new[]
+        {
+            new StructField("id", IntegerType.Instance, nullable: false),
+            new StructField("s", inner, nullable: false),
+        });
+        MutableColumnVector idCol = ColumnVectors.Create(IntegerType.Instance, 2);
+        idCol.AppendValue(10);
+        idCol.AppendValue(10);
+        MutableColumnVector fCol = ColumnVectors.Create(IntegerType.Instance, 2);
+        fCol.AppendValue(3);
+        fCol.AppendValue(-1); // row 1 violates s.f > 0 (id is fine on both rows)
+        var sCol = new StructColumnVector(inner, new ColumnVector[] { fCol });
+        ColumnBatch batch = new ManagedColumnBatch(schema, new ColumnVector[] { idCol, sCol }, 2);
+
+        var constraints = new[]
+        {
+            new DeltaTableConstraint(DeltaConstraintKind.Invariant, "id", "id > 0"),
+            new DeltaTableConstraint(DeltaConstraintKind.Invariant, "s.f", "s.f > 0"),
+        };
+        var ex = Assert.Throws<DeltaConstraintViolationException>(
+            () => DeltaLocalSink.EnforceCore(schema, constraints, new[] { batch }, AnsiMode.Ansi, memoryBudgetBytes: null));
+        Assert.Equal("s.f", ex.Constraint.Name);
+    }
+
+    [Fact]
+    public void EnforceCore_CrossFieldNestedInvariant_Enforced()
+    {
+        // #595 (council: Quality): an invariant referencing TWO nested fields (`s.a > s.b`) resolves + enforces —
+        // row 1 (a=1, b=4) violates and is rejected.
+        var inner = new StructType(new[]
+        {
+            new StructField("a", IntegerType.Instance, nullable: false),
+            new StructField("b", IntegerType.Instance, nullable: false),
+        });
+        var schema = new StructType(new[] { new StructField("s", inner, nullable: false) });
+        MutableColumnVector aCol = ColumnVectors.Create(IntegerType.Instance, 2);
+        aCol.AppendValue(5);
+        aCol.AppendValue(1);
+        MutableColumnVector bCol = ColumnVectors.Create(IntegerType.Instance, 2);
+        bCol.AppendValue(3);
+        bCol.AppendValue(4);
+        var sCol = new StructColumnVector(inner, new ColumnVector[] { aCol, bCol });
+        ColumnBatch batch = new ManagedColumnBatch(schema, new ColumnVector[] { sCol }, 2);
+
+        var ex = Assert.Throws<DeltaConstraintViolationException>(
+            () => DeltaLocalSink.EnforceCore(
+                schema, Invariant("s", "s.a > s.b"), new[] { batch }, AnsiMode.Ansi, memoryBudgetBytes: null));
+        Assert.Equal("s", ex.Constraint.Name);
     }
 }
