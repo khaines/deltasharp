@@ -217,6 +217,10 @@ public sealed class ListColumnVector : MutableColumnVector
     /// into this list's own nulls). Used to extract a nested list field of a struct that carries null rows: a
     /// field of a null struct is null (#589 / Spark semantics), sharing the element buffers zero-copy.
     /// </summary>
+    /// <remarks>Masking clears only the top-level validity bit; the masked row's element offset span is
+    /// unchanged, so the validity-gated per-row <see cref="ElementsAt"/>/<see cref="ElementLength"/> read empty
+    /// while the bulk <see cref="Elements"/> view still spans it — child data under a null slot is undefined
+    /// (Arrow semantics), so a bulk/late-materialize consumer must gate on top-level validity.</remarks>
     /// <param name="parentNulls">Per-logical-row flags (length <see cref="Length"/>) where <see langword="true"/>
     /// forces row <c>i</c> null.</param>
     /// <exception cref="ArgumentException"><paramref name="parentNulls"/> length does not equal <see cref="Length"/>.</exception>

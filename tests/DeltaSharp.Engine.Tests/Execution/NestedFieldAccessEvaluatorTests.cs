@@ -444,6 +444,8 @@ public class NestedFieldAccessEvaluatorTests
 
         Assert.Equal(arr, result.Type);
         Assert.Equal(new int[]?[] { new[] { 1, 2 }, new[] { 3 }, null }, ListRows(result));
+        Assert.True(result.HasNulls); // the field's own null row (2) is preserved zero-copy
+        Assert.Equal(1, result.NullCount);
     }
 
     [Fact]
@@ -462,6 +464,8 @@ public class NestedFieldAccessEvaluatorTests
         ColumnVector result = Eval(expr, schema, batch);
 
         Assert.Equal(new int[]?[] { new[] { 1, 2 }, null, new[] { 3 } }, ListRows(result));
+        Assert.True(result.HasNulls); // vector-level null state, not just per-row IsNull
+        Assert.Equal(1, result.NullCount); // exactly the one masked (null-struct) row
     }
 
     [Fact]
@@ -481,6 +485,8 @@ public class NestedFieldAccessEvaluatorTests
 
         Assert.Equal(map, result.Type);
         Assert.Equal(new (int, int)[]?[] { new[] { (1, 10) }, null, new[] { (2, 20), (3, 30) } }, MapRows(result));
+        Assert.True(result.HasNulls); // the field's own null row (1) is preserved zero-copy
+        Assert.Equal(1, result.NullCount);
     }
 
     [Fact]
@@ -500,6 +506,79 @@ public class NestedFieldAccessEvaluatorTests
         ColumnVector result = Eval(expr, schema, batch);
 
         Assert.Equal(new (int, int)[]?[] { new[] { (1, 10) }, null, new[] { (2, 20) } }, MapRows(result));
+        Assert.True(result.HasNulls);
+        Assert.Equal(1, result.NullCount); // exactly the one masked (null-struct) row
+    }
+
+    [Fact]
+    public void ArrayField_OverlappingParentAndFieldNulls_NoDoubleCount()
+    {
+        // #589 (council: Quality): a row that is BOTH a null struct AND an already-null field list must count
+        // ONCE (the OR-mask guards on the currently-valid bit). struct nulls [F,T,T]; field lists [[1],[2],null]:
+        // row 1 masked (struct null), row 2 already null (field null) — NullCount must be 2, not 3.
+        var arr = new ArrayType(DataTypes.IntegerType);
+        StructType s = Struct(new StructField("arr", arr, nullable: true));
+        StructType schema = Struct(new StructField("s", s, nullable: true));
+        var column = new StructColumnVector(
+            s, new ColumnVector[] { ArrCol(new[] { 1 }, new[] { 2 }, null) }, new[] { false, true, true });
+        ColumnBatch batch = Batch(schema, column);
+
+        var expr = new StructFieldExpression(new ColumnReference(0, s, nullable: true), 0, arr, true);
+        ColumnVector result = Eval(expr, schema, batch);
+
+        Assert.Equal(new int[]?[] { new[] { 1 }, null, null }, ListRows(result));
+        Assert.Equal(2, result.NullCount); // rows 1 and 2 — the overlapping row 2 is not double-counted
+    }
+
+    [Fact]
+    public void ArrayField_EmptyList_DistinctFromNull_AfterMasking()
+    {
+        // #589 (council: Quality): masking touches only validity, so an EMPTY list (offsets[i]==offsets[i+1],
+        // valid) stays empty in a present struct row, while a masked (null-struct) row becomes a NULL list —
+        // the two are distinguished (ElementLength 0 for both; IsNull differs). struct nulls [F,F,T]; field
+        // lists [ [], [1,2], [3] ]: row 0 empty (present), row 1 [1,2], row 2 null (struct null).
+        var arr = new ArrayType(DataTypes.IntegerType);
+        StructType s = Struct(new StructField("arr", arr, nullable: true));
+        StructType schema = Struct(new StructField("s", s, nullable: true));
+        var column = new StructColumnVector(
+            s, new ColumnVector[] { ArrCol(System.Array.Empty<int>(), new[] { 1, 2 }, new[] { 3 }) },
+            new[] { false, false, true });
+        ColumnBatch batch = Batch(schema, column);
+
+        var expr = new StructFieldExpression(new ColumnReference(0, s, nullable: true), 0, arr, true);
+        ColumnVector result = Eval(expr, schema, batch);
+
+        var list = Assert.IsType<ListColumnVector>(result);
+        Assert.False(list.IsNull(0)); // present, empty (NOT null)
+        Assert.Equal(0, list.ElementLength(0));
+        Assert.Equal(new[] { 1, 2 }, ListRows(result)[1]);
+        Assert.True(list.IsNull(2)); // masked null-struct row
+        Assert.Equal(1, result.NullCount);
+    }
+
+    [Fact]
+    public void MapField_NullValues_PreservedThroughMasking()
+    {
+        // #589 (council: Quality): a null map VALUE (valueContainsNull) under a valid key survives masking of a
+        // DIFFERENT (null-struct) row. map row 0 = {1: null} (present), row 1 = {2: 20} (masked null-struct).
+        var map = new MapType(DataTypes.IntegerType, DataTypes.IntegerType); // valueContainsNull: true (default)
+        var keys = IntCol(1, 2);
+        var values = IntCol(null, 20); // row 0's entry value is a null
+        var mapField = new MapColumnVector(map, keys, values, new[] { 0, 1, 2 });
+        StructType s = Struct(new StructField("m", map, nullable: true));
+        StructType schema = Struct(new StructField("s", s, nullable: true));
+        var column = new StructColumnVector(s, new ColumnVector[] { mapField }, new[] { false, true });
+        ColumnBatch batch = Batch(schema, column);
+
+        var expr = new StructFieldExpression(new ColumnReference(0, s, nullable: true), 0, map, true);
+        ColumnVector result = Eval(expr, schema, batch);
+
+        var resultMap = Assert.IsType<MapColumnVector>(result);
+        Assert.False(resultMap.IsNull(0));
+        Assert.Equal(1, resultMap.KeysAt(0).GetValue<int>(0));
+        Assert.True(resultMap.ValuesAt(0).IsNull(0)); // the null value is preserved through masking
+        Assert.True(resultMap.IsNull(1)); // the other row is masked to a null map
+        Assert.Equal(1, result.NullCount);
     }
 
     [Fact]

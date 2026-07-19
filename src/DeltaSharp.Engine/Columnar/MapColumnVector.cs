@@ -265,6 +265,11 @@ public sealed class MapColumnVector : MutableColumnVector
     /// rows: a field of a null struct is null (#589 / Spark semantics), sharing the entry buffers zero-copy.
     /// Key non-null-ness is inherited from the shared child (masking only ADDS null rows, never keys).
     /// </summary>
+    /// <remarks>Masking clears only the top-level validity bit; the masked row's entry offset span is unchanged,
+    /// so the validity-gated per-row <see cref="KeysAt"/>/<see cref="ValuesAt"/>/<see cref="EntryLength"/> read
+    /// empty while the bulk <see cref="Keys"/>/<see cref="Values"/> views still span it — child data under a
+    /// null slot is undefined (Arrow semantics), so a bulk/late-materialize consumer must gate on top-level
+    /// validity.</remarks>
     /// <param name="parentNulls">Per-logical-row flags (length <see cref="Length"/>) where <see langword="true"/>
     /// forces row <c>i</c> null.</param>
     /// <exception cref="ArgumentException"><paramref name="parentNulls"/> length does not equal <see cref="Length"/>.</exception>
