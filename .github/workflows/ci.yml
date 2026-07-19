@@ -34,7 +34,7 @@ jobs:
       # (ADR-0014). global.json pins the SDK used by `dotnet` to the 10.0.1xx band;
       # the 8.0.x install provides the net8.0 runtime so net8.0 tests can execute.
       - name: Setup .NET (net8 runtime + pinned SDK)
-        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           # Install the net8.0 runtime (to run net8.0 tests) plus the exact SDK pinned
           # by global.json, so CI stays in lockstep with the rollForward policy and a
@@ -82,7 +82,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup .NET (net8 runtime + pinned SDK)
-        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: 8.0.x
           global-json-file: global.json
