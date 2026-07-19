@@ -26,6 +26,14 @@ internal static class RowMaterializer
         BatchResult result, long? maxRows, long? maxBytes, CancellationToken cancellationToken)
     {
         StructType schema = result.Schema;
+
+        // Fail-close an adversarially deep nested result type before the recursive per-row decode can
+        // overflow the stack (symmetric with the encode door). Checked once per column (schema is fixed).
+        for (int c = 0; c < schema.Count; c++)
+        {
+            NestedTypeDepth.Ensure(schema[c].DataType, QueryExecutionStage.Materialize, schema[c].Name);
+        }
+
         var rows = new List<Row>();
         long rowsSoFar = 0;
         long bytesSoFar = 0;
@@ -69,7 +77,7 @@ internal static class RowMaterializer
                 var values = new object?[columnCount];
                 for (int c = 0; c < columnCount; c++)
                 {
-                    values[c] = columns[c].IsNull(r) ? null : ReadValue(columns[c], schema[c], r);
+                    values[c] = columns[c].IsNull(r) ? null : ReadValue(columns[c], schema[c], r, cancellationToken);
                 }
 
                 rows.Add(new Row(schema, values));
@@ -99,7 +107,7 @@ internal static class RowMaterializer
         return count;
     }
 
-    private static object ReadValue(ColumnVector column, StructField field, int index)
+    private static object ReadValue(ColumnVector column, StructField field, int index, CancellationToken cancellationToken)
     {
         DataType type = field.DataType;
         return type switch
@@ -119,9 +127,9 @@ internal static class RowMaterializer
             TimestampNtzType => ReadTimestampNtz(column, field, index),
             StringType => Encoding.UTF8.GetString(column.GetBytes(index)),
             BinaryType => column.GetBytes(index).ToArray(),
-            StructType structType => ReadStruct(column, structType, index),
-            ArrayType arrayType => ReadList(column, arrayType, index),
-            MapType mapType => ReadMap(column, mapType, index),
+            StructType structType => ReadStruct(column, structType, index, cancellationToken),
+            ArrayType arrayType => ReadList(column, arrayType, index, cancellationToken),
+            MapType mapType => ReadMap(column, mapType, index, cancellationToken),
             _ => throw new UnsupportedPlanException(
                 QueryExecutionStage.Materialize,
                 $"Row materialization has no CLR mapping for type '{type.SimpleString}'."),
@@ -131,14 +139,14 @@ internal static class RowMaterializer
     // Reads a struct value as a nested Row (the exact inverse of LocalRelationBatches' struct encode, and
     // the CreateDataFrame nested CLR convention #608): each field is read from its child at the same
     // logical index, null-aware. A null struct row never reaches here — the caller gates on IsNull.
-    private static Row ReadStruct(ColumnVector column, StructType type, int index)
+    private static Row ReadStruct(ColumnVector column, StructType type, int index, CancellationToken cancellationToken)
     {
         var vector = (StructColumnVector)column;
         var values = new object?[type.Count];
         for (int i = 0; i < type.Count; i++)
         {
             ColumnVector child = vector.Child(i);
-            values[i] = child.IsNull(index) ? null : ReadValue(child, type[i], index);
+            values[i] = child.IsNull(index) ? null : ReadValue(child, type[i], index, cancellationToken);
         }
 
         return new Row(type, values);
@@ -147,8 +155,9 @@ internal static class RowMaterializer
     // Reads an array value as an object?[] (an IReadOnlyList<object?>/IEnumerable, the inverse of the
     // non-string-IEnumerable array encode): the row's elements are read from the per-row element view,
     // null-aware. A null array row never reaches here — the caller gates on IsNull; an empty array yields
-    // an empty array.
-    private static object ReadList(ColumnVector column, ArrayType type, int index)
+    // an empty array. The token is polled per element so a single row carrying a huge collection stays
+    // cancellable (the row-level poll alone would not interrupt one gigantic cell).
+    private static object ReadList(ColumnVector column, ArrayType type, int index, CancellationToken cancellationToken)
     {
         var vector = (ListColumnVector)column;
         ColumnVector elements = vector.ElementsAt(index);
@@ -157,7 +166,12 @@ internal static class RowMaterializer
         var elementField = new StructField("element", type.ElementType, type.ContainsNull);
         for (int j = 0; j < count; j++)
         {
-            items[j] = elements.IsNull(j) ? null : ReadValue(elements, elementField, j);
+            if ((j & CancellationPollMask) == 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
+            items[j] = elements.IsNull(j) ? null : ReadValue(elements, elementField, j, cancellationToken);
         }
 
         return items;
@@ -167,7 +181,8 @@ internal static class RowMaterializer
     // map encode): the row's entries are read from the parallel per-row key/value views. Keys are non-null
     // (MapType invariant); values are null-aware. A null map row never reaches here — the caller gates on
     // IsNull; an empty map yields an empty dictionary. On the rare stored duplicate key, last value wins.
-    private static object ReadMap(ColumnVector column, MapType type, int index)
+    // The token is polled per entry so a huge map row stays cancellable.
+    private static object ReadMap(ColumnVector column, MapType type, int index, CancellationToken cancellationToken)
     {
         var vector = (MapColumnVector)column;
         ColumnVector keys = vector.KeysAt(index);
@@ -178,8 +193,13 @@ internal static class RowMaterializer
         var valueField = new StructField("value", type.ValueType, type.ValueContainsNull);
         for (int j = 0; j < count; j++)
         {
-            object key = ReadValue(keys, keyField, j);
-            map[key] = values.IsNull(j) ? null : ReadValue(values, valueField, j);
+            if ((j & CancellationPollMask) == 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
+            object key = ReadValue(keys, keyField, j, cancellationToken);
+            map[key] = values.IsNull(j) ? null : ReadValue(values, valueField, j, cancellationToken);
         }
 
         return map;

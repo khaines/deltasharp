@@ -323,6 +323,31 @@ catch-all so any CLR value renders deterministically.
   and **throws** `InvalidOperationException` when `T` is a non-nullable value type — deterministic and
   documented, so a null typed-getter never silently yields `0`/`false`.
 
+### Nested value CLR convention (#608)
+
+`CreateDataFrame` row materialization (`LocalRelationBatches`) and `collect()` materialization
+(`RowMaterializer`) are symmetric, and fix the CLR representation of a **nested** cell:
+
+| Logical type | `CreateDataFrame` input accepts | `collect()` output produces |
+| --- | --- | --- |
+| `StructType` | a nested `Row` (arity = field count) | a nested `Row` |
+| `ArrayType` | any non-`string` `IEnumerable` (`object?[]`, `List<object?>`, `int[]`, …) | `object?[]` (an `IReadOnlyList<object?>`) |
+| `MapType` | any `IDictionary` (`Dictionary<K,V>`, …); **keys non-null** | `Dictionary<object, object?>` (an `IReadOnlyDictionary<object, object?>`) |
+
+- **Liberal in, canonical out** (Spark-parity-faithful): a `string` is deliberately **not** accepted
+  as an array (it is a scalar `StringType`, not a char sequence); a null map key is rejected
+  fail-closed with a path-named `UnsupportedPlanException`. Nesting composes to arbitrary depth
+  (guarded by a `NestedTypeDepth.MaxDepth` cap so a pathological schema fails closed rather than
+  overflowing the stack).
+- **NULL vs empty** is preserved for arrays and maps (a null array/map has `IsNullAt == true`; an
+  empty one is a non-null empty collection).
+- **Round-trip / equality caveat:** because inputs are liberal but outputs canonical, a round-trip is
+  not type-identity-preserving (`int[]` in → `object?[]` out). A nested **struct** cell is a `Row` and
+  gets deep `Row.Equals`; **array/map** cells fall back to reference equality until deep array/map
+  equality lands ([#418](https://github.com/khaines/deltasharp/issues/418)), so a row containing an
+  array/map cell is **not** `Equals` after `createDataFrame`→`collect` — compare such cells by
+  unpacking them.
+
 ### Deterministic error model (#177 AC3)
 
 | Access | Condition | Exception |

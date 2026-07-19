@@ -47,11 +47,15 @@ namespace DeltaSharp;
 /// <see cref="Row"/> is <b>schema-inclusive</b>: two rows are equal only when their <see cref="Schema"/>s
 /// <i>and</i> values match. This is an intentional, <b>stricter-than-Spark</b> choice (a strictly
 /// schema-carrying <see cref="Row"/>), not plain Spark parity. <see cref="BinaryType"/> (<c>byte[]</c>)
-/// cells compare by <b>content</b> (Spark parity for binary); deeper nested-type deep equality
-/// (arrays/maps/structs) is <b>deferred (M1)</b>. That backlog — typed getters
-/// (<c>getInt</c>/<c>getString</c>/…), <c>toSeq</c>/<c>mkString</c>, complex-type getters and equality, a
-/// <see cref="DataFrame.Show(int, bool)"/> truncate-width overload, and CJK display-width handling — is
-/// tracked by <see href="https://github.com/khaines/deltasharp/issues/418">#418</see>.
+/// cells compare by <b>content</b> (Spark parity for binary). A <b>nested struct</b> cell is itself a
+/// <see cref="Row"/>, so it gets deep, schema-inclusive value equality by recursion; deep equality for
+/// <b>array and map</b> cells (and any struct that transitively contains one) is <b>deferred (M1)</b> —
+/// those fall back to reference equality, so a value-identical row containing an array/map cell is
+/// <b>not</b> <see cref="Equals(object?)"/> after a <c>createDataFrame</c>→<c>collect</c> round-trip until
+/// this lands. That backlog — typed getters
+/// (<c>getInt</c>/<c>getString</c>/…), <c>toSeq</c>/<c>mkString</c>, complex-type getters and array/map
+/// equality, a <see cref="DataFrame.Show(int, bool)"/> truncate-width overload, and CJK display-width
+/// handling — is tracked by <see href="https://github.com/khaines/deltasharp/issues/418">#418</see>.
 /// </para>
 /// </remarks>
 public sealed class Row
@@ -289,7 +293,12 @@ public sealed class Row
     /// strictly schema-carrying value. It makes rows usable as expected results
     /// (<c>Assert.Equal(expected, row)</c>), in
     /// <see cref="System.Collections.Generic.HashSet{T}"/> de-duplication, and with
-    /// <c>Contains</c>/<c>Distinct</c>.
+    /// <c>Contains</c>/<c>Distinct</c> — with one <b>caveat</b> for nested cells: a nested <b>struct</b>
+    /// is a <see cref="Row"/> and compares deeply, but a row containing an <b>array or map</b> cell will
+    /// not compare equal after a <c>createDataFrame</c>→<c>collect</c> round-trip (those cells are fresh
+    /// <see cref="System.Collections.Generic.IReadOnlyList{T}"/>/<see cref="System.Collections.Generic.IReadOnlyDictionary{TKey,TValue}"/>
+    /// instances compared by reference until deep array/map equality lands, #418) — compare such cells by
+    /// unpacking them.
     /// </summary>
     /// <param name="obj">The object to compare with.</param>
     /// <returns><see langword="true"/> when <paramref name="obj"/> is a schema- and value-equal row.</returns>
@@ -321,8 +330,10 @@ public sealed class Row
     /// <see cref="object.Equals(object?, object?)"/> (null-aware). <see cref="BinaryType"/> values are
     /// backed by <see cref="byte"/> arrays, whose default equality is by <b>reference</b>; Spark
     /// compares binary <b>by content</b> (<c>java.util.Arrays.equals</c>), so two equal-content
-    /// <c>byte[]</c> cells are equal here. Other complex/nested types (arrays, maps, structs) still fall
-    /// back to reference/default equality in M1 — that Spark-parity deep-equality work is tracked by
+    /// <c>byte[]</c> cells are equal here. A nested <b>struct</b> cell is a <see cref="Row"/>, so it
+    /// recurses through this same equality and compares deeply (schema-inclusive). <b>Array</b> and
+    /// <b>map</b> cells (and any struct that transitively contains one) still fall back to
+    /// reference/default equality in M1 — that Spark-parity deep array/map equality work is tracked by
     /// <see href="https://github.com/khaines/deltasharp/issues/418">#418</see>.
     /// </summary>
     private static bool ValuesEqual(object? a, object? b)

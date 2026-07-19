@@ -84,6 +84,11 @@ internal static class LocalRelationBatches
         for (int c = 0; c < columnCount; c++)
         {
             StructField field = schema[c];
+
+            // Fail-close an adversarially deep nested type BEFORE ColumnVectors.Create (which recurses to
+            // build the nested child vectors even for a zero-row relation) so it cannot overflow the stack.
+            NestedTypeDepth.Ensure(field.DataType, QueryExecutionStage.Scan, field.Name);
+
             MutableColumnVector vector = ColumnVectors.Create(field.DataType, Math.Max(rowCount, 1));
             for (int r = 0; r < rowCount; r++)
             {
@@ -95,7 +100,7 @@ internal static class LocalRelationBatches
                 }
 
                 object? value = rows[r][c];
-                EncodeValue(vector, field.DataType, field.Name, value);
+                EncodeValue(vector, field.DataType, field.Name, value, cancellationToken);
             }
 
             columns[c] = vector;
@@ -137,20 +142,21 @@ internal static class LocalRelationBatches
     // values follow the CreateDataFrame nested CLR convention (#608): a StructType value is a nested
     // <see cref="Row"/>, an ArrayType value is any non-string IEnumerable, a MapType value is any
     // IDictionary. This is the exact inverse of RowMaterializer.ReadValue.
-    private static void EncodeValue(MutableColumnVector vector, DataType type, string path, object? value)
+    private static void EncodeValue(
+        MutableColumnVector vector, DataType type, string path, object? value, CancellationToken cancellationToken)
     {
         switch (type)
         {
             case StructType structType:
-                EncodeStruct((StructColumnVector)vector, structType, path, value);
+                EncodeStruct((StructColumnVector)vector, structType, path, value, cancellationToken);
                 break;
 
             case ArrayType arrayType:
-                EncodeList((ListColumnVector)vector, arrayType, path, value);
+                EncodeList((ListColumnVector)vector, arrayType, path, value, cancellationToken);
                 break;
 
             case MapType mapType:
-                EncodeMap((MapColumnVector)vector, mapType, path, value);
+                EncodeMap((MapColumnVector)vector, mapType, path, value, cancellationToken);
                 break;
 
             default:
@@ -169,13 +175,14 @@ internal static class LocalRelationBatches
 
     // Encodes a struct value: a null struct advances every field child by one (null) then commits a null
     // struct row; a non-null struct requires a nested Row of the field's arity and recurses per field.
-    private static void EncodeStruct(StructColumnVector vector, StructType type, string path, object? value)
+    private static void EncodeStruct(
+        StructColumnVector vector, StructType type, string path, object? value, CancellationToken cancellationToken)
     {
         if (value is null)
         {
             for (int i = 0; i < type.Count; i++)
             {
-                EncodeValue((MutableColumnVector)vector.Child(i), type[i].DataType, FieldPath(path, type[i].Name), null);
+                EncodeValue((MutableColumnVector)vector.Child(i), type[i].DataType, FieldPath(path, type[i].Name), null, cancellationToken);
             }
 
             vector.AppendNull();
@@ -197,15 +204,18 @@ internal static class LocalRelationBatches
 
         for (int i = 0; i < type.Count; i++)
         {
-            EncodeValue((MutableColumnVector)vector.Child(i), type[i].DataType, FieldPath(path, type[i].Name), row[i]);
+            EncodeValue((MutableColumnVector)vector.Child(i), type[i].DataType, FieldPath(path, type[i].Name), row[i], cancellationToken);
         }
 
         vector.EndStruct();
     }
 
     // Encodes an array value: a null array commits a null list row (no elements); a non-null array is any
-    // non-string IEnumerable whose items encode into the element child in order, then closes the list.
-    private static void EncodeList(ListColumnVector vector, ArrayType type, string path, object? value)
+    // non-string IEnumerable whose items encode into the element child in order, then closes the list. The
+    // cancellation token is polled per element so a single row carrying a huge/unbounded (e.g. lazy generator)
+    // collection stays cancellable — the row-level poll alone would not interrupt one gigantic cell.
+    private static void EncodeList(
+        ListColumnVector vector, ArrayType type, string path, object? value, CancellationToken cancellationToken)
     {
         if (value is null)
         {
@@ -215,18 +225,27 @@ internal static class LocalRelationBatches
 
         IEnumerable elements = AsSequence(path, type, value);
         var elementChild = (MutableColumnVector)vector.Elements;
+        int index = 0;
         foreach (object? element in elements)
         {
-            EncodeValue(elementChild, type.ElementType, ElementPath(path), element);
+            if ((index++ & CancellationPollMask) == 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
+            EncodeValue(elementChild, type.ElementType, ElementPath(path), element, cancellationToken);
         }
 
         vector.EndList();
     }
 
-    // Encodes a map value: a null map commits a null map row (no entries); a non-null map is any
-    // IDictionary whose entries encode into the parallel key/value children, then closes the map. A null
-    // key is rejected fail-closed by the vector (MapType keys are structurally non-null).
-    private static void EncodeMap(MapColumnVector vector, MapType type, string path, object? value)
+    // Encodes a map value: a null map commits a null map row (no entries); a non-null map is any IDictionary
+    // whose entries encode into the parallel key/value children, then closes the map. A null key is rejected
+    // fail-closed HERE with the deterministic path-named UnsupportedPlanException (MapType keys are structurally
+    // non-null) rather than letting the vector's raw InvalidOperationException escape the encoder's contract.
+    // The token is polled per entry so a huge/unbounded map stays cancellable.
+    private static void EncodeMap(
+        MapColumnVector vector, MapType type, string path, object? value, CancellationToken cancellationToken)
     {
         if (value is null)
         {
@@ -241,10 +260,23 @@ internal static class LocalRelationBatches
 
         var keyChild = (MutableColumnVector)vector.Keys;
         var valueChild = (MutableColumnVector)vector.Values;
+        int index = 0;
         foreach (DictionaryEntry entry in dictionary)
         {
-            EncodeValue(keyChild, type.KeyType, KeyPath(path), entry.Key);
-            EncodeValue(valueChild, type.ValueType, ValuePath(path), entry.Value);
+            if ((index++ & CancellationPollMask) == 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
+            if (entry.Key is null)
+            {
+                throw new UnsupportedPlanException(
+                    QueryExecutionStage.Scan,
+                    $"Map column '{KeyPath(path)}' has a null key; MapType keys must be non-null.");
+            }
+
+            EncodeValue(keyChild, type.KeyType, KeyPath(path), entry.Key, cancellationToken);
+            EncodeValue(valueChild, type.ValueType, ValuePath(path), entry.Value, cancellationToken);
         }
 
         vector.EndMap();
