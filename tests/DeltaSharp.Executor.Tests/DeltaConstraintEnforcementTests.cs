@@ -391,6 +391,45 @@ public sealed class DeltaConstraintEnforcementTests : IDisposable
     }
 
     [Fact]
+    public void OverwriteSchema_ZeroRow_DroppingConstrainedColumn_RejectedFailClosed_NoBrick()
+    {
+        // #601: a ZERO-ROW overwriteSchema still REPLACES the schema and commits, so it must validate that a
+        // surviving named CHECK still resolves — independent of row count. Dropping `id` (referenced by the
+        // surviving CHECK) with no rows would otherwise skip enforcement (the empty-write short-circuit) and
+        // brick the table with a dangling CHECK. It is now refused fail-closed with the same parity error.
+        string table = Table("os-drop-constrained-empty");
+        Append(table, Amounts(10, 20)); // v0: {id, amount}
+        AddCheckConstraint(table, "positive_id", "id > 0"); // v1: CHECK references `id`
+
+        using SparkSession spark = NewSession();
+        var amountOnly = new StructType(new[] { new StructField("amount", IntegerType.Instance, nullable: true) });
+        DataFrame df = spark.CreateDataFrame(Array.Empty<Row>(), amountOnly); // ZERO rows, drops `id`
+
+        DeltaConstraintDependentColumnException ex = Assert.Throws<DeltaConstraintDependentColumnException>(
+            () => df.Write.Format("delta").Mode("overwrite").Option("overwriteSchema", "true").Save(table));
+        Assert.Equal("id", ex.ColumnName);
+        Assert.Contains("positive_id", ex.Message);
+        Assert.False(File.Exists(CommitFile(table, 2))); // no dangling-CHECK commit — table not bricked
+    }
+
+    [Fact]
+    public void OverwriteSchema_ZeroRow_KeepingConstrainedColumn_Committed()
+    {
+        // The dual (#601 must not OVER-reject): a ZERO-ROW overwriteSchema that KEEPS the constrained column —
+        // the surviving CHECK still resolves and there are no rows to evaluate — commits normally.
+        string table = Table("os-empty-keep-constrained");
+        Append(table, Amounts(10, 20)); // v0: {id, amount}
+        AddCheckConstraint(table, "positive_id", "id > 0"); // v1: CHECK references `id` (kept)
+
+        using SparkSession spark = NewSession();
+        var idOnly = new StructType(new[] { new StructField("id", IntegerType.Instance, nullable: false) });
+        spark.CreateDataFrame(Array.Empty<Row>(), idOnly) // ZERO rows, keeps `id`
+            .Write.Format("delta").Mode("overwrite").Option("overwriteSchema", "true").Save(table);
+
+        Assert.True(File.Exists(CommitFile(table, 2))); // committed — CHECK resolves, no rows to violate
+    }
+
+    [Fact]
     public void OverwriteSchema_DroppingConstrainedColumn_RejectedFailClosed_NoBrick()
     {
         // #596/#598: an overwriteSchema that DROPS a column a surviving CHECK references must not leave a
