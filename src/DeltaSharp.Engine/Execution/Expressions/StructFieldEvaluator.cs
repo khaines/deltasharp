@@ -15,13 +15,14 @@ namespace DeltaSharp.Engine.Execution.Expressions;
 /// the correct per-row validity, so it is returned <b>zero-copy</b> for any field type. Only when the
 /// struct carries nulls does the result materialize: a flat/primitive field is copied lane-by-lane
 /// with the combined (struct-null OR field-null) validity; a struct field is re-wrapped over its own
-/// (shared) children with the combined validity. A nested <b>collection</b> (array/map) field is
-/// rejected at build time (see <see cref="ExpressionEvaluators.Build"/>) so behavior is deterministic
-/// rather than data-dependent on the presence of a null struct. Under a batch
+/// (shared) children with the combined validity; a nested <b>collection</b> (array/map) field shares
+/// its element/entry buffers and masks only the top-level validity (#589), so a field of a null struct
+/// reads as null. Under a batch
 /// <see cref="ColumnBatch.Selection"/> the struct itself cannot row-gather (#546), so the field is
 /// extracted over the unselected physical rows and the (flat) result is gathered through the
-/// selection — a struct-<i>typed</i> field downstream of a selection still hits the #546 wall when the
-/// gathered result is itself a struct.
+/// selection — a struct- or collection-<i>typed</i> field downstream of a selection still hits the #546
+/// wall (<see cref="ColumnVector.Select"/> is unsupported for struct/list/map) when the gathered result
+/// is itself nested.
 /// </remarks>
 internal sealed class StructFieldEvaluator : ExpressionEvaluator
 {
@@ -75,10 +76,34 @@ internal sealed class StructFieldEvaluator : ExpressionEvaluator
         }
 
         // A null struct row makes the extracted field null, so combine the struct's validity with the
-        // field's own before returning.
-        return field is StructColumnVector nestedStruct
-            ? MaskNestedStruct(nestedStruct, structVector, memory, cancellationToken)
-            : MaskFlatField(field, structVector, memory, cancellationToken);
+        // field's own before returning. A nested struct re-wraps over its (shared) children; a nested
+        // collection (list/map) shares its element/entry buffers and masks only the top-level validity
+        // (#589); a flat field copies lane-by-lane.
+        return field switch
+        {
+            StructColumnVector nestedStruct => MaskNestedStruct(nestedStruct, structVector, memory, cancellationToken),
+            ListColumnVector list => list.WithParentNulls(ParentNullMask(list.Length, structVector, memory, cancellationToken)),
+            MapColumnVector map => map.WithParentNulls(ParentNullMask(map.Length, structVector, memory, cancellationToken)),
+            _ => MaskFlatField(field, structVector, memory, cancellationToken),
+        };
+    }
+
+    // The parent struct's per-row null flags [0, rows), used to mask a nested COLLECTION (list/map) field: a
+    // field of a null struct is null (Spark semantics). The field's own nulls are preserved by WithParentNulls
+    // (which ORs these in over the shared buffers), so only the parent's nulls are collected here. Reserves the
+    // masked result like the flat/struct masking paths so a large masked field is bounded.
+    private bool[] ParentNullMask(
+        int rows, StructColumnVector parent, BatchEvaluationMemory memory, CancellationToken cancellationToken)
+    {
+        memory.ReserveVector(Type, rows);
+        var mask = new bool[rows];
+        for (int i = 0; i < rows; i++)
+        {
+            CancellationPolicy.Poll(cancellationToken, i);
+            mask[i] = parent.IsNull(i);
+        }
+
+        return mask;
     }
 
     // A selection-free view over the batch's physical rows (shared column vectors, no copy), so the

@@ -125,21 +125,10 @@ internal static class ExpressionEvaluators
                 return new NullCheckEvaluator(isNull, Build(isNull.Child, inputSchema, backendName, kind));
 
             case StructFieldExpression structField:
-                if (structField.Type is ArrayType or MapType)
-                {
-                    // Masking a null-struct row over a nested collection field would need a
-                    // list/map-aware re-wrap; #580 supports scalar and struct fields only. Reject at
-                    // build (Open) time so behavior is deterministic — never data-dependent on whether
-                    // the batch happens to contain a null struct. Nested collection field access is
-                    // tracked on the #546 nested line.
-                    throw new UnsupportedOperatorException(
-                        kind,
-                        backendName,
-                        $"extracting a nested '{structField.Type.SimpleString}' field from a struct is not "
-                        + "supported in the interpreted v1 (nested collection field access is tracked on the "
-                        + "#546 nested line); extract a scalar or struct field, or read the column directly");
-                }
-
+                // #589: the interpreted StructFieldEvaluator supports nested struct AND collection (array/map)
+                // field access. Extracting a field of a null struct reads as null — a struct field re-wraps its
+                // (shared) children with the combined validity, a list/map field shares its element/entry
+                // buffers and masks only the top-level validity, and a flat field copies lane-by-lane.
                 return new StructFieldEvaluator(
                     structField, Build(structField.Child, inputSchema, backendName, kind));
 

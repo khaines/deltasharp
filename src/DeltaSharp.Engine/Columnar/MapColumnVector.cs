@@ -259,6 +259,47 @@ public sealed class MapColumnVector : MutableColumnVector
     }
 
     /// <summary>
+    /// A view sharing this map's key and value children and offsets, but with the top-level validity masked so
+    /// every logical row where <paramref name="parentNulls"/> is <see langword="true"/> reads as a null map
+    /// (OR-ed into this map's own nulls). Used to extract a nested map field of a struct that carries null
+    /// rows: a field of a null struct is null (#589 / Spark semantics), sharing the entry buffers zero-copy.
+    /// Key non-null-ness is inherited from the shared child (masking only ADDS null rows, never keys).
+    /// </summary>
+    /// <remarks>Masking clears only the top-level validity bit; the masked row's entry offset span is unchanged,
+    /// so the validity-gated per-row <see cref="KeysAt"/>/<see cref="ValuesAt"/>/<see cref="EntryLength"/> read
+    /// empty while the bulk <see cref="Keys"/>/<see cref="Values"/> views still span it — child data under a
+    /// null slot is undefined (Arrow semantics), so a bulk/late-materialize consumer must gate on top-level
+    /// validity.</remarks>
+    /// <param name="parentNulls">Per-logical-row flags (length <see cref="Length"/>) where <see langword="true"/>
+    /// forces row <c>i</c> null.</param>
+    /// <exception cref="ArgumentException"><paramref name="parentNulls"/> length does not equal <see cref="Length"/>.</exception>
+    internal MapColumnVector WithParentNulls(ReadOnlySpan<bool> parentNulls)
+    {
+        if (parentNulls.Length != _length)
+        {
+            throw new ArgumentException(
+                $"parentNulls length {parentNulls.Length} must equal the map Length {_length}.", nameof(parentNulls));
+        }
+
+        // Share both children + offsets (seal so they cannot be mutated under this view, #575); copy only the
+        // top-level validity so masking in the parent-null bits never mutates the source field's validity.
+        SealForView();
+        byte[] validity = (byte[])_validity.Clone();
+        int nullCount = _nullCount;
+        for (int i = 0; i < _length; i++)
+        {
+            int physical = _offset + i;
+            if (parentNulls[i] && Bitmap.Get(validity, physical))
+            {
+                Bitmap.Set(validity, physical, value: false);
+                nullCount++;
+            }
+        }
+
+        return new MapColumnVector(_mapType, _keys, _values, _offsets, validity, _offset, _length, nullCount);
+    }
+
+    /// <summary>
     /// Not supported in this increment. A correct row gather over a map must materialize the gathered
     /// variable-length entry ranges into new compacted key/value children and rebuild offsets, which
     /// the nested-representation increment (#570) defers rather than returning a partial/wrong view.

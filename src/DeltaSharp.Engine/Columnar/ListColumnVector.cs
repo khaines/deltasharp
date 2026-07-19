@@ -212,6 +212,45 @@ public sealed class ListColumnVector : MutableColumnVector
     }
 
     /// <summary>
+    /// A view sharing this list's element child and offsets, but with the top-level validity masked so every
+    /// logical row where <paramref name="parentNulls"/> is <see langword="true"/> reads as a null list (OR-ed
+    /// into this list's own nulls). Used to extract a nested list field of a struct that carries null rows: a
+    /// field of a null struct is null (#589 / Spark semantics), sharing the element buffers zero-copy.
+    /// </summary>
+    /// <remarks>Masking clears only the top-level validity bit; the masked row's element offset span is
+    /// unchanged, so the validity-gated per-row <see cref="ElementsAt"/>/<see cref="ElementLength"/> read empty
+    /// while the bulk <see cref="Elements"/> view still spans it — child data under a null slot is undefined
+    /// (Arrow semantics), so a bulk/late-materialize consumer must gate on top-level validity.</remarks>
+    /// <param name="parentNulls">Per-logical-row flags (length <see cref="Length"/>) where <see langword="true"/>
+    /// forces row <c>i</c> null.</param>
+    /// <exception cref="ArgumentException"><paramref name="parentNulls"/> length does not equal <see cref="Length"/>.</exception>
+    internal ListColumnVector WithParentNulls(ReadOnlySpan<bool> parentNulls)
+    {
+        if (parentNulls.Length != _length)
+        {
+            throw new ArgumentException(
+                $"parentNulls length {parentNulls.Length} must equal the list Length {_length}.", nameof(parentNulls));
+        }
+
+        // Share the element child + offsets (seal so they cannot be mutated under this view, #575); copy only
+        // the top-level validity so masking in the parent-null bits never mutates the source field's validity.
+        SealForView();
+        byte[] validity = (byte[])_validity.Clone();
+        int nullCount = _nullCount;
+        for (int i = 0; i < _length; i++)
+        {
+            int physical = _offset + i;
+            if (parentNulls[i] && Bitmap.Get(validity, physical))
+            {
+                Bitmap.Set(validity, physical, value: false);
+                nullCount++;
+            }
+        }
+
+        return new ListColumnVector(_arrayType, _child, _offsets, validity, _offset, _length, nullCount);
+    }
+
+    /// <summary>
     /// Not supported in this increment. A correct row gather over a list must materialize the gathered
     /// variable-length element ranges into a new compacted child and rebuild offsets, which the nested
     /// -representation increment (#570) defers rather than returning a partial/wrong view. Slice for a
