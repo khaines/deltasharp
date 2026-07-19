@@ -34,9 +34,11 @@ public sealed record DeltaTableConstraint(DeltaConstraintKind Kind, string Name,
 /// <summary>
 /// Collects the <see cref="DeltaTableConstraint"/>s a write must enforce (#581): named CHECK constraints
 /// from <c>metaData.configuration</c> (<c>delta.constraints.*</c>) and column invariants from the schema
-/// fields' <c>delta.invariants</c> metadata. Collection fails <b>closed</b> on any constraint this build
-/// cannot fully honor — an empty CHECK predicate, a malformed invariant value, or a <b>nested-field</b>
-/// invariant (per-row enforcement not wired yet, #595) — so a constraint is never silently dropped.
+/// fields' <c>delta.invariants</c> metadata — including a <b>nested struct-field</b> invariant on an
+/// all-struct path (<c>s.f</c>, <c>s.a.b</c>), collected with its fully-qualified path and enforced via
+/// <c>GetStructField</c> (#595). Collection fails <b>closed</b> on any constraint this build cannot fully
+/// honor — an empty CHECK predicate, a malformed invariant value, or an invariant reached <b>through an
+/// array/map</b> (per-element enforcement not wired yet, #606) — so a constraint is never silently dropped.
 /// </summary>
 internal static class DeltaTableConstraints
 {
@@ -61,7 +63,8 @@ internal static class DeltaTableConstraints
     /// table config) survive the replacement and are still collected, but the OLD schema's field invariants
     /// are replaced wholesale by <paramref name="writeSchema"/>'s and so must NOT be collected from the
     /// snapshot.</param>
-    /// <exception cref="DeltaProtocolException">A constraint is malformed, empty, or a nested-field invariant.</exception>
+    /// <exception cref="DeltaProtocolException">A constraint is malformed or empty, or an invariant is reached
+    /// through an array/map (per-element enforcement not wired yet, #606).</exception>
     public static IReadOnlyList<DeltaTableConstraint> CollectForWrite(
         Snapshot? snapshot, StructType writeSchema, bool includeSnapshotInvariants = true)
     {
@@ -136,14 +139,21 @@ internal static class DeltaTableConstraints
                     DeltaConstraintKind.Invariant, field.Name, ParseInvariantExpression(field.Name, persisted)));
             }
 
-            RejectNestedInvariant(field.Name, field.DataType);
+            CollectNestedInvariants(field.Name, field.DataType, insideCollection: false, add);
         }
     }
 
-    // Fail closed if an invariant is attached anywhere in a nested type (struct field / array element / map
-    // key or value) — enforcing it per row needs a nested field-path evaluator not yet wired (#595). Spark
-    // attaches an invariant to the field it guards, including nested fields, so a silent skip is a fail-open.
-    private static void RejectNestedInvariant(string path, DataType type)
+    // Collects nested-field column invariants (#595): a struct field on an ALL-STRUCT path from the root
+    // (`s.f`, `s.a.b`) is ENFORCEABLE — its predicate resolves via GetStructField (#580) and evaluates through
+    // the nested StructFieldEvaluator (#589) — so it is collected with its fully-qualified path as the
+    // constraint name (the predicate references that path). An invariant reached THROUGH an array or map (an
+    // array-element or map key/value struct field) needs per-element enforcement not yet available and is
+    // refused fail-closed (#606), never silently skipped (Spark attaches the invariant to the field it guards;
+    // a skip is a fail-open). NOTE: enforcement is currently unreachable END-TO-END because CreateDataFrame /
+    // LocalRelationBatches rejects nested columns (#608) before enforcement runs; #595 wires + unit-tests the
+    // mechanism so it enforces as soon as nested-column writes land.
+    private static void CollectNestedInvariants(
+        string path, DataType type, bool insideCollection, Action<DeltaTableConstraint> add)
     {
         switch (type)
         {
@@ -151,24 +161,31 @@ internal static class DeltaTableConstraints
                 foreach (StructField field in nested)
                 {
                     string childPath = path + "." + field.Name;
-                    if (field.Metadata.TryGetString(InvariantKey, out _))
+                    if (field.Metadata.TryGetString(InvariantKey, out string? persisted))
                     {
-                        throw DeltaProtocolException.Unsupported(
-                            $"Column '{childPath}' declares a nested 'delta.invariants' column invariant; "
-                            + "per-row enforcement of a nested-field invariant is not supported yet (#595), so "
-                            + "the write is refused fail-closed rather than silently skip it.");
+                        if (insideCollection)
+                        {
+                            throw DeltaProtocolException.Unsupported(
+                                $"Column '{childPath}' declares a 'delta.invariants' invariant reached through an "
+                                + "array/map; per-row enforcement of an array-element or map key/value field "
+                                + "invariant needs a per-element evaluator not yet available (#606), so the write "
+                                + "is refused fail-closed rather than silently skip it.");
+                        }
+
+                        add(new DeltaTableConstraint(
+                            DeltaConstraintKind.Invariant, childPath, ParseInvariantExpression(childPath, persisted)));
                     }
 
-                    RejectNestedInvariant(childPath, field.DataType);
+                    CollectNestedInvariants(childPath, field.DataType, insideCollection, add);
                 }
 
                 break;
             case ArrayType array:
-                RejectNestedInvariant(path + ".element", array.ElementType);
+                CollectNestedInvariants(path + ".element", array.ElementType, insideCollection: true, add);
                 break;
             case MapType map:
-                RejectNestedInvariant(path + ".key", map.KeyType);
-                RejectNestedInvariant(path + ".value", map.ValueType);
+                CollectNestedInvariants(path + ".key", map.KeyType, insideCollection: true, add);
+                CollectNestedInvariants(path + ".value", map.ValueType, insideCollection: true, add);
                 break;
         }
     }
