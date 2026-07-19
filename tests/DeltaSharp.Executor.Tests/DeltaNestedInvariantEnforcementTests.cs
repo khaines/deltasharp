@@ -13,8 +13,8 @@ namespace DeltaSharp.Executor.Tests;
 /// via <c>GetStructField</c> (#580), evaluating through the nested <c>StructFieldEvaluator</c> (#589); a row is
 /// rejected fail-closed when it does not evaluate to <c>true</c> (Delta's <c>CheckDeltaInvariant.assertRule</c>).
 /// These exercise the enforcer directly (<see cref="DeltaLocalSink.EnforceCore"/>); end-to-end enforcement
-/// through the public write door awaits nested-column writes (#571), which reject a nested column at
-/// row-encode before enforcement runs.
+/// through the public write door landed with nested-column CreateDataFrame materialization (#608) — see
+/// <c>DeltaConstraintEnforcementTests.NestedStructFieldInvariant_*</c> for the e2e reject coverage.
 /// </summary>
 public sealed class DeltaNestedInvariantEnforcementTests
 {

@@ -142,42 +142,153 @@ public sealed class LocalRelationBatchesTests
     }
 
     [Fact]
-    public void NestedArrayColumn_IsRejectedFailClosed_BeforeAnyRowIsRead()
+    public void StructColumn_RoundTrips_NestedRow_NullStruct_AndNullField()
     {
-        // The nested-schema gate is schema-only and fires before any row is drained: nested types have a
-        // columnar representation (#570) but no CreateDataFrame materialization yet (#571). Pre-gate, an
-        // all-null nested column would build a null nested vector and succeed; now it is rejected uniformly.
-        StructType schema = Schema(new StructField("xs", new ArrayType(IntegerType.Instance), nullable: true));
+        // #608: a struct column materializes (row→StructColumnVector) and round-trips back to a nested Row.
+        StructType inner = Schema(
+            new StructField("a", IntegerType.Instance, nullable: false),
+            new StructField("b", StringType.Instance, nullable: true));
+        StructType schema = Schema(new StructField("s", inner, nullable: true));
+        var rows = new[]
+        {
+            new Row(schema, new object?[] { new Row(inner, 1, "x") }),
+            new Row(schema, new object?[] { null }),                        // null struct
+            new Row(schema, new object?[] { new Row(inner, new object?[] { 2, null }) }), // null field
+        };
 
-        UnsupportedPlanException ex = Assert.Throws<UnsupportedPlanException>(
-            () => LocalRelationBatches.Build(schema, Array.Empty<Row>()));
-        Assert.Contains("nested column 'xs'", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("#571", ex.Message, StringComparison.Ordinal);
+        IReadOnlyList<Row> got = RoundTrip(schema, rows);
+
+        Assert.Equal(3, got.Count);
+        Row s0 = Assert.IsType<Row>(got[0][0]);
+        Assert.Equal(1, s0.GetAs<int>("a"));
+        Assert.Equal("x", s0.GetAs<string>("b"));
+        Assert.True(got[1].IsNullAt(0));                                    // null struct, not a struct of nulls
+        Row s2 = Assert.IsType<Row>(got[2][0]);
+        Assert.Equal(2, s2.GetAs<int>("a"));
+        Assert.True(s2.IsNullAt(1));                                        // null field inside a non-null struct
     }
 
     [Fact]
-    public void NestedStructColumn_AllNullRows_IsRejectedFailClosed()
+    public void ArrayColumn_RoundTrips_NonNull_Empty_Null_AndNullElements()
     {
-        StructType inner = Schema(new StructField("a", IntegerType.Instance, nullable: true));
+        // #608: an array column round-trips; a NULL array is distinct from an EMPTY array (Spark semantics).
+        StructType schema = Schema(
+            new StructField("xs", new ArrayType(IntegerType.Instance, containsNull: true), nullable: true));
+        var rows = new[]
+        {
+            new Row(schema, new object?[] { new object?[] { 1, 2, 3 } }),
+            new Row(schema, new object?[] { Array.Empty<object?>() }),       // empty (non-null)
+            new Row(schema, new object?[] { null }),                          // null array
+            new Row(schema, new object?[] { new object?[] { 4, null, 6 } }),  // null element
+        };
+
+        IReadOnlyList<Row> got = RoundTrip(schema, rows);
+
+        Assert.Equal(new object?[] { 1, 2, 3 }, Assert.IsAssignableFrom<IReadOnlyList<object?>>(got[0][0]));
+        Assert.Empty(Assert.IsAssignableFrom<IReadOnlyList<object?>>(got[1][0]));
+        Assert.True(got[2].IsNullAt(0));                                     // null array distinct from empty
+        Assert.Equal(new object?[] { 4, null, 6 }, Assert.IsAssignableFrom<IReadOnlyList<object?>>(got[3][0]));
+    }
+
+    [Fact]
+    public void MapColumn_RoundTrips_NonNull_Empty_Null_AndNullValues()
+    {
+        // #608: a map column round-trips; a NULL map is distinct from an EMPTY map, and a null VALUE is kept.
+        StructType schema = Schema(
+            new StructField("m", new MapType(StringType.Instance, IntegerType.Instance, valueContainsNull: true), nullable: true));
+        var rows = new[]
+        {
+            new Row(schema, new object?[] { new Dictionary<object, object?> { ["a"] = 1, ["b"] = 2 } }),
+            new Row(schema, new object?[] { new Dictionary<object, object?>() }),  // empty (non-null)
+            new Row(schema, new object?[] { null }),                               // null map
+            new Row(schema, new object?[] { new Dictionary<object, object?> { ["x"] = null } }),
+        };
+
+        IReadOnlyList<Row> got = RoundTrip(schema, rows);
+
+        var d0 = Assert.IsAssignableFrom<IReadOnlyDictionary<object, object?>>(got[0][0]);
+        Assert.Equal(2, d0.Count);
+        Assert.Equal(1, d0["a"]);
+        Assert.Equal(2, d0["b"]);
+        Assert.Empty(Assert.IsAssignableFrom<IReadOnlyDictionary<object, object?>>(got[1][0]));
+        Assert.True(got[2].IsNullAt(0));                                     // null map distinct from empty
+        var d3 = Assert.IsAssignableFrom<IReadOnlyDictionary<object, object?>>(got[3][0]);
+        Assert.Null(d3["x"]);
+    }
+
+    [Fact]
+    public void ArrayOfStruct_RoundTrips_RecursingNesting()
+    {
+        // #608: nesting composes — an array<struct> materializes and round-trips each element struct.
+        StructType elem = Schema(new StructField("f", IntegerType.Instance, nullable: false));
+        StructType schema = Schema(new StructField("xs", new ArrayType(elem), nullable: true));
+        var rows = new[]
+        {
+            new Row(schema, new object?[] { new object?[] { new Row(elem, 1), new Row(elem, 2) } }),
+        };
+
+        IReadOnlyList<Row> got = RoundTrip(schema, rows);
+
+        var a = Assert.IsAssignableFrom<IReadOnlyList<object?>>(got[0][0]);
+        Assert.Equal(2, a.Count);
+        Assert.Equal(1, Assert.IsType<Row>(a[0]).GetAs<int>("f"));
+        Assert.Equal(2, Assert.IsType<Row>(a[1]).GetAs<int>("f"));
+    }
+
+    [Fact]
+    public void StructColumn_NonRowValue_Throws_NamingTheExpectedType()
+    {
+        StructType inner = Schema(new StructField("a", IntegerType.Instance, nullable: false));
         StructType schema = Schema(new StructField("s", inner, nullable: true));
-        var rows = new[] { new Row(schema, (object?)null), new Row(schema, (object?)null) };
+        var rows = new[] { new Row(schema, new object?[] { "not a row" }) };
 
         UnsupportedPlanException ex = Assert.Throws<UnsupportedPlanException>(
             () => LocalRelationBatches.Build(schema, rows));
-        Assert.Contains("nested column 's'", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("Column 's'", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("expects a DeltaSharp.Row", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void NestedMapColumnCarriedAlongsideScalar_IsRejectedFailClosed()
+    public void StructColumn_NestedRowArityMismatch_Throws()
     {
-        // A nested column merely carried next to a scalar must be rejected at the schema gate, not surface
-        // an internal Select-not-supported error further down the plan.
-        StructType schema = Schema(
-            new StructField("m", new MapType(StringType.Instance, IntegerType.Instance), nullable: true),
-            new StructField("k", IntegerType.Instance, nullable: false));
+        StructType inner = Schema(
+            new StructField("a", IntegerType.Instance, nullable: false),
+            new StructField("b", IntegerType.Instance, nullable: false));
+        StructType wrong = Schema(new StructField("a", IntegerType.Instance, nullable: false));
+        StructType schema = Schema(new StructField("s", inner, nullable: true));
+        var rows = new[] { new Row(schema, new object?[] { new Row(wrong, 1) }) };
 
         UnsupportedPlanException ex = Assert.Throws<UnsupportedPlanException>(
-            () => LocalRelationBatches.Build(schema, Array.Empty<Row>()));
-        Assert.Contains("nested column 'm'", ex.Message, StringComparison.Ordinal);
+            () => LocalRelationBatches.Build(schema, rows));
+        Assert.Contains("expects a Row with 2 field(s)", ex.Message, StringComparison.Ordinal);
     }
+
+    [Fact]
+    public void ArrayColumn_StringValue_Throws_NotTreatedAsCharSequence()
+    {
+        // A string is a scalar StringType value, never an element sequence; accepting it here would silently
+        // mis-encode a mistyped value, so it is rejected fail-closed.
+        StructType schema = Schema(new StructField("xs", new ArrayType(IntegerType.Instance), nullable: true));
+        var rows = new[] { new Row(schema, new object?[] { "abc" }) };
+
+        UnsupportedPlanException ex = Assert.Throws<UnsupportedPlanException>(
+            () => LocalRelationBatches.Build(schema, rows));
+        Assert.Contains("non-string System.Collections.IEnumerable", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void MapColumn_NonDictionaryValue_Throws_NamingTheExpectedType()
+    {
+        StructType schema = Schema(
+            new StructField("m", new MapType(StringType.Instance, IntegerType.Instance), nullable: true));
+        var rows = new[] { new Row(schema, new object?[] { new object?[] { 1 } }) };
+
+        UnsupportedPlanException ex = Assert.Throws<UnsupportedPlanException>(
+            () => LocalRelationBatches.Build(schema, rows));
+        Assert.Contains("expects a System.Collections.IDictionary", ex.Message, StringComparison.Ordinal);
+    }
+
+    private static IReadOnlyList<Row> RoundTrip(StructType schema, params Row[] rows) =>
+        RowMaterializer.Materialize(
+            new BatchResult(schema, LocalRelationBatches.Build(schema, rows)), maxRows: null, maxBytes: null, default);
 }

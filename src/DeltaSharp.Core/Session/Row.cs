@@ -28,7 +28,13 @@ namespace DeltaSharp;
 /// mutable array. Values follow the ADR-0008 logical type model — a field's runtime value is the CLR
 /// representation of its <see cref="StructField.DataType"/> (for example <see cref="int"/> for
 /// <c>int</c>, <see cref="string"/> for <c>string</c>), or <see langword="null"/> when the field is
-/// SQL <c>NULL</c>. See <c>docs/engineering/design/actions-and-row.md</c>.
+/// SQL <c>NULL</c>. A <b>nested</b> value follows the CreateDataFrame/materialization convention
+/// (#608): a <see cref="StructType"/> value is itself a nested <see cref="Row"/>, an
+/// <see cref="ArrayType"/> value is an <see cref="IReadOnlyList{T}"/> of <see cref="object"/> (any
+/// non-<see cref="string"/> <see cref="System.Collections.IEnumerable"/> is accepted on input), and a
+/// <see cref="MapType"/> value is an <see cref="IReadOnlyDictionary{TKey,TValue}"/> keyed by
+/// <see cref="object"/> (any <see cref="System.Collections.IDictionary"/> is accepted on input; map
+/// keys are non-null). See <c>docs/engineering/design/actions-and-row.md</c>.
 /// </para>
 /// <para>
 /// The engine (the <c>DeltaSharp.Executor</c> backend, STORY-04.6.2 / #174) is what produces rows

@@ -233,6 +233,59 @@ public sealed class DeltaConstraintEnforcementTests : IDisposable
         Assert.True(File.Exists(CommitFile(table, 0)));
     }
 
+    // A schema with a struct column `s{f:int}` whose NESTED field `f` declares a column invariant reached by
+    // the all-struct path `s.f` (delta.invariants metadata on `f`, qualified-path predicate `s.f > 0`, #595).
+    private static readonly StructType NestedInner = new(new[]
+    {
+        new StructField(
+            "f", IntegerType.Instance, nullable: false,
+            FieldMetadata.FromEntries(new[] { new KeyValuePair<string, string>(
+                "delta.invariants", "{\"expression\":{\"expression\":\"s.f > 0\"}}") })),
+    });
+
+    private static readonly StructType NestedInvariantSchema = new(new[]
+    {
+        new StructField("s", NestedInner, nullable: true),
+    });
+
+    // One struct-column row per f value; a null f marks a NULL struct row (s.f is then null → not-true).
+    private static IReadOnlyList<Row> NestedRows(params int?[] fValues) =>
+        fValues.Select(f => new Row(
+            NestedInvariantSchema, new object?[] { f is { } v ? new Row(NestedInner, v) : null })).ToList();
+
+    [Fact]
+    public void NestedStructFieldInvariant_OnCreate_ViolatingRow_RejectedFailClosed()
+    {
+        // #608 closes the #595 END-TO-END gap: a struct column now materializes through CreateDataFrame
+        // (row → StructColumnVector), so a nested struct-field invariant (`s.f > 0`, declared in field `f`'s
+        // delta.invariants metadata) is enforced e2e at the write door. A violating row (s.f = -1) is rejected
+        // fail-closed, before any commit — the enforcer runs before Parquet staging, so this needs no nested
+        // Parquet write (which stays scalar-only).
+        string table = Table("nested-invariant-create");
+        using SparkSession spark = NewSession();
+
+        DeltaConstraintViolationException ex = Assert.Throws<DeltaConstraintViolationException>(
+            () => spark.CreateDataFrame(NestedRows(5, -1), NestedInvariantSchema)
+                .Write.Format("delta").Mode("append").Save(table));
+        Assert.Equal("s.f", ex.Constraint.Name);
+        Assert.Equal(DeltaConstraintKind.Invariant, ex.Constraint.Kind);
+        Assert.False(File.Exists(CommitFile(table, 0))); // rejected before any commit
+    }
+
+    [Fact]
+    public void NestedStructFieldInvariant_NullStruct_RejectedAsNotTrue()
+    {
+        // A NULL struct row makes s.f null; the invariant `s.f > 0` evaluates to null (not-true) and is
+        // rejected fail-closed, matching Delta's CheckDeltaInvariant.assertRule (null is not true).
+        string table = Table("nested-invariant-null");
+        using SparkSession spark = NewSession();
+
+        Assert.Throws<DeltaConstraintViolationException>(
+            () => spark.CreateDataFrame(NestedRows(5, null), NestedInvariantSchema)
+                .Write.Format("delta").Mode("append").Save(table));
+        Assert.False(File.Exists(CommitFile(table, 0)));
+    }
+
     [Fact]
     public void OverwriteSchema_SurvivingCheck_ViolatingRow_RejectedFailClosed()
     {

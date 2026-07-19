@@ -119,10 +119,70 @@ internal static class RowMaterializer
             TimestampNtzType => ReadTimestampNtz(column, field, index),
             StringType => Encoding.UTF8.GetString(column.GetBytes(index)),
             BinaryType => column.GetBytes(index).ToArray(),
+            StructType structType => ReadStruct(column, structType, index),
+            ArrayType arrayType => ReadList(column, arrayType, index),
+            MapType mapType => ReadMap(column, mapType, index),
             _ => throw new UnsupportedPlanException(
                 QueryExecutionStage.Materialize,
                 $"Row materialization has no CLR mapping for type '{type.SimpleString}'."),
         };
+    }
+
+    // Reads a struct value as a nested Row (the exact inverse of LocalRelationBatches' struct encode, and
+    // the CreateDataFrame nested CLR convention #608): each field is read from its child at the same
+    // logical index, null-aware. A null struct row never reaches here — the caller gates on IsNull.
+    private static Row ReadStruct(ColumnVector column, StructType type, int index)
+    {
+        var vector = (StructColumnVector)column;
+        var values = new object?[type.Count];
+        for (int i = 0; i < type.Count; i++)
+        {
+            ColumnVector child = vector.Child(i);
+            values[i] = child.IsNull(index) ? null : ReadValue(child, type[i], index);
+        }
+
+        return new Row(type, values);
+    }
+
+    // Reads an array value as an object?[] (an IReadOnlyList<object?>/IEnumerable, the inverse of the
+    // non-string-IEnumerable array encode): the row's elements are read from the per-row element view,
+    // null-aware. A null array row never reaches here — the caller gates on IsNull; an empty array yields
+    // an empty array.
+    private static object ReadList(ColumnVector column, ArrayType type, int index)
+    {
+        var vector = (ListColumnVector)column;
+        ColumnVector elements = vector.ElementsAt(index);
+        int count = elements.Length;
+        var items = new object?[count];
+        var elementField = new StructField("element", type.ElementType, type.ContainsNull);
+        for (int j = 0; j < count; j++)
+        {
+            items[j] = elements.IsNull(j) ? null : ReadValue(elements, elementField, j);
+        }
+
+        return items;
+    }
+
+    // Reads a map value as a Dictionary<object, object?> (an IDictionary, the inverse of the IDictionary
+    // map encode): the row's entries are read from the parallel per-row key/value views. Keys are non-null
+    // (MapType invariant); values are null-aware. A null map row never reaches here — the caller gates on
+    // IsNull; an empty map yields an empty dictionary. On the rare stored duplicate key, last value wins.
+    private static object ReadMap(ColumnVector column, MapType type, int index)
+    {
+        var vector = (MapColumnVector)column;
+        ColumnVector keys = vector.KeysAt(index);
+        ColumnVector values = vector.ValuesAt(index);
+        int count = keys.Length;
+        var map = new Dictionary<object, object?>(count);
+        var keyField = new StructField("key", type.KeyType, nullable: false);
+        var valueField = new StructField("value", type.ValueType, type.ValueContainsNull);
+        for (int j = 0; j < count; j++)
+        {
+            object key = ReadValue(keys, keyField, j);
+            map[key] = values.IsNull(j) ? null : ReadValue(values, valueField, j);
+        }
+
+        return map;
     }
 
     // The driver polls the effective cancellation token every 1024 materialized rows (a power-of-two
