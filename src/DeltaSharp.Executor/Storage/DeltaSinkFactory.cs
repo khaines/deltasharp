@@ -226,8 +226,9 @@ internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
     public void Enforce(
         StructType schema,
         IReadOnlyList<DeltaTableConstraint> constraints,
-        IReadOnlyList<ColumnBatch> batches) =>
-        EnforceCore(schema, constraints, batches, _ansiMode, _memoryBudgetBytes);
+        IReadOnlyList<ColumnBatch> batches,
+        StructType? priorSchema = null) =>
+        EnforceCore(schema, constraints, batches, _ansiMode, _memoryBudgetBytes, priorSchema);
 
     /// <summary>
     /// The ANSI-mode- and memory-budget-explicit core of <see cref="Enforce"/> (#597), so the mode and budget
@@ -239,7 +240,8 @@ internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
         IReadOnlyList<DeltaTableConstraint> constraints,
         IReadOnlyList<ColumnBatch> batches,
         AnsiMode ansiMode,
-        long? memoryBudgetBytes)
+        long? memoryBudgetBytes,
+        StructType? priorSchema = null)
     {
         ArgumentNullException.ThrowIfNull(schema);
         ArgumentNullException.ThrowIfNull(constraints);
@@ -254,6 +256,19 @@ internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
                 $"This write targets a table with {constraints.Count} active per-row constraints, exceeding the "
                 + $"maximum {MaxActiveConstraints} DeltaSharp enforces in one write; the write is refused "
                 + "fail-closed rather than performing unbounded per-row constraint evaluation.");
+        }
+
+        // #619 — reference-based dependent-column check (only when the schema is being REPLACED, i.e. priorSchema
+        // is supplied). Resolution-failure detection (Phase 1) catches a DROPPED/RENAMED column a CHECK reads,
+        // but a RETYPE that still type-resolves (int→bigint under `id > 0`, or a struct-field type change under
+        // `s.f > 0`) resolves cleanly and would silently enforce on the NEW type — where Delta blocks with
+        // DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE. This pass resolves each surviving CHECK against the PRIOR
+        // schema (where it was valid), collects the TOP-LEVEL columns it references, and — for any whose type
+        // differs in the new schema — reports the parity error BEFORE Phase-1 resolution (so an even
+        // type-INCOMPATIBLE retype surfaces as the dependent-column parity error, not a raw DataTypeMismatch).
+        if (priorSchema is not null)
+        {
+            DetectRetypedDependencies(priorSchema, schema, constraints);
         }
 
         // Phase 1 — resolve every constraint against the write schema. A surviving named CHECK that no longer
@@ -291,10 +306,13 @@ internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
                 // the Delta parity error after the pass, instead of the raw analyzer failure. Only named
                 // CHECK constraints are reported: a column invariant is attached to its own field and cannot
                 // be DROP CONSTRAINT'd, and a new write-schema invariant that fails to resolve is a
-                // different, non-reclassified error. A top-level RETYPE that changes an operand type inside
-                // the predicate (e.g. int->string under `id > 0`) still surfaces as DataTypeMismatch from
-                // the comparison — not from nested-field extraction — and remains fail-closed but NOT
-                // reclassified here (a genuine type error, not a dropped dependency).
+                // different, non-reclassified error. A top-level RETYPE of a referenced column is now caught
+                // EARLIER by the #619 reference-based pre-pass (when the prior schema is available, i.e. an
+                // overwriteSchema replacement) and reported as the parity error. Only when NO prior schema is
+                // available (e.g. a direct EnforceCore call without it) does a top-level int->string retype
+                // still surface here as the comparison's DataTypeMismatch — which is NOT one of the reclassified
+                // kinds, so it stays fail-closed but un-reclassified (a genuine type error absent the schema
+                // context needed to attribute it to a dependency).
                 //
                 // #618: prefer the analyzer's structured RootColumn (the bound base struct column for a nested
                 // access, or NameParts[0] for a plain/quoted-dot column) over splitting the flattened Reference
@@ -356,6 +374,115 @@ internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
         memoryBudgetBytes is { } budget
             ? new BoundedExecutionMemory(budget)
             : BoundedExecutionMemory.Unbounded;
+
+    // #619: reference-based dependent-column detection for a schema REPLACEMENT (overwriteSchema). For each
+    // surviving named CHECK, resolve it against the PRIOR schema (where it was valid) to collect the TOP-LEVEL
+    // columns it references, then compare each referenced column's type in the new schema. A column present in
+    // BOTH with a CHANGED type is a retyped dependency that Delta would block via ALTER CHANGE COLUMN
+    // (DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE), but which resolution-failure detection alone misses (a
+    // type-COMPATIBLE retype resolves cleanly). A column ABSENT from the new schema (dropped/renamed) is left to
+    // Phase-1 resolution failure (the #598/#600 path), not double-reported here. Runs before Phase-1 so an even
+    // type-INCOMPATIBLE retype surfaces as the parity error rather than a raw analyzer DataTypeMismatch. Only
+    // named CHECK constraints participate: a column invariant is attached to its own field and travels with a
+    // retype, so it is not an independently droppable dependency.
+    private static void DetectRetypedDependencies(
+        StructType priorSchema, StructType newSchema, IReadOnlyList<DeltaTableConstraint> constraints)
+    {
+        Dictionary<string, List<DeltaTableConstraint>>? retypedByColumn = null;
+        List<string>? retypedOrder = null;
+
+        foreach (DeltaTableConstraint constraint in constraints)
+        {
+            if (constraint.Kind != DeltaConstraintKind.Check)
+            {
+                continue;
+            }
+
+            CoreExpr predicate;
+            try
+            {
+                (predicate, _) = ConstraintExpressionFrontend.ParseResolveWithInput(constraint.Expression, priorSchema);
+            }
+            catch (AnalysisException)
+            {
+                // The CHECK does not cleanly resolve against the PRIOR schema either — not a retyped-dependency
+                // signal. Leave it to Phase-1 resolution against the new schema (drop/rename → #598/#600).
+                continue;
+            }
+
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (ExprAttributeReference reference in CollectReferencedColumns(predicate))
+            {
+                if (!seen.Add(reference.Name))
+                {
+                    continue; // a column referenced multiple times in one predicate is counted once
+                }
+
+                StructField? newField = FindFieldIgnoreCase(newSchema, reference.Name);
+                if (newField is null)
+                {
+                    continue; // dropped/renamed — Phase-1 resolution failure reports it, not here
+                }
+
+                if (newField.DataType.Equals(reference.Type))
+                {
+                    continue; // unchanged type — the CHECK still applies unchanged, no dependency break
+                }
+
+                retypedByColumn ??= new Dictionary<string, List<DeltaTableConstraint>>(StringComparer.OrdinalIgnoreCase);
+                retypedOrder ??= new List<string>();
+                if (!retypedByColumn.TryGetValue(reference.Name, out List<DeltaTableConstraint>? deps))
+                {
+                    deps = new List<DeltaTableConstraint>();
+                    retypedByColumn.Add(reference.Name, deps);
+                    retypedOrder.Add(reference.Name);
+                }
+
+                deps.Add(constraint);
+            }
+        }
+
+        if (retypedOrder is { Count: > 0 })
+        {
+            // Report the first retyped column deterministically (constraints arrive in CollectForWrite's stable
+            // Kind-then-name order), listing every CHECK that depends on it.
+            string column = retypedOrder[0];
+            throw DeltaConstraintDependentColumnException.ForColumnChange(column, retypedByColumn![column]);
+        }
+    }
+
+    // Collects the TOP-LEVEL column attributes a resolved predicate references (a nested access `s.f` roots at
+    // the AttributeReference `s`), walking the immutable expression tree depth-first.
+    private static IEnumerable<ExprAttributeReference> CollectReferencedColumns(CoreExpr expr)
+    {
+        if (expr is ExprAttributeReference attribute)
+        {
+            yield return attribute;
+        }
+
+        foreach (CoreExpr child in expr.Children)
+        {
+            foreach (ExprAttributeReference nested in CollectReferencedColumns(child))
+            {
+                yield return nested;
+            }
+        }
+    }
+
+    // Case-insensitive field lookup (Spark parity; StructType's own index is ordinal), returning null when the
+    // new schema has no field of that name (a dropped/renamed column).
+    private static StructField? FindFieldIgnoreCase(StructType schema, string name)
+    {
+        foreach (StructField field in schema)
+        {
+            if (string.Equals(field.Name, name, StringComparison.OrdinalIgnoreCase))
+            {
+                return field;
+            }
+        }
+
+        return null;
+    }
 
     // The top-level column of a (possibly multipart) analyzer attribute reference: `amount` -> `amount`,
     // `s.f` -> `s` (a dropped struct column referenced via nested access). Delta names the top-level column

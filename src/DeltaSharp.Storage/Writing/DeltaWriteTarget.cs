@@ -185,7 +185,8 @@ public sealed class DeltaWriteTarget : IDisposable
         StructType writeSchema,
         IReadOnlyList<ColumnBatch> batches,
         bool includeSnapshotInvariants = true,
-        bool resolveConstraintsWhenEmpty = false)
+        bool resolveConstraintsWhenEmpty = false,
+        bool detectRetypedDependencies = false)
     {
         // An empty write normally carries no rows to validate, so there is nothing to enforce (and no unenforced
         // data to protect against a bypass) — skip uniformly, keeping an empty create/append/overwrite a benign
@@ -216,7 +217,12 @@ public sealed class DeltaWriteTarget : IDisposable
                 + "the write through the executor's Delta sink (which supplies the enforcer).");
         }
 
-        enforcer.Enforce(writeSchema, constraints, batches);
+        // #619: on a schema REPLACEMENT (overwriteSchema), also hand the enforcer the PRIOR schema so it can
+        // run the reference-based dependent-column check — a surviving CHECK that references a column the
+        // replacement RETYPES (a change that still type-resolves, which the resolvability pass alone misses) is
+        // refused with the same Delta parity error, matching Delta's ALTER CHANGE COLUMN dependency block.
+        StructType? priorSchema = detectRetypedDependencies ? constraintSnapshot?.Schema : null;
+        enforcer.Enforce(writeSchema, constraints, batches, priorSchema);
     }
 
     // #596: the internal fresh-create fixture seams (name-mode / deletion-vector) construct a table with no
@@ -373,10 +379,13 @@ public sealed class DeltaWriteTarget : IDisposable
             // (replaced by writeSchema's), hence includeSnapshotInvariants: false. #601: resolveConstraintsWhenEmpty
             // makes the resolvability pass run even for a ZERO-ROW replacement, so a surviving CHECK that
             // references a column the replacement drops fails closed at resolution (no dangling-CHECK brick),
-            // independent of row count.
+            // independent of row count. #619: detectRetypedDependencies hands the enforcer the PRIOR schema so a
+            // surviving CHECK over a RETYPED column (a change that still type-resolves) is likewise refused with
+            // the Delta parity error — closing the gap where a compatible retype would silently enforce on the
+            // new type.
             EnforceWriteConstraints(
                 enforcer, snapshot, writeSchema, batches, includeSnapshotInvariants: false,
-                resolveConstraintsWhenEmpty: true);
+                resolveConstraintsWhenEmpty: true, detectRetypedDependencies: true);
 
             (IReadOnlyList<StagedDataFile> replaceFiles, long replaceRows) =
                 await StageAsync(plan.PhysicalWriteSchema, plan.PhysicalPartitionColumns, batches, cancellationToken)

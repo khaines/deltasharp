@@ -131,15 +131,19 @@ public sealed class WriteConstraintEnforcementTests : IDisposable
 
         public IReadOnlyList<ColumnBatch>? Batches { get; private set; }
 
+        public StructType? PriorSchema { get; private set; }
+
         public void Enforce(
             StructType schema,
             IReadOnlyList<DeltaTableConstraint> constraints,
-            IReadOnlyList<ColumnBatch> batches)
+            IReadOnlyList<ColumnBatch> batches,
+            StructType? priorSchema = null)
         {
             Calls++;
             Schema = schema;
             Constraints = constraints;
             Batches = batches;
+            PriorSchema = priorSchema;
             if (_reject)
             {
                 throw DeltaConstraintViolationException.ForRow(constraints[0], batchIndex: 0, rowIndex: 0);
@@ -207,6 +211,7 @@ public sealed class WriteConstraintEnforcementTests : IDisposable
         Assert.Equal("positive_id", seen.Name);
         Assert.Equal("id > 0", seen.Expression);
         Assert.Same(batch, Assert.Single(enforcer.Batches!)); // the enforcer validated the exact write batch
+        Assert.Null(enforcer.PriorSchema); // #619: an append does not REPLACE the schema → no retype check
         Assert.Equal(1L, result.Version); // committed on top of the enforced snapshot
     }
 
@@ -263,6 +268,13 @@ public sealed class WriteConstraintEnforcementTests : IDisposable
         Assert.Contains(enforcer.Constraints!, c => c.Kind == DeltaConstraintKind.Check && c.Name == "positive_id");
         Assert.Contains(enforcer.Constraints!, c => c.Kind == DeltaConstraintKind.Invariant && c.Name == "amount");
         Assert.Equal(2, enforcer.Constraints!.Count); // exactly: surviving CHECK + new-schema invariant
+
+        // #619: a schema REPLACEMENT threads the PRIOR schema so the enforcer can run the reference-based
+        // retype check. Here it is the old single-column {id} schema — distinct from the new {id, amount}
+        // schema the batches conform to — proving the pre-pass sees the BEFORE types, not the after types.
+        Assert.NotNull(enforcer.PriorSchema);
+        StructField priorField = Assert.Single(enforcer.PriorSchema!);
+        Assert.Equal("id", priorField.Name);
 
         // The committed metaData STILL declares the CHECK active (it survived the replacement, so enforcing it
         // above is what keeps the table honest — no fail-open, no dangling constraint).
