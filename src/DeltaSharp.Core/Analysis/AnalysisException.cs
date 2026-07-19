@@ -51,6 +51,14 @@ internal enum AnalysisErrorKind
     /// incompatible <c>CASE</c> branch value types.</summary>
     DataTypeMismatch,
 
+    /// <summary>A nested field reference (a struct-field access such as <c>s.f</c>) could not be resolved
+    /// because the base is not a struct or the struct has no such field — a <b>structural</b> absence (the
+    /// field was dropped/renamed, or the base column was retyped away from a struct), distinct from a general
+    /// <see cref="DataTypeMismatch"/> in a predicate's operands. Carries the full nested reference (e.g.
+    /// <c>s.f</c>) in <see cref="AnalysisException.Reference"/> so a caller can attribute the failure to the
+    /// top-level column (#600).</summary>
+    UnresolvedStructField,
+
     /// <summary>An aggregate function appears outside a valid aggregate context (e.g. in a
     /// <c>Select</c>/<c>Filter</c> with no <c>groupBy</c>/<c>agg</c>).</summary>
     MisplacedAggregate,
@@ -353,6 +361,22 @@ internal sealed class AnalysisException : Exception
         return new AnalysisException(
             $"cannot resolve '{reference}' due to data type mismatch: {detail}",
             AnalysisErrorKind.DataTypeMismatch,
+            reference,
+            Array.Empty<string>());
+    }
+
+    /// <summary>Builds an <see cref="AnalysisErrorKind.UnresolvedStructField"/> failure: a nested field
+    /// reference (<paramref name="reference"/>, e.g. <c>s.f</c>) could not be resolved because its base is
+    /// not a struct or the struct has no such field — a <b>structural</b> absence, not a predicate operand
+    /// type mismatch. <paramref name="reference"/> is the full nested path so a caller can normalise it to
+    /// the top-level column (#600).</summary>
+    public static AnalysisException UnresolvedStructField(string reference, string detail)
+    {
+        ArgumentNullException.ThrowIfNull(reference);
+        ArgumentNullException.ThrowIfNull(detail);
+        return new AnalysisException(
+            $"cannot resolve '{reference}': {detail}",
+            AnalysisErrorKind.UnresolvedStructField,
             reference,
             Array.Empty<string>());
     }

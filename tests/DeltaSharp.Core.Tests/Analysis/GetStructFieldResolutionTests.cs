@@ -66,17 +66,24 @@ public sealed class GetStructFieldResolutionTests
     [Fact]
     public void MultipartRef_NonStructLeadingColumn_FailsClosed()
     {
-        Assert.Throws<AnalysisException>(() => ResolveCondition(
+        // #600: extracting a field from a NON-struct base is a structural absence — UnresolvedStructField, not a
+        // generic DataTypeMismatch — so a survivor-CHECK reclassifier can attribute it to the top-level column.
+        var ex = Assert.Throws<AnalysisException>(() => ResolveCondition(
             SchemaWithStructAndTopLevelF,
             new BinaryComparison(Ref("id", "f"), Literal.OfInt(0), ComparisonOperator.GreaterThan)));
+        Assert.Equal(AnalysisErrorKind.UnresolvedStructField, ex.Kind);
+        Assert.Equal("id.f", ex.Reference); // full nested path, so callers can normalise to top-level `id`
     }
 
     [Fact]
     public void MultipartRef_UnknownStructField_FailsClosed()
     {
-        Assert.Throws<AnalysisException>(() => ResolveCondition(
+        // #600: a struct with no such field is likewise UnresolvedStructField, carrying the full `s.nope` path.
+        var ex = Assert.Throws<AnalysisException>(() => ResolveCondition(
             SchemaWithStructAndTopLevelF,
             new BinaryComparison(Ref("s", "nope"), Literal.OfInt(0), ComparisonOperator.GreaterThan)));
+        Assert.Equal(AnalysisErrorKind.UnresolvedStructField, ex.Kind);
+        Assert.Equal("s.nope", ex.Reference);
     }
 
     [Fact]
