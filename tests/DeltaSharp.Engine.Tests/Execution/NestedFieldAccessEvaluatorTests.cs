@@ -321,17 +321,221 @@ public class NestedFieldAccessEvaluatorTests
         Assert.Throws<NotSupportedException>(() => Eval(expr, schema, selected));
     }
 
-    [Fact]
-    public void ArrayField_RejectedAtBuildTime_NotDataDependent()
+    private static ListColumnVector ArrCol(params int[]?[] rows)
     {
-        // A nested collection (array) field is rejected at BUILD (Open) time — deterministic, never
-        // dependent on whether a batch happens to contain a null struct (#546 nested line).
-        StructType s = Struct(new StructField("arr", new ArrayType(DataTypes.IntegerType), nullable: true));
-        StructType schema = Struct(new StructField("s", s, nullable: true));
-        var expr = new StructFieldExpression(
-            new ColumnReference(0, s, nullable: true), 0, new ArrayType(DataTypes.IntegerType), true);
+        var arrayType = new ArrayType(DataTypes.IntegerType);
+        MutableColumnVector elements = ColumnVectors.Create(DataTypes.IntegerType, 8);
+        var offsets = new int[rows.Length + 1];
+        var nulls = new bool[rows.Length];
+        int off = 0;
+        for (int i = 0; i < rows.Length; i++)
+        {
+            if (rows[i] is { } row)
+            {
+                foreach (int e in row)
+                {
+                    elements.AppendValue(e);
+                    off++;
+                }
+            }
+            else
+            {
+                nulls[i] = true;
+            }
 
-        Assert.Throws<UnsupportedOperatorException>(() =>
-            ExpressionEvaluators.Build(expr, schema, BackendName, OperatorKind.Project));
+            offsets[i + 1] = off;
+        }
+
+        return new ListColumnVector(arrayType, elements, offsets, nulls);
+    }
+
+    private static MapColumnVector MapCol(params (int Key, int Value)[]?[] rows)
+    {
+        var mapType = new MapType(DataTypes.IntegerType, DataTypes.IntegerType);
+        MutableColumnVector keys = ColumnVectors.Create(DataTypes.IntegerType, 8);
+        MutableColumnVector values = ColumnVectors.Create(DataTypes.IntegerType, 8);
+        var offsets = new int[rows.Length + 1];
+        var nulls = new bool[rows.Length];
+        int off = 0;
+        for (int i = 0; i < rows.Length; i++)
+        {
+            if (rows[i] is { } row)
+            {
+                foreach ((int k, int v) in row)
+                {
+                    keys.AppendValue(k);
+                    values.AppendValue(v);
+                    off++;
+                }
+            }
+            else
+            {
+                nulls[i] = true;
+            }
+
+            offsets[i + 1] = off;
+        }
+
+        return new MapColumnVector(mapType, keys, values, offsets, nulls);
+    }
+
+    private static int[]?[] ListRows(ColumnVector v)
+    {
+        ListColumnVector list = Assert.IsType<ListColumnVector>(v);
+        var rows = new int[]?[list.Length];
+        for (int i = 0; i < list.Length; i++)
+        {
+            if (list.IsNull(i))
+            {
+                continue;
+            }
+
+            ColumnVector elems = list.ElementsAt(i);
+            var row = new int[elems.Length];
+            for (int j = 0; j < elems.Length; j++)
+            {
+                row[j] = elems.GetValue<int>(j);
+            }
+
+            rows[i] = row;
+        }
+
+        return rows;
+    }
+
+    private static (int Key, int Value)[]?[] MapRows(ColumnVector v)
+    {
+        MapColumnVector map = Assert.IsType<MapColumnVector>(v);
+        var rows = new (int, int)[]?[map.Length];
+        for (int i = 0; i < map.Length; i++)
+        {
+            if (map.IsNull(i))
+            {
+                continue;
+            }
+
+            ColumnVector keys = map.KeysAt(i);
+            ColumnVector values = map.ValuesAt(i);
+            var entries = new (int, int)[keys.Length];
+            for (int j = 0; j < keys.Length; j++)
+            {
+                entries[j] = (keys.GetValue<int>(j), values.GetValue<int>(j));
+            }
+
+            rows[i] = entries;
+        }
+
+        return rows;
+    }
+
+    [Fact]
+    public void ArrayField_FastPath_NonNullableStruct_ExtractsList()
+    {
+        // #589: a nested ARRAY field extracts zero-copy when no struct row is null, preserving the field's own
+        // per-row nulls (row 2 is a null list).
+        var arr = new ArrayType(DataTypes.IntegerType);
+        StructType s = Struct(new StructField("arr", arr, nullable: true));
+        StructType schema = Struct(new StructField("s", s, nullable: false));
+        var column = new StructColumnVector(s, new ColumnVector[] { ArrCol(new[] { 1, 2 }, new[] { 3 }, null) });
+        ColumnBatch batch = Batch(schema, column);
+
+        var expr = new StructFieldExpression(new ColumnReference(0, s, nullable: false), 0, arr, true);
+        ColumnVector result = Eval(expr, schema, batch);
+
+        Assert.Equal(arr, result.Type);
+        Assert.Equal(new int[]?[] { new[] { 1, 2 }, new[] { 3 }, null }, ListRows(result));
+    }
+
+    [Fact]
+    public void ArrayField_NullStruct_MasksFieldToNull()
+    {
+        // #589: extracting an ARRAY field of a NULL struct yields a null list — even though the child list at
+        // that row holds a non-null [9,9] — sharing the element buffers and masking only the top-level validity.
+        var arr = new ArrayType(DataTypes.IntegerType);
+        StructType s = Struct(new StructField("arr", arr, nullable: true));
+        StructType schema = Struct(new StructField("s", s, nullable: true));
+        var column = new StructColumnVector(
+            s, new ColumnVector[] { ArrCol(new[] { 1, 2 }, new[] { 9, 9 }, new[] { 3 }) }, new[] { false, true, false });
+        ColumnBatch batch = Batch(schema, column);
+
+        var expr = new StructFieldExpression(new ColumnReference(0, s, nullable: true), 0, arr, true);
+        ColumnVector result = Eval(expr, schema, batch);
+
+        Assert.Equal(new int[]?[] { new[] { 1, 2 }, null, new[] { 3 } }, ListRows(result));
+    }
+
+    [Fact]
+    public void MapField_FastPath_NonNullableStruct_ExtractsMap()
+    {
+        // #589: a nested MAP field extracts zero-copy when no struct row is null, preserving the field's own
+        // per-row nulls (row 1 is a null map).
+        var map = new MapType(DataTypes.IntegerType, DataTypes.IntegerType);
+        StructType s = Struct(new StructField("m", map, nullable: true));
+        StructType schema = Struct(new StructField("s", s, nullable: false));
+        var column = new StructColumnVector(
+            s, new ColumnVector[] { MapCol(new[] { (1, 10) }, null, new[] { (2, 20), (3, 30) }) });
+        ColumnBatch batch = Batch(schema, column);
+
+        var expr = new StructFieldExpression(new ColumnReference(0, s, nullable: false), 0, map, true);
+        ColumnVector result = Eval(expr, schema, batch);
+
+        Assert.Equal(map, result.Type);
+        Assert.Equal(new (int, int)[]?[] { new[] { (1, 10) }, null, new[] { (2, 20), (3, 30) } }, MapRows(result));
+    }
+
+    [Fact]
+    public void MapField_NullStruct_MasksFieldToNull()
+    {
+        // #589: extracting a MAP field of a NULL struct yields a null map — even though the child map at that
+        // row holds a non-null {9:99} — sharing the key/value buffers and masking only the top-level validity.
+        var map = new MapType(DataTypes.IntegerType, DataTypes.IntegerType);
+        StructType s = Struct(new StructField("m", map, nullable: true));
+        StructType schema = Struct(new StructField("s", s, nullable: true));
+        var column = new StructColumnVector(
+            s, new ColumnVector[] { MapCol(new[] { (1, 10) }, new[] { (9, 99) }, new[] { (2, 20) }) },
+            new[] { false, true, false });
+        ColumnBatch batch = Batch(schema, column);
+
+        var expr = new StructFieldExpression(new ColumnReference(0, s, nullable: true), 0, map, true);
+        ColumnVector result = Eval(expr, schema, batch);
+
+        Assert.Equal(new (int, int)[]?[] { new[] { (1, 10) }, null, new[] { (2, 20) } }, MapRows(result));
+    }
+
+    [Fact]
+    public void SlicedStructParent_ArrayField_MasksRespectingOffset()
+    {
+        // A sliced (offset≠0) struct parent masks the ARRAY field at the right physical rows. Struct rows
+        // [F,T,F,F]; lists [10],[99],[30],[40]. Slice [1,3) -> {null-struct, [30], [40]}.
+        var arr = new ArrayType(DataTypes.IntegerType);
+        StructType s = Struct(new StructField("arr", arr, nullable: true));
+        StructType schema = Struct(new StructField("s", s, nullable: true));
+        var full = new StructColumnVector(
+            s, new ColumnVector[] { ArrCol(new[] { 10 }, new[] { 99 }, new[] { 30 }, new[] { 40 }) },
+            new[] { false, true, false, false });
+        ColumnVector sliced = full.Slice(1, 3);
+        ColumnBatch batch = Batch(schema, sliced);
+
+        var expr = new StructFieldExpression(new ColumnReference(0, s, nullable: true), 0, arr, true);
+        ColumnVector result = Eval(expr, schema, batch);
+
+        Assert.Equal(new int[]?[] { null, new[] { 30 }, new[] { 40 } }, ListRows(result));
+    }
+
+    [Fact]
+    public void CollectionField_UnderSelection_HitsTheGatherWall()
+    {
+        // A collection-TYPED field downstream of a selection still hits the #546 wall (list/map cannot
+        // row-gather), consistent with a struct-typed field — a clean, deterministic per-shape boundary.
+        var arr = new ArrayType(DataTypes.IntegerType);
+        StructType s = Struct(new StructField("arr", arr, nullable: true));
+        StructType schema = Struct(new StructField("s", s, nullable: true));
+        var column = new StructColumnVector(
+            s, new ColumnVector[] { ArrCol(new[] { 1 }, new[] { 2 }, new[] { 3 }) }, new[] { false, false, false });
+        ColumnBatch selected = Batch(schema, column).WithSelection(new SelectionVector(new[] { 2, 0 }));
+
+        var expr = new StructFieldExpression(new ColumnReference(0, s, nullable: true), 0, arr, true);
+
+        Assert.Throws<NotSupportedException>(() => Eval(expr, schema, selected));
     }
 }
