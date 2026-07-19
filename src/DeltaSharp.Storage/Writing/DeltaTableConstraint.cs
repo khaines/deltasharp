@@ -36,9 +36,11 @@ public sealed record DeltaTableConstraint(DeltaConstraintKind Kind, string Name,
 /// from <c>metaData.configuration</c> (<c>delta.constraints.*</c>) and column invariants from the schema
 /// fields' <c>delta.invariants</c> metadata — including a <b>nested struct-field</b> invariant on an
 /// all-struct path (<c>s.f</c>, <c>s.a.b</c>), collected with its fully-qualified path and enforced via
-/// <c>GetStructField</c> (#595). Collection fails <b>closed</b> on any constraint this build cannot fully
-/// honor — an empty CHECK predicate, a malformed invariant value, or an invariant reached <b>through an
-/// array/map</b> (per-element enforcement not wired yet, #606) — so a constraint is never silently dropped.
+/// <c>GetStructField</c> (#595). An invariant reached <b>through an array or map</b> is <b>ignored</b>,
+/// matching Delta's <c>Invariants.getFromSchema</c> (<c>filterRecursively(checkComplexTypes = false)</c>
+/// recurses structs only, never a collection's elements/entries — #606). Collection still fails
+/// <b>closed</b> on a constraint this build cannot honor — an empty CHECK predicate or a malformed
+/// invariant value — so such a constraint is never silently dropped.
 /// </summary>
 internal static class DeltaTableConstraints
 {
@@ -63,8 +65,8 @@ internal static class DeltaTableConstraints
     /// table config) survive the replacement and are still collected, but the OLD schema's field invariants
     /// are replaced wholesale by <paramref name="writeSchema"/>'s and so must NOT be collected from the
     /// snapshot.</param>
-    /// <exception cref="DeltaProtocolException">A constraint is malformed or empty, or an invariant is reached
-    /// through an array/map (per-element enforcement not wired yet, #606).</exception>
+    /// <exception cref="DeltaProtocolException">A CHECK constraint or invariant predicate is malformed or
+    /// empty.</exception>
     public static IReadOnlyList<DeltaTableConstraint> CollectForWrite(
         Snapshot? snapshot, StructType writeSchema, bool includeSnapshotInvariants = true)
     {

@@ -244,6 +244,45 @@ public sealed class DeltaTableConstraintsTests : System.IDisposable
         Assert.Empty(DeltaTableConstraints.CollectForWrite(snapshot: null, schema));
     }
 
+    [Fact]
+    public void CollectForWrite_TopLevelArrayFieldOwnInvariant_IsCollected()
+    {
+        // #606 boundary: an invariant declared DIRECTLY on a top-level array (or map) field is on an
+        // all-struct path from the root, so it is still collected (Delta collects it too — filterRecursively
+        // matches the field before the checkComplexTypes gate governs DESCENT into its elements).
+        var schema = new StructType(new[] { InvariantField("arr", new ArrayType(IntegerType.Instance), "size(arr) > 0") });
+
+        DeltaTableConstraint only = Assert.Single(DeltaTableConstraints.CollectForWrite(snapshot: null, schema));
+        Assert.Equal("arr", only.Name);
+        Assert.Equal("size(arr) > 0", only.Expression);
+    }
+
+    [Fact]
+    public void CollectForWrite_MapKeyStructFieldInvariant_IsIgnored_DeltaParity()
+    {
+        // #606 (Delta parity): an invariant reached through a map KEY (a key-struct field) is ignored, the same
+        // as a map value — checkComplexTypes=false does not descend into either.
+        var keyStruct = new StructType(new[] { InvariantField("f", IntegerType.Instance, "f > 0") });
+        var schema = new StructType(new[]
+        {
+            new StructField("m", new MapType(keyStruct, IntegerType.Instance), nullable: true),
+        });
+
+        Assert.Empty(DeltaTableConstraints.CollectForWrite(snapshot: null, schema));
+    }
+
+    [Fact]
+    public void CollectForWrite_StructInStructUnderArray_IsIgnored_DeltaParity()
+    {
+        // #606: the ENTIRE subtree under a collection is skipped — a struct nested inside a struct inside an
+        // array (arr.element.s.f) is ignored (descent stops at the array, never re-entering struct recursion).
+        var innerStruct = new StructType(new[] { InvariantField("f", IntegerType.Instance, "f > 0") });
+        var element = new StructType(new[] { new StructField("s", innerStruct, nullable: true) });
+        var schema = new StructType(new[] { new StructField("arr", new ArrayType(element), nullable: true) });
+
+        Assert.Empty(DeltaTableConstraints.CollectForWrite(snapshot: null, schema));
+    }
+
     private Snapshot SnapshotWithCheck(string value)
     {
         var schema = new StructType(new[] { new StructField("id", IntegerType.Instance, nullable: false) });
