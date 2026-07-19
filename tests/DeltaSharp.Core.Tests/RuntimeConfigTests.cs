@@ -135,6 +135,17 @@ public sealed class RuntimeConfigTests
         Assert.True(spark.Conf.Contains(ansiKey));
     }
 
+    [Fact]
+    public void Builder_InvalidAnsiEnabledValue_ThrowsAtGetOrCreate_FailFast()
+    {
+        // #603: a builder-supplied spark.sql.ansi.enabled is validated EAGERLY at GetOrCreate (the builder seed
+        // path bypasses Conf.Set-time validation), mirroring the execution-backend key — not deferred to the
+        // first action's ReadAnsiMode.
+        ArgumentException ex = Assert.Throws<ArgumentException>(
+            () => SparkSession.Builder().AppName("ansi").Config("spark.sql.ansi.enabled", "garbage").GetOrCreate());
+        Assert.Contains("garbage", ex.Message, StringComparison.Ordinal);
+    }
+
     [Theory]
     [InlineData("interpreted", ExecutionBackend.Interpreted)]
     [InlineData("COMPILED", ExecutionBackend.Compiled)]

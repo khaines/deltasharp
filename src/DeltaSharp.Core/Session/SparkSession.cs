@@ -437,6 +437,12 @@ public sealed class SparkSession : IDisposable
         _ = ParseExecutionBackend(
             options.TryGetValue(ExecutionBackendConfigKey, out string? raw) ? raw : null);
 
+        // #603: validate a builder-supplied spark.sql.ansi.enabled with the SAME fail-fast discipline as the
+        // backend key (ApplyOptions -> SetInternal bypasses the Conf.Set-time validation), so a bad value fails
+        // at session creation rather than being deferred to the first action's ReadAnsiMode.
+        _ = ParseAnsiEnabled(
+            options.TryGetValue(AnsiEnabledConfigKey, out string? ansiRaw) ? ansiRaw : null);
+
         lock (_globalLock)
         {
             SparkSession? active = _activeSession.Value;
@@ -493,8 +499,8 @@ public sealed class SparkSession : IDisposable
     }
 
     // Parses spark.sql.ansi.enabled (case-insensitive true/false). Unset/empty defaults to true — ANSI is
-    // the DeltaSharp default (ADR-0007/0008). A non-boolean value is rejected fail-closed at Set time
-    // (ValidateTypedConfigValue) with the same discipline as the execution-backend key.
+    // the DeltaSharp default (ADR-0007/0008). A non-boolean value is rejected fail-fast — at Conf.Set time
+    // (ValidateTypedConfigValue) AND at builder GetOrCreate — with the same discipline as the backend key.
     private static bool ParseAnsiEnabled(string? raw)
     {
         if (string.IsNullOrEmpty(raw))

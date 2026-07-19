@@ -14,9 +14,10 @@ namespace DeltaSharp.Executor.Tests;
 /// End-to-end tests for #603: the session's <c>spark.sql.ansi.enabled</c> is threaded (via
 /// <c>ExecutionOptions.From</c> → the physical planner) into BOTH the query path and the write-door
 /// (CHECK-constraint enforcement, which inherits the planner's ANSI mode via the sink factory, #602).
-/// An Ansi session (the default) REPORTS an arithmetic overflow; a Legacy session WRAPS it (two's
-/// complement, not throwing the overflow). The prior tests injected the mode directly into the enforcer;
-/// these prove the missing upstream hop — the session config genuinely selects the mode per action.
+/// An Ansi session (the default) REPORTS an arithmetic overflow; a Legacy session NULLs it (DeltaSharp
+/// nulls on overflow — it never wraps to a two's-complement value; note this differs from Spark non-ANSI,
+/// which wraps). The prior tests injected the mode directly into the enforcer; these prove the missing
+/// upstream hop — the session config genuinely selects the mode per action.
 /// </summary>
 [Collection(SessionExecutionTestCollection.Name)]
 public sealed class SessionAnsiModeEndToEndTests : IDisposable
@@ -70,7 +71,7 @@ public sealed class SessionAnsiModeEndToEndTests : IDisposable
     }
 
     [Fact]
-    public void QueryPath_LegacySession_ArithmeticOverflow_WrapsToNullWithoutThrowing()
+    public void QueryPath_LegacySession_ArithmeticOverflow_NullsWithoutThrowing()
     {
         // spark.sql.ansi.enabled=false = LEGACY: the SAME overflow yields SQL NULL (DeltaSharp's documented
         // Legacy semantics) and does NOT throw — proving the session config selects the mode on the query path.
@@ -95,7 +96,30 @@ public sealed class SessionAnsiModeEndToEndTests : IDisposable
         spark.Conf.Set("spark.sql.ansi.enabled", false); // flip to Legacy at runtime
         DataFrame df2 = spark.CreateDataFrame(MaxValueRows(), Schema)
             .Select(Functions.Col("v").Plus(Functions.Col("v")).As("doubled"));
-        Assert.True(df2.Collect()[0].IsNullAt(0)); // now wraps to NULL
+        Assert.True(df2.Collect()[0].IsNullAt(0)); // now nulls the overflow
+    }
+
+    [Fact]
+    public void ExplainPhysical_IsModeIndependent_AnsiAndLegacyRenderIdentically()
+    {
+        // ExplainPhysical is non-executing: ANSI mode is an eval-time overflow/cast semantic that never appears
+        // in the rendered plan tree, so the physical explain of the SAME query is byte-identical across modes.
+        // This pins the assumption behind leaving ExplainPhysical on the planner default.
+        string ansiPlan;
+        using (SparkSession ansi = NewSession(ansiEnabled: null))
+        {
+            ansiPlan = ansi.CreateDataFrame(MaxValueRows(), Schema)
+                .Select(Functions.Col("v").Plus(Functions.Col("v")).As("doubled")).ExplainString(ExplainMode.Simple);
+        }
+
+        string legacyPlan;
+        using (SparkSession legacy = NewSession(ansiEnabled: false))
+        {
+            legacyPlan = legacy.CreateDataFrame(MaxValueRows(), Schema)
+                .Select(Functions.Col("v").Plus(Functions.Col("v")).As("doubled")).ExplainString(ExplainMode.Simple);
+        }
+
+        Assert.Equal(ansiPlan, legacyPlan);
     }
 
     // ---------- Write-door (CHECK-constraint predicate) ----------
@@ -115,13 +139,28 @@ public sealed class SessionAnsiModeEndToEndTests : IDisposable
     }
 
     [Fact]
-    public void WriteDoor_LegacySession_CheckPredicateOverflow_WrapsThenRejectsRow()
+    public void WriteDoor_LegacySession_CheckPredicateOverflow_NullsThenRejectsRow()
     {
-        // Under LEGACY the SAME CHECK overflow WRAPS (v + v = -2), so `-2 > 0` is false → the row is rejected
-        // as an ordinary constraint violation, NOT an overflow error. Proves the session config drives the
-        // write-door mode end-to-end.
+        // Under LEGACY the CHECK overflow yields SQL NULL (DeltaSharp NULLs on overflow — it never wraps to a
+        // two's-complement value), and NULL is not-true → the row is rejected as an ordinary constraint
+        // violation, NOT an overflow error. Proves the session config drives the write-door mode end-to-end.
         string table = Table("legacy-check");
         CreateTableWithCheck(table, ansiEnabled: false, "v + v > 0");
+
+        using SparkSession spark = NewSession(ansiEnabled: false);
+        Assert.Throws<DeltaConstraintViolationException>(
+            () => spark.CreateDataFrame(MaxValueRows(), Schema).Write.Format("delta").Mode("append").Save(table));
+    }
+
+    [Fact]
+    public void WriteDoor_LegacySession_OverflowIsNulled_NotWrapped_SoStaysFailClosed()
+    {
+        // Bypass guard (security): a CHECK `v + v < 0` at v=int.MaxValue would be ADMITTED by a genuine
+        // two's-complement WRAP (-2 < 0 = true), which would be a real constraint-enforcement bypass. Because
+        // DeltaSharp NULLs the overflow instead, the predicate is NULL (not-true) and the row is REJECTED — so
+        // this test regresses (goes green→fail) only if Legacy ever starts wrapping. It locks fail-closed.
+        string table = Table("legacy-bypass-guard");
+        CreateTableWithCheck(table, ansiEnabled: false, "v + v < 0");
 
         using SparkSession spark = NewSession(ansiEnabled: false);
         Assert.Throws<DeltaConstraintViolationException>(
