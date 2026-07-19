@@ -295,7 +295,12 @@ internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
                 // the predicate (e.g. int->string under `id > 0`) still surfaces as DataTypeMismatch from
                 // the comparison — not from nested-field extraction — and remains fail-closed but NOT
                 // reclassified here (a genuine type error, not a dropped dependency).
-                string column = TopLevelColumn(ex.Reference);
+                //
+                // #618: prefer the analyzer's structured RootColumn (the bound base struct column for a nested
+                // access, or NameParts[0] for a plain/quoted-dot column) over splitting the flattened Reference
+                // string — the latter mis-attributes a qualified `t.s.f` (→ `t`, not the base `s`) or a
+                // quoted-dot column `a.b` (→ `a`, not `a.b`). TopLevelColumn(Reference) remains the fallback.
+                string column = ex.RootColumn ?? TopLevelColumn(ex.Reference);
                 dependentsByColumn ??= new Dictionary<string, List<DeltaTableConstraint>>(StringComparer.OrdinalIgnoreCase);
                 droppedColumnOrder ??= new List<string>();
                 if (!dependentsByColumn.TryGetValue(column, out List<DeltaTableConstraint>? dependents))

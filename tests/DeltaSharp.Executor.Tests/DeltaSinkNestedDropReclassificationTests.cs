@@ -104,6 +104,23 @@ public sealed class DeltaSinkNestedDropReclassificationTests
     }
 
     [Fact]
+    public void EnforceCore_QualifiedNestedFieldDrop_AttributedToBoundBaseNotQualifier()
+    {
+        // #618: a surviving CHECK with a QUALIFIED nested ref `t.s.f` (phantom table qualifier `t`, real base
+        // struct `s` whose field `f` was dropped) is attributed to the bound base column `s` — NOT the
+        // qualifier `t` that a first-dot split of `t.s.f` would wrongly report. The analyzer's structured
+        // RootColumn (the bound base) feeds the per-column aggregation instead of the flattened-string split.
+        var survivingStruct = new StructType(new[] { new StructField("g", IntegerType.Instance, nullable: false) });
+        var schema = new StructType(new[] { new StructField("s", survivingStruct, nullable: true) });
+
+        var ex = Assert.Throws<DeltaConstraintDependentColumnException>(
+            () => DeltaLocalSink.EnforceCore(
+                schema, Checks(("chk_tsf", "t.s.f > 0")), NoBatches, AnsiMode.Ansi, memoryBudgetBytes: null));
+        Assert.Equal("s", ex.ColumnName); // bound base, not the phantom qualifier `t`
+        Assert.Equal("chk_tsf", Assert.Single(ex.Constraints).Name);
+    }
+
+    [Fact]
     public void EnforceCore_TopLevelRetypeUnderComparison_NotReclassified_StaysDataTypeMismatch()
     {
         // GUARD (false-positive scope): retyping a TOP-LEVEL column so a surviving CHECK's COMPARISON no longer
