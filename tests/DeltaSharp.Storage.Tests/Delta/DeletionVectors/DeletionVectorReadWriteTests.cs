@@ -245,7 +245,7 @@ public sealed class DeletionVectorReadWriteTests : IDisposable
 
         var remove = new RemoveFileAction(
             add.Path, DeletionTimestamp: 1, DataChange: true, ExtendedFileMetadata: true,
-            add.PartitionValues, add.Size, DeletionVector: null);
+            add.PartitionValues, add.Size, add.Tags, DeletionVector: null);
         var residualAdd = new AddFileAction(
             add.Path, add.PartitionValues, add.Size, ModificationTime: 1, DataChange: true,
             add.Stats! with { NumRecords = 5 }, add.Tags, inline); // physical count (5), matching Spark
@@ -281,7 +281,7 @@ public sealed class DeletionVectorReadWriteTests : IDisposable
 
         var remove = new RemoveFileAction(
             add.Path, DeletionTimestamp: 1, DataChange: true, ExtendedFileMetadata: true,
-            add.PartitionValues, add.Size, DeletionVector: null);
+            add.PartitionValues, add.Size, add.Tags, DeletionVector: null);
         var poisonedAdd = new AddFileAction(
             add.Path, add.PartitionValues, add.Size, ModificationTime: 1, DataChange: true,
             add.Stats! with { NumRecords = 5 }, add.Tags, poisoned); // honest physical count (5); the DV lies

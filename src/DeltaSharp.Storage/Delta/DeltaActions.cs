@@ -61,7 +61,9 @@ internal sealed record AddFileAction(
 /// <summary>
 /// <c>remove</c> — a tombstone deleting a previously-<c>add</c>ed <see cref="Path"/> from the active
 /// set. Retained for time travel + VACUUM; when <see cref="ExtendedFileMetadata"/> is true it round-trips
-/// <c>partitionValues</c>/<c>size</c> for checkpoint fidelity (design §2.10.1). An optional
+/// the extended trio — <c>partitionValues</c>/<c>size</c>/<c>tags</c> — for checkpoint fidelity and strict
+/// cross-engine readers (design §2.10.1; Delta protocol "Remove File"). <see cref="Tags"/> mirrors
+/// <see cref="AddFileAction.Tags"/> (default empty); DeltaSharp's own removes carry none today. An optional
 /// <see cref="DeletionVector"/> records the DV the removed logical file carried, so the DV forms part of the
 /// logical file's identity when a merge-on-read delete supersedes it with a new DV on the same path.
 /// </summary>
@@ -72,6 +74,7 @@ internal sealed record RemoveFileAction(
     bool ExtendedFileMetadata,
     ImmutableSortedDictionary<string, string?> PartitionValues,
     long? Size,
+    ImmutableSortedDictionary<string, string> Tags,
     DeletionVectorDescriptor? DeletionVector = null) : DeltaAction;
 
 /// <summary>

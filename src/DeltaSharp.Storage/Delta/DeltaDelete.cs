@@ -439,6 +439,7 @@ internal sealed class DeltaDelete
             ExtendedFileMetadata: true,
             input.PartitionValues,
             input.Size,
+            input.Tags,
             input.DeletionVector);
 
     // The stats for a DV-carrying add: numRecords is the PHYSICAL data-file row count (matching Spark — the

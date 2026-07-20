@@ -40,6 +40,7 @@ internal sealed class CheckpointColumns
     private bool?[] _removeExtendedFileMetadata = [];
     private long?[] _removeSize = [];
     private ImmutableSortedDictionary<string, string?>[] _removePartitionValues = [];
+    private ImmutableSortedDictionary<string, string>[] _removeTags = [];
     private DeletionVectorColumns _removeDeletionVector = DeletionVectorColumns.Empty;
 
     // metaData
@@ -108,6 +109,7 @@ internal sealed class CheckpointColumns
             _removeExtendedFileMetadata = await ReadBoolScalarAsync(rowGroup, schema.RemoveExtendedFileMetadata, rowCount, cancellationToken).ConfigureAwait(false),
             _removeSize = await ReadLongScalarAsync(rowGroup, schema.RemoveSize, rowCount, cancellationToken).ConfigureAwait(false),
             _removePartitionValues = await ReadNullableMapAsync(rowGroup, schema.RemovePartitionValues, rowCount, cancellationToken).ConfigureAwait(false),
+            _removeTags = await ReadStringMapAsync(rowGroup, schema.RemoveTags, rowCount, cancellationToken).ConfigureAwait(false),
             _removeDeletionVector = await ReadDeletionVectorAsync(rowGroup, schema.RemoveDeletionVector, rowCount, cancellationToken).ConfigureAwait(false),
 
             _metaId = await ReadStringScalarAsync(rowGroup, schema.MetaId, rowCount, cancellationToken, metaPresent).ConfigureAwait(false),
@@ -168,7 +170,8 @@ internal sealed class CheckpointColumns
             _removePresent[row]
             || _removeDeletionTimestamp[row] is not null || _removeDataChange[row] is not null
             || _removeExtendedFileMetadata[row] is not null || _removeSize[row] is not null
-            || _removePartitionValues[row].Count > 0 || _removeDeletionVector.IsPresent(row));
+            || _removePartitionValues[row].Count > 0 || _removeTags[row].Count > 0
+            || _removeDeletionVector.IsPresent(row));
         RequireKeyIfPresent(!isMeta, "metaData", "id", row, group,
             _metaPresent[row]
             || _metaName[row] is not null || _metaDescription[row] is not null || _metaSchemaString[row] is not null
@@ -205,6 +208,7 @@ internal sealed class CheckpointColumns
                 _removeExtendedFileMetadata[row] ?? false,
                 _removePartitionValues[row],
                 _removeSize[row],
+                _removeTags[row],
                 _removeDeletionVector.Build(row, "remove", group));
         }
 

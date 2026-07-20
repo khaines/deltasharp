@@ -27,7 +27,7 @@ public sealed class DeltaConflictCheckerTests
             DeletionVector: DeletionVectorDescriptor.ForInline(RoaringBitmapArray.Serialize(new long[] { 0 }), 1));
 
     private static RemoveFileAction Remove(string path) =>
-        new(path, DeletionTimestamp: 1L, DataChange: true, ExtendedFileMetadata: false, NoPartition, Size: null);
+        new(path, DeletionTimestamp: 1L, DataChange: true, ExtendedFileMetadata: false, NoPartition, Size: null, NoTags);
 
     private static ProtocolAction Protocol() =>
         new(1, 2, ImmutableArray<string>.Empty, ImmutableArray<string>.Empty);

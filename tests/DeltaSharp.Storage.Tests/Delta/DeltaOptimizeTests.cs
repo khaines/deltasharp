@@ -1541,7 +1541,7 @@ public sealed class DeltaOptimizeTests : IDisposable
         {
             actions.Add(new RemoveFileAction(
                 add.Path, DeletionTimestamp: 1, DataChange: true, ExtendedFileMetadata: true,
-                add.PartitionValues, add.Size, DeletionVector: null));
+                add.PartitionValues, add.Size, add.Tags, DeletionVector: null));
             actions.Add(new AddFileAction(
                 add.Path, add.PartitionValues, add.Size, ModificationTime: 1, DataChange: true,
                 add.Stats! with { NumRecords = physicalRecords }, add.Tags, inline));
@@ -1567,7 +1567,7 @@ public sealed class DeltaOptimizeTests : IDisposable
         {
             actions.Add(new RemoveFileAction(
                 add.Path, DeletionTimestamp: 1, DataChange: true, ExtendedFileMetadata: true,
-                add.PartitionValues, add.Size, DeletionVector: null));
+                add.PartitionValues, add.Size, add.Tags, DeletionVector: null));
             actions.Add(new AddFileAction(
                 add.Path, add.PartitionValues, add.Size, ModificationTime: 1, DataChange: true,
                 add.Stats! with { NumRecords = physicalRecords }, add.Tags, inline));
@@ -1589,7 +1589,7 @@ public sealed class DeltaOptimizeTests : IDisposable
         {
             new RemoveFileAction(
                 dvAdd.Path, DeletionTimestamp: 1, DataChange: true, ExtendedFileMetadata: true,
-                dvAdd.PartitionValues, dvAdd.Size, dvAdd.DeletionVector),
+                dvAdd.PartitionValues, dvAdd.Size, dvAdd.Tags, dvAdd.DeletionVector),
             new AddFileAction(
                 purged.Path, purged.PartitionValues, purged.Size, ModificationTime: 1, DataChange: true,
                 purged.Stats, ImmutableSortedDictionary<string, string>.Empty.WithComparers(StringComparer.Ordinal),

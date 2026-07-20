@@ -49,6 +49,9 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
     private static readonly ImmutableSortedDictionary<string, string?> NoPartition =
         ImmutableSortedDictionary<string, string?>.Empty.WithComparers(StringComparer.Ordinal);
 
+    private static readonly ImmutableSortedDictionary<string, string> NoTags =
+        ImmutableSortedDictionary<string, string>.Empty.WithComparers(StringComparer.Ordinal);
+
     private static StagedDataFile Staged(string path) =>
         new(path, NoPartition, Size: 1L, ModificationTime: 1L, Stats: null);
 
@@ -898,7 +901,7 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
 
         var remove = new RemoveFileAction(
             "seed.parquet", DeletionTimestamp: 1L, DataChange: true, ExtendedFileMetadata: false,
-            NoPartition, Size: null);
+            NoPartition, Size: null, NoTags);
 
         DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(() =>
             new DeltaCommitter(_backend).CommitAsync(

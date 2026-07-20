@@ -34,7 +34,7 @@ public sealed class DeltaCommitJepsenSimulationTests
         new(path, NoPartition, 1L, 1L, DataChange: true, Stats: null, Tags: NoTags);
 
     private static RemoveFileAction Remove(string path) =>
-        new(path, DeletionTimestamp: 1L, DataChange: true, ExtendedFileMetadata: false, NoPartition, Size: null);
+        new(path, DeletionTimestamp: 1L, DataChange: true, ExtendedFileMetadata: false, NoPartition, Size: null, NoTags);
 
     private static TxnAction Txn(string appId, long version) => new(appId, version, LastUpdated: null);
 
