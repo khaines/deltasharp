@@ -36,7 +36,11 @@ public interface IWriteConstraintEnforcer
     /// batches conform to it (same column order).</param>
     /// <param name="constraints">The active constraints the write must satisfy (already collected from the
     /// commit's base snapshot + the write schema's own invariants). Never empty when this is called.</param>
-    /// <param name="batches">The write batches whose rows are validated, in write order.</param>
+    /// <param name="batches">The write batches whose rows are validated, in write order. <b>May be empty</b>: a
+    /// resolve-only caller (e.g. the ALTER DROP/RENAME dependent-CHECK guard, #616) passes zero batches — the
+    /// implementation MUST still run the constraint <b>resolution</b> pass (and raise
+    /// <see cref="DeltaConstraintDependentColumnException"/> for a dangling CHECK) even when there are no rows to
+    /// evaluate; it must not early-return on empty input.</param>
     /// <param name="priorSchema">The table's PRIOR logical schema when this write REPLACES the schema (an
     /// <c>overwriteSchema</c> replacement), else <see langword="null"/>. When supplied, the enforcer additionally
     /// runs a <b>reference-based</b> dependent-column check (#619): a surviving CHECK that references a top-level

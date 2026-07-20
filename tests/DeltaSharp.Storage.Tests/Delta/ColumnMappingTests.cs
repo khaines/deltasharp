@@ -305,7 +305,7 @@ public sealed class ColumnMappingTests : IDisposable
         // Anti-bypass net (mirrors the write door, which throws when constraints exist and no enforcer is wired):
         // a table WITH active constraints but NO enforcer supplied is refused fail-closed rather than silently
         // committing a potential dangling-CHECK brick. (An unconstrained table needs no enforcer — see
-        // DropColumn_IsMetadataOnly_* / RenameColumn_IsMetadataOnly_*, which drop/rename with no enforcer.)
+        // Drop_IsMetadataOnly_* / Rename_IsMetadataOnly_*, which drop/rename with no enforcer.)
         await CreateNameMappedAsync((1L, 100L, "alice"));
         AddCheckConstraintAtV1("score_positive", "score > 0");
 
