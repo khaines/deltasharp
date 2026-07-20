@@ -279,18 +279,22 @@ internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
             }
             catch (AnalysisException ex)
                 when (constraint.Kind == DeltaConstraintKind.Check
-                    && ex.Kind == AnalysisErrorKind.UnresolvedColumn
+                    && (ex.Kind == AnalysisErrorKind.UnresolvedColumn
+                        || ex.Kind == AnalysisErrorKind.UnresolvedStructField)
                     && ex.Reference is not null)
             {
-                // A SURVIVING CHECK references a TOP-LEVEL column the write schema no longer has — an
-                // overwriteSchema (or future ALTER) dropped/renamed it. Collect it (aggregated per column,
-                // normalizing a dropped nested base `s.f` to its top-level column `s`) and surface the Delta
-                // parity error after the pass, instead of the raw "cannot resolve column" failure. Only named
-                // CHECK constraints are reported: a column invariant is attached to its own field and cannot be
-                // DROP CONSTRAINT'd, and a new write-schema invariant that fails to resolve is a different,
-                // non-reclassified error. A nested-field STRUCTURAL drop (struct survives, field dropped) or a
-                // column RETYPE surfaces as DataTypeMismatch (not UnresolvedColumn) and is intentionally NOT
-                // reclassified here — still fail-closed; tracked in #600.
+                // A SURVIVING CHECK references a column the write schema no longer resolves — an
+                // overwriteSchema (or future ALTER) dropped/renamed the TOP-LEVEL column
+                // (UnresolvedColumn), or a NESTED field the CHECK reads was dropped/renamed or its base
+                // struct retyped away from a struct (UnresolvedStructField, #600). Collect it (aggregated
+                // per column, normalizing a nested reference `s.f` to its top-level column `s`) and surface
+                // the Delta parity error after the pass, instead of the raw analyzer failure. Only named
+                // CHECK constraints are reported: a column invariant is attached to its own field and cannot
+                // be DROP CONSTRAINT'd, and a new write-schema invariant that fails to resolve is a
+                // different, non-reclassified error. A top-level RETYPE that changes an operand type inside
+                // the predicate (e.g. int->string under `id > 0`) still surfaces as DataTypeMismatch from
+                // the comparison — not from nested-field extraction — and remains fail-closed but NOT
+                // reclassified here (a genuine type error, not a dropped dependency).
                 string column = TopLevelColumn(ex.Reference);
                 dependentsByColumn ??= new Dictionary<string, List<DeltaTableConstraint>>(StringComparer.OrdinalIgnoreCase);
                 droppedColumnOrder ??= new List<string>();

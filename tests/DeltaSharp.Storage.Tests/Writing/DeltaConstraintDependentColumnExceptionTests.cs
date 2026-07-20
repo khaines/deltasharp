@@ -56,7 +56,7 @@ public sealed class DeltaConstraintDependentColumnExceptionTests
             DeltaConstraintDependentColumnException.ForColumnChange(
                 "id", new[] { Check("c", "id > 0") }, operation: "ALTER TABLE DROP COLUMN");
 
-        Assert.Contains("The ALTER TABLE DROP COLUMN drops or renames 'id'", ex.Message);
+        Assert.Contains("The ALTER TABLE DROP COLUMN changes 'id' (drops, renames, or retypes it)", ex.Message);
     }
 
     [Fact]

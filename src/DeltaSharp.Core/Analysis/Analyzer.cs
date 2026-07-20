@@ -698,14 +698,17 @@ internal sealed class Analyzer
     }
 
     // Builds a GetStructField extracting <paramref name="fieldName"/> from a struct-typed
-    // <paramref name="child"/> (case-insensitive field match, Spark parity), throwing a precise
-    // data-type-mismatch when the child is not a struct or the field is absent/ambiguous.
+    // <paramref name="child"/> (case-insensitive field match, Spark parity). A base that is not a
+    // struct, or a struct with no such field, is a STRUCTURAL absence (the field was dropped/renamed
+    // or the base retyped away from a struct) → UnresolvedStructField, so a survivor-constraint
+    // reclassifier can attribute it to the top-level column (#600). An ambiguous field match remains
+    // a DataTypeMismatch (the reference resolves to a struct, but the path is under-specified).
     private static Expression ExtractStructField(
         Expression child, string fieldName, UnresolvedAttribute origin)
     {
         if (child.Type is not StructType structType)
         {
-            throw AnalysisException.DataTypeMismatch(
+            throw AnalysisException.UnresolvedStructField(
                 origin.Name,
                 $"cannot extract field '{fieldName}' from '{child.SimpleString}' of type "
                 + $"'{child.Type?.SimpleString ?? "unknown"}' — a nested field reference requires a struct");
@@ -733,7 +736,7 @@ internal sealed class Analyzer
 
         if (ordinal < 0)
         {
-            throw AnalysisException.DataTypeMismatch(
+            throw AnalysisException.UnresolvedStructField(
                 origin.Name,
                 $"no such struct field '{fieldName}' in '{structType.SimpleString}'");
         }
