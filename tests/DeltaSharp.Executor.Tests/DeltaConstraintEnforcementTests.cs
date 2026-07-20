@@ -233,6 +233,127 @@ public sealed class DeltaConstraintEnforcementTests : IDisposable
         Assert.True(File.Exists(CommitFile(table, 0)));
     }
 
+    // A schema with a struct column `s{f:int}` whose NESTED field `f` declares a column invariant reached by
+    // the all-struct path `s.f` (delta.invariants metadata on `f`, qualified-path predicate `s.f > 0`, #595).
+    private static readonly StructType NestedInner = new(new[]
+    {
+        new StructField(
+            "f", IntegerType.Instance, nullable: false,
+            FieldMetadata.FromEntries(new[] { new KeyValuePair<string, string>(
+                "delta.invariants", "{\"expression\":{\"expression\":\"s.f > 0\"}}") })),
+    });
+
+    private static readonly StructType NestedInvariantSchema = new(new[]
+    {
+        new StructField("s", NestedInner, nullable: true),
+    });
+
+    // One struct-column row per f value; a null f marks a NULL struct row (s.f is then null → not-true).
+    private static IReadOnlyList<Row> NestedRows(params int?[] fValues) =>
+        fValues.Select(f => new Row(
+            NestedInvariantSchema, new object?[] { f is { } v ? new Row(NestedInner, v) : null })).ToList();
+
+    [Fact]
+    public void NestedStructFieldInvariant_OnCreate_ViolatingRow_RejectedFailClosed()
+    {
+        // #608 closes the #595 END-TO-END gap: a struct column now materializes through CreateDataFrame
+        // (row → StructColumnVector), so a nested struct-field invariant (`s.f > 0`, declared in field `f`'s
+        // delta.invariants metadata) is enforced e2e at the write door. A violating row (s.f = -1) is rejected
+        // fail-closed, before any commit — the enforcer runs before Parquet staging, so this needs no nested
+        // Parquet write (which stays scalar-only).
+        string table = Table("nested-invariant-create");
+        using SparkSession spark = NewSession();
+
+        DeltaConstraintViolationException ex = Assert.Throws<DeltaConstraintViolationException>(
+            () => spark.CreateDataFrame(NestedRows(5, -1), NestedInvariantSchema)
+                .Write.Format("delta").Mode("append").Save(table));
+        Assert.Equal("s.f", ex.Constraint.Name);
+        Assert.Equal(DeltaConstraintKind.Invariant, ex.Constraint.Kind);
+        Assert.False(File.Exists(CommitFile(table, 0))); // rejected before any commit
+    }
+
+    [Fact]
+    public void NestedStructFieldInvariant_NullStruct_RejectedAsNotTrue()
+    {
+        // A NULL struct row makes s.f null; the invariant `s.f > 0` evaluates to null (not-true) and is
+        // rejected fail-closed, matching Delta's CheckDeltaInvariant.assertRule (null is not true).
+        string table = Table("nested-invariant-null");
+        using SparkSession spark = NewSession();
+
+        Assert.Throws<DeltaConstraintViolationException>(
+            () => spark.CreateDataFrame(NestedRows(5, null), NestedInvariantSchema)
+                .Write.Format("delta").Mode("append").Save(table));
+        Assert.False(File.Exists(CommitFile(table, 0)));
+    }
+
+    // A two-level struct s{a{b:int}} whose innermost field `b` declares an invariant on the all-struct path
+    // `s.a.b` (delta.invariants metadata, qualified-path predicate `s.a.b > 0`).
+    private static readonly StructType DeepInnerB = new(new[]
+    {
+        new StructField(
+            "b", IntegerType.Instance, nullable: false,
+            FieldMetadata.FromEntries(new[] { new KeyValuePair<string, string>(
+                "delta.invariants", "{\"expression\":{\"expression\":\"s.a.b > 0\"}}") })),
+    });
+
+    private static readonly StructType DeepNestedSchema =
+        new(new[] { new StructField("s", new StructType(new[] { new StructField("a", DeepInnerB, nullable: false) }), nullable: false) });
+
+    private static IReadOnlyList<Row> DeepRows(params int[] bValues)
+    {
+        StructType a = ((StructType)DeepNestedSchema[0].DataType);
+        return bValues.Select(b => new Row(
+            DeepNestedSchema, new object?[] { new Row(a, new object?[] { new Row(DeepInnerB, b) }) })).ToList();
+    }
+
+    [Fact]
+    public void DeepNestedStructFieldInvariant_OnCreate_ViolatingRow_RejectedFailClosed()
+    {
+        // #608 e2e for a two-level all-struct path: `s.a.b > 0` rejects a violating row (b = -2) end-to-end.
+        string table = Table("deep-nested-invariant");
+        using SparkSession spark = NewSession();
+
+        DeltaConstraintViolationException ex = Assert.Throws<DeltaConstraintViolationException>(
+            () => spark.CreateDataFrame(DeepRows(3, -2), DeepNestedSchema)
+                .Write.Format("delta").Mode("append").Save(table));
+        Assert.Equal("s.a.b", ex.Constraint.Name);
+        Assert.False(File.Exists(CommitFile(table, 0)));
+    }
+
+    // A struct s{a:int, b:int} whose field `a` declares a CROSS-FIELD invariant `s.a > s.b`.
+    private static readonly StructType CrossInner = new(new[]
+    {
+        new StructField(
+            "a", IntegerType.Instance, nullable: false,
+            FieldMetadata.FromEntries(new[] { new KeyValuePair<string, string>(
+                "delta.invariants", "{\"expression\":{\"expression\":\"s.a > s.b\"}}") })),
+        new StructField("b", IntegerType.Instance, nullable: false),
+    });
+
+    private static readonly StructType CrossFieldSchema =
+        new(new[] { new StructField("s", CrossInner, nullable: false) });
+
+    [Fact]
+    public void CrossFieldNestedInvariant_OnCreate_ViolatingRow_RejectedFailClosed()
+    {
+        // A cross-field nested invariant `s.a > s.b` resolves BOTH nested fields and rejects a row where it
+        // does not hold (s.a=1, s.b=4) end-to-end.
+        string table = Table("cross-field-nested-invariant");
+        using SparkSession spark = NewSession();
+
+        DeltaConstraintViolationException ex = Assert.Throws<DeltaConstraintViolationException>(
+            () => spark.CreateDataFrame(
+                    new[]
+                    {
+                        new Row(CrossFieldSchema, new object?[] { new Row(CrossInner, 5, 3) }), // 5 > 3 ok
+                        new Row(CrossFieldSchema, new object?[] { new Row(CrossInner, 1, 4) }), // 1 > 4 violates
+                    },
+                    CrossFieldSchema)
+                .Write.Format("delta").Mode("append").Save(table));
+        Assert.Equal("s.a", ex.Constraint.Name);
+        Assert.False(File.Exists(CommitFile(table, 0)));
+    }
+
     [Fact]
     public void OverwriteSchema_SurvivingCheck_ViolatingRow_RejectedFailClosed()
     {

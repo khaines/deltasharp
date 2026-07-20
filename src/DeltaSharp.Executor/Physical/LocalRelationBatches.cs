@@ -1,3 +1,4 @@
+using System.Collections;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
@@ -13,9 +14,11 @@ namespace DeltaSharp.Executor;
 /// planner can plan a scan over it without the <see cref="IScanSource"/> catalog seam. It is the exact
 /// inverse of <see cref="RowMaterializer"/>: it reads each row's natural CLR value positionally and
 /// writes it onto the typed <see cref="MutableColumnVector"/> lane for the column's ADR-0008
-/// <see cref="DataType"/> (null-aware). Any row whose shape or a value's CLR type does not match the
-/// schema — or a value that cannot be encoded (overflow, unrepresentable date/timestamp/decimal) —
-/// raises the deterministic <see cref="UnsupportedPlanException"/> attributed to
+/// <see cref="DataType"/> (null-aware), recursing through nested columns (#608) — a struct value is a
+/// nested <see cref="Row"/>, an array value a non-string <see cref="System.Collections.IEnumerable"/>,
+/// a map value an <see cref="System.Collections.IDictionary"/>. Any row whose shape or a value's CLR
+/// type does not match the schema — or a value that cannot be encoded (overflow, unrepresentable
+/// date/timestamp/decimal) — raises the deterministic <see cref="UnsupportedPlanException"/> attributed to
 /// <see cref="QueryExecutionStage.Scan"/> (this deferred row→batch encode runs inside
 /// <c>ScanPlan.Execute</c> — a scan/data-in failure, not a planning one, now that #158 is merged)
 /// rather than a raw failure.
@@ -45,26 +48,6 @@ internal static class LocalRelationBatches
     {
         ArgumentNullException.ThrowIfNull(schema);
         ArgumentNullException.ThrowIfNull(data);
-
-        // Nested types (struct/array/map) have a columnar REPRESENTATION (#570) but no CreateDataFrame
-        // materialization yet (decode/build wiring is #571). Reject a nested column here fail-closed and
-        // UNIFORMLY — before any column vector is built — so every case is consistently "not yet supported":
-        // without this, an all-null nested column would build a null nested vector and succeed, while a
-        // non-null one fails later at the Append switch, and a nested column merely carried past a filter
-        // would surface an internal Select-not-supported error. This keeps CreateDataFrame's nested behavior
-        // a single clear rejection until #571 lands materialization.
-        for (int c = 0; c < schema.Count; c++)
-        {
-            DataType columnType = schema[c].DataType;
-            if (columnType is StructType or ArrayType or MapType)
-            {
-                throw new UnsupportedPlanException(
-                    QueryExecutionStage.Scan,
-                    $"CreateDataFrame does not yet support nested column '{schema[c].Name}' of type "
-                    + $"'{columnType.SimpleString}' (the nested columnar representation landed in #570; "
-                    + "row materialization is tracked in #571).");
-            }
-        }
 
         IReadOnlyList<Row> rows = Drain(data, cancellationToken);
 
@@ -101,6 +84,11 @@ internal static class LocalRelationBatches
         for (int c = 0; c < columnCount; c++)
         {
             StructField field = schema[c];
+
+            // Fail-close an adversarially deep nested type BEFORE ColumnVectors.Create (which recurses to
+            // build the nested child vectors even for a zero-row relation) so it cannot overflow the stack.
+            NestedTypeDepth.Ensure(field.DataType, QueryExecutionStage.Scan, field.Name);
+
             MutableColumnVector vector = ColumnVectors.Create(field.DataType, Math.Max(rowCount, 1));
             for (int r = 0; r < rowCount; r++)
             {
@@ -112,14 +100,7 @@ internal static class LocalRelationBatches
                 }
 
                 object? value = rows[r][c];
-                if (value is null)
-                {
-                    vector.AppendNull();
-                }
-                else
-                {
-                    Append(vector, field, value);
-                }
+                EncodeValue(vector, field.DataType, field.Name, value, cancellationToken);
             }
 
             columns[c] = vector;
@@ -154,78 +135,250 @@ internal static class LocalRelationBatches
     // uncancellable in-memory work identically.
     private const int CancellationPollMask = 1023;
 
-    private static void Append(MutableColumnVector vector, StructField field, object value)
+    // Recursively encodes one value onto its column vector for the given DataType, null- and
+    // nesting-aware. A null value is a SQL NULL: a flat/list/map vector commits a null row directly; a
+    // null struct must still advance every field child by one (a null placeholder) before committing the
+    // null struct row, so the children stay length-aligned (StructColumnVector's build contract). Nested
+    // values follow the CreateDataFrame nested CLR convention (#608): a StructType value is a nested
+    // <see cref="Row"/>, an ArrayType value is any non-string IEnumerable, a MapType value is any
+    // IDictionary. This is the exact inverse of RowMaterializer.ReadValue.
+    private static void EncodeValue(
+        MutableColumnVector vector, DataType type, string path, object? value, CancellationToken cancellationToken)
     {
-        switch (field.DataType)
+        switch (type)
+        {
+            case StructType structType:
+                EncodeStruct((StructColumnVector)vector, structType, path, value, cancellationToken);
+                break;
+
+            case ArrayType arrayType:
+                EncodeList((ListColumnVector)vector, arrayType, path, value, cancellationToken);
+                break;
+
+            case MapType mapType:
+                EncodeMap((MapColumnVector)vector, mapType, path, value, cancellationToken);
+                break;
+
+            default:
+                if (value is null)
+                {
+                    vector.AppendNull();
+                }
+                else
+                {
+                    EncodeScalar(vector, type, path, value);
+                }
+
+                break;
+        }
+    }
+
+    // Encodes a struct value: a null struct advances every field child by one (null) then commits a null
+    // struct row; a non-null struct requires a nested Row of the field's arity and recurses per field.
+    private static void EncodeStruct(
+        StructColumnVector vector, StructType type, string path, object? value, CancellationToken cancellationToken)
+    {
+        if (value is null)
+        {
+            for (int i = 0; i < type.Count; i++)
+            {
+                EncodeValue((MutableColumnVector)vector.Child(i), type[i].DataType, FieldPath(path, type[i].Name), null, cancellationToken);
+            }
+
+            vector.AppendNull();
+            return;
+        }
+
+        if (value is not Row row)
+        {
+            throw NestedTypeMismatch(path, type, "a DeltaSharp.Row", value);
+        }
+
+        if (row.Length != type.Count)
+        {
+            throw new UnsupportedPlanException(
+                QueryExecutionStage.Scan,
+                $"Struct column '{path}' of type '{type.SimpleString}' expects a Row with {type.Count} field(s), "
+                + $"but a row supplied {row.Length}.");
+        }
+
+        for (int i = 0; i < type.Count; i++)
+        {
+            EncodeValue((MutableColumnVector)vector.Child(i), type[i].DataType, FieldPath(path, type[i].Name), row[i], cancellationToken);
+        }
+
+        vector.EndStruct();
+    }
+
+    // Encodes an array value: a null array commits a null list row (no elements); a non-null array is any
+    // non-string IEnumerable whose items encode into the element child in order, then closes the list. The
+    // cancellation token is polled per element so a single row carrying a huge/unbounded (e.g. lazy generator)
+    // collection stays cancellable — the row-level poll alone would not interrupt one gigantic cell.
+    private static void EncodeList(
+        ListColumnVector vector, ArrayType type, string path, object? value, CancellationToken cancellationToken)
+    {
+        if (value is null)
+        {
+            vector.AppendNull();
+            return;
+        }
+
+        IEnumerable elements = AsSequence(path, type, value);
+        var elementChild = (MutableColumnVector)vector.Elements;
+        int index = 0;
+        foreach (object? element in elements)
+        {
+            if ((index++ & CancellationPollMask) == 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
+            EncodeValue(elementChild, type.ElementType, ElementPath(path), element, cancellationToken);
+        }
+
+        vector.EndList();
+    }
+
+    // Encodes a map value: a null map commits a null map row (no entries); a non-null map is any IDictionary
+    // whose entries encode into the parallel key/value children, then closes the map. A null key is rejected
+    // fail-closed HERE with the deterministic path-named UnsupportedPlanException (MapType keys are structurally
+    // non-null) rather than letting the vector's raw InvalidOperationException escape the encoder's contract.
+    // The token is polled per entry so a huge/unbounded map stays cancellable.
+    private static void EncodeMap(
+        MapColumnVector vector, MapType type, string path, object? value, CancellationToken cancellationToken)
+    {
+        if (value is null)
+        {
+            vector.AppendNull();
+            return;
+        }
+
+        if (value is not IDictionary dictionary)
+        {
+            throw NestedTypeMismatch(path, type, "a System.Collections.IDictionary", value);
+        }
+
+        var keyChild = (MutableColumnVector)vector.Keys;
+        var valueChild = (MutableColumnVector)vector.Values;
+        int index = 0;
+        foreach (DictionaryEntry entry in dictionary)
+        {
+            if ((index++ & CancellationPollMask) == 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
+            if (entry.Key is null)
+            {
+                throw new UnsupportedPlanException(
+                    QueryExecutionStage.Scan,
+                    $"Map column '{KeyPath(path)}' has a null key; MapType keys must be non-null.");
+            }
+
+            EncodeValue(keyChild, type.KeyType, KeyPath(path), entry.Key, cancellationToken);
+            EncodeValue(valueChild, type.ValueType, ValuePath(path), entry.Value, cancellationToken);
+        }
+
+        vector.EndMap();
+    }
+
+    // Treats an array value as a sequence of items. Any IEnumerable is accepted (object?[], List<object?>,
+    // a typed collection like int[], …) EXCEPT a string: a string is a scalar StringType value, not a
+    // char sequence, so accepting it here would silently mis-encode a mistyped value.
+    private static IEnumerable AsSequence(string path, ArrayType type, object value)
+    {
+        if (value is string || value is not IEnumerable sequence)
+        {
+            throw NestedTypeMismatch(path, type, "a non-string System.Collections.IEnumerable", value);
+        }
+
+        return sequence;
+    }
+
+    private static UnsupportedPlanException NestedTypeMismatch(string path, DataType type, string expected, object value) =>
+        new(QueryExecutionStage.Scan,
+            $"Column '{path}' is '{type.SimpleString}', which expects {expected} value, but a row supplied a "
+            + $"{value.GetType().Name}.");
+
+    private static string FieldPath(string path, string field) => $"{path}.{field}";
+
+    private static string ElementPath(string path) => $"{path}[]";
+
+    private static string KeyPath(string path) => $"{path}.key";
+
+    private static string ValuePath(string path) => $"{path}.value";
+
+    private static void EncodeScalar(MutableColumnVector vector, DataType type, string path, object value)
+    {
+        switch (type)
         {
             case BooleanType:
-                vector.AppendValue(Expect<bool>(field, value));
+                vector.AppendValue(Expect<bool>(path, type, value));
                 break;
 
             // Spark ByteType is a signed tinyint; the Engine stores it on an unsigned byte lane.
             case ByteType:
-                vector.AppendValue(unchecked((byte)Expect<sbyte>(field, value)));
+                vector.AppendValue(unchecked((byte)Expect<sbyte>(path, type, value)));
                 break;
 
             case ShortType:
-                vector.AppendValue(Expect<short>(field, value));
+                vector.AppendValue(Expect<short>(path, type, value));
                 break;
 
             case IntegerType:
-                vector.AppendValue(Expect<int>(field, value));
+                vector.AppendValue(Expect<int>(path, type, value));
                 break;
 
             case LongType:
-                vector.AppendValue(Expect<long>(field, value));
+                vector.AppendValue(Expect<long>(path, type, value));
                 break;
 
             case FloatType:
-                vector.AppendValue(Expect<float>(field, value));
+                vector.AppendValue(Expect<float>(path, type, value));
                 break;
 
             case DoubleType:
-                vector.AppendValue(Expect<double>(field, value));
+                vector.AppendValue(Expect<double>(path, type, value));
                 break;
 
             case StringType:
-                vector.AppendBytes(Encoding.UTF8.GetBytes(Expect<string>(field, value)));
+                vector.AppendBytes(Encoding.UTF8.GetBytes(Expect<string>(path, type, value)));
                 break;
 
             case BinaryType:
-                vector.AppendBytes(Expect<byte[]>(field, value));
+                vector.AppendBytes(Expect<byte[]>(path, type, value));
                 break;
 
             case DateType:
-                vector.AppendValue(EncodeDate(field, Expect<DateOnly>(field, value)));
+                vector.AppendValue(EncodeDate(Expect<DateOnly>(path, type, value)));
                 break;
 
             case TimestampType:
-                vector.AppendValue(EncodeTimestamp(Expect<DateTime>(field, value)));
+                vector.AppendValue(EncodeTimestamp(Expect<DateTime>(path, type, value)));
                 break;
 
             case TimestampNtzType:
-                vector.AppendValue(EncodeTimestampNtz(Expect<DateTime>(field, value)));
+                vector.AppendValue(EncodeTimestampNtz(Expect<DateTime>(path, type, value)));
                 break;
 
             case DecimalType decimalType:
-                AppendDecimal(vector, field, decimalType, Expect<decimal>(field, value));
+                AppendDecimal(vector, path, decimalType, Expect<decimal>(path, type, value));
                 break;
 
             default:
                 throw new UnsupportedPlanException(
                     QueryExecutionStage.Scan,
-                    $"CreateDataFrame has no CLR encoding for column '{field.Name}' of type "
-                    + $"'{field.DataType.SimpleString}'.");
+                    $"CreateDataFrame has no CLR encoding for column '{path}' of type '{type.SimpleString}'.");
         }
     }
 
-    // Requires the row value's CLR type to match the field's expected encoding type EXACTLY (an int is
-    // not accepted for a LongType lane, etc.). This mirrors Spark's createDataFrame, which does not
-    // silently widen local values, and keeps the failure deterministic and field-named: a caller must
-    // supply the ADR-0008 CLR type for the declared column type. Widening is intentionally NOT performed
-    // so a mismatched literal (e.g. `1` where a `long` is declared) fails loudly rather than masking a
+    // Requires the row value's CLR type to match the expected encoding type EXACTLY (an int is not
+    // accepted for a LongType lane, etc.). This mirrors Spark's createDataFrame, which does not silently
+    // widen local values, and keeps the failure deterministic and path-named: a caller must supply the
+    // ADR-0008 CLR type for the declared column type. Widening is intentionally NOT performed so a
+    // mismatched literal (e.g. `1` where a `long` is declared) fails loudly rather than masking a
     // schema/value drift.
-    private static T Expect<T>(StructField field, object value)
+    private static T Expect<T>(string path, DataType type, object value)
     {
         if (value is T typed)
         {
@@ -234,13 +387,13 @@ internal static class LocalRelationBatches
 
         throw new UnsupportedPlanException(
             QueryExecutionStage.Scan,
-            $"Column '{field.Name}' is '{field.DataType.SimpleString}', which expects a "
+            $"Column '{path}' is '{type.SimpleString}', which expects a "
             + $"{typeof(T).Name} value, but a row supplied a {value.GetType().Name}.");
     }
 
     // A DateType lane stores the Spark epoch-day (days since 1970-01-01) as an int — the exact inverse
     // of RowMaterializer.ReadDate. DateOnly's whole representable range fits comfortably in an int.
-    private static int EncodeDate(StructField field, DateOnly value) =>
+    private static int EncodeDate(DateOnly value) =>
         value.DayNumber - UnixEpochDate.DayNumber;
 
     // A TimestampType lane stores the Spark epoch-microsecond instant as a long — the inverse of
@@ -269,7 +422,7 @@ internal static class LocalRelationBatches
     private static readonly DateOnly UnixEpochDate = new(1970, 1, 1);
 
     private static void AppendDecimal(
-        MutableColumnVector vector, StructField field, DecimalType type, decimal value)
+        MutableColumnVector vector, string path, DecimalType type, decimal value)
     {
         // Encode value as an unscaled integer at the column's declared scale — the inverse of
         // RowMaterializer.ReadDecimal (which reconstructs a System.Decimal from the unscaled lane). A
@@ -278,7 +431,7 @@ internal static class LocalRelationBatches
         {
             throw new UnsupportedPlanException(
                 QueryExecutionStage.Scan,
-                $"Column '{field.Name}' is '{type.SimpleString}': scale {type.Scale.ToString(CultureInfo.InvariantCulture)} exceeds the "
+                $"Column '{path}' is '{type.SimpleString}': scale {type.Scale.ToString(CultureInfo.InvariantCulture)} exceeds the "
                 + $"System.Decimal maximum of {MaxDecimalScale.ToString(CultureInfo.InvariantCulture)}, so a decimal value cannot be encoded.");
         }
 
@@ -289,14 +442,14 @@ internal static class LocalRelationBatches
         }
         catch (OverflowException)
         {
-            throw DecimalOutOfRange(field, type, value);
+            throw DecimalOutOfRange(path, type, value);
         }
 
         if (scaled != decimal.Truncate(scaled))
         {
             throw new UnsupportedPlanException(
                 QueryExecutionStage.Scan,
-                $"Decimal value {Invariant(value)} for column '{field.Name}' cannot be represented at scale "
+                $"Decimal value {Invariant(value)} for column '{path}' cannot be represented at scale "
                 + $"{type.Scale.ToString(CultureInfo.InvariantCulture)} without loss of precision.");
         }
 
@@ -307,7 +460,7 @@ internal static class LocalRelationBatches
         }
         catch (OverflowException)
         {
-            throw DecimalOutOfRange(field, type, value);
+            throw DecimalOutOfRange(path, type, value);
         }
 
         Int128 magnitude = unscaled < 0 ? -unscaled : unscaled;
@@ -315,7 +468,7 @@ internal static class LocalRelationBatches
         {
             throw new UnsupportedPlanException(
                 QueryExecutionStage.Scan,
-                $"Decimal value {Invariant(value)} for column '{field.Name}' does not fit in precision "
+                $"Decimal value {Invariant(value)} for column '{path}' does not fit in precision "
                 + $"{type.Precision.ToString(CultureInfo.InvariantCulture)} (type '{type.SimpleString}').");
         }
 
@@ -330,9 +483,9 @@ internal static class LocalRelationBatches
     }
 
     private static UnsupportedPlanException DecimalOutOfRange(
-        StructField field, DecimalType type, decimal value) =>
+        string path, DecimalType type, decimal value) =>
         new(QueryExecutionStage.Scan,
-            $"Decimal value {Invariant(value)} for column '{field.Name}' is out of range for type "
+            $"Decimal value {Invariant(value)} for column '{path}' is out of range for type "
             + $"'{type.SimpleString}'.");
 
     private static string Invariant(decimal value) => value.ToString(CultureInfo.InvariantCulture);
