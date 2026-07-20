@@ -308,6 +308,7 @@ public sealed class TypeWideningProtocolTests : IDisposable
     }
 
     [Theory]
+    [InlineData("array")]       // array< struct< x:invariant > >
     [InlineData("map-value")]   // map< string, struct< x:invariant > >
     [InlineData("map-key")]     // map< struct< x:invariant >, long >
     public void UpgradeProtocol_LegacyTableWithInvariantUnderArrayOrMap_DoesNotEnumerateInvariants(string nesting)
