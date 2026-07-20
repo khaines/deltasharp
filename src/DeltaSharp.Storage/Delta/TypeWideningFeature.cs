@@ -200,10 +200,14 @@ internal static class TypeWideningFeature
 
 
     // True when any field in the schema carries a column invariant in its metadata — the legacy `invariants`
-    // feature enumerated into writerFeatures on the table-features upgrade (#568). Recurses through EVERY nesting a
-    // Delta invariant can be reachable under (Spark collects invariants through struct fields AND
-    // array-element / map key/value structs), so an invariant inside e.g. `array<struct<x>>` or
-    // `map<string, struct<y>>` is not silently missed.
+    // feature enumerated into writerFeatures on the table-features upgrade (#568). Recurses into STRUCTs only
+    // (#612), matching Delta's Invariants.getFromSchema (filterRecursively(checkComplexTypes = false)) and the
+    // invariant COLLECTION path (#606's CollectNestedInvariants): an invariant reached THROUGH an array element
+    // or a map key/value is NOT counted, so the writer-feature enumeration matches what is actually collected
+    // and enforced — and matches Delta, which would not declare the `invariants` feature for an invariant that
+    // exists only under an array/map. (An invariant declared directly on a top-level array/map FIELD is still
+    // counted: the field itself is on an all-struct path from the root; this only governs descent INTO a
+    // collection's elements/entries.)
     private static bool SchemaHasInvariant(StructType schema)
     {
         foreach (StructField field in schema)
@@ -217,15 +221,12 @@ internal static class TypeWideningFeature
         return false;
     }
 
-    // Descends a field's DATA TYPE looking for a nested struct field that carries a column invariant, through
-    // struct fields, array elements, and map keys/values.
-    private static bool TypeHasInvariant(DataType type) => type switch
-    {
-        StructType structType => SchemaHasInvariant(structType),
-        ArrayType arrayType => TypeHasInvariant(arrayType.ElementType),
-        MapType mapType => TypeHasInvariant(mapType.KeyType) || TypeHasInvariant(mapType.ValueType),
-        _ => false,
-    };
+    // Descends a field's DATA TYPE looking for a nested struct field that carries a column invariant. #612:
+    // checkComplexTypes = false — recurse into STRUCTs only; do NOT descend into an ArrayType element or a
+    // MapType key/value (or any other non-struct type), so feature detection stays consistent with collection
+    // (#606) and Delta.
+    private static bool TypeHasInvariant(DataType type) =>
+        type is StructType structType && SchemaHasInvariant(structType);
 
     private static bool HasFeature(ImmutableArray<string> features) =>
         !features.IsDefault
