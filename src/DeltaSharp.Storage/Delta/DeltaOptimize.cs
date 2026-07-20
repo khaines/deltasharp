@@ -498,22 +498,22 @@ internal sealed class DeltaOptimize
         // operationMetrics (#506); the committer stamps timestamp/engineInfo/txnId. The metrics are the
         // measured totals across every partition's compaction (files/bytes removed = the small inputs,
         // files/bytes added = the compacted outputs, numRows = the rewritten row count).
-        long numFilesAdded = 0;
-        long numFilesRemoved = 0;
+        long numAddedFiles = 0;
+        long numRemovedFiles = 0;
         long numAddedBytes = 0;
         long numRemovedBytes = 0;
         long numRows = 0;
         foreach (PartitionAccumulator accumulator in summaries.Values)
         {
-            numFilesAdded += accumulator.FilesAdded;
-            numFilesRemoved += accumulator.FilesRemoved;
+            numAddedFiles += accumulator.FilesAdded;
+            numRemovedFiles += accumulator.FilesRemoved;
             numAddedBytes += accumulator.BytesAfter;
             numRemovedBytes += accumulator.BytesBefore;
             numRows += accumulator.RowCount;
         }
 
         actions.Insert(0, DeltaCommitInfo.Optimize(
-            numFilesAdded, numFilesRemoved, numAddedBytes, numRemovedBytes, numRows));
+            numAddedFiles, numRemovedFiles, numAddedBytes, numRemovedBytes, numRows));
         DeltaCommitResult commit = await _committer.CommitAsync(
             readSnapshot, actions, DeltaReadScope.ReadFiles(inputPaths), cancellationToken).ConfigureAwait(false);
 

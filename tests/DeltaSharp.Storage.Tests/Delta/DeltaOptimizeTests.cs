@@ -215,6 +215,59 @@ public sealed class DeltaOptimizeTests : IDisposable
         Assert.Equal("8", rawMetrics.GetProperty("numRows").GetString());
     }
 
+    [Fact]
+    public async Task Optimize_MultiPartition_SumsOperationMetrics_AcrossPartitions()
+    {
+        // #506 (multi-accumulator coverage): a WHOLE-TABLE OPTIMIZE over TWO partitions, each with TWO small
+        // files, produces |summaries| == 2 so the cross-partition summation loop in DeltaOptimize is actually
+        // exercised. numAddedFiles must equal the partition COUNT (one compacted output per partition) and
+        // numRemovedFiles the TOTAL input-file count — a per-partition-vs-total confusion (or a transposed
+        // += in the loop) would break exactly one of these. Byte/row metrics are cross-checked against the
+        // OptimizeResult's own summed aggregates.
+        StagedDataFile us1 = await WriteDataFileAsync("region=US/us1.parquet", Batch((1, "a")), Partition(("region", "US")));
+        StagedDataFile us2 = await WriteDataFileAsync("region=US/us2.parquet", Batch((2, "b")), Partition(("region", "US")));
+        StagedDataFile eu1 = await WriteDataFileAsync("region=EU/eu1.parquet", Batch((3, "c")), Partition(("region", "EU")));
+        StagedDataFile eu2 = await WriteDataFileAsync("region=EU/eu2.parquet", Batch((4, "d")), Partition(("region", "EU")));
+        await SeedAsync(PartitionedSchema, partitionColumns: new[] { "region" }, us1, us2, eu1, eu2);
+
+        // No partition filter → both partitions compact; each of the 2 partitions has 2 small files.
+        OptimizeResult result = await Optimize().OptimizeAsync();
+
+        // Two partitions each compacted 2→1: 2 outputs added, 4 inputs removed, 4 rows rewritten. This is the
+        // summed multi-accumulator total (each partition contributes 1 add / 2 removes / 2 rows).
+        Assert.Equal(2, result.Partitions.Length); // |summaries| > 1 — the loop summed across partitions.
+        Assert.Equal(2, result.FilesAdded);
+        Assert.Equal(4, result.FilesRemoved);
+        Assert.Equal(4, result.RowCount);
+
+        IReadOnlyList<DeltaAction> committed =
+            await Log().ReadCommitActionsAsync(result.CommittedVersion!.Value, CancellationToken.None);
+        CommitInfoAction commitInfo = committed.OfType<CommitInfoAction>().Single();
+        ImmutableSortedDictionary<string, string> metrics = commitInfo.OperationMetrics!;
+
+        // numAddedFiles == partition count (one output per partition); numRemovedFiles == total inputs.
+        Assert.Equal("\"2\"", metrics["numAddedFiles"]);
+        Assert.Equal("\"4\"", metrics["numRemovedFiles"]);
+        Assert.Equal("\"4\"", metrics["numRows"]);
+
+        // Byte metrics equal the SUMMED add/remove totals the OptimizeResult accumulated across BOTH
+        // partitions — proving the loop summed BytesAfter/BytesBefore, not just one partition's.
+        Assert.Equal("\"" + result.BytesAfter.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\"",
+            metrics["numAddedBytes"]);
+        Assert.Equal("\"" + result.BytesBefore.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\"",
+            metrics["numRemovedBytes"]);
+
+        // On disk every value is a JSON string (Delta Map<String,String>), never a bare number.
+        JsonElement rawMetrics = await ReadRawOperationMetricsAsync(result.CommittedVersion!.Value);
+        foreach (string key in new[] { "numAddedFiles", "numRemovedFiles", "numAddedBytes", "numRemovedBytes", "numRows" })
+        {
+            Assert.Equal(JsonValueKind.String, rawMetrics.GetProperty(key).ValueKind);
+        }
+
+        Assert.Equal("2", rawMetrics.GetProperty("numAddedFiles").GetString());
+        Assert.Equal("4", rawMetrics.GetProperty("numRemovedFiles").GetString());
+    }
+
     // Reads the RAW on-disk commitInfo.operationMetrics object for a version so a test can assert the actual
     // JSON value KIND (a Delta Map<String,String> value must be a JSON string, never a bare number).
     private async Task<JsonElement> ReadRawOperationMetricsAsync(long version)

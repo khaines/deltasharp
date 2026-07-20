@@ -90,14 +90,14 @@ internal static class DeltaCommitInfo
     /// value is a JSON <b>string</b> — a numeric metric is encoded as a quoted number-string via
     /// <see cref="JsonNumberString"/> (e.g. <c>3</c> ⇒ <c>"3"</c>), NOT a bare JSON number.</para></summary>
     internal static CommitInfoAction Optimize(
-        long numFilesAdded, long numFilesRemoved, long numAddedBytes, long numRemovedBytes, long numRows) =>
+        long numAddedFiles, long numRemovedFiles, long numAddedBytes, long numRemovedBytes, long numRows) =>
         new(
             ImmutableSortedDictionary<string, string>.Empty.WithComparers(StringComparer.Ordinal),
             Operation: OptimizeOperation,
             OperationParameters: Parameters(("predicate", JsonEncodedArray(Array.Empty<string>()))),
             OperationMetrics: Parameters(
-                ("numAddedFiles", JsonNumberString(numFilesAdded)),
-                ("numRemovedFiles", JsonNumberString(numFilesRemoved)),
+                ("numAddedFiles", JsonNumberString(numAddedFiles)),
+                ("numRemovedFiles", JsonNumberString(numRemovedFiles)),
                 ("numAddedBytes", JsonNumberString(numAddedBytes)),
                 ("numRemovedBytes", JsonNumberString(numRemovedBytes)),
                 ("numRows", JsonNumberString(numRows))));
