@@ -10,6 +10,9 @@ namespace DeltaSharp.Plans.Expressions;
 /// overflow-capable/lossy argument widen a <see cref="PropagatesAny"/>/<see cref="PropagatesAll"/>
 /// result (DeltaSharp nulls on overflow/invalid-cast in Legacy).
 /// </summary>
+// Guardrail: a never-null or null-INTRODUCING function (e.g. to_date, a future try_*/nullif) MUST be
+// classified Fixed — PropagatesAny would over-report under Ansi (the #614 concern: isnull-like results
+// must stay NOT-NULL) or mis-handle a bespoke null rule.
 internal enum FunctionNullability
 {
     /// <summary>Result is null if ANY value argument is null (the common SQL default, e.g.
@@ -54,7 +57,11 @@ internal sealed class ResolvedFunction : Expression
     /// <param name="nullPropagation">How the result's nullability relates to its arguments (#627). It
     /// defaults to <see cref="FunctionNullability.PropagatesAny"/> — the common SQL rule — so callers
     /// that do not classify a function get the safe, mode-aware default. Under
-    /// <see cref="AnsiMode.Ansi"/> every classification reproduces <paramref name="nullable"/> exactly.</param>
+    /// <see cref="AnsiMode.Ansi"/> every classification reproduces <paramref name="nullable"/> exactly.
+    /// A never-null or null-INTRODUCING function (e.g. <c>to_date</c>, a future <c>try_*</c>/<c>nullif</c>)
+    /// MUST be classified <see cref="FunctionNullability.Fixed"/> — <see cref="FunctionNullability.PropagatesAny"/>
+    /// would over-report under Ansi (the #614 concern: isnull-like results must stay NOT-NULL) or
+    /// mis-handle a bespoke null rule.</param>
     /// <exception cref="ArgumentException"><paramref name="name"/> is null or empty.</exception>
     /// <exception cref="ArgumentNullException"><paramref name="type"/> or <paramref name="arguments"/>
     /// is null.</exception>
@@ -137,6 +144,8 @@ internal sealed class ResolvedFunction : Expression
     }
 
     /// <inheritdoc/>
+    // NullPropagation is deliberately excluded from equality/hashing: it is a deterministic function of
+    // Name (already compared), so it never distinguishes two otherwise-equal calls.
     protected override bool NodeEquals(Expression other)
     {
         var function = (ResolvedFunction)other;
@@ -148,6 +157,7 @@ internal sealed class ResolvedFunction : Expression
     }
 
     /// <inheritdoc/>
+    // NullPropagation is deliberately excluded (see NodeEquals): a deterministic function of Name.
     protected override int NodeHashCode()
     {
         int hash = PlanHash.Combine(PlanHash.Seed, PlanHash.OfString(Name));

@@ -99,6 +99,7 @@ internal static class FunctionRegistry
 
         return new ResolvedFunction(
             "sum", FunctionKind.Aggregate, result, nullable: true, args, fn.IsDistinct,
+            // Fixed: aggregate nullability is empty-group-driven, not argument-propagating (never widened by arg overflow).
             FunctionNullability.Fixed);
     }
 
@@ -119,6 +120,7 @@ internal static class FunctionRegistry
 
         return new ResolvedFunction(
             "avg", FunctionKind.Aggregate, result, nullable: true, args, fn.IsDistinct,
+            // Fixed: aggregate nullability is empty-group-driven, not argument-propagating (never widened by arg overflow).
             FunctionNullability.Fixed);
     }
 
@@ -135,6 +137,7 @@ internal static class FunctionRegistry
         // min/max return the input type; the extremum of an empty group is NULL.
         return new ResolvedFunction(
             name, FunctionKind.Aggregate, input, nullable: true, args, fn.IsDistinct,
+            // Fixed: aggregate nullability is empty-group-driven, not argument-propagating (never widened by arg overflow).
             FunctionNullability.Fixed);
     }
 
