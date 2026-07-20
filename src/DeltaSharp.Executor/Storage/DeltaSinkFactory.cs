@@ -8,6 +8,7 @@ using DeltaSharp.Types;
 using CoreExpr = DeltaSharp.Plans.Expressions.Expression;
 using EnginePhysicalExpression = DeltaSharp.Engine.Execution.PhysicalExpression;
 using ExprAttributeReference = DeltaSharp.Plans.Expressions.AttributeReference;
+using ExprGetStructField = DeltaSharp.Plans.Expressions.GetStructField;
 
 namespace DeltaSharp.Executor;
 
@@ -226,8 +227,9 @@ internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
     public void Enforce(
         StructType schema,
         IReadOnlyList<DeltaTableConstraint> constraints,
-        IReadOnlyList<ColumnBatch> batches) =>
-        EnforceCore(schema, constraints, batches, _ansiMode, _memoryBudgetBytes);
+        IReadOnlyList<ColumnBatch> batches,
+        StructType? priorSchema = null) =>
+        EnforceCore(schema, constraints, batches, _ansiMode, _memoryBudgetBytes, priorSchema);
 
     /// <summary>
     /// The ANSI-mode- and memory-budget-explicit core of <see cref="Enforce"/> (#597), so the mode and budget
@@ -239,7 +241,8 @@ internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
         IReadOnlyList<DeltaTableConstraint> constraints,
         IReadOnlyList<ColumnBatch> batches,
         AnsiMode ansiMode,
-        long? memoryBudgetBytes)
+        long? memoryBudgetBytes,
+        StructType? priorSchema = null)
     {
         ArgumentNullException.ThrowIfNull(schema);
         ArgumentNullException.ThrowIfNull(constraints);
@@ -254,6 +257,20 @@ internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
                 $"This write targets a table with {constraints.Count} active per-row constraints, exceeding the "
                 + $"maximum {MaxActiveConstraints} DeltaSharp enforces in one write; the write is refused "
                 + "fail-closed rather than performing unbounded per-row constraint evaluation.");
+        }
+
+        // #619 — reference-based dependent-column check (only when the schema is being REPLACED, i.e. priorSchema
+        // is supplied). Resolution-failure detection (Phase 1) catches a DROPPED/RENAMED column a CHECK reads,
+        // but a type-COMPATIBLE RETYPE (int→bigint under `id > 0`, or a struct-field type change under `s.f > 0`)
+        // resolves cleanly and would silently enforce on the NEW type — where Delta blocks with
+        // DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE. This pass compares the type at each referenced PATH between
+        // the prior and new schema (path-precise, mirroring Delta's reference-based block) and reports a broken
+        // dependency BEFORE Phase 1. An INCOMPATIBLE retype (e.g. int→string) is left to Phase-1's DataTypeMismatch
+        // — matching Delta, which surfaces a TYPE error (canChangeDataType) before ever reaching the dependent
+        // check for a disallowed change.
+        if (priorSchema is not null)
+        {
+            DetectRetypedDependencies(priorSchema, schema, constraints);
         }
 
         // Phase 1 — resolve every constraint against the write schema. A surviving named CHECK that no longer
@@ -291,11 +308,21 @@ internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
                 // the Delta parity error after the pass, instead of the raw analyzer failure. Only named
                 // CHECK constraints are reported: a column invariant is attached to its own field and cannot
                 // be DROP CONSTRAINT'd, and a new write-schema invariant that fails to resolve is a
-                // different, non-reclassified error. A top-level RETYPE that changes an operand type inside
-                // the predicate (e.g. int->string under `id > 0`) still surfaces as DataTypeMismatch from
-                // the comparison — not from nested-field extraction — and remains fail-closed but NOT
-                // reclassified here (a genuine type error, not a dropped dependency).
-                string column = TopLevelColumn(ex.Reference);
+                // different, non-reclassified error. An INCOMPATIBLE top-level retype of a referenced column
+                // (e.g. int->string under `id > 0`) surfaces here as the comparison's DataTypeMismatch — which
+                // is NOT one of the reclassified kinds, so it stays fail-closed but un-reclassified (a genuine
+                // type error, matching Delta's canChangeDataType-first ordering). When a prior schema IS available
+                // (an overwriteSchema replacement) the #619 pre-pass already handled drops/renames and COMPATIBLE
+                // retypes before this pass ran; so with a prior schema this catch only sees an incompatible-retype
+                // resolution failure, and WITHOUT one (a direct EnforceCore call) it is the primary drop/rename
+                // reclassification path.
+                //
+                // #618: prefer the analyzer's structured RootColumn (the bound base struct column for a nested
+                // access, or NameParts[0] for a plain/quoted-dot column) over splitting the flattened Reference
+                // string — the latter mis-attributes a qualified `t.s.f` (→ `t`, not the base `s`) or a
+                // quoted-dot column `a.b` (→ `a`, not `a.b`). TopLevelColumn(Reference) is a defensive fallback
+                // (every current throw site sets RootColumn; the fallback guards a future site that does not).
+                string column = ex.RootColumn ?? TopLevelColumn(ex.Reference);
                 dependentsByColumn ??= new Dictionary<string, List<DeltaTableConstraint>>(StringComparer.OrdinalIgnoreCase);
                 droppedColumnOrder ??= new List<string>();
                 if (!dependentsByColumn.TryGetValue(column, out List<DeltaTableConstraint>? dependents))
@@ -351,6 +378,224 @@ internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
         memoryBudgetBytes is { } budget
             ? new BoundedExecutionMemory(budget)
             : BoundedExecutionMemory.Unbounded;
+
+    // #619: reference-based dependent-column detection for a schema REPLACEMENT (overwriteSchema), matching
+    // Delta's reference-based dependency block (SchemaUtils.findDependentConstraints / containsDependentExpression,
+    // which is PATH-PRECISE and prefix-based). For each surviving named CHECK, resolve it against the PRIOR
+    // schema (where it was valid) and, per referenced column PATH (`id`, or a nested `s.f`), compare the type at
+    // that exact path against the new schema:
+    //   • the path is GONE in the new schema (a field/base dropped or renamed)      → dependency broken (report);
+    //   • the leaf type CHANGED and the predicate still type-resolves (a COMPATIBLE  → dependency broken (report):
+    //     retype like int→bigint, which resolution-failure detection alone misses,     Delta blocks this;
+    //     silently enforcing on the new type);
+    //   • the leaf type CHANGED but the predicate NO LONGER type-resolves (an          → NOT reported here: Delta
+    //     INCOMPATIBLE retype like int→string)                                          runs canChangeDataType
+    //     first and surfaces a TYPE error, not the dependent-column error — left to Phase-1's DataTypeMismatch;
+    //   • the leaf type is UNCHANGED (a nullability-only / metadata-only / sibling-     → NOT a dependency break:
+    //     field / field-reorder change that does not alter the REFERENCED leaf type)     Delta gates on the field's
+    //     dataType only.
+    // The report names the TOP-LEVEL column (the overwriteSchema trigger replaces whole top-level columns). Only
+    // named CHECK constraints participate: a column invariant is attached to its own field and travels with it.
+    private static void DetectRetypedDependencies(
+        StructType priorSchema, StructType newSchema, IReadOnlyList<DeltaTableConstraint> constraints)
+    {
+        Dictionary<string, List<DeltaTableConstraint>>? brokenByColumn = null;
+        List<string>? brokenOrder = null;
+
+        foreach (DeltaTableConstraint constraint in constraints)
+        {
+            if (constraint.Kind != DeltaConstraintKind.Check)
+            {
+                continue;
+            }
+
+            CoreExpr priorPredicate;
+            try
+            {
+                (priorPredicate, _) = ConstraintExpressionFrontend.ParseResolveWithInput(constraint.Expression, priorSchema);
+            }
+            catch (AnalysisException)
+            {
+                // The CHECK does not cleanly resolve against the PRIOR schema either — not a dependency signal we
+                // can attribute. Leave it to Phase-1 resolution against the new schema.
+                continue;
+            }
+
+            // Does the predicate still type-resolve against the NEW schema? Distinguishes a COMPATIBLE retype
+            // (still resolves → dependency block) from an INCOMPATIBLE one (Delta reports a TYPE error instead).
+            bool resolvesAgainstNew;
+            try
+            {
+                ConstraintExpressionFrontend.ParseResolveWithInput(constraint.Expression, newSchema);
+                resolvesAgainstNew = true;
+            }
+            catch (AnalysisException)
+            {
+                resolvesAgainstNew = false;
+            }
+
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach ((string RootColumn, string PathKey, IReadOnlyList<string> Path, DataType LeafType) reference
+                in CollectReferencedLeaves(priorPredicate))
+            {
+                if (!seen.Add(reference.PathKey))
+                {
+                    continue; // the same path referenced multiple times in one predicate is counted once
+                }
+
+                DataType? newLeafType = ResolveLeafType(newSchema, reference.RootColumn, reference.Path);
+                bool dependencyBroken;
+                if (newLeafType is null)
+                {
+                    // The referenced field/base is gone: a genuine DROP/RENAME, or a base RETYPED to a non-struct
+                    // so a nested path can no longer navigate (e.g. `s` struct→scalar under `s.f`). Both are
+                    // reported as the dependency-change parity error — consistent with #600's non-struct-base
+                    // classification. (Delta's ALTER path would surface a canChangeDataType TYPE error for the
+                    // base-retype sub-case specifically; DeltaSharp's whole-column-replacement model reports the
+                    // dependency uniformly. Both fail-closed and reject a Delta-illegal struct→scalar change.)
+                    dependencyBroken = true;
+                }
+                else if (!newLeafType.Equals(reference.LeafType))
+                {
+                    // A retype of the referenced leaf. Report only the COMPATIBLE one (the predicate still
+                    // type-resolves against the new schema); an INCOMPATIBLE retype is left to Phase-1's
+                    // DataTypeMismatch — modelling Delta's canChangeDataType-first ordering. resolvesAgainstNew is
+                    // a pragmatic proxy for canChangeDataType's allowed-widening rules (exact parity would need an
+                    // explicit widening table); it is conservative and fail-closed for the current grammar.
+                    dependencyBroken = resolvesAgainstNew;
+                }
+                else
+                {
+                    dependencyBroken = false; // unchanged leaf type — nullability/metadata/sibling/reorder is invisible
+                }
+
+                if (!dependencyBroken)
+                {
+                    continue;
+                }
+
+                brokenByColumn ??= new Dictionary<string, List<DeltaTableConstraint>>(StringComparer.OrdinalIgnoreCase);
+                brokenOrder ??= new List<string>();
+                if (!brokenByColumn.TryGetValue(reference.RootColumn, out List<DeltaTableConstraint>? deps))
+                {
+                    deps = new List<DeltaTableConstraint>();
+                    brokenByColumn.Add(reference.RootColumn, deps);
+                    brokenOrder.Add(reference.RootColumn);
+                }
+
+                if (!deps.Contains(constraint))
+                {
+                    deps.Add(constraint);
+                }
+            }
+        }
+
+        if (brokenOrder is { Count: > 0 })
+        {
+            // Report the first affected column deterministically (constraints arrive in CollectForWrite's stable
+            // Kind-then-name order), listing every CHECK that depends on it.
+            string column = brokenOrder[0];
+            throw DeltaConstraintDependentColumnException.ForColumnChange(column, brokenByColumn![column]);
+        }
+    }
+
+    // Collects the referenced column PATHS of a resolved predicate — a plain column `id` (empty field path) or a
+    // nested access `s.f`/`s.a.b` (root `s` + field path `[f]`/`[a,b]`) — each with the type AT THE REFERENCED
+    // LEAF (not the whole top-level column's type). A GetStructField's own child chain is NOT re-yielded as a
+    // separate top-level reference, so `s.f` contributes exactly one path (`s`+`[f]`), keyed on the leaf `f`'s
+    // type, never on the whole struct `s`.
+    private static IEnumerable<(string RootColumn, string PathKey, IReadOnlyList<string> Path, DataType LeafType)>
+        CollectReferencedLeaves(CoreExpr expr)
+    {
+        switch (expr)
+        {
+            case ExprAttributeReference attribute:
+                yield return (attribute.Name, attribute.Name, Array.Empty<string>(), attribute.Type);
+                yield break;
+
+            case ExprGetStructField field:
+                {
+                    var fields = new List<string>();
+                    CoreExpr current = field;
+                    while (current is ExprGetStructField gsf)
+                    {
+                        fields.Add(gsf.FieldName);
+                        current = gsf.Child;
+                    }
+
+                    fields.Reverse();
+                    if (current is ExprAttributeReference root && field.Type is { } leafType)
+                    {
+                        string pathKey = root.Name + "\u0000" + string.Join("\u0000", fields);
+                        yield return (root.Name, pathKey, fields, leafType);
+                    }
+
+                    // NOTE: in the current constraint grammar a GetStructField chain ALWAYS bottoms out at a bound
+                    // AttributeReference with a non-null Type (there is no struct-constructor function under nested
+                    // access), so the guard above always yields. If a future grammar extension allowed a
+                    // GetStructField over a cast/function base, this would silently drop the reference — revisit
+                    // here (and collect any AttributeReferences under such a base) so a dependency is never missed.
+                    yield break; // a resolved field access is a leaf reference — do not descend into its base again
+                }
+
+            default:
+                foreach (CoreExpr child in expr.Children)
+                {
+                    foreach (var leaf in CollectReferencedLeaves(child))
+                    {
+                        yield return leaf;
+                    }
+                }
+
+                break;
+        }
+    }
+
+    // Navigates the field PATH under top-level column <paramref name="rootColumn"/> in <paramref name="schema"/>
+    // (case-insensitively, Spark parity) and returns the leaf DataType, or null when any part is absent or a
+    // non-struct is traversed (the referenced path no longer exists — a drop/rename/base-retype).
+    private static DataType? ResolveLeafType(StructType schema, string rootColumn, IReadOnlyList<string> path)
+    {
+        StructField? field = FindFieldIgnoreCase(schema, rootColumn);
+        if (field is null)
+        {
+            return null;
+        }
+
+        DataType current = field.DataType;
+        foreach (string part in path)
+        {
+            if (current is not StructType structType)
+            {
+                return null; // a nested part is requested but the base is no longer a struct
+            }
+
+            StructField? child = FindFieldIgnoreCase(structType, part);
+            if (child is null)
+            {
+                return null; // the nested field was dropped/renamed
+            }
+
+            current = child.DataType;
+        }
+
+        return current;
+    }
+
+    // Case-insensitive field lookup (Spark parity; StructType's own index is ordinal), returning null when the
+    // new schema has no field of that name (a dropped/renamed column).
+    private static StructField? FindFieldIgnoreCase(StructType schema, string name)
+    {
+        foreach (StructField field in schema)
+        {
+            if (string.Equals(field.Name, name, StringComparison.OrdinalIgnoreCase))
+            {
+                return field;
+            }
+        }
+
+        return null;
+    }
 
     // The top-level column of a (possibly multipart) analyzer attribute reference: `amount` -> `amount`,
     // `s.f` -> `s` (a dropped struct column referenced via nested access). Delta names the top-level column

@@ -649,7 +649,7 @@ internal sealed class Analyzer
                 Expression current = column;
                 for (int i = baseIndex + 1; i < parts.Count; i++)
                 {
-                    current = ExtractStructField(current, parts[i], attribute);
+                    current = ExtractStructField(current, parts[i], attribute, column.Name);
                 }
 
                 return current;
@@ -659,9 +659,11 @@ internal sealed class Analyzer
         // No part resolves to a column: bind a single-part reference here (the common `col` case, where
         // the scan above is skipped), or fail. A multipart reference with no column part falls through
         // to UnresolvedColumn (a column part, including the `db.table.col` degenerate, already bound and
-        // returned inside the scan loop above).
+        // returned inside the scan loop above). RootColumn is NameParts[0] — the top-level column the
+        // reference is rooted at — so a caller (#618) attributes a quoted-dot name `a.b` (one part) to
+        // `a.b`, not to a heuristic split of the flattened `Reference` string.
         return MatchColumn(parts[^1], input, attribute)
-            ?? throw AnalysisException.UnresolvedColumn(attribute.Name, input);
+            ?? throw AnalysisException.UnresolvedColumn(attribute.Name, input, rootColumn: parts[0]);
     }
 
     // Case-insensitively matches a single column name against the input attributes (Spark parity): returns
@@ -704,14 +706,15 @@ internal sealed class Analyzer
     // reclassifier can attribute it to the top-level column (#600). An ambiguous field match remains
     // a DataTypeMismatch (the reference resolves to a struct, but the path is under-specified).
     private static Expression ExtractStructField(
-        Expression child, string fieldName, UnresolvedAttribute origin)
+        Expression child, string fieldName, UnresolvedAttribute origin, string baseColumnName)
     {
         if (child.Type is not StructType structType)
         {
             throw AnalysisException.UnresolvedStructField(
                 origin.Name,
                 $"cannot extract field '{fieldName}' from '{child.SimpleString}' of type "
-                + $"'{child.Type?.SimpleString ?? "unknown"}' — a nested field reference requires a struct");
+                + $"'{child.Type?.SimpleString ?? "unknown"}' — a nested field reference requires a struct",
+                rootColumn: baseColumnName);
         }
 
         int ordinal = -1;
@@ -738,7 +741,8 @@ internal sealed class Analyzer
         {
             throw AnalysisException.UnresolvedStructField(
                 origin.Name,
-                $"no such struct field '{fieldName}' in '{structType.SimpleString}'");
+                $"no such struct field '{fieldName}' in '{structType.SimpleString}'",
+                rootColumn: baseColumnName);
         }
 
         return new GetStructField(child, ordinal, actualName!);

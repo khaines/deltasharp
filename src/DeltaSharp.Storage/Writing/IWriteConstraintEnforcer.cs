@@ -37,9 +37,19 @@ public interface IWriteConstraintEnforcer
     /// <param name="constraints">The active constraints the write must satisfy (already collected from the
     /// commit's base snapshot + the write schema's own invariants). Never empty when this is called.</param>
     /// <param name="batches">The write batches whose rows are validated, in write order.</param>
+    /// <param name="priorSchema">The table's PRIOR logical schema when this write REPLACES the schema (an
+    /// <c>overwriteSchema</c> replacement), else <see langword="null"/>. When supplied, the enforcer additionally
+    /// runs a <b>reference-based</b> dependent-column check (#619): a surviving CHECK that references a top-level
+    /// column whose type CHANGED between <paramref name="priorSchema"/> and <paramref name="schema"/> (a retype
+    /// that still type-resolves, which resolution-failure detection alone misses) is refused with
+    /// <see cref="DeltaConstraintDependentColumnException"/> — matching Delta, which blocks an
+    /// <c>ALTER CHANGE COLUMN</c> that a constraint depends on regardless of type-compatibility.</param>
     /// <exception cref="DeltaConstraintViolationException">A row does not satisfy a constraint.</exception>
+    /// <exception cref="DeltaConstraintDependentColumnException">A surviving CHECK references a column the
+    /// schema change drops, renames, or (when <paramref name="priorSchema"/> is supplied) retypes.</exception>
     void Enforce(
         StructType schema,
         IReadOnlyList<DeltaTableConstraint> constraints,
-        IReadOnlyList<ColumnBatch> batches);
+        IReadOnlyList<ColumnBatch> batches,
+        StructType? priorSchema = null);
 }

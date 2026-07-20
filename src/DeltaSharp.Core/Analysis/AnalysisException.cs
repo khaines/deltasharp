@@ -116,12 +116,14 @@ internal sealed class AnalysisException : Exception
         string message,
         AnalysisErrorKind kind,
         string? reference,
-        IReadOnlyList<string> candidates)
+        IReadOnlyList<string> candidates,
+        string? rootColumn = null)
         : base(message)
     {
         Kind = kind;
         Reference = reference;
         Candidates = candidates;
+        RootColumn = rootColumn;
     }
 
     /// <summary>The structured error class.</summary>
@@ -129,6 +131,15 @@ internal sealed class AnalysisException : Exception
 
     /// <summary>The failing reference name (a table identifier or column name), when applicable.</summary>
     public string? Reference { get; }
+
+    /// <summary>The TOP-LEVEL column this failing reference is rooted at, as the analyzer resolved/intended it
+    /// — the bound base struct column for a nested access (<c>s.f</c>/<c>t.s.f</c> → <c>s</c>) or
+    /// <see cref="Plans.Expressions.UnresolvedAttribute.NameParts"/>[0] for a plain column (a quoted-dot name
+    /// <c>`a.b`</c> stays <c>a.b</c>, a qualified <c>t.x</c> → <c>t</c>). Set for name-resolution failures where
+    /// a caller needs to attribute the failure to a single column (e.g. the Delta dependent-column reclassifier,
+    /// #600/#618) WITHOUT re-parsing <see cref="Reference"/> — which cannot recover a quoted dot or a bound base
+    /// from the flattened dotted string. <see langword="null"/> when not applicable.</summary>
+    public string? RootColumn { get; }
 
     /// <summary>The candidate names that were in scope at the failure (empty when not applicable).</summary>
     public IReadOnlyList<string> Candidates { get; }
@@ -226,7 +237,7 @@ internal sealed class AnalysisException : Exception
     }
 
     public static AnalysisException UnresolvedColumn(
-        string name, IReadOnlyList<AttributeReference> input)
+        string name, IReadOnlyList<AttributeReference> input, string? rootColumn = null)
     {
         ArgumentNullException.ThrowIfNull(input);
         string[] candidates = input.Select(a => a.Name).ToArray();
@@ -234,7 +245,8 @@ internal sealed class AnalysisException : Exception
             $"Cannot resolve column name '{name}' given input columns: [{string.Join(", ", candidates)}]",
             AnalysisErrorKind.UnresolvedColumn,
             name,
-            candidates);
+            candidates,
+            rootColumn);
     }
 
     /// <summary>Builds an <see cref="AnalysisErrorKind.AmbiguousReference"/> failure naming the
@@ -376,7 +388,8 @@ internal sealed class AnalysisException : Exception
     /// not a struct or the struct has no such field — a <b>structural</b> absence, not a predicate operand
     /// type mismatch. <paramref name="reference"/> is the full nested path so a caller can normalise it to
     /// the top-level column (#600).</summary>
-    public static AnalysisException UnresolvedStructField(string reference, string detail)
+    public static AnalysisException UnresolvedStructField(
+        string reference, string detail, string? rootColumn = null)
     {
         ArgumentNullException.ThrowIfNull(reference);
         ArgumentNullException.ThrowIfNull(detail);
@@ -384,7 +397,8 @@ internal sealed class AnalysisException : Exception
             $"cannot resolve '{reference}': {detail}",
             AnalysisErrorKind.UnresolvedStructField,
             reference,
-            Array.Empty<string>());
+            Array.Empty<string>(),
+            rootColumn);
     }
 
     /// <summary>Builds an <see cref="AnalysisErrorKind.MisplacedAggregate"/> failure for an aggregate

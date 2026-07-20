@@ -108,6 +108,43 @@ public sealed class GetStructFieldResolutionTests
     }
 
     [Fact]
+    public void MultipartRef_QualifiedNestedDrop_RootColumnIsBoundBaseNotQualifier()
+    {
+        // #618: for a qualified nested ref `t.s.f` (phantom qualifier `t` skipped by the base scan, real base
+        // struct `s` lacking field `f`), the UnresolvedStructField carries RootColumn = the BOUND BASE column
+        // `s` — not the qualifier `t` a first-dot split of `t.s.f` would wrongly pick — so a dependent-column
+        // reclassifier attributes the failure to `s`. Reference stays the full path for the message.
+        var innerNoF = new StructType(new[] { new StructField("g", IntegerType.Instance, nullable: true) });
+        var schema = new StructType(new[] { new StructField("s", innerNoF, nullable: true) });
+
+        var ex = Assert.Throws<AnalysisException>(() => ResolveCondition(
+            schema,
+            new BinaryComparison(Ref("t", "s", "f"), Literal.OfInt(0), ComparisonOperator.GreaterThan)));
+        Assert.Equal(AnalysisErrorKind.UnresolvedStructField, ex.Kind);
+        Assert.Equal("t.s.f", ex.Reference);
+        Assert.Equal("s", ex.RootColumn); // bound base, not the phantom qualifier `t`
+    }
+
+    [Fact]
+    public void UnresolvedColumn_RootColumnIsNamePartsZero_QuotedDotStaysWhole()
+    {
+        // #618: an unresolved plain column reference carries RootColumn = NameParts[0]. A single-part
+        // quoted-dot name `a.b` roots at `a.b` (NOT split to `a`); a qualified `x.y` roots at `x`. This lets a
+        // reclassifier attribute a dropped quoted-dot column correctly instead of splitting the flattened name.
+        var schema = new StructType(new[] { new StructField("id", IntegerType.Instance, nullable: false) });
+
+        var quotedDot = Assert.Throws<AnalysisException>(() => ResolveCondition(
+            schema, new BinaryComparison(Ref("a.b"), Literal.OfInt(0), ComparisonOperator.GreaterThan)));
+        Assert.Equal(AnalysisErrorKind.UnresolvedColumn, quotedDot.Kind);
+        Assert.Equal("a.b", quotedDot.RootColumn);
+
+        var qualified = Assert.Throws<AnalysisException>(() => ResolveCondition(
+            schema, new BinaryComparison(Ref("x", "y"), Literal.OfInt(0), ComparisonOperator.GreaterThan)));
+        Assert.Equal(AnalysisErrorKind.UnresolvedColumn, qualified.Kind);
+        Assert.Equal("x", qualified.RootColumn);
+    }
+
+    [Fact]
     public void MultipartRef_NonColumnLeadingPart_FallsBackToTrailingPartBinding()
     {
         // `qualifier.id` where `qualifier` is not a column → M1 qualifier fallback binds the trailing `id`.

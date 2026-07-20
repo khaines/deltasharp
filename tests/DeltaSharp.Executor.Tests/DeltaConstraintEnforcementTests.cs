@@ -535,28 +535,55 @@ public sealed class DeltaConstraintEnforcementTests : IDisposable
     }
 
     [Fact]
-    public void OverwriteSchema_ChangingConstrainedColumnType_DoesNotReclassifyError()
+    public void OverwriteSchema_IncompatibleRetypeOfConstrainedColumn_StaysDataTypeMismatch()
     {
-        // #598 (council: Quality false-positive guard): the reclassification is scoped to UnresolvedColumn (a
-        // DROPPED column). RETYPING a constrained column so a surviving CHECK no longer resolves yields a
-        // DataTypeMismatch, which must NOT be reclassified as DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE — the
-        // write still fails closed, just not with the dependent-column parity error.
-        string table = Table("os-retype-constrained");
+        // #619 (Delta parity, canChangeDataType-first ordering): an INCOMPATIBLE retype of a constrained column
+        // (`id int -> string` under `id > 0`) makes the predicate no longer type-resolve. Delta surfaces a TYPE
+        // error for a disallowed change BEFORE the dependent-column check, so DeltaSharp likewise leaves it as a
+        // raw DataTypeMismatch (still fail-closed) rather than the dependent-column parity error. Only a
+        // COMPATIBLE retype is a dependency block (see the sibling test below).
+        string table = Table("os-retype-incompatible");
         Append(table, Amounts(10, 20)); // v0: {id int, amount int}
         AddCheckConstraint(table, "positive_id", "id > 0"); // CHECK references `id`
 
         using SparkSession spark = NewSession();
         var idRetyped = new StructType(new[]
         {
-            new StructField("id", StringType.Instance, nullable: false), // id int -> string (retype, not drop)
+            new StructField("id", StringType.Instance, nullable: false), // id int -> string (INCOMPATIBLE)
             new StructField("amount", IntegerType.Instance, nullable: true),
         });
         DataFrame df = spark.CreateDataFrame(new[] { new Row(idRetyped, "x", 5) }, idRetyped);
 
         Exception ex = Assert.ThrowsAny<Exception>(
             () => df.Write.Format("delta").Mode("overwrite").Option("overwriteSchema", "true").Save(table));
-        Assert.IsNotType<DeltaConstraintDependentColumnException>(ex); // scoped: a retype is not a dropped-column change
+        Assert.IsNotType<DeltaConstraintDependentColumnException>(ex); // a type error, not a dependency block
         Assert.False(File.Exists(CommitFile(table, 2))); // still fail-closed — no brick
+    }
+
+    [Fact]
+    public void OverwriteSchema_CompatibleRetypeOfConstrainedColumn_ReclassifiesAsDependentColumnChange()
+    {
+        // #619 (the core gap): a COMPATIBLE retype (`id int -> bigint` under `id > 0`) STILL type-resolves, so
+        // pre-#619 DeltaSharp silently enforced the CHECK on the new type — where Delta blocks the change. The
+        // overwriteSchema path now hands the enforcer the PRIOR schema; the reference-based pre-pass reports
+        // DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE naming `id`, fail-closed, before any commit.
+        string table = Table("os-retype-compatible");
+        Append(table, Amounts(10, 20)); // v0: {id int, amount int}
+        AddCheckConstraint(table, "positive_id", "id > 0"); // CHECK references `id`
+
+        using SparkSession spark = NewSession();
+        var idWidened = new StructType(new[]
+        {
+            new StructField("id", LongType.Instance, nullable: false), // id int -> bigint (COMPATIBLE)
+            new StructField("amount", IntegerType.Instance, nullable: true),
+        });
+        DataFrame df = spark.CreateDataFrame(new[] { new Row(idWidened, 5L, 5) }, idWidened);
+
+        var ex = Assert.Throws<DeltaConstraintDependentColumnException>(
+            () => df.Write.Format("delta").Mode("overwrite").Option("overwriteSchema", "true").Save(table));
+        Assert.Equal("id", ex.ColumnName);
+        Assert.Equal("positive_id", Assert.Single(ex.Constraints).Name);
+        Assert.False(File.Exists(CommitFile(table, 2))); // fail-closed — no brick
     }
 
     [Fact]
