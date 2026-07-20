@@ -292,8 +292,22 @@ public sealed class TypeWideningProtocolTests : IDisposable
         ProtocolSupport.EnsureWritable(upgraded);
     }
 
+    [Fact]
+    public void UpgradeProtocol_LegacyTableWithDeepStructPathInvariant_EnumeratesInvariants()
+    {
+        // Struct recursion must work beyond one level: an invariant reached by a TWO-level all-struct path
+        // (`payload.inner.x`) is collected + enforced (#606's recursion), so enumeration must also recurse past
+        // depth 1 (guards against a hypothetical "only look one struct deep" regression).
+        var inner = new StructType(new[] { new StructField("inner", InvariantInnerStruct(), nullable: true) });
+        var schema = new StructType(new[] { new StructField("payload", inner, nullable: true) });
+
+        ProtocolAction upgraded = TypeWideningFeature.UpgradeProtocol(
+            new ProtocolAction(1, 2, [], []), schema, ImmutableDictionary<string, string>.Empty);
+
+        Assert.Contains("invariants", upgraded.WriterFeatures);
+    }
+
     [Theory]
-    [InlineData("array")]       // array< struct< x:invariant > >
     [InlineData("map-value")]   // map< string, struct< x:invariant > >
     [InlineData("map-key")]     // map< struct< x:invariant >, long >
     public void UpgradeProtocol_LegacyTableWithInvariantUnderArrayOrMap_DoesNotEnumerateInvariants(string nesting)
