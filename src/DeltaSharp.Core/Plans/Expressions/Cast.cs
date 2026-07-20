@@ -34,8 +34,17 @@ internal sealed class Cast : Expression
     public override DataType Type => TargetType;
 
     /// <inheritdoc/>
-    // TODO(FEAT-04.5): widen for null-introducing (lossy/non-ANSI) casts
+    // #614: Legacy widening for null-introducing (lossy/non-ANSI identity-changing) casts is handled
+    // by NullableUnder; the mode-independent hint below forwards the child's.
     public override bool Nullable => Child.Nullable;
+
+    /// <inheritdoc/>
+    // #614: widening EVERY non-identity cast under Legacy (including null-safe upcasts like int->long
+    // that never actually null) is an INTENTIONAL conservative over-report. It mirrors the Engine
+    // CastExpression.Nullability exactly (the more important invariant — the interpreter nulls on
+    // invalid cast in Legacy), and over-reporting nullable is safe for an advisory hint.
+    public override bool NullableUnder(AnsiMode mode) =>
+        Child.NullableUnder(mode) || (mode == AnsiMode.Legacy && !TargetType.Equals(Child.Type));
 
     /// <inheritdoc/>
     public override string NodeName => "Cast";

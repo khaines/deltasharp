@@ -48,6 +48,9 @@ internal sealed class GetStructField : Expression
     public override bool Nullable => Child.Nullable || (Field?.Nullable ?? true);
 
     /// <inheritdoc/>
+    public override bool NullableUnder(AnsiMode mode) => Child.NullableUnder(mode) || (Field?.Nullable ?? true);
+
+    /// <inheritdoc/>
     public override string NodeName => "GetStructField";
 
     /// <inheritdoc/>

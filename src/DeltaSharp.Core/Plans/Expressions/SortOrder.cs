@@ -38,6 +38,11 @@ internal sealed class SortOrder : Expression
     public override bool Nullable => Child.Nullable;
 
     /// <inheritdoc/>
+    // #614: a SortOrder is never in output position (it wraps an ORDER BY child), so this is symmetry
+    // only — it propagates the child's mode-aware nullability like every other structural node.
+    public override bool NullableUnder(AnsiMode mode) => Child.NullableUnder(mode);
+
+    /// <inheritdoc/>
     public override string NodeName => "SortOrder";
 
     /// <inheritdoc/>

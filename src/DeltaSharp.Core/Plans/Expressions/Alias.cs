@@ -34,6 +34,9 @@ internal sealed class Alias : Expression
     public override bool Nullable => Child.Nullable;
 
     /// <inheritdoc/>
+    public override bool NullableUnder(AnsiMode mode) => Child.NullableUnder(mode);
+
+    /// <inheritdoc/>
     public override string NodeName => "Alias";
 
     /// <inheritdoc/>

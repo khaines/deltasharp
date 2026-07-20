@@ -33,6 +33,10 @@ internal sealed class And : Expression
     public override bool Nullable => Left.Nullable || Right.Nullable;
 
     /// <inheritdoc/>
+    public override bool NullableUnder(AnsiMode mode) =>
+        Left.NullableUnder(mode) || Right.NullableUnder(mode);
+
+    /// <inheritdoc/>
     public override string NodeName => "And";
 
     /// <inheritdoc/>
@@ -83,6 +87,10 @@ internal sealed class Or : Expression
     public override bool Nullable => Left.Nullable || Right.Nullable;
 
     /// <inheritdoc/>
+    public override bool NullableUnder(AnsiMode mode) =>
+        Left.NullableUnder(mode) || Right.NullableUnder(mode);
+
+    /// <inheritdoc/>
     public override string NodeName => "Or";
 
     /// <inheritdoc/>
@@ -127,6 +135,9 @@ internal sealed class Not : Expression
 
     /// <inheritdoc/>
     public override bool Nullable => Child.Nullable;
+
+    /// <inheritdoc/>
+    public override bool NullableUnder(AnsiMode mode) => Child.NullableUnder(mode);
 
     /// <inheritdoc/>
     public override string NodeName => "Not";

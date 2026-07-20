@@ -211,6 +211,13 @@ public sealed class SparkSession : IDisposable
     /// <see langword="null"/> when no storage backend is registered (a Core-only process).</summary>
     internal IFileRelationResolver? FileRelationResolver => _fileRelationResolver;
 
+    /// <summary>The session's ANSI lens (#614): <c>spark.sql.ansi.enabled</c> parsed into an
+    /// <see cref="AnsiMode"/> (unset -> <see cref="AnsiMode.Ansi"/>). Read live from the current
+    /// <see cref="Conf"/> so a runtime <see cref="RuntimeConfig.Set(string, string)"/> is honored on the
+    /// next analyze/action. Threaded into the analyzer so output-schema nullability derivation widens an
+    /// overflow-capable arithmetic / lossy cast output column to nullable under Legacy.</summary>
+    internal AnsiMode AnsiMode => ReadAnsiMode(_conf);
+
     /// <summary>
     /// Registers (or clears, when <paramref name="resolver"/> is <see langword="null"/>) the process-wide
     /// <see cref="IFileRelationResolver"/> the analyzer resolves <c>delta</c> path scans through (#499). The

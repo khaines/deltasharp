@@ -35,6 +35,7 @@ internal sealed class Analyzer
 {
     private readonly ICatalog _catalog;
     private readonly IFileRelationResolver? _fileRelationResolver;
+    private readonly AnsiMode _ansiMode;
 
     /// <summary>Creates an analyzer bound to <paramref name="catalog"/>.</summary>
     /// <exception cref="ArgumentNullException"><paramref name="catalog"/> is null.</exception>
@@ -47,13 +48,20 @@ internal sealed class Analyzer
     /// <paramref name="fileRelationResolver"/> — the read-door seam (#499) through which a <c>delta</c>
     /// path scan is bound to its schema + pinned snapshot version. When it is <see langword="null"/> (a
     /// Core-only process with no storage backend registered), a <c>delta</c> read fails closed with a clear
-    /// diagnostic instead of resolving.</summary>
+    /// diagnostic instead of resolving.
+    /// <para>
+    /// <paramref name="ansiMode"/> (#614) is the session's ANSI lens, threaded into output-schema
+    /// nullability derivation so a Legacy session widens an overflow-capable arithmetic / lossy cast
+    /// output column to nullable (DeltaSharp nulls on overflow/invalid-cast in Legacy). It defaults to
+    /// <see cref="AnsiMode.Ansi"/> so existing callers keep the ANSI-default behavior unchanged.
+    /// </para></summary>
     /// <exception cref="ArgumentNullException"><paramref name="catalog"/> is null.</exception>
-    public Analyzer(ICatalog catalog, IFileRelationResolver? fileRelationResolver)
+    public Analyzer(ICatalog catalog, IFileRelationResolver? fileRelationResolver, AnsiMode ansiMode = AnsiMode.Ansi)
     {
         ArgumentNullException.ThrowIfNull(catalog);
         _catalog = catalog;
         _fileRelationResolver = fileRelationResolver;
+        _ansiMode = ansiMode;
     }
 
     /// <summary>
@@ -750,7 +758,7 @@ internal sealed class Analyzer
 
     /// <summary>Derives the output attribute list of a resolved node from its shape and its
     /// children's memoized outputs.</summary>
-    private static IReadOnlyList<AttributeReference> DeriveOutput(
+    private IReadOnlyList<AttributeReference> DeriveOutput(
         LogicalPlan node,
         IReadOnlyDictionary<LogicalPlan, IReadOnlyList<AttributeReference>> outputByPlan,
         ExprIdGenerator idGenerator)
@@ -807,7 +815,7 @@ internal sealed class Analyzer
             ? ChildOutput(node.Children[0], outputByPlan)
             : CollectInput(node, outputByPlan);
 
-    private static IReadOnlyList<AttributeReference> ProjectionOutput(
+    private IReadOnlyList<AttributeReference> ProjectionOutput(
         IReadOnlyList<Expression> projectList, ExprIdGenerator idGenerator)
     {
         var output = new AttributeReference[projectList.Count];
@@ -821,7 +829,7 @@ internal sealed class Analyzer
 
     /// <summary>Maps a resolved projection element to the attribute it exposes: an attribute is
     /// itself; an alias becomes a fresh attribute named for the alias.</summary>
-    private static AttributeReference ToAttribute(Expression element, ExprIdGenerator idGenerator)
+    private AttributeReference ToAttribute(Expression element, ExprIdGenerator idGenerator)
     {
         switch (element)
         {
@@ -835,7 +843,7 @@ internal sealed class Analyzer
                 DataType type = alias.Type
                     ?? throw AnalysisException.UntypedResolvedExpression(
                         CoercionHelpers.PrettyReference(alias.Child), "Project");
-                return new AttributeReference(alias.Name, type, alias.Nullable, idGenerator.Next());
+                return new AttributeReference(alias.Name, type, alias.NullableUnder(_ansiMode), idGenerator.Next());
 
             case ResolvedFunction function:
                 // A bare aggregate/scalar function in output position is auto-named exactly like
@@ -848,7 +856,7 @@ internal sealed class Analyzer
                     ?? throw AnalysisException.UntypedResolvedExpression(
                         CoercionHelpers.PrettyReference(function), "Aggregate");
                 return new AttributeReference(
-                    SparkAutoName(function), functionType, function.Nullable, idGenerator.Next());
+                    SparkAutoName(function), functionType, function.NullableUnder(_ansiMode), idGenerator.Next());
 
             case GetStructField field:
                 // A bare nested reference in output position is auto-named after the extracted field,
@@ -858,7 +866,7 @@ internal sealed class Analyzer
                 DataType fieldType = field.Type
                     ?? throw AnalysisException.UntypedResolvedExpression(
                         CoercionHelpers.PrettyReference(field), "Project");
-                return new AttributeReference(field.FieldName, fieldType, field.Nullable, idGenerator.Next());
+                return new AttributeReference(field.FieldName, fieldType, field.NullableUnder(_ansiMode), idGenerator.Next());
 
             case UnresolvedFunction function:
                 // Defensive invariant: function binding (ExpressionCoercion → FunctionRegistry.Bind)

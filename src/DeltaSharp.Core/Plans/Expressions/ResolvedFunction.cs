@@ -65,6 +65,10 @@ internal sealed class ResolvedFunction : Expression
     public override DataType Type => _type;
 
     /// <inheritdoc/>
+    // #614: function-wrapped overflow nullability is intentionally NOT widened under Legacy — the
+    // stored precise nullability is kept so a function is not conservatively over-reported nullable
+    // under Ansi (e.g. isnull(...) must stay NOT-NULL). This leaves abs(v+v)-style wrapping as a
+    // documented residual under Legacy, tracked in #627.
     public override bool Nullable => _nullable;
 
     /// <inheritdoc/>

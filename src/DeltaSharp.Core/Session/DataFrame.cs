@@ -884,7 +884,7 @@ public sealed class DataFrame
     /// materialize the output schema — the collect/count contract needs only the executor's rows.
     /// </summary>
     private static LogicalPlan AnalyzeForExecution(SparkSession session, LogicalPlan plan) =>
-        Optimize(new Analyzer(session.Catalog, session.FileRelationResolver).Resolve(plan));
+        Optimize(new Analyzer(session.Catalog, session.FileRelationResolver, session.AnsiMode).Resolve(plan));
 
     /// <summary>
     /// Resolves this frame's plan and reports the <b>pinned Delta snapshot version</b> a Delta read
@@ -991,7 +991,7 @@ public sealed class DataFrame
         SparkSession session,
         LogicalPlan plan,
         out IReadOnlyList<(string Name, DataType Type, bool Nullable)> outputColumns) =>
-        Optimize(new Analyzer(session.Catalog, session.FileRelationResolver).Resolve(plan, out outputColumns));
+        Optimize(new Analyzer(session.Catalog, session.FileRelationResolver, session.AnsiMode).Resolve(plan, out outputColumns));
 
     /// <summary>
     /// The optimizer seam. The standalone rule-based <c>Optimizer</c> (STORY-04.5.3 / #172) is already
@@ -1082,7 +1082,7 @@ public sealed class DataFrame
     {
         try
         {
-            analyzed = new Analyzer(session.Catalog, session.FileRelationResolver).Resolve(Plan);
+            analyzed = new Analyzer(session.Catalog, session.FileRelationResolver, session.AnsiMode).Resolve(Plan);
             diagnostic = null;
             return true;
         }
