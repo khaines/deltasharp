@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using System.Globalization;
 using System.Security.Cryptography;
+using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Types;
 
@@ -670,7 +671,8 @@ internal sealed class DeltaTableWriter
     /// <exception cref="InvalidOperationException">The table does not use column mapping <c>name</c> mode, the
     /// source column is absent, or the target name collides with an existing column.</exception>
     internal async Task<DeltaCommitResult> RenameColumnAsync(
-        string fromName, string toName, CancellationToken cancellationToken = default)
+        string fromName, string toName, IWriteConstraintEnforcer? constraintEnforcer = null,
+        CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(fromName);
         ArgumentException.ThrowIfNullOrEmpty(toName);
@@ -712,7 +714,12 @@ internal sealed class DeltaTableWriter
                 .ToImmutableArray();
         }
 
-        return await CommitSchemaChangeAsync(snapshot, new StructType(fields), updatedPartitions, cancellationToken)
+        // #616: refuse fail-closed if a surviving named CHECK still depends on the renamed column (its
+        // predicate would no longer resolve against the post-rename schema — a dangling-CHECK brick).
+        var renamedSchema = new StructType(fields);
+        EnsureNoDependentConstraints(snapshot, renamedSchema, constraintEnforcer);
+
+        return await CommitSchemaChangeAsync(snapshot, renamedSchema, updatedPartitions, cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -726,7 +733,8 @@ internal sealed class DeltaTableWriter
     /// <exception cref="InvalidOperationException">The table does not use column mapping <c>name</c> mode, the
     /// column is absent, or dropping it would be a partition column (out of scope here).</exception>
     internal async Task<DeltaCommitResult> DropColumnAsync(
-        string name, CancellationToken cancellationToken = default)
+        string name, IWriteConstraintEnforcer? constraintEnforcer = null,
+        CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(name);
         Snapshot snapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
@@ -758,7 +766,13 @@ internal sealed class DeltaTableWriter
             }
         }
 
-        return await CommitSchemaChangeAsync(snapshot, new StructType(fields), partitionColumns: null, cancellationToken)
+        // #616: refuse fail-closed if a surviving named CHECK still depends on the dropped column — the same
+        // dangling-CHECK brick #601/#598 guard on the write door, on the ALTER DROP door (Delta's
+        // DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE).
+        var droppedSchema = new StructType(fields);
+        EnsureNoDependentConstraints(snapshot, droppedSchema, constraintEnforcer);
+
+        return await CommitSchemaChangeAsync(snapshot, droppedSchema, partitionColumns: null, cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -892,6 +906,35 @@ internal sealed class DeltaTableWriter
         bool typeWideningEnabled = TypeWideningFeature.IsWriteEnabled(readSnapshot);
         return DeltaSchemaEnforcer.Reconcile(
             readSnapshot.Schema, writeSchema, evolutionMode, partitionColumns, typeWideningEnabled);
+    }
+
+    // #616: before an ALTER that changes the LOGICAL schema (DROP/RENAME COLUMN) commits, refuse fail-closed
+    // when a surviving named CHECK constraint still depends on the removed/renamed column — the same
+    // dangling-CHECK brick the write door guards on overwriteSchema (#601/#598), on the ALTER door. The
+    // resolvability check is row-count-independent (it runs the enforcer's resolve pass over the constraint SET
+    // against the post-ALTER schema with NO batches), so a dangling CHECK is rejected with Delta's
+    // DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE before any metaData action is committed. Only NAMED CHECK
+    // constraints are considered (includeSnapshotInvariants: false): a field invariant travels with its own
+    // field, so a dropped field's invariant legitimately disappears and must not be reported as a dependency.
+    // When no enforcer is supplied (the constraint frontend lives in the query engine, not storage — see
+    // IWriteConstraintEnforcer), the guard is skipped: a caller that omits it accepts the pre-#616 behavior,
+    // exactly as the write door refuses fail-closed only when an enforcer is wired.
+    private static void EnsureNoDependentConstraints(
+        Snapshot snapshot, StructType postAlterSchema, IWriteConstraintEnforcer? constraintEnforcer)
+    {
+        if (constraintEnforcer is null)
+        {
+            return;
+        }
+
+        IReadOnlyList<DeltaTableConstraint> constraints =
+            DeltaTableConstraints.CollectForWrite(snapshot, postAlterSchema, includeSnapshotInvariants: false);
+        if (constraints.Count == 0)
+        {
+            return;
+        }
+
+        constraintEnforcer.Enforce(postAlterSchema, constraints, Array.Empty<ColumnBatch>());
     }
 
     private Task<DeltaCommitResult> CommitSchemaChangeAsync(
