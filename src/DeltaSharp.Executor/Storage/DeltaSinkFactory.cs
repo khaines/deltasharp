@@ -311,10 +311,11 @@ internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
                 // different, non-reclassified error. An INCOMPATIBLE top-level retype of a referenced column
                 // (e.g. int->string under `id > 0`) surfaces here as the comparison's DataTypeMismatch — which
                 // is NOT one of the reclassified kinds, so it stays fail-closed but un-reclassified (a genuine
-                // type error, matching Delta's canChangeDataType-first ordering). A COMPATIBLE retype
-                // (int->bigint) is caught EARLIER by the #619 reference-based pre-pass when a prior schema is
-                // available (an overwriteSchema replacement); this catch is the drop/rename path (and the
-                // no-prior-schema fallback for a nested drop).
+                // type error, matching Delta's canChangeDataType-first ordering). When a prior schema IS available
+                // (an overwriteSchema replacement) the #619 pre-pass already handled drops/renames and COMPATIBLE
+                // retypes before this pass ran; so with a prior schema this catch only sees an incompatible-retype
+                // resolution failure, and WITHOUT one (a direct EnforceCore call) it is the primary drop/rename
+                // reclassification path.
                 //
                 // #618: prefer the analyzer's structured RootColumn (the bound base struct column for a nested
                 // access, or NameParts[0] for a plain/quoted-dot column) over splitting the flattened Reference
@@ -446,11 +447,22 @@ internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
                 bool dependencyBroken;
                 if (newLeafType is null)
                 {
-                    dependencyBroken = true; // the referenced field/base is DROPPED or RENAMED away
+                    // The referenced field/base is gone: a genuine DROP/RENAME, or a base RETYPED to a non-struct
+                    // so a nested path can no longer navigate (e.g. `s` struct→scalar under `s.f`). Both are
+                    // reported as the dependency-change parity error — consistent with #600's non-struct-base
+                    // classification. (Delta's ALTER path would surface a canChangeDataType TYPE error for the
+                    // base-retype sub-case specifically; DeltaSharp's whole-column-replacement model reports the
+                    // dependency uniformly. Both fail-closed and reject a Delta-illegal struct→scalar change.)
+                    dependencyBroken = true;
                 }
                 else if (!newLeafType.Equals(reference.LeafType))
                 {
-                    dependencyBroken = resolvesAgainstNew; // a retype: report only the COMPATIBLE (still-resolving) one
+                    // A retype of the referenced leaf. Report only the COMPATIBLE one (the predicate still
+                    // type-resolves against the new schema); an INCOMPATIBLE retype is left to Phase-1's
+                    // DataTypeMismatch — modelling Delta's canChangeDataType-first ordering. resolvesAgainstNew is
+                    // a pragmatic proxy for canChangeDataType's allowed-widening rules (exact parity would need an
+                    // explicit widening table); it is conservative and fail-closed for the current grammar.
+                    dependencyBroken = resolvesAgainstNew;
                 }
                 else
                 {
@@ -518,6 +530,11 @@ internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
                         yield return (root.Name, pathKey, fields, leafType);
                     }
 
+                    // NOTE: in the current constraint grammar a GetStructField chain ALWAYS bottoms out at a bound
+                    // AttributeReference with a non-null Type (there is no struct-constructor function under nested
+                    // access), so the guard above always yields. If a future grammar extension allowed a
+                    // GetStructField over a cast/function base, this would silently drop the reference — revisit
+                    // here (and collect any AttributeReferences under such a base) so a dependency is never missed.
                     yield break; // a resolved field access is a leaf reference — do not descend into its base again
                 }
 
