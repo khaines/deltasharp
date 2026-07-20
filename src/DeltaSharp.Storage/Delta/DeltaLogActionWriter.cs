@@ -171,7 +171,12 @@ internal static class DeltaLogActionWriter
         writer.WriteBoolean("dataChange", remove.DataChange);
         writer.WriteBoolean("extendedFileMetadata", remove.ExtendedFileMetadata);
 
-        if (!remove.PartitionValues.IsEmpty)
+        // When extendedFileMetadata is true the extended fields (size/partitionValues) are
+        // being emitted, so always write partitionValues — mirroring the add action, an empty
+        // map serializes as {}. Strict cross-engine readers require partitionValues:{} for an
+        // unpartitioned file rather than an omitted key. A bare tombstone
+        // (extendedFileMetadata:false) still omits an empty map.
+        if (remove.ExtendedFileMetadata || !remove.PartitionValues.IsEmpty)
         {
             writer.WriteStartObject("partitionValues");
             WriteNullableStringMapEntries(writer, remove.PartitionValues);
