@@ -106,7 +106,7 @@ DeltaSharp.SqlParseException.ErrorKind.get -> DeltaSharp.SqlParseErrorKind
 DeltaSharp.SqlParseException.SqlParseException() -> void
 DeltaSharp.SqlParseException.SqlParseException(string! message) -> void
 DeltaSharp.SqlParseException.SqlParseException(string! message, System.Exception? innerException) -> void
-static DeltaSharp.DeltaSharpInfo.PreviewReleaseChannel.get -> string!
+[DS0001]static DeltaSharp.DeltaSharpInfo.PreviewReleaseChannel.get -> string!
 static DeltaSharp.DeltaSharpInfo.Product.get -> string!
 static DeltaSharp.DeltaSharpInfo.ProductName.get -> string!
 static DeltaSharp.DeltaSharpInfo.Version.get -> string!

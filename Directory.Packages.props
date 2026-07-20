@@ -46,12 +46,12 @@
          GA baseline (10.0.0) so locked-mode restore stays reproducible across SDK patches
          (same rationale as the ILLink pin in Directory.Build.props). Meter/ActivitySource live
          in the shared framework (System.Diagnostics.DiagnosticSource) and need no package. -->
-    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
+    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.10" />
   </ItemGroup>
 
   <ItemGroup>
     <!-- Test toolchain. -->
-    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.7.0" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.8.1" />
     <PackageVersion Include="xunit" Version="2.9.3" />
     <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5" />
     <!-- Coverage collection (FEAT-00.2 / #106 STORY-00.2.3). coverlet.collector is the
@@ -71,8 +71,8 @@
        in Directory.Build.props) — never runtime/package dependencies. The SDK ships
        Roslyn 5.0, so the 4.14.0 analyzers load without CS9057 under warnings-as-errors. -->
   <ItemGroup>
-    <PackageVersion Include="Microsoft.CodeAnalysis.PublicApiAnalyzers" Version="4.14.0" />
-    <PackageVersion Include="Microsoft.CodeAnalysis.BannedApiAnalyzers" Version="4.14.0" />
+    <PackageVersion Include="Microsoft.CodeAnalysis.PublicApiAnalyzers" Version="5.6.0" />
+    <PackageVersion Include="Microsoft.CodeAnalysis.BannedApiAnalyzers" Version="5.6.0" />
   </ItemGroup>
 
 </Project>
