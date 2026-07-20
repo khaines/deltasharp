@@ -34,6 +34,15 @@ internal static class RowMaterializer
             NestedTypeDepth.Ensure(schema[c].DataType, QueryExecutionStage.Materialize, schema[c].Name);
         }
 
+        // Bind one decode-plan reader per column ONCE, before the per-row loop: struct child views are
+        // hoisted and array/map element/key/value fields are pre-synthesized, so the per-row decode adds no
+        // structural allocation (#610). Readers carry a per-vector memo and are single-threaded within this call.
+        var readers = new ColumnReader[schema.Count];
+        for (int c = 0; c < schema.Count; c++)
+        {
+            readers[c] = ColumnReader.For(schema[c].DataType, schema[c].Name);
+        }
+
         var rows = new List<Row>();
         long rowsSoFar = 0;
         long bytesSoFar = 0;
@@ -77,7 +86,7 @@ internal static class RowMaterializer
                 var values = new object?[columnCount];
                 for (int c = 0; c < columnCount; c++)
                 {
-                    values[c] = columns[c].IsNull(r) ? null : ReadValue(columns[c], schema[c], r, cancellationToken);
+                    values[c] = columns[c].IsNull(r) ? null : readers[c].Read(columns[c], r, cancellationToken);
                 }
 
                 rows.Add(new Row(schema, values));
@@ -107,9 +116,183 @@ internal static class RowMaterializer
         return count;
     }
 
-    private static object ReadValue(ColumnVector column, StructField field, int index, CancellationToken cancellationToken)
+    // A decode-plan node bound once per schema position (before the per-row loop), so the per-row decode
+    // allocates nothing structural. Struct child views are hoisted (Child(i) is a pure function of the vector
+    // instance — for a sliced struct it returns the identical slice for every row), and array/map
+    // element/key/value names are constant, so no per-row StructField is synthesized (#610). Reader instances
+    // carry a mutable per-vector memo and are used single-threaded within one Materialize call.
+    private abstract class ColumnReader
     {
-        DataType type = field.DataType;
+        // Reads column[index] as its natural CLR value. The caller has already gated on IsNull for this
+        // position (top-level columns, struct children, and array/map elements each gate their own nulls).
+        public abstract object Read(ColumnVector column, int index, CancellationToken cancellationToken);
+
+        // Builds the reader for a logical type; nested types get a hoisting reader, everything else a scalar
+        // reader that carries the field name only for out-of-range date/timestamp diagnostics.
+        public static ColumnReader For(DataType type, string name) => type switch
+        {
+            StructType structType => new StructReader(structType),
+            ArrayType arrayType => new ListReader(arrayType),
+            MapType mapType => new MapReader(mapType),
+            _ => new ScalarReader(type, name),
+        };
+    }
+
+    // A leaf reader: decodes a scalar cell with no per-row allocation beyond the boxed CLR value itself.
+    private sealed class ScalarReader : ColumnReader
+    {
+        private readonly DataType _type;
+        private readonly string _name;
+
+        public ScalarReader(DataType type, string name)
+        {
+            _type = type;
+            _name = name;
+        }
+
+        public override object Read(ColumnVector column, int index, CancellationToken cancellationToken) =>
+            ReadScalar(column, _type, _name, index);
+    }
+
+    // Reads a struct value as a nested Row (the exact inverse of LocalRelationBatches' struct encode, and the
+    // CreateDataFrame nested CLR convention #608): each field is read from its child at the same logical index,
+    // null-aware. A null struct row never reaches here — the caller gates on IsNull. Child views are hoisted:
+    // Child(i) depends only on the struct vector's window (offset/length), not the row, so a one-entry memo
+    // keyed by vector identity computes them once (#610) — for a sliced (limit) result this replaces
+    // O(rows x fields) slice allocations with O(fields) per distinct vector; for a whole/offset-0 vector
+    // Child returns the raw child (no allocation) and the memo is a free no-op.
+    private sealed class StructReader : ColumnReader
+    {
+        private readonly StructType _type;
+        private readonly ColumnReader[] _fields;
+        private StructColumnVector? _boundVector;
+        private ColumnVector[]? _boundChildren;
+
+        public StructReader(StructType type)
+        {
+            _type = type;
+            _fields = new ColumnReader[type.Count];
+            for (int i = 0; i < type.Count; i++)
+            {
+                _fields[i] = For(type[i].DataType, type[i].Name);
+            }
+        }
+
+        public override object Read(ColumnVector column, int index, CancellationToken cancellationToken)
+        {
+            var vector = (StructColumnVector)column;
+            ColumnVector[] children = BindChildren(vector);
+            var values = new object?[_type.Count];
+            for (int i = 0; i < _type.Count; i++)
+            {
+                ColumnVector child = children[i];
+                values[i] = child.IsNull(index) ? null : _fields[i].Read(child, index, cancellationToken);
+            }
+
+            return new Row(_type, values);
+        }
+
+        // Returns the per-field child views for this vector, computing them once per distinct vector instance.
+        // Correct because Child(i) is a pure function of the vector instance (its offset/length window), so a
+        // reference-equal vector yields identical children; a different instance (the next batch's column, or a
+        // per-row array/map element view) misses and rebinds. Single-entry: struct positions are read in
+        // vector-stable runs (all rows of a top-level/nested struct share one vector; all elements of one
+        // array/map cell share one element view), so a single slot captures every reuse without thrashing.
+        private ColumnVector[] BindChildren(StructColumnVector vector)
+        {
+            if (ReferenceEquals(vector, _boundVector))
+            {
+                return _boundChildren!;
+            }
+
+            var children = new ColumnVector[_type.Count];
+            for (int i = 0; i < _type.Count; i++)
+            {
+                children[i] = vector.Child(i);
+            }
+
+            _boundVector = vector;
+            _boundChildren = children;
+            return children;
+        }
+    }
+
+    // Reads an array value as an object?[] (an IReadOnlyList<object?>/IEnumerable, the inverse of the
+    // non-string-IEnumerable array encode): the row's elements are read from the per-row element view,
+    // null-aware. A null array row never reaches here — the caller gates on IsNull; an empty array yields an
+    // empty array. The element reader is built ONCE with a constant "element" name, so no per-row StructField is
+    // synthesized (#610). The token is polled per element so a single row carrying a huge collection stays
+    // cancellable (the row-level poll alone would not interrupt one gigantic cell).
+    private sealed class ListReader : ColumnReader
+    {
+        private readonly ColumnReader _element;
+
+        public ListReader(ArrayType type) => _element = For(type.ElementType, "element");
+
+        public override object Read(ColumnVector column, int index, CancellationToken cancellationToken)
+        {
+            var vector = (ListColumnVector)column;
+            ColumnVector elements = vector.ElementsAt(index);
+            int count = elements.Length;
+            var items = new object?[count];
+            for (int j = 0; j < count; j++)
+            {
+                if ((j & CancellationPollMask) == 0)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+
+                items[j] = elements.IsNull(j) ? null : _element.Read(elements, j, cancellationToken);
+            }
+
+            return items;
+        }
+    }
+
+    // Reads a map value as a Dictionary<object, object?> (an IDictionary, the inverse of the IDictionary map
+    // encode): the row's entries are read from the parallel per-row key/value views. Keys are non-null (MapType
+    // invariant); values are null-aware. A null map row never reaches here — the caller gates on IsNull; an
+    // empty map yields an empty dictionary. On the rare stored duplicate key, last value wins. The key/value
+    // readers are built ONCE with constant "key"/"value" names, so no per-row StructField is synthesized (#610).
+    // The token is polled per entry so a huge map row stays cancellable.
+    private sealed class MapReader : ColumnReader
+    {
+        private readonly ColumnReader _key;
+        private readonly ColumnReader _value;
+
+        public MapReader(MapType type)
+        {
+            _key = For(type.KeyType, "key");
+            _value = For(type.ValueType, "value");
+        }
+
+        public override object Read(ColumnVector column, int index, CancellationToken cancellationToken)
+        {
+            var vector = (MapColumnVector)column;
+            ColumnVector keys = vector.KeysAt(index);
+            ColumnVector values = vector.ValuesAt(index);
+            int count = keys.Length;
+            var map = new Dictionary<object, object?>(count);
+            for (int j = 0; j < count; j++)
+            {
+                if ((j & CancellationPollMask) == 0)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+
+                object key = _key.Read(keys, j, cancellationToken);
+                map[key] = values.IsNull(j) ? null : _value.Read(values, j, cancellationToken);
+            }
+
+            return map;
+        }
+    }
+
+    // Decodes a scalar (non-nested) cell to its natural CLR value, null-aware handled by the caller. Nested
+    // types never reach here — ColumnReader.For routes struct/array/map to their hoisting readers; the default
+    // arm stays as a fail-closed guard for an unmapped type.
+    private static object ReadScalar(ColumnVector column, DataType type, string name, int index)
+    {
         return type switch
         {
             BooleanType => column.GetValue<bool>(index),
@@ -122,87 +305,15 @@ internal static class RowMaterializer
             FloatType => column.GetValue<float>(index),
             DoubleType => column.GetValue<double>(index),
             DecimalType decimalType => ReadDecimal(column, decimalType, index),
-            DateType => ReadDate(column, field, index),
-            TimestampType => ReadTimestamp(column, field, index),
-            TimestampNtzType => ReadTimestampNtz(column, field, index),
+            DateType => ReadDate(column, name, type, index),
+            TimestampType => ReadTimestamp(column, name, type, index),
+            TimestampNtzType => ReadTimestampNtz(column, name, type, index),
             StringType => Encoding.UTF8.GetString(column.GetBytes(index)),
             BinaryType => column.GetBytes(index).ToArray(),
-            StructType structType => ReadStruct(column, structType, index, cancellationToken),
-            ArrayType arrayType => ReadList(column, arrayType, index, cancellationToken),
-            MapType mapType => ReadMap(column, mapType, index, cancellationToken),
             _ => throw new UnsupportedPlanException(
                 QueryExecutionStage.Materialize,
                 $"Row materialization has no CLR mapping for type '{type.SimpleString}'."),
         };
-    }
-
-    // Reads a struct value as a nested Row (the exact inverse of LocalRelationBatches' struct encode, and
-    // the CreateDataFrame nested CLR convention #608): each field is read from its child at the same
-    // logical index, null-aware. A null struct row never reaches here — the caller gates on IsNull.
-    private static Row ReadStruct(ColumnVector column, StructType type, int index, CancellationToken cancellationToken)
-    {
-        var vector = (StructColumnVector)column;
-        var values = new object?[type.Count];
-        for (int i = 0; i < type.Count; i++)
-        {
-            ColumnVector child = vector.Child(i);
-            values[i] = child.IsNull(index) ? null : ReadValue(child, type[i], index, cancellationToken);
-        }
-
-        return new Row(type, values);
-    }
-
-    // Reads an array value as an object?[] (an IReadOnlyList<object?>/IEnumerable, the inverse of the
-    // non-string-IEnumerable array encode): the row's elements are read from the per-row element view,
-    // null-aware. A null array row never reaches here — the caller gates on IsNull; an empty array yields
-    // an empty array. The token is polled per element so a single row carrying a huge collection stays
-    // cancellable (the row-level poll alone would not interrupt one gigantic cell).
-    private static object ReadList(ColumnVector column, ArrayType type, int index, CancellationToken cancellationToken)
-    {
-        var vector = (ListColumnVector)column;
-        ColumnVector elements = vector.ElementsAt(index);
-        int count = elements.Length;
-        var items = new object?[count];
-        var elementField = new StructField("element", type.ElementType, type.ContainsNull);
-        for (int j = 0; j < count; j++)
-        {
-            if ((j & CancellationPollMask) == 0)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-            }
-
-            items[j] = elements.IsNull(j) ? null : ReadValue(elements, elementField, j, cancellationToken);
-        }
-
-        return items;
-    }
-
-    // Reads a map value as a Dictionary<object, object?> (an IDictionary, the inverse of the IDictionary
-    // map encode): the row's entries are read from the parallel per-row key/value views. Keys are non-null
-    // (MapType invariant); values are null-aware. A null map row never reaches here — the caller gates on
-    // IsNull; an empty map yields an empty dictionary. On the rare stored duplicate key, last value wins.
-    // The token is polled per entry so a huge map row stays cancellable.
-    private static object ReadMap(ColumnVector column, MapType type, int index, CancellationToken cancellationToken)
-    {
-        var vector = (MapColumnVector)column;
-        ColumnVector keys = vector.KeysAt(index);
-        ColumnVector values = vector.ValuesAt(index);
-        int count = keys.Length;
-        var map = new Dictionary<object, object?>(count);
-        var keyField = new StructField("key", type.KeyType, nullable: false);
-        var valueField = new StructField("value", type.ValueType, type.ValueContainsNull);
-        for (int j = 0; j < count; j++)
-        {
-            if ((j & CancellationPollMask) == 0)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-            }
-
-            object key = ReadValue(keys, keyField, j, cancellationToken);
-            map[key] = values.IsNull(j) ? null : ReadValue(values, valueField, j, cancellationToken);
-        }
-
-        return map;
     }
 
     // The driver polls the effective cancellation token every 1024 materialized rows (a power-of-two
@@ -270,7 +381,7 @@ internal static class RowMaterializer
     // An epoch-day whose date falls outside DateOnly's representable range (0001-01-01..9999-12-31) is a
     // deterministic UnsupportedPlanException (mirrors the timestamp/decimal paths) rather than a raw
     // ArgumentOutOfRangeException leaked from DateOnly.AddDays.
-    private static DateOnly ReadDate(ColumnVector column, StructField field, int index)
+    private static DateOnly ReadDate(ColumnVector column, string name, DataType type, int index)
     {
         int epochDay = column.GetValue<int>(index);
         try
@@ -279,16 +390,16 @@ internal static class RowMaterializer
         }
         catch (ArgumentOutOfRangeException)
         {
-            throw OutOfRangeDate(field);
+            throw OutOfRangeDate(name, type);
         }
     }
 
     // The out-of-range message names the offending column and type but deliberately does NOT embed the raw
     // cell value (the epoch-day), which would leak row-level data into logs/diagnostics (#176 #8).
-    private static UnsupportedPlanException OutOfRangeDate(StructField field) =>
+    private static UnsupportedPlanException OutOfRangeDate(string name, DataType type) =>
         new(QueryExecutionStage.Materialize,
-            $"Row materialization cannot surface column '{field.Name}' of type "
-            + $"'{field.DataType.SimpleString}' as System.DateOnly: the date falls outside the "
+            $"Row materialization cannot surface column '{name}' of type "
+            + $"'{type.SimpleString}' as System.DateOnly: the date falls outside the "
             + "representable DateOnly range.");
 
     // A TimestampType lane stores the Spark epoch-microsecond instant as a long; surface it as a UTC
@@ -297,16 +408,16 @@ internal static class RowMaterializer
     // A micros value whose ticks overflow long, or whose instant falls outside DateTime's range, is a
     // deterministic UnsupportedPlanException (mirrors the decimal path) rather than a raw
     // ArgumentOutOfRangeException or a silent mis-decode.
-    private static DateTime ReadTimestamp(ColumnVector column, StructField field, int index) =>
-        ReadTimestampInstant(column, field, index, DateTimeKind.Utc);
+    private static DateTime ReadTimestamp(ColumnVector column, string name, DataType type, int index) =>
+        ReadTimestampInstant(column, name, type, index, DateTimeKind.Utc);
 
     // A TimestampNtzType lane stores the same epoch-microsecond long but is timezone-LESS (#533): surface
     // it as a DateTime of kind Unspecified — a wall-clock instant with no offset — so Collect()/Show renders
     // the stored local-datetime, never a UTC-adjusted one. Range handling is identical to ReadTimestamp.
-    private static DateTime ReadTimestampNtz(ColumnVector column, StructField field, int index) =>
-        ReadTimestampInstant(column, field, index, DateTimeKind.Unspecified);
+    private static DateTime ReadTimestampNtz(ColumnVector column, string name, DataType type, int index) =>
+        ReadTimestampInstant(column, name, type, index, DateTimeKind.Unspecified);
 
-    private static DateTime ReadTimestampInstant(ColumnVector column, StructField field, int index, DateTimeKind kind)
+    private static DateTime ReadTimestampInstant(ColumnVector column, string name, DataType type, int index, DateTimeKind kind)
     {
         long micros = column.GetValue<long>(index);
         long ticks;
@@ -317,12 +428,12 @@ internal static class RowMaterializer
         }
         catch (OverflowException)
         {
-            throw OutOfRangeTimestamp(field);
+            throw OutOfRangeTimestamp(name, type);
         }
 
         if (ticks < DateTime.MinValue.Ticks || ticks > DateTime.MaxValue.Ticks)
         {
-            throw OutOfRangeTimestamp(field);
+            throw OutOfRangeTimestamp(name, type);
         }
 
         return new DateTime(ticks, kind);
@@ -330,10 +441,10 @@ internal static class RowMaterializer
 
     // Names the offending column and type but deliberately does NOT embed the raw epoch-microsecond cell
     // value, which would leak row-level data into logs/diagnostics (#176 #8).
-    private static UnsupportedPlanException OutOfRangeTimestamp(StructField field) =>
+    private static UnsupportedPlanException OutOfRangeTimestamp(string name, DataType type) =>
         new(QueryExecutionStage.Materialize,
-            $"Row materialization cannot surface column '{field.Name}' of type "
-            + $"'{field.DataType.SimpleString}' as System.DateTime: the instant falls outside the "
+            $"Row materialization cannot surface column '{name}' of type "
+            + $"'{type.SimpleString}' as System.DateTime: the instant falls outside the "
             + "representable DateTime range.");
 
     private static readonly DateOnly UnixEpochDate = new(1970, 1, 1);
