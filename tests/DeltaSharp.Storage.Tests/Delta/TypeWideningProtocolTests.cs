@@ -276,27 +276,36 @@ public sealed class TypeWideningProtocolTests : IDisposable
         Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
     }
 
+    [Fact]
+    public void UpgradeProtocol_LegacyTableWithAllStructPathInvariant_EnumeratesInvariants()
+    {
+        // An invariant reached by an ALL-STRUCT path (`payload.x`) is collected + enforced (#606), so the
+        // upgrade must enumerate the `invariants` writer feature so it stays active rather than silently
+        // deactivating on upgrade to writer 7 (it is enforced per row, #581/#568).
+        var schema = new StructType(new[] { new StructField("payload", InvariantInnerStruct(), nullable: true) });
+
+        ProtocolAction upgraded = TypeWideningFeature.UpgradeProtocol(
+            new ProtocolAction(1, 2, [], []), schema, ImmutableDictionary<string, string>.Empty);
+
+        Assert.Contains("invariants", upgraded.WriterFeatures);
+        Assert.DoesNotContain("invariants", upgraded.ReaderFeatures); // writer-only feature
+        ProtocolSupport.EnsureWritable(upgraded);
+    }
+
     [Theory]
-    [InlineData("struct")]      // struct< x:invariant >
     [InlineData("array")]       // array< struct< x:invariant > >
     [InlineData("map-value")]   // map< string, struct< x:invariant > >
     [InlineData("map-key")]     // map< struct< x:invariant >, long >
-    public void UpgradeProtocol_LegacyTableWithNestedColumnInvariant_EnumeratesInvariants(string nesting)
+    public void UpgradeProtocol_LegacyTableWithInvariantUnderArrayOrMap_DoesNotEnumerateInvariants(string nesting)
     {
-        // A column invariant reachable through a struct field, an array element, or a map key/value struct is
-        // a valid Delta construct (Spark collects/enforces invariants through array/map elements). Upgrade
-        // must recurse through ALL of these and enumerate the `invariants` writer feature so it stays active,
-        // rather than silently deactivating it on upgrade to writer 7 (it is enforced per row, #581/#568).
-        var invariantLeaf = new StructField(
-            "x", DataTypes.LongType, nullable: true,
-            FieldMetadata.FromEntries(new[]
-            {
-                new KeyValuePair<string, string>("delta.invariants", "{\"expression\":{\"expression\":\"x > 0\"}}"),
-            }));
-        var inner = new StructType(new[] { invariantLeaf });
+        // #612: feature enumeration recurses into STRUCTs only (Delta's Invariants.getFromSchema uses
+        // checkComplexTypes = false), matching the invariant COLLECTION path (#606). An invariant reached THROUGH
+        // an array element or a map key/value is IGNORED — never collected, never enforced — so the `invariants`
+        // writer feature must NOT be declared for it (a table whose only invariant is under a collection would
+        // otherwise over-declare a feature it does not enforce, diverging from Delta).
+        StructType inner = InvariantInnerStruct();
         DataType nested = nesting switch
         {
-            "struct" => inner,
             "array" => new ArrayType(inner),
             "map-value" => new MapType(DataTypes.StringType, inner),
             _ => new MapType(inner, DataTypes.LongType),
@@ -306,8 +315,38 @@ public sealed class TypeWideningProtocolTests : IDisposable
         ProtocolAction upgraded = TypeWideningFeature.UpgradeProtocol(
             new ProtocolAction(1, 2, [], []), schema, ImmutableDictionary<string, string>.Empty);
 
-        Assert.Contains("invariants", upgraded.WriterFeatures);
-        Assert.DoesNotContain("invariants", upgraded.ReaderFeatures); // writer-only feature
-        ProtocolSupport.EnsureWritable(upgraded);
+        Assert.DoesNotContain("invariants", upgraded.WriterFeatures);
     }
+
+    [Fact]
+    public void UpgradeProtocol_LegacyTableWithInvariantOnTopLevelArrayField_EnumeratesInvariants()
+    {
+        // The #612 restriction governs descent INTO a collection's elements only. An invariant declared DIRECTLY
+        // on a top-level array/map FIELD (the field itself is on an all-struct path from the root) is still
+        // collected (#606's CollectInvariants), so it is still enumerated.
+        var arrayFieldWithInvariant = new StructField(
+            "tags", new ArrayType(DataTypes.StringType), nullable: true,
+            FieldMetadata.FromEntries(new[]
+            {
+                new KeyValuePair<string, string>("delta.invariants", "{\"expression\":{\"expression\":\"size(tags) > 0\"}}"),
+            }));
+        var schema = new StructType(new[] { arrayFieldWithInvariant });
+
+        ProtocolAction upgraded = TypeWideningFeature.UpgradeProtocol(
+            new ProtocolAction(1, 2, [], []), schema, ImmutableDictionary<string, string>.Empty);
+
+        Assert.Contains("invariants", upgraded.WriterFeatures);
+    }
+
+    // A struct `{ x:long }` whose field `x` carries a `delta.invariants` (`x > 0`).
+    private static StructType InvariantInnerStruct() =>
+        new(new[]
+        {
+            new StructField(
+                "x", DataTypes.LongType, nullable: true,
+                FieldMetadata.FromEntries(new[]
+                {
+                    new KeyValuePair<string, string>("delta.invariants", "{\"expression\":{\"expression\":\"x > 0\"}}"),
+                })),
+        });
 }
