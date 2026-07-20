@@ -213,6 +213,74 @@ public sealed class SessionAnsiModeEndToEndTests : IDisposable
         }
     }
 
+    [Fact]
+    public void OutputSchema_FunctionOverArithmetic_IsModeAware_Widens()
+    {
+        // #627: a PropagatesAny function (`length`) wrapping an overflow-capable `v + v` follows the
+        // argument's Legacy widening — the analyzed output column is nullable under Legacy, NOT-NULL
+        // under Ansi. This is the residual #614 intentionally left (function-wrapped overflow).
+        Column wrapped = Functions.Length(Functions.Col("v").Plus(Functions.Col("v"))).As("len");
+
+        using (SparkSession legacy = NewSession(ansiEnabled: false))
+        {
+            DataFrame df = legacy.CreateDataFrame(MaxValueRows(), Schema).Select(wrapped);
+            Assert.True(AnalyzedNullability(legacy, df, "len"));
+        }
+
+        using (SparkSession ansi = NewSession(ansiEnabled: null))
+        {
+            DataFrame df = ansi.CreateDataFrame(MaxValueRows(), Schema).Select(wrapped);
+            Assert.False(AnalyzedNullability(ansi, df, "len"));
+        }
+    }
+
+    [Fact]
+    public void OutputSchema_CoalesceOverArithmetic_NotWidenedByNonNullFallback()
+    {
+        // #627: coalesce(v+v, 0) is PropagatesAll — the NOT-NULL literal fallback pins the result
+        // NOT-NULL, so the overflow-capable first arg does NOT widen it even under Legacy (precise, not
+        // conservatively over-reported). Ansi is byte-identical.
+        Column coalesce = Functions
+            .Coalesce(Functions.Col("v").Plus(Functions.Col("v")), Functions.Lit(0))
+            .As("c");
+
+        using (SparkSession legacy = NewSession(ansiEnabled: false))
+        {
+            DataFrame df = legacy.CreateDataFrame(MaxValueRows(), Schema).Select(coalesce);
+            Assert.False(AnalyzedNullability(legacy, df, "c"));
+        }
+
+        using (SparkSession ansi = NewSession(ansiEnabled: null))
+        {
+            DataFrame df = ansi.CreateDataFrame(MaxValueRows(), Schema).Select(coalesce);
+            Assert.False(AnalyzedNullability(ansi, df, "c"));
+        }
+    }
+
+    [Fact]
+    public void OutputSchema_CoalesceOverAllOverflowArgs_WidensUnderLegacyOnly()
+    {
+        // coalesce(v+v, v+v): every arg is overflow-capable, so under Legacy ALL can null → the column
+        // is nullable; under Ansi both throw instead of nulling, so it stays NOT-NULL (byte-identical).
+        Column coalesce = Functions
+            .Coalesce(
+                Functions.Col("v").Plus(Functions.Col("v")),
+                Functions.Col("v").Plus(Functions.Col("v")))
+            .As("c");
+
+        using (SparkSession legacy = NewSession(ansiEnabled: false))
+        {
+            DataFrame df = legacy.CreateDataFrame(MaxValueRows(), Schema).Select(coalesce);
+            Assert.True(AnalyzedNullability(legacy, df, "c"));
+        }
+
+        using (SparkSession ansi = NewSession(ansiEnabled: null))
+        {
+            DataFrame df = ansi.CreateDataFrame(MaxValueRows(), Schema).Select(coalesce);
+            Assert.False(AnalyzedNullability(ansi, df, "c"));
+        }
+    }
+
     // Reads the analyzed (resolved) output column's nullability the way a DataFrame action does — the
     // session's ANSI lens is threaded into the analyzer's output-schema derivation (#614). Uses the
     // internal analyzer directly (InternalsVisibleTo) so the assertion is on the resolved schema, not a
