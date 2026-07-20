@@ -34,8 +34,13 @@ internal sealed class Cast : Expression
     public override DataType Type => TargetType;
 
     /// <inheritdoc/>
-    // TODO(FEAT-04.5): widen for null-introducing (lossy/non-ANSI) casts
+    // #614: Legacy widening for null-introducing (lossy/non-ANSI identity-changing) casts is handled
+    // by NullableUnder; the mode-independent hint below forwards the child's.
     public override bool Nullable => Child.Nullable;
+
+    /// <inheritdoc/>
+    public override bool NullableUnder(AnsiMode mode) =>
+        Child.NullableUnder(mode) || (mode == AnsiMode.Legacy && !TargetType.Equals(Child.Type));
 
     /// <inheritdoc/>
     public override string NodeName => "Cast";

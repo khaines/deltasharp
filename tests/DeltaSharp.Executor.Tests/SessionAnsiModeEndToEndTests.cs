@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text.Json.Nodes;
+using DeltaSharp.Analysis;
 using DeltaSharp.Storage;
 using DeltaSharp.Types;
 using Xunit;
@@ -120,6 +121,46 @@ public sealed class SessionAnsiModeEndToEndTests : IDisposable
         }
 
         Assert.Equal(ansiPlan, legacyPlan);
+    }
+
+    // ---------- #614: output-schema nullability is mode-aware ----------
+
+    [Fact]
+    public void OutputSchema_LegacySession_ArithmeticOverflowColumn_IsNullable()
+    {
+        // #614: `v + v` over a NOT-NULL `v` can null on overflow under Legacy (DeltaSharp nulls rather
+        // than throwing), so the analyzed output column must be reported nullable — under-reporting a
+        // NOT-NULL column that can materialize SQL NULL is the bug this fixes.
+        using SparkSession spark = NewSession(ansiEnabled: false);
+        DataFrame df = spark.CreateDataFrame(MaxValueRows(), Schema)
+            .Select(Functions.Col("v").Plus(Functions.Col("v")).As("doubled"));
+
+        Assert.True(AnalyzedNullability(spark, df, "doubled"));
+    }
+
+    [Fact]
+    public void OutputSchema_AnsiSession_ArithmeticOverflowColumn_FollowsOperands()
+    {
+        // Under Ansi the same overflow THROWS instead of nulling, so nullability follows the operands:
+        // `v + v` over a NOT-NULL `v` stays NOT-NULL. This pins that the Legacy widening is mode-scoped
+        // and Ansi output nullability is byte-identical to the pre-#614 (mode-independent) behavior.
+        using SparkSession spark = NewSession(ansiEnabled: null);
+        DataFrame df = spark.CreateDataFrame(MaxValueRows(), Schema)
+            .Select(Functions.Col("v").Plus(Functions.Col("v")).As("doubled"));
+
+        Assert.False(AnalyzedNullability(spark, df, "doubled"));
+    }
+
+    // Reads the analyzed (resolved) output column's nullability the way a DataFrame action does — the
+    // session's ANSI lens is threaded into the analyzer's output-schema derivation (#614). Uses the
+    // internal analyzer directly (InternalsVisibleTo) so the assertion is on the resolved schema, not a
+    // rendered plan string. A cast analog is not covered end-to-end: the public Column API exposes no
+    // cast, so Cast.NullableUnder's Legacy widening is validated at the Core expression level (#614).
+    private static bool AnalyzedNullability(SparkSession spark, DataFrame df, string column)
+    {
+        _ = new Analyzer(spark.Catalog, spark.FileRelationResolver, spark.AnsiMode)
+            .Resolve(df.Plan, out IReadOnlyList<(string Name, DataType Type, bool Nullable)> output);
+        return output.Single(c => c.Name == column).Nullable;
     }
 
     // ---------- Write-door (CHECK-constraint predicate) ----------

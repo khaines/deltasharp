@@ -103,6 +103,40 @@ public class ExpressionTypeModelTests
     }
 
     [Fact]
+    public void NullableUnder_Arithmetic_WidensToNullableUnderLegacyOnly()
+    {
+        // #614: `1 + 2` over NOT-NULL literal operands is NOT-NULL under Ansi (overflow throws), but
+        // widens to nullable under Legacy (overflow nulls). NullableUnder(Ansi) must equal Nullable.
+        var arithmetic = new BinaryArithmetic(Literal.OfInt(1), Literal.OfInt(2), ArithmeticOperator.Add);
+
+        Assert.False(arithmetic.Nullable);
+        Assert.False(arithmetic.NullableUnder(AnsiMode.Ansi));
+        Assert.True(arithmetic.NullableUnder(AnsiMode.Legacy));
+    }
+
+    [Fact]
+    public void NullableUnder_NonIdentityCast_WidensToNullableUnderLegacyOnly()
+    {
+        // #614: a non-identity (lossy-capable) cast of a NOT-NULL operand widens to nullable under
+        // Legacy (invalid cast nulls) but follows the child under Ansi.
+        var cast = new Cast(Literal.OfInt(1), LongType.Instance);
+
+        Assert.False(cast.Nullable);
+        Assert.False(cast.NullableUnder(AnsiMode.Ansi));
+        Assert.True(cast.NullableUnder(AnsiMode.Legacy));
+    }
+
+    [Fact]
+    public void NullableUnder_IdentityCast_FollowsChildInBothModes()
+    {
+        // An identity cast introduces no null even under Legacy, so it follows the (NOT-NULL) child.
+        var cast = new Cast(Literal.OfInt(1), IntegerType.Instance);
+
+        Assert.False(cast.NullableUnder(AnsiMode.Ansi));
+        Assert.False(cast.NullableUnder(AnsiMode.Legacy));
+    }
+
+    [Fact]
     public void UnresolvedMarkers_HaveNoKnownType()
     {
         Assert.Null(new UnresolvedAttribute("x").Type);

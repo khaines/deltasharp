@@ -60,6 +60,10 @@ internal sealed class BinaryArithmetic : Expression
     public override bool Nullable => Left.Nullable || Right.Nullable;
 
     /// <inheritdoc/>
+    public override bool NullableUnder(AnsiMode mode) =>
+        Left.NullableUnder(mode) || Right.NullableUnder(mode) || mode == AnsiMode.Legacy;
+
+    /// <inheritdoc/>
     public override string NodeName => Operator switch
     {
         ArithmeticOperator.Add => "Add",
@@ -135,6 +139,10 @@ internal sealed class BinaryComparison : Expression
 
     /// <inheritdoc/>
     public override bool Nullable => Left.Nullable || Right.Nullable;
+
+    /// <inheritdoc/>
+    public override bool NullableUnder(AnsiMode mode) =>
+        Left.NullableUnder(mode) || Right.NullableUnder(mode);
 
     /// <inheritdoc/>
     public override string NodeName => Operator switch

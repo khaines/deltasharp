@@ -50,6 +50,15 @@ internal abstract class Expression : TreeNode<Expression>
     public virtual bool Nullable => true;
 
     /// <summary>
+    /// The mode-aware nullability hint: identical to <see cref="Nullable"/> under <see cref="AnsiMode.Ansi"/>,
+    /// but under <see cref="AnsiMode.Legacy"/> an overflow-capable arithmetic or a lossy cast can manufacture SQL
+    /// NULL from otherwise-non-null operands (DeltaSharp nulls on overflow/invalid-cast in Legacy rather than
+    /// throwing), so those nodes widen to nullable. The default forwards <see cref="Nullable"/> (a leaf/literal is
+    /// mode-independent); structural nodes that PROPAGATE child nullability override this to recurse mode-awarely.
+    /// </summary>
+    public virtual bool NullableUnder(AnsiMode mode) => Nullable;
+
+    /// <summary>
     /// Whether evaluating this expression yields the same result for the same input row every time
     /// (Catalyst <c>Expression.deterministic</c>). An expression is deterministic exactly when it
     /// and all of its children are; a <b>non-deterministic</b> node (a future <c>rand</c>/<c>uuid</c>/
