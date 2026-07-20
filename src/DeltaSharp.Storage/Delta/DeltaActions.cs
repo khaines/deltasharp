@@ -87,9 +87,9 @@ internal sealed record TxnAction(string AppId, long Version, long? LastUpdated) 
 /// key/value provenance) it models the typed fields the Delta ecosystem (<c>DESCRIBE HISTORY</c>,
 /// delta-standalone/-rs/-spark) reads: the commit <see cref="Timestamp"/> (epoch-ms), the
 /// <see cref="Operation"/> string (e.g. <c>WRITE</c>, <c>DELETE</c>, <c>OPTIMIZE</c>, <c>CREATE TABLE</c>),
-/// its <see cref="OperationParameters"/>, and the <see cref="EngineInfo"/>. All four are optional so an
-/// older or caller-minted <c>commitInfo</c> carrying only <see cref="Entries"/> stays valid (backward
-/// compatible).
+/// its <see cref="OperationParameters"/>, the per-operation <see cref="OperationMetrics"/>, and the
+/// <see cref="EngineInfo"/>. All the typed fields are optional so an older or caller-minted
+/// <c>commitInfo</c> carrying only <see cref="Entries"/> stays valid (backward compatible).
 ///
 /// <para><b><see cref="OperationParameters"/> value contract.</b> Per the Delta spec each
 /// <c>operationParameters</c> value is itself a <b>JSON-encoded string</b> — a scalar is a JSON string
@@ -99,10 +99,17 @@ internal sealed record TxnAction(string AppId, long Version, long? LastUpdated) 
 /// <c>Utf8JsonWriter.WriteRawValue</c> so a quoted scalar or a bracketed array serializes correctly, and the
 /// reader round-trips it with <c>JsonElement.GetRawText</c>. Build values through
 /// <see cref="DeltaCommitInfo"/> (never hand-concatenate) so encoding stays correct.</para>
+///
+/// <para><b><see cref="OperationMetrics"/> value contract.</b> <c>operationMetrics</c> is likewise a Delta
+/// <c>Map&lt;String,String&gt;</c>, so — exactly like <see cref="OperationParameters"/> — each value is an
+/// already JSON-encoded token. A metric is a numeric string, so its token is a quoted number-string (e.g.
+/// <c>numAddedFiles</c> ⇒ <c>"3"</c>, WITH the quotes, NOT a bare JSON number). The writer emits it raw and
+/// the reader round-trips it with <c>GetRawText</c>, identically to <see cref="OperationParameters"/>.</para>
 /// </summary>
 internal sealed record CommitInfoAction(
     ImmutableSortedDictionary<string, string> Entries,
     long? Timestamp = null,
     string? Operation = null,
     ImmutableSortedDictionary<string, string>? OperationParameters = null,
+    ImmutableSortedDictionary<string, string>? OperationMetrics = null,
     string? EngineInfo = null) : DeltaAction;

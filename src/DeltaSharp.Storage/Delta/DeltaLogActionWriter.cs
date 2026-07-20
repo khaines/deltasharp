@@ -208,9 +208,9 @@ internal static class DeltaLogActionWriter
         writer.WriteStartObject();
         writer.WriteStartObject("commitInfo");
 
-        // Delta's conventional key order: timestamp, operation, operationParameters, then the flat provenance
-        // Entries (txnId etc.), then engineInfo. Each typed field is emitted only when present (backward
-        // compatible with a commitInfo that carries only Entries).
+        // Delta's conventional key order: timestamp, operation, operationParameters, operationMetrics, then the
+        // flat provenance Entries (txnId etc.), then engineInfo. Each typed field is emitted only when present
+        // (backward compatible with a commitInfo that carries only Entries).
         if (commitInfo.Timestamp is { } timestamp)
         {
             writer.WriteNumber("timestamp", timestamp);
@@ -230,6 +230,21 @@ internal static class DeltaLogActionWriter
             {
                 writer.WritePropertyName(parameter.Key);
                 writer.WriteRawValue(parameter.Value);
+            }
+
+            writer.WriteEndObject();
+        }
+
+        if (commitInfo.OperationMetrics is { } operationMetrics)
+        {
+            writer.WriteStartObject("operationMetrics");
+            // operationMetrics is a Delta Map<String,String> too, so each value is an ALREADY JSON-encoded
+            // token — a metric is a quoted number-string like "3" — and is written RAW, exactly like
+            // operationParameters (never re-quoted; see CommitInfoAction).
+            foreach (KeyValuePair<string, string> metric in operationMetrics)
+            {
+                writer.WritePropertyName(metric.Key);
+                writer.WriteRawValue(metric.Value);
             }
 
             writer.WriteEndObject();

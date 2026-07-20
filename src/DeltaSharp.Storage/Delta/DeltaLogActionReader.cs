@@ -230,6 +230,7 @@ internal static class DeltaLogActionReader
         long? timestamp = null;
         string? operation = null;
         ImmutableSortedDictionary<string, string>? operationParameters = null;
+        ImmutableSortedDictionary<string, string>? operationMetrics = null;
         string? engineInfo = null;
         var builder = ImmutableSortedDictionary.CreateBuilder<string, string>(StringComparer.Ordinal);
         foreach (JsonProperty property in body.EnumerateObject())
@@ -244,7 +245,10 @@ internal static class DeltaLogActionReader
                     operation = property.Value.GetString();
                     break;
                 case "operationParameters" when property.Value.ValueKind == JsonValueKind.Object:
-                    operationParameters = ParseOperationParameters(property.Value);
+                    operationParameters = ParseRawTokenMap(property.Value);
+                    break;
+                case "operationMetrics" when property.Value.ValueKind == JsonValueKind.Object:
+                    operationMetrics = ParseRawTokenMap(property.Value);
                     break;
                 case "engineInfo" when property.Value.ValueKind == JsonValueKind.String:
                     engineInfo = property.Value.GetString();
@@ -261,12 +265,14 @@ internal static class DeltaLogActionReader
             }
         }
 
-        return new CommitInfoAction(builder.ToImmutable(), timestamp, operation, operationParameters, engineInfo);
+        return new CommitInfoAction(
+            builder.ToImmutable(), timestamp, operation, operationParameters, operationMetrics, engineInfo);
     }
 
-    // operationParameters values are JSON-encoded tokens (a quoted scalar or an array); preserve each as its
-    // RAW JSON text so a write→read→write cycle reproduces the exact token the writer emits raw.
-    private static ImmutableSortedDictionary<string, string> ParseOperationParameters(JsonElement parameters)
+    // operationParameters/operationMetrics values are JSON-encoded tokens (a quoted scalar, a quoted
+    // number-string, or an array); preserve each as its RAW JSON text so a write→read→write cycle reproduces
+    // the exact token the writer emits raw.
+    private static ImmutableSortedDictionary<string, string> ParseRawTokenMap(JsonElement parameters)
     {
         var builder = ImmutableSortedDictionary.CreateBuilder<string, string>(StringComparer.Ordinal);
         foreach (JsonProperty property in parameters.EnumerateObject())

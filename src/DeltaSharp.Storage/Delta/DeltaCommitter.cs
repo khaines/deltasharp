@@ -751,9 +751,9 @@ internal sealed class DeltaCommitter
     /// <summary>Builds the serialized payload: a single leading <c>commitInfo</c> carrying this attempt's
     /// idempotency <paramref name="nonce"/> (merged over any caller-supplied <c>commitInfo</c>) plus the
     /// stamped <c>timestamp</c> (from the injected clock) and <c>engineInfo</c>, followed by the caller's
-    /// non-<c>commitInfo</c> actions in order. The caller-supplied <c>operation</c>/<c>operationParameters</c>
-    /// (from <see cref="DeltaCommitInfo"/>) ride through unchanged — the engine owns only the clock/nonce/
-    /// engine stamps.</summary>
+    /// non-<c>commitInfo</c> actions in order. The caller-supplied <c>operation</c>/<c>operationParameters</c>/
+    /// <c>operationMetrics</c> (from <see cref="DeltaCommitInfo"/>) ride through unchanged — the engine owns
+    /// only the clock/nonce/engine stamps.</summary>
     private (IReadOnlyList<DeltaAction> Payload, string Nonce) BuildPayload(
         IReadOnlyList<DeltaAction> actions, string nonce)
     {
@@ -761,6 +761,7 @@ internal sealed class DeltaCommitter
         var rest = new List<DeltaAction>(actions.Count);
         string? operation = null;
         ImmutableSortedDictionary<string, string>? operationParameters = null;
+        ImmutableSortedDictionary<string, string>? operationMetrics = null;
         foreach (DeltaAction action in actions)
         {
             if (action is CommitInfoAction commitInfo)
@@ -773,6 +774,7 @@ internal sealed class DeltaCommitter
                 // First non-null wins (a commit builds at most one operation-bearing commitInfo).
                 operation ??= commitInfo.Operation;
                 operationParameters ??= commitInfo.OperationParameters;
+                operationMetrics ??= commitInfo.OperationMetrics;
             }
             else
             {
@@ -792,6 +794,7 @@ internal sealed class DeltaCommitter
             Timestamp: timestamp,
             Operation: operation,
             OperationParameters: operationParameters,
+            OperationMetrics: operationMetrics,
             EngineInfo: EngineInfo);
 
         var payload = new List<DeltaAction>(rest.Count + 1) { stampedCommitInfo };

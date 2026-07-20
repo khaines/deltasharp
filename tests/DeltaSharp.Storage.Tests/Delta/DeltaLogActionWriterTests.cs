@@ -135,6 +135,51 @@ public sealed class DeltaLogActionWriterTests
     }
 
     [Fact]
+    public void SerializesCommitInfo_RoundTrippingOperationMetrics()
+    {
+        // #506: operationMetrics (a Delta Map<String,String>, like operationParameters) round-trips through
+        // the writer/reader with each value preserved as its already-JSON-encoded token — a metric is a
+        // quoted number-string like "3".
+        var commitInfo = new CommitInfoAction(
+            StringMap(("txnId", "nonce-2")),
+            Timestamp: 1700000005000L,
+            Operation: "OPTIMIZE",
+            OperationParameters: StringMap(("predicate", "\"[]\"")),
+            OperationMetrics: StringMap(
+                ("numAddedFiles", "\"1\""),
+                ("numRemovedFiles", "\"4\""),
+                ("numAddedBytes", "\"2048\""),
+                ("numRemovedBytes", "\"4096\""),
+                ("numRows", "\"8\"")),
+            EngineInfo: "test");
+
+        var parsed = Assert.IsType<CommitInfoAction>(Assert.Single(RoundTrip(commitInfo)));
+
+        Assert.Equal("OPTIMIZE", parsed.Operation);
+        Assert.Equal("\"[]\"", parsed.OperationParameters!["predicate"]);
+        Assert.Equal("\"1\"", parsed.OperationMetrics!["numAddedFiles"]);
+        Assert.Equal("\"4\"", parsed.OperationMetrics!["numRemovedFiles"]);
+        Assert.Equal("\"2048\"", parsed.OperationMetrics!["numAddedBytes"]);
+        Assert.Equal("\"4096\"", parsed.OperationMetrics!["numRemovedBytes"]);
+        Assert.Equal("\"8\"", parsed.OperationMetrics!["numRows"]);
+    }
+
+    [Fact]
+    public void SerializesCommitInfo_OmitsOperationMetrics_WhenAbsent()
+    {
+        // A commitInfo without operationMetrics (e.g. a WRITE) omits the key entirely and round-trips to null
+        // (backward compatible — the field is optional).
+        var commitInfo = new CommitInfoAction(
+            StringMap(("txnId", "nonce-3")),
+            Operation: "WRITE",
+            OperationParameters: StringMap(("mode", "\"Append\"")));
+
+        var parsed = Assert.IsType<CommitInfoAction>(Assert.Single(RoundTrip(commitInfo)));
+
+        Assert.Null(parsed.OperationMetrics);
+    }
+
+    [Fact]
     public void ReSerializationIsByteStable()
     {
         // Serializer is deterministic: parse(serialize(A)) then serialize again yields byte-identical
