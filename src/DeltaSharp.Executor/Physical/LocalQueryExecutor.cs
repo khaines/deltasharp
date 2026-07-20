@@ -77,6 +77,10 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
         ArgumentNullException.ThrowIfNull(analyzedPlan);
         try
         {
+            // Explain is non-executing: it renders the plan tree, never opening an operator or evaluating an
+            // expression, so the ANSI mode (an evaluation-time overflow/cast semantic, #603) does not affect
+            // the rendered structure. This debug seam therefore plans under the planner default (Ansi); the
+            // session's ANSI mode is threaded into the executing path (Collect/Count/Write) via ExecutionOptions.
             PhysicalPlan physical = new PhysicalPlanner(_scanSource, _sinkFactory).Plan(analyzedPlan);
             return physical.TreeString();
         }
@@ -229,12 +233,15 @@ internal sealed class LocalQueryExecutor : IQueryExecutor
             }
 
             // Stage: Plan. UnsupportedPlanException is already stage-attributed and must propagate
-            // unwrapped (callers assert on it); any other planner fault is attributed to Plan.
+            // unwrapped (callers assert on it); any other planner fault is attributed to Plan. The planner
+            // runs under the session's ANSI mode (#603, threaded via ExecutionOptions.From) so overflow /
+            // invalid-cast semantics on the query path AND the write-door (CHECK / invariant enforcement,
+            // which inherits the planner mode via the sink factory, #602) match the session.
             planningStart = Stopwatch.GetTimestamp();
             PhysicalPlan physical;
             try
             {
-                physical = new PhysicalPlanner(_scanSource, _sinkFactory).Plan(analyzedPlan);
+                physical = new PhysicalPlanner(_scanSource, _sinkFactory, options.AnsiMode).Plan(analyzedPlan);
             }
             catch (UnsupportedPlanException)
             {

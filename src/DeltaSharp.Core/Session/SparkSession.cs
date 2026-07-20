@@ -63,6 +63,13 @@ public sealed class SparkSession : IDisposable
     /// <summary>The per-run operator memory budget in bytes (STORY-04.6.4 / #176); unset/&lt;=0 is unbounded.</summary>
     internal const string MemoryBudgetBytesConfigKey = "spark.deltasharp.execution.memoryBudgetBytes";
 
+    /// <summary>Spark's ANSI-mode flag (<c>spark.sql.ansi.enabled</c>): <c>true</c>/unset selects
+    /// <see cref="AnsiMode.Ansi"/> (the DeltaSharp default — arithmetic overflow / invalid cast is reported),
+    /// <c>false</c> selects <see cref="AnsiMode.Legacy"/> (wrap to SQL <c>NULL</c>). Read per action and
+    /// threaded into the physical planner so the query path AND the write-door (CHECK/invariant) share the
+    /// session's strictness (#603).</summary>
+    internal const string AnsiEnabledConfigKey = "spark.sql.ansi.enabled";
+
     private const int StateActive = 0;
     private const int StateStopped = 1;
 
@@ -430,6 +437,12 @@ public sealed class SparkSession : IDisposable
         _ = ParseExecutionBackend(
             options.TryGetValue(ExecutionBackendConfigKey, out string? raw) ? raw : null);
 
+        // #603: validate a builder-supplied spark.sql.ansi.enabled with the SAME fail-fast discipline as the
+        // backend key (ApplyOptions -> SetInternal bypasses the Conf.Set-time validation), so a bad value fails
+        // at session creation rather than being deferred to the first action's ReadAnsiMode.
+        _ = ParseAnsiEnabled(
+            options.TryGetValue(AnsiEnabledConfigKey, out string? ansiRaw) ? ansiRaw : null);
+
         lock (_globalLock)
         {
             SparkSession? active = _activeSession.Value;
@@ -479,6 +492,39 @@ public sealed class SparkSession : IDisposable
         {
             _ = ParseExecutionBackend(value);
         }
+        else if (string.Equals(key, AnsiEnabledConfigKey, StringComparison.Ordinal))
+        {
+            _ = ParseAnsiEnabled(value);
+        }
+    }
+
+    // Parses spark.sql.ansi.enabled (case-insensitive true/false). Unset/empty defaults to true — ANSI is
+    // the DeltaSharp default (ADR-0007/0008). A non-boolean value is rejected fail-fast — at Conf.Set time
+    // (ValidateTypedConfigValue) AND at builder GetOrCreate — with the same discipline as the backend key.
+    private static bool ParseAnsiEnabled(string? raw)
+    {
+        if (string.IsNullOrEmpty(raw))
+        {
+            return true;
+        }
+
+        return raw.Trim().ToLowerInvariant() switch
+        {
+            "true" => true,
+            "false" => false,
+            _ => throw new ArgumentException(
+                $"Unrecognized '{AnsiEnabledConfigKey}' value '{raw}'. Expected a boolean: true or false.",
+                AnsiEnabledConfigKey),
+        };
+    }
+
+    /// <summary>Reads the session's <c>spark.sql.ansi.enabled</c> into the planner's <see cref="AnsiMode"/>
+    /// (unset -> <see cref="AnsiMode.Ansi"/>). Read per action (via <c>ExecutionOptions.From</c>) so a runtime
+    /// <see cref="RuntimeConfig.Set(string, string)"/> is honored on the next query (#603).</summary>
+    internal static AnsiMode ReadAnsiMode(RuntimeConfig conf)
+    {
+        ArgumentNullException.ThrowIfNull(conf);
+        return ParseAnsiEnabled(conf.Get(AnsiEnabledConfigKey, null)) ? AnsiMode.Ansi : AnsiMode.Legacy;
     }
 
     private static ExecutionBackend ParseExecutionBackend(string? raw)

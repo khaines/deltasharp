@@ -108,6 +108,44 @@ public sealed class RuntimeConfigTests
         Assert.Equal(ExecutionBackend.Auto, spark.ExecutionBackend);
     }
 
+    [Fact]
+    public void Set_AnsiEnabled_InvalidValue_ThrowsAtSetTime_NotDeferred()
+    {
+        // #603: spark.sql.ansi.enabled is validated as a boolean at Set time (fail-fast), matching the
+        // execution-backend key's discipline, so a bad value never reaches the per-action planner-mode read.
+        const string ansiKey = "spark.sql.ansi.enabled";
+        using SparkSession spark = SparkSession.Builder().AppName("ansi").GetOrCreate();
+
+        ArgumentException ex =
+            Assert.Throws<ArgumentException>(() => spark.Conf.Set(ansiKey, "garbage"));
+        Assert.Contains("garbage", ex.Message, StringComparison.Ordinal);
+        Assert.False(spark.Conf.Contains(ansiKey));
+    }
+
+    [Theory]
+    [InlineData("true")]
+    [InlineData("FALSE")]
+    [InlineData("  True  ")]
+    public void Set_AnsiEnabled_ValidBoolean_IsAcceptedCaseInsensitively(string value)
+    {
+        const string ansiKey = "spark.sql.ansi.enabled";
+        using SparkSession spark = SparkSession.Builder().AppName("ansi").GetOrCreate();
+
+        spark.Conf.Set(ansiKey, value); // must not throw
+        Assert.True(spark.Conf.Contains(ansiKey));
+    }
+
+    [Fact]
+    public void Builder_InvalidAnsiEnabledValue_ThrowsAtGetOrCreate_FailFast()
+    {
+        // #603: a builder-supplied spark.sql.ansi.enabled is validated EAGERLY at GetOrCreate (the builder seed
+        // path bypasses Conf.Set-time validation), mirroring the execution-backend key — not deferred to the
+        // first action's ReadAnsiMode.
+        ArgumentException ex = Assert.Throws<ArgumentException>(
+            () => SparkSession.Builder().AppName("ansi").Config("spark.sql.ansi.enabled", "garbage").GetOrCreate());
+        Assert.Contains("garbage", ex.Message, StringComparison.Ordinal);
+    }
+
     [Theory]
     [InlineData("interpreted", ExecutionBackend.Interpreted)]
     [InlineData("COMPILED", ExecutionBackend.Compiled)]

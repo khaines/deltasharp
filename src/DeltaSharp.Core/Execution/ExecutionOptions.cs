@@ -1,6 +1,7 @@
 using System;
 using System.Globalization;
 using System.Threading;
+using DeltaSharp.Types;
 
 namespace DeltaSharp.Execution;
 
@@ -39,6 +40,14 @@ internal sealed class ExecutionOptions
     public long? MemoryBudgetBytes { get; init; }
 
     /// <summary>
+    /// The ANSI strictness lens (#603) sourced from the session's <c>spark.sql.ansi.enabled</c>:
+    /// <see cref="AnsiMode.Ansi"/> (default) reports arithmetic overflow / invalid cast, while
+    /// <see cref="AnsiMode.Legacy"/> wraps to SQL <c>NULL</c>. Threaded into the physical planner so the
+    /// query path AND the write-door (CHECK / invariant) enforcement share the session's strictness.
+    /// </summary>
+    public AnsiMode AnsiMode { get; init; } = AnsiMode.Ansi;
+
+    /// <summary>
     /// Builds options from a session's live configuration and the action's cancellation token. Reads
     /// the <c>spark.deltasharp.execution.*</c> keys through the live <see cref="RuntimeConfig"/> so a
     /// runtime <c>Conf.Set</c> is honored on the next action.
@@ -69,6 +78,7 @@ internal sealed class ExecutionOptions
             MaxResultRows = ReadPositiveLong(conf, SparkSession.MaxResultRowsConfigKey),
             MaxResultBytes = ReadPositiveLong(conf, SparkSession.MaxResultBytesConfigKey),
             MemoryBudgetBytes = ReadPositiveLong(conf, SparkSession.MemoryBudgetBytesConfigKey),
+            AnsiMode = SparkSession.ReadAnsiMode(conf),
         };
     }
 
