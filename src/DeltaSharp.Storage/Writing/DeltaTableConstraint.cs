@@ -36,9 +36,11 @@ public sealed record DeltaTableConstraint(DeltaConstraintKind Kind, string Name,
 /// from <c>metaData.configuration</c> (<c>delta.constraints.*</c>) and column invariants from the schema
 /// fields' <c>delta.invariants</c> metadata — including a <b>nested struct-field</b> invariant on an
 /// all-struct path (<c>s.f</c>, <c>s.a.b</c>), collected with its fully-qualified path and enforced via
-/// <c>GetStructField</c> (#595). Collection fails <b>closed</b> on any constraint this build cannot fully
-/// honor — an empty CHECK predicate, a malformed invariant value, or an invariant reached <b>through an
-/// array/map</b> (per-element enforcement not wired yet, #606) — so a constraint is never silently dropped.
+/// <c>GetStructField</c> (#595). An invariant reached <b>through an array or map</b> is <b>ignored</b>,
+/// matching Delta's <c>Invariants.getFromSchema</c> (<c>filterRecursively(checkComplexTypes = false)</c>
+/// recurses structs only, never a collection's elements/entries — #606). Collection still fails
+/// <b>closed</b> on a constraint this build cannot honor — an empty CHECK predicate or a malformed
+/// invariant value — so such a constraint is never silently dropped.
 /// </summary>
 internal static class DeltaTableConstraints
 {
@@ -63,8 +65,8 @@ internal static class DeltaTableConstraints
     /// table config) survive the replacement and are still collected, but the OLD schema's field invariants
     /// are replaced wholesale by <paramref name="writeSchema"/>'s and so must NOT be collected from the
     /// snapshot.</param>
-    /// <exception cref="DeltaProtocolException">A constraint is malformed or empty, or an invariant is reached
-    /// through an array/map (per-element enforcement not wired yet, #606).</exception>
+    /// <exception cref="DeltaProtocolException">A CHECK constraint or invariant predicate is malformed or
+    /// empty.</exception>
     public static IReadOnlyList<DeltaTableConstraint> CollectForWrite(
         Snapshot? snapshot, StructType writeSchema, bool includeSnapshotInvariants = true)
     {
@@ -139,54 +141,40 @@ internal static class DeltaTableConstraints
                     DeltaConstraintKind.Invariant, field.Name, ParseInvariantExpression(field.Name, persisted)));
             }
 
-            CollectNestedInvariants(field.Name, field.DataType, insideCollection: false, add);
+            CollectNestedInvariants(field.Name, field.DataType, add);
         }
     }
 
-    // Collects nested-field column invariants (#595): a struct field on an ALL-STRUCT path from the root
-    // (`s.f`, `s.a.b`) is ENFORCEABLE — its predicate resolves via GetStructField (#580) and evaluates through
-    // the nested StructFieldEvaluator (#589) — so it is collected with its fully-qualified path as the
-    // constraint name (the predicate references that path). An invariant reached THROUGH an array or map (an
-    // array-element or map key/value struct field) needs per-element enforcement not yet available and is
-    // refused fail-closed (#606), never silently skipped (Spark attaches the invariant to the field it guards;
-    // a skip is a fail-open). NOTE: enforcement is currently unreachable END-TO-END because CreateDataFrame /
-    // LocalRelationBatches rejects nested columns (#608) before enforcement runs; #595 wires + unit-tests the
-    // mechanism so it enforces as soon as nested-column writes land.
-    private static void CollectNestedInvariants(
-        string path, DataType type, bool insideCollection, Action<DeltaTableConstraint> add)
+    // Collects nested-field column invariants with DELTA'S traversal semantics (#606, correcting #595's earlier
+    // fail-closed reject): Delta's Invariants.getFromSchema walks the schema via
+    // SchemaUtils.filterRecursively(checkComplexTypes = false) — it recurses into STRUCTs only and does NOT
+    // descend into an array element or a map key/value. So an invariant on a struct field reached by an
+    // ALL-STRUCT path (`s.f`, `s.a.b`) is collected and enforced (its predicate resolves via GetStructField
+    // (#580) and evaluates through the nested StructFieldEvaluator (#589)); an invariant reached THROUGH an
+    // array or map is IGNORED — matching Delta, which likewise never enforces it (delta-io/delta
+    // constraints/Invariants.getFromSchema). An invariant declared directly on a top-level array/map FIELD is
+    // still collected by CollectInvariants (the field itself is on an all-struct path from the root); this only
+    // governs descent INTO a collection's elements/entries.
+    private static void CollectNestedInvariants(string path, DataType type, Action<DeltaTableConstraint> add)
     {
-        switch (type)
+        // checkComplexTypes = false: recurse into structs only; do not descend into ArrayType/MapType (or any
+        // other non-struct type). An invariant under a collection is therefore silently not collected — the
+        // exact Delta behavior.
+        if (type is not StructType nested)
         {
-            case StructType nested:
-                foreach (StructField field in nested)
-                {
-                    string childPath = path + "." + field.Name;
-                    if (field.Metadata.TryGetString(InvariantKey, out string? persisted))
-                    {
-                        if (insideCollection)
-                        {
-                            throw DeltaProtocolException.Unsupported(
-                                $"Column '{childPath}' declares a 'delta.invariants' invariant reached through an "
-                                + "array/map; per-row enforcement of an array-element or map key/value field "
-                                + "invariant needs a per-element evaluator not yet available (#606), so the write "
-                                + "is refused fail-closed rather than silently skip it.");
-                        }
+            return;
+        }
 
-                        add(new DeltaTableConstraint(
-                            DeltaConstraintKind.Invariant, childPath, ParseInvariantExpression(childPath, persisted)));
-                    }
+        foreach (StructField field in nested)
+        {
+            string childPath = path + "." + field.Name;
+            if (field.Metadata.TryGetString(InvariantKey, out string? persisted))
+            {
+                add(new DeltaTableConstraint(
+                    DeltaConstraintKind.Invariant, childPath, ParseInvariantExpression(childPath, persisted)));
+            }
 
-                    CollectNestedInvariants(childPath, field.DataType, insideCollection, add);
-                }
-
-                break;
-            case ArrayType array:
-                CollectNestedInvariants(path + ".element", array.ElementType, insideCollection: true, add);
-                break;
-            case MapType map:
-                CollectNestedInvariants(path + ".key", map.KeyType, insideCollection: true, add);
-                CollectNestedInvariants(path + ".value", map.ValueType, insideCollection: true, add);
-                break;
+            CollectNestedInvariants(childPath, field.DataType, add);
         }
     }
 
