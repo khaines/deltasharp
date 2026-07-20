@@ -148,6 +148,116 @@ public sealed class RowMaterializerNestedHoistTests
     }
 
     [Fact]
+    public void Materialize_SlicedStructWithNullField_PreservesNullThroughHoistedRead()
+    {
+        // The hoisted, sliced-view read must still honour a null STRUCT FIELD (a non-null struct row whose
+        // field is null) — dropping the child null-gate would surface a default ("" / 0) instead of null.
+        var schema = new StructType(new[] { new StructField("s", Point, nullable: true) });
+        var rows = new[]
+        {
+            new Row(schema, new object?[] { new Row(Point, 10, "a") }),
+            new Row(schema, new object?[] { new Row(Point, new object?[] { 20, null }) }), // null "name"
+            new Row(schema, new object?[] { new Row(Point, 30, "c") }),
+        };
+
+        ColumnBatch sliced = LocalRelationBatches.Build(schema, rows)[0].Slice(1, 1); // just the null-field row
+        IReadOnlyList<Row> got = Materialize(schema, sliced);
+
+        Row s = Assert.IsType<Row>(Assert.Single(got)[0]);
+        Assert.Equal(20, s.GetAs<int>("id"));
+        Assert.True(s.IsNullAt(1)); // the null field survives, not surfaced as ""
+    }
+
+    [Fact]
+    public void Materialize_SlicedListColumn_DecodesShiftedCells()
+    {
+        var schema = new StructType(new[]
+        {
+            new StructField("xs", new ArrayType(IntegerType.Instance, containsNull: true), nullable: true),
+        });
+        var rows = new[]
+        {
+            new Row(schema, new object?[] { new object?[] { 1, 2 } }),
+            new Row(schema, new object?[] { new object?[] { 3, 4, 5 } }),
+            new Row(schema, new object?[] { new object?[] { 6 } }),
+        };
+
+        // The LIST vector itself is sliced (offset 1): ElementsAt must resolve each cell's own offset window.
+        ColumnBatch sliced = LocalRelationBatches.Build(schema, rows)[0].Slice(1, 2);
+        IReadOnlyList<Row> got = Materialize(schema, sliced);
+
+        Assert.Equal(2, got.Count);
+        Assert.Equal(new object[] { 3, 4, 5 }, Assert.IsType<object[]>(got[0][0]));
+        Assert.Equal(new object[] { 6 }, Assert.IsType<object[]>(got[1][0]));
+    }
+
+    [Fact]
+    public void Materialize_SlicedView_EmptyAndNullArray_Decode()
+    {
+        var schema = new StructType(new[]
+        {
+            new StructField("xs", new ArrayType(IntegerType.Instance, containsNull: true), nullable: true),
+        });
+        var rows = new[]
+        {
+            new Row(schema, new object?[] { new object?[] { 1 } }),
+            new Row(schema, new object?[] { Array.Empty<object?>() }), // empty array
+            new Row(schema, new object?[] { null }),                   // null array
+        };
+
+        ColumnBatch sliced = LocalRelationBatches.Build(schema, rows)[0].Slice(1, 2); // empty + null cells
+        IReadOnlyList<Row> got = Materialize(schema, sliced);
+
+        Assert.Equal(2, got.Count);
+        Assert.Empty(Assert.IsType<object[]>(got[0][0])); // empty array stays empty
+        Assert.True(got[1].IsNullAt(0));                  // null array stays null
+    }
+
+    [Fact]
+    public void Materialize_SlicedMapColumn_DecodesShiftedCells()
+    {
+        var schema = new StructType(new[]
+        {
+            new StructField(
+                "m", new MapType(StringType.Instance, IntegerType.Instance, valueContainsNull: true), nullable: true),
+        });
+        var rows = new[]
+        {
+            new Row(schema, new object?[] { new Dictionary<string, int> { ["a"] = 1 } }),
+            new Row(schema, new object?[] { new Dictionary<string, int> { ["b"] = 2, ["c"] = 3 } }),
+        };
+
+        ColumnBatch sliced = LocalRelationBatches.Build(schema, rows)[0].Slice(1, 1);
+        IReadOnlyList<Row> got = Materialize(schema, sliced);
+
+        var map = Assert.IsType<Dictionary<object, object?>>(Assert.Single(got)[0]);
+        Assert.Equal(2, map.Count);
+        Assert.Equal(2, map["b"]);
+        Assert.Equal(3, map["c"]);
+    }
+
+    [Fact]
+    public void Materialize_MapWithStructKey_DecodesStructKey()
+    {
+        var keyType = new StructType(new[] { new StructField("k", IntegerType.Instance, nullable: false) });
+        var schema = new StructType(new[]
+        {
+            new StructField(
+                "m", new MapType(keyType, StringType.Instance, valueContainsNull: false), nullable: true),
+        });
+        var entries = new Dictionary<Row, string> { [new Row(keyType, 9)] = "nine" };
+        var rows = new[] { new Row(schema, new object?[] { entries }) };
+
+        IReadOnlyList<Row> got = RowMaterializer.Materialize(
+            new BatchResult(schema, LocalRelationBatches.Build(schema, rows)), null, null, default);
+
+        var map = Assert.IsType<Dictionary<object, object?>>(got[0][0]);
+        KeyValuePair<object, object?> entry = Assert.Single(map);
+        Assert.Equal(9, Assert.IsType<Row>(entry.Key).GetAs<int>("k")); // the struct key decodes (map-key path)
+        Assert.Equal("nine", entry.Value);
+    }
+
+    [Fact]
     public void Materialize_SlicedStruct_DoesNotAllocatePerRowPerField()
     {
         const int fieldCount = 8;
@@ -197,6 +307,9 @@ public sealed class RowMaterializerNestedHoistTests
 
         long Measure(BatchResult result)
         {
+            // GetAllocatedBytesForCurrentThread counts only THIS thread's allocations, so the measured region
+            // must stay single-threaded — Materialize is fully synchronous (no await/parallelism), which this
+            // relies on (F2: a future async refactor would silently under-measure and blind this gate).
             RowMaterializer.Materialize(result, null, null, default); // warm up
             long before = GC.GetAllocatedBytesForCurrentThread();
             for (int i = 0; i < iterations; i++)
@@ -214,6 +327,9 @@ public sealed class RowMaterializerNestedHoistTests
         // Hoisted, the sliced case adds only O(fieldCount) child slices per batch (per iteration), not
         // O(rowCount × fieldCount). The old per-row-per-field re-slice would add ~rowCount×fieldCount slice
         // objects per iteration; a fraction of that bound is a robust, machine-independent regression trip.
+        // This deliberately uses a differential (sliced−whole cancels the identical Row/boxed-value baseline)
+        // plus a wide ~50× margin INSTEAD of the house tight-bound + retry loop (SelectionBenchmarkTests): the
+        // margin already absorbs any one-time JIT tier-up transient, so do not "tighten" the bound to need a retry.
         long oldChurnBytes = (long)rowCount * fieldCount * iterations * 24; // ≈ per-row-per-field slice objects
         long bound = oldChurnBytes / 8;
         Assert.True(

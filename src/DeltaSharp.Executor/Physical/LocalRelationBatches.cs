@@ -141,7 +141,7 @@ internal static class LocalRelationBatches
     // null struct row, so the children stay length-aligned (StructColumnVector's build contract). Nested
     // values follow the CreateDataFrame nested CLR convention (#608): a StructType value is a nested
     // <see cref="Row"/>, an ArrayType value is any non-string IEnumerable, a MapType value is any
-    // IDictionary. This is the exact inverse of RowMaterializer.ReadValue.
+    // IDictionary. This is the exact inverse of RowMaterializer's ColumnReader decode tree.
     private static void EncodeValue(
         MutableColumnVector vector, DataType type, string path, object? value, CancellationToken cancellationToken)
     {

@@ -127,31 +127,153 @@ internal static class RowMaterializer
         // position (top-level columns, struct children, and array/map elements each gate their own nulls).
         public abstract object Read(ColumnVector column, int index, CancellationToken cancellationToken);
 
-        // Builds the reader for a logical type; nested types get a hoisting reader, everything else a scalar
-        // reader that carries the field name only for out-of-range date/timestamp diagnostics.
+        // Builds the reader for a logical type ONCE (plan-build time), so the per-cell decode is a single
+        // virtual call into a type-specialized leaf with no per-cell type switch: nested types get a hoisting
+        // reader; each scalar type gets its own leaf reader. The field name is captured only for the
+        // out-of-range date/timestamp diagnostics.
         public static ColumnReader For(DataType type, string name) => type switch
         {
+            BooleanType => BooleanReader.Instance,
+            ByteType => ByteReader.Instance,
+            ShortType => ShortReader.Instance,
+            IntegerType => Int32Reader.Instance,
+            LongType => Int64Reader.Instance,
+            FloatType => FloatReader.Instance,
+            DoubleType => DoubleReader.Instance,
+            StringType => StringReader.Instance,
+            BinaryType => BinaryReader.Instance,
+            DecimalType decimalType => new DecimalReader(decimalType),
+            DateType => new DateReader(name, type),
+            TimestampType => new TimestampReader(name, type, DateTimeKind.Utc),
+            TimestampNtzType => new TimestampReader(name, type, DateTimeKind.Unspecified),
             StructType structType => new StructReader(structType),
             ArrayType arrayType => new ListReader(arrayType),
             MapType mapType => new MapReader(mapType),
-            _ => new ScalarReader(type, name),
+            _ => throw new UnsupportedPlanException(
+                QueryExecutionStage.Materialize,
+                $"Row materialization has no CLR mapping for type '{type.SimpleString}'."),
         };
     }
 
-    // A leaf reader: decodes a scalar cell with no per-row allocation beyond the boxed CLR value itself.
-    private sealed class ScalarReader : ColumnReader
+    // Type-specialized scalar leaf readers. Each decodes one lane to its natural CLR value with no per-cell
+    // type switch (the switch is resolved once in ColumnReader.For). The stateless leaves are shared singletons
+    // (no per-column allocation); readers that carry state (decimal scale, the field name for diagnostics, the
+    // timestamp kind) are built once per column. Null is gated by the caller before Read is invoked.
+    private sealed class BooleanReader : ColumnReader
     {
-        private readonly DataType _type;
-        private readonly string _name;
+        public static readonly BooleanReader Instance = new();
 
-        public ScalarReader(DataType type, string name)
+        public override object Read(ColumnVector column, int index, CancellationToken cancellationToken) =>
+            column.GetValue<bool>(index);
+    }
+
+    private sealed class ByteReader : ColumnReader
+    {
+        public static readonly ByteReader Instance = new();
+
+        // Spark ByteType is a signed tinyint; the Engine stores it as an unsigned byte lane.
+        public override object Read(ColumnVector column, int index, CancellationToken cancellationToken) =>
+            unchecked((sbyte)column.GetValue<byte>(index));
+    }
+
+    private sealed class ShortReader : ColumnReader
+    {
+        public static readonly ShortReader Instance = new();
+
+        public override object Read(ColumnVector column, int index, CancellationToken cancellationToken) =>
+            column.GetValue<short>(index);
+    }
+
+    private sealed class Int32Reader : ColumnReader
+    {
+        public static readonly Int32Reader Instance = new();
+
+        public override object Read(ColumnVector column, int index, CancellationToken cancellationToken) =>
+            column.GetValue<int>(index);
+    }
+
+    private sealed class Int64Reader : ColumnReader
+    {
+        public static readonly Int64Reader Instance = new();
+
+        public override object Read(ColumnVector column, int index, CancellationToken cancellationToken) =>
+            column.GetValue<long>(index);
+    }
+
+    private sealed class FloatReader : ColumnReader
+    {
+        public static readonly FloatReader Instance = new();
+
+        public override object Read(ColumnVector column, int index, CancellationToken cancellationToken) =>
+            column.GetValue<float>(index);
+    }
+
+    private sealed class DoubleReader : ColumnReader
+    {
+        public static readonly DoubleReader Instance = new();
+
+        public override object Read(ColumnVector column, int index, CancellationToken cancellationToken) =>
+            column.GetValue<double>(index);
+    }
+
+    private sealed class StringReader : ColumnReader
+    {
+        public static readonly StringReader Instance = new();
+
+        public override object Read(ColumnVector column, int index, CancellationToken cancellationToken) =>
+            Encoding.UTF8.GetString(column.GetBytes(index));
+    }
+
+    private sealed class BinaryReader : ColumnReader
+    {
+        public static readonly BinaryReader Instance = new();
+
+        public override object Read(ColumnVector column, int index, CancellationToken cancellationToken) =>
+            column.GetBytes(index).ToArray();
+    }
+
+    private sealed class DecimalReader : ColumnReader
+    {
+        private readonly DecimalType _type;
+
+        public DecimalReader(DecimalType type) => _type = type;
+
+        public override object Read(ColumnVector column, int index, CancellationToken cancellationToken) =>
+            ReadDecimal(column, _type, index);
+    }
+
+    private sealed class DateReader : ColumnReader
+    {
+        private readonly string _name;
+        private readonly DataType _type;
+
+        public DateReader(string name, DataType type)
         {
-            _type = type;
             _name = name;
+            _type = type;
         }
 
         public override object Read(ColumnVector column, int index, CancellationToken cancellationToken) =>
-            ReadScalar(column, _type, _name, index);
+            ReadDate(column, _name, _type, index);
+    }
+
+    // Handles both TimestampType (kind Utc) and TimestampNtzType (kind Unspecified, timezone-less #533); the
+    // two differ only by the DateTimeKind stamped on the reconstructed instant.
+    private sealed class TimestampReader : ColumnReader
+    {
+        private readonly string _name;
+        private readonly DataType _type;
+        private readonly DateTimeKind _kind;
+
+        public TimestampReader(string name, DataType type, DateTimeKind kind)
+        {
+            _name = name;
+            _type = type;
+            _kind = kind;
+        }
+
+        public override object Read(ColumnVector column, int index, CancellationToken cancellationToken) =>
+            ReadTimestampInstant(column, _name, _type, index, _kind);
     }
 
     // Reads a struct value as a nested Row (the exact inverse of LocalRelationBatches' struct encode, and the
@@ -221,8 +343,11 @@ internal static class RowMaterializer
     // non-string-IEnumerable array encode): the row's elements are read from the per-row element view,
     // null-aware. A null array row never reaches here — the caller gates on IsNull; an empty array yields an
     // empty array. The element reader is built ONCE with a constant "element" name, so no per-row StructField is
-    // synthesized (#610). The token is polled per element so a single row carrying a huge collection stays
-    // cancellable (the row-level poll alone would not interrupt one gigantic cell).
+    // synthesized (#610). The per-cell element VIEW (ElementsAt) is inherently row-scoped — it is the row's own
+    // offset window, so it is resolved per row (never hoisted); a struct-typed element reader still hoists its
+    // child views WITHIN a cell (ElementsAt returns one vector for all the cell's elements, so the struct memo
+    // binds once and hits across elements) and rebinds across cells. The token is polled per element so a single
+    // row carrying a huge collection stays cancellable (the row-level poll alone would not interrupt one giant cell).
     private sealed class ListReader : ColumnReader
     {
         private readonly ColumnReader _element;
@@ -286,34 +411,6 @@ internal static class RowMaterializer
 
             return map;
         }
-    }
-
-    // Decodes a scalar (non-nested) cell to its natural CLR value, null-aware handled by the caller. Nested
-    // types never reach here — ColumnReader.For routes struct/array/map to their hoisting readers; the default
-    // arm stays as a fail-closed guard for an unmapped type.
-    private static object ReadScalar(ColumnVector column, DataType type, string name, int index)
-    {
-        return type switch
-        {
-            BooleanType => column.GetValue<bool>(index),
-
-            // Spark ByteType is a signed tinyint; the Engine stores it as an unsigned byte lane.
-            ByteType => unchecked((sbyte)column.GetValue<byte>(index)),
-            ShortType => column.GetValue<short>(index),
-            IntegerType => column.GetValue<int>(index),
-            LongType => column.GetValue<long>(index),
-            FloatType => column.GetValue<float>(index),
-            DoubleType => column.GetValue<double>(index),
-            DecimalType decimalType => ReadDecimal(column, decimalType, index),
-            DateType => ReadDate(column, name, type, index),
-            TimestampType => ReadTimestamp(column, name, type, index),
-            TimestampNtzType => ReadTimestampNtz(column, name, type, index),
-            StringType => Encoding.UTF8.GetString(column.GetBytes(index)),
-            BinaryType => column.GetBytes(index).ToArray(),
-            _ => throw new UnsupportedPlanException(
-                QueryExecutionStage.Materialize,
-                $"Row materialization has no CLR mapping for type '{type.SimpleString}'."),
-        };
     }
 
     // The driver polls the effective cancellation token every 1024 materialized rows (a power-of-two
@@ -402,21 +499,14 @@ internal static class RowMaterializer
             + $"'{type.SimpleString}' as System.DateOnly: the date falls outside the "
             + "representable DateOnly range.");
 
-    // A TimestampType lane stores the Spark epoch-microsecond instant as a long; surface it as a UTC
-    // DateTime — the inverse of lit(DateTime)/lit(DateTimeOffset), which normalize to epoch-micros —
-    // so Collect()/GetAs<DateTime> round-trips and Show renders an instant, not the raw epoch number.
-    // A micros value whose ticks overflow long, or whose instant falls outside DateTime's range, is a
-    // deterministic UnsupportedPlanException (mirrors the decimal path) rather than a raw
-    // ArgumentOutOfRangeException or a silent mis-decode.
-    private static DateTime ReadTimestamp(ColumnVector column, string name, DataType type, int index) =>
-        ReadTimestampInstant(column, name, type, index, DateTimeKind.Utc);
-
-    // A TimestampNtzType lane stores the same epoch-microsecond long but is timezone-LESS (#533): surface
-    // it as a DateTime of kind Unspecified — a wall-clock instant with no offset — so Collect()/Show renders
-    // the stored local-datetime, never a UTC-adjusted one. Range handling is identical to ReadTimestamp.
-    private static DateTime ReadTimestampNtz(ColumnVector column, string name, DataType type, int index) =>
-        ReadTimestampInstant(column, name, type, index, DateTimeKind.Unspecified);
-
+    // A TimestampType lane stores the Spark epoch-microsecond instant as a long; TimestampReader surfaces it
+    // as a UTC DateTime — the inverse of lit(DateTime)/lit(DateTimeOffset), which normalize to epoch-micros —
+    // so Collect()/GetAs<DateTime> round-trips and Show renders an instant, not the raw epoch number. A
+    // TimestampNtzType lane stores the same epoch-microsecond long but is timezone-LESS (#533): surfaced as a
+    // DateTime of kind Unspecified (a wall-clock instant with no offset) so Collect()/Show renders the stored
+    // local-datetime, never a UTC-adjusted one. A micros value whose ticks overflow long, or whose instant
+    // falls outside DateTime's range, is a deterministic UnsupportedPlanException (mirrors the decimal path)
+    // rather than a raw ArgumentOutOfRangeException or a silent mis-decode.
     private static DateTime ReadTimestampInstant(ColumnVector column, string name, DataType type, int index, DateTimeKind kind)
     {
         long micros = column.GetValue<long>(index);
