@@ -44,19 +44,29 @@ internal static class DeltaCommitInfo
     };
 
     /// <summary>Provenance for an append/overwrite data write: <c>operation="WRITE"</c> with
-    /// <c>mode</c> (<c>"Append"</c> / <c>"Overwrite"</c>) and <c>partitionBy</c> (a JSON array of the
-    /// partition-column names, <c>[]</c> when unpartitioned) — the shape delta-spark emits for a write.</summary>
-    internal static CommitInfoAction Write(bool overwrite, IReadOnlyList<string> partitionColumns) =>
+    /// <c>mode</c> (<c>"Append"</c> / <c>"Overwrite"</c>), <c>partitionBy</c> (the partition-column names),
+    /// and <c>isBlindAppend</c> — the shape delta-spark emits for a write.
+    ///
+    /// <para><b>Value encoding (delta-spark <c>DeltaOperations.jsonEncodedValues</c> parity).</b>
+    /// operationParameters is a <c>Map&lt;String,String&gt;</c>, so EVERY value is a JSON <b>string</b>. A
+    /// scalar is a plain JSON string (<c>mode</c> ⇒ <c>"Append"</c>). A list/bool is <b>double-encoded</b>:
+    /// the JSON array/bool is itself serialized into a JSON string, so <c>partitionBy</c> ⇒
+    /// <c>"[\"region\"]"</c> (a quoted string whose content parses to the array) and <c>isBlindAppend</c> ⇒
+    /// <c>"true"</c>. Strict readers (delta-standalone, legacy Spark) deserialize the map as
+    /// <c>Map&lt;String,String&gt;</c> and reject a bare array — hence the outer string-encoding.</para></summary>
+    internal static CommitInfoAction Write(
+        bool overwrite, IReadOnlyList<string> partitionColumns, bool isBlindAppend) =>
         WithOperation(WriteOperation, Parameters(
             ("mode", JsonString(overwrite ? "Overwrite" : "Append")),
-            ("partitionBy", JsonStringArray(partitionColumns))));
+            ("partitionBy", JsonEncodedArray(partitionColumns)),
+            ("isBlindAppend", JsonBoolString(isBlindAppend))));
 
-    /// <summary>Provenance for a table create: <c>operation="CREATE TABLE"</c> with a <c>partitionBy</c>
-    /// JSON array (minimal + Delta-shaped; richer <c>isManaged</c>/<c>properties</c> keys are deferred —
-    /// emitting a correct minimal shape beats guessing a wrong one, per the issue).</summary>
+    /// <summary>Provenance for a table create: <c>operation="CREATE TABLE"</c> with a double-encoded
+    /// <c>partitionBy</c> JSON-string token (minimal + Delta-shaped; richer <c>isManaged</c>/<c>properties</c>
+    /// keys are deferred — emitting a correct minimal shape beats guessing a wrong one, per the issue).</summary>
     internal static CommitInfoAction CreateTable(IReadOnlyList<string> partitionColumns) =>
         WithOperation(CreateTableOperation, Parameters(
-            ("partitionBy", JsonStringArray(partitionColumns))));
+            ("partitionBy", JsonEncodedArray(partitionColumns))));
 
     /// <summary>Provenance for a DELETE: <c>operation="DELETE"</c> only. The Delta <c>predicate</c> parameter
     /// (a JSON array of SQL predicate strings) is non-trivial to render faithfully from the internal delete
@@ -64,11 +74,11 @@ internal static class DeltaCommitInfo
     /// operation itself is what <c>DESCRIBE HISTORY</c> needs.</summary>
     internal static CommitInfoAction Delete() => WithOperation(DeleteOperation, EmptyParameters);
 
-    /// <summary>Provenance for an OPTIMIZE: <c>operation="OPTIMIZE"</c> with an empty <c>predicate</c> JSON
-    /// array (<c>[]</c>), matching delta-spark's whole-table compaction. <c>operationMetrics</c> is
-    /// deliberately NOT added here (deferred to #506).</summary>
+    /// <summary>Provenance for an OPTIMIZE: <c>operation="OPTIMIZE"</c> with an empty <c>predicate</c> — a
+    /// double-encoded JSON-string token whose content is the empty array (<c>"[]"</c>), matching delta-spark's
+    /// whole-table compaction. <c>operationMetrics</c> is deliberately NOT added here (deferred to #506).</summary>
     internal static CommitInfoAction Optimize() =>
-        WithOperation(OptimizeOperation, Parameters(("predicate", "[]")));
+        WithOperation(OptimizeOperation, Parameters(("predicate", JsonEncodedArray(Array.Empty<string>()))));
 
     private static CommitInfoAction WithOperation(
         string operation, ImmutableSortedDictionary<string, string> parameters) =>
@@ -121,4 +131,16 @@ internal static class DeltaCommitInfo
 
         return System.Text.Encoding.UTF8.GetString(buffer.WrittenSpan);
     }
+
+    /// <summary>Double-encodes <paramref name="values"/> into an operationParameters value token: the JSON
+    /// array is itself JSON-string-encoded, e.g. <c>["region"]</c> ⇒ <c>"[\"region\"]"</c> and
+    /// <c>[]</c> ⇒ <c>"[]"</c>. This is the <c>Map&lt;String,String&gt;</c> shape delta-spark emits (a bare
+    /// array would break strict readers). The result is a quoted JSON string, still a valid raw JSON value
+    /// for the writer's <c>WriteRawValue</c>.</summary>
+    internal static string JsonEncodedArray(IReadOnlyList<string> values) => JsonString(JsonStringArray(values));
+
+    /// <summary>Encodes <paramref name="value"/> as a JSON <b>string</b> token whose content is the JSON
+    /// boolean literal, e.g. <c>true</c> ⇒ <c>"true"</c> — the double-encoded shape delta-spark uses for a
+    /// boolean operationParameter (still a <c>Map&lt;String,String&gt;</c> value).</summary>
+    internal static string JsonBoolString(bool value) => JsonString(value ? "true" : "false");
 }

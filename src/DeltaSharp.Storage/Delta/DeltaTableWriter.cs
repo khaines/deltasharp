@@ -269,7 +269,8 @@ internal sealed class DeltaTableWriter
 
         var actions = new List<DeltaAction>(1 + (plan.SchemaChange is null ? 0 : 1) + files.Count)
         {
-            DeltaCommitInfo.Write(overwrite: false, LogicalPartitions(readSnapshot.Metadata.PartitionColumns)),
+            DeltaCommitInfo.Write(
+                overwrite: false, LogicalPartitions(readSnapshot.Metadata.PartitionColumns), isBlindAppend: true),
         };
         if (plan.SchemaChange is not null)
         {
@@ -1048,7 +1049,8 @@ internal sealed class DeltaTableWriter
         var actions = new List<DeltaAction>(
             1 + (metaDataToCommit is null ? 0 : 1) + readSnapshot.ActiveFiles.Length + files.Count)
         {
-            DeltaCommitInfo.Write(overwrite: true, LogicalPartitions(effectivePartitions)),
+            // A full overwrite commits under WholeTable (it depends on the entire active set) — never blind.
+            DeltaCommitInfo.Write(overwrite: true, LogicalPartitions(effectivePartitions), isBlindAppend: false),
         };
         if (metaDataToCommit is not null)
         {
@@ -1261,7 +1263,12 @@ internal sealed class DeltaTableWriter
         var actions = new List<DeltaAction>(
             1 + (schemaEvolution is null ? 0 : 1) + priorInTouched.Count + files.Count)
         {
-            DeltaCommitInfo.Write(overwrite: true, LogicalPartitions(effectivePartitions)),
+            // A dynamic overwrite that touches NO prior files commits under BlindAppend (nothing to remove);
+            // otherwise it removes the touched-partition priors under a ReadFiles scope — not blind.
+            DeltaCommitInfo.Write(
+                overwrite: true,
+                LogicalPartitions(effectivePartitions),
+                isBlindAppend: priorInTouched.Count == 0),
         };
         if (schemaEvolution is not null)
         {

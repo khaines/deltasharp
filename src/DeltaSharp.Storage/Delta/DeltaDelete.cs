@@ -105,17 +105,19 @@ internal sealed class DeltaDelete
     /// <summary>Creates a DELETE over <paramref name="backend"/> (rooted at the Delta table directory),
     /// constructing its own log reader + committer and using the system clock and a cryptographic id source.</summary>
     public DeltaDelete(IStorageBackend backend)
-        : this(backend, new DeltaLog(backend), new DeltaCommitter(backend))
+        : this(backend, new DeltaLog(backend))
     {
     }
 
-    /// <summary>Creates a DELETE over an explicit reader + committer (tests inject a committer with a race
-    /// probe, a deterministic clock for tombstone/modification timestamps, and a deterministic DV id source
-    /// so on-disk DV file names are predictable), plus optional injected logger/telemetry.</summary>
+    /// <summary>Creates a DELETE over an explicit reader + optional committer (tests inject a committer with a
+    /// race probe, a deterministic clock for tombstone/modification timestamps, and a deterministic DV id
+    /// source so on-disk DV file names are predictable), plus optional injected logger/telemetry. When
+    /// <paramref name="committer"/> is null the committer is built from <paramref name="timeProvider"/> so the
+    /// injected clock also drives <c>commitInfo.timestamp</c> (#510).</summary>
     internal DeltaDelete(
         IStorageBackend backend,
         DeltaLog log,
-        DeltaCommitter committer,
+        DeltaCommitter? committer = null,
         TimeProvider? timeProvider = null,
         ParquetFileReader? reader = null,
         IDeletionVectorIdSource? idSource = null,
@@ -124,11 +126,11 @@ internal sealed class DeltaDelete
     {
         ArgumentNullException.ThrowIfNull(backend);
         ArgumentNullException.ThrowIfNull(log);
-        ArgumentNullException.ThrowIfNull(committer);
         _backend = backend;
         _log = log;
-        _committer = committer;
+        // Assign the clock BEFORE building a default committer so both share the injected TimeProvider.
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _committer = committer ?? new DeltaCommitter(backend, _timeProvider);
         _reader = reader ?? new ParquetFileReader();
         _idSource = idSource ?? new RandomDeletionVectorIdSource();
         _logger = logger ?? NullLogger<DeltaDelete>.Instance;

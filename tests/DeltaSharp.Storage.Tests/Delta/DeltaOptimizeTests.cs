@@ -151,8 +151,9 @@ public sealed class DeltaOptimizeTests : IDisposable
     [Fact]
     public async Task Optimize_WritesOptimizeCommitInfo()
     {
-        // #510: OPTIMIZE records operation="OPTIMIZE" with an empty predicate ([]) in commitInfo for
-        // DESCRIBE HISTORY parity (operationMetrics deferred to #506).
+        // #510: OPTIMIZE records operation="OPTIMIZE" with a predicate whose value is a double-encoded JSON
+        // string ("[]") in commitInfo for DESCRIBE HISTORY parity (operationMetrics deferred to #506). The
+        // injected clock (Now) pins commitInfo.timestamp.
         StagedDataFile a = await WriteDataFileAsync("a.parquet", Batch((1, "a"), (2, "b")));
         StagedDataFile b = await WriteDataFileAsync("b.parquet", Batch((3, "c"), (4, null)));
         await SeedAsync(DataSchema, partitionColumns: null, a, b);
@@ -163,8 +164,9 @@ public sealed class DeltaOptimizeTests : IDisposable
             await Log().ReadCommitActionsAsync(result.CommittedVersion!.Value, CancellationToken.None);
         CommitInfoAction commitInfo = committed.OfType<CommitInfoAction>().Single();
         Assert.Equal("OPTIMIZE", commitInfo.Operation);
-        Assert.Equal("[]", commitInfo.OperationParameters!["predicate"]);
-        Assert.NotNull(commitInfo.EngineInfo);
+        Assert.Equal("\"[]\"", commitInfo.OperationParameters!["predicate"]); // double-encoded JSON string
+        Assert.Equal(Now.ToUnixTimeMilliseconds(), commitInfo.Timestamp);
+        Assert.StartsWith("DeltaSharp/", commitInfo.EngineInfo);
         Assert.True(commitInfo.Entries.ContainsKey("txnId"));
     }
 
@@ -1372,7 +1374,7 @@ public sealed class DeltaOptimizeTests : IDisposable
         new(
             _backend,
             new DeltaLog(_backend),
-            new DeltaCommitter(_backend),
+            // committer omitted → built from the injected timeProvider so commitInfo.timestamp is pinned (#510).
             timeProvider: timeProvider ?? new FixedTimeProvider(Now),
             writer: writer,
             compactedFileNameFactory: nameFactory,
