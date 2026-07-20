@@ -158,6 +158,33 @@ internal sealed class CaseWhen : Expression
     /// <inheritdoc/>
     public override string NodeName => "CaseWhen";
 
+    /// <summary>
+    /// The mode-aware analog of <see cref="Nullable"/> (#614): mirrors the else + branch-value
+    /// derivation but recurses via <see cref="Expression.NullableUnder"/>, so an overflow-capable
+    /// branch/else value (e.g. <c>v + v</c>) widens the CASE result to nullable under
+    /// <see cref="AnsiMode.Legacy"/>. A CASE does not itself overflow — it only re-exposes its
+    /// values' nullability — so there is no extra <c>|| mode == Legacy</c> term; the
+    /// <c>!HasElse ⇒ nullable</c> implicit-NULL rule is preserved, and conditions never affect
+    /// result nullability.
+    /// </summary>
+    public override bool NullableUnder(AnsiMode mode)
+    {
+        if (!HasElse || ElseValue!.NullableUnder(mode))
+        {
+            return true;
+        }
+
+        foreach ((Expression _, Expression value) in Branches)
+        {
+            if (value.NullableUnder(mode))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     /// <inheritdoc/>
     public override string SimpleString
     {

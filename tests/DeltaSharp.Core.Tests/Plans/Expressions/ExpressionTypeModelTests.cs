@@ -1,3 +1,5 @@
+using System;
+using System.Collections.Generic;
 using DeltaSharp.Plans.Expressions;
 using DeltaSharp.Types;
 using Xunit;
@@ -134,6 +136,139 @@ public class ExpressionTypeModelTests
 
         Assert.False(cast.NullableUnder(AnsiMode.Ansi));
         Assert.False(cast.NullableUnder(AnsiMode.Legacy));
+    }
+
+    // An overflow-capable value over NOT-NULL literal operands: Nullable is false, so it isolates the
+    // Legacy widening (NullableUnder(Legacy) == true, NullableUnder(Ansi) == false).
+    private static BinaryArithmetic OverflowValue() =>
+        new(Literal.OfInt(1), Literal.OfInt(2), ArithmeticOperator.Add);
+
+    [Fact]
+    public void NullableUnder_And_PropagatesOverflowChildUnderLegacyOnly()
+    {
+        var and = new And(OverflowValue(), OverflowValue());
+
+        Assert.False(and.Nullable);
+        Assert.False(and.NullableUnder(AnsiMode.Ansi));
+        Assert.True(and.NullableUnder(AnsiMode.Legacy));
+    }
+
+    [Fact]
+    public void NullableUnder_Or_PropagatesOverflowChildUnderLegacyOnly()
+    {
+        var or = new Or(OverflowValue(), OverflowValue());
+
+        Assert.False(or.Nullable);
+        Assert.False(or.NullableUnder(AnsiMode.Ansi));
+        Assert.True(or.NullableUnder(AnsiMode.Legacy));
+    }
+
+    [Fact]
+    public void NullableUnder_Not_PropagatesOverflowChildUnderLegacyOnly()
+    {
+        var not = new Not(OverflowValue());
+
+        Assert.False(not.Nullable);
+        Assert.False(not.NullableUnder(AnsiMode.Ansi));
+        Assert.True(not.NullableUnder(AnsiMode.Legacy));
+    }
+
+    [Fact]
+    public void NullableUnder_Comparison_PropagatesOverflowOperandUnderLegacyOnly()
+    {
+        var comparison = new BinaryComparison(OverflowValue(), Literal.OfInt(0), ComparisonOperator.LessThan);
+
+        Assert.False(comparison.Nullable);
+        Assert.False(comparison.NullableUnder(AnsiMode.Ansi));
+        Assert.True(comparison.NullableUnder(AnsiMode.Legacy));
+    }
+
+    [Fact]
+    public void NullableUnder_CaseWhen_PropagatesOverflowBranchValueUnderLegacyOnly()
+    {
+        // A branch VALUE of `1 + 2` with a NOT-NULL else: NOT-NULL under Ansi, nullable under Legacy.
+        var caseWhen = new CaseWhen(Literal.OfBoolean(true), OverflowValue()).WithElse(Literal.OfInt(0));
+
+        Assert.False(caseWhen.Nullable);
+        Assert.False(caseWhen.NullableUnder(AnsiMode.Ansi));
+        Assert.True(caseWhen.NullableUnder(AnsiMode.Legacy));
+    }
+
+    [Fact]
+    public void NullableUnder_UnderAnsi_EqualsNullable_ForRepresentativeNodes()
+    {
+        // #614 invariant: under Ansi, NullableUnder must be byte-identical to Nullable for every
+        // propagating node — the Legacy widening is the ONLY behavioral change.
+        var structAttr = new AttributeReference(
+            "s",
+            new StructType(new[] { new StructField("f", IntegerType.Instance, nullable: false) }),
+            nullable: false,
+            new ExprId(1));
+        BinaryArithmetic overflow = OverflowValue();
+        Expression[] representatives =
+        {
+            overflow,
+            new Cast(Literal.OfInt(1), LongType.Instance),
+            new Alias(overflow, "a"),
+            new And(overflow, overflow),
+            new Or(overflow, overflow),
+            new Not(overflow),
+            new BinaryComparison(overflow, Literal.OfInt(0), ComparisonOperator.LessThan),
+            new GetStructField(structAttr, 0, "f"),
+            new CaseWhen(Literal.OfBoolean(true), overflow).WithElse(Literal.OfInt(0)),
+        };
+
+        foreach (Expression node in representatives)
+        {
+            Assert.Equal(node.Nullable, node.NullableUnder(AnsiMode.Ansi));
+        }
+    }
+
+    [Fact]
+    public void EveryNullablePropagatingNode_AlsoOverridesNullableUnder()
+    {
+        // #614 reflection guard: any concrete Expression that OVERRIDES Nullable to propagate a child's
+        // nullability MUST also override NullableUnder, or a Legacy overflow/lossy-cast output column
+        // silently under-reports NOT-NULL (the exact #614 bug). The allowlist is the set of nodes whose
+        // Nullable is a constant/stored/non-propagating value, so a mode-aware variant would be a no-op
+        // (or, for ResolvedFunction, a deliberate over-report — residual tracked in #627).
+        var exempt = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "Literal",           // constant nullability (IsNull)
+            "AttributeReference", // stored leaf nullability
+            "IsNull",            // result is never null (non-propagating)
+            "IsNotNull",         // result is never null (non-propagating)
+            "EqualNullSafe",     // result is never null (non-propagating)
+            "ResolvedFunction",  // precise stored nullability; Legacy residual tracked in #627
+        };
+
+        Type baseType = typeof(Expression);
+        var offenders = new List<string>();
+        foreach (Type type in baseType.Assembly.GetTypes())
+        {
+            if (type.IsAbstract || type == baseType || !baseType.IsAssignableFrom(type))
+            {
+                continue;
+            }
+
+            bool overridesNullable = type.GetProperty("Nullable")!.GetGetMethod()!.DeclaringType == type;
+            if (!overridesNullable || exempt.Contains(type.Name))
+            {
+                continue;
+            }
+
+            bool overridesNullableUnder =
+                type.GetMethod("NullableUnder", new[] { typeof(AnsiMode) })!.DeclaringType == type;
+            if (!overridesNullableUnder)
+            {
+                offenders.Add(type.Name);
+            }
+        }
+
+        Assert.True(
+            offenders.Count == 0,
+            "These Expression nodes override Nullable but not NullableUnder (add a mode-aware override "
+            + "or exempt them with rationale): " + string.Join(", ", offenders));
     }
 
     [Fact]

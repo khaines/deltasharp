@@ -39,6 +39,10 @@ internal sealed class Cast : Expression
     public override bool Nullable => Child.Nullable;
 
     /// <inheritdoc/>
+    // #614: widening EVERY non-identity cast under Legacy (including null-safe upcasts like int->long
+    // that never actually null) is an INTENTIONAL conservative over-report. It mirrors the Engine
+    // CastExpression.Nullability exactly (the more important invariant — the interpreter nulls on
+    // invalid cast in Legacy), and over-reporting nullable is safe for an advisory hint.
     public override bool NullableUnder(AnsiMode mode) =>
         Child.NullableUnder(mode) || (mode == AnsiMode.Legacy && !TargetType.Equals(Child.Type));
 
