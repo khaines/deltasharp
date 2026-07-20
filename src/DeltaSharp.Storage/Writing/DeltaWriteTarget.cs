@@ -169,6 +169,12 @@ public sealed class DeltaWriteTarget : IDisposable
     /// constraints (<c>delta.constraints.*</c> config) survive the replacement and MUST still be enforced
     /// (Delta parity — the committed <c>metaData</c> keeps them), but the OLD schema's field invariants are
     /// replaced wholesale by the incoming <paramref name="writeSchema"/>'s, so only the latter apply.</param>
+    /// <param name="resolveConstraintsWhenEmpty">Whether to run the enforcer's <b>resolvability</b> pass even
+    /// when the write carries no rows. <see langword="false"/> (default) keeps an empty write a benign no-op.
+    /// <see langword="true"/> is set on the <c>overwriteSchema</c>-replace path (#601): that path commits its
+    /// new schema even at zero rows, so a surviving named CHECK that the replacement leaves referencing a
+    /// dropped column must still be validated (a schema-metadata check over the constraint set, independent of
+    /// row count) rather than skipped — otherwise the write would brick the table with a dangling CHECK.</param>
     /// <exception cref="DeltaProtocolException">A constraint is malformed, empty, or a nested-field invariant.</exception>
     /// <exception cref="InvalidOperationException">The write has active constraints but no
     /// <paramref name="enforcer"/> was provided — refused fail-closed.</exception>
@@ -178,12 +184,18 @@ public sealed class DeltaWriteTarget : IDisposable
         Snapshot? constraintSnapshot,
         StructType writeSchema,
         IReadOnlyList<ColumnBatch> batches,
-        bool includeSnapshotInvariants = true)
+        bool includeSnapshotInvariants = true,
+        bool resolveConstraintsWhenEmpty = false)
     {
-        // An empty write carries no rows to validate, so there is nothing to enforce (and no unenforced data
-        // to protect against a bypass) — skip uniformly, keeping an empty create/append/overwrite a benign
-        // no-op that needs no enforcer (Spark parity; the existing-append path also short-circuits empty).
-        if (!HasRows(batches))
+        // An empty write normally carries no rows to validate, so there is nothing to enforce (and no unenforced
+        // data to protect against a bypass) — skip uniformly, keeping an empty create/append/overwrite a benign
+        // no-op (Spark parity; the append path also short-circuits empty). EXCEPTION (#601): an overwriteSchema
+        // REPLACEMENT commits its new schema even at zero rows, so a surviving named CHECK that the replacement
+        // leaves referencing a DROPPED column must STILL be validated for resolvability — the enforcer's Phase-1
+        // pass runs over the constraint SET (not the rows), so it rejects a dangling CHECK independent of row
+        // count. Without this a 0-row overwriteSchema that drops a constrained column would commit and brick the
+        // table. resolveConstraintsWhenEmpty forces that resolve-only pass on the schema-replace path.
+        if (!HasRows(batches) && !resolveConstraintsWhenEmpty)
         {
             return;
         }
@@ -358,10 +370,13 @@ public sealed class DeltaWriteTarget : IDisposable
             // CHECK constraints (delta.constraints.* config survives — see PlanOverwriteReplaceSchema), so they
             // MUST still be enforced against the new rows (Delta parity — never commit unvalidated data into a
             // table that still declares the CHECK active). Only the OLD schema's field invariants are dropped
-            // (replaced by writeSchema's), hence includeSnapshotInvariants: false. A surviving CHECK that
-            // references a column the replacement drops fails closed at resolution (no dangling-CHECK brick).
+            // (replaced by writeSchema's), hence includeSnapshotInvariants: false. #601: resolveConstraintsWhenEmpty
+            // makes the resolvability pass run even for a ZERO-ROW replacement, so a surviving CHECK that
+            // references a column the replacement drops fails closed at resolution (no dangling-CHECK brick),
+            // independent of row count.
             EnforceWriteConstraints(
-                enforcer, snapshot, writeSchema, batches, includeSnapshotInvariants: false);
+                enforcer, snapshot, writeSchema, batches, includeSnapshotInvariants: false,
+                resolveConstraintsWhenEmpty: true);
 
             (IReadOnlyList<StagedDataFile> replaceFiles, long replaceRows) =
                 await StageAsync(plan.PhysicalWriteSchema, plan.PhysicalPartitionColumns, batches, cancellationToken)
