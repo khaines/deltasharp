@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Linq;
+using System.Reflection;
 using System.Security.Cryptography;
 using DeltaSharp.Diagnostics;
 using DeltaSharp.Storage.Backends;
@@ -54,6 +55,12 @@ internal sealed class DeltaCommitter
     /// <c>txnId</c>) so an ambiguous-ack re-GET can recognize this writer's own commit.</summary>
     internal const string CommitNonceKey = "txnId";
 
+    /// <summary>The <c>commitInfo.engineInfo</c> string stamped on every commit (Delta parity): the engine
+    /// name and version. Derived once from the assembly informational version (the build-time
+    /// <c>VersionPrefix</c>) with any <c>+&lt;metadata&gt;</c> suffix stripped, so it is deterministic within
+    /// a build and never per-run random.</summary>
+    internal static readonly string EngineInfo = BuildEngineInfo();
+
     /// <summary>A generous bound on rebase-retries; reaching it implies sustained contention (or a bug) and
     /// fails closed with <see cref="DeltaCommitContentionException"/> rather than spinning forever.</summary>
     internal const int DefaultMaxAttempts = 64;
@@ -70,6 +77,7 @@ internal sealed class DeltaCommitter
     private readonly ILogger<DeltaCommitter> _logger;
     private readonly DeltaStorageTelemetry _telemetry;
     private readonly Func<int, CancellationToken, Task>? _rebaseJitter;
+    private readonly TimeProvider _timeProvider;
 
     /// <summary>The shared <c>deltasharp.component</c>/<c>deltasharp.operation</c> correlation scope attached
     /// to every commit log line (design §7.2.1). Cached so <see cref="ILogger.BeginScope"/> allocates no new
@@ -89,10 +97,21 @@ internal sealed class DeltaCommitter
     {
     }
 
+    /// <summary>Creates a committer with an explicit <paramref name="timeProvider"/> so the wall-clock
+    /// <c>commitInfo.timestamp</c> is deterministic (the production write door threads its injected clock in;
+    /// tests pin a fake). All other seams default to production.</summary>
+    public DeltaCommitter(IStorageBackend backend, TimeProvider timeProvider)
+        : this(backend, DefaultMaxAttempts, nonceFactory: null, transientBackoff: null, timeProvider: timeProvider)
+    {
+    }
+
     /// <param name="rebaseJitter">Optional, <b>off by default</b> (null ⇒ current zero-delay behavior): when
     /// supplied, it is awaited after a safe rebase and before the next put-if-absent, spreading colliding
     /// writers in time to reduce livelock under contention (visible via the conflict metric). A deterministic
     /// delegate is injected in tests so it never perturbs the existing seams or timing.</param>
+    /// <param name="timeProvider">The clock stamped into <c>commitInfo.timestamp</c> (epoch-ms). Defaults to
+    /// <see cref="TimeProvider.System"/>; production wiring threads the write door's injected clock so a test
+    /// can pin the commit timestamp. Never a banned <c>DateTimeOffset.UtcNow</c>.</param>
     internal DeltaCommitter(
         IStorageBackend backend,
         int maxAttempts,
@@ -100,7 +119,8 @@ internal sealed class DeltaCommitter
         Func<int, CancellationToken, Task>? transientBackoff = null,
         ILogger<DeltaCommitter>? logger = null,
         DeltaStorageTelemetry? telemetry = null,
-        Func<int, CancellationToken, Task>? rebaseJitter = null)
+        Func<int, CancellationToken, Task>? rebaseJitter = null,
+        TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(backend);
         if (maxAttempts < 1)
@@ -116,6 +136,7 @@ internal sealed class DeltaCommitter
         _logger = logger ?? NullLogger<DeltaCommitter>.Instance;
         _telemetry = telemetry ?? DeltaStorageTelemetry.Shared;
         _rebaseJitter = rebaseJitter;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     /// <summary>A bounded, deterministic-friendly rebase jitter suitable for the <c>rebaseJitter</c> seam:
@@ -728,13 +749,18 @@ internal sealed class DeltaCommitter
     }
 
     /// <summary>Builds the serialized payload: a single leading <c>commitInfo</c> carrying this attempt's
-    /// idempotency <paramref name="nonce"/> (merged over any caller-supplied <c>commitInfo</c>), followed by
-    /// the caller's non-<c>commitInfo</c> actions in order.</summary>
-    private static (IReadOnlyList<DeltaAction> Payload, string Nonce) BuildPayload(
+    /// idempotency <paramref name="nonce"/> (merged over any caller-supplied <c>commitInfo</c>) plus the
+    /// stamped <c>timestamp</c> (from the injected clock) and <c>engineInfo</c>, followed by the caller's
+    /// non-<c>commitInfo</c> actions in order. The caller-supplied <c>operation</c>/<c>operationParameters</c>
+    /// (from <see cref="DeltaCommitInfo"/>) ride through unchanged — the engine owns only the clock/nonce/
+    /// engine stamps.</summary>
+    private (IReadOnlyList<DeltaAction> Payload, string Nonce) BuildPayload(
         IReadOnlyList<DeltaAction> actions, string nonce)
     {
         var entries = ImmutableSortedDictionary.CreateBuilder<string, string>(StringComparer.Ordinal);
         var rest = new List<DeltaAction>(actions.Count);
+        string? operation = null;
+        ImmutableSortedDictionary<string, string>? operationParameters = null;
         foreach (DeltaAction action in actions)
         {
             if (action is CommitInfoAction commitInfo)
@@ -743,6 +769,10 @@ internal sealed class DeltaCommitter
                 {
                     entries[entry.Key] = entry.Value;
                 }
+
+                // First non-null wins (a commit builds at most one operation-bearing commitInfo).
+                operation ??= commitInfo.Operation;
+                operationParameters ??= commitInfo.OperationParameters;
             }
             else
             {
@@ -754,9 +784,36 @@ internal sealed class DeltaCommitter
         // nonce is authoritative for ambiguous-ack recognition (a caller cannot forge/override it).
         entries[CommitNonceKey] = nonce;
 
-        var payload = new List<DeltaAction>(rest.Count + 1) { new CommitInfoAction(entries.ToImmutable()) };
+        // The engine also owns the wall-clock timestamp (from the injected TimeProvider, never a banned
+        // DateTimeOffset.UtcNow) and the engineInfo stamp — a write site only declares WHAT it did.
+        long timestamp = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
+        var stampedCommitInfo = new CommitInfoAction(
+            entries.ToImmutable(),
+            Timestamp: timestamp,
+            Operation: operation,
+            OperationParameters: operationParameters,
+            EngineInfo: EngineInfo);
+
+        var payload = new List<DeltaAction>(rest.Count + 1) { stampedCommitInfo };
         payload.AddRange(rest);
         return (payload, nonce);
+    }
+
+    /// <summary>Derives the <see cref="EngineInfo"/> stamp — <c>DeltaSharp/&lt;version&gt;</c> — from the
+    /// assembly informational version, stripping any <c>+&lt;build-metadata&gt;</c> (source-link) suffix so
+    /// the value is deterministic within a build (no per-run randomness).</summary>
+    private static string BuildEngineInfo()
+    {
+        string? informational = typeof(DeltaCommitter).Assembly
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+        string version = informational is null ? "unknown" : StripBuildMetadata(informational);
+        return $"DeltaSharp/{version}";
+    }
+
+    private static string StripBuildMetadata(string informationalVersion)
+    {
+        int plus = informationalVersion.IndexOf('+', StringComparison.Ordinal);
+        return plus < 0 ? informationalVersion : informationalVersion[..plus];
     }
 
     private static bool CommitCarriesNonce(IReadOnlyList<DeltaAction> actions, string nonce)

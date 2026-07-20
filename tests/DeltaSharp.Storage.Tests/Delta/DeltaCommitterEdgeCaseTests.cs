@@ -107,17 +107,21 @@ public sealed class DeltaCommitterEdgeCaseTests : IDisposable
     public async Task CommitAsync_MergesCallerCommitInfo_AndAddsNonce()
     {
         Snapshot snapshot = await SeedAndLoadAsync();
+        // #510: the caller declares the operation via the typed field; the committer stamps the nonce (and
+        // timestamp/engineInfo). A flat Entries key still round-trips as provenance.
         var callerCommitInfo = new CommitInfoAction(
             ImmutableSortedDictionary<string, string>.Empty
                 .WithComparers(StringComparer.Ordinal)
-                .Add("operation", "WRITE"));
+                .Add("customTag", "abc"),
+            Operation: "WRITE");
 
         DeltaCommitResult result = await new DeltaCommitter(_backend).CommitAsync(
             snapshot, new DeltaAction[] { callerCommitInfo, Add("part-0.parquet") }, DeltaReadScope.BlindAppend);
 
         IReadOnlyList<DeltaAction> committed = await new DeltaLog(_backend).ReadCommitActionsAsync(result.Version, default);
         CommitInfoAction persisted = committed.OfType<CommitInfoAction>().Single();
-        Assert.Equal("WRITE", persisted.Entries["operation"]); // caller entry preserved
+        Assert.Equal("WRITE", persisted.Operation); // caller operation preserved
+        Assert.Equal("abc", persisted.Entries["customTag"]); // caller flat entry preserved
         Assert.True(persisted.Entries.ContainsKey(DeltaCommitter.CommitNonceKey)); // nonce added
     }
 

@@ -219,24 +219,62 @@ internal static class DeltaLogActionReader
 
     private static CommitInfoAction ParseCommitInfo(JsonElement body)
     {
-        // commitInfo is best-effort provenance: preserve scalar entries as strings, ignore nested/complex
+        // commitInfo is best-effort provenance: preserve scalar entries as strings, round-trip the typed
+        // Delta fields (timestamp/operation/operationParameters/engineInfo), ignore other nested/complex
         // values. Never fails the read — it is not load-bearing for replay (§2.10.1).
         if (body.ValueKind != JsonValueKind.Object)
         {
             return new CommitInfoAction(EmptyStringMap);
         }
 
+        long? timestamp = null;
+        string? operation = null;
+        ImmutableSortedDictionary<string, string>? operationParameters = null;
+        string? engineInfo = null;
         var builder = ImmutableSortedDictionary.CreateBuilder<string, string>(StringComparer.Ordinal);
         foreach (JsonProperty property in body.EnumerateObject())
         {
-            string? scalar = ScalarToString(property.Value);
-            if (scalar is not null)
+            switch (property.Name)
             {
-                builder[property.Name] = scalar;
+                case "timestamp" when property.Value.ValueKind == JsonValueKind.Number
+                    && property.Value.TryGetInt64(out long ts):
+                    timestamp = ts;
+                    break;
+                case "operation" when property.Value.ValueKind == JsonValueKind.String:
+                    operation = property.Value.GetString();
+                    break;
+                case "operationParameters" when property.Value.ValueKind == JsonValueKind.Object:
+                    operationParameters = ParseOperationParameters(property.Value);
+                    break;
+                case "engineInfo" when property.Value.ValueKind == JsonValueKind.String:
+                    engineInfo = property.Value.GetString();
+                    break;
+                default:
+                    // Any other scalar (notably txnId) is preserved as flat provenance.
+                    string? scalar = ScalarToString(property.Value);
+                    if (scalar is not null)
+                    {
+                        builder[property.Name] = scalar;
+                    }
+
+                    break;
             }
         }
 
-        return new CommitInfoAction(builder.ToImmutable());
+        return new CommitInfoAction(builder.ToImmutable(), timestamp, operation, operationParameters, engineInfo);
+    }
+
+    // operationParameters values are JSON-encoded tokens (a quoted scalar or an array); preserve each as its
+    // RAW JSON text so a write→read→write cycle reproduces the exact token the writer emits raw.
+    private static ImmutableSortedDictionary<string, string> ParseOperationParameters(JsonElement parameters)
+    {
+        var builder = ImmutableSortedDictionary.CreateBuilder<string, string>(StringComparer.Ordinal);
+        foreach (JsonProperty property in parameters.EnumerateObject())
+        {
+            builder[property.Name] = property.Value.GetRawText();
+        }
+
+        return builder.ToImmutable();
     }
 
     private static FileStatistics? ParseStats(JsonElement add, long version, int line)

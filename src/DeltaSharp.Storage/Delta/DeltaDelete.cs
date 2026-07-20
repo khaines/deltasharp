@@ -318,6 +318,9 @@ internal sealed class DeltaDelete
 
         // ONE commit removing every affected file's prior add and adding its residual (DV-carrying) add,
         // scoped to exactly the affected paths so a concurrent change to any of them aborts (no lost delete).
+        // Prepend the DELETE provenance so DESCRIBE HISTORY records operation="DELETE" (commitInfo is
+        // informational; the committer stamps timestamp/engineInfo/txnId).
+        actions.Insert(0, DeltaCommitInfo.Delete());
         DeltaCommitResult commit = await _committer
             .CommitAsync(readSnapshot, actions, DeltaReadScope.ReadFiles(inputPaths), cancellationToken)
             .ConfigureAwait(false);

@@ -81,7 +81,28 @@ internal sealed record RemoveFileAction(
 internal sealed record TxnAction(string AppId, long Version, long? LastUpdated) : DeltaAction;
 
 /// <summary>
-/// <c>commitInfo</c> — optional, best-effort commit provenance. Not load-bearing for replay; the raw
-/// key/value pairs are preserved for diagnostics/audit without imposing a rigid schema (design §2.10.1).
+/// <c>commitInfo</c> — optional, best-effort commit provenance. Not load-bearing for replay (§2.10.1): a
+/// reader ignores it for correctness, so this is an interop/parity enrichment, not a rule. Alongside the
+/// flat <see cref="Entries"/> (which carry the engine's idempotency <c>txnId</c> and any other raw
+/// key/value provenance) it models the typed fields the Delta ecosystem (<c>DESCRIBE HISTORY</c>,
+/// delta-standalone/-rs/-spark) reads: the commit <see cref="Timestamp"/> (epoch-ms), the
+/// <see cref="Operation"/> string (e.g. <c>WRITE</c>, <c>DELETE</c>, <c>OPTIMIZE</c>, <c>CREATE TABLE</c>),
+/// its <see cref="OperationParameters"/>, and the <see cref="EngineInfo"/>. All four are optional so an
+/// older or caller-minted <c>commitInfo</c> carrying only <see cref="Entries"/> stays valid (backward
+/// compatible).
+///
+/// <para><b><see cref="OperationParameters"/> value contract.</b> Per the Delta spec each
+/// <c>operationParameters</c> value is itself a <b>JSON-encoded string</b> — a scalar is a JSON string
+/// literal (e.g. <c>mode</c> ⇒ <c>"Append"</c> WITH the quotes) and a list is a JSON array (e.g.
+/// <c>partitionBy</c> ⇒ <c>["region"]</c>). This map therefore stores each value as the <b>already
+/// JSON-encoded token</b> (string → raw-JSON-string); the writer emits it verbatim via
+/// <c>Utf8JsonWriter.WriteRawValue</c> so a quoted scalar or a bracketed array serializes correctly, and the
+/// reader round-trips it with <c>JsonElement.GetRawText</c>. Build values through
+/// <see cref="DeltaCommitInfo"/> (never hand-concatenate) so encoding stays correct.</para>
 /// </summary>
-internal sealed record CommitInfoAction(ImmutableSortedDictionary<string, string> Entries) : DeltaAction;
+internal sealed record CommitInfoAction(
+    ImmutableSortedDictionary<string, string> Entries,
+    long? Timestamp = null,
+    string? Operation = null,
+    ImmutableSortedDictionary<string, string>? OperationParameters = null,
+    string? EngineInfo = null) : DeltaAction;

@@ -67,10 +67,10 @@ public sealed class DeltaWriteTarget : IDisposable
         // Construct the committer with an optional injectable physical-name source (null ⇒ the production
         // crypto RNG). This is byte-for-byte equivalent to `new DeltaTableWriter(backend)` when nameSource is
         // null; a test injects a deterministic source so a name-mode evolution (#556) mints golden physical
-        // names. TimeProvider.System matches the pre-#556 committer clock (the door's own _timeProvider drives
-        // only staged-file mtime).
+        // names. The injected TimeProvider drives BOTH the writer's staged-file mtime AND the committer's
+        // commitInfo.timestamp (#510), so a test that pins the clock pins the recorded commit timestamp.
         _writer = new DeltaTableWriter(
-            new DeltaLog(backend), new DeltaCommitter(backend), TimeProvider.System, nameSource);
+            new DeltaLog(backend), new DeltaCommitter(backend, timeProvider), timeProvider, nameSource);
         _timeProvider = timeProvider;
         _fileNameFactory = fileNameFactory;
     }

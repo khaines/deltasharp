@@ -72,7 +72,14 @@ public sealed class DeltaLogActionWriterTests
             NullableStringMap(("dt", "2023")),
             512L);
         var txn = new TxnAction("stream-a", 42L, 1700000003000L);
-        var commitInfo = new CommitInfoAction(StringMap(("operation", "WRITE"), ("engineInfo", "test")));
+        // #510: operation/operationParameters/timestamp/engineInfo are now TYPED commitInfo fields (the
+        // Delta ecosystem reads them for DESCRIBE HISTORY); an arbitrary extra key stays flat Entries.
+        var commitInfo = new CommitInfoAction(
+            StringMap(("txnId", "nonce-1")),
+            Timestamp: 1700000004000L,
+            Operation: "WRITE",
+            OperationParameters: StringMap(("mode", "\"Append\""), ("partitionBy", "[\"dt\"]")),
+            EngineInfo: "test");
 
         IReadOnlyList<DeltaAction> actions =
             RoundTrip(commitInfo, protocol, metadata, add, remove, txn);
@@ -80,8 +87,12 @@ public sealed class DeltaLogActionWriterTests
         Assert.Equal(6, actions.Count);
 
         var parsedCommitInfo = Assert.IsType<CommitInfoAction>(actions[0]);
-        Assert.Equal("WRITE", parsedCommitInfo.Entries["operation"]);
-        Assert.Equal("test", parsedCommitInfo.Entries["engineInfo"]);
+        Assert.Equal(1700000004000L, parsedCommitInfo.Timestamp);
+        Assert.Equal("WRITE", parsedCommitInfo.Operation);
+        Assert.Equal("\"Append\"", parsedCommitInfo.OperationParameters!["mode"]);
+        Assert.Equal("[\"dt\"]", parsedCommitInfo.OperationParameters!["partitionBy"]);
+        Assert.Equal("test", parsedCommitInfo.EngineInfo);
+        Assert.Equal("nonce-1", parsedCommitInfo.Entries["txnId"]);
 
         var parsedProtocol = Assert.IsType<ProtocolAction>(actions[1]);
         Assert.Equal(1, parsedProtocol.MinReaderVersion);

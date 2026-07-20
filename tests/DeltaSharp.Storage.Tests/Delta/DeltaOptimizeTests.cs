@@ -149,6 +149,26 @@ public sealed class DeltaOptimizeTests : IDisposable
     // ---------------------------------------------------------------- AC1: compact → one commit
 
     [Fact]
+    public async Task Optimize_WritesOptimizeCommitInfo()
+    {
+        // #510: OPTIMIZE records operation="OPTIMIZE" with an empty predicate ([]) in commitInfo for
+        // DESCRIBE HISTORY parity (operationMetrics deferred to #506).
+        StagedDataFile a = await WriteDataFileAsync("a.parquet", Batch((1, "a"), (2, "b")));
+        StagedDataFile b = await WriteDataFileAsync("b.parquet", Batch((3, "c"), (4, null)));
+        await SeedAsync(DataSchema, partitionColumns: null, a, b);
+
+        OptimizeResult result = await Optimize().OptimizeAsync();
+
+        IReadOnlyList<DeltaAction> committed =
+            await Log().ReadCommitActionsAsync(result.CommittedVersion!.Value, CancellationToken.None);
+        CommitInfoAction commitInfo = committed.OfType<CommitInfoAction>().Single();
+        Assert.Equal("OPTIMIZE", commitInfo.Operation);
+        Assert.Equal("[]", commitInfo.OperationParameters!["predicate"]);
+        Assert.NotNull(commitInfo.EngineInfo);
+        Assert.True(commitInfo.Entries.ContainsKey("txnId"));
+    }
+
+    [Fact]
     public async Task Optimize_CompactsSmallFiles_IntoOneCommit_PreservingRows()
     {
         // AC1: four small unpartitioned files (8 rows total) compact into a single output published in ONE

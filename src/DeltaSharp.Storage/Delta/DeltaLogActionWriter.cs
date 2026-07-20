@@ -207,10 +207,43 @@ internal static class DeltaLogActionWriter
     {
         writer.WriteStartObject();
         writer.WriteStartObject("commitInfo");
-        // The model stores commitInfo as string→string provenance; emit every entry as a JSON string.
+
+        // Delta's conventional key order: timestamp, operation, operationParameters, then the flat provenance
+        // Entries (txnId etc.), then engineInfo. Each typed field is emitted only when present (backward
+        // compatible with a commitInfo that carries only Entries).
+        if (commitInfo.Timestamp is { } timestamp)
+        {
+            writer.WriteNumber("timestamp", timestamp);
+        }
+
+        if (commitInfo.Operation is { } operation)
+        {
+            writer.WriteString("operation", operation);
+        }
+
+        if (commitInfo.OperationParameters is { } operationParameters)
+        {
+            writer.WriteStartObject("operationParameters");
+            // Each value is an ALREADY JSON-encoded token (a quoted scalar like "Append" or an array like
+            // ["region"]) per the Delta spec, so it is written RAW — never re-quoted (see CommitInfoAction).
+            foreach (KeyValuePair<string, string> parameter in operationParameters)
+            {
+                writer.WritePropertyName(parameter.Key);
+                writer.WriteRawValue(parameter.Value);
+            }
+
+            writer.WriteEndObject();
+        }
+
+        // The model stores the flat provenance as string→string; emit every entry as a JSON string.
         foreach (KeyValuePair<string, string> entry in commitInfo.Entries)
         {
             writer.WriteString(entry.Key, entry.Value);
+        }
+
+        if (commitInfo.EngineInfo is { } engineInfo)
+        {
+            writer.WriteString("engineInfo", engineInfo);
         }
 
         writer.WriteEndObject();

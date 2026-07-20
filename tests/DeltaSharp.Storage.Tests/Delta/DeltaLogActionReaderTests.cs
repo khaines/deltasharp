@@ -15,7 +15,7 @@ public sealed class DeltaLogActionReaderTests
         // AC1: valid protocol/metaData/add/remove/txn/commitInfo actions preserve every field needed for
         // replay. One commit exercises all six action kinds in file order.
         ReadOnlyMemory<byte> content = Commit(
-            """{"commitInfo":{"operation":"WRITE","engineInfo":"test","readVersion":6}}""",
+            """{"commitInfo":{"timestamp":1700000004000,"operation":"WRITE","operationParameters":{"mode":"Append","partitionBy":["dt"]},"engineInfo":"test","readVersion":6}}""",
             """{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}""",
             """{"metaData":{"id":"t-1","name":"orders","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":["dt"],"configuration":{"delta.appendOnly":"true"},"createdTime":1700000000000}}""",
             """{"add":{"path":"dt=2024/part-0.parquet","partitionValues":{"dt":"2024"},"size":1024,"modificationTime":1700000001000,"dataChange":true,"tags":{"z":"1"}}}""",
@@ -58,7 +58,13 @@ public sealed class DeltaLogActionReaderTests
         Assert.Equal(42L, txn.Version);
 
         var commitInfo = Assert.IsType<CommitInfoAction>(actions[0]);
-        Assert.Equal("WRITE", commitInfo.Entries["operation"]);
+        // #510: operation/operationParameters/timestamp/engineInfo are typed; operationParameters values are
+        // preserved as their raw JSON tokens ("Append" is a quoted string, ["dt"] is an array).
+        Assert.Equal(1700000004000L, commitInfo.Timestamp);
+        Assert.Equal("WRITE", commitInfo.Operation);
+        Assert.Equal("\"Append\"", commitInfo.OperationParameters!["mode"]);
+        Assert.Equal("[\"dt\"]", commitInfo.OperationParameters!["partitionBy"]);
+        Assert.Equal("test", commitInfo.EngineInfo);
         Assert.Equal("6", commitInfo.Entries["readVersion"]); // numeric scalar preserved as text
     }
 

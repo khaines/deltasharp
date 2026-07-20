@@ -492,6 +492,9 @@ internal sealed class DeltaOptimize
 
         // AC1 + AC2: ONE commit removing every compacted input and adding every compacted output, both
         // dataChange=false, scoped to exactly the input paths so a concurrent change to an input aborts.
+        // Prepend the OPTIMIZE provenance so DESCRIBE HISTORY records operation="OPTIMIZE" (operationMetrics
+        // is deferred to #506; the committer stamps timestamp/engineInfo/txnId).
+        actions.Insert(0, DeltaCommitInfo.Optimize());
         DeltaCommitResult commit = await _committer.CommitAsync(
             readSnapshot, actions, DeltaReadScope.ReadFiles(inputPaths), cancellationToken).ConfigureAwait(false);
 
