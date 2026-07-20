@@ -44,4 +44,15 @@
     <ProjectReference Include="../DeltaSharp.Abstractions/DeltaSharp.Abstractions.csproj" />
   </ItemGroup>
 
+  <!-- #616: the real-enforcer ALTER DROP/RENAME dependent-CHECK e2e regressions live in
+       DeltaSharp.Executor.Tests, because the ONLY IWriteConstraintEnforcer implementation
+       (DeltaLocalSink, via DeltaSinkFactory) is internal to DeltaSharp.Executor — while the ALTER
+       door (DeltaTableWriter.DropColumnAsync/RenameColumnAsync + LocalFileSystemBackend) is internal
+       here. Those two halves can only meet in one assembly; grant that test assembly internals
+       visibility (this project already implicitly grants DeltaSharp.Storage.Tests via
+       Directory.Build.props). Mirrors DeltaSharp.Abstractions.csproj's cross-assembly test grants. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="DeltaSharp.Executor.Tests" />
+  </ItemGroup>
+
 </Project>

@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json.Nodes;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage;
 using DeltaSharp.Storage.Backends;
@@ -206,6 +207,167 @@ public sealed class ColumnMappingTests : IDisposable
         Assert.Equal(
             new (long, long?, string?)[] { (1L, 100L, "alice"), (2L, 200L, "bob") },
             history.OrderBy(r => r.Id).ToList());
+    }
+
+    // ---------------------------------------------------------------- #616: ALTER DROP/RENAME dependent-CHECK guard
+    //
+    // DropColumnAsync/RenameColumnAsync refuse fail-closed when a surviving named CHECK depends on the
+    // removed/renamed column (the dangling-CHECK brick #601/#598 guard, on the ALTER door). These tests use a
+    // fake IWriteConstraintEnforcer to prove the WIRING — the ALTER door collects the surviving CHECK, runs the
+    // enforcer's resolve pass over the constraint SET against the POST-ALTER schema with NO batches, and
+    // propagates the rejection before any commit; and, mirroring the write door's anti-bypass net, refuses
+    // fail-closed when constraints exist but no enforcer is wired. The enforcer's REAL dangling-CHECK resolution
+    // (real DeltaLocalSink through the ALTER door) is proven by
+    // AlterColumnDependentCheckEndToEndTests (Executor), and the identical null-priorSchema Phase-1 by
+    // DeltaSinkNestedDropReclassificationTests.
+
+    [Fact]
+    public async Task DropColumn_DependentCheck_EnforcerRejectsFailClosed_NoCommit()
+    {
+        await CreateNameMappedAsync((1L, 100L, "alice"));
+        AddCheckConstraintAtV1("score_positive", "score > 0"); // v1: a named CHECK referencing `score`
+
+        using var backend = new LocalFileSystemBackend(_root);
+        var writer = new DeltaTableWriter(backend);
+        var enforcer = new RecordingConstraintEnforcer(reject: true);
+
+        await Assert.ThrowsAsync<DeltaConstraintDependentColumnException>(
+            () => writer.DropColumnAsync("score", enforcer));
+
+        // The guard ran over the POST-DROP schema (no `score`) with the surviving CHECK and NO batches, and the
+        // rejection aborted the write — no v2 drop commit, so the table is not bricked.
+        Assert.Equal(1, enforcer.Calls);
+        Assert.False(enforcer.Schema!.TryGetField("score", out _));
+        Assert.Equal(new[] { "id", "name" }, enforcer.Schema.Select(f => f.Name).ToArray());
+        Assert.Equal("score_positive", Assert.Single(enforcer.Constraints!).Name);
+        Assert.Empty(enforcer.Batches!);
+        Assert.Equal(1L, (await new DeltaLog(backend).LoadSnapshotAsync(version: null)).Version); // still v1 (no drop committed)
+    }
+
+    [Fact]
+    public async Task RenameColumn_DependentCheck_EnforcerRejectsFailClosed_NoCommit()
+    {
+        await CreateNameMappedAsync((1L, 100L, "alice"));
+        AddCheckConstraintAtV1("score_positive", "score > 0");
+
+        using var backend = new LocalFileSystemBackend(_root);
+        var writer = new DeltaTableWriter(backend);
+        var enforcer = new RecordingConstraintEnforcer(reject: true);
+
+        await Assert.ThrowsAsync<DeltaConstraintDependentColumnException>(
+            () => writer.RenameColumnAsync("score", "points", enforcer));
+
+        // The guard saw the POST-RENAME schema (`points`, not `score`) — a CHECK on `score` would dangle.
+        Assert.Equal(1, enforcer.Calls);
+        Assert.False(enforcer.Schema!.TryGetField("score", out _));
+        Assert.True(enforcer.Schema.TryGetField("points", out _));
+        Assert.Equal(1L, (await new DeltaLog(backend).LoadSnapshotAsync(version: null)).Version); // still v1 (no rename committed)
+    }
+
+    [Fact]
+    public async Task DropColumn_SurvivingUnrelatedCheck_EnforcerAccepts_Commits()
+    {
+        // Happy path: a CHECK on a SURVIVING column (`id`, not the dropped `score`) resolves clean, so the guard
+        // RUNS (Calls==1) but does not block — the DROP commits. Proves the guard is non-blocking on a clean
+        // resolve (not merely skipped when there are zero constraints).
+        await CreateNameMappedAsync((1L, 100L, "alice"));
+        AddCheckConstraintAtV1("id_positive", "id > 0"); // references `id`, which SURVIVES the drop of `score`
+
+        using var backend = new LocalFileSystemBackend(_root);
+        var writer = new DeltaTableWriter(backend);
+        var enforcer = new RecordingConstraintEnforcer(); // reject: false — resolves clean
+
+        DeltaCommitResult drop = await writer.DropColumnAsync("score", enforcer);
+
+        Assert.Equal(1, enforcer.Calls); // the resolvability pass ran over the surviving CHECK
+        Assert.Equal("id_positive", Assert.Single(enforcer.Constraints!).Name);
+        Assert.Equal(2L, drop.Version); // committed — the CHECK on `id` still resolves against the post-drop schema
+    }
+
+    [Fact]
+    public async Task DropColumn_NoConstraints_EnforcerNotInvoked_Commits()
+    {
+        await CreateNameMappedAsync((1L, 100L, "alice")); // no CHECK constraints
+
+        using var backend = new LocalFileSystemBackend(_root);
+        var writer = new DeltaTableWriter(backend);
+        var enforcer = new RecordingConstraintEnforcer();
+
+        DeltaCommitResult drop = await writer.DropColumnAsync("score", enforcer);
+
+        Assert.Equal(0, enforcer.Calls); // no surviving constraints → the resolvability pass is skipped
+        Assert.Equal(1L, drop.Version); // drop committed normally
+    }
+
+    [Fact]
+    public async Task DropColumn_NullEnforcer_WithConstraints_RefusedFailClosed()
+    {
+        // Anti-bypass net (mirrors the write door, which throws when constraints exist and no enforcer is wired):
+        // a table WITH active constraints but NO enforcer supplied is refused fail-closed rather than silently
+        // committing a potential dangling-CHECK brick. (An unconstrained table needs no enforcer — see
+        // Drop_IsMetadataOnly_* / Rename_IsMetadataOnly_*, which drop/rename with no enforcer.)
+        await CreateNameMappedAsync((1L, 100L, "alice"));
+        AddCheckConstraintAtV1("score_positive", "score > 0");
+
+        using var backend = new LocalFileSystemBackend(_root);
+        var writer = new DeltaTableWriter(backend);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => writer.DropColumnAsync("score", constraintEnforcer: null));
+        Assert.Equal(1L, (await new DeltaLog(backend).LoadSnapshotAsync(version: null)).Version); // no drop committed
+    }
+
+    // Adds a named CHECK constraint to the freshly-created (v0) table as a v1 metadata-only commit (mirrors the
+    // config a `ALTER TABLE ADD CONSTRAINT` would set: delta.constraints.<name> = <expression>).
+    private void AddCheckConstraintAtV1(string name, string expression)
+    {
+        string logDir = Path.Combine(_root, "_delta_log");
+        string metaLine = File.ReadAllLines(Path.Combine(logDir, $"{0:D20}.json"))
+            .First(line => line.Contains("\"metaData\"", StringComparison.Ordinal));
+        JsonNode root = JsonNode.Parse(metaLine)!;
+        JsonObject metadata = root["metaData"]!.AsObject();
+        if (metadata["configuration"] is not JsonObject configuration)
+        {
+            configuration = new JsonObject();
+            metadata["configuration"] = configuration;
+        }
+
+        configuration[$"delta.constraints.{name}"] = expression;
+        File.WriteAllText(Path.Combine(logDir, $"{1:D20}.json"), root.ToJsonString() + "\n");
+    }
+
+    // A fake IWriteConstraintEnforcer that records the (schema, constraints, batches) it is handed and,
+    // when constructed with reject: true, simulates a surviving CHECK that depends on the altered column by
+    // throwing the same DeltaConstraintDependentColumnException the real enforcer's resolve pass raises.
+    private sealed class RecordingConstraintEnforcer : IWriteConstraintEnforcer
+    {
+        private readonly bool _reject;
+
+        public RecordingConstraintEnforcer(bool reject = false) => _reject = reject;
+
+        public int Calls { get; private set; }
+
+        public StructType? Schema { get; private set; }
+
+        public IReadOnlyList<DeltaTableConstraint>? Constraints { get; private set; }
+
+        public IReadOnlyList<ColumnBatch>? Batches { get; private set; }
+
+        public void Enforce(
+            StructType schema,
+            IReadOnlyList<DeltaTableConstraint> constraints,
+            IReadOnlyList<ColumnBatch> batches,
+            StructType? priorSchema = null)
+        {
+            Calls++;
+            Schema = schema;
+            Constraints = constraints;
+            Batches = batches;
+            if (_reject)
+            {
+                throw DeltaConstraintDependentColumnException.ForColumnChange("score", new[] { constraints[0] });
+            }
+        }
     }
 
     // ---------------------------------------------------------------- AC1 (partitioned): physical partition keys
