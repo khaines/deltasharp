@@ -189,6 +189,7 @@ internal sealed class CheckpointFixture
         bool extendedFileMetadata = false,
         (string Key, string? Value)[]? partitionValues = null,
         long? size = null,
+        (string Key, string Value)[]? tags = null,
         DvColumns? deletionVector = null)
     {
         var remove = new Dictionary<string, object?>
@@ -196,6 +197,7 @@ internal sealed class CheckpointFixture
             ["path"] = path,
             ["dataChange"] = dataChange,
             ["extendedFileMetadata"] = extendedFileMetadata,
+            ["tags"] = ToMap(tags),
         };
         if (deletionTimestamp is not null)
         {
@@ -345,6 +347,7 @@ internal sealed class CheckpointFixture
             new DataField<bool?>("extendedFileMetadata"),
             StringMap("partitionValues"),
             new DataField<long?>("size"),
+            StringMap("tags"),
         };
         if (_withDeletionVector)
         {

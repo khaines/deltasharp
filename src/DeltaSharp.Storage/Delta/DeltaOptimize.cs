@@ -702,8 +702,9 @@ internal sealed class DeltaOptimize
 
     // Tombstone a compacted input. dataChange=false marks a byte-rearranging remove (§2.11.2), and
     // ExtendedFileMetadata=true round-trips the extended trio (partitionValues/size/tags) so the remove
-    // survives checkpoint reconstruction with full fidelity (design §2.10.1). DeltaSharp's own files carry
-    // no tags today, so the tombstone carries none.
+    // survives checkpoint reconstruction with full fidelity (design §2.10.1). The tombstone inherits the
+    // compacted-away add's tags (delta-spark AddFile.removeWithTimestamp carries tags = tags), so tags
+    // authored by an external engine (e.g. INSERTION_TIME/ZCUBE_ID) survive an OPTIMIZE.
     private RemoveFileAction ToRemove(AddFileAction input, long timestamp) =>
         new(
             input.Path,
@@ -712,7 +713,7 @@ internal sealed class DeltaOptimize
             ExtendedFileMetadata: true,
             input.PartitionValues,
             input.Size,
-            NoTags);
+            input.Tags);
 
     // The canonical partition values for a compacted output: a value (possibly null) for EVERY partition
     // column, so the add satisfies the partition-coverage contract. All inputs in a group share the same

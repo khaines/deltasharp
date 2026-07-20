@@ -189,6 +189,9 @@ internal static class DeltaLogActionWriter
                 writer.WriteNumber("size", size);
             }
 
+            // Unlike add.tags (WriteStringMapIfAny, which omits an empty map), remove emits tags:{}
+            // unconditionally under ExtendedFileMetadata — intentionally symmetric with the #511
+            // partitionValues:{} decision so strict cross-engine readers see the complete extended trio.
             writer.WriteStartObject("tags");
             WriteStringMapEntries(writer, remove.Tags);
             writer.WriteEndObject();
