@@ -717,7 +717,7 @@ internal sealed class DeltaTableWriter
         // #616: refuse fail-closed if a surviving named CHECK still depends on the renamed column (its
         // predicate would no longer resolve against the post-rename schema — a dangling-CHECK brick).
         var renamedSchema = new StructType(fields);
-        EnsureNoDependentConstraints(snapshot, renamedSchema, constraintEnforcer);
+        EnsureNoDependentConstraints(snapshot, renamedSchema, constraintEnforcer, "ALTER TABLE RENAME COLUMN");
 
         return await CommitSchemaChangeAsync(snapshot, renamedSchema, updatedPartitions, cancellationToken)
             .ConfigureAwait(false);
@@ -770,7 +770,7 @@ internal sealed class DeltaTableWriter
         // dangling-CHECK brick #601/#598 guard on the write door, on the ALTER DROP door (Delta's
         // DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE).
         var droppedSchema = new StructType(fields);
-        EnsureNoDependentConstraints(snapshot, droppedSchema, constraintEnforcer);
+        EnsureNoDependentConstraints(snapshot, droppedSchema, constraintEnforcer, "ALTER TABLE DROP COLUMN");
 
         return await CommitSchemaChangeAsync(snapshot, droppedSchema, partitionColumns: null, cancellationToken)
             .ConfigureAwait(false);
@@ -912,29 +912,50 @@ internal sealed class DeltaTableWriter
     // when a surviving named CHECK constraint still depends on the removed/renamed column — the same
     // dangling-CHECK brick the write door guards on overwriteSchema (#601/#598), on the ALTER door. The
     // resolvability check is row-count-independent (it runs the enforcer's resolve pass over the constraint SET
-    // against the post-ALTER schema with NO batches), so a dangling CHECK is rejected with Delta's
-    // DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE before any metaData action is committed. Only NAMED CHECK
-    // constraints are considered (includeSnapshotInvariants: false): a field invariant travels with its own
-    // field, so a dropped field's invariant legitimately disappears and must not be reported as a dependency.
-    // When no enforcer is supplied (the constraint frontend lives in the query engine, not storage — see
-    // IWriteConstraintEnforcer), the guard is skipped: a caller that omits it accepts the pre-#616 behavior,
-    // exactly as the write door refuses fail-closed only when an enforcer is wired.
+    // against the post-ALTER schema with NO batches — EnforceCore always runs Phase-1 resolution regardless of
+    // batch count), so a dangling CHECK is rejected with Delta's DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE before
+    // any metaData action is committed. The rejection is re-labelled with the ALTER <paramref name="operation"/>
+    // (the enforcer defaults the message to "overwriteSchema replacement", its write-door caller).
+    //
+    // Snapshot field invariants are excluded (includeSnapshotInvariants: false) — a field invariant travels
+    // with its own field, so a dropped field's invariant legitimately disappears; a SURVIVING field's invariant
+    // is still collected from the post-ALTER schema. Only a table's active named CHECKs (delta.constraints.*) can
+    // dangle across a column change.
+    //
+    // Mirroring the write door's anti-bypass net: when the table HAS active constraints but NO enforcer is
+    // supplied (the constraint frontend lives in the query engine, not storage — see IWriteConstraintEnforcer),
+    // the ALTER is refused fail-closed rather than silently committing a potential brick. An unconstrained table
+    // (no active constraints) needs no enforcer and proceeds. (The real dangling-CHECK resolution is covered by
+    // DeltaSinkNestedDropReclassificationTests — the identical null-priorSchema Phase-1 path — and the
+    // AlterColumnDependentCheckEndToEndTests real-enforcer ALTER regressions.)
     private static void EnsureNoDependentConstraints(
-        Snapshot snapshot, StructType postAlterSchema, IWriteConstraintEnforcer? constraintEnforcer)
+        Snapshot snapshot, StructType postAlterSchema, IWriteConstraintEnforcer? constraintEnforcer, string operation)
     {
-        if (constraintEnforcer is null)
-        {
-            return;
-        }
-
         IReadOnlyList<DeltaTableConstraint> constraints =
             DeltaTableConstraints.CollectForWrite(snapshot, postAlterSchema, includeSnapshotInvariants: false);
         if (constraints.Count == 0)
         {
-            return;
+            return; // an unconstrained table can never dangle a CHECK across a column change
         }
 
-        constraintEnforcer.Enforce(postAlterSchema, constraints, Array.Empty<ColumnBatch>());
+        if (constraintEnforcer is null)
+        {
+            throw new InvalidOperationException(
+                $"This {operation} targets a table with {constraints.Count} active constraint(s) but no "
+                + "constraint enforcer was supplied; the ALTER is refused fail-closed rather than risking a "
+                + "dangling-CHECK brick. Thread an IWriteConstraintEnforcer (as the write door does).");
+        }
+
+        try
+        {
+            constraintEnforcer.Enforce(postAlterSchema, constraints, Array.Empty<ColumnBatch>());
+        }
+        catch (DeltaConstraintDependentColumnException ex)
+        {
+            // The enforcer names the offending column + dependent CHECKs, but its default message says
+            // "overwriteSchema replacement" (its write-door caller). Re-raise with the ALTER operation label.
+            throw DeltaConstraintDependentColumnException.ForColumnChange(ex.ColumnName, ex.Constraints, operation);
+        }
     }
 
     private Task<DeltaCommitResult> CommitSchemaChangeAsync(

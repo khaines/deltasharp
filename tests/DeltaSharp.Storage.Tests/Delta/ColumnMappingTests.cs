@@ -215,9 +215,11 @@ public sealed class ColumnMappingTests : IDisposable
     // removed/renamed column (the dangling-CHECK brick #601/#598 guard, on the ALTER door). These tests use a
     // fake IWriteConstraintEnforcer to prove the WIRING — the ALTER door collects the surviving CHECK, runs the
     // enforcer's resolve pass over the constraint SET against the POST-ALTER schema with NO batches, and
-    // propagates the rejection before any commit. The enforcer's real dangling-CHECK resolution is covered
-    // end-to-end (identical Phase-1) by DeltaConstraintEnforcementTests.OverwriteSchema_DroppingColumn* on the
-    // write door.
+    // propagates the rejection before any commit; and, mirroring the write door's anti-bypass net, refuses
+    // fail-closed when constraints exist but no enforcer is wired. The enforcer's REAL dangling-CHECK resolution
+    // (real DeltaLocalSink through the ALTER door) is proven by
+    // AlterColumnDependentCheckEndToEndTests (Executor), and the identical null-priorSchema Phase-1 by
+    // DeltaSinkNestedDropReclassificationTests.
 
     [Fact]
     public async Task DropColumn_DependentCheck_EnforcerRejectsFailClosed_NoCommit()
@@ -263,6 +265,26 @@ public sealed class ColumnMappingTests : IDisposable
     }
 
     [Fact]
+    public async Task DropColumn_SurvivingUnrelatedCheck_EnforcerAccepts_Commits()
+    {
+        // Happy path: a CHECK on a SURVIVING column (`id`, not the dropped `score`) resolves clean, so the guard
+        // RUNS (Calls==1) but does not block — the DROP commits. Proves the guard is non-blocking on a clean
+        // resolve (not merely skipped when there are zero constraints).
+        await CreateNameMappedAsync((1L, 100L, "alice"));
+        AddCheckConstraintAtV1("id_positive", "id > 0"); // references `id`, which SURVIVES the drop of `score`
+
+        using var backend = new LocalFileSystemBackend(_root);
+        var writer = new DeltaTableWriter(backend);
+        var enforcer = new RecordingConstraintEnforcer(); // reject: false — resolves clean
+
+        DeltaCommitResult drop = await writer.DropColumnAsync("score", enforcer);
+
+        Assert.Equal(1, enforcer.Calls); // the resolvability pass ran over the surviving CHECK
+        Assert.Equal("id_positive", Assert.Single(enforcer.Constraints!).Name);
+        Assert.Equal(2L, drop.Version); // committed — the CHECK on `id` still resolves against the post-drop schema
+    }
+
+    [Fact]
     public async Task DropColumn_NoConstraints_EnforcerNotInvoked_Commits()
     {
         await CreateNameMappedAsync((1L, 100L, "alice")); // no CHECK constraints
@@ -278,19 +300,21 @@ public sealed class ColumnMappingTests : IDisposable
     }
 
     [Fact]
-    public async Task DropColumn_NullEnforcer_SkipsGuard_Commits()
+    public async Task DropColumn_NullEnforcer_WithConstraints_RefusedFailClosed()
     {
-        // Backward compatible: with NO enforcer wired (the pre-#616 call shape), the ALTER door does not run the
-        // resolvability guard — mirroring the write door, which refuses fail-closed only when an enforcer is
-        // supplied. A future ALTER DDL path threads the enforcer to activate the guard.
+        // Anti-bypass net (mirrors the write door, which throws when constraints exist and no enforcer is wired):
+        // a table WITH active constraints but NO enforcer supplied is refused fail-closed rather than silently
+        // committing a potential dangling-CHECK brick. (An unconstrained table needs no enforcer — see
+        // DropColumn_IsMetadataOnly_* / RenameColumn_IsMetadataOnly_*, which drop/rename with no enforcer.)
         await CreateNameMappedAsync((1L, 100L, "alice"));
         AddCheckConstraintAtV1("score_positive", "score > 0");
 
         using var backend = new LocalFileSystemBackend(_root);
         var writer = new DeltaTableWriter(backend);
 
-        DeltaCommitResult drop = await writer.DropColumnAsync("score", constraintEnforcer: null);
-        Assert.Equal(2L, drop.Version); // committed (guard skipped); the pre-#616 behavior
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => writer.DropColumnAsync("score", constraintEnforcer: null));
+        Assert.Equal(1L, (await new DeltaLog(backend).LoadSnapshotAsync(version: null)).Version); // no drop committed
     }
 
     // Adds a named CHECK constraint to the freshly-created (v0) table as a v1 metadata-only commit (mirrors the
