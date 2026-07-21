@@ -267,7 +267,11 @@ internal sealed class DeltaTableWriter
         ValidateStagedWriteSchema(plan.PhysicalWriteSchema, plan.PhysicalPartitionColumns, files);
         ValidatePartitionCoverage(files, plan.PhysicalPartitionColumns);
 
-        var actions = new List<DeltaAction>((plan.SchemaChange is null ? 0 : 1) + files.Count);
+        var actions = new List<DeltaAction>(1 + (plan.SchemaChange is null ? 0 : 1) + files.Count)
+        {
+            DeltaCommitInfo.Write(
+                overwrite: false, LogicalPartitions(readSnapshot.Metadata.PartitionColumns), isBlindAppend: true),
+        };
         if (plan.SchemaChange is not null)
         {
             actions.Add(plan.SchemaChange);
@@ -655,7 +659,12 @@ internal sealed class DeltaTableWriter
             Configuration: configuration,
             CreatedTime: createdTime);
 
-        var actions = new List<DeltaAction>(2 + files.Count) { protocol, metadata };
+        var actions = new List<DeltaAction>(3 + files.Count)
+        {
+            DeltaCommitInfo.CreateTable(metadataPartitionColumns),
+            protocol,
+            metadata,
+        };
         AppendAddActions(actions, files);
         return _committer.CommitAsync(EmptySnapshot(), actions, DeltaReadScope.BlindAppend, cancellationToken);
     }
@@ -1035,8 +1044,14 @@ internal sealed class DeltaTableWriter
         CancellationToken cancellationToken)
     {
         long deletionTimestamp = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
+        ImmutableArray<string> effectivePartitions =
+            (metaDataToCommit ?? readSnapshot.Metadata).PartitionColumns;
         var actions = new List<DeltaAction>(
-            (metaDataToCommit is null ? 0 : 1) + readSnapshot.ActiveFiles.Length + files.Count);
+            1 + (metaDataToCommit is null ? 0 : 1) + readSnapshot.ActiveFiles.Length + files.Count)
+        {
+            // A full overwrite commits under WholeTable (it depends on the entire active set) — never blind.
+            DeltaCommitInfo.Write(overwrite: true, LogicalPartitions(effectivePartitions), isBlindAppend: false),
+        };
         if (metaDataToCommit is not null)
         {
             actions.Add(metaDataToCommit);
@@ -1243,8 +1258,18 @@ internal sealed class DeltaTableWriter
         }
 
         long deletionTimestamp = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
+        ImmutableArray<string> effectivePartitions =
+            (schemaEvolution ?? readSnapshot.Metadata).PartitionColumns;
         var actions = new List<DeltaAction>(
-            (schemaEvolution is null ? 0 : 1) + priorInTouched.Count + files.Count);
+            1 + (schemaEvolution is null ? 0 : 1) + priorInTouched.Count + files.Count)
+        {
+            // A dynamic overwrite that touches NO prior files commits under BlindAppend (nothing to remove);
+            // otherwise it removes the touched-partition priors under a ReadFiles scope — not blind.
+            DeltaCommitInfo.Write(
+                overwrite: true,
+                LogicalPartitions(effectivePartitions),
+                isBlindAppend: priorInTouched.Count == 0),
+        };
         if (schemaEvolution is not null)
         {
             actions.Add(schemaEvolution);
@@ -1266,6 +1291,11 @@ internal sealed class DeltaTableWriter
 
         return _committer.CommitAsync(readSnapshot, actions, scope, cancellationToken);
     }
+
+    // The LOGICAL partition-column names to record in commitInfo.operationParameters.partitionBy (what
+    // DESCRIBE HISTORY surfaces). A default/uninitialized array coerces to an empty list ([]).
+    private static IReadOnlyList<string> LogicalPartitions(ImmutableArray<string> columns) =>
+        columns.IsDefault ? Array.Empty<string>() : columns;
 
     private static void AppendAddActions(List<DeltaAction> actions, IReadOnlyList<StagedDataFile> files)
     {

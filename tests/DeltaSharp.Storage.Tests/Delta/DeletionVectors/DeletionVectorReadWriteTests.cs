@@ -51,6 +51,32 @@ public sealed class DeletionVectorReadWriteTests : IDisposable
     // ------------------------------------------------------------------ AC1 + AC2: DELETE round-trip
 
     [Fact]
+    public async Task Delete_WritesDeleteCommitInfo()
+    {
+        // #510: a DELETE records operation="DELETE" in commitInfo (interop/parity for DESCRIBE HISTORY),
+        // alongside the engine-stamped txnId/engineInfo/timestamp. The injected clock pins the timestamp.
+        await CreateDeletionVectorTableAsync(Batch((1, "a"), (2, "b"), (3, "c")));
+
+        var instant = new DateTimeOffset(2032, 6, 7, 8, 9, 10, TimeSpan.Zero);
+        var backend = new LocalFileSystemBackend(_root);
+        DeleteResult result = await NewDelete(backend, "delete-commitinfo", new FixedTimeProvider(instant))
+            .DeleteAsync(WhereId(id => id == 2));
+
+        IReadOnlyList<DeltaAction> committed =
+            await new DeltaLog(backend).ReadCommitActionsAsync(result.CommittedVersion!.Value, CancellationToken.None);
+        CommitInfoAction commitInfo = committed.OfType<CommitInfoAction>().Single();
+        Assert.Equal("DELETE", commitInfo.Operation);
+        Assert.Equal(instant.ToUnixTimeMilliseconds(), commitInfo.Timestamp);
+        Assert.StartsWith("DeltaSharp/", commitInfo.EngineInfo);
+        Assert.True(commitInfo.Entries.ContainsKey("txnId"));
+    }
+
+    private sealed class FixedTimeProvider(DateTimeOffset now) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => now;
+    }
+
+    [Fact]
     public async Task Delete_ExcludesDeletedRows_WithoutRewritingTheDataFile()
     {
         await CreateDeletionVectorTableAsync(
@@ -378,8 +404,10 @@ public sealed class DeletionVectorReadWriteTests : IDisposable
 
     // ------------------------------------------------------------------ helpers
 
-    private static DeltaDelete NewDelete(LocalFileSystemBackend backend, string idSeed) =>
-        new(backend, new DeltaLog(backend), new DeltaCommitter(backend),
+    private static DeltaDelete NewDelete(
+        LocalFileSystemBackend backend, string idSeed, TimeProvider? timeProvider = null) =>
+        // committer omitted → built from the injected timeProvider so commitInfo.timestamp is pinned (#510).
+        new(backend, new DeltaLog(backend), timeProvider: timeProvider,
             idSource: new SeededDeletionVectorIdSource(idSeed));
 
     private async Task RewriteWithRowGroupsAsync(string relativePath, int rowGroupRowLimit, ColumnBatch batch)

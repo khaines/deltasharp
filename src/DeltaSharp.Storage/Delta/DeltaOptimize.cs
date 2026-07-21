@@ -233,19 +233,21 @@ internal sealed class DeltaOptimize
     /// <summary>Creates an OPTIMIZE over <paramref name="backend"/> (rooted at the Delta table directory),
     /// constructing its own log reader + committer and using the system clock.</summary>
     public DeltaOptimize(IStorageBackend backend)
-        : this(backend, new DeltaLog(backend), new DeltaCommitter(backend))
+        : this(backend, new DeltaLog(backend))
     {
     }
 
-    /// <summary>Creates an OPTIMIZE over an explicit reader + committer (tests inject a committer with a
-    /// race probe, a deterministic clock for tombstone/modification timestamps, and a deterministic
+    /// <summary>Creates an OPTIMIZE over an explicit reader + optional committer (tests inject a committer
+    /// with a race probe, a deterministic clock for tombstone/modification timestamps, and a deterministic
     /// compacted-file name factory so output paths are predictable), plus an optional injected
     /// <paramref name="logger"/> / <paramref name="telemetry"/> so a test can subscribe to the OPTIMIZE
-    /// span and metrics in isolation (mirroring <see cref="DeltaVacuum"/>).</summary>
+    /// span and metrics in isolation (mirroring <see cref="DeltaVacuum"/>). When <paramref name="committer"/>
+    /// is null the committer is built from <paramref name="timeProvider"/> so the injected clock also drives
+    /// <c>commitInfo.timestamp</c> (#510).</summary>
     internal DeltaOptimize(
         IStorageBackend backend,
         DeltaLog log,
-        DeltaCommitter committer,
+        DeltaCommitter? committer = null,
         TimeProvider? timeProvider = null,
         StatisticsPolicy? statisticsPolicy = null,
         ParquetFileReader? reader = null,
@@ -256,11 +258,11 @@ internal sealed class DeltaOptimize
     {
         ArgumentNullException.ThrowIfNull(backend);
         ArgumentNullException.ThrowIfNull(log);
-        ArgumentNullException.ThrowIfNull(committer);
         _backend = backend;
         _log = log;
-        _committer = committer;
+        // Assign the clock BEFORE building a default committer so both share the injected TimeProvider.
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _committer = committer ?? new DeltaCommitter(backend, _timeProvider);
         _statisticsPolicy = statisticsPolicy ?? StatisticsPolicy.Default;
         _reader = reader ?? new ParquetFileReader();
         _writer = writer ?? new ParquetFileWriter();
@@ -492,6 +494,9 @@ internal sealed class DeltaOptimize
 
         // AC1 + AC2: ONE commit removing every compacted input and adding every compacted output, both
         // dataChange=false, scoped to exactly the input paths so a concurrent change to an input aborts.
+        // Prepend the OPTIMIZE provenance so DESCRIBE HISTORY records operation="OPTIMIZE" (operationMetrics
+        // is deferred to #506; the committer stamps timestamp/engineInfo/txnId).
+        actions.Insert(0, DeltaCommitInfo.Optimize());
         DeltaCommitResult commit = await _committer.CommitAsync(
             readSnapshot, actions, DeltaReadScope.ReadFiles(inputPaths), cancellationToken).ConfigureAwait(false);
 

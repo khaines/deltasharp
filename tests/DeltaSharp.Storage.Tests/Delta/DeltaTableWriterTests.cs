@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Text.Json;
 using DeltaSharp.Storage;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
@@ -86,6 +87,31 @@ public sealed class DeltaTableWriterTests : IDisposable
 
     private static string[] ActivePaths(Snapshot snapshot) =>
         snapshot.ActiveFiles.Select(a => a.Path).OrderBy(p => p, StringComparer.Ordinal).ToArray();
+
+    // Reads the RAW on-disk commitInfo.operationParameters.isBlindAppend value for a version (a JSON string
+    // "true"/"false" per Delta's Map<String,String> shape), so a test can assert the exact recorded flag
+    // rather than an in-memory proxy — the coverage the #510 red-team H2 gate requires.
+    private async Task<string> ReadIsBlindAppendAsync(long version)
+    {
+        string path = Path.Combine(_root, "_delta_log", version.ToString("D20") + ".json");
+        foreach (string line in await File.ReadAllLinesAsync(path))
+        {
+            if (line.Length == 0)
+            {
+                continue;
+            }
+
+            using JsonDocument doc = JsonDocument.Parse(line);
+            if (doc.RootElement.TryGetProperty("commitInfo", out JsonElement commitInfo)
+                && commitInfo.TryGetProperty("operationParameters", out JsonElement parameters)
+                && parameters.TryGetProperty("isBlindAppend", out JsonElement isBlindAppend))
+            {
+                return isBlindAppend.GetString()!;
+            }
+        }
+
+        throw new InvalidOperationException($"No commitInfo.operationParameters.isBlindAppend in version {version}.");
+    }
 
     // ---------------------------------------------------------------- AC1: append
 
@@ -219,6 +245,35 @@ public sealed class DeltaTableWriterTests : IDisposable
             PartitionOverwriteMode.Dynamic);
 
         Assert.Equal(new[] { "eu1.parquet", "us2.parquet" }, ActivePaths(await LoadAsync()));
+    }
+
+    [Fact]
+    public async Task DynamicPartitionOverwrite_IsBlindAppend_ReflectsWhetherPriorFilesAreRemoved()
+    {
+        // #510 H2: the dynamic-overwrite `isBlindAppend` operationParameter must track whether the commit
+        // actually removes prior files. Seed region-partitioned (v0) and populate US + EU (v1).
+        await SeedTableAsync(partitionColumns: new[] { "region" });
+        await Writer().AppendAsync(TableSchema, new[]
+        {
+            Staged("us1.parquet", Partition(("region", "US"))),
+            Staged("eu1.parquet", Partition(("region", "EU"))),
+        });
+
+        // Overwriting region=US REMOVES its prior file → this commit is NOT a blind append.
+        DeltaCommitResult replacing = await Writer().OverwriteAsync(
+            TableSchema,
+            new[] { Staged("us2.parquet", Partition(("region", "US"))) },
+            PartitionOverwriteMode.Dynamic);
+        Assert.Equal("false", await ReadIsBlindAppendAsync(replacing.Version));
+
+        // Overwriting a BRAND-NEW partition (region=AP) removes nothing → this commit IS a blind append.
+        // (Inverting the writer's `priorInTouched.Count == 0` guard to `!= 0` swaps both assertions and
+        // fails this test — the mutation-killing coverage the H2 gate requires.)
+        DeltaCommitResult blind = await Writer().OverwriteAsync(
+            TableSchema,
+            new[] { Staged("ap1.parquet", Partition(("region", "AP"))) },
+            PartitionOverwriteMode.Dynamic);
+        Assert.Equal("true", await ReadIsBlindAppendAsync(blind.Version));
     }
 
     [Fact]
