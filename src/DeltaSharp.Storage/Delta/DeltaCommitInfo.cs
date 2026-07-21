@@ -76,9 +76,31 @@ internal static class DeltaCommitInfo
 
     /// <summary>Provenance for an OPTIMIZE: <c>operation="OPTIMIZE"</c> with an empty <c>predicate</c> — a
     /// double-encoded JSON-string token whose content is the empty array (<c>"[]"</c>), matching delta-spark's
-    /// whole-table compaction. <c>operationMetrics</c> is deliberately NOT added here (deferred to #506).</summary>
-    internal static CommitInfoAction Optimize() =>
-        WithOperation(OptimizeOperation, Parameters(("predicate", JsonEncodedArray(Array.Empty<string>()))));
+    /// whole-table compaction — plus the OPTIMIZE <c>operationMetrics</c> (#506).
+    ///
+    /// <para><b>Metric keys (delta-spark <c>DeltaOperationMetrics.OPTIMIZE</c> parity).</b> Verified against
+    /// delta-io/delta master: the canonical file/byte metric keys are <c>numAddedFiles</c>,
+    /// <c>numRemovedFiles</c>, <c>numAddedBytes</c>, and <c>numRemovedBytes</c> (NOT the
+    /// <c>numFilesAdded</c>/<c>numFilesRemoved</c> spelling). <c>numRows</c> is a DeltaSharp observability
+    /// extension — delta-spark's OPTIMIZE metric set does not include it, but readers ignore unknown metric
+    /// keys (commitInfo is not load-bearing), so emitting the measured rewritten row count is safe and
+    /// useful. File-size percentiles / deletion-vector metrics delta also emits are omitted (not tracked).</para>
+    ///
+    /// <para><b>Value encoding.</b> operationMetrics is a Delta <c>Map&lt;String,String&gt;</c>, so each
+    /// value is a JSON <b>string</b> — a numeric metric is encoded as a quoted number-string via
+    /// <see cref="JsonNumberString"/> (e.g. <c>3</c> ⇒ <c>"3"</c>), NOT a bare JSON number.</para></summary>
+    internal static CommitInfoAction Optimize(
+        long numAddedFiles, long numRemovedFiles, long numAddedBytes, long numRemovedBytes, long numRows) =>
+        new(
+            ImmutableSortedDictionary<string, string>.Empty.WithComparers(StringComparer.Ordinal),
+            Operation: OptimizeOperation,
+            OperationParameters: Parameters(("predicate", JsonEncodedArray(Array.Empty<string>()))),
+            OperationMetrics: Parameters(
+                ("numAddedFiles", JsonNumberString(numAddedFiles)),
+                ("numRemovedFiles", JsonNumberString(numRemovedFiles)),
+                ("numAddedBytes", JsonNumberString(numAddedBytes)),
+                ("numRemovedBytes", JsonNumberString(numRemovedBytes)),
+                ("numRows", JsonNumberString(numRows))));
 
     private static CommitInfoAction WithOperation(
         string operation, ImmutableSortedDictionary<string, string> parameters) =>
@@ -143,4 +165,10 @@ internal static class DeltaCommitInfo
     /// boolean literal, e.g. <c>true</c> ⇒ <c>"true"</c> — the double-encoded shape delta-spark uses for a
     /// boolean operationParameter (still a <c>Map&lt;String,String&gt;</c> value).</summary>
     internal static string JsonBoolString(bool value) => JsonString(value ? "true" : "false");
+
+    /// <summary>Encodes <paramref name="value"/> as a JSON <b>string</b> token whose content is the invariant
+    /// decimal number, e.g. <c>3</c> ⇒ <c>"3"</c> — the shape delta-spark uses for an operationMetrics value
+    /// (a <c>Map&lt;String,String&gt;</c>, so a quoted number-string, never a bare JSON number).</summary>
+    internal static string JsonNumberString(long value) =>
+        JsonString(value.ToString(System.Globalization.CultureInfo.InvariantCulture));
 }
