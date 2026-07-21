@@ -213,6 +213,38 @@ public sealed class DeltaTableWriterTests : IDisposable
     }
 
     [Fact]
+    public async Task FullOverwrite_CarriesTombstonedFileTags_FromExternalEngine_Issue491()
+    {
+        // A file authored by an EXTERNAL engine (delta-spark) carries add.tags (e.g. INSERTION_TIME/ZCUBE_ID).
+        // When an OVERWRITE tombstones it, the emitted remove must INHERIT those tags — delta-spark's
+        // AddFile.removeWithTimestamp carries `tags = tags`. Hardcoding NoTags would silently drop the
+        // external metadata and break the extendedFileMetadata checkpoint-fidelity #491 upholds.
+        await SeedTableAsync();
+        Snapshot seeded = await LoadAsync();
+        var tags = ExternalTags(("INSERTION_TIME", "1700000000000"), ("ZCUBE_ID", "z1"));
+        await new DeltaCommitter(_backend).CommitAsync(
+            seeded, new DeltaAction[] { ExternalAdd("ext.parquet", tags) }, DeltaReadScope.BlindAppend);
+
+        DeltaCommitResult result = await Writer().OverwriteAsync(TableSchema, new[] { Staged("new.parquet") });
+
+        IReadOnlyList<DeltaAction> committed = await Log().ReadCommitActionsAsync(result.Version, CancellationToken.None);
+        RemoveFileAction remove = Assert.Single(committed.OfType<RemoveFileAction>());
+        Assert.Equal("ext.parquet", remove.Path);
+        Assert.Equal("1700000000000", remove.Tags["INSERTION_TIME"]);
+        Assert.Equal("z1", remove.Tags["ZCUBE_ID"]);
+    }
+
+    // An AddFileAction modelling a file authored by an EXTERNAL engine that carries tags. Overwrite tombstones
+    // it without reading it, so no backing Parquet bytes are needed.
+    private static AddFileAction ExternalAdd(string path, ImmutableSortedDictionary<string, string> tags) =>
+        new(path, NoPartition, Size: 1L, ModificationTime: 1L, DataChange: true, Stats: null, tags);
+
+    private static ImmutableSortedDictionary<string, string> ExternalTags(params (string Key, string Value)[] entries) =>
+        ImmutableSortedDictionary.CreateRange(
+            StringComparer.Ordinal,
+            entries.Select(e => new KeyValuePair<string, string>(e.Key, e.Value)));
+
+    [Fact]
     public async Task FullOverwrite_AbortsOnConcurrentAppend()
     {
         // AC2 isolation: a full overwrite depends on the whole active set, so a concurrent append aborts it.

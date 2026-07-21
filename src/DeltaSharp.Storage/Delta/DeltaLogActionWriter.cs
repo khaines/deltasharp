@@ -171,21 +171,30 @@ internal static class DeltaLogActionWriter
         writer.WriteBoolean("dataChange", remove.DataChange);
         writer.WriteBoolean("extendedFileMetadata", remove.ExtendedFileMetadata);
 
-        // When extendedFileMetadata is true the extended fields (size/partitionValues) are
-        // being emitted, so always write partitionValues — mirroring the add action, an empty
-        // map serializes as {}. Strict cross-engine readers require partitionValues:{} for an
-        // unpartitioned file rather than an omitted key. A bare tombstone
-        // (extendedFileMetadata:false) still omits an empty map.
-        if (remove.ExtendedFileMetadata || !remove.PartitionValues.IsEmpty)
+        // Delta's remove with extendedFileMetadata:true carries the extended trio — partitionValues +
+        // size + tags — so all three are gated together on ExtendedFileMetadata (mirroring the add action).
+        // An empty partitionValues/tags map serializes as {} rather than an omitted key, which strict
+        // cross-engine readers (delta-standalone/-rs/-spark) require for an unpartitioned/untagged file. A
+        // bare tombstone (extendedFileMetadata:false) omits all three. The Delta contract implies size is
+        // present under extendedFileMetadata, so a hand-built extended remove SHOULD supply Size — when it
+        // is null we omit the key rather than fabricate a value.
+        if (remove.ExtendedFileMetadata)
         {
             writer.WriteStartObject("partitionValues");
             WriteNullableStringMapEntries(writer, remove.PartitionValues);
             writer.WriteEndObject();
-        }
 
-        if (remove.Size is { } size)
-        {
-            writer.WriteNumber("size", size);
+            if (remove.Size is { } size)
+            {
+                writer.WriteNumber("size", size);
+            }
+
+            // Unlike add.tags (WriteStringMapIfAny, which omits an empty map), remove emits tags:{}
+            // unconditionally under ExtendedFileMetadata — intentionally symmetric with the #511
+            // partitionValues:{} decision so strict cross-engine readers see the complete extended trio.
+            writer.WriteStartObject("tags");
+            WriteStringMapEntries(writer, remove.Tags);
+            writer.WriteEndObject();
         }
 
         remove.DeletionVector?.Write(writer);

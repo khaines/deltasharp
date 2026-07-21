@@ -52,6 +52,7 @@ public sealed class DeltaLogActionReaderTests
         Assert.False(remove.DataChange);
         Assert.True(remove.ExtendedFileMetadata);
         Assert.Equal(512L, remove.Size);
+        Assert.Empty(remove.Tags); // no "tags" key present → reader resolves to an empty map (issue #491)
 
         var txn = Assert.IsType<TxnAction>(actions[5]);
         Assert.Equal("stream-a", txn.AppId);

@@ -205,6 +205,7 @@ internal static class DeltaLogActionReader
             GetOptionalBool(body, "extendedFileMetadata", "remove", version, line) ?? false,
             GetNullableStringMap(body, "partitionValues", "remove", version, line),
             GetOptionalInt64(body, "size", "remove", version, line),
+            GetStringMap(body, "tags", "remove", version, line),
             DeletionVectors.DeletionVectorDescriptor.Parse(body, "remove", version, line));
     }
 

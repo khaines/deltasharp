@@ -53,7 +53,7 @@ public sealed class AppendOnlyEnforcementTests : IDisposable
         new(path, NoPartition, 1L, 1L, dataChange, Stats: null, Tags: NoTags);
 
     private static RemoveFileAction Remove(string path, bool dataChange) =>
-        new(path, DeletionTimestamp: 1L, dataChange, ExtendedFileMetadata: false, NoPartition, Size: null);
+        new(path, DeletionTimestamp: 1L, dataChange, ExtendedFileMetadata: false, NoPartition, Size: null, NoTags);
 
     private Task<Snapshot> LoadAsync(long? version = null) => new DeltaLog(_backend).LoadSnapshotAsync(version);
 

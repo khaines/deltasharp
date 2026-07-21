@@ -531,7 +531,7 @@ public sealed class DeltaCommitTelemetryTests : IDisposable
         using var activities = new ActivityCapture(telemetry.DeltaActivitySource);
 
         var remove = new RemoveFileAction(
-            "seed.parquet", DeletionTimestamp: 1L, DataChange: true, ExtendedFileMetadata: false, NoPartition, Size: null);
+            "seed.parquet", DeletionTimestamp: 1L, DataChange: true, ExtendedFileMetadata: false, NoPartition, Size: null, NoTags);
         await Assert.ThrowsAsync<DeltaProtocolException>(() =>
             Committer(_backend, logger, telemetry)
                 .CommitAsync(snapshot, new DeltaAction[] { remove }, DeltaReadScope.WholeTable));

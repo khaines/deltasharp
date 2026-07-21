@@ -1312,8 +1312,11 @@ internal sealed class DeltaTableWriter
         }
     }
 
-    // Tombstone a prior active file. ExtendedFileMetadata=true round-trips partitionValues/size so the
-    // remove survives checkpoint reconstruction with full fidelity (design §2.10.1).
+    // Tombstone a prior active file. ExtendedFileMetadata=true round-trips the extended trio
+    // (partitionValues/size/tags) so the remove survives checkpoint reconstruction with full fidelity
+    // (design §2.10.1). The tombstone inherits the tombstoned add's tags (delta-spark
+    // AddFile.removeWithTimestamp carries tags = tags), so tags authored by an external engine
+    // (e.g. INSERTION_TIME/ZCUBE_ID) survive an OVERWRITE.
     private static RemoveFileAction ToRemove(AddFileAction add, long deletionTimestamp) =>
         new(
             add.Path,
@@ -1321,7 +1324,8 @@ internal sealed class DeltaTableWriter
             DataChange: true,
             ExtendedFileMetadata: true,
             add.PartitionValues,
-            add.Size);
+            add.Size,
+            add.Tags);
 
     // Fail-closed precondition: a partitioned write must specify a value (possibly null) for EVERY partition
     // column of each staged file, so the add lands in a well-formed partition and the exact-key remove

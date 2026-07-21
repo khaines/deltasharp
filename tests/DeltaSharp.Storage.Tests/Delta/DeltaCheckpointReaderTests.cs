@@ -25,7 +25,7 @@ public sealed class DeltaCheckpointReaderTests
                 modificationTime: 1717171717,
                 dataChange: false,
                 tags: [("ENGINE", "deltasharp")])
-            .Remove("part-old.parquet", deletionTimestamp: 123, size: 50)
+            .Remove("part-old.parquet", deletionTimestamp: 123, size: 50, tags: [("ZCUBE_ID", "z1")])
             .Txn("app-1", version: 7, lastUpdated: 999)
             .ToParquetAsync();
 
@@ -59,6 +59,7 @@ public sealed class DeltaCheckpointReaderTests
         Assert.Equal("part-old.parquet", remove.Path);
         Assert.Equal(123, remove.DeletionTimestamp);
         Assert.Equal(50, remove.Size);
+        Assert.Equal("z1", remove.Tags["ZCUBE_ID"]);
 
         TxnAction txn = Assert.Single(actions.OfType<TxnAction>());
         Assert.Equal("app-1", txn.AppId);
@@ -81,6 +82,45 @@ public sealed class DeltaCheckpointReaderTests
         Assert.Empty(add.PartitionValues);
         Assert.Empty(add.Tags);
         Assert.Null(add.Stats);
+    }
+
+    [Fact]
+    public async Task Reads_RemoveTags_FromCheckpoint()
+    {
+        // A remove authored by an external engine carries tags (e.g. INSERTION_TIME/ZCUBE_ID); the reader's
+        // remove.tags binding must decode them from the checkpoint's remove struct (issue #491).
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(1, 2)
+            .Metadata("t", EmptySchema)
+            .Remove(
+                "part-old.parquet",
+                deletionTimestamp: 123,
+                extendedFileMetadata: true,
+                size: 50,
+                tags: [("INSERTION_TIME", "1700000000000"), ("ZCUBE_ID", "abc")])
+            .ToParquetAsync();
+
+        IReadOnlyList<DeltaAction> actions = await DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default);
+
+        RemoveFileAction remove = Assert.Single(actions.OfType<RemoveFileAction>());
+        Assert.Equal("1700000000000", remove.Tags["INSERTION_TIME"]);
+        Assert.Equal("abc", remove.Tags["ZCUBE_ID"]);
+    }
+
+    [Fact]
+    public async Task Reads_EmptyRemoveTags_AsEmptyMap()
+    {
+        // A remove with no tags round-trips to an empty map (not null), like the add path.
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(1, 2)
+            .Metadata("t", EmptySchema)
+            .Remove("part-old.parquet", deletionTimestamp: 123, size: 50) // no tags → empty map
+            .ToParquetAsync();
+
+        IReadOnlyList<DeltaAction> actions = await DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default);
+
+        RemoveFileAction remove = Assert.Single(actions.OfType<RemoveFileAction>());
+        Assert.Empty(remove.Tags);
     }
 
     [Fact]

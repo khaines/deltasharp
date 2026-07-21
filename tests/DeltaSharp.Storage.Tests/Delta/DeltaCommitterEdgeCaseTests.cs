@@ -45,7 +45,7 @@ public sealed class DeltaCommitterEdgeCaseTests : IDisposable
         new(path, NoPartition, 1L, 1L, DataChange: true, Stats: null, Tags: NoTags);
 
     private static RemoveFileAction Remove(string path) =>
-        new(path, DeletionTimestamp: 1L, DataChange: true, ExtendedFileMetadata: false, NoPartition, Size: null);
+        new(path, DeletionTimestamp: 1L, DataChange: true, ExtendedFileMetadata: false, NoPartition, Size: null, NoTags);
 
     private static ProtocolAction Writer(int minWriter, params string[] writerFeatures) =>
         new(1, minWriter, ImmutableArray<string>.Empty, writerFeatures.ToImmutableArray());

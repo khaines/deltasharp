@@ -430,7 +430,8 @@ internal sealed class DeltaDelete
 
     // Tombstone the prior logical file, carrying its PRIOR deletion vector so the remove's identity key
     // matches the active add's (SnapshotState keys by path + DV uniqueId). dataChange=true (a delete changes
-    // visible data); ExtendedFileMetadata=true round-trips partitionValues/size for checkpoint fidelity.
+    // visible data); ExtendedFileMetadata=true round-trips partitionValues/size/tags (the extended trio,
+    // including the tombstoned add's tags) for checkpoint fidelity.
     private static RemoveFileAction ToRemove(AddFileAction input, long timestamp) =>
         new(
             input.Path,
@@ -439,6 +440,7 @@ internal sealed class DeltaDelete
             ExtendedFileMetadata: true,
             input.PartitionValues,
             input.Size,
+            input.Tags,
             input.DeletionVector);
 
     // The stats for a DV-carrying add: numRecords is the PHYSICAL data-file row count (matching Spark — the

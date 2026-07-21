@@ -70,7 +70,8 @@ public sealed class DeltaLogActionWriterTests
             DataChange: false,
             ExtendedFileMetadata: true,
             NullableStringMap(("dt", "2023")),
-            512L);
+            512L,
+            StringMap(("rk", "rv")));
         var txn = new TxnAction("stream-a", 42L, 1700000003000L);
         // #510: operation/operationParameters/timestamp/engineInfo are now TYPED commitInfo fields (the
         // Delta ecosystem reads them for DESCRIBE HISTORY); an arbitrary extra key stays flat Entries.
@@ -127,6 +128,7 @@ public sealed class DeltaLogActionWriterTests
         Assert.True(parsedRemove.ExtendedFileMetadata);
         Assert.Equal("2023", parsedRemove.PartitionValues["dt"]);
         Assert.Equal(512L, parsedRemove.Size);
+        Assert.Equal("rv", parsedRemove.Tags["rk"]);
 
         var parsedTxn = Assert.IsType<TxnAction>(actions[5]);
         Assert.Equal("stream-a", parsedTxn.AppId);
@@ -357,7 +359,8 @@ public sealed class DeltaLogActionWriterTests
             DataChange: true,
             ExtendedFileMetadata: false,
             ImmutableSortedDictionary<string, string?>.Empty.WithComparers(StringComparer.Ordinal),
-            Size: null);
+            Size: null,
+            StringMap());
         var txn = new TxnAction("app", 5L, LastUpdated: null);
 
         IReadOnlyList<DeltaAction> actions = RoundTrip(metadata, remove, txn);
@@ -390,7 +393,8 @@ public sealed class DeltaLogActionWriterTests
             DataChange: true,
             ExtendedFileMetadata: true,
             ImmutableSortedDictionary<string, string?>.Empty.WithComparers(StringComparer.Ordinal),
-            Size: 128L);
+            Size: 128L,
+            StringMap());
 
         byte[] bytes = DeltaLogActionWriter.SerializeCommit(new DeltaAction[] { remove });
         string text = Encoding.UTF8.GetString(bytes);
@@ -415,7 +419,8 @@ public sealed class DeltaLogActionWriterTests
             DataChange: true,
             ExtendedFileMetadata: true,
             NullableStringMap(("dt", "2023")),
-            Size: 512L);
+            Size: 512L,
+            StringMap());
 
         byte[] bytes = DeltaLogActionWriter.SerializeCommit(new DeltaAction[] { remove });
         string text = Encoding.UTF8.GetString(bytes);
@@ -437,12 +442,112 @@ public sealed class DeltaLogActionWriterTests
             DataChange: true,
             ExtendedFileMetadata: false,
             ImmutableSortedDictionary<string, string?>.Empty.WithComparers(StringComparer.Ordinal),
-            Size: null);
+            Size: null,
+            StringMap());
 
         byte[] bytes = DeltaLogActionWriter.SerializeCommit(new DeltaAction[] { remove });
         string text = Encoding.UTF8.GetString(bytes);
 
         Assert.DoesNotContain("\"partitionValues\"", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void EmitsPopulatedTags_WhenExtendedFileMetadata()
+    {
+        // A remove with extendedFileMetadata:true and non-empty tags emits its populated tags map — Delta's
+        // extended-metadata remove carries the extended trio size+partitionValues+tags (issue #491). Strict
+        // cross-engine readers and tag-bearing interop require the tags key present, and it round-trips.
+        var remove = new RemoveFileAction(
+            "dt=2023/old.parquet",
+            DeletionTimestamp: 1700000000000L,
+            DataChange: true,
+            ExtendedFileMetadata: true,
+            NullableStringMap(("dt", "2023")),
+            Size: 512L,
+            StringMap(("INSERTION_TIME", "1700000000000"), ("ZCUBE_ID", "abc")));
+
+        byte[] bytes = DeltaLogActionWriter.SerializeCommit(new DeltaAction[] { remove });
+        string text = Encoding.UTF8.GetString(bytes);
+
+        // Emitted in Ordinal key order (deterministic serialization).
+        Assert.Contains(
+            "\"tags\":{\"INSERTION_TIME\":\"1700000000000\",\"ZCUBE_ID\":\"abc\"}",
+            text,
+            StringComparison.Ordinal);
+
+        var parsed = Assert.IsType<RemoveFileAction>(Assert.Single(RoundTrip(remove)));
+        Assert.True(parsed.ExtendedFileMetadata);
+        Assert.Equal("1700000000000", parsed.Tags["INSERTION_TIME"]);
+        Assert.Equal("abc", parsed.Tags["ZCUBE_ID"]);
+    }
+
+    [Fact]
+    public void EmitsEmptyTags_WhenExtendedFileMetadataAndUntagged()
+    {
+        // An untagged remove with extendedFileMetadata:true emits tags:{} (an empty object), mirroring the
+        // partitionValues:{} behaviour from #511: under extendedFileMetadata the extended trio's keys are
+        // present, not omitted, so strict cross-engine readers see a complete extended remove (issue #491).
+        var remove = new RemoveFileAction(
+            "gone.parquet",
+            DeletionTimestamp: 1700000000000L,
+            DataChange: true,
+            ExtendedFileMetadata: true,
+            ImmutableSortedDictionary<string, string?>.Empty.WithComparers(StringComparer.Ordinal),
+            Size: 128L,
+            StringMap());
+
+        byte[] bytes = DeltaLogActionWriter.SerializeCommit(new DeltaAction[] { remove });
+        string text = Encoding.UTF8.GetString(bytes);
+
+        Assert.Contains("\"tags\":{}", text, StringComparison.Ordinal);
+
+        var parsed = Assert.IsType<RemoveFileAction>(Assert.Single(RoundTrip(remove)));
+        Assert.Empty(parsed.Tags);
+    }
+
+    [Fact]
+    public void EmitsExtendedTrio_WhenExtendedFileMetadata()
+    {
+        // The extended trio — size + partitionValues + tags — is now consistently gated on
+        // extendedFileMetadata (issue #491 consolidation): an extended remove emits all three keys.
+        var remove = new RemoveFileAction(
+            "dt=2023/old.parquet",
+            DeletionTimestamp: 1700000000000L,
+            DataChange: true,
+            ExtendedFileMetadata: true,
+            NullableStringMap(("dt", "2023")),
+            Size: 512L,
+            StringMap(("rk", "rv")));
+
+        byte[] bytes = DeltaLogActionWriter.SerializeCommit(new DeltaAction[] { remove });
+        string text = Encoding.UTF8.GetString(bytes);
+
+        Assert.Contains("\"partitionValues\":{\"dt\":\"2023\"}", text, StringComparison.Ordinal);
+        Assert.Contains("\"size\":512", text, StringComparison.Ordinal);
+        Assert.Contains("\"tags\":{\"rk\":\"rv\"}", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void OmitsExtendedTrio_WhenBareTombstone()
+    {
+        // A bare tombstone (extendedFileMetadata:false) emits NONE of the extended trio — even a populated
+        // Size or tags map is withheld, because the extended keys are meaningful only under
+        // extendedFileMetadata:true (issue #491 consolidation).
+        var remove = new RemoveFileAction(
+            "gone.parquet",
+            DeletionTimestamp: 1700000000000L,
+            DataChange: true,
+            ExtendedFileMetadata: false,
+            NullableStringMap(("dt", "2023")),
+            Size: 512L,
+            StringMap(("rk", "rv")));
+
+        byte[] bytes = DeltaLogActionWriter.SerializeCommit(new DeltaAction[] { remove });
+        string text = Encoding.UTF8.GetString(bytes);
+
+        Assert.DoesNotContain("\"partitionValues\"", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"size\"", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"tags\"", text, StringComparison.Ordinal);
     }
 
     private sealed record UnknownTestAction : DeltaAction;

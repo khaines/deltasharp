@@ -1453,6 +1453,58 @@ public sealed class DeltaOptimizeTests : IDisposable
         Assert.Equal(ColumnMappingMode.Id, ex.Mode);
     }
 
+    [Fact]
+    public async Task Optimize_CarriesTombstonedFileTags_FromExternalEngine_Issue491()
+    {
+        // A file authored by an EXTERNAL engine (delta-spark) carries add.tags (e.g. INSERTION_TIME/ZCUBE_ID).
+        // When OPTIMIZE compacts it away, the emitted remove tombstone must INHERIT those tags — delta-spark's
+        // AddFile.removeWithTimestamp carries `tags = tags`. Hardcoding NoTags would silently drop the
+        // external metadata and break the extendedFileMetadata checkpoint-fidelity #491 upholds.
+        StagedDataFile a = await WriteDataFileAsync("a.parquet", Batch((1, "a")));
+        StagedDataFile b = await WriteDataFileAsync("b.parquet", Batch((2, "b")));
+        await SeedEmptyAsync(DataSchema);
+
+        var tagsA = Tags(("INSERTION_TIME", "1700000000000"), ("ZCUBE_ID", "za"));
+        var tagsB = Tags(("INSERTION_TIME", "1700000000001"), ("ZCUBE_ID", "zb"));
+        Snapshot seeded = await Log().LoadSnapshotAsync();
+        await new DeltaCommitter(_backend).CommitAsync(
+            seeded,
+            new DeltaAction[] { ExternalAdd(a, tagsA), ExternalAdd(b, tagsB) },
+            DeltaReadScope.BlindAppend);
+
+        OptimizeResult result = await Optimize().OptimizeAsync();
+        Assert.Equal(2, result.FilesRemoved);
+
+        IReadOnlyList<DeltaAction> committed =
+            await Log().ReadCommitActionsAsync(result.CommittedVersion!.Value, CancellationToken.None);
+        var removesByPath = committed.OfType<RemoveFileAction>().ToDictionary(r => r.Path, StringComparer.Ordinal);
+
+        // Each remove tombstone round-trips (through the JSON commit) the SAME tags its add carried.
+        RemoveFileAction removeA = removesByPath["a.parquet"];
+        Assert.Equal("1700000000000", removeA.Tags["INSERTION_TIME"]);
+        Assert.Equal("za", removeA.Tags["ZCUBE_ID"]);
+        RemoveFileAction removeB = removesByPath["b.parquet"];
+        Assert.Equal("1700000000001", removeB.Tags["INSERTION_TIME"]);
+        Assert.Equal("zb", removeB.Tags["ZCUBE_ID"]);
+    }
+
+    // An AddFileAction modelling a file authored by an EXTERNAL engine that carries tags, built over a real
+    // staged Parquet file so OPTIMIZE can read and rewrite it. Small Size ⇒ a small-file compaction candidate.
+    private static AddFileAction ExternalAdd(StagedDataFile staged, ImmutableSortedDictionary<string, string> tags) =>
+        new(
+            staged.Path,
+            staged.PartitionValues,
+            staged.Size,
+            ModificationTime: 1L,
+            DataChange: true,
+            staged.Stats,
+            tags);
+
+    private static ImmutableSortedDictionary<string, string> Tags(params (string Key, string Value)[] entries) =>
+        ImmutableSortedDictionary.CreateRange(
+            StringComparer.Ordinal,
+            entries.Select(e => new KeyValuePair<string, string>(e.Key, e.Value)));
+
     // ---------------------------------------------------------------- helpers
 
     private DeltaLog Log() => new(_backend);
@@ -1663,7 +1715,7 @@ public sealed class DeltaOptimizeTests : IDisposable
         {
             actions.Add(new RemoveFileAction(
                 add.Path, DeletionTimestamp: 1, DataChange: true, ExtendedFileMetadata: true,
-                add.PartitionValues, add.Size, DeletionVector: null));
+                add.PartitionValues, add.Size, add.Tags, DeletionVector: null));
             actions.Add(new AddFileAction(
                 add.Path, add.PartitionValues, add.Size, ModificationTime: 1, DataChange: true,
                 add.Stats! with { NumRecords = physicalRecords }, add.Tags, inline));
@@ -1689,7 +1741,7 @@ public sealed class DeltaOptimizeTests : IDisposable
         {
             actions.Add(new RemoveFileAction(
                 add.Path, DeletionTimestamp: 1, DataChange: true, ExtendedFileMetadata: true,
-                add.PartitionValues, add.Size, DeletionVector: null));
+                add.PartitionValues, add.Size, add.Tags, DeletionVector: null));
             actions.Add(new AddFileAction(
                 add.Path, add.PartitionValues, add.Size, ModificationTime: 1, DataChange: true,
                 add.Stats! with { NumRecords = physicalRecords }, add.Tags, inline));
@@ -1711,7 +1763,7 @@ public sealed class DeltaOptimizeTests : IDisposable
         {
             new RemoveFileAction(
                 dvAdd.Path, DeletionTimestamp: 1, DataChange: true, ExtendedFileMetadata: true,
-                dvAdd.PartitionValues, dvAdd.Size, dvAdd.DeletionVector),
+                dvAdd.PartitionValues, dvAdd.Size, dvAdd.Tags, dvAdd.DeletionVector),
             new AddFileAction(
                 purged.Path, purged.PartitionValues, purged.Size, ModificationTime: 1, DataChange: true,
                 purged.Stats, ImmutableSortedDictionary<string, string>.Empty.WithComparers(StringComparer.Ordinal),

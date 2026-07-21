@@ -42,6 +42,7 @@ internal sealed class CheckpointSchema
     public DataField? RemoveExtendedFileMetadata { get; private init; }
     public DataField? RemoveSize { get; private init; }
     public MapLeaves? RemovePartitionValues { get; private init; }
+    public MapLeaves? RemoveTags { get; private init; }
     public DeletionVectorLeaves? RemoveDeletionVector { get; private init; }
 
     // metaData
@@ -126,6 +127,7 @@ internal sealed class CheckpointSchema
             RemoveExtendedFileMetadata = Scalar(remove, "extendedFileMetadata"),
             RemoveSize = Scalar(remove, "size"),
             RemovePartitionValues = Map(remove, "partitionValues"),
+            RemoveTags = Map(remove, "tags"),
             RemoveDeletionVector = DeletionVector(removeDv),
 
             MetaId = Scalar(metaData, "id"),
@@ -187,7 +189,7 @@ internal sealed class CheckpointSchema
         Add(AddPath); Add(AddSize); Add(AddModificationTime); Add(AddDataChange); Add(AddStats);
         AddMap(AddPartitionValues); AddMap(AddTags); AddDv(AddDeletionVector);
         Add(RemovePath); Add(RemoveDeletionTimestamp); Add(RemoveDataChange); Add(RemoveExtendedFileMetadata);
-        Add(RemoveSize); AddMap(RemovePartitionValues); AddDv(RemoveDeletionVector);
+        Add(RemoveSize); AddMap(RemovePartitionValues); AddMap(RemoveTags); AddDv(RemoveDeletionVector);
         Add(MetaId); Add(MetaName); Add(MetaDescription); Add(MetaSchemaString); Add(MetaCreatedTime);
         Add(FormatProvider); AddMap(FormatOptions); Add(MetaPartitionColumns); AddMap(MetaConfiguration);
         Add(ProtocolMinReaderVersion); Add(ProtocolMinWriterVersion); Add(ProtocolReaderFeatures);
