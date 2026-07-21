@@ -827,7 +827,8 @@ public sealed class DeltaWriteTarget : IDisposable
                 Size: bytes.LongLength,
                 ModificationTime: modificationTime,
                 Stats: result.Statistics,
-                DataSchema: writtenSchema));
+                DataSchema: writtenSchema,
+                ContentChecksum: ContentChecksum.Compute(bytes)));
             totalRows += result.RowCount;
         }
 

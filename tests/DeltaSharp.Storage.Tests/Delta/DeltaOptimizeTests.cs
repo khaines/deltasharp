@@ -340,6 +340,46 @@ public sealed class DeltaOptimizeTests : IDisposable
     }
 
     [Fact]
+    public async Task Optimize_StampsContentChecksumTag_OnCompactedOutput()
+    {
+        // #504: the compacted output add carries a deterministic sha256 content checksum of its on-disk
+        // Parquet bytes (advisory tag), so a content-equivalence audit can compare files without re-reading.
+        StagedDataFile a = await WriteDataFileAsync("a.parquet", Batch((1, "a"), (2, "b")));
+        StagedDataFile b = await WriteDataFileAsync("b.parquet", Batch((3, "c"), (4, "d")));
+        await SeedAsync(DataSchema, partitionColumns: null, a, b);
+
+        OptimizeResult result = await Optimize().OptimizeAsync();
+        Assert.Equal(1, result.FilesAdded);
+
+        Snapshot after = await Log().LoadSnapshotAsync();
+        AddFileAction output = Assert.Single(after.ActiveFiles);
+
+        // The tag reads back through the log and equals a re-hash of the compacted file's on-disk bytes.
+        string? checksum = ContentChecksum.TryRead(output.Tags);
+        Assert.NotNull(checksum);
+        Assert.StartsWith("sha256:", checksum, StringComparison.Ordinal);
+
+        Stream stream = await _backend.OpenReadAsync(output.Path, CancellationToken.None);
+        byte[] onDisk;
+        await using (stream)
+        {
+            using var buffer = new MemoryStream();
+            await stream.CopyToAsync(buffer, CancellationToken.None);
+            onDisk = buffer.ToArray();
+        }
+
+        Assert.Equal(ContentChecksum.Compute(onDisk), checksum);
+
+        // #504 R3 FIX 1: a RANGE bug (hashing/writing the buffer's full capacity incl. trailing zero padding
+        // instead of exactly [0, Length)) would slip past the re-hash assertion alone — the padded bytes land
+        // on disk AND in the tag, so re-hash(on-disk) still equals the tag. Pin the WRITTEN FILE SIZE to the
+        // recorded Parquet byte size (measured pre-slice from the stream Length): a padded write is larger
+        // than output.Size, so this fails. Also pin the tag to the hash over EXACTLY [0, output.Size) bytes.
+        Assert.Equal(output.Size, onDisk.LongLength);
+        Assert.Equal(ContentChecksum.Compute(onDisk.AsSpan(0, (int)output.Size)), checksum);
+    }
+
+    [Fact]
     public async Task Optimize_BinPacksSmallFiles_ByTargetSize_IntoMultipleGroups_InOneCommit()
     {
         // Four size-100 files with target 250: next-fit packs {a,b} and {c,d} into two groups → two

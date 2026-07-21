@@ -203,9 +203,6 @@ internal sealed class DeltaOptimize
     private static readonly ImmutableSortedDictionary<string, string?> EmptyPartition =
         ImmutableSortedDictionary<string, string?>.Empty.WithComparers(StringComparer.Ordinal);
 
-    private static readonly ImmutableSortedDictionary<string, string> NoTags =
-        ImmutableSortedDictionary<string, string>.Empty.WithComparers(StringComparer.Ordinal);
-
     private readonly IStorageBackend _backend;
     private readonly DeltaLog _log;
     private readonly DeltaCommitter _committer;
@@ -480,7 +477,7 @@ internal sealed class DeltaOptimize
                 timestamp,
                 DataChange: false,
                 output.Statistics,
-                NoTags));
+                ContentChecksum.TagsFor(output.ContentChecksum)));
 
             Accumulate(summaries, group, output);
         }
@@ -706,15 +703,25 @@ internal sealed class DeltaOptimize
             .WriteWithStatisticsAsync(buffer, dataSchema, batches, _statisticsPolicy, cancellationToken)
             .ConfigureAwait(false);
 
+        // Single materialization (#504 R2 FIX 1): hash AND write off the app-owned MemoryStream's existing
+        // backing array — a compacted output is target-sized (often 100s of MB), so an extra ToArray() copy
+        // would be a transient LOH allocation + ~2× peak memory. TryGetBuffer exposes exactly the written
+        // [0, Length) bytes (never trailing capacity). ToArray() is the correct fallback for a hypothetical
+        // non-exposable stream (GetBuffer() would throw the same way TryGetBuffer fails); it only materializes
+        // on that unreachable path, so the real path stays copy-free.
+        ReadOnlyMemory<byte> content = buffer.TryGetBuffer(out ArraySegment<byte> segment)
+            ? segment.AsMemory()
+            : buffer.ToArray();
+
         Stream target = await _backend.OpenWriteAsync(path, cancellationToken).ConfigureAwait(false);
         await using (target.ConfigureAwait(false))
         {
-            buffer.Position = 0;
-            await buffer.CopyToAsync(target, cancellationToken).ConfigureAwait(false);
+            await target.WriteAsync(content, cancellationToken).ConfigureAwait(false);
             await ((ICompletableWriteStream)target).CompleteAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        return new CompactedOutput(path, writeResult.ByteSize, writeResult.RowCount, writeResult.Statistics);
+        return new CompactedOutput(
+            path, writeResult.ByteSize, writeResult.RowCount, writeResult.Statistics, ContentChecksum.Compute(content.Span));
     }
 
     // Tombstone a compacted input. dataChange=false marks a byte-rearranging remove (§2.11.2), and
@@ -946,8 +953,11 @@ internal sealed class DeltaOptimize
     }
 
     // A written compacted file: its storage path, byte size (measured from the seekable write buffer), row
-    // count, and write-time statistics recorded on the add action.
-    private readonly record struct CompactedOutput(string Path, long ByteSize, long RowCount, FileStatistics Statistics);
+    // count, write-time statistics recorded on the add action, and the advisory content checksum (#504).
+    // ContentChecksum is non-null here (OPTIMIZE always has the whole file's bytes in the write buffer when
+    // it hashes), unlike StagedDataFile.ContentChecksum which is nullable to future-proof a streaming sink.
+    private readonly record struct CompactedOutput(
+        string Path, long ByteSize, long RowCount, FileStatistics Statistics, string ContentChecksum);
 
     // A mutable per-partition tally folded into an OptimizePartitionSummary.
     private sealed class PartitionAccumulator
