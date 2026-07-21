@@ -333,5 +333,72 @@ public sealed class DeltaLogActionWriterTests
         Assert.Null(parsedTxn.LastUpdated);
     }
 
+    [Fact]
+    public void EmitsEmptyPartitionValues_WhenExtendedFileMetadataAndUnpartitioned()
+    {
+        // An unpartitioned remove with extendedFileMetadata:true must emit partitionValues:{} (an empty
+        // JSON object), not omit the key — strict cross-engine readers (delta-standalone/-rs/-spark)
+        // require partitionValues to be present alongside the extended metadata (issue #511).
+        var remove = new RemoveFileAction(
+            "gone.parquet",
+            DeletionTimestamp: 1700000000000L,
+            DataChange: true,
+            ExtendedFileMetadata: true,
+            ImmutableSortedDictionary<string, string?>.Empty.WithComparers(StringComparer.Ordinal),
+            Size: 128L);
+
+        byte[] bytes = DeltaLogActionWriter.SerializeCommit(new DeltaAction[] { remove });
+        string text = Encoding.UTF8.GetString(bytes);
+
+        Assert.Contains("\"partitionValues\":{}", text, StringComparison.Ordinal);
+
+        // Round-trips back to an empty partition map.
+        var parsed = Assert.IsType<RemoveFileAction>(Assert.Single(RoundTrip(remove)));
+        Assert.True(parsed.ExtendedFileMetadata);
+        Assert.Empty(parsed.PartitionValues);
+        Assert.Equal(128L, parsed.Size);
+    }
+
+    [Fact]
+    public void EmitsPopulatedPartitionValues_WhenExtendedFileMetadataAndPartitioned()
+    {
+        // A partitioned remove with extendedFileMetadata:true still emits its populated partitionValues
+        // (regression guard for issue #511).
+        var remove = new RemoveFileAction(
+            "dt=2023/old.parquet",
+            DeletionTimestamp: 1700000000000L,
+            DataChange: true,
+            ExtendedFileMetadata: true,
+            NullableStringMap(("dt", "2023")),
+            Size: 512L);
+
+        byte[] bytes = DeltaLogActionWriter.SerializeCommit(new DeltaAction[] { remove });
+        string text = Encoding.UTF8.GetString(bytes);
+
+        Assert.Contains("\"partitionValues\":{\"dt\":\"2023\"}", text, StringComparison.Ordinal);
+
+        var parsed = Assert.IsType<RemoveFileAction>(Assert.Single(RoundTrip(remove)));
+        Assert.Equal("2023", parsed.PartitionValues["dt"]);
+    }
+
+    [Fact]
+    public void OmitsPartitionValues_WhenBareTombstone()
+    {
+        // A bare tombstone (extendedFileMetadata:false) with an empty partition map still omits the
+        // partitionValues key entirely — the extended-metadata fix does not touch this path (issue #511).
+        var remove = new RemoveFileAction(
+            "gone.parquet",
+            DeletionTimestamp: 1700000000000L,
+            DataChange: true,
+            ExtendedFileMetadata: false,
+            ImmutableSortedDictionary<string, string?>.Empty.WithComparers(StringComparer.Ordinal),
+            Size: null);
+
+        byte[] bytes = DeltaLogActionWriter.SerializeCommit(new DeltaAction[] { remove });
+        string text = Encoding.UTF8.GetString(bytes);
+
+        Assert.DoesNotContain("\"partitionValues\"", text, StringComparison.Ordinal);
+    }
+
     private sealed record UnknownTestAction : DeltaAction;
 }
