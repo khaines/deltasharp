@@ -52,6 +52,13 @@ internal enum PartitionOverwriteMode
 /// footer-derived data schema (physical-named under column mapping). The commit-time cross-check compares
 /// it by name + logical type only, because Parquet.Net models string/binary as nullable and a footer does
 /// not carry Spark field metadata — neither is footer-faithful.</para>
+///
+/// <para><b>Content checksum (#504).</b> <see cref="ContentChecksum"/> is the advisory
+/// <c>sha256:&lt;hex&gt;</c> fingerprint of the file's on-disk bytes, stamped onto the committed
+/// <c>add</c>'s tags so writes can be audited for content equivalence without re-reading. It is
+/// <see langword="null"/> only when the staging path did not compute one — the null-guard defensively
+/// future-proofs a streaming/columnar sink (#442/#443) that may commit before it has the whole file's
+/// bytes in hand.</para>
 /// </summary>
 internal sealed record StagedDataFile(
     string Path,
@@ -59,7 +66,8 @@ internal sealed record StagedDataFile(
     long Size,
     long ModificationTime,
     FileStatistics? Stats = null,
-    StructType? DataSchema = null);
+    StructType? DataSchema = null,
+    string? ContentChecksum = null);
 
 /// <summary>
 /// The resolved PHYSICAL write shape for an append/overwrite, computed <b>once</b> so the write door
@@ -126,9 +134,6 @@ internal readonly record struct DeltaWritePlan(
 /// </summary>
 internal sealed class DeltaTableWriter
 {
-    private static readonly ImmutableSortedDictionary<string, string> NoTags =
-        ImmutableSortedDictionary<string, string>.Empty.WithComparers(StringComparer.Ordinal);
-
     private readonly DeltaLog _log;
     private readonly DeltaCommitter _committer;
     private readonly TimeProvider _timeProvider;
@@ -1308,7 +1313,7 @@ internal sealed class DeltaTableWriter
                 file.ModificationTime,
                 DataChange: true,
                 file.Stats,
-                NoTags));
+                ContentChecksum.TagsFor(file.ContentChecksum)));
         }
     }
 
