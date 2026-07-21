@@ -195,6 +195,85 @@ public class ExpressionTypeModelTests
     }
 
     [Fact]
+    public void NullableUnder_PropagatesAnyFunction_WidensOverOverflowArgUnderLegacyOnly()
+    {
+        // #627: an OR-propagating (PropagatesAny) function wrapping an overflow-capable `1 + 2` is
+        // NOT-NULL under Ansi (its stored `_nullable` == args.Any(Nullable) == false), but nullable
+        // under Legacy because the argument can null on overflow. This is the abs(v+v)/sqrt(v*v) case.
+        var wrapped = new ResolvedFunction(
+            "length", FunctionKind.Scalar, IntegerType.Instance, nullable: false, new[] { OverflowValue() },
+            nullPropagation: FunctionNullability.PropagatesAny);
+
+        Assert.False(wrapped.Nullable);
+        Assert.False(wrapped.NullableUnder(AnsiMode.Ansi));
+        Assert.True(wrapped.NullableUnder(AnsiMode.Legacy));
+    }
+
+    [Fact]
+    public void NullableUnder_PropagatesAnyFunction_MultiArg_WidensIfAnyArgOverflowsUnderLegacy()
+    {
+        // A second OR-propagating shape (multi-arg concat-like): a NOT-NULL literal plus an
+        // overflow-capable arg is NOT-NULL under Ansi but nullable under Legacy (ANY arg nulls).
+        var wrapped = new ResolvedFunction(
+            "concat", FunctionKind.Scalar, StringType.Instance, nullable: false,
+            new Expression[] { Literal.OfInt(7), OverflowValue() },
+            nullPropagation: FunctionNullability.PropagatesAny);
+
+        Assert.False(wrapped.NullableUnder(AnsiMode.Ansi));
+        Assert.True(wrapped.NullableUnder(AnsiMode.Legacy));
+    }
+
+    [Fact]
+    public void NullableUnder_PropagatesAllFunction_NotWidenedByOneOverflowArg()
+    {
+        // #627: coalesce(v+v, 0) is PropagatesAll — null only if ALL args null. The NOT-NULL `0` pins
+        // the result NOT-NULL, so even under Legacy the overflow-capable first arg does NOT widen it.
+        var coalesce = new ResolvedFunction(
+            "coalesce", FunctionKind.Scalar, IntegerType.Instance, nullable: false,
+            new Expression[] { OverflowValue(), Literal.OfInt(0) },
+            nullPropagation: FunctionNullability.PropagatesAll);
+
+        Assert.False(coalesce.Nullable);
+        Assert.False(coalesce.NullableUnder(AnsiMode.Ansi));
+        Assert.False(coalesce.NullableUnder(AnsiMode.Legacy));
+    }
+
+    [Fact]
+    public void NullableUnder_PropagatesAllFunction_WidensWhenEveryArgOverflowsUnderLegacy()
+    {
+        // coalesce(v+v, w+w): every arg is overflow-capable, so under Legacy ALL can null → nullable.
+        // Under Ansi both throw instead of nulling, so the result stays NOT-NULL (byte-identical).
+        var coalesce = new ResolvedFunction(
+            "coalesce", FunctionKind.Scalar, IntegerType.Instance, nullable: false,
+            new Expression[] { OverflowValue(), OverflowValue() },
+            nullPropagation: FunctionNullability.PropagatesAll);
+
+        Assert.False(coalesce.NullableUnder(AnsiMode.Ansi));
+        Assert.True(coalesce.NullableUnder(AnsiMode.Legacy));
+    }
+
+    [Fact]
+    public void NullableUnder_FixedFunction_NeverWidenedUnderLegacy()
+    {
+        // #627: a Fixed function (e.g. count — never null) keeps its exact stored nullability in BOTH
+        // modes; an overflow-capable argument must NOT widen it. Mirrors aggregates and to_date.
+        var count = new ResolvedFunction(
+            "count", FunctionKind.Aggregate, LongType.Instance, nullable: false, new[] { OverflowValue() },
+            nullPropagation: FunctionNullability.Fixed);
+
+        Assert.False(count.NullableUnder(AnsiMode.Ansi));
+        Assert.False(count.NullableUnder(AnsiMode.Legacy));
+
+        // A Fixed function whose stored nullability is `true` (e.g. to_date) stays nullable, mode-independent.
+        var toDate = new ResolvedFunction(
+            "to_date", FunctionKind.Scalar, DateType.Instance, nullable: true, new[] { OverflowValue() },
+            nullPropagation: FunctionNullability.Fixed);
+
+        Assert.True(toDate.NullableUnder(AnsiMode.Ansi));
+        Assert.True(toDate.NullableUnder(AnsiMode.Legacy));
+    }
+
+    [Fact]
     public void NullableUnder_UnderAnsi_EqualsNullable_ForRepresentativeNodes()
     {
         // #614 invariant: under Ansi, NullableUnder must be byte-identical to Nullable for every
@@ -216,6 +295,19 @@ public class ExpressionTypeModelTests
             new BinaryComparison(overflow, Literal.OfInt(0), ComparisonOperator.LessThan),
             new GetStructField(structAttr, 0, "f"),
             new CaseWhen(Literal.OfBoolean(true), overflow).WithElse(Literal.OfInt(0)),
+
+            // #627 ResolvedFunction across all three FunctionNullability classifications, each over an
+            // overflow-capable arg — the Ansi lens must reproduce the stored Nullable in every case.
+            new ResolvedFunction(
+                "length", FunctionKind.Scalar, IntegerType.Instance, nullable: false, new[] { overflow },
+                nullPropagation: FunctionNullability.PropagatesAny),
+            new ResolvedFunction(
+                "coalesce", FunctionKind.Scalar, IntegerType.Instance, nullable: false,
+                new Expression[] { overflow, Literal.OfInt(0) },
+                nullPropagation: FunctionNullability.PropagatesAll),
+            new ResolvedFunction(
+                "sum", FunctionKind.Aggregate, LongType.Instance, nullable: true, new[] { overflow },
+                nullPropagation: FunctionNullability.Fixed),
         };
 
         foreach (Expression node in representatives)
@@ -230,8 +322,9 @@ public class ExpressionTypeModelTests
         // #614 reflection guard: any concrete Expression that OVERRIDES Nullable to propagate a child's
         // nullability MUST also override NullableUnder, or a Legacy overflow/lossy-cast output column
         // silently under-reports NOT-NULL (the exact #614 bug). The allowlist is the set of nodes whose
-        // Nullable is a constant/stored/non-propagating value, so a mode-aware variant would be a no-op
-        // (or, for ResolvedFunction, a deliberate over-report — residual tracked in #627).
+        // Nullable is a constant/stored/non-propagating value, so a mode-aware variant would be a no-op.
+        // ResolvedFunction is NO LONGER exempt (#627): it now overrides NullableUnder to recompute
+        // nullability mode-awarely from its FunctionNullability classification.
         var exempt = new HashSet<string>(StringComparer.Ordinal)
         {
             "Literal",           // constant nullability (IsNull)
@@ -239,7 +332,6 @@ public class ExpressionTypeModelTests
             "IsNull",            // result is never null (non-propagating)
             "IsNotNull",         // result is never null (non-propagating)
             "EqualNullSafe",     // result is never null (non-propagating)
-            "ResolvedFunction",  // precise stored nullability; Legacy residual tracked in #627
         };
 
         Type baseType = typeof(Expression);

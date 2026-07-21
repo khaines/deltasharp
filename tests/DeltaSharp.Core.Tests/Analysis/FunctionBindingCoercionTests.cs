@@ -726,6 +726,135 @@ public class FunctionBindingCoercionTests
         Assert.Contains("comparable", ex.Message);
     }
 
+    // ---- #627: mode-aware ResolvedFunction nullability (FunctionNullability classification) ----
+
+    // An overflow-capable value over NOT-NULL operands: Nullable is false, but NullableUnder(Legacy)
+    // is true (DeltaSharp nulls on overflow in Legacy). Isolates a Fixed function's non-widening.
+    private static BinaryArithmetic OverflowValue() =>
+        new(Literal.OfInt(1), Literal.OfInt(2), ArithmeticOperator.Add);
+
+    [Fact]
+    public void Bind_FixedFunction_DoesNotWidenOverOverflowArg_UnderLegacy()
+    {
+        // #627 mutation guard (Quality M3): count is Fixed(false) — an empty group counts 0, so it is
+        // NEVER null regardless of its argument. Even when the argument IS overflow-capable (`1 + 2`,
+        // which nulls on overflow under Legacy), count must stay NOT-NULL in BOTH modes. This KILLS the
+        // "reclassify count -> PropagatesAny" mutant: PropagatesAny would make Legacy widen to nullable
+        // because Children.Any(overflow.NullableUnder(Legacy)) == true.
+        ResolvedFunction count = FunctionRegistry.Bind(Fn("count", OverflowValue()));
+
+        Assert.Equal(FunctionNullability.Fixed, count.NullPropagation);
+        Assert.False(count.Nullable);
+        Assert.False(count.NullableUnder(AnsiMode.Ansi));
+        Assert.False(count.NullableUnder(AnsiMode.Legacy));
+    }
+
+    [Fact]
+    public void Bind_FixedAggregate_KeepsStoredNullability_OverOverflowArg()
+    {
+        // sum is Fixed(true) — an empty group sums to NULL, so its nullability is empty-group-driven,
+        // NOT argument-propagating. Over an overflow-capable arg it stays exactly its stored value in
+        // both modes (NullableUnder == Nullable == true); an arg's overflow must not change it.
+        ResolvedFunction sum = FunctionRegistry.Bind(Fn("sum", OverflowValue()));
+
+        Assert.Equal(FunctionNullability.Fixed, sum.NullPropagation);
+        Assert.True(sum.Nullable);
+        Assert.Equal(sum.Nullable, sum.NullableUnder(AnsiMode.Ansi));
+        Assert.Equal(sum.Nullable, sum.NullableUnder(AnsiMode.Legacy));
+    }
+
+    [Fact]
+    public void Bind_PropagatesAnyFunction_WidensOverOverflowArg_UnderLegacyOnly()
+    {
+        // Contrast to the Fixed guard: length is PropagatesAny, so wrapping an overflow-capable `1 + 2`
+        // DOES widen under Legacy (the #627 residual fix) while staying NOT-NULL under Ansi.
+        ResolvedFunction length = FunctionRegistry.Bind(Fn("length", OverflowValue()));
+
+        Assert.Equal(FunctionNullability.PropagatesAny, length.NullPropagation);
+        Assert.False(length.NullableUnder(AnsiMode.Ansi));
+        Assert.True(length.NullableUnder(AnsiMode.Legacy));
+    }
+
+    private static IEnumerable<UnresolvedFunction> EverySupportedFunctionBinding()
+    {
+        // Every function FunctionRegistry supports, bound with representative args in BOTH a non-null
+        // and a nullable shape (and an overflow-capable shape where the arg type allows), so the
+        // registry-wide Ansi invariant below stresses each classification's stored-vs-arg agreement.
+        Expression nnInt = Literal.OfInt(1);
+        Expression nullInt = Literal.Null(IntegerType.Instance);
+        Expression overflow = new BinaryArithmetic(Literal.OfInt(1), Literal.OfInt(2), ArithmeticOperator.Add);
+        Expression nnStr = Literal.OfString("a");
+        Expression nullStr = Literal.Null(StringType.Instance);
+        Expression nnDate = Literal.OfDate(1);
+        Expression nullDate = Literal.Null(DateType.Instance);
+
+        // Aggregates.
+        yield return Fn("count", nnInt);
+        yield return Fn("count", nullInt);
+        yield return Fn("count", overflow);
+        yield return Fn("sum", nnInt);
+        yield return Fn("sum", nullInt);
+        yield return Fn("sum", overflow);
+        yield return Fn("avg", nnInt);
+        yield return Fn("avg", nullInt);
+        yield return Fn("min", nnInt);
+        yield return Fn("min", nullInt);
+        yield return Fn("max", nnStr);
+        yield return Fn("max", nullStr);
+
+        // Scalar string.
+        yield return Fn("upper", nnStr);
+        yield return Fn("upper", nullStr);
+        yield return Fn("upper", overflow);
+        yield return Fn("lower", nnStr);
+        yield return Fn("lower", nullStr);
+        yield return Fn("trim", nnStr);
+        yield return Fn("trim", nullStr);
+        yield return Fn("length", nnStr);
+        yield return Fn("length", nullStr);
+        yield return Fn("length", overflow);
+        yield return Fn("concat", nnStr, nnStr);
+        yield return Fn("concat", nnStr, nullStr);
+        yield return Fn("concat", nnInt, overflow);
+        yield return Fn("coalesce", nnInt, nnInt);
+        yield return Fn("coalesce", nullInt, nullInt);
+        yield return Fn("coalesce", overflow, nnInt);
+        yield return Fn("coalesce", overflow, overflow);
+
+        // Scalar temporal.
+        yield return Fn("year", nnDate);
+        yield return Fn("year", nullDate);
+        yield return Fn("month", nnDate);
+        yield return Fn("dayofmonth", nnDate);
+        yield return Fn("to_date", nnStr);
+        yield return Fn("to_date", nullStr);
+        yield return Fn("current_date");
+        yield return Fn("current_timestamp");
+    }
+
+    [Fact]
+    public void Bind_EverySupportedFunction_NullableUnderAnsi_EqualsNullable()
+    {
+        // #627 registry-wide guard: for EVERY supported function, under Ansi the mode-aware
+        // NullableUnder must be byte-identical to the stored Nullable — the #614 invariant. A
+        // PropagatesAny/All function whose classification diverges from its stored `_nullable`, or a
+        // future function misclassified as PropagatesAny when it should be Fixed, would fail here.
+        var offenders = new List<string>();
+        foreach (UnresolvedFunction call in EverySupportedFunctionBinding())
+        {
+            ResolvedFunction bound = FunctionRegistry.Bind(call);
+            if (bound.NullableUnder(AnsiMode.Ansi) != bound.Nullable)
+            {
+                offenders.Add(call.SimpleString);
+            }
+        }
+
+        Assert.True(
+            offenders.Count == 0,
+            "These bound functions violate the Ansi byte-identical invariant (NullableUnder(Ansi) != "
+            + "Nullable): " + string.Join(", ", offenders));
+    }
+
     // ---- null-typed-resolved guard (defense-in-depth over the coercion pass) ----
 
     [Fact]

@@ -75,7 +75,8 @@ internal static class FunctionRegistry
 
         // count never returns NULL (an empty group counts 0); it accepts arguments of any type.
         return new ResolvedFunction(
-            "count", FunctionKind.Aggregate, LongType.Instance, nullable: false, args, fn.IsDistinct);
+            "count", FunctionKind.Aggregate, LongType.Instance, nullable: false, args, fn.IsDistinct,
+            FunctionNullability.Fixed);
     }
 
     private static ResolvedFunction BindSum(
@@ -97,7 +98,9 @@ internal static class FunctionRegistry
         };
 
         return new ResolvedFunction(
-            "sum", FunctionKind.Aggregate, result, nullable: true, args, fn.IsDistinct);
+            "sum", FunctionKind.Aggregate, result, nullable: true, args, fn.IsDistinct,
+            // Fixed: aggregate nullability is empty-group-driven, not argument-propagating (never widened by arg overflow).
+            FunctionNullability.Fixed);
     }
 
     private static ResolvedFunction BindAvg(
@@ -116,7 +119,9 @@ internal static class FunctionRegistry
             : DoubleType.Instance;
 
         return new ResolvedFunction(
-            "avg", FunctionKind.Aggregate, result, nullable: true, args, fn.IsDistinct);
+            "avg", FunctionKind.Aggregate, result, nullable: true, args, fn.IsDistinct,
+            // Fixed: aggregate nullability is empty-group-driven, not argument-propagating (never widened by arg overflow).
+            FunctionNullability.Fixed);
     }
 
     private static ResolvedFunction BindMinMax(
@@ -131,7 +136,9 @@ internal static class FunctionRegistry
 
         // min/max return the input type; the extremum of an empty group is NULL.
         return new ResolvedFunction(
-            name, FunctionKind.Aggregate, input, nullable: true, args, fn.IsDistinct);
+            name, FunctionKind.Aggregate, input, nullable: true, args, fn.IsDistinct,
+            // Fixed: aggregate nullability is empty-group-driven, not argument-propagating (never widened by arg overflow).
+            FunctionNullability.Fixed);
     }
 
     // ---- scalar: string ---------------------------------------------------------------------
@@ -142,7 +149,8 @@ internal static class FunctionRegistry
         DataType input = RequireUnary(fn, args, argTypes, name);
         Expression coerced = CoerceToString(fn, input, args[0], name);
         return new ResolvedFunction(
-            name, FunctionKind.Scalar, StringType.Instance, args[0].Nullable, new[] { coerced });
+            name, FunctionKind.Scalar, StringType.Instance, args[0].Nullable, new[] { coerced },
+            nullPropagation: FunctionNullability.PropagatesAny);
     }
 
     private static ResolvedFunction BindLength(
@@ -155,7 +163,8 @@ internal static class FunctionRegistry
             ? args[0]
             : CoerceToString(fn, input, args[0], "length");
         return new ResolvedFunction(
-            "length", FunctionKind.Scalar, IntegerType.Instance, args[0].Nullable, new[] { coerced });
+            "length", FunctionKind.Scalar, IntegerType.Instance, args[0].Nullable, new[] { coerced },
+            nullPropagation: FunctionNullability.PropagatesAny);
     }
 
     private static ResolvedFunction BindConcat(
@@ -177,7 +186,8 @@ internal static class FunctionRegistry
         }
 
         return new ResolvedFunction(
-            "concat", FunctionKind.Scalar, StringType.Instance, nullable, coerced);
+            "concat", FunctionKind.Scalar, StringType.Instance, nullable, coerced,
+            nullPropagation: FunctionNullability.PropagatesAny);
     }
 
     private static ResolvedFunction BindCoalesce(
@@ -208,7 +218,8 @@ internal static class FunctionRegistry
         }
 
         return new ResolvedFunction(
-            "coalesce", FunctionKind.Scalar, common, allNullable, coerced);
+            "coalesce", FunctionKind.Scalar, common, allNullable, coerced,
+            nullPropagation: FunctionNullability.PropagatesAll);
     }
 
     // ---- scalar: temporal -------------------------------------------------------------------
@@ -223,7 +234,8 @@ internal static class FunctionRegistry
         }
 
         return new ResolvedFunction(
-            name, FunctionKind.Scalar, result, nullable: false, Array.Empty<Expression>());
+            name, FunctionKind.Scalar, result, nullable: false, Array.Empty<Expression>(),
+            nullPropagation: FunctionNullability.Fixed);
     }
 
     private static ResolvedFunction BindDatePart(
@@ -243,7 +255,8 @@ internal static class FunctionRegistry
         };
 
         return new ResolvedFunction(
-            name, FunctionKind.Scalar, IntegerType.Instance, args[0].Nullable, new[] { arg });
+            name, FunctionKind.Scalar, IntegerType.Instance, args[0].Nullable, new[] { arg },
+            nullPropagation: FunctionNullability.PropagatesAny);
     }
 
     private static ResolvedFunction BindToDate(
@@ -259,9 +272,12 @@ internal static class FunctionRegistry
                 fn.Name, argTypes, "to_date requires a string, date, or timestamp argument."),
         };
 
-        // to_date can yield NULL on an unparseable string, so the result is always nullable.
+        // to_date can yield NULL on an unparseable string, so the result is always nullable. This is a
+        // fixed rule (not derived from the argument's nullability), so it must NOT widen/narrow with a
+        // NOT-NULL argument under Ansi — classify Fixed so NullableUnder stays the stored `true` (#627).
         return new ResolvedFunction(
-            "to_date", FunctionKind.Scalar, DateType.Instance, nullable: true, new[] { arg });
+            "to_date", FunctionKind.Scalar, DateType.Instance, nullable: true, new[] { arg },
+            nullPropagation: FunctionNullability.Fixed);
     }
 
     // ---- helpers ----------------------------------------------------------------------------

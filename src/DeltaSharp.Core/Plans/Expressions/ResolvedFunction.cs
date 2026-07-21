@@ -3,6 +3,32 @@ using DeltaSharp.Types;
 namespace DeltaSharp.Plans.Expressions;
 
 /// <summary>
+/// How a <see cref="ResolvedFunction"/>'s result nullability relates to its value arguments, so
+/// <see cref="ResolvedFunction.NullableUnder(AnsiMode)"/> can recompute it mode-awarely (#627). Under
+/// <see cref="AnsiMode.Ansi"/> every classification is byte-identical to the stored
+/// <see cref="ResolvedFunction.Nullable"/>; only under <see cref="AnsiMode.Legacy"/> can an
+/// overflow-capable/lossy argument widen a <see cref="PropagatesAny"/>/<see cref="PropagatesAll"/>
+/// result (DeltaSharp nulls on overflow/invalid-cast in Legacy).
+/// </summary>
+// Guardrail: a never-null or null-INTRODUCING function (e.g. to_date, a future try_*/nullif) MUST be
+// classified Fixed — PropagatesAny would over-report under Ansi (the #614 concern: isnull-like results
+// must stay NOT-NULL) or mis-handle a bespoke null rule.
+internal enum FunctionNullability
+{
+    /// <summary>Result is null if ANY value argument is null (the common SQL default, e.g.
+    /// <c>upper</c>/<c>length</c>/<c>concat</c>).</summary>
+    PropagatesAny,
+
+    /// <summary>Result is null only if ALL value arguments are null (e.g. <c>coalesce</c>).</summary>
+    PropagatesAll,
+
+    /// <summary>Nullability is independent of argument nullability — a constant, a nullary function,
+    /// or a bespoke rule not expressible as any/all propagation (e.g. <c>count</c>, aggregates,
+    /// <c>to_date</c>). The stored precise value is kept in both modes.</summary>
+    Fixed,
+}
+
+/// <summary>
 /// A <b>resolved</b> function call (Catalyst parity: a bound scalar <c>Expression</c> or an
 /// <c>AggregateFunction</c>) — the analyzer's replacement for an <see cref="UnresolvedFunction"/>.
 /// It carries the canonical Spark function name, its arguments (with any implicit
@@ -28,6 +54,14 @@ internal sealed class ResolvedFunction : Expression
     /// <param name="nullable">Whether the result is nullable.</param>
     /// <param name="arguments">The (resolved, coerced) argument expressions, in order.</param>
     /// <param name="isDistinct">Whether the call carried the <c>DISTINCT</c> qualifier.</param>
+    /// <param name="nullPropagation">How the result's nullability relates to its arguments (#627). It
+    /// defaults to <see cref="FunctionNullability.PropagatesAny"/> — the common SQL rule — so callers
+    /// that do not classify a function get the safe, mode-aware default. Under
+    /// <see cref="AnsiMode.Ansi"/> every classification reproduces <paramref name="nullable"/> exactly.
+    /// A never-null or null-INTRODUCING function (e.g. <c>to_date</c>, a future <c>try_*</c>/<c>nullif</c>)
+    /// MUST be classified <see cref="FunctionNullability.Fixed"/> — <see cref="FunctionNullability.PropagatesAny"/>
+    /// would over-report under Ansi (the #614 concern: isnull-like results must stay NOT-NULL) or
+    /// mis-handle a bespoke null rule.</param>
     /// <exception cref="ArgumentException"><paramref name="name"/> is null or empty.</exception>
     /// <exception cref="ArgumentNullException"><paramref name="type"/> or <paramref name="arguments"/>
     /// is null.</exception>
@@ -37,7 +71,8 @@ internal sealed class ResolvedFunction : Expression
         DataType type,
         bool nullable,
         IEnumerable<Expression> arguments,
-        bool isDistinct = false)
+        bool isDistinct = false,
+        FunctionNullability nullPropagation = FunctionNullability.PropagatesAny)
         : base(PlanCollections.ToImmutable(arguments, nameof(arguments)))
     {
         ArgumentException.ThrowIfNullOrEmpty(name);
@@ -47,6 +82,7 @@ internal sealed class ResolvedFunction : Expression
         _type = type;
         _nullable = nullable;
         IsDistinct = isDistinct;
+        NullPropagation = nullPropagation;
     }
 
     /// <summary>The canonical (lower-case) Spark function name.</summary>
@@ -61,15 +97,30 @@ internal sealed class ResolvedFunction : Expression
     /// <summary>Whether the call carried the <c>DISTINCT</c> qualifier.</summary>
     public bool IsDistinct { get; }
 
+    /// <summary>How this function's result nullability relates to its value arguments (#627), used by
+    /// <see cref="NullableUnder(AnsiMode)"/> to recompute nullability mode-awarely.</summary>
+    public FunctionNullability NullPropagation { get; }
+
     /// <inheritdoc/>
     public override DataType Type => _type;
 
     /// <inheritdoc/>
-    // #614: function-wrapped overflow nullability is intentionally NOT widened under Legacy — the
-    // stored precise nullability is kept so a function is not conservatively over-reported nullable
-    // under Ansi (e.g. isnull(...) must stay NOT-NULL). This leaves abs(v+v)-style wrapping as a
-    // documented residual under Legacy, tracked in #627.
+    // The stored precise nullability, mode-independent. This is the ANSI-truth value; the Legacy
+    // widening (an overflow-capable / lossy argument manufacturing SQL NULL) is applied only by
+    // NullableUnder below, per this function's NullPropagation classification (#627).
     public override bool Nullable => _nullable;
+
+    /// <inheritdoc/>
+    // #627: recompute nullability mode-awarely from the classified null-propagation. Under Ansi every
+    // branch is byte-identical to the stored _nullable (the #614 invariant); under Legacy a
+    // PropagatesAny/All function widens when an overflow-capable/lossy argument does. A Fixed function
+    // (constant, nullary, aggregate, or bespoke rule) keeps its exact stored value in both modes.
+    public override bool NullableUnder(AnsiMode mode) => NullPropagation switch
+    {
+        FunctionNullability.PropagatesAny => Children.Any(c => c.NullableUnder(mode)) || (_nullable && Children.Count == 0),
+        FunctionNullability.PropagatesAll => Children.Count > 0 && Children.All(c => c.NullableUnder(mode)),
+        _ => Nullable,
+    };
 
     /// <inheritdoc/>
     public override string NodeName => "ResolvedFunction";
@@ -89,10 +140,12 @@ internal sealed class ResolvedFunction : Expression
     public override Expression WithNewChildren(IReadOnlyList<Expression> newChildren)
     {
         RequireArity(newChildren, Arguments.Count, NodeName);
-        return new ResolvedFunction(Name, Kind, _type, _nullable, newChildren, IsDistinct);
+        return new ResolvedFunction(Name, Kind, _type, _nullable, newChildren, IsDistinct, NullPropagation);
     }
 
     /// <inheritdoc/>
+    // NullPropagation is deliberately excluded from equality/hashing: it is a deterministic function of
+    // Name (already compared), so it never distinguishes two otherwise-equal calls.
     protected override bool NodeEquals(Expression other)
     {
         var function = (ResolvedFunction)other;
@@ -104,6 +157,7 @@ internal sealed class ResolvedFunction : Expression
     }
 
     /// <inheritdoc/>
+    // NullPropagation is deliberately excluded (see NodeEquals): a deterministic function of Name.
     protected override int NodeHashCode()
     {
         int hash = PlanHash.Combine(PlanHash.Seed, PlanHash.OfString(Name));
