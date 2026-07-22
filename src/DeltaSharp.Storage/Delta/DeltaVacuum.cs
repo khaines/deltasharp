@@ -1,7 +1,6 @@
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Globalization;
-using System.Linq;
 using DeltaSharp.Diagnostics;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Diagnostics;
@@ -332,25 +331,20 @@ internal sealed class DeltaVacuum
         TimeSpan logRetention = _policy.ResolveTableLogRetention(snapshot.Metadata.Configuration);
         long logRetentionCutoffMillis = nowMillis - (long)logRetention.TotalMilliseconds;
 
-        // #489 short-circuit: the cdc scan reads EVERY in-window commit JSON, so run it only when the
-        // candidate listing actually contains a file under `_change_data/`. This is safe: the cdc-referenced
-        // set is PURELY ADDITIVE protection, so if no `_change_data/` candidate exists on disk there is nothing
-        // for it to protect and skipping the scan cannot under-protect. Deliberately NOT gated on
-        // ChangeDataFeedFeature.IsEnabled / writerFeatures — a table with CDF disabled AFTER it was enabled can
-        // still have in-window cdc files that must be protected. The predicate is ENCODING-ROBUST (matches the
-        // raw disk key OR its `Uri.UnescapeDataString` decoding), mirroring OrphanCleanup's encoding-robust
-        // protection: a candidate whose directory separator is URI-encoded (`_change_data%2F…`) must still
-        // trigger the scan, else the short-circuit would bypass the protection and delete a live cdc file.
-        // Erring toward running the scan (a spurious decode-match) is safe — it only costs a scan, never a
-        // deletion. Further reuse-listing/telemetry optimizations are deferred to #641.
-        bool hasChangeDataCandidate = candidates.Any(c =>
-            c.Path.StartsWith(ChangeDataFeedFeature.ChangeDataDirectoryPrefix, StringComparison.Ordinal)
-            || Uri.UnescapeDataString(c.Path).StartsWith(
-                ChangeDataFeedFeature.ChangeDataDirectoryPrefix, StringComparison.Ordinal));
-        IReadOnlyCollection<string> protectedChangeDataPaths = hasChangeDataCandidate
-            ? await _log.CollectInWindowChangeDataPathsAsync(logRetentionCutoffMillis, cancellationToken)
-                .ConfigureAwait(false)
-            : Array.Empty<string>();
+        // #489: the cdc scan reads every in-window commit JSON, so it is tempting to short-circuit it on the
+        // candidate listing (skip when no candidate "looks like" a `_change_data/` file). That is NOT safe and
+        // is deliberately avoided: OrphanCleanup protects a candidate when it matches ANY referenced `cdc`
+        // path — regardless of that path's prefix or URI-encoding — and a `cdc` action's path is NOT
+        // constrained to `_change_data/` (ParseCdc accepts any path). So no cheap candidate-path predicate can
+        // be co-extensive with the protection: a double-encoded (`_change_data%252F…`) or non-canonical cdc
+        // candidate would be protected-if-scanned yet skipped by any `_change_data/`-prefix predicate, and then
+        // deleted (data loss). The only predicate that never under-protects is derived from the log itself, not
+        // the candidate listing. Scanning unconditionally is the correctness reference; a SAFE scan-skip
+        // (gated on the retained protocol history ever declaring CDF, computed from the log — not candidate
+        // paths) is deferred to #641.
+        IReadOnlyCollection<string> protectedChangeDataPaths =
+            await _log.CollectInWindowChangeDataPathsAsync(logRetentionCutoffMillis, cancellationToken)
+                .ConfigureAwait(false);
 
         // The single source of the deletion decision AND the audit reason (design §2.11.5): active files,
         // retention-protected tombstones, referenced change-data files, and recently-staged files are

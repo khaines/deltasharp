@@ -497,14 +497,13 @@ public sealed class DeltaVacuumTests : IDisposable
     [Fact]
     public async Task EncodedChangeDataSeparator_CdcFile_IsNeverDeleted()
     {
-        // Red-team (Critical, #489): the scan short-circuit ("skip when no `_change_data/` candidate") must be
-        // ENCODING-ROBUST like OrphanCleanup's protection. A candidate whose directory SEPARATOR is
-        // URI-encoded ("_change_data%2Fencoded.parquet") does NOT start with the literal "_change_data/"
-        // prefix, so an Ordinal-only predicate would skip the scan, leave the cdc set empty, and DELETE the
-        // live change file. The predicate now also tests the `Uri.UnescapeDataString` form, so the scan runs
-        // and OrphanCleanup's encoding-robust match protects it. (Unlike EncodedCdcLogPath above, which
-        // encodes only the filename — whose raw disk key still carries the literal "_change_data/" prefix —
-        // this encodes the separator, the case the Ordinal short-circuit missed.)
+        // Red-team (Critical, #489): a candidate whose directory SEPARATOR is URI-encoded
+        // ("_change_data%2Fencoded.parquet") does NOT start with the literal "_change_data/" prefix. An earlier
+        // attempt to skip the cdc scan on a `_change_data/`-prefix candidate predicate would have skipped it,
+        // left the cdc set empty, and DELETED the live change file. VACUUM now scans the in-window commits
+        // UNCONDITIONALLY, so OrphanCleanup's encoding-robust match protects the file regardless of how the
+        // separator is encoded. (Unlike EncodedCdcLogPath above, which encodes only the filename — whose raw
+        // disk key still carries the literal "_change_data/" prefix — this encodes the separator.)
         await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
         await DeltaTestHarness.WriteCommitAsync(
             _backend, 1, DeltaTestHarness.Add("active.parquet"),
@@ -522,6 +521,61 @@ public sealed class DeltaVacuumTests : IDisposable
         Assert.DoesNotContain("_change_data%2Fencoded.parquet", result.DeletablePaths);
         Assert.DoesNotContain("_change_data%2Fencoded.parquet", result.DeletedPaths);
         Assert.NotNull(await _backend.HeadAsync("_change_data%2Fencoded.parquet", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task DoubleEncodedChangeDataSeparator_CdcFile_IsNeverDeleted()
+    {
+        // Red-team (2nd Critical, #489): the reason the cdc scan is UNCONDITIONAL. A verbatim writer can
+        // reference a `cdc` file whose raw disk key is DOUBLE-encoded ("_change_data%252Fencoded.parquet").
+        // OrphanCleanup protects it (raw-key match), but a one-pass `Uri.UnescapeDataString` predicate decodes
+        // only "%252F"->"%2F" (still not "_change_data/"), so any candidate-path short-circuit would skip the
+        // scan and DELETE it. Scanning unconditionally closes the gap: the cdc path is collected and matched
+        // byte-for-byte against the raw disk key.
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 1, DeltaTestHarness.Add("active.parquet"),
+            DeltaTestHarness.Cdc("_change_data%252Fencoded.parquet"));
+
+        await WriteDataFileAsync("active.parquet", Old);
+        await WriteDataFileAsync("_change_data%252Fencoded.parquet", Old); // double-encoded raw disk key, old mtime
+
+        var vacuum = new DeltaVacuum(
+            DeltaTestHarness.WithCommitTimestamps(_backend, (0, Recent), (1, Recent)),
+            policy: null, logger: null, telemetry: null, timeProvider: new FixedTimeProvider(Now));
+
+        VacuumResult result = await vacuum.VacuumAsync(Retention);
+
+        Assert.DoesNotContain("_change_data%252Fencoded.parquet", result.DeletablePaths);
+        Assert.DoesNotContain("_change_data%252Fencoded.parquet", result.DeletedPaths);
+        Assert.NotNull(await _backend.HeadAsync("_change_data%252Fencoded.parquet", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task NonCanonicalCdcPath_OutsideChangeDataDir_IsNeverDeleted()
+    {
+        // Red-team (2nd Critical, #489): a `cdc` action's path is NOT constrained to `_change_data/` (ParseCdc
+        // accepts any path), and OrphanCleanup protects a candidate matching ANY referenced cdc path. A cdc
+        // file at a non-canonical location ("cdc-blob.parquet", no `_change_data/` prefix) must therefore be
+        // protected too — a candidate-path short-circuit gated on the `_change_data/` prefix would have skipped
+        // the scan and DELETED it. The unconditional scan collects the path and OrphanCleanup protects it.
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 1, DeltaTestHarness.Add("active.parquet"),
+            DeltaTestHarness.Cdc("cdc-blob.parquet"));
+
+        await WriteDataFileAsync("active.parquet", Old);
+        await WriteDataFileAsync("cdc-blob.parquet", Old); // referenced cdc file outside _change_data/, old mtime
+
+        var vacuum = new DeltaVacuum(
+            DeltaTestHarness.WithCommitTimestamps(_backend, (0, Recent), (1, Recent)),
+            policy: null, logger: null, telemetry: null, timeProvider: new FixedTimeProvider(Now));
+
+        VacuumResult result = await vacuum.VacuumAsync(Retention);
+
+        Assert.DoesNotContain("cdc-blob.parquet", result.DeletablePaths);
+        Assert.DoesNotContain("cdc-blob.parquet", result.DeletedPaths);
+        Assert.NotNull(await _backend.HeadAsync("cdc-blob.parquet", CancellationToken.None));
     }
 
     [Theory]
