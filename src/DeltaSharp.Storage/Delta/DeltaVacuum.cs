@@ -277,10 +277,11 @@ internal sealed class DeltaVacuum
         // snapshot — with an mtime below the cutoff (clock skew / preserved-timestamp move / long copy) it
         // would bypass the recency fail-safe and be deleted. Listing first closes that window.
         //
-        // NOTE (tracked): candidate discovery + the protected set assume every referenced file is an
-        // add.path/remove.path. Deletion-vector (.bin) and Change-Data-Feed (_change_data/) files are
-        // referenced by other fields; when those features land their paths MUST be protected here (see
-        // OrphanCleanup remarks) — until then this VACUUM must not run on a table using them.
+        // NOTE (tracked): candidate discovery lists every object under the table root. Files referenced by a
+        // NON-add.path/remove.path field are protected explicitly below: deletion-vector (.bin) sidecars from
+        // the snapshot's DVs, and Change-Data-Feed (_change_data/) cdc files from the retained, in-window
+        // commit JSONs (#489, see the log scan after the snapshot load) — never from the snapshot's
+        // active/checkpoint state, which does not know cdc paths (INV C1).
         if (BeforeListProbe is { } beforeList)
         {
             await beforeList(cancellationToken).ConfigureAwait(false);
@@ -321,11 +322,24 @@ internal sealed class DeltaVacuum
         long nowMillis = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
         long cutoffMillis = nowMillis - (long)retention.TotalMilliseconds;
 
+        // #489: protect cdc `_change_data/` files referenced by a retained, in-window `cdc` action. These are
+        // referenced by a NON-add.path/remove.path field, and a `cdc` action is ignored by snapshot replay
+        // (INV C1) and not retained in checkpoints — so the loaded snapshot cannot know their paths. Scan the
+        // retained commit range (bounded by delta.logRetentionDuration, resolved from table config) for
+        // AddCdcFileAction paths and pass them as an additional protected set into the orphan-cleanup
+        // contract, mirroring how DV `.bin` sidecars are protected. A `_change_data/` file referenced only by
+        // a commit aged past log retention (below the log cutoff) is correctly absent and stays reclaimable.
+        TimeSpan logRetention = _policy.ResolveTableLogRetention(snapshot.Metadata.Configuration);
+        long logRetentionCutoffMillis = nowMillis - (long)logRetention.TotalMilliseconds;
+        IReadOnlyCollection<string> protectedChangeDataPaths =
+            await _log.CollectInWindowChangeDataPathsAsync(logRetentionCutoffMillis, cancellationToken)
+                .ConfigureAwait(false);
+
         // The single source of the deletion decision AND the audit reason (design §2.11.5): active files,
-        // retention-protected tombstones, and recently-staged files are excluded fail-safe by the contract
-        // (encoding-robust) — VACUUM never re-implements or widens this.
+        // retention-protected tombstones, referenced change-data files, and recently-staged files are
+        // excluded fail-safe by the contract (encoding-robust) — VACUUM never re-implements or widens this.
         IReadOnlyList<OrphanDecision> classified =
-            OrphanCleanup.Classify(snapshot, candidates, cutoffMillis);
+            OrphanCleanup.Classify(snapshot, candidates, cutoffMillis, protectedChangeDataPaths);
 
         (ImmutableArray<string> deletablePaths, ImmutableArray<string> deletedPaths,
             ImmutableArray<VacuumAuditEntry> audit) =
@@ -395,12 +409,13 @@ internal sealed class DeltaVacuum
         OrphanClassification.Deletable => VacuumDecision.Deletable,
         OrphanClassification.Active => VacuumDecision.Active,
         OrphanClassification.RetentionProtectedTombstone => VacuumDecision.RetentionProtectedTombstone,
+        OrphanClassification.ReferencedChangeData => VacuumDecision.ReferencedChangeData,
         _ => VacuumDecision.RecentlyStaged,
     };
 
     private void RecordDecisionCounts(ImmutableArray<VacuumAuditEntry> audit)
     {
-        long deletable = 0, active = 0, tombstone = 0, staged = 0;
+        long deletable = 0, active = 0, tombstone = 0, staged = 0, referencedCdc = 0;
         foreach (VacuumAuditEntry entry in audit)
         {
             switch (entry.Decision)
@@ -414,6 +429,9 @@ internal sealed class DeltaVacuum
                 case VacuumDecision.RetentionProtectedTombstone:
                     tombstone++;
                     break;
+                case VacuumDecision.ReferencedChangeData:
+                    referencedCdc++;
+                    break;
                 default:
                     staged++;
                     break;
@@ -423,6 +441,7 @@ internal sealed class DeltaVacuum
         _telemetry.RecordVacuumFiles(VacuumDecision.Deletable, deletable);
         _telemetry.RecordVacuumFiles(VacuumDecision.Active, active);
         _telemetry.RecordVacuumFiles(VacuumDecision.RetentionProtectedTombstone, tombstone);
+        _telemetry.RecordVacuumFiles(VacuumDecision.ReferencedChangeData, referencedCdc);
         _telemetry.RecordVacuumFiles(VacuumDecision.RecentlyStaged, staged);
     }
 

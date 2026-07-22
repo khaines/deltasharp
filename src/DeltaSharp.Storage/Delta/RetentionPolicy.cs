@@ -25,6 +25,11 @@ internal sealed record RetentionPolicy
     /// <summary>Delta's default deleted-file retention: 7 days (168 hours).</summary>
     internal static readonly TimeSpan DefaultRetentionWindow = TimeSpan.FromHours(168);
 
+    /// <summary>Delta's default log retention: 30 days. Bounds the window of retained commit JSONs (and
+    /// therefore the <c>cdc</c> <c>_change_data/</c> files knowable only from those commits, #489). Mirrors
+    /// Delta's <c>delta.logRetentionDuration</c> default.</summary>
+    internal static readonly TimeSpan DefaultLogRetentionWindow = TimeSpan.FromDays(30);
+
     /// <summary>The process-wide default policy: a 168-hour default retention with a 168-hour safety floor.</summary>
     internal static RetentionPolicy Default { get; } = new(DefaultRetentionWindow, DefaultRetentionWindow);
 
@@ -101,8 +106,41 @@ internal sealed record RetentionPolicy
         return configured;
     }
 
+    /// <summary>The Delta table property naming the log retention window that bounds how long a table's
+    /// commit JSONs are retained (design §2.6; Delta <c>delta.logRetentionDuration</c>, default 30 days).
+    /// Read from <see cref="MetadataAction.Configuration"/>. VACUUM uses it to bound the set of retained
+    /// commit JSONs it scans for <c>cdc</c> (<c>_change_data/</c>) file paths to protect (#489), because a
+    /// <c>cdc</c> action is ignored by snapshot replay (INV C1) and not retained in checkpoints — so its
+    /// referenced path is knowable only from an in-window commit JSON.</summary>
+    internal const string LogRetentionDurationKey = "delta.logRetentionDuration";
+
     /// <summary>
-    /// Parses a Delta <c>CalendarInterval</c>/duration string (e.g. <c>"interval 30 days"</c>,
+    /// Resolves the effective log retention from a table's <see cref="MetadataAction.Configuration"/>: the
+    /// parsed <see cref="LogRetentionDurationKey"/> when present and valid, else
+    /// <see cref="DefaultLogRetentionWindow"/> (30 days). Fail-closed: a property that is present but
+    /// <b>unparseable</b> (or expresses a calendar unit whose length is not fixed) throws rather than
+    /// silently falling back to a shorter default and under-protecting in-window <c>cdc</c> files.
+    /// </summary>
+    /// <exception cref="ArgumentNullException"><paramref name="configuration"/> is null.</exception>
+    /// <exception cref="FormatException">The property is present but cannot be parsed to a fixed duration.</exception>
+    internal TimeSpan ResolveTableLogRetention(ImmutableSortedDictionary<string, string> configuration)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+        if (!configuration.TryGetValue(LogRetentionDurationKey, out string? raw))
+        {
+            return DefaultLogRetentionWindow;
+        }
+
+        if (!TryParseRetentionInterval(raw, out TimeSpan configured))
+        {
+            throw new FormatException(string.Create(
+                CultureInfo.InvariantCulture,
+                $"Table property '{LogRetentionDurationKey}' value '{raw}' is not a parseable fixed-length " +
+                $"retention duration; VACUUM fails closed rather than under-protecting in-window change files."));
+        }
+
+        return configured;
+    }
     /// <c>"7 days"</c>, <c>"interval 1 weeks 12 hours"</c>) into a fixed <see cref="TimeSpan"/>. Accepts an
     /// optional leading <c>interval</c> keyword followed by one or more <c>&lt;number&gt; &lt;unit&gt;</c>
     /// pairs. Calendar units whose length is not fixed (<c>month</c>/<c>year</c>) are <b>rejected</b>

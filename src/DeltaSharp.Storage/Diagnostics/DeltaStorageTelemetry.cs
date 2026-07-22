@@ -152,7 +152,7 @@ internal enum DeleteOutcome
     Failure,
 }
 /// candidate file was kept or is deletion-eligible. The <b>deletion</b> decision itself is always the
-/// <see cref="DeltaSharp.Storage.Delta.OrphanCleanup.SelectDeletable"/> contract's output; the three kept
+/// <see cref="DeltaSharp.Storage.Delta.OrphanCleanup.SelectDeletable"/> contract's output; the four kept
 /// reasons annotate <i>why</i> the contract retained a file, for the audit trail. A closed, low-cardinality
 /// set — safe as the <see cref="DeltaStorageTelemetry.VacuumDecisionKey"/> metric label (a candidate path is
 /// never a metric tag).
@@ -172,6 +172,11 @@ internal enum VacuumDecision
     /// <summary>Modified within the retention window (<c>mtime &gt;= cutoff</c>, inclusive) — it may belong
     /// to an in-flight commit, so it is protected against listing lag / a torn view.</summary>
     RecentlyStaged,
+
+    /// <summary>Referenced by a <c>cdc</c> action in a retained, in-window commit JSON — a Change-Data-Feed
+    /// <c>_change_data/</c> file that is not an active file (INV C1) but is protected while a commit within
+    /// <c>delta.logRetentionDuration</c> still references it (#489).</summary>
+    ReferencedChangeData,
 }
 
 /// <summary>
@@ -550,6 +555,7 @@ internal sealed class DeltaStorageTelemetry : IDisposable
         VacuumDecision.Deletable => "deletable",
         VacuumDecision.Active => "active",
         VacuumDecision.RetentionProtectedTombstone => "retention_protected_tombstone",
+        VacuumDecision.ReferencedChangeData => "referenced_change_data",
         _ => "recently_staged",
     };
 

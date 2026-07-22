@@ -366,6 +366,44 @@ internal sealed class DeltaLog
         return DeltaLogActionReader.ParseCommit(content, version);
     }
 
+    /// <summary>
+    /// Enumerates the table-root-relative paths of every <c>_change_data/</c> file referenced by an
+    /// <see cref="AddCdcFileAction"/> in a <b>retained, in-window</b> commit JSON — a commit whose object
+    /// modification time is at or after <paramref name="logRetentionCutoffMillis"/> (epoch millis), i.e.
+    /// within <c>delta.logRetentionDuration</c>. This is the ONLY source for these paths: snapshot replay
+    /// ignores <c>cdc</c> actions (§2.3, §3.3 INV C1) and checkpoints do not retain them, so the snapshot
+    /// (active/checkpoint state) never knows a <c>cdc</c> file's path. VACUUM consumes this set to protect an
+    /// in-window change file from reclamation (#489). A <c>cdc</c> file referenced only by a commit that has
+    /// aged past log retention (below the cutoff — and therefore itself cleanable) is correctly absent here
+    /// and remains reclaimable, so the protection is window-bounded, never unbounded. Fail-safe: a commit
+    /// whose modification time is unknown is treated as in-window (protected), never dropped.
+    /// </summary>
+    /// <exception cref="DeltaProtocolException">A retained commit is malformed or exceeds the read ceiling.</exception>
+    internal async Task<IReadOnlyCollection<string>> CollectInWindowChangeDataPathsAsync(
+        long logRetentionCutoffMillis, CancellationToken cancellationToken)
+    {
+        LogListing listing = await ListLogAsync(cancellationToken).ConfigureAwait(false);
+        var paths = new HashSet<string>(StringComparer.Ordinal);
+        foreach (long version in listing.Commits)
+        {
+            if (listing.CommitTimestamps.TryGetValue(version, out DateTime modified)
+                && DeltaTimestamps.ToEpochMillis(modified) < logRetentionCutoffMillis)
+            {
+                continue; // known-aged past log retention → its cdc files are reclaimable, not protected.
+            }
+
+            foreach (DeltaAction action in await ReadCommitActionsAsync(version, cancellationToken).ConfigureAwait(false))
+            {
+                if (action is AddCdcFileAction cdc)
+                {
+                    paths.Add(cdc.Path);
+                }
+            }
+        }
+
+        return paths;
+    }
+
     /// <summary>Seeds <paramref name="state"/> from the selected checkpoint's parts, returning its version,
     /// or <see langword="null"/> if the checkpoint is corrupt/partial (the caller then replays from 0).</summary>
     private async Task<long?> TrySeedFromCheckpointAsync(

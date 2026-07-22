@@ -121,6 +121,14 @@ internal static class DeltaTestHarness
         """{"remove":{"path":"__P__","deletionTimestamp":1,"dataChange":true}}"""
             .Replace("__P__", path, StringComparison.Ordinal);
 
+    /// <summary>A <c>cdc</c> commit line referencing a Change-Data-Feed change file under
+    /// <c>_change_data/</c> (Delta "Add CDC File"). <c>dataChange</c> is always false — a cdc file is never
+    /// part of table state (§2.3, INV C1) — so snapshot replay ignores it; VACUUM (#489) protects the file
+    /// from an in-window commit.</summary>
+    public static string Cdc(string path) =>
+        """{"cdc":{"path":"__P__","partitionValues":{},"size":1,"dataChange":false}}"""
+            .Replace("__P__", path, StringComparison.Ordinal);
+
     /// <summary>A <c>remove</c> commit line carrying a relative-path ('u') <c>deletionVector</c> — the DV the
     /// removed logical file carried, which is part of its identity and which the checkpoint's nested DV
     /// struct must reconstruct bit-identically on a tombstone (issue #527).</summary>

@@ -341,6 +341,128 @@ public sealed class DeltaVacuumTests : IDisposable
         Assert.NotNull(await _backend.HeadAsync("hidden-active.parquet", CancellationToken.None));
     }
 
+    [Fact]
+    public async Task InWindowCdcFile_IsProtected_EvenThoughNotActive()
+    {
+        // #489: a `_change_data/x.parquet` referenced by an in-window `cdc` action must be protected by
+        // VACUUM — even though a cdc file is NEVER an active file (INV C1: snapshot replay ignores it, so it
+        // is not in ActiveFiles). Its path is knowable ONLY from the retained commit JSON, not the snapshot.
+        // The file's mtime is Old (past the deleted-file cutoff), so nothing but the cdc reference saves it.
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 1, DeltaTestHarness.Add("active.parquet"), DeltaTestHarness.Cdc("_change_data/x.parquet"));
+
+        await WriteDataFileAsync("active.parquet", Old);
+        await WriteDataFileAsync("_change_data/x.parquet", Old); // Old mtime → only the cdc ref protects it
+
+        // The cdc-bearing commit (v1) is within the 30-day log-retention window; stamp its listed mtime so
+        // the log scan sees it inside the window (a real wall-clock mtime would fall far before Now=2030).
+        var vacuum = new DeltaVacuum(
+            DeltaTestHarness.WithCommitTimestamps(_backend, (0, Recent), (1, Recent)),
+            policy: null, logger: null, telemetry: null, timeProvider: new FixedTimeProvider(Now));
+
+        VacuumResult result = await vacuum.VacuumAsync(Retention);
+
+        // The change file survives and is audited as a protected referenced-change-data file, not deletable.
+        Assert.DoesNotContain("_change_data/x.parquet", result.DeletablePaths);
+        Assert.DoesNotContain("_change_data/x.parquet", result.DeletedPaths);
+        Assert.NotNull(await _backend.HeadAsync("_change_data/x.parquet", CancellationToken.None));
+        Assert.Equal(
+            VacuumDecision.ReferencedChangeData,
+            result.Audit.Single(e => e.Path == "_change_data/x.parquet").Decision);
+    }
+
+    [Fact]
+    public async Task OrphanChangeDataFile_ReferencedByNoCdcAction_IsReclaimable()
+    {
+        // #489: a `_change_data/y.parquet` that no retained `cdc` action references is a genuine orphan
+        // (e.g. a change file staged by a crashed writer) and, once past retention, is reclaimable — the cdc
+        // protection must not blanket-protect the whole _change_data/ directory.
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 1, DeltaTestHarness.Add("active.parquet"), DeltaTestHarness.Cdc("_change_data/x.parquet"));
+
+        await WriteDataFileAsync("active.parquet", Old);
+        await WriteDataFileAsync("_change_data/x.parquet", Old);  // referenced by v1's cdc → protected
+        await WriteDataFileAsync("_change_data/y.parquet", Old);  // referenced by NO cdc action → deletable
+
+        var vacuum = new DeltaVacuum(
+            DeltaTestHarness.WithCommitTimestamps(_backend, (0, Recent), (1, Recent)),
+            policy: null, logger: null, telemetry: null, timeProvider: new FixedTimeProvider(Now));
+
+        VacuumResult result = await vacuum.VacuumAsync(Retention);
+
+        Assert.Equal(new[] { "_change_data/y.parquet" }, result.DeletedPaths.ToArray());
+        Assert.Null(await _backend.HeadAsync("_change_data/y.parquet", CancellationToken.None));
+        Assert.NotNull(await _backend.HeadAsync("_change_data/x.parquet", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task CdcFile_ReferencedOnlyByCommitAgedPastLogRetention_IsReclaimable()
+    {
+        // #489 (window-bounded): a cdc file referenced only by a commit whose JSON has aged past
+        // delta.logRetentionDuration is NOT in the retained window, so it is correctly unprotected and
+        // reclaimable. v1's listed mtime is Old (60 days) — well past the 30-day log-retention cutoff — so
+        // the log scan skips it and its cdc file falls through to Deletable.
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 1, DeltaTestHarness.Add("active.parquet"), DeltaTestHarness.Cdc("_change_data/aged.parquet"));
+
+        await WriteDataFileAsync("active.parquet", Old);
+        await WriteDataFileAsync("_change_data/aged.parquet", Old);
+
+        var vacuum = new DeltaVacuum(
+            DeltaTestHarness.WithCommitTimestamps(_backend, (0, new DateTimeOffset(Old, TimeSpan.Zero)),
+                (1, new DateTimeOffset(Old, TimeSpan.Zero))),
+            policy: null, logger: null, telemetry: null, timeProvider: new FixedTimeProvider(Now));
+
+        VacuumResult result = await vacuum.VacuumAsync(Retention);
+
+        Assert.Contains("_change_data/aged.parquet", result.DeletedPaths);
+        Assert.Null(await _backend.HeadAsync("_change_data/aged.parquet", CancellationToken.None));
+        Assert.Equal(
+            VacuumDecision.Deletable,
+            result.Audit.Single(e => e.Path == "_change_data/aged.parquet").Decision);
+    }
+
+    [Fact]
+    public async Task CdcAction_DoesNotBecomeActiveFile_InvariantC1()
+    {
+        // INV C1: a `cdc` action must not affect snapshot reconstruction — a snapshot of a table WITH a cdc
+        // action has exactly the same active state (ActiveFiles / Tombstones) as one without. This pins that
+        // VACUUM's new cdc protection does not leak the cdc file into active read state.
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 1, DeltaTestHarness.Add("active.parquet"), DeltaTestHarness.Cdc("_change_data/x.parquet"));
+
+        var log = new DeltaLog(_backend);
+        Snapshot withCdc = await log.LoadSnapshotAsync(version: null, CancellationToken.None);
+
+        // The cdc file is neither an active file nor a tombstone; only the real add is active.
+        Assert.Equal(new[] { "active.parquet" }, withCdc.ActiveFiles.Select(a => a.Path).ToArray());
+        Assert.Empty(withCdc.Tombstones);
+
+        // A parallel table with the SAME add but NO cdc action yields byte-identical active state.
+        string otherRoot = Path.Combine(Path.GetTempPath(), "vacuum-c1-" + Guid.NewGuid().ToString("N"));
+        using var otherBackend = new LocalFileSystemBackend(otherRoot);
+        try
+        {
+            await DeltaTestHarness.WriteCommitAsync(
+                otherBackend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+            await DeltaTestHarness.WriteCommitAsync(otherBackend, 1, DeltaTestHarness.Add("active.parquet"));
+            Snapshot withoutCdc = await new DeltaLog(otherBackend).LoadSnapshotAsync(version: null, CancellationToken.None);
+
+            Assert.Equal(
+                withoutCdc.ActiveFiles.Select(a => a.Path).ToArray(),
+                withCdc.ActiveFiles.Select(a => a.Path).ToArray());
+            Assert.Equal(withoutCdc.Tombstones.Length, withCdc.Tombstones.Length);
+        }
+        finally
+        {
+            Directory.Delete(otherRoot, recursive: true);
+        }
+    }
+
     // ---- helpers ----
 
     private static DateTime Old => Now.AddDays(-60).UtcDateTime;    // well before any tested cutoff → deletable
