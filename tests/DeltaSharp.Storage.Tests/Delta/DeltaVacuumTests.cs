@@ -668,7 +668,7 @@ public sealed class DeltaVacuumTests : IDisposable
         await DeltaTestHarness.WriteRawCommitAsync(
             _backend, 0, System.Text.Encoding.UTF8.GetBytes("{ this is not valid delta json"));
 
-        // A `_change_data/` candidate forces the short-circuit to actually run the scan (else it is skipped).
+        // A co-present old `_change_data/` orphan (otherwise reclaimable) confirms the abort precedes deletion.
         await WriteDataFileAsync("_change_data/orphan.parquet", Old);
 
         var vacuum = new DeltaVacuum(
@@ -709,9 +709,9 @@ public sealed class DeltaVacuumTests : IDisposable
     [Fact]
     public async Task NonCdfTable_NoChangeDataCandidates_ReclaimsOrphans()
     {
-        // #489 short-circuit: a table with no `_change_data/` candidate skips the in-window cdc scan entirely
-        // (nothing to protect). VACUUM behaves exactly as before — a genuine orphan past retention is
-        // reclaimed and the active file is protected — exercising the short-circuit path without regression.
+        // #489: a non-CDF table has no `cdc` actions in its retained commits, so the unconditional in-window
+        // cdc scan collects no protected paths and VACUUM behaves exactly as a pre-CDF table — a genuine
+        // orphan past retention is reclaimed and the active file is protected (no over-protection regression).
         await WriteLogAsync(new[] { DeltaTestHarness.Add("active.parquet") });
         await WriteDataFileAsync("active.parquet", Old);
         await WriteDataFileAsync("old-orphan.parquet", Old);
