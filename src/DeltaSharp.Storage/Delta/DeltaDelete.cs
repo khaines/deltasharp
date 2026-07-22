@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using DeltaSharp.Diagnostics;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Backends;
@@ -82,12 +83,18 @@ internal sealed class DeltaDelete
     private static readonly ImmutableSortedDictionary<string, long> EmptyNullCount =
         ImmutableSortedDictionary<string, long>.Empty.WithComparers(StringComparer.Ordinal);
 
+    // A cdc file (like an add) carries a tags map; a DELETE-generated cdc file has no tags to record.
+    private static readonly ImmutableSortedDictionary<string, string> EmptyTags =
+        ImmutableSortedDictionary<string, string>.Empty.WithComparers(StringComparer.Ordinal);
+
     private readonly IStorageBackend _backend;
     private readonly DeltaLog _log;
     private readonly DeltaCommitter _committer;
     private readonly TimeProvider _timeProvider;
     private readonly ParquetFileReader _reader;
     private readonly IDeletionVectorIdSource _idSource;
+    private readonly ChangeDataWriter _changeDataWriter;
+    private readonly Func<string> _cdcFileNameFactory;
     private readonly ILogger<DeltaDelete> _logger;
     private readonly DeltaStorageTelemetry _telemetry;
 
@@ -113,7 +120,11 @@ internal sealed class DeltaDelete
     /// race probe, a deterministic clock for tombstone/modification timestamps, and a deterministic DV id
     /// source so on-disk DV file names are predictable), plus optional injected logger/telemetry. When
     /// <paramref name="committer"/> is null the committer is built from <paramref name="timeProvider"/> so the
-    /// injected clock also drives <c>commitInfo.timestamp</c> (#510).</summary>
+    /// injected clock also drives <c>commitInfo.timestamp</c> (#510). When Change Data Feed is enabled on the
+    /// read snapshot (§2.5), the DELETE materializes its deleted rows as <c>cdc</c> files via
+    /// <paramref name="changeDataWriter"/>, whose file names come from <paramref name="cdcFileNameFactory"/>
+    /// (a deterministic seam a golden fixture injects, mirroring the data-file naming seam — never the banned
+    /// <c>Guid.NewGuid</c>).</summary>
     internal DeltaDelete(
         IStorageBackend backend,
         DeltaLog log,
@@ -122,7 +133,9 @@ internal sealed class DeltaDelete
         ParquetFileReader? reader = null,
         IDeletionVectorIdSource? idSource = null,
         ILogger<DeltaDelete>? logger = null,
-        DeltaStorageTelemetry? telemetry = null)
+        DeltaStorageTelemetry? telemetry = null,
+        ChangeDataWriter? changeDataWriter = null,
+        Func<string>? cdcFileNameFactory = null)
     {
         ArgumentNullException.ThrowIfNull(backend);
         ArgumentNullException.ThrowIfNull(log);
@@ -133,6 +146,8 @@ internal sealed class DeltaDelete
         _committer = committer ?? new DeltaCommitter(backend, _timeProvider);
         _reader = reader ?? new ParquetFileReader();
         _idSource = idSource ?? new RandomDeletionVectorIdSource();
+        _changeDataWriter = changeDataWriter ?? new ChangeDataWriter(backend);
+        _cdcFileNameFactory = cdcFileNameFactory ?? ChangeDataWriter.DefaultFileNameFactory;
         _logger = logger ?? NullLogger<DeltaDelete>.Instance;
         _telemetry = telemetry ?? DeltaStorageTelemetry.Shared;
     }
@@ -251,10 +266,24 @@ internal sealed class DeltaDelete
         // than being silently promoted.
         bool allowTypeWideningPromotion = TypeWideningFeature.Supports(readSnapshot.Protocol);
 
+        // Change Data Feed generation gate (§2.5). CDF is enabled iff the read snapshot's metadata sets
+        // delta.enableChangeDataFeed=true; ALL new behavior is gated on this, so a CDF-disabled DELETE is
+        // byte-identical to before (INV C1 — no cdc rows captured, no cdc files, no cdc actions). When
+        // enabled, EVERY affected file's newly-deleted rows are materialized as a cdc file in the SAME commit
+        // (completeness, INV C2/C3). Fail closed EARLY (before any DV/cdc side effect) if the physical data
+        // schema carries a nested column cdc generation cannot write, so we never publish an incomplete cdc
+        // set that read-time precedence would make silently lossy.
+        bool changeDataFeedEnabled = ChangeDataFeedFeature.IsEnabled(readSnapshot.Metadata.Configuration);
+        if (changeDataFeedEnabled)
+        {
+            ChangeDataWriter.EnsureWritableDataSchema(dataSchema);
+        }
+
         var actions = new List<DeltaAction>();
         var inputPaths = new List<string>();
         int filesWithDeletionVector = 0;
         int filesFullyDeleted = 0;
+        int numChangeFilesAdded = 0;
         long rowsDeleted = 0;
 
         foreach (AddFileAction add in readSnapshot.ActiveFiles)
@@ -262,12 +291,13 @@ internal sealed class DeltaDelete
             cancellationToken.ThrowIfCancellationRequested();
 
             FileDeletionPlan plan = await PlanFileDeletionAsync(
-                add, tableSchema, physicalNames, dataSchema, dataOrdinalByField, resolveByFieldId, predicate, allowTypeWideningPromotion, cancellationToken)
+                add, tableSchema, physicalNames, dataSchema, dataOrdinalByField, resolveByFieldId, predicate, allowTypeWideningPromotion, changeDataFeedEnabled, cancellationToken)
                 .ConfigureAwait(false);
 
             if (plan.NewlyDeletedCount == 0)
             {
-                // No row in this file newly matched the predicate — leave its add untouched.
+                // No row in this file newly matched the predicate — leave its add untouched. An idempotent
+                // re-delete (every match already masked by the prior DV) lands here and emits NO cdc file.
                 continue;
             }
 
@@ -278,6 +308,22 @@ internal sealed class DeltaDelete
             // file (SnapshotState keys active/tombstone by path + DV uniqueId). dataChange=true: a delete
             // changes the visible data.
             actions.Add(ToRemove(add, timestamp));
+
+            // CDF materialization (§2.5), BEFORE the partial-vs-full branch split so BOTH branches publish
+            // their newly-deleted rows as cdc (INV C2/C3 completeness — a mixed commit that materialized only
+            // the partial branch would silently lose the fully-deleted file's rows, because a cdc-bearing
+            // version suppresses ALL implicit derivation, §2.2). The cdc action rides the SAME `actions` list,
+            // so it is published atomically in this DELETE commit — never a separate commit.
+            if (changeDataFeedEnabled)
+            {
+                ChangeDataWriter.ChangeDataFile cdc = await _changeDataWriter
+                    .WriteAsync(
+                        dataSchema, plan.NewlyDeletedRows, ChangeDataWriter.DeleteChange,
+                        _cdcFileNameFactory(), cancellationToken)
+                    .ConfigureAwait(false);
+                actions.Add(new AddCdcFileAction(cdc.Path, add.PartitionValues, cdc.Size, EmptyTags));
+                numChangeFilesAdded++;
+            }
 
             long cardinality = plan.AllDeletedPositions.Length;
             if (cardinality >= plan.PhysicalRecords)
@@ -320,9 +366,10 @@ internal sealed class DeltaDelete
 
         // ONE commit removing every affected file's prior add and adding its residual (DV-carrying) add,
         // scoped to exactly the affected paths so a concurrent change to any of them aborts (no lost delete).
-        // Prepend the DELETE provenance so DESCRIBE HISTORY records operation="DELETE" (commitInfo is
-        // informational; the committer stamps timestamp/engineInfo/txnId).
-        actions.Insert(0, DeltaCommitInfo.Delete());
+        // Prepend the DELETE provenance (operation="DELETE" + operationMetrics) so DESCRIBE HISTORY records
+        // the deleted-row and cdc-file counts (commitInfo is informational; the committer stamps
+        // timestamp/engineInfo/txnId). numChangeFilesAdded is 0 when CDF is disabled.
+        actions.Insert(0, DeltaCommitInfo.Delete(rowsDeleted, numChangeFilesAdded));
         DeltaCommitResult commit = await _committer
             .CommitAsync(readSnapshot, actions, DeltaReadScope.ReadFiles(inputPaths), cancellationToken)
             .ConfigureAwait(false);
@@ -343,6 +390,7 @@ internal sealed class DeltaDelete
         bool resolveByFieldId,
         DeltaDeletePredicate predicate,
         bool allowTypeWideningPromotion,
+        bool captureChangeData,
         CancellationToken cancellationToken)
     {
         // Seed with the file's existing DV positions (a prior delete on the same file), so a second delete
@@ -370,6 +418,13 @@ internal sealed class DeltaDelete
 
         long newlyDeleted = 0;
         long fileRowOffset = 0;
+        // CDF capture (§2.5): when enabled, collect the physical data rows of exactly the NEWLY-deleted
+        // positions as selection views over the batches we're ALREADY reading here — the SAME scan pass, so
+        // no second full-file read (§4.3 memory budget). The reader hands back a fresh batch per row group
+        // (no buffer recycling — verified in ParquetFileReader), so retaining a selection view across row
+        // groups is safe. Stays null (never allocated) when CDF is disabled, so the INV C1 path is byte-for-
+        // byte the prior behavior.
+        List<ColumnBatch>? changeRows = captureChangeData ? new List<ColumnBatch>() : null;
         Stream stream = await _backend.OpenReadAsync(add.Path, cancellationToken).ConfigureAwait(false);
         await using (stream.ConfigureAwait(false))
         {
@@ -379,6 +434,7 @@ internal sealed class DeltaDelete
             {
                 ColumnBatch fullBatch = ColumnMappingProjection.BuildFullBatch(
                     add, tableSchema, physicalNames, dataOrdinalByField, dataBatch);
+                List<int>? batchSelection = null;
                 for (int row = 0; row < fullBatch.RowCount; row++)
                 {
                     if (predicate.Matches(fullBatch, row))
@@ -387,8 +443,23 @@ internal sealed class DeltaDelete
                         if (deleted.Add(position))
                         {
                             newlyDeleted++;
+                            if (captureChangeData)
+                            {
+                                // Batch-relative index of a NEWLY-deleted row. fullBatch shares dataBatch's
+                                // physical row positions (BuildFullBatch relabels columns without reordering
+                                // rows), so `row` indexes dataBatch directly for the cdc selection view.
+                                (batchSelection ??= new List<int>()).Add(row);
+                            }
                         }
                     }
+                }
+
+                if (changeRows is not null && batchSelection is not null)
+                {
+                    // Physical data columns (dataSchema) of this batch's newly-deleted rows, zero-copy. The
+                    // ChangeDataWriter appends the constant `_change_type` and writes exactly these rows.
+                    changeRows.Add(
+                        dataBatch.WithSelection(new SelectionVector(CollectionsMarshal.AsSpan(batchSelection))));
                 }
 
                 fileRowOffset = checked(fileRowOffset + dataBatch.RowCount);
@@ -408,7 +479,8 @@ internal sealed class DeltaDelete
 
         long[] all = new long[deleted.Count];
         deleted.CopyTo(all);
-        return new FileDeletionPlan(all, fileRowOffset, newlyDeleted);
+        IReadOnlyList<ColumnBatch> changeRowsResult = changeRows ?? (IReadOnlyList<ColumnBatch>)Array.Empty<ColumnBatch>();
+        return new FileDeletionPlan(all, fileRowOffset, newlyDeleted, changeRowsResult);
     }
 
     // Writes the new DV positions to an on-disk 'u' (relative-path-via-UUID) .bin at the table root and
@@ -466,8 +538,14 @@ internal sealed class DeltaDelete
         activity?.SetTag(DeltaSharpTelemetry.OutcomeKey, DeltaStorageTelemetry.ToLabel(outcome));
 
     // One file's delete plan: the complete sorted-distinct set of file-relative physical positions to delete
-    // (existing DV ∪ newly matched), the file's physical record count (rows actually read), and how many of
-    // the deleted positions are NEW (not already in the prior DV) — a file with zero new deletes is skipped.
+    // (existing DV ∪ newly matched), the file's physical record count (rows actually read), how many of the
+    // deleted positions are NEW (not already in the prior DV) — a file with zero new deletes is skipped — and,
+    // when CDF is enabled, the physical data rows of exactly those newly-deleted positions (selection views
+    // over the batches read during planning), captured in the SAME scan pass so no second full-file read
+    // occurs (§4.3). NewlyDeletedRows is empty when CDF is disabled.
     private readonly record struct FileDeletionPlan(
-        long[] AllDeletedPositions, long PhysicalRecords, long NewlyDeletedCount);
+        long[] AllDeletedPositions,
+        long PhysicalRecords,
+        long NewlyDeletedCount,
+        IReadOnlyList<ColumnBatch> NewlyDeletedRows);
 }

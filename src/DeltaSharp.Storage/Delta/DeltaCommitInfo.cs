@@ -68,11 +68,36 @@ internal static class DeltaCommitInfo
         WithOperation(CreateTableOperation, Parameters(
             ("partitionBy", JsonEncodedArray(partitionColumns))));
 
-    /// <summary>Provenance for a DELETE: <c>operation="DELETE"</c> only. The Delta <c>predicate</c> parameter
-    /// (a JSON array of SQL predicate strings) is non-trivial to render faithfully from the internal delete
-    /// predicate, so it is omitted rather than emitted in a wrong shape (the issue sanctions this) — the
-    /// operation itself is what <c>DESCRIBE HISTORY</c> needs.</summary>
-    internal static CommitInfoAction Delete() => WithOperation(DeleteOperation, EmptyParameters);
+    /// <summary>Provenance for a DELETE: <c>operation="DELETE"</c> plus the DELETE <c>operationMetrics</c>
+    /// (<paramref name="numDeletedRows"/>, <paramref name="numChangeFilesAdded"/>). The Delta
+    /// <c>predicate</c> parameter (a JSON array of SQL predicate strings) is non-trivial to render faithfully
+    /// from the internal delete predicate, so it is omitted rather than emitted in a wrong shape (the issue
+    /// sanctions this) — the operation + metrics are what <c>DESCRIBE HISTORY</c> needs.
+    ///
+    /// <para><b>Metric keys (delta-io/delta <c>DeltaOperationMetrics.DELETE</c> parity).</b> Verified against
+    /// delta-io/delta v4.3.1 (<c>DeltaOperations.scala</c> — the metric set moved into that file): the
+    /// canonical CDC-file-count key is <c>numAddedChangeFiles</c> ("number of CDC files"), NOT the
+    /// <c>numChangeFilesAdded</c> spelling; and the deleted-row key is <c>numDeletedRows</c> ("number of rows
+    /// removed"). We emit exactly these two (the story's scope) with the canonical spellings so
+    /// <c>DESCRIBE HISTORY</c> / delta-rs / delta-spark read them under their expected names — mirroring the
+    /// deliberate canonical-vs-obvious spelling choice already made for <see cref="Optimize"/>
+    /// (<c>numAddedFiles</c> over <c>numFilesAdded</c>). delta-spark's other DELETE metrics
+    /// (<c>numRemovedFiles</c>/timings/DV counts) are omitted (not tracked here); readers ignore absent
+    /// metric keys (commitInfo is not load-bearing), so a subset is safe.</para>
+    ///
+    /// <para><b>CDF gate.</b> <paramref name="numChangeFilesAdded"/> is <c>0</c> when Change Data Feed is
+    /// disabled (no <c>cdc</c> files are materialized), so the DELETE still records a well-formed, honest
+    /// metric set. <b>Value encoding.</b> operationMetrics is a Delta <c>Map&lt;String,String&gt;</c>, so each
+    /// value is a quoted number-string token via <see cref="JsonNumberString"/> (e.g. <c>3</c> ⇒ <c>"3"</c>),
+    /// never a bare JSON number — identical to <see cref="Optimize"/>.</para></summary>
+    internal static CommitInfoAction Delete(long numDeletedRows, long numChangeFilesAdded) =>
+        new(
+            ImmutableSortedDictionary<string, string>.Empty.WithComparers(StringComparer.Ordinal),
+            Operation: DeleteOperation,
+            OperationParameters: EmptyParameters,
+            OperationMetrics: Parameters(
+                ("numDeletedRows", JsonNumberString(numDeletedRows)),
+                ("numAddedChangeFiles", JsonNumberString(numChangeFilesAdded))));
 
     /// <summary>Provenance for an OPTIMIZE: <c>operation="OPTIMIZE"</c> with an empty <c>predicate</c> — a
     /// double-encoded JSON-string token whose content is the empty array (<c>"[]"</c>), matching delta-spark's
