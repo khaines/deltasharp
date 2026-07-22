@@ -127,6 +127,7 @@ internal static class DeltaLogActionReader
             "protocol" => ParseProtocol(body, version, line),
             "metaData" => ParseMetadata(body, version, line),
             "add" => ParseAdd(body, version, line),
+            "cdc" => ParseCdc(body, version, line),
             "remove" => ParseRemove(body, version, line),
             "txn" => ParseTxn(body, version, line),
             "commitInfo" => ParseCommitInfo(body),
@@ -193,6 +194,27 @@ internal static class DeltaLogActionReader
             ParseStats(body, version, line),
             GetStringMap(body, "tags", "add", version, line),
             DeletionVectors.DeletionVectorDescriptor.Parse(body, "add", version, line));
+    }
+
+    private static AddCdcFileAction ParseCdc(JsonElement body, long version, int line)
+    {
+        RequireObject(body, "cdc", version, line);
+        // A cdc file is never part of table state, and the Delta protocol mandates dataChange=false. Validate
+        // it fail-closed (reject a missing, non-boolean, or non-false value) — consistent with the other
+        // action parsers — rather than silently accepting a malformed/hostile cdc that claims dataChange=true
+        // (§2.3, INV C1). The other cdc fields (stats / modificationTime / deletionVector) are absent by design.
+        if (GetOptionalBool(body, "dataChange", "cdc", version, line) != false)
+        {
+            throw DeltaProtocolException.Malformed(
+                $"A 'cdc' action (version {version}, line {line}) must declare dataChange=false — the Delta "
+                + "protocol requires it and a change file is never part of table state — but it was absent or true.");
+        }
+
+        return new AddCdcFileAction(
+            GetRequiredString(body, "path", "cdc", version, line),
+            GetNullableStringMap(body, "partitionValues", "cdc", version, line),
+            GetRequiredInt64(body, "size", "cdc", version, line),
+            GetStringMap(body, "tags", "cdc", version, line));
     }
 
     private static RemoveFileAction ParseRemove(JsonElement body, long version, int line)

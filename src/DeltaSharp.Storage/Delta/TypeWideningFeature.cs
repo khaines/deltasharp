@@ -120,7 +120,10 @@ internal static class TypeWideningFeature
     /// (<see cref="AppendOnlyFeature.EnsureCommitAllowed"/>). The <c>invariants</c> / <c>checkConstraints</c>
     /// writer features are likewise enumerated when the table carries a column invariant or a
     /// <c>delta.constraints.*</c> CHECK constraint; they are enforced per row at the write seam (#581/#568),
-    /// so upgrading preserves rather than silently deactivates them.</para>
+    /// so upgrading preserves rather than silently deactivates them. The <c>changeDataFeed</c> writer feature
+    /// is likewise enumerated when the table carries <c>delta.enableChangeDataFeed=true</c>, so CDF stays
+    /// active across the upgrade (a normal read is unaffected — snapshot reconstruction ignores <c>cdc</c>
+    /// actions, INV C1).</para>
     ///
     /// <para>Idempotent in shape: if a feature is already present (stable OR preview <c>typeWidening</c>
     /// spelling, or an already-enumerated legacy feature) the feature lists are returned unchanged; the
@@ -135,9 +138,55 @@ internal static class TypeWideningFeature
 
         // Enumerate the implicitly-active legacy writer features so they stay ACTIVE across the table-features
         // upgrade (Delta "Active Features": a feature is active iff it is in writerFeatures AND its metadata
-        // marker is present). This build now ENFORCES each per row at the write seam (#549 appendOnly, #581
+        // marker is present). This build ENFORCES each per row at the write seam (#549 appendOnly, #581
         // invariants/CHECK constraints), so enumerating them is safe rather than silently deactivating them.
-        ImmutableArray<string> writerFeatures = WithFeature(existing.WriterFeatures);
+        // typeWidening itself is a reader+writer feature, added to BOTH lanes below.
+        ImmutableArray<string> writerFeatures = EnumerateActiveLegacyWriterFeatures(
+            WithFeature(existing.WriterFeatures), schema, configuration);
+
+        return new ProtocolAction(
+            Math.Max(existing.MinReaderVersion, ReaderVersion),
+            Math.Max(existing.MinWriterVersion, WriterVersion),
+            WithFeature(existing.ReaderFeatures),
+            writerFeatures);
+    }
+
+    /// <summary>
+    /// Upgrades <paramref name="existing"/> to the table-features <b>writer</b> version (7) for a
+    /// <b>writer-only</b> feature, enumerating every implicitly-active legacy writer feature
+    /// (<c>appendOnly</c>/#549, column <c>invariants</c> + <c>checkConstraints</c>/#568/#581,
+    /// <c>changeDataFeed</c>) so none is silently deactivated, and leaving the <b>reader lane</b> (version and
+    /// features) <b>entirely untouched</b> — the correct shape for a feature that needs no reader support
+    /// (e.g. <c>changeDataFeed</c>: a normal read ignores <c>cdc</c> actions, INV C1). Contrast
+    /// <see cref="UpgradeProtocol"/>, which additionally installs the <c>typeWidening</c> reader feature and
+    /// floors the reader version to 3. Idempotent in shape: a table already at writer 7 with the features
+    /// enumerated is returned unchanged.
+    /// </summary>
+    public static ProtocolAction UpgradeWriterFeatures(
+        ProtocolAction existing, StructType schema, IReadOnlyDictionary<string, string> configuration)
+    {
+        ArgumentNullException.ThrowIfNull(existing);
+        ArgumentNullException.ThrowIfNull(schema);
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        ImmutableArray<string> writerFeatures = EnumerateActiveLegacyWriterFeatures(
+            existing.WriterFeatures.IsDefault ? ImmutableArray<string>.Empty : existing.WriterFeatures,
+            schema,
+            configuration);
+
+        return new ProtocolAction(
+            existing.MinReaderVersion,                          // reader lane UNCHANGED (writer-only feature)
+            Math.Max(existing.MinWriterVersion, WriterVersion), // floor writer → 7
+            existing.ReaderFeatures,                            // reader features UNCHANGED
+            writerFeatures);
+    }
+
+    // Enumerates the implicitly-active legacy WRITER features into writerFeatures — shared by UpgradeProtocol
+    // (type widening, reader+writer) and UpgradeWriterFeatures (writer-only features). Does NOT add
+    // typeWidening (a reader+writer feature handled via the callers' reader lane).
+    private static ImmutableArray<string> EnumerateActiveLegacyWriterFeatures(
+        ImmutableArray<string> writerFeatures, StructType schema, IReadOnlyDictionary<string, string> configuration)
+    {
         if (AppendOnlyFeature.IsEnabled(configuration))
         {
             writerFeatures = AppendOnlyFeature.WithWriterFeature(writerFeatures);
@@ -153,11 +202,14 @@ internal static class TypeWideningFeature
             writerFeatures = WithWriterFeature(writerFeatures, InvariantsFeature);
         }
 
-        return new ProtocolAction(
-            Math.Max(existing.MinReaderVersion, ReaderVersion),
-            Math.Max(existing.MinWriterVersion, WriterVersion),
-            WithFeature(existing.ReaderFeatures),
-            writerFeatures);
+        if (ChangeDataFeedFeature.IsEnabled(configuration))
+        {
+            // Enumerate the changeDataFeed writer feature (writer-only) when the table has
+            // delta.enableChangeDataFeed=true, so CDF stays active across a legacy → table-features upgrade.
+            writerFeatures = ChangeDataFeedFeature.WithWriterFeature(writerFeatures);
+        }
+
+        return writerFeatures;
     }
 
     // Adds a writer feature to a list unless already present (a default array is treated as empty).

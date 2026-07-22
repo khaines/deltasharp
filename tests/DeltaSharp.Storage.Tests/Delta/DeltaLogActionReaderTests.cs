@@ -134,6 +134,8 @@ public sealed class DeltaLogActionReaderTests
     [InlineData("""{"protocol":{"minWriterVersion":2}}""")]                            // missing minReaderVersion
     [InlineData("""{"metaData":{"id":"t","format":{"provider":"parquet"},"partitionColumns":[]}}""")] // missing schemaString
     [InlineData("""{"add":{"path":"p","partitionValues":{},"size":"big","modificationTime":1}}""")] // wrong-typed size
+    [InlineData("""{"cdc":{"path":"_change_data/f.parquet","partitionValues":{},"size":1,"dataChange":true}}""")] // cdc must be dataChange=false
+    [InlineData("""{"cdc":{"path":"_change_data/f.parquet","partitionValues":{},"size":1}}""")]      // cdc missing required dataChange=false
     [InlineData("""{"txn":{"appId":"a","version":1},"add":{"path":"p"}}""")]           // two action keys on one line
     [InlineData("not json at all")]                                                    // malformed JSON
     [InlineData("""["array","not","object"]""")]                                       // top-level not an object

@@ -59,6 +59,22 @@ internal sealed record AddFileAction(
     DeletionVectorDescriptor? DeletionVector = null) : DeltaAction;
 
 /// <summary>
+/// <c>cdc</c> — a Change Data Feed change file (Delta protocol "Add CDC File"). Its Parquet file lives
+/// under <c>_change_data/</c> and holds the table's data columns plus a synthesized <c>_change_type</c>
+/// column. A <c>cdc</c> file is <b>never</b> part of table state: <c>dataChange</c> is ALWAYS false (modeled
+/// as a serialize-time constant, not a field), and snapshot reconstruction ignores it entirely (§2.3, §3.3
+/// INV C1) — it is consumed only by an explicit change-feed read (§2.6). Present only when the
+/// <c>changeDataFeed</c> writer feature is active. Like <see cref="AddFileAction"/>, partition columns live
+/// only on <see cref="PartitionValues"/> (never in the file body); <see cref="Tags"/> mirrors
+/// <see cref="AddFileAction.Tags"/> (default empty).
+/// </summary>
+internal sealed record AddCdcFileAction(
+    string Path,
+    ImmutableSortedDictionary<string, string?> PartitionValues,
+    long Size,
+    ImmutableSortedDictionary<string, string> Tags) : DeltaAction;
+
+/// <summary>
 /// <c>remove</c> — a tombstone deleting a previously-<c>add</c>ed <see cref="Path"/> from the active
 /// set. Retained for time travel + VACUUM; when <see cref="ExtendedFileMetadata"/> is true it round-trips
 /// the extended trio — <c>partitionValues</c>/<c>size</c>/<c>tags</c> — for checkpoint fidelity and strict

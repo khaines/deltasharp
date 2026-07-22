@@ -64,6 +64,9 @@ internal static class DeltaLogActionWriter
             case AddFileAction add:
                 WriteAdd(writer, add);
                 break;
+            case AddCdcFileAction cdc:
+                WriteCdc(writer, cdc);
+                break;
             case RemoveFileAction remove:
                 WriteRemove(writer, remove);
                 break;
@@ -154,6 +157,25 @@ internal static class DeltaLogActionWriter
 
         WriteStringMapIfAny(writer, "tags", add.Tags);
         add.DeletionVector?.Write(writer);
+        writer.WriteEndObject();
+        writer.WriteEndObject();
+    }
+
+    private static void WriteCdc(Utf8JsonWriter writer, AddCdcFileAction cdc)
+    {
+        writer.WriteStartObject();
+        writer.WriteStartObject("cdc");
+        writer.WriteString("path", cdc.Path);
+
+        writer.WriteStartObject("partitionValues");
+        WriteNullableStringMapEntries(writer, cdc.PartitionValues);
+        writer.WriteEndObject();
+
+        writer.WriteNumber("size", cdc.Size);
+        // dataChange is ALWAYS false for a cdc file (it is never part of table state, §2.3 / INV C1); it has
+        // no independent value, so it is emitted as the literal false rather than modeled as a field.
+        writer.WriteBoolean("dataChange", false);
+        WriteStringMapIfAny(writer, "tags", cdc.Tags);
         writer.WriteEndObject();
         writer.WriteEndObject();
     }

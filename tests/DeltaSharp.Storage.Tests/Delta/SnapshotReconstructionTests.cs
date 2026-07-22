@@ -27,6 +27,45 @@ public sealed class SnapshotReconstructionTests
         """{"remove":{"path":"__P__","deletionTimestamp":1,"dataChange":true}}"""
             .Replace("__P__", path, StringComparison.Ordinal);
 
+    private static string Cdc(string path, long size = 1) =>
+        """{"cdc":{"path":"__P__","partitionValues":{},"size":__S__,"dataChange":false}}"""
+            .Replace("__P__", path, StringComparison.Ordinal)
+            .Replace("__S__", size.ToString(CultureInfo.InvariantCulture), StringComparison.Ordinal);
+
+    [Fact]
+    public void Replay_IgnoresCdcActions_InvC1()
+    {
+        // INV C1 (CDF isolation): a commit sequence INCLUDING cdc actions yields an active-file set,
+        // tombstones, metadata, and protocol IDENTICAL to the same sequence WITHOUT the cdc actions. A cdc
+        // file is never part of active table state (§2.3) — a normal snapshot read of a CDF-enabled table is
+        // byte-identical to the same table with CDF off.
+        var withCdc = new SnapshotState();
+        withCdc.ApplyAll(Commit(0, ProtocolLine, MetadataLine(), Add("A"), Add("B")));
+        withCdc.ApplyAll(Commit(1, Remove("A"), Add("C"), Cdc("_change_data/cdc-1.parquet", 7)));
+        withCdc.ApplyAll(Commit(2, Cdc("_change_data/cdc-2.parquet")));
+        Snapshot withCdcSnap = withCdc.ToSnapshot(2, SnapshotLoadMetrics.Empty);
+
+        var withoutCdc = new SnapshotState();
+        withoutCdc.ApplyAll(Commit(0, ProtocolLine, MetadataLine(), Add("A"), Add("B")));
+        withoutCdc.ApplyAll(Commit(1, Remove("A"), Add("C")));
+        Snapshot withoutCdcSnap = withoutCdc.ToSnapshot(2, SnapshotLoadMetrics.Empty);
+
+        Assert.Equal(
+            withoutCdcSnap.ActiveFiles.Select(a => a.Path).OrderBy(p => p, StringComparer.Ordinal),
+            withCdcSnap.ActiveFiles.Select(a => a.Path).OrderBy(p => p, StringComparer.Ordinal));
+        Assert.Equal(
+            withoutCdcSnap.Tombstones.Select(r => r.Path).OrderBy(p => p, StringComparer.Ordinal),
+            withCdcSnap.Tombstones.Select(r => r.Path).OrderBy(p => p, StringComparer.Ordinal));
+        Assert.Equal(withoutCdcSnap.ActiveFileCount, withCdcSnap.ActiveFileCount);
+        Assert.Equal(withoutCdcSnap.ActiveSizeInBytes, withCdcSnap.ActiveSizeInBytes);
+        Assert.Equal(withoutCdcSnap.Protocol, withCdcSnap.Protocol);
+        // MetadataAction record equality is reference-based for its immutable collections, so compare the
+        // replay-relevant fields individually rather than the whole record.
+        Assert.Equal(withoutCdcSnap.Metadata.Id, withCdcSnap.Metadata.Id);
+        Assert.Equal(withoutCdcSnap.Metadata.SchemaString, withCdcSnap.Metadata.SchemaString);
+        Assert.Equal(withoutCdcSnap.Metadata.Configuration, withCdcSnap.Metadata.Configuration);
+    }
+
     [Fact]
     public void Replay_AcrossVersions_ComputesActiveFilesAndTombstones()
     {
