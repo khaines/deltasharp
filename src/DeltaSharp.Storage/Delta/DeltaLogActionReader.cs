@@ -199,8 +199,17 @@ internal static class DeltaLogActionReader
     private static AddCdcFileAction ParseCdc(JsonElement body, long version, int line)
     {
         RequireObject(body, "cdc", version, line);
-        // A cdc file is never part of table state: dataChange is always false (not modeled) and there is no
-        // stats / modificationTime / deletionVector (§2.3). Only path / partitionValues / size / tags round-trip.
+        // A cdc file is never part of table state, and the Delta protocol mandates dataChange=false. Validate
+        // it fail-closed (reject a missing, non-boolean, or non-false value) — consistent with the other
+        // action parsers — rather than silently accepting a malformed/hostile cdc that claims dataChange=true
+        // (§2.3, INV C1). The other cdc fields (stats / modificationTime / deletionVector) are absent by design.
+        if (GetOptionalBool(body, "dataChange", "cdc", version, line) != false)
+        {
+            throw DeltaProtocolException.Malformed(
+                $"A 'cdc' action (version {version}, line {line}) must declare dataChange=false — the Delta "
+                + "protocol requires it and a change file is never part of table state — but it was absent or true.");
+        }
+
         return new AddCdcFileAction(
             GetRequiredString(body, "path", "cdc", version, line),
             GetNullableStringMap(body, "partitionValues", "cdc", version, line),
