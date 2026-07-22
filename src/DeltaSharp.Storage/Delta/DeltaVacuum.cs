@@ -297,20 +297,19 @@ internal sealed class DeltaVacuum
         {
             if (IsLogObject(info.Path))
             {
-                // The table-root listing also enumerates `_delta_log/`. Track the highest VERSION among all
-                // version-bearing log artifacts it saw — commits AND checkpoints. It is an independent (and,
-                // being first, EARLIER) view of the log than the one the snapshot is reconstructed from below,
-                // so it lets us detect a tail-truncated log listing and fail closed before deleting a live
-                // version's files. Checkpoints must count too: a table's latest version can be established by a
-                // CHECKPOINT alone once its commit json has aged out of log retention, so a listing that drops
-                // the latest checkpoint would otherwise slip past a commit-only guard.
-                if (info.Path.StartsWith(LogDirectoryPrefix, StringComparison.Ordinal))
+                // The table-root listing also enumerates `_delta_log/`. Track the highest VERSION among the
+                // version-establishing log artifacts it saw — commits and classic checkpoints. It is an
+                // independent (and, being first, EARLIER) view of the log than the one the snapshot is
+                // reconstructed from below, so it lets us detect a tail-truncated log listing and fail closed
+                // before deleting a live version's files. Extraction and the counted-kinds predicate reuse the
+                // SAME helpers the snapshot's log listing uses (DeltaLogFiles.FileName + DeltaLogFile
+                // .CountsTowardLatestVersion), so this candidate max and the snapshot's resolved LatestVersion
+                // are computed byte-identically — a divergent extraction/kind set would let one see a version
+                // the other misses (fail-open) or count one the other skips like a V2 checkpoint (false-abort).
+                DeltaLogFile logFile = DeltaLogFiles.Classify(DeltaLogFiles.FileName(info.Path));
+                if (logFile.CountsTowardLatestVersion && logFile.Version > maxListedLogVersion)
                 {
-                    DeltaLogFile logFile = DeltaLogFiles.Classify(info.Path[LogDirectoryPrefix.Length..]);
-                    if (logFile.Kind != DeltaLogFileKind.Other && logFile.Version > maxListedLogVersion)
-                    {
-                        maxListedLogVersion = logFile.Version;
-                    }
+                    maxListedLogVersion = logFile.Version;
                 }
 
                 continue;

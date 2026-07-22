@@ -356,7 +356,7 @@ internal sealed class DeltaLog
         long? latest = null;
         await foreach (StorageObjectInfo info in _backend.ListAsync(LogPrefix, cancellationToken).ConfigureAwait(false))
         {
-            DeltaLogFile file = DeltaLogFiles.Classify(FileName(info.Path));
+            DeltaLogFile file = DeltaLogFiles.Classify(DeltaLogFiles.FileName(info.Path));
             if (file.Kind == DeltaLogFileKind.Commit)
             {
                 latest = Max(latest, file.Version);
@@ -532,7 +532,7 @@ internal sealed class DeltaLog
 
         await foreach (StorageObjectInfo info in _backend.ListAsync(LogPrefix, cancellationToken).ConfigureAwait(false))
         {
-            string name = FileName(info.Path);
+            string name = DeltaLogFiles.FileName(info.Path);
             if (string.Equals(name, "_last_checkpoint", StringComparison.Ordinal))
             {
                 hasHint = true;
@@ -547,7 +547,6 @@ internal sealed class DeltaLog
                     // The <N>.json object modification time is the commit-timestamp source for timestamp
                     // time travel (design §2.12.1); capture it here where the listing is the single I/O pass.
                     commitTimestamps[file.Version] = info.LastModifiedUtc;
-                    latest = Max(latest, file.Version);
                     break;
 
                 case DeltaLogFileKind.ClassicCheckpoint:
@@ -558,7 +557,6 @@ internal sealed class DeltaLog
                     }
 
                     group.Add(file.Part, file.Parts, info.Path);
-                    latest = Max(latest, file.Version);
                     break;
 
                 case DeltaLogFileKind.V2Checkpoint:
@@ -569,6 +567,16 @@ internal sealed class DeltaLog
                 case DeltaLogFileKind.Other:
                 default:
                     break;
+            }
+
+            // LatestVersion counts exactly the version-establishing artifacts (commits + classic checkpoints).
+            // VACUUM's tail-truncation guard reuses this same DeltaLogFile.CountsTowardLatestVersion predicate
+            // (and DeltaLogFiles.FileName) so the candidate pass's max version and this resolved latest are
+            // computed identically — no asymmetry that could fail open (guard misses a version the snapshot
+            // sees) or false-abort (guard counts one the snapshot skips).
+            if (file.CountsTowardLatestVersion)
+            {
+                latest = Max(latest, file.Version);
             }
         }
 
@@ -603,12 +611,6 @@ internal sealed class DeltaLog
 
             return buffer.ToArray();
         }
-    }
-
-    private static string FileName(string path)
-    {
-        int slash = path.LastIndexOf('/');
-        return slash < 0 ? path : path[(slash + 1)..];
     }
 
     private static string FormatVersion(long version) =>

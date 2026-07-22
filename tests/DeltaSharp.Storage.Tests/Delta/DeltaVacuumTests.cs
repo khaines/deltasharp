@@ -673,6 +673,59 @@ public sealed class DeltaVacuumTests : IDisposable
         Assert.NotNull(await _backend.HeadAsync("checkpoint-active.parquet", CancellationToken.None));
     }
 
+    [Fact]
+    public async Task TailTruncatedNestedCheckpoint_SeenByCandidatePass_FailsClosed_AndDeletesNothing()
+    {
+        // Red-team (Critical, #489/#640): the guard must extract the version-bearing token the SAME way the
+        // snapshot's log listing (DeltaLog.ListLogAsync) does — by file NAME (last path segment), NOT the path
+        // relative to `_delta_log/`. A checkpoint at a NESTED path `_delta_log/<sub>/<v>.checkpoint.parquet`
+        // has FileName `<v>.checkpoint.parquet` (which ListLogAsync classifies as ClassicCheckpoint v1), but
+        // the relative path `<sub>/<v>.checkpoint.parquet` classifies as Other. The old relative extraction
+        // under-counted (maxListedLogVersion stayed 0), so a torn log listing (hiding the nested checkpoint →
+        // snapshot v0) deleted v1's live file. Extracting by the shared DeltaLogFiles.FileName catches it.
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        string nestedCheckpoint =
+            "_delta_log/sub/" + 1.ToString("D20", CultureInfo.InvariantCulture) + ".checkpoint.parquet";
+        await _backend.PutIfAbsentAsync(nestedCheckpoint, new byte[] { 1 }, CancellationToken.None);
+
+        await WriteDataFileAsync("nested-active.parquet", Old);
+
+        // Tear the log listing to hide the nested checkpoint → snapshot resolves to v0; the untorn candidate
+        // root listing (prefix "") still sees it, so its FileName-derived version (1) must trip the guard.
+        var backend = new DivergentLogListingBackend(
+            _backend, omitFromSecondLogListing: new[] { nestedCheckpoint }, tearFromOrdinal: 1);
+        var vacuum = new DeltaVacuum(
+            backend, policy: null, logger: null, telemetry: null, timeProvider: new FixedTimeProvider(Now));
+
+        await Assert.ThrowsAsync<DeltaProtocolException>(() => vacuum.VacuumAsync(Retention));
+
+        Assert.NotNull(await _backend.HeadAsync("nested-active.parquet", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task StrayV2CheckpointFile_DoesNotFalselyAbortVacuum()
+    {
+        // Red-team (Medium, #489/#640): the guard must count exactly what ListLogAsync folds into
+        // LatestVersion — commits + classic checkpoints, NOT V2/UUID checkpoints (a v1-baseline reader skips
+        // them for version resolution). A stray `<v>.checkpoint.<uuid>.parquet` at a HIGH version must not be
+        // counted by the guard; otherwise maxListedLogVersion outruns the resolved snapshot version and VACUUM
+        // falsely aborts a healthy table. The shared DeltaLogFile.CountsTowardLatestVersion predicate excludes
+        // V2 checkpoints, matching ListLogAsync exactly.
+        await WriteLogAsync(new[] { DeltaTestHarness.Add("active.parquet") });
+        string strayV2 =
+            "_delta_log/" + 9.ToString("D20", CultureInfo.InvariantCulture) + ".checkpoint.0191e6f0abcd.parquet";
+        await _backend.PutIfAbsentAsync(strayV2, new byte[] { 1 }, CancellationToken.None);
+
+        await WriteDataFileAsync("active.parquet", Old);
+        await WriteDataFileAsync("old-orphan.parquet", Old);
+
+        VacuumResult result = await _vacuum.VacuumAsync(Retention);
+
+        // No false abort: VACUUM runs to completion, protects the active file, reclaims the genuine orphan.
+        Assert.Equal(new[] { "old-orphan.parquet" }, result.DeletedPaths.ToArray());
+        Assert.NotNull(await _backend.HeadAsync("active.parquet", CancellationToken.None));
+    }
+
     [Theory]
     [InlineData("interval 1 months")]
     [InlineData("garbage")]
