@@ -120,7 +120,10 @@ internal static class TypeWideningFeature
     /// (<see cref="AppendOnlyFeature.EnsureCommitAllowed"/>). The <c>invariants</c> / <c>checkConstraints</c>
     /// writer features are likewise enumerated when the table carries a column invariant or a
     /// <c>delta.constraints.*</c> CHECK constraint; they are enforced per row at the write seam (#581/#568),
-    /// so upgrading preserves rather than silently deactivates them.</para>
+    /// so upgrading preserves rather than silently deactivates them. The <c>changeDataFeed</c> writer feature
+    /// is likewise enumerated when the table carries <c>delta.enableChangeDataFeed=true</c>, so CDF stays
+    /// active across the upgrade (a normal read is unaffected — snapshot reconstruction ignores <c>cdc</c>
+    /// actions, INV C1).</para>
     ///
     /// <para>Idempotent in shape: if a feature is already present (stable OR preview <c>typeWidening</c>
     /// spelling, or an already-enumerated legacy feature) the feature lists are returned unchanged; the
@@ -151,6 +154,13 @@ internal static class TypeWideningFeature
         if (SchemaHasInvariant(schema))
         {
             writerFeatures = WithWriterFeature(writerFeatures, InvariantsFeature);
+        }
+
+        if (ChangeDataFeedFeature.IsEnabled(configuration))
+        {
+            // Enumerate the changeDataFeed writer feature (writer-only) when the table has
+            // delta.enableChangeDataFeed=true, so CDF stays active across a legacy → table-features upgrade.
+            writerFeatures = ChangeDataFeedFeature.WithWriterFeature(writerFeatures);
         }
 
         return new ProtocolAction(

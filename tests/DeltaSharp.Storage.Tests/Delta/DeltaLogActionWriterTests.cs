@@ -137,6 +137,65 @@ public sealed class DeltaLogActionWriterTests
     }
 
     [Fact]
+    public void SerializesCdcAction_RoundTrippingAlongsideOtherActions()
+    {
+        // Increment 1: a cdc (AddCDCFile) action round-trips through serialize→parse alongside the other
+        // action kinds, preserving path/partitionValues/size/tags. dataChange is ALWAYS false (a serialize-
+        // time constant, not a field), so the model has no dataChange to round-trip.
+        var protocol = new ProtocolAction(
+            1, 7, ImmutableArray<string>.Empty, ImmutableArray.Create(ChangeDataFeedFeature.Feature));
+        var metadata = new MetadataAction(
+            "t-cdc",
+            null,
+            null,
+            new TableFormat("parquet", StringMap()),
+            "{\"type\":\"struct\",\"fields\":[]}",
+            ImmutableArray.Create("dt"),
+            StringMap((ChangeDataFeedFeature.PropertyKey, "true")),
+            null);
+        var add = new AddFileAction(
+            "dt=2024/part-0.parquet", NullableStringMap(("dt", "2024")), 1024L, 1L, DataChange: true,
+            Stats: null, Tags: StringMap());
+        var remove = new RemoveFileAction(
+            "dt=2024/old.parquet", 1L, DataChange: true, ExtendedFileMetadata: false,
+            NullableStringMap(), Size: null, StringMap());
+        var cdc = new AddCdcFileAction(
+            "_change_data/dt=2024/cdc-0.parquet",
+            NullableStringMap(("dt", "2024")),
+            2048L,
+            StringMap(("k", "v")));
+
+        IReadOnlyList<DeltaAction> actions = RoundTrip(protocol, metadata, add, remove, cdc);
+
+        var parsedCdc = Assert.IsType<AddCdcFileAction>(actions[4]);
+        Assert.Equal("_change_data/dt=2024/cdc-0.parquet", parsedCdc.Path);
+        Assert.Equal("2024", parsedCdc.PartitionValues["dt"]);
+        Assert.Equal(2048L, parsedCdc.Size);
+        Assert.Equal("v", parsedCdc.Tags["k"]);
+
+        // The serialized cdc envelope carries dataChange:false verbatim.
+        string json = Encoding.UTF8.GetString(DeltaLogActionWriter.SerializeCommit(new DeltaAction[] { cdc }));
+        Assert.Contains("\"cdc\":", json, StringComparison.Ordinal);
+        Assert.Contains("\"dataChange\":false", json, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void SerializesCdcAction_EmptyMaps_RoundTripAsEmpty()
+    {
+        // An unpartitioned/untagged cdc file: partitionValues serializes as {} (round-trips to an empty map)
+        // and empty tags round-trip to an empty map (mirroring add.tags).
+        var cdc = new AddCdcFileAction(
+            "_change_data/cdc-0.parquet", NullableStringMap(), 16L, StringMap());
+
+        var parsed = Assert.IsType<AddCdcFileAction>(Assert.Single(RoundTrip(cdc)));
+        Assert.Empty(parsed.PartitionValues);
+        Assert.Empty(parsed.Tags);
+
+        string json = Encoding.UTF8.GetString(DeltaLogActionWriter.SerializeCommit(new DeltaAction[] { cdc }));
+        Assert.Contains("\"partitionValues\":{}", json, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void SerializesCommitInfo_RoundTrippingOperationMetrics()
     {
         // #506: operationMetrics (a Delta Map<String,String>, like operationParameters) round-trips through

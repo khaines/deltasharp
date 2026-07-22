@@ -47,6 +47,12 @@ internal sealed class SnapshotState
                 _tombstones.Remove(addKey);
                 break;
 
+            case AddCdcFileAction:
+                // CDF change file — never part of active table state; consumed only by an explicit
+                // change-feed read, INV C1. Ignored during snapshot reconstruction (a normal read of a
+                // CDF-enabled table is byte-identical to the same table with CDF off).
+                break;
+
             case RemoveFileAction remove:
                 string removeKey = FileKey(remove.Path, remove.DeletionVector);
                 _activeAdds.Remove(removeKey);

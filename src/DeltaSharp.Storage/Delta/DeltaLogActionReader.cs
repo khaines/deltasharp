@@ -127,6 +127,7 @@ internal static class DeltaLogActionReader
             "protocol" => ParseProtocol(body, version, line),
             "metaData" => ParseMetadata(body, version, line),
             "add" => ParseAdd(body, version, line),
+            "cdc" => ParseCdc(body, version, line),
             "remove" => ParseRemove(body, version, line),
             "txn" => ParseTxn(body, version, line),
             "commitInfo" => ParseCommitInfo(body),
@@ -193,6 +194,18 @@ internal static class DeltaLogActionReader
             ParseStats(body, version, line),
             GetStringMap(body, "tags", "add", version, line),
             DeletionVectors.DeletionVectorDescriptor.Parse(body, "add", version, line));
+    }
+
+    private static AddCdcFileAction ParseCdc(JsonElement body, long version, int line)
+    {
+        RequireObject(body, "cdc", version, line);
+        // A cdc file is never part of table state: dataChange is always false (not modeled) and there is no
+        // stats / modificationTime / deletionVector (§2.3). Only path / partitionValues / size / tags round-trip.
+        return new AddCdcFileAction(
+            GetRequiredString(body, "path", "cdc", version, line),
+            GetNullableStringMap(body, "partitionValues", "cdc", version, line),
+            GetRequiredInt64(body, "size", "cdc", version, line),
+            GetStringMap(body, "tags", "cdc", version, line));
     }
 
     private static RemoveFileAction ParseRemove(JsonElement body, long version, int line)
