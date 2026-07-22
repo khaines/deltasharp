@@ -4,16 +4,17 @@ using DeltaSharp.Storage.Backends;
 namespace DeltaSharp.Storage.Tests.Delta;
 
 /// <summary>
-/// A test-only <see cref="IStorageBackend"/> decorator that makes the <b>second (and later)</b> listing of
-/// <c>_delta_log/</c> <b>diverge</b> from the first by omitting one or more commit objects — modeling a
-/// staler/partial second view of the log (object-store eventual consistency, a transient partial LIST, or a
-/// concurrent log operation between two independent listings). The FIRST log listing is passed through
-/// complete, so a snapshot reconstructed from it is well-formed; only a SECOND, independent log listing sees
-/// the torn view. Candidate discovery (prefix <c>""</c>) and every non-list operation delegate unchanged.
-/// <para>This proves VACUUM's #489 cdc protection reuses the <b>single</b> listing the snapshot was built
-/// from: with one log listing there is no second, divergent view, so an in-window commit's <c>cdc</c> path
-/// can never be dropped. If a regression reintroduced a second independent log listing, this backend would
-/// tear it and the guarded test would fail.</para>
+/// A test-only <see cref="IStorageBackend"/> decorator that makes a chosen <c>_delta_log/</c> listing (by
+/// 1-based ordinal, <c>tearFromOrdinal</c>, and every listing after it) <b>diverge</b> by omitting one or
+/// more commit objects — modeling a staler/partial view of the log (object-store eventual consistency, a
+/// transient partial LIST, or a concurrent log operation). Candidate discovery (prefix <c>""</c>) and every
+/// non-list operation delegate unchanged.
+/// <para>With <c>tearFromOrdinal = 2</c> (default) the FIRST log listing passes through complete (so a
+/// snapshot built from it is well-formed) and only a hypothetical SECOND listing is torn — proving VACUUM's
+/// #489 cdc protection reuses the <b>single</b> listing the snapshot was built from (no second view exists,
+/// so nothing is dropped; a regression reintroducing a second listing would tear it and fail the guard).
+/// With <c>tearFromOrdinal = 1</c> the FIRST (and only) log listing is torn — modeling a tail-truncated log
+/// view that the candidate root listing (fresher) does not share, exercising VACUUM's fail-closed abort.</para>
 /// </summary>
 internal sealed class DivergentLogListingBackend : IStorageBackend
 {
@@ -21,12 +22,15 @@ internal sealed class DivergentLogListingBackend : IStorageBackend
 
     private readonly IStorageBackend _inner;
     private readonly HashSet<string> _omitFromSecondLogListing;
+    private readonly int _tearFromOrdinal;
     private int _logListingCount;
 
-    public DivergentLogListingBackend(IStorageBackend inner, IEnumerable<string> omitFromSecondLogListing)
+    public DivergentLogListingBackend(
+        IStorageBackend inner, IEnumerable<string> omitFromSecondLogListing, int tearFromOrdinal = 2)
     {
         _inner = inner;
         _omitFromSecondLogListing = new HashSet<string>(omitFromSecondLogListing, StringComparer.Ordinal);
+        _tearFromOrdinal = tearFromOrdinal;
     }
 
     /// <summary>The number of times <c>_delta_log/</c> was listed — asserts the single-listing invariant.</summary>
@@ -56,13 +60,13 @@ internal sealed class DivergentLogListingBackend : IStorageBackend
         string prefix, [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         bool isLogListing = prefix.StartsWith(LogPrefix, StringComparison.Ordinal);
-        bool tearThisListing = isLogListing && ++_logListingCount >= 2;
+        bool tearThisListing = isLogListing && ++_logListingCount >= _tearFromOrdinal;
 
         await foreach (StorageObjectInfo info in _inner.ListAsync(prefix, cancellationToken).ConfigureAwait(false))
         {
             if (tearThisListing && _omitFromSecondLogListing.Contains(info.Path))
             {
-                continue; // second, divergent log view: this in-window commit is invisible.
+                continue; // divergent log view: this in-window commit is invisible.
             }
 
             yield return info;

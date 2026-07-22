@@ -610,6 +610,38 @@ public sealed class DeltaVacuumTests : IDisposable
         Assert.Equal(1, backend.LogListingCount); // single-listing invariant: `_delta_log/` listed exactly once.
     }
 
+    [Fact]
+    public async Task TailTruncatedLogListing_SeenByCandidatePass_FailsClosed_AndDeletesNothing()
+    {
+        // Red-team (4th finding, #489/#640): the cdc scan and snapshot share ONE `_delta_log/` listing, but the
+        // candidate root listing (prefix "") is a separate, EARLIER view that also enumerates `_delta_log/`. If
+        // the single log listing is TAIL-TRUNCATED (misses the latest commit v1), the snapshot silently
+        // resolves to v0 and v1's live files (both the data file AND its cdc file, on disk as candidates) would
+        // be reclaimed as orphans — data loss. VACUUM must fail closed: the candidate pass saw commit v1, which
+        // is beyond the resolved snapshot version, so the log view is provably stale/partial → abort, delete
+        // nothing. (A missing MIDDLE commit is instead caught by snapshot reconstruction's gap detection.)
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 1, DeltaTestHarness.Add("active.parquet"), DeltaTestHarness.Cdc("_change_data/x.parquet"));
+
+        await WriteDataFileAsync("active.parquet", Old);
+        await WriteDataFileAsync("_change_data/x.parquet", Old);
+
+        // Tear the FIRST (and only) `_delta_log/` listing so it omits v1.json → the snapshot resolves to v0.
+        // The candidate root listing (prefix "") is not torn and still sees v1.json.
+        var backend = new DivergentLogListingBackend(
+            DeltaTestHarness.WithCommitTimestamps(_backend, (0, Recent), (1, Recent)),
+            omitFromSecondLogListing: new[] { DeltaLogFiles.CommitPath(1) }, tearFromOrdinal: 1);
+        var vacuum = new DeltaVacuum(
+            backend, policy: null, logger: null, telemetry: null, timeProvider: new FixedTimeProvider(Now));
+
+        await Assert.ThrowsAsync<DeltaProtocolException>(() => vacuum.VacuumAsync(Retention));
+
+        // Fail-closed: the abort precedes the deletion phase, so v1's live files are untouched on disk.
+        Assert.NotNull(await _backend.HeadAsync("active.parquet", CancellationToken.None));
+        Assert.NotNull(await _backend.HeadAsync("_change_data/x.parquet", CancellationToken.None));
+    }
+
     [Theory]
     [InlineData("interval 1 months")]
     [InlineData("garbage")]

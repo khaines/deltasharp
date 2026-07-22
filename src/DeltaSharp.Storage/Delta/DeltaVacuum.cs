@@ -291,11 +291,25 @@ internal sealed class DeltaVacuum
         // here — passing them through the contract lets it exclude them AND lets the audit record an
         // "active" decision for each, so the audit covers every discovered candidate (AC3).
         var candidates = new List<OrphanCandidate>();
+        long maxListedCommitVersion = -1;
         await foreach (StorageObjectInfo info in _backend.ListAsync(prefix: string.Empty, cancellationToken)
             .ConfigureAwait(false))
         {
             if (IsLogObject(info.Path))
             {
+                // The table-root listing also enumerates `_delta_log/`. Track the highest COMMIT version it
+                // saw: it is an independent (and, being first, EARLIER) view of the log than the one the
+                // snapshot is reconstructed from below, so it lets us detect a tail-truncated log listing and
+                // fail closed before deleting a live commit's files.
+                if (info.Path.StartsWith(LogDirectoryPrefix, StringComparison.Ordinal))
+                {
+                    DeltaLogFile logFile = DeltaLogFiles.Classify(info.Path[LogDirectoryPrefix.Length..]);
+                    if (logFile.Kind == DeltaLogFileKind.Commit && logFile.Version > maxListedCommitVersion)
+                    {
+                        maxListedCommitVersion = logFile.Version;
+                    }
+                }
+
                 continue;
             }
 
@@ -309,6 +323,23 @@ internal sealed class DeltaVacuum
         // referenced `cdc` paths from the protected set, deleting a live change file (data loss, #489).
         (Snapshot snapshot, DeltaLog.LogListing logListing) =
             await _log.LoadSnapshotWithListingAsync(version: null, cancellationToken).ConfigureAwait(false);
+
+        // Fail closed on a tail-truncated log listing (red-team #640): the table-root candidate pass above is
+        // an independent, earlier listing that also enumerated `_delta_log/`. If it saw a COMMIT beyond the
+        // version the snapshot resolved to, the single log listing the snapshot (and the cdc scan) were built
+        // on was stale/partial and missed a live commit — whose data AND `_change_data/` files are on disk as
+        // candidates. Reclaiming them would be data loss (they are referenced by a commit VACUUM simply did
+        // not see). Abort rather than delete. A missing MIDDLE commit is already caught fail-closed by
+        // snapshot reconstruction's gap detection; this closes the tail. (Guards regular data files too, not
+        // just cdc — the divergence is between the candidate listing and the log listing.)
+        if (maxListedCommitVersion > snapshot.Version)
+        {
+            throw DeltaProtocolException.Inconsistent(string.Create(
+                CultureInfo.InvariantCulture,
+                $"VACUUM aborted: the table root lists commit {maxListedCommitVersion} but the _delta_log " +
+                $"listing resolved only to version {snapshot.Version}. The log listing is stale/partial " +
+                $"(tail-truncated); reclaiming now could delete files referenced by the missing commit(s)."));
+        }
 
         // MEDIUM: resolve the effective retention. When the caller named no explicit window, honor the
         // table's delta.deletedFileRetentionDuration (from Metadata.Configuration) so a table configured for
