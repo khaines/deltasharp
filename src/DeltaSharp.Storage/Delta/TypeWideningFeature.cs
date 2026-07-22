@@ -138,11 +138,9 @@ internal static class TypeWideningFeature
 
         // Enumerate the implicitly-active legacy writer features so they stay ACTIVE across the table-features
         // upgrade (Delta "Active Features": a feature is active iff it is in writerFeatures AND its metadata
-        // marker is present). This build now ENFORCES each per row at the write seam (#549 appendOnly, #581
+        // marker is present). This build ENFORCES each per row at the write seam (#549 appendOnly, #581
         // invariants/CHECK constraints), so enumerating them is safe rather than silently deactivating them.
-        // Enumerate the implicitly-active legacy writer features so they stay ACTIVE across the table-features
-        // upgrade (Delta "Active Features": a feature is active iff it is in writerFeatures AND its metadata
-        // marker is present). typeWidening itself is a reader+writer feature, added to BOTH lanes below.
+        // typeWidening itself is a reader+writer feature, added to BOTH lanes below.
         ImmutableArray<string> writerFeatures = EnumerateActiveLegacyWriterFeatures(
             WithFeature(existing.WriterFeatures), schema, configuration);
 
