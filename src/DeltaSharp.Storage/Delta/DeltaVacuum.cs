@@ -333,14 +333,20 @@ internal sealed class DeltaVacuum
         long logRetentionCutoffMillis = nowMillis - (long)logRetention.TotalMilliseconds;
 
         // #489 short-circuit: the cdc scan reads EVERY in-window commit JSON, so run it only when the
-        // candidate listing actually contains a file under `_change_data/`. This is zero-cost and safe: the
-        // cdc-referenced set is PURELY ADDITIVE protection, so if no `_change_data/` candidate exists on disk
-        // there is nothing for it to protect and skipping the scan cannot under-protect. Deliberately NOT
-        // gated on ChangeDataFeedFeature.IsEnabled / writerFeatures — a table with CDF disabled AFTER it was
-        // enabled can still have in-window cdc files that must be protected. Further reuse-listing/telemetry
-        // optimizations are deferred to #641.
-        bool hasChangeDataCandidate = candidates.Any(
-            c => c.Path.StartsWith(ChangeDataFeedFeature.ChangeDataDirectoryPrefix, StringComparison.Ordinal));
+        // candidate listing actually contains a file under `_change_data/`. This is safe: the cdc-referenced
+        // set is PURELY ADDITIVE protection, so if no `_change_data/` candidate exists on disk there is nothing
+        // for it to protect and skipping the scan cannot under-protect. Deliberately NOT gated on
+        // ChangeDataFeedFeature.IsEnabled / writerFeatures — a table with CDF disabled AFTER it was enabled can
+        // still have in-window cdc files that must be protected. The predicate is ENCODING-ROBUST (matches the
+        // raw disk key OR its `Uri.UnescapeDataString` decoding), mirroring OrphanCleanup's encoding-robust
+        // protection: a candidate whose directory separator is URI-encoded (`_change_data%2F…`) must still
+        // trigger the scan, else the short-circuit would bypass the protection and delete a live cdc file.
+        // Erring toward running the scan (a spurious decode-match) is safe — it only costs a scan, never a
+        // deletion. Further reuse-listing/telemetry optimizations are deferred to #641.
+        bool hasChangeDataCandidate = candidates.Any(c =>
+            c.Path.StartsWith(ChangeDataFeedFeature.ChangeDataDirectoryPrefix, StringComparison.Ordinal)
+            || Uri.UnescapeDataString(c.Path).StartsWith(
+                ChangeDataFeedFeature.ChangeDataDirectoryPrefix, StringComparison.Ordinal));
         IReadOnlyCollection<string> protectedChangeDataPaths = hasChangeDataCandidate
             ? await _log.CollectInWindowChangeDataPathsAsync(logRetentionCutoffMillis, cancellationToken)
                 .ConfigureAwait(false)

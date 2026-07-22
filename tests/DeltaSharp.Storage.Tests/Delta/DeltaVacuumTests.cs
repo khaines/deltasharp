@@ -494,6 +494,36 @@ public sealed class DeltaVacuumTests : IDisposable
             result.Audit.Single(e => e.Path == "_change_data/foo bar.parquet").Decision);
     }
 
+    [Fact]
+    public async Task EncodedChangeDataSeparator_CdcFile_IsNeverDeleted()
+    {
+        // Red-team (Critical, #489): the scan short-circuit ("skip when no `_change_data/` candidate") must be
+        // ENCODING-ROBUST like OrphanCleanup's protection. A candidate whose directory SEPARATOR is
+        // URI-encoded ("_change_data%2Fencoded.parquet") does NOT start with the literal "_change_data/"
+        // prefix, so an Ordinal-only predicate would skip the scan, leave the cdc set empty, and DELETE the
+        // live change file. The predicate now also tests the `Uri.UnescapeDataString` form, so the scan runs
+        // and OrphanCleanup's encoding-robust match protects it. (Unlike EncodedCdcLogPath above, which
+        // encodes only the filename — whose raw disk key still carries the literal "_change_data/" prefix —
+        // this encodes the separator, the case the Ordinal short-circuit missed.)
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 1, DeltaTestHarness.Add("active.parquet"),
+            DeltaTestHarness.Cdc("_change_data%2Fencoded.parquet"));
+
+        await WriteDataFileAsync("active.parquet", Old);
+        await WriteDataFileAsync("_change_data%2Fencoded.parquet", Old); // encoded-separator raw disk key, old mtime
+
+        var vacuum = new DeltaVacuum(
+            DeltaTestHarness.WithCommitTimestamps(_backend, (0, Recent), (1, Recent)),
+            policy: null, logger: null, telemetry: null, timeProvider: new FixedTimeProvider(Now));
+
+        VacuumResult result = await vacuum.VacuumAsync(Retention);
+
+        Assert.DoesNotContain("_change_data%2Fencoded.parquet", result.DeletablePaths);
+        Assert.DoesNotContain("_change_data%2Fencoded.parquet", result.DeletedPaths);
+        Assert.NotNull(await _backend.HeadAsync("_change_data%2Fencoded.parquet", CancellationToken.None));
+    }
+
     [Theory]
     [InlineData("interval 1 months")]
     [InlineData("garbage")]
