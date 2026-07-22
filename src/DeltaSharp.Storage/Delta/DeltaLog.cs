@@ -68,11 +68,27 @@ internal sealed class DeltaLog
     /// (<see cref="DeltaProtocolErrorKind.RetentionGap"/>, AC3).</exception>
     public async Task<Snapshot> LoadSnapshotAsync(long? version = null, CancellationToken cancellationToken = default)
     {
+        (Snapshot snapshot, _) = await LoadSnapshotWithListingAsync(version, cancellationToken).ConfigureAwait(false);
+        return snapshot;
+    }
+
+    /// <summary>Loads the snapshot AND returns the single <see cref="LogListing"/> it was reconstructed from,
+    /// so a caller (VACUUM) can drive further log-derived work — the in-window <c>cdc</c> scan
+    /// (<see cref="CollectInWindowChangeDataPathsAsync"/>) — off the <b>same</b> listing rather than a second,
+    /// independently-listed view of <c>_delta_log</c>. Two separate listings can diverge (an eventually
+    /// consistent or transiently partial store, or a concurrent log operation), and a staler second listing
+    /// that omits an in-window commit would silently drop that commit's referenced <c>cdc</c> path from the
+    /// protected set — VACUUM would then delete a live change file (data loss, #489). Reusing one listing makes
+    /// the cdc protection provably co-extensive with the snapshot's own log view.</summary>
+    internal async Task<(Snapshot Snapshot, LogListing Listing)> LoadSnapshotWithListingAsync(
+        long? version = null, CancellationToken cancellationToken = default)
+    {
         long start = Stopwatch.GetTimestamp();
         LogListing listing = await ListLogAsync(cancellationToken).ConfigureAwait(false);
         long latest = RequireLatest(listing);
         long target = ResolveExplicitVersionTarget(listing, latest, version);
-        return await ReconstructAsync(listing, target, start, cancellationToken).ConfigureAwait(false);
+        Snapshot snapshot = await ReconstructAsync(listing, target, start, cancellationToken).ConfigureAwait(false);
+        return (snapshot, listing);
     }
 
     /// <summary>
@@ -377,12 +393,15 @@ internal sealed class DeltaLog
     /// aged past log retention (below the cutoff — and therefore itself cleanable) is correctly absent here
     /// and remains reclaimable, so the protection is window-bounded, never unbounded. Fail-safe: a commit
     /// whose modification time is unknown is treated as in-window (protected), never dropped.
+    /// <para>The caller passes the <paramref name="listing"/> that its snapshot was reconstructed from
+    /// (<see cref="LoadSnapshotWithListingAsync"/>), so the scan operates on the <b>same</b> view of
+    /// <c>_delta_log</c> as the snapshot — never a second, independently-listed view that could diverge and
+    /// silently drop an in-window commit's <c>cdc</c> paths, under-protecting a live change file (#489).</para>
     /// </summary>
     /// <exception cref="DeltaProtocolException">A retained commit is malformed or exceeds the read ceiling.</exception>
     internal async Task<IReadOnlyCollection<string>> CollectInWindowChangeDataPathsAsync(
-        long logRetentionCutoffMillis, CancellationToken cancellationToken)
+        LogListing listing, long logRetentionCutoffMillis, CancellationToken cancellationToken)
     {
-        LogListing listing = await ListLogAsync(cancellationToken).ConfigureAwait(false);
         var paths = new HashSet<string>(StringComparer.Ordinal);
         foreach (long version in listing.Commits)
         {
@@ -596,7 +615,7 @@ internal sealed class DeltaLog
         version.ToString(CultureInfo.InvariantCulture).PadLeft(VersionDigits, '0');
 
     /// <summary>The classic-checkpoint parts discovered for a single version, tracking completeness.</summary>
-    private sealed class CheckpointGroup
+    internal sealed class CheckpointGroup
     {
         private readonly Dictionary<int, string> _partPaths = new();
         private int _parts;
@@ -644,7 +663,7 @@ internal sealed class DeltaLog
     /// <summary>The discovered <c>_delta_log</c> contents: commit versions, each commit object's modification
     /// time (the timestamp-time-travel source, design §2.12.1), classic checkpoint groups, the latest
     /// reconstructable version, and whether a <c>_last_checkpoint</c> hint is present.</summary>
-    private sealed record LogListing(
+    internal sealed record LogListing(
         SortedSet<long> Commits,
         IReadOnlyDictionary<long, DateTime> CommitTimestamps,
         Dictionary<long, CheckpointGroup> Checkpoints,

@@ -302,7 +302,13 @@ internal sealed class DeltaVacuum
             candidates.Add(new OrphanCandidate(info.Path, DeltaTimestamps.ToEpochMillis(info.LastModifiedUtc)));
         }
 
-        Snapshot snapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
+        // Load the snapshot AND capture the single `_delta_log` listing it was reconstructed from. The
+        // in-window cdc scan below reuses THIS listing rather than re-listing the log — two independent
+        // listings can diverge (eventual consistency, a transient partial list, or a concurrent log
+        // operation), and a staler second listing that omits an in-window commit would drop that commit's
+        // referenced `cdc` paths from the protected set, deleting a live change file (data loss, #489).
+        (Snapshot snapshot, DeltaLog.LogListing logListing) =
+            await _log.LoadSnapshotWithListingAsync(version: null, cancellationToken).ConfigureAwait(false);
 
         // MEDIUM: resolve the effective retention. When the caller named no explicit window, honor the
         // table's delta.deletedFileRetentionDuration (from Metadata.Configuration) so a table configured for
@@ -341,9 +347,10 @@ internal sealed class DeltaVacuum
         // deleted (data loss). The only predicate that never under-protects is derived from the log itself, not
         // the candidate listing. Scanning unconditionally is the correctness reference; a SAFE scan-skip
         // (gated on the retained protocol history ever declaring CDF, computed from the log — not candidate
-        // paths) is deferred to #641.
+        // paths) is deferred to #641. The scan reuses `logListing` (the snapshot's own log view), so its
+        // protected set can never diverge from — or be staler than — the listing the snapshot was built on.
         IReadOnlyCollection<string> protectedChangeDataPaths =
-            await _log.CollectInWindowChangeDataPathsAsync(logRetentionCutoffMillis, cancellationToken)
+            await _log.CollectInWindowChangeDataPathsAsync(logListing, logRetentionCutoffMillis, cancellationToken)
                 .ConfigureAwait(false);
 
         // The single source of the deletion decision AND the audit reason (design §2.11.5): active files,

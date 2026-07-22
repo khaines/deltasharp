@@ -578,6 +578,38 @@ public sealed class DeltaVacuumTests : IDisposable
         Assert.NotNull(await _backend.HeadAsync("cdc-blob.parquet", CancellationToken.None));
     }
 
+    [Fact]
+    public async Task StaleSecondLogListing_OmittingInWindowCommit_StillProtectsItsCdcFile()
+    {
+        // Red-team (3rd Critical, #489): the cdc protection MUST be derived from the SAME `_delta_log/` listing
+        // the snapshot was reconstructed from. If VACUUM re-listed the log independently for the cdc scan, a
+        // staler/partial SECOND listing that omits an in-window commit would drop that commit's referenced cdc
+        // path from the protected set and DELETE a live change file. The fix lists the log ONCE and threads it
+        // through both snapshot load and the scan. This backend tears the SECOND log listing (hides v1.json) —
+        // proving safety two ways: the cdc file survives, AND the log is listed exactly once (so the tear that
+        // would only ever affect a second listing is unreachable). A regression reintroducing a second
+        // independent log listing would both trip LogListingCount and delete the cdc file.
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 1, DeltaTestHarness.Add("active.parquet"), DeltaTestHarness.Cdc("_change_data/x.parquet"));
+
+        await WriteDataFileAsync("active.parquet", Old);
+        await WriteDataFileAsync("_change_data/x.parquet", Old); // referenced by v1's cdc action; in-window
+
+        var backend = new DivergentLogListingBackend(
+            DeltaTestHarness.WithCommitTimestamps(_backend, (0, Recent), (1, Recent)),
+            omitFromSecondLogListing: new[] { DeltaLogFiles.CommitPath(1) });
+        var vacuum = new DeltaVacuum(
+            backend, policy: null, logger: null, telemetry: null, timeProvider: new FixedTimeProvider(Now));
+
+        VacuumResult result = await vacuum.VacuumAsync(Retention);
+
+        Assert.DoesNotContain("_change_data/x.parquet", result.DeletablePaths);
+        Assert.DoesNotContain("_change_data/x.parquet", result.DeletedPaths);
+        Assert.NotNull(await _backend.HeadAsync("_change_data/x.parquet", CancellationToken.None));
+        Assert.Equal(1, backend.LogListingCount); // single-listing invariant: `_delta_log/` listed exactly once.
+    }
+
     [Theory]
     [InlineData("interval 1 months")]
     [InlineData("garbage")]
