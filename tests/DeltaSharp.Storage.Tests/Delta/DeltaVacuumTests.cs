@@ -642,6 +642,37 @@ public sealed class DeltaVacuumTests : IDisposable
         Assert.NotNull(await _backend.HeadAsync("_change_data/x.parquet", CancellationToken.None));
     }
 
+    [Fact]
+    public async Task TailTruncatedCheckpointListing_SeenByCandidatePass_FailsClosed_AndDeletesNothing()
+    {
+        // Red-team (5th finding, #489/#640): the tail-truncation guard must track CHECKPOINT versions too, not
+        // only commits. A table's latest version can be established by a checkpoint ALONE once its commit json
+        // has aged out of log retention. Here v1 is checkpoint-only (no v1.json): the candidate root listing
+        // sees the v1 checkpoint, but the log listing is torn to hide it, so the snapshot resolves to v0 and
+        // v1's live file would be reclaimed. A commit-only guard misses this (there is no v1.json to raise
+        // maxListedCommitVersion); tracking the checkpoint version in maxListedLogVersion catches it fail-closed.
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCheckpointAsync(
+            _backend, 1,
+            new CheckpointFixture().Protocol(1, 2).Metadata(id: "t", schemaString: EmptySchemaUnescaped)
+                .Add("checkpoint-active.parquet", size: 1));
+
+        await WriteDataFileAsync("checkpoint-active.parquet", Old);
+
+        // Tear the FIRST (and only) `_delta_log/` listing so it omits the v1 checkpoint → the snapshot resolves
+        // to v0. The candidate root listing (prefix "") is not torn and still sees the v1 checkpoint object.
+        string v1Checkpoint = "_delta_log/" + 1.ToString("D20", CultureInfo.InvariantCulture) + ".checkpoint.parquet";
+        var backend = new DivergentLogListingBackend(
+            _backend, omitFromSecondLogListing: new[] { v1Checkpoint }, tearFromOrdinal: 1);
+        var vacuum = new DeltaVacuum(
+            backend, policy: null, logger: null, telemetry: null, timeProvider: new FixedTimeProvider(Now));
+
+        await Assert.ThrowsAsync<DeltaProtocolException>(() => vacuum.VacuumAsync(Retention));
+
+        // Fail-closed: v1's checkpoint-referenced live file is untouched on disk.
+        Assert.NotNull(await _backend.HeadAsync("checkpoint-active.parquet", CancellationToken.None));
+    }
+
     [Theory]
     [InlineData("interval 1 months")]
     [InlineData("garbage")]

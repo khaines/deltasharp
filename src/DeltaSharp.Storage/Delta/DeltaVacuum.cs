@@ -291,22 +291,25 @@ internal sealed class DeltaVacuum
         // here — passing them through the contract lets it exclude them AND lets the audit record an
         // "active" decision for each, so the audit covers every discovered candidate (AC3).
         var candidates = new List<OrphanCandidate>();
-        long maxListedCommitVersion = -1;
+        long maxListedLogVersion = -1;
         await foreach (StorageObjectInfo info in _backend.ListAsync(prefix: string.Empty, cancellationToken)
             .ConfigureAwait(false))
         {
             if (IsLogObject(info.Path))
             {
-                // The table-root listing also enumerates `_delta_log/`. Track the highest COMMIT version it
-                // saw: it is an independent (and, being first, EARLIER) view of the log than the one the
-                // snapshot is reconstructed from below, so it lets us detect a tail-truncated log listing and
-                // fail closed before deleting a live commit's files.
+                // The table-root listing also enumerates `_delta_log/`. Track the highest VERSION among all
+                // version-bearing log artifacts it saw — commits AND checkpoints. It is an independent (and,
+                // being first, EARLIER) view of the log than the one the snapshot is reconstructed from below,
+                // so it lets us detect a tail-truncated log listing and fail closed before deleting a live
+                // version's files. Checkpoints must count too: a table's latest version can be established by a
+                // CHECKPOINT alone once its commit json has aged out of log retention, so a listing that drops
+                // the latest checkpoint would otherwise slip past a commit-only guard.
                 if (info.Path.StartsWith(LogDirectoryPrefix, StringComparison.Ordinal))
                 {
                     DeltaLogFile logFile = DeltaLogFiles.Classify(info.Path[LogDirectoryPrefix.Length..]);
-                    if (logFile.Kind == DeltaLogFileKind.Commit && logFile.Version > maxListedCommitVersion)
+                    if (logFile.Kind != DeltaLogFileKind.Other && logFile.Version > maxListedLogVersion)
                     {
-                        maxListedCommitVersion = logFile.Version;
+                        maxListedLogVersion = logFile.Version;
                     }
                 }
 
@@ -325,26 +328,28 @@ internal sealed class DeltaVacuum
             await _log.LoadSnapshotWithListingAsync(version: null, cancellationToken).ConfigureAwait(false);
 
         // Fail closed on a tail-truncated log listing (red-team #640): the table-root candidate pass above is
-        // an independent, earlier listing that also enumerated `_delta_log/`. If it saw a COMMIT beyond the
-        // version the snapshot resolved to, the single log listing the snapshot (and the cdc scan) were built
-        // on was stale/partial and missed a live commit — whose data AND `_change_data/` files are on disk as
-        // candidates. Reclaiming them would be data loss (they are referenced by a commit VACUUM simply did
-        // not see). Abort rather than delete. A missing MIDDLE commit is already caught fail-closed by
-        // snapshot reconstruction's gap detection; this closes the tail. (Guards regular data files too, not
-        // just cdc — the divergence is between the candidate listing and the log listing.)
-        // ACCEPTED RESIDUAL (#641): a COMPOUND double-tear — the SAME commit json invisible to BOTH the
+        // an independent, earlier listing that also enumerated `_delta_log/`. If it saw a version-bearing log
+        // artifact (a commit OR a checkpoint) beyond the version the snapshot resolved to, the single log
+        // listing the snapshot (and the cdc scan) were built on was stale/partial and missed a live version —
+        // whose data AND `_change_data/` files are on disk as candidates. Reclaiming them would be data loss
+        // (they are referenced by a version VACUUM simply did not see). Abort rather than delete. A missing
+        // MIDDLE commit is already caught fail-closed by snapshot reconstruction's gap detection; this closes
+        // the tail. (Guards regular data files too, not just cdc — the divergence is between the candidate
+        // listing and the log listing.)
+        // ACCEPTED RESIDUAL (#641): a COMPOUND double-tear — the SAME log artifact invisible to BOTH the
         // candidate and the log listing while its data file stays listed and is already aged past retention —
-        // is not caught here (maxListedCommitVersion never advances). It is inherent to the #489 single-listing
+        // is not caught here (maxListedLogVersion never advances). It is inherent to the #489 single-listing
         // invariant (fully closing it needs a second independent log read, the very divergence #489 forbids),
         // is strictly NARROWER than the pre-guard behavior, and is backstopped by the recency window (a
         // fresh unpropagated commit's files are RecentlyStaged, never deleted).
-        if (maxListedCommitVersion > snapshot.Version)
+        if (maxListedLogVersion > snapshot.Version)
         {
             throw DeltaProtocolException.Inconsistent(string.Create(
                 CultureInfo.InvariantCulture,
-                $"VACUUM aborted: the table root lists commit {maxListedCommitVersion} but the _delta_log " +
-                $"listing resolved only to version {snapshot.Version}. The log listing is stale/partial " +
-                $"(tail-truncated); reclaiming now could delete files referenced by the missing commit(s)."));
+                $"VACUUM aborted: the table root lists a _delta_log artifact at version {maxListedLogVersion} " +
+                $"but the _delta_log listing resolved only to version {snapshot.Version}. The log listing is " +
+                $"stale/partial (tail-truncated); reclaiming now could delete files referenced by the missing " +
+                $"commit(s)/checkpoint(s)."));
         }
 
         // MEDIUM: resolve the effective retention. When the caller named no explicit window, honor the
