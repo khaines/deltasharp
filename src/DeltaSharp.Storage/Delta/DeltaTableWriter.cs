@@ -854,18 +854,17 @@ internal sealed class DeltaTableWriter
             return new DeltaCommitResult(snapshot.Version, Attempts: 0, Skipped: true);
         }
 
-        // Set the property FIRST so UpgradeProtocol (which enumerates changeDataFeed from config) sees CDF as
-        // active and carries the writer feature onto the upgraded table-features protocol. Every other active
-        // legacy feature is preserved by the same upgrade (appendOnly/#549, invariants/CHECK/#568). The
-        // committer re-validates the installed protocol (EnsureWritable/EnsureReadable) fail-closed.
+        // Set the property FIRST so the writer-only upgrade (which enumerates changeDataFeed from config)
+        // carries the writer feature onto the upgraded table-features protocol. UpgradeWriterFeatures floors
+        // ONLY the writer version to 7 and leaves the reader lane untouched — CDF is writer-only, so a normal
+        // read of a CDF-enabled table needs no reader feature (snapshot reconstruction ignores cdc actions,
+        // INV C1). Every other active legacy writer feature is preserved by the same enumeration
+        // (appendOnly/#549, invariants/CHECK/#568). The committer re-validates the installed protocol
+        // (EnsureWritable/EnsureReadable) fail-closed.
         ImmutableSortedDictionary<string, string> configuration =
             snapshot.Metadata.Configuration.SetItem(ChangeDataFeedFeature.PropertyKey, "true");
-        ProtocolAction upgraded = TypeWideningFeature.UpgradeProtocol(
+        ProtocolAction upgraded = TypeWideningFeature.UpgradeWriterFeatures(
             snapshot.Protocol, snapshot.Schema, configuration);
-        upgraded = upgraded with
-        {
-            WriterFeatures = ChangeDataFeedFeature.WithWriterFeature(upgraded.WriterFeatures),
-        };
         MetadataAction metadata = snapshot.Metadata with { Configuration = configuration };
 
         return await _committer.CommitAsync(

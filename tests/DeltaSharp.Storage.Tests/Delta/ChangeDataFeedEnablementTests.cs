@@ -69,6 +69,42 @@ public sealed class ChangeDataFeedEnablementTests : IDisposable
         Assert.Contains(ChangeDataFeedFeature.Feature, after.Protocol.WriterFeatures);
         Assert.DoesNotContain(ChangeDataFeedFeature.Feature, after.Protocol.ReaderFeatures); // writer-only
         Assert.Equal("true", after.Metadata.Configuration[ChangeDataFeedFeature.PropertyKey]);
+
+        // Writer-only upgrade (H1 regression guard): the reader lane is UNTOUCHED — the reader version stays
+        // v1 and NO reader feature is installed. Enabling CDF (a writer-only feature) must not drag in the
+        // unrelated typeWidening feature or bump the reader version, which would block a strict external
+        // reader from a normal snapshot read of a table whose only new capability is writer-side.
+        Assert.Equal(1, after.Protocol.MinReaderVersion);
+        Assert.Empty(after.Protocol.ReaderFeatures);
+        Assert.DoesNotContain(TypeWideningFeature.Feature, after.Protocol.ReaderFeatures);
+        Assert.DoesNotContain(TypeWideningFeature.Feature, after.Protocol.WriterFeatures);
+    }
+
+    [Fact]
+    public async Task EnableChangeDataFeed_WhenFeaturePresentButPropertyDisabled_ReEnablesProperty()
+    {
+        // A table that declares the changeDataFeed writer feature but has delta.enableChangeDataFeed=false
+        // (e.g. a prior SET TBLPROPERTIES disabled it) is NOT active — CDF is active iff the feature is
+        // enumerated AND the property is true. EnableChangeDataFeedAsync must therefore NOT no-op here: it
+        // re-commits a metaData flipping the property back to true, keeping the already-present writer
+        // feature and leaving the reader lane untouched (still writer-only).
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 0,
+            CdfWriterProtocolLine(),
+            DeltaTestHarness.MetadataWithSchemaAndConfig(
+                Schema(),
+                new[] { (ChangeDataFeedFeature.PropertyKey, "false") }));
+
+        DeltaCommitResult result = await Writer().EnableChangeDataFeedAsync();
+
+        Assert.False(result.Skipped); // property was false → re-enable, not a no-op
+        Assert.Equal(1L, result.Version);
+
+        Snapshot after = await LoadAsync();
+        Assert.Contains(ChangeDataFeedFeature.Feature, after.Protocol.WriterFeatures);
+        Assert.Equal("true", after.Metadata.Configuration[ChangeDataFeedFeature.PropertyKey]);
+        Assert.Equal(1, after.Protocol.MinReaderVersion);
+        Assert.Empty(after.Protocol.ReaderFeatures);
     }
 
     [Fact]

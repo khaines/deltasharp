@@ -140,7 +140,55 @@ internal static class TypeWideningFeature
         // upgrade (Delta "Active Features": a feature is active iff it is in writerFeatures AND its metadata
         // marker is present). This build now ENFORCES each per row at the write seam (#549 appendOnly, #581
         // invariants/CHECK constraints), so enumerating them is safe rather than silently deactivating them.
-        ImmutableArray<string> writerFeatures = WithFeature(existing.WriterFeatures);
+        // Enumerate the implicitly-active legacy writer features so they stay ACTIVE across the table-features
+        // upgrade (Delta "Active Features": a feature is active iff it is in writerFeatures AND its metadata
+        // marker is present). typeWidening itself is a reader+writer feature, added to BOTH lanes below.
+        ImmutableArray<string> writerFeatures = EnumerateActiveLegacyWriterFeatures(
+            WithFeature(existing.WriterFeatures), schema, configuration);
+
+        return new ProtocolAction(
+            Math.Max(existing.MinReaderVersion, ReaderVersion),
+            Math.Max(existing.MinWriterVersion, WriterVersion),
+            WithFeature(existing.ReaderFeatures),
+            writerFeatures);
+    }
+
+    /// <summary>
+    /// Upgrades <paramref name="existing"/> to the table-features <b>writer</b> version (7) for a
+    /// <b>writer-only</b> feature, enumerating every implicitly-active legacy writer feature
+    /// (<c>appendOnly</c>/#549, column <c>invariants</c> + <c>checkConstraints</c>/#568/#581,
+    /// <c>changeDataFeed</c>) so none is silently deactivated, and leaving the <b>reader lane</b> (version and
+    /// features) <b>entirely untouched</b> — the correct shape for a feature that needs no reader support
+    /// (e.g. <c>changeDataFeed</c>: a normal read ignores <c>cdc</c> actions, INV C1). Contrast
+    /// <see cref="UpgradeProtocol"/>, which additionally installs the <c>typeWidening</c> reader feature and
+    /// floors the reader version to 3. Idempotent in shape: a table already at writer 7 with the features
+    /// enumerated is returned unchanged.
+    /// </summary>
+    public static ProtocolAction UpgradeWriterFeatures(
+        ProtocolAction existing, StructType schema, IReadOnlyDictionary<string, string> configuration)
+    {
+        ArgumentNullException.ThrowIfNull(existing);
+        ArgumentNullException.ThrowIfNull(schema);
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        ImmutableArray<string> writerFeatures = EnumerateActiveLegacyWriterFeatures(
+            existing.WriterFeatures.IsDefault ? ImmutableArray<string>.Empty : existing.WriterFeatures,
+            schema,
+            configuration);
+
+        return new ProtocolAction(
+            existing.MinReaderVersion,                          // reader lane UNCHANGED (writer-only feature)
+            Math.Max(existing.MinWriterVersion, WriterVersion), // floor writer → 7
+            existing.ReaderFeatures,                            // reader features UNCHANGED
+            writerFeatures);
+    }
+
+    // Enumerates the implicitly-active legacy WRITER features into writerFeatures — shared by UpgradeProtocol
+    // (type widening, reader+writer) and UpgradeWriterFeatures (writer-only features). Does NOT add
+    // typeWidening (a reader+writer feature handled via the callers' reader lane).
+    private static ImmutableArray<string> EnumerateActiveLegacyWriterFeatures(
+        ImmutableArray<string> writerFeatures, StructType schema, IReadOnlyDictionary<string, string> configuration)
+    {
         if (AppendOnlyFeature.IsEnabled(configuration))
         {
             writerFeatures = AppendOnlyFeature.WithWriterFeature(writerFeatures);
@@ -163,11 +211,7 @@ internal static class TypeWideningFeature
             writerFeatures = ChangeDataFeedFeature.WithWriterFeature(writerFeatures);
         }
 
-        return new ProtocolAction(
-            Math.Max(existing.MinReaderVersion, ReaderVersion),
-            Math.Max(existing.MinWriterVersion, WriterVersion),
-            WithFeature(existing.ReaderFeatures),
-            writerFeatures);
+        return writerFeatures;
     }
 
     // Adds a writer feature to a list unless already present (a default array is treated as empty).
