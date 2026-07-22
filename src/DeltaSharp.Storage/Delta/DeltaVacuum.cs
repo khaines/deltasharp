@@ -332,6 +332,12 @@ internal sealed class DeltaVacuum
         // not see). Abort rather than delete. A missing MIDDLE commit is already caught fail-closed by
         // snapshot reconstruction's gap detection; this closes the tail. (Guards regular data files too, not
         // just cdc — the divergence is between the candidate listing and the log listing.)
+        // ACCEPTED RESIDUAL (#641): a COMPOUND double-tear — the SAME commit json invisible to BOTH the
+        // candidate and the log listing while its data file stays listed and is already aged past retention —
+        // is not caught here (maxListedCommitVersion never advances). It is inherent to the #489 single-listing
+        // invariant (fully closing it needs a second independent log read, the very divergence #489 forbids),
+        // is strictly NARROWER than the pre-guard behavior, and is backstopped by the recency window (a
+        // fresh unpropagated commit's files are RecentlyStaged, never deleted).
         if (maxListedCommitVersion > snapshot.Version)
         {
             throw DeltaProtocolException.Inconsistent(string.Create(
