@@ -331,9 +331,20 @@ internal sealed class DeltaVacuum
         // a commit aged past log retention (below the log cutoff) is correctly absent and stays reclaimable.
         TimeSpan logRetention = _policy.ResolveTableLogRetention(snapshot.Metadata.Configuration);
         long logRetentionCutoffMillis = nowMillis - (long)logRetention.TotalMilliseconds;
-        IReadOnlyCollection<string> protectedChangeDataPaths =
-            await _log.CollectInWindowChangeDataPathsAsync(logRetentionCutoffMillis, cancellationToken)
-                .ConfigureAwait(false);
+
+        // #489 short-circuit: the cdc scan reads EVERY in-window commit JSON, so run it only when the
+        // candidate listing actually contains a file under `_change_data/`. This is zero-cost and safe: the
+        // cdc-referenced set is PURELY ADDITIVE protection, so if no `_change_data/` candidate exists on disk
+        // there is nothing for it to protect and skipping the scan cannot under-protect. Deliberately NOT
+        // gated on ChangeDataFeedFeature.IsEnabled / writerFeatures — a table with CDF disabled AFTER it was
+        // enabled can still have in-window cdc files that must be protected. Further reuse-listing/telemetry
+        // optimizations are deferred to #641.
+        bool hasChangeDataCandidate = candidates.Any(
+            c => c.Path.StartsWith(ChangeDataFeedFeature.ChangeDataDirectoryPrefix, StringComparison.Ordinal));
+        IReadOnlyCollection<string> protectedChangeDataPaths = hasChangeDataCandidate
+            ? await _log.CollectInWindowChangeDataPathsAsync(logRetentionCutoffMillis, cancellationToken)
+                .ConfigureAwait(false)
+            : Array.Empty<string>();
 
         // The single source of the deletion decision AND the audit reason (design §2.11.5): active files,
         // retention-protected tombstones, referenced change-data files, and recently-staged files are

@@ -32,6 +32,11 @@ internal static class ChangeDataFeedFeature
     /// commits materialize their row changes as <c>cdc</c> files.</summary>
     public const string PropertyKey = "delta.enableChangeDataFeed";
 
+    /// <summary>The table-root-relative directory prefix under which <c>cdc</c> (<see cref="AddCdcFileAction"/>)
+    /// change files are materialized. VACUUM keys its short-circuit on this prefix: with no candidate under
+    /// <c>_change_data/</c> there is nothing for the additive cdc protection to guard (#489).</summary>
+    public const string ChangeDataDirectoryPrefix = "_change_data/";
+
     /// <summary>
     /// True when the table property <c>delta.enableChangeDataFeed</c> is set to <c>true</c>
     /// (case-insensitive). This is an OPTIONAL enable-gate, so — unlike the fail-closed

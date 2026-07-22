@@ -165,6 +165,15 @@ internal static class DeltaTestHarness
         await backend.PutIfAbsentAsync(name, content, CancellationToken.None);
     }
 
+    /// <summary>Writes a <c>&lt;version&gt;.json</c> commit object with raw (possibly malformed) bytes — used
+    /// to model a torn/corrupt in-window commit that VACUUM's in-window <c>cdc</c> scan must fail closed on
+    /// (#489).</summary>
+    public static async Task WriteRawCommitAsync(IStorageBackend backend, long version, byte[] content)
+    {
+        string name = LogPath(Pad20(version) + ".json");
+        await backend.PutIfAbsentAsync(name, content, CancellationToken.None);
+    }
+
     public static async Task WriteCheckpointAsync(IStorageBackend backend, long version, CheckpointFixture fixture)
     {
         byte[] parquet = await fixture.ToParquetAsync();

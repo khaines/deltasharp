@@ -141,6 +141,9 @@ internal sealed record RetentionPolicy
 
         return configured;
     }
+
+    /// <summary>
+    /// Parses a Delta <c>CalendarInterval</c>/duration string (e.g. <c>"interval 30 days"</c>,
     /// <c>"7 days"</c>, <c>"interval 1 weeks 12 hours"</c>) into a fixed <see cref="TimeSpan"/>. Accepts an
     /// optional leading <c>interval</c> keyword followed by one or more <c>&lt;number&gt; &lt;unit&gt;</c>
     /// pairs. Calendar units whose length is not fixed (<c>month</c>/<c>year</c>) are <b>rejected</b>

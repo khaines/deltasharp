@@ -463,7 +463,188 @@ public sealed class DeltaVacuumTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task EncodedCdcLogPath_UnencodedDiskFile_IsNeverDeleted()
+    {
+        // Quality (HIGH), encoding-robust cdc protection: a Spark/Delta table URI-encodes the `cdc` path. A
+        // change file literally named "_change_data/foo bar.parquet" on disk is recorded as
+        // "_change_data/foo%20bar.parquet" in the commit JSON, but the directory listing yields the RAW disk
+        // key "_change_data/foo bar.parquet". Absent the encoding-robust matching the raw candidate would not
+        // match the encoded cdc path → classified orphan → DELETED. This mirrors
+        // EncodedActiveLogPath_UnencodedDiskFile_IsNeverDeleted for a `cdc` action (#489).
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 1, DeltaTestHarness.Add("active.parquet"),
+            DeltaTestHarness.Cdc("_change_data/foo%20bar.parquet"));
+
+        await WriteDataFileAsync("active.parquet", Old);
+        await WriteDataFileAsync("_change_data/foo bar.parquet", Old); // raw disk key, old mtime → only the cdc ref saves it
+
+        var vacuum = new DeltaVacuum(
+            DeltaTestHarness.WithCommitTimestamps(_backend, (0, Recent), (1, Recent)),
+            policy: null, logger: null, telemetry: null, timeProvider: new FixedTimeProvider(Now));
+
+        VacuumResult result = await vacuum.VacuumAsync(Retention);
+
+        Assert.DoesNotContain("_change_data/foo bar.parquet", result.DeletablePaths);
+        Assert.DoesNotContain("_change_data/foo bar.parquet", result.DeletedPaths);
+        Assert.NotNull(await _backend.HeadAsync("_change_data/foo bar.parquet", CancellationToken.None));
+        Assert.Equal(
+            VacuumDecision.ReferencedChangeData,
+            result.Audit.Single(e => e.Path == "_change_data/foo bar.parquet").Decision);
+    }
+
+    [Theory]
+    [InlineData("interval 1 months")]
+    [InlineData("garbage")]
+    public async Task UnparseableLogRetention_FailsClosed_AndDeletesNothing(string malformed)
+    {
+        // Quality (HIGH): a table whose delta.logRetentionDuration is present but unparseable must fail
+        // closed — VACUUM cannot know how far back to scan for in-window `cdc` files, so
+        // ResolveTableLogRetention throws (FormatException) rather than silently under-protecting; nothing is
+        // reclaimed (#489).
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 0, DeltaTestHarness.Protocol(),
+            DeltaTestHarness.MetadataWithConfig(("delta.logRetentionDuration", malformed)));
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Add("active.parquet"));
+        await WriteDataFileAsync("active.parquet", Old);
+        await WriteDataFileAsync("old-orphan.parquet", Old); // deletable but for the fail-closed abort
+
+        await Assert.ThrowsAsync<FormatException>(() => _vacuum.VacuumAsync(Retention));
+
+        // Fail-closed: the malformed config aborts VACUUM before any deletion.
+        Assert.NotNull(await _backend.HeadAsync("old-orphan.parquet", CancellationToken.None));
+        Assert.NotNull(await _backend.HeadAsync("active.parquet", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task CdcCommit_AtExactLogRetentionBoundary_IsProtected()
+    {
+        // Quality (MEDIUM), exact window boundary: a cdc file whose referencing commit's mtime is EXACTLY at
+        // `now - logRetentionDuration` is in-window (the scan skips only commits STRICTLY below the cutoff),
+        // so the file is protected (#489). logRetentionDuration defaults to 30 days.
+        DateTimeOffset boundary = Now - RetentionPolicyLogWindow; // exactly at the cutoff → protected
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 1, DeltaTestHarness.Add("active.parquet"), DeltaTestHarness.Cdc("_change_data/x.parquet"));
+
+        await WriteDataFileAsync("active.parquet", Old);
+        await WriteDataFileAsync("_change_data/x.parquet", Old); // Old mtime → only the in-window cdc ref protects it
+
+        var vacuum = new DeltaVacuum(
+            DeltaTestHarness.WithCommitTimestamps(_backend, (0, boundary), (1, boundary)),
+            policy: null, logger: null, telemetry: null, timeProvider: new FixedTimeProvider(Now));
+
+        VacuumResult result = await vacuum.VacuumAsync(Retention);
+
+        Assert.DoesNotContain("_change_data/x.parquet", result.DeletedPaths);
+        Assert.NotNull(await _backend.HeadAsync("_change_data/x.parquet", CancellationToken.None));
+        Assert.Equal(
+            VacuumDecision.ReferencedChangeData,
+            result.Audit.Single(e => e.Path == "_change_data/x.parquet").Decision);
+    }
+
+    [Fact]
+    public async Task CdcCommit_JustBeyondLogRetentionBoundary_IsReclaimable()
+    {
+        // Quality (MEDIUM), exact window boundary (other side): a cdc file whose referencing commit's mtime
+        // is `now - logRetentionDuration - 1ms` is STRICTLY below the cutoff, so the scan skips it and the
+        // change file falls through to Deletable (#489).
+        DateTimeOffset justBeyond = Now - RetentionPolicyLogWindow - TimeSpan.FromMilliseconds(1);
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 1, DeltaTestHarness.Add("active.parquet"), DeltaTestHarness.Cdc("_change_data/x.parquet"));
+
+        await WriteDataFileAsync("active.parquet", Old);
+        await WriteDataFileAsync("_change_data/x.parquet", Old);
+
+        var vacuum = new DeltaVacuum(
+            DeltaTestHarness.WithCommitTimestamps(_backend, (0, justBeyond), (1, justBeyond)),
+            policy: null, logger: null, telemetry: null, timeProvider: new FixedTimeProvider(Now));
+
+        VacuumResult result = await vacuum.VacuumAsync(Retention);
+
+        Assert.Contains("_change_data/x.parquet", result.DeletedPaths);
+        Assert.Null(await _backend.HeadAsync("_change_data/x.parquet", CancellationToken.None));
+        Assert.Equal(
+            VacuumDecision.Deletable,
+            result.Audit.Single(e => e.Path == "_change_data/x.parquet").Decision);
+    }
+
+    [Fact]
+    public async Task TornInWindowCommit_FailsClosed_AndReclaimsNothing()
+    {
+        // SRE (MEDIUM): a torn/corrupt in-window commit JSON must fail VACUUM closed — the in-window `cdc`
+        // scan reads every retained commit, and a decode failure must propagate (never silently skip and
+        // under-protect). A checkpoint at v1 seeds the snapshot cleanly, so it is the SCAN that trips over
+        // the malformed v0.json; a co-present deletable orphan proves nothing is reclaimed on abort (#489).
+        await DeltaTestHarness.WriteCheckpointAsync(
+            _backend, 1, new CheckpointFixture().Protocol(1, 2).Metadata(id: "t", schemaString: EmptySchemaUnescaped));
+        await DeltaTestHarness.WriteLastCheckpointAsync(_backend, 1);
+        await DeltaTestHarness.WriteRawCommitAsync(
+            _backend, 0, System.Text.Encoding.UTF8.GetBytes("{ this is not valid delta json"));
+
+        // A `_change_data/` candidate forces the short-circuit to actually run the scan (else it is skipped).
+        await WriteDataFileAsync("_change_data/orphan.parquet", Old);
+
+        var vacuum = new DeltaVacuum(
+            DeltaTestHarness.WithCommitTimestamps(_backend, (0, Recent)), // torn v0 is in the log-retention window
+            policy: null, logger: null, telemetry: null, timeProvider: new FixedTimeProvider(Now));
+
+        await Assert.ThrowsAsync<DeltaProtocolException>(() => vacuum.VacuumAsync(Retention));
+
+        // Fail-closed: the abort happens before the deletion phase, so the orphan is untouched.
+        Assert.NotNull(await _backend.HeadAsync("_change_data/orphan.parquet", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task DryRun_ReferencedCdcFile_ShowsProtectedDecision_AndRemainsOnDisk()
+    {
+        // SRE (LOW): under dryRun a referenced cdc file is audited as ReferencedChangeData with Deleted=false
+        // and is never touched on disk (#489).
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 1, DeltaTestHarness.Add("active.parquet"), DeltaTestHarness.Cdc("_change_data/x.parquet"));
+
+        await WriteDataFileAsync("active.parquet", Old);
+        await WriteDataFileAsync("_change_data/x.parquet", Old);
+
+        var vacuum = new DeltaVacuum(
+            DeltaTestHarness.WithCommitTimestamps(_backend, (0, Recent), (1, Recent)),
+            policy: null, logger: null, telemetry: null, timeProvider: new FixedTimeProvider(Now));
+
+        VacuumResult result = await vacuum.VacuumAsync(Retention, dryRun: true);
+
+        Assert.True(result.DryRun);
+        var entry = result.Audit.Single(e => e.Path == "_change_data/x.parquet");
+        Assert.Equal(VacuumDecision.ReferencedChangeData, entry.Decision);
+        Assert.False(entry.Deleted);
+        Assert.NotNull(await _backend.HeadAsync("_change_data/x.parquet", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task NonCdfTable_NoChangeDataCandidates_ReclaimsOrphans()
+    {
+        // #489 short-circuit: a table with no `_change_data/` candidate skips the in-window cdc scan entirely
+        // (nothing to protect). VACUUM behaves exactly as before — a genuine orphan past retention is
+        // reclaimed and the active file is protected — exercising the short-circuit path without regression.
+        await WriteLogAsync(new[] { DeltaTestHarness.Add("active.parquet") });
+        await WriteDataFileAsync("active.parquet", Old);
+        await WriteDataFileAsync("old-orphan.parquet", Old);
+
+        VacuumResult result = await _vacuum.VacuumAsync(Retention);
+
+        Assert.Equal(new[] { "old-orphan.parquet" }, result.DeletedPaths.ToArray());
+        Assert.Null(await _backend.HeadAsync("old-orphan.parquet", CancellationToken.None));
+        Assert.NotNull(await _backend.HeadAsync("active.parquet", CancellationToken.None));
+    }
+
     // ---- helpers ----
+
+    // The default delta.logRetentionDuration window (30 days) the boundary tests pivot the scan cutoff on.
+    private static readonly TimeSpan RetentionPolicyLogWindow = TimeSpan.FromDays(30);
+
+    private const string EmptySchemaUnescaped = """{"type":"struct","fields":[]}""";
 
     private static DateTime Old => Now.AddDays(-60).UtcDateTime;    // well before any tested cutoff → deletable
     private static DateTimeOffset Recent => Now.AddDays(-1);         // within the 168 h window → protected
