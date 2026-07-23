@@ -55,6 +55,36 @@ public sealed class ChangeFeedReadTests : IDisposable
         new StructField("val", DataTypes.LongType, nullable: true),
     });
 
+    // FlatSchema + a nullable `extra` column — the reconciled END schema after an ALTER ADD COLUMN mid-range
+    // (§2.8 cross-range reconciliation). Rows written before `extra` existed must null-fill it at read time.
+    private static readonly StructType WideFlatSchema = new(new[]
+    {
+        new StructField("id", DataTypes.LongType, nullable: false),
+        new StructField("name", DataTypes.StringType, nullable: true),
+        new StructField("extra", DataTypes.LongType, nullable: true),
+    });
+
+    // An int `amount` column and its widened long form — drives the int→long type-widening reconciliation
+    // (§2.8): narrow int values written before the widening promote to long at the reconciled END schema.
+    private static readonly StructType WideningIntSchema = new(new[]
+    {
+        new StructField("id", DataTypes.LongType, nullable: false),
+        new StructField("amount", DataTypes.IntegerType, nullable: true),
+    });
+
+    private static readonly StructType WideningLongSchema = new(new[]
+    {
+        new StructField("id", DataTypes.LongType, nullable: false),
+        new StructField("amount", DataTypes.LongType, nullable: true),
+    });
+
+    // A single nullable `name` column: a physically-narrow file (dropping the required `id`) used to prove an
+    // absent REQUIRED column fails closed as schema evolution (never a silent null-fill of a required column).
+    private static readonly StructType NarrowNameSchema = new(new[]
+    {
+        new StructField("name", DataTypes.StringType, nullable: true),
+    });
+
     public void Dispose()
     {
         try
@@ -422,20 +452,43 @@ public sealed class ChangeFeedReadTests : IDisposable
     [Fact]
     public async Task EachProducedBatch_CarriesExactlyOneCommitVersion()
     {
-        // INV C8: a produced ColumnBatch never spans versions. Build a multi-version, multi-file range and
-        // assert every batch carries a single _commit_version, non-decreasing across the stream.
+        // INV C8: a produced ColumnBatch never spans versions — AND, when a batch is MULTI-ROW, every row in it
+        // shares the one _commit_version. Write MULTIPLE rows to the SAME partition file per commit so at least
+        // one produced batch is genuinely multi-row (a 1-row-per-batch fixture could not exercise the invariant).
         await CreateCdfPartitionedTableAsync(PartitionedBootstrap());          // v0, v1 (partitioned ⇒ multi-file)
-        await AppendPartAsync(PartBatch((10, "east", 100), (11, "west", 110))); // v2 (2 files ⇒ 2+ batches)
-        await AppendPartAsync(PartBatch((20, "east", 200), (21, "west", 210))); // v3 (2 files ⇒ 2+ batches)
+        // east = 2 rows ⇒ ONE 2-row file (a multi-row batch); west = 1 row ⇒ a second, single-row file.
+        await AppendPartAsync(PartBatch((10, "east", 100), (11, "east", 110), (12, "west", 120))); // v2
+        await AppendPartAsync(PartBatch((20, "east", 200), (21, "east", 210), (22, "west", 220))); // v3
 
         (_, List<ColumnBatch> batches) = await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 3));
-        (_, List<long> batchVersions) = DecodePartChanges(batches);   // DecodePartChanges asserts one version/batch
+        (List<PartChange> rows, List<long> batchVersions) = DecodePartChanges(batches);   // asserts one version/batch
+
+        // At least one produced batch is genuinely multi-row: the multi-row single-version invariant is exercised.
+        Assert.Contains(batches, b => b.LogicalRowCount > 1);
+        // INV C8 restated at the ROW level: within EVERY batch, all rows carry the SAME _commit_version.
+        foreach (ColumnBatch batch in batches)
+        {
+            (_, ColumnVector version, _) = MetadataColumns(batch);
+            long[] distinct = Enumerable.Range(0, batch.LogicalRowCount)
+                .Select(r => version.GetValue<long>(r)).Distinct().ToArray();
+            Assert.Single(distinct);
+        }
 
         Assert.True(batches.Count >= 4, "expected at least one batch per partition file per version");
         Assert.All(batches, b => Assert.True(b.LogicalRowCount > 0, "no empty batch should be produced"));
         Assert.Equal(batchVersions.OrderBy(x => x).ToArray(), batchVersions.ToArray());   // ascending
         Assert.Contains(2L, batchVersions);
         Assert.Contains(3L, batchVersions);
+
+        // Value-level: every appended row surfaces exactly once as an insert, stamped with its commit version.
+        Assert.Equal(
+            new[]
+            {
+                (10L, "east", (long?)100L, 2L), (11L, "east", (long?)110L, 2L), (12L, "west", (long?)120L, 2L),
+                (20L, "east", (long?)200L, 3L), (21L, "east", (long?)210L, 3L), (22L, "west", (long?)220L, 3L),
+            },
+            rows.OrderBy(r => r.Id).Select(r => (r.Id, r.Region, r.Val, r.Version)).ToArray());
+        Assert.All(rows, r => Assert.Equal(ChangeDataWriter.InsertChange, r.ChangeType));
     }
 
     // ---------------------------------------------------------------- partition reconstruction: both paths
@@ -614,6 +667,267 @@ public sealed class ChangeFeedReadTests : IDisposable
         (List<FlatChange> rows, _) = DecodeFlatChanges(batches);
         FlatChange only = Assert.Single(rows);
         Assert.Equal((3L, ChangeDataWriter.DeleteChange, 3L), (only.Id, only.ChangeType, only.Version));
+    }
+
+    // ---------------------------------------------------------------- §2.8 cross-range schema reconciliation
+
+    [Fact]
+    public async Task AddNullableColumnAcrossRange_EarlierRowsNullFillAtEndSchema()
+    {
+        // HP-07 / §2.8: enable CDF → append narrow (v2) → ALTER ADD nullable COLUMN via mergeSchema (v3).
+        // Reading [v2..end] reconciles to the END schema; the v2 rows (written before `extra` existed) MUST
+        // null-fill `extra` (schema-on-read), while the v3 row carries its value — a mutant that reads each
+        // version against its OWN schema (dropping `extra` for v2) or fails to null-fill would break here.
+        await CreateCdfFlatTableAsync(Batch((1, "a")));                          // v0, v1 (CDF on)
+        long va = await AppendFlatAsync(Batch((10, "x"), (11, "y")));            // v2: narrow (id, name)
+        Assert.Equal(2L, va);
+        long vb = await AppendMergeAsync(WideFlatSchema, Array.Empty<string>(),
+            WideBatch((20, "z", 200L)));                                        // v3: adds nullable `extra`
+        Assert.Equal(3L, vb);
+
+        (DeltaChangeFeedInfo info, List<ColumnBatch> batches) =
+            await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 3));
+        AssertCdfOutputSchema(info.Schema, WideFlatSchema);                     // reconciled END schema (id,name,extra)
+
+        Assert.Equal(
+            new[]
+            {
+                (10L, (string?)"x", (long?)null, ChangeDataWriter.InsertChange, 2L),  // v2 rows null-fill `extra`
+                (11L, "y", (long?)null, ChangeDataWriter.InsertChange, 2L),
+                (20L, "z", (long?)200L, ChangeDataWriter.InsertChange, 3L),           // v3 row carries `extra`
+            },
+            DecodeWideChanges(batches).OrderBy(r => r.Id).ToArray());
+    }
+
+    [Fact]
+    public async Task IntToLongWideningAcrossRange_EarlierNarrowValuesPromote()
+    {
+        // §2.8 type-widening reconciliation: an int→long widening between v_a and v_b. Reading [v_a..v_b] against
+        // the reconciled END (long) schema promotes the earlier narrow int values to long. A value that only
+        // fits in long (> int.MaxValue) proves the column is genuinely widened (not truncated to 32 bits).
+        await CreateWideningCdfTableAsync(IntAmountBatch((1, 1)));               // v0 seed, v1 CDF, v2 typeWidening
+        long va = await AppendIntAsync(IntAmountBatch((10, 100), (11, 110)));    // v3: narrow int append (CDF on)
+        Assert.Equal(3L, va);
+        long vb = await AppendMergeAsync(WideningLongSchema, Array.Empty<string>(),
+            LongAmountBatch((20, 3_000_000_000L)));                             // v4: widen amount int→long
+        Assert.Equal(4L, vb);
+
+        (DeltaChangeFeedInfo info, List<ColumnBatch> batches) =
+            await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(3, 4));
+        AssertCdfOutputSchema(info.Schema, WideningLongSchema);                 // reconciled END schema: amount = long
+
+        Assert.Equal(
+            new[]
+            {
+                (10L, (long?)100L, ChangeDataWriter.InsertChange, 3L),          // narrow int values promoted to long
+                (11L, (long?)110L, ChangeDataWriter.InsertChange, 3L),
+                (20L, (long?)3_000_000_000L, ChangeDataWriter.InsertChange, 4L), // > int.MaxValue ⇒ genuinely long
+            },
+            DecodeAmountChanges(batches).OrderBy(r => r.Id).ToArray());
+    }
+
+    [Fact]
+    public async Task NameModeRenameAcrossRange_EarlierRowsSurfaceUnderRenamedColumn()
+    {
+        // §2.8 rename reconciliation (name mode): rename `val`→`amount` (v3) AFTER an append (v2). Name mode keeps
+        // a STABLE physical name across the logical rename, so the v2 rows (physical `val`) resolve to the END
+        // logical `amount` — surfacing under the renamed column. The rename commit itself is metadata-only and
+        // contributes ZERO change rows. (RenameColumnAsync requires NAME mode — the write door rejects a metadata
+        // rename in id mode — so this exercises rename-reconciliation in name mode; the id-mode field-id-across-
+        // range property is covered by IdModeAcrossRange_ResolvesByFieldId.)
+        await CreateNameMappedCdfPartitionedTableAsync(PartBatch((1, "east", 1)));       // v0, v1 (name mode, CDF on)
+        long va = await AppendPartAsync(PartBatch((10, "east", 100), (11, "west", 110)));// v2 (physical `val`)
+        Assert.Equal(2L, va);
+        await new DeltaTableWriter(new LocalFileSystemBackend(_root)).RenameColumnAsync("val", "amount"); // v3
+
+        (DeltaChangeFeedInfo info, List<ColumnBatch> batches) =
+            await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 3));
+        Assert.Equal("amount", info.Schema[2].Name);   // END schema's data column 2 is the RENAMED `amount`
+
+        (List<PartChange> rows, List<long> batchVersions) = DecodePartChanges(batches);
+        Assert.Equal(
+            new[]
+            {
+                (10L, "east", (long?)100L, ChangeDataWriter.InsertChange, 2L),  // pre-rename rows under `amount`
+                (11L, "west", (long?)110L, ChangeDataWriter.InsertChange, 2L),
+            },
+            rows.OrderBy(r => r.Id).Select(r => (r.Id, r.Region, r.Val, r.ChangeType, r.Version)).ToArray());
+        Assert.DoesNotContain(3L, batchVersions);       // the rename commit contributes NO change rows
+    }
+
+    [Fact]
+    public async Task IdModeAcrossRange_ResolvesByFieldId_AndNullFillsAddedColumn()
+    {
+        // §2.8 id-mode reconciliation: in ID mapping, columns resolve by FIELD-ID (not physical/logical name).
+        // Append (v2) then ADD a nullable column via mergeSchema (v3, fresh field-id). Reading [v2..v3] resolves
+        // the v2 file's id/name by field-id against the END schema and null-fills the added column — a mutant
+        // resolving by name (or failing to null-fill the field-id-only-present column) would break here.
+        await CreateIdMappedCdfFlatTableAsync(Batch((1, "a")));                 // v0, v1 (id mode, CDF on)
+        long va = await AppendFlatAsync(Batch((10, "x"), (11, "y")));           // v2 (id, name)
+        Assert.Equal(2L, va);
+        long vb = await AppendMergeAsync(WideFlatSchema, Array.Empty<string>(),
+            WideBatch((20, "z", 200L)));                                       // v3 (adds nullable `extra`, fresh id)
+        Assert.Equal(3L, vb);
+
+        (DeltaChangeFeedInfo info, List<ColumnBatch> batches) =
+            await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 3));
+        AssertCdfOutputSchema(info.Schema, WideFlatSchema);
+
+        Assert.Equal(
+            new[]
+            {
+                (10L, (string?)"x", (long?)null, ChangeDataWriter.InsertChange, 2L),  // resolved by field-id, null-fill
+                (11L, "y", (long?)null, ChangeDataWriter.InsertChange, 2L),
+                (20L, "z", (long?)200L, ChangeDataWriter.InsertChange, 3L),
+            },
+            DecodeWideChanges(batches).OrderBy(r => r.Id).ToArray());
+    }
+
+    // ---------------------------------------------------------------- fail-closed: torn / absent / OPTIMIZE
+
+    [Fact]
+    public async Task TornDataFile_InRange_FailsClosedAsCorruptData()
+    {
+        // A resolved in-range DATA file truncated mid-body (footer lost) fails closed as a classified
+        // DeltaReadException carrying CorruptData — NOT a partial/garbage batch — and DISTINCT from the
+        // vacuumed NotFound case (VacuumedDataFile_FailsClosedAtRead), which carries StorageErrorKind.NotFound.
+        await CreateCdfFlatTableAsync(Batch((1, "a")));    // v0, v1
+        await AppendFlatAsync(Batch((10, "x")));           // v2 add(dataChange) — implicit insert source
+        var backend = new LocalFileSystemBackend(_root);
+        AddFileAction add = Assert.Single((await ReadCommitActionsAsync(backend, 2)).OfType<AddFileAction>());
+        TruncateInHalf(Path.Combine(_root, add.Path));     // torn mid-body
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
+        DeltaStorageException inner = Assert.IsType<DeltaStorageException>(ex.InnerException);
+        Assert.Equal(StorageErrorKind.CorruptData, inner.Kind);   // classified corruption, distinct from NotFound
+    }
+
+    [Fact]
+    public async Task TornCdcFile_InRange_FailsClosedAsCorruptData()
+    {
+        // A resolved in-range CDC file truncated mid-body fails closed the same way on the EXPLICIT path (the
+        // per-version cdc read opens the torn file and classifies CorruptData) — never a partial batch.
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0, v1
+        var backend = new LocalFileSystemBackend(_root);
+        await NewCdfDelete(backend, "torn-cdc").DeleteAsync(WhereId(id => id == 1));   // v2 cdc delete
+        string cdc = Assert.Single(CdcFilePaths());
+        TruncateInHalf(Path.Combine(_root, cdc));
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
+        DeltaStorageException inner = Assert.IsType<DeltaStorageException>(ex.InnerException);
+        Assert.Equal(StorageErrorKind.CorruptData, inner.Kind);
+    }
+
+    [Fact]
+    public async Task AbsentRequiredColumn_InRangeFile_FailsClosedAsSchemaEvolution()
+    {
+        // EE-05: a required (non-nullable) data column ABSENT from an in-range file fails closed as
+        // DeltaReadSchemaEvolutionException (never a silent null-fill of a required column, never masked as
+        // corruption). The narrow file is manufactured by overwriting the appended data file with one that
+        // physically drops the required `id` — reached on the IMPLICIT path (no cdc), where the reader's
+        // ColumnNotPresentInFile sentinel maps to the typed evolution exception.
+        await CreateCdfFlatTableAsync(Batch((1, "a")));    // v0, v1
+        await AppendFlatAsync(Batch((10, "x")));           // v2 add(dataChange)
+        var backend = new LocalFileSystemBackend(_root);
+        AddFileAction add = Assert.Single((await ReadCommitActionsAsync(backend, 2)).OfType<AddFileAction>());
+        byte[] narrow = await ParquetTestHelpers.WriteToBytesAsync(NarrowNameSchema, new[] { NameOnlyBatch("x") });
+        await File.WriteAllBytesAsync(Path.Combine(_root, add.Path), narrow);   // physically drop required `id`
+
+        await Assert.ThrowsAsync<DeltaReadSchemaEvolutionException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
+    }
+
+    [Fact]
+    public async Task OptimizeCommit_InRange_ContributesNoChangeRows()
+    {
+        // INV C4: an OPTIMIZE commit (dataChange=false add + dataChange=false removes) is INVISIBLE to CDF — it
+        // rewrites file layout without changing table content, so it derives ZERO change rows. Reading a range
+        // that SPANS the OPTIMIZE version surfaces only the (dataChange=true) append rows — a mutant that
+        // derived inserts from the compacted add (or deletes from the compaction removes) would double-count.
+        await CreateCdfFlatTableAsync(Batch((1, "a")));    // v0, v1
+        await AppendFlatAsync(Batch((10, "x")));           // v2 (small file 1)
+        await AppendFlatAsync(Batch((11, "y")));           // v3 (small file 2)
+        await AppendFlatAsync(Batch((12, "z")));           // v4 (small file 3)
+        var backend = new LocalFileSystemBackend(_root);
+        OptimizeResult opt = await new DeltaOptimize(backend).OptimizeAsync();   // v5: compaction (dataChange=false)
+        Assert.Equal(5L, opt.CommittedVersion);
+
+        // The OPTIMIZE commit's file actions are ALL dataChange=false, and it genuinely compacted (≥1 add).
+        IReadOnlyList<DeltaAction> v5 = await ReadCommitActionsAsync(backend, 5);
+        Assert.NotEmpty(v5.OfType<AddFileAction>());
+        Assert.All(v5.OfType<AddFileAction>(), a => Assert.False(a.DataChange));
+        Assert.All(v5.OfType<RemoveFileAction>(), r => Assert.False(r.DataChange));
+
+        (_, List<ColumnBatch> batches) = await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 5));
+        (List<FlatChange> rows, List<long> batchVersions) = DecodeFlatChanges(batches);
+
+        Assert.DoesNotContain(5L, batchVersions);          // OPTIMIZE (v5) produced NO batch at all
+        Assert.Equal(
+            new[]
+            {
+                (10L, ChangeDataWriter.InsertChange, 2L),
+                (11L, ChangeDataWriter.InsertChange, 3L),
+                (12L, ChangeDataWriter.InsertChange, 4L),
+            },
+            rows.OrderBy(r => r.Id).Select(r => (r.Id, r.ChangeType, r.Version)).ToArray());
+    }
+
+    // ---------------------------------------------------------------- resolve-time pinning + cancellation
+
+    [Fact]
+    public async Task PinnedRange_IgnoresCommitsAfterResolve()
+    {
+        // The range is resolved (and its end pinned to the then-latest) ONCE at LoadChangeFeedAsync. A commit
+        // that lands AFTER resolve but BEFORE the streaming read must NOT appear: ReadChangeBatchesAsync replays
+        // exactly the pinned [start,end] (analysis→execution TOCTOU safety, mirroring snapshot pinning).
+        await CreateCdfFlatTableAsync(Batch((1, "a")));    // v0, v1
+        await AppendFlatAsync(Batch((10, "x")));           // v2 (the only version at resolve time)
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaChangeFeedInfo info = await source.LoadChangeFeedAsync(
+            DeltaChangeFeedRange.FromVersion(2), CancellationToken.None);   // end omitted ⇒ pinned to latest (2)
+        Assert.Equal(2L, info.EndVersion);
+
+        await AppendFlatAsync(Batch((20, "y")));           // v3 committed AFTER resolve — must be ignored
+
+        var batches = new List<ColumnBatch>();
+        await foreach (ColumnBatch batch in source.ReadChangeBatchesAsync(info, CancellationToken.None))
+        {
+            batches.Add(batch);
+        }
+
+        (List<FlatChange> rows, _) = DecodeFlatChanges(batches);
+        FlatChange only = Assert.Single(rows);             // ONLY v2's insert; v3 is outside the pinned range
+        Assert.Equal((10L, ChangeDataWriter.InsertChange, 2L), (only.Id, only.ChangeType, only.Version));
+    }
+
+    [Fact]
+    public async Task Cancellation_AfterFirstBatch_StopsTheStream()
+    {
+        // The streaming read honors the CancellationToken: cancelling after the first yielded batch surfaces an
+        // OperationCanceledException on the NEXT version's iteration (proves [EnumeratorCancellation] propagation
+        // and the per-version cancellation checkpoint). Two single-batch versions guarantee a next iteration.
+        await CreateCdfFlatTableAsync(Batch((1, "a")));    // v0, v1
+        await AppendFlatAsync(Batch((10, "x")));           // v2 (batch 1)
+        await AppendFlatAsync(Batch((20, "y")));           // v3 (batch 2)
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaChangeFeedInfo info = await source.LoadChangeFeedAsync(
+            DeltaChangeFeedRange.FromVersion(2, 3), CancellationToken.None);
+        using var cts = new CancellationTokenSource();
+
+        int produced = 0;
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+        {
+            await foreach (ColumnBatch batch in source.ReadChangeBatchesAsync(info, cts.Token))
+            {
+                produced++;
+                cts.Cancel();   // after the first batch; the next version's iteration must observe cancellation
+            }
+        });
+        Assert.Equal(1, produced);   // exactly one batch surfaced before cancellation was observed
     }
 
     // ================================================================ helpers
@@ -821,10 +1135,42 @@ public sealed class ChangeFeedReadTests : IDisposable
         await new DeltaTableWriter(new LocalFileSystemBackend(_root)).EnableChangeDataFeedAsync();
     }
 
+    // A fresh int-column table with CDF AND type widening enabled, so a later long append WIDENS `amount`
+    // (int→long) IN-RANGE and the earlier narrow int files reconcile (promote) to long at read time (§2.8).
+    private async Task CreateWideningCdfTableAsync(params ColumnBatch[] intBatches)
+    {
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(_root))
+        {
+            await target.CreateDeletionVectorTableAsync(WideningIntSchema, Array.Empty<string>(), intBatches);
+        }
+
+        var backend = new LocalFileSystemBackend(_root);
+        await new DeltaTableWriter(backend).EnableChangeDataFeedAsync();
+        await new DeltaTableWriter(backend).EnableTypeWideningAsync();
+    }
+
     private async Task<long> AppendFlatAsync(params ColumnBatch[] batches)
     {
         using DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(_root);
         DeltaWriteResult result = await target.AppendAsync(FlatSchema, Array.Empty<string>(), batches);
+        return result.Version;
+    }
+
+    // An additive/widening append that EVOLVES the schema (Spark mergeSchema): add a nullable column or apply a
+    // sanctioned type widening. `schema` is the (wider) target schema written by this commit.
+    private async Task<long> AppendMergeAsync(
+        StructType schema, IReadOnlyList<string> partitionColumns, params ColumnBatch[] batches)
+    {
+        using DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(_root);
+        DeltaWriteResult result = await target.AppendAsync(schema, partitionColumns, batches, mergeSchema: true);
+        return result.Version;
+    }
+
+    // Appends narrow int rows to the widening table (the table schema already matches ⇒ no mergeSchema needed).
+    private async Task<long> AppendIntAsync(params ColumnBatch[] batches)
+    {
+        using DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(_root);
+        DeltaWriteResult result = await target.AppendAsync(WideningIntSchema, Array.Empty<string>(), batches);
         return result.Version;
     }
 
@@ -922,6 +1268,60 @@ public sealed class ChangeFeedReadTests : IDisposable
         throw new InvalidOperationException($"No commitInfo.timestamp in version {version}.");
     }
 
+    // Decodes the (id, name, extra) wide-schema change rows for the cross-range reconciliation tests, asserting
+    // per batch (via AssertMetadataRow): INV C8 (one _commit_version) + non-null, valid metadata columns.
+    private static List<(long Id, string? Name, long? Extra, string ChangeType, long Version)> DecodeWideChanges(
+        List<ColumnBatch> batches)
+    {
+        var rows = new List<(long, string?, long?, string, long)>();
+        foreach (ColumnBatch batch in batches)
+        {
+            ColumnVector id = batch.SelectedColumn(0);
+            ColumnVector name = batch.SelectedColumn(1);
+            ColumnVector extra = batch.SelectedColumn(2);
+            (ColumnVector changeType, ColumnVector version, ColumnVector ts) = MetadataColumns(batch);
+            long? single = null;
+            for (int r = 0; r < batch.LogicalRowCount; r++)
+            {
+                long v = AssertMetadataRow(changeType, version, ts, r, ref single);
+                rows.Add((id.GetValue<long>(r), name.IsNull(r) ? null : Utf8(name, r),
+                    extra.IsNull(r) ? (long?)null : extra.GetValue<long>(r), Utf8(changeType, r), v));
+            }
+        }
+
+        return rows;
+    }
+
+    // Decodes the (id, amount) widening-schema change rows, asserting per batch: INV C8 + non-null metadata.
+    private static List<(long Id, long? Amount, string ChangeType, long Version)> DecodeAmountChanges(
+        List<ColumnBatch> batches)
+    {
+        var rows = new List<(long, long?, string, long)>();
+        foreach (ColumnBatch batch in batches)
+        {
+            ColumnVector id = batch.SelectedColumn(0);
+            ColumnVector amount = batch.SelectedColumn(1);
+            (ColumnVector changeType, ColumnVector version, ColumnVector ts) = MetadataColumns(batch);
+            long? single = null;
+            for (int r = 0; r < batch.LogicalRowCount; r++)
+            {
+                long v = AssertMetadataRow(changeType, version, ts, r, ref single);
+                rows.Add((id.GetValue<long>(r), amount.IsNull(r) ? (long?)null : amount.GetValue<long>(r),
+                    Utf8(changeType, r), v));
+            }
+        }
+
+        return rows;
+    }
+
+    // Truncates a file to its first half (footer + magic lost) — a torn/partial upload that must fail closed as
+    // CorruptData, distinct from a fully-absent (NotFound/vacuumed) file.
+    private static void TruncateInHalf(string path)
+    {
+        byte[] bytes = File.ReadAllBytes(path);
+        File.WriteAllBytes(path, bytes[..(bytes.Length / 2)]);
+    }
+
     private static ColumnBatch Batch(params (long Id, string? Name)[] rows)
     {
         MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, rows.Length);
@@ -962,5 +1362,93 @@ public sealed class ChangeFeedReadTests : IDisposable
         }
 
         return new ManagedColumnBatch(PartitionedSchema, new ColumnVector[] { id, region, val }, rows.Length);
+    }
+
+    private static ColumnBatch WideBatch(params (long Id, string? Name, long? Extra)[] rows)
+    {
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, rows.Length);
+        MutableColumnVector name = ColumnVectors.Create(DataTypes.StringType, rows.Length);
+        MutableColumnVector extra = ColumnVectors.Create(DataTypes.LongType, rows.Length);
+        foreach ((long i, string? n, long? e) in rows)
+        {
+            id.AppendValue(i);
+            if (n is null)
+            {
+                name.AppendNull();
+            }
+            else
+            {
+                name.AppendBytes(Encoding.UTF8.GetBytes(n));
+            }
+
+            if (e is null)
+            {
+                extra.AppendNull();
+            }
+            else
+            {
+                extra.AppendValue(e.Value);
+            }
+        }
+
+        return new ManagedColumnBatch(WideFlatSchema, new ColumnVector[] { id, name, extra }, rows.Length);
+    }
+
+    private static ColumnBatch IntAmountBatch(params (long Id, int? Amount)[] rows)
+    {
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, rows.Length);
+        MutableColumnVector amount = ColumnVectors.Create(DataTypes.IntegerType, rows.Length);
+        foreach ((long i, int? a) in rows)
+        {
+            id.AppendValue(i);
+            if (a is null)
+            {
+                amount.AppendNull();
+            }
+            else
+            {
+                amount.AppendValue(a.Value);
+            }
+        }
+
+        return new ManagedColumnBatch(WideningIntSchema, new ColumnVector[] { id, amount }, rows.Length);
+    }
+
+    private static ColumnBatch LongAmountBatch(params (long Id, long? Amount)[] rows)
+    {
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, rows.Length);
+        MutableColumnVector amount = ColumnVectors.Create(DataTypes.LongType, rows.Length);
+        foreach ((long i, long? a) in rows)
+        {
+            id.AppendValue(i);
+            if (a is null)
+            {
+                amount.AppendNull();
+            }
+            else
+            {
+                amount.AppendValue(a.Value);
+            }
+        }
+
+        return new ManagedColumnBatch(WideningLongSchema, new ColumnVector[] { id, amount }, rows.Length);
+    }
+
+    private static ColumnBatch NameOnlyBatch(params string?[] names)
+    {
+        MutableColumnVector name = ColumnVectors.Create(DataTypes.StringType, names.Length);
+        foreach (string? n in names)
+        {
+            if (n is null)
+            {
+                name.AppendNull();
+            }
+            else
+            {
+                name.AppendBytes(Encoding.UTF8.GetBytes(n));
+            }
+        }
+
+        return new ManagedColumnBatch(NarrowNameSchema, new ColumnVector[] { name }, names.Length);
     }
 }
