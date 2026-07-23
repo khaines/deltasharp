@@ -283,7 +283,7 @@ internal sealed class DeltaDelete
         var inputPaths = new List<string>();
         int filesWithDeletionVector = 0;
         int filesFullyDeleted = 0;
-        int numChangeFilesAdded = 0;
+        int numAddedChangeFiles = 0;
         long rowsDeleted = 0;
 
         foreach (AddFileAction add in readSnapshot.ActiveFiles)
@@ -321,8 +321,18 @@ internal sealed class DeltaDelete
                         dataSchema, plan.NewlyDeletedRows, ChangeDataWriter.DeleteChange,
                         _cdcFileNameFactory(), cancellationToken)
                     .ConfigureAwait(false);
+
+                // Hardening (defense in depth): the rows the cdc writer actually wrote MUST equal the count
+                // of newly-deleted positions the plan reported — the captured-row selection views and the
+                // position set are derived from the SAME scan pass, so any divergence is a capture/planning
+                // bug that would emit an incomplete cdc set (INV C2/C3). Debug-only; the write is otherwise
+                // correct even without it.
+                Debug.Assert(
+                    cdc.RowCount == plan.NewlyDeletedCount,
+                    $"cdc row count {cdc.RowCount} != newly-deleted count {plan.NewlyDeletedCount} for '{add.Path}'.");
+
                 actions.Add(new AddCdcFileAction(cdc.Path, add.PartitionValues, cdc.Size, EmptyTags));
-                numChangeFilesAdded++;
+                numAddedChangeFiles++;
             }
 
             long cardinality = plan.AllDeletedPositions.Length;
@@ -368,8 +378,8 @@ internal sealed class DeltaDelete
         // scoped to exactly the affected paths so a concurrent change to any of them aborts (no lost delete).
         // Prepend the DELETE provenance (operation="DELETE" + operationMetrics) so DESCRIBE HISTORY records
         // the deleted-row and cdc-file counts (commitInfo is informational; the committer stamps
-        // timestamp/engineInfo/txnId). numChangeFilesAdded is 0 when CDF is disabled.
-        actions.Insert(0, DeltaCommitInfo.Delete(rowsDeleted, numChangeFilesAdded));
+        // timestamp/engineInfo/txnId). numAddedChangeFiles is 0 when CDF is disabled.
+        actions.Insert(0, DeltaCommitInfo.Delete(rowsDeleted, numAddedChangeFiles));
         DeltaCommitResult commit = await _committer
             .CommitAsync(readSnapshot, actions, DeltaReadScope.ReadFiles(inputPaths), cancellationToken)
             .ConfigureAwait(false);
@@ -421,9 +431,17 @@ internal sealed class DeltaDelete
         // CDF capture (§2.5): when enabled, collect the physical data rows of exactly the NEWLY-deleted
         // positions as selection views over the batches we're ALREADY reading here — the SAME scan pass, so
         // no second full-file read (§4.3 memory budget). The reader hands back a fresh batch per row group
-        // (no buffer recycling — verified in ParquetFileReader), so retaining a selection view across row
-        // groups is safe. Stays null (never allocated) when CDF is disabled, so the INV C1 path is byte-for-
-        // byte the prior behavior.
+        // (no buffer recycling — the pinned ParquetFileReader.ReadAsync contract), so retaining a selection
+        // view across row groups is safe. Stays null (never allocated) when CDF is disabled, so the INV C1
+        // path is byte-for-byte the prior behavior.
+        //
+        // TRADEOFF (§4.3): avoiding a second scan means every row group that contributes a newly-deleted row
+        // stays RESIDENT (its full batch is retained via the selection view, not just the matched rows)
+        // until the post-scan cdc write — a peak-memory increase over the non-CDF path, which streams each
+        // batch and lets it be collected as soon as its positions are unioned. Bounded by the file's size
+        // (one file scanned at a time) and paid only when CDF is enabled AND the file has a newly-deleted
+        // row. The alternative — a second full-file scan to re-read the matched rows — trades this bounded
+        // memory for a second pass over object storage (higher latency + I/O), which §4.3 rejects.
         List<ColumnBatch>? changeRows = captureChangeData ? new List<ColumnBatch>() : null;
         Stream stream = await _backend.OpenReadAsync(add.Path, cancellationToken).ConfigureAwait(false);
         await using (stream.ConfigureAwait(false))

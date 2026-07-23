@@ -15,7 +15,8 @@ namespace DeltaSharp.Storage.Delta;
 /// stores the table's <b>data</b> columns — physical/column-mapped names, exactly like a data file, and
 /// <b>without</b> partition columns (their values live only on the <see cref="AddCdcFileAction"/>, §2.4) —
 /// plus one synthesized, non-null <c>_change_type</c> string column that names the row change
-/// (<c>delete</c> here; <c>insert</c>/<c>update_*</c> are defined for the future UPDATE/MERGE door). The
+/// (<c>delete</c> here; the <c>insert</c>/<c>update_*</c> values arrive with the future UPDATE/MERGE and
+/// read doors — this increment consumes only <see cref="DeleteChange"/>). The
 /// <c>_commit_version</c>/<c>_commit_timestamp</c> metadata columns are NOT materialized — they are constant
 /// per version and are stamped at read time (§2.4/§2.8), so persisting them per row would waste space.
 ///
@@ -42,18 +43,10 @@ internal sealed class ChangeDataWriter
     /// non-null and — being engine-synthesized — is NEVER column-mapped (§2.4).</summary>
     public const string ChangeTypeColumn = "_change_type";
 
-    /// <summary>The <c>_change_type</c> value for a row that was inserted (implicit derivation only; no cdc
-    /// file is written for inserts — recorded here so the vocabulary is defined in one place).</summary>
-    public const string InsertChange = "insert";
-
-    /// <summary>The <c>_change_type</c> value for a row deleted by a merge-on-read DELETE (§2.5).</summary>
+    /// <summary>The <c>_change_type</c> value for a row deleted by a merge-on-read DELETE (§2.5). The
+    /// <c>insert</c>/<c>update_preimage</c>/<c>update_postimage</c> values are re-added by the increment that
+    /// consumes each (read door / #637); this generation increment materializes only deletes.</summary>
     public const string DeleteChange = "delete";
-
-    /// <summary>The <c>_change_type</c> value for an UPDATE/MERGE pre-image (the future #637 door).</summary>
-    public const string UpdatePreImageChange = "update_preimage";
-
-    /// <summary>The <c>_change_type</c> value for an UPDATE/MERGE post-image (the future #637 door).</summary>
-    public const string UpdatePostImageChange = "update_postimage";
 
     private readonly IStorageBackend _backend;
     private readonly ParquetFileWriter _writer;

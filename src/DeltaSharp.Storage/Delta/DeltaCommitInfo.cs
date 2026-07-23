@@ -69,7 +69,7 @@ internal static class DeltaCommitInfo
             ("partitionBy", JsonEncodedArray(partitionColumns))));
 
     /// <summary>Provenance for a DELETE: <c>operation="DELETE"</c> plus the DELETE <c>operationMetrics</c>
-    /// (<paramref name="numDeletedRows"/>, <paramref name="numChangeFilesAdded"/>). The Delta
+    /// (<paramref name="numDeletedRows"/>, <paramref name="numAddedChangeFiles"/>). The Delta
     /// <c>predicate</c> parameter (a JSON array of SQL predicate strings) is non-trivial to render faithfully
     /// from the internal delete predicate, so it is omitted rather than emitted in a wrong shape (the issue
     /// sanctions this) — the operation + metrics are what <c>DESCRIBE HISTORY</c> needs.
@@ -85,19 +85,19 @@ internal static class DeltaCommitInfo
     /// (<c>numRemovedFiles</c>/timings/DV counts) are omitted (not tracked here); readers ignore absent
     /// metric keys (commitInfo is not load-bearing), so a subset is safe.</para>
     ///
-    /// <para><b>CDF gate.</b> <paramref name="numChangeFilesAdded"/> is <c>0</c> when Change Data Feed is
+    /// <para><b>CDF gate.</b> <paramref name="numAddedChangeFiles"/> is <c>0</c> when Change Data Feed is
     /// disabled (no <c>cdc</c> files are materialized), so the DELETE still records a well-formed, honest
     /// metric set. <b>Value encoding.</b> operationMetrics is a Delta <c>Map&lt;String,String&gt;</c>, so each
     /// value is a quoted number-string token via <see cref="JsonNumberString"/> (e.g. <c>3</c> ⇒ <c>"3"</c>),
     /// never a bare JSON number — identical to <see cref="Optimize"/>.</para></summary>
-    internal static CommitInfoAction Delete(long numDeletedRows, long numChangeFilesAdded) =>
+    internal static CommitInfoAction Delete(long numDeletedRows, long numAddedChangeFiles) =>
         new(
             ImmutableSortedDictionary<string, string>.Empty.WithComparers(StringComparer.Ordinal),
             Operation: DeleteOperation,
             OperationParameters: EmptyParameters,
             OperationMetrics: Parameters(
                 ("numDeletedRows", JsonNumberString(numDeletedRows)),
-                ("numAddedChangeFiles", JsonNumberString(numChangeFilesAdded))));
+                ("numAddedChangeFiles", JsonNumberString(numAddedChangeFiles))));
 
     /// <summary>Provenance for an OPTIMIZE: <c>operation="OPTIMIZE"</c> with an empty <c>predicate</c> — a
     /// double-encoded JSON-string token whose content is the empty array (<c>"[]"</c>), matching delta-spark's
