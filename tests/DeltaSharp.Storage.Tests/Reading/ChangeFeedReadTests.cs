@@ -7,6 +7,7 @@ using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
 using DeltaSharp.Storage.Delta.DeletionVectors;
 using DeltaSharp.Storage.Reading;
+using DeltaSharp.Storage.Tests.Delta;
 using DeltaSharp.Storage.Tests.Delta.DeletionVectors;
 using DeltaSharp.Storage.Writing;
 using DeltaSharp.Types;
@@ -92,6 +93,19 @@ public sealed class ChangeFeedReadTests : IDisposable
     {
         new StructField("id", DataTypes.StringType, nullable: false),
         new StructField("name", DataTypes.StringType, nullable: true),
+        new StructField(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: false),
+    });
+
+    // A cdc-file leaf schema matching the reconciled END schema B (id, name, extra) PLUS `_change_type` — used
+    // to craft a v2 cdc file that is consistent with the END schema but NOT v2's OWN schema A (which lacks
+    // `extra`). `id` stays long (matching both A and B) so ONLY the presence of `extra` distinguishes A from B:
+    // the clean discriminator between per-version EE-08 validation (rejects — `extra` is absent from v2's A)
+    // and a would-be end-version validation (accepts — matches B).
+    private static readonly StructType CdcMatchesEndSchema = new(new[]
+    {
+        new StructField("id", DataTypes.LongType, nullable: false),
+        new StructField("name", DataTypes.StringType, nullable: true),
+        new StructField("extra", DataTypes.LongType, nullable: true),
         new StructField(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: false),
     });
 
@@ -241,6 +255,68 @@ public sealed class ChangeFeedReadTests : IDisposable
             long commitInfoTs = await ReadCommitInfoTimestampAsync(version);
             Assert.NotEqual(commitInfoTs, actualMillis);
         }
+    }
+
+    [Fact]
+    public async Task CommitTimestamp_StableAcrossFloorAdvancingLogCleanup()
+    {
+        // query-exec L2 (item 4) pinning PROOF (§2.8): `_commit_timestamp` is pinned at RESOLVE time, so an
+        // intervening log-cleanup that ADVANCES the earliest-reconstructable floor between LoadChangeFeedAsync
+        // and ReadChangeBatchesAsync cannot shift a near-floor version's stamped timestamp. All four <N>.json
+        // share ONE mtime T, so the monotonic timeline eff(N)=max(mtime(N), eff(N-1)+1ms) CARRIES: with floor 0
+        // ⇒ eff = {0:T, 1:T+1, 2:T+2, 3:T+3}. We resolve [2,3] (pinning eff(2)=T+2, eff(3)=T+3), THEN delete
+        // v0/v1 and write a complete checkpoint@2 so the floor advances to 2. A read-time RE-derivation would
+        // now restart the chain at the new floor ⇒ eff(2)=T, eff(3)=T+1 — DIFFERENT. The read must stamp the
+        // PINNED values (T+2, T+3), proving it reads the pinned map, not a fresh listing. (A mutant ignoring
+        // DeltaChangeFeedInfo.PinnedCommitMillis re-derives T / T+1 ⇒ this test goes RED.)
+        await CreateCdfFlatTableAsync(Batch((1, "a")));   // v0 create, v1 enable CDF
+        await AppendFlatAsync(Batch((10, "x")));           // v2 (near-floor range start)
+        await AppendFlatAsync(Batch((20, "y")));           // v3 (range end)
+
+        var baseTime = new DateTimeOffset(2021, 3, 1, 9, 0, 0, TimeSpan.Zero);
+        SetCommitMtimes(baseTime, TimeSpan.Zero, latestVersion: 3);   // ALL <N>.json share mtime T ⇒ monotonic carry
+        long t = baseTime.ToUnixTimeMilliseconds();
+
+        // Resolve+PIN the range against the pre-cleanup log (floor 0 ⇒ eff(2)=T+2, eff(3)=T+3).
+        DeltaChangeFeedInfo info;
+        using (DeltaReadSource resolveSource = DeltaReadSource.ForLocalPath(_root))
+        {
+            info = await resolveSource.LoadChangeFeedAsync(
+                DeltaChangeFeedRange.FromVersion(2, 3), CancellationToken.None);
+        }
+
+        // Simulate log-cleanup that ADVANCES the floor to 2: a complete checkpoint@2 (protocol + metadata copied
+        // from the real snapshot@2, so CDF stays active and the schema is exact) seeds state, then the earliest
+        // commit JSONs are removed. [2,3] stays reconstructable (checkpoint@2 + surviving 2.json/3.json), but the
+        // effective timeline a FRESH listing computes now differs for the near-floor start (its predecessor gone).
+        var backend = new LocalFileSystemBackend(_root);
+        await WriteCheckpointFromRealStateAsync(backend, 2);
+        File.Delete(CommitPath(0));
+        File.Delete(CommitPath(1));
+
+        // Read against the PINNED info with a FRESH source (guarantees a re-listing of the cleaned log).
+        var batches = new List<ColumnBatch>();
+        using (DeltaReadSource readSource = DeltaReadSource.ForLocalPath(_root))
+        {
+            await foreach (ColumnBatch batch in readSource.ReadChangeBatchesAsync(info, CancellationToken.None))
+            {
+                batches.Add(batch);
+            }
+        }
+
+        (List<FlatChange> rows, _) = DecodeFlatChanges(batches);
+
+        // The near-floor start v2 is the discriminator: stamped == PINNED eff(2)=(T+2)×1000 micros, NOT the
+        // (T)×1000 a read-time re-derivation over the advanced floor would compute.
+        FlatChange v2Row = rows.Single(r => r.Version == 2);
+        Assert.Equal((10L, (string?)"x"), (v2Row.Id, v2Row.Name));
+        Assert.Equal((t + 2) * 1000L, v2Row.TsMicros);       // pinned at resolve (floor-0 monotonic carry)
+        Assert.NotEqual(t * 1000L, v2Row.TsMicros);          // NOT the read-time re-derivation (floor-2) value
+
+        FlatChange v3Row = rows.Single(r => r.Version == 3);
+        Assert.Equal((20L, (string?)"y"), (v3Row.Id, v3Row.Name));
+        Assert.Equal((t + 3) * 1000L, v3Row.TsMicros);       // pinned
+        Assert.NotEqual((t + 1) * 1000L, v3Row.TsMicros);    // NOT the re-derived (floor-2) value
     }
 
     // ---------------------------------------------------------------- CDF-HP-06: timestamp-endpoint resolution
@@ -856,6 +932,73 @@ public sealed class ChangeFeedReadTests : IDisposable
     }
 
     [Fact]
+    public async Task Explicit_CdcConsistentWithEachVersionSchema_PassesAcrossEvolutionBoundary()
+    {
+        // EE-08 discrimination — POSITIVE (§3.2 AC1 + §2.8 cross-range reconciliation): an EXPLICIT (cdc) range
+        // that CROSSES a schema-evolution boundary. v2 is a DELETE under schema A (id, name) ⇒ genuine cdc(A);
+        // v3 EVOLVES the schema to B (id, name, extra) via mergeSchema (+ insert). Reading [2,3] (END schema = B)
+        // must (1) PASS the per-version EE-08 gate for v2's cdc — it validates against v2's OWN metadata A, NOT
+        // the reconciled END schema B — and (2) reconcile v2's narrow cdc(A) row to B, null-filling `extra`.
+        // This proves EE-08 does NOT false-positive across an evolution boundary AND that the EXPLICIT path
+        // reconciles a per-version-narrow cdc file to the end schema. (A mutant validating the cdc against the
+        // END schema would REJECT v2's cdc for a MISSING `extra` ⇒ this test goes RED under that mutant.)
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0, v1 (schema A = id, name; CDF on)
+        var backend = new LocalFileSystemBackend(_root);
+        DeleteResult d2 = await NewCdfDelete(backend, "ee08pos").DeleteAsync(WhereId(id => id == 1)); // v2 cdc(A)
+        Assert.Equal(2L, d2.CommittedVersion);
+        long v3 = await AppendMergeAsync(WideFlatSchema, Array.Empty<string>(),
+            WideBatch((10, "x", 100L), (11, "y", 110L)));           // v3 evolve A→B + insert
+        Assert.Equal(3L, v3);
+
+        (DeltaChangeFeedInfo info, List<ColumnBatch> batches) =
+            await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 3));
+        AssertCdfOutputSchema(info.Schema, WideFlatSchema);         // reconciled END schema (id, name, extra)
+
+        Assert.Equal(
+            new[]
+            {
+                (1L, (string?)"a", (long?)null, ChangeDataWriter.DeleteChange, 2L),  // v2 cdc(A) null-fills `extra` at B
+                (10L, "x", (long?)100L, ChangeDataWriter.InsertChange, 3L),
+                (11L, "y", (long?)110L, ChangeDataWriter.InsertChange, 3L),
+            },
+            DecodeWideChanges(batches).OrderBy(r => r.Version).ThenBy(r => r.Id).ToArray());
+    }
+
+    [Fact]
+    public async Task Explicit_CdcMatchingEndSchemaButNotItsVersion_FailsClosed()
+    {
+        // EE-08 discrimination — NEGATIVE (§3.2 AC1): the case that DISCRIMINATES per-version from end-version
+        // cdc schema validation. v2 is a DELETE under schema A (id, name); v3 EVOLVES to B (id, name, extra).
+        // v2's cdc file is then OVERWRITTEN with one whose leaf schema matches the reconciled END schema B (it
+        // carries an `extra` column A never had) but NOT v2's OWN metadata A. Reading [2,3] must FAIL CLOSED
+        // with the CDF-EE-08 marker: DeltaSharp validates each cdc file against THAT version's metadata (A),
+        // where `extra` is a column absent from the version's schema. A mutant validating against the END schema
+        // B would ACCEPT this file (it matches B) and surface an attacker-chosen row ⇒ this test goes RED under
+        // that mutant — whereas the single-version EE-08 test (its END schema == the version's own schema)
+        // CANNOT catch it.
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0, v1 (schema A)
+        var backend = new LocalFileSystemBackend(_root);
+        await NewCdfDelete(backend, "ee08endneg").DeleteAsync(WhereId(id => id == 1));   // v2 cdc(A) delete
+        string cdc = Assert.Single(CdcFilePaths());
+        long v3 = await AppendMergeAsync(WideFlatSchema, Array.Empty<string>(),
+            WideBatch((10, "x", 100L)));                            // v3 evolve A→B (END schema)
+        Assert.Equal(3L, v3);
+
+        // Overwrite v2's cdc with a file whose data columns match END schema B (id, name, extra) — consistent
+        // with B but NOT with v2's A (which has no `extra`). `id` stays long so the ONLY inconsistency is the
+        // extra `extra` column (a clean discriminator, never a leaf-type mismatch).
+        byte[] endSchemaCdc = await ParquetTestHelpers.WriteToBytesAsync(
+            CdcMatchesEndSchema, new[] { CdcMatchesEndBatch((1L, "a", 1L, ChangeDataWriter.DeleteChange)) });
+        await File.WriteAllBytesAsync(Path.Combine(_root, cdc), endSchemaCdc);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 3)));
+        Assert.Null(ex.InnerException);   // a pure per-version schema-validation failure, not a wrapped I/O fault
+        Assert.Contains("extra", ex.Message, StringComparison.Ordinal);      // names the offending end-only column
+        Assert.Contains("CDF-EE-08", ex.Message, StringComparison.Ordinal);  // the per-version cdc schema check
+    }
+
+    [Fact]
     public async Task AbsentRequiredColumn_InRangeFile_FailsClosedAsSchemaEvolution()
     {
         // EE-05: a required (non-nullable) data column ABSENT from an in-range file fails closed as
@@ -1281,6 +1424,32 @@ public sealed class ChangeFeedReadTests : IDisposable
         }
     }
 
+    // Writes a COMPLETE classic checkpoint@`version` whose protocol + metadata are copied verbatim from the
+    // real reconstructed snapshot (so CDF stays active and the schema is exact), plus the _last_checkpoint hint.
+    // No `add` rows are needed: a CDF read derives changes from commit ACTIONS and uses the snapshot only for
+    // protocol + metadata (schema/enablement), never its active-file list — so an add-less checkpoint faithfully
+    // seeds everything the read consumes. Advancing the earliest-reconstructable floor onto this checkpoint (by
+    // deleting the earlier <N>.json) keeps [version..] reconstructable while changing what a fresh effective-
+    // timeline listing would compute for a near-floor version (its monotonic-carry predecessor is now gone).
+    private async Task WriteCheckpointFromRealStateAsync(LocalFileSystemBackend backend, long version)
+    {
+        Snapshot snap = await new DeltaLog(backend).LoadSnapshotAsync(version, CancellationToken.None);
+        var fixture = new CheckpointFixture()
+            .Protocol(
+                snap.Protocol.MinReaderVersion,
+                snap.Protocol.MinWriterVersion,
+                snap.Protocol.ReaderFeatures.IsDefaultOrEmpty ? null : snap.Protocol.ReaderFeatures.ToArray(),
+                snap.Protocol.WriterFeatures.IsDefaultOrEmpty ? null : snap.Protocol.WriterFeatures.ToArray())
+            .Metadata(
+                snap.Metadata.Id,
+                snap.Metadata.SchemaString,
+                partitionColumns: snap.Metadata.PartitionColumns.IsDefaultOrEmpty
+                    ? null : snap.Metadata.PartitionColumns.ToArray(),
+                configuration: snap.Metadata.Configuration.Select(kv => (kv.Key, kv.Value)).ToArray());
+        await DeltaTestHarness.WriteCheckpointAsync(backend, version, fixture);
+        await DeltaTestHarness.WriteLastCheckpointAsync(backend, version);
+    }
+
     // Reads the RAW on-disk commitInfo.timestamp (epoch millis) for a version — the value CDF must NOT use for
     // _commit_timestamp (it uses the <N>.json mtime instead, §2.8).
     private async Task<long> ReadCommitInfoTimestampAsync(long version)
@@ -1501,5 +1670,26 @@ public sealed class ChangeFeedReadTests : IDisposable
 
         return new ManagedColumnBatch(
             CdcTypeMismatchSchema, new ColumnVector[] { id, name, changeType }, rows.Length);
+    }
+
+    // Builds a cdc file body for the END schema B (id long, name string, extra long) + `_change_type` — used to
+    // craft the v2 cdc file that matches the reconciled END schema but NOT v2's own (narrower) schema A, the
+    // EE-08 per-version-vs-end-version discriminator.
+    private static ColumnBatch CdcMatchesEndBatch(params (long Id, string Name, long Extra, string ChangeType)[] rows)
+    {
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, rows.Length);
+        MutableColumnVector name = ColumnVectors.Create(DataTypes.StringType, rows.Length);
+        MutableColumnVector extra = ColumnVectors.Create(DataTypes.LongType, rows.Length);
+        MutableColumnVector changeType = ColumnVectors.Create(DataTypes.StringType, rows.Length);
+        foreach ((long i, string n, long e, string c) in rows)
+        {
+            id.AppendValue(i);
+            name.AppendBytes(Encoding.UTF8.GetBytes(n));
+            extra.AppendValue(e);
+            changeType.AppendBytes(Encoding.UTF8.GetBytes(c));
+        }
+
+        return new ManagedColumnBatch(
+            CdcMatchesEndSchema, new ColumnVector[] { id, name, extra, changeType }, rows.Length);
     }
 }
