@@ -234,6 +234,41 @@ internal static class ParquetTestHelpers
         return forged.ToArray();
     }
 
+    /// <summary>Forges the footer schema element named <paramref name="targetFieldName"/> to
+    /// <paramref name="forgedName"/> (e.g. an empty string) and re-serializes the footer. Used to prove the
+    /// schema-mapping decode boundary fails closed: <c>ParquetTypeMapping.ToDataSchema</c> eagerly builds a
+    /// DeltaSharp <c>StructField</c> from EVERY footer field, so an empty field name makes the StructField
+    /// constructor raise a raw <see cref="ArgumentException"/> — a <see cref="ParquetFileReader"/> schema read
+    /// must map it to a deterministic CorruptData (crafted schema; storage-delta-architecture.md §5.4 C-DECODE).
+    /// The file reopens cleanly through Parquet.Net (an empty name is a valid thrift string). Mirrors
+    /// <see cref="ForgeShortColumnStatisticsAsync"/>, mutating only the named schema element's name.</summary>
+    public static async Task<byte[]> ForgeFieldNameAsync(byte[] bytes, string targetFieldName, string forgedName)
+    {
+        byte[] newFooter;
+        using (var stream = new MemoryStream(bytes, writable: false))
+        {
+            ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                global::Parquet.Meta.FileMetaData metadata = reader.Metadata!;
+                global::Parquet.Meta.SchemaElement element =
+                    metadata.Schema.FirstOrDefault(e => e.Name == targetFieldName)
+                    ?? throw new InvalidOperationException($"no footer schema element named '{targetFieldName}'");
+                element.Name = forgedName;
+                newFooter = SerializeFooter(metadata);
+            }
+        }
+
+        int originalFooterLength = BitConverter.ToInt32(bytes, bytes.Length - 8);
+        int footerStart = bytes.Length - 8 - originalFooterLength;
+        using var forged = new MemoryStream();
+        forged.Write(bytes, 0, footerStart);
+        forged.Write(newFooter, 0, newFooter.Length);
+        forged.Write(BitConverter.GetBytes(newFooter.Length), 0, 4);
+        forged.Write("PAR1"u8);
+        return forged.ToArray();
+    }
+
     private static byte[] SerializeFooter(global::Parquet.Meta.FileMetaData metadata)
     {
         Assembly parquet = typeof(ParquetReader).Assembly;

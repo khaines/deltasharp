@@ -305,7 +305,34 @@ internal sealed class ParquetFileReader
         ParquetReader reader = await OpenAsync(input, cancellationToken).ConfigureAwait(false);
         await using (reader.ConfigureAwait(false))
         {
-            return ParquetTypeMapping.ToDataSchema(reader.Schema);
+            // Fail-closed schema-mapping boundary (storage-delta-architecture.md §5.4 C-DECODE / ADR-0013).
+            // OpenAsync force-materialized reader.Schema inside its footer-PARSE boundary, but the SUBSEQUENT
+            // mapping of untrusted footer field descriptors into DeltaSharp StructFields is a distinct decode
+            // step that was unsealed: ToDataSchema eagerly builds a StructField for EVERY footer field, so a
+            // crafted footer with an empty field name makes the StructField constructor raise a raw
+            // ArgumentException (PDX-T crafted schema; storage-delta-architecture.md §5.4). Map every library/
+            // domain fault from the mapping to the deterministic CorruptData contract with a FIXED message (no
+            // ex.Message, so no footer content echoes into the error text). ToDataSchema's legitimate typed
+            // UnsupportedFeature (an unsupported-but-VALID Parquet type) is a DeltaStorageException, EXCLUDED by
+            // both predicates below, so it still propagates UNWRAPPED (never re-masked as CorruptData).
+            try
+            {
+                return ParquetTypeMapping.ToDataSchema(reader.Schema);
+            }
+            catch (Exception ex) when (IsParquetDefect(ex))
+            {
+                // Informative first catch: a low-level decode defect surfacing while mapping a field descriptor
+                // (e.g. an OverflowException from a crafted decimal precision/scale).
+                throw DeltaStorageException.CorruptData(
+                    "Parquet footer schema is malformed (undecodable field descriptor).", ex);
+            }
+            catch (Exception ex) when (IsUndecodableParquetInput(ex))
+            {
+                // Superset fallback: the empty-field-name ArgumentException from the StructField constructor and
+                // any other raw fault from mapping an attacker-controlled footer field descriptor land here.
+                throw DeltaStorageException.CorruptData(
+                    "Parquet footer declares an unmappable field descriptor (e.g. an empty field name).", ex);
+            }
         }
     }
 
@@ -1381,15 +1408,17 @@ internal sealed class ParquetFileReader
     // decode of a malformed file (the #193 CDF cdc-file fuzz drove IndexOutOfRangeException, ArgumentException,
     // InvalidOperationException, NotSupportedException, and a footer-parse NullReferenceException; a crafted
     // footer stats blob drives ArgumentException/InvalidDataException on the pruning path). A whitelist cannot
-    // enumerate an unbounded set, so at the boundaries where Parquet.Net consumes UNTRUSTED bytes — OpenAsync
-    // (footer parse), GetRowCountAsync (the checked row-group-count summation over footer NumRows fields), and
-    // ReadRowGroupAsync (which spans BOTH the row-group prologue: statistics/pruning + chunk footprints, AND
-    // the per-column page/level decode) — the fail-closed SUPERSET IsUndecodableParquetInput maps every
-    // remaining library fault to CorruptData; see those catches and IsUndecodableParquetInput for why every
-    // exception there is a library decode fault and not our own bug. IsParquetDefect is retained as the
-    // informative first catch (and for the ADR-0013 eager-allocation OOM/Overflow mapping; the same Overflow
-    // entry also covers the GetRowCountAsync summation past long.MaxValue). One further site-specific map:
-    // ArgumentOutOfRangeException in ReadValueAsync (out-of-range DATE/TIMESTAMP).
+    // enumerate an unbounded set, so at the boundaries where Parquet.Net (or the DeltaSharp mapping that
+    // consumes its decoded footer) touches UNTRUSTED bytes — OpenAsync (footer parse), GetRowCountAsync (the
+    // checked row-group-count summation over footer NumRows fields), ReadDataSchemaAsync (mapping footer field
+    // descriptors into DeltaSharp StructFields via ToDataSchema), and ReadRowGroupAsync (which spans BOTH the
+    // row-group prologue: statistics/pruning + chunk footprints, AND the per-column page/level decode) — the
+    // fail-closed SUPERSET IsUndecodableParquetInput maps every remaining library fault to CorruptData; see
+    // those catches and IsUndecodableParquetInput for why every exception there is a library decode fault and
+    // not our own bug. IsParquetDefect is retained as the informative first catch (and for the ADR-0013
+    // eager-allocation OOM/Overflow mapping; the same Overflow entry also covers the GetRowCountAsync summation
+    // past long.MaxValue). One further site-specific map: ArgumentOutOfRangeException in ReadValueAsync
+    // (out-of-range DATE/TIMESTAMP).
     internal static bool IsParquetDefect(Exception ex) => ex is
         IOException or
         InvalidDataException or
@@ -1402,6 +1431,8 @@ internal sealed class ParquetFileReader
     // The fail-closed decode-boundary SUPERSET (storage-delta-architecture.md §5.4 C-DECODE / ADR-0013) used at
     // EVERY read entry point that consumes UNTRUSTED footer/row-group/page bytes: OpenAsync (footer parse);
     // GetRowCountAsync (the checked row-group-count summation over attacker-controlled footer NumRows fields);
+    // ReadDataSchemaAsync (mapping footer field descriptors into DeltaSharp StructFields via ToDataSchema, whose
+    // eager StructField construction rejects an empty footer field name with a raw ArgumentException);
     // ReadRowGroupAsync's row-group prologue (statistics/pruning + chunk footprints); and ReadRowGroupAsync's
     // page/level decode. Because Parquet.Net's decoder raises an unbounded set of raw BCL exception types on a
     // malformed file (and an eager stats decode on the predicate-pushdown pruning path the CDF door never

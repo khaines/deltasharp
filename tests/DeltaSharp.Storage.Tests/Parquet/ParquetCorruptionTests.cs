@@ -141,6 +141,33 @@ public sealed class ParquetCorruptionTests
     }
 
     [Fact]
+    public async Task ReadDataSchema_OnEmptyFooterFieldName_FailsClosedNotRawArgument()
+    {
+        // Red-team HIGH (a FIFTH untrusted-byte decode site): ReadDataSchemaAsync maps footer field descriptors
+        // into DeltaSharp StructFields via ParquetTypeMapping.ToDataSchema. OpenAsync force-materializes
+        // reader.Schema inside its footer-PARSE boundary, but the SUBSEQUENT mapping was unsealed — ToDataSchema
+        // eagerly builds a StructField for EVERY footer field, so a crafted footer with an empty field name USED
+        // TO raise a raw System.ArgumentException ("The value cannot be an empty string") that escaped to the
+        // caller. It must now map to a deterministic CorruptData (crafted schema; storage-delta-architecture.md
+        // §5.4 C-DECODE / ADR-0013). Regression check: removing the wrap makes THIS test throw a raw
+        // ArgumentException instead of DeltaStorageException.
+        //
+        // NOTE the decorrelated sibling ReadAsync path is NOT vulnerable to this vector: it uses footer field
+        // names as dictionary KEYS (an empty name is a valid key) and reports resolution failures as a TYPED
+        // DeltaStorageException (ColumnNotPresentInFile), never a raw exception — only ToDataSchema eagerly
+        // constructs a name-validating StructField from every footer field, which is why only this entry leaked.
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] forged = await ParquetTestHelpers.ForgeFieldNameAsync(file, "keep", "");
+
+        using var stream = new MemoryStream(forged, writable: false);
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new ParquetFileReader().ReadDataSchemaAsync(stream, CancellationToken.None));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+    }
+
+    [Fact]
     public async Task MidStreamCorruption_YieldsCompleteEarlierBatchThenDeterministicError()
     {
         var schema = new StructType(new[] { KeepField });
