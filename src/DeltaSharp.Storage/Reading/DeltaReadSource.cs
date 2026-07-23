@@ -267,7 +267,7 @@ public sealed class DeltaReadSource : IDisposable
         // the read closed here rather than after emitting rows (the cardinal DV safety rule: never return a
         // row a DV invalidated because the DV failed to decode). The DV's row positions are PHYSICAL,
         // file-relative ordinals validated against the file's PHYSICAL record count.
-        DeletionVectorPositions? deletionVector = null;
+        DeletionVectorMask? deletionVector = null;
         if (add.DeletionVector is { } descriptor)
         {
             long? declared = add.Stats?.NumRecords;
@@ -326,7 +326,7 @@ public sealed class DeltaReadSource : IDisposable
                 throw new DeltaReadException(ex.Message, ex);
             }
 
-            deletionVector = new DeletionVectorPositions(positions, physicalRecords);
+            deletionVector = new DeletionVectorMask(positions, physicalRecords);
         }
 
         long fileRowOffset = 0;
@@ -346,7 +346,7 @@ public sealed class DeltaReadSource : IDisposable
                     {
                         batches.Add(fullBatch);
                     }
-                    else if (ApplyDeletionVector(fullBatch, deletionVector, fileRowOffset) is { } survived)
+                    else if (deletionVector.Apply(fullBatch, fileRowOffset) is { } survived)
                     {
                         // A fully-deleted batch (every physical row invalidated) contributes no rows, so it
                         // is dropped rather than added as an empty batch.
@@ -371,74 +371,8 @@ public sealed class DeltaReadSource : IDisposable
 
         if (deletionVector is not null)
         {
-            deletionVector.EnsureFullyConsumed(fileRowOffset, add.Path);
+            deletionVector.EnsureConsumed(fileRowOffset, add.Path);
         }
-    }
-
-    // The decoded deletion-vector positions for one active file: the sorted, distinct set of PHYSICAL,
-    // file-relative row ordinals to exclude, plus the file's physical record count for a post-read
-    // consistency check. FIX #4: a SINGLE materialization — the sorted long[] the decoder already produced —
-    // with binary-search membership, so the read path never holds both a long[] AND a HashSet of the set.
-    private sealed class DeletionVectorPositions
-    {
-        private readonly long[] _deleted;
-
-        public DeletionVectorPositions(long[] sortedDistinctPositions, long physicalRecords)
-        {
-            // RoaringBitmapArray.Deserialize guarantees ascending, distinct positions, so the array is a
-            // ready-made sorted-set membership structure (Array.BinarySearch) with no second copy.
-            _deleted = sortedDistinctPositions;
-            PhysicalRecords = physicalRecords;
-        }
-
-        public long PhysicalRecords { get; }
-
-        public bool IsDeleted(long filePosition) => Array.BinarySearch(_deleted, filePosition) >= 0;
-
-        // The Parquet file's actual physical row count (summed across row groups) must match the record count
-        // the DV was validated against — a mismatch means the file changed under the DV, so the positions
-        // cannot be trusted to map to the right rows. Fail closed.
-        public void EnsureFullyConsumed(long physicalRowsRead, string path)
-        {
-            if (physicalRowsRead != PhysicalRecords)
-            {
-                throw new DeltaReadException(
-                    $"Active file '{path}' carries a deletion vector validated against {PhysicalRecords} "
-                    + $"physical records, but the Parquet file produced {physicalRowsRead} on read. The "
-                    + "deletion vector disagrees with the data file, so the read fails closed.");
-            }
-        }
-    }
-
-    // Applies a deletion vector to one full-schema batch by building a SelectionVector of the surviving
-    // physical rows (those whose file-relative ordinal `fileRowOffset + r` is NOT in the DV). Returns null
-    // when every row in the batch is deleted (the caller drops it). The DV positions are file-relative, so
-    // the running `fileRowOffset` maps this batch's physical rows [0, RowCount) onto the file ordinal space.
-    private static ColumnBatch? ApplyDeletionVector(
-        ColumnBatch batch, DeletionVectorPositions deletionVector, long fileRowOffset)
-    {
-        int rowCount = batch.RowCount;
-        var survivors = new List<int>(rowCount);
-        for (int r = 0; r < rowCount; r++)
-        {
-            if (!deletionVector.IsDeleted(fileRowOffset + r))
-            {
-                survivors.Add(r);
-            }
-        }
-
-        if (survivors.Count == rowCount)
-        {
-            // No row in this batch was deleted — return it unchanged (identity selection is pure overhead).
-            return batch;
-        }
-
-        if (survivors.Count == 0)
-        {
-            return null;
-        }
-
-        return batch.WithSelection(new SelectionVector(survivors.ToArray()));
     }
 
     // True iff the read failed because the input Parquet file is missing a column the current data schema

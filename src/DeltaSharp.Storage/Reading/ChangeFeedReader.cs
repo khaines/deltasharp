@@ -56,6 +56,19 @@ internal sealed class ChangeFeedReader
     private static readonly StructType ChangeTypeOnlySchema =
         new(new[] { new StructField(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: false) });
 
+    // The `_change_type` domain is only four interned strings (§2.4). Their UTF-8 encodings are cached once
+    // and shared, so the explicit path's per-row `_change_type` lane appends a pooled byte[] instead of
+    // re-encoding `Encoding.UTF8.GetBytes(...)` for every row. `AppendBytes` copies the span into the
+    // vector's buffer, so sharing the cached arrays is safe.
+    private static readonly byte[] InsertChangeBytes = Encoding.UTF8.GetBytes(ChangeDataWriter.InsertChange);
+    private static readonly byte[] DeleteChangeBytes = Encoding.UTF8.GetBytes(ChangeDataWriter.DeleteChange);
+
+    private static readonly byte[] UpdatePreimageChangeBytes =
+        Encoding.UTF8.GetBytes(ChangeDataWriter.UpdatePreimageChange);
+
+    private static readonly byte[] UpdatePostimageChangeBytes =
+        Encoding.UTF8.GetBytes(ChangeDataWriter.UpdatePostimageChange);
+
     private readonly LocalFileSystemBackend _backend;
     private readonly DeltaLog _log;
     private readonly ParquetFileReader _reader;
@@ -178,7 +191,22 @@ internal sealed class ChangeFeedReader
             throw new DeltaReadException(ex.Message, ex);
         }
 
-        return new DeltaChangeFeedInfo(startVersion, endVersion, outputSchema);
+        // Pin the effective-commit-millis map for [start, end] into the resolved info (item 4 / query-exec
+        // L2): `_commit_timestamp` is stamped from THIS snapshot of the timeline at read time, never
+        // re-derived, so a log-cleanup advancing the earliest-reconstructable floor between resolve and read
+        // cannot shift a near-floor version's stamped timestamp. Every version in [start, end] was validated
+        // present in EffectiveMillisByVersion above, so each lookup is total.
+        ImmutableSortedDictionary<long, long>.Builder pinnedMillis =
+            ImmutableSortedDictionary.CreateBuilder<long, long>();
+        for (long v = startVersion; v <= endVersion; v++)
+        {
+            pinnedMillis[v] = log.EffectiveMillisByVersion[v];
+        }
+
+        return new DeltaChangeFeedInfo(startVersion, endVersion, outputSchema)
+        {
+            PinnedCommitMillis = pinnedMillis.ToImmutable(),
+        };
     }
 
     /// <summary>
@@ -195,11 +223,9 @@ internal sealed class ChangeFeedReader
         DeltaChangeFeedInfo info, [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         OutputContext ctx;
-        ChangeFeedLog log;
         try
         {
             ctx = await BuildOutputContextAsync(info, cancellationToken).ConfigureAwait(false);
-            log = await _log.LoadChangeFeedLogAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (DeltaProtocolException ex)
         {
@@ -210,13 +236,55 @@ internal sealed class ChangeFeedReader
             throw new DeltaReadException(ex.Message, ex);
         }
 
+        // `_commit_timestamp` is pinned at RESOLVE time (item 4 / query-exec L2): LoadChangeFeedAsync captured
+        // the effective `<N>.json`-mtime map for [start, end] into `info`, so an intervening log-cleanup
+        // cannot shift a near-floor version's stamped timestamp between resolve and read (versions/rows are
+        // already pinned; this pins the timestamp lane too). Only an info built via the public ctor (no
+        // resolve step, so no pinned map) falls back to deriving the timestamps from the current log.
+        IReadOnlyDictionary<long, long> commitMillisByVersion;
+        if (info.PinnedCommitMillis is { } pinned)
+        {
+            commitMillisByVersion = pinned;
+        }
+        else
+        {
+            try
+            {
+                ChangeFeedLog log = await _log.LoadChangeFeedLogAsync(cancellationToken).ConfigureAwait(false);
+                commitMillisByVersion = log.EffectiveMillisByVersion;
+            }
+            catch (DeltaProtocolException ex)
+            {
+                throw new DeltaReadException(ex.Message, ex);
+            }
+        }
+
+        // Per-version cdc schema validation (item 3 / §3.2 CDF-EE-08): the explicit path validates each cdc
+        // file's decoded leaf schema against THAT version's own log-resident metadata — the trusted authority
+        // — BEFORE any row is yielded, so a hostile/inconsistent cdc file whose columns disagree with its
+        // version fails closed rather than surfacing attacker-chosen columns. We track the prevailing metadata
+        // across the range: the baseline is the metadata as of `start`, then each version's own MetadataAction
+        // (a metaData REPLACES the whole metadata, Delta semantics) supersedes it.
+        MetadataAction currentMetadata;
+        try
+        {
+            Snapshot startSnapshot = await _log.LoadSnapshotAsync(info.StartVersion, cancellationToken)
+                .ConfigureAwait(false);
+            currentMetadata = startSnapshot.Metadata;
+        }
+        catch (DeltaProtocolException ex)
+        {
+            throw new DeltaReadException(ex.Message, ex);
+        }
+
         for (long v = info.StartVersion; v <= info.EndVersion; v++)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            // `_commit_timestamp` is the version's effective `<N>.json` mtime (millis) — the SAME value
-            // timestampAsOf resolves (§2.8). A version missing here aged out between resolve and read.
-            long commitMillis = ResolveCommitMillis(log, v);
+            // The version's effective `<N>.json` mtime (millis) — the SAME value timestampAsOf resolves
+            // (§2.8), read from the pinned/derived map. A version missing here aged out between resolve and
+            // read.
+            long commitMillis = ResolveCommitMillis(commitMillisByVersion, v);
 
             IReadOnlyList<DeltaAction> actions;
             try
@@ -237,6 +305,17 @@ internal sealed class ChangeFeedReader
                 throw new DeltaReadException(ex.Message, ex);
             }
 
+            // Track the prevailing metadata (item 3): a metaData action in this commit REPLACES it (Delta
+            // semantics). At v == start this re-applies start's own metaData (idempotent — already baked into
+            // the baseline snapshot); for later versions it advances the schema the cdc validation trusts.
+            foreach (DeltaAction action in actions)
+            {
+                if (action is MetadataAction updatedMetadata)
+                {
+                    currentMetadata = updatedMetadata;
+                }
+            }
+
             // Precedence (INV C1/C2, §2.2): ANY cdc action ⇒ explicit (read exactly the cdc rows, ignore
             // add/remove — no double count); otherwise implicit (derive from add/remove — no miss).
             bool hasCdc = false;
@@ -251,10 +330,15 @@ internal sealed class ChangeFeedReader
 
             if (hasCdc)
             {
+                // §3.2 CDF-EE-08: validate every cdc file's leaf schema against this version's metadata before
+                // reading any row (the schema is built once per version, then reused for each cdc file).
+                StructType versionPhysicalDataSchema = BuildVersionPhysicalDataSchema(currentMetadata, v);
                 foreach (DeltaAction action in actions)
                 {
                     if (action is AddCdcFileAction cdc)
                     {
+                        await ValidateExplicitCdcSchemaAsync(
+                            cdc.Path, versionPhysicalDataSchema, v, cancellationToken).ConfigureAwait(false);
                         IReadOnlyList<ColumnBatch> batches = await ReadExplicitFileAsync(
                             cdc, ctx, v, commitMillis, cancellationToken).ConfigureAwait(false);
                         foreach (ColumnBatch batch in batches)
@@ -426,8 +510,8 @@ internal sealed class ChangeFeedReader
         }
     }
 
-    private static long ResolveCommitMillis(ChangeFeedLog log, long version) =>
-        log.EffectiveMillisByVersion.TryGetValue(version, out long millis)
+    private static long ResolveCommitMillis(IReadOnlyDictionary<long, long> effectiveMillisByVersion, long version) =>
+        effectiveMillisByVersion.TryGetValue(version, out long millis)
             ? millis
             : throw new DeltaReadException(
                 $"Change feed version {version}'s commit log is no longer available (log cleanup removed it "
@@ -450,6 +534,114 @@ internal sealed class ChangeFeedReader
             info.Schema, tableSchema, physicalDataSchema, physicalNames, dataOrdinalByField, resolveByFieldId,
             allowTypeWideningPromotion);
     }
+
+    // §3.2 CDF-EE-08: builds the version's expected PHYSICAL data-leaf schema from its log-resident metadata
+    // (the trusted authority): parse the metadata's schemaString, resolve the column-mapping physical names,
+    // and drop the partition columns (which live only in the log, never the file body). A legitimate cdc
+    // file's data columns must match THIS schema exactly (leaf name + leaf type) — cross-version reconciliation
+    // to the output schema (§2.8) happens afterwards, against `ctx`, only for a file that passed this gate.
+    private static StructType BuildVersionPhysicalDataSchema(MetadataAction metadata, long version)
+    {
+        DataType parsed;
+        try
+        {
+            parsed = SchemaJson.FromJson(metadata.SchemaString);
+        }
+        catch (SchemaValidationException ex)
+        {
+            throw new DeltaReadException(
+                $"Change feed version {version}'s metadata schemaString is unparseable; the commit log is "
+                + "inconsistent, so the read fails closed.", ex);
+        }
+
+        if (parsed is not StructType schema)
+        {
+            throw new DeltaReadException(
+                $"Change feed version {version}'s metadata schemaString is not a struct; the commit log is "
+                + "inconsistent, so the read fails closed.");
+        }
+
+        ColumnMappingMode mode = ColumnMapping.ResolveMode(metadata.Configuration);
+        string[] physicalNames = ColumnMappingProjection.ResolvePhysicalNames(schema, mode);
+        return ColumnMappingProjection.BuildDataSchema(schema, physicalNames, metadata.PartitionColumns);
+    }
+
+    // §3.2 CDF-EE-08: reads a cdc file's decoded leaf schema (footer only — no page decode) and validates it
+    // against `versionPhysicalDataSchema` (the trusted per-version authority) BEFORE any row is read. Fails
+    // closed on a mismatch (a missing/extra data column, or a leaf-type disagreement), distinct from the
+    // NotFound/vacuumed classification (CDF-EE-09) and the corrupt-body classification (CDF-EE-07).
+    private async Task ValidateExplicitCdcSchemaAsync(
+        string path, StructType versionPhysicalDataSchema, long version, CancellationToken cancellationToken)
+    {
+        StructType fileSchema;
+        try
+        {
+            Stream stream = await _backend.OpenReadAsync(path, cancellationToken).ConfigureAwait(false);
+            await using (stream.ConfigureAwait(false))
+            {
+                fileSchema = await _reader.ReadDataSchemaAsync(stream, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch (DeltaStorageException ex)
+        {
+            throw ClassifyFileError(path, ex);
+        }
+
+        ValidateCdcLeafSchema(path, version, versionPhysicalDataSchema, fileSchema);
+    }
+
+    // The leaf comparison for CDF-EE-08. Physical names are 1:1 with field-ids in DeltaSharp's mapping (a
+    // renamed column keeps its physical name/id), so matching by physical name + leaf DataType validates both
+    // name and id modes. The synthesized `_change_type` column is excluded (it is engine-owned, not part of a
+    // version's data schema, and its VALUE domain is validated separately in ReadChangeTypesAsync).
+    private static void ValidateCdcLeafSchema(
+        string path, long version, StructType expected, StructType fileSchema)
+    {
+        var fileByName = new Dictionary<string, DataType>(StringComparer.Ordinal);
+        foreach (StructField field in fileSchema)
+        {
+            if (string.Equals(field.Name, ChangeDataWriter.ChangeTypeColumn, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (!fileByName.TryAdd(field.Name, field.DataType))
+            {
+                throw NewCdcSchemaMismatch(path, version, $"it declares data column '{field.Name}' more than once");
+            }
+        }
+
+        foreach (StructField expectedField in expected)
+        {
+            if (!fileByName.TryGetValue(expectedField.Name, out DataType? fileType))
+            {
+                throw NewCdcSchemaMismatch(
+                    path, version, $"it is missing the version's data column '{expectedField.Name}'");
+            }
+
+            if (!expectedField.DataType.Equals(fileType))
+            {
+                throw NewCdcSchemaMismatch(
+                    path, version,
+                    $"data column '{expectedField.Name}' has leaf type {fileType.SimpleString} but the version's "
+                    + $"metadata declares {expectedField.DataType.SimpleString}");
+            }
+
+            fileByName.Remove(expectedField.Name);
+        }
+
+        if (fileByName.Count > 0)
+        {
+            string extras = string.Join(", ", fileByName.Keys.OrderBy(name => name, StringComparer.Ordinal));
+            throw NewCdcSchemaMismatch(
+                path, version, $"it declares data column(s) [{extras}] absent from the version's metadata schema");
+        }
+    }
+
+    private static DeltaReadException NewCdcSchemaMismatch(string path, long version, string detail) =>
+        new($"Change-data file '{path}' is inconsistent with version {version}'s schema: {detail}. DeltaSharp "
+            + "validates each cdc file's leaf schema against that version's log-resident metadata (the trusted "
+            + "authority) before reading, and fails closed on a mismatch (design §3.2 CDF-EE-08).");
 
     // Explicit path (§2.2): the change rows for this version are EXACTLY the cdc file's rows, each carrying its
     // own `_change_type`. cdc files hold only the change rows (bounded by the change size, not the table), so
@@ -673,13 +865,7 @@ internal sealed class ChangeFeedReader
 
         // The file's real physical row count must match the count the DV was validated against — a mismatch
         // means the file changed under the DV, so the positions can no longer be trusted. Fail closed.
-        if (mask is not null && fileRowOffset != mask.PhysicalRecords)
-        {
-            throw new DeltaReadException(
-                $"Change-feed file '{path}' carries a deletion vector validated against {mask.PhysicalRecords} "
-                + $"physical record(s), but the Parquet file produced {fileRowOffset} on read; the deletion "
-                + "vector disagrees with the data file, so the read fails closed.");
-        }
+        mask?.EnsureConsumed(fileRowOffset, path);
     }
 
     // Assembles one implicit output batch: relabel + hydrate partition columns, stamp a CONSTANT change type
@@ -700,27 +886,10 @@ internal sealed class ChangeFeedReader
         ColumnBatch full = AppendMetadataColumns(
             logical, ctx, ConstantChangeType(changeType, physical.RowCount), version, commitMillis);
 
-        if (mask is null)
-        {
-            return full;
-        }
-
-        int rowCount = full.RowCount;
-        var survivors = new List<int>(rowCount);
-        for (int r = 0; r < rowCount; r++)
-        {
-            if (!mask.IsDeleted(fileRowOffset + r))
-            {
-                survivors.Add(r);
-            }
-        }
-
-        if (survivors.Count == rowCount)
-        {
-            return full;
-        }
-
-        return survivors.Count == 0 ? null : full.WithSelection(new SelectionVector(survivors.ToArray()));
+        // DV-aware (§2.2): surface only rows still LIVE. A batch with no masked row returns unchanged; a
+        // fully-masked batch returns null (the caller drops it). Shared with the snapshot door so the two
+        // can never drift (item 2 / #529).
+        return mask is null ? full : mask.Apply(full, fileRowOffset);
     }
 
     // Appends the three metadata columns to a data+partition logical batch, yielding a full-schema output
@@ -752,11 +921,23 @@ internal sealed class ChangeFeedReader
         MutableColumnVector vector = ColumnVectors.Create(DataTypes.StringType, Math.Max(rowCount, 1));
         for (int r = 0; r < rowCount; r++)
         {
-            vector.AppendBytes(Encoding.UTF8.GetBytes(values[start + r]));
+            vector.AppendBytes(ChangeTypeBytes(values[start + r]));
         }
 
         return vector;
     }
+
+    // Maps a validated (domain-checked in ReadChangeTypesAsync) change-type string to its cached UTF-8 bytes,
+    // avoiding a per-row re-encode. The `_` arm is unreachable for in-domain values but keeps the mapping
+    // total (defence in depth) rather than throwing.
+    private static byte[] ChangeTypeBytes(string changeType) => changeType switch
+    {
+        ChangeDataWriter.InsertChange => InsertChangeBytes,
+        ChangeDataWriter.DeleteChange => DeleteChangeBytes,
+        ChangeDataWriter.UpdatePreimageChange => UpdatePreimageChangeBytes,
+        ChangeDataWriter.UpdatePostimageChange => UpdatePostimageChangeBytes,
+        _ => Encoding.UTF8.GetBytes(changeType),
+    };
 
     private static ColumnVector ConstantLong(long value, int rowCount)
     {
@@ -817,21 +998,4 @@ internal sealed class ChangeFeedReader
         int[] DataOrdinalByField,
         bool ResolveByFieldId,
         bool AllowTypeWideningPromotion);
-
-    // A decoded deletion vector: the sorted, distinct PHYSICAL, file-relative positions to exclude, plus the
-    // file's physical record count for the post-read consistency check (mirrors DeltaReadSource's).
-    private sealed class DeletionVectorMask
-    {
-        private readonly long[] _deleted;
-
-        public DeletionVectorMask(long[] sortedDistinctPositions, long physicalRecords)
-        {
-            _deleted = sortedDistinctPositions;
-            PhysicalRecords = physicalRecords;
-        }
-
-        public long PhysicalRecords { get; }
-
-        public bool IsDeleted(long filePosition) => Array.BinarySearch(_deleted, filePosition) >= 0;
-    }
 }
