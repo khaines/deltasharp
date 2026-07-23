@@ -1,4 +1,3 @@
-using System.Collections.Immutable;
 using DeltaSharp.Types;
 
 namespace DeltaSharp.Storage;
@@ -22,26 +21,25 @@ namespace DeltaSharp.Storage;
 public readonly record struct DeltaChangeFeedInfo(long StartVersion, long EndVersion, StructType Schema)
 {
     /// <summary>
-    /// The effective <c>&lt;N&gt;.json</c>-mtime (epoch millis) for every version in
-    /// <c>[<see cref="StartVersion"/>, <see cref="EndVersion"/>]</c>, PINNED at resolve time by
-    /// <see cref="DeltaReadSource.LoadChangeFeedAsync"/> (item 4 / query-exec L2). <c>_commit_timestamp</c> is
-    /// stamped from THIS map at read time so an intervening log-cleanup — which can advance the earliest
-    /// reconstructable floor between resolve and read — cannot shift a near-floor version's stamped timestamp
-    /// (the versions and rows are already pinned; this pins the timestamp lane too, §2.8). It is
-    /// <see langword="internal"/> — it is engine plumbing, not part of the public resolved identity — and is
+    /// The non-forgeable resolution proof — the evidence that this info was produced by
+    /// <see cref="DeltaReadSource.LoadChangeFeedAsync"/>, i.e. that its range passed the full resolve-time
+    /// validation (bounds, availability, and the §2.7 conservative CDF-enablement gate) — carrying the pinned
+    /// effective-commit-millis map used to stamp <c>_commit_timestamp</c> (item 4 / query-exec L2, §2.8).
+    /// <see cref="DeltaReadSource.LoadChangeFeedAsync"/> mints it; it is <see langword="null"/> for an info
+    /// built via the public constructor or <c>default</c>, in which case
+    /// <see cref="DeltaReadSource.ReadChangeBatchesAsync"/> fails closed BEFORE any I/O rather than reading an
+    /// unvalidated range (a forged info can never bypass range/CDF-enablement validation). It is
+    /// <see langword="internal"/> — engine plumbing, not part of the public resolved identity — and is
     /// DELIBERATELY excluded from <see cref="Equals(DeltaChangeFeedInfo)"/> / <see cref="GetHashCode"/> so two
-    /// infos with the same <c>[start, end]</c> + schema remain equal regardless of the pinned map instance. It
-    /// is <see langword="null"/> only for an info built via the public constructor (no resolve step), in which
-    /// case <see cref="DeltaReadSource.ReadChangeBatchesAsync"/> falls back to deriving the timestamps from the
-    /// current log.
+    /// infos with the same <c>[start, end]</c> + schema remain equal regardless of the resolution instance.
     /// </summary>
-    internal ImmutableSortedDictionary<long, long>? PinnedCommitMillis { get; init; }
+    internal ChangeFeedResolution? Resolution { get; init; }
 
     /// <summary>
     /// Value equality over the PUBLIC resolved identity only — <see cref="StartVersion"/>,
-    /// <see cref="EndVersion"/> and <see cref="Schema"/>. The internal <see cref="PinnedCommitMillis"/> carrier
+    /// <see cref="EndVersion"/> and <see cref="Schema"/>. The internal <see cref="Resolution"/> carrier
     /// is excluded so equality matches the documented contract (a resolved info and an equivalent
-    /// user-constructed info compare equal even though only the former carries a pinned map).
+    /// user-constructed info compare equal even though only the former carries a resolution proof).
     /// </summary>
     public bool Equals(DeltaChangeFeedInfo other) =>
         StartVersion == other.StartVersion

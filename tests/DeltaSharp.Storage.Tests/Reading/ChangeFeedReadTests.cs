@@ -499,6 +499,49 @@ public sealed class ChangeFeedReadTests : IDisposable
             async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
     }
 
+    // ------------------------------------------------------ forged-info trust boundary: fail closed (red-team)
+
+    [Fact]
+    public async Task ForgedChangeFeedInfo_BypassingLoad_FailsClosed()
+    {
+        // Red-team CRITICAL: DeltaChangeFeedInfo has a PUBLIC ctor, so a consumer could forge one and pass it
+        // straight to ReadChangeBatchesAsync, skipping LoadChangeFeedAsync's resolve+validate entirely (range
+        // bounds, aged-out/VACUUMed, and CRUCIALLY the §2.7 CDF-enablement gate). The read door now REQUIRES a
+        // non-forgeable resolution proof that ONLY LoadChangeFeedAsync can mint: an info built via the public
+        // ctor — or `default` — carries none and is rejected fail-closed BEFORE any batch is produced.
+        await CreateCdfFlatTableAsync(Batch((1, "a")));   // a real CDF table (v0, v1) — the guard is state-independent
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+
+        await AssertForgedInfoFailsClosedAsync(source, new DeltaChangeFeedInfo(0, 1, FlatSchema));   // public ctor
+        await AssertForgedInfoFailsClosedAsync(source, default);                                      // default(struct)
+    }
+
+    [Fact]
+    public async Task ForgedInfoForCdfDisabledVersion_CannotBypassEnablementGate_FailsClosed()
+    {
+        // The red-team's EXACT repro: v0 is the CREATE (CDF NOT active), v1 ENABLES CDF, v2 appends. §2.7
+        // requires CDF active for EVERY version in the range, so v0's change rows must be UNreadable. Prove
+        // there is NO path — forged OR legit — to them.
+        await CreateCdfFlatTableAsync(Batch((1, "a")));   // v0 create (CDF OFF), v1 enable CDF
+        await AppendFlatAsync(Batch((2, "b")));           // v2 append
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+
+        // (1) The LEGIT resolve of [0,2] fails closed AT RESOLVE (CDF-disabled-in-range, §2.7) — v0 predates the enable.
+        await Assert.ThrowsAsync<DeltaReadException>(
+            () => source.LoadChangeFeedAsync(DeltaChangeFeedRange.FromVersion(0, 2), CancellationToken.None));
+
+        // A plausible schema for the forgery: the reconciled output schema of a VALID sub-range [1,2] (CDF
+        // active for v1,v2). The forged info is thus indistinguishable from a real one EXCEPT it lacks the proof.
+        DeltaChangeFeedInfo legit = await source.LoadChangeFeedAsync(
+            DeltaChangeFeedRange.FromVersion(1, 2), CancellationToken.None);
+        var forged = new DeltaChangeFeedInfo(0, 2, legit.Schema);
+
+        // (2) Forging (0,2,schema) and reading it must ALSO fail closed — the guard rejects the proofless info
+        // BEFORE any I/O, so v0's CDF-off change row (the create's add of id 1) NEVER surfaces.
+        await AssertForgedInfoFailsClosedAsync(source, forged);
+    }
+
     // ---------------------------------------------------------------- mixed explicit + implicit, ascending
 
     [Fact]
@@ -1134,6 +1177,25 @@ public sealed class ChangeFeedReadTests : IDisposable
         }
 
         return (info, batches);
+    }
+
+    // Asserts a forged/unvalidated info (no resolution proof) is rejected fail-closed by the read door: the
+    // classified ArgumentException (param `info`, naming LoadChangeFeedAsync) surfaces WITHOUT any batch being
+    // yielded — so a manually-constructed info can never surface change rows from an unvalidated range.
+    private static async Task AssertForgedInfoFailsClosedAsync(DeltaReadSource source, DeltaChangeFeedInfo forged)
+    {
+        int yielded = 0;
+        ArgumentException ex = await Assert.ThrowsAsync<ArgumentException>(async () =>
+        {
+            await foreach (ColumnBatch batch in source.ReadChangeBatchesAsync(forged, CancellationToken.None))
+            {
+                yielded++;
+            }
+        });
+
+        Assert.Equal("info", ex.ParamName);
+        Assert.Contains("LoadChangeFeedAsync", ex.Message);
+        Assert.Equal(0, yielded);   // fail-closed BEFORE any batch is produced
     }
 
     // Decodes flat change rows AND asserts, per batch: exactly ONE _commit_version (INV C8), non-null

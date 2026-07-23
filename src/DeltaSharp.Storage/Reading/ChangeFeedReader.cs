@@ -203,9 +203,13 @@ internal sealed class ChangeFeedReader
             pinnedMillis[v] = log.EffectiveMillisByVersion[v];
         }
 
+        // Stamp the non-forgeable resolution proof: it is the evidence that this info passed the full
+        // resolve-time validation above (bounds, availability, and the §2.7 CDF-enablement gate) and carries
+        // the pinned timeline. ReadAsync REQUIRES it, so ONLY a LoadChangeFeedAsync-produced info can be read;
+        // a forged/`default` info (no proof) fails closed there instead of surfacing an unvalidated range.
         return new DeltaChangeFeedInfo(startVersion, endVersion, outputSchema)
         {
-            PinnedCommitMillis = pinnedMillis.ToImmutable(),
+            Resolution = new ChangeFeedResolution(pinnedMillis.ToImmutable()),
         };
     }
 
@@ -215,12 +219,38 @@ internal sealed class ChangeFeedReader
     /// See the type remarks for the precedence (explicit cdc vs implicit derivation), DV-awareness, metadata
     /// stamping, and one-version-per-batch (INV C8) contract.
     /// </summary>
+    /// <exception cref="ArgumentException"><paramref name="info"/> was not obtained from
+    /// <see cref="DeltaReadSource.LoadChangeFeedAsync"/> (a manually-constructed or <c>default</c> info): it
+    /// carries no resolution proof, so its range never passed resolve-time validation (bounds, availability,
+    /// and the §2.7 CDF-enablement gate). Rejected fail-closed BEFORE any I/O so a forged info can never
+    /// surface change rows from an unvalidated range.</exception>
     /// <exception cref="DeltaReadException">A version's commit log or a required change/data file is no longer
     /// available (aged out / vacuumed between resolution and read), or a change-data file is inconsistent.</exception>
     /// <exception cref="DeltaReadSchemaEvolutionException">A cdc/data file is missing a REQUIRED (non-nullable)
     /// column the reconciled output schema demands — read-side null-fill cannot satisfy it — fails closed.</exception>
-    public async IAsyncEnumerable<ColumnBatch> ReadAsync(
-        DeltaChangeFeedInfo info, [EnumeratorCancellation] CancellationToken cancellationToken)
+    public IAsyncEnumerable<ColumnBatch> ReadAsync(
+        DeltaChangeFeedInfo info, CancellationToken cancellationToken)
+    {
+        // Fail closed EAGERLY (standard ArgumentException semantics — before the iterator body runs, so before
+        // any I/O or yield): an info WITHOUT a resolution proof did not come from ResolveAsync /
+        // LoadChangeFeedAsync, so its [start, end] range never passed resolve-time validation — crucially the
+        // §2.7 conservative "CDF active for EVERY version in the range" gate. A consumer could otherwise forge
+        // `new DeltaChangeFeedInfo(0, 2, schema)` (or pass `default`) and read change rows from a version where
+        // CDF was never enabled, defeating the fail-closed contract. A ChangeFeedResolution can be minted ONLY
+        // by ResolveAsync (internal, no public ctor), so its presence is the sole trust boundary here.
+        if (info.Resolution is not { } resolution)
+        {
+            throw new ArgumentException(
+                "DeltaChangeFeedInfo must be obtained from LoadChangeFeedAsync; a manually-constructed info "
+                + "bypasses range and CDF-enablement validation.", nameof(info));
+        }
+
+        return ReadCoreAsync(info, resolution, cancellationToken);
+    }
+
+    private async IAsyncEnumerable<ColumnBatch> ReadCoreAsync(
+        DeltaChangeFeedInfo info, ChangeFeedResolution resolution,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         OutputContext ctx;
         try
@@ -237,27 +267,12 @@ internal sealed class ChangeFeedReader
         }
 
         // `_commit_timestamp` is pinned at RESOLVE time (item 4 / query-exec L2): LoadChangeFeedAsync captured
-        // the effective `<N>.json`-mtime map for [start, end] into `info`, so an intervening log-cleanup
-        // cannot shift a near-floor version's stamped timestamp between resolve and read (versions/rows are
-        // already pinned; this pins the timestamp lane too). Only an info built via the public ctor (no
-        // resolve step, so no pinned map) falls back to deriving the timestamps from the current log.
-        IReadOnlyDictionary<long, long> commitMillisByVersion;
-        if (info.PinnedCommitMillis is { } pinned)
-        {
-            commitMillisByVersion = pinned;
-        }
-        else
-        {
-            try
-            {
-                ChangeFeedLog log = await _log.LoadChangeFeedLogAsync(cancellationToken).ConfigureAwait(false);
-                commitMillisByVersion = log.EffectiveMillisByVersion;
-            }
-            catch (DeltaProtocolException ex)
-            {
-                throw new DeltaReadException(ex.Message, ex);
-            }
-        }
+        // the effective `<N>.json`-mtime map for [start, end] into the resolution proof, so an intervening
+        // log-cleanup — which can advance the earliest-reconstructable floor between resolve and read — cannot
+        // shift a near-floor version's stamped timestamp (versions/rows are already pinned; this pins the
+        // timestamp lane too, §2.8). There is NO read-time re-derivation: every info reaching here carries a
+        // resolution (ReadAsync rejected any that did not), so the stamp always comes from the pinned map.
+        IReadOnlyDictionary<long, long> commitMillisByVersion = resolution.CommitMillisByVersion;
 
         // Per-version cdc schema validation (item 3 / §3.2 CDF-EE-08): the explicit path validates each cdc
         // file's decoded leaf schema against THAT version's own log-resident metadata — the trusted authority
