@@ -48,6 +48,28 @@ internal static class ChangeDataFeedFeature
     }
 
     /// <summary>
+    /// True when Change Data Feed is <b>active for writes</b>: the <c>changeDataFeed</c> writer feature is
+    /// negotiated in <paramref name="protocol"/>'s <c>writerFeatures</c> AND
+    /// <c>delta.enableChangeDataFeed</c> is <c>true</c> (<see cref="IsEnabled"/>). <b>Both are required</b> —
+    /// the Delta protocol honors the <c>delta.enableChangeDataFeed</c> property only when the table also
+    /// declares the backing writer feature (§2.7). A MALFORMED table carrying the property WITHOUT the feature
+    /// (an external edit, a hand-authored table, or a protocol downgrade) is therefore NOT active and
+    /// generates NO <c>cdc</c> — the write door fails <b>closed</b> rather than author change-data a
+    /// conforming reader would never look for. This is the single, authoritative definition of "CDF active
+    /// for writes"; gate ALL cdc generation on it so the enable check and the generation gate can never drift
+    /// (mirrors <see cref="TypeWideningFeature.IsWriteEnabled"/>). Distinct from the property-only
+    /// <see cref="IsEnabled"/>, which the legacy→table-features enable-UPGRADE path must use BEFORE the
+    /// feature is present in the protocol.
+    /// </summary>
+    public static bool IsActive(ProtocolAction protocol, IReadOnlyDictionary<string, string> configuration)
+    {
+        ArgumentNullException.ThrowIfNull(protocol);
+        return !protocol.WriterFeatures.IsDefault
+            && protocol.WriterFeatures.Contains(Feature, StringComparer.Ordinal)
+            && IsEnabled(configuration);
+    }
+
+    /// <summary>
     /// Adds the <c>changeDataFeed</c> feature to a <c>writerFeatures</c> list unless already present
     /// (idempotent; a default/uninitialized array is treated as empty). Used by the legacy → table-features
     /// upgrade to enumerate an active <c>changeDataFeed</c> feature so it stays active. Writer-only — this is

@@ -266,18 +266,23 @@ internal sealed class DeltaDelete
         // than being silently promoted.
         bool allowTypeWideningPromotion = TypeWideningFeature.Supports(readSnapshot.Protocol);
 
-        // Change Data Feed generation gate (§2.5). CDF is enabled iff the read snapshot's metadata sets
-        // delta.enableChangeDataFeed=true; ALL new behavior is gated on this, so a CDF-disabled DELETE is
-        // byte-identical to before (INV C1 — no cdc rows captured, no cdc files, no cdc actions). When
-        // enabled, EVERY affected file's newly-deleted rows are materialized as a cdc file in the SAME commit
-        // (completeness, INV C2/C3). Fail closed EARLY (before any DV/cdc side effect) on a schema cdc
-        // generation cannot support: (a) a reserved CDF metadata column name (`_change_type` etc.) the enable
-        // guard could not see because it was added by schema evolution AFTER CDF was enabled — a `_change_type`
-        // data column would collide with the synthesized cdc column and yield an ambiguous footer (#642); or
-        // (b) a nested data column the selection-gather + scalar Parquet writer cannot materialize — so we
-        // never publish an incomplete cdc set that read-time precedence would make silently lossy.
-        bool changeDataFeedEnabled = ChangeDataFeedFeature.IsEnabled(readSnapshot.Metadata.Configuration);
-        if (changeDataFeedEnabled)
+        // Change Data Feed generation gate (§2.5/§2.7). CDF is ACTIVE for writes only when the read snapshot's
+        // protocol negotiates the `changeDataFeed` writer feature AND its metadata sets
+        // delta.enableChangeDataFeed=true — BOTH are required (the property is honored only when backed by the
+        // feature), so a MALFORMED property-without-feature table generates NO cdc (fail-closed via
+        // ChangeDataFeedFeature.IsActive; single-sourced with the enable check so the two gates cannot drift).
+        // ALL new behavior is gated on this, so a CDF-inactive DELETE is byte-identical to before (INV C1 — no
+        // cdc rows captured, no cdc files, no cdc actions). When active, EVERY affected file's newly-deleted
+        // rows are materialized as a cdc file in the SAME commit (completeness, INV C2/C3). Fail closed EARLY
+        // (before any DV/cdc side effect) on a schema cdc generation cannot support: (a) a reserved CDF
+        // metadata column name (`_change_type` etc.) the enable guard could not see because it was added by
+        // schema evolution AFTER CDF was enabled — a `_change_type` data column would collide with the
+        // synthesized cdc column and yield an ambiguous footer (#642); or (b) a nested data column the
+        // selection-gather + scalar Parquet writer cannot materialize — so we never publish an incomplete cdc
+        // set that read-time precedence would make silently lossy.
+        bool changeDataFeedActive =
+            ChangeDataFeedFeature.IsActive(readSnapshot.Protocol, readSnapshot.Metadata.Configuration);
+        if (changeDataFeedActive)
         {
             // The reserved-name check runs over the LOGICAL schema (covers all mapping modes: in none mode
             // the collision is literal; in name/id mode the logical name is still reserved).
@@ -297,7 +302,7 @@ internal sealed class DeltaDelete
             cancellationToken.ThrowIfCancellationRequested();
 
             FileDeletionPlan plan = await PlanFileDeletionAsync(
-                add, tableSchema, physicalNames, dataSchema, dataOrdinalByField, resolveByFieldId, predicate, allowTypeWideningPromotion, changeDataFeedEnabled, cancellationToken)
+                add, tableSchema, physicalNames, dataSchema, dataOrdinalByField, resolveByFieldId, predicate, allowTypeWideningPromotion, changeDataFeedActive, cancellationToken)
                 .ConfigureAwait(false);
 
             if (plan.NewlyDeletedCount == 0)
@@ -320,7 +325,7 @@ internal sealed class DeltaDelete
             // the partial branch would silently lose the fully-deleted file's rows, because a cdc-bearing
             // version suppresses ALL implicit derivation, §2.2). The cdc action rides the SAME `actions` list,
             // so it is published atomically in this DELETE commit — never a separate commit.
-            if (changeDataFeedEnabled)
+            if (changeDataFeedActive)
             {
                 ChangeDataWriter.ChangeDataFile cdc = await _changeDataWriter
                     .WriteAsync(

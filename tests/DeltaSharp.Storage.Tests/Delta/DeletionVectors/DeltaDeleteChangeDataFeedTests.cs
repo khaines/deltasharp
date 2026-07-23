@@ -280,6 +280,74 @@ public sealed class DeltaDeleteChangeDataFeedTests : IDisposable
         Assert.Equal("0", raw.GetProperty("numAddedChangeFiles").GetString());
     }
 
+    // ------------------------------------------------- §2.7 gate: property WITHOUT the writer feature ⇒ no cdc
+
+    [Fact]
+    public async Task Delete_PropertyEnabledButWriterFeatureAbsent_MalformedTable_WritesNoCdc()
+    {
+        // #642 red-team (HIGH): CDF generation must be gated on the changeDataFeed writer FEATURE being
+        // negotiated in the protocol — NOT on the delta.enableChangeDataFeed PROPERTY alone. Per §2.7 the
+        // property is honored only when backed by the feature, so a MALFORMED table (property=true, feature
+        // ABSENT — an external edit / hand-authored table / protocol downgrade) must generate NO cdc; writing
+        // one would author change-data a conforming reader never looks for. We reach that state by enabling
+        // CDF normally, then committing a protocol DOWNGRADE that drops changeDataFeed from writerFeatures
+        // while KEEPING deletionVectors (so the DV DELETE still runs) and leaving the property set. This is
+        // the behavioral counterpart to the ChangeDataFeedFeature.IsActive truth table.
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b"), (3, "c")));
+        var backend = new LocalFileSystemBackend(_root);
+
+        // Precondition: the freshly enabled table IS active (feature + property both present).
+        Snapshot enabled = await new DeltaLog(backend).LoadSnapshotAsync();
+        Assert.True(ChangeDataFeedFeature.IsActive(enabled.Protocol, enabled.Metadata.Configuration));
+
+        // Protocol downgrade (authored directly, bypassing the committer's downgrade guard): same versions +
+        // reader lane, writer features MINUS changeDataFeed. The metadata (schema + config, incl. the still-set
+        // delta.enableChangeDataFeed=true and delta.enableDeletionVectors=true) is untouched.
+        await DeltaTestHarness.WriteCommitAsync(
+            backend, enabled.Version + 1,
+            ProtocolLine(
+                enabled.Protocol.MinReaderVersion, enabled.Protocol.MinWriterVersion,
+                enabled.Protocol.ReaderFeatures,
+                enabled.Protocol.WriterFeatures.Where(f => f != ChangeDataFeedFeature.Feature)));
+
+        // The malformed state: property STILL true, feature GONE ⇒ IsActive false (fail-closed, no cdc).
+        Snapshot malformed = await new DeltaLog(backend).LoadSnapshotAsync();
+        Assert.Equal("true", malformed.Metadata.Configuration[ChangeDataFeedFeature.PropertyKey]);
+        Assert.DoesNotContain(ChangeDataFeedFeature.Feature, malformed.Protocol.WriterFeatures);
+        Assert.False(ChangeDataFeedFeature.IsActive(malformed.Protocol, malformed.Metadata.Configuration));
+
+        // ThrowingCdcTokens: if the (now-closed) gate ever reached cdc naming/write, it would throw loudly
+        // rather than silently emit a stray cdc file — so a green run proves the gate is closed.
+        DeleteResult result = await NewCdfDelete(backend, "malformed", ThrowingCdcTokens())
+            .DeleteAsync(WhereId(id => id == 2));
+
+        // The DATA plane is UNAFFECTED — a normal partial DV delete: 1 remove + 1 residual DV-add — and NO
+        // cdc file/directory exists and NO cdc action was committed.
+        Assert.Equal(1, result.RowsDeleted);
+        Assert.Equal(1, result.FilesWithDeletionVector);
+        Assert.NotNull(result.CommittedVersion);
+        Assert.False(Directory.Exists(Path.Combine(_root, ChangeDataWriter.ChangeDataDirectory)));
+        Assert.Empty(CdcFilePaths());
+
+        IReadOnlyList<DeltaAction> committed = await ReadCommitActionsAsync(backend, result.CommittedVersion!.Value);
+        Assert.Empty(committed.OfType<AddCdcFileAction>());       // NO cdc action published (gate closed)
+        Assert.Single(committed.OfType<RemoveFileAction>());      // data plane unchanged: 1 remove…
+        AddFileAction add = Assert.Single(committed.OfType<AddFileAction>());
+        Assert.NotNull(add.DeletionVector);                       // …+ 1 residual DV-carrying add
+        Assert.Equal(1L, add.DeletionVector!.Cardinality);
+        Assert.Equal(3L, add.Stats!.NumRecords);                  // physical count unchanged
+
+        // Metric honest for a no-cdc delete: numAddedChangeFiles=0 even though the property is (malformed) set.
+        CommitInfoAction commitInfo = committed.OfType<CommitInfoAction>().Single();
+        Assert.Equal("\"1\"", commitInfo.OperationMetrics!["numDeletedRows"]);
+        Assert.Equal("\"0\"", commitInfo.OperationMetrics!["numAddedChangeFiles"]);
+
+        // …and the DELETE itself is correct: id 2 gone, ids 1 and 3 survive.
+        Assert.Equal(
+            new (long, string?)[] { (1L, "a"), (3L, "c") },
+            (await ReadLatestFlatAsync()).OrderBy(r => r.Item1).ToList());
+    }
+
     // ---------------------------------------------------------------- idempotent re-delete emits no cdc
 
     [Fact]
@@ -719,6 +787,20 @@ public sealed class DeltaDeleteChangeDataFeedTests : IDisposable
 
     private async Task<IReadOnlyList<DeltaAction>> ReadCommitActionsAsync(LocalFileSystemBackend backend, long version) =>
         await new DeltaLog(backend).ReadCommitActionsAsync(version, CancellationToken.None);
+
+    // A raw `protocol` commit line with explicit reader/writer feature lists — authored DIRECTLY (bypassing
+    // the committer's downgrade guard) so a test can install a MALFORMED protocol (e.g. one that drops the
+    // changeDataFeed writer feature while metadata still sets delta.enableChangeDataFeed=true), §2.7 gate test.
+    private static string ProtocolLine(
+        int minReader, int minWriter, IEnumerable<string> readerFeatures, IEnumerable<string> writerFeatures)
+    {
+        static string Arr(IEnumerable<string> features) =>
+            "[" + string.Join(",", features.Select(f => "\"" + f + "\"")) + "]";
+        return "{\"protocol\":{\"minReaderVersion\":" + minReader.ToString(CultureInfo.InvariantCulture)
+            + ",\"minWriterVersion\":" + minWriter.ToString(CultureInfo.InvariantCulture)
+            + ",\"readerFeatures\":" + Arr(readerFeatures)
+            + ",\"writerFeatures\":" + Arr(writerFeatures) + "}}";
+    }
 
     // Every *.parquet under _change_data/, as table-root-relative '/'-separated paths (matching an action Path).
     private List<string> CdcFilePaths()
