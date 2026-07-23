@@ -412,6 +412,89 @@ public sealed class DeltaDeleteChangeDataFeedTests : IDisposable
         Assert.Equal((1L, 10L, ChangeDataWriter.DeleteChange), only);
     }
 
+    [Fact]
+    public async Task Delete_IdMode_CdcFooterFieldIds_MatchColumnMappingIds_ChangeTypeHasNone()
+    {
+        // Column-mapping ID MODE (#642 M2): the cdc body stores the DATA columns by physical name WITH the
+        // Parquet footer field_id stamped (= delta.columnMapping.id) — exactly like a data file, so the
+        // increment-3 id-mode read door resolves cdc columns by field_id. The engine-synthesized _change_type
+        // carries NO field_id (it is never column-mapped), so a field_id reader can never mistake it for a
+        // data column (non-colliding).
+        await CreateIdMappedCdfFlatTableAsync(Batch((1, "a"), (2, "b"), (3, "c")));
+        var backend = new LocalFileSystemBackend(_root);
+        Snapshot snapshot = await new DeltaLog(backend).LoadSnapshotAsync();
+
+        DeleteResult result = await NewCdfDelete(backend, "id-mode", SequentialCdcTokens())
+            .DeleteAsync(WhereId(id => id == 2));
+        Assert.NotNull(result.CommittedVersion);
+
+        Dictionary<string, int?> footer = await ReadCdcFooterFieldIdsAsync(Assert.Single(CdcFilePaths()));
+
+        // Every DATA column's cdc-footer field_id, keyed by its PHYSICAL name, equals its delta.columnMapping.id.
+        foreach (StructField field in snapshot.Schema)
+        {
+            string physical = ColumnMapping.PhysicalName(field, ColumnMappingMode.Id);
+            Assert.True(field.Metadata.TryGetLong(ColumnMapping.IdKey, out long mappingId),
+                $"logical column '{field.Name}' carries no delta.columnMapping.id.");
+            Assert.True(footer.TryGetValue(physical, out int? footerId),
+                $"cdc footer has no physical column '{physical}'.");
+            Assert.Equal((int)mappingId, footerId);
+        }
+
+        // _change_type is PRESENT in the cdc footer but carries NO field_id (never column-mapped).
+        Assert.True(footer.TryGetValue(ChangeDataWriter.ChangeTypeColumn, out int? changeTypeId),
+            "cdc footer is missing the _change_type column.");
+        Assert.Null(changeTypeId);
+
+        // Sanity: the cdc body decodes to exactly the deleted row (id 2), stamped delete.
+        (long Id, string? Name, string ChangeType) only = Assert.Single(DecodeFlat(await ReadCdcAsync(CdcFilePaths()[0])));
+        Assert.Equal((2L, "b", ChangeDataWriter.DeleteChange), only);
+    }
+
+    // ------------------------------------------------------ multi-row-group + null (cross-group accumulation)
+
+    [Fact]
+    public async Task Delete_MultiRowGroupFile_WithNulls_CdcConcatenatesDeletedRowsInOrder()
+    {
+        // The cdc capture accumulates ONE selection view per row group and writes them ALL after the scan
+        // (§4.3); every other test uses single-row-group files, so this is the ONLY coverage of the
+        // cross-group accumulation the mechanism exists for (#642 F2/F3), and it pins null-in-cdc-body
+        // (#642 L1). A single data file is re-laid into 3 row groups; the deletes straddle every group
+        // boundary and TWO of them carry a NULL `name`. Oracle: the concatenated cdc body == exactly the
+        // deleted rows IN physical-position ORDER, NULLs surviving.
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, null), (3, "c"), (4, "d"), (5, null), (6, "f")));
+        var backend = new LocalFileSystemBackend(_root);
+        AddFileAction add = Assert.Single((await new DeltaLog(backend).LoadSnapshotAsync()).ActiveFiles);
+
+        // Re-lay the SAME six rows into 2-row row groups (3 groups: [1,2],[3,4],[5,6]); VALUES are unchanged
+        // so stats.numRecords (6) still matches the physical count.
+        await RewriteFlatWithRowGroupsAsync(
+            add.Path, rowGroupRowLimit: 2, Batch((1, "a"), (2, null), (3, "c"), (4, "d"), (5, null), (6, "f")));
+
+        // Delete ids {2,3,5} = physical positions {1,2,4}: pos 1 in group 0, pos 2 in group 1, pos 4 in
+        // group 2 — spanning EVERY boundary; ids 2 and 5 have a NULL name.
+        DeleteResult result = await NewCdfDelete(backend, "multi-rg", SequentialCdcTokens())
+            .DeleteAsync(WhereId(id => id is 2 or 3 or 5));
+        Assert.Equal(3, result.RowsDeleted);
+        Assert.NotNull(result.CommittedVersion);
+
+        // Exactly one cdc file; its concatenated body == the deleted rows in physical-position order, NULLs intact.
+        List<(long Id, string? Name, string ChangeType)> cdc = DecodeFlat(await ReadCdcAsync(Assert.Single(CdcFilePaths())));
+        Assert.Equal(
+            new[]
+            {
+                (2L, (string?)null, ChangeDataWriter.DeleteChange),
+                (3L, "c", ChangeDataWriter.DeleteChange),
+                (5L, (string?)null, ChangeDataWriter.DeleteChange),
+            },
+            cdc);
+
+        // And the DELETE itself is correct: survivors are ids 1,4,6 (a mis-captured cdc must not hide a wrong delete).
+        Assert.Equal(
+            new (long, string?)[] { (1L, "a"), (4L, "d"), (6L, "f") },
+            (await ReadLatestFlatAsync()).OrderBy(r => r.Item1).ToList());
+    }
+
     // ---------------------------------------------------------------- fail-closed: nested data column
 
     [Fact]
@@ -611,6 +694,26 @@ public sealed class DeltaDeleteChangeDataFeedTests : IDisposable
         await new DeltaTableWriter(new LocalFileSystemBackend(_root)).EnableChangeDataFeedAsync();
     }
 
+    private async Task CreateIdMappedCdfFlatTableAsync(params ColumnBatch[] batches)
+    {
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(_root))
+        {
+            await target.CreateIdMappedDeletionVectorTableAsync(
+                FlatSchema, Array.Empty<string>(), batches, new SeededPhysicalNameSource("cdf-id-mode"));
+        }
+
+        await new DeltaTableWriter(new LocalFileSystemBackend(_root)).EnableChangeDataFeedAsync();
+    }
+
+    // Re-lays a flat data file into small row groups (same rows, so stats.numRecords still matches the
+    // physical count), forcing the reader to yield multiple batches so the cross-group cdc accumulation runs.
+    private async Task RewriteFlatWithRowGroupsAsync(string relativePath, int rowGroupRowLimit, ColumnBatch batch)
+    {
+        using var buffer = new MemoryStream();
+        await new ParquetFileWriter(rowGroupRowLimit).WriteAsync(buffer, FlatSchema, new[] { batch }, CancellationToken.None);
+        await File.WriteAllBytesAsync(Path.Combine(_root, relativePath), buffer.ToArray());
+    }
+
     private static DeltaDeletePredicate WhereId(Func<long, bool> match) =>
         DeltaDeletePredicate.FromRowPredicate((batch, row) => match(batch.SelectedColumn(0).GetValue<long>(row)));
 
@@ -662,6 +765,23 @@ public sealed class DeltaDeleteChangeDataFeedTests : IDisposable
         }
 
         return (schema, batches);
+    }
+
+    // The cdc file's Parquet footer field_ids (the Thrift SchemaElement.field_id), keyed by column name — a
+    // NULLABLE int so a column with NO field_id (the engine-synthesized _change_type) is distinguishable from
+    // one carrying id 0. Read with the raw Parquet.Net reader (the DeltaSharp high-level decode does not
+    // surface field_ids), so the id-mode oracle sees exactly what a foreign field_id reader would.
+    private async Task<Dictionary<string, int?>> ReadCdcFooterFieldIdsAsync(string relativePath)
+    {
+        await using FileStream stream = File.OpenRead(Path.Combine(_root, relativePath));
+        await using global::Parquet.ParquetReader reader = await global::Parquet.ParquetReader.CreateAsync(stream);
+        var byName = new Dictionary<string, int?>(StringComparer.Ordinal);
+        foreach (global::Parquet.Meta.SchemaElement element in reader.Metadata!.Schema)
+        {
+            byName[element.Name] = element.FieldId;
+        }
+
+        return byName;
     }
 
     private static List<(long Id, string? Name, string ChangeType)> DecodeFlat(List<ColumnBatch> batches)
