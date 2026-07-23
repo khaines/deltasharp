@@ -240,6 +240,13 @@ public sealed class DeltaReadSource : IDisposable
     /// derived implicitly (<c>insert</c> from <c>add</c>, <c>delete</c> from <c>remove</c>), DV-aware so only
     /// live rows surface. Unlike the snapshot door's materialized <see cref="ReadBatchesAsync"/>, this returns
     /// an <see cref="IAsyncEnumerable{T}"/> — a deliberate streaming, consumer-paced deviation (§2.6).
+    /// <para><b>Streaming-failure contract.</b> The VACUUM / <c>deletedFileRetentionDuration</c> availability
+    /// bound is enforced LAZILY at read time (a required cdc/data file resolving to NotFound throws), so this
+    /// enumerator MAY yield one or more early in-range batches and THEN throw mid-stream if a later
+    /// version's file was reclaimed between resolution and read. The thrown exception is authoritative and
+    /// fail-closed: it invalidates the ENTIRE feed. A consumer MUST NOT treat already-yielded batches as a
+    /// complete or committed change feed and MUST discard them on ANY exception (including cancellation); a
+    /// change feed is valid only when the enumeration runs to completion without throwing.</para>
     /// </summary>
     /// <param name="info">The resolved range to replay (from <see cref="LoadChangeFeedAsync"/>).</param>
     /// <param name="cancellationToken">Cancels the log reconstruction and per-file Parquet reads.</param>
