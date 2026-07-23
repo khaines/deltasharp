@@ -142,6 +142,15 @@ internal sealed class LocalFileSystemBackend : IStorageBackend, IDisposable
     /// the backend is not disposed, so a missed dispose leaks no descriptor.</summary>
     public void Dispose() => _rootHandle?.Dispose();
 
+    /// <summary>
+    /// The canonicalized (symlink-resolved) absolute table root — a STABLE, value-based identity for this
+    /// table. Two backends constructed over the same table root (e.g. a resolve-then-read pair spanning two
+    /// <see cref="DeltaSharp.Storage.Reading.DeltaReadSource"/> instances) share it, while different tables
+    /// differ. The CDF read door binds a resolution proof to this identity so the proof cannot replay on a
+    /// DIFFERENT table (which would bypass that table's enablement gate and stamp foreign timestamps).
+    /// </summary>
+    internal string TableRootId => _realRoot;
+
     /// <summary>The PVC/POSIX backend family — the <c>deltasharp.backend=pvc</c> telemetry identity.</summary>
     public StorageBackendKind Kind => StorageBackendKind.Pvc;
 

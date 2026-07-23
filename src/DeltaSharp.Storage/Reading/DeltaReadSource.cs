@@ -251,6 +251,11 @@ public sealed class DeltaReadSource : IDisposable
     /// <param name="info">The resolved range to replay (from <see cref="LoadChangeFeedAsync"/>).</param>
     /// <param name="cancellationToken">Cancels the log reconstruction and per-file Parquet reads.</param>
     /// <returns>The change rows as full-schema batches, in ascending commit order.</returns>
+    /// <exception cref="ArgumentException"><paramref name="info"/> was not obtained from
+    /// <see cref="LoadChangeFeedAsync"/> on THIS source — a manually-constructed or <c>default</c> info (no
+    /// resolution proof, so its range never passed resolve-time validation, including the §2.7 CDF-enablement
+    /// gate), or an info resolved by a DIFFERENT source/table (its validation and pinned timestamps do not
+    /// apply here). Rejected fail-closed BEFORE any batch is produced.</exception>
     /// <exception cref="DeltaReadException">A version's commit log or a required change/data file is no longer
     /// available (aged out / vacuumed between resolution and read), or a change-data file is inconsistent.</exception>
     /// <exception cref="DeltaReadSchemaEvolutionException">A cdc/data file is missing a REQUIRED (non-nullable)

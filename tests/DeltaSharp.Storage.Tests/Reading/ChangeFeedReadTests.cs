@@ -268,7 +268,7 @@ public sealed class ChangeFeedReadTests : IDisposable
         // v0/v1 and write a complete checkpoint@2 so the floor advances to 2. A read-time RE-derivation would
         // now restart the chain at the new floor ⇒ eff(2)=T, eff(3)=T+1 — DIFFERENT. The read must stamp the
         // PINNED values (T+2, T+3), proving it reads the pinned map, not a fresh listing. (A mutant ignoring
-        // DeltaChangeFeedInfo.PinnedCommitMillis re-derives T / T+1 ⇒ this test goes RED.)
+        // Resolution.CommitMillisByVersion re-derives T / T+1 ⇒ this test goes RED.)
         await CreateCdfFlatTableAsync(Batch((1, "a")));   // v0 create, v1 enable CDF
         await AppendFlatAsync(Batch((10, "x")));           // v2 (near-floor range start)
         await AppendFlatAsync(Batch((20, "y")));           // v3 (range end)
@@ -540,6 +540,57 @@ public sealed class ChangeFeedReadTests : IDisposable
         // (2) Forging (0,2,schema) and reading it must ALSO fail closed — the guard rejects the proofless info
         // BEFORE any I/O, so v0's CDF-off change row (the create's add of id 1) NEVER surfaces.
         await AssertForgedInfoFailsClosedAsync(source, forged);
+    }
+
+    [Fact]
+    public async Task ChangeFeedInfo_FromDifferentSource_FailsClosed()
+    {
+        // Security F-1 (defense-in-depth): the resolution proof binds to the SOURCE (table root), not just the
+        // range. An info resolved on source A must NOT replay on a DIFFERENT source B — else B's versions
+        // bypass B's OWN §2.7 enablement gate and get stamped with A's timestamps (a cross-table footgun).
+
+        // Source A (this._root): CDF ENABLED; resolve [2,2] → a proof bound to A's table root.
+        await CreateCdfFlatTableAsync(Batch((1, "a")));   // v0, v1 (CDF on)
+        await AppendFlatAsync(Batch((10, "x")));          // v2 implicit insert
+        DeltaChangeFeedInfo infoA;
+        using (DeltaReadSource sourceA = DeltaReadSource.ForLocalPath(_root))
+        {
+            infoA = await sourceA.LoadChangeFeedAsync(DeltaChangeFeedRange.FromVersion(2, 2), CancellationToken.None);
+        }
+
+        // Source B (a SECOND real table root): also has v0/v1/v2 with data (so a read of [2,2] would proceed),
+        // but CDF was NEVER enabled — so B's OWN LoadChangeFeedAsync would itself fail closed. Reading A's
+        // proof on B must NOT bypass that.
+        string rootB = Path.Combine(Path.GetTempPath(), "cdf-read-other-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(rootB))
+            {
+                await target.CreateDeletionVectorTableAsync(FlatSchema, Array.Empty<string>(), new[] { Batch((1, "a")) });
+            }
+
+            using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(rootB))
+            {
+                await target.AppendAsync(FlatSchema, Array.Empty<string>(), new[] { Batch((2, "b")) });   // v1
+            }
+
+            using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(rootB))
+            {
+                await target.AppendAsync(FlatSchema, Array.Empty<string>(), new[] { Batch((3, "c")) });   // v2
+            }
+
+            // Handing A's proof to B fails closed: the read door re-checks the bound source identity and
+            // rejects the cross-source info BEFORE any I/O, so NO B row surfaces under A's proof.
+            using DeltaReadSource sourceB = DeltaReadSource.ForLocalPath(rootB);
+            await AssertForgedInfoFailsClosedAsync(sourceB, infoA, "different source");
+        }
+        finally
+        {
+            if (Directory.Exists(rootB))
+            {
+                Directory.Delete(rootB, recursive: true);
+            }
+        }
     }
 
     // ---------------------------------------------------------------- mixed explicit + implicit, ascending
@@ -1179,10 +1230,11 @@ public sealed class ChangeFeedReadTests : IDisposable
         return (info, batches);
     }
 
-    // Asserts a forged/unvalidated info (no resolution proof) is rejected fail-closed by the read door: the
-    // classified ArgumentException (param `info`, naming LoadChangeFeedAsync) surfaces WITHOUT any batch being
-    // yielded — so a manually-constructed info can never surface change rows from an unvalidated range.
-    private static async Task AssertForgedInfoFailsClosedAsync(DeltaReadSource source, DeltaChangeFeedInfo forged)
+    // Asserts a forged/unvalidated/cross-source info is rejected fail-closed by the read door: the classified
+    // ArgumentException (param `info`, its message containing <paramref name="expectedMessageSubstring"/>)
+    // surfaces WITHOUT any batch being yielded — so such an info can never surface change rows.
+    private static async Task AssertForgedInfoFailsClosedAsync(
+        DeltaReadSource source, DeltaChangeFeedInfo forged, string expectedMessageSubstring = "LoadChangeFeedAsync")
     {
         int yielded = 0;
         ArgumentException ex = await Assert.ThrowsAsync<ArgumentException>(async () =>
@@ -1194,7 +1246,7 @@ public sealed class ChangeFeedReadTests : IDisposable
         });
 
         Assert.Equal("info", ex.ParamName);
-        Assert.Contains("LoadChangeFeedAsync", ex.Message);
+        Assert.Contains(expectedMessageSubstring, ex.Message);
         Assert.Equal(0, yielded);   // fail-closed BEFORE any batch is produced
     }
 

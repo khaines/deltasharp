@@ -205,11 +205,13 @@ internal sealed class ChangeFeedReader
 
         // Stamp the non-forgeable resolution proof: it is the evidence that this info passed the full
         // resolve-time validation above (bounds, availability, and the §2.7 CDF-enablement gate) and carries
-        // the pinned timeline. ReadAsync REQUIRES it, so ONLY a LoadChangeFeedAsync-produced info can be read;
-        // a forged/`default` info (no proof) fails closed there instead of surfacing an unvalidated range.
+        // the pinned timeline. It is bound to THIS source (`_backend.TableRootId`) so it cannot replay on a
+        // different table. ReadAsync REQUIRES it, so ONLY a LoadChangeFeedAsync-produced info for THIS source
+        // can be read; a forged/`default`/cross-source info fails closed instead of surfacing an unvalidated
+        // range.
         return new DeltaChangeFeedInfo(startVersion, endVersion, outputSchema)
         {
-            Resolution = new ChangeFeedResolution(pinnedMillis.ToImmutable()),
+            Resolution = new ChangeFeedResolution(_backend.TableRootId, pinnedMillis.ToImmutable()),
         };
     }
 
@@ -220,10 +222,11 @@ internal sealed class ChangeFeedReader
     /// stamping, and one-version-per-batch (INV C8) contract.
     /// </summary>
     /// <exception cref="ArgumentException"><paramref name="info"/> was not obtained from
-    /// <see cref="DeltaReadSource.LoadChangeFeedAsync"/> (a manually-constructed or <c>default</c> info): it
-    /// carries no resolution proof, so its range never passed resolve-time validation (bounds, availability,
-    /// and the §2.7 CDF-enablement gate). Rejected fail-closed BEFORE any I/O so a forged info can never
-    /// surface change rows from an unvalidated range.</exception>
+    /// <see cref="DeltaReadSource.LoadChangeFeedAsync"/> on THIS source — either a manually-constructed or
+    /// <c>default</c> info (no resolution proof, so its range never passed resolve-time validation: bounds,
+    /// availability, and the §2.7 CDF-enablement gate), or an info resolved by a DIFFERENT source/table
+    /// (its validation and pinned timestamps do not apply here). Rejected fail-closed BEFORE any I/O so a
+    /// forged or cross-source info can never surface change rows from an unvalidated range.</exception>
     /// <exception cref="DeltaReadException">A version's commit log or a required change/data file is no longer
     /// available (aged out / vacuumed between resolution and read), or a change-data file is inconsistent.</exception>
     /// <exception cref="DeltaReadSchemaEvolutionException">A cdc/data file is missing a REQUIRED (non-nullable)
@@ -243,6 +246,18 @@ internal sealed class ChangeFeedReader
             throw new ArgumentException(
                 "DeltaChangeFeedInfo must be obtained from LoadChangeFeedAsync; a manually-constructed info "
                 + "bypasses range and CDF-enablement validation.", nameof(info));
+        }
+
+        // Defense-in-depth (Security F-1): the proof is bound to the SOURCE that minted it, not just to a
+        // range. An info resolved on source A carries A's validation + A's pinned timestamps; replaying it on
+        // a DIFFERENT source B would bypass B's own §2.7 enablement gate and stamp B's rows with A's
+        // timestamps (a cross-table footgun). Reject when the bound source identity differs from this one.
+        if (!string.Equals(resolution.SourceId, _backend.TableRootId, StringComparison.Ordinal))
+        {
+            throw new ArgumentException(
+                "DeltaChangeFeedInfo must be read by the same DeltaReadSource that resolved it (via "
+                + "LoadChangeFeedAsync); this info was produced by a different source, so its range / "
+                + "CDF-enablement validation and pinned timestamps do not apply to this table.", nameof(info));
         }
 
         return ReadCoreAsync(info, resolution, cancellationToken);
