@@ -310,6 +310,41 @@ public sealed class ParquetCorruptionTests
     }
 
     [Fact]
+    public void IsUndecodableParquetInput_FailsClosedOnUnboundedLibraryFaults()
+    {
+        // §5.4 C-DECODE / #193 increment 4: at the two decode boundaries where Parquet.Net consumes UNTRUSTED
+        // bytes (OpenAsync footer parse, ReadRowGroupAsync page/level decode) the library empirically raises an
+        // UNBOUNDED set of raw BCL types on a malformed file (the CDF cdc-file fuzz drove all of the below),
+        // so the boundary must fail closed on every fault EXCEPT cooperative cancellation and DeltaSharp's own
+        // typed storage exception. This predicate is the fail-closed SUPERSET of IsParquetDefect.
+
+        // (1) The broad BCL family IsParquetDefect deliberately EXCLUDES — the fuzz proved the library decoder
+        // raises these on corrupt data, so the boundary MUST still fail closed on them.
+        Assert.True(ParquetFileReader.IsUndecodableParquetInput(new IndexOutOfRangeException()));
+        Assert.True(ParquetFileReader.IsUndecodableParquetInput(new ArgumentException()));
+        Assert.True(ParquetFileReader.IsUndecodableParquetInput(new ArgumentOutOfRangeException()));
+        Assert.True(ParquetFileReader.IsUndecodableParquetInput(new InvalidOperationException()));
+        Assert.True(ParquetFileReader.IsUndecodableParquetInput(new NotSupportedException()));
+        Assert.True(ParquetFileReader.IsUndecodableParquetInput(new FormatException()));
+        Assert.True(ParquetFileReader.IsUndecodableParquetInput(new NullReferenceException()));
+
+        // (2) Superset property: every type IsParquetDefect matches is also undecodable input here.
+        Assert.True(ParquetFileReader.IsUndecodableParquetInput(new OutOfMemoryException()));
+        Assert.True(ParquetFileReader.IsUndecodableParquetInput(new OverflowException()));
+        Assert.True(ParquetFileReader.IsUndecodableParquetInput(new IOException()));
+        Assert.True(ParquetFileReader.IsUndecodableParquetInput(new EndOfStreamException()));
+
+        // (3) Cooperative cancellation is control flow — it must PROPAGATE, never be masked as corruption.
+        Assert.False(ParquetFileReader.IsUndecodableParquetInput(new OperationCanceledException()));
+        Assert.False(ParquetFileReader.IsUndecodableParquetInput(new TaskCanceledException()));
+
+        // (4) DeltaSharp's OWN typed fail-closed signal must propagate UNWRAPPED — an unsupported but VALID
+        // feature stays UnsupportedFeature, and an inner CorruptData is not re-masked.
+        Assert.False(ParquetFileReader.IsUndecodableParquetInput(DeltaStorageException.UnsupportedFeature("x")));
+        Assert.False(ParquetFileReader.IsUndecodableParquetInput(DeltaStorageException.CorruptData("x")));
+    }
+
+    [Fact]
     public async Task LegitimateCompressibleFile_RoundTripsThroughReadAsync()
     {
         // A constant bool column and an all-null long column filling a full default row group (131072
