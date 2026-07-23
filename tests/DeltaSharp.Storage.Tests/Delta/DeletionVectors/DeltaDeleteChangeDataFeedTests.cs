@@ -438,6 +438,113 @@ public sealed class DeltaDeleteChangeDataFeedTests : IDisposable
         }));
     }
 
+    // ---------------------------------------------------------------- fail-closed: reserved CDF column name (#642)
+
+    [Fact]
+    public void EnsureNoReservedColumnNames_RejectsEachReservedCdfName_CaseInsensitive_FailsClosed()
+    {
+        // Delta reserves the three CDF metadata column names (§2.4): `_change_type`, `_commit_version`,
+        // `_commit_timestamp`. A CDF-enabled table must declare NONE of them as a user column — in none mode a
+        // `_change_type` data column collides with the synthesized cdc column (an ambiguous footer the read
+        // door cannot disambiguate), and in ANY mode a case-insensitive reader (Spark) rejects the reserved
+        // logical name. The check is case-INsensitive (matching DeltaSharp's #572 all-mode column policy), so
+        // a case variant (`_Change_Type`) is rejected too.
+        foreach (string reserved in new[]
+        {
+            ChangeDataWriter.ChangeTypeColumn, ChangeDataWriter.CommitVersionColumn,
+            ChangeDataWriter.CommitTimestampColumn, "_Change_Type", "_COMMIT_VERSION", "_Commit_Timestamp",
+        })
+        {
+            var schema = new StructType(new[]
+            {
+                new StructField("id", DataTypes.LongType, nullable: false),
+                new StructField(reserved, DataTypes.StringType, nullable: true),
+            });
+            DeltaStorageException ex = Assert.Throws<DeltaStorageException>(
+                () => ChangeDataWriter.EnsureNoReservedColumnNames(schema));
+            Assert.Contains("reserved", ex.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("Change Data Feed", ex.Message, StringComparison.Ordinal);
+        }
+
+        // A schema with no reserved name passes (no throw) — including columns whose names merely CONTAIN a
+        // reserved token without the leading underscore (`change_type`/`commit_version` are normal columns).
+        ChangeDataWriter.EnsureNoReservedColumnNames(new StructType(new[]
+        {
+            new StructField("id", DataTypes.LongType, nullable: false),
+            new StructField("change_type", DataTypes.StringType, nullable: true),
+            new StructField("commit_version", DataTypes.LongType, nullable: true),
+        }));
+    }
+
+    [Fact]
+    public async Task Enable_OnTableWithReservedCdfColumn_FailsClosedAndDoesNotEnable()
+    {
+        // The enable-time guard (#642): enabling CDF on a table whose schema ALREADY declares a reserved CDF
+        // metadata column (`_change_type`) fails closed BEFORE the enablement commit, so such a table can
+        // never enter the CDF-enabled state (a later DELETE would otherwise author an ambiguous cdc footer).
+        var schema = new StructType(new[]
+        {
+            new StructField("id", DataTypes.LongType, nullable: false),
+            new StructField(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: true),
+        });
+        await CreateDvTableWithSchemaAsync(schema, IdPlusStringBatch(schema, (1L, "a"), (2L, "b")));
+        var backend = new LocalFileSystemBackend(_root);
+        long before = (await new DeltaLog(backend).LoadSnapshotAsync()).Version;
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new DeltaTableWriter(backend).EnableChangeDataFeedAsync());
+        Assert.Contains(ChangeDataWriter.ChangeTypeColumn, ex.Message, StringComparison.Ordinal);
+
+        // Fail-closed: no enablement commit was written, and the reloaded table is NOT CDF-enabled.
+        Snapshot after = await new DeltaLog(backend).LoadSnapshotAsync();
+        Assert.Equal(before, after.Version);
+        Assert.False(ChangeDataFeedFeature.IsEnabled(after.Metadata.Configuration));
+    }
+
+    [Fact]
+    public async Task Delete_CdfEnabled_ReservedColumnAddedByEvolution_FailsClosedBeforeSideEffect()
+    {
+        // The DELETE-time guard (#642): a reserved CDF column can appear AFTER CDF is enabled, via schema
+        // evolution — the enable-time guard cannot see a later column. A DELETE on such a table fails closed
+        // at the CDF gate BEFORE any side effect (no cdc file, no DV file, no commit), never authoring an
+        // ambiguous cdc footer.
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b"), (3, "c")));   // clean (id,name) → enable passes
+        var backend = new LocalFileSystemBackend(_root);
+
+        // Evolve the schema to ADD a reserved `_change_type` column (mergeSchema). The committer does not
+        // reject reserved names (that is exactly the gap #642 closes at enable/DELETE, not at commit), so this
+        // append commits and leaves the table CDF-enabled WITH a `_change_type` LOGICAL column.
+        var evolved = new StructType(new[]
+        {
+            new StructField("id", DataTypes.LongType, nullable: false),
+            new StructField("name", DataTypes.StringType, nullable: true),
+            new StructField(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: true),
+        });
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(_root))
+        {
+            await target.AppendAsync(
+                evolved, Array.Empty<string>(), new[] { FlatPlusChangeTypeBatch(evolved, (4L, "d", "x")) },
+                mergeSchema: true);
+        }
+
+        // Sanity: the setup produced a CDF-enabled table that carries the reserved column.
+        Snapshot snapshot = await new DeltaLog(backend).LoadSnapshotAsync();
+        Assert.True(ChangeDataFeedFeature.IsEnabled(snapshot.Metadata.Configuration));
+        Assert.Contains(snapshot.Schema, f => f.Name == ChangeDataWriter.ChangeTypeColumn);
+        long before = snapshot.Version;
+
+        // ThrowingCdcTokens ensures that IF generation ever reached the cdc write it would throw a DIFFERENT
+        // exception — so the reserved-name DeltaStorageException proves the gate fired FIRST, before any cdc
+        // naming or write.
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => NewCdfDelete(backend, "reserved-del", ThrowingCdcTokens()).DeleteAsync(WhereId(_ => true)));
+        Assert.Contains(ChangeDataWriter.ChangeTypeColumn, ex.Message, StringComparison.Ordinal);
+
+        // Fail-closed BEFORE any side effect: no cdc file on disk, and no DELETE commit (version unchanged).
+        Assert.Empty(CdcFilePaths());
+        Assert.Equal(before, (await new DeltaLog(backend).LoadSnapshotAsync()).Version);
+    }
+
     // ------------------------------------------------------------------ helpers
 
     private DeltaDelete NewCdfDelete(LocalFileSystemBackend backend, string idSeed, Func<string> cdcFileNameFactory) =>
@@ -472,6 +579,15 @@ public sealed class DeltaDeleteChangeDataFeedTests : IDisposable
     {
         using DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(_root);
         await target.CreateDeletionVectorTableAsync(FlatSchema, Array.Empty<string>(), batches);
+    }
+
+    // Creates a DV-enabled table under an ARBITRARY (e.g. reserved-name-carrying) schema — the create path
+    // has no reserved-name guard (#642 guards enable + DELETE), so this stages the "already has a reserved
+    // column" state the enable-time guard must then reject.
+    private async Task CreateDvTableWithSchemaAsync(StructType schema, params ColumnBatch[] batches)
+    {
+        using DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(_root);
+        await target.CreateDeletionVectorTableAsync(schema, Array.Empty<string>(), batches);
     }
 
     private async Task CreateCdfPartitionedTableAsync(params ColumnBatch[] batches)
@@ -665,5 +781,57 @@ public sealed class DeltaDeleteChangeDataFeedTests : IDisposable
         }
 
         return new ManagedColumnBatch(PartitionedSchema, new ColumnVector[] { id, region, val }, rows.Length);
+    }
+
+    // A (id:long non-null, <string?>) batch conforming to a 2-column schema — used to stage a reserved-name
+    // table for the enable-time guard test (#642).
+    private static ColumnBatch IdPlusStringBatch(StructType schema, params (long Id, string? Value)[] rows)
+    {
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, rows.Length);
+        MutableColumnVector value = ColumnVectors.Create(DataTypes.StringType, rows.Length);
+        foreach ((long i, string? v) in rows)
+        {
+            id.AppendValue(i);
+            if (v is null)
+            {
+                value.AppendNull();
+            }
+            else
+            {
+                value.AppendBytes(Encoding.UTF8.GetBytes(v));
+            }
+        }
+
+        return new ManagedColumnBatch(schema, new ColumnVector[] { id, value }, rows.Length);
+    }
+
+    // A (id:long non-null, name:string?, _change_type:string?) batch — used to schema-EVOLVE a reserved
+    // `_change_type` column onto a CDF-enabled table for the DELETE-time guard test (#642).
+    private static ColumnBatch FlatPlusChangeTypeBatch(
+        StructType schema, params (long Id, string? Name, string? ChangeType)[] rows)
+    {
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, rows.Length);
+        MutableColumnVector name = ColumnVectors.Create(DataTypes.StringType, rows.Length);
+        MutableColumnVector changeType = ColumnVectors.Create(DataTypes.StringType, rows.Length);
+        foreach ((long i, string? n, string? ct) in rows)
+        {
+            id.AppendValue(i);
+            AppendNullableString(name, n);
+            AppendNullableString(changeType, ct);
+        }
+
+        return new ManagedColumnBatch(schema, new ColumnVector[] { id, name, changeType }, rows.Length);
+    }
+
+    private static void AppendNullableString(MutableColumnVector vector, string? value)
+    {
+        if (value is null)
+        {
+            vector.AppendNull();
+        }
+        else
+        {
+            vector.AppendBytes(Encoding.UTF8.GetBytes(value));
+        }
     }
 }

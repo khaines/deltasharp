@@ -845,6 +845,14 @@ internal sealed class DeltaTableWriter
     {
         Snapshot snapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
 
+        // Reserved-name guard (#642): reject a schema that declares a reserved Change Data Feed metadata
+        // column name (`_change_type`/`_commit_version`/`_commit_timestamp`) BEFORE enabling — fail closed and
+        // early so a table whose schema would produce an ambiguous cdc footer (a data column named
+        // `_change_type` in none mode) can never enter the CDF-enabled state. Checked over the LOGICAL schema
+        // (all modes, all columns). The symmetric DELETE-time guard covers a reserved column added by schema
+        // evolution AFTER this point.
+        ChangeDataWriter.EnsureNoReservedColumnNames(snapshot.Schema);
+
         // Idempotent: CDF is active only when the feature is enumerated in writerFeatures AND the property is
         // set (both are required — the protocol only honors the property when the feature is present).
         bool featurePresent = !snapshot.Protocol.WriterFeatures.IsDefault

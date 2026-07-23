@@ -270,12 +270,18 @@ internal sealed class DeltaDelete
         // delta.enableChangeDataFeed=true; ALL new behavior is gated on this, so a CDF-disabled DELETE is
         // byte-identical to before (INV C1 — no cdc rows captured, no cdc files, no cdc actions). When
         // enabled, EVERY affected file's newly-deleted rows are materialized as a cdc file in the SAME commit
-        // (completeness, INV C2/C3). Fail closed EARLY (before any DV/cdc side effect) if the physical data
-        // schema carries a nested column cdc generation cannot write, so we never publish an incomplete cdc
-        // set that read-time precedence would make silently lossy.
+        // (completeness, INV C2/C3). Fail closed EARLY (before any DV/cdc side effect) on a schema cdc
+        // generation cannot support: (a) a reserved CDF metadata column name (`_change_type` etc.) the enable
+        // guard could not see because it was added by schema evolution AFTER CDF was enabled — a `_change_type`
+        // data column would collide with the synthesized cdc column and yield an ambiguous footer (#642); or
+        // (b) a nested data column the selection-gather + scalar Parquet writer cannot materialize — so we
+        // never publish an incomplete cdc set that read-time precedence would make silently lossy.
         bool changeDataFeedEnabled = ChangeDataFeedFeature.IsEnabled(readSnapshot.Metadata.Configuration);
         if (changeDataFeedEnabled)
         {
+            // The reserved-name check runs over the LOGICAL schema (covers all mapping modes: in none mode
+            // the collision is literal; in name/id mode the logical name is still reserved).
+            ChangeDataWriter.EnsureNoReservedColumnNames(tableSchema);
             ChangeDataWriter.EnsureWritableDataSchema(dataSchema);
         }
 

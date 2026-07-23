@@ -1,3 +1,4 @@
+using System.Collections.Frozen;
 using System.Globalization;
 using System.Security.Cryptography;
 using DeltaSharp.Engine.Columnar;
@@ -43,10 +44,27 @@ internal sealed class ChangeDataWriter
     /// non-null and — being engine-synthesized — is NEVER column-mapped (§2.4).</summary>
     public const string ChangeTypeColumn = "_change_type";
 
+    /// <summary>The read-time-stamped commit-version metadata column (§2.4). It is NEVER materialized in a cdc
+    /// body (it is constant per version and stamped at read time), but Delta reserves the name so a user data
+    /// column cannot shadow it — see <see cref="EnsureNoReservedColumnNames"/>.</summary>
+    public const string CommitVersionColumn = "_commit_version";
+
+    /// <summary>The read-time-stamped commit-timestamp metadata column (§2.4). Like
+    /// <see cref="CommitVersionColumn"/>, never materialized in a cdc body but a reserved name.</summary>
+    public const string CommitTimestampColumn = "_commit_timestamp";
+
     /// <summary>The <c>_change_type</c> value for a row deleted by a merge-on-read DELETE (§2.5). The
     /// <c>insert</c>/<c>update_preimage</c>/<c>update_postimage</c> values are re-added by the increment that
     /// consumes each (read door / #637); this generation increment materializes only deletes.</summary>
     public const string DeleteChange = "delete";
+
+    // The three Change Data Feed metadata column names Delta reserves (§2.4). Membership is tested
+    // case-INsensitively (OrdinalIgnoreCase), consistent with DeltaSharp's all-mode case-insensitive
+    // column-name uniqueness policy (#572) and Spark's default resolver — so `_Change_Type` is rejected as
+    // well as `_change_type`. Retrieval yields the canonical stored spelling for a precise error message.
+    private static readonly FrozenSet<string> ReservedColumnNames =
+        new[] { ChangeTypeColumn, CommitVersionColumn, CommitTimestampColumn }
+            .ToFrozenSet(StringComparer.OrdinalIgnoreCase);
 
     private readonly IStorageBackend _backend;
     private readonly ParquetFileWriter _writer;
@@ -65,6 +83,42 @@ internal sealed class ChangeDataWriter
     /// OPTIMIZE naming seams so two concurrent writers never collide on a cdc path while a deterministic
     /// factory can be injected in tests.</summary>
     internal static string DefaultFileNameFactory() => Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
+
+    /// <summary>
+    /// Rejects a table schema that declares any Change Data Feed metadata column name
+    /// (<see cref="ChangeTypeColumn"/> / <see cref="CommitVersionColumn"/> /
+    /// <see cref="CommitTimestampColumn"/>) as a user column — Delta's reserved-name rule (#642). In
+    /// <c>none</c> mode a data column literally named <c>_change_type</c> has physical name <c>_change_type</c>,
+    /// so a cdc body would carry TWO <c>_change_type</c> fields — an ambiguous Parquet footer the read door
+    /// (#637) cannot disambiguate. Even in <c>name</c>/<c>id</c> mode (physical name <c>col-&lt;uuid&gt;</c>, so
+    /// no literal footer collision) the LOGICAL name is reserved and a case-insensitive reader (Spark) rejects
+    /// the table, so DeltaSharp must not author one. Runs over the LOGICAL schema (every column — a partition
+    /// column too) at BOTH enable time (fail early, before CDF can be turned on) AND the DELETE cdc gate
+    /// (catches a reserved column added by schema evolution AFTER CDF was enabled, which the enable-time guard
+    /// cannot see). Compared case-insensitively (#572 policy). O(fields).
+    /// </summary>
+    /// <exception cref="DeltaStorageException">A column name equals a reserved CDF metadata column name
+    /// (case-insensitive) — <see cref="StorageErrorKind.UnsupportedFeature"/>.</exception>
+    public static void EnsureNoReservedColumnNames(StructType schema)
+    {
+        ArgumentNullException.ThrowIfNull(schema);
+        for (int i = 0; i < schema.Count; i++)
+        {
+            string name = schema[i].Name;
+            if (ReservedColumnNames.TryGetValue(name, out string? reserved))
+            {
+                throw DeltaStorageException.UnsupportedFeature(
+                    string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"Column '{name}' uses the reserved Change Data Feed metadata column name '{reserved}': a "
+                        + $"CDF-enabled table must not declare a data or partition column named "
+                        + $"'{ChangeTypeColumn}', '{CommitVersionColumn}', or '{CommitTimestampColumn}' (Delta's "
+                        + $"reserved-name rule). In none mode such a column collides with the synthesized cdc "
+                        + $"'{ChangeTypeColumn}' field and yields an ambiguous change-data file; Change Data Feed "
+                        + $"fails closed rather than author it."));
+            }
+        }
+    }
 
     /// <summary>
     /// Validates that <paramref name="dataSchema"/> — the physical data schema (partition columns already
