@@ -116,6 +116,31 @@ public sealed class ParquetCorruptionTests
     }
 
     [Fact]
+    public async Task GetRowCount_OnOverflowingRowGroupCounts_FailsClosedNotRawOverflow()
+    {
+        // Red-team HIGH (a FOURTH untrusted-byte decode site): GetRowCountAsync sums attacker-controlled footer
+        // NumRows via checked(total + rows). A crafted file whose per-row-group counts sum past long.MaxValue
+        // raises a raw OverflowException that USED TO escape — this metadata-only entry point had NO fail-closed
+        // try, unlike ReadRowGroupAsync. It must now map to a deterministic CorruptData (storage-delta-
+        // architecture.md §5.4 C-DECODE / ADR-0013). Regression check: removing the wrap makes THIS test throw a
+        // raw OverflowException instead of DeltaStorageException.
+        var schema = new StructType(new[] { KeepField });
+        // Two row groups (6 rows, limit 3). GetRowCountAsync reads ONLY the footer NumRows, so the physical data
+        // pages are irrelevant — forge EACH group's declared NumRows to long.MaxValue so their checked sum
+        // (long.MaxValue + long.MaxValue) overflows on the second iteration.
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3, 100, 101, 102 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch }, rowGroupRowLimit: 3);
+        byte[] forged =
+            await ParquetTestHelpers.ForgeRowGroupNumRowsAsync(file, rowGroup: 0, forgedNumRows: long.MaxValue);
+        forged = await ParquetTestHelpers.ForgeRowGroupNumRowsAsync(forged, rowGroup: 1, forgedNumRows: long.MaxValue);
+
+        using var stream = new MemoryStream(forged, writable: false);
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new ParquetFileReader().GetRowCountAsync(stream, CancellationToken.None));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+    }
+
+    [Fact]
     public async Task MidStreamCorruption_YieldsCompleteEarlierBatchThenDeterministicError()
     {
         var schema = new StructType(new[] { KeepField });

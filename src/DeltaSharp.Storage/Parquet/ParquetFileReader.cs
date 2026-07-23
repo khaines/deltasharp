@@ -243,22 +243,48 @@ internal sealed class ParquetFileReader
         ParquetReader reader = await OpenAsync(input, cancellationToken).ConfigureAwait(false);
         await using (reader.ConfigureAwait(false))
         {
-            long total = 0;
-            for (int group = 0; group < reader.RowGroupCount; group++)
+            // Fail-closed row-group-count boundary (storage-delta-architecture.md §5.4 C-DECODE / ADR-0013).
+            // The summation reads attacker-controlled footer NumRows fields, so a crafted file whose per-group
+            // row counts sum past long.MaxValue raises a raw OverflowException from checked(total + rows). This
+            // metadata-only entry point must fail closed like ReadRowGroupAsync: map every library fault (from
+            // the summation, OpenRowGroupReader, or RowCount on a crafted footer) to the deterministic
+            // CorruptData contract. The typed negative-count CorruptData (a DeltaStorageException) and
+            // cooperative cancellation (an OperationCanceledException) are both EXCLUDED by the predicates below,
+            // so they still propagate UNWRAPPED (never double-mapped, cancellation still wins).
+            try
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                using ParquetRowGroupReader rowGroup = reader.OpenRowGroupReader(group);
-                long rows = rowGroup.RowCount;
-                if (rows < 0)
+                long total = 0;
+                for (int group = 0; group < reader.RowGroupCount; group++)
                 {
-                    throw DeltaStorageException.CorruptData(
-                        $"Row group {group} declares a negative row count ({rows}).");
+                    cancellationToken.ThrowIfCancellationRequested();
+                    using ParquetRowGroupReader rowGroup = reader.OpenRowGroupReader(group);
+                    long rows = rowGroup.RowCount;
+                    if (rows < 0)
+                    {
+                        throw DeltaStorageException.CorruptData(
+                            $"Row group {group} declares a negative row count ({rows}).");
+                    }
+
+                    total = checked(total + rows);
                 }
 
-                total = checked(total + rows);
+                return total;
             }
-
-            return total;
+            catch (Exception ex) when (IsParquetDefect(ex))
+            {
+                // Expected family: checked(total + rows) over attacker-controlled footer NumRows fields raises
+                // OverflowException (which IsParquetDefect lists) when they sum past long.MaxValue. Fixed
+                // message (no ex.Message) so no footer content echoes into the error text (info-leak posture).
+                throw DeltaStorageException.CorruptData(
+                    "Parquet footer declares an implausible total row count (row-group counts overflow).", ex);
+            }
+            catch (Exception ex) when (IsUndecodableParquetInput(ex))
+            {
+                // Superset fallback for any other raw library fault from OpenRowGroupReader / RowCount on a
+                // crafted footer, so this metadata-only entry point can never leak a raw BCL exception.
+                throw DeltaStorageException.CorruptData(
+                    "Parquet footer row-group metadata is malformed.", ex);
+            }
         }
     }
 
@@ -1356,13 +1382,14 @@ internal sealed class ParquetFileReader
     // InvalidOperationException, NotSupportedException, and a footer-parse NullReferenceException; a crafted
     // footer stats blob drives ArgumentException/InvalidDataException on the pruning path). A whitelist cannot
     // enumerate an unbounded set, so at the boundaries where Parquet.Net consumes UNTRUSTED bytes — OpenAsync
-    // (footer parse) and ReadRowGroupAsync (which spans BOTH the row-group prologue: statistics/pruning +
-    // chunk footprints, AND the per-column page/level decode) — the fail-closed SUPERSET
-    // IsUndecodableParquetInput maps every remaining library fault to CorruptData; see those catches and
-    // IsUndecodableParquetInput for why every exception there is a library decode fault and not our own bug.
-    // IsParquetDefect is retained as the informative first catch (and for the ADR-0013 eager-allocation
-    // OOM/Overflow mapping). One further site-specific map: ArgumentOutOfRangeException in ReadValueAsync
-    // (out-of-range DATE/TIMESTAMP).
+    // (footer parse), GetRowCountAsync (the checked row-group-count summation over footer NumRows fields), and
+    // ReadRowGroupAsync (which spans BOTH the row-group prologue: statistics/pruning + chunk footprints, AND
+    // the per-column page/level decode) — the fail-closed SUPERSET IsUndecodableParquetInput maps every
+    // remaining library fault to CorruptData; see those catches and IsUndecodableParquetInput for why every
+    // exception there is a library decode fault and not our own bug. IsParquetDefect is retained as the
+    // informative first catch (and for the ADR-0013 eager-allocation OOM/Overflow mapping; the same Overflow
+    // entry also covers the GetRowCountAsync summation past long.MaxValue). One further site-specific map:
+    // ArgumentOutOfRangeException in ReadValueAsync (out-of-range DATE/TIMESTAMP).
     internal static bool IsParquetDefect(Exception ex) => ex is
         IOException or
         InvalidDataException or
@@ -1372,13 +1399,14 @@ internal sealed class ParquetFileReader
         global::Parquet.ParquetException or
         global::Parquet.Meta.Proto.ThriftProtocolException;
 
-    // The fail-closed decode-boundary SUPERSET (storage-delta-architecture.md §5.4 C-DECODE / ADR-0013) used
-    // where Parquet.Net decodes UNTRUSTED bytes at all THREE sites: OpenAsync (footer parse), ReadRowGroupAsync's
-    // row-group prologue (statistics/pruning + chunk footprints), and ReadRowGroupAsync's page/level decode.
-    // Because Parquet.Net's decoder raises an unbounded set of raw BCL exception types on a malformed file (and
-    // an eager stats decode on the predicate-pushdown pruning path the CDF door never exercises), the boundary
-    // must map
-    // EVERYTHING to a deterministic CorruptData EXCEPT: (a) OperationCanceledException — cooperative
+    // The fail-closed decode-boundary SUPERSET (storage-delta-architecture.md §5.4 C-DECODE / ADR-0013) used at
+    // EVERY read entry point that consumes UNTRUSTED footer/row-group/page bytes: OpenAsync (footer parse);
+    // GetRowCountAsync (the checked row-group-count summation over attacker-controlled footer NumRows fields);
+    // ReadRowGroupAsync's row-group prologue (statistics/pruning + chunk footprints); and ReadRowGroupAsync's
+    // page/level decode. Because Parquet.Net's decoder raises an unbounded set of raw BCL exception types on a
+    // malformed file (and an eager stats decode on the predicate-pushdown pruning path the CDF door never
+    // exercises), the boundary must map EVERYTHING to a deterministic CorruptData EXCEPT: (a)
+    // OperationCanceledException — cooperative
     // cancellation is control flow and must propagate; and (b) DeltaStorageException — DeltaSharp's OWN typed
     // fail-closed signal (e.g. UnsupportedFeature for a genuinely unsupported but VALID feature, or a
     // CorruptData already mapped at an inner site such as ReadValueAsync), which must propagate UNWRAPPED
