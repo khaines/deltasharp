@@ -81,6 +81,41 @@ public sealed class ParquetCorruptionTests
     }
 
     [Fact]
+    public async Task RowGroupPruning_OnCorruptColumnStatistics_FailsClosedNotRawBcl()
+    {
+        // Council R1 Security HIGH: the row-group-statistics decode is an UNTRUSTED-byte boundary. A valid
+        // Parquet file whose footer column-statistics blob is corrupt (a too-short MaxValue) OPENS cleanly, but
+        // Parquet.Net's eager typed min/max decode throws a raw ArgumentException while reading it. On the
+        // predicate-pushdown pruning path that decode is reached by RowGroupStatistics.GetStatistics — and that
+        // prologue used to run OUTSIDE ReadRowGroupAsync's fail-closed try, so a NON-NULL keepRowGroup read
+        // LEAKED the raw BCL exception (Security probe: CONSTRUCT-ONLY rawEscapes=1). It must now map to a
+        // deterministic CorruptData (storage-delta-architecture.md §5.4 C-DECODE / ADR-0013; PDX-T lying stats).
+        // Regression check: reverting the prologue wrap makes the NON-NULL-predicate assertion below go RED.
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3, 4, 5 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] corruptStats =
+            await ParquetTestHelpers.ForgeShortColumnStatisticsAsync(file, rowGroup: 0, columnIndex: 0);
+
+        // A NON-NULL pruning predicate forces the RowGroupStatistics construction that decodes the corrupt blob;
+        // the raw ArgumentException must surface as a deterministic CorruptData, never escape raw to the caller.
+        DeltaStorageException pruning = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(
+                corruptStats, schema, keepRowGroup: stats => stats.Max("keep") is long max && max >= 0));
+        Assert.Equal(StorageErrorKind.CorruptData, pruning.Kind);
+
+        // Control (the CDF door path, keepRowGroup:null): SKIPS RowGroupStatistics — but Parquet.Net ALSO reads
+        // the same column statistics WITHIN the normal column read (ReadColumnStatistics under ReadAsync<T>), so
+        // this file fails closed here TOO. Crucially that data-read decode was ALWAYS inside the fail-closed try,
+        // so the door NEVER leaked raw (Security probe: NO-PREDICATE rawEscapes=0) — it maps to CorruptData, not
+        // an ArgumentException. So the ONLY pre-fix gap was the pruning-path construction (isolated by the
+        // regression check). Both untrusted-stats-decode paths must now yield the SAME deterministic contract.
+        DeltaStorageException door = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(corruptStats, schema));
+        Assert.Equal(StorageErrorKind.CorruptData, door.Kind);
+    }
+
+    [Fact]
     public async Task MidStreamCorruption_YieldsCompleteEarlierBatchThenDeterministicError()
     {
         var schema = new StructType(new[] { KeepField });
@@ -312,9 +347,10 @@ public sealed class ParquetCorruptionTests
     [Fact]
     public void IsUndecodableParquetInput_FailsClosedOnUnboundedLibraryFaults()
     {
-        // §5.4 C-DECODE / #193 increment 4: at the two decode boundaries where Parquet.Net consumes UNTRUSTED
-        // bytes (OpenAsync footer parse, ReadRowGroupAsync page/level decode) the library empirically raises an
-        // UNBOUNDED set of raw BCL types on a malformed file (the CDF cdc-file fuzz drove all of the below),
+        // storage-delta-architecture.md §5.4 (C-DECODE) / #193 increment 4: at the THREE decode boundaries
+        // where Parquet.Net consumes UNTRUSTED bytes (OpenAsync footer parse; ReadRowGroupAsync's row-group
+        // prologue incl. statistics/pruning; ReadRowGroupAsync page/level decode) the library empirically raises
+        // an UNBOUNDED set of raw BCL types on a malformed file (the CDF cdc-file fuzz drove all of the below),
         // so the boundary must fail closed on every fault EXCEPT cooperative cancellation and DeltaSharp's own
         // typed storage exception. This predicate is the fail-closed SUPERSET of IsParquetDefect.
 

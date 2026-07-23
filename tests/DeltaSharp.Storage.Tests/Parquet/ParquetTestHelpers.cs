@@ -196,6 +196,44 @@ internal static class ParquetTestHelpers
         return forged.ToArray();
     }
 
+    /// <summary>Rewrites the footer so that (<paramref name="rowGroup"/>, <paramref name="columnIndex"/>)'s
+    /// column-chunk <c>Statistics</c> carry a deliberately TOO-SHORT <c>MaxValue</c> blob (fewer bytes than the
+    /// column's fixed-width physical type needs — e.g. 3 bytes for an INT64 that needs 8). The footer still
+    /// parses (the file OPENS cleanly) and the physical data pages are untouched — but Parquet.Net's eager typed
+    /// min/max decode throws a raw <see cref="ArgumentException"/> while reading the blob. That decode is reached
+    /// BOTH by <c>RowGroupStatistics.GetStatistics</c> on the predicate-pushdown pruning path AND by
+    /// <c>ReadColumnStatistics</c> inside a normal column read, so both must fail closed — but the pruning-path
+    /// construction used to run OUTSIDE the reader's fail-closed try, so only IT leaked the raw BCL exception. A
+    /// <see cref="ParquetFileReader"/> read must map it to a deterministic CorruptData (PDX-T crafted/lying
+    /// stats; storage-delta-architecture.md §5.4 C-DECODE). Mirrors <see cref="ForgeColumnUncompressedSizeAsync"/>,
+    /// mutating only the column's statistics blob.</summary>
+    public static async Task<byte[]> ForgeShortColumnStatisticsAsync(byte[] bytes, int rowGroup, int columnIndex)
+    {
+        byte[] newFooter;
+        using (var stream = new MemoryStream(bytes, writable: false))
+        {
+            ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                global::Parquet.Meta.FileMetaData metadata = reader.Metadata!;
+                global::Parquet.Meta.Statistics statistics =
+                    metadata.RowGroups[rowGroup].Columns[columnIndex].MetaData!.Statistics
+                    ?? throw new InvalidOperationException("column chunk carries no Statistics to corrupt");
+                statistics.MaxValue = new byte[] { 0x01, 0x02, 0x03 };
+                newFooter = SerializeFooter(metadata);
+            }
+        }
+
+        int originalFooterLength = BitConverter.ToInt32(bytes, bytes.Length - 8);
+        int footerStart = bytes.Length - 8 - originalFooterLength;
+        using var forged = new MemoryStream();
+        forged.Write(bytes, 0, footerStart);
+        forged.Write(newFooter, 0, newFooter.Length);
+        forged.Write(BitConverter.GetBytes(newFooter.Length), 0, 4);
+        forged.Write("PAR1"u8);
+        return forged.ToArray();
+    }
+
     private static byte[] SerializeFooter(global::Parquet.Meta.FileMetaData metadata)
     {
         Assembly parquet = typeof(ParquetReader).Assembly;
