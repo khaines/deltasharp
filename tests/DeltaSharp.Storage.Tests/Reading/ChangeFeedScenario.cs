@@ -264,6 +264,12 @@ internal sealed class CdfTable : IDisposable
             ColumnVector version = batch.SelectedColumn(n - 2);
             ColumnVector timestamp = batch.SelectedColumn(n - 1);
 
+            // INV C8 totality: every yielded batch carries EXACTLY ONE _commit_version — never zero. A version
+            // with no changes (OPTIMIZE / ENABLE CDF) yields NO batch, not an empty one, so this holds for the
+            // production reader. Forbidding an empty batch closes the blind spot where an out-of-order ALL-EMPTY
+            // batch would be invisible to the ascending-order check below (its version is unreadable from rows).
+            Assert.True(batch.LogicalRowCount > 0, "CDF read must not yield an empty batch (INV C8)");
+
             long? single = null;
             for (int r = 0; r < batch.LogicalRowCount; r++)
             {
@@ -291,15 +297,12 @@ internal sealed class CdfTable : IDisposable
                     val.IsNull(r) ? null : val.GetValue<long>(r), timestamp.GetValue<long>(r)));
             }
 
-            if (batch.LogicalRowCount > 0)
-            {
-                long batchVersion = single!.Value;
-                Assert.True(
-                    batchVersion >= previousBatchVersion,
-                    $"batches must arrive in ascending commit order (saw {batchVersion} after {previousBatchVersion})");
-                previousBatchVersion = batchVersion;
-                batchVersions.Add(batchVersion);
-            }
+            long batchVersion = single!.Value;
+            Assert.True(
+                batchVersion >= previousBatchVersion,
+                $"batches must arrive in ascending commit order (saw {batchVersion} after {previousBatchVersion})");
+            previousBatchVersion = batchVersion;
+            batchVersions.Add(batchVersion);
         }
 
         return new CdfReadResult(changes, batchVersions);

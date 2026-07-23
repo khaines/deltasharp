@@ -11,7 +11,8 @@ namespace DeltaSharp.Storage.Tests.Reading;
 
 /// <summary>
 /// Fail-closed fuzz for the Change Data Feed <b>read door</b> on a corrupted <c>_change_data/</c> cdc file
-/// (increment 4 of #193; design §5.4 C-DECODE "fail deterministically … fail closed", applied to §2.6).
+/// (increment 4 of #193; <c>storage-delta-architecture.md</c> §5.4 (C-DECODE) "fail deterministically … fail
+/// closed", applied to §2.6).
 /// </summary>
 /// <remarks>
 /// <para><b>Inherited coverage (NOT duplicated here).</b> The cdc bytes-decode engine is the SHARED
@@ -20,14 +21,18 @@ namespace DeltaSharp.Storage.Tests.Reading;
 /// <c>ParquetCorruptionTests</c>: garbage / malformed-footer / truncated / byte-flipped Parquet all throw a
 /// typed <c>DeltaStorageException</c>). Raw-byte Parquet decode-exception fuzzing is therefore inherited; this
 /// test does NOT re-fuzz Parquet decode exception-mapping.</para>
-/// <para><b>Termination is NOT fully inherited — this fuzz found and guards a real gap.</b> §5.4 also requires
-/// the decode to NEVER hang. A corrupt Parquet <i>data-page header</i> can drive <c>Parquet.Net</c>'s
-/// synchronous decode into a non-terminating CPU loop that no exception handler or <c>CancellationToken</c> can
-/// interrupt (repro: this fuzz with <c>DELTASHARP_TEST_SEED=42</c>, byte-flip strategy, iteration 148). That is
-/// a Parquet-reader-tier gap affecting ALL Parquet reads, tracked by #647 and not fixable at the DeltaSharp
-/// layer today. Every door read here is therefore bounded by a <see cref="WatchdogTimeout"/> watchdog so a
-/// non-terminating decode fails deterministically (citing #647) instead of stalling CI — enforcing "never
-/// hangs" mechanically. The delivered default seed never trips it (all 200 iterations fail closed in ms).</para>
+/// <para><b>Termination is NOT fully inherited — this fuzz found a real gap.</b>
+/// <c>storage-delta-architecture.md</c> §5.4 (C-DECODE) also requires the decode to NEVER hang, but a corrupt
+/// Parquet <i>data-page header</i> can drive <c>Parquet.Net</c>'s synchronous decode into a non-terminating CPU
+/// loop that no exception handler or <c>CancellationToken</c> can interrupt (repro: this fuzz with
+/// <c>DELTASHARP_TEST_SEED=42</c>, byte-flip strategy, iteration 148). That is a Parquet-reader-tier gap
+/// affecting ALL Parquet reads, not fixable at the DeltaSharp layer today; the production non-termination /
+/// multi-tenant-DoS exposure it creates is tracked by #647.</para>
+/// <para><b>The <see cref="WatchdogTimeout"/> here is a CI/TEST-TIER bound, NOT a production control.</b> It
+/// exists only to convert such a hang into a deterministic, attributable <i>test</i> failure (citing #647)
+/// instead of stalling CI — it enforces "never hangs" <i>as a test observation</i>. It does NOT bound a
+/// production reader (a real deployment gets no watchdog); the production fix is tracked by #647. The delivered
+/// default seed never trips it (all 200 iterations fail closed in ms).</para>
 /// <para><b>New coverage added here.</b> The END-TO-END read door layers CDF-specific logic ON TOP of the
 /// shared reader — exception classification/wrapping (Parquet <c>DeltaStorageException</c> →
 /// <see cref="DeltaReadException"/>), <c>_change_type</c> domain validation, per-version leaf-schema
@@ -116,12 +121,14 @@ public sealed class ChangeFeedCdcFuzzTests : IDisposable
         }
     }
 
-    // A benign or fail-closed door read completes in MILLISECONDS; this generous ceiling only ever trips on a
-    // genuinely non-terminating decode. §5.4 C-DECODE requires the decode to fail closed and NEVER hang, but a
+    // CI/TEST-TIER watchdog — NOT a production control. A benign or fail-closed door read completes in
+    // MILLISECONDS; this generous ceiling only ever trips on a genuinely non-terminating decode.
+    // storage-delta-architecture.md §5.4 (C-DECODE) requires the decode to fail closed and NEVER hang, but a
     // corrupt Parquet data-page header can drive Parquet.Net's synchronous decode into a pathological CPU loop
-    // that observes no CancellationToken (a Parquet-reader-tier gap tracked by #647; see the class remarks).
-    // The watchdog converts such a hang into a deterministic, attributable failure so this fuzz enforces "never
-    // hangs" mechanically instead of stalling CI. The delivered default seed never trips it.
+    // that observes no CancellationToken (a Parquet-reader-tier gap; see the class remarks). This watchdog only
+    // converts such a hang into a deterministic, attributable TEST failure so this fuzz enforces "never hangs"
+    // as a test observation instead of stalling CI. It does NOT bound a production reader — the production
+    // non-termination / multi-tenant-DoS fix is tracked by #647. The delivered default seed never trips it.
     private static readonly TimeSpan WatchdogTimeout = TimeSpan.FromSeconds(30);
 
     private async Task AssertDoorFailsClosedAsync(
@@ -137,10 +144,10 @@ public sealed class ChangeFeedCdcFuzzTests : IDisposable
             Assert.Fail(
                 $"CDF read door did NOT terminate within {WatchdogTimeout.TotalSeconds:0}s on a mutated cdc file "
                 + $"(range=[{range.StartingVersion},{range.EndingVersion}], mutatedBytes={mutatedLength}, "
-                + $"iteration={iteration}). §5.4 C-DECODE requires the decode to fail closed and NEVER hang. This "
-                + "is the known Parquet-reader-tier decode-termination gap tracked by #647 (a corrupt data-page "
-                + "header drives Parquet.Net's synchronous decode into a non-terminating CPU loop that observes "
-                + "no CancellationToken) — NOT a CDF-layer defect.");
+                + $"iteration={iteration}). storage-delta-architecture.md §5.4 (C-DECODE) requires the decode to "
+                + "fail closed and NEVER hang. This is the known Parquet-reader-tier decode-termination gap "
+                + "tracked by #647 (a corrupt data-page header drives Parquet.Net's synchronous decode into a "
+                + "non-terminating CPU loop that observes no CancellationToken) — NOT a CDF-layer defect.");
         }
 
         try
@@ -165,7 +172,8 @@ public sealed class ChangeFeedCdcFuzzTests : IDisposable
                 $"CDF read door threw an UNEXPECTED {ex.GetType().FullName} — not "
                 + $"{nameof(DeltaReadException)}/{nameof(DeltaReadSchemaEvolutionException)} — on a mutated cdc "
                 + $"file (range=[{range.StartingVersion},{range.EndingVersion}], mutatedBytes={mutatedLength}, "
-                + $"iteration={iteration}). The fail-closed decode contract (§5.4 C-DECODE) is violated.\n{ex}");
+                + $"iteration={iteration}). The fail-closed decode contract "
+                + $"(storage-delta-architecture.md §5.4 C-DECODE) is violated.\n{ex}");
         }
     }
 
