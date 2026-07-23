@@ -85,6 +85,16 @@ public sealed class ChangeFeedReadTests : IDisposable
         new StructField("name", DataTypes.StringType, nullable: true),
     });
 
+    // A cdc-file leaf schema whose `id` data column is STRING while the FlatSchema metadata declares long — a
+    // leaf-type mismatch EE-08 must reject. `_change_type` is present with a valid domain token (excluded from
+    // the EE-08 data-column check) so ONLY the data-column validation can fire.
+    private static readonly StructType CdcTypeMismatchSchema = new(new[]
+    {
+        new StructField("id", DataTypes.StringType, nullable: false),
+        new StructField("name", DataTypes.StringType, nullable: true),
+        new StructField(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: false),
+    });
+
     public void Dispose()
     {
         try
@@ -821,6 +831,31 @@ public sealed class ChangeFeedReadTests : IDisposable
     }
 
     [Fact]
+    public async Task CdcFileSchemaInconsistentWithVersionMetadata_FailsClosed()
+    {
+        // EE-08 (§3.2, AC1): the explicit path validates each cdc file's data-column leaf schema against THAT
+        // version's log-resident metadata (the trusted authority) BEFORE yielding any row, failing closed on a
+        // missing/extra data column or a leaf-type disagreement. Here v2's cdc file is overwritten with one whose
+        // `id` column is STRING (the metadata declares long): a leaf-type mismatch ⇒ a classified DeltaRead
+        // Exception with NO inner storage fault (distinct from the torn-body CorruptData case). `_change_type`
+        // carries a valid domain token so ONLY the data-column check can fire (isolating EE-08 from the separate
+        // _change_type domain validation).
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0, v1
+        var backend = new LocalFileSystemBackend(_root);
+        await NewCdfDelete(backend, "ee08").DeleteAsync(WhereId(id => id == 1));   // v2 cdc delete (explicit path)
+        string cdc = Assert.Single(CdcFilePaths());
+        byte[] mismatch = await ParquetTestHelpers.WriteToBytesAsync(
+            CdcTypeMismatchSchema, new[] { CdcTypeMismatchBatch(("1", "a", ChangeDataWriter.DeleteChange)) });
+        await File.WriteAllBytesAsync(Path.Combine(_root, cdc), mismatch);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
+        Assert.Null(ex.InnerException);   // a pure per-version schema-validation failure, not a wrapped I/O fault
+        Assert.Contains("id", ex.Message, StringComparison.Ordinal);         // names the offending data column
+        Assert.Contains("CDF-EE-08", ex.Message, StringComparison.Ordinal);  // the per-version cdc schema check
+    }
+
+    [Fact]
     public async Task AbsentRequiredColumn_InRangeFile_FailsClosedAsSchemaEvolution()
     {
         // EE-05: a required (non-nullable) data column ABSENT from an in-range file fails closed as
@@ -1450,5 +1485,21 @@ public sealed class ChangeFeedReadTests : IDisposable
         }
 
         return new ManagedColumnBatch(NarrowNameSchema, new ColumnVector[] { name }, names.Length);
+    }
+
+    private static ColumnBatch CdcTypeMismatchBatch(params (string Id, string Name, string ChangeType)[] rows)
+    {
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.StringType, rows.Length);
+        MutableColumnVector name = ColumnVectors.Create(DataTypes.StringType, rows.Length);
+        MutableColumnVector changeType = ColumnVectors.Create(DataTypes.StringType, rows.Length);
+        foreach ((string i, string n, string c) in rows)
+        {
+            id.AppendBytes(Encoding.UTF8.GetBytes(i));
+            name.AppendBytes(Encoding.UTF8.GetBytes(n));
+            changeType.AppendBytes(Encoding.UTF8.GetBytes(c));
+        }
+
+        return new ManagedColumnBatch(
+            CdcTypeMismatchSchema, new ColumnVector[] { id, name, changeType }, rows.Length);
     }
 }
