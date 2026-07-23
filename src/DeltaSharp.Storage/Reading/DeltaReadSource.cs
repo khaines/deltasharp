@@ -34,7 +34,15 @@ public readonly record struct DeltaSnapshotInfo(long Version, StructType Schema)
 /// <para><b>Snapshot pinning (no analysis→execution TOCTOU).</b> The caller resolves the version once via
 /// <see cref="LoadSnapshotAsync"/> (at analysis) and later reads that exact version via
 /// <see cref="ReadBatchesAsync"/> (at execution), so a concurrent commit between the two can never shift
-/// the data read.</para>
+/// the data read. The <b>change-feed</b> door mirrors this: <see cref="LoadChangeFeedAsync"/> resolves +
+/// validates the range once, and <see cref="ReadChangeBatchesAsync"/> replays that pinned range.</para>
+///
+/// <para><b>Change Data Feed reads (#193, design §2.6).</b> <see cref="LoadChangeFeedAsync"/> resolves a
+/// <see cref="DeltaChangeFeedRange"/> to a pinned inclusive <c>[start, end]</c> version range (each endpoint a
+/// version xor a timestamp) with fail-closed validation (§2.7), and <see cref="ReadChangeBatchesAsync"/>
+/// streams the change rows in ascending commit order as full-schema batches carrying the three CDF metadata
+/// columns. Unlike the snapshot door's materialized <see cref="ReadBatchesAsync"/>, the change-feed read
+/// returns an <see cref="IAsyncEnumerable{T}"/> (a deliberate streaming, consumer-paced deviation — §2.6).</para>
 ///
 /// <para><b>Scope (#499).</b> Base + time-travel reads of current-schema and <b>additively schema-evolved</b>
 /// files (#190/#497), including committed <b>deletion vectors</b> (#192): an active file's DV is decoded and
@@ -44,19 +52,21 @@ public readonly record struct DeltaSnapshotInfo(long Version, StructType Schema)
 /// null-fill, #497). A genuinely incompatible mismatch still fails <b>closed</b>: an absent <i>non-nullable</i>
 /// (required) column cannot be null-filled and surfaces a clear <see cref="DeltaReadSchemaEvolutionException"/>
 /// (mirroring OPTIMIZE's schema-evolution guard) rather than fabricating values. Predicate/column pushdown
-/// into the scan, <c>commitInfo.timestamp</c> resolution (#500), path authorization (#431), and CDF reads
-/// (#193) are out of scope.</para>
+/// into the scan, <c>commitInfo.timestamp</c> resolution (#500), and path authorization (#431) are out of
+/// scope.</para>
 /// </summary>
 public sealed class DeltaReadSource : IDisposable
 {
     private readonly LocalFileSystemBackend _backend;
     private readonly DeltaLog _log;
     private readonly ParquetFileReader _reader = new();
+    private readonly ChangeFeedReader _changeFeed;
 
     private DeltaReadSource(LocalFileSystemBackend backend)
     {
         _backend = backend;
         _log = new DeltaLog(backend);
+        _changeFeed = new ChangeFeedReader(backend, _log, _reader);
     }
 
     /// <summary>Opens a read facade over a local-filesystem Delta table directory.</summary>
@@ -198,6 +208,49 @@ public sealed class DeltaReadSource : IDisposable
 
         return batches;
     }
+
+    /// <summary>
+    /// Resolves and validates a Change Data Feed read <paramref name="range"/> ONCE (design §2.6), pinning it
+    /// to an inclusive <c>[start, end]</c> version range so a concurrent commit cannot shift it between this
+    /// call (analysis) and <see cref="ReadChangeBatchesAsync"/> (execution) — the change-feed counterpart of
+    /// <see cref="LoadSnapshotAsync"/>'s snapshot pinning. Each endpoint resolves independently as a version
+    /// xor a timestamp (a timestamp through the same monotonic <c>&lt;N&gt;.json</c>-mtime policy
+    /// <c>timestampAsOf</c> uses); the end defaults to the latest committed version. The range is validated
+    /// fail-closed (§2.7).
+    /// </summary>
+    /// <param name="range">The requested change-feed bounds.</param>
+    /// <param name="cancellationToken">Cancels the log listing/reconstruction I/O.</param>
+    /// <returns>The resolved <c>[start, end]</c> range + the reconciled CDF output schema (data columns +
+    /// <c>_change_type</c>/<c>_commit_version</c>/<c>_commit_timestamp</c>).</returns>
+    /// <exception cref="ArgumentException">A single endpoint specified both a version and a timestamp, or no
+    /// start bound was supplied (mirroring <see cref="LoadSnapshotAsync"/>'s xor rule).</exception>
+    /// <exception cref="DeltaReadException">The range is invalid or unavailable fail-closed: not a Delta
+    /// table, a negative start, an end past the latest committed version, a start after the end, a range that
+    /// has aged past log retention, or CDF not active for every version in the range (§2.7).</exception>
+    public Task<DeltaChangeFeedInfo> LoadChangeFeedAsync(
+        DeltaChangeFeedRange range, CancellationToken cancellationToken = default) =>
+        _changeFeed.ResolveAsync(range, cancellationToken);
+
+    /// <summary>
+    /// Streams the change rows of the pinned range in <paramref name="info"/> (as returned by
+    /// <see cref="LoadChangeFeedAsync"/>) in <b>ascending commit order</b>, as full-schema batches carrying
+    /// the three CDF metadata columns (design §2.6). Each yielded batch carries exactly ONE
+    /// <c>_commit_version</c> (INV C8) — batches never span versions. A version that committed <c>cdc</c>
+    /// actions is read exactly from those files (each row's own <c>_change_type</c>); a version with none is
+    /// derived implicitly (<c>insert</c> from <c>add</c>, <c>delete</c> from <c>remove</c>), DV-aware so only
+    /// live rows surface. Unlike the snapshot door's materialized <see cref="ReadBatchesAsync"/>, this returns
+    /// an <see cref="IAsyncEnumerable{T}"/> — a deliberate streaming, consumer-paced deviation (§2.6).
+    /// </summary>
+    /// <param name="info">The resolved range to replay (from <see cref="LoadChangeFeedAsync"/>).</param>
+    /// <param name="cancellationToken">Cancels the log reconstruction and per-file Parquet reads.</param>
+    /// <returns>The change rows as full-schema batches, in ascending commit order.</returns>
+    /// <exception cref="DeltaReadException">A version's commit log or a required change/data file is no longer
+    /// available (aged out / vacuumed between resolution and read), or a change-data file is inconsistent.</exception>
+    /// <exception cref="DeltaReadSchemaEvolutionException">A cdc/data file is missing a REQUIRED (non-nullable)
+    /// column the reconciled output schema demands — read-side null-fill cannot satisfy it — fails closed.</exception>
+    public IAsyncEnumerable<ColumnBatch> ReadChangeBatchesAsync(
+        DeltaChangeFeedInfo info, CancellationToken cancellationToken = default) =>
+        _changeFeed.ReadAsync(info, cancellationToken);
 
     private async Task ReadFileAsync(
         AddFileAction add,

@@ -725,18 +725,18 @@ internal sealed class DeltaLog
     {
         public int Count => Versions.Length;
     }
-
-    /// <summary>The single-listing view a Change Data Feed range read resolves against
-    /// (<see cref="LoadChangeFeedLogAsync"/>): the latest committed version (default range end), the earliest
-    /// reconstructable version (CDF-readable-window floor), and the reconstructable commit versions (ascending)
-    /// with their effective commit timestamps — as parallel lists <see cref="CommitVersions"/> /
-    /// <see cref="EffectiveMillis"/> plus the <see cref="EffectiveMillisByVersion"/> lookup used to stamp each
-    /// replayed version's <c>_commit_timestamp</c>. All timestamps come from
-    /// <see cref="BuildEffectiveCommitTimeline"/>, the same policy <c>timestampAsOf</c> uses.</summary>
-    internal sealed record ChangeFeedLog(
-        long LatestVersion,
-        long EarliestReconstructableVersion,
-        IReadOnlyList<long> CommitVersions,
-        IReadOnlyList<long> EffectiveMillis,
-        IReadOnlyDictionary<long, long> EffectiveMillisByVersion);
 }
+
+/// <summary>The single-listing view a Change Data Feed range read resolves against
+/// (<see cref="DeltaLog.LoadChangeFeedLogAsync"/>): the latest committed version (default range end), the
+/// earliest reconstructable version (CDF-readable-window floor), and the reconstructable commit versions
+/// (ascending) with their effective commit timestamps — as parallel lists <see cref="CommitVersions"/> /
+/// <see cref="EffectiveMillis"/> plus the <see cref="EffectiveMillisByVersion"/> lookup used to stamp each
+/// replayed version's <c>_commit_timestamp</c>. All timestamps come from
+/// <c>BuildEffectiveCommitTimeline</c>, the same policy <c>timestampAsOf</c> uses.</summary>
+internal sealed record ChangeFeedLog(
+    long LatestVersion,
+    long EarliestReconstructableVersion,
+    IReadOnlyList<long> CommitVersions,
+    IReadOnlyList<long> EffectiveMillis,
+    IReadOnlyDictionary<long, long> EffectiveMillisByVersion);

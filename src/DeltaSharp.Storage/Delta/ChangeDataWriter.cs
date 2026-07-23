@@ -53,10 +53,33 @@ internal sealed class ChangeDataWriter
     /// <see cref="CommitVersionColumn"/>, never materialized in a cdc body but a reserved name.</summary>
     public const string CommitTimestampColumn = "_commit_timestamp";
 
-    /// <summary>The <c>_change_type</c> value for a row deleted by a merge-on-read DELETE (§2.5). The
-    /// <c>insert</c>/<c>update_preimage</c>/<c>update_postimage</c> values are re-added by the increment that
-    /// consumes each (read door / #637); this generation increment materializes only deletes.</summary>
+    /// <summary>The <c>_change_type</c> value for a row deleted by a merge-on-read DELETE (§2.5), and the
+    /// value the read door synthesizes for a row derived from a <c>remove(dataChange=true)</c> file on the
+    /// implicit path (§2.2/§2.6).</summary>
     public const string DeleteChange = "delete";
+
+    /// <summary>The <c>_change_type</c> value the read door synthesizes for a row derived from an
+    /// <c>add(dataChange=true)</c> file on the implicit path — an append or overwrite insert (§2.2/§2.6).
+    /// Never materialized by this generation increment (which writes only <see cref="DeleteChange"/> cdc).</summary>
+    public const string InsertChange = "insert";
+
+    /// <summary>The <c>_change_type</c> value for the <b>before</b> image of an updated row (§2.4). Reserved
+    /// here for the read door's change-type domain validation; produced by the explicit (cdc) path only.</summary>
+    public const string UpdatePreimageChange = "update_preimage";
+
+    /// <summary>The <c>_change_type</c> value for the <b>after</b> image of an updated row (§2.4). Reserved
+    /// here for the read door's change-type domain validation; produced by the explicit (cdc) path only.</summary>
+    public const string UpdatePostimageChange = "update_postimage";
+
+    /// <summary>The complete, closed domain of legal <c>_change_type</c> values (§2.4/§5.2):
+    /// <see cref="InsertChange"/>, <see cref="DeleteChange"/>, <see cref="UpdatePreimageChange"/>,
+    /// <see cref="UpdatePostimageChange"/>. The read door validates every value read out of a <c>cdc</c> file
+    /// body against this set (an out-of-domain value is corrupt data → fail closed), so a foreign/tampered
+    /// writer cannot smuggle an unknown change type past the explicit path. Ordinal (case-SENSITIVE): the
+    /// canonical Delta spellings are lower-case and a differing case is not a legal value.</summary>
+    public static readonly FrozenSet<string> ChangeTypeDomain =
+        new[] { InsertChange, DeleteChange, UpdatePreimageChange, UpdatePostimageChange }
+            .ToFrozenSet(StringComparer.Ordinal);
 
     // The three Change Data Feed metadata column names Delta reserves (§2.4). Membership is tested
     // case-INsensitively (OrdinalIgnoreCase), consistent with DeltaSharp's all-mode case-insensitive

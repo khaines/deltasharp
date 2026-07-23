@@ -124,6 +124,23 @@ internal static class ColumnMappingProjection
         string[] physicalNames,
         int[] dataOrdinalByField,
         ColumnBatch dataBatch)
+        => BuildFullBatch(add.PartitionValues, tableSchema, physicalNames, dataOrdinalByField, dataBatch);
+
+    /// <summary>
+    /// The partition-values overload of <see cref="BuildFullBatch(AddFileAction,StructType,string[],int[],ColumnBatch)"/>:
+    /// relabels the physically-read <paramref name="dataBatch"/> into a full-schema LOGICAL batch, hydrating each
+    /// partition column (ordinal <c>-1</c>) from <paramref name="partitionValues"/> keyed by the column's PHYSICAL
+    /// name. It takes the partition-values map directly rather than an <see cref="AddFileAction"/> so the Change
+    /// Data Feed read door can reuse the identical relabel/hydrate for a <c>cdc</c> (<see cref="AddCdcFileAction"/>)
+    /// or <c>remove</c> action — whose <c>partitionValues</c> are keyed by physical name in every mapping mode,
+    /// exactly like <c>add.partitionValues</c>.
+    /// </summary>
+    public static ColumnBatch BuildFullBatch(
+        ImmutableSortedDictionary<string, string?> partitionValues,
+        StructType tableSchema,
+        string[] physicalNames,
+        int[] dataOrdinalByField,
+        ColumnBatch dataBatch)
     {
         int rowCount = dataBatch.RowCount;
         var columns = new ColumnVector[tableSchema.Count];
@@ -137,7 +154,7 @@ internal static class ColumnMappingProjection
             }
 
             StructField field = tableSchema[i];
-            add.PartitionValues.TryGetValue(physicalNames[i], out string? value);
+            partitionValues.TryGetValue(physicalNames[i], out string? value);
             columns[i] = DeltaReadEncoding.BuildConstantColumn(field.DataType, value, rowCount);
         }
 
