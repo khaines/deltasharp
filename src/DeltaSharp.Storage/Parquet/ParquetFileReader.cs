@@ -625,7 +625,11 @@ internal sealed class ParquetFileReader
             // sibling library NotSupportedException family (raised from page decode in ReadRowGroupAsync) is NOT
             // reclassified: Parquet.Net raises it on genuinely CORRUPT pages too (an invalid compression-method /
             // page-type / logical-type code from a bit-flip), so it is not safely separable from corruption and
-            // stays CorruptData (see the ReadRowGroupAsync superset catch).
+            // stays CorruptData (see the ReadRowGroupAsync superset catch). Likewise only encrypted-FOOTER
+            // mode (PARE magic) is classified here; plaintext-footer encryption (mode b) keeps the ordinary
+            // PAR1 magic and carries its crypto metadata in an otherwise-readable footer, so it is not caught by
+            // this magic peek and stays the CorruptData/decode default — Parquet.Net 6.0.3 can neither read nor
+            // write mode-b files, so it is not reachable/constructible today; tracked as a follow-up (#655).
             bool encryptedFooter = IsParquetEncryptedFooterMagic(input);
 
             if (reader is not null)
@@ -651,7 +655,7 @@ internal sealed class ParquetFileReader
                 // Parquet Modular Encryption file DeltaSharp cannot read. The message names the feature (the
                 // UnsupportedFeature factory carries no ex.Message, so no footer content leaks); the original
                 // library fault stays the inner exception on the CorruptData path but is deliberately not echoed
-                // here — the 'PARE' head is the whole diagnosis.
+                // here — the 'PARE' bracketing (both ends) is the whole diagnosis.
                 throw DeltaStorageException.UnsupportedFeature(
                     "Parquet Modular Encryption is not supported: the file uses an encrypted footer (PARE "
                     + "magic). DeltaSharp cannot read encrypted Parquet files.");
@@ -674,18 +678,20 @@ internal sealed class ParquetFileReader
     private static ReadOnlySpan<byte> EncryptedFooterMagic => "PARE"u8;
 
     /// <summary>
-    /// Peeks whether <paramref name="input"/> begins with the Parquet <b>encrypted-footer</b> magic
-    /// (<c>PARE</c>) — the on-disk marker of a Parquet Modular Encryption file the library rejects as "not a
-    /// parquet file" (#649). This is the <b>robust</b> encryption discriminator: it reads the file's own
-    /// leading magic from the seekable input (every reader entry point passes a seekable
+    /// Peeks whether <paramref name="input"/> is bracketed by the Parquet <b>encrypted-footer</b> magic
+    /// (<c>PARE</c>) at <b>both</b> ends — the on-disk marker of a (complete) Parquet Modular Encryption file
+    /// the library rejects as "not a parquet file" (#649). This is the <b>robust</b> encryption discriminator:
+    /// it reads the file's own leading and trailing magic from the seekable input (every reader entry point
+    /// passes a seekable
     /// <see cref="MemoryStream"/>, and <see cref="ParquetReader.CreateAsync(Stream, ParquetOptions?, bool, CancellationToken)"/>
     /// leaves the caller's stream open when it throws) rather than substring-matching the library's error
     /// message, which is byte-for-byte identical for genuine non-Parquet garbage ("not a parquet file, head:
-    /// …") and so cannot separate encryption from corruption. Only a positively-identified <c>PARE</c> head
-    /// returns <see langword="true"/>: a non-seekable, too-short, or unreadable input can NOT be confirmed
-    /// encrypted, so it returns <see langword="false"/> and the caller keeps the fail-closed CorruptData
-    /// default — encryption is asserted, never guessed. The input's position is restored so this observation
-    /// is transparent to any later use.
+    /// …") and so cannot separate encryption from corruption. Only an input positively bracketed by <c>PARE</c>
+    /// at both ends returns <see langword="true"/>: a non-seekable, too-short, merely-<c>PARE</c>-prefixed
+    /// (corrupt/truncated), or unreadable input can NOT be confirmed a complete encrypted file, so it returns
+    /// <see langword="false"/> and the caller keeps the fail-closed CorruptData default — encryption is
+    /// asserted, never guessed. The input's position is restored so this observation is transparent to any
+    /// later use.
     /// </summary>
     internal static bool IsParquetEncryptedFooterMagic(Stream input)
     {
@@ -696,17 +702,38 @@ internal sealed class ParquetFileReader
 
         try
         {
-            if (input.Length < ParquetMagicLength)
+            // A valid Parquet Modular Encryption (encrypted-footer mode) file is bracketed by the 'PARE' magic
+            // at BOTH ends (Parquet Encryption.md), so it is at least two 4-byte magics long. Requiring the
+            // TRAILING magic too — not just the head — keeps a merely-'PARE'-prefixed CORRUPT file (a 'PARE'
+            // head with a non-'PARE' or absent/truncated tail) mapped to the fail-closed CorruptData default
+            // instead of mislabeled "encrypted" (#649 precision, council R1). Only a fully-bracketed file is
+            // confidently a (complete) encrypted-footer file; a truncated one is genuinely corrupt.
+            if (input.Length < 2 * ParquetMagicLength)
             {
                 return false;
             }
 
             long savedPosition = input.Position;
-            input.Position = 0;
-            Span<byte> head = stackalloc byte[ParquetMagicLength];
-            int read = input.ReadAtLeast(head, ParquetMagicLength, throwOnEndOfStream: false);
-            input.Position = savedPosition;
-            return read == ParquetMagicLength && head.SequenceEqual(EncryptedFooterMagic);
+            try
+            {
+                Span<byte> magic = stackalloc byte[ParquetMagicLength];
+
+                input.Position = 0;
+                if (input.ReadAtLeast(magic, ParquetMagicLength, throwOnEndOfStream: false) != ParquetMagicLength
+                    || !magic.SequenceEqual(EncryptedFooterMagic))
+                {
+                    return false;
+                }
+
+                input.Position = input.Length - ParquetMagicLength;
+                return input.ReadAtLeast(magic, ParquetMagicLength, throwOnEndOfStream: false) == ParquetMagicLength
+                    && magic.SequenceEqual(EncryptedFooterMagic);
+            }
+            finally
+            {
+                // Restore on every path (both magic reads and any fault) so the observation is transparent.
+                input.Position = savedPosition;
+            }
         }
         catch (Exception ex) when (ex is IOException or ObjectDisposedException or NotSupportedException)
         {

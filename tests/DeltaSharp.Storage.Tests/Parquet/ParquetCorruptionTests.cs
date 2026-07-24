@@ -634,15 +634,59 @@ public sealed class ParquetCorruptionTests
     }
 
     [Fact]
-    public void IsParquetEncryptedFooterMagic_DetectsPareHeadOnly_AndIsTransparent()
+    public async Task PareHeadWithNonPareTail_StaysCorruptData_PrecisionGuard()
     {
-        // Unit-level proof the discriminator keys on the actual leading MAGIC BYTES (robust), not on
-        // ex.Message: a 'PARE' head is detected; a 'PAR1' head (even with a garbage footer), arbitrary
+        // PRECISION GUARD (#649, council R1): a complete encrypted-footer file is bracketed by 'PARE' at BOTH
+        // ends. A file with a 'PARE' HEAD but a non-'PARE' tail ('GARB') is genuinely corrupt (an
+        // incomplete/mangled encrypted file), NOT a valid-but-unsupported one — so it must stay CorruptData,
+        // not be mislabeled UnsupportedFeature. This pins the head-AND-tail requirement through the read door.
+        byte[] corrupt = ParquetTestHelpers.PareHeadOnlyFile();
+        var schema = new StructType(new[] { KeepField });
+
+        DeltaStorageException read = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(corrupt, schema));
+        Assert.Equal(StorageErrorKind.CorruptData, read.Kind);
+
+        using var stream = new MemoryStream(corrupt, writable: false);
+        DeltaStorageException schemaRead = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new ParquetFileReader().ReadDataSchemaAsync(stream, CancellationToken.None));
+        Assert.Equal(StorageErrorKind.CorruptData, schemaRead.Kind);
+    }
+
+    [Fact]
+    public async Task PareHeadTruncated_StaysCorruptData_PrecisionGuard()
+    {
+        // PRECISION GUARD (#649, council R1): a 'PARE'-prefixed input truncated to just the leading magic is
+        // too short to be bracketed by a trailing 'PARE' — genuinely corrupt, must stay CorruptData.
+        byte[] truncated = ParquetTestHelpers.PareHeadTruncatedFile();
+        var schema = new StructType(new[] { KeepField });
+
+        DeltaStorageException read = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(truncated, schema));
+        Assert.Equal(StorageErrorKind.CorruptData, read.Kind);
+    }
+
+    [Fact]
+    public void IsParquetEncryptedFooterMagic_RequiresPareAtBothEnds_AndIsTransparent()
+    {
+        // Unit-level proof the discriminator keys on the actual MAGIC BYTES at BOTH ends (robust), not on
+        // ex.Message: only a file bracketed by 'PARE' head AND tail is detected; a 'PARE' head with a
+        // non-'PARE' tail, a 'PARE'-only truncated file, a 'PAR1' head (even with a garbage footer), arbitrary
         // garbage, and a too-short input are NOT — so each keeps the CorruptData default. This pins the
-        // precision boundary at the classifier itself.
+        // precision boundary (head-and-tail) at the classifier itself.
         using (var pare = new MemoryStream(ParquetTestHelpers.EncryptedFooterMagicFile()))
         {
             Assert.True(ParquetFileReader.IsParquetEncryptedFooterMagic(pare));
+        }
+
+        using (var pareHeadOnly = new MemoryStream(ParquetTestHelpers.PareHeadOnlyFile()))
+        {
+            Assert.False(ParquetFileReader.IsParquetEncryptedFooterMagic(pareHeadOnly)); // non-'PARE' tail
+        }
+
+        using (var pareTruncated = new MemoryStream(ParquetTestHelpers.PareHeadTruncatedFile()))
+        {
+            Assert.False(ParquetFileReader.IsParquetEncryptedFooterMagic(pareTruncated)); // < 8 bytes
         }
 
         using (var par1 = new MemoryStream(ParquetTestHelpers.Par1MagicGarbageFooterFile()))
@@ -660,8 +704,9 @@ public sealed class ParquetCorruptionTests
             Assert.False(ParquetFileReader.IsParquetEncryptedFooterMagic(tooShort));
         }
 
-        // The peek is TRANSPARENT: it seeks to 0 to read the head, then restores the caller's position, so a
-        // 'PARE' head is still found when the stream is positioned mid-file and the caller's position survives.
+        // The peek is TRANSPARENT: it seeks to read the head and tail, then restores the caller's position, so
+        // a fully-bracketed 'PARE' file is still found when the stream is positioned mid-file and the caller's
+        // position survives.
         using (var pareMidPosition = new MemoryStream(ParquetTestHelpers.EncryptedFooterMagicFile()))
         {
             pareMidPosition.Position = 3;

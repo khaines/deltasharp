@@ -304,6 +304,26 @@ internal static class ParquetTestHelpers
         return stream.ToArray();
     }
 
+    /// <summary>A corrupt/truncated file carrying ONLY the leading <c>PARE</c> magic (no trailing magic) — the
+    /// precision SIBLING that proves the encryption classifier requires <c>PARE</c> at BOTH ends (#649,
+    /// council R1). A complete encrypted-footer file is bracketed by <c>PARE</c>; this half-bracketed shape is
+    /// genuinely corrupt, so a <see cref="ParquetFileReader"/> read must keep it
+    /// <see cref="StorageErrorKind.CorruptData"/>, never <see cref="StorageErrorKind.UnsupportedFeature"/>.</summary>
+    public static byte[] PareHeadOnlyFile()
+    {
+        using var stream = new MemoryStream();
+        stream.Write("PARE"u8);
+        stream.Write(new byte[] { 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03 }); // opaque body
+        stream.Write(BitConverter.GetBytes(8));
+        stream.Write("GARB"u8); // NON-'PARE' tail — an incomplete/corrupt encrypted file, not a complete one
+        return stream.ToArray();
+    }
+
+    /// <summary>A minimal <c>PARE</c>-prefixed input that is TRUNCATED to just the leading magic (4 bytes) —
+    /// too short to be bracketed by a trailing <c>PARE</c>. Genuinely corrupt: the classifier must keep it
+    /// <see cref="StorageErrorKind.CorruptData"/> (#649 precision, council R1).</summary>
+    public static byte[] PareHeadTruncatedFile() => "PARE"u8.ToArray();
+
     /// <summary>Rewrites the footer so that (<paramref name="rowGroup"/>, <paramref name="columnIndex"/>)'s
     /// column chunk declares <paramref name="forgedCodec"/> as its compression <c>Codec</c> — an OUT-OF-RANGE
     /// value (e.g. <c>9</c>, which is not a real <c>CompressionCodec</c>) that leaves the footer parseable and
