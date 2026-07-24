@@ -81,6 +81,93 @@ public sealed class ParquetCorruptionTests
     }
 
     [Fact]
+    public async Task RowGroupPruning_OnCorruptColumnStatistics_FailsClosedNotRawBcl()
+    {
+        // Council R1 Security HIGH: the row-group-statistics decode is an UNTRUSTED-byte boundary. A valid
+        // Parquet file whose footer column-statistics blob is corrupt (a too-short MaxValue) OPENS cleanly, but
+        // Parquet.Net's eager typed min/max decode throws a raw ArgumentException while reading it. On the
+        // predicate-pushdown pruning path that decode is reached by RowGroupStatistics.GetStatistics — and that
+        // prologue used to run OUTSIDE ReadRowGroupAsync's fail-closed try, so a NON-NULL keepRowGroup read
+        // LEAKED the raw BCL exception (Security probe: CONSTRUCT-ONLY rawEscapes=1). It must now map to a
+        // deterministic CorruptData (storage-delta-architecture.md §5.4 C-DECODE / ADR-0013; PDX-T lying stats).
+        // Regression check: reverting the prologue wrap makes the NON-NULL-predicate assertion below go RED.
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3, 4, 5 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] corruptStats =
+            await ParquetTestHelpers.ForgeShortColumnStatisticsAsync(file, rowGroup: 0, columnIndex: 0);
+
+        // A NON-NULL pruning predicate forces the RowGroupStatistics construction that decodes the corrupt blob;
+        // the raw ArgumentException must surface as a deterministic CorruptData, never escape raw to the caller.
+        DeltaStorageException pruning = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(
+                corruptStats, schema, keepRowGroup: stats => stats.Max("keep") is long max && max >= 0));
+        Assert.Equal(StorageErrorKind.CorruptData, pruning.Kind);
+
+        // Control (the CDF door path, keepRowGroup:null): SKIPS RowGroupStatistics — but Parquet.Net ALSO reads
+        // the same column statistics WITHIN the normal column read (ReadColumnStatistics under ReadAsync<T>), so
+        // this file fails closed here TOO. Crucially that data-read decode was ALWAYS inside the fail-closed try,
+        // so the door NEVER leaked raw (Security probe: NO-PREDICATE rawEscapes=0) — it maps to CorruptData, not
+        // an ArgumentException. So the ONLY pre-fix gap was the pruning-path construction (isolated by the
+        // regression check). Both untrusted-stats-decode paths must now yield the SAME deterministic contract.
+        DeltaStorageException door = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(corruptStats, schema));
+        Assert.Equal(StorageErrorKind.CorruptData, door.Kind);
+    }
+
+    [Fact]
+    public async Task GetRowCount_OnOverflowingRowGroupCounts_FailsClosedNotRawOverflow()
+    {
+        // Red-team HIGH (a FOURTH untrusted-byte decode site): GetRowCountAsync sums attacker-controlled footer
+        // NumRows via checked(total + rows). A crafted file whose per-row-group counts sum past long.MaxValue
+        // raises a raw OverflowException that USED TO escape — this metadata-only entry point had NO fail-closed
+        // try, unlike ReadRowGroupAsync. It must now map to a deterministic CorruptData (storage-delta-
+        // architecture.md §5.4 C-DECODE / ADR-0013). Regression check: removing the wrap makes THIS test throw a
+        // raw OverflowException instead of DeltaStorageException.
+        var schema = new StructType(new[] { KeepField });
+        // Two row groups (6 rows, limit 3). GetRowCountAsync reads ONLY the footer NumRows, so the physical data
+        // pages are irrelevant — forge EACH group's declared NumRows to long.MaxValue so their checked sum
+        // (long.MaxValue + long.MaxValue) overflows on the second iteration.
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3, 100, 101, 102 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch }, rowGroupRowLimit: 3);
+        byte[] forged =
+            await ParquetTestHelpers.ForgeRowGroupNumRowsAsync(file, rowGroup: 0, forgedNumRows: long.MaxValue);
+        forged = await ParquetTestHelpers.ForgeRowGroupNumRowsAsync(forged, rowGroup: 1, forgedNumRows: long.MaxValue);
+
+        using var stream = new MemoryStream(forged, writable: false);
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new ParquetFileReader().GetRowCountAsync(stream, CancellationToken.None));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+    }
+
+    [Fact]
+    public async Task ReadDataSchema_OnEmptyFooterFieldName_FailsClosedNotRawArgument()
+    {
+        // Red-team HIGH (a FIFTH untrusted-byte decode site): ReadDataSchemaAsync maps footer field descriptors
+        // into DeltaSharp StructFields via ParquetTypeMapping.ToDataSchema. OpenAsync force-materializes
+        // reader.Schema inside its footer-PARSE boundary, but the SUBSEQUENT mapping was unsealed — ToDataSchema
+        // eagerly builds a StructField for EVERY footer field, so a crafted footer with an empty field name USED
+        // TO raise a raw System.ArgumentException ("The value cannot be an empty string") that escaped to the
+        // caller. It must now map to a deterministic CorruptData (crafted schema; storage-delta-architecture.md
+        // §5.4 C-DECODE / ADR-0013). Regression check: removing the wrap makes THIS test throw a raw
+        // ArgumentException instead of DeltaStorageException.
+        //
+        // NOTE the decorrelated sibling ReadAsync path is NOT vulnerable to this vector: it uses footer field
+        // names as dictionary KEYS (an empty name is a valid key) and reports resolution failures as a TYPED
+        // DeltaStorageException (ColumnNotPresentInFile), never a raw exception — only ToDataSchema eagerly
+        // constructs a name-validating StructField from every footer field, which is why only this entry leaked.
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] forged = await ParquetTestHelpers.ForgeFieldNameAsync(file, "keep", "");
+
+        using var stream = new MemoryStream(forged, writable: false);
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new ParquetFileReader().ReadDataSchemaAsync(stream, CancellationToken.None));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+    }
+
+    [Fact]
     public async Task MidStreamCorruption_YieldsCompleteEarlierBatchThenDeterministicError()
     {
         var schema = new StructType(new[] { KeepField });
@@ -307,6 +394,42 @@ public sealed class ParquetCorruptionTests
         // A genuine logic bug in our own decode path still surfaces as itself (not masked as corruption).
         Assert.False(ParquetFileReader.IsParquetDefect(new InvalidOperationException()));
         Assert.False(ParquetFileReader.IsParquetDefect(new ArgumentException()));
+    }
+
+    [Fact]
+    public void IsUndecodableParquetInput_FailsClosedOnUnboundedLibraryFaults()
+    {
+        // storage-delta-architecture.md §5.4 (C-DECODE) / #193 increment 4: at the THREE decode boundaries
+        // where Parquet.Net consumes UNTRUSTED bytes (OpenAsync footer parse; ReadRowGroupAsync's row-group
+        // prologue incl. statistics/pruning; ReadRowGroupAsync page/level decode) the library empirically raises
+        // an UNBOUNDED set of raw BCL types on a malformed file (the CDF cdc-file fuzz drove all of the below),
+        // so the boundary must fail closed on every fault EXCEPT cooperative cancellation and DeltaSharp's own
+        // typed storage exception. This predicate is the fail-closed SUPERSET of IsParquetDefect.
+
+        // (1) The broad BCL family IsParquetDefect deliberately EXCLUDES — the fuzz proved the library decoder
+        // raises these on corrupt data, so the boundary MUST still fail closed on them.
+        Assert.True(ParquetFileReader.IsUndecodableParquetInput(new IndexOutOfRangeException()));
+        Assert.True(ParquetFileReader.IsUndecodableParquetInput(new ArgumentException()));
+        Assert.True(ParquetFileReader.IsUndecodableParquetInput(new ArgumentOutOfRangeException()));
+        Assert.True(ParquetFileReader.IsUndecodableParquetInput(new InvalidOperationException()));
+        Assert.True(ParquetFileReader.IsUndecodableParquetInput(new NotSupportedException()));
+        Assert.True(ParquetFileReader.IsUndecodableParquetInput(new FormatException()));
+        Assert.True(ParquetFileReader.IsUndecodableParquetInput(new NullReferenceException()));
+
+        // (2) Superset property: every type IsParquetDefect matches is also undecodable input here.
+        Assert.True(ParquetFileReader.IsUndecodableParquetInput(new OutOfMemoryException()));
+        Assert.True(ParquetFileReader.IsUndecodableParquetInput(new OverflowException()));
+        Assert.True(ParquetFileReader.IsUndecodableParquetInput(new IOException()));
+        Assert.True(ParquetFileReader.IsUndecodableParquetInput(new EndOfStreamException()));
+
+        // (3) Cooperative cancellation is control flow — it must PROPAGATE, never be masked as corruption.
+        Assert.False(ParquetFileReader.IsUndecodableParquetInput(new OperationCanceledException()));
+        Assert.False(ParquetFileReader.IsUndecodableParquetInput(new TaskCanceledException()));
+
+        // (4) DeltaSharp's OWN typed fail-closed signal must propagate UNWRAPPED — an unsupported but VALID
+        // feature stays UnsupportedFeature, and an inner CorruptData is not re-masked.
+        Assert.False(ParquetFileReader.IsUndecodableParquetInput(DeltaStorageException.UnsupportedFeature("x")));
+        Assert.False(ParquetFileReader.IsUndecodableParquetInput(DeltaStorageException.CorruptData("x")));
     }
 
     [Fact]
