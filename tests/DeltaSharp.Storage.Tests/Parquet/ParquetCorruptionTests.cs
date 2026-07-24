@@ -666,6 +666,29 @@ public sealed class ParquetCorruptionTests
     }
 
     [Fact]
+    public async Task UnsupportedFooterColumnType_FailsClosedWithoutEchoingFileColumnName()
+    {
+        // Message hygiene (#653): ParquetTypeMapping.ToDataType dropped the FILE footer field.Name from its
+        // UnsupportedFeature message. A footer column's physical CLR type AND its NAME are file-derived — for a
+        // foreign/untrusted table the name is attacker-authored (resolved by field-id from the untrusted
+        // footer) — and ReadDataSchemaAsync surfaces this typed UnsupportedFeature UNWRAPPED through the public
+        // read facade (both its catch predicates exclude DeltaStorageException, so it is never re-masked as
+        // CorruptData). So the mapping-failure message must name the unsupported physical TYPE yet NEVER the
+        // column name. Author a Parquet whose one column is a physical TimeSpan (no DeltaSharp type mapping)
+        // named a sentinel — a type DeltaSharp's own writer cannot emit — then map its footer schema.
+        const string sentinel = "att4cker_footer_col_s3ntinel";
+        byte[] file = await ParquetTestHelpers.WriteUnmappedTimeSpanColumnAsync(sentinel);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new ParquetFileReader().ReadDataSchemaAsync(new MemoryStream(file), CancellationToken.None));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.DoesNotContain(sentinel, error.Message, StringComparison.Ordinal);   // no file-derived column name
+        // Pins the scrubbed ToDataType site: it names the unsupported physical CLR TYPE, never the column name.
+        Assert.Contains("physical CLR type 'TimeSpan'", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task ForgedInvalidCompressionCodec_NotSupportedException_StaysCorruptData()
     {
         // PRECISION GUARD for the NotSupportedException family (#649). Forging an OUT-OF-RANGE compression

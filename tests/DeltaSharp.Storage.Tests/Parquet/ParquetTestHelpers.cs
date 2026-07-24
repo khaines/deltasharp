@@ -26,6 +26,25 @@ internal static class ParquetTestHelpers
         return stream.ToArray();
     }
 
+    /// <summary>Writes a single-column Parquet file whose one column is a physical <see cref="TimeSpan"/>
+    /// named <paramref name="columnName"/>. TimeSpan has NO DeltaSharp type mapping, so reading this file's
+    /// footer (<c>ParquetFileReader.ReadDataSchemaAsync</c> → <c>ParquetTypeMapping.ToDataType</c>) fails
+    /// closed with <c>UnsupportedFeature</c> — used to prove that fail-closed message never echoes the
+    /// file-derived column name (#653). Authored with Parquet.Net's serializer directly because DeltaSharp's
+    /// writer, by construction, cannot emit an unmapped physical type.</summary>
+    public static async Task<byte[]> WriteUnmappedTimeSpanColumnAsync(string columnName)
+    {
+        var schema = new global::Parquet.Schema.ParquetSchema(
+            new global::Parquet.Schema.DataField<TimeSpan>(columnName));
+        var rows = new List<IDictionary<string, object?>>
+        {
+            new Dictionary<string, object?> { [columnName] = TimeSpan.FromSeconds(1) },
+        };
+        using var stream = new MemoryStream();
+        await global::Parquet.Serialization.ParquetSerializer.SerializeUntypedAsync(rows, schema, stream);
+        return stream.ToArray();
+    }
+
     /// <summary>Authors an int→int map Parquet file at the LOW level, writing the key and value leaves with
     /// caller-supplied repetition levels — the only way to forge a map whose value repetition stream diverges
     /// from the key's (same total entry count, different per-row distribution), which the typed
@@ -400,6 +419,55 @@ internal static class ParquetTestHelpers
                 global::Parquet.Meta.FileMetaData metadata = reader.Metadata!;
                 metadata.RowGroups[rowGroup].Columns[columnIndex].MetaData!.Codec =
                     (global::Parquet.Meta.CompressionCodec)forgedCodec;
+                newFooter = SerializeFooter(metadata);
+            }
+        }
+
+        int originalFooterLength = BitConverter.ToInt32(bytes, bytes.Length - 8);
+        int footerStart = bytes.Length - 8 - originalFooterLength;
+        using var forged = new MemoryStream();
+        forged.Write(bytes, 0, footerStart);
+        forged.Write(newFooter, 0, newFooter.Length);
+        forged.Write(BitConverter.GetBytes(newFooter.Length), 0, 4);
+        forged.Write("PAR1"u8);
+        return forged.ToArray();
+    }
+
+    /// <summary>Renames a footer LEAF column CONSISTENTLY — both its schema element name AND every column
+    /// chunk's <c>PathInSchema</c> tail — so the file stays self-consistent and the reader can still LOCATE
+    /// and DECODE the column (unlike <see cref="ForgeFieldNameAsync"/>, which renames only the schema element,
+    /// desyncing it from the chunk path and breaking column lookup). Used to author a checkpoint whose map
+    /// key / list element LEAF carries an attacker sentinel name that surfaces in the resolved
+    /// <c>DataField.Path</c> — proving the checkpoint reconstruction fail-closed messages never echo that
+    /// file-derived leaf path (#653). Mirrors <see cref="ForgeFieldNameAsync"/>.</summary>
+    public static async Task<byte[]> ForgeLeafColumnNameAsync(byte[] bytes, string targetLeafName, string forgedName)
+    {
+        byte[] newFooter;
+        using (var stream = new MemoryStream(bytes, writable: false))
+        {
+            ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                global::Parquet.Meta.FileMetaData metadata = reader.Metadata!;
+                global::Parquet.Meta.SchemaElement element =
+                    metadata.Schema.FirstOrDefault(e => e.Name == targetLeafName)
+                    ?? throw new InvalidOperationException($"no footer schema element named '{targetLeafName}'");
+                element.Name = forgedName;
+                foreach (global::Parquet.Meta.RowGroup rowGroup in metadata.RowGroups)
+                {
+                    foreach (global::Parquet.Meta.ColumnChunk chunk in rowGroup.Columns)
+                    {
+                        List<string> path = chunk.MetaData!.PathInSchema;
+                        for (int i = 0; i < path.Count; i++)
+                        {
+                            if (string.Equals(path[i], targetLeafName, StringComparison.Ordinal))
+                            {
+                                path[i] = forgedName;
+                            }
+                        }
+                    }
+                }
+
                 newFooter = SerializeFooter(metadata);
             }
         }

@@ -290,6 +290,94 @@ internal sealed class CheckpointFixture
         return this;
     }
 
+    /// <summary>Authors a MINIMAL classic checkpoint whose ONLY column is the <c>add.partitionValues</c> MAP —
+    /// no scalar precedes it, so the checkpoint reader's FIRST (and only) reconstructed column is that map and
+    /// a row-count forge trips the MAP reconstruction path (<c>CheckpointColumns.ForEachMapEntry</c>) rather
+    /// than a scalar slot check. The map's KEY leaf is renamed to <paramref name="keyLeafName"/> by forging the
+    /// footer AFTER serialization (Parquet.Net's untyped serializer hard-requires the literal <c>key</c>/
+    /// <c>value</c> leaf names), so the resolved key <c>DataField.Path</c> carries that FILE-derived leaf name
+    /// (<c>CheckpointSchema.Map</c> returns Parquet.Net's logical <c>.Key</c>/<c>.Value</c> verbatim). The row
+    /// group's declared row count is then forged to one MORE than the two entries it holds, so the map
+    /// reconstruction fails closed at the row-count check — proving that message never echoes the leaf path
+    /// (#653).</summary>
+    internal static async Task<byte[]> MalformedAddPartitionValuesMapAsync(string keyLeafName)
+    {
+        var schema = new ParquetSchema(new StructField("add",
+            new MapField("partitionValues",
+                new DataField<string>("key", nullable: false),
+                new DataField<string?>("value"))));
+        var rows = new List<IDictionary<string, object?>>
+        {
+            new Dictionary<string, object?>
+            {
+                ["add"] = new Dictionary<string, object?>
+                {
+                    ["partitionValues"] = new Dictionary<string, string?> { ["k1"] = "v1" },
+                },
+            },
+            new Dictionary<string, object?>
+            {
+                ["add"] = new Dictionary<string, object?>
+                {
+                    ["partitionValues"] = new Dictionary<string, string?> { ["k2"] = "v2" },
+                },
+            },
+        };
+
+        byte[] bytes;
+        using (var stream = new MemoryStream())
+        {
+            await ParquetSerializer.SerializeUntypedAsync(rows, schema, stream);
+            bytes = stream.ToArray();
+        }
+
+        bytes = await ParquetTestHelpers.ForgeLeafColumnNameAsync(bytes, "key", keyLeafName);
+        long actual = await ParquetTestHelpers.RowGroupNumRowsAsync(bytes, 0);
+        return await ParquetTestHelpers.ForgeRowGroupNumRowsAsync(bytes, 0, actual + 1);
+    }
+
+    /// <summary>Authors a MINIMAL classic checkpoint whose ONLY column is the <c>metaData.partitionColumns</c>
+    /// LIST — no scalar precedes it, so the reader's FIRST (and only) reconstructed column is that list and a
+    /// row-count forge trips the LIST reconstruction path (<c>CheckpointColumns.ForEachListElement</c>). Its
+    /// ELEMENT leaf is named <paramref name="elementLeafName"/> DIRECTLY (Parquet.Net's untyped serializer
+    /// accepts a custom list-element name), so the resolved element <c>DataField.Path</c> carries that
+    /// FILE-derived leaf name (<c>CheckpointSchema.ListElement</c> returns Parquet.Net's logical <c>.Item</c>
+    /// verbatim). The row group's declared row count is then forged to one MORE than the two elements it holds,
+    /// so the list reconstruction fails closed at the row-count check — proving that message never echoes the
+    /// leaf path (#653).</summary>
+    internal static async Task<byte[]> MalformedMetaPartitionColumnsListAsync(string elementLeafName)
+    {
+        var schema = new ParquetSchema(new StructField("metaData",
+            new ListField("partitionColumns", new DataField<string?>(elementLeafName))));
+        var rows = new List<IDictionary<string, object?>>
+        {
+            new Dictionary<string, object?>
+            {
+                ["metaData"] = new Dictionary<string, object?>
+                {
+                    ["partitionColumns"] = new List<string?> { "c1" },
+                },
+            },
+            new Dictionary<string, object?>
+            {
+                ["metaData"] = new Dictionary<string, object?>
+                {
+                    ["partitionColumns"] = new List<string?> { "c2" },
+                },
+            },
+        };
+
+        byte[] bytes;
+        using (var stream = new MemoryStream())
+        {
+            await ParquetSerializer.SerializeUntypedAsync(rows, schema, stream);
+            bytes = stream.ToArray();
+        }
+
+        long actual = await ParquetTestHelpers.RowGroupNumRowsAsync(bytes, 0);
+        return await ParquetTestHelpers.ForgeRowGroupNumRowsAsync(bytes, 0, actual + 1);
+    }
+
     private static Dictionary<string, string?> ToNullableMap((string Key, string? Value)[]? entries)
     {
         var map = new Dictionary<string, string?>(StringComparer.Ordinal);

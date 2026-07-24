@@ -649,6 +649,12 @@ internal sealed class ChangeFeedReader
 
             if (!fileByName.TryAdd(field.Name, field.DataType))
             {
+                // Defense-in-depth, UNREACHABLE via the read path: ReadDataSchemaAsync (called before this
+                // validator) builds a StructType, whose ctor rejects duplicate field names
+                // (SchemaValidationException, STORY-02.5.1 AC2) and is re-mapped to CorruptData — so a
+                // duplicate-column cdc file fails closed upstream before EE-08 runs. Retained fail-closed
+                // (in case that upstream invariant ever changes) but not durably testable, so — like the
+                // other EE-08 messages (#653) — it names no file-derived column, only that a duplicate exists.
                 throw NewCdcSchemaMismatch(version, "it declares a data column more than once");
             }
         }

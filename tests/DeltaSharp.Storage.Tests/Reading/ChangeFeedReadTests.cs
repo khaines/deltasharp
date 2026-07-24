@@ -126,6 +126,12 @@ public sealed class ChangeFeedReadTests : IDisposable
     // ONLY the surplus column is inconsistent, and its file-derived NAME must never reach the surfaced message.
     private const string SurplusSentinelColumn = "z_att4cker_surplus_col_s3ntinel";
 
+    // A sentinel embedded in the cdc FILE PATH (via the DELETE's cdc-file-name factory) — the `path` param
+    // NewCdcSchemaMismatch dropped (#653 site 1a). A foreign/hostile cdc file's path is attacker-controllable
+    // (CDF §5.1), so an EE-08 mismatch must never echo it. Distinct from the surplus COLUMN sentinel so the
+    // no-echo assertion targets the PATH scrub specifically.
+    private const string CdcPathSentinel = "att4cker_cdc_path_s3ntinel";
+
     private static readonly StructType CdcSurplusColumnSchema = new(new[]
     {
         new StructField("id", DataTypes.LongType, nullable: false),
@@ -1410,6 +1416,32 @@ public sealed class ChangeFeedReadTests : IDisposable
             async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
         Assert.DoesNotContain(SurplusSentinelColumn, ex.Message, StringComparison.Ordinal);   // no file-name leak
         Assert.Contains("absent from the version's metadata schema", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("CDF-EE-08", ex.Message, StringComparison.Ordinal);
+        Assert.Null(ex.InnerException);   // a pure per-version schema-validation failure, not a wrapped I/O fault
+    }
+
+    [Fact]
+    public async Task Explicit_CdcSchemaMismatch_FailsClosedWithoutEchoingCdcFilePath()
+    {
+        // Message hygiene (#653 site 1a): NewCdcSchemaMismatch dropped the cdc file `path` param entirely — a
+        // foreign/hostile cdc file's PATH is attacker-controllable (CDF §5.1, mirrors #516), so an EE-08 schema
+        // mismatch must NOT echo it. Author a DELETE whose cdc file lives at a path carrying a sentinel token
+        // (the cdc-file-name factory feeds `_change_data/cdc-<token>.parquet` UNSANITIZED), then overwrite that
+        // cdc file with a surplus-column body to trip EE-08. The surfaced message must never contain the path
+        // sentinel. (The trigger reuses the surplus fixture, whose own COLUMN sentinel is distinct — this test
+        // asserts only the PATH sentinel's absence, isolating the dropped `path` param.)
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0, v1 (schema A = id, name)
+        var backend = new LocalFileSystemBackend(_root);
+        await NewCdfDelete(backend, CdcPathSentinel).DeleteAsync(WhereId(id => id == 1));   // v2 cdc at sentinel path
+        string cdc = Assert.Single(CdcFilePaths());
+        Assert.Contains(CdcPathSentinel, cdc, StringComparison.Ordinal);   // precondition: the sentinel IS in the path
+        byte[] surplus = await ParquetTestHelpers.WriteToBytesAsync(
+            CdcSurplusColumnSchema, new[] { CdcSurplusColumnBatch() });
+        await File.WriteAllBytesAsync(Path.Combine(_root, cdc), surplus);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
+        Assert.DoesNotContain(CdcPathSentinel, ex.Message, StringComparison.Ordinal);   // no cdc-file-path leak
         Assert.Contains("CDF-EE-08", ex.Message, StringComparison.Ordinal);
         Assert.Null(ex.InnerException);   // a pure per-version schema-validation failure, not a wrapped I/O fault
     }

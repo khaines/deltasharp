@@ -427,6 +427,54 @@ public sealed class DeltaCheckpointReaderTests
     }
 
     [Fact]
+    public async Task MalformedMapReconstruction_MessageDoesNotEchoMapKeyLeafPath()
+    {
+        // #653 no-echo (MAP reconstruction path). The sibling MalformedReconstruction_... test covers the
+        // SCALAR site; a global numRows forge on a full checkpoint never reaches the map/list sites because the
+        // FIRST scalar column (add/path) trips first. This covers the MAP site: a MINIMAL checkpoint whose ONLY
+        // column is the add.partitionValues MAP (no preceding scalar) so the map is the first reconstructed
+        // column. Its key leaf is renamed to an attacker SENTINEL — and unlike the scalar add/path (a fixed
+        // protocol name), a map key leaf name is genuinely FILE-DERIVED: CheckpointSchema.Map returns
+        // Parquet.Net's logical .Key verbatim from the footer, so a foreign checkpoint controls it. The row
+        // group over-declares its row count, so CheckpointColumns.ForEachMapEntry → EnsureRowCount fails closed
+        // — and its message must NOT echo the file-derived key path (add/partitionValues/key_value/<sentinel>).
+        const string keySentinel = "att4cker_ckpt_map_key_s3ntinel";
+        byte[] forged = await CheckpointFixture.MalformedAddPartitionValuesMapAsync(keySentinel);
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(forged), default));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.DoesNotContain(keySentinel, ex.Message, StringComparison.Ordinal);   // no file-derived leaf path
+        Assert.DoesNotContain("'", ex.Message, StringComparison.Ordinal);           // no quoted path at all
+        // Pins the scrubbed EnsureRowCount site reached via ForEachMapEntry (not the scalar SlotMismatch site):
+        // the message names the column CLASS and the reconstructed/declared row counts, never the leaf path.
+        Assert.Contains("A checkpoint column reconstructed", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task MalformedListReconstruction_MessageDoesNotEchoListElementLeafPath()
+    {
+        // #653 no-echo (LIST reconstruction path). Sibling of the map test above: a MINIMAL checkpoint whose
+        // ONLY column is the metaData.partitionColumns LIST (no preceding scalar), so the list is the first
+        // reconstructed column. Its element leaf is named an attacker SENTINEL — file-derived, since
+        // CheckpointSchema.ListElement returns Parquet.Net's logical .Item verbatim from the footer. The row
+        // group over-declares its row count, so CheckpointColumns.ForEachListElement → EnsureRowCount fails
+        // closed — and its message must NOT echo the element path (metaData/partitionColumns/list/<sentinel>).
+        const string elementSentinel = "att4cker_ckpt_list_elem_s3ntinel";
+        byte[] forged = await CheckpointFixture.MalformedMetaPartitionColumnsListAsync(elementSentinel);
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(forged), default));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.DoesNotContain(elementSentinel, ex.Message, StringComparison.Ordinal);   // no file-derived path
+        Assert.DoesNotContain("'", ex.Message, StringComparison.Ordinal);               // no quoted path at all
+        // Pins the scrubbed EnsureRowCount site reached via ForEachListElement (not the scalar SlotMismatch).
+        Assert.Contains("A checkpoint column reconstructed", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task PartByteCeiling_RejectsOversizedPart()
     {
         byte[] parquet = await new CheckpointFixture()
