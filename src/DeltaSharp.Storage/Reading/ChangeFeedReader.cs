@@ -693,8 +693,10 @@ internal sealed class ChangeFeedReader
     //
     // This is a MULTI-READ of the same file, NOT a single pass. `ReadChangeTypesAsync` first reads the
     // `_change_type` column fully into a flat array (by NAME — never column-mapped); an EAGER footer-only
-    // row-count probe (GetRowCountAsync, no data pages) then fails the count-consistency check closed BEFORE
-    // the first yield (see the eager check below — council red-team, #644); finally the data columns are
+    // row-count probe (GetRowCountAsync, no data pages) then best-effort fails the count-consistency check
+    // closed before the first yield (see the eager check below — council red-team, #644; it closes the window
+    // BEFORE the probe, not the residual probe↔data-open window — full closure needs the single-pass #658);
+    // finally the data columns are
     // STREAMED (mode-aware physical resolution) and each data batch is aligned to its slice of the change types
     // by cumulative row position. The single-pass ideal (#644) — projecting `_change_type` ALONGSIDE the data
     // columns in one ReadAsync — is NOT taken here: `ParquetFileReader.ReadAsync` cannot resolve a MIXED
@@ -720,18 +722,27 @@ internal sealed class ChangeFeedReader
         // closed domain. Read fully up front so each streamed data batch aligns to its slice by row position.
         string[] changeTypes = await ReadChangeTypesAsync(cdc.Path, cancellationToken).ConfigureAwait(false);
 
-        // EAGER fail-closed consistency check (council red-team, #644) — restores the pre-#644 BUFFERED form's
-        // "fail closed BEFORE the first batch" guarantee. The buffered form read the WHOLE file (both passes)
-        // before returning, so the `_change_type`-vs-data too-few check ran before ANY batch surfaced — even an
-        // early-break consumer of the public `ReadChangeBatchesAsync` (an IAsyncEnumerable) got the fail-closed
-        // error on a count-inconsistent cdc file. Streaming defers the post-loop too-few check to FULL
-        // enumeration, so without THIS check an external early-break consumer would receive a batch and bypass
-        // it (the red-team proved this with a TOCTOU: the cdc file atomically replaced between the two passes,
-        // yielding a different row count). So here — after the `_change_type` count is known and BEFORE the
-        // data loop yields anything — probe the cdc file's FOOTER-only row count and fail closed on a mismatch.
-        // GetRowCountAsync decodes NO data pages (footer only), so this stays cheap. NOTE: the deeper
-        // same-row-count TOCTOU (a replacement with an IDENTICAL row count) is pre-existing in BOTH forms and is
-        // structurally eliminated only by the single-pass (#658).
+        // EAGER (best-effort) fail-closed consistency check (council red-team, #644). The pre-#644 BUFFERED
+        // form read the WHOLE file (both passes) before returning, so the `_change_type`-vs-data too-few check
+        // ran before ANY batch surfaced — even an early-break consumer of the public `ReadChangeBatchesAsync`
+        // (an IAsyncEnumerable) got the fail-closed error on a count-inconsistent cdc file. Streaming defers the
+        // post-loop too-few check to FULL enumeration, so without a pre-yield check an external early-break
+        // consumer could receive a batch and bypass it. So here — after the `_change_type` count is known and
+        // BEFORE the data loop yields anything — probe the cdc file's FOOTER-only row count and fail closed on a
+        // mismatch (GetRowCountAsync decodes NO data pages, so it stays cheap).
+        //
+        // SCOPE OF THE GUARANTEE (best-effort, NOT absolute). This probe is a SEPARATE OpenReadAsync from the
+        // data stream below, so it closes only the window BEFORE the probe: a count-changing cdc-file
+        // replacement occurring before this probe is caught pre-first-yield. It does NOT close the residual
+        // window between THIS probe and the data pass's own open — a replacement timed there (or a same-row-count
+        // replacement, which this count check can never see) still yields a batch before the streamed data's
+        // per-batch too-many / post-loop too-few checks fail closed DURING enumeration. Fully restoring the
+        // buffered form's fail-closed-before-first-batch (and closing the same-count window) requires reading
+        // `_change_type` and the data from ONE open — the single-pass tracked in #658. This is defense-in-depth,
+        // not a security boundary: cdc files are immutable by the Delta protocol, so ANY such replacement is an
+        // out-of-contract mutation (storage corruption / an actor with storage-write access, who could also
+        // replace with same-count-wrong-data — misaligned in the buffered form too). In-contract (a well-formed
+        // immutable cdc file) footer count == `_change_type` count == data count always, so this is transparent.
         long footerRowCount;
         try
         {
@@ -752,8 +763,8 @@ internal sealed class ChangeFeedReader
 
         if (footerRowCount != changeTypes.Length)
         {
-            // Fail closed before the FIRST yield (all consumers, early-break or full) — the buffered form's
-            // guarantee. Same message shape as the post-loop too-few check.
+            // Fail closed before the first yield on a count mismatch the probe can see (best-effort — closes the
+            // window before this probe; see the scope note above). Same message shape as the post-loop too-few.
             throw new DeltaReadException(
                 $"Change-data file '{cdc.Path}' produced {footerRowCount} data row(s) but has "
                 + $"{changeTypes.Length} '{ChangeDataWriter.ChangeTypeColumn}' value(s); the change-data file "
@@ -830,9 +841,10 @@ internal sealed class ChangeFeedReader
         if (offset != changeTypes.Length)
         {
             // Fewer data rows than `_change_type` values ⇒ same fail-closed consistency guarantee, verified once
-            // the whole file has streamed. Retained as defence-in-depth behind the eager footer check (which
-            // now provides the fail-closed-before-first-batch guarantee): this still catches a mid-stream decode
-            // fault that truncates the data pass below the footer's declared total.
+            // the whole file has streamed. Retained as defence-in-depth alongside the best-effort eager footer
+            // probe (which cannot close the probe↔data-open window nor a same-count replacement): this catches a
+            // mid-stream decode fault, or a TOCTOU the eager probe missed, that truncates the data pass below
+            // the footer's declared total (full closure — fail-closed-before-first-batch — needs #658).
             throw new DeltaReadException(
                 $"Change-data file '{cdc.Path}' produced {offset} data row(s) but has {changeTypes.Length} "
                 + $"'{ChangeDataWriter.ChangeTypeColumn}' value(s); the change-data file is inconsistent.");
