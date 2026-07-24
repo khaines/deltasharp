@@ -458,7 +458,13 @@ internal sealed class DeltaDelete
         await using (stream.ConfigureAwait(false))
         {
             await foreach (ColumnBatch dataBatch in _reader
-                .ReadAsync(stream, dataSchema, keepRowGroup: null, nullFillMissingColumns: false, allowTypeWideningPromotion, resolveByFieldId, cancellationToken)
+                // #645: null-fill absent columns (like the read/CDF/optimize paths — DeltaReadSource /
+                // ChangeFeedReader / DeltaOptimize all pass nullFillMissingColumns:true, #497/#530). dataSchema
+                // is the CURRENT (reconciled) table schema, so a still-active file written under an OLDER,
+                // NARROWER schema (e.g. left resident by a prior partial DV-delete, then ADD COLUMN) is missing
+                // a later-added NULLABLE column; null-filling it lets the DELETE predicate re-scan that file
+                // faithfully (absent column reads as null) instead of failing closed on ColumnNotPresentInFile.
+                .ReadAsync(stream, dataSchema, keepRowGroup: null, nullFillMissingColumns: true, allowTypeWideningPromotion, resolveByFieldId, cancellationToken)
                 .ConfigureAwait(false))
             {
                 ColumnBatch fullBatch = ColumnMappingProjection.BuildFullBatch(
