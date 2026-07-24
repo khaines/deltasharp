@@ -544,6 +544,38 @@ public sealed class DeltaCheckpointReaderTests
     }
 
     [Fact]
+    public async Task MalformedMapReconstruction_SlotMismatch_MessageDoesNotEchoMapKeyLeafPath()
+    {
+        // #653 no-echo (MAP reconstruction, ForEachMapEntry key/value SLOT-COUNT check) — the R6 finding that
+        // corrects an R5 "UNREACHABLE" annotation. R5 claimed this branch could not be hit through the public
+        // read door because the only tool that can desync a map's key/value level streams — the low-level
+        // ParquetRowGroupWriter.WriteAsync<T> — is T:struct-constrained and so (it claimed) cannot author the
+        // STRING leaves a checkpoint map requires, meaning a slot-divergent map would necessarily be non-string
+        // and trip the physical-type guard FIRST. That is FALSE: ReadOnlyMemory<char> IS a struct, so the
+        // low-level writer authors a genuine STRING map whose KEY stream has 3 slots (rep 0,1,0) and VALUE
+        // stream has 2 (rep 0,0). Both decode cleanly as ReadOnlyMemory<char> (no physical-type trip) and,
+        // because both still carry two repetition-0 rows, the row count stays a consistent 2 — so
+        // CheckpointColumns.ForEachMapEntry reaches the slot-count check (keys.Definition.Length 3 !=
+        // values.Definition.Length 2) rather than a row-count check. The map key leaf carries an attacker
+        // SENTINEL — file-derived, since CheckpointSchema.Map returns Parquet.Net's logical .Key verbatim — so a
+        // reverted scrub would echo add/partitionValues/key_value/<sentinel>. NOTE: this branch's fixed message
+        // quotes nothing, so (unlike the scalar/physical-type siblings) the no-echo signal is the SENTINEL's
+        // absence — DoesNotContain(sentinel) is the load-bearing assertion; Contains(...) pins THIS branch.
+        const string keySentinel = "att4cker_ckpt_map_slots_s3ntinel";
+        byte[] forged = await CheckpointFixture.MalformedAddPartitionValuesMapSlotMismatchAsync(keySentinel);
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(forged), default));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.DoesNotContain(keySentinel, ex.Message, StringComparison.Ordinal);   // no file-derived leaf path
+        // Pins the scrubbed slot-count branch of ForEachMapEntry (distinct from the EnsureRowInRange/
+        // EnsureRowCount and physical-type sites the other map siblings pin): names the column CLASS and the
+        // bounded slot counts, never the leaf path.
+        Assert.Contains("mismatched key/value slot counts", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task PartByteCeiling_RejectsOversizedPart()
     {
         byte[] parquet = await new CheckpointFixture()

@@ -593,14 +593,16 @@ internal sealed class CheckpointColumns
             throw DeltaProtocolException.Malformed("A checkpoint map column is not repeated.");
         }
 
-        // Defensive parity, guaranteed unreachable through the public read door (R5 #653): a map's key and
-        // value share one repeated key_value group, so every conformant writer — and Parquet.Net's decoder —
-        // emits key/value level streams of identical length. The only tool that can desync them, the low-level
-        // ParquetRowGroupWriter.WriteAsync<T>, is T:struct-constrained and so cannot author the STRING leaves a
-        // checkpoint map requires; a slot-divergent map is therefore necessarily non-string, and reading its
-        // string-typed leaves trips the physical-type guard (ReadRawAsync, below) BEFORE this check. The guard
-        // is kept as an explicit local invariant so a future decode path that desynced the streams still fails
-        // closed rather than pair a key with the wrong value.
+        // Reachable through the public read door (R6 #653, correcting an earlier R5 "unreachable" annotation):
+        // a map's key and value share one repeated key_value group, so every CONFORMANT writer — and
+        // Parquet.Net's own decoder — emits key/value level streams of identical length. But the low-level
+        // ParquetRowGroupWriter.WriteAsync<T> can desync them, and its T:struct constraint does NOT bar the
+        // STRING leaves a checkpoint map requires: ReadOnlyMemory<char> IS a struct, so a string map with (say)
+        // 3 key slots vs 2 value slots authors cleanly and decodes PAST the physical-type guard (ReadRawAsync)
+        // to reach this check. Covered by
+        // DeltaCheckpointReaderTests.MalformedMapReconstruction_SlotMismatch_MessageDoesNotEchoMapKeyLeafPath.
+        // The message names only the column CLASS and the bounded slot counts — the file-derived key/value
+        // DataField.Path is scrubbed here, exactly like its EnsureRowInRange/EnsureRowCount siblings (#653).
         if (keys.Definition.Length != values.Definition.Length)
         {
             throw DeltaProtocolException.Malformed(string.Create(

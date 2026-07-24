@@ -379,6 +379,57 @@ internal sealed class CheckpointFixture
         return await ParquetTestHelpers.ForgeLeafColumnNameAsync(bytes, "value", valueLeafName);
     }
 
+    /// <summary>Authors a MINIMAL classic checkpoint whose ONLY column is the <c>add.partitionValues</c> MAP,
+    /// written through the <b>low-level</b> <see cref="ParquetRowGroupWriter"/>'s <c>WriteAsync&lt;T&gt;</c> so
+    /// the map's KEY and VALUE level streams are <b>DESYNCED</b> — something the high-level untyped serializer
+    /// can never emit (a map's key and value share one repeated <c>key_value</c> group, so it always authors
+    /// identical key/value slot counts). This is the R6 refutation of the R5 "the struct-only low-level writer
+    /// can't author string map leaves" annotation: <c>ReadOnlyMemory&lt;char&gt;</c> satisfies the writer's
+    /// <c>T : struct</c> constraint, so it authors a genuine STRING (BYTE_ARRAY/UTF8) leaf that the reader
+    /// decodes cleanly as <c>ReadOnlyMemory&lt;char&gt;</c> — the physical-type guard does NOT trip first. The
+    /// KEY leaf is written with repetition levels <c>0,1,0</c> (3 slots) and the VALUE leaf with <c>0,0</c>
+    /// (2 slots); both carry two repetition-0 markers, so the row group's row count stays a consistent 2 (no
+    /// numRows forge) and the map reconstruction reaches the key/value <b>slot-count</b> check — not a
+    /// row-count check — where <c>keys.Definition.Length</c> (3) ≠ <c>values.Definition.Length</c> (2) trips
+    /// <c>CheckpointColumns.ForEachMapEntry</c>'s slot-mismatch branch. The key leaf is renamed to
+    /// <paramref name="keyLeafName"/> after write; its resolved key <c>DataField.Path</c> is FILE-derived
+    /// (<c>CheckpointSchema.Map</c> returns Parquet.Net's logical <c>.Key</c> verbatim), so a reverted scrub
+    /// would echo <c>add/partitionValues/key_value/&lt;sentinel&gt;</c> into that message (#653).</summary>
+    internal static async Task<byte[]> MalformedAddPartitionValuesMapSlotMismatchAsync(string keyLeafName)
+    {
+        var schema = new ParquetSchema(new StructField("add",
+            new MapField("partitionValues",
+                new DataField<string>("key", nullable: false),
+                new DataField<string?>("value"))));
+        DataField[] leaves = schema.GetDataFields();   // [key, value]
+
+        // Every key/value is present (non-null) so all inferred definition levels sit at max — the divergence
+        // is purely in the NUMBER of slots (3 key vs 2 value), authored via the desynced repetition streams.
+        var keys = new ReadOnlyMemory<char>?[] { "k1".AsMemory(), "k2".AsMemory(), "k3".AsMemory() };
+        var values = new ReadOnlyMemory<char>?[] { "v1".AsMemory(), "v2".AsMemory() };
+
+        byte[] bytes;
+        using (var stream = new MemoryStream())
+        {
+            await using (ParquetWriter writer = await ParquetWriter.CreateAsync(schema, stream))
+            {
+                using ParquetRowGroupWriter rowGroup = writer.CreateRowGroup();
+                // ReadOnlyMemory<char> : struct → the low-level writer authors a real STRING leaf. Definition
+                // levels are inferred from the (all-non-null) value arrays; repetition levels are supplied
+                // directly — 3 for the key (0,1,0), 2 for the value (0,0) — so keys.Definition.Length (3) !=
+                // values.Definition.Length (2). Both streams still carry two repetition-0 rows (numRows == 2).
+                await rowGroup.WriteAsync<ReadOnlyMemory<char>>(
+                    leaves[0], new ReadOnlyMemory<ReadOnlyMemory<char>?>(keys), new[] { 0, 1, 0 }, null, CancellationToken.None);
+                await rowGroup.WriteAsync<ReadOnlyMemory<char>>(
+                    leaves[1], new ReadOnlyMemory<ReadOnlyMemory<char>?>(values), new[] { 0, 0 }, null, CancellationToken.None);
+            }
+
+            bytes = stream.ToArray();
+        }
+
+        return await ParquetTestHelpers.ForgeLeafColumnNameAsync(bytes, "key", keyLeafName);
+    }
+
     /// <summary>Authors a MINIMAL classic checkpoint whose ONLY column is a legacy 1-level <b>REPEATED</b>
     /// primitive <c>add.size</c> (a <c>DataField</c> with <c>isArray=true</c>, <c>MaxRepetitionLevel=1</c>
     /// directly under the <c>add</c> struct). <c>CheckpointSchema.Scalar</c> resolves <c>add/size</c> as an
