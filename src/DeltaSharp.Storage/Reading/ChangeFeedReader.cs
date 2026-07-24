@@ -369,9 +369,8 @@ internal sealed class ChangeFeedReader
                     {
                         await ValidateExplicitCdcSchemaAsync(
                             cdc.Path, versionPhysicalDataSchema, v, cancellationToken).ConfigureAwait(false);
-                        IReadOnlyList<ColumnBatch> batches = await ReadExplicitFileAsync(
-                            cdc, ctx, v, commitMillis, cancellationToken).ConfigureAwait(false);
-                        foreach (ColumnBatch batch in batches)
+                        await foreach (ColumnBatch batch in ReadExplicitFileAsync(
+                                cdc, ctx, v, commitMillis, cancellationToken).ConfigureAwait(false))
                         {
                             yield return batch;
                         }
@@ -674,64 +673,111 @@ internal sealed class ChangeFeedReader
             + "authority) before reading, and fails closed on a mismatch (design §3.2 CDF-EE-08).");
 
     // Explicit path (§2.2): the change rows for this version are EXACTLY the cdc file's rows, each carrying its
-    // own `_change_type`. cdc files hold only the change rows (bounded by the change size, not the table), so
-    // this materializes one cdc file's batches — enabling a clean TWO-READ over the same file: read the
-    // `_change_type` column (by name — never column-mapped) fully into a flat array, then stream the data
-    // columns (mode-aware physical resolution) and align each data batch to its slice of the change types by
-    // cumulative row position (asserting the totals match). The two reads project the same file in the same
-    // row order, so the alignment is exact.
-    private async Task<IReadOnlyList<ColumnBatch>> ReadExplicitFileAsync(
-        AddCdcFileAction cdc, OutputContext ctx, long version, long commitMillis, CancellationToken cancellationToken)
+    // own per-row `_change_type`. Streams the cdc file row-group by row-group — SYMMETRIC with
+    // ReadImplicitFileAsync (#644): a large cdc file is NOT buffered into a per-file List&lt;ColumnBatch&gt;;
+    // each row group's batch is yielded as it decodes. Every yielded batch is one row group of one cdc file of
+    // one version, so it carries exactly ONE `_commit_version` (INV C8).
+    //
+    // This is a TWO-READ of the same file, NOT a single pass. `ReadChangeTypesAsync` first reads the
+    // `_change_type` column fully into a flat array (by NAME — never column-mapped), then the data columns are
+    // STREAMED (mode-aware physical resolution) and each data batch is aligned to its slice of the change types
+    // by cumulative row position. The single-pass ideal (#644) — projecting `_change_type` ALONGSIDE the data
+    // columns in one ReadAsync — is NOT taken here: `ParquetFileReader.ReadAsync` cannot resolve a MIXED
+    // projection, because under column-mapping id mode it resolves EVERY requested column by field-id and
+    // `_change_type` (engine-written, no field-id) would be treated absent (fail closed). Folding the two reads
+    // into one needs per-field name-fallback in the reader — a fail-closed-posture change to id-mode resolution
+    // that would affect every id-mode caller, so it is deliberately deferred (tracked in #658) rather than done
+    // as invasive reader surgery riding on this perf refactor. The `_change_type` array is bounded by the
+    // CHANGE count (not the table/range), so the up-front read stays cheap; this change removes only the
+    // per-file BUFFER. The two reads project the same file in the same row order, so the alignment is exact —
+    // the cumulative-offset checks below assert the totals agree (data-row count == `_change_type` count),
+    // fail-closed defence in depth against the two reads disagreeing.
+    //
+    // Errors are classified before/around the yielding loop (NEVER across a `yield return`, mirroring
+    // ReadImplicitFileAsync): the read/classify step (MoveNextAsync + Current) sits in a try that maps a
+    // DeltaStorageException → DeltaReadSchemaEvolutionException (narrow-schema-evolution input) or
+    // ClassifyFileError; the batch assembly + `yield return` happen OUTSIDE the try.
+    private async IAsyncEnumerable<ColumnBatch> ReadExplicitFileAsync(
+        AddCdcFileAction cdc, OutputContext ctx, long version, long commitMillis,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
     {
+        // Pass 1 (bounded by the change count): the `_change_type` column, validated non-null + within the §5.2
+        // closed domain. Read fully up front so each streamed data batch aligns to its slice by row position.
         string[] changeTypes = await ReadChangeTypesAsync(cdc.Path, cancellationToken).ConfigureAwait(false);
 
-        var outputs = new List<ColumnBatch>();
-        long offset = 0;
+        Stream stream;
         try
         {
-            Stream stream = await _backend.OpenReadAsync(cdc.Path, cancellationToken).ConfigureAwait(false);
-            await using (stream.ConfigureAwait(false))
-            {
-                await foreach (ColumnBatch physical in _reader
-                    .ReadAsync(
-                        stream, ctx.PhysicalDataSchema, keepRowGroup: null, nullFillMissingColumns: true,
-                        ctx.AllowTypeWideningPromotion, ctx.ResolveByFieldId, cancellationToken)
-                    .ConfigureAwait(false))
-                {
-                    int rows = physical.RowCount;
-                    if (checked(offset + rows) > changeTypes.Length)
-                    {
-                        throw new DeltaReadException(
-                            $"Change-data file '{cdc.Path}' produced more data rows than "
-                            + $"'{ChangeDataWriter.ChangeTypeColumn}' values; the change-data file is inconsistent.");
-                    }
-
-                    ColumnBatch logical = ColumnMappingProjection.BuildFullBatch(
-                        cdc.PartitionValues, ctx.OutputDataSchema, ctx.PhysicalNames, ctx.DataOrdinalByField,
-                        physical);
-                    outputs.Add(AppendMetadataColumns(
-                        logical, ctx, PerRowChangeType(changeTypes, (int)offset, rows), version, commitMillis));
-                    offset += rows;
-                }
-            }
-        }
-        catch (DeltaStorageException ex) when (IsNarrowSchemaEvolutionInput(ex))
-        {
-            throw new DeltaReadSchemaEvolutionException(cdc.Path, ex);
+            stream = await _backend.OpenReadAsync(cdc.Path, cancellationToken).ConfigureAwait(false);
         }
         catch (DeltaStorageException ex)
         {
             throw ClassifyFileError(cdc.Path, ex);
         }
 
+        // Pass 2 STREAMED: decode the data columns row-group by row-group, aligning each batch to its slice of
+        // `changeTypes` by cumulative offset. `offset` tracks the data rows seen so far (== the next slice start).
+        long offset = 0;
+        await using (stream.ConfigureAwait(false))
+        {
+            IAsyncEnumerator<ColumnBatch> enumerator = _reader
+                .ReadAsync(
+                    stream, ctx.PhysicalDataSchema, keepRowGroup: null, nullFillMissingColumns: true,
+                    ctx.AllowTypeWideningPromotion, ctx.ResolveByFieldId, cancellationToken)
+                .GetAsyncEnumerator(cancellationToken);
+            await using (enumerator.ConfigureAwait(false))
+            {
+                while (true)
+                {
+                    ColumnBatch physical;
+                    try
+                    {
+                        if (!await enumerator.MoveNextAsync().ConfigureAwait(false))
+                        {
+                            break;
+                        }
+
+                        physical = enumerator.Current;
+                    }
+                    catch (DeltaStorageException ex) when (IsNarrowSchemaEvolutionInput(ex))
+                    {
+                        throw new DeltaReadSchemaEvolutionException(cdc.Path, ex);
+                    }
+                    catch (DeltaStorageException ex)
+                    {
+                        throw ClassifyFileError(cdc.Path, ex);
+                    }
+
+                    int rows = physical.RowCount;
+                    if (checked(offset + rows) > changeTypes.Length)
+                    {
+                        // More data rows than `_change_type` values ⇒ the two reads of the same file disagree.
+                        throw new DeltaReadException(
+                            $"Change-data file '{cdc.Path}' produced more data rows than "
+                            + $"'{ChangeDataWriter.ChangeTypeColumn}' values; the change-data file is inconsistent.");
+                    }
+
+                    // Relabel physical→logical + hydrate partition columns, then stamp the per-row `_change_type`
+                    // slice + the per-version metadata (one `_commit_version` for the whole batch, INV C8).
+                    ColumnBatch logical = ColumnMappingProjection.BuildFullBatch(
+                        cdc.PartitionValues, ctx.OutputDataSchema, ctx.PhysicalNames, ctx.DataOrdinalByField,
+                        physical);
+                    ColumnBatch output = AppendMetadataColumns(
+                        logical, ctx, PerRowChangeType(changeTypes, (int)offset, rows), version, commitMillis);
+                    offset += rows;
+                    yield return output;
+                }
+            }
+        }
+
         if (offset != changeTypes.Length)
         {
+            // Fewer data rows than `_change_type` values ⇒ same fail-closed consistency guarantee, verified once
+            // the whole file has streamed (the streaming counterpart of the original post-loop total check).
             throw new DeltaReadException(
                 $"Change-data file '{cdc.Path}' produced {offset} data row(s) but has {changeTypes.Length} "
                 + $"'{ChangeDataWriter.ChangeTypeColumn}' value(s); the change-data file is inconsistent.");
         }
-
-        return outputs;
     }
 
     // Reads the `_change_type` column (by name; never column-mapped) fully, validating each value non-null and

@@ -109,6 +109,17 @@ public sealed class ChangeFeedReadTests : IDisposable
         new StructField(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: false),
     });
 
+    // The physical body layout the ChangeDataWriter emits for a FlatSchema cdc file: the data columns FIRST,
+    // then the engine-appended `_change_type` (design §2.4 / ChangeDataWriter.AppendChangeTypeColumn). Used to
+    // author a MULTI-ROW-GROUP cdc file (#644 streaming test) that overwrites a real DELETE-produced cdc file —
+    // the explicit read reads EXACTLY the cdc file's rows (precedence), so the authored content is what surfaces.
+    private static readonly StructType CdcFlatBodySchema = new(new[]
+    {
+        new StructField("id", DataTypes.LongType, nullable: false),
+        new StructField("name", DataTypes.StringType, nullable: true),
+        new StructField(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: false),
+    });
+
     public void Dispose()
     {
         try
@@ -830,6 +841,123 @@ public sealed class ChangeFeedReadTests : IDisposable
                 (3L, "west", (long?)30L, ChangeDataWriter.DeleteChange),
             },
             rows.OrderBy(r => r.Id).Select(r => (r.Id, r.Region, r.Val, r.ChangeType)).ToArray());
+    }
+
+    [Fact]
+    public async Task Explicit_MultiRowGroupCdcFile_StreamsBatchPerRowGroup_PreservingPerRowChangeTypeAndOneCommitVersion()
+    {
+        // #644: the explicit (cdc) read streams a cdc file ROW-GROUP BY ROW-GROUP (no per-file List<ColumnBatch>
+        // buffer), symmetric with the implicit path. A cdc file spanning MULTIPLE row groups must yield MULTIPLE
+        // batches — each one row group of one version, carrying its OWN per-row `_change_type` and exactly ONE
+        // `_commit_version` (INV C8) — and the concatenation must equal the change rows IN ORDER. We author the
+        // cdc body directly (3 row groups × 2 rows, all four `_change_type` tokens) so the row-group boundaries
+        // are pinned, overwriting the DELETE-produced cdc file v2 already committed (the explicit read reads
+        // EXACTLY the cdc file's rows — precedence — so the authored content is what surfaces).
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0 create, v1 enable CDF
+        var backend = new LocalFileSystemBackend(_root);
+        await NewCdfDelete(backend, "mrg").DeleteAsync(WhereId(id => id == 1));   // v2 cdc delete (explicit path)
+        string cdc = Assert.Single(CdcFilePaths());
+
+        byte[] multiRowGroup = await ParquetTestHelpers.WriteToBytesAsync(
+            CdcFlatBodySchema,
+            new[]
+            {
+                CdcFlatBodyBatch(
+                    (10, "r0a", ChangeDataWriter.InsertChange),
+                    (11, "r0b", ChangeDataWriter.DeleteChange),
+                    (12, "r1a", ChangeDataWriter.UpdatePreimageChange),
+                    (13, "r1b", ChangeDataWriter.UpdatePostimageChange),
+                    (14, "r2a", ChangeDataWriter.InsertChange),
+                    (15, null, ChangeDataWriter.DeleteChange)),
+            },
+            rowGroupRowLimit: 2);   // 6 rows ⇒ 3 row groups of 2
+        await File.WriteAllBytesAsync(Path.Combine(_root, cdc), multiRowGroup);
+
+        (_, List<ColumnBatch> batches) = await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2));
+
+        // Streamed, NOT buffered-into-one: 3 row groups ⇒ 3 batches (a mutant that buffered the file yields 1).
+        Assert.True(batches.Count > 1, "a multi-row-group cdc file must stream more than one batch");
+        Assert.Equal(3, batches.Count);
+        Assert.All(batches, b => Assert.Equal(2, b.LogicalRowCount));   // one row group (2 rows) per batch
+
+        // DecodeFlatChanges asserts, per batch: exactly ONE `_commit_version` (INV C8) + a valid `_change_type`.
+        (List<FlatChange> rows, List<long> batchVersions) = DecodeFlatChanges(batches);
+        Assert.Equal(new[] { 2L, 2L, 2L }, batchVersions.ToArray());   // every batch stamped with v2 (one version)
+
+        // Per-row `_change_type` alignment + exact ORDER across batches: the concatenation equals the change rows.
+        Assert.Equal(
+            new (long, string?, string, long)[]
+            {
+                (10L, "r0a", ChangeDataWriter.InsertChange, 2L),
+                (11L, "r0b", ChangeDataWriter.DeleteChange, 2L),
+                (12L, "r1a", ChangeDataWriter.UpdatePreimageChange, 2L),
+                (13L, "r1b", ChangeDataWriter.UpdatePostimageChange, 2L),
+                (14L, "r2a", ChangeDataWriter.InsertChange, 2L),
+                (15L, null, ChangeDataWriter.DeleteChange, 2L),
+            },
+            rows.Select(r => (r.Id, r.Name, r.ChangeType, r.Version)).ToArray());
+
+        // Positive row-count consistency: the streamed data rows exactly equal the `_change_type` count (6).
+        Assert.Equal(6, rows.Count);
+    }
+
+    [Fact]
+    public async Task Explicit_MultiRowGroupCdcFile_CorruptLaterRowGroup_StreamsEarlierBatchThenFailsClosed()
+    {
+        // #644 streaming fail-closed: because the explicit read now streams row-group by row-group, error
+        // classification must sit AROUND the yield (never across a `yield return`). A cdc file whose LATER row
+        // group is corrupt must still stream its earlier well-formed batch and THEN fail closed as a classified
+        // CorruptData DeltaReadException — never a partial/torn batch, and never a buffer-then-fail that would
+        // hide the earlier rows. This is the reachable "data pass disagrees with `_change_type`" inconsistency:
+        // the `offset != changeTypes.Length` totals check is defence in depth (for a DECODABLE single Parquet
+        // file both passes read identical per-row-group row counts, so they cannot disagree on a clean file),
+        // while a corrupt data-column chunk in a later row group makes the data pass fail after `_change_type`
+        // (pass 1, a different column) has already been fully read.
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0, v1
+        var backend = new LocalFileSystemBackend(_root);
+        await NewCdfDelete(backend, "mrg-corrupt").DeleteAsync(WhereId(id => id == 1));   // v2 cdc delete
+        string cdc = Assert.Single(CdcFilePaths());
+
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(
+            CdcFlatBodySchema,
+            new[]
+            {
+                CdcFlatBodyBatch(
+                    (10, "r0a", ChangeDataWriter.InsertChange),
+                    (11, "r0b", ChangeDataWriter.DeleteChange),
+                    (12, "r1a", ChangeDataWriter.InsertChange),
+                    (13, "r1b", ChangeDataWriter.DeleteChange)),
+            },
+            rowGroupRowLimit: 2);   // 2 row groups of 2
+        // Poison row group 1's `id` (data column 0). Pass 1 reads `_change_type` (column 2) intact; the STREAMED
+        // data pass decodes row group 0 (yields a batch) then faults on row group 1 → CorruptData, classified.
+        byte[] poisoned = await ParquetTestHelpers.PoisonColumnChunkAsync(file, rowGroup: 1, columnIndex: 0);
+        await File.WriteAllBytesAsync(Path.Combine(_root, cdc), poisoned);
+
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaChangeFeedInfo info = await source.LoadChangeFeedAsync(
+            DeltaChangeFeedRange.FromVersion(2, 2), CancellationToken.None);
+        IAsyncEnumerator<ColumnBatch> enumerator =
+            source.ReadChangeBatchesAsync(info, CancellationToken.None).GetAsyncEnumerator();
+        try
+        {
+            // Row group 0 streams COMPLETE first (proves streaming, not buffer-then-fail): a full, correct batch.
+            Assert.True(await enumerator.MoveNextAsync());
+            Assert.Equal(2, enumerator.Current.LogicalRowCount);
+            ColumnVector id0 = enumerator.Current.SelectedColumn(0);
+            Assert.Equal(new[] { 10L, 11L }, new[] { id0.GetValue<long>(0), id0.GetValue<long>(1) });
+
+            // Advancing into the corrupt row group fails closed: classified DeltaReadException wrapping the
+            // CorruptData storage fault (distinct from the vacuumed NotFound case) — never a partial batch.
+            DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+                async () => await enumerator.MoveNextAsync());
+            DeltaStorageException inner = Assert.IsType<DeltaStorageException>(ex.InnerException);
+            Assert.Equal(StorageErrorKind.CorruptData, inner.Kind);
+        }
+        finally
+        {
+            await enumerator.DisposeAsync();
+        }
     }
 
     [Fact]
@@ -1805,5 +1933,31 @@ public sealed class ChangeFeedReadTests : IDisposable
 
         return new ManagedColumnBatch(
             CdcMatchesEndSchema, new ColumnVector[] { id, name, extra, changeType }, rows.Length);
+    }
+
+    // Builds a FlatSchema cdc file body (id, name, `_change_type`) — the physical layout ChangeDataWriter emits
+    // — so a test can author a MULTI-ROW-GROUP cdc file with a chosen per-row `_change_type` (#644 streaming).
+    private static ColumnBatch CdcFlatBodyBatch(params (long Id, string? Name, string ChangeType)[] rows)
+    {
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, rows.Length);
+        MutableColumnVector name = ColumnVectors.Create(DataTypes.StringType, rows.Length);
+        MutableColumnVector changeType = ColumnVectors.Create(DataTypes.StringType, rows.Length);
+        foreach ((long i, string? n, string c) in rows)
+        {
+            id.AppendValue(i);
+            if (n is null)
+            {
+                name.AppendNull();
+            }
+            else
+            {
+                name.AppendBytes(Encoding.UTF8.GetBytes(n));
+            }
+
+            changeType.AppendBytes(Encoding.UTF8.GetBytes(c));
+        }
+
+        return new ManagedColumnBatch(
+            CdcFlatBodySchema, new ColumnVector[] { id, name, changeType }, rows.Length);
     }
 }
