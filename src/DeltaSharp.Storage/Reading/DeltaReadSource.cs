@@ -34,7 +34,15 @@ public readonly record struct DeltaSnapshotInfo(long Version, StructType Schema)
 /// <para><b>Snapshot pinning (no analysis→execution TOCTOU).</b> The caller resolves the version once via
 /// <see cref="LoadSnapshotAsync"/> (at analysis) and later reads that exact version via
 /// <see cref="ReadBatchesAsync"/> (at execution), so a concurrent commit between the two can never shift
-/// the data read.</para>
+/// the data read. The <b>change-feed</b> door mirrors this: <see cref="LoadChangeFeedAsync"/> resolves +
+/// validates the range once, and <see cref="ReadChangeBatchesAsync"/> replays that pinned range.</para>
+///
+/// <para><b>Change Data Feed reads (#193, design §2.6).</b> <see cref="LoadChangeFeedAsync"/> resolves a
+/// <see cref="DeltaChangeFeedRange"/> to a pinned inclusive <c>[start, end]</c> version range (each endpoint a
+/// version xor a timestamp) with fail-closed validation (§2.7), and <see cref="ReadChangeBatchesAsync"/>
+/// streams the change rows in ascending commit order as full-schema batches carrying the three CDF metadata
+/// columns. Unlike the snapshot door's materialized <see cref="ReadBatchesAsync"/>, the change-feed read
+/// returns an <see cref="IAsyncEnumerable{T}"/> (a deliberate streaming, consumer-paced deviation — §2.6).</para>
 ///
 /// <para><b>Scope (#499).</b> Base + time-travel reads of current-schema and <b>additively schema-evolved</b>
 /// files (#190/#497), including committed <b>deletion vectors</b> (#192): an active file's DV is decoded and
@@ -44,19 +52,21 @@ public readonly record struct DeltaSnapshotInfo(long Version, StructType Schema)
 /// null-fill, #497). A genuinely incompatible mismatch still fails <b>closed</b>: an absent <i>non-nullable</i>
 /// (required) column cannot be null-filled and surfaces a clear <see cref="DeltaReadSchemaEvolutionException"/>
 /// (mirroring OPTIMIZE's schema-evolution guard) rather than fabricating values. Predicate/column pushdown
-/// into the scan, <c>commitInfo.timestamp</c> resolution (#500), path authorization (#431), and CDF reads
-/// (#193) are out of scope.</para>
+/// into the scan, <c>commitInfo.timestamp</c> resolution (#500), and path authorization (#431) are out of
+/// scope.</para>
 /// </summary>
 public sealed class DeltaReadSource : IDisposable
 {
     private readonly LocalFileSystemBackend _backend;
     private readonly DeltaLog _log;
     private readonly ParquetFileReader _reader = new();
+    private readonly ChangeFeedReader _changeFeed;
 
     private DeltaReadSource(LocalFileSystemBackend backend)
     {
         _backend = backend;
         _log = new DeltaLog(backend);
+        _changeFeed = new ChangeFeedReader(backend, _log, _reader);
     }
 
     /// <summary>Opens a read facade over a local-filesystem Delta table directory.</summary>
@@ -199,6 +209,61 @@ public sealed class DeltaReadSource : IDisposable
         return batches;
     }
 
+    /// <summary>
+    /// Resolves and validates a Change Data Feed read <paramref name="range"/> ONCE (design §2.6), pinning it
+    /// to an inclusive <c>[start, end]</c> version range so a concurrent commit cannot shift it between this
+    /// call (analysis) and <see cref="ReadChangeBatchesAsync"/> (execution) — the change-feed counterpart of
+    /// <see cref="LoadSnapshotAsync"/>'s snapshot pinning. Each endpoint resolves independently as a version
+    /// xor a timestamp (a timestamp through the same monotonic <c>&lt;N&gt;.json</c>-mtime policy
+    /// <c>timestampAsOf</c> uses); the end defaults to the latest committed version. The range is validated
+    /// fail-closed (§2.7).
+    /// </summary>
+    /// <param name="range">The requested change-feed bounds.</param>
+    /// <param name="cancellationToken">Cancels the log listing/reconstruction I/O.</param>
+    /// <returns>The resolved <c>[start, end]</c> range + the reconciled CDF output schema (data columns +
+    /// <c>_change_type</c>/<c>_commit_version</c>/<c>_commit_timestamp</c>).</returns>
+    /// <exception cref="ArgumentException">A single endpoint specified both a version and a timestamp, or no
+    /// start bound was supplied (mirroring <see cref="LoadSnapshotAsync"/>'s xor rule).</exception>
+    /// <exception cref="DeltaReadException">The range is invalid or unavailable fail-closed: not a Delta
+    /// table, a negative start, an end past the latest committed version, a start after the end, a range that
+    /// has aged past log retention, or CDF not active for every version in the range (§2.7).</exception>
+    public Task<DeltaChangeFeedInfo> LoadChangeFeedAsync(
+        DeltaChangeFeedRange range, CancellationToken cancellationToken = default) =>
+        _changeFeed.ResolveAsync(range, cancellationToken);
+
+    /// <summary>
+    /// Streams the change rows of the pinned range in <paramref name="info"/> (as returned by
+    /// <see cref="LoadChangeFeedAsync"/>) in <b>ascending commit order</b>, as full-schema batches carrying
+    /// the three CDF metadata columns (design §2.6). Each yielded batch carries exactly ONE
+    /// <c>_commit_version</c> (INV C8) — batches never span versions. A version that committed <c>cdc</c>
+    /// actions is read exactly from those files (each row's own <c>_change_type</c>); a version with none is
+    /// derived implicitly (<c>insert</c> from <c>add</c>, <c>delete</c> from <c>remove</c>), DV-aware so only
+    /// live rows surface. Unlike the snapshot door's materialized <see cref="ReadBatchesAsync"/>, this returns
+    /// an <see cref="IAsyncEnumerable{T}"/> — a deliberate streaming, consumer-paced deviation (§2.6).
+    /// <para><b>Streaming-failure contract.</b> The VACUUM / <c>deletedFileRetentionDuration</c> availability
+    /// bound is enforced LAZILY at read time (a required cdc/data file resolving to NotFound throws), so this
+    /// enumerator MAY yield one or more early in-range batches and THEN throw mid-stream if a later
+    /// version's file was reclaimed between resolution and read. The thrown exception is authoritative and
+    /// fail-closed: it invalidates the ENTIRE feed. A consumer MUST NOT treat already-yielded batches as a
+    /// complete or committed change feed and MUST discard them on ANY exception (including cancellation); a
+    /// change feed is valid only when the enumeration runs to completion without throwing.</para>
+    /// </summary>
+    /// <param name="info">The resolved range to replay (from <see cref="LoadChangeFeedAsync"/>).</param>
+    /// <param name="cancellationToken">Cancels the log reconstruction and per-file Parquet reads.</param>
+    /// <returns>The change rows as full-schema batches, in ascending commit order.</returns>
+    /// <exception cref="ArgumentException"><paramref name="info"/> was not obtained from
+    /// <see cref="LoadChangeFeedAsync"/> on THIS source — a manually-constructed or <c>default</c> info (no
+    /// resolution proof, so its range never passed resolve-time validation, including the §2.7 CDF-enablement
+    /// gate), or an info resolved by a DIFFERENT source/table (its validation and pinned timestamps do not
+    /// apply here). Rejected fail-closed BEFORE any batch is produced.</exception>
+    /// <exception cref="DeltaReadException">A version's commit log or a required change/data file is no longer
+    /// available (aged out / vacuumed between resolution and read), or a change-data file is inconsistent.</exception>
+    /// <exception cref="DeltaReadSchemaEvolutionException">A cdc/data file is missing a REQUIRED (non-nullable)
+    /// column the reconciled output schema demands — read-side null-fill cannot satisfy it — fails closed.</exception>
+    public IAsyncEnumerable<ColumnBatch> ReadChangeBatchesAsync(
+        DeltaChangeFeedInfo info, CancellationToken cancellationToken = default) =>
+        _changeFeed.ReadAsync(info, cancellationToken);
+
     private async Task ReadFileAsync(
         AddFileAction add,
         StructType tableSchema,
@@ -214,7 +279,7 @@ public sealed class DeltaReadSource : IDisposable
         // the read closed here rather than after emitting rows (the cardinal DV safety rule: never return a
         // row a DV invalidated because the DV failed to decode). The DV's row positions are PHYSICAL,
         // file-relative ordinals validated against the file's PHYSICAL record count.
-        DeletionVectorPositions? deletionVector = null;
+        DeletionVectorMask? deletionVector = null;
         if (add.DeletionVector is { } descriptor)
         {
             long? declared = add.Stats?.NumRecords;
@@ -273,7 +338,7 @@ public sealed class DeltaReadSource : IDisposable
                 throw new DeltaReadException(ex.Message, ex);
             }
 
-            deletionVector = new DeletionVectorPositions(positions, physicalRecords);
+            deletionVector = new DeletionVectorMask(positions, physicalRecords);
         }
 
         long fileRowOffset = 0;
@@ -293,7 +358,7 @@ public sealed class DeltaReadSource : IDisposable
                     {
                         batches.Add(fullBatch);
                     }
-                    else if (ApplyDeletionVector(fullBatch, deletionVector, fileRowOffset) is { } survived)
+                    else if (deletionVector.Apply(fullBatch, fileRowOffset) is { } survived)
                     {
                         // A fully-deleted batch (every physical row invalidated) contributes no rows, so it
                         // is dropped rather than added as an empty batch.
@@ -318,74 +383,8 @@ public sealed class DeltaReadSource : IDisposable
 
         if (deletionVector is not null)
         {
-            deletionVector.EnsureFullyConsumed(fileRowOffset, add.Path);
+            deletionVector.EnsureConsumed(fileRowOffset, add.Path);
         }
-    }
-
-    // The decoded deletion-vector positions for one active file: the sorted, distinct set of PHYSICAL,
-    // file-relative row ordinals to exclude, plus the file's physical record count for a post-read
-    // consistency check. FIX #4: a SINGLE materialization — the sorted long[] the decoder already produced —
-    // with binary-search membership, so the read path never holds both a long[] AND a HashSet of the set.
-    private sealed class DeletionVectorPositions
-    {
-        private readonly long[] _deleted;
-
-        public DeletionVectorPositions(long[] sortedDistinctPositions, long physicalRecords)
-        {
-            // RoaringBitmapArray.Deserialize guarantees ascending, distinct positions, so the array is a
-            // ready-made sorted-set membership structure (Array.BinarySearch) with no second copy.
-            _deleted = sortedDistinctPositions;
-            PhysicalRecords = physicalRecords;
-        }
-
-        public long PhysicalRecords { get; }
-
-        public bool IsDeleted(long filePosition) => Array.BinarySearch(_deleted, filePosition) >= 0;
-
-        // The Parquet file's actual physical row count (summed across row groups) must match the record count
-        // the DV was validated against — a mismatch means the file changed under the DV, so the positions
-        // cannot be trusted to map to the right rows. Fail closed.
-        public void EnsureFullyConsumed(long physicalRowsRead, string path)
-        {
-            if (physicalRowsRead != PhysicalRecords)
-            {
-                throw new DeltaReadException(
-                    $"Active file '{path}' carries a deletion vector validated against {PhysicalRecords} "
-                    + $"physical records, but the Parquet file produced {physicalRowsRead} on read. The "
-                    + "deletion vector disagrees with the data file, so the read fails closed.");
-            }
-        }
-    }
-
-    // Applies a deletion vector to one full-schema batch by building a SelectionVector of the surviving
-    // physical rows (those whose file-relative ordinal `fileRowOffset + r` is NOT in the DV). Returns null
-    // when every row in the batch is deleted (the caller drops it). The DV positions are file-relative, so
-    // the running `fileRowOffset` maps this batch's physical rows [0, RowCount) onto the file ordinal space.
-    private static ColumnBatch? ApplyDeletionVector(
-        ColumnBatch batch, DeletionVectorPositions deletionVector, long fileRowOffset)
-    {
-        int rowCount = batch.RowCount;
-        var survivors = new List<int>(rowCount);
-        for (int r = 0; r < rowCount; r++)
-        {
-            if (!deletionVector.IsDeleted(fileRowOffset + r))
-            {
-                survivors.Add(r);
-            }
-        }
-
-        if (survivors.Count == rowCount)
-        {
-            // No row in this batch was deleted — return it unchanged (identity selection is pure overhead).
-            return batch;
-        }
-
-        if (survivors.Count == 0)
-        {
-            return null;
-        }
-
-        return batch.WithSelection(new SelectionVector(survivors.ToArray()));
     }
 
     // True iff the read failed because the input Parquet file is missing a column the current data schema

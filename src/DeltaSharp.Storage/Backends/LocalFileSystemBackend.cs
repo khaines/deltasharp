@@ -142,6 +142,22 @@ internal sealed class LocalFileSystemBackend : IStorageBackend, IDisposable
     /// the backend is not disposed, so a missed dispose leaks no descriptor.</summary>
     public void Dispose() => _rootHandle?.Dispose();
 
+    /// <summary>
+    /// The canonicalized (symlink-resolved) absolute table root — a STABLE, value-based identity for this
+    /// table. Two backends constructed over the same table root (e.g. a resolve-then-read pair spanning two
+    /// <see cref="DeltaSharp.Storage.Reading.DeltaReadSource"/> instances) share it, while different tables
+    /// differ. The CDF read door binds a resolution proof to this identity so the proof cannot replay on a
+    /// DIFFERENT table (which would bypass that table's enablement gate and stamp foreign timestamps).
+    /// <para><b>Case-sensitivity assumption.</b> Consumers compare this id with <c>StringComparison.Ordinal</c>,
+    /// matching the case-sensitive Linux production filesystem (where two case-differing spellings ARE distinct
+    /// tables — an <c>OrdinalIgnoreCase</c> compare there would be a security regression, falsely ACCEPTING a
+    /// cross-table proof). On a case-INsensitive dev filesystem (macOS APFS / Windows NTFS) two case-differing
+    /// path spellings of the SAME table therefore yield different ids and a same-table resolve→read with
+    /// mismatched-case paths is falsely REJECTED — a fail-closed inconvenience (it throws, never bypasses), not
+    /// a correctness/security hole. Use consistent-case table paths on such hosts.</para>
+    /// </summary>
+    internal string TableRootId => _realRoot;
+
     /// <summary>The PVC/POSIX backend family — the <c>deltasharp.backend=pvc</c> telemetry identity.</summary>
     public StorageBackendKind Kind => StorageBackendKind.Pvc;
 

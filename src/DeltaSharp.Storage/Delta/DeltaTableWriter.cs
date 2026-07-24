@@ -1381,7 +1381,14 @@ internal sealed class DeltaTableWriter
             ExtendedFileMetadata: true,
             add.PartitionValues,
             add.Size,
-            add.Tags);
+            add.Tags,
+            // Carry the tombstoned add's PRIOR deletion vector (matching DeltaDelete.ToRemove and delta-spark
+            // AddFile.removeWithTimestamp). Two reasons: (1) SnapshotState keys the active file by
+            // (path, deletionVector.uniqueId), so a DV-carrying active file is ONLY tombstoned by a remove
+            // carrying that same DV — dropping it would leave the file spuriously active after an overwrite;
+            // (2) the CDF read door derives an overwrite's `delete` change from the removed file's LIVE rows
+            // (physical \ DV), so the tombstone must record which rows were live at removal (design §2.6).
+            add.DeletionVector);
 
     // Fail-closed precondition: a partitioned write must specify a value (possibly null) for EVERY partition
     // column of each staged file, so the add lands in a well-formed partition and the exact-key remove

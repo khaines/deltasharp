@@ -193,9 +193,8 @@ internal sealed class DeltaLog
     /// version is the answer.</summary>
     private static long ResolveTimestampTarget(LogListing listing, DateTimeOffset asOf, bool canReturnLatest)
     {
-        long floor = EarliestReconstructableVersion(listing);
-        long[] candidates = listing.Commits.Where(v => v >= floor).ToArray();
-        if (candidates.Length == 0)
+        EffectiveCommitTimeline timeline = BuildEffectiveCommitTimeline(listing);
+        if (timeline.Count == 0)
         {
             throw DeltaProtocolException.RetentionGap(
                 "No retained Delta commit files carry a timestamp; timestamp time travel is unavailable "
@@ -203,35 +202,22 @@ internal sealed class DeltaLog
         }
 
         long asOfMillis = asOf.ToUnixTimeMilliseconds();
-        long resolved = -1;
-        long effectivePrevious = long.MinValue;
-        long earliestEffective = 0;
-        for (int i = 0; i < candidates.Length; i++)
+        int resolvedIndex = -1;
+        for (int i = 0; i < timeline.Count; i++)
         {
-            long v = candidates[i];
-            long mtime = DeltaTimestamps.ToEpochMillis(listing.CommitTimestamps[v]);
-            // Delta monotonicity: force each commit strictly later than its predecessor so equal / out-of-order
-            // file mtimes still yield a deterministic, strictly-increasing timeline.
-            long effective = i == 0 ? mtime : Math.Max(mtime, effectivePrevious + MonotonicStepMillis);
-            if (i == 0)
-            {
-                earliestEffective = effective;
-            }
-
-            if (effective > asOfMillis)
+            if (timeline.EffectiveMillis[i] > asOfMillis)
             {
                 // Effective timestamps are strictly increasing, so no later version can qualify either.
                 break;
             }
 
-            resolved = v;
-            effectivePrevious = effective;
+            resolvedIndex = i;
         }
 
-        if (resolved < 0)
+        if (resolvedIndex < 0)
         {
-            long earliestCandidate = candidates[0];
-            DateTimeOffset earliestTs = DateTimeOffset.FromUnixTimeMilliseconds(earliestEffective);
+            long earliestCandidate = timeline.Versions[0];
+            DateTimeOffset earliestTs = DateTimeOffset.FromUnixTimeMilliseconds(timeline.EffectiveMillis[0]);
             throw earliestCandidate == 0
                 // v0 is retained: the timestamp is simply before the table's first commit, not log-cleaned.
                 ? DeltaProtocolException.TimestampBeforeFirstCommit(asOf, earliestTs)
@@ -240,16 +226,76 @@ internal sealed class DeltaLog
         }
 
         // When the request is strictly after the latest commit's effective timestamp, `resolved` is the latest
-        // candidate and `effectivePrevious` is that commit's effective timestamp. Delta batch reads
+        // candidate and its effective timestamp is `resolvedEffective`. Delta batch reads
         // (canReturnLastCommit=false) throw rather than silently clamp; keep parity unless the caller opts in.
-        long latestVersion = candidates[^1];
-        if (resolved == latestVersion && asOfMillis > effectivePrevious && !canReturnLatest)
+        long resolved = timeline.Versions[resolvedIndex];
+        long resolvedEffective = timeline.EffectiveMillis[resolvedIndex];
+        long latestVersion = timeline.Versions[^1];
+        if (resolved == latestVersion && asOfMillis > resolvedEffective && !canReturnLatest)
         {
             throw DeltaProtocolException.TimestampAfterLatest(
-                asOf, latestVersion, DateTimeOffset.FromUnixTimeMilliseconds(effectivePrevious));
+                asOf, latestVersion, DateTimeOffset.FromUnixTimeMilliseconds(resolvedEffective));
         }
 
         return resolved;
+    }
+
+    /// <summary>
+    /// The <b>single source</b> of the Delta commit-timestamp policy (design §2.12.1) — the reconstructable
+    /// commit versions (ascending) and each one's <b>effective</b> commit timestamp in epoch millis: the
+    /// <c>&lt;N&gt;.json</c> object modification time forced <b>strictly monotonic</b> —
+    /// <c>eff(N) = max(mtime(N), eff(N-1) + 1ms)</c> — so equal / out-of-order file mtimes still yield a
+    /// deterministic, strictly-increasing timeline. It underpins BOTH <c>timestampAsOf</c> time travel
+    /// (<see cref="ResolveTimestampTarget"/>) AND Change Data Feed range/timestamp resolution and
+    /// <c>_commit_timestamp</c> stamping (<see cref="LoadChangeFeedLogAsync"/>, design §2.8) — computed once,
+    /// here, so the two can never diverge (a stamped <c>_commit_timestamp</c> resolves back through
+    /// <c>timestampAsOf</c> to the same version). Candidates are the retained commit files at or above the
+    /// earliest reconstructable version; a version reachable only through a checkpoint (no surviving
+    /// <c>&lt;N&gt;.json</c>) carries no timestamp and is excluded.
+    /// </summary>
+    private static EffectiveCommitTimeline BuildEffectiveCommitTimeline(LogListing listing)
+    {
+        long floor = EarliestReconstructableVersion(listing);
+        // listing.Commits is a SortedSet<long>, so this enumerates ascending — the timeline order the
+        // monotonic adjustment and the strictly-increasing-search invariants both rely on.
+        long[] versions = listing.Commits.Where(v => v >= floor).ToArray();
+        var effective = new long[versions.Length];
+        long previous = long.MinValue;
+        for (int i = 0; i < versions.Length; i++)
+        {
+            long mtime = DeltaTimestamps.ToEpochMillis(listing.CommitTimestamps[versions[i]]);
+            long e = i == 0 ? mtime : Math.Max(mtime, previous + MonotonicStepMillis);
+            effective[i] = e;
+            previous = e;
+        }
+
+        return new EffectiveCommitTimeline(versions, effective);
+    }
+
+    /// <summary>
+    /// Lists <c>_delta_log</c> once and returns the state a Change Data Feed range read (design §2.6) resolves
+    /// against: the latest committed <see cref="ChangeFeedLog.LatestVersion"/> (the default range end), the
+    /// <see cref="ChangeFeedLog.EarliestReconstructableVersion"/> floor (below it a range's <c>start</c> has
+    /// aged past log retention — the CDF-readable-window lower bound, §2.6/CDF-EE-09), and the reconstructable
+    /// commit versions with their <b>effective</b> commit timestamps (<see cref="BuildEffectiveCommitTimeline"/>)
+    /// so a timestamp endpoint resolves — and every replayed version's <c>_commit_timestamp</c> is stamped —
+    /// off the <b>same</b> monotonic <c>&lt;N&gt;.json</c>-mtime policy <c>timestampAsOf</c> uses (§2.8), never
+    /// a second, divergent clock. One listing pass, so the feed's resolution is a consistent view of the log.
+    /// </summary>
+    /// <exception cref="DeltaProtocolException">The log is empty (not a Delta table).</exception>
+    internal async Task<ChangeFeedLog> LoadChangeFeedLogAsync(CancellationToken cancellationToken)
+    {
+        LogListing listing = await ListLogAsync(cancellationToken).ConfigureAwait(false);
+        long latest = RequireLatest(listing);
+        long earliest = EarliestReconstructableVersion(listing);
+        EffectiveCommitTimeline timeline = BuildEffectiveCommitTimeline(listing);
+        var effectiveByVersion = new Dictionary<long, long>(timeline.Count);
+        for (int i = 0; i < timeline.Count; i++)
+        {
+            effectiveByVersion[timeline.Versions[i]] = timeline.EffectiveMillis[i];
+        }
+
+        return new ChangeFeedLog(latest, earliest, timeline.Versions, timeline.EffectiveMillis, effectiveByVersion);
     }
 
     /// <summary>The earliest version whose snapshot can still be reconstructed from the retained log: version
@@ -671,4 +717,26 @@ internal sealed class DeltaLog
         Dictionary<long, CheckpointGroup> Checkpoints,
         long? LatestVersion,
         bool HasHint);
+
+    /// <summary>The reconstructable commit versions (ascending) and each one's <b>effective</b> commit
+    /// timestamp (epoch millis) after the strictly-monotonic <c>&lt;N&gt;.json</c>-mtime adjustment; the
+    /// parallel arrays share indices. Built by <see cref="BuildEffectiveCommitTimeline"/>.</summary>
+    private readonly record struct EffectiveCommitTimeline(long[] Versions, long[] EffectiveMillis)
+    {
+        public int Count => Versions.Length;
+    }
 }
+
+/// <summary>The single-listing view a Change Data Feed range read resolves against
+/// (<see cref="DeltaLog.LoadChangeFeedLogAsync"/>): the latest committed version (default range end), the
+/// earliest reconstructable version (CDF-readable-window floor), and the reconstructable commit versions
+/// (ascending) with their effective commit timestamps — as parallel lists <see cref="CommitVersions"/> /
+/// <see cref="EffectiveMillis"/> plus the <see cref="EffectiveMillisByVersion"/> lookup used to stamp each
+/// replayed version's <c>_commit_timestamp</c>. All timestamps come from
+/// <c>BuildEffectiveCommitTimeline</c>, the same policy <c>timestampAsOf</c> uses.</summary>
+internal sealed record ChangeFeedLog(
+    long LatestVersion,
+    long EarliestReconstructableVersion,
+    IReadOnlyList<long> CommitVersions,
+    IReadOnlyList<long> EffectiveMillis,
+    IReadOnlyDictionary<long, long> EffectiveMillisByVersion);
