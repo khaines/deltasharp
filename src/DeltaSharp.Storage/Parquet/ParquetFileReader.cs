@@ -121,9 +121,10 @@ internal sealed class ParquetFileReader
     /// stream-level reader does not.</param>
     /// <param name="cancellationToken">Cancels the read.</param>
     /// <exception cref="ArgumentNullException">An argument is null.</exception>
-    /// <exception cref="DeltaStorageException">A requested column type is unsupported
-    /// (<see cref="StorageErrorKind.UnsupportedFeature"/>); the resolved file column's physical type or
-    /// nullability does not match the requested engine type
+    /// <exception cref="DeltaStorageException">A requested column type is unsupported, or the file uses a
+    /// valid-but-unsupported library feature such as Parquet Modular Encryption (an encrypted-footer
+    /// <c>PARE</c>-magic file) (<see cref="StorageErrorKind.UnsupportedFeature"/>); the resolved file column's
+    /// physical type or nullability does not match the requested engine type
     /// (<see cref="StorageErrorKind.SchemaMismatch"/>); a requested column is absent from the file and not
     /// null-filled (per <paramref name="nullFillMissingColumns"/>)
     /// (<see cref="StorageErrorKind.ColumnNotPresentInFile"/>); or the file is malformed/truncated or a row
@@ -235,7 +236,9 @@ internal sealed class ParquetFileReader
     /// poisoned DV can neither reference a row beyond the file nor force an oversized allocation.
     /// </summary>
     /// <exception cref="DeltaStorageException">The Parquet footer is malformed/truncated, or a row group
-    /// declares a negative row count (fail closed).</exception>
+    /// declares a negative row count (<see cref="StorageErrorKind.CorruptData"/>, fail closed); or the file
+    /// uses Parquet Modular Encryption (an encrypted-footer <c>PARE</c>-magic file)
+    /// (<see cref="StorageErrorKind.UnsupportedFeature"/>).</exception>
     public async Task<long> GetRowCountAsync(Stream input, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(input);
@@ -297,7 +300,8 @@ internal sealed class ParquetFileReader
     /// </summary>
     /// <exception cref="DeltaStorageException">The footer is malformed/truncated
     /// (<see cref="StorageErrorKind.CorruptData"/>), or a footer field has no supported DeltaSharp type
-    /// mapping (<see cref="StorageErrorKind.UnsupportedFeature"/>).</exception>
+    /// mapping — or the file uses Parquet Modular Encryption (an encrypted-footer <c>PARE</c>-magic file)
+    /// (<see cref="StorageErrorKind.UnsupportedFeature"/>).</exception>
     public async Task<StructType> ReadDataSchemaAsync(Stream input, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(input);
@@ -606,7 +610,28 @@ internal sealed class ParquetFileReader
             // bug to mask here: every fault (other than the cancellation / typed-storage exceptions
             // IsUndecodableParquetInput excludes) is Parquet.Net rejecting a malformed/truncated footer. The
             // narrow IsParquetDefect whitelist is insufficient at THIS site (see IsUndecodableParquetInput), so
-            // map every such fault to CorruptData.
+            // map every such fault to CorruptData — EXCEPT the one distinguishable unsupported-but-VALID family
+            // classified below.
+            //
+            // Parquet Modular Encryption classification (#649). An encrypted-footer file is a perfectly VALID
+            // Parquet file that the LIBRARY (not DeltaSharp) refuses: Parquet.Net 6.0.3 rejects its 'PARE' head
+            // as "not a parquet file, head: 50415245, tail: 50415245" — a message shape BYTE-FOR-BYTE identical
+            // to the one it emits for arbitrary non-Parquet garbage ("head: 74686973…" for "this is not a
+            // parquet file"), so ex.Message cannot separate encryption from corruption. The file's own leading
+            // magic can, so peek it directly (the input is still seekable here — CreateAsync leaves the caller's
+            // stream open on failure) and reclassify only a positively-identified 'PARE' head as an actionable
+            // UnsupportedFeature; everything else stays the fail-closed CorruptData default. This peek MUST run
+            // BEFORE the dispose below, which (leaveStreamOpen:false) would release the input stream. NOTE the
+            // sibling library NotSupportedException family (raised from page decode in ReadRowGroupAsync) is NOT
+            // reclassified: Parquet.Net raises it on genuinely CORRUPT pages too (an invalid compression-method /
+            // page-type / logical-type code from a bit-flip), so it is not safely separable from corruption and
+            // stays CorruptData (see the ReadRowGroupAsync superset catch). Likewise only encrypted-FOOTER
+            // mode (PARE magic) is classified here; plaintext-footer encryption (mode b) keeps the ordinary
+            // PAR1 magic and carries its crypto metadata in an otherwise-readable footer, so it is not caught by
+            // this magic peek and stays the CorruptData/decode default — Parquet.Net 6.0.3 can neither read nor
+            // write mode-b files, so it is not reachable/constructible today; tracked as a follow-up (#655).
+            bool encryptedFooter = IsParquetEncryptedFooterMagic(input);
+
             if (reader is not null)
             {
                 // The forced Schema access failed after the reader was constructed: dispose it (leaveStreamOpen
@@ -624,11 +649,97 @@ internal sealed class ParquetFileReader
                 }
             }
 
+            if (encryptedFooter)
+            {
+                // Actionable, cause-preserving classification (#649): the file is not corrupt, it is a valid
+                // Parquet Modular Encryption file DeltaSharp cannot read. The message names the feature (the
+                // UnsupportedFeature factory carries no ex.Message, so no footer content leaks); the original
+                // library fault stays the inner exception on the CorruptData path but is deliberately not echoed
+                // here — the 'PARE' bracketing (both ends) is the whole diagnosis.
+                throw DeltaStorageException.UnsupportedFeature(
+                    "Parquet Modular Encryption is not supported: the file uses an encrypted footer (PARE "
+                    + "magic). DeltaSharp cannot read encrypted Parquet files.");
+            }
+
             // Fixed message (no ex.Message interpolation): an attacker-controlled footer field name must never
             // echo into the error text (info-leak, Security LOW). The cause is preserved as the inner exception
             // for logs/diagnostics.
             throw DeltaStorageException.CorruptData(
                 "The Parquet stream is malformed or truncated.", ex);
+        }
+    }
+
+    // The Parquet file magic is 4 bytes. A plaintext file is bracketed by 'PAR1'; a Parquet Modular
+    // Encryption file written in ENCRYPTED-FOOTER mode is bracketed by 'PARE' (0x50 0x41 0x52 0x45) instead
+    // (Parquet format Encryption.md). Parquet.Net 6.0.3 cannot read encrypted files and rejects the 'PARE'
+    // head during CreateAsync (#649).
+    private const int ParquetMagicLength = 4;
+
+    private static ReadOnlySpan<byte> EncryptedFooterMagic => "PARE"u8;
+
+    /// <summary>
+    /// Peeks whether <paramref name="input"/> is bracketed by the Parquet <b>encrypted-footer</b> magic
+    /// (<c>PARE</c>) at <b>both</b> ends — the on-disk marker of a (complete) Parquet Modular Encryption file
+    /// the library rejects as "not a parquet file" (#649). This is the <b>robust</b> encryption discriminator:
+    /// it reads the file's own leading and trailing magic from the seekable input (every reader entry point
+    /// passes a seekable
+    /// <see cref="MemoryStream"/>, and <see cref="ParquetReader.CreateAsync(Stream, ParquetOptions?, bool, CancellationToken)"/>
+    /// leaves the caller's stream open when it throws) rather than substring-matching the library's error
+    /// message, which is byte-for-byte identical for genuine non-Parquet garbage ("not a parquet file, head:
+    /// …") and so cannot separate encryption from corruption. Only an input positively bracketed by <c>PARE</c>
+    /// at both ends returns <see langword="true"/>: a non-seekable, too-short, merely-<c>PARE</c>-prefixed
+    /// (corrupt/truncated), or unreadable input can NOT be confirmed a complete encrypted file, so it returns
+    /// <see langword="false"/> and the caller keeps the fail-closed CorruptData default — encryption is
+    /// asserted, never guessed. The input's position is restored so this observation is transparent to any
+    /// later use.
+    /// </summary>
+    internal static bool IsParquetEncryptedFooterMagic(Stream input)
+    {
+        if (input is null || !input.CanSeek)
+        {
+            return false;
+        }
+
+        try
+        {
+            // A valid Parquet Modular Encryption (encrypted-footer mode) file is bracketed by the 'PARE' magic
+            // at BOTH ends (Parquet Encryption.md), so it is at least two 4-byte magics long. Requiring the
+            // TRAILING magic too — not just the head — keeps a merely-'PARE'-prefixed CORRUPT file (a 'PARE'
+            // head with a non-'PARE' or absent/truncated tail) mapped to the fail-closed CorruptData default
+            // instead of mislabeled "encrypted" (#649 precision, council R1). Only a fully-bracketed file is
+            // confidently a (complete) encrypted-footer file; a truncated one is genuinely corrupt.
+            if (input.Length < 2 * ParquetMagicLength)
+            {
+                return false;
+            }
+
+            long savedPosition = input.Position;
+            try
+            {
+                Span<byte> magic = stackalloc byte[ParquetMagicLength];
+
+                input.Position = 0;
+                if (input.ReadAtLeast(magic, ParquetMagicLength, throwOnEndOfStream: false) != ParquetMagicLength
+                    || !magic.SequenceEqual(EncryptedFooterMagic))
+                {
+                    return false;
+                }
+
+                input.Position = input.Length - ParquetMagicLength;
+                return input.ReadAtLeast(magic, ParquetMagicLength, throwOnEndOfStream: false) == ParquetMagicLength
+                    && magic.SequenceEqual(EncryptedFooterMagic);
+            }
+            finally
+            {
+                // Restore on every path (both magic reads and any fault) so the observation is transparent.
+                input.Position = savedPosition;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or NotSupportedException)
+        {
+            // A peek fault on an already-failing input must never REPLACE the deterministic classification;
+            // "cannot confirm the magic" degrades to "not encrypted" so the CorruptData default still holds.
+            return false;
         }
     }
 
@@ -980,6 +1091,20 @@ internal sealed class ParquetFileReader
             // IsUndecodableParquetInput excludes and lets propagate. Every remaining exception is therefore the
             // library decoding corrupt bytes: map it to the deterministic CorruptData contract rather than leak
             // a raw BCL exception. (Cooperative cancellation is excluded, so it still propagates.)
+            //
+            // #649 note — NotSupportedException stays CorruptData here (precision boundary). It is tempting to
+            // reclassify a library NotSupportedException as "unsupported-but-valid feature", but Parquet.Net
+            // 6.0.3 raises the SAME NotSupportedException on genuinely CORRUPT pages — a random bit-flip that
+            // lands on a compression-method, page-type, or logical-type code is decoded as an unknown code and
+            // rejected with e.g. "Compression method 9 is not supported" / "can't read page type 8" (an
+            // empirical fuzz over this reader's own written files reproduces it, and a forged out-of-range codec
+            // triggers it deterministically). "The footer parsed / the file opened" does NOT imply the pages are
+            // valid, so there is no runtime predicate that separates a valid-but-unimplemented encoding from a
+            // corrupt page here — and a valid-but-unsupported-encoding fixture is not even constructible with
+            // Parquet.Net 6.0.3 (it neither reads nor writes such encodings). Reclassifying would therefore
+            // MISLABEL corruption as "unsupported", violating the fail-closed contract, so it stays CorruptData.
+            // The one distinguishable unsupported-but-valid family (Parquet Modular Encryption) is caught earlier
+            // by its 'PARE' magic in OpenAsync, before any page ever reaches this decode.
             throw DeltaStorageException.CorruptData(
                 $"Failed to decode Parquet row group {group}: a column's data page or footer metadata is malformed.", ex);
         }

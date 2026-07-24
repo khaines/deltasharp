@@ -495,4 +495,223 @@ public sealed class ParquetCorruptionTests
             () => ParquetTestHelpers.ReadAllAsync(forged, schema));
         Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
     }
+
+    // ---- #649: classify library-rejected VALID features (Parquet Modular Encryption) as UnsupportedFeature,
+    // ---- not CorruptData — WITHOUT mislabeling genuine corruption (the precision boundary) ---------------
+    //
+    // The Parquet fail-closed boundaries map every non-cancellation, non-typed library fault to CorruptData:
+    // correct for genuine corruption, but it MIS-LABELS a VALID Parquet file the LIBRARY (not DeltaSharp)
+    // refuses for using an unimplemented feature. The clearest such case is Parquet Modular Encryption: an
+    // encrypted-footer file is bracketed by the 'PARE' magic (vs plaintext 'PAR1'), which Parquet.Net 6.0.3
+    // rejects at open as "not a parquet file, head: 50415245, tail: 50415245" — a message shape byte-for-byte
+    // IDENTICAL to the one it emits for arbitrary garbage ("head: 74686973…"). So the reader peeks the file's
+    // own leading MAGIC BYTES (never ex.Message) to reclassify only a 'PARE' head as an actionable
+    // UnsupportedFeature. The precision boundary is load-bearing and pinned below: genuine corruption (garbage,
+    // a 'PAR1'-magic garbage footer, a bit-flipped page, or a NotSupportedException from an invalid codec) must
+    // STILL map to CorruptData.
+
+    [Fact]
+    public async Task EncryptedFooter_ThroughReadAsync_IsUnsupportedFeatureNotCorruptData()
+    {
+        // A valid-but-unsupported encrypted-footer file ('PARE' magic). ReadAsync must classify it as an
+        // actionable UnsupportedFeature ("it's encrypted"), NOT a misleading CorruptData ("it's broken").
+        // RED-on-revert: removing the OpenAsync 'PARE'-magic peek makes the library IOException fall to the
+        // superset default and this assertion flips to CorruptData.
+        byte[] encrypted = ParquetTestHelpers.EncryptedFooterMagicFile();
+        var schema = new StructType(new[] { KeepField });
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(encrypted, schema));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase); // "Encryption"/"encrypted"
+        // The diagnosis is the feature, never the fail-closed "malformed/corrupt" default.
+        Assert.DoesNotContain("malformed", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task EncryptedFooter_ThroughReadDataSchemaAsync_IsUnsupportedFeature()
+    {
+        // The same 'PARE' file through the footer-only schema door. ReadDataSchemaAsync also funnels through
+        // OpenAsync, so the single magic-peek classifier covers it uniformly: UnsupportedFeature, not
+        // CorruptData.
+        byte[] encrypted = ParquetTestHelpers.EncryptedFooterMagicFile();
+        using var stream = new MemoryStream(encrypted, writable: false);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new ParquetFileReader().ReadDataSchemaAsync(stream, CancellationToken.None));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task EncryptedFooter_ThroughGetRowCountAsync_IsUnsupportedFeature()
+    {
+        // And through the row-count door (which bounds a deletion vector's positions) — a third public entry
+        // that goes through OpenAsync — proving the ONE OpenAsync classifier covers every entry point.
+        byte[] encrypted = ParquetTestHelpers.EncryptedFooterMagicFile();
+        using var stream = new MemoryStream(encrypted, writable: false);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new ParquetFileReader().GetRowCountAsync(stream, CancellationToken.None));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+    }
+
+    [Fact]
+    public async Task GarbageInput_StaysCorruptData_PrecisionGuard()
+    {
+        // PRECISION GUARD: non-Parquet garbage trips the SAME "not a parquet file, head: …" library
+        // IOException as an encrypted file, but its leading magic is NOT 'PARE', so it must stay CorruptData
+        // through both the data door and the schema door.
+        byte[] garbage = "this is not a parquet file"u8.ToArray();
+        var schema = new StructType(new[] { KeepField });
+
+        DeltaStorageException read = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(garbage, schema));
+        Assert.Equal(StorageErrorKind.CorruptData, read.Kind);
+
+        using var stream = new MemoryStream(garbage, writable: false);
+        DeltaStorageException schemaRead = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new ParquetFileReader().ReadDataSchemaAsync(stream, CancellationToken.None));
+        Assert.Equal(StorageErrorKind.CorruptData, schemaRead.Kind);
+    }
+
+    [Fact]
+    public async Task Par1MagicGarbageFooter_StaysCorruptData_PrecisionGuard()
+    {
+        // PRECISION GUARD (the tightest one): a corrupt file that fails at the SAME boundary as the encrypted
+        // file (OpenAsync), differing ONLY in its magic — a 'PAR1' head with a garbage footer body →
+        // ThriftProtocolException. The classifier keys on 'PARE', so this stays CorruptData: it proves the
+        // OpenAsync peek does not over-trigger on an arbitrary non-'PARE' open failure.
+        byte[] corrupt = ParquetTestHelpers.Par1MagicGarbageFooterFile();
+        var schema = new StructType(new[] { KeepField });
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(corrupt, schema));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+    }
+
+    [Fact]
+    public async Task BitFlippedValidParquetPage_StaysCorruptData_PrecisionGuard()
+    {
+        // PRECISION GUARD: a valid file whose interior column-chunk bytes are bit-flipped (footer + 'PAR1'
+        // magic intact) opens cleanly then fails during page decode — genuine corruption that must stay
+        // CorruptData (the leading magic is 'PAR1', never 'PARE').
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3, 4, 5 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] poisoned = await ParquetTestHelpers.PoisonColumnChunkAsync(file, rowGroup: 0, columnIndex: 0);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(poisoned, schema));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+    }
+
+    [Fact]
+    public async Task ForgedInvalidCompressionCodec_NotSupportedException_StaysCorruptData()
+    {
+        // PRECISION GUARD for the NotSupportedException family (#649). Forging an OUT-OF-RANGE compression
+        // codec (9, not a real CompressionCodec) yields a file that OPENS cleanly (valid footer + 'PAR1'
+        // magic) yet raises a raw System.NotSupportedException ("Compression method 9 is not supported.")
+        // during page decode. An empirical fuzz proved random bit-flips raise this SAME exception on genuinely
+        // corrupt pages (invalid codec / page-type / logical-type codes), so it is NOT separable from
+        // corruption — reclassifying it to UnsupportedFeature would MISLABEL corruption. It must stay
+        // CorruptData. This also documents why the "library NotSupported on a VALID file" case is not
+        // separately triggerable with Parquet.Net 6.0.3: the library neither reads nor writes such an encoding,
+        // so no valid-but-unsupported-encoding fixture is constructible — every NotSupportedException reachable
+        // in the page decode is corruption.
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3, 4, 5 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] forged = await ParquetTestHelpers.ForgeColumnCompressionCodecAsync(
+            file, rowGroup: 0, columnIndex: 0, forgedCodec: 9);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(forged, schema));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+    }
+
+    [Fact]
+    public async Task PareHeadWithNonPareTail_StaysCorruptData_PrecisionGuard()
+    {
+        // PRECISION GUARD (#649, council R1): a complete encrypted-footer file is bracketed by 'PARE' at BOTH
+        // ends. A file with a 'PARE' HEAD but a non-'PARE' tail ('GARB') is genuinely corrupt (an
+        // incomplete/mangled encrypted file), NOT a valid-but-unsupported one — so it must stay CorruptData,
+        // not be mislabeled UnsupportedFeature. This pins the head-AND-tail requirement through the read door.
+        byte[] corrupt = ParquetTestHelpers.PareHeadOnlyFile();
+        var schema = new StructType(new[] { KeepField });
+
+        DeltaStorageException read = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(corrupt, schema));
+        Assert.Equal(StorageErrorKind.CorruptData, read.Kind);
+
+        using var stream = new MemoryStream(corrupt, writable: false);
+        DeltaStorageException schemaRead = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new ParquetFileReader().ReadDataSchemaAsync(stream, CancellationToken.None));
+        Assert.Equal(StorageErrorKind.CorruptData, schemaRead.Kind);
+    }
+
+    [Fact]
+    public async Task PareHeadTruncated_StaysCorruptData_PrecisionGuard()
+    {
+        // PRECISION GUARD (#649, council R1): a 'PARE'-prefixed input truncated to just the leading magic is
+        // too short to be bracketed by a trailing 'PARE' — genuinely corrupt, must stay CorruptData.
+        byte[] truncated = ParquetTestHelpers.PareHeadTruncatedFile();
+        var schema = new StructType(new[] { KeepField });
+
+        DeltaStorageException read = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(truncated, schema));
+        Assert.Equal(StorageErrorKind.CorruptData, read.Kind);
+    }
+
+    [Fact]
+    public void IsParquetEncryptedFooterMagic_RequiresPareAtBothEnds_AndIsTransparent()
+    {
+        // Unit-level proof the discriminator keys on the actual MAGIC BYTES at BOTH ends (robust), not on
+        // ex.Message: only a file bracketed by 'PARE' head AND tail is detected; a 'PARE' head with a
+        // non-'PARE' tail, a 'PARE'-only truncated file, a 'PAR1' head (even with a garbage footer), arbitrary
+        // garbage, and a too-short input are NOT — so each keeps the CorruptData default. This pins the
+        // precision boundary (head-and-tail) at the classifier itself.
+        using (var pare = new MemoryStream(ParquetTestHelpers.EncryptedFooterMagicFile()))
+        {
+            Assert.True(ParquetFileReader.IsParquetEncryptedFooterMagic(pare));
+        }
+
+        using (var pareHeadOnly = new MemoryStream(ParquetTestHelpers.PareHeadOnlyFile()))
+        {
+            Assert.False(ParquetFileReader.IsParquetEncryptedFooterMagic(pareHeadOnly)); // non-'PARE' tail
+        }
+
+        using (var pareTruncated = new MemoryStream(ParquetTestHelpers.PareHeadTruncatedFile()))
+        {
+            Assert.False(ParquetFileReader.IsParquetEncryptedFooterMagic(pareTruncated)); // < 8 bytes
+        }
+
+        using (var par1 = new MemoryStream(ParquetTestHelpers.Par1MagicGarbageFooterFile()))
+        {
+            Assert.False(ParquetFileReader.IsParquetEncryptedFooterMagic(par1));
+        }
+
+        using (var garbage = new MemoryStream("this is not a parquet file"u8.ToArray()))
+        {
+            Assert.False(ParquetFileReader.IsParquetEncryptedFooterMagic(garbage));
+        }
+
+        using (var tooShort = new MemoryStream(new byte[] { 0x50, 0x41 })) // "PA" — fewer than 4 magic bytes
+        {
+            Assert.False(ParquetFileReader.IsParquetEncryptedFooterMagic(tooShort));
+        }
+
+        // The peek is TRANSPARENT: it seeks to read the head and tail, then restores the caller's position, so
+        // a fully-bracketed 'PARE' file is still found when the stream is positioned mid-file and the caller's
+        // position survives.
+        using (var pareMidPosition = new MemoryStream(ParquetTestHelpers.EncryptedFooterMagicFile()))
+        {
+            pareMidPosition.Position = 3;
+            Assert.True(ParquetFileReader.IsParquetEncryptedFooterMagic(pareMidPosition));
+            Assert.Equal(3, pareMidPosition.Position);
+        }
+    }
 }

@@ -269,6 +269,98 @@ internal static class ParquetTestHelpers
         return forged.ToArray();
     }
 
+    /// <summary>Constructs a minimal Parquet Modular Encryption (encrypted-footer mode) input: the
+    /// <c>PARE</c> magic (0x50 0x41 0x52 0x45) at BOTH the head and tail (per the Parquet format Encryption
+    /// spec), bracketing an opaque encrypted-footer body. Parquet.Net 6.0.3 rejects the <c>PARE</c> head at
+    /// open with <c>IOException "not a parquet file, head: 50415245, tail: 50415245"</c> — the same path a
+    /// real pyarrow-emitted encrypted table trips (the library can neither read nor WRITE encrypted files, so
+    /// this hand-crafted shape is the only way to author the fixture). Enough to drive the reader's encryption
+    /// classifier (#649): a <see cref="ParquetFileReader"/> read must map it to
+    /// <see cref="StorageErrorKind.UnsupportedFeature"/>, not <see cref="StorageErrorKind.CorruptData"/>.</summary>
+    public static byte[] EncryptedFooterMagicFile()
+    {
+        using var stream = new MemoryStream();
+        stream.Write("PARE"u8);
+        stream.Write(new byte[] { 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03 }); // opaque encrypted-footer body
+        stream.Write(BitConverter.GetBytes(8)); // little-endian footer length
+        stream.Write("PARE"u8);
+        return stream.ToArray();
+    }
+
+    /// <summary>The corruption-precision SIBLING of <see cref="EncryptedFooterMagicFile"/>: a genuinely
+    /// CORRUPT file that ALSO fails at open (like the encrypted file), differing ONLY in its magic — it
+    /// carries the ordinary plaintext <c>PAR1</c> magic at both ends but a garbage footer body, so
+    /// Parquet.Net rejects it with a <c>ThriftProtocolException</c>. This isolates the encryption classifier's
+    /// precision (#649): a <c>PAR1</c> head is NOT encryption, so a <see cref="ParquetFileReader"/> read must
+    /// keep classifying this as <see cref="StorageErrorKind.CorruptData"/> — only a <c>PARE</c> head becomes
+    /// <see cref="StorageErrorKind.UnsupportedFeature"/>.</summary>
+    public static byte[] Par1MagicGarbageFooterFile()
+    {
+        using var stream = new MemoryStream();
+        stream.Write("PAR1"u8);
+        stream.Write(new byte[] { 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03 }); // garbage (non-Thrift) footer body
+        stream.Write(BitConverter.GetBytes(8));
+        stream.Write("PAR1"u8);
+        return stream.ToArray();
+    }
+
+    /// <summary>A corrupt/truncated file carrying ONLY the leading <c>PARE</c> magic (no trailing magic) — the
+    /// precision SIBLING that proves the encryption classifier requires <c>PARE</c> at BOTH ends (#649,
+    /// council R1). A complete encrypted-footer file is bracketed by <c>PARE</c>; this half-bracketed shape is
+    /// genuinely corrupt, so a <see cref="ParquetFileReader"/> read must keep it
+    /// <see cref="StorageErrorKind.CorruptData"/>, never <see cref="StorageErrorKind.UnsupportedFeature"/>.</summary>
+    public static byte[] PareHeadOnlyFile()
+    {
+        using var stream = new MemoryStream();
+        stream.Write("PARE"u8);
+        stream.Write(new byte[] { 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03 }); // opaque body
+        stream.Write(BitConverter.GetBytes(8));
+        stream.Write("GARB"u8); // NON-'PARE' tail — an incomplete/corrupt encrypted file, not a complete one
+        return stream.ToArray();
+    }
+
+    /// <summary>A minimal <c>PARE</c>-prefixed input that is TRUNCATED to just the leading magic (4 bytes) —
+    /// too short to be bracketed by a trailing <c>PARE</c>. Genuinely corrupt: the classifier must keep it
+    /// <see cref="StorageErrorKind.CorruptData"/> (#649 precision, council R1).</summary>
+    public static byte[] PareHeadTruncatedFile() => "PARE"u8.ToArray();
+
+    /// <summary>Rewrites the footer so that (<paramref name="rowGroup"/>, <paramref name="columnIndex"/>)'s
+    /// column chunk declares <paramref name="forgedCodec"/> as its compression <c>Codec</c> — an OUT-OF-RANGE
+    /// value (e.g. <c>9</c>, which is not a real <c>CompressionCodec</c>) that leaves the footer parseable and
+    /// the physical pages untouched, so the file OPENS cleanly (valid <c>PAR1</c> magic), yet Parquet.Net's
+    /// page decode raises a raw <see cref="NotSupportedException"/> ("Compression method 9 is not supported.")
+    /// when it reaches the chunk. That is CORRUPTION (an invalid codec code), not a valid-but-unsupported
+    /// feature — and it is a deterministic member of the same NotSupportedException family a random bit-flip
+    /// produces — so a <see cref="ParquetFileReader"/> read must keep mapping it to
+    /// <see cref="StorageErrorKind.CorruptData"/> (#649 precision guard: the fix must NOT broaden
+    /// NotSupported → UnsupportedFeature). Mirrors <see cref="ForgeColumnUncompressedSizeAsync"/>, mutating
+    /// only the column's codec.</summary>
+    public static async Task<byte[]> ForgeColumnCompressionCodecAsync(
+        byte[] bytes, int rowGroup, int columnIndex, int forgedCodec)
+    {
+        byte[] newFooter;
+        using (var stream = new MemoryStream(bytes, writable: false))
+        {
+            ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                global::Parquet.Meta.FileMetaData metadata = reader.Metadata!;
+                metadata.RowGroups[rowGroup].Columns[columnIndex].MetaData!.Codec =
+                    (global::Parquet.Meta.CompressionCodec)forgedCodec;
+                newFooter = SerializeFooter(metadata);
+            }
+        }
+
+        int originalFooterLength = BitConverter.ToInt32(bytes, bytes.Length - 8);
+        int footerStart = bytes.Length - 8 - originalFooterLength;
+        using var forged = new MemoryStream();
+        forged.Write(bytes, 0, footerStart);
+        forged.Write(newFooter, 0, newFooter.Length);
+        forged.Write(BitConverter.GetBytes(newFooter.Length), 0, 4);
+        forged.Write("PAR1"u8);
+        return forged.ToArray();
+    }
+
     private static byte[] SerializeFooter(global::Parquet.Meta.FileMetaData metadata)
     {
         Assembly parquet = typeof(ParquetReader).Assembly;
