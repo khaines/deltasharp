@@ -640,6 +640,26 @@ public sealed class ChangeFeedModelReplayTests : IDisposable
         Assert.True(
             addedAmt > 0 && widened > 0 && addedExtra > 0,
             "the add-column + int→long widen evolution chain must be exercised each run");
+
+        // CROSS-PRODUCT guarantee, pinned to the FORCED cases (not the disjoint aggregates above): the highest-
+        // risk, least-covered combo is a FULL add→widen→add evolution chain UNDER a mapped mode (name AND id).
+        // ModeForCase pins the first ForcedEvolutionCases cases to one mode each (none/name/id), and every forced
+        // case runs the whole §2.8 chain — so that combo is GUARANTEED every run regardless of seed. Assert that
+        // guarantee at its SOURCE: the forced cases must (a) each run the full chain and (b) cover all three
+        // modes. Asserting only the disjoint counts above — or an outcomes.Any(mapped && full-chain) over ALL
+        // cases — would NOT catch a regression that stopped pinning mapped-mode evolution (e.g. all forced cases
+        // collapse to `none`): the mode counts stay satisfied by the random cases, the evolution counts by the
+        // none-mode forced cases, and a random name/id case may INCIDENTALLY complete the chain — so the widen-
+        // over-mapped-column guarantee would silently degrade from certain to probabilistic. Pinning the forced
+        // cases fails deterministically on that regression, independent of the random rolls.
+        var forced = outcomes.Take(ForcedEvolutionCases).ToList();
+        Assert.All(forced, o => Assert.True(
+            o.AddedAmt && o.WidenedAmt && o.AddedExtra,
+            $"forced-evolution case (mode {o.Mode}) must run the full add→widen→add chain"));
+        Assert.True(
+            forced.Select(o => o.Mode).ToHashSet().SetEquals(AllMappingModes),
+            "the forced-evolution cases must cover every column-mapping mode (none, name, id) so the "
+            + "widen-over-mapped-column combo is guaranteed under BOTH name and id mapping each run");
     }
 
     // ------------------------------------------------------------------ generated-history record + model
