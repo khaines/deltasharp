@@ -243,6 +243,29 @@ public sealed class DeltaCheckpointReaderTests
     }
 
     [Fact]
+    public async Task PostFooterDecodeCorruption_FailsClosed_WithFixedMessage_NoEchoOfUnderlyingBytes()
+    {
+        // #651: the OTHER changed catch — the ReadAsync top-level decode catch (a VALID footer whose
+        // post-footer page bytes are corrupt) — must likewise surface a FIXED message, not an ex.Message echo
+        // of the corrupt page. A byte flipped in the first data page (offset 8, well before the trailing footer)
+        // leaves the footer parseable (OpenAsync succeeds) but fails the row-group page decode → the top-level
+        // catch. Exact-equality proves no interpolation; the cause is preserved as the inner exception.
+        byte[] valid = await new CheckpointFixture()
+            .Protocol(1, 2)
+            .Metadata("t", EmptySchema)
+            .Add("a.parquet", size: 1)
+            .ToParquetAsync();
+        valid[8] ^= 0xFF;
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(valid), default));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.Equal("The Delta checkpoint Parquet is malformed.", ex.Message);
+        Assert.NotNull(ex.InnerException);
+    }
+
+    [Fact]
     public async Task PartialMetadataRow_MissingId_FailsClosed()
     {
         // A metaData present (schemaString set) but missing its required primary key `id` is a corrupt
