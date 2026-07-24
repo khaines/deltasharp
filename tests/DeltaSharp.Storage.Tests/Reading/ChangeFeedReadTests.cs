@@ -755,6 +755,58 @@ public sealed class ChangeFeedReadTests : IDisposable
         Assert.Equal((2L, (string?)"b", ChangeDataWriter.DeleteChange, 2L), (only.Id, only.Name, only.ChangeType, only.Version));
     }
 
+    [Fact]
+    public async Task ColumnMapping_IdMode_ImplicitPath_ForeignTable_ResolvesByFieldId()
+    {
+        // RED-TEAM DISCRIMINATOR (#660): the sibling id-mode CDF tests above/below author their tables with
+        // DeltaSharp's OWN writer, which always names a physical Parquet column == its metaData physicalName.
+        // For such tables resolving a data column by FIELD-ID and resolving it by PHYSICAL NAME are
+        // INDISTINGUISHABLE — so disabling field-id resolution (byFieldId = null in ParquetFileReader) leaves
+        // them GREEN despite their names. This test makes field-id resolution LOAD-BEARING by hand-authoring a
+        // FOREIGN id-mode table whose physical Parquet column names (z0/z1) DIVERGE from the metaData
+        // physicalNames (col-A/col-B) AND are stored in the OPPOSITE order, but carry the correct footer
+        // field_ids. The implicit CDF read derives `insert` rows from the foreign add(dataChange=true) by
+        // reading the data file with the projection [col-A(id, field_id 1), col-B(name, field_id 2)] under
+        // resolveByFieldId: true. Only field-id resolution can locate z0/z1 from that projection; a by-name
+        // read looks for "col-A"/"col-B" (absent from the file) and — because logical `id` is NON-nullable —
+        // fails closed with "Requested column 'col-A' is not present in the Parquet file schema" (surfaced as
+        // DeltaReadSchemaEvolutionException). So this test is GREEN on real code and goes RED if field-id
+        // resolution is disabled. The reversed physical order additionally defeats any positional read.
+        await SeedForeignIdModeCdfFlatTableAsync();   // v0 metaData (id mode, CDF on), v1 foreign add(dataChange=true)
+
+        (DeltaChangeFeedInfo info, List<ColumnBatch> batches) = await ReadCdfBatchesAsync(
+            DeltaChangeFeedRange.FromVersion(1, 1));
+        AssertCdfOutputSchema(info.Schema, FlatSchema);   // LOGICAL id/name surfaced, never the physical z0/z1
+        (List<FlatChange> rows, _) = DecodeFlatChanges(batches);
+
+        // The LOGICAL values, resolved by field_id from the divergently-named / reordered physical file.
+        Assert.Equal(
+            new[]
+            {
+                (1L, (string?)"a", ChangeDataWriter.InsertChange, 1L),
+                (2L, "b", ChangeDataWriter.InsertChange, 1L),
+                (3L, "c", ChangeDataWriter.InsertChange, 1L),
+            },
+            rows.OrderBy(r => r.Id).Select(r => (r.Id, r.Name, r.ChangeType, r.Version)).ToArray());
+    }
+
+    // EXPLICIT (cdc) PATH — DEFERRED, and NOT faked (#660). The task also asked for a foreign-table field-id
+    // discriminator on the EXPLICIT cdc read path. It is structurally INFEASIBLE to make such a test both GREEN
+    // on real code AND RED under the byFieldId = null mutation, so NO explicit-path test is added here:
+    //   * Before the explicit path resolves any data column by field_id, ChangeFeedReader validates the cdc
+    //     file's decoded leaf schema against the version's log-resident metadata BY PHYSICAL NAME + leaf type
+    //     (CDF-EE-08, ValidateCdcLeafSchema). A FOREIGN cdc file whose physical names DIVERGE from the metaData
+    //     physicalNames (the only shape that makes field-id resolution load-bearing) is REJECTED at EE-08
+    //     ("missing the version's data column 'col-A'") on BOTH real and mutated code — so it cannot
+    //     discriminate the mutation (it fails identically either way, for a different reason).
+    //   * If instead the cdc file's data columns are named to MATCH the metaData physicalNames (so EE-08
+    //     passes), then — exactly as for a DeltaSharp-authored table — field-id and name resolution are
+    //     indistinguishable, and the read stays GREEN under the mutation.
+    // Hence EE-08's name-equality gate structurally precedes and subsumes the explicit path's resolveByFieldId,
+    // making it non-load-bearing for a divergent-name foreign table. This is a genuine coverage gap in the CDF
+    // explicit read (its field-id resolution is dead code for foreign tables), reported to the orchestrator —
+    // covering it honestly needs an EE-08-relaxation or a reader change, not a hand-authored cdc file.
+
     // ---------------------------------------------------------------- DV-aware implicit derivation
 
     [Fact]
@@ -1633,6 +1685,91 @@ public sealed class ChangeFeedReadTests : IDisposable
 
         await new DeltaTableWriter(new LocalFileSystemBackend(_root)).EnableChangeDataFeedAsync();
     }
+
+    // Authors a FOREIGN id-mode + CDF-enabled table BY HAND across two commits (#660), the shape a non-DeltaSharp
+    // engine produces: the physical Parquet data file's column NAMES (z0/z1) do NOT match the metaData
+    // physicalNames (col-A/col-B) and are stored in the OPPOSITE order to the logical schema, but each carries
+    // the correct footer field_id. DeltaSharp's own writer always names a physical column == its physicalName,
+    // so ONLY a foreign table like this makes id-mode field-id resolution LOAD-BEARING (name/positional
+    // resolution cannot pass by coincidence). Logical schema id(field_id 1)/name(field_id 2); physical layout
+    // [z0=name(field_id 2, nullable string), z1=id(field_id 1, non-null long)] — so logical `id` (field_id 1)
+    // is at physical position 1 and its physical name z1 differs from its metaData physicalName col-A.
+    //   v0: protocol (reader v3 / writer v7; columnMapping reader+writer, changeDataFeed writer) + metaData
+    //       (id-mode column mapping, delta.enableChangeDataFeed=true) — a metadata-only create commit.
+    //   v1: the foreign add(dataChange=true) referencing the hand-written Parquet file.
+    // Reading the CDF range [1,1] derives three `insert` rows from that add.
+    private async Task SeedForeignIdModeCdfFlatTableAsync()
+    {
+        var physicalSchema = new StructType(new[]
+        {
+            PhysFieldWithId("z0", DataTypes.StringType, nullable: true, id: 2),    // logical "name" (field_id 2)
+            PhysFieldWithId("z1", DataTypes.LongType, nullable: false, id: 1),     // logical "id"   (field_id 1)
+        });
+
+        (long Id, string Name)[] rows = { (1, "a"), (2, "b"), (3, "c") };
+        MutableColumnVector z0 = ColumnVectors.Create(DataTypes.StringType, rows.Length);  // name
+        MutableColumnVector z1 = ColumnVectors.Create(DataTypes.LongType, rows.Length);    // id
+        foreach ((long id, string name) in rows)
+        {
+            z0.AppendBytes(Encoding.UTF8.GetBytes(name));
+            z1.AppendValue(id);
+        }
+
+        var batch = new ManagedColumnBatch(physicalSchema, new ColumnVector[] { z0, z1 }, rows.Length);
+
+        byte[] parquetBytes;
+        using (var buffer = new MemoryStream())
+        {
+            await new ParquetFileWriter().WriteAsync(
+                buffer, physicalSchema, new[] { batch }, CancellationToken.None);
+            parquetBytes = buffer.ToArray();
+        }
+
+        const string relativePath = "foreign-idmode-cdf.parquet";
+        using var backend = new LocalFileSystemBackend(_root);
+        await backend.PutIfAbsentAsync(relativePath, parquetBytes, CancellationToken.None);
+
+        // Logical id/name with ids 1/2 and physicalNames col-A/col-B — names that do NOT match the Parquet
+        // z0/z1, so a name-based read cannot resolve them; only field_id works.
+        const string schemaJson =
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
+            + "{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-A\"}},"
+            + "{\"name\":\"name\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"col-B\"}}]}";
+        string escapedSchema = System.Text.Json.JsonSerializer.Serialize(schemaJson);
+
+        // reader v3 / writer v7 declaring columnMapping (reader+writer) AND changeDataFeed (writer-only), so the
+        // metaData's delta.enableChangeDataFeed is honored (ChangeDataFeedFeature.IsActive requires BOTH).
+        const string protocol =
+            "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,"
+            + "\"readerFeatures\":[\"columnMapping\"],"
+            + "\"writerFeatures\":[\"columnMapping\",\"changeDataFeed\"]}}";
+        string metadata =
+            "{\"metaData\":{\"id\":\"t\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
+            + "\"schemaString\":" + escapedSchema + ",\"partitionColumns\":[],\"configuration\":{"
+            + "\"delta.columnMapping.mode\":\"id\",\"delta.columnMapping.maxColumnId\":\"2\","
+            + "\"delta.enableChangeDataFeed\":\"true\"}}}";
+
+        byte[] v0 = Encoding.UTF8.GetBytes(protocol + "\n" + metadata + "\n");
+        await backend.PutIfAbsentAsync("_delta_log/00000000000000000000.json", v0, CancellationToken.None);
+
+        // v1: the foreign add(dataChange=true). modificationTime:0 is a literal (determinism — no clock read).
+        string addLine =
+            $"{{\"add\":{{\"path\":\"{relativePath}\",\"partitionValues\":{{}},"
+            + $"\"size\":{parquetBytes.Length},\"modificationTime\":0,\"dataChange\":true}}}}";
+        byte[] v1 = Encoding.UTF8.GetBytes(addLine + "\n");
+        await backend.PutIfAbsentAsync("_delta_log/00000000000000000001.json", v1, CancellationToken.None);
+    }
+
+    // A physical StructField carrying a delta.columnMapping.id (as a long MetadataValue) — the shape the id-mode
+    // writer stamps into the Parquet field_id, used to author a foreign id-mode data file by hand (mirrors
+    // DeltaDeleteColumnMappingTests.PhysFieldWithId).
+    private static StructField PhysFieldWithId(string name, DataType type, bool nullable, long id) =>
+        new(name, type, nullable, FieldMetadata.FromValues(new[]
+        {
+            new KeyValuePair<string, MetadataValue>(ColumnMapping.IdKey, MetadataValue.Long(id)),
+        }));
 
     // A fresh int-column table with CDF AND type widening enabled, so a later long append WIDENS `amount`
     // (int→long) IN-RANGE and the earlier narrow int files reconcile (promote) to long at read time (§2.8).
