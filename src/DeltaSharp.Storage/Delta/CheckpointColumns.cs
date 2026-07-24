@@ -16,14 +16,23 @@ namespace DeltaSharp.Storage.Delta;
 /// caller falls back to JSON replay rather than materialize invented state.
 /// </summary>
 /// <remarks>
-/// Message hygiene: these fail-closed messages name no file-derived token. The checkpoint Parquet leaf
-/// paths are a bounded Delta-protocol vocabulary — each <see cref="DataField"/> comes from
-/// <see cref="CheckpointSchema"/>'s leaves and matches only expected names (<c>add/path</c>, <c>add/size</c>,
-/// <c>add/stats</c>, …); <c>stats</c> is an opaque scalar that is never descended into per-user-column
-/// names — so they are not a current attacker-byte leak. They are scrubbed anyway, uniformly with the
-/// <c>ParquetFileReader</c> decode sites, for a consistent no-file-derived-token posture and to stay
-/// forward-safe should per-column-stats resolution ever descend these paths into user column names (#653).
-/// Only bounded structural context (row indices, slot/row counts) is retained.
+/// Message hygiene (#653): these fail-closed messages name no file-derived token — only bounded structural
+/// context (row indices, slot/row counts) and expected protocol names are retained. This scrub is
+/// <b>load-bearing</b>, not merely defense-in-depth, because the checkpoint leaves are not uniformly bounded:
+/// <list type="bullet">
+///   <item><description><b>Scalar and struct leaves</b> (<c>add/path</c>, <c>add/size</c>,
+///   <c>deletionVector/storageType</c>, …) are resolved by <i>expected</i> name via
+///   <see cref="CheckpointSchema"/>'s <c>Scalar</c>/<c>Child</c>/<c>DeletionVector</c> helpers, so their
+///   <see cref="DataField.Path"/> is a bounded Delta-protocol vocabulary.</description></item>
+///   <item><description><b>Map and list leaves</b> are NOT: <c>CheckpointSchema.Map</c> returns the file's
+///   <c>map.Key</c>/<c>map.Value</c> <see cref="DataField"/>s and <c>ListElement</c> returns the file's
+///   <c>list.Item</c> — matching only the <i>column's</i> name (e.g. <c>partitionValues</c>, <c>tags</c>) and
+///   never validating the sub-field names. A crafted checkpoint can therefore give those leaves
+///   attacker-authored names that flow into <see cref="DataField.Path"/>. Scrubbing file-derived leaf
+///   paths from these messages is thus a genuine leak fix for map/list-column leaves.</description></item>
+/// </list>
+/// <c>stats</c> is an opaque scalar that is never descended into per-user-column names. The scrub is applied
+/// uniformly with the <c>ParquetFileReader</c> decode sites for a consistent no-file-derived-token posture.
 /// </remarks>
 internal sealed class CheckpointColumns
 {

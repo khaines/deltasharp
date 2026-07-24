@@ -154,7 +154,10 @@ internal sealed record DeletionVectorDescriptor(
 
         if (storageType is not (StorageTypeUuidRelative or StorageTypeInline or StorageTypeAbsolutePath))
         {
-            throw malformed($"deletionVector.storageType '{storageType}' is not one of 'u','i','p'");
+            // Message hygiene (#653): `storageType` is an attacker-authored field value from the JSON commit
+            // OR a checkpoint row (this validator is shared by both decode paths), so the invalid value is not
+            // echoed — the fixed message names the bounded legal domain instead.
+            throw malformed("deletionVector.storageType is not one of 'u','i','p'");
         }
 
         string path = pathOrInlineDv ?? throw malformed("deletionVector.pathOrInlineDv is missing");

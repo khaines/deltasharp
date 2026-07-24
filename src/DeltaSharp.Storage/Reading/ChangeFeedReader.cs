@@ -629,7 +629,7 @@ internal sealed class ChangeFeedReader
             throw ClassifyFileError(path, ex);
         }
 
-        ValidateCdcLeafSchema(path, version, versionPhysicalDataSchema, fileSchema);
+        ValidateCdcLeafSchema(version, versionPhysicalDataSchema, fileSchema);
     }
 
     // The leaf comparison for CDF-EE-08. Physical names are 1:1 with field-ids in DeltaSharp's mapping (a
@@ -637,7 +637,7 @@ internal sealed class ChangeFeedReader
     // name and id modes. The synthesized `_change_type` column is excluded (it is engine-owned, not part of a
     // version's data schema, and its VALUE domain is validated separately in ReadChangeTypesAsync).
     private static void ValidateCdcLeafSchema(
-        string path, long version, StructType expected, StructType fileSchema)
+        long version, StructType expected, StructType fileSchema)
     {
         var fileByName = new Dictionary<string, DataType>(StringComparer.Ordinal);
         foreach (StructField field in fileSchema)
@@ -649,7 +649,7 @@ internal sealed class ChangeFeedReader
 
             if (!fileByName.TryAdd(field.Name, field.DataType))
             {
-                throw NewCdcSchemaMismatch(path, version, $"it declares data column '{field.Name}' more than once");
+                throw NewCdcSchemaMismatch(version, "it declares a data column more than once");
             }
         }
 
@@ -658,13 +658,13 @@ internal sealed class ChangeFeedReader
             if (!fileByName.TryGetValue(expectedField.Name, out DataType? fileType))
             {
                 throw NewCdcSchemaMismatch(
-                    path, version, $"it is missing the version's data column '{expectedField.Name}'");
+                    version, $"it is missing the version's data column '{expectedField.Name}'");
             }
 
             if (!expectedField.DataType.Equals(fileType))
             {
                 throw NewCdcSchemaMismatch(
-                    path, version,
+                    version,
                     $"data column '{expectedField.Name}' has leaf type {fileType.SimpleString} but the version's "
                     + $"metadata declares {expectedField.DataType.SimpleString}");
             }
@@ -674,14 +674,20 @@ internal sealed class ChangeFeedReader
 
         if (fileByName.Count > 0)
         {
-            string extras = string.Join(", ", fileByName.Keys.OrderBy(name => name, StringComparer.Ordinal));
+            // Message hygiene (#653): the surplus column names come from the cdc FILE's schema — for a foreign
+            // cdc file they are attacker-authored — so the message reports only the bounded COUNT, never the
+            // names. The trusted authority is the version's log-resident metadata (below), not this file.
             throw NewCdcSchemaMismatch(
-                path, version, $"it declares data column(s) [{extras}] absent from the version's metadata schema");
+                version,
+                $"it declares {fileByName.Count} data column(s) absent from the version's metadata schema");
         }
     }
 
-    private static DeltaReadException NewCdcSchemaMismatch(string path, long version, string detail) =>
-        new($"Change-data file '{path}' is inconsistent with version {version}'s schema: {detail}. DeltaSharp "
+    // Message hygiene (#653 / change-data-feed.md:344): the cdc file `path` is attacker-controllable on a
+    // hostile log (CDF §5.1, mirrors #516), so it is NOT rendered into the surfaced message; the version
+    // (a bounded int) and the caller's `detail` (scrubbed of file-derived tokens) are the only interpolations.
+    private static DeltaReadException NewCdcSchemaMismatch(long version, string detail) =>
+        new($"A change-data file is inconsistent with version {version}'s schema: {detail}. DeltaSharp "
             + "validates each cdc file's leaf schema against that version's log-resident metadata (the trusted "
             + "authority) before reading, and fails closed on a mismatch (design §3.2 CDF-EE-08).");
 
@@ -881,8 +887,11 @@ internal sealed class ChangeFeedReader
                         if (!ChangeDataWriter.ChangeTypeDomain.Contains(changeType))
                         {
                             throw new DeltaReadException(
+                                // Message hygiene (#653): `changeType` is a raw DATA CELL value decoded from
+                                // the file (obs-conventions: row/cell values never reach an exception), so it
+                                // is NOT echoed — only the bounded legal-values domain is named.
                                 $"Change-data file '{path}' has an unrecognized "
-                                + $"'{ChangeDataWriter.ChangeTypeColumn}' value '{changeType}'; the legal values "
+                                + $"'{ChangeDataWriter.ChangeTypeColumn}' value; the legal values "
                                 + "are insert / delete / update_preimage / update_postimage.");
                         }
 

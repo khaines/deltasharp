@@ -1,4 +1,5 @@
 using System.Text.Json;
+using DeltaSharp.Storage.Delta;
 using DeltaSharp.Storage.Delta.DeletionVectors;
 using Xunit;
 
@@ -111,5 +112,25 @@ public sealed class DeletionVectorDescriptorTests
             DeletionVectorDescriptor.StorageTypeAbsolutePath, "/tmp/x.bin", Offset: 1, SizeInBytes: 40, Cardinality: 6);
 
         Assert.Throws<DeltaStorageException>(() => descriptor.ResolveRelativePath());
+    }
+
+    [Fact]
+    public void Parse_UnrecognizedStorageType_FailsClosedWithoutEchoingAttackerValue()
+    {
+        // Message hygiene (#653): `deletionVector.storageType` is an attacker-authored field on a crafted commit
+        // (and, via the SHARED Create validator, a crafted checkpoint), so the fail-closed message must NOT echo
+        // the invalid value — it names only the bounded legal domain. A crafted sentinel value proves no-echo.
+        const string sentinel = "att4cker_st0rageType_s3ntinel";
+        string json =
+            "{\"deletionVector\":{\"storageType\":\"" + sentinel
+            + "\",\"pathOrInlineDv\":\"0123456789abcdefghij\",\"sizeInBytes\":40,\"cardinality\":6}}";
+        using JsonDocument doc = JsonDocument.Parse(json);
+
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
+            () => DeletionVectorDescriptor.Parse(doc.RootElement, action: "add", version: 7, line: 3));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.DoesNotContain(sentinel, ex.Message, StringComparison.Ordinal);   // the value is never surfaced
+        Assert.Contains("storageType is not one of", ex.Message, StringComparison.Ordinal);   // fixed diagnostic
     }
 }

@@ -121,6 +121,19 @@ public sealed class ChangeFeedReadTests : IDisposable
         new StructField(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: false),
     });
 
+    // A cdc-file leaf schema carrying a SURPLUS data column named an attacker sentinel that is ABSENT from the
+    // flat metadata schema A (id, name) — drives the EE-08 "extras" branch (#653 site 1). `id`/`name` match A so
+    // ONLY the surplus column is inconsistent, and its file-derived NAME must never reach the surfaced message.
+    private const string SurplusSentinelColumn = "z_att4cker_surplus_col_s3ntinel";
+
+    private static readonly StructType CdcSurplusColumnSchema = new(new[]
+    {
+        new StructField("id", DataTypes.LongType, nullable: false),
+        new StructField("name", DataTypes.StringType, nullable: true),
+        new StructField(SurplusSentinelColumn, DataTypes.LongType, nullable: true),
+        new StructField(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: false),
+    });
+
     public void Dispose()
     {
         try
@@ -1347,8 +1360,58 @@ public sealed class ChangeFeedReadTests : IDisposable
         DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
             async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 3)));
         Assert.Null(ex.InnerException);   // a pure per-version schema-validation failure, not a wrapped I/O fault
-        Assert.Contains("extra", ex.Message, StringComparison.Ordinal);      // names the offending end-only column
+        // Message hygiene (#653): the offending column is a cdc-FILE-derived name (attacker-authored on a
+        // foreign cdc file), so it is NOT echoed — the fixed message reports the bounded absent-column COUNT.
+        Assert.DoesNotContain("extra", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("absent from the version's metadata schema", ex.Message, StringComparison.Ordinal);
         Assert.Contains("CDF-EE-08", ex.Message, StringComparison.Ordinal);  // the per-version cdc schema check
+    }
+
+    [Fact]
+    public async Task Explicit_CdcUnrecognizedChangeType_FailsClosedWithoutEchoingCellValue()
+    {
+        // Message hygiene (#653 / obs-conventions row-values): the `_change_type` cell is a raw DATA VALUE
+        // decoded from the cdc file (attacker-authored on a foreign cdc file), so an unrecognized token must
+        // fail closed WITHOUT echoing the value — only the bounded legal-value domain is named. The cdc leaf
+        // schema matches v2's metadata (EE-08 passes) so the read reaches the `_change_type` domain check with
+        // the crafted sentinel value.
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0, v1 (schema A = id, name)
+        var backend = new LocalFileSystemBackend(_root);
+        await NewCdfDelete(backend, "ct-noecho").DeleteAsync(WhereId(id => id == 1));   // v2 cdc(A) delete
+        string cdc = Assert.Single(CdcFilePaths());
+        const string sentinel = "att4cker_ch4ngeType_s3ntinel";
+        byte[] crafted = await ParquetTestHelpers.WriteToBytesAsync(
+            CdcFlatBodySchema, new[] { CdcFlatBodyBatch((1L, "a", sentinel)) });
+        await File.WriteAllBytesAsync(Path.Combine(_root, cdc), crafted);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
+        Assert.DoesNotContain(sentinel, ex.Message, StringComparison.Ordinal);   // the cell value is never surfaced
+        Assert.Contains("unrecognized", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("legal values", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Explicit_CdcSurplusDataColumn_FailsClosedWithoutEchoingFileColumnName()
+    {
+        // Message hygiene (#653): a surplus cdc data column (absent from the version's trusted metadata) carries
+        // a FILE-derived NAME — attacker-authored on a foreign cdc file — so the EE-08 extras failure must NOT
+        // echo it; the fixed message reports only the bounded absent-column COUNT. A crafted sentinel column name
+        // proves no-echo. (`id`/`name` match v2's schema A so ONLY the surplus column is inconsistent.)
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0, v1 (schema A = id, name)
+        var backend = new LocalFileSystemBackend(_root);
+        await NewCdfDelete(backend, "surplus-noecho").DeleteAsync(WhereId(id => id == 1));   // v2 cdc(A) delete
+        string cdc = Assert.Single(CdcFilePaths());
+        byte[] surplus = await ParquetTestHelpers.WriteToBytesAsync(
+            CdcSurplusColumnSchema, new[] { CdcSurplusColumnBatch() });
+        await File.WriteAllBytesAsync(Path.Combine(_root, cdc), surplus);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
+        Assert.DoesNotContain(SurplusSentinelColumn, ex.Message, StringComparison.Ordinal);   // no file-name leak
+        Assert.Contains("absent from the version's metadata schema", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("CDF-EE-08", ex.Message, StringComparison.Ordinal);
+        Assert.Null(ex.InnerException);   // a pure per-version schema-validation failure, not a wrapped I/O fault
     }
 
     [Fact]
@@ -2149,6 +2212,22 @@ public sealed class ChangeFeedReadTests : IDisposable
 
         return new ManagedColumnBatch(
             CdcMatchesEndSchema, new ColumnVector[] { id, name, extra, changeType }, rows.Length);
+    }
+
+    // Builds a one-row cdc file body for CdcSurplusColumnSchema: id/name match schema A plus a surplus column
+    // (named the attacker sentinel) absent from A — the EE-08 extras discriminator (#653 site 1).
+    private static ColumnBatch CdcSurplusColumnBatch()
+    {
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, 1);
+        MutableColumnVector name = ColumnVectors.Create(DataTypes.StringType, 1);
+        MutableColumnVector surplus = ColumnVectors.Create(DataTypes.LongType, 1);
+        MutableColumnVector changeType = ColumnVectors.Create(DataTypes.StringType, 1);
+        id.AppendValue(1L);
+        name.AppendBytes(Encoding.UTF8.GetBytes("a"));
+        surplus.AppendValue(99L);
+        changeType.AppendBytes(Encoding.UTF8.GetBytes(ChangeDataWriter.DeleteChange));
+        return new ManagedColumnBatch(
+            CdcSurplusColumnSchema, new ColumnVector[] { id, name, surplus, changeType }, 1);
     }
 
     // Builds a FlatSchema cdc file body (id, name, `_change_type`) — the physical layout ChangeDataWriter emits

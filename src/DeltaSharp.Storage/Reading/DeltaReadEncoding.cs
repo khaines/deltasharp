@@ -125,7 +125,7 @@ internal static class DeltaReadEncoding
     {
         if (!decimal.TryParse(value, NumberStyles.Number, CultureInfo.InvariantCulture, out decimal parsed))
         {
-            throw ParseFailure(type, value);
+            throw ParseFailure(type);
         }
 
         decimal scaled = parsed;
@@ -148,12 +148,12 @@ internal static class DeltaReadEncoding
     private static sbyte ParseSByte(string value) =>
         sbyte.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out sbyte result)
             ? result
-            : throw ParseFailure(ByteType.Instance, value);
+            : throw ParseFailure(ByteType.Instance);
 
     private static long ParseLong(string value) =>
         long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out long result)
             ? result
-            : throw ParseFailure(LongType.Instance, value);
+            : throw ParseFailure(LongType.Instance);
 
     private static T ParseInteger<T>(string value, long min, long max, Func<long, T> narrow)
     {
@@ -163,27 +163,29 @@ internal static class DeltaReadEncoding
             return narrow(parsed);
         }
 
+        // Message hygiene (#653 / obs-conventions): the raw partition `value` is user/attacker data and is
+        // never echoed; the fixed message names the failure class only.
         throw new DeltaStorageException(
             StorageErrorKind.CorruptData,
-            $"Partition value '{value}' is out of range for an integer partition column.");
+            "Partition value is out of range for an integer partition column.");
     }
 
     private static bool ParseBool(string value) => value switch
     {
         "true" => true,
         "false" => false,
-        _ => throw ParseFailure(BooleanType.Instance, value),
+        _ => throw ParseFailure(BooleanType.Instance),
     };
 
     private static float ParseFloat(string value) =>
         float.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out float result)
             ? result
-            : throw ParseFailure(FloatType.Instance, value);
+            : throw ParseFailure(FloatType.Instance);
 
     private static double ParseDouble(string value) =>
         double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out double result)
             ? result
-            : throw ParseFailure(DoubleType.Instance, value);
+            : throw ParseFailure(DoubleType.Instance);
 
     private static int ParseDate(string value)
     {
@@ -192,7 +194,7 @@ internal static class DeltaReadEncoding
             return date.DayNumber - UnixEpochDate.DayNumber;
         }
 
-        throw ParseFailure(DateType.Instance, value);
+        throw ParseFailure(DateType.Instance);
     }
 
     private static long ParseTimestamp(string value)
@@ -208,11 +210,13 @@ internal static class DeltaReadEncoding
             return ticks / TimeSpan.TicksPerMicrosecond;
         }
 
-        throw ParseFailure(TimestampType.Instance, value);
+        throw ParseFailure(TimestampType.Instance);
     }
 
-    private static DeltaStorageException ParseFailure(DataType type, string value) =>
+    // Message hygiene (#653 / obs-conventions): the raw partition `value` is user/attacker data and is never
+    // echoed; only the bounded target `type` (a Delta protocol type name) is named.
+    private static DeltaStorageException ParseFailure(DataType type) =>
         new(
             StorageErrorKind.CorruptData,
-            $"Partition value '{value}' is not a valid '{type.SimpleString}'.");
+            $"Partition value is not a valid '{type.SimpleString}'.");
 }
