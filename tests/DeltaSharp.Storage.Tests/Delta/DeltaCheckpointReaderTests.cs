@@ -475,6 +475,75 @@ public sealed class DeltaCheckpointReaderTests
     }
 
     [Fact]
+    public async Task MalformedScalarReconstruction_RepeatedScalar_MessageDoesNotEchoColumnPath()
+    {
+        // #653 no-echo (SCALAR repetition site, CheckpointColumns.FillScalar col.MaxRepetition != 0). A
+        // checkpoint whose add.size leaf is a legacy 1-level REPEATED long (MaxRepetitionLevel=1) still resolves
+        // as an ordinary scalar (CheckpointSchema.Scalar matches only the expected NAME, not the repetition), so
+        // the scalar reader reaches FillScalar, which fails closed on the unexpected repetition. Unlike a
+        // map/list leaf (whose name is attacker-forgeable), a SCALAR leaf name is a bounded Delta-protocol
+        // vocabulary (add/size), so no sentinel can ride it — the load-bearing no-echo signal here is the
+        // absence of any ' (quoting): a reverted scrub re-emits 'add/size' QUOTED (mirrors the sibling scalar
+        // SlotMismatch test, which pins the same class of leak on the other scalar branch).
+        byte[] parquet = await CheckpointFixture.MalformedRepeatedAddSizeScalarAsync();
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.DoesNotContain("'", ex.Message, StringComparison.Ordinal);   // no quoted (would-be 'add/size') path
+        // Pins the scrubbed FillScalar repetition site: names the column CLASS, never the leaf path.
+        Assert.Contains("scalar column is unexpectedly repeated", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task MalformedMapReconstruction_RowOutOfRange_MessageDoesNotEchoMapKeyLeafPath()
+    {
+        // #653 no-echo (MAP reconstruction, EnsureRowInRange). Sibling of MalformedMapReconstruction_… above
+        // which OVER-declares the row count (→ EnsureRowCount); this UNDER-declares it (actual-1) so a
+        // repetition-0 slot advances the reconstructed row PAST the shrunken bound and ForEachMapEntry →
+        // EnsureRowInRange fails closed. The map key leaf carries an attacker SENTINEL — file-derived, since
+        // CheckpointSchema.Map returns Parquet.Net's logical .Key verbatim — so a reverted scrub would echo
+        // add/partitionValues/key_value/<sentinel>. NOTE: this branch's fixed message legitimately contains an
+        // apostrophe ("column's"), so unlike the scalar/physical-type tests the no-echo signal is the SENTINEL's
+        // absence, not the absence of ' — DoesNotContain(sentinel) is the load-bearing assertion.
+        const string keySentinel = "att4cker_ckpt_map_range_s3ntinel";
+        byte[] forged =
+            await CheckpointFixture.MalformedAddPartitionValuesMapAsync(keySentinel, overDeclareRows: false);
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(forged), default));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.DoesNotContain(keySentinel, ex.Message, StringComparison.Ordinal);   // no file-derived leaf path
+        // Pins the scrubbed EnsureRowInRange site (distinct from the EnsureRowCount site the sibling pins).
+        Assert.Contains("repetition levels address row", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task MalformedMapPhysicalType_MessageDoesNotEchoMapValueLeafPath()
+    {
+        // #653 no-echo (physical-type site, CheckpointColumns.ReadRawAsync InvalidCastException catch — the R4
+        // finding). A checkpoint add.partitionValues MAP whose VALUE leaf is physically INT32 (renamed to an
+        // attacker SENTINEL) is read AS A STRING by the map reconstruction, so the wrong-typed RawColumnData
+        // cast throws InvalidCastException and the reader fails closed. The value leaf is file-derived
+        // (CheckpointSchema.Map returns Parquet.Net's logical .Value verbatim), so a reverted scrub would echo
+        // add/partitionValues/key_value/<sentinel>. The KEY stays a well-formed string so the VALUE read (not
+        // the key read) is the site that trips.
+        const string valueSentinel = "att4cker_ckpt_map_type_s3ntinel";
+        byte[] forged = await CheckpointFixture.MalformedAddPartitionValuesMapValueTypeAsync(valueSentinel);
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(forged), default));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.DoesNotContain(valueSentinel, ex.Message, StringComparison.Ordinal);   // no file-derived leaf path
+        Assert.DoesNotContain("'", ex.Message, StringComparison.Ordinal);             // no quoted path at all
+        // Pins the scrubbed ReadRawAsync physical-type site (not the outer generic "malformed" catch).
+        Assert.Contains("unexpected physical type", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task PartByteCeiling_RejectsOversizedPart()
     {
         byte[] parquet = await new CheckpointFixture()
@@ -642,6 +711,35 @@ public sealed class DeltaCheckpointReaderTests
             () => DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default));
         Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
         Assert.Contains("storageType", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task MalformedDeletionVector_UnrecognizedStorageType_MessageDoesNotEchoAttackerValue()
+    {
+        // #653 re-check of the CHECKPOINT-path DvMalformed site (CheckpointColumns' DvMalformed helper): it
+        // wraps the SHARED DeletionVectorDescriptor.Create validator's `detail` and adds only action/row/group
+        // — it has NO DataField in scope, so it is structurally incapable of echoing a leaf path, and the one
+        // attacker-controlled value that reaches it (the storageType STRING) is already scrubbed by Create into
+        // a fixed domain message. This drives an oversized sentinel storageType through the checkpoint decode
+        // door (the sibling BadStorageType_ test above uses a 1-char "x" that could not reveal an echo) and
+        // pins that the surfaced message never carries the attacker value — parity with the JSON-path
+        // Parse_UnrecognizedStorageType_… regression, since both share the one validator. (Belt-and-suspenders:
+        // there is no field.Path to revert here, so this is a permanent no-echo pin, not a mutation oracle.)
+        const string sentinel = "att4cker_ckpt_dv_st0rageType_s3ntinel";
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(3, 7, readerFeatures: ["deletionVectors"], writerFeatures: ["deletionVectors"])
+            .Metadata("t", EmptySchema)
+            .Add("dv.parquet", size: 1,
+                deletionVector: new CheckpointFixture.DvColumns(sentinel, "0123456789abcdefghij", Offset: 4, SizeInBytes: 40, Cardinality: 3))
+            .ToParquetAsync();
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.DoesNotContain(sentinel, ex.Message, StringComparison.Ordinal);   // attacker storageType never surfaced
+        Assert.Contains("malformed deletionVector", ex.Message, StringComparison.Ordinal);   // pins the checkpoint DvMalformed wrapper
+        Assert.Contains("storageType is not one of", ex.Message, StringComparison.Ordinal);  // fixed bounded domain
     }
 
     [Fact]

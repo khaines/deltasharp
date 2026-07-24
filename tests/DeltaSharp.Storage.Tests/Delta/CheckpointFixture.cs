@@ -297,10 +297,13 @@ internal sealed class CheckpointFixture
     /// footer AFTER serialization (Parquet.Net's untyped serializer hard-requires the literal <c>key</c>/
     /// <c>value</c> leaf names), so the resolved key <c>DataField.Path</c> carries that FILE-derived leaf name
     /// (<c>CheckpointSchema.Map</c> returns Parquet.Net's logical <c>.Key</c>/<c>.Value</c> verbatim). The row
-    /// group's declared row count is then forged to one MORE than the two entries it holds, so the map
-    /// reconstruction fails closed at the row-count check — proving that message never echoes the leaf path
-    /// (#653).</summary>
-    internal static async Task<byte[]> MalformedAddPartitionValuesMapAsync(string keyLeafName)
+    /// group's declared row count is then forged so the map reconstruction fails closed: <b>over</b>-declaring
+    /// (one MORE than the two entries) trips the row-COUNT check (<c>EnsureRowCount</c>); <b>under</b>-declaring
+    /// (one FEWER, <paramref name="overDeclareRows"/> = false) trips the row-IN-RANGE check
+    /// (<c>EnsureRowInRange</c>, whose repetition-0 slot advances <c>row</c> past the shrunken bound). Either
+    /// way the surfaced message must never echo the leaf path (#653).</summary>
+    internal static async Task<byte[]> MalformedAddPartitionValuesMapAsync(
+        string keyLeafName, bool overDeclareRows = true)
     {
         var schema = new ParquetSchema(new StructField("add",
             new MapField("partitionValues",
@@ -333,7 +336,74 @@ internal sealed class CheckpointFixture
 
         bytes = await ParquetTestHelpers.ForgeLeafColumnNameAsync(bytes, "key", keyLeafName);
         long actual = await ParquetTestHelpers.RowGroupNumRowsAsync(bytes, 0);
-        return await ParquetTestHelpers.ForgeRowGroupNumRowsAsync(bytes, 0, actual + 1);
+        return await ParquetTestHelpers.ForgeRowGroupNumRowsAsync(
+            bytes, 0, overDeclareRows ? actual + 1 : actual - 1);
+    }
+
+    /// <summary>Authors a MINIMAL classic checkpoint whose ONLY column is the <c>add.partitionValues</c> MAP
+    /// with a physically <b>INT32</b> value leaf (renamed to <paramref name="valueLeafName"/> after
+    /// serialization). The reader reads every map value leaf as a string (<c>ReadOnlyMemory&lt;char&gt;</c>),
+    /// so the INT32 physical column casts to the wrong <c>RawColumnData&lt;T&gt;</c> and
+    /// <c>CheckpointColumns.ReadRawAsync</c> fails closed with the "unexpected physical type" message. The
+    /// value leaf is FILE-derived (<c>CheckpointSchema.Map</c> returns Parquet.Net's logical <c>.Value</c>
+    /// verbatim), so it carries the caller's sentinel — proving that fail-closed message never echoes the leaf
+    /// path (#653, R4 physical-type finding). The KEY stays a well-formed string so the value read (not the
+    /// key read) is the site that trips.</summary>
+    internal static async Task<byte[]> MalformedAddPartitionValuesMapValueTypeAsync(string valueLeafName)
+    {
+        var schema = new ParquetSchema(new StructField("add",
+            new MapField("partitionValues",
+                new DataField<string>("key", nullable: false),
+                new DataField<int?>("value"))));
+        var rows = new List<IDictionary<string, object?>>
+        {
+            new Dictionary<string, object?>
+            {
+                ["add"] = new Dictionary<string, object?>
+                {
+                    ["partitionValues"] = new Dictionary<string, int?> { ["k1"] = 7 },
+                },
+            },
+        };
+
+        byte[] bytes;
+        using (var stream = new MemoryStream())
+        {
+            await ParquetSerializer.SerializeUntypedAsync(rows, schema, stream);
+            bytes = stream.ToArray();
+        }
+
+        // Rename the INT32 value leaf to the sentinel (its resolved DataField.Path is what a reverted scrub
+        // would echo). ForgeLeafColumnNameAsync rewrites BOTH the schema element and the chunk PathInSchema, so
+        // the column still LOADS and DECODES (as INT32) — the physical-type mismatch is on TYPE, not lookup.
+        return await ParquetTestHelpers.ForgeLeafColumnNameAsync(bytes, "value", valueLeafName);
+    }
+
+    /// <summary>Authors a MINIMAL classic checkpoint whose ONLY column is a legacy 1-level <b>REPEATED</b>
+    /// primitive <c>add.size</c> (a <c>DataField</c> with <c>isArray=true</c>, <c>MaxRepetitionLevel=1</c>
+    /// directly under the <c>add</c> struct). <c>CheckpointSchema.Scalar</c> resolves <c>add/size</c> as an
+    /// ordinary scalar <c>DataField</c> (it matches only the expected name), so the scalar reader reaches
+    /// <c>CheckpointColumns.FillScalar</c>, which fails closed on the unexpected repetition
+    /// (<c>col.MaxRepetition != 0</c>). Authored with the LOW-LEVEL <see cref="ParquetWriter"/> because the
+    /// untyped serializer models a repeated primitive as a 3-level list, never a 1-level repeated leaf. A
+    /// scalar leaf name is a bounded Delta-protocol vocabulary (<c>add/size</c>), so a reverted scrub would
+    /// re-echo it <i>quoted</i> — the no-echo assertion pins the absence of that quoting (#653).</summary>
+    internal static async Task<byte[]> MalformedRepeatedAddSizeScalarAsync()
+    {
+        var repeated = new DataField("size", typeof(long), isArray: true);
+        var schema = new ParquetSchema(new StructField("add", repeated));
+        DataField[] leaves = schema.GetDataFields();
+
+        using var stream = new MemoryStream();
+        await using (ParquetWriter writer = await ParquetWriter.CreateAsync(schema, stream))
+        {
+            using ParquetRowGroupWriter rowGroup = writer.CreateRowGroup();
+            // One row carrying two repeated long elements (rep 0 then rep 1) → MaxRepetitionLevel=1.
+            await rowGroup.WriteAsync<long>(
+                leaves[0], new ReadOnlyMemory<long?>(new long?[] { 1L, 2L }), new[] { 0, 1 }, null, CancellationToken.None);
+        }
+
+        return stream.ToArray();
     }
 
     /// <summary>Authors a MINIMAL classic checkpoint whose ONLY column is the <c>metaData.partitionColumns</c>

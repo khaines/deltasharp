@@ -581,11 +581,26 @@ internal sealed class CheckpointColumns
         int rowCount,
         Action<int, string, string?> onEntry)
     {
+        // Defensive parity, guaranteed unreachable through the public read door (R5 #653): ForEachMapEntry is
+        // reached only for a CheckpointSchema.Map-resolved leaf — a Parquet.Net logical MapField — whose .Key
+        // is fixed at MaxRepetitionLevel=1 by the map shape (its repeated key_value group). Forging the
+        // key_value group's repetition_type away from REPEATED does NOT lower the resolved key's
+        // MaxRepetitionLevel (the logical abstraction hard-codes it), so keys.MaxRepetition is never 0 here.
+        // The guard is kept as an explicit local invariant so a future decode path — or a library change — that
+        // produced a non-repeated map key would still fail closed rather than mis-reconstruct.
         if (keys.MaxRepetition == 0)
         {
             throw DeltaProtocolException.Malformed("A checkpoint map column is not repeated.");
         }
 
+        // Defensive parity, guaranteed unreachable through the public read door (R5 #653): a map's key and
+        // value share one repeated key_value group, so every conformant writer — and Parquet.Net's decoder —
+        // emits key/value level streams of identical length. The only tool that can desync them, the low-level
+        // ParquetRowGroupWriter.WriteAsync<T>, is T:struct-constrained and so cannot author the STRING leaves a
+        // checkpoint map requires; a slot-divergent map is therefore necessarily non-string, and reading its
+        // string-typed leaves trips the physical-type guard (ReadRawAsync, below) BEFORE this check. The guard
+        // is kept as an explicit local invariant so a future decode path that desynced the streams still fails
+        // closed rather than pair a key with the wrong value.
         if (keys.Definition.Length != values.Definition.Length)
         {
             throw DeltaProtocolException.Malformed(string.Create(
@@ -620,6 +635,13 @@ internal sealed class CheckpointColumns
     private static void ForEachListElement(
         RawColumn<ReadOnlyMemory<char>> elements, int rowCount, Action<int, string> onElement)
     {
+        // Defensive parity, guaranteed unreachable through the public read door (R5 #653): ForEachListElement
+        // is reached only for a CheckpointSchema.ListElement-resolved leaf — a Parquet.Net logical ListField —
+        // whose .Item is fixed at MaxRepetitionLevel=1 by the list shape (its repeated list group). Forging the
+        // list group's repetition_type away from REPEATED does NOT lower the resolved element's
+        // MaxRepetitionLevel, so elements.MaxRepetition is never 0 here. The guard is kept as an explicit local
+        // invariant so a future decode path — or a library change — that produced a non-repeated list element
+        // would still fail closed rather than mis-reconstruct.
         if (elements.MaxRepetition == 0)
         {
             throw DeltaProtocolException.Malformed("A checkpoint list column is not repeated.");
