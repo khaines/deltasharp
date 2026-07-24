@@ -341,7 +341,9 @@ internal sealed class ChangeFeedReader
                         $"Change feed version {v}'s commit log is no longer available (log cleanup removed it "
                         + "between range resolution and read); the requested range is outside the "
                         + "CDF-readable window.", ex)
-                    : new DeltaReadException(ex.Message, ex);
+                    : new DeltaReadException(
+                $"A change-feed file could not be read (storage fault: {ex.Kind}); the requested "
+                + "change-feed range failed closed.", ex);
             }
             catch (DeltaProtocolException ex)
             {
@@ -1157,15 +1159,19 @@ internal sealed class ChangeFeedReader
         ex.Kind == StorageErrorKind.ColumnNotPresentInFile;
 
     // Message hygiene (#653/cdf:344): Storage cannot redact (SecretRedaction is Core-internal), so the
-    // attacker-controllable cdc/change-feed file path is DROPPED, not surfaced — the `path` param was removed
-    // (it was used only to build the NotFound message; the inner exception still carries the fault). The
-    // non-NotFound branch passes through the storage layer's own `ex.Message` (not a path this method renders).
+    // attacker-controllable cdc/change-feed file path is DROPPED, not surfaced. The NotFound branch renders a
+    // fixed message; the non-NotFound branch must NOT forward `ex.Message` — a PathNotConfined fault (and
+    // others) names the rejected path in its message, so passing it through would re-surface the attacker cdc
+    // path. Instead it names only the bounded storage-error KIND (a closed enum); the inner exception still
+    // carries the full fault for server-side diagnostics (its ToString()/log exposure is tracked in #664).
     private static DeltaReadException ClassifyFileError(DeltaStorageException ex) =>
         ex.Kind == StorageErrorKind.NotFound
             ? new DeltaReadException(
                 "A change-feed file is no longer available (vacuumed, or past the data-retention "
                 + "window); the requested change-feed range is outside the CDF-readable window.", ex)
-            : new DeltaReadException(ex.Message, ex);
+            : new DeltaReadException(
+                $"A change-feed file could not be read (storage fault: {ex.Kind}); the requested "
+                + "change-feed range failed closed.", ex);
 
     // The resolved read context, built once from the end snapshot: the reconciled output schema (data + 3
     // metadata), the end-version logical data schema (data + partition, for relabeling), the physical data

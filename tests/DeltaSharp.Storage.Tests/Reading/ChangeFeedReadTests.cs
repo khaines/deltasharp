@@ -1540,6 +1540,34 @@ public sealed class ChangeFeedReadTests : IDisposable
     }
 
     [Fact]
+    public async Task Explicit_PathConfinementViolatingCdcFile_FailsClosedWithoutEchoingCdcFilePath()
+    {
+        // Message hygiene (#653/cdf:344): a NON-NotFound storage fault (here a hostile cdc path that ESCAPES the
+        // table root → PathNotConfined) must NOT re-surface the attacker path either. PathNotConfined names the
+        // rejected path in its own ex.Message, so ClassifyFileError's non-NotFound branch must NOT forward
+        // ex.Message — it names only the bounded storage-error KIND, keeping the cause on the inner exception.
+        // Author a DELETE (cdc at a normal path), then rewrite its committed `cdc.path` to a root-escaping
+        // sentinel; the explicit read's OpenReadAsync fails closed as PathNotConfined at that path.
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0, v1
+        var backend = new LocalFileSystemBackend(_root);
+        await NewCdfDelete(backend, "innocuous-cdc").DeleteAsync(WhereId(id => id == 1));   // v2 cdc
+        string cdc = Assert.Single(CdcFilePaths());
+
+        const string escapingSentinel = "../att4cker_cdc_confine_s3ntinel.parquet";   // escapes the table root
+        string commit = CommitPath(2);
+        string rewritten = (await File.ReadAllTextAsync(commit)).Replace(cdc, escapingSentinel, StringComparison.Ordinal);
+        Assert.Contains(escapingSentinel, rewritten, StringComparison.Ordinal);   // the rewrite landed
+        await File.WriteAllTextAsync(commit, rewritten);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
+        Assert.DoesNotContain("att4cker_cdc_confine_s3ntinel", ex.Message, StringComparison.Ordinal);   // no path leak
+        Assert.Contains("could not be read", ex.Message, StringComparison.Ordinal);   // bounded, path-free
+        DeltaStorageException inner = Assert.IsType<DeltaStorageException>(ex.InnerException);
+        Assert.Equal(StorageErrorKind.PathNotConfined, inner.Kind);   // the cause (with the path) stays on the inner
+    }
+
+    [Fact]
     public async Task Implicit_CdfAddStatsNumRecordsMismatch_FailsClosedWithoutEchoingDataFilePath()
     {
         // Message hygiene (#653/cdf:344, site 4): a DV-carrying add whose stats.numRecords disagrees with its
