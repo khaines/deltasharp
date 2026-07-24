@@ -1425,10 +1425,14 @@ internal sealed class ParquetFileReader
             // ArgumentOutOfRangeException source is the Parquet.Net decode above; the append delegate is
             // range-safe arithmetic). IsParquetDefect deliberately excludes ArgumentException (to surface our
             // own bugs), so map this specific decode fault to the deterministic CorruptData contract
-            // (ADR-0013) rather than leaking a raw BCL exception. The message names only the column (no cell
-            // value — #176/#8).
+            // (ADR-0013) rather than leaking a raw BCL exception. The message names NEITHER the column NOR the
+            // cell value: fileField.Name is the FILE's physical column name — under column-mapping id mode it
+            // is resolved by field_id from the untrusted footer (BuildFieldIdMap) verbatim / unsanitized, so
+            // it is attacker-authored for a foreign table. It is scrubbed like the sibling row-group decode
+            // fault above (#176/#8/#653); the cause is preserved as the inner exception for server-side
+            // diagnostics.
             throw DeltaStorageException.CorruptData(
-                $"Column '{fileField.Name}': a physical value is outside the representable date/time range.", ex);
+                "A Parquet column holds a physical value outside the representable date/time range.", ex);
         }
     }
 

@@ -229,7 +229,10 @@ internal static class DeltaCheckpointReader
     /// <paramref name="numValues"/> packed slots × (value width + the two 4-byte Dremel level ints) plus the
     /// declared decompressed payload, overflow-saturated. Fails closed on a negative declared size or a
     /// decompression ratio beyond <see cref="ParquetFileReader.MaxDecompressionRatio"/> (a decompression
-    /// bomb). Pure/arithmetic so the ceiling is unit-testable without a real Parquet stream.</summary>
+    /// bomb). The fail-closed messages carry no file-derived token — only the bounded declared scalars
+    /// (value/byte counts + the group index), which are attacker-declared int64 footer metadata, not a
+    /// byte/text (injection) channel (#653). Pure/arithmetic so the ceiling is unit-testable without a real
+    /// Parquet stream.</summary>
     /// <exception cref="DeltaProtocolException">A declared size is negative or the ratio ceiling is exceeded.</exception>
     internal static long ColumnFootprintBytes(
         Type clrType, long numValues, long compressedBytes, long uncompressedBytes, int group)

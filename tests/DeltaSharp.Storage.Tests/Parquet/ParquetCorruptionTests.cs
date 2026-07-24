@@ -632,6 +632,40 @@ public sealed class ParquetCorruptionTests
     }
 
     [Fact]
+    public async Task OutOfRangeDate_CorruptDataMessage_DoesNotEchoFileColumnName()
+    {
+        // #653 info-leak parity — a decode site the PR MISSED: ReadValueAsync<T>'s DATE/TIMESTAMP-range catch
+        // used to interpolate fileField.Name, the FILE's physical column name. Under column-mapping id mode
+        // that name is resolved by field_id from the untrusted footer verbatim (attacker-authored for a
+        // foreign/untrusted table), and it surfaces UNWRAPPED through the public read facade. It must surface a
+        // FIXED message naming NEITHER the column NOR the value (the cause is preserved as the inner exception),
+        // exactly like the sibling row-group decode fault above.
+        //
+        // Forge the fault: DeltaSharp's writer is bounded by DateTime and cannot emit an out-of-range date, so
+        // write a plain INT32 "birthdate" column holding int.MaxValue (2,147,483,647 days since epoch — far
+        // beyond DateTime.MaxValue), then annotate that column's footer schema element as a logical DATE.
+        // Reading it as a DateType column drives Parquet.Net's INT32-DATE → DateTime decode
+        // (epoch.AddDays(int.MaxValue)) → ArgumentOutOfRangeException → the reader's date/time-range catch.
+        var writeSchema = new StructType(new[] { new StructField("birthdate", DataTypes.IntegerType, nullable: true) });
+        MutableColumnVector days = ColumnVectors.Create(DataTypes.IntegerType, 1);
+        days.AppendValue(int.MaxValue);
+        var batch = new ManagedColumnBatch(writeSchema, new ColumnVector[] { days }, 1);
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(writeSchema, new[] { batch });
+        byte[] forged = await ParquetTestHelpers.ForgeColumnConvertedTypeToDateAsync(file, rowGroup: 0, columnIndex: 0);
+
+        var readSchema = new StructType(new[] { new StructField("birthdate", DataTypes.DateType, nullable: true) });
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(forged, readSchema));
+
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+        // Exact-equality proves the message carries no file-derived token (neither the column name nor a value).
+        Assert.Equal(
+            "A Parquet column holds a physical value outside the representable date/time range.", error.Message);
+        Assert.DoesNotContain("birthdate", error.Message, StringComparison.Ordinal);   // no file-derived column name
+        Assert.NotNull(error.InnerException);   // the raw decode cause is preserved, just not surfaced in text
+    }
+
+    [Fact]
     public async Task ForgedInvalidCompressionCodec_NotSupportedException_StaysCorruptData()
     {
         // PRECISION GUARD for the NotSupportedException family (#649). Forging an OUT-OF-RANGE compression
