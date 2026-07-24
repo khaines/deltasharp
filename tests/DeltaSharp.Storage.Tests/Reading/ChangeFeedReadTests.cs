@@ -6,6 +6,7 @@ using DeltaSharp.Storage;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
 using DeltaSharp.Storage.Delta.DeletionVectors;
+using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Storage.Reading;
 using DeltaSharp.Storage.Tests.Delta;
 using DeltaSharp.Storage.Tests.Delta.DeletionVectors;
@@ -958,6 +959,84 @@ public sealed class ChangeFeedReadTests : IDisposable
         {
             await enumerator.DisposeAsync();
         }
+    }
+
+    [Fact]
+    public async Task Explicit_CountInconsistentCdcFile_FailsClosedBeforeFirstYield_ForEarlyBreakConsumer()
+    {
+        // #644 red-team (High): the streaming refactor must NOT weaken the pre-#644 BUFFERED form's fail-closed
+        // guarantee. The buffered form read the WHOLE cdc file (the `_change_type` pass AND the full data pass)
+        // before returning, so the `_change_type`-vs-data COUNT-consistency check ran BEFORE any batch surfaced
+        // — even an early-break consumer of the public `ReadChangeBatchesAsync` (an IAsyncEnumerable) got the
+        // fail-closed error on a count-inconsistent cdc file. Streaming defers the post-loop too-few check to
+        // FULL enumeration, so WITHOUT the eager footer-count check an external early-break consumer would
+        // receive a batch and bypass the check (a fail-closed regression). A single well-formed Parquet file
+        // ALWAYS has matching footer + `_change_type` counts (both derive from the same per-row-group row
+        // counts), so we reproduce the red-team's TOCTOU: a decorating backend serves file A (3 `_change_type`
+        // values) for the EE-08 schema + `_change_type` opens, then file B (2 rows) for the eager footer probe —
+        // the cdc file "atomically replaced" between the passes. Because the CDF read path is wired to sealed
+        // concrete backends, this decorator (via ChangeFeedReader's internal DI ctor) is the deterministic way
+        // to drive the mismatch. The eager check (footer 2 != change-types 3) must throw on the FIRST
+        // MoveNextAsync, BEFORE any batch is yielded.
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0 create, v1 enable CDF
+        var backend = new LocalFileSystemBackend(_root);
+        await NewCdfDelete(backend, "toctou").DeleteAsync(WhereId(id => id == 1));   // v2 cdc delete (explicit path)
+        Assert.Single(CdcFilePaths());
+
+        // File A: 3 rows / 3 valid `_change_type` values — the `_change_type` pass reads N = 3.
+        byte[] fileA = await ParquetTestHelpers.WriteToBytesAsync(
+            CdcFlatBodySchema,
+            new[]
+            {
+                CdcFlatBodyBatch(
+                    (10, "a", ChangeDataWriter.DeleteChange),
+                    (11, "b", ChangeDataWriter.DeleteChange),
+                    (12, "c", ChangeDataWriter.DeleteChange)),
+            });
+        // File B: 2 rows — the eager FOOTER probe reads M = 2 (!= 3). Same leaf schema so EE-08 is agnostic to it.
+        byte[] fileB = await ParquetTestHelpers.WriteToBytesAsync(
+            CdcFlatBodySchema,
+            new[]
+            {
+                CdcFlatBodyBatch(
+                    (10, "a", ChangeDataWriter.DeleteChange),
+                    (11, "b", ChangeDataWriter.DeleteChange)),
+            });
+
+        // Serve A for the first 2 cdc opens (EE-08 schema validation, then the `_change_type` pass), B for the
+        // rest (the eager footer probe, and — if the check were missing — the data pass). Drive the SAME
+        // ChangeFeedReader for resolve + read via the internal DI ctor so the decorating backend serves the cdc
+        // file bytes; the log (DeltaLog) still reads the real backend, so resolve is unaffected.
+        var toctou = new CountMismatchCdcBackend(backend, fileA, fileB, serveAForFirstOpens: 2);
+        var reader = new ChangeFeedReader(toctou, backend.TableRootId, new DeltaLog(backend), new ParquetFileReader());
+
+        DeltaChangeFeedInfo info = await reader.ResolveAsync(
+            DeltaChangeFeedRange.FromVersion(2, 2), CancellationToken.None);
+        Assert.Empty(toctou.ServedCdcOpens);   // resolve reads ONLY the log — no cdc-file open yet
+
+        IAsyncEnumerator<ColumnBatch> enumerator = reader.ReadAsync(info, CancellationToken.None).GetAsyncEnumerator();
+        try
+        {
+            // Fail closed on the FIRST MoveNextAsync — BEFORE any batch is yielded. An early-break consumer (one
+            // that would `break` after the first batch) therefore can NEVER receive a batch on a count-
+            // inconsistent cdc file: it gets the classified fail-closed error instead of a (bypassing) batch.
+            DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+                async () => await enumerator.MoveNextAsync());
+            Assert.Contains("produced 2 data row(s) but has 3", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("inconsistent", ex.Message, StringComparison.Ordinal);
+            // The eager COUNT check throws a bare DeltaReadException (no wrapped I/O fault) — distinct from the
+            // torn/corrupt-body CorruptData case whose InnerException is a DeltaStorageException.
+            Assert.Null(ex.InnerException);
+        }
+        finally
+        {
+            await enumerator.DisposeAsync();
+        }
+
+        // The eager check fired at the FOOTER probe (open 3 = "B") BEFORE the data pass (which would be open 4):
+        // the cdc-file opens are EXACTLY A (EE-08), A (`_change_type`), B (footer). A missing eager check would
+        // have advanced to the data pass (a 4th "B" open) and yielded a batch to the early-break consumer.
+        Assert.Equal(new[] { "A", "A", "B" }, toctou.ServedCdcOpens.ToArray());
     }
 
     [Fact]
@@ -1959,5 +2038,69 @@ public sealed class ChangeFeedReadTests : IDisposable
 
         return new ManagedColumnBatch(
             CdcFlatBodySchema, new ColumnVector[] { id, name, changeType }, rows.Length);
+    }
+
+    // A storage backend that reproduces the red-team's TOCTOU count-mismatch (#644): for any `_change_data/`
+    // path it serves `_fileA`'s bytes (N `_change_type` values) for the FIRST `_serveAForFirstOpens` opens —
+    // the EE-08 schema validation (open 1) and the `_change_type` pass (open 2) — then `_fileB`'s bytes
+    // (M != N rows) for every later open — the eager footer probe (open 3) and, if the eager check were
+    // missing, the data pass (open 4). Every non-cdc path (the `_delta_log` that resolve/read walks) delegates
+    // to the real inner backend. A and B share the cdc leaf schema, so EE-08 passes on A while the eager
+    // footer read sees B's DIFFERENT row count — the cdc file "atomically replaced" between the passes. This is
+    // the deterministic seam for the count mismatch because the CDF read path is wired to sealed concrete
+    // backends and a single crafted file's footer + `_change_type` counts always agree.
+    private sealed class CountMismatchCdcBackend : IStorageBackend
+    {
+        private readonly IStorageBackend _inner;
+        private readonly byte[] _fileA;
+        private readonly byte[] _fileB;
+        private readonly int _serveAForFirstOpens;
+        private readonly List<string> _served = new();
+
+        public CountMismatchCdcBackend(IStorageBackend inner, byte[] fileA, byte[] fileB, int serveAForFirstOpens)
+        {
+            _inner = inner;
+            _fileA = fileA;
+            _fileB = fileB;
+            _serveAForFirstOpens = serveAForFirstOpens;
+        }
+
+        // The tag ("A"/"B") of each cdc-file open in order — asserted to be exactly [A, A, B], proving the eager
+        // check fired at the footer probe (open 3 = "B") BEFORE the data pass (which would be a 4th open).
+        public IReadOnlyList<string> ServedCdcOpens => _served;
+
+        public StorageBackendKind Kind => _inner.Kind;
+
+        public ValueTask<Stream> OpenReadAsync(string path, CancellationToken cancellationToken)
+        {
+            if (path.Contains(ChangeDataWriter.ChangeDataDirectory, StringComparison.Ordinal))
+            {
+                bool serveA = _served.Count < _serveAForFirstOpens;
+                _served.Add(serveA ? "A" : "B");
+                return new ValueTask<Stream>(new MemoryStream(serveA ? _fileA : _fileB, writable: false));
+            }
+
+            return _inner.OpenReadAsync(path, cancellationToken);
+        }
+
+        public ValueTask<Stream> ReadRangeAsync(
+            string path, long offset, long length, CancellationToken cancellationToken) =>
+            _inner.ReadRangeAsync(path, offset, length, cancellationToken);
+
+        public ValueTask<Stream> OpenWriteAsync(string path, CancellationToken cancellationToken) =>
+            _inner.OpenWriteAsync(path, cancellationToken);
+
+        public ValueTask<bool> PutIfAbsentAsync(
+            string path, ReadOnlyMemory<byte> content, CancellationToken cancellationToken) =>
+            _inner.PutIfAbsentAsync(path, content, cancellationToken);
+
+        public IAsyncEnumerable<StorageObjectInfo> ListAsync(string prefix, CancellationToken cancellationToken) =>
+            _inner.ListAsync(prefix, cancellationToken);
+
+        public ValueTask DeleteAsync(string path, CancellationToken cancellationToken) =>
+            _inner.DeleteAsync(path, cancellationToken);
+
+        public ValueTask<StorageObjectInfo?> HeadAsync(string path, CancellationToken cancellationToken) =>
+            _inner.HeadAsync(path, cancellationToken);
     }
 }

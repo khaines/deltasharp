@@ -69,13 +69,26 @@ internal sealed class ChangeFeedReader
     private static readonly byte[] UpdatePostimageChangeBytes =
         Encoding.UTF8.GetBytes(ChangeDataWriter.UpdatePostimageChange);
 
-    private readonly LocalFileSystemBackend _backend;
+    private readonly IStorageBackend _backend;
+    private readonly string _sourceId;
     private readonly DeltaLog _log;
     private readonly ParquetFileReader _reader;
 
     public ChangeFeedReader(LocalFileSystemBackend backend, DeltaLog log, ParquetFileReader reader)
+        : this(backend, backend.TableRootId, log, reader)
+    {
+    }
+
+    /// <summary>
+    /// DI/test seam: binds the reader to any <see cref="IStorageBackend"/> plus an explicit source identity
+    /// (the resolution-proof <c>SourceId</c>). The public ctor forwards <see cref="LocalFileSystemBackend"/>'s
+    /// <c>TableRootId</c>; only <see cref="IStorageBackend"/> members are used, so a decorating backend can
+    /// serve the cdc file's bytes — exercised by the count-mismatch/TOCTOU consistency test (#644 red-team).
+    /// </summary>
+    internal ChangeFeedReader(IStorageBackend backend, string sourceId, DeltaLog log, ParquetFileReader reader)
     {
         _backend = backend;
+        _sourceId = sourceId;
         _log = log;
         _reader = reader;
     }
@@ -205,13 +218,13 @@ internal sealed class ChangeFeedReader
 
         // Stamp the non-forgeable resolution proof: it is the evidence that this info passed the full
         // resolve-time validation above (bounds, availability, and the §2.7 CDF-enablement gate) and carries
-        // the pinned timeline. It is bound to THIS source (`_backend.TableRootId`) so it cannot replay on a
-        // different table. ReadAsync REQUIRES it, so ONLY a LoadChangeFeedAsync-produced info for THIS source
-        // can be read; a forged/`default`/cross-source info fails closed instead of surfacing an unvalidated
-        // range.
+        // the pinned timeline. It is bound to THIS source (`_sourceId`, the backend's TableRootId) so it
+        // cannot replay on a different table. ReadAsync REQUIRES it, so ONLY a LoadChangeFeedAsync-produced
+        // info for THIS source can be read; a forged/`default`/cross-source info fails closed instead of
+        // surfacing an unvalidated range.
         return new DeltaChangeFeedInfo(startVersion, endVersion, outputSchema)
         {
-            Resolution = new ChangeFeedResolution(_backend.TableRootId, pinnedMillis.ToImmutable()),
+            Resolution = new ChangeFeedResolution(_sourceId, pinnedMillis.ToImmutable()),
         };
     }
 
@@ -252,7 +265,7 @@ internal sealed class ChangeFeedReader
         // range. An info resolved on source A carries A's validation + A's pinned timestamps; replaying it on
         // a DIFFERENT source B would bypass B's own §2.7 enablement gate and stamp B's rows with A's
         // timestamps (a cross-table footgun). Reject when the bound source identity differs from this one.
-        if (!string.Equals(resolution.SourceId, _backend.TableRootId, StringComparison.Ordinal))
+        if (!string.Equals(resolution.SourceId, _sourceId, StringComparison.Ordinal))
         {
             throw new ArgumentException(
                 "DeltaChangeFeedInfo must be read by the same DeltaReadSource that resolved it (via "
@@ -678,20 +691,22 @@ internal sealed class ChangeFeedReader
     // each row group's batch is yielded as it decodes. Every yielded batch is one row group of one cdc file of
     // one version, so it carries exactly ONE `_commit_version` (INV C8).
     //
-    // This is a TWO-READ of the same file, NOT a single pass. `ReadChangeTypesAsync` first reads the
-    // `_change_type` column fully into a flat array (by NAME — never column-mapped), then the data columns are
+    // This is a MULTI-READ of the same file, NOT a single pass. `ReadChangeTypesAsync` first reads the
+    // `_change_type` column fully into a flat array (by NAME — never column-mapped); an EAGER footer-only
+    // row-count probe (GetRowCountAsync, no data pages) then fails the count-consistency check closed BEFORE
+    // the first yield (see the eager check below — council red-team, #644); finally the data columns are
     // STREAMED (mode-aware physical resolution) and each data batch is aligned to its slice of the change types
     // by cumulative row position. The single-pass ideal (#644) — projecting `_change_type` ALONGSIDE the data
     // columns in one ReadAsync — is NOT taken here: `ParquetFileReader.ReadAsync` cannot resolve a MIXED
     // projection, because under column-mapping id mode it resolves EVERY requested column by field-id and
-    // `_change_type` (engine-written, no field-id) would be treated absent (fail closed). Folding the two reads
+    // `_change_type` (engine-written, no field-id) would be treated absent (fail closed). Folding the reads
     // into one needs per-field name-fallback in the reader — a fail-closed-posture change to id-mode resolution
     // that would affect every id-mode caller, so it is deliberately deferred (tracked in #658) rather than done
     // as invasive reader surgery riding on this perf refactor. The `_change_type` array is bounded by the
-    // CHANGE count (not the table/range), so the up-front read stays cheap; this change removes only the
-    // per-file BUFFER. The two reads project the same file in the same row order, so the alignment is exact —
+    // CHANGE count (not the table/range), so the up-front reads stay cheap; this change removes only the
+    // per-file BUFFER. The reads project the same file in the same row order, so the alignment is exact —
     // the cumulative-offset checks below assert the totals agree (data-row count == `_change_type` count),
-    // fail-closed defence in depth against the two reads disagreeing.
+    // fail-closed defence in depth against the reads disagreeing.
     //
     // Errors are classified before/around the yielding loop (NEVER across a `yield return`, mirroring
     // ReadImplicitFileAsync): the read/classify step (MoveNextAsync + Current) sits in a try that maps a
@@ -704,6 +719,46 @@ internal sealed class ChangeFeedReader
         // Pass 1 (bounded by the change count): the `_change_type` column, validated non-null + within the §5.2
         // closed domain. Read fully up front so each streamed data batch aligns to its slice by row position.
         string[] changeTypes = await ReadChangeTypesAsync(cdc.Path, cancellationToken).ConfigureAwait(false);
+
+        // EAGER fail-closed consistency check (council red-team, #644) — restores the pre-#644 BUFFERED form's
+        // "fail closed BEFORE the first batch" guarantee. The buffered form read the WHOLE file (both passes)
+        // before returning, so the `_change_type`-vs-data too-few check ran before ANY batch surfaced — even an
+        // early-break consumer of the public `ReadChangeBatchesAsync` (an IAsyncEnumerable) got the fail-closed
+        // error on a count-inconsistent cdc file. Streaming defers the post-loop too-few check to FULL
+        // enumeration, so without THIS check an external early-break consumer would receive a batch and bypass
+        // it (the red-team proved this with a TOCTOU: the cdc file atomically replaced between the two passes,
+        // yielding a different row count). So here — after the `_change_type` count is known and BEFORE the
+        // data loop yields anything — probe the cdc file's FOOTER-only row count and fail closed on a mismatch.
+        // GetRowCountAsync decodes NO data pages (footer only), so this stays cheap. NOTE: the deeper
+        // same-row-count TOCTOU (a replacement with an IDENTICAL row count) is pre-existing in BOTH forms and is
+        // structurally eliminated only by the single-pass (#658).
+        long footerRowCount;
+        try
+        {
+            Stream metaStream = await _backend.OpenReadAsync(cdc.Path, cancellationToken).ConfigureAwait(false);
+            await using (metaStream.ConfigureAwait(false))
+            {
+                footerRowCount = await _reader.GetRowCountAsync(metaStream, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch (DeltaStorageException ex)
+        {
+            // Footer-only: this probe CANNOT surface a schema-evolution (ColumnNotPresentInFile) kind, so — like
+            // the implicit path's GetRowCountAsync site — every storage fault classifies straight through
+            // ClassifyFileError (no narrow-schema-evolution branch). It runs BEFORE any yield, so a plain
+            // try/catch is safe (no classify-across-a-yield concern).
+            throw ClassifyFileError(cdc.Path, ex);
+        }
+
+        if (footerRowCount != changeTypes.Length)
+        {
+            // Fail closed before the FIRST yield (all consumers, early-break or full) — the buffered form's
+            // guarantee. Same message shape as the post-loop too-few check.
+            throw new DeltaReadException(
+                $"Change-data file '{cdc.Path}' produced {footerRowCount} data row(s) but has "
+                + $"{changeTypes.Length} '{ChangeDataWriter.ChangeTypeColumn}' value(s); the change-data file "
+                + "is inconsistent.");
+        }
 
         Stream stream;
         try
@@ -751,7 +806,9 @@ internal sealed class ChangeFeedReader
                     int rows = physical.RowCount;
                     if (checked(offset + rows) > changeTypes.Length)
                     {
-                        // More data rows than `_change_type` values ⇒ the two reads of the same file disagree.
+                        // More data rows than `_change_type` values ⇒ the reads of the same file disagree.
+                        // Defence-in-depth alongside the eager footer check: it also guards a mid-stream decode
+                        // fault or a same-row-count TOCTOU that inflates a later row group past the total.
                         throw new DeltaReadException(
                             $"Change-data file '{cdc.Path}' produced more data rows than "
                             + $"'{ChangeDataWriter.ChangeTypeColumn}' values; the change-data file is inconsistent.");
@@ -773,7 +830,9 @@ internal sealed class ChangeFeedReader
         if (offset != changeTypes.Length)
         {
             // Fewer data rows than `_change_type` values ⇒ same fail-closed consistency guarantee, verified once
-            // the whole file has streamed (the streaming counterpart of the original post-loop total check).
+            // the whole file has streamed. Retained as defence-in-depth behind the eager footer check (which
+            // now provides the fail-closed-before-first-batch guarantee): this still catches a mid-stream decode
+            // fault that truncates the data pass below the footer's declared total.
             throw new DeltaReadException(
                 $"Change-data file '{cdc.Path}' produced {offset} data row(s) but has {changeTypes.Length} "
                 + $"'{ChangeDataWriter.ChangeTypeColumn}' value(s); the change-data file is inconsistent.");
