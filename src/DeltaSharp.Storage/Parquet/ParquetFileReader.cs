@@ -82,7 +82,19 @@ internal sealed class ParquetFileReader
 
     /// <summary>Reads <paramref name="input"/>, projecting to <paramref name="requested"/> (a subset of
     /// the file schema by field name) and optionally skipping row groups via
-    /// <paramref name="keepRowGroup"/>.</summary>
+    /// <paramref name="keepRowGroup"/>.
+    ///
+    /// <para><b>Batch-lifetime contract (load-bearing — do not weaken).</b> Every iteration of the returned
+    /// sequence yields a <b>freshly allocated</b> <see cref="ColumnBatch"/> for one row group, backed by
+    /// freshly-allocated column vectors; the reader NEVER recycles, pools, or overwrites a previously-yielded
+    /// batch's backing buffers across a subsequent <c>MoveNext</c> (nor after the enumerator is disposed). A
+    /// caller MAY therefore <b>retain</b> a yielded batch — or a zero-copy selection view over it — past the
+    /// next <c>MoveNext</c>, and it stays valid and <b>unaliased</b> with respect to every other yielded
+    /// batch. <see cref="DeltaSharp.Storage.Delta.DeltaDelete"/>'s Change Data Feed capture (§2.5/§4.3)
+    /// depends on this: it accumulates one selection view per row group across the whole file and writes them
+    /// all AFTER the scan completes, which a recycled/overwritten buffer would silently corrupt. A future
+    /// buffer-pool optimization MUST preserve this contract (or hand retaining callers an explicit copy); a
+    /// reader regression test pins it.</para></summary>
     /// <param name="input">The Parquet byte stream.</param>
     /// <param name="requested">The projection: the columns to read, by field name, in output order.</param>
     /// <param name="keepRowGroup">An optional row-group pruning hint (see <see cref="RowGroupPredicate"/>).</param>
@@ -133,6 +145,8 @@ internal sealed class ParquetFileReader
     /// <c>SchemaElement.field_id</c> (Delta column-mapping <b>id</b> mode, #523), instead of by physical name.
     /// The requested columns must carry the id metadata; the file's field_ids come from the Thrift footer via
     /// <see cref="ParquetReader.Metadata"/> (the high-level <c>DataField.FieldId</c> is not populated on decode).
+    /// The batch-lifetime (no-recycling) contract documented on the 6-argument overload applies unchanged —
+    /// this is the overload <see cref="DeltaSharp.Storage.Delta.DeltaDelete"/>'s cdc capture enumerates.
     /// </summary>
     public async IAsyncEnumerable<ColumnBatch> ReadAsync(
         Stream input,

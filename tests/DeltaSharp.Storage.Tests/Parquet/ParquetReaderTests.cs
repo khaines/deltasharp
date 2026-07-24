@@ -438,6 +438,79 @@ public sealed class ParquetReaderTests
         Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
     }
 
+    [Fact]
+    public async Task ReadAsync_YieldsFreshUnaliasedBatchPerRowGroup_NoBufferRecycling()
+    {
+        // Pins the load-bearing no-recycling batch-lifetime contract DeltaDelete's CDF capture depends on
+        // (#642 F2): the reader yields a FRESH ColumnBatch (fresh column vectors) per row group and never
+        // recycles/overwrites a previously-yielded batch's buffers across MoveNext — so a caller may RETAIN
+        // every yielded batch across the whole enumeration (the cdc capture accumulates one selection view
+        // per row group and writes them all AFTER the scan). A future buffer-pool that violated this would
+        // silently corrupt cross-row-group cdc; this test would then fail on identity or values.
+        ColumnBatch source = TestData.RandomBatch(FullSchema, rowCount: 7, _random);
+        using var stream = new MemoryStream();
+
+        // rowGroupRowLimit 2 over 7 rows => 4 row groups (2,2,2,1), forcing the cross-group case.
+        await new ParquetFileWriter(rowGroupRowLimit: 2)
+            .WriteAsync(stream, FullSchema, new[] { source }, CancellationToken.None);
+        stream.Position = 0;
+
+        var retained = new List<ColumnBatch>();
+        await foreach (ColumnBatch batch in new ParquetFileReader().ReadAsync(
+            stream, FullSchema, keepRowGroup: null, nullFillMissingColumns: false, allowTypeWideningPromotion: false, CancellationToken.None))
+        {
+            retained.Add(batch);   // retain past the next MoveNext — the whole point of the contract
+        }
+
+        Assert.True(retained.Count >= 3, $"expected >= 3 row groups, got {retained.Count}.");
+
+        // (1) Object IDENTITY: no two yielded batches — and no two column vectors at the same ordinal — are
+        // the SAME object, so retaining one can never be clobbered by decoding a later one.
+        for (int a = 0; a < retained.Count; a++)
+        {
+            for (int b = a + 1; b < retained.Count; b++)
+            {
+                Assert.NotSame(retained[a], retained[b]);
+                for (int c = 0; c < FullSchema.Count; c++)
+                {
+                    Assert.NotSame(retained[a].Column(c), retained[b].Column(c));
+                }
+            }
+        }
+
+        // (2) VALUES intact AFTER full enumeration: concatenating the retained batches in yield order
+        // reproduces the source rows EXACTLY — proving no earlier batch's buffer was overwritten by a later
+        // MoveNext.
+        ColumnVector srcId = source.SelectedColumn(0);
+        ColumnVector srcName = source.SelectedColumn(1);
+        ColumnVector srcScore = source.SelectedColumn(2);
+        int row = 0;
+        foreach (ColumnBatch batch in retained)
+        {
+            ColumnVector id = batch.Column(0);
+            ColumnVector name = batch.Column(1);
+            ColumnVector score = batch.Column(2);
+            for (int r = 0; r < batch.RowCount; r++, row++)
+            {
+                Assert.Equal(srcId.GetValue<long>(row), id.GetValue<long>(r));
+
+                Assert.Equal(srcName.IsNull(row), name.IsNull(r));
+                if (!srcName.IsNull(row))
+                {
+                    Assert.True(srcName.GetBytes(row).SequenceEqual(name.GetBytes(r)));
+                }
+
+                Assert.Equal(srcScore.IsNull(row), score.IsNull(r));
+                if (!srcScore.IsNull(row))
+                {
+                    Assert.Equal(srcScore.GetValue<double>(row), score.GetValue<double>(r));
+                }
+            }
+        }
+
+        Assert.Equal(source.LogicalRowCount, row);
+    }
+
     private static ColumnBatch BuildLongBatch(StructType schema, long[] values)
     {
         MutableColumnVector vector = ColumnVectors.Create(DataTypes.LongType, values.Length);
