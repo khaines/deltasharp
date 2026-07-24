@@ -213,7 +213,7 @@ internal static class DeltaCheckpointReader
             long compressed = meta.TotalCompressedSize;
             long uncompressed = meta.TotalUncompressedSize;
             totalBytes = SaturatingAdd(
-                totalBytes, ColumnFootprintBytes(field.ClrType, numValues, compressed, uncompressed, field.Path.ToString(), group));
+                totalBytes, ColumnFootprintBytes(field.ClrType, numValues, compressed, uncompressed, group));
         }
 
         if (totalBytes > maxDecodedBytes)
@@ -229,16 +229,19 @@ internal static class DeltaCheckpointReader
     /// <paramref name="numValues"/> packed slots × (value width + the two 4-byte Dremel level ints) plus the
     /// declared decompressed payload, overflow-saturated. Fails closed on a negative declared size or a
     /// decompression ratio beyond <see cref="ParquetFileReader.MaxDecompressionRatio"/> (a decompression
-    /// bomb). Pure/arithmetic so the ceiling is unit-testable without a real Parquet stream.</summary>
+    /// bomb). The fail-closed messages carry no file-derived token — only the bounded declared scalars
+    /// (value/byte counts + the group index), which are attacker-declared int64 footer metadata, not a
+    /// byte/text (injection) channel (#653). Pure/arithmetic so the ceiling is unit-testable without a real
+    /// Parquet stream.</summary>
     /// <exception cref="DeltaProtocolException">A declared size is negative or the ratio ceiling is exceeded.</exception>
     internal static long ColumnFootprintBytes(
-        Type clrType, long numValues, long compressedBytes, long uncompressedBytes, string path, int group)
+        Type clrType, long numValues, long compressedBytes, long uncompressedBytes, int group)
     {
         if (numValues < 0 || compressedBytes < 0 || uncompressedBytes < 0)
         {
             throw DeltaProtocolException.Malformed(string.Create(
                 CultureInfo.InvariantCulture,
-                $"Checkpoint column '{path}' (group {group}) declares negative metadata "
+                $"A checkpoint column (group {group}) declares negative metadata "
                 + $"(values {numValues}, compressed {compressedBytes}, decompressed {uncompressedBytes})."));
         }
 
@@ -249,7 +252,7 @@ internal static class DeltaCheckpointReader
         {
             throw DeltaProtocolException.Malformed(string.Create(
                 CultureInfo.InvariantCulture,
-                $"Checkpoint column '{path}' (group {group}) declares {uncompressedBytes} decompressed bytes "
+                $"A checkpoint column (group {group}) declares {uncompressedBytes} decompressed bytes "
                 + $"for {compressedBytes} compressed, exceeding the "
                 + $"{ParquetFileReader.MaxDecompressionRatio}:1 ratio ceiling."));
         }

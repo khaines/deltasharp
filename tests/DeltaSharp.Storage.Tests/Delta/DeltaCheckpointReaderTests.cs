@@ -304,7 +304,7 @@ public sealed class DeltaCheckpointReaderTests
         // A tiny compressed chunk that declares an enormous value count would eagerly allocate huge
         // value/level arrays: its footprint must exceed the per-row-group decode ceiling (fail closed).
         long footprint = DeltaCheckpointReader.ColumnFootprintBytes(
-            typeof(string), numValues: 100_000_000, compressedBytes: 4_096, uncompressedBytes: 4_096, "add/path", 0);
+            typeof(string), numValues: 100_000_000, compressedBytes: 4_096, uncompressedBytes: 4_096, 0);
         Assert.True(footprint > DeltaCheckpointReader.MaxCheckpointRowGroupDecodedBytes,
             $"footprint {footprint} should exceed the {DeltaCheckpointReader.MaxCheckpointRowGroupDecodedBytes}-byte ceiling");
     }
@@ -314,7 +314,7 @@ public sealed class DeltaCheckpointReaderTests
     {
         DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() =>
             DeltaCheckpointReader.ColumnFootprintBytes(
-                typeof(long), numValues: 8, compressedBytes: 1_000, uncompressedBytes: 1_000 * 5_000, "add/size", 0));
+                typeof(long), numValues: 8, compressedBytes: 1_000, uncompressedBytes: 1_000 * 5_000, 0));
         Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
         Assert.Contains("ratio", ex.Message, StringComparison.Ordinal);
     }
@@ -328,7 +328,7 @@ public sealed class DeltaCheckpointReaderTests
         // a spurious verdict — pre-fix, `Math.Max(compressedBytes, 1) * MaxDecompressionRatio` overflowed
         // (here to a negative product), flipping the comparison and wrongly rejecting this legitimate column.
         long footprint = DeltaCheckpointReader.ColumnFootprintBytes(
-            typeof(long), numValues: 1, compressedBytes: 9_223_372_036_854_776L, uncompressedBytes: 1_000, "add/size", 0);
+            typeof(long), numValues: 1, compressedBytes: 9_223_372_036_854_776L, uncompressedBytes: 1_000, 0);
         Assert.True(footprint > 0 && footprint < DeltaCheckpointReader.MaxCheckpointRowGroupDecodedBytes);
     }
 
@@ -336,7 +336,7 @@ public sealed class DeltaCheckpointReaderTests
     public void DecodeCeiling_RejectsNegativeMetadata()
     {
         Assert.Throws<DeltaProtocolException>(() =>
-            DeltaCheckpointReader.ColumnFootprintBytes(typeof(long), -1, 10, 10, "add/size", 0));
+            DeltaCheckpointReader.ColumnFootprintBytes(typeof(long), -1, 10, 10, 0));
     }
 
     [Fact]
@@ -344,8 +344,42 @@ public sealed class DeltaCheckpointReaderTests
     {
         // A realistic column (100k rows, ~2 MB) is well under the ceiling and does not throw.
         long footprint = DeltaCheckpointReader.ColumnFootprintBytes(
-            typeof(long), numValues: 100_000, compressedBytes: 500_000, uncompressedBytes: 2_000_000, "add/size", 0);
+            typeof(long), numValues: 100_000, compressedBytes: 500_000, uncompressedBytes: 2_000_000, 0);
         Assert.True(footprint > 0 && footprint < DeltaCheckpointReader.MaxCheckpointRowGroupDecodedBytes);
+    }
+
+    [Fact]
+    public void DecodeCeiling_NegativeMetadata_MessageDoesNotEchoColumnPath()
+    {
+        // #653 info-leak parity: the malformed-checkpoint-column message must NOT interpolate the (schema-
+        // derived, attacker-influenceable) column path. Exact-equality proves no '{path}' interpolation; the
+        // numeric structural context (group + declared sizes) is retained for diagnosability — these are
+        // bounded declared scalars (attacker-declared int64 footer metadata, not a text/injection channel).
+        // (The path arg was removed from ColumnFootprintBytes so the surfaced message structurally cannot
+        // carry it.)
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() =>
+            DeltaCheckpointReader.ColumnFootprintBytes(typeof(long), numValues: -1, compressedBytes: 10, uncompressedBytes: 10, group: 7));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.Equal(
+            "A checkpoint column (group 7) declares negative metadata (values -1, compressed 10, decompressed 10).",
+            ex.Message);
+        Assert.DoesNotContain("'", ex.Message, StringComparison.Ordinal);   // no quoted column path
+    }
+
+    [Fact]
+    public void DecodeCeiling_DecompressionBomb_MessageDoesNotEchoColumnPath()
+    {
+        // #653: the decompression-bomb rejection likewise carries only bounded declared scalars (the numeric
+        // ratio context — attacker-declared int64 footer metadata, not a text/injection channel), never the
+        // column path. The declared-bytes / ratio numbers are the diagnostic point of the message.
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() =>
+            DeltaCheckpointReader.ColumnFootprintBytes(typeof(long), numValues: 8, compressedBytes: 1_000, uncompressedBytes: 1_000 * 5_000, group: 4));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.DoesNotContain("'", ex.Message, StringComparison.Ordinal);   // no quoted column path
+        Assert.Contains("group 4", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("ratio ceiling", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -361,6 +395,35 @@ public sealed class DeltaCheckpointReaderTests
             () => DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default, maxDecodedBytes: 10));
         Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
         Assert.Contains("decode ceiling", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task MalformedReconstruction_MessageDoesNotEchoColumnPath()
+    {
+        // #653 defense-in-depth: the checkpoint column-reconstruction fail-closed messages (slot-count /
+        // repetition-level / physical-type faults in CheckpointColumns) must NOT interpolate the Parquet leaf
+        // path. Those paths are a bounded Delta-protocol vocabulary — not a current attacker-byte leak — but
+        // they are scrubbed uniformly with the ParquetFileReader decode sites for a consistent
+        // no-file-derived-token posture (forward-safe if per-column-stats resolution ever descends these paths
+        // into user column names). Trigger one such site: forge the row group to declare one MORE row than it
+        // actually holds, so a scalar column's decoded slot count (or a map/list reconstruction's row count) no
+        // longer matches rowCount → the reconstruction fails closed. Assert the surfaced message carries no
+        // quoted path (no ' character).
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(1, 2).Metadata("t", EmptySchema).Add("f.parquet", size: 1)
+            .ToParquetAsync();
+        long actualRows = await ParquetTestHelpers.RowGroupNumRowsAsync(parquet, rowGroup: 0);
+        byte[] forged = await ParquetTestHelpers.ForgeRowGroupNumRowsAsync(
+            parquet, rowGroup: 0, forgedNumRows: actualRows + 1);
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(forged), default));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.DoesNotContain("'", ex.Message, StringComparison.Ordinal);   // no quoted (file-derived) leaf path
+        // Pins the scrubbed CheckpointColumns SlotMismatch site (not the generic outer catch): the message
+        // names the column CLASS and the structural slot/row counts, never the leaf path.
+        Assert.Contains("A checkpoint scalar column produced", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
