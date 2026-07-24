@@ -304,7 +304,7 @@ public sealed class DeltaCheckpointReaderTests
         // A tiny compressed chunk that declares an enormous value count would eagerly allocate huge
         // value/level arrays: its footprint must exceed the per-row-group decode ceiling (fail closed).
         long footprint = DeltaCheckpointReader.ColumnFootprintBytes(
-            typeof(string), numValues: 100_000_000, compressedBytes: 4_096, uncompressedBytes: 4_096, "add/path", 0);
+            typeof(string), numValues: 100_000_000, compressedBytes: 4_096, uncompressedBytes: 4_096, 0);
         Assert.True(footprint > DeltaCheckpointReader.MaxCheckpointRowGroupDecodedBytes,
             $"footprint {footprint} should exceed the {DeltaCheckpointReader.MaxCheckpointRowGroupDecodedBytes}-byte ceiling");
     }
@@ -314,7 +314,7 @@ public sealed class DeltaCheckpointReaderTests
     {
         DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() =>
             DeltaCheckpointReader.ColumnFootprintBytes(
-                typeof(long), numValues: 8, compressedBytes: 1_000, uncompressedBytes: 1_000 * 5_000, "add/size", 0));
+                typeof(long), numValues: 8, compressedBytes: 1_000, uncompressedBytes: 1_000 * 5_000, 0));
         Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
         Assert.Contains("ratio", ex.Message, StringComparison.Ordinal);
     }
@@ -328,7 +328,7 @@ public sealed class DeltaCheckpointReaderTests
         // a spurious verdict — pre-fix, `Math.Max(compressedBytes, 1) * MaxDecompressionRatio` overflowed
         // (here to a negative product), flipping the comparison and wrongly rejecting this legitimate column.
         long footprint = DeltaCheckpointReader.ColumnFootprintBytes(
-            typeof(long), numValues: 1, compressedBytes: 9_223_372_036_854_776L, uncompressedBytes: 1_000, "add/size", 0);
+            typeof(long), numValues: 1, compressedBytes: 9_223_372_036_854_776L, uncompressedBytes: 1_000, 0);
         Assert.True(footprint > 0 && footprint < DeltaCheckpointReader.MaxCheckpointRowGroupDecodedBytes);
     }
 
@@ -336,7 +336,7 @@ public sealed class DeltaCheckpointReaderTests
     public void DecodeCeiling_RejectsNegativeMetadata()
     {
         Assert.Throws<DeltaProtocolException>(() =>
-            DeltaCheckpointReader.ColumnFootprintBytes(typeof(long), -1, 10, 10, "add/size", 0));
+            DeltaCheckpointReader.ColumnFootprintBytes(typeof(long), -1, 10, 10, 0));
     }
 
     [Fact]
@@ -344,8 +344,40 @@ public sealed class DeltaCheckpointReaderTests
     {
         // A realistic column (100k rows, ~2 MB) is well under the ceiling and does not throw.
         long footprint = DeltaCheckpointReader.ColumnFootprintBytes(
-            typeof(long), numValues: 100_000, compressedBytes: 500_000, uncompressedBytes: 2_000_000, "add/size", 0);
+            typeof(long), numValues: 100_000, compressedBytes: 500_000, uncompressedBytes: 2_000_000, 0);
         Assert.True(footprint > 0 && footprint < DeltaCheckpointReader.MaxCheckpointRowGroupDecodedBytes);
+    }
+
+    [Fact]
+    public void DecodeCeiling_NegativeMetadata_MessageDoesNotEchoColumnPath()
+    {
+        // #653 info-leak parity: the malformed-checkpoint-column message must NOT interpolate the (schema-
+        // derived, attacker-influenceable) column path. Exact-equality proves no '{path}' interpolation; the
+        // numeric structural context (group + declared sizes) is engine/bounded, not attacker text, and is
+        // retained for diagnosability. (The path arg was removed from ColumnFootprintBytes so the surfaced
+        // message structurally cannot carry it.)
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() =>
+            DeltaCheckpointReader.ColumnFootprintBytes(typeof(long), numValues: -1, compressedBytes: 10, uncompressedBytes: 10, group: 7));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.Equal(
+            "A checkpoint column (group 7) declares negative metadata (values -1, compressed 10, decompressed 10).",
+            ex.Message);
+        Assert.DoesNotContain("'", ex.Message, StringComparison.Ordinal);   // no quoted column path
+    }
+
+    [Fact]
+    public void DecodeCeiling_DecompressionBomb_MessageDoesNotEchoColumnPath()
+    {
+        // #653: the decompression-bomb rejection likewise carries only the non-attacker numeric ratio context,
+        // never the column path. The declared-bytes / ratio numbers are the diagnostic point of the message.
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() =>
+            DeltaCheckpointReader.ColumnFootprintBytes(typeof(long), numValues: 8, compressedBytes: 1_000, uncompressedBytes: 1_000 * 5_000, group: 4));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.DoesNotContain("'", ex.Message, StringComparison.Ordinal);   // no quoted column path
+        Assert.Contains("group 4", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("ratio ceiling", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]

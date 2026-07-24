@@ -1069,7 +1069,7 @@ internal sealed class ParquetFileReader
         catch (Exception ex) when (IsParquetDefect(ex))
         {
             throw DeltaStorageException.CorruptData(
-                $"Failed to decode Parquet row group {group}: {ex.Message}", ex);
+                $"Failed to decode Parquet row group {group}.", ex);
         }
         catch (Exception ex) when (IsUndecodableParquetInput(ex))
         {

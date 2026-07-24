@@ -610,6 +610,28 @@ public sealed class ParquetCorruptionTests
     }
 
     [Fact]
+    public async Task BitFlippedRowGroupPage_CorruptDataMessage_DoesNotEchoUnderlyingBytes()
+    {
+        // #653 info-leak parity: the ReadRowGroupAsync IsParquetDefect catch used to interpolate the raw
+        // decode exception's Message ("… row group {group}: {ex.Message}") into the surfaced CorruptData
+        // string — a crafted page can carry bytes into ex.Message. It must surface a FIXED message (the cause
+        // is preserved as the inner exception), mirroring the #651 checkpoint-reader fix. Poisoning the whole
+        // column chunk corrupts the page-header Thrift → an IsParquetDefect fault; exact-equality proves no
+        // ex.Message interpolation.
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3, 4, 5 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] poisoned = await ParquetTestHelpers.PoisonColumnChunkAsync(file, rowGroup: 0, columnIndex: 0);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(poisoned, schema));
+
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+        Assert.Equal("Failed to decode Parquet row group 0.", error.Message);
+        Assert.NotNull(error.InnerException);   // the raw decode cause is preserved, just not surfaced in text
+    }
+
+    [Fact]
     public async Task ForgedInvalidCompressionCodec_NotSupportedException_StaysCorruptData()
     {
         // PRECISION GUARD for the NotSupportedException family (#649). Forging an OUT-OF-RANGE compression
