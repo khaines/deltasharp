@@ -226,6 +226,23 @@ public sealed class DeltaCheckpointReaderTests
     }
 
     [Fact]
+    public async Task Corrupt_Parquet_FailsClosed_WithFixedMessage_NoEchoOfUnderlyingBytes()
+    {
+        // #651: the checkpoint reader's fail-closed message must be a FIXED string that does NOT interpolate
+        // the underlying ex.Message — a crafted checkpoint footer's structural bytes (e.g. a field name) could
+        // otherwise echo into the surfaced error text (info-leak parity with the ParquetFileReader boundaries).
+        // Exact-equality proves no interpolation; the cause is still preserved as the inner exception for logs.
+        byte[] garbage = "this is not a parquet file, just bytes"u8.ToArray();
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(garbage), default));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.Equal("The Delta checkpoint Parquet stream is malformed or truncated.", ex.Message);
+        Assert.NotNull(ex.InnerException);
+    }
+
+    [Fact]
     public async Task PartialMetadataRow_MissingId_FailsClosed()
     {
         // A metaData present (schemaString set) but missing its required primary key `id` is a corrupt

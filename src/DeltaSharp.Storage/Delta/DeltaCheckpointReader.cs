@@ -97,8 +97,12 @@ internal static class DeltaCheckpointReader
                 {
                     // Any lower-level decode failure (a page-level defect a byte-flip introduced past the
                     // footer) is a corrupt checkpoint: fail closed so the caller falls back to JSON replay.
+                    // Fixed message (no ex.Message interpolation): an attacker-controlled checkpoint footer
+                    // field name must never echo into the surfaced error text (info-leak parity with the
+                    // ParquetFileReader fail-closed boundaries, #651). The cause is preserved as the inner
+                    // exception for logs/diagnostics.
                     throw DeltaProtocolException.Malformed(
-                        $"The Delta checkpoint Parquet is malformed: {ex.Message}", ex);
+                        "The Delta checkpoint Parquet is malformed.", ex);
                 }
             }
         }
@@ -134,8 +138,10 @@ internal static class DeltaCheckpointReader
         }
         catch (Exception ex) when (ex is not (OperationCanceledException or DeltaProtocolException))
         {
+            // Fixed message (no ex.Message interpolation) so a crafted footer's bytes cannot echo into the
+            // error text (info-leak parity with ParquetFileReader, #651); ex kept as the inner exception.
             throw DeltaProtocolException.Malformed(
-                $"The Delta checkpoint Parquet stream is malformed or truncated: {ex.Message}", ex);
+                "The Delta checkpoint Parquet stream is malformed or truncated.", ex);
         }
     }
 
