@@ -27,6 +27,13 @@ internal enum OrphanClassification
     /// <summary>Modified within the retention window (<c>mtime &gt;= cutoff</c>) — it may belong to an
     /// in-flight commit, so it is protected against listing lag / a torn view.</summary>
     RecentlyStaged,
+
+    /// <summary>Referenced by a <c>cdc</c> action (an <see cref="AddCdcFileAction"/>) in a retained, in-window
+    /// commit JSON — a Change-Data-Feed <c>_change_data/</c> file. It is never an active file (INV C1) yet
+    /// must not be reclaimed while a commit within <c>delta.logRetentionDuration</c> still references it
+    /// (#489). Referenced only via a non-<c>add.path</c> field, so it is protected by an explicit set that
+    /// VACUUM collects from the retained commit range, not from the snapshot's active/checkpoint state.</summary>
+    ReferencedChangeData,
 }
 
 /// <summary>A single candidate's classification: the object <see cref="Path"/> (the raw, unencoded disk key
@@ -59,12 +66,17 @@ internal readonly record struct OrphanDecision(string Path, OrphanClassification
 /// tables; it can only ever <i>over</i>-protect (a rare filename containing a literal <c>%</c> sequence that
 /// happens to decode to another candidate's name), never over-delete.</para>
 ///
-/// <para><b>Referenced-path assumption (tracked, not yet handled).</b> The protected sets are built from
-/// <c>add.path</c> and <c>remove.path</c> only. Deletion-vector sidecars (<c>.bin</c>, referenced by
-/// <c>add.deletionVector</c>) and Change-Data-Feed files (under <c>_change_data/</c>) are referenced by
-/// <b>non-<c>add.path</c></b> fields; once those features ship their referenced paths MUST be added to the
-/// protected union here or VACUUM would wrongly reclaim a still-referenced file. A tracking issue is filed;
-/// do not attempt DV/CDF handling before it lands.</para>
+/// <para><b>Referenced-path assumption (non-<c>add.path</c> references).</b> The active/tombstone protected
+/// sets are built from <c>add.path</c> and <c>remove.path</c>. Two classes of file are referenced by
+/// <b>other</b> fields and so must be protected explicitly or VACUUM would wrongly reclaim a still-referenced
+/// file: (1) deletion-vector sidecars (<c>.bin</c>, referenced by <c>add.deletionVector</c>) — protected here
+/// from the snapshot's active/tombstone DVs; and (2) Change-Data-Feed files (under <c>_change_data/</c>,
+/// referenced by a <c>cdc</c> action) — because a <c>cdc</c> action is ignored by snapshot replay (INV C1)
+/// and not retained in checkpoints, the snapshot cannot know their paths, so VACUUM enumerates them from the
+/// retained, in-window commit JSONs (bounded by <c>delta.logRetentionDuration</c>) and passes them in as
+/// an explicit protected set (#489). A <c>_change_data/</c> file referenced by no retained
+/// <c>cdc</c> action stays reclaimable; one referenced only by a commit aged past log retention is correctly
+/// unprotected (window-bounded).</para>
 /// </summary>
 internal static class OrphanCleanup
 {
@@ -77,10 +89,13 @@ internal static class OrphanCleanup
     /// </summary>
     /// <exception cref="ArgumentNullException"><paramref name="snapshot"/> or <paramref name="candidates"/> is null.</exception>
     public static IReadOnlyList<string> SelectDeletable(
-        Snapshot snapshot, IEnumerable<OrphanCandidate> candidates, long retentionCutoffMillis)
+        Snapshot snapshot,
+        IEnumerable<OrphanCandidate> candidates,
+        long retentionCutoffMillis,
+        IReadOnlyCollection<string>? protectedReferencedPaths = null)
     {
         var deletable = new List<string>();
-        foreach (OrphanDecision decision in Classify(snapshot, candidates, retentionCutoffMillis))
+        foreach (OrphanDecision decision in Classify(snapshot, candidates, retentionCutoffMillis, protectedReferencedPaths))
         {
             if (decision.Classification == OrphanClassification.Deletable)
             {
@@ -99,7 +114,10 @@ internal static class OrphanCleanup
     /// </summary>
     /// <exception cref="ArgumentNullException"><paramref name="snapshot"/> or <paramref name="candidates"/> is null.</exception>
     public static IReadOnlyList<OrphanDecision> Classify(
-        Snapshot snapshot, IEnumerable<OrphanCandidate> candidates, long retentionCutoffMillis)
+        Snapshot snapshot,
+        IEnumerable<OrphanCandidate> candidates,
+        long retentionCutoffMillis,
+        IReadOnlyCollection<string>? protectedReferencedPaths = null)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
         ArgumentNullException.ThrowIfNull(candidates);
@@ -125,11 +143,20 @@ internal static class OrphanCleanup
             protectedRemoves.Select(remove => remove.Path)
                 .Concat(DeletionVectorSidecarPaths(protectedRemoves.Select(remove => remove.DeletionVector))));
 
+        // #489: cdc `_change_data/` files are referenced by a `cdc` action, NOT add.path/remove.path, and a
+        // cdc action is ignored by snapshot replay (INV C1) and not retained in checkpoints — so the snapshot
+        // above cannot know them. VACUUM enumerates them from the retained, in-window commit JSONs (bounded
+        // by delta.logRetentionDuration) and passes them here; they are protected under the same
+        // encoding-robust matching so a Spark-encoded cdc path protects the raw disk key.
+        ImmutableHashSet<string> referenced = protectedReferencedPaths is { Count: > 0 }
+            ? BuildEncodingRobustSet(protectedReferencedPaths)
+            : ImmutableHashSet<string>.Empty;
+
         var decisions = new List<OrphanDecision>();
         foreach (OrphanCandidate candidate in candidates)
         {
             decisions.Add(new OrphanDecision(candidate.Path, ClassifyOne(
-                candidate, active, protectedTombstones, retentionCutoffMillis)));
+                candidate, active, protectedTombstones, referenced, retentionCutoffMillis)));
         }
 
         return decisions;
@@ -139,6 +166,7 @@ internal static class OrphanCleanup
         OrphanCandidate candidate,
         ImmutableHashSet<string> active,
         ImmutableHashSet<string> protectedTombstones,
+        ImmutableHashSet<string> referenced,
         long retentionCutoffMillis)
     {
         if (active.Contains(candidate.Path))
@@ -150,6 +178,13 @@ internal static class OrphanCleanup
         {
             // removed within the retention window — a stale reader may still read it.
             return OrphanClassification.RetentionProtectedTombstone;
+        }
+
+        if (referenced.Contains(candidate.Path))
+        {
+            // a _change_data/ file referenced by an in-window cdc action (#489) — never an active file
+            // (INV C1), but a CDF read within the log-retention window still needs it.
+            return OrphanClassification.ReferencedChangeData;
         }
 
         if (candidate.ModificationTimeMillis >= retentionCutoffMillis)

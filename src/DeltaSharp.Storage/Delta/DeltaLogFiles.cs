@@ -27,6 +27,16 @@ internal static class DeltaLogFiles
     /// (design §2.11.1).</summary>
     public static string CommitPath(long version) => LogPrefix + FormatVersion(version) + ".json";
 
+    /// <summary>The last path segment of <paramref name="path"/> (the file name) — the exact token
+    /// <see cref="Classify"/> expects. Used by both the log listing (snapshot version resolution) and VACUUM's
+    /// tail-truncation guard so the two derive versions from a byte-identical extraction (a divergent
+    /// extraction would let one see a version the other misses — a fail-open or false-abort seam).</summary>
+    public static string FileName(string path)
+    {
+        int slash = path.LastIndexOf('/');
+        return slash < 0 ? path : path[(slash + 1)..];
+    }
+
     public static DeltaLogFile Classify(string fileName)
     {
         // Commit: <20-digit>.json
@@ -125,6 +135,14 @@ internal enum DeltaLogFileKind
 /// classic checkpoint — its 1-based <see cref="Part"/> of <see cref="Parts"/>.</summary>
 internal readonly record struct DeltaLogFile(DeltaLogFileKind Kind, long Version, int Part, int Parts)
 {
+    /// <summary>Whether this artifact contributes to a table's latest version. Exactly the kinds the log
+    /// listing folds into <c>LatestVersion</c> — commits and classic checkpoints — and NOT V2/UUID
+    /// checkpoints (which a v1-baseline reader rejects at protocol negotiation, so the log listing skips them
+    /// for version resolution). VACUUM's tail-truncation guard uses this same predicate so its candidate-pass
+    /// max version is computed identically to the snapshot's resolved version (no asymmetry).</summary>
+    public bool CountsTowardLatestVersion =>
+        Kind is DeltaLogFileKind.Commit or DeltaLogFileKind.ClassicCheckpoint;
+
     public static DeltaLogFile Other() => new(DeltaLogFileKind.Other, 0, 0, 0);
 
     public static DeltaLogFile Commit(long version) => new(DeltaLogFileKind.Commit, version, 0, 0);
