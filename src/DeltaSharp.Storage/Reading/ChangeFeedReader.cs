@@ -341,7 +341,7 @@ internal sealed class ChangeFeedReader
                 }
             }
 
-            // Fail closed on a column-mapping MODE transition across the range. Every version's files (explicit
+            // Fail closed on a column-mapping MODE transition WITHIN the range. Every version's files (explicit
             // cdc AND implicit add/remove) are read through the END snapshot's mode (`ctx`) — its physical-name
             // / field-id resolution. A historical version authored under a DIFFERENT mode would be MISMAPPED
             // (e.g. an id-mode cdc file with swapped footer field_ids, read by NAME when the end is name mode,
@@ -349,6 +349,13 @@ internal sealed class ChangeFeedReader
             // sticky), so a differing per-version mode is a corrupt/forged `_delta_log`; fail closed rather than
             // emit mismapped change data. (Pre-existing since the #658 end-mode read; hardened here with #662.)
             // Path-free (#653): only the bounded version is named.
+            //
+            // SCOPE (partial mitigation): this catches a mode change at any version IN `[start, end]`. It does
+            // NOT catch a file referenced by a `remove` in the range but AUTHORED before `start` under a
+            // different mode (implicit-DELETE of a historical file across a mode boundary) — the per-version
+            // check never inspects the historical version's mode. Full-history mode-immutability validation is
+            // tracked in #671 (pre-existing, requires a forged/illegal mode-change log — an actor with
+            // `_delta_log` write access).
             if (ColumnMapping.ResolveMode(currentMetadata.Configuration) != ctx.Mode)
             {
                 throw new DeltaReadException(
