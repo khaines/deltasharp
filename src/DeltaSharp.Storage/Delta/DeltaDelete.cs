@@ -40,6 +40,28 @@ namespace DeltaSharp.Storage.Delta;
 /// (<c>col.IsNull(row)</c>).
 /// </para>
 /// <para>
+/// <b>Result invariant (SQL 3VL).</b> Equivalently: <see cref="Matches"/> MUST return <see langword="true"/>
+/// <b>iff</b> the SQL predicate evaluates to <b>TRUE</b> for the row — never for UNKNOWN or FALSE. Guarded
+/// leaves compose safely under <c>AND</c>/<c>OR</c> (the delete-if-TRUE collapse {FALSE, UNKNOWN}→don't-delete
+/// is a Kleene homomorphism), but <b>NOT under negation</b>: <c>NOT (col = v)</c> must be lowered to a POSITIVE
+/// guarded leaf (<c>!col.IsNull(row) &amp;&amp; col.GetValue&lt;T&gt;(row) != v</c>), NEVER as the C# negation
+/// <c>!(!col.IsNull(row) &amp;&amp; col.GetValue&lt;T&gt;(row) == v)</c> — the latter deletes null rows
+/// (<c>NOT UNKNOWN = UNKNOWN</c>, not TRUE) AND slips past the DEBUG guard (the <c>&amp;&amp;</c> short-circuits
+/// on <see cref="ColumnVector.IsNull"/> before any poisoned read). Push negation / <c>&lt;&gt;</c> to the leaf.
+/// </para>
+/// <para>
+/// <b>Guard scope (residuals).</b> The DEBUG poison catches only the per-row <see cref="ColumnVector.GetValue{T}"/>
+/// / <see cref="ColumnVector.GetBytes"/> footgun. It does NOT cover (a) the negation shape above, nor (b) a
+/// <b>vectorized</b> predicate that reads the bulk span <see cref="ColumnVector.GetValues{T}"/> and masks with
+/// the validity bitmap — the natural performant lowering — which must itself fold
+/// <see cref="ColumnVector.TryGetValidity"/> / <see cref="ColumnVector.IsNull"/> into its selection (an
+/// un-masked bulk read of a null slot yields <c>default(T)</c> and silently mis-deletes, uncaught even in
+/// DEBUG), nor (c) data-skipping / predicate-pushdown evaluation over file statistics (its own 3VL surface).
+/// Structural, release-safe enforcement of all three — a null-guarded predicate IR with negation normalized to
+/// leaves, plus vectorized validity-folding and interpreted/vectorized parity tests — is tracked in #673, to
+/// land before the first SQL/DataFrame DELETE lowering.
+/// </para>
+/// <para>
 /// A DEBUG-only null-poison wrapper (<c>NullPoisonColumnBatch</c>, wired at the <see cref="DeltaDelete"/>
 /// predicate call site) enforces this in tests: a <see cref="ColumnVector.GetValue{T}"/> /
 /// <see cref="ColumnVector.GetBytes"/> read of a null slot THROWS instead of returning <c>default</c>, so an
@@ -643,7 +665,11 @@ internal sealed class NullPoisonColumnBatch : ColumnBatch
 {
     private readonly ColumnBatch _inner;
 
-    public NullPoisonColumnBatch(ColumnBatch inner) => _inner = inner;
+    public NullPoisonColumnBatch(ColumnBatch inner)
+    {
+        ArgumentNullException.ThrowIfNull(inner);
+        _inner = inner;
+    }
 
     /// <inheritdoc/>
     public override StructType Schema => _inner.Schema;
@@ -670,9 +696,11 @@ internal sealed class NullPoisonColumnBatch : ColumnBatch
 }
 
 /// <summary>
-/// DEBUG-only null-poison view over a <see cref="ColumnVector"/> (#657). Every member delegates to the inner
-/// vector EXCEPT <see cref="GetValue{T}"/> and <see cref="GetBytes"/>: when the inner slot is null those THROW a
-/// fixed 3VL-violation <see cref="InvalidOperationException"/> instead of returning <c>default(T)</c> / an empty
+/// DEBUG-only null-poison view over a <see cref="ColumnVector"/> (#657). Members delegate to the inner vector
+/// (<see cref="Slice"/> re-wraps so poison propagates; <see cref="ColumnVector.Select"/> is intentionally NOT
+/// overridden — see the note there; <see cref="GetValues{T}"/> is a documented, by-design residual) EXCEPT
+/// <see cref="GetValue{T}"/> and <see cref="GetBytes"/>: when the inner slot is null those THROW a fixed
+/// 3VL-violation <see cref="InvalidOperationException"/> instead of returning <c>default(T)</c> / an empty
 /// span, so a DELETE predicate that reads a value without an <see cref="IsNull"/> guard fails loud (the #657
 /// footgun). The message carries NO row values, column names, or paths (#653 hygiene).
 /// </summary>
@@ -687,7 +715,7 @@ internal sealed class NullPoisonColumnVector : ColumnVector
     private readonly ColumnVector _inner;
 
     public NullPoisonColumnVector(ColumnVector inner)
-        : base(inner.Type) => _inner = inner;
+        : base((inner ?? throw new ArgumentNullException(nameof(inner))).Type) => _inner = inner;
 
     /// <inheritdoc/>
     public override int Length => _inner.Length;
@@ -737,6 +765,10 @@ internal sealed class NullPoisonColumnVector : ColumnVector
         return _inner.GetBytes(index);
     }
 
+    // Slice re-wraps so poison survives a sub-range view. NOTE: Select is intentionally NOT overridden — the
+    // base ColumnVector.Select wraps `this` (a SelectedColumnVector that routes every read back through THIS
+    // poison vector), so poison propagates through a selection. A future refactor MUST NOT delegate Select to
+    // `_inner` (that would silently drop the poison for a selection-carrying batch).
     /// <inheritdoc/>
     public override ColumnVector Slice(int offset, int length) =>
         new NullPoisonColumnVector(_inner.Slice(offset, length));
