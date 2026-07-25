@@ -714,16 +714,238 @@ public sealed class DeltaReadSourceTests : IDisposable
         await Assert.ThrowsAsync<DeltaReadException>(() => source.ReadBatchesAsync(info.Version));
     }
 
+    [Fact]
+    public async Task PathConfinementViolatingDvAddDataFile_FailsClosedWithoutEchoingDataFilePath()
+    {
+        // Message hygiene (#653 / DeltaReadSource.cs:309, the DV-carrying-add row-count read): reading a
+        // DV-carrying add cross-checks the file's PHYSICAL row count via OpenReadAsync(add.path) BEFORE it
+        // loads the DV. If add.path ESCAPES the table root, that OpenReadAsync fails PathNotConfined — and
+        // PathNotConfined names the rejected path in its OWN ex.Message ("Path '../…' escapes …"), so the
+        // :309 catch must NOT forward ex.Message: it names only the bounded storage-error KIND and keeps the
+        // cause (with the path) on the inner exception. The snapshot-read mirror of the R8
+        // ChangeFeedReader.ClassifyFileError fix + Explicit_PathConfinementViolatingCdcFile_… .
+        //
+        // Hand-author a FOREIGN DV-carrying add (a non-DeltaSharp writer's shape): a parseable inline DV +
+        // stats.numRecords over a real 2-row file at a NORMAL path, commit it (BlindAppend), then REWRITE the
+        // committed add.path in _delta_log/*.json to a root-escaping sentinel (the R8 rewrite trick — the
+        // committer would reject an escaping path up front, but the reconstructed log carries it verbatim to
+        // the read). The read reaches ReadFileAsync's DV block (add.DeletionVector present, stats.numRecords
+        // present) and its FIRST OpenReadAsync(add.path) — the row-count read — fails closed at confinement
+        // BEFORE the DV is ever loaded, so numRecords is set to the true physical count (2): confinement is
+        // the SOLE fault.
+        var backend = new LocalFileSystemBackend(_root);
+        try
+        {
+            // v0: a DV-enabled flat table, so the reader accepts a DV-carrying add (deletionVectors feature).
+            using (DeltaWriteTarget target = WriteTarget())
+            {
+                await target.CreateDeletionVectorTableAsync(
+                    FlatSchema, Array.Empty<string>(), new[] { FlatBatch((1, "alice")) });
+            }
+
+            Snapshot snapshot = await new DeltaLog(backend).LoadSnapshotAsync();
+            AddFileAction existing = Assert.Single(snapshot.ActiveFiles);   // reuse its empty PartitionValues/Tags
+
+            // A real 2-row Parquet file at a NORMAL (confined) path — the add's stats.numRecords matches it.
+            const string normalPath = "dv-normal-addpath.parquet";
+            byte[] fileBody;
+            using (var buffer = new MemoryStream())
+            {
+                await new ParquetFileWriter().WriteWithStatisticsAsync(
+                    buffer, FlatSchema, new[] { FlatBatch((100, "x"), (200, "y")) },
+                    StatisticsPolicy.Default, CancellationToken.None);
+                fileBody = buffer.ToArray();
+            }
+
+            Assert.True(await backend.PutIfAbsentAsync(normalPath, fileBody, CancellationToken.None));
+
+            byte[] rawBitmap = RoaringBitmapArray.Serialize(new long[] { 0 });   // a parseable inline DV (masks pos 0)
+            DeletionVectorDescriptor inline = DeletionVectorDescriptor.ForInline(rawBitmap, cardinality: 1);
+            var foreignAdd = new AddFileAction(
+                normalPath, existing.PartitionValues, fileBody.Length, ModificationTime: 1, DataChange: true,
+                FileStatistics.Empty with { NumRecords = 2 }, existing.Tags, inline);   // numRecords == physical 2
+
+            await new DeltaCommitter(backend).CommitAsync(
+                snapshot, new DeltaAction[] { foreignAdd }, DeltaReadScope.BlindAppend);   // v1
+        }
+        finally
+        {
+            backend.Dispose();
+        }
+
+        // Rewrite the committed add.path (v1) to a root-escaping sentinel — its OpenReadAsync fails closed as
+        // PathNotConfined at that path (the committer never opens add.path, so this only bites at read time).
+        const string escapingSentinel = "../att4cker_addpath_confine_s3ntinel.parquet";   // escapes the table root
+        string commit = CommitPath(1);
+        string rewritten = (await File.ReadAllTextAsync(commit))
+            .Replace("dv-normal-addpath.parquet", escapingSentinel, StringComparison.Ordinal);
+        Assert.Contains(escapingSentinel, rewritten, StringComparison.Ordinal);   // the rewrite landed
+        await File.WriteAllTextAsync(commit, rewritten);
+
+        using DeltaReadSource source = ReadSource();
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);   // latest = v1
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            () => source.ReadBatchesAsync(info.Version));
+        Assert.DoesNotContain("att4cker_addpath_confine_s3ntinel", ex.Message, StringComparison.Ordinal);   // no path leak
+        Assert.Contains("could not be read", ex.Message, StringComparison.Ordinal);   // bounded, path-free
+        DeltaStorageException inner = Assert.IsType<DeltaStorageException>(ex.InnerException);
+        Assert.Equal(StorageErrorKind.PathNotConfined, inner.Kind);   // the cause (with the path) stays on the inner
+    }
+
+    [Fact]
+    public async Task PathConfinementViolatingNonDvAddDataFile_FailsClosedWithoutEchoingDataFilePath()
+    {
+        // Message hygiene (#653 / DeltaReadSource.cs:206, the MAIN ReadFileAsync data read): a NON-DV add
+        // (no DeletionVector) skips the DV block entirely and reads its data file via OpenReadAsync(add.path).
+        // If add.path ESCAPES the table root that read fails PathNotConfined — whose ex.Message NAMES the
+        // rejected path — so the loop's :206 catch must NOT forward ex.Message: bounded storage-error KIND
+        // only, cause on the inner. The non-DV sibling of the :309 (DV row-count) case: a non-DV add reaches
+        // the main data read directly, because the :303 row-count read fires ONLY for a DV-carrying add.
+        //
+        // Author a FOREIGN NON-DV add (DeletionVector defaults to null) over a real 2-row file at a NORMAL
+        // path, commit it (BlindAppend), then REWRITE the committed add.path in _delta_log/*.json to a
+        // root-escaping sentinel (the same rewrite trick as the :309 test).
+        var backend = new LocalFileSystemBackend(_root);
+        try
+        {
+            using (DeltaWriteTarget target = WriteTarget())
+            {
+                await target.AppendAsync(FlatSchema, Array.Empty<string>(), new[] { FlatBatch((1, "alice")) });   // v0
+            }
+
+            Snapshot snapshot = await new DeltaLog(backend).LoadSnapshotAsync();
+            AddFileAction existing = Assert.Single(snapshot.ActiveFiles);   // reuse its empty PartitionValues/Tags
+
+            const string normalPath = "nondv-normal-addpath.parquet";
+            byte[] fileBody;
+            using (var buffer = new MemoryStream())
+            {
+                await new ParquetFileWriter().WriteWithStatisticsAsync(
+                    buffer, FlatSchema, new[] { FlatBatch((100, "x"), (200, "y")) },
+                    StatisticsPolicy.Default, CancellationToken.None);
+                fileBody = buffer.ToArray();
+            }
+
+            Assert.True(await backend.PutIfAbsentAsync(normalPath, fileBody, CancellationToken.None));
+
+            // A foreign NON-DV add — no DeletionVector, so the read reaches the main data read, not :303/:309.
+            var foreignAdd = new AddFileAction(
+                normalPath, existing.PartitionValues, fileBody.Length, ModificationTime: 1, DataChange: true,
+                FileStatistics.Empty with { NumRecords = 2 }, existing.Tags);   // DeletionVector defaults to null
+
+            await new DeltaCommitter(backend).CommitAsync(
+                snapshot, new DeltaAction[] { foreignAdd }, DeltaReadScope.BlindAppend);   // v1
+        }
+        finally
+        {
+            backend.Dispose();
+        }
+
+        // Rewrite the committed add.path (v1) to a root-escaping sentinel — its main-data-read OpenReadAsync
+        // fails closed as PathNotConfined at that path (the committer never opens add.path).
+        const string escapingSentinel = "../att4cker_nondvpath_confine_s3ntinel.parquet";   // escapes the table root
+        string commit = CommitPath(1);
+        string rewritten = (await File.ReadAllTextAsync(commit))
+            .Replace("nondv-normal-addpath.parquet", escapingSentinel, StringComparison.Ordinal);
+        Assert.Contains(escapingSentinel, rewritten, StringComparison.Ordinal);   // the rewrite landed
+        await File.WriteAllTextAsync(commit, rewritten);
+
+        using DeltaReadSource source = ReadSource();
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);   // latest = v1
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            () => source.ReadBatchesAsync(info.Version));
+        Assert.DoesNotContain("att4cker_nondvpath_confine_s3ntinel", ex.Message, StringComparison.Ordinal);   // no path leak
+        Assert.Contains("could not be read", ex.Message, StringComparison.Ordinal);   // bounded, path-free
+        DeltaStorageException inner = Assert.IsType<DeltaStorageException>(ex.InnerException);
+        Assert.Equal(StorageErrorKind.PathNotConfined, inner.Kind);   // the cause (with the path) stays on the inner
+    }
+
+    [Fact]
+    public async Task PathConfinementViolatingDvBinFile_FailsClosedWithoutEchoingDvFilePath()
+    {
+        // Message hygiene (#653 / DeltaReadSource.cs:343, the DV `.bin` load): once a DV-carrying add's
+        // physical row-count read (:303) succeeds and its numRecords cross-check passes, DeletionVectorStore
+        // .LoadAsync opens the DV's on-disk `.bin`. For a 'u' (uuid-relative) DV the `.bin` path is
+        // <prefix>/deletion_vector_<uuid>.bin — and the PREFIX is attacker-controllable, so a `../…` prefix
+        // makes the resolved `.bin` ESCAPE the table root → HeadAsync fails PathNotConfined naming that path.
+        // The :343 catch must therefore NOT forward ex.Message: bounded storage-error KIND only, cause on the
+        // inner. (Path confinement is enforced at the backend, not at descriptor Create-validation, so the
+        // escaping-prefix 'u' descriptor round-trips through the log and only bites at the `.bin` load.)
+        //
+        // Author a FOREIGN file-DV add: a real, CONFINED 2-row data file (so :303 reads physical=2 and the
+        // numRecords==2 cross-check passes), carrying a 'u' file DV whose prefix escapes root. Execution
+        // REACHES :343 at HeadAsync of the escaping `.bin`.
+        var backend = new LocalFileSystemBackend(_root);
+        try
+        {
+            // v0: a DV-enabled flat table, so the reader accepts a DV-carrying add (deletionVectors feature).
+            using (DeltaWriteTarget target = WriteTarget())
+            {
+                await target.CreateDeletionVectorTableAsync(
+                    FlatSchema, Array.Empty<string>(), new[] { FlatBatch((1, "alice")) });
+            }
+
+            Snapshot snapshot = await new DeltaLog(backend).LoadSnapshotAsync();
+            AddFileAction existing = Assert.Single(snapshot.ActiveFiles);   // reuse its empty PartitionValues/Tags
+
+            // A real 2-row CONFINED Parquet data file — its physical count (2) matches stats.numRecords, so the
+            // :303 row-count read + :309 numRecords check PASS and execution reaches the DV `.bin` load (:343).
+            const string dataPath = "dvbin-data-addpath.parquet";
+            byte[] fileBody;
+            using (var buffer = new MemoryStream())
+            {
+                await new ParquetFileWriter().WriteWithStatisticsAsync(
+                    buffer, FlatSchema, new[] { FlatBatch((100, "x"), (200, "y")) },
+                    StatisticsPolicy.Default, CancellationToken.None);
+                fileBody = buffer.ToArray();
+            }
+
+            Assert.True(await backend.PutIfAbsentAsync(dataPath, fileBody, CancellationToken.None));
+
+            // A 'u' (file) DV whose prefix escapes the table root: ResolveRelativePath yields
+            // "../att4cker_dvbin_confine_s3ntinel/deletion_vector_<uuid>.bin". The uuid is fixed (determinism);
+            // sizeInBytes (34) passes ValidateDeclaredSize; HeadAsync of the escaping path fails before any of
+            // the offset/size/CRC checks run.
+            var dvUuid = new Guid("01020304-0506-0708-090a-0b0c0d0e0f10");
+            string escapingDvPath = DeletionVectorDescriptor.BuildRelativePathOrInlineDv(
+                "../att4cker_dvbin_confine_s3ntinel", dvUuid);
+            DeletionVectorDescriptor fileDv = DeletionVectorDescriptor.ForRelativePath(
+                escapingDvPath, offset: 0, sizeInBytes: 34, cardinality: 1);
+            var foreignAdd = new AddFileAction(
+                dataPath, existing.PartitionValues, fileBody.Length, ModificationTime: 1, DataChange: true,
+                FileStatistics.Empty with { NumRecords = 2 }, existing.Tags, fileDv);   // numRecords == physical 2
+
+            await new DeltaCommitter(backend).CommitAsync(
+                snapshot, new DeltaAction[] { foreignAdd }, DeltaReadScope.BlindAppend);   // v1
+        }
+        finally
+        {
+            backend.Dispose();
+        }
+
+        using DeltaReadSource source = ReadSource();
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);   // latest = v1
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            () => source.ReadBatchesAsync(info.Version));
+        Assert.DoesNotContain("att4cker_dvbin_confine_s3ntinel", ex.Message, StringComparison.Ordinal);   // no DV-path leak
+        Assert.Contains("deletion vector", ex.Message, StringComparison.OrdinalIgnoreCase);   // bounded, DV-scoped
+        DeltaStorageException inner = Assert.IsType<DeltaStorageException>(ex.InnerException);
+        Assert.Equal(StorageErrorKind.PathNotConfined, inner.Kind);   // the cause (with the path) stays on the inner
+    }
+
     // ---------------------------------------------------------------- helpers
 
-    private void SetCommitTimestamp(long version, DateTimeOffset timestamp)
-    {
-        string commit = Path.Combine(
+    private string CommitPath(long version) =>
+        Path.Combine(
             _root,
             "_delta_log",
             version.ToString("D20", System.Globalization.CultureInfo.InvariantCulture) + ".json");
-        File.SetLastWriteTimeUtc(commit, timestamp.UtcDateTime);
-    }
+
+    private void SetCommitTimestamp(long version, DateTimeOffset timestamp) =>
+        File.SetLastWriteTimeUtc(CommitPath(version), timestamp.UtcDateTime);
 
     private async Task<string> WriteIntValueFileAsync(string relativePath, params int[] values)
     {

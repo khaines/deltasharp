@@ -1452,7 +1452,8 @@ public sealed class ColumnMappingTests : IDisposable
         using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
         DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
         DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(() => source.ReadBatchesAsync(info.Version));
-        Assert.Contains("duplicate field_id", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("could not be read", ex.Message, StringComparison.Ordinal);   // #653: bounded outer (no path/detail)
+        Assert.Contains("duplicate field_id", ex.InnerException!.Message, StringComparison.Ordinal);   // detail on inner
     }
 
     [Fact]
@@ -1527,7 +1528,8 @@ public sealed class ColumnMappingTests : IDisposable
         DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
         DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
             () => source.ReadBatchesAsync(info.Version));
-        Assert.Contains("outside the Parquet field_id range", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("could not be read", ex.Message, StringComparison.Ordinal);   // #653: bounded outer (no path/detail)
+        Assert.Contains("outside the Parquet field_id range", ex.InnerException!.Message, StringComparison.Ordinal);   // detail on inner
     }
 
     [Fact]
