@@ -345,6 +345,77 @@ internal sealed class ParquetFileReader
         }
     }
 
+    /// <summary>One decoded leaf column of a Parquet file: its name, DeltaSharp <see cref="DataType"/>, and
+    /// (when the footer assigns one) its column-mapping <c>field_id</c> — <see langword="null"/> for a leaf the
+    /// footer gives no <c>field_id</c> (e.g. the engine-synthesized <c>_change_type</c>). The unit
+    /// <see cref="ReadDataLeafColumnsAsync"/> returns for CDF-EE-08 id-mode validation (#662).</summary>
+    internal readonly record struct ParquetLeafColumn(string Name, DataType Type, int? FieldId);
+
+    /// <summary>
+    /// Reads only the Parquet footer and returns the file's leaf data columns — each carrying its name,
+    /// DeltaSharp type (via <see cref="ParquetTypeMapping.ToDataSchema"/>), and (when the footer assigns one)
+    /// its <c>field_id</c> — decoding no data pages, in file order. This is the <b>field-id-aware sibling</b> of
+    /// <see cref="ReadDataSchemaAsync"/>: the CDF explicit (cdc) read validates a foreign column-mapping
+    /// <b>id</b>-mode cdc file's leaf schema by <c>field_id</c> (the Delta id-mode authority) rather than by
+    /// physical name, because a foreign id-mode file's physical Parquet column names may diverge from the
+    /// metaData <c>physicalName</c>s (CDF-EE-08, #662). A leaf the footer assigns no <c>field_id</c> reports
+    /// <see cref="ParquetLeafColumn.FieldId"/> == <see langword="null"/>.
+    /// </summary>
+    /// <exception cref="DeltaStorageException">The footer is malformed/truncated, or a footer field has no
+    /// supported DeltaSharp type mapping (<see cref="StorageErrorKind.CorruptData"/>); the footer declares a
+    /// duplicate <c>field_id</c> (<see cref="StorageErrorKind.SchemaMismatch"/>, via
+    /// <see cref="BuildFieldIdMap"/>); or the file uses Parquet Modular Encryption
+    /// (<see cref="StorageErrorKind.UnsupportedFeature"/>) — all fail closed.</exception>
+    internal async Task<IReadOnlyList<ParquetLeafColumn>> ReadDataLeafColumnsAsync(
+        Stream input, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+
+        ParquetReader reader = await OpenAsync(input, cancellationToken).ConfigureAwait(false);
+        await using (reader.ConfigureAwait(false))
+        {
+            // Fail-closed schema-mapping boundary — IDENTICAL to ReadDataSchemaAsync's (see there): mapping the
+            // untrusted footer field descriptors into DeltaSharp StructFields is a distinct decode step, so a
+            // crafted footer fault maps to the deterministic CorruptData contract with a FIXED message (no
+            // ex.Message echo), while ToDataSchema's typed UnsupportedFeature propagates unwrapped.
+            StructType schema;
+            try
+            {
+                schema = ParquetTypeMapping.ToDataSchema(reader.Schema);
+            }
+            catch (Exception ex) when (IsParquetDefect(ex))
+            {
+                throw DeltaStorageException.CorruptData(
+                    "Parquet footer schema is malformed (undecodable field descriptor).", ex);
+            }
+            catch (Exception ex) when (IsUndecodableParquetInput(ex))
+            {
+                throw DeltaStorageException.CorruptData(
+                    "Parquet footer declares an unmappable field descriptor (e.g. an empty field name).", ex);
+            }
+
+            // Correlate the footer field_ids with the leaves (BuildFieldIdMap fails closed on a duplicate
+            // field_id — a typed DeltaStorageException that propagates unwrapped, mirroring the ReadAsync id
+            // path). Invert to name → field_id so each leaf carries its own id; a leaf with no footer field_id
+            // (e.g. `_change_type`) stays null.
+            IReadOnlyDictionary<int, DataField> byFieldId = BuildFieldIdMap(reader);
+            var fieldIdByName = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (KeyValuePair<int, DataField> entry in byFieldId)
+            {
+                fieldIdByName[entry.Value.Name] = entry.Key;
+            }
+
+            var columns = new List<ParquetLeafColumn>(schema.Count);
+            foreach (StructField field in schema)
+            {
+                int? fieldId = fieldIdByName.TryGetValue(field.Name, out int id) ? id : null;
+                columns.Add(new ParquetLeafColumn(field.Name, field.DataType, fieldId));
+            }
+
+            return columns;
+        }
+    }
+
     /// <summary>The declared compressed/decompressed footprint of one projected column chunk, plus the
     /// per-row width of the read buffer the reader will eagerly allocate for it (including any
     /// <see cref="Nullable{T}"/> overhead) — the inputs to <see cref="EnsureDecodeCeiling"/>.
