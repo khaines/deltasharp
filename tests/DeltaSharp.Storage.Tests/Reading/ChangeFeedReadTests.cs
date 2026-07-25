@@ -879,6 +879,76 @@ public sealed class ChangeFeedReadTests : IDisposable
             rows.OrderBy(r => r.Id).Select(r => (r.Id, r.Name, r.ChangeType, r.Version)).ToArray());
     }
 
+    [Fact]
+    public async Task Explicit_CdcRangeCrossesColumnMappingModeChange_FailsClosed_NoMismappedRows()
+    {
+        // Fail-closed hardening (#662 red-team; pre-existing since the #658 end-mode read). The CDF read
+        // interprets EVERY version through the END snapshot's column-mapping mode. A forged `_delta_log` that
+        // toggles column-mapping mode mid-range (here id→name — a transition Delta forbids and DeltaSharp's own
+        // committer rejects, so only a raw-log attacker can author it) would otherwise read a HISTORICAL id-mode
+        // cdc file BY NAME when the end is name mode, silently surfacing MISMAPPED change rows (a swapped-field_id
+        // secret). The per-version mode-consistency check fails the read closed instead — the secret never
+        // surfaces, and the cdc PATH is not echoed (#653).
+        const string secret = "midrange_s3cret_leak_7d6f";
+        var fileSchema = new StructType(new[]
+        {
+            PhysFieldWithId("col-A", DataTypes.LongType, nullable: false, id: 2),   // swapped ids vs the schema
+            PhysFieldWithId("col-B", DataTypes.StringType, nullable: true, id: 1),
+            new StructField(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: false),
+        });
+        MutableColumnVector colA = ColumnVectors.Create(DataTypes.LongType, 1);
+        MutableColumnVector colB = ColumnVectors.Create(DataTypes.StringType, 1);
+        MutableColumnVector changeType = ColumnVectors.Create(DataTypes.StringType, 1);
+        colA.AppendValue(991L);
+        colB.AppendBytes(Encoding.UTF8.GetBytes(secret));
+        changeType.AppendBytes(Encoding.UTF8.GetBytes(ChangeDataWriter.InsertChange));
+        var body = new ManagedColumnBatch(fileSchema, new ColumnVector[] { colA, colB, changeType }, 1);
+        byte[] parquet;
+        using (var buffer = new MemoryStream())
+        {
+            await new ParquetFileWriter().WriteAsync(buffer, fileSchema, new[] { body }, CancellationToken.None);
+            parquet = buffer.ToArray();
+        }
+
+        const string path = "_change_data/mode-toggle-cdc.parquet";
+        using var backend = new LocalFileSystemBackend(_root);
+        await backend.PutIfAbsentAsync(path, parquet, CancellationToken.None);
+
+        const string schemaJson =
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
+            + "{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-A\"}},"
+            + "{\"name\":\"name\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"col-B\"}}]}";
+        string escaped = JsonSerializer.Serialize(schemaJson);
+        const string protocol =
+            "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,"
+            + "\"readerFeatures\":[\"columnMapping\"],"
+            + "\"writerFeatures\":[\"columnMapping\",\"changeDataFeed\"]}}";
+        string MetaLine(string mode) =>
+            "{\"metaData\":{\"id\":\"rt\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
+            + "\"schemaString\":" + escaped + ",\"partitionColumns\":[],\"configuration\":{"
+            + "\"delta.columnMapping.mode\":\"" + mode + "\",\"delta.columnMapping.maxColumnId\":\"2\","
+            + "\"delta.enableChangeDataFeed\":\"true\"}}}";
+        string cdc =
+            $"{{\"cdc\":{{\"path\":\"{path}\",\"partitionValues\":{{}},\"size\":{parquet.Length},"
+            + "\"dataChange\":false}}";
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000000.json",
+            Encoding.UTF8.GetBytes(protocol + "\n" + MetaLine("id") + "\n"), CancellationToken.None);
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000001.json", Encoding.UTF8.GetBytes(cdc + "\n"), CancellationToken.None);
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000002.json",
+            Encoding.UTF8.GetBytes(MetaLine("name") + "\n"), CancellationToken.None);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(1, 2)));
+        Assert.Contains("column-mapping mode change", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(secret, ex.Message, StringComparison.Ordinal);   // mismapped secret never surfaces
+        Assert.DoesNotContain(path, ex.Message, StringComparison.Ordinal);     // #653: no cdc-path leak
+    }
+
     // ------------------------------------------------- #662 id-mode EE-08 NEGATIVE (fail-closed) tests
     //
     // The positive test above proves the id-branch of ValidateCdcLeafSchema ACCEPTS a well-formed foreign

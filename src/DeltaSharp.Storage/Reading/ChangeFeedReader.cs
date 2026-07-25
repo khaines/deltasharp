@@ -341,6 +341,22 @@ internal sealed class ChangeFeedReader
                 }
             }
 
+            // Fail closed on a column-mapping MODE transition across the range. Every version's files (explicit
+            // cdc AND implicit add/remove) are read through the END snapshot's mode (`ctx`) — its physical-name
+            // / field-id resolution. A historical version authored under a DIFFERENT mode would be MISMAPPED
+            // (e.g. an id-mode cdc file with swapped footer field_ids, read by NAME when the end is name mode,
+            // surfaces WRONG change rows). Delta column-mapping mode is IMMUTABLE (id is creation-only, name is
+            // sticky), so a differing per-version mode is a corrupt/forged `_delta_log`; fail closed rather than
+            // emit mismapped change data. (Pre-existing since the #658 end-mode read; hardened here with #662.)
+            // Path-free (#653): only the bounded version is named.
+            if (ColumnMapping.ResolveMode(currentMetadata.Configuration) != ctx.Mode)
+            {
+                throw new DeltaReadException(
+                    $"The change-feed range crosses a column-mapping mode change at version {v}; the range is "
+                    + "read through a single (end-snapshot) column-mapping mode, so a mode transition is not "
+                    + "supported and the read fails closed rather than risk emitting mismapped change data.");
+            }
+
             // Precedence (INV C1/C2, §2.2): ANY cdc action ⇒ explicit (read exactly the cdc rows, ignore
             // add/remove — no double count); otherwise implicit (derive from add/remove — no miss).
             bool hasCdc = false;
@@ -362,12 +378,11 @@ internal sealed class ChangeFeedReader
                 {
                     if (action is AddCdcFileAction cdc)
                     {
-                        // `ctx.ResolveByFieldId` (the END snapshot's mode) drives BOTH the gate and the read, so
-                        // they can never disagree on mode. This relies on Delta column-mapping mode being
-                        // IMMUTABLE (id mode is set at table creation and cannot be toggled later), so every
-                        // version in a range shares the end's mode. A hostile log that toggled mode mid-range
-                        // still fails closed consistently: a name/none cdc file carries no footer field_ids, so
-                        // the id-mode gate rejects it (missing by id) and the id-mode read would too.
+                        // `ctx.ResolveByFieldId` (the END snapshot's mode) drives BOTH the gate and the read,
+                        // so they never disagree on mode within a version. A range that crossed a column-mapping
+                        // MODE transition — which would mismap a historical version read through the end's mode —
+                        // was already failed closed above (the per-version mode-consistency check), so by here
+                        // every version in the range provably shares the end snapshot's mode.
                         await ValidateExplicitCdcSchemaAsync(
                             cdc.Path, versionPhysicalDataSchema, v, ctx.ResolveByFieldId, cancellationToken)
                             .ConfigureAwait(false);
@@ -563,7 +578,7 @@ internal sealed class ChangeFeedReader
         bool allowTypeWideningPromotion = TypeWideningFeature.Supports(end.Protocol);
         return new OutputContext(
             info.Schema, tableSchema, physicalDataSchema, physicalNames, dataOrdinalByField, resolveByFieldId,
-            allowTypeWideningPromotion);
+            mode, allowTypeWideningPromotion);
     }
 
     // §3.2 CDF-EE-08: builds the version's expected PHYSICAL data-leaf schema from its log-resident metadata
@@ -1195,5 +1210,6 @@ internal sealed class ChangeFeedReader
         string[] PhysicalNames,
         int[] DataOrdinalByField,
         bool ResolveByFieldId,
+        ColumnMappingMode Mode,
         bool AllowTypeWideningPromotion);
 }
