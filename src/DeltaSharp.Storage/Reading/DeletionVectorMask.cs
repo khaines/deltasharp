@@ -68,12 +68,15 @@ internal sealed class DeletionVectorMask
     /// positions can no longer be trusted to map to the right rows — the read fails closed.
     /// </summary>
     /// <exception cref="DeltaReadException">The physical rows read disagree with <see cref="PhysicalRecords"/>.</exception>
-    public void EnsureConsumed(long physicalRowsRead, string path)
+    public void EnsureConsumed(long physicalRowsRead)
     {
         if (physicalRowsRead != PhysicalRecords)
         {
+            // Message hygiene (#653): the data-file path is dropped (attacker-controllable — a poisoned log
+            // can inject arbitrary/root-escaping text); the record counts are bounded statistics (not a path,
+            // column name, or cell value) and remain as diagnostics.
             throw new DeltaReadException(
-                $"File '{path}' carries a deletion vector validated against {PhysicalRecords} physical "
+                $"An active data file carries a deletion vector validated against {PhysicalRecords} physical "
                 + $"record(s), but the Parquet file produced {physicalRowsRead} on read; the deletion vector "
                 + "disagrees with the data file, so the read fails closed.");
         }

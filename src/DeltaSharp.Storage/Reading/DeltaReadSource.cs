@@ -290,8 +290,12 @@ public sealed class DeltaReadSource : IDisposable
             {
                 // A DV-carrying add MUST record numRecords in stats (Delta writer requirement). Without the
                 // physical record count we cannot cross-check the file, so fail closed.
+                // Message hygiene (#653): add.Path is attacker-controllable (a poisoned log can inject an
+                // arbitrary/root-escaping path) and must NOT be interpolated into the fault message — describe
+                // the fault without naming the file. This fires BEFORE the file is opened, so the path is not
+                // even confinement-checked yet; the caller still has it on the add action.
                 throw new DeltaReadException(
-                    $"Active file '{add.Path}' carries a deletion vector but its add action has no "
+                    "An active data file carries a deletion vector but its add action has no "
                     + "stats.numRecords, so the deleted row positions cannot be validated. The read fails "
                     + "closed rather than risk returning rows a deletion vector invalidated.");
             }
@@ -325,8 +329,10 @@ public sealed class DeltaReadSource : IDisposable
             // logical count, if ever needed, is numRecords − cardinality.)
             if (declaredPhysicalRecords != physicalRecords)
             {
+                // Message hygiene (#653): drop add.Path (attacker-controllable); the record counts are bounded
+                // file statistics (not a path, column name, or cell value), so they remain as diagnostics.
                 throw new DeltaReadException(
-                    $"Active file '{add.Path}' declares stats.numRecords={declaredPhysicalRecords} but its "
+                    $"An active data file declares stats.numRecords={declaredPhysicalRecords} but its "
                     + $"Parquet file contains {physicalRecords} physical row(s); a DV-carrying add's numRecords "
                     + "must equal the physical row count, so the read fails closed.");
             }
@@ -394,7 +400,7 @@ public sealed class DeltaReadSource : IDisposable
 
         if (deletionVector is not null)
         {
-            deletionVector.EnsureConsumed(fileRowOffset, add.Path);
+            deletionVector.EnsureConsumed(fileRowOffset);
         }
     }
 

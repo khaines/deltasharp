@@ -1045,7 +1045,7 @@ internal sealed class ChangeFeedReader
 
         // The file's real physical row count must match the count the DV was validated against — a mismatch
         // means the file changed under the DV, so the positions can no longer be trusted. Fail closed.
-        mask?.EnsureConsumed(fileRowOffset, path);
+        mask?.EnsureConsumed(fileRowOffset);
     }
 
     // Assembles one implicit output batch: relabel + hydrate partition columns, stamp a CONSTANT change type

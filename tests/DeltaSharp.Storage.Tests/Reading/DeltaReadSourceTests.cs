@@ -367,6 +367,12 @@ public sealed class DeltaReadSourceTests : IDisposable
             () => source.ReadBatchesAsync(info.Version));
         Assert.Equal("part-narrow.parquet", ex.FilePath);
         Assert.Contains("required", ex.Message, StringComparison.Ordinal);
+        // #653 no-echo (DeltaReadSchemaEvolutionException): the data-file path stays programmatically available
+        // on the FilePath PROPERTY (asserted above, unchanged API) but must NOT be interpolated into the
+        // human-facing Message — a poisoned/foreign add.path is attacker-controllable and Message flows to
+        // logs/spans automatically. Load-bearing: pre-fix the message was $"Cannot read Delta data file
+        // '{filePath}' …", so FilePath (part-narrow.parquet) appeared verbatim in Message.
+        Assert.DoesNotContain(ex.FilePath, ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -934,6 +940,157 @@ public sealed class DeltaReadSourceTests : IDisposable
         Assert.Contains("deletion vector", ex.Message, StringComparison.OrdinalIgnoreCase);   // bounded, DV-scoped
         DeltaStorageException inner = Assert.IsType<DeltaStorageException>(ex.InnerException);
         Assert.Equal(StorageErrorKind.PathNotConfined, inner.Kind);   // the cause (with the path) stays on the inner
+    }
+
+    [Fact]
+    public async Task DvAddMissingNumRecords_FailsClosedWithoutEchoingDataFilePath()
+    {
+        // Message hygiene (#653 / DeltaReadSource.cs:296, DV add missing stats.numRecords): a DV-carrying add
+        // MUST record stats.numRecords (the physical count the DV positions are validated against). When it is
+        // absent the read fails closed — and this fires BEFORE the data file is opened (the add.path is not
+        // even confinement-checked yet), so add.path is TOTALLY attacker-controlled. The fix DROPPED add.Path
+        // from the message (pre-fix: $"Active file '{add.Path}' carries a deletion vector but its add action
+        // has no …") — it now names only the bounded fault, no path.
+        //
+        // Author a FOREIGN DV-carrying add whose stats OMIT numRecords (FileStatistics.Empty ⇒ NumRecords is
+        // null) at a NORMAL path, commit it (BlindAppend), then REWRITE the committed add.path to a
+        // root-escaping sentinel (the committer rejects an escaping path up front; the reconstructed log
+        // carries it verbatim). The read enters ReadFileAsync's DV block and trips the missing-numRecords
+        // guard before any OpenReadAsync, so the (non-existent, escaping) sentinel path is never touched.
+        var backend = new LocalFileSystemBackend(_root);
+        try
+        {
+            using (DeltaWriteTarget target = WriteTarget())
+            {
+                await target.CreateDeletionVectorTableAsync(
+                    FlatSchema, Array.Empty<string>(), new[] { FlatBatch((1, "alice")) });   // v0 (DV feature on)
+            }
+
+            Snapshot snapshot = await new DeltaLog(backend).LoadSnapshotAsync();
+            AddFileAction existing = Assert.Single(snapshot.ActiveFiles);
+
+            const string normalPath = "dvnonum-normal-addpath.parquet";
+            byte[] rawBitmap = RoaringBitmapArray.Serialize(new long[] { 0 });   // a parseable inline DV (masks pos 0)
+            DeletionVectorDescriptor inline = DeletionVectorDescriptor.ForInline(rawBitmap, cardinality: 1);
+            var foreignAdd = new AddFileAction(
+                normalPath, existing.PartitionValues, Size: 1, ModificationTime: 1, DataChange: true,
+                FileStatistics.Empty, existing.Tags, inline);   // FileStatistics.Empty ⇒ NumRecords == null
+
+            await new DeltaCommitter(backend).CommitAsync(
+                snapshot, new DeltaAction[] { foreignAdd }, DeltaReadScope.BlindAppend);   // v1
+        }
+        finally
+        {
+            backend.Dispose();
+        }
+
+        const string escapingSentinel = "../att4cker_dv_nonumrecords_s3ntinel.parquet";
+        string commit = CommitPath(1);
+        string rewritten = (await File.ReadAllTextAsync(commit))
+            .Replace("dvnonum-normal-addpath.parquet", escapingSentinel, StringComparison.Ordinal);
+        Assert.Contains(escapingSentinel, rewritten, StringComparison.Ordinal);   // the rewrite landed
+        await File.WriteAllTextAsync(commit, rewritten);
+
+        using DeltaReadSource source = ReadSource();
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);   // latest = v1
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            () => source.ReadBatchesAsync(info.Version));
+        Assert.DoesNotContain("att4cker_dv_nonumrecords_s3ntinel", ex.Message, StringComparison.Ordinal);   // no path leak
+        Assert.Contains("no stats.numRecords", ex.Message, StringComparison.Ordinal);   // bounded fault, path-free
+        Assert.Contains("carries a deletion vector", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DvAddNumRecordsMismatch_FailsClosedWithoutEchoingDataFilePath()
+    {
+        // Message hygiene (#653 / DeltaReadSource.cs:329, DV numRecords != physical row count): a DV-carrying
+        // add's stats.numRecords IS the file's physical row count; the reader cross-checks it against the
+        // Parquet footer and fails closed on disagreement. This is reached when the data file OPENS + footer-
+        // reads fine (a CONFINED path), so it is the count check — not confinement — that trips. The fix
+        // DROPPED add.Path (pre-fix: $"Active file '{add.Path}' declares stats.numRecords=…"); the bounded
+        // record counts (999 declared vs 2 physical) remain as diagnostics.
+        //
+        // Author a FOREIGN DV-carrying add over a real 2-row file at a CONFINED sentinel path (so OpenRead +
+        // footer read succeed) with stats.numRecords = 999 (≠ the physical 2). The path is confined, so it is
+        // authored directly (no rewrite needed); the sentinel token in the file name is what a leak would echo.
+        var backend = new LocalFileSystemBackend(_root);
+        const string confinedSentinel = "dvmismatch-att4cker_s3ntinel.parquet";   // confined: opens + footer-reads
+        try
+        {
+            using (DeltaWriteTarget target = WriteTarget())
+            {
+                await target.CreateDeletionVectorTableAsync(
+                    FlatSchema, Array.Empty<string>(), new[] { FlatBatch((1, "alice")) });   // v0 (DV feature on)
+            }
+
+            Snapshot snapshot = await new DeltaLog(backend).LoadSnapshotAsync();
+            AddFileAction existing = Assert.Single(snapshot.ActiveFiles);
+
+            byte[] fileBody;
+            using (var buffer = new MemoryStream())
+            {
+                await new ParquetFileWriter().WriteWithStatisticsAsync(
+                    buffer, FlatSchema, new[] { FlatBatch((100, "x"), (200, "y")) },
+                    StatisticsPolicy.Default, CancellationToken.None);   // a real 2-row file
+                fileBody = buffer.ToArray();
+            }
+
+            Assert.True(await backend.PutIfAbsentAsync(confinedSentinel, fileBody, CancellationToken.None));
+
+            byte[] rawBitmap = RoaringBitmapArray.Serialize(new long[] { 0 });   // a parseable inline DV (masks pos 0)
+            DeletionVectorDescriptor inline = DeletionVectorDescriptor.ForInline(rawBitmap, cardinality: 1);
+            var foreignAdd = new AddFileAction(
+                confinedSentinel, existing.PartitionValues, fileBody.Length, ModificationTime: 1, DataChange: true,
+                FileStatistics.Empty with { NumRecords = 999 }, existing.Tags, inline);   // 999 != physical 2
+
+            await new DeltaCommitter(backend).CommitAsync(
+                snapshot, new DeltaAction[] { foreignAdd }, DeltaReadScope.BlindAppend);   // v1
+        }
+        finally
+        {
+            backend.Dispose();
+        }
+
+        using DeltaReadSource source = ReadSource();
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);   // latest = v1
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            () => source.ReadBatchesAsync(info.Version));
+        Assert.DoesNotContain("dvmismatch-att4cker_s3ntinel", ex.Message, StringComparison.Ordinal);   // no path leak
+        Assert.Contains("stats.numRecords=999", ex.Message, StringComparison.Ordinal);   // bounded counts remain
+        Assert.Contains("2 physical row", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void DvConsumedRowCountMismatch_FailsClosedWithoutEchoingDataFilePath()
+    {
+        // Message hygiene (#653 / DeletionVectorMask.EnsureConsumed, the post-read TOCTOU backstop): after a
+        // DV-carrying file streams, the physical rows READ must equal the count the DV was validated against;
+        // a mismatch means the file changed under the DV, so it fails closed. The fix DROPPED the
+        // attacker-controllable data-file path from BOTH the method SIGNATURE and the message (git diff:
+        // EnsureConsumed(long, string path) → EnsureConsumed(long); pre-fix message $"File '{path}' carries a
+        // deletion vector validated against …").
+        //
+        // This site is a DIRECT unit pin, not an end-to-end read, and that is deliberate: EnsureConsumed is
+        // UNREACHABLE through the public read seam with a stable file (evidence recorded in the handoff
+        // report). Both read paths (DeltaReadSource:403 and ChangeFeedReader:1048) derive the DV's
+        // PhysicalRecords from the Parquet FOOTER via GetRowCountAsync and cross-check stats==footer first
+        // (:329), and the streaming reader PADS every batch to that same footer count (an empirical probe:
+        // forging a 2-row footer to 3 yields a 3-row read, not 2; forging it to 1 throws CorruptData at decode
+        // — neither reaches EnsureConsumed). So physicalRowsRead == PhysicalRecords always holds for a stable
+        // file; only a genuine on-disk TOCTOU (file swapped BETWEEN the two OpenReadAsync calls) trips it, and
+        // both facades wrap a CONCRETE LocalFileSystemBackend via a private ctor with no injection seam.
+        //
+        // The pin is still durable: this ONE-arg call fails to COMPILE if the `path` parameter is restored
+        // (the pre-fix 2-arg signature — a build-break RED), and the message assertions catch a re-introduced
+        // quoted path token. RED-on-revert (leak) is demonstrated in the report by reverting to the 2-arg
+        // form and calling it with the sentinel.
+        var mask = new DeletionVectorMask(Array.Empty<long>(), physicalRecords: 3);
+        DeltaReadException ex = Assert.Throws<DeltaReadException>(() => mask.EnsureConsumed(2));
+        Assert.Contains("deletion vector", ex.Message, StringComparison.OrdinalIgnoreCase);   // bounded, DV-scoped
+        Assert.Contains("on read", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("'", ex.Message, StringComparison.Ordinal);   // pre-fix leaked the path as: File '{path}' …
     }
 
     // ---------------------------------------------------------------- helpers
