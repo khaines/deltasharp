@@ -19,7 +19,11 @@ public sealed class DeltaReadSchemaEvolutionException : Exception
     /// <param name="innerException">The originating storage exception (the absent-column read failure).</param>
     public DeltaReadSchemaEvolutionException(string filePath, Exception innerException)
         : base(
-            $"Cannot read Delta data file '{filePath}' because it is missing a required (non-nullable) column "
+            // Message hygiene (#653): the data file path is attacker-controllable (a poisoned/foreign log can
+            // inject arbitrary text) and is NOT interpolated into the message — it reaches logs/spans via
+            // Message automatically. The path stays programmatically available on the FilePath property for a
+            // caller that explicitly opts in (and can redact at its own sink).
+            "Cannot read a Delta data file because it is missing a required (non-nullable) column "
             + "the current table schema demands, which read-side null-fill cannot satisfy (only later-added "
             + "nullable columns are null-filled, #497). The read fails closed rather than fabricating a value "
             + "for a required column.",

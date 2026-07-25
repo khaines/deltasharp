@@ -341,7 +341,9 @@ internal sealed class ChangeFeedReader
                         $"Change feed version {v}'s commit log is no longer available (log cleanup removed it "
                         + "between range resolution and read); the requested range is outside the "
                         + "CDF-readable window.", ex)
-                    : new DeltaReadException(ex.Message, ex);
+                    : new DeltaReadException(
+                $"A change-feed file could not be read (storage fault: {ex.Kind}); the requested "
+                + "change-feed range failed closed.", ex);
             }
             catch (DeltaProtocolException ex)
             {
@@ -626,10 +628,10 @@ internal sealed class ChangeFeedReader
         }
         catch (DeltaStorageException ex)
         {
-            throw ClassifyFileError(path, ex);
+            throw ClassifyFileError(ex);
         }
 
-        ValidateCdcLeafSchema(path, version, versionPhysicalDataSchema, fileSchema);
+        ValidateCdcLeafSchema(version, versionPhysicalDataSchema, fileSchema);
     }
 
     // The leaf comparison for CDF-EE-08. Physical names are 1:1 with field-ids in DeltaSharp's mapping (a
@@ -637,7 +639,7 @@ internal sealed class ChangeFeedReader
     // name and id modes. The synthesized `_change_type` column is excluded (it is engine-owned, not part of a
     // version's data schema, and its VALUE domain is validated separately in ReadChangeTypesAsync).
     private static void ValidateCdcLeafSchema(
-        string path, long version, StructType expected, StructType fileSchema)
+        long version, StructType expected, StructType fileSchema)
     {
         var fileByName = new Dictionary<string, DataType>(StringComparer.Ordinal);
         foreach (StructField field in fileSchema)
@@ -649,7 +651,13 @@ internal sealed class ChangeFeedReader
 
             if (!fileByName.TryAdd(field.Name, field.DataType))
             {
-                throw NewCdcSchemaMismatch(path, version, $"it declares data column '{field.Name}' more than once");
+                // Defense-in-depth, UNREACHABLE via the read path: ReadDataSchemaAsync (called before this
+                // validator) builds a StructType, whose ctor rejects duplicate field names
+                // (SchemaValidationException, STORY-02.5.1 AC2) and is re-mapped to CorruptData — so a
+                // duplicate-column cdc file fails closed upstream before EE-08 runs. Retained fail-closed
+                // (in case that upstream invariant ever changes) but not durably testable, so — like the
+                // other EE-08 messages (#653) — it names no file-derived column, only that a duplicate exists.
+                throw NewCdcSchemaMismatch(version, "it declares a data column more than once");
             }
         }
 
@@ -658,13 +666,13 @@ internal sealed class ChangeFeedReader
             if (!fileByName.TryGetValue(expectedField.Name, out DataType? fileType))
             {
                 throw NewCdcSchemaMismatch(
-                    path, version, $"it is missing the version's data column '{expectedField.Name}'");
+                    version, $"it is missing the version's data column '{expectedField.Name}'");
             }
 
             if (!expectedField.DataType.Equals(fileType))
             {
                 throw NewCdcSchemaMismatch(
-                    path, version,
+                    version,
                     $"data column '{expectedField.Name}' has leaf type {fileType.SimpleString} but the version's "
                     + $"metadata declares {expectedField.DataType.SimpleString}");
             }
@@ -674,14 +682,20 @@ internal sealed class ChangeFeedReader
 
         if (fileByName.Count > 0)
         {
-            string extras = string.Join(", ", fileByName.Keys.OrderBy(name => name, StringComparer.Ordinal));
+            // Message hygiene (#653): the surplus column names come from the cdc FILE's schema — for a foreign
+            // cdc file they are attacker-authored — so the message reports only the bounded COUNT, never the
+            // names. The trusted authority is the version's log-resident metadata (below), not this file.
             throw NewCdcSchemaMismatch(
-                path, version, $"it declares data column(s) [{extras}] absent from the version's metadata schema");
+                version,
+                $"it declares {fileByName.Count} data column(s) absent from the version's metadata schema");
         }
     }
 
-    private static DeltaReadException NewCdcSchemaMismatch(string path, long version, string detail) =>
-        new($"Change-data file '{path}' is inconsistent with version {version}'s schema: {detail}. DeltaSharp "
+    // Message hygiene (#653 / change-data-feed.md:344): the cdc file `path` is attacker-controllable on a
+    // hostile log (CDF §5.1, mirrors #516), so it is NOT rendered into the surfaced message; the version
+    // (a bounded int) and the caller's `detail` (scrubbed of file-derived tokens) are the only interpolations.
+    private static DeltaReadException NewCdcSchemaMismatch(long version, string detail) =>
+        new($"A change-data file is inconsistent with version {version}'s schema: {detail}. DeltaSharp "
             + "validates each cdc file's leaf schema against that version's log-resident metadata (the trusted "
             + "authority) before reading, and fails closed on a mismatch (design §3.2 CDF-EE-08).");
 
@@ -758,7 +772,7 @@ internal sealed class ChangeFeedReader
             // the implicit path's GetRowCountAsync site — every storage fault classifies straight through
             // ClassifyFileError (no narrow-schema-evolution branch). It runs BEFORE any yield, so a plain
             // try/catch is safe (no classify-across-a-yield concern).
-            throw ClassifyFileError(cdc.Path, ex);
+            throw ClassifyFileError(ex);
         }
 
         if (footerRowCount != changeTypes.Length)
@@ -766,7 +780,9 @@ internal sealed class ChangeFeedReader
             // Fail closed before the first yield on a count mismatch the probe can see (best-effort — closes the
             // window before this probe; see the scope note above). Same message shape as the post-loop too-few.
             throw new DeltaReadException(
-                $"Change-data file '{cdc.Path}' produced {footerRowCount} data row(s) but has "
+                // Message hygiene (#653/cdf:344): the attacker-controllable cdc `path` is dropped, not surfaced
+                // (see the group note above ReadChangeTypesAsync); only the bounded counts are named.
+                $"A change-data file produced {footerRowCount} data row(s) but has "
                 + $"{changeTypes.Length} '{ChangeDataWriter.ChangeTypeColumn}' value(s); the change-data file "
                 + "is inconsistent.");
         }
@@ -778,7 +794,7 @@ internal sealed class ChangeFeedReader
         }
         catch (DeltaStorageException ex)
         {
-            throw ClassifyFileError(cdc.Path, ex);
+            throw ClassifyFileError(ex);
         }
 
         // Pass 2 STREAMED: decode the data columns row-group by row-group, aligning each batch to its slice of
@@ -811,7 +827,7 @@ internal sealed class ChangeFeedReader
                     }
                     catch (DeltaStorageException ex)
                     {
-                        throw ClassifyFileError(cdc.Path, ex);
+                        throw ClassifyFileError(ex);
                     }
 
                     int rows = physical.RowCount;
@@ -821,7 +837,8 @@ internal sealed class ChangeFeedReader
                         // Defence-in-depth alongside the eager footer check: it also guards a mid-stream decode
                         // fault or a same-row-count TOCTOU that inflates a later row group past the total.
                         throw new DeltaReadException(
-                            $"Change-data file '{cdc.Path}' produced more data rows than "
+                            // Message hygiene (#653/cdf:344): the cdc `path` is dropped, not surfaced (group note).
+                            $"A change-data file produced more data rows than "
                             + $"'{ChangeDataWriter.ChangeTypeColumn}' values; the change-data file is inconsistent.");
                     }
 
@@ -846,13 +863,21 @@ internal sealed class ChangeFeedReader
             // mid-stream decode fault, or a TOCTOU the eager probe missed, that truncates the data pass below
             // the footer's declared total (full closure — fail-closed-before-first-batch — needs #658).
             throw new DeltaReadException(
-                $"Change-data file '{cdc.Path}' produced {offset} data row(s) but has {changeTypes.Length} "
+                // Message hygiene (#653/cdf:344): the cdc `path` is dropped, not surfaced (group note).
+                $"A change-data file produced {offset} data row(s) but has {changeTypes.Length} "
                 + $"'{ChangeDataWriter.ChangeTypeColumn}' value(s); the change-data file is inconsistent.");
         }
     }
 
     // Reads the `_change_type` column (by name; never column-mapped) fully, validating each value non-null and
     // within the closed change-type domain (§5.2 — a foreign/tampered writer cannot smuggle an unknown type).
+    //
+    // Message hygiene (#653/cdf:344): Storage cannot redact (SecretRedaction is Core-internal and UNREACHABLE
+    // from DeltaSharp.Storage), so the attacker-controllable cdc/change-feed file path is DROPPED, not surfaced,
+    // from every fail-closed fault message here (and in ReadExplicitFileAsync, ReadImplicitFileAsync, and
+    // ClassifyFileError). A hostile log controls the cdc `path` (§5.1, mirrors #516), so only the bounded,
+    // non-path context (the `_change_type` domain, counts, storage-error kind) is named; `path` stays purely an
+    // I/O argument (OpenReadAsync / ClassifyFileError) and, where one exists, the inner exception.
     private async Task<string[]> ReadChangeTypesAsync(string path, CancellationToken cancellationToken)
     {
         var values = new List<string>();
@@ -873,7 +898,7 @@ internal sealed class ChangeFeedReader
                         if (column.IsNull(r))
                         {
                             throw new DeltaReadException(
-                                $"Change-data file '{path}' has a null '{ChangeDataWriter.ChangeTypeColumn}' "
+                                $"A change-data file has a null '{ChangeDataWriter.ChangeTypeColumn}' "
                                 + "value; a cdc file's change-type column must be non-null.");
                         }
 
@@ -881,8 +906,12 @@ internal sealed class ChangeFeedReader
                         if (!ChangeDataWriter.ChangeTypeDomain.Contains(changeType))
                         {
                             throw new DeltaReadException(
-                                $"Change-data file '{path}' has an unrecognized "
-                                + $"'{ChangeDataWriter.ChangeTypeColumn}' value '{changeType}'; the legal values "
+                                // Message hygiene (#653): `changeType` is a raw DATA CELL value decoded from
+                                // the file (obs-conventions: row/cell values never reach an exception), so it
+                                // is NOT echoed; the cdc `path` is likewise dropped (see the group note above)
+                                // — only the bounded legal-values domain is named.
+                                $"A change-data file has an unrecognized "
+                                + $"'{ChangeDataWriter.ChangeTypeColumn}' value; the legal values "
                                 + "are insert / delete / update_preimage / update_postimage.");
                         }
 
@@ -895,10 +924,12 @@ internal sealed class ChangeFeedReader
         {
             // A cdc file's `_change_type` column is engine-written and REQUIRED; any storage fault (absent
             // column, corruption, or a vanished file) makes the change-data file unreadable → fail closed.
+            // Message hygiene (#653/cdf:344): the attacker-controllable path is dropped (see the group note
+            // above); only the storage-error kind is named.
             throw ex.Kind == StorageErrorKind.NotFound
-                ? ClassifyFileError(path, ex)
+                ? ClassifyFileError(ex)
                 : new DeltaReadException(
-                    $"Change-data file '{path}' could not be read for its "
+                    $"A change-data file could not be read for its "
                     + $"'{ChangeDataWriter.ChangeTypeColumn}' column ({ex.Kind}); the change-data file is "
                     + "unreadable.", ex);
         }
@@ -942,8 +973,10 @@ internal sealed class ChangeFeedReader
                 // remove has no stats (declaredPhysicalRecords is null), so the footer count is authoritative.
                 if (declaredPhysicalRecords is { } declared && declared != physicalRecords)
                 {
+                    // Message hygiene (#653/cdf:344): the attacker-controllable path is dropped, not surfaced
+                    // (see the group note above ReadChangeTypesAsync); only the bounded counts are named.
                     throw new DeltaReadException(
-                        $"Change-feed file '{path}' declares stats.numRecords={declared} but its Parquet file "
+                        $"A change-feed file declares stats.numRecords={declared} but its Parquet file "
                         + $"contains {physicalRecords} physical row(s); a deletion-vector-carrying file's "
                         + "numRecords must equal the physical row count, so the read fails closed.");
                 }
@@ -954,7 +987,7 @@ internal sealed class ChangeFeedReader
             }
             catch (DeltaStorageException ex)
             {
-                throw ClassifyFileError(path, ex);
+                throw ClassifyFileError(ex);
             }
         }
 
@@ -965,7 +998,7 @@ internal sealed class ChangeFeedReader
         }
         catch (DeltaStorageException ex)
         {
-            throw ClassifyFileError(path, ex);
+            throw ClassifyFileError(ex);
         }
 
         long fileRowOffset = 0;
@@ -996,7 +1029,7 @@ internal sealed class ChangeFeedReader
                     }
                     catch (DeltaStorageException ex)
                     {
-                        throw ClassifyFileError(path, ex);
+                        throw ClassifyFileError(ex);
                     }
 
                     ColumnBatch? output = BuildImplicitBatch(
@@ -1012,7 +1045,7 @@ internal sealed class ChangeFeedReader
 
         // The file's real physical row count must match the count the DV was validated against — a mismatch
         // means the file changed under the DV, so the positions can no longer be trusted. Fail closed.
-        mask?.EnsureConsumed(fileRowOffset, path);
+        mask?.EnsureConsumed(fileRowOffset);
     }
 
     // Assembles one implicit output batch: relabel + hydrate partition columns, stamp a CONSTANT change type
@@ -1125,12 +1158,20 @@ internal sealed class ChangeFeedReader
     private static bool IsNarrowSchemaEvolutionInput(DeltaStorageException ex) =>
         ex.Kind == StorageErrorKind.ColumnNotPresentInFile;
 
-    private static DeltaReadException ClassifyFileError(string path, DeltaStorageException ex) =>
+    // Message hygiene (#653/cdf:344): Storage cannot redact (SecretRedaction is Core-internal), so the
+    // attacker-controllable cdc/change-feed file path is DROPPED, not surfaced. The NotFound branch renders a
+    // fixed message; the non-NotFound branch must NOT forward `ex.Message` — a PathNotConfined fault (and
+    // others) names the rejected path in its message, so passing it through would re-surface the attacker cdc
+    // path. Instead it names only the bounded storage-error KIND (a closed enum); the inner exception still
+    // carries the full fault for server-side diagnostics (its ToString()/log exposure is tracked in #664).
+    private static DeltaReadException ClassifyFileError(DeltaStorageException ex) =>
         ex.Kind == StorageErrorKind.NotFound
             ? new DeltaReadException(
-                $"Change-feed file '{path}' is no longer available (vacuumed, or past the data-retention "
+                "A change-feed file is no longer available (vacuumed, or past the data-retention "
                 + "window); the requested change-feed range is outside the CDF-readable window.", ex)
-            : new DeltaReadException(ex.Message, ex);
+            : new DeltaReadException(
+                $"A change-feed file could not be read (storage fault: {ex.Kind}); the requested "
+                + "change-feed range failed closed.", ex);
 
     // The resolved read context, built once from the end snapshot: the reconciled output schema (data + 3
     // metadata), the end-version logical data schema (data + partition, for relabeling), the physical data

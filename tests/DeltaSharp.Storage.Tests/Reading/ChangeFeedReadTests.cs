@@ -121,6 +121,25 @@ public sealed class ChangeFeedReadTests : IDisposable
         new StructField(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: false),
     });
 
+    // A cdc-file leaf schema carrying a SURPLUS data column named an attacker sentinel that is ABSENT from the
+    // flat metadata schema A (id, name) — drives the EE-08 "extras" branch (#653 site 1). `id`/`name` match A so
+    // ONLY the surplus column is inconsistent, and its file-derived NAME must never reach the surfaced message.
+    private const string SurplusSentinelColumn = "z_att4cker_surplus_col_s3ntinel";
+
+    // A sentinel embedded in the cdc FILE PATH (via the DELETE's cdc-file-name factory) — the `path` param
+    // NewCdcSchemaMismatch dropped (#653 site 1a). A foreign/hostile cdc file's path is attacker-controllable
+    // (CDF §5.1), so an EE-08 mismatch must never echo it. Distinct from the surplus COLUMN sentinel so the
+    // no-echo assertion targets the PATH scrub specifically.
+    private const string CdcPathSentinel = "att4cker_cdc_path_s3ntinel";
+
+    private static readonly StructType CdcSurplusColumnSchema = new(new[]
+    {
+        new StructField("id", DataTypes.LongType, nullable: false),
+        new StructField("name", DataTypes.StringType, nullable: true),
+        new StructField(SurplusSentinelColumn, DataTypes.LongType, nullable: true),
+        new StructField(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: false),
+    });
+
     public void Dispose()
     {
         try
@@ -1032,8 +1051,8 @@ public sealed class ChangeFeedReadTests : IDisposable
         // MoveNextAsync, BEFORE any batch is yielded.
         await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0 create, v1 enable CDF
         var backend = new LocalFileSystemBackend(_root);
-        await NewCdfDelete(backend, "toctou").DeleteAsync(WhereId(id => id == 1));   // v2 cdc delete (explicit path)
-        Assert.Single(CdcFilePaths());
+        await NewCdfDelete(backend, CdcPathSentinel).DeleteAsync(WhereId(id => id == 1));   // v2 cdc at sentinel path
+        Assert.Contains(CdcPathSentinel, Assert.Single(CdcFilePaths()), StringComparison.Ordinal);   // sentinel IS in path
 
         // File A: 3 rows / 3 valid `_change_type` values — the `_change_type` pass reads N = 3.
         byte[] fileA = await ParquetTestHelpers.WriteToBytesAsync(
@@ -1076,6 +1095,7 @@ public sealed class ChangeFeedReadTests : IDisposable
                 async () => await enumerator.MoveNextAsync());
             Assert.Contains("produced 2 data row(s) but has 3", ex.Message, StringComparison.Ordinal);
             Assert.Contains("inconsistent", ex.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(CdcPathSentinel, ex.Message, StringComparison.Ordinal);   // #653 site 1b: no cdc-path leak
             // The eager COUNT check throws a bare DeltaReadException (no wrapped I/O fault) — distinct from the
             // torn/corrupt-body CorruptData case whose InnerException is a DeltaStorageException.
             Assert.Null(ex.InnerException);
@@ -1347,8 +1367,335 @@ public sealed class ChangeFeedReadTests : IDisposable
         DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
             async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 3)));
         Assert.Null(ex.InnerException);   // a pure per-version schema-validation failure, not a wrapped I/O fault
-        Assert.Contains("extra", ex.Message, StringComparison.Ordinal);      // names the offending end-only column
+        // Message hygiene (#653): the offending column is a cdc-FILE-derived name (attacker-authored on a
+        // foreign cdc file), so it is NOT echoed — the fixed message reports the bounded absent-column COUNT.
+        Assert.DoesNotContain("extra", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("absent from the version's metadata schema", ex.Message, StringComparison.Ordinal);
         Assert.Contains("CDF-EE-08", ex.Message, StringComparison.Ordinal);  // the per-version cdc schema check
+    }
+
+    [Fact]
+    public async Task Explicit_CdcUnrecognizedChangeType_FailsClosedWithoutEchoingCellValue()
+    {
+        // Message hygiene (#653 site 2 / obs-conventions row-values): the `_change_type` cell is a raw DATA
+        // VALUE decoded from the cdc file (attacker-authored on a foreign cdc file), so an unrecognized token
+        // must fail closed WITHOUT echoing the value — only the bounded legal-value domain is named. In the same
+        // message the attacker-controllable cdc PATH (§5.1, mirrors #516) is likewise DROPPED (Storage cannot
+        // redact — SecretRedaction is Core-internal), so this also asserts the PATH sentinel is absent (a revert
+        // of the path-drop re-interpolates `'{path}'` and turns this RED). The cdc leaf schema matches v2's
+        // metadata (EE-08 passes) so the read reaches the `_change_type` domain check with the crafted value,
+        // and the DELETE lives at a sentinel cdc path.
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0, v1 (schema A = id, name)
+        var backend = new LocalFileSystemBackend(_root);
+        await NewCdfDelete(backend, CdcPathSentinel).DeleteAsync(WhereId(id => id == 1));   // v2 cdc at sentinel path
+        string cdc = Assert.Single(CdcFilePaths());
+        Assert.Contains(CdcPathSentinel, cdc, StringComparison.Ordinal);   // precondition: the sentinel IS in the path
+        const string sentinel = "att4cker_ch4ngeType_s3ntinel";
+        byte[] crafted = await ParquetTestHelpers.WriteToBytesAsync(
+            CdcFlatBodySchema, new[] { CdcFlatBodyBatch((1L, "a", sentinel)) });
+        await File.WriteAllBytesAsync(Path.Combine(_root, cdc), crafted);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
+        Assert.DoesNotContain(sentinel, ex.Message, StringComparison.Ordinal);   // the cell value is never surfaced
+        Assert.DoesNotContain(CdcPathSentinel, ex.Message, StringComparison.Ordinal);   // #653 site 2: no cdc-path leak
+        Assert.Contains("unrecognized", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("legal values", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Explicit_CdcSurplusDataColumn_FailsClosedWithoutEchoingFileColumnName()
+    {
+        // Message hygiene (#653): a surplus cdc data column (absent from the version's trusted metadata) carries
+        // a FILE-derived NAME — attacker-authored on a foreign cdc file — so the EE-08 extras failure must NOT
+        // echo it; the fixed message reports only the bounded absent-column COUNT. A crafted sentinel column name
+        // proves no-echo. (`id`/`name` match v2's schema A so ONLY the surplus column is inconsistent.)
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0, v1 (schema A = id, name)
+        var backend = new LocalFileSystemBackend(_root);
+        await NewCdfDelete(backend, "surplus-noecho").DeleteAsync(WhereId(id => id == 1));   // v2 cdc(A) delete
+        string cdc = Assert.Single(CdcFilePaths());
+        byte[] surplus = await ParquetTestHelpers.WriteToBytesAsync(
+            CdcSurplusColumnSchema, new[] { CdcSurplusColumnBatch() });
+        await File.WriteAllBytesAsync(Path.Combine(_root, cdc), surplus);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
+        Assert.DoesNotContain(SurplusSentinelColumn, ex.Message, StringComparison.Ordinal);   // no file-name leak
+        Assert.Contains("absent from the version's metadata schema", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("CDF-EE-08", ex.Message, StringComparison.Ordinal);
+        Assert.Null(ex.InnerException);   // a pure per-version schema-validation failure, not a wrapped I/O fault
+    }
+
+    [Fact]
+    public async Task Explicit_CdcSchemaMismatch_FailsClosedWithoutEchoingCdcFilePath()
+    {
+        // Message hygiene (#653 site 1a): NewCdcSchemaMismatch dropped the cdc file `path` param entirely — a
+        // foreign/hostile cdc file's PATH is attacker-controllable (CDF §5.1, mirrors #516), so an EE-08 schema
+        // mismatch must NOT echo it. Author a DELETE whose cdc file lives at a path carrying a sentinel token
+        // (the cdc-file-name factory feeds `_change_data/cdc-<token>.parquet` UNSANITIZED), then overwrite that
+        // cdc file with a surplus-column body to trip EE-08. The surfaced message must never contain the path
+        // sentinel. (The trigger reuses the surplus fixture, whose own COLUMN sentinel is distinct — this test
+        // asserts only the PATH sentinel's absence, isolating the dropped `path` param.)
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0, v1 (schema A = id, name)
+        var backend = new LocalFileSystemBackend(_root);
+        await NewCdfDelete(backend, CdcPathSentinel).DeleteAsync(WhereId(id => id == 1));   // v2 cdc at sentinel path
+        string cdc = Assert.Single(CdcFilePaths());
+        Assert.Contains(CdcPathSentinel, cdc, StringComparison.Ordinal);   // precondition: the sentinel IS in the path
+        byte[] surplus = await ParquetTestHelpers.WriteToBytesAsync(
+            CdcSurplusColumnSchema, new[] { CdcSurplusColumnBatch() });
+        await File.WriteAllBytesAsync(Path.Combine(_root, cdc), surplus);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
+        Assert.DoesNotContain(CdcPathSentinel, ex.Message, StringComparison.Ordinal);   // no cdc-file-path leak
+        Assert.Contains("CDF-EE-08", ex.Message, StringComparison.Ordinal);
+        Assert.Null(ex.InnerException);   // a pure per-version schema-validation failure, not a wrapped I/O fault
+    }
+
+    [Fact]
+    public async Task Explicit_CdcNullChangeType_FailsClosedWithoutEchoingCdcFilePath()
+    {
+        // Message hygiene (#653/cdf:344, site 1c): a foreign/tampered cdc file whose `_change_type` column is
+        // physically NULL in a row fails closed, but the surfaced message must NOT echo the attacker-controllable
+        // cdc PATH (§5.1, mirrors #516) — Storage cannot redact (SecretRedaction is Core-internal), so the path
+        // is DROPPED. Author a DELETE at a sentinel cdc path, then overwrite it with a body carrying one null
+        // `_change_type` (authored `nullable: true` so the writer emits an OPTIONAL column; because Parquet models
+        // strings as nullable, the non-null-requested `_change_type` read still surfaces the null → the null
+        // check fires — never a schema-mismatch). `id`/`name` match v2's schema A so EE-08 passes first.
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0, v1 (schema A = id, name)
+        var backend = new LocalFileSystemBackend(_root);
+        await NewCdfDelete(backend, CdcPathSentinel).DeleteAsync(WhereId(id => id == 1));   // v2 cdc at sentinel path
+        string cdc = Assert.Single(CdcFilePaths());
+        Assert.Contains(CdcPathSentinel, cdc, StringComparison.Ordinal);   // precondition: the sentinel IS in the path
+
+        var nullChangeTypeSchema = new StructType(new[]
+        {
+            new StructField("id", DataTypes.LongType, nullable: false),
+            new StructField("name", DataTypes.StringType, nullable: true),
+            new StructField(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: true),
+        });
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, 1);
+        MutableColumnVector name = ColumnVectors.Create(DataTypes.StringType, 1);
+        MutableColumnVector changeType = ColumnVectors.Create(DataTypes.StringType, 1);
+        id.AppendValue(1L);
+        name.AppendBytes(Encoding.UTF8.GetBytes("a"));
+        changeType.AppendNull();   // the physically-null `_change_type` a hostile writer could smuggle
+        var body = new ManagedColumnBatch(nullChangeTypeSchema, new ColumnVector[] { id, name, changeType }, 1);
+        byte[] crafted = await ParquetTestHelpers.WriteToBytesAsync(nullChangeTypeSchema, new[] { body });
+        await File.WriteAllBytesAsync(Path.Combine(_root, cdc), crafted);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
+        Assert.DoesNotContain(CdcPathSentinel, ex.Message, StringComparison.Ordinal);   // no cdc-file-path leak
+        Assert.Contains("null", ex.Message, StringComparison.Ordinal);
+        Assert.Contains(ChangeDataWriter.ChangeTypeColumn, ex.Message, StringComparison.Ordinal);   // bounded context kept
+    }
+
+    [Fact]
+    public async Task Explicit_UnreadableCdcChangeTypeColumn_FailsClosedWithoutEchoingCdcFilePath()
+    {
+        // Message hygiene (#653/cdf:344, site 3): when the `_change_type` column itself is unreadable (a corrupt
+        // column chunk), the read fails closed WITHOUT echoing the attacker-controllable cdc PATH — only the
+        // bounded storage-error kind is named. Author a DELETE at a sentinel cdc path, then poison ONLY the
+        // `_change_type` column chunk (columnIndex 2) — the footer/schema stay intact so EE-08 passes, and the
+        // `_change_type` pass (which reads that column FIRST, before the data pass) faults as CorruptData.
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0, v1 (schema A = id, name)
+        var backend = new LocalFileSystemBackend(_root);
+        await NewCdfDelete(backend, CdcPathSentinel).DeleteAsync(WhereId(id => id == 1));   // v2 cdc at sentinel path
+        string cdc = Assert.Single(CdcFilePaths());
+        Assert.Contains(CdcPathSentinel, cdc, StringComparison.Ordinal);
+
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(
+            CdcFlatBodySchema, new[] { CdcFlatBodyBatch((10, "a", ChangeDataWriter.DeleteChange)) });
+        byte[] poisoned = await ParquetTestHelpers.PoisonColumnChunkAsync(file, rowGroup: 0, columnIndex: 2);
+        await File.WriteAllBytesAsync(Path.Combine(_root, cdc), poisoned);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
+        Assert.DoesNotContain(CdcPathSentinel, ex.Message, StringComparison.Ordinal);   // no cdc-file-path leak
+        Assert.Contains("could not be read", ex.Message, StringComparison.Ordinal);
+        DeltaStorageException inner = Assert.IsType<DeltaStorageException>(ex.InnerException);
+        Assert.Equal(StorageErrorKind.CorruptData, inner.Kind);   // the cause stays on the inner exception
+    }
+
+    [Fact]
+    public async Task Explicit_VacuumedCdcFile_FailsClosedWithoutEchoingCdcFilePath()
+    {
+        // Message hygiene (#653/cdf:344, site 5): a cdc file VACUUMed away between resolve (log-only) and read
+        // makes the range unreadable (NotFound → ClassifyFileError), but the surfaced message must NOT echo the
+        // attacker-controllable cdc PATH — the `path` param was dropped from ClassifyFileError entirely. Author a
+        // DELETE at a sentinel cdc path, then delete the cdc file; resolution still succeeds (it reads the log's
+        // `cdc` action), and the read's OpenReadAsync fails closed as NotFound.
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0, v1
+        var backend = new LocalFileSystemBackend(_root);
+        await NewCdfDelete(backend, CdcPathSentinel).DeleteAsync(WhereId(id => id == 1));   // v2 cdc at sentinel path
+        string cdc = Assert.Single(CdcFilePaths());
+        Assert.Contains(CdcPathSentinel, cdc, StringComparison.Ordinal);
+        File.Delete(Path.Combine(_root, cdc));   // vacuum the cdc file the explicit read must open
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
+        Assert.DoesNotContain(CdcPathSentinel, ex.Message, StringComparison.Ordinal);   // no cdc-file-path leak
+        Assert.Contains("no longer available", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Explicit_PathConfinementViolatingCdcFile_FailsClosedWithoutEchoingCdcFilePath()
+    {
+        // Message hygiene (#653/cdf:344): a NON-NotFound storage fault (here a hostile cdc path that ESCAPES the
+        // table root → PathNotConfined) must NOT re-surface the attacker path either. PathNotConfined names the
+        // rejected path in its own ex.Message, so ClassifyFileError's non-NotFound branch must NOT forward
+        // ex.Message — it names only the bounded storage-error KIND, keeping the cause on the inner exception.
+        // Author a DELETE (cdc at a normal path), then rewrite its committed `cdc.path` to a root-escaping
+        // sentinel; the explicit read's OpenReadAsync fails closed as PathNotConfined at that path.
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0, v1
+        var backend = new LocalFileSystemBackend(_root);
+        await NewCdfDelete(backend, "innocuous-cdc").DeleteAsync(WhereId(id => id == 1));   // v2 cdc
+        string cdc = Assert.Single(CdcFilePaths());
+
+        const string escapingSentinel = "../att4cker_cdc_confine_s3ntinel.parquet";   // escapes the table root
+        string commit = CommitPath(2);
+        string rewritten = (await File.ReadAllTextAsync(commit)).Replace(cdc, escapingSentinel, StringComparison.Ordinal);
+        Assert.Contains(escapingSentinel, rewritten, StringComparison.Ordinal);   // the rewrite landed
+        await File.WriteAllTextAsync(commit, rewritten);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
+        Assert.DoesNotContain("att4cker_cdc_confine_s3ntinel", ex.Message, StringComparison.Ordinal);   // no path leak
+        Assert.Contains("could not be read", ex.Message, StringComparison.Ordinal);   // bounded, path-free
+        DeltaStorageException inner = Assert.IsType<DeltaStorageException>(ex.InnerException);
+        Assert.Equal(StorageErrorKind.PathNotConfined, inner.Kind);   // the cause (with the path) stays on the inner
+    }
+
+    [Fact]
+    public async Task Implicit_CdfAddStatsNumRecordsMismatch_FailsClosedWithoutEchoingDataFilePath()
+    {
+        // Message hygiene (#653/cdf:344, site 4): a DV-carrying add whose stats.numRecords disagrees with its
+        // Parquet file's physical row count fails closed on the IMPLICIT path (before the DV is even loaded), but
+        // the surfaced message must NOT echo the attacker-controllable data-file PATH — only the bounded counts
+        // are named. Hand-author a foreign add (a non-DeltaSharp writer's shape) at a sentinel path with an inline
+        // DV and a forged stats.numRecords=999 over a 2-row file; the CDF insert derivation cross-checks declared
+        // (999) vs physical (2) and fails closed. The inline DV need only PARSE (the stats check precedes its load).
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0, v1
+        var backend = new LocalFileSystemBackend(_root);
+        Snapshot snapshot = await new DeltaLog(backend).LoadSnapshotAsync();
+        AddFileAction existing = Assert.Single(snapshot.ActiveFiles);   // reuse its empty PartitionValues/Tags
+
+        const string sentinel = "att4cker_cdf_datafile_s3ntinel";
+        string dataPath = "cdf-stats-" + sentinel + ".parquet";
+        byte[] fileBody = await ParquetTestHelpers.WriteToBytesAsync(
+            FlatSchema, new[] { Batch((100, "x"), (200, "y")) });   // 2 physical rows
+        Assert.True(await backend.PutIfAbsentAsync(dataPath, fileBody, CancellationToken.None));
+
+        byte[] rawBitmap = RoaringBitmapArray.Serialize(new long[] { 0 });   // a parseable inline DV (masks pos 0)
+        DeletionVectorDescriptor inline = DeletionVectorDescriptor.ForInline(rawBitmap, cardinality: 1);
+        var foreignAdd = new AddFileAction(
+            dataPath, existing.PartitionValues, fileBody.Length, ModificationTime: 1, DataChange: true,
+            FileStatistics.Empty with { NumRecords = 999 }, existing.Tags, inline);   // forged 999 != physical 2
+
+        await new DeltaCommitter(backend).CommitAsync(
+            snapshot, new DeltaAction[] { foreignAdd }, DeltaReadScope.BlindAppend);   // v2
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
+        Assert.DoesNotContain(sentinel, ex.Message, StringComparison.Ordinal);   // no data-file-path leak
+        Assert.Contains("stats.numRecords=999", ex.Message, StringComparison.Ordinal);   // bounded declared count
+        Assert.Contains("physical row", ex.Message, StringComparison.Ordinal);           // bounded physical count
+    }
+
+    [Fact]
+    public async Task Explicit_CdcDataPassTooManyRows_FailsClosedWithoutEchoingCdcFilePath()
+    {
+        // Message hygiene (#653/cdf:344, site 1d) + defence-in-depth (#644): the data-pass "too many rows" guard
+        // fires only via a TOCTOU where the data pass reads a LONGER file than the `_change_type`/footer passes (a
+        // single well-formed file's counts always agree). Serve fileA (3 rows) for EE-08, the `_change_type` pass,
+        // AND the footer probe (footer 3 == change-types 3 passes), then fileB (4 rows) for the data pass: its
+        // first batch trips offset+4 > 3 BEFORE any yield. The surfaced message must NOT echo the cdc PATH.
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0, v1
+        var backend = new LocalFileSystemBackend(_root);
+        await NewCdfDelete(backend, CdcPathSentinel).DeleteAsync(WhereId(id => id == 1));   // v2 cdc at sentinel path
+        Assert.Contains(CdcPathSentinel, Assert.Single(CdcFilePaths()), StringComparison.Ordinal);
+
+        byte[] fileA = await ParquetTestHelpers.WriteToBytesAsync(
+            CdcFlatBodySchema,
+            new[]
+            {
+                CdcFlatBodyBatch(
+                    (10, "a", ChangeDataWriter.DeleteChange),
+                    (11, "b", ChangeDataWriter.DeleteChange),
+                    (12, "c", ChangeDataWriter.DeleteChange)),
+            });
+        byte[] fileB = await ParquetTestHelpers.WriteToBytesAsync(
+            CdcFlatBodySchema,
+            new[]
+            {
+                CdcFlatBodyBatch(
+                    (10, "a", ChangeDataWriter.DeleteChange),
+                    (11, "b", ChangeDataWriter.DeleteChange),
+                    (12, "c", ChangeDataWriter.DeleteChange),
+                    (13, "d", ChangeDataWriter.DeleteChange)),
+            });
+        // Serve A for the first 3 cdc opens (EE-08, `_change_type`, footer probe), B for the data pass (open 4).
+        var toctou = new CountMismatchCdcBackend(backend, fileA, fileB, serveAForFirstOpens: 3);
+        var reader = new ChangeFeedReader(toctou, backend.TableRootId, new DeltaLog(backend), new ParquetFileReader());
+        DeltaChangeFeedInfo info = await reader.ResolveAsync(
+            DeltaChangeFeedRange.FromVersion(2, 2), CancellationToken.None);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(async () =>
+        {
+            await foreach (ColumnBatch _ in reader.ReadAsync(info, CancellationToken.None))
+            {
+            }
+        });
+        Assert.DoesNotContain(CdcPathSentinel, ex.Message, StringComparison.Ordinal);   // no cdc-file-path leak
+        Assert.Contains("produced more data rows than", ex.Message, StringComparison.Ordinal);   // bounded context kept
+        Assert.Equal(new[] { "A", "A", "A", "B" }, toctou.ServedCdcOpens.ToArray());   // footer probe passed; data pass = B
+    }
+
+    [Fact]
+    public async Task Explicit_CdcDataPassTooFewRows_FailsClosedWithoutEchoingCdcFilePath()
+    {
+        // Message hygiene (#653/cdf:344, site 1e) + defence-in-depth (#644): the POST-LOOP "too few rows" guard
+        // fires only via a TOCTOU where the data pass reads a SHORTER file than the `_change_type`/footer passes.
+        // Serve fileA (3 rows) for EE-08, the `_change_type` pass, AND the footer probe (footer 3 == change-types
+        // 3 passes), then fileB (2 rows) for the data pass: it streams a 2-row batch, then the post-loop offset(2)
+        // != 3 fails closed. The surfaced message must NOT echo the cdc PATH.
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0, v1
+        var backend = new LocalFileSystemBackend(_root);
+        await NewCdfDelete(backend, CdcPathSentinel).DeleteAsync(WhereId(id => id == 1));   // v2 cdc at sentinel path
+        Assert.Contains(CdcPathSentinel, Assert.Single(CdcFilePaths()), StringComparison.Ordinal);
+
+        byte[] fileA = await ParquetTestHelpers.WriteToBytesAsync(
+            CdcFlatBodySchema,
+            new[]
+            {
+                CdcFlatBodyBatch(
+                    (10, "a", ChangeDataWriter.DeleteChange),
+                    (11, "b", ChangeDataWriter.DeleteChange),
+                    (12, "c", ChangeDataWriter.DeleteChange)),
+            });
+        byte[] fileB = await ParquetTestHelpers.WriteToBytesAsync(
+            CdcFlatBodySchema,
+            new[]
+            {
+                CdcFlatBodyBatch(
+                    (10, "a", ChangeDataWriter.DeleteChange),
+                    (11, "b", ChangeDataWriter.DeleteChange)),
+            });
+        var toctou = new CountMismatchCdcBackend(backend, fileA, fileB, serveAForFirstOpens: 3);
+        var reader = new ChangeFeedReader(toctou, backend.TableRootId, new DeltaLog(backend), new ParquetFileReader());
+        DeltaChangeFeedInfo info = await reader.ResolveAsync(
+            DeltaChangeFeedRange.FromVersion(2, 2), CancellationToken.None);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(async () =>
+        {
+            await foreach (ColumnBatch _ in reader.ReadAsync(info, CancellationToken.None))
+            {
+            }
+        });
+        Assert.DoesNotContain(CdcPathSentinel, ex.Message, StringComparison.Ordinal);   // no cdc-file-path leak
+        Assert.Contains("produced 2 data row(s) but has 3", ex.Message, StringComparison.Ordinal);   // bounded context kept
+        Assert.Equal(new[] { "A", "A", "A", "B" }, toctou.ServedCdcOpens.ToArray());   // footer probe passed; data pass = B
     }
 
     [Fact]
@@ -2149,6 +2496,22 @@ public sealed class ChangeFeedReadTests : IDisposable
 
         return new ManagedColumnBatch(
             CdcMatchesEndSchema, new ColumnVector[] { id, name, extra, changeType }, rows.Length);
+    }
+
+    // Builds a one-row cdc file body for CdcSurplusColumnSchema: id/name match schema A plus a surplus column
+    // (named the attacker sentinel) absent from A — the EE-08 extras discriminator (#653 site 1).
+    private static ColumnBatch CdcSurplusColumnBatch()
+    {
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, 1);
+        MutableColumnVector name = ColumnVectors.Create(DataTypes.StringType, 1);
+        MutableColumnVector surplus = ColumnVectors.Create(DataTypes.LongType, 1);
+        MutableColumnVector changeType = ColumnVectors.Create(DataTypes.StringType, 1);
+        id.AppendValue(1L);
+        name.AppendBytes(Encoding.UTF8.GetBytes("a"));
+        surplus.AppendValue(99L);
+        changeType.AppendBytes(Encoding.UTF8.GetBytes(ChangeDataWriter.DeleteChange));
+        return new ManagedColumnBatch(
+            CdcSurplusColumnSchema, new ColumnVector[] { id, name, surplus, changeType }, 1);
     }
 
     // Builds a FlatSchema cdc file body (id, name, `_change_type`) — the physical layout ChangeDataWriter emits

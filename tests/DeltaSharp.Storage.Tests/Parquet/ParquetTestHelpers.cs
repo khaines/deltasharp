@@ -26,6 +26,25 @@ internal static class ParquetTestHelpers
         return stream.ToArray();
     }
 
+    /// <summary>Writes a single-column Parquet file whose one column is a physical <see cref="TimeSpan"/>
+    /// named <paramref name="columnName"/>. TimeSpan has NO DeltaSharp type mapping, so reading this file's
+    /// footer (<c>ParquetFileReader.ReadDataSchemaAsync</c> → <c>ParquetTypeMapping.ToDataType</c>) fails
+    /// closed with <c>UnsupportedFeature</c> — used to prove that fail-closed message never echoes the
+    /// file-derived column name (#653). Authored with Parquet.Net's serializer directly because DeltaSharp's
+    /// writer, by construction, cannot emit an unmapped physical type.</summary>
+    public static async Task<byte[]> WriteUnmappedTimeSpanColumnAsync(string columnName)
+    {
+        var schema = new global::Parquet.Schema.ParquetSchema(
+            new global::Parquet.Schema.DataField<TimeSpan>(columnName));
+        var rows = new List<IDictionary<string, object?>>
+        {
+            new Dictionary<string, object?> { [columnName] = TimeSpan.FromSeconds(1) },
+        };
+        using var stream = new MemoryStream();
+        await global::Parquet.Serialization.ParquetSerializer.SerializeUntypedAsync(rows, schema, stream);
+        return stream.ToArray();
+    }
+
     /// <summary>Authors an int→int map Parquet file at the LOW level, writing the key and value leaves with
     /// caller-supplied repetition levels — the only way to forge a map whose value repetition stream diverges
     /// from the key's (same total entry count, different per-row distribution), which the typed
@@ -196,6 +215,19 @@ internal static class ParquetTestHelpers
         return forged.ToArray();
     }
 
+    /// <summary>Reads the declared <c>NumRows</c> of row group <paramref name="rowGroup"/> from the footer —
+    /// so a test can forge a value RELATIVE to the file's real row count (e.g. <c>actual + 1</c>) without
+    /// hard-coding a fixture-dependent number.</summary>
+    public static async Task<long> RowGroupNumRowsAsync(byte[] bytes, int rowGroup)
+    {
+        using var stream = new MemoryStream(bytes, writable: false);
+        ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+        await using (reader.ConfigureAwait(false))
+        {
+            return reader.Metadata!.RowGroups[rowGroup].NumRows;
+        }
+    }
+
     /// <summary>Rewrites the footer so that (<paramref name="rowGroup"/>, <paramref name="columnIndex"/>)'s
     /// column-chunk <c>Statistics</c> carry a deliberately TOO-SHORT <c>MaxValue</c> blob (fewer bytes than the
     /// column's fixed-width physical type needs — e.g. 3 bytes for an INT64 that needs 8). The footer still
@@ -255,6 +287,46 @@ internal static class ParquetTestHelpers
                     metadata.Schema.FirstOrDefault(e => e.Name == targetFieldName)
                     ?? throw new InvalidOperationException($"no footer schema element named '{targetFieldName}'");
                 element.Name = forgedName;
+                newFooter = SerializeFooter(metadata);
+            }
+        }
+
+        int originalFooterLength = BitConverter.ToInt32(bytes, bytes.Length - 8);
+        int footerStart = bytes.Length - 8 - originalFooterLength;
+        using var forged = new MemoryStream();
+        forged.Write(bytes, 0, footerStart);
+        forged.Write(newFooter, 0, newFooter.Length);
+        forged.Write(BitConverter.GetBytes(newFooter.Length), 0, 4);
+        forged.Write("PAR1"u8);
+        return forged.ToArray();
+    }
+
+    /// <summary>Rewrites the footer so the schema element for (<paramref name="rowGroup"/>,
+    /// <paramref name="columnIndex"/>) — an ordinary physical INT32 column — is annotated as a logical DATE
+    /// (BOTH the legacy <c>ConvertedType.DATE</c> and the modern <c>LogicalType.DATE</c>, since Parquet.Net
+    /// 6.0.3 keys on either). The physical pages are untouched, so a raw INT32 value the writer emitted (e.g.
+    /// <c>int.MaxValue</c> days) now decodes through Parquet.Net's INT32-DATE → <see cref="DateTime"/> path
+    /// (<c>epoch.AddDays</c>), whose <see cref="ArgumentOutOfRangeException"/> for an out-of-representable-range
+    /// day drives <c>ReadValueAsync</c>'s date/time-range fail-closed catch (#653: the surfaced CorruptData
+    /// message must NOT echo the file-derived physical column name). The file OPENS cleanly (a valid DATE
+    /// annotation). Mirrors <see cref="ForgeFieldNameAsync"/>, mutating only the named schema element's
+    /// logical-type annotation.</summary>
+    public static async Task<byte[]> ForgeColumnConvertedTypeToDateAsync(byte[] bytes, int rowGroup, int columnIndex)
+    {
+        byte[] newFooter;
+        using (var stream = new MemoryStream(bytes, writable: false))
+        {
+            ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                global::Parquet.Meta.FileMetaData metadata = reader.Metadata!;
+                global::Parquet.Meta.ColumnChunk chunk = metadata.RowGroups[rowGroup].Columns[columnIndex];
+                string leafName = chunk.MetaData!.PathInSchema[^1];
+                global::Parquet.Meta.SchemaElement element =
+                    metadata.Schema.FirstOrDefault(e => e.Name == leafName)
+                    ?? throw new InvalidOperationException($"no footer schema element named '{leafName}'");
+                element.ConvertedType = global::Parquet.Meta.ConvertedType.DATE;
+                element.LogicalType = new global::Parquet.Meta.LogicalType { DATE = new global::Parquet.Meta.DateType() };
                 newFooter = SerializeFooter(metadata);
             }
         }
@@ -347,6 +419,55 @@ internal static class ParquetTestHelpers
                 global::Parquet.Meta.FileMetaData metadata = reader.Metadata!;
                 metadata.RowGroups[rowGroup].Columns[columnIndex].MetaData!.Codec =
                     (global::Parquet.Meta.CompressionCodec)forgedCodec;
+                newFooter = SerializeFooter(metadata);
+            }
+        }
+
+        int originalFooterLength = BitConverter.ToInt32(bytes, bytes.Length - 8);
+        int footerStart = bytes.Length - 8 - originalFooterLength;
+        using var forged = new MemoryStream();
+        forged.Write(bytes, 0, footerStart);
+        forged.Write(newFooter, 0, newFooter.Length);
+        forged.Write(BitConverter.GetBytes(newFooter.Length), 0, 4);
+        forged.Write("PAR1"u8);
+        return forged.ToArray();
+    }
+
+    /// <summary>Renames a footer LEAF column CONSISTENTLY — both its schema element name AND every column
+    /// chunk's <c>PathInSchema</c> tail — so the file stays self-consistent and the reader can still LOCATE
+    /// and DECODE the column (unlike <see cref="ForgeFieldNameAsync"/>, which renames only the schema element,
+    /// desyncing it from the chunk path and breaking column lookup). Used to author a checkpoint whose map
+    /// key / list element LEAF carries an attacker sentinel name that surfaces in the resolved
+    /// <c>DataField.Path</c> — proving the checkpoint reconstruction fail-closed messages never echo that
+    /// file-derived leaf path (#653). Mirrors <see cref="ForgeFieldNameAsync"/>.</summary>
+    public static async Task<byte[]> ForgeLeafColumnNameAsync(byte[] bytes, string targetLeafName, string forgedName)
+    {
+        byte[] newFooter;
+        using (var stream = new MemoryStream(bytes, writable: false))
+        {
+            ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                global::Parquet.Meta.FileMetaData metadata = reader.Metadata!;
+                global::Parquet.Meta.SchemaElement element =
+                    metadata.Schema.FirstOrDefault(e => e.Name == targetLeafName)
+                    ?? throw new InvalidOperationException($"no footer schema element named '{targetLeafName}'");
+                element.Name = forgedName;
+                foreach (global::Parquet.Meta.RowGroup rowGroup in metadata.RowGroups)
+                {
+                    foreach (global::Parquet.Meta.ColumnChunk chunk in rowGroup.Columns)
+                    {
+                        List<string> path = chunk.MetaData!.PathInSchema;
+                        for (int i = 0; i < path.Count; i++)
+                        {
+                            if (string.Equals(path[i], targetLeafName, StringComparison.Ordinal))
+                            {
+                                path[i] = forgedName;
+                            }
+                        }
+                    }
+                }
+
                 newFooter = SerializeFooter(metadata);
             }
         }

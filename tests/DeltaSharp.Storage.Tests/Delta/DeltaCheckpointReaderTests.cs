@@ -304,7 +304,7 @@ public sealed class DeltaCheckpointReaderTests
         // A tiny compressed chunk that declares an enormous value count would eagerly allocate huge
         // value/level arrays: its footprint must exceed the per-row-group decode ceiling (fail closed).
         long footprint = DeltaCheckpointReader.ColumnFootprintBytes(
-            typeof(string), numValues: 100_000_000, compressedBytes: 4_096, uncompressedBytes: 4_096, "add/path", 0);
+            typeof(string), numValues: 100_000_000, compressedBytes: 4_096, uncompressedBytes: 4_096, 0);
         Assert.True(footprint > DeltaCheckpointReader.MaxCheckpointRowGroupDecodedBytes,
             $"footprint {footprint} should exceed the {DeltaCheckpointReader.MaxCheckpointRowGroupDecodedBytes}-byte ceiling");
     }
@@ -314,7 +314,7 @@ public sealed class DeltaCheckpointReaderTests
     {
         DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() =>
             DeltaCheckpointReader.ColumnFootprintBytes(
-                typeof(long), numValues: 8, compressedBytes: 1_000, uncompressedBytes: 1_000 * 5_000, "add/size", 0));
+                typeof(long), numValues: 8, compressedBytes: 1_000, uncompressedBytes: 1_000 * 5_000, 0));
         Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
         Assert.Contains("ratio", ex.Message, StringComparison.Ordinal);
     }
@@ -328,7 +328,7 @@ public sealed class DeltaCheckpointReaderTests
         // a spurious verdict — pre-fix, `Math.Max(compressedBytes, 1) * MaxDecompressionRatio` overflowed
         // (here to a negative product), flipping the comparison and wrongly rejecting this legitimate column.
         long footprint = DeltaCheckpointReader.ColumnFootprintBytes(
-            typeof(long), numValues: 1, compressedBytes: 9_223_372_036_854_776L, uncompressedBytes: 1_000, "add/size", 0);
+            typeof(long), numValues: 1, compressedBytes: 9_223_372_036_854_776L, uncompressedBytes: 1_000, 0);
         Assert.True(footprint > 0 && footprint < DeltaCheckpointReader.MaxCheckpointRowGroupDecodedBytes);
     }
 
@@ -336,7 +336,7 @@ public sealed class DeltaCheckpointReaderTests
     public void DecodeCeiling_RejectsNegativeMetadata()
     {
         Assert.Throws<DeltaProtocolException>(() =>
-            DeltaCheckpointReader.ColumnFootprintBytes(typeof(long), -1, 10, 10, "add/size", 0));
+            DeltaCheckpointReader.ColumnFootprintBytes(typeof(long), -1, 10, 10, 0));
     }
 
     [Fact]
@@ -344,8 +344,42 @@ public sealed class DeltaCheckpointReaderTests
     {
         // A realistic column (100k rows, ~2 MB) is well under the ceiling and does not throw.
         long footprint = DeltaCheckpointReader.ColumnFootprintBytes(
-            typeof(long), numValues: 100_000, compressedBytes: 500_000, uncompressedBytes: 2_000_000, "add/size", 0);
+            typeof(long), numValues: 100_000, compressedBytes: 500_000, uncompressedBytes: 2_000_000, 0);
         Assert.True(footprint > 0 && footprint < DeltaCheckpointReader.MaxCheckpointRowGroupDecodedBytes);
+    }
+
+    [Fact]
+    public void DecodeCeiling_NegativeMetadata_MessageDoesNotEchoColumnPath()
+    {
+        // #653 info-leak parity: the malformed-checkpoint-column message must NOT interpolate the (schema-
+        // derived, attacker-influenceable) column path. Exact-equality proves no '{path}' interpolation; the
+        // numeric structural context (group + declared sizes) is retained for diagnosability — these are
+        // bounded declared scalars (attacker-declared int64 footer metadata, not a text/injection channel).
+        // (The path arg was removed from ColumnFootprintBytes so the surfaced message structurally cannot
+        // carry it.)
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() =>
+            DeltaCheckpointReader.ColumnFootprintBytes(typeof(long), numValues: -1, compressedBytes: 10, uncompressedBytes: 10, group: 7));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.Equal(
+            "A checkpoint column (group 7) declares negative metadata (values -1, compressed 10, decompressed 10).",
+            ex.Message);
+        Assert.DoesNotContain("'", ex.Message, StringComparison.Ordinal);   // no quoted column path
+    }
+
+    [Fact]
+    public void DecodeCeiling_DecompressionBomb_MessageDoesNotEchoColumnPath()
+    {
+        // #653: the decompression-bomb rejection likewise carries only bounded declared scalars (the numeric
+        // ratio context — attacker-declared int64 footer metadata, not a text/injection channel), never the
+        // column path. The declared-bytes / ratio numbers are the diagnostic point of the message.
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() =>
+            DeltaCheckpointReader.ColumnFootprintBytes(typeof(long), numValues: 8, compressedBytes: 1_000, uncompressedBytes: 1_000 * 5_000, group: 4));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.DoesNotContain("'", ex.Message, StringComparison.Ordinal);   // no quoted column path
+        Assert.Contains("group 4", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("ratio ceiling", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -361,6 +395,184 @@ public sealed class DeltaCheckpointReaderTests
             () => DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default, maxDecodedBytes: 10));
         Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
         Assert.Contains("decode ceiling", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task MalformedReconstruction_MessageDoesNotEchoColumnPath()
+    {
+        // #653 defense-in-depth: the checkpoint column-reconstruction fail-closed messages (slot-count /
+        // repetition-level / physical-type faults in CheckpointColumns) must NOT interpolate the Parquet leaf
+        // path. Those paths are a bounded Delta-protocol vocabulary — not a current attacker-byte leak — but
+        // they are scrubbed uniformly with the ParquetFileReader decode sites for a consistent
+        // no-file-derived-token posture (forward-safe if per-column-stats resolution ever descends these paths
+        // into user column names). Trigger one such site: forge the row group to declare one MORE row than it
+        // actually holds, so a scalar column's decoded slot count (or a map/list reconstruction's row count) no
+        // longer matches rowCount → the reconstruction fails closed. Assert the surfaced message carries no
+        // quoted path (no ' character).
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(1, 2).Metadata("t", EmptySchema).Add("f.parquet", size: 1)
+            .ToParquetAsync();
+        long actualRows = await ParquetTestHelpers.RowGroupNumRowsAsync(parquet, rowGroup: 0);
+        byte[] forged = await ParquetTestHelpers.ForgeRowGroupNumRowsAsync(
+            parquet, rowGroup: 0, forgedNumRows: actualRows + 1);
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(forged), default));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.DoesNotContain("'", ex.Message, StringComparison.Ordinal);   // no quoted (file-derived) leaf path
+        // Pins the scrubbed CheckpointColumns SlotMismatch site (not the generic outer catch): the message
+        // names the column CLASS and the structural slot/row counts, never the leaf path.
+        Assert.Contains("A checkpoint scalar column produced", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task MalformedMapReconstruction_MessageDoesNotEchoMapKeyLeafPath()
+    {
+        // #653 no-echo (MAP reconstruction path). The sibling MalformedReconstruction_... test covers the
+        // SCALAR site; a global numRows forge on a full checkpoint never reaches the map/list sites because the
+        // FIRST scalar column (add/path) trips first. This covers the MAP site: a MINIMAL checkpoint whose ONLY
+        // column is the add.partitionValues MAP (no preceding scalar) so the map is the first reconstructed
+        // column. Its key leaf is renamed to an attacker SENTINEL — and unlike the scalar add/path (a fixed
+        // protocol name), a map key leaf name is genuinely FILE-DERIVED: CheckpointSchema.Map returns
+        // Parquet.Net's logical .Key verbatim from the footer, so a foreign checkpoint controls it. The row
+        // group over-declares its row count, so CheckpointColumns.ForEachMapEntry → EnsureRowCount fails closed
+        // — and its message must NOT echo the file-derived key path (add/partitionValues/key_value/<sentinel>).
+        const string keySentinel = "att4cker_ckpt_map_key_s3ntinel";
+        byte[] forged = await CheckpointFixture.MalformedAddPartitionValuesMapAsync(keySentinel);
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(forged), default));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.DoesNotContain(keySentinel, ex.Message, StringComparison.Ordinal);   // no file-derived leaf path
+        Assert.DoesNotContain("'", ex.Message, StringComparison.Ordinal);           // no quoted path at all
+        // Pins the scrubbed EnsureRowCount site reached via ForEachMapEntry (not the scalar SlotMismatch site):
+        // the message names the column CLASS and the reconstructed/declared row counts, never the leaf path.
+        Assert.Contains("A checkpoint column reconstructed", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task MalformedListReconstruction_MessageDoesNotEchoListElementLeafPath()
+    {
+        // #653 no-echo (LIST reconstruction path). Sibling of the map test above: a MINIMAL checkpoint whose
+        // ONLY column is the metaData.partitionColumns LIST (no preceding scalar), so the list is the first
+        // reconstructed column. Its element leaf is named an attacker SENTINEL — file-derived, since
+        // CheckpointSchema.ListElement returns Parquet.Net's logical .Item verbatim from the footer. The row
+        // group over-declares its row count, so CheckpointColumns.ForEachListElement → EnsureRowCount fails
+        // closed — and its message must NOT echo the element path (metaData/partitionColumns/list/<sentinel>).
+        const string elementSentinel = "att4cker_ckpt_list_elem_s3ntinel";
+        byte[] forged = await CheckpointFixture.MalformedMetaPartitionColumnsListAsync(elementSentinel);
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(forged), default));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.DoesNotContain(elementSentinel, ex.Message, StringComparison.Ordinal);   // no file-derived path
+        Assert.DoesNotContain("'", ex.Message, StringComparison.Ordinal);               // no quoted path at all
+        // Pins the scrubbed EnsureRowCount site reached via ForEachListElement (not the scalar SlotMismatch).
+        Assert.Contains("A checkpoint column reconstructed", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task MalformedScalarReconstruction_RepeatedScalar_MessageDoesNotEchoColumnPath()
+    {
+        // #653 no-echo (SCALAR repetition site, CheckpointColumns.FillScalar col.MaxRepetition != 0). A
+        // checkpoint whose add.size leaf is a legacy 1-level REPEATED long (MaxRepetitionLevel=1) still resolves
+        // as an ordinary scalar (CheckpointSchema.Scalar matches only the expected NAME, not the repetition), so
+        // the scalar reader reaches FillScalar, which fails closed on the unexpected repetition. Unlike a
+        // map/list leaf (whose name is attacker-forgeable), a SCALAR leaf name is a bounded Delta-protocol
+        // vocabulary (add/size), so no sentinel can ride it — the load-bearing no-echo signal here is the
+        // absence of any ' (quoting): a reverted scrub re-emits 'add/size' QUOTED (mirrors the sibling scalar
+        // SlotMismatch test, which pins the same class of leak on the other scalar branch).
+        byte[] parquet = await CheckpointFixture.MalformedRepeatedAddSizeScalarAsync();
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.DoesNotContain("'", ex.Message, StringComparison.Ordinal);   // no quoted (would-be 'add/size') path
+        // Pins the scrubbed FillScalar repetition site: names the column CLASS, never the leaf path.
+        Assert.Contains("scalar column is unexpectedly repeated", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task MalformedMapReconstruction_RowOutOfRange_MessageDoesNotEchoMapKeyLeafPath()
+    {
+        // #653 no-echo (MAP reconstruction, EnsureRowInRange). Sibling of MalformedMapReconstruction_… above
+        // which OVER-declares the row count (→ EnsureRowCount); this UNDER-declares it (actual-1) so a
+        // repetition-0 slot advances the reconstructed row PAST the shrunken bound and ForEachMapEntry →
+        // EnsureRowInRange fails closed. The map key leaf carries an attacker SENTINEL — file-derived, since
+        // CheckpointSchema.Map returns Parquet.Net's logical .Key verbatim — so a reverted scrub would echo
+        // add/partitionValues/key_value/<sentinel>. NOTE: this branch's fixed message legitimately contains an
+        // apostrophe ("column's"), so unlike the scalar/physical-type tests the no-echo signal is the SENTINEL's
+        // absence, not the absence of ' — DoesNotContain(sentinel) is the load-bearing assertion.
+        const string keySentinel = "att4cker_ckpt_map_range_s3ntinel";
+        byte[] forged =
+            await CheckpointFixture.MalformedAddPartitionValuesMapAsync(keySentinel, overDeclareRows: false);
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(forged), default));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.DoesNotContain(keySentinel, ex.Message, StringComparison.Ordinal);   // no file-derived leaf path
+        // Pins the scrubbed EnsureRowInRange site (distinct from the EnsureRowCount site the sibling pins).
+        Assert.Contains("repetition levels address row", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task MalformedMapPhysicalType_MessageDoesNotEchoMapValueLeafPath()
+    {
+        // #653 no-echo (physical-type site, CheckpointColumns.ReadRawAsync InvalidCastException catch — the R4
+        // finding). A checkpoint add.partitionValues MAP whose VALUE leaf is physically INT32 (renamed to an
+        // attacker SENTINEL) is read AS A STRING by the map reconstruction, so the wrong-typed RawColumnData
+        // cast throws InvalidCastException and the reader fails closed. The value leaf is file-derived
+        // (CheckpointSchema.Map returns Parquet.Net's logical .Value verbatim), so a reverted scrub would echo
+        // add/partitionValues/key_value/<sentinel>. The KEY stays a well-formed string so the VALUE read (not
+        // the key read) is the site that trips.
+        const string valueSentinel = "att4cker_ckpt_map_type_s3ntinel";
+        byte[] forged = await CheckpointFixture.MalformedAddPartitionValuesMapValueTypeAsync(valueSentinel);
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(forged), default));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.DoesNotContain(valueSentinel, ex.Message, StringComparison.Ordinal);   // no file-derived leaf path
+        Assert.DoesNotContain("'", ex.Message, StringComparison.Ordinal);             // no quoted path at all
+        // Pins the scrubbed ReadRawAsync physical-type site (not the outer generic "malformed" catch).
+        Assert.Contains("unexpected physical type", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task MalformedMapReconstruction_SlotMismatch_MessageDoesNotEchoMapKeyLeafPath()
+    {
+        // #653 no-echo (MAP reconstruction, ForEachMapEntry key/value SLOT-COUNT check) — the R6 finding that
+        // corrects an R5 "UNREACHABLE" annotation. R5 claimed this branch could not be hit through the public
+        // read door because the only tool that can desync a map's key/value level streams — the low-level
+        // ParquetRowGroupWriter.WriteAsync<T> — is T:struct-constrained and so (it claimed) cannot author the
+        // STRING leaves a checkpoint map requires, meaning a slot-divergent map would necessarily be non-string
+        // and trip the physical-type guard FIRST. That is FALSE: ReadOnlyMemory<char> IS a struct, so the
+        // low-level writer authors a genuine STRING map whose KEY stream has 3 slots (rep 0,1,0) and VALUE
+        // stream has 2 (rep 0,0). Both decode cleanly as ReadOnlyMemory<char> (no physical-type trip) and,
+        // because both still carry two repetition-0 rows, the row count stays a consistent 2 — so
+        // CheckpointColumns.ForEachMapEntry reaches the slot-count check (keys.Definition.Length 3 !=
+        // values.Definition.Length 2) rather than a row-count check. The map key leaf carries an attacker
+        // SENTINEL — file-derived, since CheckpointSchema.Map returns Parquet.Net's logical .Key verbatim — so a
+        // reverted scrub would echo add/partitionValues/key_value/<sentinel>. NOTE: this branch's fixed message
+        // quotes nothing, so (unlike the scalar/physical-type siblings) the no-echo signal is the SENTINEL's
+        // absence — DoesNotContain(sentinel) is the load-bearing assertion; Contains(...) pins THIS branch.
+        const string keySentinel = "att4cker_ckpt_map_slots_s3ntinel";
+        byte[] forged = await CheckpointFixture.MalformedAddPartitionValuesMapSlotMismatchAsync(keySentinel);
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(forged), default));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.DoesNotContain(keySentinel, ex.Message, StringComparison.Ordinal);   // no file-derived leaf path
+        // Pins the scrubbed slot-count branch of ForEachMapEntry (distinct from the EnsureRowInRange/
+        // EnsureRowCount and physical-type sites the other map siblings pin): names the column CLASS and the
+        // bounded slot counts, never the leaf path.
+        Assert.Contains("mismatched key/value slot counts", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -531,6 +743,35 @@ public sealed class DeltaCheckpointReaderTests
             () => DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default));
         Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
         Assert.Contains("storageType", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task MalformedDeletionVector_UnrecognizedStorageType_MessageDoesNotEchoAttackerValue()
+    {
+        // #653 re-check of the CHECKPOINT-path DvMalformed site (CheckpointColumns' DvMalformed helper): it
+        // wraps the SHARED DeletionVectorDescriptor.Create validator's `detail` and adds only action/row/group
+        // — it has NO DataField in scope, so it is structurally incapable of echoing a leaf path, and the one
+        // attacker-controlled value that reaches it (the storageType STRING) is already scrubbed by Create into
+        // a fixed domain message. This drives an oversized sentinel storageType through the checkpoint decode
+        // door (the sibling BadStorageType_ test above uses a 1-char "x" that could not reveal an echo) and
+        // pins that the surfaced message never carries the attacker value — parity with the JSON-path
+        // Parse_UnrecognizedStorageType_… regression, since both share the one validator. (Belt-and-suspenders:
+        // there is no field.Path to revert here, so this is a permanent no-echo pin, not a mutation oracle.)
+        const string sentinel = "att4cker_ckpt_dv_st0rageType_s3ntinel";
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(3, 7, readerFeatures: ["deletionVectors"], writerFeatures: ["deletionVectors"])
+            .Metadata("t", EmptySchema)
+            .Add("dv.parquet", size: 1,
+                deletionVector: new CheckpointFixture.DvColumns(sentinel, "0123456789abcdefghij", Offset: 4, SizeInBytes: 40, Cardinality: 3))
+            .ToParquetAsync();
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.DoesNotContain(sentinel, ex.Message, StringComparison.Ordinal);   // attacker storageType never surfaced
+        Assert.Contains("malformed deletionVector", ex.Message, StringComparison.Ordinal);   // pins the checkpoint DvMalformed wrapper
+        Assert.Contains("storageType is not one of", ex.Message, StringComparison.Ordinal);  // fixed bounded domain
     }
 
     [Fact]

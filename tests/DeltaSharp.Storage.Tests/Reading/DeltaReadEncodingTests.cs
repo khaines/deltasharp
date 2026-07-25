@@ -85,6 +85,25 @@ public sealed class DeltaReadEncodingTests
         Assert.True(sentinel.IsNull(0));
     }
 
+    [Theory]
+    [InlineData("integer")]   // routes through ParseInteger's out-of-range throw
+    [InlineData("long")]      // routes through the shared ParseFailure helper
+    public void BuildConstantColumn_UnparsablePartitionValue_FailsClosedWithoutEchoingValue(string typeName)
+    {
+        // Message hygiene (#653 / obs-conventions §row-values): a partition value is user/attacker data recorded
+        // in add.partitionValues, so a parse failure must NOT echo it into the surfaced .Message. A crafted
+        // non-numeric sentinel on a typed partition column proves no-echo on BOTH parse paths.
+        const string sentinel = "att4cker-p4rtition-s3ntinel";
+        DataType type = TypeFor(typeName);
+
+        DeltaStorageException ex = Assert.Throws<DeltaStorageException>(
+            () => DeltaReadEncoding.BuildConstantColumn(type, sentinel, rowCount: 3));
+
+        Assert.Equal(StorageErrorKind.CorruptData, ex.Kind);
+        Assert.DoesNotContain(sentinel, ex.Message, StringComparison.Ordinal);   // the value is never surfaced
+        Assert.Contains("Partition value", ex.Message, StringComparison.Ordinal);   // fixed diagnostic prefix
+    }
+
     private static DataType TypeFor(string name) => name switch
     {
         "integer" => IntegerType.Instance,

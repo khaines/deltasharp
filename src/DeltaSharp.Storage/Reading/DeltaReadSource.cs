@@ -200,10 +200,13 @@ public sealed class DeltaReadSource : IDisposable
             // rejection (PathNotConfined) — or any other internal storage fault raised while reading a file
             // — surfaces the storage layer's internal DeltaStorageException. Wrap it as the facade's
             // documented DeltaReadException so the pinned-version-vanished / poisoned-path window has ONE
-            // typed, catchable failure mode across the seam (its message is already free of raw storage
-            // detail — the backend discloses only the confined path). The #497 schema-evolution case is a
-            // distinct DeltaReadSchemaEvolutionException (not a DeltaStorageException) and escapes this catch.
-            throw new DeltaReadException(ex.Message, ex);
+            // typed, catchable failure mode across the seam. Message hygiene (#653): a PathNotConfined fault
+            // NAMES the attacker-controllable add.path in its message, so ex.Message must NOT be forwarded —
+            // name only the bounded storage-error KIND; the cause stays on the inner exception (#664). The
+            // #497 schema-evolution case is a distinct DeltaReadSchemaEvolutionException (not a
+            // DeltaStorageException) and escapes this catch.
+            throw new DeltaReadException(
+                $"An active data file could not be read (storage fault: {ex.Kind}).", ex);
         }
 
         return batches;
@@ -287,8 +290,12 @@ public sealed class DeltaReadSource : IDisposable
             {
                 // A DV-carrying add MUST record numRecords in stats (Delta writer requirement). Without the
                 // physical record count we cannot cross-check the file, so fail closed.
+                // Message hygiene (#653): add.Path is attacker-controllable (a poisoned log can inject an
+                // arbitrary/root-escaping path) and must NOT be interpolated into the fault message — describe
+                // the fault without naming the file. This fires BEFORE the file is opened, so the path is not
+                // even confinement-checked yet; the caller still has it on the add action.
                 throw new DeltaReadException(
-                    $"Active file '{add.Path}' carries a deletion vector but its add action has no "
+                    "An active data file carries a deletion vector but its add action has no "
                     + "stats.numRecords, so the deleted row positions cannot be validated. The read fails "
                     + "closed rather than risk returning rows a deletion vector invalidated.");
             }
@@ -308,7 +315,12 @@ public sealed class DeltaReadSource : IDisposable
             }
             catch (DeltaStorageException ex)
             {
-                throw new DeltaReadException(ex.Message, ex);
+                // Message hygiene (#653): a DeltaStorageException from OpenReadAsync can be a PathNotConfined
+                // fault whose message names the attacker-controllable add.path (or another path/file-derived
+                // token), so its ex.Message must NOT be forwarded — name only the bounded storage-error KIND;
+                // the cause stays on the inner exception (its ToString()/log exposure is tracked in #664).
+                throw new DeltaReadException(
+                    $"An active data file could not be read (storage fault: {ex.Kind}).", ex);
             }
 
             // FIX #2 (numRecords semantics): on a DV-carrying add, stats.numRecords IS the PHYSICAL data-file
@@ -317,8 +329,10 @@ public sealed class DeltaReadSource : IDisposable
             // logical count, if ever needed, is numRecords − cardinality.)
             if (declaredPhysicalRecords != physicalRecords)
             {
+                // Message hygiene (#653): drop add.Path (attacker-controllable); the record counts are bounded
+                // file statistics (not a path, column name, or cell value), so they remain as diagnostics.
                 throw new DeltaReadException(
-                    $"Active file '{add.Path}' declares stats.numRecords={declaredPhysicalRecords} but its "
+                    $"An active data file declares stats.numRecords={declaredPhysicalRecords} but its "
                     + $"Parquet file contains {physicalRecords} physical row(s); a DV-carrying add's numRecords "
                     + "must equal the physical row count, so the read fails closed.");
             }
@@ -335,7 +349,10 @@ public sealed class DeltaReadSource : IDisposable
                 // A malformed/oversized bitmap, bad magic/version, CRC/size/cardinality mismatch, out-of-range
                 // position, invalid Z85, or an out-of-file .bin offset/length — all surface as a typed
                 // storage fault. Fail the read closed (never silently ignore the DV and return deleted rows).
-                throw new DeltaReadException(ex.Message, ex);
+                // Message hygiene (#653): a PathNotConfined fault on the DV `.bin` path names it, so ex.Message
+                // is not forwarded — only the bounded storage-error KIND; the cause stays on the inner (#664).
+                throw new DeltaReadException(
+                    $"A deletion vector file could not be read (storage fault: {ex.Kind}).", ex);
             }
 
             deletionVector = new DeletionVectorMask(positions, physicalRecords);
@@ -383,7 +400,7 @@ public sealed class DeltaReadSource : IDisposable
 
         if (deletionVector is not null)
         {
-            deletionVector.EnsureConsumed(fileRowOffset, add.Path);
+            deletionVector.EnsureConsumed(fileRowOffset);
         }
     }
 

@@ -194,8 +194,11 @@ internal static class ParquetTypeMapping
             return type;
         }
 
+        // Message hygiene (#653): `field` is a Parquet FOOTER DataField read back from the file, so
+        // `field.Name` is attacker-authored on a foreign file and is not echoed; the bounded physical CLR
+        // type name (a Parquet.Net type vocabulary) is sufficient to diagnose the unsupported mapping.
         throw DeltaStorageException.UnsupportedFeature(
-            $"Parquet footer column '{field.Name}' has physical CLR type '{field.ClrType.Name}', which has no "
+            $"A Parquet footer column has physical CLR type '{field.ClrType.Name}', which has no "
             + "supported DeltaSharp type mapping.");
     }
 

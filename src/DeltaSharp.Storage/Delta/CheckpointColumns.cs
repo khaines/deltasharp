@@ -15,6 +15,25 @@ namespace DeltaSharp.Storage.Delta;
 /// mismatch, or an action missing a required field throws <see cref="DeltaProtocolException"/> so the
 /// caller falls back to JSON replay rather than materialize invented state.
 /// </summary>
+/// <remarks>
+/// Message hygiene (#653): these fail-closed messages name no file-derived token — only bounded structural
+/// context (row indices, slot/row counts) and expected protocol names are retained. This scrub is
+/// <b>load-bearing</b>, not merely defense-in-depth, because the checkpoint leaves are not uniformly bounded:
+/// <list type="bullet">
+///   <item><description><b>Scalar and struct leaves</b> (<c>add/path</c>, <c>add/size</c>,
+///   <c>deletionVector/storageType</c>, …) are resolved by <i>expected</i> name via
+///   <see cref="CheckpointSchema"/>'s <c>Scalar</c>/<c>Child</c>/<c>DeletionVector</c> helpers, so their
+///   <see cref="DataField.Path"/> is a bounded Delta-protocol vocabulary.</description></item>
+///   <item><description><b>Map and list leaves</b> are NOT: <c>CheckpointSchema.Map</c> returns the file's
+///   <c>map.Key</c>/<c>map.Value</c> <see cref="DataField"/>s and <c>ListElement</c> returns the file's
+///   <c>list.Item</c> — matching only the <i>column's</i> name (e.g. <c>partitionValues</c>, <c>tags</c>) and
+///   never validating the sub-field names. A crafted checkpoint can therefore give those leaves
+///   attacker-authored names that flow into <see cref="DataField.Path"/>. Scrubbing file-derived leaf
+///   paths from these messages is thus a genuine leak fix for map/list-column leaves.</description></item>
+/// </list>
+/// <c>stats</c> is an opaque scalar that is never descended into per-user-column names. The scrub is applied
+/// uniformly with the <c>ParquetFileReader</c> decode sites for a consistent no-file-derived-token posture.
+/// </remarks>
 internal sealed class CheckpointColumns
 {
     private static readonly ImmutableSortedDictionary<string, string?> EmptyNullableMap =
@@ -281,7 +300,7 @@ internal sealed class CheckpointColumns
         }
 
         RawColumn<ReadOnlyMemory<char>> col = await ReadRawAsync<ReadOnlyMemory<char>>(rowGroup, field, cancellationToken).ConfigureAwait(false);
-        FillScalar(col, rowCount, field, (r, v) => result[r] = v.ToString(), structPresent);
+        FillScalar(col, rowCount, (r, v) => result[r] = v.ToString(), structPresent);
         return result;
     }
 
@@ -295,7 +314,7 @@ internal sealed class CheckpointColumns
         }
 
         RawColumn<long> col = await ReadRawAsync<long>(rowGroup, field, cancellationToken).ConfigureAwait(false);
-        FillScalar(col, rowCount, field, (r, v) => result[r] = v);
+        FillScalar(col, rowCount, (r, v) => result[r] = v);
         return result;
     }
 
@@ -310,7 +329,7 @@ internal sealed class CheckpointColumns
         }
 
         RawColumn<int> col = await ReadRawAsync<int>(rowGroup, field, cancellationToken).ConfigureAwait(false);
-        FillScalar(col, rowCount, field, (r, v) => result[r] = v, structPresent);
+        FillScalar(col, rowCount, (r, v) => result[r] = v, structPresent);
         return result;
     }
 
@@ -324,17 +343,17 @@ internal sealed class CheckpointColumns
         }
 
         RawColumn<bool> col = await ReadRawAsync<bool>(rowGroup, field, cancellationToken).ConfigureAwait(false);
-        FillScalar(col, rowCount, field, (r, v) => result[r] = v);
+        FillScalar(col, rowCount, (r, v) => result[r] = v);
         return result;
     }
 
-    private static void FillScalar<T>(RawColumn<T> col, int rowCount, DataField field, Action<int, T> assign,
+    private static void FillScalar<T>(RawColumn<T> col, int rowCount, Action<int, T> assign,
         bool[]? structPresent = null)
         where T : struct
     {
         if (col.MaxRepetition != 0)
         {
-            throw DeltaProtocolException.Malformed($"Checkpoint scalar column '{field.Path}' is unexpectedly repeated.");
+            throw DeltaProtocolException.Malformed("A checkpoint scalar column is unexpectedly repeated.");
         }
 
         if (col.MaxDefinition == 0)
@@ -342,7 +361,7 @@ internal sealed class CheckpointColumns
             // A required column with no null encoding: one value per row.
             if (col.Values.Length != rowCount)
             {
-                throw SlotMismatch(field, col.Values.Length, rowCount);
+                throw SlotMismatch(col.Values.Length, rowCount);
             }
 
             for (int r = 0; r < rowCount; r++)
@@ -359,7 +378,7 @@ internal sealed class CheckpointColumns
 
         if (col.Definition.Length != rowCount)
         {
-            throw SlotMismatch(field, col.Definition.Length, rowCount);
+            throw SlotMismatch(col.Definition.Length, rowCount);
         }
 
         int valueIndex = 0;
@@ -487,7 +506,7 @@ internal sealed class CheckpointColumns
         var builders = new ImmutableSortedDictionary<string, string?>.Builder?[rowCount];
         RawColumn<ReadOnlyMemory<char>> keys = await ReadRawAsync<ReadOnlyMemory<char>>(rowGroup, leaves.Key, cancellationToken).ConfigureAwait(false);
         RawColumn<ReadOnlyMemory<char>> values = await ReadRawAsync<ReadOnlyMemory<char>>(rowGroup, leaves.Value, cancellationToken).ConfigureAwait(false);
-        ForEachMapEntry(keys, values, rowCount, leaves.Key, (row, key, value) =>
+        ForEachMapEntry(keys, values, rowCount, (row, key, value) =>
         {
             (builders[row] ??= ImmutableSortedDictionary.CreateBuilder<string, string?>(StringComparer.Ordinal))[key] = value;
         });
@@ -513,7 +532,7 @@ internal sealed class CheckpointColumns
         var builders = new ImmutableSortedDictionary<string, string>.Builder?[rowCount];
         RawColumn<ReadOnlyMemory<char>> keys = await ReadRawAsync<ReadOnlyMemory<char>>(rowGroup, leaves.Key, cancellationToken).ConfigureAwait(false);
         RawColumn<ReadOnlyMemory<char>> values = await ReadRawAsync<ReadOnlyMemory<char>>(rowGroup, leaves.Value, cancellationToken).ConfigureAwait(false);
-        ForEachMapEntry(keys, values, rowCount, leaves.Key, (row, key, value) =>
+        ForEachMapEntry(keys, values, rowCount, (row, key, value) =>
         {
             // Delta string-valued maps (tags/configuration/format.options) carry non-null values; a null
             // value is dropped defensively (advisory) rather than fabricating an empty string.
@@ -543,7 +562,7 @@ internal sealed class CheckpointColumns
 
         var builders = new ImmutableArray<string>.Builder?[rowCount];
         RawColumn<ReadOnlyMemory<char>> elements = await ReadRawAsync<ReadOnlyMemory<char>>(rowGroup, element, cancellationToken).ConfigureAwait(false);
-        ForEachListElement(elements, rowCount, element, (row, value) =>
+        ForEachListElement(elements, rowCount, (row, value) =>
         {
             (builders[row] ??= ImmutableArray.CreateBuilder<string>()).Add(value);
         });
@@ -560,19 +579,35 @@ internal sealed class CheckpointColumns
         RawColumn<ReadOnlyMemory<char>> keys,
         RawColumn<ReadOnlyMemory<char>> values,
         int rowCount,
-        DataField keyField,
         Action<int, string, string?> onEntry)
     {
+        // Defensive parity, guaranteed unreachable through the public read door (R5 #653): ForEachMapEntry is
+        // reached only for a CheckpointSchema.Map-resolved leaf — a Parquet.Net logical MapField — whose .Key
+        // is fixed at MaxRepetitionLevel=1 by the map shape (its repeated key_value group). Forging the
+        // key_value group's repetition_type away from REPEATED does NOT lower the resolved key's
+        // MaxRepetitionLevel (the logical abstraction hard-codes it), so keys.MaxRepetition is never 0 here.
+        // The guard is kept as an explicit local invariant so a future decode path — or a library change — that
+        // produced a non-repeated map key would still fail closed rather than mis-reconstruct.
         if (keys.MaxRepetition == 0)
         {
-            throw DeltaProtocolException.Malformed($"Checkpoint map column '{keyField.Path}' is not repeated.");
+            throw DeltaProtocolException.Malformed("A checkpoint map column is not repeated.");
         }
 
+        // Reachable through the public read door (R6 #653, correcting an earlier R5 "unreachable" annotation):
+        // a map's key and value share one repeated key_value group, so every CONFORMANT writer — and
+        // Parquet.Net's own decoder — emits key/value level streams of identical length. But the low-level
+        // ParquetRowGroupWriter.WriteAsync<T> can desync them, and its T:struct constraint does NOT bar the
+        // STRING leaves a checkpoint map requires: ReadOnlyMemory<char> IS a struct, so a string map with (say)
+        // 3 key slots vs 2 value slots authors cleanly and decodes PAST the physical-type guard (ReadRawAsync)
+        // to reach this check. Covered by
+        // DeltaCheckpointReaderTests.MalformedMapReconstruction_SlotMismatch_MessageDoesNotEchoMapKeyLeafPath.
+        // The message names only the column CLASS and the bounded slot counts — the file-derived key/value
+        // DataField.Path is scrubbed here, exactly like its EnsureRowInRange/EnsureRowCount siblings (#653).
         if (keys.Definition.Length != values.Definition.Length)
         {
             throw DeltaProtocolException.Malformed(string.Create(
                 CultureInfo.InvariantCulture,
-                $"Checkpoint map column '{keyField.Path}' has mismatched key/value slot counts "
+                $"A checkpoint map column has mismatched key/value slot counts "
                 + $"({keys.Definition.Length} vs {values.Definition.Length})."));
         }
 
@@ -587,7 +622,7 @@ internal sealed class CheckpointColumns
                 row++;
             }
 
-            EnsureRowInRange(row, rowCount, keyField);
+            EnsureRowInRange(row, rowCount);
             if (keys.Definition[i] == keys.MaxDefinition)
             {
                 string key = keys.Values[keyIndex++].ToString();
@@ -596,15 +631,22 @@ internal sealed class CheckpointColumns
             }
         }
 
-        EnsureRowCount(row, rowCount, keyField);
+        EnsureRowCount(row, rowCount);
     }
 
     private static void ForEachListElement(
-        RawColumn<ReadOnlyMemory<char>> elements, int rowCount, DataField elementField, Action<int, string> onElement)
+        RawColumn<ReadOnlyMemory<char>> elements, int rowCount, Action<int, string> onElement)
     {
+        // Defensive parity, guaranteed unreachable through the public read door (R5 #653): ForEachListElement
+        // is reached only for a CheckpointSchema.ListElement-resolved leaf — a Parquet.Net logical ListField —
+        // whose .Item is fixed at MaxRepetitionLevel=1 by the list shape (its repeated list group). Forging the
+        // list group's repetition_type away from REPEATED does NOT lower the resolved element's
+        // MaxRepetitionLevel, so elements.MaxRepetition is never 0 here. The guard is kept as an explicit local
+        // invariant so a future decode path — or a library change — that produced a non-repeated list element
+        // would still fail closed rather than mis-reconstruct.
         if (elements.MaxRepetition == 0)
         {
-            throw DeltaProtocolException.Malformed($"Checkpoint list column '{elementField.Path}' is not repeated.");
+            throw DeltaProtocolException.Malformed("A checkpoint list column is not repeated.");
         }
 
         int slots = elements.Definition.Length;
@@ -617,41 +659,41 @@ internal sealed class CheckpointColumns
                 row++;
             }
 
-            EnsureRowInRange(row, rowCount, elementField);
+            EnsureRowInRange(row, rowCount);
             if (elements.Definition[i] == elements.MaxDefinition)
             {
                 onElement(row, elements.Values[elementIndex++].ToString());
             }
         }
 
-        EnsureRowCount(row, rowCount, elementField);
+        EnsureRowCount(row, rowCount);
     }
 
-    private static void EnsureRowInRange(int row, int rowCount, DataField field)
+    private static void EnsureRowInRange(int row, int rowCount)
     {
         if (row < 0 || row >= rowCount)
         {
             throw DeltaProtocolException.Malformed(string.Create(
                 CultureInfo.InvariantCulture,
-                $"Checkpoint column '{field.Path}' repetition levels address row {row}, outside [0, {rowCount})."));
+                $"A checkpoint column's repetition levels address row {row}, outside [0, {rowCount})."));
         }
     }
 
-    private static void EnsureRowCount(int lastRow, int rowCount, DataField field)
+    private static void EnsureRowCount(int lastRow, int rowCount)
     {
         // Every row contributes exactly one repetition-0 slot, so the reconstruction must cover all rows.
         if (lastRow + 1 != rowCount)
         {
             throw DeltaProtocolException.Malformed(string.Create(
                 CultureInfo.InvariantCulture,
-                $"Checkpoint column '{field.Path}' reconstructed {lastRow + 1} rows but the row group has {rowCount}."));
+                $"A checkpoint column reconstructed {lastRow + 1} rows but the row group has {rowCount}."));
         }
     }
 
-    private static DeltaProtocolException SlotMismatch(DataField field, int actual, int rowCount) =>
+    private static DeltaProtocolException SlotMismatch(int actual, int rowCount) =>
         DeltaProtocolException.Malformed(string.Create(
             CultureInfo.InvariantCulture,
-            $"Checkpoint scalar column '{field.Path}' produced {actual} slots for a {rowCount}-row group."));
+            $"A checkpoint scalar column produced {actual} slots for a {rowCount}-row group."));
 
     // ---- low-level raw column read ----
 
@@ -690,7 +732,7 @@ internal sealed class CheckpointColumns
         catch (InvalidCastException ex)
         {
             throw DeltaProtocolException.Malformed(
-                $"Checkpoint column '{field.Path}' has an unexpected physical type.", ex);
+                "A checkpoint column has an unexpected physical type.", ex);
         }
         finally
         {
