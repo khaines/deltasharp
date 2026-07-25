@@ -1009,15 +1009,13 @@ public sealed class ChangeFeedReadTests : IDisposable
     [Fact]
     public async Task Explicit_MultiRowGroupCdcFile_CorruptLaterRowGroup_StreamsEarlierBatchThenFailsClosed()
     {
-        // #644 streaming fail-closed: because the explicit read now streams row-group by row-group, error
+        // #644 streaming fail-closed: because the explicit read streams row-group by row-group, error
         // classification must sit AROUND the yield (never across a `yield return`). A cdc file whose LATER row
         // group is corrupt must still stream its earlier well-formed batch and THEN fail closed as a classified
         // CorruptData DeltaReadException — never a partial/torn batch, and never a buffer-then-fail that would
-        // hide the earlier rows. This is the reachable "data pass disagrees with `_change_type`" inconsistency:
-        // the `offset != changeTypes.Length` totals check is defence in depth (for a DECODABLE single Parquet
-        // file both passes read identical per-row-group row counts, so they cannot disagree on a clean file),
-        // while a corrupt data-column chunk in a later row group makes the data pass fail after `_change_type`
-        // (pass 1, a different column) has already been fully read.
+        // hide the earlier rows. In the single-pass read (#658) `_change_type` is decoded in the SAME batch as
+        // the data columns, so a corrupt data-column chunk in a later row group faults that batch's decode AFTER
+        // the earlier row group's batch has already been yielded.
         await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0, v1
         var backend = new LocalFileSystemBackend(_root);
         await NewCdfDelete(backend, "mrg-corrupt").DeleteAsync(WhereId(id => id == 1));   // v2 cdc delete
@@ -1034,8 +1032,8 @@ public sealed class ChangeFeedReadTests : IDisposable
                     (13, "r1b", ChangeDataWriter.DeleteChange)),
             },
             rowGroupRowLimit: 2);   // 2 row groups of 2
-        // Poison row group 1's `id` (data column 0). Pass 1 reads `_change_type` (column 2) intact; the STREAMED
-        // data pass decodes row group 0 (yields a batch) then faults on row group 1 → CorruptData, classified.
+        // Poison row group 1's `id` (data column 0). The single combined [data…, `_change_type`] read decodes
+        // row group 0 (yields a batch) then faults on row group 1's poisoned `id` chunk → CorruptData, classified.
         byte[] poisoned = await ParquetTestHelpers.PoisonColumnChunkAsync(file, rowGroup: 1, columnIndex: 0);
         await File.WriteAllBytesAsync(Path.Combine(_root, cdc), poisoned);
 
@@ -1452,7 +1450,7 @@ public sealed class ChangeFeedReadTests : IDisposable
         // column chunk), the read fails closed WITHOUT echoing the attacker-controllable cdc PATH — only the
         // bounded storage-error kind is named. Author a DELETE at a sentinel cdc path, then poison ONLY the
         // `_change_type` column chunk (columnIndex 2) — the footer/schema stay intact so EE-08 passes, and the
-        // `_change_type` pass (which reads that column FIRST, before the data pass) faults as CorruptData.
+        // single combined [data…, `_change_type`] read faults decoding that chunk → CorruptData → ClassifyFileError.
         await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0, v1 (schema A = id, name)
         var backend = new LocalFileSystemBackend(_root);
         await NewCdfDelete(backend, CdcPathSentinel).DeleteAsync(WhereId(id => id == 1));   // v2 cdc at sentinel path
@@ -1470,6 +1468,35 @@ public sealed class ChangeFeedReadTests : IDisposable
         Assert.Contains("could not be read", ex.Message, StringComparison.Ordinal);
         DeltaStorageException inner = Assert.IsType<DeltaStorageException>(ex.InnerException);
         Assert.Equal(StorageErrorKind.CorruptData, inner.Kind);   // the cause stays on the inner exception
+    }
+
+    [Fact]
+    public async Task Explicit_CdcFileMissingChangeTypeColumn_FailsClosedWithPreciseError_NoPathLeak()
+    {
+        // #658 diagnostics (EE-08 presence check): a cdc file whose DATA columns are present but that LACKS the
+        // engine-required `_change_type` column is corrupt/foreign. It must fail closed at EE-08 with a PRECISE
+        // "missing `_change_type`" DeltaReadException — NOT the misleading data-column DeltaReadSchemaEvolution
+        // Exception ("missing a required column the table schema demands") the single-pass read would otherwise
+        // surface for an ENGINE column (the two are sibling exception types). The `_change_type` name is a FIXED
+        // engine literal (safe to name under #653); the attacker-controllable cdc PATH is NOT echoed.
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0, v1
+        var backend = new LocalFileSystemBackend(_root);
+        await NewCdfDelete(backend, CdcPathSentinel).DeleteAsync(WhereId(id => id == 1));   // v2 cdc at sentinel path
+        string cdc = Assert.Single(CdcFilePaths());
+        Assert.Contains(CdcPathSentinel, cdc, StringComparison.Ordinal);
+
+        // Overwrite the cdc body with a DATA-ONLY file ([id, name], no `_change_type`) — the data leaves match
+        // the version's physical data schema so the EE-08 data-column comparison passes, but the new presence
+        // check trips. (DeltaReadSchemaEvolutionException is NOT a DeltaReadException subtype, so ThrowsAsync
+        // <DeltaReadException> below also proves the classification is the precise cdc error, not schema-evolution.)
+        byte[] dataOnly = await ParquetTestHelpers.WriteToBytesAsync(FlatSchema, new[] { Batch((10, "x")) });
+        await File.WriteAllBytesAsync(Path.Combine(_root, cdc), dataOnly);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
+        Assert.Contains("_change_type", ex.Message, StringComparison.Ordinal);   // names the fixed engine column
+        Assert.Contains("missing", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(CdcPathSentinel, ex.Message, StringComparison.Ordinal);   // no cdc-path leak
     }
 
     [Fact]

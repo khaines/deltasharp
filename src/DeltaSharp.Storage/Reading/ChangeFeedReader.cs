@@ -616,16 +616,23 @@ internal sealed class ChangeFeedReader
 
     // The leaf comparison for CDF-EE-08. Physical names are 1:1 with field-ids in DeltaSharp's mapping (a
     // renamed column keeps its physical name/id), so matching by physical name + leaf DataType validates both
-    // name and id modes. The synthesized `_change_type` column is excluded (it is engine-owned, not part of a
-    // version's data schema, and its VALUE domain is validated separately, per batch, in ValidateChangeTypeColumn).
+    // name and id modes. The synthesized `_change_type` column is excluded from the DATA-column comparison (it
+    // is engine-owned, not part of a version's data schema, and its VALUE domain is validated separately, per
+    // batch, in ValidateChangeTypeColumn) — but its PRESENCE is required: the single-pass read (#658) projects
+    // `_change_type` by name alongside the data columns, so a cdc file lacking it is a corrupt/foreign file that
+    // is failed closed HERE with a precise "missing `_change_type`" error, rather than reaching the read and
+    // surfacing the misleading data-column DeltaReadSchemaEvolutionException ("missing a required column the
+    // table schema demands") for an engine column.
     private static void ValidateCdcLeafSchema(
         long version, StructType expected, StructType fileSchema)
     {
         var fileByName = new Dictionary<string, DataType>(StringComparer.Ordinal);
+        bool sawChangeType = false;
         foreach (StructField field in fileSchema)
         {
             if (string.Equals(field.Name, ChangeDataWriter.ChangeTypeColumn, StringComparison.Ordinal))
             {
+                sawChangeType = true;
                 continue;
             }
 
@@ -639,6 +646,16 @@ internal sealed class ChangeFeedReader
                 // other EE-08 messages (#653) — it names no file-derived column, only that a duplicate exists.
                 throw NewCdcSchemaMismatch(version, "it declares a data column more than once");
             }
+        }
+
+        if (!sawChangeType)
+        {
+            // The engine-synthesized `_change_type` column is REQUIRED in every cdc file body (§2.2). A file
+            // lacking it is corrupt/foreign — fail closed with a precise, path-free message (the column name is
+            // a FIXED engine literal, not a file-derived/attacker token, so naming it is safe under #653).
+            throw NewCdcSchemaMismatch(
+                version,
+                $"it is missing the engine-synthesized '{ChangeDataWriter.ChangeTypeColumn}' column");
         }
 
         foreach (StructField expectedField in expected)
@@ -808,7 +825,8 @@ internal sealed class ChangeFeedReader
 
     // Appends the engine-synthesized `_change_type` field (StringType, non-nullable, NO column-mapping id — so
     // the reader resolves it by name) to a physical data schema, forming the single-pass explicit-read
-    // projection (#658).
+    // projection (#658). Mirrors the writer's `ChangeDataWriter.AppendChangeTypeColumn`: the read projection
+    // must stay in lockstep with the cdc body layout the writer emits (data columns first, then `_change_type`).
     private static StructType AppendChangeTypeColumn(StructType physicalDataSchema)
     {
         var fields = new List<StructField>(physicalDataSchema.Count + 1);

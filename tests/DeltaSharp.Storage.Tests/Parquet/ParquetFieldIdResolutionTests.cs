@@ -107,6 +107,31 @@ public sealed class ParquetFieldIdResolutionTests
     }
 
     [Fact]
+    public async Task DeclaredIdAbsent_AgainstNoFieldIdFileColumn_FailsClosed_IsolatesIdStrictness()
+    {
+        // Isolates the id-STRICTNESS guarantee from the `idBearingFileNames` guard. The file column `foo` has NO
+        // field_id, so the guard would NOT block a by-name fallback onto it — the ONLY thing that fails this
+        // read closed is that a requested column DECLARING an id (99, absent from the footer) resolves STRICTLY
+        // by id and never falls through to name matching. (The sibling `DeclaredIdAbsentFromFooter…` test uses an
+        // id-BEARING file column, where the guard ALSO blocks the match, so it does not isolate this branch —
+        // mutating away the id-strictness leaves that test green but fails THIS one.)
+        var physical = new StructType(new[]
+        {
+            new StructField("foo", DataTypes.LongType, nullable: false),   // NO field_id
+        });
+        byte[] bytes = await WriteAsync(physical, batch => AppendLong(batch[0], 4242));
+
+        var requested = new StructType(new[]
+        {
+            IdField("foo", DataTypes.LongType, nullable: false, id: 99),   // declares id 99 (absent from footer)
+        });
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadSingleAsync(bytes, requested, nullFill: false));
+        Assert.Equal(StorageErrorKind.ColumnNotPresentInFile, ex.Kind);   // strict-by-id: never name-matched to foo
+    }
+
+    [Fact]
     public async Task NoIdColumn_AbsentByName_NullFillsWhenNullable()
     {
         // A no-id requested column genuinely absent from the file (no matching un-mapped physical name) null-fills
