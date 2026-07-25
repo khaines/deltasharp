@@ -35,6 +35,8 @@ P:System.DateTimeOffset.Now;[determinism] DateTimeOffset.Now reads ambient local
 P:System.DateTimeOffset.UtcNow;[determinism] DateTimeOffset.UtcNow reads the wall clock and is nondeterministic. Inject a TimeProvider/clock.
 M:System.Guid.NewGuid;[determinism] Guid.NewGuid is a nondeterministic identity source. Inject an id/RNG abstraction so plan, shuffle, and file identifiers are reproducible and testable.
 T:System.Random;[determinism/security] System.Random is banned outright: it is not thread-safe and an unseeded instance is nondeterministic. Inject a deterministic RNG abstraction (seeded at a well-defined point) so shuffles and sampling are reproducible. For security-sensitive randomness use System.Security.Cryptography.RandomNumberGenerator.
+P:System.Environment.TickCount;[determinism] Environment.TickCount reads the ambient system uptime clock and is nondeterministic. Inject a TimeProvider/clock so timing-dependent logic stays reproducible and testable.
+P:System.Environment.TickCount64;[determinism] Environment.TickCount64 reads the ambient system uptime clock and is nondeterministic. Inject a TimeProvider/clock so timing-dependent logic stays reproducible and testable.
 
 // === Security-sensitive: command execution and broken cryptography (checklist 05) ===
 M:System.Diagnostics.Process.Start;[security] Process.Start() (instance) spawns the configured external process (command-injection and sandbox-escape surface). Avoid in engine/executor paths; if a subprocess is unavoidable get security review (checklist 05) and pass a validated argument list, never a shell string.

@@ -314,34 +314,39 @@ internal sealed class ParquetFileReader
         ParquetReader reader = await OpenAsync(input, cancellationToken).ConfigureAwait(false);
         await using (reader.ConfigureAwait(false))
         {
-            // Fail-closed schema-mapping boundary (storage-delta-architecture.md §5.4 C-DECODE / ADR-0013).
-            // OpenAsync force-materialized reader.Schema inside its footer-PARSE boundary, but the SUBSEQUENT
-            // mapping of untrusted footer field descriptors into DeltaSharp StructFields is a distinct decode
-            // step that was unsealed: ToDataSchema eagerly builds a StructField for EVERY footer field, so a
-            // crafted footer with an empty field name makes the StructField constructor raise a raw
-            // ArgumentException (PDX-T crafted schema; storage-delta-architecture.md §5.4). Map every library/
-            // domain fault from the mapping to the deterministic CorruptData contract with a FIXED message (no
-            // ex.Message, so no footer content echoes into the error text). ToDataSchema's legitimate typed
-            // UnsupportedFeature (an unsupported-but-VALID Parquet type) is a DeltaStorageException, EXCLUDED by
-            // both predicates below, so it still propagates UNWRAPPED (never re-masked as CorruptData).
-            try
-            {
-                return ParquetTypeMapping.ToDataSchema(reader.Schema);
-            }
-            catch (Exception ex) when (IsParquetDefect(ex))
-            {
-                // Informative first catch: a low-level decode defect surfacing while mapping a field descriptor
-                // (e.g. an OverflowException from a crafted decimal precision/scale).
-                throw DeltaStorageException.CorruptData(
-                    "Parquet footer schema is malformed (undecodable field descriptor).", ex);
-            }
-            catch (Exception ex) when (IsUndecodableParquetInput(ex))
-            {
-                // Superset fallback: the empty-field-name ArgumentException from the StructField constructor and
-                // any other raw fault from mapping an attacker-controlled footer field descriptor land here.
-                throw DeltaStorageException.CorruptData(
-                    "Parquet footer declares an unmappable field descriptor (e.g. an empty field name).", ex);
-            }
+            return MapFooterSchemaFailClosed(reader);
+        }
+    }
+
+    // Fail-closed schema-mapping boundary (storage-delta-architecture.md §5.4 C-DECODE / ADR-0013), shared by
+    // ReadDataSchemaAsync and ReadDataLeafColumnsAsync so the two footer-schema readers can NEVER diverge on it.
+    // OpenAsync force-materialized reader.Schema inside its footer-PARSE boundary, but the SUBSEQUENT mapping of
+    // untrusted footer field descriptors into DeltaSharp StructFields is a distinct decode step that was
+    // unsealed: ToDataSchema eagerly builds a StructField for EVERY footer field, so a crafted footer with an
+    // empty field name makes the StructField constructor raise a raw ArgumentException (PDX-T crafted schema).
+    // Map every library/domain fault from the mapping to the deterministic CorruptData contract with a FIXED
+    // message (no ex.Message, so no footer content echoes into the error text). ToDataSchema's legitimate typed
+    // UnsupportedFeature (an unsupported-but-VALID Parquet type) is a DeltaStorageException, EXCLUDED by both
+    // predicates below, so it still propagates UNWRAPPED (never re-masked as CorruptData).
+    private static StructType MapFooterSchemaFailClosed(ParquetReader reader)
+    {
+        try
+        {
+            return ParquetTypeMapping.ToDataSchema(reader.Schema);
+        }
+        catch (Exception ex) when (IsParquetDefect(ex))
+        {
+            // Informative first catch: a low-level decode defect surfacing while mapping a field descriptor
+            // (e.g. an OverflowException from a crafted decimal precision/scale).
+            throw DeltaStorageException.CorruptData(
+                "Parquet footer schema is malformed (undecodable field descriptor).", ex);
+        }
+        catch (Exception ex) when (IsUndecodableParquetInput(ex))
+        {
+            // Superset fallback: the empty-field-name ArgumentException from the StructField constructor and
+            // any other raw fault from mapping an attacker-controlled footer field descriptor land here.
+            throw DeltaStorageException.CorruptData(
+                "Parquet footer declares an unmappable field descriptor (e.g. an empty field name).", ex);
         }
     }
 
@@ -374,25 +379,7 @@ internal sealed class ParquetFileReader
         ParquetReader reader = await OpenAsync(input, cancellationToken).ConfigureAwait(false);
         await using (reader.ConfigureAwait(false))
         {
-            // Fail-closed schema-mapping boundary — IDENTICAL to ReadDataSchemaAsync's (see there): mapping the
-            // untrusted footer field descriptors into DeltaSharp StructFields is a distinct decode step, so a
-            // crafted footer fault maps to the deterministic CorruptData contract with a FIXED message (no
-            // ex.Message echo), while ToDataSchema's typed UnsupportedFeature propagates unwrapped.
-            StructType schema;
-            try
-            {
-                schema = ParquetTypeMapping.ToDataSchema(reader.Schema);
-            }
-            catch (Exception ex) when (IsParquetDefect(ex))
-            {
-                throw DeltaStorageException.CorruptData(
-                    "Parquet footer schema is malformed (undecodable field descriptor).", ex);
-            }
-            catch (Exception ex) when (IsUndecodableParquetInput(ex))
-            {
-                throw DeltaStorageException.CorruptData(
-                    "Parquet footer declares an unmappable field descriptor (e.g. an empty field name).", ex);
-            }
+            StructType schema = MapFooterSchemaFailClosed(reader);
 
             // Correlate the footer field_ids with the leaves (BuildFieldIdMap fails closed on a duplicate
             // field_id — a typed DeltaStorageException that propagates unwrapped, mirroring the ReadAsync id

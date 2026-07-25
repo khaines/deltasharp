@@ -362,6 +362,12 @@ internal sealed class ChangeFeedReader
                 {
                     if (action is AddCdcFileAction cdc)
                     {
+                        // `ctx.ResolveByFieldId` (the END snapshot's mode) drives BOTH the gate and the read, so
+                        // they can never disagree on mode. This relies on Delta column-mapping mode being
+                        // IMMUTABLE (id mode is set at table creation and cannot be toggled later), so every
+                        // version in a range shares the end's mode. A hostile log that toggled mode mid-range
+                        // still fails closed consistently: a name/none cdc file carries no footer field_ids, so
+                        // the id-mode gate rejects it (missing by id) and the id-mode read would too.
                         await ValidateExplicitCdcSchemaAsync(
                             cdc.Path, versionPhysicalDataSchema, v, ctx.ResolveByFieldId, cancellationToken)
                             .ConfigureAwait(false);
@@ -660,6 +666,20 @@ internal sealed class ChangeFeedReader
             {
                 if (string.Equals(column.Name, ChangeDataWriter.ChangeTypeColumn, StringComparison.Ordinal))
                 {
+                    if (column.FieldId is not null)
+                    {
+                        // A well-formed cdc file NEVER column-maps `_change_type` (it is engine-written by
+                        // literal name and read by name, in both EE-08 presence and the projection). A foreign
+                        // file that stamped a field_id on it is malformed — reject it PRECISELY at the gate so
+                        // EE-08 stays strictly symmetric with the read (which would otherwise fail it closed
+                        // less precisely as a schema-evolution error). Path-free (#653): only the fixed engine
+                        // literal is named.
+                        throw NewCdcSchemaMismatch(
+                            version,
+                            $"the engine-synthesized '{ChangeDataWriter.ChangeTypeColumn}' column must not "
+                            + "carry a column-mapping field_id");
+                    }
+
                     continue;
                 }
 
@@ -679,6 +699,16 @@ internal sealed class ChangeFeedReader
                 }
             }
 
+            // `_change_type` PRESENCE is checked BEFORE the data-column comparison — SAME position as the
+            // name/none branch below (so a file missing both `_change_type` and a data column reports the
+            // engine-column absence first, consistently across modes).
+            if (!sawChangeType)
+            {
+                throw NewCdcSchemaMismatch(
+                    version,
+                    $"it is missing the engine-synthesized '{ChangeDataWriter.ChangeTypeColumn}' column");
+            }
+
             foreach (StructField expectedField in expected)
             {
                 if (!ColumnMapping.TryGetId(expectedField, out long id))
@@ -690,7 +720,11 @@ internal sealed class ChangeFeedReader
                         version, "a version metadata column lacks a column-mapping id");
                 }
 
-                if (!fileByFieldId.TryGetValue((int)id, out DataType? fileType))
+                // Mirror the read's field-id guard (ParquetFileReader.ResolveFileFields): a column-mapping id
+                // outside the Parquet footer's int field_id range can never match a footer field_id, so treat
+                // it as MISSING (fail closed) rather than narrowing-cast it into a spurious match. Keeps EE-08's
+                // acceptance set identical to the read's.
+                if (id is < 0 or > int.MaxValue || !fileByFieldId.TryGetValue((int)id, out DataType? fileType))
                 {
                     // The column-mapping id is a version-metadata integer (the trusted authority) — safe to
                     // name; the file's physical name is NOT (#653).
@@ -707,13 +741,6 @@ internal sealed class ChangeFeedReader
                 }
 
                 fileByFieldId.Remove((int)id);
-            }
-
-            if (!sawChangeType)
-            {
-                throw NewCdcSchemaMismatch(
-                    version,
-                    $"it is missing the engine-synthesized '{ChangeDataWriter.ChangeTypeColumn}' column");
             }
 
             if (fileByFieldId.Count > 0 || unmappedDataColumns > 0)
