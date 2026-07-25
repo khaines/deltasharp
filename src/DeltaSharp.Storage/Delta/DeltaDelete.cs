@@ -21,13 +21,47 @@ namespace DeltaSharp.Storage.Delta;
 /// deletion-vectored row is still presented so the union with the existing DV stays idempotent), so its
 /// verdict maps directly to a file-relative physical position recorded in the new deletion vector.
 /// </summary>
+/// <remarks>
+/// <para>
+/// <b>Three-valued-logic (3VL) contract — MANDATORY.</b> A predicate MUST <see cref="ColumnVector.IsNull"/>-guard
+/// EVERY column reference it reads. A null — including a <b>schema-evolution null-fill</b>, where a DELETE
+/// re-scans a still-active NARROW data file under a wider table schema and null-fills a later-added nullable
+/// column (#645) — is three-valued-logic <b>NOT-TRUE</b>: an <c>IS NULL</c> test matches it, but every value
+/// comparison over it (<c>== v</c>, <c>&gt; 0</c>, …) does NOT match. A null must NEVER be read as
+/// <c>default(T)</c> and compared as if it were a real value.
+/// </para>
+/// <para>
+/// <b>Footgun.</b> <see cref="ColumnVector.GetValue{T}"/> and <see cref="ColumnVector.GetBytes"/> return
+/// <c>default(T)</c> / an empty span on a null slot — they do <b>NOT</b> throw. So a value comparison authored
+/// WITHOUT an <see cref="ColumnVector.IsNull"/> guard (e.g. <c>col.GetValue&lt;long&gt;(row) == 0</c>) silently
+/// matches every null-filled row and deletes the WRONG rows — a data-loss footgun surfaced by #645/#656 and
+/// tracked by #657. Author each column reference as a guarded value test
+/// (<c>!col.IsNull(row) &amp;&amp; col.GetValue&lt;T&gt;(row) == v</c>) or an <c>IS NULL</c> test
+/// (<c>col.IsNull(row)</c>).
+/// </para>
+/// <para>
+/// A DEBUG-only null-poison wrapper (<c>NullPoisonColumnBatch</c>, wired at the <see cref="DeltaDelete"/>
+/// predicate call site) enforces this in tests: a <see cref="ColumnVector.GetValue{T}"/> /
+/// <see cref="ColumnVector.GetBytes"/> read of a null slot THROWS instead of returning <c>default</c>, so an
+/// un-guarded value predicate FAILS LOUD rather than silently mis-deleting. Release builds pass the batch
+/// through unchanged (zero overhead).
+/// </para>
+/// </remarks>
 internal abstract class DeltaDeletePredicate
 {
     /// <summary>Returns <see langword="true"/> when the row at <paramref name="rowIndex"/> in the
-    /// full-schema logical <paramref name="batch"/> should be deleted.</summary>
+    /// full-schema logical <paramref name="batch"/> should be deleted. The implementation MUST honor the
+    /// class-level three-valued-logic (3VL) contract: <see cref="ColumnVector.IsNull"/>-guard every column
+    /// reference so a null (incl. a schema-evolution null-fill, #645) is treated as NOT-TRUE, never as
+    /// <c>default(T)</c>.</summary>
     public abstract bool Matches(ColumnBatch batch, int rowIndex);
 
-    /// <summary>Builds a predicate from a delegate over a full-schema logical batch and row index.</summary>
+    /// <summary>Builds a predicate from a delegate over a full-schema logical batch and row index. The delegate
+    /// MUST honor the class-level three-valued-logic (3VL) contract: <see cref="ColumnVector.IsNull"/>-guard
+    /// every column reference (a null — incl. a schema-evolution null-fill, #645 — is NOT-TRUE, never
+    /// <c>default(T)</c>). An un-guarded value read (e.g. <c>col.GetValue&lt;long&gt;(row) == 0</c>) silently
+    /// matches null-filled rows and deletes the wrong rows; a DEBUG-only null-poison guard makes that FAIL LOUD
+    /// in tests (#657).</summary>
     public static DeltaDeletePredicate FromRowPredicate(Func<ColumnBatch, int, bool> predicate)
     {
         ArgumentNullException.ThrowIfNull(predicate);
@@ -469,10 +503,20 @@ internal sealed class DeltaDelete
             {
                 ColumnBatch fullBatch = ColumnMappingProjection.BuildFullBatch(
                     add, tableSchema, physicalNames, dataOrdinalByField, dataBatch);
+#if DEBUG
+                // #657: in DEBUG, evaluate the predicate against a NULL-POISON view of fullBatch so a DELETE
+                // delegate that reads a value WITHOUT an IsNull guard (the 3VL footgun #645/#656 exposed on a
+                // schema-evolution null-fill) FAILS LOUD instead of silently matching a null slot's default(T).
+                // ONLY the predicate call is wrapped — the DV-position bookkeeping below stays keyed to the
+                // ORIGINAL fullBatch/row. Release builds set predicateBatch = fullBatch (zero prod overhead).
+                ColumnBatch predicateBatch = new NullPoisonColumnBatch(fullBatch);
+#else
+                ColumnBatch predicateBatch = fullBatch;
+#endif
                 List<int>? batchSelection = null;
                 for (int row = 0; row < fullBatch.RowCount; row++)
                 {
-                    if (predicate.Matches(fullBatch, row))
+                    if (predicate.Matches(predicateBatch, row))
                     {
                         long position = fileRowOffset + row;
                         if (deleted.Add(position))
@@ -584,3 +628,117 @@ internal sealed class DeltaDelete
         long NewlyDeletedCount,
         IReadOnlyList<ColumnBatch> NewlyDeletedRows);
 }
+
+#if DEBUG
+/// <summary>
+/// DEBUG-only null-poison view over a <see cref="ColumnBatch"/> that enforces the <see cref="DeltaDeletePredicate"/>
+/// three-valued-logic (3VL) contract (#657). It wraps the full-schema logical batch handed to a predicate so an
+/// un-<see cref="ColumnVector.IsNull"/>-guarded value read of a null slot (incl. a schema-evolution null-fill,
+/// #645) FAILS LOUD instead of silently returning <c>default(T)</c> and mis-deleting. Every member delegates to
+/// the inner batch; <see cref="Column(int)"/> (and <see cref="ColumnBatch.Column(string)"/> via the base)
+/// returns a <see cref="NullPoisonColumnVector"/>. Compiled only in DEBUG — Release passes the batch through
+/// unchanged (zero production overhead).
+/// </summary>
+internal sealed class NullPoisonColumnBatch : ColumnBatch
+{
+    private readonly ColumnBatch _inner;
+
+    public NullPoisonColumnBatch(ColumnBatch inner) => _inner = inner;
+
+    /// <inheritdoc/>
+    public override StructType Schema => _inner.Schema;
+
+    /// <inheritdoc/>
+    public override int RowCount => _inner.RowCount;
+
+    /// <inheritdoc/>
+    public override int ColumnCount => _inner.ColumnCount;
+
+    /// <inheritdoc/>
+    public override SelectionVector? Selection => _inner.Selection;
+
+    /// <inheritdoc/>
+    public override ColumnVector Column(int ordinal) => new NullPoisonColumnVector(_inner.Column(ordinal));
+
+    /// <inheritdoc/>
+    public override ColumnBatch Slice(int offset, int length) =>
+        new NullPoisonColumnBatch(_inner.Slice(offset, length));
+
+    /// <inheritdoc/>
+    public override ColumnBatch WithSelection(SelectionVector selection) =>
+        new NullPoisonColumnBatch(_inner.WithSelection(selection));
+}
+
+/// <summary>
+/// DEBUG-only null-poison view over a <see cref="ColumnVector"/> (#657). Every member delegates to the inner
+/// vector EXCEPT <see cref="GetValue{T}"/> and <see cref="GetBytes"/>: when the inner slot is null those THROW a
+/// fixed 3VL-violation <see cref="InvalidOperationException"/> instead of returning <c>default(T)</c> / an empty
+/// span, so a DELETE predicate that reads a value without an <see cref="IsNull"/> guard fails loud (the #657
+/// footgun). The message carries NO row values, column names, or paths (#653 hygiene).
+/// </summary>
+internal sealed class NullPoisonColumnVector : ColumnVector
+{
+    // Fixed, value-free message (#653 hygiene: no row values / column names / paths in a failure message).
+    internal const string PoisonMessage =
+        "DELETE predicate read a null value at a column without an IsNull guard — three-valued-logic (3VL) "
+        + "violation (#657): a null (incl. a schema-evolution null-fill) must be treated as NOT-TRUE, never "
+        + "default(T). IsNull-guard every column reference.";
+
+    private readonly ColumnVector _inner;
+
+    public NullPoisonColumnVector(ColumnVector inner)
+        : base(inner.Type) => _inner = inner;
+
+    /// <inheritdoc/>
+    public override int Length => _inner.Length;
+
+    /// <inheritdoc/>
+    public override int Offset => _inner.Offset;
+
+    /// <inheritdoc/>
+    public override bool HasNulls => _inner.HasNulls;
+
+    /// <inheritdoc/>
+    public override int NullCount => _inner.NullCount;
+
+    /// <inheritdoc/>
+    public override bool IsNull(int index) => _inner.IsNull(index);
+
+    /// <inheritdoc/>
+    public override bool TryGetValidity(out Validity validity) => _inner.TryGetValidity(out validity);
+
+    /// <summary>
+    /// Delegates to the inner bulk span and is intentionally NOT poisoned: it returns EVERY slot at once, so a
+    /// per-slot null throw is impossible here (a caller reading the whole span must pair it with
+    /// <see cref="IsNull"/>, per the base contract). The common per-row <see cref="GetValue{T}"/> /
+    /// <see cref="GetBytes"/> footgun — the one a naive DELETE delegate hits — IS caught; this residual is by design.
+    /// </summary>
+    public override ReadOnlySpan<T> GetValues<T>() => _inner.GetValues<T>();
+
+    /// <summary>Poisoned (#657): THROWS on a null slot instead of returning <c>default(T)</c>.</summary>
+    public override T GetValue<T>(int index)
+    {
+        if (_inner.IsNull(index))
+        {
+            throw new InvalidOperationException(PoisonMessage);
+        }
+
+        return _inner.GetValue<T>(index);
+    }
+
+    /// <summary>Poisoned (#657): THROWS on a null slot instead of returning an empty span.</summary>
+    public override ReadOnlySpan<byte> GetBytes(int index)
+    {
+        if (_inner.IsNull(index))
+        {
+            throw new InvalidOperationException(PoisonMessage);
+        }
+
+        return _inner.GetBytes(index);
+    }
+
+    /// <inheritdoc/>
+    public override ColumnVector Slice(int offset, int length) =>
+        new NullPoisonColumnVector(_inner.Slice(offset, length));
+}
+#endif
