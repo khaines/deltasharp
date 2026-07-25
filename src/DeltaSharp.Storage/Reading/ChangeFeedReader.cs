@@ -341,6 +341,29 @@ internal sealed class ChangeFeedReader
                 }
             }
 
+            // Fail closed on a column-mapping MODE transition WITHIN the range. Every version's files (explicit
+            // cdc AND implicit add/remove) are read through the END snapshot's mode (`ctx`) — its physical-name
+            // / field-id resolution. A historical version authored under a DIFFERENT mode would be MISMAPPED
+            // (e.g. an id-mode cdc file with swapped footer field_ids, read by NAME when the end is name mode,
+            // surfaces WRONG change rows). Delta column-mapping mode is IMMUTABLE (id is creation-only, name is
+            // sticky), so a differing per-version mode is a corrupt/forged `_delta_log`; fail closed rather than
+            // emit mismapped change data. (Pre-existing since the #658 end-mode read; hardened here with #662.)
+            // Path-free (#653): only the bounded version is named.
+            //
+            // SCOPE (partial mitigation): this catches a mode change at any version IN `[start, end]`. It does
+            // NOT catch a file referenced by a `remove` in the range but AUTHORED before `start` under a
+            // different mode (implicit-DELETE of a historical file across a mode boundary) — the per-version
+            // check never inspects the historical version's mode. Full-history mode-immutability validation is
+            // tracked in #671 (pre-existing, requires a forged/illegal mode-change log — an actor with
+            // `_delta_log` write access).
+            if (ColumnMapping.ResolveMode(currentMetadata.Configuration) != ctx.Mode)
+            {
+                throw new DeltaReadException(
+                    $"The change-feed range crosses a column-mapping mode change at version {v}; the range is "
+                    + "read through a single (end-snapshot) column-mapping mode, so a mode transition is not "
+                    + "supported and the read fails closed rather than risk emitting mismapped change data.");
+            }
+
             // Precedence (INV C1/C2, §2.2): ANY cdc action ⇒ explicit (read exactly the cdc rows, ignore
             // add/remove — no double count); otherwise implicit (derive from add/remove — no miss).
             bool hasCdc = false;
@@ -362,8 +385,14 @@ internal sealed class ChangeFeedReader
                 {
                     if (action is AddCdcFileAction cdc)
                     {
+                        // `ctx.ResolveByFieldId` (the END snapshot's mode) drives BOTH the gate and the read,
+                        // so they never disagree on mode within a version. A range that crossed a column-mapping
+                        // MODE transition — which would mismap a historical version read through the end's mode —
+                        // was already failed closed above (the per-version mode-consistency check), so by here
+                        // every version in the range provably shares the end snapshot's mode.
                         await ValidateExplicitCdcSchemaAsync(
-                            cdc.Path, versionPhysicalDataSchema, v, cancellationToken).ConfigureAwait(false);
+                            cdc.Path, versionPhysicalDataSchema, v, ctx.ResolveByFieldId, cancellationToken)
+                            .ConfigureAwait(false);
                         await foreach (ColumnBatch batch in ReadExplicitFileAsync(
                                 cdc, ctx, v, commitMillis, cancellationToken).ConfigureAwait(false))
                         {
@@ -556,7 +585,7 @@ internal sealed class ChangeFeedReader
         bool allowTypeWideningPromotion = TypeWideningFeature.Supports(end.Protocol);
         return new OutputContext(
             info.Schema, tableSchema, physicalDataSchema, physicalNames, dataOrdinalByField, resolveByFieldId,
-            allowTypeWideningPromotion);
+            mode, allowTypeWideningPromotion);
     }
 
     // §3.2 CDF-EE-08: builds the version's expected PHYSICAL data-leaf schema from its log-resident metadata
@@ -595,15 +624,20 @@ internal sealed class ChangeFeedReader
     // closed on a mismatch (a missing/extra data column, or a leaf-type disagreement), distinct from the
     // NotFound/vacuumed classification (CDF-EE-09) and the corrupt-body classification (CDF-EE-07).
     private async Task ValidateExplicitCdcSchemaAsync(
-        string path, StructType versionPhysicalDataSchema, long version, CancellationToken cancellationToken)
+        string path, StructType versionPhysicalDataSchema, long version, bool resolveByFieldId,
+        CancellationToken cancellationToken)
     {
-        StructType fileSchema;
+        IReadOnlyList<ParquetFileReader.ParquetLeafColumn> fileColumns;
         try
         {
             Stream stream = await _backend.OpenReadAsync(path, cancellationToken).ConfigureAwait(false);
             await using (stream.ConfigureAwait(false))
             {
-                fileSchema = await _reader.ReadDataSchemaAsync(stream, cancellationToken).ConfigureAwait(false);
+                // Field-id-aware in id mode (#662): the leaf columns carry their footer field_id so a foreign
+                // id-mode cdc file — whose physical names may diverge from the metaData physicalNames — is
+                // validated by field_id (the same authority the read resolves by), not by physical name.
+                fileColumns = await _reader.ReadDataLeafColumnsAsync(stream, cancellationToken)
+                    .ConfigureAwait(false);
             }
         }
         catch (DeltaStorageException ex)
@@ -611,34 +645,153 @@ internal sealed class ChangeFeedReader
             throw ClassifyFileError(ex);
         }
 
-        ValidateCdcLeafSchema(version, versionPhysicalDataSchema, fileSchema);
+        ValidateCdcLeafSchema(version, versionPhysicalDataSchema, fileColumns, resolveByFieldId);
     }
 
-    // The leaf comparison for CDF-EE-08. Physical names are 1:1 with field-ids in DeltaSharp's mapping (a
-    // renamed column keeps its physical name/id), so matching by physical name + leaf DataType validates both
-    // name and id modes. The synthesized `_change_type` column is excluded from the DATA-column comparison (it
-    // is engine-owned, not part of a version's data schema, and its VALUE domain is validated separately, per
-    // batch, in ValidateChangeTypeColumn) — but its PRESENCE is required: the single-pass read (#658) projects
+    // The leaf comparison for CDF-EE-08. In column-mapping <b>id</b> mode the cdc file's data columns are
+    // validated by <c>field_id</c> — the Delta id-mode authority (#662): a FOREIGN id-mode cdc file's physical
+    // Parquet column names may diverge from the metaData <c>physicalName</c>s, so the footer <c>field_id</c>
+    // (not the physical name) is what resolves them, symmetric with the read (which reads that same file by
+    // field-id). In name/none mode the columns are validated by physical name + leaf DataType (there are no
+    // field_ids to trust). The synthesized `_change_type` column is excluded from the DATA-column comparison
+    // (it is engine-owned, carries no field_id, and its VALUE domain is validated separately, per batch, in
+    // ValidateChangeTypeColumn) — but its PRESENCE is required: the single-pass read (#658) projects
     // `_change_type` by name alongside the data columns, so a cdc file lacking it is a corrupt/foreign file that
     // is failed closed HERE with a precise "missing `_change_type`" error, rather than reaching the read and
     // surfacing the misleading data-column DeltaReadSchemaEvolutionException ("missing a required column the
     // table schema demands") for an engine column.
     private static void ValidateCdcLeafSchema(
-        long version, StructType expected, StructType fileSchema)
+        long version, StructType expected,
+        IReadOnlyList<ParquetFileReader.ParquetLeafColumn> fileColumns, bool resolveByFieldId)
     {
-        var fileByName = new Dictionary<string, DataType>(StringComparer.Ordinal);
+        // `_change_type` PRESENCE (the #658 check): the engine-synthesized column is REQUIRED in every cdc body
+        // (§2.2) and is EXCLUDED from the data-column comparison below. Its name is a FIXED engine literal —
+        // safe to name under #653. Computed once; both mode branches share it.
         bool sawChangeType = false;
-        foreach (StructField field in fileSchema)
+        foreach (ParquetFileReader.ParquetLeafColumn column in fileColumns)
         {
-            if (string.Equals(field.Name, ChangeDataWriter.ChangeTypeColumn, StringComparison.Ordinal))
+            if (string.Equals(column.Name, ChangeDataWriter.ChangeTypeColumn, StringComparison.Ordinal))
             {
                 sawChangeType = true;
+                break;
+            }
+        }
+
+        if (resolveByFieldId)
+        {
+            // id mode: key the file's data columns by footer field_id (the id-mode authority). `_change_type`
+            // carries no field_id (skipped); any OTHER data column missing a field_id is anomalous in id mode —
+            // counted (bounded) as surplus, never named (#653).
+            var fileByFieldId = new Dictionary<int, DataType>();
+            int unmappedDataColumns = 0;
+            foreach (ParquetFileReader.ParquetLeafColumn column in fileColumns)
+            {
+                if (string.Equals(column.Name, ChangeDataWriter.ChangeTypeColumn, StringComparison.Ordinal))
+                {
+                    if (column.FieldId is not null)
+                    {
+                        // A well-formed cdc file NEVER column-maps `_change_type` (it is engine-written by
+                        // literal name and read by name, in both EE-08 presence and the projection). A foreign
+                        // file that stamped a field_id on it is malformed — reject it PRECISELY at the gate so
+                        // EE-08 stays strictly symmetric with the read (which would otherwise fail it closed
+                        // less precisely as a schema-evolution error). Path-free (#653): only the fixed engine
+                        // literal is named.
+                        throw NewCdcSchemaMismatch(
+                            version,
+                            $"the engine-synthesized '{ChangeDataWriter.ChangeTypeColumn}' column must not "
+                            + "carry a column-mapping field_id");
+                    }
+
+                    continue;
+                }
+
+                if (column.FieldId is not int fieldId)
+                {
+                    unmappedDataColumns++;
+                    continue;
+                }
+
+                if (!fileByFieldId.TryAdd(fieldId, column.Type))
+                {
+                    // Defense-in-depth, UNREACHABLE via the read path: BuildFieldIdMap (called inside
+                    // ReadDataLeafColumnsAsync, before this validator) already rejects a duplicate field_id
+                    // fail-closed. Retained (in case that upstream invariant ever changes) but path-free: it
+                    // names no file-derived token, only that a duplicate exists (#653).
+                    throw NewCdcSchemaMismatch(version, "it declares a data column more than once");
+                }
+            }
+
+            // `_change_type` PRESENCE is checked BEFORE the data-column comparison — SAME position as the
+            // name/none branch below (so a file missing both `_change_type` and a data column reports the
+            // engine-column absence first, consistently across modes).
+            if (!sawChangeType)
+            {
+                throw NewCdcSchemaMismatch(
+                    version,
+                    $"it is missing the engine-synthesized '{ChangeDataWriter.ChangeTypeColumn}' column");
+            }
+
+            foreach (StructField expectedField in expected)
+            {
+                if (!ColumnMapping.TryGetId(expectedField, out long id))
+                {
+                    // UNREACHABLE for well-formed id-mode metadata: BuildDataSchema preserves each field's
+                    // delta.columnMapping.id, so an id-mode version's expected columns always carry one. Fail
+                    // closed (never silently fall back to name matching) with a path-free reason (#653).
+                    throw NewCdcSchemaMismatch(
+                        version, "a version metadata column lacks a column-mapping id");
+                }
+
+                // Mirror the read's field-id guard (ParquetFileReader.ResolveFileFields): a column-mapping id
+                // outside the Parquet footer's int field_id range can never match a footer field_id, so treat
+                // it as MISSING (fail closed) rather than narrowing-cast it into a spurious match. Keeps EE-08's
+                // acceptance set identical to the read's.
+                if (id is < 0 or > int.MaxValue || !fileByFieldId.TryGetValue((int)id, out DataType? fileType))
+                {
+                    // The column-mapping id is a version-metadata integer (the trusted authority) — safe to
+                    // name; the file's physical name is NOT (#653).
+                    throw NewCdcSchemaMismatch(
+                        version, $"it is missing the version's data column with column-mapping id {id}");
+                }
+
+                if (!expectedField.DataType.Equals(fileType))
+                {
+                    throw NewCdcSchemaMismatch(
+                        version,
+                        $"the data column with column-mapping id {id} has leaf type {fileType.SimpleString} but "
+                        + $"the version's metadata declares {expectedField.DataType.SimpleString}");
+                }
+
+                fileByFieldId.Remove((int)id);
+            }
+
+            if (fileByFieldId.Count > 0 || unmappedDataColumns > 0)
+            {
+                // Message hygiene (#653): surplus columns (by field_id) and field-id-less data columns are both
+                // inconsistent with the version's id-mode metadata; report only the bounded COUNT, never a
+                // file-derived name/field_id.
+                throw NewCdcSchemaMismatch(
+                    version,
+                    $"it declares {fileByFieldId.Count + unmappedDataColumns} data column(s) absent from the "
+                    + "version's metadata schema");
+            }
+
+            return;
+        }
+
+        // name/none mode: validate by physical name + leaf DataType — the pre-#662 behavior, now consuming the
+        // leaf list instead of a StructType.
+        var fileByName = new Dictionary<string, DataType>(StringComparer.Ordinal);
+        foreach (ParquetFileReader.ParquetLeafColumn column in fileColumns)
+        {
+            if (string.Equals(column.Name, ChangeDataWriter.ChangeTypeColumn, StringComparison.Ordinal))
+            {
                 continue;
             }
 
-            if (!fileByName.TryAdd(field.Name, field.DataType))
+            if (!fileByName.TryAdd(column.Name, column.Type))
             {
-                // Defense-in-depth, UNREACHABLE via the read path: ReadDataSchemaAsync (called before this
+                // Defense-in-depth, UNREACHABLE via the read path: ReadDataLeafColumnsAsync (called before this
                 // validator) builds a StructType, whose ctor rejects duplicate field names
                 // (SchemaValidationException, STORY-02.5.1 AC2) and is re-mapped to CorruptData — so a
                 // duplicate-column cdc file fails closed upstream before EE-08 runs. Retained fail-closed
@@ -1064,5 +1217,6 @@ internal sealed class ChangeFeedReader
         string[] PhysicalNames,
         int[] DataOrdinalByField,
         bool ResolveByFieldId,
+        ColumnMappingMode Mode,
         bool AllowTypeWideningPromotion);
 }

@@ -842,22 +842,305 @@ public sealed class ChangeFeedReadTests : IDisposable
             rows.OrderBy(r => r.Id).Select(r => (r.Id, r.Name, r.ChangeType, r.Version)).ToArray());
     }
 
-    // EXPLICIT (cdc) PATH — DEFERRED, and NOT faked (#660). The task also asked for a foreign-table field-id
-    // discriminator on the EXPLICIT cdc read path. It is structurally INFEASIBLE to make such a test both GREEN
-    // on real code AND RED under the byFieldId = null mutation, so NO explicit-path test is added here:
-    //   * Before the explicit path resolves any data column by field_id, ChangeFeedReader validates the cdc
-    //     file's decoded leaf schema against the version's log-resident metadata BY PHYSICAL NAME + leaf type
-    //     (CDF-EE-08, ValidateCdcLeafSchema). A FOREIGN cdc file whose physical names DIVERGE from the metaData
-    //     physicalNames (the only shape that makes field-id resolution load-bearing) is REJECTED at EE-08
-    //     ("missing the version's data column 'col-A'") on BOTH real and mutated code — so it cannot
-    //     discriminate the mutation (it fails identically either way, for a different reason).
-    //   * If instead the cdc file's data columns are named to MATCH the metaData physicalNames (so EE-08
-    //     passes), then — exactly as for a DeltaSharp-authored table — field-id and name resolution are
-    //     indistinguishable, and the read stays GREEN under the mutation.
-    // Hence EE-08's name-equality gate structurally precedes and subsumes the explicit path's resolveByFieldId,
-    // making it non-load-bearing for a divergent-name foreign table. This is a genuine coverage gap in the CDF
-    // explicit read (its field-id resolution is dead code for foreign tables), reported to the orchestrator —
-    // covering it honestly needs an EE-08-relaxation or a reader change, not a hand-authored cdc file.
+    [Fact]
+    public async Task ColumnMapping_IdMode_ExplicitPath_ForeignTable_ResolvesByFieldId()
+    {
+        // RED-TEAM DISCRIMINATOR (#662) — the EXPLICIT (cdc) sibling of the implicit-path test above. Before
+        // #662, CDF-EE-08 (ValidateCdcLeafSchema) validated a cdc file's leaf schema against the version's
+        // metadata BY PHYSICAL NAME + leaf type, which STRUCTURALLY REJECTED any FOREIGN id-mode cdc file whose
+        // physical names diverge from the metaData physicalNames ("missing the version's data column 'col-A'")
+        // — so the explicit path's field-id resolution was DEAD CODE for exactly the files that need it. #662
+        // makes EE-08 validate by delta.columnMapping.id (footer field_id) in id mode, matching the read.
+        //
+        // This hand-authors a FOREIGN id-mode CDC commit: logical id(field_id 1)/name(field_id 2) with
+        // physicalNames col-A/col-B, but a cdc BODY whose physical Parquet columns are named z0/z1, stored in
+        // the OPPOSITE order [z0=name(field_id 2), z1=id(field_id 1)], carrying a `_change_type` column (no
+        // field_id) plus a distinct per-row change type. Only field-id resolution can (a) PASS EE-08 and
+        // (b) READ the divergently-named/reordered body: a by-name read looks for "col-A"/"col-B" (absent from
+        // the file) and — because logical `id` is NON-nullable — fails closed. So this test is GREEN on real
+        // code and goes RED if EITHER EE-08 or the reader reverts to by-name (verified out of band, #662). The
+        // reversed physical order additionally defeats any positional read.
+        await SeedForeignIdModeExplicitCdcFlatTableAsync();   // v0 metaData (id mode, CDF on), v1 foreign cdc
+
+        (DeltaChangeFeedInfo info, List<ColumnBatch> batches) = await ReadCdfBatchesAsync(
+            DeltaChangeFeedRange.FromVersion(1, 1));
+        AssertCdfOutputSchema(info.Schema, FlatSchema);   // LOGICAL id/name surfaced, never the physical z0/z1
+        (List<FlatChange> rows, _) = DecodeFlatChanges(batches);
+
+        // The LOGICAL id/name values AND the per-row `_change_type`, resolved by field_id from the divergently-
+        // named / reversed-order physical cdc body (a by-name read cannot locate any of them).
+        Assert.Equal(
+            new[]
+            {
+                (1L, (string?)"a", ChangeDataWriter.DeleteChange, 1L),
+                (2L, "b", ChangeDataWriter.InsertChange, 1L),
+                (3L, "c", ChangeDataWriter.UpdatePostimageChange, 1L),
+            },
+            rows.OrderBy(r => r.Id).Select(r => (r.Id, r.Name, r.ChangeType, r.Version)).ToArray());
+    }
+
+    [Fact]
+    public async Task Explicit_CdcRangeCrossesColumnMappingModeChange_FailsClosed_NoMismappedRows()
+    {
+        // Fail-closed hardening (#662 red-team; pre-existing since the #658 end-mode read). The CDF read
+        // interprets EVERY version through the END snapshot's column-mapping mode. A forged `_delta_log` that
+        // toggles column-mapping mode mid-range (here id→name — a transition Delta forbids and DeltaSharp's own
+        // committer rejects, so only a raw-log attacker can author it) would otherwise read a HISTORICAL id-mode
+        // cdc file BY NAME when the end is name mode, silently surfacing MISMAPPED change rows (a swapped-field_id
+        // secret). The per-version mode-consistency check fails the read closed instead — the secret never
+        // surfaces, and the cdc PATH is not echoed (#653).
+        const string secret = "midrange_s3cret_leak_7d6f";
+        var fileSchema = new StructType(new[]
+        {
+            PhysFieldWithId("col-A", DataTypes.LongType, nullable: false, id: 2),   // swapped ids vs the schema
+            PhysFieldWithId("col-B", DataTypes.StringType, nullable: true, id: 1),
+            new StructField(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: false),
+        });
+        MutableColumnVector colA = ColumnVectors.Create(DataTypes.LongType, 1);
+        MutableColumnVector colB = ColumnVectors.Create(DataTypes.StringType, 1);
+        MutableColumnVector changeType = ColumnVectors.Create(DataTypes.StringType, 1);
+        colA.AppendValue(991L);
+        colB.AppendBytes(Encoding.UTF8.GetBytes(secret));
+        changeType.AppendBytes(Encoding.UTF8.GetBytes(ChangeDataWriter.InsertChange));
+        var body = new ManagedColumnBatch(fileSchema, new ColumnVector[] { colA, colB, changeType }, 1);
+        byte[] parquet;
+        using (var buffer = new MemoryStream())
+        {
+            await new ParquetFileWriter().WriteAsync(buffer, fileSchema, new[] { body }, CancellationToken.None);
+            parquet = buffer.ToArray();
+        }
+
+        const string path = "_change_data/mode-toggle-cdc.parquet";
+        using var backend = new LocalFileSystemBackend(_root);
+        await backend.PutIfAbsentAsync(path, parquet, CancellationToken.None);
+
+        const string schemaJson =
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
+            + "{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-A\"}},"
+            + "{\"name\":\"name\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"col-B\"}}]}";
+        string escaped = JsonSerializer.Serialize(schemaJson);
+        const string protocol =
+            "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,"
+            + "\"readerFeatures\":[\"columnMapping\"],"
+            + "\"writerFeatures\":[\"columnMapping\",\"changeDataFeed\"]}}";
+        string MetaLine(string mode) =>
+            "{\"metaData\":{\"id\":\"rt\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
+            + "\"schemaString\":" + escaped + ",\"partitionColumns\":[],\"configuration\":{"
+            + "\"delta.columnMapping.mode\":\"" + mode + "\",\"delta.columnMapping.maxColumnId\":\"2\","
+            + "\"delta.enableChangeDataFeed\":\"true\"}}}";
+        string cdc =
+            $"{{\"cdc\":{{\"path\":\"{path}\",\"partitionValues\":{{}},\"size\":{parquet.Length},"
+            + "\"dataChange\":false}}";
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000000.json",
+            Encoding.UTF8.GetBytes(protocol + "\n" + MetaLine("id") + "\n"), CancellationToken.None);
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000001.json", Encoding.UTF8.GetBytes(cdc + "\n"), CancellationToken.None);
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000002.json",
+            Encoding.UTF8.GetBytes(MetaLine("name") + "\n"), CancellationToken.None);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(1, 2)));
+        Assert.Contains("column-mapping mode change", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(secret, ex.Message, StringComparison.Ordinal);   // mismapped secret never surfaces
+        Assert.DoesNotContain(path, ex.Message, StringComparison.Ordinal);     // #653: no cdc-path leak
+    }
+
+    // ------------------------------------------------- #662 id-mode EE-08 NEGATIVE (fail-closed) tests
+    //
+    // The positive test above proves the id-branch of ValidateCdcLeafSchema ACCEPTS a well-formed foreign
+    // id-mode cdc body. The six tests below prove it REJECTS every malformed one — one test per fail-closed
+    // gate in the id-branch (#670 review council finding: the id-branch throws were mutation-vacuous, i.e. no
+    // test depended on them). Each authors a DEFECTIVE foreign id-mode cdc body (id-mode metaData ⇒ the reader
+    // sets ctx.ResolveByFieldId, so the id-branch runs), reads the explicit CDF over the cdc version, and
+    // asserts (a) a DeltaReadException — NOT the sibling DeltaReadSchemaEvolutionException, so the throw is the
+    // precise EE-08 gate, not an incidental read fault — carrying (b) the exact gate fragment AND the
+    // "CDF-EE-08" marker, and (c) #653 hygiene: the attacker-baked physical-name sentinel is ABSENT from the
+    // surfaced message. Every gate is mutation-verified out of band (neuter the throw ⇒ the matching test goes
+    // RED), so none is dead code.
+
+    [Fact]
+    public async Task ColumnMapping_IdMode_Explicit_MissingDataColumnByFieldId_FailsClosed()
+    {
+        // GATE: an expected id-mode data column whose field_id is ABSENT from the cdc body. The body carries
+        // `_change_type` and ONLY the version's field_id-2 column (under the attacker sentinel name); field_id 1
+        // is omitted. EE-08 must fail closed naming ONLY the trusted metadata integer id (1), never the file's
+        // physical name (#653).
+        var schema = new StructType(new[]
+        {
+            PhysFieldWithId(ForeignIdModePhysNameSentinel, DataTypes.StringType, nullable: true, id: 2),
+            new StructField(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: false),
+        });
+        MutableColumnVector name = ColumnVectors.Create(DataTypes.StringType, 1);
+        MutableColumnVector changeType = ColumnVectors.Create(DataTypes.StringType, 1);
+        name.AppendBytes(Encoding.UTF8.GetBytes("a"));
+        changeType.AppendBytes(Encoding.UTF8.GetBytes(ChangeDataWriter.DeleteChange));
+        await WriteForeignIdModeExplicitCdcCommitAsync(
+            schema, new ManagedColumnBatch(schema, new ColumnVector[] { name, changeType }, 1));
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(1, 1)));
+        Assert.Contains(
+            "missing the version's data column with column-mapping id", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("column-mapping id 1", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("CDF-EE-08", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(ForeignIdModePhysNameSentinel, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ColumnMapping_IdMode_Explicit_LeafTypeMismatchByFieldId_FailsClosed()
+    {
+        // GATE: a cdc body column whose footer field_id matches an expected id but whose LEAF TYPE does not.
+        // field_id 1 (metadata: long) is stamped onto a STRING column (under the sentinel name). EE-08 must
+        // fail closed naming the column-mapping id + the bounded type tokens — never the physical name (#653).
+        var schema = new StructType(new[]
+        {
+            PhysFieldWithId(ForeignIdModePhysNameSentinel, DataTypes.StringType, nullable: true, id: 1),
+            PhysFieldWithId("z0", DataTypes.StringType, nullable: true, id: 2),
+            new StructField(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: false),
+        });
+        MutableColumnVector wrongTyped = ColumnVectors.Create(DataTypes.StringType, 1);
+        MutableColumnVector name = ColumnVectors.Create(DataTypes.StringType, 1);
+        MutableColumnVector changeType = ColumnVectors.Create(DataTypes.StringType, 1);
+        wrongTyped.AppendBytes(Encoding.UTF8.GetBytes("x"));
+        name.AppendBytes(Encoding.UTF8.GetBytes("a"));
+        changeType.AppendBytes(Encoding.UTF8.GetBytes(ChangeDataWriter.InsertChange));
+        await WriteForeignIdModeExplicitCdcCommitAsync(
+            schema,
+            new ManagedColumnBatch(schema, new ColumnVector[] { wrongTyped, name, changeType }, 1));
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(1, 1)));
+        Assert.Contains("has leaf type", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("column-mapping id 1", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("CDF-EE-08", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(ForeignIdModePhysNameSentinel, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ColumnMapping_IdMode_Explicit_SurplusFieldIdColumn_FailsClosed()
+    {
+        // GATE (surplus by field_id): the body carries the 2 expected id-mode columns + `_change_type` + an
+        // EXTRA data column bearing an UNEXPECTED field_id (99) under the attacker sentinel name. EE-08 must
+        // report only the bounded surplus COUNT — never the column's physical name OR its field_id (#653).
+        var schema = new StructType(new[]
+        {
+            PhysFieldWithId("z0", DataTypes.StringType, nullable: true, id: 2),
+            PhysFieldWithId("z1", DataTypes.LongType, nullable: false, id: 1),
+            new StructField(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: false),
+            PhysFieldWithId(ForeignIdModePhysNameSentinel, DataTypes.LongType, nullable: true, id: 99),
+        });
+        MutableColumnVector name = ColumnVectors.Create(DataTypes.StringType, 1);
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, 1);
+        MutableColumnVector changeType = ColumnVectors.Create(DataTypes.StringType, 1);
+        MutableColumnVector surplus = ColumnVectors.Create(DataTypes.LongType, 1);
+        name.AppendBytes(Encoding.UTF8.GetBytes("a"));
+        id.AppendValue(1L);
+        changeType.AppendBytes(Encoding.UTF8.GetBytes(ChangeDataWriter.DeleteChange));
+        surplus.AppendValue(7L);
+        await WriteForeignIdModeExplicitCdcCommitAsync(
+            schema,
+            new ManagedColumnBatch(schema, new ColumnVector[] { name, id, changeType, surplus }, 1));
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(1, 1)));
+        Assert.Contains("data column(s) absent from the", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("1 data column", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("CDF-EE-08", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(ForeignIdModePhysNameSentinel, ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("99", ex.Message, StringComparison.Ordinal);   // #653: no surplus field_id leak
+    }
+
+    [Fact]
+    public async Task ColumnMapping_IdMode_Explicit_SurplusUnmappedColumn_FailsClosed()
+    {
+        // GATE (surplus via the unmappedDataColumns path): the body carries the 2 expected id-mode columns +
+        // `_change_type` + an extra data column with NO field_id (anomalous in id mode) under the attacker
+        // sentinel name. EE-08 must count it as surplus by COUNT only — never naming it (#653).
+        var schema = new StructType(new[]
+        {
+            PhysFieldWithId("z0", DataTypes.StringType, nullable: true, id: 2),
+            PhysFieldWithId("z1", DataTypes.LongType, nullable: false, id: 1),
+            new StructField(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: false),
+            new StructField(ForeignIdModePhysNameSentinel, DataTypes.LongType, nullable: true),
+        });
+        MutableColumnVector name = ColumnVectors.Create(DataTypes.StringType, 1);
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, 1);
+        MutableColumnVector changeType = ColumnVectors.Create(DataTypes.StringType, 1);
+        MutableColumnVector unmapped = ColumnVectors.Create(DataTypes.LongType, 1);
+        name.AppendBytes(Encoding.UTF8.GetBytes("a"));
+        id.AppendValue(1L);
+        changeType.AppendBytes(Encoding.UTF8.GetBytes(ChangeDataWriter.DeleteChange));
+        unmapped.AppendValue(7L);
+        await WriteForeignIdModeExplicitCdcCommitAsync(
+            schema,
+            new ManagedColumnBatch(schema, new ColumnVector[] { name, id, changeType, unmapped }, 1));
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(1, 1)));
+        Assert.Contains("data column(s) absent from the", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("1 data column", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("CDF-EE-08", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(ForeignIdModePhysNameSentinel, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ColumnMapping_IdMode_Explicit_MissingChangeType_FailsClosed()
+    {
+        // GATE (id-mode `_change_type` PRESENCE — distinct from the name-mode Explicit_CdcFileMissingChangeType
+        // Column test): the body has the 2 CORRECT id-mode data columns but NO `_change_type`. The id-branch
+        // checks presence BEFORE the data-column comparison, so it fails closed on the engine column.
+        var schema = new StructType(new[]
+        {
+            PhysFieldWithId("z0", DataTypes.StringType, nullable: true, id: 2),
+            PhysFieldWithId("z1", DataTypes.LongType, nullable: false, id: 1),
+        });
+        MutableColumnVector name = ColumnVectors.Create(DataTypes.StringType, 1);
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, 1);
+        name.AppendBytes(Encoding.UTF8.GetBytes("a"));
+        id.AppendValue(1L);
+        await WriteForeignIdModeExplicitCdcCommitAsync(
+            schema, new ManagedColumnBatch(schema, new ColumnVector[] { name, id }, 1));
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(1, 1)));
+        Assert.Contains(
+            "missing the engine-synthesized '_change_type'", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("CDF-EE-08", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ColumnMapping_IdMode_Explicit_ChangeTypeCarryingFieldId_FailsClosed()
+    {
+        // GATE (id-branch symmetry check): a well-formed cdc file NEVER column-maps `_change_type`. This body
+        // has the 2 correct id-mode data columns + a `_change_type` that CARRIES a field_id (3). EE-08 must
+        // reject it PRECISELY at the gate (path-free — only the fixed engine literal is named).
+        var schema = new StructType(new[]
+        {
+            PhysFieldWithId("z0", DataTypes.StringType, nullable: true, id: 2),
+            PhysFieldWithId("z1", DataTypes.LongType, nullable: false, id: 1),
+            PhysFieldWithId(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: false, id: 3),
+        });
+        MutableColumnVector name = ColumnVectors.Create(DataTypes.StringType, 1);
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, 1);
+        MutableColumnVector changeType = ColumnVectors.Create(DataTypes.StringType, 1);
+        name.AppendBytes(Encoding.UTF8.GetBytes("a"));
+        id.AppendValue(1L);
+        changeType.AppendBytes(Encoding.UTF8.GetBytes(ChangeDataWriter.InsertChange));
+        await WriteForeignIdModeExplicitCdcCommitAsync(
+            schema,
+            new ManagedColumnBatch(schema, new ColumnVector[] { name, id, changeType }, 1));
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(1, 1)));
+        Assert.Contains(
+            "'_change_type' column must not carry a column-mapping field_id", ex.Message,
+            StringComparison.Ordinal);
+        Assert.Contains("CDF-EE-08", ex.Message, StringComparison.Ordinal);
+    }
 
     // ---------------------------------------------------------------- DV-aware implicit derivation
 
@@ -1992,6 +2275,149 @@ public sealed class ChangeFeedReadTests : IDisposable
             $"{{\"add\":{{\"path\":\"{relativePath}\",\"partitionValues\":{{}},"
             + $"\"size\":{parquetBytes.Length},\"modificationTime\":0,\"dataChange\":true}}}}";
         byte[] v1 = Encoding.UTF8.GetBytes(addLine + "\n");
+        await backend.PutIfAbsentAsync("_delta_log/00000000000000000001.json", v1, CancellationToken.None);
+    }
+
+    // The EXPLICIT (cdc) sibling of SeedForeignIdModeCdfFlatTableAsync (#662): a FOREIGN id-mode CDF table whose
+    // v1 commits a `cdc` action (not an add), and whose cdc BODY has divergent physical column names z0/z1 in
+    // REVERSED order [z0=name(field_id 2), z1=id(field_id 1)] PLUS the engine-synthesized `_change_type` column
+    // (which carries NO field_id, so the writer stamps none — the id-mode reader resolves it by NAME). Only
+    // field-id resolution can validate (EE-08) and read this body — a by-name read looks for the metaData
+    // physicalNames col-A/col-B, which are ABSENT from the file. Logical schema id(field_id 1)/name(field_id 2);
+    // physicalNames col-A/col-B; each cdc row carries its own per-row `_change_type`.
+    //   v0: protocol (reader v3 / writer v7; columnMapping reader+writer, changeDataFeed writer) + metaData
+    //       (id-mode column mapping, delta.enableChangeDataFeed=true) — a metadata-only create commit.
+    //   v1: a `cdc` action (dataChange=false, protocol-mandated) referencing the hand-written cdc Parquet file.
+    // Reading the CDF range [1,1] reads EXACTLY the cdc rows (precedence), each carrying its own `_change_type`.
+    private async Task SeedForeignIdModeExplicitCdcFlatTableAsync()
+    {
+        var physicalSchema = new StructType(new[]
+        {
+            PhysFieldWithId("z0", DataTypes.StringType, nullable: true, id: 2),    // logical "name" (field_id 2)
+            PhysFieldWithId("z1", DataTypes.LongType, nullable: false, id: 1),     // logical "id"   (field_id 1)
+            // The engine-synthesized `_change_type` — carries NO delta.columnMapping.id, so the writer stamps no
+            // footer field_id; the id-mode read resolves it by NAME through the per-field fallback (#658).
+            new StructField(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: false),
+        });
+
+        (long Id, string Name, string ChangeType)[] rows =
+        {
+            (1, "a", ChangeDataWriter.DeleteChange),
+            (2, "b", ChangeDataWriter.InsertChange),
+            (3, "c", ChangeDataWriter.UpdatePostimageChange),
+        };
+        MutableColumnVector z0 = ColumnVectors.Create(DataTypes.StringType, rows.Length);   // name
+        MutableColumnVector z1 = ColumnVectors.Create(DataTypes.LongType, rows.Length);     // id
+        MutableColumnVector changeType = ColumnVectors.Create(DataTypes.StringType, rows.Length);
+        foreach ((long id, string name, string ct) in rows)
+        {
+            z0.AppendBytes(Encoding.UTF8.GetBytes(name));
+            z1.AppendValue(id);
+            changeType.AppendBytes(Encoding.UTF8.GetBytes(ct));
+        }
+
+        var batch = new ManagedColumnBatch(
+            physicalSchema, new ColumnVector[] { z0, z1, changeType }, rows.Length);
+
+        byte[] parquetBytes;
+        using (var buffer = new MemoryStream())
+        {
+            await new ParquetFileWriter().WriteAsync(
+                buffer, physicalSchema, new[] { batch }, CancellationToken.None);
+            parquetBytes = buffer.ToArray();
+        }
+
+        const string relativePath = "_change_data/foreign-idmode-cdc-explicit.parquet";
+        using var backend = new LocalFileSystemBackend(_root);
+        await backend.PutIfAbsentAsync(relativePath, parquetBytes, CancellationToken.None);
+
+        // Logical id/name with ids 1/2 and physicalNames col-A/col-B — names that do NOT match the Parquet
+        // z0/z1, so a name-based read cannot resolve them; only field_id works.
+        const string schemaJson =
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
+            + "{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-A\"}},"
+            + "{\"name\":\"name\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"col-B\"}}]}";
+        string escapedSchema = System.Text.Json.JsonSerializer.Serialize(schemaJson);
+
+        // reader v3 / writer v7 declaring columnMapping (reader+writer) AND changeDataFeed (writer-only), so the
+        // metaData's delta.enableChangeDataFeed is honored (ChangeDataFeedFeature.IsActive requires BOTH).
+        const string protocol =
+            "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,"
+            + "\"readerFeatures\":[\"columnMapping\"],"
+            + "\"writerFeatures\":[\"columnMapping\",\"changeDataFeed\"]}}";
+        string metadata =
+            "{\"metaData\":{\"id\":\"t\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
+            + "\"schemaString\":" + escapedSchema + ",\"partitionColumns\":[],\"configuration\":{"
+            + "\"delta.columnMapping.mode\":\"id\",\"delta.columnMapping.maxColumnId\":\"2\","
+            + "\"delta.enableChangeDataFeed\":\"true\"}}}";
+
+        byte[] v0 = Encoding.UTF8.GetBytes(protocol + "\n" + metadata + "\n");
+        await backend.PutIfAbsentAsync("_delta_log/00000000000000000000.json", v0, CancellationToken.None);
+
+        // v1: the foreign `cdc` action. The Delta protocol REQUIRES dataChange=false for a cdc action (a change
+        // file is never part of table state), and DeltaSharp parses it fail-closed.
+        string cdcLine =
+            $"{{\"cdc\":{{\"path\":\"{relativePath}\",\"partitionValues\":{{}},"
+            + $"\"size\":{parquetBytes.Length},\"dataChange\":false}}}}";
+        byte[] v1 = Encoding.UTF8.GetBytes(cdcLine + "\n");
+        await backend.PutIfAbsentAsync("_delta_log/00000000000000000001.json", v1, CancellationToken.None);
+    }
+
+    // A distinctive attacker-controlled PHYSICAL column name baked into the DEFECTIVE foreign id-mode cdc
+    // bodies authored by WriteForeignIdModeExplicitCdcCommitAsync (the #662 id-mode EE-08 negative tests).
+    // #653 message hygiene forbids echoing any file-derived physical name in an EE-08 error, so every negative
+    // test asserts this sentinel is ABSENT from the surfaced message.
+    private const string ForeignIdModePhysNameSentinel = "z_att4cker_physname_s3ntinel";
+
+    // Authoring core for the DEFECTIVE foreign id-mode EXPLICIT cdc bodies (#662 id-mode EE-08 negative tests).
+    // Writes a FOREIGN id-mode CDF table with the SAME v0 metaData as SeedForeignIdModeExplicitCdcFlatTableAsync
+    // — logical id(field_id 1, long, non-null)/name(field_id 2, string, nullable), physicalNames col-A/col-B,
+    // id-mode column mapping, CDF on — whose v1 `cdc` action references a caller-supplied, deliberately
+    // malformed physical body. Each caller injects ONE id-mode defect (missing field_id, wrong leaf type,
+    // surplus mapped/unmapped column, missing / field_id-carrying `_change_type`) so EE-08's id-branch fails
+    // closed at exactly one gate. Because the metaData is id mode, the reader sets ctx.ResolveByFieldId ⇒ the
+    // id-branch of ValidateCdcLeafSchema runs.
+    private async Task WriteForeignIdModeExplicitCdcCommitAsync(StructType physicalSchema, ColumnBatch body)
+    {
+        byte[] parquetBytes;
+        using (var buffer = new MemoryStream())
+        {
+            await new ParquetFileWriter().WriteAsync(
+                buffer, physicalSchema, new[] { body }, CancellationToken.None);
+            parquetBytes = buffer.ToArray();
+        }
+
+        const string relativePath = "_change_data/foreign-idmode-cdc-defect.parquet";
+        using var backend = new LocalFileSystemBackend(_root);
+        await backend.PutIfAbsentAsync(relativePath, parquetBytes, CancellationToken.None);
+
+        const string schemaJson =
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
+            + "{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-A\"}},"
+            + "{\"name\":\"name\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"col-B\"}}]}";
+        string escapedSchema = System.Text.Json.JsonSerializer.Serialize(schemaJson);
+
+        const string protocol =
+            "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,"
+            + "\"readerFeatures\":[\"columnMapping\"],"
+            + "\"writerFeatures\":[\"columnMapping\",\"changeDataFeed\"]}}";
+        string metadata =
+            "{\"metaData\":{\"id\":\"t\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
+            + "\"schemaString\":" + escapedSchema + ",\"partitionColumns\":[],\"configuration\":{"
+            + "\"delta.columnMapping.mode\":\"id\",\"delta.columnMapping.maxColumnId\":\"2\","
+            + "\"delta.enableChangeDataFeed\":\"true\"}}}";
+
+        byte[] v0 = Encoding.UTF8.GetBytes(protocol + "\n" + metadata + "\n");
+        await backend.PutIfAbsentAsync("_delta_log/00000000000000000000.json", v0, CancellationToken.None);
+
+        string cdcLine =
+            $"{{\"cdc\":{{\"path\":\"{relativePath}\",\"partitionValues\":{{}},"
+            + $"\"size\":{parquetBytes.Length},\"dataChange\":false}}}}";
+        byte[] v1 = Encoding.UTF8.GetBytes(cdcLine + "\n");
         await backend.PutIfAbsentAsync("_delta_log/00000000000000000001.json", v1, CancellationToken.None);
     }
 

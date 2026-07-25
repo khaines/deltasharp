@@ -314,34 +314,92 @@ internal sealed class ParquetFileReader
         ParquetReader reader = await OpenAsync(input, cancellationToken).ConfigureAwait(false);
         await using (reader.ConfigureAwait(false))
         {
-            // Fail-closed schema-mapping boundary (storage-delta-architecture.md §5.4 C-DECODE / ADR-0013).
-            // OpenAsync force-materialized reader.Schema inside its footer-PARSE boundary, but the SUBSEQUENT
-            // mapping of untrusted footer field descriptors into DeltaSharp StructFields is a distinct decode
-            // step that was unsealed: ToDataSchema eagerly builds a StructField for EVERY footer field, so a
-            // crafted footer with an empty field name makes the StructField constructor raise a raw
-            // ArgumentException (PDX-T crafted schema; storage-delta-architecture.md §5.4). Map every library/
-            // domain fault from the mapping to the deterministic CorruptData contract with a FIXED message (no
-            // ex.Message, so no footer content echoes into the error text). ToDataSchema's legitimate typed
-            // UnsupportedFeature (an unsupported-but-VALID Parquet type) is a DeltaStorageException, EXCLUDED by
-            // both predicates below, so it still propagates UNWRAPPED (never re-masked as CorruptData).
-            try
+            return MapFooterSchemaFailClosed(reader);
+        }
+    }
+
+    // Fail-closed schema-mapping boundary (storage-delta-architecture.md §5.4 C-DECODE / ADR-0013), shared by
+    // ReadDataSchemaAsync and ReadDataLeafColumnsAsync so the two footer-schema readers can NEVER diverge on it.
+    // OpenAsync force-materialized reader.Schema inside its footer-PARSE boundary, but the SUBSEQUENT mapping of
+    // untrusted footer field descriptors into DeltaSharp StructFields is a distinct decode step that was
+    // unsealed: ToDataSchema eagerly builds a StructField for EVERY footer field, so a crafted footer with an
+    // empty field name makes the StructField constructor raise a raw ArgumentException (PDX-T crafted schema).
+    // Map every library/domain fault from the mapping to the deterministic CorruptData contract with a FIXED
+    // message (no ex.Message, so no footer content echoes into the error text). ToDataSchema's legitimate typed
+    // UnsupportedFeature (an unsupported-but-VALID Parquet type) is a DeltaStorageException, EXCLUDED by both
+    // predicates below, so it still propagates UNWRAPPED (never re-masked as CorruptData).
+    private static StructType MapFooterSchemaFailClosed(ParquetReader reader)
+    {
+        try
+        {
+            return ParquetTypeMapping.ToDataSchema(reader.Schema);
+        }
+        catch (Exception ex) when (IsParquetDefect(ex))
+        {
+            // Informative first catch: a low-level decode defect surfacing while mapping a field descriptor
+            // (e.g. an OverflowException from a crafted decimal precision/scale).
+            throw DeltaStorageException.CorruptData(
+                "Parquet footer schema is malformed (undecodable field descriptor).", ex);
+        }
+        catch (Exception ex) when (IsUndecodableParquetInput(ex))
+        {
+            // Superset fallback: the empty-field-name ArgumentException from the StructField constructor and
+            // any other raw fault from mapping an attacker-controlled footer field descriptor land here.
+            throw DeltaStorageException.CorruptData(
+                "Parquet footer declares an unmappable field descriptor (e.g. an empty field name).", ex);
+        }
+    }
+
+    /// <summary>One decoded leaf column of a Parquet file: its name, DeltaSharp <see cref="DataType"/>, and
+    /// (when the footer assigns one) its column-mapping <c>field_id</c> — <see langword="null"/> for a leaf the
+    /// footer gives no <c>field_id</c> (e.g. the engine-synthesized <c>_change_type</c>). The unit
+    /// <see cref="ReadDataLeafColumnsAsync"/> returns for CDF-EE-08 id-mode validation (#662).</summary>
+    internal readonly record struct ParquetLeafColumn(string Name, DataType Type, int? FieldId);
+
+    /// <summary>
+    /// Reads only the Parquet footer and returns the file's leaf data columns — each carrying its name,
+    /// DeltaSharp type (via <see cref="ParquetTypeMapping.ToDataSchema"/>), and (when the footer assigns one)
+    /// its <c>field_id</c> — decoding no data pages, in file order. This is the <b>field-id-aware sibling</b> of
+    /// <see cref="ReadDataSchemaAsync"/>: the CDF explicit (cdc) read validates a foreign column-mapping
+    /// <b>id</b>-mode cdc file's leaf schema by <c>field_id</c> (the Delta id-mode authority) rather than by
+    /// physical name, because a foreign id-mode file's physical Parquet column names may diverge from the
+    /// metaData <c>physicalName</c>s (CDF-EE-08, #662). A leaf the footer assigns no <c>field_id</c> reports
+    /// <see cref="ParquetLeafColumn.FieldId"/> == <see langword="null"/>.
+    /// </summary>
+    /// <exception cref="DeltaStorageException">The footer is malformed/truncated, or a footer field has no
+    /// supported DeltaSharp type mapping (<see cref="StorageErrorKind.CorruptData"/>); the footer declares a
+    /// duplicate <c>field_id</c> (<see cref="StorageErrorKind.SchemaMismatch"/>, via
+    /// <see cref="BuildFieldIdMap"/>); or the file uses Parquet Modular Encryption
+    /// (<see cref="StorageErrorKind.UnsupportedFeature"/>) — all fail closed.</exception>
+    internal async Task<IReadOnlyList<ParquetLeafColumn>> ReadDataLeafColumnsAsync(
+        Stream input, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+
+        ParquetReader reader = await OpenAsync(input, cancellationToken).ConfigureAwait(false);
+        await using (reader.ConfigureAwait(false))
+        {
+            StructType schema = MapFooterSchemaFailClosed(reader);
+
+            // Correlate the footer field_ids with the leaves (BuildFieldIdMap fails closed on a duplicate
+            // field_id — a typed DeltaStorageException that propagates unwrapped, mirroring the ReadAsync id
+            // path). Invert to name → field_id so each leaf carries its own id; a leaf with no footer field_id
+            // (e.g. `_change_type`) stays null.
+            IReadOnlyDictionary<int, DataField> byFieldId = BuildFieldIdMap(reader);
+            var fieldIdByName = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (KeyValuePair<int, DataField> entry in byFieldId)
             {
-                return ParquetTypeMapping.ToDataSchema(reader.Schema);
+                fieldIdByName[entry.Value.Name] = entry.Key;
             }
-            catch (Exception ex) when (IsParquetDefect(ex))
+
+            var columns = new List<ParquetLeafColumn>(schema.Count);
+            foreach (StructField field in schema)
             {
-                // Informative first catch: a low-level decode defect surfacing while mapping a field descriptor
-                // (e.g. an OverflowException from a crafted decimal precision/scale).
-                throw DeltaStorageException.CorruptData(
-                    "Parquet footer schema is malformed (undecodable field descriptor).", ex);
+                int? fieldId = fieldIdByName.TryGetValue(field.Name, out int id) ? id : null;
+                columns.Add(new ParquetLeafColumn(field.Name, field.DataType, fieldId));
             }
-            catch (Exception ex) when (IsUndecodableParquetInput(ex))
-            {
-                // Superset fallback: the empty-field-name ArgumentException from the StructField constructor and
-                // any other raw fault from mapping an attacker-controlled footer field descriptor land here.
-                throw DeltaStorageException.CorruptData(
-                    "Parquet footer declares an unmappable field descriptor (e.g. an empty field name).", ex);
-            }
+
+            return columns;
         }
     }
 
