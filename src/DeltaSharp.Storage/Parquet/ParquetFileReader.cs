@@ -141,13 +141,18 @@ internal sealed class ParquetFileReader
 
     /// <summary>
     /// As <see cref="ReadAsync(Stream, StructType, RowGroupPredicate?, bool, bool, CancellationToken)"/>, but
-    /// when <paramref name="resolveByFieldId"/> is <see langword="true"/> each requested column is resolved to
-    /// a file column by its <c>delta.columnMapping.id</c> matched against the Parquet footer's
-    /// <c>SchemaElement.field_id</c> (Delta column-mapping <b>id</b> mode, #523), instead of by physical name.
-    /// The requested columns must carry the id metadata; the file's field_ids come from the Thrift footer via
-    /// <see cref="ParquetReader.Metadata"/> (the high-level <c>DataField.FieldId</c> is not populated on decode).
-    /// The batch-lifetime (no-recycling) contract documented on the 6-argument overload applies unchanged —
-    /// this is the overload <see cref="DeltaSharp.Storage.Delta.DeltaDelete"/>'s cdc capture enumerates.
+    /// when <paramref name="resolveByFieldId"/> is <see langword="true"/> each requested column is resolved
+    /// <b>independently</b> (Delta column-mapping <b>id</b> mode, #523/#658): a column that carries a
+    /// <c>delta.columnMapping.id</c> is matched by that id against the Parquet footer's
+    /// <c>SchemaElement.field_id</c> (not by physical name — a logical rename that never rewrote the file still
+    /// reads through), while a column that carries <b>no</b> id falls back to by-<b>name</b> resolution. The
+    /// by-name fallback lets a single call project id-mapped data columns <b>alongside</b> an engine-synthesized
+    /// column that is never column-mapped (e.g. CDF's <c>_change_type</c>). A column that declares an id whose
+    /// value is absent from the footer fails <b>closed</b> (it is never silently name-matched). The file's
+    /// field_ids come from the Thrift footer via <see cref="ParquetReader.Metadata"/> (the high-level
+    /// <c>DataField.FieldId</c> is not populated on decode). The batch-lifetime (no-recycling) contract
+    /// documented on the 6-argument overload applies unchanged — this is the overload
+    /// <see cref="DeltaSharp.Storage.Delta.DeltaDelete"/>'s cdc capture enumerates.
     /// </summary>
     public async IAsyncEnumerable<ColumnBatch> ReadAsync(
         Stream input,
@@ -792,6 +797,21 @@ internal sealed class ParquetFileReader
             byName[field.Name] = field;
         }
 
+        // Id mode only (#658): the set of file columns that carry a footer field_id. A requested column with NO
+        // delta.columnMapping.id falls back to by-name resolution, but ONLY against a file column that is itself
+        // un-mapped (no field_id) — an engine-synthesized column like CDF's `_change_type`. This keeps the
+        // fallback from letting a requested column that merely LACKS its id silently grab a genuinely
+        // column-mapped (id-bearing) file column by physical name, which would mask a foreign/corrupt file.
+        HashSet<string>? idBearingFileNames = null;
+        if (byFieldId is not null)
+        {
+            idBearingFileNames = new HashSet<string>(StringComparer.Ordinal);
+            foreach (DataField idBearing in byFieldId.Values)
+            {
+                idBearingFileNames.Add(idBearing.Name);
+            }
+        }
+
         var resolved = new ResolvedColumn[requested.Count];
         for (int c = 0; c < requested.Count; c++)
         {
@@ -819,21 +839,31 @@ internal sealed class ParquetFileReader
                 continue;
             }
 
-            // id mode (#523): resolve by the requested column's delta.columnMapping.id against the file's
-            // footer field_ids (BuildFieldIdMap), not by physical name — so a logical rename that never
-            // rewrites the Parquet still reads through. Absence is keyed on the id, not the name.
+            // Per-field resolution (#523, #658): under column-mapping id mode each requested column is resolved
+            // INDEPENDENTLY — by its delta.columnMapping.id against the file's footer field_ids
+            // (BuildFieldIdMap) when it DECLARES one (so a logical rename that never rewrites the Parquet still
+            // reads through), or by physical NAME when it carries NO id. A requested column with no
+            // column-mapping id is an engine-synthesized column (e.g. CDF's `_change_type`, written by literal
+            // name and never column-mapped); the by-name fallback lets a MIXED projection —
+            // [data-by-id, _change_type-by-name] — resolve in ONE ReadAsync. Fail-closed posture is preserved:
+            // a column that DECLARES an id whose value is ABSENT from the footer fails closed here (present
+            // stays false → null-fill or ColumnNotPresentInFile) — it is NEVER silently name-matched, so a
+            // foreign/corrupt file that dropped that id can't be masked by a coincidental physical-name hit.
             DataField? field = null;
             bool present;
-            if (byFieldId is not null)
+            if (byFieldId is not null && ColumnMapping.TryGetId(requestedField, out long id))
             {
-                present = ColumnMapping.TryGetId(requestedField, out long id)
-                    && id is >= 0 and <= int.MaxValue
+                present = id is >= 0 and <= int.MaxValue
                     && byFieldId.TryGetValue((int)id, out field);
             }
-            else if (byName.TryGetValue(name, out Field? candidate))
+            else if (byName.TryGetValue(name, out Field? candidate)
+                && (idBearingFileNames is null || !idBearingFileNames.Contains(name)))
             {
-                // A scalar column resolves to a leaf DataField. If the file column with this name is itself
-                // nested, the requested scalar type genuinely disagrees with the file — a SchemaMismatch.
+                // Name mode (byFieldId is null), OR id mode for a column that carries no delta.columnMapping.id
+                // AND whose physical-name match is an un-mapped file column (idBearingFileNames guard above —
+                // so a no-id request can never grab a column-mapped file column by name). A scalar column
+                // resolves to a leaf DataField. If the file column with this name is itself nested, the
+                // requested scalar type genuinely disagrees with the file — a SchemaMismatch.
                 field = candidate as DataField
                     ?? throw DeltaStorageException.SchemaMismatch(
                         $"Column '{name}': the requested type '{requestedField.DataType.SimpleString}' is scalar "
