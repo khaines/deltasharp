@@ -559,6 +559,257 @@ public sealed class ParquetCorruptionTests
         Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
     }
 
+    // ---- #655: plaintext-footer Parquet Modular Encryption (mode b — ordinary 'PAR1' magic) --------------
+    //
+    // Encrypted-FOOTER mode (above) is caught by the 'PARE' magic peek in the OpenAsync FAILURE path.
+    // Plaintext-FOOTER mode is the format's SECOND encryption mode: the file keeps the ordinary 'PAR1' magic
+    // and its footer parses cleanly, carrying encryption_algorithm (and/or per-column ColumnCryptoMetaData)
+    // while the column chunks are encrypted. It therefore opens SUCCESSFULLY, so it is classified on the
+    // OpenAsync SUCCESS path via IsPlaintextFooterEncrypted(reader.Metadata). Fixtures are synthesized by
+    // splicing the crypto Thrift fields into a normal file's footer (Parquet.Net 6.0.3 parses them but cannot
+    // decrypt) — no library upgrade required (#655).
+
+    [Fact]
+    public async Task PlaintextFooterEncryption_ThroughReadAsync_IsUnsupportedFeatureNotCorruptData()
+    {
+        // A plaintext-footer encrypted file (encryption_algorithm present, 'PAR1' magic). ReadAsync must
+        // classify it as an actionable UnsupportedFeature, NOT a misleading CorruptData or a garbage read.
+        // RED-on-revert: removing the OpenAsync IsPlaintextFooterEncrypted check lets the reader open the file
+        // and read its (plaintext) pages, so this Assert.ThrowsAsync would fail (no exception thrown).
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3, 4, 5 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] encrypted = await ParquetTestHelpers.PlaintextFooterEncryptedFileAsync(file);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(encrypted, schema));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+        // The diagnosis is the feature, never the fail-closed "malformed/corrupt" default.
+        Assert.DoesNotContain("malformed", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task PlaintextFooterEncryption_ThroughReadDataSchemaAsync_IsUnsupportedFeature()
+    {
+        // The footer-only schema door funnels through the SAME OpenAsync classifier — UnsupportedFeature, not
+        // CorruptData — proving one success-path check covers every entry point (mirrors the 'PARE' coverage).
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 7, 8, 9 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] encrypted = await ParquetTestHelpers.PlaintextFooterEncryptedFileAsync(file);
+        using var stream = new MemoryStream(encrypted, writable: false);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new ParquetFileReader().ReadDataSchemaAsync(stream, CancellationToken.None));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task PlaintextFooterEncryption_ThroughGetRowCountAsync_IsUnsupportedFeature()
+    {
+        // And through the row-count door — the third OpenAsync entry point.
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3, 4 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] encrypted = await ParquetTestHelpers.PlaintextFooterEncryptedFileAsync(file);
+        using var stream = new MemoryStream(encrypted, writable: false);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new ParquetFileReader().GetRowCountAsync(stream, CancellationToken.None));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+    }
+
+    [Fact]
+    public async Task PlaintextFooterColumnCrypto_OnlySubsetOfColumnsEncrypted_IsUnsupportedFeature()
+    {
+        // Edge case: a plaintext-footer file may encrypt only SOME columns — the file-level
+        // encryption_algorithm is UNSET, but a single column chunk carries ColumnCryptoMetaData. The
+        // per-column arm of IsPlaintextFooterEncrypted must still classify it UnsupportedFeature.
+        var schema = new StructType(new[] { KeepField, PoisonField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3 }, new long[] { 4, 5, 6 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] encrypted = await ParquetTestHelpers.PlaintextFooterColumnCryptoFileAsync(file, rowGroup: 0, columnIndex: 1);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(encrypted, schema));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task NormalFile_WithoutEncryptionMetadata_ReadsNormally_NoFalsePositive()
+    {
+        // Precision guard: a normal 'PAR1' file with NO crypto footer metadata must NOT false-positive — it
+        // reads its data normally. This proves IsPlaintextFooterEncrypted keys on the presence of the crypto
+        // fields, not on merely opening successfully. (The same normal file is the fixture base for the
+        // encrypted cases above, so this pins that only the spliced crypto field flips the classification.)
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 10, 11, 12, 13 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+
+        List<ColumnBatch> result = await ParquetTestHelpers.ReadAllAsync(file, schema);
+
+        ColumnBatch only = Assert.Single(result);
+        ColumnVector keep = only.SelectedColumn(0);
+        Assert.Equal(new long[] { 10, 11, 12, 13 }, Enumerable.Range(0, 4).Select(i => keep.GetValue<long>(i)));
+    }
+
+    // ---- #655: the REALISTIC plaintext-footer shape (encrypted column OMITS plaintext ColumnMetaData) -----
+    //
+    // A real encrypting writer stores an encrypted column's ColumnMetaData ENCRYPTED, so the plaintext
+    // `meta_data` (Thrift field 3) is absent. Parquet.Net 6.0.3 dereferences it unguarded during
+    // CreateAsync's row-group-reader init, throwing an NRE BEFORE the success-path reader.Metadata check runs.
+    // These files therefore reach the OpenAsync FAILURE path and are classified by the reflection-free footer
+    // probe (which reads the file-level encryption_algorithm the format spec sets on every mode-b file). Prior
+    // to the failure-path probe they misclassified as CorruptData — so each of these is RED-on-revert against
+    // the probe.
+
+    [Fact]
+    public async Task PlaintextFooterEncryption_EncryptedColumnMetaDataOmitted_ThroughReadAsync_IsUnsupportedFeature()
+    {
+        // The shape a genuine encryptor produces: file-level encryption_algorithm + per-column crypto_metadata,
+        // and the encrypted column's plaintext meta_data OMITTED (→ Parquet.Net NREs in CreateAsync). The
+        // failure-path footer probe must reclassify it UnsupportedFeature, not CorruptData.
+        var schema = new StructType(new[] { KeepField, PoisonField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3 }, new long[] { 4, 5, 6 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] encrypted = await ParquetTestHelpers.PlaintextFooterEncryptedRealisticFileAsync(file, rowGroup: 0, columnIndex: 1);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(encrypted, schema));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("malformed", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task PlaintextFooterEncryption_EncryptedColumnMetaDataOmitted_ThroughReadDataSchemaAsync_IsUnsupportedFeature()
+    {
+        var schema = new StructType(new[] { KeepField, PoisonField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3 }, new long[] { 4, 5, 6 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] encrypted = await ParquetTestHelpers.PlaintextFooterEncryptedRealisticFileAsync(file, rowGroup: 0, columnIndex: 1);
+        using var stream = new MemoryStream(encrypted, writable: false);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new ParquetFileReader().ReadDataSchemaAsync(stream, CancellationToken.None));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task PlaintextFooterEncryption_EncryptedColumnMetaDataOmitted_ThroughGetRowCountAsync_IsUnsupportedFeature()
+    {
+        var schema = new StructType(new[] { KeepField, PoisonField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3 }, new long[] { 4, 5, 6 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] encrypted = await ParquetTestHelpers.PlaintextFooterEncryptedRealisticFileAsync(file, rowGroup: 0, columnIndex: 1);
+        using var stream = new MemoryStream(encrypted, writable: false);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new ParquetFileReader().GetRowCountAsync(stream, CancellationToken.None));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+    }
+
+    [Fact]
+    public async Task Par1FileWithBitFlippedFooterLength_StaysCorruptData_ProbePrecisionGuard()
+    {
+        // PRECISION GUARD for the footer probe: a genuinely corrupt PAR1 file whose trailing 4-byte footer
+        // length is bit-flipped to a bogus value opens-fails in Parquet.Net, and the probe — reading that
+        // bogus length — must NOT over-trigger. It stays CorruptData (the probe is fail-closed on a footer
+        // length it cannot use).
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] corrupt = (byte[])file.Clone();
+        // Corrupt the 4-byte little-endian footer length that sits just before the trailing 'PAR1' magic.
+        corrupt[^8] ^= 0xFF;
+        corrupt[^7] ^= 0xFF;
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(corrupt, schema));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+    }
+
+    [Fact]
+    public async Task MalformedFooterWithField8StructHeaderButTruncatedBody_StaysCorruptData_ProbePrecisionGuard()
+    {
+        // Red-team R2 precision guard: a malformed PAR1 file whose 1-byte "footer" is exactly a Thrift field-8
+        // STRUCT header (0x8C = field delta 8 | type STRUCT=12) with NO struct body/STOP must NOT be mislabeled
+        // encryption. The footer probe requires the WHOLE footer to parse cleanly to its STOP (validating the
+        // field-8 struct body), so a truncated field-8 struct fails the walk and stays the fail-closed
+        // CorruptData default. RED-on-revert against an early-return-on-field-8-header probe.
+        byte[] malformed =
+        [
+            0x50, 0x41, 0x52, 0x31, // 'PAR1' head
+            0x8C,                   // footer content: field 8 (delta 8), type STRUCT — but no body/STOP
+            0x01, 0x00, 0x00, 0x00, // footer_length = 1 (little-endian) => the footer is just the 0x8C byte
+            0x50, 0x41, 0x52, 0x31, // 'PAR1' tail magic
+        ];
+        var schema = new StructType(new[] { KeepField });
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(malformed, schema));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+    }
+
+    [Fact]
+    public async Task WellFormedFooterButNotAFileMetaData_WithEmptyField8_StaysCorruptData_ProbePrecisionGuard()
+    {
+        // Red-team R3 precision guard: a footer that is SYNTACTICALLY valid Thrift but is NOT a plausible
+        // FileMetaData — just an EMPTY field-8 struct then the top-level STOP ([0x8C, 0x00, 0x00]) — must stay
+        // CorruptData. It lacks the FileMetaData required fields (version/schema/num_rows/row_groups) and its
+        // encryption_algorithm union is empty (no member), so the probe rejects it. RED-on-revert against a
+        // probe that trusts a bare field-8-struct header without required-field / non-empty-union validation.
+        byte[] malformed =
+        [
+            0x50, 0x41, 0x52, 0x31, // 'PAR1' head
+            0x8C, 0x00, 0x00,       // footer: field 8 STRUCT, empty body (0x00 = struct STOP), 0x00 = top STOP
+            0x03, 0x00, 0x00, 0x00, // footer_length = 3 (little-endian)
+            0x50, 0x41, 0x52, 0x31, // 'PAR1' tail magic
+        ];
+        var schema = new StructType(new[] { KeepField });
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(malformed, schema));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+    }
+
+    [Fact]
+    public async Task WellFormedField8UnionButNoRequiredFields_StaysCorruptData_ProbePrecisionGuard()
+    {
+        // Independently exercises the required-fields guard (red-team R4): this footer carries a NON-EMPTY
+        // field-8 encryption_algorithm union (so the union guard alone would accept it) but NONE of the
+        // FileMetaData required fields (version/schema/num_rows/row_groups), so it must stay CorruptData. If
+        // the required-fields mask were dropped, this would flip to UnsupportedFeature — so it is RED-on-revert
+        // against removing that guard. Footer bytes: field 8 STRUCT { field 1 STRUCT {} } then top STOP.
+        byte[] malformed =
+        [
+            0x50, 0x41, 0x52, 0x31, // 'PAR1' head
+            0x8C,                   // field 8 (delta 8), STRUCT (encryption_algorithm)
+            0x1C,                   //   field 1 (delta 1), STRUCT (a union member => non-empty)
+            0x00,                   //   STOP (empty member struct)
+            0x00,                   // STOP (encryption_algorithm union)
+            0x00,                   // STOP (top-level FileMetaData)
+            0x05, 0x00, 0x00, 0x00, // footer_length = 5 (little-endian)
+            0x50, 0x41, 0x52, 0x31, // 'PAR1' tail magic
+        ];
+        var schema = new StructType(new[] { KeepField });
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(malformed, schema));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+    }
+
     [Fact]
     public async Task GarbageInput_StaysCorruptData_PrecisionGuard()
     {
