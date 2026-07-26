@@ -506,6 +506,9 @@ internal static class ParquetTestHelpers
         forged.Write("PAR1"u8);
         return forged.ToArray();
     }
+
+    /// <summary>Rewrites the footer so that (<paramref name="rowGroup"/>, <paramref name="columnIndex"/>)'s
+    /// column chunk declares <paramref name="forgedCodec"/> as its compression <c>Codec</c> — an OUT-OF-RANGE
     /// value (e.g. <c>9</c>, which is not a real <c>CompressionCodec</c>) that leaves the footer parseable and
     /// the physical pages untouched, so the file OPENS cleanly (valid <c>PAR1</c> magic), yet Parquet.Net's
     /// page decode raises a raw <see cref="NotSupportedException"/> ("Compression method 9 is not supported.")
