@@ -139,6 +139,33 @@ public sealed class LocalFileSystemBackendTests : IDisposable
     }
 
     [Fact]
+    public async Task PathNotConfined_CanonicalizeFallback_SanitizesControlChars()
+    {
+        // #516/#667: the 'could not be resolved' fallback (symlink cycle / inaccessible ancestor during
+        // real-target canonicalization) also echoes the requested path — reached deterministically via the
+        // resolve-canon fault seam with a LEXICALLY-CONFINED (no '..') but CRLF-poisoned path. It must be
+        // sanitized at parity with the lexical-escape siblings. RED-on-revert against dropping the sanitize on
+        // that branch. (This class is in the process-global BackendFaultInjectionCollection, so the hook is
+        // safe from parallel races; reset in the finally.)
+        const string poisoned = "sub\r\nInjected.bin";
+        LocalFileSystemBackend.IoFaultHook = tag => tag == "resolve-canon" ? new IOException("ELOOP cycle") : null;
+        try
+        {
+            DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+                async () => await _backend.PutIfAbsentAsync(poisoned, new byte[] { 0 }, CancellationToken.None));
+
+            Assert.Equal(StorageErrorKind.PathNotConfined, error.Kind);
+            Assert.DoesNotContain('\n', error.Message);
+            Assert.DoesNotContain('\r', error.Message);
+            Assert.DoesNotContain(poisoned, error.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            LocalFileSystemBackend.IoFaultHook = null;
+        }
+    }
+
+    [Fact]
     public async Task Delete_IsIdempotent()
     {
         const string key = "data/file.bin";
