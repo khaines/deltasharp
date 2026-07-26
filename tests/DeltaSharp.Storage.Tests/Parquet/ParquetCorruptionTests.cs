@@ -660,6 +660,86 @@ public sealed class ParquetCorruptionTests
         Assert.Equal(new long[] { 10, 11, 12, 13 }, Enumerable.Range(0, 4).Select(i => keep.GetValue<long>(i)));
     }
 
+    // ---- #655: the REALISTIC plaintext-footer shape (encrypted column OMITS plaintext ColumnMetaData) -----
+    //
+    // A real encrypting writer stores an encrypted column's ColumnMetaData ENCRYPTED, so the plaintext
+    // `meta_data` (Thrift field 3) is absent. Parquet.Net 6.0.3 dereferences it unguarded during
+    // CreateAsync's row-group-reader init, throwing an NRE BEFORE the success-path reader.Metadata check runs.
+    // These files therefore reach the OpenAsync FAILURE path and are classified by the reflection-free footer
+    // probe (which reads the file-level encryption_algorithm the format spec sets on every mode-b file). Prior
+    // to the failure-path probe they misclassified as CorruptData — so each of these is RED-on-revert against
+    // the probe.
+
+    [Fact]
+    public async Task PlaintextFooterEncryption_EncryptedColumnMetaDataOmitted_ThroughReadAsync_IsUnsupportedFeature()
+    {
+        // The shape a genuine encryptor produces: file-level encryption_algorithm + per-column crypto_metadata,
+        // and the encrypted column's plaintext meta_data OMITTED (→ Parquet.Net NREs in CreateAsync). The
+        // failure-path footer probe must reclassify it UnsupportedFeature, not CorruptData.
+        var schema = new StructType(new[] { KeepField, PoisonField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3 }, new long[] { 4, 5, 6 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] encrypted = await ParquetTestHelpers.PlaintextFooterEncryptedRealisticFileAsync(file, rowGroup: 0, columnIndex: 1);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(encrypted, schema));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("malformed", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task PlaintextFooterEncryption_EncryptedColumnMetaDataOmitted_ThroughReadDataSchemaAsync_IsUnsupportedFeature()
+    {
+        var schema = new StructType(new[] { KeepField, PoisonField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3 }, new long[] { 4, 5, 6 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] encrypted = await ParquetTestHelpers.PlaintextFooterEncryptedRealisticFileAsync(file, rowGroup: 0, columnIndex: 1);
+        using var stream = new MemoryStream(encrypted, writable: false);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new ParquetFileReader().ReadDataSchemaAsync(stream, CancellationToken.None));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task PlaintextFooterEncryption_EncryptedColumnMetaDataOmitted_ThroughGetRowCountAsync_IsUnsupportedFeature()
+    {
+        var schema = new StructType(new[] { KeepField, PoisonField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3 }, new long[] { 4, 5, 6 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] encrypted = await ParquetTestHelpers.PlaintextFooterEncryptedRealisticFileAsync(file, rowGroup: 0, columnIndex: 1);
+        using var stream = new MemoryStream(encrypted, writable: false);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new ParquetFileReader().GetRowCountAsync(stream, CancellationToken.None));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+    }
+
+    [Fact]
+    public async Task Par1FileWithBitFlippedFooterLength_StaysCorruptData_ProbePrecisionGuard()
+    {
+        // PRECISION GUARD for the footer probe: a genuinely corrupt PAR1 file whose trailing 4-byte footer
+        // length is bit-flipped to a bogus value opens-fails in Parquet.Net, and the probe — reading that
+        // bogus length — must NOT over-trigger. It stays CorruptData (the probe is fail-closed on a footer
+        // length it cannot use).
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] corrupt = (byte[])file.Clone();
+        // Corrupt the 4-byte little-endian footer length that sits just before the trailing 'PAR1' magic.
+        corrupt[^8] ^= 0xFF;
+        corrupt[^7] ^= 0xFF;
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(corrupt, schema));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+    }
+
     [Fact]
     public async Task GarbageInput_StaysCorruptData_PrecisionGuard()
     {

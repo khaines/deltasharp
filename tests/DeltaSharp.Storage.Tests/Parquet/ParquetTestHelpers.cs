@@ -466,8 +466,46 @@ internal static class ParquetTestHelpers
         return forged.ToArray();
     }
 
-    /// <summary>Rewrites the footer so that (<paramref name="rowGroup"/>, <paramref name="columnIndex"/>)'s
-    /// column chunk declares <paramref name="forgedCodec"/> as its compression <c>Codec</c> — an OUT-OF-RANGE
+    /// <summary>Constructs the <b>realistic</b> plaintext-footer encryption shape (#655): a real encrypting
+    /// writer sets the file-level <c>EncryptionAlgorithm</c>, marks the encrypted column
+    /// (<paramref name="rowGroup"/>, <paramref name="columnIndex"/>) with <c>ColumnCryptoMetaData</c>, and
+    /// <b>OMITS</b> that column's plaintext <c>ColumnMetaData</c> (it is stored encrypted, not in the plaintext
+    /// footer). That omission is what makes Parquet.Net 6.0.3 throw during <c>CreateAsync</c>'s row-group-reader
+    /// init — so this fixture exercises the <b>failure-path</b> footer probe, not the success-path
+    /// <c>reader.Metadata</c> check. Unlike <see cref="PlaintextFooterEncryptedFileAsync"/> (which keeps
+    /// <c>ColumnMetaData</c> and so opens cleanly), this is the shape a genuine encryptor produces.</summary>
+    public static async Task<byte[]> PlaintextFooterEncryptedRealisticFileAsync(byte[] bytes, int rowGroup, int columnIndex)
+    {
+        byte[] newFooter;
+        using (var stream = new MemoryStream(bytes, writable: false))
+        {
+            ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                global::Parquet.Meta.FileMetaData metadata = reader.Metadata!;
+                metadata.EncryptionAlgorithm = new global::Parquet.Meta.EncryptionAlgorithm
+                {
+                    AESGCMV1 = new global::Parquet.Meta.AesGcmV1(),
+                };
+                metadata.RowGroups[rowGroup].Columns[columnIndex].CryptoMetadata =
+                    new global::Parquet.Meta.ColumnCryptoMetaData
+                    {
+                        ENCRYPTIONWITHFOOTERKEY = new global::Parquet.Meta.EncryptionWithFooterKey(),
+                    };
+                metadata.RowGroups[rowGroup].Columns[columnIndex].MetaData = null;
+                newFooter = SerializeFooter(metadata);
+            }
+        }
+
+        int originalFooterLength = BitConverter.ToInt32(bytes, bytes.Length - 8);
+        int footerStart = bytes.Length - 8 - originalFooterLength;
+        using var forged = new MemoryStream();
+        forged.Write(bytes, 0, footerStart);
+        forged.Write(newFooter, 0, newFooter.Length);
+        forged.Write(BitConverter.GetBytes(newFooter.Length), 0, 4);
+        forged.Write("PAR1"u8);
+        return forged.ToArray();
+    }
     /// value (e.g. <c>9</c>, which is not a real <c>CompressionCodec</c>) that leaves the footer parseable and
     /// the physical pages untouched, so the file OPENS cleanly (valid <c>PAR1</c> magic), yet Parquet.Net's
     /// page decode raises a raw <see cref="NotSupportedException"/> ("Compression method 9 is not supported.")

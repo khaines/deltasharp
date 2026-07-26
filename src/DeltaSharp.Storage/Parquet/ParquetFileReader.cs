@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using System.Text;
 using DeltaSharp.Engine.Columnar;
@@ -664,14 +665,16 @@ internal sealed class ParquetFileReader
             // (storage-delta-architecture.md §5.4 C-DECODE).
             _ = reader.Schema;
 
-            // Plaintext-footer Parquet Modular Encryption (#655). Unlike encrypted-footer mode (the PARE
-            // magic classified in the catch below), a plaintext-footer encrypted file keeps the ordinary
-            // PAR1 magic and its footer parses cleanly HERE, carrying its crypto metadata in the readable
-            // footer (encryption_algorithm and/or per-column ColumnCryptoMetaData) while the column chunks
-            // themselves are encrypted and unreadable. Detect it from the parsed footer and fail closed with
-            // the SAME actionable UnsupportedFeature as encrypted-footer mode, rather than returning a reader
-            // whose later column reads would fall through to CorruptData. Detection is presence-only — the
-            // field's existence is the whole diagnosis; no footer content is read or echoed (#653 hygiene).
+            // Plaintext-footer Parquet Modular Encryption — SUCCESS-path arm (#655). A plaintext-footer
+            // encrypted file keeps the ordinary PAR1 magic; when its encrypted columns RETAIN their plaintext
+            // ColumnMetaData (a spec-permitted shape) Parquet.Net opens it cleanly HERE, so we detect it from
+            // the parsed footer metadata (file-level encryption_algorithm and/or per-column ColumnCryptoMetaData)
+            // and fail closed with an actionable UnsupportedFeature rather than returning a reader whose column
+            // reads would later fall through to CorruptData. The COMPLEMENTARY case — a real encrypting writer
+            // that OMITS the plaintext ColumnMetaData on encrypted columns — makes Parquet.Net 6.0.3 throw
+            // (NRE) during its row-group-reader init inside CreateAsync above, before this line; that shape is
+            // caught on the FAILURE path in the catch below via the footer probe. Detection is presence-only —
+            // the field's existence is the diagnosis; no footer content is read or echoed (#653 hygiene).
             if (IsPlaintextFooterEncrypted(reader.Metadata))
             {
                 // Dispose the healthy reader (leaveStreamOpen:false also releases the input stream) before
@@ -689,9 +692,7 @@ internal sealed class ParquetFileReader
                     // classification below remains the single, meaningful outcome.
                 }
 
-                throw DeltaStorageException.UnsupportedFeature(
-                    "Parquet Modular Encryption is not supported: the file uses plaintext-footer encryption "
-                    + "(encryption_algorithm present in the footer). DeltaSharp cannot read encrypted Parquet files.");
+                throw DeltaStorageException.UnsupportedFeature(PlaintextFooterEncryptionMessage);
             }
 
             return reader;
@@ -712,19 +713,20 @@ internal sealed class ParquetFileReader
             // as "not a parquet file, head: 50415245, tail: 50415245" — a message shape BYTE-FOR-BYTE identical
             // to the one it emits for arbitrary non-Parquet garbage ("head: 74686973…" for "this is not a
             // parquet file"), so ex.Message cannot separate encryption from corruption. The file's own leading
-            // magic can, so peek it directly (the input is still seekable here — CreateAsync leaves the caller's
-            // stream open on failure) and reclassify only a positively-identified 'PARE' head as an actionable
-            // UnsupportedFeature; everything else stays the fail-closed CorruptData default. This peek MUST run
-            // BEFORE the dispose below, which (leaveStreamOpen:false) would release the input stream. NOTE the
-            // sibling library NotSupportedException family (raised from page decode in ReadRowGroupAsync) is NOT
-            // reclassified: Parquet.Net raises it on genuinely CORRUPT pages too (an invalid compression-method /
-            // page-type / logical-type code from a bit-flip), so it is not safely separable from corruption and
-            // stays CorruptData (see the ReadRowGroupAsync superset catch). Likewise only encrypted-FOOTER
-            // mode (PARE magic) is classified HERE (in this footer-parse-FAILURE catch); plaintext-footer
-            // encryption (mode b) keeps the ordinary PAR1 magic and its footer parses SUCCESSFULLY, so it is
-            // classified on the SUCCESS path above via IsPlaintextFooterEncrypted(reader.Metadata) (#655) and
-            // never reaches this catch.
+            // stays CorruptData (see the ReadRowGroupAsync superset catch). Encrypted-FOOTER mode (PARE magic)
+            // is classified via the leading-magic peek. Plaintext-footer encryption (mode b) keeps the ordinary
+            // PAR1 magic; when its encrypted columns retain plaintext ColumnMetaData the footer parses cleanly
+            // and it is classified on the SUCCESS path above, but a real encrypting writer OMITS that plaintext
+            // metadata, so Parquet.Net 6.0.3 throws (NRE) during row-group-reader init and lands HERE. Probe the
+            // plaintext footer directly for the FileMetaData encryption_algorithm field to reclassify that shape
+            // as UnsupportedFeature too (#655). Both peeks read the still-open input (CreateAsync leaves the
+            // caller's stream open on failure) and MUST run BEFORE the dispose below (leaveStreamOpen:false
+            // releases the input stream); anything not positively identified stays the fail-closed CorruptData
+            // default. NOTE the sibling library NotSupportedException family (raised from page decode in
+            // ReadRowGroupAsync) is NOT reclassified: Parquet.Net raises it on genuinely CORRUPT pages too, so it
+            // is not safely separable from corruption and stays CorruptData (see the ReadRowGroupAsync catch).
             bool encryptedFooter = IsParquetEncryptedFooterMagic(input);
+            bool plaintextFooterEncrypted = !encryptedFooter && IsPlaintextFooterEncryptedByFooterProbe(input);
 
             if (reader is not null)
             {
@@ -753,6 +755,16 @@ internal sealed class ParquetFileReader
                 throw DeltaStorageException.UnsupportedFeature(
                     "Parquet Modular Encryption is not supported: the file uses an encrypted footer (PARE "
                     + "magic). DeltaSharp cannot read encrypted Parquet files.");
+            }
+
+            if (plaintextFooterEncrypted)
+            {
+                // The FAILURE-path twin of the success-path arm (#655): a real plaintext-footer encrypted file
+                // whose encrypted columns omit plaintext ColumnMetaData made CreateAsync throw, but its footer
+                // carries encryption_algorithm — detected by IsPlaintextFooterEncryptedByFooterProbe. Same
+                // presence-only diagnosis, same fixed message (no footer content echoed, #653), same fail-closed
+                // UnsupportedFeature the success-path arm throws.
+                throw DeltaStorageException.UnsupportedFeature(PlaintextFooterEncryptionMessage);
             }
 
             // Fixed message (no ex.Message interpolation): an attacker-controlled footer field name must never
@@ -807,6 +819,365 @@ internal sealed class ParquetFileReader
         }
 
         return false;
+    }
+
+    // Shared message for both plaintext-footer arms (success-path metadata check + failure-path footer probe).
+    // Presence-only diagnosis: it names the feature, never a footer field name/path/value (#653 info-leak
+    // hygiene), and is accurate whether the file-level encryption_algorithm or a per-column crypto_metadata
+    // triggered detection.
+    private const string PlaintextFooterEncryptionMessage =
+        "Parquet Modular Encryption is not supported: the file uses plaintext-footer encryption "
+        + "(the footer carries Parquet Modular Encryption metadata). DeltaSharp cannot read encrypted Parquet files.";
+
+    // Upper bound on the plaintext footer we will parse on the CreateAsync-FAILURE path. A Parquet footer is
+    // normally KB-scale; this cap stops a crafted oversized footer_length from forcing a large read/scan before
+    // we fall back to the fail-closed CorruptData default.
+    private const int MaxProbedFooterBytes = 16 * 1024 * 1024;
+
+    // Recursion-depth ceiling for the untrusted Thrift-compact footer walk so a crafted deeply-nested footer
+    // cannot exhaust the stack. Real Parquet FileMetaData nests only a handful of levels.
+    private const int MaxThriftProbeDepth = 64;
+
+    // Thrift Compact Protocol type codes — the subset the footer walk must recognize to skip a field value
+    // (Apache Thrift compact spec). FileMetaData.encryption_algorithm is field 8, a struct (union).
+    private const int ThriftBoolTrue = 1;
+    private const int ThriftBoolFalse = 2;
+    private const int ThriftI8 = 3;
+    private const int ThriftI16 = 4;
+    private const int ThriftI32 = 5;
+    private const int ThriftI64 = 6;
+    private const int ThriftDouble = 7;
+    private const int ThriftBinary = 8;
+    private const int ThriftList = 9;
+    private const int ThriftSet = 10;
+    private const int ThriftMap = 11;
+    private const int ThriftStruct = 12;
+    private const int EncryptionAlgorithmFieldId = 8;
+
+    /// <summary>
+    /// Reflection-free detection of a plaintext-footer Parquet Modular Encryption file by reading the file's
+    /// own plaintext footer and probing the <c>FileMetaData.encryption_algorithm</c> field (Thrift field 8),
+    /// which the format spec sets for <b>every</b> plaintext-footer encrypted file. Needed because a real
+    /// encrypting writer omits the plaintext <c>ColumnMetaData</c> on encrypted columns, which makes
+    /// Parquet.Net 6.0.3 throw during <c>CreateAsync</c>'s row-group-reader init <b>before</b> the success-path
+    /// <c>reader.Metadata</c> check runs — so that shape is only reachable here, on the failure path. Reflection
+    /// is deliberately avoided (Storage keeps the trim/AOT analyzers clean, ADR-0014); this walks the footer as
+    /// a <see cref="ReadOnlySpan{T}"/>. As a parser of <b>untrusted</b> bytes it is strictly bounded (footer
+    /// size cap + recursion-depth cap + total-work bounded by the footer length) and <b>fail-closed</b>: any
+    /// truncated/oversized/malformed input returns <see langword="false"/> so the caller keeps the CorruptData
+    /// default, and it never throws. The input position is restored so the observation is transparent.
+    /// </summary>
+    private static bool IsPlaintextFooterEncryptedByFooterProbe(Stream input)
+    {
+        if (input is null || !input.CanSeek)
+        {
+            return false;
+        }
+
+        try
+        {
+            long length = input.Length;
+            // Minimum plausible file: a (>=1 byte) footer + the 4-byte footer length + 4-byte trailing magic.
+            if (length < ParquetMagicLength + 8)
+            {
+                return false;
+            }
+
+            long savedPosition = input.Position;
+            try
+            {
+                // Trailing 8 bytes: [footer_length int32 LE][magic 4 bytes]. (PARE was excluded by the caller;
+                // a genuine mode-b file is PAR1-bracketed. The footer_length bound below — not the magic — is
+                // the real guard: garbage will not parse to a field-8 struct and stays CorruptData.)
+                Span<byte> tail = stackalloc byte[8];
+                input.Position = length - 8;
+                if (input.ReadAtLeast(tail, 8, throwOnEndOfStream: false) != 8)
+                {
+                    return false;
+                }
+
+                int footerLength = BinaryPrimitives.ReadInt32LittleEndian(tail);
+                if (footerLength <= 0 || footerLength > length - 8 || footerLength > MaxProbedFooterBytes)
+                {
+                    return false;
+                }
+
+                byte[] footer = new byte[footerLength];
+                input.Position = length - 8 - footerLength;
+                if (input.ReadAtLeast(footer, footerLength, throwOnEndOfStream: false) != footerLength)
+                {
+                    return false;
+                }
+
+                return ThriftFooterHasEncryptionAlgorithm(footer);
+            }
+            finally
+            {
+                // Restore on every path so the probe is transparent to any later use of the stream.
+                input.Position = savedPosition;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or NotSupportedException)
+        {
+            // A probe I/O fault on an already-failing input must never REPLACE the fail-closed classification.
+            return false;
+        }
+    }
+
+    // Walks the top-level FileMetaData struct (Thrift Compact Protocol) looking ONLY for field 8
+    // (encryption_algorithm, a struct); every other field's value is skipped. Returns true iff field 8 is
+    // present as a struct. Fail-closed: returns false on STOP-without-field-8, truncation, or any malformed
+    // encoding. Bounded: every non-boolean field/element consumes >= 1 byte, so total work is O(footer length),
+    // and recursion is depth-capped.
+    private static bool ThriftFooterHasEncryptionAlgorithm(ReadOnlySpan<byte> footer)
+    {
+        int pos = 0;
+        int lastFieldId = 0;
+        while (true)
+        {
+            if (pos >= footer.Length)
+            {
+                return false;
+            }
+
+            byte header = footer[pos++];
+            if (header == 0)
+            {
+                return false; // STOP: end of FileMetaData, encryption_algorithm not present.
+            }
+
+            int type = header & 0x0F;
+            int delta = (header >> 4) & 0x0F;
+            int fieldId;
+            if (delta != 0)
+            {
+                fieldId = lastFieldId + delta;
+            }
+            else if (TryReadZigZag(footer, ref pos, out long explicitId) && explicitId > 0 && explicitId <= int.MaxValue)
+            {
+                fieldId = (int)explicitId;
+            }
+            else
+            {
+                return false;
+            }
+
+            lastFieldId = fieldId;
+
+            if (fieldId == EncryptionAlgorithmFieldId && type == ThriftStruct)
+            {
+                return true;
+            }
+
+            // A boolean field carries its value in the header (no data bytes); every other type has a value to
+            // skip. (encryption_algorithm is a struct, so field 8 never reaches this skip.)
+            if (type is ThriftBoolTrue or ThriftBoolFalse)
+            {
+                continue;
+            }
+
+            if (!SkipThriftValue(footer, ref pos, type, depth: 1))
+            {
+                return false;
+            }
+        }
+    }
+
+    // Skips one Thrift-compact value of the given type. Called for non-boolean struct-field values and for
+    // collection/map elements (where a boolean element DOES occupy one byte). Fail-closed on truncation,
+    // unknown type, or excessive depth.
+    private static bool SkipThriftValue(ReadOnlySpan<byte> data, ref int pos, int type, int depth)
+    {
+        if (depth > MaxThriftProbeDepth)
+        {
+            return false;
+        }
+
+        switch (type)
+        {
+            case ThriftBoolTrue:
+            case ThriftBoolFalse:
+                return AdvanceThrift(data, ref pos, 1); // element context: one byte per boolean.
+            case ThriftI8:
+                return AdvanceThrift(data, ref pos, 1);
+            case ThriftI16:
+            case ThriftI32:
+            case ThriftI64:
+                return TrySkipVarint(data, ref pos);
+            case ThriftDouble:
+                return AdvanceThrift(data, ref pos, 8);
+            case ThriftBinary:
+                if (!TryReadVarint(data, ref pos, out long binLen) || binLen < 0 || binLen > int.MaxValue)
+                {
+                    return false;
+                }
+
+                return AdvanceThrift(data, ref pos, (int)binLen);
+            case ThriftList:
+            case ThriftSet:
+                return SkipThriftCollection(data, ref pos, depth);
+            case ThriftMap:
+                return SkipThriftMap(data, ref pos, depth);
+            case ThriftStruct:
+                return SkipThriftStruct(data, ref pos, depth);
+            default:
+                return false; // unknown/invalid compact type => fail closed.
+        }
+    }
+
+    // Skips a struct: field headers until STOP, skipping each field's value (a boolean field value is in its
+    // header, so nothing extra is consumed for it).
+    private static bool SkipThriftStruct(ReadOnlySpan<byte> data, ref int pos, int depth)
+    {
+        if (depth > MaxThriftProbeDepth)
+        {
+            return false;
+        }
+
+        while (true)
+        {
+            if (pos >= data.Length)
+            {
+                return false;
+            }
+
+            byte header = data[pos++];
+            if (header == 0)
+            {
+                return true; // STOP.
+            }
+
+            int type = header & 0x0F;
+            int delta = (header >> 4) & 0x0F;
+            if (delta == 0 && !TrySkipVarint(data, ref pos))
+            {
+                return false; // explicit zigzag field id.
+            }
+
+            if (type is ThriftBoolTrue or ThriftBoolFalse)
+            {
+                continue; // boolean field value carried in the header.
+            }
+
+            if (!SkipThriftValue(data, ref pos, type, depth + 1))
+            {
+                return false;
+            }
+        }
+    }
+
+    // Skips a list/set: a 1-byte size/element-type header (size extended to a varint when the nibble is 0xF),
+    // then each element. Every element consumes >= 1 byte, so a crafted huge size runs out of footer and bails.
+    private static bool SkipThriftCollection(ReadOnlySpan<byte> data, ref int pos, int depth)
+    {
+        if (pos >= data.Length)
+        {
+            return false;
+        }
+
+        byte sizeAndType = data[pos++];
+        int elementType = sizeAndType & 0x0F;
+        long size = (sizeAndType >> 4) & 0x0F;
+        if (size == 0x0F && (!TryReadVarint(data, ref pos, out size) || size < 0 || size > int.MaxValue))
+        {
+            return false;
+        }
+
+        for (long i = 0; i < size; i++)
+        {
+            if (!SkipThriftValue(data, ref pos, elementType, depth + 1))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    // Skips a map: a varint size, then (for a non-empty map) a 1-byte key/value type header, then each pair.
+    private static bool SkipThriftMap(ReadOnlySpan<byte> data, ref int pos, int depth)
+    {
+        if (!TryReadVarint(data, ref pos, out long size) || size < 0 || size > int.MaxValue)
+        {
+            return false;
+        }
+
+        if (size == 0)
+        {
+            return true;
+        }
+
+        if (pos >= data.Length)
+        {
+            return false;
+        }
+
+        byte kvTypes = data[pos++];
+        int keyType = (kvTypes >> 4) & 0x0F;
+        int valueType = kvTypes & 0x0F;
+        for (long i = 0; i < size; i++)
+        {
+            if (!SkipThriftValue(data, ref pos, keyType, depth + 1)
+                || !SkipThriftValue(data, ref pos, valueType, depth + 1))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    // Reads an unsigned LEB128 varint (max 10 bytes for 64 bits). Fail-closed on truncation/overrun.
+    private static bool TryReadVarint(ReadOnlySpan<byte> data, ref int pos, out long value)
+    {
+        value = 0;
+        int shift = 0;
+        while (shift <= 63)
+        {
+            if (pos >= data.Length)
+            {
+                value = 0;
+                return false;
+            }
+
+            byte b = data[pos++];
+            value |= (long)(b & 0x7F) << shift;
+            if ((b & 0x80) == 0)
+            {
+                return true;
+            }
+
+            shift += 7;
+        }
+
+        value = 0;
+        return false; // more than 10 continuation bytes => malformed.
+    }
+
+    private static bool TrySkipVarint(ReadOnlySpan<byte> data, ref int pos) => TryReadVarint(data, ref pos, out _);
+
+    // Reads a zigzag-encoded varint (Thrift's signed int encoding), used only for an explicit field id.
+    private static bool TryReadZigZag(ReadOnlySpan<byte> data, ref int pos, out long value)
+    {
+        if (!TryReadVarint(data, ref pos, out long raw))
+        {
+            value = 0;
+            return false;
+        }
+
+        value = (long)((ulong)raw >> 1) ^ -(raw & 1L);
+        return true;
+    }
+
+    private static bool AdvanceThrift(ReadOnlySpan<byte> data, ref int pos, int count)
+    {
+        if (count < 0 || count > data.Length - pos)
+        {
+            return false;
+        }
+
+        pos += count;
+        return true;
     }
 
     // The Parquet file magic is 4 bytes. A plaintext file is bracketed by 'PAR1'; a Parquet Modular
