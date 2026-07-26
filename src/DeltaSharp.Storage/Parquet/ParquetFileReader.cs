@@ -926,16 +926,17 @@ internal sealed class ParquetFileReader
 
     // Walks the ENTIRE top-level FileMetaData struct (Thrift Compact Protocol), skipping every field's value,
     // and reports whether it is a PLAUSIBLE ENCRYPTED FileMetaData: a well-formed footer that (a) parses
-    // cleanly to its top-level STOP, (b) carries the FileMetaData required fields (1=version, 2=schema,
-    // 3=num_rows, 4=row_groups per parquet.thrift), and (c) carries field 8 (encryption_algorithm) as a
-    // NON-EMPTY struct (a valid EncryptionAlgorithm union has exactly one member, so its struct body does not
-    // start with an immediate STOP). Requiring all three — not merely a field-8-struct header — keeps a
-    // malformed/truncated footer, or a syntactically-valid-but-not-a-FileMetaData footer that merely embeds a
-    // field-8 struct (e.g. 0x8C… or an empty field-8 union), on the fail-closed CorruptData default rather than
-    // mislabeling it "encrypted" (red-team R2/R3). A real encrypted Parquet file always satisfies all three.
-    // Fail-closed: returns false on truncation, an unparseable value, or a footer that is not a plausible
-    // encrypted FileMetaData. Bounded: every non-boolean field/element consumes >= 1 byte (total work is
-    // O(footer length)) and recursion is depth-capped.
+    // cleanly to its top-level STOP, (b) carries the FileMetaData required fields WITH their expected Thrift
+    // types (1=version i32, 2=schema list, 3=num_rows i64, 4=row_groups list per parquet.thrift), and (c)
+    // carries field 8 (encryption_algorithm) as a NON-EMPTY struct (a valid EncryptionAlgorithm union has
+    // exactly one member, so its struct body does not start with an immediate STOP). Requiring all three — not
+    // merely a field-8-struct header, nor a type-blind field-id presence — keeps a malformed/truncated footer,
+    // or a syntactically-valid-but-not-a-FileMetaData footer that merely embeds a field-8 struct (e.g. 0x8C…,
+    // an empty field-8 union, or wrong-typed required fields), on the fail-closed CorruptData default rather
+    // than mislabeling it "encrypted" (red-team R2/R3/R4). A real encrypted Parquet file always satisfies all
+    // three. Fail-closed: returns false on truncation, an unparseable value, or a footer that is not a
+    // plausible encrypted FileMetaData. Bounded: every non-boolean field/element consumes >= 1 byte (total
+    // work is O(footer length)) and recursion is depth-capped.
     private static bool ThriftFooterHasEncryptionAlgorithm(ReadOnlySpan<byte> footer)
     {
         // Bits 1..4 = the FileMetaData required fields (version/schema/num_rows/row_groups).
@@ -979,7 +980,21 @@ internal sealed class ParquetFileReader
 
             if (fieldId is >= 1 and <= 4)
             {
-                seenRequiredFields |= 1 << fieldId;
+                // Require each required field to also carry its FileMetaData type (version=i32, schema=list,
+                // num_rows=i64, row_groups=list per parquet.thrift) — a type-blind presence check would accept
+                // a footer that reuses those ids with arbitrary types (red-team R4).
+                bool typeMatches = fieldId switch
+                {
+                    1 => type == ThriftI32,
+                    2 => type == ThriftList,
+                    3 => type == ThriftI64,
+                    4 => type == ThriftList,
+                    _ => false,
+                };
+                if (typeMatches)
+                {
+                    seenRequiredFields |= 1 << fieldId;
+                }
             }
             else if (fieldId == EncryptionAlgorithmFieldId
                 && type == ThriftStruct

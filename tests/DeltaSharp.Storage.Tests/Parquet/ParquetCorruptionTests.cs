@@ -785,6 +785,32 @@ public sealed class ParquetCorruptionTests
     }
 
     [Fact]
+    public async Task WellFormedField8UnionButNoRequiredFields_StaysCorruptData_ProbePrecisionGuard()
+    {
+        // Independently exercises the required-fields guard (red-team R4): this footer carries a NON-EMPTY
+        // field-8 encryption_algorithm union (so the union guard alone would accept it) but NONE of the
+        // FileMetaData required fields (version/schema/num_rows/row_groups), so it must stay CorruptData. If
+        // the required-fields mask were dropped, this would flip to UnsupportedFeature — so it is RED-on-revert
+        // against removing that guard. Footer bytes: field 8 STRUCT { field 1 STRUCT {} } then top STOP.
+        byte[] malformed =
+        [
+            0x50, 0x41, 0x52, 0x31, // 'PAR1' head
+            0x8C,                   // field 8 (delta 8), STRUCT (encryption_algorithm)
+            0x1C,                   //   field 1 (delta 1), STRUCT (a union member => non-empty)
+            0x00,                   //   STOP (empty member struct)
+            0x00,                   // STOP (encryption_algorithm union)
+            0x00,                   // STOP (top-level FileMetaData)
+            0x05, 0x00, 0x00, 0x00, // footer_length = 5 (little-endian)
+            0x50, 0x41, 0x52, 0x31, // 'PAR1' tail magic
+        ];
+        var schema = new StructType(new[] { KeepField });
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(malformed, schema));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+    }
+
+    [Fact]
     public async Task GarbageInput_StaysCorruptData_PrecisionGuard()
     {
         // PRECISION GUARD: non-Parquet garbage trips the SAME "not a parquet file, head: …" library
