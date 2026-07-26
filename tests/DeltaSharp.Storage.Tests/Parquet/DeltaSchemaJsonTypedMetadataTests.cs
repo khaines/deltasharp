@@ -93,8 +93,8 @@ public sealed class DeltaSchemaJsonTypedMetadataTests
         // the Storage DeltaSchemaJson must emit byte-identical output for a schema whose metadata
         // exercises every MetadataValueKind — string, long, double, bool, null, array, and nested
         // object. This proves the shared-writer collapse (no drift) rather than trusting a copied
-        // literal. Field types stay atomic/struct so DeltaSchemaJson.WriteType's tracked complex-type
-        // deferral (#518) does not enter the comparison.
+        // literal. (Complex-type field parity is covered separately by
+        // DeltaSchemaJsonComplexTypeTests since #518.)
         var nested = FieldMetadata.FromValues(new[]
         {
             new KeyValuePair<string, MetadataValue>("inner.long", MetadataValue.Long(42)),

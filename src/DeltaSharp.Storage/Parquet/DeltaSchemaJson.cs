@@ -11,8 +11,10 @@ namespace DeltaSharp.Storage.Parquet;
 /// metadata is serialized via the shared <c>SchemaJson.WriteMetadataValue</c> in
 /// <c>DeltaSharp.Abstractions</c> (visible here through the <c>InternalsVisibleTo</c> grant), so
 /// numeric column-mapping ids and identity numbers/booleans stay byte-for-byte identical to the
-/// engine's serializer. Only <see cref="WriteType"/> differs — this layer stringifies complex
-/// types (see the tracked deferral there).
+/// engine's serializer. <see cref="WriteType"/> now mirrors the engine's
+/// <c>SchemaJson.WriteType</c> recursion for every kind — struct, array, and map — so the footer
+/// schema string and the Delta log <c>metaData.schemaString</c> agree even for complex-typed
+/// columns (#518), a prerequisite for stamping column-mapping ids into nested trees (#191/#676).
 /// </summary>
 /// <remarks>Uses the reflection-free <see cref="Utf8JsonWriter"/> so the layer stays trim/AOT-clean
 /// (ADR-0014).</remarks>
@@ -78,19 +80,49 @@ internal static class DeltaSchemaJson
         writer.WriteEndObject();
     }
 
+    // Serializes a type node with the same nested shape as the engine's canonical
+    // SchemaJson.WriteType (DeltaSharp.Abstractions) — struct/array/map emit their object form and
+    // recurse; atomic/decimal types emit their TypeName string. Keeping this byte-for-byte
+    // identical to the engine is what makes the Parquet footer schema string and the Delta log
+    // metaData.schemaString agree for complex-typed columns (#518); the byte-parity test guards it
+    // against drift. The default arm fails closed so a future DataType added without a matching
+    // case cannot be silently mis-serialized (engine parity).
     private static void WriteType(Utf8JsonWriter writer, DataType type)
     {
-        if (type is StructType nested)
+        switch (type)
         {
-            WriteStruct(writer, nested);
-            return;
-        }
+            case StructType structType:
+                WriteStruct(writer, structType);
+                break;
 
-        // TRACKED DEFERRAL (#518): unlike the engine's SchemaJson.WriteType, this layer stringifies
-        // ALL non-struct types (including Array/Map) to their TypeName rather than emitting the
-        // nested elementType/keyType/valueType object shape. That footer complex-type gap is
-        // pre-existing and out of scope for #330; #191 will need the full shape. Until then this
-        // is intentionally NOT shared with SchemaJson.WriteType.
-        writer.WriteStringValue(type.TypeName);
+            case ArrayType array:
+                writer.WriteStartObject();
+                writer.WriteString("type", "array");
+                writer.WritePropertyName("elementType");
+                WriteType(writer, array.ElementType);
+                writer.WriteBoolean("containsNull", array.ContainsNull);
+                writer.WriteEndObject();
+                break;
+
+            case MapType map:
+                writer.WriteStartObject();
+                writer.WriteString("type", "map");
+                writer.WritePropertyName("keyType");
+                WriteType(writer, map.KeyType);
+                writer.WritePropertyName("valueType");
+                WriteType(writer, map.ValueType);
+                writer.WriteBoolean("valueContainsNull", map.ValueContainsNull);
+                writer.WriteEndObject();
+                break;
+
+            default:
+                if (type is AtomicType or DecimalType)
+                {
+                    writer.WriteStringValue(type.TypeName);
+                    break;
+                }
+
+                throw new SchemaValidationException($"Cannot serialize unsupported type '{type.SimpleString}'.");
+        }
     }
 }
