@@ -326,6 +326,112 @@ internal sealed class CdfTable : IDisposable
     public async Task<long> LatestVersionAsync(CancellationToken cancellationToken = default) =>
         (await new DeltaLog(Backend()).LoadSnapshotAsync(version: null, cancellationToken)).Version;
 
+    /// <summary>Renames a NON-partition, NON-key logical column via the production metadata-only
+    /// <see cref="DeltaTableWriter.RenameColumnAsync"/> door (name mode ONLY, <c>dataChange=false</c> — ZERO
+    /// change rows). The physical <c>col-&lt;uuid&gt;</c> + <c>delta.columnMapping.id</c> are preserved, so
+    /// pre-rename rows read through the UNCHANGED Parquet under the new logical name (§2.8 rename
+    /// reconciliation). Returns the committed version.</summary>
+    public async Task<long> RenameColumnAsync(string from, string to, CancellationToken cancellationToken = default) =>
+        (await new DeltaTableWriter(Backend()).RenameColumnAsync(from, to, cancellationToken: cancellationToken)).Version;
+
+    /// <summary>Drops a NON-partition, NON-key logical column via the production metadata-only
+    /// <see cref="DeltaTableWriter.DropColumnAsync"/> door (name mode ONLY, <c>dataChange=false</c> — ZERO
+    /// change rows). The physical column stays in existing data files (no rewrite), so time travel to a
+    /// pre-drop version still exposes the dropped column + its data. Returns the committed version.</summary>
+    public async Task<long> DropColumnAsync(string name, CancellationToken cancellationToken = default) =>
+        (await new DeltaTableWriter(Backend()).DropColumnAsync(name, cancellationToken: cancellationToken)).Version;
+
+    /// <summary>Appends rows under the table's CURRENT ON-DISK logical schema (id + region partition + the
+    /// single remaining data column), discovered from the live snapshot — the rename/drop-aware writer the
+    /// axis-1 curated tests use to add inserts AFTER a rename (carrying the renamed data column) or a drop
+    /// (carrying no data column). <paramref name="dataValue"/> is written into whatever non-key,
+    /// non-partition column currently exists (or ignored when the table has none, e.g. after a drop). Every
+    /// appended row is an <c>insert</c> change.</summary>
+    public async Task<long> AppendUnderCurrentSchemaAsync(
+        IReadOnlyList<(long Id, string Region, long? DataValue)> rows, CancellationToken cancellationToken = default)
+    {
+        Snapshot snapshot = await new DeltaLog(Backend()).LoadSnapshotAsync(version: null, cancellationToken)
+            .ConfigureAwait(false);
+        StructType schema = snapshot.Schema;
+        int dataColumn = -1;
+        for (int i = 0; i < schema.Count; i++)
+        {
+            if (!string.Equals(schema[i].Name, IdColumn, StringComparison.Ordinal)
+                && !string.Equals(schema[i].Name, RegionColumn, StringComparison.Ordinal))
+            {
+                dataColumn = i;
+                break;
+            }
+        }
+
+        // Guard (#661 review): when the current schema has NO data column (e.g. after a DROP), a non-null
+        // DataValue can no longer be written anywhere. Fail loud so a caller mistake is caught, rather than
+        // silently discarding data.
+        if (dataColumn == -1)
+        {
+            foreach ((_, _, long? dataValue) in rows)
+            {
+                if (dataValue is not null)
+                {
+                    throw new InvalidOperationException(
+                        "AppendUnderCurrentSchemaAsync: a row carries a non-null DataValue but the table has no "
+                        + "data column (it was dropped); the value would be silently lost.");
+                }
+            }
+        }
+
+        var vectors = new ColumnVector[schema.Count];
+        for (int c = 0; c < schema.Count; c++)
+        {
+            StructField field = schema[c];
+            MutableColumnVector vector = ColumnVectors.Create(field.DataType, rows.Count);
+            foreach ((long id, string region, long? dataValue) in rows)
+            {
+                if (string.Equals(field.Name, IdColumn, StringComparison.Ordinal))
+                {
+                    vector.AppendValue(id);
+                }
+                else if (string.Equals(field.Name, RegionColumn, StringComparison.Ordinal))
+                {
+                    vector.AppendBytes(Encoding.UTF8.GetBytes(region));
+                }
+                else if (c == dataColumn)
+                {
+                    AppendLongOrNull(vector, dataValue);
+                }
+                else
+                {
+                    throw new InvalidOperationException($"Unexpected column '{field.Name}' in current-schema append.");
+                }
+            }
+
+            vectors[c] = vector;
+        }
+
+        using DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(_root);
+        DeltaWriteResult result = await target.AppendAsync(
+            schema, PartitionColumns, new[] { new ManagedColumnBatch(schema, vectors, rows.Count) },
+            cancellationToken: cancellationToken);
+        return result.Version;
+    }
+
+    /// <summary>The physical Parquet name of a LOGICAL column at <paramref name="version"/> (latest when
+    /// null) — <c>col-&lt;uuid&gt;</c> in a name-mapped table, else the logical name. The physical↔logical
+    /// divergence witness for the axis-1 rename tests (a rename must PRESERVE this).</summary>
+    public async Task<string> PhysicalNameOfAsync(
+        string logicalName, long? version = null, CancellationToken cancellationToken = default)
+    {
+        Snapshot snapshot = await new DeltaLog(Backend()).LoadSnapshotAsync(version, cancellationToken)
+            .ConfigureAwait(false);
+        if (!snapshot.Schema.TryGetField(logicalName, out StructField field))
+        {
+            throw new InvalidOperationException(
+                $"Column '{logicalName}' is absent from the schema at version {version?.ToString(CultureInfo.InvariantCulture) ?? "latest"}.");
+        }
+
+        return ColumnMapping.PhysicalName(field, _mappingMode);
+    }
+
     /// <summary>Every <c>*.parquet</c> under <c>_change_data/</c>, as table-root-relative '/'-separated paths
     /// (empty when no DELETE has materialized a cdc file yet). Used by the fuzz to locate a cdc file to mutate
     /// and by the goldens to assert the implicit paths write none.</summary>
