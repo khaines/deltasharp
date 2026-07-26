@@ -125,8 +125,16 @@ public sealed class ChangeFeedRenameDropTests : IDisposable
         long preDrop = await table.AppendAsync([Row(1, "east", 10), Row(2, "west", 20)]); // v2 (with `val`)
         Assert.Equal(2L, preDrop);
 
+        // Delta invariant: dropping a column RETIRES its id — maxColumnId is a monotonic high-water mark that is
+        // NEVER decremented and the retired id is NEVER reused. Capture it before/after the drop and assert it
+        // is unchanged (a regression that recycled the id or rewound maxColumnId would go RED here).
+        string maxColumnIdBeforeDrop = await MaxColumnIdAsync(table);
+
         long dropVersion = await table.DropColumnAsync("val");                       // v3 (metadata-only)
         Assert.Equal(3L, dropVersion);
+
+        string maxColumnIdAfterDrop = await MaxColumnIdAsync(table);
+        Assert.Equal(maxColumnIdBeforeDrop, maxColumnIdAfterDrop);
 
         long postDrop = await table.AppendUnderCurrentSchemaAsync(
             [(3, "east", null), (4, "north", null)]);                              // v4 (no data column now)
@@ -179,6 +187,24 @@ public sealed class ChangeFeedRenameDropTests : IDisposable
 
     // ------------------------------------------------------------------ helpers
 
+    // The three trailing engine metadata columns a CDF read appends to every output schema (§2.4). Deriving the
+    // data-column set by EXCLUDING these named columns is the single source of truth — no positional `Count-3`.
+    private static readonly string[] MetadataColumnNames =
+    [
+        ChangeDataWriter.ChangeTypeColumn,
+        ChangeDataWriter.CommitVersionColumn,
+        ChangeDataWriter.CommitTimestampColumn,
+    ];
+
+    private static bool IsMetadataColumn(string name) => Array.IndexOf(MetadataColumnNames, name) >= 0;
+
+    // Reads the table's tracked delta.columnMapping.maxColumnId from the live snapshot configuration.
+    private static async Task<string> MaxColumnIdAsync(CdfTable table)
+    {
+        Snapshot snapshot = await new DeltaLog(table.Backend()).LoadSnapshotAsync(version: null);
+        return snapshot.Metadata.Configuration[ColumnMapping.MaxColumnIdKey];
+    }
+
     private readonly record struct Change(long Version, string ChangeType, long Id, string Region, long? Data);
 
     // Reads a CDF range through the production door and flattens it into (id, region, data) change rows,
@@ -219,17 +245,22 @@ public sealed class ChangeFeedRenameDropTests : IDisposable
         return (schema, changes);
     }
 
-    // The logical names of the DATA columns (everything before the three trailing engine metadata columns).
+    // The logical names of the DATA columns (everything except the trailing engine metadata columns).
     private static string[] DataColumnNames(StructType outputSchema) =>
-        outputSchema.Take(outputSchema.Count - 3).Select(f => f.Name).ToArray();
+        outputSchema.Where(f => !IsMetadataColumn(f.Name)).Select(f => f.Name).ToArray();
 
     // The single non-key, non-partition data column's index in a CDF output schema, or -1 when the table has
-    // none (e.g. after `val` is dropped). Scans only the data columns (excludes the 3 trailing metadata cols).
+    // none (e.g. after `val` is dropped). Skips the id/region keys and the engine metadata columns by name.
     private static int FindDataColumn(StructType schema)
     {
-        for (int i = 0; i < schema.Count - 3; i++)
+        for (int i = 0; i < schema.Count; i++)
         {
             string name = schema[i].Name;
+            if (IsMetadataColumn(name))
+            {
+                continue;
+            }
+
             if (!string.Equals(name, "id", StringComparison.Ordinal)
                 && !string.Equals(name, "region", StringComparison.Ordinal))
             {

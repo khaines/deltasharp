@@ -14,9 +14,10 @@ namespace DeltaSharp.Storage.Tests.Delta;
 /// End-to-end curated coverage for the wider Delta <b>type-widening</b> pairs the CDF/snapshot oracle did not
 /// yet exercise: <c>short → int</c>, <c>float → double</c>, and grow-only <c>decimal(p,s) → decimal(p',s')</c>
 /// (the model oracle already covers <c>int → long</c>). Each pair is driven through the REAL production doors
-/// in BOTH column-mapping modes it is reachable in (<c>none</c> and <c>name</c>): create a table with the
-/// NARROW column, append narrow rows, enable <c>typeWidening</c>, then a <c>mergeSchema</c> append writes the
-/// WIDE type and APPLIES the same-family widening (<see cref="TypeWidening.IsSchemaEvolutionWidening"/>).
+/// in ALL THREE column-mapping modes it is reachable in (<c>none</c>, <c>name</c>, AND <c>id</c> — id-mode
+/// data resolves by Parquet <c>field_id</c>, a distinct promotion code path): create a table with the NARROW
+/// column, append narrow rows, enable <c>typeWidening</c>, then a <c>mergeSchema</c> append writes the WIDE
+/// type and APPLIES the same-family widening (<see cref="TypeWidening.IsSchemaEvolutionWidening"/>).
 /// </summary>
 /// <remarks>
 /// <para><b>Load-bearing.</b> Each narrow batch carries at least one value that would be WRONG under a
@@ -25,9 +26,12 @@ namespace DeltaSharp.Storage.Tests.Delta;
 /// the value), and each wide append carries a value only representable in the WIDE type (an <c>int</c> beyond
 /// <c>short</c> range; a <c>double</c> not representable as <c>float</c>; a decimal needing the new scale). So
 /// a regression that misread the promoted narrow file, or failed to evolve the reconciled schema to the wide
-/// type, goes RED on the value map or the end-schema type. The NEGATIVE oracle proves the promotion is GATED:
-/// reading the narrow file under the wide schema with the promotion gate CLOSED fails closed as
-/// <see cref="StorageErrorKind.SchemaMismatch"/> — never a silent misread.</para>
+/// type, goes RED on the value map or the end-schema type. The NEGATIVE oracles prove the promotion is GATED:
+/// the low-level reader with the promotion gate CLOSED fails closed as
+/// <see cref="StorageErrorKind.SchemaMismatch"/>, and — at the FACADE level
+/// (<see cref="Widen_WithoutTypeWideningFeature_FailsClosedAtDoor"/>) — a <c>mergeSchema</c> widen through the
+/// real write door on a table that has NOT enabled the <c>typeWidening</c> feature is rejected
+/// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> before any commit — never a silent misread.</para>
 /// <para>Cross-family pairs (e.g. <c>int → double</c>) are deliberately NOT exercised on the append path: they
 /// are read-promotable / ALTER-applicable but NOT schema-evolution-eligible
 /// (<see cref="TypeWidening.IsSchemaEvolutionWidening"/> excludes them), so a <c>mergeSchema</c> append of a
@@ -54,11 +58,12 @@ public sealed class TypeWideningPairsTests : IDisposable
     }
 
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task Widen_ShortToInt_PromotesNarrowRows_AndEvolvesSchema(bool nameMapped)
+    [InlineData("none")]
+    [InlineData("name")]
+    [InlineData("id")]
+    public async Task Widen_ShortToInt_PromotesNarrowRows_AndEvolvesSchema(string modeName)
     {
-        ColumnMappingMode mode = nameMapped ? ColumnMappingMode.Name : ColumnMappingMode.None;
+        ColumnMappingMode mode = ParseMode(modeName);
         // A NEGATIVE short (-5) is the truncation/sign-extension witness (an unsigned misread yields 65531);
         // 30000 is the narrow upper sample. The wide append writes 100000 / -200000 — GENUINE ints beyond the
         // short range, proving the reconciled column is truly `int` (not a re-widened short).
@@ -77,11 +82,12 @@ public sealed class TypeWideningPairsTests : IDisposable
     }
 
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task Widen_FloatToDouble_PromotesNarrowRows_AndEvolvesSchema(bool nameMapped)
+    [InlineData("none")]
+    [InlineData("name")]
+    [InlineData("id")]
+    public async Task Widen_FloatToDouble_PromotesNarrowRows_AndEvolvesSchema(string modeName)
     {
-        ColumnMappingMode mode = nameMapped ? ColumnMappingMode.Name : ColumnMappingMode.None;
+        ColumnMappingMode mode = ParseMode(modeName);
         // 1.5f / -0.25f are EXACT in both float and double, so a correct promotion reproduces them bit-for-bit
         // (a bit-reinterpretation misread would not). The wide append writes 0.1d — NOT representable as a
         // float — proving the reconciled column is truly `double`.
@@ -99,11 +105,12 @@ public sealed class TypeWideningPairsTests : IDisposable
     }
 
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task Widen_DecimalGrow_RescalesNarrowRows_AndEvolvesSchema(bool nameMapped)
+    [InlineData("none")]
+    [InlineData("name")]
+    [InlineData("id")]
+    public async Task Widen_DecimalGrow_RescalesNarrowRows_AndEvolvesSchema(string modeName)
     {
-        ColumnMappingMode mode = nameMapped ? ColumnMappingMode.Name : ColumnMappingMode.None;
+        ColumnMappingMode mode = ParseMode(modeName);
         // decimal(6,2) → decimal(10,4): both the integer-digit range (p−s: 4→6) and the scale (2→4) grow, so
         // every value is preserved by an EXACT rescale (12.34 → 12.3400). The wide append writes 1.2345 —
         // needing the NEW scale of 4 — proving the reconciled column is truly decimal(10,4).
@@ -124,13 +131,52 @@ public sealed class TypeWideningPairsTests : IDisposable
             v => { ParquetTypeMapping.AppendDecimal(v, narrow, 12.34m); ParquetTypeMapping.AppendDecimal(v, narrow, -0.05m); }, 2);
     }
 
-    // ------------------------------------------------------------------ end-to-end widening driver
+    // A FACADE-level negative for #5: on a table that has NOT enabled the typeWidening feature, a mergeSchema
+    // widen through the real DeltaWriteTarget write door is rejected fail-closed BEFORE any commit — the door
+    // must not open the promotion gate when the feature is absent (else the existing narrow Parquet would
+    // become unreadable under the widened logical schema, #495). This complements the low-level reader
+    // negative (AssertFailsClosedWithoutPromotionAsync) by proving the gate holds at the production door.
+    [Fact]
+    public async Task Widen_WithoutTypeWideningFeature_FailsClosedAtDoor()
+    {
+        string root = NewRoot();
+        var narrowSchema = new StructType(new[]
+        {
+            new StructField("id", DataTypes.LongType, nullable: false),
+            new StructField("v", DataTypes.IntegerType, nullable: true),
+        });
+        var wideSchema = new StructType(new[]
+        {
+            new StructField("id", DataTypes.LongType, nullable: false),
+            new StructField("v", DataTypes.LongType, nullable: true),
+        });
 
-    // Creates a (`none` or `name`-mapped) table with a NARROW `v` column + narrow rows, enables typeWidening,
-    // then a mergeSchema append writes the WIDE `v` column + wide rows (applying the same-family widening).
-    // Reads the final snapshot back through the production door (which opens the promotion gate because the
-    // table declares the typeWidening feature) and returns the reconciled end schema + an id→decoded-value map
-    // (narrow rows PROMOTED into the wide lane, wide rows native).
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(root))
+        {
+            ColumnBatch narrowBatch = BuildBatch(narrowSchema, [1, 2], v => { v.AppendValue(-5); v.AppendValue(30000); });
+            await target.AppendAsync(narrowSchema, Array.Empty<string>(), new[] { narrowBatch });
+        }
+
+        // NOTE: typeWidening feature deliberately NOT enabled.
+        using DeltaWriteTarget widenTarget = DeltaWriteTarget.ForLocalPath(root);
+        ColumnBatch wideBatch = BuildBatch(wideSchema, [3], v => v.AppendValue(5_000_000_000L));
+        DeltaSchemaMismatchException ex = await Assert.ThrowsAsync<DeltaSchemaMismatchException>(
+            () => widenTarget.AppendAsync(wideSchema, Array.Empty<string>(), new[] { wideBatch }, mergeSchema: true));
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+
+        // Nothing was published beyond the initial create (version 0).
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(root);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        Assert.Equal(0L, info.Version);
+        Assert.Equal(DataTypes.IntegerType, info.Schema["v"].DataType);
+    }
+
+    // ------------------------------------------------------------------ end-to-end widening driver
+    // Creates a (`none`, `name`- or `id`-mapped) table with a NARROW `v` column + narrow rows, enables
+    // typeWidening, then a mergeSchema append writes the WIDE `v` column + wide rows (applying the same-family
+    // widening). Reads the final snapshot back through the production door (which opens the promotion gate
+    // because the table declares the typeWidening feature) and returns the reconciled end schema + an
+    // id→decoded-value map (narrow rows PROMOTED into the wide lane, wide rows native).
     private async Task<(StructType Schema, Dictionary<long, T> Map)> RunWideningAsync<T>(
         ColumnMappingMode mode, DataType narrow, DataType wide,
         long[] narrowIds, Action<MutableColumnVector> fillNarrow,
@@ -155,6 +201,11 @@ public sealed class TypeWideningPairsTests : IDisposable
             if (mode == ColumnMappingMode.Name)
             {
                 await target.CreateNameMappedTableAsync(
+                    narrowSchema, Array.Empty<string>(), new[] { narrowBatch }, new SeededPhysicalNameSource("tw-pairs"));
+            }
+            else if (mode == ColumnMappingMode.Id)
+            {
+                await target.CreateIdMappedTableAsync(
                     narrowSchema, Array.Empty<string>(), new[] { narrowBatch }, new SeededPhysicalNameSource("tw-pairs"));
             }
             else
@@ -219,6 +270,14 @@ public sealed class TypeWideningPairsTests : IDisposable
         fillV(vColumn);
         return new ManagedColumnBatch(schema, new ColumnVector[] { idColumn, vColumn }, ids.Length);
     }
+
+    private static ColumnMappingMode ParseMode(string modeName) => modeName switch
+    {
+        "none" => ColumnMappingMode.None,
+        "name" => ColumnMappingMode.Name,
+        "id" => ColumnMappingMode.Id,
+        _ => throw new ArgumentOutOfRangeException(nameof(modeName), modeName, "unknown column-mapping mode"),
+    };
 
     private string NewRoot()
     {

@@ -364,6 +364,22 @@ internal sealed class CdfTable : IDisposable
             }
         }
 
+        // Guard (#661 review): when the current schema has NO data column (e.g. after a DROP), a non-null
+        // DataValue can no longer be written anywhere. Fail loud so a caller mistake is caught, rather than
+        // silently discarding data.
+        if (dataColumn == -1)
+        {
+            foreach ((_, _, long? dataValue) in rows)
+            {
+                if (dataValue is not null)
+                {
+                    throw new InvalidOperationException(
+                        "AppendUnderCurrentSchemaAsync: a row carries a non-null DataValue but the table has no "
+                        + "data column (it was dropped); the value would be silently lost.");
+                }
+            }
+        }
+
         var vectors = new ColumnVector[schema.Count];
         for (int c = 0; c < schema.Count; c++)
         {

@@ -72,7 +72,10 @@ public sealed class ColumnMappingTamperFuzzTests : IDisposable
         });
 
         DeltaReadException ex = await AssertLoadFailsClosedAsync(root);
-        Assert.Contains("assigned to more than one column", ex.Message, StringComparison.Ordinal);
+        // Pin the PHYSICAL-NAME diagnostic specifically: "assigned to more than one column" alone is ALSO a
+        // substring of the duplicate-ID message, so it would not discriminate this defect from a dup-id.
+        Assert.Contains("physical name '", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("is assigned to more than one column", ex.Message, StringComparison.Ordinal);
         AssertNoPathLeak(ex, root);
         // NOTE: this defect's message intentionally echoes the offending physical name (the schema-consistency
         // diagnostic), so the no-col-uuid hygiene assertion does NOT apply here — only the no-path invariant.
@@ -107,6 +110,43 @@ public sealed class ColumnMappingTamperFuzzTests : IDisposable
 
         DeltaReadException ex = await AssertLoadFailsClosedAsync(root);
         Assert.Contains("has no '" + IdKey + "'", ex.Message, StringComparison.Ordinal);
+        AssertNoLeak(ex, root);
+    }
+
+    [Fact]
+    public async Task NameMode_MissingPhysicalName_FailsClosedAtLoad_NoLeak()
+    {
+        string root = await CreateMappedTableAsync(ColumnMappingMode.Name);
+
+        // Strip a field's physicalName: under column mapping every field MUST carry one — resolving the
+        // physical Parquet column by logical name would be a silent mis-bind, so the door fails closed.
+        TamperSchema(root, schema =>
+        {
+            JsonObject metadata = schema["fields"]!.AsArray()[1]!["metadata"]!.AsObject();
+            metadata.Remove(PhysicalNameKey);
+        });
+
+        DeltaReadException ex = await AssertLoadFailsClosedAsync(root);
+        Assert.Contains("has no '" + PhysicalNameKey + "'", ex.Message, StringComparison.Ordinal);
+        AssertNoLeak(ex, root);
+    }
+
+    [Fact]
+    public async Task IdMode_DuplicateColumnMappingId_FailsClosedAtLoad_NoLeak()
+    {
+        string root = await CreateMappedTableAsync(ColumnMappingMode.Id);
+
+        // The id-mode structural counterpart of the name-mode dup-id defect: id-mode data resolves by
+        // field_id, so a duplicate id is an ambiguous bind foreign engines must never emit — the door rejects
+        // it at load exactly as in name mode, closing the name/id coverage asymmetry.
+        TamperSchema(root, schema =>
+        {
+            JsonArray fields = schema["fields"]!.AsArray();
+            fields[1]!["metadata"]![IdKey] = fields[0]!["metadata"]![IdKey]!.GetValue<long>();
+        });
+
+        DeltaReadException ex = await AssertLoadFailsClosedAsync(root);
+        Assert.Contains("is assigned to more than one column", ex.Message, StringComparison.Ordinal);
         AssertNoLeak(ex, root);
     }
 
@@ -221,11 +261,13 @@ public sealed class ColumnMappingTamperFuzzTests : IDisposable
         return await Assert.ThrowsAsync<DeltaReadException>(() => source.LoadSnapshotAsync(null, null));
     }
 
-    // #653: the surfaced message must never echo an on-disk path (the tamper file or the table root).
+    // #653: the surfaced message must never echo an on-disk path (the tamper file, the table root, or even the
+    // bare commit filename — a regression surfacing only "00000000000000000000.json" must still be caught).
     private static void AssertNoPathLeak(Exception ex, string root)
     {
         Assert.DoesNotContain(root, ex.Message, StringComparison.Ordinal);
         Assert.DoesNotContain(CommitPath(root), ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(Path.GetFileName(CommitPath(root)), ex.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("_delta_log", ex.Message, StringComparison.Ordinal);
     }
 
