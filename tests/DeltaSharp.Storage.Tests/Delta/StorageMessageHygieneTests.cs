@@ -127,6 +127,19 @@ public sealed class StorageMessageHygieneTests
     }
 
     [Fact]
+    public void Sanitize_NeutralizesLoneSurrogates_ButKeepsValidPairs()
+    {
+        // A pre-existing lone (unpaired) surrogate is malformed UTF-16 and is neutralized to U+FFFD; a valid
+        // astral pair survives intact. (Red-team R1: the cap back-off only prevented SPLITTING a pair — an
+        // already-lone surrogate in the input must also be neutralized.)
+        Assert.Equal("a\uFFFDb", DiagnosticText.Sanitize("a\uD800b")); // lone HIGH surrogate
+        Assert.Equal("a\uFFFDb", DiagnosticText.Sanitize("a\uDC00b")); // lone LOW surrogate
+        Assert.Equal("a\U0001F600b", DiagnosticText.Sanitize("a\U0001F600b")); // valid pair preserved
+        // Even with a negative/oversized cap (no length capping), a lone surrogate is still neutralized.
+        Assert.Equal("\uFFFD", DiagnosticText.Sanitize("\uD800", maxLength: -10));
+    }
+
+    [Fact]
     public void ValidateLevelRange_SanitizesLeafPathInMessage()
     {
         // #665: the nested reader's out-of-range-level guard echoes the file-derived leaf path — it must be

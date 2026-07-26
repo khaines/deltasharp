@@ -58,6 +58,32 @@ internal static class DiagnosticText
         for (int i = 0; i < cap; i++)
         {
             char c = raw[i];
+            if (char.IsHighSurrogate(c))
+            {
+                // A valid high+low surrogate pair (both within the cap — the cap back-off above guarantees a
+                // high surrogate is never the last retained char) is a legal astral code point: keep it
+                // verbatim (neither half is a control/separator). A high surrogate NOT followed by a low
+                // surrogate is a LONE (malformed) surrogate — neutralize it.
+                if (i + 1 < cap && char.IsLowSurrogate(raw[i + 1]))
+                {
+                    builder.Append(c);
+                    builder.Append(raw[i + 1]);
+                    i++;
+                    continue;
+                }
+
+                builder.Append('\uFFFD');
+                continue;
+            }
+
+            if (char.IsLowSurrogate(c))
+            {
+                // Reached only when this low surrogate has no preceding high surrogate (a valid pair is consumed
+                // above) — a lone (malformed) surrogate.
+                builder.Append('\uFFFD');
+                continue;
+            }
+
             builder.Append(IsInjectionUnsafe(c) ? '\uFFFD' : c);
         }
 
