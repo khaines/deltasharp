@@ -1350,7 +1350,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend, IDisposable
             // RELATIVE-path-only message so the absolute root never leaks and a catch(DeltaStorageException)
             // caller still traps it.
             throw DeltaStorageException.PathNotConfined(
-                $"Path '{path}' could not be resolved (possible symlink cycle or inaccessible ancestor) and is rejected.");
+                $"Path '{DiagnosticText.Sanitize(path)}' could not be resolved (possible symlink cycle or inaccessible ancestor) and is rejected.");
         }
 
         bool realIsRoot = string.Equals(realFull, _realRoot, StringComparison.Ordinal);

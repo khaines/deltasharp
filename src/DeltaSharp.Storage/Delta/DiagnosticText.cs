@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 
 namespace DeltaSharp.Storage.Delta;
@@ -41,15 +42,37 @@ internal static class DiagnosticText
             return "(null)";
         }
 
-        string capped = raw.Length <= maxLength
-            ? raw
-            : string.Concat(raw.AsSpan(0, maxLength), "…");
-        var builder = new StringBuilder(capped.Length);
-        foreach (char c in capped)
+        // Cap the length without splitting a UTF-16 surrogate pair (a lone surrogate is malformed text).
+        int cap = raw.Length;
+        if (maxLength >= 0 && cap > maxLength)
         {
-            builder.Append(char.IsControl(c) ? '\uFFFD' : c);
+            cap = maxLength;
+            if (cap > 0 && char.IsHighSurrogate(raw[cap - 1]))
+            {
+                cap--;
+            }
+        }
+
+        bool truncated = cap < raw.Length;
+        var builder = new StringBuilder(cap + (truncated ? 1 : 0));
+        for (int i = 0; i < cap; i++)
+        {
+            char c = raw[i];
+            builder.Append(IsInjectionUnsafe(c) ? '\uFFFD' : c);
+        }
+
+        if (truncated)
+        {
+            builder.Append('…');
         }
 
         return builder.ToString();
     }
+
+    // A character is neutralized if it is a C0/C1 control (category Cc — CR/LF/NUL/tab/NEL) OR a Unicode
+    // LINE/PARAGRAPH SEPARATOR (U+2028/U+2029, categories Zl/Zp), which several renderers and log viewers treat
+    // as a newline — so the full log-injection line-break surface, not just Cc, is closed.
+    private static bool IsInjectionUnsafe(char c) =>
+        char.IsControl(c)
+        || char.GetUnicodeCategory(c) is UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator;
 }

@@ -123,6 +123,22 @@ public sealed class LocalFileSystemBackendTests : IDisposable
     }
 
     [Fact]
+    public async Task PathNotConfined_Message_SanitizesControlChars_NoLogInjection()
+    {
+        // #516: an escaping add.path carrying a CRLF payload (a poisoned _delta_log can inject arbitrary text)
+        // must not reach a structured-log sink verbatim — the confinement message sanitizes it (control chars
+        // stripped, raw payload not echoed). RED-on-revert against dropping DiagnosticText.Sanitize(path).
+        const string poisoned = "../esc\r\nInjected-fake-log-line";
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            async () => await _backend.PutIfAbsentAsync(poisoned, new byte[] { 0 }, CancellationToken.None));
+
+        Assert.Equal(StorageErrorKind.PathNotConfined, error.Kind);
+        Assert.DoesNotContain('\n', error.Message);
+        Assert.DoesNotContain('\r', error.Message);
+        Assert.DoesNotContain(poisoned, error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Delete_IsIdempotent()
     {
         const string key = "data/file.bin";

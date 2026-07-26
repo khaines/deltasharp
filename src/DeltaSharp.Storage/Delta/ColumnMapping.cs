@@ -153,22 +153,10 @@ internal static class ColumnMapping
     private const int MaxEchoedTokenLength = 64;
 
     // Bounds and redacts an untrusted configuration value (e.g. delta.columnMapping.mode) before it is
-    // interpolated into an exception message (#516 log-injection hardening): caps the length and replaces
-    // control characters with U+FFFD, so a poisoned table property cannot inject newlines/control sequences
-    // into a log line or blow up a diagnostic with an unbounded string.
-    private static string SanitizeEchoedToken(string raw)
-    {
-        string capped = raw.Length <= MaxEchoedTokenLength
-            ? raw
-            : string.Concat(raw.AsSpan(0, MaxEchoedTokenLength), "…");
-        var builder = new StringBuilder(capped.Length);
-        foreach (char c in capped)
-        {
-            builder.Append(char.IsControl(c) ? '\uFFFD' : c);
-        }
-
-        return builder.ToString();
-    }
+    // interpolated into an exception message (#516 log-injection hardening). Delegates to the shared
+    // DiagnosticText.Sanitize with a tighter cap for config tokens (they are short protocol strings, unlike a
+    // dotted column path), so the control-char/line-separator neutralization stays in one place (#667).
+    private static string SanitizeEchoedToken(string raw) => DiagnosticText.Sanitize(raw, MaxEchoedTokenLength);
 
     // The conservative, portable per-path-COMPONENT budget (in UTF-8 bytes) for a NAME that becomes a Hive
     // partition-directory segment ("name=value") — #572 deltaspec R7. Filesystems cap a single path component
