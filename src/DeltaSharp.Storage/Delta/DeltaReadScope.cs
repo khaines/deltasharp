@@ -94,11 +94,13 @@ internal abstract record DeltaReadScope
                 {
                     case RemoveFileAction remove when Paths.Contains(remove.Path):
                         throw new ConcurrentDeleteReadException(
-                            $"A concurrent commit removed file '{remove.Path}', which this writer read, since its read snapshot; the commit was aborted.");
+                            // #667 message hygiene: the file path is not interpolated (a poisoned log can
+                            // inject arbitrary text); the conflict kind is the diagnosis.
+                            "A concurrent commit removed a file which this writer read since its read snapshot; the commit was aborted.");
 
                     case AddFileAction add when Paths.Contains(add.Path):
                         throw new ConcurrentAppendException(
-                            $"A concurrent commit re-added file '{add.Path}', which this writer read, since its read snapshot; the commit was aborted.");
+                            "A concurrent commit re-added a file which this writer read since its read snapshot; the commit was aborted.");
 
                     default:
                         break;

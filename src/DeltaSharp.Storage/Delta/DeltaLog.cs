@@ -649,7 +649,9 @@ internal sealed class DeltaLog
                 {
                     throw DeltaProtocolException.Inconsistent(string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Delta log object '{path}' exceeds the {_maxLogObjectBytes}-byte read ceiling."));
+                        // #667 message hygiene: the log-object path is structural (_delta_log/<version>), but
+                        // it is dropped for a uniform no-path posture; the bounded byte ceiling is the diagnosis.
+                        $"A Delta log object exceeds the {_maxLogObjectBytes}-byte read ceiling."));
                 }
 
                 buffer.Write(chunk, 0, read);

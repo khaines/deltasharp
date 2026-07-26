@@ -360,7 +360,8 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
                 new[] { StagedWith("a.parquet", Struct(F("id", DataTypes.LongType, nullable: false))) }));
 
         Assert.Equal(DeltaSchemaMismatchKind.PhysicalWriteSchemaMismatch, ex.Kind);
-        Assert.Contains("a.parquet", ex.Message, StringComparison.Ordinal);
+        // #667 message hygiene: the staged file path is NOT echoed into the message (callers branch on Kind).
+        Assert.DoesNotContain("a.parquet", ex.Message, StringComparison.Ordinal);
         Assert.Equal(0L, (await LoadAsync()).Version); // nothing published
     }
 
@@ -463,7 +464,9 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
             Writer().AppendAsync(readSnapshot, declared, new[] { realFile }));
 
         Assert.Equal(DeltaSchemaMismatchKind.PhysicalWriteSchemaMismatch, ex.Kind);
-        Assert.Contains("real.parquet", ex.Message, StringComparison.Ordinal);
+        // #667 message hygiene: the staged file path and physical schemas are NOT echoed into the message
+        // (callers branch on Kind). The classification is carried by the typed Kind, not the message text.
+        Assert.DoesNotContain("real.parquet", ex.Message, StringComparison.Ordinal);
         Assert.Equal(0L, (await LoadAsync()).Version); // nothing published
     }
 

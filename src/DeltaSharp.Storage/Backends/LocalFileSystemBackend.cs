@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using DeltaSharp.Storage.Delta;
 using Microsoft.Win32.SafeHandles;
 
 namespace DeltaSharp.Storage.Backends;
@@ -939,7 +940,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend, IDisposable
         if (!isUnderRoot && !(allowRoot && isRoot))
         {
             throw DeltaStorageException.PathNotConfined(
-                $"Path '{path}' escapes the confined table root and is rejected.");
+                $"Path '{DiagnosticText.Sanitize(path)}' escapes the confined table root and is rejected.");
         }
 
         return isRoot ? string.Empty : full[_rootWithSeparator.Length..];
@@ -948,10 +949,10 @@ internal sealed class LocalFileSystemBackend : IStorageBackend, IDisposable
     // Maps a confinement-walk failure to the deterministic storage error the backend contract promises.
     private static DeltaStorageException MapWalkError(ConfinedFileSystem.WalkError error, string path) => error switch
     {
-        ConfinedFileSystem.WalkError.NotFound => DeltaStorageException.NotFound($"Object '{path}' does not exist."),
+        ConfinedFileSystem.WalkError.NotFound => DeltaStorageException.NotFound($"Object '{DiagnosticText.Sanitize(path)}' does not exist."),
         ConfinedFileSystem.WalkError.NotConfined => DeltaStorageException.PathNotConfined(
-            $"Path '{path}' resolves through a symlink to a location outside the confined table root and is rejected."),
-        _ => DeltaStorageException.Transient($"Resolving '{path}' failed."),
+            $"Path '{DiagnosticText.Sanitize(path)}' resolves through a symlink to a location outside the confined table root and is rejected."),
+        _ => DeltaStorageException.Transient($"Resolving '{DiagnosticText.Sanitize(path)}' failed."),
     };
 
     // Race-free confined open of a leaf (POSIX): walks each component with openat + O_NOFOLLOW from the
@@ -982,7 +983,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend, IDisposable
             string full = Resolve(path);
             if (!File.Exists(full))
             {
-                throw DeltaStorageException.NotFound($"Object '{path}' does not exist.");
+                throw DeltaStorageException.NotFound($"Object '{DiagnosticText.Sanitize(path)}' does not exist.");
             }
 
             return new FileStream(
@@ -1324,7 +1325,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend, IDisposable
         if (!isUnderRoot && !(allowRoot && isRoot))
         {
             throw DeltaStorageException.PathNotConfined(
-                $"Path '{path}' escapes the confined table root and is rejected.");
+                $"Path '{DiagnosticText.Sanitize(path)}' escapes the confined table root and is rejected.");
         }
 
         // Real-target gate: follow symlinks on the existing portion and re-check containment, so a
@@ -1357,7 +1358,7 @@ internal sealed class LocalFileSystemBackend : IStorageBackend, IDisposable
         if (!realIsUnderRoot && !(allowRoot && realIsRoot))
         {
             throw DeltaStorageException.PathNotConfined(
-                $"Path '{path}' resolves through a symlink to a location outside the confined table root and is rejected.");
+                $"Path '{DiagnosticText.Sanitize(path)}' resolves through a symlink to a location outside the confined table root and is rejected.");
         }
 
         return full;

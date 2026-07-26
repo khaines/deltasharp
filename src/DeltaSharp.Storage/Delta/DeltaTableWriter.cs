@@ -1410,7 +1410,9 @@ internal sealed class DeltaTableWriter
                         StorageErrorKind.SchemaMismatch,
                         string.Create(
                             CultureInfo.InvariantCulture,
-                            $"Staged file '{file.Path}' carries partition value(s) " +
+                            // #667 message hygiene: the staged file path is not interpolated (a poisoned log
+                            // can inject arbitrary text); the partition-column keys are bounded schema tokens.
+                            $"A staged file carries partition value(s) " +
                             $"[{string.Join(", ", file.PartitionValues.Keys)}] but the table is unpartitioned; " +
                             $"an unpartitioned write must not specify any partition value."));
                 }
@@ -1441,7 +1443,9 @@ internal sealed class DeltaTableWriter
                     StorageErrorKind.SchemaMismatch,
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Staged file '{file.Path}' carries partition value(s) [{string.Join(", ", stray)}] " +
+                        // #667 message hygiene: the staged file path is not interpolated; the partition-column
+                        // keys and declared columns are bounded schema tokens.
+                        $"A staged file carries partition value(s) [{string.Join(", ", stray)}] " +
                         $"not declared by the table's partition columns [{string.Join(", ", partitionColumns)}]; " +
                         $"a partitioned write must not specify any partition value beyond the declared columns."));
             }
@@ -1456,7 +1460,9 @@ internal sealed class DeltaTableWriter
                     StorageErrorKind.SchemaMismatch,
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Staged file '{file.Path}' is missing partition column(s) " +
+                        // #667 message hygiene: the staged file path is not interpolated; the missing
+                        // partition-column names are bounded schema tokens.
+                        $"A staged file is missing partition column(s) " +
                         $"[{string.Join(", ", missing)}]; a partitioned write must specify a value " +
                         $"(possibly null) for every partition column."));
             }
@@ -1499,8 +1505,7 @@ internal sealed class DeltaTableWriter
         {
             if (file.DataSchema is { } actual && !DataColumnsMatch(expected, actual))
             {
-                throw DeltaSchemaMismatchException.PhysicalWriteSchemaMismatch(
-                    file.Path, expected.SimpleString, actual.SimpleString);
+                throw DeltaSchemaMismatchException.PhysicalWriteSchemaMismatch();
             }
         }
     }

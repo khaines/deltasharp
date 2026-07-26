@@ -715,8 +715,11 @@ public sealed class DeltaOptimizeTests : IDisposable
         OptimizeSchemaEvolutionException ex = await Assert.ThrowsAsync<OptimizeSchemaEvolutionException>(
             () => Optimize().OptimizeAsync());
 
-        // The clear error names the file and the required-column cause, and does NOT surface the raw defect.
-        Assert.Contains("a.parquet", ex.Message, StringComparison.Ordinal);
+        // #667 message hygiene (mirrors the read-path DeltaReadSchemaEvolutionException): the file path is NOT
+        // echoed into the message — it stays on the typed FilePath property. The required-column cause is
+        // retained (bounded token), and the raw defect is still not surfaced.
+        Assert.DoesNotContain("a.parquet", ex.Message, StringComparison.Ordinal);
+        Assert.Equal("a.parquet", ex.FilePath);
         Assert.Contains("REQUIRED", ex.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("not present in the Parquet file schema", ex.Message, StringComparison.Ordinal);
 

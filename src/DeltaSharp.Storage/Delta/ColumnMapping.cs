@@ -856,7 +856,10 @@ internal static class ColumnMapping
                 throw DeltaProtocolException.Inconsistent(
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Schema column '{path}' collides case-insensitively with '{existingPath}'; column names "
+                        // #667 message hygiene: the schema column names are the caller's own identifiers, so
+                        // they are echoed through DiagnosticText.Sanitize (control-char strip + length cap)
+                        // to close the log-injection vector while preserving the diagnostic names.
+                        $"Schema column '{DiagnosticText.Sanitize(path)}' collides case-insensitively with '{DiagnosticText.Sanitize(existingPath)}'; column names "
                         + $"must be unique ignoring case (a case-insensitive reader such as Spark rejects the "
                         + $"table as a duplicate column)."));
             }
