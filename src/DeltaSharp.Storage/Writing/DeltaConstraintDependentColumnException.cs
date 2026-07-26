@@ -75,14 +75,19 @@ public sealed class DeltaConstraintDependentColumnException : Exception
 
         // Defensive copy so the public property is immutable regardless of the caller's list lifetime.
         DeltaTableConstraint[] dependents = constraints.ToArray();
-        // Each dependent's Name (a delta.constraints.<name> key-suffix) and Expression (the predicate) are
-        // attacker-authored on a foreign/hostile table — sanitize both before echoing so a crafted
-        // name/predicate cannot inject control/line-break chars into a structured-log sink or render unbounded
-        // (#666). The structural "\n  " separators are intentional formatting; the raw values remain on the
-        // typed Constraints property for full inspection.
-        string listing = string.Join("", dependents.Select(c =>
+        // Render at most MaxEchoedListItems dependents (each per-token sanitized), eliding the rest as
+        // "… (+N more)", so a hostile table with thousands of CHECK constraints cannot flood the message even
+        // though each entry is individually bounded (#666). The Name (delta.constraints.<name> key-suffix) and
+        // Expression (predicate) are attacker-authored config text; the structural "\n  " separators are
+        // intentional formatting, and the raw values remain on the typed Constraints property for inspection.
+        int shownDependents = Math.Min(dependents.Length, DiagnosticText.MaxEchoedListItems);
+        string listing = string.Join("", dependents.Take(shownDependents).Select(c =>
             $"\n  {DiagnosticText.Sanitize(c.Name, DiagnosticText.ConfigTokenMaxLength)}"
             + $" -> {DiagnosticText.Sanitize(c.Expression, DiagnosticText.DefaultMaxLength)}"));
+        if (dependents.Length > shownDependents)
+        {
+            listing += FormattableString.Invariant($"\n  … (+{dependents.Length - shownDependents} more)");
+        }
         string depends = dependents.Length == 1
             ? "this surviving CHECK constraint still depends"
             : "these surviving CHECK constraints still depend";

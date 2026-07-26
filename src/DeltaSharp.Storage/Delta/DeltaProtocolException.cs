@@ -1,5 +1,4 @@
 using System.Globalization;
-using System.Linq;
 
 namespace DeltaSharp.Storage.Delta;
 
@@ -91,10 +90,11 @@ internal sealed class DeltaProtocolException : Exception
             CultureInfo.InvariantCulture,
             // The feature names are the UNSUPPORTED subset of a foreign table's readerFeatures/writerFeatures —
             // attacker-authored on a hostile table (parsed verbatim from the raw _delta_log with no
-            // charset/length validation). Sanitize each so a crafted name cannot inject control/line-break
-            // chars into a structured-log sink or render unbounded (#666); {role} is a trusted caller literal.
+            // charset/length validation). SanitizeAndJoin sanitizes each (control/line-break strip + per-item
+            // cap) AND bounds the LIST length (eliding a hostile thousands-long list as "… (+N more)"), so the
+            // aggregate message cannot flood a log line (#666). {role} is a trusted caller literal.
             $"The table requires unsupported Delta {role} feature(s): "
-            + $"{string.Join(", ", features.Select(feature => DiagnosticText.Sanitize(feature, DiagnosticText.ConfigTokenMaxLength)))}."
+            + $"{DiagnosticText.SanitizeAndJoin(features, DiagnosticText.ConfigTokenMaxLength)}."
             + $" The table cannot be read safely."));
 
     /// <summary>An internally inconsistent reconstructed log.</summary>

@@ -168,15 +168,12 @@ public sealed class StorageMessageHygieneTests
     // line or render a control sequence) and not the raw payload verbatim. Messages that legitimately contain
     // structural newlines (e.g. the dependent-column listing) pass allowNewlines: true — the attacker's own
     // newline is still neutralized to U+FFFD, so only the message's own formatting newlines remain.
-    private static void AssertFullyNeutralized(string message, bool allowNewlines = false)
+    private static void AssertFullyNeutralized(string message, int expectedNewlines = 0)
     {
-        var dangerous = new List<char> { '\r', '\0', '\t', '\u0085', '\u2028', '\u2029', '\uD800' };
-        if (!allowNewlines)
-        {
-            dangerous.Add('\n');
-        }
-
-        foreach (char c in dangerous)
+        // Exact structural-newline count — an injected LF (a sanitizer that leaked '\n') changes the count and
+        // is caught, unlike a permissive "allow newlines" skip that hid LF-only regressions (#666 red-team R2).
+        Assert.Equal(expectedNewlines, message.Count(c => c == '\n'));
+        foreach (char c in new[] { '\r', '\0', '\t', '\u0085', '\u2028', '\u2029', '\uD800' })
         {
             Assert.DoesNotContain(c, message);
         }
@@ -333,13 +330,39 @@ public sealed class StorageMessageHygieneTests
     public void ConstraintDependentColumn_ForColumnChange_SanitizesNameAndPredicate_RawOnProperty()
     {
         // #666 / red-team: each dependent CHECK's name + predicate (attacker-authored) are listed in the
-        // aggregate message. The listing uses structural newlines (allowNewlines: true) — the attacker's own
-        // newline is still neutralized, so only the message's own formatting newlines remain.
+        // aggregate message. The listing uses structural newlines — exactly 2 for one dependent (the "\n  "
+        // listing prefix + the "\nThe {operation}…" sentence). Asserting the exact count catches an injected
+        // LF (the attacker's own newline is neutralized to U+FFFD; only the message's formatting newlines remain).
         var deps = new[] { new DeltaTableConstraint(DeltaConstraintKind.Check, FullInjectionCorpus, FullInjectionCorpus) };
         DeltaConstraintDependentColumnException ex =
             DeltaConstraintDependentColumnException.ForColumnChange("amount", deps);
 
-        AssertFullyNeutralized(ex.Message, allowNewlines: true);
+        AssertFullyNeutralized(ex.Message, expectedNewlines: 2);
         Assert.Equal(FullInjectionCorpus, Assert.Single(ex.Constraints).Expression); // raw retained on property
+    }
+
+    [Fact]
+    public void UnsupportedFeatures_HugeList_IsBounded_ElidesRemainder()
+    {
+        // #666 red-team R2: per-item caps do NOT bound a hostile LIST. A forged readerFeatures array of
+        // thousands must be elided ("… (+N more)") so the aggregate message cannot flood a log line.
+        string[] many = Enumerable.Range(0, 5000).Select(i => "feat" + i).ToArray();
+        var protocol = new ProtocolAction(3, 7, [.. many], []);
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() => ProtocolSupport.EnsureReadable(protocol));
+
+        Assert.Contains("more)", ex.Message, StringComparison.Ordinal);
+        Assert.True(ex.Message.Length < 2000, $"aggregate message not bounded: {ex.Message.Length} chars");
+    }
+
+    [Fact]
+    public void ConstraintDependentColumn_HugeList_IsBounded_ElidesRemainder()
+    {
+        DeltaTableConstraint[] many = Enumerable.Range(0, 5000)
+            .Select(i => new DeltaTableConstraint(DeltaConstraintKind.Check, "c" + i, "x > " + i)).ToArray();
+        DeltaConstraintDependentColumnException ex =
+            DeltaConstraintDependentColumnException.ForColumnChange("amount", many);
+
+        Assert.Contains("more)", ex.Message, StringComparison.Ordinal);
+        Assert.True(ex.Message.Length < 3000, $"aggregate message not bounded: {ex.Message.Length} chars");
     }
 }
