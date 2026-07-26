@@ -925,20 +925,25 @@ internal sealed class ParquetFileReader
     }
 
     // Walks the ENTIRE top-level FileMetaData struct (Thrift Compact Protocol), skipping every field's value,
-    // and reports whether it is a WELL-FORMED footer that contains field 8 (encryption_algorithm, a struct).
-    // Detection deliberately requires the whole footer to parse cleanly to its STOP — including the field-8
-    // struct's own body — rather than returning on the field-8 header alone: a malformed/truncated footer whose
-    // first byte merely LOOKS like a field-8-struct header (e.g. 0x8C followed by garbage) must stay the
-    // fail-closed CorruptData default, not be mislabeled "encrypted" (red-team R2). This keeps the
-    // false-positive rate on already-broken files minimal: only a footer that is valid Thrift AND carries a
-    // well-formed encryption_algorithm is classified as encryption. Fail-closed: returns false on truncation,
-    // an unparseable value, or a STOP without field 8. Bounded: every non-boolean field/element consumes >= 1
-    // byte (so total work is O(footer length)) and recursion is depth-capped.
+    // and reports whether it is a PLAUSIBLE ENCRYPTED FileMetaData: a well-formed footer that (a) parses
+    // cleanly to its top-level STOP, (b) carries the FileMetaData required fields (1=version, 2=schema,
+    // 3=num_rows, 4=row_groups per parquet.thrift), and (c) carries field 8 (encryption_algorithm) as a
+    // NON-EMPTY struct (a valid EncryptionAlgorithm union has exactly one member, so its struct body does not
+    // start with an immediate STOP). Requiring all three — not merely a field-8-struct header — keeps a
+    // malformed/truncated footer, or a syntactically-valid-but-not-a-FileMetaData footer that merely embeds a
+    // field-8 struct (e.g. 0x8C… or an empty field-8 union), on the fail-closed CorruptData default rather than
+    // mislabeling it "encrypted" (red-team R2/R3). A real encrypted Parquet file always satisfies all three.
+    // Fail-closed: returns false on truncation, an unparseable value, or a footer that is not a plausible
+    // encrypted FileMetaData. Bounded: every non-boolean field/element consumes >= 1 byte (total work is
+    // O(footer length)) and recursion is depth-capped.
     private static bool ThriftFooterHasEncryptionAlgorithm(ReadOnlySpan<byte> footer)
     {
+        // Bits 1..4 = the FileMetaData required fields (version/schema/num_rows/row_groups).
+        const int requiredFieldsMask = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4);
+        int seenRequiredFields = 0;
+        bool encryptionAlgorithmPresent = false;
         int pos = 0;
         int lastFieldId = 0;
-        bool found = false;
         while (true)
         {
             if (pos >= footer.Length)
@@ -949,7 +954,9 @@ internal sealed class ParquetFileReader
             byte header = footer[pos++];
             if (header == 0)
             {
-                return found; // Clean STOP: trust the encryption_algorithm signal only on a well-formed footer.
+                // Clean STOP: trust the encryption signal only on a plausible encrypted FileMetaData.
+                return encryptionAlgorithmPresent
+                    && (seenRequiredFields & requiredFieldsMask) == requiredFieldsMask;
             }
 
             int type = header & 0x0F;
@@ -970,10 +977,19 @@ internal sealed class ParquetFileReader
 
             lastFieldId = fieldId;
 
-            if (fieldId == EncryptionAlgorithmFieldId && type == ThriftStruct)
+            if (fieldId is >= 1 and <= 4)
             {
-                found = true;
-                // Fall through to skip (and thereby VALIDATE) the field-8 struct body; do not early-return.
+                seenRequiredFields |= 1 << fieldId;
+            }
+            else if (fieldId == EncryptionAlgorithmFieldId
+                && type == ThriftStruct
+                && pos < footer.Length
+                && footer[pos] != 0)
+            {
+                // Field 8 is a struct whose body does not start with an immediate STOP => a NON-EMPTY
+                // EncryptionAlgorithm union (a valid one has exactly one member). An empty field-8 struct is
+                // rejected. Fall through to skip (and thereby fully validate) the struct body.
+                encryptionAlgorithmPresent = true;
             }
 
             // A boolean field carries its value in the header (no data bytes); every other type has a value to
