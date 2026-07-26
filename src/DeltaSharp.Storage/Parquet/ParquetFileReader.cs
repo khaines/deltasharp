@@ -663,6 +663,37 @@ internal sealed class ParquetFileReader
             // cannot escape as a raw BCL exception at a later reader.Schema access
             // (storage-delta-architecture.md §5.4 C-DECODE).
             _ = reader.Schema;
+
+            // Plaintext-footer Parquet Modular Encryption (#655). Unlike encrypted-footer mode (the PARE
+            // magic classified in the catch below), a plaintext-footer encrypted file keeps the ordinary
+            // PAR1 magic and its footer parses cleanly HERE, carrying its crypto metadata in the readable
+            // footer (encryption_algorithm and/or per-column ColumnCryptoMetaData) while the column chunks
+            // themselves are encrypted and unreadable. Detect it from the parsed footer and fail closed with
+            // the SAME actionable UnsupportedFeature as encrypted-footer mode, rather than returning a reader
+            // whose later column reads would fall through to CorruptData. Detection is presence-only — the
+            // field's existence is the whole diagnosis; no footer content is read or echoed (#653 hygiene).
+            if (IsPlaintextFooterEncrypted(reader.Metadata))
+            {
+                // Dispose the healthy reader (leaveStreamOpen:false also releases the input stream) before
+                // failing closed; guard the dispose so a dispose-time fault cannot escape UNMAPPED and
+                // replace the UnsupportedFeature contract — the boundary stays exception-total, mirroring the
+                // encrypted-footer dispose in the catch below. This UnsupportedFeature is a DeltaStorageException,
+                // which IsUndecodableParquetInput excludes, so it propagates past the catch (not re-caught).
+                try
+                {
+                    await reader.DisposeAsync().ConfigureAwait(false);
+                }
+                catch (Exception disposeFault) when (IsUndecodableParquetInput(disposeFault))
+                {
+                    // Cleanup fault on the reader being torn down: ignore it so the UnsupportedFeature
+                    // classification below remains the single, meaningful outcome.
+                }
+
+                throw DeltaStorageException.UnsupportedFeature(
+                    "Parquet Modular Encryption is not supported: the file uses plaintext-footer encryption "
+                    + "(encryption_algorithm present in the footer). DeltaSharp cannot read encrypted Parquet files.");
+            }
+
             return reader;
         }
         catch (Exception ex) when (IsUndecodableParquetInput(ex))
@@ -689,10 +720,10 @@ internal sealed class ParquetFileReader
             // reclassified: Parquet.Net raises it on genuinely CORRUPT pages too (an invalid compression-method /
             // page-type / logical-type code from a bit-flip), so it is not safely separable from corruption and
             // stays CorruptData (see the ReadRowGroupAsync superset catch). Likewise only encrypted-FOOTER
-            // mode (PARE magic) is classified here; plaintext-footer encryption (mode b) keeps the ordinary
-            // PAR1 magic and carries its crypto metadata in an otherwise-readable footer, so it is not caught by
-            // this magic peek and stays the CorruptData/decode default — Parquet.Net 6.0.3 can neither read nor
-            // write mode-b files, so it is not reachable/constructible today; tracked as a follow-up (#655).
+            // mode (PARE magic) is classified HERE (in this footer-parse-FAILURE catch); plaintext-footer
+            // encryption (mode b) keeps the ordinary PAR1 magic and its footer parses SUCCESSFULLY, so it is
+            // classified on the SUCCESS path above via IsPlaintextFooterEncrypted(reader.Metadata) (#655) and
+            // never reaches this catch.
             bool encryptedFooter = IsParquetEncryptedFooterMagic(input);
 
             if (reader is not null)
@@ -730,6 +761,52 @@ internal sealed class ParquetFileReader
             throw DeltaStorageException.CorruptData(
                 "The Parquet stream is malformed or truncated.", ex);
         }
+    }
+
+    // Detects a plaintext-footer Parquet Modular Encryption file (#655) from the PARSED footer metadata.
+    // Two independent markers, either of which is sufficient (Parquet format Encryption.md):
+    //   * FileMetaData.EncryptionAlgorithm (Thrift field 8) — "set only in encrypted files with plaintext
+    //     footer" per the format spec, so its mere presence is definitive; and
+    //   * any ColumnChunk.CryptoMetadata (ColumnCryptoMetaData) — a plaintext-footer file may encrypt only a
+    //     SUBSET of columns, carrying per-column crypto metadata even when the file-level algorithm is unset.
+    // Detection is presence-only: no field CONTENTS are read, so no attacker-controlled footer value can be
+    // echoed (#653 hygiene). A normal (unencrypted) file has neither marker, so this never false-positives.
+    private static bool IsPlaintextFooterEncrypted(global::Parquet.Meta.FileMetaData? metadata)
+    {
+        if (metadata is null)
+        {
+            return false;
+        }
+
+        if (metadata.EncryptionAlgorithm is not null)
+        {
+            return true;
+        }
+
+        IReadOnlyList<global::Parquet.Meta.RowGroup>? rowGroups = metadata.RowGroups;
+        if (rowGroups is null)
+        {
+            return false;
+        }
+
+        foreach (global::Parquet.Meta.RowGroup? rowGroup in rowGroups)
+        {
+            IReadOnlyList<global::Parquet.Meta.ColumnChunk>? columns = rowGroup?.Columns;
+            if (columns is null)
+            {
+                continue;
+            }
+
+            foreach (global::Parquet.Meta.ColumnChunk? column in columns)
+            {
+                if (column?.CryptoMetadata is not null)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     // The Parquet file magic is 4 bytes. A plaintext file is bracketed by 'PAR1'; a Parquet Modular

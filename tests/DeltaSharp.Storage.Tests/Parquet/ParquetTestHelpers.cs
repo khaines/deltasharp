@@ -396,6 +396,76 @@ internal static class ParquetTestHelpers
     /// <see cref="StorageErrorKind.CorruptData"/> (#649 precision, council R1).</summary>
     public static byte[] PareHeadTruncatedFile() => "PARE"u8.ToArray();
 
+    /// <summary>Constructs a <b>plaintext-footer</b> Parquet Modular Encryption fixture (#655) from a normal
+    /// Parquet <paramref name="bytes"/> file: reopens it, sets <c>FileMetaData.EncryptionAlgorithm</c> (Thrift
+    /// field 8 — per the format spec "set only in encrypted files with plaintext footer") to an empty
+    /// AES-GCM-V1 algorithm, re-serializes the footer with Parquet.Net's own Thrift writer, and splices it
+    /// back. The file keeps the ordinary <c>PAR1</c> magic and its footer parses cleanly, so
+    /// <see cref="ParquetReader.CreateAsync(System.IO.Stream, ParquetOptions?, bool, CancellationToken)"/>
+    /// opens it and populates <c>reader.Metadata.EncryptionAlgorithm</c> — exactly the mode-b shape the reader
+    /// must classify as <see cref="StorageErrorKind.UnsupportedFeature"/>. (The column pages are left as
+    /// ordinary plaintext, which is irrelevant: classification is footer-presence-based and occurs at open
+    /// time, before any column is materialized.)</summary>
+    public static async Task<byte[]> PlaintextFooterEncryptedFileAsync(byte[] bytes)
+    {
+        byte[] newFooter;
+        using (var stream = new MemoryStream(bytes, writable: false))
+        {
+            ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                global::Parquet.Meta.FileMetaData metadata = reader.Metadata!;
+                metadata.EncryptionAlgorithm = new global::Parquet.Meta.EncryptionAlgorithm
+                {
+                    AESGCMV1 = new global::Parquet.Meta.AesGcmV1(),
+                };
+                newFooter = SerializeFooter(metadata);
+            }
+        }
+
+        int originalFooterLength = BitConverter.ToInt32(bytes, bytes.Length - 8);
+        int footerStart = bytes.Length - 8 - originalFooterLength;
+        using var forged = new MemoryStream();
+        forged.Write(bytes, 0, footerStart);
+        forged.Write(newFooter, 0, newFooter.Length);
+        forged.Write(BitConverter.GetBytes(newFooter.Length), 0, 4);
+        forged.Write("PAR1"u8);
+        return forged.ToArray();
+    }
+
+    /// <summary>The per-column SIBLING of <see cref="PlaintextFooterEncryptedFileAsync"/>: leaves the
+    /// file-level <c>EncryptionAlgorithm</c> UNSET and instead marks the single column chunk
+    /// (<paramref name="rowGroup"/>, <paramref name="columnIndex"/>) with <c>ColumnCryptoMetaData</c> — the
+    /// "only a SUBSET of columns encrypted" shape a plaintext-footer file may take. The reader must still
+    /// classify it as <see cref="StorageErrorKind.UnsupportedFeature"/>.</summary>
+    public static async Task<byte[]> PlaintextFooterColumnCryptoFileAsync(byte[] bytes, int rowGroup, int columnIndex)
+    {
+        byte[] newFooter;
+        using (var stream = new MemoryStream(bytes, writable: false))
+        {
+            ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                global::Parquet.Meta.FileMetaData metadata = reader.Metadata!;
+                metadata.RowGroups[rowGroup].Columns[columnIndex].CryptoMetadata =
+                    new global::Parquet.Meta.ColumnCryptoMetaData
+                    {
+                        ENCRYPTIONWITHFOOTERKEY = new global::Parquet.Meta.EncryptionWithFooterKey(),
+                    };
+                newFooter = SerializeFooter(metadata);
+            }
+        }
+
+        int originalFooterLength = BitConverter.ToInt32(bytes, bytes.Length - 8);
+        int footerStart = bytes.Length - 8 - originalFooterLength;
+        using var forged = new MemoryStream();
+        forged.Write(bytes, 0, footerStart);
+        forged.Write(newFooter, 0, newFooter.Length);
+        forged.Write(BitConverter.GetBytes(newFooter.Length), 0, 4);
+        forged.Write("PAR1"u8);
+        return forged.ToArray();
+    }
+
     /// <summary>Rewrites the footer so that (<paramref name="rowGroup"/>, <paramref name="columnIndex"/>)'s
     /// column chunk declares <paramref name="forgedCodec"/> as its compression <c>Codec</c> — an OUT-OF-RANGE
     /// value (e.g. <c>9</c>, which is not a real <c>CompressionCodec</c>) that leaves the footer parseable and
