@@ -27,6 +27,13 @@ internal static class DiagnosticText
     /// bounded so a crafted name cannot blow up a log line.</summary>
     internal const int DefaultMaxLength = 128;
 
+    /// <summary>The cap for an echoed <b>table-property / configuration VALUE</b> (e.g. a
+    /// <c>metaData.configuration</c> entry such as <c>delta.appendOnly</c> or a retention duration) — the
+    /// single source of truth shared by every config-value echo so the bound cannot drift across surfaces
+    /// (#666). Tighter than <see cref="DefaultMaxLength"/> because a valid property value is a short protocol
+    /// string (a boolean or a calendar-interval literal), unlike a dotted column path.</summary>
+    internal const int ConfigTokenMaxLength = 64;
+
     /// <summary>
     /// Bounds and neutralizes an untrusted token before it is interpolated into a diagnostic message: caps
     /// the length (appending an ellipsis when truncated) and replaces every control character with U+FFFD, so

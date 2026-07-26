@@ -73,10 +73,16 @@ internal static class AppendOnlyFeature
             return false;
         }
 
+        // The attacker-authored configuration VALUE is sanitized (bounded + control-char/line-separator strip)
+        // before it is echoed — a hostile table's metaData.configuration is foreign text and a raw value could
+        // inject CRLF/control chars into a structured-log sink or render unbounded (#666). The bounded property
+        // KEY is a trusted protocol literal and is echoed verbatim.
         throw DeltaProtocolException.Malformed(
-            $"Table property '{PropertyKey}' has a non-boolean value '{value}'; it must be exactly 'true' or "
-            + "'false' (case-insensitive, no surrounding whitespace). Refusing fail-closed rather than silently "
-            + "treating the table as not append-only (a malformed value must not drop the append-only guarantee).");
+            $"Table property '{PropertyKey}' has a non-boolean value "
+            + $"'{DiagnosticText.Sanitize(value, DiagnosticText.ConfigTokenMaxLength)}'; it must be exactly "
+            + "'true' or 'false' (case-insensitive, no surrounding whitespace). Refusing fail-closed rather than "
+            + "silently treating the table as not append-only (a malformed value must not drop the append-only "
+            + "guarantee).");
     }
 
     /// <summary>

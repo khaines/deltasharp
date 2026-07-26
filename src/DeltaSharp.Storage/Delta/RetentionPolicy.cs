@@ -99,8 +99,9 @@ internal sealed record RetentionPolicy
         {
             throw new FormatException(string.Create(
                 CultureInfo.InvariantCulture,
-                $"Table property '{DeletedFileRetentionDurationKey}' value '{raw}' is not a parseable fixed-length " +
-                $"retention duration; VACUUM fails closed rather than under-retaining deleted-file history."));
+                $"Table property '{DeletedFileRetentionDurationKey}' value " +
+                $"'{DiagnosticText.Sanitize(raw, DiagnosticText.ConfigTokenMaxLength)}' is not a parseable " +
+                $"fixed-length retention duration; VACUUM fails closed rather than under-retaining deleted-file history."));
         }
 
         return configured;
@@ -135,8 +136,9 @@ internal sealed record RetentionPolicy
         {
             throw new FormatException(string.Create(
                 CultureInfo.InvariantCulture,
-                $"Table property '{LogRetentionDurationKey}' value '{raw}' is not a parseable fixed-length " +
-                $"retention duration; VACUUM fails closed rather than under-protecting in-window change files."));
+                $"Table property '{LogRetentionDurationKey}' value " +
+                $"'{DiagnosticText.Sanitize(raw, DiagnosticText.ConfigTokenMaxLength)}' is not a parseable " +
+                $"fixed-length retention duration; VACUUM fails closed rather than under-protecting in-window change files."));
         }
 
         return configured;

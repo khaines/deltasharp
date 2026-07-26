@@ -1,3 +1,5 @@
+using System.Collections.Generic;
+using System.Collections.Immutable;
 using DeltaSharp.Storage.Delta;
 using DeltaSharp.Storage.Parquet;
 using Xunit;
@@ -152,5 +154,79 @@ public sealed class StorageMessageHygieneTests
         Assert.DoesNotContain('\n', ex.Message);
         Assert.DoesNotContain('\r', ex.Message);
         Assert.DoesNotContain(poisoned, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ConfigToken_SharedCap_IsTighterThanDefault()
+    {
+        // #666: the config-value cap is the single shared source of truth (used by AppendOnlyFeature,
+        // RetentionPolicy, and ColumnMapping.SanitizeEchoedToken) and is deliberately tighter than the
+        // default identifier cap — a valid property value is a short protocol string.
+        Assert.True(DiagnosticText.ConfigTokenMaxLength < DiagnosticText.DefaultMaxLength);
+    }
+
+    [Fact]
+    public void AppendOnly_MalformedValue_SanitizesValueInMessage_KeepsKey()
+    {
+        // #666: delta.appendOnly's VALUE is attacker-authored on a foreign/hostile table. A malformed value
+        // fails closed (MalformedAction); its echo must be sanitized so a crafted CRLF payload cannot inject
+        // into a structured-log sink, while the trusted protocol KEY stays verbatim for diagnosis.
+        const string poisoned = "ye\r\ns\u2028INJECTED";
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
+            () => AppendOnlyFeature.IsEnabled(new Dictionary<string, string> { ["delta.appendOnly"] = poisoned }));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.DoesNotContain('\n', ex.Message);
+        Assert.DoesNotContain('\r', ex.Message);
+        Assert.DoesNotContain('\u2028', ex.Message); // line separator also neutralized
+        Assert.DoesNotContain(poisoned, ex.Message, StringComparison.Ordinal);
+        Assert.Contains("delta.appendOnly", ex.Message, StringComparison.Ordinal); // trusted KEY preserved
+    }
+
+    [Fact]
+    public void AppendOnly_OversizedValue_IsCappedInMessage()
+    {
+        // A non-boolean value longer than the config-token cap is truncated (with an ellipsis) so a crafted
+        // value cannot render an unbounded log line.
+        string oversized = new('x', DiagnosticText.ConfigTokenMaxLength + 40);
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
+            () => AppendOnlyFeature.IsEnabled(new Dictionary<string, string> { ["delta.appendOnly"] = oversized }));
+
+        Assert.DoesNotContain(oversized, ex.Message, StringComparison.Ordinal); // full raw never rendered
+        Assert.Contains("…", ex.Message, StringComparison.Ordinal); // truncation marker present
+    }
+
+    [Fact]
+    public void RetentionPolicy_UnparseableDeletedFileRetention_SanitizesValueInMessage_KeepsKey()
+    {
+        // #666: delta.deletedFileRetentionDuration's VALUE is attacker-authored. An unparseable value fails
+        // closed (FormatException); its echo must be sanitized while the trusted property KEY is preserved.
+        const string poisoned = "not-a-duration\r\nFAKE LOG LINE";
+        ImmutableSortedDictionary<string, string> config = ImmutableSortedDictionary<string, string>.Empty
+            .Add(RetentionPolicy.DeletedFileRetentionDurationKey, poisoned);
+
+        FormatException ex = Assert.Throws<FormatException>(
+            () => RetentionPolicy.Default.ResolveTableRetention(config));
+
+        Assert.DoesNotContain('\n', ex.Message);
+        Assert.DoesNotContain('\r', ex.Message);
+        Assert.DoesNotContain(poisoned, ex.Message, StringComparison.Ordinal);
+        Assert.Contains(RetentionPolicy.DeletedFileRetentionDurationKey, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RetentionPolicy_UnparseableLogRetention_SanitizesValueInMessage_KeepsKey()
+    {
+        const string poisoned = "not-a-duration\r\nFAKE LOG LINE";
+        ImmutableSortedDictionary<string, string> config = ImmutableSortedDictionary<string, string>.Empty
+            .Add(RetentionPolicy.LogRetentionDurationKey, poisoned);
+
+        FormatException ex = Assert.Throws<FormatException>(
+            () => RetentionPolicy.Default.ResolveTableLogRetention(config));
+
+        Assert.DoesNotContain('\n', ex.Message);
+        Assert.DoesNotContain('\r', ex.Message);
+        Assert.DoesNotContain(poisoned, ex.Message, StringComparison.Ordinal);
+        Assert.Contains(RetentionPolicy.LogRetentionDurationKey, ex.Message, StringComparison.Ordinal);
     }
 }
