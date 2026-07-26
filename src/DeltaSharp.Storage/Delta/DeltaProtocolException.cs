@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Linq;
 
 namespace DeltaSharp.Storage.Delta;
 
@@ -88,7 +89,13 @@ internal sealed class DeltaProtocolException : Exception
     public static DeltaProtocolException UnsupportedFeatures(string role, IEnumerable<string> features) =>
         Unsupported(string.Create(
             CultureInfo.InvariantCulture,
-            $"The table requires unsupported Delta {role} feature(s): {string.Join(", ", features)}. The table cannot be read safely."));
+            // The feature names are the UNSUPPORTED subset of a foreign table's readerFeatures/writerFeatures —
+            // attacker-authored on a hostile table (parsed verbatim from the raw _delta_log with no
+            // charset/length validation). Sanitize each so a crafted name cannot inject control/line-break
+            // chars into a structured-log sink or render unbounded (#666); {role} is a trusted caller literal.
+            $"The table requires unsupported Delta {role} feature(s): "
+            + $"{string.Join(", ", features.Select(feature => DiagnosticText.Sanitize(feature, DiagnosticText.ConfigTokenMaxLength)))}."
+            + $" The table cannot be read safely."));
 
     /// <summary>An internally inconsistent reconstructed log.</summary>
     public static DeltaProtocolException Inconsistent(string message, Exception? innerException = null) =>

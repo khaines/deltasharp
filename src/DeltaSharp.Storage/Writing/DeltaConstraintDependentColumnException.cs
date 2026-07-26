@@ -1,4 +1,5 @@
 using System.Linq;
+using DeltaSharp.Storage.Delta;
 
 namespace DeltaSharp.Storage;
 
@@ -74,7 +75,14 @@ public sealed class DeltaConstraintDependentColumnException : Exception
 
         // Defensive copy so the public property is immutable regardless of the caller's list lifetime.
         DeltaTableConstraint[] dependents = constraints.ToArray();
-        string listing = string.Join("", dependents.Select(c => $"\n  {c.Name} -> {c.Expression}"));
+        // Each dependent's Name (a delta.constraints.<name> key-suffix) and Expression (the predicate) are
+        // attacker-authored on a foreign/hostile table — sanitize both before echoing so a crafted
+        // name/predicate cannot inject control/line-break chars into a structured-log sink or render unbounded
+        // (#666). The structural "\n  " separators are intentional formatting; the raw values remain on the
+        // typed Constraints property for full inspection.
+        string listing = string.Join("", dependents.Select(c =>
+            $"\n  {DiagnosticText.Sanitize(c.Name, DiagnosticText.ConfigTokenMaxLength)}"
+            + $" -> {DiagnosticText.Sanitize(c.Expression, DiagnosticText.DefaultMaxLength)}"));
         string depends = dependents.Length == 1
             ? "this surviving CHECK constraint still depends"
             : "these surviving CHECK constraints still depend";
