@@ -924,26 +924,32 @@ internal sealed class ParquetFileReader
         }
     }
 
-    // Walks the top-level FileMetaData struct (Thrift Compact Protocol) looking ONLY for field 8
-    // (encryption_algorithm, a struct); every other field's value is skipped. Returns true iff field 8 is
-    // present as a struct. Fail-closed: returns false on STOP-without-field-8, truncation, or any malformed
-    // encoding. Bounded: every non-boolean field/element consumes >= 1 byte, so total work is O(footer length),
-    // and recursion is depth-capped.
+    // Walks the ENTIRE top-level FileMetaData struct (Thrift Compact Protocol), skipping every field's value,
+    // and reports whether it is a WELL-FORMED footer that contains field 8 (encryption_algorithm, a struct).
+    // Detection deliberately requires the whole footer to parse cleanly to its STOP — including the field-8
+    // struct's own body — rather than returning on the field-8 header alone: a malformed/truncated footer whose
+    // first byte merely LOOKS like a field-8-struct header (e.g. 0x8C followed by garbage) must stay the
+    // fail-closed CorruptData default, not be mislabeled "encrypted" (red-team R2). This keeps the
+    // false-positive rate on already-broken files minimal: only a footer that is valid Thrift AND carries a
+    // well-formed encryption_algorithm is classified as encryption. Fail-closed: returns false on truncation,
+    // an unparseable value, or a STOP without field 8. Bounded: every non-boolean field/element consumes >= 1
+    // byte (so total work is O(footer length)) and recursion is depth-capped.
     private static bool ThriftFooterHasEncryptionAlgorithm(ReadOnlySpan<byte> footer)
     {
         int pos = 0;
         int lastFieldId = 0;
+        bool found = false;
         while (true)
         {
             if (pos >= footer.Length)
             {
-                return false;
+                return false; // Ran out before a clean STOP => malformed => not confidently encrypted.
             }
 
             byte header = footer[pos++];
             if (header == 0)
             {
-                return false; // STOP: end of FileMetaData, encryption_algorithm not present.
+                return found; // Clean STOP: trust the encryption_algorithm signal only on a well-formed footer.
             }
 
             int type = header & 0x0F;
@@ -966,11 +972,12 @@ internal sealed class ParquetFileReader
 
             if (fieldId == EncryptionAlgorithmFieldId && type == ThriftStruct)
             {
-                return true;
+                found = true;
+                // Fall through to skip (and thereby VALIDATE) the field-8 struct body; do not early-return.
             }
 
             // A boolean field carries its value in the header (no data bytes); every other type has a value to
-            // skip. (encryption_algorithm is a struct, so field 8 never reaches this skip.)
+            // skip (encryption_algorithm is a struct, so its body IS skipped/validated here).
             if (type is ThriftBoolTrue or ThriftBoolFalse)
             {
                 continue;

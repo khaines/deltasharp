@@ -741,6 +741,28 @@ public sealed class ParquetCorruptionTests
     }
 
     [Fact]
+    public async Task MalformedFooterWithField8StructHeaderButTruncatedBody_StaysCorruptData_ProbePrecisionGuard()
+    {
+        // Red-team R2 precision guard: a malformed PAR1 file whose 1-byte "footer" is exactly a Thrift field-8
+        // STRUCT header (0x8C = field delta 8 | type STRUCT=12) with NO struct body/STOP must NOT be mislabeled
+        // encryption. The footer probe requires the WHOLE footer to parse cleanly to its STOP (validating the
+        // field-8 struct body), so a truncated field-8 struct fails the walk and stays the fail-closed
+        // CorruptData default. RED-on-revert against an early-return-on-field-8-header probe.
+        byte[] malformed =
+        [
+            0x50, 0x41, 0x52, 0x31, // 'PAR1' head
+            0x8C,                   // footer content: field 8 (delta 8), type STRUCT — but no body/STOP
+            0x01, 0x00, 0x00, 0x00, // footer_length = 1 (little-endian) => the footer is just the 0x8C byte
+            0x50, 0x41, 0x52, 0x31, // 'PAR1' tail magic
+        ];
+        var schema = new StructType(new[] { KeepField });
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(malformed, schema));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+    }
+
+    [Fact]
     public async Task GarbageInput_StaysCorruptData_PrecisionGuard()
     {
         // PRECISION GUARD: non-Parquet garbage trips the SAME "not a parquet file, head: …" library
