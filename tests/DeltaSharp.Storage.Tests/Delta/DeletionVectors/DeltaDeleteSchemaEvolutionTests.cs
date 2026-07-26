@@ -226,6 +226,132 @@ public sealed class DeltaDeleteSchemaEvolutionTests : IDisposable
             survivors.OrderBy(r => r.Id).ToList());
     }
 
+    [Fact]
+    public async Task Delete_IsNullGuardedPredicate_MatchesNullFilledRows()
+    {
+        // #657 Part C(1): over the SAME schema-evolution null-fill setup (a still-active NARROW file f re-scanned
+        // under wider schema B, so its later-added `extra` column null-fills for f's rows), an IsNull-GUARDED
+        // `IS NULL` predicate (`extra.IsNull(row)`) matches EXACTLY the null-filled rows — correct three-valued
+        // logic, and the mirror image of the naive-value footgun in C(3).
+        await SetupNarrowDvRetainedFilePlusWideAsync();
+
+        // `extra IS NULL` — the only 3VL-correct way to match a null. It matches every one of f's rows (extra
+        // null-filled) and never g's row (real extra=100).
+        DeleteResult result = await NewDelete("issue-657-isnull").DeleteAsync(
+            DeltaDeletePredicate.FromRowPredicate((batch, row) => batch.SelectedColumn(2).IsNull(row)));
+
+        // f's four still-visible null-filled rows (id 1,3,4,5; id 2 was removed during setup) are deleted; g's
+        // real-valued row is untouched.
+        Assert.NotNull(result.CommittedVersion);
+        Assert.Equal(4, result.RowsDeleted);
+
+        List<(long Id, string? Name, long? Extra)> survivors = await ReadRowsAsync();
+        Assert.Equal(
+            new (long, string?, long?)[] { (10L, "z", 100L) },
+            survivors.OrderBy(r => r.Id).ToList());
+    }
+
+    [Fact]
+    public async Task Delete_IsNullGuardedValuePredicate_DoesNotMatchNullFilledRows()
+    {
+        // #657 Part C(2): an IsNull-GUARDED VALUE predicate (`!extra.IsNull(row) && extra == 0`) deletes NONE of
+        // the null-filled rows — the guard excludes f's null-fills (3VL NOT-TRUE) and no real row has extra==0, so
+        // the DELETE is a clean no-op. This is the CORRECT authoring of the naive footgun in C(3).
+        await SetupNarrowDvRetainedFilePlusWideAsync();
+
+        DeleteResult result = await NewDelete("issue-657-guarded-value").DeleteAsync(
+            DeltaDeletePredicate.FromRowPredicate((batch, row) =>
+                !batch.SelectedColumn(2).IsNull(row)                     // extra IS NOT NULL (excludes f's null-fills)
+                && batch.SelectedColumn(2).GetValue<long>(row) == 0L));  // extra == 0 (no real row matches)
+
+        // No-op: nothing deleted, no commit; every row survives (f's four null-filled rows + g's real extra=100).
+        Assert.Null(result.CommittedVersion);
+        Assert.Equal(0, result.RowsDeleted);
+
+        List<(long Id, string? Name, long? Extra)> survivors = await ReadRowsAsync();
+        Assert.Equal(
+            new (long, string?, long?)[]
+            {
+                (1L, "a", null),
+                (3L, "c", null),
+                (4L, "d", null),
+                (5L, "e", null),
+                (10L, "z", 100L),
+            },
+            survivors.OrderBy(r => r.Id).ToList());
+    }
+
+#if DEBUG
+    [Fact]
+    public async Task Delete_NaiveValuePredicate_WithoutIsNullGuard_IsCaughtByDebugGuard()
+    {
+        // #657 Part C(3): a NAIVE value predicate (`extra == 0`, NO IsNull guard) is the data-loss footgun — on a
+        // null-filled slot GetValue<long> returns default(0L), so WITHOUT the guard it would spuriously match all
+        // of f's null-filled rows. The DEBUG-only null-poison guard (NullPoisonColumnBatch, wired at the
+        // DeltaDelete predicate call site) makes that un-guarded read THROW a fixed 3VL-violation
+        // InvalidOperationException instead of silently mis-deleting — so the footgun FAILS LOUD. Gated
+        // #if DEBUG: the guard is compiled out of Release (zero prod overhead), so this assertion — and the
+        // GetBytes/Select/Slice wrapper tests below — exist only in DEBUG. CI's Release run compiles them out;
+        // structural release-safe enforcement is tracked by #673.
+        await SetupNarrowDvRetainedFilePlusWideAsync();
+
+        InvalidOperationException ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => NewDelete("issue-657-naive").DeleteAsync(
+                DeltaDeletePredicate.FromRowPredicate((batch, row) =>
+                    batch.SelectedColumn(2).GetValue<long>(row) == 0L)));  // NAIVE: reads extra with NO IsNull guard
+
+        // The guard fired: a value-free (#653 hygiene) three-valued-logic-violation message tagged with #657.
+        Assert.Contains("3VL", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("#657", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void NullPoisonColumnVector_GetBytes_OnNullSlot_Throws()
+    {
+        // #657 Part C(4): the GetBytes mirror of the C(3) footgun. A naive DELETE reading a null-filled
+        // STRING/BINARY column via GetBytes (no IsNull guard) would get an EMPTY span (default) and mis-match;
+        // the DEBUG poison wrapper THROWS on the null slot while a non-null slot delegates unchanged.
+        MutableColumnVector name = ColumnVectors.Create(DataTypes.StringType, 2);
+        AppendNullableString(name, "keep");   // slot 0: non-null
+        AppendNullableString(name, null);     // slot 1: null
+        var poison = new NullPoisonColumnVector(name);
+
+        // Non-null slot delegates cleanly.
+        Assert.Equal("keep", Encoding.UTF8.GetString(poison.GetBytes(0)));
+
+        // Null slot FAILS LOUD with the value-free 3VL-violation message (#657), not an empty span.
+        InvalidOperationException ex =
+            Assert.Throws<InvalidOperationException>(() => { _ = poison.GetBytes(1).Length; });
+        Assert.Contains("3VL", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("#657", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void NullPoisonColumnVector_PropagatesPoisonThroughSelectAndSlice()
+    {
+        // #657 Part C(5): poison MUST survive the zero-copy views a predicate/kernel can take. Select is
+        // deliberately NOT overridden — the base wraps `this` in a SelectedColumnVector that routes per-row
+        // reads back through the poison — and Slice re-wraps. A null slot must still THROW through BOTH, so a
+        // future refactor that delegates Select/Slice to the inner (silently dropping poison) is caught here.
+        MutableColumnVector extra = ColumnVectors.Create(DataTypes.LongType, 3);
+        extra.AppendValue(10L);   // slot 0
+        extra.AppendNull();       // slot 1: null
+        extra.AppendValue(30L);   // slot 2
+        var poison = new NullPoisonColumnVector(extra);
+
+        // Select: logical 0 -> physical slot 2 (30, non-null); logical 1 -> physical slot 1 (null).
+        ColumnVector selected = poison.Select(new SelectionVector(new[] { 2, 1, 0 }));
+        Assert.Equal(30L, selected.GetValue<long>(0));
+        Assert.Throws<InvalidOperationException>(() => { _ = selected.GetValue<long>(1); });
+
+        // Slice [1, 3) -> {null, 30}, re-wrapped as a NullPoisonColumnVector; the null slot still throws.
+        ColumnVector sliced = poison.Slice(1, 2);
+        Assert.IsType<NullPoisonColumnVector>(sliced);
+        Assert.Throws<InvalidOperationException>(() => { _ = sliced.GetValue<long>(0); });
+        Assert.Equal(30L, sliced.GetValue<long>(1));
+    }
+#endif
+
     // ------------------------------------------------------------------ helpers
 
     private async Task CreateDvTableAsync(StructType schema, params ColumnBatch[] batches)
