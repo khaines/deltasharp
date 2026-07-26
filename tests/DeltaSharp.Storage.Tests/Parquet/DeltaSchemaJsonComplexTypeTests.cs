@@ -192,4 +192,68 @@ public sealed class DeltaSchemaJsonComplexTypeTests
         Assert.Contains("\"elementType\":{\"type\":\"struct\"", footer, StringComparison.Ordinal);
         AssertFooterMatchesLog(schema);
     }
+
+    [Fact]
+    public void NestedDecimalTypes_FooterSchema_MatchesLogSchema()
+    {
+        // DecimalType has a parameterized TypeName ("decimal(p,s)") and serializes as a JSON *string*
+        // (the shared default arm) even inside an array/map object shape. Pin that the footer emits
+        // the string form at the recursion base — not an object — byte-identically to the log.
+        var schema = new StructType(new[]
+        {
+            new StructField(
+                "amounts",
+                DataTypes.CreateArrayType(DataTypes.CreateDecimalType(20, 4), containsNull: true),
+                nullable: true),
+            new StructField(
+                "rates",
+                DataTypes.CreateMapType(DataTypes.StringType, DataTypes.CreateDecimalType(10, 2), valueContainsNull: false),
+                nullable: false),
+        });
+
+        string footer = DeltaSchemaJson.ToJson(schema);
+        Assert.Contains("\"elementType\":\"decimal(20,4)\"", footer, StringComparison.Ordinal);
+        Assert.Contains("\"valueType\":\"decimal(10,2)\"", footer, StringComparison.Ordinal);
+        AssertFooterMatchesLog(schema);
+    }
+
+    [Fact]
+    public void EmptyStruct_FooterSchema_MatchesLogSchema()
+    {
+        // An empty struct must emit {"type":"struct","fields":[]} identically in footer and log, both
+        // as a field type and nested as an array element (the foreach over zero fields must not drift).
+        var schema = new StructType(new[]
+        {
+            new StructField("empty", StructType.Empty, nullable: true),
+            new StructField("empties", DataTypes.CreateArrayType(StructType.Empty, containsNull: false), nullable: false),
+        });
+
+        string footer = DeltaSchemaJson.ToJson(schema);
+        Assert.Contains("\"type\":{\"type\":\"struct\",\"fields\":[]}", footer, StringComparison.Ordinal);
+        AssertFooterMatchesLog(schema);
+    }
+
+    [Fact]
+    public void MapWithStructKey_FooterSchema_MatchesLogSchema()
+    {
+        // A complex (struct) map KEY exercises the keyType recursion into a struct (MapType rejects
+        // only NullType/MapType keys). The footer must match the log for the key-side recursion too,
+        // not just the value side.
+        var key = new StructType(new[]
+        {
+            new StructField("region", DataTypes.StringType, nullable: false),
+            new StructField("zone", DataTypes.IntegerType, nullable: false),
+        });
+        var schema = new StructType(new[]
+        {
+            new StructField(
+                "byRegion",
+                DataTypes.CreateMapType(key, DataTypes.LongType, valueContainsNull: true),
+                nullable: true),
+        });
+
+        string footer = DeltaSchemaJson.ToJson(schema);
+        Assert.Contains("\"keyType\":{\"type\":\"struct\"", footer, StringComparison.Ordinal);
+        AssertFooterMatchesLog(schema);
+    }
 }
