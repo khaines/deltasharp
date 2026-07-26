@@ -450,6 +450,44 @@ public sealed class DeltaTableWriterTests : IDisposable
     }
 
     [Fact]
+    public async Task Append_OnPartitionedTable_StrayPartitionKeyWithControlChars_IsSanitizedInMessage()
+    {
+        // #667 message hygiene: a stray partition key can be foreign/attacker-authored (column-mapping name
+        // mode) and carry a CRLF payload; the coverage-guard message must sanitize the echoed key. RED-on-
+        // revert against dropping the .Select(k => DiagnosticText.Sanitize(k)) projection on the keys.
+        await SeedTableAsync(partitionColumns: new[] { "region" });
+        const string poisoned = "zo\r\nne-inj";
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(() =>
+            Writer().AppendAsync(
+                TableSchema,
+                new[] { Staged("stray.parquet", Partition(("region", "US"), (poisoned, "az1"))) }));
+
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+        Assert.DoesNotContain('\n', ex.Message);
+        Assert.DoesNotContain('\r', ex.Message);
+        Assert.DoesNotContain(poisoned, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Append_OnUnpartitionedTable_PartitionKeyWithControlChars_IsSanitizedInMessage()
+    {
+        // The unpartitioned-table branch also echoes the file's partition keys — sanitize them too (#667).
+        await SeedTableAsync(partitionColumns: Array.Empty<string>());
+        const string poisoned = "reg\r\nion-inj";
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(() =>
+            Writer().AppendAsync(
+                TableSchema,
+                new[] { Staged("stray.parquet", Partition((poisoned, "US"))) }));
+
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+        Assert.DoesNotContain('\n', ex.Message);
+        Assert.DoesNotContain('\r', ex.Message);
+        Assert.DoesNotContain(poisoned, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Append_OnPartitionedTable_RejectsCaseVariantPartitionKey_ViaOrdinalGuard()
     {
         // HIGH (red-team, #487 round-4): the partitioned coverage guard must decide key equality with OUR

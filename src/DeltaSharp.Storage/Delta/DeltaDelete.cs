@@ -396,7 +396,9 @@ internal sealed class DeltaDelete
                 // correct even without it.
                 Debug.Assert(
                     cdc.RowCount == plan.NewlyDeletedCount,
-                    $"cdc row count {cdc.RowCount} != newly-deleted count {plan.NewlyDeletedCount} for '{add.Path}'.");
+                    // #667 message hygiene: the file path is not interpolated (it can carry
+                    // attacker-controllable text from a poisoned log); the bounded row counts suffice.
+                    $"cdc row count {cdc.RowCount} != newly-deleted count {plan.NewlyDeletedCount}.");
 
                 actions.Add(new AddCdcFileAction(cdc.Path, add.PartitionValues, cdc.Size, EmptyTags));
                 numAddedChangeFiles++;
@@ -479,7 +481,10 @@ internal sealed class DeltaDelete
             if (declared is not { } physicalRecords)
             {
                 throw DeltaStorageException.CorruptData(
-                    $"Active file '{add.Path}' carries a deletion vector but its add has no stats.numRecords; "
+                    // #667 message hygiene (the DELETE twin of the #663 read-path DeltaReadSource fix): the
+                    // file path is attacker-controllable (a poisoned log can inject arbitrary text) and is not
+                    // interpolated — the diagnosis is the missing stats.numRecords, not the path.
+                    "An active data file carries a deletion vector but its add action has no stats.numRecords; "
                     + "the DELETE cannot compute the file's physical record count, so it fails closed.");
             }
 
@@ -573,7 +578,9 @@ internal sealed class DeltaDelete
         if (add.Stats?.NumRecords is { } declaredPhysical && declaredPhysical != fileRowOffset)
         {
             throw DeltaStorageException.CorruptData(
-                $"Active file '{add.Path}' declares stats.numRecords={declaredPhysical} but the Parquet file "
+                // #667 message hygiene (the DELETE twin of the #663 read-path numRecords-mismatch fix): the
+                // file path is not interpolated; the bounded record counts are the diagnosis.
+                $"An active data file declares stats.numRecords={declaredPhysical} but the Parquet file "
                 + $"contains {fileRowOffset} physical record(s); the DELETE fails closed rather than write a "
                 + "count that disagrees with the data.");
         }

@@ -116,7 +116,9 @@ internal static class DeltaConflictChecker
             if (path is not null)
             {
                 throw new ConcurrentDeleteReadException(
-                    $"A concurrent commit changed file '{path}', for which this writer is committing a deletion "
+                    // #667 message hygiene: the file path is not interpolated (a poisoned log can inject
+                    // arbitrary text); the conflict kind is the diagnosis.
+                    "A concurrent commit changed a file for which this writer is committing a deletion "
                     + "vector, since its read snapshot; the commit was aborted to avoid losing a concurrent delete.");
             }
         }

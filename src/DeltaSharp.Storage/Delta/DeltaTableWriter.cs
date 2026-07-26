@@ -1410,8 +1410,11 @@ internal sealed class DeltaTableWriter
                         StorageErrorKind.SchemaMismatch,
                         string.Create(
                             CultureInfo.InvariantCulture,
-                            $"Staged file '{file.Path}' carries partition value(s) " +
-                            $"[{string.Join(", ", file.PartitionValues.Keys)}] but the table is unpartitioned; " +
+                            // #667 message hygiene: the staged file path is not interpolated, and the
+                            // partition-column keys (which can be foreign/attacker-authored in name mode) are
+                            // sanitized to close the log-injection vector.
+                            $"A staged file carries partition value(s) " +
+                            $"[{string.Join(", ", file.PartitionValues.Keys.Select(k => DiagnosticText.Sanitize(k)))}] but the table is unpartitioned; " +
                             $"an unpartitioned write must not specify any partition value."));
                 }
             }
@@ -1441,8 +1444,10 @@ internal sealed class DeltaTableWriter
                     StorageErrorKind.SchemaMismatch,
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Staged file '{file.Path}' carries partition value(s) [{string.Join(", ", stray)}] " +
-                        $"not declared by the table's partition columns [{string.Join(", ", partitionColumns)}]; " +
+                        // #667 message hygiene: the staged file path is not interpolated; the partition-column
+                        // keys (foreign/attacker-authored in name mode) and declared columns are sanitized.
+                        $"A staged file carries partition value(s) [{string.Join(", ", stray.Select(k => DiagnosticText.Sanitize(k)))}] " +
+                        $"not declared by the table's partition columns [{string.Join(", ", partitionColumns.Select(k => DiagnosticText.Sanitize(k)))}]; " +
                         $"a partitioned write must not specify any partition value beyond the declared columns."));
             }
 
@@ -1456,8 +1461,10 @@ internal sealed class DeltaTableWriter
                     StorageErrorKind.SchemaMismatch,
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Staged file '{file.Path}' is missing partition column(s) " +
-                        $"[{string.Join(", ", missing)}]; a partitioned write must specify a value " +
+                        // #667 message hygiene: the staged file path is not interpolated; the missing
+                        // partition-column names are sanitized (declared table schema, but uniform posture).
+                        $"A staged file is missing partition column(s) " +
+                        $"[{string.Join(", ", missing.Select(k => DiagnosticText.Sanitize(k)))}]; a partitioned write must specify a value " +
                         $"(possibly null) for every partition column."));
             }
         }
@@ -1499,8 +1506,7 @@ internal sealed class DeltaTableWriter
         {
             if (file.DataSchema is { } actual && !DataColumnsMatch(expected, actual))
             {
-                throw DeltaSchemaMismatchException.PhysicalWriteSchemaMismatch(
-                    file.Path, expected.SimpleString, actual.SimpleString);
+                throw DeltaSchemaMismatchException.PhysicalWriteSchemaMismatch();
             }
         }
     }

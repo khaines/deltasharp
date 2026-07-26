@@ -1,6 +1,7 @@
 using System.Runtime.CompilerServices;
 using System.Text;
 using DeltaSharp.Engine.Columnar;
+using DeltaSharp.Storage.Delta;
 using DeltaSharp.Types;
 using Parquet;
 using Parquet.Schema;
@@ -673,10 +674,13 @@ internal static class NestedParquetColumnReader
         {
             // Parquet.Net's DATE/TIMESTAMP decode throws ArgumentOutOfRangeException for a physical value
             // outside the representable DateTime range — a corrupt/hostile file, mapped to the deterministic
-            // CorruptData contract (mirrors the flat reader's ReadValueAsync). Named by the requested leaf type
+            // CorruptData contract (mirrors the flat reader's ReadValueAsync). The file-derived leaf path is echoed
+            // through DiagnosticText.Sanitize (#665) — it is bounded to the requested schema when reachable (nested
+            // reads under column-mapping id mode fail closed before decode), so this closes only the residual
+            // log-injection vector. Named by the requested leaf type
             // so the message is accurate for whichever leaf raised it (not hard-coded to date/time).
             throw DeltaStorageException.CorruptData(
-                $"Nested leaf '{leaf.Path}' of type '{elementType.SimpleString}' has a physical value outside "
+                $"Nested leaf '{DiagnosticText.Sanitize(leaf.Path.ToString())}' of type '{elementType.SimpleString}' has a physical value outside "
                 + "its representable range.", ex);
         }
 
@@ -743,7 +747,7 @@ internal static class NestedParquetColumnReader
             if ((uint)levels[i] > (uint)maxLevel)
             {
                 throw DeltaStorageException.CorruptData(
-                    $"Nested leaf '{leafPath}' has a {kind} level {levels[i]} outside the valid range "
+                    $"Nested leaf '{DiagnosticText.Sanitize(leafPath)}' has a {kind} level {levels[i]} outside the valid range "
                     + $"[0, {maxLevel}].");
             }
         }
@@ -881,7 +885,7 @@ internal static class NestedParquetColumnReader
             if (_remaining < 0 || (perSlotBytes > 0 && numValues > _remaining / perSlotBytes))
             {
                 throw DeltaStorageException.CorruptData(
-                    $"Nested leaf '{leaf.Path}' declares {numValues} values, whose eager decode would exceed the "
+                    $"Nested leaf '{DiagnosticText.Sanitize(leaf.Path.ToString())}' declares {numValues} values, whose eager decode would exceed the "
                     + $"{Ceiling}-byte ceiling.");
             }
 
@@ -915,12 +919,12 @@ internal static class NestedParquetColumnReader
     {
         global::Parquet.Meta.ColumnMetaData meta = rowGroup.GetMetadata(leaf)?.MetaData
             ?? throw DeltaStorageException.CorruptData(
-                $"Nested leaf '{leaf.Path}' has no column-chunk metadata (a stripped/absent footer).");
+                $"Nested leaf '{DiagnosticText.Sanitize(leaf.Path.ToString())}' has no column-chunk metadata (a stripped/absent footer).");
         long numValues = meta.NumValues;
         if (numValues < 0)
         {
             throw DeltaStorageException.CorruptData(
-                $"Nested leaf '{leaf.Path}' declares a negative value count ({numValues}).");
+                $"Nested leaf '{DiagnosticText.Sanitize(leaf.Path.ToString())}' declares a negative value count ({numValues}).");
         }
 
         long perSlotBytes = elementWidth
@@ -960,7 +964,7 @@ internal static class NestedParquetColumnReader
         if (numValues > int.MaxValue)
         {
             throw DeltaStorageException.CorruptData(
-                $"Nested leaf '{leaf.Path}' declares {numValues} values, exceeding Int32.MaxValue.");
+                $"Nested leaf '{DiagnosticText.Sanitize(leaf.Path.ToString())}' declares {numValues} values, exceeding Int32.MaxValue.");
         }
 
         return (int)numValues;

@@ -105,6 +105,28 @@ public sealed class DeltaConflictCheckerTests
     }
 
     [Fact]
+    public void ConcurrentConflicts_DoNotEchoFilePathInMessage()
+    {
+        // #667 message hygiene: the file path is DROPPED from concurrent-commit conflict messages (a poisoned
+        // log could otherwise inject arbitrary text). RED-on-revert against re-adding the path — covers the
+        // DeltaReadScope re-added/removed paths and the DeltaConflictChecker deletion-vector path.
+        var append = Assert.Throws<ConcurrentAppendException>(() =>
+            Check(new DeltaAction[] { Add("o.parquet") }, DeltaReadScope.WholeTable, new DeltaAction[] { Add("winner-inj.parquet") }));
+        Assert.DoesNotContain("winner-inj.parquet", append.Message, StringComparison.Ordinal);
+
+        var delete = Assert.Throws<ConcurrentDeleteReadException>(() =>
+            Check(new DeltaAction[] { Add("o.parquet") }, DeltaReadScope.WholeTable, new DeltaAction[] { Remove("gone-inj.parquet") }));
+        Assert.DoesNotContain("gone-inj.parquet", delete.Message, StringComparison.Ordinal);
+
+        var dv = Assert.Throws<ConcurrentDeleteReadException>(() =>
+            Check(
+                new DeltaAction[] { AddWithDv("f-inj.parquet"), Remove("f-inj.parquet") },
+                DeltaReadScope.BlindAppend,
+                new DeltaAction[] { Remove("f-inj.parquet") }));
+        Assert.DoesNotContain("f-inj.parquet", dv.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void WholeTable_RebasesWhenNoConcurrentDataChange()
     {
         // Only a concurrent txn for a different appId — no data overlap, no metadata/protocol change.

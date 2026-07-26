@@ -104,28 +104,28 @@ internal sealed class DeltaSchemaMismatchException : Exception
         new(
             DeltaSchemaMismatchKind.MissingRequiredColumn,
             path,
-            $"The write is missing required (non-nullable) column '{path}'; a write must provide every " +
+            $"The write is missing required (non-nullable) column '{DiagnosticText.Sanitize(path)}'; a write must provide every " +
             "non-nullable column, or the column must first be made nullable.");
 
     public static DeltaSchemaMismatchException NewColumnNotAllowed(string path) =>
         new(
             DeltaSchemaMismatchKind.NewColumnNotAllowed,
             path,
-            $"The write introduces column '{path}', which is not in the table schema. Enable schema " +
+            $"The write introduces column '{DiagnosticText.Sanitize(path)}', which is not in the table schema. Enable schema " +
             "evolution (SchemaEvolutionMode.AddNewColumns / MergeSchema) to add new columns.");
 
     public static DeltaSchemaMismatchException NewColumnMustBeNullable(string path) =>
         new(
             DeltaSchemaMismatchKind.NewColumnMustBeNullable,
             path,
-            $"The write adds new column '{path}' as non-nullable; a column added to a table that already " +
+            $"The write adds new column '{DiagnosticText.Sanitize(path)}' as non-nullable; a column added to a table that already " +
             "has data must be nullable because existing rows carry no value for it.");
 
     public static DeltaSchemaMismatchException NullabilityViolation(string path) =>
         new(
             DeltaSchemaMismatchKind.NullabilityViolation,
             path,
-            $"The write declares '{path}' nullable but the table requires it to be non-nullable; " +
+            $"The write declares '{DiagnosticText.Sanitize(path)}' nullable but the table requires it to be non-nullable; " +
             "null-bearing data cannot be written into a required column, and a required column cannot be " +
             "relaxed to nullable by a write.");
 
@@ -133,7 +133,7 @@ internal sealed class DeltaSchemaMismatchException : Exception
         new(
             DeltaSchemaMismatchKind.IncompatibleType,
             path,
-            $"The write type '{writeType}' for column '{path}' is not compatible with the table type " +
+            $"The write type '{writeType}' for column '{DiagnosticText.Sanitize(path)}' is not compatible with the table type " +
             $"'{tableType}'; an existing column's type cannot be changed by a write (never a narrowing or an " +
             "unrelated type).");
 
@@ -141,7 +141,7 @@ internal sealed class DeltaSchemaMismatchException : Exception
         new(
             DeltaSchemaMismatchKind.TypeWideningUnsupported,
             path,
-            $"The type change '{tableType}'→'{writeType}' for column '{path}' is a Delta-sanctioned widening " +
+            $"The type change '{tableType}'→'{writeType}' for column '{DiagnosticText.Sanitize(path)}' is a Delta-sanctioned widening " +
             "but is not applied here: the table has not enabled type widening (the 'typeWidening' table " +
             "feature must be present AND the 'delta.enableTypeWidening' property set to 'true'), or the change " +
             "is a read-promote-only cross-family widening this build never auto-applies on append. Widening " +
@@ -157,7 +157,7 @@ internal sealed class DeltaSchemaMismatchException : Exception
         new(
             DeltaSchemaMismatchKind.TypeWideningUnsupported,
             path,
-            $"The type change '{tableType}'→'{writeType}' for partition column '{path}' is a Delta-sanctioned " +
+            $"The type change '{tableType}'→'{writeType}' for partition column '{DiagnosticText.Sanitize(path)}' is a Delta-sanctioned " +
             "widening that does NOT require a table rewrite (partition values are stored as strings, so no " +
             "data file needs rewriting), but partition-column type widening is DEFERRED in this build " +
             "(tracked in #537). It is rejected fail-closed until that lands.");
@@ -166,22 +166,24 @@ internal sealed class DeltaSchemaMismatchException : Exception
         new(
             DeltaSchemaMismatchKind.CaseInsensitiveDuplicateColumn,
             path,
-            $"Evolving the schema would add column '{path}', which collides case-insensitively with existing " +
-            $"column '{other}'. Delta requires column names to be unique ignoring case, so this write is rejected.");
+            $"Evolving the schema would add column '{DiagnosticText.Sanitize(path)}', which collides case-insensitively with existing " +
+            $"column '{DiagnosticText.Sanitize(other)}'. Delta requires column names to be unique ignoring case, so this write is rejected.");
 
     public static DeltaSchemaMismatchException PartitionColumnEvolution(string path, string tableType, string writeType) =>
         new(
             DeltaSchemaMismatchKind.PartitionColumnEvolutionUnsupported,
             path,
-            $"The write changes the type of partition column '{path}' from '{tableType}' to '{writeType}'; a " +
+            $"The write changes the type of partition column '{DiagnosticText.Sanitize(path)}' from '{tableType}' to '{writeType}'; a " +
             "partition column's type is encoded in the table layout and cannot be evolved (it requires a full " +
             "table rewrite). Rejected.");
 
-    public static DeltaSchemaMismatchException PhysicalWriteSchemaMismatch(string filePath, string declared, string actual) =>
+    public static DeltaSchemaMismatchException PhysicalWriteSchemaMismatch() =>
         new(
             DeltaSchemaMismatchKind.PhysicalWriteSchemaMismatch,
             path: string.Empty,
-            $"Staged file '{filePath}' was written with physical data schema '{actual}', which does not " +
-            $"match the declared write schema's data columns '{declared}'. Schema enforcement gates the real " +
-            "written bytes (#497), so a write whose staged files diverge from its declared schema is rejected.");
+            // #667 message hygiene: neither the staged file path (attacker-controllable) nor the physical
+            // data schemas (file-layout disclosure) are interpolated; the diagnosis is the divergence itself.
+            "A staged file was written with a physical data schema that does not match the declared write " +
+            "schema's data columns. Schema enforcement gates the real written bytes (#497), so a write whose " +
+            "staged files diverge from its declared schema is rejected.");
 }

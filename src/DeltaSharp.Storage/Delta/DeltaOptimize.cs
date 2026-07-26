@@ -30,7 +30,11 @@ internal sealed class OptimizeSchemaEvolutionException : Exception
 {
     internal OptimizeSchemaEvolutionException(string filePath, Exception innerException)
         : base(
-            $"OPTIMIZE cannot compact file '{filePath}' because it is missing a REQUIRED (non-nullable) " +
+            // #667 message hygiene (mirrors the read-path DeltaReadSchemaEvolutionException, #653): the file
+            // path is attacker-controllable (a poisoned/foreign log can inject arbitrary text) and is NOT
+            // interpolated — it stays programmatically available on the FilePath property for a caller that
+            // opts in and can redact at its own sink.
+            "OPTIMIZE cannot compact a file because it is missing a REQUIRED (non-nullable) " +
             "column that the current table schema declares, and a required column cannot be null-filled " +
             "when compacting a file written under an older schema. OPTIMIZE fails closed rather than " +
             "compacting such a file; the table is left unchanged. (Additively-added NULLABLE columns ARE " +
