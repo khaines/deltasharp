@@ -3,7 +3,7 @@ name: review-pr
 description: >-
   Orchestrates world-class pull request reviews using specialist agent personas and engineering checklists.
   Use this when asked to review a PR, review code changes, or assess PR quality.
-  A cheap scout triages and routes; a multi-frontier council (Claude Opus 4.8 + Gemini 3.1 Pro)
+  A cheap scout triages and routes; a multi-frontier council (Claude Opus 5 + Gemini 3.1 Pro)
   reviews complex changes with up to 3 scout-selected domain specialists; a decorrelated GPT-5.6 Sol
   red-team executes repros (C7) and gates. Posts findings as GitHub PR code reviews (inline comments
   + review summary) for remote PRs.
@@ -149,13 +149,13 @@ Dispatch **4 parallel reviews** using the `task` tool. Each slot has a fixed **r
 
 | Slot | Role | Model | `agent_type` allowlist |
 |---|---|---|---|
-| **Architect** | Deep reasoning — architecture implications, subtle bugs, design flaws | `claude-opus-4.8` (effort high/max) | `general-purpose`, `cloud-native-distributed-systems-architect`, `query-execution-engine-engineer`, `delta-storage-format-engineer`, `data-platform-connectors-engineer` |
-| **Balanced** | Code quality, patterns, maintainability, operational pragmatism | `claude-opus-4.8` (effort high/max) | `general-purpose`, `dotnet-framework-runtime-engineer`, `cloud-native-site-reliability-engineer`, `developer-experience-api-engineer` |
+| **Architect** | Deep reasoning — architecture implications, subtle bugs, design flaws | `claude-opus-5` (effort high/xhigh/max) | `general-purpose`, `cloud-native-distributed-systems-architect`, `query-execution-engine-engineer`, `delta-storage-format-engineer`, `data-platform-connectors-engineer` |
+| **Balanced** | Code quality, patterns, maintainability, operational pragmatism | `claude-opus-5` (effort high/xhigh/max) | `general-purpose`, `dotnet-framework-runtime-engineer`, `cloud-native-site-reliability-engineer`, `developer-experience-api-engineer` |
 | **Quality** | Testability, measurability, reliability, alternative pattern recognition | `gemini-3.1-pro-preview` (effort high) | `general-purpose`, `reliability-test-chaos-engineer`, `performance-benchmarking-engineer`, `technical-writer` |
-| **Security** | Tenant isolation, auth bypass, injection, supply-chain, cryptographic correctness, privacy/compliance | `claude-opus-4.8` (effort high/max) | `cloud-native-security-sme`, `privacy-compliance-grc-lead`, `general-purpose` |
+| **Security** | Tenant isolation, auth bypass, injection, supply-chain, cryptographic correctness, privacy/compliance | `claude-opus-5` (effort high/xhigh/max) | `cloud-native-security-sme`, `privacy-compliance-grc-lead`, `general-purpose` |
 
-> **Models track the newest top-tier of each family** — currently Claude **Opus 4.8** (in place
-> of older Opus 4.7 / Sonnet 4.6) for the deep / balanced / security lenses, and **Gemini 3.1 Pro**
+> **Models track the newest top-tier of each family** — currently Claude **Opus 5** (in place
+> of older Opus 4.8 / 4.7) for the deep / balanced / security lenses, and **Gemini 3.1 Pro**
 > (`gemini-3.1-pro-preview`) for Quality — a non-Claude voting perspective. Update these as families
 > advance. The council spans **three frontier families**: Claude (spine), Gemini (Quality), and GPT
 > (the Phase 8 red-team, `gpt-5.6-sol` / GPT-5.6 Sol) — so the red-team gate is **decorrelated from
@@ -167,7 +167,7 @@ Dispatch **4 parallel reviews** using the `task` tool. Each slot has a fixed **r
 domain specialist from the scout's Review Package as an **additional voting seat** on a frontier
 model (`agent_type` = the specialist persona; model = a **voting-spine family (Claude or Gemini),
 never GPT** — so the red-team's GPT-family decorrelation stays *structurally* guaranteed; a specialist
-on GPT would silently degrade the gate to provisional; e.g. `claude-opus-4.8`),
+on GPT would silently degrade the gate to provisional; e.g. `claude-opus-5`),
 scoped to its owned files + checklist IDs. The 4 lenses are the spine; specialists add depth for
 the domains the diff actually touches (Delta storage, query execution, operator, connectors, …).
 
@@ -421,7 +421,7 @@ After the rating, dispatch the **red-team** (`.github/skills/review-pr/red-team.
 gate-keeper. It runs **last**, **shell-capable** (`agent_type: general-purpose`), on a frontier
 family **distinct from the majority voting spine and ideally used by no voting seat**. With the
 current council (Claude spine + Gemini Quality), use **`gpt-5.6-sol`** (GPT-5.6 Sol) — the GPT family
-is used by no voting seat; do not reuse a voting seat's family (`claude-opus-4.8` or
+is used by no voting seat; do not reuse a voting seat's family (`claude-opus-5` or
 `gemini-3.1-pro-preview`) as the red-team.
 
 Give it the diff, the Review Package, and **every voting seat's full verdict + findings**. It
