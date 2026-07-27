@@ -310,7 +310,7 @@ CI (vacuous tests, validator↔consumer mismatches, migration notes the code con
   **ideally a family used by no voting seat** (true decorrelation). With the current council (Claude
   spine + Gemini Quality) use **`gpt-5.6-sol`** — do **not** dispatch the red-team on a family a
   voting seat already uses (e.g. don't use `gemini-3.1-pro-preview` while the Quality lens is
-  `gemini-3.1-pro-preview`, or `claude-opus-4.8` while the spine is Opus). A red-team `MISS-FOUND`
+  `gemini-3.1-pro-preview`, or `claude-opus-5` while the spine is Opus). A red-team `MISS-FOUND`
   **always blocks** — its findings are actionable, in the canonical `Critical|High|Medium|Low|Info`
   set (the red-team does not emit `blocking/major/minor`).
 - `NO-MISS-CERTIFIED` is valid only with a fully-populated Falsification-Attempts block and a C7

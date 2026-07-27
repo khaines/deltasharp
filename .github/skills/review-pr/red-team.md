@@ -20,7 +20,7 @@ manufactures the independent, adversarial error-checking that constructive revie
   not share their blind spots. The current council is Claude (spine: Architect/Balanced/Security
   + specialists) + Gemini (the Quality lens is `gemini-3.1-pro-preview`), so run the red-team on
   **`gpt-5.6-sol`** (GPT-5.6 Sol) — the GPT family no voting seat uses; do **not** reuse a voting
-  seat's family (e.g. `claude-opus-4.8` or `gemini-3.1-pro-preview`) as the red-team. Record which
+  seat's family (e.g. `claude-opus-5` or `gemini-3.1-pro-preview`) as the red-team. Record which
   model gated. A red-team on the *same* family as a voting seat (or the majority spine) is
   **provisional** and does **not** satisfy the gate for protected-domain changes — say so and
   require a decorrelated re-run or a documented human waiver.
