@@ -261,9 +261,10 @@ internal sealed class ChangeFeedReader
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         OutputContext ctx;
+        MetadataAction endMetadata;
         try
         {
-            ctx = await BuildOutputContextAsync(info, cancellationToken).ConfigureAwait(false);
+            (ctx, endMetadata) = await BuildOutputContextAsync(info, cancellationToken).ConfigureAwait(false);
         }
         catch (DeltaProtocolException ex)
         {
@@ -274,14 +275,15 @@ internal sealed class ChangeFeedReader
             throw new DeltaReadException(ex.Message, ex);
         }
 
-        // Full-history column-mapping mode immutability (#671): the per-version check below covers a mode
-        // transition WITHIN [start, end], but a file a `remove` in the range references may have been AUTHORED
-        // before `start` under a different mode (the implicit-DELETE path reads it through the END mode) — a
-        // mismap the per-version check never sees. Validate that every RETAINED version before `start` shares
-        // the end mode (Delta column-mapping mode is immutable), failing closed on any difference.
+        // Full-history column-mapping IDENTITY immutability (#671, maintainer-broadened from mode-only): the
+        // per-version check below covers a transition WITHIN [start, end], but a file a `remove` in the range
+        // references may have been AUTHORED before `start` under a different column-mapping identity (mode,
+        // field id, or physical name) — the implicit-DELETE path reads it through the END identity, a mismap
+        // the per-version check never sees. Validate that every RETAINED version before `start` shares the end
+        // identity, failing closed on any difference.
         try
         {
-            await _log.ValidateColumnMappingModeStableBeforeAsync(info.StartVersion, ctx.Mode, cancellationToken)
+            await _log.ValidateColumnMappingIdentityStableBeforeAsync(info.StartVersion, endMetadata, cancellationToken)
                 .ConfigureAwait(false);
         }
         catch (DeltaProtocolException ex)
@@ -321,6 +323,24 @@ internal sealed class ChangeFeedReader
             throw new DeltaReadException(ex.Message, ex);
         }
 
+        // #671 in-range half of the full-history column-mapping IDENTITY-immutability gate. The pre-range half
+        // (ValidateColumnMappingIdentityStableBeforeAsync, above) validated [earliest, start-1]; this validates
+        // every version IN [start, end] against the end identity as the replay advances the prevailing
+        // metadata. Their union is the full retained window a CDF read can touch (#671). Parse the end and the
+        // start-baseline identities once; the per-version loop refreshes `currentIdentity` only when a metaData
+        // action replaces the prevailing metadata.
+        ColumnMappingIdentity endIdentity;
+        ColumnMappingIdentity currentIdentity;
+        try
+        {
+            endIdentity = ColumnMappingIdentity.FromMetadata(endMetadata);
+            currentIdentity = ColumnMappingIdentity.FromMetadata(currentMetadata);
+        }
+        catch (SchemaValidationException ex)
+        {
+            throw new DeltaReadException(ex.Message, ex);
+        }
+
         for (long v = info.StartVersion; v <= info.EndVersion; v++)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -353,37 +373,54 @@ internal sealed class ChangeFeedReader
 
             // Track the prevailing metadata (item 3): a metaData action in this commit REPLACES it (Delta
             // semantics). At v == start this re-applies start's own metaData (idempotent — already baked into
-            // the baseline snapshot); for later versions it advances the schema the cdc validation trusts.
+            // the baseline snapshot); for later versions it advances the schema the cdc validation trusts. We
+            // refresh the column-mapping identity in lock-step so the #671 per-version check below is a cheap
+            // value compare (the schemaString is re-parsed only when the metadata actually changes).
             foreach (DeltaAction action in actions)
             {
                 if (action is MetadataAction updatedMetadata)
                 {
                     currentMetadata = updatedMetadata;
+                    try
+                    {
+                        currentIdentity = ColumnMappingIdentity.FromMetadata(updatedMetadata);
+                    }
+                    catch (SchemaValidationException ex)
+                    {
+                        throw new DeltaReadException(ex.Message, ex);
+                    }
                 }
             }
 
-            // Fail closed on a column-mapping MODE transition WITHIN the range. Every version's files (explicit
-            // cdc AND implicit add/remove) are read through the END snapshot's mode (`ctx`) — its physical-name
-            // / field-id resolution. A historical version authored under a DIFFERENT mode would be MISMAPPED
-            // (e.g. an id-mode cdc file with swapped footer field_ids, read by NAME when the end is name mode,
-            // surfaces WRONG change rows). Delta column-mapping mode is IMMUTABLE (id is creation-only, name is
-            // sticky), so a differing per-version mode is a corrupt/forged `_delta_log`; fail closed rather than
-            // emit mismapped change data. (Pre-existing since the #658 end-mode read; hardened here with #662.)
-            // Path-free (#653): only the bounded version is named.
+            // Fail closed on a column-mapping IDENTITY transition WITHIN the range (#671, maintainer-broadened
+            // from #670's mode-only check). Every version's files (explicit cdc AND implicit add/remove) are
+            // read through the END snapshot's column-mapping identity (`ctx` — its mode + physical-name /
+            // field-id resolution). A version whose prevailing metadata declares a different mode, a reassigned
+            // field id, or a changed physical name would be MISMAPPED (e.g. an id-mode file with swapped
+            // field_ids read through the end field-ids, or a name-mode file read through a reassigned physical
+            // name — WRONG change rows). Delta column-mapping identity is IMMUTABLE (mode is
+            // creation-only/sticky; field ids and physical names are assigned once), so a differing per-version
+            // identity is a corrupt/forged `_delta_log`; fail closed rather than emit mismapped change data.
+            // Legitimate schema evolution (ADDING a column) is allowed — only columns present in BOTH the
+            // version and the end are compared. The #662 EE-08 gate independently validates each EXPLICIT cdc
+            // file's leaf schema; this gate covers the implicit add/remove path too. Path-free (#653): only the
+            // bounded version is named.
             //
-            // SCOPE: this catches a mode change at any version IN `[start, end]`. The COMPLEMENTARY pre-range
-            // check (`ValidateColumnMappingModeStableBeforeAsync`, run before this loop) covers a file
-            // referenced by a `remove` in the range but AUTHORED before `start` under a different mode
-            // (implicit-DELETE of a historical file across a mode boundary) — so full retained-history
-            // mode-immutability is now validated (#671). Residual (inherent): a mode flip entirely within
-            // AGED-OUT history below the earliest reconstructable version is physically unreadable; mode
-            // immutability then guarantees the surviving history's uniform mode also held there.
-            if (ColumnMapping.ResolveMode(currentMetadata.Configuration) != ctx.Mode)
+            // SCOPE: this catches an identity change at any version IN `[start, end]`; the COMPLEMENTARY
+            // pre-range check (`ValidateColumnMappingIdentityStableBeforeAsync`, run before this loop) covers a
+            // file referenced by a `remove` in the range but AUTHORED before `start` under a different identity
+            // (implicit-DELETE of a historical file across an identity boundary). Their union is the full
+            // retained window (#671). Residual (inherent): an identity change entirely within AGED-OUT history
+            // below the earliest reconstructable version is physically unreadable; a still-referenced
+            // below-floor file is then read under the uniform retained identity — equivalent to ordinary
+            // data-content forgery, no capability beyond the issue's `_delta_log`-write threat model.
+            if (!endIdentity.IsImmutableFrom(currentIdentity))
             {
                 throw new DeltaReadException(
-                    $"The change-feed range crosses a column-mapping mode change at version {v}; the range is "
-                    + "read through a single (end-snapshot) column-mapping mode, so a mode transition is not "
-                    + "supported and the read fails closed rather than risk emitting mismapped change data.");
+                    $"The change-feed range crosses a column-mapping identity change at version {v}; the range "
+                    + "is read through a single (end-snapshot) column-mapping identity (mode, field ids, and "
+                    + "physical names), so such a transition is not supported and the read fails closed rather "
+                    + "than risk emitting mismapped change data.");
             }
 
             // Precedence (INV C1/C2, §2.2): ANY cdc action ⇒ explicit (read exactly the cdc rows, ignore
@@ -409,9 +446,10 @@ internal sealed class ChangeFeedReader
                     {
                         // `ctx.ResolveByFieldId` (the END snapshot's mode) drives BOTH the gate and the read,
                         // so they never disagree on mode within a version. A range that crossed a column-mapping
-                        // MODE transition — which would mismap a historical version read through the end's mode —
-                        // was already failed closed above (the per-version mode-consistency check), so by here
-                        // every version in the range provably shares the end snapshot's mode.
+                        // IDENTITY transition — which would mismap a historical version read through the end's
+                        // mode / field-ids / physical names — was already failed closed above (the per-version
+                        // identity-consistency check, #671), so by here every version in the range provably
+                        // shares the end snapshot's column-mapping identity.
                         await ValidateExplicitCdcSchemaAsync(
                             cdc.Path, versionPhysicalDataSchema, v, ctx.ResolveByFieldId, cancellationToken)
                             .ConfigureAwait(false);
@@ -592,7 +630,7 @@ internal sealed class ChangeFeedReader
                 $"Change feed version {version}'s commit log is no longer available (log cleanup removed it "
                 + "between range resolution and read); the requested range is outside the CDF-readable window.");
 
-    private async Task<OutputContext> BuildOutputContextAsync(
+    private async Task<(OutputContext Ctx, MetadataAction EndMetadata)> BuildOutputContextAsync(
         DeltaChangeFeedInfo info, CancellationToken cancellationToken)
     {
         Snapshot end = await _log.LoadSnapshotAsync(info.EndVersion, cancellationToken).ConfigureAwait(false);
@@ -605,9 +643,13 @@ internal sealed class ChangeFeedReader
             ColumnMappingProjection.BuildDataSchema(tableSchema, physicalNames, partitionColumns);
         int[] dataOrdinalByField = ColumnMappingProjection.MapDataOrdinals(physicalNames, physicalDataSchema);
         bool allowTypeWideningPromotion = TypeWideningFeature.Supports(end.Protocol);
-        return new OutputContext(
+        // Return the end MetadataAction alongside `ctx` so the caller can drive the #671 full-history
+        // column-mapping IDENTITY-immutability check off the SAME end snapshot's metadata (mode + schema
+        // field ids/physical names + partition columns) that `ctx` was derived from.
+        var ctx = new OutputContext(
             info.Schema, tableSchema, physicalDataSchema, physicalNames, dataOrdinalByField, resolveByFieldId,
             mode, allowTypeWideningPromotion);
+        return (ctx, end.Metadata);
     }
 
     // §3.2 CDF-EE-08: builds the version's expected PHYSICAL data-leaf schema from its log-resident metadata
