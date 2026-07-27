@@ -1,5 +1,6 @@
 using System;
 using System.Globalization;
+using System.Linq;
 using System.Text;
 using DeltaSharp.Diagnostics;
 using DeltaSharp.Sql;
@@ -34,22 +35,29 @@ public sealed class SqlParserDiagnosticHygieneTests
     /// <c>expected SELECT</c>, <c>expected FROM</c>, <c>unexpected … after the query</c>, and
     /// <c>expected ')'</c>. Each template's <c>{0}</c> is filled with the hostile token.
     /// </summary>
-    public static TheoryData<string, string, bool> HostileEchoSites() => new()
+    /// <remarks>
+    /// The <c>expectedProse</c> column is what makes this theory a <i>coverage</i> guard and not merely five
+    /// hygiene assertions: hygiene holds unconditionally at the <see cref="SqlParseException"/> chokepoint, so
+    /// without it a grammar change that collapsed two of these templates onto the same site would shrink real
+    /// coverage while the suite stayed green. Pinning the prose per row makes that collapse a test failure.
+    /// The sibling <see cref="BoundedEchoSites"/> theory already works this way.
+    /// </remarks>
+    public static TheoryData<string, string, bool, string> HostileEchoSites() => new()
     {
-        // SqlParser.ParseConstraintExpression: "unexpected trailing input '<tok>' after the constraint …".
-        { "constraint-trailing-input", "other > 0 `{0}`", false },
+        // SqlParser.ParseConstraintExpression.
+        { "constraint-trailing-input", "other > 0 `{0}`", false, "unexpected trailing input '" },
 
-        // SqlParser.ParseStatement: "expected SELECT but found '<tok>'".
-        { "expected-select", "`{0}` a FROM t", true },
+        // SqlParser.ParseStatement.
+        { "expected-select", "`{0}` a FROM t", true, "expected SELECT but found '" },
 
-        // SqlParser.ParseStatement: "expected FROM but found '<tok>'".
-        { "expected-from", "SELECT a `x` `{0}` t", true },
+        // SqlParser.ParseStatement.
+        { "expected-from", "SELECT a `x` `{0}` t", true, "expected FROM but found '" },
 
-        // SqlParser.ExpectEnd: "unexpected '<tok>' after the query".
-        { "trailing-after-query", "SELECT a FROM t `{0}`", true },
+        // SqlParser.ExpectEnd.
+        { "trailing-after-query", "SELECT a FROM t `{0}`", true, "unexpected '" },
 
-        // SqlParser.Expect(RParen, ")"): "expected ')' but found '<tok>'".
-        { "expected-rparen", "SELECT a FROM t WHERE (a > 1 `{0}`", true },
+        // SqlParser.Expect(RParen, ")").
+        { "expected-rparen", "SELECT a FROM t WHERE (a > 1 `{0}`", true, "expected ')' but found '" },
     };
 
     /// <summary>
@@ -79,7 +87,7 @@ public sealed class SqlParserDiagnosticHygieneTests
     [Theory]
     [MemberData(nameof(HostileEchoSites))]
     public void SyntaxError_HostileTokenAtEveryReachableEchoSite_IsControlCharFreeAndBounded(
-        string site, string template, bool viaStatementDoor)
+        string site, string template, bool viaStatementDoor, string expectedProse)
     {
         Assert.NotEmpty(site);
 
@@ -102,7 +110,24 @@ public sealed class SqlParserDiagnosticHygieneTests
             });
 
         Assert.Equal(SqlParseErrorKind.SyntaxError, ex.ErrorKind);
+
+        // Pin the site. Every row must reach a DISTINCT template, so coverage cannot silently shrink.
+        Assert.Contains(expectedProse, ex.Message, StringComparison.Ordinal);
         AssertHygienic(ex.Message);
+    }
+
+    /// <summary>
+    /// Guards the <i>distinctness</i> half of <see cref="HostileEchoSites"/> directly: two rows sharing a
+    /// prose pin would still satisfy the per-row <c>Assert.Contains</c> above, so the coverage claim in that
+    /// theory's summary — five sites, not four — is asserted here rather than left to the comment.
+    /// </summary>
+    [Fact]
+    public void HostileEchoSites_EachRowPinsADistinctSite()
+    {
+        string[] pins = HostileEchoSites().Select(row => (string)row[3]).ToArray();
+
+        Assert.Equal(5, pins.Length);
+        Assert.Equal(pins.Length, pins.Distinct(StringComparer.Ordinal).Count());
     }
 
     [Theory]
