@@ -90,19 +90,80 @@ public sealed class ReplayedMetadataLogTests
     }
 
     [Fact]
-    public void AHoleInsideTheClaimedWindow_FailsClosed_RatherThanSkipTheVersion()
+    public void ANonContiguousObservation_FailsClosed_SoTheCoveredIntervalIsNeverWiderThanWhatWasSeen()
     {
         var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
         MetadataAction m = Meta("t");
         log.Record(10, None, m, m);
-        log.Record(12, None, m, m);
 
-        // The replay is contiguous by construction, so a missing 11 inside [10, 12] is a broken invariant in
-        // the observing seam. Skipping it would silently shrink the validation set.
+        // Coverage is stated as an INTERVAL. If the observer ever skipped a version, the interval would claim
+        // coverage of a version nothing read — the exact shape of a silently-narrowed validation set. Reject
+        // it at RECORD time, where it is unambiguous, rather than reasoning about it at consumption.
         DeltaProtocolException error =
-            Assert.Throws<DeltaProtocolException>(() => log.TryGetProvenObservation(11, out _));
+            Assert.Throws<DeltaProtocolException>(() => log.Record(12, None, m, m));
 
+        Assert.Contains("12", error.Message, StringComparison.Ordinal);
         Assert.Contains("11", error.Message, StringComparison.Ordinal);
+        AssertPathFree(error.Message);
+    }
+
+    [Fact]
+    public void TheCoveredSetIsExactlyTheContiguousIntervalObserved()
+    {
+        var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
+        MetadataAction m = Meta("t");
+        Assert.False(log.HasCoverage);
+
+        log.Record(31, None, m, m);
+        log.Record(32, None, m, m);
+        log.Record(33, None, m, m);
+
+        Assert.True(log.HasCoverage);
+        Assert.Equal(31, log.CoveredFromInclusive);
+        Assert.Equal(34, log.CoveredToExclusive);
+        Assert.False(log.TryGetProvenObservation(30, out _));
+        Assert.True(log.TryGetProvenObservation(31, out _));
+        Assert.True(log.TryGetProvenObservation(33, out _));
+        Assert.False(log.TryGetProvenObservation(34, out _));
+    }
+
+    [Fact]
+    public void SilentVersionsCostNoDictionaryEntry_SoRetentionIsOMetadataRevisionsNotOCommits()
+    {
+        // Council R1 (architect seat, low): storing one entry per replayed version would be ~48 B x history
+        // length per concurrent change-feed read. Coverage is an interval, so silence is free.
+        var log = new ReplayedMetadataLog(exclusiveUpperBound: 100_000);
+        MetadataAction m = Meta("t");
+        for (long v = 0; v < 10_000; v++)
+        {
+            log.Record(v, None, m, m);
+        }
+
+        Assert.Equal(0, log.RecordedObservationCount);
+        Assert.Equal(0, log.CoveredFromInclusive);
+        Assert.Equal(10_000, log.CoveredToExclusive);
+
+        MetadataAction next = Meta("next");
+        log.Record(10_000, new[] { next }, m, next);
+        Assert.Equal(1, log.RecordedObservationCount);   // one entry per METADATA REVISION, not per commit.
+    }
+
+    [Fact]
+    public void AWholesaleFailureToRecordMetadata_IsCaughtByTheWindowLineageCheck()
+    {
+        // The per-version check needs an entry to contradict. This models an observer that produced NO entry
+        // for the version that actually carried the metaData, so only the whole-window lineage cross-check can
+        // see it: the metadata the reconstruction ended on is not accounted for by anything recorded.
+        var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
+        MetadataAction before = Meta("before");
+        MetadataAction after = Meta("after");
+        log.Record(20, None, before, before);   // silent, no entry
+        log.Record(21, None, before, after);    // the metaData the observer failed to report
+
+        DeltaProtocolException error =
+            Assert.Throws<DeltaProtocolException>(() => log.TryGetProvenObservation(20, out _));
+
+        Assert.Contains("20", error.Message, StringComparison.Ordinal);
         AssertPathFree(error.Message);
     }
 

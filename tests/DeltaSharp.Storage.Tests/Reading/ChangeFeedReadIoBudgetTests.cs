@@ -57,8 +57,11 @@ public sealed class ChangeFeedReadIoBudgetTests : IDisposable
     [Fact]
     public async Task Cdf_ReadOverLongRetainedHistory_ListsTheLogOnce_AndReadsNoCommitAThirdTime()
     {
-        // #691 budget pin. History: v0 (protocol + metaData) .. v40; the CDF range is [40, 40], so the
-        // pre-range window is [0, 39] — 39 commits the pre-range identity gate must cover.
+        // #691 budget pin for the BEST case: a checkpoint-FREE history, where the start-snapshot replay begins
+        // at v0 and therefore covers the whole pre-range window. Real tables are checkpointed — see
+        // Cdf_ReadOverACheckpointedHistory_* for the representative layout and the honest numbers. History:
+        // v0 (protocol + metaData) .. v40; the CDF range is [40, 40], so the pre-range window is [0, 39] — 39
+        // commits the pre-range identity gate must cover.
         //
         // BEFORE (main @ a6ff45f), the READ phase issued 4 log LISTs and 123 commit GETs:
         //     end snapshot  : 1 LIST + 41 GETs   (replay 0..40)
@@ -99,6 +102,60 @@ public sealed class ChangeFeedReadIoBudgetTests : IDisposable
         for (long v = 1; v < latest; v++)
         {
             Assert.Equal(2, counting.CommitReadsOf(v));   // the two reconstructions only — no gate re-read.
+        }
+    }
+
+    [Fact]
+    public async Task Cdf_ReadOverACheckpointedHistory_ListsTheLogOnce_AndOnlyReReadsBelowTheCheckpointFloor()
+    {
+        // #691 budget pin for the REPRESENTATIVE layout (council R1, architect seat). Every table Spark and
+        // delta-rs write is checkpointed (default interval 10), so the checkpoint-FREE fixture above — where
+        // the start-snapshot replay happens to cover the entire pre-range window and the gate's own GETs fall
+        // to zero — is the optimization's BEST case, not its typical one. Here `checkpoint@30` splits the
+        // pre-range window: both reconstructions seed at 30 and replay only 31..40, so the gate can reuse
+        // observations for 31..39 and must still READ 1..30 itself.
+        //
+        //                         main @ a6ff45f   this PR
+        //   log LISTs                          4         1     (universal: threading the resolution's listing)
+        //   commit GETs                       61        52     (-15%)
+        //     of which the gate's own         40        31     (-22%)
+        //
+        // The LIST reduction is layout-independent. The GET reduction is NOT: it is bounded by how much of the
+        // pre-range window the replay covers, i.e. by the checkpoint interval — so for a long retained history
+        // the scan is asymptotically unchanged. This test exists so that DOMINANT term (the below-floor scan)
+        // is pinned rather than invisible: a regression that doubled it would be caught here.
+        const int latest = 40;
+        using var local = new LocalFileSystemBackend(_root);
+        await WriteLongHistoryAsync(local, latest, forgedIdentityAtVersion: null);
+        await WriteCheckpointAtAsync(local, 30);
+
+        var counting = new CountingStorageBackend(local);
+        var log = new DeltaLog(counting);
+        var reader = new ChangeFeedReader(counting, "io-budget", log, new ParquetFileReader());
+
+        DeltaChangeFeedInfo info = await reader.ResolveAsync(
+            DeltaChangeFeedRange.FromVersion(latest, latest), CancellationToken.None);
+        counting.Reset();
+
+        await foreach (ColumnBatch batch in reader.ReadAsync(info, CancellationToken.None))
+        {
+            _ = batch;
+        }
+
+        Assert.Equal(1, counting.LogListings);
+
+        // 10 (end replay 31..40) + 10 (start replay 31..40) + 1 (baseline snapshot at v0)
+        // + 30 (the gate's own reads of 1..30, which NO replay reaches) + 1 (in-range read of v40) = 52.
+        Assert.Equal(52, counting.CommitReads);
+        Assert.Equal(1, counting.CommitReadsOf(0));                     // baseline snapshot only
+        for (long v = 1; v <= 30; v++)
+        {
+            Assert.Equal(1, counting.CommitReadsOf(v));                 // below the floor: the gate reads it once
+        }
+
+        for (long v = 31; v < latest; v++)
+        {
+            Assert.Equal(2, counting.CommitReadsOf(v));                 // two reconstructions; the gate reuses
         }
     }
 
@@ -272,11 +329,11 @@ public sealed class ChangeFeedReadIoBudgetTests : IDisposable
 
         // Observed: the fused change-feed start load, which threads a ReplayedMetadataLog through the SAME
         // reconstruction and then runs the pre-range gate off its observations.
-        (Snapshot End, DeltaLog.LogListing Listing) end =
-            await log.LoadSnapshotWithListingAsync(latest, CancellationToken.None);
+        (Snapshot End, DeltaLog.ChangeFeedEndView View) end =
+            await log.LoadChangeFeedEndViewAsync(latest, CancellationToken.None);
         counting.Reset();
         Snapshot observed = await log.LoadChangeFeedStartSnapshotAsync(
-            end.Listing, 30, end.End.Metadata, CancellationToken.None);
+            end.View, 30, CancellationToken.None);
         int observedCommitReads = counting.CommitReads;
 
         Assert.Equal(unobserved.Version, observed.Version);

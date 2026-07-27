@@ -261,11 +261,10 @@ internal sealed class ChangeFeedReader
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         OutputContext ctx;
-        MetadataAction endMetadata;
-        DeltaLog.LogListing logListing;
+        DeltaLog.ChangeFeedEndView endView;
         try
         {
-            (ctx, endMetadata, logListing) = await BuildOutputContextAsync(info, cancellationToken).ConfigureAwait(false);
+            (ctx, endView) = await BuildOutputContextAsync(info, cancellationToken).ConfigureAwait(false);
         }
         catch (DeltaProtocolException ex)
         {
@@ -289,7 +288,10 @@ internal sealed class ChangeFeedReader
         // here (#691), driven off the listing the END snapshot above was reconstructed from. The gate's
         // coverage, order, and fail-closed messages are unchanged (see
         // `DeltaLog.LoadChangeFeedStartSnapshotAsync`), and it still runs to completion BEFORE the replay loop
-        // below reads any change/data file or yields any batch. The explicit path validates each cdc file's
+        // below reads any change/data file or yields any batch. FAIL ORDER did change: the start-snapshot
+        // reconstruction now runs before the identity gate (it feeds it), so a log that is both
+        // protocol-illegal at `start` and identity-forged earlier surfaces the protocol error rather than the
+        // identity error. Both are fail-closed and path-free; only which one wins changed. The explicit path validates each cdc file's
         // decoded leaf schema against THAT version's own log-resident metadata — the trusted authority —
         // BEFORE any row is yielded, so a hostile/inconsistent cdc file whose columns disagree with its
         // version fails closed rather than surfacing attacker-chosen columns. We track the prevailing metadata
@@ -299,7 +301,7 @@ internal sealed class ChangeFeedReader
         try
         {
             Snapshot startSnapshot = await _log.LoadChangeFeedStartSnapshotAsync(
-                logListing, info.StartVersion, endMetadata, cancellationToken).ConfigureAwait(false);
+                endView, info.StartVersion, cancellationToken).ConfigureAwait(false);
             currentMetadata = startSnapshot.Metadata;
         }
         catch (DeltaProtocolException ex)
@@ -308,9 +310,12 @@ internal sealed class ChangeFeedReader
         }
         catch (DeltaStorageException ex)
         {
+            // Covers BOTH halves of the fused call (#691): the start-snapshot reconstruction and the
+            // pre-range validation scan. Named jointly so on-call is not told "pre-range validation" for a
+            // fault raised while reconstructing the start version itself.
             throw new DeltaReadException(
-                $"A change-feed pre-range validation read failed (storage fault: {ex.Kind}); the requested "
-                + "change-feed range failed closed.", ex);
+                $"A change-feed start-snapshot load or pre-range validation read failed (storage fault: "
+                + $"{ex.Kind}); the requested change-feed range failed closed.", ex);
         }
 
         // `_commit_timestamp` is pinned at RESOLVE time (item 4 / query-exec L2): LoadChangeFeedAsync captured
@@ -331,7 +336,7 @@ internal sealed class ChangeFeedReader
         ColumnMappingIdentity currentIdentity;
         try
         {
-            endIdentity = ColumnMappingIdentity.FromMetadata(endMetadata);
+            endIdentity = ColumnMappingIdentity.FromMetadata(endView.EndMetadata);
             currentIdentity = ColumnMappingIdentity.FromMetadata(currentMetadata);
         }
         catch (Exception ex) when (ex is SchemaValidationException or DeltaProtocolException)
@@ -638,16 +643,23 @@ internal sealed class ChangeFeedReader
                 $"Change feed version {version}'s commit log is no longer available (log cleanup removed it "
                 + "between range resolution and read); the requested range is outside the CDF-readable window.");
 
-    private async Task<(OutputContext Ctx, MetadataAction EndMetadata, DeltaLog.LogListing Listing)> BuildOutputContextAsync(
+    private async Task<(OutputContext Ctx, DeltaLog.ChangeFeedEndView EndView)> BuildOutputContextAsync(
         DeltaChangeFeedInfo info, CancellationToken cancellationToken)
     {
-        // Take the END snapshot AND the single `_delta_log` listing it was reconstructed from (#691): the
-        // pre-range column-mapping identity gate and the start-snapshot load are then driven off that SAME
-        // listing rather than re-listing the log twice more. Beyond the saved LISTs this is strictly safer —
-        // the pre-range window the gate validates is provably co-extensive with the log view the end identity
-        // it compares against came from, instead of a second view a concurrent log cleanup could have shrunk.
-        (Snapshot end, DeltaLog.LogListing listing) =
-            await _log.LoadSnapshotWithListingAsync(info.EndVersion, cancellationToken).ConfigureAwait(false);
+        // Take the END snapshot AND the single `_delta_log` listing it was reconstructed from, bound together
+        // in a `ChangeFeedEndView` only DeltaLog can mint (#691): the pre-range column-mapping identity gate
+        // and the start-snapshot load are then driven off that SAME listing rather than re-listing the log
+        // twice more, and the pairing is structural rather than a caller convention.
+        //
+        // Beyond the saved LISTs this is COVERAGE-SAFER: log cleanup only DELETES, so this (earlier) listing's
+        // commit set is a superset of any later one's, and the gate can therefore only validate MORE than a
+        // freshly listed view would. It is AVAILABILITY-COSTLIER: the listing is now consumed over one long
+        // window instead of three short ones, so a commit that concurrent cleanup removes between the listing
+        // and the gate's read of it fails the read closed instead of being silently absent from a re-listing.
+        // That trade is deliberate — a gate that exists to fail closed on anything it cannot verify should
+        // prefer a hard error to a quietly narrowed window.
+        (Snapshot end, DeltaLog.ChangeFeedEndView endView) =
+            await _log.LoadChangeFeedEndViewAsync(info.EndVersion, cancellationToken).ConfigureAwait(false);
         StructType tableSchema = end.Schema;
         ColumnMappingMode mode = ColumnMapping.ResolveMode(end.Metadata.Configuration);
         bool resolveByFieldId = mode == ColumnMappingMode.Id;
@@ -657,14 +669,14 @@ internal sealed class ChangeFeedReader
             ColumnMappingProjection.BuildDataSchema(tableSchema, physicalNames, partitionColumns);
         int[] dataOrdinalByField = ColumnMappingProjection.MapDataOrdinals(physicalNames, physicalDataSchema);
         bool allowTypeWideningPromotion = TypeWideningFeature.Supports(end.Protocol);
-        // Return the end MetadataAction and the log LISTING alongside `ctx` so the caller can drive the #671
-        // full-history column-mapping IDENTITY-immutability check — and the start-snapshot load it is fused
-        // with (#691) — off the SAME end snapshot's metadata (mode + schema field ids/physical names +
-        // partition columns) that `ctx` was derived from, and off the SAME log view.
+        // Return the END VIEW alongside `ctx` so the caller can drive the #671 full-history column-mapping
+        // IDENTITY-immutability check — and the start-snapshot load it is fused with (#691) — off the SAME end
+        // snapshot's metadata (mode + schema field ids/physical names + partition columns) that `ctx` was
+        // derived from, and off the SAME log view. The view carries both, so they cannot be mismatched.
         var ctx = new OutputContext(
             info.Schema, tableSchema, physicalDataSchema, physicalNames, dataOrdinalByField, resolveByFieldId,
             mode, allowTypeWideningPromotion);
-        return (ctx, end.Metadata, listing);
+        return (ctx, endView);
     }
 
     // §3.2 CDF-EE-08: builds the version's expected PHYSICAL data-leaf schema from its log-resident metadata

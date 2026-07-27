@@ -509,25 +509,66 @@ internal sealed class DeltaLog
     /// retained pre-range commit — including a stray surviving strictly below a compacting checkpoint floor,
     /// which the replay never touches. Validation order is unchanged (baseline first, then ascending
     /// versions), so the fail-closed message still names the same version.</para>
-    /// <para>Because the gate now runs off the caller's listing, the pre-range window it validates is provably
-    /// co-extensive with the log view the END identity itself came from, rather than a second, independently
-    /// listed view that a concurrent log cleanup could have shrunk between the two listings.</para>
+    /// <para><b>Log-view coupling.</b> Because the gate runs off the listing carried by
+    /// <paramref name="endView"/>, the pre-range window it validates is provably co-extensive with the log
+    /// view the END identity it compares against came from — the <see cref="ChangeFeedEndView"/> type makes
+    /// that a structural property rather than a caller convention. That is COVERAGE-SAFER (log cleanup only
+    /// deletes, so the earlier listing's commit set is a SUPERSET of any later one's, and the gate can only
+    /// validate more), but it is AVAILABILITY-COSTLIER: the listing is now consumed over one long window
+    /// instead of three short ones, so a commit that concurrent cleanup deletes between the listing and the
+    /// gate's read of it surfaces as a fail-closed read error rather than being silently absent from a fresh
+    /// listing. That trade is deliberate — the gate exists to fail closed on anything it cannot verify.</para>
+    /// <para><b>Fail ORDER changed (#691).</b> The start-snapshot reconstruction now runs BEFORE the pre-range
+    /// gate (it is what feeds it). On a log that is BOTH protocol-illegal at the start version and forged
+    /// earlier in history, the surfaced error is now the protocol/feature error rather than the identity
+    /// error, so the "names the offending version" contract of the identity gate does not apply on that path.
+    /// Both are fail-closed and both are path-free; only which one wins changed.</para>
     /// </summary>
     /// <exception cref="DeltaProtocolException">The start version is out of range / no longer retained, the
-    /// log has a gap, a retained commit is malformed, or a retained version before the range declares a
-    /// different (or unrecognized) column-mapping identity.</exception>
+    /// log has a gap, a retained commit is malformed, the reconstruction did not land on the requested start
+    /// version, or a retained version before the range declares a different (or unrecognized) column-mapping
+    /// identity.</exception>
     internal async Task<Snapshot> LoadChangeFeedStartSnapshotAsync(
-        LogListing listing, long rangeStartVersion, MetadataAction endMetadata, CancellationToken cancellationToken)
+        ChangeFeedEndView endView, long rangeStartVersion, CancellationToken cancellationToken)
     {
         // Only PRE-range versions are observed: [start, end] is the reader's per-version gate, and bounding the
         // observation keeps the retained metadata proportional to the pre-range history's metadata revisions.
         long startTimestamp = Stopwatch.GetTimestamp();
         var replayed = new ReplayedMetadataLog(rangeStartVersion);
         Snapshot startSnapshot = await LoadSnapshotFromListingAsync(
-            listing, rangeStartVersion, startTimestamp, replayed, cancellationToken).ConfigureAwait(false);
+            endView.Listing, rangeStartVersion, startTimestamp, replayed, cancellationToken)
+            .ConfigureAwait(false);
+
+        // The observer's exclusive upper bound is the REQUESTED start version, while the replay stops at the
+        // version target resolution landed on. They are equal for a valid explicit version (the resolver is
+        // the identity there — only the timestamp path clamps), but that equality is an assumption, and if it
+        // ever drifted the failure mode would be a silent COVERAGE hole, not a compile error. Assert it.
+        if (startSnapshot.Version != rangeStartVersion)
+        {
+            throw DeltaProtocolException.Inconsistent(string.Create(
+                CultureInfo.InvariantCulture,
+                $"A change-feed start-snapshot load for version {rangeStartVersion} reconstructed version "
+                + $"{startSnapshot.Version} instead; the pre-range validation window can no longer be proven "
+                + $"to match the range, so the read fails closed."));
+        }
+
         await ValidateColumnMappingIdentityStableBeforeAsync(
-            listing, rangeStartVersion, endMetadata, replayed, cancellationToken).ConfigureAwait(false);
+            endView.Listing, rangeStartVersion, endView.EndMetadata, replayed, cancellationToken)
+            .ConfigureAwait(false);
         return startSnapshot;
+    }
+
+    /// <summary>Loads the change-feed range's END snapshot together with the single <c>_delta_log</c> listing
+    /// it was reconstructed from, minting the <see cref="ChangeFeedEndView"/> that
+    /// <see cref="LoadChangeFeedStartSnapshotAsync"/> consumes. The view exists so "this end metadata and this
+    /// listing came from the SAME snapshot load" is enforced by the type system rather than by a caller
+    /// convention over two unrelated parameters.</summary>
+    internal async Task<(Snapshot End, ChangeFeedEndView View)> LoadChangeFeedEndViewAsync(
+        long? version, CancellationToken cancellationToken)
+    {
+        (Snapshot Snapshot, LogListing Listing) load =
+            await LoadSnapshotWithListingAsync(version, cancellationToken).ConfigureAwait(false);
+        return (load.Snapshot, ChangeFeedEndView.From(load));
     }
 
     /// <summary>
@@ -911,6 +952,34 @@ internal sealed class DeltaLog
 
     /// <summary>A resolved checkpoint to seed from: its <see cref="Version"/> and ordered part paths.</summary>
     private sealed record CheckpointSelection(long Version, IReadOnlyList<string> PartPaths);
+
+    /// <summary>
+    /// The END-of-range view a change-feed read validates against: the end snapshot's <c>metaData</c> AND the
+    /// single <c>_delta_log</c> listing that snapshot was reconstructed from, bound together (#691, council
+    /// R1 item 6). Only <see cref="LoadChangeFeedEndViewAsync"/> can mint one, so a caller cannot accidentally
+    /// pair an end identity with a listing from a DIFFERENT log view — the "provably co-extensive" claim the
+    /// pre-range gate's coverage argument rests on is structural, not a convention.
+    /// </summary>
+    internal readonly struct ChangeFeedEndView
+    {
+        private ChangeFeedEndView(MetadataAction endMetadata, LogListing listing)
+        {
+            EndMetadata = endMetadata;
+            Listing = listing;
+        }
+
+        /// <summary>The end snapshot's <c>metaData</c> — the identity every earlier version is compared to.</summary>
+        internal MetadataAction EndMetadata { get; }
+
+        /// <summary>The log listing that same end snapshot was reconstructed from.</summary>
+        internal LogListing Listing { get; }
+
+        /// <summary>The ONLY way to build one: the end metadata is DERIVED from the snapshot in the same
+        /// <see cref="LoadSnapshotWithListingAsync"/> result the listing came from, so the pair cannot be
+        /// assembled from two unrelated log views. The constructor itself is private.</summary>
+        internal static ChangeFeedEndView From((Snapshot Snapshot, LogListing Listing) load) =>
+            new(load.Snapshot.Metadata, load.Listing);
+    }
 
     /// <summary>The discovered <c>_delta_log</c> contents: commit versions, each commit object's modification
     /// time (the timestamp-time-travel source, design §2.12.1), classic checkpoint groups, the latest
