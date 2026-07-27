@@ -56,16 +56,25 @@ internal static class DiagnosticText
         // feature key, an ordinary SQL identifier. #696 also calls this per-row-group x per-nested-column, so
         // an unconditional StringBuilder allocation (measured 160 bytes/call) shows up as real Gen0 pressure on
         // a hot path that previously allocated nothing. Verify the input is already within budget and free of
-        // anything the slow path would rewrite, then hand back the SAME instance. Surrogates bail to the slow
-        // path even when the pair is well-formed (where it would copy them verbatim): pair validation is the
-        // slow path's job, and keeping the fast path a single flat scan keeps it obviously equivalent.
+        // anything the slow path would rewrite, then hand back the SAME instance.
+        //
+        // LOAD-BEARING, do not "optimize" this into a specialized inline scan: the fast path is safe precisely
+        // because it calls THE SAME IsInjectionUnsafe predicate as the slow path rather than restating the
+        // rule. That sharing IS the control. A hand-inlined character test here would be a second statement of
+        // the rule that the compiler cannot keep in sync — exactly the drift this file exists to prevent.
+        //
+        // Surrogates bail to the slow path even when the pair is well-formed (where the slow path may keep it
+        // verbatim): pair validation and astral classification are the slow path's job, and keeping this a
+        // single flat scan over code UNITS keeps its equivalence inspectable rather than argued. The
+        // short-circuit order also matters — char.IsSurrogate runs first, so the Rune constructor below never
+        // sees a surrogate (it would throw).
         if (raw.Length <= maxLength)
         {
             bool clean = true;
             for (int i = 0; i < raw.Length; i++)
             {
                 char c = raw[i];
-                if (IsInjectionUnsafe(c) || char.IsSurrogate(c))
+                if (char.IsSurrogate(c) || IsInjectionUnsafe(new Rune(c)))
                 {
                     clean = false;
                     break;
@@ -96,20 +105,16 @@ internal static class DiagnosticText
             char c = raw[i];
             if (char.IsHighSurrogate(c))
             {
-                // A valid high+low surrogate pair (both within the cap — the cap back-off above guarantees a
-                // high surrogate is never the last retained char) is a legal astral code point. It must still
-                // be CATEGORY-CHECKED: Cc/Zl/Zp are entirely BMP, but Cf is NOT — U+E0020–U+E007F (the TAG
-                // block) encodes arbitrary ASCII invisibly, which is the canonical invisible-text smuggling
-                // vector and a strictly stronger instance of "make the log lie" than the U+202E this primitive
-                // already neutralizes. U+110BD, U+110CD, U+13430–U+1343F, U+1BCA0–U+1BCA3 and
-                // U+1D173–U+1D17A are astral Cf too. A hostile `_delta_log` JSON string can carry any UTF-16,
-                // so this is reachable. A high surrogate NOT followed by a low surrogate is a LONE (malformed)
-                // surrogate — neutralize it.
+                // A high surrogate followed by a low surrogate (both within the cap — the back-off above
+                // guarantees a high surrogate is never the last retained char) is a well-formed astral CODE
+                // POINT. Decode it and run the SAME classification every other code point gets: an astral
+                // format character is neutralized to a single U+FFFD (one replacement for the code point, not
+                // one per code unit), and legitimate astral text — emoji, CJK extensions — is kept verbatim.
+                // A high surrogate NOT followed by a low surrogate is a LONE (malformed) surrogate.
                 if (i + 1 < cap && char.IsLowSurrogate(raw[i + 1]))
                 {
-                    var rune = new Rune(c, raw[i + 1]);
-                    if (Rune.GetUnicodeCategory(rune) is UnicodeCategory.Control or UnicodeCategory.Format
-                            or UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator)
+                    var pair = new Rune(c, raw[i + 1]);
+                    if (IsInjectionUnsafe(pair))
                     {
                         builder.Append('\uFFFD');
                         i++;
@@ -134,7 +139,7 @@ internal static class DiagnosticText
                 continue;
             }
 
-            builder.Append(IsInjectionUnsafe(c) ? '\uFFFD' : c);
+            builder.Append(IsInjectionUnsafe(new Rune(c)) ? '\uFFFD' : c);
         }
 
         if (truncated)
@@ -191,37 +196,49 @@ internal static class DiagnosticText
         return builder.ToString();
     }
 
-    // A character is neutralized if it is a C0/C1 control (category Cc — CR/LF/NUL/tab/NEL), a Unicode
-    // LINE/PARAGRAPH SEPARATOR (U+2028/U+2029, categories Zl/Zp) which several renderers and log viewers treat
-    // as a newline, or a FORMAT character (category Cf).
+    // THE RULE, stated exactly once. A code point is neutralized if it is a C0/C1 control (category Cc —
+    // CR/LF/NUL/tab/NEL), a Unicode LINE or PARAGRAPH SEPARATOR (U+2028/U+2029, categories Zl/Zp) which
+    // several renderers and log viewers treat as a newline, or a FORMAT character (category Cf).
+    //
+    // The parameter is a Rune, not a char, ON PURPOSE. A char is a UTF-16 code UNIT, and a code-unit predicate
+    // structurally CANNOT classify an astral code point — a surrogate is category Cs, never Cf, so a char-wise
+    // test silently answers "safe" for every astral character no matter what the rule says. Cc, Zl and Zp are
+    // entirely BMP, so a code-unit predicate happened to be complete for them; Cf is not (the TAG block
+    // U+E0020–U+E007F, U+110BD, U+110CD, U+13430–U+1343F, U+1BCA0–U+1BCA3, U+1D173–U+1D17A), and adding Cf
+    // therefore turned a complete rule into a half-implemented one. Taking a Rune makes the model match the
+    // domain, so BOTH loops below and the fast path share one definition and there is nothing to keep in sync.
+    // A comment saying "remember to mirror this" is not a control; a single call site is.
     //
     // Cf matters even though it cannot forge a new log RECORD, because it serves the same objective this
     // primitive exists to defeat — making the log lie. U+202E (RTL override) visually reverses the remainder of
     // a rendered line, so an attacker can make a hostile token read as something else entirely during incident
     // triage; U+200B/U+200E/U+FEFF/U+00AD hide or silently reorder text in exactly the surfaces (log viewers,
-    // terminals, issue trackers) a fault message is read in.
+    // terminals, issue trackers) a fault message is read in. The TAG block is worse still: it renders as
+    // NOTHING AT ALL, so an operator pasting a message into a ticket carries an invisible arbitrary-ASCII
+    // payload along with it — strictly more deceptive than U+202E, which at least looks odd.
     //
     // DELIBERATE TRADE, do not "fix" this back: U+200D (ZWJ) and U+200C (ZWNJ) are also Cf and ARE semantically
     // required for correct Indic/Arabic shaping and emoji sequences, so a blanket Cf ban slightly degrades how
-    // an exotic-but-legitimate identifier RENDERS. That trade is right here for two reasons. (1) A diagnostic
+    // an exotic-but-legitimate identifier RENDERS. That trade is right here for three reasons. (1) A diagnostic
     // message is not a text-rendering surface — it is prose read by a human triaging a failure, and a
     // zero-width joiner carries no information a reader can act on, while an RTL override actively misleads
     // them. (2) The raw value is never lost: it stays verbatim on the typed, machine-readable channel
     // (AnalysisException.Reference/RootColumn/Candidates, SqlToken.Text), which is what any caller that needs
-    // the exact bytes should read. Neutralizing the whole category keeps the rule stated in one place and
-    // trivially auditable, rather than an allow-list that must be revisited each Unicode revision.
+    // the exact bytes should read. (3) THE CATEGORY IS THE STABLE CONTRACT. Carving out an allow-list for
+    // ZWJ/ZWNJ would have to be re-audited against every Unicode revision as new format characters are
+    // assigned; "the category" does not. Security's round-3 sweep is the evidence — U+061C, U+0600, U+2060,
+    // U+2069 and U+FFF9–U+FFFB were all neutralized without anyone having thought of them, precisely because
+    // this is a category test and not a list.
     //
-    // SCOPE: this predicate takes a `char`, so it only decides BMP code points. Cc/Zl/Zp are entirely BMP, so
-    // for those it IS the whole rule — but Cf is not: the TAG block U+E0020–U+E007F, U+110BD, U+110CD,
-    // U+13430–U+1343F, U+1BCA0–U+1BCA3 and U+1D173–U+1D17A are all astral Format characters. The astral half
-    // of the same rule therefore lives in Sanitize's surrogate-pair branch, which category-checks the decoded
-    // Rune against the identical four categories. Any change to the set below MUST be mirrored there:
-    // a half-implemented Cf control is worse than no Cf control, because it documents a guarantee that
-    // quietly does not hold.
-    private static bool IsInjectionUnsafe(char c) =>
-        char.IsControl(c)
-        || char.GetUnicodeCategory(c)
-            is UnicodeCategory.LineSeparator
+    // OUT OF SCOPE, deliberately: combining marks (category Mn — "Zalgo" stacking). A stacked payload does
+    // survive, but it is hard-bounded by the length caps every caller applies (128 per token, 512 for a parse
+    // diagnostic, 1024 for an analysis one), the harm is a transient visual smear rather than forgery or
+    // smuggling, and unlike Cf the category is genuinely required for ordinary text in many scripts. Cf earns a
+    // blanket ban because its legitimate uses are invisible-by-design; Mn does not.
+    private static bool IsInjectionUnsafe(Rune rune) =>
+        Rune.GetUnicodeCategory(rune)
+            is UnicodeCategory.Control
+                or UnicodeCategory.LineSeparator
                 or UnicodeCategory.ParagraphSeparator
                 or UnicodeCategory.Format;
 }

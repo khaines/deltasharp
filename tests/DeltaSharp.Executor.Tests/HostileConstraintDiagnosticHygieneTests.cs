@@ -144,6 +144,23 @@ public sealed class HostileConstraintDiagnosticHygieneTests : IDisposable
     }
 
     [Fact]
+    public void HostileCheckPredicate_SecurityAstralRepro_SurfacesNoInvisiblePayload_AndFailsClosed()
+    {
+        // Security's round-3 parser repro, pinned verbatim. Pre-fix:
+        //   E2E_AstralFormatChars_Parser_StillReachTheSink
+        //     … unexpected trailing input 'TRAIL<U+E0001><U+1BCA0>FORGED'
+        // Two different astral Cf blocks in one token, so this also covers the non-TAG astral ranges.
+        string table = Table("security-astral");
+        SeedWithHostileConstraint(table, "other > 0 `TRAIL\U000E0001\U0001BCA0FORGED`");
+
+        Exception ex = Assert.ThrowsAny<Exception>(() => Append(table, Amounts(1)));
+
+        AssertChainIsHygienic(ex);
+        Assert.Contains("TRAIL\uFFFD\uFFFDFORGED", ex.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(CommitFile(table, 2)));
+    }
+
+    [Fact]
     public void WellFormedCheckPredicate_StillEnforced_ControlIsolatesTheHygieneChange()
     {
         // Control: the hygiene change must not disturb normal enforcement — a well-formed CHECK still parses,

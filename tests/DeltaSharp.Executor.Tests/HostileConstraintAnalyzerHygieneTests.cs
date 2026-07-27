@@ -150,6 +150,32 @@ public sealed class HostileConstraintAnalyzerHygieneTests : IDisposable
     }
 
     [Fact]
+    public void HostileLiteral_SecurityAstralRepro_SurfacesNoInvisiblePayload_AndFailsClosed()
+    {
+        // Security's round-3 repro, pinned verbatim. Pre-fix, through the PUBLIC write door with a hostile
+        // `_delta_log`:
+        //   E2E_AstralFormatChars_StillReachTheSink
+        //     QueryExecutionException len=202 :: cannot resolve
+        //     '(amount > "A<U+E0001><U+E0046><U+E004F><U+E0052><U+E0047><U+E0045><U+E0044>OK")'
+        // "FORGED" is spelled in the TAG block, so the message read as `A…OK` in every viewer while carrying
+        // the word invisibly. That is strictly more deceptive than U+202E, which at least looks odd.
+        string table = Table("security-astral");
+        SeedWithHostileConstraint(
+            table,
+            "amount > 'A\U000E0046\U000E004F\U000E0052\U000E0047\U000E0045\U000E0044OK'");
+
+        Exception ex = Assert.ThrowsAny<Exception>(() => Append(table, Amounts(1)));
+
+        AssertChainIsHygienic(ex);
+        Assert.Contains("data type mismatch", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(ex.Message.EnumerateRunes(), r => r.Value is >= 0xE0000 and <= 0xE007F);
+
+        // The visible text is unchanged, so the neutralization is legible rather than silent.
+        Assert.Contains("A\uFFFD\uFFFD\uFFFD\uFFFD\uFFFD\uFFFDOK", ex.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(CommitFile(table, 2)));
+    }
+
+    [Fact]
     public void HostileLiteral_InsideNotOperand_SurfacesHygienicMessage_AndFailsClosed()
     {
         // A second analyzer throw site (ExpressionCoercion.RequireBoolean), reached without any comparison —
