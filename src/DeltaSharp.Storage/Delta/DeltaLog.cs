@@ -552,6 +552,12 @@ internal sealed class DeltaLog
                 + $"to match the range, so the read fails closed."));
         }
 
+        // Close the observation phase BEFORE anything consumes it: sealing runs the whole-window cross-checks
+        // once over the COMPLETE window and makes Record/TryGetProvenObservation mutually exclusive phases, so
+        // a future change that interleaved replay with validation cannot evaluate a whole-window predicate
+        // over a partial window (council R2).
+        replayed.Seal();
+
         await ValidateColumnMappingIdentityStableBeforeAsync(
             endView.Listing, rangeStartVersion, endView.EndMetadata, replayed, cancellationToken)
             .ConfigureAwait(false);

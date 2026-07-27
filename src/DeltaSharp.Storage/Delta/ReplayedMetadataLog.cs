@@ -30,12 +30,18 @@ namespace DeltaSharp.Storage.Delta;
 /// <c>metaData</c> where it did not) is rejected fail-closed at CONSUMPTION time by
 /// <see cref="EnsureObservationMatchesReplayedState"/>. Absence of a record therefore means "neither signal
 /// fired", not "the observer chose to say nothing".</description></item>
-/// <item><description><b>Corroborated lineage (whole window).</b> Independently of any single version, the
-/// prevailing metadata at the START of the covered interval and at its END moved if and only if some covered
-/// version carried a <c>metaData</c>, and a lineage that moved must be accounted for by a recorded
-/// <c>metaData</c> whose applied result IS the metadata the window ends on
-/// (<see cref="EnsureLineageIsAccountedFor"/>). This catches a WHOLESALE failure to record, which leaves no
-/// per-version entry to contradict.</description></item>
+/// <item><description><b>Corroborated lineage (whole window).</b> Independently of any single version, and
+/// checked once when the window is <see cref="Seal">sealed</see>: the prevailing metadata at the START of the
+/// covered interval and at its END moved if and only if some covered version carried a <c>metaData</c>; a
+/// lineage that moved must be accounted for by a recorded <c>metaData</c> whose applied result IS the metadata
+/// the window ends on; AND the recorded observations must form an unbroken CHAIN from the window's opening
+/// metadata to its closing metadata (<see cref="EnsureLineageIsAccountedFor"/>). The chain conjunct is what
+/// makes silence safe under a SPARSE dictionary: because an unrecorded covered version is by definition one
+/// that neither carried a <c>metaData</c> nor moved the state, an omitted revision necessarily shows up as a
+/// break between two recorded links — even when the omission is compounded by an equalised before/after
+/// witness, which defeats every per-version check. Together these catch a WHOLESALE failure to record and a
+/// PARTIAL omission of a non-final revision, neither of which leaves a per-version entry to
+/// contradict.</description></item>
 /// </list>
 ///
 /// <para><b>Single extraction site.</b> <see cref="MetadataActionsOf"/> is the ONE place a commit's
@@ -48,8 +54,17 @@ namespace DeltaSharp.Storage.Delta;
 /// occupies a dictionary entry. Retention is therefore O(METADATA REVISIONS in the observed window), one entry
 /// for a normal table, NOT O(commits); and never the file actions, which dominate a commit's size.</para>
 ///
-/// <para>An observer defect can consequently cost AVAILABILITY (a fail-closed read) or PERFORMANCE (a disk
-/// fallback) — never COVERAGE. Fail-closed messages are path-free (#653): they name ONLY versions.</para>
+/// <para><b>Scope of the guarantee.</b> An observer defect costs AVAILABILITY (a fail-closed read) or
+/// PERFORMANCE (a disk fallback), not COVERAGE, for any defect that leaves the reconstruction's own metadata
+/// lineage intact — which includes every single-point defect at the observation site (under-reporting,
+/// over-reporting, wholesale non-recording, a non-contiguous or post-seal hand-over, and a partial omission of
+/// any revision including a non-final one). It is NOT an unconditional claim: an observer that fabricated a
+/// self-consistent lineage — omitting a revision AND rewriting the before/after witnesses of every surrounding
+/// record to close the chain over it — would defeat these cross-checks, because at that point the observation
+/// no longer describes the snapshot the reconstruction built. That is a different failure class from a
+/// regression in the replay path, and the disk-fallback default (anything outside the proven interval) is
+/// unaffected by it.</para>
+/// <para>Fail-closed messages are path-free (#653): they name ONLY versions.</para>
 /// </summary>
 internal sealed class ReplayedMetadataLog
 {
@@ -59,11 +74,17 @@ internal sealed class ReplayedMetadataLog
     // replayed metadata moved — the same set unless the observer is defective, which is precisely what the
     // consumption-time cross-checks must catch.
     private readonly Dictionary<long, ObservedCommit> _recorded = new();
+
+    // The recorded versions in the order they were handed over, which Record proves is strictly ascending and
+    // contiguous-within-the-window. The lineage CHAIN check walks this — a chain is order-sensitive, and
+    // deriving the order structurally (append order) rather than by sorting keys at read time means a future
+    // edit cannot quietly drop the ordering the check depends on.
+    private readonly List<long> _recordedVersions = new();
     private readonly long _exclusiveUpperBound;
 
     private MetadataAction? _lineageAtWindowStart;
     private MetadataAction? _lineageAtWindowEnd;
-    private bool _lineageChecked;
+    private bool _sealed;
 
     internal ReplayedMetadataLog(long exclusiveUpperBound) => _exclusiveUpperBound = exclusiveUpperBound;
 
@@ -148,6 +169,15 @@ internal sealed class ReplayedMetadataLog
         MetadataAction? prevailingBefore,
         MetadataAction? prevailingAfter)
     {
+        if (_sealed)
+        {
+            throw DeltaProtocolException.Inconsistent(string.Create(
+                CultureInfo.InvariantCulture,
+                $"A change-feed pre-range validation observation arrived for version {version} after the "
+                + $"observed window was sealed; the window's whole-window cross-checks were computed over a "
+                + $"different set, so the read fails closed."));
+        }
+
         if (version >= _exclusiveUpperBound)
         {
             return; // [start, end] is the reader's per-version gate; bounding the window bounds the retention.
@@ -176,7 +206,30 @@ internal sealed class ReplayedMetadataLog
         if (metadata.Count > 0 || !ReferenceEquals(prevailingBefore, prevailingAfter))
         {
             _recorded[version] = new ObservedCommit(metadata, prevailingBefore, prevailingAfter);
+            _recordedVersions.Add(version);
         }
+    }
+
+    /// <summary>
+    /// Closes the observation phase and runs the whole-window cross-checks ONCE, over the COMPLETE window.
+    /// The caller (<c>DeltaLog.LoadChangeFeedStartSnapshotAsync</c>) seals as soon as the reconstruction it
+    /// observed has returned. Sealing is what makes the phase separation structural rather than a convention:
+    /// <see cref="Record"/> fails closed after it and <see cref="TryGetProvenObservation"/> fails closed
+    /// before it, so a future change that interleaved observation with consumption — streaming the gate
+    /// alongside the replay, say — could not silently evaluate a whole-window predicate over a PARTIAL window
+    /// and reuse the answer.
+    /// </summary>
+    /// <exception cref="DeltaProtocolException">The observed window's metadata lineage is not accounted for by
+    /// the recorded observations.</exception>
+    internal void Seal()
+    {
+        if (_sealed)
+        {
+            return;
+        }
+
+        _sealed = true;
+        EnsureLineageIsAccountedFor();
     }
 
     /// <summary>
@@ -190,6 +243,14 @@ internal sealed class ReplayedMetadataLog
     internal bool TryGetProvenObservation(long version, out IReadOnlyList<MetadataAction> metadata)
     {
         metadata = None;
+        if (!_sealed)
+        {
+            throw DeltaProtocolException.Inconsistent(
+                "A change-feed pre-range validation observation was consumed before the observed window was "
+                + "sealed, so its whole-window cross-checks have not run over the complete window; the read "
+                + "fails closed.");
+        }
+
         if (!HasCoverage || version < CoveredFromInclusive || version >= CoveredToExclusive)
         {
             return false; // Outside the proven interval — the caller MUST read the commit itself.
@@ -202,7 +263,6 @@ internal sealed class ReplayedMetadataLog
             metadata = observed.Metadata;
         }
 
-        EnsureLineageIsAccountedFor();
         return true;
     }
 
@@ -214,12 +274,6 @@ internal sealed class ReplayedMetadataLog
     /// </summary>
     private void EnsureLineageIsAccountedFor()
     {
-        if (_lineageChecked)
-        {
-            return;
-        }
-
-        _lineageChecked = true;
         bool lineageMoved = !ReferenceEquals(_lineageAtWindowStart, _lineageAtWindowEnd);
         bool anyMetadataRecorded = false;
         bool endMetadataAccounted = false;
@@ -234,7 +288,32 @@ internal sealed class ReplayedMetadataLog
             endMetadataAccounted |= ReferenceEquals(entry.PrevailingAfter, _lineageAtWindowEnd);
         }
 
-        if (lineageMoved ? endMetadataAccounted : !anyMetadataRecorded)
+        // CHAIN conjunct. The two predicates above are existential — they prove that SOME record explains the
+        // metadata the window ends on. They do NOT prove the records run UNBROKEN from the metadata the window
+        // began on, and a sparse dictionary makes "absent" mean "silent and state-unchanged", not "not
+        // covered". So a version that genuinely applied a metaData, but was omitted from the dictionary AND
+        // had its before/after witness equalised, would be reported covered-and-silent with nothing to
+        // contradict it — a fail-OPEN (council R2, architect seat). Because every UNRECORDED covered version
+        // is by definition one that neither carried a metaData nor moved the state, the recorded links must
+        // form an unbroken chain from the window's opening metadata to its closing metadata; a gap in that
+        // chain is exactly an omitted revision. Walk it in observation order (Record proves that order is
+        // strictly ascending), and require the chain to close on the window's end.
+        MetadataAction? cursor = _lineageAtWindowStart;
+        bool chained = true;
+        foreach (long recordedVersion in _recordedVersions)
+        {
+            ObservedCommit link = _recorded[recordedVersion];
+            if (!ReferenceEquals(link.PrevailingBefore, cursor))
+            {
+                chained = false;
+                break;
+            }
+
+            cursor = link.PrevailingAfter;
+        }
+
+        chained = chained && ReferenceEquals(cursor, _lineageAtWindowEnd);
+        if (chained && (lineageMoved ? endMetadataAccounted : !anyMetadataRecorded))
         {
             return;
         }

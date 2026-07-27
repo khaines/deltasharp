@@ -37,6 +37,15 @@ public sealed class ReplayedMetadataLogTests
 
     private static IReadOnlyList<MetadataAction> None => Array.Empty<MetadataAction>();
 
+    // Observation and consumption are separate PHASES (council R2): the whole-window cross-checks run once, at
+    // seal time, over the complete window. Every consumption below goes through this so the phase order the
+    // production caller uses is the phase order the tests exercise.
+    private static ReplayedMetadataLog Sealed(ReplayedMetadataLog log)
+    {
+        log.Seal();
+        return log;
+    }
+
     // ---------------------------------------------------------------------------------------------------
     // Rule 1 — proven coverage: an observation is consumable ONLY inside the contiguous window the replay
     // actually recorded. "Not covered" must be reported as such (caller reads disk), never as "nothing here".
@@ -51,7 +60,7 @@ public sealed class ReplayedMetadataLogTests
         log.Record(22, None, m, m);
 
         // Version 1 survives below a compacting checkpoint the replay seeded from: the replay never touched it.
-        Assert.False(log.TryGetProvenObservation(1, out IReadOnlyList<MetadataAction> observed));
+        Assert.False(Sealed(log).TryGetProvenObservation(1, out IReadOnlyList<MetadataAction> observed));
         Assert.Empty(observed);
     }
 
@@ -62,7 +71,7 @@ public sealed class ReplayedMetadataLogTests
         MetadataAction m = Meta("t");
         log.Record(21, None, m, m);
 
-        Assert.False(log.TryGetProvenObservation(22, out _));
+        Assert.False(Sealed(log).TryGetProvenObservation(22, out _));
     }
 
     [Fact]
@@ -70,9 +79,9 @@ public sealed class ReplayedMetadataLogTests
     {
         var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
 
-        Assert.False(log.TryGetProvenObservation(0, out _));
-        Assert.False(log.TryGetProvenObservation(50, out _));
-        Assert.False(log.TryGetProvenObservation(long.MaxValue, out _));
+        Assert.False(Sealed(log).TryGetProvenObservation(0, out _));
+        Assert.False(Sealed(log).TryGetProvenObservation(50, out _));
+        Assert.False(Sealed(log).TryGetProvenObservation(long.MaxValue, out _));
     }
 
     [Fact]
@@ -84,9 +93,9 @@ public sealed class ReplayedMetadataLogTests
         log.Record(40, None, m, m);
         log.Record(41, None, m, m);
 
-        Assert.True(log.TryGetProvenObservation(39, out _));
-        Assert.False(log.TryGetProvenObservation(40, out _));
-        Assert.False(log.TryGetProvenObservation(41, out _));
+        Assert.True(Sealed(log).TryGetProvenObservation(39, out _));
+        Assert.False(Sealed(log).TryGetProvenObservation(40, out _));
+        Assert.False(Sealed(log).TryGetProvenObservation(41, out _));
     }
 
     [Fact]
@@ -121,10 +130,10 @@ public sealed class ReplayedMetadataLogTests
         Assert.True(log.HasCoverage);
         Assert.Equal(31, log.CoveredFromInclusive);
         Assert.Equal(34, log.CoveredToExclusive);
-        Assert.False(log.TryGetProvenObservation(30, out _));
-        Assert.True(log.TryGetProvenObservation(31, out _));
-        Assert.True(log.TryGetProvenObservation(33, out _));
-        Assert.False(log.TryGetProvenObservation(34, out _));
+        Assert.False(Sealed(log).TryGetProvenObservation(30, out _));
+        Assert.True(Sealed(log).TryGetProvenObservation(31, out _));
+        Assert.True(Sealed(log).TryGetProvenObservation(33, out _));
+        Assert.False(Sealed(log).TryGetProvenObservation(34, out _));
     }
 
     [Fact]
@@ -161,7 +170,7 @@ public sealed class ReplayedMetadataLogTests
         log.Record(21, None, before, after);    // the metaData the observer failed to report
 
         DeltaProtocolException error =
-            Assert.Throws<DeltaProtocolException>(() => log.TryGetProvenObservation(20, out _));
+            Assert.Throws<DeltaProtocolException>(() => Sealed(log).TryGetProvenObservation(20, out _));
 
         Assert.Contains("20", error.Message, StringComparison.Ordinal);
         AssertPathFree(error.Message);
@@ -183,7 +192,7 @@ public sealed class ReplayedMetadataLogTests
         log.Record(20, None, Meta("before"), Meta("after"));
 
         DeltaProtocolException error =
-            Assert.Throws<DeltaProtocolException>(() => log.TryGetProvenObservation(20, out _));
+            Assert.Throws<DeltaProtocolException>(() => Sealed(log).TryGetProvenObservation(20, out _));
 
         Assert.Contains("20", error.Message, StringComparison.Ordinal);
         AssertPathFree(error.Message);
@@ -197,7 +206,7 @@ public sealed class ReplayedMetadataLogTests
         log.Record(20, new[] { Meta("phantom") }, m, m);
 
         DeltaProtocolException error =
-            Assert.Throws<DeltaProtocolException>(() => log.TryGetProvenObservation(20, out _));
+            Assert.Throws<DeltaProtocolException>(() => Sealed(log).TryGetProvenObservation(20, out _));
 
         Assert.Contains("20", error.Message, StringComparison.Ordinal);
         AssertPathFree(error.Message);
@@ -210,7 +219,7 @@ public sealed class ReplayedMetadataLogTests
         MetadataAction m = Meta("t");
         log.Record(20, None, m, m); // no metaData observed AND the replayed metadata did not move.
 
-        Assert.True(log.TryGetProvenObservation(20, out IReadOnlyList<MetadataAction> observed));
+        Assert.True(Sealed(log).TryGetProvenObservation(20, out IReadOnlyList<MetadataAction> observed));
         Assert.Empty(observed);
     }
 
@@ -222,7 +231,7 @@ public sealed class ReplayedMetadataLogTests
         MetadataAction second = Meta("second");
         log.Record(20, new[] { first, second }, Meta("before"), second);
 
-        Assert.True(log.TryGetProvenObservation(20, out IReadOnlyList<MetadataAction> observed));
+        Assert.True(Sealed(log).TryGetProvenObservation(20, out IReadOnlyList<MetadataAction> observed));
         Assert.Equal(new[] { first, second }, observed);
     }
 
@@ -233,7 +242,7 @@ public sealed class ReplayedMetadataLogTests
         MetadataAction m = Meta("t");
         log.Record(0, new[] { m }, null, m);
 
-        Assert.True(log.TryGetProvenObservation(0, out IReadOnlyList<MetadataAction> observed));
+        Assert.True(Sealed(log).TryGetProvenObservation(0, out IReadOnlyList<MetadataAction> observed));
         Assert.Single(observed);
     }
 
@@ -243,7 +252,83 @@ public sealed class ReplayedMetadataLogTests
         var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
         log.Record(0, None, null, Meta("t"));
 
-        Assert.Throws<DeltaProtocolException>(() => log.TryGetProvenObservation(0, out _));
+        Assert.Throws<DeltaProtocolException>(() => Sealed(log).TryGetProvenObservation(0, out _));
+    }
+
+    [Fact]
+    public void APartiallyOmittedNonFinalRevision_IsCaughtByTheLineageCHAINCheck()
+    {
+        // Council R2 (architect seat) — the BLOCKING fail-open, isolated. A version that genuinely applied a
+        // metaData but was omitted from the sparse dictionary AND had its before/after witness equalised is
+        // reported covered-and-silent, and NO per-version check can fire because there is no entry to
+        // contradict. The existential "some record explains the window's end metadata" predicate is also
+        // satisfied here (v12 does explain it), so only the CHAIN conjunct sees the break: v12's
+        // PrevailingBefore is m1, but the chain from the window's opening metadata has only reached m0.
+        var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
+        MetadataAction m0 = Meta("m0");
+        MetadataAction m1 = Meta("m1");   // the revision the defective observer dropped
+        MetadataAction m2 = Meta("m2");
+        log.Record(10, None, m0, m0);
+        log.Record(11, None, m0, m0);           // truly applied m1; dropped, witness equalised
+        log.Record(12, new[] { m2 }, m1, m2);
+
+        DeltaProtocolException error = Assert.Throws<DeltaProtocolException>(log.Seal);
+
+        Assert.Contains("10", error.Message, StringComparison.Ordinal);
+        Assert.Contains("12", error.Message, StringComparison.Ordinal);
+        AssertPathFree(error.Message);
+    }
+
+    [Fact]
+    public void AnUnbrokenChainOfSeveralRevisions_IsAccepted_SoTheChainCheckIsNotAFalsePositive()
+    {
+        // The chain conjunct must not reject a legitimate history that changes metadata repeatedly — including
+        // a change-and-change-back, where each revert is a NEWLY parsed instance.
+        var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
+        MetadataAction m0 = Meta("m0");
+        MetadataAction m1 = Meta("m1");
+        MetadataAction m2 = Meta("m2");
+        log.Record(10, None, m0, m0);
+        log.Record(11, new[] { m1 }, m0, m1);
+        log.Record(12, None, m1, m1);
+        log.Record(13, new[] { m2 }, m1, m2);
+        log.Record(14, None, m2, m2);
+        log.Seal();
+
+        Assert.Equal(2, log.RecordedObservationCount);
+        Assert.True(log.TryGetProvenObservation(12, out IReadOnlyList<MetadataAction> silent));
+        Assert.Empty(silent);
+        Assert.True(log.TryGetProvenObservation(13, out IReadOnlyList<MetadataAction> revision));
+        Assert.Equal(new[] { m2 }, revision);
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // Observation and consumption are separate PHASES, enforced by the type (council R2).
+    // ---------------------------------------------------------------------------------------------------
+
+    [Fact]
+    public void ConsumingBeforeSealing_FailsClosed_BecauseTheWholeWindowChecksHaveNotRunOverTheWholeWindow()
+    {
+        var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
+        MetadataAction m = Meta("t");
+        log.Record(10, None, m, m);
+
+        Assert.Throws<DeltaProtocolException>(() => log.TryGetProvenObservation(10, out _));
+    }
+
+    [Fact]
+    public void ObservingAfterSealing_FailsClosed_SoAWholeWindowVerdictIsNeverReusedOverAWiderWindow()
+    {
+        var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
+        MetadataAction m = Meta("t");
+        log.Record(10, None, m, m);
+        log.Seal();
+
+        DeltaProtocolException error =
+            Assert.Throws<DeltaProtocolException>(() => log.Record(11, None, m, m));
+
+        Assert.Contains("11", error.Message, StringComparison.Ordinal);
+        AssertPathFree(error.Message);
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -274,7 +359,7 @@ public sealed class ReplayedMetadataLogTests
         var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
         log.Observe(7, new DeltaAction[] { new ProtocolAction(1, 2, ImmutableArray<string>.Empty, ImmutableArray<string>.Empty), m }, Meta("before"), m);
 
-        Assert.True(log.TryGetProvenObservation(7, out IReadOnlyList<MetadataAction> observed));
+        Assert.True(Sealed(log).TryGetProvenObservation(7, out IReadOnlyList<MetadataAction> observed));
         Assert.Equal(new[] { m }, observed);
     }
 
