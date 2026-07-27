@@ -262,9 +262,10 @@ internal sealed class ChangeFeedReader
     {
         OutputContext ctx;
         MetadataAction endMetadata;
+        DeltaLog.LogListing logListing;
         try
         {
-            (ctx, endMetadata) = await BuildOutputContextAsync(info, cancellationToken).ConfigureAwait(false);
+            (ctx, endMetadata, logListing) = await BuildOutputContextAsync(info, cancellationToken).ConfigureAwait(false);
         }
         catch (DeltaProtocolException ex)
         {
@@ -281,10 +282,25 @@ internal sealed class ChangeFeedReader
         // field id, or physical name) — the implicit-DELETE path reads it through the END identity, a mismap
         // the per-version check never sees. Validate that every RETAINED version before `start` shares the end
         // identity, failing closed on any difference.
+        //
+        // Per-version cdc schema validation (item 3 / §3.2 CDF-EE-08) needs the metadata prevailing at
+        // `start`, which is the START snapshot's — so the SAME call returns it. The two were separate log
+        // passes (a second `_delta_log` LIST plus a second GET of every pre-range commit); they are fused
+        // here (#691), driven off the listing the END snapshot above was reconstructed from. The gate's
+        // coverage, order, and fail-closed messages are unchanged (see
+        // `DeltaLog.LoadChangeFeedStartSnapshotAsync`), and it still runs to completion BEFORE the replay loop
+        // below reads any change/data file or yields any batch. The explicit path validates each cdc file's
+        // decoded leaf schema against THAT version's own log-resident metadata — the trusted authority —
+        // BEFORE any row is yielded, so a hostile/inconsistent cdc file whose columns disagree with its
+        // version fails closed rather than surfacing attacker-chosen columns. We track the prevailing metadata
+        // across the range: the baseline is the metadata as of `start`, then each version's own MetadataAction
+        // (a metaData REPLACES the whole metadata, Delta semantics) supersedes it.
+        MetadataAction currentMetadata;
         try
         {
-            await _log.ValidateColumnMappingIdentityStableBeforeAsync(info.StartVersion, endMetadata, cancellationToken)
-                .ConfigureAwait(false);
+            Snapshot startSnapshot = await _log.LoadChangeFeedStartSnapshotAsync(
+                logListing, info.StartVersion, endMetadata, cancellationToken).ConfigureAwait(false);
+            currentMetadata = startSnapshot.Metadata;
         }
         catch (DeltaProtocolException ex)
         {
@@ -305,26 +321,8 @@ internal sealed class ChangeFeedReader
         // resolution (ReadAsync rejected any that did not), so the stamp always comes from the pinned map.
         IReadOnlyDictionary<long, long> commitMillisByVersion = resolution.CommitMillisByVersion;
 
-        // Per-version cdc schema validation (item 3 / §3.2 CDF-EE-08): the explicit path validates each cdc
-        // file's decoded leaf schema against THAT version's own log-resident metadata — the trusted authority
-        // — BEFORE any row is yielded, so a hostile/inconsistent cdc file whose columns disagree with its
-        // version fails closed rather than surfacing attacker-chosen columns. We track the prevailing metadata
-        // across the range: the baseline is the metadata as of `start`, then each version's own MetadataAction
-        // (a metaData REPLACES the whole metadata, Delta semantics) supersedes it.
-        MetadataAction currentMetadata;
-        try
-        {
-            Snapshot startSnapshot = await _log.LoadSnapshotAsync(info.StartVersion, cancellationToken)
-                .ConfigureAwait(false);
-            currentMetadata = startSnapshot.Metadata;
-        }
-        catch (DeltaProtocolException ex)
-        {
-            throw new DeltaReadException(ex.Message, ex);
-        }
-
         // #671 in-range half of the full-history column-mapping IDENTITY-immutability gate. The pre-range half
-        // (ValidateColumnMappingIdentityStableBeforeAsync, above) validated [earliest, start-1]; this validates
+        // (DeltaLog.LoadChangeFeedStartSnapshotAsync, above) validated [earliest, start-1]; this validates
         // every version IN [start, end] against the end identity as the replay advances the prevailing
         // metadata. Their union is the full retained window a CDF read can touch (#671). Parse the end and the
         // start-baseline identities once; the per-version loop refreshes `currentIdentity` only when a metaData
@@ -417,7 +415,7 @@ internal sealed class ChangeFeedReader
             // bounded version is named.
             //
             // SCOPE: this catches an identity change at any version IN `[start, end]`; the COMPLEMENTARY
-            // pre-range check (`ValidateColumnMappingIdentityStableBeforeAsync`, run before this loop) covers a
+            // pre-range check (`DeltaLog.LoadChangeFeedStartSnapshotAsync`, run before this loop) covers a
             // file referenced by a `remove` in the range but AUTHORED before `start` under a different identity
             // (implicit-DELETE of a historical file across an identity boundary). Their union is the full
             // retained window (#671). Residual (inherent): an identity change entirely within AGED-OUT history
@@ -640,10 +638,16 @@ internal sealed class ChangeFeedReader
                 $"Change feed version {version}'s commit log is no longer available (log cleanup removed it "
                 + "between range resolution and read); the requested range is outside the CDF-readable window.");
 
-    private async Task<(OutputContext Ctx, MetadataAction EndMetadata)> BuildOutputContextAsync(
+    private async Task<(OutputContext Ctx, MetadataAction EndMetadata, DeltaLog.LogListing Listing)> BuildOutputContextAsync(
         DeltaChangeFeedInfo info, CancellationToken cancellationToken)
     {
-        Snapshot end = await _log.LoadSnapshotAsync(info.EndVersion, cancellationToken).ConfigureAwait(false);
+        // Take the END snapshot AND the single `_delta_log` listing it was reconstructed from (#691): the
+        // pre-range column-mapping identity gate and the start-snapshot load are then driven off that SAME
+        // listing rather than re-listing the log twice more. Beyond the saved LISTs this is strictly safer —
+        // the pre-range window the gate validates is provably co-extensive with the log view the end identity
+        // it compares against came from, instead of a second view a concurrent log cleanup could have shrunk.
+        (Snapshot end, DeltaLog.LogListing listing) =
+            await _log.LoadSnapshotWithListingAsync(info.EndVersion, cancellationToken).ConfigureAwait(false);
         StructType tableSchema = end.Schema;
         ColumnMappingMode mode = ColumnMapping.ResolveMode(end.Metadata.Configuration);
         bool resolveByFieldId = mode == ColumnMappingMode.Id;
@@ -653,13 +657,14 @@ internal sealed class ChangeFeedReader
             ColumnMappingProjection.BuildDataSchema(tableSchema, physicalNames, partitionColumns);
         int[] dataOrdinalByField = ColumnMappingProjection.MapDataOrdinals(physicalNames, physicalDataSchema);
         bool allowTypeWideningPromotion = TypeWideningFeature.Supports(end.Protocol);
-        // Return the end MetadataAction alongside `ctx` so the caller can drive the #671 full-history
-        // column-mapping IDENTITY-immutability check off the SAME end snapshot's metadata (mode + schema
-        // field ids/physical names + partition columns) that `ctx` was derived from.
+        // Return the end MetadataAction and the log LISTING alongside `ctx` so the caller can drive the #671
+        // full-history column-mapping IDENTITY-immutability check — and the start-snapshot load it is fused
+        // with (#691) — off the SAME end snapshot's metadata (mode + schema field ids/physical names +
+        // partition columns) that `ctx` was derived from, and off the SAME log view.
         var ctx = new OutputContext(
             info.Schema, tableSchema, physicalDataSchema, physicalNames, dataOrdinalByField, resolveByFieldId,
             mode, allowTypeWideningPromotion);
-        return (ctx, end.Metadata);
+        return (ctx, end.Metadata, listing);
     }
 
     // §3.2 CDF-EE-08: builds the version's expected PHYSICAL data-leaf schema from its log-resident metadata
