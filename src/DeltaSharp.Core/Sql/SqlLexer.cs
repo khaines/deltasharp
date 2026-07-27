@@ -313,6 +313,11 @@ internal static class SqlLexer
         }
 
         string glyph = c.ToString(CultureInfo.InvariantCulture);
+
+        // #687: `glyph` is a single raw source character and CAN itself be a control character (a NUL or a
+        // U+2028 line separator inside a hostile `delta.constraints.<name>` predicate is not whitespace, so it
+        // reaches here). It is neutralized centrally by SqlParseException.Syntax, which sanitizes the whole
+        // detail — see the hygiene remark there.
         throw SqlParseException.Syntax($"unexpected character '{glyph}'", position);
     }
 }

@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Globalization;
 using System.Runtime.CompilerServices;
+using DeltaSharp.Diagnostics;
 using DeltaSharp.Plans;
 using DeltaSharp.Plans.Expressions;
 using DeltaSharp.Plans.Logical;
@@ -47,6 +48,18 @@ internal sealed class SqlParser
     /// is what makes over-deep input a deterministic, catchable <see cref="SqlParseException"/>.
     /// </summary>
     private const int MaxExpressionDepth = TreeNode<LogicalPlan>.MaxDepth;
+
+    /// <summary>
+    /// The cap applied to the raw lexeme text this parser echoes into a <see cref="SqlParseException"/>
+    /// diagnostic (see <see cref="Describe"/>). Chosen to be generous — a real SQL identifier, keyword, or
+    /// numeric literal is an order of magnitude shorter — so interactive SQL users still get their offending
+    /// token back verbatim and in full, while a hostile <c>delta.constraints.&lt;name&gt;</c> CHECK predicate
+    /// carrying a 100&#160;000-character token can no longer render a 100&#160;000-character message (#687).
+    /// Bounding the TOKEN (rather than only the finished message, which
+    /// <see cref="SqlParseException.MaxSyntaxDetailLength"/> also does) keeps the surrounding explanatory prose
+    /// intact instead of letting an oversized lexeme consume the entire message budget.
+    /// </summary>
+    private const int EchoedTokenMaxLength = DiagnosticText.DefaultMaxLength;
 
     private readonly IReadOnlyList<SqlToken> _tokens;
     private int _pos;
@@ -113,7 +126,7 @@ internal sealed class SqlParser
             if (parser.Current.Kind != SqlTokenKind.EndOfInput)
             {
                 throw SqlParseException.Syntax(
-                    $"unexpected trailing input '{parser.Current.Text}' after the constraint expression; a "
+                    $"unexpected trailing input '{Describe(parser.Current)}' after the constraint expression; a "
                     + "constraint is a single boolean expression, not a statement",
                     parser.Current.Position);
             }
@@ -150,7 +163,7 @@ internal sealed class SqlParser
             string? construct = MapStatementKeyword(first);
             throw construct is not null
                 ? SqlParseException.Unsupported(construct, first.Position)
-                : SqlParseException.Syntax($"expected SELECT but found '{first.Text}'", first.Position);
+                : SqlParseException.Syntax($"expected SELECT but found '{Describe(first)}'", first.Position);
         }
 
         Advance();
@@ -174,7 +187,7 @@ internal sealed class SqlParser
             throw SqlParseException.Syntax(
                 fromToken.Kind == SqlTokenKind.EndOfInput
                     ? "expected FROM but found end of input"
-                    : $"expected FROM but found '{fromToken.Text}'",
+                    : $"expected FROM but found '{Describe(fromToken)}'",
                 fromToken.Position);
         }
 
@@ -701,7 +714,16 @@ internal sealed class SqlParser
         // untrusted literal contents never leak back to the caller verbatim.
         SqlTokenKind.EndOfInput => "end of input",
         SqlTokenKind.StringLiteral => "string literal",
-        _ => token.Text,
+
+        // #687: the SINGLE place the parser renders a lexeme's raw source text. SQL is not always
+        // caller-authored — a Delta `delta.constraints.<name>` CHECK predicate is read from the table's
+        // `_delta_log` and parsed on the write path — so the offending token can be attacker-chosen.
+        // Sanitize it: control characters (CR/LF/NUL/…) become U+FFFD so the diagnostic cannot forge lines
+        // in a structured-log sink, and the echo is capped at EchoedTokenMaxLength so a hostile
+        // 100,000-character identifier cannot render a 100,000-character message. The cap is deliberately
+        // generous (a real SQL identifier is far shorter), so the INTERACTIVE experience is unchanged: a
+        // typo'd name still comes back verbatim and in full.
+        _ => DiagnosticText.Sanitize(token.Text, EchoedTokenMaxLength),
     };
 
     private static string? MapPredicateKeyword(SqlToken token)
