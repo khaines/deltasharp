@@ -1,3 +1,5 @@
+using System.Collections.Generic;
+using System.Collections.Immutable;
 using DeltaSharp.Storage.Delta;
 using DeltaSharp.Storage.Parquet;
 using Xunit;
@@ -152,5 +154,230 @@ public sealed class StorageMessageHygieneTests
         Assert.DoesNotContain('\n', ex.Message);
         Assert.DoesNotContain('\r', ex.Message);
         Assert.DoesNotContain(poisoned, ex.Message, StringComparison.Ordinal);
+    }
+
+    // ---- #666: attacker-authored config / protocol-feature / CHECK-constraint VALUE & key echoes ----
+
+    // The full injection/hygiene corpus exercised at every attacker-authored config-text sink: CR, LF, NUL,
+    // tab, a C1 control (NEL U+0085), the Unicode LINE & PARAGRAPH separators (U+2028/U+2029), and a lone
+    // (unpaired) high surrogate — every class DiagnosticText.Sanitize neutralizes. Kept under the config-token
+    // cap so truncation never masks a "raw payload absent" assertion.
+    private const string FullInjectionCorpus = "a\r\nb\0c\td\u0085e\u2028f\u2029g\uD800h";
+
+    // Asserts a rendered message carries none of the corpus's injection characters (so nothing can break a log
+    // line or render a control sequence) and not the raw payload verbatim. Messages that legitimately contain
+    // structural newlines (e.g. the dependent-column listing) pass allowNewlines: true — the attacker's own
+    // newline is still neutralized to U+FFFD, so only the message's own formatting newlines remain.
+    private static void AssertFullyNeutralized(string message, int expectedNewlines = 0)
+    {
+        // Exact structural-newline count — an injected LF (a sanitizer that leaked '\n') changes the count and
+        // is caught, unlike a permissive "allow newlines" skip that hid LF-only regressions (#666 red-team R2).
+        Assert.Equal(expectedNewlines, message.Count(c => c == '\n'));
+        foreach (char c in new[] { '\r', '\0', '\t', '\u0085', '\u2028', '\u2029', '\uD800' })
+        {
+            Assert.DoesNotContain(c, message);
+        }
+
+        Assert.DoesNotContain(FullInjectionCorpus, message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ConfigToken_SharedCap_IsTighterThanDefault()
+    {
+        // #666: the config-value cap is the single shared source of truth (used by AppendOnlyFeature,
+        // RetentionPolicy, and ColumnMapping.SanitizeEchoedToken) and is deliberately tighter than the
+        // default identifier cap — a valid property value is a short protocol string.
+        Assert.True(DiagnosticText.ConfigTokenMaxLength < DiagnosticText.DefaultMaxLength);
+    }
+
+    [Fact]
+    public void AppendOnly_MalformedValue_SanitizesValueInMessage_KeepsKey()
+    {
+        // #666: delta.appendOnly's VALUE is attacker-authored on a foreign/hostile table. A malformed value
+        // fails closed (MalformedAction); its echo must be sanitized so a crafted payload cannot inject into a
+        // structured-log sink, while the trusted protocol KEY stays verbatim for diagnosis.
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
+            () => AppendOnlyFeature.IsEnabled(new Dictionary<string, string> { ["delta.appendOnly"] = FullInjectionCorpus }));
+
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        AssertFullyNeutralized(ex.Message);
+        Assert.Contains("delta.appendOnly", ex.Message, StringComparison.Ordinal); // trusted KEY preserved
+    }
+
+    [Fact]
+    public void AppendOnly_OversizedValue_IsCappedInMessage()
+    {
+        // A non-boolean value longer than the config-token cap is truncated (with an ellipsis) so a crafted
+        // value cannot render an unbounded log line.
+        string oversized = new('x', DiagnosticText.ConfigTokenMaxLength + 40);
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
+            () => AppendOnlyFeature.IsEnabled(new Dictionary<string, string> { ["delta.appendOnly"] = oversized }));
+
+        Assert.DoesNotContain(oversized, ex.Message, StringComparison.Ordinal); // full raw never rendered
+        Assert.Contains("…", ex.Message, StringComparison.Ordinal); // truncation marker present
+    }
+
+    [Fact]
+    public void RetentionPolicy_UnparseableDeletedFileRetention_SanitizesValueInMessage_KeepsKey()
+    {
+        // #666: delta.deletedFileRetentionDuration's VALUE is attacker-authored. An unparseable value fails
+        // closed (FormatException); its echo must be sanitized while the trusted property KEY is preserved.
+        ImmutableSortedDictionary<string, string> config = ImmutableSortedDictionary<string, string>.Empty
+            .Add(RetentionPolicy.DeletedFileRetentionDurationKey, FullInjectionCorpus);
+
+        FormatException ex = Assert.Throws<FormatException>(
+            () => RetentionPolicy.Default.ResolveTableRetention(config));
+
+        AssertFullyNeutralized(ex.Message);
+        Assert.Contains(RetentionPolicy.DeletedFileRetentionDurationKey, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RetentionPolicy_UnparseableLogRetention_SanitizesValueInMessage_KeepsKey()
+    {
+        ImmutableSortedDictionary<string, string> config = ImmutableSortedDictionary<string, string>.Empty
+            .Add(RetentionPolicy.LogRetentionDurationKey, FullInjectionCorpus);
+
+        FormatException ex = Assert.Throws<FormatException>(
+            () => RetentionPolicy.Default.ResolveTableLogRetention(config));
+
+        AssertFullyNeutralized(ex.Message);
+        Assert.Contains(RetentionPolicy.LogRetentionDurationKey, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(true)]  // delta.deletedFileRetentionDuration
+    [InlineData(false)] // delta.logRetentionDuration
+    public void RetentionPolicy_OversizedValue_IsCappedInMessage(bool deletedFileKey)
+    {
+        // An unparseable value longer than the config-token cap is truncated (ellipsis) at BOTH retention
+        // sinks so a crafted value cannot render an unbounded log line (Quality R1: the sink-level cap must be
+        // exercised, not just the shared Sanitize contract).
+        string oversized = "interval " + new string('9', DiagnosticText.ConfigTokenMaxLength + 40) + " fortnights";
+        string key = deletedFileKey
+            ? RetentionPolicy.DeletedFileRetentionDurationKey
+            : RetentionPolicy.LogRetentionDurationKey;
+        ImmutableSortedDictionary<string, string> config = ImmutableSortedDictionary<string, string>.Empty
+            .Add(key, oversized);
+
+        FormatException ex = Assert.Throws<FormatException>(() => deletedFileKey
+            ? RetentionPolicy.Default.ResolveTableRetention(config)
+            : RetentionPolicy.Default.ResolveTableLogRetention(config));
+
+        Assert.DoesNotContain(oversized, ex.Message, StringComparison.Ordinal); // full raw never rendered
+        Assert.Contains("…", ex.Message, StringComparison.Ordinal); // truncation marker present
+        Assert.Contains(key, ex.Message, StringComparison.Ordinal); // trusted KEY preserved
+    }
+
+    [Fact]
+    public void UnsupportedFeatures_ReaderPath_SanitizesFeatureNameInMessage()
+    {
+        // #666 (strongest instance): a foreign table's readerFeatures are attacker-authored; an unsupported
+        // one is echoed by EnsureReadable. A crafted feature name must be sanitized so it cannot inject into a
+        // log sink or render unbounded — while the read still fails closed (UnsupportedProtocol).
+        var protocol = new ProtocolAction(3, 7, [FullInjectionCorpus], []);
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() => ProtocolSupport.EnsureReadable(protocol));
+
+        Assert.Equal(DeltaProtocolErrorKind.UnsupportedProtocol, ex.Kind); // still fails closed
+        AssertFullyNeutralized(ex.Message);
+    }
+
+    [Fact]
+    public void UnsupportedFeatures_WriterPath_SanitizesFeatureNameInMessage()
+    {
+        var protocol = new ProtocolAction(3, 7, [], [FullInjectionCorpus]);
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() => ProtocolSupport.EnsureWritable(protocol));
+
+        Assert.Equal(DeltaProtocolErrorKind.UnsupportedProtocol, ex.Kind);
+        AssertFullyNeutralized(ex.Message);
+    }
+
+    [Fact]
+    public void UnsupportedFeatures_OversizedFeatureName_IsCappedInMessage()
+    {
+        string oversized = new('z', DiagnosticText.ConfigTokenMaxLength + 50);
+        var protocol = new ProtocolAction(3, 7, [oversized], []);
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() => ProtocolSupport.EnsureReadable(protocol));
+
+        Assert.DoesNotContain(oversized, ex.Message, StringComparison.Ordinal);
+        Assert.Contains("…", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ConstraintViolation_ForRow_SanitizesCheckNameAndPredicate_RawOnProperty()
+    {
+        // #666 / red-team: a CHECK constraint's NAME (delta.constraints.<name> key-suffix) and its predicate
+        // Expression are attacker-authored config text on a foreign table; the per-row violation message must
+        // sanitize both, while the raw values remain on the typed Constraint property for inspection.
+        var constraint = new DeltaTableConstraint(DeltaConstraintKind.Check, FullInjectionCorpus, FullInjectionCorpus);
+        DeltaConstraintViolationException ex = DeltaConstraintViolationException.ForRow(constraint, batchIndex: 0, rowIndex: 3);
+
+        AssertFullyNeutralized(ex.Message);
+        Assert.Equal(FullInjectionCorpus, ex.Constraint.Name);
+        Assert.Equal(FullInjectionCorpus, ex.Constraint.Expression);
+    }
+
+    [Fact]
+    public void ConstraintViolation_ForRow_InvariantColumnName_IsSanitized()
+    {
+        var constraint = new DeltaTableConstraint(DeltaConstraintKind.Invariant, FullInjectionCorpus, FullInjectionCorpus);
+        DeltaConstraintViolationException ex = DeltaConstraintViolationException.ForRow(constraint, batchIndex: 1, rowIndex: 2);
+
+        AssertFullyNeutralized(ex.Message);
+    }
+
+    [Fact]
+    public void ConstraintDependentColumn_ForColumnChange_SanitizesNameAndPredicate_RawOnProperty()
+    {
+        // #666 / red-team: each dependent CHECK's name + predicate (attacker-authored) are listed in the
+        // aggregate message. The listing uses structural newlines — exactly 2 for one dependent (the "\n  "
+        // listing prefix + the "\nThe {operation}…" sentence). Asserting the exact count catches an injected
+        // LF (the attacker's own newline is neutralized to U+FFFD; only the message's formatting newlines remain).
+        var deps = new[] { new DeltaTableConstraint(DeltaConstraintKind.Check, FullInjectionCorpus, FullInjectionCorpus) };
+        DeltaConstraintDependentColumnException ex =
+            DeltaConstraintDependentColumnException.ForColumnChange("amount", deps);
+
+        AssertFullyNeutralized(ex.Message, expectedNewlines: 2);
+        Assert.Equal(FullInjectionCorpus, Assert.Single(ex.Constraints).Expression); // raw retained on property
+    }
+
+    [Fact]
+    public void ConstraintDependentColumn_ForColumnChange_SanitizesColumnName_RawOnProperty()
+    {
+        // #666 red-team R3 (High): the altered column name (derived from a foreign/hostile table's
+        // schema/CHECK predicate) was echoed RAW twice — a live CRLF injection. It must be sanitized in the
+        // message (one clean dependent → 2 structural newlines) while the raw name stays on the ColumnName
+        // property.
+        var deps = new[] { new DeltaTableConstraint(DeltaConstraintKind.Check, "ck", "x > 0") };
+        DeltaConstraintDependentColumnException ex =
+            DeltaConstraintDependentColumnException.ForColumnChange(FullInjectionCorpus, deps);
+
+        AssertFullyNeutralized(ex.Message, expectedNewlines: 2);
+        Assert.Equal(FullInjectionCorpus, ex.ColumnName); // raw retained on property
+    }
+
+    [Fact]
+    public void UnsupportedFeatures_HugeList_IsBounded_ElidesRemainder()
+    {
+        // #666 red-team R2: per-item caps do NOT bound a hostile LIST. A forged readerFeatures array of
+        // thousands must be elided ("… (+N more)") so the aggregate message cannot flood a log line.
+        string[] many = Enumerable.Range(0, 5000).Select(i => "feat" + i).ToArray();
+        var protocol = new ProtocolAction(3, 7, [.. many], []);
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(() => ProtocolSupport.EnsureReadable(protocol));
+
+        Assert.Contains("more)", ex.Message, StringComparison.Ordinal);
+        Assert.True(ex.Message.Length < 2000, $"aggregate message not bounded: {ex.Message.Length} chars");
+    }
+
+    [Fact]
+    public void ConstraintDependentColumn_HugeList_IsBounded_ElidesRemainder()
+    {
+        DeltaTableConstraint[] many = Enumerable.Range(0, 5000)
+            .Select(i => new DeltaTableConstraint(DeltaConstraintKind.Check, "c" + i, "x > " + i)).ToArray();
+        DeltaConstraintDependentColumnException ex =
+            DeltaConstraintDependentColumnException.ForColumnChange("amount", many);
+
+        Assert.Contains("more)", ex.Message, StringComparison.Ordinal);
+        Assert.True(ex.Message.Length < 3000, $"aggregate message not bounded: {ex.Message.Length} chars");
     }
 }

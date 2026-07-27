@@ -122,9 +122,13 @@ internal static class DeltaTableConstraints
             string name = entry.Key[CheckConstraintKeyPrefix.Length..];
             if (string.IsNullOrWhiteSpace(entry.Value))
             {
+                // The CHECK name is the attacker-authored suffix of a foreign table's config KEY
+                // (delta.constraints.<name>) — sanitize it (bounded + control/line-separator strip) so an
+                // empty-predicate diagnostic cannot inject into a structured-log sink or render unbounded (#666).
                 throw DeltaProtocolException.Unsupported(
-                    $"CHECK constraint '{name}' declares an empty predicate; the write is refused fail-closed "
-                    + "rather than silently skip a declared constraint.");
+                    $"CHECK constraint '{DiagnosticText.Sanitize(name, DiagnosticText.ConfigTokenMaxLength)}' "
+                    + "declares an empty predicate; the write is refused fail-closed rather than silently skip a "
+                    + "declared constraint.");
             }
 
             add(new DeltaTableConstraint(DeltaConstraintKind.Check, name, entry.Value));

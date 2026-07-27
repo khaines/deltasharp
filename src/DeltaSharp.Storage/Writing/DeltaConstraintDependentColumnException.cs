@@ -1,4 +1,5 @@
 using System.Linq;
+using DeltaSharp.Storage.Delta;
 
 namespace DeltaSharp.Storage;
 
@@ -74,13 +75,30 @@ public sealed class DeltaConstraintDependentColumnException : Exception
 
         // Defensive copy so the public property is immutable regardless of the caller's list lifetime.
         DeltaTableConstraint[] dependents = constraints.ToArray();
-        string listing = string.Join("", dependents.Select(c => $"\n  {c.Name} -> {c.Expression}"));
+        // Render at most MaxEchoedListItems dependents (each per-token sanitized), eliding the rest as
+        // "… (+N more)", so a hostile table with thousands of CHECK constraints cannot flood the message even
+        // though each entry is individually bounded (#666). The Name (delta.constraints.<name> key-suffix) and
+        // Expression (predicate) are attacker-authored config text; the structural "\n  " separators are
+        // intentional formatting, and the raw values remain on the typed Constraints property for inspection.
+        int shownDependents = Math.Min(dependents.Length, DiagnosticText.MaxEchoedListItems);
+        string listing = string.Join("", dependents.Take(shownDependents).Select(c =>
+            $"\n  {DiagnosticText.Sanitize(c.Name, DiagnosticText.ConfigTokenMaxLength)}"
+            + $" -> {DiagnosticText.Sanitize(c.Expression, DiagnosticText.DefaultMaxLength)}"));
+        if (dependents.Length > shownDependents)
+        {
+            listing += FormattableString.Invariant($"\n  … (+{dependents.Length - shownDependents} more)");
+        }
         string depends = dependents.Length == 1
             ? "this surviving CHECK constraint still depends"
             : "these surviving CHECK constraints still depend";
+        // The altered column name is derived from a foreign/hostile table's schema/CHECK predicate (a peer
+        // engine's overwriteSchema against an attacker-authored table), so sanitize it before echoing — a
+        // crafted name must not inject control/line-break chars into a structured-log sink. It is echoed twice;
+        // the raw value is retained on the typed ColumnName property. (operation/ErrorClass are trusted literals.)
+        string safeColumn = DiagnosticText.Sanitize(columnName, DiagnosticText.ConfigTokenMaxLength);
         string message =
-            $"Cannot alter column '{columnName}' because this column is referenced by the following check "
-            + $"constraint(s):{listing}\nThe {operation} changes '{columnName}' (drops, renames, or retypes it), "
+            $"Cannot alter column '{safeColumn}' because this column is referenced by the following check "
+            + $"constraint(s):{listing}\nThe {operation} changes '{safeColumn}' (drops, renames, or retypes it), "
             + $"but {depends} on it; committing would leave a dangling constraint that rejects every future "
             + "write. Drop the dependent constraint(s) first (e.g. ALTER TABLE ... DROP CONSTRAINT), then change "
             + $"the column. [{ErrorClass}]";

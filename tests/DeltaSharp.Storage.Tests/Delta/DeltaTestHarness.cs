@@ -58,8 +58,13 @@ internal static class DeltaTestHarness
         StructType schema, (string Key, string Value)[] configuration, string id = "t", string[]? partitionColumns = null)
     {
         string escapedSchema = EscapeForJsonString(DeltaSchemaJson.ToJson(schema));
+        // Serialize each config key/value as a proper JSON string (System.Text.Json escapes control chars,
+        // quotes, and separators) so an arbitrary — including attacker-crafted CR/LF/control — key or value
+        // round-trips faithfully instead of producing invalid JSON. Mirrors the JsonSerializer use in Add.
         string config = "{" + string.Join(
-            ",", configuration.Select(kv => $"\"{kv.Key}\":\"{kv.Value}\"")) + "}";
+            ",", configuration.Select(kv =>
+                System.Text.Json.JsonSerializer.Serialize(kv.Key)
+                + ":" + System.Text.Json.JsonSerializer.Serialize(kv.Value))) + "}";
         return """{"metaData":{"id":"__ID__","format":{"provider":"parquet","options":{}},"schemaString":"__S__","partitionColumns":[__P__],"configuration":__C__}}"""
             .Replace("__ID__", id, StringComparison.Ordinal)
             .Replace("__S__", escapedSchema, StringComparison.Ordinal)

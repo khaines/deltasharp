@@ -126,6 +126,22 @@ public sealed class DeltaTableConstraintsTests : System.IDisposable
             SnapshotWithCheck(""), schema));
     }
 
+    [Fact]
+    public void CollectForWrite_EmptyCheckConstraint_SanitizesKeySuffixInMessage()
+    {
+        // #666 / Security: the CHECK name is a delta.constraints.<name> key-suffix — attacker-authored on a
+        // foreign/hostile table. The empty-predicate fault message must sanitize it so a crafted suffix cannot
+        // inject CR/LF/control chars into a structured-log sink.
+        var schema = new StructType(new[] { new StructField("id", IntegerType.Instance, nullable: false) });
+        const string poisonedSuffix = "ck\r\nINJECTED-LOG-LINE";
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
+            () => DeltaTableConstraints.CollectForWrite(SnapshotWithCheckKey(poisonedSuffix), schema));
+
+        Assert.DoesNotContain('\r', ex.Message);
+        Assert.DoesNotContain('\n', ex.Message);
+        Assert.DoesNotContain(poisonedSuffix, ex.Message, StringComparison.Ordinal);
+    }
+
     // Builds a StructField carrying a delta.invariants column invariant with the given persisted expression.
     private static StructField InvariantField(string name, DataType type, string sql) => new(
         name, type, nullable: true,
@@ -287,5 +303,13 @@ public sealed class DeltaTableConstraintsTests : System.IDisposable
     {
         var schema = new StructType(new[] { new StructField("id", IntegerType.Instance, nullable: false) });
         return WriteAndLoadAsync(schema, ("delta.constraints.ck", value)).GetAwaiter().GetResult();
+    }
+
+    private Snapshot SnapshotWithCheckKey(string keySuffix)
+    {
+        // A hostile hand-authored _delta_log whose CHECK constraint KEY suffix carries an injection payload
+        // (JSON escapes/round-trips the control chars). The empty predicate value forces the fail-closed throw.
+        var schema = new StructType(new[] { new StructField("id", IntegerType.Instance, nullable: false) });
+        return WriteAndLoadAsync(schema, ("delta.constraints." + keySuffix, "")).GetAwaiter().GetResult();
     }
 }

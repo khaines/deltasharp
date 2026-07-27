@@ -149,14 +149,13 @@ internal static class ColumnMapping
         };
     }
 
-    /// <summary>The maximum length of an untrusted configuration token echoed into a diagnostic.</summary>
-    private const int MaxEchoedTokenLength = 64;
-
     // Bounds and redacts an untrusted configuration value (e.g. delta.columnMapping.mode) before it is
     // interpolated into an exception message (#516 log-injection hardening). Delegates to the shared
-    // DiagnosticText.Sanitize with a tighter cap for config tokens (they are short protocol strings, unlike a
-    // dotted column path), so the control-char/line-separator neutralization stays in one place (#667).
-    private static string SanitizeEchoedToken(string raw) => DiagnosticText.Sanitize(raw, MaxEchoedTokenLength);
+    // DiagnosticText.Sanitize with the shared config-token cap (short protocol strings, unlike a dotted column
+    // path), so both the control-char/line-separator neutralization (#667) AND the bound (#666) stay in one
+    // place and cannot drift from the other config-value echoes (AppendOnlyFeature, RetentionPolicy).
+    private static string SanitizeEchoedToken(string raw) =>
+        DiagnosticText.Sanitize(raw, DiagnosticText.ConfigTokenMaxLength);
 
     // The conservative, portable per-path-COMPONENT budget (in UTF-8 bytes) for a NAME that becomes a Hive
     // partition-directory segment ("name=value") — #572 deltaspec R7. Filesystems cap a single path component

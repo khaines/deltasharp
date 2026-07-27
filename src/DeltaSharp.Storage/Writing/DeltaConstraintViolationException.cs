@@ -1,3 +1,5 @@
+using DeltaSharp.Storage.Delta;
+
 namespace DeltaSharp.Storage;
 
 /// <summary>
@@ -32,13 +34,21 @@ public sealed class DeltaConstraintViolationException : Exception
         DeltaTableConstraint constraint, int batchIndex, int rowIndex)
     {
         ArgumentNullException.ThrowIfNull(constraint);
+
+        // constraint.Name (a delta.constraints.<name> CHECK key-suffix, or an invariant's column name) and
+        // constraint.Expression (the predicate text) are attacker-authored on a foreign/hostile table —
+        // sanitize both before echoing so a crafted name/predicate cannot inject control/line-break chars into
+        // a structured-log sink or render unbounded (#666). The raw values remain on the typed Constraint
+        // property for full programmatic inspection.
+        string name = DiagnosticText.Sanitize(constraint.Name, DiagnosticText.ConfigTokenMaxLength);
         string subject = constraint.Kind == DeltaConstraintKind.Check
-            ? $"CHECK constraint '{constraint.Name}'"
-            : $"column invariant on '{constraint.Name}'";
+            ? $"CHECK constraint '{name}'"
+            : $"column invariant on '{name}'";
         return new DeltaConstraintViolationException(
             constraint,
-            $"The write violates the {subject}: the predicate '{constraint.Expression}' did not evaluate to "
-            + $"true for the row at batch {batchIndex}, position {rowIndex}. The write is rejected fail-closed "
-            + "before any data is staged.");
+            $"The write violates the {subject}: the predicate "
+            + $"'{DiagnosticText.Sanitize(constraint.Expression, DiagnosticText.DefaultMaxLength)}' did not "
+            + $"evaluate to true for the row at batch {batchIndex}, position {rowIndex}. The write is rejected "
+            + "fail-closed before any data is staged.");
     }
 }
