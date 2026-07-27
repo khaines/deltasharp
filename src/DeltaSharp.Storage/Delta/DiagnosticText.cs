@@ -40,7 +40,14 @@ internal static class DiagnosticText
     /// <summary>The maximum number of items rendered from an attacker-influenceable LIST (a foreign table's
     /// unsupported reader/writer features, or the CHECK constraints dependent on a changed column) before the
     /// remainder is elided as <c>… (+N more)</c>. Bounds the AGGREGATE message length so a hostile list of
-    /// thousands of (individually per-item-capped) entries cannot flood a log line (#666).</summary>
+    /// thousands of (individually per-item-capped) entries cannot flood a log line (#666).
+    /// <para><b>This is the single authoritative Storage elision bound, on every path.</b> Storage elides
+    /// lists two ways — through <see cref="SanitizeAndJoin"/> (e.g. <c>DeltaProtocolException</c>'s
+    /// reader/writer feature list) and by reading this constant directly for a hand-rolled listing (e.g.
+    /// <c>DeltaConstraintDependentColumnException</c>'s dependent-CHECK listing). The forwarder therefore
+    /// passes this constant EXPLICITLY to the shared primitive rather than letting it supply a bound of its
+    /// own, so both paths are provably governed by this one declaration and cannot silently desynchronize.
+    /// The shared primitive deliberately has no default to inherit (#687 follow-up).</para></summary>
     internal const int MaxEchoedListItems = 16;
 
     /// <summary>
@@ -66,7 +73,7 @@ internal static class DiagnosticText
     /// a log line even though every element is individually bounded.
     /// </summary>
     internal static string SanitizeAndJoin(IEnumerable<string> tokens, int maxItemLength, string separator = ", ") =>
-        SharedDiagnosticText.SanitizeAndJoin(tokens, maxItemLength, separator);
+        SharedDiagnosticText.SanitizeAndJoin(tokens, maxItemLength, MaxEchoedListItems, separator);
 
     /// <summary>
     /// Renders <paramref name="exception"/> as <c>{TypeName}: {Message}</c> (optionally followed by

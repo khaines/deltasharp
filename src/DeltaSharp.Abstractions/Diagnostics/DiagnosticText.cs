@@ -35,11 +35,6 @@ internal static class DiagnosticText
     /// crafted token cannot blow up a log line.</summary>
     internal const int DefaultMaxLength = 128;
 
-    /// <summary>The maximum number of items rendered from an attacker-influenceable LIST before the remainder
-    /// is elided as <c>… (+N more)</c>. Bounds the AGGREGATE message length so a hostile list of thousands of
-    /// (individually per-item-capped) entries cannot flood a log line.</summary>
-    internal const int MaxEchoedListItems = 16;
-
     /// <summary>
     /// Bounds and neutralizes an untrusted token before it is interpolated into a diagnostic message: caps
     /// the length (appending an ellipsis when truncated) and replaces every control character with U+FFFD, so
@@ -111,14 +106,30 @@ internal static class DiagnosticText
     /// <summary>
     /// Sanitizes each token in <paramref name="tokens"/> (per-item bounded via <see cref="Sanitize"/> with
     /// <paramref name="maxItemLength"/>) and joins them with <paramref name="separator"/>, rendering at most
-    /// <see cref="MaxEchoedListItems"/> and appending <c>… (+N more)</c> when the list is longer — so an
+    /// <paramref name="maxItems"/> and appending <c>… (+N more)</c> when the list is longer — so an
     /// attacker-supplied LIST (e.g. a foreign table's thousands of forged reader/writer features) cannot flood
     /// a log line even though every element is individually bounded.
     /// </summary>
-    internal static string SanitizeAndJoin(IEnumerable<string> tokens, int maxItemLength, string separator = ", ")
+    /// <remarks>
+    /// <b>Both bounds are caller-supplied on purpose.</b> This primitive owns the ALGORITHM; the calling layer
+    /// owns its POSTURE — the per-item length cap and the item count cap are the layer's policy, and only the
+    /// layer knows what a legitimate list looks like there (a Delta reader/writer feature set is not a SQL
+    /// select list). Neither has a default here, so a caller cannot silently inherit a bound it did not choose:
+    /// a layer that already declares its own cap (e.g. <c>DeltaSharp.Storage.Delta.DiagnosticText</c>'s
+    /// <c>MaxEchoedListItems</c>, which that layer ALSO reads directly for its hand-rolled elisions) must pass
+    /// it, so its declared constant is provably the one in force on every path. Adding a default here would
+    /// re-create exactly the silent-drift hazard the shared primitive exists to eliminate: two independent
+    /// constants, one name, and no signal when they diverge.
+    /// </remarks>
+    /// <param name="tokens">The untrusted tokens to render.</param>
+    /// <param name="maxItemLength">The per-item length cap handed to <see cref="Sanitize"/>.</param>
+    /// <param name="maxItems">The maximum number of items rendered before the remainder is elided.</param>
+    /// <param name="separator">The separator placed between rendered items.</param>
+    internal static string SanitizeAndJoin(
+        IEnumerable<string> tokens, int maxItemLength, int maxItems, string separator = ", ")
     {
         IReadOnlyList<string> list = tokens as IReadOnlyList<string> ?? tokens.ToList();
-        int shown = Math.Min(list.Count, MaxEchoedListItems);
+        int shown = Math.Min(list.Count, maxItems);
         var builder = new StringBuilder();
         for (int i = 0; i < shown; i++)
         {
