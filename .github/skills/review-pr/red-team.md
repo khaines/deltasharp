@@ -17,13 +17,21 @@ manufactures the independent, adversarial error-checking that constructive revie
 
 - **Different frontier family.** Run the red-team on a frontier family **distinct from the
   majority of the voting seats, and ideally a family no voting seat uses at all** — so it does
-  not share their blind spots. The current council is Claude (spine: Architect/Balanced/Security
-  + specialists) + Gemini (the Quality lens is `gemini-3.1-pro-preview`), so run the red-team on
-  **`gpt-5.6-sol`** (GPT-5.6 Sol) — the GPT family no voting seat uses; do **not** reuse a voting
-  seat's family (e.g. `claude-opus-5` or `gemini-3.1-pro-preview`) as the red-team. Record which
+  not share their blind spots. The current council runs **all four voting lenses on Claude**
+  (Architect/Balanced/Quality/Security + specialists), so run the red-team on
+  **`gemini-3.1-pro-preview`** (Gemini 3.1 Pro) — the Gemini family no voting seat uses; do **not**
+  reuse a voting seat's family (e.g. `claude-opus-5`) as the red-team. Record which
   model gated. A red-team on the *same* family as a voting seat (or the majority spine) is
   **provisional** and does **not** satisfy the gate for protected-domain changes — say so and
   require a decorrelated re-run or a documented human waiver.
+- **Do not gate on the GPT family (measured, 2026-07).** Over 5 consecutive red-team runs spanning
+  `gpt-5.6-sol` and `gpt-5.6-terra`, **5/5 returned an empty first response** (one after 3,936 s of
+  work) and **4/5 never discharged C7**. The failure tracked *long adversarial prose generation*,
+  not adversarial reasoning — the same models emitted fine when asked for terse verdicts, while
+  Claude/Gemini seats produced materially identical adversarial content at length without issue.
+  A gate that reliably fails to emit is worse than no gate, because it consumes the slot. If a
+  future GPT release is retested and emits reliably, this may be revisited — but re-measure before
+  re-adopting, and keep the telemetry.
 - **Shell-capable, always.** The red-team MUST hold a real shell to run C7 repros. Dispatch
   it with `agent_type: general-purpose` (full CLI tools) — **never** a file-view-only
   persona agent. (A reviewer that cannot execute cannot certify; a file-view-only seat that
