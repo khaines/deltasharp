@@ -27,14 +27,22 @@ public sealed class SqlParseException : Exception
     }
 
     /// <summary>Initializes a new instance with a precise <paramref name="message"/>.</summary>
-    /// <param name="message">The deterministic error message.</param>
+    /// <param name="message">The deterministic error message. <b>It is rewritten:</b> injection-unsafe
+    /// characters (Unicode categories <c>Cc</c>, <c>Cf</c>, <c>Zl</c>, <c>Zp</c>, plus lone surrogates) are
+    /// replaced with U+FFFD and the result is capped — see <see cref="MaxMessageLength"/> for why this applies
+    /// to every constructor and not just to the internal factories. A single-line message of ordinary length
+    /// is returned unchanged.</param>
     public SqlParseException(string message)
         : base(Bounded(message))
     {
     }
 
     /// <summary>Initializes a new instance with a <paramref name="message"/> and underlying cause.</summary>
-    /// <param name="message">The deterministic error message.</param>
+    /// <param name="message">The deterministic error message. <b>It is rewritten:</b> injection-unsafe
+    /// characters (Unicode categories <c>Cc</c>, <c>Cf</c>, <c>Zl</c>, <c>Zp</c>, plus lone surrogates) are
+    /// replaced with U+FFFD and the result is capped — see <see cref="MaxMessageLength"/>. A single-line
+    /// message of ordinary length is returned unchanged. The <paramref name="innerException"/>'s message is
+    /// NOT touched.</param>
     /// <param name="innerException">The exception that caused this error.</param>
     public SqlParseException(string message, Exception? innerException)
         : base(Bounded(message), innerException)
@@ -81,6 +89,12 @@ public sealed class SqlParseException : Exception
     /// precisely so <c>DeltaConstraintDependentColumnException</c>'s own <c>"\n  "</c> listing survives. A
     /// future multi-line SQL diagnostic must therefore sanitize its untrusted TOKENS and opt out of this
     /// whole-message backstop, not fight it.</para>
+    /// <para><b>No nested elision.</b> Two-layer bounding can in principle produce a doubly-elided render
+    /// (a per-token <c>…</c> that is then itself truncated by the whole-message cap, yielding <c>… …</c>).
+    /// The SQL path is provably immune: the token echo is capped at 128, the fixed prose and the
+    /// <c>"Syntax error at position N: "</c> prefix are all inside this 512-character budget, and the longest
+    /// message the parser can compose is well under it — so the outer cap never fires on a message the inner
+    /// cap already elided. Noted here so a future reader does not re-derive it as a defect.</para>
     /// </remarks>
     internal const int MaxMessageLength = 512;
 

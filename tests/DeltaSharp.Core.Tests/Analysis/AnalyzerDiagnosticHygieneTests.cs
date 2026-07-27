@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Text;
 using DeltaSharp.Analysis;
 using DeltaSharp.Plans.Expressions;
 using DeltaSharp.Types;
@@ -69,6 +70,12 @@ public sealed class AnalyzerDiagnosticHygieneTests
         { "lrm-and-soft-hyphen-literal", "amount > 'A\u200E\u00ADFORGED'" },
         { "isolate-literal", "amount > 'A\u2066FORGED\u2069'" },
         { "rtl-override-column", "`A\u202EFORGED` > 0" },
+
+        // Astral Cf (council round 3, item 1): the TAG block encodes arbitrary ASCII invisibly. `IsInjectionUnsafe`
+        // takes a char and cannot see these; they are neutralized in Sanitize's surrogate-pair branch.
+        { "tag-smuggled-literal", "amount > 'safe\U000E0045\U000E0056\U000E0049\U000E004CFORGED'" },
+        { "tag-smuggled-column", "`safe\U000E0045\U000E0056\U000E0049\U000E004CFORGED` > 0" },
+        { "astral-music-format-literal", "amount > 'A\U0001D173FORGED'" },
     };
 
     [Theory]
@@ -288,18 +295,51 @@ public sealed class AnalyzerDiagnosticHygieneTests
     /// log viewers render as a newline) may survive into a diagnostic, and the render must be bounded.</summary>
     private static void AssertHygienic(string site, string message)
     {
-        for (int i = 0; i < message.Length; i++)
+        foreach (Rune rune in message.EnumerateRunes())
         {
-            char c = message[i];
+            // Rune-based, not char-based, on purpose: Cc/Zl/Zp are entirely BMP but Cf is NOT (the TAG block
+            // U+E0020-U+E007F and friends are astral), so a char-wise scan cannot see an astral format
+            // character at all and would pass vacuously on exactly the payload it is meant to catch.
             Assert.False(
-                char.IsControl(c)
-                || char.GetUnicodeCategory(c)
-                    is UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator or UnicodeCategory.Format,
-                FormattableString.Invariant($"[{site}] injection-unsafe U+{(int)c:X4} at index {i}"));
+                Rune.GetUnicodeCategory(rune)
+                    is UnicodeCategory.Control or UnicodeCategory.LineSeparator
+                        or UnicodeCategory.ParagraphSeparator or UnicodeCategory.Format,
+                FormattableString.Invariant($"[{site}] injection-unsafe U+{rune.Value:X4}"));
         }
+
+        Assert.False(ContainsLoneSurrogate(message), site + ": message carries a lone surrogate");
 
         Assert.True(
             message.Length <= AnalysisException.MaxMessageLength + 1,
             FormattableString.Invariant($"[{site}] message length {message.Length} exceeds the backstop"));
     }
+
+    /// <summary>A LONE (unpaired) surrogate is malformed UTF-16 that the sanitizer neutralizes; a WELL-FORMED
+    /// pair is legitimate astral text (an emoji, a CJK-extension ideograph) that must survive. Checking for
+    /// "no surrogates at all" would be wrong — it would contradict the primitive's deliberate contract — so
+    /// this checks precisely for the malformed case.</summary>
+    private static bool ContainsLoneSurrogate(string value)
+    {
+        for (int i = 0; i < value.Length; i++)
+        {
+            if (char.IsHighSurrogate(value[i]))
+            {
+                if (i + 1 >= value.Length || !char.IsLowSurrogate(value[i + 1]))
+                {
+                    return true;
+                }
+
+                i++;
+                continue;
+            }
+
+            if (char.IsLowSurrogate(value[i]))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
 }

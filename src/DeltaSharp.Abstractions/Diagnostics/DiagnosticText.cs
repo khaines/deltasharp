@@ -97,11 +97,25 @@ internal static class DiagnosticText
             if (char.IsHighSurrogate(c))
             {
                 // A valid high+low surrogate pair (both within the cap — the cap back-off above guarantees a
-                // high surrogate is never the last retained char) is a legal astral code point: keep it
-                // verbatim (neither half is a control/separator). A high surrogate NOT followed by a low
-                // surrogate is a LONE (malformed) surrogate — neutralize it.
+                // high surrogate is never the last retained char) is a legal astral code point. It must still
+                // be CATEGORY-CHECKED: Cc/Zl/Zp are entirely BMP, but Cf is NOT — U+E0020–U+E007F (the TAG
+                // block) encodes arbitrary ASCII invisibly, which is the canonical invisible-text smuggling
+                // vector and a strictly stronger instance of "make the log lie" than the U+202E this primitive
+                // already neutralizes. U+110BD, U+110CD, U+13430–U+1343F, U+1BCA0–U+1BCA3 and
+                // U+1D173–U+1D17A are astral Cf too. A hostile `_delta_log` JSON string can carry any UTF-16,
+                // so this is reachable. A high surrogate NOT followed by a low surrogate is a LONE (malformed)
+                // surrogate — neutralize it.
                 if (i + 1 < cap && char.IsLowSurrogate(raw[i + 1]))
                 {
+                    var rune = new Rune(c, raw[i + 1]);
+                    if (Rune.GetUnicodeCategory(rune) is UnicodeCategory.Control or UnicodeCategory.Format
+                            or UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator)
+                    {
+                        builder.Append('\uFFFD');
+                        i++;
+                        continue;
+                    }
+
                     builder.Append(c);
                     builder.Append(raw[i + 1]);
                     i++;
@@ -196,6 +210,14 @@ internal static class DiagnosticText
     // (AnalysisException.Reference/RootColumn/Candidates, SqlToken.Text), which is what any caller that needs
     // the exact bytes should read. Neutralizing the whole category keeps the rule stated in one place and
     // trivially auditable, rather than an allow-list that must be revisited each Unicode revision.
+    //
+    // SCOPE: this predicate takes a `char`, so it only decides BMP code points. Cc/Zl/Zp are entirely BMP, so
+    // for those it IS the whole rule — but Cf is not: the TAG block U+E0020–U+E007F, U+110BD, U+110CD,
+    // U+13430–U+1343F, U+1BCA0–U+1BCA3 and U+1D173–U+1D17A are all astral Format characters. The astral half
+    // of the same rule therefore lives in Sanitize's surrogate-pair branch, which category-checks the decoded
+    // Rune against the identical four categories. Any change to the set below MUST be mirrored there:
+    // a half-implemented Cf control is worse than no Cf control, because it documents a guarantee that
+    // quietly does not hold.
     private static bool IsInjectionUnsafe(char c) =>
         char.IsControl(c)
         || char.GetUnicodeCategory(c)

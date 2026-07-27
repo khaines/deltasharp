@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Text.Json.Nodes;
 using DeltaSharp.Storage;
 using DeltaSharp.Types;
@@ -126,6 +127,23 @@ public sealed class HostileConstraintDiagnosticHygieneTests : IDisposable
     }
 
     [Fact]
+    public void HostileCheckPredicate_TagBlockSmuggling_SurfacesNoInvisiblePayload_AndFailsClosed()
+    {
+        // Council round 3, item 1: the ASTRAL half of the Cf rule at the PARSER sink. A hostile `_delta_log`
+        // JSON string can carry any UTF-16, so the TAG block is reachable here exactly as CR/LF is.
+        string table = Table("tag-smuggle");
+        SeedWithHostileConstraint(
+            table, "other > 0 `TRAIL\U000E0045\U000E0056\U000E0049\U000E004CFORGED`");
+
+        Exception ex = Assert.ThrowsAny<Exception>(() => Append(table, Amounts(1)));
+
+        AssertChainIsHygienic(ex);
+        Assert.Contains("FORGED", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(ex.Message.EnumerateRunes(), r => r.Value is >= 0xE0020 and <= 0xE007F);
+        Assert.False(File.Exists(CommitFile(table, 2)));
+    }
+
+    [Fact]
     public void WellFormedCheckPredicate_StillEnforced_ControlIsolatesTheHygieneChange()
     {
         // Control: the hygiene change must not disturb normal enforcement — a well-formed CHECK still parses,
@@ -189,16 +207,20 @@ public sealed class HostileConstraintDiagnosticHygieneTests : IDisposable
         for (Exception? current = thrown; current is not null; current = current.InnerException)
         {
             string message = current.Message;
-            for (int i = 0; i < message.Length; i++)
+            foreach (Rune rune in message.EnumerateRunes())
             {
-                char c = message[i];
+                // Rune-based, not char-based: Cc/Zl/Zp are entirely BMP but Cf is NOT (the TAG block
+                // U+E0020-U+E007F and friends are astral), so a char-wise scan cannot see an astral format
+                // character and would pass vacuously on exactly the payload it is meant to catch.
                 Assert.False(
-                    char.IsControl(c)
-                    || char.GetUnicodeCategory(c)
-                        is UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator or UnicodeCategory.Format,
+                    Rune.GetUnicodeCategory(rune)
+                        is UnicodeCategory.Control or UnicodeCategory.LineSeparator
+                            or UnicodeCategory.ParagraphSeparator or UnicodeCategory.Format,
                     FormattableString.Invariant(
-                        $"{current.GetType().Name}.Message carries injection-unsafe U+{(int)c:X4} at index {i}"));
+                        $"{current.GetType().Name}.Message carries injection-unsafe U+{rune.Value:X4}"));
             }
+
+            Assert.False(ContainsLoneSurrogate(message), "surfaced message carries a lone surrogate");
 
             Assert.True(
                 message.Length <= MaxSurfacedMessageLength,
@@ -206,4 +228,33 @@ public sealed class HostileConstraintDiagnosticHygieneTests : IDisposable
                     $"{current.GetType().Name}.Message length {message.Length} exceeds the bounded render budget"));
         }
     }
+
+    /// <summary>A LONE (unpaired) surrogate is malformed UTF-16 that the sanitizer neutralizes; a WELL-FORMED
+    /// pair is legitimate astral text (an emoji, a CJK-extension ideograph) that must survive. Checking for
+    /// "no surrogates at all" would be wrong — it would contradict the primitive's deliberate contract — so
+    /// this checks precisely for the malformed case.</summary>
+    private static bool ContainsLoneSurrogate(string value)
+    {
+        for (int i = 0; i < value.Length; i++)
+        {
+            if (char.IsHighSurrogate(value[i]))
+            {
+                if (i + 1 >= value.Length || !char.IsLowSurrogate(value[i + 1]))
+                {
+                    return true;
+                }
+
+                i++;
+                continue;
+            }
+
+            if (char.IsLowSurrogate(value[i]))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
 }

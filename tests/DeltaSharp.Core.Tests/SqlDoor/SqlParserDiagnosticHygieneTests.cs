@@ -1,5 +1,6 @@
 using System;
 using System.Globalization;
+using System.Text;
 using DeltaSharp.Diagnostics;
 using DeltaSharp.Sql;
 using Xunit;
@@ -169,6 +170,9 @@ public sealed class SqlParserDiagnosticHygieneTests
     [InlineData("\u00ad")] // SOFT HYPHEN (Cf) — invisible in most renderers
     [InlineData("\u2066")] // LEFT-TO-RIGHT ISOLATE (Cf)
     [InlineData("\u200b")] // ZERO WIDTH SPACE (Cf) — hides or reorders text during triage
+    [InlineData("\U000E0001")] // LANGUAGE TAG (ASTRAL Cf) — invisible to a char-wise category check
+    [InlineData("\U000E0045\U000E0056\U000E0049\U000E004C")] // "EVIL" smuggled in the TAG block
+    [InlineData("\U0001D173")] // MUSICAL SYMBOL BEGIN BEAM (ASTRAL Cf)
     public void SyntaxError_NonCrLfLineBreakingCharacters_AreAlsoNeutralized(string payload)
     {
         SqlParseException ex = Assert.Throws<SqlParseException>(
@@ -176,7 +180,7 @@ public sealed class SqlParserDiagnosticHygieneTests
 
         AssertHygienic(ex.Message);
         Assert.DoesNotContain(payload, ex.Message, StringComparison.Ordinal);
-        Assert.Contains("t\uFFFDu", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("t" + new string('\uFFFD', payload.EnumerateRunes().Count()) + "u", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -307,18 +311,51 @@ public sealed class SqlParserDiagnosticHygieneTests
     // fixed "Syntax error at position N: " prefix — never proportional to the attacker's token length.
     private static void AssertHygienic(string message)
     {
-        for (int i = 0; i < message.Length; i++)
+        foreach (Rune rune in message.EnumerateRunes())
         {
-            char c = message[i];
+            // Rune-based, not char-based, on purpose: Cc/Zl/Zp are entirely BMP but Cf is NOT (the TAG block
+            // U+E0020-U+E007F and friends are astral), so a char-wise scan cannot see an astral format
+            // character at all and would pass vacuously on exactly the payload it is meant to catch.
             Assert.False(
-                char.IsControl(c)
-                || char.GetUnicodeCategory(c) is UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator or UnicodeCategory.Format,
-                FormattableString.Invariant(
-                    $"message carries an injection-unsafe char U+{(int)c:X4} at index {i}"));
+                Rune.GetUnicodeCategory(rune)
+                    is UnicodeCategory.Control or UnicodeCategory.LineSeparator
+                        or UnicodeCategory.ParagraphSeparator or UnicodeCategory.Format,
+                FormattableString.Invariant($"message carries an injection-unsafe U+{rune.Value:X4}"));
         }
+
+        Assert.False(ContainsLoneSurrogate(message), "message carries a lone surrogate");
 
         Assert.True(
             message.Length <= SqlParseException.MaxMessageLength + 64,
             FormattableString.Invariant($"message length {message.Length} exceeds the bounded render budget"));
     }
+
+    /// <summary>A LONE (unpaired) surrogate is malformed UTF-16 that the sanitizer neutralizes; a WELL-FORMED
+    /// pair is legitimate astral text (an emoji, a CJK-extension ideograph) that must survive. Checking for
+    /// "no surrogates at all" would be wrong — it would contradict the primitive's deliberate contract — so
+    /// this checks precisely for the malformed case.</summary>
+    private static bool ContainsLoneSurrogate(string value)
+    {
+        for (int i = 0; i < value.Length; i++)
+        {
+            if (char.IsHighSurrogate(value[i]))
+            {
+                if (i + 1 >= value.Length || !char.IsLowSurrogate(value[i + 1]))
+                {
+                    return true;
+                }
+
+                i++;
+                continue;
+            }
+
+            if (char.IsLowSurrogate(value[i]))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
 }
