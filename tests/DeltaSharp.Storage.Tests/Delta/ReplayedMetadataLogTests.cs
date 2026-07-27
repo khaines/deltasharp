@@ -188,6 +188,11 @@ public sealed class ReplayedMetadataLogTests
         // (here witnessed by the replayed state's metadata changing across the version). Before this check the
         // gate believed the silence and skipped the version — a forged pre-range identity passed. Now the
         // contradiction between the observation and the snapshot the reconstruction actually built is fatal.
+        //
+        // NOTE (council R2, quality seat): this pins the BEHAVIOUR, not the LAYER. The window here holds a
+        // single record, so the whole-window lineage check rejects it too — deleting
+        // EnsureObservationMatchesReplayedState leaves this test GREEN. The layer's own oracle is
+        // AnUnderReportAtANonFinalRevision_IsCaughtByThePerVersionGuard_WhichNoWholeWindowCheckSubsumes below.
         var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
         log.Record(20, None, Meta("before"), Meta("after"));
 
@@ -201,6 +206,8 @@ public sealed class ReplayedMetadataLogTests
     [Fact]
     public void AnOverReportingObservation_AlsoFailsClosed_SoTheCheckHoldsInBothDirections()
     {
+        // As above, this pins the behaviour rather than the layer — see
+        // AnOverReportAtANonFinalRevision_IsCaughtByThePerVersionGuard_SoBothDirectionsHaveTheirOwnOracle.
         var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
         MetadataAction m = Meta("t");
         log.Record(20, new[] { Meta("phantom") }, m, m);
@@ -253,6 +260,81 @@ public sealed class ReplayedMetadataLogTests
         log.Record(0, None, null, Meta("t"));
 
         Assert.Throws<DeltaProtocolException>(() => Sealed(log).TryGetProvenObservation(0, out _));
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // Rule 2, DISCRIMINATING cases (council R2, quality seat). The three tests above are honest end-behaviour
+    // tests, but each records a single version, so the WHOLE-WINDOW lineage check rejects them as well:
+    // deleting EnsureObservationMatchesReplayedState outright left the entire suite green. A test that passes
+    // because SOME layer caught the defect does not defend THIS layer, and the per-version guard is the fix
+    // for the council-R1 fail-open — the layer that most needs an oracle had none.
+    //
+    // The shape that isolates it is an under-report at a NON-FINAL metadata revision. The whole-window checks
+    // are satisfied — the lineage moved, the recorded links chain unbroken from the window's opening metadata
+    // to its closing metadata, and the final revision's applied result IS the window's end metadata — yet an
+    // earlier version silently swallowed a real metaData. Only the per-version corroboration can see it.
+    // ---------------------------------------------------------------------------------------------------
+
+    [Fact]
+    public void AnUnderReportAtANonFinalRevision_IsCaughtByThePerVersionGuard_WhichNoWholeWindowCheckSubsumes()
+    {
+        // v10 truly applied `forged` but is reported silent; v11 reverts to `reverted`, which IS the metadata
+        // the window ends on. Whole-window verdict: lineage moved AND is accounted for AND the links chain —
+        // it PASSES. Without the per-version guard the forged identity at v10 would be validated away.
+        var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
+        MetadataAction original = Meta("original");
+        MetadataAction forged = Meta("forged");
+        MetadataAction reverted = Meta("reverted");
+        log.Record(10, None, original, forged);                       // under-reported, NON-final revision
+        log.Record(11, new[] { reverted }, forged, reverted);         // final revision, correctly reported
+
+        ReplayedMetadataLog sealedLog = Sealed(log); // the whole-window checks accept this window.
+
+        DeltaProtocolException error =
+            Assert.Throws<DeltaProtocolException>(() => sealedLog.TryGetProvenObservation(10, out _));
+
+        Assert.Contains("10", error.Message, StringComparison.Ordinal);
+        AssertPathFree(error.Message);
+    }
+
+    [Fact]
+    public void AnOverReportAtANonFinalRevision_IsCaughtByThePerVersionGuard_SoBothDirectionsHaveTheirOwnOracle()
+    {
+        // The mirror image: v10 claims a metaData the reconstruction never applied, while v11 carries the real
+        // final revision. The whole-window verdict is again satisfied, so only the per-version guard fires.
+        var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
+        MetadataAction original = Meta("original");
+        MetadataAction latest = Meta("latest");
+        log.Record(10, new[] { Meta("phantom") }, original, original); // over-reported, NON-final version
+        log.Record(11, new[] { latest }, original, latest);            // final revision, correctly reported
+
+        ReplayedMetadataLog sealedLog = Sealed(log);
+
+        DeltaProtocolException error =
+            Assert.Throws<DeltaProtocolException>(() => sealedLog.TryGetProvenObservation(10, out _));
+
+        Assert.Contains("10", error.Message, StringComparison.Ordinal);
+        AssertPathFree(error.Message);
+    }
+
+    [Fact]
+    public void AnUnderReportedCreationCommit_IsCaughtByThePerVersionGuard_WhenALaterRevisionClosesTheLineage()
+    {
+        // The creation commit (metadata appearing from nothing) at a NON-final position: v0 is reported silent
+        // though it created the table's metadata, and v1 replaces it with the metadata the window ends on.
+        var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
+        MetadataAction created = Meta("created");
+        MetadataAction replaced = Meta("replaced");
+        log.Record(0, None, null, created);                      // under-reported creation, NON-final
+        log.Record(1, new[] { replaced }, created, replaced);    // final revision, correctly reported
+
+        ReplayedMetadataLog sealedLog = Sealed(log);
+
+        DeltaProtocolException error =
+            Assert.Throws<DeltaProtocolException>(() => sealedLog.TryGetProvenObservation(0, out _));
+
+        Assert.Contains("0", error.Message, StringComparison.Ordinal);
+        AssertPathFree(error.Message);
     }
 
     [Fact]

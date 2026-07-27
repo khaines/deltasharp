@@ -44,6 +44,22 @@ namespace DeltaSharp.Storage.Delta;
 /// contradict.</description></item>
 /// </list>
 ///
+/// <para><b>The three rules are INDEPENDENT layers; none subsumes another.</b> Worth stating explicitly,
+/// because two of the conjuncts above are individually far weaker than the property the coverage argument
+/// needs, and the gap between them is exactly where a fail-open lives:</para>
+/// <list type="bullet">
+/// <item><description>The end-accounting predicate ("a moved lineage is explained by a recorded
+/// <c>metaData</c> whose applied result is the window's end metadata") is satisfied by recording ONLY the LAST
+/// revision in the window, which would fail open for every earlier one. The CHAIN conjunct is what closes
+/// that; end-accounting alone is not a coverage argument.</description></item>
+/// <item><description>Conversely the whole-window checks cannot see an under-report at a NON-FINAL revision
+/// whose successor restores the window's end metadata: the lineage moved, is accounted for, and the recorded
+/// links chain unbroken, yet an earlier version silently swallowed a real <c>metaData</c>. Only
+/// <see cref="EnsureObservationMatchesReplayedState"/> catches that shape.</description></item>
+/// </list>
+/// <para>Each layer therefore has its OWN discriminating test rather than sharing an end-behaviour one, so
+/// deleting any single layer turns a specific, disjoint set of tests red (council R2).</para>
+///
 /// <para><b>Single extraction site.</b> <see cref="MetadataActionsOf"/> is the ONE place a commit's
 /// <c>metaData</c> actions are picked out of its parsed actions; the gate's disk-fallback path calls the same
 /// helper, so the observed and re-read paths cannot drift apart, and a defect in the extraction breaks BOTH
