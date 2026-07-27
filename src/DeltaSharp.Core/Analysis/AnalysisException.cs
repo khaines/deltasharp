@@ -1,3 +1,4 @@
+using DeltaSharp.Diagnostics;
 using DeltaSharp.Plans.Expressions;
 using DeltaSharp.Plans.Logical;
 using DeltaSharp.Types;
@@ -112,13 +113,37 @@ internal enum AnalysisErrorKind
 /// </remarks>
 internal sealed class AnalysisException : Exception
 {
+    /// <summary>
+    /// The cap applied to the <b>whole composed message</b> of every <see cref="AnalysisException"/> — the
+    /// backstop half of the #687 diagnostic-hygiene posture, and the analyzer's analogue of
+    /// <c>SqlParseException.MaxSyntaxDetailLength</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Almost every factory below interpolates text that is attacker-authored in the hostile-<c>_delta_log</c>
+    /// threat model: a rendered expression carrying a CHECK predicate's string literals, a column or function
+    /// name taken from the log's schema, a storage-side failure reason. Sanitizing the composed message at the
+    /// one private constructor closes the class for <b>all</b> of them at once — including any factory added
+    /// later — instead of relying on ~20 call sites each remembering to sanitize.
+    /// </para>
+    /// <para>
+    /// Deliberately generous: control-character neutralization is lossless and always applied, while the cap
+    /// exists only to make the render independent of attacker input length. It comfortably fits a
+    /// wide-schema "given input columns: [...]" listing, and where it does bite, no information is lost —
+    /// <see cref="Reference"/>, <see cref="RootColumn"/>, and <see cref="Candidates"/> remain available
+    /// <b>unmodified</b> as the structured, machine-readable channel (they are matched on by callers such as
+    /// the Delta dependent-column reclassifier, so they must never be rewritten).
+    /// </para>
+    /// </remarks>
+    internal const int MaxMessageLength = 1024;
+
     private AnalysisException(
         string message,
         AnalysisErrorKind kind,
         string? reference,
         IReadOnlyList<string> candidates,
         string? rootColumn = null)
-        : base(message)
+        : base(DiagnosticText.Sanitize(message, MaxMessageLength))
     {
         Kind = kind;
         Reference = reference;

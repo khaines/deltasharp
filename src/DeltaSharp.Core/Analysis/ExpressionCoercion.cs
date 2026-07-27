@@ -51,7 +51,7 @@ internal static class ExpressionCoercion
         if (coercion is not { } c)
         {
             throw AnalysisException.DataTypeMismatch(
-                CoercionHelpers.PrettyReference(arithmetic),
+                CoercionHelpers.DiagnosticReference(arithmetic),
                 $"the '{arithmetic.NodeName}' operator requires numeric operands but got "
                 + $"'{leftType.SimpleString}' and '{rightType.SimpleString}'.");
         }
@@ -74,7 +74,7 @@ internal static class ExpressionCoercion
         if (common is null)
         {
             throw AnalysisException.DataTypeMismatch(
-                CoercionHelpers.PrettyReference(comparison),
+                CoercionHelpers.DiagnosticReference(comparison),
                 $"the '{comparison.NodeName}' operator requires comparable operand types but got "
                 + $"'{leftType.SimpleString}' and '{rightType.SimpleString}'.");
         }
@@ -113,7 +113,7 @@ internal static class ExpressionCoercion
         if (common is null)
         {
             throw AnalysisException.DataTypeMismatch(
-                CoercionHelpers.PrettyReference(caseWhen),
+                CoercionHelpers.DiagnosticReference(caseWhen),
                 "the branch/else result values of a CASE expression must share a common type but got "
                 + $"[{string.Join(", ", valueTypes.Select(t => t.SimpleString))}].");
         }
@@ -170,7 +170,7 @@ internal static class ExpressionCoercion
             NullType => new Cast(operand, BooleanType.Instance),
             null => operand,
             _ => throw AnalysisException.DataTypeMismatch(
-                CoercionHelpers.PrettyReference(operand),
+                CoercionHelpers.DiagnosticReference(operand),
                 $"a '{context}' operand must be boolean but got '{operand.Type.SimpleString}'."),
         };
     }

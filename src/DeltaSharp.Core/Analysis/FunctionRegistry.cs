@@ -291,7 +291,7 @@ internal static class FunctionRegistry
                 ?? throw AnalysisException.InvalidFunctionArgument(
                     fn.Name,
                     Array.Empty<DataType>(),
-                    $"argument #{i + 1} ('{CoercionHelpers.PrettyReference(fn.Arguments[i])}') has no result type.");
+                    $"argument #{i + 1} ('{CoercionHelpers.DiagnosticReference(fn.Arguments[i])}') has no result type.");
         }
 
         return types;

@@ -1,3 +1,4 @@
+using DeltaSharp.Diagnostics;
 using DeltaSharp.Plans.Expressions;
 using DeltaSharp.Types;
 
@@ -13,6 +14,21 @@ namespace DeltaSharp.Analysis;
 /// </summary>
 internal static class CoercionHelpers
 {
+    /// <summary>
+    /// The cap applied to an expression rendered <b>into a diagnostic</b> by
+    /// <see cref="DiagnosticReference"/>. Generous enough to show any realistic predicate or projection
+    /// element whole — several times the length of a typical <c>(amount &gt; 0)</c> / <c>CASE WHEN … END</c>
+    /// render — while keeping the echo independent of the attacker's input length: a hostile
+    /// <c>delta.constraints.&lt;name&gt;</c> predicate carrying a 100&#160;000-character string literal used
+    /// to render a 100&#160;156-character analyzer message (#687).
+    /// </summary>
+    /// <remarks>Deliberately larger than <see cref="DiagnosticText.DefaultMaxLength"/> (which bounds a single
+    /// identifier-shaped token) because this bounds a whole rendered <em>expression tree</em>, and smaller
+    /// than <see cref="AnalysisException.MaxMessageLength"/> so the surrounding explanatory prose — the
+    /// operand types, the operator name, the actionable advice — survives intact even when the reference
+    /// itself is elided.</remarks>
+    internal const int DiagnosticReferenceMaxLength = 256;
+
     /// <summary>Wraps <paramref name="expression"/> in a <see cref="Cast"/> to
     /// <paramref name="target"/> unless it already has that type (structural sharing on a no-op
     /// coercion). This is the single implementation of the "cast unless already that type" rule shared
@@ -47,6 +63,14 @@ internal static class CoercionHelpers
     /// future node types. Diagnostics therefore show <c>(b + i)</c> / <c>i</c> / <c>(b AND i)</c> /
     /// <c>(i IS NULL)</c> / <c>CASE WHEN b THEN i ELSE s END</c> rather than <c>(b#7 + i#8)</c> etc.
     /// </para>
+    /// <para>
+    /// <b>Not hygienic.</b> The render embeds leaf text verbatim — notably a <see cref="Literal"/>'s decoded
+    /// <em>value</em> — which is attacker-authored when the expression came from a hostile
+    /// <c>delta.constraints.&lt;name&gt;</c> predicate. This raw form is correct for the <b>auto-naming</b>
+    /// callers (it becomes an output-schema column name, which must not be rewritten); every call that
+    /// interpolates a reference into an <b>exception message</b> must go through
+    /// <see cref="DiagnosticReference"/> instead (#687).
+    /// </para>
     /// </summary>
     public static string PrettyReference(Expression expression)
     {
@@ -73,6 +97,32 @@ internal static class CoercionHelpers
             _ => PrettyFallback(expression),
         };
     }
+
+    /// <summary>
+    /// Renders <paramref name="expression"/> for use <b>inside a diagnostic message</b>: the
+    /// <see cref="PrettyReference"/> SQL form, then bounded and neutralized by
+    /// <see cref="DiagnosticText.Sanitize"/> at <see cref="DiagnosticReferenceMaxLength"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// #687. A rendered expression embeds <b>attacker-authored</b> text whenever the expression came from a
+    /// hostile <c>_delta_log</c> — a <c>delta.constraints.&lt;name&gt;</c> CHECK predicate reaches the analyzer
+    /// through <c>ConstraintExpressionFrontend</c>, and its string-literal leaves render their decoded
+    /// <em>value</em> (the SQL parser is already hygienic here: it reports the token kind
+    /// <c>string literal</c>, never the value). A predicate of
+    /// <c>amount &gt; 'A&lt;CR&gt;&lt;LF&gt;FORGED'</c> therefore used to drive raw CR/LF into the surfaced
+    /// message (log-line forgery), and a 100&#160;000-character literal drove a 100&#160;156-character render.
+    /// </para>
+    /// <para>
+    /// This is deliberately a <b>separate entry point</b> rather than sanitization inside
+    /// <see cref="PrettyReference"/>: that renderer is also the source of Spark-parity <em>auto-names</em>
+    /// for functions in output position (<c>Analyzer.SparkAutoName</c>, <c>LogicalOutput</c>), where the
+    /// result is a real <b>output-schema column name</b>, not diagnostic prose. Bounding or rewriting text
+    /// there would silently change query <em>results</em>. Diagnostics are bounded; names are not.
+    /// </para>
+    /// </remarks>
+    public static string DiagnosticReference(Expression expression) =>
+        DiagnosticText.Sanitize(PrettyReference(expression), DiagnosticReferenceMaxLength);
 
     /// <summary>Total, leak-proof fallback for any node without a bespoke SQL form. A true leaf
     /// (<see cref="Literal"/>, an unresolved marker) carries no ExprId, so its <c>SimpleString</c> is
