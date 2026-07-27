@@ -336,9 +336,14 @@ internal sealed class ChangeFeedReader
             endIdentity = ColumnMappingIdentity.FromMetadata(endMetadata);
             currentIdentity = ColumnMappingIdentity.FromMetadata(currentMetadata);
         }
-        catch (SchemaValidationException ex)
+        catch (Exception ex) when (ex is SchemaValidationException or DeltaProtocolException)
         {
-            throw new DeltaReadException(ex.Message, ex);
+            // Fixed, path-free message (both an unparseable/non-struct schema AND an unrecognized mode reach
+            // here — the latter as DeltaProtocolException from ColumnMapping.ResolveMode); the raw detail is
+            // retained on InnerException for diagnostics but never surfaced (#653 / #664).
+            throw new DeltaReadException(
+                "A change-feed range's metadata declared an unreadable column-mapping identity (unrecognized "
+                + "mode or malformed/inconsistent schema); the read fails closed.", ex);
         }
 
         for (long v = info.StartVersion; v <= info.EndVersion; v++)
@@ -385,9 +390,14 @@ internal sealed class ChangeFeedReader
                     {
                         currentIdentity = ColumnMappingIdentity.FromMetadata(updatedMetadata);
                     }
-                    catch (SchemaValidationException ex)
+                    catch (Exception ex) when (ex is SchemaValidationException or DeltaProtocolException)
                     {
-                        throw new DeltaReadException(ex.Message, ex);
+                        // Same fixed, path-free fail-closed as the pre-loop parse: an in-range version whose
+                        // metaData carries an unparseable/non-struct schema OR an unrecognized column-mapping
+                        // mode (DeltaProtocolException from ResolveMode) fails the read closed uniformly.
+                        throw new DeltaReadException(
+                            "A change-feed range's metadata declared an unreadable column-mapping identity "
+                            + "(unrecognized mode or malformed/inconsistent schema); the read fails closed.", ex);
                     }
                 }
             }

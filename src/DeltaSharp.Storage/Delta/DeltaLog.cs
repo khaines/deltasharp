@@ -487,11 +487,13 @@ internal sealed class DeltaLog
     /// column) is allowed: only a column present in BOTH a historical version and the end is identity-compared.
     /// The in-range <c>[start, end]</c> window is validated per-version by the change-feed reader, so this
     /// closes the pre-<c>start</c> gap the per-version check cannot see.
-    /// <para><b>Residual (inherent).</b> An identity change entirely within AGED-OUT history below the earliest
-    /// reconstructable version is physically unreadable; a still-referenced below-floor file is then read under
-    /// the uniform retained identity, which is equivalent to ordinary data-content forgery — no capability
-    /// beyond the issue's already-stipulated <c>_delta_log</c>-write threat model (surviving pre-range commits
-    /// ARE still scanned here; only deleted commit JSON is unvalidatable).</para>
+    /// <para><b>Residual (inherent).</b> An identity change recorded ONLY in commit JSON that has been DELETED
+    /// (aged out) below the earliest reconstructable version is physically unreadable; a still-referenced
+    /// below-floor file is then read under the uniform retained identity, which is equivalent to ordinary
+    /// data-content forgery — no capability beyond the issue's already-stipulated <c>_delta_log</c>-write
+    /// threat model. Every commit whose JSON SURVIVES — including a stray persisting strictly below a
+    /// compacting checkpoint floor — IS scanned here (we skip only the exact baseline version); only truly
+    /// deleted commit JSON is unvalidatable.</para>
     /// The fail-closed message is path-free (#653): it names ONLY the offending version.
     /// </summary>
     /// <exception cref="DeltaProtocolException">A retained version before the range declares a different (or
@@ -515,12 +517,17 @@ internal sealed class DeltaLog
         ValidateHistoricalIdentity(earliest, earliestSnapshot.Metadata, endIdentity);
 
         // Every retained commit's metaData REPLACES the metadata (Delta semantics); a differing identity at any
-        // version before the range — including a change-and-change-back that reverted before start — is forged.
+        // version before the range — including a change-and-change-back that reverted before start, or a
+        // SURVIVING commit whose JSON persists strictly below the earliest reconstructable floor (e.g. below a
+        // compacting checkpoint) — is forged. We skip ONLY the exact baseline version (== earliest, already
+        // validated above via the earliest snapshot); a below-floor stray (version < earliest) with a surviving
+        // JSON is still read and validated, so a transient identity forged there cannot hide beneath a
+        // checkpoint that bakes the reverted identity.
         foreach (long version in listing.Commits)
         {
-            if (version <= earliest || version >= rangeStartVersion)
+            if (version == earliest || version >= rangeStartVersion)
             {
-                continue; // <= earliest folded into the baseline; >= start is the reader's per-version check.
+                continue; // == earliest folded into the baseline; >= start is the reader's per-version check.
             }
 
             cancellationToken.ThrowIfCancellationRequested();
@@ -555,8 +562,8 @@ internal sealed class DeltaLog
         catch (SchemaValidationException ex)
         {
             throw DeltaProtocolException.Malformed(
-                "A change-feed range's metadata schemaString is unparseable; the commit log is inconsistent, "
-                + "so the read fails closed.", ex);
+                "A change-feed range's metadata schemaString is unparseable or not a struct; the commit log "
+                + "is inconsistent, so the read fails closed.", ex);
         }
     }
 

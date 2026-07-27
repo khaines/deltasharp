@@ -1312,6 +1312,185 @@ public sealed class ChangeFeedReadTests : IDisposable
         Assert.DoesNotContain(histFile, ex.Message, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task Cdf_SurvivingSubFloorCommitIdentityDiffers_FailsClosed_NamesSubFloorVersion()
+    {
+        // #671 sub-floor coverage (Architect/QueryExec/dotnet-runtime R2, executed probe): a commit whose JSON
+        // SURVIVES strictly BELOW a compacting checkpoint floor must still be identity-validated. Layout: v0
+        // aged out; checkpoint@2 bakes identity X (== end); a RETAINED v1.json (below the floor `earliest=2`)
+        // forges identity Y; end v3 == X removes a file. The pre-range baseline (checkpoint@2) matches the end,
+        // so ONLY scanning the surviving sub-floor v1 catches the forgery. Guards against the `<= earliest`
+        // regression (which skipped v1); with the `== earliest` fix it fails closed naming version 1.
+        string SchemaJson(int idForId, int idForName) =>
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
+            + "{\"delta.columnMapping.id\":" + idForId + ",\"delta.columnMapping.physicalName\":\"col-A\"}},"
+            + "{\"name\":\"name\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":" + idForName + ",\"delta.columnMapping.physicalName\":\"col-B\"}}]}";
+        var config = new[]
+        {
+            ("delta.columnMapping.mode", "id"),
+            ("delta.columnMapping.maxColumnId", "2"),
+            ("delta.enableChangeDataFeed", "true"),
+        };
+        string MetaLine(int idForId, int idForName) =>
+            "{\"metaData\":{\"id\":\"rt\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
+            + "\"schemaString\":" + JsonSerializer.Serialize(SchemaJson(idForId, idForName))
+            + ",\"partitionColumns\":[],\"configuration\":{"
+            + "\"delta.columnMapping.mode\":\"id\",\"delta.columnMapping.maxColumnId\":\"2\","
+            + "\"delta.enableChangeDataFeed\":\"true\"}}}";
+        const string histFile = "data/subfloor-hist.parquet";
+        using var backend = new LocalFileSystemBackend(_root);
+        // checkpoint@2 bakes identity X (== end); commit 0 aged out; the sub-floor v1.json SURVIVES.
+        await DeltaTestHarness.WriteCheckpointAsync(backend, 2, new CheckpointFixture()
+            .Protocol(3, 7, new[] { "columnMapping" }, new[] { "columnMapping", "changeDataFeed" })
+            .Metadata("rt", SchemaJson(1, 2), partitionColumns: null, configuration: config)
+            .Add(histFile, size: 1, modificationTime: 1));
+        await DeltaTestHarness.WriteLastCheckpointAsync(backend, 2);
+        await backend.PutIfAbsentAsync(   // SURVIVING sub-floor commit (< earliest=2): forges identity Y
+            "_delta_log/00000000000000000001.json",
+            Encoding.UTF8.GetBytes(MetaLine(2, 1) + "\n"), CancellationToken.None);
+        await backend.PutIfAbsentAsync(   // end v3 == X, removes the checkpoint's historical file
+            "_delta_log/00000000000000000003.json",
+            Encoding.UTF8.GetBytes(MetaLine(1, 2) + "\n" + DeltaTestHarness.Remove(histFile) + "\n"),
+            CancellationToken.None);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(3, 3)));
+        Assert.Contains("column-mapping identity", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("version 1", ex.Message, StringComparison.Ordinal);   // the surviving sub-floor version
+        Assert.DoesNotContain(histFile, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Cdf_PartitionColumnChangeBeforeStart_FailsClosed()
+    {
+        // #671 partition-membership arm (reliability-chaos R2 HIGH + red-team): identity includes the
+        // partition-column set. A forged v2 metaData changes partitionColumns (unpartitioned -> ["name"], same
+        // mode + field ids) while removing a v0 file authored unpartitioned. The pre-range identity check fails
+        // closed on the partition-set difference (path-free).
+        const string protocol =
+            "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,"
+            + "\"readerFeatures\":[\"columnMapping\"],\"writerFeatures\":[\"columnMapping\",\"changeDataFeed\"]}}";
+        const string schemaJson =
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
+            + "{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-A\"}},"
+            + "{\"name\":\"name\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"col-B\"}}]}";
+        string MetaLine(string partitionColumns) =>
+            "{\"metaData\":{\"id\":\"rt\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
+            + "\"schemaString\":" + JsonSerializer.Serialize(schemaJson)
+            + ",\"partitionColumns\":[" + partitionColumns + "],\"configuration\":{"
+            + "\"delta.columnMapping.mode\":\"id\",\"delta.columnMapping.maxColumnId\":\"2\","
+            + "\"delta.enableChangeDataFeed\":\"true\"}}}";
+        const string dataPath = "data/hist-partition-file.parquet";
+        using var backend = new LocalFileSystemBackend(_root);
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000000.json",
+            Encoding.UTF8.GetBytes(protocol + "\n" + MetaLine("") + "\n" + DeltaTestHarness.Add(dataPath) + "\n"),
+            CancellationToken.None);
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000001.json",
+            Encoding.UTF8.GetBytes(DeltaTestHarness.Add("data/filler.parquet") + "\n"), CancellationToken.None);
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000002.json",
+            Encoding.UTF8.GetBytes(MetaLine("\"name\"") + "\n" + DeltaTestHarness.Remove(dataPath) + "\n"),
+            CancellationToken.None);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
+        Assert.Contains("column-mapping identity", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(dataPath, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Cdf_MalformedSchemaStringInPreRangeCommit_FailsClosed()
+    {
+        // #671 fail-closed on a forged/inconsistent log (reliability-chaos R2 LOW): a pre-range commit whose
+        // metaData schemaString is unparseable is caught by the pre-range scan's BuildIdentity wrap
+        // (SchemaValidationException -> DeltaProtocolException.Malformed -> DeltaReadException), not surfaced
+        // raw. The end (v2) schema is valid so the range resolves; v1's malformed schema fails the read closed.
+        const string protocol =
+            "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,"
+            + "\"readerFeatures\":[\"columnMapping\"],\"writerFeatures\":[\"columnMapping\",\"changeDataFeed\"]}}";
+        const string schemaJson =
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
+            + "{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-A\"}}]}";
+        string ValidMeta() =>
+            "{\"metaData\":{\"id\":\"rt\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
+            + "\"schemaString\":" + JsonSerializer.Serialize(schemaJson)
+            + ",\"partitionColumns\":[],\"configuration\":{"
+            + "\"delta.columnMapping.mode\":\"id\",\"delta.columnMapping.maxColumnId\":\"1\","
+            + "\"delta.enableChangeDataFeed\":\"true\"}}}";
+        // v1's schemaString is valid JSON but NOT a schema ("not-a-schema") — FromMetadata fails closed.
+        string MalformedMeta() =>
+            "{\"metaData\":{\"id\":\"rt\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
+            + "\"schemaString\":" + JsonSerializer.Serialize("\"not-a-schema\"")
+            + ",\"partitionColumns\":[],\"configuration\":{"
+            + "\"delta.columnMapping.mode\":\"id\",\"delta.columnMapping.maxColumnId\":\"1\","
+            + "\"delta.enableChangeDataFeed\":\"true\"}}}";
+        const string dataPath = "data/malformed-hist.parquet";
+        using var backend = new LocalFileSystemBackend(_root);
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000000.json",
+            Encoding.UTF8.GetBytes(protocol + "\n" + ValidMeta() + "\n" + DeltaTestHarness.Add(dataPath) + "\n"),
+            CancellationToken.None);
+        await backend.PutIfAbsentAsync(   // pre-range commit with a malformed schemaString
+            "_delta_log/00000000000000000001.json",
+            Encoding.UTF8.GetBytes(MalformedMeta() + "\n"), CancellationToken.None);
+        await backend.PutIfAbsentAsync(   // valid end + remove
+            "_delta_log/00000000000000000002.json",
+            Encoding.UTF8.GetBytes(ValidMeta() + "\n" + DeltaTestHarness.Remove(dataPath) + "\n"),
+            CancellationToken.None);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
+        Assert.DoesNotContain(dataPath, ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("not-a-schema", ex.Message, StringComparison.Ordinal);   // no forged-schema echo
+    }
+
+    [Fact]
+    public async Task Cdf_UnrecognizedColumnMappingModeInRange_FailsClosed_AsDeltaReadException()
+    {
+        // #671 in-loop fail-closed direction (dotnet-runtime R2 LOW): an in-range, NON-end version whose
+        // metaData declares an UNRECOGNIZED column-mapping mode makes ColumnMapping.ResolveMode throw a
+        // DeltaProtocolException; the reader's in-loop identity refresh catches it (alongside
+        // SchemaValidationException) and fails the read closed as a DeltaReadException — the uniform read-door
+        // contract — rather than leaking a raw DeltaProtocolException. (v3 is the end and is valid, so the end
+        // snapshot builds; v2's bogus mode is hit only by the in-loop refresh.) Message is path-free.
+        const string protocol =
+            "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,"
+            + "\"readerFeatures\":[\"columnMapping\"],\"writerFeatures\":[\"columnMapping\",\"changeDataFeed\"]}}";
+        const string schemaJson =
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
+            + "{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-A\"}}]}";
+        string MetaLine(string mode) =>
+            "{\"metaData\":{\"id\":\"rt\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
+            + "\"schemaString\":" + JsonSerializer.Serialize(schemaJson)
+            + ",\"partitionColumns\":[],\"configuration\":{"
+            + "\"delta.columnMapping.mode\":\"" + mode + "\",\"delta.columnMapping.maxColumnId\":\"1\","
+            + "\"delta.enableChangeDataFeed\":\"true\"}}}";
+        using var backend = new LocalFileSystemBackend(_root);
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000000.json",
+            Encoding.UTF8.GetBytes(protocol + "\n" + MetaLine("id") + "\n"), CancellationToken.None);
+        await backend.PutIfAbsentAsync(   // in-range, metaData-ONLY version with an unrecognized mode
+            "_delta_log/00000000000000000001.json",
+            Encoding.UTF8.GetBytes(MetaLine("bogus") + "\n"), CancellationToken.None);
+        await backend.PutIfAbsentAsync(   // valid end (mode reverts) so the end snapshot builds; add not reached
+            "_delta_log/00000000000000000002.json",
+            Encoding.UTF8.GetBytes(MetaLine("id") + "\n" + DeltaTestHarness.Add("data/b.parquet") + "\n"),
+            CancellationToken.None);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(0, 2)));
+        Assert.Contains("unreadable column-mapping identity", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("bogus", ex.Message, StringComparison.Ordinal);   // no forged-mode echo in .Message
+    }
+
     // ------------------------------------------------- #662 id-mode EE-08 NEGATIVE (fail-closed) tests
     //
     // The positive test above proves the id-branch of ValidateCdcLeafSchema ACCEPTS a well-formed foreign

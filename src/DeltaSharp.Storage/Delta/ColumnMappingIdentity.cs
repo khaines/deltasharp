@@ -36,16 +36,26 @@ internal readonly struct ColumnMappingIdentity
     /// by logical path is correct: two versions "agree" on a column when the same logical column maps to the
     /// same physical identity.
     /// </summary>
-    /// <exception cref="SchemaValidationException">The <c>schemaString</c> is unparseable (a forged /
-    /// inconsistent log); the caller fails the read closed.</exception>
+    /// <exception cref="SchemaValidationException">The <c>schemaString</c> is unparseable OR parses to a
+    /// non-<see cref="StructType"/> top-level type (a Delta table schema is ALWAYS a struct, so either is a
+    /// forged / inconsistent log); the caller fails the read closed.</exception>
+    /// <exception cref="DeltaProtocolException">The metadata declares an unrecognized column-mapping mode
+    /// (via <see cref="ColumnMapping.ResolveMode"/>); the caller fails the read closed.</exception>
     internal static ColumnMappingIdentity FromMetadata(MetadataAction metadata)
     {
+        // A Delta table schema's top level is ALWAYS a struct. An unparseable schemaString throws inside
+        // SchemaJson.FromJson; a schemaString that parses to a NON-struct DataType (e.g. a bare "long") is
+        // likewise a forged/inconsistent log — fail closed rather than treat it as zero columns (which would
+        // silently exempt the version from the per-column identity compare).
         var columns = new Dictionary<string, ColumnKey>(StringComparer.Ordinal);
-        if (SchemaJson.FromJson(metadata.SchemaString) is StructType schema)
+        if (SchemaJson.FromJson(metadata.SchemaString) is not StructType schema)
         {
-            Collect(schema, string.Empty, columns);
+            throw new SchemaValidationException(
+                "A change-feed metadata schemaString parsed to a non-struct top-level type; a Delta table "
+                + "schema must be a struct, so the log is inconsistent and the read fails closed.");
         }
 
+        Collect(schema, string.Empty, columns);
         return new ColumnMappingIdentity(
             ColumnMapping.ResolveMode(metadata.Configuration), metadata.PartitionColumns, columns);
     }
@@ -54,10 +64,20 @@ internal readonly struct ColumnMappingIdentity
     /// True if <paramref name="historical"/> is a legal (immutability-preserving) predecessor of THIS (end)
     /// identity: identical mode, identical partition-column set, and — for every column present in BOTH — an
     /// identical (field id, physical name). A column present on only one side is permitted, because
-    /// legitimate schema evolution ADDS columns; only a COMMON column whose identity changed is a violation.
-    /// A logical rename (column-mapping) keeps id + physical name but changes the logical path, so it changes
-    /// the key and is neither falsely flagged (legal) nor able to mask a reassignment of a still-present
-    /// logical column (that column stays keyed and is compared).
+    /// legitimate schema evolution ADDS (or DROPS) columns; only a COMMON column whose identity changed is a
+    /// violation.
+    /// <para>A logical rename (column-mapping) keeps id + physical name but changes the logical path, so it
+    /// changes the key: it is neither falsely flagged (legal) nor able to mask a reassignment of a
+    /// still-present logical column (that column stays keyed and is compared).</para>
+    /// <para><b>Rename-equivalent residual (not a preventable mismap).</b> Dropping a logical column
+    /// <c>victim(id=1, phys=col-A)</c> and adding a NEW logical column <c>attacker(id=1, phys=col-A)</c> that
+    /// REUSES the dropped id/physical name is byte-identical, in the metadata, to a legal RENAME of
+    /// <c>victim</c>→<c>attacker</c> (a rename also preserves id + physical name). The read resolves by the
+    /// identity anchor (field id in id mode, physical name in name mode), so the re-added column surfaces the
+    /// same data a rename would — there is no metadata-only way to distinguish an illegal id/physical REUSE
+    /// from a legal rename, so failing closed on it would also reject every legitimate rename (an availability
+    /// regression). It therefore passes here and grants no capability beyond the issue's stipulated
+    /// <c>_delta_log</c>-write / data-content-forgery threat model.</para>
     /// </summary>
     internal bool IsImmutableFrom(in ColumnMappingIdentity historical)
     {
@@ -78,6 +98,14 @@ internal readonly struct ColumnMappingIdentity
         return true;
     }
 
+    // Collects each logical column's (field id, physical name) keyed by its fully-qualified logical path.
+    // Recurses DIRECT struct fields only — structs nested inside array/map element types are NOT descended,
+    // matching this build's support surface (nested column mapping — incl. nested-in-array/map — is
+    // unsupported and rejected fail-closed upstream at create/commit and in the Parquet reader; tracked under
+    // #676). The dotted path key is not collision-proof against a forged literal-dot logical name (e.g. a
+    // top-level column literally named "a.b" vs a nested "a"→"b"), but that is not a reachable mismap here:
+    // an id-mode nested read already fails closed (flat/leaf-only), so no CDF read resolves through a nested
+    // path, and a legitimate table never carries such a name.
     private static void Collect(StructType schema, string prefix, Dictionary<string, ColumnKey> into)
     {
         foreach (StructField field in schema)
