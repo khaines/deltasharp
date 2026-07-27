@@ -86,4 +86,39 @@ public sealed class StorageExceptionToStringTests
         Assert.Contains("The path is not a Delta table.", rendered, StringComparison.Ordinal);
         Assert.Contains(nameof(DeltaReadException), rendered, StringComparison.Ordinal);
     }
+
+    [Fact]
+    public void DeltaReadSchemaEvolutionException_ToString_OmitsInner_KeepsPathOnProperty()
+    {
+        // The attacker-controllable data-file path is kept only on .FilePath (never in the message); the
+        // originating storage exception is the inner and must not be auto-rendered.
+        const string poisonedPath = "s3://evil/\r\ninjected/file.parquet";
+        var inner = DeltaStorageException.ColumnNotPresentInFile("secret_col");
+        var ex = new DeltaReadSchemaEvolutionException(poisonedPath, inner);
+
+        string rendered = ex.ToString();
+
+        Assert.Contains(nameof(DeltaReadSchemaEvolutionException), rendered, StringComparison.Ordinal);
+        Assert.DoesNotContain(poisonedPath, rendered, StringComparison.Ordinal); // path only on .FilePath
+        Assert.DoesNotContain("secret_col", rendered, StringComparison.Ordinal); // inner not auto-rendered
+        Assert.DoesNotContain('\r', rendered);
+        Assert.Same(inner, ex.InnerException);
+        Assert.Equal(poisonedPath, ex.FilePath); // raw path retained on the typed property
+    }
+
+    [Fact]
+    public void DeltaCommitUnknownStateException_ToString_OmitsRawInner_KeepsMessage()
+    {
+        var raw = new InvalidOperationException(RawInnerLeak);
+        var ex = new DeltaCommitUnknownStateException(42, "The commit outcome could not be resolved.", raw);
+
+        string rendered = ex.ToString();
+
+        Assert.Contains("The commit outcome could not be resolved.", rendered, StringComparison.Ordinal);
+        Assert.Contains(nameof(DeltaCommitUnknownStateException), rendered, StringComparison.Ordinal);
+        Assert.DoesNotContain("RAW-INNER-LEAK", rendered, StringComparison.Ordinal);
+        Assert.DoesNotContain('\r', rendered);
+        Assert.Same(raw, ex.InnerException);
+        Assert.Equal(42, ex.Version);
+    }
 }

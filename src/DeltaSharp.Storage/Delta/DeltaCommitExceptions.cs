@@ -128,6 +128,14 @@ internal sealed class DeltaCommitUnknownStateException : Exception
 
     /// <summary>The commit version whose durability could not be determined.</summary>
     public long Version { get; }
+
+    /// <summary>
+    /// Renders this exception WITHOUT its <see cref="Exception.InnerException"/> chain (#664, RF-8b parity):
+    /// the underlying ambiguous-commit cause (a possibly-raw framework/IO exception) is retained as the inner
+    /// for server-side diagnostics but never auto-rendered by <c>ToString()</c> / <c>ILogger.LogError(ex, …)</c>.
+    /// The inner remains reachable via <see cref="Exception.InnerException"/>.
+    /// </summary>
+    public override string ToString() => DiagnosticText.DescribeWithoutInner(this);
 }
 
 /// <summary>
