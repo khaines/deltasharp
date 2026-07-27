@@ -944,9 +944,183 @@ public sealed class ChangeFeedReadTests : IDisposable
 
         DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
             async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(1, 2)));
-        Assert.Contains("column-mapping mode change", ex.Message, StringComparison.Ordinal);
+        // Fails closed on the column-mapping mode inconsistency. NOTE: with the #671 full-history check, the
+        // pre-range validation now fires FIRST for this layout (v0's id mode is BEFORE start=1 and differs
+        // from the end name mode), so the message is the "not immutable across retained history" variant
+        // rather than the per-version "mode change" one; both are the same fail-closed outcome. Assert on the
+        // substring common to both.
+        Assert.Contains("column-mapping mode", ex.Message, StringComparison.Ordinal);
         Assert.DoesNotContain(secret, ex.Message, StringComparison.Ordinal);   // mismapped secret never surfaces
         Assert.DoesNotContain(path, ex.Message, StringComparison.Ordinal);     // #653: no cdc-path leak
+    }
+
+    [Fact]
+    public async Task Implicit_RemovedFileAuthoredBeforeStartUnderDifferentMode_FailsClosed_NoMismappedRows()
+    {
+        // #671 red-team repro (pre-existing since the #658 end-mode read; the #670 per-version check covers
+        // ONLY [start,end]). A forged `_delta_log` creates an ID-mode data file at v0 (a swapped-field_id
+        // secret), then v2 flips to NAME mode and REMOVEs that historical file. A CDF read of [2,2] derives an
+        // implicit DELETE from v2's remove and would read the v0 ID-mode file BY NAME (the end mode) —
+        // surfacing a MISMAPPED secret row. The full-history mode-immutability check (every retained version
+        // BEFORE `start` must share the end mode) fails the read closed: v0's mode differs from the end. The
+        // secret never surfaces and no path is echoed (#653).
+        const string secret = "prestart_s3cret_leak_9a2b";
+        var fileSchema = new StructType(new[]
+        {
+            PhysFieldWithId("col-A", DataTypes.LongType, nullable: false, id: 2),  // swapped ids vs the schema
+            PhysFieldWithId("col-B", DataTypes.StringType, nullable: true, id: 1),
+        });
+        MutableColumnVector colA = ColumnVectors.Create(DataTypes.LongType, 1);
+        MutableColumnVector colB = ColumnVectors.Create(DataTypes.StringType, 1);
+        colA.AppendValue(991L);
+        colB.AppendBytes(Encoding.UTF8.GetBytes(secret));
+        var body = new ManagedColumnBatch(fileSchema, new ColumnVector[] { colA, colB }, 1);
+        byte[] parquet;
+        using (var buffer = new MemoryStream())
+        {
+            await new ParquetFileWriter().WriteAsync(buffer, fileSchema, new[] { body }, CancellationToken.None);
+            parquet = buffer.ToArray();
+        }
+
+        const string dataPath = "data/historical-id-file.parquet";
+        using var backend = new LocalFileSystemBackend(_root);
+        await backend.PutIfAbsentAsync(dataPath, parquet, CancellationToken.None);
+
+        const string schemaJson =
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
+            + "{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-A\"}},"
+            + "{\"name\":\"name\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"col-B\"}}]}";
+        string escaped = JsonSerializer.Serialize(schemaJson);
+        const string protocol =
+            "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,"
+            + "\"readerFeatures\":[\"columnMapping\"],\"writerFeatures\":[\"columnMapping\",\"changeDataFeed\"]}}";
+        string MetaLine(string mode) =>
+            "{\"metaData\":{\"id\":\"rt\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
+            + "\"schemaString\":" + escaped + ",\"partitionColumns\":[],\"configuration\":{"
+            + "\"delta.columnMapping.mode\":\"" + mode + "\",\"delta.columnMapping.maxColumnId\":\"2\","
+            + "\"delta.enableChangeDataFeed\":\"true\"}}}";
+
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000000.json",
+            Encoding.UTF8.GetBytes(protocol + "\n" + MetaLine("id") + "\n" + DeltaTestHarness.Add(dataPath) + "\n"),
+            CancellationToken.None);
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000001.json",
+            Encoding.UTF8.GetBytes(DeltaTestHarness.Add("data/other-id-file.parquet") + "\n"), CancellationToken.None);
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000002.json",
+            Encoding.UTF8.GetBytes(MetaLine("name") + "\n" + DeltaTestHarness.Remove(dataPath) + "\n"),
+            CancellationToken.None);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
+        Assert.Contains("column-mapping mode", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("immutable", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(secret, ex.Message, StringComparison.Ordinal);   // mismapped secret never surfaces
+        Assert.DoesNotContain(dataPath, ex.Message, StringComparison.Ordinal); // #653: no path leak
+    }
+
+    [Fact]
+    public async Task Cdf_ColumnMappingModeChangeAndChangeBackBeforeStart_FailsClosed()
+    {
+        // #671 tamper-fuzz: a TRANSIENT mode flip that REVERTS before the range (v0=name, v1=id, v2=name) is a
+        // forged mode transition even though the earliest-retained mode equals the end mode — a creation-vs-end
+        // check ALONE would miss it. The full pre-range scan of EVERY retained version's metaData catches v1's
+        // id mode != the end name mode and fails the read closed (path-free — names only the version).
+        const string schemaJson =
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
+            + "{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-A\"}}]}";
+        string escaped = JsonSerializer.Serialize(schemaJson);
+        const string protocol =
+            "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,"
+            + "\"readerFeatures\":[\"columnMapping\"],\"writerFeatures\":[\"columnMapping\",\"changeDataFeed\"]}}";
+        string MetaLine(string mode) =>
+            "{\"metaData\":{\"id\":\"rt\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
+            + "\"schemaString\":" + escaped + ",\"partitionColumns\":[],\"configuration\":{"
+            + "\"delta.columnMapping.mode\":\"" + mode + "\",\"delta.columnMapping.maxColumnId\":\"1\","
+            + "\"delta.enableChangeDataFeed\":\"true\"}}}";
+
+        using var backend = new LocalFileSystemBackend(_root);
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000000.json",
+            Encoding.UTF8.GetBytes(protocol + "\n" + MetaLine("name") + "\n"), CancellationToken.None);
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000001.json",
+            Encoding.UTF8.GetBytes(MetaLine("id") + "\n"), CancellationToken.None);     // transient flip
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000002.json",
+            Encoding.UTF8.GetBytes(MetaLine("name") + "\n"), CancellationToken.None);   // reverts (end mode)
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
+        Assert.Contains("immutable", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("1", ex.Message, StringComparison.Ordinal); // names the offending version (1)
+    }
+
+    [Fact]
+    public async Task Cdf_UniformColumnMappingModeAcrossHistory_ReadsSuccessfully_NoFalsePositive()
+    {
+        // Guards against a false positive: a LEGITIMATE column-mapped table whose mode is UNIFORM across all
+        // retained history (the normal case) must NOT be failed closed by the full-history mode-immutability
+        // check. Uniform id mode across v0..v2 with a VALID (non-swapped) id-mode cdc file in range reads its
+        // change rows normally.
+        var fileSchema = new StructType(new[]
+        {
+            PhysFieldWithId("col-A", DataTypes.LongType, nullable: false, id: 1),   // matches the schema
+            PhysFieldWithId("col-B", DataTypes.StringType, nullable: true, id: 2),
+            new StructField(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: false),
+        });
+        MutableColumnVector colA = ColumnVectors.Create(DataTypes.LongType, 1);
+        MutableColumnVector colB = ColumnVectors.Create(DataTypes.StringType, 1);
+        MutableColumnVector changeType = ColumnVectors.Create(DataTypes.StringType, 1);
+        colA.AppendValue(42L);
+        colB.AppendBytes(Encoding.UTF8.GetBytes("hello"));
+        changeType.AppendBytes(Encoding.UTF8.GetBytes(ChangeDataWriter.InsertChange));
+        var body = new ManagedColumnBatch(fileSchema, new ColumnVector[] { colA, colB, changeType }, 1);
+        byte[] parquet;
+        using (var buffer = new MemoryStream())
+        {
+            await new ParquetFileWriter().WriteAsync(buffer, fileSchema, new[] { body }, CancellationToken.None);
+            parquet = buffer.ToArray();
+        }
+
+        const string path = "_change_data/uniform-id-cdc.parquet";
+        using var backend = new LocalFileSystemBackend(_root);
+        await backend.PutIfAbsentAsync(path, parquet, CancellationToken.None);
+
+        const string schemaJson =
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
+            + "{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-A\"}},"
+            + "{\"name\":\"name\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"col-B\"}}]}";
+        string escaped = JsonSerializer.Serialize(schemaJson);
+        const string protocol =
+            "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,"
+            + "\"readerFeatures\":[\"columnMapping\"],\"writerFeatures\":[\"columnMapping\",\"changeDataFeed\"]}}";
+        string idMeta =
+            "{\"metaData\":{\"id\":\"rt\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
+            + "\"schemaString\":" + escaped + ",\"partitionColumns\":[],\"configuration\":{"
+            + "\"delta.columnMapping.mode\":\"id\",\"delta.columnMapping.maxColumnId\":\"2\","
+            + "\"delta.enableChangeDataFeed\":\"true\"}}}";
+        string cdc =
+            $"{{\"cdc\":{{\"path\":\"{path}\",\"partitionValues\":{{}},\"size\":{parquet.Length},"
+            + "\"dataChange\":false}}";
+
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000000.json",
+            Encoding.UTF8.GetBytes(protocol + "\n" + idMeta + "\n"), CancellationToken.None);
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000001.json", Encoding.UTF8.GetBytes(cdc + "\n"), CancellationToken.None);
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000002.json", Encoding.UTF8.GetBytes(idMeta + "\n"), CancellationToken.None);
+
+        // Uniform id mode across all retained history → the mode-immutability check passes; the read succeeds.
+        (_, List<ColumnBatch> batches) = await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(1, 2));
+        Assert.NotEmpty(batches);
     }
 
     // ------------------------------------------------- #662 id-mode EE-08 NEGATIVE (fail-closed) tests

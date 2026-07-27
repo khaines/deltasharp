@@ -469,6 +469,72 @@ internal sealed class DeltaLog
         return paths;
     }
 
+    /// <summary>
+    /// Validates that the column-mapping MODE is immutable across the RETAINED history strictly BEFORE
+    /// <paramref name="rangeStartVersion"/>, matching <paramref name="endMode"/> — the end-of-range snapshot
+    /// mode a change-feed read interprets every touched file through (#671). A file a <c>remove</c> in the
+    /// range references may have been AUTHORED at any prior retained version; because Delta column-mapping mode
+    /// is <b>immutable</b> (id is creation-only, name is sticky), a historical version whose mode differs from
+    /// the end is a forged/illegal <c>_delta_log</c> — reading its file through the end mode would surface
+    /// MISMAPPED change rows (e.g. an id-mode file with swapped <c>field_id</c>s read by NAME), so the read
+    /// must fail closed. Scans the baseline mode at the earliest reconstructable version (a checkpoint-compacted
+    /// mode no surviving commit re-expresses) plus every retained commit's <c>metaData</c> before the range —
+    /// including a transient change-and-change-back that reverted before <c>start</c>. The in-range
+    /// <c>[start, end]</c> window is validated per-version by the change-feed reader, so this closes the
+    /// pre-<c>start</c> gap the per-version check cannot see. The fail-closed message is path-free (#653): it
+    /// names ONLY the offending version, never a file path, column name, or cell value.
+    /// </summary>
+    /// <exception cref="DeltaProtocolException">A retained version before the range declares a different (or
+    /// unrecognized) column-mapping mode, or a retained commit is malformed / exceeds the read ceiling.</exception>
+    internal async Task ValidateColumnMappingModeStableBeforeAsync(
+        long rangeStartVersion, ColumnMappingMode endMode, CancellationToken cancellationToken)
+    {
+        LogListing listing = await ListLogAsync(cancellationToken).ConfigureAwait(false);
+        long earliest = EarliestReconstructableVersion(listing);
+        if (earliest >= rangeStartVersion)
+        {
+            return; // No retained history before the range; the reader's per-version check covers [start, end].
+        }
+
+        // Baseline: the mode as of the earliest reconstructable version — compacted from a checkpoint when the
+        // creation commit has aged out, so a checkpoint-baked mode that no surviving commit re-expresses is
+        // still caught.
+        Snapshot earliestSnapshot = await LoadSnapshotAsync(earliest, cancellationToken).ConfigureAwait(false);
+        if (ColumnMapping.ResolveMode(earliestSnapshot.Metadata.Configuration) != endMode)
+        {
+            throw ColumnMappingModeNotImmutable(earliest);
+        }
+
+        // Every retained commit's metaData REPLACES the metadata (Delta semantics); a differing mode at any
+        // version before the range — including a change-and-change-back that reverted before start — is a
+        // forged mode transition.
+        foreach (long version in listing.Commits)
+        {
+            if (version >= rangeStartVersion)
+            {
+                continue;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            foreach (DeltaAction action in await ReadCommitActionsAsync(version, cancellationToken).ConfigureAwait(false))
+            {
+                if (action is MetadataAction metadata
+                    && ColumnMapping.ResolveMode(metadata.Configuration) != endMode)
+                {
+                    throw ColumnMappingModeNotImmutable(version);
+                }
+            }
+        }
+    }
+
+    private static DeltaProtocolException ColumnMappingModeNotImmutable(long version) =>
+        DeltaProtocolException.Unsupported(string.Create(
+            CultureInfo.InvariantCulture,
+            $"The table's column-mapping mode is not immutable across retained history (version {version} "
+            + $"declares a different mode than the end of the requested change-feed range); a column-mapping "
+            + $"mode transition is protocol-illegal, so the change-feed read fails closed rather than risk "
+            + $"emitting mismapped change data."));
+
     /// <summary>Seeds <paramref name="state"/> from the selected checkpoint's parts, returning its version,
     /// or <see langword="null"/> if the checkpoint is corrupt/partial (the caller then replays from 0).</summary>
     private async Task<long?> TrySeedFromCheckpointAsync(

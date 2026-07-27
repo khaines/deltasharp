@@ -274,6 +274,27 @@ internal sealed class ChangeFeedReader
             throw new DeltaReadException(ex.Message, ex);
         }
 
+        // Full-history column-mapping mode immutability (#671): the per-version check below covers a mode
+        // transition WITHIN [start, end], but a file a `remove` in the range references may have been AUTHORED
+        // before `start` under a different mode (the implicit-DELETE path reads it through the END mode) — a
+        // mismap the per-version check never sees. Validate that every RETAINED version before `start` shares
+        // the end mode (Delta column-mapping mode is immutable), failing closed on any difference.
+        try
+        {
+            await _log.ValidateColumnMappingModeStableBeforeAsync(info.StartVersion, ctx.Mode, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (DeltaProtocolException ex)
+        {
+            throw new DeltaReadException(ex.Message, ex);
+        }
+        catch (DeltaStorageException ex)
+        {
+            throw new DeltaReadException(
+                $"A change-feed pre-range validation read failed (storage fault: {ex.Kind}); the requested "
+                + "change-feed range failed closed.", ex);
+        }
+
         // `_commit_timestamp` is pinned at RESOLVE time (item 4 / query-exec L2): LoadChangeFeedAsync captured
         // the effective `<N>.json`-mtime map for [start, end] into the resolution proof, so an intervening
         // log-cleanup — which can advance the earliest-reconstructable floor between resolve and read — cannot
@@ -350,12 +371,13 @@ internal sealed class ChangeFeedReader
             // emit mismapped change data. (Pre-existing since the #658 end-mode read; hardened here with #662.)
             // Path-free (#653): only the bounded version is named.
             //
-            // SCOPE (partial mitigation): this catches a mode change at any version IN `[start, end]`. It does
-            // NOT catch a file referenced by a `remove` in the range but AUTHORED before `start` under a
-            // different mode (implicit-DELETE of a historical file across a mode boundary) — the per-version
-            // check never inspects the historical version's mode. Full-history mode-immutability validation is
-            // tracked in #671 (pre-existing, requires a forged/illegal mode-change log — an actor with
-            // `_delta_log` write access).
+            // SCOPE: this catches a mode change at any version IN `[start, end]`. The COMPLEMENTARY pre-range
+            // check (`ValidateColumnMappingModeStableBeforeAsync`, run before this loop) covers a file
+            // referenced by a `remove` in the range but AUTHORED before `start` under a different mode
+            // (implicit-DELETE of a historical file across a mode boundary) — so full retained-history
+            // mode-immutability is now validated (#671). Residual (inherent): a mode flip entirely within
+            // AGED-OUT history below the earliest reconstructable version is physically unreadable; mode
+            // immutability then guarantees the surviving history's uniform mode also held there.
             if (ColumnMapping.ResolveMode(currentMetadata.Configuration) != ctx.Mode)
             {
                 throw new DeltaReadException(
