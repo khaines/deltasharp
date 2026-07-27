@@ -144,6 +144,17 @@ internal sealed class LogicalOutput
                 return new AttributeReference(alias.Name, aliasType, alias.Nullable, new ExprId(_nextId++));
 
             case ResolvedFunction function:
+                // A bare function in output position is auto-named with the pretty SQL string, mirroring the
+                // analyzer's ToAttribute so the physical schema matches the analyzed one exactly.
+                //
+                // #687: this MUST stay on the RAW renderer. CoercionHelpers.PrettyReference is dual-purpose —
+                // diagnostics render the offending reference with the same renderer, but they go through
+                // CoercionHelpers.DiagnosticReference, which bounds and neutralizes the result. Here the result
+                // is a real output-schema COLUMN NAME, so bounding it would change query RESULTS, not prose:
+                // an over-cap auto-name would silently become an elided `…`-suffixed column. Note this site is
+                // in a DIFFERENT ASSEMBLY from the analyzer's twin (Analyzer.SparkAutoName), so converting only
+                // one of them compiles, passes, and silently desynchronizes the analyzed and physical schemas —
+                // LogicalOutputAutoNameHygieneTests pins the two together against exactly that edit.
                 return new AttributeReference(
                     CoercionHelpers.PrettyReference(function), function.Type, function.Nullable, new ExprId(_nextId++));
 

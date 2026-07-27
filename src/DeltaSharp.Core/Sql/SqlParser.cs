@@ -56,7 +56,7 @@ internal sealed class SqlParser
     /// token back verbatim and in full, while a hostile <c>delta.constraints.&lt;name&gt;</c> CHECK predicate
     /// carrying a 100&#160;000-character token can no longer render a 100&#160;000-character message (#687).
     /// Bounding the TOKEN (rather than only the finished message, which
-    /// <see cref="SqlParseException.MaxSyntaxDetailLength"/> also does) keeps the surrounding explanatory prose
+    /// <see cref="SqlParseException.MaxMessageLength"/> also does) keeps the surrounding explanatory prose
     /// intact instead of letting an oversized lexeme consume the entire message budget.
     /// </summary>
     private const int EchoedTokenMaxLength = DiagnosticText.DefaultMaxLength;

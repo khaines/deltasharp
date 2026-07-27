@@ -30,9 +30,11 @@ namespace DeltaSharp.Diagnostics;
 /// </remarks>
 internal static class DiagnosticText
 {
-    /// <summary>The default cap for an echoed identifier-shaped token — generous enough for any real dotted
-    /// column path, SQL identifier, or physical <c>col-&lt;uuid&gt;</c> name (40 chars), yet bounded so a
-    /// crafted token cannot blow up a log line.</summary>
+    /// <summary>The default cap for an echoed <b>identifier-shaped token</b> — generous enough for any
+    /// realistic identifier, dotted path, or protocol key, yet bounded so a crafted token cannot blow up a log
+    /// line. This is the primitive's neutral default; each calling layer documents its own reason where it
+    /// aliases or overrides it (for example <c>SqlParser.EchoedTokenMaxLength</c> for an echoed SQL lexeme, or
+    /// <c>DeltaSharp.Storage.Delta.DiagnosticText.ConfigTokenMaxLength</c> for a table-property value).</summary>
     internal const int DefaultMaxLength = 128;
 
     /// <summary>
@@ -48,6 +50,32 @@ internal static class DiagnosticText
         if (raw is null)
         {
             return "(null)";
+        }
+
+        // Fast path: the overwhelmingly common case is a short, clean token — a real column name, a protocol
+        // feature key, an ordinary SQL identifier. #696 also calls this per-row-group x per-nested-column, so
+        // an unconditional StringBuilder allocation (measured 160 bytes/call) shows up as real Gen0 pressure on
+        // a hot path that previously allocated nothing. Verify the input is already within budget and free of
+        // anything the slow path would rewrite, then hand back the SAME instance. Surrogates bail to the slow
+        // path even when the pair is well-formed (where it would copy them verbatim): pair validation is the
+        // slow path's job, and keeping the fast path a single flat scan keeps it obviously equivalent.
+        if (raw.Length <= maxLength)
+        {
+            bool clean = true;
+            for (int i = 0; i < raw.Length; i++)
+            {
+                char c = raw[i];
+                if (IsInjectionUnsafe(c) || char.IsSurrogate(c))
+                {
+                    clean = false;
+                    break;
+                }
+            }
+
+            if (clean)
+            {
+                return raw;
+            }
         }
 
         // Cap the length without splitting a UTF-16 surrogate pair (a lone surrogate is malformed text).
@@ -149,10 +177,29 @@ internal static class DiagnosticText
         return builder.ToString();
     }
 
-    // A character is neutralized if it is a C0/C1 control (category Cc — CR/LF/NUL/tab/NEL) OR a Unicode
-    // LINE/PARAGRAPH SEPARATOR (U+2028/U+2029, categories Zl/Zp), which several renderers and log viewers treat
-    // as a newline — so the full log-injection line-break surface, not just Cc, is closed.
+    // A character is neutralized if it is a C0/C1 control (category Cc — CR/LF/NUL/tab/NEL), a Unicode
+    // LINE/PARAGRAPH SEPARATOR (U+2028/U+2029, categories Zl/Zp) which several renderers and log viewers treat
+    // as a newline, or a FORMAT character (category Cf).
+    //
+    // Cf matters even though it cannot forge a new log RECORD, because it serves the same objective this
+    // primitive exists to defeat — making the log lie. U+202E (RTL override) visually reverses the remainder of
+    // a rendered line, so an attacker can make a hostile token read as something else entirely during incident
+    // triage; U+200B/U+200E/U+FEFF/U+00AD hide or silently reorder text in exactly the surfaces (log viewers,
+    // terminals, issue trackers) a fault message is read in.
+    //
+    // DELIBERATE TRADE, do not "fix" this back: U+200D (ZWJ) and U+200C (ZWNJ) are also Cf and ARE semantically
+    // required for correct Indic/Arabic shaping and emoji sequences, so a blanket Cf ban slightly degrades how
+    // an exotic-but-legitimate identifier RENDERS. That trade is right here for two reasons. (1) A diagnostic
+    // message is not a text-rendering surface — it is prose read by a human triaging a failure, and a
+    // zero-width joiner carries no information a reader can act on, while an RTL override actively misleads
+    // them. (2) The raw value is never lost: it stays verbatim on the typed, machine-readable channel
+    // (AnalysisException.Reference/RootColumn/Candidates, SqlToken.Text), which is what any caller that needs
+    // the exact bytes should read. Neutralizing the whole category keeps the rule stated in one place and
+    // trivially auditable, rather than an allow-list that must be revisited each Unicode revision.
     private static bool IsInjectionUnsafe(char c) =>
         char.IsControl(c)
-        || char.GetUnicodeCategory(c) is UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator;
+        || char.GetUnicodeCategory(c)
+            is UnicodeCategory.LineSeparator
+                or UnicodeCategory.ParagraphSeparator
+                or UnicodeCategory.Format;
 }

@@ -110,6 +110,22 @@ public sealed class HostileConstraintDiagnosticHygieneTests : IDisposable
     }
 
     [Fact]
+    public void HostileCheckPredicate_WithFormatCharacters_SurfacesNoBidiOrZeroWidthPayload_AndFailsClosed()
+    {
+        // Council round 2, item 2: the Cf half of the injection class at the PARSER sink. Pre-fix these
+        // survived the Cc-only neutralization set intact (Security: 10 of 21 parametrized payloads failed, all
+        // and only the Cf ones).
+        string table = Table("format-chars");
+        SeedWithHostileConstraint(table, "other > 0 `TRAIL\u202EFORGED\u200E\uFEFF\u00AD\u2066\u200B`");
+
+        Exception ex = Assert.ThrowsAny<Exception>(() => Append(table, Amounts(1)));
+
+        AssertChainIsHygienic(ex);
+        Assert.Contains("FORGED", ex.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(CommitFile(table, 2)));
+    }
+
+    [Fact]
     public void WellFormedCheckPredicate_StillEnforced_ControlIsolatesTheHygieneChange()
     {
         // Control: the hygiene change must not disturb normal enforcement — a well-formed CHECK still parses,
@@ -179,7 +195,7 @@ public sealed class HostileConstraintDiagnosticHygieneTests : IDisposable
                 Assert.False(
                     char.IsControl(c)
                     || char.GetUnicodeCategory(c)
-                        is UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator,
+                        is UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator or UnicodeCategory.Format,
                     FormattableString.Invariant(
                         $"{current.GetType().Name}.Message carries injection-unsafe U+{(int)c:X4} at index {i}"));
             }

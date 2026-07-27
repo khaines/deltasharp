@@ -103,6 +103,28 @@ public sealed class HostileConstraintAnalyzerHygieneTests : IDisposable
     }
 
     [Fact]
+    public void HostileLiteral_FormatCharacters_SurfaceNoBidiOrZeroWidthPayload_AndFailClosed()
+    {
+        // Council round 2, item 2 (Security + red-team, independently): before UnicodeCategory.Format was added
+        // to IsInjectionUnsafe, this reached the real sink intact —
+        //   E2E_FormatChars_SurviveToTheSink: len=195 :: … '(amount > "A<U+202E>FORGED<U+200E><U+FEFF>")' …
+        // U+202E visually reverses the remainder of a rendered log line and the zero-width characters hide or
+        // reorder text during incident triage. It cannot forge a NEW record (hence Medium, not High), but it
+        // serves the same "make the log lie" objective this PR exists to close.
+        string table = Table("format-chars");
+        SeedWithHostileConstraint(table, "amount > 'A\u202EFORGED\u200E\uFEFF\u00AD\u2066\u200B'");
+
+        Exception ex = Assert.ThrowsAny<Exception>(() => Append(table, Amounts(1)));
+
+        AssertChainIsHygienic(ex);
+
+        // Non-vacuity: the analyzer diagnostic really is the one surfaced, and the neutralized text is present.
+        Assert.Contains("data type mismatch", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("FORGED", ex.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(CommitFile(table, 2)));
+    }
+
+    [Fact]
     public void HostileLiteral_InsideNotOperand_SurfacesHygienicMessage_AndFailsClosed()
     {
         // A second analyzer throw site (ExpressionCoercion.RequireBoolean), reached without any comparison —
@@ -173,7 +195,7 @@ public sealed class HostileConstraintAnalyzerHygieneTests : IDisposable
                 Assert.False(
                     char.IsControl(c)
                     || char.GetUnicodeCategory(c)
-                        is UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator,
+                        is UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator or UnicodeCategory.Format,
                     FormattableString.Invariant(
                         $"{current.GetType().Name}.Message carries injection-unsafe U+{(int)c:X4} at index {i}"));
             }

@@ -163,6 +163,12 @@ public sealed class SqlParserDiagnosticHygieneTests
     [InlineData("\u2029")] // PARAGRAPH SEPARATOR
     [InlineData("\u001b")] // ESC — the lead-in for ANSI terminal escape sequences
     [InlineData("\u0085")] // NEL (C1 control)
+    [InlineData("\u202e")] // RIGHT-TO-LEFT OVERRIDE (Cf) — visually reverses the rest of a rendered log line
+    [InlineData("\u200e")] // LEFT-TO-RIGHT MARK (Cf)
+    [InlineData("\ufeff")] // ZERO WIDTH NO-BREAK SPACE / BOM (Cf)
+    [InlineData("\u00ad")] // SOFT HYPHEN (Cf) — invisible in most renderers
+    [InlineData("\u2066")] // LEFT-TO-RIGHT ISOLATE (Cf)
+    [InlineData("\u200b")] // ZERO WIDTH SPACE (Cf) — hides or reorders text during triage
     public void SyntaxError_NonCrLfLineBreakingCharacters_AreAlsoNeutralized(string payload)
     {
         SqlParseException ex = Assert.Throws<SqlParseException>(
@@ -214,6 +220,53 @@ public sealed class SqlParserDiagnosticHygieneTests
     }
 
     [Fact]
+    public void EchoedTokenCap_IsExactlyOneHundredTwentyEight_PinnedAsALiteral()
+    {
+        // The interactive-UX promise ("a realistic typo comes back whole") is calibrated to this number, and
+        // three layers alias it (Abstractions -> Storage -> SqlParser.EchoedTokenMaxLength). The neighbouring
+        // boundary tests reference the constant, so they would move with it and prove nothing; this one pins
+        // the LITERAL so shrinking the bound is a deliberate, visible act.
+        string atCap = new('c', 128);
+        string overCap = new('c', 129);
+
+        SqlParseException whole = Assert.Throws<SqlParseException>(
+            () => SqlParser.ParseConstraintExpression("a > 0 `" + atCap + "`"));
+        SqlParseException elided = Assert.Throws<SqlParseException>(
+            () => SqlParser.ParseConstraintExpression("a > 0 `" + overCap + "`"));
+
+        Assert.Contains(atCap, whole.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain('\u2026', whole.Message);
+        Assert.Contains('\u2026', elided.Message);
+    }
+
+    [Fact]
+    public void PublicConstructors_AreAlsoBounded_TheBackstopIsNotSyntaxOnly()
+    {
+        // Council round 2, item 4 (Architect A2 + Security): SqlParseException is a public sealed type with
+        // three PUBLIC constructors that bypass the Syntax factory. The backstop used to live in the factory,
+        // so the doc's "no present or future call site can bypass" claim was wrong. It now lives in a private
+        // chokepoint every constructor routes through. All three current in-repo uses carry fixed prose, so
+        // nothing was exploitable — this pins the stronger posture so a future untrusted-input caller inherits
+        // it for free.
+        string hostile = "TRAIL\r\nFORGED" + new string('z', FloodLength);
+
+        foreach (SqlParseException ex in new[]
+        {
+            new SqlParseException(hostile),
+            new SqlParseException(hostile, new InvalidOperationException("inner")),
+        })
+        {
+            AssertHygienic(ex.Message);
+
+            // `Sanitize` keeps MaxMessageLength characters and then appends the elision glyph, so the bound on
+            // the rendered string is MaxMessageLength + 1. Pinned exactly rather than loosely so a change in
+            // the elision shape is visible here.
+            Assert.Equal(SqlParseException.MaxMessageLength + 1, ex.Message.Length);
+            Assert.EndsWith("\u2026", ex.Message, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
     public void SyntaxError_HostileToken_StaysDeterministic_AcrossRepeatedParses()
     {
         // Sanitizing must not make the diagnostic nondeterministic — the parse door's stability contract.
@@ -259,13 +312,13 @@ public sealed class SqlParserDiagnosticHygieneTests
             char c = message[i];
             Assert.False(
                 char.IsControl(c)
-                || char.GetUnicodeCategory(c) is UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator,
+                || char.GetUnicodeCategory(c) is UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator or UnicodeCategory.Format,
                 FormattableString.Invariant(
                     $"message carries an injection-unsafe char U+{(int)c:X4} at index {i}"));
         }
 
         Assert.True(
-            message.Length <= SqlParseException.MaxSyntaxDetailLength + 64,
+            message.Length <= SqlParseException.MaxMessageLength + 64,
             FormattableString.Invariant($"message length {message.Length} exceeds the bounded render budget"));
     }
 }

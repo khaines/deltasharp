@@ -116,7 +116,7 @@ internal sealed class AnalysisException : Exception
     /// <summary>
     /// The cap applied to the <b>whole composed message</b> of every <see cref="AnalysisException"/> — the
     /// backstop half of the #687 diagnostic-hygiene posture, and the analyzer's analogue of
-    /// <c>SqlParseException.MaxSyntaxDetailLength</c>.
+    /// <c>SqlParseException.MaxMessageLength</c>.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -133,6 +133,15 @@ internal sealed class AnalysisException : Exception
     /// <see cref="Reference"/>, <see cref="RootColumn"/>, and <see cref="Candidates"/> remain available
     /// <b>unmodified</b> as the structured, machine-readable channel (they are matched on by callers such as
     /// the Delta dependent-column reclassifier, so they must never be rewritten).
+    /// </para>
+    /// <para>
+    /// <b>Invariant this creates:</b> an <see cref="AnalysisException"/> message is single-line by
+    /// construction — a structural <c>\n</c> a factory might want for a multi-line listing would itself be
+    /// neutralized to U+FFFD. That is deliberate for an analyzer diagnostic (every one is a single sentence)
+    /// and is the opposite of the Storage posture, where per-token sanitization exists precisely so
+    /// <c>DeltaConstraintDependentColumnException</c>'s own <c>"\n  "</c> listing survives. A future
+    /// multi-line analyzer diagnostic must therefore sanitize its untrusted TOKENS and opt out of this
+    /// whole-message backstop, not fight it.
     /// </para>
     /// </remarks>
     internal const int MaxMessageLength = 1024;

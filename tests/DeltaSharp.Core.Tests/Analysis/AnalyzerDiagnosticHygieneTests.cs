@@ -46,8 +46,13 @@ public sealed class AnalyzerDiagnosticHygieneTests
 
     /// <summary>Hostile CHECK predicates, each reaching a DIFFERENT analyzer diagnostic that interpolates
     /// attacker-authored text. The first four go through the expression renderer (the confirmed
-    /// <c>DataTypeMismatch</c> leak); the last two reach factories that interpolate a raw name and a raw
-    /// CANDIDATE list instead, and are covered only by the constructor backstop.</summary>
+    /// <c>DataTypeMismatch</c> leak); the rest reach factories that interpolate a raw name, a raw CANDIDATE
+    /// list, or a raw function name instead — they never touch the renderer, so only the constructor backstop
+    /// covers them.
+    /// <para>Payloads span both halves of the injection class: <c>Cc</c> (raw CR/LF, forges a new log record)
+    /// and <c>Cf</c> format characters (U+202E RTL-override visually reverses the rest of a rendered line;
+    /// U+200B/U+200E/U+FEFF hide or reorder text during triage — they cannot forge a record but serve the same
+    /// "make the log lie" objective).</para></summary>
     public static TheoryData<string, string> HostilePredicates() => new()
     {
         { "comparison-mismatch", "amount > 'A" + CrLf + "FORGED'" },
@@ -56,6 +61,14 @@ public sealed class AnalyzerDiagnosticHygieneTests
         { "nested-in-conjunction", "amount > 0 AND amount > 'A" + CrLf + "FORGED'" },
         { "unresolved-column-name", "`A" + CrLf + "FORGED` > 0" },
         { "struct-field-on-scalar", "amount.`A" + CrLf + "FORGED` > 0" },
+
+        // Cf (format) payloads, at the renderer and at the backstop-only factories.
+        { "rtl-override-literal", "amount > 'A\u202EFORGED'" },
+        { "zero-width-space-literal", "amount > 'A\u200BFORGED'" },
+        { "bom-literal", "amount > 'A\uFEFFFORGED'" },
+        { "lrm-and-soft-hyphen-literal", "amount > 'A\u200E\u00ADFORGED'" },
+        { "isolate-literal", "amount > 'A\u2066FORGED\u2069'" },
+        { "rtl-override-column", "`A\u202EFORGED` > 0" },
     };
 
     [Theory]
@@ -127,6 +140,59 @@ public sealed class AnalyzerDiagnosticHygieneTests
         Assert.True(
             ex.Message.Length <= AnalysisException.MaxMessageLength + 1,
             FormattableString.Invariant($"message length {ex.Message.Length} exceeds the backstop"));
+    }
+
+    /// <summary>The factories the whole-message backstop <b>uniquely</b> protects: each takes direct string
+    /// input, composes its own message, and never reaches the expression renderer — so the per-reference layer
+    /// cannot help them. They are exercised through their public factories rather than through SQL because the
+    /// M1 SQL door rejects a function call at PARSE time, so a hostile CHECK predicate cannot reach
+    /// <c>UnknownFunction</c> today; the analyzer can still raise them (a DataFrame-API path, or the EPIC-07
+    /// frontend), and the backstop must hold when it does.</summary>
+    public static TheoryData<string, Func<Exception>> BackstopOnlyFactories() => new()
+    {
+        {
+            "unknown-function",
+            () => AnalysisException.UnknownFunction(
+                "A" + CrLf + "\u202EFORGED", new DataType[] { IntegerType.Instance })
+        },
+        {
+            "unknown-function-flood",
+            () => AnalysisException.UnknownFunction(new string('z', FloodLength), Array.Empty<DataType>())
+        },
+        {
+            "table-or-view-not-found",
+            () => AnalysisException.TableOrViewNotFound(new[] { "ns", "A" + CrLf + "\u202EFORGED" })
+        },
+        {
+            "table-or-view-not-found-flood",
+            () => AnalysisException.TableOrViewNotFound(new[] { new string('z', FloodLength) })
+        },
+        {
+            "ambiguous-reference",
+            () => AnalysisException.AmbiguousReference(
+                "A" + CrLf + "\u202EFORGED",
+                new[]
+                {
+                    new AttributeReference("A\u200BFORGED", IntegerType.Instance, true, new ExprId(1)),
+                    new AttributeReference(new string('z', FloodLength), IntegerType.Instance, true, new ExprId(2)),
+                })
+        },
+        {
+            "invalid-function-argument",
+            () => AnalysisException.InvalidFunctionArgument(
+                "A\uFEFFFORGED", Array.Empty<DataType>(), "argument #1 ('" + new string('z', FloodLength) + "')")
+        },
+    };
+
+    [Theory]
+    [MemberData(nameof(BackstopOnlyFactories))]
+    public void BackstopOnlyFactory_IsBoundedAndNeutralized(string site, Func<Exception> build)
+    {
+        ArgumentNullException.ThrowIfNull(build);
+
+        Exception ex = build();
+
+        AssertHygienic(site, ex.Message);
     }
 
     [Fact]
@@ -228,7 +294,7 @@ public sealed class AnalyzerDiagnosticHygieneTests
             Assert.False(
                 char.IsControl(c)
                 || char.GetUnicodeCategory(c)
-                    is UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator,
+                    is UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator or UnicodeCategory.Format,
                 FormattableString.Invariant($"[{site}] injection-unsafe U+{(int)c:X4} at index {i}"));
         }
 

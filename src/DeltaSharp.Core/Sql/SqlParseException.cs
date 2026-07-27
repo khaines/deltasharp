@@ -29,7 +29,7 @@ public sealed class SqlParseException : Exception
     /// <summary>Initializes a new instance with a precise <paramref name="message"/>.</summary>
     /// <param name="message">The deterministic error message.</param>
     public SqlParseException(string message)
-        : base(message)
+        : base(Bounded(message))
     {
     }
 
@@ -37,12 +37,12 @@ public sealed class SqlParseException : Exception
     /// <param name="message">The deterministic error message.</param>
     /// <param name="innerException">The exception that caused this error.</param>
     public SqlParseException(string message, Exception? innerException)
-        : base(message, innerException)
+        : base(Bounded(message), innerException)
     {
     }
 
     private SqlParseException(string message, SqlParseErrorKind kind, string? construct)
-        : base(message)
+        : base(Bounded(message))
     {
         ErrorKind = kind;
         Construct = construct;
@@ -62,12 +62,32 @@ public sealed class SqlParseException : Exception
     public string? Construct { get; }
 
     /// <summary>
-    /// The backstop cap applied to a whole <see cref="Syntax"/> detail. Sized well above the longest
-    /// diagnostic the parser composes today (its longest fixed prose plus a per-token-bounded echo is under
-    /// 250 characters), so it never truncates a well-behaved message — it exists only so a call site that
-    /// forgets to bound its own echo still cannot render an unbounded message.
+    /// The backstop cap applied to the <b>whole composed message</b> of every <see cref="SqlParseException"/>.
+    /// Sized well above the longest diagnostic the parser composes today (its longest fixed prose plus a
+    /// per-token-bounded echo is under 350 characters), so it never truncates a well-behaved message — it
+    /// exists only so a call site that forgets to bound its own echo still cannot render an unbounded message.
     /// </summary>
-    internal const int MaxSyntaxDetailLength = 512;
+    /// <remarks>
+    /// <para><b>Applied in every constructor, including the three public ones.</b> Placing it in the
+    /// <see cref="Syntax"/> factory alone left it bypassable: this type is public and exposes public
+    /// <c>(string)</c> / <c>(string, Exception)</c> constructors that never reach that factory. Nothing in the
+    /// repo exploits that today (all in-repo uses carry fixed prose), but "the backstop no call site can
+    /// bypass" has to be structurally true, not true by inspection — so the sanitize moved down to
+    /// <see cref="Bounded"/>, which every construction path runs through.</para>
+    /// <para><b>Invariant this creates:</b> a <see cref="SqlParseException"/> message is single-line by
+    /// construction — a structural <c>\n</c> a factory might want for a multi-line listing would itself be
+    /// neutralized to U+FFFD. That is deliberate for a parser diagnostic (every one is a single
+    /// position-tagged line) and is the opposite of the Storage posture, where per-token sanitization exists
+    /// precisely so <c>DeltaConstraintDependentColumnException</c>'s own <c>"\n  "</c> listing survives. A
+    /// future multi-line SQL diagnostic must therefore sanitize its untrusted TOKENS and opt out of this
+    /// whole-message backstop, not fight it.</para>
+    /// </remarks>
+    internal const int MaxMessageLength = 512;
+
+    /// <summary>Applies the <see cref="MaxMessageLength"/> backstop — the single chokepoint every constructor
+    /// routes through.</summary>
+    private static string? Bounded(string? message) =>
+        message is null ? null : DiagnosticText.Sanitize(message, MaxMessageLength);
 
     /// <summary>Builds a deterministic <see cref="SqlParseErrorKind.SyntaxError"/> tagged with the
     /// 1-based source <paramref name="position"/>.</summary>
@@ -77,30 +97,28 @@ public sealed class SqlParseException : Exception
     /// CHECK predicate comes from the table's <c>_delta_log</c> and is parsed on the write path
     /// (<c>ConstraintExpressionFrontend</c>), so a hostile table can choose the token this message renders.
     /// Every detail is therefore passed through <see cref="DiagnosticText.Sanitize"/> before it becomes the
-    /// message: control characters (raw CR/LF and friends) are neutralized to U+FFFD so the message cannot
-    /// forge lines in a structured-log sink, and the whole detail is capped at
-    /// <see cref="MaxSyntaxDetailLength"/> so a 100&#160;000-character token cannot render a
+    /// message: control characters (raw CR/LF and friends), Unicode line/paragraph separators, and format
+    /// characters (U+202E RTL-override and the zero-width family) are neutralized to U+FFFD so the message
+    /// cannot forge or visually rewrite lines in a structured-log sink, and the whole message is capped at
+    /// <see cref="MaxMessageLength"/> so a 100&#160;000-character token cannot render a
     /// 100&#160;000-character message. Individual sites additionally bound the token they echo
-    /// (<c>SqlParser.Describe</c>), so this cap is a BACKSTOP that no present or future call site can bypass —
-    /// it is deliberately generous enough never to truncate a diagnostic built from a per-token-bounded echo.
+    /// (<c>SqlParser.Describe</c>), so the cap here is a BACKSTOP no construction path can bypass — it is
+    /// deliberately generous enough never to truncate a diagnostic built from a per-token-bounded echo.
     /// Sanitizing is idempotent, so the two layers compose without double-eliding a well-formed message.</para>
     /// </remarks>
     /// <param name="detail">A precise description of what was expected/found.</param>
     /// <param name="position">The 1-based position of the offending token in the source SQL.</param>
     internal static SqlParseException Syntax(string detail, int position) =>
-        new(
-            $"Syntax error at position {position}: {DiagnosticText.Sanitize(detail, MaxSyntaxDetailLength)}",
-            SqlParseErrorKind.SyntaxError,
-            null);
+        new($"Syntax error at position {position}: {detail}", SqlParseErrorKind.SyntaxError, null);
 
     /// <summary>Builds a deterministic <see cref="SqlParseErrorKind.UnsupportedFeature"/> whose
     /// <see cref="Construct"/> is the stable <paramref name="construct"/> token and whose message
     /// carries the human-readable prose (plus a DataFrame-API onboarding hint when one exists).</summary>
-    /// <remarks>Unlike <see cref="Syntax"/> this factory is <b>not</b> sanitized, and deliberately so: every
-    /// <paramref name="construct"/> the parser passes is a compile-time constant from its own keyword maps
-    /// (<c>JOIN</c>, <c>GROUP_BY</c>, <c>FUNCTION_CALL</c>, …) — never source text — so no attacker-chosen
-    /// token can reach this message, and its long fixed onboarding prose would be the only thing a length cap
-    /// could truncate (#687).</remarks>
+    /// <remarks>The backstop applies here too (every constructor routes through it), but it is a <b>no-op</b>
+    /// in practice and always has been: every <paramref name="construct"/> the parser passes is a compile-time
+    /// constant from its own keyword maps (<c>JOIN</c>, <c>GROUP_BY</c>, <c>FUNCTION_CALL</c>, …) — never
+    /// source text — so no attacker-chosen token can reach this message, and the longest message this factory
+    /// can compose is 328 characters, comfortably inside <see cref="MaxMessageLength"/> (#687).</remarks>
     /// <param name="construct">The unsupported construct's stable token (for example <c>JOIN</c>).</param>
     /// <param name="position">The 1-based position of the construct in the source SQL.</param>
     internal static SqlParseException Unsupported(string construct, int position)

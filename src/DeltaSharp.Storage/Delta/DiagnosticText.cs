@@ -27,8 +27,13 @@ internal static class DiagnosticText
 {
     /// <summary>The default cap for an echoed identifier — generous enough for any real dotted column path
     /// (a physical name is <c>col-&lt;uuid&gt;</c> = 40 chars; a nested logical path is typically short) yet
-    /// bounded so a crafted name cannot blow up a log line.</summary>
-    internal const int DefaultMaxLength = 128;
+    /// bounded so a crafted name cannot blow up a log line.
+    /// <para><b>Aliases the shared primitive's constant rather than restating its value</b>, so there is
+    /// exactly one definition. It was previously declared here verbatim AND in
+    /// <c>DeltaSharp.Diagnostics.DiagnosticText</c>, unlinked — and because <see cref="Sanitize"/>'s optional
+    /// parameter binds THIS one, editing the shared constant silently did nothing to Storage. That is the same
+    /// silent-drift class as the elision bound above, so it is closed the same way (#687 follow-up).</para></summary>
+    internal const int DefaultMaxLength = SharedDiagnosticText.DefaultMaxLength;
 
     /// <summary>The cap for an echoed <b>table-property / configuration VALUE</b> (e.g. a
     /// <c>metaData.configuration</c> entry such as <c>delta.appendOnly</c> or a retention duration) — the
