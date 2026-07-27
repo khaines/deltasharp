@@ -8,9 +8,10 @@ namespace DeltaSharp.Storage.Tests;
 /// <summary>
 /// Typed field-metadata interop (issue #330): the Storage-side <see cref="DeltaSchemaJson"/> writer
 /// must serialize typed metadata (numeric column-mapping ids, identity numbers/booleans) exactly like
-/// the engine's <c>SchemaJson</c>. Since #330's round-1 fix, both writers call the SAME shared
-/// <c>SchemaJson.WriteMetadataValue</c> in <c>DeltaSharp.Abstractions</c>, so the parity is
-/// structural rather than a coincidence of two duplicated literals — asserted directly in
+/// the engine's <c>SchemaJson</c>. Since #330's round-1 fix, both writers shared the metadata-value
+/// writer; since #679 the Storage-side <see cref="DeltaSchemaJson"/> delegates the WHOLE footer schema
+/// to <c>SchemaJson.ToJson</c> in <c>DeltaSharp.Abstractions</c>, so the parity is structural rather
+/// than a coincidence of two duplicated literals — asserted directly in
 /// <see cref="BothWriters_EmitByteIdenticalMetadata_ForEveryValueKind"/>.
 /// </summary>
 public sealed class DeltaSchemaJsonTypedMetadataTests

@@ -131,8 +131,10 @@ internal static class SchemaJson
     // Writes a typed metadata value (string/long/double/bool/null/array/nested-object). Numbers
     // are emitted so an integer stays an unquoted integer and a double keeps a fractional/exponent
     // form (so it re-reads as a Double, not a Long) — the Delta-log interop contract (#330).
-    // Shared byte-for-byte with DeltaSharp.Storage's DeltaSchemaJson.WriteMetadataValue.
-    internal static void WriteMetadataValue(Utf8JsonWriter writer, MetadataValue value)
+    // Narrowed back to private by #679: DeltaSharp.Storage's footer serializer used to call this
+    // directly to keep its duplicated WriteMetadata in lockstep. That copy is gone — Storage now
+    // delegates the whole footer schema to ToJson — so no cross-assembly seam is needed here.
+    private static void WriteMetadataValue(Utf8JsonWriter writer, MetadataValue value)
     {
         switch (value.Kind)
         {
