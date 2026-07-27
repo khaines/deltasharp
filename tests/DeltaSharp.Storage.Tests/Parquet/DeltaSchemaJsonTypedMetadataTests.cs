@@ -132,6 +132,16 @@ public sealed class DeltaSchemaJsonTypedMetadataTests
         string engineJson = SchemaJson.ToJson(schema);
         string storageJson = DeltaSchemaJson.ToJson(schema);
 
+        // Golden captured from the PRE-consolidation Storage serializer at a6ff45f. Since #679 both
+        // names above resolve to one implementation, so the equality below is f(x) == f(x) and guards
+        // only the delegation seam — this golden is what actually pins every metadata value kind.
+        const string golden =
+            "{\"type\":\"struct\",\"fields\":[{\"name\":\"everything\",\"type\":\"long\"" +
+            ",\"nullable\":false,\"metadata\":{\"k.arr\":[1,2.5,true,\"s\",null],\"k.bool\":false" +
+            ",\"k.double\":3.0,\"k.long\":7,\"k.nested\":{\"inner.long\":42" +
+            ",\"inner.str\":\"nested\"},\"k.null\":null,\"k.string\":\"text\"}}]}";
+        Assert.Equal(golden, storageJson);
+
         Assert.Equal(engineJson, storageJson);
     }
 

@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Text.Json;
 using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Types;
 using Xunit;
@@ -15,9 +16,18 @@ namespace DeltaSharp.Storage.Tests;
 /// single serializer and the footer path merely delegates to it.
 /// </summary>
 /// <remarks>
-/// These tests guard the consolidation itself, complementing (not replacing) the per-shape byte-parity
-/// tests in <c>DeltaSchemaJsonComplexTypeTests</c> and the per-metadata-kind parity test in
-/// <c>DeltaSchemaJsonTypedMetadataTests</c>, which continue to pin the emitted wire shape.
+/// <para>
+/// These tests guard the consolidation itself, complementing (not replacing) the per-shape golden
+/// tests in <c>DeltaSchemaJsonComplexTypeTests</c> and the per-metadata-kind test in
+/// <c>DeltaSchemaJsonTypedMetadataTests</c>, which pin the emitted wire shape.
+/// </para>
+/// <para>
+/// CAUTION for future edits: now that both paths resolve to one serializer, an assertion of the form
+/// <c>Assert.Equal(SchemaJson.ToJson(x), DeltaSchemaJson.ToJson(x))</c> is <c>f(x) == f(x)</c> and
+/// CANNOT fail for a serializer defect — it only guards the delegation seam. Every footer↔log
+/// assertion below is therefore paired with a golden literal captured from the PRE-consolidation
+/// serializer at commit a6ff45f. Never add a footer↔log assertion as a test's only assertion.
+/// </para>
 /// </remarks>
 public sealed class DeltaSchemaJsonSingleSourceTests
 {
@@ -26,7 +36,7 @@ public sealed class DeltaSchemaJsonSingleSourceTests
     {
         // Structural single-source-of-truth guard: Storage must hold ONLY the delegating entry point.
         // Re-introducing a local WriteType/WriteStruct/WriteMetadata copy (the #518 interim shape, whose
-        // drift risk #679 exists to eliminate) fails here rather than waiting for a byte-parity test to
+        // drift risk #679 exists to eliminate) fails here rather than waiting for a golden test to
         // notice after the two implementations have already diverged.
         const BindingFlags DeclaredMembers =
             BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.DeclaredOnly;
@@ -38,6 +48,39 @@ public sealed class DeltaSchemaJsonSingleSourceTests
             .ToArray();
 
         Assert.Equal(new[] { nameof(DeltaSchemaJson.ToJson) }, declared);
+    }
+
+    [Fact]
+    public void NoTypeInStorage_DeclaresASchemaTreeSerializer()
+    {
+        // Assembly-wide companion to the test above, which is type-scoped and so would miss the more
+        // likely future accident: a schema serializer re-inlined into some OTHER Storage type (say
+        // ParquetFileWriter) rather than back into DeltaSchemaJson. A schema-tree serializer is
+        // identifiable by signature — it threads a Utf8JsonWriter alongside a schema node (DataType or
+        // FieldMetadata). Storage must own no such method; that responsibility lives solely in
+        // DeltaSharp.Abstractions.SchemaJson. Delta LOG action writers legitimately pair a
+        // Utf8JsonWriter with action types (MetadataAction etc.), which is why the predicate keys on
+        // the schema type tree specifically rather than on the writer alone.
+        const BindingFlags DeclaredMembers =
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static
+            | BindingFlags.Instance | BindingFlags.DeclaredOnly;
+
+        static bool IsSchemaNode(Type t) => typeof(DataType).IsAssignableFrom(t) || t == typeof(FieldMetadata);
+
+        string[] offenders = typeof(DeltaSchemaJson).Assembly
+            .GetTypes()
+            .SelectMany(t => t.GetMethods(DeclaredMembers))
+            .Where(m =>
+            {
+                Type[] parameters = m.GetParameters().Select(x => x.ParameterType).ToArray();
+                return Array.Exists(parameters, x => x == typeof(Utf8JsonWriter))
+                    && Array.Exists(parameters, IsSchemaNode);
+            })
+            .Select(m => $"{m.DeclaringType!.FullName}.{m.Name}")
+            .OrderBy(n => n, StringComparer.Ordinal)
+            .ToArray();
+
+        Assert.Empty(offenders);
     }
 
     [Fact]
@@ -88,20 +131,40 @@ public sealed class DeltaSchemaJsonSingleSourceTests
         string log = SchemaJson.ToJson(schema);
         string footer = DeltaSchemaJson.ToJson(schema);
 
-        Assert.Equal(log, footer);
+        // Golden captured from the pre-consolidation serializer at a6ff45f. This, not the equality
+        // below, is what pins the wire shape.
+        const string golden =
+            "{\"type\":\"struct\",\"fields\":[{\"name\":\"nested\",\"type\":{\"type\":\"map\"" +
+            ",\"keyType\":\"string\",\"valueType\":{\"type\":\"array\"" +
+            ",\"elementType\":{\"type\":\"struct\",\"fields\":[{\"name\":\"leaf\"" +
+            ",\"type\":\"decimal(18,6)\",\"nullable\":false" +
+            ",\"metadata\":{\"delta.columnMapping.id\":11" +
+            ",\"delta.columnMapping.physicalName\":\"col-11\"}},{\"name\":\"flag\"" +
+            ",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{\"k.bool\":true" +
+            ",\"k.double\":1.0,\"k.null\":null}}]},\"containsNull\":true}" +
+            ",\"valueContainsNull\":false},\"nullable\":true" +
+            ",\"metadata\":{\"delta.columnMapping.id\":3" +
+            ",\"delta.columnMapping.physicalName\":\"col-3\"}},{\"name\":\"blank\"" +
+            ",\"type\":{\"type\":\"struct\",\"fields\":[]},\"nullable\":false" +
+            ",\"metadata\":{\"delta.columnMapping.id\":4" +
+            ",\"delta.columnMapping.physicalName\":\"col-4\"}}]}";
+        Assert.Equal(golden, footer);
 
-        // Sanity-pin the non-trivial bits so the equality above cannot pass on two empty strings.
-        Assert.Contains("\"delta.columnMapping.id\":11", footer, StringComparison.Ordinal);
-        Assert.Contains("\"type\":\"decimal(18,6)\"", footer, StringComparison.Ordinal);
-        Assert.Contains("\"type\":{\"type\":\"struct\",\"fields\":[]}", footer, StringComparison.Ordinal);
-        Assert.Contains("\"k.double\":1.0", footer, StringComparison.Ordinal);
+        // Delegation seam (see class remarks): cannot fail for a serializer defect, only for a broken
+        // or transforming delegation.
+        Assert.Equal(log, footer);
     }
 
     [Fact]
-    public void FooterAndLog_AreByteIdentical_ForEveryAtomicTypeInTheTypeSystem()
+    public void EveryAtomicTypeInTheTypeSystem_SerializesToItsPinnedTypeName()
     {
-        // Breadth guard over the recursion base: every atomic type name must render identically on both
-        // paths, so adding a DataType cannot land in one serializer's default arm and not the other's.
+        // Breadth guard over the recursion base: pins the emitted type-name string for every atomic
+        // type plus a decimal, so corrupting the shared default arm (e.g. uppercasing TypeName) is
+        // caught. NOTE: post-#679 there is only ONE default arm, so the old framing of this test —
+        // "a new DataType cannot land in one serializer's default arm and not the other's" — describes
+        // an invariant that can no longer be violated, and the footer↔log assertion that expressed it
+        // was inert. The golden below is the real assertion; it is captured from the pre-consolidation
+        // serializer at a6ff45f.
         var atomics = new DataType[]
         {
             DataTypes.BooleanType,
@@ -123,6 +186,24 @@ public sealed class DeltaSchemaJsonSingleSourceTests
             .Select((type, i) => new StructField($"c{i}", type, nullable: i % 2 == 0))
             .ToArray());
 
+        const string golden =
+            "{\"type\":\"struct\",\"fields\":[{\"name\":\"c0\",\"type\":\"boolean\"" +
+            ",\"nullable\":true,\"metadata\":{}},{\"name\":\"c1\",\"type\":\"byte\"" +
+            ",\"nullable\":false,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"short\"" +
+            ",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\"" +
+            ",\"nullable\":false,\"metadata\":{}},{\"name\":\"c4\",\"type\":\"long\"" +
+            ",\"nullable\":true,\"metadata\":{}},{\"name\":\"c5\",\"type\":\"float\"" +
+            ",\"nullable\":false,\"metadata\":{}},{\"name\":\"c6\",\"type\":\"double\"" +
+            ",\"nullable\":true,\"metadata\":{}},{\"name\":\"c7\",\"type\":\"string\"" +
+            ",\"nullable\":false,\"metadata\":{}},{\"name\":\"c8\",\"type\":\"binary\"" +
+            ",\"nullable\":true,\"metadata\":{}},{\"name\":\"c9\",\"type\":\"date\"" +
+            ",\"nullable\":false,\"metadata\":{}},{\"name\":\"c10\",\"type\":\"timestamp\"" +
+            ",\"nullable\":true,\"metadata\":{}},{\"name\":\"c11\",\"type\":\"timestamp_ntz\"" +
+            ",\"nullable\":false,\"metadata\":{}},{\"name\":\"c12\",\"type\":\"decimal(38,18)\"" +
+            ",\"nullable\":true,\"metadata\":{}}]}";
+        Assert.Equal(golden, DeltaSchemaJson.ToJson(schema));
+
+        // Delegation seam only (see class remarks).
         Assert.Equal(SchemaJson.ToJson(schema), DeltaSchemaJson.ToJson(schema));
     }
 }
