@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
 using DeltaSharp.Storage.Backends;
+using DeltaSharp.Types;
 
 namespace DeltaSharp.Storage.Delta;
 
@@ -468,6 +469,111 @@ internal sealed class DeltaLog
 
         return paths;
     }
+
+    /// <summary>
+    /// Validates that the column-mapping IDENTITY — mode, per-column <c>delta.columnMapping.id</c> (field id),
+    /// physical name, and the partition-column set — is immutable across the RETAINED history strictly BEFORE
+    /// <paramref name="rangeStartVersion"/>, matching the end-of-range identity in
+    /// <paramref name="endMetadata"/> (#671, scope broadened by the maintainer from mode-only to full identity).
+    /// A change-feed read interprets every file it touches — including a file a <c>remove</c> in the range
+    /// references but that was AUTHORED at any prior retained version — through the END snapshot's identity.
+    /// Delta column-mapping identity is <b>immutable</b> (mode is sticky/creation-only; field ids and physical
+    /// names are assigned once), so a historical version whose identity differs is a forged/illegal
+    /// <c>_delta_log</c> — reading its file through the end identity would surface MISMAPPED change rows (a mode
+    /// flip, a field-id reassignment, or a physical-name change). Scans the baseline identity at the earliest
+    /// reconstructable version (compacted from a checkpoint when the creation commit has aged out) plus every
+    /// retained commit's <c>metaData</c> before the range — including a transient change-and-change-back that
+    /// reverted before <c>start</c> — and fails closed on any difference. Legitimate schema evolution (ADDING a
+    /// column) is allowed: only a column present in BOTH a historical version and the end is identity-compared.
+    /// The in-range <c>[start, end]</c> window is validated per-version by the change-feed reader, so this
+    /// closes the pre-<c>start</c> gap the per-version check cannot see.
+    /// <para><b>Residual (inherent).</b> An identity change recorded ONLY in commit JSON that has been DELETED
+    /// (aged out) below the earliest reconstructable version is physically unreadable; a still-referenced
+    /// below-floor file is then read under the uniform retained identity, which is equivalent to ordinary
+    /// data-content forgery — no capability beyond the issue's already-stipulated <c>_delta_log</c>-write
+    /// threat model. Every commit whose JSON SURVIVES — including a stray persisting strictly below a
+    /// compacting checkpoint floor — IS scanned here (we skip only the exact baseline version); only truly
+    /// deleted commit JSON is unvalidatable.</para>
+    /// The fail-closed message is path-free (#653): it names ONLY the offending version.
+    /// </summary>
+    /// <exception cref="DeltaProtocolException">A retained version before the range declares a different (or
+    /// unrecognized) column-mapping identity, or a retained commit is malformed / exceeds the read ceiling.</exception>
+    internal async Task ValidateColumnMappingIdentityStableBeforeAsync(
+        long rangeStartVersion, MetadataAction endMetadata, CancellationToken cancellationToken)
+    {
+        LogListing listing = await ListLogAsync(cancellationToken).ConfigureAwait(false);
+        long earliest = EarliestReconstructableVersion(listing);
+        if (earliest >= rangeStartVersion)
+        {
+            return; // No retained history before the range; the reader's per-version check covers [start, end].
+        }
+
+        ColumnMappingIdentity endIdentity = BuildIdentity(endMetadata);
+
+        // Baseline: the identity as of the earliest reconstructable version — compacted from a checkpoint when
+        // the creation commit has aged out, so a checkpoint-baked identity that no surviving commit re-expresses
+        // is still caught.
+        Snapshot earliestSnapshot = await LoadSnapshotAsync(earliest, cancellationToken).ConfigureAwait(false);
+        ValidateHistoricalIdentity(earliest, earliestSnapshot.Metadata, endIdentity);
+
+        // Every retained commit's metaData REPLACES the metadata (Delta semantics); a differing identity at any
+        // version before the range — including a change-and-change-back that reverted before start, or a
+        // SURVIVING commit whose JSON persists strictly below the earliest reconstructable floor (e.g. below a
+        // compacting checkpoint) — is forged. We skip ONLY the exact baseline version (== earliest, already
+        // validated above via the earliest snapshot); a below-floor stray (version < earliest) with a surviving
+        // JSON is still read and validated, so a transient identity forged there cannot hide beneath a
+        // checkpoint that bakes the reverted identity.
+        foreach (long version in listing.Commits)
+        {
+            if (version == earliest || version >= rangeStartVersion)
+            {
+                continue; // == earliest folded into the baseline; >= start is the reader's per-version check.
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            foreach (DeltaAction action in await ReadCommitActionsAsync(version, cancellationToken).ConfigureAwait(false))
+            {
+                if (action is MetadataAction metadata)
+                {
+                    ValidateHistoricalIdentity(version, metadata, endIdentity);
+                }
+            }
+        }
+    }
+
+    // Fails closed if a historical version's column-mapping identity differs from the end's (mode,
+    // partition-column set, or any COMMON column's field id / physical name). Path-free (#653): names only the
+    // version. An unparseable schemaString is itself a forged/inconsistent log → fail closed.
+    private static void ValidateHistoricalIdentity(
+        long version, MetadataAction metadata, in ColumnMappingIdentity endIdentity)
+    {
+        if (!endIdentity.IsImmutableFrom(BuildIdentity(metadata)))
+        {
+            throw ColumnMappingIdentityNotImmutable(version);
+        }
+    }
+
+    private static ColumnMappingIdentity BuildIdentity(MetadataAction metadata)
+    {
+        try
+        {
+            return ColumnMappingIdentity.FromMetadata(metadata);
+        }
+        catch (SchemaValidationException ex)
+        {
+            throw DeltaProtocolException.Malformed(
+                "A change-feed range's metadata schemaString is unparseable or not a struct; the commit log "
+                + "is inconsistent, so the read fails closed.", ex);
+        }
+    }
+
+    private static DeltaProtocolException ColumnMappingIdentityNotImmutable(long version) =>
+        DeltaProtocolException.Unsupported(string.Create(
+            CultureInfo.InvariantCulture,
+            $"The table's column-mapping identity (mode, field ids, physical names, or partition columns) is "
+            + $"not immutable across retained history (version {version} differs from the end of the requested "
+            + $"change-feed range); such a transition is protocol-illegal, so the change-feed read fails closed "
+            + $"rather than risk emitting mismapped change data."));
 
     /// <summary>Seeds <paramref name="state"/> from the selected checkpoint's parts, returning its version,
     /// or <see langword="null"/> if the checkpoint is corrupt/partial (the caller then replays from 0).</summary>
