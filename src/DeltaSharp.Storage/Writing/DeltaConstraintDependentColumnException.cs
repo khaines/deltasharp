@@ -91,9 +91,14 @@ public sealed class DeltaConstraintDependentColumnException : Exception
         string depends = dependents.Length == 1
             ? "this surviving CHECK constraint still depends"
             : "these surviving CHECK constraints still depend";
+        // The altered column name is derived from a foreign/hostile table's schema/CHECK predicate (a peer
+        // engine's overwriteSchema against an attacker-authored table), so sanitize it before echoing — a
+        // crafted name must not inject control/line-break chars into a structured-log sink. It is echoed twice;
+        // the raw value is retained on the typed ColumnName property. (operation/ErrorClass are trusted literals.)
+        string safeColumn = DiagnosticText.Sanitize(columnName, DiagnosticText.ConfigTokenMaxLength);
         string message =
-            $"Cannot alter column '{columnName}' because this column is referenced by the following check "
-            + $"constraint(s):{listing}\nThe {operation} changes '{columnName}' (drops, renames, or retypes it), "
+            $"Cannot alter column '{safeColumn}' because this column is referenced by the following check "
+            + $"constraint(s):{listing}\nThe {operation} changes '{safeColumn}' (drops, renames, or retypes it), "
             + $"but {depends} on it; committing would leave a dangling constraint that rejects every future "
             + "write. Drop the dependent constraint(s) first (e.g. ALTER TABLE ... DROP CONSTRAINT), then change "
             + $"the column. [{ErrorClass}]";

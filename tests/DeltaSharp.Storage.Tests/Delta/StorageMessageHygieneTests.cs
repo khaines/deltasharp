@@ -342,6 +342,21 @@ public sealed class StorageMessageHygieneTests
     }
 
     [Fact]
+    public void ConstraintDependentColumn_ForColumnChange_SanitizesColumnName_RawOnProperty()
+    {
+        // #666 red-team R3 (High): the altered column name (derived from a foreign/hostile table's
+        // schema/CHECK predicate) was echoed RAW twice — a live CRLF injection. It must be sanitized in the
+        // message (one clean dependent → 2 structural newlines) while the raw name stays on the ColumnName
+        // property.
+        var deps = new[] { new DeltaTableConstraint(DeltaConstraintKind.Check, "ck", "x > 0") };
+        DeltaConstraintDependentColumnException ex =
+            DeltaConstraintDependentColumnException.ForColumnChange(FullInjectionCorpus, deps);
+
+        AssertFullyNeutralized(ex.Message, expectedNewlines: 2);
+        Assert.Equal(FullInjectionCorpus, ex.ColumnName); // raw retained on property
+    }
+
+    [Fact]
     public void UnsupportedFeatures_HugeList_IsBounded_ElidesRemainder()
     {
         // #666 red-team R2: per-item caps do NOT bound a hostile LIST. A forged readerFeatures array of
