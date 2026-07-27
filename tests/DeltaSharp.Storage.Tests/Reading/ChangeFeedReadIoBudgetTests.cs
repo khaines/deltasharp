@@ -205,6 +205,105 @@ public sealed class ChangeFeedReadIoBudgetTests : IDisposable
         Assert.Equal(1, counting.LogListings);
     }
 
+    [Fact]
+    public async Task Cdf_PreRangeCommitBelowTheSeedingCheckpoint_IsReadFromDisk_AndStillFailsClosed()
+    {
+        // Council R1 (quality seat): pins the DISK-FALLBACK branch of the observation seam for an ORDINARY
+        // pre-range commit — not just the sub-floor edge. Layout: v0..v40 all retained (so the earliest
+        // reconstructable version is 0) with a complete checkpoint@20. Both snapshot reconstructions seed from
+        // that checkpoint and replay only 21..40, so pre-range commits 1..19 are covered by NO observation at
+        // all. The gate must therefore READ them, and a forged identity at v10 (reverted at v11, so the end
+        // identity is untouched and only the deep-history scan can see it) must still fail the read closed.
+        //
+        // This is the property that makes an observer defect cost only PERFORMANCE: "not observed" can never
+        // be read as "nothing to validate".
+        const int latest = 40;
+        using var local = new LocalFileSystemBackend(_root);
+        await WriteLongHistoryAsync(local, latest, forgedIdentityAtVersion: 10);
+        await WriteCheckpointAtAsync(local, 20);
+
+        var counting = new CountingStorageBackend(local);
+        var log = new DeltaLog(counting);
+        var reader = new ChangeFeedReader(counting, "io-budget", log, new ParquetFileReader());
+
+        DeltaChangeFeedInfo info = await reader.ResolveAsync(
+            DeltaChangeFeedRange.FromVersion(latest, latest), CancellationToken.None);
+        counting.Reset();
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(async () =>
+        {
+            await foreach (ColumnBatch batch in reader.ReadAsync(info, CancellationToken.None))
+            {
+                _ = batch;
+            }
+        });
+
+        Assert.Contains("column-mapping identity", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("version 10", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("_delta_log", ex.Message, StringComparison.Ordinal);  // #653: no path
+        Assert.DoesNotContain("col-A", ex.Message, StringComparison.Ordinal);       // #653: no physical name
+        Assert.DoesNotContain("col-B", ex.Message, StringComparison.Ordinal);
+
+        // No replay reaches v10, so the gate read it itself — exactly once, and only because the seam reported
+        // "not covered" rather than inferring silence.
+        Assert.Equal(1, counting.CommitReadsOf(10));
+        Assert.Equal(1, counting.LogListings);
+    }
+
+    [Fact]
+    public async Task StartSnapshot_LoadedThroughTheObservedPath_IsIdenticalToTheUnobservedLoad()
+    {
+        // Council R1 (quality seat, low): the observation seam is claimed to be BEHAVIOUR-NEUTRAL for the
+        // snapshot itself — the observer is a pure sink, and passing `null` (every ordinary load) leaves the
+        // reconstruction byte-for-byte on its pre-#691 path. Nothing asserted that. This pins it: the snapshot
+        // the fused change-feed load returns is equal, field by field, to the one the plain (null-observer)
+        // LoadSnapshotAsync returns for the same version, and the reconstruction costs the same commit GETs.
+        const int latest = 40;
+        using var local = new LocalFileSystemBackend(_root);
+        await WriteLongHistoryAsync(local, latest, forgedIdentityAtVersion: null);
+
+        var counting = new CountingStorageBackend(local);
+        var log = new DeltaLog(counting);
+
+        // Unobserved: the ordinary public load path, exactly as it behaved before #691.
+        counting.Reset();
+        Snapshot unobserved = await log.LoadSnapshotAsync(30, CancellationToken.None);
+        int unobservedCommitReads = counting.CommitReads;
+
+        // Observed: the fused change-feed start load, which threads a ReplayedMetadataLog through the SAME
+        // reconstruction and then runs the pre-range gate off its observations.
+        (Snapshot End, DeltaLog.LogListing Listing) end =
+            await log.LoadSnapshotWithListingAsync(latest, CancellationToken.None);
+        counting.Reset();
+        Snapshot observed = await log.LoadChangeFeedStartSnapshotAsync(
+            end.Listing, 30, end.End.Metadata, CancellationToken.None);
+        int observedCommitReads = counting.CommitReads;
+
+        Assert.Equal(unobserved.Version, observed.Version);
+        Assert.Equal(unobserved.Protocol.MinReaderVersion, observed.Protocol.MinReaderVersion);
+        Assert.Equal(unobserved.Protocol.MinWriterVersion, observed.Protocol.MinWriterVersion);
+        Assert.Equal(unobserved.Protocol.ReaderFeatures.ToArray(), observed.Protocol.ReaderFeatures.ToArray());
+        Assert.Equal(unobserved.Protocol.WriterFeatures.ToArray(), observed.Protocol.WriterFeatures.ToArray());
+        Assert.Equal(unobserved.Metadata.Id, observed.Metadata.Id);
+        Assert.Equal(unobserved.Metadata.SchemaString, observed.Metadata.SchemaString);
+        Assert.Equal(unobserved.Metadata.PartitionColumns.ToArray(), observed.Metadata.PartitionColumns.ToArray());
+        Assert.Equal(unobserved.Metadata.Configuration.ToArray(), observed.Metadata.Configuration.ToArray());
+        Assert.Equal(unobserved.Schema.ToString(), observed.Schema.ToString());
+        Assert.Equal(
+            unobserved.ActiveFiles.Select(f => f.Path).ToArray(),
+            observed.ActiveFiles.Select(f => f.Path).ToArray());
+        Assert.Equal(
+            unobserved.Tombstones.Select(f => f.Path).ToArray(),
+            observed.Tombstones.Select(f => f.Path).ToArray());
+        Assert.Equal(unobserved.Transactions.ToArray(), observed.Transactions.ToArray());
+
+        // The observed load reads the same 31 commits (0..30) the unobserved one does; its ONLY extra read is
+        // the pre-range gate's baseline snapshot at the earliest reconstructable version (v0). The gate itself
+        // contributes nothing further, because every other pre-range commit is a proven, corroborated
+        // observation of the replay above.
+        Assert.Equal(unobservedCommitReads + 1, observedCommitReads);
+    }
+
     // Writes v0 = protocol + an id-mode, CDF-enabled metaData, v1..(latest-1) = single-`add` commits, and
     // `latest` = a metadata-free txn commit so a well-formed read of [latest, latest] touches no data file.
     // When `forgedIdentityAtVersion` is set, that version carries a FORGED identity-changing metaData (the
@@ -245,5 +344,35 @@ public sealed class ChangeFeedReadIoBudgetTests : IDisposable
         }
 
         await DeltaTestHarness.WriteCommitAsync(backend, latest, DeltaTestHarness.Txn("tail", 1));
+    }
+
+    // Writes a COMPLETE single-part checkpoint at `version` over the history WriteLongHistoryAsync produced,
+    // plus the _last_checkpoint hint, so a snapshot reconstruction seeds there and never replays [1, version].
+    private static async Task WriteCheckpointAtAsync(IStorageBackend backend, int version)
+    {
+        var fixture = new CheckpointFixture()
+            .Protocol(3, 7, new[] { "columnMapping" }, new[] { "columnMapping", "changeDataFeed" })
+            .Metadata(
+                "rt",
+                "{\"type\":\"struct\",\"fields\":["
+                + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
+                + "{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-A\"}},"
+                + "{\"name\":\"name\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+                + "{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"col-B\"}}]}",
+                partitionColumns: null,
+                configuration: new[]
+                {
+                    ("delta.columnMapping.mode", "id"),
+                    ("delta.columnMapping.maxColumnId", "2"),
+                    ("delta.enableChangeDataFeed", "true"),
+                });
+        for (int v = 1; v <= version; v++)
+        {
+            fixture = fixture.Add(
+                "data/f" + v.ToString(CultureInfo.InvariantCulture) + ".parquet", size: 1, modificationTime: 1);
+        }
+
+        await DeltaTestHarness.WriteCheckpointAsync(backend, version, fixture);
+        await DeltaTestHarness.WriteLastCheckpointAsync(backend, version);
     }
 }

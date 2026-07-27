@@ -555,6 +555,15 @@ internal sealed class DeltaLog
     /// which no replay can reach — is still READ here. The validated set is therefore identical to a full
     /// re-scan: <c>{earliest}</c> (baseline snapshot) ∪ <c>{v ∈ listing.Commits : v &lt; start, v ≠ earliest}</c>,
     /// visited in ascending version order either way.</para>
+    /// <para><b>Why an observation is never trusted on its silence (council R1).</b> This gate enforces a
+    /// SECURITY property, so it must not infer "this version changed no identity" from an observer that merely
+    /// SAYS nothing — that would make the gate vacuous if a future replay change under-reported. An observation
+    /// is consumed only when the replay PROVABLY covered the version (contiguous covered window) and the record
+    /// is corroborated by the reconstruction's own metadata lineage (state metadata reference changes across a
+    /// version iff that version carried a <c>metaData</c>); see <see cref="ReplayedMetadataLog"/>. Everything
+    /// else either falls back to the disk read or fails closed. Consequently the union of (proven, corroborated
+    /// observations) and (disk reads) equals the full validation set BY CONSTRUCTION, and any defect in the
+    /// observing seam can only cost performance or availability — never coverage.</para>
     /// <para><b>Residual (inherent).</b> An identity change recorded ONLY in commit JSON that has been DELETED
     /// (aged out) below the earliest reconstructable version is physically unreadable; a still-referenced
     /// below-floor file is then read under the uniform retained identity, which is equivalent to ordinary
@@ -603,23 +612,20 @@ internal sealed class DeltaLog
 
             // #691: the start-snapshot reconstruction on THIS listing already read (and fully parsed) this
             // commit; reuse its metaData actions rather than issuing a second GET for the same immutable
-            // object. A version it did NOT replay — always the case for a sub-floor stray — is read here.
-            if (alreadyReplayed.TryGetObservedMetadata(version, out IReadOnlyList<MetadataAction> observed))
-            {
-                foreach (MetadataAction metadata in observed)
-                {
-                    ValidateHistoricalIdentity(version, metadata, endIdentity);
-                }
+            // object. The observation is consumable ONLY when the replay PROVABLY covered this version and its
+            // record is corroborated by the reconstruction's own metadata lineage (see ReplayedMetadataLog);
+            // anything else — a version the replay never reached (always the case for a sub-floor stray or a
+            // commit below the seeding checkpoint) — falls back to the disk read below. An observer defect can
+            // therefore cost a fail-closed read or an extra GET, but can NEVER shrink this validation set.
+            IReadOnlyList<MetadataAction> versionMetadata =
+                alreadyReplayed.TryGetProvenObservation(version, out IReadOnlyList<MetadataAction> observed)
+                    ? observed
+                    : ReplayedMetadataLog.MetadataActionsOf(
+                        await ReadCommitActionsAsync(version, cancellationToken).ConfigureAwait(false));
 
-                continue;
-            }
-
-            foreach (DeltaAction action in await ReadCommitActionsAsync(version, cancellationToken).ConfigureAwait(false))
+            foreach (MetadataAction metadata in versionMetadata)
             {
-                if (action is MetadataAction metadata)
-                {
-                    ValidateHistoricalIdentity(version, metadata, endIdentity);
-                }
+                ValidateHistoricalIdentity(version, metadata, endIdentity);
             }
         }
     }
@@ -685,9 +691,10 @@ internal sealed class DeltaLog
     }
 
     /// <summary>Replays JSON commits <c>[start, target]</c> in ascending order into <paramref name="state"/>,
-    /// requiring a contiguous chain (a missing version is a gap → fail closed). Each replayed version's
-    /// parsed actions are reported to <paramref name="replayObserver"/> (when supplied) BEFORE they are
-    /// applied, so an observing caller sees exactly the commits this replay read.</summary>
+    /// requiring a contiguous chain (a missing version is a gap → fail closed). Each replayed version is
+    /// reported to <paramref name="replayObserver"/> (when supplied) with its parsed actions AND the state's
+    /// prevailing metadata immediately before/after applying them, so an observing caller sees exactly the
+    /// commits this replay read and can corroborate every observation against the state it produced.</summary>
     private async Task<int> ReplayContiguousAsync(
         SnapshotState state, long start, long target, IReadOnlySet<long> commits,
         ReplayedMetadataLog? replayObserver, CancellationToken cancellationToken)
@@ -705,8 +712,9 @@ internal sealed class DeltaLog
             string path = LogPrefix + FormatVersion(v) + ".json";
             ReadOnlyMemory<byte> content = await ReadAllAsync(path, cancellationToken).ConfigureAwait(false);
             IReadOnlyList<DeltaAction> actions = DeltaLogActionReader.ParseCommit(content, v);
-            replayObserver?.Observe(v, actions);
+            MetadataAction? prevailingBefore = state.Metadata;
             state.ApplyAll(actions);
+            replayObserver?.Observe(v, actions, prevailingBefore, state.Metadata);
             replayed++;
         }
 
@@ -903,64 +911,6 @@ internal sealed class DeltaLog
 
     /// <summary>A resolved checkpoint to seed from: its <see cref="Version"/> and ordered part paths.</summary>
     private sealed record CheckpointSelection(long Version, IReadOnlyList<string> PartPaths);
-
-    /// <summary>
-    /// A pure OBSERVER of a snapshot reconstruction's JSON replay (#691): it records which commit versions
-    /// <b>below an exclusive upper bound</b> the replay actually read, and the <c>metaData</c> actions each of
-    /// them expressed. It exists so the change-feed pre-range column-mapping identity gate
-    /// (<see cref="ValidateColumnMappingIdentityStableBeforeAsync"/>) can be driven off the commits the
-    /// start-snapshot reconstruction ALREADY read, instead of issuing a second GET per commit for the same
-    /// immutable object. A commit's JSON is write-once (put-if-absent, never rewritten), so a replayed
-    /// commit's parsed actions are exactly what a re-read would yield.
-    /// <para><b>Retention bound.</b> Only versions strictly below <see cref="_exclusiveUpperBound"/> (the
-    /// range start) are observed, and only <c>metaData</c> actions are retained — never the file actions,
-    /// which dominate a commit's size. The retained set is therefore proportional to the number of METADATA
-    /// REVISIONS in the pre-range history (one for a normal table), not to the history's file count.</para>
-    /// </summary>
-    private sealed class ReplayedMetadataLog
-    {
-        private static readonly IReadOnlyList<MetadataAction> None = Array.Empty<MetadataAction>();
-
-        private readonly Dictionary<long, IReadOnlyList<MetadataAction>> _observed = new();
-        private readonly long _exclusiveUpperBound;
-
-        public ReplayedMetadataLog(long exclusiveUpperBound) => _exclusiveUpperBound = exclusiveUpperBound;
-
-        /// <summary>Records that <paramref name="version"/> was replayed, retaining (in log order) the
-        /// <c>metaData</c> actions it expressed. Called once per replayed version.</summary>
-        public void Observe(long version, IReadOnlyList<DeltaAction> actions)
-        {
-            if (version >= _exclusiveUpperBound)
-            {
-                return;
-            }
-
-            List<MetadataAction>? metadata = null;
-            foreach (DeltaAction action in actions)
-            {
-                if (action is MetadataAction metadataAction)
-                {
-                    (metadata ??= new List<MetadataAction>()).Add(metadataAction);
-                }
-            }
-
-            _observed[version] = metadata ?? None;
-        }
-
-        /// <summary>True when <paramref name="version"/> was replayed by the observed reconstruction, yielding
-        /// its (possibly empty) <c>metaData</c> actions; false when the caller must read the commit itself.</summary>
-        public bool TryGetObservedMetadata(long version, out IReadOnlyList<MetadataAction> metadata)
-        {
-            if (_observed.TryGetValue(version, out IReadOnlyList<MetadataAction>? found))
-            {
-                metadata = found;
-                return true;
-            }
-
-            metadata = None;
-            return false;
-        }
-    }
 
     /// <summary>The discovered <c>_delta_log</c> contents: commit versions, each commit object's modification
     /// time (the timestamp-time-travel source, design §2.12.1), classic checkpoint groups, the latest
