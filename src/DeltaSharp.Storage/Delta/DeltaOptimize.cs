@@ -44,6 +44,16 @@ internal sealed class OptimizeSchemaEvolutionException : Exception
     /// <summary>The compaction input whose physical schema is narrower than the current data schema in a
     /// way that cannot be null-filled (an absent required column).</summary>
     internal string FilePath { get; }
+
+    /// <summary>
+    /// Renders this exception WITHOUT its <see cref="Exception.InnerException"/> chain (#664, RF-8b parity):
+    /// OPTIMIZE surfaces this in place of the raw <see cref="DeltaStorageException"/> (whose message reads like
+    /// file corruption), retaining that storage exception as the inner for server-side diagnostics; the
+    /// default <c>ToString()</c> / <c>ILogger.LogError(ex, …)</c> would re-surface it (and the
+    /// attacker-controllable file path is only on <see cref="FilePath"/>, never the message). The inner
+    /// remains reachable via <see cref="Exception.InnerException"/>.
+    /// </summary>
+    public override string ToString() => DiagnosticText.DescribeWithoutInner(this);
 }
 
 /// <summary>

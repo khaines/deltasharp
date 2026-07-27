@@ -121,4 +121,49 @@ public sealed class StorageExceptionToStringTests
         Assert.Same(raw, ex.InnerException);
         Assert.Equal(42, ex.Version);
     }
+
+    [Fact]
+    public void OptimizeSchemaEvolutionException_ToString_OmitsInner_KeepsPathOnProperty()
+    {
+        // Red-team R1: OPTIMIZE's narrow-file failure chains the raw storage exception and had no override.
+        const string poisonedPath = "s3://evil/\r\ninjected/opt.parquet";
+        DeltaStorageException inner = DeltaStorageException.ColumnNotPresentInFile("secret_col_leak");
+        var ex = new OptimizeSchemaEvolutionException(poisonedPath, inner);
+
+        string rendered = ex.ToString();
+
+        Assert.Contains(nameof(OptimizeSchemaEvolutionException), rendered, StringComparison.Ordinal);
+        Assert.DoesNotContain(poisonedPath, rendered, StringComparison.Ordinal); // path only on .FilePath
+        Assert.DoesNotContain("secret_col_leak", rendered, StringComparison.Ordinal); // inner not auto-rendered
+        Assert.DoesNotContain('\r', rendered);
+        Assert.Same(inner, ex.InnerException);
+        Assert.Equal(poisonedPath, ex.FilePath); // raw path retained on the typed property
+    }
+
+    [Fact]
+    public void CoveredException_WrappedInOuterOrAggregate_ToString_TransitivelyOmitsRawInner()
+    {
+        // Production reality: these exceptions are usually caught-and-wrapped or framework-logged, not
+        // ToString()'d directly. Exception.ToString() recurses into the inner via the inner's OWN (overridden)
+        // ToString(), so a covered storage exception nested in a plain outer exception or an
+        // AggregateException must STILL suppress its raw inner — the load-bearing transitive-virtual-dispatch
+        // behavior the default ILogger/OTel rendering relies on (SRE R1). Nothing else locks this.
+        var raw = new InvalidOperationException(RawInnerLeak);
+        DeltaStorageException storage = DeltaStorageException.CorruptData("Parquet footer is malformed.", raw);
+
+        // (a) wrapped in a plain outer exception (caught-and-rethrown) — the covered layer's sanitized message
+        // surfaces, but its raw inner does not.
+        var wrapped = new InvalidOperationException("outer read step failed", storage);
+        string wrappedRendered = wrapped.ToString();
+        Assert.Contains("Parquet footer is malformed.", wrappedRendered, StringComparison.Ordinal);
+        Assert.DoesNotContain("RAW-INNER-LEAK", wrappedRendered, StringComparison.Ordinal);
+        Assert.DoesNotContain("crafted-bytes-0xDEADBEEF", wrappedRendered, StringComparison.Ordinal);
+        Assert.DoesNotContain('\r', wrappedRendered);
+
+        // (b) AggregateException + (c) its Flatten() (the Task / parallel pattern, common before logging).
+        var aggregate = new AggregateException(storage);
+        Assert.DoesNotContain("RAW-INNER-LEAK", aggregate.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain('\r', aggregate.ToString());
+        Assert.DoesNotContain("RAW-INNER-LEAK", aggregate.Flatten().ToString(), StringComparison.Ordinal);
+    }
 }

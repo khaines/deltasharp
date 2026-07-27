@@ -146,9 +146,21 @@ internal static class DiagnosticText
     /// raw underlying cause (e.g. a Parquet.Net message or a JSON parse error over crafted bytes) as the inner
     /// for server-side diagnostics; the default <see cref="Exception.ToString"/> would re-surface that raw
     /// inner (as would the default <c>ILogger.LogError(ex, …)</c> providers, which render <c>ToString()</c>),
-    /// re-leaking exactly what <see cref="Exception.Message"/> dropped. This override closes that vector
-    /// (#664, RF-8b parity): the inner stays attached (reachable via <see cref="Exception.InnerException"/>)
-    /// for a debugger / deliberate server-side read, but is never auto-rendered.
+    /// re-leaking exactly what <see cref="Exception.Message"/> dropped. This override closes the
+    /// <c>ToString()</c>/<c>ILogger</c>-<b>rendering</b> vector (#664): the inner stays attached (reachable via
+    /// <see cref="Exception.InnerException"/>) for a debugger / deliberate server-side read, but is never
+    /// auto-rendered — and because <see cref="Exception.ToString"/> recurses into an inner via the inner's own
+    /// (overridden) <c>ToString()</c>, a covered exception nested inside an outer exception or an
+    /// <see cref="AggregateException"/> is suppressed transitively.
+    /// <para><b>Residual (by design).</b> This is <c>ToString()</c>-rendering parity with RF-8b, NOT the full
+    /// RF-8b treatment: unlike <c>LocalFileSystemBackend.SurfaceFailure</c> (which attaches a <i>synthetic,
+    /// sanitized</i> inner so even reflection is safe), these types <b>retain the raw inner object</b>. A
+    /// sink that serializes the exception <i>object graph</i> by reflection (e.g. a Serilog exception
+    /// destructurer, <c>JsonSerializer.Serialize(ex)</c>) — rather than calling <c>ToString()</c> — can still
+    /// walk <see cref="Exception.InnerException"/> and re-surface the raw cause. That is a sink-side
+    /// encode-on-write concern: a tenant-visible sink MUST render <c>.Message</c>/<c>.ToString()</c> and MUST
+    /// NOT reflect over <see cref="Exception.InnerException"/>, which is server-side-diagnostic-only. No such
+    /// reflecting logger exists in this repository today.</para>
     /// </summary>
     internal static string DescribeWithoutInner(Exception exception, string? kind = null)
     {
