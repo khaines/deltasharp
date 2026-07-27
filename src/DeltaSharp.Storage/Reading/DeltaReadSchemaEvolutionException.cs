@@ -1,3 +1,5 @@
+using DeltaSharp.Storage.Delta;
+
 namespace DeltaSharp.Storage;
 
 /// <summary>
@@ -31,4 +33,12 @@ public sealed class DeltaReadSchemaEvolutionException : Exception
 
     /// <summary>The data file whose physical schema is narrower than the current snapshot schema.</summary>
     public string FilePath { get; }
+
+    /// <summary>
+    /// Renders this exception WITHOUT its <see cref="Exception.InnerException"/> chain (#664, RF-8b parity).
+    /// The originating storage exception is retained as the inner for server-side diagnostics but never
+    /// auto-rendered (the attacker-controllable data-file path is likewise only on <see cref="FilePath"/>,
+    /// never in the message). The inner remains reachable via <see cref="Exception.InnerException"/>.
+    /// </summary>
+    public override string ToString() => DiagnosticText.DescribeWithoutInner(this);
 }

@@ -1,3 +1,5 @@
+using DeltaSharp.Storage.Delta;
+
 namespace DeltaSharp.Storage;
 
 /// <summary>
@@ -69,6 +71,16 @@ internal sealed class DeltaStorageException : Exception
 
     /// <summary>The deterministic failure class of this error.</summary>
     public StorageErrorKind Kind { get; }
+
+    /// <summary>
+    /// Renders this exception WITHOUT its <see cref="System.Exception.InnerException"/> chain (#664, RF-8b
+    /// parity). The sanitized <see cref="System.Exception.Message"/> deliberately drops attacker-influenceable
+    /// decode content while the raw underlying cause (e.g. a Parquet.Net exception over crafted bytes) is
+    /// retained as the inner for server-side diagnostics; the default <c>ToString()</c> / <c>ILogger.LogError(ex, …)</c>
+    /// would re-surface that raw inner, so this override omits it. The inner remains reachable via
+    /// <see cref="System.Exception.InnerException"/>.
+    /// </summary>
+    public override string ToString() => DiagnosticText.DescribeWithoutInner(this, Kind.ToString());
 
     /// <summary>Creates an <see cref="StorageErrorKind.UnsupportedFeature"/> error naming the feature.</summary>
     public static DeltaStorageException UnsupportedFeature(string feature) =>

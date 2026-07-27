@@ -1,3 +1,5 @@
+using DeltaSharp.Storage.Delta;
+
 namespace DeltaSharp.Storage;
 
 /// <summary>
@@ -18,4 +20,15 @@ public sealed class DeltaReadException : Exception
         : base(message, innerException)
     {
     }
+
+    /// <summary>
+    /// Renders this exception WITHOUT its <see cref="Exception.InnerException"/> chain (#664, RF-8b parity).
+    /// This facade re-wraps an internal storage exception (whose own inner may descend to a raw Parquet.Net /
+    /// JSON message over crafted bytes) as <c>new DeltaReadException(inner.Message, inner)</c>; the sanitized
+    /// <see cref="Exception.Message"/> is safe to surface, but the default <c>ToString()</c> /
+    /// <c>ILogger.LogError(ex, …)</c> would render the whole chain down to that raw inner. This override omits
+    /// the chain; the inner remains reachable via <see cref="Exception.InnerException"/> for server-side
+    /// diagnostics.
+    /// </summary>
+    public override string ToString() => DiagnosticText.DescribeWithoutInner(this);
 }

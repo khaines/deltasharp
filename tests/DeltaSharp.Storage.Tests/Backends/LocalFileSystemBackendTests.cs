@@ -841,7 +841,7 @@ public sealed class LocalFileSystemBackendTests : IDisposable
                     "sekret-warehouse/obj.json", new byte[] { 1 }, CancellationToken.None).AsTask());
             Assert.Equal(StorageErrorKind.Transient, putError.Kind);
             Assert.DoesNotContain(_root, putError.Message, StringComparison.Ordinal);
-            Assert.DoesNotContain(_root, putError.ToString(), StringComparison.Ordinal); // incl. inner chain
+            Assert.DoesNotContain(_root, putError.ToString(), StringComparison.Ordinal); // rendered form (Message)
 
             DeltaStorageException openError = await Assert.ThrowsAsync<DeltaStorageException>(
                 () => _backend.OpenWriteAsync("sekret-warehouse/obj.parquet", CancellationToken.None).AsTask());
@@ -859,7 +859,8 @@ public sealed class LocalFileSystemBackendTests : IDisposable
     public async Task StagingSetupFailure_ThroughFileWhereDirectoryExpected_DoesNotLeakAbsolutePath()
     {
         // A staging-SETUP failure where a path component ("collide") is a FILE must surface a CLASSIFIED
-        // error whose .Message and .ToString() (inner chain) exclude the absolute root. On POSIX the
+        // error whose .Message and .ToString() (rendered Message; the synthetic inner is verified centrally in
+        // SurfaceFailure_StripsAbsoluteRootFromMessageAndInnerChain) exclude the absolute root. On POSIX the
         // confined openat+O_NOFOLLOW walk opens the intermediate component with O_DIRECTORY, so a non-
         // directory component fails ENOTDIR — indistinguishable at the syscall level from an un-followed
         // symlink swapped into that slot — and is rejected fail-closed as PathNotConfined with a
@@ -882,11 +883,12 @@ public sealed class LocalFileSystemBackendTests : IDisposable
     public async Task StagingWriteFailure_DoesNotLeakAbsolutePathInInnerChain()
     {
         // RF-8b (Security): a write/flush-time failure (the ENOSPC/EDQUOT/EIO quota class) whose framework
-        // exception carries the absolute temp path must surface ONLY the relative path — in .Message AND
-        // .ToString() (the inner chain, which Exception.ToString() includes). Simulated via the FlushToDisk
-        // seam throwing a root-bearing IOException. Covers BOTH PutIfAbsentAsync (write block) and the
-        // StagedWriteStream CompleteAsync path. Non-vacuous: reverting the StagingFailure/Sanitize helpers
-        // to chain the raw exception reintroduces the absolute path into .ToString().
+        // exception carries the absolute temp path must surface ONLY the relative path — in .Message AND the
+        // synthetic .InnerException. Simulated via the FlushToDisk seam throwing a root-bearing IOException.
+        // Covers BOTH PutIfAbsentAsync (write block) and the StagedWriteStream CompleteAsync path. Non-vacuous:
+        // reverting the StagingFailure/Sanitize helpers to chain the raw exception reddens the .InnerException
+        // checks. (Post-#664 .ToString() omits the inner chain, so the raw-inner regression is caught directly
+        // on .InnerException, not .ToString().)
         LocalFileSystemBackend.FlushToDiskProbe = stream =>
             throw new IOException(string.Create(
                 System.Globalization.CultureInfo.InvariantCulture, $"No space left on device : '{stream.Name}'"));
@@ -896,6 +898,8 @@ public sealed class LocalFileSystemBackendTests : IDisposable
                 () => _backend.PutIfAbsentAsync("logs/x.json", new byte[] { 1 }, CancellationToken.None).AsTask());
             Assert.DoesNotContain(_root, putError.Message, StringComparison.Ordinal);
             Assert.DoesNotContain(_root, putError.ToString(), StringComparison.Ordinal);
+            Assert.DoesNotContain(
+                _root, putError.InnerException?.Message ?? string.Empty, StringComparison.Ordinal);
 
             Stream stream = await _backend.OpenWriteAsync("logs/y.parquet", CancellationToken.None);
             DeltaStorageException openError = await Assert.ThrowsAsync<DeltaStorageException>(async () =>
@@ -908,6 +912,8 @@ public sealed class LocalFileSystemBackendTests : IDisposable
             });
             Assert.DoesNotContain(_root, openError.Message, StringComparison.Ordinal);
             Assert.DoesNotContain(_root, openError.ToString(), StringComparison.Ordinal);
+            Assert.DoesNotContain(
+                _root, openError.InnerException?.Message ?? string.Empty, StringComparison.Ordinal);
         }
         finally
         {
@@ -919,8 +925,12 @@ public sealed class LocalFileSystemBackendTests : IDisposable
     public void SurfaceFailure_StripsAbsoluteRootFromMessageAndInnerChain()
     {
         // RF-8b: the SurfaceFailure mechanism (used by every read/write/delete surfaced error) discloses
-        // only the caller-relative path + failure type, never the absolute root — in .Message AND the inner
-        // chain. Non-vacuous: reverting Redact reddens .Message; chaining the raw exception reddens .ToString().
+        // only the caller-relative path + failure type, never the absolute root — in .Message and in the
+        // synthetic inner. Non-vacuous: reverting Redact reddens .Message; chaining the RAW path-bearing
+        // exception (instead of the synthetic redacted inner) reddens the .InnerException checks below.
+        // (Post-#664, DeltaStorageException.ToString() omits the inner chain, so the raw-inner regression is
+        // caught by the direct .InnerException + NotSame checks — not by .ToString(), which renders only the
+        // sanitized Message.)
         var raw = new IOException(string.Create(
             System.Globalization.CultureInfo.InvariantCulture,
             $"No space left on device : '{Path.Combine(_root, "logs", "x.tmp")}'"));
@@ -929,8 +939,10 @@ public sealed class LocalFileSystemBackendTests : IDisposable
         Assert.Equal(StorageErrorKind.Transient, surfaced.Kind);
         Assert.Contains("logs/x", surfaced.Message, StringComparison.Ordinal); // relative path retained
         Assert.DoesNotContain(_root, surfaced.Message, StringComparison.Ordinal);
-        Assert.DoesNotContain(_root, surfaced.ToString(), StringComparison.Ordinal); // inner chain too
+        Assert.DoesNotContain(_root, surfaced.ToString(), StringComparison.Ordinal); // rendered form (Message)
         Assert.NotSame(raw, surfaced.InnerException); // the raw path-bearing exception is NOT chained
+        Assert.DoesNotContain( // the synthetic inner is redacted too (directly asserted; ToString no longer renders it)
+            _root, surfaced.InnerException?.Message ?? string.Empty, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1499,8 +1511,9 @@ public sealed class LocalFileSystemBackendTests : IDisposable
         // primitive's real-target canonicalization (ResolveLinkTarget final=true) throw a raw,
         // path-bearing, UNCLASSIFIED IOException that escapes BEFORE any sanitizer -- leaking the absolute
         // root AND evading a catch(DeltaStorageException) caller. EVERY op must instead fail closed with a
-        // CLASSIFIED PathNotConfined whose .Message and .ToString() (inner chain) exclude the root.
-        // Non-vacuous: removing the Resolve ELOOP catch reddens this with a raw, unclassified IOException.
+        // CLASSIFIED PathNotConfined whose .Message and .ToString() (rendered Message) exclude the root.
+        // Non-vacuous: removing the Resolve ELOOP catch reddens this with a raw, unclassified IOException
+        // (the Assert.ThrowsAsync<DeltaStorageException> type gate fails).
         string a = Path.Combine(_root, "cycleA");
         string b = Path.Combine(_root, "cycleB");
         try
@@ -1535,7 +1548,7 @@ public sealed class LocalFileSystemBackendTests : IDisposable
         DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(action);
         Assert.Equal(StorageErrorKind.PathNotConfined, error.Kind);
         Assert.DoesNotContain(_root, error.Message, StringComparison.Ordinal);
-        Assert.DoesNotContain(_root, error.ToString(), StringComparison.Ordinal); // incl. inner chain
+        Assert.DoesNotContain(_root, error.ToString(), StringComparison.Ordinal); // rendered form (PathNotConfined carries no inner)
     }
 
     [Fact]
@@ -1820,8 +1833,9 @@ public sealed class LocalFileSystemBackendTests : IDisposable
     {
         // Q1 (Quality): the read-open sanitizer (OpenReadAsync / ReadRangeAsync open) is made non-vacuous
         // via IoFaultHook. A root-bearing UnauthorizedAccessException injected at "read-open" must surface
-        // a DeltaStorageException whose .Message and .ToString() (inner chain) exclude the absolute root.
-        // Non-vacuous: reverting SurfaceFailure's Redact/synthetic-inner reddens these assertions.
+        // a DeltaStorageException whose .Message and .ToString() (rendered Message; the synthetic inner is
+        // verified centrally in SurfaceFailure_StripsAbsoluteRootFromMessageAndInnerChain) exclude the
+        // absolute root. Non-vacuous: reverting SurfaceFailure's Redact reddens .Message.
         await _backend.PutIfAbsentAsync("logs/r.json", new byte[] { 1 }, CancellationToken.None); // File.Exists passes
 
         LocalFileSystemBackend.IoFaultHook = tag => tag == "read-open"
@@ -1850,8 +1864,10 @@ public sealed class LocalFileSystemBackendTests : IDisposable
     {
         // Q2 (Quality): the StagedWriteStream.WriteAsync sanitizer is made non-vacuous via IoFaultHook. A
         // root-bearing IOException injected at "write" during an OpenWriteAsync stream write must surface a
-        // DeltaStorageException whose .Message and .ToString() (inner chain) exclude the absolute root.
-        // Non-vacuous: reverting Sanitize's synthetic-inner to chain the raw exception reddens .ToString().
+        // DeltaStorageException whose .Message and synthetic .InnerException exclude the absolute root.
+        // Non-vacuous: reverting Sanitize's synthetic-inner to chain the raw exception reddens the
+        // .InnerException check below. (Post-#664 .ToString() omits the inner chain, so the raw-inner
+        // regression is caught by the direct .InnerException assertion, not by .ToString().)
         LocalFileSystemBackend.IoFaultHook = tag => tag == "write"
             ? new IOException($"No space left on device : '{Path.Combine(_root, "logs", "w.tmp")}'")
             : null;
@@ -1897,6 +1913,8 @@ public sealed class LocalFileSystemBackendTests : IDisposable
             Assert.Equal(StorageErrorKind.Transient, error.Kind);
             Assert.DoesNotContain(_root, error.Message, StringComparison.Ordinal);
             Assert.DoesNotContain(_root, error.ToString(), StringComparison.Ordinal);
+            Assert.DoesNotContain( // synthetic inner is redacted (ToString no longer renders it post-#664)
+                _root, error.InnerException?.Message ?? string.Empty, StringComparison.Ordinal);
         }
         finally
         {
@@ -1909,8 +1927,9 @@ public sealed class LocalFileSystemBackendTests : IDisposable
     {
         // publish (Security/Quality): a root-bearing IOException injected at "publish" (BEFORE the real
         // link/Move) flows into the PutIfAbsent publish catch, which must redact + attach a path-free
-        // synthetic inner. Both .Message and .ToString() (inner chain) must exclude the absolute root.
-        // Non-vacuous: reverting the publish-catch Redact/synthetic-inner reddens these assertions.
+        // synthetic inner. Both .Message and the synthetic .InnerException must exclude the absolute root.
+        // Non-vacuous: reverting the publish-catch Redact/synthetic-inner reddens these assertions. (Post-#664
+        // .ToString() omits the inner, so the synthetic-inner property is asserted directly on .InnerException.)
         LocalFileSystemBackend.IoFaultHook = tag => tag == "publish"
             ? new IOException($"I/O error : '{Path.Combine(_root, "logs", "p.tmp")}'")
             : null;
@@ -1921,6 +1940,8 @@ public sealed class LocalFileSystemBackendTests : IDisposable
             Assert.Equal(StorageErrorKind.RetryUnsafeAmbiguous, error.Kind);
             Assert.DoesNotContain(_root, error.Message, StringComparison.Ordinal);
             Assert.DoesNotContain(_root, error.ToString(), StringComparison.Ordinal);
+            Assert.DoesNotContain( // synthetic inner is redacted (ToString no longer renders it post-#664)
+                _root, error.InnerException?.Message ?? string.Empty, StringComparison.Ordinal);
         }
         finally
         {
