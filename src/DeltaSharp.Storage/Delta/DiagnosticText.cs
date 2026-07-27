@@ -138,6 +138,36 @@ internal static class DiagnosticText
         return builder.ToString();
     }
 
+    /// <summary>
+    /// Renders <paramref name="exception"/> as <c>{TypeName}: {Message}</c> (optionally followed by
+    /// <c>(Kind: {kind})</c>) plus its OWN stack trace, deliberately <b>omitting the
+    /// <see cref="Exception.InnerException"/> chain</b>. The DeltaSharp storage decode/validation exceptions
+    /// scrub attacker-influenceable content from their sanitized <see cref="Exception.Message"/> but retain the
+    /// raw underlying cause (e.g. a Parquet.Net message or a JSON parse error over crafted bytes) as the inner
+    /// for server-side diagnostics; the default <see cref="Exception.ToString"/> would re-surface that raw
+    /// inner (as would the default <c>ILogger.LogError(ex, …)</c> providers, which render <c>ToString()</c>),
+    /// re-leaking exactly what <see cref="Exception.Message"/> dropped. This override closes that vector
+    /// (#664, RF-8b parity): the inner stays attached (reachable via <see cref="Exception.InnerException"/>)
+    /// for a debugger / deliberate server-side read, but is never auto-rendered.
+    /// </summary>
+    internal static string DescribeWithoutInner(Exception exception, string? kind = null)
+    {
+        ArgumentNullException.ThrowIfNull(exception);
+        var builder = new StringBuilder();
+        builder.Append(exception.GetType().ToString()).Append(": ").Append(exception.Message);
+        if (kind is not null)
+        {
+            builder.Append(" (Kind: ").Append(kind).Append(')');
+        }
+
+        if (exception.StackTrace is { } stackTrace)
+        {
+            builder.Append(Environment.NewLine).Append(stackTrace);
+        }
+
+        return builder.ToString();
+    }
+
     // A character is neutralized if it is a C0/C1 control (category Cc — CR/LF/NUL/tab/NEL) OR a Unicode
     // LINE/PARAGRAPH SEPARATOR (U+2028/U+2029, categories Zl/Zp), which several renderers and log viewers treat
     // as a newline — so the full log-injection line-break surface, not just Cc, is closed.

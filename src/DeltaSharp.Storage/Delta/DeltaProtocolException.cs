@@ -62,6 +62,15 @@ internal sealed class DeltaProtocolException : Exception
     /// <summary>The classified failure reason.</summary>
     public DeltaProtocolErrorKind Kind { get; }
 
+    /// <summary>
+    /// Renders this exception WITHOUT its <see cref="Exception.InnerException"/> chain (#664, RF-8b parity):
+    /// the sanitized <see cref="Exception.Message"/> drops attacker-influenceable log/decode content while the
+    /// raw cause (e.g. a JSON parse error over crafted commit bytes) is retained as the inner for server-side
+    /// diagnostics; the default <c>ToString()</c> / <c>ILogger.LogError(ex, …)</c> would re-surface it. The
+    /// inner remains reachable via <see cref="Exception.InnerException"/>.
+    /// </summary>
+    public override string ToString() => DiagnosticText.DescribeWithoutInner(this, Kind.ToString());
+
     /// <summary>A malformed/truncated commit line or checkpoint action.</summary>
     public static DeltaProtocolException Malformed(string message, Exception? innerException = null) =>
         new(DeltaProtocolErrorKind.MalformedAction, message, innerException);
