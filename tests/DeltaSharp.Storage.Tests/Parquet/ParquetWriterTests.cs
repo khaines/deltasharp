@@ -255,7 +255,36 @@ public sealed class ParquetWriterTests
         // A field with NO metadata alongside fields that have it, so "always emit {}" and "omit
         // when empty" stay distinguishable at this layer.
         new StructField("third", DataTypes.IntegerType, nullable: true),
+        // METADATA KEY and METADATA STRING VALUE are the other two arbitrary-string positions in
+        // the wire format, and until now only field names were pinned for encoding. A rogue that
+        // escaped names correctly but emitted keys and values raw was byte-exact for this entire
+        // corpus and shipped 1648-green. Both positions are writable — verified against the writer,
+        // not assumed — so the same probe string goes through both.
+        new StructField("fourth", DataTypes.StringType, nullable: true, FieldMetadata.FromValues(new[]
+        {
+            new KeyValuePair<string, MetadataValue>(EveryEscapeForm, MetadataValue.String(EveryEscapeForm)),
+        })),
     });
+
+    /// <summary>
+    /// One string exercising every escape form the serializer emits, used in BOTH the metadata-key
+    /// and metadata-string-value positions. Deliberately a single shared constant: the encoding
+    /// contract does not vary by position, so neither should the corpus that pins it.
+    /// </summary>
+    internal const string EveryEscapeForm = "e\\\t\n\r\b\f\u00E9\"z";
+
+    /// <summary>Footer bytes for the metadata corpus; shared with the encoding guard.</summary>
+    private const string MetadataFooterGolden =
+            "{\"type\":\"struct\",\"fields\":[" +
+            "{\"name\":\"first\",\"type\":\"long\",\"nullable\":false,\"metadata\":{" +
+            "\"delta.columnMapping.id\":7,\"delta.columnMapping.physicalName\":\"col-7\"}}," +
+            "{\"name\":\"second\",\"type\":\"string\",\"nullable\":true,\"metadata\":{" +
+            "\"absent\":null,\"arr\":[1,\"two\",false,null]," +
+            "\"comment\":\"a \\u0022quoted\\u0022 note\"," +
+            "\"delta.columnMapping.id\":12,\"delta.columnMapping.physicalName\":\"col-12\"," +
+            "\"flag\":true,\"obj\":{\"deep\":{\"leaf\":\"x\"},\"inner\":9},\"ratio\":0.5}}," +
+            "{\"name\":\"third\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}," +
+            "{\"name\":\"fourth\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\":\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\"}}]}";
 
     [Fact]
     public async Task WrittenFooter_PinsFieldMetadata_IncludingUnquotedColumnMappingIds()
@@ -273,22 +302,13 @@ public sealed class ParquetWriterTests
 
         string schemaJson = await WriteAndReadFooterSchemaAsync(MetadataCorpusSchema);
 
-        const string footerGolden =
-            "{\"type\":\"struct\",\"fields\":[" +
-            "{\"name\":\"first\",\"type\":\"long\",\"nullable\":false,\"metadata\":{" +
-            "\"delta.columnMapping.id\":7,\"delta.columnMapping.physicalName\":\"col-7\"}}," +
-            "{\"name\":\"second\",\"type\":\"string\",\"nullable\":true,\"metadata\":{" +
-            "\"absent\":null,\"arr\":[1,\"two\",false,null]," +
-            "\"comment\":\"a \\u0022quoted\\u0022 note\"," +
-            "\"delta.columnMapping.id\":12,\"delta.columnMapping.physicalName\":\"col-12\"," +
-            "\"flag\":true,\"obj\":{\"deep\":{\"leaf\":\"x\"},\"inner\":9},\"ratio\":0.5}}," +
-            "{\"name\":\"third\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}";
+        // Golden hoisted to MetadataFooterGolden so the encoding completeness guard reads it.
 
         // Same dual oracle as the sibling test, same execution order: the golden is asserted first
         // and shadows the equality for both a call-site swap and shared-serializer drift; the
         // equality is the only assertion that can fail while the footer still matches the golden,
         // i.e. when SchemaJson drifts and the footer does not follow. Neither subsumes the other.
-        Assert.Equal(footerGolden, schemaJson);
+        Assert.Equal(MetadataFooterGolden, schemaJson);
         Assert.Equal(SchemaJson.ToJson(MetadataCorpusSchema), schemaJson);
     }
 
@@ -377,6 +397,22 @@ public sealed class ParquetWriterTests
         "{\"name\":\"emoji\\uD83C\\uDF89\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}," +
         "{\"name\":\"ctrl\\u0001x\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}";
 
+    /// <summary>The field-name artifact corpus; shared with the encoding completeness guard.</summary>
+    private static readonly StructType NameCorpusSchema = new(new[]
+    {
+        new StructField("café", DataTypes.LongType, nullable: false),
+        new StructField("中文", DataTypes.StringType, nullable: true),
+        new StructField("q\"z", DataTypes.LongType, nullable: true),
+        new StructField("a\\b", DataTypes.LongType, nullable: true),
+        new StructField("tab\there", DataTypes.LongType, nullable: true),
+        new StructField("nl\nhere", DataTypes.LongType, nullable: true),
+        new StructField("cr\rhere", DataTypes.LongType, nullable: true),
+        new StructField("bs\bhere", DataTypes.LongType, nullable: true),
+        new StructField("ff\fhere", DataTypes.LongType, nullable: true),
+        new StructField("emoji\U0001F389", DataTypes.LongType, nullable: true),
+        new StructField("ctrl\u0001x", DataTypes.LongType, nullable: true),
+    });
+
     [Fact]
     public async Task WrittenFooter_PinsFieldNamesRequiringJsonEscaping()
     {
@@ -393,28 +429,14 @@ public sealed class ParquetWriterTests
         // backslash as \\, tab as \t and newline as \n, and astral characters as a surrogate PAIR.
         // No structural or round-trip check can see any of that. All of these names are accepted by
         // the writer today — verified, not assumed.
-        var schema = new StructType(new[]
-        {
-            new StructField("café", DataTypes.LongType, nullable: false),
-            new StructField("中文", DataTypes.StringType, nullable: true),
-            new StructField("q\"z", DataTypes.LongType, nullable: true),
-            new StructField("a\\b", DataTypes.LongType, nullable: true),
-            new StructField("tab\there", DataTypes.LongType, nullable: true),
-            new StructField("nl\nhere", DataTypes.LongType, nullable: true),
-            new StructField("cr\rhere", DataTypes.LongType, nullable: true),
-            new StructField("bs\bhere", DataTypes.LongType, nullable: true),
-            new StructField("ff\fhere", DataTypes.LongType, nullable: true),
-            new StructField("emoji\U0001F389", DataTypes.LongType, nullable: true),
-            new StructField("ctrl\u0001x", DataTypes.LongType, nullable: true),
-        });
 
-        string schemaJson = await WriteAndReadFooterSchemaAsync(schema);
+        string schemaJson = await WriteAndReadFooterSchemaAsync(NameCorpusSchema);
 
         // Golden hoisted to NameEncodingGolden so the escape-form completeness guard reads THIS
         // string rather than a copy of it.
 
         Assert.Equal(NameEncodingGolden, schemaJson);
-        Assert.Equal(SchemaJson.ToJson(schema), schemaJson);
+        Assert.Equal(SchemaJson.ToJson(NameCorpusSchema), schemaJson);
 
         // The footer must remain parseable JSON: a raw-interpolating rogue breaks this outright for
         // the quote-bearing name, and this fails with a clearer message than a byte diff would.
@@ -483,17 +505,65 @@ public sealed class ParquetWriterTests
     }
 
     [Fact]
-    public void NameEncodingCorpus_CoversEveryEscapeFormTheSerializerEmits()
+    public void EncodingCorpus_CoversEveryEscapeFormInEveryStringPosition()
     {
-        // #679: COMPLETENESS guard for field-name ENCODING. The corpus of escaped names is a list,
-        // and the set it must cover is not obvious by inspection -- the encoder emits SEVEN distinct
-        // escape forms, and the first version of that corpus covered four (it omitted \b, \f and \r
-        // without anything saying so).
+        // #679: COMPLETENESS guard for STRING ENCODING, across every position a caller-supplied
+        // string can occupy in the wire format.
         //
-        // So the required set is DERIVED: probe the serializer across the control range plus a
-        // sample of non-ASCII, observe which escape forms it actually produces, and require the
-        // pinned name golden to exercise each one. Nothing here restates the encoder's policy; if
-        // the encoder changes, this set changes with it.
+        // Two independent things go wrong here, and an earlier version of this guard got both:
+        //
+        //   1. The required SET was hand-listed. The encoder emits SEVEN distinct escape forms and
+        //      the first corpus covered four, omitting \b, \f and \r with nothing saying so.
+        //   2. The set of POSITIONS was hand-listed -- implicitly, at one. This guard checked field
+        //      names only, while a schema JSON has THREE arbitrary-string positions: field name,
+        //      metadata key, and metadata string value. A rogue that escaped names correctly but
+        //      emitted metadata keys and values raw was byte-exact for every pinned corpus here
+        //      and shipped 1648-green.
+        //
+        // Both are now derived. The required set is probed out of the serializer; each position is
+        // checked against that same set, so widening the encoder or adding a corpus row cannot
+        // leave one position silently behind the others.
+        SortedSet<string> required = ProbeEmittedEscapeForms();
+
+        // Non-vacuity: a probe loop that silently stopped matching would make everything below pass
+        // trivially, so require the encoder to have produced a plausible number of forms.
+        Assert.True(required.Count >= 5, $"Escape-form probe produced only {required.Count} forms.");
+
+        (string Position, IEnumerable<string> Strings)[] positions =
+        [
+            ("field name", NameCorpusSchema.Select(field => field.Name)),
+            ("metadata key", MetadataStrings(MetadataCorpusSchema, keys: true)),
+            ("metadata string value", MetadataStrings(MetadataCorpusSchema, keys: false)),
+        ];
+
+        foreach ((string position, IEnumerable<string> strings) in positions)
+        {
+            var covered = new SortedSet<string>(StringComparer.Ordinal);
+            foreach (string candidate in strings)
+            {
+                covered.UnionWith(EscapeFormsIn(candidate));
+            }
+
+            string[] missing = required.Where(form => !covered.Contains(form)).ToArray();
+            Assert.True(
+                missing.Length == 0,
+                $"The serializer emits these escape forms but no artifact corpus row exercises them "
+                + $"in the {position} position, so a rogue mishandling them there would ship "
+                + $"undetected: {string.Join(" ", missing)}");
+        }
+
+        // Non-vacuity for the goldens themselves: the escaped bytes must actually appear in the
+        // pinned footers, not merely in the in-memory corpus.
+        Assert.Contains("\\u00E9", NameEncodingGolden, StringComparison.Ordinal);
+        Assert.Contains("\\u00E9", MetadataFooterGolden, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Probes the serializer to discover which escape forms it actually emits, rather than
+    /// restating its policy. If the encoder changes, this set changes with it.
+    /// </summary>
+    private static SortedSet<string> ProbeEmittedEscapeForms()
+    {
         var emitted = new SortedSet<string>(StringComparer.Ordinal);
         var codepoints = new List<int>();
         for (int c = 1; c < 0x80; c++)
@@ -501,38 +571,89 @@ public sealed class ParquetWriterTests
             codepoints.Add(c);
         }
 
-        codepoints.AddRange(new[] { 0x00A0, 0x00E9, 0x2028, 0x2029, 0x4E2D, 0xFFFD });
+        codepoints.AddRange([0x00A0, 0x00E9, 0x2028, 0x2029, 0x4E2D, 0xFFFD]);
 
         foreach (int codepoint in codepoints)
         {
-            string probeName = "x" + char.ConvertFromUtf32(codepoint) + "y";
-            string json = SchemaJson.ToJson(
-                new StructType(new[] { new StructField(probeName, DataTypes.LongType) }));
+            emitted.UnionWith(EscapeFormsIn(char.ConvertFromUtf32(codepoint)));
+        }
 
-            int start = json.IndexOf("\"name\":\"x", StringComparison.Ordinal) + 9;
-            int end = json.IndexOf("y\",\"type\"", StringComparison.Ordinal);
-            string encoded = json[start..end];
-            if (encoded.Length == 1 && encoded[0] == codepoint)
+        return emitted;
+    }
+
+    /// <summary>
+    /// Returns the escape forms the serializer emits for <paramref name="value"/>, obtained by
+    /// running it through <c>SchemaJson</c> itself -- the serializer is its own oracle here.
+    /// </summary>
+    private static IEnumerable<string> EscapeFormsIn(string value)
+    {
+        string json = SchemaJson.ToJson(
+            new StructType([new StructField("x" + value + "y", DataTypes.LongType)]));
+        int start = json.IndexOf("\"name\":\"x", StringComparison.Ordinal) + 9;
+        int end = json.IndexOf("y\",\"type\"", StringComparison.Ordinal);
+        string encoded = json[start..end];
+
+        var forms = new List<string>();
+        for (int i = 0; i < encoded.Length; i++)
+        {
+            if (encoded[i] != '\\')
             {
                 continue;
             }
 
-            // Collapse \uXXXX to its family; the specific codepoints are pinned by the golden.
-            emitted.Add(encoded.StartsWith("\\u", StringComparison.Ordinal) ? "\\u" : encoded);
+            // Collapse \uXXXX to its family; the specific codepoints are pinned by the goldens.
+            forms.Add(encoded[i + 1] == 'u' ? "\\u" : encoded.Substring(i, 2));
+            i++;
         }
 
-        // Non-vacuity: a probe loop that silently stopped matching would make the check below pass
-        // trivially, so require the encoder to have produced a plausible number of forms.
-        Assert.True(emitted.Count >= 5, $"Escape-form probe produced only {emitted.Count} forms.");
+        return forms;
+    }
 
-        string[] unpinned = emitted
-            .Where(form => !NameEncodingGolden.Contains(form, StringComparison.Ordinal))
-            .ToArray();
-        Assert.True(
-            unpinned.Length == 0,
-            "The serializer emits these escape forms but WrittenFooter_PinsFieldNamesRequiringJsonEscaping "
-            + "does not pin any name using them, so a rogue mishandling them would ship undetected: "
-            + string.Join(" ", unpinned));
+    /// <summary>Recursively collects every metadata key, or every metadata string value.</summary>
+    private static IEnumerable<string> MetadataStrings(StructType schema, bool keys)
+    {
+        var found = new List<string>();
+        foreach (StructField field in schema)
+        {
+            Walk(field.Metadata, found, keys);
+        }
+
+        return found;
+
+        static void Walk(FieldMetadata metadata, List<string> into, bool keys)
+        {
+            foreach (KeyValuePair<string, MetadataValue> entry in metadata)
+            {
+                if (keys)
+                {
+                    into.Add(entry.Key);
+                }
+
+                WalkValue(entry.Value, into, keys);
+            }
+        }
+
+        static void WalkValue(MetadataValue value, List<string> into, bool keys)
+        {
+            switch (value.Kind)
+            {
+                case MetadataValueKind.String when !keys:
+                    into.Add(value.AsString());
+                    break;
+                case MetadataValueKind.Array:
+                    foreach (MetadataValue item in value.AsArray())
+                    {
+                        WalkValue(item, into, keys);
+                    }
+
+                    break;
+                case MetadataValueKind.Nested:
+                    Walk(value.AsNested(), into, keys);
+                    break;
+                default:
+                    break;
+            }
+        }
     }
 
     [Fact]
