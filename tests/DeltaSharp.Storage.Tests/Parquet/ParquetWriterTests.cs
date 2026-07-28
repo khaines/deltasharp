@@ -116,6 +116,45 @@ public sealed class ParquetWriterTests
         Assert.Equal(1L, amountStats.NullCount);
     }
 
+    /// <summary>
+    /// Pins the footer metadata keys to their WIRE LITERALS, transcribed independently in
+    /// <see cref="FooterWireKeys"/> rather than read from the production constants.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Every footer assertion in this file used to look the schema up through
+    /// <c>DeltaSchemaJson.SchemaMetadataKey</c> — the same symbol the writer stamps with — so the
+    /// lookup succeeded whatever that symbol contained. A one-character deletion from it leaves the
+    /// serializer, its input and the emitted bytes ALL CORRECT and moves only the wire identifier;
+    /// it was 0 kills solution-wide. External readers would then find no schema in the footer at
+    /// all, which is a worse outcome than a divergent one and is not what any of the open deferrals
+    /// describe: every one of those scopes the schemaString VALUE.
+    /// </para>
+    /// <para>
+    /// This is the tautology #679 exists to delete, moved from the value to the key, and it says
+    /// something about shared sources generally that the rest of this file should be read with: a
+    /// source shared between the prober and the probed is safe when it sits OUTSIDE both and unsafe
+    /// when it sits BETWEEN them. Direction is what matters, not distance.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void FooterMetadataKeys_AreTheWireLiterals()
+    {
+        Assert.Equal("org.apache.spark.sql.parquet.row.metadata", FooterWireKeys.Schema);
+
+        if (!string.Equals(FooterWireKeys.Schema, DeltaSchemaJson.SchemaMetadataKey, StringComparison.Ordinal))
+        {
+            Assert.Fail(
+                "The footer schema key no longer matches Spark's wire literal, so every external "
+                + "reader would find NO schema in the footer -- the schemaString itself can be "
+                + "perfectly correct and this still breaks every consumer."
+                + $"{Environment.NewLine}  wire literal: {FooterWireKeys.Schema}"
+                + $"{Environment.NewLine}  writer stamps: {DeltaSchemaJson.SchemaMetadataKey}");
+        }
+
+        Assert.Equal(FooterWireKeys.Writer, DeltaSchemaJson.WriterMetadataKey);
+    }
+
     [Fact]
     public async Task WrittenFile_CarriesDeltaSchemaMetadata()
     {
@@ -125,8 +164,8 @@ public sealed class ParquetWriterTests
 
         await using ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
 
-        Assert.True(reader.CustomMetadata.ContainsKey(DeltaSchemaJson.SchemaMetadataKey));
-        string schemaJson = reader.CustomMetadata[DeltaSchemaJson.SchemaMetadataKey];
+        Assert.True(reader.CustomMetadata.ContainsKey(FooterWireKeys.Schema));
+        string schemaJson = reader.CustomMetadata[FooterWireKeys.Schema];
 
         // #679: this is the ARTIFACT assertion — it pins the bytes actually stamped into the written
         // Parquet footer, rather than what the serializer helper would have produced.
@@ -182,7 +221,7 @@ public sealed class ParquetWriterTests
         Assert.Contains("\"type\":\"struct\"", schemaJson);
         Assert.Contains("\"name\":\"id\"", schemaJson);
         Assert.Contains("\"name\":\"amount\"", schemaJson);
-        Assert.True(reader.CustomMetadata.ContainsKey(DeltaSchemaJson.WriterMetadataKey));
+        Assert.True(reader.CustomMetadata.ContainsKey(FooterWireKeys.Writer));
     }
 
     /// <summary>
@@ -206,7 +245,7 @@ public sealed class ParquetWriterTests
 
         await using ParquetReader reader =
             await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
-        string declared = reader.CustomMetadata[DeltaSchemaJson.SchemaMetadataKey];
+        string declared = reader.CustomMetadata[FooterWireKeys.Schema];
 
         // THE OUTPUT-SIDE CHECK. Every other guard in this file ranges over the INPUT MODEL, while
         // the property they all protect is about the OUTPUT -- so anything that can differ between

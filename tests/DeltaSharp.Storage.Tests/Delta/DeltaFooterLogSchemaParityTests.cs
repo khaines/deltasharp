@@ -199,7 +199,7 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
         await using FileStream stream = File.OpenRead(path);
         await using ParquetReader reader =
             await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
-        return reader.CustomMetadata[DeltaSchemaJson.SchemaMetadataKey];
+        return reader.CustomMetadata[FooterWireKeys.Schema];
     }
 
     /// <summary>
