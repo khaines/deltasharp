@@ -59,13 +59,36 @@ public sealed class DeltaSchemaJsonSingleSourceTests
         // identifiable by signature — it threads a Utf8JsonWriter alongside a schema node (DataType or
         // FieldMetadata). Storage must own no such method; that responsibility lives solely in
         // DeltaSharp.Abstractions.SchemaJson. Delta LOG action writers legitimately pair a
-        // Utf8JsonWriter with action types (MetadataAction etc.), which is why the predicate keys on
-        // the schema type tree specifically rather than on the writer alone.
+        // Utf8JsonWriter with action types (MetadataAction etc., declared in DeltaSharp.Storage.Delta),
+        // which is why the predicate keys on the schema type system specifically rather than on the
+        // writer alone.
         const BindingFlags DeclaredMembers =
             BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static
             | BindingFlags.Instance | BindingFlags.DeclaredOnly;
 
-        static bool IsSchemaNode(Type t) => typeof(DataType).IsAssignableFrom(t) || t == typeof(FieldMetadata);
+        // The predicate must close the CLASS of schema-serializer signatures, not enumerate the ones we
+        // happen to imagine. An earlier version keyed on "DataType-assignable or FieldMetadata", which a
+        // re-inlined serializer evades completely just by threading StructField, MetadataValue (literally
+        // the signature of the cross-assembly seam this PR deleted), or a `ref Utf8JsonWriter`. So:
+        //   * unwrap by-ref/out/pointer/array so `ref Utf8JsonWriter` and `in StructField` still match;
+        //   * treat ANY type from the schema type system (namespace DeltaSharp.Types in the Abstractions
+        //     assembly) as a schema node, rather than naming four of its members;
+        //   * recurse through generic arguments so IReadOnlyList<StructField>/ReadOnlySpan<StructField>
+        //     match too.
+        static Type Unwrap(Type t) => t.GetElementType() ?? t;
+
+        static bool MentionsSchemaType(Type t)
+        {
+            Type actual = Unwrap(t);
+            if (actual.Namespace == "DeltaSharp.Types" && actual.Assembly == typeof(DataType).Assembly)
+            {
+                return true;
+            }
+
+            return actual.IsGenericType && actual.GetGenericArguments().Any(MentionsSchemaType);
+        }
+
+        static bool IsJsonWriter(Type t) => Unwrap(t) == typeof(Utf8JsonWriter);
 
         string[] offenders = typeof(DeltaSchemaJson).Assembly
             .GetTypes()
@@ -73,13 +96,14 @@ public sealed class DeltaSchemaJsonSingleSourceTests
             .Where(m =>
             {
                 Type[] parameters = m.GetParameters().Select(x => x.ParameterType).ToArray();
-                return Array.Exists(parameters, x => x == typeof(Utf8JsonWriter))
-                    && Array.Exists(parameters, IsSchemaNode);
+                return Array.Exists(parameters, IsJsonWriter)
+                    && Array.Exists(parameters, MentionsSchemaType);
             })
             .Select(m => $"{m.DeclaringType!.FullName}.{m.Name}")
             .OrderBy(n => n, StringComparer.Ordinal)
             .ToArray();
 
+        // Named rather than counted, so a failure says WHICH method reintroduced a serializer.
         Assert.Empty(offenders);
     }
 

@@ -102,7 +102,10 @@ public sealed class SchemaJsonSerializerPropertyTests
             new StructField("mapped", DataTypes.CreateArrayType(leaf, containsNull: true), nullable: true, metadata),
         }));
 
-        // Names needing JSON escaping must survive the round trip byte-stably.
+        // Names needing JSON escaping, for the round-trip theories below. NOTE: those theories assert
+        // idempotence and structural equality, BOTH of which are invariant under the encoder choice —
+        // so this entry does NOT pin the escaped bytes. That is done explicitly by
+        // JsonEscapingPolicy_IsPinned_SoTheEncoderCannotSilentlyChangePersistedBytes.
         data.Add("escaped-names", new StructType(new[]
         {
             new StructField("quote\"name", DataTypes.StringType, nullable: true),
@@ -193,6 +196,60 @@ public sealed class SchemaJsonSerializerPropertyTests
         Assert.Equal(
             "{\"type\":\"struct\",\"fields\":[{\"name\":\"f\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}",
             SchemaJson.ToJson(new StructType(new[] { new StructField("f", DataTypes.LongType, nullable: true) })));
+    }
+
+    [Fact]
+    public void JsonEscapingPolicy_IsPinned_SoTheEncoderCannotSilentlyChangePersistedBytes()
+    {
+        // The Utf8JsonWriter's JavaScriptEncoder is part of the persisted wire format, not an
+        // implementation detail: switching to JavaScriptEncoder.UnsafeRelaxedJsonEscaping emits the SAME
+        // logical schema with DIFFERENT bytes for any non-ASCII or quoted field name, changing the
+        // on-disk metaData.schemaString of a committed table. Nothing else in the suite pins it —
+        // round-trip idempotence and structural equality are both invariant under encoder choice — so
+        // these literals are the only thing standing between a one-word constructor change and a silent
+        // change to every schemaString carrying a non-ASCII column name.
+        //
+        // Default (strict) encoder policy, pinned exactly: non-ASCII escapes to \uXXXX with UPPERCASE
+        // hex, and a double quote escapes to \u0022 rather than \". UnsafeRelaxedJsonEscaping emits the
+        // literal UTF-8 character and \" respectively, so each assertion below fails under it.
+        Assert.Equal(
+            "{\"type\":\"struct\",\"fields\":[{\"name\":\"caf\\u00E9\",\"type\":\"string\"" +
+            ",\"nullable\":true,\"metadata\":{}}]}",
+            SchemaJson.ToJson(new StructType(new[]
+            {
+                new StructField("caf\u00e9", DataTypes.StringType, nullable: true),
+            })));
+
+        // A non-BMP-adjacent CJK code point, to pin that the escape is per-code-point uppercase hex.
+        Assert.Equal(
+            "{\"type\":\"struct\",\"fields\":[{\"name\":\"a\\u4E2Db\",\"type\":\"string\"" +
+            ",\"nullable\":true,\"metadata\":{}}]}",
+            SchemaJson.ToJson(new StructType(new[]
+            {
+                new StructField("a\u4e2db", DataTypes.StringType, nullable: true),
+            })));
+
+        // The quote case discriminates the two encoders most sharply: \u0022 (strict) vs \" (relaxed).
+        Assert.Equal(
+            "{\"type\":\"struct\",\"fields\":[{\"name\":\"q\\u0022z\",\"type\":\"string\"" +
+            ",\"nullable\":true,\"metadata\":{}}]}",
+            SchemaJson.ToJson(new StructType(new[]
+            {
+                new StructField("q\"z", DataTypes.StringType, nullable: true),
+            })));
+
+        // Metadata KEYS and string VALUES go through the same encoder, so pin them too — column-mapping
+        // physical names are attacker-adjacent free text and are exactly where a non-ASCII name lands.
+        Assert.Equal(
+            "{\"type\":\"struct\",\"fields\":[{\"name\":\"f\",\"type\":\"long\"" +
+            ",\"nullable\":true,\"metadata\":{\"k\\u00E9y\":\"v\\u00E9l\"}}]}",
+            SchemaJson.ToJson(new StructType(new[]
+            {
+                new StructField("f", DataTypes.LongType, nullable: true, FieldMetadata.FromValues(new[]
+                {
+                    new KeyValuePair<string, MetadataValue>("k\u00e9y", MetadataValue.String("v\u00e9l")),
+                })),
+            })));
     }
 
     [Fact]
