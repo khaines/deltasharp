@@ -969,6 +969,10 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// borrows nothing from the renderer. The assertion is EQUALITY, not a bound: a count too small is the
     /// defect, and a count too large would mean the model is optimistic and the test itself unsound. It
     /// holds on every one of the cells below.</para>
+    /// <para><b>The cardinalities are not decorative either.</b> Six four-character fields at budget 61 is
+    /// the witness two seats reported independently: the complete render is exactly 61 characters and the
+    /// forward walk shows four of them. It is a cell of this sweep rather than a row of its own, because a
+    /// reported witness pinned as a literal only ever guards the cell it was reported at.</para>
     /// </summary>
     [Fact]
     public void TheFieldCountIsTheLargestFeasibleCount_NotOneShortOfTheFirstInfeasibleOne()
@@ -988,7 +992,7 @@ public sealed class AnalysisExceptionTypeRenderTests
 
             foreach (int nameLength in new[] { 1, 2, 3, 4, 5, 6, 7, 8, 12 })
             {
-                foreach (int fieldCount in new[] { 2, 3, 4, 5, 9, 11, 30 })
+                foreach (int fieldCount in new[] { 2, 3, 4, 5, 6, 7, 9, 11, 30 })
                 {
                     StructType subject = UniformStruct(fieldCount, nameLength, childKind);
                     int perField = nameLength + 1 + compact.Length;
