@@ -106,6 +106,17 @@ namespace DeltaSharp.Storage.Delta;
 /// So the discipline is mechanical: grep the assertion's WORDING across <c>src/</c> and <c>tests/</c> —
 /// "load-bearing", "no test can kill", "equivalent", "dead code", "redundant" — and fix every site in the
 /// same commit as the retraction.</para>
+/// <para><b>Where that grep stops.</b> Two seats re-ran the sweep with ~19 and ~12 further terms
+/// (<c>unkillable</c>, <c>equivalent mutant</c>, <c>vacuous</c>, <c>has no effect</c>, <c>safe to remove</c>,
+/// <c>never fires</c>, <c>vestigial</c>, <c>tautolog</c>, …) and found no fourth site, but they did surface
+/// three NEAR-MISSES worth naming so the next reader does not re-litigate them. The other <c>not
+/// load-bearing</c> hits are <c>commitInfo</c> provenance — a different claim class, about protocol
+/// semantics rather than test coverage. <c>NullMaskTier</c> / <c>KernelTier</c>'s <c>vacuously "green"</c> is
+/// the INVERSE shape: it justifies a testability affordance instead of excusing an untested guard.
+/// <c>ChangeFeedReader</c>'s <c>UNREACHABLE via the read path</c> is the closest miss and is CORRECT — and it
+/// is correct for the reason the rule turns on: it names its upstream reason and RETAINS the guard. Naming
+/// why something is unreachable and keeping it is sound; concluding it is therefore deletable is not. That,
+/// not the vocabulary, is the line.</para>
 /// <para><b>The one worked set-wise comparison, shown as SETS because its totals were disputed twice.</b>
 /// A script implementing the rule above produced 13 non-boolean state writes; an independent hand audit
 /// produced 11. Neither total is evidence of anything; the membership is:</para>
@@ -469,10 +480,25 @@ internal sealed class ReplayedMetadataLog
             // already reject every version — and no SINGLE-POINT mutant of it can be killed. An earlier
             // version of this comment concluded from that it was "NOT load-bearing, which is why no test can
             // kill a mutant of it". That was FALSE and is retracted: tests DO kill it, once the guard it is
-            // redundant WITH is also broken. Measured (council R8/R9): remove the upper bound alone -> 3 red;
-            // remove the upper bound AND this disjunct -> 6, the extra three being an empty observer and two
-            // surviving-sub-floor CDF cases. Against the LOWER bound it is genuinely unobservable (4 red
-            // either way, identical sets).
+            // redundant WITH is also broken.
+            //
+            // Figures below re-measured at c3dfd6c, on the condition as written one line above. They are
+            // PROSE and do not execute, so treat them as stale if that line has changed since. The three
+            // test names ARE pinned executably, by ReplayedMetadataLogTests
+            // .TheHasCoverageAuditBlockNamesThreeTestsThatAllStillExist. The mutations are given as their
+            // literal edited condition, because a kill count is meaningless without the exact mutant:
+            //
+            //   Uhi     `if (!HasCoverage || version < CoveredFromInclusive)`                       -> 3 red
+            //   Uhi+S1  `if (version < CoveredFromInclusive)`                                       -> 6 red
+            //   Ulo     `if (!HasCoverage || version >= CoveredToExclusive)`                        -> 4 red
+            //   Ulo+S1  `if (version >= CoveredToExclusive)`                                        -> 4 red
+            //
+            // Uhi+S1's extra three over Uhi are AnEmptyObserver_ReportsEverythingNotCovered_SoTheGate
+            // DegradesToAFullDiskScan, Cdf_PreRangeIdentityGate_StillReadsASurvivingSubFloorCommitThe
+            // ReplayCannotReach, and Cdf_SurvivingSubFloorCommitIdentityDiffers_FailsClosed_NamesSubFloor
+            // Version. Against the LOWER bound this disjunct is genuinely unobservable — 4 red either way,
+            // and compared SET-WISE those two are the same four tests name for name, not merely the same
+            // count.
             //
             // The earlier claim's falsification space was inputs only ({MIN,-1,0,1,99,100,MAX} x four
             // observer states). That is the insufficiency this type's doc now forbids: an equivalence claim

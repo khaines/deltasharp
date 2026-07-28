@@ -618,6 +618,38 @@ public sealed class ReplayedMetadataLogTests
         Assert.Equal(new[] { m }, observed);
     }
 
+    /// <summary>
+    /// Audit for the <c>DO NOT DELETE `!HasCoverage`</c> block in <see cref="ReplayedMetadataLog"/>. That block
+    /// justifies keeping a redundant-looking disjunct by citing measured kill sets, and names the three tests
+    /// that a mutant of it kills once the upper bound is broken too. Those numbers are PROSE and cannot execute
+    /// — but the test NAMES can, and a rename or deletion is the likeliest way the block goes quietly stale.
+    ///
+    /// <para>This pins the names only. It does NOT re-measure the counts: applying the mutations requires
+    /// editing source, which a test cannot do. So the block also carries a re-measured-at marker, and this
+    /// audit narrows the silent-drift surface to the counts alone rather than closing it.</para>
+    /// </summary>
+    [Fact]
+    public void TheHasCoverageAuditBlockNamesThreeTestsThatAllStillExist()
+    {
+        (Type Type, string Method)[] cited =
+        {
+            (typeof(ReplayedMetadataLogTests),
+                nameof(AnEmptyObserver_ReportsEverythingNotCovered_SoTheGateDegradesToAFullDiskScan)),
+            (typeof(Reading.ChangeFeedReadIoBudgetTests),
+                "Cdf_PreRangeIdentityGate_StillReadsASurvivingSubFloorCommitTheReplayCannotReach"),
+            (typeof(Reading.ChangeFeedReadTests),
+                "Cdf_SurvivingSubFloorCommitIdentityDiffers_FailsClosed_NamesSubFloorVersion"),
+        };
+
+        foreach ((Type type, string method) in cited)
+        {
+            Assert.True(
+                type.GetMethod(method) is not null,
+                $"The !HasCoverage audit block cites {type.Name}.{method}, which no longer exists. "
+                + "Re-measure the block's kill sets and update it — do not just fix this name.");
+        }
+    }
+
     // #653 hygiene: a fail-closed message names ONLY a version — never a path, column name, or physical name.
     private static void AssertPathFree(string message)
     {
