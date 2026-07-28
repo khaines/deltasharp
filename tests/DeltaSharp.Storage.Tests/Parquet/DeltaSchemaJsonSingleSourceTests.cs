@@ -35,9 +35,11 @@ namespace DeltaSharp.Storage.Tests;
 /// passes all of them). The complementary checks are the <b>artifact</b> assertions in
 /// <c>ParquetWriterTests</c>, which read the schema string back out of a written Parquet footer and
 /// so cannot be evaded by tool choice. Those now range over field metadata (including the
-/// column-mapping id contract), every atomic type the writer accepts with the decimal parameter
-/// boundaries, and field names requiring JSON escaping — and a completeness guard fails if the
-/// writer ever accepts a type the corpus does not pin. What they still cannot reach is nested
+/// column-mapping id contract and every <c>MetadataValueKind</c>, arrays and nested objects
+/// among them), every atomic type the writer accepts with the decimal parameter boundaries, and
+/// field names requiring JSON escaping — and three completeness guards, each deriving its
+/// required set from the type system or by probing the writer, fail if the corpus falls behind
+/// any of those three dimensions. What they still cannot reach is nested
 /// types, which <c>ParquetTypeMapping</c> refuses to write at all (#713). Neither layer is a
 /// complete net on its own; this file fails earlier and explains itself better, the artifact
 /// assertions are provenance-independent, and both are bounded.
@@ -169,9 +171,11 @@ public sealed class DeltaSchemaJsonSingleSourceTests
         // The complementary checks are therefore the ARTIFACT assertions in ParquetWriterTests, which
         // read the schema string back out of a written Parquet footer and pin its bytes. Those ask
         // about OUTCOME, not provenance, so they cannot be dodged by CHOICE OF TOOL -- and their
-        // corpus now covers field metadata, every atomic type the writer accepts (decimal boundaries
-        // included) and field names requiring JSON escaping, with a completeness guard that fires if
-        // the writer outgrows the corpus. What remains out of their reach is nested types, which the
+        // corpus now covers field metadata (every MetadataValueKind, arrays and nested objects
+        // included), every atomic type the writer accepts (decimal boundaries included) and field
+        // names requiring JSON escaping, with three completeness guards that fire if the corpus
+        // falls behind any of those dimensions. What remains out of their reach is nested types,
+        // which the
         // writer refuses outright (#713). These reflection guards are defense-in-depth: they fail
         // earlier and with a far more actionable message. Neither layer is complete alone.
         //
