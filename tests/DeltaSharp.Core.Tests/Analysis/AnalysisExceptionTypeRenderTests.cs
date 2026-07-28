@@ -368,10 +368,12 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// <summary>
     /// The field-name bound must not cut a REAL field name, and the corpus must be able to tell.
     /// <para>A flat cap of 32 stood inside the type renderer — the same number four seats rejected for
-    /// candidate names — while every field in this file's fixture is 24 characters, so no row could reach it.
-    /// Restoring the 32 was measured at <b>0 RED across the whole suite</b>. That is the vacuity pattern this
-    /// PR has now hit five times: a corpus whose items are all shorter than the bound cannot test the bound.
-    /// </para>
+    /// candidate names — and every field name the file generated was shorter than it, so no row could reach
+    /// it. Restoring the 32 was measured at <b>0 RED across the whole suite</b>. That is the vacuity pattern
+    /// this PR keeps hitting: a corpus whose items are all shorter than the bound cannot test the bound. The
+    /// widths themselves are not named here; they are read off the generators by
+    /// <see cref="TheFixturesThatPredateThisPin_CannotReachTheDiscriminatingRegion"/>, because every attempt
+    /// in this change to write down what the fixtures are has been wrong.</para>
     /// <para>These names are real-world lengths (35 and 43). The first must survive verbatim; the point of
     /// the ceiling is to stop ONE pathological name consuming the render, not to trim ordinary schemas.</para>
     /// </summary>
@@ -488,7 +490,7 @@ public sealed class AnalysisExceptionTypeRenderTests
         {
             for (int width = 1; width <= 60; width++)
             {
-                foreach (int nameLength in new[] { 8, 16, 32 })
+                foreach (int nameLength in LegacySweptNameLengths)
                 {
                     DataType payload = new StructType(
                     [
@@ -978,6 +980,7 @@ public sealed class AnalysisExceptionTypeRenderTests
             .. shaped.Fields.Select(f => f.Name),
             .. shaped.Fields.Select(f => f.DataType).OfType<StructType>()
                 .SelectMany(inner => inner.Fields).Select(f => f.Name),
+            .. LegacySweptNameLengths.Select(n => new string('f', n)),
         ];
 
         var reachable = new List<string>();
@@ -1009,6 +1012,15 @@ public sealed class AnalysisExceptionTypeRenderTests
 
     /// <summary>Distinct leading characters, so names stay unique down to a length of one.</summary>
     private const string Alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+
+    /// <summary>The field-name widths swept by <see cref="NoFieldIsElided_WhileTheBudgetCouldStillHavePaidForIt"/>,
+    /// hoisted so that
+    /// <see cref="TheFixturesThatPredateThisPin_CannotReachTheDiscriminatingRegion"/> can READ them.
+    /// A second reviewer falsified the deleted prose by this route rather than by marginal cost — a
+    /// predating fixture does not fix ONE width, it sweeps three — so the assertion has to cover the swept
+    /// widths as well as the hard-coded ones, and restating them here would reintroduce exactly the copy
+    /// this change exists to remove.</summary>
+    private static readonly int[] LegacySweptNameLengths = [8, 16, 32];
 
     /// <summary>The exact width of the <c>… (+N more)</c> marker, spelled out rather than borrowed from
     /// <c>DiagnosticText</c>, so that the oracle below shares no arithmetic with the code it judges.</summary>
