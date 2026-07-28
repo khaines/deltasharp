@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Text.RegularExpressions;
 using DeltaSharp.Analysis;
 using DeltaSharp.Plans.Expressions;
 using DeltaSharp.Types;
@@ -14,9 +15,12 @@ namespace DeltaSharp.Core.Tests.Analysis;
 /// that echo a list of columns.
 /// <para><b>The regression this closes.</b> The whole-message backstop added earlier in this PR was a cap on
 /// the composed string, so a wide schema had its <c>given input columns: [...]</c> listing cut mid-way with no
-/// indication that anything had been dropped. Measured at <c>0ba0f8b</c>: a 50-column table rendered 1025
-/// characters (down from 1107) and a 400-column table rendered the <b>byte-identical</b> message — 355
-/// candidates silently gone. These are TRUSTED-path names: a user's own schema, not attacker text. Being told
+/// indication that anything had been dropped. At <c>0ba0f8b</c> a 50-column and a 400-column table rendered
+/// the <b>byte-identical</b> message, so every candidate past the cut was silently gone — <i>how many</i> is
+/// not written here, because it is a property of the corpus and a prose number cannot be trusted to track it.
+/// <c>OverflowCount_NamesExactlyHowManyCandidatesAreHidden</c> asserts the count instead: a hand-written
+/// figure in this file was wrong by one, in a comment whose own argument is that a wrong count is worse than
+/// no count. These are TRUSTED-path names: a user's own schema, not attacker text. Being told
 /// "your column does not resolve" and then shown a truncated candidate list with no hint that it is truncated
 /// is the difference between spotting a typo and filing a support ticket.</para>
 /// <para><b>Why per-item bounding rather than a bigger cap.</b> A cap that truncates the CONTAINER destroys
@@ -62,14 +66,14 @@ public sealed class AnalysisExceptionCandidateListingTests
         string fourHundred = AnalysisException.UnresolvedColumn("nosuch", Columns(400)).Message;
 
         Assert.NotEqual(fifty, fourHundred);
-        Assert.Contains("(+36 more)", fifty, StringComparison.Ordinal);
-        Assert.Contains("(+386 more)", fourHundred, StringComparison.Ordinal);
+        AssertCountIsAccurate(fifty, 50);
+        AssertCountIsAccurate(fourHundred, 400);
     }
 
     /// <summary>The count must be ACCURATE, not merely present — an overflow marker that reports the wrong
     /// number is worse than none, because it is believed.</summary>
     [Theory]
-    [InlineData(15)]
+    [InlineData(30)]
     [InlineData(50)]
     [InlineData(100)]
     [InlineData(400)]
@@ -78,11 +82,7 @@ public sealed class AnalysisExceptionCandidateListingTests
     {
         AnalysisException ex = AnalysisException.UnresolvedColumn("nosuch", Columns(width));
 
-        int shown = AnalysisException.MaxEchoedCandidates;
-        Assert.Contains(
-            string.Create(CultureInfo.InvariantCulture, $"(+{width - shown} more)"),
-            ex.Message,
-            StringComparison.Ordinal);
+        AssertCountIsAccurate(ex.Message, width);
 
         // ...and the structured channel still carries every one of them, unmodified — including the ones the
         // message elides, which is what keeps the raw channel worth having.
@@ -90,22 +90,52 @@ public sealed class AnalysisExceptionCandidateListingTests
         Assert.Equal(RealisticName(width - 1), ex.Candidates[width - 1]);
     }
 
-    /// <summary>A schema that fits is listed in full, with no overflow marker at all — the common case must
-    /// not pay for the wide-schema fix.</summary>
+    /// <summary>
+    /// Round 7 (Quality): <b>nothing is elided while the budget still has room.</b> A fixed item cap made a
+    /// listing discard names with more than half the message budget unused — a 30-column listing capped at 20
+    /// rendered 491 characters against a 1024-character ceiling, which is <i>worse than the unbounded
+    /// original</i> at every width that used to fit. The bound is now the space actually remaining, so this
+    /// sweeps the boundary band <b>continuously</b>: the previous corpus stopped at 20 and resumed at 50,
+    /// leaving 21–46 — precisely where the regression lived — untested at every width.
+    /// </summary>
     [Theory]
-    [InlineData(1)]
-    [InlineData(5)]
-    [InlineData(14)]
-    public void SchemasWithinTheBound_AreListedInFull_WithNoOverflowMarker(int width)
+    [MemberData(nameof(ContinuousWidths))]
+    public void ListingBudget_IsSpentBeforeAnythingIsElided(int width)
     {
         string message = AnalysisException.UnresolvedColumn("nosuch", Columns(width)).Message;
+        string listing = message[(message.IndexOf('[', StringComparison.Ordinal) + 1)..^1];
 
-        Assert.DoesNotContain("more)", message, StringComparison.Ordinal);
-        Assert.DoesNotContain('\u2026', message);
-        for (int i = 0; i < width; i++)
+        if (!message.Contains('\u2026'))
         {
-            Assert.Contains(RealisticName(i), message, StringComparison.Ordinal);
+            for (int i = 0; i < width; i++)
+            {
+                Assert.Contains(RealisticName(i), message, StringComparison.Ordinal);
+            }
+
+            return;
         }
+
+        // Elided: prove it was necessary. One more item at this corpus's own name length would not have fit
+        // under the whole-message cap, so no information was discarded while there was room to keep it.
+        int itemCost = RealisticName(0).Length + ", ".Length;
+        Assert.True(
+            message.Length + itemCost > AnalysisException.MaxMessageLength,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"width {width} elided at {message.Length} chars with room for another {itemCost}-char " +
+                $"name under the {AnalysisException.MaxMessageLength} cap; listing was {listing.Length}"));
+    }
+
+    /// <summary>Every width from 1 to 60 — the band a two-point corpus cannot see.</summary>
+    public static TheoryData<int> ContinuousWidths()
+    {
+        var data = new TheoryData<int>();
+        for (int width = 1; width <= 60; width++)
+        {
+            data.Add(width);
+        }
+
+        return data;
     }
 
     /// <summary>
@@ -137,7 +167,7 @@ public sealed class AnalysisExceptionCandidateListingTests
                         + $"destroyed by the whole-message cap again"));
 
             // The count survived precisely because the backstop never fired.
-            Assert.Contains("(+4986 more)", message, StringComparison.Ordinal);
+            AssertCountIsAccurate(message, 5_000, itemPattern: "w+");
         }
     }
 
@@ -272,6 +302,20 @@ public sealed class AnalysisExceptionCandidateListingTests
         { "UnsupportedWriteFormat", n => AnalysisException.UnsupportedWriteFormat("x", "/t", LongNames(n), LongNames(n)) },
     };
 
+    /// <summary>
+    /// The count oracle, stated once and free of any tuning constant: the names actually rendered plus the
+    /// reported overflow must equal the true width. Asserting a literal <c>(+N more)</c> instead couples the
+    /// test to whatever item cap happened to be in force, so it has to be <i>re-tuned</i> rather than
+    /// <i>re-verified</i> every time the bound changes — and it says nothing about whether the count is
+    /// right, only that it is unchanged.
+    /// </summary>
+    private static void AssertCountIsAccurate(string message, int width, string itemPattern = @"customer_lifetime_value_rolling_\d{4}")
+    {
+        int shown = Regex.Matches(message, itemPattern).Count;
+        int reported = OverflowCounts(message).Sum();
+        Assert.Equal(width, shown + reported);
+    }
+
     /// <summary>Extracts every <c>(+N more)</c> count from a message, in order.</summary>
     private static int[] OverflowCounts(string message)
     {
@@ -353,7 +397,7 @@ public sealed class AnalysisExceptionCandidateListingTests
     {
         AnalysisException ex = AnalysisException.AmbiguousReference("amount", Columns(75));
 
-        Assert.Contains("(+61 more)", ex.Message, StringComparison.Ordinal);
+        AssertCountIsAccurate(ex.Message, 75);
         Assert.True(ex.Message.Length < AnalysisException.MaxMessageLength);
         Assert.Equal(75, ex.Candidates.Count);
     }

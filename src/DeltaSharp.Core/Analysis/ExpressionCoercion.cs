@@ -116,10 +116,11 @@ internal static class ExpressionCoercion
             throw AnalysisException.DataTypeMismatch(
                 CoercionHelpers.DiagnosticReference(caseWhen),
                 "the branch/else result values of a CASE expression must share a common type but got "
-                + $"[{DiagnosticText.SanitizeAndJoin(
-                    valueTypes.Select(t => CoercionHelpers.DiagnosticType(t, AnalysisException.MaxEchoedCandidateLength)),
-                    AnalysisException.MaxEchoedCandidateLength,
-                    AnalysisException.MaxEchoedCandidates)}].");
+                + $"[{AnalysisException.ComposeDetailWithListing(
+                    d => $"the branch/else result values of a CASE expression must share a common type but "
+                        + $"got [{d}].",
+                    valueTypes,
+                    CoercionHelpers.DiagnosticType)}].");
         }
 
         // Rebuild the flattened children [c0, v0, c1, v1, …, (else?)] with boolean-checked conditions

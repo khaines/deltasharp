@@ -180,22 +180,10 @@ internal sealed class AnalysisException : Exception
     /// </remarks>
     internal const int MaxMessageLength = 1024;
 
-    /// <summary>
-    /// The number of candidate columns echoed in a "given input columns"/"could be" listing before the
-    /// remainder is replaced by an explicit <c>(+N more)</c> count.
-    /// </summary>
-    /// <remarks>
-    /// This is the analyzer's instance of the posture stated at <c>SqlParser.cs</c>: bound the TOKEN so the
-    /// PROSE survives. Bounding per item keeps the message bounded <i>and</i> honest — the reader is told
-    /// exactly how many candidates they are not seeing — whereas letting
-    /// <see cref="MaxMessageLength"/> cut the composed string yields a listing that is truncated with no
-    /// indication that it is truncated, or by how much.
-    /// </remarks>
-    internal const int MaxEchoedCandidates = 14;
 
     /// <summary>
     /// The <b>ceiling</b> on a single listed item. A per-item budget is derived from how many items are
-    /// actually being shown (<see cref="ItemBudget"/>); this caps that derivation so one pathological name
+    /// actually being shown (<c>DiagnosticText.SanitizeToBudget</c>); this caps that derivation so one name
     /// cannot consume the whole listing's allowance.
     /// </summary>
     internal const int MaxEchoedCandidateLength = 224;
@@ -208,41 +196,62 @@ internal sealed class AnalysisException : Exception
     internal const int MinEchoedCandidateLength = 48;
 
     /// <summary>
-    /// The total number of characters one message may spend on <b>item text</b> across all of its listings.
+    /// Composes a message whose listing is bounded by <b>the space the message actually has left</b>, rather
+    /// than by a chosen constant.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>Derived from measurement, not picked.</b> The binding constraint is the longest-prose list factory,
-    /// <see cref="UnknownFunction"/> at roughly 140 fixed characters — not <see cref="UnresolvedColumn"/> at
-    /// 53. Sizing against the short one is how an earlier attempt landed 1 character over the cap on the long
-    /// one. With <c>prose(140) + reference(64+1) + separators(13 × 2) + overflow(~18)</c> ≈ 250 accounted for,
-    /// roughly 770 characters remain under <see cref="MaxMessageLength"/>; 640 takes that with a deliberate
-    /// margin. Measured worst case at this setting (500-character names, 5 000 items, 500-character
-    /// reference):
-    /// </para>
-    /// <code>
-    /// UnresolvedColumn      846   headroom 178      &lt;- the binding constraint
-    /// AmbiguousReference    817   headroom 207
-    /// TableOrViewNotFound   739   headroom 285
-    /// UnknownFunction       334   headroom 690
-    /// InvalidFunctionArgument 271 headroom 753
-    /// </code>
-    /// <para>
-    /// <b>Why a shared budget rather than a flat per-item cap.</b> A flat cap makes the common case pay for
-    /// the wide case: at a flat 32 a schema of three entirely legitimate names elided, and
-    /// <c>customer_lifetime_value_usd_2023_q1</c> and <c>…_q2</c> — the two the user actually meant —
-    /// collapsed to the same 190-character render, in a message nowhere near the backstop. Dividing a fixed
-    /// budget among the items actually shown means a 3-column listing spends ~213 characters per name and
-    /// elides nothing, while a 400-column listing falls back to the floor. The common case pays nothing.
+    /// <paramref name="compose"/> is called twice: once with an empty listing to measure the fixed prose, and
+    /// once with the listing rendered into whatever remains under <see cref="MaxMessageLength"/>. The result
+    /// therefore fits by construction, and the listing is elided <em>only</em> when it genuinely will not fit.
     /// </para>
     /// <para>
-    /// <b>Do not trust the arithmetic above — it is a sketch.</b>
-    /// <c>EveryListComposingFactory_StaysUnderTheBackstop</c> measures the true worst case for every list
-    /// factory and reports the headroom, so changing any of these constants tells you immediately whether the
-    /// budget still holds.
+    /// <b>Why not a constant.</b> Four review seats each objected to a different fixed number here — a per-item
+    /// cap of 32, an item cap of 20, an item cap of 14 — and every objection had the same shape: a number
+    /// chosen without reference to the space available. Both kinds discarded information while the budget went
+    /// unused, which is <em>worse than the unbounded original</em> at every width that used to fit. Measured
+    /// against the corpus in <c>AnalysisExceptionCandidateListingTests</c> (35-character real-world column
+    /// names), the previous revision elided a <b>four</b>-column listing at 197 characters, and pinned every
+    /// width from 14 upward at 771 — leaving a quarter of the budget permanently unspent while dropping names.
+    /// Deriving the budget removes the constant, and with it the argument about the constant. These figures
+    /// are not maintained by hand either: <c>ListingBudget_IsSpentBeforeAnythingIsElided</c> asserts the
+    /// property they illustrate, at every width in the band.
+    /// </para>
+    /// <para>
+    /// The floor and ceiling on a single item survive, because they are not tuning: the ceiling stops one
+    /// pathological name consuming the listing, and the floor keeps every name recognizable. Both are
+    /// exercised by <c>ListingBudget_IsSpentBeforeAnythingIsElided</c>, which sweeps the boundary band
+    /// continuously rather than sampling either side of it.
     /// </para>
     /// </remarks>
-    private const int ListCharacterBudget = 640;
+    /// <param name="compose">Builds the full message from a rendered listing.</param>
+    /// <param name="items">The untrusted items to list.</param>
+    /// <param name="render">Renders one item within a supplied allowance.</param>
+    /// <param name="reserved">Characters an outer wrapper will add that <paramref name="compose"/> cannot see.</param>
+    private static string ComposeWithListing<T>(
+        Func<string, string> compose, IReadOnlyList<T> items, Func<T, int, string> render, int reserved = 0) =>
+        RenderListing(items, render, RemainingBudget(compose(string.Empty).Length + reserved));
+
+    /// <summary>
+    /// Variant for a caller that composes a <c>detail</c> string rather than a whole message
+    /// (<see cref="ExpressionCoercion"/>). The wrapping factory's own prose is not visible there, so its
+    /// worst case — a <see cref="DataTypeMismatch"/> reference at its full budget plus fixed prose — is
+    /// reserved up front.
+    /// </summary>
+    internal static string ComposeDetailWithListing<T>(
+        Func<string, string> compose, IReadOnlyList<T> items, Func<T, int, string> render) =>
+        ComposeWithListing(
+            compose, items, render, reserved: CoercionHelpers.DiagnosticReferenceMaxLength + 64);
+
+    /// <summary>The characters left for listings once <paramref name="proseLength"/> is spent, shared evenly
+    /// when a message composes more than one listing.</summary>
+    private static int RemainingBudget(int proseLength, int lists = 1) =>
+        Math.Max(MinEchoedCandidateLength, (MaxMessageLength - proseLength) / lists);
+
+    private static string RenderListing<T>(
+        IReadOnlyList<T> items, Func<T, int, string> render, int budget, string separator = ", ") =>
+        DiagnosticText.SanitizeToBudget(
+            items, render, budget, MinEchoedCandidateLength, MaxEchoedCandidateLength, separator);
 
     /// <summary>The cap applied to the unresolved/ambiguous name echoed in the MESSAGE. The structured
     /// <see cref="Reference"/> property keeps the full value; this bounds only the prose, so that a long name
@@ -264,22 +273,6 @@ internal sealed class AnalysisException : Exception
     /// characters, and hand-enumerating the factories had missed it. That is the argument for ranging a test
     /// over the class instead of listing its members.
     /// </remarks>
-    private const int SharedListBudget = MaxEchoedCandidates / 2;
-
-    /// <summary>
-    /// The per-item character budget for a listing of <paramref name="itemCount"/> items, spread over
-    /// <paramref name="lists"/> listings in the same message. Derived rather than constant: the fixed
-    /// <see cref="ListCharacterBudget"/> is divided among the items actually shown, clamped to
-    /// [<see cref="MinEchoedCandidateLength"/>, <see cref="MaxEchoedCandidateLength"/>], so a short listing
-    /// is never elided and a wide one still names every item recognizably.
-    /// </summary>
-    private static int ItemBudget(int itemCount, int lists = 1)
-    {
-        int cap = lists == 1 ? MaxEchoedCandidates : SharedListBudget;
-        int shown = Math.Clamp(itemCount, 1, cap);
-        return Math.Clamp(
-            ListCharacterBudget / (lists * shown), MinEchoedCandidateLength, MaxEchoedCandidateLength);
-    }
 
     private AnalysisException(
         string message,
@@ -319,9 +312,10 @@ internal sealed class AnalysisException : Exception
     {
         ArgumentNullException.ThrowIfNull(identifier);
         string name = string.Join('.', identifier);
+        string Compose(string listing) => $"Table or view not found: {listing}";
         return new AnalysisException(
-            $"Table or view not found: "
-                + $"{DiagnosticText.SanitizeAndJoin(identifier, ItemBudget(identifier.Count), MaxEchoedCandidates, ".")}",
+            Compose(RenderListing(
+                identifier, DiagnosticText.SanitizeTo, RemainingBudget(Compose(string.Empty).Length), ".")),
             AnalysisErrorKind.TableOrViewNotFound,
             name,
             Array.Empty<string>());
@@ -368,12 +362,12 @@ internal sealed class AnalysisException : Exception
         // Redact credential-bearing fragments so neither the diagnostic nor any log capturing it leaks a
         // secret embedded in the sink path (parity with the read-door's UnsupportedDataSource, #424/#432).
         string safePath = path is null ? "<none>" : SecretRedaction.RedactPath(path);
-        string alternatives = DiagnosticText.SanitizeAndJoin(
-            localFormats, ItemBudget(localFormats.Count), MaxEchoedCandidates);
-        return new AnalysisException(
+        string Compose(string listing) =>
             $"Writing a '{format}' data source is not supported in this milestone: the writer for target "
             + $"'{safePath}' is delivered by EPIC-05 (Delta transaction-log storage). Until then, write to a "
-            + $"supported M1 local sink (format: [{alternatives}]).",
+            + $"supported M1 local sink (format: [{listing}]).";
+        return new AnalysisException(
+            Compose(ComposeWithListing(Compose, localFormats, DiagnosticText.SanitizeTo)),
             AnalysisErrorKind.UnsupportedDataSink,
             safePath,
             Array.Empty<string>());
@@ -398,12 +392,17 @@ internal sealed class AnalysisException : Exception
         ArgumentNullException.ThrowIfNull(deferredFormats);
 
         string safePath = path is null ? "<none>" : SecretRedaction.RedactPath(path);
-        return new AnalysisException(
+        string Compose(string local, string deferred) =>
             $"Unsupported write format '{format}' for target '{safePath}'. DeltaSharp M1 writes these "
-            + $"local sink formats: "
-            + $"[{DiagnosticText.SanitizeAndJoin(localFormats, ItemBudget(localFormats.Count, 2), SharedListBudget)}]; "
-            + $"these formats are recognized but deferred to EPIC-05 (Delta/Parquet storage): "
-            + $"[{DiagnosticText.SanitizeAndJoin(deferredFormats, ItemBudget(deferredFormats.Count, 2), SharedListBudget)}].",
+            + $"local sink formats: [{local}]; these formats are recognized but deferred to EPIC-05 "
+            + $"(Delta/Parquet storage): [{deferred}].";
+
+        // Two listings in one message, so they share what is left rather than each taking it.
+        int shared = RemainingBudget(Compose(string.Empty, string.Empty).Length, lists: 2);
+        return new AnalysisException(
+            Compose(
+                RenderListing(localFormats, DiagnosticText.SanitizeTo, shared),
+                RenderListing(deferredFormats, DiagnosticText.SanitizeTo, shared)),
             AnalysisErrorKind.UnsupportedDataSink,
             safePath,
             Array.Empty<string>());
@@ -417,12 +416,11 @@ internal sealed class AnalysisException : Exception
 
         // Bound the LISTING, not the composed message: a wide schema must still be told how many candidates
         // it is not being shown. `candidates` (the structured channel) keeps every name, unmodified.
-        string echoed = DiagnosticText.SanitizeAndJoin(
-            candidates, ItemBudget(candidates.Length), MaxEchoedCandidates);
+        string safeName = DiagnosticText.Sanitize(name, MaxEchoedReferenceLength);
+        string Compose(string listing) =>
+            $"Cannot resolve column name '{safeName}' given input columns: [{listing}]";
         return new AnalysisException(
-            $"Cannot resolve column name "
-                + $"'{DiagnosticText.Sanitize(name, MaxEchoedReferenceLength)}' "
-                + $"given input columns: [{echoed}]",
+            Compose(ComposeWithListing(Compose, candidates, DiagnosticText.SanitizeTo)),
             AnalysisErrorKind.UnresolvedColumn,
             name,
             candidates,
@@ -437,14 +435,13 @@ internal sealed class AnalysisException : Exception
         ArgumentNullException.ThrowIfNull(matches);
         string[] candidates = matches.Select(a => a.SimpleString).ToArray();
 
-        // RenderCandidate, not the raw SimpleString: the per-item cap must not eat the #exprId discriminator.
-        string echoed = DiagnosticText.SanitizeAndJoin(
-            matches.Select(a => RenderCandidate(a, ItemBudget(matches.Count))),
-            ItemBudget(matches.Count),
-            MaxEchoedCandidates);
+        // RenderCandidate, not Sanitize: the per-item allowance must eat NAME characters, never the
+        // #exprId that is the only thing distinguishing two same-named candidates.
+        string safeName = DiagnosticText.Sanitize(name, MaxEchoedReferenceLength);
+        string Compose(string listing) =>
+            $"Reference '{safeName}' is ambiguous, could be: {listing}.";
         return new AnalysisException(
-            $"Reference '{DiagnosticText.Sanitize(name, MaxEchoedReferenceLength)}' "
-                + $"is ambiguous, could be: {echoed}.",
+            Compose(ComposeWithListing(Compose, matches, RenderCandidate)),
             AnalysisErrorKind.AmbiguousReference,
             name,
             candidates);
@@ -535,11 +532,12 @@ internal sealed class AnalysisException : Exception
     {
         ArgumentNullException.ThrowIfNull(name);
         ArgumentNullException.ThrowIfNull(argumentTypes);
+        string safeName = DiagnosticText.Sanitize(name, MaxEchoedReferenceLength);
+        string Compose(string listing) =>
+            $"Undefined function: '{safeName}'. The function is neither a registered scalar nor an "
+            + $"aggregate function in the M1 registry (supplied argument types: [{listing}]).";
         return new AnalysisException(
-            $"Undefined function: '{DiagnosticText.Sanitize(name, MaxEchoedReferenceLength)}'. "
-            + $"The function is neither a registered scalar nor an "
-            + $"aggregate function in the M1 registry (supplied argument types: "
-            + $"[{RenderTypes(argumentTypes)}]).",
+            Compose(ComposeWithListing(Compose, argumentTypes, CoercionHelpers.DiagnosticType)),
             AnalysisErrorKind.UnresolvedFunction,
             name,
             Array.Empty<string>());
@@ -553,10 +551,11 @@ internal sealed class AnalysisException : Exception
         ArgumentNullException.ThrowIfNull(name);
         ArgumentNullException.ThrowIfNull(argumentTypes);
         ArgumentNullException.ThrowIfNull(expected);
+        string safeName = DiagnosticText.Sanitize(name, MaxEchoedReferenceLength);
+        string Compose(string listing) =>
+            $"Cannot resolve function '{safeName}({listing})': {expected}";
         return new AnalysisException(
-            $"Cannot resolve function "
-                + $"'{DiagnosticText.Sanitize(name, MaxEchoedReferenceLength)}"
-                + $"({RenderTypes(argumentTypes)})': {expected}",
+            Compose(ComposeWithListing(Compose, argumentTypes, CoercionHelpers.DiagnosticType)),
             AnalysisErrorKind.InvalidFunctionArgument,
             name,
             Array.Empty<string>());
@@ -660,16 +659,6 @@ internal sealed class AnalysisException : Exception
         int nameBudget = Math.Max(MinEchoedNameLength, budget - id.Length - 1);
         return DiagnosticText.Sanitize(attribute.Name, nameBudget) + id;
     }
-
-    /// <summary>Renders a list of user-supplied types for a diagnostic. Each element goes through
-    /// <see cref="CoercionHelpers.DiagnosticType"/> <b>first</b> — a struct type is itself a collection, so
-    /// capping its flat <c>SimpleString</c> would cut it with a bare ellipsis and no count — and only then
-    /// through the shared list bound, which by construction can no longer bind.</summary>
-    private static string RenderTypes(IReadOnlyList<DataType> types) =>
-        DiagnosticText.SanitizeAndJoin(
-            types.Select(t => CoercionHelpers.DiagnosticType(t, ItemBudget(types.Count))),
-            ItemBudget(types.Count),
-            MaxEchoedCandidates);
 
     /// <summary>Builds an <see cref="AnalysisErrorKind.InvalidTimeTravelSpec"/> failure for a read that
     /// pins both a version and a timestamp (#499): the <c>versionAsOf</c> and <c>timestampAsOf</c> options

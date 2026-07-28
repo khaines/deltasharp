@@ -196,6 +196,109 @@ internal static class DiagnosticText
         return builder.ToString();
     }
 
+    /// <summary>
+    /// Renders <paramref name="items"/> into <b>at most <paramref name="budget"/> characters</b>, showing as
+    /// many as fit in full and appending <c>… (+N more)</c> for the remainder.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Why this exists alongside <see cref="SanitizeAndJoin"/>.</b> That primitive takes a fixed item cap
+    /// and a fixed per-item cap, which means a listing can elide while most of the message budget goes
+    /// unused: a 30-item listing capped at 20 dropped 10 items to render 491 characters against a 1024-char
+    /// ceiling. Eliding while more than half the budget is spare discards information for no benefit — and it
+    /// is <em>worse</em> than the unbounded original for every width that used to fit. This overload derives
+    /// both bounds from the space actually available, so a listing is elided only when it genuinely will not
+    /// fit, and the common case is untouched by construction rather than by a well-chosen constant.
+    /// </para>
+    /// <para>
+    /// The per-item allowance is <c>budget / count</c> clamped to
+    /// [<paramref name="minItemLength"/>, <paramref name="maxItemLength"/>]; items shorter than their
+    /// allowance simply leave room for more items, so a listing of ordinary names fills the budget rather
+    /// than stopping at an arbitrary count. The result never exceeds <paramref name="budget"/>: room for the
+    /// overflow suffix is reserved before each item is committed, so the count can never be the thing cut.
+    /// </para>
+    /// </remarks>
+    /// <typeparam name="T">The item type, rendered by <paramref name="render"/>.</typeparam>
+    /// <param name="items">The untrusted items to render.</param>
+    /// <param name="render">Renders one item within a supplied character allowance. Taking the allowance as a
+    /// parameter is what lets a caller decide which PART of a composite item to sacrifice — an
+    /// <c>name#exprId</c> candidate must lose name characters, never the discriminating identifier.</param>
+    /// <param name="budget">The hard ceiling on the composed result.</param>
+    /// <param name="minItemLength">Floor on the per-item allowance, so a wide listing still names each item
+    /// recognizably.</param>
+    /// <param name="maxItemLength">Ceiling on the per-item allowance, so one pathological item cannot consume
+    /// the whole listing.</param>
+    /// <param name="separator">The separator placed between rendered items.</param>
+    internal static string SanitizeToBudget<T>(
+        IReadOnlyList<T> items,
+        Func<T, int, string> render,
+        int budget,
+        int minItemLength,
+        int maxItemLength,
+        string separator = ", ")
+    {
+        ArgumentNullException.ThrowIfNull(items);
+        ArgumentNullException.ThrowIfNull(render);
+        ArgumentNullException.ThrowIfNull(separator);
+
+        if (items.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        // Upper bound on the overflow suffix, reserved so the count is never what gets cut.
+        int reserve = string.Create(CultureInfo.InvariantCulture, $"{separator}… (+{items.Count} more)").Length;
+        int allowance = Math.Clamp(budget / items.Count, minItemLength, maxItemLength);
+
+        var builder = new StringBuilder();
+        int shown = 0;
+        for (int i = 0; i < items.Count; i++)
+        {
+            string rendered = render(items[i], allowance);
+            int addition = (shown > 0 ? separator.Length : 0) + rendered.Length;
+
+            // The last item needs no room for a suffix, because taking it means there is no remainder.
+            int needed = i == items.Count - 1 ? 0 : reserve;
+            if (builder.Length + addition + needed > budget)
+            {
+                break;
+            }
+
+            if (shown > 0)
+            {
+                builder.Append(separator);
+            }
+
+            builder.Append(rendered);
+            shown++;
+        }
+
+        if (shown == items.Count)
+        {
+            return builder.ToString();
+        }
+
+        return (shown == 0 ? new StringBuilder() : builder.Append(separator))
+            .Append(CultureInfo.InvariantCulture, $"… (+{items.Count - shown} more)")
+            .ToString();
+    }
+
+    /// <summary>Adapter exposing <see cref="Sanitize"/> in the <c>(item, allowance)</c> shape
+    /// <see cref="SanitizeToBudget{T}(IReadOnlyList{T}, Func{T, int, string}, int, int, int, string)"/>
+    /// expects, so a plain string listing needs no lambda at every call site.</summary>
+    internal static string SanitizeTo(string raw, int maxLength) => Sanitize(raw, maxLength);
+
+    /// <summary>String overload of
+    /// <see cref="SanitizeToBudget{T}(IReadOnlyList{T}, Func{T, int, string}, int, int, int, string)"/>,
+    /// rendering each item with <see cref="Sanitize"/>.</summary>
+    internal static string SanitizeToBudget(
+        IReadOnlyList<string> items,
+        int budget,
+        int minItemLength,
+        int maxItemLength,
+        string separator = ", ") =>
+        SanitizeToBudget(items, Sanitize, budget, minItemLength, maxItemLength, separator);
+
     // THE RULE, stated exactly once. A code point is neutralized if it is a C0/C1 control (category Cc —
     // CR/LF/NUL/tab/NEL), a Unicode LINE or PARAGRAPH SEPARATOR (U+2028/U+2029, categories Zl/Zp) which
     // several renderers and log viewers treat as a newline, or a FORMAT character (category Cf).
