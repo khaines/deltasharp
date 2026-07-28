@@ -319,6 +319,89 @@ public sealed class ParquetWriterTests
     }
 
     [Fact]
+    public async Task ScalarArtifactCorpus_CoversEveryTypeTheWriterAccepts()
+    {
+        // #679: COMPLETENESS guard for the corpus of the test above. That test pins a fixed list of
+        // types, and a fixed list silently falls behind: this suite already shipped an artifact
+        // corpus of three types while the writer accepted thirteen, and nothing failed to say so.
+        //
+        // So rather than trusting the list, enumerate every DataType the engine exposes, ask the
+        // writer which ones it will actually accept, and require each accepted one to appear in the
+        // pinned corpus. Adding a new atomic type without extending the corpus now fails HERE, with a
+        // message naming the type, instead of quietly widening the unpinned surface.
+        //
+        // This guards COVERAGE, not bytes — the golden above is what pins the wire shape.
+        var candidates = new List<DataType>
+        {
+            DataTypes.BooleanType, DataTypes.ByteType, DataTypes.ShortType, DataTypes.IntegerType,
+            DataTypes.LongType, DataTypes.FloatType, DataTypes.DoubleType, DataTypes.StringType,
+            DataTypes.BinaryType, DataTypes.DateType, DataTypes.TimestampType, DataTypes.TimestampNtzType,
+            DataTypes.NullType, DataTypes.CreateDecimalType(28, 7),
+            DataTypes.CreateArrayType(DataTypes.StringType),
+            DataTypes.CreateMapType(DataTypes.StringType, DataTypes.LongType),
+            DataTypes.CreateStructType(new[] { new StructField("x", DataTypes.LongType) }),
+        };
+
+        // Cross-check the hand-written candidate list against reflection, so a newly added atomic type
+        // that nobody listed here cannot make this guard vacuously pass.
+        string[] declaredAtomics = typeof(DataType).Assembly.GetTypes()
+            .Where(t => !t.IsAbstract && typeof(AtomicType).IsAssignableFrom(t))
+            .Select(t => t.Name)
+            .OrderBy(n => n, StringComparer.Ordinal)
+            .ToArray();
+        string[] coveredAtomics = candidates
+            .Where(t => t is AtomicType)
+            .Select(t => t.GetType().Name)
+            .OrderBy(n => n, StringComparer.Ordinal)
+            .ToArray();
+        Assert.Equal(declaredAtomics, coveredAtomics);
+
+        var accepted = new List<string>();
+        var rejected = new List<string>();
+        foreach (DataType candidate in candidates)
+        {
+            var probe = new StructType(new[] { new StructField("probe", candidate, nullable: true) });
+            try
+            {
+                await WriteAndReadFooterSchemaAsync(probe);
+                accepted.Add(candidate.TypeName);
+            }
+            catch (DeltaStorageException)
+            {
+                // The writer refuses this type, so no artifact assertion for it is possible.
+                rejected.Add(candidate.TypeName);
+            }
+        }
+
+        // Nested types and the void type are refused; everything else must be in the pinned corpus.
+        // (Type names here are the bare DataType.TypeName: "array"/"map"/"struct", and the null type
+        // spells itself "void" — both verified against the writer rather than assumed.)
+        Assert.Equal(
+            new[] { "array", "map", "struct", "void" },
+            rejected.OrderBy(n => n, StringComparer.Ordinal).ToArray());
+
+        string[] missing = accepted
+            .Where(typeName => !PinnedScalarCorpusTypeNames.Contains(typeName))
+            .OrderBy(n => n, StringComparer.Ordinal)
+            .ToArray();
+        Assert.True(
+            missing.Length == 0,
+            "ParquetFileWriter accepts these types but WrittenFooter_PinsEveryScalarTypeTheWriterAccepts "
+            + "does not pin them, so a footer/log divergence in them would ship undetected: "
+            + string.Join(", ", missing));
+    }
+
+    /// <summary>
+    /// The type names pinned by <c>WrittenFooter_PinsEveryScalarTypeTheWriterAccepts</c>. Kept beside
+    /// that golden; the completeness guard above fails if the writer outgrows this set.
+    /// </summary>
+    private static readonly HashSet<string> PinnedScalarCorpusTypeNames = new(StringComparer.Ordinal)
+    {
+        "boolean", "byte", "short", "integer", "long", "float", "double",
+        "string", "binary", "date", "timestamp", "timestamp_ntz", "decimal(28,7)",
+    };
+
+    [Fact]
     public async Task WriteAsync_CancelledToken_ThrowsOnMultiRowGroupStringWrite()
     {
         // CF-8: the writer honors cancellation at row-group granularity for ALL schemas (previously only
