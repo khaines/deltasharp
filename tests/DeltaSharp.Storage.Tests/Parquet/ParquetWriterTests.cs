@@ -142,13 +142,15 @@ public sealed class ParquetWriterTests
         // ones that ship inside the Parquet footer.
         //
         // SCOPE — read this before relying on the sentence above. Outcome coverage is bounded by the
-        // CORPUS, and this test's corpus is one schema: three atomic fields with EMPTY metadata. A
-        // rogue that is byte-exact for scalar/empty-metadata schemas and diverges only elsewhere —
-        // e.g. emitting column-mapping ids as quoted strings, breaking the #330 unquoted-integer
-        // contract — ships a live footer/log divergence with this test green. Field metadata and the
-        // remaining scalar types DO reach the footer and are pinned only at the helper layer; nested
-        // types cannot reach it at all today (ParquetTypeMapping rejects them, design §2.9). Tracked
-        // in #713. Widen the corpus there rather than assuming this assertion generalises.
+        // CORPUS, and THIS test's corpus is one schema: three atomic fields with EMPTY metadata. A
+        // rogue that is byte-exact for that shape and diverges only elsewhere would pass here. The
+        // reachable part of that gap is closed by the two sibling tests below, which extend the
+        // artifact layer over field metadata (including the #330 unquoted-integer column-mapping id
+        // contract) and over every scalar type the writer accepts. What remains uncovered at this
+        // layer is only the part that is INHERENTLY unreachable: nested types cannot be written at
+        // all today, because ParquetTypeMapping.CreateField rejects array/map/struct with
+        // UnsupportedFeature (design §2.9), so no artifact test can pin them until that lands. They
+        // are pinned at the helper layer meanwhile. Tracked in #713.
         //
         // The three Assert.Contains calls below are substring checks: blind to field ORDER, to
         // property order within a field, and to anything additional, so they could never have caught
@@ -172,6 +174,141 @@ public sealed class ParquetWriterTests
         Assert.Contains("\"name\":\"id\"", schemaJson);
         Assert.Contains("\"name\":\"amount\"", schemaJson);
         Assert.True(reader.CustomMetadata.ContainsKey(DeltaSchemaJson.WriterMetadataKey));
+    }
+
+    /// <summary>
+    /// Reads the Delta schema string back out of a footer written for <paramref name="schema"/>.
+    /// </summary>
+    /// <remarks>
+    /// Writes ZERO batches on purpose. <c>ParquetFileWriter.WriteAsync</c> builds its custom-metadata
+    /// dictionary — including the <c>DeltaSchemaJson.ToJson(schema)</c> call this suite exists to pin —
+    /// <b>before</b> the row-group loop and unconditionally, and the loop is pre-test so zero rows
+    /// produce zero row groups. So the footer schema bytes here come from the identical call site the
+    /// data-bearing test above exercises, while the schema corpus is freed from the cost of
+    /// materialising a column vector per type. That is what makes broad type coverage affordable at
+    /// the ARTIFACT layer rather than only at the helper layer.
+    /// </remarks>
+    private static async Task<string> WriteAndReadFooterSchemaAsync(StructType schema)
+    {
+        using var stream = new MemoryStream();
+        await new ParquetFileWriter().WriteAsync(
+            stream, schema, Array.Empty<ColumnBatch>(), CancellationToken.None);
+        stream.Position = 0;
+
+        await using ParquetReader reader =
+            await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+        return reader.CustomMetadata[DeltaSchemaJson.SchemaMetadataKey];
+    }
+
+    [Fact]
+    public async Task WrittenFooter_PinsFieldMetadata_IncludingUnquotedColumnMappingIds()
+    {
+        // #679: ARTIFACT-layer coverage of FIELD METADATA. The sibling test above pins a schema whose
+        // fields all carry EMPTY metadata, so a rogue serializer at ParquetFileWriter's call site that
+        // reproduces flat-atomic bytes exactly but mishandles metadata — dropping it, or emitting
+        // delta.columnMapping.id as a QUOTED string — ships a live footer/log divergence and passes
+        // there. Field metadata does reach the footer (it takes no part in Parquet type mapping), and
+        // it is the column-mapping payload of #191/#676, so it is pinned here rather than deferred.
+        //
+        // The unquoted 7 and 12 below are load-bearing: the Delta protocol requires column-mapping ids
+        // to be JSON integers, not strings (#330). Quoting them is a real interop break that a
+        // structural or round-trip check would not notice.
+        var schema = new StructType(new[]
+        {
+            new StructField("first", DataTypes.LongType, nullable: false, FieldMetadata.FromValues(new[]
+            {
+                new KeyValuePair<string, MetadataValue>("delta.columnMapping.id", MetadataValue.Long(7)),
+                new KeyValuePair<string, MetadataValue>(
+                    "delta.columnMapping.physicalName", MetadataValue.String("col-7")),
+            })),
+            new StructField("second", DataTypes.StringType, nullable: true, FieldMetadata.FromValues(new[]
+            {
+                new KeyValuePair<string, MetadataValue>("delta.columnMapping.id", MetadataValue.Long(12)),
+                new KeyValuePair<string, MetadataValue>(
+                    "delta.columnMapping.physicalName", MetadataValue.String("col-12")),
+                // Exercises the remaining metadata value kinds that survive the writer, plus the
+                // escaping policy (" is emitted as \u0022, not \"), and key ORDERING (ordinal-sorted,
+                // so "absent" leads even though it was supplied last).
+                new KeyValuePair<string, MetadataValue>("comment", MetadataValue.String("a \"quoted\" note")),
+                new KeyValuePair<string, MetadataValue>("flag", MetadataValue.Boolean(true)),
+                new KeyValuePair<string, MetadataValue>("ratio", MetadataValue.Double(0.5)),
+                new KeyValuePair<string, MetadataValue>("absent", MetadataValue.Null),
+            })),
+            // A field with NO metadata alongside fields that have it, so "always emit {}" and "omit
+            // when empty" stay distinguishable at this layer.
+            new StructField("third", DataTypes.IntegerType, nullable: true),
+        });
+
+        string schemaJson = await WriteAndReadFooterSchemaAsync(schema);
+
+        const string footerGolden =
+            "{\"type\":\"struct\",\"fields\":[" +
+            "{\"name\":\"first\",\"type\":\"long\",\"nullable\":false,\"metadata\":{" +
+            "\"delta.columnMapping.id\":7,\"delta.columnMapping.physicalName\":\"col-7\"}}," +
+            "{\"name\":\"second\",\"type\":\"string\",\"nullable\":true,\"metadata\":{" +
+            "\"absent\":null,\"comment\":\"a \\u0022quoted\\u0022 note\"," +
+            "\"delta.columnMapping.id\":12,\"delta.columnMapping.physicalName\":\"col-12\"," +
+            "\"flag\":true,\"ratio\":0.5}}," +
+            "{\"name\":\"third\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}";
+
+        // Same dual oracle as the sibling test: the golden catches drift inside the shared serializer
+        // reaching the footer; the equality catches the footer being repointed at a different
+        // serializer while the shared one is untouched. Neither subsumes the other.
+        Assert.Equal(footerGolden, schemaJson);
+        Assert.Equal(SchemaJson.ToJson(schema), schemaJson);
+    }
+
+    [Fact]
+    public async Task WrittenFooter_PinsEveryScalarTypeTheWriterAccepts()
+    {
+        // #679: ARTIFACT-layer coverage of TYPE BREADTH. The data-bearing test above reaches the
+        // footer with three type names (long, decimal, string), so a rogue that spells any other type
+        // name differently in the footer than the log does — "int" for "integer", "timestampNtz" for
+        // "timestamp_ntz" — diverges undetected at this layer.
+        //
+        // This is every atomic type ParquetTypeMapping.CreateField accepts. Nested types are
+        // deliberately absent: CreateField throws UnsupportedFeature for array/map/struct (design
+        // §2.9), so they cannot be written at all and cannot be pinned here until that lands (#713).
+        // If nested write support arrives, extend this corpus rather than adding a new layer.
+        var schema = new StructType(new[]
+        {
+            new StructField("c_bool", DataTypes.BooleanType, nullable: false),
+            new StructField("c_byte", DataTypes.ByteType, nullable: true),
+            new StructField("c_short", DataTypes.ShortType, nullable: false),
+            new StructField("c_int", DataTypes.IntegerType, nullable: true),
+            new StructField("c_long", DataTypes.LongType, nullable: false),
+            new StructField("c_float", DataTypes.FloatType, nullable: true),
+            new StructField("c_double", DataTypes.DoubleType, nullable: false),
+            new StructField("c_string", DataTypes.StringType, nullable: true),
+            new StructField("c_binary", DataTypes.BinaryType, nullable: false),
+            new StructField("c_date", DataTypes.DateType, nullable: true),
+            new StructField("c_ts", DataTypes.TimestampType, nullable: false),
+            new StructField("c_ts_ntz", DataTypes.TimestampNtzType, nullable: true),
+            // Precision 28 is ParquetTypeMapping.MaxSupportedDecimalPrecision, so the parameterised
+            // decimal(p,s) rendering is pinned at its supported boundary rather than a mid-range value.
+            new StructField("c_dec", DataTypes.CreateDecimalType(28, 7), nullable: true),
+        });
+
+        string schemaJson = await WriteAndReadFooterSchemaAsync(schema);
+
+        const string footerGolden =
+            "{\"type\":\"struct\",\"fields\":[" +
+            "{\"name\":\"c_bool\",\"type\":\"boolean\",\"nullable\":false,\"metadata\":{}}," +
+            "{\"name\":\"c_byte\",\"type\":\"byte\",\"nullable\":true,\"metadata\":{}}," +
+            "{\"name\":\"c_short\",\"type\":\"short\",\"nullable\":false,\"metadata\":{}}," +
+            "{\"name\":\"c_int\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}," +
+            "{\"name\":\"c_long\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}," +
+            "{\"name\":\"c_float\",\"type\":\"float\",\"nullable\":true,\"metadata\":{}}," +
+            "{\"name\":\"c_double\",\"type\":\"double\",\"nullable\":false,\"metadata\":{}}," +
+            "{\"name\":\"c_string\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}," +
+            "{\"name\":\"c_binary\",\"type\":\"binary\",\"nullable\":false,\"metadata\":{}}," +
+            "{\"name\":\"c_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}," +
+            "{\"name\":\"c_ts\",\"type\":\"timestamp\",\"nullable\":false,\"metadata\":{}}," +
+            "{\"name\":\"c_ts_ntz\",\"type\":\"timestamp_ntz\",\"nullable\":true,\"metadata\":{}}," +
+            "{\"name\":\"c_dec\",\"type\":\"decimal(28,7)\",\"nullable\":true,\"metadata\":{}}]}";
+
+        Assert.Equal(footerGolden, schemaJson);
+        Assert.Equal(SchemaJson.ToJson(schema), schemaJson);
     }
 
     [Fact]
