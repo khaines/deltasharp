@@ -913,9 +913,13 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// rather than a fixed property of the fixture.
     /// </summary>
     /// <remarks>
-    /// <see cref="ShapedStruct"/> hard-codes twelve-character names, which is realistic and is exactly why
-    /// it cannot reach the region this file was missing a guard for. Name length is not decoration here: it
-    /// is the quantity that decides whether the feasible field counts form a prefix.
+    /// The fixtures that predate this helper fix their names at whatever width was realistic for the
+    /// property they were written for, and none of them can reach the region this file was missing a guard
+    /// for. That claim is not made in prose here — two attempts to write it down were wrong, the second
+    /// while correcting the first — it is asserted by
+    /// <see cref="TheFixturesThatPredateThisPin_CannotReachTheDiscriminatingRegion"/>, which reads the
+    /// widths off the generators themselves. Name length is not decoration: together with the child type it
+    /// decides whether the feasible field counts form a prefix.
     /// </remarks>
     private static StructType UniformStruct(int fieldCount, int nameLength, string childKind)
     {
@@ -935,6 +939,72 @@ public sealed class AnalysisExceptionTypeRenderTests
             .. Enumerable.Range(0, fieldCount).Select(i => new StructField(
                 Alphabet[i] + new string('x', nameLength - 1), child, true)),
         ]);
+    }
+
+    /// <summary>
+    /// #687 council round 18 (Architect BLOCKING) — the fixtures that predate the pin above cannot reach
+    /// the region it guards, asserted rather than described.
+    /// </summary>
+    /// <remarks>
+    /// <para>Two revisions of that claim shipped as prose and both were wrong, the second while correcting
+    /// the first. Each compared the wrong quantity: the discriminating region is decided by a field's
+    /// MARGINAL cost — separator, name, colon and the most compact child — and both sentences compared the
+    /// NAME width alone, which is smaller. One of them concluded "well above the refund" about a name that
+    /// is exactly equal to it and another that is below it, reaching the right verdict for a reason that
+    /// does not hold.</para>
+    /// <para>A sentence telling a maintainer how to build a discriminating corpus has a silent, delayed
+    /// failure mode: follow it, get a corpus that cannot see the defect, and every test passes. So it is
+    /// not a sentence any more. This reads the names off the generators, charges each the CHEAPEST child
+    /// the renderer can emit, and asserts the result is at or above the refund — the condition under which
+    /// the feasible counts form a prefix and the two walk shapes are indistinguishable. If a future fixture
+    /// drops below it, this fails and says which one, rather than a comment silently becoming true.</para>
+    /// </remarks>
+    [Fact]
+    public void TheFixturesThatPredateThisPin_CannotReachTheDiscriminatingRegion()
+    {
+        // The cheapest field the renderer can emit is the one whose child renders shortest, so charging
+        // every legacy name that child is the most favourable case for discrimination. If even that clears
+        // the refund, no budget can put these fixtures in the region.
+        int cheapestChild = CoercionHelpers
+            .DiagnosticType(IntegerType.Instance, CoercionHelpers.MinDiagnosticTypeLength).Length;
+        int refund = 1 + MarkerWidth(1);
+
+        // Read off the generators rather than restated, which is the whole point: a width written down here
+        // is a width that can drift away from the fixture it claims to describe.
+        StructType shaped = ShapedStruct(4, 2);
+        string[] names =
+        [
+            FieldName(0),
+            .. shaped.Fields.Select(f => f.Name),
+            .. shaped.Fields.Select(f => f.DataType).OfType<StructType>()
+                .SelectMany(inner => inner.Fields).Select(f => f.Name),
+        ];
+
+        var reachable = new List<string>();
+        foreach (string name in names.Distinct(StringComparer.Ordinal))
+        {
+            int marginalCost = 1 + name.Length + 1 + cheapestChild;
+            if (marginalCost < refund)
+            {
+                reachable.Add(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"'{name}' ({name.Length} chars) has marginal cost {marginalCost}, below the refund "
+                        + $"{refund}"));
+            }
+        }
+
+        Assert.True(
+            reachable.Count == 0,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"{reachable.Count} legacy fixture name(s) now reach the discriminating region, so the pin "
+                    + $"above is no longer the only guard that can see it and this remark is stale:\n")
+            + string.Join("\n", reachable));
+
+        Assert.True(
+            names.Distinct(StringComparer.Ordinal).Count() > 1,
+            "the generators produced fewer than two distinct names, so this assertion inspected almost "
+                + "nothing — it must enumerate the fixtures, not a sample of them");
     }
 
     /// <summary>Distinct leading characters, so names stay unique down to a length of one.</summary>

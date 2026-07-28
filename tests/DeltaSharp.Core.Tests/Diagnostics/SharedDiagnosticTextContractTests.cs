@@ -210,6 +210,7 @@ public sealed class SharedDiagnosticTextContractTests
         ];
 
         int exercised = 0;
+        var violations = new List<string>();
         foreach ((int budget, int count) in cases)
         {
             string[] items = [.. Enumerable.Range(0, count).Select(i =>
@@ -230,16 +231,46 @@ public sealed class SharedDiagnosticTextContractTests
             exercised++;
 
             // Over budget is permitted in exactly one shape: the bare marker, nothing else, and no wider
-            // than the marker for the number it actually reports.
+            // than the marker for the number it actually reports. Every failure carries its cell and they
+            // are collected rather than thrown at the first: folding seven parametrized rows into one sweep
+            // gained cells and would otherwise have lost the row name that used to identify them, which is
+            // a worse debugging surface than the rows it replaced.
             Match marker = Regex.Match(rendered, @"^\u2026 \(\+(\d+) more\)$");
-            Assert.True(
-                marker.Success,
-                string.Create(
+            if (!marker.Success)
+            {
+                violations.Add(string.Create(
                     CultureInfo.InvariantCulture,
-                    $"exceeded budget {budget} with something other than the bare marker: '{rendered}'"));
-            Assert.Equal(count, int.Parse(marker.Groups[1].Value, CultureInfo.InvariantCulture));
-            Assert.Equal(SharedDiagnosticText.OverflowMarkerLength(count), rendered.Length);
+                    $"budget={budget} count={count}: exceeded its budget with something other than the "
+                        + $"bare marker — '{rendered}'"));
+                continue;
+            }
+
+            int reported = int.Parse(marker.Groups[1].Value, CultureInfo.InvariantCulture);
+            if (reported != count)
+            {
+                violations.Add(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"budget={budget} count={count}: the marker reported {reported} hidden items — "
+                        + $"'{rendered}'"));
+            }
+
+            int markerWidth = SharedDiagnosticText.OverflowMarkerLength(count);
+            if (rendered.Length != markerWidth)
+            {
+                violations.Add(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"budget={budget} count={count}: rendered {rendered.Length} characters where the bare "
+                        + $"marker is {markerWidth} — '{rendered}'"));
+            }
         }
+
+        Assert.True(
+            violations.Count == 0,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"{violations.Count} of {cases.Length} cells exceeded their budget outside the one "
+                    + $"permitted shape:\n")
+            + string.Join("\n", violations));
 
         Assert.True(
             exercised > 0,
