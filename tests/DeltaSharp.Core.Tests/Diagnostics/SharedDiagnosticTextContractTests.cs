@@ -224,4 +224,106 @@ public sealed class SharedDiagnosticTextContractTests
         Assert.Equal(count, int.Parse(marker.Groups[1].Value, CultureInfo.InvariantCulture));
         Assert.Equal(SharedDiagnosticText.OverflowMarkerLength(count), rendered.Length);
     }
+
+    /// <summary>The exact width of the <c>… (+N more)</c> marker, spelled out rather than taken from
+    /// <c>OverflowMarkerLength</c>, so the oracle below shares no arithmetic with the code it judges.
+    /// </summary>
+    private static int MarkerWidth(int hidden) =>
+        string.Create(CultureInfo.InvariantCulture, $"\u2026 (+{hidden} more)").Length;
+
+    /// <summary>
+    /// #687 council round 17 (Architect BLOCKING, sibling half) — the listing shows the <b>largest</b>
+    /// number of items that fits, not the one below the first that does not.
+    /// <para>This primitive's downward scan was already pinned when the identical scan in
+    /// <c>CoercionHelpers</c> was not, and that asymmetry is the finding: a property held at one of a pair
+    /// of sites and not at the other, with the untravelled half being the <em>test</em>. Both halves now
+    /// state the same property in the same shape, and both end by asserting that their corpus still
+    /// reaches the region where the property has any content.</para>
+    /// <para>That region exists only where the feasible counts are <b>not a prefix</b>. Taking one more
+    /// item costs its own width plus a separator, but the step that takes the LAST one also deletes the
+    /// marker, refunding a separator and eleven characters. Where an item is cheaper than that refund, a
+    /// count can be infeasible while a larger one fits, and a stop-at-first-failure walk halts below it.
+    /// With items of twelve characters or more no such count exists and the two walk shapes are the same
+    /// function — which is exactly how the sibling site stayed unguarded.</para>
+    /// </summary>
+    [Fact]
+    public void TheListingCountIsTheLargestFeasibleCount_NotOneShortOfTheFirstInfeasibleOne()
+    {
+        var counterexamples = new List<string>();
+        int cells = 0;
+        int discriminating = 0;
+
+        foreach (int itemLength in new[] { 1, 2, 3, 4, 6, 8, 10, 11, 12, 18 })
+        {
+            foreach (int count in new[] { 2, 3, 4, 5, 9, 11, 30, 107 })
+            {
+                string[] items =
+                [
+                    .. Enumerable.Range(0, count).Select(i =>
+                        string.Create(CultureInfo.InvariantCulture, $"{i:D3}")
+                            .PadRight(itemLength, 'x')[..itemLength]),
+                ];
+
+                // Pinning the allowance to the item length keeps every item verbatim, so the oracle needs
+                // no model of per-item truncation — a different property, guarded elsewhere.
+                for (int budget = 1; budget <= 420; budget++)
+                {
+                    cells++;
+                    string rendered =
+                        SharedDiagnosticText.SanitizeToBudget(items, budget, itemLength, itemLength);
+
+                    int Cost(int k) => (k * itemLength) + ((k - 1) * ", ".Length)
+                        + (k == count ? 0 : ", ".Length + MarkerWidth(count - k));
+
+                    int largestFeasible = 0;
+                    for (int k = 1; k <= count; k++)
+                    {
+                        if (Cost(k) <= budget)
+                        {
+                            largestFeasible = k;
+                        }
+                    }
+
+                    for (int k = 1; k < largestFeasible; k++)
+                    {
+                        if (Cost(k) > budget)
+                        {
+                            discriminating++;
+                            break;
+                        }
+                    }
+
+                    // Counted from the text, not from the marker: everything that is not the marker is an
+                    // item. Reading the count off the marker would be reading the renderer's own answer.
+                    int shown = rendered.Length == 0
+                        ? 0
+                        : rendered.Split(", ", StringSplitOptions.None)
+                            .Count(segment => !segment.StartsWith('\u2026'));
+
+                    if (shown != largestFeasible)
+                    {
+                        counterexamples.Add(string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"itemLength={itemLength} count={count} budget={budget}: showed {shown} of a "
+                                + $"feasible {largestFeasible} in {rendered.Length} chars — {rendered}"));
+                    }
+                }
+            }
+        }
+
+        Assert.True(
+            counterexamples.Count == 0,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"{counterexamples.Count} of {cells} cells listed fewer items than fit; first 5:\n")
+            + string.Join("\n", counterexamples.Take(5)));
+
+        Assert.True(
+            discriminating > 0,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"none of {cells} cells has a feasible count above an infeasible one, so this corpus can "
+                    + $"no longer distinguish a downward scan from a forward walk — shorten the items or "
+                    + $"lower the budgets until it can"));
+    }
 }

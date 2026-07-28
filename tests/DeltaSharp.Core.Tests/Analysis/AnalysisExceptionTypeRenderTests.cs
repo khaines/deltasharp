@@ -850,6 +850,12 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// #687 council round 15 — the companion property: a field is elided only when it could not have been
     /// shown. Asks the independent question (could ONE MORE have been shown?) rather than the renderer's
     /// own, for the reason set out on the listing sweep.
+    /// <para><b>Necessary and, on its own, not sufficient</b> — see
+    /// <see cref="TheFieldCountIsTheLargestFeasibleCount_NotOneShortOfTheFirstInfeasibleOne"/>. "Could one
+    /// more have been shown" is a <em>local</em> question, and the feasible counts are not a prefix: the
+    /// overflow marker disappears entirely at the last step, so a count can be infeasible while a LARGER
+    /// one fits. In that region showing one more genuinely does not fit and this test is correctly silent,
+    /// while showing every remaining field does. Round 17 found a real defect sitting precisely there.</para>
     /// </summary>
     [Fact]
     public void NoFieldIsElided_WhileTheBudgetCouldStillHavePaidForIt()
@@ -899,5 +905,158 @@ public sealed class AnalysisExceptionTypeRenderTests
         Assert.True(
             counterexamples.Count == 0,
             string.Join("\n", counterexamples.Take(5)));
+    }
+
+    /// <summary>
+    /// A struct of <paramref name="fieldCount"/> uniformly shaped fields whose names are exactly
+    /// <paramref name="nameLength"/> characters, so that the cheapest possible field is a corpus parameter
+    /// rather than a fixed property of the fixture.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="ShapedStruct"/> hard-codes twelve-character names, which is realistic and is exactly why
+    /// it cannot reach the region this file was missing a guard for. Name length is not decoration here: it
+    /// is the quantity that decides whether the feasible field counts form a prefix.
+    /// </remarks>
+    private static StructType UniformStruct(int fieldCount, int nameLength, string childKind)
+    {
+        DataType child = childKind switch
+        {
+            "int" => IntegerType.Instance,
+            "nested" => new StructType([new StructField("g0", IntegerType.Instance, true)]),
+            _ => new StructType(
+            [
+                .. Enumerable.Range(0, 8).Select(i => new StructField(
+                    string.Create(CultureInfo.InvariantCulture, $"g{i}"), IntegerType.Instance, true)),
+            ]),
+        };
+
+        return new StructType(
+        [
+            .. Enumerable.Range(0, fieldCount).Select(i => new StructField(
+                Alphabet[i] + new string('x', nameLength - 1), child, true)),
+        ]);
+    }
+
+    /// <summary>Distinct leading characters, so names stay unique down to a length of one.</summary>
+    private const string Alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+
+    /// <summary>The exact width of the <c>… (+N more)</c> marker, spelled out rather than borrowed from
+    /// <c>DiagnosticText</c>, so that the oracle below shares no arithmetic with the code it judges.</summary>
+    private static int MarkerWidth(int hidden) =>
+        string.Create(CultureInfo.InvariantCulture, $"\u2026 (+{hidden} more)").Length;
+
+    /// <summary>
+    /// #687 council round 17 (Architect BLOCKING) — the rendered field count is the <b>largest</b> count
+    /// that fits, not the one below the first that does not.
+    /// <para>Pass 1 of the struct render scans <em>downward</em> for its count. Reverting it to a
+    /// forward stop-at-first-failure walk was <b>0 RED across the whole solution</b> while measurably
+    /// eliding fields whose full render fits — a three-field struct at budget 32 rendering
+    /// <c>struct&lt;a:int,b:int … (+2 more)&gt;</c> when all four fit in 31 characters. Invariant 1, the
+    /// bound firing when everything would have fitted, unpinned.</para>
+    /// <para>The identical scan in <c>DiagnosticText.SanitizeToBudget</c> <em>is</em> pinned. This is the
+    /// seventh time in this change that a fix landed at one of a pair of sites, and the first time the
+    /// half that failed to travel was the <b>test</b>. The remedy is not only to port the guard but to
+    /// make it say out loud which region it needs to reach, which is the assertion at the end.</para>
+    /// <para><b>Why every existing guard was blind.</b> Not a missing axis this time but a fixture VALUE.
+    /// The counts that fit form a prefix whenever the cheapest field costs more than the marker's
+    /// disappearance is worth (one separator plus <c>… (+1 more)</c>, thirteen characters). Every fixture
+    /// in this file uses twelve-character names, so the cheapest field costs seventeen and the region
+    /// where the two walk shapes differ does not exist in the corpus. Under twelve-character names the
+    /// forward walk and the downward scan are the same function. Sixth vacuity of the "corpus cannot see
+    /// the bound" family, and the one that hid the longest.</para>
+    /// <para><b>The oracle.</b> Each field's minimum cost is reconstructed from the corpus — the name, a
+    /// colon, and the most compact form of its type — so the largest feasible count is arithmetic that
+    /// borrows nothing from the renderer. The assertion is EQUALITY, not a bound: a count too small is the
+    /// defect, and a count too large would mean the model is optimistic and the test itself unsound. It
+    /// holds on every one of the cells below.</para>
+    /// </summary>
+    [Fact]
+    public void TheFieldCountIsTheLargestFeasibleCount_NotOneShortOfTheFirstInfeasibleOne()
+    {
+        var counterexamples = new List<string>();
+        int cells = 0;
+        int discriminating = 0;
+
+        foreach (string childKind in new[] { "int", "nested", "wide" })
+        {
+            string compact = childKind switch
+            {
+                "int" => "int",
+                "nested" => "struct<(1 fields)>",
+                _ => "struct<(8 fields)>",
+            };
+
+            foreach (int nameLength in new[] { 1, 2, 3, 4, 5, 6, 7, 8, 12 })
+            {
+                foreach (int fieldCount in new[] { 2, 3, 4, 5, 9, 11, 30 })
+                {
+                    StructType subject = UniformStruct(fieldCount, nameLength, childKind);
+                    int perField = nameLength + 1 + compact.Length;
+
+                    for (int budget = CoercionHelpers.MinDiagnosticTypeLength; budget <= 400; budget++)
+                    {
+                        cells++;
+                        string rendered = CoercionHelpers.DiagnosticType(subject, budget);
+
+                        // "struct<" + k fields + (k-1) commas + [" … (+h more)"] + ">".
+                        int Cost(int k) => 7 + (k * perField) + (k - 1)
+                            + (fieldCount == k ? 0 : 1 + MarkerWidth(fieldCount - k)) + 1;
+
+                        int largestFeasible = 0;
+                        bool anySmallerInfeasible = false;
+                        for (int k = 1; k <= fieldCount; k++)
+                        {
+                            if (Cost(k) <= budget)
+                            {
+                                largestFeasible = k;
+                            }
+                        }
+
+                        for (int k = 1; k < largestFeasible; k++)
+                        {
+                            if (Cost(k) > budget)
+                            {
+                                anySmallerInfeasible = true;
+                            }
+                        }
+
+                        // The cell can tell the two walk shapes apart only where the feasible counts are
+                        // not a prefix. Counted, and asserted non-zero below.
+                        if (anySmallerInfeasible)
+                        {
+                            discriminating++;
+                        }
+
+                        int shown = TopLevelFields(rendered);
+                        if (shown != largestFeasible || rendered.Length > budget)
+                        {
+                            counterexamples.Add(string.Create(
+                                CultureInfo.InvariantCulture,
+                                $"child={childKind} nameLength={nameLength} fields={fieldCount} "
+                                    + $"budget={budget}: showed {shown} of a feasible {largestFeasible} "
+                                    + $"in {rendered.Length} chars — {rendered}"));
+                        }
+                    }
+                }
+            }
+        }
+
+        Assert.True(
+            counterexamples.Count == 0,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"{counterexamples.Count} of {cells} cells rendered fewer fields than fit; first 5:\n")
+            + string.Join("\n", counterexamples.Take(5)));
+
+        // The anti-vacuity half, and the part that would have prevented this round. A corpus can drift out
+        // of the region a test was written for without any assertion noticing, because passing looks
+        // identical either way. This one fails loudly instead.
+        Assert.True(
+            discriminating > 0,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"none of {cells} cells has a feasible count above an infeasible one, so this corpus can "
+                    + $"no longer distinguish a downward scan from a forward walk — shorten the names or "
+                    + $"lower the budgets until it can"));
     }
 }

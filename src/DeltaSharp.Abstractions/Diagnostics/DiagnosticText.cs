@@ -290,6 +290,17 @@ internal static class DiagnosticText
         // Scanning downward returns the maximum feasible k by construction, which matters because cost is not
         // monotonic in k: taking one more item lengthens the listing but can shorten the marker, so a "stop at
         // the first failure" walk can stop just below a k that fits.
+        //
+        // The counts that fit are therefore NOT a prefix, and that is the whole content of the property. The
+        // step that takes the last item deletes the marker outright, refunding a separator and eleven
+        // characters, so an item cheaper than that refund creates a k that fails while k+1 succeeds. Where
+        // every item is twelve characters or more no such k exists and the two walk shapes are the same
+        // function — which is how the identical scan in CoercionHelpers.RenderBounded stayed 0-RED for two
+        // rounds while this one was pinned. Not a missing axis: a fixture VALUE.
+        //
+        // Pinned by SharedDiagnosticTextContractTests.TheListingCountIsTheLargestFeasibleCount_NotOneShortOf
+        // TheFirstInfeasibleOne, whose Core sibling states the same property in the same shape, and which
+        // asserts that its corpus still contains such a k rather than assuming it.
         for (int k = items.Count; k >= 1; k--)
         {
             int hidden = items.Count - k;

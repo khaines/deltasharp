@@ -299,7 +299,18 @@ internal static class CoercionHelpers
                     // compact form of its type — which does not depend on the budget, so a prefix-sum gives the
                     // cost of showing any k of them exactly. The largest feasible k is then a downward scan,
                     // exactly as in DiagnosticText.SanitizeToBudget and for the same reason: total cost is not
-                    // monotonic in k, because the overflow marker shrinks as k grows.
+                    // monotonic in k, because the marker vanishes entirely at the last step, refunding more
+                    // than a cheap field costs. So a count can be infeasible while a LARGER one fits, and a
+                    // forward stop-at-first-failure walk halts below it.
+                    //
+                    // That sentence was, until round 17, an executable claim with nothing executing it. It is
+                    // now the property asserted by
+                    // AnalysisExceptionTypeRenderTests.TheFieldCountIsTheLargestFeasibleCount_NotOneShortOfThe
+                    // FirstInfeasibleOne, which also asserts that its corpus still CONTAINS a count of that
+                    // shape — because every other fixture in that file uses twelve-character names, for which
+                    // no such count exists and the two walk shapes are indistinguishable. The scan was 0-RED
+                    // across the whole solution for two rounds on exactly that account: not a missing axis but
+                    // a fixture VALUE, with the sibling scan in DiagnosticText pinned all along.
                     //
                     // Pass 2 fixes HOW MUCH DETAIL. The count is now settled, so each child in turn may expand
                     // into whatever is left after reserving the minimum for the fields that follow it. Nothing a
@@ -309,15 +320,24 @@ internal static class CoercionHelpers
                     // dies, because either alone is silently wrong in a different direction: a count has to
                     // be retuned whenever coverage legitimately grows, and every drift then looks like a
                     // regression, while an under-enumerated name list fails loudly when a name is WRONG and
-                    // silently when one is MISSING. Restoring the stop-at-first-fit walk is 32 failing rows
-                    // across 5 methods, identical on net8.0 and net10.0:
-                    // TypeBudget_IsSpentBeforeAnyFieldIsElided (28 of the 32 rows),
-                    // NestedPayloads_SpendTheirBudget_BeforeAnyFieldIsElided,
-                    // NoFieldIsElided_WhileTheBudgetCouldStillHavePaidForIt,
-                    // RealisticFieldNames_SurviveTheFieldNameCeilingVerbatim and
-                    // AMapWithACheapValue_SpendsTheSlackOnItsKey. Rows against methods is what makes the
-                    // pair checkable rather than merely redundant: 32 and 5 disagree loudly if either is
-                    // stale, which a lone figure of either kind cannot.
+                    // silently when one is MISSING. Both figures below are rows-per-TFM against methods, and
+                    // both were re-derived at this HEAD — the pair only reconciles if each is labelled with
+                    // which kind of thing it counts.
+                    //
+                    // Reversing the SCAN DIRECTION — the same scan, ascending, stopping at the first failure
+                    // — is 1 row on each of net8.0 and net10.0, 1 method:
+                    // TheFieldCountIsTheLargestFeasibleCount_NotOneShortOfTheFirstInfeasibleOne.
+                    //
+                    // Deleting pass 2's reservation for the fields that follow — handing each child
+                    // "budget - builder.Length - trailing" — is 2 rows on each TFM, 2 methods: that test and
+                    // TheStructRender_IsMonotoneAndFullySpent_AcrossBudgetWidthAndChildShape.
+                    //
+                    // A third figure used to stand here — 32 rows across 5 methods for "restoring the
+                    // stop-at-first-fit walk" — and it is deleted rather than re-measured, because the edit
+                    // it names cannot be applied to this file: round 15 replaced that walk, so a reader has
+                    // no way to re-derive the number, and a figure nobody can reproduce is a figure nobody
+                    // can falsify. A mutation claim is only worth writing down if it is an edit to the code
+                    // as it now stands. Both surviving figures are.
                     int fieldCount = structType.Count;
                     string[] fieldNames = new string[fieldCount];
                     string[] compactChildren = new string[fieldCount];
