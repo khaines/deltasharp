@@ -230,19 +230,12 @@ public sealed class ParquetWriterTests
         // columns, this form is RED while the input-only form is GREEN 1659 -- the old form's kill
         // had been coming entirely from the caller.
         //
-        // An earlier revision compared against the input ONLY, on the stated grounds that going
-        // through FromJson would make the oracle inherit the reader's depth ceiling. That reason
-        // was FALSE at the time it was written -- the round-trip assertion below already calls
-        // FromJson unconditionally on this very string, three lines later. It had been true in the
-        // broken state that preceded the depth-probe fix, and survived as a justification after the
-        // fix removed the constraint. Recorded because a correct decision resting on a stale reason
-        // is exactly the failure this file keeps finding in itself.
-        //
         // Domain note: this ranges over column NAMES. Physical type, decimal precision and
         // timestamp annotation are not expressible here and are pinned by the read-path guards
         // instead -- measured, not assumed: ByteType->short is 12 RED, decimal(p)->p+1 is 16 RED,
         // and flipping isAdjustedToUTC for timestamp_ntz is 2 RED. The narrowness is a division of
-        // labour, not a gap.
+        // labour, not a gap. The positional gap is the real one, and it is the LOG-side sibling
+        // call site, guarded in DeltaFooterLogSchemaParityTests rather than here.
         string[] physical = reader.Schema.DataFields.Select(x => x.Name).ToArray();
         string[] redeclared = ((StructType)SchemaJson.FromJson(declared)).Select(x => x.Name).ToArray();
         string[] logical = schema.Select(x => x.Name).ToArray();
@@ -2144,6 +2137,18 @@ public sealed class ParquetWriterTests
         Assert.True(
             cultures.Any(x => string.Compare("a", "B", x, System.Globalization.CompareOptions.None) < 0),
             "No culture collates 'a' before 'B', so a culture-sensitive sort would be invisible.");
+
+        // BuildCultureHazardSchema carries 'id'/'ID' keys specifically to probe dotted/dotless-I
+        // casing, which is the hazard a culture-sensitive ToUpper/ToLower on a metadata key would
+        // trip. That probe was passing INCIDENTALLY: the three requirements above are all satisfied
+        // without any Turkic culture present, so the casing coverage rested on the derivation
+        // happening to pick one rather than on anything requiring it. Same shape as the astral
+        // case -- a probe that exists but is required by nothing.
+        Assert.True(
+            cultures.Any(x => !string.Equals("i".ToUpper(x), "I", StringComparison.Ordinal)),
+            "No culture maps 'i' to something other than 'I', so the dotted/dotless-I keys in "
+            + "BuildCultureHazardSchema probe nothing and a culture-sensitive casing of metadata "
+            + "keys would be invisible.");
     }
 
     /// <summary>
