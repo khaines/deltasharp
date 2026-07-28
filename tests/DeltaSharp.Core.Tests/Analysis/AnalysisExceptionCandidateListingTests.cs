@@ -402,9 +402,14 @@ public sealed class AnalysisExceptionCandidateListingTests
     /// <summary>
     /// Round 7 (Security, elevated by Balanced): distinct legitimate names must render <b>distinctly</b>.
     /// A flat per-item cap collapsed <c>customer_lifetime_value_usd_2023_q1</c> and <c>…_q2</c> — the two
-    /// the user actually meant — into the identical string, in a 190-character message nowhere near the
-    /// backstop, so nothing needed bounding at all. Verified RED at <c>2d686a7</c>: three legitimate names
-    /// produced two identical renders at both sites.
+    /// the user actually meant — into the identical string, in a message roughly a sixth of the backstop,
+    /// so nothing needed bounding at all.
+    /// <para>The cross-HEAD claim is stated so it can be checked, since this test cannot compile at that
+    /// commit and "verified RED there" would be unfalsifiable. Building <c>2d686a7</c>'s DeltaSharp.Core
+    /// and invoking both factories through reflection renders all three names as the identical
+    /// <c>customer_lifetime_value_usd_2023…</c>, in messages of <b>162</b> characters here and <b>147</b>
+    /// for AmbiguousReference — not the 190 an earlier revision of this comment asserted, which was the
+    /// sixth unmeasured figure found in this PR and the only one found by its own author.</para>
     /// <para>Names deliberately share a 32-character prefix, so this corpus can only pass if the bound is
     /// wide enough to reach the part that differs. A corpus whose items are all shorter than the bound
     /// cannot test the bound — that is exactly how the previous guard here passed while the defect
