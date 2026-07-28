@@ -1040,6 +1040,334 @@ public sealed class ParquetWriterTests
         return result;
     }
 
+    private static string Truncate(string text) =>
+        text.Length <= 400 ? text : text[..200] + $" …[{text.Length} chars]… " + text[^200..];
+
+    /// <summary>
+    /// Collection sizes the constructive sweep emits.
+    /// <para>
+    /// PARTIALLY DERIVED, and the split matters. WHICH collections must be varied is derived --
+    /// <see cref="SchemaDegreesOfFreedom_AreEachVaried"/> finds every collection-valued member of
+    /// the schema types by reflection, so a new collection cannot be added to the model without
+    /// this file failing until it is exercised. WHAT COUNTS to use is not derivable: neither the
+    /// writer nor the reader has a cardinality limit to probe, exactly as with
+    /// <see cref="MagnitudeLengths"/>. These bracket the inline/pooled buffer capacities real
+    /// serializers use. Zero is included because an empty collection is a distinct emission path
+    /// (no separators at all), not merely a small one.
+    /// </para>
+    /// </summary>
+    private static readonly int[] CardinalityCounts = [0, 1, 15, 16, 17, 63, 64, 65, 257];
+
+    /// <summary>
+    /// The largest collection <see cref="SchemaDegreesOfFreedom_AreEachVaried"/> demands to see.
+    /// <para>
+    /// This is a chosen number, like <see cref="CardinalityCounts"/> -- but it is DELIBERATELY NOT
+    /// derived from that array. Writing it as <c>CardinalityCounts.Max()</c> was the first attempt
+    /// and it was vacuous: narrowing the sweep's counts narrowed the requirement along with them,
+    /// so the guard agreed with whatever it was auditing. That is the same shared-source defect
+    /// this file fixed at the codepoint axis and again at the depth axis, made a third time in the
+    /// guard written to prevent it -- which is the strongest evidence available that the shape is
+    /// easy to reintroduce and worth a named rule.
+    /// </para>
+    /// <para>
+    /// Two chosen numbers from independent places disagree when either moves; one number cannot.
+    /// </para>
+    /// </summary>
+    private const int MinimumLargestCollection = 257;
+
+    /// <summary>
+    /// The schemas the cardinality sweep writes: every count above, in every collection-valued
+    /// position the model has, with <c>Nullable</c> varied across them.
+    /// </summary>
+    private static IEnumerable<(string What, StructType Schema)> CardinalitySweepSchemas()
+    {
+        foreach (int n in CardinalityCounts)
+        {
+            // Field count. Zero is skipped because the WRITER rejects a fieldless schema -- a
+            // probed fact, asserted by CardinalitySweep_SkipsOnlyWhatTheWriterRejects, not an
+            // assumption. If that ever changes, the assertion fails and this regains a count.
+            if (n > 0)
+            {
+                var fields = new List<StructField>();
+                for (int i = 0; i < n; i++)
+                {
+                    fields.Add(new StructField($"f{i}", DataTypes.LongType, nullable: i % 2 == 0));
+                }
+
+                yield return ($"{n} fields", new StructType(fields));
+            }
+
+            // Metadata entry count -- the position that evicts protocol keys when it overflows.
+            var entries = new List<KeyValuePair<string, MetadataValue>>();
+            for (int i = 0; i < n; i++)
+            {
+                entries.Add(new KeyValuePair<string, MetadataValue>(
+                    $"a.tenant.tag{i:D3}", MetadataValue.String($"v{i}")));
+            }
+
+            entries.Add(new KeyValuePair<string, MetadataValue>(
+                "delta.columnMapping.id", MetadataValue.Long(7)));
+            entries.Add(new KeyValuePair<string, MetadataValue>(
+                "delta.columnMapping.physicalName", MetadataValue.String("col-7")));
+            entries.Add(new KeyValuePair<string, MetadataValue>(
+                "delta.identity.start", MetadataValue.Long(4)));
+
+            yield return ($"{n} metadata entries", new StructType(
+            [
+                new StructField(
+                    "m", DataTypes.LongType, nullable: n % 2 == 0,
+                    FieldMetadata.FromValues(entries.ToArray())),
+            ]));
+
+            // Array element count, and a nested metadata object of the same size one level down.
+            var items = new List<MetadataValue>();
+            for (int i = 0; i < n; i++)
+            {
+                items.Add(MetadataValue.String($"e{i}"));
+            }
+
+            yield return ($"{n} array elements", new StructType(
+            [
+                new StructField(
+                    "a", DataTypes.StringType, nullable: n % 2 != 0,
+                    FieldMetadata.FromValues(
+                    [
+                        new KeyValuePair<string, MetadataValue>("arr", MetadataValue.Array(items.ToArray())),
+                        new KeyValuePair<string, MetadataValue>(
+                            "obj", MetadataValue.Nested(FieldMetadata.FromValues(entries.ToArray()))),
+                    ])),
+            ]));
+        }
+    }
+
+    /// <summary>
+    /// The cardinality sweep skips exactly one cell -- zero fields -- and only because the writer
+    /// refuses it. This asserts that refusal, so the skip is a measured property of the writer
+    /// rather than a convenience.
+    /// </summary>
+    [Fact]
+    public async Task CardinalitySweep_SkipsOnlyWhatTheWriterRejects()
+    {
+        await Assert.ThrowsAnyAsync<Exception>(
+            async () => await WriteAndReadFooterSchemaAsync(new StructType([])));
+    }
+
+    /// <summary>
+    /// META-GUARD: every degree of freedom the schema model HAS must be varied by something this
+    /// file writes -- and the list of degrees of freedom is read off the TYPES, not written here.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Sixteen review rounds found sixteen divergence axes, one at a time, and each was fixed by
+    /// deriving the values WITHIN that axis from an external source. That works, and it never
+    /// terminates, because the set of AXES was still discovered by inspection: two consecutive
+    /// rounds found structural axes (nesting depth, then collection cardinality) that no amount of
+    /// character-level derivation could have reached.
+    /// </para>
+    /// <para>
+    /// The input to the serializer is a closed object model, so the axes are not actually open:
+    /// they are the members of <c>StructType</c>, <c>StructField</c>, <c>FieldMetadata</c>,
+    /// <c>MetadataValue</c> and <c>DataType</c>. Reflection enumerates them. This test asserts that
+    /// each one is actually VARIED by the corpus, with the requirement derived from the member's
+    /// TYPE: a <c>bool</c> must show both values, an enum every value, a count several values
+    /// including a large one, a string several values.
+    /// </para>
+    /// <para>
+    /// So adding a property to the model -- or, as happened here, leaving <c>Nullable</c> pinned to
+    /// <c>true</c> and every collection under nine elements -- fails this test rather than waiting
+    /// for a reviewer to notice. That is the axis-enumeration problem given the same treatment
+    /// <c>UnicodeCategory</c> gave the codepoint problem: rooted in a definition outside the test.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void SchemaDegreesOfFreedom_AreEachVaried()
+    {
+        var observed = new Dictionary<string, HashSet<object>>(StringComparer.Ordinal);
+        foreach (StructType schema in ArtifactSchemas())
+        {
+            ObserveType(schema, observed);
+        }
+
+        // The one member that is invariant BY THE WRITER'S SIGNATURE rather than by choice: the
+        // footer schema root is typed StructType, so its TypeName cannot be anything but "struct".
+        // That justification is checked here rather than asserted in a comment -- if the writer
+        // ever accepts a wider root type, this fails and TypeName becomes a live degree of freedom.
+        System.Reflection.ParameterInfo schemaParameter = typeof(ParquetFileWriter)
+            .GetMethod(nameof(ParquetFileWriter.WriteAsync))!
+            .GetParameters()
+            .Single(p => p.ParameterType == typeof(StructType) || p.Name == "schema");
+        Assert.Equal(typeof(StructType), schemaParameter.ParameterType);
+
+        var unvaried = new List<string>();
+        foreach ((Type owner, System.Reflection.PropertyInfo property) in SchemaDegreesOfFreedom())
+        {
+            string key = $"{owner.Name}.{property.Name}";
+            if (key == "StructType.TypeName")
+            {
+                continue;
+            }
+
+            HashSet<object> values = observed.TryGetValue(key, out HashSet<object>? v)
+                ? v
+                : new HashSet<object>();
+
+            Type t = Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType;
+            if (t == typeof(bool))
+            {
+                if (values.Count < 2)
+                {
+                    unvaried.Add($"{key} (bool) only ever {Describe(values)}");
+                }
+            }
+            else if (t.IsEnum)
+            {
+                object[] missing = Enum.GetValues(t).Cast<object>().Where(x => !values.Contains(x)).ToArray();
+                if (missing.Length > 0)
+                {
+                    unvaried.Add($"{key} (enum) never {string.Join("/", missing)}");
+                }
+            }
+            else if (t == typeof(int))
+            {
+                int max = values.Count == 0 ? -1 : values.Cast<int>().Max();
+                if (values.Count < 3 || max < MinimumLargestCollection)
+                {
+                    unvaried.Add(
+                        $"{key} (count) took {values.Count} distinct values, max {max}, "
+                        + $"below the required minimum of {MinimumLargestCollection}");
+                }
+            }
+            else if (t == typeof(string) && values.Count < 2)
+            {
+                unvaried.Add($"{key} (string) only ever {Describe(values)}");
+            }
+        }
+
+        Assert.True(
+            unvaried.Count == 0,
+            "These degrees of freedom of the schema model are never varied by anything this file "
+            + "writes to a footer, so a serializer that mishandles them diverges undetected:"
+            + Environment.NewLine + string.Join(Environment.NewLine, unvaried.Select(u => "  - " + u)));
+
+        static string Describe(HashSet<object> values) =>
+            values.Count == 0 ? "unobserved" : string.Join("/", values.Select(v => v?.ToString() ?? "null"));
+    }
+
+    /// <summary>
+    /// The degrees of freedom, read off the schema types. Reference-typed members are excluded
+    /// BY THEIR TYPE rather than by name: they are other model objects or views over them, and are
+    /// covered by their own owner's entry.
+    /// </summary>
+    private static IEnumerable<(Type Owner, System.Reflection.PropertyInfo Property)> SchemaDegreesOfFreedom()
+    {
+        Type[] owners =
+        [
+            typeof(StructType), typeof(StructField), typeof(FieldMetadata), typeof(MetadataValue),
+        ];
+
+        foreach (Type owner in owners)
+        {
+            foreach (System.Reflection.PropertyInfo property in owner.GetProperties(
+                System.Reflection.BindingFlags.Public
+                | System.Reflection.BindingFlags.Instance
+                | System.Reflection.BindingFlags.DeclaredOnly))
+            {
+                Type t = property.PropertyType;
+                bool scalar = t.IsEnum || t == typeof(bool) || t == typeof(int) || t == typeof(string);
+                if (property.GetIndexParameters().Length == 0 && scalar)
+                {
+                    yield return (owner, property);
+                }
+            }
+        }
+    }
+
+    private static void Observe(object target, Dictionary<string, HashSet<object>> into)
+    {
+        foreach ((Type owner, System.Reflection.PropertyInfo property) in SchemaDegreesOfFreedom())
+        {
+            if (!owner.IsInstanceOfType(target))
+            {
+                continue;
+            }
+
+            object? value = property.GetValue(target);
+            if (value is null)
+            {
+                continue;
+            }
+
+            if (!into.TryGetValue($"{owner.Name}.{property.Name}", out HashSet<object>? set))
+            {
+                set = new HashSet<object>();
+                into[$"{owner.Name}.{property.Name}"] = set;
+            }
+
+            set.Add(value);
+        }
+    }
+
+    private static void ObserveType(StructType schema, Dictionary<string, HashSet<object>> into)
+    {
+        Observe(schema, into);
+        foreach (StructField field in schema)
+        {
+            Observe(field, into);
+            ObserveMetadata(field.Metadata, into);
+        }
+    }
+
+    private static void ObserveMetadata(FieldMetadata metadata, Dictionary<string, HashSet<object>> into)
+    {
+        Observe(metadata, into);
+        foreach (KeyValuePair<string, MetadataValue> entry in metadata)
+        {
+            ObserveValue(entry.Value, into);
+        }
+    }
+
+    private static void ObserveValue(MetadataValue value, Dictionary<string, HashSet<object>> into)
+    {
+        Observe(value, into);
+        switch (value.Kind)
+        {
+            case MetadataValueKind.Array:
+                foreach (MetadataValue item in value.AsArray())
+                {
+                    ObserveValue(item, into);
+                }
+
+                break;
+            case MetadataValueKind.Nested:
+                ObserveMetadata(value.AsNested(), into);
+                break;
+            default:
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Every schema this file actually writes to a Parquet footer. The degrees-of-freedom guard
+    /// observes THESE rather than a separate list, so it reports on real artifact coverage.
+    /// </summary>
+    private static IEnumerable<StructType> ArtifactSchemas()
+    {
+        yield return MetadataCorpusSchema;
+        yield return NameCorpusSchema;
+        yield return BuildNumericSweepSchema();
+        foreach ((string _, StructType schema) in CardinalitySweepSchemas())
+        {
+            yield return schema;
+        }
+
+        var covered = new HashSet<(string, int, string)>();
+        yield return BuildSweepSchema([.. HazardCodepoints.Take(8)], 0, covered);
+        foreach (int length in MagnitudeLengths)
+        {
+            yield return BuildSweepSchema([new string('m', length)], -length, covered);
+        }
+    }
+
     /// <summary>
     /// Meta-guard: the hazard set must represent EVERY Unicode category that has members.
     /// </summary>
@@ -1151,6 +1479,25 @@ public sealed class ParquetWriterTests
                     + $"fixed-buffer truncation."
                     + $"{Environment.NewLine}  expected length: {expected.Length}"
                     + $"{Environment.NewLine}  actual length: {footer.Length}");
+            }
+        }
+
+        // CARDINALITY. Every axis before this one varies what a SINGLE ITEM contains; none varied
+        // how many items there are. A serializer with a fixed inline buffer for metadata entries
+        // needs no hostile character and no long string to diverge -- and because keys are emitted
+        // in ordinal order, enough tenant-supplied keys evict the protocol's own delta.* keys from
+        // the footer while the log keeps them.
+        foreach ((string what, StructType schema) in CardinalitySweepSchemas())
+        {
+            string cardExpected = SchemaJson.ToJson(schema);
+            string cardFooter = await WriteAndReadFooterSchemaAsync(schema);
+            if (!string.Equals(cardExpected, cardFooter, StringComparison.Ordinal))
+            {
+                Assert.Fail(
+                    $"Footer diverged from the shared serializer at {what} -- a fixed-capacity "
+                    + "collection buffer."
+                    + $"{Environment.NewLine}  expected (log): {Truncate(cardExpected)}"
+                    + $"{Environment.NewLine}  actual (footer): {Truncate(cardFooter)}");
             }
         }
 
