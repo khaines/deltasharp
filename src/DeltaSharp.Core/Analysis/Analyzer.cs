@@ -476,7 +476,7 @@ internal sealed class Analyzer
     {
         if (condition.Type is not BooleanType)
         {
-            string actual = condition.Type?.SimpleString ?? "unknown";
+            string actual = RenderType(condition.Type);
             throw AnalysisException.DataTypeMismatch(
                 CoercionHelpers.DiagnosticReference(condition),
                 $"the condition of a '{ownerNodeName}' must be boolean but is '{actual}'.");
@@ -713,6 +713,12 @@ internal sealed class Analyzer
     // or the base retyped away from a struct) → UnresolvedStructField, so a survivor-constraint
     // reclassifier can attribute it to the top-level column (#600). An ambiguous field match remains
     // a DataTypeMismatch (the reference resolves to a struct, but the path is under-specified).
+    /// <summary>Renders a possibly-unknown operand type for a diagnostic, bounded and count-carrying
+    /// (<see cref="CoercionHelpers.DiagnosticType"/>). A struct type is a user-authored <em>collection</em>,
+    /// so it must never be cut by the whole-message backstop with a bare ellipsis.</summary>
+    private static string RenderType(DataType? type) =>
+        type is null ? "unknown" : CoercionHelpers.DiagnosticType(type);
+
     private static Expression ExtractStructField(
         Expression child, string fieldName, UnresolvedAttribute origin, string baseColumnName)
     {
@@ -720,8 +726,9 @@ internal sealed class Analyzer
         {
             throw AnalysisException.UnresolvedStructField(
                 origin.Name,
-                $"cannot extract field '{fieldName}' from '{child.SimpleString}' of type "
-                + $"'{child.Type?.SimpleString ?? "unknown"}' — a nested field reference requires a struct",
+                $"cannot extract field '{DiagnosticText.Sanitize(fieldName)}' from "
+                + $"'{CoercionHelpers.DiagnosticReference(child)}' of type "
+                + $"'{RenderType(child.Type)}' — a nested field reference requires a struct",
                 rootColumn: baseColumnName);
         }
 
@@ -738,7 +745,8 @@ internal sealed class Analyzer
             {
                 throw AnalysisException.DataTypeMismatch(
                     origin.Name,
-                    $"field '{fieldName}' is ambiguous in struct type '{structType.SimpleString}'");
+                    $"field '{DiagnosticText.Sanitize(fieldName)}' is ambiguous in struct type "
+                    + $"'{CoercionHelpers.DiagnosticType(structType)}'");
             }
 
             ordinal = i;
@@ -749,7 +757,8 @@ internal sealed class Analyzer
         {
             throw AnalysisException.UnresolvedStructField(
                 origin.Name,
-                $"no such struct field '{fieldName}' in '{structType.SimpleString}'",
+                $"no such struct field '{DiagnosticText.Sanitize(fieldName)}' in "
+                + $"'{CoercionHelpers.DiagnosticType(structType)}'",
                 rootColumn: baseColumnName);
         }
 

@@ -1,3 +1,4 @@
+using DeltaSharp.Diagnostics;
 using DeltaSharp.Plans.Expressions;
 using DeltaSharp.Types;
 
@@ -53,7 +54,7 @@ internal static class ExpressionCoercion
             throw AnalysisException.DataTypeMismatch(
                 CoercionHelpers.DiagnosticReference(arithmetic),
                 $"the '{arithmetic.NodeName}' operator requires numeric operands but got "
-                + $"'{leftType.SimpleString}' and '{rightType.SimpleString}'.");
+                + $"'{CoercionHelpers.DiagnosticType(leftType)}' and '{CoercionHelpers.DiagnosticType(rightType)}'.");
         }
 
         Expression left = CoercionHelpers.CastIfNeeded(arithmetic.Left, c.LeftTarget);
@@ -76,7 +77,7 @@ internal static class ExpressionCoercion
             throw AnalysisException.DataTypeMismatch(
                 CoercionHelpers.DiagnosticReference(comparison),
                 $"the '{comparison.NodeName}' operator requires comparable operand types but got "
-                + $"'{leftType.SimpleString}' and '{rightType.SimpleString}'.");
+                + $"'{CoercionHelpers.DiagnosticType(leftType)}' and '{CoercionHelpers.DiagnosticType(rightType)}'.");
         }
 
         Expression left = CoercionHelpers.CastIfNeeded(comparison.Left, common);
@@ -115,7 +116,10 @@ internal static class ExpressionCoercion
             throw AnalysisException.DataTypeMismatch(
                 CoercionHelpers.DiagnosticReference(caseWhen),
                 "the branch/else result values of a CASE expression must share a common type but got "
-                + $"[{string.Join(", ", valueTypes.Select(t => t.SimpleString))}].");
+                + $"[{DiagnosticText.SanitizeAndJoin(
+                    valueTypes.Select(t => CoercionHelpers.DiagnosticType(t, AnalysisException.MaxEchoedCandidateLength)),
+                    AnalysisException.MaxEchoedCandidateLength,
+                    AnalysisException.MaxEchoedCandidates)}].");
         }
 
         // Rebuild the flattened children [c0, v0, c1, v1, …, (else?)] with boolean-checked conditions
@@ -171,7 +175,7 @@ internal static class ExpressionCoercion
             null => operand,
             _ => throw AnalysisException.DataTypeMismatch(
                 CoercionHelpers.DiagnosticReference(operand),
-                $"a '{context}' operand must be boolean but got '{operand.Type.SimpleString}'."),
+                $"a '{context}' operand must be boolean but got '{CoercionHelpers.DiagnosticType(operand.Type)}'."),
         };
     }
 

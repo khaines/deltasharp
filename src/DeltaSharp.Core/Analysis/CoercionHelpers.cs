@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.Text;
 using DeltaSharp.Diagnostics;
 using DeltaSharp.Plans.Expressions;
 using DeltaSharp.Types;
@@ -124,10 +126,142 @@ internal static class CoercionHelpers
     public static string DiagnosticReference(Expression expression) =>
         DiagnosticText.Sanitize(PrettyReference(expression), DiagnosticReferenceMaxLength);
 
-    /// <summary>Total, leak-proof fallback for any node without a bespoke SQL form. A true leaf
-    /// (<see cref="Literal"/>, an unresolved marker) carries no ExprId, so its <c>SimpleString</c> is
-    /// safe; any composite is rendered generically from <em>pretty</em> children so no resolved
-    /// <see cref="AttributeReference"/> descendant can leak its <c>#ExprId</c>.</summary>
+    /// <summary>
+    /// The budget for a type rendered into the <em>detail</em> of a single-type diagnostic
+    /// (<c>Analyzer.ExtractStructField</c>, <see cref="ExpressionCoercion"/>). Sized to show an ordinary
+    /// nested payload struct with its field names intact while leaving room for the surrounding prose,
+    /// the reference and the field name inside <see cref="AnalysisException.MaxMessageLength"/>.
+    /// </summary>
+    internal const int DiagnosticTypeMaxLength = 320;
+
+    /// <summary>The smallest budget <see cref="DiagnosticType"/> accepts: the widest possible compact
+    /// summary (<c>struct&lt;(2147483647 fields)&gt;</c>, 27 characters) must fit, or the hard
+    /// length guarantee could not be honoured without cutting the count off the end.</summary>
+    private const int MinDiagnosticTypeLength = 32;
+
+    /// <summary>Per-field-name cap inside a rendered type. Field names are user-authored (a hostile
+    /// <c>_delta_log</c> schema) and otherwise unbounded.</summary>
+    private const int MaxEchoedFieldNameLength = 32;
+
+    /// <summary>Nesting depth past which a composite renders as its compact summary. Bounds the render
+    /// of a pathologically deep type (<c>array&lt;array&lt;…&gt;&gt;</c>) that carries no fields at all
+    /// and so would never trip the character budget.</summary>
+    private const int MaxEchoedTypeDepth = 4;
+
+    /// <summary>
+    /// Renders <paramref name="type"/> for use <b>inside a diagnostic message</b>, bounded to
+    /// <paramref name="maxLength"/> characters and neutralized, <b>with an explicit overflow count for
+    /// every field it omits</b>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Why this exists rather than <c>Sanitize(type.SimpleString, cap)</c>.</b> A type render is not a
+    /// token, it is a <em>recursive collection</em>: <c>StructType.SimpleString</c> is
+    /// <c>struct&lt;f1:int,f2:string,…&gt;</c> over user-authored field names. Capping that flat string cuts
+    /// the container and destroys the signal that anything was cut — a 60-field and a 400-field payload
+    /// struct rendered as the <em>same</em> 1024-character message ending in a bare <c>…</c>, so a user
+    /// mistyping <c>df.Select("payload.typo")</c> on an ordinary wide struct was shown a silently
+    /// truncated field list with no indication that it was truncated or by how much. Bounding each
+    /// field and reporting <c>(+N more)</c> keeps the render bounded <em>and</em> honest.
+    /// </para>
+    /// <para>
+    /// <b>The length guarantee is hard.</b> The result is never longer than <paramref name="maxLength"/>.
+    /// The budget-driven walk stops emitting fields as it approaches the ceiling, but a deeply nested
+    /// type can still overshoot (each level reserves room for its own <c>(+N more)</c> suffix); when it
+    /// does, the whole render collapses to the compact summary <c>struct&lt;(N fields)&gt;</c>, which is
+    /// short, bounded by construction, and <em>still carries the count</em>. Both branches are honest —
+    /// that is the property, not the exact shape.
+    /// </para>
+    /// </remarks>
+    internal static string DiagnosticType(DataType type, int maxLength = DiagnosticTypeMaxLength)
+    {
+        ArgumentNullException.ThrowIfNull(type);
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxLength, MinDiagnosticTypeLength);
+        return RenderBounded(type, maxLength, depth: 0);
+    }
+
+    /// <summary>Compact, count-carrying fallback used when the detailed render does not fit its budget or
+    /// bottoms out on depth. Bounded by construction: the longest form is a struct summary carrying an
+    /// <see cref="int"/> field count (<c>struct&lt;(2147483647 fields)&gt;</c>, 27 characters), which is why
+    /// <see cref="MinDiagnosticTypeLength"/> is the floor on a caller's budget.</summary>
+    private static string SummarizeType(DataType type, int maxLength) => type switch
+    {
+        StructType structType =>
+            string.Create(CultureInfo.InvariantCulture, $"struct<({structType.Count} fields)>"),
+        ArrayType => "array<\u2026>",
+        MapType => "map<\u2026>",
+        _ => DiagnosticText.Sanitize(type.SimpleString, maxLength),
+    };
+
+    /// <summary>
+    /// Renders <paramref name="type"/> in at most <paramref name="budget"/> characters. Each candidate
+    /// piece is rendered first and appended only if it <em>and</em> a worst-case overflow suffix still fit,
+    /// so the count can never be the thing that gets cut; if the detailed form does not fit even so, the
+    /// whole render collapses to the count-carrying summary. The fit-is-checked-before-committing shape is
+    /// deliberate: an append-then-measure loop overshoots by up to one field, which made the render flip
+    /// between detailed and summary form on nothing more than a change in field-name length.
+    /// </summary>
+    private static string RenderBounded(DataType type, int budget, int depth)
+    {
+        // " … (+2147483647 more)" is 21 characters and the closing '>' is one more.
+        const int SuffixReserve = 22;
+
+        string summary = SummarizeType(type, budget);
+        if (depth >= MaxEchoedTypeDepth)
+        {
+            return summary;
+        }
+
+        string detailed;
+        switch (type)
+        {
+            case StructType structType:
+                var builder = new StringBuilder("struct<");
+                int shown = 0;
+                for (int i = 0; i < structType.Count; i++)
+                {
+                    string name = DiagnosticText.Sanitize(structType[i].Name, MaxEchoedFieldNameLength);
+                    string child = RenderBounded(structType[i].DataType, budget, depth + 1);
+                    string piece = string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"{(shown > 0 ? "," : string.Empty)}{name}:{child}");
+                    if (builder.Length + piece.Length + SuffixReserve > budget)
+                    {
+                        break;
+                    }
+
+                    builder.Append(piece);
+                    shown++;
+                }
+
+                if (shown < structType.Count)
+                {
+                    builder.Append(
+                        CultureInfo.InvariantCulture, $" \u2026 (+{structType.Count - shown} more)");
+                }
+
+                detailed = builder.Append('>').ToString();
+                break;
+
+            case ArrayType arrayType:
+                detailed = $"array<{RenderBounded(arrayType.ElementType, budget - 7, depth + 1)}>";
+                break;
+
+            case MapType mapType:
+                detailed = $"map<{RenderBounded(mapType.KeyType, budget - 5, depth + 1)}," +
+                    $"{RenderBounded(mapType.ValueType, budget - 5, depth + 1)}>";
+                break;
+
+            default:
+                // An atomic type's SimpleString is a compile-time constant or a decimal(p,s) form: no
+                // user-authored text. Sanitized anyway so the rule holds for any future DataType.
+                detailed = DiagnosticText.Sanitize(type.SimpleString, MaxEchoedFieldNameLength);
+                break;
+        }
+
+        return detailed.Length <= budget ? detailed : summary;
+    }
+
     private static string PrettyFallback(Expression expression) =>
         expression.Children.Count == 0
             ? expression.SimpleString

@@ -187,10 +187,11 @@ public sealed class AnalysisExceptionLengthIndependenceTests
         // rather than layer 1: these factories never touch CoercionHelpers.DiagnosticReference, so nothing
         // shortens them before construction. Deliberately expressed as "close to the bound" without asserting
         // the bound's value.
-        // DataTypeMismatch, not UnknownFunction (round 6): the function factories now bound their own
-        // components, so they no longer render anywhere near the backstop and could not demonstrate it. This
-        // one interpolates a single unbounded token, which is the case the backstop legitimately owns.
-        string message = AnalysisException.DataTypeMismatch(Pad(LargePayload), "boolean expected").Message;
+        // Round 7: the DETAIL channel, not the reference. Every argument a factory OWNS is now bounded by
+        // that factory, so the backstop's remaining job is the one thing it cannot delegate — the opaque
+        // string a CALLER composes and hands in. Naming that channel explicitly is the honest calibration;
+        // this fact went red when the reference became bounded, which is precisely what it is for.
+        string message = AnalysisException.DataTypeMismatch("amount", Pad(LargePayload)).Message;
 
         Assert.True(
             message.Length > 512,

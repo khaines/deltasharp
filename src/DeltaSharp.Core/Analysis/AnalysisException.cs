@@ -148,6 +148,19 @@ internal sealed class AnalysisException : Exception
     /// a different thing from eliding a list without saying so.
     /// </para>
     /// <para>
+    /// <b>The factories are not the whole class.</b> A second family composes its text in the analyzer
+    /// (<c>Analyzer.ExtractStructField</c>, <c>ExpressionCoercion</c>) and hands it to
+    /// <see cref="DataTypeMismatch"/> / <see cref="UnresolvedStructField"/> as an opaque <c>detail</c>
+    /// string, so no factory-ranging test can see it. Those sites interpolated a <see cref="DataType"/>,
+    /// and a type render is itself a <em>recursive collection</em> — <c>struct&lt;f1:int,…&gt;</c> over
+    /// user-authored field names — so an ordinary 60-field nested payload struct was cut by this cap with a
+    /// bare ellipsis and no count, identically to a 400-field one. They now render through
+    /// <see cref="CoercionHelpers.DiagnosticType"/>, and <c>AnalysisExceptionTypeRenderTests</c> ranges over
+    /// the diagnostic <em>sites</em> rather than the factories. The general rule, stated once: <b>anything
+    /// interpolated into a diagnostic that is a collection — a list, or a type that contains one — must
+    /// bound its own elements and report what it dropped.</b>
+    /// </para>
+    /// <para>
     /// The same correction applies to the mitigation this comment used to cite: <see cref="Reference"/>,
     /// <see cref="RootColumn"/> and <see cref="Candidates"/> do remain <b>unmodified</b> as the structured,
     /// machine-readable channel (they are matched on by callers such as the Delta dependent-column
@@ -404,7 +417,8 @@ internal sealed class AnalysisException : Exception
         ArgumentNullException.ThrowIfNull(reference);
         ArgumentNullException.ThrowIfNull(nodeName);
         return new AnalysisException(
-            $"Plan is not fully resolved: unresolved reference '{reference}' remains in operator "
+            $"Plan is not fully resolved: unresolved reference "
+            + $"'{DiagnosticText.Sanitize(reference, CoercionHelpers.DiagnosticReferenceMaxLength)}' remains in operator "
             + $"'{nodeName}' after analysis.",
             AnalysisErrorKind.UnresolvedPlan,
             reference,
@@ -514,7 +528,8 @@ internal sealed class AnalysisException : Exception
         ArgumentNullException.ThrowIfNull(reference);
         ArgumentNullException.ThrowIfNull(detail);
         return new AnalysisException(
-            $"cannot resolve '{reference}' due to data type mismatch: {detail}",
+            $"cannot resolve '{DiagnosticText.Sanitize(reference, CoercionHelpers.DiagnosticReferenceMaxLength)}' "
+            + $"due to data type mismatch: {detail}",
             AnalysisErrorKind.DataTypeMismatch,
             reference,
             Array.Empty<string>());
@@ -531,7 +546,7 @@ internal sealed class AnalysisException : Exception
         ArgumentNullException.ThrowIfNull(reference);
         ArgumentNullException.ThrowIfNull(detail);
         return new AnalysisException(
-            $"cannot resolve '{reference}': {detail}",
+            $"cannot resolve '{DiagnosticText.Sanitize(reference, CoercionHelpers.DiagnosticReferenceMaxLength)}': {detail}",
             AnalysisErrorKind.UnresolvedStructField,
             reference,
             Array.Empty<string>(),
@@ -605,9 +620,15 @@ internal sealed class AnalysisException : Exception
         return DiagnosticText.Sanitize(attribute.Name, nameBudget) + id;
     }
 
+    /// <summary>Renders a list of user-supplied types for a diagnostic. Each element goes through
+    /// <see cref="CoercionHelpers.DiagnosticType"/> <b>first</b> — a struct type is itself a collection, so
+    /// capping its flat <c>SimpleString</c> would cut it with a bare ellipsis and no count — and only then
+    /// through the shared list bound, which by construction can no longer bind.</summary>
     private static string RenderTypes(IReadOnlyList<DataType> types) =>
         DiagnosticText.SanitizeAndJoin(
-            types.Select(t => t.SimpleString), MaxEchoedCandidateLength, MaxEchoedCandidates);
+            types.Select(t => CoercionHelpers.DiagnosticType(t, MaxEchoedCandidateLength)),
+            MaxEchoedCandidateLength,
+            MaxEchoedCandidates);
 
     /// <summary>Builds an <see cref="AnalysisErrorKind.InvalidTimeTravelSpec"/> failure for a read that
     /// pins both a version and a timestamp (#499): the <c>versionAsOf</c> and <c>timestampAsOf</c> options
