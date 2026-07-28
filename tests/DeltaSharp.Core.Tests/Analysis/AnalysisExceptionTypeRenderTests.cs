@@ -944,70 +944,105 @@ public sealed class AnalysisExceptionTypeRenderTests
     }
 
     /// <summary>
-    /// #687 council round 18 (Architect BLOCKING) — the fixtures that predate the pin above cannot reach
-    /// the region it guards, asserted rather than described.
+    /// #687 council round 18 (Architect, Quality and Security BLOCKING) — no fixture that predates the pin
+    /// below can reach the region it guards, asserted rather than described.
     /// </summary>
     /// <remarks>
-    /// <para>Two revisions of that claim shipped as prose and both were wrong, the second while correcting
-    /// the first. Each compared the wrong quantity: the discriminating region is decided by a field's
-    /// MARGINAL cost — separator, name, colon and the most compact child — and both sentences compared the
-    /// NAME width alone, which is smaller. One of them concluded "well above the refund" about a name that
-    /// is exactly equal to it and another that is below it, reaching the right verdict for a reason that
-    /// does not hold.</para>
-    /// <para>A sentence telling a maintainer how to build a discriminating corpus has a silent, delayed
-    /// failure mode: follow it, get a corpus that cannot see the defect, and every test passes. So it is
-    /// not a sentence any more. This reads the names off the generators, charges each the CHEAPEST child
-    /// the renderer can emit, and asserts the result is at or above the refund — the condition under which
-    /// the feasible counts form a prefix and the two walk shapes are indistinguishable. If a future fixture
-    /// drops below it, this fails and says which one, rather than a comment silently becoming true.</para>
+    /// <para>Three revisions of that claim shipped as prose and all three were wrong, the second and third
+    /// while correcting the one before. They failed in three different ways — comparing a field's NAME
+    /// width where the deciding quantity is its MARGINAL cost; asserting a single fixed width where one
+    /// predating test already sweeps three; and calling widths "well beyond the threshold" when reflection
+    /// over every fixture finds nine distinct widths, four of them below it. Three seats falsified one
+    /// sentence by three methods.</para>
+    /// <para><b>And the conclusion was right the whole time, for a reason none of the three gave.</b> A
+    /// differential over every pre-existing fixture showed the corpus genuinely cannot discriminate — so
+    /// each wrong sentence survived every check of its conclusion and failed only when someone checked its
+    /// reason. That is the most dangerous shape a comment can have: it is guidance, it is followed, and it
+    /// is vindicated by the thing it misexplains.</para>
+    /// <para>The real reason is that only the LAST field of a struct can create a non-prefix count. The
+    /// marker vanishes at <c>k == fieldCount</c> and nowhere else, so that step is the only one that
+    /// refunds; every earlier step costs a separator, a name and a child, which is strictly positive.
+    /// A fixture may therefore contain names far below the refund — one predating fixture has a two-
+    /// character name whose marginal cost is well under it — and still be unable to discriminate, because
+    /// that name is not last. This charges each struct its own last field, with the child that struct
+    /// actually declares, at every depth.</para>
     /// </remarks>
     [Fact]
     public void TheFixturesThatPredateThisPin_CannotReachTheDiscriminatingRegion()
     {
-        // The cheapest field the renderer can emit is the one whose child renders shortest, so charging
-        // every legacy name that child is the most favourable case for discrimination. If even that clears
-        // the refund, no budget can put these fixtures in the region.
-        int cheapestChild = CoercionHelpers
-            .DiagnosticType(IntegerType.Instance, CoercionHelpers.MinDiagnosticTypeLength).Length;
         int refund = 1 + MarkerWidth(1);
 
-        // Read off the generators rather than restated, which is the whole point: a width written down here
-        // is a width that can drift away from the fixture it claims to describe.
-        StructType shaped = ShapedStruct(4, 2);
-        string[] names =
+        // Fixtures are ENUMERATED, never restated: the widths are read off the generators, and the swept
+        // widths are read off the array the sweep itself iterates.
+        List<StructType> fixtures =
         [
-            FieldName(0),
-            .. shaped.Fields.Select(f => f.Name),
-            .. shaped.Fields.Select(f => f.DataType).OfType<StructType>()
-                .SelectMany(inner => inner.Fields).Select(f => f.Name),
-            .. LegacySweptNameLengths.Select(n => new string('f', n)),
+            WideStruct(4),
+            ShapedStruct(6, 3),
+            PayloadSchema(4),
+            .. LegacySweptNameLengths.Select(n => new StructType(
+            [
+                .. Enumerable.Range(0, 3).Select(i => new StructField(
+                    string.Create(CultureInfo.InvariantCulture, $"{i:D2}").PadRight(n, 'f')[..n],
+                    IntegerType.Instance,
+                    true)),
+            ])),
         ];
 
         var reachable = new List<string>();
-        foreach (string name in names.Distinct(StringComparer.Ordinal))
+        int inspected = 0;
+        int tightest = int.MaxValue;
+
+        void Inspect(StructType structType)
         {
-            int marginalCost = 1 + name.Length + 1 + cheapestChild;
+            inspected++;
+            StructField last = structType.Fields[^1];
+
+            // The compact child is taken from the renderer itself rather than modelled here; BoundTypes at
+            // a zero allowance is the one reachable path that returns exactly the summary the struct walk
+            // charges each field.
+            string compact = CoercionHelpers.BoundTypes(0, last.DataType)[0];
+            int marginalCost = 1 + last.Name.Length + 1 + compact.Length;
+            tightest = Math.Min(tightest, marginalCost);
+
             if (marginalCost < refund)
             {
                 reachable.Add(string.Create(
                     CultureInfo.InvariantCulture,
-                    $"'{name}' ({name.Length} chars) has marginal cost {marginalCost}, below the refund "
-                        + $"{refund}"));
+                    $"last field '{last.Name}:{compact}' costs {marginalCost}, below the refund {refund}"));
             }
+
+            foreach (StructType nested in structType.Fields.Select(f => f.DataType).OfType<StructType>())
+            {
+                Inspect(nested);
+            }
+        }
+
+        foreach (StructType fixture in fixtures)
+        {
+            Inspect(fixture);
         }
 
         Assert.True(
             reachable.Count == 0,
             string.Create(
                 CultureInfo.InvariantCulture,
-                $"{reachable.Count} legacy fixture name(s) now reach the discriminating region, so the pin "
-                    + $"above is no longer the only guard that can see it and this remark is stale:\n")
+                $"{reachable.Count} of {inspected} pre-existing struct(s) can now reach the discriminating "
+                    + $"region, so the pin below is no longer the only guard that can see it:\n")
             + string.Join("\n", reachable));
 
+        // Non-vacuity, in the two ways this assertion can quietly stop meaning anything: inspecting nothing,
+        // and inspecting only structs so far above the refund that no plausible edit could cross it. The
+        // tightest pre-existing margin is one character, which is why "well beyond the threshold" was the
+        // wrong description and why the margin is measured instead.
         Assert.True(
-            names.Distinct(StringComparer.Ordinal).Count() > 1,
-            "the generators produced fewer than two distinct names, so this assertion inspected almost "
-                + "nothing — it must enumerate the fixtures, not a sample of them");
+            inspected > 1,
+            "fewer than two structs were inspected, so this assertion covers almost nothing");
+        Assert.True(
+            tightest < refund * 2,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"the tightest pre-existing last-field cost is {tightest}, far above the refund {refund}: "
+                    + $"the fixtures have drifted so far from the boundary that this no longer guards it"));
     }
 
     /// <summary>Distinct leading characters, so names stay unique down to a length of one.</summary>
