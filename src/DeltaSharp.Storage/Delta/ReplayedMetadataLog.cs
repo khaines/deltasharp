@@ -74,30 +74,35 @@ namespace DeltaSharp.Storage.Delta;
 /// boolean-valued ones. The narrower boolean phrasing was this rule's own first defect (council R3, balanced
 /// seat): it is narrower than the audit actually performed, and it would mislead the next person extending
 /// it. The interval bounds, the lineage endpoints, the witness order, <c>cursor</c>'s seed and advance, and
-/// the recorded-version list are all non-boolean and all load-bearing; they were audited separately and
-/// killed (8/71/72/64/74/6/1/74/74/71/74 red), so the narrow rule concealed no gap at this HEAD — but it did
-/// understate its own scope, and</description></item>
+/// the recorded-version list are all non-boolean and all load-bearing; each was audited separately and every
+/// one was killed, so the narrow rule concealed no gap at this HEAD — but it did understate its own scope,
+/// and</description></item>
 /// <item><description>each ORDERING constraint between a state write and a validation call.</description>
 /// </item>
 /// </list>
-/// <para>That rule yields <b>29</b> points: 26 conditions/exits, 2 boolean state writes, 1 ordering
-/// constraint. <b>An earlier draft claimed this was corroborated by the mechanical count of categories 1+2
-/// matching a hand audit's 26. That claim is RETRACTED: the totals agreed over DIFFERENT SETS</b> — the hand
-/// audit's 26 included two state writes this rule assigns to another category. Re-derived at the broadened
-/// scope the same way, the two enumerations again differ (13 non-boolean writes by rule, 11 by hand: the rule
-/// separately counts <c>_sealed = true</c>, already the ordering constraint, and splits <c>cursor</c>'s seed
-/// from its advance; the hand list counts an argument-ORDER mutation that is not a write at all). Two counts
-/// agreeing is not evidence the sets agree, and agreeing totals over different sets is precisely the error
-/// this file has been caught by twice. Compare enumerations SET-WISE or not at all. The rule does, however,
-/// explain the historical misses. Categories 3 and 4 are not <c>if</c> statements, so a
-/// guard-shaped enumeration cannot see them — and those three sites are EXACTLY the three fail-opens found by
-/// review rather than by this file's own audit: the chain-closure <c>ReferenceEquals</c> (write), the
-/// <c>endMetadataAccounted</c> <c>ReferenceEquals</c> (write), and <see cref="Seal"/>'s ordering. The lesson
-/// generalises past this file: an audit that enumerates conditions will systematically miss validation logic
-/// that lives in an assignment.</para>
+/// <para><b>No total is quoted for this rule, deliberately.</b> A count has been wrong in this doc three
+/// times — first as a hand-listed "every guard", then as a spurious corroboration, then as an accounting
+/// carried over from the narrow rule after the rule had been broadened. What is durable is the METHOD; the
+/// number is a derived quantity that goes stale the moment the rule or the file moves, and it has never once
+/// been the thing that caught a defect. Re-derive from the four categories above when you need a set, and
+/// compare SETS rather than totals.</para>
+/// <para><b>Why that instruction is emphatic.</b> An earlier draft claimed the rule was corroborated because
+/// a mechanical count matched a hand audit's total. That was RETRACTED — equal totals over different sets.
+/// The retraction then shipped with a worked example intended to demonstrate set-wise comparison, and THAT
+/// example did not compare set-wise either: it credited a difference the hand list did not have, and its
+/// arithmetic did not close. Both the claim and its correction failed the same way, one level apart. The
+/// mechanism is worth naming, because it is not carelessness: <b>a correction is written at the moment of
+/// greatest confidence, immediately after the insight, which is exactly when its own arithmetic is least
+/// examined</b>. Treat a freshly-written correction as the least-audited text in the file, not the most.</para>
+/// <para>The rule does, however, explain the historical misses. Categories 3 and 4 are not <c>if</c>
+/// statements, so a guard-shaped enumeration cannot see them — and those sites are EXACTLY the fail-opens
+/// found by review rather than by this file's own audit: the chain-closure <c>ReferenceEquals</c> (write),
+/// the <c>endMetadataAccounted</c> <c>ReferenceEquals</c> (write), the chain walk's latching write, and
+/// <see cref="Seal"/>'s ordering. The lesson generalises past this file: an audit that enumerates conditions
+/// will systematically miss validation logic that lives in an assignment.</para>
 ///
-/// <para><b>Result: 27 of the 29 killed; two survivors, both equivalent. No point fails open at this
-/// HEAD.</b> Attribution is stated as
+/// <para><b>Result: every derived point was individually neutered against the full suite. All but three are
+/// killed; no point fails open at this HEAD.</b> Attribution is stated as
 /// two SEPARATE properties, because asserting the stronger one over the whole file was wrong three times:</para>
 /// <list type="bullet">
 /// <item><description><b>Disjoint in identity — the four conjuncts of
@@ -118,10 +123,12 @@ namespace DeltaSharp.Storage.Delta;
 /// </list>
 ///
 /// <para><b>The survivors, classified — and the classification matters more than the count.</b> Two are
-/// genuinely equivalent, and both survive PAIRED treatment as well as single-point (council R5, quality
-/// seat, sweeping HasCoverage and Seal's early return against each other and against the loop guards: no real
-/// red). A third was classified twice, wrongly and in the benign direction both times, before being pinned —
-/// see the entry below and the warning that follows it.</para>
+/// genuinely equivalent, and both survive PAIRED treatment as well as single-point: council R5 swept the
+/// complete survivor lattice — every single, pair and triple over the four then-surviving points — and
+/// <c>!HasCoverage</c> and <see cref="Seal"/>'s early return stayed 0-red in every combination excluding
+/// themselves. That sweep was measured BEFORE the chain walk's write was pinned, so it was re-checked at this
+/// HEAD rather than carried across trees: both are still 0-red here, and the write is now killed. Citing a
+/// measurement taken on a different tree is the same error as comparing totals over different sets.</para>
 /// <list type="number">
 /// <item><description><b>Execution-falsified equivalent (1).</b> The <c>!HasCoverage</c> disjunct in
 /// <see cref="TryGetProvenObservation"/>: with no coverage the interval is <c>[0, 0)</c>, so the bounds
