@@ -555,7 +555,12 @@ public sealed class AnalysisExceptionTypeRenderTests
                         () => ConstraintExpressionFrontend.ParseResolveWithInput(
                             "payload.nosuchfield > 0", schema));
 
-                    if (ex.Message.Contains('\u2026', StringComparison.Ordinal) && depth > 1)
+                    // The observable is the overflow MARKER, not the bare elision glyph. The glyph also
+                    // appears when a single over-long name is truncated in place, which is a different
+                    // event from a field being dropped; counting it would let this guard be satisfied by
+                    // something its own failure message does not describe. The two happen to coincide on
+                    // this corpus today, which is exactly why the looser one would never have been noticed.
+                    if (depth > 1 && Regex.IsMatch(ex.Message, @"\(\+\d+ more\)"))
                     {
                         elidedBelowTheTop++;
                     }

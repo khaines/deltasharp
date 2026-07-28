@@ -741,6 +741,14 @@ public sealed class AnalysisExceptionCandidateListingTests
     /// <c>TableOrViewNotFound</c> by a different route. An off-by-one in the marker was 9 rows RED and none
     /// of them was this factory: its list is types, not candidates, so no count-checking assertion in the
     /// file could see it, while its message legitimately reaches a count of several hundred.</para>
+    /// <para><b>Presence is inspectable; correctness is only mutable.</b> Two reviewers reached opposite
+    /// verdicts on this same file at the same commit, and the reason is method rather than care: one
+    /// measured how many cells carry a count, saw that they do, and concluded the invariant was covered;
+    /// the other changed the count and asked which tests died. Only the second can distinguish invariant 1
+    /// from invariant 2, because a count that is present is visible to inspection while a count that is
+    /// correct is visible only to a mutation. Any claim of the form "this is covered" that was reached by
+    /// counting rather than by killing is unverified — the second time in this change that a coverage claim
+    /// failed exactly there.</para>
     /// <para>How it went unnoticed is the part worth keeping: a comment discharged those rows by CITING two
     /// tests, and the citation was written without mapping either one's call sites. Both cited tests turn
     /// out to be scoped — one by its callers' factories, the other by an <c>OfType&lt;string[]&gt;</c> gate
