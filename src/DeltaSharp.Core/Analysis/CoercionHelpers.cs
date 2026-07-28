@@ -304,6 +304,20 @@ internal static class CoercionHelpers
                     // Pass 2 fixes HOW MUCH DETAIL. The count is now settled, so each child in turn may expand
                     // into whatever is left after reserving the minimum for the fields that follow it. Nothing a
                     // child does can cost a later field its name, which is what the greedy walk got wrong.
+                    //
+                    // What pins the shape, stated as BOTH a measured count and the complete list of what
+                    // dies, because either alone is silently wrong in a different direction: a count has to
+                    // be retuned whenever coverage legitimately grows, and every drift then looks like a
+                    // regression, while an under-enumerated name list fails loudly when a name is WRONG and
+                    // silently when one is MISSING. Restoring the stop-at-first-fit walk is 32 failing rows
+                    // across 5 methods, identical on net8.0 and net10.0:
+                    // TypeBudget_IsSpentBeforeAnyFieldIsElided (28 of the 32 rows),
+                    // NestedPayloads_SpendTheirBudget_BeforeAnyFieldIsElided,
+                    // NoFieldIsElided_WhileTheBudgetCouldStillHavePaidForIt,
+                    // RealisticFieldNames_SurviveTheFieldNameCeilingVerbatim and
+                    // AMapWithACheapValue_SpendsTheSlackOnItsKey. Rows against methods is what makes the
+                    // pair checkable rather than merely redundant: 32 and 5 disagree loudly if either is
+                    // stale, which a lone figure of either kind cannot.
                     int fieldCount = structType.Count;
                     string[] fieldNames = new string[fieldCount];
                     string[] compactChildren = new string[fieldCount];
