@@ -316,7 +316,7 @@ public sealed class ParquetWriterTests
     /// corpus that pins it. Two rogues in a row exploited exactly that -- one correct in names and
     /// wrong in metadata, one correct at depth 0 and wrong at depth 1.
     /// </summary>
-    internal const string EveryEscapeForm = "e\\\t\n\r\b\f\u00E9\"z";
+    internal const string EveryEscapeForm = "e\\\t\n\r\b\f\u00E9\"z\U0001F389";
 
     /// <summary>Footer bytes for the metadata corpus; shared with the encoding guard.</summary>
     private const string MetadataFooterGolden =
@@ -329,9 +329,9 @@ public sealed class ParquetWriterTests
             "\"delta.columnMapping.id\":12,\"delta.columnMapping.physicalName\":\"col-12\"," +
             "\"flag\":true,\"obj\":{\"deep\":{\"leaf\":\"x\"},\"inner\":9},\"ratio\":0.5}}," +
             "{\"name\":\"third\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}," +
-            "{\"name\":\"fourth\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\":\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\"}}," +
+            "{\"name\":\"fourth\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\\uD83C\\uDF89\":\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\\uD83C\\uDF89\"}}," +
         "{\"name\":\"fifth\",\"type\":\"long\",\"nullable\":true,\"metadata\":{\"bigid\":3000000000,\"maxlong\":9223372036854775807,\"minlong\":-9223372036854775808,\"negwhole\":-42.0,\"tiny\":1E-300,\"whole\":1.0}}," +
-            "{\"name\":\"sixth\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"darr\":[\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\"],\"dobj\":{\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\":\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\"}}}]}";
+            "{\"name\":\"sixth\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"darr\":[\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\\uD83C\\uDF89\"],\"dobj\":{\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\\uD83C\\uDF89\":\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\\uD83C\\uDF89\"}}}]}";
 
     [Fact]
     public async Task WrittenFooter_PinsFieldMetadata_IncludingUnquotedColumnMappingIds()
@@ -670,7 +670,9 @@ public sealed class ParquetWriterTests
             codepoints.Add(c);
         }
 
-        codepoints.AddRange([0x00A0, 0x00E9, 0x2028, 0x2029, 0x4E2D, 0xFFFD]);
+        // Includes ASTRAL codepoints: without one the probe never emits "\u(astral pair)" and
+        // the surrogate-pair path drops out of the required set entirely.
+        codepoints.AddRange([0x00A0, 0x00E9, 0x2028, 0x2029, 0x4E2D, 0xFFFD, 0x1F389, 0x1F600]);
 
         foreach (int codepoint in codepoints)
         {
@@ -700,9 +702,32 @@ public sealed class ParquetWriterTests
                 continue;
             }
 
-            // Collapse \uXXXX to its family; the specific codepoints are pinned by the goldens.
-            forms.Add(encoded[i + 1] == 'u' ? "\\u" : encoded.Substring(i, 2));
-            i++;
+            if (encoded[i + 1] != 'u')
+            {
+                forms.Add(encoded.Substring(i, 2));
+                i++;
+                continue;
+            }
+
+            // \uXXXX. BMP and ASTRAL must stay DISTINGUISHABLE. An earlier version collapsed both
+            // to a single "\u" family token, which made a corpus containing only \u00E9 satisfy the
+            // requirement for astral -- and an astral codepoint is emitted as a surrogate PAIR, two
+            // \u escapes for one character, which is a materially different encoding path. A rogue
+            // emitting astral characters raw was byte-exact for every corpus row that used only BMP.
+            int code = int.Parse(
+                encoded.AsSpan(i + 2, 4),
+                System.Globalization.NumberStyles.HexNumber,
+                System.Globalization.CultureInfo.InvariantCulture);
+            if (char.IsHighSurrogate((char)code))
+            {
+                forms.Add("\\u(astral pair)");
+                i += 11;
+            }
+            else
+            {
+                forms.Add("\\u(bmp)");
+                i += 5;
+            }
         }
 
         return forms;
