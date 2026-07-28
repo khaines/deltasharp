@@ -969,9 +969,18 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// borrows nothing from the renderer. The assertion is EQUALITY, not a bound: a count too small is the
     /// defect, and a count too large would mean the model is optimistic and the test itself unsound. It
     /// holds on every one of the cells below.</para>
+    /// <para><b>Why the scan is over every k and not over shown + 1.</b> A reviewer building this same
+    /// oracle independently reported clean on its first attempt, because it asked only whether ONE more
+    /// field would have fitted. The marker vanishes outright at k == fieldCount, so the smallest count
+    /// that beats the rendered one can be two or more above it, and an oracle that steps once from the
+    /// renderer's own answer is anchored to that answer. This one never looks at the rendered count until
+    /// it has computed the whole feasible set, which is the only reason it is not just the renderer asking
+    /// itself for a second opinion.</para>
     /// <para><b>The cardinalities are not decorative either.</b> Six four-character fields at budget 61 is
     /// the witness two seats reported independently: the complete render is exactly 61 characters and the
-    /// forward walk shows four of them. It is a cell of this sweep rather than a row of its own, because a
+    /// forward walk shows four of them. A third seat's witness — three five-character fields at budget 37,
+    /// whose complete render is exactly the budget and which the forward walk renders as one field — is a
+    /// cell of this sweep for the same reason. It is a cell of this sweep rather than a row of its own, because a
     /// reported witness pinned as a literal only ever guards the cell it was reported at.</para>
     /// </summary>
     [Fact]

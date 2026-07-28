@@ -332,12 +332,20 @@ internal static class CoercionHelpers
                     // "budget - builder.Length - trailing" — is 2 rows on each TFM, 2 methods: that test and
                     // TheStructRender_IsMonotoneAndFullySpent_AcrossBudgetWidthAndChildShape.
                     //
-                    // A third figure used to stand here — 32 rows across 5 methods for "restoring the
-                    // stop-at-first-fit walk" — and it is deleted rather than re-measured, because the edit
-                    // it names cannot be applied to this file: round 15 replaced that walk, so a reader has
-                    // no way to re-derive the number, and a figure nobody can reproduce is a figure nobody
-                    // can falsify. A mutation claim is only worth writing down if it is an edit to the code
-                    // as it now stands. Both surviving figures are.
+                    // A third figure used to stand here, for "restoring the stop-at-first-fit walk", and it
+                    // was deleted rather than re-measured. Round 15 replaced that walk, so the edit it names
+                    // cannot be applied to this file and a reader has no way to re-derive the number.
+                    //
+                    // That is not a quibble about staleness. A reviewer who went looking measured the
+                    // boundary two ways — the literal reading of the sentence, and a maximal revert of the
+                    // whole struct case — and got two different answers, neither the figure quoted. An
+                    // unnameable boundary cannot be mismeasured, only unmeasurable. Its count and its name
+                    // list had also drifted TOGETHER, because whoever wrote them took both from the same
+                    // wrong run: pairing a count with names detects a stale half, not a stale pair.
+                    //
+                    // So a mutation claim is worth writing down only if it names an edit to the code as it
+                    // now stands, precisely enough that two people get the same number. Both surviving
+                    // figures do, and both are re-derived above.
                     int fieldCount = structType.Count;
                     string[] fieldNames = new string[fieldCount];
                     string[] compactChildren = new string[fieldCount];
