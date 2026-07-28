@@ -53,8 +53,10 @@ internal static class ExpressionCoercion
         {
             throw AnalysisException.DataTypeMismatch(
                 CoercionHelpers.DiagnosticReference(arithmetic),
-                $"the '{arithmetic.NodeName}' operator requires numeric operands but got "
-                + $"'{CoercionHelpers.DiagnosticType(leftType)}' and '{CoercionHelpers.DiagnosticType(rightType)}'.");
+                t => $"the '{arithmetic.NodeName}' operator requires numeric operands but got "
+                    + $"'{t[0]}' and '{t[1]}'.",
+                leftType,
+                rightType);
         }
 
         Expression left = CoercionHelpers.CastIfNeeded(arithmetic.Left, c.LeftTarget);
@@ -76,8 +78,10 @@ internal static class ExpressionCoercion
         {
             throw AnalysisException.DataTypeMismatch(
                 CoercionHelpers.DiagnosticReference(comparison),
-                $"the '{comparison.NodeName}' operator requires comparable operand types but got "
-                + $"'{CoercionHelpers.DiagnosticType(leftType)}' and '{CoercionHelpers.DiagnosticType(rightType)}'.");
+                t => $"the '{comparison.NodeName}' operator requires comparable operand types but got "
+                    + $"'{t[0]}' and '{t[1]}'.",
+                leftType,
+                rightType);
         }
 
         Expression left = CoercionHelpers.CastIfNeeded(comparison.Left, common);
@@ -176,7 +180,9 @@ internal static class ExpressionCoercion
             null => operand,
             _ => throw AnalysisException.DataTypeMismatch(
                 CoercionHelpers.DiagnosticReference(operand),
-                $"a '{context}' operand must be boolean but got '{CoercionHelpers.DiagnosticType(operand.Type)}'."),
+                t => $"a '{context}' operand must be boolean but got "
+                    + $"'{(operand.Type is null ? "unknown" : t[0])}'.",
+                operand.Type is null ? [] : [operand.Type]),
         };
     }
 

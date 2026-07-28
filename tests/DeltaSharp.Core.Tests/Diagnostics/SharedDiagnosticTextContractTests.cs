@@ -124,4 +124,59 @@ public sealed class SharedDiagnosticTextContractTests
 
         return false;
     }
+    /// <summary>
+    /// #687 council round 10 (Balanced BLOCKING 2) — the <b>last-item reserve exemption</b> in
+    /// <c>SanitizeToBudget</c>, which was the one piece of this round's budget-filling design that nothing
+    /// asserted.
+    /// <para>The renderer refuses an item unless it <i>and</i> a worst-case <c>… (+N more)</c> suffix still
+    /// fit — except for the final item, which needs no such room because taking it leaves no remainder to
+    /// report. That exemption is precisely what allows the budget to be spent to the last character. Deleting
+    /// it (<c>needed = reserve</c> unconditionally) was measured at <b>0 RED across 1,291 tests</b> while
+    /// being provably non-equivalent, so the comment stating the property was an unasserted claim about this
+    /// round's own invariant.</para>
+    /// <para>The oracle is the exemption's exact boundary and needs no constant: a collection whose full
+    /// render is <i>exactly</i> the budget must render in full with no marker, because only the exemption can
+    /// make the last item fit. One character less must elide and report the count. Sweeping both sides of
+    /// that boundary is what a corpus sampling round numbers cannot do.</para>
+    /// </summary>
+    [Theory]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(5)]
+    [InlineData(12)]
+    [InlineData(40)]
+    public void LastItemReserveExemption_LetsAnExactlyFittingListingSpendItsWholeBudget(int count)
+    {
+        // Items must be long enough that the SECOND-TO-LAST one still clears the reserve — only then is the
+        // final item's admission attributable to the exemption rather than to slack. Below that the listing
+        // elides for an unrelated reason and the row would be vacuous, which is the trap this whole PR keeps
+        // re-learning: a corpus that cannot reach the condition cannot test it.
+        foreach (int itemLength in new[] { 12, 18, 33, 64 })
+        {
+            string[] items = [.. Enumerable.Range(0, count).Select(i =>
+                string.Create(CultureInfo.InvariantCulture, $"{i:D2}").PadRight(itemLength, 'x'))];
+            int exact = (count * itemLength) + ((count - 1) * ", ".Length);
+
+            string full = SharedDiagnosticText.SanitizeToBudget(items, exact, 1, itemLength);
+            Assert.True(
+                full.Length == exact,
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"count={count} itemLength={itemLength} budget={exact} rendered {full.Length}: the "
+                        + $"last-item reserve exemption is gone, so an exactly-fitting listing now elides "
+                        + $"and under-spends its budget — {full}"));
+            Assert.DoesNotContain('\u2026', full);
+            foreach (string item in items)
+            {
+                Assert.Contains(item, full, StringComparison.Ordinal);
+            }
+
+            // One character short: the listing must elide AND say by how much. Without the count this would
+            // be the silent-truncation defect the whole round exists to prevent.
+            string tight = SharedDiagnosticText.SanitizeToBudget(items, exact - 1, 1, itemLength);
+            Assert.Contains(" more)", tight, StringComparison.Ordinal);
+            Assert.NotEqual(full, tight);
+        }
+    }
+
 }

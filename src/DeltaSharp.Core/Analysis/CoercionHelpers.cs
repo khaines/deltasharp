@@ -1,4 +1,6 @@
+using System;
 using System.Globalization;
+using System.Linq;
 using System.Text;
 using DeltaSharp.Diagnostics;
 using DeltaSharp.Plans.Expressions;
@@ -10,7 +12,7 @@ namespace DeltaSharp.Analysis;
 /// Small shared helpers for the analyzer's binding + type-coercion pass (STORY-04.5.2 / #171): the
 /// "cast-unless-already-that-type" widening and the pretty (ExprId-free) reference renderer used both
 /// to auto-name functions in output position and to name the offending reference in a
-/// <see cref="AnalysisException.DataTypeMismatch"/> diagnostic. Centralizing them keeps the two
+/// <see cref="AnalysisException.DataTypeMismatch(string, string)"/> diagnostic. Centralizing them keeps the two
 /// coercion entry points (<see cref="ExpressionCoercion"/>, <see cref="FunctionRegistry"/>) and the
 /// diagnostic call sites in agreement (one DRY source for each concern).
 /// </summary>
@@ -127,21 +129,80 @@ internal static class CoercionHelpers
         DiagnosticText.Sanitize(PrettyReference(expression), DiagnosticReferenceMaxLength);
 
     /// <summary>
-    /// The budget for a type rendered into the <em>detail</em> of a single-type diagnostic
-    /// (<c>Analyzer.ExtractStructField</c>, <see cref="ExpressionCoercion"/>). Sized to show an ordinary
-    /// nested payload struct with its field names intact while leaving room for the surrounding prose,
-    /// the reference and the field name inside <see cref="AnalysisException.MaxMessageLength"/>.
+    /// Bounds a message's type slots by the space that message actually has left, spending the budget
+    /// max-min fair so a narrow type hands its remainder to a wide one.
     /// </summary>
-    internal const int DiagnosticTypeMaxLength = 320;
+    /// <remarks>
+    /// <para>
+    /// The common case is bounded by nothing at all: if every type's natural render fits in the available
+    /// space, all of them are returned untouched. Only when they genuinely do not fit is anything cut, and
+    /// then the shortest is served first so that a <c>struct&lt;…&gt;</c> beside an <c>int</c> gets nearly
+    /// the whole budget rather than half of it.
+    /// </para>
+    /// <para>
+    /// When there is not even room for the compact summaries there is <b>no floor</b> — every slot collapses
+    /// to <see cref="SummarizeType"/>, which is short, bounded by construction and still carries its field
+    /// count. Granting a floor larger than the space available is what turns "no room left" into "overflow
+    /// the cap", and overflowing the cap is what feeds the listing's own count to the backstop.
+    /// </para>
+    /// </remarks>
+    /// <param name="available">Characters the message has left for all of its type slots together.</param>
+    /// <param name="types">The types to render, in the order the message interpolates them.</param>
+    internal static string[] BoundTypes(int available, params DataType[] types)
+    {
+        ArgumentNullException.ThrowIfNull(types);
+        if (types.Length == 0)
+        {
+            return [];
+        }
+
+        if (available < types.Length * MinDiagnosticTypeLength)
+        {
+            return [.. types.Select(t => SummarizeType(t, MinDiagnosticTypeLength))];
+        }
+
+        string[] natural = [.. types.Select(t => DiagnosticType(t, available))];
+
+        // Fast path only, and PROVABLY equivalent to the loop below rather than a behavioural branch: the
+        // loop serves shortest-first, so when everything fits, each type's natural render is at or under the
+        // running average and is therefore kept whole anyway. Removing it is 0 RED, and that is the correct
+        // result for an equivalent mutant — recorded here so it is not re-filed as an unpinned branch.
+        if (natural.Sum(r => r.Length) <= available)
+        {
+            return natural;
+        }
+
+        var bounded = new string[types.Length];
+        int[] shortestFirst = [.. Enumerable.Range(0, types.Length).OrderBy(i => natural[i].Length)];
+        int remaining = available;
+
+        for (int n = 0; n < shortestFirst.Length; n++)
+        {
+            int i = shortestFirst[n];
+            int share = Math.Max(MinDiagnosticTypeLength, remaining / (shortestFirst.Length - n));
+            bounded[i] = natural[i].Length <= share ? natural[i] : DiagnosticType(types[i], share);
+            remaining = Math.Max(0, remaining - bounded[i].Length);
+        }
+
+        return bounded;
+    }
 
     /// <summary>The smallest budget <see cref="DiagnosticType"/> accepts: the widest possible compact
     /// summary (<c>struct&lt;(2147483647 fields)&gt;</c>, 27 characters) must fit, or the hard
     /// length guarantee could not be honoured without cutting the count off the end.</summary>
     private const int MinDiagnosticTypeLength = 32;
 
-    /// <summary>Per-field-name cap inside a rendered type. Field names are user-authored (a hostile
-    /// <c>_delta_log</c> schema) and otherwise unbounded.</summary>
-    private const int MaxEchoedFieldNameLength = 32;
+    /// <summary>Ceiling on one field name inside a rendered type, so a single pathological name cannot
+    /// consume the whole render. Field names are user-authored (a hostile <c>_delta_log</c> schema) and
+    /// otherwise unbounded.</summary>
+    private const int MaxEchoedFieldNameLength = 128;
+
+    // A field-name FLOOR used to sit here. It is gone: a floor on a name can only matter once the render is
+    // nearly full, and at that point the fit check below refuses the field anyway, so the floor changed
+    // nothing that was observable — lowering it 16 -> 4 was 0 RED, and correctly so. A constant that cannot
+    // be observed is a constant that will be defended in review without evidence, so it is better deleted
+    // than justified. The allowance now floors at 0, where Sanitize yields a bare elision mark and the fit
+    // check ends the walk.
 
     /// <summary>Nesting depth past which a composite renders as its compact summary. Bounds the render
     /// of a pathologically deep type (<c>array&lt;array&lt;…&gt;&gt;</c>) that carries no fields at all
@@ -173,7 +234,7 @@ internal static class CoercionHelpers
     /// that is the property, not the exact shape.
     /// </para>
     /// </remarks>
-    internal static string DiagnosticType(DataType type, int maxLength = DiagnosticTypeMaxLength)
+    internal static string DiagnosticType(DataType type, int maxLength)
     {
         ArgumentNullException.ThrowIfNull(type);
         ArgumentOutOfRangeException.ThrowIfLessThan(maxLength, MinDiagnosticTypeLength);
@@ -220,7 +281,17 @@ internal static class CoercionHelpers
                 int shown = 0;
                 for (int i = 0; i < structType.Count; i++)
                 {
-                    string name = DiagnosticText.Sanitize(structType[i].Name, MaxEchoedFieldNameLength);
+                    // As much as the render still has, capped so ONE name cannot consume it all. Note what
+                    // this deliberately does NOT do: divide the budget by the field count. Dividing makes a
+                    // wide struct cut every name to fit them all in, which is the common case paying for the
+                    // pathological one — and it is unnecessary, because the fit check below already stops the
+                    // walk when the budget is spent and the (+N more) count reports the remainder. Width is
+                    // handled by the count; the cap exists only for a single oversized name.
+                    // The floor cannot overflow the budget: a name rendered at the floor still has to pass
+                    // the fit check, which is what ends the loop.
+                    int allowance = Math.Clamp(
+                        budget - builder.Length - SuffixReserve, 0, MaxEchoedFieldNameLength);
+                    string name = DiagnosticText.Sanitize(structType[i].Name, allowance);
                     string child = RenderBounded(structType[i].DataType, budget, depth + 1);
                     string piece = string.Create(
                         CultureInfo.InvariantCulture,

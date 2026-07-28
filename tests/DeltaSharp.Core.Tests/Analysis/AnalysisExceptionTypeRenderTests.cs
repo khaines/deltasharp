@@ -307,4 +307,119 @@ public sealed class AnalysisExceptionTypeRenderTests
         yield return deep;
         yield return IntegerType.Instance;
     }
+    /// <summary>
+    /// #687 council round 10 (Balanced BLOCKING 1) — the type-render analogue of
+    /// <c>ListingBudget_IsSpentBeforeAnythingIsElided</c>, which is the one test shape that has actually
+    /// caught this family.
+    /// <para>The listing constants were replaced by a derivation two rounds ago, but types kept a hand-picked
+    /// <c>DiagnosticTypeMaxLength = 320</c> shared by the one-slot and two-slot sites. It elided an ordinary
+    /// nested payload struct at <b>13 fields</b> — 359 characters rendered against a 1024-character message,
+    /// two thirds of the budget unspent — while claiming in its own doc to show such a struct intact. It was
+    /// also unpinned: cutting it to 64, which elides a <em>two</em>-field struct, was 0 RED across the suite.
+    /// That is the same vacuity the listing corpus had, one family over, and it landed because this file
+    /// asserted backstop, count, width and hostile-input properties but never <b>utilisation</b>.</para>
+    /// <para>The property needs no constant: either nothing was elided and every field name is present, or
+    /// something was elided and one more field at this schema's own name length would not have fit. Sweeping
+    /// widths continuously is the part that matters — a corpus sampling 60 and 400 cannot see a bound that
+    /// bites at 13.</para>
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(ContinuousFieldWidths))]
+    public void TypeBudget_IsSpentBeforeAnyFieldIsElided(int fields)
+    {
+        string message = MessageFor("payload.typo > 0", fields);
+
+        if (!message.Contains('\u2026'))
+        {
+            for (int i = 0; i < fields; i++)
+            {
+                Assert.Contains(FieldName(i), message, StringComparison.Ordinal);
+            }
+
+            return;
+        }
+
+        // Elided: prove it was necessary rather than merely permitted. "int" is the narrowest field this
+        // schema produces, so if even that would still have fitted, the budget was left unspent.
+        int narrowest = FieldName(0).Length + ":string,".Length;
+        Assert.True(
+            message.Length + narrowest > AnalysisException.MaxMessageLength,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"{fields} fields elided at {message.Length} chars with room for another {narrowest} under "
+                    + $"the {AnalysisException.MaxMessageLength} cap — the type budget is not being spent"));
+    }
+
+    /// <summary>Every width from 1 to 60. The bound that shipped bit at 13, between the two widths this file
+    /// previously sampled.</summary>
+    public static TheoryData<int> ContinuousFieldWidths()
+    {
+        var data = new TheoryData<int>();
+        for (int fields = 1; fields <= 60; fields++)
+        {
+            data.Add(fields);
+        }
+
+        return data;
+    }
+
+    /// <summary>
+    /// The field-name bound must not cut a REAL field name, and the corpus must be able to tell.
+    /// <para>A flat cap of 32 stood inside the type renderer — the same number four seats rejected for
+    /// candidate names — while every field in this file's fixture is 24 characters, so no row could reach it.
+    /// Restoring the 32 was measured at <b>0 RED across the whole suite</b>. That is the vacuity pattern this
+    /// PR has now hit five times: a corpus whose items are all shorter than the bound cannot test the bound.
+    /// </para>
+    /// <para>These names are real-world lengths (35 and 43). The first must survive verbatim; the point of
+    /// the ceiling is to stop ONE pathological name consuming the render, not to trim ordinary schemas.</para>
+    /// </summary>
+    [Fact]
+    public void RealisticFieldNames_SurviveTheFieldNameCeilingVerbatim()
+    {
+        const string Long = "customer_lifetime_value_rolling_90d";
+        const string Longer = "net_revenue_retention_trailing_twelve_mths";
+        var payload = new StructType(
+        [
+            new StructField(Long, StringType.Instance, true),
+            new StructField(Longer, StringType.Instance, true),
+        ]);
+        var schema = new StructType(
+        [
+            new StructField("payload", payload, true),
+            new StructField("other", IntegerType.Instance, true),
+        ]);
+
+        Exception ex = Assert.ThrowsAny<Exception>(
+            () => ConstraintExpressionFrontend.ParseResolveWithInput("payload.typo > 0", schema));
+
+        Assert.Contains(Long, ex.Message, StringComparison.Ordinal);
+        Assert.Contains(Longer, ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain('\u2026', ex.Message);
+    }
+
+    /// <summary>
+    /// The ceiling is nevertheless load-bearing: a single pathological name must not be able to consume the
+    /// render and starve every sibling field. Bounded, and the count still reports what was dropped.
+    /// </summary>
+    [Fact]
+    public void OnePathologicalFieldName_CannotStarveItsSiblings()
+    {
+        var payload = new StructType(
+        [
+            new StructField(new string('z', 5_000), StringType.Instance, true),
+            .. Enumerable.Range(0, 8).Select(i => new StructField(FieldName(i), StringType.Instance, true)),
+        ]);
+        var schema = new StructType(
+        [
+            new StructField("payload", payload, true),
+            new StructField("other", IntegerType.Instance, true),
+        ]);
+
+        Exception ex = Assert.ThrowsAny<Exception>(
+            () => ConstraintExpressionFrontend.ParseResolveWithInput("payload.typo > 0", schema));
+
+        Assert.True(ex.Message.Length <= AnalysisException.MaxMessageLength, ex.Message);
+        Assert.Contains(FieldName(0), ex.Message, StringComparison.Ordinal);
+    }
+
 }

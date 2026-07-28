@@ -165,7 +165,7 @@ internal sealed class AnalysisException : Exception
     /// <para>
     /// <b>The factories are not the whole class.</b> A second family composes its text in the analyzer
     /// (<c>Analyzer.ExtractStructField</c>, <c>ExpressionCoercion</c>) and hands it to
-    /// <see cref="DataTypeMismatch"/> / <see cref="UnresolvedStructField"/> as an opaque <c>detail</c>
+    /// <see cref="DataTypeMismatch(string, string)"/> / <see cref="UnresolvedStructField(string, string, string?)"/> as an opaque <c>detail</c>
     /// string, so no factory-ranging test can see it. Those sites interpolated a <see cref="DataType"/>,
     /// and a type render is itself a <em>recursive collection</em> — <c>struct&lt;f1:int,…&gt;</c> over
     /// user-authored field names — so an ordinary 60-field nested payload struct was cut by this cap with a
@@ -250,9 +250,34 @@ internal sealed class AnalysisException : Exception
     /// <summary>
     /// Variant for a caller that composes a <c>detail</c> string rather than a whole message
     /// (<see cref="ExpressionCoercion"/>). The wrapping factory's own prose is not visible there, so its
-    /// worst case — a <see cref="DataTypeMismatch"/> reference at its full budget plus fixed prose — is
+    /// worst case — a <see cref="DataTypeMismatch(string, string)"/> reference at its full budget plus fixed prose — is
     /// reserved up front.
     /// </summary>
+    /// <summary>
+    /// Composes a <c>detail</c> string whose TYPE slots are bounded by the space the finished message will
+    /// actually have left, rather than by a constant.
+    /// </summary>
+    /// <remarks>
+    /// The listing sibling of this helper measures the prose by composing it once with an empty listing; this
+    /// does the same with empty type slots, so the free tokens a detail interpolates — a field name, a
+    /// rendered reference, an operator context — are <b>measured</b> rather than estimated. Only the wrapping
+    /// factory's own prose has to be reserved, because that is the one part not visible from here.
+    /// </remarks>
+    /// <param name="compose">Builds the detail from one rendered string per type slot.</param>
+    /// <param name="types">The types to render, in the order <paramref name="compose"/> interpolates them.</param>
+    /// <param name="wrap">Wraps a finished detail in the calling factory's own prose.</param>
+    private static string ComposeDetailWithTypes(
+        Func<string[], string> compose, DataType[] types, Func<string, string> wrap)
+    {
+        ArgumentNullException.ThrowIfNull(compose);
+        ArgumentNullException.ThrowIfNull(types);
+
+        // Two passes, and BOTH layers are measured: the detail with empty type slots, then the factory's own
+        // prose around it. Nothing here is estimated, so the types get every character the message can spare.
+        string[] empty = [.. types.Select(_ => string.Empty)];
+        return compose(CoercionHelpers.BoundTypes(MaxMessageLength - wrap(compose(empty)).Length, types));
+    }
+
     internal static string ComposeDetailWithListing<T>(
         Func<string, string> compose, IReadOnlyList<T> items, Func<T, int, string> render) =>
         ComposeWithListing(
@@ -654,12 +679,31 @@ internal sealed class AnalysisException : Exception
         ArgumentNullException.ThrowIfNull(reference);
         ArgumentNullException.ThrowIfNull(detail);
         return new AnalysisException(
-            $"cannot resolve '{DiagnosticText.Sanitize(reference, CoercionHelpers.DiagnosticReferenceMaxLength)}' "
-            + $"due to data type mismatch: {detail}",
+            DataTypeMismatchMessage(reference, detail),
             AnalysisErrorKind.DataTypeMismatch,
             reference,
             Array.Empty<string>());
     }
+
+    private static string DataTypeMismatchMessage(string reference, string detail) =>
+        $"cannot resolve '{DiagnosticText.Sanitize(reference, CoercionHelpers.DiagnosticReferenceMaxLength)}' "
+        + $"due to data type mismatch: {detail}";
+
+    /// <summary>
+    /// <see cref="DataTypeMismatch(string, string)"/> for a detail containing TYPE slots, sized against this
+    /// factory's own composed prose rather than against a reserve.
+    /// </summary>
+    /// <remarks>
+    /// The detail cannot see the wrapping prose, so an earlier revision had the detail-side helper reserve a
+    /// worst case for it — the full 256-character reference cap plus slack. That is an estimate, and it was
+    /// wrong in the ordinary direction: for a short reference like <c>payload.typo</c> it over-reserved by
+    /// roughly 300 characters, and <c>TypeBudget_IsSpentBeforeAnyFieldIsElided</c> caught the render eliding
+    /// at 723 of 1024. Composing here instead <b>measures</b> the prose, which is the same correction this
+    /// PR already applied to listings; a reserve is a constant wearing a different hat.
+    /// </remarks>
+    internal static AnalysisException DataTypeMismatch(
+        string reference, Func<string[], string> detail, params DataType[] types) =>
+        DataTypeMismatch(reference, ComposeDetailWithTypes(detail, types, d => DataTypeMismatchMessage(reference, d)));
 
     /// <summary>Builds an <see cref="AnalysisErrorKind.UnresolvedStructField"/> failure: a nested field
     /// reference (<paramref name="reference"/>, e.g. <c>s.f</c>) could not be resolved because its base is
@@ -672,12 +716,30 @@ internal sealed class AnalysisException : Exception
         ArgumentNullException.ThrowIfNull(reference);
         ArgumentNullException.ThrowIfNull(detail);
         return new AnalysisException(
-            $"cannot resolve '{DiagnosticText.Sanitize(reference, CoercionHelpers.DiagnosticReferenceMaxLength)}': {detail}",
+            UnresolvedStructFieldMessage(reference, detail),
             AnalysisErrorKind.UnresolvedStructField,
             reference,
             Array.Empty<string>(),
             rootColumn);
     }
+
+    private static string UnresolvedStructFieldMessage(string reference, string detail) =>
+        $"cannot resolve '{DiagnosticText.Sanitize(reference, CoercionHelpers.DiagnosticReferenceMaxLength)}': {detail}";
+
+    /// <summary>
+    /// <see cref="UnresolvedStructField(string, string, string?)"/> for a detail containing TYPE slots, sized
+    /// against this factory's own composed prose. See <see cref="DataTypeMismatch(string, Func{string[], string}, DataType[])"/>
+    /// for why this is measured here rather than reserved by the caller.
+    /// </summary>
+    internal static AnalysisException UnresolvedStructField(
+        string reference,
+        Func<string[], string> detail,
+        DataType[] types,
+        string? rootColumn = null) =>
+        UnresolvedStructField(
+            reference,
+            ComposeDetailWithTypes(detail, types, d => UnresolvedStructFieldMessage(reference, d)),
+            rootColumn);
 
     /// <summary>Builds an <see cref="AnalysisErrorKind.MisplacedAggregate"/> failure for an aggregate
     /// function used outside a valid aggregate context.</summary>
