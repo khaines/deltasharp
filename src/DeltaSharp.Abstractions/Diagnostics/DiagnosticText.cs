@@ -263,8 +263,24 @@ internal static class DiagnosticText
         // budget all along: at 107 seven-character names it elided two of them at 1015 characters when the
         // full listing renders in 1020. Discarding a user's own column names with budget to spare is worse
         // than the unbounded original this bound replaced — the exact disqualifier this design is built on.
-        // The reserve itself stays: deleting it is 10 RED, because it is what keeps the count from being cut
-        // once the listing genuinely does not fit. It is only wrong to charge it when nothing will overflow.
+        // The reserve itself stays: it is what keeps the count from being cut once the listing genuinely does
+        // not fit, and it is only wrong to charge it when nothing will overflow. Setting `reserve` to 0
+        // breaks EveryListComposingFactory_StaysUnderTheBackstop, EveryListComposingFactory_ReportsAnOverflow-
+        // Count, NoFreeProseToken_CanCrowdOutAListingsOverflowCount, AmbiguousReference_BoundsItsCandidateList_
+        // WithAnAccurateCount and ListingBudget_IsSpentBeforeAnythingIsElided_AcrossTheProductOfWidthAndName-
+        // Length.
+        //
+        // Those are named rather than counted deliberately. A RED count is a claim about the SUITE, so it has
+        // to be re-tuned whenever coverage legitimately grows, and every drift then looks exactly like a
+        // regression — this comment said "10" and was 14 within one round. Names are a claim about the
+        // PROPERTY: they do not move when the suite grows, they say what actually dies, and a stale one is a
+        // filter that matches nothing rather than a sentence that is quietly wrong. It is the same reason the
+        // listing tests assert a constant-free count oracle instead of a literal (+N more).
+        //
+        // The 0 RED figures elsewhere in this file and in CoercionHelpers are a different kind of claim and
+        // are left as numbers on purpose: they assert a mutant is EQUIVALENT, so 0 is the whole content of the
+        // claim, it cannot drift upward as coverage grows without the equivalence itself having become false,
+        // and that falsification is precisely the signal wanted. Do not "correct" them into test names.
         if (whole <= budget)
         {
             return string.Join(separator, rendered);
