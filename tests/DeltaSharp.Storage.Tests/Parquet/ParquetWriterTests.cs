@@ -206,7 +206,41 @@ public sealed class ParquetWriterTests
 
         await using ParquetReader reader =
             await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
-        return reader.CustomMetadata[DeltaSchemaJson.SchemaMetadataKey];
+        string declared = reader.CustomMetadata[DeltaSchemaJson.SchemaMetadataKey];
+
+        // THE OUTPUT-SIDE CHECK. Every other guard in this file ranges over the INPUT MODEL, while
+        // the property they all protect is about the OUTPUT -- so anything that can differ between
+        // what the writer was given and what it actually wrote is outside them by construction. A
+        // writer that stamps a correct schemaString onto a file carrying FEWER PHYSICAL COLUMNS
+        // produces a file whose own embedded metadata contradicts its own column list, and Spark,
+        // delta-rs and Trino would each resolve the declared columns against the physical ones.
+        //
+        // This sits in the shared oracle rather than in one test, so it applies to every footer
+        // this file writes: the corpora, the constructive sweep at every cardinality, and all 1200
+        // generated schemas.
+        // Compared against the INPUT rather than against a re-parse of the declared string: the
+        // callers already assert that the declared string equals the shared serializer's output
+        // for this very schema, so input and declaration are pinned to each other, and going
+        // through FromJson here would make the oracle inherit the READER's depth ceiling and throw
+        // on schemas the writer legitimately produces.
+        string[] physical = reader.Schema.DataFields.Select(x => x.Name).ToArray();
+        string[] logical = schema.Select(x => x.Name).ToArray();
+        if (!physical.SequenceEqual(logical, StringComparer.Ordinal))
+        {
+            Assert.Fail(
+                $"The written file DECLARES {logical.Length} columns in its schemaString but "
+                + $"physically carries {physical.Length}."
+                + $"{Environment.NewLine}  declared: {Truncate(string.Join(", ", logical))}"
+                + $"{Environment.NewLine}  physical: {Truncate(string.Join(", ", physical))}");
+        }
+
+        // AND IT MUST BE READABLE. A footer that only the writer can understand is a footer no
+        // reader can open, so the artifact is round-tripped through the shared reader rather than
+        // merely compared as text. This is what caught the depth probe measuring a cheaper shape
+        // than the sweep emits.
+        Assert.Equal(declared, SchemaJson.ToJson(SchemaJson.FromJson(declared)));
+
+        return declared;
     }
 
     /// <summary>The metadata artifact corpus; shared with the value-kind completeness guard.</summary>
@@ -2343,9 +2377,17 @@ public sealed class ParquetWriterTests
         return deepest;
     }
 
+    /// <remarks>
+    /// The leaf is an ARRAY, not a bare string, because that is what the sweep actually emits at
+    /// its deepest level -- <see cref="NestMetadata"/> puts an array beside the recursion at every
+    /// depth, and an array element costs one more JSON level than a string does. Probing the
+    /// cheaper shape and applying the answer to the more expensive one is a bound measured in one
+    /// place and used in another, which is the defect this probe exists to remove; it was found by
+    /// the output-side check, which parsed a swept footer and hit the reader's ceiling.
+    /// </remarks>
     private static StructType BuildDepthProbeSchema(int depth)
     {
-        MetadataValue value = MetadataValue.String("leaf");
+        MetadataValue value = MetadataValue.Array([MetadataValue.String("leaf")]);
         for (int i = 0; i < depth; i++)
         {
             value = MetadataValue.Nested(FieldMetadata.FromValues(
