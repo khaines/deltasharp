@@ -320,9 +320,13 @@ public sealed class SqlParserDiagnosticHygieneTests
     [Fact]
     public void UnsupportedFeature_LongOnboardingProse_IsNotTruncated_ByTheSyntaxBackstop()
     {
-        // UnsupportedFeature messages carry long FIXED onboarding prose built only from compile-time construct
-        // constants — never source text — so they are deliberately NOT passed through the Syntax backstop and
-        // must survive intact.
+        // UnsupportedFeature messages carry long FIXED onboarding prose. The backstop DOES apply here — every
+        // constructor routes through it — but it is a no-op in practice and always has been: the construct is
+        // a compile-time constant from the parser's own keyword maps, never source text, so no attacker-chosen
+        // token can reach this message, and the longest one this factory can compose is 328 characters,
+        // comfortably inside the cap. That is why the prose survives intact rather than being exempt from the
+        // backstop, and this test pins the CONSEQUENCE (no elision glyph) rather than the mechanism. See the
+        // remarks on SqlParseException.Unsupported, which is the authoritative statement of this.
         SqlParseException ex = Assert.Throws<SqlParseException>(() => SqlParser.Parse("SELECT a FROM t LIMIT 10"));
 
         Assert.Equal(SqlParseErrorKind.UnsupportedFeature, ex.ErrorKind);
