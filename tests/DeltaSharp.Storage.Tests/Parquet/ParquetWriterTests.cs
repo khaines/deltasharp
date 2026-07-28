@@ -1199,9 +1199,9 @@ public sealed class ParquetWriterTests
         Assert.Equal(typeof(StructType), schemaParameter.ParameterType);
 
         var unvaried = new List<string>();
-        foreach ((Type owner, System.Reflection.PropertyInfo property) in SchemaDegreesOfFreedom())
+        foreach ((Type owner, System.Reflection.MemberInfo member) in SchemaDegreesOfFreedom())
         {
-            string key = $"{owner.Name}.{property.Name}";
+            string key = $"{owner.Name}.{member.Name}";
             if (key == "StructType.TypeName")
             {
                 continue;
@@ -1211,7 +1211,14 @@ public sealed class ParquetWriterTests
                 ? v
                 : new HashSet<object>();
 
-            Type t = Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType;
+            Type declared = MemberValueType(member);
+
+            // A collection member's axis is its SIZE, and sizes are compared on the same footing
+            // as any other count -- so "how many fields", "how many metadata entries" and "how
+            // many array elements" are one derived requirement rather than three hand-written ones.
+            Type t = IsCollectionAxis(declared)
+                ? typeof(int)
+                : Nullable.GetUnderlyingType(declared) ?? declared;
             if (t == typeof(bool))
             {
                 if (values.Count < 2)
@@ -1258,52 +1265,103 @@ public sealed class ParquetWriterTests
     /// BY THEIR TYPE rather than by name: they are other model objects or views over them, and are
     /// covered by their own owner's entry.
     /// </summary>
-    private static IEnumerable<(Type Owner, System.Reflection.PropertyInfo Property)> SchemaDegreesOfFreedom()
+    private static IEnumerable<(Type Owner, System.Reflection.MemberInfo Member)> SchemaDegreesOfFreedom()
     {
         Type[] owners =
         [
             typeof(StructType), typeof(StructField), typeof(FieldMetadata), typeof(MetadataValue),
         ];
 
+        const System.Reflection.BindingFlags flags =
+            System.Reflection.BindingFlags.Public
+            | System.Reflection.BindingFlags.Instance
+            | System.Reflection.BindingFlags.DeclaredOnly;
+
         foreach (Type owner in owners)
         {
-            foreach (System.Reflection.PropertyInfo property in owner.GetProperties(
-                System.Reflection.BindingFlags.Public
-                | System.Reflection.BindingFlags.Instance
-                | System.Reflection.BindingFlags.DeclaredOnly))
+            foreach (System.Reflection.PropertyInfo property in owner.GetProperties(flags))
             {
-                Type t = property.PropertyType;
-                bool scalar = t.IsEnum || t == typeof(bool) || t == typeof(int) || t == typeof(string);
-                if (property.GetIndexParameters().Length == 0 && scalar)
+                if (property.GetIndexParameters().Length == 0
+                    && (IsScalarAxis(property.PropertyType) || IsCollectionAxis(property.PropertyType)))
                 {
                     yield return (owner, property);
+                }
+            }
+
+            // Parameterless METHODS returning a collection are degrees of freedom too. This is not
+            // pedantry: MetadataValue exposes its array only through AsArray(), so a
+            // property-only walk never asks for array-element cardinality to be varied -- the
+            // sweep happened to vary it, but nothing REQUIRED it, which is the difference between
+            // coverage and accident that this file has already been caught by once.
+            foreach (System.Reflection.MethodInfo method in owner.GetMethods(flags))
+            {
+                if (!method.IsSpecialName
+                    && method.GetParameters().Length == 0
+                    && method.Name != nameof(IEnumerable<int>.GetEnumerator)
+                    && IsCollectionAxis(method.ReturnType))
+                {
+                    yield return (owner, method);
                 }
             }
         }
     }
 
+    private static Type MemberValueType(System.Reflection.MemberInfo member) =>
+        member is System.Reflection.PropertyInfo p
+            ? p.PropertyType
+            : ((System.Reflection.MethodInfo)member).ReturnType;
+
+    private static bool IsScalarAxis(Type t)
+    {
+        Type u = Nullable.GetUnderlyingType(t) ?? t;
+        return u.IsEnum || u == typeof(bool) || u == typeof(int) || u == typeof(string);
+    }
+
+    private static bool IsCollectionAxis(Type t) =>
+        t != typeof(string) && typeof(System.Collections.IEnumerable).IsAssignableFrom(t);
+
     private static void Observe(object target, Dictionary<string, HashSet<object>> into)
     {
-        foreach ((Type owner, System.Reflection.PropertyInfo property) in SchemaDegreesOfFreedom())
+        foreach ((Type owner, System.Reflection.MemberInfo member) in SchemaDegreesOfFreedom())
         {
             if (!owner.IsInstanceOfType(target))
             {
                 continue;
             }
 
-            object? value = property.GetValue(target);
+            object? value;
+            try
+            {
+                value = member is System.Reflection.PropertyInfo p
+                    ? p.GetValue(target)
+                    : ((System.Reflection.MethodInfo)member).Invoke(target, null);
+            }
+            catch (System.Reflection.TargetInvocationException)
+            {
+                // A kind-specific accessor on the wrong kind (AsArray on a Long). Not an
+                // observation, and not an error -- the axis is observed from the values that do
+                // have it.
+                continue;
+            }
+
             if (value is null)
             {
                 continue;
             }
 
-            if (!into.TryGetValue($"{owner.Name}.{property.Name}", out HashSet<object>? set))
+            // For a collection the observation is its SIZE, which is what makes cardinality a
+            // derived axis rather than a hand-listed one.
+            object observation = value is System.Collections.IEnumerable sequence and not string
+                ? sequence.Cast<object>().Count()
+                : value;
+
+            if (!into.TryGetValue($"{owner.Name}.{member.Name}", out HashSet<object>? set))
             {
                 set = new HashSet<object>();
-                into[$"{owner.Name}.{property.Name}"] = set;
+                into[$"{owner.Name}.{member.Name}"] = set;
             }
 
-            set.Add(value);
+            set.Add(observation);
         }
     }
 
@@ -1449,6 +1507,12 @@ public sealed class ParquetWriterTests
             $"The hazard codepoint probe collapsed to {codepoints.Count} entries.");
 
         var covered = new HashSet<(string Position, int Depth, string Text)>();
+
+        // NOT A COVERAGE BOUND. This only decides how many codepoints share one write, and it was
+        // read as a coverage bound once -- for a while it was the ONLY thing setting the artifact
+        // layer's schema width, so a writer with a 64-column buffer passed everything. Schema
+        // width is now an explicit axis (CardinalityCounts, up to 257 fields) and is REQUIRED by
+        // SchemaDegreesOfFreedom_AreEachVaried, so changing this number cannot narrow coverage.
         const int chunkSize = 48;
         for (int start = 0; start < codepoints.Count; start += chunkSize)
         {
