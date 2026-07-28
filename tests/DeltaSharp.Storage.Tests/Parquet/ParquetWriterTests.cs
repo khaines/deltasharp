@@ -218,20 +218,50 @@ public sealed class ParquetWriterTests
         // This sits in the shared oracle rather than in one test, so it applies to every footer
         // this file writes: the corpora, the constructive sweep at every cardinality, and all 1200
         // generated schemas.
-        // Compared against the INPUT rather than against a re-parse of the declared string: the
-        // callers already assert that the declared string equals the shared serializer's output
-        // for this very schema, so input and declaration are pinned to each other, and going
-        // through FromJson here would make the oracle inherit the READER's depth ceiling and throw
-        // on schemas the writer legitimately produces.
+        // The comparison runs against the RE-PARSED DECLARED STRING, so both sides are read back
+        // out of the artifact and the assertion is self-contained: it says the file does not
+        // contradict itself, without borrowing anything from the caller. The input is then checked
+        // against the declaration as well, which makes the three-way equality independent of
+        // CALLER DISCIPLINE -- the callers do each pin the declared string to the shared
+        // serializer's output, but a future caller that forgot to would silently unpin the input
+        // side, and a guard that holds only while every call site remembers something is a guard
+        // with a maintenance requirement rather than an invariant. MEASURED, not argued: with the
+        // sweep's own parity assertion neutered and the declared string truncated to 64 of 257
+        // columns, this form is RED while the input-only form is GREEN 1659 -- the old form's kill
+        // had been coming entirely from the caller.
+        //
+        // An earlier revision compared against the input ONLY, on the stated grounds that going
+        // through FromJson would make the oracle inherit the reader's depth ceiling. That reason
+        // was FALSE at the time it was written -- the round-trip assertion below already calls
+        // FromJson unconditionally on this very string, three lines later. It had been true in the
+        // broken state that preceded the depth-probe fix, and survived as a justification after the
+        // fix removed the constraint. Recorded because a correct decision resting on a stale reason
+        // is exactly the failure this file keeps finding in itself.
+        //
+        // Domain note: this ranges over column NAMES. Physical type, decimal precision and
+        // timestamp annotation are not expressible here and are pinned by the read-path guards
+        // instead -- measured, not assumed: ByteType->short is 12 RED, decimal(p)->p+1 is 16 RED,
+        // and flipping isAdjustedToUTC for timestamp_ntz is 2 RED. The narrowness is a division of
+        // labour, not a gap.
         string[] physical = reader.Schema.DataFields.Select(x => x.Name).ToArray();
+        string[] redeclared = ((StructType)SchemaJson.FromJson(declared)).Select(x => x.Name).ToArray();
         string[] logical = schema.Select(x => x.Name).ToArray();
-        if (!physical.SequenceEqual(logical, StringComparer.Ordinal))
+        if (!physical.SequenceEqual(redeclared, StringComparer.Ordinal))
         {
             Assert.Fail(
-                $"The written file DECLARES {logical.Length} columns in its schemaString but "
+                $"The written file DECLARES {redeclared.Length} columns in its schemaString but "
                 + $"physically carries {physical.Length}."
-                + $"{Environment.NewLine}  declared: {Truncate(string.Join(", ", logical))}"
+                + $"{Environment.NewLine}  declared: {Truncate(string.Join(", ", redeclared))}"
                 + $"{Environment.NewLine}  physical: {Truncate(string.Join(", ", physical))}");
+        }
+
+        if (!redeclared.SequenceEqual(logical, StringComparer.Ordinal))
+        {
+            Assert.Fail(
+                $"The written file DECLARES {redeclared.Length} columns but was HANDED "
+                + $"{logical.Length}."
+                + $"{Environment.NewLine}  handed:   {Truncate(string.Join(", ", logical))}"
+                + $"{Environment.NewLine}  declared: {Truncate(string.Join(", ", redeclared))}");
         }
 
         // AND IT MUST BE READABLE. A footer that only the writer can understand is a footer no
