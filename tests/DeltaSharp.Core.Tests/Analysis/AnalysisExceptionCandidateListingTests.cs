@@ -164,6 +164,26 @@ public sealed class AnalysisExceptionCandidateListingTests
                 + string.Join("\n", counterexamples.Take(8)));
     }
 
+    /// <summary>The item widths swept by
+    /// <see cref="HowManyCandidatesAreShown_DoesNotDependOnHowLongTheyAre"/>, read by that theory and by the
+    /// non-vacuity fact that measures which of them are in the discriminating region.</summary>
+    public static TheoryData<int> ItemLengthSweepWidths()
+    {
+        var data = new TheoryData<int>();
+        foreach (int width in ItemLengthSweepWidthValues)
+        {
+            data.Add(width);
+        }
+
+        return data;
+    }
+
+    /// <summary>The same widths, readable as values so the non-vacuity fact cannot drift from the theory.</summary>
+    private static int[] ItemLengthSweepWidthValues => [6, 12, 20, 40];
+
+    /// <summary>The item lengths swept at each of those widths.</summary>
+    private static int[] ItemLengthSweep => [60, 120, 240, 3000];
+
     /// <summary>
     /// #687 council round 12 (Quality) — the <b>fair-share divisor</b>. The per-item allowance is
     /// <c>budget / itemCount</c>; mutating it to <c>budget</c> was 0 RED while demonstrably changing output,
@@ -175,18 +195,16 @@ public sealed class AnalysisExceptionCandidateListingTests
     /// thereby lose a different column from the diagnostic.</para>
     /// </summary>
     [Theory]
-    [InlineData(6)]
-    [InlineData(12)]
-    [InlineData(20)]
-    [InlineData(40)]
+    [MemberData(nameof(ItemLengthSweepWidths))]
     public void HowManyCandidatesAreShown_DoesNotDependOnHowLongTheyAre(int width)
     {
         // These MUST straddle the per-item clamp, not sit above it. The first draft of this test used
         // 240/480/960/3000 — every one of them past the ceiling — so the mutant it exists to catch produced a
         // constant allowance across the whole row and the assertion held under it: 0 RED, vacuous, and the
-        // same "corpus in the saturated region" mistake this PR has now made five times. 60 and 120 are below
-        // the fair share at these widths and 3000 is far above it, so the row spans the interesting range.
-        int[] lengths = [60, 120, 240, 3000];
+        // same "corpus in the saturated region" mistake this PR has now made five times. WHICH of the widths
+        // below straddle the clamp is not written here — the sentence that wrote it said "at these widths"
+        // and was true of some of them — it is asserted by TheItemLengthSweep_StraddlesTheClampSomewhere.
+        int[] lengths = ItemLengthSweep;
         int[] shown =
         [
             .. lengths.Select(length =>
@@ -213,6 +231,62 @@ public sealed class AnalysisExceptionCandidateListingTests
                 $"width {width}: item lengths {string.Join(",", lengths)} showed "
                     + $"{string.Join(",", shown)} candidates respectively — the number shown moved with item "
                     + $"length, so one long name is starving its siblings instead of being truncated."));
+    }
+
+    /// <summary>
+    /// #687 council round 20 (Balanced) — non-vacuity for the sweep above, executed instead of described.
+    /// <para>That theory catches a constant per-item allowance only at widths where the clamp binds
+    /// DIFFERENTLY across the swept lengths; at a width where every swept length is already truncated the
+    /// row sits wholly in the saturated region and the mutant survives it. A comment claimed the shortest
+    /// swept lengths were under the allowance "at these widths" — a universal quantifier over the fixture's
+    /// own values, measured against a threshold. It is the eighth sentence of that exact shape in this
+    /// change to be false, and like the other seven its conclusion held: the sweep does straddle, at some of
+    /// its widths and not all of them.</para>
+    /// <para>So the claim is made here, where it can fail. This fact reports the straddling cells by name;
+    /// if a future edit lengthens the corpus or narrows the clamp until none straddle, the theory above
+    /// becomes vacuous and this fails first, saying so.</para>
+    /// </summary>
+    [Fact]
+    public void TheItemLengthSweep_StraddlesTheClampSomewhere()
+    {
+        var straddling = new List<string>();
+        foreach (int width in ItemLengthSweepWidthValues)
+        {
+            int[] rendered = [.. ItemLengthSweep.Select(length => RenderedItemWidth(width, length))];
+            if (rendered.Zip(ItemLengthSweep, (r, l) => r == l).Any(x => x)
+                && rendered.Zip(ItemLengthSweep, (r, l) => r < l).Any(x => x))
+            {
+                straddling.Add(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"width {width} renders {string.Join(",", rendered)} for {string.Join(",", ItemLengthSweep)}"));
+            }
+        }
+
+        Assert.True(
+            straddling.Count > 0,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"no swept width has both an untruncated and a truncated item length, so ")
+                + $"{nameof(HowManyCandidatesAreShown_DoesNotDependOnHowLongTheyAre)} cannot observe the "
+                + $"fair-share divisor at any of its rows and is vacuous.");
+    }
+
+    /// <summary>How wide the first candidate actually renders, name only, with its #ExprId suffix removed.</summary>
+    private static int RenderedItemWidth(int width, int length)
+    {
+        AttributeReference[] columns =
+        [
+            .. Enumerable.Range(0, width).Select(i => new AttributeReference(
+                string.Create(CultureInfo.InvariantCulture, $"{i:D3}").PadRight(length, 'c')[..length],
+                IntegerType.Instance,
+                true,
+                new ExprId(i + 1))),
+        ];
+
+        string message = AnalysisException.UnresolvedColumn("nosuch", columns).Message;
+        int open = message.IndexOf('[', StringComparison.Ordinal);
+        string first = message[(open + 1)..message.LastIndexOf(']')].Split(", ")[0];
+        return first.Split('#')[0].Length;
     }
 
     /// <summary>

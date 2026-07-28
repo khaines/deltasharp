@@ -66,6 +66,13 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// Every analyzer diagnostic that renders a user-authored type into its message, driven through the
     /// real constraint front end. Each row is (label, predicate) where the predicate makes the site fire
     /// against <see cref="PayloadSchema"/>.
+    /// <para>This list is hand-written, and that is sound here for a reason worth stating, because a
+    /// reviewer applying this change's own rule against hand-listed populations will otherwise flag it: the
+    /// bound is enforced at a single chokepoint every construction path routes through
+    /// (<c>AnalysisException : base(DiagnosticText.Sanitize(message, MaxMessageLength))</c>), so a site
+    /// missing from this list is still bounded. The list governs COVERAGE BREADTH, not safety. A chosen
+    /// population is only dangerous where the list IS the guarantee — which is exactly the case in the
+    /// corpus assertion this file deleted, and not the case here.</para>
     /// </summary>
     public static TheoryData<string, string> TypeRenderingSites() => new()
     {
@@ -368,19 +375,43 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// <summary>
     /// The field-name bound must not cut a REAL field name, and the corpus must be able to tell.
     /// <para>A flat cap of 32 stood inside the type renderer — the same number four seats rejected for
-    /// candidate names — and every field name the file generated was shorter than it, so no row could reach
-    /// it. Restoring the 32 was measured at <b>0 RED across the whole suite</b>. That is the vacuity pattern
-    /// this PR keeps hitting: a corpus whose items are all shorter than the bound cannot test the bound. The
-    /// widths themselves are not named here, because every attempt in this change to write down what this
-    /// file's fixtures are — in prose and twice in an assertion — has been wrong.</para>
-    /// <para>These names are real-world lengths (35 and 43). The first must survive verbatim; the point of
-    /// the ceiling is to stop ONE pathological name consuming the render, not to trim ordinary schemas.</para>
+    /// candidate names — and nothing in the suite failed when it was restored. This test is what closes
+    /// that: at HEAD, restoring it fails here and nowhere else. Why the older corpus could not reach the
+    /// cap is deliberately not stated. This paragraph said it, and was the SEVENTH sentence in this change
+    /// to make the same claim wrongly — it read "every field name the file generated was shorter than it"
+    /// while the file two commits earlier was already generating names of ten thousand and five thousand
+    /// characters. It sat four lines above a sentence warning that every such attempt had been wrong.</para>
+    /// <para><b>The shape, and how to find it.</b> All seven instances are the same sentence:
+    /// <i>a universal quantifier over this file's own generators, measured against a threshold, where the
+    /// conclusion holds and the reason is false.</i> Five wording-derived sweeps missed this one — digits,
+    /// spelled numerals, tag-embedded numerals, hyphenated and ordinal forms, and a paraphrase pass — because
+    /// each drew its patterns from text already known to be bad, and this sentence shares no wording with
+    /// any of them. A sweep on the SHAPE found it on its first run:
+    /// <c>(every|each|all|no|none|only|both|the) &lt;population-noun&gt; …
+    /// (shorter|longer|below|above|beyond|under|past|at least|at most)</c>.
+    /// Use that, not a word list, and prefer deleting a hit to re-deriving it.</para>
+    /// <para>Both names below are ordinary business-schema lengths and both exceed the flat cap, which is
+    /// the only reason the pair discriminates — asserted in the body rather than written here as two
+    /// numbers, one of which was wrong. The first must survive verbatim; the point of the ceiling is to stop
+    /// ONE pathological name consuming the render, not to trim ordinary schemas.</para>
     /// </summary>
     [Fact]
     public void RealisticFieldNames_SurviveTheFieldNameCeilingVerbatim()
     {
         const string Long = "customer_lifetime_value_rolling_90d";
         const string Longer = "net_revenue_retention_trailing_twelve_mths";
+
+        // The flat cap this test exists to keep deleted. Both names must exceed it or the fixture cannot
+        // tell whether the cap is back, and neither length is stated in prose: the last prose statement of
+        // them was wrong by one.
+        const int FlatCapThatShipped = 32;
+        Assert.All(
+            new[] { Long, Longer },
+            name => Assert.True(
+                name.Length > FlatCapThatShipped,
+                $"'{name}' is {name.Length} characters, not longer than the flat cap of "
+                    + $"{FlatCapThatShipped} this fixture must be able to reach."));
+
         var payload = new StructType(
         [
             new StructField(Long, StringType.Instance, true),
