@@ -72,8 +72,17 @@ public sealed class AnalysisExceptionLengthIndependenceTests
     private static IReadOnlyList<DataType> Types(int count) =>
         Enumerable.Repeat<DataType>(IntegerType.Instance, count).ToArray();
 
-    /// <summary>Every factory that interpolates attacker-influenceable text, keyed by the growth axis under
-    /// test. The <see cref="Func{T, TResult}"/> takes the payload scale and returns the composed exception.
+    /// <summary>The factories whose interpolated text can be grown by a caller, keyed by the growth axis
+    /// under test. The <see cref="Func{T, TResult}"/> takes the payload scale and returns the composed
+    /// exception.
+    /// <para>Not every public factory appears here, and the omitted ones are omitted for a checkable reason
+    /// rather than by judgement: their only string comes from <c>TreeNode.NodeName</c>, which every node
+    /// type overrides with a compile-time literal — including the two that compute it, which select among
+    /// literals over a closed enum — so no caller can grow it and there is no length axis to sweep. Safety
+    /// does not rest on this list in any case: every message routes through the
+    /// <c>DiagnosticText.Sanitize</c> call in the constructor, and the backstop is ranged over by
+    /// reflection elsewhere. This list decides which growth AXES are swept — coverage breadth — not whether
+    /// an unlisted factory is bounded.</para>
     /// </summary>
     public static TheoryData<string, Func<int, Exception>> UnboundedGrowthAxes() => new()
     {

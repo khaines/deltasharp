@@ -38,13 +38,21 @@ namespace DeltaSharp.Core.Tests.Analysis;
 public sealed class AnalysisExceptionCandidateListingTests
 {
     /// <summary>
-    /// A REALISTIC-LENGTH name (35 characters, the length of <c>customer_lifetime_value_rolling_90d</c>).
+    /// A name of the length a real analytics column has — the shape of
+    /// <c>customer_lifetime_value_rolling_90d</c>, with a generated ordinal in place of the suffix.
     /// </summary>
     /// <remarks>
     /// Round 6, and the reason this suite missed two defects: the original corpus used
-    /// <c>customer_metric_000</c> — 19 characters, comfortably under every cap in play. <b>A corpus whose
-    /// items are all shorter than the bound cannot test the bound.</b> Every case here is now at or past
-    /// real-world column-name length, so the per-item cap is actually exercised.
+    /// <c>customer_metric_000</c>, comfortably under every cap in play. <b>A corpus whose items are all
+    /// shorter than the bound cannot test the bound.</b>
+    /// <para>Two things this remark used to say are gone, and both were the shape this change keeps
+    /// finding — a claim about the file's own generator, measured against a threshold. It gave a character
+    /// count that was the real column's, not this generator's, which produces one more; and it concluded
+    /// that the per-item cap is therefore exercised, which was true against the flat cap of round 6 and is
+    /// NOT true against the fair-share clamp that replaced it, since that clamp has a floor no name of this
+    /// length reaches. Neither is restated. Whether a given corpus reaches the clamp is a property of that
+    /// corpus, and where it matters it is asserted by
+    /// <see cref="TheItemLengthSweep_StraddlesTheClampSomewhere"/> rather than claimed here.</para>
     /// </remarks>
     private static string RealisticName(int i) =>
         string.Create(CultureInfo.InvariantCulture, $"customer_lifetime_value_rolling_{i:D4}");

@@ -66,13 +66,15 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// Every analyzer diagnostic that renders a user-authored type into its message, driven through the
     /// real constraint front end. Each row is (label, predicate) where the predicate makes the site fire
     /// against <see cref="PayloadSchema"/>.
-    /// <para>This list is hand-written, and that is sound here for a reason worth stating, because a
-    /// reviewer applying this change's own rule against hand-listed populations will otherwise flag it: the
-    /// bound is enforced at a single chokepoint every construction path routes through
+    /// <para>This list is hand-written and does NOT reach every type-rendering diagnostic; a reviewer
+    /// applying this change's own rule against hand-listed populations should read this before flagging it.
+    /// The bound is enforced at a single chokepoint every construction path routes through
     /// (<c>AnalysisException : base(DiagnosticText.Sanitize(message, MaxMessageLength))</c>), so a site
-    /// missing from this list is still bounded. The list governs COVERAGE BREADTH, not safety. A chosen
-    /// population is only dangerous where the list IS the guarantee — which is exactly the case in the
-    /// corpus assertion this file deleted, and not the case here.</para>
+    /// missing from this list is still bounded, and a reviewer drove the reflected population to confirm it.
+    /// The list governs COVERAGE BREADTH, not safety. A chosen population is safe when trimming it breaks
+    /// the test (as with the pin at the end of this file) or when a chokepoint makes the property hold
+    /// whatever the list contains (as here). It is dangerous only where the list IS the guarantee — which
+    /// is exactly what the corpus assertion this file deleted was, satisfying neither.</para>
     /// </summary>
     public static TheoryData<string, string> TypeRenderingSites() => new()
     {
@@ -1061,6 +1063,14 @@ public sealed class AnalysisExceptionTypeRenderTests
         var misruled = new List<string>();
         int dearestDiscriminating = 0;
 
+        // This corpus is chosen, not enumerated, and that is sound here by a criterion this change had to
+        // learn the hard way: it is SELF-CHECKING. Trim it — nameLength to {7, 8, 12} — and the test goes
+        // RED, on the tightness assertion at the end, because the region it pins is no longer reached. A
+        // chosen population is safe when removing members breaks the test, or when a structural chokepoint
+        // makes the property hold whatever the list contains. The corpus assertion this file deleted last
+        // round satisfied NEITHER: trimming it only made it inspect less and still pass, and there was no
+        // chokepoint behind it, so the list WAS the guarantee. That is the distinction to apply before
+        // flagging any literal corpus in this file.
         foreach (string childKind in new[] { "int", "nested", "wide" })
         {
             string compact = childKind switch

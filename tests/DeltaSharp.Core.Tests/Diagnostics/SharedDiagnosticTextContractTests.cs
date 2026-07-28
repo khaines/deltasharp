@@ -327,6 +327,11 @@ public sealed class SharedDiagnosticTextContractTests
         // destination. Both sites compute it now, which is the only form of that sentence safe to copy.
         int refund = ", ".Length + MarkerWidth(1);
 
+        // Chosen, not enumerated, and self-checking: trim itemLength to {12, 18} and this test goes RED,
+        // because every remaining item is at or above the refund and the corpus stops reaching the region
+        // it exists to pin. That is the criterion for a literal corpus here — trimming it must break the
+        // test, or a chokepoint must make the property hold whatever the list contains. A corpus that
+        // satisfies neither is a claim with a green checkmark, which is what the sibling suite deleted.
         foreach (int itemLength in new[] { 1, 2, 3, 4, 6, 8, 10, 11, 12, 18 })
         {
             foreach (int count in new[] { 2, 3, 4, 5, 9, 11, 30, 107 })
