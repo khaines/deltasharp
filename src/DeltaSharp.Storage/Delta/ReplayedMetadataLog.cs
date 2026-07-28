@@ -96,17 +96,19 @@ namespace DeltaSharp.Storage.Delta;
 /// generalises past this file: an audit that enumerates conditions will systematically miss validation logic
 /// that lives in an assignment.</para>
 ///
-/// <para><b>Result: 26 of the 29 killed; of the three survivors two are equivalent and one is half of a
-/// masking pair (see below). No point fails open at this HEAD.</b> Attribution is stated as
+/// <para><b>Result: 27 of the 29 killed; two survivors, both equivalent. No point fails open at this
+/// HEAD.</b> Attribution is stated as
 /// two SEPARATE properties, because asserting the stronger one over the whole file was wrong three times:</para>
 /// <list type="bullet">
 /// <item><description><b>Disjoint in identity — the four conjuncts of
 /// <see cref="EnsureLineageIsAccountedFor"/> only.</b> Each names a different oracle:
-/// chain-link → <c>APartiallyOmittedNonFinalRevision</c>; chain-closure →
+/// chain-link → <c>APartiallyOmittedNonFinalRevision</c> +
+/// <c>AnOmittedRevisionWhoseBreakPointLandsOnTheWindowEnd</c>; chain-closure →
 /// <c>ATrailingSilentVersionWhoseWitnessContradictsTheChain</c>; end-accounting →
 /// <c>AWholesaleFailureToRecordMetadata</c> + <c>AMovedButSilentTrailingRevision</c>; un-moved branch →
-/// <c>AMetadataRecordedAcrossAnUnMovedLineage</c>. Note this is disjoint in IDENTITY but no longer "exactly
-/// one red each" — end-accounting now has two oracles.</description></item>
+/// <c>AMetadataRecordedAcrossAnUnMovedLineage</c>. The four red sets are PAIRWISE DISJOINT, but this is
+/// disjointness in IDENTITY only — it is no longer "exactly one red each", since chain-link and end-accounting
+/// now have two oracles apiece.</description></item>
 /// <item><description><b>Everything else: individually discriminating, NOT disjoint.</b> Measured overlaps —
 /// the exclusive-window bound's single red is a strict SUBSET of the upper coverage bound's; the two coverage
 /// bounds share <c>TheCoveredSetIsExactlyTheContiguousIntervalObserved</c>; and the empty-entry skip, its
@@ -116,7 +118,10 @@ namespace DeltaSharp.Storage.Delta;
 /// </list>
 ///
 /// <para><b>The survivors, classified — and the classification matters more than the count.</b> Two are
-/// genuinely equivalent; the third turned out not to be a survivor at all but half of a masking pair.</para>
+/// genuinely equivalent, and both survive PAIRED treatment as well as single-point (council R5, quality
+/// seat, sweeping HasCoverage and Seal's early return against each other and against the loop guards: no real
+/// red). A third was classified twice, wrongly and in the benign direction both times, before being pinned —
+/// see the entry below and the warning that follows it.</para>
 /// <list type="number">
 /// <item><description><b>Execution-falsified equivalent (1).</b> The <c>!HasCoverage</c> disjunct in
 /// <see cref="TryGetProvenObservation"/>: with no coverage the interval is <c>[0, 0)</c>, so the bounds
@@ -132,20 +137,32 @@ namespace DeltaSharp.Storage.Delta;
 /// refuses to mutate a sealed window, a repeated <see cref="Seal"/> re-runs a deterministic check over frozen
 /// state and reaches the same verdict — pass/pass or throw/throw. It is a memoisation, not a guard. It was
 /// NOT equivalent before that fix; see below.</description></item>
-/// <item><description><b>NOT equivalent — one half of a MUTUALLY-MASKING PAIR (2 points).</b> The
-/// <c>break</c> after <c>chained = false</c>, and that write itself. Each survives ALONE and neither is
-/// equivalent: remove the <c>break</c> and the already-latched <c>false</c> preserves the verdict; flip the
-/// write to <c>true</c> and the surviving <c>break</c> leaves <c>cursor</c> stale, which the chain-CLOSURE
-/// conjunct then rejects. Neuter BOTH and the walk fails OPEN — caught by
-/// <c>APartiallyOmittedNonFinalRevision</c> (measured: 0 red, 0 red, 1 red). Two prior analyses called this
-/// site equivalent on arguments that are individually TRUE but are not the reason: that <c>chained</c> is
-/// monotone, and that the loop writes zero instance state so there is no prior-call dimension. Both are
-/// correct and both miss the masking partner. <b>The transferable point: single-point mutation analysis is
-/// structurally blind to mutually-masking pairs</b>, so a survivor may be neither killed-elsewhere nor
-/// equivalent, but half of a pair that must be mutated together. Six independent audits of this type all used
-/// single-point mutation and none could have seen this.</description></item>
+/// <item><description><b>ARGUED equivalent by monotonicity (1) — the weakest claim in this file, flagged for
+/// attack.</b> The <c>break</c> after <c>chained = false</c>. Once the write has latched <c>false</c> nothing
+/// restores it, and the loop's only other effect is advancing <c>cursor</c>, which is consumed solely by a
+/// conjunction already false — so continuing the walk cannot change the verdict. This rests on an argument,
+/// not a swept space, which by this file's own rule makes it the survivor most likely to be wrong. Attack it
+/// first. Note the argument is only valid GIVEN the write beside it, which is separately
+/// load-bearing.</description></item>
 /// </list>
 ///
+/// <para><b>The write beside that <c>break</c> is load-bearing, and getting there took three wrong
+/// classifications — read this before classifying anything here.</b> <c>chained = false</c> is pinned
+/// single-point by <c>AnOmittedRevisionWhoseBreakPointLandsOnTheWindowEnd</c>: flip it to <c>true</c>, leave
+/// the <c>break</c>, and a window with a silently omitted revision is ACCEPTED. An earlier revision of this
+/// doc called that write merely half of a mutually-masking pair, because on the probe then available the
+/// break left <c>cursor</c> stale and the chain-CLOSURE conjunct re-rejected. The distinguishing probe is one
+/// whose break point leaves <c>cursor</c> on EXACTLY the window end, where closure is satisfied and cannot
+/// re-reject. <b>"Masked on the probe I had" is not "maskable"</b>, and the masking-pair explanation is
+/// withdrawn for this site: the true cause was simply an unpinned guard.</para>
+/// <para>That was the third classification on this type to resolve toward benign — <see cref="Seal"/>'s
+/// idempotence was twice called provably equivalent and was a latent fail-open; this <c>break</c> was called
+/// a genuine equivalent and was not the whole story; this write was called half a pair and is independently
+/// fail-open. Each was reached honestly, and each time acquiring an EXPLANATION is what ended the search.
+/// So: <b>a survivor's classification is the LAST thing to establish, not the first, and the moment a
+/// mechanism is found is the moment to ask whether it is the ONLY one</b> — because that is precisely when
+/// there is a reason to stop looking. Concretely, "this mutant is masked" must be demonstrated over a probe
+/// set chosen to break the masking, not over the probes that happened to be at hand.</para>
 /// <para><b>Safer-direction survivors: a third category, distinct from equivalent.</b> A mutant that makes
 /// the code fail closed MORE cannot be killed by a suite whose assertions are "must throw" — it is invisible
 /// to the method, not absent from the code. There are none now, but before the ordering fix, deleting

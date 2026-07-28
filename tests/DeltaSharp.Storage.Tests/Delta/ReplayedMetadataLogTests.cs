@@ -177,6 +177,35 @@ public sealed class ReplayedMetadataLogTests
     }
 
     [Fact]
+    public void AnOmittedRevisionWhoseBreakPointLandsOnTheWindowEnd_IsCaughtOnlyByTheChainedFalseWrite()
+    {
+        // Council R5, quality seat. The `chained = false` write in the chain walk is load-bearing ON ITS OWN,
+        // and this is the shape that proves it. Version 1's witness says the reconstruction was on `b` before
+        // applying it, but the walk arrived carrying `a` — a revision was omitted. The walk breaks there, and
+        // the break point leaves `cursor` on `a`, which IS the window's end metadata. So the chain-CLOSURE
+        // conjunct is SATISFIED and cannot re-reject: the only thing that rejects this window is the write
+        // that latched `chained` to false.
+        //
+        // An earlier revision of this file classified that write as merely half of a masking pair with the
+        // `break` beside it, on the strength of a different probe where the closure DID re-reject. That was
+        // "masked on the probe I had" mistaken for "maskable". Flipping the write alone, with the `break`
+        // retained, accepts this window — a silently omitted revision — and turned ZERO tests red before this
+        // test existed.
+        var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
+        MetadataAction arrivedOn = Meta("arrived-on");
+        MetadataAction claimed = Meta("claimed");
+        log.Record(0, new[] { arrivedOn }, null, arrivedOn);
+        log.Record(1, new[] { claimed }, claimed, arrivedOn);   // witness disagrees with the walk's cursor
+
+        DeltaProtocolException error =
+            Assert.Throws<DeltaProtocolException>(() => Sealed(log).TryGetProvenObservation(0, out _));
+
+        Assert.Contains("0", error.Message, StringComparison.Ordinal);
+        Assert.Contains("1", error.Message, StringComparison.Ordinal);
+        AssertPathFree(error.Message);
+    }
+
+    [Fact]
     public void AMovedButSilentTrailingRevision_IsRejectedOnlyByTheEndAccountingReferenceEquals()
     {
         // Council R3, balanced seat. Every other part of the lineage check PASSES on this shape: the chain is
