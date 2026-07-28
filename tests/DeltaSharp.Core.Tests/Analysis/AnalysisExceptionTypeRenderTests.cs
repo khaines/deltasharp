@@ -950,20 +950,27 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// that fits, not the one below the first that does not.
     /// <para>Pass 1 of the struct render scans <em>downward</em> for its count. Reverting it to a
     /// forward stop-at-first-failure walk was <b>0 RED across the whole solution</b> while measurably
-    /// eliding fields whose full render fits — a three-field struct at budget 32 rendering
-    /// <c>struct&lt;a:int,b:int … (+2 more)&gt;</c> when all four fit in 31 characters. Invariant 1, the
-    /// bound firing when everything would have fitted, unpinned.</para>
+    /// eliding fields whose full render fits. The failure message below prints the offending cell — its
+    /// shape, its budget, the count it showed, the count that fitted and the render itself — so no comment
+    /// needs to restate one, and an earlier revision of this sentence restated it wrongly (a four-field
+    /// cell described as three) precisely because a restated cell is copied, not computed. Invariant 1,
+    /// the bound firing when everything would have fitted, unpinned.</para>
     /// <para>The identical scan in <c>DiagnosticText.SanitizeToBudget</c> <em>is</em> pinned. This is the
     /// seventh time in this change that a fix landed at one of a pair of sites, and the first time the
     /// half that failed to travel was the <b>test</b>. The remedy is not only to port the guard but to
     /// make it say out loud which region it needs to reach, which is the assertion at the end.</para>
     /// <para><b>Why every existing guard was blind.</b> Not a missing axis this time but a fixture VALUE.
-    /// The counts that fit form a prefix whenever the cheapest field costs more than the marker's
-    /// disappearance is worth (one separator plus <c>… (+1 more)</c>, thirteen characters). Every fixture
-    /// in this file uses twelve-character names, so the cheapest field costs seventeen and the region
-    /// where the two walk shapes differ does not exist in the corpus. Under twelve-character names the
-    /// forward walk and the downward scan are the same function. Sixth vacuity of the "corpus cannot see
-    /// the bound" family, and the one that hid the longest.</para>
+    /// The counts that fit form a prefix — and so the two walk shapes agree — whenever taking one more
+    /// field costs at least as much as reaching the last one refunds, that refund being the separator plus
+    /// the marker which vanishes outright at <c>k == fieldCount</c>. The threshold is <c>refund</c> below,
+    /// computed from <c>MarkerWidth</c> at run time and named in the non-vacuity message, deliberately not
+    /// written here as a number: the previous revision of this sentence stated one that was too large by
+    /// one, which would have led a maintainer picking a corpus by it to choose a NON-discriminating one —
+    /// the worst failure mode available to a comment, since it survives review by sounding like guidance.
+    /// Every fixture that existed before this test used a single long name width (see the two name helpers
+    /// above), well beyond the threshold, so the region where the walks differ did not exist in the corpus
+    /// at all. Sixth vacuity of the "corpus cannot see the bound" family, and the one that hid the
+    /// longest.</para>
     /// <para><b>The oracle.</b> Each field's minimum cost is reconstructed from the corpus — the name, a
     /// colon, and the most compact form of its type — so the largest feasible count is arithmetic that
     /// borrows nothing from the renderer. The assertion is EQUALITY, not a bound: a count too small is the
@@ -989,6 +996,14 @@ public sealed class AnalysisExceptionTypeRenderTests
         var counterexamples = new List<string>();
         int cells = 0;
         int discriminating = 0;
+
+        // What reaching the final field refunds: the separator the marker would have needed, plus the
+        // marker for a single hidden field. A field whose marginal cost is strictly below this creates a
+        // count that fails while a larger one succeeds, which is the whole region this test exists for.
+        // Computed, not stated, so that it cannot be quoted stale.
+        int refund = 1 + MarkerWidth(1);
+        var misruled = new List<string>();
+        int dearestDiscriminating = 0;
 
         foreach (string childKind in new[] { "int", "nested", "wide" })
         {
@@ -1038,6 +1053,21 @@ public sealed class AnalysisExceptionTypeRenderTests
                         if (anySmallerInfeasible)
                         {
                             discriminating++;
+                            dearestDiscriminating = Math.Max(dearestDiscriminating, perField + 1);
+
+                            // And the stated rule for CHOOSING such a corpus is executed here rather than
+                            // described above: a cell can only be discriminating if one more field costs
+                            // strictly less than the final field refunds. Necessary, not sufficient — the
+                            // budget must also land in the band — so this is asserted in the direction that
+                            // guides a maintainer, which is the direction the old comment got wrong.
+                            if (perField + 1 >= refund)
+                            {
+                                misruled.Add(string.Create(
+                                    CultureInfo.InvariantCulture,
+                                    $"child={childKind} nameLength={nameLength} fields={fieldCount} "
+                                        + $"budget={budget}: discriminating although a field's marginal "
+                                        + $"cost {perField + 1} is not below the refund {refund}"));
+                            }
                         }
 
                         int shown = TopLevelFields(rendered);
@@ -1061,6 +1091,21 @@ public sealed class AnalysisExceptionTypeRenderTests
                 $"{counterexamples.Count} of {cells} cells rendered fewer fields than fit; first 5:\n")
             + string.Join("\n", counterexamples.Take(5)));
 
+        Assert.True(
+            misruled.Count == 0,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"{misruled.Count} of {cells} cells discriminate outside the rule this test states for "
+                    + $"picking a corpus, so the rule is wrong and following it would produce a corpus "
+                    + $"that cannot see the defect; first 5:\n")
+            + string.Join("\n", misruled.Take(5)));
+
+        // Tightness, which the necessary direction alone does not give. A refund stated too LARGE still
+        // satisfies every check above — it merely admits shapes that never discriminate — and too large by
+        // one is exactly what the previous revision of this comment said. Equality pins it from both
+        // sides: the dearest field the corpus ever discriminates on is the last one below the refund.
+        Assert.Equal(refund - 1, dearestDiscriminating);
+
         // The anti-vacuity half, and the part that would have prevented this round. A corpus can drift out
         // of the region a test was written for without any assertion noticing, because passing looks
         // identical either way. This one fails loudly instead.
@@ -1069,7 +1114,8 @@ public sealed class AnalysisExceptionTypeRenderTests
             string.Create(
                 CultureInfo.InvariantCulture,
                 $"none of {cells} cells has a feasible count above an infeasible one, so this corpus can "
-                    + $"no longer distinguish a downward scan from a forward walk — shorten the names or "
-                    + $"lower the budgets until it can"));
+                    + $"no longer distinguish a downward scan from a forward walk — shorten the names "
+                    + $"until a field's marginal cost (name + 1 + child + separator) falls strictly below "
+                    + $"{refund}, or lower the budgets until it can"));
     }
 }

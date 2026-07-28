@@ -307,10 +307,14 @@ internal static class CoercionHelpers
                     // now the property asserted by
                     // AnalysisExceptionTypeRenderTests.TheFieldCountIsTheLargestFeasibleCount_NotOneShortOfThe
                     // FirstInfeasibleOne, which also asserts that its corpus still CONTAINS a count of that
-                    // shape — because every other fixture in that file uses twelve-character names, for which
-                    // no such count exists and the two walk shapes are indistinguishable. The scan was 0-RED
-                    // across the whole solution for two rounds on exactly that account: not a missing axis but
-                    // a fixture VALUE, with the sibling scan in DiagnosticText pinned all along.
+                    // shape — because every fixture that predates it fixes its field names at one long width
+                    // (there are two such widths in that file, both well above the refund), for which no such
+                    // count exists and the two walk shapes are indistinguishable. The scan was 0-RED across
+                    // the whole solution for two rounds on exactly that account: not a missing axis but a
+                    // fixture VALUE, with the sibling scan in DiagnosticText pinned all along. That test now
+                    // computes the refund and asserts the threshold in both directions instead of stating it,
+                    // an earlier revision having stated it wrongly in the direction that would have sent the
+                    // next maintainer to a corpus which cannot see the defect.
                     //
                     // Pass 2 fixes HOW MUCH DETAIL. The count is now settled, so each child in turn may expand
                     // into whatever is left after reserving the minimum for the fields that follow it. Nothing a

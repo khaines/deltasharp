@@ -292,11 +292,17 @@ internal static class DiagnosticText
         // the first failure" walk can stop just below a k that fits.
         //
         // The counts that fit are therefore NOT a prefix, and that is the whole content of the property. The
-        // step that takes the last item deletes the marker outright, refunding a separator and eleven
-        // characters, so an item cheaper than that refund creates a k that fails while k+1 succeeds. Where
-        // every item is twelve characters or more no such k exists and the two walk shapes are the same
-        // function — which is how the identical scan in CoercionHelpers.RenderBounded stayed 0-RED for two
-        // rounds while this one was pinned. Not a missing axis: a fixture VALUE.
+        // step that takes the last item deletes the marker outright and refunds its separator with it, so an
+        // item that costs less than that refund creates a k that fails while k+1 succeeds. Above the refund
+        // no such k exists and the two walk shapes are the same function — which is how the identical scan
+        // in CoercionHelpers.RenderBounded stayed 0-RED for two rounds while this one was pinned. Not a
+        // missing axis: a fixture VALUE.
+        //
+        // The threshold is deliberately NOT written here as a number. This same sentence carried one in the
+        // Core sibling and it was too large by one, which is the direction that sends a maintainer choosing
+        // a corpus by it to a corpus that cannot see the defect — a comment that fails by being followed.
+        // Both pins now compute the refund from the marker itself and assert it in both directions: that
+        // nothing discriminates at or above it, and that something discriminates immediately below it.
         //
         // Pinned by SharedDiagnosticTextContractTests.TheListingCountIsTheLargestFeasibleCount_NotOneShortOf
         // TheFirstInfeasibleOne, whose Core sibling states the same property in the same shape, and which

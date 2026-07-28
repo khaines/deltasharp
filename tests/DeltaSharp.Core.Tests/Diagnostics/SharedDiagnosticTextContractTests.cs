@@ -187,41 +187,67 @@ public sealed class SharedDiagnosticTextContractTests
     /// reserve and is safe, but the contract is the API — this primitive lives in Abstractions expressly so
     /// that Core, Storage and Engine can share it, and the next caller reads the summary, not the loop.</para>
     /// <para>Written as a test rather than left as the corrected sentence, because a sentence cannot fail.
-    /// Seven figures in this change have been wrong in prose; none of the asserted ones have. If the
+    /// Figures in this change have been wrong in prose ten times and in an assertion never once. If the
     /// exemption ever widens beyond the marker, this fails instead of the documentation quietly going
     /// stale.</para>
+    /// <para><b>Pinned in both directions, which the first version was not.</b> As seven parametrized rows
+    /// each returning early when the result fitted, it was green under the mutation that deletes the
+    /// exemption altogether — a terminal path returning the empty string satisfies "never exceeds its
+    /// budget" perfectly, and destroys the count the exemption exists to preserve. Widening was pinned;
+    /// narrowing to nothing was not, and a reviewer mutating only outward would have called it covered.
+    /// That is the general shape: an exemption is a permission, so a test that only checks the permission
+    /// is not abused says nothing about it being exercised. It is now one fact with an interior sweep that
+    /// counts how many cells actually reached the exemption and fails if none did — the same
+    /// non-vacuity remedy the two walk pins in this file and its Core sibling already carry.</para>
     /// </remarks>
-    [Theory]
-    [InlineData(0, 1)]
-    [InlineData(0, 100000)]
-    [InlineData(1, 7)]
-    [InlineData(5, 3)]
-    [InlineData(11, 40)]
-    [InlineData(24, 400)]
-    [InlineData(60, 12)]
-    public void TheMarkerExemption_IsTheOnlyWayTheResultMayExceedItsBudget(int budget, int count)
+    [Fact]
+    public void TheMarkerExemption_IsTheOnlyWayTheResultMayExceedItsBudget()
     {
-        string[] items = [.. Enumerable.Range(0, count).Select(i =>
-            string.Create(CultureInfo.InvariantCulture, $"column_name_{i:D5}"))];
+        (int Budget, int Count)[] cases =
+        [
+            (0, 1), (0, 100000), (1, 7), (5, 3), (11, 40), (24, 400), (60, 12),
+            (2, 2), (8, 9), (13, 5), (30, 1000), (47, 60),
+        ];
 
-        string rendered = SharedDiagnosticText.SanitizeToBudget(
-            items, static (item, allowance) => SharedDiagnosticText.Sanitize(item, allowance), budget, 8, 64);
-
-        if (rendered.Length <= budget)
+        int exercised = 0;
+        foreach ((int budget, int count) in cases)
         {
-            return;
+            string[] items = [.. Enumerable.Range(0, count).Select(i =>
+                string.Create(CultureInfo.InvariantCulture, $"column_name_{i:D5}"))];
+
+            string rendered = SharedDiagnosticText.SanitizeToBudget(
+                items,
+                static (item, allowance) => SharedDiagnosticText.Sanitize(item, allowance),
+                budget,
+                8,
+                64);
+
+            if (rendered.Length <= budget)
+            {
+                continue;
+            }
+
+            exercised++;
+
+            // Over budget is permitted in exactly one shape: the bare marker, nothing else, and no wider
+            // than the marker for the number it actually reports.
+            Match marker = Regex.Match(rendered, @"^\u2026 \(\+(\d+) more\)$");
+            Assert.True(
+                marker.Success,
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"exceeded budget {budget} with something other than the bare marker: '{rendered}'"));
+            Assert.Equal(count, int.Parse(marker.Groups[1].Value, CultureInfo.InvariantCulture));
+            Assert.Equal(SharedDiagnosticText.OverflowMarkerLength(count), rendered.Length);
         }
 
-        // Over budget is permitted in exactly one shape: the bare marker, nothing else, and no wider than
-        // the marker for the number it actually reports.
-        Match marker = Regex.Match(rendered, @"^\u2026 \(\+(\d+) more\)$");
         Assert.True(
-            marker.Success,
+            exercised > 0,
             string.Create(
                 CultureInfo.InvariantCulture,
-                $"exceeded budget {budget} with something other than the bare marker: '{rendered}'"));
-        Assert.Equal(count, int.Parse(marker.Groups[1].Value, CultureInfo.InvariantCulture));
-        Assert.Equal(SharedDiagnosticText.OverflowMarkerLength(count), rendered.Length);
+                $"none of {cases.Length} cells reached the exemption, so every assertion above was skipped "
+                    + $"and this test would stay green with the exemption deleted — raise the counts or "
+                    + $"lower the budgets until at least one cell cannot fit a single item"));
     }
 
     /// <summary>The exact width of the <c>… (+N more)</c> marker, spelled out rather than taken from
@@ -240,17 +266,32 @@ public sealed class SharedDiagnosticTextContractTests
     /// reaches the region where the property has any content.</para>
     /// <para>That region exists only where the feasible counts are <b>not a prefix</b>. Taking one more
     /// item costs its own width plus a separator, but the step that takes the LAST one also deletes the
-    /// marker, refunding a separator and eleven characters. Where an item is cheaper than that refund, a
-    /// count can be infeasible while a larger one fits, and a stop-at-first-failure walk halts below it.
-    /// With items of twelve characters or more no such count exists and the two walk shapes are the same
-    /// function — which is exactly how the sibling site stayed unguarded.</para>
+    /// marker, refunding that marker and its separator. Where an item is cheaper than the refund, a count
+    /// can be infeasible while a larger one fits and a stop-at-first-failure walk halts below it; at or
+    /// above the refund no such count exists and the two walk shapes are the same function — which is
+    /// exactly how the sibling site stayed unguarded.</para>
+    /// <para>The refund is computed below as <c>refund</c> and asserted in both directions, rather than
+    /// written here as a number. The same sentence in the Core sibling did name one, it was too large by
+    /// one, and too large is the direction that sends a maintainer choosing a corpus by it to a corpus
+    /// that cannot see the defect. A threshold a reader is expected to ACT on belongs in an assertion; a
+    /// figure that only describes belongs in prose. This one is acted on.</para>
     /// </summary>
     [Fact]
     public void TheListingCountIsTheLargestFeasibleCount_NotOneShortOfTheFirstInfeasibleOne()
     {
         var counterexamples = new List<string>();
+        var misruled = new List<string>();
         int cells = 0;
         int discriminating = 0;
+        int dearestDiscriminating = 0;
+
+        // What reaching the final item refunds: the separator the marker would have needed, plus the marker
+        // for a single hidden item. Taking one more item costs a separator and the item, so an item cheaper
+        // than this refund creates a k that fails while a larger k succeeds. Computed here and asserted
+        // below rather than written into SanitizeToBudget's comment as a literal, where the same sentence
+        // in the Core sibling was wrong by one in the direction that would send a maintainer to a
+        // NON-discriminating corpus.
+        int refund = ", ".Length + MarkerWidth(1);
 
         foreach (int itemLength in new[] { 1, 2, 3, 4, 6, 8, 10, 11, 12, 18 })
         {
@@ -288,6 +329,18 @@ public sealed class SharedDiagnosticTextContractTests
                         if (Cost(k) > budget)
                         {
                             discriminating++;
+                            dearestDiscriminating =
+                                Math.Max(dearestDiscriminating, ", ".Length + itemLength);
+                            if (", ".Length + itemLength >= refund)
+                            {
+                                misruled.Add(string.Create(
+                                    CultureInfo.InvariantCulture,
+                                    $"itemLength={itemLength} count={count} budget={budget}: "
+                                        + $"discriminating although one more item costs "
+                                        + $"{", ".Length + itemLength}, which the refund {refund} does not "
+                                        + $"exceed"));
+                            }
+
                             break;
                         }
                     }
@@ -318,11 +371,25 @@ public sealed class SharedDiagnosticTextContractTests
             + string.Join("\n", counterexamples.Take(5)));
 
         Assert.True(
+            misruled.Count == 0,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"{misruled.Count} of {cells} cells discriminate outside the rule for choosing a corpus, "
+                    + $"so the rule is wrong and following it would produce a corpus that cannot see the "
+                    + $"defect; first 5:\n")
+            + string.Join("\n", misruled.Take(5)));
+
+        // Tightness. The check above admits a refund stated too large, which is exactly the error that
+        // shipped in the Core sibling's prose; equality pins it from both sides.
+        Assert.Equal(refund - 1, dearestDiscriminating);
+
+        Assert.True(
             discriminating > 0,
             string.Create(
                 CultureInfo.InvariantCulture,
                 $"none of {cells} cells has a feasible count above an infeasible one, so this corpus can "
-                    + $"no longer distinguish a downward scan from a forward walk — shorten the items or "
-                    + $"lower the budgets until it can"));
+                    + $"no longer distinguish a downward scan from a forward walk — shorten the items "
+                    + $"until one costs less than {refund} with its separator, or lower the budgets until "
+                    + $"it can"));
     }
 }
