@@ -264,6 +264,26 @@ public sealed class ParquetWriterTests
         {
             new KeyValuePair<string, MetadataValue>(EveryEscapeForm, MetadataValue.String(EveryEscapeForm)),
         })),
+        // NUMERIC TOKEN FORMATTING. Every other pinned number here is a small positive, so
+        // WriteDouble's integral-value branch (which appends ".0" when the round-tripped text
+        // carries no fraction or exponent) was never exercised at this layer, and no Long outside
+        // Int32 range was pinned anywhere. A transducer that rewrote only number tokens was
+        // byte-exact for every other corpus and shipped 7159-green, producing both a TYPE CHANGE
+        // visible on re-read (1.0 read back as Long, not Double) and a column-mapping id silently
+        // corrupted by Int32 overflow (3000000000 -> -1294967296).
+        new StructField("fifth", DataTypes.LongType, nullable: true, FieldMetadata.FromValues(new[]
+        {
+            // Integral-valued double: the ".0" branch. Without this the footer may spell it "1"
+            // and re-read as a different metadata type than the log.
+            new KeyValuePair<string, MetadataValue>("whole", MetadataValue.Double(1.0)),
+            new KeyValuePair<string, MetadataValue>("negwhole", MetadataValue.Double(-42.0)),
+            // Past Int32 range, and the 64-bit boundaries themselves.
+            new KeyValuePair<string, MetadataValue>("bigid", MetadataValue.Long(3000000000L)),
+            new KeyValuePair<string, MetadataValue>("maxlong", MetadataValue.Long(long.MaxValue)),
+            new KeyValuePair<string, MetadataValue>("minlong", MetadataValue.Long(long.MinValue)),
+            // Exponent and high-precision forms, so "R" formatting is pinned alongside ".0".
+            new KeyValuePair<string, MetadataValue>("tiny", MetadataValue.Double(1e-300)),
+        })),
     });
 
     /// <summary>
@@ -284,7 +304,8 @@ public sealed class ParquetWriterTests
             "\"delta.columnMapping.id\":12,\"delta.columnMapping.physicalName\":\"col-12\"," +
             "\"flag\":true,\"obj\":{\"deep\":{\"leaf\":\"x\"},\"inner\":9},\"ratio\":0.5}}," +
             "{\"name\":\"third\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}," +
-            "{\"name\":\"fourth\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\":\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\"}}]}";
+            "{\"name\":\"fourth\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\":\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\"}}," +
+        "{\"name\":\"fifth\",\"type\":\"long\",\"nullable\":true,\"metadata\":{\"bigid\":3000000000,\"maxlong\":9223372036854775807,\"minlong\":-9223372036854775808,\"negwhole\":-42.0,\"tiny\":1E-300,\"whole\":1.0}}]}";
 
     [Fact]
     public async Task WrittenFooter_PinsFieldMetadata_IncludingUnquotedColumnMappingIds()
@@ -684,61 +705,36 @@ public sealed class ParquetWriterTests
         // trivially. Tie it to the corpus so a broken parse cannot look like success.
         Assert.Equal(ScalarCorpusSchema.Count, pinnedTypeNames.Length);
 
-        var candidates = new List<DataType>
-        {
-            DataTypes.BooleanType, DataTypes.ByteType, DataTypes.ShortType, DataTypes.IntegerType,
-            DataTypes.LongType, DataTypes.FloatType, DataTypes.DoubleType, DataTypes.StringType,
-            DataTypes.BinaryType, DataTypes.DateType, DataTypes.TimestampType, DataTypes.TimestampNtzType,
-            DataTypes.NullType,
-            DataTypes.CreateDecimalType(1, 0), DataTypes.CreateDecimalType(9, 2),
-            DataTypes.CreateDecimalType(10, 0), DataTypes.CreateDecimalType(28, 7),
-            DataTypes.CreateDecimalType(28, 28),
-            DataTypes.CreateArrayType(DataTypes.StringType),
-            DataTypes.CreateMapType(DataTypes.StringType, DataTypes.LongType),
-            DataTypes.CreateStructType(new[] { new StructField("x", DataTypes.LongType) }),
-        };
+        // The candidate set is DERIVED by asking the writer across the whole DataType space --
+        // including the full decimal precision sweep -- not by reflecting over AtomicType
+        // subclasses. That earlier derivation reached 17 types; asking the writer reaches 95,
+        // because DecimalType is a parameterised family whose parameters are protocol-visible.
+        // Eleven-plus accepted types sat outside the old derivation's reach while it looked
+        // thorough: the same leaf-of-the-derivation defect, one level further out.
+        IReadOnlyList<DataType> accepted = await WriterAcceptedTypesAsync();
 
-        // Cross-check the candidate list against reflection over every CONCRETE DataType the engine
-        // declares — not just AtomicType subclasses. DecimalType, ArrayType, MapType and StructType
-        // all derive straight from DataType, so an AtomicType-scoped check would leave the entire
-        // parameterised decimal family outside its reach while appearing thorough.
-        string[] declaredTypes = typeof(DataType).Assembly.GetTypes()
-            .Where(t => !t.IsAbstract && typeof(DataType).IsAssignableFrom(t))
-            .Select(t => t.Name)
-            .OrderBy(n => n, StringComparer.Ordinal)
+        // Non-vacuity: an empty or collapsed support would make every check below pass trivially.
+        Assert.True(
+            accepted.Count >= 20,
+            $"Writer-accepted type support collapsed to {accepted.Count}.");
+
+        // What the GOLDEN corpus must pin, and what it deliberately does not.
+        //
+        // Pinning all 95 accepted types as literal bytes is neither possible nor useful -- the
+        // decimal family is unbounded in principle and its members differ only in two integers.
+        // The division of labour is explicit:
+        //   * every accepted NON-parameterised type must be pinned as bytes here, because each one
+        //     is a distinct arm of the serializer's type switch;
+        //   * the parameterised family is pinned at its BOUNDARIES (the widest precision the writer
+        //     accepts, and the maximum scale), because that is where its encoding can break;
+        //   * breadth across the interior of the family is covered by the GENERATED surface, whose
+        //     support is this same derived list.
+        // A type that is neither pinned nor generated would be invisible; none is.
+        string[] unparameterised = accepted
+            .Where(t => !t.TypeName.StartsWith("decimal", StringComparison.Ordinal))
+            .Select(t => t.TypeName)
             .ToArray();
-        string[] coveredTypes = candidates
-            .Select(t => t.GetType().Name)
-            .Distinct(StringComparer.Ordinal)
-            .OrderBy(n => n, StringComparer.Ordinal)
-            .ToArray();
-        Assert.Equal(declaredTypes, coveredTypes);
-
-        var accepted = new List<string>();
-        var rejected = new List<string>();
-        foreach (DataType candidate in candidates)
-        {
-            var probe = new StructType(new[] { new StructField("probe", candidate, nullable: true) });
-            try
-            {
-                await WriteAndReadFooterSchemaAsync(probe);
-                accepted.Add(candidate.TypeName);
-            }
-            catch (DeltaStorageException)
-            {
-                // The writer refuses this type, so no artifact assertion for it is possible.
-                rejected.Add(candidate.TypeName);
-            }
-        }
-
-        // Nested types and the void type are refused; everything else must be in the pinned corpus.
-        // (Type names here are the bare DataType.TypeName: "array"/"map"/"struct", and the null type
-        // spells itself "void" — both verified against the writer rather than assumed.)
-        Assert.Equal(
-            new[] { "array", "map", "struct", "void" },
-            rejected.OrderBy(n => n, StringComparer.Ordinal).ToArray());
-
-        string[] missing = accepted
+        string[] missing = unparameterised
             .Where(typeName => !pinnedTypeNames.Contains(typeName, StringComparer.Ordinal))
             .OrderBy(n => n, StringComparer.Ordinal)
             .ToArray();
@@ -747,6 +743,24 @@ public sealed class ParquetWriterTests
             "ParquetFileWriter accepts these types but WrittenFooter_PinsEveryScalarTypeTheWriterAccepts "
             + "does not pin them, so a footer/log divergence in them would ship undetected: "
             + string.Join(", ", missing));
+
+        // The widest accepted decimal precision must be pinned as bytes: it is the boundary, and a
+        // boundary that only the generator visits is a boundary nothing pins the wire shape of.
+        int widestPrecision = accepted
+            .OfType<DecimalType>()
+            .Max(d => d.Precision);
+        Assert.Contains(
+            pinnedTypeNames,
+            t => t.StartsWith($"decimal({widestPrecision},", StringComparison.Ordinal));
+
+        // The refusal boundary, asserted rather than described: nested types and the null type are
+        // the only shapes the writer rejects outright, which is exactly the scope of #713 and the
+        // reason no artifact assertion for them is possible at this HEAD.
+        string[] acceptedNames = accepted.Select(t => t.TypeName).ToArray();
+        Assert.DoesNotContain("array", acceptedNames, StringComparer.Ordinal);
+        Assert.DoesNotContain("map", acceptedNames, StringComparer.Ordinal);
+        Assert.DoesNotContain("struct", acceptedNames, StringComparer.Ordinal);
+        Assert.DoesNotContain("void", acceptedNames, StringComparer.Ordinal);
     }
 
     [Fact]
@@ -825,5 +839,282 @@ public sealed class ParquetWriterTests
         await Assert.ThrowsAsync<OperationCanceledException>(
             async () => await new ParquetFileWriter(rowGroupRowLimit: 1024)
                 .WriteAsync(stream, schema, new[] { batch }, cts.Token));
+    }
+
+    /// <summary>
+    /// GENERATED artifact surface: the primary call-site divergence assertion.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Every pinned corpus in this file enumerates one axis — scalar type, metadata value kind,
+    /// string-encoding position, numeric token shape — and nine review rounds established the
+    /// pattern that closing the axis you were shown leaves the next one hand-listed. This test
+    /// replaces axis enumeration for the divergence property: the oracle is
+    /// <c>footer == SchemaJson.ToJson(schema)</c>, which is axis-free, so a rogue at the writer's
+    /// call site is caught by any generated schema that reaches the shape it mishandles, whether or
+    /// not anyone thought of that shape.
+    /// </para>
+    /// <para>
+    /// SCOPE — stated precisely, because the temptation to overclaim here is exactly the failure
+    /// mode this PR keeps rediscovering. Generation is sound and strictly subsumes axis
+    /// enumeration for call-site divergence, but it does <b>not</b> close the space by
+    /// construction: the enumeration relocates into the generator's <i>support</i>. A shape the
+    /// support cannot express is still invisible. This is one derived surface instead of N derived
+    /// guards plus a hand-list of axes — a large reduction, not elimination.
+    /// </para>
+    /// <para>
+    /// The goldens remain necessary and are not superseded. This assertion compares the footer
+    /// against the shared serializer, so it cannot see drift <i>inside</i> that serializer, where
+    /// both sides move together. Only the pinned bytes can.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task GeneratedSchemas_FooterAlwaysMatchesTheSharedSerializer()
+    {
+        IReadOnlyList<DataType> support = await WriterAcceptedTypesAsync();
+
+        // The support is DERIVED by asking the writer across the whole DataType space, including
+        // the full decimal parameter sweep — not by reflecting over AtomicType subclasses, which
+        // leaves every parameterised type outside its reach while appearing thorough.
+        Assert.True(
+            support.Count >= 20,
+            $"Writer-accepted type support collapsed to {support.Count}; the generator would be "
+            + "exercising a fraction of the type space while still passing.");
+
+        var rng = new DeterministicRng(20260728);
+        for (int i = 0; i < 200; i++)
+        {
+            StructType schema = GenerateSchema(rng, support);
+            string footer = await WriteAndReadFooterSchemaAsync(schema);
+            Assert.Equal(SchemaJson.ToJson(schema), footer);
+        }
+    }
+
+    /// <summary>
+    /// Asks the WRITER which types it accepts, by attempting a real write of each candidate. The
+    /// property we care about is acceptance, not the shape of the code that decides it, so this
+    /// never reads <c>ParquetTypeMapping</c>'s switch. The decimal family is swept across its full
+    /// precision range rather than sampled, because its parameters are protocol-visible.
+    /// </summary>
+    private static async Task<IReadOnlyList<DataType>> WriterAcceptedTypesAsync()
+    {
+        var candidates = new List<DataType>();
+
+        // Every non-abstract DataType the engine declares that exposes a parameterless singleton.
+        foreach (System.Reflection.PropertyInfo property in typeof(DataTypes).GetProperties(
+            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static))
+        {
+            if (typeof(DataType).IsAssignableFrom(property.PropertyType)
+                && property.GetValue(null) is DataType singleton)
+            {
+                candidates.Add(singleton);
+            }
+        }
+
+        // Full decimal parameter sweep. Scale extremes at every precision: the accepted region is
+        // bounded by precision, and both bounds are protocol-visible in schemaString.
+        for (int precision = 1; precision <= 38; precision++)
+        {
+            foreach (int scale in new[] { 0, precision / 2, precision })
+            {
+                candidates.Add(DataTypes.CreateDecimalType(precision, scale));
+            }
+        }
+
+        candidates.Add(DataTypes.CreateArrayType(DataTypes.StringType));
+        candidates.Add(DataTypes.CreateMapType(DataTypes.StringType, DataTypes.LongType));
+        candidates.Add(DataTypes.CreateStructType([new StructField("x", DataTypes.LongType)]));
+
+        var accepted = new List<DataType>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (DataType candidate in candidates)
+        {
+            if (!seen.Add(candidate.TypeName))
+            {
+                continue;
+            }
+
+            try
+            {
+                await WriteAndReadFooterSchemaAsync(
+                    new StructType([new StructField("probe", candidate, nullable: true)]));
+                accepted.Add(candidate);
+            }
+            catch (DeltaStorageException)
+            {
+                // Refused by the writer, so no artifact assertion for it is possible at all.
+            }
+        }
+
+        return accepted;
+    }
+
+    private static StructType GenerateSchema(DeterministicRng rng, IReadOnlyList<DataType> support)
+    {
+        int fieldCount = 1 + rng.Next(4);
+        var fields = new List<StructField>(fieldCount);
+        var usedNames = new HashSet<string>(StringComparer.Ordinal);
+        for (int i = 0; i < fieldCount; i++)
+        {
+            string name = GenerateString(rng);
+            if (!usedNames.Add(name))
+            {
+                name += i.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                usedNames.Add(name);
+            }
+
+            fields.Add(new StructField(
+                name,
+                support[rng.Next(support.Count)],
+                nullable: rng.Next(2) == 0,
+                GenerateMetadata(rng, depth: 0)));
+        }
+
+        return new StructType(fields);
+    }
+
+    private static FieldMetadata GenerateMetadata(DeterministicRng rng, int depth)
+    {
+        int count = rng.Next(depth == 0 ? 4 : 3);
+        var entries = new List<KeyValuePair<string, MetadataValue>>(count);
+        var usedKeys = new HashSet<string>(StringComparer.Ordinal);
+        for (int i = 0; i < count; i++)
+        {
+            string key = GenerateString(rng);
+            if (!usedKeys.Add(key))
+            {
+                continue;
+            }
+
+            entries.Add(new KeyValuePair<string, MetadataValue>(key, GenerateValue(rng, depth)));
+        }
+
+        return FieldMetadata.FromValues(entries.ToArray());
+    }
+
+    private static MetadataValue GenerateValue(DeterministicRng rng, int depth)
+    {
+        // Every MetadataValueKind is reachable; Array and Nested recurse to a bounded depth so
+        // compositions no hand-written corpus expresses are generated.
+        MetadataValueKind[] kinds = Enum.GetValues<MetadataValueKind>();
+        MetadataValueKind kind = kinds[rng.Next(kinds.Length)];
+        if (depth >= 2 && (kind == MetadataValueKind.Array || kind == MetadataValueKind.Nested))
+        {
+            kind = MetadataValueKind.Long;
+        }
+
+        switch (kind)
+        {
+            case MetadataValueKind.Long:
+                return MetadataValue.Long(GenerateLong(rng));
+            case MetadataValueKind.Double:
+                return MetadataValue.Double(GenerateDouble(rng));
+            case MetadataValueKind.Boolean:
+                return MetadataValue.Boolean(rng.Next(2) == 0);
+            case MetadataValueKind.Null:
+                return MetadataValue.Null;
+            case MetadataValueKind.Array:
+                int items = rng.Next(4);
+                var array = new MetadataValue[items];
+                for (int i = 0; i < items; i++)
+                {
+                    array[i] = GenerateValue(rng, depth + 1);
+                }
+
+                return MetadataValue.Array(array);
+            case MetadataValueKind.Nested:
+                return MetadataValue.Nested(GenerateMetadata(rng, depth + 1));
+            default:
+                return MetadataValue.String(GenerateString(rng));
+        }
+    }
+
+    /// <summary>
+    /// Longs across the FULL 64-bit range, with the boundaries and the Int32 edges weighted in:
+    /// a transducer that narrowed ids to Int32 corrupted 3000000000 to -1294967296 silently.
+    /// </summary>
+    private static long GenerateLong(DeterministicRng rng) => rng.Next(6) switch
+    {
+        0 => long.MinValue,
+        1 => long.MaxValue,
+        2 => int.MaxValue,
+        3 => (long)int.MaxValue + 1,
+        4 => int.MinValue,
+        _ => unchecked((long)rng.NextUInt64()),
+    };
+
+    /// <summary>
+    /// Doubles including INTEGRAL values, which are the ones that exercise WriteDouble's ".0"
+    /// branch and whose omission let a number-token rogue change a metadata value's type on
+    /// re-read (Double 1.0 spelled "1" reads back as Long).
+    /// </summary>
+    private static double GenerateDouble(DeterministicRng rng) => rng.Next(6) switch
+    {
+        0 => 0.0,
+        1 => 1.0,
+        2 => -42.0,
+        3 => 1e-300,
+        4 => double.MaxValue,
+        // Finite only: NaN and the infinities are not JSON numbers at all, so they are a
+        // SHARED-serializer question rather than a footer/log divergence one, and the equality
+        // oracle here is blind to them by construction. Tracked separately.
+        _ => BitConverter.Int64BitsToDouble(unchecked((long)rng.NextUInt64())) is double d
+            && double.IsFinite(d) ? d : 0.5,
+    };
+
+    /// <summary>
+    /// Strings across the character classes the encoder treats differently: plain ASCII, the
+    /// control range, the quote and backslash, non-ASCII BMP, and astral codepoints (which the
+    /// encoder emits as a surrogate PAIR).
+    /// </summary>
+    private static string GenerateString(DeterministicRng rng)
+    {
+        int length = 1 + rng.Next(6);
+        var chars = new System.Text.StringBuilder(length);
+        for (int i = 0; i < length; i++)
+        {
+            switch (rng.Next(6))
+            {
+                case 0:
+                    chars.Append((char)('a' + rng.Next(26)));
+                    break;
+                case 1:
+                    chars.Append((char)(1 + rng.Next(0x20)));
+                    break;
+                case 2:
+                    chars.Append(rng.Next(2) == 0 ? '"' : '\\');
+                    break;
+                case 3:
+                    chars.Append((char)(0x80 + rng.Next(0x300)));
+                    break;
+                case 4:
+                    chars.Append(char.ConvertFromUtf32(0x10000 + rng.Next(0x1000)));
+                    break;
+                default:
+                    chars.Append((char)(0x2000 + rng.Next(0x2000)));
+                    break;
+            }
+        }
+
+        return chars.ToString();
+    }
+
+    /// <summary>
+    /// Seeded xorshift64*. Deterministic by construction so a failure is reproducible from the
+    /// seed alone, and independent of any ambient randomness source.
+    /// </summary>
+    private sealed class DeterministicRng(ulong seed)
+    {
+        private ulong _state = seed == 0 ? 0x9E3779B97F4A7C15UL : seed;
+
+        public ulong NextUInt64()
+        {
+            _state ^= _state >> 12;
+            _state ^= _state << 25;
+            _state ^= _state >> 27;
+            return unchecked(_state * 0x2545F4914F6CDD1DUL);
+        }
+
+        public int Next(int exclusiveBound) => (int)(NextUInt64() % (ulong)exclusiveBound);
     }
 }
