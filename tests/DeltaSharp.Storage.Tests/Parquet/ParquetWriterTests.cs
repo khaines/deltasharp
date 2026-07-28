@@ -857,10 +857,20 @@ public sealed class ParquetWriterTests
     /// <para>
     /// SCOPE — stated precisely, because the temptation to overclaim here is exactly the failure
     /// mode this PR keeps rediscovering. Generation is sound and strictly subsumes axis
-    /// enumeration for call-site divergence, but it does <b>not</b> close the space by
-    /// construction: the enumeration relocates into the generator's <i>support</i>. A shape the
-    /// support cannot express is still invisible. This is one derived surface instead of N derived
-    /// guards plus a hand-list of axes — a large reduction, not elimination.
+    /// enumeration for call-site divergence, but <b>enumeration cannot be eliminated, only
+    /// relocated to one auditable place</b>. It relocates here, into the per-position value
+    /// domains below. A generator drawing doubles from <c>[0,1)</c> would miss an integral-double
+    /// rogue with probability ~1 — exactly as a hand corpus containing only <c>0.5</c> does. The
+    /// win is that N scattered hand-lists became one surface that a reviewer can read in a single
+    /// sitting; the domains are still chosen, and they are now the thing to review.
+    /// </para>
+    /// <para>
+    /// This is also why <c>GeneratedValueDomains_AreNotSilentlyNarrowed</c> exists. Every earlier
+    /// guard in this file derives its <i>set</i> — types from writer acceptance, kinds from the
+    /// enum, escape forms probed from the serializer — but all of those range over strings and
+    /// kinds. Nothing constrained the <i>value</i> inside a numeric kind, which is how an
+    /// integral-double rogue survived. A domain narrowed by a well-meaning edit must fail loudly
+    /// rather than quietly reduce coverage, so the domains are asserted, not just documented.
     /// </para>
     /// <para>
     /// The goldens remain necessary and are not superseded. This assertion compares the footer
@@ -887,6 +897,121 @@ public sealed class ParquetWriterTests
             StructType schema = GenerateSchema(rng, support);
             string footer = await WriteAndReadFooterSchemaAsync(schema);
             Assert.Equal(SchemaJson.ToJson(schema), footer);
+        }
+    }
+
+    /// <summary>
+    /// Audits the generator's VALUE DOMAINS, which are where enumeration now lives.
+    /// </summary>
+    /// <remarks>
+    /// The sibling test's oracle is axis-free, so it can only catch a rogue on a shape its
+    /// generator actually produces. That makes the domains load-bearing in exactly the way a hand
+    /// corpus used to be: a generator drawing doubles from <c>[0,1)</c> misses an integral-double
+    /// rogue with probability ~1. Narrowing a domain — by an innocent-looking edit to a
+    /// <c>switch</c> arm — would silently reduce coverage while every test stayed green, which is
+    /// the failure this file has been correcting for ten rounds. So the domains are asserted
+    /// against the same generator, on the same seed, rather than described in prose.
+    /// </remarks>
+    [Fact]
+    public async Task GeneratedValueDomains_AreNotSilentlyNarrowed()
+    {
+        IReadOnlyList<DataType> support = await WriterAcceptedTypesAsync();
+        var rng = new DeterministicRng(20260728);
+
+        var kinds = new HashSet<MetadataValueKind>();
+        var typeNames = new HashSet<string>(StringComparer.Ordinal);
+        bool integralDouble = false;
+        bool exponentDouble = false;
+        bool longBeyondInt32 = false;
+        bool longAtBoundary = false;
+        bool astralCodepoint = false;
+        bool controlCharacter = false;
+        bool quoteOrBackslash = false;
+        bool nonAsciiBmp = false;
+
+        for (int i = 0; i < 200; i++)
+        {
+            StructType schema = GenerateSchema(rng, support);
+            foreach (StructField field in schema)
+            {
+                typeNames.Add(field.DataType.TypeName);
+                InspectString(field.Name);
+                InspectMetadata(field.Metadata);
+            }
+        }
+
+        // Numeric domains: the axis that no earlier guard constrained, because every other guard
+        // ranges over strings and kinds rather than the value inside a kind.
+        Assert.True(integralDouble, "No integral-valued double generated: WriteDouble's \".0\" branch is unreachable.");
+        Assert.True(exponentDouble, "No exponent-form double generated.");
+        Assert.True(longBeyondInt32, "No long outside Int32 range generated: an Int32-narrowing rogue would survive.");
+        Assert.True(longAtBoundary, "Neither 64-bit boundary generated.");
+
+        // String domains: the character classes the encoder treats differently.
+        Assert.True(astralCodepoint, "No astral codepoint generated: surrogate-pair encoding is unexercised.");
+        Assert.True(controlCharacter, "No control character generated.");
+        Assert.True(quoteOrBackslash, "Neither quote nor backslash generated.");
+        Assert.True(nonAsciiBmp, "No non-ASCII BMP character generated.");
+
+        // Kind and type domains, derived from the same sources the generator draws from.
+        Assert.Equal(Enum.GetValues<MetadataValueKind>().OrderBy(k => k), kinds.OrderBy(k => k));
+        Assert.True(
+            typeNames.Count >= 20,
+            $"Only {typeNames.Count} distinct types generated across 200 schemas.");
+
+        void InspectMetadata(FieldMetadata metadata)
+        {
+            foreach (KeyValuePair<string, MetadataValue> entry in metadata)
+            {
+                InspectString(entry.Key);
+                InspectValue(entry.Value);
+            }
+        }
+
+        void InspectValue(MetadataValue value)
+        {
+            kinds.Add(value.Kind);
+            switch (value.Kind)
+            {
+                case MetadataValueKind.Double:
+                    double d = value.AsDouble();
+                    string text = d.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
+                    integralDouble |= double.IsFinite(d) && text.IndexOfAny(['.', 'e', 'E']) < 0;
+                    exponentDouble |= text.IndexOfAny(['e', 'E']) >= 0;
+                    break;
+                case MetadataValueKind.Long:
+                    long l = value.AsLong();
+                    longBeyondInt32 |= l > int.MaxValue || l < int.MinValue;
+                    longAtBoundary |= l == long.MaxValue || l == long.MinValue;
+                    break;
+                case MetadataValueKind.String:
+                    InspectString(value.AsString());
+                    break;
+                case MetadataValueKind.Array:
+                    foreach (MetadataValue item in value.AsArray())
+                    {
+                        InspectValue(item);
+                    }
+
+                    break;
+                case MetadataValueKind.Nested:
+                    InspectMetadata(value.AsNested());
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        void InspectString(string text)
+        {
+            for (int i = 0; i < text.Length; i++)
+            {
+                char c = text[i];
+                astralCodepoint |= char.IsHighSurrogate(c);
+                controlCharacter |= c < 0x20;
+                quoteOrBackslash |= c is '"' or '\\';
+                nonAsciiBmp |= c >= 0x80 && !char.IsSurrogate(c);
+            }
         }
     }
 
