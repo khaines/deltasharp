@@ -70,20 +70,34 @@ namespace DeltaSharp.Storage.Delta;
 /// <item><description>each top-level boolean operand (split on <c>&amp;&amp;</c> / <c>||</c>) of every
 /// condition, and</description></item>
 /// <item><description>each <c>return</c>, <c>continue</c> and <c>break</c>, and</description></item>
-/// <item><description>each boolean-valued STATE WRITE — an assignment whose right-hand side contains a
-/// comparison or <c>ReferenceEquals</c>, and</description></item>
+/// <item><description>each STATE WRITE WHOSE VALUE PARTICIPATES IN A VALIDATION DECISION — NOT merely the
+/// boolean-valued ones. The narrower boolean phrasing was this rule's own first defect (council R3, balanced
+/// seat): it is narrower than the audit actually performed, and it would mislead the next person extending
+/// it. The interval bounds, the lineage endpoints, the witness order, <c>cursor</c>'s seed and advance, and
+/// the recorded-version list are all non-boolean and all load-bearing; they were audited separately and
+/// killed (8/71/72/64/74/6/1/74/74/71/74 red), so the narrow rule concealed no gap at this HEAD — but it did
+/// understate its own scope, and</description></item>
 /// <item><description>each ORDERING constraint between a state write and a validation call.</description>
 /// </item>
 /// </list>
 /// <para>That rule yields <b>29</b> points: 26 conditions/exits, 2 boolean state writes, 1 ordering
-/// constraint. It also explains the historical misses. Categories 3 and 4 are not <c>if</c> statements, so a
+/// constraint. <b>An earlier draft claimed this was corroborated by the mechanical count of categories 1+2
+/// matching a hand audit's 26. That claim is RETRACTED: the totals agreed over DIFFERENT SETS</b> — the hand
+/// audit's 26 included two state writes this rule assigns to another category. Re-derived at the broadened
+/// scope the same way, the two enumerations again differ (13 non-boolean writes by rule, 11 by hand: the rule
+/// separately counts <c>_sealed = true</c>, already the ordering constraint, and splits <c>cursor</c>'s seed
+/// from its advance; the hand list counts an argument-ORDER mutation that is not a write at all). Two counts
+/// agreeing is not evidence the sets agree, and agreeing totals over different sets is precisely the error
+/// this file has been caught by twice. Compare enumerations SET-WISE or not at all. The rule does, however,
+/// explain the historical misses. Categories 3 and 4 are not <c>if</c> statements, so a
 /// guard-shaped enumeration cannot see them — and those three sites are EXACTLY the three fail-opens found by
 /// review rather than by this file's own audit: the chain-closure <c>ReferenceEquals</c> (write), the
 /// <c>endMetadataAccounted</c> <c>ReferenceEquals</c> (write), and <see cref="Seal"/>'s ordering. The lesson
 /// generalises past this file: an audit that enumerates conditions will systematically miss validation logic
 /// that lives in an assignment.</para>
 ///
-/// <para><b>Result of running all 29: 26 killed, 3 survivors, none fail-open.</b> Attribution is stated as
+/// <para><b>Result: 26 of the 29 killed; of the three survivors two are equivalent and one is half of a
+/// masking pair (see below). No point fails open at this HEAD.</b> Attribution is stated as
 /// two SEPARATE properties, because asserting the stronger one over the whole file was wrong three times:</para>
 /// <list type="bullet">
 /// <item><description><b>Disjoint in identity — the four conjuncts of
@@ -101,27 +115,35 @@ namespace DeltaSharp.Storage.Delta;
 /// false.</description></item>
 /// </list>
 ///
-/// <para><b>The three survivors, classified — and the classification matters more than the count.</b></para>
+/// <para><b>The survivors, classified — and the classification matters more than the count.</b> Two are
+/// genuinely equivalent; the third turned out not to be a survivor at all but half of a masking pair.</para>
 /// <list type="number">
 /// <item><description><b>Execution-falsified equivalent (1).</b> The <c>!HasCoverage</c> disjunct in
 /// <see cref="TryGetProvenObservation"/>: with no coverage the interval is <c>[0, 0)</c>, so the bounds
 /// beside it already reject every version. FOUR independent falsification attempts, over
 /// <c>{long.MinValue, -1, 0, 1, 99, 100, long.MaxValue}</c> against four observer states, over
 /// <c>{MinValue, -1, 0, 1, MaxValue}</c> including the <c>version = -1</c> overflow edge, plus the proof that
-/// <c>CoveredToExclusive != 0</c> implies <see cref="HasCoverage"/>. None could distinguish it.</description>
+/// <c>CoveredToExclusive != 0</c> implies <see cref="HasCoverage"/>. None could distinguish it. Cross-checked
+/// for VACUITY from the other side: forcing the <c>HasCoverage</c> WRITE always-false turns 71 red, so the
+/// surrounding machinery is live and the disjunct's survival really is about the disjunct.</description>
 /// </item>
 /// <item><description><b>Equivalent as a CONSEQUENCE of the ordering fix (1).</b> <see cref="Seal"/>'s
 /// idempotent early return. Because the flag is now set only after the check PASSES, and <see cref="Record"/>
 /// refuses to mutate a sealed window, a repeated <see cref="Seal"/> re-runs a deterministic check over frozen
 /// state and reaches the same verdict — pass/pass or throw/throw. It is a memoisation, not a guard. It was
 /// NOT equivalent before that fix; see below.</description></item>
-/// <item><description><b>ARGUED equivalent, not execution-falsified (1) — the weakest claim in this file.</b>
-/// The <c>break</c> after <c>chained = false</c> in the chain walk. <c>chained</c> is monotone: nothing ever
-/// sets it back to true, and the loop's only other effect is advancing <c>cursor</c>, which is consumed
-/// solely by a conjunction that is already false. So continuing the walk cannot change the verdict. This is
-/// the ONLY equivalence here resting on an argument rather than a swept space, and by the rule stated below
-/// that makes it the one most likely to be wrong. Flagged deliberately so the next reader attacks it first
-/// rather than trusting it.</description></item>
+/// <item><description><b>NOT equivalent — one half of a MUTUALLY-MASKING PAIR (2 points).</b> The
+/// <c>break</c> after <c>chained = false</c>, and that write itself. Each survives ALONE and neither is
+/// equivalent: remove the <c>break</c> and the already-latched <c>false</c> preserves the verdict; flip the
+/// write to <c>true</c> and the surviving <c>break</c> leaves <c>cursor</c> stale, which the chain-CLOSURE
+/// conjunct then rejects. Neuter BOTH and the walk fails OPEN — caught by
+/// <c>APartiallyOmittedNonFinalRevision</c> (measured: 0 red, 0 red, 1 red). Two prior analyses called this
+/// site equivalent on arguments that are individually TRUE but are not the reason: that <c>chained</c> is
+/// monotone, and that the loop writes zero instance state so there is no prior-call dimension. Both are
+/// correct and both miss the masking partner. <b>The transferable point: single-point mutation analysis is
+/// structurally blind to mutually-masking pairs</b>, so a survivor may be neither killed-elsewhere nor
+/// equivalent, but half of a pair that must be mutated together. Six independent audits of this type all used
+/// single-point mutation and none could have seen this.</description></item>
 /// </list>
 ///
 /// <para><b>Safer-direction survivors: a third category, distinct from equivalent.</b> A mutant that makes
