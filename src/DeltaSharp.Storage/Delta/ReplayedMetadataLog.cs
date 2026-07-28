@@ -60,31 +60,46 @@ namespace DeltaSharp.Storage.Delta;
 /// <para>Each layer therefore has its OWN discriminating test rather than sharing an end-behaviour one. The
 /// precise, audited form of that claim (council R2 — the earlier unqualified wording was falsified by a
 /// surviving mutant, so it is stated here only to the extent it has actually been checked):
-/// <b>every mutation point in this type was individually neutered and the whole suite run</b>. Fourteen in
-/// total, in three categories — the third category is the one that matters, because it is the class a
+/// <b>every mutation point in this type was individually neutered and the whole suite run</b>. FOURTEEN in
+/// total — thirteen guards plus one ORDERING constraint (<see cref="Seal"/>'s, which is not an <c>if</c> but
+/// is a mutation point with its own oracle, and is counted separately precisely because it was the thing a
+/// guard was concealing). Three categories; the third is the one that matters, because it is the class a
 /// fail-closed suite is STRUCTURALLY INCAPABLE of detecting:</para>
 /// <list type="number">
-/// <item><description><b>Killed (12).</b> Each turns a specific, non-overlapping set of tests red. The four
-/// conjuncts of <see cref="EnsureLineageIsAccountedFor"/> turn exactly ONE red each, and a different one.
-/// </description></item>
-/// <item><description><b>Provably equivalent (2), each falsified against a recorded state space rather than
-/// argued.</b> An equivalence claim is only as good as the space it survived, so the space is recorded here,
-/// not just the verdict. (a) The <c>!HasCoverage</c> disjunct in <see cref="TryGetProvenObservation"/>: with
-/// no coverage the interval is <c>[0, 0)</c>, so the bounds beside it already reject every version — swept
-/// over <c>{long.MinValue, -1, 0, 1, 99, 100, long.MaxValue}</c> against four observer states, plus the
-/// proof that <c>CoveredToExclusive != 0</c> implies <see cref="HasCoverage"/>. (b) <see cref="Seal"/>'s
-/// idempotent early return, but ONLY as a consequence of the ordering fix below: because the flag is now set
-/// only after the check PASSES, and <see cref="Record"/> refuses to mutate a sealed window, a repeated
-/// <see cref="Seal"/> re-runs a deterministic check over frozen state and reaches the same verdict — pass,
-/// pass or throw, throw. It is a memoisation, not a guard.</description></item>
+/// <item><description><b>Killed (12).</b> Two DIFFERENT properties hold here and they must be stated
+/// separately, because asserting the stronger one over both groups was wrong. (a) The four conjuncts of
+/// <see cref="EnsureLineageIsAccountedFor"/> are disjoint in COUNT AND IDENTITY: exactly one red each, four
+/// different tests. (b) The interval guards (the two coverage bounds and the exclusive window bound) are each
+/// individually DISCRIMINATING but NOT disjoint — their red sets are pairwise distinct yet overlapping, and
+/// the window bound's single red is a strict SUBSET of the upper coverage bound's. Every observable guard
+/// still has a discriminating oracle; "non-overlapping" as a blanket adjective was simply
+/// false.</description></item>
+/// <item><description><b>Provably equivalent (2), each falsified BY EXECUTION against a recorded state space
+/// rather than argued from the shape of the code.</b> An equivalence claim is only as good as the space it
+/// survived, so the space is recorded here, not just the verdict. (a) The <c>!HasCoverage</c> disjunct in
+/// <see cref="TryGetProvenObservation"/>: with no coverage the interval is <c>[0, 0)</c>, so the bounds
+/// beside it already reject every version — THREE independent falsification attempts, over
+/// <c>{long.MinValue, -1, 0, 1, 99, 100, long.MaxValue}</c> against four observer states, over
+/// <c>{MinValue, -1, 0, 1, MaxValue}</c> including the <c>version = -1</c> overflow edge, plus the proof that
+/// <c>CoveredToExclusive != 0</c> implies <see cref="HasCoverage"/>. None could distinguish it; it holds.
+/// (b) <see cref="Seal"/>'s idempotent early return, but ONLY as a consequence of the ordering fix below:
+/// because the flag is now set only after the check PASSES, and <see cref="Record"/> refuses to mutate a
+/// sealed window, a repeated <see cref="Seal"/> re-runs a deterministic check over frozen state and reaches
+/// the same verdict — pass/pass or throw/throw. It is a memoisation, not a guard.</description></item>
 /// <item><description><b>Safer-direction survivors (0 now; 1 before the ordering fix).</b> A mutant that makes
 /// the code fail closed MORE cannot be killed by a suite whose assertions are "must throw" — it is invisible
 /// to the method, not absent from the code. Before the fix, deleting <see cref="Seal"/>'s early return made a
-/// retried seal re-throw instead of returning silently: strictly safer, therefore unkillable, therefore
-/// mistaken for redundant by two separate audits. What that survivor was CONCEALING was the real defect — the
-/// ordering, now guard 14 and killed. Any future survivor here must be classified into this bucket before it
-/// is called equivalent.</description></item>
+/// retried seal re-throw instead of returning silently: strictly safer, therefore unkillable. Any future
+/// survivor here must be excluded from this bucket BEFORE it may be called equivalent.</description></item>
 /// </list>
+/// <para><b>Why that last rule is stated so bluntly.</b> <see cref="Seal"/>'s early return was independently
+/// assessed as unkillable by two reviewers using two DIFFERENT arguments — one swept four observer states
+/// against three <see cref="Seal"/> calls, the other reasoned that <see cref="Record"/> throws after sealing
+/// so the check is pure over frozen state — and BOTH were wrong, because the distinguishing input requires a
+/// PRIOR FAILED CALL, a dimension neither ranged over. What the survivor concealed was a real fail-open: the
+/// ordering underneath it. Three people have now re-derived that wrong conclusion, so it is written down: an
+/// equivalence claim here must be falsified by EXECUTION over a state space that includes prior-call
+/// OUTCOMES, never argued from the shape of the code.</para>
 ///
 /// <para><b>Single extraction site.</b> <see cref="MetadataActionsOf"/> is the ONE place a commit's
 /// <c>metaData</c> actions are picked out of its parsed actions; the gate's disk-fallback path calls the same
