@@ -290,7 +290,10 @@ public sealed class SharedDiagnosticTextContractTests
         // than this refund creates a k that fails while a larger k succeeds. Computed here and asserted
         // below rather than written into SanitizeToBudget's comment as a literal, where the same sentence
         // in the Core sibling was wrong by one in the direction that would send a maintainer to a
-        // NON-discriminating corpus.
+        // NON-discriminating corpus. It was wrong there because it was RIGHT here and then copied: this
+        // renderer separates with ", " and the struct with a single ',', so a separator-derived figure
+        // shared across the pair is correct at its origin and off by exactly the difference at its
+        // destination. Both sites compute it now, which is the only form of that sentence safe to copy.
         int refund = ", ".Length + MarkerWidth(1);
 
         foreach (int itemLength in new[] { 1, 2, 3, 4, 6, 8, 10, 11, 12, 18 })

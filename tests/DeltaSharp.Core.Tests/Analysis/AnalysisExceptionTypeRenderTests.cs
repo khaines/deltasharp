@@ -976,6 +976,13 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// borrows nothing from the renderer. The assertion is EQUALITY, not a bound: a count too small is the
     /// defect, and a count too large would mean the model is optimistic and the test itself unsound. It
     /// holds on every one of the cells below.</para>
+    /// <para><b>The anti-vacuity half also catches a blinded oracle, not just a drifted corpus.</b>
+    /// Anchoring the search to <c>shown</c> and <c>shown + 1</c> AND reverting the scan silences the
+    /// counterexample assertion completely — nothing is reported, because an oracle that starts from the
+    /// renderer's answer cannot contradict it. The corpus-region assertions still fail, since the anchored
+    /// search collapses the discriminating set to empty and the tightness check reads zero where it expects
+    /// the dearest discriminating field. So the two halves are not the same claim twice: one says the
+    /// renderer is right, the other says this test is still in a position to tell.</para>
     /// <para><b>Why the scan is over every k and not over shown + 1.</b> A reviewer building this same
     /// oracle independently reported clean on its first attempt, because it asked only whether ONE more
     /// field would have fitted. The marker vanishes outright at k == fieldCount, so the smallest count
@@ -1000,7 +1007,13 @@ public sealed class AnalysisExceptionTypeRenderTests
         // What reaching the final field refunds: the separator the marker would have needed, plus the
         // marker for a single hidden field. A field whose marginal cost is strictly below this creates a
         // count that fails while a larger one succeeds, which is the whole region this test exists for.
-        // Computed, not stated, so that it cannot be quoted stale.
+        //
+        // Computed rather than stated, and the reason is sharper than "figures go stale". The number that
+        // stood here was CORRECT — at the sibling site. That renderer separates with ", " and this one with
+        // a single ',', so one sentence copied across the pair without re-measuring is right in one file and
+        // wrong in the other, which is the hardest form to catch by reading: it survives comparison with its
+        // twin. Every quantity these two walks derive from their separator is exposed to that copy, so both
+        // now compute it. The sentence still travels; the number no longer does.
         int refund = 1 + MarkerWidth(1);
         var misruled = new List<string>();
         int dearestDiscriminating = 0;
