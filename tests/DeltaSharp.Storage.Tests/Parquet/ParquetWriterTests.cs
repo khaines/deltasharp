@@ -1087,6 +1087,30 @@ public sealed class ParquetWriterTests
     /// The schemas the cardinality sweep writes: every count above, in every collection-valued
     /// position the model has, with <c>Nullable</c> varied across them.
     /// </summary>
+    /// <summary>
+    /// Content for slot <paramref name="i"/> of a swept collection, rotating through the boundary
+    /// classes the degrees-of-freedom guard requires so that every class occurs INSIDE a
+    /// collection of every swept size.
+    /// </summary>
+    /// <remarks>
+    /// The rotation is by index rather than by a hand-placed special case, so the classes land in
+    /// every collection regardless of its size, and the long one appears once per collection
+    /// rather than in every slot -- a 257-entry collection of 4097-character keys is a megabyte of
+    /// metadata for no extra coverage.
+    /// </remarks>
+    private static string ContentAt(int i, string plain, bool allowEmpty) =>
+        // Exactly ONE empty slot per collection, not one in seven: an empty key repeated is a
+        // single dictionary entry, so a rotating empty silently SHRANK the collections it was
+        // meant to decorate and pulled the cardinality axis back below its own boundary.
+        i == 2 && allowEmpty
+            ? string.Empty
+            : (i % 7) switch
+            {
+                1 => "caf\u00E9\u2028\uD83D\uDE00" + plain,
+                3 => plain + new string('m', MinimumLongestString),
+                _ => plain,
+            };
+
     private static IEnumerable<(string What, StructType Schema)> CardinalitySweepSchemas()
     {
         foreach (int n in CardinalityCounts)
@@ -1099,7 +1123,13 @@ public sealed class ParquetWriterTests
                 var fields = new List<StructField>();
                 for (int i = 0; i < n; i++)
                 {
-                    fields.Add(new StructField($"f{i}", DataTypes.LongType, nullable: i % 2 == 0));
+                    // CARDINALITY x ENCODING. The counts used to carry nothing but plain ASCII, so
+                    // "large collections are covered" and "hostile content is covered" were both
+                    // true while the cell where a LARGE collection carries HOSTILE content was
+                    // covered by neither. Content classes are mixed in at every count.
+                    fields.Add(new StructField(
+                        ContentAt(i, $"f{i}", allowEmpty: false), DataTypes.LongType,
+                        nullable: i % 2 == 0));
                 }
 
                 yield return ($"{n} fields", new StructType(fields));
@@ -1110,7 +1140,8 @@ public sealed class ParquetWriterTests
             for (int i = 0; i < n; i++)
             {
                 entries.Add(new KeyValuePair<string, MetadataValue>(
-                    $"a.tenant.tag{i:D3}", MetadataValue.String($"v{i}")));
+                    ContentAt(i, $"a.tenant.tag{i:D3}", allowEmpty: true),
+                    MetadataValue.String(ContentAt(i + 1, $"v{i}", allowEmpty: true))));
             }
 
             entries.Add(new KeyValuePair<string, MetadataValue>(
@@ -1131,7 +1162,7 @@ public sealed class ParquetWriterTests
             var items = new List<MetadataValue>();
             for (int i = 0; i < n; i++)
             {
-                items.Add(MetadataValue.String($"e{i}"));
+                items.Add(MetadataValue.String(ContentAt(i, $"e{i}", allowEmpty: true)));
             }
 
             yield return ($"{n} array elements", new StructType(
@@ -1191,9 +1222,10 @@ public sealed class ParquetWriterTests
     public void SchemaDegreesOfFreedom_AreEachVaried()
     {
         var observed = new Dictionary<string, HashSet<object>>(StringComparer.Ordinal);
+        var joint = new JointCells();
         foreach (StructType schema in ArtifactSchemas())
         {
-            ObserveType(schema, observed);
+            ObserveType(schema, observed, joint);
         }
 
         var unvaried = new List<string>();
@@ -1265,6 +1297,30 @@ public sealed class ParquetWriterTests
                     unvaried.Add(
                         $"{key} (string) reaches only {lengths.Max()} characters, below the "
                         + $"required {MinimumLongestString}");
+                }
+                else
+                {
+                    // THE JOINT. Everything above is a MARGINAL: it asks whether the axis ever
+                    // took a value, never whether it took it while the collection around it was
+                    // large. Both marginals can be satisfied -- large collections of ASCII, and
+                    // non-ASCII in small ones -- while the cell where a LARGE collection carries
+                    // non-ASCII content is required by neither. A bulk ASCII fast path that
+                    // engages only above a size threshold lives exactly there, and it is an
+                    // optimisation someone would plausibly write.
+                    //
+                    // The pairs are not hand-listed. Each class below is one the marginal arm
+                    // ALREADY requires, so the joint is the marginal lifted, and the two cannot
+                    // drift apart: adding a class to the marginal adds it here.
+                    foreach (string cls in RequiredContentClasses(owner, member.Name))
+                    {
+                        if (!joint.Has(key, cls, MinimumLargestCollection))
+                        {
+                            unvaried.Add(
+                                $"{key} (string) is never {cls} inside a collection of at least "
+                                + $"{MinimumLargestCollection} -- the marginals are covered, the "
+                                + "joint cell is not");
+                        }
+                    }
                 }
             }
         }
@@ -1516,9 +1572,15 @@ public sealed class ParquetWriterTests
     /// still see it; what would be lost is the REQUIREMENT that it be varied at a boundary.
     /// </para>
     /// <para>
-    /// The same reservation applies to <c>owners</c>: it lists the schema model's own types, and
-    /// notably not <c>DataType</c>, whose coverage is pinned instead by the writable-type corpus
-    /// guard. That is a different mechanism, not a derivation, and it is recorded as such.
+    /// The same reservation applies to <c>owners</c>, and it has a NAMED consequence rather than a
+    /// hypothetical one: the list omits <c>DataType</c>, so the walk never descends through
+    /// <c>StructField.DataType</c> and <c>DecimalType.Precision</c>/<c>Scale</c> are required by
+    /// nothing. They are exercised by the writable-type corpus, which is byte-parity rather than a
+    /// requirement -- accidental coverage, which this file has been caught trusting before.
+    /// Tracked as issue #729, and filed rather than fixed here because the obvious repair states
+    /// an IMPOSSIBLE requirement: the int arm below is written for collection sizes and demands a
+    /// maximum of 257, while <c>DecimalType</c> rejects any precision above 38. The repair needs
+    /// the arm split, with scalar ints rooted in the model's own declared bounds.
     /// </para>
     /// </remarks>
     private static bool IsScalarAxis(Type t)
@@ -1585,44 +1647,135 @@ public sealed class ParquetWriterTests
         }
     }
 
-    private static void ObserveType(StructType schema, Dictionary<string, HashSet<object>> into)
+    private static void ObserveType(
+        StructType schema, Dictionary<string, HashSet<object>> into, JointCells joint)
     {
         Observe(schema, into);
+        int width = schema.Count;
         foreach (StructField field in schema)
         {
             Observe(field, into);
-            ObserveMetadata(field.Metadata, into);
+
+            // The JOINT cell: this name, and how many names sit beside it. A marginal record of
+            // "some name was non-ASCII" and "some schema was 257 wide" leaves the cell where a
+            // WIDE schema carries a non-ASCII name required by neither.
+            joint.Add($"{nameof(StructField)}.{nameof(StructField.Name)}", width, field.Name);
+            ObserveMetadata(field.Metadata, into, joint);
         }
     }
 
-    private static void ObserveMetadata(FieldMetadata metadata, Dictionary<string, HashSet<object>> into)
+    private static void ObserveMetadata(
+        FieldMetadata metadata, Dictionary<string, HashSet<object>> into, JointCells joint)
     {
         Observe(metadata, into);
+        int size = metadata.Count();
         foreach (KeyValuePair<string, MetadataValue> entry in metadata)
         {
-            ObserveValue(entry.Value, into);
+            joint.Add($"{nameof(FieldMetadata)}.{nameof(FieldMetadata.Keys)}[]", size, entry.Key);
+            ObserveValue(entry.Value, into, joint, size);
         }
     }
 
-    private static void ObserveValue(MetadataValue value, Dictionary<string, HashSet<object>> into)
+    private static void ObserveValue(
+        MetadataValue value, Dictionary<string, HashSet<object>> into, JointCells joint, int size)
     {
         Observe(value, into);
         switch (value.Kind)
         {
+            case MetadataValueKind.String:
+                joint.Add($"{nameof(MetadataValue)}.{nameof(MetadataValue.AsString)}", size, value.AsString());
+                break;
             case MetadataValueKind.Array:
-                foreach (MetadataValue item in value.AsArray())
+                IReadOnlyList<MetadataValue> items = value.AsArray();
+                foreach (MetadataValue item in items)
                 {
-                    ObserveValue(item, into);
+                    ObserveValue(item, into, joint, items.Count);
                 }
 
                 break;
             case MetadataValueKind.Nested:
-                ObserveMetadata(value.AsNested(), into);
+                ObserveMetadata(value.AsNested(), into, joint);
                 break;
             default:
                 break;
         }
     }
+
+    /// <summary>
+    /// Joint (collection size x content class) cells for the string axes.
+    /// </summary>
+    /// <remarks>
+    /// The requirement here is not a new hand-list of interacting pairs. It is the marginal
+    /// requirement LIFTED: whatever a content axis is separately required to hold, a
+    /// boundary-sized collection must be observed holding it too. That is derived from the
+    /// requirements already stated, so it cannot drift away from them, and it closes the cell a
+    /// bulk fast path lives in -- "identity until the collection is large, then drop the
+    /// non-ASCII entries" is invisible to a guard that checks size and content separately.
+    /// </remarks>
+    private sealed class JointCells
+    {
+        private readonly Dictionary<string, HashSet<(int Size, string Class)>> _cells =
+            new(StringComparer.Ordinal);
+
+        public void Add(string axis, int size, string text)
+        {
+            if (!_cells.TryGetValue(axis, out HashSet<(int, string)>? set))
+            {
+                set = new HashSet<(int, string)>();
+                _cells[axis] = set;
+            }
+
+            foreach (string cls in ContentClasses(text))
+            {
+                set.Add((size, cls));
+            }
+        }
+
+        public bool Has(string axis, string cls, int minimumSize) =>
+            _cells.TryGetValue(axis, out HashSet<(int Size, string Class)>? set)
+            && set.Any(x => x.Size >= minimumSize && string.Equals(x.Class, cls, StringComparison.Ordinal));
+
+        /// <summary>
+        /// The boundary classes a string belongs to -- the same boundaries the marginal string arm
+        /// requires, so the joint requirement is stated in the marginal's own vocabulary.
+        /// </summary>
+        public static IEnumerable<string> ContentClasses(string text)
+        {
+            if (text.Length == 0)
+            {
+                yield return EmptyClass;
+            }
+
+            if (text.Length >= MinimumLongestString)
+            {
+                yield return LongClass;
+            }
+
+            if (text.Any(c => c > '\u007F'))
+            {
+                yield return NonAsciiClass;
+            }
+        }
+    }
+
+    /// <summary>
+    /// The content classes this axis must show INSIDE a boundary-sized collection: exactly those
+    /// the marginal arm requires of it, minus any the model forbids.
+    /// </summary>
+    private static IEnumerable<string> RequiredContentClasses(Type owner, string memberName)
+    {
+        if (EmptyStringIsConstructible(owner, memberName))
+        {
+            yield return EmptyClass;
+        }
+
+        yield return LongClass;
+        yield return NonAsciiClass;
+    }
+
+    private const string EmptyClass = "EMPTY";
+    private const string LongClass = "LONG";
+    private const string NonAsciiClass = "NON-ASCII";
 
     /// <summary>
     /// The single enumeration of every schema the constructive layer writes to a Parquet footer.
@@ -1679,13 +1832,31 @@ public sealed class ParquetWriterTests
     }
 
     /// <summary>
-    /// Every schema this file actually writes to a Parquet footer: the constructive artifacts,
-    /// from the same enumeration the sweep writes, plus the two corpora that their own tests write.
+    /// The schemas this guard observes: the constructive artifacts, taken from the very
+    /// enumeration the sweep writes, plus the three fixed corpora that their own tests write.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This deliberately does NOT claim to be every schema the file writes. It used to, and the
+    /// claim was false -- a prose totality claim of the same family as the completeness table
+    /// already deleted from this PR, and a test that never runs. What it claims now is the
+    /// direction that matters for soundness: everything observed here IS written to a real footer,
+    /// so the guard cannot report an axis covered on the strength of an artifact that does not
+    /// exist. The converse is safe to leave open, because observing FEWER schemas can only make
+    /// the guard demand more, never less.
+    /// </para>
+    /// <para>
+    /// The 1200 generated schemas are excluded on purpose. A coverage requirement satisfied by a
+    /// random draw is that requirement plus a sampling assumption, which is the reasoning that
+    /// made the finite axes constructive in the first place; the guard must not come to depend on
+    /// a seed.
+    /// </para>
+    /// </remarks>
     private static IEnumerable<StructType> ArtifactSchemas()
     {
         yield return MetadataCorpusSchema;
         yield return NameCorpusSchema;
+        yield return ScalarCorpusSchema;
         var covered = new HashSet<(string, int, string)>();
         foreach ((string _, StructType schema) in ConstructiveArtifacts(covered))
         {
