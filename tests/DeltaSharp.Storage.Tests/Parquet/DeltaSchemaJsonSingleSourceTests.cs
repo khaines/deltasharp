@@ -128,6 +128,124 @@ public sealed class DeltaSchemaJsonSingleSourceTests
     }
 
     [Fact]
+    public void EveryStorageTypeTouchingUtf8JsonWriter_IsOnTheJsonWritingAllowlist()
+    {
+        // The guard above tries to RECOGNISE a schema node, and recognition is a game the guard
+        // cannot win. Successive review rounds evaded it with StructField, MetadataValue, a by-ref
+        // writer, constructor injection, a Storage-local DataType subclass, an open generic
+        // parameter (`T` has IsGenericType == false, so recursion through generic ARGUMENTS never
+        // reaches it), and plain `object`. Type erasure always defeats recognition; patching each
+        // shape as it is found is an unwinnable sequence.
+        //
+        // So this guard changes the KEY. It does not ask what a parameter means; it asks who is
+        // allowed to write JSON at all. A re-inlined schema serializer must emit JSON, so it must
+        // touch Utf8JsonWriter, so it trips here no matter how it spells its schema argument --
+        // generic, object, dynamic, or a Storage-local DTO. That converts "guess the shape" into
+        // "edit a three-line list on purpose", which is exactly the deliberate act a tripwire
+        // should require. The narrower signature guard above is KEPT: two guards, different keys,
+        // and the narrower one gives the more specific diagnosis when it is the one that fires.
+        //
+        // The scan reaches method BODIES, not just signatures: a serializer can construct its own
+        // Utf8JsonWriter as a local and never name it in any signature (DeltaSchemaJson itself did
+        // exactly that before #679), which a signature-only allowlist would miss.
+        const BindingFlags DeclaredMembers =
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static
+            | BindingFlags.Instance | BindingFlags.DeclaredOnly;
+
+        // The complete set of Storage types permitted to touch Utf8JsonWriter. All three write Delta
+        // LOG JSON (actions, commit info, deletion vector descriptors) -- none serializes a schema
+        // tree. Adding an entry here is a deliberate act that should be justified in review; if the
+        // new type serializes a schema tree, the answer is to delegate to SchemaJson instead.
+        string[] allowlist =
+        [
+            "DeltaSharp.Storage.Delta.DeletionVectors.DeletionVectorDescriptor",
+            "DeltaSharp.Storage.Delta.DeltaCommitInfo",
+            "DeltaSharp.Storage.Delta.DeltaLogActionWriter",
+        ];
+
+        static Type Unwrap(Type t) => t.GetElementType() ?? t;
+
+        static bool IsJsonWriter(Type t) => Unwrap(t) == typeof(Utf8JsonWriter);
+
+        static IEnumerable<Type> TouchedTypes(Type t, BindingFlags flags)
+        {
+            foreach (MethodInfo method in t.GetMethods(flags))
+            {
+                yield return method.ReturnType;
+                foreach (ParameterInfo parameter in method.GetParameters())
+                {
+                    yield return parameter.ParameterType;
+                }
+            }
+
+            foreach (ConstructorInfo constructor in t.GetConstructors(flags))
+            {
+                foreach (ParameterInfo parameter in constructor.GetParameters())
+                {
+                    yield return parameter.ParameterType;
+                }
+            }
+
+            foreach (FieldInfo field in t.GetFields(flags))
+            {
+                yield return field.FieldType;
+            }
+
+            foreach (PropertyInfo property in t.GetProperties(flags))
+            {
+                yield return property.PropertyType;
+            }
+
+            // Method bodies: catches a writer that is only ever a local.
+            foreach (MethodBase member in t.GetMethods(flags).Cast<MethodBase>().Concat(t.GetConstructors(flags)))
+            {
+                MethodBody? body = member.GetMethodBody();
+                if (body is null)
+                {
+                    continue;
+                }
+
+                foreach (LocalVariableInfo local in body.LocalVariables)
+                {
+                    yield return local.LocalType;
+                }
+            }
+        }
+
+        // Compiler-generated nested types (async state machines, closures) inherit their outer
+        // type's entry, so an allowlisted type may freely grow an async JSON-writing member without
+        // this test demanding a new, unreadable `Foo+<Bar>d__7` entry.
+        static Type Outermost(Type t)
+        {
+            Type outer = t;
+            while (outer.DeclaringType is not null)
+            {
+                outer = outer.DeclaringType;
+            }
+
+            return outer;
+        }
+
+        string[] offenders = typeof(DeltaSchemaJson).Assembly
+            .GetTypes()
+            .Where(t => TouchedTypes(t, DeclaredMembers).Any(IsJsonWriter))
+            .Select(t => Outermost(t).FullName!)
+            .Distinct(StringComparer.Ordinal)
+            .Where(name => !allowlist.Contains(name, StringComparer.Ordinal))
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+
+        Assert.True(
+            offenders.Length == 0,
+            $"These DeltaSharp.Storage types touch Utf8JsonWriter but are not on the JSON-writing "
+            + $"allowlist in this test: {string.Join(", ", offenders)}. Storage owns no schema-tree "
+            + $"serializer (#679) — schema JSON is produced solely by DeltaSharp.Abstractions.SchemaJson, "
+            + $"and DeltaSchemaJson merely delegates to it. If the new type serializes a SCHEMA, delegate "
+            + $"to SchemaJson instead of writing JSON here. If it genuinely writes Delta LOG JSON, add it "
+            + $"to the allowlist deliberately and say why in review.");
+    }
+
+    [Fact]
     public void ToJson_RejectsNullSchema_WithItsOwnParameterName()
     {
         // The delegation must not leak the shared serializer's parameter name to this call site.
