@@ -127,7 +127,8 @@ public sealed class ParquetWriterTests
         Assert.True(reader.CustomMetadata.ContainsKey(DeltaSchemaJson.SchemaMetadataKey));
         string schemaJson = reader.CustomMetadata[DeltaSchemaJson.SchemaMetadataKey];
 
-        // #679: this is the ARTIFACT assertion, and it is the one that actually matters.
+        // #679: this is the ARTIFACT assertion — it pins the bytes actually stamped into the written
+        // Parquet footer, rather than what the serializer helper would have produced.
         //
         // Every other guard in this area — the reflection single-source guards, the DeltaSchemaJson
         // goldens — answers "who is allowed to serialize?". That is a question about PROVENANCE, and
@@ -136,18 +137,29 @@ public sealed class ParquetWriterTests
         // divergence while every provenance guard stays green, because they key on Utf8JsonWriter and
         // a StringBuilder is not one. Writing JSON does not require Utf8JsonWriter.
         //
-        // These two assertions instead ask "are the bytes right?" — a question about OUTCOME, which no
-        // rogue serializer can dodge, because the bytes read back here are the ones that ship inside
-        // the Parquet footer. The three Assert.Contains calls below are substring checks: they are
-        // blind to field ORDER, to property order within a field, and to anything additional, so they
-        // could never have caught this.
+        // These two assertions instead ask "are the bytes right?" — a question about OUTCOME, which a
+        // rogue serializer cannot dodge BY CHOICE OF TOOL, because the bytes read back here are the
+        // ones that ship inside the Parquet footer.
+        //
+        // SCOPE — read this before relying on the sentence above. Outcome coverage is bounded by the
+        // CORPUS, and this test's corpus is one schema: three atomic fields with EMPTY metadata. A
+        // rogue that is byte-exact for scalar/empty-metadata schemas and diverges only elsewhere —
+        // e.g. emitting column-mapping ids as quoted strings, breaking the #330 unquoted-integer
+        // contract — ships a live footer/log divergence with this test green. Field metadata and the
+        // remaining scalar types DO reach the footer and are pinned only at the helper layer; nested
+        // types cannot reach it at all today (ParquetTypeMapping rejects them, design §2.9). Tracked
+        // in #713. Widen the corpus there rather than assuming this assertion generalises.
+        //
+        // The three Assert.Contains calls below are substring checks: blind to field ORDER, to
+        // property order within a field, and to anything additional, so they could never have caught
+        // the call-site swap this assertion exists for.
         //
         // The two assertions are deliberately not redundant:
         //   * equality with SchemaJson.ToJson catches the footer being repointed at some OTHER
         //     serializer while the shared one is untouched (the call-site swap);
         //   * the golden catches drift INSIDE the shared serializer reaching the footer, which the
         //     equality check cannot see because both sides would move together.
-        // Together they pin footer bytes == shared serializer == fixed wire shape, end to end.
+        // Together they pin footer bytes == shared serializer == fixed wire shape, for this corpus.
         const string footerGolden =
             "{\"type\":\"struct\",\"fields\":[" +
             "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}," +
