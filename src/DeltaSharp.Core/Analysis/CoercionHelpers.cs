@@ -309,11 +309,11 @@ internal static class CoercionHelpers
                     // FirstInfeasibleOne, which also asserts that its corpus still CONTAINS a count of that
                     // shape — because no fixture that predates it can reach that region, which is itself
                     // asserted, by TheFixturesThatPredateThisPin_CannotReachTheDiscriminatingRegion, rather
-                    // than described here. Two revisions of this comment described it and both were wrong,
-                    // the second while correcting the first, each comparing a field's NAME width where the
-                    // quantity that decides the region is its MARGINAL cost. Guidance for building a
-                    // discriminating corpus fails silently when followed, so it is executed now and this
-                    // paragraph names the test instead of the numbers. The scan was 0-RED across the whole
+                    // than described here. EVERY revision of this comment that described it was wrong, each
+                    // one written while correcting the last, and each comparing something other than the
+                    // quantity that decides the region. Guidance for building a discriminating corpus fails
+                    // silently when followed, so it is executed now and this paragraph names the test
+                    // instead of the numbers. The scan was 0-RED across the whole
                     // solution for two rounds on exactly that account: not a missing axis but a fixture
                     // VALUE, with the sibling scan in DiagnosticText pinned all along.
                     //

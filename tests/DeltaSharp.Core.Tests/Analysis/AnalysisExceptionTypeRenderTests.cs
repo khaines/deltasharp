@@ -915,12 +915,11 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// rather than a fixed property of the fixture.
     /// </summary>
     /// <remarks>
-    /// The fixtures that predate this helper fix their names at whatever width was realistic for the
-    /// property they were written for, and none of them can reach the region this file was missing a guard
-    /// for. That claim is not made in prose here — two attempts to write it down were wrong, the second
-    /// while correcting the first — it is asserted by
-    /// <see cref="TheFixturesThatPredateThisPin_CannotReachTheDiscriminatingRegion"/>, which reads the
-    /// widths off the generators themselves. Name length is not decoration: together with the child type it
+    /// No fixture that predates this helper can reach the region this file was missing a guard for. That
+    /// claim is not made in prose here — every attempt to write it down was wrong, each one written while
+    /// correcting the last — it is asserted by
+    /// <see cref="TheFixturesThatPredateThisPin_CannotReachTheDiscriminatingRegion"/>, which enumerates the
+    /// fixtures rather than describing them. Name length is not decoration: together with the child type it
     /// decides whether the feasible field counts form a prefix.
     /// </remarks>
     private static StructType UniformStruct(int fieldCount, int nameLength, string childKind)
@@ -948,12 +947,14 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// below can reach the region it guards, asserted rather than described.
     /// </summary>
     /// <remarks>
-    /// <para>Three revisions of that claim shipped as prose and all three were wrong, the second and third
-    /// while correcting the one before. They failed in three different ways — comparing a field's NAME
-    /// width where the deciding quantity is its MARGINAL cost; asserting a single fixed width where one
-    /// predating test already sweeps three; and calling widths "well beyond the threshold" when reflection
-    /// over every fixture finds nine distinct widths, four of them below it. Three seats falsified one
-    /// sentence by three methods.</para>
+    /// <para>Every revision of that claim that shipped as prose was wrong, each written while correcting
+    /// the one before, and they failed in different ways — comparing a field's NAME width where the
+    /// deciding quantity is its MARGINAL cost; asserting a single fixed width where one predating test
+    /// already sweeps several; and calling the widths "well beyond the threshold" when reflection over
+    /// every fixture finds several below it. Four seats falsified one sentence by four methods, and the
+    /// replacement all four proposed — assert that no fixture's field cost falls under the refund — is RED
+    /// on a correct renderer, for the reason the next paragraph gives. Even the remedy needed the
+    /// distinction the prose kept losing.</para>
     /// <para><b>And the conclusion was right the whole time, for a reason none of the three gave.</b> A
     /// differential over every pre-existing fixture showed the corpus genuinely cannot discriminate — so
     /// each wrong sentence survived every check of its conclusion and failed only when someone checked its
@@ -966,6 +967,11 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// character name whose marginal cost is well under it — and still be unable to discriminate, because
     /// that name is not last. This charges each struct its own last field, with the child that struct
     /// actually declares, at every depth.</para>
+    /// <para>Recorded for whoever audits this next: the wrong figures in this change hid, in order, from a
+    /// digit-only scan, from a spelled-numeral scan, and from a scan that read tag-embedded digits — each
+    /// filter found what the previous one could not see. Five such sweeps have now run this surface. The
+    /// one form still invisible to all of them is a numeral inside an identifier in a <c>see cref</c>, which
+    /// no filter here matches; there are none today, and that is the next place this class will hide.</para>
     /// </remarks>
     [Fact]
     public void TheFixturesThatPredateThisPin_CannotReachTheDiscriminatingRegion()
