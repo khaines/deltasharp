@@ -705,4 +705,199 @@ public sealed class AnalysisExceptionTypeRenderTests
                     + $"fields, leaving {budget - rendered.Length} unused of {budget} — the key's natural "
                     + $"render is {natural}, so the slack an int value declined was not returned to it"));
     }
+
+    /// <summary>
+    /// The top-level field count rendered inside the outermost <c>struct&lt;…&gt;</c>, counted by nesting
+    /// depth rather than by the overflow marker.
+    /// </summary>
+    /// <remarks>
+    /// Reading the count off the <c>(+N more)</c> marker looks equivalent and is not: a nested struct emits
+    /// a marker of its own, so a regex finds the INNER one and reports a field count that can come out
+    /// negative. The first version of this sweep did exactly that and produced a spurious counterexample.
+    /// Depth-counting is independent of the renderer and of the marker.
+    /// </remarks>
+    private static int TopLevelFields(string rendered)
+    {
+        if (!rendered.StartsWith("struct<", StringComparison.Ordinal))
+        {
+            return -1;
+        }
+
+        int depth = 0;
+        int fields = 0;
+        for (int i = 6; i < rendered.Length; i++)
+        {
+            switch (rendered[i])
+            {
+                case '<': depth++; break;
+                case '>': depth--; break;
+                case ':' when depth == 1: fields++; break;
+                default: break;
+            }
+        }
+
+        return fields;
+    }
+
+    private static StructType ShapedStruct(int width, int innerFields)
+    {
+        var inner = new StructType(
+        [
+            .. Enumerable.Range(0, Math.Max(innerFields, 1)).Select(i => new StructField(
+                string.Create(CultureInfo.InvariantCulture, $"g{i:D3}xxxxxx"), IntegerType.Instance, true)),
+        ]);
+
+        return new StructType(
+        [
+            .. Enumerable.Range(0, width).Select(i => new StructField(
+                string.Create(CultureInfo.InvariantCulture, $"f{i:D3}xxxxxxxx"),
+                innerFields > 0 && i % 2 == 0 ? inner : IntegerType.Instance,
+                true)),
+        ]);
+    }
+
+    /// <summary>
+    /// #687 council round 15 (Quality BLOCKING) — the struct render over the <b>product</b> of budget,
+    /// cardinality and child shape.
+    /// <para>The walk that this replaces was forward-greedy, and a forward-greedy walk over a budget that
+    /// its own children consume is not merely suboptimal — it is NON-MONOTONE. A child handed more room
+    /// renders its own structure instead of a summary and starves the fields after it, so the render showed
+    /// strictly LESS at a larger budget: 22 field names at 374 characters and 21 at 375, leaving 34
+    /// characters unspent. The identical defect had already been found and fixed in
+    /// <c>DiagnosticText.SanitizeToBudget</c>, with the reason written down there; this walk kept the old
+    /// shape. Round 14 fixed its RESERVE and left its SHAPE.</para>
+    /// <para>The previous guard, <see cref="TypeBudget_IsSpentBeforeAnyFieldIsElided(int)"/>, sweeps
+    /// cardinality at ONE budget over a scalar-leaf schema, so it could reach neither the budget axis nor
+    /// the compact-versus-expanded alternation that causes this. A sweep over one axis with the others held
+    /// fixed cannot find a defect that lives on their product — the sixth time that has been true in this
+    /// change, and the reason this asserts four properties over the product rather than one along a line.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void TheStructRender_IsMonotoneAndFullySpent_AcrossBudgetWidthAndChildShape()
+    {
+        var counterexamples = new List<string>();
+        int cells = 0;
+
+        foreach (int width in new[] { 1, 2, 3, 5, 8, 13, 21, 40, 60, 120, 400 })
+        {
+            foreach (int innerFields in new[] { 0, 1, 3, 8, 20 })
+            {
+                foreach (bool wrapped in new[] { false, true })
+                {
+                    StructType shape = ShapedStruct(width, innerFields);
+                    DataType subject = wrapped
+                        ? new StructType([new StructField("outer", shape, true)])
+                        : shape;
+
+                    string previous = string.Empty;
+                    int previousFields = -1;
+
+                    for (int budget = CoercionHelpers.MinDiagnosticTypeLength; budget <= 1100; budget++)
+                    {
+                        string rendered = CoercionHelpers.DiagnosticType(subject, budget);
+                        cells++;
+                        string where = string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"width={width} inner={innerFields} wrapped={wrapped} budget={budget}");
+
+                        // 1. Never larger than the budget it was given.
+                        if (rendered.Length > budget)
+                        {
+                            counterexamples.Add(string.Create(
+                                CultureInfo.InvariantCulture, $"{where}: rendered {rendered.Length}"));
+                        }
+
+                        int fields = TopLevelFields(rendered);
+
+                        // 2. More budget never shows fewer field names. This is the property the defect
+                        //    violated, and it is what a reader of the diagnostic is actually looking for:
+                        //    the name they got wrong is in that list or it is not.
+                        if (previousFields >= 0 && fields < previousFields)
+                        {
+                            counterexamples.Add(string.Create(
+                                CultureInfo.InvariantCulture,
+                                $"{where}: {previousFields} fields at {budget - 1}, {fields} at {budget}"));
+                        }
+
+                        // 3. At an equal field count, more budget never shows less DETAIL. Stated only at
+                        //    equal counts on purpose: round 14 established that a render legitimately
+                        //    trades length for breadth, so an unconditional length assertion here would be
+                        //    asserting something false.
+                        if (previousFields == fields && rendered.Length < previous.Length)
+                        {
+                            counterexamples.Add(string.Create(
+                                CultureInfo.InvariantCulture,
+                                $"{where}: {previous.Length} chars at {budget - 1}, {rendered.Length}"));
+                        }
+
+                        previous = rendered;
+                        previousFields = fields;
+                    }
+                }
+            }
+        }
+
+        Assert.True(
+            counterexamples.Count == 0,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"{counterexamples.Count} of {cells} cells violated a struct-render property; first 5:\n")
+            + string.Join("\n", counterexamples.Take(5)));
+    }
+
+    /// <summary>
+    /// #687 council round 15 — the companion property: a field is elided only when it could not have been
+    /// shown. Asks the independent question (could ONE MORE have been shown?) rather than the renderer's
+    /// own, for the reason set out on the listing sweep.
+    /// </summary>
+    [Fact]
+    public void NoFieldIsElided_WhileTheBudgetCouldStillHavePaidForIt()
+    {
+        var counterexamples = new List<string>();
+
+        foreach (int width in new[] { 2, 5, 13, 31, 60, 120, 400 })
+        {
+            foreach (int innerFields in new[] { 0, 1, 8 })
+            {
+                for (int budget = 64; budget <= 1024; budget += 7)
+                {
+                    string rendered =
+                        CoercionHelpers.DiagnosticType(ShapedStruct(width, innerFields), budget);
+                    Match marker = Regex.Match(rendered, @"\(\+(\d+) more\)");
+                    if (!marker.Success)
+                    {
+                        continue;
+                    }
+
+                    int hidden = int.Parse(marker.Groups[1].Value, CultureInfo.InvariantCulture);
+
+                    // The cheapest a further field could possibly be: separator, name, colon, and the most
+                    // compact form of its type. Reconstructed from the corpus, not from the renderer.
+                    int compactChild = innerFields > 0
+                        ? string.Create(
+                            CultureInfo.InvariantCulture, $"struct<({Math.Max(innerFields, 1)} fields)>").Length
+                        : "int".Length;
+                    int cheapest = 1 + "f000xxxxxxxx".Length + 1 + compactChild;
+                    int markerNow = string.Create(CultureInfo.InvariantCulture, $"\u2026 (+{hidden} more)").Length;
+                    int cost = hidden == 1
+                        ? cheapest - (1 + markerNow)
+                        : cheapest + string.Create(
+                            CultureInfo.InvariantCulture, $"\u2026 (+{hidden - 1} more)").Length - markerNow;
+
+                    if (rendered.Length + cost <= budget)
+                    {
+                        counterexamples.Add(string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"width={width} inner={innerFields} budget={budget}: {rendered.Length} chars, "
+                            + $"{hidden} hidden, one more costs {cost}"));
+                    }
+                }
+            }
+        }
+
+        Assert.True(
+            counterexamples.Count == 0,
+            string.Join("\n", counterexamples.Take(5)));
+    }
 }

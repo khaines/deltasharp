@@ -285,57 +285,91 @@ internal static class CoercionHelpers
         switch (type)
         {
             case StructType structType:
-                var builder = new StringBuilder("struct<");
-                int shown = 0;
-                for (int i = 0; i < structType.Count; i++)
                 {
-                    // As much as the render still has, capped so ONE name cannot consume it all. Note what
-                    // this deliberately does NOT do: divide the budget by the field count. Dividing makes a
-                    // wide struct cut every name to fit them all in, which is the common case paying for the
-                    // pathological one — and it is unnecessary, because the fit check below already stops the
-                    // walk when the budget is spent and the (+N more) count reports the remainder. Width is
-                    // handled by the count; the cap exists only for a single oversized name.
-                    // (The claim that "the fit check below already stops the walk when the budget is spent"
-                    // was false while the child render below was handed the full budget: the walk stopped
-                    // with 7 of 1024 spent. It is true now that the child is given only what remains.)
-                    // The floor cannot overflow the budget: a name rendered at the floor still has to pass
-                    // the fit check, which is what ends the loop.
-                    int stopHere = Owed(structType.Count - i - 1);
-                    int allowance = Math.Clamp(
-                        budget - builder.Length - stopHere, 0, MaxEchoedFieldNameLength);
-                    string name = DiagnosticText.Sanitize(structType[i].Name, allowance);
-
-                    // REMAINING budget, not the full one. Passing `budget` here let a child render as though
-                    // it had the whole message to itself; the parent then measured the oversized result
-                    // against the space actually left and broke on its FIRST field. One level of nesting was
-                    // enough: an ordinary 40-field payload one struct deep rendered 99 characters of a
-                    // 1024-character budget and showed zero field names, which is the common shape for Delta
-                    // (address.geo.latitude), not a pathological one. The sibling accumulation is the point —
-                    // what is left shrinks as fields are appended, so the quantity has to be recomputed per
-                    // field rather than fixed before the loop.
-                    int childBudget = Math.Max(
-                        0, budget - builder.Length - name.Length - 1 - stopHere);
-                    string child = RenderBounded(structType[i].DataType, childBudget, depth + 1);
-                    string piece = string.Create(
-                        CultureInfo.InvariantCulture,
-                        $"{(shown > 0 ? "," : string.Empty)}{name}:{child}");
-                    if (builder.Length + piece.Length + stopHere > budget)
+                    // TWO PASSES, and no search. Round 15 began by fixing this walk's SHAPE — a forward-greedy
+                    // walk stops just below a count that fits, because a child handed more room renders its own
+                    // structure instead of a summary and starves the fields after it, so the render could show
+                    // strictly LESS at a larger budget. The first attempt searched over candidate reserves and
+                    // expansion caps sampled at powers of ten and two. That was the same mistake this whole
+                    // change has been removing in other places: a SAMPLED candidate set is an incomplete one,
+                    // and it missed optima that fell between the samples (31 fields elided at 970 characters
+                    // with 32 to spare). The quantities are computable, so they are computed.
+                    //
+                    // Pass 1 fixes HOW MANY. Every field has a minimum cost — its name, a colon, and the most
+                    // compact form of its type — which does not depend on the budget, so a prefix-sum gives the
+                    // cost of showing any k of them exactly. The largest feasible k is then a downward scan,
+                    // exactly as in DiagnosticText.SanitizeToBudget and for the same reason: total cost is not
+                    // monotonic in k, because the overflow marker shrinks as k grows.
+                    //
+                    // Pass 2 fixes HOW MUCH DETAIL. The count is now settled, so each child in turn may expand
+                    // into whatever is left after reserving the minimum for the fields that follow it. Nothing a
+                    // child does can cost a later field its name, which is what the greedy walk got wrong.
+                    int fieldCount = structType.Count;
+                    string[] fieldNames = new string[fieldCount];
+                    string[] compactChildren = new string[fieldCount];
+                    int[] minimumCost = new int[fieldCount + 1];
+                    for (int i = 0; i < fieldCount; i++)
                     {
-                        break;
+                        // Names are capped but never DIVIDED among the fields. Dividing makes a wide struct cut
+                        // every name to fit them all in, which is the common case paying for the pathological
+                        // one; the count reports what did not fit instead.
+                        fieldNames[i] = DiagnosticText.Sanitize(
+                            structType[i].Name, MaxEchoedFieldNameLength);
+                        compactChildren[i] = SummarizeType(
+                            structType[i].DataType, MaxEchoedFieldNameLength);
+                        minimumCost[i + 1] = minimumCost[i] + (i > 0 ? 1 : 0)
+                            + fieldNames[i].Length + 1 + compactChildren[i].Length;
                     }
 
-                    builder.Append(piece);
-                    shown++;
-                }
+                    const int openingLength = 7; // "struct<"
+                    int shown = 0;
+                    for (int k = fieldCount; k >= 1; k--)
+                    {
+                        if (openingLength + minimumCost[k] + Owed(fieldCount - k) <= budget)
+                        {
+                            shown = k;
+                            break;
+                        }
+                    }
 
-                if (shown < structType.Count)
-                {
-                    builder.Append(
-                        CultureInfo.InvariantCulture, $" \u2026 (+{structType.Count - shown} more)");
-                }
+                    int trailing = Owed(fieldCount - shown);
+                    var builder = new StringBuilder("struct<");
+                    for (int i = 0; i < shown; i++)
+                    {
+                        if (i > 0)
+                        {
+                            builder.Append(',');
+                        }
 
-                detailed = builder.Append('>').ToString();
-                break;
+                        builder.Append(fieldNames[i]).Append(':');
+
+                        // What is left once the fields after this one are guaranteed their minimum.
+                        int room = Math.Max(
+                            0,
+                            budget - builder.Length - (minimumCost[shown] - minimumCost[i + 1]) - trailing);
+                        string child = RenderBounded(structType[i].DataType, room, depth + 1);
+
+                        // RenderBounded may return longer than it was allowed, because its summary fallback has
+                        // a floor of its own. Falling back to the compact form keeps the guarantee that the
+                        // fields after this one can still be shown.
+                        //
+                        // Defensive, and labelled as such: 0-RED and byte-identical across 117,590 renders, so
+                        // no reachable shape exercises it — but, exactly as with the map's reclaim guard, there
+                        // is no PROOF it is dead, because the contract that motivates it is real. Not claimed
+                        // to be equivalent, only to be cheap insurance on a call that may legitimately exceed
+                        // the caller's assumption.
+                        builder.Append(child.Length <= room ? child : compactChildren[i]);
+                    }
+
+                    if (shown < fieldCount)
+                    {
+                        builder.Append(
+                            CultureInfo.InvariantCulture, $" \u2026 (+{fieldCount - shown} more)");
+                    }
+
+                    detailed = builder.Append('>').ToString();
+                    break;
+                }
 
             case ArrayType arrayType:
                 detailed = $"array<{RenderBounded(arrayType.ElementType, budget - 7, depth + 1)}>";
