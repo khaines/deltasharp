@@ -510,13 +510,19 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// <para>The oracle is the same independent question the listing suite asks, and deliberately not the
     /// implementation's own predicate: reconstruct from the <i>rendered message</i> what showing one more
     /// field would have cost, and require that it would not have fit. Fields are uniform width, so the next
-    /// field's cost is known from the ones already shown. Sweeping depth is the point — the defect was
-    /// invisible at depth 1, where every prior assertion in this file lives.</para>
+    /// field's cost is known from the ones already shown. Sweeping depth is the point, and that this sweep
+    /// REACHES the depths it sweeps is asserted at the end rather than claimed here: the sentence that used
+    /// to justify the depth axis said the defect was invisible at depth 1 "where every prior assertion in
+    /// this file lives", and a theory thirty lines above it had swept nesting 1–4 since round 9. Eighth
+    /// instance in this change of one shape — a universal quantifier with a false reason and a sound
+    /// conclusion — and the first to quantify over ASSERTIONS rather than over fixture widths, which is why
+    /// the earlier sweeps could not see it.</para>
     /// </summary>
     [Fact]
     public void NestedPayloads_SpendTheirBudget_BeforeAnyFieldIsElided()
     {
         var counterexamples = new List<string>();
+        int elidedBelowTheTop = 0;
 
         for (int depth = 1; depth <= 4; depth++)
         {
@@ -547,6 +553,11 @@ public sealed class AnalysisExceptionTypeRenderTests
                         () => ConstraintExpressionFrontend.ParseResolveWithInput(
                             "payload.nosuchfield > 0", schema));
 
+                    if (ex.Message.Contains('\u2026', StringComparison.Ordinal) && depth > 1)
+                    {
+                        elidedBelowTheTop++;
+                    }
+
                     if (CouldHaveShownOneMoreField(ex.Message, width, nameLength) is { } failure)
                     {
                         counterexamples.Add(
@@ -562,6 +573,18 @@ public sealed class AnalysisExceptionTypeRenderTests
             counterexamples.Count == 0,
             string.Create(CultureInfo.InvariantCulture, $"{counterexamples.Count} cells hid fields with "
                 + $"budget to spare; first 8:\n") + string.Join("\n", counterexamples.Take(8)));
+
+        // Adequacy of the chosen corpus, asserted rather than argued. The widths, depths and name lengths
+        // above are chosen; what makes choosing them acceptable is not that the list is complete but that
+        // the choice is demonstrably adequate for the question — here, that elision is actually reached
+        // BELOW the top level, which is the only place the defect this test pins could ever have shown.
+        Assert.True(
+            elidedBelowTheTop > 0,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"no swept cell elided a field below the top level, so the depth axis is decorative and ")
+                + $"this sweep would pass identically at depth 1 only — widen the widths or narrow the "
+                + $"budgets until a nested payload has to drop something.");
     }
 
     /// <summary>
@@ -895,6 +918,7 @@ public sealed class AnalysisExceptionTypeRenderTests
     public void NoFieldIsElided_WhileTheBudgetCouldStillHavePaidForIt()
     {
         var counterexamples = new List<string>();
+        int elided = 0;
 
         foreach (int width in new[] { 2, 5, 13, 31, 60, 120, 400 })
         {
@@ -909,6 +933,8 @@ public sealed class AnalysisExceptionTypeRenderTests
                     {
                         continue;
                     }
+
+                    elided++;
 
                     int hidden = int.Parse(marker.Groups[1].Value, CultureInfo.InvariantCulture);
 
@@ -939,6 +965,12 @@ public sealed class AnalysisExceptionTypeRenderTests
         Assert.True(
             counterexamples.Count == 0,
             string.Join("\n", counterexamples.Take(5)));
+
+        // Every cell that does not elide is skipped above, so a corpus that never elides passes this test
+        // without asking it anything. Adequacy of the chosen widths and shapes, asserted.
+        Assert.True(
+            elided > 0,
+            "no swept cell elided a field, so every cell was skipped and this sweep asked nothing");
     }
 
     /// <summary>
@@ -1071,6 +1103,14 @@ public sealed class AnalysisExceptionTypeRenderTests
         // round satisfied NEITHER: trimming it only made it inspect less and still pass, and there was no
         // chokepoint behind it, so the list WAS the guarantee. That is the distinction to apply before
         // flagging any literal corpus in this file.
+        //
+        // Three seats converged on three tests for a chosen population, and the third is the general one
+        // because it applies where the other two do not: (1) trimming it goes RED; (2) a chokepoint makes
+        // the property hold whatever the list contains; (3) the test ASSERTS THAT THE CHOICE IS ADEQUATE —
+        // discriminating > 0, exercised > 0, the tightness equality below. Rule (3) is the one to reach for
+        // first. "Enumerate, never hand-list" is often impossible; "assert that what you chose reaches the
+        // region you chose it for" almost always is, and it fails loudly when a later edit drifts the
+        // corpus out of that region, which is precisely how every miss in this change went unnoticed.
         foreach (string childKind in new[] { "int", "nested", "wide" })
         {
             string compact = childKind switch

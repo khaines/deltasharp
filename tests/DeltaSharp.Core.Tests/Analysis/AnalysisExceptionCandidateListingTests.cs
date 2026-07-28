@@ -650,6 +650,7 @@ public sealed class AnalysisExceptionCandidateListingTests
     public void EveryListComposingFactory_StaysUnderTheBackstop(string factory, Func<int, int, Exception> build)
     {
         ArgumentNullException.ThrowIfNull(build);
+        int exercisedElision = 0;
 
         foreach (int width in new[] { 0, 1, 12, 200, 5_000 })
         {
@@ -673,8 +674,22 @@ public sealed class AnalysisExceptionCandidateListingTests
                 // cut the listing off, so the count that says how much was dropped has to still be there.
                 // Scoped to the listing: an elision mark elsewhere in the message is a bounded free prose
                 // token doing its job, which is a different event from a list losing members silently.
+                //
+                // That scoping is by bracket, and not every factory here renders its list in brackets —
+                // some use "could be: a, b", some an argument list in parentheses, some dotted parts — so
+                // this half of the property runs on a subset of the rows. Found by writing the adequacy
+                // assertion below INSIDE this branch, where it went RED on the rows that never enter it;
+                // the prose version of the same claim would have shipped. For the rows it does not reach,
+                // the count is pinned per factory by AssertCountIsAccurate and by
+                // NoFreeProseToken_CanCrowdOutAListingsOverflowCount, and the headroom half above still
+                // runs on every row.
                 int open = message.IndexOf('[', StringComparison.Ordinal);
                 int close = message.LastIndexOf(']');
+                if (OverflowCounts(message).Length > 0)
+                {
+                    exercisedElision++;
+                }
+
                 if (width > 0 && open >= 0 && close > open)
                 {
                     string listing = message[(open + 1)..close];
@@ -686,6 +701,17 @@ public sealed class AnalysisExceptionCandidateListingTests
                 }
             }
         }
+
+        // The widths and prose lengths above are chosen, not enumerated. What makes that acceptable is not
+        // that the list is complete but that the choice is demonstrably adequate: unless some cell in this
+        // row actually drives the factory into the elision region, both assertions above are satisfied by a
+        // message that was never near the cap, and the row confirms nothing.
+        Assert.True(
+            exercisedElision > 0,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"[{factory}] no swept cell produced a (+N more) count, so no cell reached the region ")
+                + $"where the backstop could destroy one and this row asks nothing of the factory");
     }
 
     /// <summary>The sibling factory carries the same contract; a fix applied to only one of the two list

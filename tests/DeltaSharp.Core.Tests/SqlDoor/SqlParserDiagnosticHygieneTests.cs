@@ -274,9 +274,14 @@ public sealed class SqlParserDiagnosticHygieneTests
         // Council round 2, item 4 (Architect A2 + Security): SqlParseException is a public sealed type with
         // three PUBLIC constructors that bypass the Syntax factory. The backstop used to live in the factory,
         // so the doc's "no present or future call site can bypass" claim was wrong. It now lives in a private
-        // chokepoint every constructor routes through. All three current in-repo uses carry fixed prose, so
-        // nothing was exploitable — this pins the stronger posture so a future untrusted-input caller inherits
-        // it for free.
+        // chokepoint every constructor routes through. Nothing was exploitable, and this pins the stronger
+        // posture so a future untrusted-input caller inherits it for free.
+        //
+        // A count of the in-repo callers used to stand here and was wrong at HEAD — it said three, there are
+        // five, in two files. It is not corrected because it should never have been load-bearing: the whole
+        // point of moving the backstop into a private chokepoint is that the caller list stops mattering.
+        // Counting the callers is the argument you make when there is no chokepoint, and making it next to
+        // one is how a comment ends up asserting something weaker than the code.
         string hostile = "TRAIL\r\nFORGED" + new string('z', FloodLength);
 
         foreach (SqlParseException ex in new[]
