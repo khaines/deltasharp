@@ -56,30 +56,46 @@ public sealed class DeltaSchemaJsonSingleSourceTests
         // Assembly-wide companion to the test above, which is type-scoped and so would miss the more
         // likely future accident: a schema serializer re-inlined into some OTHER Storage type (say
         // ParquetFileWriter) rather than back into DeltaSchemaJson. A schema-tree serializer is
-        // identifiable by signature — it threads a Utf8JsonWriter alongside a schema node (DataType or
-        // FieldMetadata). Storage must own no such method; that responsibility lives solely in
-        // DeltaSharp.Abstractions.SchemaJson. Delta LOG action writers legitimately pair a
-        // Utf8JsonWriter with action types (MetadataAction etc., declared in DeltaSharp.Storage.Delta),
-        // which is why the predicate keys on the schema type system specifically rather than on the
-        // writer alone.
+        // identifiable by signature — it threads a Utf8JsonWriter alongside a schema node (DataType,
+        // StructField, FieldMetadata, MetadataValue …). Storage must own no such type; that
+        // responsibility lives solely in DeltaSharp.Abstractions.SchemaJson. Delta LOG action writers
+        // legitimately pair a Utf8JsonWriter with action types (MetadataAction etc., declared in
+        // DeltaSharp.Storage.Delta), which is why the predicate keys on the schema type system
+        // specifically rather than on the writer alone.
         const BindingFlags DeclaredMembers =
             BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static
             | BindingFlags.Instance | BindingFlags.DeclaredOnly;
 
         // The predicate must close the CLASS of schema-serializer signatures, not enumerate the ones we
-        // happen to imagine. An earlier version keyed on "DataType-assignable or FieldMetadata", which a
-        // re-inlined serializer evades completely just by threading StructField, MetadataValue (literally
-        // the signature of the cross-assembly seam this PR deleted), or a `ref Utf8JsonWriter`. So:
-        //   * unwrap by-ref/out/pointer/array so `ref Utf8JsonWriter` and `in StructField` still match;
-        //   * treat ANY type from the schema type system (namespace DeltaSharp.Types in the Abstractions
-        //     assembly) as a schema node, rather than naming four of its members;
-        //   * recurse through generic arguments so IReadOnlyList<StructField>/ReadOnlySpan<StructField>
-        //     match too.
+        // happen to imagine. Two independent dimensions have to hold at once, and an earlier revision of
+        // this test held only one of them at a time:
+        //
+        //   WHAT COUNTS AS A SCHEMA NODE — the union of two rules, because neither dominates the other.
+        //     (a) assignable to DataType, or FieldMetadata. Misses StructField, MetadataValue (literally
+        //         the signature of the cross-assembly seam this PR deleted) and IReadOnlyList<StructField>,
+        //         none of which are DataTypes.
+        //     (b) any type from the schema type system's namespace in the Abstractions assembly. Misses a
+        //         Storage-LOCAL subclass of DataType, which is assignable but declared in namespace
+        //         DeltaSharp.Storage.
+        //   Keying on (b) alone silently NARROWS coverage relative to (a); keying on (a) alone is the
+        //   evasion (b) was added to close. Both, plus by-ref/array unwrapping so `ref Utf8JsonWriter` and
+        //   `in StructField` match, plus recursion through generic arguments.
+        //
+        //   WHERE THE SIGNATURE MAY LIVE — the whole type, not one member. Requiring both the writer and
+        //   the schema node on the SAME parameter list is evaded by the most natural shape a re-inlined
+        //   serializer would actually take: a stateful writer class that takes the Utf8JsonWriter in its
+        //   constructor and the schema node on a method. So the parameter/field types of every declared
+        //   member are unioned per type before the two rules are applied.
         static Type Unwrap(Type t) => t.GetElementType() ?? t;
 
         static bool MentionsSchemaType(Type t)
         {
             Type actual = Unwrap(t);
+            if (typeof(DataType).IsAssignableFrom(actual) || actual == typeof(FieldMetadata))
+            {
+                return true;
+            }
+
             if (actual.Namespace == "DeltaSharp.Types" && actual.Assembly == typeof(DataType).Assembly)
             {
                 return true;
@@ -90,20 +106,24 @@ public sealed class DeltaSchemaJsonSingleSourceTests
 
         static bool IsJsonWriter(Type t) => Unwrap(t) == typeof(Utf8JsonWriter);
 
+        static IEnumerable<Type> SignatureTypes(Type t, BindingFlags flags) =>
+            t.GetMethods(flags).SelectMany(m => m.GetParameters()).Select(p => p.ParameterType)
+                .Concat(t.GetConstructors(flags).SelectMany(c => c.GetParameters()).Select(p => p.ParameterType))
+                .Concat(t.GetFields(flags).Select(f => f.FieldType));
+
         string[] offenders = typeof(DeltaSchemaJson).Assembly
             .GetTypes()
-            .SelectMany(t => t.GetMethods(DeclaredMembers))
-            .Where(m =>
+            .Where(t =>
             {
-                Type[] parameters = m.GetParameters().Select(x => x.ParameterType).ToArray();
-                return Array.Exists(parameters, IsJsonWriter)
-                    && Array.Exists(parameters, MentionsSchemaType);
+                Type[] signature = SignatureTypes(t, DeclaredMembers).ToArray();
+                return Array.Exists(signature, IsJsonWriter)
+                    && Array.Exists(signature, MentionsSchemaType);
             })
-            .Select(m => $"{m.DeclaringType!.FullName}.{m.Name}")
+            .Select(t => t.FullName!)
             .OrderBy(n => n, StringComparer.Ordinal)
             .ToArray();
 
-        // Named rather than counted, so a failure says WHICH method reintroduced a serializer.
+        // Named rather than counted, so a failure says WHICH type reintroduced a serializer.
         Assert.Empty(offenders);
     }
 
