@@ -247,7 +247,7 @@ internal static class DiagnosticText
         }
 
         // Upper bound on the overflow suffix, reserved so the count is never what gets cut.
-        int reserve = string.Create(CultureInfo.InvariantCulture, $"{separator}… (+{items.Count} more)").Length;
+        int reserve = separator.Length + OverflowMarkerLength(items.Count);
         int allowance = Math.Clamp(budget / items.Count, minItemLength, maxItemLength);
 
         var builder = new StringBuilder();
@@ -282,6 +282,18 @@ internal static class DiagnosticText
             .Append(CultureInfo.InvariantCulture, $"… (+{items.Count - shown} more)")
             .ToString();
     }
+
+    /// <summary>
+    /// The exact width of the <c>… (+N more)</c> marker for <paramref name="hidden"/> dropped items — the
+    /// space a listing needs in order to be able to say <em>anything at all</em>.
+    /// </summary>
+    /// <remarks>
+    /// Stated here, next to the marker it measures, because a caller that reserves room for the count must
+    /// reserve the <b>same</b> amount the renderer will later spend. Two independent expressions of one
+    /// width is the drift hazard that a shared constant exists to remove.
+    /// </remarks>
+    internal static int OverflowMarkerLength(int hidden) =>
+        string.Create(CultureInfo.InvariantCulture, $"… (+{hidden} more)").Length;
 
     /// <summary>Adapter exposing <see cref="Sanitize"/> in the <c>(item, allowance)</c> shape
     /// <see cref="SanitizeToBudget{T}(IReadOnlyList{T}, Func{T, int, string}, int, int, int, string)"/>

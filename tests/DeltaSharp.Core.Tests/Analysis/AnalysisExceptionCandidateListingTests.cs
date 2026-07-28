@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Reflection;
 using System.Text.RegularExpressions;
 using DeltaSharp.Analysis;
 using DeltaSharp.Plans.Expressions;
@@ -423,4 +424,145 @@ public sealed class AnalysisExceptionCandidateListingTests
         Assert.Contains('\u2026', message);
         Assert.DoesNotContain(new string('z', AnalysisException.MaxEchoedCandidateLength + 1), message, StringComparison.Ordinal);
     }
+    /// <summary>
+    /// Round 9, Architect BLOCKING — the listing budget is only as honest as the PROSE is bounded.
+    /// <para>The budget for a listing is <c>MaxMessageLength − prose</c>, so an <b>unbounded free token</b>
+    /// interpolated into that prose can drive the message past the cap on its own. The whole-message backstop
+    /// then cuts from the tail, which is precisely where the listing and its <c>(+N more)</c> count live. An
+    /// 816-character path did exactly that to <see cref="AnalysisException.UnsupportedDataSink"/> and
+    /// <see cref="AnalysisException.UnsupportedWriteFormat"/> — the same defect the listing budget was built
+    /// to prevent, arriving through the prose instead of through the list.</para>
+    /// <para>This ranges over every list-composing factory by REFLECTION and oversizes <b>every</b> string
+    /// parameter, not a named one. That distinction is the point: the review repro used the <c>path</c>
+    /// parameter, but <c>format</c> was equally unbounded and equally capable of it, and a test naming
+    /// <c>path</c> would have closed one of the two. A factory added later with a new free token is caught
+    /// without anyone remembering to add a row.</para>
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(ListComposingFactoryNames))]
+    public void NoFreeProseToken_CanCrowdOutAListingsOverflowCount(string factoryName)
+    {
+        MethodInfo factory = FactoryMethods().Single(m => m.Name == factoryName);
+        object[] args = [.. factory.GetParameters().Select((p, i) => Oversized(p.ParameterType, i))];
+        var ex = (AnalysisException)factory.Invoke(null, args)!;
+
+        // Sanitize appends an elision mark, so a message the backstop has cut is exactly one character over
+        // the cap. That makes "the backstop fired" directly observable rather than inferred.
+        Assert.True(
+            ex.Message.Length <= AnalysisException.MaxMessageLength,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"[{factoryName}] rendered {ex.Message.Length} chars, so the whole-message backstop did the "
+                    + $"cutting and took the overflow count off the tail: …{ex.Message[^60..]}"));
+
+        // The listing must be ACCOUNTED FOR, not merely bounded: every item is either rendered or counted.
+        // Demanding a count unconditionally would be wrong — a narrow listing can genuinely fit beside even
+        // a pathological token, and then there is nothing to report.
+        string[][] listings = [.. args.OfType<string[]>()];
+        if (listings.Length > 0)
+        {
+            int total = listings.Sum(l => l.Length);
+            int shown = listings.Sum(l => l.Count(n => ex.Message.Contains(n, StringComparison.Ordinal)));
+            Assert.Equal(total, shown + OverflowCounts(ex.Message).Sum());
+        }
+    }
+
+    /// <summary>
+    /// The other half of the same bound, and the one that has been claimed before without a corpus able to
+    /// exercise it: bounding the free tokens must cost the COMMON case nothing. Allocation is max-min fair
+    /// and shortest-first, so an ordinary format plus an ordinary path consume only what they need and are
+    /// reproduced verbatim — no elision mark anywhere in the message.
+    /// </summary>
+    [Fact]
+    public void FreeProseTokens_AreBoundedOnlyWhenTheyDoNotFit()
+    {
+        const string Path = "s3://analytics-prod-lake/warehouse/customer/lifetime_value/dt=2026-07-28/part-0000";
+        string[] formats = ["csv", "json", "parquet"];
+
+        foreach (string message in new[]
+        {
+            AnalysisException.UnsupportedDataSink("delta", Path, formats).Message,
+            AnalysisException.UnsupportedWriteFormat("delta", Path, formats, ["delta", "parquet"]).Message,
+        })
+        {
+            Assert.Contains(Path, message, StringComparison.Ordinal);
+            Assert.Contains("'delta'", message, StringComparison.Ordinal);
+            foreach (string format in formats)
+            {
+                Assert.Contains(format, message, StringComparison.Ordinal);
+            }
+
+            Assert.DoesNotContain('\u2026', message);
+        }
+    }
+
+    /// <summary>Every public factory that composes at least one listing, found by reflection so the
+    /// enumeration cannot drift from the type.</summary>
+    private static IEnumerable<MethodInfo> FactoryMethods() =>
+        typeof(AnalysisException)
+            .GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .Where(m => m.ReturnType == typeof(AnalysisException))
+            .Where(m => m.GetParameters().Any(p => IsCollection(p.ParameterType)));
+
+    public static TheoryData<string> ListComposingFactoryNames()
+    {
+        var data = new TheoryData<string>();
+        foreach (MethodInfo m in FactoryMethods())
+        {
+            data.Add(m.Name);
+        }
+
+        return data;
+    }
+
+    private static bool IsCollection(Type type) =>
+        type.IsGenericType && type.GetGenericTypeDefinition() == typeof(IReadOnlyList<>);
+
+    /// <summary>A pathological value for each parameter shape: every free token long enough to consume the
+    /// whole message on its own, and every collection wide enough to have something to elide.</summary>
+    private static object Oversized(Type type, int seed)
+    {
+        if (type == typeof(string))
+        {
+            return new string('p', 900);
+        }
+
+        if (type == typeof(int))
+        {
+            return 3;
+        }
+
+        if (type == typeof(bool))
+        {
+            return true;
+        }
+
+        if (!IsCollection(type))
+        {
+            throw new NotSupportedException(
+                string.Create(CultureInfo.InvariantCulture, $"no oversized value defined for {type}"));
+        }
+
+        Type item = type.GetGenericArguments()[0];
+        if (item == typeof(string))
+        {
+            // Distinct per parameter, so a factory composing TWO listings cannot have one list's names
+            // counted against the other's overflow.
+            return Enumerable.Range(0, 40).Select(i => RealisticName((seed * 1000) + i)).ToArray();
+        }
+
+        if (item == typeof(AttributeReference))
+        {
+            return Columns(40);
+        }
+
+        if (item == typeof(DataType))
+        {
+            return Enumerable.Range(0, 40).Select(object (_) => IntegerType.Instance).Cast<DataType>().ToArray();
+        }
+
+        throw new NotSupportedException(
+            string.Create(CultureInfo.InvariantCulture, $"no oversized collection defined for {item}"));
+    }
+
 }

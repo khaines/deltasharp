@@ -1,4 +1,6 @@
+using System;
 using System.Globalization;
+using System.Linq;
 using DeltaSharp.Diagnostics;
 using DeltaSharp.Plans.Expressions;
 using DeltaSharp.Plans.Logical;
@@ -137,15 +139,28 @@ internal sealed class AnalysisException : Exception
     /// 50-column table already rendered 1107 characters and was silently cut to 1025. Truncating the whole
     /// message destroys the very signal that truncation happened, which on the TRUSTED path (a user's own
     /// schema) turns a self-service fix into a support ticket. Any factory composing a LIST must therefore
-    /// bound its own items and report an explicit overflow count, so this cap never elides a list. Every one
-    /// of them does: <see cref="UnresolvedColumn"/>, <see cref="AmbiguousReference"/>,
-    /// <see cref="TableOrViewNotFound"/>, <see cref="UnsupportedDataSink"/>,
-    /// <see cref="UnsupportedWriteFormat"/>, and both users of <c>RenderTypes</c>
-    /// (<see cref="UnknownFunction"/>, <see cref="InvalidFunctionArgument"/>). That enumeration is not
-    /// maintained by hand — <c>EveryListComposingFactory_ReportsAnOverflowCount</c> ranges over all of them,
-    /// because a comment asserting a global property is worth nothing without a test that ranges over the
-    /// whole class. A single oversized TOKEN can still reach this cap; that is the cap doing its job, and is
-    /// a different thing from eliding a list without saying so.
+    /// bound its own items and report an explicit overflow count, so this cap never elides a list.
+    /// </para>
+    /// <para>
+    /// <b>That is a claim about every list-composing factory, so it is asserted rather than listed.</b>
+    /// <c>EveryListComposingFactory_ReportsAnOverflowCount</c> and
+    /// <c>NoFreeProseToken_CanCrowdOutAListingsOverflowCount</c> both discover the factories by reflection.
+    /// A hand-written enumeration stood here for one revision and was already wrong: bounding each list is
+    /// necessary but <em>not sufficient</em>, because a listing's budget is <c>MaxMessageLength − prose</c>
+    /// and is therefore only as honest as the prose is bounded. <see cref="UnsupportedDataSink"/> and
+    /// <see cref="UnsupportedWriteFormat"/> interpolated two unbounded user tokens — a target path and a
+    /// requested format — and an 816-character path pushed both messages past this cap, so the backstop cut
+    /// from the tail and took the listing and its count with it. <see cref="BoundTokens"/> closes that, and
+    /// the reflective test is what keeps the claim true for a factory added tomorrow. Note which of the two
+    /// tokens the review repro used: <c>path</c>. <c>format</c> was equally unbounded and equally capable of
+    /// it, so a fix or a test naming <c>path</c> would have closed half the defect.
+    /// </para>
+    /// <para>
+    /// A single oversized TOKEN can still reach this cap in a factory that composes <b>no</b> listing, and
+    /// there that is the cap doing its job. The distinction is not "token versus list" — it is whether
+    /// anything with a count is downstream of the cut. An earlier revision of this paragraph drew the line
+    /// the first way and was falsified by exactly that case: an oversized token in a list-composing factory
+    /// produced the thing the paragraph called impossible.
     /// </para>
     /// <para>
     /// <b>The factories are not the whole class.</b> A second family composes its text in the analyzer
@@ -245,8 +260,75 @@ internal sealed class AnalysisException : Exception
 
     /// <summary>The characters left for listings once <paramref name="proseLength"/> is spent, shared evenly
     /// when a message composes more than one listing.</summary>
+    /// <remarks>
+    /// The floor is <b>zero</b>, deliberately. An earlier revision floored this at
+    /// <see cref="MinEchoedCandidateLength"/>, on the reasoning that a listing should always get enough room
+    /// to show something. That is a claim about the world, and the world falsified it: prose containing an
+    /// unbounded token could consume the entire message, the listing was granted 48 characters anyway, and
+    /// the composed result ran past <see cref="MaxMessageLength"/> — so the whole-message backstop cut the
+    /// listing <em>and its overflow count</em> off the tail. A floor asserts "there is always room for a
+    /// little"; returning the truth lets <c>SanitizeToBudget</c> collapse the listing to its count, which is
+    /// the one thing worth keeping when there is no room. <see cref="BoundTokens"/> is what makes that
+    /// remainder large enough to be useful.
+    /// </remarks>
     private static int RemainingBudget(int proseLength, int lists = 1) =>
-        Math.Max(MinEchoedCandidateLength, (MaxMessageLength - proseLength) / lists);
+        Math.Max(0, (MaxMessageLength - proseLength) / lists);
+
+    /// <summary>
+    /// The space free prose TOKENS may occupy: everything the fixed literal text does not need, less the room
+    /// each listing needs to state its own overflow count.
+    /// </summary>
+    /// <param name="literalProseLength">Length of the message with every token and listing empty.</param>
+    /// <param name="itemCounts">The cardinality of each listing the message composes.</param>
+    private static int TokenBudget(int literalProseLength, params int[] itemCounts) =>
+        MaxMessageLength - literalProseLength - itemCounts.Sum(DiagnosticText.OverflowMarkerLength);
+
+    /// <summary>
+    /// Bounds the free prose tokens of a message — a path, a format name — so that no single one of them can
+    /// crowd out the listing that follows it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Why this exists.</b> The listing budget is derived from the composed prose, so it is only as honest
+    /// as the prose is bounded. <see cref="UnsupportedDataSink"/> and <see cref="UnsupportedWriteFormat"/>
+    /// interpolate two user-supplied tokens — the redacted target path and the requested format — neither of
+    /// which had any bound at all. An 816-character path drove both messages to the backstop, taking the
+    /// listing and its <c>(+N more)</c> count with it, which is exactly the failure the listing budget was
+    /// introduced to prevent, arriving through the prose instead of the list.
+    /// </para>
+    /// <para>
+    /// <b>Allocation is max-min fair, shortest first, so the common case is bounded by nothing at all.</b> A
+    /// token shorter than its even share consumes only what it needs and hands the remainder to the others;
+    /// only when the tokens genuinely cannot all fit does any of them get cut. An ordinary
+    /// <c>'delta'</c>-plus-a-real-path message is therefore byte-identical to what it was before this bound
+    /// existed — the property <c>FreeProseTokens_AreBoundedOnlyWhenTheyDoNotFit</c> asserts, because
+    /// "the common case must not pay for the pathological one" has been claimed here before by a comment
+    /// whose corpus could not exercise it.
+    /// </para>
+    /// </remarks>
+    /// <param name="available">The token budget from <see cref="TokenBudget"/>.</param>
+    /// <param name="tokens">The free prose tokens, in the order the message interpolates them.</param>
+    private static string[] BoundTokens(int available, params string[] tokens)
+    {
+        var bounded = new string[tokens.Length];
+        int remaining = Math.Max(0, available);
+        int[] shortestFirst = [.. Enumerable.Range(0, tokens.Length).OrderBy(i => tokens[i].Length)];
+
+        for (int n = 0; n < shortestFirst.Length; n++)
+        {
+            int i = shortestFirst[n];
+            int share = remaining / (shortestFirst.Length - n);
+
+            // Sanitize returns maxLength + 1 characters when it truncates, because it appends the elision
+            // mark. Asking for one less when a cut is certain makes the allocation exact rather than
+            // one-over — and one-over is the whole defect, since the backstop then eats the overflow count.
+            bounded[i] = DiagnosticText.Sanitize(
+                tokens[i], tokens[i].Length <= share ? share : Math.Max(0, share - 1));
+            remaining = Math.Max(0, remaining - bounded[i].Length);
+        }
+
+        return bounded;
+    }
 
     private static string RenderListing<T>(
         IReadOnlyList<T> items, Func<T, int, string> render, int budget, string separator = ", ") =>
@@ -262,17 +344,6 @@ internal sealed class AnalysisException : Exception
     /// <summary>The floor on the NAME half of a composite <c>name#exprId</c> candidate, so that clamping can
     /// never invert and leave the identifier as the only surviving part.</summary>
     private const int MinEchoedNameLength = 8;
-
-    /// <summary>
-    /// The per-list item budget for a factory that composes <b>two</b> lists in one message, which must
-    /// therefore share the single-list allowance rather than each taking it.
-    /// </summary>
-    /// <remarks>
-    /// Found by <c>EveryListComposingFactory_StaysUnderTheBackstop</c>, not by inspection:
-    /// <see cref="UnsupportedWriteFormat"/> was the one factory whose budget is doubled, it rendered 1025
-    /// characters, and hand-enumerating the factories had missed it. That is the argument for ranging a test
-    /// over the class instead of listing its members.
-    /// </remarks>
 
     private AnalysisException(
         string message,
@@ -362,10 +433,16 @@ internal sealed class AnalysisException : Exception
         // Redact credential-bearing fragments so neither the diagnostic nor any log capturing it leaks a
         // secret embedded in the sink path (parity with the read-door's UnsupportedDataSource, #424/#432).
         string safePath = path is null ? "<none>" : SecretRedaction.RedactPath(path);
-        string Compose(string listing) =>
-            $"Writing a '{format}' data source is not supported in this milestone: the writer for target "
-            + $"'{safePath}' is delivered by EPIC-05 (Delta transaction-log storage). Until then, write to a "
+        string Render(string fmt, string target, string listing) =>
+            $"Writing a '{fmt}' data source is not supported in this milestone: the writer for target "
+            + $"'{target}' is delivered by EPIC-05 (Delta transaction-log storage). Until then, write to a "
             + $"supported M1 local sink (format: [{listing}]).";
+
+        string[] tokens = BoundTokens(
+            TokenBudget(Render(string.Empty, string.Empty, string.Empty).Length, localFormats.Count),
+            format,
+            safePath);
+        string Compose(string listing) => Render(tokens[0], tokens[1], listing);
         return new AnalysisException(
             Compose(ComposeWithListing(Compose, localFormats, DiagnosticText.SanitizeTo)),
             AnalysisErrorKind.UnsupportedDataSink,
@@ -392,10 +469,19 @@ internal sealed class AnalysisException : Exception
         ArgumentNullException.ThrowIfNull(deferredFormats);
 
         string safePath = path is null ? "<none>" : SecretRedaction.RedactPath(path);
-        string Compose(string local, string deferred) =>
-            $"Unsupported write format '{format}' for target '{safePath}'. DeltaSharp M1 writes these "
+        string Render(string fmt, string target, string local, string deferred) =>
+            $"Unsupported write format '{fmt}' for target '{target}'. DeltaSharp M1 writes these "
             + $"local sink formats: [{local}]; these formats are recognized but deferred to EPIC-05 "
             + $"(Delta/Parquet storage): [{deferred}].";
+
+        string[] tokens = BoundTokens(
+            TokenBudget(
+                Render(string.Empty, string.Empty, string.Empty, string.Empty).Length,
+                localFormats.Count,
+                deferredFormats.Count),
+            format,
+            safePath);
+        string Compose(string local, string deferred) => Render(tokens[0], tokens[1], local, deferred);
 
         // Two listings in one message, so they share what is left rather than each taking it.
         int shared = RemainingBudget(Compose(string.Empty, string.Empty).Length, lists: 2);
