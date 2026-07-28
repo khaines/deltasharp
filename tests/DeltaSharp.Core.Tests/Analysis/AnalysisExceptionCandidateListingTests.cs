@@ -216,13 +216,19 @@ public sealed class AnalysisExceptionCandidateListingTests
     }
 
     /// <summary>
-    /// The exact, constant-free oracle for "elision was necessary": if the message elided, then the listing
-    /// rendered <i>in full</i> must not have fit alongside this message's own prose.
-    /// <para>The predicate this replaces was <c>message.Length + oneMoreName &gt; MaxMessageLength</c>, which
-    /// is wrong twice. It compares against the length of the <i>elided</i> message — which carries an overflow
-    /// marker the full one would not — and it is off by one at the boundary, passing the 107×7 counterexample
-    /// at <c>1015 + 9 = 1024</c> because 1024 is not greater than 1024. Measuring the full listing against the
-    /// prose that must accompany it has neither problem.</para>
+    /// The oracle, and it deliberately asks a question the implementation does <b>not</b> ask:
+    /// <b>could one more item have been shown?</b>
+    /// <para>The previous version asked whether the <i>complete</i> listing would have fit — which is
+    /// precisely the condition the code enforced, so it confirmed the implementation instead of testing it.
+    /// It could see a listing that elided when nothing needed to be elided, and was structurally blind to a
+    /// listing that elided <em>too much</em>: 108 seven-character names showed 105 at 1015 characters, three
+    /// short with the budget unspent, and 36,000 cells of sweep reported no counterexample. An oracle that
+    /// encodes the implementation's own predicate is a tautology however wide you sweep it.</para>
+    /// <para>This reconstructs the cost of showing one more item from the <i>rendered message</i> — the
+    /// observed item width, the observed prose, and the marker recomputed for one fewer hidden item — and
+    /// requires that it would not have fit. Optimality, not agreement. It needs the corpus to use
+    /// uniform-length names so the next item's rendered width is known from the ones already shown, which is
+    /// what every caller here does.</para>
     /// </summary>
     /// <returns><see langword="null"/> when the message is within contract, else the failure description.</returns>
     private static string? ElisionWasNecessary(string message, string[] names)
@@ -230,8 +236,10 @@ public sealed class AnalysisExceptionCandidateListingTests
         int open = message.IndexOf('[', StringComparison.Ordinal);
         int close = message.LastIndexOf(']');
         string listing = message[(open + 1)..close];
+        string[] parts = listing.Split(", ");
+        bool elided = parts[^1].StartsWith("\u2026 (+", StringComparison.Ordinal);
 
-        if (!message.Contains('\u2026'))
+        if (!elided)
         {
             // Nothing elided: every name must be present verbatim, which is the other half of the contract.
             foreach (string name in names)
@@ -247,16 +255,27 @@ public sealed class AnalysisExceptionCandidateListingTests
             return null;
         }
 
+        int shown = parts.Length - 1;
+        int hidden = names.Length - shown;
+        int itemWidth = parts[0].Length;
         int proseLength = message.Length - listing.Length;
-        int fullListingLength = names.Sum(name => name.Length) + ((names.Length - 1) * ", ".Length);
-        return proseLength + fullListingLength > AnalysisException.MaxMessageLength
+
+        // What the listing would have cost with one more item shown, composed the same way any reader would
+        // compose it, from observed widths rather than from anything the renderer knows.
+        int nextHidden = hidden - 1;
+        int oneMore = ((shown + 1) * itemWidth)
+            + (shown * ", ".Length)
+            + (nextHidden == 0
+                ? 0
+                : ", ".Length + string.Create(CultureInfo.InvariantCulture, $"\u2026 (+{nextHidden} more)").Length);
+
+        return proseLength + oneMore > AnalysisException.MaxMessageLength
             ? null
             : string.Create(
                 CultureInfo.InvariantCulture,
-                $"width={names.Length}: elided at {message.Length} chars, but the full listing "
-                    + $"({fullListingLength}) plus this message's prose ({proseLength}) is "
-                    + $"{proseLength + fullListingLength}, which fits under "
-                    + $"{AnalysisException.MaxMessageLength}");
+                $"width={names.Length}: showed {shown} of {names.Length} at {message.Length} chars, but "
+                    + $"showing {shown + 1} would have cost {proseLength + oneMore}, which fits under "
+                    + $"{AnalysisException.MaxMessageLength} — items were hidden with budget to spare");
     }
 
     /// <summary>Every width from 1 to 60 — the band a two-point corpus cannot see.</summary>

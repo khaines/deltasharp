@@ -246,81 +246,57 @@ internal static class DiagnosticText
             return string.Empty;
         }
 
-        // Upper bound on the overflow suffix, reserved so the count is never what gets cut.
-        int reserve = separator.Length + OverflowMarkerLength(items.Count);
         int allowance = Math.Clamp(budget / items.Count, minItemLength, maxItemLength);
         string[] rendered = new string[items.Count];
-        int whole = 0;
+        int[] prefix = new int[items.Count + 1];
         for (int i = 0; i < items.Count; i++)
         {
             rendered[i] = render(items[i], allowance);
-            whole += rendered[i].Length + (i > 0 ? separator.Length : 0);
+            prefix[i + 1] = prefix[i] + rendered[i].Length + (i > 0 ? separator.Length : 0);
         }
 
-        // FITS-ENTIRELY PRE-CHECK, and it has to come before the greedy walk rather than fall out of it.
-        // The walk charges every non-final item for an overflow suffix that will not exist if the listing
-        // turns out to fit, so it can stop short while the complete listing would have been inside the
-        // budget all along: at 107 seven-character names it elided two of them at 1015 characters when the
-        // full listing renders in 1020. Discarding a user's own column names with budget to spare is worse
-        // than the unbounded original this bound replaced — the exact disqualifier this design is built on.
-        // The reserve itself stays: it is what keeps the count from being cut once the listing genuinely does
-        // not fit, and it is only wrong to charge it when nothing will overflow. Setting `reserve` to 0
-        // breaks EveryListComposingFactory_StaysUnderTheBackstop, EveryListComposingFactory_ReportsAnOverflow-
-        // Count, NoFreeProseToken_CanCrowdOutAListingsOverflowCount, AmbiguousReference_BoundsItsCandidateList_
-        // WithAnAccurateCount and ListingBudget_IsSpentBeforeAnythingIsElided_AcrossTheProductOfWidthAndName-
-        // Length.
+        // Show the LARGEST number of items whose listing, together with the marker naming exactly the ones it
+        // hides, is within budget. Stated that way the answer is a search rather than a walk, and the walk is
+        // what kept being subtly wrong.
         //
-        // Those are named rather than counted deliberately. A RED count is a claim about the SUITE, so it has
-        // to be re-tuned whenever coverage legitimately grows, and every drift then looks exactly like a
-        // regression — this comment said "10" and was 14 within one round. Names are a claim about the
-        // PROPERTY: they do not move when the suite grows, they say what actually dies, and a stale one is a
-        // filter that matches nothing rather than a sentence that is quietly wrong. It is the same reason the
-        // listing tests assert a constant-free count oracle instead of a literal (+N more).
+        // The walk charged every item a reserve of OverflowMarkerLength(items.Count) — the marker for hiding
+        // ALL of them — when what it actually needed was the marker for the few that would really be left.
+        // A wider count makes a wider number makes a bigger reserve, so it stopped early and hid items it had
+        // room for: 108 seven-character names showed 105 at 1015 characters when 108 fit in 1024. The earlier
+        // "does the whole thing fit" pre-check patched exactly one cell of that — the case where nothing is
+        // hidden — and could not help at any width where something genuinely is. Charging the true remaining
+        // count removes the reserve concept altogether, and with it the fits-entirely special case, since
+        // k == items.Count is simply the candidate that carries no marker.
         //
-        // The 0 RED figures elsewhere in this file and in CoercionHelpers are a different kind of claim and
-        // are left as numbers on purpose: they assert a mutant is EQUIVALENT, so 0 is the whole content of the
-        // claim, it cannot drift upward as coverage grows without the equivalence itself having become false,
-        // and that falsification is precisely the signal wanted. Do not "correct" them into test names.
-        if (whole <= budget)
+        // Scanning downward returns the maximum feasible k by construction, which matters because cost is not
+        // monotonic in k: taking one more item lengthens the listing but can shorten the marker, so a "stop at
+        // the first failure" walk can stop just below a k that fits.
+        for (int k = items.Count; k >= 1; k--)
         {
-            return string.Join(separator, rendered);
-        }
-
-        var builder = new StringBuilder();
-        int shown = 0;
-        for (int i = 0; i < items.Count; i++)
-        {
-            int addition = (shown > 0 ? separator.Length : 0) + rendered[i].Length;
-
-            // Every item is charged for the overflow suffix, with no exemption for the last. There used to be
-            // one, on the reasoning that taking the final item leaves no remainder to report — true, but now
-            // unreachable: this loop only runs when the complete listing does NOT fit, and admitting the last
-            // item would mean exactly that it does. Deleting the exemption is 0 RED, which is the correct
-            // result for dead code rather than a gap in the corpus. The pre-check above is what actually
-            // delivers the "spend the whole budget" property the exemption was reaching for, and it delivers
-            // it for every item rather than only the final one.
-            if (builder.Length + addition + reserve > budget)
+            int hidden = items.Count - k;
+            int cost = prefix[k]
+                + (hidden == 0 ? 0 : separator.Length + OverflowMarkerLength(hidden));
+            if (cost > budget)
             {
-                break;
+                continue;
             }
 
-            if (shown > 0)
+            var builder = new StringBuilder(rendered[0]);
+            for (int i = 1; i < k; i++)
             {
-                builder.Append(separator);
+                builder.Append(separator).Append(rendered[i]);
             }
 
-            builder.Append(rendered[i]);
-            shown++;
+            return hidden == 0
+                ? builder.ToString()
+                : builder.Append(separator)
+                    .Append(CultureInfo.InvariantCulture, $"… (+{hidden} more)")
+                    .ToString();
         }
 
-        if (shown == items.Count)
-        {
-            return builder.ToString();
-        }
-
-        return (shown == 0 ? new StringBuilder() : builder.Append(separator))
-            .Append(CultureInfo.InvariantCulture, $"… (+{items.Count - shown} more)")
-            .ToString();
+        // Not even one item and its marker fit, so the count is all that can be said. It is still said: a
+        // listing that admits how much it dropped remains useful, whereas a silently empty one does not.
+        return string.Create(CultureInfo.InvariantCulture, $"… (+{items.Count} more)");
     }
 
     /// <summary>

@@ -252,12 +252,6 @@ internal sealed class AnalysisException : Exception
         RenderListing(items, render, RemainingBudget(compose(string.Empty).Length + reserved));
 
     /// <summary>
-    /// Variant for a caller that composes a <c>detail</c> string rather than a whole message
-    /// (<see cref="ExpressionCoercion"/>). The wrapping factory's own prose is not visible there, so its
-    /// worst case — a <see cref="DataTypeMismatch(string, string)"/> reference at its full budget plus fixed prose — is
-    /// reserved up front.
-    /// </summary>
-    /// <summary>
     /// Composes a <c>detail</c> string whose TYPE slots are bounded by the space the finished message will
     /// actually have left, rather than by a constant.
     /// </summary>
@@ -282,6 +276,23 @@ internal sealed class AnalysisException : Exception
         return compose(CoercionHelpers.BoundTypes(MaxMessageLength - wrap(compose(empty)).Length, types));
     }
 
+    /// <summary>
+    /// Variant for a caller that composes a <c>detail</c> string rather than a whole message
+    /// (<see cref="ExpressionCoercion"/>). The wrapping factory's own prose is not visible from here, so its
+    /// worst case — a <see cref="DataTypeMismatch(string, string)"/> reference at its full budget plus fixed
+    /// prose — is reserved up front.
+    /// </summary>
+    /// <remarks>
+    /// Note the contrast with <see cref="ComposeDetailWithTypes"/>, which sits directly above and does NOT
+    /// reserve: it can compose its wrapper and measure it. This one cannot, because the listing is rendered
+    /// before the caller's <c>detail</c> is handed on, so a reservation is the honest option. This paragraph
+    /// exists because both summaries were once attached to the same method, leaving that one documented as
+    /// reserving up front when its own remarks and body say it measures — the two really do differ, and
+    /// which is which is the load-bearing detail.
+    /// </remarks>
+    /// <param name="compose">Builds the detail from a rendered listing.</param>
+    /// <param name="items">The untrusted items to list.</param>
+    /// <param name="render">Renders one item within a supplied allowance.</param>
     internal static string ComposeDetailWithListing<T>(
         Func<string, string> compose, IReadOnlyList<T> items, Func<T, int, string> render) =>
         ComposeWithListing(
@@ -309,6 +320,14 @@ internal sealed class AnalysisException : Exception
     /// </summary>
     /// <param name="literalProseLength">Length of the message with every token and listing empty.</param>
     /// <param name="itemCounts">The cardinality of each listing the message composes.</param>
+    /// <remarks>
+    /// Sizing the reserve at the TOTAL cardinality rather than the hidden one is the shape of the round-14
+    /// defect fixed in <see cref="DiagnosticText.SanitizeToBudget"/> and in the struct walk — but here it is
+    /// the only thing available and not an error. How many items a listing hides depends on the budget left
+    /// after the tokens, which is what this method is computing; the dependency is circular, so the reserve
+    /// must assume the worst. It is pessimistic by at most the difference in digit count between the total
+    /// and the hidden count — a few characters — and it is pessimistic in the safe direction.
+    /// </remarks>
     private static int TokenBudget(int literalProseLength, params int[] itemCounts) =>
         MaxMessageLength - literalProseLength - itemCounts.Sum(DiagnosticText.OverflowMarkerLength);
 

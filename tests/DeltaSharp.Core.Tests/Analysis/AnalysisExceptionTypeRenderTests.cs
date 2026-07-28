@@ -462,4 +462,245 @@ public sealed class AnalysisExceptionTypeRenderTests
                 $"a payload nested {nesting} deep lost its leaf field name to the depth bound; a user "
                     + $"misspelling a field at this depth is shown a collapsed type: {ex.Message}"));
     }
+
+    /// <summary>
+    /// #687 council round 14 (Balanced BLOCKING 2) — <b>a nested type must spend its budget too.</b>
+    /// <para>The struct walk handed each child render the <i>full</i> budget instead of what was left, so the
+    /// child rendered as though it owned the whole message and the parent then measured that oversized result
+    /// against the space actually remaining — and broke on its <b>first</b> field. One level of nesting was
+    /// enough: a 40-field payload one struct deep rendered 99 characters of 1024 and showed <b>zero</b> field
+    /// names. That is the ordinary shape of a Delta schema (<c>address.geo.latitude</c>), not a hostile one.
+    /// </para>
+    /// <para>The oracle is the same independent question the listing suite asks, and deliberately not the
+    /// implementation's own predicate: reconstruct from the <i>rendered message</i> what showing one more
+    /// field would have cost, and require that it would not have fit. Fields are uniform width, so the next
+    /// field's cost is known from the ones already shown. Sweeping depth is the point — the defect was
+    /// invisible at depth 1, where every prior assertion in this file lives.</para>
+    /// </summary>
+    [Fact]
+    public void NestedPayloads_SpendTheirBudget_BeforeAnyFieldIsElided()
+    {
+        var counterexamples = new List<string>();
+
+        for (int depth = 1; depth <= 4; depth++)
+        {
+            for (int width = 1; width <= 60; width++)
+            {
+                foreach (int nameLength in new[] { 8, 16, 32 })
+                {
+                    DataType payload = new StructType(
+                    [
+                        .. Enumerable.Range(0, width).Select(i => new StructField(
+                            string.Create(CultureInfo.InvariantCulture, $"{i:D2}")
+                                .PadRight(nameLength, 'f')[..nameLength],
+                            IntegerType.Instance,
+                            true)),
+                    ]);
+
+                    for (int level = 1; level < depth; level++)
+                    {
+                        payload = new StructType(
+                        [
+                            new StructField(
+                                string.Create(CultureInfo.InvariantCulture, $"lvl{level}"), payload, true),
+                        ]);
+                    }
+
+                    var schema = new StructType([new StructField("payload", payload, true)]);
+                    Exception ex = Assert.ThrowsAny<Exception>(
+                        () => ConstraintExpressionFrontend.ParseResolveWithInput(
+                            "payload.nosuchfield > 0", schema));
+
+                    if (CouldHaveShownOneMoreField(ex.Message, width, nameLength) is { } failure)
+                    {
+                        counterexamples.Add(
+                            string.Create(
+                                CultureInfo.InvariantCulture,
+                                $"depth={depth} nameLength={nameLength} {failure}"));
+                    }
+                }
+            }
+        }
+
+        Assert.True(
+            counterexamples.Count == 0,
+            string.Create(CultureInfo.InvariantCulture, $"{counterexamples.Count} cells hid fields with "
+                + $"budget to spare; first 8:\n") + string.Join("\n", counterexamples.Take(8)));
+    }
+
+    /// <summary>
+    /// Reconstructs, from the rendered message alone, what showing one more field would have cost, and
+    /// reports a failure when that would have fit. Independent of how the renderer decides.
+    /// </summary>
+    private static string? CouldHaveShownOneMoreField(string message, int width, int nameLength)
+    {
+        var marker = Regex.Match(message, @" \u2026 \(\+(\d+) more\)");
+        int shownNames = Regex.Matches(message, @"\d{2}f+:").Count;
+
+        if (!marker.Success)
+        {
+            return shownNames >= width
+                ? null
+                : string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"width={width} rendered {shownNames} of {width} fields with no overflow marker");
+        }
+
+        int hidden = int.Parse(marker.Groups[1].Value, CultureInfo.InvariantCulture);
+        int shown = width - hidden;
+        if (shown <= 0)
+        {
+            // Nothing shown at all: the only honest bound is that a single field could not have fit.
+            int lone = nameLength + ":int".Length;
+            return message.Length + lone <= AnalysisException.MaxMessageLength
+                ? string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"width={width} showed NO field names at {message.Length} chars, though one costs "
+                        + $"{lone} and the cap is {AnalysisException.MaxMessageLength}")
+                : null;
+        }
+
+        // Uniform fields, so one more costs a separator plus the width of those already rendered.
+        int piece = nameLength + ":int".Length;
+        int nextMarker = hidden == 1
+            ? 0
+            : string.Create(CultureInfo.InvariantCulture, $" \u2026 (+{hidden - 1} more)").Length;
+        int projected = message.Length - marker.Length + 1 + piece + nextMarker;
+
+        return projected > AnalysisException.MaxMessageLength
+            ? null
+            : string.Create(
+                CultureInfo.InvariantCulture,
+                $"width={width}: showed {shown} of {width} fields at {message.Length} chars, but showing "
+                    + $"{shown + 1} would have cost {projected}, which fits under "
+                    + $"{AnalysisException.MaxMessageLength}");
+    }
+
+    /// <summary>
+    /// The contract every composite render owes, stated once for all of them: <b>a render given a budget must
+    /// fit inside that budget.</b>
+    /// <para>Struct, array and map each recurse, and each has to hand its children the space that is actually
+    /// LEFT rather than the space it started with. The struct child and the map <em>value</em> both got the
+    /// full budget — the map value because it was given <c>budget - 5</c> with no account of what the key had
+    /// already consumed. Sweeping struct shapes alone could not see the map, which is why this asserts the
+    /// invariant over the composite kinds and their combinations instead of over one shape.</para>
+    /// <para>Stated this way the property needs no oracle and no knowledge of how the budget is divided: it is
+    /// simply the postcondition of the function's own signature.</para>
+    /// </summary>
+    [Fact]
+    public void EveryCompositeRender_FitsTheBudgetItWasGiven()
+    {
+        var wide = new StructType(
+        [
+            .. Enumerable.Range(0, 40).Select(i => new StructField(
+                string.Create(CultureInfo.InvariantCulture, $"field_name_number_{i:D3}"),
+                StringType.Instance,
+                true)),
+        ]);
+
+        DataType[] shapes =
+        [
+            wide,
+            new ArrayType(wide, true),
+            new MapType(wide, wide, true),
+            new MapType(new ArrayType(wide, true), new MapType(wide, wide, true), true),
+            new StructType([new StructField("payload", new MapType(wide, wide, true), true)]),
+            new ArrayType(new MapType(wide, new ArrayType(wide, true), true), true),
+        ];
+
+        var violations = new List<string>();
+        foreach (DataType shape in shapes)
+        {
+            // MORE BUDGET MUST NEVER YIELD A SHORTER RENDER. This is the property the postcondition alone
+            // cannot see: the renderer falls back to a bare summary when a composed render overruns, so
+            // overspending a child's budget does not surface as an oversized string — it surfaces as the whole
+            // render silently collapsing. A map at budget 900 emitted "map<…>", six characters, where the same
+            // map at 600 rendered 598. Monotonic length catches that, and needs no model of how the budget is
+            // divided between children.
+            //
+            // Length, specifically, and NOT the number of field names — which was the first draft and is
+            // false. A composite legitimately trades one kind of detail for another: at budget 77 a nested
+            // map's value collapses to "map<…>" leaving the key room for a field name, and at 78 the value
+            // renders real structure and the key gives that name back. Fewer names, more information. An
+            // oracle has to assert something true before it can be strict, and the true statement here is
+            // about how much the render says, not how many names it happens to contain.
+            int longest = 0;
+            for (int budget = CoercionHelpers.MinDiagnosticTypeLength; budget <= 1200; budget++)
+            {
+                int length = CoercionHelpers.DiagnosticType(shape, budget).Length;
+                if (length < longest)
+                {
+                    violations.Add(
+                        string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"budget={budget} rendered {length} chars for {shape.GetType().Name}, fewer than "
+                                + $"the {longest} a smaller budget managed"));
+                }
+
+                longest = Math.Max(longest, length);
+            }
+
+            // From the method's own documented precondition, not from 1: below MinDiagnosticTypeLength it
+            // throws by contract, and asserting a postcondition outside a stated precondition tests nothing.
+            for (int budget = CoercionHelpers.MinDiagnosticTypeLength; budget <= 1200; budget++)
+            {
+                string rendered = CoercionHelpers.DiagnosticType(shape, budget);
+                if (rendered.Length > budget)
+                {
+                    violations.Add(
+                        string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"budget={budget} produced {rendered.Length} chars for {shape.GetType().Name}"));
+                }
+            }
+        }
+
+        Assert.True(
+            violations.Count == 0,
+            string.Create(CultureInfo.InvariantCulture, $"{violations.Count} renders overran their budget; "
+                + $"first 5:\n") + string.Join("\n", violations.Take(5)));
+    }
+
+    /// <summary>
+    /// The map's slack reclaim: <b>a small value must not cost the key its detail.</b> Both children are
+    /// offered half the budget, and whatever the value declines returns to the key — so the same key renders
+    /// with more of its fields visible when paired with a cheap value than with an expensive one.
+    /// <para>Pinned because removing the reclaim is otherwise 0 RED while demonstrably changing output
+    /// (corpus fingerprint <c>-820776980</c> to <c>105950410</c> over four map shapes × 1,169 budgets). A live
+    /// branch that no assertion reaches is exactly the class this PR keeps finding, so it is dispositioned by
+    /// measurement rather than argued to be equivalent.</para>
+    /// </summary>
+    [Theory]
+    [InlineData(400)]
+    [InlineData(600)]
+    [InlineData(900)]
+    [InlineData(1200)]
+    public void AMapWithACheapValue_SpendsTheSlackOnItsKey(int budget)
+    {
+        var wide = new StructType(
+        [
+            .. Enumerable.Range(0, 40).Select(i => new StructField(
+                string.Create(CultureInfo.InvariantCulture, $"field_name_number_{i:D3}"),
+                StringType.Instance,
+                true)),
+        ]);
+
+        // The key's own natural render, measured rather than assumed, so the assertion knows exactly how
+        // much detail was available to show.
+        int natural = CoercionHelpers.DiagnosticType(wide, 100_000).Length;
+        string rendered = CoercionHelpers.DiagnosticType(new MapType(wide, IntegerType.Instance, true), budget);
+        int keyNames = Regex.Matches(rendered, "field_name_number_").Count;
+
+        // With a 3-character value, everything except a few characters of syntax belongs to the key. So the
+        // key must show as much as that space allows: all 40 fields once the budget can hold its natural
+        // render, and otherwise a listing that actually spends what it was given.
+        int expected = budget >= natural + "map<,int>".Length ? 40 : keyNames;
+        Assert.True(
+            keyNames == expected && rendered.Length > budget / 2,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"budget={budget}: map<wideStruct,int> rendered {rendered.Length} chars showing {keyNames} "
+                    + $"fields, leaving {budget - rendered.Length} unused of {budget} — the key's natural "
+                    + $"render is {natural}, so the slack an int value declined was not returned to it"));
+    }
 }

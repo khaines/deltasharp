@@ -190,7 +190,7 @@ internal static class CoercionHelpers
     /// <summary>The smallest budget <see cref="DiagnosticType"/> accepts: the widest possible compact
     /// summary (<c>struct&lt;(2147483647 fields)&gt;</c>, 27 characters) must fit, or the hard
     /// length guarantee could not be honoured without cutting the count off the end.</summary>
-    private const int MinDiagnosticTypeLength = 32;
+    internal const int MinDiagnosticTypeLength = 32;
 
     /// <summary>Ceiling on one field name inside a rendered type, so a single pathological name cannot
     /// consume the whole render. Field names are user-authored (a hostile <c>_delta_log</c> schema) and
@@ -264,8 +264,16 @@ internal static class CoercionHelpers
     /// </summary>
     private static string RenderBounded(DataType type, int budget, int depth)
     {
-        // " … (+2147483647 more)" is 21 characters and the closing '>' is one more.
-        const int SuffixReserve = 22;
+        // What this render still owes at the point it stops: the closing '>', plus the overflow marker if and
+        // only if something is actually hidden, sized for THAT many rather than for int.MaxValue.
+        //
+        // This used to be a fixed 22 — the width of " … (+2147483647 more)" plus the '>'. A constant reserve
+        // is a reserve for the worst case charged to every case, so the walk stopped up to 20 characters
+        // early at every width, and the independent "could one more field have been shown" oracle found 226
+        // such cells. Identical in shape to the listing walk's reserve, which charged the marker for hiding
+        // ALL items rather than the few really left; both are the same error, so both are now the same fix.
+        static int Owed(int hidden) =>
+            1 + (hidden == 0 ? 0 : 1 + DiagnosticText.OverflowMarkerLength(hidden));
 
         string summary = SummarizeType(type, budget);
         if (depth >= MaxEchoedTypeDepth)
@@ -287,16 +295,31 @@ internal static class CoercionHelpers
                     // pathological one — and it is unnecessary, because the fit check below already stops the
                     // walk when the budget is spent and the (+N more) count reports the remainder. Width is
                     // handled by the count; the cap exists only for a single oversized name.
+                    // (The claim that "the fit check below already stops the walk when the budget is spent"
+                    // was false while the child render below was handed the full budget: the walk stopped
+                    // with 7 of 1024 spent. It is true now that the child is given only what remains.)
                     // The floor cannot overflow the budget: a name rendered at the floor still has to pass
                     // the fit check, which is what ends the loop.
+                    int stopHere = Owed(structType.Count - i - 1);
                     int allowance = Math.Clamp(
-                        budget - builder.Length - SuffixReserve, 0, MaxEchoedFieldNameLength);
+                        budget - builder.Length - stopHere, 0, MaxEchoedFieldNameLength);
                     string name = DiagnosticText.Sanitize(structType[i].Name, allowance);
-                    string child = RenderBounded(structType[i].DataType, budget, depth + 1);
+
+                    // REMAINING budget, not the full one. Passing `budget` here let a child render as though
+                    // it had the whole message to itself; the parent then measured the oversized result
+                    // against the space actually left and broke on its FIRST field. One level of nesting was
+                    // enough: an ordinary 40-field payload one struct deep rendered 99 characters of a
+                    // 1024-character budget and showed zero field names, which is the common shape for Delta
+                    // (address.geo.latitude), not a pathological one. The sibling accumulation is the point —
+                    // what is left shrinks as fields are appended, so the quantity has to be recomputed per
+                    // field rather than fixed before the loop.
+                    int childBudget = Math.Max(
+                        0, budget - builder.Length - name.Length - 1 - stopHere);
+                    string child = RenderBounded(structType[i].DataType, childBudget, depth + 1);
                     string piece = string.Create(
                         CultureInfo.InvariantCulture,
                         $"{(shown > 0 ? "," : string.Empty)}{name}:{child}");
-                    if (builder.Length + piece.Length + SuffixReserve > budget)
+                    if (builder.Length + piece.Length + stopHere > budget)
                     {
                         break;
                     }
@@ -319,8 +342,62 @@ internal static class CoercionHelpers
                 break;
 
             case MapType mapType:
-                detailed = $"map<{RenderBounded(mapType.KeyType, budget - 5, depth + 1)}," +
-                    $"{RenderBounded(mapType.ValueType, budget - 5, depth + 1)}>";
+                // A map has TWO children competing for one budget, so it splits max-min fair rather than
+                // letting the key take what it likes and handing the value the scraps.
+                //
+                // Giving each child the full budget overran and collapsed the whole render to "map<…>".
+                // Giving the value "what the key left" is better but still wrong, because the key is served
+                // first and will happily eat everything: at budget 900 the key spent 890 and the value could
+                // not render at all, so the composed map overran, hit the summary fallback below, and emitted
+                // six characters of a 900-character budget — LESS detail than the same map at 600. That
+                // fallback is why neither bug shows up as an overrun; it converts overspend into silent total
+                // loss, which is exactly the failure mode this PR exists to remove.
+                int available = Math.Max(0, budget - "map<,>".Length);
+                int half = available / 2;
+                string keyRender = RenderBounded(mapType.KeyType, half, depth + 1);
+                string valueRender = RenderBounded(
+                    mapType.ValueType, Math.Max(0, available - keyRender.Length), depth + 1);
+
+                // Whatever the value did not want goes back to the key, so a small value does not cost the
+                // key its detail: map<wideStruct,int> must show MORE of its key than map<wideStruct,wideStruct>
+                // at the same budget, because there is more left over for it.
+                //
+                // The reclaim is unconditional on there being slack. It was once also gated on the key having
+                // filled its half, which sounds right and meant it essentially never ran: a struct walk stops
+                // at a field boundary, so the key lands just UNDER its allowance and the gate was false almost
+                // always. map<wideStruct,int> then rendered 580 characters of a 1200-character budget with 620
+                // unused, while the key's natural render — 1167 — would have fit whole.
+                //
+                // A shortest-first variant was tried here instead, mirroring BoundTypes exactly. An earlier
+                // oracle rejected it for showing zero field names at budget 82 where budget 81 showed one —
+                // but that oracle asserted monotonicity of the FIELD-NAME COUNT, which is not a true property
+                // of this render (a nested map legitimately trades names for structure as its budget grows),
+                // and it was removed for that reason. Re-tested at this HEAD, shortest-first passes every
+                // property asserted here. So the choice between it and the half-split below is NOT pinned and
+                // is not claimed to be: what is pinned is the OUTCOME — the value is sized against what the
+                // key actually took (EveryCompositeRender_FitsTheBudgetItWasGiven) and leftover space goes back
+                // to the key (AMapWithACheapValue_SpendsTheSlackOnItsKey) — which both strategies must satisfy.
+                int slack = available - keyRender.Length - valueRender.Length;
+                if (slack > 0)
+                {
+                    // Defensive, and honestly labelled as such. RenderBounded's contract permits a return
+                    // LONGER than the budget it was given, because its summary fallback has a floor of its
+                    // own; this check stops such a return from overrunning the map and collapsing it. It is
+                    // 0-RED, and unlike the last-item exemption there is no proof it is dead: an 8,883-point
+                    // sweep (7 map shapes x budgets 32..1300) is byte-identical with it removed, so no
+                    // reachable shape exercises it, but the contract that motivates it is real. Kept as a
+                    // postcondition on a call that may legitimately violate the caller's assumption, not as
+                    // a claim that it fires. (An earlier comment here justified it by a field-name-count
+                    // monotonicity oracle; that oracle was unsound and has been removed.)
+                    string reclaimed = RenderBounded(
+                        mapType.KeyType, keyRender.Length + slack, depth + 1);
+                    if (reclaimed.Length + valueRender.Length <= available)
+                    {
+                        keyRender = reclaimed;
+                    }
+                }
+
+                detailed = $"map<{keyRender},{valueRender}>";
                 break;
 
             default:

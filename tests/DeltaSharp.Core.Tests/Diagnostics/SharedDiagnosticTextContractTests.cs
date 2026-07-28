@@ -125,18 +125,22 @@ public sealed class SharedDiagnosticTextContractTests
         return false;
     }
     /// <summary>
-    /// #687 council round 11 — the <b>fits-entirely pre-check</b>, which is what lets a listing spend its
-    /// whole budget.
+    /// #687 council round 11 — an <b>exactly fitting listing spends its whole budget</b>, with no item
+    /// discarded and no marker emitted.
     /// <para>The greedy walk charges every item for an overflow suffix that will not exist if the listing
     /// turns out to fit, so it stopped short while the complete listing was inside the budget all along:
     /// 107 seven-character names elided two of them at 1015 characters when the full listing renders in
     /// 1020. Two of a user's own column names discarded with budget to spare, on the trusted path — worse
     /// than the unbounded original this bound replaced.</para>
-    /// <para>The oracle is the pre-check's exact boundary and needs no constant: a collection whose full
-    /// render is <i>exactly</i> the budget must render in full with no marker; one character less must elide
-    /// and report the count. This replaces a round-10 test that named the last-item <em>exemption</em>, which
-    /// the pre-check has since made unreachable — the exemption was a special case for the final item of the
-    /// property the pre-check now provides for all of them.</para>
+    /// <para>The oracle is the exact boundary and needs no constant: a collection whose full render is
+    /// <i>exactly</i> the budget must render in full with no marker; one character less must elide and
+    /// report the count.</para>
+    /// <para>Round 11 fixed this with a dedicated pre-check. Round 14 removed that branch: the pre-check
+    /// only ever asked whether <em>everything</em> fits, so it could not stop the walk eliding more than it
+    /// had to, and it is now the k == Count case of the max-k search. This test is deliberately phrased
+    /// against the <em>behaviour</em> rather than the mechanism, so it survived that rewrite unchanged —
+    /// which is the point. It also replaces a round-10 test that named the last-item <em>exemption</em>,
+    /// a special case for the final item of the property now provided for all of them.</para>
     /// </summary>
     [Theory]
     [InlineData(2)]
@@ -145,7 +149,7 @@ public sealed class SharedDiagnosticTextContractTests
     [InlineData(12)]
     [InlineData(40)]
     [InlineData(107)]
-    public void FitsEntirelyPreCheck_LetsAnExactlyFittingListingSpendItsWholeBudget(int count)
+    public void AnExactlyFittingListing_SpendsItsWholeBudget(int count)
     {
         foreach (int itemLength in new[] { 1, 4, 7, 12, 18, 33, 64 })
         {
