@@ -371,9 +371,8 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// candidate names — and every field name the file generated was shorter than it, so no row could reach
     /// it. Restoring the 32 was measured at <b>0 RED across the whole suite</b>. That is the vacuity pattern
     /// this PR keeps hitting: a corpus whose items are all shorter than the bound cannot test the bound. The
-    /// widths themselves are not named here; they are read off the generators by
-    /// <see cref="TheFixturesThatPredateThisPin_CannotReachTheDiscriminatingRegion"/>, because every attempt
-    /// in this change to write down what the fixtures are has been wrong.</para>
+    /// widths themselves are not named here, because every attempt in this change to write down what this
+    /// file's fixtures are — in prose and twice in an assertion — has been wrong.</para>
     /// <para>These names are real-world lengths (35 and 43). The first must survive verbatim; the point of
     /// the ceiling is to stop ONE pathological name consuming the render, not to trim ordinary schemas.</para>
     /// </summary>
@@ -490,7 +489,7 @@ public sealed class AnalysisExceptionTypeRenderTests
         {
             for (int width = 1; width <= 60; width++)
             {
-                foreach (int nameLength in LegacySweptNameLengths)
+                foreach (int nameLength in new[] { 8, 16, 32 })
                 {
                     DataType payload = new StructType(
                     [
@@ -915,12 +914,13 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// rather than a fixed property of the fixture.
     /// </summary>
     /// <remarks>
-    /// No fixture that predates this helper can reach the region this file was missing a guard for. That
-    /// claim is not made in prose here — every attempt to write it down was wrong, each one written while
-    /// correcting the last — it is asserted by
-    /// <see cref="TheFixturesThatPredateThisPin_CannotReachTheDiscriminatingRegion"/>, which enumerates the
-    /// fixtures rather than describing them. Name length is not decoration: together with the child type it
-    /// decides whether the feasible field counts form a prefix.
+    /// Which of this file's OTHER fixtures can reach the region the pin below guards is a question that has
+    /// now been answered wrongly by three sentences and by two assertions, the last of which measured a
+    /// corpus it had hand-picked and so reported a margin that does not exist. It is not answered here at
+    /// all. The pin asserts that ITS OWN corpus reaches the region, which is the only part anything depends
+    /// on; a claim about the rest of the file has never once survived contact with an enumeration nobody
+    /// chose. Name length is not decoration: together with the child type it decides whether the feasible
+    /// field counts form a prefix.
     /// </remarks>
     private static StructType UniformStruct(int fieldCount, int nameLength, string childKind)
     {
@@ -942,126 +942,8 @@ public sealed class AnalysisExceptionTypeRenderTests
         ]);
     }
 
-    /// <summary>
-    /// #687 council round 18 (Architect, Quality and Security BLOCKING) — no fixture that predates the pin
-    /// below can reach the region it guards, asserted rather than described.
-    /// </summary>
-    /// <remarks>
-    /// <para>Every revision of that claim that shipped as prose was wrong, each written while correcting
-    /// the one before, and they failed in different ways — comparing a field's NAME width where the
-    /// deciding quantity is its MARGINAL cost; asserting a single fixed width where one predating test
-    /// already sweeps several; and calling the widths "well beyond the threshold" when reflection over
-    /// every fixture finds several below it. Four seats falsified one sentence by four methods, and the
-    /// replacement all four proposed — assert that no fixture's field cost falls under the refund — is RED
-    /// on a correct renderer, for the reason the next paragraph gives. Even the remedy needed the
-    /// distinction the prose kept losing.</para>
-    /// <para><b>And the conclusion was right the whole time, for a reason none of the three gave.</b> A
-    /// differential over every pre-existing fixture showed the corpus genuinely cannot discriminate — so
-    /// each wrong sentence survived every check of its conclusion and failed only when someone checked its
-    /// reason. That is the most dangerous shape a comment can have: it is guidance, it is followed, and it
-    /// is vindicated by the thing it misexplains.</para>
-    /// <para>The real reason is that only the LAST field of a struct can create a non-prefix count. The
-    /// marker vanishes at <c>k == fieldCount</c> and nowhere else, so that step is the only one that
-    /// refunds; every earlier step costs a separator, a name and a child, which is strictly positive.
-    /// A fixture may therefore contain names far below the refund — one predating fixture has a two-
-    /// character name whose marginal cost is well under it — and still be unable to discriminate, because
-    /// that name is not last. This charges each struct its own last field, with the child that struct
-    /// actually declares, at every depth.</para>
-    /// <para>Recorded for whoever audits this next: the wrong figures in this change hid, in order, from a
-    /// digit-only scan, from a spelled-numeral scan, and from a scan that read tag-embedded digits — each
-    /// filter found what the previous one could not see. Five such sweeps have now run this surface. The
-    /// one form still invisible to all of them is a numeral inside an identifier in a <c>see cref</c>, which
-    /// no filter here matches; there are none today, and that is the next place this class will hide.</para>
-    /// </remarks>
-    [Fact]
-    public void TheFixturesThatPredateThisPin_CannotReachTheDiscriminatingRegion()
-    {
-        int refund = 1 + MarkerWidth(1);
-
-        // Fixtures are ENUMERATED, never restated: the widths are read off the generators, and the swept
-        // widths are read off the array the sweep itself iterates.
-        List<StructType> fixtures =
-        [
-            WideStruct(4),
-            ShapedStruct(6, 3),
-            PayloadSchema(4),
-            .. LegacySweptNameLengths.Select(n => new StructType(
-            [
-                .. Enumerable.Range(0, 3).Select(i => new StructField(
-                    string.Create(CultureInfo.InvariantCulture, $"{i:D2}").PadRight(n, 'f')[..n],
-                    IntegerType.Instance,
-                    true)),
-            ])),
-        ];
-
-        var reachable = new List<string>();
-        int inspected = 0;
-        int tightest = int.MaxValue;
-
-        void Inspect(StructType structType)
-        {
-            inspected++;
-            StructField last = structType.Fields[^1];
-
-            // The compact child is taken from the renderer itself rather than modelled here; BoundTypes at
-            // a zero allowance is the one reachable path that returns exactly the summary the struct walk
-            // charges each field.
-            string compact = CoercionHelpers.BoundTypes(0, last.DataType)[0];
-            int marginalCost = 1 + last.Name.Length + 1 + compact.Length;
-            tightest = Math.Min(tightest, marginalCost);
-
-            if (marginalCost < refund)
-            {
-                reachable.Add(string.Create(
-                    CultureInfo.InvariantCulture,
-                    $"last field '{last.Name}:{compact}' costs {marginalCost}, below the refund {refund}"));
-            }
-
-            foreach (StructType nested in structType.Fields.Select(f => f.DataType).OfType<StructType>())
-            {
-                Inspect(nested);
-            }
-        }
-
-        foreach (StructType fixture in fixtures)
-        {
-            Inspect(fixture);
-        }
-
-        Assert.True(
-            reachable.Count == 0,
-            string.Create(
-                CultureInfo.InvariantCulture,
-                $"{reachable.Count} of {inspected} pre-existing struct(s) can now reach the discriminating "
-                    + $"region, so the pin below is no longer the only guard that can see it:\n")
-            + string.Join("\n", reachable));
-
-        // Non-vacuity, in the two ways this assertion can quietly stop meaning anything: inspecting nothing,
-        // and inspecting only structs so far above the refund that no plausible edit could cross it. The
-        // tightest pre-existing margin is one character, which is why "well beyond the threshold" was the
-        // wrong description and why the margin is measured instead.
-        Assert.True(
-            inspected > 1,
-            "fewer than two structs were inspected, so this assertion covers almost nothing");
-        Assert.True(
-            tightest < refund * 2,
-            string.Create(
-                CultureInfo.InvariantCulture,
-                $"the tightest pre-existing last-field cost is {tightest}, far above the refund {refund}: "
-                    + $"the fixtures have drifted so far from the boundary that this no longer guards it"));
-    }
-
     /// <summary>Distinct leading characters, so names stay unique down to a length of one.</summary>
     private const string Alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
-
-    /// <summary>The field-name widths swept by <see cref="NoFieldIsElided_WhileTheBudgetCouldStillHavePaidForIt"/>,
-    /// hoisted so that
-    /// <see cref="TheFixturesThatPredateThisPin_CannotReachTheDiscriminatingRegion"/> can READ them.
-    /// A second reviewer falsified the deleted prose by this route rather than by marginal cost — a
-    /// predating fixture does not fix ONE width, it sweeps three — so the assertion has to cover the swept
-    /// widths as well as the hard-coded ones, and restating them here would reintroduce exactly the copy
-    /// this change exists to remove.</summary>
-    private static readonly int[] LegacySweptNameLengths = [8, 16, 32];
 
     /// <summary>The exact width of the <c>… (+N more)</c> marker, spelled out rather than borrowed from
     /// <c>DiagnosticText</c>, so that the oracle below shares no arithmetic with the code it judges.</summary>
@@ -1090,10 +972,17 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// written here as a number: the previous revision of this sentence stated one that was too large by
     /// one, which would have led a maintainer picking a corpus by it to choose a NON-discriminating one —
     /// the worst failure mode available to a comment, since it survives review by sounding like guidance.
-    /// Every fixture that existed before this test used a single long name width (see the two name helpers
-    /// above), well beyond the threshold, so the region where the walks differ did not exist in the corpus
-    /// at all. Sixth vacuity of the "corpus cannot see the bound" family, and the one that hid the
-    /// longest.</para>
+    /// Sixth vacuity of the "corpus cannot see the bound" family, and the one that hid the longest.</para>
+    /// <para><b>Why the older fixtures were blind is not recorded here, and that is the finding.</b> Four
+    /// sentences and two assertions in this change tried to say it. All six were false, each written while
+    /// correcting the one before, and the last of them — an assertion, which should have been immune —
+    /// was false because it measured a corpus its author had hand-listed, so it inspected a third of this
+    /// file's structs and missed two that reach the region today. The conclusion held every time and the
+    /// stated reason never did. A claim about the fixtures AROUND this pin turns out to be unaskable
+    /// without enumerating source, and nothing depends on it: what the guard needs is that THIS pin's own
+    /// corpus reaches the discriminating region, which is asserted below and fails loudly if a future edit
+    /// lengthens these names. If you are here because you are adding a fixture, do not read a rule off
+    /// this paragraph — run the assertion.</para>
     /// <para><b>The oracle.</b> Each field's minimum cost is reconstructed from the corpus — the name, a
     /// colon, and the most compact form of its type — so the largest feasible count is arithmetic that
     /// borrows nothing from the renderer. The assertion is EQUALITY, not a bound: a count too small is the

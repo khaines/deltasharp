@@ -301,21 +301,27 @@ internal static class CoercionHelpers
                     // exactly as in DiagnosticText.SanitizeToBudget and for the same reason: total cost is not
                     // monotonic in k, because the marker vanishes entirely at the last step, refunding more
                     // than a cheap field costs. So a count can be infeasible while a LARGER one fits, and a
-                    // forward stop-at-first-failure walk halts below it.
+                    // forward stop-at-first-failure walk halts below it. The last step is not the ONLY
+                    // refunding one — Owed also shrinks each time the hidden count crosses a power of ten —
+                    // it is only the one whose refund can exceed a field. The scan does not distinguish them
+                    // and does not need to, which is why it is a scan and not a special case at k ==
+                    // fieldCount; a round of this review spent itself on an exclusivity claim the code had
+                    // never made.
                     //
                     // That sentence was, until round 17, an executable claim with nothing executing it. It is
                     // now the property asserted by
                     // AnalysisExceptionTypeRenderTests.TheFieldCountIsTheLargestFeasibleCount_NotOneShortOfThe
                     // FirstInfeasibleOne, which also asserts that its corpus still CONTAINS a count of that
-                    // shape — because no fixture that predates it can reach that region, which is itself
-                    // asserted, by TheFixturesThatPredateThisPin_CannotReachTheDiscriminatingRegion, rather
-                    // than described here. EVERY revision of this comment that described it was wrong, each
-                    // one written while correcting the last, and each comparing something other than the
-                    // quantity that decides the region. Guidance for building a discriminating corpus fails
-                    // silently when followed, so it is executed now and this paragraph names the test
-                    // instead of the numbers. The scan was 0-RED across the whole
-                    // solution for two rounds on exactly that account: not a missing axis but a fixture
-                    // VALUE, with the sibling scan in DiagnosticText pinned all along.
+                    // shape, rather than assuming it. WHY the older fixtures did not catch this is not
+                    // recorded here, and that is deliberate. Every revision of this paragraph that explained
+                    // it was wrong — three sentences and two assertions, each written while correcting the
+                    // last, each comparing something other than the quantity that decides the region, and
+                    // the final assertion measuring a corpus it had hand-picked so that its answer came out
+                    // the way the sentence had. The conclusion held every time and the stated reason never
+                    // did, which is the most reliable signal in this whole change that an explanation is
+                    // load-bearing prose pretending to be a fact. The scan was 0-RED across the whole
+                    // solution for two rounds, and the live guard against that is the pin's own assertion
+                    // that ITS corpus reaches the region — not any claim about the fixtures around it.
                     //
                     // Pass 2 fixes HOW MUCH DETAIL. The count is now settled, so each child in turn may expand
                     // into whatever is left after reserving the minimum for the fields that follow it. Nothing a
