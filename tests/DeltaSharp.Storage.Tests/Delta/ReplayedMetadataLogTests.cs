@@ -176,6 +176,33 @@ public sealed class ReplayedMetadataLogTests
         AssertPathFree(error.Message);
     }
 
+    [Fact]
+    public void AMovedButSilentTrailingRevision_IsRejectedOnlyByTheEndAccountingReferenceEquals()
+    {
+        // Council R3, balanced seat. Every other part of the lineage check PASSES on this shape: the chain is
+        // unbroken, it closes on the window end, the lineage moved, and a metaData WAS recorded. The one thing
+        // that is false is the thing `endMetadataAccounted` is computed from — no recorded metaData's applied
+        // result is the metadata the reconstruction actually ended on. Version 1 moved the lineage silently,
+        // so the window's end metadata is corroborated by nothing.
+        //
+        // This is the oracle for the `ReferenceEquals` in the `endMetadataAccounted |= ...` accumulation.
+        // Weakening only that half (to an always-true predicate) turned ZERO tests red before this test
+        // existed: `AWholesaleFailureToRecordMetadata_...` cannot reach it, because there EVERY entry has an
+        // empty metadata list and the accumulation loop `continue`s past all of them.
+        var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
+        MetadataAction recorded = Meta("recorded");
+        MetadataAction endedOn = Meta("ended-on");
+        log.Record(0, new[] { recorded }, null, recorded);   // a real metaData, but not the window's end
+        log.Record(1, None, recorded, endedOn);              // lineage moves with nothing recorded to explain it
+
+        DeltaProtocolException error =
+            Assert.Throws<DeltaProtocolException>(() => Sealed(log).TryGetProvenObservation(0, out _));
+
+        Assert.Contains("0", error.Message, StringComparison.Ordinal);
+        Assert.Contains("1", error.Message, StringComparison.Ordinal);
+        AssertPathFree(error.Message);
+    }
+
     // ---------------------------------------------------------------------------------------------------
     // Rule 2 — corroborated silence: "this version expressed no metaData" is CHECKED against the
     // reconstruction's own metadata lineage, not believed. This is the exact council-R1 fail-open.

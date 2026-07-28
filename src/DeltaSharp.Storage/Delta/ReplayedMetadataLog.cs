@@ -57,41 +57,86 @@ namespace DeltaSharp.Storage.Delta;
 /// links chain unbroken, yet an earlier version silently swallowed a real <c>metaData</c>. Only
 /// <see cref="EnsureObservationMatchesReplayedState"/> catches that shape.</description></item>
 /// </list>
-/// <para>Each layer therefore has its OWN discriminating test rather than sharing an end-behaviour one. The
-/// precise, audited form of that claim (council R2 — the earlier unqualified wording was falsified by a
-/// surviving mutant, so it is stated here only to the extent it has actually been checked):
-/// <b>every mutation point in this type was individually neutered and the whole suite run</b>. FOURTEEN in
-/// total — thirteen guards plus one ORDERING constraint (<see cref="Seal"/>'s, which is not an <c>if</c> but
-/// is a mutation point with its own oracle, and is counted separately precisely because it was the thing a
-/// guard was concealing). Three categories; the third is the one that matters, because it is the class a
-/// fail-closed suite is STRUCTURALLY INCAPABLE of detecting:</para>
+/// <para>Each layer therefore has its OWN discriminating test rather than sharing an end-behaviour one.</para>
+///
+/// <para><b>How that claim is audited, and why the METHOD is written down instead of a number.</b> Five
+/// independent audits of this type counted 12, 18, 19, 21 and 26 "guards" and found 1, 2, 2, 2 and 3
+/// survivors respectively. Every finer audit found more. That is the signature of a set nobody DERIVED:
+/// each reviewer hand-listed, and their granularity decided their count, so "every guard in this type" was
+/// unverifiable by construction — which is why it was falsified three times by three different people. The
+/// enumeration is therefore no longer hand-listed. A mutation point in this type is defined as, and can be
+/// re-derived mechanically from the source by:</para>
 /// <list type="number">
-/// <item><description><b>Killed (12).</b> Two DIFFERENT properties hold here and they must be stated
-/// separately, because asserting the stronger one over both groups was wrong. (a) The four conjuncts of
-/// <see cref="EnsureLineageIsAccountedFor"/> are disjoint in COUNT AND IDENTITY: exactly one red each, four
-/// different tests. (b) The interval guards (the two coverage bounds and the exclusive window bound) are each
-/// individually DISCRIMINATING but NOT disjoint — their red sets are pairwise distinct yet overlapping, and
-/// the window bound's single red is a strict SUBSET of the upper coverage bound's. Every observable guard
-/// still has a discriminating oracle; "non-overlapping" as a blanket adjective was simply
+/// <item><description>each top-level boolean operand (split on <c>&amp;&amp;</c> / <c>||</c>) of every
+/// condition, and</description></item>
+/// <item><description>each <c>return</c>, <c>continue</c> and <c>break</c>, and</description></item>
+/// <item><description>each boolean-valued STATE WRITE — an assignment whose right-hand side contains a
+/// comparison or <c>ReferenceEquals</c>, and</description></item>
+/// <item><description>each ORDERING constraint between a state write and a validation call.</description>
+/// </item>
+/// </list>
+/// <para>That rule yields <b>29</b> points: 26 conditions/exits, 2 boolean state writes, 1 ordering
+/// constraint. It also explains the historical misses. Categories 3 and 4 are not <c>if</c> statements, so a
+/// guard-shaped enumeration cannot see them — and those three sites are EXACTLY the three fail-opens found by
+/// review rather than by this file's own audit: the chain-closure <c>ReferenceEquals</c> (write), the
+/// <c>endMetadataAccounted</c> <c>ReferenceEquals</c> (write), and <see cref="Seal"/>'s ordering. The lesson
+/// generalises past this file: an audit that enumerates conditions will systematically miss validation logic
+/// that lives in an assignment.</para>
+///
+/// <para><b>Result of running all 29: 26 killed, 3 survivors, none fail-open.</b> Attribution is stated as
+/// two SEPARATE properties, because asserting the stronger one over the whole file was wrong three times:</para>
+/// <list type="bullet">
+/// <item><description><b>Disjoint in identity — the four conjuncts of
+/// <see cref="EnsureLineageIsAccountedFor"/> only.</b> Each names a different oracle:
+/// chain-link → <c>APartiallyOmittedNonFinalRevision</c>; chain-closure →
+/// <c>ATrailingSilentVersionWhoseWitnessContradictsTheChain</c>; end-accounting →
+/// <c>AWholesaleFailureToRecordMetadata</c> + <c>AMovedButSilentTrailingRevision</c>; un-moved branch →
+/// <c>AMetadataRecordedAcrossAnUnMovedLineage</c>. Note this is disjoint in IDENTITY but no longer "exactly
+/// one red each" — end-accounting now has two oracles.</description></item>
+/// <item><description><b>Everything else: individually discriminating, NOT disjoint.</b> Measured overlaps —
+/// the exclusive-window bound's single red is a strict SUBSET of the upper coverage bound's; the two coverage
+/// bounds share <c>TheCoveredSetIsExactlyTheContiguousIntervalObserved</c>; and the empty-entry skip, its
+/// <c>continue</c>, and the <c>endMetadataAccounted</c> conjunct all die with the SAME two-element set. Every
+/// point still has an oracle that dies; "non-overlapping" as a blanket adjective is simply
 /// false.</description></item>
-/// <item><description><b>Provably equivalent (2), each falsified BY EXECUTION against a recorded state space
-/// rather than argued from the shape of the code.</b> An equivalence claim is only as good as the space it
-/// survived, so the space is recorded here, not just the verdict. (a) The <c>!HasCoverage</c> disjunct in
+/// </list>
+///
+/// <para><b>The three survivors, classified — and the classification matters more than the count.</b></para>
+/// <list type="number">
+/// <item><description><b>Execution-falsified equivalent (1).</b> The <c>!HasCoverage</c> disjunct in
 /// <see cref="TryGetProvenObservation"/>: with no coverage the interval is <c>[0, 0)</c>, so the bounds
-/// beside it already reject every version — THREE independent falsification attempts, over
+/// beside it already reject every version. FOUR independent falsification attempts, over
 /// <c>{long.MinValue, -1, 0, 1, 99, 100, long.MaxValue}</c> against four observer states, over
 /// <c>{MinValue, -1, 0, 1, MaxValue}</c> including the <c>version = -1</c> overflow edge, plus the proof that
-/// <c>CoveredToExclusive != 0</c> implies <see cref="HasCoverage"/>. None could distinguish it; it holds.
-/// (b) <see cref="Seal"/>'s idempotent early return, but ONLY as a consequence of the ordering fix below:
-/// because the flag is now set only after the check PASSES, and <see cref="Record"/> refuses to mutate a
-/// sealed window, a repeated <see cref="Seal"/> re-runs a deterministic check over frozen state and reaches
-/// the same verdict — pass/pass or throw/throw. It is a memoisation, not a guard.</description></item>
-/// <item><description><b>Safer-direction survivors (0 now; 1 before the ordering fix).</b> A mutant that makes
-/// the code fail closed MORE cannot be killed by a suite whose assertions are "must throw" — it is invisible
-/// to the method, not absent from the code. Before the fix, deleting <see cref="Seal"/>'s early return made a
-/// retried seal re-throw instead of returning silently: strictly safer, therefore unkillable. Any future
-/// survivor here must be excluded from this bucket BEFORE it may be called equivalent.</description></item>
+/// <c>CoveredToExclusive != 0</c> implies <see cref="HasCoverage"/>. None could distinguish it.</description>
+/// </item>
+/// <item><description><b>Equivalent as a CONSEQUENCE of the ordering fix (1).</b> <see cref="Seal"/>'s
+/// idempotent early return. Because the flag is now set only after the check PASSES, and <see cref="Record"/>
+/// refuses to mutate a sealed window, a repeated <see cref="Seal"/> re-runs a deterministic check over frozen
+/// state and reaches the same verdict — pass/pass or throw/throw. It is a memoisation, not a guard. It was
+/// NOT equivalent before that fix; see below.</description></item>
+/// <item><description><b>ARGUED equivalent, not execution-falsified (1) — the weakest claim in this file.</b>
+/// The <c>break</c> after <c>chained = false</c> in the chain walk. <c>chained</c> is monotone: nothing ever
+/// sets it back to true, and the loop's only other effect is advancing <c>cursor</c>, which is consumed
+/// solely by a conjunction that is already false. So continuing the walk cannot change the verdict. This is
+/// the ONLY equivalence here resting on an argument rather than a swept space, and by the rule stated below
+/// that makes it the one most likely to be wrong. Flagged deliberately so the next reader attacks it first
+/// rather than trusting it.</description></item>
 /// </list>
+///
+/// <para><b>Safer-direction survivors: a third category, distinct from equivalent.</b> A mutant that makes
+/// the code fail closed MORE cannot be killed by a suite whose assertions are "must throw" — it is invisible
+/// to the method, not absent from the code. There are none now, but before the ordering fix, deleting
+/// <see cref="Seal"/>'s early return made a retried seal re-throw instead of returning silently: strictly
+/// safer, therefore unkillable, and it CONCEALED the real fail-open underneath it. Any future survivor must
+/// be excluded from this bucket BEFORE it may be called equivalent.</para>
+///
+/// <para><b>Mutant quality is part of the audit.</b> Three of this file's own mutants were initially DEFECTIVE
+/// — they weakened a guard only at <c>long.MinValue</c>, so they were near-equivalent by construction and
+/// "survived" for a reason that said nothing about the test suite. Corrected to always-false forms, all three
+/// died (1, 26 and 2 red). A survivor is evidence about the tests ONLY once the mutant is shown to change
+/// behaviour on a reachable input; otherwise it is evidence about the mutant.</para>
+///
 /// <para><b>Why that last rule is stated so bluntly.</b> <see cref="Seal"/>'s early return was independently
 /// assessed as unkillable by two reviewers using two DIFFERENT arguments — one swept four observer states
 /// against three <see cref="Seal"/> calls, the other reasoned that <see cref="Record"/> throws after sealing
