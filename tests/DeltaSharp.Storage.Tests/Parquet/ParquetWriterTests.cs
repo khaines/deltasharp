@@ -1205,11 +1205,27 @@ public sealed class ParquetWriterTests
     /// </para>
     /// <para>
     /// The input to the serializer is a closed object model, so the axes are not actually open:
-    /// they are the members of <c>StructType</c>, <c>StructField</c>, <c>FieldMetadata</c>,
-    /// <c>MetadataValue</c> and <c>DataType</c>. Reflection enumerates them. This test asserts that
-    /// each one is actually VARIED by the corpus, with the requirement derived from the member's
-    /// TYPE: a <c>bool</c> must show both values, an enum every value, a count several values
-    /// including a large one, a string several values.
+    /// they are the members of <c>StructType</c>, <c>StructField</c>, <c>FieldMetadata</c> and
+    /// <c>MetadataValue</c>. Reflection enumerates them. This test asserts that each one is
+    /// actually VARIED by the corpus, with the requirement derived from the member's TYPE: a
+    /// <c>bool</c> must show both values, an enum every value, a count several values including a
+    /// large one, a string several values -- and, where a collection and its contents interact,
+    /// the JOINT cell rather than the two marginals.
+    /// </para>
+    /// <para>
+    /// This paragraph used to name <c>DataType</c> as well. It was not in the list the code walks,
+    /// which made it a completeness claim in prose that no test runs -- the same pattern as the
+    /// table deleted from this PR earlier, found independently by two reviewers. The consequence
+    /// is real and is tracked as issue #729: <c>DecimalType.Precision</c> and <c>Scale</c> are
+    /// required by nothing here.
+    /// </para>
+    /// <para>
+    /// One category is outside this scheme entirely and cannot be reached by extending it: an axis
+    /// must be a member of the input model, so AMBIENT PROCESS STATE is invisible to this guard by
+    /// construction. Culture is the instance that mattered -- a culture-sensitive number format
+    /// makes the footer structurally invalid JSON -- and it is pinned separately by
+    /// <see cref="SharedSerializer_IsIndependentOfAmbientCulture"/> rather than by anything derived
+    /// from the model.
     /// </para>
     /// <para>
     /// So adding a property to the model -- or, as happened here, leaving <c>Nullable</c> pinned to
@@ -1862,6 +1878,208 @@ public sealed class ParquetWriterTests
         {
             yield return schema;
         }
+    }
+
+
+    /// <summary>
+    /// A schema whose serialization depends on ambient culture if anything in the writer is
+    /// culture-sensitive: fractional and negative doubles, exponent forms, negative longs, and
+    /// keys whose ORDINAL order differs from every linguistic collation.
+    /// </summary>
+    /// <remarks>
+    /// Built PER CALL, not once into a static. A static would be constructed under whichever
+    /// culture happened to be current at type-initialisation, and any culture sensitivity in
+    /// CONSTRUCTION -- metadata keys are held in a sorted dictionary, so the comparer decides the
+    /// footer's key order -- would then be frozen before the first culture is ever set. Measured:
+    /// with a static, a rogue swapping the key comparer to the current culture scored 0 kills; the
+    /// hazard was invisible because the schema had already been sorted.
+    /// </remarks>
+    private static StructType BuildCultureHazardSchema() => new(
+    [
+        new StructField(
+            "ratio", DataTypes.DoubleType, nullable: true,
+            FieldMetadata.FromValues(
+            [
+                // Number formatting: the decimal separator, the negative sign, the exponent form
+                // and the digit shapes are all culture-dependent, and a footer carrying a comma
+                // separator is not merely wrong, it is INVALID JSON -- the log's schemaString with
+                // it is unreadable by every Delta reader, ours and everyone else's.
+                new KeyValuePair<string, MetadataValue>("half", MetadataValue.Double(0.5)),
+                new KeyValuePair<string, MetadataValue>("negHalf", MetadataValue.Double(-0.5)),
+                new KeyValuePair<string, MetadataValue>("tiny", MetadataValue.Double(1E-300)),
+                new KeyValuePair<string, MetadataValue>("huge", MetadataValue.Double(double.MaxValue)),
+                new KeyValuePair<string, MetadataValue>("least", MetadataValue.Double(double.MinValue)),
+                new KeyValuePair<string, MetadataValue>("eps", MetadataValue.Double(double.Epsilon)),
+                new KeyValuePair<string, MetadataValue>("negZero", MetadataValue.Double(-0.0)),
+                new KeyValuePair<string, MetadataValue>("negLong", MetadataValue.Long(long.MinValue)),
+
+                // Collation: these four sort one way ORDINALLY and another way under essentially
+                // every linguistic comparer, so a culture-sensitive sort reorders the footer.
+                new KeyValuePair<string, MetadataValue>("_leading", MetadataValue.String("a")),
+                new KeyValuePair<string, MetadataValue>("Zebra", MetadataValue.String("b")),
+                new KeyValuePair<string, MetadataValue>("apple", MetadataValue.String("c")),
+
+                // Casing: Turkish maps i/I outside the ASCII pair, so any ToUpper/ToLower on a key
+                // shows up here and nowhere else.
+                new KeyValuePair<string, MetadataValue>("id", MetadataValue.String("I")),
+                new KeyValuePair<string, MetadataValue>("ID", MetadataValue.String("i")),
+            ])),
+    ]);
+
+    /// <summary>
+    /// One representative culture per distinct FORMATTING BEHAVIOUR, derived from the runtime's
+    /// own culture table rather than chosen.
+    /// </summary>
+    /// <remarks>
+    /// Naming three cultures would be a hand-list, and a hand-list is what this file keeps being
+    /// caught by. The signature below is the behaviour the serializer could actually depend on --
+    /// number formatting, collation, casing -- so the set covers every DISTINCT behaviour the
+    /// runtime knows about, and grows by itself when the runtime's table does.
+    /// </remarks>
+    private static IReadOnlyList<System.Globalization.CultureInfo> FormattingBehaviourCultures()
+    {
+        var representatives =
+            new Dictionary<string, System.Globalization.CultureInfo>(StringComparer.Ordinal);
+        foreach (System.Globalization.CultureInfo culture in
+            System.Globalization.CultureInfo.GetCultures(System.Globalization.CultureTypes.AllCultures))
+        {
+            representatives.TryAdd(FormattingSignature(culture), culture);
+        }
+
+        return representatives.Values.ToArray();
+    }
+
+    private static string FormattingSignature(System.Globalization.CultureInfo culture)
+    {
+        System.Globalization.NumberFormatInfo n = culture.NumberFormat;
+        return string.Join(
+            '\u0001',
+            n.NumberDecimalSeparator,
+            n.NumberGroupSeparator,
+            n.NegativeSign,
+            n.PositiveSign,
+            string.Concat(n.NativeDigits),
+            n.DigitSubstitution.ToString(),
+            Math.Sign(string.Compare("a", "B", culture, System.Globalization.CompareOptions.None))
+                .ToString(System.Globalization.CultureInfo.InvariantCulture),
+            "i".ToUpper(culture),
+            "I".ToLower(culture));
+    }
+
+    /// <summary>
+    /// The serializer's output must not depend on the AMBIENT CULTURE of the process.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A category that every other guard in this file is blind to BY CONSTRUCTION. The
+    /// degrees-of-freedom guard defines an axis as a member of the schema model, and ambient
+    /// process state is not a member of the schema model, so nothing derived from it can see this.
+    /// Eighteen rogues varied the input or replaced the serializer; this one varies the
+    /// ENVIRONMENT the serializer runs in, and the shipped code passes only because the machine
+    /// running it happens to use a dot.
+    /// </para>
+    /// <para>
+    /// The consequence is not a wrong string, it is an INVALID one. A comma decimal separator
+    /// makes both the footer and the log's schemaString structurally invalid JSON, so every table
+    /// written on such a host is unreadable by every Delta reader, including ours -- silently, and
+    /// for tables already written. That is why this is pinned rather than deferred.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void SharedSerializer_IsIndependentOfAmbientCulture()
+    {
+        System.Globalization.CultureInfo original = System.Globalization.CultureInfo.CurrentCulture;
+        try
+        {
+            System.Globalization.CultureInfo.CurrentCulture =
+                System.Globalization.CultureInfo.InvariantCulture;
+            string baseline = SchemaJson.ToJson(BuildCultureHazardSchema());
+
+            foreach (System.Globalization.CultureInfo culture in FormattingBehaviourCultures())
+            {
+                System.Globalization.CultureInfo.CurrentCulture = culture;
+                string actual = SchemaJson.ToJson(BuildCultureHazardSchema());
+                if (!string.Equals(baseline, actual, StringComparison.Ordinal))
+                {
+                    Assert.Fail(
+                        $"The shared serializer's output depends on the ambient culture "
+                        + $"'{culture.Name}'."
+                        + $"{Environment.NewLine}  invariant: {Truncate(baseline)}"
+                        + $"{Environment.NewLine}  {culture.Name,-12}: {Truncate(actual)}");
+                }
+
+                // Byte-equality alone would still pass if BOTH sides were broken the same way, so
+                // the output is also required to remain READABLE.
+                SchemaJson.FromJson(actual);
+            }
+        }
+        finally
+        {
+            System.Globalization.CultureInfo.CurrentCulture = original;
+        }
+    }
+
+    /// <summary>
+    /// The ARTIFACT under a hostile culture: a real footer, read back, compared to the log.
+    /// </summary>
+    /// <remarks>
+    /// The test above pins the shared serializer in isolation. This one pins the whole write path,
+    /// because culture reaches further than one method -- anything between the schema and the
+    /// bytes on disk could format a number, and only a real footer proves it did not.
+    /// </remarks>
+    [Fact]
+    public async Task WrittenFooter_IsIndependentOfAmbientCulture()
+    {
+        System.Globalization.CultureInfo original = System.Globalization.CultureInfo.CurrentCulture;
+        try
+        {
+            foreach (System.Globalization.CultureInfo culture in FormattingBehaviourCultures())
+            {
+                System.Globalization.CultureInfo.CurrentCulture = culture;
+                StructType schema = BuildCultureHazardSchema();
+                string expected = SchemaJson.ToJson(schema);
+                string footer = await WriteAndReadFooterSchemaAsync(schema);
+                if (!string.Equals(expected, footer, StringComparison.Ordinal))
+                {
+                    Assert.Fail(
+                        $"The written footer depends on the ambient culture '{culture.Name}'."
+                        + $"{Environment.NewLine}  expected (log): {Truncate(expected)}"
+                        + $"{Environment.NewLine}  actual (footer): {Truncate(footer)}");
+                }
+
+                SchemaJson.FromJson(footer);
+            }
+        }
+        finally
+        {
+            System.Globalization.CultureInfo.CurrentCulture = original;
+        }
+    }
+
+    /// <summary>
+    /// Meta-guard: the derived culture set must actually CONTAIN the hazards it exists to probe.
+    /// </summary>
+    /// <remarks>
+    /// Under globalization-invariant mode the runtime's culture table collapses to a single
+    /// entry, and the culture test above would pass while probing nothing -- a guard that silently
+    /// becomes a no-op is the failure this file has met more than once. This names the condition
+    /// instead, and it is rooted in the culture data rather than in the list under test.
+    /// </remarks>
+    [Fact]
+    public void FormattingBehaviourCultures_ContainTheHazardsTheyProbe()
+    {
+        IReadOnlyList<System.Globalization.CultureInfo> cultures = FormattingBehaviourCultures();
+
+        Assert.True(
+            cultures.Any(x => x.NumberFormat.NumberDecimalSeparator != "."),
+            "No culture uses a non-dot decimal separator, so the culture guard probes nothing. "
+            + "This is what globalization-invariant mode looks like from inside the test.");
+        Assert.True(
+            cultures.Any(x => x.NumberFormat.NegativeSign != "-"),
+            "No culture uses a non-ASCII negative sign.");
+        Assert.True(
+            cultures.Any(x => string.Compare("a", "B", x, System.Globalization.CompareOptions.None) < 0),
+            "No culture collates 'a' before 'B', so a culture-sensitive sort would be invisible.");
     }
 
     /// <summary>
