@@ -36,8 +36,9 @@ namespace DeltaSharp.Core.Tests.Analysis;
 /// suite fails <b>closed</b>, on the non-vacuity precondition, with a message naming the axis and the observed
 /// length — a test that says "this case can no longer observe the backstop" rather than one that silently
 /// passes. That is the correct failure direction, and re-scaling is then a one-line change here. Quality found
-/// this by re-baselining to 4096, which the original cardinality scale (200 items, 1030–3774 chars) could not
-/// survive; both scales below are now chosen so the two axes have comparable headroom.</para>
+/// this by re-baselining to 4096, which the original cardinality scale could not survive because its widest
+/// case still rendered well under the new cap; both scales below are now chosen so the two axes have
+/// comparable headroom.</para>
 /// <para><b>Coverage is the class, not an example.</b> The property is asserted over every factory that
 /// interpolates attacker-influenceable text, along BOTH growth axes each one exposes: the length of an
 /// individual token, and the CARDINALITY of a list (a wide hostile schema, a long candidate set). A property

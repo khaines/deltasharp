@@ -71,8 +71,8 @@ public sealed class SqlParseException : Exception
 
     /// <summary>
     /// The backstop cap applied to the <b>whole composed message</b> of every <see cref="SqlParseException"/>.
-    /// Sized well above the longest diagnostic the parser composes today (its longest fixed prose plus a
-    /// per-token-bounded echo is under 350 characters), so it never truncates a well-behaved message — it
+    /// Sized well above the longest diagnostic the parser composes today — its longest fixed prose plus a
+    /// per-token-bounded echo is a small fraction of it — so it never truncates a well-behaved message; it
     /// exists only so a call site that forgets to bound its own echo still cannot render an unbounded message.
     /// </summary>
     /// <remarks>
@@ -132,7 +132,7 @@ public sealed class SqlParseException : Exception
     /// in practice and always has been: every <paramref name="construct"/> the parser passes is a compile-time
     /// constant from its own keyword maps (<c>JOIN</c>, <c>GROUP_BY</c>, <c>FUNCTION_CALL</c>, …) — never
     /// source text — so no attacker-chosen token can reach this message, and the longest message this factory
-    /// can compose is 328 characters, comfortably inside <see cref="MaxMessageLength"/> (#687).</remarks>
+    /// can compose is comfortably inside <see cref="MaxMessageLength"/> (#687).</remarks>
     /// <param name="construct">The unsupported construct's stable token (for example <c>JOIN</c>).</param>
     /// <param name="position">The 1-based position of the construct in the source SQL.</param>
     internal static SqlParseException Unsupported(string construct, int position)

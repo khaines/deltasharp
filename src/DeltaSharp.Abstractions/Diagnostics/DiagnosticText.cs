@@ -206,8 +206,8 @@ internal static class DiagnosticText
     /// <para>
     /// <b>Why this exists alongside <see cref="SanitizeAndJoin"/>.</b> That primitive takes a fixed item cap
     /// and a fixed per-item cap, which means a listing can elide while most of the message budget goes
-    /// unused: a 30-item listing capped at 20 dropped 10 items to render 491 characters against a 1024-char
-    /// ceiling. Eliding while more than half the budget is spare discards information for no benefit — and it
+    /// unused: a listing wider than the item cap dropped names while leaving over half the message budget
+    /// spare. Eliding while the budget is spare discards information for no benefit — and it
     /// is <em>worse</em> than the unbounded original for every width that used to fit. This overload derives
     /// both bounds from the space actually available, so a listing is elided only when it genuinely will not
     /// fit, and the common case is untouched by construction rather than by a well-chosen constant.
@@ -281,7 +281,7 @@ internal static class DiagnosticText
         // The walk charged every item a reserve of OverflowMarkerLength(items.Count) — the marker for hiding
         // ALL of them — when what it actually needed was the marker for the few that would really be left.
         // A wider count makes a wider number makes a bigger reserve, so it stopped early and hid items it had
-        // room for: 108 seven-character names showed 105 at 1015 characters when 108 fit in 1024. The earlier
+        // room for. The earlier
         // "does the whole thing fit" pre-check patched exactly one cell of that — the case where nothing is
         // hidden — and could not help at any width where something genuinely is. Charging the true remaining
         // count removes the reserve concept altogether, and with it the fits-entirely special case, since

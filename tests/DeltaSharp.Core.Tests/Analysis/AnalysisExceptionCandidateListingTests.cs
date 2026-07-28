@@ -93,8 +93,8 @@ public sealed class AnalysisExceptionCandidateListingTests
 
     /// <summary>
     /// Round 7 (Quality): <b>nothing is elided while the budget still has room.</b> A fixed item cap made a
-    /// listing discard names with more than half the message budget unused — a 30-column listing capped at 20
-    /// rendered 491 characters against a 1024-character ceiling, which is <i>worse than the unbounded
+    /// listing discard names with more than half the message budget unused — any listing wider than the item
+    /// cap dropped names while most of the ceiling went unspent, which is <i>worse than the unbounded
     /// original</i> at every width that used to fit. The bound is now the space actually remaining, so this
     /// sweeps the boundary band <b>continuously</b>: the previous corpus stopped at 20 and resumed at 50,
     /// leaving 21–46 — precisely where the regression lived — untested at every width.
@@ -117,11 +117,11 @@ public sealed class AnalysisExceptionCandidateListingTests
     /// rather than a line through it.
     /// <para>Sweeping width at a single name length cannot find a defect that lives on their interaction, and
     /// one did: the greedy walk charged every item for an overflow suffix that would not exist if the listing
-    /// fit, so at 107 seven-character names it elided two of them at 1015 characters when the complete
-    /// listing renders in 1020. Nine characters of budget unspent, two of the user's own column names gone,
-    /// on the trusted path. The prior corpus swept width 1–60 at one 35-character name and structurally could
-    /// not reach that cell — the third time a corpus in this PR was one dimension short.</para>
-    /// <para>This is a single fact with an interior sweep rather than 36,000 theory rows, and it collects
+    /// fit, so at a wide listing of short names it elided some of them with the budget still unspent — the
+    /// user's own column names gone, on the trusted path. The prior corpus swept width at one 35-character
+    /// name and structurally could not reach that cell — the third time a corpus in this PR was one dimension
+    /// short.</para>
+    /// <para>This is a single fact with an interior sweep rather than one theory row per cell, and it collects
     /// every counterexample before failing so the report shows the shape of a violating band instead of its
     /// lowest corner.</para>
     /// </summary>
@@ -221,8 +221,8 @@ public sealed class AnalysisExceptionCandidateListingTests
     /// <para>The previous version asked whether the <i>complete</i> listing would have fit — which is
     /// precisely the condition the code enforced, so it confirmed the implementation instead of testing it.
     /// It could see a listing that elided when nothing needed to be elided, and was structurally blind to a
-    /// listing that elided <em>too much</em>: 108 seven-character names showed 105 at 1015 characters, three
-    /// short with the budget unspent, and 36,000 cells of sweep reported no counterexample. An oracle that
+    /// listing that elided <em>too much</em> — a wide listing of short names showing fewer than it had room
+    /// for — and the sweep reported no counterexample over its whole product. An oracle that
     /// encodes the implementation's own predicate is a tautology however wide you sweep it.</para>
     /// <para>This reconstructs the cost of showing one more item from the <i>rendered message</i> — the
     /// observed item width, the observed prose, and the marker recomputed for one fewer hidden item — and

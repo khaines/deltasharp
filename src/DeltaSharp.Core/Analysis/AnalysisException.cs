@@ -135,8 +135,8 @@ internal sealed class AnalysisException : Exception
     /// </para>
     /// <para>
     /// <b>It is a backstop, and a factory that can routinely reach it has a bug.</b> An earlier revision of
-    /// this comment claimed the cap "comfortably fits a wide-schema listing"; that was measurably false — a
-    /// 50-column table already rendered 1107 characters and was silently cut to 1025. Truncating the whole
+    /// this comment claimed the cap "comfortably fits a wide-schema listing"; that was measurably false — an
+    /// ordinary wide-schema table already overran the cap and was silently cut. Truncating the whole
     /// message destroys the very signal that truncation happened, which on the TRUSTED path (a user's own
     /// schema) turns a self-service fix into a support ticket. Any factory composing a LIST must therefore
     /// bound its own items and report an explicit overflow count, so this cap never elides a list.
@@ -226,11 +226,11 @@ internal sealed class AnalysisException : Exception
     /// chosen without reference to the space available. Both kinds discarded information while the budget went
     /// unused, which is <em>worse than the unbounded original</em> at every width that used to fit. Measured
     /// against the corpus in <c>AnalysisExceptionCandidateListingTests</c> (35-character real-world column
-    /// names), the previous revision elided a <b>four</b>-column listing at 197 characters, and pinned every
-    /// width from 14 upward at 771 — leaving a quarter of the budget permanently unspent while dropping names.
-    /// Deriving the budget removes the constant, and with it the argument about the constant. These figures
-    /// are not maintained by hand either: <c>ListingBudget_IsSpentBeforeAnythingIsElided</c> asserts the
-    /// property they illustrate, over the whole <b>product</b> of listing width (1–400) and item length
+    /// names), the previous revision elided a listing only four columns wide, and pinned the rendered length
+    /// flat from a modest width upward — leaving much of the budget permanently unspent while dropping names.
+    /// Deriving the budget removes the constant, and with it the argument about the constant. The property
+    /// those observations illustrate is asserted rather than restated:
+    /// <c>ListingBudget_IsSpentBeforeAnythingIsElided</c> covers the whole <b>product</b> of listing width (1–400) and item length
     /// (1–90) — 36,000 cells. It swept width alone at a single 35-character name until round 11, when a
     /// defect living on the interaction of the two axes went undetected by exactly that shape of corpus: a
     /// line through a plane cannot find it.
@@ -688,8 +688,8 @@ internal sealed class AnalysisException : Exception
         // Both free prose tokens go through the allocator, not just the name. `expected` was echoed raw: it
         // is supplied by a function's own argument contract today, but it is a plain string parameter on a
         // public factory, and the round-9 guard oversized each parameter ONE AT A TIME, so a caller passing
-        // two long tokens at once slipped through. 1024-char name + 1024-char expected rendered 1025 chars,
-        // i.e. straight into the whole-message backstop, which is the one cut that takes a listing's
+        // two long tokens at once slipped through: one oversized parameter fitted, and two together ran
+        // straight into the whole-message backstop, which is the one cut that takes a listing's
         // (+N more) count with it.
         string Render(string fn, string want, string listing) =>
             $"Cannot resolve function '{fn}({listing})': {want}";
@@ -731,8 +731,8 @@ internal sealed class AnalysisException : Exception
     /// The detail cannot see the wrapping prose, so an earlier revision had the detail-side helper reserve a
     /// worst case for it — the full 256-character reference cap plus slack. That is an estimate, and it was
     /// wrong in the ordinary direction: for a short reference like <c>payload.typo</c> it over-reserved by
-    /// roughly 300 characters, and <c>TypeBudget_IsSpentBeforeAnyFieldIsElided</c> caught the render eliding
-    /// at 723 of 1024. Composing here instead <b>measures</b> the prose, which is the same correction this
+    /// most of what it had asked for, and <c>TypeBudget_IsSpentBeforeAnyFieldIsElided</c> caught the render
+    /// eliding with the budget still substantially unspent. Composing here instead <b>measures</b> the prose, which is the same correction this
     /// PR already applied to listings; a reserve is a constant wearing a different hat.
     /// </remarks>
     internal static AnalysisException DataTypeMismatch(

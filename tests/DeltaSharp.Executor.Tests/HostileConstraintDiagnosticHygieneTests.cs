@@ -114,8 +114,8 @@ public sealed class HostileConstraintDiagnosticHygieneTests : IDisposable
     public void HostileCheckPredicate_WithFormatCharacters_SurfacesNoBidiOrZeroWidthPayload_AndFailsClosed()
     {
         // Council round 2, item 2: the Cf half of the injection class at the PARSER sink. Pre-fix these
-        // survived the Cc-only neutralization set intact (Security: 10 of 21 parametrized payloads failed, all
-        // and only the Cf ones).
+        // survived the Cc-only neutralization set intact — the failures were all and only the Cf payloads,
+        // which is what identified the missing category rather than a missing character.
         string table = Table("format-chars");
         SeedWithHostileConstraint(table, "other > 0 `TRAIL\u202EFORGED\u200E\uFEFF\u00AD\u2066\u200B`");
 

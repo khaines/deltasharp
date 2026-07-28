@@ -14,7 +14,7 @@ namespace DeltaSharp.Core.Tests.Diagnostics;
 /// <c>DeltaSharp.Storage</c>.
 /// <para>The primitive's lone-surrogate and astral rules were only covered from
 /// <c>DeltaSharp.Storage.Tests</c>, through Storage's forwarder. Security proved the gap: mutating the fast
-/// path to drop <i>only</i> the surrogate bail-out produced <b>1 RED, Storage only</b> — the Core suites, which
+/// path to drop <i>only</i> the surrogate bail-out failed in <b>Storage alone</b> — the Core suites, which
 /// consume the same primitive from <c>SqlParser</c>, <c>SqlParseException</c> and <c>AnalysisException</c>,
 /// stayed 61/61 green. A Storage refactor that stopped forwarding would have silently deleted the primitive's
 /// only guard.</para>
@@ -130,9 +130,8 @@ public sealed class SharedDiagnosticTextContractTests
     /// discarded and no marker emitted.
     /// <para>The greedy walk charges every item for an overflow suffix that will not exist if the listing
     /// turns out to fit, so it stopped short while the complete listing was inside the budget all along:
-    /// 107 seven-character names elided two of them at 1015 characters when the full listing renders in
-    /// 1020. Two of a user's own column names discarded with budget to spare, on the trusted path — worse
-    /// than the unbounded original this bound replaced.</para>
+    /// a wide listing of short names discarded some of the user's own column names with budget to spare, on
+    /// the trusted path — worse than the unbounded original this bound replaced.</para>
     /// <para>The oracle is the exact boundary and needs no constant: a collection whose full render is
     /// <i>exactly</i> the budget must render in full with no marker; one character less must elide and
     /// report the count.</para>

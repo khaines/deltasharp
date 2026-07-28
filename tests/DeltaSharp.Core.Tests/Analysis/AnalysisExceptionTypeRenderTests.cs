@@ -315,8 +315,8 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// caught this family.
     /// <para>The listing constants were replaced by a derivation two rounds ago, but types kept a hand-picked
     /// <c>DiagnosticTypeMaxLength = 320</c> shared by the one-slot and two-slot sites. It elided an ordinary
-    /// nested payload struct at <b>13 fields</b> — 359 characters rendered against a 1024-character message,
-    /// two thirds of the budget unspent — while claiming in its own doc to show such a struct intact. It was
+    /// nested payload struct barely a dozen fields wide, with most of the message budget unspent, while
+    /// claiming in its own doc to show such a struct intact. It was
     /// also unpinned: cutting it to 64, which elides a <em>two</em>-field struct, was 0 RED across the suite.
     /// That is the same vacuity the listing corpus had, one family over, and it landed because this file
     /// asserted backstop, count, width and hostile-input properties but never <b>utilisation</b>.</para>
@@ -470,8 +470,8 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// <para>The struct walk handed each child render the <i>full</i> budget instead of what was left, so the
     /// child rendered as though it owned the whole message and the parent then measured that oversized result
     /// against the space actually remaining — and broke on its <b>first</b> field. One level of nesting was
-    /// enough: a 40-field payload one struct deep rendered 99 characters of 1024 and showed <b>zero</b> field
-    /// names. That is the ordinary shape of a Delta schema (<c>address.geo.latitude</c>), not a hostile one.
+    /// enough: a wide payload one struct deep spent a small fraction of its budget and showed <b>zero</b>
+    /// field names. That is the ordinary shape of a Delta schema (<c>address.geo.latitude</c>), not a hostile one.
     /// </para>
     /// <para>The oracle is the same independent question the listing suite asks, and deliberately not the
     /// implementation's own predicate: reconstruct from the <i>rendered message</i> what showing one more
@@ -667,8 +667,8 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// The map's slack reclaim: <b>a small value must not cost the key its detail.</b> Both children are
     /// offered half the budget, and whatever the value declines returns to the key — so the same key renders
     /// with more of its fields visible when paired with a cheap value than with an expensive one.
-    /// <para>Pinned because removing the reclaim is otherwise 0 RED while demonstrably changing output
-    /// (corpus fingerprint <c>-820776980</c> to <c>105950410</c> over four map shapes × 1,169 budgets). A live
+    /// <para>Pinned because removing the reclaim is otherwise 0 RED while demonstrably changing output over
+    /// the map shapes and budgets swept below. A live
     /// branch that no assertion reaches is exactly the class this PR keeps finding, so it is dispositioned by
     /// measurement rather than argued to be equivalent.</para>
     /// </summary>
@@ -762,8 +762,8 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// <para>The walk that this replaces was forward-greedy, and a forward-greedy walk over a budget that
     /// its own children consume is not merely suboptimal — it is NON-MONOTONE. A child handed more room
     /// renders its own structure instead of a summary and starves the fields after it, so the render showed
-    /// strictly LESS at a larger budget: 22 field names at 374 characters and 21 at 375, leaving 34
-    /// characters unspent. The identical defect had already been found and fixed in
+    /// strictly LESS at a larger budget: one more character of budget dropped a field name and left the
+    /// render shorter than it had been. The identical defect had already been found and fixed in
     /// <c>DiagnosticText.SanitizeToBudget</c>, with the reason written down there; this walk kept the old
     /// shape. Round 14 fixed its RESERVE and left its SHAPE.</para>
     /// <para>The previous guard, <see cref="TypeBudget_IsSpentBeforeAnyFieldIsElided(int)"/>, sweeps

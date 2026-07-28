@@ -268,9 +268,9 @@ internal static class CoercionHelpers
         // only if something is actually hidden, sized for THAT many rather than for int.MaxValue.
         //
         // This used to be a fixed 22 — the width of " … (+2147483647 more)" plus the '>'. A constant reserve
-        // is a reserve for the worst case charged to every case, so the walk stopped up to 20 characters
-        // early at every width, and the independent "could one more field have been shown" oracle found 226
-        // such cells. Identical in shape to the listing walk's reserve, which charged the marker for hiding
+        // is a reserve for the worst case charged to every case, so the walk stopped early at every width by
+        // the difference between the worst case and the real one, which the independent "could one more field
+        // have been shown" oracle found in quantity. Identical in shape to the listing walk's reserve, which charged the marker for hiding
         // ALL items rather than the few really left; both are the same error, so both are now the same fix.
         static int Owed(int hidden) =>
             1 + (hidden == 0 ? 0 : 1 + DiagnosticText.OverflowMarkerLength(hidden));
@@ -292,8 +292,8 @@ internal static class CoercionHelpers
                     // strictly LESS at a larger budget. The first attempt searched over candidate reserves and
                     // expansion caps sampled at powers of ten and two. That was the same mistake this whole
                     // change has been removing in other places: a SAMPLED candidate set is an incomplete one,
-                    // and it missed optima that fell between the samples (31 fields elided at 970 characters
-                    // with 32 to spare). The quantities are computable, so they are computed.
+                    // and it missed optima that fell between the samples, eliding a field with room to spare.
+                    // The quantities are computable, so they are computed.
                     //
                     // Pass 1 fixes HOW MANY. Every field has a minimum cost — its name, a colon, and the most
                     // compact form of its type — which does not depend on the budget, so a prefix-sum gives the
@@ -459,8 +459,9 @@ internal static class CoercionHelpers
                 // The reclaim is unconditional on there being slack. It was once also gated on the key having
                 // filled its half, which sounds right and meant it essentially never ran: a struct walk stops
                 // at a field boundary, so the key lands just UNDER its allowance and the gate was false almost
-                // always. map<wideStruct,int> then rendered 580 characters of a 1200-character budget with 620
-                // unused, while the key's natural render — 1167 — would have fit whole.
+                // always. map<wideStruct,int> then rendered under half its budget while the key's natural
+                // render would have fitted whole, which is the property
+                // AMapWithACheapValue_SpendsTheSlackOnItsKey now asserts instead of this sentence.
                 //
                 // A shortest-first variant was tried here instead, mirroring BoundTypes exactly. An earlier
                 // oracle rejected it for showing zero field names at budget 82 where budget 81 showed one —
