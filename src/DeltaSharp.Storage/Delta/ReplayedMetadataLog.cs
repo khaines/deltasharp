@@ -57,8 +57,14 @@ namespace DeltaSharp.Storage.Delta;
 /// links chain unbroken, yet an earlier version silently swallowed a real <c>metaData</c>. Only
 /// <see cref="EnsureObservationMatchesReplayedState"/> catches that shape.</description></item>
 /// </list>
-/// <para>Each layer therefore has its OWN discriminating test rather than sharing an end-behaviour one, so
-/// deleting any single layer turns a specific, disjoint set of tests red (council R2).</para>
+/// <para>Each layer therefore has its OWN discriminating test rather than sharing an end-behaviour one. The
+/// precise, audited form of that claim (council R2, security seat — the earlier unqualified wording was
+/// falsified by a surviving mutant, so it is stated here only to the extent it has actually been checked):
+/// <b>every guard in this type was individually neutered and the whole suite run</b>. Eleven of the twelve
+/// turn a specific, non-overlapping set of tests red. The twelfth — the <c>!HasCoverage</c> disjunct in
+/// <see cref="TryGetProvenObservation"/> — survives because it is PROVABLY REDUNDANT rather than untested:
+/// with no coverage the interval is <c>[0, 0)</c>, so the bounds comparison beside it already rejects every
+/// version. It is kept as a readability guard, not as a load-bearing one, and no test can distinguish it.</para>
 ///
 /// <para><b>Single extraction site.</b> <see cref="MetadataActionsOf"/> is the ONE place a commit's
 /// <c>metaData</c> actions are picked out of its parsed actions; the gate's disk-fallback path calls the same
@@ -269,6 +275,9 @@ internal sealed class ReplayedMetadataLog
 
         if (!HasCoverage || version < CoveredFromInclusive || version >= CoveredToExclusive)
         {
+            // `!HasCoverage` is redundant, deliberately: with no coverage the interval is [0, 0), so the two
+            // bounds already reject every version. Kept for readability; it is NOT load-bearing, which is why
+            // no test can kill a mutant of it (council R2, security seat — see the type doc's audit note).
             return false; // Outside the proven interval — the caller MUST read the commit itself.
         }
 

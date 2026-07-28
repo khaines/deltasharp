@@ -362,6 +362,58 @@ public sealed class ReplayedMetadataLogTests
     }
 
     [Fact]
+    public void ATrailingSilentVersionWhoseWitnessContradictsTheChain_IsCaughtOnlyByTheChainCLOSURE()
+    {
+        // Council R2 (security seat), mutant M3. The chain conjunct has TWO parts: each recorded link must
+        // continue from the previous one, and the chain must CLOSE on the metadata the window ends on. The
+        // closure half was load-bearing but pinned by nothing — neutering it alone left the whole suite green.
+        //
+        // The shape it uniquely rejects: every RECORDED link chains perfectly, but a trailing version that is
+        // silent AND state-unchanged (so it earns no dictionary entry, and no per-version check can fire)
+        // carries a witness contradicting where the recorded chain actually ended. Here the links run
+        // null -> a -> b, yet v2 witnesses the prevailing metadata as `a`, so the window ends on `a` while the
+        // chain ends on `b`. Only the closure comparison sees the discrepancy; without it v2 is reported
+        // covered-and-silent and the gate SKIPS it — a fail-open.
+        var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
+        MetadataAction a = Meta("a");
+        MetadataAction b = Meta("b");
+        log.Record(0, new[] { a }, null, a);
+        log.Record(1, new[] { b }, a, b);
+        log.Record(2, None, a, a); // silent, unmoved, unrecorded — but `a` is not where the chain ended.
+
+        DeltaProtocolException error = Assert.Throws<DeltaProtocolException>(log.Seal);
+
+        Assert.Contains("0", error.Message, StringComparison.Ordinal);
+        Assert.Contains("2", error.Message, StringComparison.Ordinal);
+        AssertPathFree(error.Message);
+    }
+
+    [Fact]
+    public void AMetadataRecordedAcrossAnUnMovedLineage_IsCaughtOnlyByTheUnmovedBranchOfTheLineageCheck()
+    {
+        // The fourth conjunct, found while re-verifying the disjointness claim per-conjunct rather than taking
+        // it on trust: when the window's opening and closing metadata are the SAME INSTANCE, no metaData may
+        // have been recorded anywhere in it. A Delta metaData REPLACES the prevailing metadata with the newly
+        // parsed action instance, so a genuine revision — even a change-and-change-back — always leaves the
+        // window ending on a DIFFERENT instance than it opened on. A window that both recorded revisions and
+        // ended on the very instance it started with therefore cannot have come from a real replay.
+        //
+        // Every other conjunct is satisfied here: the links chain (a -> b -> a) and the chain closes on the
+        // window's end. Only `!anyMetadataRecorded` rejects it.
+        var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
+        MetadataAction a = Meta("a");
+        MetadataAction b = Meta("b");
+        log.Record(10, new[] { b }, a, b);
+        log.Record(11, new[] { a }, b, a); // reverts to the SAME instance the window opened on.
+
+        DeltaProtocolException error = Assert.Throws<DeltaProtocolException>(log.Seal);
+
+        Assert.Contains("10", error.Message, StringComparison.Ordinal);
+        Assert.Contains("11", error.Message, StringComparison.Ordinal);
+        AssertPathFree(error.Message);
+    }
+
+    [Fact]
     public void AnUnbrokenChainOfSeveralRevisions_IsAccepted_SoTheChainCheckIsNotAFalsePositive()
     {
         // The chain conjunct must not reject a legitimate history that changes metadata repeatedly — including
