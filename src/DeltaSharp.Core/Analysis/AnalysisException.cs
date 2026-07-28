@@ -666,9 +666,20 @@ internal sealed class AnalysisException : Exception
         ArgumentNullException.ThrowIfNull(name);
         ArgumentNullException.ThrowIfNull(argumentTypes);
         ArgumentNullException.ThrowIfNull(expected);
-        string safeName = DiagnosticText.Sanitize(name, MaxEchoedReferenceLength);
-        string Compose(string listing) =>
-            $"Cannot resolve function '{safeName}({listing})': {expected}";
+        // Both free prose tokens go through the allocator, not just the name. `expected` was echoed raw: it
+        // is supplied by a function's own argument contract today, but it is a plain string parameter on a
+        // public factory, and the round-9 guard oversized each parameter ONE AT A TIME, so a caller passing
+        // two long tokens at once slipped through. 1024-char name + 1024-char expected rendered 1025 chars,
+        // i.e. straight into the whole-message backstop, which is the one cut that takes a listing's
+        // (+N more) count with it.
+        string Render(string fn, string want, string listing) =>
+            $"Cannot resolve function '{fn}({listing})': {want}";
+
+        string[] tokens = BoundTokens(
+            TokenBudget(Render(string.Empty, string.Empty, string.Empty).Length, argumentTypes.Count),
+            name,
+            expected);
+        string Compose(string listing) => Render(tokens[0], tokens[1], listing);
         return new AnalysisException(
             Compose(ComposeWithListing(Compose, argumentTypes, CoercionHelpers.DiagnosticType)),
             AnalysisErrorKind.InvalidFunctionArgument,

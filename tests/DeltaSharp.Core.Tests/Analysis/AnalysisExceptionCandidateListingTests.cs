@@ -165,6 +165,57 @@ public sealed class AnalysisExceptionCandidateListingTests
     }
 
     /// <summary>
+    /// #687 council round 12 (Quality) — the <b>fair-share divisor</b>. The per-item allowance is
+    /// <c>budget / itemCount</c>; mutating it to <c>budget</c> was 0 RED while demonstrably changing output,
+    /// because a single long item is then free to spend the whole listing and the ones behind it are dropped.
+    /// <para>The property that pins it needs no constant and no knowledge of the divisor: <b>how many items
+    /// are shown must not depend on how long they are</b>, once every item already exceeds its allowance.
+    /// Fair share makes the allowance a function of budget and count only, so length cannot move the count;
+    /// without the divisor, longer items mean fewer shown. A user who widens a column's name should not
+    /// thereby lose a different column from the diagnostic.</para>
+    /// </summary>
+    [Theory]
+    [InlineData(6)]
+    [InlineData(12)]
+    [InlineData(20)]
+    [InlineData(40)]
+    public void HowManyCandidatesAreShown_DoesNotDependOnHowLongTheyAre(int width)
+    {
+        // These MUST straddle the per-item clamp, not sit above it. The first draft of this test used
+        // 240/480/960/3000 — every one of them past the ceiling — so the mutant it exists to catch produced a
+        // constant allowance across the whole row and the assertion held under it: 0 RED, vacuous, and the
+        // same "corpus in the saturated region" mistake this PR has now made five times. 60 and 120 are below
+        // the fair share at these widths and 3000 is far above it, so the row spans the interesting range.
+        int[] lengths = [60, 120, 240, 3000];
+        int[] shown =
+        [
+            .. lengths.Select(length =>
+            {
+                AttributeReference[] columns =
+                [
+                    .. Enumerable.Range(0, width).Select(i => new AttributeReference(
+                        string.Create(CultureInfo.InvariantCulture, $"{i:D3}").PadRight(length, 'c')[..length],
+                        IntegerType.Instance,
+                        true,
+                        new ExprId(i + 1))),
+                ];
+
+                string message = AnalysisException.UnresolvedColumn("nosuch", columns).Message;
+                int open = message.IndexOf('[', StringComparison.Ordinal);
+                return message[(open + 1)..message.LastIndexOf(']')].Split(", ").Length;
+            }),
+        ];
+
+        Assert.True(
+            shown.Distinct().Count() == 1,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"width {width}: item lengths {string.Join(",", lengths)} showed "
+                    + $"{string.Join(",", shown)} candidates respectively — the number shown moved with item "
+                    + $"length, so one long name is starving its siblings instead of being truncated."));
+    }
+
+    /// <summary>
     /// The exact, constant-free oracle for "elision was necessary": if the message elided, then the listing
     /// rendered <i>in full</i> must not have fit alongside this message's own prose.
     /// <para>The predicate this replaces was <c>message.Length + oneMoreName &gt; MaxMessageLength</c>, which
@@ -373,16 +424,39 @@ public sealed class AnalysisExceptionCandidateListingTests
         }
     }
 
-    public static TheoryData<string, Func<int, Exception>> ListComposingFactories() => new()
+    /// <summary>
+    /// Every factory that composes a list, as (label, build) where <c>build(width, prose)</c> takes the list
+    /// cardinality <i>and</i> the length of the factory's free prose tokens.
+    /// <para>The prose parameter exists because round 12 (Quality) found this corpus built every row with
+    /// short literal prose — <c>"x"</c>, <c>"/t"</c> — so the guard that claimed to rule out "any combination
+    /// of long items, a long reference and huge cardinality" varied only cardinality. The unbounded component
+    /// in practice is a redacted object path, and S3 keys are legal to 1024 characters, so the interesting
+    /// region of this corpus is precisely the one it could not reach.</para>
+    /// </summary>
+    public static TheoryData<string, Func<int, int, Exception>> ListComposingFactories() => new()
     {
-        { "UnresolvedColumn", n => AnalysisException.UnresolvedColumn("nosuch", Columns(n)) },
-        { "AmbiguousReference", n => AnalysisException.AmbiguousReference("amb", Columns(n)) },
-        { "UnknownFunction", n => AnalysisException.UnknownFunction("f", Types(n)) },
-        { "InvalidFunctionArgument", n => AnalysisException.InvalidFunctionArgument("f", Types(n), "an integer") },
-        { "TableOrViewNotFound", n => AnalysisException.TableOrViewNotFound(LongNames(n)) },
-        { "UnsupportedDataSink", n => AnalysisException.UnsupportedDataSink("x", "/t", LongNames(n)) },
-        { "UnsupportedWriteFormat", n => AnalysisException.UnsupportedWriteFormat("x", "/t", LongNames(n), LongNames(n)) },
+        { "UnresolvedColumn", (n, p) => AnalysisException.UnresolvedColumn(Prose("nosuch", p), Columns(n)) },
+        { "AmbiguousReference", (n, p) => AnalysisException.AmbiguousReference(Prose("amb", p), Columns(n)) },
+        { "UnknownFunction", (n, p) => AnalysisException.UnknownFunction(Prose("f", p), Types(n)) },
+        {
+            "InvalidFunctionArgument",
+            (n, p) => AnalysisException.InvalidFunctionArgument(Prose("f", p), Types(n), Prose("an integer", p))
+        },
+        { "TableOrViewNotFound", (n, _) => AnalysisException.TableOrViewNotFound(LongNames(n)) },
+        {
+            "UnsupportedDataSink",
+            (n, p) => AnalysisException.UnsupportedDataSink(Prose("x", p), Prose("/t", p), LongNames(n))
+        },
+        {
+            "UnsupportedWriteFormat",
+            (n, p) => AnalysisException.UnsupportedWriteFormat(
+                Prose("x", p), Prose("/t", p), LongNames(n), LongNames(n))
+        },
     };
+
+    /// <summary>A free prose token grown to <paramref name="length"/>, keeping its readable stem.</summary>
+    private static string Prose(string stem, int length) =>
+        length <= stem.Length ? stem : stem + new string('s', length - stem.Length);
 
     /// <summary>
     /// The count oracle, stated once and free of any tuning constant: the names actually rendered plus the
@@ -426,13 +500,13 @@ public sealed class AnalysisExceptionCandidateListingTests
 
     [Theory]
     [MemberData(nameof(ListComposingFactories))]
-    public void EveryListComposingFactory_ReportsAnOverflowCount(string factory, Func<int, Exception> build)
+    public void EveryListComposingFactory_ReportsAnOverflowCount(string factory, Func<int, int, Exception> build)
     {
         ArgumentNullException.ThrowIfNull(build);
 
         const int Width = 400;
-        int[] atWidth = OverflowCounts(build(Width).Message);
-        int[] atDouble = OverflowCounts(build(Width * 2).Message);
+        int[] atWidth = OverflowCounts(build(Width, 0).Message);
+        int[] atDouble = OverflowCounts(build(Width * 2, 0).Message);
 
         Assert.True(
             atWidth.Length > 0,
@@ -452,24 +526,55 @@ public sealed class AnalysisExceptionCandidateListingTests
 
     /// <summary>
     /// The budget invariant, measured rather than derived: no list factory can be driven to the
-    /// whole-message backstop by any combination of long items, a long reference and huge cardinality. The
+    /// whole-message backstop by any combination of long items, long free prose and huge cardinality. The
     /// failure message reports the headroom so a constant change is self-diagnosing.
+    /// <para>Round 12 (Quality): this swept cardinality alone, at prose fixed to <c>"x"</c> and <c>"/t"</c>,
+    /// and so was green while the property was false — a long redacted path drove two factories past the cap
+    /// and the backstop cut the listing tail together with its <c>(+N more)</c> count. It now sweeps the
+    /// <b>product</b> of cardinality and prose length, out to well past a legal 1024-character S3 key, and
+    /// asserts the count survives rather than only that the message is short.</para>
     /// </summary>
     [Theory]
     [MemberData(nameof(ListComposingFactories))]
-    public void EveryListComposingFactory_StaysUnderTheBackstop(string factory, Func<int, Exception> build)
+    public void EveryListComposingFactory_StaysUnderTheBackstop(string factory, Func<int, int, Exception> build)
     {
         ArgumentNullException.ThrowIfNull(build);
 
-        string message = build(5_000).Message;
-        int headroom = AnalysisException.MaxMessageLength - message.Length;
+        foreach (int width in new[] { 0, 1, 12, 200, 5_000 })
+        {
+            foreach (int prose in new[] { 0, 64, 700, 798, 1_024, 5_000, 100_000 })
+            {
+                string message = build(width, prose).Message;
+                int headroom = AnalysisException.MaxMessageLength - message.Length;
 
-        Assert.True(
-            headroom > 0,
-            string.Create(
-                CultureInfo.InvariantCulture,
-                $"[{factory}] rendered {message.Length} chars, headroom {headroom} — the whole-message cap "
-                    + $"is eliding this list again, which destroys its (+N more) count"));
+                // The exact test for "the backstop fired" is length > the cap, because Sanitize returns
+                // maxLength + 1 characters when it truncates (the elision mark). Requiring strictly positive
+                // headroom instead would fail a message that lands exactly on the cap without being cut.
+                Assert.True(
+                    headroom >= 0,
+                    string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"[{factory}] width={width} prose={prose} rendered {message.Length} chars, headroom "
+                            + $"{headroom} — the whole-message cap is eliding this list again, which destroys "
+                            + $"its (+N more) count"));
+
+                // Headroom alone is not the property. A message can be short precisely BECAUSE the backstop
+                // cut the listing off, so the count that says how much was dropped has to still be there.
+                // Scoped to the listing: an elision mark elsewhere in the message is a bounded free prose
+                // token doing its job, which is a different event from a list losing members silently.
+                int open = message.IndexOf('[', StringComparison.Ordinal);
+                int close = message.LastIndexOf(']');
+                if (width > 0 && open >= 0 && close > open)
+                {
+                    string listing = message[(open + 1)..close];
+                    Assert.True(
+                        OverflowCounts(message).Length > 0 || !listing.Contains('\u2026'),
+                        string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"[{factory}] width={width} prose={prose} elided with no (+N more): {message}"));
+                }
+            }
+        }
     }
 
     /// <summary>The sibling factory carries the same contract; a fix applied to only one of the two list

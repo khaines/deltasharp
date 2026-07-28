@@ -422,4 +422,44 @@ public sealed class AnalysisExceptionTypeRenderTests
         Assert.Contains(FieldName(0), ex.Message, StringComparison.Ordinal);
     }
 
+
+    /// <summary>
+    /// #687 council round 12 (Quality) — the <b>type-render depth bound</b>. Mutating
+    /// <c>MaxEchoedTypeDepth</c> from 4 to 1 was 0 RED, so the entire depth dimension of this suite was
+    /// unguarded: every assertion here concerned width, length or the backstop, and none concerned nesting.
+    /// <para>The claim the bound has to earn is a UX one — an ordinary nested payload must render with its
+    /// field names intact, all the way to the leaf. Delta schemas nest naturally (<c>address.geo.latitude</c>)
+    /// and a diagnostic that collapses the level containing the misspelling is no help. So this asserts the
+    /// depth at which real schemas live rather than restating the constant: nest a realistic payload and
+    /// require the leaf field name verbatim. Measured at this HEAD, nesting 1–4 keeps it and 5 collapses to
+    /// <c>(1 fields)</c>, so this is the bound's actual reach, not a number copied from the source.</para>
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    public void OrdinaryNestedPayloads_RenderTheirLeafFieldNameVerbatim(int nesting)
+    {
+        DataType nested = new StructType([new StructField("latitude_degrees", DoubleType.Instance, true)]);
+        for (int level = 1; level < nesting; level++)
+        {
+            nested = new StructType(
+            [
+                new StructField(
+                    string.Create(CultureInfo.InvariantCulture, $"geo_location_{level}"), nested, true),
+            ]);
+        }
+
+        var schema = new StructType([new StructField("payload", nested, true)]);
+        Exception ex = Assert.ThrowsAny<Exception>(
+            () => ConstraintExpressionFrontend.ParseResolveWithInput("payload.typo > 0", schema));
+
+        Assert.True(
+            ex.Message.Contains("latitude_degrees", StringComparison.Ordinal),
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"a payload nested {nesting} deep lost its leaf field name to the depth bound; a user "
+                    + $"misspelling a field at this depth is shown a collapsed type: {ex.Message}"));
+    }
 }
