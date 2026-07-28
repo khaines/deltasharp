@@ -1257,11 +1257,131 @@ public sealed class ParquetWriterTests
     }
 
     /// <summary>
-    /// The deepest nesting the systematic sweep constructs. Matched to the generator's bound so
-    /// the two agree on what "every depth" means, and so a rogue that only misbehaves at depth is
-    /// caught by CONSTRUCTION here rather than by a lucky draw there.
+    /// The deepest nesting the systematic sweep constructs: the deepest the READER accepts,
+    /// MEASURED by asking it, not copied from it.
     /// </summary>
-    private const int SweepDepthBound = GeneratedMetadataDepthBound;
+    /// <remarks>
+    /// <para>
+    /// This used to be <c>= GeneratedMetadataDepthBound</c>, which made one literal cap the sweep,
+    /// the generator AND the requirement that audits them both. That is the shared-source defect
+    /// this file already fixed at the codepoint axis, surviving one level up at the depth axis: a
+    /// cell-set parameterised by the bound it is supposed to check can never name a missing depth.
+    /// A writer with a fixed 3-slot depth stack, emitting an empty container instead of recursing,
+    /// passed all three layers.
+    /// </para>
+    /// <para>
+    /// Metadata nesting is unbounded in the grammar, so there is no natural literal. The bound that
+    /// matters in production is the one past which the footer stops ROUND-TRIPPING, and that is a
+    /// property of <c>SchemaJson.FromJson</c> -- so it is probed from the reader's actual
+    /// behaviour. If the reader's limit changes, this follows without anyone editing a test.
+    /// </para>
+    /// </remarks>
+    private static int SweepDepthBound => ProbedMaxMetadataDepth;
+
+    /// <summary>
+    /// The deepest metadata nesting that survives a <c>ToJson</c> -&gt; <c>FromJson</c> -&gt;
+    /// <c>ToJson</c> round trip, discovered by binary-free linear probe rather than declared.
+    /// </summary>
+    private static int ProbedMaxMetadataDepth => _probedMaxDepth ??= ProbeMaxMetadataDepth();
+
+    private static int? _probedMaxDepth;
+
+    /// <summary>
+    /// A ceiling on the PROBE, not on the format. It is not allowed to be the binding constraint --
+    /// <see cref="SweepDepthBound_IsTheReadersOwnLimit"/> fails if the probe ever reaches it, which
+    /// is what keeps this from becoming another hand-chosen bound hiding behind a derivation.
+    /// </summary>
+    private const int DepthProbeCeiling = 128;
+
+    private static int ProbeMaxMetadataDepth()
+    {
+        int deepest = 0;
+        for (int depth = 1; depth <= DepthProbeCeiling; depth++)
+        {
+            string json = SchemaJson.ToJson(BuildDepthProbeSchema(depth));
+            try
+            {
+                if (!string.Equals(SchemaJson.ToJson(SchemaJson.FromJson(json)), json, StringComparison.Ordinal))
+                {
+                    break;
+                }
+            }
+            catch (Exception)
+            {
+                break;
+            }
+
+            deepest = depth;
+        }
+
+        return deepest;
+    }
+
+    private static StructType BuildDepthProbeSchema(int depth)
+    {
+        MetadataValue value = MetadataValue.String("leaf");
+        for (int i = 0; i < depth; i++)
+        {
+            value = MetadataValue.Nested(FieldMetadata.FromValues(
+                [new KeyValuePair<string, MetadataValue>("o", value)]));
+        }
+
+        return new StructType(
+        [
+            new StructField(
+                "probe",
+                DataTypes.LongType,
+                nullable: true,
+                FieldMetadata.FromValues([new KeyValuePair<string, MetadataValue>("m", value)])),
+        ]);
+    }
+
+    /// <summary>
+    /// Meta-guard: the sweep's depth bound is the reader's own limit, and the probe that found it
+    /// was not itself the limit.
+    /// </summary>
+    [Fact]
+    public void SweepDepthBound_IsTheReadersOwnLimit()
+    {
+        int probed = ProbedMaxMetadataDepth;
+
+        // The sweep must USE the probed limit. Trivially true as written, and deliberately so:
+        // it is the regression guard against someone re-pinning SweepDepthBound to a literal,
+        // which is exactly how this axis was defective before -- and which every other assertion
+        // here would happily pass, because they check the PROBE rather than what consumes it.
+        Assert.Equal(probed, SweepDepthBound);
+
+        Assert.True(
+            probed > GeneratedMetadataDepthBound,
+            $"The probed reader depth limit ({probed}) is not deeper than the generator's bound "
+            + $"({GeneratedMetadataDepthBound}), so the constructive sweep would add no depth "
+            + "coverage over the random draw and the depth axis would be sampled only.");
+
+        Assert.True(
+            probed < DepthProbeCeiling,
+            $"The depth probe reached its own ceiling ({DepthProbeCeiling}) without finding the "
+            + "reader's limit, so the bound the sweep uses is this test's literal rather than a "
+            + "property of the reader. Raise the ceiling.");
+
+        // Non-vacuity of the probe itself: one deeper than the measured limit must NOT round-trip,
+        // or the loop is stopping for a reason other than the reader's depth handling.
+        string tooDeep = SchemaJson.ToJson(BuildDepthProbeSchema(probed + 1));
+        bool roundTripped;
+        try
+        {
+            roundTripped = string.Equals(
+                SchemaJson.ToJson(SchemaJson.FromJson(tooDeep)), tooDeep, StringComparison.Ordinal);
+        }
+        catch (Exception)
+        {
+            roundTripped = false;
+        }
+
+        Assert.False(
+            roundTripped,
+            $"Metadata nested {probed + 1} deep round-trips, so the probe stopped early and the "
+            + "sweep is shallower than the reader actually supports.");
+    }
 
     /// <summary>
     /// Nests <paramref name="text"/> into a key, a string value and an array element at every depth
