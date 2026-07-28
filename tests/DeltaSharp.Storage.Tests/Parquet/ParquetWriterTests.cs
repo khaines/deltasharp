@@ -316,7 +316,7 @@ public sealed class ParquetWriterTests
     /// corpus that pins it. Two rogues in a row exploited exactly that -- one correct in names and
     /// wrong in metadata, one correct at depth 0 and wrong at depth 1.
     /// </summary>
-    internal const string EveryEscapeForm = "e\\\t\n\r\b\f\u00E9\"z\U0001F389";
+    internal const string EveryEscapeForm = "e\\\t\n\r\b\f\u00E9\"z\U0001F389\0n";
 
     /// <summary>Footer bytes for the metadata corpus; shared with the encoding guard.</summary>
     private const string MetadataFooterGolden =
@@ -329,9 +329,9 @@ public sealed class ParquetWriterTests
             "\"delta.columnMapping.id\":12,\"delta.columnMapping.physicalName\":\"col-12\"," +
             "\"flag\":true,\"obj\":{\"deep\":{\"leaf\":\"x\"},\"inner\":9},\"ratio\":0.5}}," +
             "{\"name\":\"third\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}," +
-            "{\"name\":\"fourth\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\\uD83C\\uDF89\":\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\\uD83C\\uDF89\"}}," +
+            "{\"name\":\"fourth\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\\uD83C\\uDF89\\u0000n\":\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\\uD83C\\uDF89\\u0000n\"}}," +
         "{\"name\":\"fifth\",\"type\":\"long\",\"nullable\":true,\"metadata\":{\"bigid\":3000000000,\"maxlong\":9223372036854775807,\"minlong\":-9223372036854775808,\"negwhole\":-42.0,\"tiny\":1E-300,\"whole\":1.0}}," +
-            "{\"name\":\"sixth\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"darr\":[\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\\uD83C\\uDF89\"],\"dobj\":{\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\\uD83C\\uDF89\":\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\\uD83C\\uDF89\"}}}]}";
+            "{\"name\":\"sixth\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"darr\":[\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\\uD83C\\uDF89\\u0000n\"],\"dobj\":{\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\\uD83C\\uDF89\\u0000n\":\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\\uD83C\\uDF89\\u0000n\"}}}]}";
 
     [Fact]
     public async Task WrittenFooter_PinsFieldMetadata_IncludingUnquotedColumnMappingIds()
@@ -442,7 +442,8 @@ public sealed class ParquetWriterTests
         "{\"name\":\"bs\\bhere\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}," +
         "{\"name\":\"ff\\fhere\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}," +
         "{\"name\":\"emoji\\uD83C\\uDF89\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}," +
-        "{\"name\":\"ctrl\\u0001x\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}";
+        "{\"name\":\"ctrl\\u0001x\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}," +
+            "{\"name\":\"nul\\u0000end\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}";
 
     /// <summary>The field-name artifact corpus; shared with the encoding completeness guard.</summary>
     private static readonly StructType NameCorpusSchema = new(new[]
@@ -458,6 +459,10 @@ public sealed class ParquetWriterTests
         new StructField("ff\fhere", DataTypes.LongType, nullable: true),
         new StructField("emoji\U0001F389", DataTypes.LongType, nullable: true),
         new StructField("ctrl\u0001x", DataTypes.LongType, nullable: true),
+        // U+0000. The writer accepts it in all three string positions, and a footer
+        // serializer that round-tripped through a NUL-TERMINATED UTF-8 buffer truncated the
+        // name there -- declaring a different column set than the log, fully green.
+        new StructField("nul\0end", DataTypes.LongType, nullable: true),
     });
 
     [Fact]
@@ -661,26 +666,7 @@ public sealed class ParquetWriterTests
     /// Probes the serializer to discover which escape forms it actually emits, rather than
     /// restating its policy. If the encoder changes, this set changes with it.
     /// </summary>
-    private static SortedSet<string> ProbeEmittedEscapeForms()
-    {
-        var emitted = new SortedSet<string>(StringComparer.Ordinal);
-        var codepoints = new List<int>();
-        for (int c = 1; c < 0x80; c++)
-        {
-            codepoints.Add(c);
-        }
-
-        // Includes ASTRAL codepoints: without one the probe never emits "\u(astral pair)" and
-        // the surrogate-pair path drops out of the required set entirely.
-        codepoints.AddRange([0x00A0, 0x00E9, 0x2028, 0x2029, 0x4E2D, 0xFFFD, 0x1F389, 0x1F600]);
-
-        foreach (int codepoint in codepoints)
-        {
-            emitted.UnionWith(EscapeFormsIn(char.ConvertFromUtf32(codepoint)));
-        }
-
-        return emitted;
-    }
+    private static SortedSet<string> ProbeEmittedEscapeForms() => EscapeProbe.Forms;
 
     /// <summary>
     /// Returns the escape forms the serializer emits for <paramref name="value"/>, obtained by
@@ -1394,53 +1380,144 @@ public sealed class ParquetWriterTests
     };
 
     /// <summary>
-    /// The generator's escape-producing alphabet, DERIVED from the serializer rather than listed.
+    /// THE single codepoint sweep. Both the required escape-form set and the generator's alphabet
+    /// read from this one probe.
     /// <para>
-    /// The previous version hand-wrote its character classes in a <c>switch</c>, which is the same
-    /// leaf-of-the-derivation defect this file has corrected repeatedly one level in: the set of
-    /// escape FORMS was probed for the pinned corpus while the generator's alphabet remained a
-    /// hand-choice, so widening the encoder would leave the generator behind silently. This walks
-    /// the codepoint space, asks <c>SchemaJson</c> what each character encodes to, and keeps one
-    /// representative per distinct emitted form — so the alphabet grows with the encoder.
+    /// Two duplicated walks used to exist, and both opened with <c>for (int c = 1; ...)</c> — so
+    /// <b>U+0000 was excluded from the requirement AND from the generator that is checked against
+    /// it</b>. Because the exclusion was shared, the meta-guard comparing them could not see it:
+    /// they agreed perfectly while both being short. The writer accepts NUL in field names,
+    /// metadata keys and metadata string values, and a footer serializer that truncated at NUL
+    /// (UTF-8 marshalling through a NUL-terminated buffer) declared a different column set than the
+    /// log and shipped fully green. That is the subtlest form of this file's recurring defect: not
+    /// a leaf that stopped deriving, but <i>a bound shared by the prober and the thing it probes</i>.
     /// </para>
     /// <para>
-    /// LONE SURROGATES ARE EXCLUDED DELIBERATELY, and this is the explicit statement of it that
-    /// was previously only implicit in the range arithmetic. An unpaired surrogate is replaced by
-    /// U+FFFD on the way to UTF-8, which is a real defect but a KNOWN and separately tracked one
-    /// (#710); generating it here would make this test fail for a reason it is not about.
+    /// So there is now ONE walk, it starts at U+0000, and it covers the WHOLE Basic Multilingual
+    /// Plane rather than stopping at an ASCII boundary — 63,488 codepoints in ~75 ms, measured, so
+    /// completeness costs nothing worth trading. Astral is sampled rather than swept because the
+    /// encoder's behaviour above the BMP is uniform (every astral scalar becomes a surrogate pair);
+    /// that claim is not assumed, it is checked by
+    /// <c>AlphabetCompletenessBound_IsJustifiedByTheEncoder</c>.
+    /// </para>
+    /// <para>
+    /// LONE SURROGATES ARE EXCLUDED DELIBERATELY. An unpaired surrogate is replaced by U+FFFD on
+    /// the way to UTF-8 — a real defect, but a KNOWN and separately tracked one (#710); generating
+    /// it here would make these tests fail for a reason they are not about.
     /// </para>
     /// </summary>
-    private static IReadOnlyList<string> EscapeAlphabet => _escapeAlphabet ??= BuildEscapeAlphabet();
+    private static (SortedSet<string> Forms, IReadOnlyList<string> Alphabet) EscapeProbe =>
+        _escapeProbe ??= BuildEscapeProbe();
 
-    private static IReadOnlyList<string>? _escapeAlphabet;
+    private static (SortedSet<string> Forms, IReadOnlyList<string> Alphabet)? _escapeProbe;
 
-    private static IReadOnlyList<string> BuildEscapeAlphabet()
+    /// <summary>
+    /// The codepoint below which the generator's alphabet is COMPLETE — every escaped character
+    /// under it is in the alphabet, not merely one representative per form. Above it the alphabet
+    /// keeps one representative per form. This is a stated bound, but unlike the bound it replaced
+    /// it is <b>checked</b>: <c>AlphabetCompletenessBound_IsJustifiedByTheEncoder</c> fails if the
+    /// encoder ever emits a form above this bound that it does not also emit below it.
+    /// </summary>
+    private const int AlphabetCompletenessBound = 0x100;
+
+    /// <summary>Astral samples. The encoder is uniform above the BMP; see the bound guard.</summary>
+    private static readonly int[] AstralProbes = [0x10000, 0x1F389, 0x1F600, 0x10FFFF];
+
+    private static (SortedSet<string> Forms, IReadOnlyList<string> Alphabet) BuildEscapeProbe()
     {
+        var forms = new SortedSet<string>(StringComparer.Ordinal);
+        var alphabet = new List<string>();
         var byForm = new SortedDictionary<string, string>(StringComparer.Ordinal);
-        var codepoints = new List<int>();
-        for (int c = 1; c < 0x80; c++)
-        {
-            codepoints.Add(c);
-        }
 
-        codepoints.AddRange([0x00A0, 0x00E9, 0x0301, 0x2028, 0x2029, 0x4E2D, 0xFFFD, 0x1F600]);
-
-        foreach (int codepoint in codepoints)
+        // Complete below the bound: EVERY escaped codepoint enters the alphabet, so NUL, the C0
+        // controls, the quote and the backslash are all individually generable rather than being
+        // represented by whichever one happened to be found first.
+        for (int c = 0; c < AlphabetCompletenessBound; c++)
         {
-            // Skip the surrogate range entirely (see #710 above); ConvertFromUtf32 would throw.
-            if (codepoint is >= 0xD800 and <= 0xDFFF)
+            string text = char.ConvertFromUtf32(c);
+            string[] found = EscapeFormsIn(text).ToArray();
+            if (found.Length == 0)
             {
                 continue;
             }
 
-            string text = char.ConvertFromUtf32(codepoint);
+            forms.UnionWith(found);
+            alphabet.Add(text);
+        }
+
+        // The rest of the BMP, swept in full for FORMS, sampled for alphabet representatives.
+        for (int c = AlphabetCompletenessBound; c <= 0xFFFF; c++)
+        {
+            if (c is >= 0xD800 and <= 0xDFFF)
+            {
+                continue;
+            }
+
+            string text = char.ConvertFromUtf32(c);
             foreach (string form in EscapeFormsIn(text))
             {
+                forms.Add(form);
                 byForm.TryAdd(form, text);
             }
         }
 
-        return byForm.Values.ToArray();
+        foreach (int c in AstralProbes)
+        {
+            string text = char.ConvertFromUtf32(c);
+            foreach (string form in EscapeFormsIn(text))
+            {
+                forms.Add(form);
+                byForm.TryAdd(form, text);
+            }
+
+            alphabet.Add(text);
+        }
+
+        alphabet.AddRange(byForm.Values.Where(v => !alphabet.Contains(v, StringComparer.Ordinal)));
+        return (forms, alphabet);
+    }
+
+    /// <summary>
+    /// Justifies <see cref="AlphabetCompletenessBound"/> instead of asserting it in prose.
+    /// </summary>
+    /// <remarks>
+    /// The generator's alphabet is complete only below the bound; above it, it keeps one
+    /// representative per form. That is sound exactly as long as the encoder emits no form up there
+    /// that it does not also emit down here. This test sweeps the entire remaining BMP and the
+    /// astral samples and checks precisely that, so the bound cannot quietly become wrong — which
+    /// is the failure mode of the bound it replaced.
+    /// </remarks>
+    [Fact]
+    public void AlphabetCompletenessBound_IsJustifiedByTheEncoder()
+    {
+        var below = new SortedSet<string>(StringComparer.Ordinal);
+        for (int c = 0; c < AlphabetCompletenessBound; c++)
+        {
+            below.UnionWith(EscapeFormsIn(char.ConvertFromUtf32(c)));
+        }
+
+        var above = new SortedSet<string>(StringComparer.Ordinal);
+        for (int c = AlphabetCompletenessBound; c <= 0xFFFF; c++)
+        {
+            if (c is >= 0xD800 and <= 0xDFFF)
+            {
+                continue;
+            }
+
+            above.UnionWith(EscapeFormsIn(char.ConvertFromUtf32(c)));
+        }
+
+        string[] onlyAbove = above.Where(form => !below.Contains(form)).ToArray();
+        Assert.True(
+            onlyAbove.Length == 0,
+            $"The encoder emits {string.Join(" ", onlyAbove)} only ABOVE U+{AlphabetCompletenessBound:X4}, "
+            + "so one-representative-per-form is no longer sufficient up there and the generator's "
+            + "alphabet is incomplete for those forms. Raise AlphabetCompletenessBound.");
+
+        // Non-vacuity: the sweeps must actually have found the encoder's forms.
+        Assert.Contains("\\u(bmp)", below);
+        Assert.Contains("\\n", below);
+        Assert.True(above.Count > 0, "The above-bound sweep produced no escape forms at all.");
     }
 
     /// <summary>
@@ -1450,7 +1527,7 @@ public sealed class ParquetWriterTests
     /// </summary>
     private static string GenerateString(DeterministicRng rng)
     {
-        IReadOnlyList<string> alphabet = EscapeAlphabet;
+        IReadOnlyList<string> alphabet = EscapeProbe.Alphabet;
         int length = 1 + rng.Next(6);
         var chars = new System.Text.StringBuilder(length);
         for (int i = 0; i < length; i++)
