@@ -27,8 +27,17 @@ namespace DeltaSharp.Core.Tests.Analysis;
 /// depend on. Here the number is not the contract — <i>boundedness</i> is. A literal pin would forbid a
 /// legitimate re-baseline (say 1024 → 2048 for a genuinely richer diagnostic) while still permitting the
 /// dangerous change if someone re-baselined the pin along with the constant. A property that says "the render
-/// does not grow with the attacker's input" is immune to deliberate re-baselining and is the shape already used
+/// does not grow with the attacker's input" survives a deliberate re-baseline and is the shape already used
 /// one layer up (<c>RenderedReference_IsIndependentOfAttackerInputLength</c>).</para>
+/// <para><b>How far that survival actually extends (round 5, Quality).</b> Not unqualified, and the honest
+/// bound is worth stating rather than implying: the property holds for any re-baseline of the cap up to
+/// roughly the SMALL scale below (~10&#160;000 rendered characters on both axes), because past that the small
+/// payload stops being truncated and there is no longer a bounded render to compare against. Beyond it the
+/// suite fails <b>closed</b>, on the non-vacuity precondition, with a message naming the axis and the observed
+/// length — a test that says "this case can no longer observe the backstop" rather than one that silently
+/// passes. That is the correct failure direction, and re-scaling is then a one-line change here. Quality found
+/// this by re-baselining to 4096, which the original cardinality scale (200 items, 1030–3774 chars) could not
+/// survive; both scales below are now chosen so the two axes have comparable headroom.</para>
 /// <para><b>Coverage is the class, not an example.</b> The property is asserted over every factory that
 /// interpolates attacker-influenceable text, along BOTH growth axes each one exposes: the length of an
 /// individual token, and the CARDINALITY of a list (a wide hostile schema, a long candidate set). A property
@@ -43,10 +52,12 @@ public sealed class AnalysisExceptionLengthIndependenceTests
 
     private const int LargePayload = 100_000;
 
-    /// <summary>List cardinalities, likewise both past the bound.</summary>
-    private const int SmallCardinality = 200;
+    /// <summary>List cardinalities. Chosen so the SMALLEST-rendering list factory (~5 characters per item)
+    /// still renders past the small-payload scale above, giving the cardinality axis the same re-baseline
+    /// headroom as the token axis instead of a tenth of it.</summary>
+    private const int SmallCardinality = 2_000;
 
-    private const int LargeCardinality = 2_000;
+    private const int LargeCardinality = 20_000;
 
     private static string Pad(int length) => new('z', length);
 
@@ -153,6 +164,29 @@ public sealed class AnalysisExceptionLengthIndependenceTests
         // this survives a legitimate re-baseline of the cap while still failing any removal or inflation of it.
         Assert.Equal(smallMessage.Length, largeMessage.Length);
         Assert.Equal(smallMessage, largeMessage);
+    }
+
+    /// <summary>
+    /// Round 5 (Quality) — asserts the <c>UnsupportedProjection/reference</c> EXCLUSION noted in
+    /// <see cref="UnboundedGrowthAxes"/> rather than only commenting it. That argument reaches the typed
+    /// <c>Reference</c> property and deliberately never the message, so it is correctly absent from the growth
+    /// theory; but with the reason living only in a comment, a future edit that interpolated it would draw no
+    /// objection. There would be no leak — the backstop still bounds the message — yet the growth theory would
+    /// silently lose an axis it is supposed to cover. This turns that into a failing test.
+    /// </summary>
+    [Fact]
+    public void UnsupportedProjection_Reference_IsNotInterpolatedIntoTheMessage()
+    {
+        string hostile = Pad(LargePayload);
+        AnalysisException ex = AnalysisException.UnsupportedProjection("unsupported projection", hostile);
+
+        // The raw channel is intact: DeltaSinkFactory matches on Reference, so it must NOT be bounded.
+        Assert.Equal(hostile, ex.Reference);
+
+        // ...and it must not have reached the message. Probing with a short prefix rather than the whole
+        // payload so this still fires if a future edit interpolates a TRUNCATED form of the reference.
+        Assert.DoesNotContain(Pad(64), ex.Message, StringComparison.Ordinal);
+        Assert.Equal("unsupported projection", ex.Message);
     }
 
     [Fact]
