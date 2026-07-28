@@ -619,6 +619,36 @@ public sealed class ReplayedMetadataLogTests
     }
 
     /// <summary>
+    /// Pins the END-ACCOUNTING conjunct's ACCUMULATION (<c>|=</c>), which is a DIFFERENT mutation point from
+    /// its <c>ReferenceEquals</c> predicate — the predicate was already pinned at 1 red, and the operator was
+    /// not (<c>|=</c> -> <c>=</c> was 0 red; council R10 gate).
+    ///
+    /// <para>The probe has to make the window-end match NOT the last metadata-carrying record, which the
+    /// CHAIN CLOSURE conjunct otherwise forces: closure requires the walk to end on the window's end
+    /// metadata, so under a closing chain the final link normally IS the match. The way through is a trailing
+    /// SILENT record whose witness returns the lineage to an instance an EARLIER record produced — legal to
+    /// the existential predicate ("some record explains the end metadata" — v0 does), legal to the chain
+    /// (every link's before matches the cursor, and the walk closes on the end), and fatal to <c>=</c>, which
+    /// keeps only the last metadata record's verdict and so discards v0's match.</para>
+    /// </summary>
+    [Fact]
+    public void AnEarlierRecordExplainsTheWindowEnd_SoTheEndAccountingMustACCUMULATE_NotOverwrite()
+    {
+        var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
+        MetadataAction end = Meta("end");    // produced at v0, and prevailing again at the window's end
+        MetadataAction mid = Meta("mid");    // produced at v1 — the LAST metadata record, and not the match
+        log.Record(0, new[] { end }, null, end);
+        log.Record(1, new[] { mid }, end, mid);
+        log.Record(2, None, mid, end);       // silent, but the lineage returns to what v0 produced
+
+        log.Seal();
+
+        // Sealed, so the window is consumable: the accumulation accepted a history the overwrite rejects.
+        Assert.True(log.TryGetProvenObservation(0, out IReadOnlyList<MetadataAction> observed));
+        Assert.Equal(new[] { end }, observed);
+    }
+
+    /// <summary>
     /// Audit for the <c>DO NOT DELETE `!HasCoverage`</c> block in <see cref="ReplayedMetadataLog"/>. That block
     /// justifies keeping a redundant-looking disjunct by citing measured kill sets, and names the three tests
     /// that a mutant of it kills once the upper bound is broken too. Those numbers are PROSE and cannot execute

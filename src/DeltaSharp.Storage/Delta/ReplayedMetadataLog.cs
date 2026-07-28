@@ -117,6 +117,19 @@ namespace DeltaSharp.Storage.Delta;
 /// is correct for the reason the rule turns on: it names its upstream reason and RETAINS the guard. Naming
 /// why something is unreachable and keeping it is sound; concluding it is therefore deletable is not. That,
 /// not the vocabulary, is the line.</para>
+/// <para><b>One mutation point is not one line.</b> The end-accounting conjunct carried TWO — the
+/// <c>ReferenceEquals</c> predicate and the <c>|=</c> that accumulates it — and pinning the first was
+/// repeatedly reported as pinning "G21". It was not: the predicate was 1-red from R8 and the accumulation was
+/// still 0-red at R10. Category 3 of the derivation rule says "each state write whose value participates in a
+/// validation decision", and a compound assignment is TWO such points, since the operator and the operand can
+/// be mutated independently. The lesson is not about this line: <b>when a claim is attached to a name rather
+/// than to a point ("G21 is pinned"), check that the name denotes exactly one point.</b></para>
+/// <para>Its disposition also shows the third disguise of the equivalence insufficiency. The proposed reason
+/// was iteration order; the operative constraint was a NEIGHBOURING CONJUNCT (chain closure). Both would have
+/// predicted 0 red, so the measurement could not distinguish them — but they differ in what they license,
+/// because an unspecified enumeration contract cannot be probed while a conjunct can. <b>Two reasons that
+/// predict the same measurement are not the same claim</b>, and the one to keep is the one that yields a
+/// probe.</para>
 /// <para><b>The one worked set-wise comparison, shown as SETS because its totals were disputed twice.</b>
 /// A script implementing the rule above produced 13 non-boolean state writes; an independent hand audit
 /// produced 11. Neither total is evidence of anything; the membership is:</para>
@@ -536,6 +549,23 @@ internal sealed class ReplayedMetadataLog
             }
 
             anyMetadataRecorded = true;
+
+            // `|=`, NOT `=`. This is a SEPARATE mutation point from the ReferenceEquals beside it: the
+            // predicate has been pinned since R8, and the ACCUMULATION was still 0-red at R10 -- "G21 is
+            // pinned" was true of one and false of the other. Now pinned by AnEarlierRecordExplainsTheWindow
+            // End_SoTheEndAccountingMustACCUMULATE_NotOverwrite, at 1 red, and the mutant fails CLOSED
+            // (DeltaProtocolException), which is why it was a residual and not a defect.
+            //
+            // The R10 gate proposed to retire it as equivalent because "dictionary iteration order
+            // structurally guarantees the absolute end state is evaluated last". That reason is WRONG twice
+            // over. Dictionary<,> enumeration order is UNSPECIFIED in .NET -- insertion order is an
+            // implementation detail, not a contract -- so it guarantees nothing structurally. And it is not
+            // the operative constraint anyway: what made `=` look equivalent is CHAIN CLOSURE below, which
+            // requires the walk to end on _lineageAtWindowEnd and so normally makes the final link the match.
+            // Note the two loops do not even share an order -- this one walks _recorded.Values (dictionary
+            // order), the chain walks _recordedVersions (proven ascending). A trailing SILENT record whose
+            // witness returns the lineage to an instance an EARLIER record produced satisfies closure with
+            // the match NOT last, and that is the probe.
             endMetadataAccounted |= ReferenceEquals(entry.PrevailingAfter, _lineageAtWindowEnd);
         }
 
