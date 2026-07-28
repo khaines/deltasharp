@@ -1,3 +1,4 @@
+using System.Globalization;
 using DeltaSharp.Diagnostics;
 using DeltaSharp.Plans.Expressions;
 using DeltaSharp.Plans.Logical;
@@ -135,9 +136,16 @@ internal sealed class AnalysisException : Exception
     /// this comment claimed the cap "comfortably fits a wide-schema listing"; that was measurably false — a
     /// 50-column table already rendered 1107 characters and was silently cut to 1025. Truncating the whole
     /// message destroys the very signal that truncation happened, which on the TRUSTED path (a user's own
-    /// schema) turns a self-service fix into a support ticket. Any factory composing a list must therefore
-    /// bound its own items and report an explicit overflow count — see
-    /// <see cref="UnresolvedColumn"/> — so this cap is never what does the cutting.
+    /// schema) turns a self-service fix into a support ticket. Any factory composing a LIST must therefore
+    /// bound its own items and report an explicit overflow count, so this cap never elides a list. Every one
+    /// of them does: <see cref="UnresolvedColumn"/>, <see cref="AmbiguousReference"/>,
+    /// <see cref="TableOrViewNotFound"/>, <see cref="UnsupportedDataSink"/>,
+    /// <see cref="UnsupportedWriteFormat"/>, and both users of <c>RenderTypes</c>
+    /// (<see cref="UnknownFunction"/>, <see cref="InvalidFunctionArgument"/>). That enumeration is not
+    /// maintained by hand — <c>EveryListComposingFactory_ReportsAnOverflowCount</c> ranges over all of them,
+    /// because a comment asserting a global property is worth nothing without a test that ranges over the
+    /// whole class. A single oversized TOKEN can still reach this cap; that is the cap doing its job, and is
+    /// a different thing from eliding a list without saying so.
     /// </para>
     /// <para>
     /// The same correction applies to the mitigation this comment used to cite: <see cref="Reference"/>,
@@ -170,17 +178,56 @@ internal sealed class AnalysisException : Exception
     /// <see cref="MaxMessageLength"/> cut the composed string yields a listing that is truncated with no
     /// indication that it is truncated, or by how much.
     /// </remarks>
-    internal const int MaxEchoedCandidates = 20;
+    internal const int MaxEchoedCandidates = 14;
 
     /// <summary>The per-candidate length cap. A single pathological name is elided with <c>…</c> — which is
     /// visible — instead of being allowed to consume the whole listing's budget.</summary>
-    internal const int MaxEchoedCandidateLength = 32;
+    /// <remarks>
+    /// <para>
+    /// <b>Derived, not round.</b> The first version of this was 32, which is BELOW real column-name length —
+    /// <c>customer_lifetime_value_rolling_90d</c> is 35 — so a schema of three entirely legitimate names
+    /// already elided, and the common case paid for the wide case. Three legitimate names now render in full.
+    /// </para>
+    /// <para>
+    /// The budget must fit the LONGEST-prose list factory, which is <see cref="UnknownFunction"/> at roughly
+    /// 140 fixed characters — not <see cref="UnresolvedColumn"/> at 53. Sizing against the short one is how
+    /// the first attempt at these numbers ended up 1 character over the cap on the long one:
+    /// <c>prose(140) + reference(64+1) + items(14 × 49) + separators(13 × 2) + overflow(~18)</c> = 935,
+    /// leaving 89 characters of headroom under <see cref="MaxMessageLength"/>. 48 covers the 35-character
+    /// real-world name with room to spare; going to 64 would have bought length at the cost of dropping to
+    /// ~10 candidates, and an unrecognizable name is useless at any count, so the trade favours name length
+    /// first and count second.
+    /// </para>
+    /// <para>
+    /// <b>Do not trust the arithmetic above — it is a sketch.</b>
+    /// <c>EveryListComposingFactory_StaysUnderTheBackstop</c> measures the true worst case for every list
+    /// factory and reports the headroom, so changing any of these constants tells you immediately whether
+    /// the budget still holds.
+    /// </para>
+    /// </remarks>
+    internal const int MaxEchoedCandidateLength = 48;
 
     /// <summary>The cap applied to the unresolved/ambiguous name echoed in the MESSAGE. The structured
     /// <see cref="Reference"/> property keeps the full value; this bounds only the prose, so that a long name
     /// cannot push a listing past <see cref="MaxMessageLength"/> and destroy the overflow count with it.
     /// </summary>
-    internal const int MaxEchoedReferenceLength = 128;
+    internal const int MaxEchoedReferenceLength = 64;
+
+    /// <summary>The floor on the NAME half of a composite <c>name#exprId</c> candidate, so that clamping can
+    /// never invert and leave the identifier as the only surviving part.</summary>
+    private const int MinEchoedNameLength = 8;
+
+    /// <summary>
+    /// The per-list item budget for a factory that composes <b>two</b> lists in one message, which must
+    /// therefore share the single-list allowance rather than each taking it.
+    /// </summary>
+    /// <remarks>
+    /// Found by <c>EveryListComposingFactory_StaysUnderTheBackstop</c>, not by inspection:
+    /// <see cref="UnsupportedWriteFormat"/> was the one factory whose budget is doubled, it rendered 1025
+    /// characters, and hand-enumerating the factories had missed it. That is the argument for ranging a test
+    /// over the class instead of listing its members.
+    /// </remarks>
+    private const int SharedListBudget = MaxEchoedCandidates / 2;
 
     private AnalysisException(
         string message,
@@ -221,7 +268,8 @@ internal sealed class AnalysisException : Exception
         ArgumentNullException.ThrowIfNull(identifier);
         string name = string.Join('.', identifier);
         return new AnalysisException(
-            $"Table or view not found: {name}",
+            $"Table or view not found: "
+                + $"{DiagnosticText.SanitizeAndJoin(identifier, MaxEchoedCandidateLength, MaxEchoedCandidates, ".")}",
             AnalysisErrorKind.TableOrViewNotFound,
             name,
             Array.Empty<string>());
@@ -268,7 +316,8 @@ internal sealed class AnalysisException : Exception
         // Redact credential-bearing fragments so neither the diagnostic nor any log capturing it leaks a
         // secret embedded in the sink path (parity with the read-door's UnsupportedDataSource, #424/#432).
         string safePath = path is null ? "<none>" : SecretRedaction.RedactPath(path);
-        string alternatives = string.Join(", ", localFormats);
+        string alternatives = DiagnosticText.SanitizeAndJoin(
+            localFormats, MaxEchoedCandidateLength, MaxEchoedCandidates);
         return new AnalysisException(
             $"Writing a '{format}' data source is not supported in this milestone: the writer for target "
             + $"'{safePath}' is delivered by EPIC-05 (Delta transaction-log storage). Until then, write to a "
@@ -299,8 +348,10 @@ internal sealed class AnalysisException : Exception
         string safePath = path is null ? "<none>" : SecretRedaction.RedactPath(path);
         return new AnalysisException(
             $"Unsupported write format '{format}' for target '{safePath}'. DeltaSharp M1 writes these "
-            + $"local sink formats: [{string.Join(", ", localFormats)}]; these formats are recognized but "
-            + $"deferred to EPIC-05 (Delta/Parquet storage): [{string.Join(", ", deferredFormats)}].",
+            + $"local sink formats: "
+            + $"[{DiagnosticText.SanitizeAndJoin(localFormats, MaxEchoedCandidateLength, SharedListBudget)}]; "
+            + $"these formats are recognized but deferred to EPIC-05 (Delta/Parquet storage): "
+            + $"[{DiagnosticText.SanitizeAndJoin(deferredFormats, MaxEchoedCandidateLength, SharedListBudget)}].",
             AnalysisErrorKind.UnsupportedDataSink,
             safePath,
             Array.Empty<string>());
@@ -333,8 +384,10 @@ internal sealed class AnalysisException : Exception
     {
         ArgumentNullException.ThrowIfNull(matches);
         string[] candidates = matches.Select(a => a.SimpleString).ToArray();
+
+        // RenderCandidate, not the raw SimpleString: the per-item cap must not eat the #exprId discriminator.
         string echoed = DiagnosticText.SanitizeAndJoin(
-            candidates, MaxEchoedCandidateLength, MaxEchoedCandidates);
+            matches.Select(RenderCandidate), MaxEchoedCandidateLength, MaxEchoedCandidates);
         return new AnalysisException(
             $"Reference '{DiagnosticText.Sanitize(name, MaxEchoedReferenceLength)}' "
                 + $"is ambiguous, could be: {echoed}.",
@@ -428,8 +481,10 @@ internal sealed class AnalysisException : Exception
         ArgumentNullException.ThrowIfNull(name);
         ArgumentNullException.ThrowIfNull(argumentTypes);
         return new AnalysisException(
-            $"Undefined function: '{name}'. The function is neither a registered scalar nor an "
-            + $"aggregate function in the M1 registry (supplied argument types: [{RenderTypes(argumentTypes)}]).",
+            $"Undefined function: '{DiagnosticText.Sanitize(name, MaxEchoedReferenceLength)}'. "
+            + $"The function is neither a registered scalar nor an "
+            + $"aggregate function in the M1 registry (supplied argument types: "
+            + $"[{RenderTypes(argumentTypes)}]).",
             AnalysisErrorKind.UnresolvedFunction,
             name,
             Array.Empty<string>());
@@ -444,7 +499,9 @@ internal sealed class AnalysisException : Exception
         ArgumentNullException.ThrowIfNull(argumentTypes);
         ArgumentNullException.ThrowIfNull(expected);
         return new AnalysisException(
-            $"Cannot resolve function '{name}({RenderTypes(argumentTypes)})': {expected}",
+            $"Cannot resolve function "
+                + $"'{DiagnosticText.Sanitize(name, MaxEchoedReferenceLength)}"
+                + $"({RenderTypes(argumentTypes)})': {expected}",
             AnalysisErrorKind.InvalidFunctionArgument,
             name,
             Array.Empty<string>());
@@ -527,8 +584,30 @@ internal sealed class AnalysisException : Exception
             Array.Empty<string>());
     }
 
+    /// <summary>
+    /// Renders one <c>name#exprId</c> candidate for an ambiguity diagnostic, bounding the NAME and keeping
+    /// the identifier.
+    /// </summary>
+    /// <remarks>
+    /// <b>Why not just <c>Sanitize(SimpleString, cap)</c>.</b> Sanitize truncates from the TAIL, and the tail
+    /// of a composite candidate is precisely <c>#exprId</c> — the only thing distinguishing two same-named
+    /// candidates. Applying the cap to the composite therefore deleted the discriminator and rendered two
+    /// byte-identical entries in the one message whose entire purpose is to tell them apart. A bound on a
+    /// COMPOSITE token has to be applied to the component that is not load-bearing for the reader.
+    /// </remarks>
+    private static string RenderCandidate(AttributeReference attribute)
+    {
+        string id = string.Create(CultureInfo.InvariantCulture, $"#{attribute.ExprId}");
+
+        // -1 leaves room for Sanitize's own elision glyph, so the composite still fits the per-item cap and
+        // SanitizeAndJoin never gets the chance to re-truncate (and re-delete the id).
+        int nameBudget = Math.Max(MinEchoedNameLength, MaxEchoedCandidateLength - id.Length - 1);
+        return DiagnosticText.Sanitize(attribute.Name, nameBudget) + id;
+    }
+
     private static string RenderTypes(IReadOnlyList<DataType> types) =>
-        string.Join(", ", types.Select(t => t.SimpleString));
+        DiagnosticText.SanitizeAndJoin(
+            types.Select(t => t.SimpleString), MaxEchoedCandidateLength, MaxEchoedCandidates);
 
     /// <summary>Builds an <see cref="AnalysisErrorKind.InvalidTimeTravelSpec"/> failure for a read that
     /// pins both a version and a timestamp (#499): the <c>versionAsOf</c> and <c>timestampAsOf</c> options

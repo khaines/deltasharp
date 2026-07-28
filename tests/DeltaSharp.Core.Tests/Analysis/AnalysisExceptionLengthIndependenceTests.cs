@@ -52,13 +52,6 @@ public sealed class AnalysisExceptionLengthIndependenceTests
 
     private const int LargePayload = 100_000;
 
-    /// <summary>List cardinalities. Chosen so the SMALLEST-rendering list factory (~5 characters per item)
-    /// still renders past the small-payload scale above, giving the cardinality axis the same re-baseline
-    /// headroom as the token axis instead of a tenth of it.</summary>
-    private const int SmallCardinality = 2_000;
-
-    private const int LargeCardinality = 20_000;
-
     private static string Pad(int length) => new('z', length);
 
     private static IReadOnlyList<AttributeReference> Columns(int count) =>
@@ -115,35 +108,24 @@ public sealed class AnalysisExceptionLengthIndependenceTests
         { "UnsupportedWriteFormat/format", n => AnalysisException.UnsupportedWriteFormat(Pad(n), "/t", Names(2), Names(2)) },
     };
 
-    /// <summary>The CARDINALITY axis — a hostile schema or candidate set is wide rather than long, and a bound
-    /// that only caps individual tokens would miss it entirely.</summary>
-    public static TheoryData<string, Func<int, Exception>> UnboundedCardinalityAxes() => new()
-    {
-        // UnresolvedColumn/schema-width and AmbiguousReference/candidates deliberately LEFT OUT (round 6).
-        // They no longer rely on this backstop at all: they bound their own listing and report an explicit
-        // (+N more) count, so their render is intentionally NOT byte-identical across cardinalities — the
-        // numeral differs, which is the entire point. Asserting equality here would have forced a choice
-        // between this property and an honest diagnostic. They are held to a STRICTLY STRONGER contract in
-        // AnalysisExceptionCandidateListingTests: bounded, backstop-unreachable, and the count is accurate.
-        { "TableOrViewNotFound/parts", n => AnalysisException.TableOrViewNotFound(Names(n)) },
-        { "UnknownFunction/arity", n => AnalysisException.UnknownFunction("f", Types(n)) },
-        { "InvalidFunctionArgument/arity", n => AnalysisException.InvalidFunctionArgument("f", Types(n), "x") },
-        { "UnsupportedDataSink/formats", n => AnalysisException.UnsupportedDataSink("x", "/t", Names(n)) },
-        { "UnsupportedWriteFormat/formats", n => AnalysisException.UnsupportedWriteFormat("x", "/t", Names(n), Names(n)) },
-    };
+    // THE CARDINALITY THEORY IS GONE, and its absence is the point (round 6, Architect).
+    //
+    // It used to hold the factories that relied on this backstop to bound a LIST. Every one of them now
+    // bounds its own items and reports an explicit (+N more) count, so none of them relies on the backstop
+    // for cardinality any more and none can be asserted to render identically across widths — the numeral
+    // differs, which is exactly what makes the diagnostic honest.
+    //
+    // What replaced it is stronger, and is deliberately in AnalysisExceptionCandidateListingTests rather
+    // than here: EveryListComposingFactory_ReportsAnOverflowCount ranges over the whole class instead of
+    // enumerating axes by hand, which is what the earlier revision of this suite got wrong — it pinned the
+    // truncation of UnknownFunction and InvalidFunctionArgument AS EXPECTED BEHAVIOUR and so ratified the
+    // very defect it was meant to guard against.
 
     [Theory]
     [MemberData(nameof(UnboundedGrowthAxes))]
     public void FactoryRender_IsIndependentOfAttackerTokenLength(string axis, Func<int, Exception> build)
     {
         AssertIndependent(axis, build, SmallPayload, LargePayload);
-    }
-
-    [Theory]
-    [MemberData(nameof(UnboundedCardinalityAxes))]
-    public void FactoryRender_IsIndependentOfAttackerListCardinality(string axis, Func<int, Exception> build)
-    {
-        AssertIndependent(axis, build, SmallCardinality, LargeCardinality);
     }
 
     private static void AssertIndependent(
@@ -205,7 +187,10 @@ public sealed class AnalysisExceptionLengthIndependenceTests
         // rather than layer 1: these factories never touch CoercionHelpers.DiagnosticReference, so nothing
         // shortens them before construction. Deliberately expressed as "close to the bound" without asserting
         // the bound's value.
-        string message = AnalysisException.UnknownFunction(Pad(LargePayload), Types(1)).Message;
+        // DataTypeMismatch, not UnknownFunction (round 6): the function factories now bound their own
+        // components, so they no longer render anywhere near the backstop and could not demonstrate it. This
+        // one interpolates a single unbounded token, which is the case the backstop legitimately owns.
+        string message = AnalysisException.DataTypeMismatch(Pad(LargePayload), "boolean expected").Message;
 
         Assert.True(
             message.Length > 512,
