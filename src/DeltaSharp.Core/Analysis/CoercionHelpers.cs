@@ -395,11 +395,29 @@ internal static class CoercionHelpers
                         // a floor of its own. Falling back to the compact form keeps the guarantee that the
                         // fields after this one can still be shown.
                         //
-                        // Defensive, and labelled as such: 0-RED and byte-identical across 117,590 renders, so
-                        // no reachable shape exercises it — but, exactly as with the map's reclaim guard, there
+                        // Defensive, and labelled as such: 0-RED and byte-identical over every cell of
+                        // TheStructRender_IsMonotoneAndFullySpent_AcrossBudgetWidthAndChildShape, so no
+                        // reachable shape exercises it — but, exactly as with the map's reclaim guard, there
                         // is no PROOF it is dead, because the contract that motivates it is real. Not claimed
                         // to be equivalent, only to be cheap insurance on a call that may legitimately exceed
-                        // the caller's assumption.
+                        // the caller's assumption. The corpus is NAMED rather than counted: a cell count in
+                        // prose has to be retyped every time the sweep grows, and the sweep knows its own
+                        // size and prints it on failure.
+                        //
+                        // PAIRED mutation says that caution was right, and says something more precise than
+                        // "no proof". Appending child unconditionally is 0 rows on both TFMs. Doing that AND
+                        // returning "detailed" unconditionally at the end of this method, instead of falling
+                        // back to summary, is 4 rows on both TFMs across 4 methods; that second edit ALONE is
+                        // 2 rows on both across 2 — DiagnosticType_NeverExceedsItsBudget_ForAnyShape and
+                        // EveryCompositeRender_FitsTheBudgetItWasGiven, the further two being
+                        // TheFieldCountIsTheLargestFeasibleCount_NotOneShortOfTheFirstInfeasibleOne and the
+                        // monotonicity sweep named above.
+                        //
+                        // So this is half of a masking pair rather than an equivalent — and the half that
+                        // masks it is ITSELF pinned, which is the part worth knowing. A masking pair is only
+                        // dangerous when the masker can be removed silently; here it cannot, so no single
+                        // edit can quietly turn this guard from dead into load-bearing. Neither mutation
+                        // alone supports that statement, which is the argument for running them in pairs.
                         builder.Append(child.Length <= room ? child : compactChildren[i]);
                     }
 
@@ -459,9 +477,11 @@ internal static class CoercionHelpers
                     // Defensive, and honestly labelled as such. RenderBounded's contract permits a return
                     // LONGER than the budget it was given, because its summary fallback has a floor of its
                     // own; this check stops such a return from overrunning the map and collapsing it. It is
-                    // 0-RED, and unlike the last-item exemption there is no proof it is dead: an 8,883-point
-                    // sweep (7 map shapes x budgets 32..1300) is byte-identical with it removed, so no
-                    // reachable shape exercises it, but the contract that motivates it is real. Kept as a
+                    // 0-RED, and unlike the last-item exemption there is no proof it is dead: every cell of
+                    // EveryCompositeRender_FitsTheBudgetItWasGiven and AMapWithACheapValue_SpendsTheSlackOn
+                    // ItsKey is byte-identical with it removed, so no reachable shape exercises it, but the
+                    // contract that motivates it is real. Named rather than counted, for the reason given on
+                    // the struct child's fallback above. Kept as a
                     // postcondition on a call that may legitimately violate the caller's assumption, not as
                     // a claim that it fires. (An earlier comment here justified it by a field-name-count
                     // monotonicity oracle; that oracle was unsound and has been removed.)
