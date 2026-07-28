@@ -1076,6 +1076,14 @@ public sealed class ParquetWriterTests
     private const int MinimumLargestCollection = 257;
 
     /// <summary>
+    /// The longest string <see cref="SchemaDegreesOfFreedom_AreEachVaried"/> demands to see.
+    /// Chosen, and deliberately NOT <c>MagnitudeLengths.Max()</c>, for the reason given on
+    /// <see cref="MinimumLargestCollection"/>: a requirement derived from the thing it audits
+    /// agrees with it however that thing is narrowed.
+    /// </summary>
+    private const int MinimumLongestString = 4097;
+
+    /// <summary>
     /// The schemas the cardinality sweep writes: every count above, in every collection-valued
     /// position the model has, with <c>Nullable</c> varied across them.
     /// </summary>
@@ -1188,35 +1196,22 @@ public sealed class ParquetWriterTests
             ObserveType(schema, observed);
         }
 
-        // The one member that is invariant BY THE WRITER'S SIGNATURE rather than by choice: the
-        // footer schema root is typed StructType, so its TypeName cannot be anything but "struct".
-        // That justification is checked here rather than asserted in a comment -- if the writer
-        // ever accepts a wider root type, this fails and TypeName becomes a live degree of freedom.
-        System.Reflection.ParameterInfo schemaParameter = typeof(ParquetFileWriter)
-            .GetMethod(nameof(ParquetFileWriter.WriteAsync))!
-            .GetParameters()
-            .Single(p => p.ParameterType == typeof(StructType) || p.Name == "schema");
-        Assert.Equal(typeof(StructType), schemaParameter.ParameterType);
-
         var unvaried = new List<string>();
-        foreach ((Type owner, System.Reflection.MemberInfo member) in SchemaDegreesOfFreedom())
+        foreach ((Type owner, System.Reflection.MemberInfo member, bool elements) in SchemaDegreesOfFreedom())
         {
-            string key = $"{owner.Name}.{member.Name}";
-            if (key == "StructType.TypeName")
-            {
-                continue;
-            }
-
+            string key = elements ? $"{owner.Name}.{member.Name}[]" : $"{owner.Name}.{member.Name}";
             HashSet<object> values = observed.TryGetValue(key, out HashSet<object>? v)
                 ? v
                 : new HashSet<object>();
 
-            Type declared = MemberValueType(member);
+            Type declared = elements
+                ? ElementType(MemberValueType(member))
+                : MemberValueType(member);
 
             // A collection member's axis is its SIZE, and sizes are compared on the same footing
             // as any other count -- so "how many fields", "how many metadata entries" and "how
             // many array elements" are one derived requirement rather than three hand-written ones.
-            Type t = IsCollectionAxis(declared)
+            Type t = !elements && IsCollectionAxis(declared)
                 ? typeof(int)
                 : Nullable.GetUnderlyingType(declared) ?? declared;
             if (t == typeof(bool))
@@ -1244,9 +1239,33 @@ public sealed class ParquetWriterTests
                         + $"below the required minimum of {MinimumLargestCollection}");
                 }
             }
-            else if (t == typeof(string) && values.Count < 2)
+            else if (t == typeof(string))
             {
-                unvaried.Add($"{key} (string) only ever {Describe(values)}");
+                // SYMMETRY WITH THE COUNT ARM. This used to require only "two distinct values",
+                // while the count arm required a specific boundary -- so a string axis could
+                // satisfy the guard while missing the boundary that matters, and the guard would
+                // report coverage. A requirement weaker than the thing it certifies is the exact
+                // shape this file exists to remove, and it had reached the layer meant to end it.
+                //
+                // Strings get the same treatment as counts: the empty string is the zero of the
+                // length axis, exactly as 0 is for cardinality, and there must be a long one.
+                var lengths = values.Cast<string>().Select(x => x.Length).ToArray();
+                if (values.Count < 2)
+                {
+                    unvaried.Add($"{key} (string) only ever {Describe(values)}");
+                }
+                else if (!lengths.Contains(0) && EmptyStringIsConstructible(owner, member.Name))
+                {
+                    unvaried.Add(
+                        $"{key} (string) is never EMPTY -- the zero of the length axis, and the "
+                        + "value a \"skip blanks\" normalisation silently drops");
+                }
+                else if (lengths.Max() < MinimumLongestString)
+                {
+                    unvaried.Add(
+                        $"{key} (string) reaches only {lengths.Max()} characters, below the "
+                        + $"required {MinimumLongestString}");
+                }
             }
         }
 
@@ -1265,7 +1284,7 @@ public sealed class ParquetWriterTests
     /// BY THEIR TYPE rather than by name: they are other model objects or views over them, and are
     /// covered by their own owner's entry.
     /// </summary>
-    private static IEnumerable<(Type Owner, System.Reflection.MemberInfo Member)> SchemaDegreesOfFreedom()
+    private static IEnumerable<(Type Owner, System.Reflection.MemberInfo Member, bool Elements)> SchemaDegreesOfFreedom()
     {
         Type[] owners =
         [
@@ -1281,10 +1300,36 @@ public sealed class ParquetWriterTests
         {
             foreach (System.Reflection.PropertyInfo property in owner.GetProperties(flags))
             {
-                if (property.GetIndexParameters().Length == 0
-                    && (IsScalarAxis(property.PropertyType) || IsCollectionAxis(property.PropertyType)))
+                if (property.GetIndexParameters().Length != 0)
                 {
-                    yield return (owner, property);
+                    continue;
+                }
+
+                // A scalar member is an axis only if it is CALLER-SUPPLIED, decided by matching a
+                // constructor parameter. That replaces a hand-written exclusion of
+                // StructType.TypeName with a rule: TypeName and SimpleString are RENDERINGS of the
+                // type, not inputs to it, so demanding an empty SimpleString would be demanding
+                // something no caller can ask for. Collections are exempt from the rule, because a
+                // collection member always exposes real contained state however it is surfaced --
+                // FieldMetadata.Keys is not a constructor parameter but its size is still an axis.
+                if (IsCollectionAxis(property.PropertyType))
+                {
+                    yield return (owner, property, false);
+                    if (IsScalarAxis(ElementType(property.PropertyType)))
+                    {
+                        // A collection of scalars has TWO degrees of freedom: how many it holds and
+                        // what they contain. FieldMetadata.Keys is the case that matters -- metadata
+                        // keys are strings that reach the serializer, but they are elements rather
+                        // than members, so a member-only walk asked for their COUNT to be varied and
+                        // never for their CONTENT. That is how the empty key stayed unreachable
+                        // while the guard reported the model fully covered.
+                        yield return (owner, property, true);
+                    }
+                }
+                else if (IsScalarAxis(property.PropertyType)
+                    && IsCallerSupplied(owner, property.PropertyType))
+                {
+                    yield return (owner, property, false);
                 }
             }
 
@@ -1295,12 +1340,30 @@ public sealed class ParquetWriterTests
             // coverage and accident that this file has already been caught by once.
             foreach (System.Reflection.MethodInfo method in owner.GetMethods(flags))
             {
-                if (!method.IsSpecialName
-                    && method.GetParameters().Length == 0
-                    && method.Name != nameof(IEnumerable<int>.GetEnumerator)
-                    && IsCollectionAxis(method.ReturnType))
+                if (method.IsSpecialName
+                    || method.GetParameters().Length != 0
+                    || method.Name == nameof(IEnumerable<int>.GetEnumerator)
+                    || method.GetBaseDefinition().DeclaringType == typeof(object))
                 {
-                    yield return (owner, method);
+                    continue;
+                }
+
+                if (IsCollectionAxis(method.ReturnType))
+                {
+                    yield return (owner, method, false);
+                    if (IsScalarAxis(ElementType(method.ReturnType)))
+                    {
+                        yield return (owner, method, true);
+                    }
+                }
+                else if (IsScalarAxis(method.ReturnType) && IsCallerSupplied(owner, method.ReturnType))
+                {
+                    // MetadataValue.AsString() is the string that a metadata value CONTAINS. Like
+                    // AsArray() before it, it is exposed only as a method, so the property walk
+                    // never saw it -- and it is the position an empty-string-dropping normalisation
+                    // attacks. Object's own overrides are excluded by asking where the method was
+                    // first declared, not by naming them.
+                    yield return (owner, method, false);
                 }
             }
         }
@@ -1311,6 +1374,153 @@ public sealed class ParquetWriterTests
             ? p.PropertyType
             : ((System.Reflection.MethodInfo)member).ReturnType;
 
+    /// <summary>
+    /// Whether the empty string is a CONSTRUCTIBLE value for this member, decided by trying it.
+    /// </summary>
+    /// <remarks>
+    /// <c>StructField</c> rejects an empty name outright, so demanding an empty field name would be
+    /// demanding a value the model forbids -- a fact of the type, discovered by asking it, not a
+    /// judgement to hand-list. Metadata keys, string values and array elements all accept empty,
+    /// so they keep the requirement. If the probe cannot decide, it FAILS CLOSED and the
+    /// requirement stands: an undecidable case should surface, not disappear.
+    /// </remarks>
+    private static bool EmptyStringIsConstructible(Type owner, string memberName)
+    {
+        foreach (System.Reflection.ConstructorInfo ctor in owner.GetConstructors(
+            System.Reflection.BindingFlags.Public
+            | System.Reflection.BindingFlags.NonPublic
+            | System.Reflection.BindingFlags.Instance))
+        {
+            System.Reflection.ParameterInfo[] parameters = ctor.GetParameters();
+            int index = Array.FindIndex(
+                parameters,
+                x => x.ParameterType == typeof(string)
+                    && string.Equals(x.Name, memberName, StringComparison.OrdinalIgnoreCase));
+            if (index < 0)
+            {
+                continue;
+            }
+
+            var arguments = new object?[parameters.Length];
+            bool buildable = true;
+            for (int i = 0; i < parameters.Length && buildable; i++)
+            {
+                if (i == index)
+                {
+                    arguments[i] = string.Empty;
+                }
+                else if (!TryDefaultArgument(parameters[i].ParameterType, out arguments[i]))
+                {
+                    buildable = false;
+                }
+            }
+
+            if (!buildable)
+            {
+                continue;
+            }
+
+            try
+            {
+                ctor.Invoke(arguments);
+                return true;
+            }
+            catch (System.Reflection.TargetInvocationException)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool TryDefaultArgument(Type type, out object? value)
+    {
+        value = type switch
+        {
+            _ when type == typeof(string) => "x",
+            _ when type == typeof(bool) => true,
+            _ when type == typeof(DataType) => DataTypes.LongType,
+            _ when type == typeof(FieldMetadata) => FieldMetadata.Empty,
+            _ when type.IsValueType => Activator.CreateInstance(type),
+            _ => null,
+        };
+
+        return value is not null;
+    }
+
+    /// <summary>
+    /// <summary>
+    /// Whether a caller can SUPPLY a value of this type to this owner, decided by looking for a
+    /// parameter of that type on any constructor or any static factory returning the owner.
+    /// </summary>
+    /// <remarks>
+    /// Matching on TYPE rather than on parameter NAME is what makes this work for factory-built
+    /// types: MetadataValue.AsString() reads back what MetadataValue.String(string) was given, and
+    /// no name matches across that pair. StructType stays excluded on the same rule for the same
+    /// reason as before -- it is constructed from fields alone, so no caller can hand it a
+    /// SimpleString or a TypeName, and demanding an empty one would demand the unaskable.
+    /// </remarks>
+    private static bool IsCallerSupplied(Type owner, Type valueType)
+    {
+        const System.Reflection.BindingFlags flags =
+            System.Reflection.BindingFlags.Public
+            | System.Reflection.BindingFlags.NonPublic
+            | System.Reflection.BindingFlags.Instance
+            | System.Reflection.BindingFlags.Static;
+
+        foreach (System.Reflection.MethodBase candidate in
+            owner.GetConstructors(flags).Cast<System.Reflection.MethodBase>()
+                .Concat(owner.GetMethods(flags).Where(x => x.IsStatic && x.ReturnType == owner)))
+        {
+            if (candidate.GetParameters().Any(x => x.ParameterType == valueType))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// The element type of a collection axis, or the collection type itself when it is not generic.
+    /// </summary>
+    private static Type ElementType(Type collection)
+    {
+        Type? enumerable = collection.IsGenericType
+            && collection.GetGenericTypeDefinition() == typeof(IEnumerable<>)
+                ? collection
+                : collection.GetInterfaces().FirstOrDefault(
+                    x => x.IsGenericType && x.GetGenericTypeDefinition() == typeof(IEnumerable<>));
+
+        return enumerable?.GetGenericArguments()[0] ?? collection;
+    }
+
+    /// <summary>
+    /// The scalar kinds this guard knows how to state a boundary for.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This set and the <c>owners</c> array in <see cref="SchemaDegreesOfFreedom"/> are the two
+    /// HAND-LISTS remaining inside a guard whose purpose is to remove hand-lists, and they are
+    /// named here rather than left to be discovered. Neither has a live gap today: every scalar
+    /// member of the schema model is an enum, a bool, an int or a string, and the model is the four
+    /// types listed.
+    /// </para>
+    /// <para>
+    /// What happens when a new scalar kind is added is the part worth stating plainly: a member of
+    /// an unlisted kind is silently NOT an axis, so it would be unrequired without any test saying
+    /// so -- the same failure shape this file has been caught by repeatedly. A long or a decimal
+    /// added to the model is the realistic case. The mitigation available today is that such a
+    /// member still has to be serialized, so the corpus-completeness and byte-parity layers would
+    /// still see it; what would be lost is the REQUIREMENT that it be varied at a boundary.
+    /// </para>
+    /// <para>
+    /// The same reservation applies to <c>owners</c>: it lists the schema model's own types, and
+    /// notably not <c>DataType</c>, whose coverage is pinned instead by the writable-type corpus
+    /// guard. That is a different mechanism, not a derivation, and it is recorded as such.
+    /// </para>
+    /// </remarks>
     private static bool IsScalarAxis(Type t)
     {
         Type u = Nullable.GetUnderlyingType(t) ?? t;
@@ -1322,7 +1532,7 @@ public sealed class ParquetWriterTests
 
     private static void Observe(object target, Dictionary<string, HashSet<object>> into)
     {
-        foreach ((Type owner, System.Reflection.MemberInfo member) in SchemaDegreesOfFreedom())
+        foreach ((Type owner, System.Reflection.MemberInfo member, bool elements) in SchemaDegreesOfFreedom())
         {
             if (!owner.IsInstanceOfType(target))
             {
@@ -1349,19 +1559,29 @@ public sealed class ParquetWriterTests
                 continue;
             }
 
-            // For a collection the observation is its SIZE, which is what makes cardinality a
-            // derived axis rather than a hand-listed one.
-            object observation = value is System.Collections.IEnumerable sequence and not string
-                ? sequence.Cast<object>().Count()
-                : value;
-
-            if (!into.TryGetValue($"{owner.Name}.{member.Name}", out HashSet<object>? set))
+            string key = elements ? $"{owner.Name}.{member.Name}[]" : $"{owner.Name}.{member.Name}";
+            if (!into.TryGetValue(key, out HashSet<object>? set))
             {
                 set = new HashSet<object>();
-                into[$"{owner.Name}.{member.Name}"] = set;
+                into[key] = set;
             }
 
-            set.Add(observation);
+            if (elements)
+            {
+                // The CONTENT axis of a scalar collection: every element is an observation.
+                foreach (object item in ((System.Collections.IEnumerable)value).Cast<object>())
+                {
+                    set.Add(item);
+                }
+
+                continue;
+            }
+
+            // For a collection the observation is its SIZE, which is what makes cardinality a
+            // derived axis rather than a hand-listed one.
+            set.Add(value is System.Collections.IEnumerable sequence and not string
+                ? sequence.Cast<object>().Count()
+                : value);
         }
     }
 
@@ -1405,24 +1625,71 @@ public sealed class ParquetWriterTests
     }
 
     /// <summary>
-    /// Every schema this file actually writes to a Parquet footer. The degrees-of-freedom guard
-    /// observes THESE rather than a separate list, so it reports on real artifact coverage.
+    /// The single enumeration of every schema the constructive layer writes to a Parquet footer.
+    /// </summary>
+    /// <remarks>
+    /// The sweep WRITES these and the degrees-of-freedom guard OBSERVES these, from one source.
+    /// Before, the guard walked a parallel reconstruction that merely resembled the sweep, and
+    /// nothing checked the resemblance -- so the guard could have reported an axis covered on the
+    /// strength of a schema no footer ever saw. That is the unsafe direction of an unchecked
+    /// structural claim, and this file has already been caught believing one. Sharing the source
+    /// makes "observed implies written" true by construction rather than by assertion.
+    /// </remarks>
+    private static IEnumerable<(string What, StructType Schema)> ConstructiveArtifacts(
+        HashSet<(string, int, string)> covered)
+    {
+        IReadOnlyList<string> codepoints = HazardCodepoints;
+
+        // NOT A COVERAGE BOUND. This only decides how many codepoints share one write, and it was
+        // read as a coverage bound once -- for a while it was the ONLY thing setting the artifact
+        // layer's schema width, so a writer with a 64-column buffer passed everything. Schema
+        // width is now an explicit axis (CardinalityCounts, up to 257 fields) and is REQUIRED by
+        // SchemaDegreesOfFreedom_AreEachVaried, so changing this number cannot narrow coverage.
+        const int chunkSize = 48;
+        for (int start = 0; start < codepoints.Count; start += chunkSize)
+        {
+            string[] chunk = codepoints.Skip(start).Take(chunkSize).ToArray();
+            yield return (
+                $"the systematic sweep, chunk starting at codepoint index {start}",
+                BuildSweepSchema(chunk, start, covered));
+        }
+
+        // Magnitude, same construction: one long string per position per length.
+        foreach (int length in MagnitudeLengths)
+        {
+            yield return (
+                $"string length {length} -- a fixed-buffer truncation",
+                BuildSweepSchema([new string('m', length)], -length, covered));
+        }
+
+        // CARDINALITY. Every axis before this one varies what a SINGLE ITEM contains; none varied
+        // how many items there are. A serializer with a fixed inline buffer for metadata entries
+        // needs no hostile character and no long string to diverge -- and because keys are emitted
+        // in ordinal order, enough tenant-supplied keys evict the protocol's own delta.* keys from
+        // the footer while the log keeps them.
+        foreach ((string what, StructType schema) in CardinalitySweepSchemas())
+        {
+            yield return ($"{what} -- a fixed-capacity collection buffer", schema);
+        }
+
+        // NUMERIC BOUNDARIES, enumerated rather than sampled. Every reflected double and long is
+        // written at every depth. -0.0 is here because it is derived from the sign bit rather than
+        // from a value comparison; no equality-based enumeration can produce it, since -0.0 == 0.0.
+        yield return ("a reflected numeric boundary value", BuildNumericSweepSchema());
+    }
+
+    /// <summary>
+    /// Every schema this file actually writes to a Parquet footer: the constructive artifacts,
+    /// from the same enumeration the sweep writes, plus the two corpora that their own tests write.
     /// </summary>
     private static IEnumerable<StructType> ArtifactSchemas()
     {
         yield return MetadataCorpusSchema;
         yield return NameCorpusSchema;
-        yield return BuildNumericSweepSchema();
-        foreach ((string _, StructType schema) in CardinalitySweepSchemas())
+        var covered = new HashSet<(string, int, string)>();
+        foreach ((string _, StructType schema) in ConstructiveArtifacts(covered))
         {
             yield return schema;
-        }
-
-        var covered = new HashSet<(string, int, string)>();
-        yield return BuildSweepSchema([.. HazardCodepoints.Take(8)], 0, covered);
-        foreach (int length in MagnitudeLengths)
-        {
-            yield return BuildSweepSchema([new string('m', length)], -length, covered);
         }
     }
 
@@ -1506,81 +1773,25 @@ public sealed class ParquetWriterTests
             codepoints.Count >= 0x100,
             $"The hazard codepoint probe collapsed to {codepoints.Count} entries.");
 
-        var covered = new HashSet<(string Position, int Depth, string Text)>();
+        var covered = new HashSet<(string, int, string)>();
 
-        // NOT A COVERAGE BOUND. This only decides how many codepoints share one write, and it was
-        // read as a coverage bound once -- for a while it was the ONLY thing setting the artifact
-        // layer's schema width, so a writer with a 64-column buffer passed everything. Schema
-        // width is now an explicit axis (CardinalityCounts, up to 257 fields) and is REQUIRED by
-        // SchemaDegreesOfFreedom_AreEachVaried, so changing this number cannot narrow coverage.
-        const int chunkSize = 48;
-        for (int start = 0; start < codepoints.Count; start += chunkSize)
+        // ONE source, shared with the degrees-of-freedom guard: everything that guard observes is
+        // written HERE, so its coverage report cannot outrun the artifacts.
+        foreach ((string what, StructType schema) in ConstructiveArtifacts(covered))
         {
-            string[] chunk = codepoints.Skip(start).Take(chunkSize).ToArray();
-            StructType schema = BuildSweepSchema(chunk, start, covered);
             string expected = SchemaJson.ToJson(schema);
             string footer = await WriteAndReadFooterSchemaAsync(schema);
             if (!string.Equals(expected, footer, StringComparison.Ordinal))
             {
                 Assert.Fail(
-                    $"Footer diverged from the shared serializer on the systematic sweep, chunk "
-                    + $"starting at codepoint index {start}."
-                    + $"{Environment.NewLine}  expected (log): {expected}"
-                    + $"{Environment.NewLine}  actual (footer): {footer}");
+                    $"Footer diverged from the shared serializer at {what}."
+                    + $"{Environment.NewLine}  expected (log, {expected.Length} chars): "
+                    + $"{Truncate(expected)}"
+                    + $"{Environment.NewLine}  actual (footer, {footer.Length} chars): "
+                    + $"{Truncate(footer)}");
             }
         }
 
-        // Magnitude, same construction: one long string per position per length.
-        foreach (int length in MagnitudeLengths)
-        {
-            StructType schema = BuildSweepSchema([new string('m', length)], -length, covered);
-            string expected = SchemaJson.ToJson(schema);
-            string footer = await WriteAndReadFooterSchemaAsync(schema);
-            if (!string.Equals(expected, footer, StringComparison.Ordinal))
-            {
-                Assert.Fail(
-                    $"Footer diverged from the shared serializer at string length {length} -- a "
-                    + $"fixed-buffer truncation."
-                    + $"{Environment.NewLine}  expected length: {expected.Length}"
-                    + $"{Environment.NewLine}  actual length: {footer.Length}");
-            }
-        }
-
-        // CARDINALITY. Every axis before this one varies what a SINGLE ITEM contains; none varied
-        // how many items there are. A serializer with a fixed inline buffer for metadata entries
-        // needs no hostile character and no long string to diverge -- and because keys are emitted
-        // in ordinal order, enough tenant-supplied keys evict the protocol's own delta.* keys from
-        // the footer while the log keeps them.
-        foreach ((string what, StructType schema) in CardinalitySweepSchemas())
-        {
-            string cardExpected = SchemaJson.ToJson(schema);
-            string cardFooter = await WriteAndReadFooterSchemaAsync(schema);
-            if (!string.Equals(cardExpected, cardFooter, StringComparison.Ordinal))
-            {
-                Assert.Fail(
-                    $"Footer diverged from the shared serializer at {what} -- a fixed-capacity "
-                    + "collection buffer."
-                    + $"{Environment.NewLine}  expected (log): {Truncate(cardExpected)}"
-                    + $"{Environment.NewLine}  actual (footer): {Truncate(cardFooter)}");
-            }
-        }
-
-        // NUMERIC BOUNDARIES, enumerated rather than sampled. Every reflected double and long is
-        // written at every depth. -0.0 is here because it is derived from the sign bit rather than
-        // from a value comparison; no equality-based enumeration can produce it, since -0.0 == 0.0.
-        StructType numericSchema = BuildNumericSweepSchema();
-        string numericExpected = SchemaJson.ToJson(numericSchema);
-        string numericFooter = await WriteAndReadFooterSchemaAsync(numericSchema);
-        if (!string.Equals(numericExpected, numericFooter, StringComparison.Ordinal))
-        {
-            Assert.Fail(
-                "Footer diverged from the shared serializer on a numeric boundary value."
-                + $"{Environment.NewLine}  expected (log): {numericExpected}"
-                + $"{Environment.NewLine}  actual (footer): {numericFooter}");
-        }
-
-        // Self-check: the schema builder must actually have placed every codepoint in every cell.
-        // Cheap, and it fires if the builder ever stops filling a position.
         (string Position, int Depth)[] cells = RequiredStringCells(SweepDepthBound).ToArray();
         foreach (string text in codepoints)
         {
@@ -1621,6 +1832,21 @@ public sealed class ParquetWriterTests
                 FieldMetadata.FromValues(new[]
                 {
                     new KeyValuePair<string, MetadataValue>("k" + t, MetadataValue.String("v" + t)),
+
+                    // The EMPTY STRING, in every position that accepts one. It is the zero of the
+                    // length axis and was unreachable by construction: every swept string carried
+                    // a literal prefix, MagnitudeLengths started at 1 while CardinalityCounts
+                    // started at 0, and the generator drew at least one character. A "skip blanks"
+                    // normalisation therefore dropped entries with no test noticing.
+                    new KeyValuePair<string, MetadataValue>(string.Empty, MetadataValue.String("kept-under-empty-key")),
+                    new KeyValuePair<string, MetadataValue>("blank", MetadataValue.String(string.Empty)),
+                    new KeyValuePair<string, MetadataValue>("blanks", MetadataValue.Array(
+                        [MetadataValue.String(string.Empty), MetadataValue.String("after")])),
+                    new KeyValuePair<string, MetadataValue>("blanknest", MetadataValue.Nested(
+                        FieldMetadata.FromValues(
+                        [
+                            new KeyValuePair<string, MetadataValue>(string.Empty, MetadataValue.String(string.Empty)),
+                        ]))),
                     new KeyValuePair<string, MetadataValue>("obj", NestMetadata(t, 1)),
                     new KeyValuePair<string, MetadataValue>("arr", MetadataValue.Array(new[]
                     {
@@ -2227,7 +2453,7 @@ public sealed class ParquetWriterTests
         var usedKeys = new HashSet<string>(StringComparer.Ordinal);
         for (int i = 0; i < count; i++)
         {
-            string key = GenerateString(rng);
+            string key = GenerateString(rng, allowEmpty: true);
             if (!usedKeys.Add(key))
             {
                 continue;
@@ -2280,7 +2506,7 @@ public sealed class ParquetWriterTests
             case MetadataValueKind.Nested:
                 return MetadataValue.Nested(GenerateMetadata(rng, depth + 1));
             default:
-                return MetadataValue.String(GenerateString(rng));
+                return MetadataValue.String(GenerateString(rng, allowEmpty: true));
         }
     }
 
@@ -2481,7 +2707,13 @@ public sealed class ParquetWriterTests
     /// treats structurally differently — plain ASCII, non-ASCII BMP, and astral codepoints, which
     /// the encoder emits as a surrogate PAIR rather than a single escape.
     /// </summary>
-    private static string GenerateString(DeterministicRng rng)
+    /// <param name="allowEmpty">
+    /// Whether the empty string is a legal draw HERE. It is legal for a metadata key or a metadata
+    /// string value and illegal for a field name, because StructField rejects an empty name -- so
+    /// the generator is narrowed by the model rather than by a blanket minimum length of one, which
+    /// was the third of the four mechanisms that made the empty string unreachable.
+    /// </param>
+    private static string GenerateString(DeterministicRng rng, bool allowEmpty = false)
     {
         IReadOnlyList<string> alphabet = EscapeProbe.Alphabet;
         IReadOnlyList<string> forms = EscapeFormRepresentatives;
@@ -2489,6 +2721,11 @@ public sealed class ParquetWriterTests
         // MAGNITUDE is a domain, not an accident of the loop bound. One draw in eight is long
         // enough to cross a fixed-buffer truncation; the rest stay short so compositions stay
         // cheap and the case budget still buys interaction coverage rather than bulk.
+        if (allowEmpty && rng.Next(16) == 0)
+        {
+            return string.Empty;
+        }
+
         int length = rng.Next(8) == 0
             ? MagnitudeLengths[rng.Next(MagnitudeLengths.Length)]
             : 1 + rng.Next(6);
