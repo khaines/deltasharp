@@ -128,11 +128,24 @@ internal sealed class AnalysisException : Exception
     /// </para>
     /// <para>
     /// Deliberately generous: control-character neutralization is lossless and always applied, while the cap
-    /// exists only to make the render independent of attacker input length. It comfortably fits a
-    /// wide-schema "given input columns: [...]" listing, and where it does bite, no information is lost —
-    /// <see cref="Reference"/>, <see cref="RootColumn"/>, and <see cref="Candidates"/> remain available
-    /// <b>unmodified</b> as the structured, machine-readable channel (they are matched on by callers such as
-    /// the Delta dependent-column reclassifier, so they must never be rewritten).
+    /// exists only to make the render independent of attacker input length.
+    /// </para>
+    /// <para>
+    /// <b>It is a backstop, and a factory that can routinely reach it has a bug.</b> An earlier revision of
+    /// this comment claimed the cap "comfortably fits a wide-schema listing"; that was measurably false — a
+    /// 50-column table already rendered 1107 characters and was silently cut to 1025. Truncating the whole
+    /// message destroys the very signal that truncation happened, which on the TRUSTED path (a user's own
+    /// schema) turns a self-service fix into a support ticket. Any factory composing a list must therefore
+    /// bound its own items and report an explicit overflow count — see
+    /// <see cref="UnresolvedColumn"/> — so this cap is never what does the cutting.
+    /// </para>
+    /// <para>
+    /// The same correction applies to the mitigation this comment used to cite: <see cref="Reference"/>,
+    /// <see cref="RootColumn"/> and <see cref="Candidates"/> do remain <b>unmodified</b> as the structured,
+    /// machine-readable channel (they are matched on by callers such as the Delta dependent-column
+    /// reclassifier, so they must never be rewritten) — but this type is <c>internal</c>, so they are NOT
+    /// reachable by an external consumer and are not a user-facing mitigation for a truncated message. They
+    /// justify keeping the raw channel raw; they do not justify a lossy message.
     /// </para>
     /// <para>
     /// <b>Invariant this creates:</b> an <see cref="AnalysisException"/> message is single-line by
@@ -145,6 +158,29 @@ internal sealed class AnalysisException : Exception
     /// </para>
     /// </remarks>
     internal const int MaxMessageLength = 1024;
+
+    /// <summary>
+    /// The number of candidate columns echoed in a "given input columns"/"could be" listing before the
+    /// remainder is replaced by an explicit <c>(+N more)</c> count.
+    /// </summary>
+    /// <remarks>
+    /// This is the analyzer's instance of the posture stated at <c>SqlParser.cs</c>: bound the TOKEN so the
+    /// PROSE survives. Bounding per item keeps the message bounded <i>and</i> honest — the reader is told
+    /// exactly how many candidates they are not seeing — whereas letting
+    /// <see cref="MaxMessageLength"/> cut the composed string yields a listing that is truncated with no
+    /// indication that it is truncated, or by how much.
+    /// </remarks>
+    internal const int MaxEchoedCandidates = 20;
+
+    /// <summary>The per-candidate length cap. A single pathological name is elided with <c>…</c> — which is
+    /// visible — instead of being allowed to consume the whole listing's budget.</summary>
+    internal const int MaxEchoedCandidateLength = 32;
+
+    /// <summary>The cap applied to the unresolved/ambiguous name echoed in the MESSAGE. The structured
+    /// <see cref="Reference"/> property keeps the full value; this bounds only the prose, so that a long name
+    /// cannot push a listing past <see cref="MaxMessageLength"/> and destroy the overflow count with it.
+    /// </summary>
+    internal const int MaxEchoedReferenceLength = 128;
 
     private AnalysisException(
         string message,
@@ -275,8 +311,15 @@ internal sealed class AnalysisException : Exception
     {
         ArgumentNullException.ThrowIfNull(input);
         string[] candidates = input.Select(a => a.Name).ToArray();
+
+        // Bound the LISTING, not the composed message: a wide schema must still be told how many candidates
+        // it is not being shown. `candidates` (the structured channel) keeps every name, unmodified.
+        string echoed = DiagnosticText.SanitizeAndJoin(
+            candidates, MaxEchoedCandidateLength, MaxEchoedCandidates);
         return new AnalysisException(
-            $"Cannot resolve column name '{name}' given input columns: [{string.Join(", ", candidates)}]",
+            $"Cannot resolve column name "
+                + $"'{DiagnosticText.Sanitize(name, MaxEchoedReferenceLength)}' "
+                + $"given input columns: [{echoed}]",
             AnalysisErrorKind.UnresolvedColumn,
             name,
             candidates,
@@ -290,8 +333,11 @@ internal sealed class AnalysisException : Exception
     {
         ArgumentNullException.ThrowIfNull(matches);
         string[] candidates = matches.Select(a => a.SimpleString).ToArray();
+        string echoed = DiagnosticText.SanitizeAndJoin(
+            candidates, MaxEchoedCandidateLength, MaxEchoedCandidates);
         return new AnalysisException(
-            $"Reference '{name}' is ambiguous, could be: {string.Join(", ", candidates)}.",
+            $"Reference '{DiagnosticText.Sanitize(name, MaxEchoedReferenceLength)}' "
+                + $"is ambiguous, could be: {echoed}.",
             AnalysisErrorKind.AmbiguousReference,
             name,
             candidates);

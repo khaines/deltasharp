@@ -119,8 +119,12 @@ public sealed class AnalysisExceptionLengthIndependenceTests
     /// that only caps individual tokens would miss it entirely.</summary>
     public static TheoryData<string, Func<int, Exception>> UnboundedCardinalityAxes() => new()
     {
-        { "UnresolvedColumn/schema-width", n => AnalysisException.UnresolvedColumn("missing", Columns(n)) },
-        { "AmbiguousReference/candidates", n => AnalysisException.AmbiguousReference("amb", Columns(n)) },
+        // UnresolvedColumn/schema-width and AmbiguousReference/candidates deliberately LEFT OUT (round 6).
+        // They no longer rely on this backstop at all: they bound their own listing and report an explicit
+        // (+N more) count, so their render is intentionally NOT byte-identical across cardinalities — the
+        // numeral differs, which is the entire point. Asserting equality here would have forced a choice
+        // between this property and an honest diagnostic. They are held to a STRICTLY STRONGER contract in
+        // AnalysisExceptionCandidateListingTests: bounded, backstop-unreachable, and the count is accurate.
         { "TableOrViewNotFound/parts", n => AnalysisException.TableOrViewNotFound(Names(n)) },
         { "UnknownFunction/arity", n => AnalysisException.UnknownFunction("f", Types(n)) },
         { "InvalidFunctionArgument/arity", n => AnalysisException.InvalidFunctionArgument("f", Types(n), "x") },
@@ -150,11 +154,16 @@ public sealed class AnalysisExceptionLengthIndependenceTests
         string smallMessage = build(small).Message;
         string largeMessage = build(large).Message;
 
-        // Non-vacuity: the SMALLER payload must already have engaged the backstop, otherwise "the two renders
-        // are equal" would be trivially true for reasons unrelated to bounding. The elision glyph is the
-        // direct, constant-free evidence that truncation fired — none of the payloads above contain one.
+        // Non-vacuity: the SMALLER payload must already have been bounded, otherwise "the two renders are
+        // equal" would be trivially true for reasons unrelated to bounding. The elision glyph is the direct,
+        // constant-free evidence that truncation fired — none of the payloads above contain one.
+        //
+        // CONTAINS, not ENDS-WITH (round 6): the candidate-listing factories now bound their components
+        // individually rather than letting the whole message be cut, so the glyph legitimately appears in the
+        // MIDDLE of the message. Requiring it at the tail would have made those rows fail for a reason that
+        // has nothing to do with the property under test.
         Assert.True(
-            smallMessage.EndsWith('\u2026'),
+            smallMessage.Contains('\u2026', StringComparison.Ordinal),
             string.Create(
                 CultureInfo.InvariantCulture,
                 $"[{axis}] the {small}-scale payload was not truncated (rendered {smallMessage.Length} chars) — "
