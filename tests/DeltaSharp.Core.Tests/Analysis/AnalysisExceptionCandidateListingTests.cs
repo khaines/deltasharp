@@ -217,6 +217,50 @@ public sealed class AnalysisExceptionCandidateListingTests
     /// ranges over the whole class; this is that test, and adding a new list factory without a count will
     /// fail it.
     /// </remarks>
+    /// <summary>
+    /// Round 7 (Security, elevated by Balanced): distinct legitimate names must render <b>distinctly</b>.
+    /// A flat per-item cap collapsed <c>customer_lifetime_value_usd_2023_q1</c> and <c>…_q2</c> — the two
+    /// the user actually meant — into the identical string, in a 190-character message nowhere near the
+    /// backstop, so nothing needed bounding at all. Verified RED at <c>2d686a7</c>: three legitimate names
+    /// produced two identical renders at both sites.
+    /// <para>Names deliberately share a 32-character prefix, so this corpus can only pass if the bound is
+    /// wide enough to reach the part that differs. A corpus whose items are all shorter than the bound
+    /// cannot test the bound — that is exactly how the previous guard here passed while the defect
+    /// shipped.</para>
+    /// </summary>
+    [Fact]
+    public void LegitimateNamesSharingALongPrefix_RenderDistinctly()
+    {
+        string[] names =
+        [
+            "customer_lifetime_value_usd_2023",
+            "customer_lifetime_value_usd_2023_q1",
+            "customer_lifetime_value_usd_2023_q2",
+        ];
+        IReadOnlyList<AttributeReference> input = names
+            .Select((n, i) => new AttributeReference(n, IntegerType.Instance, true, new ExprId(i + 11)))
+            .ToArray();
+
+        foreach (string message in new[]
+        {
+            AnalysisException.UnresolvedColumn("clv", input).Message,
+            AnalysisException.AmbiguousReference("clv", input).Message,
+        })
+        {
+            Assert.DoesNotContain('\u2026', message);
+            foreach (string name in names)
+            {
+                Assert.Contains(name, message, StringComparison.Ordinal);
+            }
+
+            // ...and the renders are pairwise distinct, which is the property the shared prefix attacks.
+            string body = message[(message.LastIndexOf(": ", StringComparison.Ordinal) + 2)..]
+                .Trim('[', ']', '.');
+            string[] rendered = body.Split(", ");
+            Assert.Equal(rendered.Length, rendered.Distinct(StringComparer.Ordinal).Count());
+        }
+    }
+
     public static TheoryData<string, Func<int, Exception>> ListComposingFactories() => new()
     {
         { "UnresolvedColumn", n => AnalysisException.UnresolvedColumn("nosuch", Columns(n)) },
