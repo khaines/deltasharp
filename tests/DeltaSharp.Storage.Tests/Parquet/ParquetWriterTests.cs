@@ -284,12 +284,37 @@ public sealed class ParquetWriterTests
             // Exponent and high-precision forms, so "R" formatting is pinned alongside ".0".
             new KeyValuePair<string, MetadataValue>("tiny", MetadataValue.Double(1e-300)),
         })),
+        // ENCODING AT DEPTH. The escape forms above sit at the TOP LEVEL of a field's metadata,
+        // and the guard that checks them unioned its findings across depths -- so a form present
+        // in a top-level key satisfied "metadata key" while every nested key, nested string value
+        // and array element string in this corpus stayed bare ASCII. A rogue that escaped names
+        // and top-level keys/values correctly and emitted raw at depth >= 1 was byte-exact for
+        // every pinned corpus here and shipped 1645-green, producing structurally invalid JSON
+        // (an unescaped quote inside a nested value). The escaping contract does not vary with
+        // depth, so the corpus must not either.
+        new StructField("sixth", DataTypes.StringType, nullable: true, FieldMetadata.FromValues(new[]
+        {
+            // Array element string at depth 1.
+            new KeyValuePair<string, MetadataValue>("darr", MetadataValue.Array(new[]
+            {
+                MetadataValue.String(EveryEscapeForm),
+            })),
+            // Nested metadata KEY and nested metadata STRING VALUE, both at depth 1.
+            new KeyValuePair<string, MetadataValue>("dobj", MetadataValue.Nested(
+                FieldMetadata.FromValues(new[]
+                {
+                    new KeyValuePair<string, MetadataValue>(
+                        EveryEscapeForm, MetadataValue.String(EveryEscapeForm)),
+                }))),
+        })),
     });
 
     /// <summary>
-    /// One string exercising every escape form the serializer emits, used in BOTH the metadata-key
-    /// and metadata-string-value positions. Deliberately a single shared constant: the encoding
-    /// contract does not vary by position, so neither should the corpus that pins it.
+    /// One string exercising every escape form the serializer emits, used in EVERY arbitrary-string
+    /// position and at EVERY depth the guard requires. Deliberately a single shared constant: the
+    /// encoding contract varies with neither position nor nesting depth, so neither should the
+    /// corpus that pins it. Two rogues in a row exploited exactly that -- one correct in names and
+    /// wrong in metadata, one correct at depth 0 and wrong at depth 1.
     /// </summary>
     internal const string EveryEscapeForm = "e\\\t\n\r\b\f\u00E9\"z";
 
@@ -305,7 +330,8 @@ public sealed class ParquetWriterTests
             "\"flag\":true,\"obj\":{\"deep\":{\"leaf\":\"x\"},\"inner\":9},\"ratio\":0.5}}," +
             "{\"name\":\"third\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}," +
             "{\"name\":\"fourth\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\":\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\"}}," +
-        "{\"name\":\"fifth\",\"type\":\"long\",\"nullable\":true,\"metadata\":{\"bigid\":3000000000,\"maxlong\":9223372036854775807,\"minlong\":-9223372036854775808,\"negwhole\":-42.0,\"tiny\":1E-300,\"whole\":1.0}}]}";
+        "{\"name\":\"fifth\",\"type\":\"long\",\"nullable\":true,\"metadata\":{\"bigid\":3000000000,\"maxlong\":9223372036854775807,\"minlong\":-9223372036854775808,\"negwhole\":-42.0,\"tiny\":1E-300,\"whole\":1.0}}," +
+            "{\"name\":\"sixth\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"darr\":[\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\"],\"dobj\":{\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\":\"e\\\\\\t\\n\\r\\b\\f\\u00E9\\u0022z\"}}}]}";
 
     [Fact]
     public async Task WrittenFooter_PinsFieldMetadata_IncludingUnquotedColumnMappingIds()
@@ -544,6 +570,18 @@ public sealed class ParquetWriterTests
         // Both are now derived. The required set is probed out of the serializer; each position is
         // checked against that same set, so widening the encoder or adding a corpus row cannot
         // leave one position silently behind the others.
+        //
+        //   3. The set of DEPTHS was hand-listed -- also implicitly, at one. The walk below
+        //      unioned its findings across nesting levels, so a form appearing in a TOP-LEVEL
+        //      metadata key satisfied "metadata key" outright while every nested key, nested
+        //      string value and array element string in the corpus was bare ASCII. A rogue that
+        //      escaped correctly at depth 0 and emitted raw at depth >= 1 was byte-exact for
+        //      every pinned corpus and shipped 1645-green.
+        //
+        // Depth is now part of the cell key, and the required depth range is stated ONCE as an
+        // explicit bound (RequiredMetadataDepth) rather than falling out of whatever the corpus
+        // happens to contain. That bound is the one hand-choice left in this guard, and it is
+        // deliberately in a single named place so a reviewer can see and challenge it.
         SortedSet<string> required = ProbeEmittedEscapeForms();
 
         // Non-vacuity: a probe loop that silently stopped matching would make everything below pass
@@ -553,24 +591,64 @@ public sealed class ParquetWriterTests
         (string Position, IEnumerable<string> Strings)[] positions =
         [
             ("field name", NameCorpusSchema.Select(field => field.Name)),
-            ("metadata key", MetadataStrings(MetadataCorpusSchema, keys: true)),
-            ("metadata string value", MetadataStrings(MetadataCorpusSchema, keys: false)),
         ];
+
+        var cells = new Dictionary<(string Position, int Depth), SortedSet<string>>();
+
+        static SortedSet<string> Cell(
+            Dictionary<(string, int), SortedSet<string>> into, string position, int depth)
+        {
+            if (!into.TryGetValue((position, depth), out SortedSet<string>? set))
+            {
+                set = new SortedSet<string>(StringComparer.Ordinal);
+                into[(position, depth)] = set;
+            }
+
+            return set;
+        }
 
         foreach ((string position, IEnumerable<string> strings) in positions)
         {
-            var covered = new SortedSet<string>(StringComparer.Ordinal);
             foreach (string candidate in strings)
             {
-                covered.UnionWith(EscapeFormsIn(candidate));
+                Cell(cells, position, 0).UnionWith(EscapeFormsIn(candidate));
             }
+        }
+
+        foreach ((string position, int depth, string value) in MetadataStrings(MetadataCorpusSchema))
+        {
+            Cell(cells, position, depth).UnionWith(EscapeFormsIn(value));
+        }
+
+        // The required cells come from the GRAMMAR of the wire format -- the set of arbitrary-string
+        // positions a schema JSON admits -- crossed with the depth bound, not from what the corpus
+        // happens to contain. A cell the corpus never reaches is therefore a failure, not a silent
+        // absence, which is precisely what the union-across-depths version could not express.
+        var requiredCells = new List<(string Position, int Depth)> { ("field name", 0) };
+        for (int depth = 0; depth <= RequiredMetadataDepth; depth++)
+        {
+            requiredCells.Add(("metadata key", depth));
+            requiredCells.Add(("metadata string value", depth));
+
+            // An array element is by construction inside its array, so it cannot occur at depth 0.
+            if (depth >= 1)
+            {
+                requiredCells.Add(("array element string", depth));
+            }
+        }
+
+        foreach ((string position, int depth) in requiredCells)
+        {
+            SortedSet<string> covered = cells.TryGetValue((position, depth), out SortedSet<string>? found)
+                ? found
+                : new SortedSet<string>(StringComparer.Ordinal);
 
             string[] missing = required.Where(form => !covered.Contains(form)).ToArray();
             Assert.True(
                 missing.Length == 0,
                 $"The serializer emits these escape forms but no artifact corpus row exercises them "
-                + $"in the {position} position, so a rogue mishandling them there would ship "
-                + $"undetected: {string.Join(" ", missing)}");
+                + $"in the {position} position at depth {depth}, so a rogue mishandling them there "
+                + $"would ship undetected: {string.Join(" ", missing)}");
         }
 
         // Non-vacuity for the goldens themselves: the escaped bytes must actually appear in the
@@ -630,46 +708,63 @@ public sealed class ParquetWriterTests
         return forms;
     }
 
-    /// <summary>Recursively collects every metadata key, or every metadata string value.</summary>
-    private static IEnumerable<string> MetadataStrings(StructType schema, bool keys)
+    /// <summary>
+    /// The metadata nesting depth to which the encoding guard requires every escape form to be
+    /// pinned in every position. This is an explicit BOUND, not a derivation: the input grammar
+    /// admits unbounded nesting, so some finite cut is unavoidable and it belongs in one named
+    /// place rather than being an emergent property of the corpus. Depth 0 is a field's own
+    /// metadata; depth 1 is inside a nested object or array value. Raising it requires
+    /// corresponding corpus rows, and the guard will say exactly which cells are missing.
+    /// </summary>
+    private const int RequiredMetadataDepth = 1;
+
+    /// <summary>
+    /// Recursively collects every arbitrary string in the metadata of <paramref name="schema"/>,
+    /// tagged with the wire-format POSITION it occupies and its nesting DEPTH.
+    /// <para>
+    /// An earlier version returned bare strings and let the caller union them, which made a form
+    /// present at depth 0 satisfy the check for all depths. Depth is part of the identity of a
+    /// position, so it is carried here rather than discarded.
+    /// </para>
+    /// </summary>
+    private static IEnumerable<(string Position, int Depth, string Value)> MetadataStrings(
+        StructType schema)
     {
-        var found = new List<string>();
+        var found = new List<(string Position, int Depth, string Value)>();
         foreach (StructField field in schema)
         {
-            Walk(field.Metadata, found, keys);
+            Walk(field.Metadata, found, depth: 0);
         }
 
         return found;
 
-        static void Walk(FieldMetadata metadata, List<string> into, bool keys)
+        static void Walk(
+            FieldMetadata metadata, List<(string, int, string)> into, int depth)
         {
             foreach (KeyValuePair<string, MetadataValue> entry in metadata)
             {
-                if (keys)
-                {
-                    into.Add(entry.Key);
-                }
-
-                WalkValue(entry.Value, into, keys);
+                into.Add(("metadata key", depth, entry.Key));
+                WalkValue(entry.Value, into, depth, "metadata string value");
             }
         }
 
-        static void WalkValue(MetadataValue value, List<string> into, bool keys)
+        static void WalkValue(
+            MetadataValue value, List<(string, int, string)> into, int depth, string position)
         {
             switch (value.Kind)
             {
-                case MetadataValueKind.String when !keys:
-                    into.Add(value.AsString());
+                case MetadataValueKind.String:
+                    into.Add((position, depth, value.AsString()));
                     break;
                 case MetadataValueKind.Array:
                     foreach (MetadataValue item in value.AsArray())
                     {
-                        WalkValue(item, into, keys);
+                        WalkValue(item, into, depth + 1, "array element string");
                     }
 
                     break;
                 case MetadataValueKind.Nested:
-                    Walk(value.AsNested(), into, keys);
+                    Walk(value.AsNested(), into, depth + 1);
                     break;
                 default:
                     break;
@@ -865,6 +960,16 @@ public sealed class ParquetWriterTests
     /// sitting; the domains are still chosen, and they are now the thing to review.
     /// </para>
     /// <para>
+    /// WHY THIS IS DIFFERENT FROM THE PREVIOUS NINE ROUNDS, rather than a tenth patch. The space of
+    /// AXES along which a rogue may diverge is <i>open</i> — nobody enumerated it, which is why ten
+    /// rounds found ten. The space this relocates enumeration into is the <i>closed grammar of the
+    /// input type</i>: concrete types by writer acceptance, kinds by <c>Enum.GetValues</c>, string
+    /// alphabet probed from the serializer, nesting depth by an explicit bound, numeric domains
+    /// over the full 64-bit ranges. A closed grammar is something a meta-guard can check, and
+    /// <c>GeneratedValueDomains_AreNotSilentlyNarrowed</c> checks it. That is the difference: the
+    /// remaining hand-choices are finite, named, and asserted rather than scattered and implicit.
+    /// </para>
+    /// <para>
     /// This is also why <c>GeneratedValueDomains_AreNotSilentlyNarrowed</c> exists. Every earlier
     /// guard in this file derives its <i>set</i> — types from writer acceptance, kinds from the
     /// enum, escape forms probed from the serializer — but all of those range over strings and
@@ -891,14 +996,38 @@ public sealed class ParquetWriterTests
             $"Writer-accepted type support collapsed to {support.Count}; the generator would be "
             + "exercising a fraction of the type space while still passing.");
 
-        var rng = new DeterministicRng(20260728);
-        for (int i = 0; i < 200; i++)
+        var rng = new DeterministicRng(GeneratedSeed);
+        for (int i = 0; i < GeneratedCaseCount; i++)
         {
             StructType schema = GenerateSchema(rng, support);
+            string expected = SchemaJson.ToJson(schema);
             string footer = await WriteAndReadFooterSchemaAsync(schema);
-            Assert.Equal(SchemaJson.ToJson(schema), footer);
+            if (!string.Equals(expected, footer, StringComparison.Ordinal))
+            {
+                // Record the failing case in full. The seed and index reproduce it exactly, and
+                // the two payloads are printed because a CI log is often the only artifact anyone
+                // gets to look at.
+                Assert.Fail(
+                    $"Footer diverged from the shared serializer at seed {GeneratedSeed}, case {i}."
+                    + $"{Environment.NewLine}  expected (log): {expected}"
+                    + $"{Environment.NewLine}  actual (footer): {footer}");
+            }
         }
     }
+
+    /// <summary>
+    /// Fixed seed: a failure must be reproducible from the test name alone, so this never draws on
+    /// ambient randomness. Changing it is a deliberate act that re-samples the whole surface.
+    /// </summary>
+    private const int GeneratedSeed = 20260728;
+
+    /// <summary>
+    /// Case budget. Each case is a real Parquet write and footer read; the zero-batch path keeps
+    /// that to roughly half a millisecond, so this costs ~0.1s against a Storage suite that runs
+    /// in about three minutes. Raising it is cheap and raising it a lot is not, which is why the
+    /// number is here rather than inline.
+    /// </summary>
+    private const int GeneratedCaseCount = 200;
 
     /// <summary>
     /// Audits the generator's VALUE DOMAINS, which are where enumeration now lives.
@@ -916,7 +1045,7 @@ public sealed class ParquetWriterTests
     public async Task GeneratedValueDomains_AreNotSilentlyNarrowed()
     {
         IReadOnlyList<DataType> support = await WriterAcceptedTypesAsync();
-        var rng = new DeterministicRng(20260728);
+        var rng = new DeterministicRng(GeneratedSeed);
 
         var kinds = new HashSet<MetadataValueKind>();
         var typeNames = new HashSet<string>(StringComparer.Ordinal);
@@ -928,15 +1057,19 @@ public sealed class ParquetWriterTests
         bool controlCharacter = false;
         bool quoteOrBackslash = false;
         bool nonAsciiBmp = false;
+        var emittedForms = new SortedSet<string>(StringComparer.Ordinal);
+        var stringPositions = new SortedSet<string>(StringComparer.Ordinal);
+        int maxDepth = -1;
+        bool loneSurrogate = false;
 
-        for (int i = 0; i < 200; i++)
+        for (int i = 0; i < GeneratedCaseCount; i++)
         {
             StructType schema = GenerateSchema(rng, support);
             foreach (StructField field in schema)
             {
                 typeNames.Add(field.DataType.TypeName);
-                InspectString(field.Name);
-                InspectMetadata(field.Metadata);
+                InspectString(field.Name, "field name");
+                InspectMetadata(field.Metadata, 0);
             }
         }
 
@@ -957,18 +1090,53 @@ public sealed class ParquetWriterTests
         Assert.Equal(Enum.GetValues<MetadataValueKind>().OrderBy(k => k), kinds.OrderBy(k => k));
         Assert.True(
             typeNames.Count >= 20,
-            $"Only {typeNames.Count} distinct types generated across 200 schemas.");
+            $"Only {typeNames.Count} distinct types generated across {GeneratedCaseCount} schemas.");
 
-        void InspectMetadata(FieldMetadata metadata)
+        // ESCAPE FORMS, derived from the serializer -- not from the generator's own alphabet, so a
+        // narrowed alphabet cannot satisfy this by also narrowing what it is compared against.
+        string[] missingForms = ProbeEmittedEscapeForms()
+            .Where(form => !emittedForms.Contains(form)).ToArray();
+        Assert.True(
+            missingForms.Length == 0,
+            $"The generator never produced these escape forms the serializer emits, so a rogue "
+            + $"mishandling them would not be sampled: {string.Join(" ", missingForms)}");
+
+        // POSITIONS and DEPTH: the grammar's string slots, and that recursion actually reaches the
+        // stated bound rather than terminating early for some accident of the seed.
+        Assert.Equal(
+            new[]
+            {
+                "array element string", "field name", "metadata key", "metadata string value",
+                "nested metadata key", "nested metadata string value",
+            },
+            stringPositions.ToArray());
+        Assert.True(
+            maxDepth >= GeneratedMetadataDepthBound,
+            $"Generated metadata reached depth {maxDepth}, below the stated bound of "
+            + $"{GeneratedMetadataDepthBound}: the recursive arms are under-sampled.");
+
+        // The #710 exclusion, asserted rather than assumed. If the alphabet ever admits a lone
+        // surrogate the sibling test starts failing for a known-open defect it is not about, and
+        // this says so directly instead of leaving a confusing byte diff.
+        Assert.False(
+            loneSurrogate,
+            "The generator produced a lone surrogate. Those are replaced by U+FFFD en route to "
+            + "UTF-8 (#710) and are deliberately outside this generator's support.");
+
+        void InspectMetadata(FieldMetadata metadata, int depth)
         {
+            maxDepth = Math.Max(maxDepth, depth);
             foreach (KeyValuePair<string, MetadataValue> entry in metadata)
             {
-                InspectString(entry.Key);
-                InspectValue(entry.Value);
+                InspectString(entry.Key, depth == 0 ? "metadata key" : "nested metadata key");
+                InspectValue(
+                    entry.Value,
+                    depth,
+                    depth == 0 ? "metadata string value" : "nested metadata string value");
             }
         }
 
-        void InspectValue(MetadataValue value)
+        void InspectValue(MetadataValue value, int depth, string position)
         {
             kinds.Add(value.Kind);
             switch (value.Kind)
@@ -985,25 +1153,27 @@ public sealed class ParquetWriterTests
                     longAtBoundary |= l == long.MaxValue || l == long.MinValue;
                     break;
                 case MetadataValueKind.String:
-                    InspectString(value.AsString());
+                    InspectString(value.AsString(), position);
                     break;
                 case MetadataValueKind.Array:
                     foreach (MetadataValue item in value.AsArray())
                     {
-                        InspectValue(item);
+                        InspectValue(item, depth + 1, "array element string");
                     }
 
                     break;
                 case MetadataValueKind.Nested:
-                    InspectMetadata(value.AsNested());
+                    InspectMetadata(value.AsNested(), depth + 1);
                     break;
                 default:
                     break;
             }
         }
 
-        void InspectString(string text)
+        void InspectString(string text, string position)
         {
+            stringPositions.Add(position);
+            emittedForms.UnionWith(EscapeFormsIn(text));
             for (int i = 0; i < text.Length; i++)
             {
                 char c = text[i];
@@ -1011,6 +1181,9 @@ public sealed class ParquetWriterTests
                 controlCharacter |= c < 0x20;
                 quoteOrBackslash |= c is '"' or '\\';
                 nonAsciiBmp |= c >= 0x80 && !char.IsSurrogate(c);
+                loneSurrogate |= char.IsHighSurrogate(c)
+                    ? i + 1 >= text.Length || !char.IsLowSurrogate(text[i + 1])
+                    : char.IsLowSurrogate(c) && (i == 0 || !char.IsHighSurrogate(text[i - 1]));
             }
         }
     }
@@ -1117,13 +1290,21 @@ public sealed class ParquetWriterTests
         return FieldMetadata.FromValues(entries.ToArray());
     }
 
+    /// <summary>
+    /// The nesting depth the generator recurses to. The input grammar admits unbounded nesting, so
+    /// this is an explicit BOUND rather than a derivation — stated once, next to the other
+    /// generator domains, so it is reviewable rather than buried in a comparison.
+    /// </summary>
+    private const int GeneratedMetadataDepthBound = 2;
+
     private static MetadataValue GenerateValue(DeterministicRng rng, int depth)
     {
         // Every MetadataValueKind is reachable; Array and Nested recurse to a bounded depth so
         // compositions no hand-written corpus expresses are generated.
         MetadataValueKind[] kinds = Enum.GetValues<MetadataValueKind>();
         MetadataValueKind kind = kinds[rng.Next(kinds.Length)];
-        if (depth >= 2 && (kind == MetadataValueKind.Array || kind == MetadataValueKind.Nested))
+        if (depth >= GeneratedMetadataDepthBound
+            && (kind == MetadataValueKind.Array || kind == MetadataValueKind.Nested))
         {
             kind = MetadataValueKind.Long;
         }
@@ -1188,35 +1369,86 @@ public sealed class ParquetWriterTests
     };
 
     /// <summary>
-    /// Strings across the character classes the encoder treats differently: plain ASCII, the
-    /// control range, the quote and backslash, non-ASCII BMP, and astral codepoints (which the
-    /// encoder emits as a surrogate PAIR).
+    /// The generator's escape-producing alphabet, DERIVED from the serializer rather than listed.
+    /// <para>
+    /// The previous version hand-wrote its character classes in a <c>switch</c>, which is the same
+    /// leaf-of-the-derivation defect this file has corrected repeatedly one level in: the set of
+    /// escape FORMS was probed for the pinned corpus while the generator's alphabet remained a
+    /// hand-choice, so widening the encoder would leave the generator behind silently. This walks
+    /// the codepoint space, asks <c>SchemaJson</c> what each character encodes to, and keeps one
+    /// representative per distinct emitted form — so the alphabet grows with the encoder.
+    /// </para>
+    /// <para>
+    /// LONE SURROGATES ARE EXCLUDED DELIBERATELY, and this is the explicit statement of it that
+    /// was previously only implicit in the range arithmetic. An unpaired surrogate is replaced by
+    /// U+FFFD on the way to UTF-8, which is a real defect but a KNOWN and separately tracked one
+    /// (#710); generating it here would make this test fail for a reason it is not about.
+    /// </para>
+    /// </summary>
+    private static IReadOnlyList<string> EscapeAlphabet => _escapeAlphabet ??= BuildEscapeAlphabet();
+
+    private static IReadOnlyList<string>? _escapeAlphabet;
+
+    private static IReadOnlyList<string> BuildEscapeAlphabet()
+    {
+        var byForm = new SortedDictionary<string, string>(StringComparer.Ordinal);
+        var codepoints = new List<int>();
+        for (int c = 1; c < 0x80; c++)
+        {
+            codepoints.Add(c);
+        }
+
+        codepoints.AddRange([0x00A0, 0x00E9, 0x0301, 0x2028, 0x2029, 0x4E2D, 0xFFFD, 0x1F600]);
+
+        foreach (int codepoint in codepoints)
+        {
+            // Skip the surrogate range entirely (see #710 above); ConvertFromUtf32 would throw.
+            if (codepoint is >= 0xD800 and <= 0xDFFF)
+            {
+                continue;
+            }
+
+            string text = char.ConvertFromUtf32(codepoint);
+            foreach (string form in EscapeFormsIn(text))
+            {
+                byForm.TryAdd(form, text);
+            }
+        }
+
+        return byForm.Values.ToArray();
+    }
+
+    /// <summary>
+    /// Strings drawn from the DERIVED escape alphabet plus the character classes the encoder
+    /// treats structurally differently — plain ASCII, non-ASCII BMP, and astral codepoints, which
+    /// the encoder emits as a surrogate PAIR rather than a single escape.
     /// </summary>
     private static string GenerateString(DeterministicRng rng)
     {
+        IReadOnlyList<string> alphabet = EscapeAlphabet;
         int length = 1 + rng.Next(6);
         var chars = new System.Text.StringBuilder(length);
         for (int i = 0; i < length; i++)
         {
-            switch (rng.Next(6))
+            switch (rng.Next(5))
             {
                 case 0:
                     chars.Append((char)('a' + rng.Next(26)));
                     break;
                 case 1:
-                    chars.Append((char)(1 + rng.Next(0x20)));
+                    chars.Append(alphabet[rng.Next(alphabet.Count)]);
                     break;
                 case 2:
-                    chars.Append(rng.Next(2) == 0 ? '"' : '\\');
-                    break;
-                case 3:
+                    // Non-ASCII BMP, below the surrogate range.
                     chars.Append((char)(0x80 + rng.Next(0x300)));
                     break;
-                case 4:
+                case 3:
+                    // Astral: a surrogate PAIR, never a lone surrogate.
                     chars.Append(char.ConvertFromUtf32(0x10000 + rng.Next(0x1000)));
                     break;
                 default:
-                    chars.Append((char)(0x2000 + rng.Next(0x2000)));
+                    // BMP above the surrogate range.
+                    chars.Append((char)(0xE000 + rng.Next(0x1000)));
                     break;
             }
         }
