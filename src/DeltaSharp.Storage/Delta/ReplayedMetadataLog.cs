@@ -58,13 +58,33 @@ namespace DeltaSharp.Storage.Delta;
 /// <see cref="EnsureObservationMatchesReplayedState"/> catches that shape.</description></item>
 /// </list>
 /// <para>Each layer therefore has its OWN discriminating test rather than sharing an end-behaviour one. The
-/// precise, audited form of that claim (council R2, security seat — the earlier unqualified wording was
-/// falsified by a surviving mutant, so it is stated here only to the extent it has actually been checked):
-/// <b>every guard in this type was individually neutered and the whole suite run</b>. Eleven of the twelve
-/// turn a specific, non-overlapping set of tests red. The twelfth — the <c>!HasCoverage</c> disjunct in
-/// <see cref="TryGetProvenObservation"/> — survives because it is PROVABLY REDUNDANT rather than untested:
-/// with no coverage the interval is <c>[0, 0)</c>, so the bounds comparison beside it already rejects every
-/// version. It is kept as a readability guard, not as a load-bearing one, and no test can distinguish it.</para>
+/// precise, audited form of that claim (council R2 — the earlier unqualified wording was falsified by a
+/// surviving mutant, so it is stated here only to the extent it has actually been checked):
+/// <b>every mutation point in this type was individually neutered and the whole suite run</b>. Fourteen in
+/// total, in three categories — the third category is the one that matters, because it is the class a
+/// fail-closed suite is STRUCTURALLY INCAPABLE of detecting:</para>
+/// <list type="number">
+/// <item><description><b>Killed (12).</b> Each turns a specific, non-overlapping set of tests red. The four
+/// conjuncts of <see cref="EnsureLineageIsAccountedFor"/> turn exactly ONE red each, and a different one.
+/// </description></item>
+/// <item><description><b>Provably equivalent (2), each falsified against a recorded state space rather than
+/// argued.</b> An equivalence claim is only as good as the space it survived, so the space is recorded here,
+/// not just the verdict. (a) The <c>!HasCoverage</c> disjunct in <see cref="TryGetProvenObservation"/>: with
+/// no coverage the interval is <c>[0, 0)</c>, so the bounds beside it already reject every version — swept
+/// over <c>{long.MinValue, -1, 0, 1, 99, 100, long.MaxValue}</c> against four observer states, plus the
+/// proof that <c>CoveredToExclusive != 0</c> implies <see cref="HasCoverage"/>. (b) <see cref="Seal"/>'s
+/// idempotent early return, but ONLY as a consequence of the ordering fix below: because the flag is now set
+/// only after the check PASSES, and <see cref="Record"/> refuses to mutate a sealed window, a repeated
+/// <see cref="Seal"/> re-runs a deterministic check over frozen state and reaches the same verdict — pass,
+/// pass or throw, throw. It is a memoisation, not a guard.</description></item>
+/// <item><description><b>Safer-direction survivors (0 now; 1 before the ordering fix).</b> A mutant that makes
+/// the code fail closed MORE cannot be killed by a suite whose assertions are "must throw" — it is invisible
+/// to the method, not absent from the code. Before the fix, deleting <see cref="Seal"/>'s early return made a
+/// retried seal re-throw instead of returning silently: strictly safer, therefore unkillable, therefore
+/// mistaken for redundant by two separate audits. What that survivor was CONCEALING was the real defect — the
+/// ordering, now guard 14 and killed. Any future survivor here must be classified into this bucket before it
+/// is called equivalent.</description></item>
+/// </list>
 ///
 /// <para><b>Single extraction site.</b> <see cref="MetadataActionsOf"/> is the ONE place a commit's
 /// <c>metaData</c> actions are picked out of its parsed actions; the gate's disk-fallback path calls the same
@@ -250,8 +270,15 @@ internal sealed class ReplayedMetadataLog
             return;
         }
 
-        _sealed = true;
+        // ORDER IS LOAD-BEARING (council R2 — found independently by three parties, rated blocking).
+        // Assigning `_sealed` BEFORE the check gave the field two meanings: Seal wrote it to mean "seal
+        // ATTEMPTED", while TryGetProvenObservation's `!_sealed` gate reads it to mean "seal VALIDATED". The
+        // disagreement is exactly a FAILED verdict being consumable as a passed one — a retried Seal returned
+        // silently instead of re-throwing, and observations from a window whose lineage check had THROWN were
+        // served. A gate whose failure path marks itself validated contradicts this type's own
+        // phase-separation argument, so the flag is set only once the cross-checks have PASSED.
         EnsureLineageIsAccountedFor();
+        _sealed = true;
     }
 
     /// <summary>
@@ -277,7 +304,8 @@ internal sealed class ReplayedMetadataLog
         {
             // `!HasCoverage` is redundant, deliberately: with no coverage the interval is [0, 0), so the two
             // bounds already reject every version. Kept for readability; it is NOT load-bearing, which is why
-            // no test can kill a mutant of it (council R2, security seat — see the type doc's audit note).
+            // no test can kill a mutant of it. Falsified against {MIN,-1,0,1,99,100,MAX} x four observer
+            // states, plus the proof that CoveredToExclusive != 0 implies HasCoverage (council R2).
             return false; // Outside the proven interval — the caller MUST read the commit itself.
         }
 

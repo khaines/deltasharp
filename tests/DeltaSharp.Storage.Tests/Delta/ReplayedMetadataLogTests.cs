@@ -451,6 +451,42 @@ public sealed class ReplayedMetadataLogTests
     }
 
     [Fact]
+    public void AFailedSealDoesNotPresentAsSealed_SoAThrownVerdictIsNeverMistakenForAPassedOne()
+    {
+        // Council R2 (security seat, follow-up). Seal() marks the window sealed only AFTER the whole-window
+        // cross-checks pass. With the flag set first, a FAILED seal left the window looking sealed: a retried
+        // Seal returned silently instead of re-throwing, and TryGetProvenObservation's pre-seal guard admitted
+        // observations from a window whose lineage check had THROWN — a gate whose failure path marks itself
+        // validated, which is the exact defect class the sealing primitive exists to prevent.
+        var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
+        MetadataAction m0 = Meta("m0");
+        MetadataAction m1 = Meta("m1");
+        MetadataAction m5 = Meta("m5");
+        MetadataAction m6 = Meta("m6");
+        MetadataAction m7 = Meta("m7");
+
+        // The window is deliberately made to violate the chain-LINK, chain-CLOSURE and end-ACCOUNTING
+        // conjuncts simultaneously, so that neutering any ONE of them still leaves the seal failing. Without
+        // that, this oracle would ride along with whichever single conjunct its window happened to trip and
+        // would show up as a second RED in that conjunct's mutant, blunting the per-conjunct disjointness the
+        // audit above asserts. What this test pins is the ORDERING, and only the ordering.
+        log.Record(10, new[] { Meta("x") }, m0, m1);
+        log.Record(11, new[] { Meta("y") }, m5, m6); // link break: m5 is not where the chain had reached
+        log.Record(12, None, m7, m7);                // silent + unmoved: no entry, but moves the window end
+
+        Assert.Throws<DeltaProtocolException>(log.Seal);
+
+        // A retry must re-run the check and fail closed again, NOT return silently. This assertion is what
+        // the ordering uniquely controls.
+        Assert.Throws<DeltaProtocolException>(log.Seal);
+
+        // And consumption must still be refused, because the window was never successfully sealed. This one
+        // deliberately overlaps the pre-seal guard (defence in depth): it is the security consequence of the
+        // ordering defect, so it is asserted here even though ConsumingBeforeSealing_… also covers the guard.
+        Assert.Throws<DeltaProtocolException>(() => log.TryGetProvenObservation(11, out _));
+    }
+
+    [Fact]
     public void ObservingAfterSealing_FailsClosed_SoAWholeWindowVerdictIsNeverReusedOverAWiderWindow()
     {
         var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
