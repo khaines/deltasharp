@@ -249,17 +249,41 @@ internal static class DiagnosticText
         // Upper bound on the overflow suffix, reserved so the count is never what gets cut.
         int reserve = separator.Length + OverflowMarkerLength(items.Count);
         int allowance = Math.Clamp(budget / items.Count, minItemLength, maxItemLength);
+        string[] rendered = new string[items.Count];
+        int whole = 0;
+        for (int i = 0; i < items.Count; i++)
+        {
+            rendered[i] = render(items[i], allowance);
+            whole += rendered[i].Length + (i > 0 ? separator.Length : 0);
+        }
+
+        // FITS-ENTIRELY PRE-CHECK, and it has to come before the greedy walk rather than fall out of it.
+        // The walk charges every non-final item for an overflow suffix that will not exist if the listing
+        // turns out to fit, so it can stop short while the complete listing would have been inside the
+        // budget all along: at 107 seven-character names it elided two of them at 1015 characters when the
+        // full listing renders in 1020. Discarding a user's own column names with budget to spare is worse
+        // than the unbounded original this bound replaced — the exact disqualifier this design is built on.
+        // The reserve itself stays: deleting it is 10 RED, because it is what keeps the count from being cut
+        // once the listing genuinely does not fit. It is only wrong to charge it when nothing will overflow.
+        if (whole <= budget)
+        {
+            return string.Join(separator, rendered);
+        }
 
         var builder = new StringBuilder();
         int shown = 0;
         for (int i = 0; i < items.Count; i++)
         {
-            string rendered = render(items[i], allowance);
-            int addition = (shown > 0 ? separator.Length : 0) + rendered.Length;
+            int addition = (shown > 0 ? separator.Length : 0) + rendered[i].Length;
 
-            // The last item needs no room for a suffix, because taking it means there is no remainder.
-            int needed = i == items.Count - 1 ? 0 : reserve;
-            if (builder.Length + addition + needed > budget)
+            // Every item is charged for the overflow suffix, with no exemption for the last. There used to be
+            // one, on the reasoning that taking the final item leaves no remainder to report — true, but now
+            // unreachable: this loop only runs when the complete listing does NOT fit, and admitting the last
+            // item would mean exactly that it does. Deleting the exemption is 0 RED, which is the correct
+            // result for dead code rather than a gap in the corpus. The pre-check above is what actually
+            // delivers the "spend the whole budget" property the exemption was reaching for, and it delivers
+            // it for every item rather than only the final one.
+            if (builder.Length + addition + reserve > budget)
             {
                 break;
             }
@@ -269,7 +293,7 @@ internal static class DiagnosticText
                 builder.Append(separator);
             }
 
-            builder.Append(rendered);
+            builder.Append(rendered[i]);
             shown++;
         }
 

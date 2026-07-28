@@ -98,33 +98,114 @@ public sealed class AnalysisExceptionCandidateListingTests
     /// original</i> at every width that used to fit. The bound is now the space actually remaining, so this
     /// sweeps the boundary band <b>continuously</b>: the previous corpus stopped at 20 and resumed at 50,
     /// leaving 21–46 — precisely where the regression lived — untested at every width.
+    /// <para>Covers: width 1–60 at one 35-character name. That is a line through the corpus, not the corpus;
+    /// the defect this property is about lives on the <i>product</i> of width and name length, so
+    /// <see cref="ListingBudget_IsSpentBeforeAnythingIsElided_AcrossTheProductOfWidthAndNameLength"/> sweeps
+    /// the plane and this theory remains as the readable, per-width failure message.</para>
     /// </summary>
     [Theory]
     [MemberData(nameof(ContinuousWidths))]
     public void ListingBudget_IsSpentBeforeAnythingIsElided(int width)
     {
         string message = AnalysisException.UnresolvedColumn("nosuch", Columns(width)).Message;
-        string listing = message[(message.IndexOf('[', StringComparison.Ordinal) + 1)..^1];
+        string? failure = ElisionWasNecessary(message, [.. Enumerable.Range(0, width).Select(RealisticName)]);
+        Assert.True(failure is null, failure ?? string.Empty);
+    }
+
+    /// <summary>
+    /// #687 council round 11 (Security BLOCKING) — the same property over the <b>product</b> of the two axes
+    /// rather than a line through it.
+    /// <para>Sweeping width at a single name length cannot find a defect that lives on their interaction, and
+    /// one did: the greedy walk charged every item for an overflow suffix that would not exist if the listing
+    /// fit, so at 107 seven-character names it elided two of them at 1015 characters when the complete
+    /// listing renders in 1020. Nine characters of budget unspent, two of the user's own column names gone,
+    /// on the trusted path. The prior corpus swept width 1–60 at one 35-character name and structurally could
+    /// not reach that cell — the third time a corpus in this PR was one dimension short.</para>
+    /// <para>This is a single fact with an interior sweep rather than 36,000 theory rows, and it collects
+    /// every counterexample before failing so the report shows the shape of a violating band instead of its
+    /// lowest corner.</para>
+    /// </summary>
+    [Fact]
+    public void ListingBudget_IsSpentBeforeAnythingIsElided_AcrossTheProductOfWidthAndNameLength()
+    {
+        var counterexamples = new List<string>();
+
+        for (int nameLength = 1; nameLength <= 90; nameLength++)
+        {
+            for (int width = 1; width <= 400; width++)
+            {
+                string[] names =
+                [
+                    .. Enumerable.Range(0, width).Select(i =>
+                        string.Create(CultureInfo.InvariantCulture, $"{i:D3}")
+                            .PadRight(nameLength, 'c')[..nameLength]),
+                ];
+
+                AttributeReference[] columns =
+                [
+                    .. names.Select((name, i) =>
+                        new AttributeReference(name, IntegerType.Instance, true, new ExprId(i + 1))),
+                ];
+
+                string message = AnalysisException.UnresolvedColumn("nosuch", columns).Message;
+                if (ElisionWasNecessary(message, names) is { } failure)
+                {
+                    counterexamples.Add(
+                        string.Create(CultureInfo.InvariantCulture, $"nameLength={nameLength} {failure}"));
+                }
+            }
+        }
+
+        Assert.True(
+            counterexamples.Count == 0,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"{counterexamples.Count} of 36000 cells elided with budget to spare; first 8:\n")
+                + string.Join("\n", counterexamples.Take(8)));
+    }
+
+    /// <summary>
+    /// The exact, constant-free oracle for "elision was necessary": if the message elided, then the listing
+    /// rendered <i>in full</i> must not have fit alongside this message's own prose.
+    /// <para>The predicate this replaces was <c>message.Length + oneMoreName &gt; MaxMessageLength</c>, which
+    /// is wrong twice. It compares against the length of the <i>elided</i> message — which carries an overflow
+    /// marker the full one would not — and it is off by one at the boundary, passing the 107×7 counterexample
+    /// at <c>1015 + 9 = 1024</c> because 1024 is not greater than 1024. Measuring the full listing against the
+    /// prose that must accompany it has neither problem.</para>
+    /// </summary>
+    /// <returns><see langword="null"/> when the message is within contract, else the failure description.</returns>
+    private static string? ElisionWasNecessary(string message, string[] names)
+    {
+        int open = message.IndexOf('[', StringComparison.Ordinal);
+        int close = message.LastIndexOf(']');
+        string listing = message[(open + 1)..close];
 
         if (!message.Contains('\u2026'))
         {
-            for (int i = 0; i < width; i++)
+            // Nothing elided: every name must be present verbatim, which is the other half of the contract.
+            foreach (string name in names)
             {
-                Assert.Contains(RealisticName(i), message, StringComparison.Ordinal);
+                if (!message.Contains(name, StringComparison.Ordinal))
+                {
+                    return string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"width={names.Length} reported no elision yet dropped '{name}'");
+                }
             }
 
-            return;
+            return null;
         }
 
-        // Elided: prove it was necessary. One more item at this corpus's own name length would not have fit
-        // under the whole-message cap, so no information was discarded while there was room to keep it.
-        int itemCost = RealisticName(0).Length + ", ".Length;
-        Assert.True(
-            message.Length + itemCost > AnalysisException.MaxMessageLength,
-            string.Create(
+        int proseLength = message.Length - listing.Length;
+        int fullListingLength = names.Sum(name => name.Length) + ((names.Length - 1) * ", ".Length);
+        return proseLength + fullListingLength > AnalysisException.MaxMessageLength
+            ? null
+            : string.Create(
                 CultureInfo.InvariantCulture,
-                $"width {width} elided at {message.Length} chars with room for another {itemCost}-char " +
-                $"name under the {AnalysisException.MaxMessageLength} cap; listing was {listing.Length}"));
+                $"width={names.Length}: elided at {message.Length} chars, but the full listing "
+                    + $"({fullListingLength}) plus this message's prose ({proseLength}) is "
+                    + $"{proseLength + fullListingLength}, which fits under "
+                    + $"{AnalysisException.MaxMessageLength}");
     }
 
     /// <summary>Every width from 1 to 60 — the band a two-point corpus cannot see.</summary>

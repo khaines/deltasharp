@@ -230,13 +230,17 @@ internal sealed class AnalysisException : Exception
     /// width from 14 upward at 771 — leaving a quarter of the budget permanently unspent while dropping names.
     /// Deriving the budget removes the constant, and with it the argument about the constant. These figures
     /// are not maintained by hand either: <c>ListingBudget_IsSpentBeforeAnythingIsElided</c> asserts the
-    /// property they illustrate, at every width in the band.
+    /// property they illustrate, over the whole <b>product</b> of listing width (1–400) and item length
+    /// (1–90) — 36,000 cells. It swept width alone at a single 35-character name until round 11, when a
+    /// defect living on the interaction of the two axes went undetected by exactly that shape of corpus: a
+    /// line through a plane cannot find it.
     /// </para>
     /// <para>
     /// The floor and ceiling on a single item survive, because they are not tuning: the ceiling stops one
     /// pathological name consuming the listing, and the floor keeps every name recognizable. Both are
     /// exercised by <c>ListingBudget_IsSpentBeforeAnythingIsElided</c>, which sweeps the boundary band
-    /// continuously rather than sampling either side of it.
+    /// continuously rather than sampling either side of it, and by the product sweep above — a ceiling is
+    /// only observable at item lengths that exceed it, so a corpus of uniformly short names cannot see one.
     /// </para>
     /// </remarks>
     /// <param name="compose">Builds the full message from a rendered listing.</param>
