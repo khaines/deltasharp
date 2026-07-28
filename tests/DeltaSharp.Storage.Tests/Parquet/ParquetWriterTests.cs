@@ -156,12 +156,18 @@ public sealed class ParquetWriterTests
         // property order within a field, and to anything additional, so they could never have caught
         // the call-site swap this assertion exists for.
         //
-        // The two assertions are deliberately not redundant:
-        //   * equality with SchemaJson.ToJson catches the footer being repointed at some OTHER
-        //     serializer while the shared one is untouched (the call-site swap);
-        //   * the golden catches drift INSIDE the shared serializer reaching the footer, which the
-        //     equality check cannot see because both sides would move together.
-        // Together they pin footer bytes == shared serializer == fixed wire shape, for this corpus.
+        // The two assertions are deliberately not redundant, but note the ORDER they execute in,
+        // because it decides which one you will actually see fail:
+        //   * the golden is asserted FIRST and fires for any divergence of the footer bytes from the
+        //     pinned wire shape — a call-site swap AND shared-serializer drift reaching the footer
+        //     both trip it. For those two failure modes it SHADOWS the equality below, which is
+        //     never reached. (Measured: a rogue at the call site reports Expected = the golden.)
+        //   * the equality is therefore not "the call-site swap check" — it is the only assertion
+        //     that can fail while the footer bytes still MATCH the golden, i.e. when SchemaJson has
+        //     drifted away from the pinned shape but the footer has not followed it. That is the log
+        //     side moving while the footer stays put, which the golden cannot see by construction.
+        // So: the golden pins footer bytes == fixed wire shape; the equality pins footer bytes ==
+        // shared serializer. Neither subsumes the other, and both hold only for this corpus.
         const string footerGolden =
             "{\"type\":\"struct\",\"fields\":[" +
             "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}," +
@@ -251,9 +257,10 @@ public sealed class ParquetWriterTests
             "\"flag\":true,\"ratio\":0.5}}," +
             "{\"name\":\"third\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}";
 
-        // Same dual oracle as the sibling test: the golden catches drift inside the shared serializer
-        // reaching the footer; the equality catches the footer being repointed at a different
-        // serializer while the shared one is untouched. Neither subsumes the other.
+        // Same dual oracle as the sibling test, same execution order: the golden is asserted first
+        // and shadows the equality for both a call-site swap and shared-serializer drift; the
+        // equality is the only assertion that can fail while the footer still matches the golden,
+        // i.e. when SchemaJson drifts and the footer does not follow. Neither subsumes the other.
         Assert.Equal(footerGolden, schemaJson);
         Assert.Equal(SchemaJson.ToJson(schema), schemaJson);
     }
