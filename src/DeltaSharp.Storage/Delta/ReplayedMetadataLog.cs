@@ -97,6 +97,28 @@ namespace DeltaSharp.Storage.Delta;
 /// mechanism is worth naming, because it is not carelessness: <b>a correction is written at the moment of
 /// greatest confidence, immediately after the insight, which is exactly when its own arithmetic is least
 /// examined</b>. Treat a freshly-written correction as the least-audited text in the file, not the most.</para>
+/// <para><b>The one worked set-wise comparison, shown as SETS because its totals were disputed twice.</b>
+/// A script implementing the rule above produced 13 non-boolean state writes; an independent hand audit
+/// produced 11. Neither total is evidence of anything; the membership is:</para>
+/// <list type="bullet">
+/// <item><description><b>Script but not hand (4):</b> <c>_sealed = true</c>, <c>metadata = None</c>,
+/// <c>_recorded[version] = …</c>, <c>chained = false</c>.</description></item>
+/// <item><description><b>Hand but not script (2):</b> the <c>ObservedCommit</c> witness ARGUMENT ORDER, which
+/// is not a write at all; and <c>cursor</c>'s SEED.</description></item>
+/// <item><description><b>Closing:</b> 13 − 4 + 2 = 11, which closes only once all six differences are
+/// named.</description></item>
+/// </list>
+/// <para>Three points about that, because two seats disagreed and a third split the difference. First, an
+/// earlier draft named only THREE differences, which netted to 11 rather than 13 — the objection that the
+/// arithmetic did not close was CORRECT. Second, that draft credited "the rule splits <c>cursor</c>'s seed
+/// from its advance" as a difference; it is not one, and it is backwards — the hand audit had both, and the
+/// script had only the advance. Third, the reason is a real blind spot rather than a slip: <c>cursor</c>'s
+/// seed is a DECLARATION with an initialiser, and the script matched only assignments. <b>The mechanical rule
+/// missed a site the hand audit caught.</b> Two later reviews affirmed the illustration after verifying that
+/// the seed and the advance are two distinct SITES — which is true, and is a different proposition from their
+/// being a DIFFERENCE between the two sets. That is the whole reason this is written as sets: agreement about
+/// a total, or about a neighbouring true statement, is not agreement about membership.</para>
+///
 /// <para>The rule does, however, explain the historical misses. Categories 3 and 4 are not <c>if</c>
 /// statements, so a guard-shaped enumeration cannot see them — and those sites are EXACTLY the fail-opens
 /// found by review rather than by this file's own audit: the chain-closure <c>ReferenceEquals</c> (write),
@@ -105,9 +127,12 @@ namespace DeltaSharp.Storage.Delta;
 /// will systematically miss validation logic that lives in an assignment.</para>
 ///
 /// <para><b>Result: every derived point was individually neutered against the full suite. All but three are
-/// killed; no point fails open at this HEAD. Of the three, only ONE is a true equivalent</b> — see the
-/// classification list, and note that two of the three were previously mis-labelled in the benign direction.
-/// Attribution is stated as
+/// killed, and every point whose neutering fails OPEN is caught by at least one test.</b> State that
+/// carefully: an earlier revision asserted "no point fails open at this HEAD" while the chain walk's latching
+/// write was still unpinned, so <b>the file's own headline safety claim was FALSE for three commits</b> and
+/// was corrected only after three separate seats each found it with a different probe. It is the same failure
+/// as every other in this list — a safety property asserted over a set, at the moment of greatest confidence,
+/// without executing the members. Attribution is stated as
 /// two SEPARATE properties, because asserting the stronger one over the whole file was wrong three times:</para>
 /// <list type="bullet">
 /// <item><description><b>Disjoint in identity — the four conjuncts of
@@ -145,19 +170,24 @@ namespace DeltaSharp.Storage.Delta;
 /// <b>Why four falsifications missed it: every one swept the INPUT space with the rest of the code intact.
 /// The dimension that distinguishes this guard is the CODE STATE of a neighbouring guard.</b> An equivalence
 /// claim must range over both, which is the same lesson as the prior-call dimension and the fixture
-/// dimension, in a third disguise.</description></item>
+/// dimension, in a third disguise. Two seats reached apparently opposite verdicts here and BOTH are right
+/// over the space each swept: composed against the other SURVIVORS it is behaviour-identical, because none of
+/// them touches the interval; composed against the KILLED upper bound it is observable. A survivor lattice is
+/// not a sufficient space for an equivalence claim — redundancy must also be tested against the guards the
+/// claim says it is redundant WITH, and those are usually not survivors.</description></item>
 /// <item><description><b>Equivalent as a CONSEQUENCE of the ordering fix (1).</b> <see cref="Seal"/>'s
 /// idempotent early return. Because the flag is now set only after the check PASSES, and <see cref="Record"/>
 /// refuses to mutate a sealed window, a repeated <see cref="Seal"/> re-runs a deterministic check over frozen
 /// state and reaches the same verdict — pass/pass or throw/throw. It is a memoisation, not a guard. It was
 /// NOT equivalent before that fix; see below.</description></item>
-/// <item><description><b>ARGUED equivalent by monotonicity (1) — the weakest claim in this file, flagged for
-/// attack.</b> The <c>break</c> after <c>chained = false</c>. Once the write has latched <c>false</c> nothing
-/// restores it, and the loop's only other effect is advancing <c>cursor</c>, which is consumed solely by a
-/// conjunction already false — so continuing the walk cannot change the verdict. This rests on an argument,
-/// not a swept space, which by this file's own rule makes it the survivor most likely to be wrong. Attack it
-/// first. Note the argument is only valid GIVEN the write beside it, which is separately
-/// load-bearing.</description></item>
+/// <item><description><b>Genuine equivalent (1).</b> The <c>break</c> after <c>chained = false</c>. Once the
+/// write has latched <c>false</c> nothing restores it, and the loop's only other effect is advancing
+/// <c>cursor</c>, which is consumed solely by a conjunction already false — so continuing the walk cannot
+/// change the verdict. Unlike the earlier ARGUED form of this claim, it is now backed by execution: council
+/// R7 composed it with the other two survivors and the result is behaviour-identical, so the three are
+/// equivalent singly AND jointly. Note the argument is valid only GIVEN the write beside it, which is
+/// separately load-bearing and separately pinned — the <c>break</c> was briefly mistaken for the load-bearing
+/// half of that pair, when the truth was the reverse.</description></item>
 /// </list>
 ///
 /// <para><b>The write beside that <c>break</c> is load-bearing, and getting there took three wrong
