@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Types;
@@ -144,9 +145,11 @@ public sealed class ParquetWriterTests
         // SCOPE — read this before relying on the sentence above. Outcome coverage is bounded by the
         // CORPUS, and THIS test's corpus is one schema: three atomic fields with EMPTY metadata. A
         // rogue that is byte-exact for that shape and diverges only elsewhere would pass here. The
-        // reachable part of that gap is closed by the two sibling tests below, which extend the
+        // reachable part of that gap is closed by the sibling tests below, which extend the
         // artifact layer over field metadata (including the #330 unquoted-integer column-mapping id
-        // contract) and over every scalar type the writer accepts. What remains uncovered at this
+        // contract), over every scalar type the writer accepts with the decimal parameter boundaries,
+        // and over field names requiring JSON escaping — plus a completeness guard that fires if the
+        // writer ever accepts a type this corpus does not pin. What remains uncovered at this
         // layer is only the part that is INHERENTLY unreachable: nested types cannot be written at
         // all today, because ParquetTypeMapping.CreateField rejects array/map/struct with
         // UnsupportedFeature (design §2.9), so no artifact test can pin them until that lands. They
@@ -265,96 +268,182 @@ public sealed class ParquetWriterTests
         Assert.Equal(SchemaJson.ToJson(schema), schemaJson);
     }
 
+    /// <summary>
+    /// The scalar artifact corpus: every atomic type <c>ParquetTypeMapping.CreateField</c> accepts,
+    /// plus the decimal parameter family at its boundaries. Shared by the pinning test and the
+    /// completeness guard, so the two cannot disagree about what "the corpus" is.
+    /// </summary>
+    private static readonly StructType ScalarCorpusSchema = new(new[]
+    {
+        new StructField("c_bool", DataTypes.BooleanType, nullable: false),
+        new StructField("c_byte", DataTypes.ByteType, nullable: true),
+        new StructField("c_short", DataTypes.ShortType, nullable: false),
+        new StructField("c_int", DataTypes.IntegerType, nullable: true),
+        new StructField("c_long", DataTypes.LongType, nullable: false),
+        new StructField("c_float", DataTypes.FloatType, nullable: true),
+        new StructField("c_double", DataTypes.DoubleType, nullable: false),
+        new StructField("c_string", DataTypes.StringType, nullable: true),
+        new StructField("c_binary", DataTypes.BinaryType, nullable: false),
+        new StructField("c_date", DataTypes.DateType, nullable: true),
+        new StructField("c_ts", DataTypes.TimestampType, nullable: false),
+        new StructField("c_ts_ntz", DataTypes.TimestampNtzType, nullable: true),
+        // decimal(p,s) is a parameterised FAMILY, and p/s are protocol-visible in schemaString, so
+        // pinning one member pins almost nothing. These are its boundaries: minimum precision,
+        // a mid-range value, zero scale, maximum supported precision (28 ==
+        // ParquetTypeMapping.MaxSupportedDecimalPrecision), and scale == precision.
+        new StructField("c_dec_min", DataTypes.CreateDecimalType(1, 0), nullable: true),
+        new StructField("c_dec_mid", DataTypes.CreateDecimalType(9, 2), nullable: false),
+        new StructField("c_dec_int", DataTypes.CreateDecimalType(10, 0), nullable: true),
+        new StructField("c_dec_max", DataTypes.CreateDecimalType(28, 7), nullable: false),
+        new StructField("c_dec_scale", DataTypes.CreateDecimalType(28, 28), nullable: true),
+    });
+
+    /// <summary>Footer bytes for <see cref="ScalarCorpusSchema"/>, read back out of a real file.</summary>
+    private const string ScalarFooterGolden =
+        "{\"type\":\"struct\",\"fields\":[" +
+        "{\"name\":\"c_bool\",\"type\":\"boolean\",\"nullable\":false,\"metadata\":{}}," +
+        "{\"name\":\"c_byte\",\"type\":\"byte\",\"nullable\":true,\"metadata\":{}}," +
+        "{\"name\":\"c_short\",\"type\":\"short\",\"nullable\":false,\"metadata\":{}}," +
+        "{\"name\":\"c_int\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}," +
+        "{\"name\":\"c_long\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}," +
+        "{\"name\":\"c_float\",\"type\":\"float\",\"nullable\":true,\"metadata\":{}}," +
+        "{\"name\":\"c_double\",\"type\":\"double\",\"nullable\":false,\"metadata\":{}}," +
+        "{\"name\":\"c_string\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}," +
+        "{\"name\":\"c_binary\",\"type\":\"binary\",\"nullable\":false,\"metadata\":{}}," +
+        "{\"name\":\"c_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}," +
+        "{\"name\":\"c_ts\",\"type\":\"timestamp\",\"nullable\":false,\"metadata\":{}}," +
+        "{\"name\":\"c_ts_ntz\",\"type\":\"timestamp_ntz\",\"nullable\":true,\"metadata\":{}}," +
+        "{\"name\":\"c_dec_min\",\"type\":\"decimal(1,0)\",\"nullable\":true,\"metadata\":{}}," +
+        "{\"name\":\"c_dec_mid\",\"type\":\"decimal(9,2)\",\"nullable\":false,\"metadata\":{}}," +
+        "{\"name\":\"c_dec_int\",\"type\":\"decimal(10,0)\",\"nullable\":true,\"metadata\":{}}," +
+        "{\"name\":\"c_dec_max\",\"type\":\"decimal(28,7)\",\"nullable\":false,\"metadata\":{}}," +
+        "{\"name\":\"c_dec_scale\",\"type\":\"decimal(28,28)\",\"nullable\":true,\"metadata\":{}}]}";
+
     [Fact]
     public async Task WrittenFooter_PinsEveryScalarTypeTheWriterAccepts()
     {
         // #679: ARTIFACT-layer coverage of TYPE BREADTH. The data-bearing test above reaches the
         // footer with three type names (long, decimal, string), so a rogue that spells any other type
-        // name differently in the footer than the log does — "int" for "integer", "timestampNtz" for
-        // "timestamp_ntz" — diverges undetected at this layer.
+        // name differently in the footer than the log does — "int" for "integer", or collapsing
+        // "timestamp_ntz" to "timestamp" — diverges undetected at that corpus. The NTZ collapse in
+        // particular is real cross-engine corruption, not a cosmetic difference: an NTZ column
+        // silently becomes UTC for every external reader.
         //
-        // This is every atomic type ParquetTypeMapping.CreateField accepts. Nested types are
-        // deliberately absent: CreateField throws UnsupportedFeature for array/map/struct (design
-        // §2.9), so they cannot be written at all and cannot be pinned here until that lands (#713).
-        // If nested write support arrives, extend this corpus rather than adding a new layer.
+        // Nested types are deliberately absent: CreateField throws UnsupportedFeature for
+        // array/map/struct (design §2.9), so they cannot be written at all and cannot be pinned here
+        // until that lands (#713). If nested write support arrives, extend this corpus.
+        string schemaJson = await WriteAndReadFooterSchemaAsync(ScalarCorpusSchema);
+
+        Assert.Equal(ScalarFooterGolden, schemaJson);
+        Assert.Equal(SchemaJson.ToJson(ScalarCorpusSchema), schemaJson);
+    }
+
+    [Fact]
+    public async Task WrittenFooter_PinsFieldNamesRequiringJsonEscaping()
+    {
+        // #679: ARTIFACT-layer coverage of NAME ENCODING — the dimension every other corpus here
+        // misses, because every other field name is a plain ASCII identifier.
+        //
+        // A rogue that interpolates names into JSON raw is byte-exact for ASCII identifiers and so
+        // passes every other assertion in this file, yet produces a footer that disagrees with the
+        // log for any name needing an escape — and for a quote-bearing name produces STRUCTURALLY
+        // INVALID JSON ("name":"q"z"), which is a protocol break, not a cosmetic one.
+        //
+        // The escaping is deliberately NOT uniform, and that is the point of pinning it rather than
+        // asserting a round-trip: the strict encoder emits " as \u0022 with UPPERCASE hex, but
+        // backslash as \\, tab as \t and newline as \n, and astral characters as a surrogate PAIR.
+        // No structural or round-trip check can see any of that. All of these names are accepted by
+        // the writer today — verified, not assumed.
         var schema = new StructType(new[]
         {
-            new StructField("c_bool", DataTypes.BooleanType, nullable: false),
-            new StructField("c_byte", DataTypes.ByteType, nullable: true),
-            new StructField("c_short", DataTypes.ShortType, nullable: false),
-            new StructField("c_int", DataTypes.IntegerType, nullable: true),
-            new StructField("c_long", DataTypes.LongType, nullable: false),
-            new StructField("c_float", DataTypes.FloatType, nullable: true),
-            new StructField("c_double", DataTypes.DoubleType, nullable: false),
-            new StructField("c_string", DataTypes.StringType, nullable: true),
-            new StructField("c_binary", DataTypes.BinaryType, nullable: false),
-            new StructField("c_date", DataTypes.DateType, nullable: true),
-            new StructField("c_ts", DataTypes.TimestampType, nullable: false),
-            new StructField("c_ts_ntz", DataTypes.TimestampNtzType, nullable: true),
-            // Precision 28 is ParquetTypeMapping.MaxSupportedDecimalPrecision, so the parameterised
-            // decimal(p,s) rendering is pinned at its supported boundary rather than a mid-range value.
-            new StructField("c_dec", DataTypes.CreateDecimalType(28, 7), nullable: true),
+            new StructField("café", DataTypes.LongType, nullable: false),
+            new StructField("中文", DataTypes.StringType, nullable: true),
+            new StructField("q\"z", DataTypes.LongType, nullable: true),
+            new StructField("a\\b", DataTypes.LongType, nullable: true),
+            new StructField("tab\there", DataTypes.LongType, nullable: true),
+            new StructField("nl\nhere", DataTypes.LongType, nullable: true),
+            new StructField("emoji\U0001F389", DataTypes.LongType, nullable: true),
+            new StructField("ctrl\u0001x", DataTypes.LongType, nullable: true),
         });
 
         string schemaJson = await WriteAndReadFooterSchemaAsync(schema);
 
         const string footerGolden =
             "{\"type\":\"struct\",\"fields\":[" +
-            "{\"name\":\"c_bool\",\"type\":\"boolean\",\"nullable\":false,\"metadata\":{}}," +
-            "{\"name\":\"c_byte\",\"type\":\"byte\",\"nullable\":true,\"metadata\":{}}," +
-            "{\"name\":\"c_short\",\"type\":\"short\",\"nullable\":false,\"metadata\":{}}," +
-            "{\"name\":\"c_int\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}," +
-            "{\"name\":\"c_long\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}," +
-            "{\"name\":\"c_float\",\"type\":\"float\",\"nullable\":true,\"metadata\":{}}," +
-            "{\"name\":\"c_double\",\"type\":\"double\",\"nullable\":false,\"metadata\":{}}," +
-            "{\"name\":\"c_string\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}," +
-            "{\"name\":\"c_binary\",\"type\":\"binary\",\"nullable\":false,\"metadata\":{}}," +
-            "{\"name\":\"c_date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}," +
-            "{\"name\":\"c_ts\",\"type\":\"timestamp\",\"nullable\":false,\"metadata\":{}}," +
-            "{\"name\":\"c_ts_ntz\",\"type\":\"timestamp_ntz\",\"nullable\":true,\"metadata\":{}}," +
-            "{\"name\":\"c_dec\",\"type\":\"decimal(28,7)\",\"nullable\":true,\"metadata\":{}}]}";
+            "{\"name\":\"caf\\u00E9\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}," +
+            "{\"name\":\"\\u4E2D\\u6587\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}," +
+            "{\"name\":\"q\\u0022z\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}," +
+            "{\"name\":\"a\\\\b\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}," +
+            "{\"name\":\"tab\\there\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}," +
+            "{\"name\":\"nl\\nhere\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}," +
+            "{\"name\":\"emoji\\uD83C\\uDF89\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}," +
+            "{\"name\":\"ctrl\\u0001x\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}";
 
         Assert.Equal(footerGolden, schemaJson);
         Assert.Equal(SchemaJson.ToJson(schema), schemaJson);
+
+        // The footer must remain parseable JSON: a raw-interpolating rogue breaks this outright for
+        // the quote-bearing name, and this fails with a clearer message than a byte diff would.
+        Assert.Equal(schemaJson, SchemaJson.ToJson(SchemaJson.FromJson(schemaJson)));
     }
 
     [Fact]
     public async Task ScalarArtifactCorpus_CoversEveryTypeTheWriterAccepts()
     {
-        // #679: COMPLETENESS guard for the corpus of the test above. That test pins a fixed list of
-        // types, and a fixed list silently falls behind: this suite already shipped an artifact
-        // corpus of three types while the writer accepted thirteen, and nothing failed to say so.
+        // #679: COMPLETENESS guard for the corpus above. That corpus is a list, and a list silently
+        // falls behind: this suite already shipped an artifact corpus of three types while the writer
+        // accepted seventeen, with nothing failing to say so.
         //
-        // So rather than trusting the list, enumerate every DataType the engine exposes, ask the
-        // writer which ones it will actually accept, and require each accepted one to appear in the
-        // pinned corpus. Adding a new atomic type without extending the corpus now fails HERE, with a
-        // message naming the type, instead of quietly widening the unpinned surface.
+        // The guard therefore derives BOTH of its inputs instead of restating them:
+        //   * what the writer accepts — by attempting a real write of each candidate, not by reading
+        //     the switch in ParquetTypeMapping (the property we care about is acceptance, not the
+        //     shape of the code that decides it);
+        //   * what the corpus pins — by parsing the type names straight out of ScalarFooterGolden,
+        //     so removing a field from the corpus removes it from this set too and the guard fires.
+        //     A hand-maintained mirror of the golden could be edited in step with it, which would
+        //     let the corpus shrink silently — the exact failure this guard exists to prevent.
         //
-        // This guards COVERAGE, not bytes — the golden above is what pins the wire shape.
+        // This guards COVERAGE, not bytes — the golden is what pins the wire shape.
+        string[] pinnedTypeNames = Regex
+            .Matches(ScalarFooterGolden, "\"type\":\"(?<t>[^\"]+)\"")
+            .Select(m => m.Groups["t"].Value)
+            .Where(t => !string.Equals(t, "struct", StringComparison.Ordinal))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        // Non-vacuity: if the regex ever stops matching, every "missing" check below would pass
+        // trivially. Tie it to the corpus so a broken parse cannot look like success.
+        Assert.Equal(ScalarCorpusSchema.Count, pinnedTypeNames.Length);
+
         var candidates = new List<DataType>
         {
             DataTypes.BooleanType, DataTypes.ByteType, DataTypes.ShortType, DataTypes.IntegerType,
             DataTypes.LongType, DataTypes.FloatType, DataTypes.DoubleType, DataTypes.StringType,
             DataTypes.BinaryType, DataTypes.DateType, DataTypes.TimestampType, DataTypes.TimestampNtzType,
-            DataTypes.NullType, DataTypes.CreateDecimalType(28, 7),
+            DataTypes.NullType,
+            DataTypes.CreateDecimalType(1, 0), DataTypes.CreateDecimalType(9, 2),
+            DataTypes.CreateDecimalType(10, 0), DataTypes.CreateDecimalType(28, 7),
+            DataTypes.CreateDecimalType(28, 28),
             DataTypes.CreateArrayType(DataTypes.StringType),
             DataTypes.CreateMapType(DataTypes.StringType, DataTypes.LongType),
             DataTypes.CreateStructType(new[] { new StructField("x", DataTypes.LongType) }),
         };
 
-        // Cross-check the hand-written candidate list against reflection, so a newly added atomic type
-        // that nobody listed here cannot make this guard vacuously pass.
-        string[] declaredAtomics = typeof(DataType).Assembly.GetTypes()
-            .Where(t => !t.IsAbstract && typeof(AtomicType).IsAssignableFrom(t))
+        // Cross-check the candidate list against reflection over every CONCRETE DataType the engine
+        // declares — not just AtomicType subclasses. DecimalType, ArrayType, MapType and StructType
+        // all derive straight from DataType, so an AtomicType-scoped check would leave the entire
+        // parameterised decimal family outside its reach while appearing thorough.
+        string[] declaredTypes = typeof(DataType).Assembly.GetTypes()
+            .Where(t => !t.IsAbstract && typeof(DataType).IsAssignableFrom(t))
             .Select(t => t.Name)
             .OrderBy(n => n, StringComparer.Ordinal)
             .ToArray();
-        string[] coveredAtomics = candidates
-            .Where(t => t is AtomicType)
+        string[] coveredTypes = candidates
             .Select(t => t.GetType().Name)
+            .Distinct(StringComparer.Ordinal)
             .OrderBy(n => n, StringComparer.Ordinal)
             .ToArray();
-        Assert.Equal(declaredAtomics, coveredAtomics);
+        Assert.Equal(declaredTypes, coveredTypes);
 
         var accepted = new List<string>();
         var rejected = new List<string>();
@@ -381,7 +470,7 @@ public sealed class ParquetWriterTests
             rejected.OrderBy(n => n, StringComparer.Ordinal).ToArray());
 
         string[] missing = accepted
-            .Where(typeName => !PinnedScalarCorpusTypeNames.Contains(typeName))
+            .Where(typeName => !pinnedTypeNames.Contains(typeName, StringComparer.Ordinal))
             .OrderBy(n => n, StringComparer.Ordinal)
             .ToArray();
         Assert.True(
@@ -391,15 +480,29 @@ public sealed class ParquetWriterTests
             + string.Join(", ", missing));
     }
 
-    /// <summary>
-    /// The type names pinned by <c>WrittenFooter_PinsEveryScalarTypeTheWriterAccepts</c>. Kept beside
-    /// that golden; the completeness guard above fails if the writer outgrows this set.
-    /// </summary>
-    private static readonly HashSet<string> PinnedScalarCorpusTypeNames = new(StringComparer.Ordinal)
+    [Fact]
+    public async Task DecimalPrecisionBoundary_IsWhereTheWriterStopsAccepting()
     {
-        "boolean", "byte", "short", "integer", "long", "float", "double",
-        "string", "binary", "date", "timestamp", "timestamp_ntz", "decimal(28,7)",
-    };
+        // The decimal family is unbounded in principle, so the corpus pins its BOUNDARIES rather than
+        // its members. This asserts the boundary is where the corpus assumes it is: if a future change
+        // raises MaxSupportedDecimalPrecision, precision 29 starts writing, silently landing an
+        // unpinned type name in footers. That would pass the completeness guard above, because a type
+        // nobody probes is a type nobody notices.
+        var accepted = new StructType(new[]
+        {
+            new StructField("d", DataTypes.CreateDecimalType(ParquetTypeMappingMaxPrecision, 0), nullable: true),
+        });
+        Assert.Contains($"decimal({ParquetTypeMappingMaxPrecision},0)", await WriteAndReadFooterSchemaAsync(accepted));
+
+        var beyond = new StructType(new[]
+        {
+            new StructField("d", DataTypes.CreateDecimalType(ParquetTypeMappingMaxPrecision + 1, 0), nullable: true),
+        });
+        await Assert.ThrowsAsync<DeltaStorageException>(() => WriteAndReadFooterSchemaAsync(beyond));
+    }
+
+    /// <summary>Mirrors <c>ParquetTypeMapping.MaxSupportedDecimalPrecision</c>, pinned by the test above.</summary>
+    private const int ParquetTypeMappingMaxPrecision = 28;
 
     [Fact]
     public async Task WriteAsync_CancelledToken_ThrowsOnMultiRowGroupStringWrite()

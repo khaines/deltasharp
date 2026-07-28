@@ -32,13 +32,15 @@ namespace DeltaSharp.Storage.Tests;
 /// SCOPE, so this file is not mistaken for the whole net: every guard here keys on
 /// <b>provenance</b> — who is permitted to serialize — and provenance guards are evadable by
 /// choosing a different tool (a <c>StringBuilder</c> serializer wired into the footer call site
-/// passes all of them). The complementary check is the <b>artifact</b> assertion in
-/// <c>ParquetWriterTests.WrittenFile_CarriesDeltaSchemaMetadata</c>, which reads the schema string
-/// back out of a written Parquet footer, and so cannot be evaded by tool choice — but it is bounded
-/// by its corpus (one schema: atomic fields, empty metadata), so a rogue that diverges only on
-/// field metadata or on unexercised scalar types still passes it. See #713. Neither layer is a
+/// passes all of them). The complementary checks are the <b>artifact</b> assertions in
+/// <c>ParquetWriterTests</c>, which read the schema string back out of a written Parquet footer and
+/// so cannot be evaded by tool choice. Those now range over field metadata (including the
+/// column-mapping id contract), every atomic type the writer accepts with the decimal parameter
+/// boundaries, and field names requiring JSON escaping — and a completeness guard fails if the
+/// writer ever accepts a type the corpus does not pin. What they still cannot reach is nested
+/// types, which <c>ParquetTypeMapping</c> refuses to write at all (#713). Neither layer is a
 /// complete net on its own; this file fails earlier and explains itself better, the artifact
-/// assertion is provenance-independent, and both are bounded.
+/// assertions are provenance-independent, and both are bounded.
 /// </para>
 /// </remarks>
 public sealed class DeltaSchemaJsonSingleSourceTests
@@ -164,14 +166,14 @@ public sealed class DeltaSchemaJsonSingleSourceTests
         // this file stays green. This whole family of guards keys on PROVENANCE -- who serializes --
         // which an author can always evade by choosing a different tool.
         //
-        // The complementary check is therefore the ARTIFACT assertion in
-        // ParquetWriterTests.WrittenFile_CarriesDeltaSchemaMetadata, which reads the schema string
-        // back out of a written Parquet footer and pins its bytes. That asks about OUTCOME, not
-        // provenance, so it cannot be dodged by CHOICE OF TOOL -- but it is bounded by its corpus
-        // (one schema: atomic fields, empty metadata), so a rogue diverging only on field metadata
-        // or on unexercised scalar types still passes it. See #713. These reflection guards are
-        // defense-in-depth: they fail earlier and with a far more actionable message. Neither layer
-        // is complete alone.
+        // The complementary checks are therefore the ARTIFACT assertions in ParquetWriterTests, which
+        // read the schema string back out of a written Parquet footer and pin its bytes. Those ask
+        // about OUTCOME, not provenance, so they cannot be dodged by CHOICE OF TOOL -- and their
+        // corpus now covers field metadata, every atomic type the writer accepts (decimal boundaries
+        // included) and field names requiring JSON escaping, with a completeness guard that fires if
+        // the writer outgrows the corpus. What remains out of their reach is nested types, which the
+        // writer refuses outright (#713). These reflection guards are defense-in-depth: they fail
+        // earlier and with a far more actionable message. Neither layer is complete alone.
         //
         // The scan reaches method BODIES, not just signatures: a serializer can construct its own
         // Utf8JsonWriter as a local and never name it in any signature (DeltaSchemaJson itself did
