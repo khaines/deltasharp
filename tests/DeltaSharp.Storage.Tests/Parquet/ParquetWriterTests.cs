@@ -126,6 +126,36 @@ public sealed class ParquetWriterTests
 
         Assert.True(reader.CustomMetadata.ContainsKey(DeltaSchemaJson.SchemaMetadataKey));
         string schemaJson = reader.CustomMetadata[DeltaSchemaJson.SchemaMetadataKey];
+
+        // #679: this is the ARTIFACT assertion, and it is the one that actually matters.
+        //
+        // Every other guard in this area — the reflection single-source guards, the DeltaSchemaJson
+        // goldens — answers "who is allowed to serialize?". That is a question about PROVENANCE, and
+        // an author can always evade it by picking a different tool: a Storage-local StringBuilder
+        // serializer wired into ParquetFileWriter's call site produces a genuine footer/log
+        // divergence while every provenance guard stays green, because they key on Utf8JsonWriter and
+        // a StringBuilder is not one. Writing JSON does not require Utf8JsonWriter.
+        //
+        // These two assertions instead ask "are the bytes right?" — a question about OUTCOME, which no
+        // rogue serializer can dodge, because the bytes read back here are the ones that ship inside
+        // the Parquet footer. The three Assert.Contains calls below are substring checks: they are
+        // blind to field ORDER, to property order within a field, and to anything additional, so they
+        // could never have caught this.
+        //
+        // The two assertions are deliberately not redundant:
+        //   * equality with SchemaJson.ToJson catches the footer being repointed at some OTHER
+        //     serializer while the shared one is untouched (the call-site swap);
+        //   * the golden catches drift INSIDE the shared serializer reaching the footer, which the
+        //     equality check cannot see because both sides would move together.
+        // Together they pin footer bytes == shared serializer == fixed wire shape, end to end.
+        const string footerGolden =
+            "{\"type\":\"struct\",\"fields\":[" +
+            "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}," +
+            "{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}}," +
+            "{\"name\":\"label\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}";
+        Assert.Equal(footerGolden, schemaJson);
+        Assert.Equal(SchemaJson.ToJson(Schema), schemaJson);
+
         Assert.Contains("\"type\":\"struct\"", schemaJson);
         Assert.Contains("\"name\":\"id\"", schemaJson);
         Assert.Contains("\"name\":\"amount\"", schemaJson);

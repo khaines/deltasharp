@@ -28,6 +28,15 @@ namespace DeltaSharp.Storage.Tests;
 /// assertion below is therefore paired with a golden literal captured from the PRE-consolidation
 /// serializer at commit a6ff45f. Never add a footer↔log assertion as a test's only assertion.
 /// </para>
+/// <para>
+/// SCOPE, so this file is not mistaken for the whole net: every guard here keys on
+/// <b>provenance</b> — who is permitted to serialize — and provenance guards are evadable by
+/// choosing a different tool (a <c>StringBuilder</c> serializer wired into the footer call site
+/// passes all of them). The assertion that actually pins the shipped bytes is the <b>artifact</b>
+/// assertion in <c>ParquetWriterTests.WrittenFile_CarriesDeltaSchemaMetadata</c>, which reads the
+/// schema string back out of a written Parquet footer. Treat this file as defense-in-depth: it
+/// fails earlier and explains itself better, but it is not the last line.
+/// </para>
 /// </remarks>
 public sealed class DeltaSchemaJsonSingleSourceTests
 {
@@ -138,12 +147,26 @@ public sealed class DeltaSchemaJsonSingleSourceTests
         // shape as it is found is an unwinnable sequence.
         //
         // So this guard changes the KEY. It does not ask what a parameter means; it asks who is
-        // allowed to write JSON at all. A re-inlined schema serializer must emit JSON, so it must
-        // touch Utf8JsonWriter, so it trips here no matter how it spells its schema argument --
-        // generic, object, dynamic, or a Storage-local DTO. That converts "guess the shape" into
-        // "edit a three-line list on purpose", which is exactly the deliberate act a tripwire
-        // should require. The narrower signature guard above is KEPT: two guards, different keys,
-        // and the narrower one gives the more specific diagnosis when it is the one that fires.
+        // allowed to write JSON at all. Within the JSON writer we actually use, a re-inlined schema
+        // serializer trips here no matter how it spells its schema argument -- generic, object,
+        // dynamic, or a Storage-local DTO. That converts "guess the shape" into "edit a three-line
+        // list on purpose", which is exactly the deliberate act a tripwire should require. The
+        // narrower signature guard above is KEPT: two guards, different keys, and the narrower one
+        // gives the more specific diagnosis when it is the one that fires.
+        //
+        // KNOWN LIMIT, and it is a real one. An earlier revision of this comment claimed a schema
+        // serializer "must emit JSON, so it must touch Utf8JsonWriter". That is FALSE: emitting JSON
+        // needs no particular API. A Storage-local StringBuilder serializer wired into
+        // ParquetFileWriter's call site produces a genuine footer/log divergence and every guard in
+        // this file stays green. This whole family of guards keys on PROVENANCE -- who serializes --
+        // which an author can always evade by choosing a different tool.
+        //
+        // The actual net is therefore the ARTIFACT assertion in
+        // ParquetWriterTests.WrittenFile_CarriesDeltaSchemaMetadata, which reads the schema string
+        // back out of a written Parquet footer and pins its bytes. That asks about OUTCOME, not
+        // provenance, so no rogue serializer can dodge it. These reflection guards are
+        // defense-in-depth: they fail earlier and with a far more actionable message, but they are
+        // not the thing standing between us and a divergent footer.
         //
         // The scan reaches method BODIES, not just signatures: a serializer can construct its own
         // Utf8JsonWriter as a local and never name it in any signature (DeltaSchemaJson itself did
@@ -212,9 +235,12 @@ public sealed class DeltaSchemaJsonSingleSourceTests
             }
         }
 
-        // Compiler-generated nested types (async state machines, closures) inherit their outer
-        // type's entry, so an allowlisted type may freely grow an async JSON-writing member without
-        // this test demanding a new, unreadable `Foo+<Bar>d__7` entry.
+        // Nested types resolve to their outermost declaring type. The motivating case is
+        // compiler-generated (async state machines, closures), so an allowlisted type may grow an
+        // async JSON-writing member without demanding an unreadable `Foo+<Bar>d__7` entry — but note
+        // this collapses HAND-WRITTEN nested types too, so a nested helper inherits its outer type's
+        // allowlist entry rather than needing its own. That is the intended trade: entries name types
+        // an engineer would recognise, and the outer type is still named on failure.
         static Type Outermost(Type t)
         {
             Type outer = t;

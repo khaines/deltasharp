@@ -69,10 +69,12 @@
          Abstractions PublicAPI baseline is unchanged. -->
     <InternalsVisibleTo Include="DeltaSharp.Storage" />
     <InternalsVisibleTo Include="DeltaSharp.Engine.Tests" />
-    <!-- #330 round-1 council fix: the Storage-side DeltaSchemaJson metadata parity test asserts
-         SchemaJson.ToJson (this assembly, internal) and DeltaSchemaJson.ToJson emit byte-identical
-         metadata, so it must observe the internal SchemaJson serializer directly. The seam stays
-         internal — the Abstractions PublicAPI baseline is unchanged. -->
+    <!-- #330 round-1 council fix, rescoped by #679: the Storage-side tests observe the internal
+         SchemaJson serializer directly. Originally that was for a single metadata byte-parity test;
+         since #679 removed Storage's duplicate serializer, SchemaJson is also the expected value for
+         the footer wire-shape goldens and for the Parquet footer ARTIFACT assertion in
+         ParquetWriterTests, which pins the schema string actually stamped into a written file. The
+         seam stays internal — the Abstractions PublicAPI baseline is unchanged. -->
     <InternalsVisibleTo Include="DeltaSharp.Storage.Tests" />
   </ItemGroup>
 
