@@ -187,9 +187,13 @@ public sealed class SharedDiagnosticTextContractTests
     /// reserve and is safe, but the contract is the API — this primitive lives in Abstractions expressly so
     /// that Core, Storage and Engine can share it, and the next caller reads the summary, not the loop.</para>
     /// <para>Written as a test rather than left as the corrected sentence, because a sentence cannot fail.
-    /// Figures in this change have been wrong in prose ten times and in an assertion never once. If the
-    /// exemption ever widens beyond the marker, this fails instead of the documentation quietly going
-    /// stale.</para>
+    /// This paragraph used to say that no figure in this change had ever been wrong inside an assertion,
+    /// which was false when it was written and false by the author's own retraction two rounds earlier: a
+    /// margin computed and printed by an assertion was wrong because the assertion measured a hand-picked
+    /// corpus. An assertion is only as honest as the population it measures, and a tally of how often the
+    /// change has erred is itself the kind of claim it keeps getting wrong, so neither is restated. What
+    /// survives is the reason for the form: if the exemption ever widens beyond the marker, this fails,
+    /// instead of documentation quietly going stale.</para>
     /// <para><b>Pinned in both directions, which the first version was not.</b> As seven parametrized rows
     /// each returning early when the result fitted, it was green under the mutation that deletes the
     /// exemption altogether — a terminal path returning the empty string satisfies "never exceeds its

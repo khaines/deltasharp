@@ -383,7 +383,9 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// to make the same claim wrongly — it read "every field name the file generated was shorter than it"
     /// while the file two commits earlier was already generating names of ten thousand and five thousand
     /// characters. It sat four lines above a sentence warning that every such attempt had been wrong.</para>
-    /// <para><b>The shape, and how to find it.</b> All seven instances are the same sentence:
+    /// <para><b>The shape, and how to find it.</b> Every instance found in this change has been the same
+    /// sentence — a running count of them stood here and disagreed with the count in a sibling file in the
+    /// same commit range, which is what a self-referential tally does:
     /// <i>a universal quantifier over this file's own generators, measured against a threshold, where the
     /// conclusion holds and the reason is false.</i> Five wording-derived sweeps missed this one — digits,
     /// spelled numerals, tag-embedded numerals, hyphenated and ordinal forms, and a paraphrase pass — because

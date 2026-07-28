@@ -247,9 +247,10 @@ public sealed class AnalysisExceptionCandidateListingTests
     /// DIFFERENTLY across the swept lengths; at a width where every swept length is already truncated the
     /// row sits wholly in the saturated region and the mutant survives it. A comment claimed the shortest
     /// swept lengths were under the allowance "at these widths" — a universal quantifier over the fixture's
-    /// own values, measured against a threshold. It is the eighth sentence of that exact shape in this
-    /// change to be false, and like the other seven its conclusion held: the sweep does straddle, at some of
-    /// its widths and not all of them.</para>
+    /// own values, measured against a threshold — a shape this change has found repeatedly, always with a
+    /// sound conclusion and a false reason. Here too: the sweep does straddle, at some of its widths and not
+    /// all of them. The running tally that used to sit here is gone; it disagreed with the tally in the
+    /// sibling suite in the same commit range, which is what a self-referential count does.</para>
     /// <para>So the claim is made here, where it can fail. This fact reports the straddling cells by name;
     /// if a future edit lengthens the corpus or narrows the clamp until none straddle, the theory above
     /// becomes vacuous and this fails first, saying so.</para>
@@ -679,10 +680,16 @@ public sealed class AnalysisExceptionCandidateListingTests
                 // some use "could be: a, b", some an argument list in parentheses, some dotted parts — so
                 // this half of the property runs on a subset of the rows. Found by writing the adequacy
                 // assertion below INSIDE this branch, where it went RED on the rows that never enter it;
-                // the prose version of the same claim would have shipped. For the rows it does not reach,
-                // the count is pinned per factory by AssertCountIsAccurate and by
-                // NoFreeProseToken_CanCrowdOutAListingsOverflowCount, and the headroom half above still
-                // runs on every row.
+                // the prose version of the same claim would have shipped.
+                //
+                // What used to stand here was a CITATION discharging those rows — two tests named as
+                // covering them — and it was wrong, because it was written without mapping either test's
+                // call sites: one is reached only by candidate-listing factories, the other gates its
+                // accounting half on a string[] payload a type list never satisfies. InvalidFunctionArgument
+                // was left with invariant 1 (a count is present) pinned and invariant 2 (the count is
+                // correct) pinned by nothing, while its message legitimately reports several hundred hidden
+                // types. A citation is a claim about a population, and this change has learned to distrust
+                // those; the factory is now pinned directly, so nothing here needs to name anything.
                 int open = message.IndexOf('[', StringComparison.Ordinal);
                 int close = message.LastIndexOf(']');
                 if (OverflowCounts(message).Length > 0)
@@ -724,6 +731,35 @@ public sealed class AnalysisExceptionCandidateListingTests
         AssertCountIsAccurate(ex.Message, 75);
         Assert.True(ex.Message.Length < AnalysisException.MaxMessageLength);
         Assert.Equal(75, ex.Candidates.Count);
+    }
+
+    /// <summary>
+    /// #687 council round 23 (Balanced BLOCKING) — the third list-composing factory's count, which nothing
+    /// pinned.
+    /// <para>The suite pinned invariant 1 (a count is PRESENT) for every factory and invariant 2 (the count
+    /// is CORRECT) only for the two that render a bracketed candidate listing, plus
+    /// <c>TableOrViewNotFound</c> by a different route. An off-by-one in the marker was 9 rows RED and none
+    /// of them was this factory: its list is types, not candidates, so no count-checking assertion in the
+    /// file could see it, while its message legitimately reaches a count of several hundred.</para>
+    /// <para>How it went unnoticed is the part worth keeping: a comment discharged those rows by CITING two
+    /// tests, and the citation was written without mapping either one's call sites. Both cited tests turn
+    /// out to be scoped — one by its callers' factories, the other by an <c>OfType&lt;string[]&gt;</c> gate
+    /// that a type list never satisfies. A citation is a claim about a population, and this change has
+    /// learned to distrust exactly that; it is now checkable, because the factory is pinned directly.</para>
+    /// </summary>
+    [Fact]
+    public void InvalidFunctionArgument_BoundsItsTypeList_WithAnAccurateCount()
+    {
+        const int Arity = 400;
+        string message = AnalysisException.InvalidFunctionArgument("f", Types(Arity), "an integer").Message;
+
+        // Adequacy: a count that never appears cannot be wrong, so require the factory to have reached the
+        // eliding region before asking whether what it reported is accurate.
+        Assert.NotEmpty(OverflowCounts(message));
+
+        // "int" as a whole word: the trailing prose says "an integer", which must not be counted as a type.
+        AssertCountIsAccurate(message, Arity, itemPattern: @"\bint\b");
+        Assert.True(message.Length <= AnalysisException.MaxMessageLength);
     }
 
     /// <summary>
