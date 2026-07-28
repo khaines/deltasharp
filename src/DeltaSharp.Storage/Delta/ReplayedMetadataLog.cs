@@ -97,6 +97,15 @@ namespace DeltaSharp.Storage.Delta;
 /// mechanism is worth naming, because it is not carelessness: <b>a correction is written at the moment of
 /// greatest confidence, immediately after the insight, which is exactly when its own arithmetic is least
 /// examined</b>. Treat a freshly-written correction as the least-audited text in the file, not the most.</para>
+/// <para><b>And when you retract a claim, search for its CONTENT, not its location.</b> The equivalence
+/// retraction above was applied to this type doc and NOT to the inline comment at the guard itself, 290 lines
+/// away, which went on asserting the retracted sentence — and asserting it in the place a maintainer standing
+/// at that guard actually reads, where "NOT load-bearing" is a standing invitation to delete a fail-closed
+/// layer. The correction was right and INCOMPLETE, and the second site was found by a reviewer rather than by
+/// the corrector; that has now happened three times across this change's siblings, always in that same shape.
+/// So the discipline is mechanical: grep the assertion's WORDING across <c>src/</c> and <c>tests/</c> —
+/// "load-bearing", "no test can kill", "equivalent", "dead code", "redundant" — and fix every site in the
+/// same commit as the retraction.</para>
 /// <para><b>The one worked set-wise comparison, shown as SETS because its totals were disputed twice.</b>
 /// A script implementing the rule above produced 13 non-boolean state writes; an independent hand audit
 /// produced 11. Neither total is evidence of anything; the membership is:</para>
@@ -113,8 +122,14 @@ namespace DeltaSharp.Storage.Delta;
 /// arithmetic did not close was CORRECT. Second, that draft credited "the rule splits <c>cursor</c>'s seed
 /// from its advance" as a difference; it is not one, and it is backwards — the hand audit had both, and the
 /// script had only the advance. Third, the reason is a real blind spot rather than a slip: <c>cursor</c>'s
-/// seed is a DECLARATION with an initialiser, and the script matched only assignments. <b>The mechanical rule
-/// missed a site the hand audit caught.</b> Two later reviews affirmed the illustration after verifying that
+/// seed is a DECLARATION with an initialiser, which the script's write-detector did not recognise. Note the
+/// cause is NOT simply "it matched only assignments" — it also matched collection-mutating calls, and
+/// <c>_recordedVersions.Add</c> must be inside its 13 for the arithmetic above to close. A write-detector
+/// needs at least four shapes an assignment-matcher misses: declarations with initialisers, expression-bodied
+/// member writes, collection-mutating calls, and <c>??=</c> in expression position. All four were probed and
+/// all were killed, so the hole cost no coverage — but the cause has to be stated correctly, because the
+/// accounting depends on which shapes the script actually saw. <b>The mechanical rule missed a site the hand
+/// audit caught.</b> Two later reviews affirmed the illustration after verifying that
 /// the seed and the advance are two distinct SITES — which is true, and is a different proposition from their
 /// being a DIFFERENCE between the two sets. That is the whole reason this is written as sets: agreement about
 /// a total, or about a neighbouring true statement, is not agreement about membership.</para>
@@ -449,10 +464,20 @@ internal sealed class ReplayedMetadataLog
 
         if (!HasCoverage || version < CoveredFromInclusive || version >= CoveredToExclusive)
         {
-            // `!HasCoverage` is redundant, deliberately: with no coverage the interval is [0, 0), so the two
-            // bounds already reject every version. Kept for readability; it is NOT load-bearing, which is why
-            // no test can kill a mutant of it. Falsified against {MIN,-1,0,1,99,100,MAX} x four observer
-            // states, plus the proof that CoveredToExclusive != 0 implies HasCoverage (council R2).
+            // DO NOT DELETE `!HasCoverage`. It is a fail-closed defence-in-depth layer, NOT dead code.
+            // It looks redundant — with no coverage the interval is [0, 0), so the two bounds beside it
+            // already reject every version — and no SINGLE-POINT mutant of it can be killed. An earlier
+            // version of this comment concluded from that it was "NOT load-bearing, which is why no test can
+            // kill a mutant of it". That was FALSE and is retracted: tests DO kill it, once the guard it is
+            // redundant WITH is also broken. Measured (council R8/R9): remove the upper bound alone -> 3 red;
+            // remove the upper bound AND this disjunct -> 6, the extra three being an empty observer and two
+            // surviving-sub-floor CDF cases. Against the LOWER bound it is genuinely unobservable (4 red
+            // either way, identical sets).
+            //
+            // The earlier claim's falsification space was inputs only ({MIN,-1,0,1,99,100,MAX} x four
+            // observer states). That is the insufficiency this type's doc now forbids: an equivalence claim
+            // must also range over the CODE STATE of the guards it claims redundancy with. See the mutation
+            // audit on the type for the full rule.
             return false; // Outside the proven interval — the caller MUST read the commit itself.
         }
 
