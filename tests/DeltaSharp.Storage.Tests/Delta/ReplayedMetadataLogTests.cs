@@ -177,6 +177,35 @@ public sealed class ReplayedMetadataLogTests
     }
 
     [Fact]
+    public void AnOmittedRevisionWhoseSuccessorRestoresAnEarlierLink_IsCaughtOnlyByTheChainedFalseWrite()
+    {
+        // Council R6, architect seat — a SECOND, structurally different input that unmasks the same write.
+        // Here the window is three versions with a silent one in the middle, and the omission at version 12 is
+        // followed by a witness whose applied result RESTORES version 10's `PrevailingAfter`. That restoration
+        // is what leaves `cursor` equal to the window end at the break point, so the chain-CLOSURE conjunct is
+        // satisfied and only the latched `false` rejects the window.
+        //
+        // Two distinct probes now unmask the write (this one and the two-version shape above). That matters
+        // more than either test alone: it is what turns "masked on the fixture I had" into "not maskable", and
+        // it is the evidence the earlier half-of-a-pair classification lacked.
+        var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
+        MetadataAction seed = Meta("seed");
+        MetadataAction restored = Meta("restored");
+        MetadataAction omitted = Meta("omitted");
+        MetadataAction successor = Meta("successor");
+        log.Record(10, new[] { restored }, seed, restored);
+        log.Record(11, None, restored, restored);              // silent, unmoved — records nothing
+        log.Record(12, new[] { successor }, omitted, restored); // arrives from a link the walk never saw
+
+        DeltaProtocolException error =
+            Assert.Throws<DeltaProtocolException>(() => Sealed(log).TryGetProvenObservation(10, out _));
+
+        Assert.Contains("10", error.Message, StringComparison.Ordinal);
+        Assert.Contains("12", error.Message, StringComparison.Ordinal);
+        AssertPathFree(error.Message);
+    }
+
+    [Fact]
     public void AnOmittedRevisionWhoseBreakPointLandsOnTheWindowEnd_IsCaughtOnlyByTheChainedFalseWrite()
     {
         // Council R5, quality seat. The `chained = false` write in the chain walk is load-bearing ON ITS OWN,

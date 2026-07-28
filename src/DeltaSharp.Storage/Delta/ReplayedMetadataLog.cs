@@ -71,9 +71,12 @@ namespace DeltaSharp.Storage.Delta;
 /// condition, and</description></item>
 /// <item><description>each <c>return</c>, <c>continue</c> and <c>break</c>, and</description></item>
 /// <item><description>each STATE WRITE WHOSE VALUE PARTICIPATES IN A VALIDATION DECISION — NOT merely the
-/// boolean-valued ones. The narrower boolean phrasing was this rule's own first defect (council R3, balanced
-/// seat): it is narrower than the audit actually performed, and it would mislead the next person extending
-/// it. The interval bounds, the lineage endpoints, the witness order, <c>cursor</c>'s seed and advance, and
+/// boolean-valued ones, and INCLUDING declarations with initialisers, which are writes and were the rule's
+/// second demonstrated blind spot: a script implementing it matched only assignments and so missed
+/// <c>cursor</c>'s seed entirely, while a hand audit caught it. The narrower boolean phrasing was this
+/// rule's own FIRST defect (council R3, balanced seat): it is narrower than the audit actually performed,
+/// and it would mislead the next person extending it. The interval bounds, the lineage endpoints, the
+/// witness order, <c>cursor</c>'s seed and advance, and
 /// the recorded-version list are all non-boolean and all load-bearing; each was audited separately and every
 /// one was killed, so the narrow rule concealed no gap at this HEAD — but it did understate its own scope,
 /// and</description></item>
@@ -102,7 +105,9 @@ namespace DeltaSharp.Storage.Delta;
 /// will systematically miss validation logic that lives in an assignment.</para>
 ///
 /// <para><b>Result: every derived point was individually neutered against the full suite. All but three are
-/// killed; no point fails open at this HEAD.</b> Attribution is stated as
+/// killed; no point fails open at this HEAD. Of the three, only ONE is a true equivalent</b> — see the
+/// classification list, and note that two of the three were previously mis-labelled in the benign direction.
+/// Attribution is stated as
 /// two SEPARATE properties, because asserting the stronger one over the whole file was wrong three times:</para>
 /// <list type="bullet">
 /// <item><description><b>Disjoint in identity — the four conjuncts of
@@ -123,22 +128,24 @@ namespace DeltaSharp.Storage.Delta;
 /// </list>
 ///
 /// <para><b>The survivors, classified — and the classification matters more than the count.</b> Two are
-/// genuinely equivalent, and both survive PAIRED treatment as well as single-point: council R5 swept the
+/// survivors, and PAIRED treatment refined rather than confirmed their labels: council R5 swept the
 /// complete survivor lattice — every single, pair and triple over the four then-surviving points — and
 /// <c>!HasCoverage</c> and <see cref="Seal"/>'s early return stayed 0-red in every combination excluding
 /// themselves. That sweep was measured BEFORE the chain walk's write was pinned, so it was re-checked at this
 /// HEAD rather than carried across trees: both are still 0-red here, and the write is now killed. Citing a
 /// measurement taken on a different tree is the same error as comparing totals over different sets.</para>
 /// <list type="number">
-/// <item><description><b>Execution-falsified equivalent (1).</b> The <c>!HasCoverage</c> disjunct in
-/// <see cref="TryGetProvenObservation"/>: with no coverage the interval is <c>[0, 0)</c>, so the bounds
-/// beside it already reject every version. FOUR independent falsification attempts, over
-/// <c>{long.MinValue, -1, 0, 1, 99, 100, long.MaxValue}</c> against four observer states, over
-/// <c>{MinValue, -1, 0, 1, MaxValue}</c> including the <c>version = -1</c> overflow edge, plus the proof that
-/// <c>CoveredToExclusive != 0</c> implies <see cref="HasCoverage"/>. None could distinguish it. Cross-checked
-/// for VACUITY from the other side: forcing the <c>HasCoverage</c> WRITE always-false turns 71 red, so the
-/// surrounding machinery is live and the disjunct's survival really is about the disjunct.</description>
-/// </item>
+/// <item><description><b>CONTINGENT redundancy, guarded by the upper bound — NOT equivalent (1).</b> The
+/// <c>!HasCoverage</c> disjunct in <see cref="TryGetProvenObservation"/>. It survives single-point (0 red)
+/// and was four times called provably equivalent, including by this doc. That was wrong in the benign
+/// direction. It is redundant only WHILE the bound beside it is intact: remove the upper bound alone and 3
+/// tests fail; remove the upper bound AND this disjunct and 6 do, the extra three being an empty observer and
+/// two surviving-sub-floor CDF cases. Against the LOWER bound it really is unobservable (4 red either way,
+/// identical sets). So it is a defence-in-depth layer that no single-point test can kill, not dead code.
+/// <b>Why four falsifications missed it: every one swept the INPUT space with the rest of the code intact.
+/// The dimension that distinguishes this guard is the CODE STATE of a neighbouring guard.</b> An equivalence
+/// claim must range over both, which is the same lesson as the prior-call dimension and the fixture
+/// dimension, in a third disguise.</description></item>
 /// <item><description><b>Equivalent as a CONSEQUENCE of the ordering fix (1).</b> <see cref="Seal"/>'s
 /// idempotent early return. Because the flag is now set only after the check PASSES, and <see cref="Record"/>
 /// refuses to mutate a sealed window, a repeated <see cref="Seal"/> re-runs a deterministic check over frozen
@@ -160,8 +167,12 @@ namespace DeltaSharp.Storage.Delta;
 /// doc called that write merely half of a mutually-masking pair, because on the probe then available the
 /// break left <c>cursor</c> stale and the chain-CLOSURE conjunct re-rejected. The distinguishing probe is one
 /// whose break point leaves <c>cursor</c> on EXACTLY the window end, where closure is satisfied and cannot
-/// re-reject. <b>"Masked on the probe I had" is not "maskable"</b>, and the masking-pair explanation is
-/// withdrawn for this site: the true cause was simply an unpinned guard.</para>
+/// re-reject. TWO structurally different probes now do this — a two-version window, and a three-version one
+/// whose successor RESTORES an earlier link's applied result — and the write alone fails open on both. The
+/// masking was therefore a property of the FIXTURE, not of the code: the older test happened to choose a
+/// value that left <c>cursor</c> stale. <b>"Masked on the fixture I had" is not "maskable"</b>, and the
+/// masking-pair explanation is withdrawn for this site: the true cause was simply an unpinned
+/// guard.</para>
 /// <para>That was the third classification on this type to resolve toward benign — <see cref="Seal"/>'s
 /// idempotence was twice called provably equivalent and was a latent fail-open; this <c>break</c> was called
 /// a genuine equivalent and was not the whole story; this write was called half a pair and is independently
