@@ -404,12 +404,17 @@ public sealed class AnalysisExceptionCandidateListingTests
     /// A flat per-item cap collapsed <c>customer_lifetime_value_usd_2023_q1</c> and <c>…_q2</c> — the two
     /// the user actually meant — into the identical string, in a message roughly a sixth of the backstop,
     /// so nothing needed bounding at all.
-    /// <para>The cross-HEAD claim is stated so it can be checked, since this test cannot compile at that
-    /// commit and "verified RED there" would be unfalsifiable. Building <c>2d686a7</c>'s DeltaSharp.Core
-    /// and invoking both factories through reflection renders all three names as the identical
-    /// <c>customer_lifetime_value_usd_2023…</c>, in messages of <b>162</b> characters here and <b>147</b>
-    /// for AmbiguousReference — not the 190 an earlier revision of this comment asserted, which was the
-    /// sixth unmeasured figure found in this PR and the only one found by its own author.</para>
+    /// <para>The corpus is built the way it is on purpose: one name lands <b>exactly</b> on the 32-character
+    /// cap and two fall past it. That is what separates "the cap collapsed everything" from "the cap
+    /// collapsed only what exceeded it", and the two factories behaved differently on it — the one that
+    /// truncated at the boundary lost only the two longer names, the one that truncated past it lost all
+    /// three. A corpus of three equal-length names could not have told those apart.</para>
+    /// <para>No character counts are quoted here, deliberately. This sentence has carried a wrong number
+    /// twice: first an invented one, then a real measurement of the <em>wrong corpus</em> — the right
+    /// factories driven with a different root column and different ExprIds, which is worse than a guess
+    /// because it looks rigorous. A cross-HEAD length is not checkable by anything in this suite, since the
+    /// suite cannot compile at that commit, so it is exactly the kind of claim that should be a test or
+    /// nothing. What this test asserts is the property itself, at a HEAD where it can fail.</para>
     /// <para>Names deliberately share a 32-character prefix, so this corpus can only pass if the bound is
     /// wide enough to reach the part that differs. A corpus whose items are all shorter than the bound
     /// cannot test the bound — that is exactly how the previous guard here passed while the defect

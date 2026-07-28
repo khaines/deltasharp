@@ -2,6 +2,7 @@ using System;
 using System.Globalization;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 using Xunit;
 using SharedDiagnosticText = DeltaSharp.Diagnostics.DiagnosticText;
 
@@ -174,4 +175,53 @@ public sealed class SharedDiagnosticTextContractTests
         }
     }
 
+
+    /// <summary>
+    /// #687 council round 16 (Security BLOCKING) — the documented exemption is the ONLY way the result may
+    /// exceed its budget, and it may exceed it only by the marker's own width.
+    /// </summary>
+    /// <remarks>
+    /// <para>The summary said "at most <c>budget</c> characters" and the remarks said room for the suffix
+    /// "is reserved before each item is committed". Neither survived round 14, which deleted the per-item
+    /// reserve in favour of a feasibility scan; and the terminal path returns the bare marker whatever the
+    /// budget, so a zero budget with 100,000 items yields 16 characters. One caller today pairs it with a
+    /// reserve and is safe, but the contract is the API — this primitive lives in Abstractions expressly so
+    /// that Core, Storage and Engine can share it, and the next caller reads the summary, not the loop.</para>
+    /// <para>Written as a test rather than left as the corrected sentence, because a sentence cannot fail.
+    /// Seven figures in this change have been wrong in prose; none of the asserted ones have. If the
+    /// exemption ever widens beyond the marker, this fails instead of the documentation quietly going
+    /// stale.</para>
+    /// </remarks>
+    [Theory]
+    [InlineData(0, 1)]
+    [InlineData(0, 100000)]
+    [InlineData(1, 7)]
+    [InlineData(5, 3)]
+    [InlineData(11, 40)]
+    [InlineData(24, 400)]
+    [InlineData(60, 12)]
+    public void TheMarkerExemption_IsTheOnlyWayTheResultMayExceedItsBudget(int budget, int count)
+    {
+        string[] items = [.. Enumerable.Range(0, count).Select(i =>
+            string.Create(CultureInfo.InvariantCulture, $"column_name_{i:D5}"))];
+
+        string rendered = SharedDiagnosticText.SanitizeToBudget(
+            items, static (item, allowance) => SharedDiagnosticText.Sanitize(item, allowance), budget, 8, 64);
+
+        if (rendered.Length <= budget)
+        {
+            return;
+        }
+
+        // Over budget is permitted in exactly one shape: the bare marker, nothing else, and no wider than
+        // the marker for the number it actually reports.
+        Match marker = Regex.Match(rendered, @"^\u2026 \(\+(\d+) more\)$");
+        Assert.True(
+            marker.Success,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"exceeded budget {budget} with something other than the bare marker: '{rendered}'"));
+        Assert.Equal(count, int.Parse(marker.Groups[1].Value, CultureInfo.InvariantCulture));
+        Assert.Equal(SharedDiagnosticText.OverflowMarkerLength(count), rendered.Length);
+    }
 }

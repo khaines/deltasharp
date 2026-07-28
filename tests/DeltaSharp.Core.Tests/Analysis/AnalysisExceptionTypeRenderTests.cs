@@ -191,11 +191,11 @@ public sealed class AnalysisExceptionTypeRenderTests
 
     /// <summary>
     /// Round 6's elevated finding, pinned with Balanced's exact corpus: three legitimate, distinct column
-    /// names that share a 32-character prefix. At <c>2d686a7</c> the per-item cap of 32 rendered all three
-    /// as the identical string <c>customer_lifetime_value_usd_2023…</c> — measured, by building that
-    /// commit's DeltaSharp.Core and invoking the factory through reflection, at 162 characters for this
-    /// site and 147 for AmbiguousReference. Both are roughly a sixth of the 1024 backstop, so nothing
-    /// needed bounding here at all.
+    /// names that share a 32-character prefix, in a message far short of the backstop — so nothing needed
+    /// bounding here at all, and a flat per-item cap collapsed distinct names anyway. No cross-HEAD
+    /// character counts are quoted: see the note on the sibling test in
+    /// <c>AnalysisExceptionCandidateListingTests</c> for why that sentence is now stated as a property
+    /// rather than as a measurement.
     /// </summary>
     [Fact]
     public void LegitimateNamesSharingALongPrefix_AreListedInFull()

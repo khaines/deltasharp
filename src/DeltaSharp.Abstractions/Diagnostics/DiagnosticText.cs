@@ -197,8 +197,10 @@ internal static class DiagnosticText
     }
 
     /// <summary>
-    /// Renders <paramref name="items"/> into <b>at most <paramref name="budget"/> characters</b>, showing as
-    /// many as fit in full and appending <c>… (+N more)</c> for the remainder.
+    /// Renders <paramref name="items"/> into <b>at most <paramref name="budget"/> characters, with one
+    /// stated exception</b>, showing as many as fit in full and appending <c>… (+N more)</c> for the
+    /// remainder. When not even one item fits, the bare <c>… (+N more)</c> is returned <b>whatever the
+    /// budget</b> — see the contract note in the remarks, which every caller must honour.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -214,8 +216,25 @@ internal static class DiagnosticText
     /// The per-item allowance is <c>budget / count</c> clamped to
     /// [<paramref name="minItemLength"/>, <paramref name="maxItemLength"/>]; items shorter than their
     /// allowance simply leave room for more items, so a listing of ordinary names fills the budget rather
-    /// than stopping at an arbitrary count. The result never exceeds <paramref name="budget"/>: room for the
-    /// overflow suffix is reserved before each item is committed, so the count can never be the thing cut.
+    /// than stopping at an arbitrary count.
+    /// </para>
+    /// <para>
+    /// <b>The contract, exactly.</b> The result is within <paramref name="budget"/> in every case except
+    /// one: if not even a single item plus its marker fits, the bare <c>… (+N more)</c> is returned and may
+    /// exceed the budget — by up to the marker's own width, which grows with the digit count of
+    /// <c>N</c>. That is deliberate. The alternative is truncating the marker, which destroys the count,
+    /// and the count is the one thing this whole family of bounds exists to protect: a listing that admits
+    /// how much it dropped is useful, a silently empty one is not.
+    /// </para>
+    /// <para>
+    /// <b>So the caller owes the marker its room.</b> A caller that subtracts nothing and trusts the budget
+    /// as a ceiling can be handed a longer string than it asked for. The one caller today
+    /// (<c>AnalysisException</c>) discharges this through its <c>TokenBudget</c>, which reserves exactly
+    /// <see cref="OverflowMarkerLength(int)"/> per listing before any budget is handed out. This is written
+    /// down because the primitive was hoisted into Abstractions precisely so Core, Storage and Engine could
+    /// share it: having a single caller is an accident of timing, not a property of the design, and the next
+    /// caller will read this summary rather than the loop. <c>TheMarkerExemption_IsTheOnlyWayThe…</c> test
+    /// in the shared contract suite pins the exemption's width so it cannot silently widen.
     /// </para>
     /// </remarks>
     /// <typeparam name="T">The item type, rendered by <paramref name="render"/>.</typeparam>
