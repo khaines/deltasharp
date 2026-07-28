@@ -629,18 +629,8 @@ public sealed class ParquetWriterTests
         // positions a schema JSON admits -- crossed with the depth bound, not from what the corpus
         // happens to contain. A cell the corpus never reaches is therefore a failure, not a silent
         // absence, which is precisely what the union-across-depths version could not express.
-        var requiredCells = new List<(string Position, int Depth)> { ("field name", 0) };
-        for (int depth = 0; depth <= RequiredMetadataDepth; depth++)
-        {
-            requiredCells.Add(("metadata key", depth));
-            requiredCells.Add(("metadata string value", depth));
-
-            // An array element is by construction inside its array, so it cannot occur at depth 0.
-            if (depth >= 1)
-            {
-                requiredCells.Add(("array element string", depth));
-            }
-        }
+        (string Position, int Depth)[] requiredCells =
+            RequiredStringCells(RequiredMetadataDepth).ToArray();
 
         foreach ((string position, int depth) in requiredCells)
         {
@@ -948,6 +938,391 @@ public sealed class ParquetWriterTests
     }
 
     /// <summary>
+    /// The arbitrary-string cells of the wire format: every (position, depth) pair the grammar
+    /// admits up to <paramref name="depthBound"/>. Shared by the corpus guard and the generator
+    /// audit so the two cannot drift apart -- the generator audit checked MARGINALS while the
+    /// corpus guard checked cells, which is how a depth-only rogue survived one and not the other.
+    /// <para>
+    /// Sharing a source is not automatically safe -- a shared loop bound is exactly how U+0000 hid
+    /// from the audit that was supposed to find it, because the prober and the thing it probed
+    /// agreed while both were short. The difference here is the direction of the sharing: this is
+    /// one DERIVATION consumed by two independent CHECKS, not a check validating itself against
+    /// its own input. If this method is wrong both guards fail together and loudly; if it were a
+    /// bound shared with a prober, both would pass together and silently.
+    /// </para>
+    /// </summary>
+    private static IEnumerable<(string Position, int Depth)> RequiredStringCells(int depthBound)
+    {
+        yield return ("field name", 0);
+        for (int depth = 0; depth <= depthBound; depth++)
+        {
+            yield return ("metadata key", depth);
+            yield return ("metadata string value", depth);
+
+            // An array element is by construction inside its array, so it cannot occur at depth 0.
+            if (depth >= 1)
+            {
+                yield return ("array element string", depth);
+            }
+        }
+    }
+
+    /// <summary>
+    /// String lengths the systematic sweep pins.
+    /// <para>
+    /// UNLIKE every other domain in this file, these values are <b>chosen, not derived</b>, and
+    /// that is stated rather than disguised. There is no external ground truth for magnitude: the
+    /// writer accepts any length and the serializer's behaviour does not change at any documented
+    /// boundary, so nothing can be probed for it. They bracket the buffer sizes real serializers
+    /// actually use -- <c>stackalloc</c> thresholds and pooled-buffer sizes -- because that is
+    /// where truncation lives. A reviewer should treat this array as the weakest derivation here.
+    /// </para>
+    /// </summary>
+    private static readonly int[] MagnitudeLengths = [1, 255, 256, 257, 1023, 1024, 4097];
+
+    /// <summary>
+    /// The codepoints the systematic sweep places in every position at every depth.
+    /// <para>
+    /// GROUND TRUTH IS EXTERNAL TO THIS TEST. Earlier versions kept one representative per escape
+    /// FORM, which is a lossy projection: <c>SchemaJson</c> escapes every non-ASCII character
+    /// identically, so U+2028 LINE SEPARATOR and U+00E9 share a form and only one survived --
+    /// while a rogue using a laxer encoder emits U+2028 raw and breaks JSON parsers that treat it
+    /// as a line terminator. Keying on the serializer's own output cannot distinguish them,
+    /// because the serializer treats them the same.
+    /// </para>
+    /// <para>
+    /// So the set is derived from the <b>Unicode character database</b> instead: complete over the
+    /// first 256 codepoints, then sampled per <see cref="System.Globalization.UnicodeCategory"/>
+    /// across the BMP and the astral planes. U+2028 and U+2029 appear here because they are the
+    /// sole members of <c>LineSeparator</c> and <c>ParagraphSeparator</c> -- derived, not
+    /// remembered. Adding a category to Unicode adds cells here without anyone editing this file.
+    /// </para>
+    /// <para>Lone surrogates are excluded: they are #710, a known-open defect these tests are not about.</para>
+    /// </summary>
+    private static IReadOnlyList<string> HazardCodepoints => _hazardCodepoints ??= BuildHazardCodepoints();
+
+    private static IReadOnlyList<string>? _hazardCodepoints;
+
+    private const int HazardSamplesPerCategory = 2;
+
+    private static IReadOnlyList<string> BuildHazardCodepoints()
+    {
+        var result = new List<string>();
+        var perCategory = new Dictionary<System.Globalization.UnicodeCategory, int>();
+
+        // Complete over the first 256 codepoints: NUL, the C0 controls, the ASCII specials, C1 and
+        // Latin-1. No sampling, no bound to be wrong.
+        for (int c = 0; c < 0x100; c++)
+        {
+            result.Add(char.ConvertFromUtf32(c));
+        }
+
+        // Then every Unicode category, sampled. The enumeration source is the UCD, not this file.
+        for (int c = 0x100; c <= 0x10FFFF; c++)
+        {
+            if (c is >= 0xD800 and <= 0xDFFF)
+            {
+                continue;
+            }
+
+            System.Globalization.UnicodeCategory category =
+                System.Globalization.CharUnicodeInfo.GetUnicodeCategory(c);
+            perCategory.TryGetValue(category, out int seen);
+            if (seen >= HazardSamplesPerCategory)
+            {
+                continue;
+            }
+
+            perCategory[category] = seen + 1;
+            result.Add(char.ConvertFromUtf32(c));
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Meta-guard: the hazard set must represent EVERY Unicode category that has members.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This exists because the first version of the sweep reproduced, in new code, the exact defect
+    /// it was written to fix. <see cref="HazardCodepoints"/> feeds both the sweep and the
+    /// generator's hazard stratum, so stripping its sampling loop narrowed the requirement and the
+    /// satisfier TOGETHER: a rogue emitting U+2028 raw then survived all three layers, and the
+    /// domain audit stayed green because its character-class assertions are all satisfiable from
+    /// the first 256 codepoints. That is a shared source between a requirement and the thing that
+    /// meets it -- measured, not theorised (verify25 M3).
+    /// </para>
+    /// <para>
+    /// The requirement here is therefore rooted in a DIFFERENT source: the
+    /// <see cref="System.Globalization.UnicodeCategory"/> enumeration, not the loop that samples
+    /// it. If the sampling loop is narrowed, this fails; if a future runtime adds a category, this
+    /// fails until the set covers it. The two can only agree by both being right.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void HazardCodepoints_RepresentEveryUnicodeCategory()
+    {
+        var represented = new HashSet<System.Globalization.UnicodeCategory>();
+        foreach (string text in HazardCodepoints)
+        {
+            represented.Add(System.Globalization.CharUnicodeInfo.GetUnicodeCategory(
+                char.ConvertToUtf32(text, 0)));
+        }
+
+        // Surrogate is deliberately absent: lone surrogates are #710, a known-open defect this
+        // file is not about, and a surrogate codepoint cannot be expressed as a string here anyway.
+        var expected = Enum.GetValues<System.Globalization.UnicodeCategory>()
+            .Where(c => c != System.Globalization.UnicodeCategory.Surrogate)
+            .ToArray();
+
+        string[] missing = expected
+            .Where(c => !represented.Contains(c))
+            .Select(c => c.ToString())
+            .ToArray();
+
+        Assert.True(
+            missing.Length == 0,
+            "The hazard codepoint set does not represent every Unicode category, so characters in "
+            + "the missing ones are unreachable by both the sweep and the generator: "
+            + string.Join(", ", missing));
+    }
+
+    /// <summary>
+    /// SYSTEMATIC artifact sweep: every probed codepoint, in every string position, at every depth.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the constructive half of the artifact layer, and it exists because of a measured
+    /// distinction. Four independent reviews found the same defect in four projections -- a shared
+    /// loop bound, a marginal instead of a joint cell, a form-keyed alphabet, and a missing
+    /// magnitude axis -- and in each case the meta-guard could not see the gap BECAUSE IT USED THE
+    /// SAME PROJECTION as the thing it was auditing.
+    /// </para>
+    /// <para>
+    /// The response is not another audit. An audit that checks whether a random draw happened to
+    /// cover an enumeration is strictly worse than executing the enumeration: it is the same
+    /// enumeration plus a sampling assumption. So for the axes that are finite and enumerable --
+    /// codepoint, position, depth, magnitude -- this test ENUMERATES AND EMITS rather than sampling
+    /// and auditing. Coverage is true by construction, not by assertion.
+    /// </para>
+    /// <para>
+    /// Random generation is retained in the sibling test for what this cannot do: COMPOSITIONS.
+    /// The two are complementary -- this one is complete on single axes and blind to interactions;
+    /// the generator reaches interactions and is complete on nothing.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task SystematicSweep_PinsEveryProbedCodepointInEveryPositionAndDepth()
+    {
+        IReadOnlyList<string> codepoints = HazardCodepoints;
+        Assert.True(
+            codepoints.Count >= 0x100,
+            $"The hazard codepoint probe collapsed to {codepoints.Count} entries.");
+
+        var covered = new HashSet<(string Position, int Depth, string Text)>();
+        const int chunkSize = 48;
+        for (int start = 0; start < codepoints.Count; start += chunkSize)
+        {
+            string[] chunk = codepoints.Skip(start).Take(chunkSize).ToArray();
+            StructType schema = BuildSweepSchema(chunk, start, covered);
+            string expected = SchemaJson.ToJson(schema);
+            string footer = await WriteAndReadFooterSchemaAsync(schema);
+            if (!string.Equals(expected, footer, StringComparison.Ordinal))
+            {
+                Assert.Fail(
+                    $"Footer diverged from the shared serializer on the systematic sweep, chunk "
+                    + $"starting at codepoint index {start}."
+                    + $"{Environment.NewLine}  expected (log): {expected}"
+                    + $"{Environment.NewLine}  actual (footer): {footer}");
+            }
+        }
+
+        // Magnitude, same construction: one long string per position per length.
+        foreach (int length in MagnitudeLengths)
+        {
+            StructType schema = BuildSweepSchema([new string('m', length)], -length, covered);
+            string expected = SchemaJson.ToJson(schema);
+            string footer = await WriteAndReadFooterSchemaAsync(schema);
+            if (!string.Equals(expected, footer, StringComparison.Ordinal))
+            {
+                Assert.Fail(
+                    $"Footer diverged from the shared serializer at string length {length} -- a "
+                    + $"fixed-buffer truncation."
+                    + $"{Environment.NewLine}  expected length: {expected.Length}"
+                    + $"{Environment.NewLine}  actual length: {footer.Length}");
+            }
+        }
+
+        // NUMERIC BOUNDARIES, enumerated rather than sampled. Every reflected double and long is
+        // written at every depth. -0.0 is here because it is derived from the sign bit rather than
+        // from a value comparison; no equality-based enumeration can produce it, since -0.0 == 0.0.
+        StructType numericSchema = BuildNumericSweepSchema();
+        string numericExpected = SchemaJson.ToJson(numericSchema);
+        string numericFooter = await WriteAndReadFooterSchemaAsync(numericSchema);
+        if (!string.Equals(numericExpected, numericFooter, StringComparison.Ordinal))
+        {
+            Assert.Fail(
+                "Footer diverged from the shared serializer on a numeric boundary value."
+                + $"{Environment.NewLine}  expected (log): {numericExpected}"
+                + $"{Environment.NewLine}  actual (footer): {numericFooter}");
+        }
+
+        // Self-check: the schema builder must actually have placed every codepoint in every cell.
+        // Cheap, and it fires if the builder ever stops filling a position.
+        (string Position, int Depth)[] cells = RequiredStringCells(SweepDepthBound).ToArray();
+        foreach (string text in codepoints)
+        {
+            foreach ((string position, int depth) in cells)
+            {
+                Assert.Contains((position, depth, text), covered);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Builds a schema placing each of <paramref name="texts"/> in EVERY arbitrary-string position
+    /// at every depth the grammar admits, recording the cells it filled.
+    /// </summary>
+    private static StructType BuildSweepSchema(
+        IReadOnlyList<string> texts, int salt, HashSet<(string, int, string)> covered)
+    {
+        var fields = new List<StructField>(texts.Count);
+        for (int i = 0; i < texts.Count; i++)
+        {
+            string t = texts[i];
+            string tag = $"{salt}_{i}";
+            covered.Add(("field name", 0, t));
+            for (int depth = 0; depth <= SweepDepthBound; depth++)
+            {
+                covered.Add(("metadata key", depth, t));
+                covered.Add(("metadata string value", depth, t));
+                if (depth >= 1)
+                {
+                    covered.Add(("array element string", depth, t));
+                }
+            }
+
+            fields.Add(new StructField(
+                "f" + tag + t,
+                DataTypes.LongType,
+                nullable: true,
+                FieldMetadata.FromValues(new[]
+                {
+                    new KeyValuePair<string, MetadataValue>("k" + t, MetadataValue.String("v" + t)),
+                    new KeyValuePair<string, MetadataValue>("obj", NestMetadata(t, 1)),
+                    new KeyValuePair<string, MetadataValue>("arr", MetadataValue.Array(new[]
+                    {
+                        MetadataValue.String("a" + t),
+                    })),
+                })));
+        }
+
+        return new StructType(fields);
+    }
+
+    /// <summary>
+    /// A schema carrying every reflected numeric boundary, at every depth, as a metadata value.
+    /// </summary>
+    private static StructType BuildNumericSweepSchema()
+    {
+        var entries = new List<KeyValuePair<string, MetadataValue>>();
+        for (int depth = 0; depth <= SweepDepthBound; depth++)
+        {
+            var level = new List<MetadataValue>();
+            foreach (double d in DoubleBoundaries)
+            {
+                level.Add(MetadataValue.Double(d));
+            }
+
+            foreach (long l in LongBoundaries)
+            {
+                level.Add(MetadataValue.Long(l));
+            }
+
+            entries.Add(new KeyValuePair<string, MetadataValue>(
+                "d" + depth, MetadataValue.Array(level.ToArray())));
+        }
+
+        MetadataValue nested = MetadataValue.Nested(FieldMetadata.FromValues(entries.ToArray()));
+        return new StructType(
+        [
+            new StructField(
+                "numeric",
+                DataTypes.LongType,
+                nullable: true,
+                FieldMetadata.FromValues(
+                    entries.Append(new KeyValuePair<string, MetadataValue>("obj", nested)).ToArray())),
+        ]);
+    }
+
+    /// <summary>
+    /// The deepest nesting the systematic sweep constructs. Matched to the generator's bound so
+    /// the two agree on what "every depth" means, and so a rogue that only misbehaves at depth is
+    /// caught by CONSTRUCTION here rather than by a lucky draw there.
+    /// </summary>
+    private const int SweepDepthBound = GeneratedMetadataDepthBound;
+
+    /// <summary>
+    /// Nests <paramref name="text"/> into a key, a string value and an array element at every depth
+    /// from <paramref name="depth"/> down to <see cref="SweepDepthBound"/>.
+    /// </summary>
+    private static MetadataValue NestMetadata(string text, int depth)
+    {
+        var entries = new List<KeyValuePair<string, MetadataValue>>
+        {
+            new("k" + depth + text, MetadataValue.String("v" + depth + text)),
+            new("arr", MetadataValue.Array([MetadataValue.String("a" + depth + text)])),
+        };
+
+        if (depth < SweepDepthBound)
+        {
+            entries.Add(new KeyValuePair<string, MetadataValue>(
+                "obj", NestMetadata(text, depth + 1)));
+        }
+
+        return MetadataValue.Nested(FieldMetadata.FromValues(entries.ToArray()));
+    }
+
+    /// <summary>
+    /// Numeric boundary values, REFLECTED from the numeric types rather than listed.
+    /// <para>
+    /// <c>MinValue</c>, <c>MaxValue</c> and <c>Epsilon</c> come from the type system, and the Int32
+    /// edges come from <c>typeof(int)</c> -- which is the actual narrowing hazard, so the hazard
+    /// defines its own boundary. NEGATIVE ZERO is added from its bit pattern because it cannot be
+    /// discovered by any value-based enumeration: <c>-0.0 == 0.0</c> is true, so it is invisible to
+    /// equality yet renders as a different JSON token.
+    /// </para>
+    /// </summary>
+    private static IReadOnlyList<double> DoubleBoundaries => _doubleBoundaries ??= BuildBoundaries<double>(
+        [BitConverter.Int64BitsToDouble(long.MinValue), 0.0, 1.0, -1.0, 1e-300]);
+
+    private static IReadOnlyList<double>? _doubleBoundaries;
+
+    private static IReadOnlyList<long> LongBoundaries => _longBoundaries ??= BuildBoundaries<long>(
+        [0L, 1L, -1L, int.MaxValue, (long)int.MaxValue + 1, int.MinValue, (long)int.MinValue - 1]);
+
+    private static IReadOnlyList<long>? _longBoundaries;
+
+    private static IReadOnlyList<T> BuildBoundaries<T>(IReadOnlyList<T> extras)
+        where T : struct
+    {
+        var values = new List<T>();
+        foreach (System.Reflection.FieldInfo field in typeof(T).GetFields(
+            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static))
+        {
+            if (field.FieldType == typeof(T) && field.GetValue(null) is T value
+                && (value is not double d || double.IsFinite(d)))
+            {
+                values.Add(value);
+            }
+        }
+
+        values.AddRange(extras);
+        return values;
+    }
+
+    /// <summary>
     /// GENERATED artifact surface: the primary call-site divergence assertion.
     /// </summary>
     /// <remarks>
@@ -1038,7 +1413,7 @@ public sealed class ParquetWriterTests
     /// in about three minutes. Raising it is cheap and raising it a lot is not, which is why the
     /// number is here rather than inline.
     /// </summary>
-    private const int GeneratedCaseCount = 200;
+    private const int GeneratedCaseCount = 1200;
 
     /// <summary>
     /// Audits the generator's VALUE DOMAINS, which are where enumeration now lives.
@@ -1059,6 +1434,7 @@ public sealed class ParquetWriterTests
         var rng = new DeterministicRng(GeneratedSeed);
 
         var kinds = new HashSet<MetadataValueKind>();
+        var formCells = new Dictionary<(string Position, int Depth), SortedSet<string>>();
         var typeNames = new HashSet<string>(StringComparer.Ordinal);
         bool integralDouble = false;
         bool exponentDouble = false;
@@ -1068,8 +1444,8 @@ public sealed class ParquetWriterTests
         bool controlCharacter = false;
         bool quoteOrBackslash = false;
         bool nonAsciiBmp = false;
-        var emittedForms = new SortedSet<string>(StringComparer.Ordinal);
         var stringPositions = new SortedSet<string>(StringComparer.Ordinal);
+        int maxStringLength = 0;
         int maxDepth = -1;
         bool loneSurrogate = false;
 
@@ -1079,7 +1455,7 @@ public sealed class ParquetWriterTests
             foreach (StructField field in schema)
             {
                 typeNames.Add(field.DataType.TypeName);
-                InspectString(field.Name, "field name");
+                InspectString(field.Name, "field name", 0);
                 InspectMetadata(field.Metadata, 0);
             }
         }
@@ -1103,23 +1479,50 @@ public sealed class ParquetWriterTests
             typeNames.Count >= 20,
             $"Only {typeNames.Count} distinct types generated across {GeneratedCaseCount} schemas.");
 
-        // ESCAPE FORMS, derived from the serializer -- not from the generator's own alphabet, so a
-        // narrowed alphabet cannot satisfy this by also narrowing what it is compared against.
-        string[] missingForms = ProbeEmittedEscapeForms()
-            .Where(form => !emittedForms.Contains(form)).ToArray();
+        // ESCAPE FORMS per (POSITION x DEPTH) CELL -- not unioned across them.
+        //
+        // The previous version collected every emitted form into ONE set and checked that set
+        // against the serializer's. That is a MARGINAL: a form produced anywhere satisfied it
+        // everywhere, so a generator that emitted backslashes only in field names and never at
+        // depth reported full coverage. It is exactly the collapse fixed in the corpus guard by
+        // making depth part of the cell key -- and the fix was applied there and not here, in the
+        // same commit. The cell key is now joint in both places.
+        SortedSet<string> requiredForms = ProbeEmittedEscapeForms();
+        foreach ((string position, int depth) in RequiredStringCells(GeneratedMetadataDepthBound))
+        {
+            SortedSet<string> covered = formCells.TryGetValue((position, depth), out SortedSet<string>? c)
+                ? c
+                : new SortedSet<string>(StringComparer.Ordinal);
+            string[] missing = requiredForms.Where(form => !covered.Contains(form)).ToArray();
+            Assert.True(
+                missing.Length == 0,
+                $"The generator never produced these escape forms in the {position} position at "
+                + $"depth {depth}, so a rogue mishandling them THERE would not be sampled: "
+                + $"{string.Join(" ", missing)}");
+        }
+
+        // MAGNITUDE. Length was not a dimension of this audit at all: the generator drew 1-6
+        // elements, so no string ever exceeded ~12 characters, and a footer serializer that
+        // truncated at a fixed buffer size (256 chars) collapsed two distinct columns onto one
+        // footer name -- an identity break with no hostile characters anywhere in it.
         Assert.True(
-            missingForms.Length == 0,
-            $"The generator never produced these escape forms the serializer emits, so a rogue "
-            + $"mishandling them would not be sampled: {string.Join(" ", missingForms)}");
+            maxStringLength >= MagnitudeLengths.Max(),
+            $"The generator's longest string was {maxStringLength} characters, below the longest "
+            + $"pinned magnitude ({MagnitudeLengths.Max()}): a fixed-buffer truncation would not "
+            + "be sampled.");
 
         // POSITIONS and DEPTH: the grammar's string slots, and that recursion actually reaches the
         // stated bound rather than terminating early for some accident of the seed.
+        // Positions come from the SAME derivation the cell loop uses, rather than being repeated as
+        // a literal. The literal that used to be here still named the pre-depth-key positions
+        // ("nested metadata key"), which conflated position with depth -- the very collapse the
+        // cell key was introduced to remove.
         Assert.Equal(
-            new[]
-            {
-                "array element string", "field name", "metadata key", "metadata string value",
-                "nested metadata key", "nested metadata string value",
-            },
+            RequiredStringCells(GeneratedMetadataDepthBound)
+                .Select(c => c.Position)
+                .Distinct(StringComparer.Ordinal)
+                .OrderBy(p => p, StringComparer.Ordinal)
+                .ToArray(),
             stringPositions.ToArray());
         Assert.True(
             maxDepth >= GeneratedMetadataDepthBound,
@@ -1139,11 +1542,8 @@ public sealed class ParquetWriterTests
             maxDepth = Math.Max(maxDepth, depth);
             foreach (KeyValuePair<string, MetadataValue> entry in metadata)
             {
-                InspectString(entry.Key, depth == 0 ? "metadata key" : "nested metadata key");
-                InspectValue(
-                    entry.Value,
-                    depth,
-                    depth == 0 ? "metadata string value" : "nested metadata string value");
+                InspectString(entry.Key, "metadata key", depth);
+                InspectValue(entry.Value, depth, "metadata string value");
             }
         }
 
@@ -1164,7 +1564,7 @@ public sealed class ParquetWriterTests
                     longAtBoundary |= l == long.MaxValue || l == long.MinValue;
                     break;
                 case MetadataValueKind.String:
-                    InspectString(value.AsString(), position);
+                    InspectString(value.AsString(), position, depth);
                     break;
                 case MetadataValueKind.Array:
                     foreach (MetadataValue item in value.AsArray())
@@ -1181,10 +1581,17 @@ public sealed class ParquetWriterTests
             }
         }
 
-        void InspectString(string text, string position)
+        void InspectString(string text, string position, int depth)
         {
             stringPositions.Add(position);
-            emittedForms.UnionWith(EscapeFormsIn(text));
+            maxStringLength = Math.Max(maxStringLength, text.Length);
+            if (!formCells.TryGetValue((position, depth), out SortedSet<string>? cell))
+            {
+                cell = new SortedSet<string>(StringComparer.Ordinal);
+                formCells[(position, depth)] = cell;
+            }
+
+            cell.UnionWith(EscapeFormsIn(text));
             for (int i = 0; i < text.Length; i++)
             {
                 char c = text[i];
@@ -1350,34 +1757,37 @@ public sealed class ParquetWriterTests
     /// Longs across the FULL 64-bit range, with the boundaries and the Int32 edges weighted in:
     /// a transducer that narrowed ids to Int32 corrupted 3000000000 to -1294967296 silently.
     /// </summary>
-    private static long GenerateLong(DeterministicRng rng) => rng.Next(6) switch
+    private static long GenerateLong(DeterministicRng rng)
     {
-        0 => long.MinValue,
-        1 => long.MaxValue,
-        2 => int.MaxValue,
-        3 => (long)int.MaxValue + 1,
-        4 => int.MinValue,
-        _ => unchecked((long)rng.NextUInt64()),
-    };
+        IReadOnlyList<long> boundaries = LongBoundaries;
+        return rng.Next(2) == 0
+            ? boundaries[rng.Next(boundaries.Count)]
+            : unchecked((long)rng.NextUInt64());
+    }
 
     /// <summary>
     /// Doubles including INTEGRAL values, which are the ones that exercise WriteDouble's ".0"
     /// branch and whose omission let a number-token rogue change a metadata value's type on
     /// re-read (Double 1.0 spelled "1" reads back as Long).
     /// </summary>
-    private static double GenerateDouble(DeterministicRng rng) => rng.Next(6) switch
+    private static double GenerateDouble(DeterministicRng rng)
     {
-        0 => 0.0,
-        1 => 1.0,
-        2 => -42.0,
-        3 => 1e-300,
-        4 => double.MaxValue,
+        // Half the draws come from the REFLECTED boundary set (so -0.0, Epsilon, MinValue and the
+        // integral ".0" cases are all reachable without being hand-listed here), half from the full
+        // 64-bit bit space. The arms used to be a hand-written switch, which is the same
+        // hand-listed-leaf defect one level in from the domains it was supposed to widen.
+        IReadOnlyList<double> boundaries = DoubleBoundaries;
+        if (rng.Next(2) == 0)
+        {
+            return boundaries[rng.Next(boundaries.Count)];
+        }
+
         // Finite only: NaN and the infinities are not JSON numbers at all, so they are a
         // SHARED-serializer question rather than a footer/log divergence one, and the equality
         // oracle here is blind to them by construction. Tracked separately.
-        _ => BitConverter.Int64BitsToDouble(unchecked((long)rng.NextUInt64())) is double d
-            && double.IsFinite(d) ? d : 0.5,
-    };
+        return BitConverter.Int64BitsToDouble(unchecked((long)rng.NextUInt64())) is double d
+            && double.IsFinite(d) ? d : 0.5;
+    }
 
     /// <summary>
     /// THE single codepoint sweep. Both the required escape-form set and the generator's alphabet
@@ -1406,6 +1816,21 @@ public sealed class ParquetWriterTests
     /// it here would make these tests fail for a reason they are not about.
     /// </para>
     /// </summary>
+    /// <summary>
+    /// One text per escape form the encoder emits, PROBED rather than listed. The generator draws
+    /// from this stratum as well as from the full alphabet: the alphabet is complete over the
+    /// first 256 codepoints, which dilutes the seven escape forms to roughly 1/250 per character,
+    /// so uniform sampling stopped reaching them in the rarer (position, depth) cells. Widening
+    /// the alphabet narrowed form coverage -- the two are in tension, and stratifying resolves it
+    /// without either set being hand-written.
+    /// </summary>
+    private static IReadOnlyList<string> EscapeFormRepresentatives =>
+        _escapeFormReps ??= EscapeProbe.Alphabet
+            .Where(t => EscapeFormsIn(t).Any(f => f != "literal"))
+            .ToArray();
+
+    private static IReadOnlyList<string>? _escapeFormReps;
+
     private static (SortedSet<string> Forms, IReadOnlyList<string> Alphabet) EscapeProbe =>
         _escapeProbe ??= BuildEscapeProbe();
 
@@ -1528,29 +1953,42 @@ public sealed class ParquetWriterTests
     private static string GenerateString(DeterministicRng rng)
     {
         IReadOnlyList<string> alphabet = EscapeProbe.Alphabet;
-        int length = 1 + rng.Next(6);
+        IReadOnlyList<string> forms = EscapeFormRepresentatives;
+
+        // MAGNITUDE is a domain, not an accident of the loop bound. One draw in eight is long
+        // enough to cross a fixed-buffer truncation; the rest stay short so compositions stay
+        // cheap and the case budget still buys interaction coverage rather than bulk.
+        int length = rng.Next(8) == 0
+            ? MagnitudeLengths[rng.Next(MagnitudeLengths.Length)]
+            : 1 + rng.Next(6);
         var chars = new System.Text.StringBuilder(length);
+        IReadOnlyList<string> hazards = HazardCodepoints;
         for (int i = 0; i < length; i++)
         {
-            switch (rng.Next(5))
+            // Four strata, three of them DERIVED. The arms used to carry hand-chosen sub-ranges
+            // (0x80 + 0x300, 0x10000 + 0x1000, 0xE000 + 0x1000) which is the same defect as a
+            // hand-chosen loop bound, one level in: the generator could only ever reach the
+            // characters those literals happened to span, and U+2028 was outside all of them.
+            switch (rng.Next(4))
             {
                 case 0:
+                    // Plain ASCII, so most generated strings stay legible in a failure message.
                     chars.Append((char)('a' + rng.Next(26)));
                     break;
                 case 1:
-                    chars.Append(alphabet[rng.Next(alphabet.Count)]);
+                    // The escape-form stratum, probed from the encoder.
+                    chars.Append(forms[rng.Next(forms.Count)]);
                     break;
                 case 2:
-                    // Non-ASCII BMP, below the surrogate range.
-                    chars.Append((char)(0x80 + rng.Next(0x300)));
-                    break;
-                case 3:
-                    // Astral: a surrogate PAIR, never a lone surrogate.
-                    chars.Append(char.ConvertFromUtf32(0x10000 + rng.Next(0x1000)));
+                    // The alphabet the encoding audit requires coverage of.
+                    chars.Append(alphabet[rng.Next(alphabet.Count)]);
                     break;
                 default:
-                    // BMP above the surrogate range.
-                    chars.Append((char)(0xE000 + rng.Next(0x1000)));
+                    // The UCD-derived hazard set: every Unicode category, plus everything below
+                    // U+0100 exhaustively. U+2028 and U+2029 are reachable from here because the
+                    // character database says they are their own categories, not because anyone
+                    // remembered them.
+                    chars.Append(hazards[rng.Next(hazards.Count)]);
                     break;
             }
         }
