@@ -106,9 +106,16 @@ public sealed class DeltaFooterLogParityCoverageTests
     /// The two halves are composed in the direction each is sound in: WHICH entry points ran is
     /// answered dynamically by the recorder, and WHICH call sites those can reach is answered
     /// statically. The static leg over-approximates -- an untaken branch still counts as reached --
-    /// so this proves a call site is not ORPHANED, not that it executed. That limit is stated
-    /// rather than hidden: the parity assertions prove behaviour at a site, and this only ensures
-    /// some test drives the operation that owns it.
+    /// so this proves a call site is not ORPHANED, not that it executed. The parity assertions
+    /// prove behaviour at a site; this only ensures some test drives the operation that owns it.
+    /// </para>
+    /// <para>
+    /// That gap is MEASURED, not merely suspected: a <c>SchemaJson.ToJson</c> call site placed
+    /// behind a branch that never fires is reported covered (0 kills), while the same site with no
+    /// call from a reached method is reported unreached. It is tracked as issue #734, whose remedy
+    /// is to make this leg dynamic too -- most likely from the coverage data this repo already
+    /// collects -- rather than to refine the walk, for the same reason the driven side had to stop
+    /// being static: "could this be reached" cannot answer "was this executed".
     /// </para>
     /// </remarks>
     [Fact]
