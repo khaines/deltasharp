@@ -1,6 +1,9 @@
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Linq.Expressions;
+using System.Reflection;
+using System.Threading.Tasks;
 
 namespace DeltaSharp.Storage.Tests.Delta;
 
@@ -44,13 +47,59 @@ internal static class WriteEntryPointRecorder
     /// method to walk from.
     /// </para>
     /// </remarks>
-    /// <param name="parameterTypes">
-    /// The driven overload's parameter types. Omit them only while the name is unambiguous: the
-    /// guard resolves a label to EXACTLY ONE product method and fails if the name matches several,
-    /// because joining on a bare name silently promotes every same-named overload to a driven root.
-    /// A name is not a method.
-    /// </param>
-    internal static void Record(Type owner, string method, params Type[] parameterTypes)
+    /// <summary>
+    /// Invokes <paramref name="call"/> on <paramref name="target"/> and records the entry point
+    /// IT ACTUALLY CALLED, after it has returned.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the ONLY way to record, and <c>Record</c> is private so that no other code can emit
+    /// a label. That is deliberate and it is the whole fix for v7. Previously a label was AUTHORED
+    /// next to a call rather than produced BY one, so the two could be satisfied from different
+    /// places: move the real call into a never-taken branch (which still satisfies a
+    /// branch-insensitive IL walk) and emit its label from a different helper that does run, and an
+    /// entry point nothing invoked is reported driven with the suite green. Ordering was not the
+    /// defect and moving the label after the await would not have fixed it -- the label was simply
+    /// not bound to its own call site.
+    /// </para>
+    /// <para>
+    /// Binding is structural here rather than checked: the identity comes from the
+    /// <see cref="MethodInfo"/> in the expression the compiler resolved, so the label cannot name a
+    /// method other than the one invoked, and it is emitted only after the invocation completes, so
+    /// a call that does not happen cannot be labelled. Resolution answers WHICH METHOD A LABEL
+    /// NAMES; only this answers WHETHER THE METHOD THAT EMITTED IT CALLED IT.
+    /// </para>
+    /// </remarks>
+    /// <typeparam name="TTarget">The receiver type.</typeparam>
+    /// <typeparam name="TResult">The awaited result type.</typeparam>
+    /// <param name="target">The receiver to invoke against.</param>
+    /// <param name="call">A single method call on <paramref name="target"/>.</param>
+    /// <returns>Whatever the driven entry point returned.</returns>
+    internal static async Task<TResult> DriveAsync<TTarget, TResult>(
+        TTarget target, Expression<Func<TTarget, Task<TResult>>> call)
+    {
+        ArgumentNullException.ThrowIfNull(call);
+
+        if (call.Body is not MethodCallExpression invocation)
+        {
+            throw new ArgumentException(
+                "A driven entry point must be a single method call, so the recorded label is the "
+                + "method the compiler resolved rather than one an author chose.",
+                nameof(call));
+        }
+
+        TResult result = await call.Compile()(target).ConfigureAwait(false);
+
+        MethodInfo driven = invocation.Method;
+        Record(
+            driven.DeclaringType ?? typeof(TTarget),
+            driven.Name,
+            driven.GetParameters().Select(q => q.ParameterType).ToArray());
+
+        return result;
+    }
+
+    private static void Record(Type owner, string method, params Type[] parameterTypes)
     {
         ArgumentNullException.ThrowIfNull(owner);
         ArgumentNullException.ThrowIfNull(parameterTypes);

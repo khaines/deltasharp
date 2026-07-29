@@ -424,7 +424,7 @@ public sealed class DeltaFooterLogParityCoverageTests
                 }
             }
 
-            foreach (MethodBase called in CallTargets(current))
+            foreach (MethodBase called in CallTargets(current, includeMethodTokens: true))
             {
                 found.Add(called);
 
@@ -574,8 +574,16 @@ public sealed class DeltaFooterLogParityCoverageTests
     /// Same instruction, opposite consequences: for "does this site exist" a missed reference is
     /// the danger, and for "was this label earned" a spurious one is.
     /// </param>
+    /// <param name="includeMethodTokens">
+    /// Also yield methods referenced by <c>ldtoken</c>. The label-honesty walk sets this because a
+    /// driver expressed as an expression tree references its callee by TOKEN rather than calling
+    /// it -- the call happens inside the compiled delegate, which has no IL to walk. Note this is a
+    /// DIFFERENT opcode from <c>ldftn</c>: the dead-local-function attack used a method-group
+    /// conversion, and excluding <c>ldftn</c> is what closes it, so recognising expression trees
+    /// here does not reopen it.
+    /// </param>
     private static IEnumerable<MethodBase> CallTargets(
-        MethodBase method, bool includeFunctionPointers = false)
+        MethodBase method, bool includeFunctionPointers = false, bool includeMethodTokens = false)
     {
         byte[]? il = method.GetMethodBody()?.GetILAsByteArray();
         if (il is null)
@@ -594,7 +602,8 @@ public sealed class DeltaFooterLogParityCoverageTests
             OpCode op = ReadOpCode(il, ref i);
 
             bool referencesMethod = op == OpCodes.Call || op == OpCodes.Callvirt || op == OpCodes.Newobj
-                || (includeFunctionPointers && (op == OpCodes.Ldftn || op == OpCodes.Ldvirtftn));
+                || (includeFunctionPointers && (op == OpCodes.Ldftn || op == OpCodes.Ldvirtftn))
+                || (includeMethodTokens && op == OpCodes.Ldtoken);
 
             if (referencesMethod)
             {

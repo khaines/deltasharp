@@ -237,9 +237,8 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
             vectors[i] = vector;
         }
 
-        WriteEntryPointRecorder.Record(typeof(DeltaWriteTarget), nameof(DeltaWriteTarget.AppendAsync));
-        await target.AppendAsync(
-            schema, partitionColumns, new[] { new ManagedColumnBatch(schema, vectors, 2) });
+        await WriteEntryPointRecorder.DriveAsync(
+            target, t => t.AppendAsync(schema, partitionColumns, new[] { new ManagedColumnBatch(schema, vectors, 2) }));
     }
 
     /// <summary>Appends partition value number <paramref name="row"/>, distinct per row.</summary>
@@ -298,10 +297,9 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
         using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
             _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names))
         {
-            WriteEntryPointRecorder.Record(typeof(DeltaWriteTarget), nameof(DeltaWriteTarget.CreateNameMappedTableAsync));
-            await target.CreateNameMappedTableAsync(
-                created, Array.Empty<string>(), new[] { BuildBatch(created, "west") },
-                new SeededPhysicalNameSource(CreateSeed));
+            await WriteEntryPointRecorder.DriveAsync(
+                target, t => t.CreateNameMappedTableAsync(created, Array.Empty<string>(), new[] { BuildBatch(created, "west") },
+                new SeededPhysicalNameSource(CreateSeed)));
         }
 
         // mergeSchema on a name-mapped table routes through the column-mapping evolution branch,
@@ -311,9 +309,9 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
             _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names,
             new SeededPhysicalNameSource(EvolveSeed)))
         {
-            WriteEntryPointRecorder.Record(typeof(DeltaWriteTarget), nameof(DeltaWriteTarget.AppendAsync));
-            await append.AppendAsync(
-                evolved, Array.Empty<string>(), new[] { BuildBatch(evolved, "east") }, mergeSchema: true);
+            await WriteEntryPointRecorder.DriveAsync(
+                append, t => t.AppendAsync(
+                    evolved, Array.Empty<string>(), new[] { BuildBatch(evolved, "east") }, mergeSchema: true));
         }
 
         IReadOnlyList<(long Version, string Path, string Declared)> written = ReadCommittedFiles();
@@ -383,24 +381,20 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
             switch (seam)
             {
                 case CreateSeam.IdMapped:
-                    WriteEntryPointRecorder.Record(typeof(DeltaWriteTarget), nameof(DeltaWriteTarget.CreateIdMappedTableAsync));
-                    await target.CreateIdMappedTableAsync(
-                                created, Array.Empty<string>(), batches, source);
+                    await WriteEntryPointRecorder.DriveAsync(
+                        target, t => t.CreateIdMappedTableAsync(created, Array.Empty<string>(), batches, source));
                     break;
                 case CreateSeam.NameMappedDeletionVector:
-                    WriteEntryPointRecorder.Record(typeof(DeltaWriteTarget), nameof(DeltaWriteTarget.CreateNameMappedDeletionVectorTableAsync));
-                    await target.CreateNameMappedDeletionVectorTableAsync(
-                                created, Array.Empty<string>(), batches, source);
+                    await WriteEntryPointRecorder.DriveAsync(
+                        target, t => t.CreateNameMappedDeletionVectorTableAsync(created, Array.Empty<string>(), batches, source));
                     break;
                 case CreateSeam.IdMappedDeletionVector:
-                    WriteEntryPointRecorder.Record(typeof(DeltaWriteTarget), nameof(DeltaWriteTarget.CreateIdMappedDeletionVectorTableAsync));
-                    await target.CreateIdMappedDeletionVectorTableAsync(
-                                created, Array.Empty<string>(), batches, source);
+                    await WriteEntryPointRecorder.DriveAsync(
+                        target, t => t.CreateIdMappedDeletionVectorTableAsync(created, Array.Empty<string>(), batches, source));
                     break;
                 case CreateSeam.DeletionVector:
-                    WriteEntryPointRecorder.Record(typeof(DeltaWriteTarget), nameof(DeltaWriteTarget.CreateDeletionVectorTableAsync));
-                    await target.CreateDeletionVectorTableAsync(
-                                created, Array.Empty<string>(), batches);
+                    await WriteEntryPointRecorder.DriveAsync(
+                        target, t => t.CreateDeletionVectorTableAsync(created, Array.Empty<string>(), batches));
                     break;
                 default:
                     Assert.Fail(
@@ -459,11 +453,9 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
             _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), FileNames(),
             new SeededPhysicalNameSource(CreateSeed)))
         {
-            WriteEntryPointRecorder.Record(
-                typeof(DeltaWriteTarget), nameof(DeltaWriteTarget.CreateNameMappedTableAsync));
-            await target.CreateNameMappedTableAsync(
-                created, Array.Empty<string>(), new[] { BuildBatch(created, "west") },
-                new SeededPhysicalNameSource(CreateSeed));
+            await WriteEntryPointRecorder.DriveAsync(
+                target, t => t.CreateNameMappedTableAsync(created, Array.Empty<string>(), new[] { BuildBatch(created, "west") },
+                new SeededPhysicalNameSource(CreateSeed)));
         }
 
         var writer = new DeltaTableWriter(new LocalFileSystemBackend(_root));
@@ -471,16 +463,14 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
 
         if (drop)
         {
-            WriteEntryPointRecorder.Record(
-                typeof(DeltaTableWriter), nameof(DeltaTableWriter.DropColumnAsync));
-            await writer.DropColumnAsync("naïve");
+            await WriteEntryPointRecorder.DriveAsync(
+                writer, t => t.DropColumnAsync("naïve"));
             expected = new StructType(created.Where(f => f.Name != "naïve").ToArray());
         }
         else
         {
-            WriteEntryPointRecorder.Record(
-                typeof(DeltaTableWriter), nameof(DeltaTableWriter.RenameColumnAsync));
-            await writer.RenameColumnAsync("région", "region");
+            await WriteEntryPointRecorder.DriveAsync(
+                writer, t => t.RenameColumnAsync("région", "region"));
             expected = new StructType(created
                 .Select(f => f.Name == "région"
                     ? new StructField("region", f.DataType, f.Nullable, f.Metadata)
@@ -617,8 +607,8 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
         using DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(_root);
 
         var batch = BuildBatch(schema, "west");
-        WriteEntryPointRecorder.Record(typeof(DeltaWriteTarget), nameof(DeltaWriteTarget.AppendAsync));
-        await target.AppendAsync(schema, partitionColumns, new[] { batch }, mergeSchema);
+        await WriteEntryPointRecorder.DriveAsync(
+            target, t => t.AppendAsync(schema, partitionColumns, new[] { batch }, mergeSchema));
     }
 
     /// <summary>
@@ -629,13 +619,12 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
     {
         using DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(_root);
 
-        WriteEntryPointRecorder.Record(typeof(DeltaWriteTarget), nameof(DeltaWriteTarget.OverwriteAsync));
-        await target.OverwriteAsync(
-            schema,
+        await WriteEntryPointRecorder.DriveAsync(
+            target, t => t.OverwriteAsync(schema,
             Array.Empty<string>(),
             new[] { BuildBatch(schema, "north") },
             DeltaPartitionOverwriteMode.Static,
-            overwriteSchema: true);
+            overwriteSchema: true));
     }
 
     private static ManagedColumnBatch BuildBatch(StructType schema, string region)
