@@ -189,6 +189,14 @@ public sealed class DeltaFooterLogParityCoverageTests
     /// artifact to compare against. Everything else in this set is pinned by byte parity. Do not
     /// read a green result here as equivalent coverage for those two. Tracked by #741.
     /// </para>
+    /// <para>
+    /// LIMIT -- the set is scoped to ONE assembly, DeltaSharp.Storage (ProductionMethods walks
+    /// typeof(DeltaWriteTarget).Assembly). "The production assembly" reads as though there is only
+    /// one, and there is not: SchemaJson is internal but IVT-visible to DeltaSharp.Engine and
+    /// DeltaSharp.Core as well, so a call site in either of those is outside this walk entirely and
+    /// this guard will stay green while it goes undriven. Widening the scope is the fix, not
+    /// widening the walk. Tracked by #743.
+    /// </para>
     /// </remarks>
     private static HashSet<MethodBase> RequiredSites()
     {
