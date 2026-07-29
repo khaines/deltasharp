@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Text;
 using System.Text.Json;
 using DeltaSharp.Engine.Columnar;
@@ -489,6 +490,86 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
             + string.Join(", ", committed.Select(c => c.Version)));
 
         AssertDeclaredPreservesCallerMetadata(expected, committed[^1].Declared);
+    }
+
+    /// <summary>
+    /// Drives the two PUBLIC staged-file write overloads that nothing else in this suite reaches.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>DeltaTableWriter.AppendAsync(StructType, IReadOnlyList&lt;StagedDataFile&gt;, ...)</c> and the
+    /// matching <c>OverwriteAsync</c> take an ALREADY-STAGED file and load the snapshot themselves,
+    /// so they are a different shape from the <c>DeltaWriteTarget</c> seams the rest of this suite
+    /// drives -- and they were reached by nothing. They are public API that serializes a committed
+    /// schemaString, so a transform in either reproduces issue #679's divergence with every other
+    /// test in this file green. That is not hypothetical: they were found precisely because the
+    /// coverage guard's required side was widened, and they were the first thing it reported.
+    /// </para>
+    /// <para>
+    /// The oracle is metadata PRESERVATION rather than footer/log byte equality, because these
+    /// overloads write no footer -- the caller stages the file. So the assertion is the one that
+    /// holds without a sibling artifact, the same one ALTER and column-mapping evolution use: what
+    /// the caller declared must survive into the committed log.
+    /// </para>
+    /// </remarks>
+    /// <param name="overwrite">Drive <c>OverwriteAsync</c> rather than <c>AppendAsync</c>.</param>
+    /// <returns>A task that completes when the assertions have run.</returns>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task StagedFileOverloads_PreserveEveryMetadataEntryTheCallerDeclared(bool overwrite)
+    {
+        StructType created = HostileSchema();
+
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), FileNames(),
+            new SeededPhysicalNameSource(CreateSeed)))
+        {
+            await WriteEntryPointRecorder.DriveAsync(
+                target, t => t.AppendAsync(
+                    created, Array.Empty<string>(), new[] { BuildBatch(created, "west") }));
+        }
+
+        var writer = new DeltaTableWriter(new LocalFileSystemBackend(_root));
+        var staged = new[]
+        {
+            new StagedDataFile(
+                "part-00001-staged.parquet",
+                ImmutableSortedDictionary<string, string?>.Empty,
+                Size: 1L,
+                ModificationTime: 1L,
+                Stats: null),
+        };
+
+        // The schemaString is only re-serialized when the commit carries a metaData action, which
+        // for these overloads means an ADDITIVE evolution. A same-schema write commits adds only and
+        // would drive the overload without ever reaching the serializer -- coverage of the entry
+        // point but not of the call site, which is the distinction this whole guard family exists
+        // to keep. So widen, and evolve.
+        StructType evolved = Widen(created, "staged_added");
+
+        if (overwrite)
+        {
+            await WriteEntryPointRecorder.DriveAsync(
+                writer, t => t.OverwriteAsync(
+                    evolved, staged, PartitionOverwriteMode.Static, SchemaEvolutionMode.AddNewColumns));
+        }
+        else
+        {
+            await WriteEntryPointRecorder.DriveAsync(
+                writer, t => t.AppendAsync(evolved, staged, SchemaEvolutionMode.AddNewColumns));
+        }
+
+        IReadOnlyList<(long Version, string Declared)> committed = ReadCommittedSchemas();
+
+        // Fails closed: if the overload committed nothing, the create's schemaString would satisfy
+        // the assertion below while the seam under test never ran.
+        Assert.True(
+            committed.Count >= 2 && committed[^1].Version > committed[0].Version,
+            "the staged-file overload produced no new schema-carrying commit; versions seen: "
+            + string.Join(", ", committed.Select(c => c.Version)));
+
+        AssertDeclaredPreservesCallerMetadata(evolved, committed[^1].Declared);
     }
 
     private static void AssertDeclaredPreservesCallerMetadata(StructType expectedSchema, string declared)

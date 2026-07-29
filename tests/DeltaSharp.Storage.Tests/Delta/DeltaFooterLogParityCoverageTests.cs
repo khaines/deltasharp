@@ -129,7 +129,7 @@ public sealed class DeltaFooterLogParityCoverageTests
     [Fact]
     public async Task ParityGuard_ReachesEverySchemaJsonCallSite()
     {
-        MethodBase[] callSites = SchemaJsonCallSites().ToArray();
+        MethodBase[] callSites = RequiredSites().ToArray();
 
         // Non-vacuity: if the scan finds nothing every check below passes for the wrong reason --
         // and finding nothing is exactly what a renamed serializer would look like.
@@ -163,6 +163,47 @@ public sealed class DeltaFooterLogParityCoverageTests
     }
 
     /// <summary>Every production method whose IL calls <c>SchemaJson.ToJson</c>.</summary>
+    /// <summary>
+    /// Every production method that reaches <c>SchemaJson.ToJson</c>, TRANSITIVELY.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This used to be DIRECT callers only, which is one hop short of the property. A seam that
+    /// serializes through an in-assembly wrapper was invisible -- and that is not a hypothetical
+    /// shape, it is how the footer site itself is written: ParquetFileWriter calls
+    /// DeltaSchemaJson.ToJson, the wrapper, not SchemaJson.ToJson. So a new seam written the same
+    /// way as the existing one would not have been asked about.
+    /// </para>
+    /// <para>
+    /// Widening it is cheap -- 7 direct callers expand to 28 methods out of 2888 -- and it paid for
+    /// itself on the first run: it reported DeltaTableWriter.AppendAsync and OverwriteAsync, the
+    /// PUBLIC staged-file overloads, as reaching a committed schemaString with nothing driving
+    /// them. That was a real product-surface coverage gap, not a guard artifact, and it is now
+    /// covered by StagedFileOverloads_PreserveEveryMetadataEntryTheCallerDeclared.
+    /// </para>
+    /// </remarks>
+    private static HashSet<MethodBase> RequiredSites()
+    {
+        MethodBase[] all = ProductionMethods().ToArray();
+        var closure = SchemaJsonCallSites().ToHashSet();
+
+        for (bool grew = true; grew;)
+        {
+            grew = false;
+            foreach (MethodBase m in all)
+            {
+                if (!closure.Contains(m)
+                    && CallTargets(m, includeFunctionPointers: true).Any(closure.Contains))
+                {
+                    closure.Add(m);
+                    grew = true;
+                }
+            }
+        }
+
+        return closure;
+    }
+
     private static IEnumerable<MethodBase> SchemaJsonCallSites()
     {
         foreach (MethodBase method in ProductionMethods())
