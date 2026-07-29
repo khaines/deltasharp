@@ -236,11 +236,15 @@ public sealed class ParquetWriterTests
     /// materialising a column vector per type. That is what makes broad type coverage affordable at
     /// the ARTIFACT layer rather than only at the helper layer.
     /// </remarks>
-    private static async Task<string> WriteAndReadFooterSchemaAsync(StructType schema)
+    private static async Task<string> WriteAndReadFooterSchemaAsync(
+        StructType schema, ColumnBatch? rows = null)
     {
         using var stream = new MemoryStream();
         await new ParquetFileWriter().WriteAsync(
-            stream, schema, Array.Empty<ColumnBatch>(), CancellationToken.None);
+            stream,
+            schema,
+            rows is null ? Array.Empty<ColumnBatch>() : new[] { rows },
+            CancellationToken.None);
         stream.Position = 0;
 
         await using ParquetReader reader =
@@ -1134,6 +1138,123 @@ public sealed class ParquetWriterTests
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// The footer schemaString must not depend on THE DATA — same schema, rows and no rows, byte
+    /// for byte.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="WriteAndReadFooterSchemaAsync"/> writes ZERO batches, which is a large speed win
+    /// (no row groups) and was chosen for that reason. But it also silently PINS a parameter of the
+    /// thing under test, and a pinned parameter is a coordinate no rogue has to respect: a
+    /// divergence conditioned on rows being present is invisible to every test that goes through
+    /// that oracle. Measured — a footer serializer handed a metadata-stripped schema only when
+    /// <c>totalRows &gt; 0</c> was 0 kills across the whole footer surface.
+    /// </para>
+    /// <para>
+    /// So the row count is stated here as a DIFFERENTIAL property rather than left as a provenance
+    /// argument about today's call site. Every artifact schema is written both ways and the two
+    /// footers must be identical to each other and to the shared serializer. All-null rows are used
+    /// deliberately: they are constructible for every type the writer accepts, so this covers the
+    /// whole corpus rather than the subset someone was willing to hand-build values for.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task FooterSchemaString_IsIndependentOfWhetherRowsWereWritten()
+    {
+        var covered = new HashSet<(string, int, string)>();
+        foreach ((string what, StructType schema) in ConstructiveArtifacts(covered))
+        {
+            string expected = SchemaJson.ToJson(schema);
+            string empty = await WriteAndReadFooterSchemaAsync(schema);
+            string populated = await WriteAndReadFooterSchemaAsync(schema, SingleRowBatch(schema));
+
+            if (!string.Equals(empty, populated, StringComparison.Ordinal))
+            {
+                Assert.Fail(
+                    $"The footer schemaString changed when rows were written, at {what}."
+                    + $"{Environment.NewLine}  no rows ({empty.Length} chars): {Truncate(empty)}"
+                    + $"{Environment.NewLine}  rows    ({populated.Length} chars): {Truncate(populated)}");
+            }
+
+            Assert.Equal(expected, populated);
+        }
+    }
+
+    /// <summary>
+    /// A single row: null wherever the schema permits one, a value wherever it does not.
+    /// </summary>
+    /// <remarks>
+    /// Nulls are used wherever they are legal so that BOTH definition-level paths are exercised
+    /// rather than only the dense one — the writer rejects a null in a non-nullable column
+    /// (<c>"Non-nullable column 'a' holds a null at row 0"</c>), which is why this is not simply an
+    /// all-null row. The value side dispatches over the type surface rather than a hand-picked
+    /// subset, and the default arm FAILS CLOSED, so a newly accepted writer type cannot quietly
+    /// drop out of this test's coverage.
+    /// </remarks>
+    private static ColumnBatch SingleRowBatch(StructType schema)
+    {
+        var vectors = new ColumnVector[schema.Count];
+        for (int i = 0; i < schema.Count; i++)
+        {
+            StructField field = schema[i];
+            MutableColumnVector vector = ColumnVectors.Create(field.DataType, 1);
+            if (field.Nullable)
+            {
+                vector.AppendNull();
+            }
+            else
+            {
+                AppendOneValue(vector, field.DataType);
+            }
+
+            vectors[i] = vector;
+        }
+
+        return new ManagedColumnBatch(schema, vectors, 1);
+    }
+
+    private static void AppendOneValue(MutableColumnVector vector, DataType type)
+    {
+        switch (type)
+        {
+            case BooleanType:
+                vector.AppendValue(true);
+                break;
+            case ByteType:
+                vector.AppendValue((sbyte)1);
+                break;
+            case ShortType:
+                vector.AppendValue((short)1);
+                break;
+            case IntegerType:
+            case DateType:
+                vector.AppendValue(1);
+                break;
+            case LongType:
+            case TimestampType:
+            case TimestampNtzType:
+            case DecimalType:
+                vector.AppendValue(1L);
+                break;
+            case FloatType:
+                vector.AppendValue(1f);
+                break;
+            case DoubleType:
+                vector.AppendValue(1d);
+                break;
+            case StringType:
+            case BinaryType:
+                vector.AppendBytes(new byte[] { 1 });
+                break;
+            default:
+                Assert.Fail(
+                    $"No value is constructible here for {type.SimpleString}, so a schema using it "
+                    + "would silently drop out of the rows-vs-no-rows comparison. Add an arm.");
+                break;
+        }
     }
 
     private static string Truncate(string text) =>
