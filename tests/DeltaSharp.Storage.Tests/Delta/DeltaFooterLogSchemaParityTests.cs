@@ -148,39 +148,112 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
     /// <remarks>
     /// A partitioned table stores partition values in the <c>add</c> action's
     /// <c>partitionValues</c> rather than in the data file, so the footer legitimately declares
-    /// FEWER columns than the log (measured, issue #724). Stating that as an exact relationship --
+    /// FEWER columns than the log (measured, issue #724). It is stated as an exact relationship --
     /// footer equals the log's schema minus exactly the partition columns, same order, byte for
-    /// byte -- means a transform that drops anything else from either side still fails here.
+    /// byte -- rather than as a mere inequality.
     /// <para>
-    /// The theory covers position and count because a relationship that only holds for a leading
-    /// single partition column would be a coincidence of the case chosen, not a property. It also
-    /// writes MULTIPLE data files: an earlier version asserted a single file existed, so the
-    /// multi-file commit was outside the guard entirely.
+    /// THE INSTANTIATION IS THE GUARD. At a single LEADING partition column, "drop the named
+    /// partition columns" and "drop the leading N columns" are indistinguishable, so a pruner that
+    /// silently switched from name-based to position-based would satisfy this test while corrupting
+    /// every other layout. That was measured, not imagined: such a transform is invisible at
+    /// position 0 and caught at positions 1 and 2. Hence the theory varies POSITION (first, middle,
+    /// last) and COUNT (one, two, and two NON-ADJACENT), because a relationship verified only where
+    /// two different rules coincide is a coincidence of the case chosen, not a property.
+    /// </para>
+    /// <para>
+    /// The partition VALUES also vary per row, so the commit genuinely produces more than one data
+    /// file and every one of them is compared. An earlier version asserted a single file existed,
+    /// which put multi-file commits outside the guard; removing that assertion was not enough on
+    /// its own, because the batch still carried one distinct partition value and so still produced
+    /// exactly one file. The file count is therefore ASSERTED here rather than described, since a
+    /// claim about coverage that nothing checks is how the first version came to be wrong.
     /// </para>
     /// </remarks>
     [Theory]
-    [InlineData(0)]
-    [InlineData(1)]
-    [InlineData(2)]
-    public async Task Partitioned_FooterOmitsExactlyThePartitionColumns_AndNothingElse(int position)
+    [InlineData(new[] { 0 })]
+    [InlineData(new[] { 1 })]
+    [InlineData(new[] { 2 })]
+    [InlineData(new[] { 0, 1 })]
+    [InlineData(new[] { 1, 2 })]
+    [InlineData(new[] { 0, 2 })]
+    public async Task Partitioned_FooterOmitsExactlyThePartitionColumns_AndNothingElse(int[] positions)
     {
         StructType schema = HostileSchema();
-        string[] partitionColumns = { schema[position].Name };
+        string[] partitionColumns = positions.Select(i => schema[i].Name).ToArray();
 
-        await AppendAsync(schema, partitionColumns, mergeSchema: false);
+        await AppendPartitionedAsync(schema, partitionColumns);
 
         var remainder = new StructType(
             schema.Where(f => !partitionColumns.Contains(f.Name, StringComparer.Ordinal)).ToArray());
         string expected = SchemaJson.ToJson(remainder);
 
         IReadOnlyList<(long Version, string Path, string Declared)> written = ReadCommittedFiles();
-        Assert.NotEmpty(written);
+
+        // Two rows carrying DIFFERENT partition values must land in two different partition
+        // directories, hence two data files. Asserted, because the previous version of this test
+        // described multi-file coverage it did not actually have.
+        Assert.Equal(2, written.Count);
 
         foreach ((long _, string path, string declared) in written)
         {
             Assert.Equal(SchemaJson.ToJson(schema), declared);
             Assert.NotEqual(declared, await ReadFooterSchema(path));
             Assert.Equal(expected, await ReadFooterSchema(path));
+        }
+    }
+
+    /// <summary>
+    /// Writes one partitioned commit whose two rows differ in EVERY partition column, so the
+    /// commit spans two partition directories and produces two data files.
+    /// </summary>
+    private async Task AppendPartitionedAsync(StructType schema, IReadOnlyList<string> partitionColumns)
+    {
+        using DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(_root);
+
+        var vectors = new ColumnVector[schema.Count];
+        for (int i = 0; i < schema.Count; i++)
+        {
+            StructField field = schema[i];
+            MutableColumnVector vector = ColumnVectors.Create(field.DataType, 2);
+            if (partitionColumns.Contains(field.Name, StringComparer.Ordinal))
+            {
+                AppendPartitionValue(vector, field.DataType, 0);
+                AppendPartitionValue(vector, field.DataType, 1);
+            }
+            else
+            {
+                ScalarCorpus.AppendOne(vector, field.DataType);
+                ScalarCorpus.AppendOne(vector, field.DataType);
+            }
+
+            vectors[i] = vector;
+        }
+
+        await target.AppendAsync(
+            schema, partitionColumns, new[] { new ManagedColumnBatch(schema, vectors, 2) });
+    }
+
+    /// <summary>Appends partition value number <paramref name="row"/>, distinct per row.</summary>
+    /// <remarks>
+    /// Fails closed: a partition column of a type with no arm here would otherwise silently get
+    /// two IDENTICAL values, collapsing the commit back to a single file and quietly removing the
+    /// multi-file coverage this test exists to provide.
+    /// </remarks>
+    private static void AppendPartitionValue(MutableColumnVector vector, DataType type, int row)
+    {
+        switch (type)
+        {
+            case StringType:
+                vector.AppendBytes(Encoding.UTF8.GetBytes(row == 0 ? "west" : "east"));
+                break;
+            case LongType:
+                vector.AppendValue(row == 0 ? 1L : 2L);
+                break;
+            default:
+                Assert.Fail(
+                    $"No DISTINCT partition value is constructible here for {type.SimpleString}, so "
+                    + "partitioning on it would collapse to one file and silently narrow this test.");
+                break;
         }
     }
 
