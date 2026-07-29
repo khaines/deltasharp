@@ -57,7 +57,8 @@ public sealed class DeltaFooterLogParityCoverageTests
         // Non-vacuity: an empty required set makes every check below pass for the wrong reason.
         Assert.NotEmpty(required);
 
-        IReadOnlySet<string> driven = await RunParitySuiteAsync();
+        IReadOnlySet<(string Type, string Method)> record = await RunParitySuiteAsync();
+        HashSet<string> driven = record.Select(r => r.Method).ToHashSet(StringComparer.Ordinal);
 
         string[] undriven = required
             .Select(m => m.Name)
@@ -80,6 +81,149 @@ public sealed class DeltaFooterLogParityCoverageTests
     }
 
     /// <summary>
+    /// Every <c>SchemaJson.ToJson</c> call site in production is reached by something the parity
+    /// suite actually ran.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the REQUIRED side, and it exists because the previous required side was a hand-list
+    /// wearing a reflection query. It asked <c>typeof(DeltaWriteTarget)</c> for methods returning
+    /// <c>Task&lt;DeltaWriteResult&gt;</c> -- two hand-picked literals -- while the property this
+    /// suite protects is about <c>SchemaJson.ToJson</c> call sites. Those live on other types and
+    /// return other things: the ALTER RENAME/DROP seam and the empty-create seam are on
+    /// <c>DeltaTableWriter</c> returning <c>Task&lt;DeltaCommitResult&gt;</c>, so they sat outside
+    /// the asked-about set BY CONSTRUCTION and no improvement to the walk could ever have surfaced
+    /// them. A transform installed at only those sites left the whole suite green while an ALTER
+    /// silently rewrote a committed <c>schemaString</c>.
+    /// </para>
+    /// <para>
+    /// So the required set is read off the property itself: every method in the production
+    /// assembly whose IL contains a call to <c>SchemaJson.ToJson</c>. A new call site, on a new
+    /// type, with a new return type, surfaces here automatically. The driven side had been
+    /// hardened against hand-listing three times over while the required side stayed two literals.
+    /// </para>
+    /// <para>
+    /// The two halves are composed in the direction each is sound in: WHICH entry points ran is
+    /// answered dynamically by the recorder, and WHICH call sites those can reach is answered
+    /// statically. The static leg over-approximates -- an untaken branch still counts as reached --
+    /// so this proves a call site is not ORPHANED, not that it executed. That limit is stated
+    /// rather than hidden: the parity assertions prove behaviour at a site, and this only ensures
+    /// some test drives the operation that owns it.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task ParityGuard_ReachesEverySchemaJsonCallSite()
+    {
+        MethodBase[] callSites = SchemaJsonCallSites().ToArray();
+
+        // Non-vacuity: if the scan finds nothing every check below passes for the wrong reason --
+        // and finding nothing is exactly what a renamed serializer would look like.
+        Assert.NotEmpty(callSites);
+
+        IReadOnlySet<(string Type, string Method)> record = await RunParitySuiteAsync();
+        HashSet<MethodBase> reached = ReachableInProduction(record);
+
+        string[] orphaned = callSites
+            .Where(m => !reached.Contains(m))
+            .Select(m => $"{m.DeclaringType?.Name}.{m.Name}")
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(n => n, StringComparer.Ordinal)
+            .ToArray();
+
+        if (orphaned.Length > 0)
+        {
+            Assert.Fail(
+                "Production serializes a committed schemaString at call sites that nothing the "
+                + "footer/log parity suite executed can reach, so a transform there reproduces "
+                + "issue #679's divergence with the suite green."
+                + $"{Environment.NewLine}  unreached call sites: {string.Join(", ", orphaned)}"
+                + $"{Environment.NewLine}  executed entry points: "
+                + string.Join(", ", record.Select(r => r.Method).OrderBy(n => n, StringComparer.Ordinal)));
+        }
+    }
+
+    /// <summary>Every production method whose IL calls <c>SchemaJson.ToJson</c>.</summary>
+    private static IEnumerable<MethodBase> SchemaJsonCallSites()
+    {
+        foreach (MethodBase method in ProductionMethods())
+        {
+            foreach (MethodBase called in CallTargets(method))
+            {
+                if (string.Equals(called.Name, "ToJson", StringComparison.Ordinal)
+                    && string.Equals(called.DeclaringType?.Name, "SchemaJson", StringComparison.Ordinal))
+                {
+                    yield return method;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// <summary>Every method in the production assembly, including compiler-generated ones.</summary>
+    private static IEnumerable<MethodBase> ProductionMethods()
+    {
+        const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic
+            | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly;
+
+        foreach (Type type in typeof(DeltaWriteTarget).Assembly.GetTypes())
+        {
+            foreach (MethodBase method in type.GetMethods(flags).Cast<MethodBase>()
+                .Concat(type.GetConstructors(flags)))
+            {
+                yield return method;
+            }
+        }
+    }
+
+    /// <summary>Production methods reachable from the entry points the suite actually executed.</summary>
+    private static HashSet<MethodBase> ReachableInProduction(
+        IReadOnlySet<(string Type, string Method)> executed)
+    {
+        const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic
+            | BindingFlags.Instance | BindingFlags.Static;
+
+        Assembly production = typeof(DeltaWriteTarget).Assembly;
+
+        MethodBase[] roots = executed
+            .SelectMany(e => production.GetType(e.Type) is { } owner
+                ? owner.GetMethods(flags)
+                    .Where(m => string.Equals(m.Name, e.Method, StringComparison.Ordinal))
+                    .Cast<MethodBase>()
+                : Array.Empty<MethodBase>())
+            .ToArray();
+
+        // Non-vacuity: recorded entry points that resolve to nothing would empty the reachable set
+        // and report every call site orphaned -- loud, but for the wrong reason.
+        Assert.NotEmpty(roots);
+
+        var seen = new HashSet<MethodBase>(roots);
+        var queue = new Queue<MethodBase>(roots);
+
+        while (queue.Count > 0)
+        {
+            MethodBase current = queue.Dequeue();
+
+            foreach (MethodBase moved in StateMachineMethodsOf(current))
+            {
+                if (seen.Add(moved))
+                {
+                    queue.Enqueue(moved);
+                }
+            }
+
+            foreach (MethodBase called in CallTargets(current))
+            {
+                if (called.DeclaringType?.Assembly == production && seen.Add(called))
+                {
+                    queue.Enqueue(called);
+                }
+            }
+        }
+
+        return seen;
+    }
+
+    /// <summary>
     /// Runs every executable case of the parity suite and returns the entry points they invoked.
     /// </summary>
     /// <remarks>
@@ -89,7 +233,7 @@ public sealed class DeltaFooterLogParityCoverageTests
     /// visible -- both remove cases from this enumeration, so the entry points they drove stop
     /// appearing in the recorded set.
     /// </remarks>
-    private static async Task<IReadOnlySet<string>> RunParitySuiteAsync()
+    private static async Task<IReadOnlySet<(string Type, string Method)>> RunParitySuiteAsync()
     {
         const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic
             | BindingFlags.Instance | BindingFlags.DeclaredOnly;
@@ -175,15 +319,20 @@ public sealed class DeltaFooterLogParityCoverageTests
     [Fact]
     public async Task RecordedEntryPoints_AreBackedByRealCalls()
     {
-        IReadOnlySet<string> recorded = await RunParitySuiteAsync();
-        HashSet<string> callable = ReachableFromTests(typeof(DeltaFooterLogSchemaParityTests))
-            .Where(m => m.DeclaringType == typeof(DeltaWriteTarget))
-            .Select(m => m.Name)
-            .ToHashSet(StringComparer.Ordinal);
+        IReadOnlySet<(string Type, string Method)> recorded = await RunParitySuiteAsync();
+
+        // The owning type is compared too, so a label naming the right method on the WRONG type is
+        // unbacked -- the recorder's key is what the required-side walk roots itself on.
+        HashSet<(string Type, string Method)> callable =
+            ReachableFromTests(typeof(DeltaFooterLogSchemaParityTests))
+                .Where(m => m.DeclaringType?.FullName is not null)
+                .Select(m => (m.DeclaringType!.FullName!, m.Name))
+                .ToHashSet();
 
         Assert.NotEmpty(callable);
 
-        string[] unbacked = recorded.Where(n => !callable.Contains(n))
+        string[] unbacked = recorded.Where(r => !callable.Contains(r))
+            .Select(r => $"{r.Type}.{r.Method}")
             .OrderBy(n => n, StringComparer.Ordinal).ToArray();
 
         if (unbacked.Length > 0)

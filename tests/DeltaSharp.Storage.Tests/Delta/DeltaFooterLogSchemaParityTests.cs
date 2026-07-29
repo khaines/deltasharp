@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using DeltaSharp.Engine.Columnar;
+using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
 using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Storage.Writing;
@@ -236,7 +237,7 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
             vectors[i] = vector;
         }
 
-        WriteEntryPointRecorder.Record(nameof(DeltaWriteTarget.AppendAsync));
+        WriteEntryPointRecorder.Record(typeof(DeltaWriteTarget), nameof(DeltaWriteTarget.AppendAsync));
         await target.AppendAsync(
             schema, partitionColumns, new[] { new ManagedColumnBatch(schema, vectors, 2) });
     }
@@ -297,7 +298,7 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
         using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
             _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names))
         {
-            WriteEntryPointRecorder.Record(nameof(DeltaWriteTarget.CreateNameMappedTableAsync));
+            WriteEntryPointRecorder.Record(typeof(DeltaWriteTarget), nameof(DeltaWriteTarget.CreateNameMappedTableAsync));
             await target.CreateNameMappedTableAsync(
                 created, Array.Empty<string>(), new[] { BuildBatch(created, "west") },
                 new SeededPhysicalNameSource(CreateSeed));
@@ -310,7 +311,7 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
             _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names,
             new SeededPhysicalNameSource(EvolveSeed)))
         {
-            WriteEntryPointRecorder.Record(nameof(DeltaWriteTarget.AppendAsync));
+            WriteEntryPointRecorder.Record(typeof(DeltaWriteTarget), nameof(DeltaWriteTarget.AppendAsync));
             await append.AppendAsync(
                 evolved, Array.Empty<string>(), new[] { BuildBatch(evolved, "east") }, mergeSchema: true);
         }
@@ -382,22 +383,22 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
             switch (seam)
             {
                 case CreateSeam.IdMapped:
-                    WriteEntryPointRecorder.Record(nameof(DeltaWriteTarget.CreateIdMappedTableAsync));
+                    WriteEntryPointRecorder.Record(typeof(DeltaWriteTarget), nameof(DeltaWriteTarget.CreateIdMappedTableAsync));
                     await target.CreateIdMappedTableAsync(
                                 created, Array.Empty<string>(), batches, source);
                     break;
                 case CreateSeam.NameMappedDeletionVector:
-                    WriteEntryPointRecorder.Record(nameof(DeltaWriteTarget.CreateNameMappedDeletionVectorTableAsync));
+                    WriteEntryPointRecorder.Record(typeof(DeltaWriteTarget), nameof(DeltaWriteTarget.CreateNameMappedDeletionVectorTableAsync));
                     await target.CreateNameMappedDeletionVectorTableAsync(
                                 created, Array.Empty<string>(), batches, source);
                     break;
                 case CreateSeam.IdMappedDeletionVector:
-                    WriteEntryPointRecorder.Record(nameof(DeltaWriteTarget.CreateIdMappedDeletionVectorTableAsync));
+                    WriteEntryPointRecorder.Record(typeof(DeltaWriteTarget), nameof(DeltaWriteTarget.CreateIdMappedDeletionVectorTableAsync));
                     await target.CreateIdMappedDeletionVectorTableAsync(
                                 created, Array.Empty<string>(), batches, source);
                     break;
                 case CreateSeam.DeletionVector:
-                    WriteEntryPointRecorder.Record(nameof(DeltaWriteTarget.CreateDeletionVectorTableAsync));
+                    WriteEntryPointRecorder.Record(typeof(DeltaWriteTarget), nameof(DeltaWriteTarget.CreateDeletionVectorTableAsync));
                     await target.CreateDeletionVectorTableAsync(
                                 created, Array.Empty<string>(), batches);
                     break;
@@ -426,6 +427,80 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
     /// <summary>
     /// Asserts the committed log declares everything the caller did, adding only mapping keys.
     /// </summary>
+    /// <summary>
+    /// ALTER RENAME/DROP COLUMN rewrites the committed <c>schemaString</c>, and must carry every
+    /// metadata entry the caller declared through the rewrite.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This drives <c>DeltaTableWriter.CommitSchemaChangeAsync</c>, a <c>SchemaJson.ToJson</c> call
+    /// site that no other test in this suite could reach. It was invisible to the operation-set
+    /// guard for a structural reason worth recording: that guard derived its required set from
+    /// <c>typeof(DeltaWriteTarget)</c> methods returning <c>Task&lt;DeltaWriteResult&gt;</c>, and
+    /// ALTER is on a different type returning a different result, so it was excluded BY
+    /// CONSTRUCTION rather than by oversight. A transform installed at only this site left the
+    /// entire suite green while an ALTER silently dropped a field's classification metadata.
+    /// </para>
+    /// <para>
+    /// There is no footer to compare against here -- ALTER is metadata-only and writes no data
+    /// file -- so the assertion is the one that holds without a sibling artifact: the caller's own
+    /// declared metadata, which is test-owned ground truth, survives the rewrite. That is the same
+    /// property the column-mapping evolution test pins, at the seam ALTER owns.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AlterColumn_PreservesEveryMetadataEntryTheCallerDeclared(bool drop)
+    {
+        StructType created = MappableSchema();
+
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), FileNames(),
+            new SeededPhysicalNameSource(CreateSeed)))
+        {
+            WriteEntryPointRecorder.Record(
+                typeof(DeltaWriteTarget), nameof(DeltaWriteTarget.CreateNameMappedTableAsync));
+            await target.CreateNameMappedTableAsync(
+                created, Array.Empty<string>(), new[] { BuildBatch(created, "west") },
+                new SeededPhysicalNameSource(CreateSeed));
+        }
+
+        var writer = new DeltaTableWriter(new LocalFileSystemBackend(_root));
+        StructType expected;
+
+        if (drop)
+        {
+            WriteEntryPointRecorder.Record(
+                typeof(DeltaTableWriter), nameof(DeltaTableWriter.DropColumnAsync));
+            await writer.DropColumnAsync("naïve");
+            expected = new StructType(created.Where(f => f.Name != "naïve").ToArray());
+        }
+        else
+        {
+            WriteEntryPointRecorder.Record(
+                typeof(DeltaTableWriter), nameof(DeltaTableWriter.RenameColumnAsync));
+            await writer.RenameColumnAsync("région", "region");
+            expected = new StructType(created
+                .Select(f => f.Name == "région"
+                    ? new StructField("region", f.DataType, f.Nullable, f.Metadata)
+                    : f)
+                .ToArray());
+        }
+
+        IReadOnlyList<(long Version, string Declared)> committed = ReadCommittedSchemas();
+
+        // The ALTER commit must be a NEW one at a LATER version: if the operation committed
+        // nothing, the create's schemaString would satisfy the assertion below while the seam
+        // under test never ran.
+        Assert.True(
+            committed.Count >= 2 && committed[^1].Version > committed[0].Version,
+            "ALTER produced no new schema-carrying commit; versions seen: "
+            + string.Join(", ", committed.Select(c => c.Version)));
+
+        AssertDeclaredPreservesCallerMetadata(expected, committed[^1].Declared);
+    }
+
     private static void AssertDeclaredPreservesCallerMetadata(StructType expectedSchema, string declared)
     {
         var logged = (StructType)SchemaJson.FromJson(declared);
@@ -542,7 +617,7 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
         using DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(_root);
 
         var batch = BuildBatch(schema, "west");
-        WriteEntryPointRecorder.Record(nameof(DeltaWriteTarget.AppendAsync));
+        WriteEntryPointRecorder.Record(typeof(DeltaWriteTarget), nameof(DeltaWriteTarget.AppendAsync));
         await target.AppendAsync(schema, partitionColumns, new[] { batch }, mergeSchema);
     }
 
@@ -554,7 +629,7 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
     {
         using DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(_root);
 
-        WriteEntryPointRecorder.Record(nameof(DeltaWriteTarget.OverwriteAsync));
+        WriteEntryPointRecorder.Record(typeof(DeltaWriteTarget), nameof(DeltaWriteTarget.OverwriteAsync));
         await target.OverwriteAsync(
             schema,
             Array.Empty<string>(),
@@ -620,6 +695,40 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
     /// nothing between the writer and the assertion can normalize a difference away.
     /// </para>
     /// </remarks>
+    /// <summary>
+    /// The <c>schemaString</c> of every commit that carries a <c>metaData</c> action.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="ReadCommittedFiles"/> pairs a schema with the data files committed under it, so a
+    /// metadata-ONLY commit -- which is what ALTER produces -- yields no row there. This reader
+    /// exists for those seams and deliberately keeps the version, so a test can require that the
+    /// operation actually committed rather than silently re-reading the create.
+    /// </remarks>
+    private IReadOnlyList<(long Version, string Declared)> ReadCommittedSchemas()
+    {
+        var results = new List<(long, string)>();
+        string[] commits = Directory.GetFiles(Path.Combine(_root, "_delta_log"), "*.json");
+        Array.Sort(commits, StringComparer.Ordinal);
+
+        foreach (string commit in commits)
+        {
+            long version = long.Parse(
+                Path.GetFileNameWithoutExtension(commit), System.Globalization.CultureInfo.InvariantCulture);
+
+            foreach (string line in File.ReadAllLines(commit))
+            {
+                using JsonDocument document = JsonDocument.Parse(line);
+                if (document.RootElement.TryGetProperty("metaData", out JsonElement metadata)
+                    && metadata.TryGetProperty("schemaString", out JsonElement schemaString))
+                {
+                    results.Add((version, schemaString.GetString()!));
+                }
+            }
+        }
+
+        return results;
+    }
+
     private IReadOnlyList<(long Version, string Path, string Declared)> ReadCommittedFiles()
     {
         var results = new List<(long, string, string)>();

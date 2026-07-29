@@ -3,7 +3,7 @@ using System.Collections.Concurrent;
 namespace DeltaSharp.Storage.Tests.Delta;
 
 /// <summary>
-/// Records which <c>DeltaWriteTarget</c> entry points the footer/log parity suite ACTUALLY invoked
+/// Records which production entry points the footer/log parity suite ACTUALLY invoked
 /// during a run, as opposed to which ones its code could reach.
 /// </summary>
 /// <remarks>
@@ -25,18 +25,29 @@ namespace DeltaSharp.Storage.Tests.Delta;
 /// </remarks>
 internal static class WriteEntryPointRecorder
 {
-    private static readonly ConcurrentDictionary<string, byte> Driven = new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<(string Type, string Method), byte> Driven = new();
 
-    /// <summary>Notes that <paramref name="entryPoint"/> was invoked.</summary>
+    /// <summary>Notes that <paramref name="method"/> on <paramref name="owner"/> was invoked.</summary>
     /// <remarks>
     /// Calls sit immediately beside the invocation they describe, and
     /// <c>RecordedEntryPoints_AreBackedByRealCalls</c> checks each recorded name against the IL of
-    /// the method that recorded it -- so a label that drifts away from the call it claims to
-    /// describe fails rather than quietly widening the reported coverage.
+    /// the suite -- so a label that drifts away from the call it claims to describe fails rather
+    /// than quietly widening the reported coverage.
+    /// <para>
+    /// The owning TYPE is recorded, not just the name, because the required side is derived from
+    /// <c>SchemaJson.ToJson</c> call sites across all of <c>DeltaSharp.Storage</c> -- which span
+    /// more than one type and more than one return type -- and coverage is computed by walking
+    /// production IL forward from what actually ran. A bare name cannot be resolved back to a
+    /// method to walk from.
+    /// </para>
     /// </remarks>
-    internal static void Record(string entryPoint) => Driven[entryPoint] = 0;
+    internal static void Record(Type owner, string method)
+    {
+        ArgumentNullException.ThrowIfNull(owner);
+        Driven[(owner.FullName!, method)] = 0;
+    }
 
-    internal static IReadOnlySet<string> Snapshot() => Driven.Keys.ToHashSet(StringComparer.Ordinal);
+    internal static IReadOnlySet<(string Type, string Method)> Snapshot() => Driven.Keys.ToHashSet();
 
     internal static void Reset() => Driven.Clear();
 }
