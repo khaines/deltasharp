@@ -57,13 +57,13 @@ public sealed class DeltaFooterLogParityCoverageTests
         // Non-vacuity: an empty required set makes every check below pass for the wrong reason.
         Assert.NotEmpty(required);
 
-        IReadOnlySet<(string Type, string Method)> record = await RunParitySuiteAsync();
-        HashSet<string> driven = record.Select(r => r.Method).ToHashSet(StringComparer.Ordinal);
+        IReadOnlySet<(string Type, string Method, string Signature)> record = await RunParitySuiteAsync();
+        HashSet<MethodBase> driven = ResolveRecorded(record);
 
         string[] undriven = required
-            .Select(m => m.Name)
+            .Where(m => !driven.Contains(m))
+            .Select(Describe)
             .Distinct(StringComparer.Ordinal)
-            .Where(n => !driven.Contains(n))
             .OrderBy(n => n, StringComparer.Ordinal)
             .ToArray();
 
@@ -74,7 +74,7 @@ public sealed class DeltaFooterLogParityCoverageTests
                 + "in the footer/log parity suite executed, so a transform at their call sites "
                 + "reproduces issue #679's divergence with the suite green."
                 + $"{Environment.NewLine}  undriven: {string.Join(", ", undriven)}"
-                + $"{Environment.NewLine}  executed: {string.Join(", ", driven.OrderBy(n => n, StringComparer.Ordinal))}"
+                + $"{Environment.NewLine}  executed: {string.Join(", ", driven.Select(Describe).OrderBy(n => n, StringComparer.Ordinal))}"
                 + $"{Environment.NewLine}  A skipped test, a deleted [InlineData] row and a "
                 + "commented-out [Fact] all reach here, because this counts EXECUTION.");
         }
@@ -135,7 +135,7 @@ public sealed class DeltaFooterLogParityCoverageTests
         // and finding nothing is exactly what a renamed serializer would look like.
         Assert.NotEmpty(callSites);
 
-        IReadOnlySet<(string Type, string Method)> record = await RunParitySuiteAsync();
+        IReadOnlySet<(string Type, string Method, string Signature)> record = await RunParitySuiteAsync();
         HashSet<MethodBase> reached = ReachableInProduction(record);
 
         string[] orphaned = callSites
@@ -197,20 +197,10 @@ public sealed class DeltaFooterLogParityCoverageTests
 
     /// <summary>Production methods reachable from the entry points the suite actually executed.</summary>
     private static HashSet<MethodBase> ReachableInProduction(
-        IReadOnlySet<(string Type, string Method)> executed)
+        IReadOnlySet<(string Type, string Method, string Signature)> executed)
     {
-        const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic
-            | BindingFlags.Instance | BindingFlags.Static;
-
         Assembly production = typeof(DeltaWriteTarget).Assembly;
-
-        MethodBase[] roots = executed
-            .SelectMany(e => production.GetType(e.Type) is { } owner
-                ? owner.GetMethods(flags)
-                    .Where(m => string.Equals(m.Name, e.Method, StringComparison.Ordinal))
-                    .Cast<MethodBase>()
-                : Array.Empty<MethodBase>())
-            .ToArray();
+        MethodBase[] roots = ResolveRecorded(executed).ToArray();
 
         // Non-vacuity: recorded entry points that resolve to nothing would empty the reachable set
         // and report every call site orphaned -- loud, but for the wrong reason.
@@ -253,7 +243,7 @@ public sealed class DeltaFooterLogParityCoverageTests
     /// visible -- both remove cases from this enumeration, so the entry points they drove stop
     /// appearing in the recorded set.
     /// </remarks>
-    private static async Task<IReadOnlySet<(string Type, string Method)>> RunParitySuiteAsync()
+    private static async Task<IReadOnlySet<(string Type, string Method, string Signature)>> RunParitySuiteAsync()
     {
         const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic
             | BindingFlags.Instance | BindingFlags.DeclaredOnly;
@@ -339,7 +329,7 @@ public sealed class DeltaFooterLogParityCoverageTests
     [Fact]
     public async Task RecordedEntryPoints_AreBackedByRealCalls()
     {
-        IReadOnlySet<(string Type, string Method)> recorded = await RunParitySuiteAsync();
+        IReadOnlySet<(string Type, string Method, string Signature)> recorded = await RunParitySuiteAsync();
 
         // The owning type is compared too, so a label naming the right method on the WRONG type is
         // unbacked -- the recorder's key is what the required-side walk roots itself on.
@@ -351,7 +341,7 @@ public sealed class DeltaFooterLogParityCoverageTests
 
         Assert.NotEmpty(callable);
 
-        string[] unbacked = recorded.Where(r => !callable.Contains(r))
+        string[] unbacked = recorded.Where(r => !callable.Contains((r.Type, r.Method)))
             .Select(r => $"{r.Type}.{r.Method}")
             .OrderBy(n => n, StringComparer.Ordinal).ToArray();
 
@@ -472,6 +462,80 @@ public sealed class DeltaFooterLogParityCoverageTests
             yield return m;
         }
     }
+
+    /// <summary>Each recorded label, resolved to EXACTLY ONE production method.</summary>
+    /// <remarks>
+    /// <para>
+    /// Both halves of this guard used to join on the bare method NAME, which meant every
+    /// same-named overload was promoted to a driven root regardless of what ran. A private,
+    /// uncalled overload of a real write door -- not in any branch, taken or otherwise -- was
+    /// therefore reported covered, while the byte-identical method under a DIFFERENT name was
+    /// caught. The whole delta between "covered" and "caught" was the name, and adding an overload
+    /// is ordinary maintenance.
+    /// </para>
+    /// <para>
+    /// So ambiguity is an ERROR here rather than a broadcast: a label matching several methods
+    /// fails instead of rooting all of them. That is the fail-closed direction, and it makes the
+    /// author say which overload ran (via the parameter-type arguments to <c>Record</c>) instead of
+    /// silently claiming all of them. This is the same defect as the function-pointer blind spot,
+    /// one level down -- an opcode set is not a call graph, and a name is not a method.
+    /// </para>
+    /// </remarks>
+    private static HashSet<MethodBase> ResolveRecorded(
+        IReadOnlySet<(string Type, string Method, string Signature)> recorded)
+    {
+        const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic
+            | BindingFlags.Instance | BindingFlags.Static;
+
+        Assembly production = typeof(DeltaWriteTarget).Assembly;
+        var resolved = new HashSet<MethodBase>();
+        var bad = new List<string>();
+
+        foreach ((string type, string method, string signature) in recorded)
+        {
+            MethodInfo[] matches = production.GetType(type) is { } owner
+                ? owner.GetMethods(flags)
+                    .Where(m => string.Equals(m.Name, method, StringComparison.Ordinal))
+                    .Where(m => signature.Length == 0 || string.Equals(
+                        signature,
+                        WriteEntryPointRecorder.SignatureOf(m.GetParameters().Select(q => q.ParameterType)),
+                        StringComparison.Ordinal))
+                    .ToArray()
+                : Array.Empty<MethodInfo>();
+
+            if (matches.Length == 1)
+            {
+                resolved.Add(matches[0]);
+            }
+            else if (matches.Length == 0)
+            {
+                bad.Add($"{type}.{method} resolves to NO product method");
+            }
+            else
+            {
+                bad.Add(
+                    $"{type}.{method} is AMBIGUOUS -- it names {matches.Length} methods "
+                    + $"({string.Join(" | ", matches.Select(Describe))}). Rooting all of them would "
+                    + "report an overload nobody executed as driven, so record the parameter types.");
+            }
+        }
+
+        if (bad.Count > 0)
+        {
+            Assert.Fail(
+                "A recorded entry point does not identify exactly one production method, so the "
+                + "driven set cannot be trusted."
+                + $"{Environment.NewLine}  {string.Join(Environment.NewLine + "  ", bad)}");
+        }
+
+        // Non-vacuity: no roots would empty the reachable set and report every call site orphaned.
+        Assert.NotEmpty(resolved);
+        return resolved;
+    }
+
+    /// <summary>A method rendered with its signature, so overloads are distinguishable.</summary>
+    private static string Describe(MethodBase method) =>
+        $"{method.Name}({string.Join(", ", method.GetParameters().Select(p => p.ParameterType.Name))})";
 
     private static bool IsWithin(Type? candidate, Type outer)
     {

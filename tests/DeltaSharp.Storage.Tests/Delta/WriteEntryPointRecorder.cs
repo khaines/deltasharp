@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace DeltaSharp.Storage.Tests.Delta;
 
@@ -25,7 +27,8 @@ namespace DeltaSharp.Storage.Tests.Delta;
 /// </remarks>
 internal static class WriteEntryPointRecorder
 {
-    private static readonly ConcurrentDictionary<(string Type, string Method), byte> Driven = new();
+    private static readonly ConcurrentDictionary<(string Type, string Method, string Signature), byte>
+        Driven = new();
 
     /// <summary>Notes that <paramref name="method"/> on <paramref name="owner"/> was invoked.</summary>
     /// <remarks>
@@ -41,13 +44,25 @@ internal static class WriteEntryPointRecorder
     /// method to walk from.
     /// </para>
     /// </remarks>
-    internal static void Record(Type owner, string method)
+    /// <param name="parameterTypes">
+    /// The driven overload's parameter types. Omit them only while the name is unambiguous: the
+    /// guard resolves a label to EXACTLY ONE product method and fails if the name matches several,
+    /// because joining on a bare name silently promotes every same-named overload to a driven root.
+    /// A name is not a method.
+    /// </param>
+    internal static void Record(Type owner, string method, params Type[] parameterTypes)
     {
         ArgumentNullException.ThrowIfNull(owner);
-        Driven[(owner.FullName!, method)] = 0;
+        ArgumentNullException.ThrowIfNull(parameterTypes);
+        Driven[(owner.FullName!, method, SignatureOf(parameterTypes))] = 0;
     }
 
-    internal static IReadOnlySet<(string Type, string Method)> Snapshot() => Driven.Keys.ToHashSet();
+    internal static IReadOnlySet<(string Type, string Method, string Signature)> Snapshot() =>
+        Driven.Keys.ToHashSet();
 
     internal static void Reset() => Driven.Clear();
+
+    /// <summary>The canonical signature key, or the empty string when none was supplied.</summary>
+    internal static string SignatureOf(IEnumerable<Type> parameterTypes) =>
+        string.Join(",", parameterTypes.Select(t => t.FullName ?? t.Name));
 }
