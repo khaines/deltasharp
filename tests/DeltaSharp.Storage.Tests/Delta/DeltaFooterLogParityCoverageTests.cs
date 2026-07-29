@@ -162,7 +162,6 @@ public sealed class DeltaFooterLogParityCoverageTests
         }
     }
 
-    /// <summary>Every production method whose IL calls <c>SchemaJson.ToJson</c>.</summary>
     /// <summary>
     /// Every production method that reaches <c>SchemaJson.ToJson</c>, TRANSITIVELY.
     /// </summary>
@@ -180,6 +179,15 @@ public sealed class DeltaFooterLogParityCoverageTests
     /// PUBLIC staged-file overloads, as reaching a committed schemaString with nothing driving
     /// them. That was a real product-surface coverage gap, not a guard artifact, and it is now
     /// covered by StagedFileOverloads_PreserveEveryMetadataEntryTheCallerDeclared.
+    /// </para>
+    /// <para>
+    /// LIMIT -- "reached" is NOT uniformly strong across this set. Two members, the public
+    /// staged-file overloads AppendAsync(StructType, IReadOnlyList&lt;StagedDataFile&gt;, ...) and
+    /// the matching OverwriteAsync, are covered by metadata-survival into the committed
+    /// schemaString rather than by footer-vs-log BYTE PARITY, because they emit NO FOOTER: the
+    /// caller stages the file and the writer only commits log actions, so there is no second
+    /// artifact to compare against. Everything else in this set is pinned by byte parity. Do not
+    /// read a green result here as equivalent coverage for those two. Tracked by #741.
     /// </para>
     /// </remarks>
     private static HashSet<MethodBase> RequiredSites()
