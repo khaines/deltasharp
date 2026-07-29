@@ -731,6 +731,20 @@ public sealed class ReplayedMetadataLogTests
         // contradiction by design; the storage rule is observed through the chain it keeps intact.
         Assert.True(log.TryGetProvenObservation(3, out IReadOnlyList<MetadataAction> observed));
         Assert.Equal(new[] { c }, observed.ToArray());
+
+        // DISCRIMINATING CONTROL. The assertion above is an ACCEPT, which a gate that rejects NOTHING also
+        // satisfies — measured: a fully neutered EnsureLineageIsAccountedFor turns 12 tests red and this one
+        // is not among them. So pair it with the minimal near-miss: the SAME history, except v2 witnesses a
+        // third instance instead of the twin, which must still be REJECTED. Together they say the twin is
+        // what makes the chain close, rather than that everything closes.
+        var control = new ReplayedMetadataLog(exclusiveUpperBound: 100);
+        control.Record(0, new[] { a }, null, a);
+        control.Record(1, None, a, twin);
+        control.Record(2, None, Meta("other"), b);   // NOT the twin — the chain must break here
+        control.Record(3, new[] { c }, b, c);
+
+        DeltaProtocolException error = Assert.Throws<DeltaProtocolException>(control.Seal);
+        AssertPathFree(error.Message);
     }
 
     /// <summary>

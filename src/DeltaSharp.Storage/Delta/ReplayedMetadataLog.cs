@@ -148,7 +148,29 @@ namespace DeltaSharp.Storage.Delta;
 /// <para>NOTE for whoever extends this: identity-vs-value is a REPO-WIDE shape wherever
 /// <c>ReferenceEquals</c> is applied to a record type, and it is used deliberately elsewhere (plan-tree
 /// rewriters return <c>this</c> when a child is unchanged BY IDENTITY). Those sites are outside this
-/// change's scope and are not audited here; do not assume this file's sweep covered them.</para>
+/// change's scope and are not audited here; do not assume this file's sweep covered them. Tracked by
+/// issue #733, which carries the site enumeration and the reason value equality would be a behaviour
+/// change at the plan-tree sites rather than a fix.</para>
+/// <para><b>Why five auditors missed it, which is worth more than the rule.</b> The round before had found a
+/// second mutation point on that exact line, so every seat had reason to examine it more carefully than any
+/// other line in the file — and all five mutated the ACCUMULATION, the point the previous finding had made
+/// salient. <b>The fix created the attention and simultaneously bounded it: the correction propagated as a
+/// PATTERN TO MATCH rather than a METHOD TO APPLY.</b> That is the failure mode to watch for after any
+/// finding, because the natural response to "we missed X here" is to look for X, and the line is now the
+/// least likely place to find Y. Re-derive the points from the rule at a corrected site; do not scan it for
+/// the shape of the last defect.</para>
+/// <para><b>Re-run a single-observation RED before banking it.</b> The first strictness sweep reported 1 red
+/// at the corroboration check, in an unrelated projection test; it did not reproduce. Reporting it would have
+/// claimed that guard PINNED when it was not. Flaky failures are habitually re-run and flaky results that
+/// make a guard look COVERED habitually are not — and the second kind is the dangerous one, because it
+/// terminates the search. A red that would let you stop looking deserves the same second run as a red that
+/// blocks a merge.</para>
+/// <para><b>An ACCEPT assertion is a weaker oracle than a REJECT assertion</b>, and needs a discriminating
+/// control. Where a mutation fails CLOSED the only way to pin it is a history that must be accepted — but
+/// "does not throw" is also satisfied by a gate that rejects NOTHING. Measured here: neutering the whole
+/// lineage cross-check turns 12 tests red, and the accept-only version of the storage-rule test was not among
+/// them. Pairing it with the minimal near-miss that must still be REJECTED puts it in both sets (13 red under
+/// the neutered gate, and still a single-point kill of its own mutation).</para>
 /// <para><b>The one worked set-wise comparison, shown as SETS because its totals were disputed twice.</b>
 /// A script implementing the rule above produced 13 non-boolean state writes; an independent hand audit
 /// produced 11. Neither total is evidence of anything; the membership is:</para>
