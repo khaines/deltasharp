@@ -117,6 +117,14 @@ public sealed class DeltaFooterLogParityCoverageTests
     /// collects -- rather than to refine the walk, for the same reason the driven side had to stop
     /// being static: "could this be reached" cannot answer "was this executed".
     /// </para>
+    /// <para>
+    /// A second limit, so that "every call site is covered" is not read as more than it is: one of
+    /// the seven sites serializes <c>StructType.Empty</c> (the empty-create path). It is covered as
+    /// a CALL SITE, but a transform shaped like the ones this suite exists to catch -- dropping or
+    /// rewriting field metadata -- is INERT there by construction, because there are no fields to
+    /// act on. No assertion can distinguish a correct empty-schema serializer from a corrupted one
+    /// on that input, so counting it toward coverage is honest only with this stated.
+    /// </para>
     /// </remarks>
     [Fact]
     public async Task ParityGuard_ReachesEverySchemaJsonCallSite()
@@ -145,7 +153,12 @@ public sealed class DeltaFooterLogParityCoverageTests
                 + "issue #679's divergence with the suite green."
                 + $"{Environment.NewLine}  unreached call sites: {string.Join(", ", orphaned)}"
                 + $"{Environment.NewLine}  executed entry points: "
-                + string.Join(", ", record.Select(r => r.Method).OrderBy(n => n, StringComparer.Ordinal)));
+                + string.Join(", ", record.Select(r => r.Method).OrderBy(n => n, StringComparer.Ordinal))
+                + $"{Environment.NewLine}  A site named '.cctor' means a serializer reference was "
+                + "moved into a delegate field. That site is still real -- it is counted precisely "
+                + "so the required set cannot shrink when someone refactors to a delegate -- but "
+                + "the reachability walk does not follow function pointers, so it cannot prove "
+                + "anything drives it. Either call it directly or drive it explicitly.");
         }
     }
 
@@ -154,7 +167,7 @@ public sealed class DeltaFooterLogParityCoverageTests
     {
         foreach (MethodBase method in ProductionMethods())
         {
-            foreach (MethodBase called in CallTargets(method))
+            foreach (MethodBase called in CallTargets(method, includeFunctionPointers: true))
             {
                 if (string.Equals(called.Name, "ToJson", StringComparison.Ordinal)
                     && string.Equals(called.DeclaringType?.Name, "SchemaJson", StringComparison.Ordinal))
@@ -473,7 +486,32 @@ public sealed class DeltaFooterLogParityCoverageTests
         return false;
     }
 
-    private static IEnumerable<MethodBase> CallTargets(MethodBase method)
+    /// <summary>
+    /// The methods <paramref name="method"/> references in its IL.
+    /// </summary>
+    /// <param name="method">The method whose body is walked.</param>
+    /// <param name="includeFunctionPointers">
+    /// Also yield targets taken by ADDRESS (<c>ldftn</c>/<c>ldvirtftn</c>) rather than called.
+    /// This flag exists because the two users of this walk need opposite safe directions, and
+    /// getting it backwards fails OPEN in one of them:
+    /// <list type="bullet">
+    /// <item><description>
+    /// The REQUIRED-side scan must set it. A method that hands <c>SchemaJson.ToJson</c> to a
+    /// delegate still serializes a committed schemaString, and omitting it silently SHRINKS the
+    /// required set -- an ordinary behaviour-preserving refactor to a delegate removed a real call
+    /// site from the guard's universe with nothing going red.
+    /// </description></item>
+    /// <item><description>
+    /// The label-honesty walk must NOT set it. There, following a bare address means a
+    /// method-group conversion that is never invoked counts as a call, which is precisely how the
+    /// dead-local-function attack got a recorded label declared honest.
+    /// </description></item>
+    /// </list>
+    /// Same instruction, opposite consequences: for "does this site exist" a missed reference is
+    /// the danger, and for "was this label earned" a spurious one is.
+    /// </param>
+    private static IEnumerable<MethodBase> CallTargets(
+        MethodBase method, bool includeFunctionPointers = false)
     {
         byte[]? il = method.GetMethodBody()?.GetILAsByteArray();
         if (il is null)
@@ -491,7 +529,10 @@ public sealed class DeltaFooterLogParityCoverageTests
         {
             OpCode op = ReadOpCode(il, ref i);
 
-            if (op == OpCodes.Call || op == OpCodes.Callvirt || op == OpCodes.Newobj)
+            bool referencesMethod = op == OpCodes.Call || op == OpCodes.Callvirt || op == OpCodes.Newobj
+                || (includeFunctionPointers && (op == OpCodes.Ldftn || op == OpCodes.Ldvirtftn));
+
+            if (referencesMethod)
             {
                 int token = BitConverter.ToInt32(il, i);
                 MethodBase? target = null;
