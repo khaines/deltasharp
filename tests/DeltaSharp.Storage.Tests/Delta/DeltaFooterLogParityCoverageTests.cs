@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Reflection.Emit;
+using System.Runtime.CompilerServices;
 using DeltaSharp.Storage.Writing;
 using Xunit;
 
@@ -208,7 +209,27 @@ public sealed class DeltaFooterLogParityCoverageTests
     /// follows only calls it can actually reach from them.
     /// <para>
     /// Async bodies live in compiler-generated state machines, so a test method's own IL contains
-    /// almost none of its calls; the walk therefore follows into nested types of the suite as well.
+    /// almost none of its calls. Those state machines are resolved by ATTRIBUTE IDENTITY -- each
+    /// reached method is asked for its own <see cref="StateMachineAttribute"/> -- and never by
+    /// name. An earlier version matched them by name substring
+    /// (<c>nested.Name.Contains($"&lt;{m.Name}&gt;")</c>), which walked ANY nested type whose name
+    /// embedded a reached method's name, reachable or not. A never-invoked non-capturing async
+    /// local function compiles to <c>&lt;&lt;Outer&gt;g__Dead|N_M&gt;d__X</c>, matched that
+    /// pattern, and had its calls reported as backing a recorded label -- measured GREEN with the
+    /// only real call sitting in dead code. Worse, the same walk was capture-SENSITIVE: the
+    /// capturing form of the identical local function lands in a <c>&lt;&gt;c__DisplayClass</c>,
+    /// was not matched, and went red. Soundness that depends on whether a lambda happens to
+    /// capture is not soundness, and compiler lowering is not a contract. Attribute identity
+    /// resolves the state machine OF a specific reached method, so dead code is unreachable by
+    /// construction and a called async local function is still followed transitively (its own
+    /// method is a call target, and its state machine comes off its own attribute).
+    /// </para>
+    /// <para>
+    /// Where this walk is now deliberately INCOMPLETE it is incomplete in the strict direction: a
+    /// body reached only through a delegate (<c>ldftn</c> + <c>newobj</c>) is not followed, so an
+    /// entry point called exclusively from a lambda would be reported as unbacked. That fails
+    /// CLOSED -- a false alarm, not a false clearance -- which is the correct direction for a
+    /// guard.
     /// </para>
     /// </remarks>
     private static HashSet<MethodBase> ReachableFromTests(Type type)
@@ -231,47 +252,25 @@ public sealed class DeltaFooterLogParityCoverageTests
 
         while (queue.Count > 0)
         {
-            foreach (MethodBase called in CallTargets(queue.Dequeue()))
+            MethodBase current = queue.Dequeue();
+
+            // An async or iterator method's own body is a stub that builds a state machine; the
+            // calls are in the machine. Ask THIS method which machine is its own, so nothing is
+            // reached that this method did not produce.
+            foreach (MethodBase moved in StateMachineMethodsOf(current))
+            {
+                if (seen.Add(moved))
+                {
+                    queue.Enqueue(moved);
+                }
+            }
+
+            foreach (MethodBase called in CallTargets(current))
             {
                 found.Add(called);
 
-                // Follow the suite's own code -- its helpers and the state machines its async
-                // methods compile into -- but stop at the product boundary.
-                if (IsWithin(called.DeclaringType, type) && seen.Add(called))
-                {
-                    queue.Enqueue(called);
-                }
-            }
-        }
-
-        // An async method's calls live in its state machine, which is reached via the
-        // AsyncTaskMethodBuilder rather than by a direct call, so pull those in explicitly.
-        foreach (Type nested in type.GetNestedTypes(BindingFlags.Public | BindingFlags.NonPublic))
-        {
-            foreach (MethodBase method in nested.GetMethods(flags).Cast<MethodBase>()
-                .Concat(nested.GetConstructors(flags)))
-            {
-                if (!IsStateMachineOf(nested, seen))
-                {
-                    continue;
-                }
-
-                foreach (MethodBase called in CallTargets(method))
-                {
-                    found.Add(called);
-                    if (IsWithin(called.DeclaringType, type) && seen.Add(called))
-                    {
-                        queue.Enqueue(called);
-                    }
-                }
-            }
-        }
-
-        while (queue.Count > 0)
-        {
-            foreach (MethodBase called in CallTargets(queue.Dequeue()))
-            {
-                found.Add(called);
+                // Follow the suite's own code -- its helpers and local functions -- but stop at
+                // the product boundary.
                 if (IsWithin(called.DeclaringType, type) && seen.Add(called))
                 {
                     queue.Enqueue(called);
@@ -282,9 +281,28 @@ public sealed class DeltaFooterLogParityCoverageTests
         return found;
     }
 
-    /// <summary>Is <paramref name="nested"/> the state machine of a method already reached?</summary>
-    private static bool IsStateMachineOf(Type nested, HashSet<MethodBase> reached) =>
-        reached.Any(m => nested.Name.Contains($"<{m.Name}>", StringComparison.Ordinal));
+    /// <summary>
+    /// The methods of <paramref name="method"/>'s own compiler-generated state machine, if it has
+    /// one, resolved from the attribute the compiler stamped on that specific method.
+    /// </summary>
+    private static IEnumerable<MethodBase> StateMachineMethodsOf(MethodBase method)
+    {
+        Type? machine = (method as MethodInfo)?
+            .GetCustomAttribute<StateMachineAttribute>(inherit: false)?.StateMachineType;
+
+        if (machine is null)
+        {
+            yield break;
+        }
+
+        const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic
+            | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly;
+
+        foreach (MethodBase m in machine.GetMethods(flags))
+        {
+            yield return m;
+        }
+    }
 
     private static bool IsWithin(Type? candidate, Type outer)
     {
