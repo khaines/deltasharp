@@ -171,6 +171,22 @@ namespace DeltaSharp.Storage.Delta;
 /// lineage cross-check turns 12 tests red, and the accept-only version of the storage-rule test was not among
 /// them. Pairing it with the minimal near-miss that must still be REJECTED puts it in both sets (13 red under
 /// the neutered gate, and still a single-point kill of its own mutation).</para>
+/// <para><b>A <c>!=</c> or <c>==</c> guard rejects in TWO directions, so one relational mutant is half a
+/// test.</b> Mutate to BOTH <c>&lt;</c> and <c>&gt;</c> — one mutant per rejected direction. The contiguity
+/// guard was reported PINNED by a seat that measured <c>!=</c> -> <c>&lt;</c> at 1 red; the other direction,
+/// <c>!=</c> -> <c>&gt;</c>, was 0 red, and a REPEATED or BACKWARD hand-over was accepted as a proven window.
+/// That is worse than a duplicate: <c>CoveredToExclusive = version + 1</c> runs unconditionally below the
+/// guard, so a backward hand-over SHRINKS the covered interval, and <c>_recordedVersions</c> is a
+/// <c>List&lt;long&gt;</c>, so a repeat duplicates a link in the chain walk this guard is what lets the doc
+/// call strictly ascending.</para>
+/// <para>Two seats mutated the SAME operator and reached OPPOSITE conclusions — neither carelessly. This is
+/// the relational form of the strictness axis that the <c>ReferenceEquals</c> sweep found, and that sweep
+/// structurally could not have caught it, because it was scoped to a method name rather than to a property of
+/// comparisons. Both-direction sweep of every <c>==</c>/<c>!=</c> in this type: contiguity 1 red each way
+/// (disjoint); the per-version corroboration 3 red one way and 1 red the other (disjoint); the metadata-count
+/// skip 77 red when inverted. The one exception is <c>entry.Metadata.Count == 0</c> -> <c>&lt;= 0</c> at
+/// 0 red, which is a PROVABLE equivalent rather than a hole: <c>Count</c> is non-negative by the
+/// <see cref="IReadOnlyList{T}"/> contract, so the two agree on every reachable value.</para>
 /// <para><b>The one worked set-wise comparison, shown as SETS because its totals were disputed twice.</b>
 /// A script implementing the rule above produced 13 non-boolean state writes; an independent hand audit
 /// produced 11. Neither total is evidence of anything; the membership is:</para>

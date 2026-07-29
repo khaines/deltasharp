@@ -618,6 +618,39 @@ public sealed class ReplayedMetadataLogTests
         Assert.Equal(new[] { m }, observed);
     }
 
+    /// <summary>
+    /// The contiguity guard (<c>version != CoveredToExclusive</c>) rejects in TWO directions, and only the
+    /// FORWARD one was pinned — <c>!=</c> -> <c>&lt;</c> was 1 red, <c>!=</c> -> <c>&gt;</c> was 0 red
+    /// (council R13). This is the backward half: a REPEATED or BACKWARD hand-over.
+    ///
+    /// <para>It matters more than a duplicate record, because <c>CoveredToExclusive = version + 1</c> runs
+    /// unconditionally below the guard. A backward hand-over therefore SHRINKS the covered interval — here
+    /// below its own start, leaving a window that claims coverage it never had and that the chain walk would
+    /// read in an order the type doc promises is strictly ascending.</para>
+    /// </summary>
+    [Fact]
+    public void ARepeatedOrBackwardHandOver_FailsClosed_SoObservationOrderIsStrictlyAscending()
+    {
+        var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
+        MetadataAction m = Meta("t");
+        log.Record(10, None, m, m);
+        log.Record(11, None, m, m);
+
+        DeltaProtocolException repeated =
+            Assert.Throws<DeltaProtocolException>(() => log.Record(11, None, m, m));
+        DeltaProtocolException backward =
+            Assert.Throws<DeltaProtocolException>(() => log.Record(5, None, m, m));
+
+        Assert.Contains("11", repeated.Message, StringComparison.Ordinal);
+        Assert.Contains("5", backward.Message, StringComparison.Ordinal);
+        AssertPathFree(repeated.Message);
+        AssertPathFree(backward.Message);
+
+        // The rejected hand-overs must not have moved the window: fail-closed, not fail-and-corrupt.
+        Assert.Equal(10, log.CoveredFromInclusive);
+        Assert.Equal(12, log.CoveredToExclusive);
+    }
+
     // ---------------------------------------------------------------------------------------------------
     // IDENTITY-vs-VALUE probes (council R11). MetadataAction is a `sealed record`, so `==` is VALUE equality
     // and compiles wherever ReferenceEquals does — every identity check in the lineage cross-check therefore
