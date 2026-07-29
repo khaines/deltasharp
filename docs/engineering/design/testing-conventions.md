@@ -123,6 +123,46 @@ skeleton has no cross-boundary behavior), so today `--filter Category=Integratio
 matches no tests (a clean no-op) and `Category!=Integration` runs the full unit suite; this
 names the convention so the first integration project slots in without churn.
 
+## Falsify a guard before reporting it
+
+A **guard** is a test whose subject is the adequacy of other tests or of a corpus: a
+completeness check, a derived-axis check, a parity or coverage assertion. Guards are worth
+writing, but they fail differently from ordinary tests. An ordinary test that stops working
+usually goes red. A guard that stops working usually goes **green**, because the failure mode
+is *agreeing with whatever it audits*.
+
+That is not hypothetical. During the work on
+[#679](https://github.com/khaines/deltasharp/issues/679), **three separate guards, each
+written specifically to prevent a defect, contained that same defect** and were green:
+
+| guard | how it agreed with what it audited |
+|---|---|
+| codepoint sweep | the hazard set was read from the same constant the writer used |
+| cardinality guard | the requirement was `CardinalityCounts.Max()`, so narrowing the corpus narrowed the requirement |
+| operation coverage | it collected calls *mentioned* anywhere in the suite, so a dead helper satisfied it |
+
+Each was found only by mutating the guard itself; none was found by reading it. So the
+practice is:
+
+> **Before reporting a guard, mutate the guard.** Make the condition it exists to detect
+> actually true, and confirm it goes red. A guard that has never been observed to fail has
+> not been shown to do anything.
+
+Two rules follow from the same base rate:
+
+- **A shared source is safe when it sits *outside* both the prober and the probed, and
+  unsafe when it sits *between* them.** Direction, not distance. Deriving an expectation from
+  test-owned input is fine; deriving it from the production helper under test is a tautology,
+  whether the sharing is in the value or in the key.
+- **Guards must fail closed.** Where a guard cannot decide, it must report a gap rather than
+  assume coverage. Prefer the strictness that produces a false alarm over the leniency that
+  produces silent absence — a guard that fails open is worse than no guard, because it also
+  removes the suspicion that would have prompted someone to look.
+
+Finally, a claim about what a test covers belongs in an **assertion**, not a comment.
+Coverage claims written only in prose were wrong twice in the same PR — a doc comment stating
+that a commit spanned multiple files sat above a test that produced exactly one.
+
 ## References
 
 - [Repository layout & project conventions](repository-layout.md)

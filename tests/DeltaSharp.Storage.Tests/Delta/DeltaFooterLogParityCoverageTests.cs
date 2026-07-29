@@ -9,6 +9,14 @@ namespace DeltaSharp.Storage.Tests.Delta;
 /// Completeness guard for the footer/log parity suite's OPERATION set.
 /// </summary>
 /// <remarks>
+/// This is a GUARD -- a test whose subject is the adequacy of other tests -- so it is subject to
+/// the practice in <c>docs/engineering/design/testing-conventions.md</c>, "Falsify a guard before
+/// reporting it": a guard that stops working goes GREEN rather than red, because its failure mode
+/// is agreeing with whatever it audits. This one was mutated before it was reported, and the first
+/// version FAILED that check (see <see cref="ReachableFromTests"/>). Do not modify it without
+/// re-running that falsification.
+/// </remarks>
+/// <remarks>
 /// <para>
 /// The parity suite derives its CONTENT axes -- metadata value kinds come from
 /// <c>Enum.GetValues&lt;MetadataValueKind&gt;()</c>, the type corpus from a shared object that is
