@@ -105,16 +105,23 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
         StructType widened = Widen(initial, "added_one");
         StructType final = Widen(widened, "added_two");
 
+        StructType replaced = Widen(final, "replaced_by_overwrite");
+
+        // The OPERATION set, not just the commit set. Schema-carrying commits are produced by
+        // several different DeltaTableWriter call sites, and an append-only sequence reaches only
+        // some of them: a transform installed at the OVERWRITE site is invisible to any number of
+        // appends. ParityGuard_DrivesEveryWriteEntryPoint holds this honest.
         await AppendAsync(initial, Array.Empty<string>(), mergeSchema: false);
         await AppendAsync(widened, Array.Empty<string>(), mergeSchema: true);
         await AppendAsync(final, Array.Empty<string>(), mergeSchema: true);
+        await OverwriteAsync(replaced);
 
         IReadOnlyList<(long Version, string Path, string Declared)> written = ReadCommittedFiles();
 
-        // The sequence must actually have evolved, or this passes by writing the same schema three
+        // The sequence must actually have evolved, or this passes by writing the same schema four
         // times -- the shape of accidental coverage this file keeps finding elsewhere.
-        Assert.Equal(3, written.Count);
-        Assert.Equal(3, written.Select(x => x.Declared).Distinct(StringComparer.Ordinal).Count());
+        Assert.Equal(4, written.Count);
+        Assert.Equal(4, written.Select(x => x.Declared).Distinct(StringComparer.Ordinal).Count());
 
         // AND THE LOG MUST DECLARE WHAT THE CALLER HANDED IT. Footer-vs-log equality alone cannot
         // see a transform that narrows the schema on the way into an EVOLUTION commit and leaves
@@ -123,7 +130,7 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
         // compliance-visible: field metadata carries classification and PII tags, and losing them
         // from the on-disk schema is silent. So the final commit is also compared against the
         // schema this test asked for.
-        Assert.Equal(SchemaJson.ToJson(final), written[^1].Declared);
+        Assert.Equal(SchemaJson.ToJson(replaced), written[^1].Declared);
 
         foreach ((long version, string path, string declared) in written)
         {
@@ -337,6 +344,111 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
     }
 
     /// <summary>
+    /// The remaining fresh-create entry points, each of which commits a <c>metaData</c> from its
+    /// own call site.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// These are driven because <c>ParityGuard_DrivesEveryWriteEntryPoint</c> derives the required
+    /// operation set from the product and named them as unreachable from this suite. They were not
+    /// chosen; they were reported.
+    /// </para>
+    /// <para>
+    /// The assertion is metadata PRESERVATION rather than footer/log byte equality, because the
+    /// mapped seams legitimately rewrite names into the footer -- the same reason the column-mapping
+    /// evolution test uses this invariant. It holds for every seam here: whatever the caller
+    /// declared must appear in the committed log, and only <c>delta.columnMapping.*</c> may be
+    /// added. That is exactly what an input-narrowing transform at any of these sites destroys.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData(CreateSeam.IdMapped)]
+    [InlineData(CreateSeam.NameMappedDeletionVector)]
+    [InlineData(CreateSeam.IdMappedDeletionVector)]
+    [InlineData(CreateSeam.DeletionVector)]
+    public async Task EveryCreateSeam_PreservesEveryMetadataEntryTheCallerDeclared(CreateSeam seam)
+    {
+        StructType created = MappableSchema();
+        var batches = new[] { BuildBatch(created, "west") };
+
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), FileNames(),
+            new SeededPhysicalNameSource(CreateSeed)))
+        {
+            var source = new SeededPhysicalNameSource(CreateSeed);
+            switch (seam)
+            {
+                case CreateSeam.IdMapped:
+                    await target.CreateIdMappedTableAsync(
+                        created, Array.Empty<string>(), batches, source);
+                    break;
+                case CreateSeam.NameMappedDeletionVector:
+                    await target.CreateNameMappedDeletionVectorTableAsync(
+                        created, Array.Empty<string>(), batches, source);
+                    break;
+                case CreateSeam.IdMappedDeletionVector:
+                    await target.CreateIdMappedDeletionVectorTableAsync(
+                        created, Array.Empty<string>(), batches, source);
+                    break;
+                case CreateSeam.DeletionVector:
+                    await target.CreateDeletionVectorTableAsync(
+                        created, Array.Empty<string>(), batches);
+                    break;
+                default:
+                    Assert.Fail(
+                        $"CreateSeam.{seam} was added but this test does not drive it, so its "
+                        + "call site would have no footer/log guard.");
+                    break;
+            }
+        }
+
+        IReadOnlyList<(long Version, string Path, string Declared)> written = ReadCommittedFiles();
+        Assert.NotEmpty(written);
+        AssertDeclaredPreservesCallerMetadata(created, written[^1].Declared);
+    }
+
+    /// <summary>The fresh-create entry points this suite drives, one per <c>metaData</c> call site.</summary>
+    public enum CreateSeam
+    {
+        IdMapped,
+        NameMappedDeletionVector,
+        IdMappedDeletionVector,
+        DeletionVector,
+    }
+
+    /// <summary>
+    /// Asserts the committed log declares everything the caller did, adding only mapping keys.
+    /// </summary>
+    private static void AssertDeclaredPreservesCallerMetadata(StructType expectedSchema, string declared)
+    {
+        var logged = (StructType)SchemaJson.FromJson(declared);
+        Assert.Equal(expectedSchema.Count, logged.Count);
+
+        foreach (StructField expected in expectedSchema)
+        {
+            StructField actual = Assert.Single(logged, f => f.Name == expected.Name);
+
+            foreach (KeyValuePair<string, MetadataValue> entry in expected.Metadata)
+            {
+                Assert.True(
+                    actual.Metadata.TryGetValue(entry.Key, out MetadataValue? value),
+                    $"Field '{expected.Name}' lost metadata key '{entry.Key}'; the caller declared "
+                    + "it and only column-mapping keys may be added.");
+                Assert.Equal(entry.Value, value);
+            }
+
+            foreach (string key in actual.Metadata.Keys)
+            {
+                Assert.True(
+                    expected.Metadata.ContainsKey(key)
+                        || key.StartsWith("delta.columnMapping.", StringComparison.Ordinal),
+                    $"Field '{expected.Name}' gained metadata key '{key}', which the caller never "
+                    + "declared and which is not a column-mapping key.");
+            }
+        }
+    }
+
+    /// <summary>
     /// The hostile metadata of <see cref="HostileSchema"/> without the hand-written
     /// <c>delta.columnMapping.id</c>, which the mapping writer mints itself.
     /// </summary>
@@ -424,6 +536,22 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
 
         var batch = BuildBatch(schema, "west");
         await target.AppendAsync(schema, partitionColumns, new[] { batch }, mergeSchema);
+    }
+
+    /// <summary>
+    /// Replaces the table schema wholesale via the overwrite door, which commits its
+    /// <c>metaData</c> from a DIFFERENT call site than any append.
+    /// </summary>
+    private async Task OverwriteAsync(StructType schema)
+    {
+        using DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(_root);
+
+        await target.OverwriteAsync(
+            schema,
+            Array.Empty<string>(),
+            new[] { BuildBatch(schema, "north") },
+            DeltaPartitionOverwriteMode.Static,
+            overwriteSchema: true);
     }
 
     private static ManagedColumnBatch BuildBatch(StructType schema, string region)
