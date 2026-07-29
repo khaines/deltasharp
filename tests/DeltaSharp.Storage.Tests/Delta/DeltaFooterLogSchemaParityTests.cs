@@ -236,6 +236,7 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
             vectors[i] = vector;
         }
 
+        WriteEntryPointRecorder.Record(nameof(DeltaWriteTarget.AppendAsync));
         await target.AppendAsync(
             schema, partitionColumns, new[] { new ManagedColumnBatch(schema, vectors, 2) });
     }
@@ -296,6 +297,7 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
         using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
             _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names))
         {
+            WriteEntryPointRecorder.Record(nameof(DeltaWriteTarget.CreateNameMappedTableAsync));
             await target.CreateNameMappedTableAsync(
                 created, Array.Empty<string>(), new[] { BuildBatch(created, "west") },
                 new SeededPhysicalNameSource(CreateSeed));
@@ -308,6 +310,7 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
             _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names,
             new SeededPhysicalNameSource(EvolveSeed)))
         {
+            WriteEntryPointRecorder.Record(nameof(DeltaWriteTarget.AppendAsync));
             await append.AppendAsync(
                 evolved, Array.Empty<string>(), new[] { BuildBatch(evolved, "east") }, mergeSchema: true);
         }
@@ -379,20 +382,24 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
             switch (seam)
             {
                 case CreateSeam.IdMapped:
+                    WriteEntryPointRecorder.Record(nameof(DeltaWriteTarget.CreateIdMappedTableAsync));
                     await target.CreateIdMappedTableAsync(
-                        created, Array.Empty<string>(), batches, source);
+                                created, Array.Empty<string>(), batches, source);
                     break;
                 case CreateSeam.NameMappedDeletionVector:
+                    WriteEntryPointRecorder.Record(nameof(DeltaWriteTarget.CreateNameMappedDeletionVectorTableAsync));
                     await target.CreateNameMappedDeletionVectorTableAsync(
-                        created, Array.Empty<string>(), batches, source);
+                                created, Array.Empty<string>(), batches, source);
                     break;
                 case CreateSeam.IdMappedDeletionVector:
+                    WriteEntryPointRecorder.Record(nameof(DeltaWriteTarget.CreateIdMappedDeletionVectorTableAsync));
                     await target.CreateIdMappedDeletionVectorTableAsync(
-                        created, Array.Empty<string>(), batches, source);
+                                created, Array.Empty<string>(), batches, source);
                     break;
                 case CreateSeam.DeletionVector:
+                    WriteEntryPointRecorder.Record(nameof(DeltaWriteTarget.CreateDeletionVectorTableAsync));
                     await target.CreateDeletionVectorTableAsync(
-                        created, Array.Empty<string>(), batches);
+                                created, Array.Empty<string>(), batches);
                     break;
                 default:
                     Assert.Fail(
@@ -535,6 +542,7 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
         using DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(_root);
 
         var batch = BuildBatch(schema, "west");
+        WriteEntryPointRecorder.Record(nameof(DeltaWriteTarget.AppendAsync));
         await target.AppendAsync(schema, partitionColumns, new[] { batch }, mergeSchema);
     }
 
@@ -546,6 +554,7 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
     {
         using DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(_root);
 
+        WriteEntryPointRecorder.Record(nameof(DeltaWriteTarget.OverwriteAsync));
         await target.OverwriteAsync(
             schema,
             Array.Empty<string>(),

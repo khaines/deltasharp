@@ -46,35 +46,151 @@ namespace DeltaSharp.Storage.Tests.Delta;
 public sealed class DeltaFooterLogParityCoverageTests
 {
     [Fact]
-    public void ParityGuard_DrivesEveryWriteEntryPoint()
+    public async Task ParityGuard_DrivesEveryWriteEntryPoint()
     {
         MethodInfo[] required = typeof(DeltaWriteTarget)
             .GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
             .Where(m => m.ReturnType == typeof(Task<DeltaWriteResult>))
             .ToArray();
 
-        // Non-vacuity: if the filter ever stops matching, every "is covered" check below passes
-        // trivially and this guard silently becomes a no-op.
+        // Non-vacuity: an empty required set makes every check below pass for the wrong reason.
         Assert.NotEmpty(required);
 
-        HashSet<MethodBase> driven = ReachableFromTests(typeof(DeltaFooterLogSchemaParityTests));
+        IReadOnlySet<string> driven = await RunParitySuiteAsync();
 
-        string[] missing = required
-            .Where(m => !driven.Contains(m))
+        string[] undriven = required
             .Select(m => m.Name)
             .Distinct(StringComparer.Ordinal)
+            .Where(n => !driven.Contains(n))
             .OrderBy(n => n, StringComparer.Ordinal)
             .ToArray();
 
-        if (missing.Length > 0)
+        if (undriven.Length > 0)
         {
             Assert.Fail(
-                "DeltaWriteTarget commits schema-carrying metaData from write entry points the "
-                + "footer/log parity suite never drives, so a transform installed at their call "
-                + "sites reproduces issue #679's divergence with the parity suite green."
-                + $"{Environment.NewLine}  undriven: {string.Join(", ", missing)}"
-                + $"{Environment.NewLine}  Drive them from DeltaFooterLogSchemaParityTests, or, if "
-                + "an entry point genuinely cannot carry a schema, say so here with the reason.");
+                "DeltaWriteTarget commits schema-carrying metaData from entry points that NOTHING "
+                + "in the footer/log parity suite executed, so a transform at their call sites "
+                + "reproduces issue #679's divergence with the suite green."
+                + $"{Environment.NewLine}  undriven: {string.Join(", ", undriven)}"
+                + $"{Environment.NewLine}  executed: {string.Join(", ", driven.OrderBy(n => n, StringComparer.Ordinal))}"
+                + $"{Environment.NewLine}  A skipped test, a deleted [InlineData] row and a "
+                + "commented-out [Fact] all reach here, because this counts EXECUTION.");
+        }
+    }
+
+    /// <summary>
+    /// Runs every executable case of the parity suite and returns the entry points they invoked.
+    /// </summary>
+    /// <remarks>
+    /// The suite is executed rather than analysed, and the case list is built the way xUnit builds
+    /// it: <c>[Fact]</c> and <c>[Theory]</c> methods, one case per <c>[InlineData]</c> row, MINUS
+    /// anything carrying a <c>Skip</c>. That is what makes a deleted data row and a skipped theory
+    /// visible -- both remove cases from this enumeration, so the entry points they drove stop
+    /// appearing in the recorded set.
+    /// </remarks>
+    private static async Task<IReadOnlySet<string>> RunParitySuiteAsync()
+    {
+        const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic
+            | BindingFlags.Instance | BindingFlags.DeclaredOnly;
+
+        MethodInfo[] tests = typeof(DeltaFooterLogSchemaParityTests).GetMethods(flags)
+            .Where(m => m.GetCustomAttributes(inherit: false).Any(IsExecutableTestCase))
+            .ToArray();
+
+        // Non-vacuity: if the suite has no executable cases at all, the recorded set is empty and
+        // the guard must report every operation undriven rather than silently pass.
+        Assert.NotEmpty(tests);
+
+        WriteEntryPointRecorder.Reset();
+
+        foreach (MethodInfo test in tests)
+        {
+            foreach (object?[] args in CasesFor(test))
+            {
+                object instance = Activator.CreateInstance(typeof(DeltaFooterLogSchemaParityTests))!;
+                try
+                {
+                    if (test.Invoke(instance, args) is Task task)
+                    {
+                        await task;
+                    }
+                }
+                finally
+                {
+                    (instance as IDisposable)?.Dispose();
+                }
+            }
+        }
+
+        return WriteEntryPointRecorder.Snapshot();
+    }
+
+    /// <summary>A test attribute that will actually run -- i.e. one without a <c>Skip</c>.</summary>
+    private static bool IsExecutableTestCase(object attribute)
+    {
+        if (attribute.GetType().Name is not ("FactAttribute" or "TheoryAttribute"))
+        {
+            return false;
+        }
+
+        string? skip = attribute.GetType().GetProperty("Skip")?.GetValue(attribute) as string;
+        return string.IsNullOrEmpty(skip);
+    }
+
+    private static IEnumerable<object?[]> CasesFor(MethodInfo test)
+    {
+        object[] rows = test.GetCustomAttributes(inherit: false)
+            .Where(a => a.GetType().Name == "InlineDataAttribute")
+            .ToArray();
+
+        if (rows.Length == 0)
+        {
+            yield return Array.Empty<object?>();
+            yield break;
+        }
+
+        foreach (object row in rows)
+        {
+            object?[]? data = row.GetType()
+                .GetMethod("GetData")?
+                .Invoke(row, new object?[] { test }) is IEnumerable<object?[]> sets
+                ? sets.FirstOrDefault()
+                : null;
+
+            yield return data ?? (object?[])row.GetType().GetProperty("Data")!.GetValue(row)!;
+        }
+    }
+
+    /// <summary>
+    /// Every recorded label names a method the recording code really calls.
+    /// </summary>
+    /// <remarks>
+    /// The recorded side is written by hand beside each invocation, so on its own it could claim
+    /// anything. This checks each label against the IL of the parity suite: a label with no
+    /// corresponding call is a coverage claim with nothing behind it. Static reachability is the
+    /// wrong tool for "was it executed" and the right one for "is this label honest" -- the two
+    /// guards together give both halves.
+    /// </remarks>
+    [Fact]
+    public async Task RecordedEntryPoints_AreBackedByRealCalls()
+    {
+        IReadOnlySet<string> recorded = await RunParitySuiteAsync();
+        HashSet<string> callable = ReachableFromTests(typeof(DeltaFooterLogSchemaParityTests))
+            .Where(m => m.DeclaringType == typeof(DeltaWriteTarget))
+            .Select(m => m.Name)
+            .ToHashSet(StringComparer.Ordinal);
+
+        Assert.NotEmpty(callable);
+
+        string[] unbacked = recorded.Where(n => !callable.Contains(n))
+            .OrderBy(n => n, StringComparer.Ordinal).ToArray();
+
+        if (unbacked.Length > 0)
+        {
+            Assert.Fail(
+                "The parity suite records driving entry points its own code never calls, so the "
+                + "recorded coverage overstates what runs."
+                + $"{Environment.NewLine}  recorded but never called: {string.Join(", ", unbacked)}");
         }
     }
 
