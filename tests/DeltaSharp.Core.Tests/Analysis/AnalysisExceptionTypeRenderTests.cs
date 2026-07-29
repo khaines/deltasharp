@@ -376,11 +376,10 @@ public sealed class AnalysisExceptionTypeRenderTests
 
     /// <summary>
     /// The field-name bound must not cut a REAL field name, and the corpus must be able to tell.
-    /// <para>A flat cap of 32 stood inside the type renderer — the same number four seats rejected for
+    /// <para>A flat cap of 32 stood inside the type renderer — the same number the review rejected for
     /// candidate names — and nothing in the suite failed when it was restored. This test is what closes
     /// that: at HEAD, restoring it fails here and nowhere else. Why the older corpus could not reach the
-    /// cap is deliberately not stated. This paragraph said it, and was the SEVENTH sentence in this change
-    /// to make the same claim wrongly — it read "every field name the file generated was shorter than it"
+    /// cap is deliberately not stated. This paragraph said it, and said it wrongly — it read "every field name the file generated was shorter than it"
     /// while the file two commits earlier was already generating names of ten thousand and five thousand
     /// characters. It sat four lines above a sentence warning that every such attempt had been wrong.</para>
     /// <para><b>The shape, and how to find it.</b> Every instance found in this change has been the same
@@ -394,6 +393,16 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// <c>(every|each|all|no|none|only|both|the) &lt;population-noun&gt; …
     /// (shorter|longer|below|above|beyond|under|past|at least|at most)</c>.
     /// Use that, not a word list, and prefer deleting a hit to re-deriving it.</para>
+    /// <para><b>The second shape: a tally of instances inside this change.</b> Counts like "the Nth time
+    /// this has happened here" were removed from this file and its siblings, having been swept with
+    /// <c>&lt;ordinal-or-numeral&gt; &lt;occurrence-noun&gt;</c> over comment runs stitched across line
+    /// breaks — with no requirement that a self-reference appear nearby, since the one that hid longest had
+    /// none, and reporting every match per block rather than the first, since a per-block stop had already
+    /// under-counted this file once. The criterion is not "no numbers in comments": it is whether the number
+    /// counts an OPEN population that keeps growing. A tally of instances of a recurring defect grows every
+    /// time the defect recurs, so it is false by the next round and no reader can re-derive it; a pointer to
+    /// a fixed past event ("the identical scan stayed 0-RED for two rounds") names something finished and
+    /// stays true. The lessons those tallies carried are kept; only the counting is gone.</para>
     /// <para>Both names below are ordinary business-schema lengths and both exceed the flat cap, which is
     /// the only reason the pair discriminates — asserted in the body rather than written here as two
     /// numbers, one of which was wrong. The first must survive verbatim; the point of the ceiling is to stop
@@ -515,10 +524,9 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// field's cost is known from the ones already shown. Sweeping depth is the point, and that this sweep
     /// REACHES the depths it sweeps is asserted at the end rather than claimed here: the sentence that used
     /// to justify the depth axis said the defect was invisible at depth 1 "where every prior assertion in
-    /// this file lives", and a theory thirty lines above it had swept nesting 1–4 since round 9. Eighth
-    /// instance in this change of one shape — a universal quantifier with a false reason and a sound
-    /// conclusion — and the first to quantify over ASSERTIONS rather than over fixture widths, which is why
-    /// the earlier sweeps could not see it.</para>
+    /// this file lives", and a theory thirty lines above it had swept nesting 1–4 since round 9. That is
+    /// one shape — a universal quantifier with a false reason and a sound conclusion — quantifying here over
+    /// ASSERTIONS rather than over fixture widths, which is why sweeps keyed to widths could not see it.</para>
     /// </summary>
     [Fact]
     public void NestedPayloads_SpendTheirBudget_BeforeAnyFieldIsElided()
@@ -833,8 +841,8 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// <para>The previous guard, <see cref="TypeBudget_IsSpentBeforeAnyFieldIsElided(int)"/>, sweeps
     /// cardinality at ONE budget over a scalar-leaf schema, so it could reach neither the budget axis nor
     /// the compact-versus-expanded alternation that causes this. A sweep over one axis with the others held
-    /// fixed cannot find a defect that lives on their product — the sixth time that has been true in this
-    /// change, and the reason this asserts four properties over the product rather than one along a line.
+    /// fixed cannot find a defect that lives on their product, which is why this asserts four properties
+    /// over the product rather than one along a line.
     /// </para>
     /// </summary>
     [Fact]
@@ -987,7 +995,7 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// </summary>
     /// <remarks>
     /// Which of this file's OTHER fixtures can reach the region the pin below guards is a question that has
-    /// now been answered wrongly by three sentences and by two assertions, the last of which measured a
+    /// now been answered wrongly by prose and by assertion alike, the last of which measured a
     /// corpus it had hand-picked and so reported a margin that does not exist. It is not answered here at
     /// all. The pin asserts that ITS OWN corpus reaches the region, which is the only part anything depends
     /// on; a claim about the rest of the file has never once survived contact with an enumeration nobody
@@ -1032,9 +1040,9 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// needs to restate one, and an earlier revision of this sentence restated it wrongly (a four-field
     /// cell described as three) precisely because a restated cell is copied, not computed. Invariant 1,
     /// the bound firing when everything would have fitted, unpinned.</para>
-    /// <para>The identical scan in <c>DiagnosticText.SanitizeToBudget</c> <em>is</em> pinned. This is the
-    /// seventh time in this change that a fix landed at one of a pair of sites, and the first time the
-    /// half that failed to travel was the <b>test</b>. The remedy is not only to port the guard but to
+    /// <para>The identical scan in <c>DiagnosticText.SanitizeToBudget</c> <em>is</em> pinned. A fix landing
+    /// at one of a pair of sites is the recurring shape here; what is unusual is that the half which failed
+    /// to travel was the <b>test</b>. The remedy is not only to port the guard but to
     /// make it say out loud which region it needs to reach, which is the assertion at the end.</para>
     /// <para><b>Why every existing guard was blind.</b> Not a missing axis this time but a fixture VALUE.
     /// The counts that fit form a prefix — and so the two walk shapes agree — whenever taking one more
@@ -1044,9 +1052,9 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// written here as a number: the previous revision of this sentence stated one that was too large by
     /// one, which would have led a maintainer picking a corpus by it to choose a NON-discriminating one —
     /// the worst failure mode available to a comment, since it survives review by sounding like guidance.
-    /// Sixth vacuity of the "corpus cannot see the bound" family, and the one that hid the longest.</para>
-    /// <para><b>Why the older fixtures were blind is not recorded here, and that is the finding.</b> Four
-    /// sentences and two assertions in this change tried to say it. All six were false, each written while
+    /// It belongs to the "corpus cannot see the bound" family, and it hid longer than the others.</para>
+    /// <para><b>Why the older fixtures were blind is not recorded here, and that is the finding.</b> Prose
+    /// and assertion alike tried to say it and were false, each written while
     /// correcting the one before, and the last of them — an assertion, which should have been immune —
     /// was false because it measured a corpus its author had hand-listed, so it inspected a third of this
     /// file's structs and missed two that reach the region today. The conclusion held every time and the

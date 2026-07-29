@@ -127,8 +127,8 @@ public sealed class AnalysisExceptionCandidateListingTests
     /// one did: the greedy walk charged every item for an overflow suffix that would not exist if the listing
     /// fit, so at a wide listing of short names it elided some of them with the budget still unspent — the
     /// user's own column names gone, on the trusted path. The prior corpus swept width at one 35-character
-    /// name and structurally could not reach that cell — the third time a corpus in this PR was one dimension
-    /// short.</para>
+    /// name and structurally could not reach that cell: a corpus one dimension short, which is the recurring
+    /// way a guard in this change has turned out to be vacuous.</para>
     /// <para>This is a single fact with an interior sweep rather than one theory row per cell, and it collects
     /// every counterexample before failing so the report shows the shape of a violating band instead of its
     /// lowest corner.</para>
@@ -209,7 +209,7 @@ public sealed class AnalysisExceptionCandidateListingTests
         // These MUST straddle the per-item clamp, not sit above it. The first draft of this test used
         // 240/480/960/3000 — every one of them past the ceiling — so the mutant it exists to catch produced a
         // constant allowance across the whole row and the assertion held under it: 0 RED, vacuous, and the
-        // same "corpus in the saturated region" mistake this PR has now made five times. WHICH of the widths
+        // same "corpus in the saturated region" mistake this change keeps making. WHICH of the widths
         // below straddle the clamp is not written here — the sentence that wrote it said "at these widths"
         // and was true of some of them — it is asserted by TheItemLengthSweep_StraddlesTheClampSomewhere.
         int[] lengths = ItemLengthSweep;
@@ -747,8 +747,8 @@ public sealed class AnalysisExceptionCandidateListingTests
     /// the other changed the count and asked which tests died. Only the second can distinguish invariant 1
     /// from invariant 2, because a count that is present is visible to inspection while a count that is
     /// correct is visible only to a mutation. Any claim of the form "this is covered" that was reached by
-    /// counting rather than by killing is unverified — the second time in this change that a coverage claim
-    /// failed exactly there.</para>
+    /// counting rather than by killing is unverified, and coverage claims in this change have failed at
+    /// exactly that step more than once.</para>
     /// <para><b>Name the property, not the test.</b> Two reviewers then mutated two different points and
     /// reported opposite verdicts under one test's name: perturbing the budget arithmetic turns
     /// <c>NoFreeProseToken_…</c> RED for every factory here, while perturbing the overflow count leaves it

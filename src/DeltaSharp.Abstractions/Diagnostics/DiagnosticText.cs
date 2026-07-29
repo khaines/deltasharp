@@ -304,9 +304,18 @@ internal static class DiagnosticText
         // Both pins now compute the refund from the marker itself and assert it in both directions: that
         // nothing discriminates at or above it, and that something discriminates immediately below it.
         //
-        // Pinned by SharedDiagnosticTextContractTests.TheListingCountIsTheLargestFeasibleCount_NotOneShortOf
-        // TheFirstInfeasibleOne, whose Core sibling states the same property in the same shape, and which
-        // asserts that its corpus still contains such a k rather than assuming it.
+        // The PROPERTY pinned here is that this scan yields the LARGEST feasible k, not the k before the
+        // first infeasible one. Making the scan stop at its first infeasible k — the surgical mutant for
+        // exactly that property — is caught by several tests, not one, including the contract pin named
+        // below, which asserts that its corpus still contains such a k rather than assuming it:
+        // SharedDiagnosticTextContractTests.TheListingCountIsTheLargestFeasibleCount_NotOneShortOfTheFirst-
+        // InfeasibleOne, whose Core sibling states the same property in the same shape.
+        //
+        // The name is a pointer, not the coverage claim; the property above is. An earlier revision of this
+        // comment named one test as though a name were a unit of coverage, and elsewhere in this change that
+        // habit hid a genuinely unpinned invariant: one test's name covered two properties and a reviewer
+        // discharged both by observing the first. Which mutant is used decides what can be concluded — a
+        // coarse one (reversing the scan direction) kills most of this area's tests and attributes nothing.
         for (int k = items.Count; k >= 1; k--)
         {
             int hidden = items.Count - k;
