@@ -761,6 +761,22 @@ public sealed class AnalysisExceptionCandidateListingTests
     /// nothing. The count mutant is surgical: it changes one rendered number and leaves every length alone,
     /// so exactly the assertions that read the number react. A mutation that perturbs several properties at
     /// once proves the suite is alive, not that any particular property is pinned.</para>
+    /// <para><b>That rule governs positive attribution only, and the asymmetry matters.</b> A blunt mutant
+    /// with a large RED count says nothing about WHICH property any of those tests pins. A blunt mutant with
+    /// ZERO RED is the strongest evidence available in the other direction: many observables moved and
+    /// nothing noticed, so the gap is real and wider than any single surgical probe could show. Discount
+    /// blunt positives; keep blunt negatives. Applied the other way round, this rule would throw away the
+    /// evidence that opened this whole line of work.</para>
+    /// <para><b>Attribution by deletion is stronger still.</b> Which rows go RED under a mutant is inferred
+    /// attribution; deleting a test and re-running the same mutant is direct. Removing the pin below and
+    /// re-running the count mutant loses exactly its rows and nothing takes their place — no other test
+    /// steps in for this factory — which is what "this test pins this property" means and is checkable by
+    /// anyone in two runs. It also disposes of the failure mode where a mutation is caught only by a test
+    /// that would have caught anything.</para>
+    /// <para>A trim is not automatically a mutation, either. Shrinking a swept axis proves the guard reaches
+    /// that axis only if the guard could have failed some OTHER way under it; where an adequacy counter is
+    /// gated on the same axis being swept, trimming the axis makes the counter unreachable and the RED
+    /// proves the loop bound rather than the property. Prefer a mutant that leaves the axis intact.</para>
     /// <para>How it went unnoticed is the part worth keeping: a comment discharged those rows by CITING two
     /// tests, and the citation was written without mapping either one's call sites. Both cited tests turn
     /// out to be scoped — one by its callers' factories, the other by an <c>OfType&lt;string[]&gt;</c> gate

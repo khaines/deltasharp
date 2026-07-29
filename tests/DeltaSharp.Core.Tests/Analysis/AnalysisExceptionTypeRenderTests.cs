@@ -361,8 +361,7 @@ public sealed class AnalysisExceptionTypeRenderTests
                     + $"the {AnalysisException.MaxMessageLength} cap — the type budget is not being spent"));
     }
 
-    /// <summary>Every width from 1 to 60. The bound that shipped bit at 13, between the two widths this file
-    /// previously sampled.</summary>
+    /// <summary>Every width from 1 to 60 — the band a two-point corpus cannot see.</summary>
     public static TheoryData<int> ContinuousFieldWidths()
     {
         var data = new TheoryData<int>();
@@ -391,8 +390,13 @@ public sealed class AnalysisExceptionTypeRenderTests
     /// each drew its patterns from text already known to be bad, and this sentence shares no wording with
     /// any of them. A sweep on the SHAPE found it on its first run:
     /// <c>(every|each|all|no|none|only|both|the) &lt;population-noun&gt; …
-    /// (shorter|longer|below|above|beyond|under|past|at least|at most)</c>.
-    /// Use that, not a word list, and prefer deleting a hit to re-deriving it.</para>
+    /// (shorter|longer|below|above|beyond|under|past|at least|at most|between|within|spans|either side
+    /// of|straddles|outside)</c>.
+    /// Use that, not a word list, and prefer deleting a hit to re-deriving it. The range relations at the
+    /// end of that list were absent from the first four sweeps and are what let one instance survive all of
+    /// them: it said a bound bit "BETWEEN the two widths this file previously sampled" when both samples were
+    /// above it, and a threshold-only comparator set cannot match a range word. A claim can be wrong about
+    /// where a value sits relative to a corpus without ever using a threshold word.</para>
     /// <para><b>The second shape: a tally of instances inside this change.</b> Counts like "the Nth time
     /// this has happened here" were removed from this file and its siblings, having been swept with
     /// <c>&lt;ordinal-or-numeral&gt; &lt;occurrence-noun&gt;</c> over comment runs stitched across line
