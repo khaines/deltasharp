@@ -749,6 +749,18 @@ public sealed class AnalysisExceptionCandidateListingTests
     /// correct is visible only to a mutation. Any claim of the form "this is covered" that was reached by
     /// counting rather than by killing is unverified — the second time in this change that a coverage claim
     /// failed exactly there.</para>
+    /// <para><b>Name the property, not the test.</b> Two reviewers then mutated two different points and
+    /// reported opposite verdicts under one test's name: perturbing the budget arithmetic turns
+    /// <c>NoFreeProseToken_…</c> RED for every factory here, while perturbing the overflow count leaves it
+    /// GREEN for all but one. Both observations are true, because that test pins CROWDING for every factory
+    /// and count ACCURACY only where its accounting half is reached. A test name is not a unit of coverage;
+    /// a property is. "Pinned by <c>T</c>" is the sentence that keeps going wrong, and "pinned for property
+    /// P" is the one that can be checked.</para>
+    /// <para>Mutation granularity is what separates those two readings. The budget mutant is coarse — it
+    /// changes every rendered length, so most of this file reacts to it and it can attribute coverage to
+    /// nothing. The count mutant is surgical: it changes one rendered number and leaves every length alone,
+    /// so exactly the assertions that read the number react. A mutation that perturbs several properties at
+    /// once proves the suite is alive, not that any particular property is pinned.</para>
     /// <para>How it went unnoticed is the part worth keeping: a comment discharged those rows by CITING two
     /// tests, and the citation was written without mapping either one's call sites. Both cited tests turn
     /// out to be scoped — one by its callers' factories, the other by an <c>OfType&lt;string[]&gt;</c> gate
