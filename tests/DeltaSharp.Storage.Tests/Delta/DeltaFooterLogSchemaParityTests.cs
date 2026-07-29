@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using DeltaSharp.Engine.Columnar;
+using DeltaSharp.Storage.Delta;
 using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Storage.Writing;
 using DeltaSharp.Types;
@@ -41,7 +42,23 @@ namespace DeltaSharp.Storage.Tests.Delta;
 /// </remarks>
 public sealed class DeltaFooterLogSchemaParityTests : IDisposable
 {
+    private const string CreateSeed = "issue-679-footerlog-create";
+    private const string EvolveSeed = "issue-679-footerlog-evolve";
+
     private readonly string _root;
+
+    /// <summary>A fixed clock, so commit timestamps are not a source of variation.</summary>
+    private sealed class FixedTimeProvider(DateTimeOffset now) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => now;
+    }
+
+    /// <summary>Deterministic data-file names, so the mapping seeds are the only source of variation.</summary>
+    private static Func<string> FileNames()
+    {
+        int counter = 0;
+        return () => "file" + counter++.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    }
 
     public DeltaFooterLogSchemaParityTests() =>
         _root = Path.Combine(Path.GetTempPath(), "delta-footerlog-" + Guid.NewGuid().ToString("N"));
@@ -58,56 +75,188 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
     }
 
     [Fact]
-    public async Task Unpartitioned_FooterSchemaString_IsByteIdenticalToTheCommittedLog()
+    public async Task EveryCommit_FooterSchemaString_IsByteIdenticalToTheLogInEffect()
     {
-        StructType schema = HostileSchema();
+        StructType initial = HostileSchema();
 
-        await AppendAsync(schema, Array.Empty<string>());
+        StructType widened = Widen(initial, "added_one");
+        StructType final = Widen(widened, "added_two");
 
-        string footer = await ReadFooterSchema();
-        string log = ReadCommittedSchemaString();
+        await AppendAsync(initial, Array.Empty<string>(), mergeSchema: false);
+        await AppendAsync(widened, Array.Empty<string>(), mergeSchema: true);
+        await AppendAsync(final, Array.Empty<string>(), mergeSchema: true);
 
-        if (!string.Equals(footer, log, StringComparison.Ordinal))
+        IReadOnlyList<(long Version, string Path, string Declared)> written = ReadCommittedFiles();
+
+        // The sequence must actually have evolved, or this passes by writing the same schema three
+        // times -- the shape of accidental coverage this file keeps finding elsewhere.
+        Assert.Equal(3, written.Count);
+        Assert.Equal(3, written.Select(x => x.Declared).Distinct(StringComparer.Ordinal).Count());
+
+        // AND THE LOG MUST DECLARE WHAT THE CALLER HANDED IT. Footer-vs-log equality alone cannot
+        // see a transform that narrows the schema on the way into an EVOLUTION commit and leaves
+        // the two artifacts agreeing with each other about the wrong thing -- both sides derive
+        // from the same narrowed input at some sites. The damage from such a transform is real and
+        // compliance-visible: field metadata carries classification and PII tags, and losing them
+        // from the on-disk schema is silent. So the final commit is also compared against the
+        // schema this test asked for.
+        Assert.Equal(SchemaJson.ToJson(final), written[^1].Declared);
+
+        foreach ((long version, string path, string declared) in written)
         {
-            Assert.Fail(
-                "The committed _delta_log schemaString and the data file's footer delta.schema "
-                + "disagree -- issue #679's original divergence, at the two REAL artifacts."
-                + $"{Environment.NewLine}  log    ({log.Length} chars): {Truncate(log)}"
-                + $"{Environment.NewLine}  footer ({footer.Length} chars): {Truncate(footer)}"
-                + $"{Environment.NewLine}  first difference at char {FirstDifference(log, footer)}");
+            string footer = await ReadFooterSchema(path);
+            if (!string.Equals(footer, declared, StringComparison.Ordinal))
+            {
+                Assert.Fail(
+                    $"Commit {version} declares a schemaString its own data file does not carry -- "
+                    + "issue #679's divergence, at the two REAL artifacts."
+                    + $"{Environment.NewLine}  file: {path}"
+                    + $"{Environment.NewLine}  log    ({declared.Length} chars): {Truncate(declared)}"
+                    + $"{Environment.NewLine}  footer ({footer.Length} chars): {Truncate(footer)}"
+                    + $"{Environment.NewLine}  first difference at char {FirstDifference(declared, footer)}");
+            }
         }
     }
 
     /// <summary>
-    /// Pins the one place the two artifacts are legitimately allowed to differ, so that the
-    /// equality above cannot be "fixed" by widening it into a rule that hides a real defect.
+    /// Pins the one place the two artifacts are legitimately allowed to differ, across partition
+    /// counts and POSITIONS rather than the single case it was first written for.
     /// </summary>
     /// <remarks>
     /// A partitioned table stores partition values in the <c>add</c> action's
     /// <c>partitionValues</c> rather than in the data file, so the footer legitimately declares
-    /// FEWER columns than the log. That is measured rather than assumed (issue #724), and stating
-    /// it as an exact relationship — footer equals the log's schema minus the partition columns,
-    /// same order, byte for byte — means a transform that drops something else from either side
-    /// still fails here.
+    /// FEWER columns than the log (measured, issue #724). Stating that as an exact relationship --
+    /// footer equals the log's schema minus exactly the partition columns, same order, byte for
+    /// byte -- means a transform that drops anything else from either side still fails here.
+    /// <para>
+    /// The theory covers position and count because a relationship that only holds for a leading
+    /// single partition column would be a coincidence of the case chosen, not a property. It also
+    /// writes MULTIPLE data files: an earlier version asserted a single file existed, so the
+    /// multi-file commit was outside the guard entirely.
+    /// </para>
     /// </remarks>
-    [Fact]
-    public async Task Partitioned_FooterOmitsExactlyThePartitionColumns_AndNothingElse()
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public async Task Partitioned_FooterOmitsExactlyThePartitionColumns_AndNothingElse(int position)
     {
         StructType schema = HostileSchema();
-        string[] partitionColumns = { schema[0].Name };
+        string[] partitionColumns = { schema[position].Name };
 
-        await AppendAsync(schema, partitionColumns);
-
-        string footer = await ReadFooterSchema();
-        string log = ReadCommittedSchemaString();
-
-        Assert.NotEqual(log, footer);
+        await AppendAsync(schema, partitionColumns, mergeSchema: false);
 
         var remainder = new StructType(
             schema.Where(f => !partitionColumns.Contains(f.Name, StringComparer.Ordinal)).ToArray());
-        Assert.Equal(SchemaJson.ToJson(remainder), footer);
-        Assert.Equal(SchemaJson.ToJson(schema), log);
+        string expected = SchemaJson.ToJson(remainder);
+
+        IReadOnlyList<(long Version, string Path, string Declared)> written = ReadCommittedFiles();
+        Assert.NotEmpty(written);
+
+        foreach ((long _, string path, string declared) in written)
+        {
+            Assert.Equal(SchemaJson.ToJson(schema), declared);
+            Assert.NotEqual(declared, await ReadFooterSchema(path));
+            Assert.Equal(expected, await ReadFooterSchema(path));
+        }
     }
+
+    /// <summary>
+    /// The <b>column-mapping</b> evolution commit, which is the one sibling call site the
+    /// footer/log byte comparison structurally cannot reach.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Under column mapping the two artifacts are <b>supposed</b> to differ: the log carries
+    /// logical names plus <c>delta.columnMapping.physicalName</c>, while the footer carries the
+    /// physical names with empty metadata. So byte equality is the wrong assertion there -- it
+    /// would fail on correct output -- and the site stays dark if the only guard is the byte
+    /// comparison. Measured: a metadata-narrowing transform installed at that site is green under
+    /// the byte-parity test even after that test was widened to range over every commit.
+    /// </para>
+    /// <para>
+    /// What still holds unconditionally is that the mapping commit may only <i>add</i> mapping
+    /// keys. Everything the caller declared has to survive into the committed log verbatim, which
+    /// is exactly what an input-narrowing transform at that site destroys. The expectation is the
+    /// caller's own metadata -- test-owned ground truth -- so nothing derived from the write path
+    /// sits between the assertion and the code it audits. In particular this does NOT call
+    /// <c>ColumnMapping.MapWriteSchemaToPhysical</c> to build the expectation, which would put a
+    /// production helper on both sides and re-create the tautology this PR exists to remove.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task ColumnMappingEvolution_PreservesEveryMetadataEntryTheCallerDeclared()
+    {
+        StructType created = MappableSchema();
+        Func<string> names = FileNames();
+
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names))
+        {
+            await target.CreateNameMappedTableAsync(
+                created, Array.Empty<string>(), new[] { BuildBatch(created, "west") },
+                new SeededPhysicalNameSource(CreateSeed));
+        }
+
+        // mergeSchema on a name-mapped table routes through the column-mapping evolution branch,
+        // which is a DIFFERENT SchemaJson.ToJson call site from the plain-merge one.
+        StructType evolved = Widen(created, "added");
+        using (DeltaWriteTarget append = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), names,
+            new SeededPhysicalNameSource(EvolveSeed)))
+        {
+            await append.AppendAsync(
+                evolved, Array.Empty<string>(), new[] { BuildBatch(evolved, "east") }, mergeSchema: true);
+        }
+
+        IReadOnlyList<(long Version, string Path, string Declared)> written = ReadCommittedFiles();
+        Assert.Equal(2, written.Count);
+
+        // The evolution commit's log, parsed off disk. Every caller-declared entry must be present
+        // verbatim; the commit is allowed to ADD delta.columnMapping.* and nothing else.
+        var logged = (StructType)SchemaJson.FromJson(written[^1].Declared);
+        Assert.Equal(evolved.Count, logged.Count);
+
+        foreach (StructField expected in evolved)
+        {
+            StructField actual = Assert.Single(logged, f => f.Name == expected.Name);
+
+            foreach (KeyValuePair<string, MetadataValue> entry in expected.Metadata)
+            {
+                Assert.True(
+                    actual.Metadata.TryGetValue(entry.Key, out MetadataValue? value),
+                    $"Field '{expected.Name}' lost metadata key '{entry.Key}' in the column-mapping "
+                    + "evolution commit; the caller declared it and only mapping keys may be added.");
+                Assert.Equal(entry.Value, value);
+            }
+
+            foreach (string key in actual.Metadata.Keys)
+            {
+                Assert.True(
+                    expected.Metadata.ContainsKey(key) || key.StartsWith("delta.columnMapping.", StringComparison.Ordinal),
+                    $"Field '{expected.Name}' gained metadata key '{key}', which the caller never "
+                    + "declared and which is not a column-mapping key.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// The hostile metadata of <see cref="HostileSchema"/> without the hand-written
+    /// <c>delta.columnMapping.id</c>, which the mapping writer mints itself.
+    /// </summary>
+    private static StructType MappableSchema() =>
+        new(HostileSchema()
+            .Select(f => new StructField(
+                f.Name,
+                f.DataType,
+                f.Nullable,
+                FieldMetadata.FromValues(f.Metadata.Where(
+                    e => !e.Key.StartsWith("delta.columnMapping.", StringComparison.Ordinal)))))
+            .ToArray());
+
+    /// <summary>Adds a nullable column, so a later append evolves the schema rather than matching it.</summary>
+    private static StructType Widen(StructType schema, string name) =>
+        new(schema.Append(new StructField(name, DataTypes.StringType, nullable: true)).ToArray());
 
     /// <summary>
     /// A schema built to make an input-narrowing transform at EITHER call site observable, since
@@ -172,56 +321,109 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
             + "footer/log parity guard would silently stop covering it."),
     };
 
-    private async Task AppendAsync(StructType schema, IReadOnlyList<string> partitionColumns)
+    private async Task AppendAsync(
+        StructType schema, IReadOnlyList<string> partitionColumns, bool mergeSchema)
     {
         using DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(_root);
 
-        MutableColumnVector region = ColumnVectors.Create(DataTypes.StringType, 2);
-        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, 2);
-        MutableColumnVector name = ColumnVectors.Create(DataTypes.StringType, 2);
-        region.AppendBytes(Encoding.UTF8.GetBytes("west"));
-        region.AppendBytes(Encoding.UTF8.GetBytes("west"));
-        id.AppendValue(1L);
-        id.AppendValue(2L);
-        name.AppendBytes(Encoding.UTF8.GetBytes("a"));
-        name.AppendBytes(Encoding.UTF8.GetBytes("b"));
-
-        var batch = new ManagedColumnBatch(schema, new ColumnVector[] { region, id, name }, 2);
-        await target.AppendAsync(schema, partitionColumns, new[] { batch });
+        var batch = BuildBatch(schema, "west");
+        await target.AppendAsync(schema, partitionColumns, new[] { batch }, mergeSchema);
     }
 
-    /// <summary>Reads the <c>delta.schema</c> footer metadata off the committed data file.</summary>
-    private async Task<string> ReadFooterSchema()
+    private static ManagedColumnBatch BuildBatch(StructType schema, string region)
     {
-        string[] files = Directory.GetFiles(_root, "*.parquet", SearchOption.AllDirectories);
-        string path = Assert.Single(files);
+        var vectors = new ColumnVector[schema.Count];
+        for (int i = 0; i < schema.Count; i++)
+        {
+            MutableColumnVector vector = ColumnVectors.Create(schema[i].DataType, 2);
+            if (schema[i].DataType is LongType)
+            {
+                vector.AppendValue(1L);
+                vector.AppendValue(2L);
+            }
+            else
+            {
+                vector.AppendBytes(Encoding.UTF8.GetBytes(region));
+                vector.AppendBytes(Encoding.UTF8.GetBytes(region));
+            }
 
-        await using FileStream stream = File.OpenRead(path);
+            vectors[i] = vector;
+        }
+
+        return new ManagedColumnBatch(schema, vectors, 2);
+    }
+
+    /// <summary>Reads the <c>delta.schema</c> footer metadata off one committed data file.</summary>
+    private async Task<string> ReadFooterSchema(string relativePath)
+    {
+        await using FileStream stream = File.OpenRead(Path.Combine(_root, relativePath));
         await using ParquetReader reader =
             await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
         return reader.CustomMetadata[FooterWireKeys.Schema];
     }
 
     /// <summary>
-    /// Reads <c>metaData.schemaString</c> out of the committed log's RAW BYTES, rather than through
-    /// a snapshot object, so nothing between the writer and this assertion can normalize a
-    /// difference away.
+    /// Replays EVERY commit in the log and returns each added data file paired with the
+    /// <c>schemaString</c> that was in effect when that file was committed.
     /// </summary>
-    private string ReadCommittedSchemaString()
+    /// <remarks>
+    /// <para>
+    /// An earlier version read only <c>00000000000000000000.json</c> and asserted a single data
+    /// file existed. That guarded commit 0 of a one-file table and nothing else -- so the SCHEMA
+    /// EVOLUTION call sites, which run on commits 1..n and are a different set of
+    /// <c>SchemaJson.ToJson</c> calls, were never footer/log compared, and the multi-file commit
+    /// was excluded by an assertion rather than covered. "One instance guarded, its siblings not"
+    /// had bitten at the call-site level; this is the same shape at the COMMIT level.
+    /// </para>
+    /// <para>
+    /// The schemaString is CARRIED FORWARD across commits because a commit that adds no
+    /// <c>metaData</c> action still writes data files, and those files must match the schema still
+    /// in effect. Reading the raw committed bytes rather than a snapshot object is deliberate:
+    /// nothing between the writer and the assertion can normalize a difference away.
+    /// </para>
+    /// </remarks>
+    private IReadOnlyList<(long Version, string Path, string Declared)> ReadCommittedFiles()
     {
-        string commit = Path.Combine(_root, "_delta_log", "00000000000000000000.json");
-        foreach (string line in File.ReadAllLines(commit))
+        var results = new List<(long, string, string)>();
+        string logDirectory = Path.Combine(_root, "_delta_log");
+        string[] commits = Directory.GetFiles(logDirectory, "*.json");
+        Array.Sort(commits, StringComparer.Ordinal);
+
+        string? current = null;
+        foreach (string commit in commits)
         {
-            using JsonDocument document = JsonDocument.Parse(line);
-            if (document.RootElement.TryGetProperty("metaData", out JsonElement metadata)
-                && metadata.TryGetProperty("schemaString", out JsonElement schemaString))
+            long version = long.Parse(
+                Path.GetFileNameWithoutExtension(commit), System.Globalization.CultureInfo.InvariantCulture);
+            var added = new List<string>();
+
+            foreach (string line in File.ReadAllLines(commit))
             {
-                return schemaString.GetString()!;
+                using JsonDocument document = JsonDocument.Parse(line);
+                if (document.RootElement.TryGetProperty("metaData", out JsonElement metadata)
+                    && metadata.TryGetProperty("schemaString", out JsonElement schemaString))
+                {
+                    current = schemaString.GetString();
+                }
+
+                if (document.RootElement.TryGetProperty("add", out JsonElement add)
+                    && add.TryGetProperty("path", out JsonElement path))
+                {
+                    added.Add(Uri.UnescapeDataString(path.GetString()!));
+                }
+            }
+
+            if (current is null && added.Count > 0)
+            {
+                Assert.Fail($"Commit {version} added data files before any metaData action was committed.");
+            }
+
+            foreach (string path in added)
+            {
+                results.Add((version, path, current!));
             }
         }
 
-        Assert.Fail($"No metaData action was committed to {commit}.");
-        return string.Empty;
+        return results;
     }
 
     private static int FirstDifference(string left, string right)
