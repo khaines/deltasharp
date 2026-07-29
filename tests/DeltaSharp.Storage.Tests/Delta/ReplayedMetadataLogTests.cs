@@ -618,6 +618,121 @@ public sealed class ReplayedMetadataLogTests
         Assert.Equal(new[] { m }, observed);
     }
 
+    // ---------------------------------------------------------------------------------------------------
+    // IDENTITY-vs-VALUE probes (council R11). MetadataAction is a `sealed record`, so `==` is VALUE equality
+    // and compiles wherever ReferenceEquals does — every identity check in the lineage cross-check therefore
+    // has a STRICTNESS mutation point distinct from its subject, and all six were 0-red. The whole suite used
+    // one instance per distinct metadata, so identity and value never disagreed. These probes make them
+    // disagree: `Dup()` returns a SECOND instance structurally equal to the first. Each is single-point
+    // against the identity check named in its title, and each fails OPEN under `==` (accepts a history the
+    // identity check rejects), which is why they are defects rather than residuals.
+    // ---------------------------------------------------------------------------------------------------
+
+    /// <summary>A second, DISTINCT <see cref="MetadataAction"/> instance that is structurally equal to
+    /// <see cref="Meta"/>'s — identical under <c>==</c>, different under <c>ReferenceEquals</c>. The
+    /// reconstruction produces exactly this whenever two commits carry byte-identical <c>metaData</c>.</summary>
+    private static MetadataAction Dup(string id) => Meta(id);
+
+    /// <summary>Chain CLOSURE (<c>chained &amp;&amp; ReferenceEquals(cursor, _lineageAtWindowEnd)</c>). A
+    /// trailing SILENT record whose witness is unmoved is not stored, so it advances the window end without
+    /// advancing the cursor — and here the cursor lands on a value-equal TWIN of the end, not the end.</summary>
+    [Fact]
+    public void ATrailingSilentVersionWhoseWitnessIsAValueEqualTwin_StillBreaksTheChainCLOSURE()
+    {
+        var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
+        MetadataAction x = Meta("dup");
+        MetadataAction twin = Dup("dup");
+        log.Record(0, new[] { x }, null, x);
+        log.Record(1, new[] { twin }, x, twin);
+        log.Record(2, None, x, x);              // silent + unmoved: not stored, but moves the window end to x
+
+        DeltaProtocolException error = Assert.Throws<DeltaProtocolException>(log.Seal);
+        AssertPathFree(error.Message);
+    }
+
+    /// <summary>Chain LINK (<c>!ReferenceEquals(link.PrevailingBefore, cursor)</c>). The omitted revision's
+    /// successor witnesses a value-equal TWIN of the cursor rather than the cursor itself.</summary>
+    [Fact]
+    public void ARevisionWitnessingAValueEqualTwinOfTheCursor_StillBreaksTheChainLINK()
+    {
+        var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
+        MetadataAction a = Meta("dup");
+        MetadataAction twin = Dup("dup");
+        log.Record(0, new[] { a }, null, a);
+        log.Record(1, new[] { Meta("b") }, twin, Meta("b"));
+
+        DeltaProtocolException error = Assert.Throws<DeltaProtocolException>(log.Seal);
+        AssertPathFree(error.Message);
+    }
+
+    /// <summary>END ACCOUNTING (<c>ReferenceEquals(entry.PrevailingAfter, _lineageAtWindowEnd)</c>). The only
+    /// metadata record explains a value-equal TWIN of the window end, not the window end.</summary>
+    [Fact]
+    public void AMetadataRecordExplainingOnlyAValueEqualTwinOfTheEnd_DoesNotACCOUNTForIt()
+    {
+        var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
+        MetadataAction a = Meta("dup");
+        log.Record(0, new[] { a }, null, a);
+        log.Record(1, None, a, Dup("dup"));     // silent, but the witness moves to a twin
+
+        DeltaProtocolException error = Assert.Throws<DeltaProtocolException>(log.Seal);
+        AssertPathFree(error.Message);
+    }
+
+    /// <summary>LINEAGE MOVED (<c>!ReferenceEquals(_lineageAtWindowStart, _lineageAtWindowEnd)</c>). The
+    /// lineage moves to a value-equal TWIN, which selects the accounting branch, not the silent branch.</summary>
+    [Fact]
+    public void ALineageThatMovesToAValueEqualTwin_StillCountsAsHavingMOVED()
+    {
+        var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
+        log.Record(0, None, Meta("dup"), Dup("dup"));
+
+        DeltaProtocolException error = Assert.Throws<DeltaProtocolException>(log.Seal);
+        AssertPathFree(error.Message);
+    }
+
+    /// <summary>Per-version CORROBORATION (<c>!ReferenceEquals(prevailingBefore, prevailingAfter)</c>). The
+    /// under-reporting observer this guard exists to catch, hiding behind a value-equal twin: the
+    /// reconstruction replaced the instance, the observer recorded no <c>metaData</c>.</summary>
+    [Fact]
+    public void AnObserverSilentWhileTheStateMovedToAValueEqualTwin_StillContradictsTheReplayedState()
+    {
+        MetadataAction before = Meta("dup");
+
+        DeltaProtocolException error = Assert.Throws<DeltaProtocolException>(
+            () => ReplayedMetadataLog.EnsureObservationMatchesReplayedState(7, None, before, Dup("dup")));
+
+        Assert.Contains("7", error.Message, StringComparison.Ordinal);
+        AssertPathFree(error.Message);
+    }
+
+    /// <summary>STORAGE rule (<c>metadata.Count > 0 || !ReferenceEquals(prevailingBefore, prevailingAfter)</c>)
+    /// — the sparse dictionary's admission test. A silent record whose witness moves to a value-equal TWIN is
+    /// still a state move and must still be STORED, because it is a link the chain walk needs. Under value
+    /// equality it is dropped, the chain loses that link, and the next record's witness no longer matches the
+    /// cursor. Unlike the other five this mutation fails CLOSED, so it is pinned by a history that must be
+    /// ACCEPTED rather than one that must be rejected.</summary>
+    [Fact]
+    public void ASilentRecordWhoseWitnessMovesToAValueEqualTwin_IsStillSTOREDAsAChainLink()
+    {
+        var log = new ReplayedMetadataLog(exclusiveUpperBound: 100);
+        MetadataAction a = Meta("dup");
+        MetadataAction twin = Dup("dup");
+        MetadataAction b = Meta("b");
+        MetadataAction c = Meta("c");
+        log.Record(0, new[] { a }, null, a);
+        log.Record(1, None, a, twin);        // silent, witness moves to a twin — dropped if `==` is used
+        log.Record(2, None, twin, b);        // its `before` is the twin, so the chain needs v1's link
+        log.Record(3, new[] { c }, b, c);
+
+        log.Seal();                          // must be ACCEPTED: the chain is unbroken and closes on c
+
+        // v1 itself is deliberately a silent-while-moved record, so CONSUMING it is a per-version
+        // contradiction by design; the storage rule is observed through the chain it keeps intact.
+        Assert.True(log.TryGetProvenObservation(3, out IReadOnlyList<MetadataAction> observed));
+        Assert.Equal(new[] { c }, observed.ToArray());
+    }
+
     /// <summary>
     /// Pins the END-ACCOUNTING conjunct's ACCUMULATION (<c>|=</c>), which is a DIFFERENT mutation point from
     /// its <c>ReferenceEquals</c> predicate — the predicate was already pinned at 1 red, and the operator was

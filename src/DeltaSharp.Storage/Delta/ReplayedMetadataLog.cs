@@ -130,6 +130,25 @@ namespace DeltaSharp.Storage.Delta;
 /// because an unspecified enumeration contract cannot be probed while a conjunct can. <b>Two reasons that
 /// predict the same measurement are not the same claim</b>, and the one to keep is the one that yields a
 /// probe.</para>
+/// <para><b>And an EXPRESSION is not one point either.</b> The rule above was adopted after the
+/// <c>endMetadataAccounted</c> line was found to carry two points under one name, and it was still one level
+/// too shallow: every <c>ReferenceEquals</c> here also carries a STRICTNESS point, because
+/// <see cref="MetadataAction"/> is a <c>sealed record</c> and <c>==</c> therefore compiles wherever
+/// <c>ReferenceEquals</c> does while meaning VALUE equality. All six identity checks in this type were 0-red
+/// against that mutation, and four seats had audited the busiest of them and reported it pinned — because
+/// each of them mutated the ACCUMULATION and none mutated the PREDICATE'S STRICTNESS. So the audit unit is
+/// the sub-expression: a comparison has a subject, an operator and a strictness; a compound assignment has an
+/// accumulation and a predicate; each is mutable alone.</para>
+/// <para>The masking cause was again a fixture value choice, and a systematic one: the suite used ONE
+/// instance per distinct metadata, so identity and value never disagreed anywhere. That is not an exotic
+/// input — the reconstruction produces a fresh instance per commit, so any two commits carrying identical
+/// <c>metaData</c> are exactly this. Five of the six mutations fail OPEN (they accept histories the identity
+/// checks reject); the storage rule's fails CLOSED, so it is pinned by a history that must be ACCEPTED rather
+/// than rejected. The probes are the <c>ValueEqualTwin</c> tests.</para>
+/// <para>NOTE for whoever extends this: identity-vs-value is a REPO-WIDE shape wherever
+/// <c>ReferenceEquals</c> is applied to a record type, and it is used deliberately elsewhere (plan-tree
+/// rewriters return <c>this</c> when a child is unchanged BY IDENTITY). Those sites are outside this
+/// change's scope and are not audited here; do not assume this file's sweep covered them.</para>
 /// <para><b>The one worked set-wise comparison, shown as SETS because its totals were disputed twice.</b>
 /// A script implementing the rule above produced 13 non-boolean state writes; an independent hand audit
 /// produced 11. Neither total is evidence of anything; the membership is:</para>
