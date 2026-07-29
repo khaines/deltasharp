@@ -460,34 +460,10 @@ public sealed class ParquetWriterTests
     }
 
     /// <summary>
-    /// The scalar artifact corpus: every atomic type <c>ParquetTypeMapping.CreateField</c> accepts,
-    /// plus the decimal parameter family at its boundaries. Shared by the pinning test and the
-    /// completeness guard, so the two cannot disagree about what "the corpus" is.
+    /// The scalar artifact corpus, shared with the LOG-side parity guard via
+    /// <see cref="ScalarCorpus"/> so the two sides cannot disagree about what "the corpus" is.
     /// </summary>
-    private static readonly StructType ScalarCorpusSchema = new(new[]
-    {
-        new StructField("c_bool", DataTypes.BooleanType, nullable: false),
-        new StructField("c_byte", DataTypes.ByteType, nullable: true),
-        new StructField("c_short", DataTypes.ShortType, nullable: false),
-        new StructField("c_int", DataTypes.IntegerType, nullable: true),
-        new StructField("c_long", DataTypes.LongType, nullable: false),
-        new StructField("c_float", DataTypes.FloatType, nullable: true),
-        new StructField("c_double", DataTypes.DoubleType, nullable: false),
-        new StructField("c_string", DataTypes.StringType, nullable: true),
-        new StructField("c_binary", DataTypes.BinaryType, nullable: false),
-        new StructField("c_date", DataTypes.DateType, nullable: true),
-        new StructField("c_ts", DataTypes.TimestampType, nullable: false),
-        new StructField("c_ts_ntz", DataTypes.TimestampNtzType, nullable: true),
-        // decimal(p,s) is a parameterised FAMILY, and p/s are protocol-visible in schemaString, so
-        // pinning one member pins almost nothing. These are its boundaries: minimum precision,
-        // a mid-range value, zero scale, maximum supported precision (28 ==
-        // ParquetTypeMapping.MaxSupportedDecimalPrecision), and scale == precision.
-        new StructField("c_dec_min", DataTypes.CreateDecimalType(1, 0), nullable: true),
-        new StructField("c_dec_mid", DataTypes.CreateDecimalType(9, 2), nullable: false),
-        new StructField("c_dec_int", DataTypes.CreateDecimalType(10, 0), nullable: true),
-        new StructField("c_dec_max", DataTypes.CreateDecimalType(28, 7), nullable: false),
-        new StructField("c_dec_scale", DataTypes.CreateDecimalType(28, 28), nullable: true),
-    });
+    private static readonly StructType ScalarCorpusSchema = ScalarCorpus.Schema;
 
     /// <summary>Footer bytes for <see cref="ScalarCorpusSchema"/>, read back out of a real file.</summary>
     private const string ScalarFooterGolden =
@@ -1216,46 +1192,8 @@ public sealed class ParquetWriterTests
         return new ManagedColumnBatch(schema, vectors, 1);
     }
 
-    private static void AppendOneValue(MutableColumnVector vector, DataType type)
-    {
-        switch (type)
-        {
-            case BooleanType:
-                vector.AppendValue(true);
-                break;
-            case ByteType:
-                vector.AppendValue((sbyte)1);
-                break;
-            case ShortType:
-                vector.AppendValue((short)1);
-                break;
-            case IntegerType:
-            case DateType:
-                vector.AppendValue(1);
-                break;
-            case LongType:
-            case TimestampType:
-            case TimestampNtzType:
-            case DecimalType:
-                vector.AppendValue(1L);
-                break;
-            case FloatType:
-                vector.AppendValue(1f);
-                break;
-            case DoubleType:
-                vector.AppendValue(1d);
-                break;
-            case StringType:
-            case BinaryType:
-                vector.AppendBytes(new byte[] { 1 });
-                break;
-            default:
-                Assert.Fail(
-                    $"No value is constructible here for {type.SimpleString}, so a schema using it "
-                    + "would silently drop out of the rows-vs-no-rows comparison. Add an arm.");
-                break;
-        }
-    }
+    private static void AppendOneValue(MutableColumnVector vector, DataType type) =>
+        ScalarCorpus.AppendOne(vector, type);
 
     private static string Truncate(string text) =>
         text.Length <= 400 ? text : text[..200] + $" …[{text.Length} chars]… " + text[^200..];

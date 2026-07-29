@@ -34,10 +34,24 @@ namespace DeltaSharp.Storage.Tests.Delta;
 /// end-to-end comparison of the two real artifacts can hold it.
 /// </para>
 /// <para>
-/// So these tests go through the public write door, then read both bytes back off disk: the
-/// committed log JSON, and the footer of the data file that commit points at. Nothing is
-/// re-serialized in between. That is deliberate — a comparison that re-serializes either side is
-/// once again comparing an artifact to a helper.
+/// So these tests go through the public write door and read both artifacts back off disk: the
+/// committed log JSON, and the footer of the data file that commit points at.
+/// </para>
+/// <para>
+/// Where the property is <b>equality</b> -- the unpartitioned, unmapped case -- nothing is
+/// re-serialized in between: both sides are bytes read off disk and compared directly. That is
+/// deliberate, because re-serializing either side would once again compare an artifact to a
+/// helper, which is the mistake this PR exists to remove.
+/// </para>
+/// <para>
+/// Where the two artifacts are <b>supposed to differ</b> -- partitioning drops the partition
+/// columns from the footer, column mapping replaces logical names with physical ones -- equality
+/// is the wrong assertion and would fail on correct output, so those tests necessarily compute an
+/// expectation. What keeps that honest is not avoiding serialization but <b>where the expectation
+/// comes from</b>: it is derived from the CALLER'S schema, which the test owns, and never from the
+/// write path's own mapping helpers. A helper that turns test-owned input into an expectation sits
+/// OUTSIDE both the prober and the probed; a helper that re-derives one of the two artifacts being
+/// compared sits BETWEEN them. Only the second is a tautology.
 /// </para>
 /// </remarks>
 public sealed class DeltaFooterLogSchemaParityTests : IDisposable
@@ -74,10 +88,19 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
         }
     }
 
-    [Fact]
-    public async Task EveryCommit_FooterSchemaString_IsByteIdenticalToTheLogInEffect()
+    /// <param name="useScalarCorpus">
+    /// Which input schema to drive. The guard was originally keyed on one hand-written schema of
+    /// three fields and two types, so a divergence conditioned on a type it did not contain was
+    /// unreachable here while being well covered on the footer side. The corpus arm ranges over
+    /// every atomic type the writer accepts plus the decimal family at its boundaries, and it is
+    /// the SAME object the footer-side tests use, so a newly accepted type widens both at once.
+    /// </param>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task EveryCommit_FooterSchemaString_IsByteIdenticalToTheLogInEffect(bool useScalarCorpus)
     {
-        StructType initial = HostileSchema();
+        StructType initial = useScalarCorpus ? ScalarCorpus.Schema : HostileSchema();
 
         StructType widened = Widen(initial, "added_one");
         StructType final = Widen(widened, "added_two");
@@ -336,15 +359,20 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
         for (int i = 0; i < schema.Count; i++)
         {
             MutableColumnVector vector = ColumnVectors.Create(schema[i].DataType, 2);
-            if (schema[i].DataType is LongType)
+            if (schema[i].DataType is StringType)
             {
-                vector.AppendValue(1L);
-                vector.AppendValue(2L);
+                // Partition columns are string-typed here, and the partition VALUE has to vary to
+                // produce a multi-file commit, so strings carry the caller's value rather than the
+                // corpus placeholder.
+                vector.AppendBytes(Encoding.UTF8.GetBytes(region));
+                vector.AppendBytes(Encoding.UTF8.GetBytes(region));
             }
             else
             {
-                vector.AppendBytes(Encoding.UTF8.GetBytes(region));
-                vector.AppendBytes(Encoding.UTF8.GetBytes(region));
+                // Fails closed on a type it cannot build, so a newly accepted writer type cannot
+                // quietly drop out of the footer/log comparison.
+                ScalarCorpus.AppendOne(vector, schema[i].DataType);
+                ScalarCorpus.AppendOne(vector, schema[i].DataType);
             }
 
             vectors[i] = vector;
