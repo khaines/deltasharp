@@ -3,8 +3,8 @@ name: review-pr
 description: >-
   Orchestrates world-class pull request reviews using specialist agent personas and engineering checklists.
   Use this when asked to review a PR, review code changes, or assess PR quality.
-  A cheap scout triages and routes; a multi-frontier council (Claude Opus 5 + Gemini 3.1 Pro)
-  reviews complex changes with up to 3 scout-selected domain specialists; a decorrelated GPT-5.6 Sol
+  A cheap scout triages and routes; a Claude Opus 5 council
+  reviews complex changes with up to 3 scout-selected domain specialists; a decorrelated Gemini 3.1 Pro
   red-team executes repros (C7) and gates. Posts findings as GitHub PR code reviews (inline comments
   + review summary) for remote PRs.
 ---
@@ -151,23 +151,38 @@ Dispatch **4 parallel reviews** using the `task` tool. Each slot has a fixed **r
 |---|---|---|---|
 | **Architect** | Deep reasoning — architecture implications, subtle bugs, design flaws | `claude-opus-5` (effort high/xhigh/max) | `general-purpose`, `cloud-native-distributed-systems-architect`, `query-execution-engine-engineer`, `delta-storage-format-engineer`, `data-platform-connectors-engineer` |
 | **Balanced** | Code quality, patterns, maintainability, operational pragmatism | `claude-opus-5` (effort high/xhigh/max) | `general-purpose`, `dotnet-framework-runtime-engineer`, `cloud-native-site-reliability-engineer`, `developer-experience-api-engineer` |
-| **Quality** | Testability, measurability, reliability, alternative pattern recognition | `gemini-3.1-pro-preview` (effort high) | `general-purpose`, `reliability-test-chaos-engineer`, `performance-benchmarking-engineer`, `technical-writer` |
+| **Quality** | Testability, measurability, reliability, alternative pattern recognition | `claude-opus-5` (effort high/xhigh/max) | `general-purpose`, `reliability-test-chaos-engineer`, `performance-benchmarking-engineer`, `technical-writer` |
 | **Security** | Tenant isolation, auth bypass, injection, supply-chain, cryptographic correctness, privacy/compliance | `claude-opus-5` (effort high/xhigh/max) | `cloud-native-security-sme`, `privacy-compliance-grc-lead`, `general-purpose` |
 
-> **Models track the newest top-tier of each family** — currently Claude **Opus 5** (in place
-> of older Opus 4.8 / 4.7) for the deep / balanced / security lenses, and **Gemini 3.1 Pro**
-> (`gemini-3.1-pro-preview`) for Quality — a non-Claude voting perspective. Update these as families
-> advance. The council spans **three frontier families**: Claude (spine), Gemini (Quality), and GPT
-> (the Phase 8 red-team, `gpt-5.6-sol` / GPT-5.6 Sol) — so the red-team gate is **decorrelated from
-> every voting seat** (no voting seat uses GPT). See Phase 8.
+> **Models track the newest top-tier of each family** — currently Claude **Opus 5** across all four
+> voting lenses (deep / balanced / quality / security). Update these as families advance.
+>
+> **The voting spine is entirely Claude; the gate is entirely Gemini.** The Phase 8 red-team runs on
+> **`gemini-3.1-pro-preview`** (Gemini 3.1 Pro), a family **no voting seat uses** — so the gate is
+> **decorrelated from every voting seat** by construction. See Phase 8.
+>
+> **Why the gate moved off GPT (2026-07).** Measured over 5 consecutive red-team runs spanning
+> `gpt-5.6-sol` and `gpt-5.6-terra`: **5/5 returned an empty first response** (one after 3,936 s of
+> work) and **4/5 never discharged C7** — the red-team's defining duty. The failure tracked *long
+> adversarial prose generation*, not adversarial reasoning: the same models emitted fine when asked
+> for terse verdicts, and Claude/Gemini seats produced materially identical adversarial content
+> (real PII payloads, forged log lines, TAG-block smuggling, 16,000 crafted footer mutations) at
+> length without issue. Gemini had already demonstrated the required rigor in the Quality seat (a
+> 106-RED mutation experiment that overturned its own prior 2/5), so the gate moved to the model
+> proven capable of executing it.
+>
+> **Trade-off, recorded deliberately:** the council no longer has a non-Claude *voting* perspective.
+> Voting-seat diversity now comes from persona and effort rather than model family. Decorrelation is
+> spent on the gate, where a blind spot is unrecoverable, rather than on a voting seat, where four
+> other seats and the gate can still catch it.
 
 **Models are fixed per slot.** Diverse pattern recognition across the council comes from the model mix; domain specialization comes from the per-slot `agent_type` choice.
 
 **Specialist seats (scout-selected, ≤3).** In addition to the 4 fixed lenses, dispatch each
 domain specialist from the scout's Review Package as an **additional voting seat** on a frontier
-model (`agent_type` = the specialist persona; model = a **voting-spine family (Claude or Gemini),
-never GPT** — so the red-team's GPT-family decorrelation stays *structurally* guaranteed; a specialist
-on GPT would silently degrade the gate to provisional; e.g. `claude-opus-5`),
+model (`agent_type` = the specialist persona; model = a **voting-spine family (Claude), never
+Gemini** — so the red-team's Gemini-family decorrelation stays *structurally* guaranteed; a
+specialist on Gemini would silently degrade the gate to provisional; e.g. `claude-opus-5`),
 scoped to its owned files + checklist IDs. The 4 lenses are the spine; specialists add depth for
 the domains the diff actually touches (Delta storage, query execution, operator, connectors, …).
 
@@ -420,9 +435,9 @@ Complex changes** and for any change touching a protected domain.
 After the rating, dispatch the **red-team** (`.github/skills/review-pr/red-team.md`) — the council's
 gate-keeper. It runs **last**, **shell-capable** (`agent_type: general-purpose`), on a frontier
 family **distinct from the majority voting spine and ideally used by no voting seat**. With the
-current council (Claude spine + Gemini Quality), use **`gpt-5.6-sol`** (GPT-5.6 Sol) — the GPT family
-is used by no voting seat; do not reuse a voting seat's family (`claude-opus-5` or
-`gemini-3.1-pro-preview`) as the red-team.
+current council (all four voting lenses on Claude), use **`gemini-3.1-pro-preview`** (Gemini 3.1
+Pro) — the Gemini family is used by no voting seat; do not reuse a voting seat's family
+(`claude-opus-5`) as the red-team.
 
 Give it the diff, the Review Package, and **every voting seat's full verdict + findings**. It
 assumes the PR is broken, tries to falsify the seats' approvals, hunts the council's historical
