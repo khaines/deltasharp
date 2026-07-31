@@ -266,11 +266,15 @@ audited producers to zero so the escape hatch cannot be re-introduced.
 
 Because those controls key on the `SqlParseException` *type*, one further guarantee closes the
 *type* axis: the door promises (AC2) that every rejection surfaces as a `SqlParseException`, never a
-raw `FormatException`/`InvalidOperationException` echoing the lexeme. Numeric literals parse through
-`double.TryParse` (the lexer admits any Unicode `Nd` digit, which `double.Parse` rejects), and a
-behavioral property test fuzzes the door over hostile input asserting that **only** a
-`SqlParseException` — with a hygienic message and a fixed-prose inner — ever escapes, so an implicit
-leak on any exception type is caught where the source-shape audits cannot reach.
+raw `FormatException`/`InvalidOperationException` echoing the lexeme. This is enforced **structurally**,
+not by a source audit: each door (`Parse`, `ParseConstraintExpression`) wraps its whole body —
+tokenizer included — in a fail-closed `catch (Exception ex) when (ex is not SqlParseException)` that
+re-throws a fixed-prose `SqlParseException.Internal()` with the raw inner **dropped**, so no other
+exception type — from a BCL conversion, an unexpected internal error, or a future producer's throw —
+can carry a lexeme out of the door. Numeric literals additionally parse through `double.TryParse`
+(the lexer admits any Unicode `Nd` digit `double.Parse` rejects), an allow-list test requires every
+exception a producer constructs to carry a fixed-literal message, and a behavioral property test
+fuzzes the door asserting only a `SqlParseException` ever escapes.
 
 | Rejected input                         | `ErrorKind`         | `Construct` (stable token)                  | Detected at                    |
 | -------------------------------------- | ------------------- | ------------------------------------------- | ------------------------------ |

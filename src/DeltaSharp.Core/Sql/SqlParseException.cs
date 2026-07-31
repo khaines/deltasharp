@@ -163,6 +163,14 @@ public sealed class SqlParseException : Exception
             null,
             innerException);
 
+    /// <summary>The AC2 fail-closed backstop: a fixed-prose diagnostic for ANY exception that reaches a
+    /// door boundary without already being a <see cref="SqlParseException"/>. It takes no source text and
+    /// drops the raw inner, so the door structurally can never emit a non-<see cref="SqlParseException"/>
+    /// that echoes a lexeme (unbounded/unsanitized) via <see cref="Exception.ToString"/> on the type axis,
+    /// regardless of what any future producer throws (#687).</summary>
+    internal static SqlParseException Internal() =>
+        new("The SQL text could not be parsed.", SqlParseErrorKind.SyntaxError, null);
+
     /// <summary>Builds the fixed-prose CHECK-constraint depth diagnostic. The only interpolation is the
     /// caller-supplied compile-time constant <paramref name="maxDepth"/>; this factory takes no source
     /// text, so it keeps the constraint depth diagnostic off the banned public constructors (#687).</summary>

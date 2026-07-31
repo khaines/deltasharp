@@ -39,6 +39,9 @@ public sealed class SqlParserDiagnosticHygieneTests
     private const string ConstraintNestingTooDeepInvocationPattern =
         @"SqlParseException\s*\.\s*ConstraintNestingTooDeep\s*\(";
 
+    private const string InternalInvocationPattern =
+        @"SqlParseException\s*\.\s*Internal\s*\(";
+
     private const string ConstructorInvocationPattern =
         @"new\s+SqlParseException\s*\(";
 
@@ -67,6 +70,7 @@ public sealed class SqlParserDiagnosticHygieneTests
             ["Unsupported"] = UnsupportedInvocationPattern,
             ["NestingTooDeep"] = NestingTooDeepInvocationPattern,
             ["ConstraintNestingTooDeep"] = ConstraintNestingTooDeepInvocationPattern,
+            ["Internal"] = InternalInvocationPattern,
         };
 
     /// <summary>
@@ -907,38 +911,60 @@ public sealed class SqlParserDiagnosticHygieneTests
     }
 
     [Fact]
-    public void AuditedProducerThrows_ComposeNoInterpolatedMessage()
+    public void AuditedProducerExceptionConstructions_ComposeAFixedLiteralMessage()
     {
-        // Complements the behavioral guard on the static axis: EVERY `throw new <Type>(...)` in an
-        // audited producer must carry a fixed-literal message (no `$"…"` hole, no runtime formatting),
-        // regardless of the exception TYPE — so a `throw new InvalidOperationException($"…{lexeme}")`
-        // that never routes through Bounded/Describe is RED (Round-15 finding). SqlParseException's own
-        // construction is separately RS0030-banned. At HEAD the only such throw is the single fixed-
-        // prose InvalidOperationException in ConstraintExpressionFrontend.
-        var interpolationOrFormat = new Regex(
-            @"\$""|string\s*\.\s*(?:Format|Concat|Join)\s*\(",
-            RegexOptions.Singleline);
+        // Source ALLOW-LIST complementing the fail-closed door catch. Round-16 replaced a construction
+        // syntax proxy with a deny-list over interpolation syntax; both were bypassed (+ concatenation,
+        // helper indirection, a hoisted local, a BCL type with a public message ctor). Flip to an
+        // allow-list over the PROPERTY: EVERY `new <…>Exception(` in an audited producer — regardless
+        // of construction shape or exception type — must pass a fixed-literal-chain first argument, so
+        // no lexeme can be composed into any exception the producer builds. SqlParseException's own
+        // message ctors are separately RS0030-banned, so its exact type name is skipped (it is built
+        // only through the private ctor from the audited factories).
         string srcRoot = Path.GetFullPath(
             Path.Combine(Path.GetDirectoryName(SqlParserSourcePath())!, "..", ".."));
         foreach (string producer in AuditedProducers)
         {
             string source = File.ReadAllText(
                 Path.Combine(srcRoot, producer.Replace('/', Path.DirectorySeparatorChar)));
-            foreach (Match throwNew in Regex.Matches(
+            foreach (Match construction in Regex.Matches(
                 source,
-                @"throw\s+new\s+(?<type>[A-Za-z_][\w.]*)\s*\("))
+                @"\bnew\s+(?<type>[A-Za-z_][\w.]*Exception)\s*\("))
             {
-                if (throwNew.Groups["type"].Value.EndsWith("SqlParseException", StringComparison.Ordinal))
+                string type = construction.Groups["type"].Value;
+                if (type == "SqlParseException"
+                    || type.EndsWith(".SqlParseException", StringComparison.Ordinal))
                 {
                     continue;
                 }
 
-                int openParen = throwNew.Index + throwNew.Length - 1;
+                int openParen = construction.Index + construction.Length - 1;
                 int closeParen = FindMatchingParenthesis(source, openParen);
                 string arguments = source[(openParen + 1)..closeParen];
-                Assert.DoesNotMatch(interpolationOrFormat, arguments);
+                int comma = TopLevelOperator(arguments, ',');
+                string firstArgument = comma < 0 ? arguments : arguments[..comma];
+                Assert.True(
+                    IsLiteralChain(firstArgument),
+                    $"{producer}: new {type}(...) composes a non-literal message: {firstArgument.Trim()}");
             }
         }
+    }
+
+    [Fact]
+    public void BothDoors_CarryTheFailClosedTypeAxisBackstop()
+    {
+        // The type axis is closed STRUCTURALLY by a fail-closed backstop at each door boundary —
+        // `catch (Exception ex) when (ex is not SqlParseException) { … throw SqlParseException.Internal(); }`
+        // — so any non-SqlParseException (a BCL conversion, an unexpected internal error, a future
+        // producer's throw) becomes fixed prose with the raw inner dropped, and no lexeme escapes on the
+        // type axis. Pin BOTH backstops so removing one (letting a raw exception escape) fails closed.
+        string code = SqlParserCode();
+        int backstops = Regex.Matches(
+            code,
+            @"catch\s*\(\s*Exception\s+\w+\s*\)\s*when\s*\(\s*\w+\s+is\s+not\s+SqlParseException\s*\)"
+                + @"[^}]*?SqlParseException\s*\.\s*Internal\s*\(\s*\)",
+            RegexOptions.Singleline).Count;
+        Assert.Equal(2, backstops);
     }
 
     [Fact]
@@ -965,7 +991,8 @@ public sealed class SqlParserDiagnosticHygieneTests
         // new factory cannot be waved through by a one-line table edit (Round-12 finding). The table is
         // then reconciled against the SAME literal pin, so the producer inventory's recognizer stays
         // complete while neither the reflected set nor the table can be silenced independently.
-        string[] pinned = ["ConstraintNestingTooDeep", "NestingTooDeep", "Syntax", "Unsupported"];
+        string[] pinned =
+            ["ConstraintNestingTooDeep", "Internal", "NestingTooDeep", "Syntax", "Unsupported"];
         Assert.Equal(pinned, factories);
         Assert.Equal(
             pinned,

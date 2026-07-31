@@ -78,9 +78,9 @@ internal sealed class SqlParser
     /// (<see cref="SqlParseErrorKind.UnsupportedFeature"/>).</exception>
     public static LogicalPlan Parse(string sql)
     {
-        IReadOnlyList<SqlToken> tokens = SqlLexer.Tokenize(sql);
         try
         {
+            IReadOnlyList<SqlToken> tokens = SqlLexer.Tokenize(sql);
             return new SqlParser(tokens).ParseStatement();
         }
         catch (PlanDepthExceededException ex)
@@ -99,6 +99,15 @@ internal sealed class SqlParser
             // uncatchable StackOverflowException that would crash the whole driver process.
             throw SqlParseException.NestingTooDeep(ex);
         }
+        catch (Exception ex) when (ex is not SqlParseException)
+        {
+            // AC2 fail-closed backstop (Tokenize is inside the try so the lexer is covered too): the
+            // door promises a SqlParseException, never a raw exception that could echo a lexeme
+            // unbounded/unsanitized out of ToString(). Any other exception — a BCL conversion, an
+            // unexpected internal error — becomes a fixed-prose diagnostic with the raw inner DROPPED,
+            // so "only a SqlParseException escapes" is a structural property, not a source-audit hope.
+            throw SqlParseException.Internal();
+        }
     }
 
     /// <summary>
@@ -116,10 +125,10 @@ internal sealed class SqlParser
     public static Expression ParseConstraintExpression(string expression)
     {
         ArgumentNullException.ThrowIfNull(expression);
-        IReadOnlyList<SqlToken> tokens = SqlLexer.Tokenize(expression);
-        var parser = new SqlParser(tokens);
         try
         {
+            IReadOnlyList<SqlToken> tokens = SqlLexer.Tokenize(expression);
+            var parser = new SqlParser(tokens);
             Expression parsed = parser.ParseExpression();
             if (parser.Current.Kind != SqlTokenKind.EndOfInput)
             {
@@ -143,6 +152,13 @@ internal sealed class SqlParser
             // headroom, so it surfaces as a deterministic, catchable SqlParseException, never an uncatchable
             // StackOverflowException that would crash the driver process on a hostile constraint string.
             throw SqlParseException.NestingTooDeep(ex);
+        }
+        catch (Exception ex) when (ex is not SqlParseException)
+        {
+            // AC2 fail-closed backstop (Tokenize is inside the try): any non-SqlParseException on the
+            // untrusted CHECK-constraint path becomes fixed prose with the raw inner DROPPED, so no
+            // lexeme can escape the door on the type axis regardless of what a producer throws (#687).
+            throw SqlParseException.Internal();
         }
     }
 
