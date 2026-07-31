@@ -25,6 +25,15 @@ namespace DeltaSharp.Core.Tests.SqlDoor;
 /// </summary>
 public sealed class SqlParserDiagnosticHygieneTests
 {
+    private const string SyntaxInvocationPattern =
+        @"SqlParseException\s*\.\s*Syntax\s*\(";
+
+    private const string UnsupportedInvocationPattern =
+        @"SqlParseException\s*\.\s*Unsupported\s*\(";
+
+    private const string ConstructorInvocationPattern =
+        @"new\s+SqlParseException\s*\(";
+
     /// <summary>The red-team's exact payload: a quoted token carrying a raw CR and LF.</summary>
     private const string CrLfPayload = "TRAIL\r\nFORGED";
 
@@ -240,12 +249,15 @@ public sealed class SqlParserDiagnosticHygieneTests
         {
             string payload = $"SECRET_{length}_" + new string('q', length);
             string marker = $"SECRET_{length}_";
+            string endMarker = $"_END_SECRET_{length}";
+            payload += endMarker;
             string probe = sql.Replace("SEC\r\nRET_PAYLOAD", payload, StringComparison.Ordinal);
             Assert.NotEqual(sql, probe);
 
             SqlParseException ex = ParseSyntaxError(probe, viaStatementDoor);
             Assert.DoesNotContain(payload, ex.Message, StringComparison.Ordinal);
             Assert.DoesNotContain(marker, ex.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(endMarker, ex.Message, StringComparison.Ordinal);
             Assert.Contains("string literal", ex.Message, StringComparison.Ordinal);
             AssertHygienic(ex.Message);
         }
@@ -355,7 +367,7 @@ public sealed class SqlParserDiagnosticHygieneTests
     public void EveryDynamicSyntaxDiagnostic_RoutesLexemesThroughDescribe()
     {
         string code = SqlParserCode();
-        string[] calls = InvocationArguments(code, "SqlParseException.Syntax(").ToArray();
+        string[] calls = InvocationArguments(code, SyntaxInvocationPattern).ToArray();
         Assert.Equal(
             EchoSites.Length,
             calls.Count(arguments => arguments.Contains("Describe(", StringComparison.Ordinal)));
@@ -373,9 +385,7 @@ public sealed class SqlParserDiagnosticHygieneTests
     public void EveryUnsupportedConstruct_IsFixedOrMapped()
     {
         string code = SqlParserCode();
-        MatchCollection calls = Regex.Matches(
-            code,
-            @"SqlParseException\.Unsupported\(\s*(?<construct>[^,\r\n]+),");
+        string[] calls = InvocationArguments(code, UnsupportedInvocationPattern).ToArray();
         Assert.NotEmpty(calls);
 
         string[] mapped = ["construct", "unsupported", "negatedPredicate", "predicate"];
@@ -386,9 +396,9 @@ public sealed class SqlParserDiagnosticHygieneTests
             .Select(match => match.Groups["name"].Value)
             .ToArray();
         var usesByName = new Dictionary<string, int>(StringComparer.Ordinal);
-        foreach (Match call in calls)
+        foreach (string call in calls)
         {
-            string construct = call.Groups["construct"].Value.Trim();
+            string construct = FirstArgument(call);
             bool fixedLiteral = Regex.IsMatch(construct, @"^""(?:[^""\\]|\\.)*""$");
             Assert.True(
                 fixedLiteral || mapped.Contains(construct, StringComparer.Ordinal),
@@ -401,16 +411,29 @@ public sealed class SqlParserDiagnosticHygieneTests
 
         foreach (string construct in mapped)
         {
-            Match[] assignments = Regex.Matches(
+            Match[] allAssignments = Regex.Matches(
                     code,
-                    $@"\b(?:string\??|var)\s+{construct}\s*=(?!=)\s*(?<value>[^;]+);")
+                    $@"\b{construct}\s*(?<operator>\?\?=|\+=|=)(?!=)\s*(?<value>[^;]+);")
                 .Cast<Match>()
-                .Concat(
-                    Regex.Matches(
-                            code,
-                            $@"(?m)^\s*{construct}\s*=(?!=)\s*(?<value>[^;]+);")
-                        .Cast<Match>())
                 .ToArray();
+            Match[] excluded = allAssignments
+                .Where(assignment =>
+                {
+                    int lineStart = code.LastIndexOf('\n', assignment.Index);
+                    string prefix = code[(lineStart + 1)..assignment.Index];
+                    return Regex.IsMatch(prefix, @"\bExpression\s*$");
+                })
+                .ToArray();
+            if (construct == "predicate")
+            {
+                Assert.Single(excluded);
+            }
+            else
+            {
+                Assert.Empty(excluded);
+            }
+
+            Match[] assignments = allAssignments.Except(excluded).ToArray();
             Assert.True(
                 assignments.Length >= usesByName.GetValueOrDefault(construct),
                 $"No assignment found for mapped construct '{construct}'.");
@@ -418,7 +441,11 @@ public sealed class SqlParserDiagnosticHygieneTests
                 assignments,
                 assignment =>
                 {
+                    string op = assignment.Groups["operator"].Value;
                     string value = assignment.Groups["value"].Value.Trim();
+                    Assert.True(
+                        op is "=" or "??=",
+                        $"Mapped construct '{construct}' uses unsupported assignment operator '{op}'.");
                     Assert.Matches(
                         new Regex(
                             @"^Map\w+\([^;]+\)(?:\s*\?\?\s*Map\w+\([^;]+\))*$"),
@@ -451,26 +478,23 @@ public sealed class SqlParserDiagnosticHygieneTests
     public void EveryPublicConstructorMessage_IsFixedProse()
     {
         string code = SqlParserCode() + "\n" + ConstraintExpressionFrontendCode();
-        MatchCollection calls = Regex.Matches(
-            code,
-            @"new SqlParseException\((?<arguments>.*?)\)(?=\s*;)",
-            RegexOptions.Singleline);
+        string[] calls = InvocationArguments(code, ConstructorInvocationPattern).ToArray();
         Assert.NotEmpty(calls);
 
         var fixedLiteralChain = new Regex(
             @"^""(?:[^""\\]|\\.)*""(?:\s*\+\s*""(?:[^""\\]|\\.)*"")*\s*(?:,|$)",
             RegexOptions.Singleline);
-        foreach (Match call in calls)
+        foreach (string call in calls)
         {
-            string arguments = call.Groups["arguments"].Value;
-            MatchCollection holes = Regex.Matches(arguments, @"\{(?<expression>[^{}]+)\}");
+            string message = FirstArgument(call);
+            MatchCollection holes = Regex.Matches(message, @"\{(?<expression>[^{}]+)\}");
             Assert.All(
                 holes,
                 hole => Assert.Equal(
                     "MaxConstraintExpressionDepth",
                     hole.Groups["expression"].Value.Trim()));
 
-            string normalized = arguments
+            string normalized = message
                 .Replace(
                     "{MaxConstraintExpressionDepth}",
                     "MAX_DEPTH",
@@ -493,9 +517,9 @@ public sealed class SqlParserDiagnosticHygieneTests
             .Where(path =>
             {
                 string source = File.ReadAllText(path);
-                return source.Contains("SqlParseException.Syntax(", StringComparison.Ordinal)
-                    || source.Contains("SqlParseException.Unsupported(", StringComparison.Ordinal)
-                    || source.Contains("new SqlParseException(", StringComparison.Ordinal);
+                return Regex.IsMatch(source, SyntaxInvocationPattern)
+                    || Regex.IsMatch(source, UnsupportedInvocationPattern)
+                    || Regex.IsMatch(source, ConstructorInvocationPattern);
             })
             .Select(path => Path.GetRelativePath(root, path).Replace('\\', '/'))
             .OrderBy(path => path, StringComparer.Ordinal)
@@ -515,7 +539,7 @@ public sealed class SqlParserDiagnosticHygieneTests
     [Fact]
     public void EveryLexerSyntaxDiagnostic_UsesApprovedProse()
     {
-        string[] calls = InvocationArguments(SqlLexerCode(), "SqlParseException.Syntax(").ToArray();
+        string[] calls = InvocationArguments(SqlLexerCode(), SyntaxInvocationPattern).ToArray();
         Assert.Equal(6, calls.Length);
         Assert.All(
             calls,
@@ -528,8 +552,41 @@ public sealed class SqlParserDiagnosticHygieneTests
     public void LexerCannotIntroduceUnauditedMessageSurfaces()
     {
         string code = SqlLexerCode();
-        Assert.DoesNotContain("SqlParseException.Unsupported(", code, StringComparison.Ordinal);
-        Assert.DoesNotContain("new SqlParseException(", code, StringComparison.Ordinal);
+        Assert.DoesNotMatch(new Regex(UnsupportedInvocationPattern), code);
+        Assert.DoesNotMatch(new Regex(ConstructorInvocationPattern), code);
+    }
+
+    [Fact]
+    public void LexerGlyphBinding_IsExactlyOneSourceCharacter()
+    {
+        string code = SqlLexerCode();
+        MatchCollection assignments = Regex.Matches(
+            code,
+            @"\bglyph\s*(?<operator>\?\?=|\+=|=)(?!=)\s*(?<value>[^;]+);");
+
+        Match declaration = Assert.Single(assignments.Cast<Match>());
+        Assert.Equal("=", declaration.Groups["operator"].Value);
+        Assert.Equal(
+            "c.ToString(CultureInfo.InvariantCulture)",
+            declaration.Groups["value"].Value.Trim());
+    }
+
+    [Fact]
+    public void LexerUnexpectedCharacter_NeverDisclosesFollowingLiteral()
+    {
+        foreach (int length in new[] { 8, 60, 140, 400, 520, 1_200, FloodLength })
+        {
+            string marker = $"SECRET_{length}_";
+            string payload = marker + new string('q', length);
+            SqlParseException ex = ParseSyntaxError(
+                $"a > 0 # '{payload}'",
+                viaStatementDoor: false);
+
+            Assert.Contains("unexpected character '#'", ex.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(marker, ex.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(payload, ex.Message, StringComparison.Ordinal);
+            AssertHygienic(ex.Message);
+        }
     }
 
     private static SqlParseException ParseSyntaxError(string sql, bool viaStatementDoor) =>
@@ -594,15 +651,13 @@ public sealed class SqlParserDiagnosticHygieneTests
             source.Split('\n').Where(line => !line.TrimStart().StartsWith("//", StringComparison.Ordinal)));
     }
 
-    private static IEnumerable<string> InvocationArguments(string source, string marker)
+    private static IEnumerable<string> InvocationArguments(string source, string invocationPattern)
     {
-        int searchFrom = 0;
-        while (source.IndexOf(marker, searchFrom, StringComparison.Ordinal) is int markerAt && markerAt >= 0)
+        foreach (Match invocation in Regex.Matches(source, invocationPattern))
         {
-            int openParen = markerAt + marker.Length - 1;
+            int openParen = invocation.Index + invocation.Length - 1;
             int closeParen = FindMatchingParenthesis(source, openParen);
             yield return source[(openParen + 1)..closeParen];
-            searchFrom = closeParen + 1;
         }
     }
 

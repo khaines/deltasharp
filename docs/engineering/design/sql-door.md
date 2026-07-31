@@ -241,7 +241,8 @@ inventory, reject dynamic `SqlParseException.Syntax` prose that interpolates any
 `Describe` result (or the fixed `Expect` glyph), require `Unsupported` constructs and public
 constructor prose to remain fixed or mapped, require every `Map*` arm to return a stable literal or
 `null`, and pin each exception's exact throwing method. An explicit Core producer-file inventory
-extends the same prose rules through the lexer and fails closed when a new producer appears. A
+extends the same prose rules through the lexer and fails closed when a new producer appears; the
+lexer's approved glyph is bound to exactly one source character and driven with a trailing secret. A
 length-swept behavioral oracle over all nine parser rejection positions independently proves that no
 decoded value — including a truncation-surviving secret prefix — reaches a message. Once two attacker
 messages exceed the backstop budget, their rendered messages are byte-identical rather than
