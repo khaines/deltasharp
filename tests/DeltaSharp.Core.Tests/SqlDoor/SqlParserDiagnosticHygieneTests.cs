@@ -258,10 +258,7 @@ public sealed class SqlParserDiagnosticHygieneTests
     [Fact]
     public void EchoSiteInventory_ReconcilesEveryDescribeCall()
     {
-        string source = File.ReadAllText(SqlParserSourcePath());
-        string code = string.Join(
-            '\n',
-            source.Split('\n').Where(line => !line.TrimStart().StartsWith("//", StringComparison.Ordinal)));
+        string code = SqlParserCode();
         int declarations = Regex.Matches(code, @"private static string Describe\b").Count;
         int references = Regex.Matches(code, @"\bDescribe\b").Count - declarations;
 
@@ -281,6 +278,45 @@ public sealed class SqlParserDiagnosticHygieneTests
 
         EchoSite accepted = Assert.Single(EchoSites, site => site.AcceptedStringLiteralSql is not null);
         SqlParser.Parse(accepted.AcceptedStringLiteralSql!);
+    }
+
+    [Fact]
+    public void EveryDynamicSyntaxDiagnostic_RoutesLexemesThroughDescribe()
+    {
+        string code = SqlParserCode();
+        MatchCollection calls = Regex.Matches(
+            code,
+            @"SqlParseException\.Syntax\((?<arguments>.*?)\)(?=\s*;)",
+            RegexOptions.Singleline);
+        Assert.Equal(
+            EchoSites.Length,
+            calls.Count(call => call.Groups["arguments"].Value.Contains("Describe(", StringComparison.Ordinal)));
+
+        foreach (Match call in calls)
+        {
+            string arguments = call.Groups["arguments"].Value;
+            string withoutDescribe = Regex.Replace(
+                arguments,
+                @"\{Describe\([^()]*\)\}",
+                "DESCRIBED_TOKEN");
+            MatchCollection interpolationHoles = Regex.Matches(
+                withoutDescribe,
+                @"\{(?<expression>[^{}]+)\}");
+            Assert.All(
+                interpolationHoles,
+                hole => Assert.Equal("glyph", hole.Groups["expression"].Value.Trim()));
+
+            if (arguments.Contains("Describe(", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            Assert.Matches(
+                new Regex(
+                    @"^""(?:[^""\\]|\\.)*""(?:\s*\+\s*""(?:[^""\\]|\\.)*"")*\s*,",
+                    RegexOptions.Singleline),
+                arguments.TrimStart());
+        }
     }
 
     private static SqlParseException ParseSyntaxError(string sql, bool viaStatementDoor) =>
@@ -333,6 +369,16 @@ public sealed class SqlParserDiagnosticHygieneTests
 
         throw new DirectoryNotFoundException(
             $"Could not locate DeltaSharp.sln above test base directory '{AppContext.BaseDirectory}'.");
+    }
+
+    private static string SqlParserCode()
+    {
+        string path = SqlParserSourcePath();
+        Assert.True(File.Exists(path), $"SqlParser source does not exist at '{path}'");
+        string source = File.ReadAllText(path);
+        return string.Join(
+            '\n',
+            source.Split('\n').Where(line => !line.TrimStart().StartsWith("//", StringComparison.Ordinal)));
     }
 
     [Fact]

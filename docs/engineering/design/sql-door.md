@@ -237,9 +237,10 @@ its decoded value and caps any echoed lexeme at 128 characters. Every message-ta
 `SqlParseException` constructor then applies a single-line, 512-character whole-message backstop; the
 parameterless constructor accepts no input and carries only a runtime-supplied default message. Tests
 derive the hostile, bounded, and string-literal corpora from one source-reconciled `Describe`-site
-inventory, pin each exception's exact throwing method, and assert that once two attacker messages
-exceed the backstop budget, their rendered messages are byte-identical rather than proportional to
-attacker input length.
+inventory, reject dynamic `SqlParseException.Syntax` prose that interpolates anything except a
+`Describe` result (or the fixed `Expect` glyph), pin each exception's exact throwing method, and
+assert that once two attacker messages exceed the backstop budget, their rendered messages are
+byte-identical rather than proportional to attacker input length.
 
 | Rejected input                         | `ErrorKind`         | `Construct` (stable token)                  | Detected at                    |
 | -------------------------------------- | ------------------- | ------------------------------------------- | ------------------------------ |

@@ -80,6 +80,17 @@ public sealed class AnalysisExceptionCandidateListingTests
         AssertCountIsAccurate(fourHundred, 400);
     }
 
+    [Fact]
+    public void CountOracle_IgnoresMatchingFreeProseOutsideTheListing()
+    {
+        const int Width = 400;
+        string message = AnalysisException.UnresolvedColumn(
+            "customer_lifetime_value_rolling_9999",
+            Columns(Width)).Message;
+
+        AssertCountIsAccurate(message, Width);
+    }
+
     /// <summary>The count must be ACCURATE, not merely present — an overflow marker that reports the wrong
     /// number is worse than none, because it is believed.</summary>
     [Theory]
@@ -567,9 +578,37 @@ public sealed class AnalysisExceptionCandidateListingTests
     /// </summary>
     private static void AssertCountIsAccurate(string message, int width, string itemPattern = @"customer_lifetime_value_rolling_\d{4}")
     {
-        int shown = Regex.Matches(message, itemPattern).Count;
+        int shown = Regex.Matches(ListingText(message), itemPattern).Count;
         int reported = OverflowCounts(message).Sum();
         Assert.Equal(width, shown + reported);
+    }
+
+    private static string ListingText(string message)
+    {
+        int openBracket = message.LastIndexOf('[');
+        int closeBracket = message.LastIndexOf(']');
+        if (openBracket >= 0 && closeBracket > openBracket)
+        {
+            return message[(openBracket + 1)..closeBracket];
+        }
+
+        const string AmbiguousPrefix = "could be: ";
+        int ambiguous = message.IndexOf(AmbiguousPrefix, StringComparison.Ordinal);
+        if (ambiguous >= 0)
+        {
+            return message[(ambiguous + AmbiguousPrefix.Length)..].TrimEnd('.');
+        }
+
+        const string FunctionPrefix = "Cannot resolve function '";
+        int function = message.IndexOf(FunctionPrefix, StringComparison.Ordinal);
+        int openParen = function < 0 ? -1 : message.IndexOf('(', function + FunctionPrefix.Length);
+        int closeParen = openParen < 0 ? -1 : message.IndexOf(")':", openParen, StringComparison.Ordinal);
+        if (openParen >= 0 && closeParen > openParen)
+        {
+            return message[(openParen + 1)..closeParen];
+        }
+
+        throw new InvalidOperationException($"Could not isolate listing text in: {message}");
     }
 
     /// <summary>Extracts every <c>(+N more)</c> count from a message, in order.</summary>
@@ -900,11 +939,6 @@ public sealed class AnalysisExceptionCandidateListingTests
     private static object FactoryArgument(
         ParameterInfo parameter, int width, int proseLength, int seed)
     {
-        if (parameter.HasDefaultValue)
-        {
-            return parameter.DefaultValue!;
-        }
-
         Type type = parameter.ParameterType;
         if (type == typeof(string))
         {
@@ -1058,6 +1092,12 @@ public sealed class AnalysisExceptionCandidateListingTests
     {
         ListingArgument[] listings = ListingArguments(factory, args);
         Assert.NotEmpty(listings);
+        if (listings.Length > 1 && listings.Any(listing => listing.Tokens.Length > 0))
+        {
+            Assert.Equal(
+                listings.Length,
+                listings.Select(listing => listing.Tokens.Length).Distinct().Count());
+        }
 
         int[] overflow = OverflowCounts(message);
         string[] allTokens = listings.SelectMany(listing => listing.Tokens).ToArray();
