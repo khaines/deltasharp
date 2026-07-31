@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Globalization;
 using System.Runtime.CompilerServices;
+using DeltaSharp.Diagnostics;
 using DeltaSharp.Plans;
 using DeltaSharp.Plans.Expressions;
 using DeltaSharp.Plans.Logical;
@@ -48,6 +49,18 @@ internal sealed class SqlParser
     /// </summary>
     private const int MaxExpressionDepth = TreeNode<LogicalPlan>.MaxDepth;
 
+    /// <summary>
+    /// The cap applied to the raw lexeme text this parser echoes into a <see cref="SqlParseException"/>
+    /// diagnostic (see <see cref="Describe"/>). Chosen to be generous — a real SQL identifier, keyword, or
+    /// numeric literal is an order of magnitude shorter — so interactive SQL users still get their offending
+    /// token back verbatim and in full, while a hostile <c>delta.constraints.&lt;name&gt;</c> CHECK predicate
+    /// carrying a 100&#160;000-character token can no longer render a 100&#160;000-character message (#687).
+    /// Bounding the TOKEN (rather than only the finished message, which
+    /// <see cref="SqlParseException.MaxMessageLength"/> also does) keeps the surrounding explanatory prose
+    /// intact instead of letting an oversized lexeme consume the entire message budget.
+    /// </summary>
+    private const int EchoedTokenMaxLength = DiagnosticText.DefaultMaxLength;
+
     private readonly IReadOnlyList<SqlToken> _tokens;
     private int _pos;
     private int _depth;
@@ -65,9 +78,13 @@ internal sealed class SqlParser
     /// (<see cref="SqlParseErrorKind.UnsupportedFeature"/>).</exception>
     public static LogicalPlan Parse(string sql)
     {
-        IReadOnlyList<SqlToken> tokens = SqlLexer.Tokenize(sql);
+        // A null ARGUMENT is a caller-contract violation, not malformed SQL: validate it BEFORE the
+        // try (symmetric with ParseConstraintExpression) so it surfaces as ArgumentNullException rather
+        // than being swallowed by the fail-closed backstop into Internal()'s "malformed SQL" prose.
+        ArgumentNullException.ThrowIfNull(sql);
         try
         {
+            IReadOnlyList<SqlToken> tokens = SqlLexer.Tokenize(sql);
             return new SqlParser(tokens).ParseStatement();
         }
         catch (PlanDepthExceededException ex)
@@ -75,8 +92,7 @@ internal sealed class SqlParser
             // Belt-and-suspenders: the recursion-depth guard below should fire first, but if an
             // over-deep tree ever reaches node construction, translate the INTERNAL plan-depth
             // exception into the public, catchable SqlParseException the door promises (AC2).
-            throw new SqlParseException(
-                "Syntax error: expression nesting too deep to parse.", ex);
+            throw SqlParseException.NestingTooDeep(ex);
         }
         catch (InsufficientExecutionStackException ex)
         {
@@ -85,8 +101,16 @@ internal sealed class SqlParser
             // ladder but builds no node). RuntimeHelpers.EnsureSufficientExecutionStack() fires while
             // there is still headroom, so this is a deterministic, catchable failure — never an
             // uncatchable StackOverflowException that would crash the whole driver process.
-            throw new SqlParseException(
-                "Syntax error: expression nesting too deep to parse.", ex);
+            throw SqlParseException.NestingTooDeep(ex);
+        }
+        catch (Exception ex) when (ex is not SqlParseException)
+        {
+            // AC2 fail-closed backstop (Tokenize is inside the try so the lexer is covered too): the
+            // door promises a SqlParseException, never a raw exception that could echo a lexeme
+            // unbounded/unsanitized out of ToString(). Any other exception — a BCL conversion, an
+            // unexpected internal error — becomes a fixed-prose diagnostic with the raw inner DROPPED,
+            // so "only a SqlParseException escapes" is a structural property, not a source-audit hope.
+            throw SqlParseException.Internal();
         }
     }
 
@@ -105,15 +129,15 @@ internal sealed class SqlParser
     public static Expression ParseConstraintExpression(string expression)
     {
         ArgumentNullException.ThrowIfNull(expression);
-        IReadOnlyList<SqlToken> tokens = SqlLexer.Tokenize(expression);
-        var parser = new SqlParser(tokens);
         try
         {
+            IReadOnlyList<SqlToken> tokens = SqlLexer.Tokenize(expression);
+            var parser = new SqlParser(tokens);
             Expression parsed = parser.ParseExpression();
             if (parser.Current.Kind != SqlTokenKind.EndOfInput)
             {
                 throw SqlParseException.Syntax(
-                    $"unexpected trailing input '{parser.Current.Text}' after the constraint expression; a "
+                    $"unexpected trailing input '{Describe(parser.Current)}' after the constraint expression; a "
                     + "constraint is a single boolean expression, not a statement",
                     parser.Current.Position);
             }
@@ -122,7 +146,7 @@ internal sealed class SqlParser
         }
         catch (PlanDepthExceededException ex)
         {
-            throw new SqlParseException("Syntax error: expression nesting too deep to parse.", ex);
+            throw SqlParseException.NestingTooDeep(ex);
         }
         catch (InsufficientExecutionStackException ex)
         {
@@ -131,7 +155,14 @@ internal sealed class SqlParser
             // but building no node — trips RuntimeHelpers.EnsureSufficientExecutionStack() while there is still
             // headroom, so it surfaces as a deterministic, catchable SqlParseException, never an uncatchable
             // StackOverflowException that would crash the driver process on a hostile constraint string.
-            throw new SqlParseException("Syntax error: expression nesting too deep to parse.", ex);
+            throw SqlParseException.NestingTooDeep(ex);
+        }
+        catch (Exception ex) when (ex is not SqlParseException)
+        {
+            // AC2 fail-closed backstop (Tokenize is inside the try): any non-SqlParseException on the
+            // untrusted CHECK-constraint path becomes fixed prose with the raw inner DROPPED, so no
+            // lexeme can escape the door on the type axis regardless of what a producer throws (#687).
+            throw SqlParseException.Internal();
         }
     }
 
@@ -150,7 +181,7 @@ internal sealed class SqlParser
             string? construct = MapStatementKeyword(first);
             throw construct is not null
                 ? SqlParseException.Unsupported(construct, first.Position)
-                : SqlParseException.Syntax($"expected SELECT but found '{first.Text}'", first.Position);
+                : SqlParseException.Syntax($"expected SELECT but found '{Describe(first)}'", first.Position);
         }
 
         Advance();
@@ -174,7 +205,7 @@ internal sealed class SqlParser
             throw SqlParseException.Syntax(
                 fromToken.Kind == SqlTokenKind.EndOfInput
                     ? "expected FROM but found end of input"
-                    : $"expected FROM but found '{fromToken.Text}'",
+                    : $"expected FROM but found '{Describe(fromToken)}'",
                 fromToken.Position);
         }
 
@@ -614,7 +645,15 @@ internal sealed class SqlParser
 
         if (token.Kind == SqlTokenKind.DecimalLiteral)
         {
-            double value = double.Parse(token.Text, CultureInfo.InvariantCulture);
+            // The lexer admits any Unicode Nd digit (char.IsDigit), but double.Parse accepts only
+            // ASCII digits — so a non-ASCII or otherwise unrepresentable decimal literal must surface
+            // as a bounded, sanitized SqlParseException, never a raw FormatException/OverflowException
+            // echoing the attacker lexeme verbatim and unbounded out of the door (#687, AC2).
+            if (!double.TryParse(token.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double value))
+            {
+                throw SqlParseException.Unsupported("DECIMAL_LITERAL", token.Position);
+            }
+
             return Literal.OfDouble(negative ? -value : value);
         }
 
@@ -701,7 +740,16 @@ internal sealed class SqlParser
         // untrusted literal contents never leak back to the caller verbatim.
         SqlTokenKind.EndOfInput => "end of input",
         SqlTokenKind.StringLiteral => "string literal",
-        _ => token.Text,
+
+        // #687: the SINGLE place the parser renders a lexeme's raw source text. SQL is not always
+        // caller-authored — a Delta `delta.constraints.<name>` CHECK predicate is read from the table's
+        // `_delta_log` and parsed on the write path — so the offending token can be attacker-chosen.
+        // Sanitize it: control characters (CR/LF/NUL/…) become U+FFFD so the diagnostic cannot forge lines
+        // in a structured-log sink, and the echo is capped at EchoedTokenMaxLength so a hostile
+        // 100,000-character identifier cannot render a 100,000-character message. The cap is deliberately
+        // generous (a real SQL identifier is far shorter), so the INTERACTIVE experience is unchanged: a
+        // typo'd name still comes back verbatim and in full.
+        _ => DiagnosticText.Sanitize(token.Text, EchoedTokenMaxLength),
     };
 
     private static string? MapPredicateKeyword(SqlToken token)

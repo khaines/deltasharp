@@ -1,3 +1,4 @@
+using DeltaSharp.Diagnostics;
 using DeltaSharp.Plans.Expressions;
 using DeltaSharp.Types;
 
@@ -51,9 +52,11 @@ internal static class ExpressionCoercion
         if (coercion is not { } c)
         {
             throw AnalysisException.DataTypeMismatch(
-                CoercionHelpers.PrettyReference(arithmetic),
-                $"the '{arithmetic.NodeName}' operator requires numeric operands but got "
-                + $"'{leftType.SimpleString}' and '{rightType.SimpleString}'.");
+                CoercionHelpers.DiagnosticReference(arithmetic),
+                t => $"the '{arithmetic.NodeName}' operator requires numeric operands but got "
+                    + $"'{t[0]}' and '{t[1]}'.",
+                leftType,
+                rightType);
         }
 
         Expression left = CoercionHelpers.CastIfNeeded(arithmetic.Left, c.LeftTarget);
@@ -74,9 +77,11 @@ internal static class ExpressionCoercion
         if (common is null)
         {
             throw AnalysisException.DataTypeMismatch(
-                CoercionHelpers.PrettyReference(comparison),
-                $"the '{comparison.NodeName}' operator requires comparable operand types but got "
-                + $"'{leftType.SimpleString}' and '{rightType.SimpleString}'.");
+                CoercionHelpers.DiagnosticReference(comparison),
+                t => $"the '{comparison.NodeName}' operator requires comparable operand types but got "
+                    + $"'{t[0]}' and '{t[1]}'.",
+                leftType,
+                rightType);
         }
 
         Expression left = CoercionHelpers.CastIfNeeded(comparison.Left, common);
@@ -113,9 +118,13 @@ internal static class ExpressionCoercion
         if (common is null)
         {
             throw AnalysisException.DataTypeMismatch(
-                CoercionHelpers.PrettyReference(caseWhen),
+                CoercionHelpers.DiagnosticReference(caseWhen),
                 "the branch/else result values of a CASE expression must share a common type but got "
-                + $"[{string.Join(", ", valueTypes.Select(t => t.SimpleString))}].");
+                + $"[{AnalysisException.ComposeDetailWithListing(
+                    d => $"the branch/else result values of a CASE expression must share a common type but "
+                        + $"got [{d}].",
+                    valueTypes,
+                    CoercionHelpers.DiagnosticType)}].");
         }
 
         // Rebuild the flattened children [c0, v0, c1, v1, …, (else?)] with boolean-checked conditions
@@ -170,8 +179,10 @@ internal static class ExpressionCoercion
             NullType => new Cast(operand, BooleanType.Instance),
             null => operand,
             _ => throw AnalysisException.DataTypeMismatch(
-                CoercionHelpers.PrettyReference(operand),
-                $"a '{context}' operand must be boolean but got '{operand.Type.SimpleString}'."),
+                CoercionHelpers.DiagnosticReference(operand),
+                t => $"a '{context}' operand must be boolean but got "
+                    + $"'{(operand.Type is null ? "unknown" : t[0])}'.",
+                operand.Type is null ? [] : [operand.Type]),
         };
     }
 

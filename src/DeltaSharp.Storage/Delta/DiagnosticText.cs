@@ -1,5 +1,5 @@
-using System.Globalization;
 using System.Text;
+using SharedDiagnosticText = DeltaSharp.Diagnostics.DiagnosticText;
 
 namespace DeltaSharp.Storage.Delta;
 
@@ -18,14 +18,22 @@ namespace DeltaSharp.Storage.Delta;
 /// vector while preserving the diagnostic name.</item>
 /// </list>
 /// This is the same idiom as <c>ColumnMapping.SanitizeEchoedToken</c> (#516), lifted to a single shared
-/// helper so the postures cannot drift across surfaces.
+/// helper so the postures cannot drift across surfaces. The sanitizing PRIMITIVE itself now lives in
+/// <c>DeltaSharp.Abstractions</c> (<c>DeltaSharp.Diagnostics.DiagnosticText</c>) because the
+/// <c>DeltaSharp.Core</c> SQL parser needs the identical semantics (#687) and Core must not reference
+/// Storage; this type keeps the Storage-specific caps/postures and forwards the primitive.
 /// </summary>
 internal static class DiagnosticText
 {
     /// <summary>The default cap for an echoed identifier — generous enough for any real dotted column path
     /// (a physical name is <c>col-&lt;uuid&gt;</c> = 40 chars; a nested logical path is typically short) yet
-    /// bounded so a crafted name cannot blow up a log line.</summary>
-    internal const int DefaultMaxLength = 128;
+    /// bounded so a crafted name cannot blow up a log line.
+    /// <para><b>Aliases the shared primitive's constant rather than restating its value</b>, so there is
+    /// exactly one definition. It was previously declared here verbatim AND in
+    /// <c>DeltaSharp.Diagnostics.DiagnosticText</c>, unlinked — and because <see cref="Sanitize"/>'s optional
+    /// parameter binds THIS one, editing the shared constant silently did nothing to Storage. That is the same
+    /// silent-drift class as the elision bound above, so it is closed the same way (#687 follow-up).</para></summary>
+    internal const int DefaultMaxLength = SharedDiagnosticText.DefaultMaxLength;
 
     /// <summary>The cap for an echoed <b>table-property / configuration VALUE</b> (e.g. a
     /// <c>metaData.configuration</c> entry such as <c>delta.appendOnly</c> or a retention duration) — the
@@ -37,76 +45,30 @@ internal static class DiagnosticText
     /// <summary>The maximum number of items rendered from an attacker-influenceable LIST (a foreign table's
     /// unsupported reader/writer features, or the CHECK constraints dependent on a changed column) before the
     /// remainder is elided as <c>… (+N more)</c>. Bounds the AGGREGATE message length so a hostile list of
-    /// thousands of (individually per-item-capped) entries cannot flood a log line (#666).</summary>
+    /// thousands of (individually per-item-capped) entries cannot flood a log line (#666).
+    /// <para><b>This is the single authoritative Storage elision bound, on every path.</b> Storage elides
+    /// lists two ways — through <see cref="SanitizeAndJoin"/> (e.g. <c>DeltaProtocolException</c>'s
+    /// reader/writer feature list) and by reading this constant directly for a hand-rolled listing (e.g.
+    /// <c>DeltaConstraintDependentColumnException</c>'s dependent-CHECK listing). The forwarder therefore
+    /// passes this constant EXPLICITLY to the shared primitive rather than letting it supply a bound of its
+    /// own, so both paths are provably governed by this one declaration and cannot silently desynchronize.
+    /// The shared primitive deliberately has no default to inherit (#687 follow-up).</para></summary>
     internal const int MaxEchoedListItems = 16;
 
     /// <summary>
     /// Bounds and neutralizes an untrusted token before it is interpolated into a diagnostic message: caps
     /// the length (appending an ellipsis when truncated) and replaces every control character with U+FFFD, so
     /// a poisoned value cannot inject newlines/control sequences into a log line or render an unbounded string.
+    /// <para>Forwards to the shared <c>DeltaSharp.Abstractions</c> primitive
+    /// (<c>DeltaSharp.Diagnostics.DiagnosticText</c>) so the Storage config-value surfaces and the
+    /// <c>DeltaSharp.Core</c> SQL-parser diagnostics (#687) sanitize <b>identically</b> — Core cannot reference
+    /// Storage (wrong layering direction), so the one implementation lives in the assembly both reference.</para>
     /// </summary>
     /// <param name="raw">The token to sanitize. A <see langword="null"/> token renders as the literal
     /// <c>(null)</c> so the message stays well-formed.</param>
     /// <param name="maxLength">The maximum retained length before truncation.</param>
-    internal static string Sanitize(string? raw, int maxLength = DefaultMaxLength)
-    {
-        if (raw is null)
-        {
-            return "(null)";
-        }
-
-        // Cap the length without splitting a UTF-16 surrogate pair (a lone surrogate is malformed text).
-        int cap = raw.Length;
-        if (maxLength >= 0 && cap > maxLength)
-        {
-            cap = maxLength;
-            if (cap > 0 && char.IsHighSurrogate(raw[cap - 1]))
-            {
-                cap--;
-            }
-        }
-
-        bool truncated = cap < raw.Length;
-        var builder = new StringBuilder(cap + (truncated ? 1 : 0));
-        for (int i = 0; i < cap; i++)
-        {
-            char c = raw[i];
-            if (char.IsHighSurrogate(c))
-            {
-                // A valid high+low surrogate pair (both within the cap — the cap back-off above guarantees a
-                // high surrogate is never the last retained char) is a legal astral code point: keep it
-                // verbatim (neither half is a control/separator). A high surrogate NOT followed by a low
-                // surrogate is a LONE (malformed) surrogate — neutralize it.
-                if (i + 1 < cap && char.IsLowSurrogate(raw[i + 1]))
-                {
-                    builder.Append(c);
-                    builder.Append(raw[i + 1]);
-                    i++;
-                    continue;
-                }
-
-                builder.Append('\uFFFD');
-                continue;
-            }
-
-            if (char.IsLowSurrogate(c))
-            {
-                // Reached only when this low surrogate has no preceding high surrogate (a valid pair is consumed
-                // above) — a lone (malformed) surrogate.
-                builder.Append('\uFFFD');
-                continue;
-            }
-
-            builder.Append(IsInjectionUnsafe(c) ? '\uFFFD' : c);
-        }
-
-        if (truncated)
-        {
-            builder.Append('…');
-        }
-
-        return builder.ToString();
-    }
+    internal static string Sanitize(string? raw, int maxLength = DefaultMaxLength) =>
+        SharedDiagnosticText.Sanitize(raw, maxLength);
 
     /// <summary>
     /// Sanitizes each token in <paramref name="tokens"/> (per-item bounded via <see cref="Sanitize"/> with
@@ -115,28 +77,8 @@ internal static class DiagnosticText
     /// attacker-supplied LIST (e.g. a foreign table's thousands of forged reader/writer features) cannot flood
     /// a log line even though every element is individually bounded.
     /// </summary>
-    internal static string SanitizeAndJoin(IEnumerable<string> tokens, int maxItemLength, string separator = ", ")
-    {
-        IReadOnlyList<string> list = tokens as IReadOnlyList<string> ?? tokens.ToList();
-        int shown = Math.Min(list.Count, MaxEchoedListItems);
-        var builder = new StringBuilder();
-        for (int i = 0; i < shown; i++)
-        {
-            if (i > 0)
-            {
-                builder.Append(separator);
-            }
-
-            builder.Append(Sanitize(list[i], maxItemLength));
-        }
-
-        if (list.Count > shown)
-        {
-            builder.Append(separator).Append(CultureInfo.InvariantCulture, $"… (+{list.Count - shown} more)");
-        }
-
-        return builder.ToString();
-    }
+    internal static string SanitizeAndJoin(IEnumerable<string> tokens, int maxItemLength, string separator = ", ") =>
+        SharedDiagnosticText.SanitizeAndJoin(tokens, maxItemLength, MaxEchoedListItems, separator);
 
     /// <summary>
     /// Renders <paramref name="exception"/> as <c>{TypeName}: {Message}</c> (optionally followed by
@@ -179,11 +121,4 @@ internal static class DiagnosticText
 
         return builder.ToString();
     }
-
-    // A character is neutralized if it is a C0/C1 control (category Cc — CR/LF/NUL/tab/NEL) OR a Unicode
-    // LINE/PARAGRAPH SEPARATOR (U+2028/U+2029, categories Zl/Zp), which several renderers and log viewers treat
-    // as a newline — so the full log-injection line-break surface, not just Cc, is closed.
-    private static bool IsInjectionUnsafe(char c) =>
-        char.IsControl(c)
-        || char.GetUnicodeCategory(c) is UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator;
 }

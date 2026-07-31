@@ -232,6 +232,58 @@ human-readable phrasing — and, where a live DataFrame equivalent exists, an on
 deterministic inputs (the construct token / offending token and its 1-based position), so they are
 stable and catchable (`SqlParseException.cs`).
 
+Diagnostic hygiene is layered. `SqlParser.Describe` reports a string literal's token kind rather than
+its decoded value and caps any echoed lexeme at 128 characters. Every message-taking
+`SqlParseException` constructor then applies a single-line, 512-character whole-message backstop; the
+parameterless constructor accepts no input and carries only a runtime-supplied default message. Tests
+derive the hostile, bounded, and string-literal corpora from one source-reconciled `Describe`-site
+inventory, reject dynamic `SqlParseException.Syntax` prose that interpolates anything except a
+`Describe` result (or the fixed `Expect` glyph), require `Unsupported` constructs and public
+constructor prose to remain fixed or mapped, require every `Map*` arm to return a stable literal or
+`null`; reflective hostile-token execution additionally requires every non-null Map result to be a
+registered `ConstructInfo` key. The `Describe` string-literal arm is pinned exactly to its kind-only
+render, and each exception's throwing method is pinned. An explicit Core producer-file inventory
+extends the same prose rules through the lexer and fails closed when a new producer appears; the
+lexer's approved glyph is bound to exactly one source character and driven with a trailing secret. A
+length-swept behavioral oracle over all nine parser rejection positions independently proves that no
+decoded value — including a truncation-surviving secret prefix — reaches a message. Once two attacker
+messages exceed the backstop budget, their rendered messages are byte-identical rather than
+proportional to attacker input length.
+
+Two structural guarantees make the source-shape test guards above **defense-in-depth rather than the
+sole control**. First, `SqlParseException.Unsupported` **fails closed**: an unregistered construct
+renders fixed generic prose (`an unsupported SQL construct`) instead of echoing the raw token, and the
+stable `Construct` token is itself length-bounded and control-char sanitized on assignment — so no
+future or mis-wired producer can leak an unregistered construct verbatim through the message or the
+property. Second, the public message-taking `SqlParseException` constructors are **banned in Core via
+`BannedSymbols.txt` (RS0030)** with **no pragma exemption anywhere**: every diagnostic is built through
+one of exactly four audited factories (`Syntax`, `Unsupported`, `NestingTooDeep`,
+`ConstraintNestingTooDeep`) on the private constructor. The two depth factories take no source text
+(an internal exception and a compile-time constant), so the fixed-prose depth diagnostics carry no
+lexeme. A raw-lexeme producer written with **any** construction syntax — including the target-typed
+`new(...)` idiom — is therefore a **compile error**, and a test pins the RS0030 suppression count in the
+audited producers to zero so the escape hatch cannot be re-introduced.
+
+Because those controls key on the `SqlParseException` *type*, one further guarantee closes the
+*type* axis: the door promises (AC2) that every rejection surfaces as a `SqlParseException`, never a
+raw `FormatException`/`InvalidOperationException` echoing the lexeme. This is enforced **structurally**,
+not by a source audit: each door (`Parse`, `ParseConstraintExpression`) wraps its whole body —
+tokenizer included — in a fail-closed `catch (Exception ex) when (ex is not SqlParseException)` that
+re-throws a fixed-prose `SqlParseException.Internal()` with the raw inner **dropped**, so no other
+exception type — from a BCL conversion, an unexpected internal error, or a future producer's throw —
+can carry a lexeme out of the door. A **null argument** is the one deliberate exception to the "only a
+`SqlParseException` escapes" rule: it is a caller-contract violation, not malformed SQL, so both doors
+validate it with `ArgumentNullException.ThrowIfNull` **before** the `try` — an explicit precondition,
+symmetric across both doors, never misreported as "malformed SQL". Numeric literals additionally parse
+through `double.TryParse` (the lexer admits any Unicode `Nd` digit `double.Parse` rejects) and surface
+as `Unsupported("DECIMAL_LITERAL")`; a behavioral test pins that **property** (`Construct ==
+"DECIMAL_LITERAL"`, which the fail-closed `Internal()` leaves `null`) so the structural catch cannot
+silently mask a reverted numeric-literal fix. Behind the structural catch, a **defense-in-depth**
+allow-list test requires every argument of every non-`SqlParseException` a producer constructs to be a
+fixed-literal chain — it keys on construction *shape* in source, so it is deliberately backup to (not
+the source of) the type-axis guarantee, which the door catch alone enforces. A behavioral property test
+fuzzes the door asserting only a `SqlParseException` ever escapes.
+
 | Rejected input                         | `ErrorKind`         | `Construct` (stable token)                  | Detected at                    |
 | -------------------------------------- | ------------------- | ------------------------------------------- | ------------------------------ |
 | `… JOIN …`, `INNER/LEFT/… JOIN`        | `UnsupportedFeature`| `JOIN`                                      | `ExpectEnd` → `MapTrailingConstruct` |

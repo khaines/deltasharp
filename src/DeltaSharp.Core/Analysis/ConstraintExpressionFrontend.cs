@@ -112,9 +112,7 @@ internal static class ConstraintExpressionFrontend
 
             if (depth > MaxConstraintExpressionDepth)
             {
-                throw new SqlParseException(
-                    $"Constraint expression nests deeper than {MaxConstraintExpressionDepth} levels; a CHECK "
-                    + "constraint must be a shallow predicate over the table's columns.");
+                throw SqlParseException.ConstraintNestingTooDeep(MaxConstraintExpressionDepth);
             }
 
             foreach (Expression child in node.Children)

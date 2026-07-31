@@ -1,3 +1,7 @@
+using System;
+using System.Globalization;
+using System.Linq;
+using DeltaSharp.Diagnostics;
 using DeltaSharp.Plans.Expressions;
 using DeltaSharp.Plans.Logical;
 using DeltaSharp.Types;
@@ -112,13 +116,293 @@ internal enum AnalysisErrorKind
 /// </remarks>
 internal sealed class AnalysisException : Exception
 {
+    /// <summary>
+    /// The cap applied to the <b>whole composed message</b> of every <see cref="AnalysisException"/> — the
+    /// backstop half of the #687 diagnostic-hygiene posture, and the analyzer's analogue of
+    /// <c>SqlParseException.MaxMessageLength</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Almost every factory below interpolates text that is attacker-authored in the hostile-<c>_delta_log</c>
+    /// threat model: a rendered expression carrying a CHECK predicate's string literals, a column or function
+    /// name taken from the log's schema, a storage-side failure reason. Sanitizing the composed message at the
+    /// one private constructor closes the class for <b>all</b> of them at once — including any factory added
+    /// later — instead of relying on ~20 call sites each remembering to sanitize.
+    /// </para>
+    /// <para>
+    /// Deliberately generous: control-character neutralization is lossless and always applied, while the cap
+    /// exists only to make the render independent of attacker input length.
+    /// </para>
+    /// <para>
+    /// <b>It is a backstop, and a factory that can routinely reach it has a bug.</b> An earlier revision of
+    /// this comment claimed the cap "comfortably fits a wide-schema listing"; that was measurably false — an
+    /// ordinary wide-schema table already overran the cap and was silently cut. Truncating the whole
+    /// message destroys the very signal that truncation happened, which on the TRUSTED path (a user's own
+    /// schema) turns a self-service fix into a support ticket. Any factory composing a LIST must therefore
+    /// bound its own items and report an explicit overflow count, so this cap never elides a list.
+    /// </para>
+    /// <para>
+    /// <b>That is a claim about every public list-composing factory, so the theories are generated from the
+    /// reflected factory methods and invoke those exact methods with shape-derived arguments.</b>
+    /// <c>EveryListComposingFactory_ReportsAccurateOverflowCounts</c> and
+    /// <c>NoFreeProseToken_CanCrowdOutAListingsOverflowCount</c> discover every non-string
+    /// <c>IEnumerable&lt;T&gt;</c> parameter, fail closed on an unknown element shape, and account each
+    /// generated item by a unique rendered token. A hand-written enumeration stood here for one revision and
+    /// was already wrong: bounding each list is necessary but <em>not sufficient</em>, because a listing's
+    /// budget is <c>MaxMessageLength − prose</c>
+    /// and is therefore only as honest as the prose is bounded. <see cref="UnsupportedDataSink"/> and
+    /// <see cref="UnsupportedWriteFormat"/> interpolated two unbounded user tokens — a target path and a
+    /// requested format — and an 816-character path pushed both messages past this cap, so the backstop cut
+    /// from the tail and took the listing and its count with it. <see cref="BoundTokens"/> closes that, and
+    /// the reflective test is what keeps the claim true for a factory added tomorrow. Note which of the two
+    /// tokens the review repro used: <c>path</c>. <c>format</c> was equally unbounded and equally capable of
+    /// it, so a fix or a test naming <c>path</c> would have closed half the defect.
+    /// </para>
+    /// <para>
+    /// A single oversized TOKEN can still reach this cap in a factory that composes <b>no</b> listing, and
+    /// there that is the cap doing its job. The distinction is not "token versus list" — it is whether
+    /// anything with a count is downstream of the cut. An earlier revision of this paragraph drew the line
+    /// the first way and was falsified by exactly that case: an oversized token in a list-composing factory
+    /// produced the thing the paragraph called impossible.
+    /// </para>
+    /// <para>
+    /// <b>The factories are not the whole class.</b> A second family composes its text in the analyzer
+    /// (<c>Analyzer.ExtractStructField</c>, <c>ExpressionCoercion</c>) and hands it to
+    /// <see cref="DataTypeMismatch(string, string)"/> / <see cref="UnresolvedStructField(string, string, string?)"/> as an opaque <c>detail</c>
+    /// string, so no factory-ranging test can see it. Those sites interpolated a <see cref="DataType"/>,
+    /// and a type render is itself a <em>recursive collection</em> — <c>struct&lt;f1:int,…&gt;</c> over
+    /// user-authored field names — so an ordinary 60-field nested payload struct was cut by this cap with a
+    /// bare ellipsis and no count, identically to a 400-field one. They now render through
+    /// <see cref="CoercionHelpers.DiagnosticType"/>, and <c>AnalysisExceptionTypeRenderTests</c> ranges over
+    /// the diagnostic <em>sites</em> rather than the factories. The general rule, stated once: <b>anything
+    /// interpolated into a diagnostic that is a collection — a list, or a type that contains one — must
+    /// bound its own elements and report what it dropped.</b>
+    /// </para>
+    /// <para>
+    /// The same correction applies to the mitigation this comment used to cite: <see cref="Reference"/>,
+    /// <see cref="RootColumn"/> and <see cref="Candidates"/> do remain <b>unmodified</b> as the structured,
+    /// machine-readable channel (they are matched on by callers such as the Delta dependent-column
+    /// reclassifier, so they must never be rewritten) — but this type is <c>internal</c>, so they are NOT
+    /// reachable by an external consumer and are not a user-facing mitigation for a truncated message. They
+    /// justify keeping the raw channel raw; they do not justify a lossy message.
+    /// </para>
+    /// <para>
+    /// <b>Invariant this creates:</b> an <see cref="AnalysisException"/> message is single-line by
+    /// construction — a structural <c>\n</c> a factory might want for a multi-line listing would itself be
+    /// neutralized to U+FFFD. That is deliberate for an analyzer diagnostic (every one is a single sentence)
+    /// and is the opposite of the Storage posture, where per-token sanitization exists precisely so
+    /// <c>DeltaConstraintDependentColumnException</c>'s own <c>"\n  "</c> listing survives. A future
+    /// multi-line analyzer diagnostic must therefore sanitize its untrusted TOKENS and opt out of this
+    /// whole-message backstop, not fight it.
+    /// </para>
+    /// </remarks>
+    internal const int MaxMessageLength = 1024;
+
+
+    /// <summary>
+    /// The <b>ceiling</b> on a single listed item. A per-item budget is derived from how many items are
+    /// actually being shown (<c>DiagnosticText.SanitizeToBudget</c>); this caps that derivation so one name
+    /// cannot consume the whole listing's allowance.
+    /// </summary>
+    internal const int MaxEchoedCandidateLength = 224;
+
+    /// <summary>
+    /// The <b>floor</b> on a single listed item, so a very wide listing still shows enough of each name to
+    /// be recognizable. 48 clears the longest real-world column names observed in review
+    /// (<c>customer_lifetime_value_rolling_90d</c> is 35).
+    /// </summary>
+    internal const int MinEchoedCandidateLength = 48;
+
+    /// <summary>
+    /// Composes a message whose listing is bounded by <b>the space the message actually has left</b>, rather
+    /// than by a chosen constant.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <paramref name="compose"/> is called twice: once with an empty listing to measure the fixed prose, and
+    /// once with the listing rendered into whatever remains under <see cref="MaxMessageLength"/>. The result
+    /// therefore fits by construction, and the listing is elided <em>only</em> when it genuinely will not fit.
+    /// </para>
+    /// <para>
+    /// <b>Why not a constant.</b> Four review seats each objected to a different fixed number here — a per-item
+    /// cap of 32, an item cap of 20, an item cap of 14 — and every objection had the same shape: a number
+    /// chosen without reference to the space available. Both kinds discarded information while the budget went
+    /// unused, which is <em>worse than the unbounded original</em> at every width that used to fit. Measured
+    /// against the corpus in <c>AnalysisExceptionCandidateListingTests</c> (35-character real-world column
+    /// names), the previous revision elided a listing only four columns wide, and pinned the rendered length
+    /// flat from a modest width upward — leaving much of the budget permanently unspent while dropping names.
+    /// Deriving the budget removes the constant, and with it the argument about the constant. The property
+    /// those observations illustrate is asserted rather than restated:
+    /// <c>ListingBudget_IsSpentBeforeAnythingIsElided</c> covers the whole <b>product</b> of listing width (1–400) and item length
+    /// (1–90) — 36,000 cells. It swept width alone at a single 35-character name until round 11, when a
+    /// defect living on the interaction of the two axes went undetected by exactly that shape of corpus: a
+    /// line through a plane cannot find it.
+    /// </para>
+    /// <para>
+    /// The floor and ceiling on a single item survive, because they are not tuning: the ceiling stops one
+    /// pathological name consuming the listing, and the floor keeps every name recognizable. Both are
+    /// exercised by <c>ListingBudget_IsSpentBeforeAnythingIsElided</c>, which sweeps the boundary band
+    /// continuously rather than sampling either side of it, and by the product sweep above — a ceiling is
+    /// only observable at item lengths that exceed it, so a corpus of uniformly short names cannot see one.
+    /// </para>
+    /// </remarks>
+    /// <param name="compose">Builds the full message from a rendered listing.</param>
+    /// <param name="items">The untrusted items to list.</param>
+    /// <param name="render">Renders one item within a supplied allowance.</param>
+    /// <param name="reserved">Characters an outer wrapper will add that <paramref name="compose"/> cannot see.</param>
+    private static string ComposeWithListing<T>(
+        Func<string, string> compose, IReadOnlyList<T> items, Func<T, int, string> render, int reserved = 0) =>
+        RenderListing(items, render, RemainingBudget(compose(string.Empty).Length + reserved));
+
+    /// <summary>
+    /// Composes a <c>detail</c> string whose TYPE slots are bounded by the space the finished message will
+    /// actually have left, rather than by a constant.
+    /// </summary>
+    /// <remarks>
+    /// The listing sibling of this helper measures the prose by composing it once with an empty listing; this
+    /// does the same with empty type slots, so the free tokens a detail interpolates — a field name, a
+    /// rendered reference, an operator context — are <b>measured</b> rather than estimated. Only the wrapping
+    /// factory's own prose has to be reserved, because that is the one part not visible from here.
+    /// </remarks>
+    /// <param name="compose">Builds the detail from one rendered string per type slot.</param>
+    /// <param name="types">The types to render, in the order <paramref name="compose"/> interpolates them.</param>
+    /// <param name="wrap">Wraps a finished detail in the calling factory's own prose.</param>
+    private static string ComposeDetailWithTypes(
+        Func<string[], string> compose, DataType[] types, Func<string, string> wrap)
+    {
+        ArgumentNullException.ThrowIfNull(compose);
+        ArgumentNullException.ThrowIfNull(types);
+
+        // Two passes, and BOTH layers are measured: the detail with empty type slots, then the factory's own
+        // prose around it. Nothing here is estimated, so the types get every character the message can spare.
+        string[] empty = [.. types.Select(_ => string.Empty)];
+        return compose(CoercionHelpers.BoundTypes(MaxMessageLength - wrap(compose(empty)).Length, types));
+    }
+
+    /// <summary>
+    /// Variant for a caller that composes a <c>detail</c> string rather than a whole message
+    /// (<see cref="ExpressionCoercion"/>). The wrapping factory's own prose is not visible from here, so its
+    /// worst case — a <see cref="DataTypeMismatch(string, string)"/> reference at its full budget plus fixed
+    /// prose — is reserved up front.
+    /// </summary>
+    /// <remarks>
+    /// Note the contrast with <see cref="ComposeDetailWithTypes"/>, which sits directly above and does NOT
+    /// reserve: it can compose its wrapper and measure it. This one cannot, because the listing is rendered
+    /// before the caller's <c>detail</c> is handed on, so a reservation is the honest option. This paragraph
+    /// exists because both summaries were once attached to the same method, leaving that one documented as
+    /// reserving up front when its own remarks and body say it measures — the two really do differ, and
+    /// which is which is the load-bearing detail.
+    /// </remarks>
+    /// <param name="compose">Builds the detail from a rendered listing.</param>
+    /// <param name="items">The untrusted items to list.</param>
+    /// <param name="render">Renders one item within a supplied allowance.</param>
+    internal static string ComposeDetailWithListing<T>(
+        Func<string, string> compose, IReadOnlyList<T> items, Func<T, int, string> render) =>
+        ComposeWithListing(
+            compose, items, render, reserved: CoercionHelpers.DiagnosticReferenceMaxLength + 64);
+
+    /// <summary>The characters left for listings once <paramref name="proseLength"/> is spent, shared evenly
+    /// when a message composes more than one listing.</summary>
+    /// <remarks>
+    /// The floor is <b>zero</b>, deliberately. An earlier revision floored this at
+    /// <see cref="MinEchoedCandidateLength"/>, on the reasoning that a listing should always get enough room
+    /// to show something. That is a claim about the world, and the world falsified it: prose containing an
+    /// unbounded token could consume the entire message, the listing was granted 48 characters anyway, and
+    /// the composed result ran past <see cref="MaxMessageLength"/> — so the whole-message backstop cut the
+    /// listing <em>and its overflow count</em> off the tail. A floor asserts "there is always room for a
+    /// little"; returning the truth lets <c>SanitizeToBudget</c> collapse the listing to its count, which is
+    /// the one thing worth keeping when there is no room. <see cref="BoundTokens"/> is what makes that
+    /// remainder large enough to be useful.
+    /// </remarks>
+    private static int RemainingBudget(int proseLength, int lists = 1) =>
+        Math.Max(0, (MaxMessageLength - proseLength) / lists);
+
+    /// <summary>
+    /// The space free prose TOKENS may occupy: everything the fixed literal text does not need, less the room
+    /// each listing needs to state its own overflow count.
+    /// </summary>
+    /// <param name="literalProseLength">Length of the message with every token and listing empty.</param>
+    /// <param name="itemCounts">The cardinality of each listing the message composes.</param>
+    /// <remarks>
+    /// Sizing the reserve at the TOTAL cardinality rather than the hidden one is the shape of the round-14
+    /// defect fixed in <see cref="DiagnosticText.SanitizeToBudget"/> and in the struct walk — but here it is
+    /// the only thing available and not an error. How many items a listing hides depends on the budget left
+    /// after the tokens, which is what this method is computing; the dependency is circular, so the reserve
+    /// must assume the worst. It is pessimistic by at most the difference in digit count between the total
+    /// and the hidden count — a few characters — and it is pessimistic in the safe direction.
+    /// </remarks>
+    private static int TokenBudget(int literalProseLength, params int[] itemCounts) =>
+        MaxMessageLength - literalProseLength - itemCounts.Sum(DiagnosticText.OverflowMarkerLength);
+
+    /// <summary>
+    /// Bounds the free prose tokens of a message — a path, a format name — so that no single one of them can
+    /// crowd out the listing that follows it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Why this exists.</b> The listing budget is derived from the composed prose, so it is only as honest
+    /// as the prose is bounded. <see cref="UnsupportedDataSink"/> and <see cref="UnsupportedWriteFormat"/>
+    /// interpolate two user-supplied tokens — the redacted target path and the requested format — neither of
+    /// which had any bound at all. An 816-character path drove both messages to the backstop, taking the
+    /// listing and its <c>(+N more)</c> count with it, which is exactly the failure the listing budget was
+    /// introduced to prevent, arriving through the prose instead of the list.
+    /// </para>
+    /// <para>
+    /// <b>Allocation is max-min fair, shortest first, so the common case is bounded by nothing at all.</b> A
+    /// token shorter than its even share consumes only what it needs and hands the remainder to the others;
+    /// only when the tokens genuinely cannot all fit does any of them get cut. An ordinary
+    /// <c>'delta'</c>-plus-a-real-path message is therefore byte-identical to what it was before this bound
+    /// existed — the property <c>FreeProseTokens_AreBoundedOnlyWhenTheyDoNotFit</c> asserts, because
+    /// "the common case must not pay for the pathological one" has been claimed here before by a comment
+    /// whose corpus could not exercise it.
+    /// </para>
+    /// </remarks>
+    /// <param name="available">The token budget from <see cref="TokenBudget"/>.</param>
+    /// <param name="tokens">The free prose tokens, in the order the message interpolates them.</param>
+    private static string[] BoundTokens(int available, params string[] tokens)
+    {
+        var bounded = new string[tokens.Length];
+        int remaining = Math.Max(0, available);
+        int[] shortestFirst = [.. Enumerable.Range(0, tokens.Length).OrderBy(i => tokens[i].Length)];
+
+        for (int n = 0; n < shortestFirst.Length; n++)
+        {
+            int i = shortestFirst[n];
+            int share = remaining / (shortestFirst.Length - n);
+
+            // Sanitize returns maxLength + 1 characters when it truncates, because it appends the elision
+            // mark. Asking for one less when a cut is certain makes the allocation exact rather than
+            // one-over — and one-over is the whole defect, since the backstop then eats the overflow count.
+            bounded[i] = DiagnosticText.Sanitize(
+                tokens[i], tokens[i].Length <= share ? share : Math.Max(0, share - 1));
+            remaining = Math.Max(0, remaining - bounded[i].Length);
+        }
+
+        return bounded;
+    }
+
+    private static string RenderListing<T>(
+        IReadOnlyList<T> items, Func<T, int, string> render, int budget, string separator = ", ") =>
+        DiagnosticText.SanitizeToBudget(
+            items, render, budget, MinEchoedCandidateLength, MaxEchoedCandidateLength, separator);
+
+    /// <summary>The cap applied to the unresolved/ambiguous name echoed in the MESSAGE. The structured
+    /// <see cref="Reference"/> property keeps the full value; this bounds only the prose, so that a long name
+    /// cannot push a listing past <see cref="MaxMessageLength"/> and destroy the overflow count with it.
+    /// </summary>
+    internal const int MaxEchoedReferenceLength = 64;
+
+    /// <summary>The floor on the NAME half of a composite <c>name#exprId</c> candidate, so that clamping can
+    /// never invert and leave the identifier as the only surviving part.</summary>
+    private const int MinEchoedNameLength = 8;
+
     private AnalysisException(
         string message,
         AnalysisErrorKind kind,
         string? reference,
         IReadOnlyList<string> candidates,
         string? rootColumn = null)
-        : base(message)
+        : base(DiagnosticText.Sanitize(message, MaxMessageLength))
     {
         Kind = kind;
         Reference = reference;
@@ -150,8 +434,10 @@ internal sealed class AnalysisException : Exception
     {
         ArgumentNullException.ThrowIfNull(identifier);
         string name = string.Join('.', identifier);
+        string Compose(string listing) => $"Table or view not found: {listing}";
         return new AnalysisException(
-            $"Table or view not found: {name}",
+            Compose(RenderListing(
+                identifier, DiagnosticText.SanitizeTo, RemainingBudget(Compose(string.Empty).Length), ".")),
             AnalysisErrorKind.TableOrViewNotFound,
             name,
             Array.Empty<string>());
@@ -198,11 +484,18 @@ internal sealed class AnalysisException : Exception
         // Redact credential-bearing fragments so neither the diagnostic nor any log capturing it leaks a
         // secret embedded in the sink path (parity with the read-door's UnsupportedDataSource, #424/#432).
         string safePath = path is null ? "<none>" : SecretRedaction.RedactPath(path);
-        string alternatives = string.Join(", ", localFormats);
+        string Render(string fmt, string target, string listing) =>
+            $"Writing a '{fmt}' data source is not supported in this milestone: the writer for target "
+            + $"'{target}' is delivered by EPIC-05 (Delta transaction-log storage). Until then, write to a "
+            + $"supported M1 local sink (format: [{listing}]).";
+
+        string[] tokens = BoundTokens(
+            TokenBudget(Render(string.Empty, string.Empty, string.Empty).Length, localFormats.Count),
+            format,
+            safePath);
+        string Compose(string listing) => Render(tokens[0], tokens[1], listing);
         return new AnalysisException(
-            $"Writing a '{format}' data source is not supported in this milestone: the writer for target "
-            + $"'{safePath}' is delivered by EPIC-05 (Delta transaction-log storage). Until then, write to a "
-            + $"supported M1 local sink (format: [{alternatives}]).",
+            Compose(ComposeWithListing(Compose, localFormats, DiagnosticText.SanitizeTo)),
             AnalysisErrorKind.UnsupportedDataSink,
             safePath,
             Array.Empty<string>());
@@ -227,10 +520,26 @@ internal sealed class AnalysisException : Exception
         ArgumentNullException.ThrowIfNull(deferredFormats);
 
         string safePath = path is null ? "<none>" : SecretRedaction.RedactPath(path);
+        string Render(string fmt, string target, string local, string deferred) =>
+            $"Unsupported write format '{fmt}' for target '{target}'. DeltaSharp M1 writes these "
+            + $"local sink formats: [{local}]; these formats are recognized but deferred to EPIC-05 "
+            + $"(Delta/Parquet storage): [{deferred}].";
+
+        string[] tokens = BoundTokens(
+            TokenBudget(
+                Render(string.Empty, string.Empty, string.Empty, string.Empty).Length,
+                localFormats.Count,
+                deferredFormats.Count),
+            format,
+            safePath);
+        string Compose(string local, string deferred) => Render(tokens[0], tokens[1], local, deferred);
+
+        // Two listings in one message, so they share what is left rather than each taking it.
+        int shared = RemainingBudget(Compose(string.Empty, string.Empty).Length, lists: 2);
         return new AnalysisException(
-            $"Unsupported write format '{format}' for target '{safePath}'. DeltaSharp M1 writes these "
-            + $"local sink formats: [{string.Join(", ", localFormats)}]; these formats are recognized but "
-            + $"deferred to EPIC-05 (Delta/Parquet storage): [{string.Join(", ", deferredFormats)}].",
+            Compose(
+                RenderListing(localFormats, DiagnosticText.SanitizeTo, shared),
+                RenderListing(deferredFormats, DiagnosticText.SanitizeTo, shared)),
             AnalysisErrorKind.UnsupportedDataSink,
             safePath,
             Array.Empty<string>());
@@ -241,8 +550,14 @@ internal sealed class AnalysisException : Exception
     {
         ArgumentNullException.ThrowIfNull(input);
         string[] candidates = input.Select(a => a.Name).ToArray();
+
+        // Bound the LISTING, not the composed message: a wide schema must still be told how many candidates
+        // it is not being shown. `candidates` (the structured channel) keeps every name, unmodified.
+        string safeName = DiagnosticText.Sanitize(name, MaxEchoedReferenceLength);
+        string Compose(string listing) =>
+            $"Cannot resolve column name '{safeName}' given input columns: [{listing}]";
         return new AnalysisException(
-            $"Cannot resolve column name '{name}' given input columns: [{string.Join(", ", candidates)}]",
+            Compose(ComposeWithListing(Compose, candidates, DiagnosticText.SanitizeTo)),
             AnalysisErrorKind.UnresolvedColumn,
             name,
             candidates,
@@ -256,8 +571,14 @@ internal sealed class AnalysisException : Exception
     {
         ArgumentNullException.ThrowIfNull(matches);
         string[] candidates = matches.Select(a => a.SimpleString).ToArray();
+
+        // RenderCandidate, not Sanitize: the per-item allowance must eat NAME characters, never the
+        // #exprId that is the only thing distinguishing two same-named candidates.
+        string safeName = DiagnosticText.Sanitize(name, MaxEchoedReferenceLength);
+        string Compose(string listing) =>
+            $"Reference '{safeName}' is ambiguous, could be: {listing}.";
         return new AnalysisException(
-            $"Reference '{name}' is ambiguous, could be: {string.Join(", ", candidates)}.",
+            Compose(ComposeWithListing(Compose, matches, RenderCandidate)),
             AnalysisErrorKind.AmbiguousReference,
             name,
             candidates);
@@ -271,7 +592,8 @@ internal sealed class AnalysisException : Exception
         ArgumentNullException.ThrowIfNull(reference);
         ArgumentNullException.ThrowIfNull(nodeName);
         return new AnalysisException(
-            $"Plan is not fully resolved: unresolved reference '{reference}' remains in operator "
+            $"Plan is not fully resolved: unresolved reference "
+            + $"'{DiagnosticText.Sanitize(reference, CoercionHelpers.DiagnosticReferenceMaxLength)}' remains in operator "
             + $"'{nodeName}' after analysis.",
             AnalysisErrorKind.UnresolvedPlan,
             reference,
@@ -347,9 +669,12 @@ internal sealed class AnalysisException : Exception
     {
         ArgumentNullException.ThrowIfNull(name);
         ArgumentNullException.ThrowIfNull(argumentTypes);
+        string safeName = DiagnosticText.Sanitize(name, MaxEchoedReferenceLength);
+        string Compose(string listing) =>
+            $"Undefined function: '{safeName}'. The function is neither a registered scalar nor an "
+            + $"aggregate function in the M1 registry (supplied argument types: [{listing}]).";
         return new AnalysisException(
-            $"Undefined function: '{name}'. The function is neither a registered scalar nor an "
-            + $"aggregate function in the M1 registry (supplied argument types: [{RenderTypes(argumentTypes)}]).",
+            Compose(ComposeWithListing(Compose, argumentTypes, CoercionHelpers.DiagnosticType)),
             AnalysisErrorKind.UnresolvedFunction,
             name,
             Array.Empty<string>());
@@ -363,8 +688,22 @@ internal sealed class AnalysisException : Exception
         ArgumentNullException.ThrowIfNull(name);
         ArgumentNullException.ThrowIfNull(argumentTypes);
         ArgumentNullException.ThrowIfNull(expected);
+        // Both free prose tokens go through the allocator, not just the name. `expected` was echoed raw: it
+        // is supplied by a function's own argument contract today, but it is a plain string parameter on a
+        // public factory, and the round-9 guard oversized each parameter ONE AT A TIME, so a caller passing
+        // two long tokens at once slipped through: one oversized parameter fitted, and two together ran
+        // straight into the whole-message backstop, which is the one cut that takes a listing's
+        // (+N more) count with it.
+        string Render(string fn, string want, string listing) =>
+            $"Cannot resolve function '{fn}({listing})': {want}";
+
+        string[] tokens = BoundTokens(
+            TokenBudget(Render(string.Empty, string.Empty, string.Empty).Length, argumentTypes.Count),
+            name,
+            expected);
+        string Compose(string listing) => Render(tokens[0], tokens[1], listing);
         return new AnalysisException(
-            $"Cannot resolve function '{name}({RenderTypes(argumentTypes)})': {expected}",
+            Compose(ComposeWithListing(Compose, argumentTypes, CoercionHelpers.DiagnosticType)),
             AnalysisErrorKind.InvalidFunctionArgument,
             name,
             Array.Empty<string>());
@@ -377,11 +716,31 @@ internal sealed class AnalysisException : Exception
         ArgumentNullException.ThrowIfNull(reference);
         ArgumentNullException.ThrowIfNull(detail);
         return new AnalysisException(
-            $"cannot resolve '{reference}' due to data type mismatch: {detail}",
+            DataTypeMismatchMessage(reference, detail),
             AnalysisErrorKind.DataTypeMismatch,
             reference,
             Array.Empty<string>());
     }
+
+    private static string DataTypeMismatchMessage(string reference, string detail) =>
+        $"cannot resolve '{DiagnosticText.Sanitize(reference, CoercionHelpers.DiagnosticReferenceMaxLength)}' "
+        + $"due to data type mismatch: {detail}";
+
+    /// <summary>
+    /// <see cref="DataTypeMismatch(string, string)"/> for a detail containing TYPE slots, sized against this
+    /// factory's own composed prose rather than against a reserve.
+    /// </summary>
+    /// <remarks>
+    /// The detail cannot see the wrapping prose, so an earlier revision had the detail-side helper reserve a
+    /// worst case for it — the full 256-character reference cap plus slack. That is an estimate, and it was
+    /// wrong in the ordinary direction: for a short reference like <c>payload.typo</c> it over-reserved by
+    /// most of what it had asked for, and <c>TypeBudget_IsSpentBeforeAnyFieldIsElided</c> caught the render
+    /// eliding with the budget still substantially unspent. Composing here instead <b>measures</b> the prose, which is the same correction this
+    /// PR already applied to listings; a reserve is a constant wearing a different hat.
+    /// </remarks>
+    internal static AnalysisException DataTypeMismatch(
+        string reference, Func<string[], string> detail, params DataType[] types) =>
+        DataTypeMismatch(reference, ComposeDetailWithTypes(detail, types, d => DataTypeMismatchMessage(reference, d)));
 
     /// <summary>Builds an <see cref="AnalysisErrorKind.UnresolvedStructField"/> failure: a nested field
     /// reference (<paramref name="reference"/>, e.g. <c>s.f</c>) could not be resolved because its base is
@@ -394,12 +753,30 @@ internal sealed class AnalysisException : Exception
         ArgumentNullException.ThrowIfNull(reference);
         ArgumentNullException.ThrowIfNull(detail);
         return new AnalysisException(
-            $"cannot resolve '{reference}': {detail}",
+            UnresolvedStructFieldMessage(reference, detail),
             AnalysisErrorKind.UnresolvedStructField,
             reference,
             Array.Empty<string>(),
             rootColumn);
     }
+
+    private static string UnresolvedStructFieldMessage(string reference, string detail) =>
+        $"cannot resolve '{DiagnosticText.Sanitize(reference, CoercionHelpers.DiagnosticReferenceMaxLength)}': {detail}";
+
+    /// <summary>
+    /// <see cref="UnresolvedStructField(string, string, string?)"/> for a detail containing TYPE slots, sized
+    /// against this factory's own composed prose. See <see cref="DataTypeMismatch(string, Func{string[], string}, DataType[])"/>
+    /// for why this is measured here rather than reserved by the caller.
+    /// </summary>
+    internal static AnalysisException UnresolvedStructField(
+        string reference,
+        Func<string[], string> detail,
+        DataType[] types,
+        string? rootColumn = null) =>
+        UnresolvedStructField(
+            reference,
+            ComposeDetailWithTypes(detail, types, d => UnresolvedStructFieldMessage(reference, d)),
+            rootColumn);
 
     /// <summary>Builds an <see cref="AnalysisErrorKind.MisplacedAggregate"/> failure for an aggregate
     /// function used outside a valid aggregate context.</summary>
@@ -447,8 +824,26 @@ internal sealed class AnalysisException : Exception
             Array.Empty<string>());
     }
 
-    private static string RenderTypes(IReadOnlyList<DataType> types) =>
-        string.Join(", ", types.Select(t => t.SimpleString));
+    /// <summary>
+    /// Renders one <c>name#exprId</c> candidate for an ambiguity diagnostic, bounding the NAME and keeping
+    /// the identifier.
+    /// </summary>
+    /// <remarks>
+    /// <b>Why not just <c>Sanitize(SimpleString, cap)</c>.</b> Sanitize truncates from the TAIL, and the tail
+    /// of a composite candidate is precisely <c>#exprId</c> — the only thing distinguishing two same-named
+    /// candidates. Applying the cap to the composite therefore deleted the discriminator and rendered two
+    /// byte-identical entries in the one message whose entire purpose is to tell them apart. A bound on a
+    /// COMPOSITE token has to be applied to the component that is not load-bearing for the reader.
+    /// </remarks>
+    private static string RenderCandidate(AttributeReference attribute, int budget)
+    {
+        string id = string.Create(CultureInfo.InvariantCulture, $"#{attribute.ExprId}");
+
+        // -1 leaves room for Sanitize's own elision glyph, so the composite still fits the per-item cap and
+        // SanitizeAndJoin never gets the chance to re-truncate (and re-delete the id).
+        int nameBudget = Math.Max(MinEchoedNameLength, budget - id.Length - 1);
+        return DiagnosticText.Sanitize(attribute.Name, nameBudget) + id;
+    }
 
     /// <summary>Builds an <see cref="AnalysisErrorKind.InvalidTimeTravelSpec"/> failure for a read that
     /// pins both a version and a timestamp (#499): the <c>versionAsOf</c> and <c>timestampAsOf</c> options

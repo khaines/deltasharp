@@ -451,7 +451,7 @@ internal sealed class Analyzer
         if (expression.Resolved && expression.Type is null)
         {
             throw AnalysisException.UntypedResolvedExpression(
-                CoercionHelpers.PrettyReference(expression), ownerNodeName);
+                CoercionHelpers.DiagnosticReference(expression), ownerNodeName);
         }
     }
 
@@ -476,10 +476,11 @@ internal sealed class Analyzer
     {
         if (condition.Type is not BooleanType)
         {
-            string actual = condition.Type?.SimpleString ?? "unknown";
             throw AnalysisException.DataTypeMismatch(
-                CoercionHelpers.PrettyReference(condition),
-                $"the condition of a '{ownerNodeName}' must be boolean but is '{actual}'.");
+                CoercionHelpers.DiagnosticReference(condition),
+                t => $"the condition of a '{ownerNodeName}' must be boolean but is "
+                    + $"'{(condition.Type is null ? "unknown" : t[0])}'.",
+                condition.Type is null ? [] : [condition.Type]);
         }
     }
 
@@ -720,8 +721,11 @@ internal sealed class Analyzer
         {
             throw AnalysisException.UnresolvedStructField(
                 origin.Name,
-                $"cannot extract field '{fieldName}' from '{child.SimpleString}' of type "
-                + $"'{child.Type?.SimpleString ?? "unknown"}' — a nested field reference requires a struct",
+                t => $"cannot extract field '{DiagnosticText.Sanitize(fieldName)}' from "
+                    + $"'{CoercionHelpers.DiagnosticReference(child)}' of type "
+                    + $"'{(child.Type is null ? "unknown" : t[0])}' — a nested field reference requires "
+                    + $"a struct",
+                child.Type is null ? [] : [child.Type],
                 rootColumn: baseColumnName);
         }
 
@@ -738,7 +742,9 @@ internal sealed class Analyzer
             {
                 throw AnalysisException.DataTypeMismatch(
                     origin.Name,
-                    $"field '{fieldName}' is ambiguous in struct type '{structType.SimpleString}'");
+                    t => $"field '{DiagnosticText.Sanitize(fieldName)}' is ambiguous in struct type "
+                        + $"'{t[0]}'",
+                    structType);
             }
 
             ordinal = i;
@@ -749,7 +755,8 @@ internal sealed class Analyzer
         {
             throw AnalysisException.UnresolvedStructField(
                 origin.Name,
-                $"no such struct field '{fieldName}' in '{structType.SimpleString}'",
+                t => $"no such struct field '{DiagnosticText.Sanitize(fieldName)}' in '{t[0]}'",
+                [structType],
                 rootColumn: baseColumnName);
         }
 
@@ -842,7 +849,7 @@ internal sealed class Analyzer
                 // untyped-resolved guard reports symmetrically with CheckAnalysis.
                 DataType type = alias.Type
                     ?? throw AnalysisException.UntypedResolvedExpression(
-                        CoercionHelpers.PrettyReference(alias.Child), "Project");
+                        CoercionHelpers.DiagnosticReference(alias.Child), "Project");
                 return new AttributeReference(alias.Name, type, alias.NullableUnder(_ansiMode), idGenerator.Next());
 
             case ResolvedFunction function:
@@ -854,7 +861,7 @@ internal sealed class Analyzer
                 // coercion gap reported symmetrically with the Alias case.
                 DataType functionType = function.Type
                     ?? throw AnalysisException.UntypedResolvedExpression(
-                        CoercionHelpers.PrettyReference(function), "Aggregate");
+                        CoercionHelpers.DiagnosticReference(function), "Aggregate");
                 return new AttributeReference(
                     SparkAutoName(function), functionType, function.NullableUnder(_ansiMode), idGenerator.Next());
 
@@ -865,7 +872,7 @@ internal sealed class Analyzer
                 // symmetrically with the Alias/function cases.
                 DataType fieldType = field.Type
                     ?? throw AnalysisException.UntypedResolvedExpression(
-                        CoercionHelpers.PrettyReference(field), "Project");
+                        CoercionHelpers.DiagnosticReference(field), "Project");
                 return new AttributeReference(field.FieldName, fieldType, field.NullableUnder(_ansiMode), idGenerator.Next());
 
             case UnresolvedFunction function:
@@ -882,7 +889,7 @@ internal sealed class Analyzer
 
             default:
                 throw AnalysisException.UnsupportedProjection(
-                    $"Projection element '{CoercionHelpers.PrettyReference(element)}' is not a named output element "
+                    $"Projection element '{CoercionHelpers.DiagnosticReference(element)}' is not a named output element "
                     + "(expected an attribute or an alias).");
         }
     }
@@ -892,9 +899,11 @@ internal sealed class Analyzer
     /// suffix), e.g. <c>sum(salary)</c>, <c>count(1)</c>, <c>avg(x)</c>, <c>count(DISTINCT v)</c>.
     /// It delegates to the shared <see cref="CoercionHelpers.PrettyReference"/> renderer, which
     /// unwraps implicit coercion <see cref="Cast"/>s and uppercases <c>DISTINCT</c>, mirroring Spark's
-    /// <c>usePrettyExpression</c>. The same renderer names the offending reference in a
-    /// <see cref="AnalysisException.DataTypeMismatch"/> diagnostic, so auto-names and diagnostics never
-    /// diverge and neither leaks an ExprId.</summary>
+    /// <c>usePrettyExpression</c>. Diagnostics render the offending reference with the <em>same</em>
+    /// renderer, so auto-names and diagnostics never diverge and neither leaks an ExprId — but they go
+    /// through <see cref="CoercionHelpers.DiagnosticReference"/>, which additionally bounds and neutralizes
+    /// the render (#687). This call must stay on the <b>raw</b> renderer: its result is a real output-schema
+    /// column <b>name</b>, and bounding or rewriting it would change query results, not just prose.</summary>
     private static string SparkAutoName(ResolvedFunction function) =>
         CoercionHelpers.PrettyReference(function);
 
