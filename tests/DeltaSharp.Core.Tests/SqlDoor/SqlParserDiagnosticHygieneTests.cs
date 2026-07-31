@@ -228,6 +228,28 @@ public sealed class SqlParserDiagnosticHygieneTests
 
     [Theory]
     [MemberData(nameof(StringLiteralEchoSites))]
+    public void StringLiteralEchoSites_NeverDiscloseDecodedValues_AtAnyRelevantLength(
+        string site, string sql, bool viaStatementDoor, string expectedProse, string expectedFrame)
+    {
+        Assert.NotEmpty(site);
+        Assert.NotEmpty(expectedProse);
+        Assert.NotEmpty(expectedFrame);
+
+        foreach (int length in new[] { 8, 60, 140, 400 })
+        {
+            string payload = $"SECRET_{length}_" + new string('q', length);
+            string probe = sql.Replace("SEC\r\nRET_PAYLOAD", payload, StringComparison.Ordinal);
+            Assert.NotEqual(sql, probe);
+
+            SqlParseException ex = ParseSyntaxError(probe, viaStatementDoor);
+            Assert.DoesNotContain(payload, ex.Message, StringComparison.Ordinal);
+            Assert.Contains("string literal", ex.Message, StringComparison.Ordinal);
+            AssertHygienic(ex.Message);
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(StringLiteralEchoSites))]
     public void SyntaxError_StringLiteralEchoSites_ReportKind_NotDecodedValue(
         string site, string sql, bool viaStatementDoor, string expectedProse, string expectedFrame)
     {
@@ -305,6 +327,14 @@ public sealed class SqlParserDiagnosticHygieneTests
             Assert.All(
                 interpolationHoles,
                 hole => Assert.Equal("glyph", hole.Groups["expression"].Value.Trim()));
+            MatchCollection concatenations = Regex.Matches(
+                withoutDescribe,
+                @"\+\s*(?<operand>\S)");
+            Assert.All(
+                concatenations,
+                concatenation => Assert.Equal(
+                    "\"",
+                    concatenation.Groups["operand"].Value));
 
             if (arguments.Contains("Describe(", StringComparison.Ordinal))
             {
@@ -316,6 +346,77 @@ public sealed class SqlParserDiagnosticHygieneTests
                     @"^""(?:[^""\\]|\\.)*""(?:\s*\+\s*""(?:[^""\\]|\\.)*"")*\s*,",
                     RegexOptions.Singleline),
                 arguments.TrimStart());
+        }
+    }
+
+    [Fact]
+    public void EveryUnsupportedConstruct_IsFixedOrMapped()
+    {
+        string code = SqlParserCode();
+        MatchCollection calls = Regex.Matches(
+            code,
+            @"SqlParseException\.Unsupported\(\s*(?<construct>[^,\r\n]+),");
+        Assert.NotEmpty(calls);
+
+        string[] mapped = ["construct", "unsupported", "negatedPredicate", "predicate"];
+        foreach (Match call in calls)
+        {
+            string construct = call.Groups["construct"].Value.Trim();
+            bool fixedLiteral = Regex.IsMatch(construct, @"^""(?:[^""\\]|\\.)*""$");
+            Assert.True(
+                fixedLiteral || mapped.Contains(construct, StringComparer.Ordinal),
+                $"Unsupported construct is neither fixed nor mapped: {construct}");
+        }
+
+        Assert.All(
+            mapped,
+            construct => Assert.Contains($"{construct} = Map", code, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void EveryExpectGlyph_IsFixedLiteral()
+    {
+        string code = SqlParserCode();
+        int declarations = Regex.Matches(code, @"private void Expect\(").Count;
+        int references = Regex.Matches(code, @"\bExpect\(").Count - declarations;
+        int fixedLiteralCalls = Regex.Matches(
+            code,
+            @"\bExpect\(\s*SqlTokenKind\.[^,\r\n]+,\s*""(?:[^""\\]|\\.)*""\s*\)").Count;
+
+        Assert.Equal(1, declarations);
+        Assert.Equal(references, fixedLiteralCalls);
+    }
+
+    [Fact]
+    public void EveryPublicConstructorMessage_IsFixedProse()
+    {
+        string code = SqlParserCode() + "\n" + ConstraintExpressionFrontendCode();
+        MatchCollection calls = Regex.Matches(
+            code,
+            @"new SqlParseException\((?<arguments>.*?)\)(?=\s*;)",
+            RegexOptions.Singleline);
+        Assert.NotEmpty(calls);
+
+        var fixedLiteralChain = new Regex(
+            @"^""(?:[^""\\]|\\.)*""(?:\s*\+\s*""(?:[^""\\]|\\.)*"")*\s*(?:,|$)",
+            RegexOptions.Singleline);
+        foreach (Match call in calls)
+        {
+            string arguments = call.Groups["arguments"].Value;
+            MatchCollection holes = Regex.Matches(arguments, @"\{(?<expression>[^{}]+)\}");
+            Assert.All(
+                holes,
+                hole => Assert.Equal(
+                    "MaxConstraintExpressionDepth",
+                    hole.Groups["expression"].Value.Trim()));
+
+            string normalized = arguments
+                .Replace(
+                    "{MaxConstraintExpressionDepth}",
+                    "MAX_DEPTH",
+                    StringComparison.Ordinal)
+                .Replace("$\"", "\"", StringComparison.Ordinal);
+            Assert.Matches(fixedLiteralChain, normalized.TrimStart());
         }
     }
 
@@ -375,6 +476,21 @@ public sealed class SqlParserDiagnosticHygieneTests
     {
         string path = SqlParserSourcePath();
         Assert.True(File.Exists(path), $"SqlParser source does not exist at '{path}'");
+        string source = File.ReadAllText(path);
+        return string.Join(
+            '\n',
+            source.Split('\n').Where(line => !line.TrimStart().StartsWith("//", StringComparison.Ordinal)));
+    }
+
+    private static string ConstraintExpressionFrontendCode()
+    {
+        string path = Path.GetFullPath(
+            Path.Combine(
+                Path.GetDirectoryName(SqlParserSourcePath())!,
+                "..",
+                "Analysis",
+                "ConstraintExpressionFrontend.cs"));
+        Assert.True(File.Exists(path), $"constraint frontend source does not exist at '{path}'");
         string source = File.ReadAllText(path);
         return string.Join(
             '\n',
