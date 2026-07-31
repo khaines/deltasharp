@@ -917,10 +917,14 @@ public sealed class SqlParserDiagnosticHygieneTests
         // syntax proxy with a deny-list over interpolation syntax; both were bypassed (+ concatenation,
         // helper indirection, a hoisted local, a BCL type with a public message ctor). Flip to an
         // allow-list over the PROPERTY: EVERY `new <…>Exception(` in an audited producer — regardless
-        // of construction shape or exception type — must pass a fixed-literal-chain first argument, so
-        // no lexeme can be composed into any exception the producer builds. SqlParseException's own
-        // message ctors are separately RS0030-banned, so its exact type name is skipped (it is built
-        // only through the private ctor from the audited factories).
+        // of construction shape or exception type — must pass a fixed-literal-chain in EVERY top-level
+        // argument (not just the first: the Argument* family renders a later arg into Message), so no
+        // lexeme can be composed into any exception the producer builds. SqlParseException's own message
+        // ctors are separately RS0030-banned, so its exact type name is skipped (it is built only through
+        // the private ctor from the audited factories). This is defense-in-depth BEHIND the structural
+        // door catch, which alone guarantees the type axis; it keys on source shape, so a target-typed
+        // `new(...)` or a producer-local `class X : Exception` is (documented as) out of its reach and
+        // covered structurally by the catch, not here.
         string srcRoot = Path.GetFullPath(
             Path.Combine(Path.GetDirectoryName(SqlParserSourcePath())!, "..", ".."));
         foreach (string producer in AuditedProducers)
@@ -941,11 +945,22 @@ public sealed class SqlParserDiagnosticHygieneTests
                 int openParen = construction.Index + construction.Length - 1;
                 int closeParen = FindMatchingParenthesis(source, openParen);
                 string arguments = source[(openParen + 1)..closeParen];
-                int comma = TopLevelOperator(arguments, ',');
-                string firstArgument = comma < 0 ? arguments : arguments[..comma];
-                Assert.True(
-                    IsLiteralChain(firstArgument),
-                    $"{producer}: new {type}(...) composes a non-literal message: {firstArgument.Trim()}");
+
+                // Require EVERY top-level argument to be a fixed literal chain, not just the first. The
+                // first-argument check was itself a POSITION proxy: the BCL Argument* family renders a
+                // LATER argument into Message — ArgumentException(message, paramName),
+                // ArgumentOutOfRangeException(paramName, actualValue, message) — so a literal arg #1 with
+                // an attacker-bearing arg #2/#3 would leak yet pass. A foreign exception that must wrap an
+                // inner or carry detail routes through a SqlParseException factory (whose ctor sanitizes),
+                // never a raw foreign construction here, so "no non-literal argument in any position" is
+                // the honest property. (Backed structurally by the fail-closed door catch regardless.)
+                foreach (string argument in SplitTopLevelArguments(arguments))
+                {
+                    Assert.True(
+                        IsLiteralChain(argument),
+                        $"{producer}: new {type}(...) passes a non-literal argument that can render into "
+                            + $"Message in some position (e.g. the Argument* family): {argument.Trim()}");
+                }
             }
         }
     }
@@ -965,6 +980,38 @@ public sealed class SqlParserDiagnosticHygieneTests
                 + @"[^}]*?SqlParseException\s*\.\s*Internal\s*\(\s*\)",
             RegexOptions.Singleline).Count;
         Assert.Equal(2, backstops);
+    }
+
+    [Fact]
+    public void NonAsciiDecimalLiteral_SurfacesAsUnsupportedConstruct_NotMaskedByTheDoorCatch()
+    {
+        // Storage's R18 finding (the recurring proxy-vs-property class, inverted). The R17 fail-closed
+        // door catch converts ANY non-SqlParseException — including the raw FormatException a reverted
+        // `double.Parse` throws on a non-ASCII Nd digit — into Internal() fixed prose with Construct ==
+        // null. That makes the SECURITY property (only a SqlParseException escapes) hold, but it silently
+        // MASKS the diagnostic-quality regression: with the R16 `double.TryParse -> Unsupported(
+        // "DECIMAL_LITERAL")` fix reverted, the whole suite stayed green because every guard keyed on "a
+        // SqlParseException was thrown" is vacuous behind the catch. Pin the PROPERTY, not the type: a
+        // non-ASCII decimal literal must surface as the specific Unsupported("DECIMAL_LITERAL") construct
+        // — ErrorKind + Construct, both of which Internal() leaves at SyntaxError/null. RED if the
+        // producer fix is reverted (Actual: Construct null); GREEN at HEAD.
+        var ex = Assert.Throws<SqlParseException>(
+            () => SqlParser.ParseConstraintExpression("amount > \u0661.\u0665"));
+        Assert.Equal(SqlParseErrorKind.UnsupportedFeature, ex.ErrorKind);
+        Assert.Equal("DECIMAL_LITERAL", ex.Construct);
+    }
+
+    [Fact]
+    public void BothDoors_RejectNullArgument_WithArgumentNullException_NotSqlParseException()
+    {
+        // The fail-closed door catch guarantees only a SqlParseException escapes for any *parse* input,
+        // but a null ARGUMENT is a caller-contract violation, not malformed SQL — so both doors validate
+        // it with ArgumentNullException BEFORE the try (an explicit, symmetric precondition), never
+        // misreporting it as "malformed SQL". R18: Parse previously lacked the guard its sibling had, so
+        // Parse(null) was swallowed into Internal()'s generic prose — asymmetric and misleading, and it
+        // falsified the doc's "only a SqlParseException escapes" wording. Pin the symmetry.
+        Assert.Throws<ArgumentNullException>(() => SqlParser.Parse(null!));
+        Assert.Throws<ArgumentNullException>(() => SqlParser.ParseConstraintExpression(null!));
     }
 
     [Fact]
@@ -1343,6 +1390,28 @@ public sealed class SqlParserDiagnosticHygieneTests
         }
 
         return arguments.Trim();
+    }
+
+    private static IEnumerable<string> SplitTopLevelArguments(string arguments)
+    {
+        if (string.IsNullOrWhiteSpace(arguments))
+        {
+            yield break;
+        }
+
+        int start = 0;
+        while (true)
+        {
+            int comma = TopLevelOperator(arguments, ',', start);
+            if (comma < 0)
+            {
+                yield return arguments[start..].Trim();
+                yield break;
+            }
+
+            yield return arguments[start..comma].Trim();
+            start = comma + 1;
+        }
     }
 
     private static int SkipQuoted(string source, int quote)

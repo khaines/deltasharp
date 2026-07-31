@@ -78,6 +78,10 @@ internal sealed class SqlParser
     /// (<see cref="SqlParseErrorKind.UnsupportedFeature"/>).</exception>
     public static LogicalPlan Parse(string sql)
     {
+        // A null ARGUMENT is a caller-contract violation, not malformed SQL: validate it BEFORE the
+        // try (symmetric with ParseConstraintExpression) so it surfaces as ArgumentNullException rather
+        // than being swallowed by the fail-closed backstop into Internal()'s "malformed SQL" prose.
+        ArgumentNullException.ThrowIfNull(sql);
         try
         {
             IReadOnlyList<SqlToken> tokens = SqlLexer.Tokenize(sql);

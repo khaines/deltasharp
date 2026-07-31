@@ -271,9 +271,17 @@ not by a source audit: each door (`Parse`, `ParseConstraintExpression`) wraps it
 tokenizer included — in a fail-closed `catch (Exception ex) when (ex is not SqlParseException)` that
 re-throws a fixed-prose `SqlParseException.Internal()` with the raw inner **dropped**, so no other
 exception type — from a BCL conversion, an unexpected internal error, or a future producer's throw —
-can carry a lexeme out of the door. Numeric literals additionally parse through `double.TryParse`
-(the lexer admits any Unicode `Nd` digit `double.Parse` rejects), an allow-list test requires every
-exception a producer constructs to carry a fixed-literal message, and a behavioral property test
+can carry a lexeme out of the door. A **null argument** is the one deliberate exception to the "only a
+`SqlParseException` escapes" rule: it is a caller-contract violation, not malformed SQL, so both doors
+validate it with `ArgumentNullException.ThrowIfNull` **before** the `try` — an explicit precondition,
+symmetric across both doors, never misreported as "malformed SQL". Numeric literals additionally parse
+through `double.TryParse` (the lexer admits any Unicode `Nd` digit `double.Parse` rejects) and surface
+as `Unsupported("DECIMAL_LITERAL")`; a behavioral test pins that **property** (`Construct ==
+"DECIMAL_LITERAL"`, which the fail-closed `Internal()` leaves `null`) so the structural catch cannot
+silently mask a reverted numeric-literal fix. Behind the structural catch, a **defense-in-depth**
+allow-list test requires every argument of every non-`SqlParseException` a producer constructs to be a
+fixed-literal chain — it keys on construction *shape* in source, so it is deliberately backup to (not
+the source of) the type-axis guarantee, which the door catch alone enforces. A behavioral property test
 fuzzes the door asserting only a `SqlParseException` ever escapes.
 
 | Rejected input                         | `ErrorKind`         | `Construct` (stable token)                  | Detected at                    |
