@@ -80,18 +80,19 @@ public sealed class SqlParseException : Exception
     /// <para><b>Applied in every message-taking constructor, including both message-taking public ones.</b>
     /// Placing it in the <see cref="Syntax"/> factory alone left it bypassable: this type is public and exposes
     /// public <c>(string)</c> / <c>(string, Exception)</c> constructors that never reach that factory. The
-    /// parameterless public constructor carries only the runtime's fixed default message and accepts no input.
+    /// parameterless public constructor carries only a runtime-supplied default message and accepts no input.
     /// Nothing in the repo exploits the message-taking bypass today (all in-repo uses carry fixed prose), but
     /// "the backstop no caller-supplied message can bypass" has to be structurally true, not true by
     /// inspection — so the sanitize moved down to <see cref="Bounded"/>, which every message-taking
     /// construction path runs through.</para>
-    /// <para><b>Invariant this creates:</b> a <see cref="SqlParseException"/> message is single-line by
-    /// construction — a structural <c>\n</c> a factory might want for a multi-line listing would itself be
-    /// neutralized to U+FFFD. That is deliberate for a parser diagnostic (every one is a single
-    /// position-tagged line) and is the opposite of the Storage posture, where per-token sanitization exists
-    /// precisely so <c>DeltaConstraintDependentColumnException</c>'s own <c>"\n  "</c> listing survives. A
-    /// future multi-line SQL diagnostic must therefore sanitize its untrusted TOKENS and opt out of this
-    /// whole-message backstop, not fight it.</para>
+    /// <para><b>Invariant this creates:</b> every caller-supplied or parser-composed
+    /// <see cref="SqlParseException"/> message is single-line by construction — a structural <c>\n</c> a
+    /// factory might want for a multi-line listing would itself be neutralized to U+FFFD. That is deliberate
+    /// for a parser diagnostic (every one is a single position-tagged line) and is the opposite of the Storage
+    /// posture, where per-token sanitization exists precisely so
+    /// <c>DeltaConstraintDependentColumnException</c>'s own <c>"\n  "</c> listing survives. A future
+    /// multi-line SQL diagnostic must therefore sanitize its untrusted TOKENS and opt out of this whole-message
+    /// backstop, not fight it.</para>
     /// <para><b>No nested elision.</b> Two-layer bounding can in principle produce a doubly-elided render
     /// (a per-token <c>…</c> that is then itself truncated by the whole-message cap, yielding <c>… …</c>).
     /// The SQL path is provably immune: the token echo is capped at 128, the fixed prose and the

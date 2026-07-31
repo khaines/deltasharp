@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -537,49 +538,20 @@ public sealed class AnalysisExceptionCandidateListingTests
     }
 
     /// <summary>
-    /// Every factory that composes a list, as (label, build) where <c>build(width, prose)</c> takes the list
-    /// cardinality <i>and</i> the length of the factory's free prose tokens. The population is reconciled
-    /// against <see cref="FactoryMethods"/> below rather than trusted as a self-authored enumeration.
-    /// <para>The prose parameter exists because round 12 (Quality) found this corpus built every row with
-    /// short literal prose — <c>"x"</c>, <c>"/t"</c> — so the guard that claimed to rule out "any combination
-    /// of long items, a long reference and huge cardinality" varied only cardinality. The unbounded component
-    /// in practice is a redacted object path, and S3 keys are legal to 1024 characters, so the interesting
-    /// region of this corpus is precisely the one it could not reach.</para>
+    /// Every public list-composing factory, derived directly from reflection. The unique signature is only
+    /// xUnit's display/serialization key; each test resolves that key back to the same <see cref="MethodInfo"/>
+    /// and invokes it with shape-derived arguments, so no hand-authored label or delegate can name one factory
+    /// while exercising another.
     /// </summary>
-    public static TheoryData<string, Func<int, int, Exception>> ListComposingFactories() => new()
+    public static TheoryData<string> ListComposingFactories()
     {
-        { "UnresolvedColumn", (n, p) => AnalysisException.UnresolvedColumn(Prose("nosuch", p), Columns(n)) },
-        { "AmbiguousReference", (n, p) => AnalysisException.AmbiguousReference(Prose("amb", p), Columns(n)) },
-        { "UnknownFunction", (n, p) => AnalysisException.UnknownFunction(Prose("f", p), Types(n)) },
+        var data = new TheoryData<string>();
+        foreach (MethodInfo factory in FactoryMethods())
         {
-            "InvalidFunctionArgument",
-            (n, p) => AnalysisException.InvalidFunctionArgument(Prose("f", p), Types(n), Prose("an integer", p))
-        },
-        { "TableOrViewNotFound", (n, _) => AnalysisException.TableOrViewNotFound(LongNames(n)) },
-        {
-            "UnsupportedDataSink",
-            (n, p) => AnalysisException.UnsupportedDataSink(Prose("x", p), Prose("/t", p), LongNames(n))
-        },
-        {
-            "UnsupportedWriteFormat",
-            (n, p) => AnalysisException.UnsupportedWriteFormat(
-                Prose("x", p), Prose("/t", p), LongNames(n), LongNames(n))
-        },
-    };
+            data.Add(FactoryKey(factory));
+        }
 
-    [Fact]
-    public void ListComposingFactories_CoversEveryReflectedFactory()
-    {
-        string[] expected = FactoryMethods()
-            .Select(method => method.Name)
-            .OrderBy(name => name, StringComparer.Ordinal)
-            .ToArray();
-        string[] actual = ListComposingFactories()
-            .Select(row => (string)row[0])
-            .OrderBy(name => name, StringComparer.Ordinal)
-            .ToArray();
-
-        Assert.Equal(expected, actual);
+        return data;
     }
 
     /// <summary>A free prose token grown to <paramref name="length"/>, keeping its readable stem.</summary>
@@ -628,23 +600,24 @@ public sealed class AnalysisExceptionCandidateListingTests
 
     [Theory]
     [MemberData(nameof(ListComposingFactories))]
-    public void EveryListComposingFactory_ReportsAnOverflowCount(string factory, Func<int, int, Exception> build)
+    public void EveryListComposingFactory_ReportsAccurateOverflowCounts(string factoryKey)
     {
-        ArgumentNullException.ThrowIfNull(build);
-
+        MethodInfo factory = ResolveFactory(factoryKey);
         const int Width = 400;
-        int[] atWidth = OverflowCounts(build(Width, 0).Message);
-        int[] atDouble = OverflowCounts(build(Width * 2, 0).Message);
+        object[] atWidthArgs = FactoryArguments(factory, Width, proseLength: 0);
+        AnalysisException atWidthException = InvokeFactory(factory, atWidthArgs);
+        int[] atWidth = OverflowCounts(atWidthException.Message);
+        AssertListingsAreAccuratelyAccountedFor(
+            factory, atWidthArgs, atWidthException.Message, requirePartialListing: true);
 
-        Assert.True(
-            atWidth.Length > 0,
-            string.Create(CultureInfo.InvariantCulture, $"[{factory}] elided its list without any (+N more)"));
+        object[] atDoubleArgs = FactoryArguments(factory, Width * 2, proseLength: 0);
+        AnalysisException atDoubleException = InvokeFactory(factory, atDoubleArgs);
+        int[] atDouble = OverflowCounts(atDoubleException.Message);
+        AssertListingsAreAccuratelyAccountedFor(
+            factory, atDoubleArgs, atDoubleException.Message, requirePartialListing: true);
 
-        // Accuracy asserted WITHOUT naming a budget: each list shows a fixed number of items, so doubling the
-        // input must move every reported count by exactly the width. This holds whatever per-list allowance a
-        // factory uses — which matters, because the one factory composing TWO lists necessarily halves it.
-        // A literal count here would have been coupled to that allowance and would have had to be re-tuned
-        // rather than re-verified.
+        // The exact accounting assertion above catches a constant offset. This derivative assertion separately
+        // pins each marker's response to cardinality, including factories that compose more than one list.
         Assert.Equal(atWidth.Length, atDouble.Length);
         for (int i = 0; i < atWidth.Length; i++)
         {
@@ -664,16 +637,17 @@ public sealed class AnalysisExceptionCandidateListingTests
     /// </summary>
     [Theory]
     [MemberData(nameof(ListComposingFactories))]
-    public void EveryListComposingFactory_StaysUnderTheBackstop(string factory, Func<int, int, Exception> build)
+    public void EveryListComposingFactory_StaysUnderTheBackstop(string factoryKey)
     {
-        ArgumentNullException.ThrowIfNull(build);
+        MethodInfo factory = ResolveFactory(factoryKey);
         int exercisedElision = 0;
 
         foreach (int width in new[] { 0, 1, 12, 200, 5_000 })
         {
             foreach (int prose in new[] { 0, 64, 700, 798, 1_024, 5_000, 100_000 })
             {
-                string message = build(width, prose).Message;
+                object[] args = FactoryArguments(factory, width, prose);
+                string message = InvokeFactory(factory, args).Message;
                 int headroom = AnalysisException.MaxMessageLength - message.Length;
 
                 // The exact test for "the backstop fired" is length > the cap, because Sanitize returns
@@ -683,44 +657,17 @@ public sealed class AnalysisExceptionCandidateListingTests
                     headroom >= 0,
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"[{factory}] width={width} prose={prose} rendered {message.Length} chars, headroom "
+                        $"[{factoryKey}] width={width} prose={prose} rendered {message.Length} chars, headroom "
                             + $"{headroom} — the whole-message cap is eliding this list again, which destroys "
                             + $"its (+N more) count"));
 
-                // Headroom alone is not the property. A message can be short precisely BECAUSE the backstop
-                // cut the listing off, so the count that says how much was dropped has to still be there.
-                // Scoped to the listing: an elision mark elsewhere in the message is a bounded free prose
-                // token doing its job, which is a different event from a list losing members silently.
-                //
-                // That scoping is by bracket, and not every factory here renders its list in brackets —
-                // some use "could be: a, b", some an argument list in parentheses, some dotted parts — so
-                // this half of the property runs on a subset of the rows. Found by writing the adequacy
-                // assertion below INSIDE this branch, where it went RED on the rows that never enter it;
-                // the prose version of the same claim would have shipped.
-                //
-                // What used to stand here was a CITATION discharging those rows — two tests named as
-                // covering them — and it was wrong, because it was written without mapping either test's
-                // call sites: one is reached only by candidate-listing factories, the other gates its
-                // accounting half on a string[] payload a type list never satisfies. InvalidFunctionArgument
-                // was left with invariant 1 (a count is present) pinned and invariant 2 (the count is
-                // correct) pinned by nothing, while its message legitimately reports several hundred hidden
-                // types. A citation is a claim about a population, and this change has learned to distrust
-                // those; the factory is now pinned directly, so nothing here needs to name anything.
-                int open = message.IndexOf('[', StringComparison.Ordinal);
-                int close = message.LastIndexOf(']');
-                if (OverflowCounts(message).Length > 0)
+                // A short message can be short because the whole-message backstop destroyed its listing.
+                // Account every generated item on every cell, independent of the factory's punctuation.
+                AssertListingsAreAccuratelyAccountedFor(
+                    factory, args, message, requirePartialListing: false);
+                if (width > 0 && OverflowCounts(message).Length > 0)
                 {
                     exercisedElision++;
-                }
-
-                if (width > 0 && open >= 0 && close > open)
-                {
-                    string listing = message[(open + 1)..close];
-                    Assert.True(
-                        OverflowCounts(message).Length > 0 || !listing.Contains('\u2026'),
-                        string.Create(
-                            CultureInfo.InvariantCulture,
-                            $"[{factory}] width={width} prose={prose} elided with no (+N more): {message}"));
                 }
             }
         }
@@ -733,7 +680,7 @@ public sealed class AnalysisExceptionCandidateListingTests
             exercisedElision > 0,
             string.Create(
                 CultureInfo.InvariantCulture,
-                $"[{factory}] no swept cell produced a (+N more) count, so no cell reached the region ")
+                $"[{factoryKey}] no swept cell produced a (+N more) count, so no cell reached the region ")
                 + $"where the backstop could destroy one and this row asks nothing of the factory");
     }
 
@@ -850,12 +797,12 @@ public sealed class AnalysisExceptionCandidateListingTests
     /// without anyone remembering to add a row.</para>
     /// </summary>
     [Theory]
-    [MemberData(nameof(ListComposingFactoryNames))]
-    public void NoFreeProseToken_CanCrowdOutAListingsOverflowCount(string factoryName)
+    [MemberData(nameof(ListComposingFactories))]
+    public void NoFreeProseToken_CanCrowdOutAListingsOverflowCount(string factoryKey)
     {
-        MethodInfo factory = FactoryMethods().Single(m => m.Name == factoryName);
-        object[] args = [.. factory.GetParameters().Select((p, i) => Oversized(p.ParameterType, i))];
-        var ex = (AnalysisException)factory.Invoke(null, args)!;
+        MethodInfo factory = ResolveFactory(factoryKey);
+        object[] args = FactoryArguments(factory, width: 400, proseLength: 900);
+        AnalysisException ex = InvokeFactory(factory, args);
 
         // Sanitize appends an elision mark, so a message the backstop has cut is exactly one character over
         // the cap. That makes "the backstop fired" directly observable rather than inferred.
@@ -863,19 +810,11 @@ public sealed class AnalysisExceptionCandidateListingTests
             ex.Message.Length <= AnalysisException.MaxMessageLength,
             string.Create(
                 CultureInfo.InvariantCulture,
-                $"[{factoryName}] rendered {ex.Message.Length} chars, so the whole-message backstop did the "
+                $"[{factoryKey}] rendered {ex.Message.Length} chars, so the whole-message backstop did the "
                     + $"cutting and took the overflow count off the tail: …{ex.Message[^60..]}"));
 
-        // The listing must be ACCOUNTED FOR, not merely bounded: every item is either rendered or counted.
-        // Demanding a count unconditionally would be wrong — a narrow listing can genuinely fit beside even
-        // a pathological token, and then there is nothing to report.
-        (ParameterInfo Parameter, object Value)[] listings = factory.GetParameters()
-            .Select((parameter, index) => (parameter, args[index]))
-            .Where(entry => IsCollection(entry.parameter.ParameterType))
-            .ToArray();
-        int total = listings.Sum(entry => ((Array)entry.Value).Length);
-        int shown = listings.Sum(entry => CountShownItems(ex.Message, entry.Parameter, entry.Value));
-        Assert.Equal(total, shown + OverflowCounts(ex.Message).Sum());
+        AssertListingsAreAccuratelyAccountedFor(
+            factory, args, ex.Message, requirePartialListing: false);
     }
 
     /// <summary>
@@ -913,54 +852,63 @@ public sealed class AnalysisExceptionCandidateListingTests
         typeof(AnalysisException)
             .GetMethods(BindingFlags.Public | BindingFlags.Static)
             .Where(m => m.ReturnType == typeof(AnalysisException))
-            .Where(m => m.GetParameters().Any(p => IsCollection(p.ParameterType)));
+            .Where(m => m.GetParameters().Any(p => CollectionElementType(p.ParameterType) is not null))
+            .OrderBy(FactoryKey, StringComparer.Ordinal);
 
-    public static TheoryData<string> ListComposingFactoryNames()
-    {
-        var data = new TheoryData<string>();
-        foreach (MethodInfo m in FactoryMethods())
-        {
-            data.Add(m.Name);
-        }
+    private static string FactoryKey(MethodInfo factory) =>
+        $"{factory.Name}({string.Join(",", factory.GetParameters().Select(p => p.ParameterType))})";
 
-        return data;
-    }
+    private static MethodInfo ResolveFactory(string factoryKey) =>
+        FactoryMethods().Single(factory => FactoryKey(factory) == factoryKey);
 
-    private static bool IsCollection(Type type) =>
-        type.IsGenericType && type.GetGenericTypeDefinition() == typeof(IReadOnlyList<>);
-
-    private static int CountShownItems(string message, ParameterInfo parameter, object value)
-    {
-        Type item = parameter.ParameterType.GetGenericArguments()[0];
-        if (item == typeof(string))
-        {
-            return ((IEnumerable<string>)value).Count(name => message.Contains(name, StringComparison.Ordinal));
-        }
-
-        if (item == typeof(AttributeReference))
-        {
-            return ((IEnumerable<AttributeReference>)value)
-                .Count(attribute => message.Contains(attribute.Name, StringComparison.Ordinal));
-        }
-
-        if (item == typeof(DataType))
-        {
-            // Oversized() deliberately supplies IntegerType for every item. Match the whole token so the
-            // trailing prose "an integer" is not counted as a rendered type.
-            return Regex.Matches(message, @"\bint\b").Count;
-        }
-
-        throw new NotSupportedException(
-            string.Create(CultureInfo.InvariantCulture, $"no accounting rule defined for {item}"));
-    }
-
-    /// <summary>A pathological value for each parameter shape: every free token long enough to consume the
-    /// whole message on its own, and every collection wide enough to have something to elide.</summary>
-    private static object Oversized(Type type, int seed)
+    private static Type? CollectionElementType(Type type)
     {
         if (type == typeof(string))
         {
-            return new string('p', 900);
+            return null;
+        }
+
+        if (type.IsArray)
+        {
+            return type.GetElementType();
+        }
+
+        Type[] elementTypes = type
+            .GetInterfaces()
+            .Prepend(type)
+            .Where(candidate =>
+                candidate.IsGenericType
+                && candidate.GetGenericTypeDefinition() == typeof(IEnumerable<>))
+            .Select(candidate => candidate.GetGenericArguments()[0])
+            .Distinct()
+            .ToArray();
+        if (elementTypes.Length > 1)
+        {
+            throw new NotSupportedException(
+                string.Create(CultureInfo.InvariantCulture, $"{type} exposes multiple enumerable element types"));
+        }
+
+        return elementTypes.SingleOrDefault();
+    }
+
+    private static object[] FactoryArguments(
+        MethodInfo factory, int width, int proseLength) =>
+        factory.GetParameters()
+            .Select((parameter, index) => FactoryArgument(parameter, width, proseLength, index))
+            .ToArray();
+
+    private static object FactoryArgument(
+        ParameterInfo parameter, int width, int proseLength, int seed)
+    {
+        if (parameter.HasDefaultValue)
+        {
+            return parameter.DefaultValue!;
+        }
+
+        Type type = parameter.ParameterType;
+        if (type == typeof(string))
+        {
+            return Prose(parameter.Name ?? $"argument{seed}", proseLength);
         }
 
         if (type == typeof(int))
@@ -973,32 +921,175 @@ public sealed class AnalysisExceptionCandidateListingTests
             return true;
         }
 
-        if (!IsCollection(type))
+        Type? itemType = CollectionElementType(type);
+        if (itemType is null)
         {
             throw new NotSupportedException(
-                string.Create(CultureInfo.InvariantCulture, $"no oversized value defined for {type}"));
+                string.Create(CultureInfo.InvariantCulture, $"no generated value defined for {type}"));
         }
 
-        Type item = type.GetGenericArguments()[0];
-        if (item == typeof(string))
+        int itemCount = width == 0 ? 0 : checked(width + (seed * 37));
+        Array items = Array.CreateInstance(itemType, itemCount);
+        for (int i = 0; i < itemCount; i++)
         {
-            // Distinct per parameter, so a factory composing TWO listings cannot have one list's names
-            // counted against the other's overflow.
-            return Enumerable.Range(0, 40).Select(i => RealisticName((seed * 1000) + i)).ToArray();
+            items.SetValue(ListingItem(itemType, seed, i), i);
         }
 
-        if (item == typeof(AttributeReference))
+        if (type.IsAssignableFrom(items.GetType()))
         {
-            return Columns(40);
+            return items;
         }
 
-        if (item == typeof(DataType))
+        Type listType = typeof(List<>).MakeGenericType(itemType);
+        var list = (IList)Activator.CreateInstance(listType)!;
+        foreach (object? item in items)
         {
-            return Enumerable.Range(0, 40).Select(object (_) => IntegerType.Instance).Cast<DataType>().ToArray();
+            list.Add(item);
+        }
+
+        if (type.IsAssignableFrom(listType))
+        {
+            return list;
         }
 
         throw new NotSupportedException(
-            string.Create(CultureInfo.InvariantCulture, $"no oversized collection defined for {item}"));
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"generated {items.GetType()} and {listType} are not assignable to {type}"));
     }
 
+    private static object ListingItem(Type itemType, int seed, int index)
+    {
+        if (itemType == typeof(string))
+        {
+            return ListingName("name", seed, index);
+        }
+
+        if (itemType == typeof(AttributeReference))
+        {
+            return new AttributeReference(
+                ListingName("attribute", seed, index),
+                IntegerType.Instance,
+                true,
+                new ExprId((seed * 100_000) + index + 1));
+        }
+
+        if (itemType == typeof(DataType))
+        {
+            return new StructType(
+                new[]
+                {
+                    new StructField(
+                        string.Create(CultureInfo.InvariantCulture, $"t{seed:D2}_{index:D4}"),
+                        IntegerType.Instance,
+                        nullable: true),
+                });
+        }
+
+        throw new NotSupportedException(
+            string.Create(CultureInfo.InvariantCulture, $"no generated listing item defined for {itemType}"));
+    }
+
+    private static string ListingName(string kind, int seed, int index) =>
+        string.Create(
+            CultureInfo.InvariantCulture,
+            $"{kind[0]}{seed:D2}_{index:D4}_metric");
+
+    private static AnalysisException InvokeFactory(MethodInfo factory, object[] args) =>
+        Assert.IsType<AnalysisException>(factory.Invoke(null, args));
+
+    private sealed record ListingArgument(ParameterInfo Parameter, object Value, string[] Tokens);
+
+    private static ListingArgument[] ListingArguments(MethodInfo factory, object[] args) =>
+        factory.GetParameters()
+            .Select((parameter, index) => (Parameter: parameter, Value: args[index]))
+            .Where(entry => CollectionElementType(entry.Parameter.ParameterType) is not null)
+            .Select(entry => new ListingArgument(
+                entry.Parameter,
+                entry.Value,
+                ListingTokens(entry.Parameter, entry.Value)))
+            .ToArray();
+
+    private static string[] ListingTokens(ParameterInfo parameter, object value)
+    {
+        Type itemType = CollectionElementType(parameter.ParameterType)
+            ?? throw new InvalidOperationException($"{parameter.Name} is not a collection");
+        var tokens = new List<string>();
+        foreach (object item in (IEnumerable)value)
+        {
+            if (itemType == typeof(string))
+            {
+                tokens.Add((string)item);
+            }
+            else if (itemType == typeof(AttributeReference))
+            {
+                tokens.Add(((AttributeReference)item).Name);
+            }
+            else if (itemType == typeof(DataType))
+            {
+                tokens.Add(
+                    CoercionHelpers.DiagnosticType(
+                        (DataType)item,
+                        AnalysisException.MaxEchoedCandidateLength));
+            }
+            else
+            {
+                throw new NotSupportedException(
+                    string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"no accounting token defined for {itemType}"));
+            }
+        }
+
+        Assert.Equal(tokens.Count, tokens.Distinct(StringComparer.Ordinal).Count());
+        string? overFloor = tokens.FirstOrDefault(
+            token => token.Length > AnalysisException.MinEchoedCandidateLength);
+        Assert.True(
+            overFloor is null,
+            $"generated token exceeds the containment oracle's unelided floor: {overFloor}");
+        return tokens.ToArray();
+    }
+
+    private static void AssertListingsAreAccuratelyAccountedFor(
+        MethodInfo factory,
+        object[] args,
+        string message,
+        bool requirePartialListing)
+    {
+        ListingArgument[] listings = ListingArguments(factory, args);
+        Assert.NotEmpty(listings);
+
+        int[] overflow = OverflowCounts(message);
+        string[] allTokens = listings.SelectMany(listing => listing.Tokens).ToArray();
+        int total = allTokens.Length;
+        Assert.Equal(total, allTokens.Distinct(StringComparer.Ordinal).Count());
+        int[] shownByListing = listings
+            .Select(listing => listing.Tokens.Count(token =>
+                message.Contains(token, StringComparison.Ordinal)))
+            .ToArray();
+        int[] hiddenByListing = listings
+            .Select((listing, index) => listing.Tokens.Length - shownByListing[index])
+            .Where(hidden => hidden > 0)
+            .ToArray();
+        Assert.Equal(hiddenByListing, overflow);
+
+        int shown = shownByListing.Sum();
+        Assert.True(
+            total == shown + overflow.Sum(),
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"[{FactoryKey(factory)}] listing accounting: total={total}, shown={shown}, "
+                    + $"reported={overflow.Sum()} :: {message}"));
+
+        if (!requirePartialListing)
+        {
+            return;
+        }
+
+        Assert.Equal(listings.Length, overflow.Length);
+        for (int i = 0; i < listings.Length; i++)
+        {
+            Assert.InRange(shownByListing[i], 1, listings[i].Tokens.Length - 1);
+        }
+    }
 }

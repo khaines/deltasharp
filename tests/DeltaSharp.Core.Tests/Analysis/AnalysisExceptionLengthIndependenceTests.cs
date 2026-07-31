@@ -126,9 +126,9 @@ public sealed class AnalysisExceptionLengthIndependenceTests
     // differs, which is exactly what makes the diagnostic honest.
     //
     // What replaced it is stronger, and is deliberately in AnalysisExceptionCandidateListingTests rather
-    // than here: EveryListComposingFactory_ReportsAnOverflowCount uses a corpus reconciled against the whole
-    // reflected factory population, instead of trusting an enumeration by hand. That is what the earlier
-    // revision of this suite got wrong — it pinned the truncation of UnknownFunction and
+    // than here: EveryListComposingFactory_ReportsAccurateOverflowCounts derives its cases from the reflected
+    // public factory methods and invokes those exact methods, instead of trusting an enumeration by hand.
+    // That is what the earlier revision of this suite got wrong — it pinned the truncation of UnknownFunction and
     // InvalidFunctionArgument AS EXPECTED BEHAVIOUR and so ratified the very defect it was meant to guard.
 
     [Theory]

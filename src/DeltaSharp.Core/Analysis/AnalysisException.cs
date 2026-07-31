@@ -142,13 +142,14 @@ internal sealed class AnalysisException : Exception
     /// bound its own items and report an explicit overflow count, so this cap never elides a list.
     /// </para>
     /// <para>
-    /// <b>That is a claim about every list-composing factory, so the detailed corpus is reconciled against
-    /// the reflected factory population.</b> <c>EveryListComposingFactory_ReportsAnOverflowCount</c> uses
-    /// shape-specific builders whose names must exactly equal the factories discovered by reflection, while
-    /// <c>NoFreeProseToken_CanCrowdOutAListingsOverflowCount</c> drives the reflected factories directly.
-    /// A hand-written enumeration stood here without that reconciliation for one revision and was already
-    /// wrong: bounding each list is necessary but <em>not sufficient</em>, because a listing's budget is
-    /// <c>MaxMessageLength − prose</c>
+    /// <b>That is a claim about every public list-composing factory, so the theories are generated from the
+    /// reflected factory methods and invoke those exact methods with shape-derived arguments.</b>
+    /// <c>EveryListComposingFactory_ReportsAccurateOverflowCounts</c> and
+    /// <c>NoFreeProseToken_CanCrowdOutAListingsOverflowCount</c> discover every non-string
+    /// <c>IEnumerable&lt;T&gt;</c> parameter, fail closed on an unknown element shape, and account each
+    /// generated item by a unique rendered token. A hand-written enumeration stood here for one revision and
+    /// was already wrong: bounding each list is necessary but <em>not sufficient</em>, because a listing's
+    /// budget is <c>MaxMessageLength − prose</c>
     /// and is therefore only as honest as the prose is bounded. <see cref="UnsupportedDataSink"/> and
     /// <see cref="UnsupportedWriteFormat"/> interpolated two unbounded user tokens — a target path and a
     /// requested format — and an 816-character path pushed both messages past this cap, so the backstop cut

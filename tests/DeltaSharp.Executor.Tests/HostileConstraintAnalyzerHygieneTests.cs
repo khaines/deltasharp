@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.Json.Nodes;
+using DeltaSharp.Storage;
 using DeltaSharp.Types;
 using Xunit;
 
@@ -190,6 +191,35 @@ public sealed class HostileConstraintAnalyzerHygieneTests : IDisposable
         AssertChainIsHygienic(ex);
         Assert.Contains("must be boolean", ex.Message, StringComparison.Ordinal);
         Assert.Contains("FORGED", ex.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(CommitFile(table, 2)));
+    }
+
+    [Fact]
+    public void HostileUnresolvedColumn_ReclassificationPreservesRawTypedName_AndSanitizesMessage()
+    {
+        // The CHECK names a hostile column that the table schema does not contain. Analysis carries that exact
+        // name in RootColumn so the write seam can reclassify the resolution failure; the parity exception must
+        // retain it byte-for-byte on ColumnName while sanitizing only its rendered message.
+        string table = Table("raw-root-column");
+        SeedWithHostileConstraint(table, $"`{CrLfPayload}` > 0");
+
+        DeltaConstraintDependentColumnException ex =
+            Assert.Throws<DeltaConstraintDependentColumnException>(() => Append(table, Amounts(1)));
+
+        Assert.Equal(CrLfPayload, ex.ColumnName);
+        Assert.Equal("safe", Assert.Single(ex.Constraints).Name);
+        Assert.DoesNotContain(CrLfPayload, ex.Message, StringComparison.Ordinal);
+        Assert.Contains("A\uFFFD\uFFFDFORGED", ex.Message, StringComparison.Ordinal);
+        Assert.All(
+            ex.Message.EnumerateRunes(),
+            rune => Assert.False(
+                rune.Value != '\n'
+                && Rune.GetUnicodeCategory(rune)
+                    is UnicodeCategory.Control or UnicodeCategory.LineSeparator
+                        or UnicodeCategory.ParagraphSeparator or UnicodeCategory.Format,
+                FormattableString.Invariant(
+                    $"rendered dependent-column message carries injection-unsafe U+{rune.Value:X4}")));
+        Assert.True(ex.Message.Length <= MaxSurfacedMessageLength);
         Assert.False(File.Exists(CommitFile(table, 2)));
     }
 

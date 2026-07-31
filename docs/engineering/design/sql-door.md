@@ -235,10 +235,11 @@ stable and catchable (`SqlParseException.cs`).
 Diagnostic hygiene is layered. `SqlParser.Describe` reports a string literal's token kind rather than
 its decoded value and caps any echoed lexeme at 128 characters. Every message-taking
 `SqlParseException` constructor then applies a single-line, 512-character whole-message backstop; the
-parameterless constructor accepts no input and carries only the runtime's fixed default message. Tests
-enumerate and pin the current reachable string-literal rejection sites, and assert that once two
-attacker messages exceed the backstop budget, their rendered messages are byte-identical rather than
-proportional to attacker input length.
+parameterless constructor accepts no input and carries only a runtime-supplied default message. Tests
+derive the hostile, bounded, and string-literal corpora from one source-reconciled `Describe`-site
+inventory, pin each exception's exact throwing method, and assert that once two attacker messages
+exceed the backstop budget, their rendered messages are byte-identical rather than proportional to
+attacker input length.
 
 | Rejected input                         | `ErrorKind`         | `Construct` (stable token)                  | Detected at                    |
 | -------------------------------------- | ------------------- | ------------------------------------------- | ------------------------------ |
