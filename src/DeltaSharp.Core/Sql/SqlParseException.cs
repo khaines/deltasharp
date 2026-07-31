@@ -53,7 +53,7 @@ public sealed class SqlParseException : Exception
         : base(Bounded(message))
     {
         ErrorKind = kind;
-        Construct = construct;
+        Construct = construct is null ? null : DiagnosticText.Sanitize(construct, MaxConstructLength);
     }
 
     /// <summary>The structured reason the statement was rejected.</summary>
@@ -65,7 +65,9 @@ public sealed class SqlParseException : Exception
     /// identifier token (for example <c>JOIN</c>, <c>GROUP_BY</c>, <c>FUNCTION_CALL</c>,
     /// <c>SELECT_DISTINCT</c>) — the programmatic branch key callers switch on. The human-readable
     /// prose lives only in <see cref="Exception.Message"/>. It is <see langword="null"/> for a
-    /// <see cref="SqlParseErrorKind.SyntaxError"/>.
+    /// <see cref="SqlParseErrorKind.SyntaxError"/>. The value is length-bounded and control-char
+    /// sanitized (<see cref="MaxConstructLength"/>) on assignment — a no-op for every registered
+    /// construct, but it keeps this property from becoming an unbounded raw-token sink.
     /// </summary>
     public string? Construct { get; }
 
@@ -101,6 +103,12 @@ public sealed class SqlParseException : Exception
     /// cap already elided. Noted here so a future reader does not re-derive it as a defect.</para>
     /// </remarks>
     internal const int MaxMessageLength = 512;
+
+    /// <summary>The backstop length for the structured <see cref="Construct"/> token. A registered
+    /// construct is a short compile-time constant far under this, so the cap is a no-op in practice;
+    /// it exists only so <see cref="Construct"/> cannot become an unbounded raw-token sink if a future
+    /// or mis-wired producer ever hands it an oversized value (#687).</summary>
+    private const int MaxConstructLength = 128;
 
     /// <summary>Applies the <see cref="MaxMessageLength"/> backstop — the single chokepoint every
     /// message-taking constructor routes through.</summary>

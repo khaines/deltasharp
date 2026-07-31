@@ -250,6 +250,19 @@ decoded value — including a truncation-surviving secret prefix — reaches a m
 messages exceed the backstop budget, their rendered messages are byte-identical rather than
 proportional to attacker input length.
 
+Two structural guarantees make the source-shape test guards above **defense-in-depth rather than the
+sole control**. First, `SqlParseException.Unsupported` **fails closed**: an unregistered construct
+renders fixed generic prose (`an unsupported SQL construct`) instead of echoing the raw token, and the
+stable `Construct` token is itself length-bounded and control-char sanitized on assignment — so no
+future or mis-wired producer can leak an unregistered construct verbatim through the message or the
+property. Second, the public message-taking `SqlParseException` constructors are **banned in Core via
+`BannedSymbols.txt` (RS0030)**, so every diagnostic must be built through the audited `Syntax`/
+`Unsupported` factories (which use the private constructor); the handful of fixed-prose depth-limit
+diagnostics that legitimately use a public constructor carry a scoped `#pragma warning disable RS0030`
+documenting that their message is a compile-time constant. A raw-lexeme producer written with any
+construction syntax — including the target-typed `new(...)` idiom — is therefore a **compile error**,
+not merely a test failure.
+
 | Rejected input                         | `ErrorKind`         | `Construct` (stable token)                  | Detected at                    |
 | -------------------------------------- | ------------------- | ------------------------------------------- | ------------------------------ |
 | `… JOIN …`, `INNER/LEFT/… JOIN`        | `UnsupportedFeature`| `JOIN`                                      | `ExpectEnd` → `MapTrailingConstruct` |

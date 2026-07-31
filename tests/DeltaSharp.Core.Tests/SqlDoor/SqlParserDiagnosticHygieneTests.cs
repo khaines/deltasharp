@@ -566,6 +566,7 @@ public sealed class SqlParserDiagnosticHygieneTests
             .Select(match => match.Groups["name"].Value)
             .ToArray();
         var usesByName = new Dictionary<string, int>(StringComparer.Ordinal);
+        ISet<string> registered = ConstructInfoKeys();
         foreach (string call in calls)
         {
             string construct = FirstArgument(call);
@@ -573,7 +574,15 @@ public sealed class SqlParserDiagnosticHygieneTests
             Assert.True(
                 fixedLiteral || mapped.Contains(construct, StringComparer.Ordinal),
                 $"Unsupported construct is neither fixed nor mapped: {construct}");
-            if (!fixedLiteral)
+            if (fixedLiteral)
+            {
+                // A direct literal call site must pass a REGISTERED construct — not merely a literal.
+                // Since the R13 keystone makes Unsupported fail closed, an unregistered direct construct
+                // would silently render generic prose instead of naming the feature; audit the property
+                // (registration) here just as the Map output side does (Round-13 finding).
+                AssertConstructIsRegistered(construct, "an Unsupported call site", registered);
+            }
+            else
             {
                 usesByName[construct] = usesByName.GetValueOrDefault(construct) + 1;
             }
@@ -756,6 +765,33 @@ public sealed class SqlParserDiagnosticHygieneTests
     }
 
     [Fact]
+    public void AuditedProducerSources_ContainNoBlockComments()
+    {
+        // The source-shape guards read production source with line-comment (`//`) stripping plus
+        // quote-skipping hand parsers (MethodBody, FindMatchingParenthesis, FindMatchingBrace), but
+        // they do NOT track block comments. A `/* ... */` carrying an unbalanced brace or paren would
+        // desync those parsers and silently vacuate the guards for the rest of a method (Round-13
+        // finding). Ban block comments in the audited producers so the hand parsers cannot desync;
+        // `//` prose is unaffected. (Verified: none of these files contains `//` inside a string
+        // literal, so stripping `//` to end-of-line cannot hide a real `/*`.)
+        string srcRoot = Path.GetFullPath(
+            Path.Combine(Path.GetDirectoryName(SqlParserSourcePath())!, "..", ".."));
+        foreach (string producer in new[]
+        {
+            "DeltaSharp.Core/Analysis/ConstraintExpressionFrontend.cs",
+            "DeltaSharp.Core/Sql/SqlLexer.cs",
+            "DeltaSharp.Core/Sql/SqlParseException.cs",
+            "DeltaSharp.Core/Sql/SqlParser.cs",
+        })
+        {
+            string source = File.ReadAllText(
+                Path.Combine(srcRoot, producer.Replace('/', Path.DirectorySeparatorChar)));
+            string withoutLineComments = Regex.Replace(source, @"//[^\n]*", string.Empty);
+            Assert.DoesNotMatch(new Regex(@"/\*"), withoutLineComments);
+        }
+    }
+
+    [Fact]
     public void SqlParseExceptionFactorySet_IsClosed()
     {
         // Discover every producer DECLARED on SqlParseException that hands back a SqlParseException —
@@ -812,6 +848,25 @@ public sealed class SqlParserDiagnosticHygieneTests
         Assert.Contains("an unsupported SQL construct", ex.Message, StringComparison.Ordinal);
         Assert.Equal(Unregistered, ex.Construct);
         AssertHygienic(ex.Message);
+    }
+
+    [Fact]
+    public void UnsupportedConstruct_IsLengthBounded_OnAssignment()
+    {
+        // Construct is bounded/sanitized on assignment (MaxConstructLength) so it cannot become an
+        // unbounded raw-token sink even if a future or mis-wired producer ever hands Unsupported an
+        // oversized value — the last place a raw token could otherwise survive after the keystone.
+        MethodInfo unsupported = typeof(SqlParseException).GetMethod(
+            "Unsupported",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        var ex = (SqlParseException)unsupported.Invoke(null, [new string('z', 300), 1])!;
+
+        Assert.NotNull(ex.Construct);
+        Assert.True(
+            ex.Construct!.Length <= 129,
+            $"Construct was {ex.Construct.Length} chars; expected it bounded to MaxConstructLength "
+                + "(128) plus at most a one-character truncation ellipsis.");
     }
 
     [Fact]
@@ -997,27 +1052,34 @@ public sealed class SqlParserDiagnosticHygieneTests
             .ToHashSet(StringComparer.Ordinal);
     }
 
-    private static string MapMethodBody(string source, string mapName) =>
-        MethodBody(source, $"string? {mapName}(");
+    private static string MapMethodBody(string source, string mapName)
+    {
+        // Anchor on the declaration and fail closed if the visibility-agnostic marker is ambiguous
+        // (a future call site written `string? MapX(`, or one Map name prefixing another) rather than
+        // silently taking the first match (Round-13 finding).
+        string marker = $"string? {mapName}(";
+        Assert.Single(Regex.Matches(source, Regex.Escape(marker)).Cast<Match>());
+        return MethodBody(source, marker);
+    }
 
     private static void AssertConstructIsRegistered(
-        string value, string mapName, ISet<string> registered)
+        string value, string origin, ISet<string> registered)
     {
         if (value == "null")
         {
             return;
         }
 
-        // A Map* helper can only return null or a quoted stable token; that token must be a
-        // registered ConstructInfo key, or SqlParseException.Unsupported would render generic
-        // fallback prose instead of the construct's intended message. Auditing the OUTPUT literals
-        // (independent of arm/label SHAPE) closes the when-guard / constant-pattern / early-return
-        // escapes the input-side reconciliation cannot see (Round-12 finding).
+        // A Map* helper or a direct Unsupported call site can only hand over null or a quoted stable
+        // token; that token must be a registered ConstructInfo key, or SqlParseException.Unsupported
+        // renders generic fallback prose instead of the construct's intended message. Auditing the
+        // OUTPUT literals (independent of arm/label SHAPE) closes the when-guard / constant-pattern /
+        // early-return escapes the input-side reconciliation cannot see (Round-12/13 findings).
         string construct = value.Trim('"');
         Assert.True(
             registered.Contains(construct),
-            $"{mapName} can return construct '{construct}', which is not a registered ConstructInfo "
-                + "key; register it (or the Unsupported fallback renders generic prose for it).");
+            $"{origin} produces construct '{construct}', which is not a registered ConstructInfo key; "
+                + "register it (or SqlParseException.Unsupported renders generic fallback prose for it).");
     }
 
     private static string MethodBody(string source, string marker)
