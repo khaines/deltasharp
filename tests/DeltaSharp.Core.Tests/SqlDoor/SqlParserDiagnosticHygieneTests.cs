@@ -446,7 +446,7 @@ public sealed class SqlParserDiagnosticHygieneTests
     [Fact]
     public void EveryDynamicSyntaxDiagnostic_RoutesLexemesThroughDescribe()
     {
-        string code = SqlParserCode();
+        string code = SqlParserCode() + "\n" + ConstraintExpressionFrontendCode();
         string[] calls = InvocationArguments(code, SyntaxInvocationPattern).ToArray();
         Assert.Equal(
             EchoSites.Length,
@@ -464,7 +464,7 @@ public sealed class SqlParserDiagnosticHygieneTests
     [Fact]
     public void EveryUnsupportedConstruct_IsFixedOrMapped()
     {
-        string code = SqlParserCode();
+        string code = SqlParserCode() + "\n" + ConstraintExpressionFrontendCode();
         string[] calls = InvocationArguments(code, UnsupportedInvocationPattern).ToArray();
         Assert.NotEmpty(calls);
 
