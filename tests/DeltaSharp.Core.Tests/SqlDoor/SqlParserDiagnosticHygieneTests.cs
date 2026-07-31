@@ -331,6 +331,12 @@ public sealed class SqlParserDiagnosticHygieneTests
                             new Regex(
                                 @"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*(?:\(\))?$"),
                             value[..switchAt].Trim());
+                        int openBrace = value.IndexOf('{', switchAt);
+                        Assert.True(openBrace >= 0, $"Map switch has no body: {value}");
+                        int closeBrace = FindMatchingBrace(value, openBrace);
+                        Assert.True(
+                            string.IsNullOrWhiteSpace(value[(closeBrace + 1)..]),
+                            $"Map switch has an unaudited suffix: {value[(closeBrace + 1)..]}");
                     }
                     else
                     {
@@ -362,6 +368,8 @@ public sealed class SqlParserDiagnosticHygieneTests
             "OUTER", "GROUP", "ORDER", "HAVING", "LIMIT", "OFFSET", "UNION", "INTERSECT",
             "EXCEPT", "MINUS", "WINDOW", "CLUSTER", "DISTRIBUTE", "SORT",
             "SECRET_HOSTILE_TOKEN",
+            "COL1_SECRET9",
+            "héllo_секрет",
             new string('x', 400),
             new string('z', FloodLength),
         ];
@@ -370,7 +378,8 @@ public sealed class SqlParserDiagnosticHygieneTests
             .. from kind in Enum.GetValues<SqlTokenKind>()
                from text in texts
                from quoted in new[] { false, true }
-               select new SqlToken(kind, text, Position: 1, IsQuoted: quoted),
+               from position in new[] { 1, 2, 17, 400 }
+               select new SqlToken(kind, text, Position: position, IsQuoted: quoted),
         ];
         var notToken = new SqlToken(SqlTokenKind.Not, "NOT", Position: 1);
 
@@ -491,6 +500,9 @@ public sealed class SqlParserDiagnosticHygieneTests
 
         foreach (string construct in mapped)
         {
+            Assert.DoesNotMatch(
+                new Regex($@"\bout\s+(?:var\s+)?{construct}\b"),
+                code);
             Match[] allAssignments = Regex.Matches(
                     code,
                     $@"\b{construct}\s*(?<operator>\?\?=|\+=|=)(?!=)\s*(?<value>[^;]+);")
@@ -614,6 +626,32 @@ public sealed class SqlParserDiagnosticHygieneTests
                 "Sql/SqlParser.cs",
             },
             producers);
+
+        foreach (string producer in producers)
+        {
+            string code = File.ReadAllText(Path.Combine(root, producer));
+            Assert.DoesNotMatch(
+                new Regex(
+                    @"using\s+\w+\s*=\s*[\w.]*SqlParseException\s*;"),
+                code);
+            Assert.DoesNotMatch(
+                new Regex(
+                    @"\bSqlParseException\s+\w+\s*=\s*new\s*\("),
+                code);
+        }
+    }
+
+    [Fact]
+    public void SqlParseExceptionFactorySet_IsClosed()
+    {
+        string[] factories = typeof(SqlParseException)
+            .GetMethods(BindingFlags.NonPublic | BindingFlags.Static)
+            .Where(method => method.ReturnType == typeof(SqlParseException))
+            .Select(method => method.Name)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+
+        Assert.Equal(new[] { "Syntax", "Unsupported" }, factories);
     }
 
     [Fact]
@@ -697,6 +735,10 @@ public sealed class SqlParserDiagnosticHygieneTests
         Assert.All(
             forbidden,
             value => Assert.DoesNotContain(value, ex.Message, StringComparison.Ordinal));
+        if (payload.Contains('q'))
+        {
+            Assert.DoesNotContain(new string('q', 16), ex.Message, StringComparison.Ordinal);
+        }
         Assert.Contains("string literal", ex.Message, StringComparison.Ordinal);
         AssertHygienic(ex.Message);
     }
@@ -809,6 +851,30 @@ public sealed class SqlParserDiagnosticHygieneTests
         }
 
         throw new InvalidOperationException($"Unbalanced method body: {marker}");
+    }
+
+    private static int FindMatchingBrace(string source, int openBrace)
+    {
+        int depth = 0;
+        for (int i = openBrace; i < source.Length; i++)
+        {
+            if (source[i] is '"' or '\'')
+            {
+                i = SkipQuoted(source, i);
+                continue;
+            }
+
+            if (source[i] == '{')
+            {
+                depth++;
+            }
+            else if (source[i] == '}' && --depth == 0)
+            {
+                return i;
+            }
+        }
+
+        throw new InvalidOperationException($"Unbalanced switch body at source offset {openBrace}.");
     }
 
     private static string FirstArgument(string arguments)
