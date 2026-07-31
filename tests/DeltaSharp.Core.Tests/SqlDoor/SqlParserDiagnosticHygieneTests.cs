@@ -37,11 +37,21 @@ public sealed class SqlParserDiagnosticHygieneTests
         @"new\s+SqlParseException\s*\(";
 
     /// <summary>
-    /// The closed set of <see cref="SqlParseException"/> factory methods, each paired with the
-    /// source invocation pattern the audits key off. <see cref="SqlParseExceptionFactorySet_IsClosed"/>
-    /// pins this against reflection across EVERY visibility, and the producer inventory derives its
-    /// recognizer from these patterns — so a new factory cannot be introduced without both tripping
-    /// that guard and registering the pattern its call sites are audited against.
+    /// Discovers <c>Map*</c> keyword-mapping helpers regardless of declared visibility, so the audit
+    /// closes on the same terms as the widened factory set (a <c>public</c>/<c>internal</c> Map helper
+    /// cannot escape discovery the way a <c>NonPublic</c>-only reflection would let it).
+    /// </summary>
+    private const string MapHelperPattern =
+        @"(?:private|internal|public)\s+static\s+string\??\s+(?<name>Map\w+)\(";
+
+    /// <summary>
+    /// The closed set of <see cref="SqlParseException"/> factory methods, each paired with the source
+    /// invocation pattern the audits key off, and the producer inventory's recognizer.
+    /// <see cref="SqlParseExceptionFactorySet_IsClosed"/> pins BOTH the reflected producer set (across
+    /// every visibility, static and instance, and any SqlParseException-or-base return type) AND these
+    /// keys to the same literal <c>{Syntax, Unsupported}</c> — so a new factory can be silenced neither
+    /// by a one-line table edit nor by a base-typed return, and its call-site pattern must be
+    /// registered here for the producer inventory to recognize it.
     /// </summary>
     private static readonly IReadOnlyDictionary<string, string> AuditedFactoryInvocations =
         new Dictionary<string, string>(StringComparer.Ordinal)
@@ -307,19 +317,18 @@ public sealed class SqlParserDiagnosticHygieneTests
             "MapStatementKeyword",
             "MapTrailingConstruct",
         ];
-        string[] discovered = Regex.Matches(
-                code,
-                @"private static string\??\s+(?<name>Map\w+)\(")
+        string[] discovered = Regex.Matches(code, MapHelperPattern)
             .Cast<Match>()
             .Select(match => match.Groups["name"].Value)
             .OrderBy(name => name, StringComparer.Ordinal)
             .ToArray();
         Assert.Equal(expected, discovered);
 
+        ISet<string> registered = ConstructInfoKeys();
         var stableToken = new Regex(@"^(?:null|""(?:[^""\\]|\\.)*"")$");
         foreach (string method in discovered)
         {
-            string body = MethodBody(code, $"private static string? {method}(");
+            string body = MapMethodBody(code, method);
             MatchCollection switchArms = Regex.Matches(
                 body,
                 @"=>\s*(?<value>.*?)(?=,\s*(?:\r?\n|$)|\r?\n\s*\})",
@@ -328,7 +337,12 @@ public sealed class SqlParserDiagnosticHygieneTests
             Assert.Equal(Regex.Matches(body, "=>").Count, switchArms.Count);
             Assert.All(
                 switchArms,
-                arm => Assert.Matches(stableToken, arm.Groups["value"].Value.Trim()));
+                arm =>
+                {
+                    string value = arm.Groups["value"].Value.Trim();
+                    Assert.Matches(stableToken, value);
+                    AssertConstructIsRegistered(value, method, registered);
+                });
 
             MatchCollection earlyReturns = Regex.Matches(
                 body,
@@ -355,6 +369,7 @@ public sealed class SqlParserDiagnosticHygieneTests
                     else
                     {
                         Assert.Matches(stableToken, value);
+                        AssertConstructIsRegistered(value, method, registered);
                     }
                 });
         }
@@ -368,7 +383,7 @@ public sealed class SqlParserDiagnosticHygieneTests
                 .GetField("ConstructInfo", BindingFlags.NonPublic | BindingFlags.Static)!
                 .GetValue(null));
         MethodInfo[] maps = typeof(SqlParser)
-            .GetMethods(BindingFlags.NonPublic | BindingFlags.Static)
+            .GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
             .Where(method => method.Name.StartsWith("Map", StringComparison.Ordinal))
             .OrderBy(method => method.Name, StringComparer.Ordinal)
             .ToArray();
@@ -418,7 +433,8 @@ public sealed class SqlParserDiagnosticHygieneTests
 
         foreach (MethodInfo map in maps)
         {
-            string[] labels = CaseLabels(MethodBody(parserSource, $"private static string? {map.Name}("));
+            string body = MapMethodBody(parserSource, map.Name);
+            string[] labels = CaseLabels(body);
             Assert.NotEmpty(labels);
             Assert.All(
                 labels,
@@ -426,13 +442,25 @@ public sealed class SqlParserDiagnosticHygieneTests
                     corpus.Contains(label),
                     $"{map.Name} switches on case label '{label}' absent from the hostile-token "
                         + "corpus; add it to texts[] so the registered-construct loop exercises that arm."));
+
+            // Fail closed on arm SHAPE: every `=>` arm must be accounted for by either an extracted
+            // label run or the `_` discard. A `when`-guarded, constant-pattern, or otherwise
+            // unreadable arm is invisible to CaseLabels, so without this the reconciliation is
+            // fail-OPEN — the arm would be neither reconciled here nor fed to the loop below
+            // (Round-12 finding). The output-side registration guard is the primary control; this
+            // keeps the input-side reconciliation honest.
+            int labelArms = Regex.Matches(
+                body,
+                @"(?<labels>(?:""(?:[^""\\]|\\.)*""\s*(?:or\s+)?)+)=>").Count;
+            int discardArms = Regex.Matches(body, @"(?<![\w""])_\s*=>").Count;
+            Assert.Equal(Regex.Matches(body, "=>").Count, labelArms + discardArms);
         }
 
         // Anti-vacuity: the extractor must pull representative labels from every Map, including the
         // trailing member of each `or`-joined arm (DESC, OUTER, MINUS, SORT) — a regex that dropped
         // or-tails would leave a new unlisted or-tail arm unreconciled.
         string[] allLabels = maps
-            .SelectMany(map => CaseLabels(MethodBody(parserSource, $"private static string? {map.Name}(")))
+            .SelectMany(map => CaseLabels(MapMethodBody(parserSource, map.Name)))
             .ToArray();
         Assert.All(
             new[] { "IS", "BETWEEN", "INSERT", "DESC", "JOIN", "OUTER", "MINUS", "SORT" },
@@ -533,9 +561,7 @@ public sealed class SqlParserDiagnosticHygieneTests
         Assert.NotEmpty(calls);
 
         string[] mapped = ["construct", "unsupported", "negatedPredicate", "predicate"];
-        string[] mapHelpers = Regex.Matches(
-                code,
-                @"private static string\??\s+(?<name>Map\w+)\(")
+        string[] mapHelpers = Regex.Matches(code, MapHelperPattern)
             .Cast<Match>()
             .Select(match => match.Groups["name"].Value)
             .ToArray();
@@ -654,13 +680,46 @@ public sealed class SqlParserDiagnosticHygieneTests
     [Fact]
     public void EveryCoreSqlParseExceptionProducer_IsAudited()
     {
-        string root = Path.GetFullPath(
-            Path.Combine(Path.GetDirectoryName(SqlParserSourcePath())!, ".."));
-        string[] producers = Directory
-            .EnumerateFiles(root, "*.cs", SearchOption.AllDirectories)
+        // Root the sweep at the whole repository `src/`, not just DeltaSharp.Core, so a producer that
+        // appears in another assembly (Storage/Executor/Engine) is a guard failure rather than an
+        // unobserved event (Round-12 finding).
+        string srcRoot = Path.GetFullPath(
+            Path.Combine(Path.GetDirectoryName(SqlParserSourcePath())!, "..", ".."));
+
+        string[] SourcesUnderSrc() => Directory
+            .EnumerateFiles(srcRoot, "*.cs", SearchOption.AllDirectories)
             .Where(path =>
                 !path.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}", StringComparison.Ordinal)
                 && !path.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}", StringComparison.Ordinal))
+            .ToArray();
+
+        // Fail-closed inventory keyed on MENTION, not construction syntax: any file that so much as
+        // names SqlParseException must be a known file. This catches a new producer written with the
+        // target-typed `new(...)` house idiom (which ConstructorInvocationPattern cannot see) and a
+        // producer in any assembly — the file simply will not be in this pinned set (Round-12 finding).
+        string[] mentioning = SourcesUnderSrc()
+            .Where(path => Regex.IsMatch(File.ReadAllText(path), @"\bSqlParseException\b"))
+            .Select(path => Path.GetRelativePath(srcRoot, path).Replace('\\', '/'))
+            .OrderBy(path => path, StringComparer.Ordinal)
+            .ToArray();
+
+        Assert.Equal(
+            new[]
+            {
+                "DeltaSharp.Core/Analysis/AnalysisException.cs",
+                "DeltaSharp.Core/Analysis/ConstraintExpressionFrontend.cs",
+                "DeltaSharp.Core/Session/SparkSession.cs",
+                "DeltaSharp.Core/Sql/SqlLexer.cs",
+                "DeltaSharp.Core/Sql/SqlParseErrorKind.cs",
+                "DeltaSharp.Core/Sql/SqlParseException.cs",
+                "DeltaSharp.Core/Sql/SqlParser.cs",
+                "DeltaSharp.Core/Sql/SqlToken.cs",
+            },
+            mentioning);
+
+        // Within that inventory the actual PRODUCERS (files that build the exception via an audited
+        // factory or the public constructor) carry the stricter hygiene bans below.
+        string[] producers = SourcesUnderSrc()
             .Where(path =>
             {
                 string source = File.ReadAllText(path);
@@ -668,23 +727,23 @@ public sealed class SqlParserDiagnosticHygieneTests
                     .Append(ConstructorInvocationPattern)
                     .Any(pattern => Regex.IsMatch(source, pattern));
             })
-            .Select(path => Path.GetRelativePath(root, path).Replace('\\', '/'))
+            .Select(path => Path.GetRelativePath(srcRoot, path).Replace('\\', '/'))
             .OrderBy(path => path, StringComparer.Ordinal)
             .ToArray();
 
         Assert.Equal(
             new[]
             {
-                "Analysis/ConstraintExpressionFrontend.cs",
-                "Sql/SqlLexer.cs",
-                "Sql/SqlParseException.cs",
-                "Sql/SqlParser.cs",
+                "DeltaSharp.Core/Analysis/ConstraintExpressionFrontend.cs",
+                "DeltaSharp.Core/Sql/SqlLexer.cs",
+                "DeltaSharp.Core/Sql/SqlParseException.cs",
+                "DeltaSharp.Core/Sql/SqlParser.cs",
             },
             producers);
 
         foreach (string producer in producers)
         {
-            string code = File.ReadAllText(Path.Combine(root, producer));
+            string code = File.ReadAllText(Path.Combine(srcRoot, producer));
             Assert.DoesNotMatch(
                 new Regex(
                     @"using\s+\w+\s*=\s*[\w.]*SqlParseException\s*;"),
@@ -699,21 +758,31 @@ public sealed class SqlParserDiagnosticHygieneTests
     [Fact]
     public void SqlParseExceptionFactorySet_IsClosed()
     {
+        // Discover every producer DECLARED on SqlParseException that hands back a SqlParseException —
+        // OR a base type it is assignable to (SystemException/Exception), the ThrowHelper idiom —
+        // across every visibility and both static and instance. Keying on the exact return type (R12)
+        // let an `internal static Exception Detail(...)` escape the set; a base-typed return + Instance
+        // now cannot hide a producer.
         string[] factories = typeof(SqlParseException)
-            .GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
-            .Where(method => method.ReturnType == typeof(SqlParseException))
+            .GetMethods(
+                BindingFlags.Public | BindingFlags.NonPublic
+                | BindingFlags.Static | BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .Where(method =>
+                method.ReturnType.IsAssignableFrom(typeof(SqlParseException))
+                && typeof(Exception).IsAssignableFrom(method.ReturnType))
             .Select(method => method.Name)
             .OrderBy(name => name, StringComparer.Ordinal)
             .ToArray();
 
-        // The factory set is closed across EVERY visibility: a public/internal/private static
-        // producer that returns a SqlParseException must appear in AuditedFactoryInvocations, so it
-        // cannot slip past a NonPublic-only reflection (the R11 hole) nor escape the source audits
-        // that key off these patterns.
-        string[] audited = AuditedFactoryInvocations.Keys
-            .OrderBy(name => name, StringComparer.Ordinal)
-            .ToArray();
-        Assert.Equal(audited, factories);
+        // Pin the closed set to the LITERAL factory names, NOT to AuditedFactoryInvocations.Keys — so a
+        // new factory cannot be waved through by a one-line table edit (Round-12 finding). The table is
+        // then reconciled against the SAME literal pin, so the producer inventory's recognizer stays
+        // complete while neither the reflected set nor the table can be silenced independently.
+        string[] pinned = ["Syntax", "Unsupported"];
+        Assert.Equal(pinned, factories);
+        Assert.Equal(
+            pinned,
+            AuditedFactoryInvocations.Keys.OrderBy(name => name, StringComparer.Ordinal).ToArray());
 
         // Each audited factory's invocation pattern must target that exact factory name (and only
         // it), so the pattern the source audits run cannot drift onto a sibling or a renamed factory.
@@ -722,6 +791,27 @@ public sealed class SqlParserDiagnosticHygieneTests
             Assert.Matches(pattern, $"SqlParseException.{name}(");
             Assert.DoesNotMatch(pattern, $"SqlParseException.{name}Extra(");
         }
+    }
+
+    [Fact]
+    public void UnsupportedFallback_ForUnregisteredConstruct_RendersFixedProse_NotVerbatim()
+    {
+        // The Unsupported factory FAILS CLOSED: an unregistered construct token renders fixed generic
+        // prose, never the raw token, so no future or mis-wired producer (any Map arm shape, direct
+        // call site, …) can leak an unregistered construct verbatim through the message. This is the
+        // Round-12 keystone that makes the corpus/case-label reconciliation defense-in-depth rather
+        // than the sole control. The stable token is still preserved on Construct for programmatic use.
+        const string Unregistered = "ZZ_UNREGISTERED_SECRET_CONSTRUCT";
+        MethodInfo unsupported = typeof(SqlParseException).GetMethod(
+            "Unsupported",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        var ex = (SqlParseException)unsupported.Invoke(null, [Unregistered, 7])!;
+
+        Assert.DoesNotContain(Unregistered, ex.Message, StringComparison.Ordinal);
+        Assert.Contains("an unsupported SQL construct", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(Unregistered, ex.Construct);
+        AssertHygienic(ex.Message);
     }
 
     [Fact]
@@ -893,6 +983,41 @@ public sealed class SqlParserDiagnosticHygieneTests
         }
 
         throw new InvalidOperationException($"Unbalanced invocation at source offset {openParen}.");
+    }
+
+    private static ISet<string> ConstructInfoKeys()
+    {
+        var constructInfo = Assert.IsAssignableFrom<IDictionary>(
+            typeof(SqlParseException)
+                .GetField("ConstructInfo", BindingFlags.NonPublic | BindingFlags.Static)!
+                .GetValue(null));
+        return constructInfo.Keys
+            .Cast<object>()
+            .Select(key => (string)key)
+            .ToHashSet(StringComparer.Ordinal);
+    }
+
+    private static string MapMethodBody(string source, string mapName) =>
+        MethodBody(source, $"string? {mapName}(");
+
+    private static void AssertConstructIsRegistered(
+        string value, string mapName, ISet<string> registered)
+    {
+        if (value == "null")
+        {
+            return;
+        }
+
+        // A Map* helper can only return null or a quoted stable token; that token must be a
+        // registered ConstructInfo key, or SqlParseException.Unsupported would render generic
+        // fallback prose instead of the construct's intended message. Auditing the OUTPUT literals
+        // (independent of arm/label SHAPE) closes the when-guard / constant-pattern / early-return
+        // escapes the input-side reconciliation cannot see (Round-12 finding).
+        string construct = value.Trim('"');
+        Assert.True(
+            registered.Contains(construct),
+            $"{mapName} can return construct '{construct}', which is not a registered ConstructInfo "
+                + "key; register it (or the Unsupported fallback renders generic prose for it).");
     }
 
     private static string MethodBody(string source, string marker)

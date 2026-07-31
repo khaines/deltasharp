@@ -137,14 +137,20 @@ public sealed class SqlParseException : Exception
     /// a compile-time constant from its own keyword maps (<c>JOIN</c>, <c>GROUP_BY</c>,
     /// <c>FUNCTION_CALL</c>, …) — never
     /// source text — so no attacker-chosen token can reach this message, and the longest message this factory
-    /// can compose is comfortably inside <see cref="MaxMessageLength"/> (#687).</remarks>
+    /// can compose is comfortably inside <see cref="MaxMessageLength"/> (#687).
+    /// <para>The lookup also <b>fails closed</b>: an <paramref name="construct"/> that is not a registered
+    /// <see cref="ConstructInfo"/> key renders fixed generic prose rather than echoing the raw token into the
+    /// message. The stable token is still preserved verbatim on <see cref="Construct"/> (a programmatic key,
+    /// not human-facing text), so this is behaviour-neutral for every construct the parser emits today while
+    /// structurally guaranteeing that no future or mis-wired producer can leak an unregistered token verbatim
+    /// via this path (#687).</para></remarks>
     /// <param name="construct">The unsupported construct's stable token (for example <c>JOIN</c>).</param>
     /// <param name="position">The 1-based position of the construct in the source SQL.</param>
     internal static SqlParseException Unsupported(string construct, int position)
     {
         (string description, string? hint) = ConstructInfo.TryGetValue(construct, out (string, string?) info)
             ? info
-            : (construct, null);
+            : ("an unsupported SQL construct", null);
 
         string message =
             $"Unsupported SQL feature at position {position}: {description} is not supported by the M1 "
