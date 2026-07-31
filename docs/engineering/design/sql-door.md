@@ -256,12 +256,13 @@ renders fixed generic prose (`an unsupported SQL construct`) instead of echoing 
 stable `Construct` token is itself length-bounded and control-char sanitized on assignment — so no
 future or mis-wired producer can leak an unregistered construct verbatim through the message or the
 property. Second, the public message-taking `SqlParseException` constructors are **banned in Core via
-`BannedSymbols.txt` (RS0030)**, so every diagnostic must be built through the audited `Syntax`/
-`Unsupported` factories (which use the private constructor); the handful of fixed-prose depth-limit
-diagnostics that legitimately use a public constructor carry a scoped `#pragma warning disable RS0030`
-documenting that their message is a compile-time constant. A raw-lexeme producer written with any
-construction syntax — including the target-typed `new(...)` idiom — is therefore a **compile error**,
-not merely a test failure.
+`BannedSymbols.txt` (RS0030)** with **no pragma exemption anywhere**: every diagnostic is built through
+one of exactly four audited factories (`Syntax`, `Unsupported`, `NestingTooDeep`,
+`ConstraintNestingTooDeep`) on the private constructor. The two depth factories take no source text
+(an internal exception and a compile-time constant), so the fixed-prose depth diagnostics carry no
+lexeme. A raw-lexeme producer written with **any** construction syntax — including the target-typed
+`new(...)` idiom — is therefore a **compile error**, and a test pins the RS0030 suppression count in the
+audited producers to zero so the escape hatch cannot be re-introduced.
 
 | Rejected input                         | `ErrorKind`         | `Construct` (stable token)                  | Detected at                    |
 | -------------------------------------- | ------------------- | ------------------------------------------- | ------------------------------ |

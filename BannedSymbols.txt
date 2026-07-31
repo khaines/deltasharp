@@ -51,8 +51,9 @@ T:System.Security.Cryptography.HMACSHA1;[security] HMAC-SHA1 builds a MAC on the
 
 // === SQL diagnostic hygiene: force all Core SqlParseException construction through the audited
 // factories so no raw lexeme can reach a message via the public message-taking constructors (#687).
-// Syntax/Unsupported build through the private 3-arg ctor (not banned). The handful of fixed-prose
-// depth-limit diagnostics that legitimately use these ctors carry a scoped "#pragma warning disable
-// RS0030" documenting that their message is a compile-time constant. See sql-door.md. ===
+// Syntax/Unsupported/NestingTooDeep/ConstraintNestingTooDeep build through the private 4-arg ctor
+// (not banned); those four are the ONLY construction sites, so the ban stands with NO pragma
+// exemption anywhere in Core — a raw-lexeme producer written with any construction syntax
+// (including target-typed new(...)) is a compile error. See sql-door.md. ===
 M:DeltaSharp.SqlParseException.#ctor(System.String);[security] SqlParseException(string) can interpolate a raw lexeme into a diagnostic message, bypassing SqlParser.Describe kind-rendering and the EchoedTokenMaxLength cap (#687). Build diagnostics through SqlParseException.Syntax/Unsupported; a fixed-prose exception needs a scoped "#pragma warning disable RS0030" documenting the message is a compile-time constant.
 M:DeltaSharp.SqlParseException.#ctor(System.String,System.Exception);[security] SqlParseException(string, Exception) can interpolate a raw lexeme into a diagnostic message, bypassing SqlParser.Describe kind-rendering and the EchoedTokenMaxLength cap (#687). Build diagnostics through SqlParseException.Syntax/Unsupported; a fixed-prose exception needs a scoped "#pragma warning disable RS0030" documenting the message is a compile-time constant.

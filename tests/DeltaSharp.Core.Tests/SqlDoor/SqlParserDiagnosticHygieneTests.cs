@@ -33,6 +33,12 @@ public sealed class SqlParserDiagnosticHygieneTests
     private const string UnsupportedInvocationPattern =
         @"SqlParseException\s*\.\s*Unsupported\s*\(";
 
+    private const string NestingTooDeepInvocationPattern =
+        @"SqlParseException\s*\.\s*NestingTooDeep\s*\(";
+
+    private const string ConstraintNestingTooDeepInvocationPattern =
+        @"SqlParseException\s*\.\s*ConstraintNestingTooDeep\s*\(";
+
     private const string ConstructorInvocationPattern =
         @"new\s+SqlParseException\s*\(";
 
@@ -49,16 +55,31 @@ public sealed class SqlParserDiagnosticHygieneTests
     /// invocation pattern the audits key off, and the producer inventory's recognizer.
     /// <see cref="SqlParseExceptionFactorySet_IsClosed"/> pins BOTH the reflected producer set (across
     /// every visibility, static and instance, and any SqlParseException-or-base return type) AND these
-    /// keys to the same literal <c>{Syntax, Unsupported}</c> — so a new factory can be silenced neither
-    /// by a one-line table edit nor by a base-typed return, and its call-site pattern must be
-    /// registered here for the producer inventory to recognize it.
+    /// keys to the same literal four-name set — so a new factory can be silenced neither by a one-line
+    /// table edit nor by a base-typed return, and its call-site pattern must be registered here for the
+    /// producer inventory to recognize it. The two depth factories take no source text, so they exist
+    /// solely to keep the fixed-prose depth diagnostics off the banned public message constructors.
     /// </summary>
     private static readonly IReadOnlyDictionary<string, string> AuditedFactoryInvocations =
         new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["Syntax"] = SyntaxInvocationPattern,
             ["Unsupported"] = UnsupportedInvocationPattern,
+            ["NestingTooDeep"] = NestingTooDeepInvocationPattern,
+            ["ConstraintNestingTooDeep"] = ConstraintNestingTooDeepInvocationPattern,
         };
+
+    /// <summary>
+    /// The audited Core producer files (repo-<c>src/</c>-relative), shared by the producer inventory,
+    /// the block-comment ban, and the RS0030-suppression pin so those guards cannot drift out of step.
+    /// </summary>
+    private static readonly string[] AuditedProducers =
+    [
+        "DeltaSharp.Core/Analysis/ConstraintExpressionFrontend.cs",
+        "DeltaSharp.Core/Sql/SqlLexer.cs",
+        "DeltaSharp.Core/Sql/SqlParseException.cs",
+        "DeltaSharp.Core/Sql/SqlParser.cs",
+    ];
 
     /// <summary>The red-team's exact payload: a quoted token carrying a raw CR and LF.</summary>
     private const string CrLfPayload = "TRAIL\r\nFORGED";
@@ -657,33 +678,17 @@ public sealed class SqlParserDiagnosticHygieneTests
     }
 
     [Fact]
-    public void EveryPublicConstructorMessage_IsFixedProse()
+    public void Producers_ComposeNoMessageAtAConstructionSite()
     {
+        // The public message-taking constructors are banned (RS0030) with NO pragma exemption, so the
+        // parser and constraint frontend must build every diagnostic through the audited factories
+        // (Syntax / Unsupported / NestingTooDeep / ConstraintNestingTooDeep). This is the source-level
+        // belt to the compiler ban: not a single `new SqlParseException(...)` remains at a producer
+        // call site, so no message — and therefore no lexeme — can be composed at construction.
+        // The two depth factories that replaced the former public-ctor sites take NO source text
+        // (an Exception and a compile-time int), so their fixed-prose messages cannot carry a lexeme.
         string code = SqlParserCode() + "\n" + ConstraintExpressionFrontendCode();
-        string[] calls = InvocationArguments(code, ConstructorInvocationPattern).ToArray();
-        Assert.NotEmpty(calls);
-
-        var fixedLiteralChain = new Regex(
-            @"^""(?:[^""\\]|\\.)*""(?:\s*\+\s*""(?:[^""\\]|\\.)*"")*\s*(?:,|$)",
-            RegexOptions.Singleline);
-        foreach (string call in calls)
-        {
-            string message = FirstArgument(call);
-            MatchCollection holes = Regex.Matches(message, @"\{(?<expression>[^{}]+)\}");
-            Assert.All(
-                holes,
-                hole => Assert.Equal(
-                    "MaxConstraintExpressionDepth",
-                    hole.Groups["expression"].Value.Trim()));
-
-            string normalized = message
-                .Replace(
-                    "{MaxConstraintExpressionDepth}",
-                    "MAX_DEPTH",
-                    StringComparison.Ordinal)
-                .Replace("$\"", "\"", StringComparison.Ordinal);
-            Assert.Matches(fixedLiteralChain, normalized.TrimStart());
-        }
+        Assert.Empty(InvocationArguments(code, ConstructorInvocationPattern));
     }
 
     [Fact]
@@ -740,15 +745,7 @@ public sealed class SqlParserDiagnosticHygieneTests
             .OrderBy(path => path, StringComparer.Ordinal)
             .ToArray();
 
-        Assert.Equal(
-            new[]
-            {
-                "DeltaSharp.Core/Analysis/ConstraintExpressionFrontend.cs",
-                "DeltaSharp.Core/Sql/SqlLexer.cs",
-                "DeltaSharp.Core/Sql/SqlParseException.cs",
-                "DeltaSharp.Core/Sql/SqlParser.cs",
-            },
-            producers);
+        Assert.Equal(AuditedProducers, producers);
 
         foreach (string producer in producers)
         {
@@ -776,19 +773,75 @@ public sealed class SqlParserDiagnosticHygieneTests
         // literal, so stripping `//` to end-of-line cannot hide a real `/*`.)
         string srcRoot = Path.GetFullPath(
             Path.Combine(Path.GetDirectoryName(SqlParserSourcePath())!, "..", ".."));
-        foreach (string producer in new[]
-        {
-            "DeltaSharp.Core/Analysis/ConstraintExpressionFrontend.cs",
-            "DeltaSharp.Core/Sql/SqlLexer.cs",
-            "DeltaSharp.Core/Sql/SqlParseException.cs",
-            "DeltaSharp.Core/Sql/SqlParser.cs",
-        })
+        foreach (string producer in AuditedProducers)
         {
             string source = File.ReadAllText(
                 Path.Combine(srcRoot, producer.Replace('/', Path.DirectorySeparatorChar)));
             string withoutLineComments = Regex.Replace(source, @"//[^\n]*", string.Empty);
             Assert.DoesNotMatch(new Regex(@"/\*"), withoutLineComments);
         }
+    }
+
+    [Fact]
+    public void Rs0030Suppressions_AreAbsentFromAuditedProducers()
+    {
+        // The compiler ban on the public message constructors has exactly ONE sanctioned escape:
+        // `#pragma warning disable RS0030`. Round-14 introduced five such suppressions; Round-15
+        // removed them by routing the fixed-prose depth diagnostics through audited factories. Pin the
+        // count to ZERO so the escape hatch cannot be re-introduced into an audited producer, where a
+        // pragma plus a target-typed `new(...)` would otherwise defeat both the compiler ban and the
+        // construction-syntax source guards at once (Round-14 finding).
+        string srcRoot = Path.GetFullPath(
+            Path.Combine(Path.GetDirectoryName(SqlParserSourcePath())!, "..", ".."));
+        foreach (string producer in AuditedProducers)
+        {
+            string source = File.ReadAllText(
+                Path.Combine(srcRoot, producer.Replace('/', Path.DirectorySeparatorChar)));
+            Assert.Empty(Regex.Matches(source, @"#pragma\s+warning\s+disable\s+[^\r\n]*\bRS0030\b")
+                .Cast<Match>());
+        }
+    }
+
+    [Fact]
+    public void DepthFactoryCallSites_PassOnlyACaughtVariable()
+    {
+        // NestingTooDeep chains a caller-supplied inner exception, which ex.ToString() renders (the
+        // observable a structured-log sink emits, not audited by AssertHygienic). Require every call
+        // site to pass a BARE caught-variable identifier, never a construction expression — so a
+        // future author cannot chain `new InvalidOperationException($"…{lexeme}", ex)` and leak a
+        // lexeme through ToString() (Round-14 finding). ConstraintNestingTooDeep takes only an int.
+        string code = SqlParserCode() + "\n" + ConstraintExpressionFrontendCode();
+        string[] nestingCalls = InvocationArguments(code, NestingTooDeepInvocationPattern).ToArray();
+        Assert.NotEmpty(nestingCalls);
+        Assert.All(
+            nestingCalls,
+            arguments => Assert.Matches(new Regex(@"^[A-Za-z_]\w*$"), arguments.Trim()));
+
+        string[] constraintCalls =
+            InvocationArguments(code, ConstraintNestingTooDeepInvocationPattern).ToArray();
+        Assert.All(
+            constraintCalls,
+            arguments => Assert.Matches(new Regex(@"^[A-Za-z_]\w*$"), arguments.Trim()));
+    }
+
+    [Fact]
+    public void GlyphBindings_AreClosed_AcrossEveryAuditedProducer()
+    {
+        // IsSafeSyntaxMessage blesses a `{glyph}` interpolation hole by identifier NAME, on the
+        // premise that `glyph` is bound to exactly one source character. LexerGlyphBinding pins that
+        // premise in the lexer only; a `Syntax($"… '{glyph}'")` in the parser with a `glyph` parameter
+        // bound to a full token bypasses it. Pin every `glyph` binding across all audited producers to
+        // the single approved source-character binding (or a parameter), so the name cannot be reused
+        // for attacker-controlled text (Round-14 finding).
+        string code = SqlParserCode() + "\n" + SqlLexerCode() + "\n" + ConstraintExpressionFrontendCode();
+        string[] bindings = Regex.Matches(code, @"\bstring\s+glyph\s*(?<tail>=[^;]+;|[,)])")
+            .Cast<Match>()
+            .Select(match => match.Groups["tail"].Value.Trim())
+            .OrderBy(tail => tail, StringComparer.Ordinal)
+            .ToArray();
+        Assert.Equal(
+            new[] { ")", "= c.ToString(CultureInfo.InvariantCulture);" },
+            bindings);
     }
 
     [Fact]
@@ -814,7 +867,7 @@ public sealed class SqlParserDiagnosticHygieneTests
         // new factory cannot be waved through by a one-line table edit (Round-12 finding). The table is
         // then reconciled against the SAME literal pin, so the producer inventory's recognizer stays
         // complete while neither the reflected set nor the table can be silenced independently.
-        string[] pinned = ["Syntax", "Unsupported"];
+        string[] pinned = ["ConstraintNestingTooDeep", "NestingTooDeep", "Syntax", "Unsupported"];
         Assert.Equal(pinned, factories);
         Assert.Equal(
             pinned,
@@ -851,22 +904,27 @@ public sealed class SqlParserDiagnosticHygieneTests
     }
 
     [Fact]
-    public void UnsupportedConstruct_IsLengthBounded_OnAssignment()
+    public void UnsupportedConstruct_IsLengthBoundedAndSanitized_OnAssignment()
     {
-        // Construct is bounded/sanitized on assignment (MaxConstructLength) so it cannot become an
-        // unbounded raw-token sink even if a future or mis-wired producer ever hands Unsupported an
-        // oversized value — the last place a raw token could otherwise survive after the keystone.
+        // Construct is length-bounded AND control-char sanitized on assignment (MaxConstructLength via
+        // DiagnosticText.Sanitize) so it cannot become an unbounded, injection-carrying raw-token sink
+        // even if a future or mis-wired producer ever hands Unsupported an oversized/hostile value —
+        // the last place a raw token could otherwise survive after the keystone. The doc claims BOTH
+        // properties, so audit BOTH (Round-14 finding: the length half was tested, the sanitize half
+        // was not).
         MethodInfo unsupported = typeof(SqlParseException).GetMethod(
             "Unsupported",
             BindingFlags.NonPublic | BindingFlags.Static)!;
 
-        var ex = (SqlParseException)unsupported.Invoke(null, [new string('z', 300), 1])!;
-
-        Assert.NotNull(ex.Construct);
+        var bounded = (SqlParseException)unsupported.Invoke(null, [new string('z', 300), 1])!;
+        Assert.NotNull(bounded.Construct);
         Assert.True(
-            ex.Construct!.Length <= 129,
-            $"Construct was {ex.Construct.Length} chars; expected it bounded to MaxConstructLength "
+            bounded.Construct!.Length <= 129,
+            $"Construct was {bounded.Construct.Length} chars; expected it bounded to MaxConstructLength "
                 + "(128) plus at most a one-character truncation ellipsis.");
+
+        var hostile = (SqlParseException)unsupported.Invoke(null, ["TRAIL\r\nFORGED\u202Ehostile", 1])!;
+        AssertHygienic(hostile.Construct!);
     }
 
     [Fact]

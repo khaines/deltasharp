@@ -88,10 +88,7 @@ internal sealed class SqlParser
             // Belt-and-suspenders: the recursion-depth guard below should fire first, but if an
             // over-deep tree ever reaches node construction, translate the INTERNAL plan-depth
             // exception into the public, catchable SqlParseException the door promises (AC2).
-#pragma warning disable RS0030 // #687: fixed-prose depth diagnostic (compile-time constant, no lexeme); the 2-arg ctor chains the internal depth exception.
-            throw new SqlParseException(
-                "Syntax error: expression nesting too deep to parse.", ex);
-#pragma warning restore RS0030
+            throw SqlParseException.NestingTooDeep(ex);
         }
         catch (InsufficientExecutionStackException ex)
         {
@@ -100,10 +97,7 @@ internal sealed class SqlParser
             // ladder but builds no node). RuntimeHelpers.EnsureSufficientExecutionStack() fires while
             // there is still headroom, so this is a deterministic, catchable failure — never an
             // uncatchable StackOverflowException that would crash the whole driver process.
-#pragma warning disable RS0030 // #687: fixed-prose depth diagnostic (compile-time constant, no lexeme); the 2-arg ctor chains the internal depth exception.
-            throw new SqlParseException(
-                "Syntax error: expression nesting too deep to parse.", ex);
-#pragma warning restore RS0030
+            throw SqlParseException.NestingTooDeep(ex);
         }
     }
 
@@ -139,9 +133,7 @@ internal sealed class SqlParser
         }
         catch (PlanDepthExceededException ex)
         {
-#pragma warning disable RS0030 // #687: fixed-prose depth diagnostic (compile-time constant, no lexeme); the 2-arg ctor chains the internal depth exception.
-            throw new SqlParseException("Syntax error: expression nesting too deep to parse.", ex);
-#pragma warning restore RS0030
+            throw SqlParseException.NestingTooDeep(ex);
         }
         catch (InsufficientExecutionStackException ex)
         {
@@ -150,9 +142,7 @@ internal sealed class SqlParser
             // but building no node — trips RuntimeHelpers.EnsureSufficientExecutionStack() while there is still
             // headroom, so it surfaces as a deterministic, catchable SqlParseException, never an uncatchable
             // StackOverflowException that would crash the driver process on a hostile constraint string.
-#pragma warning disable RS0030 // #687: fixed-prose depth diagnostic (compile-time constant, no lexeme); the 2-arg ctor chains the internal depth exception.
-            throw new SqlParseException("Syntax error: expression nesting too deep to parse.", ex);
-#pragma warning restore RS0030
+            throw SqlParseException.NestingTooDeep(ex);
         }
     }
 

@@ -112,11 +112,7 @@ internal static class ConstraintExpressionFrontend
 
             if (depth > MaxConstraintExpressionDepth)
             {
-#pragma warning disable RS0030 // #687: fixed-prose depth diagnostic; the only interpolation is the compile-time constant MaxConstraintExpressionDepth, no lexeme.
-                throw new SqlParseException(
-                    $"Constraint expression nests deeper than {MaxConstraintExpressionDepth} levels; a CHECK "
-                    + "constraint must be a shallow predicate over the table's columns.");
-#pragma warning restore RS0030
+                throw SqlParseException.ConstraintNestingTooDeep(MaxConstraintExpressionDepth);
             }
 
             foreach (Expression child in node.Children)

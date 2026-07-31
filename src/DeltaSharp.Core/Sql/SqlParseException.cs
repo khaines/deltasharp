@@ -49,8 +49,9 @@ public sealed class SqlParseException : Exception
     {
     }
 
-    private SqlParseException(string message, SqlParseErrorKind kind, string? construct)
-        : base(Bounded(message))
+    private SqlParseException(
+        string message, SqlParseErrorKind kind, string? construct, Exception? innerException = null)
+        : base(Bounded(message), innerException)
     {
         ErrorKind = kind;
         Construct = construct is null ? null : DiagnosticText.Sanitize(construct, MaxConstructLength);
@@ -136,6 +137,30 @@ public sealed class SqlParseException : Exception
     /// <param name="position">The 1-based position of the offending token in the source SQL.</param>
     internal static SqlParseException Syntax(string detail, int position) =>
         new($"Syntax error at position {position}: {detail}", SqlParseErrorKind.SyntaxError, null);
+
+    /// <summary>Builds the fixed-prose "expression nesting too deep" diagnostic, chaining the internal
+    /// depth exception so a caller catching <see cref="SqlParseException"/> never sees the raw
+    /// <c>PlanDepthExceededException</c>/<c>InsufficientExecutionStackException</c>. The message is a
+    /// compile-time constant with no lexeme — this factory takes no source text — so it exists to keep
+    /// depth diagnostics off the banned public message constructors (#687).</summary>
+    /// <param name="innerException">The internal depth/stack exception to chain.</param>
+    internal static SqlParseException NestingTooDeep(Exception innerException) =>
+        new(
+            "Syntax error: expression nesting too deep to parse.",
+            SqlParseErrorKind.SyntaxError,
+            null,
+            innerException);
+
+    /// <summary>Builds the fixed-prose CHECK-constraint depth diagnostic. The only interpolation is the
+    /// caller-supplied compile-time constant <paramref name="maxDepth"/>; this factory takes no source
+    /// text, so it keeps the constraint depth diagnostic off the banned public constructors (#687).</summary>
+    /// <param name="maxDepth">The compile-time maximum constraint nesting depth.</param>
+    internal static SqlParseException ConstraintNestingTooDeep(int maxDepth) =>
+        new(
+            $"Constraint expression nests deeper than {maxDepth} levels; a CHECK constraint must be a "
+                + "shallow predicate over the table's columns.",
+            SqlParseErrorKind.SyntaxError,
+            null);
 
     /// <summary>Builds a deterministic <see cref="SqlParseErrorKind.UnsupportedFeature"/> whose
     /// <see cref="Construct"/> is the stable <paramref name="construct"/> token and whose message
