@@ -301,11 +301,23 @@ public sealed class SqlParserDiagnosticHygieneTests
                 body,
                 @"\breturn\s+(?<value>[^;]+);");
             Assert.All(
-                earlyReturns.Cast<Match>().Where(
-                    statement => !statement.Groups["value"].Value.Contains(" switch", StringComparison.Ordinal)),
-                statement => Assert.Matches(
-                    stableToken,
-                    statement.Groups["value"].Value.Trim()));
+                earlyReturns,
+                statement =>
+                {
+                    string value = statement.Groups["value"].Value.Trim();
+                    int switchAt = value.IndexOf(" switch", StringComparison.Ordinal);
+                    if (switchAt >= 0)
+                    {
+                        Assert.Matches(
+                            new Regex(
+                                @"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*(?:\(\))?$"),
+                            value[..switchAt].Trim());
+                    }
+                    else
+                    {
+                        Assert.Matches(stableToken, value);
+                    }
+                });
         }
     }
 
