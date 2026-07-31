@@ -127,6 +127,7 @@ public sealed class HostileConstraintDiagnosticHygieneTests : IDisposable
         Exception ex = Assert.ThrowsAny<Exception>(() => Append(table, Amounts(1)));
 
         AssertChainIsHygienic(ex);
+        Assert.Contains("unexpected trailing input", ex.Message, StringComparison.Ordinal);
         Assert.Contains("FORGED", ex.Message, StringComparison.Ordinal);
         Assert.False(File.Exists(CommitFile(table, 2)));
     }
@@ -143,6 +144,7 @@ public sealed class HostileConstraintDiagnosticHygieneTests : IDisposable
         Exception ex = Assert.ThrowsAny<Exception>(() => Append(table, Amounts(1)));
 
         AssertChainIsHygienic(ex);
+        Assert.Contains("unexpected trailing input", ex.Message, StringComparison.Ordinal);
         Assert.Contains("FORGED", ex.Message, StringComparison.Ordinal);
         Assert.DoesNotContain(ex.Message.EnumerateRunes(), r => r.Value is >= 0xE0020 and <= 0xE007F);
         Assert.False(File.Exists(CommitFile(table, 2)));
@@ -161,6 +163,7 @@ public sealed class HostileConstraintDiagnosticHygieneTests : IDisposable
         Exception ex = Assert.ThrowsAny<Exception>(() => Append(table, Amounts(1)));
 
         AssertChainIsHygienic(ex);
+        Assert.Contains("unexpected trailing input", ex.Message, StringComparison.Ordinal);
         Assert.Contains("TRAIL\uFFFD\uFFFDFORGED", ex.Message, StringComparison.Ordinal);
         Assert.False(File.Exists(CommitFile(table, 2)));
     }
