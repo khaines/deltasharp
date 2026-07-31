@@ -625,7 +625,15 @@ internal sealed class SqlParser
 
         if (token.Kind == SqlTokenKind.DecimalLiteral)
         {
-            double value = double.Parse(token.Text, CultureInfo.InvariantCulture);
+            // The lexer admits any Unicode Nd digit (char.IsDigit), but double.Parse accepts only
+            // ASCII digits — so a non-ASCII or otherwise unrepresentable decimal literal must surface
+            // as a bounded, sanitized SqlParseException, never a raw FormatException/OverflowException
+            // echoing the attacker lexeme verbatim and unbounded out of the door (#687, AC2).
+            if (!double.TryParse(token.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double value))
+            {
+                throw SqlParseException.Unsupported("DECIMAL_LITERAL", token.Position);
+            }
+
             return Literal.OfDouble(negative ? -value : value);
         }
 

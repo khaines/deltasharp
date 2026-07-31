@@ -783,20 +783,30 @@ public sealed class SqlParserDiagnosticHygieneTests
     }
 
     [Fact]
-    public void Rs0030Suppressions_AreAbsentFromAuditedProducers()
+    public void Rs0030Suppressions_AreAbsentFromEverySqlParseExceptionMentioner()
     {
         // The compiler ban on the public message constructors has exactly ONE sanctioned escape:
-        // `#pragma warning disable RS0030`. Round-14 introduced five such suppressions; Round-15
-        // removed them by routing the fixed-prose depth diagnostics through audited factories. Pin the
-        // count to ZERO so the escape hatch cannot be re-introduced into an audited producer, where a
-        // pragma plus a target-typed `new(...)` would otherwise defeat both the compiler ban and the
-        // construction-syntax source guards at once (Round-14 finding).
+        // `#pragma warning disable RS0030`. Round-15 removed every such suppression by routing the
+        // fixed-prose depth diagnostics through audited factories. Pin the count to ZERO across EVERY
+        // Core file that so much as mentions SqlParseException — not just the four producer files — so
+        // the hatch cannot be re-introduced next door (e.g. SparkSession.cs), where a pragma plus a
+        // target-typed `new(...)` would otherwise defeat both the compiler ban and the source guards
+        // at once (Round-14/15 finding). Files that do NOT mention SqlParseException keep their
+        // legitimate RS0030 suppressions (Expression.Compile / ADR-0001) untouched.
         string srcRoot = Path.GetFullPath(
             Path.Combine(Path.GetDirectoryName(SqlParserSourcePath())!, "..", ".."));
-        foreach (string producer in AuditedProducers)
+        foreach (string path in Directory
+            .EnumerateFiles(srcRoot, "*.cs", SearchOption.AllDirectories)
+            .Where(path =>
+                !path.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}", StringComparison.Ordinal)
+                && !path.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}", StringComparison.Ordinal)))
         {
-            string source = File.ReadAllText(
-                Path.Combine(srcRoot, producer.Replace('/', Path.DirectorySeparatorChar)));
+            string source = File.ReadAllText(path);
+            if (!Regex.IsMatch(source, @"\bSqlParseException\b"))
+            {
+                continue;
+            }
+
             Assert.Empty(Regex.Matches(source, @"#pragma\s+warning\s+disable\s+[^\r\n]*\bRS0030\b")
                 .Cast<Match>());
         }
@@ -834,7 +844,7 @@ public sealed class SqlParserDiagnosticHygieneTests
         // the single approved source-character binding (or a parameter), so the name cannot be reused
         // for attacker-controlled text (Round-14 finding).
         string code = SqlParserCode() + "\n" + SqlLexerCode() + "\n" + ConstraintExpressionFrontendCode();
-        string[] bindings = Regex.Matches(code, @"\bstring\s+glyph\s*(?<tail>=[^;]+;|[,)])")
+        string[] bindings = Regex.Matches(code, @"\b(?:var|[A-Za-z_][\w.]*)\s+glyph\s*(?<tail>=[^;]+;|[,)])")
             .Cast<Match>()
             .Select(match => match.Groups["tail"].Value.Trim())
             .OrderBy(tail => tail, StringComparer.Ordinal)
@@ -842,6 +852,93 @@ public sealed class SqlParserDiagnosticHygieneTests
         Assert.Equal(
             new[] { ")", "= c.ToString(CultureInfo.InvariantCulture);" },
             bindings);
+    }
+
+    [Fact]
+    public void SqlDoor_ThrowsOnlySqlParseException_ForHostileInput()
+    {
+        // THE type-axis PROPERTY guard. Every other control keys on the type name SqlParseException —
+        // a proxy for "no lexeme escapes the SQL door". This asserts the property directly: for a
+        // corpus of hostile inputs, every exception that escapes SqlParser.Parse /
+        // ParseConstraintExpression MUST be a SqlParseException with a hygienic message and a hygienic
+        // (fixed-prose, lexeme-free) inner. It catches leaks the source-shape audits cannot — an
+        // IMPLICIT throw such as an unguarded double.Parse on a non-ASCII decimal digit surfaces as a
+        // raw FormatException here (Round-15 live-leak finding), and a hostile chained inner surfaces
+        // through InnerException.
+        string flood = new string('9', 100_000);
+        string[] hostile =
+        [
+            "a > \u0661.\u0665",                              // Arabic-Indic decimal → double.Parse vector
+            "a > \u0967\u0968.\u0969",                        // Devanagari decimal
+            "a > \u0661e\u0662",                              // non-ASCII exponent
+            $"a > {flood}.{flood}",                           // decimal flood
+            $"a > {flood}",                                   // integer flood
+            "a > 1.5e99999999",                               // overflow exponent
+            "a > '" + new string('x', 100_000) + "'",         // string-literal flood
+            "a > 'TRAIL\r\nFORGED SECRET'",                   // CR/LF + decoded literal
+            "a \u202E > 0",                                   // RTL override
+            "\uD800 a > 0",                                   // lone surrogate
+            "SELECT * FROM t WHERE a > \u0661.\u0665",        // statement door → same decimal vector
+            "SELECT " + new string('z', 100_000) + " FROM t",
+        ];
+
+        foreach (string sql in hostile)
+        {
+            foreach (Action door in new Action[]
+            {
+                () => SqlParser.Parse(sql),
+                () => SqlParser.ParseConstraintExpression(sql),
+            })
+            {
+                Exception? thrown = Record.Exception(door);
+                if (thrown is null)
+                {
+                    continue;
+                }
+
+                Assert.IsType<SqlParseException>(thrown);
+                AssertHygienic(thrown.Message);
+                if (thrown.InnerException is not null)
+                {
+                    AssertHygienic(thrown.InnerException.Message);
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public void AuditedProducerThrows_ComposeNoInterpolatedMessage()
+    {
+        // Complements the behavioral guard on the static axis: EVERY `throw new <Type>(...)` in an
+        // audited producer must carry a fixed-literal message (no `$"…"` hole, no runtime formatting),
+        // regardless of the exception TYPE — so a `throw new InvalidOperationException($"…{lexeme}")`
+        // that never routes through Bounded/Describe is RED (Round-15 finding). SqlParseException's own
+        // construction is separately RS0030-banned. At HEAD the only such throw is the single fixed-
+        // prose InvalidOperationException in ConstraintExpressionFrontend.
+        var interpolationOrFormat = new Regex(
+            @"\$""|string\s*\.\s*(?:Format|Concat|Join)\s*\(",
+            RegexOptions.Singleline);
+        string srcRoot = Path.GetFullPath(
+            Path.Combine(Path.GetDirectoryName(SqlParserSourcePath())!, "..", ".."));
+        foreach (string producer in AuditedProducers)
+        {
+            string source = File.ReadAllText(
+                Path.Combine(srcRoot, producer.Replace('/', Path.DirectorySeparatorChar)));
+            foreach (Match throwNew in Regex.Matches(
+                source,
+                @"throw\s+new\s+(?<type>[A-Za-z_][\w.]*)\s*\("))
+            {
+                if (throwNew.Groups["type"].Value.EndsWith("SqlParseException", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                int openParen = throwNew.Index + throwNew.Length - 1;
+                int closeParen = FindMatchingParenthesis(source, openParen);
+                string arguments = source[(openParen + 1)..closeParen];
+                Assert.DoesNotMatch(interpolationOrFormat, arguments);
+            }
+        }
     }
 
     [Fact]
@@ -860,6 +957,7 @@ public sealed class SqlParserDiagnosticHygieneTests
                 method.ReturnType.IsAssignableFrom(typeof(SqlParseException))
                 && typeof(Exception).IsAssignableFrom(method.ReturnType))
             .Select(method => method.Name)
+            .Distinct(StringComparer.Ordinal)
             .OrderBy(name => name, StringComparer.Ordinal)
             .ToArray();
 

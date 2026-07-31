@@ -264,6 +264,14 @@ lexeme. A raw-lexeme producer written with **any** construction syntax — inclu
 `new(...)` idiom — is therefore a **compile error**, and a test pins the RS0030 suppression count in the
 audited producers to zero so the escape hatch cannot be re-introduced.
 
+Because those controls key on the `SqlParseException` *type*, one further guarantee closes the
+*type* axis: the door promises (AC2) that every rejection surfaces as a `SqlParseException`, never a
+raw `FormatException`/`InvalidOperationException` echoing the lexeme. Numeric literals parse through
+`double.TryParse` (the lexer admits any Unicode `Nd` digit, which `double.Parse` rejects), and a
+behavioral property test fuzzes the door over hostile input asserting that **only** a
+`SqlParseException` — with a hygienic message and a fixed-prose inner — ever escapes, so an implicit
+leak on any exception type is caught where the source-shape audits cannot reach.
+
 | Rejected input                         | `ErrorKind`         | `Construct` (stable token)                  | Detected at                    |
 | -------------------------------------- | ------------------- | ------------------------------------------- | ------------------------------ |
 | `… JOIN …`, `INNER/LEFT/… JOIN`        | `UnsupportedFeature`| `JOIN`                                      | `ExpectEnd` → `MapTrailingConstruct` |

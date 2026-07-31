@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using DeltaSharp.Diagnostics;
+using DeltaSharp.Plans;
 
 namespace DeltaSharp;
 
@@ -140,11 +141,22 @@ public sealed class SqlParseException : Exception
 
     /// <summary>Builds the fixed-prose "expression nesting too deep" diagnostic, chaining the internal
     /// depth exception so a caller catching <see cref="SqlParseException"/> never sees the raw
-    /// <c>PlanDepthExceededException</c>/<c>InsufficientExecutionStackException</c>. The message is a
-    /// compile-time constant with no lexeme — this factory takes no source text — so it exists to keep
-    /// depth diagnostics off the banned public message constructors (#687).</summary>
-    /// <param name="innerException">The internal depth/stack exception to chain.</param>
-    internal static SqlParseException NestingTooDeep(Exception innerException) =>
+    /// <c>PlanDepthExceededException</c>/<c>InsufficientExecutionStackException</c>. Overloaded on the
+    /// two internal depth types (rather than <see cref="Exception"/>) so the chained inner is
+    /// constrained by the COMPILER: an arbitrary <see cref="Exception"/> carrying a lexeme cannot be
+    /// passed, closing the <c>ToString()</c>-leak vector by construction. The message is a compile-time
+    /// constant with no lexeme (#687).</summary>
+    /// <param name="innerException">The internal plan-depth exception to chain.</param>
+    internal static SqlParseException NestingTooDeep(PlanDepthExceededException innerException) =>
+        new(
+            "Syntax error: expression nesting too deep to parse.",
+            SqlParseErrorKind.SyntaxError,
+            null,
+            innerException);
+
+    /// <summary>Depth diagnostic for the physical-stack guard; see the plan-depth overload.</summary>
+    /// <param name="innerException">The internal insufficient-stack exception to chain.</param>
+    internal static SqlParseException NestingTooDeep(InsufficientExecutionStackException innerException) =>
         new(
             "Syntax error: expression nesting too deep to parse.",
             SqlParseErrorKind.SyntaxError,
