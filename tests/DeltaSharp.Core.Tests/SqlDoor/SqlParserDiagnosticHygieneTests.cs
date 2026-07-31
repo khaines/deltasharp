@@ -36,6 +36,20 @@ public sealed class SqlParserDiagnosticHygieneTests
     private const string ConstructorInvocationPattern =
         @"new\s+SqlParseException\s*\(";
 
+    /// <summary>
+    /// The closed set of <see cref="SqlParseException"/> factory methods, each paired with the
+    /// source invocation pattern the audits key off. <see cref="SqlParseExceptionFactorySet_IsClosed"/>
+    /// pins this against reflection across EVERY visibility, and the producer inventory derives its
+    /// recognizer from these patterns — so a new factory cannot be introduced without both tripping
+    /// that guard and registering the pattern its call sites are audited against.
+    /// </summary>
+    private static readonly IReadOnlyDictionary<string, string> AuditedFactoryInvocations =
+        new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["Syntax"] = SyntaxInvocationPattern,
+            ["Unsupported"] = UnsupportedInvocationPattern,
+        };
+
     /// <summary>The red-team's exact payload: a quoted token carrying a raw CR and LF.</summary>
     private const string CrLfPayload = "TRAIL\r\nFORGED";
 
@@ -383,6 +397,47 @@ public sealed class SqlParserDiagnosticHygieneTests
         ];
         var notToken = new SqlToken(SqlTokenKind.Not, "NOT", Position: 1);
 
+        // Reconcile the corpus with the ACTUAL switch case labels: every keyword a Map switches on
+        // must be exercised by the hostile-token loop below. A new arm keyed on a keyword absent
+        // from `texts` fails HERE (fail-closed) rather than silently escaping the registered-construct
+        // check because the loop never feeds that keyword in. This ties the hand-maintained corpus to
+        // the source it is meant to cover instead of trusting it as a proxy.
+        string parserSource = SqlParserCode();
+        var corpus = new HashSet<string>(texts, StringComparer.Ordinal);
+
+        static string[] CaseLabels(string body) => Regex.Matches(
+                body,
+                @"(?<labels>(?:""(?:[^""\\]|\\.)*""\s*(?:or\s+)?)+)=>")
+            .Cast<Match>()
+            .SelectMany(arm => Regex.Matches(
+                    arm.Groups["labels"].Value,
+                    @"""(?<text>(?:[^""\\]|\\.)*)""")
+                .Cast<Match>()
+                .Select(literal => literal.Groups["text"].Value))
+            .ToArray();
+
+        foreach (MethodInfo map in maps)
+        {
+            string[] labels = CaseLabels(MethodBody(parserSource, $"private static string? {map.Name}("));
+            Assert.NotEmpty(labels);
+            Assert.All(
+                labels,
+                label => Assert.True(
+                    corpus.Contains(label),
+                    $"{map.Name} switches on case label '{label}' absent from the hostile-token "
+                        + "corpus; add it to texts[] so the registered-construct loop exercises that arm."));
+        }
+
+        // Anti-vacuity: the extractor must pull representative labels from every Map, including the
+        // trailing member of each `or`-joined arm (DESC, OUTER, MINUS, SORT) — a regex that dropped
+        // or-tails would leave a new unlisted or-tail arm unreconciled.
+        string[] allLabels = maps
+            .SelectMany(map => CaseLabels(MethodBody(parserSource, $"private static string? {map.Name}(")))
+            .ToArray();
+        Assert.All(
+            new[] { "IS", "BETWEEN", "INSERT", "DESC", "JOIN", "OUTER", "MINUS", "SORT" },
+            representative => Assert.Contains(representative, allLabels));
+
         foreach (MethodInfo map in maps)
         {
             foreach (SqlToken token in tokens)
@@ -609,9 +664,9 @@ public sealed class SqlParserDiagnosticHygieneTests
             .Where(path =>
             {
                 string source = File.ReadAllText(path);
-                return Regex.IsMatch(source, SyntaxInvocationPattern)
-                    || Regex.IsMatch(source, UnsupportedInvocationPattern)
-                    || Regex.IsMatch(source, ConstructorInvocationPattern);
+                return AuditedFactoryInvocations.Values
+                    .Append(ConstructorInvocationPattern)
+                    .Any(pattern => Regex.IsMatch(source, pattern));
             })
             .Select(path => Path.GetRelativePath(root, path).Replace('\\', '/'))
             .OrderBy(path => path, StringComparer.Ordinal)
@@ -645,13 +700,28 @@ public sealed class SqlParserDiagnosticHygieneTests
     public void SqlParseExceptionFactorySet_IsClosed()
     {
         string[] factories = typeof(SqlParseException)
-            .GetMethods(BindingFlags.NonPublic | BindingFlags.Static)
+            .GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
             .Where(method => method.ReturnType == typeof(SqlParseException))
             .Select(method => method.Name)
             .OrderBy(name => name, StringComparer.Ordinal)
             .ToArray();
 
-        Assert.Equal(new[] { "Syntax", "Unsupported" }, factories);
+        // The factory set is closed across EVERY visibility: a public/internal/private static
+        // producer that returns a SqlParseException must appear in AuditedFactoryInvocations, so it
+        // cannot slip past a NonPublic-only reflection (the R11 hole) nor escape the source audits
+        // that key off these patterns.
+        string[] audited = AuditedFactoryInvocations.Keys
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+        Assert.Equal(audited, factories);
+
+        // Each audited factory's invocation pattern must target that exact factory name (and only
+        // it), so the pattern the source audits run cannot drift onto a sibling or a renamed factory.
+        foreach ((string name, string pattern) in AuditedFactoryInvocations)
+        {
+            Assert.Matches(pattern, $"SqlParseException.{name}(");
+            Assert.DoesNotMatch(pattern, $"SqlParseException.{name}Extra(");
+        }
     }
 
     [Fact]
