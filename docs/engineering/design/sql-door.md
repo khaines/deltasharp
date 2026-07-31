@@ -239,10 +239,13 @@ parameterless constructor accepts no input and carries only a runtime-supplied d
 derive the hostile, bounded, and string-literal corpora from one source-reconciled `Describe`-site
 inventory, reject dynamic `SqlParseException.Syntax` prose that interpolates anything except a
 `Describe` result (or the fixed `Expect` glyph), require `Unsupported` constructs and public
-constructor prose to remain fixed or mapped, and pin each exception's exact throwing method. A
-length-swept behavioral oracle independently proves that no rejected string-literal value is decoded
-into any message path. Once two attacker messages exceed the backstop budget, their rendered messages
-are byte-identical rather than proportional to attacker input length.
+constructor prose to remain fixed or mapped, require every `Map*` arm to return a stable literal or
+`null`, and pin each exception's exact throwing method. An explicit Core producer-file inventory
+extends the same prose rules through the lexer and fails closed when a new producer appears. A
+length-swept behavioral oracle over all nine parser rejection positions independently proves that no
+decoded value — including a truncation-surviving secret prefix — reaches a message. Once two attacker
+messages exceed the backstop budget, their rendered messages are byte-identical rather than
+proportional to attacker input length.
 
 | Rejected input                         | `ErrorKind`         | `Construct` (stable token)                  | Detected at                    |
 | -------------------------------------- | ------------------- | ------------------------------------------- | ------------------------------ |
