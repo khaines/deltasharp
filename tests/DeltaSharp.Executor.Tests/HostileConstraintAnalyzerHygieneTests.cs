@@ -100,6 +100,8 @@ public sealed class HostileConstraintAnalyzerHygieneTests : IDisposable
         Exception ex = Assert.ThrowsAny<Exception>(() => Append(table, Amounts(1)));
 
         AssertChainIsHygienic(ex);
+        Assert.Contains("data type mismatch", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("FORGED", ex.Message, StringComparison.Ordinal);
         Assert.False(File.Exists(CommitFile(table, 2)));
     }
 
@@ -186,6 +188,8 @@ public sealed class HostileConstraintAnalyzerHygieneTests : IDisposable
         Exception ex = Assert.ThrowsAny<Exception>(() => Append(table, Amounts(1)));
 
         AssertChainIsHygienic(ex);
+        Assert.Contains("must be boolean", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("FORGED", ex.Message, StringComparison.Ordinal);
         Assert.False(File.Exists(CommitFile(table, 2)));
     }
 

@@ -232,6 +232,12 @@ human-readable phrasing — and, where a live DataFrame equivalent exists, an on
 deterministic inputs (the construct token / offending token and its 1-based position), so they are
 stable and catchable (`SqlParseException.cs`).
 
+Diagnostic hygiene is layered. `SqlParser.Describe` reports a string literal's token kind rather than
+its decoded value and caps any echoed lexeme at 128 characters. Every `SqlParseException` constructor
+then applies a single-line, 512-character whole-message backstop. Tests pin the literal-kind policy at
+each reachable rejection site and assert that once two attacker messages exceed the backstop budget,
+their rendered messages are byte-identical rather than proportional to attacker input length.
+
 | Rejected input                         | `ErrorKind`         | `Construct` (stable token)                  | Detected at                    |
 | -------------------------------------- | ------------------- | ------------------------------------------- | ------------------------------ |
 | `… JOIN …`, `INNER/LEFT/… JOIN`        | `UnsupportedFeature`| `JOIN`                                      | `ExpectEnd` → `MapTrailingConstruct` |

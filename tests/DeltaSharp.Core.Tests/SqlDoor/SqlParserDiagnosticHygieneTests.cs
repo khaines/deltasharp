@@ -84,6 +84,19 @@ public sealed class SqlParserDiagnosticHygieneTests
         { "SELECT a FROM t WHERE a > )", "expected an expression but found ')'" },
     };
 
+    /// <summary>
+    /// Every reachable parser site that rejects a string literal and therefore must report the token
+    /// <b>kind</b>, never the decoded literal value. This pins the non-disclosure half of
+    /// <c>SqlParser.Describe</c> independently of its control-character and length hygiene.
+    /// </summary>
+    public static TheoryData<string, bool, string> StringLiteralEchoSites() => new()
+    {
+        { "'SEC\r\nRET_PAYLOAD' a FROM t", true, "expected SELECT but found 'string literal'" },
+        { "SELECT a 'SEC\r\nRET_PAYLOAD' t", true, "expected FROM but found 'string literal'" },
+        { "SELECT a FROM t 'SEC\r\nRET_PAYLOAD'", true, "unexpected 'string literal' after the query" },
+        { "a > 0 'SEC\r\nRET_PAYLOAD'", false, "unexpected trailing input 'string literal'" },
+    };
+
     [Theory]
     [MemberData(nameof(HostileEchoSites))]
     public void SyntaxError_HostileTokenAtEveryReachableEchoSite_IsControlCharFreeAndBounded(
@@ -138,6 +151,29 @@ public sealed class SqlParserDiagnosticHygieneTests
 
         Assert.Equal(SqlParseErrorKind.SyntaxError, ex.ErrorKind);
         Assert.Contains(expected, ex.Message, StringComparison.Ordinal);
+        AssertHygienic(ex.Message);
+    }
+
+    [Theory]
+    [MemberData(nameof(StringLiteralEchoSites))]
+    public void SyntaxError_StringLiteralEchoSites_ReportKind_NotDecodedValue(
+        string sql, bool viaStatementDoor, string expectedProse)
+    {
+        SqlParseException ex = Assert.Throws<SqlParseException>(
+            () =>
+            {
+                if (viaStatementDoor)
+                {
+                    SqlParser.Parse(sql);
+                }
+                else
+                {
+                    SqlParser.ParseConstraintExpression(sql);
+                }
+            });
+
+        Assert.Contains(expectedProse, ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("RET_PAYLOAD", ex.Message, StringComparison.Ordinal);
         AssertHygienic(ex.Message);
     }
 
@@ -297,6 +333,29 @@ public sealed class SqlParserDiagnosticHygieneTests
             // the elision shape is visible here.
             Assert.Equal(SqlParseException.MaxMessageLength + 1, ex.Message.Length);
             Assert.EndsWith("\u2026", ex.Message, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void PublicConstructorBackstop_IsIndependentOfAttackerLength_OnceBothInputsExceedItsBudget()
+    {
+        const string prefix = "TRAIL\r\nFORGED";
+        string shorter = prefix + new string('z', 4_096);
+        string longer = prefix + new string('z', FloodLength);
+
+        foreach (Func<string, SqlParseException> create in new Func<string, SqlParseException>[]
+        {
+            message => new SqlParseException(message),
+            message => new SqlParseException(message, new InvalidOperationException("inner")),
+        })
+        {
+            SqlParseException shorterException = create(shorter);
+            SqlParseException longerException = create(longer);
+
+            Assert.Equal(shorterException.Message, longerException.Message);
+            Assert.EndsWith("\u2026", shorterException.Message, StringComparison.Ordinal);
+            Assert.True(shorterException.Message.Length < shorter.Length);
+            AssertHygienic(shorterException.Message);
         }
     }
 
