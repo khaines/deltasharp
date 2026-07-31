@@ -1,8 +1,10 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using System.Text.RegularExpressions;
 using DeltaSharp.Diagnostics;
@@ -245,22 +247,39 @@ public sealed class SqlParserDiagnosticHygieneTests
         Assert.NotEmpty(expectedProse);
         Assert.NotEmpty(expectedFrame);
 
+        foreach (string payload in new[] { "K7V2", "P1N4X6", "hunter2" })
+        {
+            AssertStringLiteralPayloadNotDisclosed(sql, viaStatementDoor, payload, payload);
+        }
+
         foreach (int length in new[] { 8, 60, 140, 400, 520, 1_200, FloodLength })
         {
             string payload = $"SECRET_{length}_" + new string('q', length);
             string marker = $"SECRET_{length}_";
             string endMarker = $"_END_SECRET_{length}";
             payload += endMarker;
-            string probe = sql.Replace("SEC\r\nRET_PAYLOAD", payload, StringComparison.Ordinal);
-            Assert.NotEqual(sql, probe);
-
-            SqlParseException ex = ParseSyntaxError(probe, viaStatementDoor);
-            Assert.DoesNotContain(payload, ex.Message, StringComparison.Ordinal);
-            Assert.DoesNotContain(marker, ex.Message, StringComparison.Ordinal);
-            Assert.DoesNotContain(endMarker, ex.Message, StringComparison.Ordinal);
-            Assert.Contains("string literal", ex.Message, StringComparison.Ordinal);
-            AssertHygienic(ex.Message);
+            AssertStringLiteralPayloadNotDisclosed(
+                sql,
+                viaStatementDoor,
+                payload,
+                marker,
+                endMarker);
         }
+    }
+
+    [Fact]
+    public void DescribeStringLiteralArm_IsExactlyKindOnly()
+    {
+        string body = MethodBody(
+            SqlParserCode(),
+            "private static string Describe(");
+        MatchCollection arms = Regex.Matches(
+            body,
+            @"SqlTokenKind\.StringLiteral(?<guard>\s+when[^,\r\n]*?)?\s*=>\s*(?<value>[^,\r\n]+),");
+        Match arm = Assert.Single(arms.Cast<Match>());
+
+        Assert.True(string.IsNullOrWhiteSpace(arm.Groups["guard"].Value));
+        Assert.Equal("\"string literal\"", arm.Groups["value"].Value.Trim());
     }
 
     [Fact]
@@ -318,6 +337,55 @@ public sealed class SqlParserDiagnosticHygieneTests
                         Assert.Matches(stableToken, value);
                     }
                 });
+        }
+    }
+
+    [Fact]
+    public void EveryMapHelper_ReturnsOnlyRegisteredConstructs_ForHostileTokens()
+    {
+        var constructInfo = Assert.IsAssignableFrom<IDictionary>(
+            typeof(SqlParseException)
+                .GetField("ConstructInfo", BindingFlags.NonPublic | BindingFlags.Static)!
+                .GetValue(null));
+        MethodInfo[] maps = typeof(SqlParser)
+            .GetMethods(BindingFlags.NonPublic | BindingFlags.Static)
+            .Where(method => method.Name.StartsWith("Map", StringComparison.Ordinal))
+            .OrderBy(method => method.Name, StringComparer.Ordinal)
+            .ToArray();
+        Assert.Equal(4, maps.Length);
+
+        string[] texts =
+        [
+            "IS", "IN", "LIKE", "BETWEEN", "INSERT", "UPDATE", "DELETE", "MERGE", "CREATE",
+            "DROP", "ALTER", "TRUNCATE", "WITH", "VALUES", "SHOW", "DESCRIBE", "DESC",
+            "EXPLAIN", "USE", "SET", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS",
+            "OUTER", "GROUP", "ORDER", "HAVING", "LIMIT", "OFFSET", "UNION", "INTERSECT",
+            "EXCEPT", "MINUS", "WINDOW", "CLUSTER", "DISTRIBUTE", "SORT",
+            "SECRET_HOSTILE_TOKEN",
+            new string('x', 400),
+            new string('z', FloodLength),
+        ];
+        SqlToken[] tokens =
+        [
+            .. from kind in Enum.GetValues<SqlTokenKind>()
+               from text in texts
+               from quoted in new[] { false, true }
+               select new SqlToken(kind, text, Position: 1, IsQuoted: quoted),
+        ];
+        var notToken = new SqlToken(SqlTokenKind.Not, "NOT", Position: 1);
+
+        foreach (MethodInfo map in maps)
+        {
+            foreach (SqlToken token in tokens)
+            {
+                object?[] args = map.GetParameters().Length == 1
+                    ? [token]
+                    : [notToken, token];
+                string? result = (string?)map.Invoke(null, args);
+                Assert.True(
+                    result is null || constructInfo.Contains(result),
+                    $"{map.Name} returned unregistered construct '{result}' for {token}");
+            }
         }
     }
 
@@ -614,6 +682,24 @@ public sealed class SqlParserDiagnosticHygieneTests
                     SqlParser.ParseConstraintExpression(sql);
                 }
             });
+
+    private static void AssertStringLiteralPayloadNotDisclosed(
+        string sql,
+        bool viaStatementDoor,
+        string payload,
+        params string[] forbidden)
+    {
+        string probe = sql.Replace("SEC\r\nRET_PAYLOAD", payload, StringComparison.Ordinal);
+        Assert.NotEqual(sql, probe);
+
+        SqlParseException ex = ParseSyntaxError(probe, viaStatementDoor);
+        Assert.DoesNotContain(payload, ex.Message, StringComparison.Ordinal);
+        Assert.All(
+            forbidden,
+            value => Assert.DoesNotContain(value, ex.Message, StringComparison.Ordinal));
+        Assert.Contains("string literal", ex.Message, StringComparison.Ordinal);
+        AssertHygienic(ex.Message);
+    }
 
     private static string ThrowingParserFrame(SqlParseException exception)
     {

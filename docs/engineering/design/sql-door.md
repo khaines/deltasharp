@@ -240,7 +240,9 @@ derive the hostile, bounded, and string-literal corpora from one source-reconcil
 inventory, reject dynamic `SqlParseException.Syntax` prose that interpolates anything except a
 `Describe` result (or the fixed `Expect` glyph), require `Unsupported` constructs and public
 constructor prose to remain fixed or mapped, require every `Map*` arm to return a stable literal or
-`null`, and pin each exception's exact throwing method. An explicit Core producer-file inventory
+`null`; reflective hostile-token execution additionally requires every non-null Map result to be a
+registered `ConstructInfo` key. The `Describe` string-literal arm is pinned exactly to its kind-only
+render, and each exception's throwing method is pinned. An explicit Core producer-file inventory
 extends the same prose rules through the lexer and fails closed when a new producer appears; the
 lexer's approved glyph is bound to exactly one source character and driven with a trailing secret. A
 length-swept behavioral oracle over all nine parser rejection positions independently proves that no
