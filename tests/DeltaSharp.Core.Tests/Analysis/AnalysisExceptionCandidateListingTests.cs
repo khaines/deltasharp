@@ -538,7 +538,8 @@ public sealed class AnalysisExceptionCandidateListingTests
 
     /// <summary>
     /// Every factory that composes a list, as (label, build) where <c>build(width, prose)</c> takes the list
-    /// cardinality <i>and</i> the length of the factory's free prose tokens.
+    /// cardinality <i>and</i> the length of the factory's free prose tokens. The population is reconciled
+    /// against <see cref="FactoryMethods"/> below rather than trusted as a self-authored enumeration.
     /// <para>The prose parameter exists because round 12 (Quality) found this corpus built every row with
     /// short literal prose — <c>"x"</c>, <c>"/t"</c> — so the guard that claimed to rule out "any combination
     /// of long items, a long reference and huge cardinality" varied only cardinality. The unbounded component
@@ -565,6 +566,21 @@ public sealed class AnalysisExceptionCandidateListingTests
                 Prose("x", p), Prose("/t", p), LongNames(n), LongNames(n))
         },
     };
+
+    [Fact]
+    public void ListComposingFactories_CoversEveryReflectedFactory()
+    {
+        string[] expected = FactoryMethods()
+            .Select(method => method.Name)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+        string[] actual = ListComposingFactories()
+            .Select(row => (string)row[0])
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+
+        Assert.Equal(expected, actual);
+    }
 
     /// <summary>A free prose token grown to <paramref name="length"/>, keeping its readable stem.</summary>
     private static string Prose(string stem, int length) =>
@@ -853,13 +869,13 @@ public sealed class AnalysisExceptionCandidateListingTests
         // The listing must be ACCOUNTED FOR, not merely bounded: every item is either rendered or counted.
         // Demanding a count unconditionally would be wrong — a narrow listing can genuinely fit beside even
         // a pathological token, and then there is nothing to report.
-        string[][] listings = [.. args.OfType<string[]>()];
-        if (listings.Length > 0)
-        {
-            int total = listings.Sum(l => l.Length);
-            int shown = listings.Sum(l => l.Count(n => ex.Message.Contains(n, StringComparison.Ordinal)));
-            Assert.Equal(total, shown + OverflowCounts(ex.Message).Sum());
-        }
+        (ParameterInfo Parameter, object Value)[] listings = factory.GetParameters()
+            .Select((parameter, index) => (parameter, args[index]))
+            .Where(entry => IsCollection(entry.parameter.ParameterType))
+            .ToArray();
+        int total = listings.Sum(entry => ((Array)entry.Value).Length);
+        int shown = listings.Sum(entry => CountShownItems(ex.Message, entry.Parameter, entry.Value));
+        Assert.Equal(total, shown + OverflowCounts(ex.Message).Sum());
     }
 
     /// <summary>
@@ -912,6 +928,31 @@ public sealed class AnalysisExceptionCandidateListingTests
 
     private static bool IsCollection(Type type) =>
         type.IsGenericType && type.GetGenericTypeDefinition() == typeof(IReadOnlyList<>);
+
+    private static int CountShownItems(string message, ParameterInfo parameter, object value)
+    {
+        Type item = parameter.ParameterType.GetGenericArguments()[0];
+        if (item == typeof(string))
+        {
+            return ((IEnumerable<string>)value).Count(name => message.Contains(name, StringComparison.Ordinal));
+        }
+
+        if (item == typeof(AttributeReference))
+        {
+            return ((IEnumerable<AttributeReference>)value)
+                .Count(attribute => message.Contains(attribute.Name, StringComparison.Ordinal));
+        }
+
+        if (item == typeof(DataType))
+        {
+            // Oversized() deliberately supplies IntegerType for every item. Match the whole token so the
+            // trailing prose "an integer" is not counted as a rendered type.
+            return Regex.Matches(message, @"\bint\b").Count;
+        }
+
+        throw new NotSupportedException(
+            string.Create(CultureInfo.InvariantCulture, $"no accounting rule defined for {item}"));
+    }
 
     /// <summary>A pathological value for each parameter shape: every free token long enough to consume the
     /// whole message on its own, and every collection wide enough to have something to elide.</summary>

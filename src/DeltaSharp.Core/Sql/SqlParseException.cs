@@ -30,8 +30,8 @@ public sealed class SqlParseException : Exception
     /// <param name="message">The deterministic error message. <b>It is rewritten:</b> injection-unsafe
     /// characters (Unicode categories <c>Cc</c>, <c>Cf</c>, <c>Zl</c>, <c>Zp</c>, plus lone surrogates) are
     /// replaced with U+FFFD and the result is capped — see <see cref="MaxMessageLength"/> for why this applies
-    /// to every constructor and not just to the internal factories. A single-line message of ordinary length
-    /// is returned unchanged.</param>
+    /// to every message-taking constructor and not just to the internal factories. A single-line message of
+    /// ordinary length is returned unchanged.</param>
     public SqlParseException(string message)
         : base(Bounded(message))
     {
@@ -70,18 +70,21 @@ public sealed class SqlParseException : Exception
     public string? Construct { get; }
 
     /// <summary>
-    /// The backstop cap applied to the <b>whole composed message</b> of every <see cref="SqlParseException"/>.
-    /// Sized well above the longest diagnostic the parser composes today — its longest fixed prose plus a
-    /// per-token-bounded echo is a small fraction of it — so it never truncates a well-behaved message; it
-    /// exists only so a call site that forgets to bound its own echo still cannot render an unbounded message.
+    /// The backstop cap applied to every caller-supplied or parser-composed <see cref="SqlParseException"/>
+    /// message. Sized well above the longest diagnostic the parser composes today — its longest fixed prose
+    /// plus a per-token-bounded echo is a small fraction of it — so it never truncates a well-behaved message;
+    /// it exists only so a call site that forgets to bound its own echo still cannot render an unbounded
+    /// message.
     /// </summary>
     /// <remarks>
-    /// <para><b>Applied in every constructor, including the three public ones.</b> Placing it in the
-    /// <see cref="Syntax"/> factory alone left it bypassable: this type is public and exposes public
-    /// <c>(string)</c> / <c>(string, Exception)</c> constructors that never reach that factory. Nothing in the
-    /// repo exploits that today (all in-repo uses carry fixed prose), but "the backstop no call site can
-    /// bypass" has to be structurally true, not true by inspection — so the sanitize moved down to
-    /// <see cref="Bounded"/>, which every construction path runs through.</para>
+    /// <para><b>Applied in every message-taking constructor, including both message-taking public ones.</b>
+    /// Placing it in the <see cref="Syntax"/> factory alone left it bypassable: this type is public and exposes
+    /// public <c>(string)</c> / <c>(string, Exception)</c> constructors that never reach that factory. The
+    /// parameterless public constructor carries only the runtime's fixed default message and accepts no input.
+    /// Nothing in the repo exploits the message-taking bypass today (all in-repo uses carry fixed prose), but
+    /// "the backstop no caller-supplied message can bypass" has to be structurally true, not true by
+    /// inspection — so the sanitize moved down to <see cref="Bounded"/>, which every message-taking
+    /// construction path runs through.</para>
     /// <para><b>Invariant this creates:</b> a <see cref="SqlParseException"/> message is single-line by
     /// construction — a structural <c>\n</c> a factory might want for a multi-line listing would itself be
     /// neutralized to U+FFFD. That is deliberate for a parser diagnostic (every one is a single
@@ -98,8 +101,8 @@ public sealed class SqlParseException : Exception
     /// </remarks>
     internal const int MaxMessageLength = 512;
 
-    /// <summary>Applies the <see cref="MaxMessageLength"/> backstop — the single chokepoint every constructor
-    /// routes through.</summary>
+    /// <summary>Applies the <see cref="MaxMessageLength"/> backstop — the single chokepoint every
+    /// message-taking constructor routes through.</summary>
     private static string? Bounded(string? message) =>
         message is null ? null : DiagnosticText.Sanitize(message, MaxMessageLength);
 
@@ -128,9 +131,10 @@ public sealed class SqlParseException : Exception
     /// <summary>Builds a deterministic <see cref="SqlParseErrorKind.UnsupportedFeature"/> whose
     /// <see cref="Construct"/> is the stable <paramref name="construct"/> token and whose message
     /// carries the human-readable prose (plus a DataFrame-API onboarding hint when one exists).</summary>
-    /// <remarks>The backstop applies here too (every constructor routes through it), but it is a <b>no-op</b>
-    /// in practice and always has been: every <paramref name="construct"/> the parser passes is a compile-time
-    /// constant from its own keyword maps (<c>JOIN</c>, <c>GROUP_BY</c>, <c>FUNCTION_CALL</c>, …) — never
+    /// <remarks>The backstop applies here too (every message-taking constructor routes through it), but it is
+    /// a <b>no-op</b> in practice and always has been: every <paramref name="construct"/> the parser passes is
+    /// a compile-time constant from its own keyword maps (<c>JOIN</c>, <c>GROUP_BY</c>,
+    /// <c>FUNCTION_CALL</c>, …) — never
     /// source text — so no attacker-chosen token can reach this message, and the longest message this factory
     /// can compose is comfortably inside <see cref="MaxMessageLength"/> (#687).</remarks>
     /// <param name="construct">The unsupported construct's stable token (for example <c>JOIN</c>).</param>

@@ -89,17 +89,17 @@ public sealed class SqlParserDiagnosticHygieneTests
     /// <b>kind</b>, never the decoded literal value. This pins the non-disclosure half of
     /// <c>SqlParser.Describe</c> independently of its control-character and length hygiene.
     /// </summary>
-    public static TheoryData<string, string, bool, string> StringLiteralEchoSites() => new()
+    public static TheoryData<string, string, bool, string, string> StringLiteralEchoSites() => new()
     {
-        { "expected-select", "'SEC\r\nRET_PAYLOAD' a FROM t", true, "expected SELECT but found 'string literal'" },
-        { "expected-from", "SELECT a 'SEC\r\nRET_PAYLOAD' t", true, "expected FROM but found 'string literal'" },
-        { "trailing-after-query", "SELECT a FROM t 'SEC\r\nRET_PAYLOAD'", true, "unexpected 'string literal' after the query" },
-        { "constraint-trailing-input", "a > 0 'SEC\r\nRET_PAYLOAD'", false, "unexpected trailing input 'string literal'" },
-        { "alias-after-as", "SELECT a AS 'SEC\r\nRET_PAYLOAD' FROM t", true, "expected an alias name after AS but found 'string literal'" },
-        { "relation-name", "SELECT a FROM 'SEC\r\nRET_PAYLOAD'", true, "expected a table name but found 'string literal'" },
-        { "relation-identifier-after-dot", "SELECT a FROM t.'SEC\r\nRET_PAYLOAD'", true, "expected an identifier after '.' but found 'string literal'" },
-        { "constraint-identifier-after-dot", "a.'SEC\r\nRET_PAYLOAD' > 0", false, "expected an identifier after '.' but found 'string literal'" },
-        { "constraint-expected-rparen", "(a > 1 'SEC\r\nRET_PAYLOAD'", false, "expected ')' but found 'string literal'" },
+        { "expected-select", "'SEC\r\nRET_PAYLOAD' a FROM t", true, "expected SELECT but found 'string literal'", "SqlParser.ParseStatement" },
+        { "expected-from", "SELECT a 'SEC\r\nRET_PAYLOAD' t", true, "expected FROM but found 'string literal'", "SqlParser.ParseStatement" },
+        { "trailing-after-query", "SELECT a FROM t 'SEC\r\nRET_PAYLOAD'", true, "unexpected 'string literal' after the query", "SqlParser.ExpectEnd" },
+        { "constraint-trailing-input", "a > 0 'SEC\r\nRET_PAYLOAD'", false, "unexpected trailing input 'string literal'", "SqlParser.ParseConstraintExpression" },
+        { "alias-after-as", "SELECT a AS 'SEC\r\nRET_PAYLOAD' FROM t", true, "expected an alias name after AS but found 'string literal'", "SqlParser.ExpectAliasName" },
+        { "relation-name", "SELECT a FROM 'SEC\r\nRET_PAYLOAD'", true, "expected a table name but found 'string literal'", "SqlParser.ParseRelation" },
+        { "relation-identifier-after-dot", "SELECT a FROM t.'SEC\r\nRET_PAYLOAD'", true, "expected an identifier after '.' but found 'string literal'", "SqlParser.ParseRelation" },
+        { "constraint-identifier-after-dot", "a.'SEC\r\nRET_PAYLOAD' > 0", false, "expected an identifier after '.' but found 'string literal'", "SqlParser.ParseColumnReference" },
+        { "constraint-expected-rparen", "(a > 1 'SEC\r\nRET_PAYLOAD'", false, "expected ')' but found 'string literal'", "SqlParser.Expect" },
     };
 
     [Theory]
@@ -162,7 +162,7 @@ public sealed class SqlParserDiagnosticHygieneTests
     [Theory]
     [MemberData(nameof(StringLiteralEchoSites))]
     public void SyntaxError_StringLiteralEchoSites_ReportKind_NotDecodedValue(
-        string site, string sql, bool viaStatementDoor, string expectedProse)
+        string site, string sql, bool viaStatementDoor, string expectedProse, string expectedFrame)
     {
         Assert.NotEmpty(site);
 
@@ -180,17 +180,24 @@ public sealed class SqlParserDiagnosticHygieneTests
             });
 
         Assert.Contains(expectedProse, ex.Message, StringComparison.Ordinal);
+        Assert.Contains(expectedFrame, ex.StackTrace, StringComparison.Ordinal);
         Assert.DoesNotContain("RET_PAYLOAD", ex.Message, StringComparison.Ordinal);
         AssertHygienic(ex.Message);
     }
 
+    /// <summary>
+    /// The site key comes from observable exception provenance and prose, not the row's descriptive label.
+    /// Some parser methods contain more than one rejection site, so neither frame nor prose alone is enough.
+    /// </summary>
     [Fact]
-    public void StringLiteralEchoSites_EachRowPinsADistinctCurrentSite()
+    public void StringLiteralEchoSites_EachRowPinsDistinctFrameAndProse()
     {
-        string[] sites = StringLiteralEchoSites().Select(row => (string)row[0]).ToArray();
+        (string Frame, string Prose)[] pins = StringLiteralEchoSites()
+            .Select(row => ((string)row[4], (string)row[3]))
+            .ToArray();
 
-        Assert.Equal(9, sites.Length);
-        Assert.Equal(sites.Length, sites.Distinct(StringComparer.Ordinal).Count());
+        Assert.Equal(9, pins.Length);
+        Assert.Equal(pins.Length, pins.Distinct().Count());
     }
 
     [Fact]
