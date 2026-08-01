@@ -1363,6 +1363,55 @@ public sealed class ChangeFeedReadTests : IDisposable
     }
 
     [Fact]
+    public async Task Cdf_SurvivingSubFloorForgery_WhenTheFloorEqualsTheRangeStart_FailsClosed_NamesSubFloorVersion()
+    {
+        // #671 boundary (Security seat, executed): the pre-range identity gate must validate surviving
+        // sub-floor commits EVEN WHEN the earliest reconstructable floor == the range start. The prior
+        // `if (earliest >= rangeStartVersion) return;` early return skipped the ENTIRE scan in that case, so a
+        // forged commit whose JSON survives strictly below a checkpoint sitting exactly at `start` went
+        // unvalidated and its (schema-compatible) identity swap could emit mismapped change data out the door.
+        // Layout: v0 aged out; checkpoint@2 bakes identity X (== end) so earliest == 2; a RETAINED v1.json
+        // (below the floor) forges the swapped identity Y; a benign v2.json (identity X) makes start == 2 == the
+        // floor readable. Reading [2,2] emits no change rows, so pre-fix the read ACCEPTED (fail-open); with the
+        // fix the surviving sub-floor v1 is read and validated, and the read fails closed naming version 1.
+        string SchemaJson(int idForId, int idForName) =>
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
+            + "{\"delta.columnMapping.id\":" + idForId + ",\"delta.columnMapping.physicalName\":\"col-A\"}},"
+            + "{\"name\":\"name\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":" + idForName + ",\"delta.columnMapping.physicalName\":\"col-B\"}}]}";
+        var config = new[]
+        {
+            ("delta.columnMapping.mode", "id"),
+            ("delta.columnMapping.maxColumnId", "2"),
+            ("delta.enableChangeDataFeed", "true"),
+        };
+        string MetaLine(int idForId, int idForName) =>
+            "{\"metaData\":{\"id\":\"rt\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
+            + "\"schemaString\":" + JsonSerializer.Serialize(SchemaJson(idForId, idForName))
+            + ",\"partitionColumns\":[],\"configuration\":{"
+            + "\"delta.columnMapping.mode\":\"id\",\"delta.columnMapping.maxColumnId\":\"2\","
+            + "\"delta.enableChangeDataFeed\":\"true\"}}}";
+        using var backend = new LocalFileSystemBackend(_root);
+        // checkpoint@2 bakes identity X (== end); commit 0 aged out; earliest reconstructable == 2 == start.
+        await DeltaTestHarness.WriteCheckpointAsync(backend, 2, new CheckpointFixture()
+            .Protocol(3, 7, new[] { "columnMapping" }, new[] { "columnMapping", "changeDataFeed" })
+            .Metadata("rt", SchemaJson(1, 2), partitionColumns: null, configuration: config));
+        await DeltaTestHarness.WriteLastCheckpointAsync(backend, 2);
+        await backend.PutIfAbsentAsync(   // SURVIVING sub-floor v1.json (< earliest=2): forges swapped identity Y
+            "_delta_log/00000000000000000001.json",
+            Encoding.UTF8.GetBytes(MetaLine(2, 1) + "\n"), CancellationToken.None);
+        await backend.PutIfAbsentAsync(   // benign v2.json (identity X): makes start==2==floor a readable version
+            "_delta_log/00000000000000000002.json",
+            Encoding.UTF8.GetBytes(MetaLine(1, 2) + "\n"), CancellationToken.None);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
+        Assert.Contains("column-mapping identity", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("version 1", ex.Message, StringComparison.Ordinal);   // the surviving sub-floor version
+    }
+
+    [Fact]
     public async Task Cdf_PartitionColumnChangeBeforeStart_FailsClosed()
     {
         // #671 partition-membership arm (reliability-chaos R2 HIGH + red-team): identity includes the

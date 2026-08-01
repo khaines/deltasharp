@@ -627,19 +627,30 @@ internal sealed class DeltaLog
         ReplayedMetadataLog alreadyReplayed, CancellationToken cancellationToken)
     {
         long earliest = EarliestReconstructableVersion(listing);
-        if (earliest >= rangeStartVersion)
-        {
-            return; // No retained history before the range; the reader's per-version check covers [start, end].
-        }
-
         ColumnMappingIdentity endIdentity = BuildIdentity(endMetadata);
 
         // Baseline: the identity as of the earliest reconstructable version — compacted from a checkpoint when
         // the creation commit has aged out, so a checkpoint-baked identity that no surviving commit re-expresses
-        // is still caught. Reconstructed from the SAME listing (no second LIST, #691).
-        Snapshot earliestSnapshot = await LoadSnapshotFromListingAsync(
-            listing, earliest, Stopwatch.GetTimestamp(), null, cancellationToken).ConfigureAwait(false);
-        ValidateHistoricalIdentity(earliest, earliestSnapshot.Metadata, endIdentity);
+        // is still caught. Reconstructed from the SAME listing (no second LIST, #691). This baseline exists
+        // ONLY when the reconstructable floor precedes the range: when earliest >= start the floor sits inside
+        // [start, end], where the reader's own per-version identity check already covers it, so there is no
+        // pre-range baseline to establish here. The surviving-commit loop below still runs in BOTH cases.
+        if (earliest < rangeStartVersion)
+        {
+            Snapshot earliestSnapshot = await LoadSnapshotFromListingAsync(
+                listing, earliest, Stopwatch.GetTimestamp(), null, cancellationToken).ConfigureAwait(false);
+            ValidateHistoricalIdentity(earliest, earliestSnapshot.Metadata, endIdentity);
+        }
+
+        // Every retained commit's metaData REPLACES the metadata (Delta semantics); a differing identity at any
+        // version before the range — including a change-and-change-back that reverted before start, or a
+        // SURVIVING commit whose JSON persists strictly below the earliest reconstructable floor (e.g. below a
+        // compacting checkpoint) — is forged. Critically this holds EVEN WHEN the floor is at or above the range
+        // start: a forged sub-floor stray under a checkpoint at/above `start` must still be validated (the prior
+        // `earliest >= start` early return skipped this loop, letting such a forgery emit mismapped change data).
+        // We skip ONLY the exact baseline version (== earliest, validated above when it precedes the range) and
+        // in-range versions (>= start, the reader's per-version check); a below-floor stray with surviving JSON
+        // is still read and validated, so a transient forged identity cannot hide beneath a compacting checkpoint.
 
         // Every retained commit's metaData REPLACES the metadata (Delta semantics); a differing identity at any
         // version before the range — including a change-and-change-back that reverted before start, or a
