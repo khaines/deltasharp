@@ -16,10 +16,28 @@ namespace DeltaSharp.Storage.Tests;
 /// that footer == log for every complex shape, which is the hard prerequisite for stamping
 /// column-mapping ids into nested trees (#191/#676).
 /// </summary>
+/// <remarks>
+/// <para>
+/// EVERY test here pins a <c>golden</c> literal in addition to the footer↔log comparison. That is
+/// load-bearing since #679 consolidated both paths onto one serializer: with a single implementation
+/// the footer↔log assertion is <c>f(x) == f(x)</c> and can no longer fail for a serializer defect, so
+/// on its own it would silently stop guarding the wire shape. The goldens carry that weight now; the
+/// footer↔log assertion is retained because it still guards the <em>delegation seam</em> (it fails if
+/// <c>DeltaSchemaJson.ToJson</c> stops forwarding to <c>SchemaJson.ToJson</c>).
+/// </para>
+/// <para>
+/// The goldens were captured by running the PRE-consolidation Storage serializer (the deleted
+/// <c>DeltaSchemaJson.WriteType</c>/<c>WriteStruct</c>/<c>WriteMetadata</c> at commit a6ff45f) over
+/// these exact schemas, so they are simultaneously a wire-shape pin AND a cross-commit differential
+/// fixture: they prove #679 preserved behavior rather than merely asserting it.
+/// </para>
+/// </remarks>
 public sealed class DeltaSchemaJsonComplexTypeTests
 {
-    // Both serializers are exercised on the SAME schema; equality here is exactly the footer↔log
-    // agreement (DeltaTableWriter's SchemaJson.ToJson vs ParquetFileWriter's DeltaSchemaJson.ToJson).
+    // Guards the DELEGATION SEAM: since #679 both sides resolve to the same serializer, so this
+    // fails only if DeltaSchemaJson.ToJson stops forwarding to SchemaJson.ToJson (or transforms its
+    // result) — NOT if the shared serializer itself regresses. It must therefore never be the only
+    // assertion in a test; the per-test golden is what pins the emitted bytes.
     private static void AssertFooterMatchesLog(StructType schema)
     {
         string log = SchemaJson.ToJson(schema);
@@ -56,6 +74,12 @@ public sealed class DeltaSchemaJsonComplexTypeTests
             "\"type\":{\"type\":\"array\",\"elementType\":\"long\",\"containsNull\":false}",
             DeltaSchemaJson.ToJson(schema),
             StringComparison.Ordinal);
+
+        const string golden =
+            "{\"type\":\"struct\",\"fields\":[{\"name\":\"ids\",\"type\":{\"type\":\"array\"" +
+            ",\"elementType\":\"long\",\"containsNull\":false},\"nullable\":false" +
+            ",\"metadata\":{}}]}";
+        Assert.Equal(golden, DeltaSchemaJson.ToJson(schema));
         AssertFooterMatchesLog(schema);
     }
 
@@ -93,6 +117,12 @@ public sealed class DeltaSchemaJsonComplexTypeTests
             "\"type\":{\"type\":\"map\",\"keyType\":\"string\",\"valueType\":\"integer\",\"valueContainsNull\":false}",
             DeltaSchemaJson.ToJson(schema),
             StringComparison.Ordinal);
+
+        const string golden =
+            "{\"type\":\"struct\",\"fields\":[{\"name\":\"counts\",\"type\":{\"type\":\"map\"" +
+            ",\"keyType\":\"string\",\"valueType\":\"integer\",\"valueContainsNull\":false}" +
+            ",\"nullable\":false,\"metadata\":{}}]}";
+        Assert.Equal(golden, DeltaSchemaJson.ToJson(schema));
         AssertFooterMatchesLog(schema);
     }
 
@@ -109,6 +139,13 @@ public sealed class DeltaSchemaJsonComplexTypeTests
             new StructField("rows", DataTypes.CreateArrayType(element, containsNull: false), nullable: true),
         });
 
+        const string golden =
+            "{\"type\":\"struct\",\"fields\":[{\"name\":\"rows\",\"type\":{\"type\":\"array\"" +
+            ",\"elementType\":{\"type\":\"struct\",\"fields\":[{\"name\":\"k\",\"type\":\"string\"" +
+            ",\"nullable\":false,\"metadata\":{}},{\"name\":\"v\",\"type\":\"double\"" +
+            ",\"nullable\":true,\"metadata\":{}}]},\"containsNull\":false},\"nullable\":true" +
+            ",\"metadata\":{}}]}";
+        Assert.Equal(golden, DeltaSchemaJson.ToJson(schema));
         AssertFooterMatchesLog(schema);
     }
 
@@ -128,6 +165,13 @@ public sealed class DeltaSchemaJsonComplexTypeTests
                 nullable: true),
         });
 
+        const string golden =
+            "{\"type\":\"struct\",\"fields\":[{\"name\":\"geo\",\"type\":{\"type\":\"map\"" +
+            ",\"keyType\":\"string\",\"valueType\":{\"type\":\"struct\"" +
+            ",\"fields\":[{\"name\":\"lat\",\"type\":\"double\",\"nullable\":false" +
+            ",\"metadata\":{}},{\"name\":\"lon\",\"type\":\"double\",\"nullable\":false" +
+            ",\"metadata\":{}}]},\"valueContainsNull\":true},\"nullable\":true,\"metadata\":{}}]}";
+        Assert.Equal(golden, DeltaSchemaJson.ToJson(schema));
         AssertFooterMatchesLog(schema);
     }
 
@@ -153,6 +197,18 @@ public sealed class DeltaSchemaJsonComplexTypeTests
             new StructField("m", DataTypes.CreateMapType(DataTypes.StringType, mValue, valueContainsNull: true), nullable: false),
         });
 
+        const string golden =
+            "{\"type\":\"struct\",\"fields\":[{\"name\":\"a\",\"type\":{\"type\":\"array\"" +
+            ",\"elementType\":{\"type\":\"map\",\"keyType\":\"string\"" +
+            ",\"valueType\":{\"type\":\"array\",\"elementType\":{\"type\":\"struct\"" +
+            ",\"fields\":[{\"name\":\"x\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}]}" +
+            ",\"containsNull\":true},\"valueContainsNull\":false},\"containsNull\":false}" +
+            ",\"nullable\":true,\"metadata\":{}},{\"name\":\"m\",\"type\":{\"type\":\"map\"" +
+            ",\"keyType\":\"string\",\"valueType\":{\"type\":\"struct\"" +
+            ",\"fields\":[{\"name\":\"y\",\"type\":{\"type\":\"array\",\"elementType\":\"integer\"" +
+            ",\"containsNull\":true},\"nullable\":true,\"metadata\":{}}]}" +
+            ",\"valueContainsNull\":true},\"nullable\":false,\"metadata\":{}}]}";
+        Assert.Equal(golden, DeltaSchemaJson.ToJson(schema));
         AssertFooterMatchesLog(schema);
     }
 
@@ -190,6 +246,15 @@ public sealed class DeltaSchemaJsonComplexTypeTests
         string footer = DeltaSchemaJson.ToJson(schema);
         Assert.Contains("\"delta.columnMapping.id\":7", footer, StringComparison.Ordinal);
         Assert.Contains("\"elementType\":{\"type\":\"struct\"", footer, StringComparison.Ordinal);
+
+        const string golden =
+            "{\"type\":\"struct\",\"fields\":[{\"name\":\"nested\",\"type\":{\"type\":\"array\"" +
+            ",\"elementType\":{\"type\":\"struct\",\"fields\":[{\"name\":\"leaf\"" +
+            ",\"type\":\"long\",\"nullable\":false,\"metadata\":{\"delta.columnMapping.id\":7" +
+            ",\"delta.columnMapping.physicalName\":\"col-7\"}}]},\"containsNull\":false}" +
+            ",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":3" +
+            ",\"delta.columnMapping.physicalName\":\"col-3\"}}]}";
+        Assert.Equal(golden, footer);
         AssertFooterMatchesLog(schema);
     }
 
@@ -214,6 +279,14 @@ public sealed class DeltaSchemaJsonComplexTypeTests
         string footer = DeltaSchemaJson.ToJson(schema);
         Assert.Contains("\"elementType\":\"decimal(20,4)\"", footer, StringComparison.Ordinal);
         Assert.Contains("\"valueType\":\"decimal(10,2)\"", footer, StringComparison.Ordinal);
+
+        const string golden =
+            "{\"type\":\"struct\",\"fields\":[{\"name\":\"amounts\",\"type\":{\"type\":\"array\"" +
+            ",\"elementType\":\"decimal(20,4)\",\"containsNull\":true},\"nullable\":true" +
+            ",\"metadata\":{}},{\"name\":\"rates\",\"type\":{\"type\":\"map\"" +
+            ",\"keyType\":\"string\",\"valueType\":\"decimal(10,2)\",\"valueContainsNull\":false}" +
+            ",\"nullable\":false,\"metadata\":{}}]}";
+        Assert.Equal(golden, footer);
         AssertFooterMatchesLog(schema);
     }
 
@@ -230,6 +303,13 @@ public sealed class DeltaSchemaJsonComplexTypeTests
 
         string footer = DeltaSchemaJson.ToJson(schema);
         Assert.Contains("\"type\":{\"type\":\"struct\",\"fields\":[]}", footer, StringComparison.Ordinal);
+
+        const string golden =
+            "{\"type\":\"struct\",\"fields\":[{\"name\":\"empty\",\"type\":{\"type\":\"struct\"" +
+            ",\"fields\":[]},\"nullable\":true,\"metadata\":{}},{\"name\":\"empties\"" +
+            ",\"type\":{\"type\":\"array\",\"elementType\":{\"type\":\"struct\",\"fields\":[]}" +
+            ",\"containsNull\":false},\"nullable\":false,\"metadata\":{}}]}";
+        Assert.Equal(golden, footer);
         AssertFooterMatchesLog(schema);
     }
 
@@ -254,6 +334,14 @@ public sealed class DeltaSchemaJsonComplexTypeTests
 
         string footer = DeltaSchemaJson.ToJson(schema);
         Assert.Contains("\"keyType\":{\"type\":\"struct\"", footer, StringComparison.Ordinal);
+
+        const string golden =
+            "{\"type\":\"struct\",\"fields\":[{\"name\":\"byRegion\",\"type\":{\"type\":\"map\"" +
+            ",\"keyType\":{\"type\":\"struct\",\"fields\":[{\"name\":\"region\"" +
+            ",\"type\":\"string\",\"nullable\":false,\"metadata\":{}},{\"name\":\"zone\"" +
+            ",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}}]},\"valueType\":\"long\"" +
+            ",\"valueContainsNull\":true},\"nullable\":true,\"metadata\":{}}]}";
+        Assert.Equal(golden, footer);
         AssertFooterMatchesLog(schema);
     }
 }
