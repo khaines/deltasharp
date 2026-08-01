@@ -893,6 +893,12 @@ internal sealed class DeltaLog
                 case DeltaLogFileKind.V2Checkpoint:
                     // Skipped: V2/UUID checkpoints are accepted only under the v2Checkpoint reader feature,
                     // which protocol negotiation rejects for a v1-baseline reader (§2.10.3/§2.10.5).
+                    //
+                    // FORWARD-COMPAT (#671, Architect R5): a V2/sidecar checkpoint aggregates a version's actions
+                    // across sidecar files — a THIRD metaData-aggregation point (beyond JSON commit parse and
+                    // classic-checkpoint seed). When v2Checkpoint support lands it MUST carry the same cross-part
+                    // ≤1-metaData guard (the checkpoint-side analogue in TrySeedFromCheckpointAsync), or the
+                    // "validate only the prevailing identity" class re-opens on the sidecar path.
                     break;
 
                 case DeltaLogFileKind.Other:

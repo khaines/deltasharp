@@ -1316,8 +1316,10 @@ public sealed class ChangeFeedReadTests : IDisposable
         Assert.DoesNotContain(histFile, ex.Message, StringComparison.Ordinal);
     }
 
-    [Fact]
-    public async Task Cdf_ForgedCheckpointWithMultipleMetadata_FailsClosed()
+    [Theory]
+    [InlineData(1)]   // single-part checkpoint (both metaData in one part)
+    [InlineData(2)]   // multi-part: metaData(Y) and metaData(X) split ONE-PER-PART — pins the CROSS-part count
+    public async Task Cdf_ForgedCheckpointWithMultipleMetadata_FailsClosed(int checkpointParts)
     {
         // #671 CHECKPOINT-path class closure (Security seat R4, executed end-to-end). The pre-range identity
         // gate seeds its baseline snapshot from a checkpoint via SnapshotState.ApplyAll, which is LAST-WINS over
@@ -1338,6 +1340,13 @@ public sealed class ChangeFeedReadTests : IDisposable
         // at the gate with no physical victim Parquet: with the guard the read fails closed; mutation (guard
         // removed) ⇒ checkpoint seeds X, the gate passes, and [3,3] is ACCEPTED empty (quoted in the PR fix
         // record).
+        //
+        // The `parts:2` case pins the guard's CROSS-part property (Security + Balanced R5). The fixture order
+        // metaData(Y), metaData(X), Protocol shards round-robin (i % parts) to part0=[metaData(Y), Protocol],
+        // part1=[metaData(X)] — exactly ONE metaData per part, with clean X winning last-wins. A per-part
+        // counter (the most natural "cleanup", e.g. moving the count into DeltaCheckpointReader) would see
+        // 1-per-part, seed X, pass the gate, and ACCEPT the split forgery; only the cross-part running count
+        // rejects it. The single-part case (parts:1) alone cannot distinguish the two counters.
         string SchemaJson(int idForId, int idForName) =>
             "{\"type\":\"struct\",\"fields\":["
             + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
@@ -1357,13 +1366,25 @@ public sealed class ChangeFeedReadTests : IDisposable
             + "\"delta.columnMapping.mode\":\"id\",\"delta.columnMapping.maxColumnId\":\"2\","
             + "\"delta.enableChangeDataFeed\":\"true\"}}}";
         using var backend = new LocalFileSystemBackend(_root);
-        // Checkpoint@2 carries TWO metaData rows: forged Y (id→2, name→1) THEN clean X (id→1, name→2). ApplyAll
-        // is last-wins ⇒ X would seed the baseline and satisfy the gate. Commits 0..2 JSON are aged out.
-        await DeltaTestHarness.WriteCheckpointAsync(backend, 2, new CheckpointFixture()
-            .Protocol(3, 7, new[] { "columnMapping" }, new[] { "columnMapping", "changeDataFeed" })
-            .Metadata("rt", SchemaJson(2, 1), partitionColumns: null, configuration: config)    // Y (forged)
-            .Metadata("rt", SchemaJson(1, 2), partitionColumns: null, configuration: config));   // X (clean, last-wins)
-        await DeltaTestHarness.WriteLastCheckpointAsync(backend, 2);
+        // Checkpoint@2 carries TWO metaData rows: forged Y (id→2, name→1) THEN clean X (id→1, name→2), then the
+        // Protocol. ApplyAll is last-wins ⇒ X seeds the baseline and would satisfy the gate. Commits 0..2 JSON
+        // are aged out. Row order is chosen so the parts:2 round-robin split puts one metaData in EACH part with
+        // X winning last (see the cross-part note above).
+        var checkpoint = new CheckpointFixture()
+            .Metadata("rt", SchemaJson(2, 1), partitionColumns: null, configuration: config)    // Y (forged) → part0
+            .Metadata("rt", SchemaJson(1, 2), partitionColumns: null, configuration: config)    // X (clean, wins) → part1
+            .Protocol(3, 7, new[] { "columnMapping" }, new[] { "columnMapping", "changeDataFeed" });
+        if (checkpointParts == 1)
+        {
+            await DeltaTestHarness.WriteCheckpointAsync(backend, 2, checkpoint);
+            await DeltaTestHarness.WriteLastCheckpointAsync(backend, 2);
+        }
+        else
+        {
+            await DeltaTestHarness.WriteMultipartCheckpointAsync(backend, 2, checkpoint, checkpointParts);
+            await DeltaTestHarness.WriteLastCheckpointAsync(backend, 2, checkpointParts);
+        }
+
         // v3 (end): identity X, metaData-only (no add/remove) ⇒ [3,3] would emit zero change rows if the gate passed.
         await backend.PutIfAbsentAsync(
             "_delta_log/00000000000000000003.json",
@@ -1371,6 +1392,10 @@ public sealed class ChangeFeedReadTests : IDisposable
 
         DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
             async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(3, 3)));
+        // Positive attribution (Quality R5): the guard rejects the checkpoint as non-authoritative, so the read
+        // falls back to JSON replay and fails on the aged-out gap — the missing floor commit is version 0. This
+        // distinguishes "forged checkpoint discarded ⇒ replay hits the gap" from any other DeltaReadException.
+        Assert.Matches(@"version 0\b", ex.Message);
         Assert.DoesNotContain("col-A", ex.Message, StringComparison.Ordinal);   // #653 path/identity-free
         Assert.DoesNotContain("col-B", ex.Message, StringComparison.Ordinal);
         Assert.DoesNotContain(".parquet", ex.Message, StringComparison.Ordinal);

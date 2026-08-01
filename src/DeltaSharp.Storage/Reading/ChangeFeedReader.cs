@@ -425,7 +425,13 @@ internal sealed class ChangeFeedReader
             }
 
             // Fail closed on a column-mapping IDENTITY transition WITHIN the range (#671, maintainer-broadened
-            // from #670's mode-only check). Every version's files (explicit cdc AND implicit add/remove) are
+            // from #670's mode-only check). This POST-LOOP check validates each version's PREVAILING identity;
+            // it is the backstop for a version that carries NO metaData yet inherits a differing identity —
+            // every metaData-CARRYING version is already validated per-applied-metaData at the in-loop check
+            // above (search "a metaData applied within the commit"), which fires first. While the parse guard
+            // holds (≤1 metaData/commit) the two are equivalent for metaData-carrying versions; this one's
+            // unique path is unreachable given the pre-range gate + the in-loop check, so it is a mutation-
+            // proven backstop (neuter the in-loop check ⇒ this one still fails closed). Every version's files (explicit cdc AND implicit add/remove) are
             // read through the END snapshot's column-mapping identity (`ctx` — its mode + physical-name /
             // field-id resolution). A version whose prevailing metadata declares a different mode, a reassigned
             // field id, or a changed physical name would be MISMAPPED (e.g. an id-mode file with swapped
