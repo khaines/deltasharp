@@ -725,12 +725,41 @@ internal sealed class DeltaLog
     {
         try
         {
+            // A checkpoint summarizes exactly ONE prevailing metaData at its version (Delta protocol: a
+            // checkpoint is the reconciled snapshot of the table state, and a version carries at most one
+            // metaData). Enforce it ACROSS ALL PARTS — the checkpoint-side analogue of the single-metaData
+            // guard at the JSON parse point (DeltaLogActionReader.ParseCommit). Without it, a forged
+            // multi-metaData checkpoint is applied last-wins over an UNORDERED row set, letting an attacker
+            // choose which column-mapping identity seeds the baseline snapshot the #671 CDF identity gate then
+            // validates: a forged row can govern a checkpointed file while the clean row satisfies the gate,
+            // emitting mismapped change data. The count is cross-part (a split forgery, metaData(Y) in one part
+            // and metaData(X) in another, must not slip through). A malformed checkpoint is non-authoritative
+            // (design §2.10.3): this throw is caught below, the partial seed discarded, and the read falls back
+            // to JSON replay — which fails closed on the aged-out gap rather than serving a forged identity.
+            int metadataActions = 0;
             foreach (string partPath in checkpoint.PartPaths)
             {
                 Stream stream = await _backend.OpenReadAsync(partPath, cancellationToken).ConfigureAwait(false);
                 await using (stream.ConfigureAwait(false))
                 {
-                    state.ApplyAll(await DeltaCheckpointReader.ReadAsync(stream, cancellationToken).ConfigureAwait(false));
+                    IReadOnlyList<DeltaAction> actions =
+                        await DeltaCheckpointReader.ReadAsync(stream, cancellationToken).ConfigureAwait(false);
+                    foreach (DeltaAction action in actions)
+                    {
+                        if (action is MetadataAction)
+                        {
+                            metadataActions++;
+                        }
+                    }
+
+                    if (metadataActions > 1)
+                    {
+                        throw DeltaProtocolException.Malformed(string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"Checkpoint at version {checkpoint.Version} carries {metadataActions} metaData actions; a checkpoint must summarize at most one."));
+                    }
+
+                    state.ApplyAll(actions);
                 }
             }
 
@@ -969,9 +998,11 @@ internal sealed class DeltaLog
     /// <summary>
     /// The END-of-range view a change-feed read validates against: the end snapshot's <c>metaData</c> AND the
     /// single <c>_delta_log</c> listing that snapshot was reconstructed from, bound together (#691, council
-    /// R1 item 6). Only <see cref="LoadChangeFeedEndViewAsync"/> can mint one, so a caller cannot accidentally
-    /// pair an end identity with a listing from a DIFFERENT log view — the "provably co-extensive" claim the
-    /// pre-range gate's coverage argument rests on is structural, not a convention.
+    /// R1 item 6). The private constructor keeps the pair un-mintable by external code, and the sole PRODUCTION
+    /// factory (<see cref="LoadChangeFeedEndViewAsync"/>) derives BOTH members from one snapshot-load result —
+    /// so in production the end identity and the listing are provably co-extensive, which the pre-range gate's
+    /// coverage argument rests on. (<see cref="From"/> is <c>internal</c>, so in-assembly test code can
+    /// deliberately mispair a snapshot with an unrelated listing; production has exactly one call site.)
     /// </summary>
     internal readonly struct ChangeFeedEndView
     {
@@ -987,9 +1018,10 @@ internal sealed class DeltaLog
         /// <summary>The log listing that same end snapshot was reconstructed from.</summary>
         internal LogListing Listing { get; }
 
-        /// <summary>The ONLY way to build one: the end metadata is DERIVED from the snapshot in the same
-        /// <see cref="LoadSnapshotWithListingAsync"/> result the listing came from, so the pair cannot be
-        /// assembled from two unrelated log views. The constructor itself is private.</summary>
+        /// <summary>The sole PRODUCTION factory: the end metadata is DERIVED from the snapshot in the same
+        /// <see cref="LoadSnapshotWithListingAsync"/> result the listing came from, so its single production
+        /// call site cannot pair two unrelated log views. The constructor itself is private; this factory is
+        /// <c>internal</c> for in-assembly tests (which may deliberately mispair to exercise the gate).</summary>
         internal static ChangeFeedEndView From((Snapshot Snapshot, LogListing Listing) load) =>
             new(load.Snapshot.Metadata, load.Listing);
     }

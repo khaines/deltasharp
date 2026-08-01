@@ -1220,9 +1220,13 @@ public sealed class ChangeFeedReadTests : IDisposable
         // change that REVERTS to the end identity WITHIN the range: v0=X (baseline, before start), v1=X, v2=Y
         // (swapped ids) + remove, v3=X (reverted == end). The pre-range check does NOT fire (v0's identity ==
         // the end's), so ONLY the per-version in-range identity gate in the ChangeFeedReader loop can catch
-        // v2's prevailing identity (Y) != the end identity (X); it fails closed BEFORE reading v2's remove,
-        // naming the offending in-range version (2). Directly exercises the loop gate (a mutant that neuters it
-        // goes RED here).
+        // v2's identity (Y) != the end identity (X); it fails closed BEFORE reading v2's remove, naming the
+        // offending in-range version (2). v2 carries a single metaData, so the IN-LOOP per-applied-metaData
+        // check (ChangeFeedReader `:411`) catches it first — asserted via its distinct "within the commit"
+        // wording. The post-loop PREVAILING-identity check (`:444`) is the backstop for a no-metaData version
+        // that inherits a differing seed; it is redundant here (same value, one metaData) and is proven live
+        // by mutation in the PR fix record (neuter `:411` ⇒ this read still fails closed via `:444` with the
+        // general wording; neuter BOTH ⇒ the forgery is accepted).
         const string protocol =
             "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,"
             + "\"readerFeatures\":[\"columnMapping\"],\"writerFeatures\":[\"columnMapping\",\"changeDataFeed\"]}}";
@@ -1258,8 +1262,8 @@ public sealed class ChangeFeedReadTests : IDisposable
 
         DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
             async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(1, 3)));
-        Assert.Contains("column-mapping identity", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("version 2", ex.Message, StringComparison.Ordinal);   // names the offending in-range version
+        Assert.Contains("a metaData applied within the commit", ex.Message, StringComparison.Ordinal); // in-loop gate (:411)
+        Assert.Matches(@"version 2\b", ex.Message);                          // names the offending in-range version, uniquely
         Assert.DoesNotContain(dataPath, ex.Message, StringComparison.Ordinal);
     }
 
@@ -1308,8 +1312,69 @@ public sealed class ChangeFeedReadTests : IDisposable
             async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(3, 3)));
         Assert.Contains("column-mapping identity", ex.Message, StringComparison.Ordinal);
         Assert.Contains("immutable", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("version 2", ex.Message, StringComparison.Ordinal);   // names the checkpoint (baseline) version
+        Assert.Matches(@"version 2\b", ex.Message);   // names the checkpoint (baseline) version
         Assert.DoesNotContain(histFile, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Cdf_ForgedCheckpointWithMultipleMetadata_FailsClosed()
+    {
+        // #671 CHECKPOINT-path class closure (Security seat R4, executed end-to-end). The pre-range identity
+        // gate seeds its baseline snapshot from a checkpoint via SnapshotState.ApplyAll, which is LAST-WINS over
+        // the checkpoint's UNORDERED action set — and a checkpoint parsed through DeltaCheckpointReader never
+        // reaches the JSON single-metaData guard (DeltaLogActionReader.ParseCommit). So a forged checkpoint
+        // carrying TWO metaData rows lets an attacker choose which column-mapping identity wins: a clean row (X)
+        // satisfies the gate while a forged row (Y) governs a checkpointed file, and CDF then emits that file's
+        // change rows MISMAPPED. Security's executed exploit (B9): checkpoint@2 = [protocol, metaData(Y),
+        // metaData(X), add(victim)] with 3.json = [metaData(X), remove(victim)] returned ACCEPTED rows with the
+        // id/amt columns TRANSPOSED on origin/main. The fix — a CROSS-PART single-metaData guard in
+        // DeltaLog.TrySeedFromCheckpointAsync — treats the multi-metaData checkpoint as non-authoritative, so
+        // the read falls back to JSON replay and fails closed on the aged-out gap.
+        //
+        // The discriminator Security identified is minimal: the ONLY difference from the accepted-by-the-gate
+        // control (Cdf_CheckpointCompactedBaselineIdentityDiffersFromEnd, a single differing metaData Y that the
+        // gate correctly rejects) is the SECOND metaData row (X) that last-wins would let satisfy the gate. Here
+        // the end version carries only metaData (no add/remove), so the guard's effect is a clean accept↔reject
+        // at the gate with no physical victim Parquet: with the guard the read fails closed; mutation (guard
+        // removed) ⇒ checkpoint seeds X, the gate passes, and [3,3] is ACCEPTED empty (quoted in the PR fix
+        // record).
+        string SchemaJson(int idForId, int idForName) =>
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
+            + "{\"delta.columnMapping.id\":" + idForId + ",\"delta.columnMapping.physicalName\":\"col-A\"}},"
+            + "{\"name\":\"name\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":" + idForName + ",\"delta.columnMapping.physicalName\":\"col-B\"}}]}";
+        var config = new[]
+        {
+            ("delta.columnMapping.mode", "id"),
+            ("delta.columnMapping.maxColumnId", "2"),
+            ("delta.enableChangeDataFeed", "true"),
+        };
+        string EndMeta(int idForId, int idForName) =>
+            "{\"metaData\":{\"id\":\"rt\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
+            + "\"schemaString\":" + JsonSerializer.Serialize(SchemaJson(idForId, idForName))
+            + ",\"partitionColumns\":[],\"configuration\":{"
+            + "\"delta.columnMapping.mode\":\"id\",\"delta.columnMapping.maxColumnId\":\"2\","
+            + "\"delta.enableChangeDataFeed\":\"true\"}}}";
+        using var backend = new LocalFileSystemBackend(_root);
+        // Checkpoint@2 carries TWO metaData rows: forged Y (id→2, name→1) THEN clean X (id→1, name→2). ApplyAll
+        // is last-wins ⇒ X would seed the baseline and satisfy the gate. Commits 0..2 JSON are aged out.
+        await DeltaTestHarness.WriteCheckpointAsync(backend, 2, new CheckpointFixture()
+            .Protocol(3, 7, new[] { "columnMapping" }, new[] { "columnMapping", "changeDataFeed" })
+            .Metadata("rt", SchemaJson(2, 1), partitionColumns: null, configuration: config)    // Y (forged)
+            .Metadata("rt", SchemaJson(1, 2), partitionColumns: null, configuration: config));   // X (clean, last-wins)
+        await DeltaTestHarness.WriteLastCheckpointAsync(backend, 2);
+        // v3 (end): identity X, metaData-only (no add/remove) ⇒ [3,3] would emit zero change rows if the gate passed.
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000003.json",
+            Encoding.UTF8.GetBytes(EndMeta(1, 2) + "\n"), CancellationToken.None);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(3, 3)));
+        Assert.DoesNotContain("col-A", ex.Message, StringComparison.Ordinal);   // #653 path/identity-free
+        Assert.DoesNotContain("col-B", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(".parquet", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("_delta_log", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1399,7 +1464,8 @@ public sealed class ChangeFeedReadTests : IDisposable
 
         DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
             async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(1, 1)));
-        Assert.Contains("metaData action", ex.Message, StringComparison.Ordinal);   // the structural parse guard
+        Assert.Matches(@"version 1\b", ex.Message);                                  // names the offending version, uniquely
+        Assert.Contains("2 metaData actions", ex.Message, StringComparison.Ordinal); // pins the count the guard reports
         Assert.DoesNotContain("col-A", ex.Message, StringComparison.Ordinal);        // #653 path/identity-free
         Assert.DoesNotContain("col-B", ex.Message, StringComparison.Ordinal);
     }
@@ -1450,7 +1516,7 @@ public sealed class ChangeFeedReadTests : IDisposable
         DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
             async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(3, 3)));
         Assert.Contains("column-mapping identity", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("version 1", ex.Message, StringComparison.Ordinal);   // the surviving sub-floor version
+        Assert.Matches(@"version 1\b", ex.Message);   // the surviving sub-floor version
         Assert.DoesNotContain(histFile, ex.Message, StringComparison.Ordinal);
     }
 

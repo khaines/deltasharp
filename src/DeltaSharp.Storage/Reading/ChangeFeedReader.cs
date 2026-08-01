@@ -407,12 +407,17 @@ internal sealed class ChangeFeedReader
                     // >1 metaData per commit): validate EVERY applied metaData's identity, not only the last-wins
                     // prevailing one, so a forged-then-reverted identity within a single commit could not slip
                     // past even if that guard were ever relaxed. Redundant while the guard holds (a commit
-                    // carries at most one metaData), so this only ever fires under a mutated/forged parser.
+                    // carries at most one metaData ⇒ the applied metaData IS the prevailing one the post-loop
+                    // check re-validates), so this only ever fires uniquely under a mutated/forged parser. Its
+                    // message names the "within the commit" origin so a mutation that neuters it is attributable
+                    // (removing it makes this scenario fall through to the post-loop backstop with a distinct
+                    // message).
                     if (!endIdentity.IsImmutableFrom(currentIdentity))
                     {
                         throw new DeltaReadException(
-                            $"The change-feed range crosses a column-mapping identity change at version {v}; the range "
-                            + "is read through a single (end-snapshot) column-mapping identity (mode, field ids, and "
+                            $"The change-feed range crosses a column-mapping identity change at version {v} (a metaData "
+                            + "applied within the commit declares an identity that differs from the end of the range); the "
+                            + "range is read through a single (end-snapshot) column-mapping identity (mode, field ids, and "
                             + "physical names), so such a transition is not supported and the read fails closed rather "
                             + "than risk emitting mismapped change data.");
                     }
