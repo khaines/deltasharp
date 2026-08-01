@@ -55,6 +55,36 @@ internal static class DeltaLogActionReader
             }
         }
 
+        // A commit may declare AT MOST ONE metaData action (Delta protocol: a commit's metaData REPLACES the
+        // table metadata; two in one commit is malformed). Enforcing it here — the single JSON-commit parse
+        // point, shared by the reader, the pre-range gate, snapshot replay, and commit-conflict detection —
+        // closes the "validate only the final prevailing identity" class for every JSON-commit consumer
+        // (#671): none can be fooled by a forged-then-reverted column-mapping identity WITHIN one commit,
+        // because such a commit fails closed here before any identity check runs. (A CDF read wraps this
+        // DeltaProtocolException as a path-free DeltaReadException.) The *checkpoint* path does NOT flow
+        // through here — it is guarded by the cross-part analogue in DeltaLog.TrySeedFromCheckpointAsync; the
+        // two guards together make "≤1 metaData per version" hold across BOTH aggregation points.
+        //
+        // NOTE (forward-compat): if log compaction (`<lo>.<hi>.compacted.json`, which legitimately aggregates
+        // several versions' actions into one file) is ever added, it MUST NOT be routed through ParseCommit —
+        // a compaction range may carry one metaData per constituent version, which this per-commit guard would
+        // wrongly reject. Give it a distinct entry point.
+        int metadataActions = 0;
+        foreach (DeltaAction parsed in actions)
+        {
+            if (parsed is MetadataAction)
+            {
+                metadataActions++;
+            }
+        }
+
+        if (metadataActions > 1)
+        {
+            throw DeltaProtocolException.Malformed(string.Create(
+                CultureInfo.InvariantCulture,
+                $"Delta log version {version} carries {metadataActions} metaData actions; a commit must declare at most one."));
+        }
+
         return actions;
     }
 

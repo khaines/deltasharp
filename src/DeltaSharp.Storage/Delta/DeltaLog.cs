@@ -86,10 +86,28 @@ internal sealed class DeltaLog
     {
         long start = Stopwatch.GetTimestamp();
         LogListing listing = await ListLogAsync(cancellationToken).ConfigureAwait(false);
+        Snapshot snapshot = await LoadSnapshotFromListingAsync(listing, version, start, null, cancellationToken)
+            .ConfigureAwait(false);
+        return (snapshot, listing);
+    }
+
+    /// <summary>Resolves and reconstructs a snapshot from an <b>already-obtained</b> <see cref="LogListing"/> —
+    /// <see cref="LoadSnapshotWithListingAsync"/> minus the <c>_delta_log</c> LIST — so a caller holding a
+    /// listing can load a second snapshot (or drive a listing-derived scan) without re-listing (#691).
+    /// Resolution is identical to the listing-owning overload (<see cref="RequireLatest"/> +
+    /// <see cref="ResolveExplicitVersionTarget"/>), so an out-of-range or retention-gapped
+    /// <paramref name="version"/> fails closed with the SAME typed error. <paramref name="replayObserver"/>,
+    /// when supplied, records the JSON commits this reconstruction actually replays (see
+    /// <see cref="ReplayedMetadataLog"/>); passing <see langword="null"/> leaves the reconstruction path
+    /// byte-for-byte unchanged.</summary>
+    private async Task<Snapshot> LoadSnapshotFromListingAsync(
+        LogListing listing, long? version, long startTimestamp, ReplayedMetadataLog? replayObserver,
+        CancellationToken cancellationToken)
+    {
         long latest = RequireLatest(listing);
         long target = ResolveExplicitVersionTarget(listing, latest, version);
-        Snapshot snapshot = await ReconstructAsync(listing, target, start, cancellationToken).ConfigureAwait(false);
-        return (snapshot, listing);
+        return await ReconstructAsync(listing, target, startTimestamp, replayObserver, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     /// <summary>
@@ -137,7 +155,7 @@ internal sealed class DeltaLog
         LogListing listing = await ListLogAsync(cancellationToken).ConfigureAwait(false);
         _ = RequireLatest(listing);
         long resolved = ResolveTimestampTarget(listing, asOf, canReturnLatest);
-        Snapshot snapshot = await ReconstructAsync(listing, resolved, start, cancellationToken).ConfigureAwait(false);
+        Snapshot snapshot = await ReconstructAsync(listing, resolved, start, null, cancellationToken).ConfigureAwait(false);
         return new TimeTravelResult(snapshot, resolved);
     }
 
@@ -331,9 +349,15 @@ internal sealed class DeltaLog
 
     /// <summary>Reconstructs the immutable snapshot at <paramref name="target"/>: seed from the newest usable
     /// checkpoint <c>≤ target</c> (never a later one — AC4), replay JSON commits up to <paramref name="target"/>,
-    /// materialize, and fail closed on an unsupported protocol before serving.</summary>
+    /// materialize, and fail closed on an unsupported protocol before serving.
+    /// <para><paramref name="replayObserver"/> (optional, <see langword="null"/> for every ordinary load) is a
+    /// pure OBSERVER of the JSON replay: it records which commit versions this reconstruction actually read
+    /// and the <c>metaData</c> actions they expressed, so a caller that must ALSO inspect those commits'
+    /// metadata (the #671 change-feed pre-range column-mapping identity gate) can reuse this pass instead of
+    /// reading the same commit objects a second time (#691). It cannot influence reconstruction.</para></summary>
     private async Task<Snapshot> ReconstructAsync(
-        LogListing listing, long target, long startTimestamp, CancellationToken cancellationToken)
+        LogListing listing, long target, long startTimestamp, ReplayedMetadataLog? replayObserver,
+        CancellationToken cancellationToken)
     {
         IReadOnlyList<CheckpointSelection> checkpoints =
             await SelectCheckpointsAsync(listing, target, cancellationToken).ConfigureAwait(false);
@@ -356,8 +380,8 @@ internal sealed class DeltaLog
         }
 
         long replayStart = checkpointVersion is { } c ? c + 1 : 0;
-        int replayed = await ReplayContiguousAsync(state, replayStart, target, listing.Commits, cancellationToken)
-            .ConfigureAwait(false);
+        int replayed = await ReplayContiguousAsync(
+            state, replayStart, target, listing.Commits, replayObserver, cancellationToken).ConfigureAwait(false);
 
         var metrics = new SnapshotLoadMetrics(
             CheckpointVersion: checkpointVersion,
@@ -471,6 +495,89 @@ internal sealed class DeltaLog
     }
 
     /// <summary>
+    /// Loads the snapshot at a change-feed range's <paramref name="rangeStartVersion"/> AND — in the SAME
+    /// log pass — validates the #671 pre-range column-mapping IDENTITY-immutability gate over
+    /// <c>[earliest, rangeStartVersion - 1]</c>. Both were previously independent operations that each listed
+    /// <c>_delta_log</c> and each read the SAME pre-range commit objects; fusing them makes the pre-range gate
+    /// <b>listing-free</b> (it runs entirely off the caller's <paramref name="listing"/> — the one the END
+    /// snapshot was reconstructed from) and collapses the double read of every pre-range commit to a single
+    /// read (#691).
+    /// <para><b>Coverage is unchanged</b> (see
+    /// <see cref="ValidateColumnMappingIdentityStableBeforeAsync"/> for the proof): the start-snapshot
+    /// reconstruction reports every commit it replays to a <see cref="ReplayedMetadataLog"/>, and the gate
+    /// consumes those observations for exactly the versions the replay covered, explicitly READING every other
+    /// retained pre-range commit — including a stray surviving strictly below a compacting checkpoint floor,
+    /// which the replay never touches. Validation order is unchanged (baseline first, then ascending
+    /// versions), so the fail-closed message still names the same version.</para>
+    /// <para><b>Log-view coupling.</b> Because the gate runs off the listing carried by
+    /// <paramref name="endView"/>, the pre-range window it validates is provably co-extensive with the log
+    /// view the END identity it compares against came from — the <see cref="ChangeFeedEndView"/> type makes
+    /// that a structural property rather than a caller convention. That is COVERAGE-SAFER (log cleanup only
+    /// deletes, so the earlier listing's commit set is a SUPERSET of any later one's, and the gate can only
+    /// validate more), but it is AVAILABILITY-COSTLIER: the listing is now consumed over one long window
+    /// instead of three short ones, so a commit that concurrent cleanup deletes between the listing and the
+    /// gate's read of it surfaces as a fail-closed read error rather than being silently absent from a fresh
+    /// listing. That trade is deliberate — the gate exists to fail closed on anything it cannot verify.</para>
+    /// <para><b>Fail ORDER changed (#691).</b> The start-snapshot reconstruction now runs BEFORE the pre-range
+    /// gate (it is what feeds it). On a log that is BOTH protocol-illegal at the start version and forged
+    /// earlier in history, the surfaced error is now the protocol/feature error rather than the identity
+    /// error, so the "names the offending version" contract of the identity gate does not apply on that path.
+    /// Both are fail-closed and both are path-free; only which one wins changed.</para>
+    /// </summary>
+    /// <exception cref="DeltaProtocolException">The start version is out of range / no longer retained, the
+    /// log has a gap, a retained commit is malformed, the reconstruction did not land on the requested start
+    /// version, or a retained version before the range declares a different (or unrecognized) column-mapping
+    /// identity.</exception>
+    internal async Task<Snapshot> LoadChangeFeedStartSnapshotAsync(
+        ChangeFeedEndView endView, long rangeStartVersion, CancellationToken cancellationToken)
+    {
+        // Only PRE-range versions are observed: [start, end] is the reader's per-version gate, and bounding the
+        // observation keeps the retained metadata proportional to the pre-range history's metadata revisions.
+        long startTimestamp = Stopwatch.GetTimestamp();
+        var replayed = new ReplayedMetadataLog(rangeStartVersion);
+        Snapshot startSnapshot = await LoadSnapshotFromListingAsync(
+            endView.Listing, rangeStartVersion, startTimestamp, replayed, cancellationToken)
+            .ConfigureAwait(false);
+
+        // The observer's exclusive upper bound is the REQUESTED start version, while the replay stops at the
+        // version target resolution landed on. They are equal for a valid explicit version (the resolver is
+        // the identity there — only the timestamp path clamps), but that equality is an assumption, and if it
+        // ever drifted the failure mode would be a silent COVERAGE hole, not a compile error. Assert it.
+        if (startSnapshot.Version != rangeStartVersion)
+        {
+            throw DeltaProtocolException.Inconsistent(string.Create(
+                CultureInfo.InvariantCulture,
+                $"A change-feed start-snapshot load for version {rangeStartVersion} reconstructed version "
+                + $"{startSnapshot.Version} instead; the pre-range validation window can no longer be proven "
+                + $"to match the range, so the read fails closed."));
+        }
+
+        // Close the observation phase BEFORE anything consumes it: sealing runs the whole-window cross-checks
+        // once over the COMPLETE window and makes Record/TryGetProvenObservation mutually exclusive phases, so
+        // a future change that interleaved replay with validation cannot evaluate a whole-window predicate
+        // over a partial window (council R2).
+        replayed.Seal();
+
+        await ValidateColumnMappingIdentityStableBeforeAsync(
+            endView.Listing, rangeStartVersion, endView.EndMetadata, replayed, cancellationToken)
+            .ConfigureAwait(false);
+        return startSnapshot;
+    }
+
+    /// <summary>Loads the change-feed range's END snapshot together with the single <c>_delta_log</c> listing
+    /// it was reconstructed from, minting the <see cref="ChangeFeedEndView"/> that
+    /// <see cref="LoadChangeFeedStartSnapshotAsync"/> consumes. The view exists so "this end metadata and this
+    /// listing came from the SAME snapshot load" is enforced by the type system rather than by a caller
+    /// convention over two unrelated parameters.</summary>
+    internal async Task<(Snapshot End, ChangeFeedEndView View)> LoadChangeFeedEndViewAsync(
+        long? version, CancellationToken cancellationToken)
+    {
+        (Snapshot Snapshot, LogListing Listing) load =
+            await LoadSnapshotWithListingAsync(version, cancellationToken).ConfigureAwait(false);
+        return (load.Snapshot, ChangeFeedEndView.From(load));
+    }
+
+    /// <summary>
     /// Validates that the column-mapping IDENTITY — mode, per-column <c>delta.columnMapping.id</c> (field id),
     /// physical name, and the partition-column set — is immutable across the RETAINED history strictly BEFORE
     /// <paramref name="rangeStartVersion"/>, matching the end-of-range identity in
@@ -487,56 +594,92 @@ internal sealed class DeltaLog
     /// column) is allowed: only a column present in BOTH a historical version and the end is identity-compared.
     /// The in-range <c>[start, end]</c> window is validated per-version by the change-feed reader, so this
     /// closes the pre-<c>start</c> gap the per-version check cannot see.
+    /// <para><b>Scan source (#691).</b> <paramref name="alreadyReplayed"/> carries the commits the caller's
+    /// start-snapshot reconstruction ALREADY read on this same <paramref name="listing"/>; a pre-range version
+    /// it covers is validated from those observations instead of being re-read (the replay parsed the whole
+    /// commit, so its <c>metaData</c> actions are exactly what a re-read would yield). Every pre-range commit
+    /// the replay did NOT cover — always including a stray surviving strictly below the reconstructable floor,
+    /// which no replay can reach — is still READ here. The validated set is therefore identical to a full
+    /// re-scan: <c>{earliest}</c> (baseline snapshot, when <c>earliest &lt; start</c>) ∪
+    /// <c>{v ∈ listing.Commits : v &lt; start}</c> — every pre-range commit's OWN <c>metaData</c>, including the
+    /// floor commit's, visited in ascending version order either way.</para>
+    /// <para><b>Why an observation is never trusted on its silence (council R1).</b> This gate enforces a
+    /// SECURITY property, so it must not infer "this version changed no identity" from an observer that merely
+    /// SAYS nothing — that would make the gate vacuous if a future replay change under-reported. An observation
+    /// is consumed only when the replay PROVABLY covered the version (contiguous covered window) and the record
+    /// is corroborated by the reconstruction's own metadata lineage (state metadata reference changes across a
+    /// version iff that version carried a <c>metaData</c>); see <see cref="ReplayedMetadataLog"/>. Everything
+    /// else either falls back to the disk read or fails closed. Consequently the union of (proven, corroborated
+    /// observations) and (disk reads) equals the full validation set BY CONSTRUCTION, and any defect in the
+    /// observing seam can only cost performance or availability — never coverage.</para>
     /// <para><b>Residual (inherent).</b> An identity change recorded ONLY in commit JSON that has been DELETED
     /// (aged out) below the earliest reconstructable version is physically unreadable; a still-referenced
     /// below-floor file is then read under the uniform retained identity, which is equivalent to ordinary
     /// data-content forgery — no capability beyond the issue's already-stipulated <c>_delta_log</c>-write
     /// threat model. Every commit whose JSON SURVIVES — including a stray persisting strictly below a
-    /// compacting checkpoint floor — IS scanned here (we skip only the exact baseline version); only truly
+    /// compacting checkpoint floor, AND the floor commit's own JSON when it survives — IS scanned here (the
+    /// baseline validates the checkpoint-BAKED identity, which a forger can make disagree with
+    /// <c>&lt;earliest&gt;.json</c>, so the floor commit's own <c>metaData</c> is validated too); only truly
     /// deleted commit JSON is unvalidatable.</para>
     /// The fail-closed message is path-free (#653): it names ONLY the offending version.
     /// </summary>
     /// <exception cref="DeltaProtocolException">A retained version before the range declares a different (or
     /// unrecognized) column-mapping identity, or a retained commit is malformed / exceeds the read ceiling.</exception>
-    internal async Task ValidateColumnMappingIdentityStableBeforeAsync(
-        long rangeStartVersion, MetadataAction endMetadata, CancellationToken cancellationToken)
+    private async Task ValidateColumnMappingIdentityStableBeforeAsync(
+        LogListing listing, long rangeStartVersion, MetadataAction endMetadata,
+        ReplayedMetadataLog alreadyReplayed, CancellationToken cancellationToken)
     {
-        LogListing listing = await ListLogAsync(cancellationToken).ConfigureAwait(false);
         long earliest = EarliestReconstructableVersion(listing);
-        if (earliest >= rangeStartVersion)
-        {
-            return; // No retained history before the range; the reader's per-version check covers [start, end].
-        }
-
         ColumnMappingIdentity endIdentity = BuildIdentity(endMetadata);
 
         // Baseline: the identity as of the earliest reconstructable version — compacted from a checkpoint when
         // the creation commit has aged out, so a checkpoint-baked identity that no surviving commit re-expresses
-        // is still caught.
-        Snapshot earliestSnapshot = await LoadSnapshotAsync(earliest, cancellationToken).ConfigureAwait(false);
-        ValidateHistoricalIdentity(earliest, earliestSnapshot.Metadata, endIdentity);
+        // is still caught. Reconstructed from the SAME listing (no second LIST, #691). This baseline exists
+        // ONLY when the reconstructable floor precedes the range: when earliest >= start the floor sits inside
+        // [start, end], where the reader's own per-version identity check already covers it, so there is no
+        // pre-range baseline to establish here. The surviving-commit loop below still runs in BOTH cases.
+        if (earliest < rangeStartVersion)
+        {
+            Snapshot earliestSnapshot = await LoadSnapshotFromListingAsync(
+                listing, earliest, Stopwatch.GetTimestamp(), null, cancellationToken).ConfigureAwait(false);
+            ValidateHistoricalIdentity(earliest, earliestSnapshot.Metadata, endIdentity);
+        }
 
         // Every retained commit's metaData REPLACES the metadata (Delta semantics); a differing identity at any
-        // version before the range — including a change-and-change-back that reverted before start, or a
-        // SURVIVING commit whose JSON persists strictly below the earliest reconstructable floor (e.g. below a
-        // compacting checkpoint) — is forged. We skip ONLY the exact baseline version (== earliest, already
-        // validated above via the earliest snapshot); a below-floor stray (version < earliest) with a surviving
-        // JSON is still read and validated, so a transient identity forged there cannot hide beneath a
-        // checkpoint that bakes the reverted identity.
+        // version before the range is forged — a change-and-change-back reverted before start, a SURVIVING
+        // commit whose JSON persists strictly below the reconstructable floor (below a compacting checkpoint),
+        // or the floor commit's OWN metaData. We validate every pre-range commit's own `metaData` here and skip
+        // ONLY in-range versions (>= start, the reader's per-version check). Critically we do NOT skip
+        // `version == earliest`: the baseline above validated the RECONSTRUCTED snapshot at `earliest`, which for
+        // a checkpoint floor is the checkpoint's BAKED identity — NOT `<earliest>.json`'s own declaration. A
+        // forged log can bake a clean identity into the checkpoint at V while `V.json` declares a swapped one;
+        // only reading `<V>.json` here catches it. When the floor commit's JSON has aged out, `earliest` is not
+        // in `listing.Commits`, so there is nothing extra to read and the baseline alone covers it.
         foreach (long version in listing.Commits)
         {
-            if (version == earliest || version >= rangeStartVersion)
+            if (version >= rangeStartVersion)
             {
-                continue; // == earliest folded into the baseline; >= start is the reader's per-version check.
+                continue; // in-range versions are covered by the reader's per-version identity check.
             }
 
             cancellationToken.ThrowIfCancellationRequested();
-            foreach (DeltaAction action in await ReadCommitActionsAsync(version, cancellationToken).ConfigureAwait(false))
+
+            // #691: the start-snapshot reconstruction on THIS listing already read (and fully parsed) this
+            // commit; reuse its metaData actions rather than issuing a second GET for the same immutable
+            // object. The observation is consumable ONLY when the replay PROVABLY covered this version and its
+            // record is corroborated by the reconstruction's own metadata lineage (see ReplayedMetadataLog);
+            // anything else — a version the replay never reached (always the case for a sub-floor stray or a
+            // commit below the seeding checkpoint) — falls back to the disk read below. An observer defect can
+            // therefore cost a fail-closed read or an extra GET, but can NEVER shrink this validation set.
+            IReadOnlyList<MetadataAction> versionMetadata =
+                alreadyReplayed.TryGetProvenObservation(version, out IReadOnlyList<MetadataAction> observed)
+                    ? observed
+                    : ReplayedMetadataLog.MetadataActionsOf(
+                        await ReadCommitActionsAsync(version, cancellationToken).ConfigureAwait(false));
+
+            foreach (MetadataAction metadata in versionMetadata)
             {
-                if (action is MetadataAction metadata)
-                {
-                    ValidateHistoricalIdentity(version, metadata, endIdentity);
-                }
+                ValidateHistoricalIdentity(version, metadata, endIdentity);
             }
         }
     }
@@ -582,12 +725,41 @@ internal sealed class DeltaLog
     {
         try
         {
+            // A checkpoint summarizes exactly ONE prevailing metaData at its version (Delta protocol: a
+            // checkpoint is the reconciled snapshot of the table state, and a version carries at most one
+            // metaData). Enforce it ACROSS ALL PARTS — the checkpoint-side analogue of the single-metaData
+            // guard at the JSON parse point (DeltaLogActionReader.ParseCommit). Without it, a forged
+            // multi-metaData checkpoint is applied last-wins over an UNORDERED row set, letting an attacker
+            // choose which column-mapping identity seeds the baseline snapshot the #671 CDF identity gate then
+            // validates: a forged row can govern a checkpointed file while the clean row satisfies the gate,
+            // emitting mismapped change data. The count is cross-part (a split forgery, metaData(Y) in one part
+            // and metaData(X) in another, must not slip through). A malformed checkpoint is non-authoritative
+            // (design §2.10.3): this throw is caught below, the partial seed discarded, and the read falls back
+            // to JSON replay — which fails closed on the aged-out gap rather than serving a forged identity.
+            int metadataActions = 0;
             foreach (string partPath in checkpoint.PartPaths)
             {
                 Stream stream = await _backend.OpenReadAsync(partPath, cancellationToken).ConfigureAwait(false);
                 await using (stream.ConfigureAwait(false))
                 {
-                    state.ApplyAll(await DeltaCheckpointReader.ReadAsync(stream, cancellationToken).ConfigureAwait(false));
+                    IReadOnlyList<DeltaAction> actions =
+                        await DeltaCheckpointReader.ReadAsync(stream, cancellationToken).ConfigureAwait(false);
+                    foreach (DeltaAction action in actions)
+                    {
+                        if (action is MetadataAction)
+                        {
+                            metadataActions++;
+                        }
+                    }
+
+                    if (metadataActions > 1)
+                    {
+                        throw DeltaProtocolException.Malformed(string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"Checkpoint at version {checkpoint.Version} carries {metadataActions} metaData actions; a checkpoint must summarize at most one."));
+                    }
+
+                    state.ApplyAll(actions);
                 }
             }
 
@@ -602,9 +774,13 @@ internal sealed class DeltaLog
     }
 
     /// <summary>Replays JSON commits <c>[start, target]</c> in ascending order into <paramref name="state"/>,
-    /// requiring a contiguous chain (a missing version is a gap → fail closed).</summary>
+    /// requiring a contiguous chain (a missing version is a gap → fail closed). Each replayed version is
+    /// reported to <paramref name="replayObserver"/> (when supplied) with its parsed actions AND the state's
+    /// prevailing metadata immediately before/after applying them, so an observing caller sees exactly the
+    /// commits this replay read and can corroborate every observation against the state it produced.</summary>
     private async Task<int> ReplayContiguousAsync(
-        SnapshotState state, long start, long target, IReadOnlySet<long> commits, CancellationToken cancellationToken)
+        SnapshotState state, long start, long target, IReadOnlySet<long> commits,
+        ReplayedMetadataLog? replayObserver, CancellationToken cancellationToken)
     {
         int replayed = 0;
         for (long v = start; v <= target; v++)
@@ -618,7 +794,10 @@ internal sealed class DeltaLog
 
             string path = LogPrefix + FormatVersion(v) + ".json";
             ReadOnlyMemory<byte> content = await ReadAllAsync(path, cancellationToken).ConfigureAwait(false);
-            state.ApplyAll(DeltaLogActionReader.ParseCommit(content, v));
+            IReadOnlyList<DeltaAction> actions = DeltaLogActionReader.ParseCommit(content, v);
+            MetadataAction? prevailingBefore = state.Metadata;
+            state.ApplyAll(actions);
+            replayObserver?.Observe(v, actions, prevailingBefore, state.Metadata);
             replayed++;
         }
 
@@ -714,6 +893,12 @@ internal sealed class DeltaLog
                 case DeltaLogFileKind.V2Checkpoint:
                     // Skipped: V2/UUID checkpoints are accepted only under the v2Checkpoint reader feature,
                     // which protocol negotiation rejects for a v1-baseline reader (§2.10.3/§2.10.5).
+                    //
+                    // FORWARD-COMPAT (#671, Architect R5): a V2/sidecar checkpoint aggregates a version's actions
+                    // across sidecar files — a THIRD metaData-aggregation point (beyond JSON commit parse and
+                    // classic-checkpoint seed). When v2Checkpoint support lands it MUST carry the same cross-part
+                    // ≤1-metaData guard (the checkpoint-side analogue in TrySeedFromCheckpointAsync), or the
+                    // "validate only the prevailing identity" class re-opens on the sidecar path.
                     break;
 
                 case DeltaLogFileKind.Other:
@@ -815,6 +1000,37 @@ internal sealed class DeltaLog
 
     /// <summary>A resolved checkpoint to seed from: its <see cref="Version"/> and ordered part paths.</summary>
     private sealed record CheckpointSelection(long Version, IReadOnlyList<string> PartPaths);
+
+    /// <summary>
+    /// The END-of-range view a change-feed read validates against: the end snapshot's <c>metaData</c> AND the
+    /// single <c>_delta_log</c> listing that snapshot was reconstructed from, bound together (#691, council
+    /// R1 item 6). The private constructor keeps the pair un-mintable by external code, and the sole PRODUCTION
+    /// factory (<see cref="LoadChangeFeedEndViewAsync"/>) derives BOTH members from one snapshot-load result —
+    /// so in production the end identity and the listing are provably co-extensive, which the pre-range gate's
+    /// coverage argument rests on. (<see cref="From"/> is <c>internal</c>, so in-assembly test code can
+    /// deliberately mispair a snapshot with an unrelated listing; production has exactly one call site.)
+    /// </summary>
+    internal readonly struct ChangeFeedEndView
+    {
+        private ChangeFeedEndView(MetadataAction endMetadata, LogListing listing)
+        {
+            EndMetadata = endMetadata;
+            Listing = listing;
+        }
+
+        /// <summary>The end snapshot's <c>metaData</c> — the identity every earlier version is compared to.</summary>
+        internal MetadataAction EndMetadata { get; }
+
+        /// <summary>The log listing that same end snapshot was reconstructed from.</summary>
+        internal LogListing Listing { get; }
+
+        /// <summary>The sole PRODUCTION factory: the end metadata is DERIVED from the snapshot in the same
+        /// <see cref="LoadSnapshotWithListingAsync"/> result the listing came from, so its single production
+        /// call site cannot pair two unrelated log views. The constructor itself is private; this factory is
+        /// <c>internal</c> for in-assembly tests (which may deliberately mispair to exercise the gate).</summary>
+        internal static ChangeFeedEndView From((Snapshot Snapshot, LogListing Listing) load) =>
+            new(load.Snapshot.Metadata, load.Listing);
+    }
 
     /// <summary>The discovered <c>_delta_log</c> contents: commit versions, each commit object's modification
     /// time (the timestamp-time-travel source, design §2.12.1), classic checkpoint groups, the latest
