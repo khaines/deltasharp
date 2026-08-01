@@ -600,8 +600,9 @@ internal sealed class DeltaLog
     /// commit, so its <c>metaData</c> actions are exactly what a re-read would yield). Every pre-range commit
     /// the replay did NOT cover — always including a stray surviving strictly below the reconstructable floor,
     /// which no replay can reach — is still READ here. The validated set is therefore identical to a full
-    /// re-scan: <c>{earliest}</c> (baseline snapshot) ∪ <c>{v ∈ listing.Commits : v &lt; start, v ≠ earliest}</c>,
-    /// visited in ascending version order either way.</para>
+    /// re-scan: <c>{earliest}</c> (baseline snapshot, when <c>earliest &lt; start</c>) ∪
+    /// <c>{v ∈ listing.Commits : v &lt; start}</c> — every pre-range commit's OWN <c>metaData</c>, including the
+    /// floor commit's, visited in ascending version order either way.</para>
     /// <para><b>Why an observation is never trusted on its silence (council R1).</b> This gate enforces a
     /// SECURITY property, so it must not infer "this version changed no identity" from an observer that merely
     /// SAYS nothing — that would make the gate vacuous if a future replay change under-reported. An observation
@@ -616,7 +617,9 @@ internal sealed class DeltaLog
     /// below-floor file is then read under the uniform retained identity, which is equivalent to ordinary
     /// data-content forgery — no capability beyond the issue's already-stipulated <c>_delta_log</c>-write
     /// threat model. Every commit whose JSON SURVIVES — including a stray persisting strictly below a
-    /// compacting checkpoint floor — IS scanned here (we skip only the exact baseline version); only truly
+    /// compacting checkpoint floor, AND the floor commit's own JSON when it survives — IS scanned here (the
+    /// baseline validates the checkpoint-BAKED identity, which a forger can make disagree with
+    /// <c>&lt;earliest&gt;.json</c>, so the floor commit's own <c>metaData</c> is validated too); only truly
     /// deleted commit JSON is unvalidatable.</para>
     /// The fail-closed message is path-free (#653): it names ONLY the offending version.
     /// </summary>
@@ -643,27 +646,20 @@ internal sealed class DeltaLog
         }
 
         // Every retained commit's metaData REPLACES the metadata (Delta semantics); a differing identity at any
-        // version before the range — including a change-and-change-back that reverted before start, or a
-        // SURVIVING commit whose JSON persists strictly below the earliest reconstructable floor (e.g. below a
-        // compacting checkpoint) — is forged. Critically this holds EVEN WHEN the floor is at or above the range
-        // start: a forged sub-floor stray under a checkpoint at/above `start` must still be validated (the prior
-        // `earliest >= start` early return skipped this loop, letting such a forgery emit mismapped change data).
-        // We skip ONLY the exact baseline version (== earliest, validated above when it precedes the range) and
-        // in-range versions (>= start, the reader's per-version check); a below-floor stray with surviving JSON
-        // is still read and validated, so a transient forged identity cannot hide beneath a compacting checkpoint.
-
-        // Every retained commit's metaData REPLACES the metadata (Delta semantics); a differing identity at any
-        // version before the range — including a change-and-change-back that reverted before start, or a
-        // SURVIVING commit whose JSON persists strictly below the earliest reconstructable floor (e.g. below a
-        // compacting checkpoint) — is forged. We skip ONLY the exact baseline version (== earliest, already
-        // validated above via the earliest snapshot); a below-floor stray (version < earliest) with a surviving
-        // JSON is still read and validated, so a transient identity forged there cannot hide beneath a
-        // checkpoint that bakes the reverted identity.
+        // version before the range is forged — a change-and-change-back reverted before start, a SURVIVING
+        // commit whose JSON persists strictly below the reconstructable floor (below a compacting checkpoint),
+        // or the floor commit's OWN metaData. We validate every pre-range commit's own `metaData` here and skip
+        // ONLY in-range versions (>= start, the reader's per-version check). Critically we do NOT skip
+        // `version == earliest`: the baseline above validated the RECONSTRUCTED snapshot at `earliest`, which for
+        // a checkpoint floor is the checkpoint's BAKED identity — NOT `<earliest>.json`'s own declaration. A
+        // forged log can bake a clean identity into the checkpoint at V while `V.json` declares a swapped one;
+        // only reading `<V>.json` here catches it. When the floor commit's JSON has aged out, `earliest` is not
+        // in `listing.Commits`, so there is nothing extra to read and the baseline alone covers it.
         foreach (long version in listing.Commits)
         {
-            if (version == earliest || version >= rangeStartVersion)
+            if (version >= rangeStartVersion)
             {
-                continue; // == earliest folded into the baseline; >= start is the reader's per-version check.
+                continue; // in-range versions are covered by the reader's per-version identity check.
             }
 
             cancellationToken.ThrowIfCancellationRequested();

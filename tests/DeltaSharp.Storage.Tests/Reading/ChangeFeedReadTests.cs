@@ -1313,6 +1313,59 @@ public sealed class ChangeFeedReadTests : IDisposable
     }
 
     [Fact]
+    public async Task Cdf_CheckpointFloorCommitOwnMetadataDiffersFromEnd_FailsClosed_NamesFloorVersion()
+    {
+        // #671 checkpoint-floor OWN-metaData coverage (Security seat R2, executed). A complete checkpoint@2
+        // bakes a CLEAN identity X (== end) so the baseline snapshot passes; but the surviving `2.json` at the
+        // floor version itself declares a SWAPPED identity Y. The baseline reconstructs the checkpoint-BAKED
+        // identity (X), not `<2>.json`'s own declaration (Y) — a forger with `_delta_log` write access can make
+        // them disagree. Only reading `<2>.json`'s own metaData in the pre-range scan catches it; the prior
+        // `version == earliest` skip assumed the baseline covered it and let Y through, emitting mismapped
+        // change data. Reading [3,3] (v3 == X, no change rows) means pre-fix the read ACCEPTED; with the fix it
+        // fails closed naming version 2. (Sibling of Cdf_CheckpointCompactedBaselineIdentityDiffersFromEnd,
+        // which exercises the OTHER direction — checkpoint identity itself differs from end.)
+        string SchemaJson(int idForId, int idForName) =>
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
+            + "{\"delta.columnMapping.id\":" + idForId + ",\"delta.columnMapping.physicalName\":\"col-A\"}},"
+            + "{\"name\":\"name\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":" + idForName + ",\"delta.columnMapping.physicalName\":\"col-B\"}}]}";
+        var config = new[]
+        {
+            ("delta.columnMapping.mode", "id"),
+            ("delta.columnMapping.maxColumnId", "2"),
+            ("delta.enableChangeDataFeed", "true"),
+        };
+        string MetaLine(int idForId, int idForName) =>
+            "{\"metaData\":{\"id\":\"rt\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
+            + "\"schemaString\":" + JsonSerializer.Serialize(SchemaJson(idForId, idForName))
+            + ",\"partitionColumns\":[],\"configuration\":{"
+            + "\"delta.columnMapping.mode\":\"id\",\"delta.columnMapping.maxColumnId\":\"2\","
+            + "\"delta.enableChangeDataFeed\":\"true\"}}}";
+        using var backend = new LocalFileSystemBackend(_root);
+        // Checkpoint@2 bakes CLEAN identity X (id→1, name→2, == end); commits 0..1 JSON aged out ⇒ earliest = 2.
+        await DeltaTestHarness.WriteCheckpointAsync(backend, 2, new CheckpointFixture()
+            .Protocol(3, 7, new[] { "columnMapping" }, new[] { "columnMapping", "changeDataFeed" })
+            .Metadata("rt", SchemaJson(1, 2), partitionColumns: null, configuration: config));
+        await DeltaTestHarness.WriteLastCheckpointAsync(backend, 2);
+        // 2.json SURVIVES at the floor version, declaring the SWAPPED identity Y (id→2, name→1) — the forgery.
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000002.json",
+            Encoding.UTF8.GetBytes(MetaLine(2, 1) + "\n"), CancellationToken.None);
+        // v3 (end): identity X again, no data change — so [3,3] emits no rows and only the gate can object.
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000003.json",
+            Encoding.UTF8.GetBytes(MetaLine(1, 2) + "\n"), CancellationToken.None);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(3, 3)));
+        Assert.Contains("column-mapping identity", ex.Message, StringComparison.Ordinal);
+        Assert.Matches(@"version 2\b", ex.Message);                           // names the floor version, uniquely
+        Assert.DoesNotContain("col-A", ex.Message, StringComparison.Ordinal); // #653 path/identity-free
+        Assert.DoesNotContain("col-B", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Cdf_SurvivingSubFloorCommitIdentityDiffers_FailsClosed_NamesSubFloorVersion()
     {
         // #671 sub-floor coverage (Architect/QueryExec/dotnet-runtime R2, executed probe): a commit whose JSON
@@ -1408,7 +1461,9 @@ public sealed class ChangeFeedReadTests : IDisposable
         DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
             async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
         Assert.Contains("column-mapping identity", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("version 1", ex.Message, StringComparison.Ordinal);   // the surviving sub-floor version
+        Assert.Matches(@"version 1\b", ex.Message);                           // names the sub-floor version, uniquely
+        Assert.DoesNotContain("col-A", ex.Message, StringComparison.Ordinal); // #653 path/identity-free
+        Assert.DoesNotContain("col-B", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
