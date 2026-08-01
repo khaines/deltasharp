@@ -402,6 +402,20 @@ internal sealed class ChangeFeedReader
                             "A change-feed range's metadata declared an unreadable column-mapping identity "
                             + "(unrecognized mode or malformed/inconsistent schema); the read fails closed.", ex);
                     }
+
+                    // Defense-in-depth behind the parse-level single-metaData guard (DeltaLogActionReader rejects
+                    // >1 metaData per commit): validate EVERY applied metaData's identity, not only the last-wins
+                    // prevailing one, so a forged-then-reverted identity within a single commit could not slip
+                    // past even if that guard were ever relaxed. Redundant while the guard holds (a commit
+                    // carries at most one metaData), so this only ever fires under a mutated/forged parser.
+                    if (!endIdentity.IsImmutableFrom(currentIdentity))
+                    {
+                        throw new DeltaReadException(
+                            $"The change-feed range crosses a column-mapping identity change at version {v}; the range "
+                            + "is read through a single (end-snapshot) column-mapping identity (mode, field ids, and "
+                            + "physical names), so such a transition is not supported and the read fails closed rather "
+                            + "than risk emitting mismapped change data.");
+                    }
                 }
             }
 

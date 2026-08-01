@@ -55,6 +55,28 @@ internal static class DeltaLogActionReader
             }
         }
 
+        // A commit may declare AT MOST ONE metaData action (Delta protocol: a commit's metaData REPLACES the
+        // table metadata; two in one commit is malformed). Enforcing it at the single parse point closes the
+        // "validate only the final prevailing identity" class STRUCTURALLY (#671): no reader or gate that
+        // inspects a commit's metaData can be fooled by a forged-then-reverted column-mapping identity WITHIN
+        // one commit — such a commit fails closed here, before any identity check runs. (A CDF read wraps this
+        // DeltaProtocolException as a path-free DeltaReadException.)
+        int metadataActions = 0;
+        foreach (DeltaAction parsed in actions)
+        {
+            if (parsed is MetadataAction)
+            {
+                metadataActions++;
+            }
+        }
+
+        if (metadataActions > 1)
+        {
+            throw DeltaProtocolException.Malformed(string.Create(
+                CultureInfo.InvariantCulture,
+                $"Delta log version {version} carries {metadataActions} metaData actions; a commit must declare at most one."));
+        }
+
         return actions;
     }
 

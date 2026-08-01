@@ -1366,6 +1366,45 @@ public sealed class ChangeFeedReadTests : IDisposable
     }
 
     [Fact]
+    public async Task Cdf_InRangeCommitWithMultipleMetadataActions_FailsClosed()
+    {
+        // #671 structural class-closure (Security seat R3, executed). The reader validated only each in-range
+        // version's FINAL prevailing identity, so a forged-then-reverted metaData WITHIN one commit
+        // (`[metaData(forged Y), metaData(clean X)]`) slipped the transient Y past the check and emitted
+        // mismapped change data. Closed structurally: `DeltaLogActionReader` rejects any commit carrying >1
+        // metaData action at parse, so such a commit fails the read closed before any identity check runs. (The
+        // reader also validates every applied metaData as defense-in-depth behind that guard.)
+        string SchemaJson(int idForId, int idForName) =>
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
+            + "{\"delta.columnMapping.id\":" + idForId + ",\"delta.columnMapping.physicalName\":\"col-A\"}},"
+            + "{\"name\":\"name\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":" + idForName + ",\"delta.columnMapping.physicalName\":\"col-B\"}}]}";
+        const string protocol =
+            "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,"
+            + "\"readerFeatures\":[\"columnMapping\"],\"writerFeatures\":[\"columnMapping\",\"changeDataFeed\"]}}";
+        string MetaLine(int idForId, int idForName) =>
+            "{\"metaData\":{\"id\":\"rt\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
+            + "\"schemaString\":" + JsonSerializer.Serialize(SchemaJson(idForId, idForName))
+            + ",\"partitionColumns\":[],\"configuration\":{"
+            + "\"delta.columnMapping.mode\":\"id\",\"delta.columnMapping.maxColumnId\":\"2\","
+            + "\"delta.enableChangeDataFeed\":\"true\"}}}";
+        using var backend = new LocalFileSystemBackend(_root);
+        await backend.PutIfAbsentAsync(   // v0: identity X (id→1, name→2)
+            "_delta_log/00000000000000000000.json",
+            Encoding.UTF8.GetBytes(protocol + "\n" + MetaLine(1, 2) + "\n"), CancellationToken.None);
+        await backend.PutIfAbsentAsync(   // v1 (in-range): forged Y then reverted to X in ONE commit — 2 metaData
+            "_delta_log/00000000000000000001.json",
+            Encoding.UTF8.GetBytes(MetaLine(2, 1) + "\n" + MetaLine(1, 2) + "\n"), CancellationToken.None);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(1, 1)));
+        Assert.Contains("metaData action", ex.Message, StringComparison.Ordinal);   // the structural parse guard
+        Assert.DoesNotContain("col-A", ex.Message, StringComparison.Ordinal);        // #653 path/identity-free
+        Assert.DoesNotContain("col-B", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Cdf_SurvivingSubFloorCommitIdentityDiffers_FailsClosed_NamesSubFloorVersion()
     {
         // #671 sub-floor coverage (Architect/QueryExec/dotnet-runtime R2, executed probe): a commit whose JSON
