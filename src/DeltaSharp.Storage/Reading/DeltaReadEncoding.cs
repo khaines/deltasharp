@@ -35,6 +35,24 @@ internal static class DeltaReadEncoding
         ArgumentNullException.ThrowIfNull(type);
         ArgumentOutOfRangeException.ThrowIfNegative(rowCount);
 
+        // #685 message hygiene / fail-closed (Security seat): validate the DECLARED partition type BEFORE
+        // `ColumnVectors.Create` and before the null short-circuit below. `type` comes straight from a foreign
+        // `metaData.schemaString`, so a hostile table can declare a partition column of a NON-SCALAR type
+        // (struct/array/map). For such a type `ColumnVectors.Create` builds a composite vector whose
+        // `AppendNull()` (the null / `__HIVE_DEFAULT_PARTITION__` path) throws a RAW, unbounded,
+        // injection-bearing child-shape message carrying the attacker-authored nested field NAMES
+        // (DeltaSharp.Engine.Columnar cannot see DiagnosticText). Guarding here — reusing the SAME
+        // `DeltaWriteEncoding.IsSupportedPartitionType` allow-list the WRITE/commit side already enforces, so
+        // the read and write recognizers cannot drift — closes that value-conditional escape: an unsupported
+        // partition type now fails closed uniformly with the bounded `type.TypeName`, whether its value is null
+        // or not.
+        if (!DeltaWriteEncoding.IsSupportedPartitionType(type))
+        {
+            throw new DeltaStorageException(
+                StorageErrorKind.UnsupportedFeature,
+                $"Type '{type.TypeName}' is not supported as a Delta partition column.");
+        }
+
         MutableColumnVector vector = ColumnVectors.Create(type, Math.Max(rowCount, 1));
 
         // A JSON null OR the Hive default-partition sentinel string (`__HIVE_DEFAULT_PARTITION__`, the
@@ -97,10 +115,16 @@ internal static class DeltaReadEncoding
             case StringType:
                 FillBytes(vector, Encoding.UTF8.GetBytes(value), rowCount);
                 break;
+            // Defense-in-depth backstop: `BuildConstantColumn` now rejects any non-scalar partition type at its
+            // entry (via `DeltaWriteEncoding.IsSupportedPartitionType`) BEFORE the value is examined, so this arm
+            // is unreachable for a foreign struct/array/map partition column. Kept — with the same bounded
+            // `type.TypeName` message (NOT SimpleString, which appends nested field names verbatim: 73,944 chars
+            // with raw U+2028 was measured before) — so any future caller that reaches FillTyped directly still
+            // fails closed.
             default:
                 throw new DeltaStorageException(
                     StorageErrorKind.UnsupportedFeature,
-                    $"Type '{type.SimpleString}' is not supported as a Delta partition column.");
+                    $"Type '{type.TypeName}' is not supported as a Delta partition column.");
         }
     }
 
@@ -215,6 +239,10 @@ internal static class DeltaReadEncoding
 
     // Message hygiene (#653 / obs-conventions): the raw partition `value` is user/attacker data and is never
     // echoed; only the bounded target `type` (a Delta protocol type name) is named.
+    // SimpleString is deliberate and safe HERE, unlike the nested-type sites this sweep changed to TypeName:
+    // every caller passes a scalar singleton (ByteType.Instance, LongType.Instance, ...) or the DecimalType
+    // being parsed, so it can only ever render a leaf name -- and for decimals `decimal(10,2)` tells the
+    // operator strictly more than `decimal`. Do not copy this pattern to a site whose type can be nested.
     private static DeltaStorageException ParseFailure(DataType type) =>
         new(
             StorageErrorKind.CorruptData,

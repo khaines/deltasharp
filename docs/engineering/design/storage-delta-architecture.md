@@ -1166,16 +1166,49 @@ POSIX permissions (`0700`/`0600`). *Job submission* authN/authZ (who may run a j
 ### 5.3 Secret handling & redaction (C-REDACT)
 
 Credentials reach the adapter only via environment/mounted secrets/workload-identity — **never** as a
-plan value, a `_delta_log` field, or a rendered string. The existing centralized primitive
-`SecretRedaction.RedactPath` (`src/DeltaSharp.Core/Plans/Logical/SecretRedaction.cs`) is the **single**
-redactor for any path/URI that must appear in a human-readable message (it masks SAS `?sig=`, presigned
-signatures, and `userinfo`); it is never re-implemented. Because `SecretRedaction` is `internal` to Core
-(with `InternalsVisibleTo("DeltaSharp.Executor")`), **`DeltaSharp.Storage`/`DeltaSharp.Executor` reach it
-via IVT** — the smallest reversible change — rather than promoting it to public API (decided when the
-first storage log site lands; see §7.2). Option **values are never rendered** (keys only, mirroring
-`UnresolvedFileRelation.SimpleString`), so `;`-delimited connection strings — which `RedactPath` does not
-parse — are safe by never being rendered at all. Every new storage diagnostic path ships a redaction
-unit test (checklist 09a).
+plan value, a `_delta_log` field, or a rendered string. Core's `SecretRedaction.RedactPath`
+(`src/DeltaSharp.Core/Plans/Logical/SecretRedaction.cs`) is the redactor on the **Core plan/logical**
+side (it masks SAS `?sig=`, presigned signatures, and `userinfo`). It is `internal` to Core with
+`InternalsVisibleTo("DeltaSharp.Executor")` **only** — it is **not** visible to `DeltaSharp.Storage`.
+
+**The Storage layer therefore owns its own diagnostic-hygiene primitive,
+`DeltaSharp.Storage.Delta.DiagnosticText`** (#683/#685/#686), applied at every storage exception/log
+site that can carry an attacker-authored or data-derived token (a foreign table's
+`metaData.schemaString` supplies arbitrary column/schema names and nested types; a file path is
+Hive-encoded and its partition segments are **column values = data/PII**). It is deliberately
+**stronger** than `RedactPath` for the class it targets: `DescribePath` **drops** partition values
+(rather than masking them), keeping only the path SHAPE and the partition column NAMES. The posture is
+tiered:
+
+1. attacker-controllable content → **DROPPED**;
+2. data-derived content (Hive-path partition **values**) → **DROPPED**, never sanitized;
+3. path SHAPE (rooted?, parent-traversal count, control directory) → kept as counts/fixed literals;
+4. operator identifiers (schema/column names, partition column **names**) → **SANITIZED** — control
+   chars (Cc), line/paragraph separators (Zl/Zp), bidi/format controls (Cf, incl. U+202E) and unpaired
+   surrogates (Cs) are replaced with U+FFFD, and the token is length-capped;
+5. identifier **lists** → sanitized **and** cardinality-bounded (`MaxEchoedListItems`, with `(+N more)`);
+6. inherently-bounded tokens (error kind, a **scalar** type's `SimpleString`) → echoed as-is;
+7. a **nested** `StructType.SimpleString` → **never** echoed raw (it appends nested field names verbatim
+   and is unbounded); use `DescribeSchema`/`DescribeType`.
+
+Physical/partition **path segments** carry the same unsafe-character rejection at their validation guard
+(`ColumnMapping.FindUnsafePathSegmentReason`), since a physical name becomes a real filesystem directory
+segment. Every storage diagnostic path ships a redaction unit test (checklist 09a); the executable
+evidence lives in `PathDisclosureHygieneTests`, `StorageHygieneSweepTests`, and the per-file message-
+hygiene suites. Option **values are never rendered** (keys only).
+
+> **OUT OF SCOPE — credential-bearing URIs (open obligation, formerly #113).** `DescribePath` describes a
+> **table-relative object path**; it does **not** parse URIs and does **not** redact URL credentials (a SAS
+> `?sig=`, a presigned `X-Amz-Signature`, `userinfo@`, an opaque `?token`, or a `#fragment`). Today the only
+> backend is `LocalFileSystemBackend`, whose POSIX paths carry no secret, so there is no live exposure. When an
+> object-store backend (S3/ADLS/GCS) lands, any URI that can reach a message or a typed `Path` property **MUST**
+> be redacted by a dedicated URL renderer **before** it reaches a describer — `DescribePath` will misread a
+> query string as a Hive segment (e.g. rendering `?sig=…` as `partitioned by: …?sig`), which is both a leak
+> risk and factually wrong. This obligation is tracked for the object-store ADR, not this PR.
+
+*(Historical note: an earlier revision of this section planned to reach `SecretRedaction` via IVT from
+Storage; that IVT grant was never made and the stronger Storage-local `DiagnosticText` posture above
+supersedes it — see §7.2.)*
 
 ### 5.4 Input validation, protocol & commit safety (C-DECODE, C-PROTO, C-COMMIT)
 
@@ -1260,7 +1293,7 @@ These are the named controls used above and in the threat model. Each is deny-by
 |---|---|---|
 | **C-IDENT** | Ambient/federated workload identity via SDK default chain; short-lived scoped creds; no baked keys; per-tenant/job scope, never broadened | §5.2; 05 "Trust boundaries and identity"; 14 "Executor, credential, and runtime isolation" |
 | **C-SCOPE** | Path canonicalization + table-root/tenant-prefix confinement of **user-supplied *and* log-resolved** paths (`add`/`remove`/DV/CDC/sidecar), fail-closed on absolute/`..` at snapshot reconstruction; authorized listing; snapshot from committed log, not directory listing | §5.5; 14 "Storage and shuffle isolation"; 17 "Delta log protocol"; STORY-05.1.3 AC3 |
-| **C-REDACT** | `SecretRedaction.RedactPath` on every storage path/URI; option values never rendered (keys only); connection strings never rendered; stats/paths never telemetry labels | §5.3; `SecretRedaction.cs`; `UnresolvedFileRelation.cs`; `observability-conventions.md` "Redaction" |
+| **C-REDACT** | Storage paths → `DiagnosticText.DescribePath` (drops Hive partition VALUES, keeps shape + column names); Core/Executor plan/`Explain` paths → `SecretRedaction.RedactPath`; credential-bearing URIs (`?sig=`/presigned/`userinfo`) are **OUT OF SCOPE** of both, deferred to the object-store backend ADR (§5.3); option values never rendered (keys only); connection strings never rendered; stats/paths never telemetry labels | §5.3 "OUT OF SCOPE — credential-bearing URIs"; `DiagnosticText.cs`; `SecretRedaction.cs`; `UnresolvedFileRelation.cs`; `observability-conventions.md` "Redaction" |
 | **C-DECODE** | Bounded/validated decode: size/ratio/depth/count ceilings, magic+checksum validation, codec allowlist, deterministic fail-closed | §5.4; 17 "Parquet correctness"; STORY-05.1.1 AC4 |
 | **C-PROTO** | Reader/writer protocol + feature negotiation fail-closed; schema/protocol validated before publish | §5.4; ADR-0011; 17 "Delta log protocol"; STORY-05.3.1 AC2 |
 | **C-COMMIT** | Conditional-put single-winner atomic commit; ambiguous-ack resolution; idempotent txn ids; bounded conflict-aware retry | §5.4; 17 "Optimistic commits and ACID"; STORY-05.3.1/05.3.2 |
@@ -1354,7 +1387,7 @@ STRIDE letters: **S**poofing · **T**ampering · **R**epudiation · **I**nfo-dis
 | **CMT-D1** | Commit-path DoS · D | Small-file flooding: many tiny commits/files → log bloat, replay blowup, listing-cost amplification | Bounded log replay + checkpoints (17; STORY-05.2.2); OPTIMIZE/compaction + small-file thresholds (17); per-tenant object-store request + PVC budgets (14 "Resource budgets") | Budget enforcement is partly EPIC-08/scheduler; in-budget pressure detection → **operator / SRE** |
 | **CMT-D2** | Commit-path DoS · D | Checkpoint bomb: oversized/mis-sized checkpoint Parquet → OOM on load | C-DECODE applied to the checkpoint reader; corrupt/partial checkpoint → safe fallback or fail without inventing state (STORY-05.2.2 AC2) | As PDX-D |
 | **CMT-T** | Commit-path race · T,D | Concurrent/ambiguous commits → duplicate or lost version (split-brain) | C-COMMIT conditional-put single-winner; ambiguous-ack → determine committed or precise unknown-state error (STORY-05.3.1 AC4); idempotent txn ids (STORY-05.3.2); adapters that cannot prove the atomic primitive are rejected (17) | Per-backend conditional-write primitive is an open question <!-- TBD: mandatory primitives per S3/ADLS/GCS (EPIC-05 open Q) --> → **delta-storage-format-engineer** |
-| **CRD-I1** | Credential disclosure · I | SAS `?sig=` / presigned / `userinfo` / account-key surfaces in a rendered path, `Explain`, log, metric, or exception | C-REDACT: `RedactPath` on every path; option values never rendered (keys only); connection strings never rendered | `RedactPath` is best-effort textual; a novel credential query key outside its keyword set could slip in a *raw path* — options are safe by never-render; add redaction tests (09a) |
+| **CRD-I1** | Credential disclosure · I | SAS `?sig=` / presigned / `userinfo` / account-key surfaces in a rendered path, `Explain`, log, metric, or exception | C-REDACT: storage paths via `DiagnosticText.DescribePath` (Core/Executor plan paths via `SecretRedaction.RedactPath`); option values never rendered (keys only); connection strings never rendered | **Credential-bearing URIs are OUT OF SCOPE of `DescribePath`/`RedactPath` today** (neither parses URIs; §5.3 "OUT OF SCOPE — credential-bearing URIs"): a SAS/presigned/`userinfo` URI reaching a describer is redacted only incidentally and unreliably (a `?sig=` may even render as a fake partition segment) — an object-store backend MUST redact it with a dedicated URL renderer FIRST. `RedactPath` (Core/Executor) is likewise best-effort textual; options are safe by never-render; add redaction tests (09a) |
 | **CRD-I2** | Stats disclosure · I | min/max stats disclose literal column values to another tenant or shared telemetry | Stats inherit classification, never a telemetry label/attribute; privacy-sensitive stats omitted/bounded (STORY-05.6.3 AC2); tenant-scoped read authz on the log | Stats in the log are visible to **any authorized log reader** (inherent to Delta) — the control is read authz + tenant scope, not hiding from authorized readers |
 | **XT-I/E** | Co-tenant · I,E | Path traversal / prefix bypass / shared PVC to read, list, or write another tenant's files or stats | C-SCOPE canonicalization + table-root confinement + authorized listing (14; 05); per-tenant C-IDENT; PVC namespace/pod scope + POSIX perms | Shared-bucket deployments where cloud prefix policy is the only boundary — a mis-scoped bucket policy defeats app checks; correct cloud IAM is a **documented operator responsibility** (14 isolation assumptions) |
 | **XT-E2** | Co-tenant · E (confused deputy / SSRF) | Raw URI aims the adapter's powerful identity at an unintended resource (other tenant prefix, metadata endpoint) | C-SCOPE reject credential-bearing/traversal URIs + confine to table root; deny-by-default | Raw-URI-vs-catalog-policy alignment lands with EPIC-06 <!-- TBD --> → **data-source-connectors / developer-experience-api** |
@@ -1415,13 +1448,13 @@ Attach these through `ILogger.BeginScope` using the `DeltaSharpTelemetry` keys s
 | Run/correlation | `deltasharp.job.id`, `deltasharp.correlation.id` | action boundary / ambient `Activity` | opaque; never user/tenant identity |
 | Trace/span | `trace.id`/`span.id` | `Activity.Current` when tracing enabled | include only when an `Activity` is active (checklist 09c) |
 
-**Table *path* handling (reconciling the request with house convention).** The house rule is that the raw, credential-bearing path is **never** a structured dimension, metric label, or span attribute — the logical `deltasharp.table` is the correlation identity. When a *physical* path or object key is genuinely required in a human-readable message (e.g., "orphan data file `{Path}` left by a failed commit", "adapter GET on `{Path}` returned 503"), it appears **only in the message template**, routed through the existing centralized primitive `SecretRedaction.RedactPath` (`src/DeltaSharp.Core/Plans/Logical/SecretRedaction.cs`) — never re-implemented (conventions, "Paths → `SecretRedaction.RedactPath`"). Because `SecretRedaction` is `internal` to `DeltaSharp.Core` and grants `InternalsVisibleTo("DeltaSharp.Executor")` today, **DeltaSharp.Storage must be added as an IVT grantee of Core** (smallest reversible change) — or `RedactPath` promoted via a reviewed PublicAPI change if Storage's redaction surface warrants it. `<!-- TBD: IVT grant vs PublicAPI promotion — decide when the first storage log site lands -->`
+**Table *path* handling (reconciling the request with house convention).** The house rule is that the raw, credential-bearing path is **never** a structured dimension, metric label, or span attribute — the logical `deltasharp.table` is the correlation identity. When a *physical* path or object key is genuinely required in a human-readable message (e.g., "orphan data file `{Path}` left by a failed commit", "adapter GET on `{Path}` returned 503"), it appears **only in the message template**. **DECIDED (#683/#685/#686, the first storage log/exception sites having landed):** Storage renders table-relative paths through its own `DiagnosticText.DescribePath` (which drops Hive partition VALUES and keeps shape + column names), **not** through Core's `SecretRedaction` — that primitive is `internal` to Core with an IVT grant to `DeltaSharp.Executor` only, and the IVT-to-Storage option was **not** taken (see §5.3 for the shipped 7-tier posture). Credential-bearing **URIs** (SAS/presigned/`userinfo`) are a separate, still-open obligation deferred to the object-store backend ADR (§5.3 "OUT OF SCOPE — credential-bearing URIs"); `DescribePath` does not parse them.
 
 #### 7.2.2 Never logged — redaction by omission
 
 Storage handles the highest-value leak vectors, so the "never rendered" rule is load-bearing here (checklists 09a, 05):
 
-- **Credentials** — S3/ADLS/GCS keys, SAS `?sig=`/`&X-Amz-Signature=`, presigned signatures, bearer tokens, `AccountKey=…;`. `RedactPath` masks `?`/`&` query-string creds and `userinfo`, but **not** `;`-delimited connection strings — so ADLS/ADO connection strings and all option values are kept safe by **never rendering option values at all** (option **keys only**, per conventions), not by the redactor.
+- **Credentials** — S3/ADLS/GCS keys, SAS `?sig=`/`&X-Amz-Signature=`, presigned signatures, bearer tokens, `AccountKey=…;`. In Storage, a path is rendered by `DiagnosticText.DescribePath`, which drops Hive partition **values** but does **not** parse URIs — so a credential-bearing URI is **OUT OF SCOPE** of the storage redactor (§5.3; the Core/Executor plan-layer `SecretRedaction.RedactPath` masks `?`/`&` query-string creds and `userinfo`, but is not invokable from Storage). Connection strings (`;`-delimited, e.g. ADLS/ADO) and all option values are therefore kept safe by **never rendering option values at all** (option **keys only**, per conventions), not by any redactor.
 - **Row data & statistics values** — never log cell values, min/max/null-count *values* from Parquet footers or `add.stats`, or deletion-vector row positions. Log stats *coverage/shape* (e.g., "min/max present for 12/14 columns"), never the values themselves — they are user data and a materialization the lazy/eager boundary forbids outside an action (checklist 09a). This is the direct tie to #455: storage supplies the stats-derived and path-derived identifiers that must be scrubbed at the diagnostics→telemetry boundary.
 - **Do not `Activity.RecordException(ex)` blindly** on a storage exception whose message embeds a table identifier or path; record a structural/redacted form (conventions redaction bullet; #455).
 
@@ -1485,7 +1518,7 @@ This satisfies checklist 17 explicitly — "Metrics report files skipped, row gr
 **Cardinality guardrails (the review council will check these):**
 
 - **`table` and `table.version` are never metric labels.** They are unbounded over a table's history and would multiply time-series. Active-file / small-file counts are therefore recorded as **distributions (histograms)** across snapshot loads and post-maintenance commits — *not* as per-`table` labeled gauges. The exact per-table value lives on the `SnapshotReconstructed`/`VacuumCompleted` **log line** and the snapshot **span** (where `deltasharp.table`/`deltasharp.table.version` are permitted), and attaches to the histogram as an **exemplar** so a dashboard spike pivots to the offending table's trace (checklist 09b — "High-cardinality analysis uses logs, traces, exemplars, or sampling rather than metric labels").
-- Instruments never allocate per row/row-group/tight-loop iteration; hot-path tag construction (a `backend` `ToString()`, a `TagList`, a `RedactPath` call) is guarded with `if (instrument.Enabled)` (conventions, "Safe no-ops"). Metric export failure must never block a commit, decode, or VACUUM (checklists 09b, 10).
+- Instruments never allocate per row/row-group/tight-loop iteration; hot-path tag construction (a `backend` `ToString()`, a `TagList`, a `DiagnosticText.DescribePath` call — the Storage-layer path primitive, e.g. guarded at `DeltaVacuum.cs` behind `IsEnabled(LogLevel.Debug)`) is guarded with `if (instrument.Enabled)` (conventions, "Safe no-ops"). Metric export failure must never block a commit, decode, or VACUUM (checklists 09b, 10).
 
 ### 7.4 Traces
 
@@ -1576,7 +1609,7 @@ The real "feature flag" is **reader/writer protocol-version negotiation** (ADR-0
 | R5 | **Small-file amplification** | High / Med (scan + request/cost blowup) | OPTIMIZE/compaction with thresholds for count/size/skew/request-amplification (checklist 17); small-file metric + alert | `snapshot.small_files` distribution; throttle co-movement | `delta-storage-format-engineer`; cost to `compute-storage-finops-engineer` |
 | R6 | **VACUUM deletes still-referenced files** (retention/stale-reader/listing-lag error) | Low / **Critical (data loss, broken time travel)** | Retention safety threshold + explicit unsafe override; dry-run; stale-reader protection; listing-lag awareness; audit records for candidate/deleted/skipped (checklist 17; STORY-05.6.2 AC) | `VacuumSafetyViolationBlocked` SEV-1 (§7.5); DR rehearsal with `reliability-test-chaos-engineer` | `delta-storage-format-engineer` + `privacy-compliance-grc-lead` |
 | R7 | **net8 packable-surface sunset interaction** | Low / Low | `DeltaSharp.Storage` is **net10-only, engine-internal, `IsPackable=false`** (mirroring `DeltaSharp.Engine` per ADR-0014), so it never enters the `net8.0;net10.0` packable surface (Core/Abstractions) and is decoupled from any future net8 sunset decision | Package-validation gate in `pack.yml` (informational) would catch any accidental packable/TFM regression | `dotnet-library-platform-engineer` |
-| R8 | **Storage-derived identifiers leak tenant data into telemetry** (paths/stats/table names on spans/exceptions) | Med / High | Scrub at the diagnostics→telemetry boundary; `RedactPath` for paths; never render stats/row/option values (§7.2.2); audited by **#455** downstream of #458 | Redaction tests on every storage diagnostic path (checklist 09a) | `cloud-native-site-reliability-engineer` + `cloud-native-security-sme` |
+| R8 | **Storage-derived identifiers leak tenant data into telemetry** (paths/stats/table names on spans/exceptions) | Med / High | Scrub at the diagnostics→telemetry boundary; storage paths via `DiagnosticText.DescribePath` (Core/Executor plan paths via `SecretRedaction.RedactPath`; credential-bearing URIs OUT OF SCOPE — §5.3); never render stats/row/option values (§7.2.2); audited by **#455** downstream of #458 | Redaction tests on every storage diagnostic path (checklist 09a) | `cloud-native-site-reliability-engineer` + `cloud-native-security-sme` |
 | R9 | **Driver commit-orchestration / snapshot-ship failure** (the snapshot is driver-built and *shipped* to executors, OQ-3; commit is a driver-side single-writer op, §2.4/§2.5) — a snapshot-ship failure stalls reads; a driver crash between conditional-put issue and ack leaves an ambiguous commit. Distinct from R4's *scaling/OOM* framing. | Med / Med-High | Correctness half mitigated by §8.2 re-GET reconciliation + idempotent `txn`; availability half by snapshot-ship retry/rebuild and bounded driver restart. Topology/HA is not solved in EPIC-05. | `snapshot.load` failure rate + `storage.io.inflight` saturation (both real instruments, §7.3); ambiguous acks resolve **terminally** (§2.11.3/§8.2) so they surface as commit retry-exhaustion / `commit.attempts`, not a separate counter | topology/HA → `cloud-native-distributed-systems-architect` (EPIC-08); detection/runbook → SRE |
 
 ### 8.4 Dependency sequencing

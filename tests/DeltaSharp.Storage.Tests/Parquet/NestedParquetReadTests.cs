@@ -922,8 +922,15 @@ public sealed class NestedParquetReadTests
     {
         // A nested type within a nested type (array-of-struct) is out of scope for #571: it must be rejected
         // deterministically before any decode, never read partially.
+        //
+        // The element's field name is deliberately hostile. This pins ParquetTypeMapping.EnsureScalarReadable
+        // (the guard that actually fires for this shape — NestedParquetColumnReader.ExpectScalarLeaf's
+        // identical guard sits behind it as defense-in-depth and is unreachable from here): inside it the type
+        // is statically Array/Map/Struct, so SimpleString would recursively embed every nested field name
+        // verbatim. Only the bounded KIND may be echoed.
+        const string hostileFieldName = "n\r\n[CRITICAL] forged";
         StructType element =
-            DataTypes.CreateStructType(new[] { DataTypes.CreateStructField("A", DataTypes.IntegerType) });
+            DataTypes.CreateStructType(new[] { DataTypes.CreateStructField(hostileFieldName, DataTypes.IntegerType) });
         var requested = new StructType(new[]
         {
             new StructField("X", DataTypes.CreateArrayType(element), nullable: true),
@@ -933,6 +940,10 @@ public sealed class NestedParquetReadTests
         DeltaStorageException error =
             await Assert.ThrowsAsync<DeltaStorageException>(() => ReadSingleAsync(bytes, requested));
         Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("nested type within a nested type ('struct')", error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(hostileFieldName, error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain('\r', error.Message);
+        Assert.DoesNotContain('\n', error.Message);
     }
 
     [Fact]

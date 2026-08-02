@@ -43,7 +43,7 @@ internal static class ColumnMappingProjection
                 throw DeltaProtocolException.Unsupported(
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Column '{field.Name}' is a nested ({field.DataType.TypeName}) type; nested column "
+                        $"Column '{DiagnosticText.Sanitize(field.Name)}' is a nested ({field.DataType.TypeName}) type; nested column "
                         + $"mapping is unsupported in this build (design §2.9/§2.12.3). Only top-level (leaf) "
                         + $"columns are supported under column mapping (name or id mode)."));
             }

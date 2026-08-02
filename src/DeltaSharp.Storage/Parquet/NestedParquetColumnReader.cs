@@ -91,6 +91,12 @@ internal static class NestedParquetColumnReader
     /// increment supports (<see cref="StorageErrorKind.UnsupportedFeature"/>).</exception>
     public static void ValidateShape(Field fileField, DataType requestedType, string columnName)
     {
+        // #683 message hygiene: `columnName` is a pure DIAGNOSTIC LABEL (never a lookup key) that is echoed
+        // into every message this reader raises, including the recursive sub-labels built from it. Sanitize it
+        // ONCE at the entry point (control-char strip + length cap) so a crafted/foreign schema name cannot
+        // inject line breaks into a structured-log sink or render unbounded.
+        columnName = DiagnosticText.Sanitize(columnName);
+
         switch (requestedType)
         {
             case StructType structType:
@@ -142,7 +148,7 @@ internal static class NestedParquetColumnReader
                 break;
             default:
                 throw DeltaStorageException.UnsupportedFeature(
-                    $"Parquet nested read for column '{columnName}' of type '{requestedType.SimpleString}' "
+                    $"Parquet nested read for column '{columnName}' of type '{DiagnosticText.Sanitize(requestedType.SimpleString)}' "
                     + "is not supported.");
         }
     }
@@ -188,6 +194,12 @@ internal static class NestedParquetColumnReader
         NestedDecodeBudget budget,
         CancellationToken cancellationToken)
     {
+        // #683 message hygiene: `columnName` is a pure DIAGNOSTIC LABEL (never a lookup key) that is echoed
+        // into every message this reader raises, including the recursive sub-labels built from it. Sanitize it
+        // ONCE at the entry point (control-char strip + length cap) so a crafted/foreign schema name cannot
+        // inject line breaks into a structured-log sink or render unbounded.
+        columnName = DiagnosticText.Sanitize(columnName);
+
         return requestedType switch
         {
             StructType structType => await ReadStructAsync(
@@ -200,7 +212,7 @@ internal static class NestedParquetColumnReader
                 rowGroup, ExpectMap(fileField, columnName), mapType, rowCount, columnName, budget, cancellationToken)
                 .ConfigureAwait(false),
             _ => throw DeltaStorageException.UnsupportedFeature(
-                $"Parquet nested read for column '{columnName}' of type '{requestedType.SimpleString}' "
+                $"Parquet nested read for column '{columnName}' of type '{DiagnosticText.Sanitize(requestedType.SimpleString)}' "
                 + "is not supported."),
         };
     }
@@ -240,7 +252,7 @@ internal static class NestedParquetColumnReader
             if (numValues != rowCount)
             {
                 throw DeltaStorageException.CorruptData(
-                    $"Struct column '{columnName}' field '{field.Name}' declares {numValues} values for a "
+                    $"Struct column '{columnName}' field '{DiagnosticText.Sanitize(field.Name)}' declares {numValues} values for a "
                     + $"{rowCount}-row group (a struct field must be one value per row).");
             }
 
@@ -628,7 +640,7 @@ internal static class NestedParquetColumnReader
                     static (v, x) => v.AppendBytes(x.Span), cancellationToken);
             default:
                 throw DeltaStorageException.UnsupportedFeature(
-                    $"Parquet nested read for leaf type '{scalarType.SimpleString}' is not supported.");
+                    $"Parquet nested read for leaf type '{DiagnosticText.Sanitize(scalarType.SimpleString)}' is not supported.");
         }
     }
 
@@ -680,7 +692,7 @@ internal static class NestedParquetColumnReader
             // log-injection vector. Named by the requested leaf type
             // so the message is accurate for whichever leaf raised it (not hard-coded to date/time).
             throw DeltaStorageException.CorruptData(
-                $"Nested leaf '{DiagnosticText.Sanitize(leaf.Path.ToString())}' of type '{elementType.SimpleString}' has a physical value outside "
+                $"Nested leaf '{DiagnosticText.Sanitize(leaf.Path.ToString())}' of type '{DiagnosticText.Sanitize(elementType.SimpleString)}' has a physical value outside "
                 + "its representable range.", ex);
         }
 
@@ -762,6 +774,12 @@ internal static class NestedParquetColumnReader
     // is present). Internal so the guard can be pinned by a direct unit test as well as through the read door.
     internal static void ValidateParallelRepetition(int[]? keyRep, int[]? valueRep, string columnName)
     {
+        // #683 message hygiene: `columnName` is a pure DIAGNOSTIC LABEL (never a lookup key) that is echoed
+        // into every message this reader raises, including the recursive sub-labels built from it. Sanitize it
+        // ONCE at the entry point (control-char strip + length cap) so a crafted/foreign schema name cannot
+        // inject line breaks into a structured-log sink or render unbounded.
+        columnName = DiagnosticText.Sanitize(columnName);
+
         int keyLen = keyRep?.Length ?? 0;
         int valueLen = valueRep?.Length ?? 0;
         if (keyLen != valueLen)
@@ -812,6 +830,12 @@ internal static class NestedParquetColumnReader
     // nullability, so a key/value definition divergence is not authorable end-to-end).
     internal static void ValidateParallelDefinition(int[]? keyDef, int[]? valueDef, int mapMaxDef, string columnName)
     {
+        // #683 message hygiene: `columnName` is a pure DIAGNOSTIC LABEL (never a lookup key) that is echoed
+        // into every message this reader raises, including the recursive sub-labels built from it. Sanitize it
+        // ONCE at the entry point (control-char strip + length cap) so a crafted/foreign schema name cannot
+        // inject line breaks into a structured-log sink or render unbounded.
+        columnName = DiagnosticText.Sanitize(columnName);
+
         int keyLen = keyDef?.Length ?? 0;
         int valueLen = valueDef?.Length ?? 0;
         if (keyLen != valueLen)
@@ -1016,12 +1040,12 @@ internal static class NestedParquetColumnReader
         if (match is null)
         {
             throw DeltaStorageException.SchemaMismatch(
-                $"Struct column '{columnName}' is missing requested field '{requested.Name}' in the file.");
+                $"Struct column '{columnName}' is missing requested field '{DiagnosticText.Sanitize(requested.Name)}' in the file.");
         }
 
         return ExpectScalarLeaf(
             match, requested.DataType, fileStruct.MaxRepetitionLevel, fileStruct.MaxDefinitionLevel,
-            $"struct column '{columnName}' field '{requested.Name}'");
+            $"struct column '{columnName}' field '{DiagnosticText.Sanitize(requested.Name)}'");
     }
 
     private static DataField ExpectScalarLeaf(
@@ -1029,9 +1053,16 @@ internal static class NestedParquetColumnReader
     {
         if (requestedScalar is ArrayType or MapType or StructType)
         {
+            // DEFENSE IN DEPTH, unreachable from the read path today: ParquetTypeMapping.EnsureScalarReadable
+            // rejects the same shape earlier (pinned by NestedParquetReadTests.ArrayOfStruct_FailsClosed_*),
+            // so no test can drive this arm — which is precisely why it must not be the site that drifts. The
+            // predicate makes `requestedScalar` statically nested, so SimpleString necessarily recurses and
+            // carries nested field names verbatim; Sanitize bounded it (this was never a flood or an
+            // injection) but rendered a 128-char truncation of `struct<...>`. Uses the same bounded renderer
+            // as its reachable twin so the two cannot say different things about the same condition.
             throw DeltaStorageException.UnsupportedFeature(
                 $"Parquet nested read for {context}: a nested type within a nested type "
-                + $"('{requestedScalar.SimpleString}') is not supported.");
+                + $"('{DiagnosticText.DescribeType(requestedScalar)}') is not supported.");
         }
 
         if (fileField is not DataField leaf)
@@ -1122,7 +1153,7 @@ internal static class NestedParquetColumnReader
         {
             throw DeltaStorageException.SchemaMismatch(
                 $"Parquet nested read for {context}: the file physical type '{leaf.ClrType.Name}' does not match "
-                + $"the requested '{requested.SimpleString}'.");
+                + $"the requested '{DiagnosticText.Sanitize(requested.SimpleString)}'.");
         }
     }
 }

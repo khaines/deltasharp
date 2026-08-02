@@ -138,6 +138,150 @@ public sealed class ColumnMappingTests : IDisposable
         Assert.DoesNotContain("score", parquetColumns);
     }
 
+    // -------------------------------------------------- #683: rename-door message hygiene (council item 4)
+
+    // The logical column names echoed by the rename door come from the caller AND from the table schema (which
+    // on a foreign/hostile table is attacker-authored). DropColumnAsync's identical idiom was sanitized in the
+    // first pass; the rename door 50 lines above it was missed.
+    private const string RenamePoison = "col\r\n[CRITICAL] forged\u2028entry\0";
+
+    [Fact]
+    public async Task Drop_UnknownPoisonedName_IsSanitizedInMessage()
+    {
+        // Council round 3 / Quality: DeltaTableWriter's DROP-column echoes were sanitized in round 2 but
+        // individually mutation-VACUOUS — the rename siblings had tests, drop did not.
+        await CreateNameMappedAsync((1L, 100L, "alice"));
+        using var backend = new LocalFileSystemBackend(_root);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => new DeltaTableWriter(backend).DropColumnAsync(RenamePoison));
+
+        Assert.Contains("no such column", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, ex.Message.Count(c => c == '\n'));
+        foreach (char c in new[] { '\r', '\0', '\u2028' })
+        {
+            Assert.DoesNotContain(c, ex.Message);
+        }
+
+        Assert.DoesNotContain(RenamePoison, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Drop_PoisonedPartitionColumn_IsSanitizedInMessage()
+    {
+        // The second drop-column echo: a poisoned name that IS a declared partition column, so the
+        // out-of-scope guard fires instead of the not-found one.
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), FileNames()))
+        {
+            var schema = new StructType(
+            [
+                new StructField(RenamePoison, DataTypes.LongType, nullable: true),
+                new StructField("payload", DataTypes.LongType, nullable: true),
+            ]);
+
+            MutableColumnVector part = ColumnVectors.Create(DataTypes.LongType, 1);
+            part.AppendValue(1L);
+            MutableColumnVector payload = ColumnVectors.Create(DataTypes.LongType, 1);
+            payload.AppendValue(2L);
+
+            await target.CreateNameMappedTableAsync(
+                schema,
+                new[] { RenamePoison },
+                new[] { (ColumnBatch)new ManagedColumnBatch(schema, new ColumnVector[] { part, payload }, 1) },
+                new SeededPhysicalNameSource(Seed));
+        }
+
+        using var backend = new LocalFileSystemBackend(_root);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => new DeltaTableWriter(backend).DropColumnAsync(RenamePoison));
+
+        Assert.Contains("partition column", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, ex.Message.Count(c => c == '\n'));
+        foreach (char c in new[] { '\r', '\0', '\u2028' })
+        {
+            Assert.DoesNotContain(c, ex.Message);
+        }
+
+        Assert.DoesNotContain(RenamePoison, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Rename_UnknownPoisonedFromName_IsSanitizedInMessage()
+    {
+        await CreateNameMappedAsync((1L, 100L, "alice"));
+        using var backend = new LocalFileSystemBackend(_root);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => new DeltaTableWriter(backend).RenameColumnAsync(RenamePoison, "points"));
+
+        Assert.Contains("no such column", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, ex.Message.Count(c => c == '\n'));
+        foreach (char c in new[] { '\r', '\0', '\u2028' })
+        {
+            Assert.DoesNotContain(c, ex.Message);
+        }
+
+        Assert.DoesNotContain(RenamePoison, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Rename_ToExistingPoisonedName_IsSanitizedInMessage()
+    {
+        // The collision branch interpolates `toName` TWICE (and `fromName` once), so a raw oversized/poisoned
+        // name is a 3x flood amplifier. Reaching it needs the poisoned name to ALREADY EXIST in the schema,
+        // which a foreign table's `metaData.schemaString` supplies.
+        //
+        // BOTH names carry the payload. Renaming a CLEAN `id` onto the poisoned name left the branch's
+        // `fromName` echo mutation-vacuous — dropping its Sanitize kept every test green — even though a
+        // rename's SOURCE name comes from the same foreign schema as its destination.
+        const string fromPoison = RenamePoison + "-from";
+        var poisonedSchema = new StructType(new[]
+        {
+            new StructField(fromPoison, DataTypes.LongType, nullable: false),
+            new StructField(RenamePoison, DataTypes.LongType, nullable: true),
+        });
+
+        using (DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
+            _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), FileNames()))
+        {
+            await target.CreateNameMappedTableAsync(
+                poisonedSchema, Array.Empty<string>(), Array.Empty<ColumnBatch>(),
+                new SeededPhysicalNameSource(Seed));
+        }
+
+        using var backend = new LocalFileSystemBackend(_root);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => new DeltaTableWriter(backend).RenameColumnAsync(fromPoison, RenamePoison));
+
+        Assert.Contains("already exists", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(fromPoison, ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, ex.Message.Count(c => c == '\n'));
+        foreach (char c in new[] { '\r', '\0', '\u2028' })
+        {
+            Assert.DoesNotContain(c, ex.Message);
+        }
+
+        Assert.DoesNotContain(RenamePoison, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Rename_UnknownOversizedFromName_IsLengthBoundedInMessage()
+    {
+        await CreateNameMappedAsync((1L, 100L, "alice"));
+        using var backend = new LocalFileSystemBackend(_root);
+        string huge = new('z', 5_000);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => new DeltaTableWriter(backend).RenameColumnAsync(huge, "points"));
+
+        Assert.Contains("no such column", ex.Message, StringComparison.Ordinal);
+        Assert.True(ex.Message.Length < 300, $"message not bounded: {ex.Message.Length} chars");
+        Assert.DoesNotContain(huge, ex.Message, StringComparison.Ordinal);
+    }
+
     // ---------------------------------------------------------------- AC1: rename read-through (HP-10)
 
     [Fact]

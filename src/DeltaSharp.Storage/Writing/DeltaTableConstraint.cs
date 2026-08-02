@@ -202,8 +202,19 @@ internal static class DeltaTableConstraints
         }
 
         throw DeltaProtocolException.Unsupported(
-            $"Column '{column}' declares a 'delta.invariants' value this build cannot parse as a persisted "
-            + "expression of the form '{{\"expression\":{{\"expression\":\"<predicate>\"}}}}'; the write is "
+            // #685: `column` is a StructField.Name (or a dotted nested path) collected from the snapshot's
+            // schema. On a foreign/hostile table read that schema is attacker-authored, so a crafted field
+            // name would otherwise reach a structured-log sink raw (log-injection / unbounded render) — the
+            // #653/#665 schema-name class, reached here on the write/constraint-collection path.
+            // Cap class: `column` may be a DOTTED NESTED PATH, which is exactly what DefaultMaxLength (128)
+            // is documented for. The tighter config-token cap (64) is for short protocol VALUES; under column
+            // mapping two `col-<uuid>` segments alone exceed 64, which would elide the very identifier the
+            // operator needs to locate the offending field. (#685 proposed 64; the cap class is what drifted.)
+            $"Column '{DiagnosticText.Sanitize(column, DiagnosticText.DefaultMaxLength)}' declares a "
+            + "'delta.invariants' value this build cannot parse as a persisted "
+            // Interpolated so the doubled braces render as the SINGLE braces of real JSON — in a plain (non-$)
+            // fragment `{{` renders literally, which printed malformed example JSON to the operator.
+            + $"expression of the form '{{\"expression\":{{\"expression\":\"<predicate>\"}}}}'; the write is "
             + "refused fail-closed rather than silently skip invariant enforcement.");
     }
 }

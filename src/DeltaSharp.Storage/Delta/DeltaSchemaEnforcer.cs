@@ -190,11 +190,11 @@ internal static class DeltaSchemaEnforcer
                     if (TypeWidening.IsAnySanctionedWidening(tableField.DataType, writeField.DataType))
                     {
                         throw DeltaSchemaMismatchException.PartitionColumnWideningDeferred(
-                            path, tableField.DataType.SimpleString, writeField.DataType.SimpleString);
+                            path, tableField.DataType, writeField.DataType);
                     }
 
                     throw DeltaSchemaMismatchException.PartitionColumnEvolution(
-                        path, tableField.DataType.SimpleString, writeField.DataType.SimpleString);
+                        path, tableField.DataType, writeField.DataType);
                 }
 
                 mergedFields.Add(MergeField(tableField, writeField, mode, path, typeWideningEnabled));
@@ -322,7 +322,13 @@ internal static class DeltaSchemaEnforcer
                 return new MapType(mergedKey, mergedValue, tableMap.ValueContainsNull);
 
             default:
-                // A differing scalar type. APPLY the widening on write ONLY when it is a Delta
+                // NOT "a differing scalar type" (as this comment previously claimed): the switch above matches
+                // only when BOTH sides are the SAME kind, so this arm also catches a MISMATCHED KIND — e.g. a
+                // table column declared struct<...> against a bigint write, which is the ordinary
+                // mergeSchema=true shape. That is why the echoed types go through DiagnosticText.DescribeType
+                // (enforced by the factory signatures, which take DataType and never a pre-rendered string):
+                // SimpleString here rendered every nested field name verbatim and recursively.
+                // APPLY the widening on write ONLY when it is a Delta
                 // SCHEMA-EVOLUTION-eligible widening AND type widening is enabled AND we are at a promotable
                 // scalar position. The applied subset (IsSchemaEvolutionWidening) is the SAME-FAMILY cases
                 // (integral byte→…→long, float→double, grow-only decimal) PLUS date→timestamp_ntz (#533),
@@ -346,11 +352,11 @@ internal static class DeltaSchemaEnforcer
                     // tracked as the #535 follow-up, #546). Surfaced distinctly as TypeWideningUnsupported
                     // (fail-closed) rather than the generic IncompatibleType a truly-unrelated change gets.
                     throw DeltaSchemaMismatchException.TypeWideningUnsupported(
-                        path, tableType.SimpleString, writeType.SimpleString);
+                        path, tableType, writeType);
                 }
 
                 throw DeltaSchemaMismatchException.IncompatibleType(
-                    path, tableType.SimpleString, writeType.SimpleString);
+                    path, tableType, writeType);
         }
     }
 

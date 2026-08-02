@@ -551,6 +551,53 @@ internal static class ParquetTestHelpers
     /// key / list element LEAF carries an attacker sentinel name that surfaces in the resolved
     /// <c>DataField.Path</c> — proving the checkpoint reconstruction fail-closed messages never echo that
     /// file-derived leaf path (#653). Mirrors <see cref="ForgeFieldNameAsync"/>.</summary>
+    /// <summary>Rewrites the footer so the column chunk whose <c>PathInSchema</c> ends with
+    /// <paramref name="leafName"/> declares <paramref name="numValues"/> values, leaving the pages untouched.
+    /// Drives <c>NestedParquetColumnReader.LeafNumValues</c>' fail-closed guards (negative count, eager-decode
+    /// ceiling, Int32 overflow) on a file whose leaf NAME is attacker-chosen — the #653 channel those
+    /// messages echo.</summary>
+    public static async Task<byte[]> ForgeLeafNumValuesAsync(byte[] bytes, string leafName, long numValues)
+    {
+        byte[] newFooter;
+        using (var stream = new MemoryStream(bytes, writable: false))
+        {
+            ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                global::Parquet.Meta.FileMetaData metadata = reader.Metadata!;
+                bool found = false;
+                foreach (global::Parquet.Meta.RowGroup rowGroup in metadata.RowGroups)
+                {
+                    foreach (global::Parquet.Meta.ColumnChunk chunk in rowGroup.Columns)
+                    {
+                        global::Parquet.Meta.ColumnMetaData meta = chunk.MetaData!;
+                        if (meta.PathInSchema.Contains(leafName, StringComparer.Ordinal))
+                        {
+                            meta.NumValues = numValues;
+                            found = true;
+                        }
+                    }
+                }
+
+                if (!found)
+                {
+                    throw new InvalidOperationException($"no column chunk whose path contains '{leafName}'");
+                }
+
+                newFooter = SerializeFooter(metadata);
+            }
+        }
+
+        int originalFooterLength = BitConverter.ToInt32(bytes, bytes.Length - 8);
+        int footerStart = bytes.Length - 8 - originalFooterLength;
+        using var forged = new MemoryStream();
+        forged.Write(bytes, 0, footerStart);
+        forged.Write(newFooter, 0, newFooter.Length);
+        forged.Write(BitConverter.GetBytes(newFooter.Length), 0, 4);
+        forged.Write("PAR1"u8);
+        return forged.ToArray();
+    }
+
     public static async Task<byte[]> ForgeLeafColumnNameAsync(byte[] bytes, string targetLeafName, string forgedName)
     {
         byte[] newFooter;

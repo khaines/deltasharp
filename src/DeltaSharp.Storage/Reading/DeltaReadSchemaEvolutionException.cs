@@ -31,7 +31,13 @@ public sealed class DeltaReadSchemaEvolutionException : Exception
             + "for a required column.",
             innerException) => FilePath = filePath;
 
-    /// <summary>The data file whose physical schema is narrower than the current snapshot schema.</summary>
+    /// <summary>The data file whose physical schema is narrower than the current snapshot schema.
+    /// <para><b>Privacy channel (#686):</b> this raw path is a Hive-encoded data-file path whose partition
+    /// segments (<c>col=value</c>) embed table <b>column values</b> — i.e. potential personal data / PII. It is
+    /// deliberately kept off the rendered <see cref="Exception.Message"/>/<see cref="ToString"/> (which use
+    /// <c>DiagnosticText.DescribePath</c> to drop values) and exposed here only for an <b>entitled</b> owner. A
+    /// consumer that logs or destructures this property is responsible for its own data-minimization; do not
+    /// forward it to an untrusted sink.</para></summary>
     public string FilePath { get; }
 
     /// <summary>

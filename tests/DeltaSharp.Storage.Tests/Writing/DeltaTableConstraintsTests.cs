@@ -299,6 +299,110 @@ public sealed class DeltaTableConstraintsTests : System.IDisposable
         Assert.Empty(DeltaTableConstraints.CollectForWrite(snapshot: null, schema));
     }
 
+    // ---- #685: the malformed-invariant message's foreign SCHEMA FIELD NAME echo ----
+
+    // A field carrying a delta.invariants value this build cannot parse (fail-closed) — the throw path whose
+    // message echoes the owning column name.
+    private static StructField MalformedInvariantField(string name) => new(
+        name, IntegerType.Instance, nullable: true,
+        FieldMetadata.FromEntries(new[]
+        {
+            new System.Collections.Generic.KeyValuePair<string, string>("delta.invariants", "{\"nope\":1}"),
+        }));
+
+    [Fact]
+    public void CollectForWrite_MalformedInvariant_SanitizesColumnNameInMessage()
+    {
+        // #685: `column` is a StructField.Name collected from the snapshot's schema. On a foreign/hostile
+        // table that schema is attacker-authored, so a crafted field name reached the fail-closed
+        // "malformed delta.invariants" message RAW — the #653/#665 schema-name class on the WRITE path.
+        // RED-on-revert against dropping DiagnosticText.Sanitize(column, ConfigTokenMaxLength).
+        const string poisoned = "am\r\nInjected: fake-log-line\u2028ount";
+        var schema = new StructType(new[] { MalformedInvariantField(poisoned) });
+
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
+            () => DeltaTableConstraints.CollectForWrite(snapshot: null, schema));
+
+        Assert.DoesNotContain('\r', ex.Message);
+        Assert.DoesNotContain('\n', ex.Message);
+        Assert.DoesNotContain('\u2028', ex.Message);
+        Assert.DoesNotContain(poisoned, ex.Message, StringComparison.Ordinal);
+        Assert.Contains("am\uFFFD\uFFFDInjected", ex.Message, StringComparison.Ordinal); // neutralized, still named
+    }
+
+    [Fact]
+    public void CollectForWrite_MalformedNestedInvariant_SanitizesDottedChildPathInMessage()
+    {
+        // The nested collector builds `childPath` = parent + "." + field.Name, so BOTH segments are foreign
+        // schema text; the same sanitize must cover the dotted path.
+        const string poisonedLeaf = "le\r\naf";
+        var inner = new StructType(new[] { MalformedInvariantField(poisonedLeaf) });
+        var schema = new StructType(new[] { new StructField("s\u2029x", inner, nullable: true) });
+
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
+            () => DeltaTableConstraints.CollectForWrite(snapshot: null, schema));
+
+        Assert.DoesNotContain('\r', ex.Message);
+        Assert.DoesNotContain('\n', ex.Message);
+        Assert.DoesNotContain('\u2029', ex.Message);
+    }
+
+    [Fact]
+    public void CollectForWrite_MalformedInvariant_OversizedColumnName_IsCappedInMessage()
+    {
+        // The echo is length-bounded at the shared identifier cap, so a crafted 5,000-char field name
+        // cannot render an unbounded log line.
+        string oversized = new('n', DiagnosticText.DefaultMaxLength + 5000);
+        var schema = new StructType(new[] { MalformedInvariantField(oversized) });
+
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
+            () => DeltaTableConstraints.CollectForWrite(snapshot: null, schema));
+
+        Assert.DoesNotContain(oversized, ex.Message, StringComparison.Ordinal);
+        Assert.Contains("\u2026", ex.Message, StringComparison.Ordinal); // truncation marker
+        Assert.True(ex.Message.Length < 600, $"message not bounded: {ex.Message.Length} chars");
+    }
+
+    [Fact]
+    public void CollectForWrite_MalformedInvariant_DottedPath_UsesTheIdentifierCapNotTheConfigTokenCap()
+    {
+        // Cap class (council item 9): `column` may be a DOTTED NESTED PATH, which is precisely what
+        // DefaultMaxLength (128) is documented for; the config-token cap (64) is for short protocol VALUES.
+        // Under column mapping a single physical segment is `col-<uuid>` = 40 chars, so TWO segments already
+        // exceed 64 — capping at 64 would elide the very identifier an operator needs to find the field.
+        // A dotted path between the two caps must therefore survive intact.
+        string segment = new('s', 30);
+        string dotted = segment + "." + segment + "." + segment; // 92 chars: > 64, < 128
+        Assert.True(dotted.Length > DiagnosticText.ConfigTokenMaxLength);
+        Assert.True(dotted.Length < DiagnosticText.DefaultMaxLength);
+
+        var schema = new StructType(new[] { MalformedInvariantField(dotted) });
+
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
+            () => DeltaTableConstraints.CollectForWrite(snapshot: null, schema));
+
+        Assert.Contains(dotted, ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("\u2026", ex.Message, StringComparison.Ordinal); // not elided
+    }
+
+    [Fact]
+    public void CollectForWrite_MalformedInvariant_RendersWellFormedExampleJson()
+    {
+        // Council item 14: the example JSON sat in a PLAIN (non-$) fragment, so `{{`/`}}` rendered as literal
+        // DOUBLED braces — printing malformed JSON to the operator it was meant to help.
+        var schema = new StructType(new[] { MalformedInvariantField("amount") });
+
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
+            () => DeltaTableConstraints.CollectForWrite(snapshot: null, schema));
+
+        Assert.Contains(
+            "'{\"expression\":{\"expression\":\"<predicate>\"}}'", ex.Message, StringComparison.Ordinal);
+        // `{{` never occurs in the correct rendering (the nested objects open as `{"expression":{`), so it is
+        // a sound negative check. `}}` legitimately DOES occur — it is the two closing braces of the nested
+        // objects — so it must not be asserted against.
+        Assert.DoesNotContain("{{", ex.Message, StringComparison.Ordinal);
+    }
+
     private Snapshot SnapshotWithCheck(string value)
     {
         var schema = new StructType(new[] { new StructField("id", IntegerType.Instance, nullable: false) });

@@ -95,7 +95,14 @@ public sealed class DeltaConstraintDependentColumnException : Exception
         // engine's overwriteSchema against an attacker-authored table), so sanitize it before echoing — a
         // crafted name must not inject control/line-break chars into a structured-log sink. It is echoed twice;
         // the raw value is retained on the typed ColumnName property. (operation/ErrorClass are trusted literals.)
-        string safeColumn = DiagnosticText.Sanitize(columnName, DiagnosticText.ConfigTokenMaxLength);
+        //
+        // Cap class = SCHEMA IDENTIFIER, not config-token VALUE: a column name may be a DOTTED NESTED PATH, and
+        // under column mapping two `col-<uuid>` segments alone exceed the 64-char ConfigTokenMaxLength — which
+        // would elide the very identifier the operator needs to locate the offending field. So use
+        // DefaultMaxLength (128), matching the identifier cap DeltaTableConstraints uses for the same class
+        // (DeltaTableConstraint.cs). ConfigTokenMaxLength stays on `c.Name` above — a `delta.constraints.<name>`
+        // key-suffix, which IS the config-token class.
+        string safeColumn = DiagnosticText.Sanitize(columnName, DiagnosticText.DefaultMaxLength);
         string message =
             $"Cannot alter column '{safeColumn}' because this column is referenced by the following check "
             + $"constraint(s):{listing}\nThe {operation} changes '{safeColumn}' (drops, renames, or retypes it), "

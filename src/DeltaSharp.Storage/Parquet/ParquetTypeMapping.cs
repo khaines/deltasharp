@@ -75,11 +75,16 @@ internal static class ParquetTypeMapping
             TimestampNtzType => new DateTimeDataField(
                 field.Name, DateTimeFormat.Timestamp, isAdjustedToUTC: false, unit: DateTimeTimeUnit.Micros, isNullable: nullable),
             DecimalType decimalType => CreateDecimalField(field.Name, decimalType, nullable),
+            // #683/#686: `SimpleString` is NOT a bounded type name for a nested type — StructType.SimpleString
+            // appends each field's Name VERBATIM and recurses, so it is simultaneously a raw-name echo and an
+            // unbounded aggregate (a 5,000-field struct renders ~124,000 chars). This arm matches ONLY
+            // Array/Map/Struct, so the bounded KIND ("array"/"map"/"struct") carries the same diagnosis
+            // alongside the already-sanitized column label, with no unbounded foreign content.
             ArrayType or MapType or StructType => throw DeltaStorageException.UnsupportedFeature(
-                $"Parquet mapping for column '{field.Name}': nested types (phased, design §2.9) — "
-                + $"'{field.DataType.SimpleString}'."),
+                $"Parquet mapping for column '{DiagnosticText.Sanitize(field.Name)}': nested types (phased, design §2.9) — "
+                + $"'{field.DataType.TypeName}'."),
             _ => throw DeltaStorageException.UnsupportedFeature(
-                $"Parquet mapping for column '{field.Name}' of type '{field.DataType.SimpleString}' "
+                $"Parquet mapping for column '{DiagnosticText.Sanitize(field.Name)}' of type '{DiagnosticText.Sanitize(field.DataType.SimpleString)}' "
                 + "is not supported."),
         };
 
@@ -98,7 +103,7 @@ internal static class ParquetTypeMapping
             if (fieldId is <= 0 or > int.MaxValue)
             {
                 throw DeltaStorageException.UnsupportedFeature(
-                    $"Column '{field.Name}' has a delta.columnMapping.id ({fieldId}) outside the Parquet "
+                    $"Column '{DiagnosticText.Sanitize(field.Name)}' has a delta.columnMapping.id ({fieldId}) outside the Parquet "
                     + "field_id range [1, int.MaxValue].");
             }
 
@@ -127,11 +132,11 @@ internal static class ParquetTypeMapping
         switch (field.DataType)
         {
             case ArrayType array:
-                EnsureScalarReadable(array.ElementType, $"array column '{field.Name}' element");
+                EnsureScalarReadable(array.ElementType, $"array column '{DiagnosticText.Sanitize(field.Name)}' element");
                 break;
             case MapType map:
-                EnsureScalarReadable(map.KeyType, $"map column '{field.Name}' key");
-                EnsureScalarReadable(map.ValueType, $"map column '{field.Name}' value");
+                EnsureScalarReadable(map.KeyType, $"map column '{DiagnosticText.Sanitize(field.Name)}' key");
+                EnsureScalarReadable(map.ValueType, $"map column '{DiagnosticText.Sanitize(field.Name)}' value");
                 break;
             case StructType structType:
                 if (structType.Count == 0)
@@ -141,12 +146,12 @@ internal static class ParquetTypeMapping
                     // ctor — fail closed on the DeltaStorageException contract instead (parity with the prior
                     // CreateField reject of all nested types).
                     throw DeltaStorageException.UnsupportedFeature(
-                        $"Parquet read for struct column '{field.Name}': a zero-field struct is not supported.");
+                        $"Parquet read for struct column '{DiagnosticText.Sanitize(field.Name)}': a zero-field struct is not supported.");
                 }
 
                 foreach (StructField nested in structType)
                 {
-                    EnsureScalarReadable(nested.DataType, $"struct column '{field.Name}' field '{nested.Name}'");
+                    EnsureScalarReadable(nested.DataType, $"struct column '{DiagnosticText.Sanitize(field.Name)}' field '{DiagnosticText.Sanitize(nested.Name)}'");
                 }
 
                 break;
@@ -167,8 +172,11 @@ internal static class ParquetTypeMapping
     {
         if (type is ArrayType or MapType or StructType)
         {
+            // #683/#686: inside this guard `type` is Array/Map/Struct, so `SimpleString` would recursively
+            // embed every nested field NAME verbatim and unbounded. Echo the bounded KIND instead; `context`
+            // already carries the (sanitized) column label that identifies WHICH column is at fault.
             throw DeltaStorageException.UnsupportedFeature(
-                $"Parquet read for {context}: a nested type within a nested type ('{type.SimpleString}') is "
+                $"Parquet read for {context}: a nested type within a nested type ('{type.TypeName}') is "
                 + "not supported.");
         }
 
@@ -278,7 +286,7 @@ internal static class ParquetTypeMapping
         if (type.Precision > MaxSupportedDecimalPrecision)
         {
             throw DeltaStorageException.UnsupportedFeature(
-                $"Parquet mapping for column '{name}': decimal precision {type.Precision} exceeds the "
+                $"Parquet mapping for column '{DiagnosticText.Sanitize(name)}': decimal precision {type.Precision} exceeds the "
                 + $"System.Decimal limit of {MaxSupportedDecimalPrecision} (phased, design §2.9).");
         }
 

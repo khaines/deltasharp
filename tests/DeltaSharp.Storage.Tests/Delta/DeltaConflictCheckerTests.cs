@@ -228,6 +228,47 @@ public sealed class DeltaConflictCheckerTests
     }
 
     [Fact]
+    public void SameAppIdTxn_PoisonedAppId_IsSanitizedInMessage()
+    {
+        // #686 uniformity with DeltaCommitter's PartialTxn echo. SEVERITY, stated accurately: the throw is
+        // gated by an ORDINAL match against THIS writer's own loser app ids, so the echoed content is
+        // locally-determined (own-identifier class) rather than foreign/attacker-supplied. It is sanitized so
+        // the posture cannot drift from the sibling site, and because an own app id may itself be derived
+        // from untrusted input (a user-supplied job or stream name).
+        const string poison = "stream\r\n[CRITICAL] forged\u2028line\0";
+
+        var ex = Assert.Throws<ConcurrentTransactionException>(() =>
+            Check(
+                new DeltaAction[] { Txn(poison, 5L), Add("n.parquet") },
+                DeltaReadScope.BlindAppend,
+                new DeltaAction[] { Txn(poison, 4L), Add("w.parquet") }));
+
+        Assert.Equal(DeltaConflictKind.ConcurrentTransaction, ex.Kind);
+        Assert.Equal(0, ex.Message.Count(c => c == '\n'));
+        foreach (char c in new[] { '\r', '\0', '\u2028' })
+        {
+            Assert.DoesNotContain(c, ex.Message);
+        }
+
+        Assert.DoesNotContain(poison, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void SameAppIdTxn_OversizedAppId_IsLengthBoundedInMessage()
+    {
+        string huge = new('a', 5_000);
+
+        var ex = Assert.Throws<ConcurrentTransactionException>(() =>
+            Check(
+                new DeltaAction[] { Txn(huge, 5L), Add("n.parquet") },
+                DeltaReadScope.BlindAppend,
+                new DeltaAction[] { Txn(huge, 4L), Add("w.parquet") }));
+
+        Assert.True(ex.Message.Length < 300, $"message not bounded: {ex.Message.Length} chars");
+        Assert.Contains("\u2026", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void DifferentAppIdTxn_DoesNotConflict()
     {
         Check(
