@@ -742,8 +742,29 @@ internal sealed class DeltaLog
                 Stream stream = await _backend.OpenReadAsync(partPath, cancellationToken).ConfigureAwait(false);
                 await using (stream.ConfigureAwait(false))
                 {
-                    IReadOnlyList<DeltaAction> actions =
-                        await DeltaCheckpointReader.ReadAsync(stream, cancellationToken).ConfigureAwait(false);
+                    IReadOnlyList<DeltaAction> actions;
+                    try
+                    {
+                        actions = await DeltaCheckpointReader.ReadAsync(stream, cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (DeltaStorageException ex) when (ex.Kind == StorageErrorKind.UnsupportedFeature)
+                    {
+                        // Same non-authoritative rule as the DeltaProtocolException catch below, for a
+                        // checkpoint that is a VALID Parquet file DeltaSharp cannot read (Parquet Modular
+                        // Encryption, #681): that door's DIAGNOSIS was upgraded (malformed →
+                        // UnsupportedFeature) and must NOT change snapshot availability, so reconstruction
+                        // still falls back to JSON replay instead of failing the table read. (The data-file
+                        // door's UnsupportedFeature is NOT swallowed anywhere: there the data IS
+                        // authoritative.)
+                        //
+                        // Scoped to THIS call — not the enclosing try — deliberately: the checkpoint READER
+                        // is the only component whose UnsupportedFeature means "unusable derived artifact".
+                        // The same kind raised by _backend.OpenReadAsync above would mean the TABLE itself is
+                        // unreadable, and swallowing that would mask it behind a silent full JSON replay, so
+                        // it must keep propagating (PR #698 security review, FIX 1).
+                        return null;
+                    }
+
                     foreach (DeltaAction action in actions)
                     {
                         if (action is MetadataAction)

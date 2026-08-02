@@ -507,6 +507,106 @@ internal static class ParquetTestHelpers
         return forged.ToArray();
     }
 
+    /// <summary>The <c>AES_GCM_CTR_V1</c> sibling of <see cref="PlaintextFooterEncryptedFileAsync"/> (which
+    /// uses <c>AES_GCM_V1</c>). <c>parquet.thrift</c> defines the <c>EncryptionAlgorithm</c> union with exactly
+    /// these two members, and since #698 review FIX 4 the classifier accepts a union only if one of them is
+    /// set — so this fixture pins the SECOND disjunct, which the <c>AES_GCM_V1</c> fixtures alone leave
+    /// unguarded against a future edit dropping it (#698 review FIX 7).</summary>
+    public static async Task<byte[]> PlaintextFooterEncryptedCtrFileAsync(byte[] bytes)
+    {
+        byte[] newFooter;
+        using (var stream = new MemoryStream(bytes, writable: false))
+        {
+            ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                global::Parquet.Meta.FileMetaData metadata = reader.Metadata!;
+                metadata.EncryptionAlgorithm = new global::Parquet.Meta.EncryptionAlgorithm
+                {
+                    AESGCMCTRV1 = new global::Parquet.Meta.AesGcmCtrV1(),
+                };
+                newFooter = SerializeFooter(metadata);
+            }
+        }
+
+        int originalFooterLength = BitConverter.ToInt32(bytes, bytes.Length - 8);
+        int footerStart = bytes.Length - 8 - originalFooterLength;
+        using var forged = new MemoryStream();
+        forged.Write(bytes, 0, footerStart);
+        forged.Write(newFooter, 0, newFooter.Length);
+        forged.Write(BitConverter.GetBytes(newFooter.Length), 0, 4);
+        forged.Write("PAR1"u8);
+        return forged.ToArray();
+    }
+
+    /// <summary>The ZERO-COLUMN-CHUNK variant of <see cref="EmptyEncryptionAlgorithmUnionFileAsync"/>: sets a
+    /// non-null <c>EncryptionAlgorithm</c> whose known union members are BOTH null — the shape an unknown
+    /// future algorithm id takes, since Parquet.Net 6.0.3 silently drops a union member it cannot
+    /// deserialize — and ALSO clears <c>RowGroups</c>, so the footer carries no column chunk at all. That
+    /// combination empties the per-column <c>CryptoMetadata</c> backstop: with no columns there is nothing to
+    /// mark, so "the spec mandates crypto_metadata on every encrypted column" becomes vacuously true and
+    /// cannot vouch for the file. Both doors must therefore fall back to bare presence and still classify it
+    /// <see cref="StorageErrorKind.UnsupportedFeature"/> rather than reading it as ordinary plaintext
+    /// (#698 gate finding).</summary>
+    public static async Task<byte[]> EmptyEncryptionAlgorithmUnionNoRowGroupsFileAsync(byte[] bytes)
+    {
+        byte[] newFooter;
+        using (var stream = new MemoryStream(bytes, writable: false))
+        {
+            ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                global::Parquet.Meta.FileMetaData metadata = reader.Metadata!;
+                metadata.EncryptionAlgorithm = new global::Parquet.Meta.EncryptionAlgorithm();
+                metadata.RowGroups = new List<global::Parquet.Meta.RowGroup>();
+                metadata.NumRows = 0;
+                newFooter = SerializeFooter(metadata);
+            }
+        }
+
+        int originalFooterLength = BitConverter.ToInt32(bytes, bytes.Length - 8);
+        int footerStart = bytes.Length - 8 - originalFooterLength;
+        using var forged = new MemoryStream();
+        forged.Write(bytes, 0, footerStart);
+        forged.Write(newFooter, 0, newFooter.Length);
+        forged.Write(BitConverter.GetBytes(newFooter.Length), 0, 4);
+        forged.Write("PAR1"u8);
+        return forged.ToArray();
+    }
+
+    /// <summary>The EMPTY-UNION sibling of <see cref="PlaintextFooterEncryptedFileAsync"/>: sets the
+    /// file-level <c>EncryptionAlgorithm</c> to a union with NEITHER member set. This is not a shape any real
+    /// encryptor produces — per <c>parquet.thrift</c> the union always carries exactly one of
+    /// <c>AES_GCM_V1</c>/<c>AES_GCM_CTR_V1</c> — but it IS the shape a corrupt footer parses into (every
+    /// single-bit-flip false positive observed in the checkpoint fuzz corpus was an empty union). Everything
+    /// else in the footer is left intact, so the file opens cleanly AND its schema materializes: the
+    /// schema-first ordering therefore does NOT reject it, which is what makes this fixture a guard on the
+    /// union-non-empty rule ALONE (#698 review FIX 4). Both doors must classify it as corruption, not
+    /// <see cref="StorageErrorKind.UnsupportedFeature"/>.</summary>
+    public static async Task<byte[]> EmptyEncryptionAlgorithmUnionFileAsync(byte[] bytes)
+    {
+        byte[] newFooter;
+        using (var stream = new MemoryStream(bytes, writable: false))
+        {
+            ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                global::Parquet.Meta.FileMetaData metadata = reader.Metadata!;
+                metadata.EncryptionAlgorithm = new global::Parquet.Meta.EncryptionAlgorithm();
+                newFooter = SerializeFooter(metadata);
+            }
+        }
+
+        int originalFooterLength = BitConverter.ToInt32(bytes, bytes.Length - 8);
+        int footerStart = bytes.Length - 8 - originalFooterLength;
+        using var forged = new MemoryStream();
+        forged.Write(bytes, 0, footerStart);
+        forged.Write(newFooter, 0, newFooter.Length);
+        forged.Write(BitConverter.GetBytes(newFooter.Length), 0, 4);
+        forged.Write("PAR1"u8);
+        return forged.ToArray();
+    }
+
     /// <summary>Rewrites the footer so that (<paramref name="rowGroup"/>, <paramref name="columnIndex"/>)'s
     /// column chunk declares <paramref name="forgedCodec"/> as its compression <c>Codec</c> — an OUT-OF-RANGE
     /// value (e.g. <c>9</c>, which is not a real <c>CompressionCodec</c>) that leaves the footer parseable and
