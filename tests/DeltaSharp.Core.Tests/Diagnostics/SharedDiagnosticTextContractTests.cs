@@ -500,4 +500,16 @@ public sealed class SharedDiagnosticTextContractTests
         Assert.Throws<ArgumentOutOfRangeException>(
             () => SharedDiagnosticText.SanitizeAndJoin(input, maxItemLength: 32, maxItems: -1));
     }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void SanitizeAndJoin_NegativeMaxItemLength_ThrowsIdenticallyOnBothPaths(bool forceLazy)
+    {
+        // maxItemLength guard is also before the branch split.
+        string[] tokens = ["a"];
+        IEnumerable<string> input = forceLazy ? tokens.Select(x => x) : tokens;
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => SharedDiagnosticText.SanitizeAndJoin(input, maxItemLength: -1, maxItems: 16));
+    }
 }

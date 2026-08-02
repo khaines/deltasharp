@@ -143,16 +143,18 @@ internal sealed class DeltaProtocolException : Exception
     /// <summary>An internally inconsistent reconstructed log.</summary>
     /// <remarks><b>Message hygiene obligation (#747):</b> the <paramref name="message"/> is
     /// accepted fully-composed; any attacker-influenceable token (e.g. a version number, a column name,
-    /// or content from a foreign <c>_delta_log</c>) must be sanitized by the caller
-    /// before interpolation. Verified for known call sites by <c>StorageMessageHygieneTests</c>.</remarks>
+    /// or content from a foreign <c>_delta_log</c>) MUST be routed through
+    /// <see cref="DiagnosticText.Sanitize"/> by the caller before interpolation. Verified for
+    /// known call sites by <c>StorageMessageHygieneTests</c>.</remarks>
     public static DeltaProtocolException Inconsistent(string message, Exception? innerException = null) =>
         new(DeltaProtocolErrorKind.InconsistentLog, message, innerException);
 
     /// <summary>A time-travel target older than the earliest retained log (a log-cleanup retention gap).</summary>
     /// <remarks><b>Message hygiene obligation (#747):</b> the <paramref name="message"/> is
     /// accepted fully-composed; any attacker-influenceable token (e.g. a version number, a column name,
-    /// or content from a foreign <c>_delta_log</c>) must be sanitized by the caller
-    /// before interpolation. Verified for known call sites by <c>StorageMessageHygieneTests</c>.</remarks>
+    /// or content from a foreign <c>_delta_log</c>) MUST be routed through
+    /// <see cref="DiagnosticText.Sanitize"/> by the caller before interpolation. Verified for
+    /// known call sites by <c>StorageMessageHygieneTests</c>.</remarks>
     public static DeltaProtocolException RetentionGap(string message) =>
         new(DeltaProtocolErrorKind.RetentionGap, message, innerException: null);
 

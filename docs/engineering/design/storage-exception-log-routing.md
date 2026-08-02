@@ -54,12 +54,16 @@ test, the test is named inline.
 ## The contract
 
 > **Contract.** Treat every storage `.Message` as untrusted tenant data. Fixed literals and tokens actually
-> routed through `DiagnosticText.Sanitize` have the posture described below; the message-posture table below
-> lists the **verified producers for call sites known as of `76d2c8e`; coverage is a manually maintained door list, not an automated inventory**, enforced by `StorageHygieneSweepTests`
-> (a mutation turning a `Sanitize` call into an identity turns a sweep-test case red). Eight of the nine `DeltaStorageException` factories accept a fully-composed message and carry the hygiene obligation in the type-level XML `<remarks>` (only `ColumnNotPresentInFile` sanitizes internally at the factory); `DeltaProtocolException` carries the same obligation. The six `ToString()`-covered exception
-> types can retain a **raw, unsanitized `.InnerException`**, and several storage exceptions retain **raw,
-> unsanitized typed properties**. A tenant-visible sink MUST render `.Message` or `.ToString()`, and MUST
-> NOT walk `.InnerException` or reflect over the exception object graph.
+> routed through `DiagnosticText.Sanitize` have the posture described below; the message-posture table
+> below lists the **verified producers for call sites known as of `76d2c8e`; coverage is a manually maintained door list, not an automated inventory**,
+> enforced by `StorageHygieneSweepTests` (a mutation turning a `Sanitize` call into an identity turns a
+> sweep-test case red). Eight of the nine `DeltaStorageException` factories accept a fully-composed
+> message and carry the hygiene obligation in the type-level XML `<remarks>` (only
+> `ColumnNotPresentInFile` sanitizes internally at the factory); `DeltaProtocolException` carries the
+> same obligation. The six `ToString()`-covered exception types can retain a **raw, unsanitized
+> `.InnerException`**, and several storage exceptions retain **raw, unsanitized typed properties**. A
+> tenant-visible sink MUST render `.Message` or `.ToString()`, and MUST NOT walk `.InnerException` or
+> reflect over the exception object graph.
 >
 > **`Sanitized` means record-forgery-safe for tokens actually passed through `DiagnosticText.Sanitize`
 > (line-break **and** `Cf` text-confusion classes — bidi/zero-width/TAG — neutralized to `U+FFFD`) and free
@@ -223,7 +227,8 @@ table; a type-level membership match cannot hide a missing property.
 ## What a storage `.Message` still retains
 
 `Sanitized` is a **record-forgery and raw-decoder-text** property, not a personal-data property. This page
-previously let the two be read as the same thing. The table below is a behavior-pinned set of **verified producers for call sites known as of `76d2c8e`; coverage is a manually maintained door list, not an automated inventory**,
+previously let the two be read as the same thing. The table below is a behavior-pinned set of
+**verified producers for call sites known as of `76d2c8e`; coverage is a manually maintained door list, not an automated inventory**,
 enforced by `StorageHygieneSweepTests` for LocalFileSystemBackend and ColumnNotPresentInFile producers,
 `ParquetMessageHygieneTests` and `ParquetCorruptionTests` for Parquet `columnLabel`/`columnName` producers
 (a mutation on any listed sanitizer turns the respective suite red; #749).
@@ -247,7 +252,9 @@ The hygiene posture differs by site, so do not generalize from one example. `Map
 which drops Hive partition values and keeps only the file/directory shape plus partition column names;
 `SurfaceFailure`'s root-redacted framework detail is also line-break-sanitized.
 `ColumnNotPresentInFile` routes the displayed column name through `DiagnosticText.Sanitize`, so line-break
-and format controls are neutralized there too. Backend write/publish and Parquet schema producers known as of `76d2c8e` are covered by the sweep or the Parquet-specific suites; new producers remain a reviewer obligation tracked by [#749](https://github.com/khaines/deltasharp/issues/749). None of these controls
+and format controls are neutralized there too. Backend write/publish and Parquet schema producers known as of `76d2c8e` are covered by the sweep or
+the Parquet-specific suites; new producers remain a reviewer obligation tracked by
+[#749](https://github.com/khaines/deltasharp/issues/749). None of these controls
 removes the tenant's own data from a relative path or column name.
 
 **Consequences for routing:**
@@ -607,7 +614,12 @@ invisible-smuggling** class as well:
   producer that has not been reviewed for hygiene into a shared log stream should still encode on write
   to guard against line-break injection. The sanitizer covers all producers known as of `76d2c8e`;
   any future producer at a new guard is a reviewer obligation until it is added to the sweep.
-- **All producers known as of `76d2c8e` are covered (#747, completed — closes on PR merge).** All `DeltaStorageException` and `DeltaProtocolException` factories that accept fully-composed messages carry an explicit hygiene obligation in the type-level XML `<remarks>`; their call sites pre-sanitize attacker-influenceable tokens before interpolation — verified by `StorageHygieneSweepTests` and `StorageMessageHygieneTests` for known call sites (both suites carry `DeltaProtocolException` producers). New producers remain a manual reviewer obligation (#749, open).
+- **All producers known as of `76d2c8e` are covered ([#747](https://github.com/khaines/deltasharp/issues/747), completed — closes on PR merge).**
+  All `DeltaStorageException` and `DeltaProtocolException` factories that accept fully-composed messages
+  carry an explicit hygiene obligation in the type-level XML `<remarks>`; their call sites pre-sanitize
+  attacker-influenceable tokens before interpolation — verified by `StorageHygieneSweepTests` and
+  `StorageMessageHygieneTests` for known call sites (both suites carry `DeltaProtocolException`
+  producers). New producers remain a manual reviewer obligation (#749, open).
 
 ## Verification
 

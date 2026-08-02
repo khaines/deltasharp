@@ -67,7 +67,7 @@ internal enum StorageErrorKind
 /// (a column name, a type name from a foreign Parquet footer, a path segment from a foreign
 /// <c>_delta_log</c>) MUST be routed through <see cref="DiagnosticText.Sanitize"/> — or a
 /// stronger drop/minimization — BEFORE interpolation. The sweep test in
-/// <c>StorageHygieneSweepTests</c> covers call sites known as of `76d2c8e`; new call sites carry the
+/// <c>StorageHygieneSweepTests</c> covers call sites known as of <c>76d2c8e</c>; new call sites carry the
 /// same obligation.
 /// </remarks>
 internal sealed class DeltaStorageException : Exception
@@ -101,7 +101,7 @@ internal sealed class DeltaStorageException : Exception
     /// <remarks>
     /// The <see cref="System.Exception.Message"/> is authored by factory methods whose call sites are
     /// responsible for sanitizing attacker-influenceable tokens before interpolation (verified by
-    /// <c>StorageHygieneSweepTests</c> for known producers as of `76d2c8e`; see the type-level <c>&lt;remarks&gt;</c>
+    /// <c>StorageHygieneSweepTests</c> for known producers as of <c>76d2c8e</c>; see the type-level <c>&lt;remarks&gt;</c>
     /// for the full obligation — #745/#749). The raw
     /// underlying cause (e.g. a Parquet.Net exception over crafted bytes) is retained as the inner for
     /// server-side diagnostics; the default <c>ToString()</c> / <c>ILogger.LogError(ex, …)</c> would
@@ -116,7 +116,7 @@ internal sealed class DeltaStorageException : Exception
     /// (a column name, a type name derived from a foreign Parquet footer, a protocol feature key from a
     /// foreign <c>_delta_log</c>) MUST be routed through <see cref="DiagnosticText.Sanitize"/> — or a
     /// stronger drop/minimization — BEFORE interpolation. The sweep test in
-    /// <c>StorageHygieneSweepTests</c> enforces this for every known call site; new call sites must
+    /// <c>StorageHygieneSweepTests</c> enforces this for call sites known as of <c>76d2c8e</c>; new call sites must
     /// satisfy the same property.</para></summary>
     public static DeltaStorageException UnsupportedFeature(string message) =>
         new(StorageErrorKind.UnsupportedFeature, message);
@@ -132,7 +132,7 @@ internal sealed class DeltaStorageException : Exception
     /// <para><b>Message hygiene obligation (#747):</b> same contract as
     /// <see cref="UnsupportedFeature"/>: the message is accepted fully-composed; any attacker-influenceable
     /// token must be routed through <see cref="DiagnosticText.Sanitize"/> by the caller before
-    /// interpolation. The sweep test in <c>StorageHygieneSweepTests</c> covers call sites known as of `76d2c8e`.</para></summary>
+    /// interpolation. The sweep test in <c>StorageHygieneSweepTests</c> covers call sites known as of <c>76d2c8e</c>.</para></summary>
     public static DeltaStorageException SchemaMismatch(string message) =>
         new(StorageErrorKind.SchemaMismatch, message);
 

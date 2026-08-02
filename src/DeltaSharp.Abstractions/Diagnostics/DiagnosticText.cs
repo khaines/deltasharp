@@ -180,6 +180,7 @@ internal static class DiagnosticText
     {
         ArgumentNullException.ThrowIfNull(tokens);
         ArgumentNullException.ThrowIfNull(separator);
+        ArgumentOutOfRangeException.ThrowIfNegative(maxItemLength);
         ArgumentOutOfRangeException.ThrowIfNegative(maxItems);
 
         // Fast path: the count is free when the sequence is already a list — no need to enumerate it twice.
