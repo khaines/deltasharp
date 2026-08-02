@@ -170,47 +170,59 @@ internal static class DiagnosticText
     /// </remarks>
     /// <param name="tokens">The untrusted tokens to render. When not already an
     /// <see cref="IReadOnlyList{T}"/>, at most <paramref name="maxItems"/> tokens are materialized; the
-    /// remainder are counted-only so a hostile unbounded sequence does not force a full allocation (#767).</param>
+    /// remainder are counted-only, bounding retained allocation; the sequence is still fully enumerated to
+    /// compute the count — do not pass an unbounded or I/O-backed sequence (#767).</param>
     /// <param name="maxItemLength">The per-item length cap handed to <see cref="Sanitize"/>.</param>
     /// <param name="maxItems">The maximum number of items rendered before the remainder is elided.</param>
     /// <param name="separator">The separator placed between rendered items.</param>
     internal static string SanitizeAndJoin(
         IEnumerable<string> tokens, int maxItemLength, int maxItems, string separator = ", ")
     {
+        ArgumentNullException.ThrowIfNull(tokens);
+        ArgumentNullException.ThrowIfNull(separator);
+        ArgumentOutOfRangeException.ThrowIfNegative(maxItems);
+
         // Fast path: the count is free when the sequence is already a list — no need to enumerate it twice.
         if (tokens is IReadOnlyList<string> list)
         {
             int shown = Math.Min(list.Count, maxItems);
-            var b = new StringBuilder();
+            var builder = new StringBuilder();
             for (int i = 0; i < shown; i++)
             {
                 if (i > 0)
                 {
-                    b.Append(separator);
+                    builder.Append(separator);
                 }
 
-                b.Append(Sanitize(list[i], maxItemLength));
+                builder.Append(Sanitize(list[i], maxItemLength));
             }
 
             if (list.Count > shown)
             {
-                b.Append(separator).Append(CultureInfo.InvariantCulture, $"… (+{list.Count - shown} more)");
+                builder.Append(separator).Append(CultureInfo.InvariantCulture, $"… (+{list.Count - shown} more)");
             }
 
-            return b.ToString();
+            return builder.ToString();
         }
 
-        // Lazy path: cap DURING enumeration — never materialize the tail (#767). Collect at most
-        // maxItems rendered strings, then count-only the remainder so the elision marker is accurate without
-        // allocating the full hostile list. The caller's IEnumerable may yield millions of items; the only
-        // allocation here is at most maxItems sanitized strings.
-        var rendered = new List<string>(Math.Min(maxItems, 16));
+        // Lazy path: cap DURING enumeration — never materialize the tail (#767). Stream sanitized tokens
+        // directly into the builder, then count-only the remainder so the elision marker is accurate
+        // without allocating the full hostile list. Allocation is bounded; enumeration runs to completion
+        // to compute the tail count — do not pass an unbounded or I/O-backed sequence.
+        var lazyBuilder = new StringBuilder();
+        int lazyShown = 0;
         int tail = 0;
         foreach (string token in tokens)
         {
-            if (rendered.Count < maxItems)
+            if (lazyShown < maxItems)
             {
-                rendered.Add(Sanitize(token, maxItemLength));
+                if (lazyShown > 0)
+                {
+                    lazyBuilder.Append(separator);
+                }
+
+                lazyBuilder.Append(Sanitize(token, maxItemLength));
+                lazyShown++;
             }
             else
             {
@@ -218,23 +230,12 @@ internal static class DiagnosticText
             }
         }
 
-        var builder = new StringBuilder();
-        for (int i = 0; i < rendered.Count; i++)
-        {
-            if (i > 0)
-            {
-                builder.Append(separator);
-            }
-
-            builder.Append(rendered[i]);
-        }
-
         if (tail > 0)
         {
-            builder.Append(separator).Append(CultureInfo.InvariantCulture, $"… (+{tail} more)");
+            lazyBuilder.Append(separator).Append(CultureInfo.InvariantCulture, $"… (+{tail} more)");
         }
 
-        return builder.ToString();
+        return lazyBuilder.ToString();
     }
 
     /// <summary>

@@ -1147,12 +1147,13 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
     /// </remarks>
     private const string RootlessBackslashPathValue = @"(?=[^/]*\\)[^/]*$";
 
-    private const string PathRegionStart = @"(?<![^/\""'\s])";
+    private const string PathRegionStart = @"(?<![^/\\""'\s])";
 
     // Guard-site mutation profile for NoSeparatorEarlierInSegment/QuotedPathPrefix, measured per-site
-    // at the alternation that exists today. Every site is now subsumed while branch 6 (RootlessBackslashPath-
-    // Value) is present; the per-site pin is in PathDisclosureHygieneTests.SegmentGuard_PerSiteProfile_-
-    // IsMeasuredAtThisHeadRatherThanDescribed (which reads the pattern by reflection and deletes branch 6 at
+    // at the alternation that exists today. Every site is now subsumed while branch 6
+    // (RootlessBackslashPathValue) is present; the per-site pin is in
+    // PathDisclosureHygieneTests.SegmentGuard_PerSiteProfile_IsMeasuredAtThisHeadRatherThanDescribed
+    // (which reads the pattern by reflection and deletes branch 6 at
     // runtime to restore individual teeth). Historical baseline:
     // MEASURED-AT 83b88dc — dropping `^` killed 6 tests, dropping `/` killed 5; at the next commit both
     // killed 0 as branch 6 became the sub-key blocker. The per-site test now owns these numbers.
@@ -1166,6 +1167,44 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
         @"(?<!(?:^|/)[^/]*" + DiagnosticText.HiveSeparatorPattern + @"[^/]*)";
 
     private const string QuotedPathPrefix = @"(?<=(?<oq>['""])[^'""]*?[/\\])" + NoSeparatorEarlierInSegment;
+
+    // EVERY SITE THE SEPARATOR ALPHABET IS SPELLED, AND WHAT EACH ONE DOES WITH A BACKSLASH. Two rounds
+    // running, this rule was applied where a defect was measured rather than at every position the
+    // property has to hold, and each time the next reviewer found the position that was missed. So the
+    // sites are enumerated, and a site that legitimately differs says why:
+    //
+    //   1. value classes, all six branches       [^/]*            admits \ -- a value may contain one
+    //   2. branch 1 right anchor                 (?=/)            excludes \ -- it must not END a value
+    //   3. ClosingQuoteValue right anchor        \k<oq>(?:[/\\\\s]...) admits \ AFTER the closing
+    //                                            quote, where it is past the value and cannot truncate it
+    //   4. branches 1 and 4 left anchor          (?<=[/\\])       admits \, guarded (below)
+    //   5. QuotedPathPrefix left anchor          [/\\]           admits \, guarded (below)
+    //   6. key classes                           [^/\\=...]      exclude \ -- a key never spans one
+    //   7. DiagnosticText.PathSeparators         { /, \\ }        splits on \, guarded by the
+    //                                            hiveInBackslashRun latch AND by suppressing key harvest
+    //                                            inside a latched run
+    //   8. RootlessPathValue right anchor        (?=/[^/]*...)    excludes \ -- like site 2, a
+    //                                            backslash must not stand in for the slash that proves
+    //                                            this is a path
+    //   9. PathRegionStart left anchor           (?<![^/\\""'\s])     admits \, guarded (below) -- the
+    //                                            third left-anchor site, added with branch 5
+    //  10. NoSeparatorEarlierInSegment           (?<!(?:^|/)[^/]*=[^/]*) spells / THREE TIMES and \ not at
+    //                                            all: the guard's notion of "segment" is deliberately the
+    //                                            FORWARD-SLASH segment, because a backslash-delimited run is
+    //                                            exactly what it exists to look across
+    //  11. RootlessBackslashPathValue            (?=[^/]*\\)[^/]*$      requires a \ ANYWHERE as
+    //                                            evidence, then runs to end of input; the only site where a
+    //                                            backslash is the evidence rather than a hazard
+    //
+    // THIS TABLE IS NOW EXECUTED, because it went stale three times in three rounds and a prose table
+    // asserting completeness is a test that never runs. See
+    // PathDisclosureHygieneTests.SeparatorBearingConstants_AllHaveARowInTheTotalityTable: it reflects over
+    // this type's private string constants, selects the ones spelling a separator, and requires the name set
+    // to equal the table's. It covers rows 3, 8, 9, 10 and 11 -- the EXTRACTED constants, which are the rows
+    // that have historically gone missing. Rows 1, 2, 4, 5 and 6 are written inline in the [GeneratedRegex]
+    // attribute and row 7 lives in the sibling, so those remain prose obligations; that limit is written
+    // down rather than left implied, because a completeness check that quietly is not one is the defect
+    // this whole table exists to prevent.
 
     [GeneratedRegex(
         @"(?:"

@@ -60,6 +60,16 @@ internal enum StorageErrorKind
 /// <see cref="Kind"/> so a failure is classifiable without parsing its message, and a message that
 /// <b>names</b> the unsupported feature or the concrete defect (design §2.9.1, §2.13.3).
 /// </summary>
+/// <remarks>
+/// <b>Message hygiene obligation (#747):</b> every factory that accepts a fully-composed
+/// <c>string message</c> or <c>string defect</c> passes it verbatim to
+/// <see cref="Exception.Message"/>. Any caller-supplied token that is attacker-influenceable
+/// (a column name, a type name from a foreign Parquet footer, a path segment from a foreign
+/// <c>_delta_log</c>) MUST be routed through <see cref="DiagnosticText.Sanitize"/> — or a
+/// stronger drop/minimization — BEFORE interpolation. The sweep test in
+/// <c>StorageHygieneSweepTests</c> covers every known call site; new call sites carry the
+/// same obligation.
+/// </remarks>
 internal sealed class DeltaStorageException : Exception
 {
     /// <summary>Creates a storage exception of the given <paramref name="kind"/>.</summary>
@@ -86,16 +96,18 @@ internal sealed class DeltaStorageException : Exception
     public string? Path { get; init; }
 
     /// <summary>
-    /// Renders this exception WITHOUT its <see cref="System.Exception.InnerException"/> chain (#664, RF-8b
-    /// parity). The <see cref="System.Exception.Message"/> is authored by factory methods whose call sites are
+    /// Renders this exception without its <see cref="System.Exception.InnerException"/> chain.
+    /// </summary>
+    /// <remarks>
+    /// The <see cref="System.Exception.Message"/> is authored by factory methods whose call sites are
     /// responsible for sanitizing attacker-influenceable tokens before interpolation (verified by
-    /// <c>StorageHygieneSweepTests</c> for every known producer; see the <b>Message hygiene obligation</b>
-    /// note on <see cref="UnsupportedFeature"/> and <see cref="SchemaMismatch"/> — #745/#749). The raw
+    /// <c>StorageHygieneSweepTests</c> for every known producer; see the type-level <c>&lt;remarks&gt;</c>
+    /// for the full obligation — #745/#749). The raw
     /// underlying cause (e.g. a Parquet.Net exception over crafted bytes) is retained as the inner for
     /// server-side diagnostics; the default <c>ToString()</c> / <c>ILogger.LogError(ex, …)</c> would
-    /// re-surface that raw inner, so this override omits it. The inner remains reachable via
-    /// <see cref="System.Exception.InnerException"/>.
-    /// </summary>
+    /// re-surface that raw inner, so this override omits it (#664, RF-8b parity). The inner remains
+    /// reachable via <see cref="System.Exception.InnerException"/>.
+    /// </remarks>
     public override string ToString() => DiagnosticText.DescribeWithoutInner(this, Kind.ToString());
 
     /// <summary>Creates an <see cref="StorageErrorKind.UnsupportedFeature"/> error naming the feature.
@@ -110,6 +122,9 @@ internal sealed class DeltaStorageException : Exception
         new(StorageErrorKind.UnsupportedFeature, feature);
 
     /// <summary>Creates a <see cref="StorageErrorKind.CorruptData"/> error naming the defect.</summary>
+    /// <remarks><b>Message hygiene obligation:</b> see the type-level
+    /// <c>&lt;remarks&gt;</c> — the <paramref name="defect"/> string is accepted fully-composed;
+    /// any attacker-influenceable token must be sanitized by the caller before interpolation.</remarks>
     public static DeltaStorageException CorruptData(string defect, Exception? innerException = null) =>
         new(StorageErrorKind.CorruptData, defect, innerException);
 

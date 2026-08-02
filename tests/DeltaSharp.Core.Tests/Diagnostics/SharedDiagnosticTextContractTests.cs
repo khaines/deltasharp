@@ -435,4 +435,57 @@ public sealed class SharedDiagnosticTextContractTests
                     + $"until one costs less than {refund} with its separator, or lower the budgets until "
                     + $"it can"));
     }
+
+    [Fact]
+    public void SanitizeAndJoin_LazyPath_BoundsAllocationRegardlessOfSequenceLength()
+    {
+        // #767: the lazy path must NOT materialize the full sequence. 1_000_000 tokens, maxItems=16.
+        // Verify: (a) elision marker is produced, (b) correct count, (c) only maxItems tokens appear
+        // in the output (structural bound — allocation measurement is too environment-sensitive for CI).
+        int yielded = 0;
+        IEnumerable<string> LazyTokens()
+        {
+            for (int i = 0; i < 1_000_000; i++)
+            {
+                yielded++;
+                yield return $"t{i}";
+            }
+        }
+
+        string result = SharedDiagnosticText.SanitizeAndJoin(LazyTokens(), maxItemLength: 32, maxItems: 16);
+
+        Assert.Equal(1_000_000, yielded); // fully enumerated (count-only tail)
+        Assert.Contains("(+", result);   // elision marker present
+        Assert.Contains("+999984 more)", result); // exact tail count
+        // Only 16 tokens rendered — result does not contain token 17+
+        Assert.DoesNotContain("t16,", result);
+    }
+
+    [Theory]
+    [InlineData(0, 0)]
+    [InlineData(1, 1)]
+    [InlineData(2, 1)]
+    [InlineData(15, 16)]
+    [InlineData(16, 16)]
+    [InlineData(17, 16)]
+    [InlineData(40, 16)]
+    [InlineData(5, 2)]
+    public void SanitizeAndJoin_FastAndLazyPaths_ProduceIdenticalOutput(int tokenCount, int maxItems)
+    {
+        string[] tokens = Enumerable.Range(0, tokenCount).Select(i => $"tok-{i}").ToArray();
+        // Force lazy path with a non-IReadOnlyList wrapper
+        IEnumerable<string> lazy = tokens.Select(x => x);
+
+        string fast = SharedDiagnosticText.SanitizeAndJoin(tokens, maxItemLength: 32, maxItems: maxItems);
+        string slowPath = SharedDiagnosticText.SanitizeAndJoin(lazy, maxItemLength: 32, maxItems: maxItems);
+
+        Assert.Equal(fast, slowPath);
+    }
+
+    [Fact]
+    public void SanitizeAndJoin_NegativeMaxItems_Throws()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => SharedDiagnosticText.SanitizeAndJoin(new[] { "a" }, maxItemLength: 32, maxItems: -1));
+    }
 }

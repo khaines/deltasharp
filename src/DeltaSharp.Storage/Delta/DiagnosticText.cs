@@ -208,7 +208,9 @@ internal static class DiagnosticText
         // separators, so `a\b\c\email=v` reports "3 directories omitted" where a POSIX reader sees one
         // component and no directories at all. Both readings misinform — counting only `/` reports "0 omitted"
         // while three names were in fact dropped on Windows — but neither reading discloses a partition VALUE
-        // or any directory NAME: the count is a structural fact, not data. The safe direction for a
+        // or any directory NAME: the count is a bounded
+        // scalar derived from the number of separator characters, which leaks only a weak character-frequency
+        // oracle over the withheld names — not the names themselves. Accepted. The safe direction for a
         // non-disclosing claim is OVER-REPORT (more directories omitted than truly were), which is exactly
         // what counting `\` produces on a POSIX-produced path. Counting only `/` would UNDER-REPORT on a
         // Windows-produced path, hiding traversal depth.
@@ -308,7 +310,10 @@ internal static class DiagnosticText
         // been recorded, so consulting it here would lose suppression on
         // `email=x\alice.taylor%40example.com/`. `lastSegmentInsideHiveRun` is the latch state BEFORE the
         // terminal segment, which is exactly the state needed for both file-name and partition-key
-        // suppression here.
+        // suppression here. It strictly dominates the live latch at this point: once the terminal
+        // segment is recorded, a following `/` can only CLEAR the live latch, never set it — so
+        // reading the live latch could only ever LOSE suppression, which is the definition of a
+        // fail-open read.
         bool terminalIsPartitionDirectory = terminalCarriesHive || lastSegmentInsideHiveRun;
         if (terminalCarriesHive && !lastSegmentInsideHiveRun)
         {
@@ -412,6 +417,10 @@ internal static class DiagnosticText
     /// case. A foreign writer may percent-encode the separator, and a segment whose separator arrived that
     /// way is still a Hive partition directory — declining it echoes the value, which is the fail-open class
     /// this whole family of guards exists to close.</para>
+    /// <para><b>Archaeology note.</b> Three recognizer spellings were fixed in <c>Redact</c>
+    /// and missed here in successive rounds — the empty key, the <c>IndexOf('=') &gt;= 0</c>
+    /// off-by-one, and the percent-encoded separator. The shared predicate closes the class:
+    /// any future spelling is added once and is covered in both recognizers by construction.</para>
     /// </remarks>
     internal static int HiveSeparatorIndex(ReadOnlySpan<char> segment, out int separatorLength)
     {
