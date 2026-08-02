@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.Collections.Immutable;
 using DeltaSharp.Storage.Delta;
 using DeltaSharp.Storage.Parquet;
+using DeltaSharp.Types;
 using Xunit;
 
 namespace DeltaSharp.Storage.Tests;
@@ -85,6 +86,17 @@ public sealed class StorageMessageHygieneTests
     }
 
     [Fact]
+    public void Sanitize_StripsBidiAndZeroWidthFormatCharacters()
+    {
+        // Category Cf (Format) is NOT caught by char.IsControl, yet U+202E RIGHT-TO-LEFT OVERRIDE spoofs the
+        // rendered order of a log line / filename and zero-width formatters (U+200B, U+FEFF, U+00AD) hide
+        // payload. An identifier legitimately carries none of these, so the sanitizer must neutralize them.
+        Assert.Equal("a\uFFFDb\uFFFDc\uFFFDd", DiagnosticText.Sanitize("a\u202Eb\u200Bc\uFEFFd"));
+        // The classic bidi-override log-forge spoof is neutralized, not passed through.
+        Assert.DoesNotContain('\u202E', DiagnosticText.Sanitize("acct\u202Etxt.forged"));
+    }
+
+    [Fact]
     public void Sanitize_DoesNotSplitSurrogatePairAtCap()
     {
         // A cap that would land mid-surrogate-pair must back off so no lone surrogate is emitted.
@@ -111,11 +123,11 @@ public sealed class StorageMessageHygieneTests
             DeltaSchemaMismatchException.NewColumnNotAllowed(poisoned),
             DeltaSchemaMismatchException.NewColumnMustBeNullable(poisoned),
             DeltaSchemaMismatchException.NullabilityViolation(poisoned),
-            DeltaSchemaMismatchException.IncompatibleType(poisoned, "integer", "string"),
-            DeltaSchemaMismatchException.TypeWideningUnsupported(poisoned, "integer", "long"),
-            DeltaSchemaMismatchException.PartitionColumnWideningDeferred(poisoned, "integer", "long"),
+            DeltaSchemaMismatchException.IncompatibleType(poisoned, DataTypes.IntegerType, DataTypes.StringType),
+            DeltaSchemaMismatchException.TypeWideningUnsupported(poisoned, DataTypes.IntegerType, DataTypes.LongType),
+            DeltaSchemaMismatchException.PartitionColumnWideningDeferred(poisoned, DataTypes.IntegerType, DataTypes.LongType),
             DeltaSchemaMismatchException.CaseInsensitiveDuplicateColumn(poisoned, poisoned),
-            DeltaSchemaMismatchException.PartitionColumnEvolution(poisoned, "integer", "long"),
+            DeltaSchemaMismatchException.PartitionColumnEvolution(poisoned, DataTypes.IntegerType, DataTypes.LongType),
         ];
 
         foreach (DeltaSchemaMismatchException ex in exceptions)
@@ -139,6 +151,26 @@ public sealed class StorageMessageHygieneTests
         Assert.Equal("a\U0001F600b", DiagnosticText.Sanitize("a\U0001F600b")); // valid pair preserved
         // Even with a negative/oversized cap (no length capping), a lone surrogate is still neutralized.
         Assert.Equal("\uFFFD", DiagnosticText.Sanitize("\uD800", maxLength: -10));
+    }
+
+    [Fact]
+    public void Sanitize_NeutralizesAstralFormatControls_TagBlockAndOthers()
+    {
+        // Regression (Balanced/Security/Connectors seats, R3 re-poll): the surrogate-pair fast path kept a
+        // valid pair VERBATIM without category-checking the combined code point, so ASTRAL Format controls
+        // (Cf) — invisible/spoofing-capable exactly like the BMP Cf that Sanitize_StripsBidiAndZeroWidth…
+        // already neutralizes — survived. char.GetUnicodeCategory is per UTF-16 code UNIT and cannot see them;
+        // the code-POINT check now neutralizes them to U+FFFD. This keeps Sanitize in lock-step with
+        // ColumnMapping.FindUnsafePathSegmentReason (both reject astral Cf), which the in-code comment asserts.
+        Assert.Equal("a\uFFFDb", DiagnosticText.Sanitize("a\U000E0001b")); // U+E0001 LANGUAGE TAG
+        Assert.Equal("a\uFFFDb", DiagnosticText.Sanitize("a\U000E0020b")); // U+E0020 TAG SPACE (TAG block)
+        Assert.Equal("a\uFFFDb", DiagnosticText.Sanitize("a\U000E007Fb")); // U+E007F CANCEL TAG
+        Assert.Equal("a\uFFFDb", DiagnosticText.Sanitize("a\U0001D173b")); // U+1D173 MUSICAL SYMBOL (Cf)
+        // The canonical invisible-ASCII-smuggling case: 'col1' vs 'col1'+U+E0020 render identically to an
+        // operator; after sanitizing they are visibly distinct (the tag char becomes U+FFFD).
+        Assert.NotEqual(DiagnosticText.Sanitize("col1"), DiagnosticText.Sanitize("col1\U000E0020"));
+        // A VISIBLE astral pair is still preserved (the fix rejects only Cf, not all astral).
+        Assert.Equal("a\U00020BB7b", DiagnosticText.Sanitize("a\U00020BB7b")); // CJK Ext-B — kept verbatim
     }
 
     [Fact]
@@ -379,5 +411,116 @@ public sealed class StorageMessageHygieneTests
 
         Assert.Contains("more)", ex.Message, StringComparison.Ordinal);
         Assert.True(ex.Message.Length < 3000, $"aggregate message not bounded: {ex.Message.Length} chars");
+    }
+
+    // ---- #683: the residual own-identifier / schema-name echoes (the last raw-token family) ----
+
+    [Fact]
+    public void ColumnNotPresentInFile_SanitizesColumnNameInMessage()
+    {
+        // #685 (maintainer follow-up on the #664 R1 Security seat): DeltaStorageException.ColumnNotPresentInFile
+        // interpolated the required column name RAW, unlike DeltaSchemaMismatchException. On a foreign table the
+        // requested column name is attacker-authored schema text, so it must go through the shared sanitizer.
+        DeltaStorageException ex = DeltaStorageException.ColumnNotPresentInFile(FullInjectionCorpus);
+
+        Assert.Equal(StorageErrorKind.ColumnNotPresentInFile, ex.Kind); // still fails closed on the same kind
+        AssertFullyNeutralized(ex.Message);
+    }
+
+    [Fact]
+    public void ColumnNotPresentInFile_OversizedColumnName_IsCappedInMessage()
+    {
+        string oversized = new('q', DiagnosticText.DefaultMaxLength + 200);
+
+        DeltaStorageException ex = DeltaStorageException.ColumnNotPresentInFile(oversized);
+
+        Assert.DoesNotContain(oversized, ex.Message, StringComparison.Ordinal);
+        Assert.Contains("…", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void NestedReader_ParallelRepetitionGuard_SanitizesColumnLabel()
+    {
+        // #683: the nested reader threads `columnName` as a pure DIAGNOSTIC LABEL into ~40 messages. It is now
+        // sanitized ONCE at each entry point, so a poisoned label cannot inject at any of them.
+        DeltaStorageException ex = Assert.Throws<DeltaStorageException>(
+            () => NestedParquetColumnReader.ValidateParallelRepetition(
+                new[] { 0 }, new[] { 0, 1 }, FullInjectionCorpus));
+
+        Assert.Equal(StorageErrorKind.CorruptData, ex.Kind);
+        AssertFullyNeutralized(ex.Message);
+    }
+
+    [Fact]
+    public void NestedReader_ParallelDefinitionGuard_SanitizesColumnLabel()
+    {
+        DeltaStorageException ex = Assert.Throws<DeltaStorageException>(
+            () => NestedParquetColumnReader.ValidateParallelDefinition(
+                new[] { 0 }, new[] { 0, 1 }, mapMaxDef: 2, FullInjectionCorpus));
+
+        Assert.Equal(StorageErrorKind.CorruptData, ex.Kind);
+        AssertFullyNeutralized(ex.Message);
+    }
+
+    [Fact]
+    public void NestedReader_ValidateShape_SanitizesColumnLabel()
+    {
+        // The shape-validation entry point (reached before any data page is read) echoes the label too.
+        DeltaStorageException ex = Assert.Throws<DeltaStorageException>(
+            () => NestedParquetColumnReader.ValidateShape(
+                new global::Parquet.Schema.DataField<int>("leaf"),
+                new StructType(new[] { new StructField("f", IntegerType.Instance, nullable: true) }),
+                FullInjectionCorpus));
+
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+        AssertFullyNeutralized(ex.Message);
+    }
+
+    [Fact]
+    public void ParquetTypeMapping_NestedColumn_SanitizesFieldNameInMessage()
+    {
+        // #683: the Parquet mapping's own-schema {field.Name} echoes are the same class — a foreign table's
+        // (or a column-mapped physical) name reaches the fail-closed unsupported-type message.
+        var nested = new StructField(
+            FullInjectionCorpus,
+            new StructType(new[] { new StructField("x", IntegerType.Instance, nullable: true) }),
+            nullable: true);
+
+        DeltaStorageException ex = Assert.Throws<DeltaStorageException>(() => ParquetTypeMapping.CreateField(nested));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, ex.Kind);
+        AssertFullyNeutralized(ex.Message);
+    }
+
+    [Fact]
+    public void ChangeDataWriter_NestedDataColumn_SanitizesFieldNameInMessage()
+    {
+        // #685 audit (write path): the CDF write-door's nested-column gate echoes a data column name that, on
+        // a foreign table, is attacker-authored schema text.
+        var schema = new StructType(new[]
+        {
+            new StructField(
+                FullInjectionCorpus,
+                new StructType(new[] { new StructField("x", IntegerType.Instance, nullable: true) }),
+                nullable: true),
+        });
+
+        DeltaStorageException ex = Assert.Throws<DeltaStorageException>(
+            () => ChangeDataWriter.EnsureWritableDataSchema(schema));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, ex.Kind);
+        AssertFullyNeutralized(ex.Message);
+    }
+
+    [Fact]
+    public void ColumnMapping_PartitionColumnNotInSchema_SanitizesColumnNameInMessage()
+    {
+        // #683: metaData.partitionColumns entries are foreign table metadata; the absent-column guard echoed
+        // the name raw.
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
+            () => ColumnMapping.EnsurePartitionColumnsInSchema(
+                StructType.Empty, ImmutableArray.Create(FullInjectionCorpus)));
+
+        AssertFullyNeutralized(ex.Message);
     }
 }

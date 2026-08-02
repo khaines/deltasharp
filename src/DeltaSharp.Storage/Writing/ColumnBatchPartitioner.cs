@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Globalization;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Delta;
 using DeltaSharp.Types;
@@ -51,8 +52,16 @@ internal static class ColumnBatchPartitioner
             int ordinal = fullSchema.IndexOf(partitionColumns[i]);
             if (ordinal < 0)
             {
+                // #683 message hygiene: reachable through the PUBLIC DeltaWriteTarget.AppendAsync door, so
+                // both tokens are caller-influenced. The column name is the foreign-schema-name class ->
+                // Sanitize. `fullSchema.SimpleString` is NOT a bounded type name: StructType.SimpleString
+                // appends every field name verbatim and recurses, so a 5,000-column schema rendered ~129,000
+                // characters carrying every name raw -> DescribeSchema (count + bounded name sample).
                 throw new ArgumentException(
-                    $"Partition column '{partitionColumns[i]}' is not present in the write schema '{fullSchema.SimpleString}'.",
+                    string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"Partition column '{DiagnosticText.Sanitize(partitionColumns[i])}' is not present in "
+                        + $"the write schema {DiagnosticText.DescribeSchema(fullSchema)}."),
                     nameof(partitionColumns));
             }
 

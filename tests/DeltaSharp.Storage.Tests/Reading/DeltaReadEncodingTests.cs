@@ -104,6 +104,36 @@ public sealed class DeltaReadEncodingTests
         Assert.Contains("Partition value", ex.Message, StringComparison.Ordinal);   // fixed diagnostic prefix
     }
 
+    [Theory]
+    [InlineData(null)]                             // JSON null — the value-conditional ESCAPE (Security seat, #685)
+    [InlineData("__HIVE_DEFAULT_PARTITION__")]     // Hive sentinel — same null arm, same escape
+    [InlineData("some-value")]                     // non-null — the arm that was already guarded inside FillTyped
+    public void BuildConstantColumn_NonScalarPartitionType_FailsClosedBounded_NoNestedNameLeak(string? value)
+    {
+        // #685 Critical (Security seat, executed end-to-end). A FOREIGN metaData.schemaString can declare a
+        // partition column of a NON-SCALAR type (struct/array/map). The unsupported-type guard used to live
+        // inside FillTyped, which is reached ONLY for a non-null value — so a hostile table recording null or
+        // __HIVE_DEFAULT_PARTITION__ in add.partitionValues bypassed it, hit ColumnVectors.Create(struct), and
+        // its AppendNull threw a RAW, unbounded, injection-bearing child-shape message carrying the attacker-
+        // authored nested field NAMES (DeltaSharp.Engine.Columnar cannot see DiagnosticText). The guard now runs
+        // at BuildConstantColumn's ENTRY, before ColumnVectors.Create and the null short-circuit, so EVERY value
+        // arm fails closed with the same bounded type-name message and no nested field name is ever rendered.
+        const string poison = "secret\r\n[CRITICAL] forged\u2028\u202Ename";
+        var structType = new StructType(new[] { new StructField(poison, IntegerType.Instance, nullable: true) });
+
+        DeltaStorageException ex = Assert.Throws<DeltaStorageException>(
+            () => DeltaReadEncoding.BuildConstantColumn(structType, value, rowCount: 3));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, ex.Kind);
+        Assert.Contains("not supported as a Delta partition column", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("secret", ex.Message, StringComparison.Ordinal);        // no nested field name (any form)
+        Assert.DoesNotContain("forged", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain('\n', ex.Message);                                       // no CR/LF injection
+        Assert.DoesNotContain('\u2028', ex.Message);
+        Assert.DoesNotContain('\u202E', ex.Message);                                   // no bidi override
+        Assert.True(ex.Message.Length < 200, "bounded type-name message, not the unbounded raw child-shape throw");
+    }
+
     private static DataType TypeFor(string name) => name switch
     {
         "integer" => IntegerType.Instance,

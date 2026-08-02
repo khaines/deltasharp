@@ -1369,7 +1369,7 @@ internal sealed class ParquetFileReader
                 if (byFieldId is not null)
                 {
                     throw DeltaStorageException.UnsupportedFeature(
-                        $"Column '{name}': reading a nested column under column-mapping id mode is not supported.");
+                        $"Column '{DiagnosticText.Sanitize(name)}': reading a nested column under column-mapping id mode is not supported.");
                 }
 
                 if (!byName.TryGetValue(name, out Field? nestedField))
@@ -1410,7 +1410,7 @@ internal sealed class ParquetFileReader
                 // requested scalar type genuinely disagrees with the file — a SchemaMismatch.
                 field = candidate as DataField
                     ?? throw DeltaStorageException.SchemaMismatch(
-                        $"Column '{name}': the requested type '{requestedField.DataType.SimpleString}' is scalar "
+                        $"Column '{DiagnosticText.Sanitize(name)}': the requested type '{requestedField.DataType.SimpleString}' is scalar "
                         + "but the file column is nested.");
                 present = true;
             }
@@ -1459,6 +1459,20 @@ internal sealed class ParquetFileReader
     // still rejected fail-closed.
     private static void ValidateFileField(DataField fileField, StructField requestedField, bool allowTypeWideningPromotion)
     {
+        // #683 message hygiene: `requestedField.Name` originates in `metaData.schemaString`, which on a
+        // foreign/hostile table read is fully attacker-authored. It is a pure DIAGNOSTIC LABEL here (every
+        // resolution decision above used the raw name; this method only reports), so sanitize it ONCE at the
+        // entry point — the same idiom applied at the resolution sites ~60 lines above and in
+        // NestedParquetColumnReader — rather than at each of the five throw sites below.
+        string columnLabel = DiagnosticText.Sanitize(requestedField.Name);
+
+        // `requestedField.DataType.SimpleString` IS echoed raw below, and that is deliberate. The class doc on
+        // DiagnosticText warns that SimpleString is unbounded FOR A NESTED TYPE, because StructType/ArrayType/
+        // MapType append every nested field name verbatim and recurse. This method only ever sees a SCALAR:
+        // ParquetTypeMapping.CreateField (next line) rejects nested types outright, and a nested request is
+        // routed to NestedParquetColumnReader.ValidateShape long before it reaches here. On a scalar,
+        // SimpleString is a bounded literal ("bigint", "decimal(10,2)") carrying no caller text. Do NOT copy
+        // this pattern into a context that can see a nested type.
         DataField expected = ParquetTypeMapping.CreateField(requestedField);
 
         // Read-side promotion gate: a narrower physical type that is a sanctioned widening of the request is
@@ -1473,7 +1487,7 @@ internal sealed class ParquetFileReader
         if (!promotable && fileField.ClrType != expected.ClrType)
         {
             throw DeltaStorageException.SchemaMismatch(
-                $"Column '{requestedField.Name}': file physical type '{fileField.ClrType.Name}' does not "
+                $"Column '{columnLabel}': file physical type '{fileField.ClrType.Name}' does not "
                 + $"match the requested engine type '{requestedField.DataType.SimpleString}' "
                 + $"(expected '{expected.ClrType.Name}').");
         }
@@ -1486,7 +1500,7 @@ internal sealed class ParquetFileReader
         if (fileField.IsNullable && !expected.IsNullable)
         {
             throw DeltaStorageException.SchemaMismatch(
-                $"Column '{requestedField.Name}': the file column is nullable but the requested engine "
+                $"Column '{columnLabel}': the file column is nullable but the requested engine "
                 + "type is non-nullable.");
         }
 
@@ -1504,7 +1518,7 @@ internal sealed class ParquetFileReader
                 if (fileField is not DateTimeDataField { DateTimeFormat: DateTimeFormat.Date })
                 {
                     throw DeltaStorageException.SchemaMismatch(
-                        $"Column '{requestedField.Name}': expected a DATE column but the file annotation "
+                        $"Column '{columnLabel}': expected a DATE column but the file annotation "
                         + "is not DATE.");
                 }
 
@@ -1522,7 +1536,7 @@ internal sealed class ParquetFileReader
                     || timestampField.DateTimeFormat == DateTimeFormat.Date)
                 {
                     throw DeltaStorageException.SchemaMismatch(
-                        $"Column '{requestedField.Name}': expected a {requestedField.DataType.SimpleString} "
+                        $"Column '{columnLabel}': expected a {requestedField.DataType.SimpleString} "
                         + "column but the file annotation is DATE or not a temporal type.");
                 }
 
@@ -1534,7 +1548,7 @@ internal sealed class ParquetFileReader
                     || decimalField.Scale != decimalType.Scale)
                 {
                     throw DeltaStorageException.SchemaMismatch(
-                        $"Column '{requestedField.Name}': file decimal type does not match the requested "
+                        $"Column '{columnLabel}': file decimal type does not match the requested "
                         + $"'{decimalType.SimpleString}' (precision/scale differ).");
                 }
 
@@ -1774,7 +1788,7 @@ internal sealed class ParquetFileReader
                 break;
             default:
                 throw DeltaStorageException.UnsupportedFeature(
-                    $"Parquet read for column '{requestedField.Name}' of type "
+                    $"Parquet read for column '{DiagnosticText.Sanitize(requestedField.Name)}' of type "
                     + $"'{requestedField.DataType.SimpleString}' is not supported.");
         }
     }
@@ -1879,7 +1893,7 @@ internal sealed class ParquetFileReader
             default:
                 // Unreachable: ValidateFileField only admits the sanctioned widenings handled above.
                 throw DeltaStorageException.SchemaMismatch(
-                    $"Column '{requestedField.Name}': cannot promote physical type "
+                    $"Column '{DiagnosticText.Sanitize(requestedField.Name)}': cannot promote physical type "
                     + $"'{physicalType.SimpleString}' to requested '{requestedField.DataType.SimpleString}'.");
         }
     }

@@ -1,3 +1,4 @@
+using System.Globalization;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Delta;
 using DeltaSharp.Types;
@@ -78,9 +79,18 @@ internal sealed class ParquetFileWriter
             ColumnBatch batch = batches[b] ?? throw new ArgumentNullException(nameof(batches), $"Batch {b} is null.");
             if (!batch.Schema.Equals(schema))
             {
+                // This is an internal-invariant guard: every in-tree caller derives `batch.Schema` and
+                // `schema` from the same source, so a mismatch means a DeltaSharp bug. It is NOT dead code
+                // though — InternalsVisibleTo makes WriteAsync directly callable, and the guard exists
+                // precisely because the invariant can break. Both renders therefore go through
+                // DescribeSchema: StructType.SimpleString embeds every field name verbatim and recurses, so
+                // these two tokens rendered ~129,000 raw characters on a wide schema.
                 throw new ArgumentException(
-                    $"Batch {b} has schema '{batch.Schema.SimpleString}' but the writer schema is "
-                    + $"'{schema.SimpleString}'.", nameof(batches));
+                    string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"Batch {b} has schema {DiagnosticText.DescribeSchema(batch.Schema)} but the writer "
+                        + $"schema is {DiagnosticText.DescribeSchema(schema)}."),
+                    nameof(batches));
             }
 
             var columns = new ColumnVector[columnCount];
@@ -274,8 +284,8 @@ internal sealed class ParquetFileWriter
                 break;
             default:
                 throw DeltaStorageException.UnsupportedFeature(
-                    $"Parquet write for column '{schemaField.Name}' of type "
-                    + $"'{schemaField.DataType.SimpleString}' is not supported.");
+                    $"Parquet write for column '{DiagnosticText.Sanitize(schemaField.Name)}' of type "
+                    + $"'{DiagnosticText.Sanitize(schemaField.DataType.SimpleString)}' is not supported.");
         }
     }
 
@@ -321,7 +331,7 @@ internal sealed class ParquetFileWriter
                     if (vector.IsNull(row))
                     {
                         throw DeltaStorageException.CorruptData(
-                            $"Non-nullable column '{field.Name}' holds a null at row {row}.");
+                            $"Non-nullable column '{DiagnosticText.Sanitize(field.Name)}' holds a null at row {row}.");
                     }
 
                     values[idx++] = read(vector, row);
@@ -374,7 +384,7 @@ internal sealed class ParquetFileWriter
                     if (vector.IsNull(row))
                     {
                         throw DeltaStorageException.CorruptData(
-                            $"Non-nullable column '{field.Name}' holds a null at row {row}.");
+                            $"Non-nullable column '{DiagnosticText.Sanitize(field.Name)}' holds a null at row {row}.");
                     }
 
                     values[idx++] = ParquetTypeMapping.ReadDecimal(vector, decimalType, row);
@@ -467,7 +477,7 @@ internal sealed class ParquetFileWriter
         if (!nullable)
         {
             throw DeltaStorageException.CorruptData(
-                $"Non-nullable column '{field.Name}' holds a null at row {row}.");
+                $"Non-nullable column '{DiagnosticText.Sanitize(field.Name)}' holds a null at row {row}.");
         }
     }
 

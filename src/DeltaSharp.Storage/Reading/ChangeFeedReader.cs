@@ -872,10 +872,18 @@ internal sealed class ChangeFeedReader
 
                 if (!expectedField.DataType.Equals(fileType))
                 {
+                    // `fileType` is a ParquetLeafColumn.Type: ParquetTypeMapping.ToDataSchema builds it from
+                    // Parquet.Net's LEAF DataFields, so it is atomic/decimal BY DATA SOURCE and SimpleString
+                    // is a bounded literal there (and `decimal(10,2)` is what makes a decimal mismatch
+                    // diagnosable). `expectedField.DataType` is NOT: it is copied verbatim out of the foreign
+                    // schemaString by BuildDataSchema, which does not flatten — so it must go through the
+                    // bounded renderer. (Unreachable with a struct TODAY, because id mode implies
+                    // ResolvePhysicalNames already rejected a nested top-level column; routed anyway so the
+                    // two branches cannot drift if that upstream guard is ever relaxed.)
                     throw NewCdcSchemaMismatch(
                         version,
                         $"the data column with column-mapping id {id} has leaf type {fileType.SimpleString} but "
-                        + $"the version's metadata declares {expectedField.DataType.SimpleString}");
+                        + $"the version's metadata declares {DiagnosticText.DescribeType(expectedField.DataType)}");
                 }
 
                 fileByFieldId.Remove((int)id);
@@ -932,15 +940,21 @@ internal sealed class ChangeFeedReader
             if (!fileByName.TryGetValue(expectedField.Name, out DataType? fileType))
             {
                 throw NewCdcSchemaMismatch(
-                    version, $"it is missing the version's data column '{expectedField.Name}'");
+                    version, $"it is missing the version's data column '{DiagnosticText.Sanitize(expectedField.Name)}'");
             }
 
             if (!expectedField.DataType.Equals(fileType))
             {
+                // See the id-branch note above. This branch is the REACHABLE one: under column-mapping mode
+                // NONE, ResolvePhysicalNames does not run its nested-column rejection, so a foreign
+                // schemaString may declare a STRUCT data column here. A StructType can never equal a leaf, so
+                // the guard fires unconditionally and `expectedField.DataType.SimpleString` would render every
+                // nested field name verbatim and recursively — a >100,000-character, control-character-bearing
+                // message from a single crafted commit.
                 throw NewCdcSchemaMismatch(
                     version,
-                    $"data column '{expectedField.Name}' has leaf type {fileType.SimpleString} but the version's "
-                    + $"metadata declares {expectedField.DataType.SimpleString}");
+                    $"data column '{DiagnosticText.Sanitize(expectedField.Name)}' has leaf type {fileType.SimpleString} but the version's "
+                    + $"metadata declares {DiagnosticText.DescribeType(expectedField.DataType)}");
             }
 
             fileByName.Remove(expectedField.Name);

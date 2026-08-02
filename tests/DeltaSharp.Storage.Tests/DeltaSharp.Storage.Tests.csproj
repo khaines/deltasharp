@@ -22,4 +22,23 @@
     <ProjectReference Include="../../src/DeltaSharp.Storage/DeltaSharp.Storage.csproj" />
   </ItemGroup>
 
+  <!--
+    The superseded-enumeration totality guard reads its OWN source, because the property it asserts is
+    "where a piece of text appears in the source" and nothing in IL preserves that. Reading it from disk
+    via CallerFilePath is green locally and red in CI: deterministic builds map source paths to /_/..., so
+    the file is not beside the build and the guard fails on every pipeline run while passing on every
+    developer run. Embedding the file makes the two environments identical, keeps fail-rather-than-skip
+    intact (a missing resource is still a hard failure), and pins the copy to the very build under test
+    rather than to whatever happens to be on disk.
+
+    LogicalName is %(Identity) rather than a name of its own, so the manifest resource is called
+    `Delta/PathDisclosureHygieneTests.cs` and the guard's failures cite a path an editor can open instead
+    of an opaque resource id. One decision, not two: move the file and the Include carries the name with
+    it, and the constant in the guard stops matching, which is a loud failure rather than a stale read.
+  -->
+  <ItemGroup>
+    <EmbeddedResource Include="Delta/PathDisclosureHygieneTests.cs" LogicalName="%(Identity)" />
+    <EmbeddedResource Include="../../src/DeltaSharp.Storage/Backends/LocalFileSystemBackend.cs" LogicalName="LocalFileSystemBackend.cs" />
+  </ItemGroup>
+
 </Project>

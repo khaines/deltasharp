@@ -73,6 +73,19 @@ internal sealed class DeltaStorageException : Exception
     public StorageErrorKind Kind { get; }
 
     /// <summary>
+    /// The RAW table-relative object path this failure concerns, when the failing operation names one.
+    /// <para>The <see cref="System.Exception.Message"/> deliberately renders a path through
+    /// <see cref="DiagnosticText.DescribePath"/>, which drops the Hive partition VALUES (column values, i.e.
+    /// table data and potentially PII) and keeps only the sanitized file name and partition COLUMN NAMES.
+    /// The table owner, however, is entitled to their own data and needs the exact key to act on it — so the
+    /// unmodified path is retained here for a caller to read and route deliberately to a sink it trusts.
+    /// This is the same split <c>DeltaSchemaMismatchException.Path</c> already uses (#682).</para>
+    /// <para>Treat this as untrusted text: it comes from the <c>_delta_log</c>. Anything that writes it to a
+    /// structured-log sink must sanitize it at that boundary.</para>
+    /// </summary>
+    public string? Path { get; init; }
+
+    /// <summary>
     /// Renders this exception WITHOUT its <see cref="System.Exception.InnerException"/> chain (#664, RF-8b
     /// parity). The sanitized <see cref="System.Exception.Message"/> deliberately drops attacker-influenceable
     /// decode content while the raw underlying cause (e.g. a Parquet.Net exception over crafted bytes) is
@@ -99,30 +112,39 @@ internal sealed class DeltaStorageException : Exception
     /// the read/OPTIMIZE schema-evolution guards classify it without string-matching the message (#513).</summary>
     public static DeltaStorageException ColumnNotPresentInFile(string columnName) =>
         new(StorageErrorKind.ColumnNotPresentInFile,
-            $"Requested column '{columnName}' is not present in the Parquet file schema.");
+            // #683/#685: the requested column name is a schema identifier that, on a foreign/untrusted table,
+            // is attacker-authored — route it through the shared sanitizer (control-char strip + length cap)
+            // exactly like DeltaSchemaMismatchException already does, so the two cannot drift.
+            $"Requested column '{DiagnosticText.Sanitize(columnName)}' is not present in the Parquet file schema.");
 
     /// <summary>Creates a <see cref="StorageErrorKind.Transient"/> error (a retryable I/O condition).</summary>
-    // NOTE (#113): when the object-store backends (S3/ADLS/GCS) land, any URI/credential embedded in a
-    // path or message MUST be routed through SecretRedaction before it reaches this factory. Local
-    // POSIX paths carry no secret, so they are passed through verbatim today.
-    public static DeltaStorageException Transient(string message, Exception? innerException = null) =>
-        new(StorageErrorKind.Transient, message, innerException);
+    // NOTE (#683/#685): a table-relative path that must appear in a Transient message is redacted at the CALL
+    // SITE via DiagnosticText.DescribePath (drops Hive partition VALUES, keeps shape + partition column names)
+    // — rendering moved out of this factory. The raw path is retained on the typed Path property for the
+    // entitled owner; a reflecting log sink that destructures it is the caller's obligation, not this
+    // factory's (see DiagnosticText's class doc). Local POSIX paths carry no secret today.
+    // OPEN OBLIGATION (formerly #113): DescribePath does NOT parse URIs / redact URL credentials (SAS ?sig=,
+    // presigned signatures, userinfo). When an object-store backend (S3/ADLS/GCS) lands, a credential-bearing
+    // URI reaching this factory MUST be redacted by a dedicated URL renderer FIRST — see
+    // storage-delta-architecture.md §5.3 "OUT OF SCOPE — credential-bearing URIs".
+    public static DeltaStorageException Transient(string message, Exception? innerException = null, string? path = null) =>
+        new(StorageErrorKind.Transient, message, innerException) { Path = path };
 
     /// <summary>Creates a <see cref="StorageErrorKind.RetryUnsafeAmbiguous"/> error: an operation whose
     /// outcome cannot be determined (the effect may have landed but is not confirmed durable), so the
     /// caller must re-resolve idempotently rather than blindly retry or assume failure.</summary>
-    public static DeltaStorageException RetryUnsafeAmbiguous(string message, Exception? innerException = null) =>
-        new(StorageErrorKind.RetryUnsafeAmbiguous, message, innerException);
+    public static DeltaStorageException RetryUnsafeAmbiguous(string message, Exception? innerException = null, string? path = null) =>
+        new(StorageErrorKind.RetryUnsafeAmbiguous, message, innerException) { Path = path };
 
     /// <summary>Creates a <see cref="StorageErrorKind.PathNotConfined"/> error naming the rejected path.</summary>
-    public static DeltaStorageException PathNotConfined(string message) =>
-        new(StorageErrorKind.PathNotConfined, message);
+    public static DeltaStorageException PathNotConfined(string message, string? path = null) =>
+        new(StorageErrorKind.PathNotConfined, message) { Path = path };
 
     /// <summary>Creates a <see cref="StorageErrorKind.NotFound"/> error.</summary>
-    public static DeltaStorageException NotFound(string message, Exception? innerException = null) =>
-        new(StorageErrorKind.NotFound, message, innerException);
+    public static DeltaStorageException NotFound(string message, Exception? innerException = null, string? path = null) =>
+        new(StorageErrorKind.NotFound, message, innerException) { Path = path };
 
     /// <summary>Creates an <see cref="StorageErrorKind.AlreadyExists"/> error.</summary>
-    public static DeltaStorageException AlreadyExists(string message) =>
-        new(StorageErrorKind.AlreadyExists, message);
+    public static DeltaStorageException AlreadyExists(string message, string? path = null) =>
+        new(StorageErrorKind.AlreadyExists, message) { Path = path };
 }

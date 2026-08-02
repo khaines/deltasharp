@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using System.Diagnostics;
+using System.Globalization;
 using System.Linq;
 using System.Reflection;
 using System.Security.Cryptography;
@@ -916,14 +917,28 @@ internal sealed class DeltaCommitter
         {
             if (action is TxnAction txn)
             {
-                (IsTxnCovered(txn, txnState) ? committed : uncommitted).Add($"{txn.AppId}@{txn.Version}");
+                // #686: the app id is the writer's OWN idempotency token but is echoed into a diagnostic, so
+                // per-item sanitize it (control-char strip + config-token cap) rather than interpolating raw.
+                (IsTxnCovered(txn, txnState) ? committed : uncommitted).Add(
+                    string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"{DiagnosticText.Sanitize(txn.AppId, DiagnosticText.ConfigTokenMaxLength)}@{txn.Version}"));
             }
         }
 
         return new PartialTransactionException(
             $"This commit carries {committed.Count + uncommitted.Count} application transactions of which "
-            + $"{committed.Count} are already committed [{string.Join(", ", committed)}] and "
-            + $"{uncommitted.Count} are not [{string.Join(", ", uncommitted)}]; idempotency for an atomic "
+            // #686: both lists are count-bounded (SanitizeAndJoin renders at most MaxEchoedListItems and
+            // elides the remainder as "… (+N more)") so a batch bundling thousands of SetTransaction actions
+            // cannot render a ~710,000-char message into a structured-log sink. The COUNTS above stay exact.
+            // Cap class: each item was ALREADY per-item capped at ConfigTokenMaxLength (64) above, BEFORE the
+            // "@{version}" suffix was appended, so an item is at most 64 + 1 + 19 = 84 chars. DefaultMaxLength
+            // (128) is therefore deliberately chosen so the per-item cap at THIS layer never fires and only
+            // the COUNT cap is live. Tightening it to 64 here would truncate mid-item and CHOP the "@version"
+            // suffix — destroying the reconciliation key an operator needs. The two caps compose; they are not
+            // redundant.
+            + $"{committed.Count} are already committed [{DiagnosticText.SanitizeAndJoin(committed, DiagnosticText.DefaultMaxLength)}] and "
+            + $"{uncommitted.Count} are not [{DiagnosticText.SanitizeAndJoin(uncommitted, DiagnosticText.DefaultMaxLength)}]; idempotency for an atomic "
             + "batch is all-or-nothing, so a partially-committed batch is failed closed rather than skipped "
             + "(which would drop the uncommitted transactions and their data) or committed (which would "
             + "double-apply the committed ones). Do not bundle unrelated or non-monotonic application "

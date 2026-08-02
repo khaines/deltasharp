@@ -191,11 +191,52 @@ internal static class ColumnMapping
     private static string? FindUnsafePathSegmentReason(string segment)
     {
         bool whitespaceOnly = true;
-        foreach (char c in segment)
+        for (int i = 0; i < segment.Length; i++)
         {
-            if (c is '/' or '\\' or '=' or ':' || char.IsControl(c))
+            char c = segment[i];
+
+            // A well-formed high+low SURROGATE PAIR is one astral code point (emoji, CJK Ext-B, mathematical
+            // alphanumerics) — legal Unicode, legal UTF-8, and a legal filesystem segment / Parquet column
+            // name. char.GetUnicodeCategory is per UTF-16 CODE UNIT and reports Surrogate for BOTH halves, so
+            // consume a valid VISIBLE pair here; a LONE surrogate falls through to the reject set below. The
+            // astral planes ALSO carry FORMAT controls (Cf) — U+E0001 LANGUAGE TAG and the U+E0020–E007F TAG
+            // block (invisible-ASCII smuggling: two physical names that render identically to an operator),
+            // U+110BD/U+110CD, U+13430, U+1BCA0, U+1D173–U+1D17A — which are just as unsafe in a directory /
+            // column segment as a BMP Cf. char.GetUnicodeCategory cannot see them (per code UNIT); the
+            // CharUnicodeInfo (string,int) overload reads the whole code POINT, so an astral Cf pair is NOT
+            // consumed here and instead falls through to the reject block, where the high surrogate matches the
+            // UnicodeCategory.Surrogate arm and returns the shared "…format control…/unpaired surrogate" reason.
+            // Cf is the only extra check a valid pair needs: no other reject category (Cc, Zl/Zp, '/'\'='':')
+            // has any astral member. This is the SAME pair-aware rule DiagnosticText.Sanitize now uses (it
+            // neutralizes an astral Cf to U+FFFD) — the two agree, or a table one accepts the other rejects.
+            if (char.IsHighSurrogate(c) && i + 1 < segment.Length && char.IsLowSurrogate(segment[i + 1])
+                && CharUnicodeInfo.GetUnicodeCategory(segment, i) != UnicodeCategory.Format)
             {
-                return "contain a path separator ('/' or '\\'), '=', ':', or a control character";
+                whitespaceOnly = false;
+                i++;
+                continue;
+            }
+
+            // A path segment becomes a REAL filesystem directory name (`name=value`) AND a Parquet column
+            // name, so reject the full display/injection-unsafe set, aligned with DiagnosticText's message
+            // sanitizer: path separators / `=` / `:`, any control (Cc), a line/paragraph separator (Zl/Zp), a
+            // bidirectional or other FORMAT control (Cf — e.g. U+202E RIGHT-TO-LEFT OVERRIDE spoofs a directory
+            // name's rendered order; the zero-width joiners U+200C/U+200D are also Cf and are DELIBERATELY
+            // rejected in a literal directory segment despite being orthographically meaningful in some
+            // scripts; the astral U+E0020–E007F TAG block — an invisible mirror of ASCII, and the tail of an
+            // emoji subdivision-flag sequence like 🏴󠁧󠁢󠁳󠁣󠁴󠁿 — is Cf too and is likewise rejected: a path segment is
+            // not a display string, and the TAG block cannot be admitted for flags without admitting arbitrary
+            // invisible-ASCII smuggling), or a LONE (unpaired) UTF-16 surrogate (Cs — malformed, non-encodable).
+            // Cf and a lone Cs are NOT caught by char.IsControl.
+            if (c is '/' or '\\' or '=' or ':'
+                || char.IsControl(c)
+                || char.GetUnicodeCategory(c) is UnicodeCategory.LineSeparator
+                    or UnicodeCategory.ParagraphSeparator
+                    or UnicodeCategory.Format
+                    or UnicodeCategory.Surrogate)
+            {
+                return "contain a path separator ('/' or '\\'), '=', ':', a control character, a "
+                    + "line/paragraph separator, a bidirectional/format control, or an unpaired surrogate";
             }
 
             if (!char.IsWhiteSpace(c))
@@ -242,7 +283,7 @@ internal static class ColumnMapping
         throw DeltaProtocolException.Inconsistent(
             string.Create(
                 CultureInfo.InvariantCulture,
-                $"Column '{logicalName}' has a '{PhysicalNameKey}' ('{SanitizeEchoedToken(physical)}') that is "
+                $"Column '{DiagnosticText.Sanitize(logicalName)}' has a '{PhysicalNameKey}' ('{SanitizeEchoedToken(physical)}') that is "
                 + $"not a safe path segment; under column mapping the physical name is used as a Parquet column "
                 + $"name and a partition-directory segment, so it MUST NOT {reason}. The schema is inconsistent "
                 + $"and cannot be read safely."));
@@ -389,7 +430,11 @@ internal static class ColumnMapping
                 throw DeltaProtocolException.Inconsistent(
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Column mapping physical name '{physical}' is assigned to more than one column; "
+                        // #683: do NOT rely on EnsureSafePhysicalName having neutralized this token — it
+                        // rejects `char.IsControl` (Unicode Cc) but NOT U+2028/U+2029 (Zl/Zp), which
+                        // DiagnosticText.IsInjectionUnsafe exists to close. A path-safety guard is not a
+                        // log-injection guard. Same cap class as the physicalName echo above.
+                        $"Column mapping physical name '{SanitizeEchoedToken(physical)}' is assigned to more than one column; "
                         + $"under column mapping every top-level field (data and partition) MUST have a unique "
                         + $"'{PhysicalNameKey}'. The schema is inconsistent and cannot be read safely."));
             }
@@ -399,7 +444,7 @@ internal static class ColumnMapping
                 throw DeltaProtocolException.Inconsistent(
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Column '{field.Name}' has no '{IdKey}' but the table uses column mapping; the schema is inconsistent and cannot be read safely."));
+                        $"Column '{DiagnosticText.Sanitize(field.Name)}' has no '{IdKey}' but the table uses column mapping; the schema is inconsistent and cannot be read safely."));
             }
 
             // Id lower-bound invariant (#572 deltaspec N3/R4): Delta column-mapping ids start at 1
@@ -415,7 +460,7 @@ internal static class ColumnMapping
                 throw DeltaProtocolException.Inconsistent(
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Column '{field.Name}' has '{IdKey}'={id} which is outside the valid column-mapping "
+                        $"Column '{DiagnosticText.Sanitize(field.Name)}' has '{IdKey}'={id} which is outside the valid column-mapping "
                         + $"id range [1, int.MaxValue] (Delta column-mapping ids start at 1). The schema is "
                         + $"inconsistent and cannot be read safely."));
             }
@@ -433,7 +478,7 @@ internal static class ColumnMapping
                 throw DeltaProtocolException.Inconsistent(
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Column '{field.Name}' has '{IdKey}'={id} which exceeds the tracked "
+                        $"Column '{DiagnosticText.Sanitize(field.Name)}' has '{IdKey}'={id} which exceeds the tracked "
                         + $"'{MaxColumnIdKey}'={maxColumnId}; the schema is inconsistent and cannot be read "
                         + $"safely."));
             }
@@ -511,7 +556,7 @@ internal static class ColumnMapping
         throw DeltaProtocolException.Inconsistent(
             string.Create(
                 CultureInfo.InvariantCulture,
-                $"Column '{field.Name}' has no '{PhysicalNameKey}' but the table uses column mapping; the "
+                $"Column '{DiagnosticText.Sanitize(field.Name)}' has no '{PhysicalNameKey}' but the table uses column mapping; the "
                 + $"schema is inconsistent and cannot be read safely."));
     }
 
@@ -615,7 +660,7 @@ internal static class ColumnMapping
                     throw DeltaProtocolException.Inconsistent(
                         string.Create(
                             CultureInfo.InvariantCulture,
-                            $"Name-mode column '{field.Name}' has no '{IdKey}'; the table schema is "
+                            $"Name-mode column '{DiagnosticText.Sanitize(field.Name)}' has no '{IdKey}'; the table schema is "
                             + $"inconsistent and cannot be evolved."));
                 }
             }
@@ -711,7 +756,7 @@ internal static class ColumnMapping
                 throw DeltaProtocolException.Inconsistent(
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Write column '{field.Name}' is not present in the {ModeName(mode)}-mode table schema, "
+                        $"Write column '{DiagnosticText.Sanitize(field.Name)}' is not present in the {ModeName(mode)}-mode table schema, "
                         + $"so it has no '{PhysicalNameKey}' to stage under; the write is rejected fail-closed."));
             }
 
@@ -748,7 +793,7 @@ internal static class ColumnMapping
                 throw DeltaProtocolException.Inconsistent(
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Partition column '{column}' is not present in the table schema."));
+                        $"Partition column '{DiagnosticText.Sanitize(column)}' is not present in the table schema."));
             }
 
             physical.Add(PhysicalName(field, mode));
@@ -788,15 +833,20 @@ internal static class ColumnMapping
                 throw DeltaProtocolException.Inconsistent(
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Partition column '{column}' is not present in the table schema."));
+                        $"Partition column '{DiagnosticText.Sanitize(column)}' is not present in the table schema."));
             }
 
+            // TypeName, not SimpleString: this guard fires ONLY when the type is non-atomic, so
+            // StructType.SimpleString always recurses and appends every nested field name verbatim. Measured
+            // 74,052 chars with raw U+2028 from a 3,000-field foreign struct -- both defects this sweep
+            // closes, one line below a Sanitize. The KIND (struct/array/map/binary) is the whole diagnosis
+            // here; the offending column is already named and sanitized.
             if (!DeltaWriteEncoding.IsSupportedPartitionType(field.DataType))
             {
                 throw DeltaProtocolException.Inconsistent(
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Partition column '{column}' has type '{field.DataType.SimpleString}', which is not a "
+                        $"Partition column '{DiagnosticText.Sanitize(column)}' has type '{field.DataType.TypeName}', which is not a "
                         + $"supported Delta partition-column type; only atomic types (not struct/array/map/binary) "
                         + $"may be partition columns."));
             }
@@ -806,7 +856,7 @@ internal static class ColumnMapping
                 throw DeltaProtocolException.Inconsistent(
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Partition column '{column}' is listed more than once in metaData.partitionColumns; "
+                        $"Partition column '{DiagnosticText.Sanitize(column)}' is listed more than once in metaData.partitionColumns; "
                         + $"partition columns must be distinct (a duplicate doubles the partition-directory path "
                         + $"and yields a table strict readers reject as a duplicate column)."));
             }
@@ -902,7 +952,10 @@ internal static class ColumnMapping
                 throw DeltaProtocolException.Inconsistent(
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Partition column '{SanitizeEchoedToken(column)}' is not a safe path segment; in none "
+                    // Cap class: a partition column NAME is a schema identifier, so it uses the shared
+                    // DefaultMaxLength like every other partition-column echo in this file — not the tighter
+                    // config-token cap, which is for protocol VALUES and physical names.
+                    $"Partition column '{DiagnosticText.Sanitize(column)}' is not a safe path segment; in none "
                         + $"mode a partition column's logical name becomes a partition-directory path segment, "
                         + $"so it MUST NOT {reason}. The table cannot be written safely."));
             }
@@ -969,7 +1022,7 @@ internal static class ColumnMapping
             throw DeltaProtocolException.Inconsistent(
                 string.Create(
                     CultureInfo.InvariantCulture,
-                    $"Column '{logicalName}' has no '{IdKey}' but the table uses column mapping 'id' mode; the "
+                    $"Column '{DiagnosticText.Sanitize(logicalName)}' has no '{IdKey}' but the table uses column mapping 'id' mode; the "
                     + $"schema is inconsistent and cannot be written safely."));
         }
 
@@ -997,7 +1050,7 @@ internal static class ColumnMapping
             throw DeltaProtocolException.Unsupported(
                 string.Create(
                     CultureInfo.InvariantCulture,
-                    $"Column '{field.Name}' is a nested ({field.DataType.TypeName}) type; nested column "
+                    $"Column '{DiagnosticText.Sanitize(field.Name)}' is a nested ({field.DataType.TypeName}) type; nested column "
                     + $"mapping is phased in this build (design §2.9/§2.12.3). Only top-level (leaf) columns "
                     + $"are supported in column mapping 'name'/'id' mode."));
         }

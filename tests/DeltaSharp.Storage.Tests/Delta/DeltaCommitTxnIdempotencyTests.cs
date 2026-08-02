@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Globalization;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
 using Xunit;
@@ -189,6 +190,111 @@ public sealed class DeltaCommitTxnIdempotencyTests : IDisposable
 
         Snapshot reloaded = await LoadAsync();
         Assert.DoesNotContain("would-be-lost.parquet", reloaded.ActiveFiles.Select(a => a.Path)); // nothing partial published
+    }
+
+    [Fact]
+    public async Task MultiTxnBatch_PartiallyCovered_PoisonedAppId_IsSanitizedInMessage()
+    {
+        // #686: PartialTransactionException echoed each SetTransaction app id RAW ("{AppId}@{Version}").
+        // An app id is the writer's OWN idempotency token (lowest sensitivity) but still reaches a
+        // structured-log sink, so a CRLF-bearing id is a log-injection vector. Two layers now neutralize it
+        // (the per-item Sanitize AND the SanitizeAndJoin render), so this test reddens when BOTH are reverted;
+        // MultiTxnBatch_OversizedAppId_IsPerItemCapped_KeepingTheVersionSuffix pins the per-item layer alone
+        // and MultiTxnBatch_PartiallyCovered_HugeTxnList_IsBounded_ElidesRemainder pins the aggregate layer.
+        const string poisoned = "stream-b\r\nInjected: fake-log-line\u2028x";
+        await SeedAsync();
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Txn("stream-a", 5), DeltaTestHarness.Add("a5.parquet"));
+        Snapshot snapshot = await LoadAsync();
+
+        PartialTransactionException ex = await Assert.ThrowsAsync<PartialTransactionException>(() =>
+            new DeltaCommitter(_backend).CommitAsync(
+                snapshot,
+                new DeltaAction[] { Txn("stream-a", 5), Txn(poisoned, 3), Add("would-be-lost.parquet") },
+                DeltaReadScope.BlindAppend));
+
+        Assert.DoesNotContain('\r', ex.Message);
+        Assert.DoesNotContain('\n', ex.Message);
+        Assert.DoesNotContain('\u2028', ex.Message);
+        Assert.DoesNotContain(poisoned, ex.Message, StringComparison.Ordinal);
+        Assert.Contains("already committed [stream-a@5]", ex.Message, StringComparison.Ordinal); // clean id intact
+    }
+
+    [Fact]
+    public async Task MultiTxnBatch_OversizedAppId_IsPerItemCapped_KeepingTheVersionSuffix()
+    {
+        // #686: the app id is capped PER ITEM (at the config-token cap) BEFORE the "@{version}" suffix is
+        // appended, so an oversized id truncates but the version — the operator's reconciliation key — stays
+        // visible. RED-on-revert against dropping the inner Sanitize(txn.AppId, ConfigTokenMaxLength) and
+        // relying on the outer list cap alone, which would swallow the "@3" suffix.
+        string oversized = new('a', 5000);
+        await SeedAsync();
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Txn("stream-a", 5), DeltaTestHarness.Add("a5.parquet"));
+        Snapshot snapshot = await LoadAsync();
+
+        PartialTransactionException ex = await Assert.ThrowsAsync<PartialTransactionException>(() =>
+            new DeltaCommitter(_backend).CommitAsync(
+                snapshot,
+                new DeltaAction[] { Txn("stream-a", 5), Txn(oversized, 3), Add("would-be-lost.parquet") },
+                DeltaReadScope.BlindAppend));
+
+        Assert.DoesNotContain(oversized, ex.Message, StringComparison.Ordinal);
+        Assert.Contains("\u2026@3]", ex.Message, StringComparison.Ordinal); // truncated id, version preserved
+        Assert.True(ex.Message.Length < 1000, $"message not bounded: {ex.Message.Length} chars");
+    }
+
+    [Fact]
+    public async Task MultiTxnBatch_PartiallyCovered_HugeTxnList_IsBounded_ElidesRemainder()
+    {
+        // #686: 5,000 bundled SetTransaction actions rendered a ~710,000-char message with no elision
+        // marker — a log-flooding vector. SanitizeAndJoin caps the rendered count; the exact COUNTS stay in
+        // the message so an operator can still reconcile.
+        await SeedAsync();
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Txn("stream-a", 5), DeltaTestHarness.Add("a5.parquet"));
+        Snapshot snapshot = await LoadAsync();
+
+        var actions = new List<DeltaAction> { Txn("stream-a", 5) };
+        actions.AddRange(Enumerable.Range(0, 5000)
+            .Select(i => (DeltaAction)Txn("uncommitted-app-" + i.ToString(CultureInfo.InvariantCulture), 1)));
+        actions.Add(Add("would-be-lost.parquet"));
+
+        PartialTransactionException ex = await Assert.ThrowsAsync<PartialTransactionException>(() =>
+            new DeltaCommitter(_backend).CommitAsync(snapshot, actions, DeltaReadScope.BlindAppend));
+
+        Assert.Contains("more)", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("5000 are not", ex.Message, StringComparison.Ordinal); // exact count preserved
+        Assert.True(ex.Message.Length < 2000, $"aggregate message not bounded: {ex.Message.Length} chars");
+
+        // The message renders TWO lists and the assertions above bound only the UNCOMMITTED one, so the
+        // committed-side SanitizeAndJoin was mutation-vacuous (dropping it to string.Join left this green).
+        // Drive the mirror shape: thousands of ALREADY-COMMITTED transactions and one that is not.
+        var committedLines = new List<string>();
+        for (int i = 0; i < 5000; i++)
+        {
+            committedLines.Add(DeltaTestHarness.Txn(
+                "committed-app-" + i.ToString(CultureInfo.InvariantCulture), 1));
+        }
+
+        committedLines.Add(DeltaTestHarness.Add("bulk.parquet"));
+        await DeltaTestHarness.WriteCommitAsync(_backend, 2, committedLines.ToArray());
+        Snapshot afterBulk = await LoadAsync();
+
+        var mirrored = new List<DeltaAction>();
+        for (int i = 0; i < 5000; i++)
+        {
+            mirrored.Add(Txn("committed-app-" + i.ToString(CultureInfo.InvariantCulture), 1));
+        }
+
+        mirrored.Add(Txn("brand-new-app", 1));
+        mirrored.Add(Add("would-be-lost-2.parquet"));
+
+        PartialTransactionException committedSide = await Assert.ThrowsAsync<PartialTransactionException>(() =>
+            new DeltaCommitter(_backend).CommitAsync(afterBulk, mirrored, DeltaReadScope.BlindAppend));
+
+        Assert.Contains("5000 are already committed", committedSide.Message, StringComparison.Ordinal);
+        Assert.Contains("more)", committedSide.Message, StringComparison.Ordinal);
+        Assert.True(
+            committedSide.Message.Length < 2000,
+            $"committed-side aggregate message not bounded: {committedSide.Message.Length} chars");
     }
 
     [Fact]

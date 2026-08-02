@@ -1,3 +1,5 @@
+using DeltaSharp.Types;
+
 namespace DeltaSharp.Storage.Delta;
 
 /// <summary>
@@ -129,19 +131,19 @@ internal sealed class DeltaSchemaMismatchException : Exception
             "null-bearing data cannot be written into a required column, and a required column cannot be " +
             "relaxed to nullable by a write.");
 
-    public static DeltaSchemaMismatchException IncompatibleType(string path, string tableType, string writeType) =>
+    public static DeltaSchemaMismatchException IncompatibleType(string path, DataType tableType, DataType writeType) =>
         new(
             DeltaSchemaMismatchKind.IncompatibleType,
             path,
-            $"The write type '{writeType}' for column '{DiagnosticText.Sanitize(path)}' is not compatible with the table type " +
-            $"'{tableType}'; an existing column's type cannot be changed by a write (never a narrowing or an " +
+            $"The write type '{DiagnosticText.DescribeType(writeType)}' for column '{DiagnosticText.Sanitize(path)}' is not compatible with the table type " +
+            $"'{DiagnosticText.DescribeType(tableType)}'; an existing column's type cannot be changed by a write (never a narrowing or an " +
             "unrelated type).");
 
-    public static DeltaSchemaMismatchException TypeWideningUnsupported(string path, string tableType, string writeType) =>
+    public static DeltaSchemaMismatchException TypeWideningUnsupported(string path, DataType tableType, DataType writeType) =>
         new(
             DeltaSchemaMismatchKind.TypeWideningUnsupported,
             path,
-            $"The type change '{tableType}'→'{writeType}' for column '{DiagnosticText.Sanitize(path)}' is a Delta-sanctioned widening " +
+            $"The type change '{DiagnosticText.DescribeType(tableType)}'→'{DiagnosticText.DescribeType(writeType)}' for column '{DiagnosticText.Sanitize(path)}' is a Delta-sanctioned widening " +
             "but is not applied here: the table has not enabled type widening (the 'typeWidening' table " +
             "feature must be present AND the 'delta.enableTypeWidening' property set to 'true'), or the change " +
             "is a read-promote-only cross-family widening this build never auto-applies on append. Widening " +
@@ -153,11 +155,11 @@ internal sealed class DeltaSchemaMismatchException : Exception
     /// build DEFERS partition-column widening (#537). Classified as <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>
     /// (fail-closed) with an HONEST message — deliberately NOT the factually-wrong "requires a full table
     /// rewrite" reason the non-widening <see cref="PartitionColumnEvolution"/> case carries.</summary>
-    public static DeltaSchemaMismatchException PartitionColumnWideningDeferred(string path, string tableType, string writeType) =>
+    public static DeltaSchemaMismatchException PartitionColumnWideningDeferred(string path, DataType tableType, DataType writeType) =>
         new(
             DeltaSchemaMismatchKind.TypeWideningUnsupported,
             path,
-            $"The type change '{tableType}'→'{writeType}' for partition column '{DiagnosticText.Sanitize(path)}' is a Delta-sanctioned " +
+            $"The type change '{DiagnosticText.DescribeType(tableType)}'→'{DiagnosticText.DescribeType(writeType)}' for partition column '{DiagnosticText.Sanitize(path)}' is a Delta-sanctioned " +
             "widening that does NOT require a table rewrite (partition values are stored as strings, so no " +
             "data file needs rewriting), but partition-column type widening is DEFERRED in this build " +
             "(tracked in #537). It is rejected fail-closed until that lands.");
@@ -169,11 +171,11 @@ internal sealed class DeltaSchemaMismatchException : Exception
             $"Evolving the schema would add column '{DiagnosticText.Sanitize(path)}', which collides case-insensitively with existing " +
             $"column '{DiagnosticText.Sanitize(other)}'. Delta requires column names to be unique ignoring case, so this write is rejected.");
 
-    public static DeltaSchemaMismatchException PartitionColumnEvolution(string path, string tableType, string writeType) =>
+    public static DeltaSchemaMismatchException PartitionColumnEvolution(string path, DataType tableType, DataType writeType) =>
         new(
             DeltaSchemaMismatchKind.PartitionColumnEvolutionUnsupported,
             path,
-            $"The write changes the type of partition column '{DiagnosticText.Sanitize(path)}' from '{tableType}' to '{writeType}'; a " +
+            $"The write changes the type of partition column '{DiagnosticText.Sanitize(path)}' from '{DiagnosticText.DescribeType(tableType)}' to '{DiagnosticText.DescribeType(writeType)}'; a " +
             "partition column's type is encoded in the table layout and cannot be evolved (it requires a full " +
             "table rewrite). Rejected.");
 

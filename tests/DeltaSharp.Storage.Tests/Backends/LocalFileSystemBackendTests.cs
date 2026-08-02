@@ -946,6 +946,68 @@ public sealed class LocalFileSystemBackendTests : IDisposable
     }
 
     [Fact]
+    public void SurfaceFailure_PoisonedRelativePath_IsSanitizedInMessage()
+    {
+        // #683: on the READ path `path` is the log-supplied `add.path`. A CONFINED-but-poisoned relative path
+        // ("sub\r\nx.parquet" is a perfectly valid under-root POSIX name) that then hits a genuine IO fault
+        // echoed RAW into the Transient message — a control-char log-injection at a structured-log sink.
+        // RED-on-revert: dropping DiagnosticText.Sanitize(path) from SurfaceFailure re-admits the raw CRLF.
+        const string poisoned = "sub\r\nInjected: fake-log-line\u2028x.parquet";
+        DeltaStorageException surfaced =
+            _backend.SurfaceFailure("Reading", poisoned, new IOException("Input/output error"));
+
+        Assert.Equal(StorageErrorKind.Transient, surfaced.Kind); // still fails closed on the same kind
+        Assert.DoesNotContain('\n', surfaced.Message);
+        Assert.DoesNotContain('\r', surfaced.Message);
+        Assert.DoesNotContain('\u2028', surfaced.Message);
+        Assert.DoesNotContain(poisoned, surfaced.Message, StringComparison.Ordinal);
+        Assert.Contains("sub\uFFFD\uFFFDInjected", surfaced.Message, StringComparison.Ordinal); // neutralized, still diagnostic
+    }
+
+    [Fact]
+    public void SurfaceFailure_OversizedRelativePath_IsLengthBoundedInMessage()
+    {
+        // The same echo must be length-bounded: a 4,000-char log-supplied path cannot render an unbounded
+        // Transient message. The cap keeps the path portion at DefaultMaxLength + the truncation ellipsis.
+        string oversized = new('p', 4000);
+        DeltaStorageException surfaced =
+            _backend.SurfaceFailure("Reading", oversized, new IOException("Input/output error"));
+
+        Assert.DoesNotContain(oversized, surfaced.Message, StringComparison.Ordinal);
+        Assert.Contains("…", surfaced.Message, StringComparison.Ordinal);
+        Assert.True(
+            surfaced.Message.Length < 500,
+            $"SurfaceFailure message not bounded: {surfaced.Message.Length} chars");
+    }
+
+    [Fact]
+    public async Task StagedWritePublish_PoisonedDisplayPath_IsSanitizedInAlreadyExistsMessage()
+    {
+        // #683: the staged-write stream's _displayPath is the same log-/caller-supplied relative path class.
+        // It is sanitized once at construction so every message the stream raises (ambiguous publish,
+        // already-exists, non-durable entry) is injection-safe. The already-exists branch is the one reachable
+        // deterministically without an injected fault.
+        const string poisoned = "sta\r\nged\u2029.parquet";
+        await _backend.PutIfAbsentAsync(poisoned, new byte[] { 1, 2, 3 }, CancellationToken.None);
+
+        Stream staged = await _backend.OpenWriteAsync(poisoned, CancellationToken.None);
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(async () =>
+        {
+            await using (staged.ConfigureAwait(false))
+            {
+                await staged.WriteAsync(new byte[] { 4 });
+                await ((ICompletableWriteStream)staged).CompleteAsync(CancellationToken.None);
+            }
+        });
+
+        Assert.Equal(StorageErrorKind.AlreadyExists, ex.Kind);
+        Assert.DoesNotContain('\r', ex.Message);
+        Assert.DoesNotContain('\n', ex.Message);
+        Assert.DoesNotContain('\u2029', ex.Message);
+        Assert.DoesNotContain(poisoned, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task DeleteFailure_OnDirectoryPath_DoesNotLeakAbsolutePath()
     {
         // RF-8b: File.Delete on a path that is a DIRECTORY throws a root-bearing framework exception; the

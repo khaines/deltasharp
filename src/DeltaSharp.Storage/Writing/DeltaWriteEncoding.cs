@@ -78,10 +78,13 @@ internal static class DeltaWriteEncoding
             case BinaryType:
                 destination.AppendBytes(source.GetBytes(row));
                 break;
+            // TypeName, not SimpleString: ColumnVectors.Create builds StructColumnVector/ListColumnVector/
+            // MapColumnVector, so `source` genuinely can be nested-typed here and SimpleString would recurse
+            // through every foreign field name. Verified reachable at runtime with a committed struct row.
             default:
                 throw new DeltaStorageException(
                     StorageErrorKind.UnsupportedFeature,
-                    $"The Delta write facade has no columnar encoding for type '{source.Type.SimpleString}'.");
+                    $"The Delta write facade has no columnar encoding for type '{source.Type.TypeName}'.");
         }
     }
 
@@ -122,9 +125,10 @@ internal static class DeltaWriteEncoding
             DateType => UnixEpochDate.AddDays(source.GetValue<int>(row)).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
             TimestampType or TimestampNtzType => FormatTimestamp(source.GetValue<long>(row)),
             DecimalType decimalType => FormatDecimal(source, row, decimalType),
+            // TypeName, not SimpleString -- same reachability as AppendValue's default arm above.
             _ => throw new DeltaStorageException(
                 StorageErrorKind.UnsupportedFeature,
-                $"Type '{source.Type.SimpleString}' is not supported as a Delta partition column."),
+                $"Type '{source.Type.TypeName}' is not supported as a Delta partition column."),
         };
     }
 

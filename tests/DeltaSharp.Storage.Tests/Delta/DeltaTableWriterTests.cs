@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Globalization;
 using System.Text.Json;
 using DeltaSharp.Storage;
 using DeltaSharp.Storage.Backends;
@@ -485,6 +486,82 @@ public sealed class DeltaTableWriterTests : IDisposable
         Assert.DoesNotContain('\n', ex.Message);
         Assert.DoesNotContain('\r', ex.Message);
         Assert.DoesNotContain(poisoned, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Append_OnUnpartitionedTable_HugePartitionKeyList_IsBounded_ElidesRemainder()
+    {
+        // #686: per-item sanitization (#667) does NOT bound the AGGREGATE. A staged file carrying 5,000
+        // partition keys rendered a ~655,000-char message with no elision marker — a log-flooding vector.
+        // RED-on-revert against restoring string.Join(", ", keys.Select(Sanitize)).
+        await SeedTableAsync(partitionColumns: Array.Empty<string>());
+        ImmutableSortedDictionary<string, string?> many = Partition(
+            Enumerable.Range(0, 5000).Select(i => ("k" + i.ToString(CultureInfo.InvariantCulture), (string?)"v")).ToArray());
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(() =>
+            Writer().AppendAsync(TableSchema, new[] { Staged("flood.parquet", many) }));
+
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind); // still fails closed
+        Assert.Contains("more)", ex.Message, StringComparison.Ordinal); // elision marker present
+        Assert.True(ex.Message.Length < 2000, $"aggregate message not bounded: {ex.Message.Length} chars");
+
+        // Council item 13: the rendered tokens are PartitionValues.Keys (column NAMES), never partition
+        // VALUES. The message must say so, or every audit reads it as a value-disclosure finding.
+        Assert.Contains("partition column(s)", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("carries partition value(s)", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Append_OnPartitionedTable_HugeStrayKeyList_IsBounded_ElidesRemainder()
+    {
+        // #686: the stray-key branch renders BOTH the stray keys and the declared partition columns; the
+        // stray list must be count-capped.
+        await SeedTableAsync(partitionColumns: new[] { "region" });
+        var keys = new List<(string, string?)> { ("region", "US") };
+        keys.AddRange(Enumerable.Range(0, 5000)
+            .Select(i => ("stray" + i.ToString(CultureInfo.InvariantCulture), (string?)"v")));
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(() =>
+            Writer().AppendAsync(TableSchema, new[] { Staged("flood.parquet", Partition(keys.ToArray())) }));
+
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+        Assert.Contains("more)", ex.Message, StringComparison.Ordinal);
+        Assert.True(ex.Message.Length < 2000, $"aggregate message not bounded: {ex.Message.Length} chars");
+        Assert.Contains("carries partition column(s)", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Append_HugeDeclaredPartitionColumnList_IsBounded_ElidesRemainder()
+    {
+        // #686 (the headline case): the table's own foreign `metaData.partitionColumns` is echoed in the
+        // stray-key fault. A hostile table declaring 5,000 partition columns rendered ~655,000 chars.
+        string[] declared = Enumerable.Range(0, 5000)
+            .Select(i => "p" + i.ToString(CultureInfo.InvariantCulture)).ToArray();
+        await SeedTableAsync(partitionColumns: declared);
+
+        // A single undeclared key trips the stray branch, which renders the 5,000-column declared list.
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(() =>
+            Writer().AppendAsync(TableSchema, new[] { Staged("flood.parquet", Partition(("zone", "az1"))) }));
+
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+        Assert.Contains("more)", ex.Message, StringComparison.Ordinal);
+        Assert.True(ex.Message.Length < 2000, $"aggregate message not bounded: {ex.Message.Length} chars");
+    }
+
+    [Fact]
+    public async Task Append_HugeMissingPartitionColumnList_IsBounded_ElidesRemainder()
+    {
+        // #686: the missing-coverage branch lists every declared column the staged file omits — also capped.
+        string[] declared = Enumerable.Range(0, 5000)
+            .Select(i => "p" + i.ToString(CultureInfo.InvariantCulture)).ToArray();
+        await SeedTableAsync(partitionColumns: declared);
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(() =>
+            Writer().AppendAsync(TableSchema, new[] { Staged("nopart.parquet") })); // NoPartition ⇒ all missing
+
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+        Assert.Contains("more)", ex.Message, StringComparison.Ordinal);
+        Assert.True(ex.Message.Length < 2000, $"aggregate message not bounded: {ex.Message.Length} chars");
     }
 
     [Fact]

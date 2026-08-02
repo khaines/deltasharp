@@ -50,7 +50,7 @@ that adds logging, metrics, or tracing.
 | Execution | One synchronous `DataFrame` action on the local driver (`LocalQueryExecutor`) | Driver + executor pods, gRPC control plane, Arrow Flight data plane ([ADR-0003](../../adr/0003-data-plane-transport.md)) |
 | Stage/metrics seam | `ExecutionMetrics` snapshot per action; `QueryExecutionStage` attribution; `ExecutionAudit` lazy/eager audit | Stage/task spans and instruments fed from the same values |
 | Correlation | Ambient `Activity` (if tracing enabled) within one process; no cross-process boundary yet | W3C Trace Context over gRPC + Arrow Flight; shuffle re-resolution spans ([ADR-0004](../../adr/0004-shuffle-architecture.md)) |
-| Redaction | `SecretRedaction.RedactPath` (path/credential-scoped) in plan/diagnostic rendering; SQL/rows/option values kept safe by never rendering them | Same path primitive reused at every log/metric/span path site |
+| Redaction | Core/Executor: `SecretRedaction.RedactPath` (path/credential-scoped) in plan/diagnostic rendering; **Storage: `DiagnosticText.DescribePath`/`Sanitize`** (Storage cannot see `SecretRedaction`); SQL/rows/option values kept safe by never rendering them | Layer-appropriate path primitive at every log/metric/span path site — one per assembly reach, **not** one global (see storage-delta-architecture.md §5.3); credential-bearing URIs OUT OF SCOPE |
 
 This document changes **no public API**. `DeltaSharpTelemetry` is `internal`, so the
 `DeltaSharp.Abstractions` and `DeltaSharp.Core` PublicAPI baselines are unchanged (RS0016/RS0017 stay
@@ -272,15 +272,19 @@ DeltaSharp has exactly **one** structured redaction primitive, and its scope is 
 **path/credential-scoped only**. Everything else (SQL, rows, option values) is kept safe by **never
 rendering it**, not by a redactor:
 
-- **Paths → `SecretRedaction.RedactPath`.** Route **every** data-source path through the existing
-  centralized primitive `SecretRedaction.RedactPath`
+- **Paths → the redactor for that layer.** In the **Core plan/logical** layer, route every data-source path
+  through the existing centralized primitive `SecretRedaction.RedactPath`
   (`src/DeltaSharp.Core/Plans/Logical/SecretRedaction.cs`) before it enters a log line, an exception
   message, or any diagnostic. It is a best-effort textual mask that redacts `userinfo` passwords and the
   values of credential-bearing **query-string** parameters (`?sig=`/`&token=`/`&X-Amz-Signature=`, …). Do
-  not re-implement it. It is the same primitive already applied when plan trees, `Explain` output, and
-  analysis diagnostics render a path (`src/DeltaSharp.Core/Analysis/AnalysisException.cs`,
+  not re-implement it *within Core's reach*. It is the same primitive already applied when plan trees,
+  `Explain` output, and analysis diagnostics render a path (`src/DeltaSharp.Core/Analysis/AnalysisException.cs`,
   `src/DeltaSharp.Executor/Physical/SinkRegistry.cs`,
-  `src/DeltaSharp.Core/Plans/Logical/SinkDescriptor.cs`).
+  `src/DeltaSharp.Core/Plans/Logical/SinkDescriptor.cs`). The **`DeltaSharp.Storage`** layer cannot see
+  `SecretRedaction` (Core grants IVT to `DeltaSharp.Executor` only) and owns its own, stronger
+  `DiagnosticText.DescribePath`, which **drops** Hive partition VALUES rather than masking (see
+  storage-delta-architecture.md §5.3). Credential-bearing **URIs** in Storage paths are an open obligation
+  deferred to the object-store backend ADR (§5.3 "OUT OF SCOPE — credential-bearing URIs").
 - **SQL and row/cell values → never rendered.** There is **no** SQL or row redactor, and one is not the
   goal: SQL must be reduced to a **structural summary** (operator shape, bounded stage/outcome, statement
   kind) or a **parameterized** form with literals stripped **before** anything is logged — a raw literal or
@@ -310,10 +314,14 @@ rendering it**, not by a redactor:
   structural/redacted form or omit the identifier. Auditing the existing diagnostic-render paths against
   this rule once instrumentation is wired is tracked in
   [#455](https://github.com/khaines/deltasharp/issues/455).
-- Redaction is **centralized and tested**: `SecretRedaction` has unit coverage, and any new diagnostic
-  path adds a redaction test (checklist [09a](../checklists/09a-logging-checklist.md)). `SecretRedaction`
-  is `internal` to `DeltaSharp.Core` today; a log site in another assembly reuses it through the existing
-  internals-visibility grants or promotes it via a reviewed PublicAPI change — it is never duplicated.
+- Redaction is **centralized and tested** *within each assembly's reach*: `SecretRedaction` has unit
+  coverage (Core/Executor), and `DiagnosticText` has its own (`PathDisclosureHygieneTests`,
+  `StorageHygieneSweepTests`); any new diagnostic path adds a redaction test (checklist
+  [09a](../checklists/09a-logging-checklist.md)). `SecretRedaction` is `internal` to `DeltaSharp.Core`; a
+  Core/Executor log site reuses it through the existing internals-visibility grant. It is **never
+  duplicated within an assembly's reach** — but `DeltaSharp.Storage`, which the IVT grant does not cover,
+  deliberately owns the separate `DiagnosticText` primitive rather than reaching across the boundary (see
+  storage-delta-architecture.md §5.3).
 - Security-, privacy-, and tenant-sensitive logging changes are reviewed against
   [05](../checklists/05-security-checklist.md), [07](../checklists/07-privacy-checklist.md), and
   [14](../checklists/14-tenant-isolation-checklist.md).
@@ -550,7 +558,7 @@ whenever it touches credentials, tenant routing, or storage paths, and
 | --- | --- | --- |
 | 00.4.1 | Stable log field names (job, stage, task, executor, attempt, partition, table version, correlation) | [Shared telemetry vocabulary](#shared-telemetry-vocabulary); `DeltaSharpTelemetry` |
 | 00.4.1 | Correlation propagated across a boundary, or non-propagation documented | [Correlation and context propagation](#correlation-and-context-propagation) (M1 non-propagation rule) |
-| 00.4.1 | Redaction rules prohibit secrets/sensitive tokens in logs | [Redaction](#redaction-never-log-secrets-credential-bearing-paths-sql-literals-or-row-values); `SecretRedaction.RedactPath` |
+| 00.4.1 | Redaction rules prohibit secrets/sensitive tokens in logs | [Redaction](#redaction-never-log-secrets-credential-bearing-paths-sql-literals-or-row-values); `SecretRedaction.RedactPath` (Core/Executor), `DiagnosticText.DescribePath`/`Sanitize` (Storage) |
 | 00.4.1 | Logger categories + event-naming guidance for new components | [Logger categories, event names, and EventIds](#logger-categories-event-names-and-eventids) |
 | 00.4.2 | Meter name, versioning policy, instrument-naming pattern | [Meter name and versioning policy](#meter-name-and-versioning-policy), [Instrument naming and types](#instrument-naming-and-types) |
 | 00.4.2 | `ActivitySource` names + span attributes within cardinality limits | [Tracing conventions](#tracing-conventions) |
@@ -572,5 +580,6 @@ whenever it touches credentials, tenant routing, or storage paths, and
 - [14 — Tenant Isolation Checklist](../checklists/14-tenant-isolation-checklist.md)
 - [execution-boundaries.md](execution-boundaries.md) — `ExecutionMetrics`, stage attribution, the driver
 - `src/DeltaSharp.Abstractions/Diagnostics/DeltaSharpTelemetry.cs` — canonical telemetry names
-- `src/DeltaSharp.Core/Plans/Logical/SecretRedaction.cs` — centralized path redaction
+- `src/DeltaSharp.Core/Plans/Logical/SecretRedaction.cs` — centralized path redaction (Core/Executor)
+- `src/DeltaSharp.Storage/Delta/DiagnosticText.cs` — Storage-side path/schema redaction (`DescribePath`/`Sanitize`; Storage cannot see `SecretRedaction`)
 - OpenTelemetry .NET (logs, metrics, tracing), W3C Trace Context, and semantic-convention guidance

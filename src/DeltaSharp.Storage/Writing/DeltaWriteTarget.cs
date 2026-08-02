@@ -839,7 +839,12 @@ public sealed class DeltaWriteTarget : IDisposable
     // the __HIVE_DEFAULT_PARTITION__ sentinel directory; the log still records a real null), then a unique
     // `part-<guid>.parquet`. Partition truth lives in the committed add.partitionValues, so the physical
     // directory encoding never affects read correctness.
-    private static string DataFilePath(
+    // internal (not private) so PathDisclosureHygieneTests can cross-check DiagnosticText.DescribePath
+    // against a path this method ACTUALLY produced. The Hive `key=value` layout is authored here and
+    // re-encoded by the describer; asserting the describer against a literal would let the two drift
+    // silently, and the thing that breaks on drift is the PRIVACY guarantee -- a failure with no other
+    // symptom. Nothing else may call this.
+    internal static string DataFilePath(
         IReadOnlyList<string> partitionColumns,
         System.Collections.Immutable.ImmutableSortedDictionary<string, string?> partitionValues,
         string fileNameToken)

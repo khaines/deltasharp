@@ -453,8 +453,23 @@ internal sealed class DeltaVacuum
 
             VacuumDecision auditDecision = ToVacuumDecision(decision.Classification);
             audit.Add(new VacuumAuditEntry(decision.Path, auditDecision, wasDeleted));
-            DeltaVacuumLog.VacuumCandidateDecision(
-                _logger, decision.Path, DeltaStorageTelemetry.ToLabel(auditDecision), wasDeleted);
+            // Hive-path PII ruling: the audit LINE renders a description (sanitized file name + sanitized
+            // partition COLUMN NAMES, no values); the audit ENTRY above keeps the raw path for the caller.
+            //
+            // The explicit IsEnabled gate is load-bearing, not belt-and-braces. [LoggerMessage] puts its
+            // generated IsEnabled check INSIDE the generated method, so C# argument evaluation runs
+            // DescribePath at the CALL SITE regardless of level. This is the one per-candidate (rather than
+            // per-fault) DescribePath in the codebase, and it replaced a free field read with a scan +
+            // Sanitize + join costing ~1.2 KB per candidate: a 1M-file VACUUM with Debug disabled — the
+            // production default — would burn ~1.2 GB of transient Gen0 rendering lines nobody sees.
+            if (_logger.IsEnabled(LogLevel.Debug))
+            {
+                DeltaVacuumLog.VacuumCandidateDecision(
+                    _logger,
+                    DiagnosticText.DescribePath(decision.Path),
+                    DeltaStorageTelemetry.ToLabel(auditDecision),
+                    wasDeleted);
+            }
         }
 
         return (deletable.ToImmutable(), deleted.ToImmutable(), audit.ToImmutable());

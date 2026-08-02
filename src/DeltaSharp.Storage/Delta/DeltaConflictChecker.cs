@@ -145,8 +145,14 @@ internal static class DeltaConflictChecker
         {
             if (action is TxnAction winnerTxn && loserAppIds.Contains(winnerTxn.AppId))
             {
+                // #686 message hygiene: uniform with DeltaCommitter's PartialTxn app-id echo. NOTE the
+                // severity honestly — the throw is gated by `loserAppIds.Contains(winnerTxn.AppId)`, an
+                // ORDINAL equality match against THIS writer's own app ids, so the echoed content is
+                // locally-determined (own-identifier class), not foreign. Sanitized anyway so the posture
+                // cannot drift from the sibling site and so an own id built from untrusted input (an app id
+                // derived from a user-supplied job name) cannot inject into a structured-log sink.
                 throw new ConcurrentTransactionException(
-                    $"A concurrent commit recorded a transaction for appId '{winnerTxn.AppId}' since this writer's read snapshot; the commit was aborted to preserve idempotency.");
+                    $"A concurrent commit recorded a transaction for appId '{DiagnosticText.Sanitize(winnerTxn.AppId, DiagnosticText.ConfigTokenMaxLength)}' since this writer's read snapshot; the commit was aborted to preserve idempotency.");
             }
         }
     }

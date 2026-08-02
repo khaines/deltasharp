@@ -133,7 +133,7 @@ internal sealed class ChangeDataWriter
                 throw DeltaStorageException.UnsupportedFeature(
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Column '{name}' uses the reserved Change Data Feed metadata column name '{reserved}': a "
+                        $"Column '{DiagnosticText.Sanitize(name)}' uses the reserved Change Data Feed metadata column name '{reserved}': a "
                         + $"CDF-enabled table must not declare a data or partition column named "
                         + $"'{ChangeTypeColumn}', '{CommitVersionColumn}', or '{CommitTimestampColumn}' (Delta's "
                         + $"reserved-name rule). In none mode such a column collides with the synthesized cdc "
@@ -165,7 +165,7 @@ internal sealed class ChangeDataWriter
                     string.Create(
                         CultureInfo.InvariantCulture,
                         $"Change Data Feed generation does not support the nested "
-                        + $"({field.DataType.TypeName}) data column '{field.Name}': the DELETE fails closed "
+                        + $"({field.DataType.TypeName}) data column '{DiagnosticText.Sanitize(field.Name)}': the DELETE fails closed "
                         + $"rather than write incomplete change data (which read-time precedence would make "
                         + $"silently lossy). Only scalar data columns are supported for cdc generation."));
             }

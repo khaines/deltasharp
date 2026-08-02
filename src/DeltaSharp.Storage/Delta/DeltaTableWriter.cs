@@ -697,13 +697,15 @@ internal sealed class DeltaTableWriter
         if (!schema.TryGetField(fromName, out StructField target))
         {
             throw new InvalidOperationException(
-                $"Cannot rename column '{fromName}': no such column in the table schema.");
+                $"Cannot rename column '{DiagnosticText.Sanitize(fromName)}': no such column in the table schema.");
         }
 
         if (!string.Equals(fromName, toName, StringComparison.Ordinal) && schema.IndexOf(toName) >= 0)
         {
+            // #683: `toName` appears TWICE, so a raw oversized name is a 3x flood amplifier. Same idiom as
+            // DropColumnAsync below.
             throw new InvalidOperationException(
-                $"Cannot rename column '{fromName}' to '{toName}': a column named '{toName}' already exists.");
+                $"Cannot rename column '{DiagnosticText.Sanitize(fromName)}' to '{DiagnosticText.Sanitize(toName)}': a column named '{DiagnosticText.Sanitize(toName)}' already exists.");
         }
 
         var fields = new List<StructField>(schema.Count);
@@ -758,7 +760,7 @@ internal sealed class DeltaTableWriter
         if (!schema.TryGetField(name, out StructField target))
         {
             throw new InvalidOperationException(
-                $"Cannot drop column '{name}': no such column in the table schema.");
+                $"Cannot drop column '{DiagnosticText.Sanitize(name)}': no such column in the table schema.");
         }
 
         // MEDIUM#5: the partition-column guard checks the LOGICAL name against metaData.partitionColumns
@@ -766,7 +768,7 @@ internal sealed class DeltaTableWriter
         if (snapshot.Metadata.PartitionColumns.Contains(name, StringComparer.Ordinal))
         {
             throw new InvalidOperationException(
-                $"Cannot drop partition column '{name}'; dropping a partition column is out of scope.");
+                $"Cannot drop partition column '{DiagnosticText.Sanitize(name)}'; dropping a partition column is out of scope.");
         }
 
         var fields = new List<StructField>(schema.Count - 1);
@@ -1412,9 +1414,14 @@ internal sealed class DeltaTableWriter
                             CultureInfo.InvariantCulture,
                             // #667 message hygiene: the staged file path is not interpolated, and the
                             // partition-column keys (which can be foreign/attacker-authored in name mode) are
-                            // sanitized to close the log-injection vector.
-                            $"A staged file carries partition value(s) " +
-                            $"[{string.Join(", ", file.PartitionValues.Keys.Select(k => DiagnosticText.Sanitize(k)))}] but the table is unpartitioned; " +
+                            // sanitized to close the log-injection vector. #686: the LIST is bounded too —
+                            // per-item sanitization alone still let thousands of keys render a ~655,000-char
+                            // message, so SanitizeAndJoin caps the rendered count and elides the remainder.
+                            // The rendered tokens are partition-column NAMES (PartitionValues.Keys), never
+                            // partition VALUES — word the message accordingly so it does not read as a
+                            // value-disclosure finding in an audit.
+                            $"A staged file carries partition column(s) " +
+                            $"[{DiagnosticText.SanitizeAndJoin(file.PartitionValues.Keys, DiagnosticText.DefaultMaxLength)}] but the table is unpartitioned; " +
                             $"an unpartitioned write must not specify any partition value."));
                 }
             }
@@ -1446,8 +1453,10 @@ internal sealed class DeltaTableWriter
                         CultureInfo.InvariantCulture,
                         // #667 message hygiene: the staged file path is not interpolated; the partition-column
                         // keys (foreign/attacker-authored in name mode) and declared columns are sanitized.
-                        $"A staged file carries partition value(s) [{string.Join(", ", stray.Select(k => DiagnosticText.Sanitize(k)))}] " +
-                        $"not declared by the table's partition columns [{string.Join(", ", partitionColumns.Select(k => DiagnosticText.Sanitize(k)))}]; " +
+                        // #686: both LISTS are count-bounded via SanitizeAndJoin (per-item sanitize + elision)
+                        // so a 5,000-column table or a 5,000-key staged file cannot flood a log line.
+                        $"A staged file carries partition column(s) [{DiagnosticText.SanitizeAndJoin(stray, DiagnosticText.DefaultMaxLength)}] " +
+                        $"not declared by the table's partition columns [{DiagnosticText.SanitizeAndJoin(partitionColumns, DiagnosticText.DefaultMaxLength)}]; " +
                         $"a partitioned write must not specify any partition value beyond the declared columns."));
             }
 
@@ -1463,8 +1472,9 @@ internal sealed class DeltaTableWriter
                         CultureInfo.InvariantCulture,
                         // #667 message hygiene: the staged file path is not interpolated; the missing
                         // partition-column names are sanitized (declared table schema, but uniform posture).
+                        // #686: count-bounded via SanitizeAndJoin so a wide partition layout cannot flood.
                         $"A staged file is missing partition column(s) " +
-                        $"[{string.Join(", ", missing.Select(k => DiagnosticText.Sanitize(k)))}]; a partitioned write must specify a value " +
+                        $"[{DiagnosticText.SanitizeAndJoin(missing, DiagnosticText.DefaultMaxLength)}]; a partitioned write must specify a value " +
                         $"(possibly null) for every partition column."));
             }
         }
