@@ -626,26 +626,37 @@ internal static class DiagnosticText
     /// <summary>
     /// Renders <paramref name="exception"/> as <c>{TypeName}: {Message}</c> (optionally followed by
     /// <c>(Kind: {kind})</c>) plus its OWN stack trace, deliberately <b>omitting the
-    /// <see cref="Exception.InnerException"/> chain</b>. The DeltaSharp storage decode/validation exceptions
-    /// scrub attacker-influenceable content from their sanitized <see cref="Exception.Message"/> but retain the
-    /// raw underlying cause (e.g. a Parquet.Net message or a JSON parse error over crafted bytes) as the inner
-    /// for server-side diagnostics; the default <see cref="Exception.ToString"/> would re-surface that raw
-    /// inner (as would the default <c>ILogger.LogError(ex, …)</c> providers, which render <c>ToString()</c>),
-    /// re-leaking exactly what <see cref="Exception.Message"/> dropped. This override closes the
+    /// <see cref="Exception.InnerException"/> chain</b>. DeltaSharp storage decode/validation paths are
+    /// intended to keep raw decoder text out of <see cref="Exception.Message"/> and route
+    /// attacker-influenceable tokens through message hygiene where implemented, while retaining the raw
+    /// underlying cause as the inner for server-side diagnostics. Treat every storage message as untrusted;
+    /// known unsanitized producers are scoped in
+    /// <c>docs/engineering/design/storage-exception-log-routing.md</c> and tracked by #747/#749. The
+    /// default <see cref="Exception.ToString"/> would re-surface that raw inner (as would the default
+    /// <c>ILogger.LogError(ex, …)</c> providers, which render <c>ToString()</c>), re-leaking exactly what
+    /// <see cref="Exception.Message"/> dropped. This override closes the
     /// <c>ToString()</c>/<c>ILogger</c>-<b>rendering</b> vector (#664): the inner stays attached (reachable via
     /// <see cref="Exception.InnerException"/>) for a debugger / deliberate server-side read, but is never
     /// auto-rendered — and because <see cref="Exception.ToString"/> recurses into an inner via the inner's own
     /// (overridden) <c>ToString()</c>, a covered exception nested inside an outer exception or an
     /// <see cref="AggregateException"/> is suppressed transitively.
     /// <para><b>Residual (by design).</b> This is <c>ToString()</c>-rendering parity with RF-8b, NOT the full
-    /// RF-8b treatment: unlike <c>LocalFileSystemBackend.SurfaceFailure</c> (which attaches a <i>synthetic,
-    /// sanitized</i> inner so even reflection is safe), these types <b>retain the raw inner object</b>. A
-    /// sink that serializes the exception <i>object graph</i> by reflection (e.g. a Serilog exception
-    /// destructurer, <c>JsonSerializer.Serialize(ex)</c>) — rather than calling <c>ToString()</c> — can still
-    /// walk <see cref="Exception.InnerException"/> and re-surface the raw cause. That is a sink-side
-    /// encode-on-write concern: a tenant-visible sink MUST render <c>.Message</c>/<c>.ToString()</c> and MUST
-    /// NOT reflect over <see cref="Exception.InnerException"/>, which is server-side-diagnostic-only. No such
-    /// reflecting logger exists in this repository today.</para>
+    /// RF-8b treatment: unlike <c>LocalFileSystemBackend.SurfaceFailure</c> (which replaces the raw framework
+    /// exception object with a <i>synthetic, root-redacted</i> inner whose message is now also
+    /// partition-value-redacted and line-break-sanitized — the untrusted residual there is the raw typed
+    /// properties and reflection reach, #749), these types <b>retain the raw inner object</b>. The
+    /// suppression works because <see cref="Exception.ToString"/> delegates the chain walk to the inner's own
+    /// virtual <c>ToString()</c>, so it protects only a sink that lets <c>Exception.ToString()</c> do that
+    /// walk. A sink that enumerates <see cref="Exception.InnerException"/> <b>itself</b> — measured on NLog's
+    /// <c>${exception:maxInnerExceptionLevel=…}</c> and on Application Insights' <c>ExceptionDetails</c> list,
+    /// both of which re-render the raw cause even while calling this override per level — or that serializes
+    /// the exception <i>object graph</i> by reflection (a Serilog exception destructurer, <c>{@Ex}</c>,
+    /// <c>JsonSerializer.Serialize(ex)</c>) still re-surfaces it, and reflection additionally reaches the raw
+    /// typed properties. That is a sink-side encode-on-write concern: a tenant-visible sink MUST render
+    /// <c>.Message</c>/<c>.ToString()</c> and MUST NOT walk <see cref="Exception.InnerException"/> or reflect
+    /// over the object graph. See <c>docs/engineering/design/storage-exception-log-routing.md</c> for the
+    /// measured per-sink matrix. The storage assembly's exact source-generated log-site signatures are pinned
+    /// by <c>StorageExceptionToStringTests</c> and accept no <see cref="Exception"/> object.</para>
     /// </summary>
     internal static string DescribeWithoutInner(Exception exception, string? kind = null)
     {
