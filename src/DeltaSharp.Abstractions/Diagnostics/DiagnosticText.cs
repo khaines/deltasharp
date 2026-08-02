@@ -168,29 +168,70 @@ internal static class DiagnosticText
     /// re-create exactly the silent-drift hazard the shared primitive exists to eliminate: two independent
     /// constants, one name, and no signal when they diverge.
     /// </remarks>
-    /// <param name="tokens">The untrusted tokens to render.</param>
+    /// <param name="tokens">The untrusted tokens to render. When not already an
+    /// <see cref="IReadOnlyList{T}"/>, at most <paramref name="maxItems"/> tokens are materialized; the
+    /// remainder are counted-only so a hostile unbounded sequence does not force a full allocation (#767).</param>
     /// <param name="maxItemLength">The per-item length cap handed to <see cref="Sanitize"/>.</param>
     /// <param name="maxItems">The maximum number of items rendered before the remainder is elided.</param>
     /// <param name="separator">The separator placed between rendered items.</param>
     internal static string SanitizeAndJoin(
         IEnumerable<string> tokens, int maxItemLength, int maxItems, string separator = ", ")
     {
-        IReadOnlyList<string> list = tokens as IReadOnlyList<string> ?? tokens.ToList();
-        int shown = Math.Min(list.Count, maxItems);
+        // Fast path: the count is free when the sequence is already a list — no need to enumerate it twice.
+        if (tokens is IReadOnlyList<string> list)
+        {
+            int shown = Math.Min(list.Count, maxItems);
+            var b = new StringBuilder();
+            for (int i = 0; i < shown; i++)
+            {
+                if (i > 0)
+                {
+                    b.Append(separator);
+                }
+
+                b.Append(Sanitize(list[i], maxItemLength));
+            }
+
+            if (list.Count > shown)
+            {
+                b.Append(separator).Append(CultureInfo.InvariantCulture, $"… (+{list.Count - shown} more)");
+            }
+
+            return b.ToString();
+        }
+
+        // Lazy path: cap DURING enumeration — never materialize the tail (#767). Collect at most
+        // maxItems rendered strings, then count-only the remainder so the elision marker is accurate without
+        // allocating the full hostile list. The caller's IEnumerable may yield millions of items; the only
+        // allocation here is at most maxItems sanitized strings.
+        var rendered = new List<string>(Math.Min(maxItems, 16));
+        int tail = 0;
+        foreach (string token in tokens)
+        {
+            if (rendered.Count < maxItems)
+            {
+                rendered.Add(Sanitize(token, maxItemLength));
+            }
+            else
+            {
+                tail++;
+            }
+        }
+
         var builder = new StringBuilder();
-        for (int i = 0; i < shown; i++)
+        for (int i = 0; i < rendered.Count; i++)
         {
             if (i > 0)
             {
                 builder.Append(separator);
             }
 
-            builder.Append(Sanitize(list[i], maxItemLength));
+            builder.Append(rendered[i]);
         }
 
-        if (list.Count > shown)
+        if (tail > 0)
         {
-            builder.Append(separator).Append(CultureInfo.InvariantCulture, $"… (+{list.Count - shown} more)");
+            builder.Append(separator).Append(CultureInfo.InvariantCulture, $"… (+{tail} more)");
         }
 
         return builder.ToString();

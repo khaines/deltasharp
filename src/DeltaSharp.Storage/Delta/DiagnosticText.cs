@@ -204,14 +204,21 @@ internal static class DiagnosticText
         // been updated to include the segment by the time the segment is classified.
         bool lastSegmentInsideHiveRun = false;
 
-        // KNOWN AND NOT FIXED HERE: the directory COUNT is still derived from both separators, so
-        // `a\b\c\email=v` reports "3 directories omitted" where a POSIX reader has one component and no
-        // directories at all. That is a false structural claim, but it is a claim in the NON-disclosing
-        // direction -- it names nothing -- and the same ambiguity runs the other way, since counting only
-        // `/` would report "0 omitted" while three names were in fact dropped. Both readings misinform;
-        // only one of them can be picked, and the choice is coupled to traversal detection, which is
-        // security-relevant and should not be changed as a side effect of a naming fix. Tracked by #719
-        // rather than resolved by whichever way this function happens to be edited next.
+        // DECISION (#719, Option 3 — ACCEPTED AND DOCUMENTED): the directory COUNT is derived from both
+        // separators, so `a\b\c\email=v` reports "3 directories omitted" where a POSIX reader sees one
+        // component and no directories at all. Both readings misinform — counting only `/` reports "0 omitted"
+        // while three names were in fact dropped on Windows — but neither reading discloses a partition VALUE
+        // or any directory NAME: the count is a structural fact, not data. The safe direction for a
+        // non-disclosing claim is OVER-REPORT (more directories omitted than truly were), which is exactly
+        // what counting `\` produces on a POSIX-produced path. Counting only `/` would UNDER-REPORT on a
+        // Windows-produced path, hiding traversal depth.
+        //
+        // Option 1 (count only `/`) is probably the correct LONG-TERM choice but requires re-pinning the
+        // traversal-detection logic (which is security-relevant and gates `..` detection) before the
+        // separator alphabet can be narrowed without risk of silently under-reporting a traversal. That
+        // change belongs in its own focused PR, not as a side-effect of a message-hygiene edit. Until it
+        // lands, this comment IS the resolution: the choice is deliberate (over-report, non-disclosing),
+        // documented, and coupled to traversal detection.
 
         // A leading separator (POSIX absolute) or a drive/UNC prefix (Windows) means the path was never
         // table-relative. That is a fact about the REQUEST, not about the table's data, so it is safe to keep
@@ -277,9 +284,8 @@ internal static class DiagnosticText
         // The TERMINAL segment gets the same key=value test as every other one. A path can legitimately end at
         // a partition DIRECTORY (a listing prefix, or simply a poisoned add.path), and rendering that segment
         // as "the file name" would push the partition VALUE straight through Sanitize — which, by the very
-        // argument this helper exists for, cannot remove an email address. Found independently by two review
-        // seats; not reachable from DeltaSharp's own call graph today, but IStorageBackend is an extensible
-        // seam and the guard belongs in the helper, not in its callers' discipline.
+        // argument this helper exists for, cannot remove an email address. The guard belongs in the helper,
+        // not in caller discipline.
         //
         // `>= 0`, not `> 0`: an EMPTY Hive key ("=<value>") must still be recognized. This is the sibling of
         // the empty-key fail-open closed in LocalFileSystemBackend's Redact recognizer, and it is the more
@@ -297,25 +303,12 @@ internal static class DiagnosticText
         // the POSIX reading it is the TAIL OF A PARTITION VALUE rather than a file name. Render it as the
         // directory it may well be, and never as a name.
         //
-        // NOT `hiveInBackslashRun`, which was the third exit of this same leak (round 22, Quality). The
-        // live latch is a statement about the END OF THE STRING; the question here is about the TERMINAL
-        // SEGMENT, and a `/` arriving AFTER that segment clears the latch before it is ever consulted:
-        //
-        //     email=x\alice.taylor%40example.com/   ->   'alice.taylor%40example.com' (partitioned by: email)
-        //
-        // The identical path without the trailing slash redacted correctly, which is why two prior seats
-        // hunting a third echo path did not find it -- neither corpus varied the TAIL. `lastSegmentInsideHiveRun`
-        // is the latch as of BEFORE the terminal segment, which is the state that describes the segment
-        // rather than the string, and it is what the CollectPartitionKey guard below already uses. It also
-        // strictly dominates the live latch here: once the terminal segment is recorded the latch can only
-        // be CLEARED (a following `/` resets it; a following `\` cannot set it, because the only segments
-        // after the terminal one are empty). Reading the live latch could therefore only ever LOSE
-        // suppression -- never add it -- which is the definition of a fail-open read.
-        //
-        // The general rule, one level deeper than where it was applied before: suppressing one echo of a
-        // token says nothing about the others, AND A GUARD'S OWN LIFETIME IS ONE OF THE OTHERS. The file
-        // name echo was closed, then the column name echo; this is the latch that closes both being read
-        // at the wrong instant.
+        // NOT `hiveInBackslashRun`: the live latch describes the END OF THE STRING, but this decision is
+        // about the TERMINAL SEGMENT. A trailing `/` clears the live latch after the segment has already
+        // been recorded, so consulting it here would lose suppression on
+        // `email=x\alice.taylor%40example.com/`. `lastSegmentInsideHiveRun` is the latch state BEFORE the
+        // terminal segment, which is exactly the state needed for both file-name and partition-key
+        // suppression here.
         bool terminalIsPartitionDirectory = terminalCarriesHive || lastSegmentInsideHiveRun;
         if (terminalCarriesHive && !lastSegmentInsideHiveRun)
         {
@@ -410,24 +403,11 @@ internal static class DiagnosticText
     /// Returns the index at which the separator begins, or <c>-1</c>; <paramref name="separatorLength"/>
     /// receives its width so the caller can slice the key and the value without re-deriving the spelling.
     /// </summary>
-    /// <remarks>
-    /// <para><b>Why this exists as a shared predicate rather than three <c>IndexOf('=')</c> calls and a
+    /// <remarks><para><b>Why this exists as a shared predicate rather than three <c>IndexOf('=')</c> calls and a
     /// regex.</b> DeltaSharp has TWO recognizers that independently answer this question — this one, which
     /// drops the partition VALUE from a described path, and <c>LocalFileSystemBackend.Redact</c>, which
-    /// strips it out of an echoed framework message. For three consecutive review rounds a shape was found
-    /// in one and fixed only there: the empty key (fixed in <c>Redact</c>, missed here), the
-    /// <c>IndexOf('=') &gt;= 0</c> off-by-one (fixed here, and its interior siblings missed), and the
-    /// percent-encoded separator (fixed in <c>Redact</c>, missed here). All three produced the same absurd
-    /// artifact — a single message in which one half redacted the value and the other echoed it:
-    /// <code>
-    /// Opening a read for 'email%3Dalice%40example.com' failed:
-    ///   IOException: Could not open '&lt;table-root&gt;/email=&lt;value&gt;'.
-    /// </code>
-    /// The durable fix is not another one-line patch but one predicate both halves consult, so the NEXT
-    /// spelling anyone discovers is covered in both by construction. <see cref="HiveSeparatorPattern"/> is
-    /// the regex half of the same definition and is compiled directly into <c>Redact</c>'s pattern, so the
-    /// two cannot drift: adding a spelling means editing this method and that constant, together, here.
-    /// </para>
+    /// strips it out of an echoed framework message. They must consult one predicate and the shared
+    /// <see cref="HiveSeparatorPattern"/> so description and redaction cannot drift.</para>
     /// <para><b>Recognized spellings.</b> A literal <c>=</c>, and its percent-encoding <c>%3D</c> in either
     /// case. A foreign writer may percent-encode the separator, and a segment whose separator arrived that
     /// way is still a Hive partition directory — declining it echoes the value, which is the fail-open class

@@ -64,10 +64,12 @@ internal sealed class DeltaProtocolException : Exception
 
     /// <summary>
     /// Renders this exception WITHOUT its <see cref="Exception.InnerException"/> chain (#664, RF-8b parity):
-    /// the sanitized <see cref="Exception.Message"/> drops attacker-influenceable log/decode content while the
-    /// raw cause (e.g. a JSON parse error over crafted commit bytes) is retained as the inner for server-side
-    /// diagnostics; the default <c>ToString()</c> / <c>ILogger.LogError(ex, …)</c> would re-surface it. The
-    /// inner remains reachable via <see cref="Exception.InnerException"/>.
+    /// the <see cref="Exception.Message"/> is authored by factory methods whose call sites sanitize
+    /// attacker-influenceable tokens (e.g. foreign protocol feature names — verified by
+    /// <c>StorageHygieneSweepTests</c> for every known producer; #745/#749); the raw cause (e.g. a JSON
+    /// parse error over crafted commit bytes) is retained as the inner for server-side diagnostics; the
+    /// default <c>ToString()</c> / <c>ILogger.LogError(ex, …)</c> would re-surface it. The inner remains
+    /// reachable via <see cref="Exception.InnerException"/>.
     /// </summary>
     public override string ToString() => DiagnosticText.DescribeWithoutInner(this, Kind.ToString());
 

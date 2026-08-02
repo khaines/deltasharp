@@ -87,15 +87,25 @@ internal sealed class DeltaStorageException : Exception
 
     /// <summary>
     /// Renders this exception WITHOUT its <see cref="System.Exception.InnerException"/> chain (#664, RF-8b
-    /// parity). The sanitized <see cref="System.Exception.Message"/> deliberately drops attacker-influenceable
-    /// decode content while the raw underlying cause (e.g. a Parquet.Net exception over crafted bytes) is
-    /// retained as the inner for server-side diagnostics; the default <c>ToString()</c> / <c>ILogger.LogError(ex, …)</c>
-    /// would re-surface that raw inner, so this override omits it. The inner remains reachable via
+    /// parity). The <see cref="System.Exception.Message"/> is authored by factory methods whose call sites are
+    /// responsible for sanitizing attacker-influenceable tokens before interpolation (verified by
+    /// <c>StorageHygieneSweepTests</c> for every known producer; see the <b>Message hygiene obligation</b>
+    /// note on <see cref="UnsupportedFeature"/> and <see cref="SchemaMismatch"/> — #745/#749). The raw
+    /// underlying cause (e.g. a Parquet.Net exception over crafted bytes) is retained as the inner for
+    /// server-side diagnostics; the default <c>ToString()</c> / <c>ILogger.LogError(ex, …)</c> would
+    /// re-surface that raw inner, so this override omits it. The inner remains reachable via
     /// <see cref="System.Exception.InnerException"/>.
     /// </summary>
     public override string ToString() => DiagnosticText.DescribeWithoutInner(this, Kind.ToString());
 
-    /// <summary>Creates an <see cref="StorageErrorKind.UnsupportedFeature"/> error naming the feature.</summary>
+    /// <summary>Creates an <see cref="StorageErrorKind.UnsupportedFeature"/> error naming the feature.
+    /// <para><b>Message hygiene obligation (#747):</b> this factory accepts a fully-composed message; it cannot
+    /// sanitize tokens on the caller's behalf. Any caller-supplied token that is attacker-influenceable
+    /// (a column name, a type name derived from a foreign Parquet footer, a protocol feature key from a
+    /// foreign <c>_delta_log</c>) MUST be routed through <see cref="DiagnosticText.Sanitize"/> — or a
+    /// stronger drop/minimization — BEFORE interpolation. The sweep test in
+    /// <c>StorageHygieneSweepTests</c> enforces this for every known call site; new call sites must
+    /// satisfy the same property.</para></summary>
     public static DeltaStorageException UnsupportedFeature(string feature) =>
         new(StorageErrorKind.UnsupportedFeature, feature);
 
@@ -103,7 +113,11 @@ internal sealed class DeltaStorageException : Exception
     public static DeltaStorageException CorruptData(string defect, Exception? innerException = null) =>
         new(StorageErrorKind.CorruptData, defect, innerException);
 
-    /// <summary>Creates a <see cref="StorageErrorKind.SchemaMismatch"/> error naming the mismatch.</summary>
+    /// <summary>Creates a <see cref="StorageErrorKind.SchemaMismatch"/> error naming the mismatch.
+    /// <para><b>Message hygiene obligation (#747):</b> same contract as
+    /// <see cref="UnsupportedFeature"/>: the message is accepted fully-composed; any attacker-influenceable
+    /// token must be routed through <see cref="DiagnosticText.Sanitize"/> by the caller before
+    /// interpolation. The sweep test in <c>StorageHygieneSweepTests</c> covers every known call site.</para></summary>
     public static DeltaStorageException SchemaMismatch(string message) =>
         new(StorageErrorKind.SchemaMismatch, message);
 
