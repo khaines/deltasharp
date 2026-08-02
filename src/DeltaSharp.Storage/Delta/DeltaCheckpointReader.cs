@@ -28,9 +28,13 @@ namespace DeltaSharp.Storage.Delta;
 /// not exactly one action, an <c>add</c> missing its required <c>path</c>/<c>size</c>, a <c>metaData</c>
 /// missing <c>schemaString</c>/<c>format</c>, a value column whose physical type is not the expected
 /// one, or a row group whose declared decode footprint exceeds the ceiling — throws
-/// <see cref="DeltaProtocolException"/>. The checkpoint is <b>non-authoritative</b> (design §2.10.3): the
-/// caller (<see cref="DeltaLog"/>) treats any such failure as a corrupt checkpoint and falls back to JSON
-/// replay from version 0, never inventing state.</para>
+/// <see cref="DeltaProtocolException"/>. A checkpoint that is a <b>valid</b> Parquet file DeltaSharp simply
+/// cannot read — today only Parquet Modular Encryption, in either footer mode — instead throws
+/// <see cref="DeltaStorageException"/> with <see cref="StorageErrorKind.UnsupportedFeature"/> (#681), so the
+/// diagnosis is actionable rather than a misleading "malformed" (diagnosability parity with the data-file
+/// door, #655). The checkpoint is <b>non-authoritative</b> (design §2.10.3) in BOTH cases: the caller
+/// (<see cref="DeltaLog"/>) treats either failure as an unusable checkpoint and falls back to JSON replay
+/// from version 0, never inventing state.</para>
 ///
 /// <para><b>Forward compatible.</b> Unknown checkpoint columns are ignored and absent optional columns
 /// default to null/empty, mirroring <see cref="DeltaLogActionReader"/>'s tolerance — a v1-baseline reader
@@ -68,6 +72,12 @@ internal static class DeltaCheckpointReader
     /// </summary>
     /// <exception cref="DeltaProtocolException">The part is malformed/truncated, exceeds a decode ceiling,
     /// or carries an action row that violates the required Delta action shape (fail closed).</exception>
+    /// <exception cref="DeltaStorageException">The part is a valid Parquet file written with a feature
+    /// DeltaSharp cannot read — Parquet Modular Encryption, either footer mode
+    /// (<see cref="StorageErrorKind.UnsupportedFeature"/>, #681). Distinct from
+    /// <see cref="DeltaProtocolException"/> so an unreadable-but-VALID checkpoint is not reported as a corrupt
+    /// one; the checkpoint stays non-authoritative either way (<see cref="DeltaLog"/> falls back to JSON
+    /// replay).</exception>
     public static async Task<IReadOnlyList<DeltaAction>> ReadAsync(
         Stream stream, CancellationToken cancellationToken,
         long maxPartBytes = MaxCheckpointPartBytes, long maxDecodedBytes = MaxCheckpointRowGroupDecodedBytes)
@@ -130,18 +140,111 @@ internal static class DeltaCheckpointReader
         return buffer;
     }
 
+    /// <summary>Opens the checkpoint Parquet, classifying a Parquet Modular Encryption checkpoint as
+    /// <see cref="StorageErrorKind.UnsupportedFeature"/> and every other open failure as fail-closed
+    /// <see cref="DeltaProtocolErrorKind.MalformedAction"/> (#681).</summary>
     private static async Task<ParquetReader> OpenAsync(Stream input, CancellationToken cancellationToken)
     {
+        ParquetReader? reader = null;
         try
         {
-            return await ParquetReader.CreateAsync(input, null, false, cancellationToken).ConfigureAwait(false);
+            reader = await ParquetReader.CreateAsync(input, null, false, cancellationToken).ConfigureAwait(false);
+
+            // Parquet.Net parses the footer LAZILY: CreateAsync reads the Thrift FileMetaData, but the
+            // high-level ParquetSchema is built ON FIRST ACCESS. Force that materialization HERE — the same
+            // order the data-file door uses (ParquetFileReader.OpenAsync) — so a corrupt footer is proven
+            // corrupt BEFORE the encryption check below runs. The order matters for PRECISION: a byte-flipped
+            // footer can still PARSE into a bogus non-null encryption_algorithm (4 of the 400 single-bit flips
+            // in DeltaFuzzTests.CheckpointReader_OnlyFailsClosed_OnByteFlippedCheckpoint do exactly that),
+            // and every one of those flips also breaks the schema — so materializing the schema first keeps a
+            // genuinely corrupt checkpoint classified MALFORMED instead of mislabeled "encrypted". A real
+            // encrypted checkpoint is unaffected: its plaintext footer and schema materialize cleanly, so it
+            // reaches the check below.
+            //
+            // LOAD-BEARING: this line is the SOLE control for those 4 flips, not a redundant second one.
+            // Deleting it turns the fuzz test RED. All 4 corrupt into a footer with an EMPTY
+            // encryption_algorithm union AND zero inspectable column chunks, which is precisely the shape the
+            // classifier's third arm treats as bare presence (its per-column backstop cannot speak), so the
+            // classifier calls them "encrypted" and only the schema probe rejects them first. Note the
+            // coupling this creates: the third arm is what re-armed this line, so changing either one changes
+            // the other's bite — they are NOT independent.
+            //
+            // The claim is asserted, not merely asserted-in-prose: DeltaCheckpointReaderTests
+            // .SchemaFirstOrdering_IsSoleControl_ForAtLeastOneCorruptFlip pins both halves (that the
+            // classifier alone WOULD misclassify at least one flip, and that the door still reports
+            // MALFORMED for every such flip) so this comment cannot drift out of date again.
+            _ = reader.Schema;
+
+            // Parquet Modular Encryption, SUCCESS-path arm (#681, diagnosability parity with #655/#680 on the
+            // data-file door). A plaintext-footer encrypted checkpoint keeps the ordinary PAR1 magic and its
+            // footer parses cleanly, so it OPENS here and would otherwise fail later — as "malformed" — when
+            // its encrypted pages fail to decode. It is not malformed: it is a valid checkpoint written with a
+            // feature DeltaSharp cannot read. Detection is the shared classifier's presence-only footer check
+            // (no field content, path, or key id is read or echoed — #653 hygiene).
+            if (ParquetEncryption.IsPlaintextFooterEncrypted(reader.Metadata))
+            {
+                await DisposeQuietlyAsync(reader).ConfigureAwait(false);
+                throw DeltaStorageException.UnsupportedFeature(
+                    ParquetEncryption.PlaintextFooterEncryptionMessage);
+            }
+
+            return reader;
         }
-        catch (Exception ex) when (ex is not (OperationCanceledException or DeltaProtocolException))
+        catch (Exception ex) when (ex is not (OperationCanceledException or DeltaProtocolException)
+            && ex is not DeltaStorageException { Kind: StorageErrorKind.UnsupportedFeature })
         {
+            // Parquet Modular Encryption, FAILURE-path arm (#681). Encrypted-FOOTER mode (PARE magic) is
+            // rejected by Parquet.Net at open, and a REAL plaintext-footer encryptor omits the encrypted
+            // columns' plaintext ColumnMetaData, which makes the library throw during row-group-reader init —
+            // both land here, indistinguishable (by message) from genuine corruption. The shared classifier
+            // reads the input's own magic/footer to separate them; it MUST run before the dispose below, which
+            // releases the input stream. Anything not positively identified keeps the fail-closed malformed
+            // default — encryption is asserted, never guessed.
+            //
+            // The filter excludes ONLY the exception this method itself re-raises (the SUCCESS-path
+            // UnsupportedFeature above, thrown inside this same try) — not DeltaStorageException as a whole.
+            // Excluding the whole type would be safe only while ReadAsync fully buffers each part into a
+            // MemoryStream before calling us; if checkpoint parts are ever streamed straight from the backend,
+            // a transient storage fault raised in here would escape UNMAPPED past DeltaLog's UnsupportedFeature
+            // -only fallback, turning a retryable blip into a failed table read instead of a JSON replay
+            // (#698 review FIX 5, same class as the DeltaLog swallow narrowing).
+            string? unsupportedEncryption = ParquetEncryption.ClassifyUnreadableInput(input);
+            if (reader is not null)
+            {
+                await DisposeQuietlyAsync(reader).ConfigureAwait(false);
+            }
+
+            if (unsupportedEncryption is not null)
+            {
+                // The classifier's fixed message names only the feature — no path, footer field, or value
+                // (#653), and no ex.Message echo.
+                throw DeltaStorageException.UnsupportedFeature(unsupportedEncryption);
+            }
+
             // Fixed message (no ex.Message interpolation) so a crafted footer's bytes cannot echo into the
             // error text (info-leak parity with ParquetFileReader, #651); ex kept as the inner exception.
             throw DeltaProtocolException.Malformed(
                 "The Delta checkpoint Parquet stream is malformed or truncated.", ex);
+        }
+    }
+
+    /// <summary>Disposes a reader that is being abandoned on a fail-closed path, swallowing a dispose-time
+    /// fault so it cannot escape UNMAPPED and replace the classification the caller is about to throw (the
+    /// open boundary stays exception-total). Deliberately BROADER than the data-file door's equivalent, which
+    /// swallows only <c>IsUndecodableParquetInput</c> faults: here every non-cancellation dispose fault is
+    /// swallowed, because on this path a classification is already pending and any cleanup fault that replaced
+    /// it would be strictly less informative. Swallowing more is the safe direction for an exception-total
+    /// boundary; cancellation still propagates (#698 review).</summary>
+    private static async ValueTask DisposeQuietlyAsync(ParquetReader reader)
+    {
+        try
+        {
+            await reader.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception disposeFault) when (disposeFault is not OperationCanceledException)
+        {
+            // Cleanup fault on a reader being torn down: ignored so the pending classification stays the
+            // single, meaningful outcome.
         }
     }
 

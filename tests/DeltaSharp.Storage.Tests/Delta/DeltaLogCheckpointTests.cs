@@ -144,6 +144,80 @@ public sealed class DeltaLogCheckpointTests : IDisposable
     }
 
     [Fact]
+    public async Task EncryptedCheckpoint_StillFallsBackToJsonReplay()
+    {
+        // #681 must upgrade the checkpoint door's DIAGNOSIS without changing snapshot AVAILABILITY. An
+        // encrypted checkpoint now raises UnsupportedFeature (a DeltaStorageException) instead of
+        // MalformedAction, and a checkpoint is NON-AUTHORITATIVE (design §2.10.3) — so reconstruction must
+        // still fall back to JSON replay and produce the identical table, exactly as for a corrupt one. A
+        // regression here (the new exception escaping TrySeedFromCheckpointAsync) would turn an unreadable
+        // derived artifact into a failed table read.
+        IStorageBackend jsonOnly = NewBackend();
+        await WriteJsonHistoryAsync(jsonOnly);
+        Snapshot fromJson = await new DeltaLog(jsonOnly).LoadSnapshotAsync();
+
+        IStorageBackend backend = NewBackend();
+        await WriteJsonHistoryAsync(backend);
+        byte[] checkpoint = await CheckpointAtV1().ToParquetAsync();
+        await DeltaTestHarness.WriteRawCheckpointAsync(
+            backend, 1, await ParquetTestHelpers.PlaintextFooterEncryptedFileAsync(checkpoint));
+        await DeltaTestHarness.WriteLastCheckpointAsync(backend, 1);
+
+        Snapshot fromCheckpoint = await new DeltaLog(backend).LoadSnapshotAsync();
+
+        Assert.Null(fromCheckpoint.Metrics.CheckpointVersion);
+        Assert.Equal(3, fromCheckpoint.Metrics.ReplayedCommitCount);
+        Assert.Equal(DeltaTestHarness.Describe(fromJson), DeltaTestHarness.Describe(fromCheckpoint));
+    }
+
+    [Fact]
+    public async Task BackendUnsupportedFeatureOnCheckpointOpen_Propagates_NotSilentlyReplayed()
+    {
+        // SCOPE guard for #681's non-authoritative swallow (PR #698 security review, FIX 1). The swallow is
+        // scoped to the DeltaCheckpointReader.ReadAsync call, NOT to the enclosing try that also covers
+        // _backend.OpenReadAsync. Semantics differ: an UnsupportedFeature from the READER means "unusable
+        // derived artifact" (fall back), while the same kind from the BACKEND OPEN means the table's storage
+        // itself cannot be read — masking that behind a silent full JSON replay would hide a genuinely
+        // unreadable table.
+        // RED-on-revert: widening the catch back to the enclosing try swallows this too, and the read
+        // "succeeds" via JSON replay instead of throwing.
+        IStorageBackend backend = NewBackend();
+        await WriteJsonHistoryAsync(backend);
+        await DeltaTestHarness.WriteCheckpointAsync(backend, 1, CheckpointAtV1());
+        await DeltaTestHarness.WriteLastCheckpointAsync(backend, 1);
+
+        var unreadable = new UnsupportedOpenBackend(backend, ".checkpoint.parquet");
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new DeltaLog(unreadable).LoadSnapshotAsync());
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+    }
+
+    [Fact]
+    public async Task TransientFaultDuringCheckpointRead_Propagates_NotSilentlyReplayed()
+    {
+        // KIND guard for #681's non-authoritative-checkpoint swallow (PR #698 review, FIX 1). The swallow is
+        // filtered to `Kind == UnsupportedFeature`. A retryable Transient raised WHILE READING the checkpoint
+        // part (via BufferAsync over the live backend stream — NOT at open, which UnsupportedOpenBackend
+        // already covers) must PROPAGATE, not be masked behind a silent full JSON replay: swallowing a
+        // transient blip would turn a retryable read into a "successful" table read on stale/partial data.
+        // RED-on-revert: dropping the `when (ex.Kind == UnsupportedFeature)` filter (a bare
+        // `catch (DeltaStorageException)`) swallows this into JSON replay and LoadSnapshotAsync stops throwing.
+        IStorageBackend backend = NewBackend();
+        await WriteJsonHistoryAsync(backend);
+        await DeltaTestHarness.WriteCheckpointAsync(backend, 1, CheckpointAtV1());
+        await DeltaTestHarness.WriteLastCheckpointAsync(backend, 1);
+
+        var faulty = new FaultyReadCheckpointBackend(backend, ".checkpoint.parquet");
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new DeltaLog(faulty).LoadSnapshotAsync());
+
+        Assert.Equal(StorageErrorKind.Transient, error.Kind);
+    }
+
+    [Fact]
     public async Task StaleHint_ToMissingCheckpoint_FallsBackToListing()
     {
         IStorageBackend backend = NewBackend();

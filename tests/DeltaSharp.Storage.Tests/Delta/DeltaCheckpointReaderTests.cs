@@ -1,11 +1,29 @@
 using System.Collections.Immutable;
 using DeltaSharp.Storage.Delta;
+using DeltaSharp.Storage.Parquet;
 using Xunit;
 
 namespace DeltaSharp.Storage.Tests.Delta;
 
 public sealed class DeltaCheckpointReaderTests
 {
+    [Fact]
+    public async Task ReadAsync_TransientFaultWhileReadingPart_SurfacesUnmapped_NotMalformed()
+    {
+        // KIND guard (PR #698 review, FIX 5). ReadAsync buffers the part via BufferAsync over the supplied
+        // stream BEFORE OpenAsync's reclassification catch runs, so a retryable Transient raised while reading
+        // must surface UNMAPPED — never remapped to a corrupt-checkpoint Malformed (which DeltaLog would then
+        // swallow into JSON replay). This is the reader-side complement to
+        // TransientFaultDuringCheckpointRead_Propagates_NotSilentlyReplayed. RED-on-revert: a bare
+        // `catch (Exception)` over BufferAsync, or mapping every DeltaStorageException to Malformed, reddens.
+        await using var faulty = new FaultyReadCheckpointBackend.TransientOnReadStream();
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => DeltaCheckpointReader.ReadAsync(faulty, default));
+
+        Assert.Equal(StorageErrorKind.Transient, error.Kind);
+    }
+
     [Fact]
     public async Task Reads_AllActionKinds_WithNestedMapsAndLists()
     {
@@ -862,6 +880,345 @@ public sealed class DeltaCheckpointReaderTests
         // The DV-free sibling still reads back a null descriptor under the depth-2 (required-leaf) shape.
         AddFileAction plain = Assert.Single(actions.OfType<AddFileAction>(), a => a.Path == "plain.parquet");
         Assert.Null(plain.DeletionVector);
+    }
+
+    // ---- #681: Parquet Modular Encryption on the CHECKPOINT door (diagnosability parity with #655/#680) --
+    //
+    // The data-file door (ParquetFileReader.OpenAsync) classifies both encryption modes as an actionable
+    // UnsupportedFeature. The checkpoint door opens its Parquet through a SEPARATE door
+    // (DeltaCheckpointReader.OpenAsync -> ParquetReader.CreateAsync), which used to report an encrypted
+    // checkpoint as MalformedAction — fail-closed, but a misleading diagnosis: the file is not malformed, it
+    // is a valid checkpoint written with a feature DeltaSharp cannot read. Both doors now share ONE classifier
+    // (ParquetEncryption), so these tests pin BOTH of its arms on the checkpoint door:
+    //   * SUCCESS path — a plaintext-footer file whose encrypted columns keep their plaintext ColumnMetaData
+    //     opens cleanly, and is caught from the PARSED footer (encryption_algorithm / ColumnCryptoMetaData);
+    //   * FAILURE path — an encrypted-footer ('PARE') file, and the shape a REAL plaintext-footer encryptor
+    //     writes (encrypted column's plaintext ColumnMetaData omitted), both make Parquet.Net throw at open,
+    //     and are caught by reading the input's own magic / plaintext footer.
+    // Fixtures reuse the #655/#680 footer-splicing helpers, applied to a real checkpoint Parquet.
+
+    [Fact]
+    public async Task PlaintextFooterEncryptedCheckpoint_IsUnsupportedFeature_NotMalformed()
+    {
+        // SUCCESS-path arm: file-level encryption_algorithm spliced into a real checkpoint's plaintext footer
+        // (ordinary 'PAR1' magic, footer parses cleanly, so CreateAsync succeeds).
+        // RED-on-revert: dropping the checkpoint door's IsPlaintextFooterEncrypted check lets the checkpoint
+        // open and decode its (plaintext) pages, so no exception is thrown at all.
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(1, 2)
+            .Metadata("t", EmptySchema)
+            .Add("a.parquet", size: 1)
+            .ToParquetAsync();
+        byte[] encrypted = await ParquetTestHelpers.PlaintextFooterEncryptedFileAsync(parquet);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(encrypted), default));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+        // The whole point of #681: the diagnosis is the feature, never the fail-closed "malformed" default.
+        Assert.DoesNotContain("malformed", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task PlaintextFooterEncryptedCheckpoint_OnlySubsetOfColumnsEncrypted_IsUnsupportedFeature()
+    {
+        // SUCCESS-path arm, per-column marker only: a plaintext-footer checkpoint may encrypt just SOME
+        // columns — file-level encryption_algorithm UNSET, one column chunk carrying ColumnCryptoMetaData.
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(1, 2)
+            .Metadata("t", EmptySchema)
+            .Add("a.parquet", size: 1)
+            .ToParquetAsync();
+        byte[] encrypted = await ParquetTestHelpers.PlaintextFooterColumnCryptoFileAsync(
+            parquet, rowGroup: 0, columnIndex: 0);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(encrypted), default));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task PlaintextFooterEncryptedCheckpoint_EncryptedColumnMetaDataOmitted_IsUnsupportedFeature()
+    {
+        // FAILURE-path arm: the shape a genuine encryptor writes — the encrypted column's plaintext
+        // ColumnMetaData is absent (stored encrypted), which makes Parquet.Net 6.0.3 throw inside CreateAsync
+        // before any parsed-metadata check can run. Only the footer probe can classify it.
+        // RED-on-revert: dropping the checkpoint door's ClassifyUnreadableInput call sends this straight back
+        // to DeltaProtocolException/MalformedAction.
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(1, 2)
+            .Metadata("t", EmptySchema)
+            .Add("a.parquet", size: 1)
+            .ToParquetAsync();
+        byte[] encrypted = await ParquetTestHelpers.PlaintextFooterEncryptedRealisticFileAsync(
+            parquet, rowGroup: 0, columnIndex: 0);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(encrypted), default));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("malformed", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task EncryptedFooterCheckpoint_IsUnsupportedFeature_NotMalformed()
+    {
+        // FAILURE-path arm, encrypted-FOOTER mode (#649): the checkpoint is bracketed by the 'PARE' magic,
+        // which Parquet.Net rejects with a message byte-for-byte identical to the one it emits for arbitrary
+        // garbage — so the classification comes from the file's own magic, at both ends.
+        byte[] encrypted = ParquetTestHelpers.EncryptedFooterMagicFile();
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(encrypted), default));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task SchemaFirstOrdering_IsSoleControl_ForAtLeastOneCorruptFlip()
+    {
+        // EXECUTABLE PIN for the `_ = reader.Schema;` ordering claim in DeltaCheckpointReader.OpenAsync
+        // (#698 Balanced review). That claim used to live only in prose, and it went stale twice — this test
+        // asserts it instead, so it cannot drift again.
+        //
+        // It pins BOTH halves of the invariant, over the same seeded corpus the fuzz test uses:
+        //   (a) there is AT LEAST ONE bit-flip whose corrupt footer the classifier ALONE would call
+        //       "encrypted" — so the schema probe is load-bearing, not defense-in-depth; and
+        //   (b) for every such flip the door still reports MALFORMED, never UnsupportedFeature — so the
+        //       ordering actually does its job.
+        // Assert.NotEmpty on (a) is the anti-vacuity guard: if a future classifier change ever covers the
+        // whole corpus on its own, this goes RED and whoever made that change must re-derive the comment
+        // rather than leave it stale. Deleting `_ = reader.Schema;` turns (b) RED.
+        //
+        // The set is derived by RUNNING the classifier, so on its own it would encode the implementation's
+        // own predicate and confirm it rather than test it (#698 gate finding): a future precision
+        // regression would silently redefine the set instead of failing. Its IDENTITY is therefore pinned
+        // too, against the value four review seats and three gate runs measured independently.
+        //
+        // These indices are NOT a tunable bound that gets re-fitted to make a test pass. They are a
+        // property of a FIXED seed over a FIXED corpus, so there are exactly two ways they can move — the
+        // corpus changed, or the classifier's precision changed — and both must be noticed, not absorbed.
+        // A pin like this is re-VERIFIED, never re-TUNED; if it goes red, derive why before touching it.
+        // The byte/bit offsets are pinned alongside the indices so a corpus change is self-diagnosing:
+        // offsets shifting while indices hold means the fixture moved, not the classifier.
+        byte[] valid = await new CheckpointFixture()
+            .Protocol(1, 2)
+            .Metadata("t", """{"type":"struct","fields":[]}""")
+            .Add("a.parquet", size: 1)
+            .ToParquetAsync();
+
+        var random = new Random(5);
+        var classifierAloneWouldMisclassify = new List<(int Iteration, int ByteOffset, int Bit)>();
+        for (int i = 0; i < 400; i++)
+        {
+            byte[] mutated = (byte[])valid.Clone();
+            int byteOffset = random.Next(mutated.Length);
+            int bit = random.Next(8);
+            mutated[byteOffset] ^= (byte)(1 << bit);
+
+            global::Parquet.Meta.FileMetaData? metadata = null;
+            try
+            {
+                using var probe = new MemoryStream(mutated, writable: false);
+                global::Parquet.ParquetReader reader =
+                    await global::Parquet.ParquetReader.CreateAsync(probe, null, false, default);
+                await using (reader.ConfigureAwait(false))
+                {
+                    metadata = reader.Metadata;
+                }
+            }
+            catch
+            {
+                continue; // Cannot even open: the failure-path probe owns this one, not the ordering.
+            }
+
+            if (!ParquetEncryption.IsPlaintextFooterEncrypted(metadata))
+            {
+                continue;
+            }
+
+            classifierAloneWouldMisclassify.Add((i, byteOffset, bit));
+
+            // (b) The door must still fail closed as MALFORMED — the schema probe rejects it first.
+            await Assert.ThrowsAsync<DeltaProtocolException>(
+                () => DeltaCheckpointReader.ReadAsync(new MemoryStream(mutated), default));
+        }
+
+        // (a) Non-vacuity: the schema probe is the SOLE control for these flips.
+        Assert.NotEmpty(classifierAloneWouldMisclassify);
+
+        // (c) Identity: the set is exactly this, not merely non-empty. Independently measured by the
+        // Architect, Security, Balanced and Quality seats and by three red-team gate runs.
+        //
+        // Measured direction of travel, so a future reader knows what a failure here means. Reverting the
+        // union rule to bare presence — the MAXIMAL classifier, which calls every non-null algorithm
+        // encrypted — leaves this set byte-identical, so on this corpus the set cannot GROW from a
+        // classifier change: these 4 are every flip that produces a non-null encryption_algorithm at all.
+        // It can only SHRINK (a precision change; (a) catches a shrink to empty and (c) catches a shrink
+        // to a proper subset) or MOVE (the corpus changed). Note the seed is not free either: seed 6 over
+        // this corpus hits the unbounded-CreateAsync hang tracked in #699, so re-seeding to make this pass
+        // is not an option that exists.
+        Assert.Equal(
+            new[] { (45, 2982, 5), (289, 2428, 7), (306, 2430, 5), (353, 2546, 7) },
+            classifierAloneWouldMisclassify);
+    }
+
+    [Fact]
+    public async Task EncryptionAlgorithmWithNoRowGroupsCheckpoint_FailsClosed_AsUnsupportedFeature()
+    {
+        // #698 gate finding — the zero-column-chunk gap in the narrowed union rule. The footer carries a
+        // non-null encryption_algorithm whose known union members are both null (the shape an unknown FUTURE
+        // algorithm id takes) AND no row groups, which empties the per-column CryptoMetadata backstop the
+        // narrowing relies on: with no columns, "every encrypted column carries crypto_metadata" is vacuously
+        // true and vouches for nothing. Where the backstop cannot speak the classifier must fall back to bare
+        // presence and fail CLOSED.
+        // RED-on-revert: drop the third arm (return false instead of the bare-presence fallback) and this
+        // checkpoint is read as ordinary plaintext, so no exception is thrown at all.
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(1, 2)
+            .Metadata("t", EmptySchema)
+            .Add("a.parquet", size: 1)
+            .ToParquetAsync();
+        byte[] forged = await ParquetTestHelpers.EmptyEncryptionAlgorithmUnionNoRowGroupsFileAsync(parquet);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(forged), default));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task PlaintextFooterEncryptedCheckpoint_AesGcmCtrV1_IsUnsupportedFeature()
+    {
+        // #698 review FIX 7 — pins the SECOND union disjunct. parquet.thrift defines EncryptionAlgorithm as
+        // exactly {AES_GCM_V1, AES_GCM_CTR_V1}; the other fixtures all use the former, so without this one a
+        // future edit could drop the AESGCMCTRV1 arm of the classifier and no test would notice.
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(1, 2)
+            .Metadata("t", EmptySchema)
+            .Add("a.parquet", size: 1)
+            .ToParquetAsync();
+        byte[] encrypted = await ParquetTestHelpers.PlaintextFooterEncryptedCtrFileAsync(parquet);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(encrypted), default));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("malformed", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task EmptyEncryptionAlgorithmUnionCheckpoint_IsNotClassifiedEncrypted()
+    {
+        // #698 review FIX 4 — precision guard on the SUCCESS-path arm, independent of the schema-first
+        // ordering. The footer carries a NON-NULL encryption_algorithm whose union has NEITHER member set:
+        // the shape a corrupt footer parses into, and the shape every observed single-bit-flip false positive
+        // took. Everything else in the footer is intact, so the file opens AND its schema materializes —
+        // schema-first therefore does NOT reject it, leaving the union-non-empty rule as the only control
+        // that can. Post-fix the marker is correctly ignored and the checkpoint simply reads.
+        // RED-on-revert: relax IsPlaintextFooterEncrypted back to bare `EncryptionAlgorithm is not null` and
+        // this read throws UnsupportedFeature on a file that is not encrypted.
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(1, 2)
+            .Metadata("t", EmptySchema)
+            .Add("a.parquet", size: 1)
+            .ToParquetAsync();
+        byte[] forged = await ParquetTestHelpers.EmptyEncryptionAlgorithmUnionFileAsync(parquet);
+
+        IReadOnlyList<DeltaAction> actions =
+            await DeltaCheckpointReader.ReadAsync(new MemoryStream(forged), default);
+
+        // The real markers still round-trip, so the door must produce the same actions as the unforged file.
+        Assert.Equal(3, actions.Count);
+        Assert.Contains(actions, a => a is AddFileAction { Path: "a.parquet" });
+    }
+
+    [Fact]
+    public async Task EncryptedCheckpoint_Message_IsFixed_AndEchoesNoCheckpointContent()
+    {
+        // #653 hygiene on the NEW classification: the surfaced text must be a FIXED, presence-only diagnosis.
+        // The sentinel action path is genuinely attacker-influenced AND genuinely present in the footer this
+        // door parsed (Parquet writes column statistics — min/max of the path column — into the footer), so
+        // its absence from the message is a real no-echo proof, not a vacuous one. Exact-equality additionally
+        // proves nothing is interpolated, and the null inner proves no raw library fault rides along.
+        const string sentinel = "s3://tenant-42/secret-prefix/leak-me.parquet";
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(1, 2)
+            .Metadata("t", EmptySchema)
+            .Add(sentinel, size: 1)
+            .ToParquetAsync();
+        byte[] encrypted = await ParquetTestHelpers.PlaintextFooterEncryptedFileAsync(parquet);
+
+        // Pin the no-echo proof to the exact bytes this door PARSED — the trailing footer of the file it was
+        // handed — not merely to the file as a whole (where the sentinel also sits in the data pages). If
+        // Parquet ever stopped writing the path column's statistics into the footer, a whole-file assertion
+        // would still pass while the proof quietly evaporated; this slice cannot go vacuous without failing.
+        int footerLength = BitConverter.ToInt32(encrypted, encrypted.Length - 8);
+        int footerStart = encrypted.Length - 8 - footerLength;
+        Assert.Contains(
+            sentinel,
+            System.Text.Encoding.UTF8.GetString(encrypted, footerStart, footerLength),
+            StringComparison.Ordinal);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(encrypted), default));
+
+        Assert.Equal(
+            "Parquet Modular Encryption is not supported: the file uses plaintext-footer encryption "
+            + "(the footer carries Parquet Modular Encryption metadata). DeltaSharp cannot read encrypted "
+            + "Parquet files.",
+            error.Message);
+        Assert.DoesNotContain(sentinel, error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("tenant-42", error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("encryption_algorithm", error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("AESGCM", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Null(error.InnerException);
+    }
+
+    [Fact]
+    public async Task NormalCheckpoint_WithoutEncryptionMetadata_ReadsNormally_NoFalsePositive()
+    {
+        // Precision guard: the SAME checkpoint the encrypted fixtures are spliced from must still read — only
+        // the spliced crypto field flips the classification, so the classifier cannot be firing on "any
+        // checkpoint" or on a merely-successful open.
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(1, 2)
+            .Metadata("t", EmptySchema)
+            .Add("a.parquet", size: 1)
+            .ToParquetAsync();
+
+        IReadOnlyList<DeltaAction> actions = await DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default);
+
+        Assert.Single(actions.OfType<AddFileAction>(), a => a.Path == "a.parquet");
+    }
+
+    [Fact]
+    public async Task CorruptCheckpoint_StaysMalformed_NotReclassifiedAsEncryption()
+    {
+        // Precision guard on the other side: genuine corruption must NOT be relabeled "encrypted". A
+        // bit-flipped trailing footer LENGTH is the adversarial case for the footer probe (it reads that
+        // length), and a plain garbage stream is the baseline — both stay MalformedAction.
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(1, 2)
+            .Metadata("t", EmptySchema)
+            .Add("a.parquet", size: 1)
+            .ToParquetAsync();
+        parquet[^5] ^= 0xFF; // last byte of the 4-byte footer length, just before the trailing 'PAR1'
+
+        DeltaProtocolException flipped = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default));
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, flipped.Kind);
+
+        DeltaProtocolException garbage = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream("not a parquet file"u8.ToArray()), default));
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, garbage.Kind);
     }
 
     private const string EmptySchema = """{"type":"struct","fields":[]}""";

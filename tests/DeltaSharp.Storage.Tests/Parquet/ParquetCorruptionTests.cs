@@ -591,6 +591,62 @@ public sealed class ParquetCorruptionTests
     }
 
     [Fact]
+    public async Task EncryptionAlgorithmWithNoRowGroups_FailsClosed_AsUnsupportedFeature()
+    {
+        // #698 gate finding — the same zero-column-chunk gap on the DATA-FILE door, which shares the
+        // classifier. Non-null encryption_algorithm with both known union members null (an unknown future
+        // algorithm id) and no row groups, so the per-column backstop is vacuous. Must fail closed rather
+        // than read as an ordinary empty plaintext file.
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] forged = await ParquetTestHelpers.EmptyEncryptionAlgorithmUnionNoRowGroupsFileAsync(file);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(forged, schema));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task PlaintextFooterEncryption_AesGcmCtrV1_IsUnsupportedFeature()
+    {
+        // #698 review FIX 7 — the same second-disjunct guard on the DATA-FILE door, which shares the
+        // classifier. AES_GCM_CTR_V1 is the other algorithm parquet.thrift's union defines; it must classify
+        // identically to AES_GCM_V1.
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3, 4, 5 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] encrypted = await ParquetTestHelpers.PlaintextFooterEncryptedCtrFileAsync(file);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(encrypted, schema));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("malformed", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task EmptyEncryptionAlgorithmUnion_IsNotClassifiedEncrypted()
+    {
+        // #698 review FIX 4 — the same precision guard on the DATA-FILE door, which shares the classifier.
+        // encryption_algorithm is present but its union is EMPTY: not a shape any real encryptor writes (per
+        // parquet.thrift exactly one member is always set), only a shape corruption parses into. The rest of
+        // the footer is untouched, so the file opens and its schema materializes — the read must succeed and
+        // return the original rows rather than being mislabelled UnsupportedFeature.
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3, 4, 5 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] forged = await ParquetTestHelpers.EmptyEncryptionAlgorithmUnionFileAsync(file);
+
+        IReadOnlyList<ColumnBatch> read = await ParquetTestHelpers.ReadAllAsync(forged, schema);
+
+        Assert.Equal(5, read.Sum(b => b.RowCount));
+    }
+
+    [Fact]
     public async Task PlaintextFooterEncryption_ThroughReadDataSchemaAsync_IsUnsupportedFeature()
     {
         // The footer-only schema door funnels through the SAME OpenAsync classifier — UnsupportedFeature, not
@@ -1003,35 +1059,36 @@ public sealed class ParquetCorruptionTests
         // ex.Message: only a file bracketed by 'PARE' head AND tail is detected; a 'PARE' head with a
         // non-'PARE' tail, a 'PARE'-only truncated file, a 'PAR1' head (even with a garbage footer), arbitrary
         // garbage, and a too-short input are NOT — so each keeps the CorruptData default. This pins the
-        // precision boundary (head-and-tail) at the classifier itself.
+        // precision boundary (head-and-tail) at the shared ParquetEncryption classifier itself (#681 moved
+        // it there from ParquetFileReader so both reader doors apply the identical rule).
         using (var pare = new MemoryStream(ParquetTestHelpers.EncryptedFooterMagicFile()))
         {
-            Assert.True(ParquetFileReader.IsParquetEncryptedFooterMagic(pare));
+            Assert.True(ParquetEncryption.IsParquetEncryptedFooterMagic(pare));
         }
 
         using (var pareHeadOnly = new MemoryStream(ParquetTestHelpers.PareHeadOnlyFile()))
         {
-            Assert.False(ParquetFileReader.IsParquetEncryptedFooterMagic(pareHeadOnly)); // non-'PARE' tail
+            Assert.False(ParquetEncryption.IsParquetEncryptedFooterMagic(pareHeadOnly)); // non-'PARE' tail
         }
 
         using (var pareTruncated = new MemoryStream(ParquetTestHelpers.PareHeadTruncatedFile()))
         {
-            Assert.False(ParquetFileReader.IsParquetEncryptedFooterMagic(pareTruncated)); // < 8 bytes
+            Assert.False(ParquetEncryption.IsParquetEncryptedFooterMagic(pareTruncated)); // < 8 bytes
         }
 
         using (var par1 = new MemoryStream(ParquetTestHelpers.Par1MagicGarbageFooterFile()))
         {
-            Assert.False(ParquetFileReader.IsParquetEncryptedFooterMagic(par1));
+            Assert.False(ParquetEncryption.IsParquetEncryptedFooterMagic(par1));
         }
 
         using (var garbage = new MemoryStream("this is not a parquet file"u8.ToArray()))
         {
-            Assert.False(ParquetFileReader.IsParquetEncryptedFooterMagic(garbage));
+            Assert.False(ParquetEncryption.IsParquetEncryptedFooterMagic(garbage));
         }
 
         using (var tooShort = new MemoryStream(new byte[] { 0x50, 0x41 })) // "PA" — fewer than 4 magic bytes
         {
-            Assert.False(ParquetFileReader.IsParquetEncryptedFooterMagic(tooShort));
+            Assert.False(ParquetEncryption.IsParquetEncryptedFooterMagic(tooShort));
         }
 
         // The peek is TRANSPARENT: it seeks to read the head and tail, then restores the caller's position, so
@@ -1040,7 +1097,7 @@ public sealed class ParquetCorruptionTests
         using (var pareMidPosition = new MemoryStream(ParquetTestHelpers.EncryptedFooterMagicFile()))
         {
             pareMidPosition.Position = 3;
-            Assert.True(ParquetFileReader.IsParquetEncryptedFooterMagic(pareMidPosition));
+            Assert.True(ParquetEncryption.IsParquetEncryptedFooterMagic(pareMidPosition));
             Assert.Equal(3, pareMidPosition.Position);
         }
     }
