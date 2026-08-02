@@ -51,6 +51,18 @@ internal enum DeltaProtocolErrorKind
 /// the exact reader/writer version or feature name so the failure is precise and actionable — the
 /// reader always fails closed on an unsupported or corrupt log rather than silently degrading.
 /// </summary>
+/// <remarks>
+/// <b>Message hygiene obligation (#747):</b> every factory that accepts a fully-composed
+/// <c>string message</c> passes it verbatim to <see cref="Exception.Message"/>. Any
+/// caller-supplied token that is attacker-influenceable (a version number, a content-derived
+/// string from a foreign <c>_delta_log</c>) MUST be routed through
+/// <see cref="DiagnosticText.Sanitize"/> — or a stronger primitive — BEFORE interpolation.
+/// For unsupported reader/writer <em>feature name lists</em>, call
+/// <see cref="UnsupportedFeatures"/> instead; it applies <see cref="DiagnosticText.SanitizeAndJoin"/>
+/// which also bounds list length (#666). Call sites known as of <c>76d2c8e</c> are verified by
+/// <c>StorageMessageHygieneTests</c> and <c>StorageHygieneSweepTests</c>; new call sites carry
+/// the same obligation.
+/// </remarks>
 internal sealed class DeltaProtocolException : Exception
 {
     private DeltaProtocolException(DeltaProtocolErrorKind kind, string message, Exception? innerException)
@@ -63,21 +75,23 @@ internal sealed class DeltaProtocolException : Exception
     public DeltaProtocolErrorKind Kind { get; }
 
     /// <summary>
-    /// Renders this exception WITHOUT its <see cref="Exception.InnerException"/> chain (#664, RF-8b parity):
-    /// the <see cref="Exception.Message"/> is authored by factory methods whose call sites sanitize
-    /// attacker-influenceable tokens (e.g. foreign protocol feature names from the <c>_delta_log</c> — verified by
-    /// <c>StorageMessageHygieneTests</c> for DeltaProtocolException producers,
-    /// <c>StorageHygieneSweepTests</c> for DeltaStorageException producers; #745/#749); the raw cause (e.g. a JSON
-    /// parse error over crafted commit bytes) is retained as the inner for server-side diagnostics; the
-    /// default <c>ToString()</c> / <c>ILogger.LogError(ex, …)</c> would re-surface it. The inner remains
-    /// reachable via <see cref="Exception.InnerException"/>.
+    /// Renders this exception without its <see cref="Exception.InnerException"/> chain.
     /// </summary>
+    /// <remarks>
+    /// The <see cref="Exception.Message"/> is authored by factory methods whose call sites sanitize
+    /// attacker-influenceable tokens (e.g. a version number or content from a foreign <c>_delta_log</c>
+    /// — verified by <c>StorageMessageHygieneTests</c> and <c>StorageHygieneSweepTests</c> for known
+    /// producers; see the type-level <c>&lt;remarks&gt;</c> for the full obligation — #745/#749); the raw
+    /// cause (e.g. a JSON parse error over crafted commit bytes) is retained as the inner for
+    /// server-side diagnostics; the default <c>ToString()</c> / <c>ILogger.LogError(ex, …)</c> would
+    /// re-surface it. The inner remains reachable via <see cref="Exception.InnerException"/>.
+    /// </remarks>
     public override string ToString() => DiagnosticText.DescribeWithoutInner(this, Kind.ToString());
 
     /// <summary>A malformed/truncated commit line or checkpoint action.</summary>
     /// <remarks><b>Message hygiene obligation (#747):</b> the <paramref name="message"/> is
-    /// accepted fully-composed; any attacker-influenceable token (e.g. a protocol feature name,
-    /// a version number, or content from a foreign <c>_delta_log</c>) MUST be routed through
+    /// accepted fully-composed; any attacker-influenceable token (e.g. a version number, a column name,
+    /// or content from a foreign <c>_delta_log</c>) MUST be routed through
     /// <see cref="DiagnosticText.Sanitize"/> by the caller before interpolation. Verified for
     /// known call sites by <c>StorageMessageHygieneTests</c>.</remarks>
     public static DeltaProtocolException Malformed(string message, Exception? innerException = null) =>
@@ -85,18 +99,20 @@ internal sealed class DeltaProtocolException : Exception
 
     /// <summary>An unsupported reader/writer protocol version or named table feature (fail closed).</summary>
     /// <remarks><b>Message hygiene obligation (#747):</b> the <paramref name="message"/> is
-    /// accepted fully-composed; any attacker-influenceable token (e.g. a protocol feature name,
-    /// a version number, or content from a foreign <c>_delta_log</c>) MUST be routed through
-    /// <see cref="DiagnosticText.Sanitize"/> by the caller before interpolation. Verified for
-    /// known call sites by <c>StorageMessageHygieneTests</c>.</remarks>
+    /// accepted fully-composed; any attacker-influenceable token (e.g. a version number or
+    /// content from a foreign <c>_delta_log</c>) MUST be routed through
+    /// <see cref="DiagnosticText.Sanitize"/> by the caller before interpolation. For reader/writer
+    /// <em>feature name lists</em>, call <see cref="UnsupportedFeatures"/> — it sanitizes each
+    /// item AND bounds list length (#666); do not hand-sanitize a feature list into this overload.
+    /// Verified for known call sites by <c>StorageMessageHygieneTests</c>.</remarks>
     public static DeltaProtocolException Unsupported(string message) =>
         new(DeltaProtocolErrorKind.UnsupportedProtocol, message, innerException: null);
 
     /// <summary>A commit that changes committed data on an append-only table (<c>delta.appendOnly=true</c>),
     /// refused fail-closed (#549).</summary>
     /// <remarks><b>Message hygiene obligation (#747):</b> the <paramref name="message"/> is
-    /// accepted fully-composed; any attacker-influenceable token (e.g. a protocol feature name,
-    /// a version number, or content from a foreign <c>_delta_log</c>) MUST be routed through
+    /// accepted fully-composed; any attacker-influenceable token (e.g. a version number, a column name,
+    /// or content from a foreign <c>_delta_log</c>) MUST be routed through
     /// <see cref="DiagnosticText.Sanitize"/> by the caller before interpolation. Verified for
     /// known call sites by <c>StorageMessageHygieneTests</c>.</remarks>
     public static DeltaProtocolException AppendOnly(string message) =>
@@ -126,14 +142,16 @@ internal sealed class DeltaProtocolException : Exception
 
     /// <summary>An internally inconsistent reconstructed log.</summary>
     /// <remarks><b>Message hygiene obligation (#747):</b> the <paramref name="message"/> is
-    /// accepted fully-composed; any attacker-influenceable token must be sanitized by the caller
+    /// accepted fully-composed; any attacker-influenceable token (e.g. a version number, a column name,
+    /// or content from a foreign <c>_delta_log</c>) must be sanitized by the caller
     /// before interpolation. Verified for known call sites by <c>StorageMessageHygieneTests</c>.</remarks>
     public static DeltaProtocolException Inconsistent(string message, Exception? innerException = null) =>
         new(DeltaProtocolErrorKind.InconsistentLog, message, innerException);
 
     /// <summary>A time-travel target older than the earliest retained log (a log-cleanup retention gap).</summary>
     /// <remarks><b>Message hygiene obligation (#747):</b> the <paramref name="message"/> is
-    /// accepted fully-composed; any attacker-influenceable token must be sanitized by the caller
+    /// accepted fully-composed; any attacker-influenceable token (e.g. a version number, a column name,
+    /// or content from a foreign <c>_delta_log</c>) must be sanitized by the caller
     /// before interpolation. Verified for known call sites by <c>StorageMessageHygieneTests</c>.</remarks>
     public static DeltaProtocolException RetentionGap(string message) =>
         new(DeltaProtocolErrorKind.RetentionGap, message, innerException: null);

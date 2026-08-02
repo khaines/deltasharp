@@ -437,28 +437,35 @@ public sealed class SharedDiagnosticTextContractTests
     }
 
     [Fact]
-    public void SanitizeAndJoin_LazyPath_BoundsAllocationRegardlessOfSequenceLength()
+    public void SanitizeAndJoin_LazyPath_AllocationIsBoundedByMaxItems_NotBySequenceLength()
     {
-        // #767: the lazy path must NOT materialize the full sequence. 1_000_000 tokens, maxItems=16.
-        // Verify: (a) elision marker is produced, (b) correct count, (c) only maxItems tokens appear
-        // in the output (structural bound — allocation measurement is too environment-sensitive for CI).
-        int yielded = 0;
-        IEnumerable<string> LazyTokens()
+        // #767 ALLOCATION ORACLE. The structural sibling cannot kill the regression it names:
+        // streaming and materializing are output-EQUIVALENT, so no assertion over the result string
+        // separates them. GC.GetAllocatedBytesForCurrentThread is exact byte accounting, not timing,
+        // so this is deterministic. The fixed pool makes the generator itself allocation-free; the only
+        // allocation attributable to the call is the primitive's own.
+        // Streaming measures ~1.2 KB; materializing 1e6 refs measures ~16.8 MB. 64 KB threshold
+        // is ~4 orders of magnitude clear of both — regression detector, not perf assertion.
+        const int N = 1_000_000;
+        string[] pool = Enumerable.Range(0, 64).Select(i => "tok-" + i).ToArray();
+        IEnumerable<string> Hostile()
         {
-            for (int i = 0; i < 1_000_000; i++)
-            {
-                yielded++;
-                yield return $"t{i}";
-            }
+            for (int i = 0; i < N; i++) { yield return pool[i & 63]; }
         }
 
-        string result = SharedDiagnosticText.SanitizeAndJoin(LazyTokens(), maxItemLength: 32, maxItems: 16);
+        _ = SharedDiagnosticText.SanitizeAndJoin(Hostile(), maxItemLength: 32, maxItems: 16); // warm JIT
 
-        Assert.Equal(1_000_000, yielded); // fully enumerated (count-only tail)
-        Assert.Contains("(+", result);   // elision marker present
-        Assert.Contains("+999984 more)", result); // exact tail count
-        // Only 16 tokens rendered — result does not contain token 17+
-        Assert.DoesNotContain("t16,", result);
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        string result = SharedDiagnosticText.SanitizeAndJoin(Hostile(), maxItemLength: 32, maxItems: 16);
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.Contains("(+999984 more)", result, StringComparison.Ordinal);
+
+        Assert.True(
+            allocated < 64 * 1024,
+            $"SanitizeAndJoin allocated {allocated:N0} bytes for {N:N0}-token lazy sequence at maxItems=16; "
+            + "expected < 65536. Allocation must be bounded by maxItems, not by sequence length (#767): "
+            + "the lazy path has been reverted to materializing the hostile tail.");
     }
 
     [Theory]
@@ -482,10 +489,15 @@ public sealed class SharedDiagnosticTextContractTests
         Assert.Equal(fast, slowPath);
     }
 
-    [Fact]
-    public void SanitizeAndJoin_NegativeMaxItems_Throws()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void SanitizeAndJoin_NegativeMaxItems_ThrowsIdenticallyOnBothPaths(bool forceLazy)
     {
+        // Guard is before the branch split, so both paths must throw identically.
+        string[] tokens = ["a"];
+        IEnumerable<string> input = forceLazy ? tokens.Select(x => x) : tokens;
         Assert.Throws<ArgumentOutOfRangeException>(
-            () => SharedDiagnosticText.SanitizeAndJoin(new[] { "a" }, maxItemLength: 32, maxItems: -1));
+            () => SharedDiagnosticText.SanitizeAndJoin(input, maxItemLength: 32, maxItems: -1));
     }
 }

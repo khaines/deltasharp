@@ -141,7 +141,7 @@ internal static class DiagnosticText
     /// innocent in-root <c>passwd</c> would all render <c>'passwd'</c>. So the structural facts are kept
     /// alongside the omission — whether the path was rooted, how many parent traversals it used, how many
     /// directories were dropped, and whether it sits under a DeltaSharp-generated control directory. Every one
-    /// of those is a count or a fixed literal, so none of it can carry table data. A caller therefore does NOT
+    /// of those is a count or a fixed literal; a directory count may reflect the number of separator characters in a withheld name (a weak cardinality signal, not the name itself — see the #719 decision block), and fixed literals are DeltaSharp-authored. A caller therefore does NOT
     /// need a second, shape-preserving renderer for control paths: a poisoned <c>add.path</c> such as
     /// <c>email=alice%40example.com/../../../etc/passwd</c> reaches the confinement guard WITH a partition
     /// value attached, so a "control paths may echo raw" branch would reopen the disclosure this method

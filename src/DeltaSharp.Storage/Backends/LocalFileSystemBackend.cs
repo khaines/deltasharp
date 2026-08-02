@@ -1124,7 +1124,7 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
     // separator has yet appeared in the current forward-slash segment. After that, everything further along
     // the run is value content and a `\` would invent a synthetic sub-key inside it.
     //
-    // MECHANISM 7. add.path is RELATIVE by the Delta protocol, so a message may begin with its first
+    // MECHANISM 7 (from PathDisclosureHygieneTests.Redact_RootlessRelativePath_RedactsTheFirstSegmentToo). add.path is RELATIVE by the Delta protocol, so a message may begin with its first
     // `key=value` segment. Branch 5 (RootlessPathValue) therefore takes its path evidence from the RIGHT: a
     // following `/...` proves a path continues without weakening the anchored branches above it.
     // PathRegionStart lets that branch open at the start of input, after a quote, or after whitespace.
@@ -1175,7 +1175,7 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
     //
     //   1. value classes, all six branches       [^/]*            admits \ -- a value may contain one
     //   2. branch 1 right anchor                 (?=/)            excludes \ -- it must not END a value
-    //   3. ClosingQuoteValue right anchor        \k<oq>(?:[/\\\\s]...) admits \ AFTER the closing
+    //   3. ClosingQuoteValue right anchor        \k<oq>(?:[/\\\s]|$|[.,:;)\]]) admits \ AFTER the closing
     //                                            quote, where it is past the value and cannot truncate it
     //   4. branches 1 and 4 left anchor          (?<=[/\\])       admits \, guarded (below)
     //   5. QuotedPathPrefix left anchor          [/\\]           admits \, guarded (below)
