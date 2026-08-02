@@ -20,7 +20,9 @@
 > [14](../checklists/14-tenant-isolation-checklist.md). Read with
 > [execution-boundaries.md](execution-boundaries.md) (the `ExecutionMetrics`/stage seam these conventions
 > attach to) and [engine-architecture.md](engine-architecture.md). Update it whenever a telemetry name,
-> attribute key, redaction rule, propagation rule, or the `DeltaSharpTelemetry` registry changes.
+> attribute key, redaction rule, propagation rule, or the `DeltaSharpTelemetry` registry changes. The
+> `.Message`-only sink contract for storage exceptions has its own operator-facing page:
+> [storage-exception-log-routing.md](storage-exception-log-routing.md).
 
 This document defines the OpenTelemetry .NET conventions DeltaSharp components follow when they emit
 **logs**, **metrics**, and **traces**, plus the **correlation** and **redaction** rules that tie those
@@ -38,10 +40,23 @@ document is the source of truth for how they are used.
 
 ## Scope and status
 
-These are **conventions and scaffolding**, not a running telemetry pipeline. No component ships a `Meter`
-or `ActivitySource` yet; there is no `Microsoft.Extensions.Logging` dependency in the tree today. The
-rules below apply the moment the first instrumented component lands, and reviewers apply them to any PR
-that adds logging, metrics, or tracing.
+These are **conventions**, and most of the tree is still scaffolding against them — but the storage layer
+now instruments against them for real, so read them as binding rather than aspirational.
+`DeltaStorageTelemetry` (`src/DeltaSharp.Storage/Diagnostics/DeltaStorageTelemetry.cs`, introduced by
+STORY-05.3 / [#479](https://github.com/khaines/deltasharp/issues/479) and since extended to the
+maintenance paths) owns two `Meter`s and two `ActivitySource`s, named `DeltaSharp.Delta` and
+`DeltaSharp.Storage` off `DeltaSharpTelemetry.RootName`. `DeltaSharp.Storage` is also the one assembly
+that takes a `Microsoft.Extensions.Logging` dependency — **`.Abstractions` only**, for `ILogger<T>`, the
+`[LoggerMessage]` source generator, `EventId`, and `LogLevel`.
+
+What still does **not** exist is a running telemetry *pipeline*. As of **2026-08-02**, current-tree
+inspection finds no provider, formatter, sink, or exporter package in the root solution projects; the
+reviewed provider families are partially enforced by
+`StorageExceptionToStringTests.StorageAssembly_IsNonPackable_AndReviewedProviderFamiliesAreAbsent`.
+Every signal is therefore a safe no-op until a host wires one: a `Counter.Add`/`Histogram.Record` with no
+`MeterListener`, a `StartActivity` with no
+`ActivityListener`, and an `ILogger` call with no configured provider all perform no work. Reviewers
+apply these rules to any PR that adds logging, metrics, or tracing.
 
 ### What exists today, and what is deferred
 
@@ -51,6 +66,7 @@ that adds logging, metrics, or tracing.
 | Stage/metrics seam | `ExecutionMetrics` snapshot per action; `QueryExecutionStage` attribution; `ExecutionAudit` lazy/eager audit | Stage/task spans and instruments fed from the same values |
 | Correlation | Ambient `Activity` (if tracing enabled) within one process; no cross-process boundary yet | W3C Trace Context over gRPC + Arrow Flight; shuffle re-resolution spans ([ADR-0004](../../adr/0004-shuffle-architecture.md)) |
 | Redaction | Core/Executor: `SecretRedaction.RedactPath` (path/credential-scoped) in plan/diagnostic rendering; **Storage: `DiagnosticText.DescribePath`/`Sanitize`** (Storage cannot see `SecretRedaction`); SQL/rows/option values kept safe by never rendering them | Layer-appropriate path primitive at every log/metric/span path site — one per assembly reach, **not** one global (see storage-delta-architecture.md §5.3); credential-bearing URIs OUT OF SCOPE |
+| Storage telemetry | `DeltaStorageTelemetry` ships the `DeltaSharp.Delta` commit/VACUUM/OPTIMIZE/DELETE instruments and spans, plus the `LoggerMessage` log sites in `src/DeltaSharp.Storage/Diagnostics/` | Adapter and Parquet I/O instruments on the `DeltaSharp.Storage` meter/source, which are created (to fix the naming) but carry no instruments yet |
 
 This document changes **no public API**. `DeltaSharpTelemetry` is `internal`, so the
 `DeltaSharp.Abstractions` and `DeltaSharp.Core` PublicAPI baselines are unchanged (RS0016/RS0017 stay
@@ -314,6 +330,28 @@ rendering it**, not by a redactor:
   structural/redacted form or omit the identifier. Auditing the existing diagnostic-render paths against
   this rule once instrumentation is wired is tracked in
   [#455](https://github.com/khaines/deltasharp/issues/455).
+- **Exception objects are diagnostics too — let `Exception.ToString()` do the chain walk, never do it
+  yourself.** Treat every storage `Exception.Message` as untrusted tenant data: some tokens are routed
+  through `DiagnosticText.Sanitize`, others are interpolated raw, and the reviewed producer examples are
+  not exhaustive. Covered types can also carry a **raw, unsanitized** `Exception.InnerException`
+  (retained for server-side debugging) and raw typed properties (`.FilePath`, `.Path`, `.Constraint`,
+  `.ColumnName`). Known unsanitized producers and the full audit are tracked by
+  [#747](https://github.com/khaines/deltasharp/issues/747), with the complete producer inventory owned by
+  [#749](https://github.com/khaines/deltasharp/issues/749). The covered types' `ToString()` overrides cut
+  the chain, and that works because
+  `Exception.ToString()` recurses through the inner's *own* virtual `ToString()`. So the safe/unsafe axis
+  is **not** "renders vs reflects" — it is **"does the sink walk `.InnerException` itself"**:
+  - Safe: a sink that prints `.Message`, or calls `ToString()` **once** — the built-in console providers,
+    Serilog's default `{Exception}` token and JSON formatters, `Activity.AddException(ex)`.
+  - **Leaks:** a sink that enumerates the chain itself even while *rendering* each level — measured on
+    NLog's `${exception:maxInnerExceptionLevel=…}` and on Application Insights' `ExceptionDetails` list —
+    or that reflects over the object graph (a destructurer, `{@Ex}` in a Serilog template, an
+    object-graph serializer), which also reaches the raw typed properties.
+
+  For `ILogger` the **provider and its layout**, not the call, decide. The measured sink
+  matrix, the per-sink DO/DON'T rules, what a storage `.Message` still retains, and why there is no
+  analyzer for this live in
+  [storage-exception-log-routing.md](storage-exception-log-routing.md).
 - Redaction is **centralized and tested** *within each assembly's reach*: `SecretRedaction` has unit
   coverage (Core/Executor), and `DiagnosticText` has its own (`PathDisclosureHygieneTests`,
   `StorageHygieneSweepTests`); any new diagnostic path adds a redaction test (checklist
@@ -579,6 +617,8 @@ whenever it touches credentials, tenant routing, or storage paths, and
 - [11 — Documentation Support Checklist](../checklists/11-documentation-support-checklist.md)
 - [14 — Tenant Isolation Checklist](../checklists/14-tenant-isolation-checklist.md)
 - [execution-boundaries.md](execution-boundaries.md) — `ExecutionMetrics`, stage attribution, the driver
+- [storage-exception-log-routing.md](storage-exception-log-routing.md) — the `.Message`-only sink contract
+  for storage exceptions
 - `src/DeltaSharp.Abstractions/Diagnostics/DeltaSharpTelemetry.cs` — canonical telemetry names
 - `src/DeltaSharp.Core/Plans/Logical/SecretRedaction.cs` — centralized path redaction (Core/Executor)
 - `src/DeltaSharp.Storage/Delta/DiagnosticText.cs` — Storage-side path/schema redaction (`DescribePath`/`Sanitize`; Storage cannot see `SecretRedaction`)
