@@ -1,9 +1,9 @@
 # Storage exception log routing: the `.Message`-only sink contract
 
 > **Status:** living document (operator guidance). Created with
-> [#689](https://github.com/khaines/deltasharp/issues/689) as the operator-facing counterpart to the
+> [#689](https://github.com/khaines/deltasharp/issues/689) <!-- issue-state:closed --> as the operator-facing counterpart to the
 > per-type XML documentation added by [#688](https://github.com/khaines/deltasharp/pull/688)
-> ([#664](https://github.com/khaines/deltasharp/issues/664)); substantially corrected by
+> ([#664](https://github.com/khaines/deltasharp/issues/664) <!-- issue-state:closed -->); substantially corrected by
 > [#694](https://github.com/khaines/deltasharp/pull/694) — see
 > [What #694 corrected](#what-694-corrected-one-defect-class-six-symptoms). Grounded in the
 > message-hygiene work of #648/#651/#653/#667 and in `DiagnosticText.DescribeWithoutInner`
@@ -17,7 +17,7 @@
 > ownership, collection, review, failure-signal, residency, and erasure governance below that only the
 > deploying host can set, and a
 > `privacy-compliance-grc-lead` sign-off on the default recommendation is tracked in
-> [#744](https://github.com/khaines/deltasharp/issues/744). See
+> [#744](https://github.com/khaines/deltasharp/issues/744) <!-- issue-state:open -->. See
 > [What a storage `.Message` still retains](#what-a-storage-message-still-retains). Read with
 > [observability-conventions.md](observability-conventions.md) (the repo-wide logging, metrics, tracing,
 > and redaction rules) and [storage-delta-architecture.md](storage-delta-architecture.md) (the storage
@@ -254,7 +254,7 @@ which drops Hive partition values and keeps only the file/directory shape plus p
 `ColumnNotPresentInFile` routes the displayed column name through `DiagnosticText.Sanitize`, so line-break
 and format controls are neutralized there too. Backend write/publish and Parquet schema producers known as of `76d2c8e` are covered by the sweep or
 the Parquet-specific suites; new producers remain a reviewer obligation tracked by
-[#749](https://github.com/khaines/deltasharp/issues/749). None of these controls
+[#749](https://github.com/khaines/deltasharp/issues/749) <!-- issue-state:open -->. None of these controls
 removes the tenant's own data from a relative path or column name.
 
 **Consequences for routing:**
@@ -291,7 +291,7 @@ called compliant. This page cannot set these properties for you — it can only 
 | **Erasure path** | How a subject-erasure request reaches this sink | Enumerable by table and time window, and included in your DSAR/erasure runbook |
 
 `privacy-compliance-grc-lead` sign-off on recommended defaults for these obligations is tracked in
-[#744](https://github.com/khaines/deltasharp/issues/744). Until that lands, this page claims only
+[#744](https://github.com/khaines/deltasharp/issues/744) <!-- issue-state:open -->. Until that lands, this page claims only
 "reviewed against 07", not "satisfies 07".
 
 ## The residual: reflection over the exception graph
@@ -513,7 +513,7 @@ This reference recommendation is scoped to the **failure sites** described above
 every string field on every storage event as tenant-safe. `DeltaVacuumLog.VacuumCandidateDecision`
 (event 4102) previously emitted a listing-derived relative path in an unbounded `{Path}` field at Debug
 level, which could carry Hive partition values or line-break characters. **That was closed by #696** (now
-on `main`; [#750](https://github.com/khaines/deltasharp/issues/750) resolved): event 4102 now carries a
+on `main`; [#750](https://github.com/khaines/deltasharp/issues/750) <!-- issue-state:closed --> resolved): event 4102 now carries a
 `{CandidateDescription}` — a bounded, partition-value-free rendering via `DiagnosticText.DescribePath` —
 so there is no raw `Path` field to copy. **Operator action (do not skip):** erasure/retention evidence
 that projected the `Path` field of event 4102 now resolves **null** and MUST be repointed at
@@ -606,7 +606,7 @@ invisible-smuggling** class as well:
   zero-width characters (`U+200B`), and Unicode TAG characters (`U+E0000`–`U+E007F`). The sanitizer now
   neutralizes every `UnicodeCategory.Format` (`Cf`) code point to `U+FFFD`, read at the whole **code
   point** so astral TAG characters are caught too. This closed the gap this page originally tracked as open
-  in [#746](https://github.com/khaines/deltasharp/issues/746) (now resolved): the crafted
+  in [#746](https://github.com/khaines/deltasharp/issues/746) <!-- issue-state:closed --> (now resolved): the crafted
   `protocol.readerFeatures` → `SanitizeAndJoin` → `DeltaReadException` spoofing path is neutralized. The
   neutralization lives in the shared `DeltaSharp.Abstractions` primitive that both Storage and the Core SQL
   parser forward to, so the two recognizers cannot drift.
@@ -614,7 +614,7 @@ invisible-smuggling** class as well:
   producer that has not been reviewed for hygiene into a shared log stream should still encode on write
   to guard against line-break injection. The sanitizer covers all producers known as of `76d2c8e`;
   any future producer at a new guard is a reviewer obligation until it is added to the sweep.
-- **All producers known as of `76d2c8e` are covered ([#747](https://github.com/khaines/deltasharp/issues/747), completed — closes on PR merge).**
+- **All producers known as of `76d2c8e` are covered ([#747](https://github.com/khaines/deltasharp/issues/747) <!-- issue-state:closed -->, completed — closes on PR merge).**
   All `DeltaStorageException` and `DeltaProtocolException` factories that accept fully-composed messages
   carry an explicit hygiene obligation in the type-level XML `<remarks>`; their call sites pre-sanitize
   attacker-influenceable tokens before interpolation — verified by `StorageHygieneSweepTests` and
