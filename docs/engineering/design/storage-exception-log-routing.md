@@ -91,8 +91,9 @@ Exception and diagnostic message formatting follows a split rule:
   no culture risk.
 - **`string.Create(CultureInfo.InvariantCulture, ...)` is required** when interpolation is genuinely
   culture-sensitive — decimals/floats, or any value whose `ToString()` is locale-influenced (numeric
-  separators, sign marks, alternate digit forms). **Prefer** it for signed integers where the
-  non-negative guarantee is not type-enforced and not guarded explicitly.
+  separators, sign marks, alternate digit forms). **Prefer** it for signed integers that do not
+  satisfy any of the conditions above — i.e., where the non-negative guarantee is neither
+  type-enforced nor explicitly guarded.
 
 The goal is correctness and consistency, not blanket churn: this repository's dominant message style is
 bare interpolation, so converting isolated safe call sites to invariant formatting is noise without
