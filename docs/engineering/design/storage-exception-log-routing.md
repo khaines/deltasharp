@@ -74,6 +74,24 @@ test, the test is named inline.
 > [What a storage `.Message` still retains](#what-a-storage-message-still-retains) and
 > [Known gaps](#known-gaps-in-the-sanitizer-itself).
 
+## Exception/diagnostic message culture convention (#764)
+
+Exception and diagnostic message formatting follows a split rule:
+
+- **Bare interpolation (`$"..."`) is acceptable** when interpolation is culture-insensitive by construction
+  (for example non-negative integer counts/versions, or round-trip `:O` timestamps).
+- **`string.Create(CultureInfo.InvariantCulture, ...)` is required** when interpolation is
+  culture-sensitive (for example decimals/floats, values that may carry a sign, and path rendering).
+
+The goal is correctness and consistency, not blanket churn: this repository's dominant message style is
+bare interpolation, so converting isolated safe integer-only call sites to invariant formatting is
+noise-only. Apply invariant formatting where behavior can change with culture, and keep safe integer/timestamp
+diagnostics simple.
+
+**Analyzer policy (CA1305):** keep CA1305 scoped to culture-sensitive paths rather than enabling it as a
+global diagnostic over all exception text sites. A global CA1305 pass would mostly generate false positives
+for intentionally culture-insensitive integer-only diagnostics.
+
 ## Why the contract exists: the surfaced-message / raw-state split
 
 The storage decode and validation boundaries fail **closed** on malformed, foreign, or hostile input: a
