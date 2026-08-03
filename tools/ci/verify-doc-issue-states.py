@@ -75,11 +75,15 @@ def parse_docs_from_args(argv: list[str]) -> tuple[list[Path], list[str]]:
     return docs, errors
 
 
+def normalize_doc_key(path: Path) -> str:
+    return str(path.relative_to(REPO_ROOT)).replace("\\", "/").lower()
+
+
 def enforce_tracked_doc_scope(docs: list[Path], explicit_args: bool) -> list[str]:
     if not explicit_args:
         return []
-    tracked = {str(path.relative_to(REPO_ROOT)) for path in DOCS}
-    selected = {str(path.relative_to(REPO_ROOT)) for path in docs}
+    tracked = {normalize_doc_key(path) for path in DOCS}
+    selected = {normalize_doc_key(path) for path in docs}
     if not (tracked & selected):
         return []
     if tracked.issubset(selected):
@@ -118,13 +122,15 @@ def marker_after_link(
 def parse_expected_states(docs: list[Path]) -> tuple[list[ExpectedState], list[str]]:
     expected: list[ExpectedState] = []
     errors: list[str] = []
-    expected_by_doc = {str(doc.relative_to(REPO_ROOT)): 0 for doc in docs}
-    issue_frequencies_by_doc: dict[str, dict[int, int]] = {
-        str(doc.relative_to(REPO_ROOT)): {} for doc in docs
-    }
+    expected_by_doc = {normalize_doc_key(doc): 0 for doc in docs}
+    issue_frequencies_by_doc: dict[str, dict[int, int]] = {normalize_doc_key(doc): {} for doc in docs}
 
     for doc in docs:
-        text = doc.read_text(encoding="utf-8")
+        try:
+            text = doc.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError) as ex:
+            errors.append(f"{doc.relative_to(REPO_ROOT)}: unable to read markdown file: {ex}")
+            continue
         matches = list(GH_LINK_RE.finditer(text))
         for index, match in enumerate(matches):
             kind = match.group(1)
@@ -156,23 +162,25 @@ def parse_expected_states(docs: list[Path]) -> tuple[list[ExpectedState], list[s
                     line=link_line,
                 )
             )
-            doc_key = str(doc.relative_to(REPO_ROOT))
+            doc_key = normalize_doc_key(doc)
             expected_by_doc[doc_key] += 1
             issue_frequencies_by_doc[doc_key][issue] = (
                 issue_frequencies_by_doc[doc_key].get(issue, 0) + 1
             )
 
     for doc_path, expected_count in EXPECTED_ANNOTATED_COUNTS.items():
-        if doc_path in expected_by_doc and expected_by_doc[doc_path] != expected_count:
+        key = doc_path.lower()
+        if key in expected_by_doc and expected_by_doc[key] != expected_count:
             errors.append(
                 f"{doc_path}: expected {expected_count} annotated issue links, found "
-                f"{expected_by_doc[doc_path]}"
+                f"{expected_by_doc[key]}"
             )
     for doc_path, expected_frequencies in EXPECTED_ANNOTATED_ISSUE_FREQUENCIES.items():
-        if doc_path in issue_frequencies_by_doc and issue_frequencies_by_doc[doc_path] != expected_frequencies:
+        key = doc_path.lower()
+        if key in issue_frequencies_by_doc and issue_frequencies_by_doc[key] != expected_frequencies:
             errors.append(
                 f"{doc_path}: expected annotated issue frequencies {expected_frequencies}, found "
-                f"{issue_frequencies_by_doc[doc_path]}"
+                f"{issue_frequencies_by_doc[key]}"
             )
 
     return expected, errors
