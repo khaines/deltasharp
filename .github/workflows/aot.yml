@@ -48,8 +48,11 @@ jobs:
       # (build-test-format restores the solution with --locked-mode); this is a discard-only
       # trim/AOT-regression gate — the binary is asserted, never signed or published.
       # -warnaserror fails the publish on any IL2xxx/IL3xxx trim/AOT warning.
+      # Parquet.NET currently emits assembly-level IL2104/IL3053 warnings under NativeAOT analysis; this
+      # gate suppresses only those two third-party assembly-summary codes so app-level trim/AOT warnings
+      # remain fatal while the schema-json write-path smoke stays rooted in the binary.
       - name: Publish executor (NativeAOT linux-x64)
-        run: dotnet publish src/DeltaSharp.Executor -c Release -r linux-x64 -p:PublishAot=true -p:TreatWarningsAsErrors=true -warnaserror
+        run: dotnet publish src/DeltaSharp.Executor -c Release -r linux-x64 -p:PublishAot=true -p:TreatWarningsAsErrors=true -warnaserror -p:NoWarn='IL2104;IL3053'
 
       - name: Assert expected executable
         run: |
