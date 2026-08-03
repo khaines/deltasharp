@@ -66,6 +66,7 @@ jobs:
           echo "$output"
           echo "$output" | grep -qF "interpreted-vectorized (dynamic-code=False)"
           echo "$output" | grep -qF "affine(20)=41"
+          echo "$output" | grep -qF "storage schema-json write path: ok"
           # AC3: the optional CompiledBackend must be dead-code-eliminated from the native image.
           # Use `strings`, not `nm`: NativeAOT strips managed type names from the binary symbol table,
           # so `nm` yields a false-negative (a leaked managed type is invisible to it). The type name

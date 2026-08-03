@@ -88,6 +88,57 @@ public sealed class DeltaSchemaJsonTypedMetadataTests
     }
 
     [Fact]
+    public void ToJson_PerCallAllocation_StaysWithinCurrentHeadroom()
+    {
+        // #758 (pre-existing perf envelope): pin current allocation headroom so regressions are caught without
+        // requiring this follow-up to optimize the serializer internals.
+        var schema = new StructType(new[]
+        {
+            new StructField(
+                "everything",
+                DataTypes.LongType,
+                nullable: false,
+                FieldMetadata.FromValues(new[]
+                {
+                    new KeyValuePair<string, MetadataValue>("k.arr", MetadataValue.Array(new[]
+                    {
+                        MetadataValue.Long(1),
+                        MetadataValue.Double(2.5),
+                        MetadataValue.Boolean(true),
+                        MetadataValue.String("s"),
+                        MetadataValue.Null,
+                    })),
+                    new KeyValuePair<string, MetadataValue>("k.bool", MetadataValue.Boolean(false)),
+                    new KeyValuePair<string, MetadataValue>("k.double", MetadataValue.Double(3.0)),
+                    new KeyValuePair<string, MetadataValue>("k.long", MetadataValue.Long(7)),
+                    new KeyValuePair<string, MetadataValue>("k.nested", MetadataValue.Nested(FieldMetadata.FromValues(new[]
+                    {
+                        new KeyValuePair<string, MetadataValue>("inner.long", MetadataValue.Long(42)),
+                        new KeyValuePair<string, MetadataValue>("inner.str", MetadataValue.String("nested")),
+                    }))),
+                    new KeyValuePair<string, MetadataValue>("k.null", MetadataValue.Null),
+                    new KeyValuePair<string, MetadataValue>("k.string", MetadataValue.String("text")),
+                })),
+        });
+
+        const int iterations = 256;
+        _ = DeltaSchemaJson.ToJson(schema); // warm-up
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < iterations; i++)
+        {
+            _ = DeltaSchemaJson.ToJson(schema);
+        }
+
+        long after = GC.GetAllocatedBytesForCurrentThread();
+        long perCall = (after - before) / iterations;
+
+        Assert.True(
+            perCall <= 12_000,
+            $"SchemaJson.ToJson allocation headroom regressed: {perCall} B/call (budget: 12000 B/call).");
+    }
+
+    [Fact]
     public void BothWriters_EmitByteIdenticalMetadata_ForEveryValueKind()
     {
         // DIRECT parity: the engine's internal SchemaJson (visible here via InternalsVisibleTo) and
