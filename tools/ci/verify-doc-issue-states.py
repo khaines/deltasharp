@@ -22,7 +22,6 @@ STATE_MARKER_RE = re.compile(r"<!--\s*issue-state:(open|closed)\s*-->", re.IGNOR
 
 @dataclass(frozen=True)
 class ExpectedState:
-    kind: str
     issue: int
     expected: str
     file: Path
@@ -67,8 +66,6 @@ def marker_after_link(
         if i > 0 and item.strip() == "":
             break
         candidate_lines.append(item)
-        if i == 2:
-            break
     candidate = "\n".join(candidate_lines)
     marker = STATE_MARKER_RE.search(candidate)
     if marker is None:
@@ -107,7 +104,6 @@ def parse_expected_states(docs: list[Path]) -> tuple[list[ExpectedState], list[s
                 continue
             expected.append(
                 ExpectedState(
-                    kind=kind,
                     issue=issue,
                     expected=marker.group(1).lower(),
                     file=doc,
