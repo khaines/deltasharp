@@ -81,19 +81,22 @@ obligations described above.*
 
 Exception and diagnostic message formatting follows a split rule:
 
-- **Bare interpolation (`$"..."`) is acceptable** for unsigned integral types (`uint`, `ulong`) and
-  round-trip `:O` timestamps — values whose rendered form is culture-invariant by type. Bare
-  interpolation of signed `int`/`long` is also acceptable when the value is demonstrably non-negative
-  at the call site — for example, bounded by a preceding `ArgumentOutOfRangeException.ThrowIfNegative`
-  or similar guard, derived from an unsigned source, or constrained by a validated constructor
-  parameter. Note: on locales such as `ar-SA`, the sign-rendering path prepends a bidi-control
-  character for *negative* values — not positive ones — so a verified non-negative call site carries
-  no culture risk.
+- **Bare interpolation (`$"..."`) is acceptable** for unsigned integral types (`byte`, `ushort`,
+  `uint`, `ulong`, `nuint`) and round-trip `:O` timestamps — values whose rendered form is
+  culture-invariant by type. Bare interpolation of signed `int`/`long` is also acceptable when the
+  value is demonstrably non-negative at the call site — for example, bounded by a preceding
+  `ArgumentOutOfRangeException.ThrowIfNegative` or similar guard, derived from an unsigned source and
+  known to fit the signed range, or constrained by a validated constructor parameter. Note: on
+  locales such as `ar-SA`, the sign-rendering path prepends a bidi-control character for *negative*
+  values — not positive ones — so a verified non-negative call site carries no culture risk.
 - **`string.Create(CultureInfo.InvariantCulture, ...)` is required** when interpolation is genuinely
-  culture-sensitive — decimals/floats, or any value whose `ToString()` is locale-influenced (numeric
-  separators, sign marks, alternate digit forms). **Prefer** it for signed integers that do not
-  satisfy any of the conditions above — i.e., where the non-negative guarantee is neither
-  type-enforced nor explicitly guarded.
+  culture-sensitive — decimals/floats, or any value whose `ToString()` is locale-influenced through
+  numeric separators or alternate digit forms. **Prefer** it for signed integers that do not satisfy
+  any of the conditions above — i.e., where the non-negative guarantee is neither type-enforced nor
+  explicitly guarded. Signed-integer *sign-mark* divergence (the `ar-SA` bidi-control prefix above) is
+  deliberately placed in this lower **prefer** tier rather than **required**: it affects only the
+  leading sign of already-negative values, a low-risk rendering difference, so it warrants a default
+  toward invariant formatting without mandating churn at every unguarded signed-integer call site.
 
 The goal is correctness and consistency, not blanket churn: this repository's dominant message style is
 bare interpolation, so converting isolated safe call sites to invariant formatting is noise without
@@ -101,11 +104,16 @@ correctness benefit. Apply invariant formatting where culture can change behavio
 integer and timestamp diagnostics simple.
 
 **Analyzer policy (CA1305):** CA1305 (*SpecifyIFormatProvider*) is not enabled globally in this
-repository. A global pass would generate warnings for every bare integral interpolation — true positives
-from the analyzer's perspective (the type implements `IFormattable` and a culture-providing overload
-exists), but representing intentionally accepted low risk for unsigned integral types and guarded non-negative call sites.
-Enabling CA1305 globally would require suppressing a high volume of call sites with negligible
-real-world culture risk; instead, apply it selectively on culture-sensitive paths.
+repository, and it would not enforce this convention if it were. Modern C# lowers bare interpolation
+(`$"..."`) to `DefaultInterpolatedStringHandler`, which CA1305 does **not** flag — verified on this
+repo's toolchain (`net10.0`, `AnalysisLevel=latest`): with CA1305 raised to a warning, bare `int`,
+`uint`, `long`, and `double` interpolations produce zero CA1305 diagnostics, while explicit
+`int.ToString()` and `string.Format(...)` calls without an `IFormatProvider` are flagged. CA1305 is
+therefore blind to exactly the interpolation call sites this convention governs, and fires only on the
+comparatively rare explicit `ToString()`/`string.Format()` paths. Because the analyzer can neither
+catch the cases we care about nor distinguish a guarded non-negative site from a hazardous one, this
+convention is upheld by the split rule above and in code review rather than by a global CA1305 gate;
+apply invariant formatting selectively on genuinely culture-sensitive paths.
 
 ## Why the contract exists: the surfaced-message / raw-state split
 
