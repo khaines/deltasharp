@@ -87,10 +87,10 @@ internal static class WriteEntryPointRecorder
 
     /// <summary>Notes that <paramref name="method"/> on <paramref name="owner"/> was invoked.</summary>
     /// <remarks>
-    /// Calls sit immediately beside the invocation they describe, and
-    /// <c>RecordedEntryPoints_AreBackedByRealCalls</c> checks each recorded name against the IL of
-    /// the suite -- so a label that drifts away from the call it claims to describe fails rather
-    /// than quietly widening the reported coverage.
+    /// The binding is structural: <c>DriveAsync</c> resolves the <c>MethodInfo</c> from the
+    /// compiler-produced delegate and passes it here — so the label cannot drift away from the
+    /// call it describes. <c>RecordedEntryPoints_AreBackedByRealCalls</c> cross-checks each
+    /// recorded name against the IL of the suite, confirming the structural binding holds end-to-end.
     /// <para>
     /// The owning TYPE is recorded, not just the name, because the required side is derived from
     /// <c>SchemaJson.ToJson</c> call sites across all of <c>DeltaSharp.Storage</c> -- which span
