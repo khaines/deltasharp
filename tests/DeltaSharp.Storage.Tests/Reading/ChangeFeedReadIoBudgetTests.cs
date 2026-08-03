@@ -264,6 +264,140 @@ public sealed class ChangeFeedReadIoBudgetTests : IDisposable
     }
 
     [Fact]
+    public async Task Cdf_SubFloorScan_WhenEarliestEqualsStart_ReadsOnlyTheStraySubFloorCommitOnce()
+    {
+        // #760 pin: the earliest==start branch of the pre-range identity gate still has to scan any surviving
+        // sub-floor commit, but it must not reintroduce extra list/read passes. Layout:
+        // - reconstructable floor = 2 (checkpoint@2 + v0 aged out),
+        // - range = [2,2] (so earliest == start),
+        // - a retained sub-floor v1.json declares a forged identity.
+        //
+        // Expected read-phase budget:
+        // - exactly one _delta_log listing for the whole read path,
+        // - exactly one commit GET total (v1), because the read fails closed in the pre-range scan BEFORE the
+        //   in-range replay starts.
+        string SchemaJson(int idForId, int idForName) =>
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
+            + "{\"delta.columnMapping.id\":" + idForId.ToString(CultureInfo.InvariantCulture)
+            + ",\"delta.columnMapping.physicalName\":\"col-A\"}},"
+            + "{\"name\":\"name\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":" + idForName.ToString(CultureInfo.InvariantCulture)
+            + ",\"delta.columnMapping.physicalName\":\"col-B\"}}]}";
+        string MetaLine(int idForId, int idForName) =>
+            "{\"metaData\":{\"id\":\"rt\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
+            + "\"schemaString\":" + JsonSerializer.Serialize(SchemaJson(idForId, idForName))
+            + ",\"partitionColumns\":[],\"configuration\":{"
+            + "\"delta.columnMapping.mode\":\"id\",\"delta.columnMapping.maxColumnId\":\"2\","
+            + "\"delta.enableChangeDataFeed\":\"true\"}}}";
+
+        using var local = new LocalFileSystemBackend(_root);
+        await DeltaTestHarness.WriteCheckpointAsync(local, 2, new CheckpointFixture()
+            .Protocol(3, 7, new[] { "columnMapping" }, new[] { "columnMapping", "changeDataFeed" })
+            .Metadata(
+                "rt",
+                SchemaJson(1, 2),
+                partitionColumns: null,
+                configuration: new[]
+                {
+                    ("delta.columnMapping.mode", "id"),
+                    ("delta.columnMapping.maxColumnId", "2"),
+                    ("delta.enableChangeDataFeed", "true"),
+                }));
+        await DeltaTestHarness.WriteLastCheckpointAsync(local, 2);
+        await DeltaTestHarness.WriteCommitAsync(local, 1, MetaLine(2, 1)); // retained sub-floor forgery
+        await DeltaTestHarness.WriteCommitAsync(local, 2, DeltaTestHarness.Txn("floor", 2)); // keeps [2,2] retained
+
+        var counting = new CountingStorageBackend(local);
+        var log = new DeltaLog(counting);
+        var reader = new ChangeFeedReader(counting, "io-budget", log, new ParquetFileReader());
+
+        DeltaChangeFeedInfo info = await reader.ResolveAsync(
+            DeltaChangeFeedRange.FromVersion(2, 2), CancellationToken.None);
+        counting.Reset();
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(async () =>
+        {
+            await foreach (ColumnBatch batch in reader.ReadAsync(info, CancellationToken.None))
+            {
+                _ = batch;
+            }
+        });
+
+        Assert.Contains("column-mapping identity", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("version 1", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("_delta_log", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("col-A", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("col-B", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(1, counting.LogListings);
+        Assert.Equal(1, counting.CommitReads);
+        Assert.Equal(1, counting.CommitReadsOf(1));
+        Assert.Equal(0, counting.CommitReadsOf(2));
+    }
+
+    [Fact]
+    public async Task Cdf_SubFloorScan_WhenEarliestEqualsStart_ReadsAllRetainedSubFloorCommitsOnce_OnGreenPath()
+    {
+        // #760 companion pin: earliest==start without a forgery must still scan every retained sub-floor
+        // commit exactly once, then proceed into the in-range commit read without extra list/read passes.
+        // Layout:
+        // - reconstructable floor = 3 (checkpoint@3 + v0 aged out),
+        // - range = [3,3] (so earliest == start),
+        // - retained sub-floor v1 and v2 both preserve identity X (green path).
+        string SchemaJson(int idForId, int idForName) =>
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
+            + "{\"delta.columnMapping.id\":" + idForId.ToString(CultureInfo.InvariantCulture)
+            + ",\"delta.columnMapping.physicalName\":\"col-A\"}},"
+            + "{\"name\":\"name\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":" + idForName.ToString(CultureInfo.InvariantCulture)
+            + ",\"delta.columnMapping.physicalName\":\"col-B\"}}]}";
+        string MetaLine(int idForId, int idForName) =>
+            "{\"metaData\":{\"id\":\"rt\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
+            + "\"schemaString\":" + JsonSerializer.Serialize(SchemaJson(idForId, idForName))
+            + ",\"partitionColumns\":[],\"configuration\":{"
+            + "\"delta.columnMapping.mode\":\"id\",\"delta.columnMapping.maxColumnId\":\"2\","
+            + "\"delta.enableChangeDataFeed\":\"true\"}}}";
+
+        using var local = new LocalFileSystemBackend(_root);
+        await DeltaTestHarness.WriteCheckpointAsync(local, 3, new CheckpointFixture()
+            .Protocol(3, 7, new[] { "columnMapping" }, new[] { "columnMapping", "changeDataFeed" })
+            .Metadata(
+                "rt",
+                SchemaJson(1, 2),
+                partitionColumns: null,
+                configuration: new[]
+                {
+                    ("delta.columnMapping.mode", "id"),
+                    ("delta.columnMapping.maxColumnId", "2"),
+                    ("delta.enableChangeDataFeed", "true"),
+                }));
+        await DeltaTestHarness.WriteLastCheckpointAsync(local, 3);
+        await DeltaTestHarness.WriteCommitAsync(local, 1, MetaLine(1, 2)); // retained sub-floor, identity X
+        await DeltaTestHarness.WriteCommitAsync(local, 2, MetaLine(1, 2)); // retained sub-floor, identity X
+        await DeltaTestHarness.WriteCommitAsync(local, 3, DeltaTestHarness.Txn("floor", 3)); // in-range commit
+
+        var counting = new CountingStorageBackend(local);
+        var log = new DeltaLog(counting);
+        var reader = new ChangeFeedReader(counting, "io-budget", log, new ParquetFileReader());
+
+        DeltaChangeFeedInfo info = await reader.ResolveAsync(
+            DeltaChangeFeedRange.FromVersion(3, 3), CancellationToken.None);
+        counting.Reset();
+
+        await foreach (ColumnBatch batch in reader.ReadAsync(info, CancellationToken.None))
+        {
+            _ = batch;
+        }
+
+        Assert.Equal(1, counting.LogListings);
+        Assert.Equal(3, counting.CommitReads);
+        Assert.Equal(1, counting.CommitReadsOf(1));
+        Assert.Equal(1, counting.CommitReadsOf(2));
+        Assert.Equal(1, counting.CommitReadsOf(3));
+    }
+
+    [Fact]
     public async Task Cdf_PreRangeCommitBelowTheSeedingCheckpoint_IsReadFromDisk_AndStillFailsClosed()
     {
         // Council R1 (quality seat): pins the DISK-FALLBACK branch of the observation seam for an ORDINARY

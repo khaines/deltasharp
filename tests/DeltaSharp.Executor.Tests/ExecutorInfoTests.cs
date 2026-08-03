@@ -20,4 +20,15 @@ public class ExecutorInfoTests
         Assert.Contains("DeltaSharp execution backend:", line);
         Assert.Contains("affine(20)=41", line);
     }
+
+    [Fact]
+    public void StorageSchemaJsonWritePathLine_RootsStorageWritePath()
+    {
+        string line = Program.StorageSchemaJsonWritePathLine();
+        Assert.Contains("DeltaSharp storage schema-json write path: ok", line);
+        Assert.Contains("version=0", line);
+        Assert.Contains("files=1", line);
+        Assert.Contains("rows=1", line);
+        Assert.Contains("schemaString-pinned=True", line);
+    }
 }
