@@ -19,6 +19,22 @@ EXPECTED_ANNOTATED_COUNTS = {
     "docs/engineering/design/storage-exception-log-routing.md": 8,
     "docs/engineering/design/observability-conventions.md": 4,
 }
+EXPECTED_ANNOTATED_ISSUE_FREQUENCIES = {
+    "docs/engineering/design/storage-exception-log-routing.md": {
+        664: 1,
+        689: 1,
+        744: 2,
+        746: 1,
+        747: 1,
+        749: 1,
+        750: 1,
+    },
+    "docs/engineering/design/observability-conventions.md": {
+        479: 2,
+        747: 1,
+        749: 1,
+    },
+}
 MAX_MARKER_DISTANCE_CHARS = 200
 
 GH_LINK_RE = re.compile(r"https://github\.com/khaines/deltasharp/(issues|pull)/(\d+)")
@@ -66,7 +82,7 @@ def enforce_tracked_doc_scope(docs: list[Path], explicit_args: bool) -> list[str
     selected = {str(path.relative_to(REPO_ROOT)) for path in docs}
     if not (tracked & selected):
         return []
-    if selected == tracked:
+    if tracked.issubset(selected):
         return []
     return [
         "tracked-doc mode requires both tracked docs together: "
@@ -103,6 +119,9 @@ def parse_expected_states(docs: list[Path]) -> tuple[list[ExpectedState], list[s
     expected: list[ExpectedState] = []
     errors: list[str] = []
     expected_by_doc = {str(doc.relative_to(REPO_ROOT)): 0 for doc in docs}
+    issue_frequencies_by_doc: dict[str, dict[int, int]] = {
+        str(doc.relative_to(REPO_ROOT)): {} for doc in docs
+    }
 
     for doc in docs:
         text = doc.read_text(encoding="utf-8")
@@ -137,13 +156,23 @@ def parse_expected_states(docs: list[Path]) -> tuple[list[ExpectedState], list[s
                     line=link_line,
                 )
             )
-            expected_by_doc[str(doc.relative_to(REPO_ROOT))] += 1
+            doc_key = str(doc.relative_to(REPO_ROOT))
+            expected_by_doc[doc_key] += 1
+            issue_frequencies_by_doc[doc_key][issue] = (
+                issue_frequencies_by_doc[doc_key].get(issue, 0) + 1
+            )
 
     for doc_path, expected_count in EXPECTED_ANNOTATED_COUNTS.items():
         if doc_path in expected_by_doc and expected_by_doc[doc_path] != expected_count:
             errors.append(
                 f"{doc_path}: expected {expected_count} annotated issue links, found "
                 f"{expected_by_doc[doc_path]}"
+            )
+    for doc_path, expected_frequencies in EXPECTED_ANNOTATED_ISSUE_FREQUENCIES.items():
+        if doc_path in issue_frequencies_by_doc and issue_frequencies_by_doc[doc_path] != expected_frequencies:
+            errors.append(
+                f"{doc_path}: expected annotated issue frequencies {expected_frequencies}, found "
+                f"{issue_frequencies_by_doc[doc_path]}"
             )
 
     return expected, errors
@@ -184,10 +213,14 @@ def main() -> int:
     live_cache: dict[int, str] = {}
     mismatches: list[str] = []
     for item in expected:
-        live = live_cache.get(item.issue)
-        if live is None:
-            live = live_issue_state(item.issue)
-            live_cache[item.issue] = live
+        try:
+            live = live_cache.get(item.issue)
+            if live is None:
+                live = live_issue_state(item.issue)
+                live_cache[item.issue] = live
+        except RuntimeError as ex:
+            print(f"Doc issue-state lookup error: {ex}")
+            return 1
         if live != item.expected:
             mismatches.append(
                 f"{item.file.relative_to(REPO_ROOT)}:{item.line}: issue #{item.issue} is "
