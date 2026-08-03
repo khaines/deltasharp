@@ -88,8 +88,11 @@ Exception and diagnostic message formatting follows a split rule:
   the sign-rendering path prepends a bidi-control character even for positive values, and a type-level
   guarantee is fragile across refactors.
 - **`string.Create(CultureInfo.InvariantCulture, ...)` is required** when interpolation is
-  culture-sensitive — for example decimals/floats, signed integers, or any value whose `ToString()` is
-  locale-influenced (numeric separators, sign marks, alternate digit forms).
+  genuinely culture-sensitive — decimals/floats, or any value whose `ToString()` is
+  locale-influenced (numeric separators, sign marks, alternate digit forms). **Prefer** it for
+  signed integers (`int`, `long`) where a non-negative guarantee is not type-enforced; bare
+  interpolation of `int`/`long` in internal diagnostic messages remains acceptable where the
+  call site is clearly sign-free.
 
 The goal is correctness and consistency, not blanket churn: this repository's dominant message style is
 bare interpolation, so converting isolated safe call sites to invariant formatting is noise without
