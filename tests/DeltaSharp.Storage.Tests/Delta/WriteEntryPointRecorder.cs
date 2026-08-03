@@ -33,20 +33,6 @@ internal static class WriteEntryPointRecorder
     private static readonly ConcurrentDictionary<(string Type, string Method, string Signature), byte>
         Driven = new();
 
-    /// <summary>Notes that <paramref name="method"/> on <paramref name="owner"/> was invoked.</summary>
-    /// <remarks>
-    /// Calls sit immediately beside the invocation they describe, and
-    /// <c>RecordedEntryPoints_AreBackedByRealCalls</c> checks each recorded name against the IL of
-    /// the suite -- so a label that drifts away from the call it claims to describe fails rather
-    /// than quietly widening the reported coverage.
-    /// <para>
-    /// The owning TYPE is recorded, not just the name, because the required side is derived from
-    /// <c>SchemaJson.ToJson</c> call sites across all of <c>DeltaSharp.Storage</c> -- which span
-    /// more than one type and more than one return type -- and coverage is computed by walking
-    /// production IL forward from what actually ran. A bare name cannot be resolved back to a
-    /// method to walk from.
-    /// </para>
-    /// </remarks>
     /// <summary>
     /// Invokes <paramref name="call"/> on <paramref name="target"/> and records the entry point
     /// IT ACTUALLY CALLED, after it has returned.
@@ -99,6 +85,20 @@ internal static class WriteEntryPointRecorder
         return result;
     }
 
+    /// <summary>Notes that <paramref name="method"/> on <paramref name="owner"/> was invoked.</summary>
+    /// <remarks>
+    /// Calls sit immediately beside the invocation they describe, and
+    /// <c>RecordedEntryPoints_AreBackedByRealCalls</c> checks each recorded name against the IL of
+    /// the suite -- so a label that drifts away from the call it claims to describe fails rather
+    /// than quietly widening the reported coverage.
+    /// <para>
+    /// The owning TYPE is recorded, not just the name, because the required side is derived from
+    /// <c>SchemaJson.ToJson</c> call sites across all of <c>DeltaSharp.Storage</c> -- which span
+    /// more than one type and more than one return type -- and coverage is computed by walking
+    /// production IL forward from what actually ran. A bare name cannot be resolved back to a
+    /// method to walk from.
+    /// </para>
+    /// </remarks>
     private static void Record(Type owner, string method, params Type[] parameterTypes)
     {
         ArgumentNullException.ThrowIfNull(owner);

@@ -14,7 +14,7 @@ namespace DeltaSharp.Storage.Tests.Delta;
 
 /// <summary>
 /// The <b>log-side</b> artifact layer for issue #679, and the only place anything compares a real
-/// <c>_delta_log</c> <c>metaData.schemaString</c> to a real Parquet footer <c>delta.schema</c>.
+/// <c>_delta_log</c> <c>metaData.schemaString</c> to a real Parquet footer <c>org.apache.spark.sql.parquet.row.metadata</c>.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -736,7 +736,7 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
         return new ManagedColumnBatch(schema, vectors, 2);
     }
 
-    /// <summary>Reads the <c>delta.schema</c> footer metadata off one committed data file.</summary>
+    /// <summary>Reads the <c>org.apache.spark.sql.parquet.row.metadata</c> footer metadata off one committed data file.</summary>
     private async Task<string> ReadFooterSchema(string relativePath)
     {
         await using FileStream stream = File.OpenRead(Path.Combine(_root, relativePath));
