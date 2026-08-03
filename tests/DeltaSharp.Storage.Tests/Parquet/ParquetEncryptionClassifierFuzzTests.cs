@@ -151,7 +151,7 @@ public sealed class ParquetEncryptionClassifierFuzzTests
         // must short-circuit BEFORE touching it. Asserting the surface was never touched makes this a genuine
         // RED-on-revert pin: deleting the `!CanSeek` guard lets the probe read `input.Length` and trips the spy
         // (whereas a throwing stub would be masked by the IO-fault catch arm and pass for the wrong reason).
-        var stream = new SeekSpyNonSeekableStream(await ValidPlaintextFileAsync());
+        using var stream = new SeekSpyNonSeekableStream(await ValidPlaintextFileAsync());
 
         string? verdict = ParquetEncryption.ClassifyUnreadableInput(stream);
 
