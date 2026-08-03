@@ -1222,4 +1222,72 @@ public sealed class DeltaCheckpointReaderTests
     }
 
     private const string EmptySchema = """{"type":"struct","fields":[]}""";
+
+    // ---- #773 (Quality residual): DisposeQuietlyAsync fail-closed dispose contract -------------------------
+    //
+    // The fail-closed open path abandons its reader through DisposeQuietlyAsync so a dispose-time fault cannot
+    // escape UNMAPPED and replace the classification the caller is about to throw. These pins fix that
+    // contract directly (it is otherwise only reachable when a real ParquetReader.DisposeAsync throws, which
+    // no fixture can force): every NON-cancellation dispose fault is swallowed, cancellation still propagates,
+    // and the normal reader is disposed exactly once.
+
+    private sealed class ThrowingAsyncDisposable(Exception fault) : IAsyncDisposable
+    {
+        public int DisposeCount { get; private set; }
+
+        public ValueTask DisposeAsync()
+        {
+            DisposeCount++;
+            throw fault;
+        }
+    }
+
+    private sealed class CountingAsyncDisposable : IAsyncDisposable
+    {
+        public int DisposeCount { get; private set; }
+
+        public ValueTask DisposeAsync()
+        {
+            DisposeCount++;
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    [Fact]
+    public async Task DisposeQuietlyAsync_SwallowsNonCancellationDisposeFault()
+    {
+        // A dispose-time IOException on the abandoned reader must be swallowed so the pending classification
+        // remains the single, meaningful outcome. RED-on-revert: narrowing the catch (or removing it) lets the
+        // fault escape and this call throws.
+        var reader = new ThrowingAsyncDisposable(new IOException("disk gone during teardown"));
+
+        await DeltaCheckpointReader.DisposeQuietlyAsync(reader);
+
+        Assert.Equal(1, reader.DisposeCount);
+    }
+
+    [Fact]
+    public async Task DisposeQuietlyAsync_PropagatesCancellation()
+    {
+        // Cancellation is the ONE dispose fault that must NOT be swallowed — it is not a cleanup defect and the
+        // caller's cooperative-cancellation contract depends on it surfacing. RED-on-revert: broadening the
+        // catch to all exceptions swallows this and the assertion flips.
+        var reader = new ThrowingAsyncDisposable(new OperationCanceledException());
+
+        await Assert.ThrowsAsync<OperationCanceledException>(
+            async () => await DeltaCheckpointReader.DisposeQuietlyAsync(reader));
+
+        Assert.Equal(1, reader.DisposeCount);
+    }
+
+    [Fact]
+    public async Task DisposeQuietlyAsync_DisposesNormalReaderExactlyOnce()
+    {
+        // Positive control: a well-behaved reader is disposed exactly once and no fault is invented.
+        var reader = new CountingAsyncDisposable();
+
+        await DeltaCheckpointReader.DisposeQuietlyAsync(reader);
+
+        Assert.Equal(1, reader.DisposeCount);
+    }
 }

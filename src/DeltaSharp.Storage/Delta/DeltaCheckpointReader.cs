@@ -234,8 +234,9 @@ internal static class DeltaCheckpointReader
     /// swallows only <c>IsUndecodableParquetInput</c> faults: here every non-cancellation dispose fault is
     /// swallowed, because on this path a classification is already pending and any cleanup fault that replaced
     /// it would be strictly less informative. Swallowing more is the safe direction for an exception-total
-    /// boundary; cancellation still propagates (#698 review).</summary>
-    private static async ValueTask DisposeQuietlyAsync(ParquetReader reader)
+    /// boundary; cancellation still propagates (#698 review). Typed as <see cref="IAsyncDisposable"/> (the
+    /// reader implements it) so the swallow-but-propagate-cancellation contract is unit-pinnable (#773).</summary>
+    internal static async ValueTask DisposeQuietlyAsync(IAsyncDisposable reader)
     {
         try
         {
