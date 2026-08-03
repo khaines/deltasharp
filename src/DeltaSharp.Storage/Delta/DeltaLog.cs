@@ -631,6 +631,7 @@ internal sealed class DeltaLog
     {
         long earliest = EarliestReconstructableVersion(listing);
         ColumnMappingIdentity endIdentity = BuildIdentity(endMetadata);
+        IReadOnlyList<MetadataAction>? earliestVersionMetadataFromBaseline = null;
 
         // Baseline: the identity as of the earliest reconstructable version — compacted from a checkpoint when
         // the creation commit has aged out, so a checkpoint-baked identity that no surviving commit re-expresses
@@ -640,9 +641,17 @@ internal sealed class DeltaLog
         // pre-range baseline to establish here. The surviving-commit loop below still runs in BOTH cases.
         if (earliest < rangeStartVersion)
         {
+            var baselineReplayed = new ReplayedMetadataLog(earliest + 1);
             Snapshot earliestSnapshot = await LoadSnapshotFromListingAsync(
-                listing, earliest, Stopwatch.GetTimestamp(), null, cancellationToken).ConfigureAwait(false);
+                listing, earliest, Stopwatch.GetTimestamp(), baselineReplayed, cancellationToken).ConfigureAwait(false);
+            baselineReplayed.Seal();
             ValidateHistoricalIdentity(earliest, earliestSnapshot.Metadata, endIdentity);
+
+            if (baselineReplayed.TryGetProvenObservation(
+                earliest, out IReadOnlyList<MetadataAction> observedEarliestMetadata))
+            {
+                earliestVersionMetadataFromBaseline = observedEarliestMetadata;
+            }
         }
 
         // Every retained commit's metaData REPLACES the metadata (Delta semantics); a differing identity at any
@@ -672,7 +681,9 @@ internal sealed class DeltaLog
             // commit below the seeding checkpoint) — falls back to the disk read below. An observer defect can
             // therefore cost a fail-closed read or an extra GET, but can NEVER shrink this validation set.
             IReadOnlyList<MetadataAction> versionMetadata =
-                alreadyReplayed.TryGetProvenObservation(version, out IReadOnlyList<MetadataAction> observed)
+                (version == earliest && earliestVersionMetadataFromBaseline is not null)
+                    ? earliestVersionMetadataFromBaseline
+                    : alreadyReplayed.TryGetProvenObservation(version, out IReadOnlyList<MetadataAction> observed)
                     ? observed
                     : ReplayedMetadataLog.MetadataActionsOf(
                         await ReadCommitActionsAsync(version, cancellationToken).ConfigureAwait(false));
