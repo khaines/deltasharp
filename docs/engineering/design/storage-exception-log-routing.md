@@ -76,21 +76,32 @@ test, the test is named inline.
 
 ## Exception/diagnostic message culture convention (#764)
 
+*This convention applies at the formatting layer; it is orthogonal to the sanitization and routing
+obligations described above.*
+
 Exception and diagnostic message formatting follows a split rule:
 
-- **Bare interpolation (`$"..."`) is acceptable** when interpolation is culture-insensitive by construction
-  (for example non-negative integer counts/versions, or round-trip `:O` timestamps).
+- **Bare interpolation (`$"..."`) is acceptable** when the interpolated type is an unsigned integral
+  type (`uint`, `ulong`) or a round-trip `:O` timestamp — values where culture cannot affect the
+  rendered form. Signed integer types (`int`, `long`) are technically safe when guaranteed non-negative
+  at a specific call site, but prefer `InvariantCulture` for signed values: on locales such as `ar-SA`
+  the sign-rendering path prepends a bidi-control character even for positive values, and a type-level
+  guarantee is fragile across refactors.
 - **`string.Create(CultureInfo.InvariantCulture, ...)` is required** when interpolation is
-  culture-sensitive (for example decimals/floats, values that may carry a sign, and path rendering).
+  culture-sensitive — for example decimals/floats, signed integers, or any value whose `ToString()` is
+  locale-influenced (numeric separators, sign marks, alternate digit forms).
 
 The goal is correctness and consistency, not blanket churn: this repository's dominant message style is
-bare interpolation, so converting isolated safe integer-only call sites to invariant formatting is
-noise-only. Apply invariant formatting where behavior can change with culture, and keep safe integer/timestamp
-diagnostics simple.
+bare interpolation, so converting isolated safe call sites to invariant formatting is noise without
+correctness benefit. Apply invariant formatting where culture can change behaviour; keep unsigned
+integer and timestamp diagnostics simple.
 
-**Analyzer policy (CA1305):** keep CA1305 scoped to culture-sensitive paths rather than enabling it as a
-global diagnostic over all exception text sites. A global CA1305 pass would mostly generate false positives
-for intentionally culture-insensitive integer-only diagnostics.
+**Analyzer policy (CA1305):** CA1305 (*SpecifyIFormatProvider*) is not enabled globally in this
+repository. A global pass would generate warnings for every bare integral interpolation — true positives
+from the analyzer's perspective (the type implements `IFormattable` and a culture-providing overload
+exists), but representing intentionally accepted low risk for unsigned/provably-non-negative sites.
+Enabling CA1305 globally would require suppressing a high volume of call sites with negligible
+real-world culture risk; instead, apply it selectively on culture-sensitive paths.
 
 ## Why the contract exists: the surfaced-message / raw-state split
 
