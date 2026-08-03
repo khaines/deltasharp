@@ -146,13 +146,17 @@ public sealed class ParquetEncryptionClassifierFuzzTests
     public async Task ClassifyUnreadableInput_NonSeekableStream_FailsClosedReturnsNull()
     {
         // Pins the `!input.CanSeek` early-return arm on both doors: a readable but non-seekable stream cannot
-        // be probed (the footer read seeks from the tail), so it must fail closed as NOT-encrypted rather than
-        // throw or guess. Wraps a genuine plaintext file's bytes so the null is due to non-seekability alone.
-        using var stream = new NonSeekableStream(await ValidPlaintextFileAsync());
+        // be probed (the footer read seeks from the tail), so it must fail closed as NOT-encrypted. The stub is
+        // a SPY whose seek surface (Length/Position/Seek) is fully functional but records any access; the guard
+        // must short-circuit BEFORE touching it. Asserting the surface was never touched makes this a genuine
+        // RED-on-revert pin: deleting the `!CanSeek` guard lets the probe read `input.Length` and trips the spy
+        // (whereas a throwing stub would be masked by the IO-fault catch arm and pass for the wrong reason).
+        var stream = new SeekSpyNonSeekableStream(await ValidPlaintextFileAsync());
 
         string? verdict = ParquetEncryption.ClassifyUnreadableInput(stream);
 
         Assert.Null(verdict);
+        Assert.False(stream.SeekSurfaceTouched, "the !CanSeek guard must short-circuit before touching Length/Position/Seek");
     }
 
     /// <summary>A seekable stream whose reads always throw <see cref="IOException"/>, to drive the probe's
@@ -191,25 +195,51 @@ public sealed class ParquetEncryptionClassifierFuzzTests
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
 
-    /// <summary>A readable but non-seekable stream, to drive the probe's <c>!CanSeek</c> early-return arm.</summary>
-    private sealed class NonSeekableStream(byte[] bytes) : Stream
+    /// <summary>A readable but non-seekable stream that <b>spies</b> on its seek surface: Length/Position/Seek
+    /// are fully functional (delegating to an inner buffer) but flip <see cref="SeekSurfaceTouched"/> on any
+    /// access. Lets a test prove the <c>!CanSeek</c> guard short-circuits BEFORE any seek attempt — a real
+    /// RED-on-revert pin, unlike a throwing stub whose fault the probe's IO catch arm would mask.</summary>
+    private sealed class SeekSpyNonSeekableStream(byte[] bytes) : Stream
     {
         private readonly MemoryStream _inner = new(bytes, writable: false);
+
+        public bool SeekSurfaceTouched { get; private set; }
 
         public override bool CanRead => true;
         public override bool CanSeek => false;
         public override bool CanWrite => false;
-        public override long Length => throw new NotSupportedException();
+
+        public override long Length
+        {
+            get
+            {
+                SeekSurfaceTouched = true;
+                return _inner.Length;
+            }
+        }
 
         public override long Position
         {
-            get => throw new NotSupportedException();
-            set => throw new NotSupportedException();
+            get
+            {
+                SeekSurfaceTouched = true;
+                return _inner.Position;
+            }
+
+            set
+            {
+                SeekSurfaceTouched = true;
+                _inner.Position = value;
+            }
         }
 
         public override int Read(byte[] buffer, int offset, int count) => _inner.Read(buffer, offset, count);
 
-        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin)
+        {
+            SeekSurfaceTouched = true;
+            return _inner.Seek(offset, origin);
+        }
 
         public override void Flush()
         {
