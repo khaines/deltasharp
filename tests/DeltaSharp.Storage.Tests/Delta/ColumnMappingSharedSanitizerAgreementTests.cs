@@ -13,14 +13,14 @@ namespace DeltaSharp.Storage.Tests.Delta;
 /// </summary>
 public sealed class ColumnMappingSharedSanitizerAgreementTests
 {
+    private static readonly MethodInfo PathSegmentGuard = typeof(ColumnMapping).GetMethod(
+        "FindUnsafePathSegmentReason",
+        BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new InvalidOperationException("FindUnsafePathSegmentReason not found.");
+
     [Fact]
     public void PathSegmentGuard_And_SharedSanitizer_Agree_OnEveryScalarValue_InContextualSegments()
     {
-        MethodInfo guard = typeof(ColumnMapping).GetMethod(
-            "FindUnsafePathSegmentReason",
-            BindingFlags.NonPublic | BindingFlags.Static)
-            ?? throw new InvalidOperationException("FindUnsafePathSegmentReason not found.");
-
         var mismatches = new List<string>();
         int checkedScalars = 0;
 
@@ -43,7 +43,7 @@ public sealed class ColumnMappingSharedSanitizerAgreementTests
             int codeUnitCount = rune.EncodeToUtf16(codeUnits);
             string segment = "a" + new string(codeUnits, 0, codeUnitCount) + "b";
 
-            string? reason = (string?)guard.Invoke(null, [segment]);
+            string? reason = (string?)PathSegmentGuard.Invoke(null, [segment]);
             bool guardRejects = reason is not null;
             bool sanitizerMutates = !string.Equals(
                 segment,
@@ -69,5 +69,40 @@ public sealed class ColumnMappingSharedSanitizerAgreementTests
                 CultureInfo.InvariantCulture,
                 $"Found {mismatches.Count} guard/sanitizer mismatches. First mismatches:{Environment.NewLine}")
             + string.Join(Environment.NewLine, mismatches));
+    }
+
+    [Fact]
+    public void PathSegmentGuard_Rejects_ExplicitDelimiterRunes()
+    {
+        foreach (char delimiter in new[] { '/', '\\', '=', ':' })
+        {
+            string segment = string.Create(
+                CultureInfo.InvariantCulture,
+                $"a{delimiter}b");
+            string? reason = (string?)PathSegmentGuard.Invoke(null, [segment]);
+            Assert.False(string.IsNullOrWhiteSpace(reason));
+        }
+    }
+
+    [Theory]
+    [InlineData("x")]
+    [InlineData("xA")]
+    [InlineData("Ax")]
+    [InlineData("\u0001")]
+    [InlineData("\u0001A")]
+    [InlineData("A\u0001")]
+    [InlineData("\u200F")]
+    [InlineData("\u200FA")]
+    [InlineData("A\u200F")]
+    public void PathSegmentGuard_And_SharedSanitizer_Agree_OnBoundarySegmentShapes(string segment)
+    {
+        string? reason = (string?)PathSegmentGuard.Invoke(null, [segment]);
+        bool guardRejects = reason is not null;
+        bool sanitizerMutates = !string.Equals(
+            segment,
+            SharedDiagnosticText.Sanitize(segment, maxLength: -1),
+            StringComparison.Ordinal);
+
+        Assert.Equal(sanitizerMutates, guardRejects);
     }
 }
