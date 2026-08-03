@@ -52,7 +52,7 @@ jobs:
       # gate suppresses only those two third-party assembly-summary codes so app-level trim/AOT warnings
       # remain fatal while the schema-json write-path smoke stays rooted in the binary.
       - name: Publish executor (NativeAOT linux-x64)
-        run: dotnet publish src/DeltaSharp.Executor -c Release -r linux-x64 -p:PublishAot=true -p:TreatWarningsAsErrors=true -warnaserror -p:NoWarn='IL2104;IL3053'
+        run: dotnet publish src/DeltaSharp.Executor -c Release -r linux-x64 -p:PublishAot=true -p:TreatWarningsAsErrors=true -warnaserror -p:NoWarn=IL2104%3BIL3053
 
       - name: Assert expected executable
         run: |
