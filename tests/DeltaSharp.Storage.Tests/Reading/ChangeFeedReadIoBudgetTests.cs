@@ -117,8 +117,8 @@ public sealed class ChangeFeedReadIoBudgetTests : IDisposable
         //
         //                         main @ a6ff45f   this PR
         //   log LISTs                          4         1     (universal: threading the resolution's listing)
-        //   commit GETs                       61        53     (-13%)
-        //     of which the gate's own         40        32     (-20%)
+        //   commit GETs                       61        52     (-15%)
+        //     of which the gate's own         40        31   (-22.5%)
         //
         // The LIST reduction is layout-independent. The GET reduction is NOT: it is bounded by how much of the
         // pre-range window the replay covers, i.e. by the checkpoint interval — so for a long retained history
@@ -144,12 +144,11 @@ public sealed class ChangeFeedReadIoBudgetTests : IDisposable
 
         Assert.Equal(1, counting.LogListings);
 
-        // 10 (end replay 31..40) + 10 (start replay 31..40) + 2 (baseline snapshot at v0, PLUS the gate now
-        // reads v0's OWN metaData — the baseline reconstructs the checkpoint-baked identity, which a forger can
-        // make disagree with <v0>.json, so the floor commit's own declaration is validated too, #691 2nd fix)
-        // + 30 (the gate's own reads of 1..30, which NO replay reaches) + 1 (in-range read of v40) = 53.
-        Assert.Equal(53, counting.CommitReads);
-        Assert.Equal(2, counting.CommitReadsOf(0));                    // baseline snapshot + the floor commit's own metaData
+        // 10 (end replay 31..40) + 10 (start replay 31..40) + 1 (baseline snapshot at v0; the floor commit's
+        // own metaData is now reused from that baseline replay, so no extra GET is needed) + 30 (the gate's
+        // own reads of 1..30, which NO replay reaches) + 1 (in-range read of v40) = 52.
+        Assert.Equal(52, counting.CommitReads);
+        Assert.Equal(1, counting.CommitReadsOf(0));                    // baseline snapshot only
         for (long v = 1; v <= 30; v++)
         {
             Assert.Equal(1, counting.CommitReadsOf(v));                 // below the floor: the gate reads it once
