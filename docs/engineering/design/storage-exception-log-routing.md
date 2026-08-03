@@ -81,18 +81,18 @@ obligations described above.*
 
 Exception and diagnostic message formatting follows a split rule:
 
-- **Bare interpolation (`$"..."`) is acceptable** when the interpolated type is an unsigned integral
-  type (`uint`, `ulong`) or a round-trip `:O` timestamp — values where culture cannot affect the
-  rendered form. Signed integer types (`int`, `long`) are technically safe when guaranteed non-negative
-  at a specific call site, but prefer `InvariantCulture` for signed values: on locales such as `ar-SA`
-  the sign-rendering path prepends a bidi-control character even for positive values, and a type-level
-  guarantee is fragile across refactors.
-- **`string.Create(CultureInfo.InvariantCulture, ...)` is required** when interpolation is
-  genuinely culture-sensitive — decimals/floats, or any value whose `ToString()` is
-  locale-influenced (numeric separators, sign marks, alternate digit forms). **Prefer** it for
-  signed integers (`int`, `long`) where a non-negative guarantee is not type-enforced; bare
-  interpolation of `int`/`long` in internal diagnostic messages remains acceptable where the
-  call site is clearly sign-free.
+- **Bare interpolation (`$"..."`) is acceptable** for unsigned integral types (`uint`, `ulong`) and
+  round-trip `:O` timestamps — values whose rendered form is culture-invariant by type. Bare
+  interpolation of signed `int`/`long` is also acceptable when the value is demonstrably non-negative
+  at the call site — for example, bounded by a preceding `ArgumentOutOfRangeException.ThrowIfNegative`
+  or similar guard, derived from an unsigned source, or constrained by a validated constructor
+  parameter. Note: on locales such as `ar-SA`, the sign-rendering path prepends a bidi-control
+  character for *negative* values — not positive ones — so a verified non-negative call site carries
+  no culture risk.
+- **`string.Create(CultureInfo.InvariantCulture, ...)` is required** when interpolation is genuinely
+  culture-sensitive — decimals/floats, or any value whose `ToString()` is locale-influenced (numeric
+  separators, sign marks, alternate digit forms). **Prefer** it for signed integers where the
+  non-negative guarantee is not type-enforced and not guarded explicitly.
 
 The goal is correctness and consistency, not blanket churn: this repository's dominant message style is
 bare interpolation, so converting isolated safe call sites to invariant formatting is noise without
@@ -102,7 +102,7 @@ integer and timestamp diagnostics simple.
 **Analyzer policy (CA1305):** CA1305 (*SpecifyIFormatProvider*) is not enabled globally in this
 repository. A global pass would generate warnings for every bare integral interpolation — true positives
 from the analyzer's perspective (the type implements `IFormattable` and a culture-providing overload
-exists), but representing intentionally accepted low risk for unsigned/provably-non-negative sites.
+exists), but representing intentionally accepted low risk for unsigned integral types and guarded non-negative call sites.
 Enabling CA1305 globally would require suppressing a high volume of call sites with negligible
 real-world culture risk; instead, apply it selectively on culture-sensitive paths.
 
