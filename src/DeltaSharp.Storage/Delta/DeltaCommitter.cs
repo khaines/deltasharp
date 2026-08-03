@@ -189,6 +189,20 @@ internal sealed class DeltaCommitter
             throw new ArgumentException("A commit must contain at least one action.", nameof(actions));
         }
 
+        // Symmetry with the read-side #671 invariant: a single Delta commit may declare at most one metaData
+        // action. Rejecting >1 at the write door makes it impossible for DeltaSharp to author a log that its
+        // own parser would reject as malformed.
+        int metadataActions = 0;
+        foreach (DeltaAction action in actions)
+        {
+            if (action is MetadataAction && ++metadataActions > 1)
+            {
+                throw DeltaProtocolException.Malformed(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"Commit payload carries {metadataActions} metaData actions; a commit must declare at most one."));
+            }
+        }
+
         // Column mapping (#523 read / #572 write): all three modes (none/name/id) are now writable through
         // this commit choke point. id-mode DATA columns resolve by the Parquet field_id — the write door
         // stages the physical Parquet with the field_id stamped and commits the id-mode metaData/protocol

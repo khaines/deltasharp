@@ -322,6 +322,31 @@ public sealed class DeltaCommitterTests : IDisposable
     }
 
     [Fact]
+    public async Task RejectsCommit_WithMoreThanOneMetadataAction_FailsClosed_AtWriteDoor()
+    {
+        // #762: write-side symmetry with the read-side single-metaData invariant. A commit payload carrying
+        // two metaData actions must be rejected as malformed before publish, so DeltaSharp cannot author a
+        // log its own parser would reject.
+        await SeedTableAsync();
+        Snapshot snapshot = await LoadAsync();
+
+        MetadataAction first = MetadataWith(NoneModeSchemaJson, NoneModeConfiguration);
+        MetadataAction second = MetadataWith(NoneModeSchemaJson, NoneModeConfiguration);
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => new DeltaCommitter(_backend).CommitAsync(
+                snapshot,
+                new DeltaAction[] { first, second, Add("part-1.parquet") },
+                DeltaReadScope.WholeTable));
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
+        Assert.Contains("2 metaData actions", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("at most one", ex.Message, StringComparison.Ordinal);
+
+        Snapshot after = await LoadAsync();
+        Assert.Equal(0L, after.Version); // commit was rejected, nothing published
+    }
+
+    [Fact]
     public async Task RejectsCommit_IdModeSchema_NonPositiveId_FailsClosed_AtCommit()
     {
         // deltaspec N3/R4 finding #1: Delta column-mapping ids start at 1, so a mapped field with id <= 0 is
