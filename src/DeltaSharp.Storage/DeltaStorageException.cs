@@ -60,6 +60,16 @@ internal enum StorageErrorKind
 /// <see cref="Kind"/> so a failure is classifiable without parsing its message, and a message that
 /// <b>names</b> the unsupported feature or the concrete defect (design §2.9.1, §2.13.3).
 /// </summary>
+/// <remarks>
+/// <b>Message hygiene obligation (#747):</b> every factory that accepts a fully-composed
+/// <c>string message</c> or <c>string defect</c> passes it verbatim to
+/// <see cref="Exception.Message"/>. Any caller-supplied token that is attacker-influenceable
+/// (a column name, a type name from a foreign Parquet footer, a path segment from a foreign
+/// <c>_delta_log</c>) MUST be routed through <see cref="DiagnosticText.Sanitize"/> — or a
+/// stronger drop/minimization — BEFORE interpolation. The sweep test in
+/// <c>StorageHygieneSweepTests</c> covers call sites known as of <c>76d2c8e</c>; new call sites carry the
+/// same obligation.
+/// </remarks>
 internal sealed class DeltaStorageException : Exception
 {
     /// <summary>Creates a storage exception of the given <paramref name="kind"/>.</summary>
@@ -86,24 +96,43 @@ internal sealed class DeltaStorageException : Exception
     public string? Path { get; init; }
 
     /// <summary>
-    /// Renders this exception WITHOUT its <see cref="System.Exception.InnerException"/> chain (#664, RF-8b
-    /// parity). The sanitized <see cref="System.Exception.Message"/> deliberately drops attacker-influenceable
-    /// decode content while the raw underlying cause (e.g. a Parquet.Net exception over crafted bytes) is
-    /// retained as the inner for server-side diagnostics; the default <c>ToString()</c> / <c>ILogger.LogError(ex, …)</c>
-    /// would re-surface that raw inner, so this override omits it. The inner remains reachable via
-    /// <see cref="System.Exception.InnerException"/>.
+    /// Renders this exception without its <see cref="System.Exception.InnerException"/> chain.
     /// </summary>
+    /// <remarks>
+    /// The <see cref="System.Exception.Message"/> is authored by factory methods whose call sites are
+    /// responsible for sanitizing attacker-influenceable tokens before interpolation (verified by
+    /// <c>StorageHygieneSweepTests</c> for known producers as of <c>76d2c8e</c>; see the type-level <c>&lt;remarks&gt;</c>
+    /// for the full obligation — #745/#749). The raw
+    /// underlying cause (e.g. a Parquet.Net exception over crafted bytes) is retained as the inner for
+    /// server-side diagnostics; the default <c>ToString()</c> / <c>ILogger.LogError(ex, …)</c> would
+    /// re-surface that raw inner, so this override omits it (#664, RF-8b parity). The inner remains
+    /// reachable via <see cref="System.Exception.InnerException"/>.
+    /// </remarks>
     public override string ToString() => DiagnosticText.DescribeWithoutInner(this, Kind.ToString());
 
-    /// <summary>Creates an <see cref="StorageErrorKind.UnsupportedFeature"/> error naming the feature.</summary>
-    public static DeltaStorageException UnsupportedFeature(string feature) =>
-        new(StorageErrorKind.UnsupportedFeature, feature);
+    /// <summary>Creates an <see cref="StorageErrorKind.UnsupportedFeature"/> error naming the feature.
+    /// <para><b>Message hygiene obligation (#747):</b> this factory accepts a fully-composed message; it cannot
+    /// sanitize tokens on the caller's behalf. Any caller-supplied token that is attacker-influenceable
+    /// (a column name, a type name derived from a foreign Parquet footer, a protocol feature key from a
+    /// foreign <c>_delta_log</c>) MUST be routed through <see cref="DiagnosticText.Sanitize"/> — or a
+    /// stronger drop/minimization — BEFORE interpolation. The sweep test in
+    /// <c>StorageHygieneSweepTests</c> enforces this for call sites known as of <c>76d2c8e</c>; new call sites must
+    /// satisfy the same property.</para></summary>
+    public static DeltaStorageException UnsupportedFeature(string message) =>
+        new(StorageErrorKind.UnsupportedFeature, message);
 
     /// <summary>Creates a <see cref="StorageErrorKind.CorruptData"/> error naming the defect.</summary>
+    /// <remarks><b>Message hygiene obligation:</b> see the type-level
+    /// <c>&lt;remarks&gt;</c> — the <paramref name="defect"/> string is accepted fully-composed;
+    /// any attacker-influenceable token must be sanitized by the caller before interpolation.</remarks>
     public static DeltaStorageException CorruptData(string defect, Exception? innerException = null) =>
         new(StorageErrorKind.CorruptData, defect, innerException);
 
-    /// <summary>Creates a <see cref="StorageErrorKind.SchemaMismatch"/> error naming the mismatch.</summary>
+    /// <summary>Creates a <see cref="StorageErrorKind.SchemaMismatch"/> error naming the mismatch.
+    /// <para><b>Message hygiene obligation (#747):</b> same contract as
+    /// <see cref="UnsupportedFeature"/>: the message is accepted fully-composed; any attacker-influenceable
+    /// token must be routed through <see cref="DiagnosticText.Sanitize"/> by the caller before
+    /// interpolation. The sweep test in <c>StorageHygieneSweepTests</c> covers call sites known as of <c>76d2c8e</c>.</para></summary>
     public static DeltaStorageException SchemaMismatch(string message) =>
         new(StorageErrorKind.SchemaMismatch, message);
 

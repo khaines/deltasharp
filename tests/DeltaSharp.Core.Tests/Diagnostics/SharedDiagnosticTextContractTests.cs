@@ -435,4 +435,81 @@ public sealed class SharedDiagnosticTextContractTests
                     + $"until one costs less than {refund} with its separator, or lower the budgets until "
                     + $"it can"));
     }
+
+    [Fact]
+    public void SanitizeAndJoin_LazyPath_AllocationIsBoundedByMaxItems_NotBySequenceLength()
+    {
+        // #767 ALLOCATION ORACLE. The structural sibling cannot kill the regression it names:
+        // streaming and materializing are output-EQUIVALENT, so no assertion over the result string
+        // separates them. GC.GetAllocatedBytesForCurrentThread is exact byte accounting, not timing,
+        // so this is deterministic. The fixed pool makes the generator itself allocation-free; the only
+        // allocation attributable to the call is the primitive's own.
+        // Streaming measures ~1.2 KB; materializing 1e6 refs measures ~16.8 MB. 64 KB threshold
+        // is ~4 orders of magnitude clear of both — regression detector, not perf assertion.
+        const int N = 1_000_000;
+        string[] pool = Enumerable.Range(0, 64).Select(i => "tok-" + i).ToArray();
+        IEnumerable<string> Hostile()
+        {
+            for (int i = 0; i < N; i++) { yield return pool[i & 63]; }
+        }
+
+        _ = SharedDiagnosticText.SanitizeAndJoin(Hostile(), maxItemLength: 32, maxItems: 16); // warm JIT
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        string result = SharedDiagnosticText.SanitizeAndJoin(Hostile(), maxItemLength: 32, maxItems: 16);
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.Contains("(+999984 more)", result, StringComparison.Ordinal);
+
+        Assert.True(
+            allocated < 64 * 1024,
+            $"SanitizeAndJoin allocated {allocated:N0} bytes for {N:N0}-token lazy sequence at maxItems=16; "
+            + "expected < 65536. Allocation must be bounded by maxItems, not by sequence length (#767): "
+            + "the lazy path has been reverted to materializing the hostile tail.");
+    }
+
+    [Theory]
+    [InlineData(0, 0)]
+    [InlineData(1, 1)]
+    [InlineData(2, 1)]
+    [InlineData(15, 16)]
+    [InlineData(16, 16)]
+    [InlineData(17, 16)]
+    [InlineData(40, 16)]
+    [InlineData(5, 2)]
+    public void SanitizeAndJoin_FastAndLazyPaths_ProduceIdenticalOutput(int tokenCount, int maxItems)
+    {
+        string[] tokens = Enumerable.Range(0, tokenCount).Select(i => $"tok-{i}").ToArray();
+        // Force lazy path with a non-IReadOnlyList wrapper
+        IEnumerable<string> lazy = tokens.Select(x => x);
+
+        string fast = SharedDiagnosticText.SanitizeAndJoin(tokens, maxItemLength: 32, maxItems: maxItems);
+        string slowPath = SharedDiagnosticText.SanitizeAndJoin(lazy, maxItemLength: 32, maxItems: maxItems);
+
+        Assert.Equal(fast, slowPath);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void SanitizeAndJoin_NegativeMaxItems_ThrowsIdenticallyOnBothPaths(bool forceLazy)
+    {
+        // Guard is before the branch split, so both paths must throw identically.
+        string[] tokens = ["a"];
+        IEnumerable<string> input = forceLazy ? tokens.Select(x => x) : tokens;
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => SharedDiagnosticText.SanitizeAndJoin(input, maxItemLength: 32, maxItems: -1));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void SanitizeAndJoin_NegativeMaxItemLength_ThrowsIdenticallyOnBothPaths(bool forceLazy)
+    {
+        // maxItemLength guard is also before the branch split.
+        string[] tokens = ["a"];
+        IEnumerable<string> input = forceLazy ? tokens.Select(x => x) : tokens;
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => SharedDiagnosticText.SanitizeAndJoin(input, maxItemLength: -1, maxItems: 16));
+    }
 }

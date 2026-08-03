@@ -1029,130 +1029,27 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
     // Path.Combine + GetFullPath, so every framework message carries an absolute path and root-stripping
     // always leaves the remainder behind a separator.
     //
-    // The remaining residuals are NOT restated here. They are enumerated as R1/R2 beside the branch table
-    // below, next to the character classes that produce them, because a residual list kept at a distance
-    // from the code it describes is how the previous one came to be factually wrong.
-    // SIX branches, ordered MOST-ANCHORED FIRST. It was FOUR until the rootless branch closed mechanism 7,
-    // and FIVE until the rootless-BACKSLASH branch closed sibling drift #5; if a comment anywhere still says
-    // four or five, it predates one of those and is wrong. Counts of the code's own shape are the prose most
-    // likely to rot, because they are true when written and nothing re-checks them -- and a stale STRUCTURAL
-    // claim is worse than a stale behavioural one, since a reader uses it to decide where to look rather
-    // than what to expect. Three such counts had rotted by the time this was written, and the separator
-    // table below rotted three more times after it -- which is why that one is now executed rather than
-    // read. This count is not, and a reader should treat it accordingly.
+    // Branches are ordered most-anchored first.
     //
-    // THE INVARIANT, and it is the one this recognizer kept violating: NO BRANCH MAY EMIT A MARKER OVER A
-    // PARTIALLY-CONSUMED VALUE. Every outcome must be exactly one of
+    // THE INVARIANT: NO BRANCH MAY EMIT A MARKER OVER A PARTIALLY-CONSUMED VALUE. Every outcome must be
+    // exactly one of
     //
     //     FULL     -- the value is consumed to a true segment boundary and "<value>" replaces all of it, or
     //     DECLINE  -- nothing matches, the segment is echoed as-is and sanitized like any other text.
     //
-    // PARTIAL is not a third option. It is strictly WORSE than DECLINE even though it discloses less,
-    // because the marker tells the reader the value was handled while its tail sits next to the marker:
-    // "email=<value> Taylor" or "email=<value>'taylor%40example.com". A decline is a documentable residual;
-    // a partial is a false claim of removal. SEVEN distinct mechanisms produced partials here, and only the
-    // first was found by reasoning about the design rather than by measuring it. Six are enumerated
-    // immediately below; the seventh is stated where the branch that closes it is defined, because it is a
-    // fact about a LEFT anchor rather than about a value class:
+    // PARTIAL is not a third option: it is worse than DECLINE because the marker claims removal while tail
+    // content remains beside it. The same rule resolves `\` fail-closed: when delimiter meaning depends on
+    // platform, treat backslash as content rather than let it end a value early.
     //
-    //   1. BRANCH ORDER. An unanchored branch tried first wins at the same start position and stops the
-    //      value at whitespace, so the anchored branch that would have consumed the rest never runs.
-    //   2. VALUE CLASS vs QUOTE DELIMITER. A value class excluding quotes stops at a quote INSIDE the value,
-    //      and a bare (?=['"]) lookahead is then satisfied by that interior quote.
-    //   3. UNANCHORED TERMINAL BRANCH. With no right anchor at all, a value class excluding whitespace
-    //      simply stops mid-value and emits.
-    //   4. RIGHT ANCHOR MET INSIDE THE VALUE. Strengthening the lookahead to demand a boundary AFTER the
-    //      quote narrows the class but does not close it: any quote in the value that happens to be
-    //      followed by a boundary still satisfies it. `/tbl/email=Boys' Club.taylor%40example.com` emits a
-    //      marker over "Boys" and leaves the rest standing. Mechanism 2 with a shorter reach.
-    //   5. A CUT THAT INVENTS AN UNPARSEABLE SHAPE. Not in the recognizer at all -- in Redact, which caps
-    //      the input at RedactScanLimit. A blind cut removes only text, which is why it looked obviously
-    //      safe, but it also FABRICATES a quoted path whose closing quote was cut off. That is the one
-    //      input on which an interior quote is genuinely indistinguishable from a closing quote, because
-    //      the truncated string is byte-identical to a legitimately closed one, so the recognizer stops at
-    //      the apostrophe and the tail survives beside the marker. It cannot be fixed in the pattern; the
-    //      cut has to land on a segment boundary, and it now does. The lesson generalises past this file:
-    //      a defensive bound is part of the parser's input contract, and one that can synthesise a shape
-    //      the parser cannot disambiguate is a defect no matter how strictly it only-removes-data.
+    // Beyond the invariant, the branch structure encodes a LADDER: the stronger the right delimiter, the
+    // more permissive the key may be, because the delimiter is the evidence that a path is in play at all.
     //
-    //   6. A CHARACTER THAT IS A SEPARATOR ON ONE PLATFORM AND CONTENT ON ANOTHER. `\` was excluded from
-    //      every value class and accepted by every right anchor, so the value run stopped at a backslash
-    //      and that same backslash satisfied the lookahead. On Windows that reading is right; on POSIX a
-    //      backslash is an ordinary filename character, so `dept=Legal\alice%40example.com` is ONE
-    //      component and the marker was emitted over half of it. The recognizer cannot know which platform
-    //      produced a foreign add.path, and the two errors are not symmetric: reading `\` as a separator
-    //      LEAKS on POSIX, while reading it as content merely over-redacts a Windows directory name. So it
-    //      is read as content -- fail closed -- and `\` is no longer a right delimiter anywhere.
-    //
-    //      THE GENERAL FORM, which is what makes this worth six lines: a delimiter that holds on one
-    //      platform is not a delimiter, it is a guess, and a recognizer must not resolve a guess in the
-    //      direction that discloses. This is the delimiter-strength ladder applied to a dimension the
-    //      ladder did not originally range over -- strength across PLATFORMS, not merely across contexts.
-    //
-    // Mechanism 3 is closed by anchoring branch 4 at $ and letting its value run to the end of the segment.
-    // Mechanism 5 is closed in Redact, by backing the cut off to the last path separator.
-    // Mechanism 6 is closed by admitting `\` to every value class and removing it from branch 1's right
-    // anchor. Measured on the 4500-cell lattice: 180 partials to 0, no FULL cell lost for a strict key, and
-    // the over-redaction corpus SHRANK by one row -- `stat '/usr/lib' -> st_mode=0100644\` now survives
-    // verbatim, because prose ending in a backslash is no longer eaten by a value run.
-    // Mechanisms 2 and 4 are closed by QuotedPathPrefix, and the reason it works where two rounds of
-    // boundary-set tuning did not is that it stops asking a LOCAL question. "Is this quote followed by
-    // something boundary-shaped?" is unanswerable from the quote's neighbourhood, because an interior
-    // quote and a closing quote have identical neighbourhoods. "Did anything OPEN this quote?" is
-    // answerable, and it is the question that actually defines a delimiter. When the path is unquoted the
-    // quote branches decline and branch 4 consumes the value in full, so closing this cost no coverage:
-    // measured over a 768-cell product, 99 partials became 0 with zero FULL cells lost.
-    //
-    // A NOTE ON MECHANISM 1, which the previous version of this comment got WRONG in a way worth keeping.
-    // It claimed anchoring branch 4 SUBSUMED the ordering fix, so that "no ordering of these four can
-    // [FOUR AT THE TIME; there are five now -- the quotation is preserved as it was written, because the
-    // point is that the claim was false when it was true-as-counted]
-    // produce a partial". Mechanism 4 falsifies that: a right anchor satisfied INSIDE the value still lets
-    // an earlier branch pre-empt the branch that would have consumed the whole run. The claim was derived
-    // from a matrix that was green -- and green because its corpus could not express the cell. Anchoring
-    // constrains where a branch may STOP; it says nothing about which branch gets to start. Ordering
-    // remains load-bearing, and the two are independent.
-    //
-    // AND THE COROLLARY, because the obvious repair for mechanism 4 is to reorder rather than to gate.
-    // Putting the $-anchored branch first DOES close the partials -- a reviewer measured exactly that and
-    // was right about it. But it was right against a recognizer where the partials were still OPEN. Once
-    // QuotedPathPrefix closes them, reordering buys nothing and costs prose. Re-measured on the 1620-cell
-    // lattice, the one that HAS the follower axis:
-    //
-    //     shipped [1,2,3,4]   FULL 1098  PARTIAL 0  DECLINE 522   trailing prose 3/3
-    //     B4 first [4,1,2,3]  FULL 1098  PARTIAL 0  DECLINE 522   trailing prose 1/3
-    //     B4 second [1,4,2,3] FULL 1098  PARTIAL 0  DECLINE 522   trailing prose 1/3
-    //
-    // Identical census, strictly worse diagnosability: "Access to the path '...' is denied." loses
-    // " is denied." and "...'. Retry later." loses "Retry later.", because the $-anchored value run eats
-    // every character to end-of-message once it is allowed to start first. The ordering is pinned -- the
-    // reorder turns tests RED, among them
-    // Redact_ApostropheBearingPartitionValue_IsFullyStrippedAndKeepsTheProse -- so this is a decision the
-    // suite defends rather than a comment claiming it.
-    //
-    // The general lesson, and it applies to every measurement recorded in this file: A MEASUREMENT IS
-    // ONLY VALID AGAINST THE BASELINE IT WAS TAKEN ON. Both the earlier claim (ordering is subsumed) and
-    // this one (reordering is free) were sound when measured and wrong when carried forward.
-    //
-    // Beyond the invariant, the branch structure encodes a LADDER: the STRONGER the right delimiter, the
-    // MORE PERMISSIVE the key may be, because the delimiter is the evidence that a path is in play at all.
-    // Earlier rounds instead anchored by delimiter CLASS and tuned key classes to compensate, which coupled
-    // the two axes -- narrowing a key class to protect prose silently withdrew coverage from a legal column
-    // name, and widening it to restore that ate prose. Four rounds of that produced six fail-opens.
-    //
-    //   1. PATH SEPARATOR follows -- strongest evidence. Key `[^/\=]` and value `[^/\]`: quotes AND
-    //                                whitespace allowed in both. Covers every segment DeltaWriteTarget can
-    //                                emit, including "o'brien y=v/".
-    //   2. CLOSING QUOTE follows,  -- one relaxation: quotes in the key. Covers
-    //      key has quotes, no space    "'<root>/o'brien=alice%40example.com' is denied."
-    //                                  This branch is for DIAGNOSABILITY, not privacy, and the distinction
-    //                                  is measured: dropping it leaves the matrix green, because branch 4
-    //                                  then consumes the same values to end-of-message. What is lost is the
-    //                                  PROSE AFTER the closing quote -- " is denied." gets eaten along with
-    //                                  the value. It is pinned by the over-redaction theory, which is the
-    //                                  honest place for it, rather than claimed as a leak guard.
-    //   3. CLOSING QUOTE follows,  -- the mirror relaxation: whitespace in the key, no quotes. Covers
-    //      key has space, no quotes    "'<root>/my col=alice%40example.com'."
+    //   1. PATH SEPARATOR follows -- strongest evidence. Key `[^/\=]` and value `[^/]`: quotes AND
+    //                                whitespace allowed in both.
+    //   2. CLOSING QUOTE follows,  -- one relaxation: quotes in the key, so prose after a quoted path can
+    //      key has quotes, no space    survive instead of being consumed by branch 4.
+    //   3. CLOSING QUOTE follows,  -- the mirror relaxation: whitespace in the key, no quotes.
+    //      key has space, no quotes
     //   4. END OF MESSAGE follows  -- key without whitespace (quotes allowed), value runs to the end.
     //
     // Branches 2 and 3 are deliberately NOT merged. Their INTERSECTION -- a key holding BOTH a quote and
@@ -1163,78 +1060,20 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
     // reason: whitespace is what keeps it off "open /proc/self/fd failed: errno=13".
     //
     // EVERY key group is LAZY (`*?`), and that is a correctness requirement, not a performance tweak.
-    //
-    //   The shared DiagnosticText.HiveSeparatorPattern made this recognizer and DescribePath accept the same
-    //   separator ALPHABET. It did NOT make them equivalent, because they used different SEARCH STRATEGIES:
-    //   DescribePath scans left-to-right and stops at the FIRST separator, while a GREEDY regex key takes the
-    //   LAST one it can reach. On "/k%3DSECRET=value/" the greedy form captured "k%3DSECRET" as the key and
-    //   redacted only "value" -- so SECRET, a partition VALUE, was echoed, while DescribePath correctly
-    //   reported the key as "k" and dropped the rest. Five reviewers verified the shared constant and all
-    //   five confirmed it, because the property they checked -- "do both halves accept the same spellings?"
-    //   -- genuinely holds. The question none of us asked is "do both halves pick the same separator when
-    //   SEVERAL are present?" Lazy keys make the regex adopt first-separator semantics, which is
-    //   DescribePath's rule, and Redact_AndDescribePath_ResolveTheSameKey asserts the two agree on WHICH
-    //   SUBSTRING IS THE KEY -- not merely that neither leaks. A shared alphabet is not a shared decision
-    //   procedure; only the equivalence assertion catches that.
+    // DescribePath takes the FIRST separator in a segment, so this regex must do the same; lazy keys plus
+    // excluding '=' keep Redact and DescribePath aligned on WHICH SUBSTRING IS THE KEY, not just on which
+    // separator spellings exist.
     //
     // Excluding '=' from every key class stops greedy over-capture across "/a=1=2=3/".
+
+    // THE RESIDUALS are pinned by Redact_MonotonicityMatrix. R1 and R2 are DECLINE clauses; R3 is
+    // closed for balanced quoting; R4 is defined beside branch 5; R5 is the only PARTIAL residual and
+    // stays separate; R6 is closed.
     //
-    // THE RESIDUALS. This list has been factually wrong in three consecutive reviews, so it is no longer
-    // written as prose that a reader must trust. The clauses below are the LITERAL PREDICATE evaluated
-    // by Redact_MonotonicityMatrix: a declined cell that does not satisfy one of them fails that test, and
-    // so does a clause that no longer has any declined cell to explain. The list cannot drift from the code
-    // in either direction, which is the only property that makes a residual list worth reading.
-    //
-    // THE FULL SET, because this block announces itself as "THE RESIDUALS" and for two rounds it did not
-    // contain all of them. R1 and R2 are stated here. R3 is CLOSED and its scoping is stated below. R4 is
-    // defined beside branch 5, ~280 lines down, because it is a fact about that branch's left anchor -- and
-    // an auditor reading only this block would have judged an R4-classified decline undocumented, which is
-    // the failure mode this block exists to prevent, arriving through layout instead of through wording.
-    // R5 is stated below and is a PARTIAL residual, the only one; it is filed as #723 and deliberately not
-    // folded into a decline clause. R6 was the bare trailing backslash; it is CLOSED, and it is kept in this
-    // list with its disposition rather than deleted, because a residual that was filed and then fixed is the
-    // only kind whose absence looks identical to a residual that was never noticed.
-    // Distance from the code is why the old list rotted, so nothing is moved
-    // here that belongs beside its branch -- but a set that names itself complete has to enumerate, and the
-    // pointers are the enumeration.
-    //
-    // R4 HAS SINCE BEEN NARROWED, AND THE WAY IT WAS OVER-READ IS THE MOST TRANSFERABLE THING IN THIS FILE.
-    // Its text says "no slash at all"; every classifier written against it said "no FORWARD slash"; and the
-    // gap between those two sentences was a live disclosure that five reviewers, three corpora and a
-    // purpose-built anti-over-claim assertion all filed under R4 as irreducible. When a residual is used to
-    // EXCUSE a divergence, the predicate that selects it is load-bearing security code and has to be read
-    // against the residual's own words, not written from the shape of the cells in front of you.
-    //
-    // NO COUNTS ARE RESTATED HERE, deliberately. Every previous version of this comment carried a census
-    // ("exactly two cells are declined") that the recognizer contradicted -- once while it was separately
-    // producing 82 PARTIAL matches across the same sweep, which is why two reviewers read the same
-    // paragraph and disagreed about whether the partials were documented. They were not, and could not be:
-    // a decline list cannot express a partial. The census lives in the test, as numbers a change must
-    // update.
-    //
-    //   R1  {WHITESPACE-BEARING key} x {NO right delimiter}. "No right delimiter" now covers FOUR ways of
-    //       having none: end of message, an unquoted path merely ENDING in a quote, a quoted path whose
-    //       quote nothing ever closes, and -- added this round -- a path that continues with a BACKSLASH,
-    //       since a backslash is a filename character on POSIX and so cannot be relied on to end anything.
-    //       That last one is not a new residual; it is this clause acquiring one more spelling of "there
-    //       was nothing here strong enough to stop at", which is why it is a widening of R1 (738 to 1017
-    //       cells) rather than a new numbered residual. All four are one clause because they are one
-    //       cause; the matrix
-    //       classifies cells by the delimiter structure of the RENDERED string rather than by how the row
-    //       was built, which is what showed these to be the same residual and not three. ("Rather than a
-    //       NEW NUMBERED RESIDUAL" was written when the next free number was 4; R4 now exists and means
-    //       something else, so the phrasing is by cause, not by index.)
-    //       Not closable, and this is MEASURED rather than argued: admitting whitespace to branch 4's key
-    //       -- the change that would close R1 -- turns tests RED, most of them prose rows in
-    //       Redact_LeavesOperationalDiagnosticsVerbatim: "open /proc/self/fd failed: errno=13",
-    //       "Error opening \"/tmp/file\": errno=13\"", "path /var/log/app: retries=5 attempts",
-    //       "check /var/log then set retries=5" and both st_mode spellings. A residual's justification is
-    //       the easiest thing in this file to write as an excuse, so it is pinned as a mutant: the cost of
-    //       closing R1 is six operator diagnostics, and that number is reproducible rather than asserted. Safe in-tree
-    //       because no genuine door on this backend surfaces a runtime path at all -- the confinement and
-    //       not-found guards pre-empt with their own DescribePath render, and the syscall wrappers
-    //       synthesize a path-free errno detail. Pinned by
-    //       Redact_NoGenuineDoorOnThisBackendSurfacesARuntimePath. Tracked by #704/#708.
+    //   R1  {WHITESPACE-BEARING key} x {NO right delimiter}. Not closable. Safe in-tree because no genuine
+    //       door on this backend surfaces a runtime path at all -- the confinement and not-found guards
+    //       pre-empt with their own DescribePath render, and the syscall wrappers synthesize a path-free
+    //       errno detail. Pinned by Redact_NoGenuineDoorOnThisBackendSurfacesARuntimePath. Tracked by #704/#708.
     //   R2  {key bearing BOTH a quote and whitespace} x {any right delimiter that is NOT a real path
     //       separator}. The errno=13 cell. Irreducible: `o'brien y=v'` and `file": errno=13"` are the SAME
     //       STRING SHAPE, so no recognizer can redact one and preserve the other -- re-admitting quotes to
@@ -1243,67 +1082,13 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
     //       appends "/part-<guid>.parquet" and so supplies the separator branch 1 needs. This is a
     //       monotonicity regression against 9220b66 and is tracked by #714.
     //
-    // A DOCUMENTED OVER-REDACTION, recorded because "unstated" is how four fail-opens got into this file
-    // and the same argument applies to losses in the safe direction. Branch 4 is anchored at $ and its
-    // value class runs to the end of the message, so any prose sitting after an undelimited partition
-    // segment is consumed with the value: "/tbl/name=Alice (errno 13)" renders as "name=<value>" and the
-    // errno goes with it. This is over-redaction, not disclosure, and it is the direct price of closing
-    // mechanism 3 -- an unanchored terminal branch stops mid-value and leaks, so the branch must reach the
-    // end. It is bounded to the terminal segment: prose after a segment that HAS a right delimiter is kept,
-    // which is what the trailing-prose rows in the B4-first table above measure. Not a residual, because
-    // nothing survives that should have been removed; the entry exists so the next reader finds it
-    // measured rather than discovering it.
+    // R3 -- {quote INSIDE the value} -- is closed for the balanced quoting a framework message emits; an
+    // unclosed opening quote belongs to R1 instead.
     //
-    // R3 -- {quote INSIDE the value} -- WAS a residual, was then declared CLOSED one round too early, and
-    // is closed now. Admitting quotes to the value run closed it only for the follower class the corpus
-    // happened to use (a LETTER after the interior quote); every other follower still partial-matched. The
-    // matrix now ranges over the follower explicitly and asserts those cells FULL, so "R3 is closed" is a
-    // measured fact rather than a claim.
-    //
-    // SCOPE THAT CLAIM TO ITS INPUT SET, because three independent censuses disagreed about it and all
-    // three were right. Restricted to BALANCED quoting -- a framework message closes the quote it opens --
-    // the class measures zero. Without that restriction it does not: unbalanced shapes still produce
-    // quote-follower partials, and a census that admits them will report them. Neither result refutes the
-    // other; they are answers about different input sets, and the difference is the restriction, not the
-    // recognizer. So what is claimed here is the narrow thing: R3 is closed for the messages a framework
-    // actually emits. The unbalanced shapes are a SEPARATE and narrower question, they are the "quoted
-    // path whose quote nothing ever closes" clause of R1 rather than a live R3, and they have their own
-    // matrix axis plus Redact_UnclosedOpeningQuote_RedactsTheQuotedRegionAndNothingElse. Stating the
-    // unrestricted result as if it were the restricted one -- in either direction -- is precisely the
-    // failure this comment block has had to retract three times. Note the failure mode this had: a residual declared closed was
-    // checked in neither direction, while the two declared OPEN each had an anti-vacuity assertion. A list
-    // that is only audited where it says "open" will keep drifting where it says "closed".
-    //
-    // R5 -- AND IT IS A PARTIAL RESIDUAL, NOT A DECLINE ONE. This entry previously read "NOT A RESIDUAL",
-    // on the argument that a message opening a quote it never closes places the tail OUTSIDE the quoted
-    // path, so redacting up to the first quote is the correct PARSE. That argument is still true and it is
-    // still the right parse. It is also the wrong claim, because the question a residual list answers is
-    // not "did we parse correctly" but "what can still be disclosed", and those come apart here:
-    //
-    //   stat failed on '/tbl/name=Boys' Club Holdings
-    //     ->            stat failed on '/tbl/name=<value>' Club Holdings
-    //
-    // If the message was truncated, `Club Holdings` is prose and this is a full redaction. If the partition
-    // value was legitimately `Boys' Club Holdings` -- an ordinary possessive, not an adversarial shape --
-    // then a marker has been printed over a value of which half survives. THE TWO INPUTS ARE BYTE-IDENTICAL,
-    // so no recognizer reading this string can tell them apart, and no closing rule exists: resolving the
-    // ambiguity the other way would truncate every legitimately-quoted path at its first interior quote.
-    // Irreducible, and accepted as such.
-    //
-    // What is NOT acceptable is the label. R1 and R2 are DECLINE clauses, and this file states that a
-    // decline list cannot express a partial; filing this under R1 would assert no marker where the code
-    // emits one. A reader auditing "are there partial matches?" would get the wrong answer from a list that
-    // looks complete, which is a worse failure than an omission -- an omission invites a question and a
-    // mislabel closes it. So it is stated separately, as a PARTIAL residual, and tracked by its own issue
-    // rather than folded into a decline clause: #723.
-    //
-    // The census reports PARTIAL 0, and that figure is scoped to the reader's parse -- opening quote to the
-    // first quote of that kind -- which is the parse the recognizer implements. Under the alternate reading
-    // these cells are partial. Both statements are true of different input sets, the same scoping that
-    // applies to R3, and neither refutes the other.
-    //
-    // Pinned by Redact_UnclosedOpeningQuote_RedactsTheQuotedRegionAndNothingElse for the parse, and by
-    // Redact_InteriorQuoteInAValue_IsAnIrreduciblePartialResidual for the disclosure.
+    // R5 is a PARTIAL residual, tracked by #723. A legitimately unclosed or truncated quote can still yield
+    // `stat failed on '/tbl/name=<value>' Club Holdings`; those byte-identical inputs are irreducible at this
+    // layer. Pinned by Redact_UnclosedOpeningQuote_RedactsTheQuotedRegionAndNothingElse for the parse, and
+    // by Redact_InteriorQuoteInAValue_IsAnIrreduciblePartialResidual for the disclosure.
     //
     // ACCEPTED OVER-REDACTION, the safe direction, pinned in Redact_DelimiterAdjacentProse_IsAKnownAccepted-
     // OverRedaction: prose that places a key=value run before a later path separator now loses the value,
@@ -1311,62 +1096,16 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
     //
     // The separator alphabet is DiagnosticText.HiveSeparatorPattern, the same definition DescribePath's
     // HiveSeparatorIndex scans for, concatenated in as a constant so the two recognizers cannot drift.
-    // COST. The figures that used to sit here (~16 ms redacting / ~82 ms declining at 60,000 segments, with
-    // a claimed linear scaling) are WITHDRAWN. They were measured before QuotedPathPrefix existed and they
-    // no longer describe this recognizer, because a variable-length lookbehind changes the complexity class
-    // rather than the constant. Re-measured on the form actually shipped here:
-    //
-    //   UNBOUNDED input, quote-free (the worst case: the backward scan finds no quote and runs to position
-    //   0 from every start position) -- 49 KB in 0.65 s, 99 KB in 2.2 s, 209 KB in 3.5 s, 429 KB in 15.4 s,
-    //   869 KB in 63.3 s. Doubling the input roughly quadruples the time, i.e. QUADRATIC, not linear. This
-    //   was a ReDoS regression that the lookbehind introduced and that no earlier measurement here could
-    //   have caught, since every earlier form scanned forward only.
-    //
-    //   BOUNDED at RedactScanLimit (what Redact actually feeds it) -- ~0.85 ms per call and CONSTANT, since
-    //   the input can no longer grow: 4,096 chars x 100 iterations completes in 83 ms whatever the caller
-    //   passed in. That constant is the only number worth trusting, and it is the reason the bound lives on
-    //   the INPUT and not on the pattern (see Redact).
-    //
-    // Treat the bounded figure as an order of magnitude and not a budget; the unbounded row is recorded
-    // only so the next person to relax RedactScanLimit knows what they are re-enabling. The "faster than
-    // the form it replaces" claim once made here is withdrawn as unmeasurable -- any A/B compares a
-    // source-generated matcher against an interpreted one.
     /// <summary>
     /// Value run and right anchor shared by the two QUOTE-DELIMITED branches of the recognizer.
     /// </summary>
     /// <remarks>
-    /// <para>
-    /// Two independent decisions, and separating them is what took the partial-match count to zero without
-    /// paying for it in diagnosability.
-    /// </para>
-    /// <para>
-    /// THE VALUE RUN IS FULLY PERMISSIVE — it admits quotes. Four reviewers converged on this
-    /// independently and they are right: excluding quotes from the value never protected prose (the KEY
-    /// classes do that work), it only stopped the run at the first INTERIOR quote and let a bare
-    /// <c>(?=['"])</c> be satisfied by it. Spark's <c>escapePathName</c> does not escape an apostrophe and
-    /// <c>add.path</c> is foreign, so <c>name=O'Brien Household</c> is a real partition value, not a
-    /// hypothetical.
-    /// </para>
-    /// <para>
-    /// THE RIGHT ANCHOR IS STRONG — the quote must be followed by a separator, whitespace, end of message,
-    /// or terminal punctuation. Relaxing the value run WITHOUT this, which is the literal form the reviewers
-    /// prescribed, re-opens the class it was meant to close: greedy backtracking settles on the LAST quote
-    /// in the segment, and when that quote is an interior one because the path was never quoted at all,
-    /// <c>&lt;table-root&gt;/name=O'Brien Household</c> emits a marker over <c>O</c> and leaves
-    /// <c>'Brien Household</c> standing.
-    /// </para>
-    /// <para>
-    /// Both halves are pinned by mutation rather than by a census in this comment, which is the policy the
-    /// residual block below explains: reverting the value run to a quote-excluding class, and reducing the
-    /// anchor to a bare <c>(?=['"])</c>, each turn the suite RED — the first on
-    /// Redact_ApostropheBearingPartitionValue_IsFullyStrippedAndKeepsTheProse and the matrix census, the
-    /// second on the unquoted-terminal row of that same test. If either claim here stops being true, a test
-    /// says so.
-    /// </para>
-    /// <para>
-    /// Defined once because two branches use it and a divergence between them is the exact failure this
-    /// recognizer has now had four times.
-    /// </para>
+    /// <para>The value run is fully permissive: quotes are valid value content, so excluding them would stop
+    /// at an interior quote and produce a PARTIAL match.</para>
+    /// <para>The right anchor is strong: the matching quote must be followed by a separator, whitespace, end
+    /// of message, or terminal punctuation. A quote ends the value only when it has closing-delimiter
+    /// evidence too.</para>
+    /// <para>Defined once because the two quote-delimited branches must share the same rule.</para>
     /// </remarks>
     private const string ClosingQuoteValue = @"[^/]*(?=\k<oq>(?:[/\\\s]|$|[.,:;)\]]))";
 
@@ -1374,20 +1113,61 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
     /// Left precondition for the two QUOTE-DELIMITED branches: the path must actually be QUOTED.
     /// </summary>
     /// <remarks>
-    /// <para>
-    /// A quote is only a delimiter if something opened it. Without this, ANY quote inside a value that
-    /// happens to be followed by a boundary character satisfies <c>ClosingQuoteValue</c>, and an ordinary
-    /// partition value truncates mid-string:
-    /// <c>/tbl/email=Boys&#39; Club.taylor%40example.com</c> emits a marker over <c>Boys</c> and leaves
-    /// the rest standing. That is a PARTIAL match, which this recognizer may not produce.
-    /// </para>
-    /// <para>
-    /// Variable-length lookbehind plus a backreference is the whole mechanism: capture the opening quote,
-    /// require no intervening quote between it and the current segment, and require the CLOSING quote to
-    /// be the SAME character. When the path is unquoted the branches decline and the end-of-message branch
-    /// consumes the value in full, which is why closing this cost no coverage.
-    /// </para>
+    /// <para>A quote is only a delimiter if something opened it. Without this, any interior quote followed
+    /// by a boundary would satisfy <c>ClosingQuoteValue</c> and truncate a partition value mid-string.</para>
+    /// <para>The lookbehind captures the opening quote, keeps the segment free of intervening quotes, and
+    /// requires the closing quote to match the same character. When the path is unquoted these branches
+    /// decline and branch 4 consumes the value in full.</para>
     /// </remarks>
+    // Separator roles are deliberate. `\` is admitted in every VALUE class because on POSIX it can be
+    // content. The left-anchor question is narrower: a backslash may open a segment only while no Hive
+    // separator has yet appeared in the current forward-slash segment. After that, everything further along
+    // the run is value content and a `\` would invent a synthetic sub-key inside it.
+    //
+    // MECHANISM 7 (from PathDisclosureHygieneTests.Redact_RootlessRelativePath_RedactsTheFirstSegmentToo). add.path is RELATIVE by the Delta protocol, so a message may begin with its first
+    // `key=value` segment. Branch 5 (RootlessPathValue) therefore takes its path evidence from the RIGHT: a
+    // following `/...` proves a path continues without weakening the anchored branches above it.
+    // PathRegionStart lets that branch open at the start of input, after a quote, or after whitespace.
+    //
+    // It deliberately does NOT match a bare key=value with no separator evidence. That is residual R4: a
+    // key=value carrying no separator evidence ANYWHERE. `k=v` and `k=v.parquet` still decline. `k=v\` does not.
+    private const string RootlessPathValue = @"[^/]*(?=/[^/]*(?:[/'""]|$))";
+
+    /// <summary>
+    /// Right anchor for a rootless path whose only separator evidence is a BACKSLASH.
+    /// </summary>
+    /// <remarks>
+    /// <para>The value runs to the end of the message. On POSIX a backslash is ordinary filename content,
+    /// so stopping at <c>\</c> would emit a marker over a partially consumed value.</para>
+    /// <para>The evidence required is a backslash ANYWHERE, including a trailing one. Branch 6 is the
+    /// rootless backslash-only sibling to branch 5 and closes the former trailing-backslash R6 case without
+    /// reintroducing partial matches.</para>
+    /// <para>The asymmetry with branch 5 is deliberate: <c>/</c> is a real component boundary, so branch 5
+    /// may let the tail survive; <c>\</c> is not, so branch 6 must consume it.</para>
+    /// </remarks>
+    private const string RootlessBackslashPathValue = @"(?=[^/]*\\)[^/]*$";
+
+    private const string PathRegionStart = @"(?<![^/\\""'\s])";
+
+    // Guard-site mutation profile for NoSeparatorEarlierInSegment/QuotedPathPrefix, measured per-site
+    // at the alternation that exists today. Every site is now subsumed while branch 6
+    // (RootlessBackslashPathValue) is present; the per-site pin is in
+    // PathDisclosureHygieneTests.SegmentGuard_PerSiteProfile_IsMeasuredAtThisHeadRatherThanDescribed
+    // (which reads the pattern by reflection and deletes branch 6 at
+    // runtime to restore individual teeth). Historical baseline:
+    // MEASURED-AT 83b88dc — dropping `^` killed 6 tests, dropping `/` killed 5; at the next commit both
+    // killed 0 as branch 6 became the sub-key blocker. The per-site test now owns these numbers.
+
+    // The left anchor resolves the backslash guess in the same fail-closed direction as the value classes.
+    // NoSeparatorEarlierInSegment scans the current forward-slash segment (including `^` for Windows-shaped
+    // paths with no `/`) and declines once a Hive separator has already appeared there. After a separator,
+    // a `\` is inside value content and must not start a synthetic sub-key. QuotedPathPrefix reuses the
+    // same rule for quote-delimited openings.
+    private const string NoSeparatorEarlierInSegment =
+        @"(?<!(?:^|/)[^/]*" + DiagnosticText.HiveSeparatorPattern + @"[^/]*)";
+
+    private const string QuotedPathPrefix = @"(?<=(?<oq>['""])[^'""]*?[/\\])" + NoSeparatorEarlierInSegment;
+
     // EVERY SITE THE SEPARATOR ALPHABET IS SPELLED, AND WHAT EACH ONE DOES WITH A BACKSLASH. Two rounds
     // running, this rule was applied where a defect was measured rather than at every position the
     // property has to hold, and each time the next reviewer found the position that was missed. So the
@@ -1395,7 +1175,7 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
     //
     //   1. value classes, all six branches       [^/]*            admits \ -- a value may contain one
     //   2. branch 1 right anchor                 (?=/)            excludes \ -- it must not END a value
-    //   3. ClosingQuoteValue right anchor        \k<oq>(?:[/\\\\s]...) admits \ AFTER the closing
+    //   3. ClosingQuoteValue right anchor        \k<oq>(?:[/\\\s]|$|[.,:;)\]]) admits \ AFTER the closing
     //                                            quote, where it is past the value and cannot truncate it
     //   4. branches 1 and 4 left anchor          (?<=[/\\])       admits \, guarded (below)
     //   5. QuotedPathPrefix left anchor          [/\\]           admits \, guarded (below)
@@ -1425,428 +1205,6 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
     // attribute and row 7 lives in the sibling, so those remain prose obligations; that limit is written
     // down rather than left implied, because a completeness check that quietly is not one is the defect
     // this whole table exists to prevent.
-    //
-    // ROW 10 WAS MISSING FROM THE DAY THE GUARD WAS WRITTEN, for a third consecutive round of this table
-    // being incomplete, and it was found by grepping for the alphabet rather than by reading the table.
-    // Row 11 is new in the same commit and was written INTO the table before the constant was declared,
-    // which is the order this table only becomes reliable in once the check runs.
-    //
-    // SITE 8'S MISSING ROW WAS THE LEAKING CONSTRUCT. That is not a coincidence and it is the strongest
-    // argument for keeping this table honest. Before the round that added these entries, site 8's anchor
-    // read (?=/[^/\s]*...) -- it excluded WHITESPACE from the segment after the value, so a file name with
-    // a space in it made the whole branch decline and a rootless partition value went out in full. Had the
-    // site been enumerated, its disposition would have had to be written down as "excludes whitespace in a
-    // segment the value does not live in", and that sentence does not survive being read. The documentation
-    // gap and the disclosure were the same omission at two layers, found by two different reviewers, and
-    // they are closed in the same commit.
-    //
-    // SITES 8 AND 9 WERE MISSING FOR TWO ROUNDS. Branch 5 introduced both, one edit updated entry 1 to say
-    // "all five branches", and the two new constants were never given rows. A reviewer swept for stale
-    // claims here and reported the table consistent, because it IS consistent: the header says seven and
-    // seven rows follow. A COUNT-CHECK CANNOT DETECT A MISSING ROW -- the observable is identical whether
-    // the table is complete or not, which makes a totality claim the one kind of prose that cannot be
-    // audited by reading it. The only check that discriminates is the one that goes the other way: grep
-    // the file for separator alphabets and confirm every occurrence has a row. TWO reviewers swept this
-    // table in the same round and each found ONE of the two missing entries -- one the left anchor, one the
-    // right. Neither sweep was wrong and neither was complete, which is the same partial-sweep pattern the
-    // table exists to prevent, arriving in the audit of the table rather than in the code. That is the check to run
-    // when a branch is added, and it is stated here because the table's own purpose -- preventing a rule
-    // applied at some positions and not others -- was defeated at exactly the position it did not list.
-    //
-    // Site 7 is the other recognizer and it needed the guard twice: the latch stopped a value being echoed
-    // as a FILE NAME, and a second round found the same value still being echoed as a COLUMN NAME by the
-    // key harvester. Suppressing one echo of a token says nothing about the others.
-    //
-    // THE LEFT ANCHOR NEEDS THE SAME POSIX RULE AS THE RIGHT ONE, BUT NOT THE SAME REMEDY.
-    // A backslash is an ordinary filename character on POSIX (see the block above), so it cannot be
-    // trusted to END a value -- that is why every value class is now [^/]*. The mirror-image question is
-    // whether it may START a key, and the naive uniform answer, "no, drop it from the left anchors too",
-    // is WRONG. Measured: dropping it turns C:\\warehouse\\tbl\\email=alice@example.com\\part-1.parquet
-    // from a full redaction into a DECLINE, because a Windows-shaped message contains no forward slash to
-    // anchor on at all. That is not a conservative outcome; on a Windows or PVC host it surrenders every
-    // partition value in the deployment. The rule is not "a backslash is never a separator" -- it is that a
-    // backslash may never RESOLVE THE PLATFORM GUESS TOWARD DISCLOSURE, and which way that cuts depends on
-    // the syntactic position, because the DIRECTION OF THE ERROR differs:
-    //
-    //   right anchor / value class : guessing "separator" ends the value early -> the tail SURVIVES -> PARTIAL.
-    //   left anchor                : guessing "not a separator" only fails to start -> DECLINE, never PARTIAL.
-    //   left anchor                : guessing "separator" invents a segment INSIDE a value, and the synthetic
-    //                                sub-key is then echoed verbatim by ${key} -> PARTIAL.
-    //
-    // So the left anchor has a leaking guess too, just a different one, and it needs a narrower remedy than
-    // exclusion. This is it: a backslash may open a segment only while no Hive separator has yet appeared in
-    // the current forward-slash segment. Once one has, everything further along that run is value content and
-    // no sub-key inside it is real. That is the identical rule DiagnosticText.DescribePath latches with
-    // hiveInBackslashRun, arrived at from the other recognizer, and the two halves now agree on it by
-    // construction rather than by coincidence.
-    //
-    // The guard costs nothing at a slash-opened position: neither [^/]* may cross the slash, so the pattern
-    // can never end immediately after one. It therefore constrains exactly the backslash arm while being
-    // written once, which is the point -- the previous defect was a rule applied at some positions and not
-    // others. It over-declines on one documented shape: prose carrying an equals sign with no slash between
-    // it and a Windows path ("retries=5 then check C:\\tbl\\name=..."). That is the safe direction and it
-    // is asserted, not assumed, by Redact_ProseEqualsBeforeAWindowsPath_DeclinesRatherThanInventingAKey.
-    // THE `^` ALTERNATIVE IS LOAD-BEARING, AND THE WAY I NEARLY LOST IT IS THE LESSON. The guard scans
-    // back to the start of the current forward-slash segment; on a Windows-shaped message there is no
-    // forward slash anywhere, so `^` is the ONLY scan origin and without it the guard stops guarding
-    // exactly the shape the Windows cost argument above makes load-bearing. Deleting it reopens 138
-    // census cells as PARTIAL -- C:\\warehouse\\my col=<value>\\<value>=<marker> with two sentinels
-    // surviving under a marker -- and is pinned by Redact_WindowsRootWithTwoSeparators_...
-    //
-    // I reported this alternative as unpinned-but-harmless on the strength of a mutant that WIDENED the
-    // guard's start set and changed no cell. That was true and it was worthless: widening a guard can only
-    // make the recognizer more conservative, so it can never demonstrate the guard is load-bearing. A
-    // mutation run in the direction that cannot leak is not evidence about the direction that can. Two
-    // rules come out of it, and both generalize past this line:
-    //
-    //   - EQUIVALENCE IN THE SAFE DIRECTION IS NOT EVIDENCE OF PINNING. Mutate toward disclosure.
-    //   - INTRODUCING A NEW CONSIDERATION INVALIDATES EVERY PRIOR EQUIVALENCE MEASUREMENT WHOSE CORPUS
-    //     DOES NOT RANGE OVER IT. The commit that added the Windows cost argument is the commit that made
-    //     a slash-free root relevant, and the equivalence was measured in that same commit on a corpus
-    //     that predated the argument. A 0-RED result carried across a change of argument measures the old
-    //     world. The corpus and the argument have to move together.
-    // MECHANISM 7 AND THE BRANCH THAT CLOSES IT. add.path is RELATIVE by the Delta protocol, so a message
-    // can carry a partition path with nothing before the first key. That first segment has no left
-    // delimiter and could never match, while the SECOND segment still did -- printing a marker over an
-    // unredacted head, the worst reading available, because the reader is told a value was removed and one
-    // was, just not that one:
-    //
-    //   email=alice%40example.com/region=<value>/part-0.parquet
-    //
-    // The left anchor exists to prove we are in a PATH rather than in prose, since key=value is also what
-    // an operator diagnostic looks like. A preceding separator is that proof, and a rootless segment has
-    // none -- so the proof has to come from the right instead. My first attempt simply weakened branch 1's
-    // left anchor, on the reasoning that branch 1 already requires a following slash. A following slash is
-    // NOT sufficient, and ordinary prose says so:
-    //
-    //   compression ratio=1/2 rejected      ->  ratio=<value>/2 rejected
-    //   mount option uid=1000/gid=1000 ...  ->  uid=<value>/gid=<value>
-    //   quota=80/100 exceeded               ->  quota=<value>/100 exceeded
-    //
-    // Eight prose rows did not contain a single key=N/M, so the corpus that exists to protect operator
-    // diagnostics could not see it. So the weak-left case is its own branch with a STRONGER right anchor
-    // than branch 1 has, rather than a relaxation of branch 1 -- rooted behaviour is untouched, and the
-    // ladder stays honest: the strength a branch needs at one end depends on what it already has at the
-    // other.
-    //
-    // THE DISCRIMINATOR THAT ANCHOR FIRST USED WAS FALSE, and it is worth the space because it was false
-    // about the domain rather than about the regex. It read: a PATH segment contains no whitespace and
-    // ends at a separator, a quote or end of input, whereas prose resumes with a space. Parquet file names
-    // contain spaces. `part 0.parquet` is an ordinary name, and one space ONE SEGMENT DOWNSTREAM of the
-    // value made the whole branch decline:
-    //
-    //   k=SENTINEL/part-0.parquet   ->  k=<value>/part-0.parquet     redacted
-    //   k=SENTINEL/part 0.parquet   ->  k=SENTINEL/part 0.parquet    ECHOED IN FULL
-    //
-    // That is not a residual, it is an ATTACKER-SELECTABLE OPT-OUT: add.path is foreign, so the writer of
-    // the poisoned path chooses whether the recognizer runs by choosing a file name. This file's own rule
-    // -- a shape the recognizer declines is a redaction the attacker opted out of by choosing it -- has no
-    // exception for shapes that are expensive to close. So the downstream whitespace class is gone and the
-    // right anchor is (?=/[^/]*(?:[/'"]|$)).
-    //
-    // AND THAT CLOSURE IS TOTAL, NOT NARROWED, WHICH IS A STRUCTURAL ARGUMENT AND NOT A CELL COUNT. Once a
-    // `/` follows the value, [^/]* cannot cross a separator, so the run after that slash always terminates
-    // at either a later `/` or `$` -- the alternation (?:[/'"]|$) is therefore SATISFIABLE BY CONSTRUCTION
-    // for every input of this shape. There is no residue of the whitespace class left to find, and no
-    // downstream character class remains that an attacker could steer. This is worth more than the cell
-    // counts that accompany it: a census says no cell in this corpus opts out, whereas this says no cell
-    // CAN. Corpora are how the defects here were found; arguments of this shape are how a class is closed.
-    //
-    // THE COST, measured and pinned rather than asserted to be small: four rootless key=N/M prose rows
-    // move from the verbatim corpus to Redact_DelimiterAdjacentProse_IsAKnownAcceptedOverRedaction, with
-    // their exact rendered text. `compression ratio=1/2 rejected` becomes `ratio=<value>/2 rejected` --
-    // the key, the denominator and the surrounding prose survive and a numerator is lost. The trade is a
-    // numerator in a rootless framework message against a partition value echoed in full, and it is only
-    // a trade at all because both readings of `key=value/token token` are genuinely available; there is no
-    // third option that keeps both, and I looked for one before taking the cost.
-    //
-    // THE GENERAL FORM, since this is the fourth time this recognizer and DescribePath have disagreed:
-    // A CLASS THAT NARROWS A RECOGNIZER ON EVIDENCE THE ATTACKER SUPPLIES IS A SWITCH THE ATTACKER OWNS.
-    // The four drifts were the fragment alphabet, the search strategy, the separator alphabet, and this --
-    // the whitespace class of a segment the value does not even live in. Each was found by a different
-    // reviewer's corpus, never by reasoning, which is why the two recognizers are now compared cell by
-    // cell over the whole corpus rather than at the positions a defect was last measured.
-    //
-    // A FIFTH drift followed anyway, at the R4 boundary below, and the cell-by-cell comparison did not see
-    // it -- because the comparison EXCUSES any divergence that lands in a filed residual, and the predicate
-    // naming that residual was wider than the residual itself. Comparing two recognizers everywhere is not
-    // enough if the disagreements are triaged by a predicate nobody checked against the text it models.
-    //
-    // Its key class also excludes whitespace. A rootless key is the weakest evidence in the file and does
-    // not get the permissive key class as well. That exclusion is DEFENCE IN DEPTH AND IS NOT CLAIMED AS
-    // PINNED: admitting whitespace to it turns no test red, and I could not build a row that discriminates,
-    // because PathRegionStart opens after any whitespace, so a strict key simply starts at the last space
-    // and the echoed ${key} comes out identical either way. Per the rule recorded at the segment guard, a
-    // mutation in the over-redacting direction proves nothing about pinning, and "no test failed" is not a
-    // licence to call it equivalent -- it is recorded as unpinned so the next reader knows which it is.
-    //
-    // What it deliberately does NOT do is match a bare key=value with no slash at all. That is residual R4:
-    // indistinguishable from errno=13 by any means available in the string, and redacting it would destroy
-    // the diagnostics this recognizer is built to preserve.
-    //
-    // R4 IS NARROWER THAN EVERY CLASSIFIER THAT MODELLED IT, AND THE GAP WAS A LIVE DISCLOSURE.
-    // Read the sentence above literally: the justification is INDISTINGUISHABILITY, and the qualifying
-    // phrase is "by any means AVAILABLE IN THE STRING". A backslash is such a means. `errno=13` has none;
-    // DescribePath reaches a FULL redaction on `k=SENTINEL\part.parquet` using nothing else; and this
-    // recognizer already accepted a backslash as evidence when the path was ROOTED, redacting
-    // `C:\t\k=SENTINEL\part.parquet` via branch 4. Accepting the same separator rooted and rejecting it
-    // rootless was an internal inconsistency, not a principled decline -- sibling drift #5, and a value
-    // echoed in full on any relative add.path written by a Windows or PVC writer.
-    //
-    // HOW IT SURVIVED FIVE REVIEWS. This block says "no slash at all". Every classifier written against it
-    // -- three independent corpora, five reviewers, and the outsideBoth == 0 assertion added one round
-    // earlier for the express purpose of stopping over-wide claims -- said "no FORWARD slash". A predicate
-    // WIDER than the residual it models does not merely fail to catch the cell: it files the cell under a
-    // residual that has been argued irreducible, which converts a finding into an excuse and does it
-    // silently. An omission invites a question; a MISLABEL closes it.
-    //
-    // Branch 6 closes it, and R4 keeps only what its own sentence describes: a key=value carrying no
-    // separator evidence ANYWHERE. `k=v` and `k=v.parquet` still decline. `k=v\` does not.
-    //
-    // R6 IS CLOSED, AND IT WAS THE THIRD ATTACKER-SELECTABLE OPT-OUT. Branch 6 first read
-    // `(?=[^/]*\\[^/])`, requiring the backslash to have CONTENT AFTER IT, which spared the prose row
-    // `st_mode=0100644\`. That one character was a switch: a value ending AT its backslash declined and
-    // echoed in full, so the author of a poisoned `add.path` opted out of redaction by ending the path at a
-    // separator -- which is the natural spelling of a partition DIRECTORY. The sixth drift, introduced by
-    // the commit that fixed the fifth, in the construct that fixed it.
-    //
-    // THE RULE THAT SETTLES IT IS ALREADY IN THIS FILE, one paragraph down, and it points the other way
-    // from where it was applied. Branch 6 consumes its tail because on POSIX a `\` is an ordinary filename
-    // character, so a value may legitimately END with one and cutting there would emit a marker over a
-    // partly-consumed value. The same premise forbids a trailing `\` from being the thing that DENIES
-    // evidence: it cannot simultaneously be an ordinary character too weak to bound a value and a signal
-    // strong enough to prove the string is prose. That is why the terminal case was a bug rather than a
-    // second, symmetric asymmetry -- one premise, applied consistently, decides both.
-    //
-    // ITS REACHABILITY WAS DISPUTED, AND THE DISPUTE IS RECORDED AS MOOT RATHER THAN RESOLVED. One reviewer
-    // held that no door presents the bare shape, because Redact is only ever handed a path already made
-    // ROOTED, so `k=QQSENTINELQQ\` renders `Could not delete file <table-root>/k=<value>` -- clean, the root
-    // supplying the evidence the string lacks. Another held that a foreign `add.path` naming a partition
-    // directory ends at its separator by nature. Both measurements reproduce; the fix was one character
-    // wide, and this file has already been wrong twice about what an attacker can reach. Settling a
-    // reachability argument is worth less than the round it costs whenever the fix is cheaper than the
-    // argument, and betting a disclosure on the caller's habits is the coupling the residual was filed to
-    // name in the first place. Both layers now hold independently -- the door roots the path AND the
-    // recognizer redacts the bare string -- which is what keeps the dispute moot instead of load-bearing.
-    //
-    // A CANDIDATE FOURTH OPT-OUT, RECORDED AS A CANDIDATE AND DECLINED -- read this before hunting one.
-    // The strongest shape anyone has found that still survives is the QUOTED ROOTLESS SINGLE SEGMENT:
-    //
-    //     Could not find file 'email=SENTINEL'.        survives in full
-    //     Access to the path 'email=SENTINEL' is denied.  survives in full
-    //     'email=SENTINEL/p.parquet'  '/tbl/email=SENTINEL'  'email=SENTINEL\'   all redact
-    //
-    // It is DECLINED, and it is genuinely R4 rather than an excuse: the message carries no separator in
-    // either alphabet, so by the residual's own sentence nothing in it proves the token is a path. The
-    // quotes are the only candidate evidence, and admitting a bare quote re-breaks the pinned prose row
-    // `Error opening "/tmp/file": errno=13"` -- which is the row branch 3's whole right-anchor design
-    // exists to preserve. Verified at this HEAD: that row is still verbatim.
-    //
-    // THE NARROWING THAT WOULD REACH IT, if it is ever needed, is an opening quote IMMEDIATELY ABUTTING
-    // `key=` -- `'email=` -- which the errno row never is, because its quote sits several tokens to the
-    // left. That is a real distinction and it is written down here for one reason: the next person hunting
-    // opt-outs will re-derive this shape, and without the cost stated they will either file it as a
-    // disclosure it is not, or implement quote-as-evidence and discover the errno row the hard way.
-    // Naming what a fix would COST is the part of a decline that keeps it from being an excuse.
-    //
-    // AND THE DIRECTION OF EVERY DRIFT SO FAR IS ITSELF A FINDING. Across a separator-agnostic census of
-    // 3,808 cells, every single divergence between this recognizer and DescribePath ran the same way:
-    // describe=SUPPRESSED, redact=ECHOED. Six drifts, six times the pattern-matcher was the weaker of the
-    // two, and never once the splitter. That is not luck -- DescribePath decides by SPLITTING on a
-    // separator set, so a new shape is a new segment and the default is to suppress; Redact decides by
-    // MATCHING, so a new shape is an unmatched one and the default is to pass through. A structure whose
-    // failure mode is "emit the input" will drift toward disclosure every time, which is why the sibling
-    // census exists at all, and why the review effort belongs HERE rather than split evenly between them.
-    //
-    // THE COST, MEASURED: exactly one prose row, `st_mode=0100644\`, which moves to the accepted
-    // over-redaction corpus and loses a trailing separator off a mode bitmask. Flipping the character
-    // breaks five tests; the other four are expectations encoding the old behaviour. Against a value going
-    // out in full the trade is not close, and it is the same trade taken one round earlier when the
-    // whitespace-reachability narrowing was rejected: pay in over-redaction rather than leave a switch.
-    // The census moved only toward FULL -- 135 cells in the monotonicity matrix, 29 in the tail axis, with
-    // R1, R2 and R4 all shrinking and nothing moving the other way.
-    //
-    // "Not preceded by anything that is not a separator, quote, or whitespace" also succeeds at position
-    // zero, so one lookbehind covers rootless, post-quote and post-space openings alike.
-    private const string RootlessPathValue = @"[^/]*(?=/[^/]*(?:[/'""]|$))";
-
-    /// <summary>
-    /// Right anchor for a rootless path whose only separator evidence is a BACKSLASH.
-    /// </summary>
-    /// <remarks>
-    /// <para>The value runs to the end of the message, exactly as branch 4's does, rather than stopping at
-    /// the backslash: on POSIX the backslash is an ordinary filename character, so everything after it is
-    /// still the same component's VALUE, and stopping there would emit a marker over a partially consumed
-    /// value -- partial-match mechanism 6, which every value class in this file exists to prevent.</para>
-    /// <para>The evidence required is a backslash ANYWHERE, including a trailing one. Requiring content
-    /// after it was the third attacker-selectable opt-out; see the R6 paragraph above for why the same
-    /// premise that makes this branch consume its tail also forbids a trailing backslash from denying
-    /// evidence.</para>
-    /// <para>WHY THE TWO SEPARATORS ARE HANDLED DIFFERENTLY, which is the question every reader of a file
-    /// with five recorded drifts will ask on sight. Branch 5 lets the tail SURVIVE
-    /// (<c>k=&lt;value&gt;/a/b (errno 13)</c>); branch 6 consumes it. That asymmetry in the code is what
-    /// makes the two cases SYMMETRIC UNDER THE INVARIANTS: a <c>/</c> is a component boundary on every
-    /// platform, so the value provably ends there and what follows is not value content; a <c>\</c> is an
-    /// ordinary POSIX byte, so stopping there would emit a marker over a PARTLY-CONSUMED value, which is an
-    /// invariant 1 violation. Consuming to end of input is then the only option that satisfies invariant 3,
-    /// FULL or DECLINE and never PARTIAL. Treating the two separators identically is what would be
-    /// asymmetric -- it would apply one rule to a boundary and the same rule to a byte.</para>
-    /// <para>MEASURED, NOT ONLY ARGUED. Substituting <c>[^/\\]*</c> for the value run -- i.e. stopping at the
-    /// backslash -- turns 32,193 cells of the guard corpus that this recognizer renders CLEAN into
-    /// mechanism-6 partials of exactly the predicted shape, <c>email=&lt;value&gt;\QQSENTINELQQ</c>: a marker
-    /// standing beside the very run it claims to have replaced. So consuming to end of input trades
-    /// disclosure for over-redaction deliberately, and the trade is forced by invariant 3 rather than
-    /// incidental. Two reviewers reached the same conclusion independently, one analytically and one by
-    /// measuring the counterfactual on its own corpus.</para>
-    /// <para>The evidence class is deliberately NOT narrowed to "a backslash reachable without crossing
-    /// whitespace", which would spare the prose row <c>retries=5 then check C:\\tbl\\name=...</c> from
-    /// collapsing to <c>retries=&lt;value&gt;</c>. A space inside the value is ATTACKER-SUPPLIED, so that
-    /// narrowing is a switch the attacker owns -- <c>k=a b\\c.parquet</c> would decline and echo -- which is
-    /// the defect closed one round earlier in <see cref="RootlessPathValue"/>. The cost is paid instead as
-    /// over-redaction, in the corpus that already records over-redaction of delimiter-adjacent prose.</para>
-    /// </remarks>
-    private const string RootlessBackslashPathValue = @"(?=[^/]*\\)[^/]*$";
-
-    private const string PathRegionStart = @"(?<![^/\\""'\s])";
-
-    // WHICH SITES OF THIS GUARD ARE LOAD-BEARING, MEASURED PER SITE RATHER THAN AS A WHOLE. Deleting the
-    // guard from one branch at a time gives three different answers, and the differences are the useful
-    // part. MEASURED-AT the commit that added branch 6, and not re-run since -- the counts below are facts
-    // about that tree, not about the one you are reading:
-    //
-    //   branch 4 (terminal)     RED 10, 738 cells   load-bearing outright
-    //   quoted prefix           RED  3, 198 cells   load-bearing outright
-    //   branch 1 (slash-right)  GREEN               MASKED, not subsumed -- see below
-    //   branch 5 (rootless)     GREEN               masked the same way, by branch 1
-    //   branch 6 (rootless \)   GREEN               added later; see the RE-MEASUREMENT below
-    //
-    // ...and the row branch 6 never got when it was added, which is the omission this table exists to
-    // prevent and committed anyway. It is GREEN, and for the same reason every other site is now green:
-    // branch 6 itself masks them. The whole profile is measured in the test named below.
-    //
-    // THE TABLE ABOVE IS THE OLD MEASUREMENT AND THE WHOLE ROW SET IS NOW SUPERSEDED -- kept because the
-    // way it went stale is the finding. The guard is spelled FIVE times in source (branches 1, 4, 5 and 6
-    // directly, plus once inside QuotedPathPrefix) and SIX times in the compiled pattern, because
-    // QuotedPathPrefix is used by branches 2 and 3. This table said FOUR, and branch 6 had no row at all,
-    // for the same reason and in the same commit as every other stale structural count here.
-    //
-    // RE-MEASURED AFTER BRANCH 6, AND THE ANSWER CHANGED FOR EVERY SITE AT ONCE. MEASURED-AT 83b88dc and
-    // at the commit that added branch 6; not re-run since. At 83b88dc, dropping the
-    // guard's `^` origin killed 6 tests and dropping its `/` origin killed 5. At the commit that added
-    // branch 6, both dropped to ZERO -- and deleting the guard from ALL SIX compiled sites is now
-    // output-identical over 168,000 corpus cells. It is not inert: delete branch 6 as well and the guard
-    // immediately regains its teeth in the DISCLOSURE direction, harvesting a sub-key from inside the value
-    // and echoing it through ${key}. Masking, not equivalence.
-    //
-    // THE SIXTH CAUSE, RUNNING BACKWARDS, AND IT ARRIVED IN THE COMMIT THAT NAMED THE SIXTH CAUSE. Below,
-    // TIME is recorded as "an equivalence certified before its masker existed". This is the mirror image:
-    // A NEW BRANCH SILENTLY UN-PINNING AN EXISTING GUARD. It is the more dangerous orientation, because the
-    // certification was correct when made AND the guard is still load-bearing -- only its PIN is gone, so
-    // nothing fails and nothing tells you. Hence the rule, which is the operational form of the sixth
-    // cause: ANY COMMIT THAT ADDS A BRANCH TO THE ALTERNATION MUST RE-RUN EVERY GUARD-SITE MUTATION,
-    // because a new branch can absorb another guard's failures without touching it. This is the second time
-    // an alternation change has invalidated a prior mutation result.
-    //
-    // AND THE RE-RUN IS NOW AUTOMATIC, because a rule that depends on someone remembering it is the same
-    // artifact as a prose table asserting completeness. See
-    // PathDisclosureHygieneTests.SegmentGuard_IsSubsumedByTheRootlessBranches_ButOnlyWhileTheyExist: it
-    // takes the SHIPPED pattern text, deletes the guard from it at runtime, and asserts both halves --
-    // output-identical while branch 6 exists, and materially different (with a sub-key echo) once branch 6
-    // is removed. It also asserts the site count, so the number in this paragraph is checked by the build
-    // rather than maintained by hand. The day the guard stops being subsumed, that test fails and says so,
-    // which is what a comment reading "currently masked" could never do.
-    //
-    // Branch 1 measures green because the regex engine scans left to right and branch 5 reaches the REAL
-    // key at an earlier start position, so branch 1 never gets offered the synthetic one. Delete branch 5
-    // as well and branch 1's guard becomes load-bearing immediately.
-    //
-    // THAT SENTENCE IS STILL TRUE. THE EVIDENCE IT USED TO CITE IS NOT, AND THE ROW READ AS PLAUSIBLE
-    // THROUGHOUT. It used to end "RED 5, and the partials are the BACKSLASH class" -- MEASURED-AT the
-    // commit that wrote it. Deleting branch 5 now fails a large set of tests, and turning branch 1's guard
-    // off on top of that fails exactly the same set -- increment zero, no backslash partials. The row's claim was re-derived at the level of the recognizer
-    // instead, and it holds: branch 1's site goes from 0 to 1,152 differing cells the moment branch 5 is
-    // removed, every one of them a sub-key echo.
-    //
-    // SATURATION, NOT MASKING -- CAUSE TWO, NOT CAUSE FOUR, and the distinction is not pedantry because the
-    // two have opposite remedies. Masking is repaired by re-pinning against the masker; saturation is
-    // repaired by measuring something finer-grained than a pass/fail count. A reviewer reading only the
-    // suite delta reached the masking diagnosis and named branch 6 as the masker. Branch 6 is measurably
-    // NOT the masker here: the DIFFERING CELLS are byte-identical with branch 6 present and absent, which
-    // is asserted by set equality rather than by comparing two counts. The backslash partials the row cited
-    // are gone for an unrelated reason -- branch 6 now redacts that class outright.
-    //
-    // AND THE GENERAL LESSON, WHICH IS WHY THIS ROW IS NOW A TEST: a row whose evidence is "N tests go red"
-    // is only as good as the corpus behind N, and it rots the moment anything ELSE in the file starts
-    // failing first. Rows stating a count of the code's own shape rot VISIBLY -- someone eventually counts.
-    // Rows stating a RED delta rot INVISIBLY, and keep reading as plausible while doing it. Every row of
-    // this table was of the second kind.
-    //
-    // THE SWEEP WAS BUILT FOR ONE TABLE AND NOT RUN ON THE OTHER, IN THE SAME COMMIT. The every-site sweep
-    // exists forty lines up, for the separator alphabet, and was created by the commit that left this table
-    // with a missing row and a stale reason. That is this recognizer's own recurring defect -- the rule
-    // applied where a defect was measured rather than at every position the property has to hold -- applied
-    // to the artifact built to prevent it. Both tables are now executable:
-    // PathDisclosureHygieneTests.SegmentGuard_PerSiteProfile_IsMeasuredAtThisHeadRatherThanDescribed
-    // measures every site under every branch set and pins the whole profile, so a row cannot go stale in
-    // its reasoning while remaining plausible.
-    //
-    // AND THAT PROFILE IS THE RE-PIN THE UN-PINNING ASKED FOR, which is the part worth reading twice. The
-    // two halves of this guard's origin set lost their individual killers when branch 6 landed.
-    // MEASURED-AT 83b88dc and at the commit after it; not re-run since: dropping `^` killed 6 tests and
-    // dropping `/` killed 5; at the next commit both killed zero. Neither
-    // half is pinned by the whole-guard subsumption test either, because as SHIPPED the guard is inert, so
-    // any edit to it is output-identical. The per-site profile restores both pins without changing the
-    // recognizer at all, by measuring the guard where it still has an effect:
-    //
-    //   drop `^` from the origin set   quoted-prefix site, without branch 6: 480 cells -> 96    RED
-    //   drop `/` from the origin set   quoted-prefix site, without branch 6: 480 cells -> 384   RED
-    //   add `\` to the origin set      whole profile unchanged                                  GREEN
-    //
-    // The third is recorded because it is GREEN and should be: widening the set of positions an earlier
-    // separator may sit at only makes the guard decline MORE, which is the safe direction, and equivalence
-    // in the safe direction is not evidence of pinning. A mutation score is only meaningful when the mutant
-    // moves toward DISCLOSURE. Both mutants that do are now killed on a measured number rather than on a
-    // pass/fail count, which is also why the guard's text is read out of this class by reflection in the
-    // test rather than transcribed there: an earlier draft transcribed it, and both mutants then failed on
-    // "expected 6 sites, actual 0" -- a report that the copy had drifted, carrying no information about
-    // behaviour at all.
-    //
-    // So the guard stays on ALL FIVE SOURCE SITES, and none of them is removed on the strength of the
-    // subsumption above. "Correct only while some other branch is present" is not a property a recognizer
-    // should rely on silently, and it is now not relied on silently: it is asserted, with its own
-    // dependency stated in the assertion. A single-site mutation score is a statement about the CURRENT
-    // branch set, not about the site -- which is exactly why the site count and the subsumption are both
-    // executed rather than described.
-    //
-    // AND A SIXTH CAUSE OF A 0-RED SURVIVOR, which is the one none of the other five is: TIME. An
-    // equivalence can be certified correctly and become false when a LATER commit adds the masker. A
-    // reviewer paired branch 1's guard with branch 4 and certified a genuine equivalent; the real masker is
-    // branch 5, which did not exist when the pairing was run. The classification was right when made. The
-    // other five causes -- mis-scoped mutant, saturated corpus, safe-direction mutation, masking, and a
-    // corpus that predates the argument -- are all properties of the ANALYSIS, and can be found by
-    // re-reading it. This one cannot: nothing about the measurement is wrong, and no amount of re-reading
-    // reveals it. Only re-running does.
-    //
-    // WHICH MAKES "RE-DERIVE EVERY EQUIVALENCE CLAIM WHEN A BRANCH IS ADDED" A STANDING OBLIGATION, of the
-    // same shape as the separator-alphabet sweep above, and it is easier to skip because each individual
-    // claim still reads correctly. The two claims in this file that predate branch 5 were re-derived
-    // against it rather than assumed to survive:
-    //
-    //   * "dropping branch 2 leaves the matrix green, because branch 4 then consumes the same values"
-    //     (~40 lines up). Still true, and still for that reason: deleting branch 2 costs exactly one
-    //     over-redaction row and no matrix cell, and deleting branch 2 AND branch 5 together costs only
-    //     branch 5's own rows on top. Branch 5 is not a second masker here -- the two mutants' failure sets
-    //     are disjoint, which is what distinguishes independence from masking.
-    //   * "re-bounding the key quantifier to {0,512} left the entire suite green" (below the regex).
-    //     RE-DERIVED AND THE WORDING WAS STALE -- it said "on both branches" and there are five. Re-run
-    //     across all five: red only in Recognizer_StripsTheValueAtAnyKeyLength_BelowTheDetailCap. The
-    //     finding it records is intact and is now BETTER supported than when written: the test that exists
-    //     because the property was invisible behind the cap is the test that catches it.
-    //
-    private const string NoSeparatorEarlierInSegment =
-        @"(?<!(?:^|/)[^/]*" + DiagnosticText.HiveSeparatorPattern + @"[^/]*)";
-
-    private const string QuotedPathPrefix = @"(?<=(?<oq>['""])[^'""]*?[/\\])" + NoSeparatorEarlierInSegment;
 
     [GeneratedRegex(
         @"(?:"
@@ -1859,16 +1217,9 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
         + @"|" + PathRegionStart + NoSeparatorEarlierInSegment + @"(?<key>[^/\\=\s]*?)"
             + DiagnosticText.HiveSeparatorPattern + RootlessBackslashPathValue
         + @")")]
-    // INTERNAL, not private, and only for tests -- deliberately, with a reason that is itself a finding.
-    // The `.Message`-level regressions pin this recognizer only up to DetailMaxLength (512): past that the
-    // Sanitize cap truncates the message and MASKS whether the recognizer matched at all. Measured when the
-    // recognizer had two branches: with the key quantifier re-bounded to {0,512} on both of them the ENTIRE
-    // suite stayed green, because every observable assertion sat behind the cap. Re-derived across all five
-    // branches after branch 5 was added -- red only in the recognizer-level test this finding
-    // caused to be written, which is the outcome the finding predicts rather than a contradiction of it. That made the cap load-bearing for PII through an undocumented
-    // coupling -- raising DetailMaxLength ("framework prose is getting truncated") would silently re-arm the
-    // exact bypass that has already failed open twice in this file. Pinning the recognizer BELOW the cap is
-    // the only place the property is observable without that confound.
+    // INTERNAL for tests: `.Message`-level assertions are masked beyond DetailMaxLength by Sanitize, so
+    // the recognizer must be pinned below that cap. Keeping this visible to tests makes the pre-cap
+    // behavior observable without changing the production surface.
     internal static partial Regex HivePartitionValue();
 
     // Wraps a filesystem operation failure into a Transient DeltaStorageException that discloses ONLY the

@@ -7870,4 +7870,19 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
         // statement about the code.
         Assert.Equal(2760, cells);
     }
+
+    [Fact]
+    public void PathRegionStart_ContainsBackslashInNegatedClass()
+    {
+        // Security pin: PathRegionStart must admit \ as a path-region opener so that Windows-shaped
+        // rootless paths (no forward slash) still redact partition values. A comment-only edit must
+        // not silently narrow this anchor. #774 R1 Security finding.
+        const string expected = @"(?<![^/\\""'\s])";
+        var field = typeof(LocalFileSystemBackend).GetField(
+            "PathRegionStart",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(field);
+        string? actual = field!.GetValue(null) as string;
+        Assert.Equal(expected, actual);
+    }
 }

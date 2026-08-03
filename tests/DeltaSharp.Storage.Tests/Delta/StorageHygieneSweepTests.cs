@@ -1405,10 +1405,12 @@ public sealed class StorageHygieneSweepTests
     //         ChangeFeedReader.cs:844 (id-branch declared type)
     //           -> Door_ChangeFeed_Ee08NestedMetadataColumn id-mode rows +
     //              Door_ChangeFeed_MappedPoisonedPhysicalName_IsStoppedAtLoad
-    //         LocalFileSystemBackend.cs:400, :428, :1977, :2471 — the WINDOWS twins of POSIX sites this
-    //         sweep pins. The doors do not branch on platform: Door_Backend_ConditionalCreateAmbiguity,
-    //         Door_Backend_NotFound and Door_Backend_StagedWriteStreamDisplayPath pin whichever twin the
-    //         runner executes, so these four are covered on a Windows runner and dominated on this one.
+    //         LocalFileSystemBackend.PutIfAbsentAsync (:399, :427 — RetryUnsafeAmbiguous on race)
+    //         and StagedWriteStream.Publish (:2138 RetryUnsafeAmbiguous, :2147 AlreadyExists, :2164 RetryUnsafeAmbiguous)
+    //         — the non-confined WINDOWS producer set. The doors do not branch on platform:
+    //         Door_Backend_ConditionalCreateAmbiguity, Door_Backend_NotFound and
+    //         Door_Backend_StagedWriteStreamDisplayPath pin whichever twin the runner executes, so these
+    //         five are covered on a Windows runner and dominated on this one.
     // ---------------------------------------------------------------------------------------------------
     [Theory]
     [MemberData(nameof(Poisons))]

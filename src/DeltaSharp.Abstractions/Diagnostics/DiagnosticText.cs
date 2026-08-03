@@ -168,32 +168,75 @@ internal static class DiagnosticText
     /// re-create exactly the silent-drift hazard the shared primitive exists to eliminate: two independent
     /// constants, one name, and no signal when they diverge.
     /// </remarks>
-    /// <param name="tokens">The untrusted tokens to render.</param>
+    /// <param name="tokens">The untrusted tokens to render. When not already an
+    /// <see cref="IReadOnlyList{T}"/>, at most <paramref name="maxItems"/> tokens are materialized; the
+    /// remainder are counted-only, bounding retained allocation; the sequence is still fully enumerated to
+    /// compute the count — do not pass an unbounded or I/O-backed sequence (#767).</param>
     /// <param name="maxItemLength">The per-item length cap handed to <see cref="Sanitize"/>.</param>
     /// <param name="maxItems">The maximum number of items rendered before the remainder is elided.</param>
     /// <param name="separator">The separator placed between rendered items.</param>
     internal static string SanitizeAndJoin(
         IEnumerable<string> tokens, int maxItemLength, int maxItems, string separator = ", ")
     {
-        IReadOnlyList<string> list = tokens as IReadOnlyList<string> ?? tokens.ToList();
-        int shown = Math.Min(list.Count, maxItems);
-        var builder = new StringBuilder();
-        for (int i = 0; i < shown; i++)
+        ArgumentNullException.ThrowIfNull(tokens);
+        ArgumentNullException.ThrowIfNull(separator);
+        ArgumentOutOfRangeException.ThrowIfNegative(maxItemLength);
+        ArgumentOutOfRangeException.ThrowIfNegative(maxItems);
+
+        // Fast path: the count is free when the sequence is already a list — no need to enumerate it twice.
+        if (tokens is IReadOnlyList<string> list)
         {
-            if (i > 0)
+            int shown = Math.Min(list.Count, maxItems);
+            var builder = new StringBuilder();
+            for (int i = 0; i < shown; i++)
             {
-                builder.Append(separator);
+                if (i > 0)
+                {
+                    builder.Append(separator);
+                }
+
+                builder.Append(Sanitize(list[i], maxItemLength));
             }
 
-            builder.Append(Sanitize(list[i], maxItemLength));
+            if (list.Count > shown)
+            {
+                builder.Append(separator).Append(CultureInfo.InvariantCulture, $"… (+{list.Count - shown} more)");
+            }
+
+            return builder.ToString();
         }
 
-        if (list.Count > shown)
+        // Lazy path: cap DURING enumeration — never materialize the tail (#767). Stream sanitized tokens
+        // directly into the builder, then count-only the remainder so the elision marker is accurate
+        // without allocating the full hostile list. Allocation is bounded; enumeration runs to completion
+        // to compute the tail count — do not pass an unbounded or I/O-backed sequence.
+        var lazyBuilder = new StringBuilder();
+        int lazyShown = 0;
+        int tail = 0;
+        foreach (string token in tokens)
         {
-            builder.Append(separator).Append(CultureInfo.InvariantCulture, $"… (+{list.Count - shown} more)");
+            if (lazyShown < maxItems)
+            {
+                if (lazyShown > 0)
+                {
+                    lazyBuilder.Append(separator);
+                }
+
+                lazyBuilder.Append(Sanitize(token, maxItemLength));
+                lazyShown++;
+            }
+            else
+            {
+                tail++;
+            }
         }
 
-        return builder.ToString();
+        if (tail > 0)
+        {
+            lazyBuilder.Append(separator).Append(CultureInfo.InvariantCulture, $"… (+{tail} more)");
+        }
+
+        return lazyBuilder.ToString();
     }
 
     /// <summary>
