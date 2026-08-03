@@ -339,11 +339,31 @@ public sealed class DeltaCommitterTests : IDisposable
                 new DeltaAction[] { first, second, Add("part-1.parquet") },
                 DeltaReadScope.WholeTable));
         Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind);
-        Assert.Contains("2 metaData actions", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("more than one metaData action", ex.Message, StringComparison.Ordinal);
         Assert.Contains("at most one", ex.Message, StringComparison.Ordinal);
 
         Snapshot after = await LoadAsync();
         Assert.Equal(0L, after.Version); // commit was rejected, nothing published
+    }
+
+    [Fact]
+    public async Task AcceptsCommit_WithExactlyOneMetadataAction_Succeeds_AtWriteDoor()
+    {
+        // #762 acceptance boundary: a commit with exactly one metaData action must still succeed.
+        // Pins the == 1 boundary: a guard mutated to >= 1 would turn this test red.
+        await SeedTableAsync();
+        Snapshot snapshot = await LoadAsync();
+
+        MetadataAction single = MetadataWith(NoneModeSchemaJson, NoneModeConfiguration);
+
+        DeltaCommitResult result = await new DeltaCommitter(_backend).CommitAsync(
+            snapshot,
+            new DeltaAction[] { single, Add("part-1.parquet") },
+            DeltaReadScope.WholeTable);
+
+        Assert.Equal(1L, result.Version);
+        Snapshot after = await LoadAsync();
+        Assert.Equal(1L, after.Version); // single-metaData commit was published normally
     }
 
     [Fact]

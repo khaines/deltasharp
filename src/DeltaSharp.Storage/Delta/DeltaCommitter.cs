@@ -197,9 +197,8 @@ internal sealed class DeltaCommitter
         {
             if (action is MetadataAction && ++metadataActions > 1)
             {
-                throw DeltaProtocolException.Malformed(string.Create(
-                    CultureInfo.InvariantCulture,
-                    $"Commit payload carries {metadataActions} metaData actions; a commit must declare at most one."));
+                throw DeltaProtocolException.Malformed(
+                    "Commit payload carries more than one metaData action; a commit must declare at most one.");
             }
         }
 
