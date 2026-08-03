@@ -43,7 +43,7 @@ document is the source of truth for how they are used.
 These are **conventions**, and most of the tree is still scaffolding against them — but the storage layer
 now instruments against them for real, so read them as binding rather than aspirational.
 `DeltaStorageTelemetry` (`src/DeltaSharp.Storage/Diagnostics/DeltaStorageTelemetry.cs`, introduced by
-STORY-05.3 / [#479](https://github.com/khaines/deltasharp/issues/479) and since extended to the
+STORY-05.3 / [#479](https://github.com/khaines/deltasharp/issues/479) <!-- issue-state:closed --> and since extended to the
 maintenance paths) owns two `Meter`s and two `ActivitySource`s, named `DeltaSharp.Delta` and
 `DeltaSharp.Storage` off `DeltaSharpTelemetry.RootName`. `DeltaSharp.Storage` is also the one assembly
 that takes a `Microsoft.Extensions.Logging` dependency — **`.Abstractions` only**, for `ILogger<T>`, the
@@ -329,14 +329,14 @@ rendering it**, not by a redactor:
   EXPLAIN/plan string to a span or structured log, when the identifier can carry tenant identity — record a
   structural/redacted form or omit the identifier. Auditing the existing diagnostic-render paths against
   this rule once instrumentation is wired is tracked in
-  [#455](https://github.com/khaines/deltasharp/issues/455).
+  [#455](https://github.com/khaines/deltasharp/issues/455) <!-- issue-state:open -->.
 - **Exception objects are diagnostics too — let `Exception.ToString()` do the chain walk, never do it
   yourself.** Treat every storage `Exception.Message` as untrusted tenant data: some tokens are routed
   through `DiagnosticText.Sanitize`, others are interpolated raw, and the reviewed producer examples are
   not exhaustive. Covered types can also carry a **raw, unsanitized** `Exception.InnerException`
   (retained for server-side debugging) and raw typed properties (`.FilePath`, `.Path`, `.Constraint`,
-  `.ColumnName`). The hygiene sweep in [PR #774](https://github.com/khaines/deltasharp/pull/774) completes the [#747](https://github.com/khaines/deltasharp/issues/747) work (issue closes on merge);
-  [#749](https://github.com/khaines/deltasharp/issues/749) remains open for producers added after `76d2c8e`. The covered types' `ToString()` overrides cut
+  `.ColumnName`). The hygiene sweep in [PR #774](https://github.com/khaines/deltasharp/pull/774) completes the [#747](https://github.com/khaines/deltasharp/issues/747) <!-- issue-state:closed --> work (issue closes on merge);
+  [#749](https://github.com/khaines/deltasharp/issues/749) <!-- issue-state:open --> remains open for producers added after `76d2c8e`. The covered types' `ToString()` overrides cut
   the chain, and that works because
   `Exception.ToString()` recurses through the inner's *own* virtual `ToString()`. So the safe/unsafe axis
   is **not** "renders vs reflects" — it is **"does the sink walk `.InnerException` itself"**:
