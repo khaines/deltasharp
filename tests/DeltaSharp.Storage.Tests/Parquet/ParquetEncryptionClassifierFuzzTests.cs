@@ -43,8 +43,9 @@ public sealed class ParquetEncryptionClassifierFuzzTests
     public async Task ClassifyUnreadableInput_PrefixTruncationClass_NeverFalsePositiveNeverThrows()
     {
         // Structural mutation class 1: every prefix length of a NON-encrypted file. A truncation reshapes the
-        // trailing [footer_length][magic] framing the probe relies on, driving it down every early-return and
-        // catch arm. None may be misclassified as encrypted, and none may throw.
+        // trailing [footer_length][magic] framing the probe relies on, driving it down its early-return arms.
+        // None may be misclassified as encrypted, and none may throw. (The probe's IO-fault catch arm is a
+        // separate axis pinned by ClassifyUnreadableInput_ThrowingStream_* below.)
         byte[] file = await ValidPlaintextFileAsync();
 
         for (int len = 0; len <= file.Length; len++)
@@ -54,7 +55,8 @@ public sealed class ParquetEncryptionClassifierFuzzTests
 
             string? verdict = ParquetEncryption.ClassifyUnreadableInput(stream);
 
-            Assert.Null(verdict); // fail-closed: never the encryption sentinel for a non-encrypted file
+            // fail-closed: never the encryption sentinel for a non-encrypted file
+            Assert.True(verdict is null, $"truncation len={len} misclassified as encrypted: {verdict}");
         }
     }
 
@@ -79,16 +81,16 @@ public sealed class ParquetEncryptionClassifierFuzzTests
 
             string? verdict = ParquetEncryption.ClassifyUnreadableInput(stream);
 
-            Assert.Null(verdict);
+            Assert.True(verdict is null, $"hostile footer_length={hostile} misclassified as encrypted: {verdict}");
         }
     }
 
     [Fact]
     public async Task ClassifyUnreadableInput_ByteRotationClass_NeverFalsePositiveNeverThrows()
     {
-        // Structural mutation class 3: rotate the footer region by a byte (a framing shift, not a bit-flip) at
-        // several offsets. Shifting the Thrift field stream desynchronizes field ids/types; the walk must stay
-        // bounded and fail closed rather than stumble onto a field-8 shape and false-positive.
+        // Structural mutation class 3: rotate the WHOLE file left by N bytes (a framing shift, not a bit-flip),
+        // which shifts the trailing [footer_length][magic] framing. Desynchronizing the Thrift field stream
+        // must keep the walk bounded and fail closed rather than stumble onto a field-8 shape and false-positive.
         byte[] file = await ValidPlaintextFileAsync();
 
         foreach (int rotate in new[] { 1, 2, 3, 5, 8, 13 })
@@ -105,7 +107,7 @@ public sealed class ParquetEncryptionClassifierFuzzTests
 
             string? verdict = ParquetEncryption.ClassifyUnreadableInput(stream);
 
-            Assert.Null(verdict);
+            Assert.True(verdict is null, $"left-rotate by {rotate} misclassified as encrypted: {verdict}");
         }
     }
 
@@ -123,5 +125,108 @@ public sealed class ParquetEncryptionClassifierFuzzTests
 
         Assert.NotNull(verdict);
         Assert.Contains("ncrypt", verdict, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ClassifyUnreadableInput_ThrowingReadStream_IsExceptionTotalReturnsNull()
+    {
+        // Pins the probe's IO-fault axis (both doors' `catch (IOException/ObjectDisposedException/
+        // NotSupportedException)` arms): a seekable stream whose reads throw mid-probe must be classified
+        // fail-closed as NOT-encrypted (null) — the classifier is exception-total on a hostile stream and
+        // never lets an IO fault escape to be mistaken for (or mask) an encryption verdict. RED-on-revert:
+        // removing either catch arm turns this into a thrown IOException.
+        using var stream = new ThrowOnReadStream(length: 64);
+
+        string? verdict = ParquetEncryption.ClassifyUnreadableInput(stream);
+
+        Assert.Null(verdict);
+    }
+
+    [Fact]
+    public async Task ClassifyUnreadableInput_NonSeekableStream_FailsClosedReturnsNull()
+    {
+        // Pins the `!input.CanSeek` early-return arm on both doors: a readable but non-seekable stream cannot
+        // be probed (the footer read seeks from the tail), so it must fail closed as NOT-encrypted rather than
+        // throw or guess. Wraps a genuine plaintext file's bytes so the null is due to non-seekability alone.
+        using var stream = new NonSeekableStream(await ValidPlaintextFileAsync());
+
+        string? verdict = ParquetEncryption.ClassifyUnreadableInput(stream);
+
+        Assert.Null(verdict);
+    }
+
+    /// <summary>A seekable stream whose reads always throw <see cref="IOException"/>, to drive the probe's
+    /// IO-fault catch arm.</summary>
+    private sealed class ThrowOnReadStream(long length) : Stream
+    {
+        public override bool CanRead => true;
+        public override bool CanSeek => true;
+        public override bool CanWrite => false;
+        public override long Length => length;
+        public override long Position { get; set; }
+
+        public override int Read(byte[] buffer, int offset, int count) =>
+            throw new IOException("simulated read fault during encryption probe");
+
+        public override int Read(Span<byte> buffer) =>
+            throw new IOException("simulated read fault during encryption probe");
+
+        public override long Seek(long offset, SeekOrigin origin)
+        {
+            Position = origin switch
+            {
+                SeekOrigin.Begin => offset,
+                SeekOrigin.Current => Position + offset,
+                _ => length + offset,
+            };
+            return Position;
+        }
+
+        public override void Flush()
+        {
+        }
+
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    /// <summary>A readable but non-seekable stream, to drive the probe's <c>!CanSeek</c> early-return arm.</summary>
+    private sealed class NonSeekableStream(byte[] bytes) : Stream
+    {
+        private readonly MemoryStream _inner = new(bytes, writable: false);
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) => _inner.Read(buffer, offset, count);
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+        public override void Flush()
+        {
+        }
+
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                _inner.Dispose();
+            }
+
+            base.Dispose(disposing);
+        }
     }
 }
