@@ -76,11 +76,17 @@ public sealed class ColumnMappingSharedSanitizerAgreementTests
     {
         foreach (char delimiter in new[] { '/', '\\', '=', ':' })
         {
-            string segment = string.Create(
-                CultureInfo.InvariantCulture,
-                $"a{delimiter}b");
-            string? reason = (string?)PathSegmentGuard.Invoke(null, [segment]);
-            Assert.False(string.IsNullOrWhiteSpace(reason));
+            foreach (string segment in new[]
+            {
+                string.Create(CultureInfo.InvariantCulture, $"a{delimiter}b"),
+                string.Create(CultureInfo.InvariantCulture, $"{delimiter}ab"),
+                string.Create(CultureInfo.InvariantCulture, $"ab{delimiter}"),
+                delimiter.ToString(),
+            })
+            {
+                string? reason = (string?)PathSegmentGuard.Invoke(null, [segment]);
+                Assert.False(string.IsNullOrWhiteSpace(reason));
+            }
         }
     }
 
@@ -94,6 +100,12 @@ public sealed class ColumnMappingSharedSanitizerAgreementTests
     [InlineData("\u200F")]
     [InlineData("\u200FA")]
     [InlineData("A\u200F")]
+    [InlineData("\U00010000")]
+    [InlineData("\U00010000A")]
+    [InlineData("A\U00010000")]
+    [InlineData("\U000E0001")]
+    [InlineData("\U000E0001A")]
+    [InlineData("A\U000E0001")]
     public void PathSegmentGuard_And_SharedSanitizer_Agree_OnBoundarySegmentShapes(string segment)
     {
         string? reason = (string?)PathSegmentGuard.Invoke(null, [segment]);
