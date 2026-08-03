@@ -30,10 +30,29 @@ EXPECTED_ANNOTATED_ISSUE_FREQUENCIES = {
         750: 1,
     },
     "docs/engineering/design/observability-conventions.md": {
-        479: 2,
+        455: 1,
+        479: 1,
         747: 1,
         749: 1,
     },
+}
+EXPECTED_ANNOTATED_ISSUE_LINE_ANCHORS = {
+    "docs/engineering/design/storage-exception-log-routing.md": [
+        (4, 689),
+        (6, 664),
+        (20, 744),
+        (257, 749),
+        (294, 744),
+        (516, 750),
+        (609, 746),
+        (617, 747),
+    ],
+    "docs/engineering/design/observability-conventions.md": [
+        (46, 479),
+        (332, 455),
+        (338, 747),
+        (339, 749),
+    ],
 }
 MAX_MARKER_DISTANCE_CHARS = 200
 
@@ -124,6 +143,7 @@ def parse_expected_states(docs: list[Path]) -> tuple[list[ExpectedState], list[s
     errors: list[str] = []
     expected_by_doc = {normalize_doc_key(doc): 0 for doc in docs}
     issue_frequencies_by_doc: dict[str, dict[int, int]] = {normalize_doc_key(doc): {} for doc in docs}
+    issue_anchors_by_doc: dict[str, list[tuple[int, int]]] = {normalize_doc_key(doc): [] for doc in docs}
 
     for doc in docs:
         try:
@@ -167,6 +187,7 @@ def parse_expected_states(docs: list[Path]) -> tuple[list[ExpectedState], list[s
             issue_frequencies_by_doc[doc_key][issue] = (
                 issue_frequencies_by_doc[doc_key].get(issue, 0) + 1
             )
+            issue_anchors_by_doc[doc_key].append((link_line, issue))
 
     for doc_path, expected_count in EXPECTED_ANNOTATED_COUNTS.items():
         key = doc_path.lower()
@@ -181,6 +202,13 @@ def parse_expected_states(docs: list[Path]) -> tuple[list[ExpectedState], list[s
             errors.append(
                 f"{doc_path}: expected annotated issue frequencies {expected_frequencies}, found "
                 f"{issue_frequencies_by_doc[key]}"
+            )
+    for doc_path, expected_anchors in EXPECTED_ANNOTATED_ISSUE_LINE_ANCHORS.items():
+        key = doc_path.lower()
+        if key in issue_anchors_by_doc and issue_anchors_by_doc[key] != expected_anchors:
+            errors.append(
+                f"{doc_path}: expected annotated issue anchors {expected_anchors}, found "
+                f"{issue_anchors_by_doc[key]}"
             )
 
     return expected, errors
