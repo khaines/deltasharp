@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using DeltaSharp.Types;
 using Xunit;
@@ -80,23 +81,20 @@ public sealed class SchemaJsonSerializerPropertyTests
             containsNull: false);
         data.Add("deep-nest", deep);
 
-        // Typed metadata at nested depth: numeric column-mapping ids, an integral double (must keep a
-        // fractional part so it re-reads as Double, not Long), booleans, null, arrays, nested objects.
-        var metadata = FieldMetadata.FromValues(new[]
+        // Model-derived metadata corpus: every MetadataValueKind must be represented directly from the enum,
+        // so adding a new kind cannot leave Core's schema serializer corpus silently incomplete on net8.0.
+        var metadataEntries = new List<KeyValuePair<string, MetadataValue>>
         {
-            new KeyValuePair<string, MetadataValue>("delta.columnMapping.id", MetadataValue.Long(9)),
-            new KeyValuePair<string, MetadataValue>("m.arr", MetadataValue.Array(new[]
-            {
-                MetadataValue.Long(1), MetadataValue.Double(2.5), MetadataValue.Boolean(false), MetadataValue.Null,
-            })),
-            new KeyValuePair<string, MetadataValue>("m.bool", MetadataValue.Boolean(true)),
-            new KeyValuePair<string, MetadataValue>("m.integral-double", MetadataValue.Double(4.0)),
-            new KeyValuePair<string, MetadataValue>("m.nested", MetadataValue.Nested(FieldMetadata.FromValues(new[]
-            {
-                new KeyValuePair<string, MetadataValue>("deep", MetadataValue.String("v")),
-            }))),
-            new KeyValuePair<string, MetadataValue>("m.null", MetadataValue.Null),
-        });
+            new("delta.columnMapping.id", MetadataValue.Long(9)),
+        };
+        foreach (MetadataValueKind kind in Enum.GetValues<MetadataValueKind>())
+        {
+            metadataEntries.Add(new KeyValuePair<string, MetadataValue>(
+                string.Create(CultureInfo.InvariantCulture, $"m.{kind}"),
+                ValueOfKind(kind)));
+        }
+
+        var metadata = FieldMetadata.FromValues(metadataEntries);
         data.Add("metadata-rich", new StructType(new[]
         {
             new StructField("mapped", DataTypes.CreateArrayType(leaf, containsNull: true), nullable: true, metadata),
@@ -115,6 +113,22 @@ public sealed class SchemaJsonSerializerPropertyTests
 
         return data;
     }
+
+    private static MetadataValue ValueOfKind(MetadataValueKind kind) => kind switch
+    {
+        MetadataValueKind.Null => MetadataValue.Null,
+        MetadataValueKind.String => MetadataValue.String("v"),
+        MetadataValueKind.Long => MetadataValue.Long(42),
+        MetadataValueKind.Double => MetadataValue.Double(4.0), // integral double must stay Double
+        MetadataValueKind.Boolean => MetadataValue.Boolean(true),
+        MetadataValueKind.Array => MetadataValue.Array(new[] { MetadataValue.Long(1), MetadataValue.String("x") }),
+        MetadataValueKind.Nested => MetadataValue.Nested(FieldMetadata.FromValues(new[]
+        {
+            new KeyValuePair<string, MetadataValue>("deep", MetadataValue.String("v")),
+        })),
+        _ => throw new NotSupportedException(
+            $"MetadataValueKind.{kind} was added but this corpus does not build one."),
+    };
 
     [Theory]
     [MemberData(nameof(Corpus))]
