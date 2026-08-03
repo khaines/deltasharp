@@ -134,8 +134,8 @@ public sealed class DeltaSchemaJsonTypedMetadataTests
         long perCall = (after - before) / iterations;
 
         Assert.True(
-            perCall <= 12_000,
-            $"SchemaJson.ToJson allocation headroom regressed: {perCall} B/call (budget: 12000 B/call).");
+            perCall <= 2_000,
+            $"SchemaJson.ToJson allocation headroom regressed: {perCall} B/call (budget: 2000 B/call).");
     }
 
     [Fact]

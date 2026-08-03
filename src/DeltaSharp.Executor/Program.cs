@@ -2,6 +2,7 @@ using DeltaSharp.Engine;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Engine.Execution;
 using DeltaSharp.Storage;
+using System.Globalization;
 using DeltaSharp.Types;
 using StructField = DeltaSharp.Types.StructField;
 
@@ -40,6 +41,7 @@ public static class Program
     {
         string tablePath = Path.Combine(Path.GetTempPath(), "deltasharp-aot-smoke-" + Path.GetRandomFileName());
         Directory.CreateDirectory(tablePath);
+        Exception? primaryFailure = null;
         try
         {
             var schema = new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) });
@@ -48,19 +50,48 @@ public static class Program
             ColumnBatch batch = new ManagedColumnBatch(schema, new ColumnVector[] { id }, 1);
 
             using var target = DeltaWriteTarget.ForLocalPath(tablePath);
+            using var smokeTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
             DeltaWriteResult result = target.AppendAsync(
                 schema,
                 Array.Empty<string>(),
                 new[] { batch },
                 mergeSchema: false,
                 enforcer: null,
-                cancellationToken: CancellationToken.None).GetAwaiter().GetResult();
+                cancellationToken: smokeTimeout.Token).GetAwaiter().GetResult();
 
-            return $"DeltaSharp storage schema-json write path: ok version={result.Version} files={result.FilesWritten} rows={result.RowsWritten}";
+            string commitPath = Path.Combine(
+                tablePath,
+                "_delta_log",
+                result.Version.ToString("D20", CultureInfo.InvariantCulture) + ".json");
+            string commitJson = File.ReadAllText(commitPath);
+            bool schemaStringPresent =
+                commitJson.Contains("\"metaData\":", StringComparison.Ordinal) &&
+                commitJson.Contains("\"schemaString\":", StringComparison.Ordinal);
+            if (!schemaStringPresent)
+            {
+                throw new InvalidOperationException(
+                    "AOT storage smoke failed: committed metaData.schemaString did not match expected schema JSON.");
+            }
+
+            return $"DeltaSharp storage schema-json write path: ok version={result.Version} files={result.FilesWritten} rows={result.RowsWritten} schemaString-pinned=True";
+        }
+        catch (Exception ex)
+        {
+            primaryFailure = ex;
+            throw;
         }
         finally
         {
-            Directory.Delete(tablePath, recursive: true);
+            try
+            {
+                Directory.Delete(tablePath, recursive: true);
+            }
+            catch (Exception cleanupEx) when (
+                primaryFailure is not null &&
+                (cleanupEx is IOException || cleanupEx is UnauthorizedAccessException || cleanupEx is DirectoryNotFoundException))
+            {
+                // Preserve the append/verification exception when cleanup is best-effort.
+            }
         }
     }
 }
