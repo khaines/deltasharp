@@ -15,6 +15,11 @@ DOCS = [
     REPO_ROOT / "docs/engineering/design/storage-exception-log-routing.md",
     REPO_ROOT / "docs/engineering/design/observability-conventions.md",
 ]
+EXPECTED_ANNOTATED_COUNTS = {
+    "docs/engineering/design/storage-exception-log-routing.md": 8,
+    "docs/engineering/design/observability-conventions.md": 4,
+}
+MAX_MARKER_DISTANCE_CHARS = 200
 
 GH_LINK_RE = re.compile(r"https://github\.com/khaines/deltasharp/(issues|pull)/(\d+)")
 STATE_MARKER_RE = re.compile(r"<!--\s*issue-state:(open|closed)\s*-->", re.IGNORECASE)
@@ -44,6 +49,9 @@ def parse_docs_from_args(argv: list[str]) -> tuple[list[Path], list[str]]:
         if not doc.exists():
             errors.append(f"{raw_path}: file does not exist")
             continue
+        if not doc.is_file():
+            errors.append(f"{raw_path}: path is not a file")
+            continue
         if doc.suffix.lower() != ".md":
             errors.append(f"{raw_path}: expected a markdown file (*.md)")
             continue
@@ -70,12 +78,15 @@ def marker_after_link(
     marker = STATE_MARKER_RE.search(candidate)
     if marker is None:
         return None, None
+    if marker.start() > MAX_MARKER_DISTANCE_CHARS:
+        return None, None
     return marker, line_number(text, link_end + marker.start())
 
 
 def parse_expected_states(docs: list[Path]) -> tuple[list[ExpectedState], list[str]]:
     expected: list[ExpectedState] = []
     errors: list[str] = []
+    expected_by_doc = {str(doc.relative_to(REPO_ROOT)): 0 for doc in docs}
 
     for doc in docs:
         text = doc.read_text(encoding="utf-8")
@@ -109,6 +120,14 @@ def parse_expected_states(docs: list[Path]) -> tuple[list[ExpectedState], list[s
                     file=doc,
                     line=link_line,
                 )
+            )
+            expected_by_doc[str(doc.relative_to(REPO_ROOT))] += 1
+
+    for doc_path, expected_count in EXPECTED_ANNOTATED_COUNTS.items():
+        if doc_path in expected_by_doc and expected_by_doc[doc_path] != expected_count:
+            errors.append(
+                f"{doc_path}: expected {expected_count} annotated issue links, found "
+                f"{expected_by_doc[doc_path]}"
             )
 
     return expected, errors
