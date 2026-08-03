@@ -16,40 +16,102 @@ DOCS = [
     REPO_ROOT / "docs/engineering/design/observability-conventions.md",
 ]
 
-ISSUE_LINK_RE = re.compile(r"https://github\.com/khaines/deltasharp/issues/(\d+)")
-STATE_MARKER_RE = re.compile(r"\)\s*<!--\s*issue-state:(open|closed)\s*-->", re.IGNORECASE)
+GH_LINK_RE = re.compile(r"https://github\.com/khaines/deltasharp/(issues|pull)/(\d+)")
+STATE_MARKER_RE = re.compile(r"<!--\s*issue-state:(open|closed)\s*-->", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
 class ExpectedState:
+    kind: str
     issue: int
     expected: str
     file: Path
     line: int
 
 
-def parse_expected_states() -> tuple[list[ExpectedState], list[str]]:
+def parse_docs_from_args(argv: list[str]) -> tuple[list[Path], list[str]]:
+    if len(argv) <= 1:
+        return DOCS, []
+
+    docs: list[Path] = []
+    errors: list[str] = []
+    for raw_path in argv[1:]:
+        doc = (REPO_ROOT / raw_path).resolve()
+        try:
+            doc.relative_to(REPO_ROOT)
+        except ValueError:
+            errors.append(f"{raw_path}: path must be inside repository root")
+            continue
+        if not doc.exists():
+            errors.append(f"{raw_path}: file does not exist")
+            continue
+        if doc.suffix.lower() != ".md":
+            errors.append(f"{raw_path}: expected a markdown file (*.md)")
+            continue
+        docs.append(doc)
+    return docs, errors
+
+
+def line_number(text: str, index: int) -> int:
+    return text.count("\n", 0, index) + 1
+
+
+def marker_after_link(
+    text: str, link_end: int, next_link_start: int | None
+) -> tuple[re.Match[str] | None, int | None]:
+    window_end = next_link_start if next_link_start is not None else len(text)
+    window = text[link_end:window_end]
+    lines = window.splitlines()
+    candidate_lines: list[str] = []
+    for i, item in enumerate(lines):
+        if i > 0 and item.strip() == "":
+            break
+        candidate_lines.append(item)
+        if i == 2:
+            break
+    candidate = "\n".join(candidate_lines)
+    marker = STATE_MARKER_RE.search(candidate)
+    if marker is None:
+        return None, None
+    return marker, line_number(text, link_end + marker.start())
+
+
+def parse_expected_states(docs: list[Path]) -> tuple[list[ExpectedState], list[str]]:
     expected: list[ExpectedState] = []
     errors: list[str] = []
 
-    for doc in DOCS:
+    for doc in docs:
         text = doc.read_text(encoding="utf-8")
-        for match in ISSUE_LINK_RE.finditer(text):
-            issue = int(match.group(1))
-            line = text.count("\n", 0, match.start()) + 1
-            marker = STATE_MARKER_RE.match(text[match.end() : match.end() + 80])
+        matches = list(GH_LINK_RE.finditer(text))
+        for index, match in enumerate(matches):
+            kind = match.group(1)
+            issue = int(match.group(2))
+            link_line = line_number(text, match.start())
+            next_link_start = matches[index + 1].start() if index + 1 < len(matches) else None
+            marker, marker_line = marker_after_link(text, match.end(), next_link_start)
+
+            if kind == "pull":
+                if marker is not None:
+                    line = marker_line if marker_line is not None else link_line
+                    errors.append(
+                        f"{doc.relative_to(REPO_ROOT)}:{line}: issue-state marker cannot be attached "
+                        f"to pull request link #{issue}; use the issue URL instead"
+                    )
+                continue
+
             if marker is None:
                 errors.append(
-                    f"{doc.relative_to(REPO_ROOT)}:{line}: missing "
+                    f"{doc.relative_to(REPO_ROOT)}:{link_line}: missing "
                     f"'<!-- issue-state:open|closed -->' after issue link #{issue}"
                 )
                 continue
             expected.append(
                 ExpectedState(
+                    kind=kind,
                     issue=issue,
                     expected=marker.group(1).lower(),
                     file=doc,
-                    line=line,
+                    line=link_line,
                 )
             )
 
@@ -73,7 +135,14 @@ def live_issue_state(issue: int) -> str:
 
 
 def main() -> int:
-    expected, parse_errors = parse_expected_states()
+    docs, doc_errors = parse_docs_from_args(sys.argv)
+    if doc_errors:
+        print("Doc issue-state input errors:")
+        for error in doc_errors:
+            print(f"- {error}")
+        return 1
+
+    expected, parse_errors = parse_expected_states(docs)
     if parse_errors:
         print("Doc issue-state annotation errors:")
         for error in parse_errors:
@@ -101,7 +170,7 @@ def main() -> int:
 
     print(
         f"OK: validated {len(expected)} annotated issue references across "
-        f"{len(DOCS)} docs ({len(live_cache)} unique issues)."
+        f"{len(docs)} docs ({len(live_cache)} unique issues)."
     )
     return 0
 
