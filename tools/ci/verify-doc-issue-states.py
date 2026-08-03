@@ -59,6 +59,22 @@ def parse_docs_from_args(argv: list[str]) -> tuple[list[Path], list[str]]:
     return docs, errors
 
 
+def enforce_tracked_doc_scope(docs: list[Path], explicit_args: bool) -> list[str]:
+    if not explicit_args:
+        return []
+    tracked = {str(path.relative_to(REPO_ROOT)) for path in DOCS}
+    selected = {str(path.relative_to(REPO_ROOT)) for path in docs}
+    if not (tracked & selected):
+        return []
+    if selected == tracked:
+        return []
+    return [
+        "tracked-doc mode requires both tracked docs together: "
+        "docs/engineering/design/storage-exception-log-routing.md and "
+        "docs/engineering/design/observability-conventions.md"
+    ]
+
+
 def line_number(text: str, index: int) -> int:
     return text.count("\n", 0, index) + 1
 
@@ -151,9 +167,10 @@ def live_issue_state(issue: int) -> str:
 
 def main() -> int:
     docs, doc_errors = parse_docs_from_args(sys.argv)
-    if doc_errors:
+    scope_errors = enforce_tracked_doc_scope(docs, explicit_args=len(sys.argv) > 1)
+    if doc_errors or scope_errors:
         print("Doc issue-state input errors:")
-        for error in doc_errors:
+        for error in [*doc_errors, *scope_errors]:
             print(f"- {error}")
         return 1
 
