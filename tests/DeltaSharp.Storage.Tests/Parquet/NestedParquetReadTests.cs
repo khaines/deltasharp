@@ -1518,6 +1518,66 @@ public sealed class NestedParquetReadTests
         Assert.Contains("file column is itself nested", error.Message, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task NestedColumnResolution_UsesRawName_NotSanitizedName()
+    {
+        // Kills: byName.TryGetValue(DiagnosticText.Sanitize(name), ...) at the nested-column arm in
+        // ParquetFileReader.ResolveFileFields. If the lookup were sanitized, the RAW name lookup would
+        // fail to find the column (DiagnosticText.Sanitize("s\u200b") != "s\u200b"), throwing
+        // ColumnNotPresentInFile. With the correct RAW lookup the read succeeds.
+        //
+        // U+200B (ZERO WIDTH SPACE, Unicode category Cf/Format) is sanitized to U+FFFD by
+        // DiagnosticText.Sanitize, so Sanitize("s\u200b") == "s\uFFFD" — an injectable/format category
+        // character. The test asserts the read succeeds with the raw name, proving the nested-column arm
+        // uses the unmodified field name for its byName lookup, not the sanitized diagnostic form.
+        const string rawName = "s\u200b";
+
+        // Write a struct column with a U+200B in its top-level name using the low-level Parquet.Net API
+        // (ParquetSerializer only accepts CLR property names, which can't carry U+200B).
+        var structField = new global::Parquet.Schema.StructField(
+            rawName,
+            new global::Parquet.Schema.DataField<int>("A"));
+        var parquetSchema = new global::Parquet.Schema.ParquetSchema(
+            new global::Parquet.Schema.DataField<int>("Id"), structField);
+        global::Parquet.Schema.DataField[] leaves = parquetSchema.GetDataFields(); // [Id, s\u200b.A]
+
+        using var writeStream = new MemoryStream();
+        await using (global::Parquet.ParquetWriter writer =
+            await global::Parquet.ParquetWriter.CreateAsync(parquetSchema, writeStream))
+        {
+            using global::Parquet.ParquetRowGroupWriter rg = writer.CreateRowGroup();
+            // Row 1: Id=1, s\u200b.A=10; Row 2: Id=2, s\u200b.A=20
+            await rg.WriteAsync<int>(leaves[0], new ReadOnlyMemory<int?>(new int?[] { 1, 2 }), null, null, CancellationToken.None);
+            await rg.WriteAsync<int>(leaves[1], new ReadOnlyMemory<int?>(new int?[] { 10, 20 }), null, null, CancellationToken.None);
+        }
+
+        byte[] bytes = writeStream.ToArray();
+
+        // Request the struct column by its RAW name (containing U+200B).
+        StructType innerType = DataTypes.CreateStructType(new[]
+        {
+            DataTypes.CreateStructField("A", DataTypes.IntegerType, nullable: false),
+        });
+        var requested = new StructType(new[]
+        {
+            new StructField("Id", DataTypes.IntegerType, nullable: false),
+            new StructField(rawName, innerType, nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSingleAsync(bytes, requested);
+        Assert.Equal(2, batch.RowCount);
+
+        ColumnVector id = batch.Column("Id");
+        Assert.Equal(1, id.GetValue<int>(0));
+        Assert.Equal(2, id.GetValue<int>(1));
+
+        var s = Assert.IsType<StructColumnVector>(batch.Column(rawName));
+        Assert.False(s.IsNull(0));
+        Assert.False(s.IsNull(1));
+        Assert.Equal(10, s.Child("A").GetValue<int>(0));
+        Assert.Equal(20, s.Child("A").GetValue<int>(1));
+    }
+
     private static async Task<byte[]> WriteAsync<T>(IReadOnlyList<T> rows)
         where T : class, new()
     {

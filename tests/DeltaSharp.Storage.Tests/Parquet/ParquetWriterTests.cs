@@ -2188,11 +2188,18 @@ public sealed class ParquetWriterTests
         System.Globalization.CultureInfo original = System.Globalization.CultureInfo.CurrentCulture;
         try
         {
+            // Pin to InvariantCulture before building the schema and computing the expected JSON,
+            // so the anchor is genuinely culture-neutral rather than dependent on the ambient
+            // process culture. This makes the oracle sensitive to a mutation that shifts both
+            // sides identically inside the loop — the expected value is anchored here, outside
+            // any rogue culture, and under a known-good culture.
+            System.Globalization.CultureInfo.CurrentCulture = System.Globalization.CultureInfo.InvariantCulture;
+            StructType schema = BuildCultureHazardSchema();
+            string expected = SchemaJson.ToJson(schema);
+
             foreach (System.Globalization.CultureInfo culture in FormattingBehaviourCultures())
             {
                 System.Globalization.CultureInfo.CurrentCulture = culture;
-                StructType schema = BuildCultureHazardSchema();
-                string expected = SchemaJson.ToJson(schema);
                 string footer = await WriteAndReadFooterSchemaAsync(schema);
                 if (!string.Equals(expected, footer, StringComparison.Ordinal))
                 {

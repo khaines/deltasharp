@@ -48,8 +48,11 @@ jobs:
       # (build-test-format restores the solution with --locked-mode); this is a discard-only
       # trim/AOT-regression gate — the binary is asserted, never signed or published.
       # -warnaserror fails the publish on any IL2xxx/IL3xxx trim/AOT warning.
+      # Parquet.NET currently emits assembly-level IL2104/IL3053 warnings under NativeAOT analysis; this
+      # gate suppresses only those two third-party assembly-summary codes so app-level trim/AOT warnings
+      # remain fatal while the schema-json write-path smoke stays rooted in the binary.
       - name: Publish executor (NativeAOT linux-x64)
-        run: dotnet publish src/DeltaSharp.Executor -c Release -r linux-x64 -p:PublishAot=true -p:TreatWarningsAsErrors=true -warnaserror
+        run: dotnet publish src/DeltaSharp.Executor -c Release -r linux-x64 -p:PublishAot=true -p:TreatWarningsAsErrors=true -warnaserror -p:NoWarn=IL2104%3BIL3053
 
       - name: Assert expected executable
         run: |
@@ -66,6 +69,8 @@ jobs:
           echo "$output"
           echo "$output" | grep -qF "interpreted-vectorized (dynamic-code=False)"
           echo "$output" | grep -qF "affine(20)=41"
+          echo "$output" | grep -qF "storage schema-json write path: ok"
+          echo "$output" | grep -qF "version=0 files=1 rows=1 schemaString-pinned=True"
           # AC3: the optional CompiledBackend must be dead-code-eliminated from the native image.
           # Use `strings`, not `nm`: NativeAOT strips managed type names from the binary symbol table,
           # so `nm` yields a false-negative (a leaked managed type is invisible to it). The type name
