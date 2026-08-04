@@ -607,8 +607,63 @@ internal static class ParquetTestHelpers
         return forged.ToArray();
     }
 
-    /// <summary>Rewrites the footer so that (<paramref name="rowGroup"/>, <paramref name="columnIndex"/>)'s
-    /// column chunk declares <paramref name="forgedCodec"/> as its compression <c>Codec</c> — an OUT-OF-RANGE
+    /// <summary>The UNKNOWN-MEMBER sibling of <see cref="EmptyEncryptionAlgorithmUnionFileAsync"/>: forges a
+    /// file-level <c>EncryptionAlgorithm</c> whose union member is a <b>third, unknown</b> id (3) that this
+    /// Parquet.Net version cannot deserialize. Built by serializing a real <c>AES_GCM_V1</c> member (union
+    /// field id 1, Thrift-compact header <c>0x1C</c> = delta 1, struct type) and diff-patching that member
+    /// header to id 3 (<c>0x3C</c>) — the byte-level "unknown union member" the #698 council byte-patched
+    /// empirically. Parquet.Net's reader <c>SkipField</c>s the unrecognized id, so it OPENS the file cleanly
+    /// with a non-null <c>EncryptionAlgorithm</c> whose <c>AESGCMV1</c>/<c>AESGCMCTRV1</c> are BOTH null — the
+    /// exact residual shape from #773. This is distinct from the empty-union corruption shape at the RAW
+    /// footer level (field-8 is NON-EMPTY here, EMPTY there), which is how the classifier separates them.
+    /// Columns are left intact and carry no <c>crypto_metadata</c>, so the parsed classifier's per-column and
+    /// bare-presence arms do not fire.</summary>
+    public static async Task<byte[]> UnknownEncryptionAlgorithmUnionMemberFileAsync(byte[] bytes)
+    {
+        byte[] aesFooter = await SerializeFooterWithAlgorithmAsync(bytes, aesMember: true);
+        byte[] emptyFooter = await SerializeFooterWithAlgorithmAsync(bytes, aesMember: false);
+
+        // The only difference between the two footers is the AES_GCM_V1 member inside field-8; the first
+        // divergence is that member's Thrift-compact header (0x1C). Patch its id nibble 1 -> 3 (0x3C).
+        int i = 0;
+        int min = Math.Min(aesFooter.Length, emptyFooter.Length);
+        while (i < min && aesFooter[i] == emptyFooter[i])
+        {
+            i++;
+        }
+
+        if (i >= aesFooter.Length || aesFooter[i] != 0x1C)
+        {
+            throw new InvalidOperationException(
+                $"expected AES_GCM_V1 member header 0x1C at footer offset {i}, got "
+                + (i < aesFooter.Length ? $"0x{aesFooter[i]:X2}" : "<end>"));
+        }
+
+        aesFooter[i] = 0x3C; // union member id 1 -> 3 (unknown), type nibble (struct) unchanged
+
+        int originalFooterLength = BitConverter.ToInt32(bytes, bytes.Length - 8);
+        int footerStart = bytes.Length - 8 - originalFooterLength;
+        using var forged = new MemoryStream();
+        forged.Write(bytes, 0, footerStart);
+        forged.Write(aesFooter, 0, aesFooter.Length);
+        forged.Write(BitConverter.GetBytes(aesFooter.Length), 0, 4);
+        forged.Write("PAR1"u8);
+        return forged.ToArray();
+    }
+
+    private static async Task<byte[]> SerializeFooterWithAlgorithmAsync(byte[] bytes, bool aesMember)
+    {
+        using var stream = new MemoryStream(bytes, writable: false);
+        ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+        await using (reader.ConfigureAwait(false))
+        {
+            global::Parquet.Meta.FileMetaData metadata = reader.Metadata!;
+            metadata.EncryptionAlgorithm = aesMember
+                ? new global::Parquet.Meta.EncryptionAlgorithm { AESGCMV1 = new global::Parquet.Meta.AesGcmV1() }
+                : new global::Parquet.Meta.EncryptionAlgorithm();
+            return SerializeFooter(metadata);
+        }
+    }
     /// value (e.g. <c>9</c>, which is not a real <c>CompressionCodec</c>) that leaves the footer parseable and
     /// the physical pages untouched, so the file OPENS cleanly (valid <c>PAR1</c> magic), yet Parquet.Net's
     /// page decode raises a raw <see cref="NotSupportedException"/> ("Compression method 9 is not supported.")

@@ -921,6 +921,31 @@ public sealed class DeltaCheckpointReaderTests
     }
 
     [Fact]
+    public async Task UnknownEncryptionAlgorithmUnionMemberCheckpoint_IsUnsupportedFeature_NotMalformed()
+    {
+        // #773 — the foreign-writer residual, closed on the CHECKPOINT door. The checkpoint's footer carries an
+        // EncryptionAlgorithm whose union member is an UNKNOWN id (3); Parquet.Net SkipFields it and opens the
+        // checkpoint with both known members null, so the PARSED classifier (which also has inspectable columns
+        // here and no crypto_metadata) returns false — the residual. The raw-footer disambiguation must classify
+        // it UnsupportedFeature (non-empty field-8), not let the checkpoint decode its ciphertext pages and be
+        // reported as malformed. RED-on-revert: reverting the door to IsPlaintextFooterEncrypted(metadata) — the
+        // parsed-only overload — reopens the residual and this throws DeltaProtocolException (malformed) instead.
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(1, 2)
+            .Metadata("t", EmptySchema)
+            .Add("a.parquet", size: 1)
+            .ToParquetAsync();
+        byte[] forged = await ParquetTestHelpers.UnknownEncryptionAlgorithmUnionMemberFileAsync(parquet);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(forged), default));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("malformed", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task PlaintextFooterEncryptedCheckpoint_OnlySubsetOfColumnsEncrypted_IsUnsupportedFeature()
     {
         // SUCCESS-path arm, per-column marker only: a plaintext-footer checkpoint may encrypt just SOME

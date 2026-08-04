@@ -181,7 +181,7 @@ internal static class DeltaCheckpointReader
             // its encrypted pages fail to decode. It is not malformed: it is a valid checkpoint written with a
             // feature DeltaSharp cannot read. Detection is the shared classifier's presence-only footer check
             // (no field content, path, or key id is read or echoed — #653 hygiene).
-            if (ParquetEncryption.IsPlaintextFooterEncrypted(reader.Metadata))
+            if (ParquetEncryption.IsPlaintextFooterEncrypted(reader.Metadata, input))
             {
                 await DisposeQuietlyAsync(reader).ConfigureAwait(false);
                 throw DeltaStorageException.UnsupportedFeature(

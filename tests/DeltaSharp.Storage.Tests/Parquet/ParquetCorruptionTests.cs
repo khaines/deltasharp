@@ -647,6 +647,48 @@ public sealed class ParquetCorruptionTests
     }
 
     [Fact]
+    public async Task UnknownEncryptionAlgorithmUnionMember_ThroughReadAsync_IsUnsupportedFeature()
+    {
+        // #773 — the foreign-writer residual, closed on the DATA-FILE door. A file whose EncryptionAlgorithm
+        // union carries an UNKNOWN member id (3) — reachable TODAY by any spec-violating writer, not gated on
+        // a third member shipping — is deserialized by Parquet.Net with BOTH known members null (it SkipFields
+        // the unrecognized id), so the file opens cleanly and the PARSED classifier cannot tell it from a
+        // corrupt empty union. The raw-footer disambiguation must classify it UnsupportedFeature (its field-8
+        // is a NON-EMPTY struct — a real, if unknown, member), NOT read its (ciphertext) columns as plaintext.
+        // RED-on-revert: the parsed-only IsPlaintextFooterEncrypted(metadata) returns false here, so removing
+        // the raw-footer overload lets ReadAsync open the file and return rows — this Assert.ThrowsAsync fails.
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3, 4, 5 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] forged = await ParquetTestHelpers.UnknownEncryptionAlgorithmUnionMemberFileAsync(file);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(forged, schema));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("malformed", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task UnknownEncryptionAlgorithmUnionMember_ThroughReadDataSchemaAsync_IsUnsupportedFeature()
+    {
+        // The footer-only schema door funnels through the same OpenAsync classifier, so the #773 residual is
+        // closed there too — UnsupportedFeature, not a schema returned for an encrypted file.
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 6, 7, 8 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] forged = await ParquetTestHelpers.UnknownEncryptionAlgorithmUnionMemberFileAsync(file);
+        using var stream = new MemoryStream(forged, writable: false);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new ParquetFileReader().ReadDataSchemaAsync(stream, CancellationToken.None));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task PlaintextFooterEncryption_ThroughReadDataSchemaAsync_IsUnsupportedFeature()
     {
         // The footer-only schema door funnels through the SAME OpenAsync classifier — UnsupportedFeature, not

@@ -82,6 +82,39 @@ internal static class ParquetEncryption
     // those flips lands on the third arm above (empty union + zero inspectable column chunks), which by
     // design reads as bare presence. The schema probe is the sole control for them, and it is pinned by
     // DeltaCheckpointReaderTests.SchemaFirstOrdering_IsSoleControl_ForAtLeastOneCorruptFlip.
+    /// <summary>Success-path classifier with RAW-FOOTER disambiguation (#773). Behaves exactly like
+    /// <see cref="IsPlaintextFooterEncrypted(global::Parquet.Meta.FileMetaData?)"/>, except it closes the
+    /// foreign-writer residual named at that method's third arm: when the parsed check is inconclusive because
+    /// the file carries a non-null <c>EncryptionAlgorithm</c> whose two KNOWN union members are BOTH null, it
+    /// re-reads the raw footer. That shape is what Parquet.Net produces for an <b>unknown</b> union member it
+    /// could not deserialize (its reader <c>SkipField</c>s the unrecognized id, leaving the parsed union
+    /// empty) — reachable today by any foreign/spec-violating writer, not only if a third member ever ships —
+    /// and it is indistinguishable at the PARSED layer from a corrupt footer's spurious empty union. The RAW
+    /// footer separates them: a NON-EMPTY field-8 struct carries a real (if unknown) member → encrypted; an
+    /// EMPTY field-8 is the corruption shape → not encrypted. This closes the residual WITHOUT the
+    /// bare-presence collapse the third arm warns against (which would reintroduce the empty-union false
+    /// positive), because the raw probe — unlike the parsed model — can see the dropped member. The extra read
+    /// runs ONLY in this rare ambiguous case; normal files (no algorithm) and known-member encrypted files are
+    /// already decided by the parsed check. Falls back to the parsed verdict when <paramref name="input"/> is
+    /// not seekable (the probe cannot run), which is no worse than the prior behaviour.</summary>
+    internal static bool IsPlaintextFooterEncrypted(global::Parquet.Meta.FileMetaData? metadata, Stream input)
+    {
+        if (IsPlaintextFooterEncrypted(metadata))
+        {
+            return true;
+        }
+
+        global::Parquet.Meta.EncryptionAlgorithm? algorithm = metadata?.EncryptionAlgorithm;
+        if (algorithm is not null && algorithm.AESGCMV1 is null && algorithm.AESGCMCTRV1 is null)
+        {
+            // Empty PARSED union but a present algorithm: consult the raw footer. A non-empty field-8 means an
+            // unknown member Parquet.Net dropped (→ encrypted); an empty field-8 is corruption (→ false).
+            return IsPlaintextFooterEncryptedByFooterProbe(input);
+        }
+
+        return false;
+    }
+
     internal static bool IsPlaintextFooterEncrypted(global::Parquet.Meta.FileMetaData? metadata)
     {
         if (metadata is null)
