@@ -715,6 +715,52 @@ public sealed class ParquetCorruptionTests
     }
 
     [Fact]
+    public async Task UnknownEncryptionAlgorithmUnionMember_ExplicitFieldId65544_FailsClosed()
+    {
+        // #773 R3 red-team MISS: a field-8 header written with an EXPLICIT Thrift-compact field id of 65544
+        // (0x10008). Parquet.Net's ReadI16 truncates it to (short)8, so it parses the field AS
+        // encryption_algorithm (algorithm present, both known members null). A raw walk that read the id at
+        // full width (65544 != 8) would MISS field-8 and, under the pre-fix mapping, read the ciphertext file
+        // as plaintext. The fix (1) resolves field ids exactly as Parquet.Net does — (short)-truncated — so the
+        // walk sees field-8 too, AND (2) fails closed on any raw/parsed disagreement. Must be UnsupportedFeature.
+        // RED-on-revert: reverting the field-id truncation OR the inverted default reopens the fail-open.
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] forged = await ParquetTestHelpers.UnknownEncryptionAlgorithmUnionMember_ExplicitFieldId65544_FileAsync(file);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(forged, schema));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("malformed", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task UnknownEncryptionAlgorithmUnionMember_MistypedRequiredField_FailsClosed()
+    {
+        // #773 R3 security MISS: an unknown-member file with num_rows (required field 3) mistyped from i64 to
+        // i32 (a single-nibble footer edit). Parquet.Net tolerantly opens it (row counts come from row-group
+        // metadata), so the parsed layer still confirms the algorithm is present; but the strict raw walk's
+        // FileMetaData-required-fields gate then fails, and the pre-fix success mapping read the encrypted file
+        // as plaintext. The fix reads a file as plaintext ONLY on a positively-confirmed benign EMPTY field-8;
+        // a non-empty field-8 with a mistyped required field now fails closed. Must be UnsupportedFeature.
+        // RED-on-revert: mapping the raw walk's non-benign result to plaintext reopens the fail-open.
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] forged = await ParquetTestHelpers.UnknownEncryptionAlgorithmUnionMember_MistypedNumRows_FileAsync(file, rowCount: 3);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(forged, schema));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("malformed", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task PlaintextFooterEncryption_ThroughReadDataSchemaAsync_IsUnsupportedFeature()
     {
         // The footer-only schema door funnels through the SAME OpenAsync classifier — UnsupportedFeature, not

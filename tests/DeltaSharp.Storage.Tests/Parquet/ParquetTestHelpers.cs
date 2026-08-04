@@ -709,6 +709,97 @@ internal static class ParquetTestHelpers
         forged.Write("PAR1"u8);
         return forged.ToArray();
     }
+
+    /// <summary>#773 red-team field-id-truncation fixture. Builds a file whose <c>encryption_algorithm</c>
+    /// (field 8) header uses an EXPLICIT Thrift-compact field id of <c>65544</c> (<c>0x10008</c>) carrying an
+    /// unknown union member. Parquet.Net decodes the explicit id via <c>ReadI16</c> =
+    /// <c>(short)ZigzagToInt(...)</c>, which TRUNCATES <c>65544</c> to <c>8</c>, so it parses the field AS
+    /// <c>encryption_algorithm</c> (opening the file with a non-null algorithm, both known members null). A
+    /// strict raw walk that read the id at full width would see <c>65544 != 8</c> and miss field-8 entirely —
+    /// the differential that let this be read as plaintext. Splices the AES-member footer up to the field-8
+    /// field header, replaces that header with an explicit-id-65544 struct header + an unknown (id-3) member,
+    /// then the required STOP bytes.</summary>
+    public static async Task<byte[]> UnknownEncryptionAlgorithmUnionMember_ExplicitFieldId65544_FileAsync(byte[] bytes)
+    {
+        byte[] aesFooter = await SerializeFooterWithAlgorithmAsync(bytes, aesMember: true);
+        byte[] emptyFooter = await SerializeFooterWithAlgorithmAsync(bytes, aesMember: false);
+
+        int i = 0;
+        int min = Math.Min(aesFooter.Length, emptyFooter.Length);
+        while (i < min && aesFooter[i] == emptyFooter[i])
+        {
+            i++;
+        }
+
+        if (i >= aesFooter.Length || aesFooter[i] != 0x1C)
+        {
+            throw new InvalidOperationException(
+                $"expected AES_GCM_V1 member header 0x1C at footer offset {i}, got "
+                + (i < aesFooter.Length ? $"0x{aesFooter[i]:X2}" : "<end>"));
+        }
+
+        int originalFooterLength = BitConverter.ToInt32(bytes, bytes.Length - 8);
+        int footerStart = bytes.Length - 8 - originalFooterLength;
+        using var footerBuilder = new MemoryStream();
+        footerBuilder.Write(bytes, 0, footerStart);
+        // Everything up to (but not including) the field-8 FIELD header byte (the byte just before the member).
+        footerBuilder.Write(aesFooter, 0, i - 1);
+        // field-8 header with explicit field id: type=struct (0x0C), modifier nibble 0 => explicit id follows.
+        footerBuilder.WriteByte(0x0C);
+        // zigzag varint for field id 65544: zigzag(65544) = 131088 => varint 0x90 0x80 0x08.
+        footerBuilder.WriteByte(0x90);
+        footerBuilder.WriteByte(0x80);
+        footerBuilder.WriteByte(0x08);
+        // Unknown union member: field id 3, struct, empty body => header 0x3C, then STOP.
+        footerBuilder.WriteByte(0x3C);
+        footerBuilder.WriteByte(0x00);
+        // STOP for the encryption_algorithm struct, then STOP for the top-level FileMetaData struct.
+        footerBuilder.WriteByte(0x00);
+        footerBuilder.WriteByte(0x00);
+
+        byte[] withFooter = footerBuilder.ToArray();
+        int newFooterLen = withFooter.Length - footerStart;
+        using var final = new MemoryStream();
+        final.Write(withFooter, 0, withFooter.Length);
+        final.Write(BitConverter.GetBytes(newFooterLen), 0, 4);
+        final.Write("PAR1"u8);
+        return final.ToArray();
+    }
+
+    /// <summary>#773 security fixture: an unknown-member file with one required FileMetaData field mistyped —
+    /// <c>num_rows</c> (field 3) flipped from its Thrift i64 field header (<c>0x16</c>) to i32 (<c>0x15</c>).
+    /// Parquet.Net tolerantly opens it (row counts come from row-group metadata), so the parsed layer still
+    /// confirms the algorithm is present; a raw walk that gated on the exact required-field types would then
+    /// (pre-fix) read the encrypted file as plaintext. Locates the header by the deterministic <c>0x16</c>
+    /// (delta 1, i64) followed by the zigzag varint of the known row count.</summary>
+    public static async Task<byte[]> UnknownEncryptionAlgorithmUnionMember_MistypedNumRows_FileAsync(
+        byte[] bytes, long rowCount)
+    {
+        byte[] forged = await UnknownEncryptionAlgorithmUnionMemberFileAsync(bytes);
+        int originalFooterLength = BitConverter.ToInt32(forged, forged.Length - 8);
+        int footerStart = forged.Length - 8 - originalFooterLength;
+
+        byte zig = (byte)((rowCount << 1) ^ (rowCount >> 63)); // small non-negative counts fit one byte
+        int at = -1;
+        for (int p = footerStart; p < forged.Length - 8 - 1; p++)
+        {
+            if (forged[p] == 0x16 && forged[p + 1] == zig)
+            {
+                at = p;
+                break;
+            }
+        }
+
+        if (at < 0)
+        {
+            throw new InvalidOperationException(
+                $"could not locate num_rows header 0x16 followed by zigzag(0x{zig:X2}) in the footer");
+        }
+
+        forged[at] = 0x15; // i64 (0x6) -> i32 (0x5): mistype the required num_rows field
+        return forged;
+    }
+
     /// value (e.g. <c>9</c>, which is not a real <c>CompressionCodec</c>) that leaves the footer parseable and
     /// the physical pages untouched, so the file OPENS cleanly (valid <c>PAR1</c> magic), yet Parquet.Net's
     /// page decode raises a raw <see cref="NotSupportedException"/> ("Compression method 9 is not supported.")
