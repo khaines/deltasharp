@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 
 namespace DeltaSharp.Storage.Parquet;
@@ -229,14 +230,27 @@ internal static class ParquetEncryption
                     return false;
                 }
 
-                byte[] footer = new byte[footerLength];
-                input.Position = length - 8 - footerLength;
-                if (input.ReadAtLeast(footer, footerLength, throwOnEndOfStream: false) != footerLength)
+                byte[] footer = ArrayPool<byte>.Shared.Rent(footerLength);
+                try
                 {
-                    return false;
-                }
+                    input.Position = length - 8 - footerLength;
+                    // Read into the exact-length slice, not the whole rented buffer: ReadAtLeast fills up to
+                    // the span length, and a rented buffer is >= footerLength, so passing the full array would
+                    // over-read past the footer (returning > footerLength) and spuriously fail the check.
+                    if (input.ReadAtLeast(footer.AsSpan(0, footerLength), footerLength, throwOnEndOfStream: false) != footerLength)
+                    {
+                        return false;
+                    }
 
-                return ThriftFooterHasEncryptionAlgorithm(footer);
+                    // Rent may return a larger buffer than requested; classify only the footer bytes read.
+                    return ThriftFooterHasEncryptionAlgorithm(footer.AsSpan(0, footerLength));
+                }
+                finally
+                {
+                    // No clearArray: the footer is untrusted on-disk metadata, not a secret; the failure-path
+                    // buffer (<= MaxProbedFooterBytes) is returned for reuse to avoid a large LOH allocation.
+                    ArrayPool<byte>.Shared.Return(footer);
+                }
             }
             finally
             {
