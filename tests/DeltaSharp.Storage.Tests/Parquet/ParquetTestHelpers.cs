@@ -674,6 +674,41 @@ internal static class ParquetTestHelpers
             return SerializeFooter(metadata);
         }
     }
+
+    /// <summary>Returns a valid Parquet file identical to <paramref name="bytes"/> except its footer metadata
+    /// carries an extra <c>key_value_metadata</c> entry of roughly <paramref name="padBytes"/> bytes, inflating
+    /// the total footer_length past a threshold. Used to build the #773 red-team's oversized-footer bypass
+    /// fixture: <c>key_value_metadata</c> is FileMetaData field 5 (before field-8 encryption_algorithm), so a
+    /// subsequent <see cref="UnknownEncryptionAlgorithmUnionMemberFileAsync"/> patch still locates the field-8
+    /// member header as the first divergence — the padding is byte-identical in both serializations.</summary>
+    public static async Task<byte[]> PadFooterMetadataAsync(byte[] bytes, int padBytes)
+    {
+        byte[] newFooter;
+        using (var stream = new MemoryStream(bytes, writable: false))
+        {
+            ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                global::Parquet.Meta.FileMetaData metadata = reader.Metadata!;
+                metadata.KeyValueMetadata ??= new List<global::Parquet.Meta.KeyValue>();
+                metadata.KeyValueMetadata.Add(new global::Parquet.Meta.KeyValue
+                {
+                    Key = "deltasharp.test.padding",
+                    Value = new string('A', padBytes),
+                });
+                newFooter = SerializeFooter(metadata);
+            }
+        }
+
+        int originalFooterLength = BitConverter.ToInt32(bytes, bytes.Length - 8);
+        int footerStart = bytes.Length - 8 - originalFooterLength;
+        using var forged = new MemoryStream();
+        forged.Write(bytes, 0, footerStart);
+        forged.Write(newFooter, 0, newFooter.Length);
+        forged.Write(BitConverter.GetBytes(newFooter.Length), 0, 4);
+        forged.Write("PAR1"u8);
+        return forged.ToArray();
+    }
     /// value (e.g. <c>9</c>, which is not a real <c>CompressionCodec</c>) that leaves the footer parseable and
     /// the physical pages untouched, so the file OPENS cleanly (valid <c>PAR1</c> magic), yet Parquet.Net's
     /// page decode raises a raw <see cref="NotSupportedException"/> ("Compression method 9 is not supported.")

@@ -108,11 +108,14 @@ internal static class ParquetEncryption
         if (algorithm is not null && algorithm.AESGCMV1 is null && algorithm.AESGCMCTRV1 is null)
         {
             // Empty PARSED union but a present algorithm: consult the raw footer. A non-empty field-8 means an
-            // unknown member Parquet.Net dropped (→ encrypted); an empty field-8 is corruption (→ false).
+            // unknown member Parquet.Net dropped (→ encrypted); an empty field-8 is corruption (→ false). If the
+            // probe cannot determine the answer (e.g. an attacker padded the footer past MaxProbedFooterBytes,
+            // or a read fault), FAIL CLOSED (→ encrypted): the parsed metadata already confirms an algorithm is
+            // present, so we must never read such a file as plaintext (#773 red-team: the >16 MiB footer bypass).
             // (The `both members null` check is defensive/self-documenting: control only reaches here after the
             // base overload returned false, so a non-null algorithm here already implies both known members are
             // null — the base's first arm would have returned true otherwise.)
-            return IsPlaintextFooterEncryptedByFooterProbe(input);
+            return ProbeRawFooterEncryptionAlgorithm(input) ?? true;
         }
 
         return false;
@@ -259,9 +262,27 @@ internal static class ParquetEncryption
     /// </summary>
     private static bool IsPlaintextFooterEncryptedByFooterProbe(Stream input)
     {
+        // Failure-path mapping: an indeterminate probe (couldn't read/oversized footer) keeps the caller's
+        // fail-closed CorruptData default, so null collapses to false here.
+        return ProbeRawFooterEncryptionAlgorithm(input) ?? false;
+    }
+
+    /// <summary>Tri-state core of the raw-footer encryption probe. Returns <see langword="true"/> when the
+    /// footer was read and carries a NON-EMPTY <c>encryption_algorithm</c> struct (a real, possibly unknown,
+    /// union member — the #773 shape), <see langword="false"/> when the footer was read and the field is
+    /// absent/empty (ordinary or empty-union-corruption), and <see langword="null"/> when the probe could NOT
+    /// determine the answer because the footer was unreadable within its bounds — non-seekable input, a
+    /// footer_length that is non-positive, exceeds the file, or exceeds <see cref="MaxProbedFooterBytes"/>, a
+    /// short read, or an I/O fault. The two callers map <see langword="null"/> differently: the failure path
+    /// keeps its CorruptData default (null → not-encryption), while the success-path overload — which already
+    /// KNOWS from the parsed metadata that an <c>encryption_algorithm</c> is present — must fail CLOSED
+    /// (null → treat as encrypted), so a footer padded past the probe cap cannot be read as plaintext (#773
+    /// red-team). Never throws; restores the input position.</summary>
+    private static bool? ProbeRawFooterEncryptionAlgorithm(Stream input)
+    {
         if (input is null || !input.CanSeek)
         {
-            return false;
+            return null;
         }
 
         try
@@ -270,7 +291,7 @@ internal static class ParquetEncryption
             // Minimum plausible file: a (>=1 byte) footer + the 4-byte footer length + 4-byte trailing magic.
             if (length < ParquetMagicLength + 8)
             {
-                return false;
+                return null;
             }
 
             long savedPosition = input.Position;
@@ -283,20 +304,23 @@ internal static class ParquetEncryption
                 input.Position = length - 8;
                 if (input.ReadAtLeast(tail, 8, throwOnEndOfStream: false) != 8)
                 {
-                    return false;
+                    return null;
                 }
 
                 int footerLength = BinaryPrimitives.ReadInt32LittleEndian(tail);
                 if (footerLength <= 0 || footerLength > length - 8 || footerLength > MaxProbedFooterBytes)
                 {
-                    return false;
+                    // Indeterminate: an oversized (attacker-padded) or invalid footer_length means the probe
+                    // cannot inspect field-8. The success-path caller fails closed on this (null), so padding
+                    // the footer past MaxProbedFooterBytes cannot bypass unknown-member detection.
+                    return null;
                 }
 
                 byte[] footer = new byte[footerLength];
                 input.Position = length - 8 - footerLength;
                 if (input.ReadAtLeast(footer, footerLength, throwOnEndOfStream: false) != footerLength)
                 {
-                    return false;
+                    return null;
                 }
 
                 return ThriftFooterHasEncryptionAlgorithm(footer);
@@ -309,8 +333,9 @@ internal static class ParquetEncryption
         }
         catch (Exception ex) when (ex is IOException or ObjectDisposedException or NotSupportedException)
         {
-            // A probe I/O fault on an already-failing input must never REPLACE the fail-closed classification.
-            return false;
+            // A probe I/O fault leaves the answer indeterminate; each caller maps null to its own fail-closed
+            // default (CorruptData on the failure path, UnsupportedFeature on the success path).
+            return null;
         }
     }
 

@@ -690,6 +690,31 @@ public sealed class ParquetCorruptionTests
     }
 
     [Fact]
+    public async Task UnknownEncryptionAlgorithmUnionMember_OversizedFooter_FailsClosed_NotReadAsPlaintext()
+    {
+        // #773 red-team MISS: the raw-footer probe caps the footer it will read at MaxProbedFooterBytes (16 MiB).
+        // A malicious writer who pads the footer (here a ~17 MiB key_value_metadata entry) past that cap while
+        // using an UNKNOWN EncryptionAlgorithm union member would, under the first fix, make the probe abort and
+        // the success-path classifier return false — reading the (ciphertext) file as PLAINTEXT (fail-open).
+        // The tri-state fix makes an indeterminate probe (oversized/unreadable footer) FAIL CLOSED on the
+        // success path, because the parsed metadata already confirms an algorithm is present. Must be
+        // UnsupportedFeature, never a successful plaintext read. RED-on-revert: `?? true` -> `?? false` (or the
+        // old bool probe) reopens the fail-open and this Assert.ThrowsAsync fails (rows are returned).
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] padded = await ParquetTestHelpers.PadFooterMetadataAsync(file, padBytes: 17 * 1024 * 1024);
+        byte[] forged = await ParquetTestHelpers.UnknownEncryptionAlgorithmUnionMemberFileAsync(padded);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(forged, schema));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("malformed", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task PlaintextFooterEncryption_ThroughReadDataSchemaAsync_IsUnsupportedFeature()
     {
         // The footer-only schema door funnels through the SAME OpenAsync classifier — UnsupportedFeature, not
