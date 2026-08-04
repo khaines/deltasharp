@@ -109,6 +109,9 @@ internal static class ParquetEncryption
         {
             // Empty PARSED union but a present algorithm: consult the raw footer. A non-empty field-8 means an
             // unknown member Parquet.Net dropped (→ encrypted); an empty field-8 is corruption (→ false).
+            // (The `both members null` check is defensive/self-documenting: control only reaches here after the
+            // base overload returned false, so a non-null algorithm here already implies both known members are
+            // null — the base's first arm would have returned true otherwise.)
             return IsPlaintextFooterEncryptedByFooterProbe(input);
         }
 
@@ -133,10 +136,13 @@ internal static class ParquetEncryption
         // below and are read as bare presence anyway — see the ordering note at the top of this method.
         //
         // Forward-compat note: if a future format revision adds a third union member that this Parquet.Net
-        // version cannot deserialize, both properties stay null here. The backstop is then the PER-COLUMN
-        // CryptoMetadata arm below — NOT the raw-bytes failure-path probe, which only runs when CreateAsync
-        // THROWS, and such a file opens cleanly (verified: patching the union's member field id to an unknown
-        // value leaves Parquet.Net opening the file with a non-null algorithm and both members null). That is
+        // version cannot deserialize, both properties stay null here. In THIS parsed-only overload the backstop
+        // is the PER-COLUMN CryptoMetadata arm below — NOT the raw-bytes failure-path probe, which only runs
+        // when CreateAsync THROWS, and such a file opens cleanly (verified: patching the union's member field id
+        // to an unknown value leaves Parquet.Net opening the file with a non-null algorithm and both members
+        // null). (Success-path callers close that same foreign-writer residual for the columns-present case via
+        // the stream-aware IsPlaintextFooterEncrypted(metadata, input) overload ABOVE, which runs the raw-footer
+        // probe on exactly this empty-parsed-union shape — see #773.) That is
         // why the per-column arm is deliberately left BARE-PRESENCE rather than being tightened to match this
         // one: the asymmetry between the two arms is the mechanism that keeps an unknown future algorithm
         // classified. The spec mandates crypto_metadata on every encrypted column, so a real file with any

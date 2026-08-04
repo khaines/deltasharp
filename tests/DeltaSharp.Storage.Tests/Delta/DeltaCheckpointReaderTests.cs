@@ -927,9 +927,10 @@ public sealed class DeltaCheckpointReaderTests
         // EncryptionAlgorithm whose union member is an UNKNOWN id (3); Parquet.Net SkipFields it and opens the
         // checkpoint with both known members null, so the PARSED classifier (which also has inspectable columns
         // here and no crypto_metadata) returns false — the residual. The raw-footer disambiguation must classify
-        // it UnsupportedFeature (non-empty field-8), not let the checkpoint decode its ciphertext pages and be
-        // reported as malformed. RED-on-revert: reverting the door to IsPlaintextFooterEncrypted(metadata) — the
-        // parsed-only overload — reopens the residual and this throws DeltaProtocolException (malformed) instead.
+        // it UnsupportedFeature (non-empty field-8), not let the checkpoint decode its (plaintext-in-fixture)
+        // pages. RED-on-revert: reverting the door to IsPlaintextFooterEncrypted(metadata) — the parsed-only
+        // overload — reopens the residual; the classifier returns false and ReadAsync decodes the checkpoint and
+        // returns its actions with NO exception, so this Assert.ThrowsAsync fails ("No exception was thrown").
         byte[] parquet = await new CheckpointFixture()
             .Protocol(1, 2)
             .Metadata("t", EmptySchema)

@@ -686,6 +686,7 @@ public sealed class ParquetCorruptionTests
 
         Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
         Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("malformed", error.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

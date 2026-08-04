@@ -639,6 +639,16 @@ internal static class ParquetTestHelpers
                 + (i < aesFooter.Length ? $"0x{aesFooter[i]:X2}" : "<end>"));
         }
 
+        // Belt-and-braces: the divergence on the EMPTY side must be the union's STOP byte (0x00). Pinning both
+        // sides proves offset i is genuinely the start of the field-8 union body, ruling out a coincidental
+        // 0x1C at an unrelated earlier divergence if the Thrift layout ever shifts.
+        if (i >= emptyFooter.Length || emptyFooter[i] != 0x00)
+        {
+            throw new InvalidOperationException(
+                $"expected empty-union STOP 0x00 at footer offset {i}, got "
+                + (i < emptyFooter.Length ? $"0x{emptyFooter[i]:X2}" : "<end>"));
+        }
+
         aesFooter[i] = 0x3C; // union member id 1 -> 3 (unknown), type nibble (struct) unchanged
 
         int originalFooterLength = BitConverter.ToInt32(bytes, bytes.Length - 8);
