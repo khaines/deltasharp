@@ -593,10 +593,11 @@ public sealed class ParquetCorruptionTests
     [Fact]
     public async Task EncryptionAlgorithmWithNoRowGroups_FailsClosed_AsUnsupportedFeature()
     {
-        // #698 gate finding — the same zero-column-chunk gap on the DATA-FILE door, which shares the
-        // classifier. Non-null encryption_algorithm with both known union members null (an unknown future
-        // algorithm id) and no row groups, so the per-column backstop is vacuous. Must fail closed rather
-        // than read as an ordinary empty plaintext file.
+        // #773 (was #698 gate finding) — the same no-row-group shape on the DATA-FILE door, which shares the
+        // classifier. Non-null encryption_algorithm with both known union members null (an unknown algorithm
+        // id) and no row groups; bare-presence arm-1 fails closed on any parsed algorithm. Must be
+        // UnsupportedFeature, not an ordinary empty plaintext read. RED-on-revert: narrowing arm-1 to a
+        // non-empty union reopens it.
         var schema = new StructType(new[] { KeepField });
         ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3 });
         byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });

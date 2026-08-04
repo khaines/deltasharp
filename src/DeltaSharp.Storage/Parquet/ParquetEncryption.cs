@@ -65,22 +65,24 @@ internal static class ParquetEncryption
     }
 
     // Detects a plaintext-footer Parquet Modular Encryption file (#655) from the PARSED footer metadata.
-    // Three markers, any of which is sufficient (Parquet format Encryption.md):
+    // TWO markers, either of which is sufficient (Parquet format Encryption.md), both by BARE PRESENCE (#773):
     //   * FileMetaData.EncryptionAlgorithm (Thrift field 8) — "set only in encrypted files with plaintext
-    //     footer" per the format spec, carrying a NON-EMPTY union (see below);
-    //   * any ColumnChunk.CryptoMetadata (ColumnCryptoMetaData) — a plaintext-footer file may encrypt only a
-    //     SUBSET of columns, carrying per-column crypto metadata even when the file-level algorithm is unset;
-    //     and
-    //   * a non-null EncryptionAlgorithm of any shape when the footer has NO column chunk to inspect, where
-    //     the per-column marker is vacuous and the narrowed union rule must fail closed (#698 gate).
+    //     footer" per the format spec — in ANY parsed shape (a known member, an unknown member Parquet.Net
+    //     dropped via SkipField leaving both known members null, or an empty union a corrupt footer parsed
+    //     into); and
+    //   * any ColumnChunk.CryptoMetadata (ColumnCryptoMetaData), checked only when the file-level algorithm is
+    //     unset — a plaintext-footer file may encrypt only a SUBSET of columns.
+    // Bare presence on the file-level algorithm (rather than the former "require a non-empty union" precision)
+    // is deliberate: an unknown union member is INDISTINGUISHABLE at the parsed layer from an empty-union
+    // corruption, and the #773 review found FOUR parser differentials proving a raw-footer re-parse cannot
+    // securely tell them apart, so this fails closed on any parsed algorithm (see the classifier body).
     // Detection is presence-only: no field CONTENTS are read, so no attacker-controlled footer value can be
     // echoed (#653 hygiene). A healthy unencrypted file has no marker, so this never false-positives on one.
     // A CORRUPT footer, however, can still PARSE into a spurious marker (~1% of single-bit flips in the
     // checkpoint fuzz corpus) — which is why both doors materialize the high-level schema BEFORE consulting
-    // this check, so a genuinely corrupt file is proven corrupt first. That ordering is REQUIRED, not
-    // belt-and-braces: this classifier does NOT cover the observed corpus on its own, because every one of
-    // those flips lands on the third arm above (empty union + zero inspectable column chunks), which by
-    // design reads as bare presence. The schema probe is the sole control for them, and it is pinned by
+    // this check, so a genuinely corrupt file is proven corrupt (MALFORMED) first. That ordering is REQUIRED,
+    // not belt-and-braces: those flips parse a spurious (empty) algorithm that bare presence would call
+    // "encrypted", so the schema probe is the sole control that keeps them MALFORMED, pinned by
     // DeltaCheckpointReaderTests.SchemaFirstOrdering_IsSoleControl_ForAtLeastOneCorruptFlip.
     internal static bool IsPlaintextFooterEncrypted(global::Parquet.Meta.FileMetaData? metadata)
     {

@@ -1097,14 +1097,12 @@ public sealed class DeltaCheckpointReaderTests
     [Fact]
     public async Task EncryptionAlgorithmWithNoRowGroupsCheckpoint_FailsClosed_AsUnsupportedFeature()
     {
-        // #698 gate finding — the zero-column-chunk gap in the narrowed union rule. The footer carries a
-        // non-null encryption_algorithm whose known union members are both null (the shape an unknown FUTURE
-        // algorithm id takes) AND no row groups, which empties the per-column CryptoMetadata backstop the
-        // narrowing relies on: with no columns, "every encrypted column carries crypto_metadata" is vacuously
-        // true and vouches for nothing. Where the backstop cannot speak the classifier must fall back to bare
-        // presence and fail CLOSED.
-        // RED-on-revert: drop the third arm (return false instead of the bare-presence fallback) and this
-        // checkpoint is read as ordinary plaintext, so no exception is thrown at all.
+        // #773 (was #698 gate finding) — a footer carrying a non-null encryption_algorithm whose known union
+        // members are both null (the shape an unknown algorithm id takes) AND no row groups. Under the former
+        // three-arm classifier this was the case the per-column CryptoMetadata backstop could not vouch for;
+        // now bare-presence arm-1 covers it directly — ANY parsed encryption_algorithm fails closed.
+        // RED-on-revert: narrowing arm-1 back to a non-empty-union requirement lets this checkpoint be read as
+        // ordinary plaintext, so no exception is thrown at all.
         byte[] parquet = await new CheckpointFixture()
             .Protocol(1, 2)
             .Metadata("t", EmptySchema)
