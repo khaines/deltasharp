@@ -710,6 +710,60 @@ internal static class ParquetTestHelpers
         return forged.ToArray();
     }
 
+    /// <summary>#773 R4 red-team/security fixture: a TYPE-NIBBLE / multi-field-8 desync. The footer carries TWO
+    /// field-8 headers — first an EMPTY struct (<c>0x00</c> body), then a BOOLEAN-typed field-8 (explicit id 8,
+    /// header <c>0x01 0x10</c>) followed by an unknown member and STOPs (<c>0x3C 0x00 0x00 0x00</c>).
+    /// Parquet.Net's <c>FileMetaData.Read</c> dispatches field 8 by id ALONE (ignoring the type nibble) and
+    /// always consumes it as a struct via <c>EncryptionAlgorithm.Read</c>, so it re-enters a nested struct and
+    /// parses the trailing bytes as a real unknown member — opening the file with a NON-NULL algorithm. A
+    /// strict raw walk that gated field-8 on <c>type == struct</c> skipped the boolean-typed second field-8 and
+    /// locked in the first (empty) struct — the last-wins desync that read this as plaintext. Splices the
+    /// AES-member footer up to the field-8 field header.</summary>
+    public static async Task<byte[]> UnknownEncryptionAlgorithmUnionMember_TypeConfusedMultiField8_FileAsync(byte[] bytes)
+    {
+        byte[] aesFooter = await SerializeFooterWithAlgorithmAsync(bytes, aesMember: true);
+        byte[] emptyFooter = await SerializeFooterWithAlgorithmAsync(bytes, aesMember: false);
+
+        int i = 0;
+        int min = Math.Min(aesFooter.Length, emptyFooter.Length);
+        while (i < min && aesFooter[i] == emptyFooter[i])
+        {
+            i++;
+        }
+
+        if (i >= aesFooter.Length || aesFooter[i] != 0x1C)
+        {
+            throw new InvalidOperationException(
+                $"expected AES_GCM_V1 member header 0x1C at footer offset {i}, got "
+                + (i < aesFooter.Length ? $"0x{aesFooter[i]:X2}" : "<end>"));
+        }
+
+        int originalFooterLength = BitConverter.ToInt32(bytes, bytes.Length - 8);
+        int footerStart = bytes.Length - 8 - originalFooterLength;
+        using var footerBuilder = new MemoryStream();
+        footerBuilder.Write(bytes, 0, footerStart);
+        // Fields 1..7 up to (but not including) the field-8 FIELD header byte.
+        footerBuilder.Write(aesFooter, 0, i - 1);
+        // field-8 #1: the original struct header (aesFooter[i-1]) with an EMPTY body (immediate STOP).
+        footerBuilder.WriteByte(aesFooter[i - 1]);
+        footerBuilder.WriteByte(0x00);
+        // field-8 #2: boolean-typed (0x01), explicit id zigzag(8)=0x10, then unknown member 0x3C + STOPs.
+        footerBuilder.WriteByte(0x01);
+        footerBuilder.WriteByte(0x10);
+        footerBuilder.WriteByte(0x3C);
+        footerBuilder.WriteByte(0x00); // STOP for the (re-entered) EncryptionAlgorithm struct
+        footerBuilder.WriteByte(0x00); // STOP for the top-level FileMetaData struct
+        footerBuilder.WriteByte(0x00); // trailing STOP margin
+
+        byte[] withFooter = footerBuilder.ToArray();
+        int newFooterLen = withFooter.Length - footerStart;
+        using var final = new MemoryStream();
+        final.Write(withFooter, 0, withFooter.Length);
+        final.Write(BitConverter.GetBytes(newFooterLen), 0, 4);
+        final.Write("PAR1"u8);
+        return final.ToArray();
+    }
+
     /// <summary>#773 red-team field-id-truncation fixture. Builds a file whose <c>encryption_algorithm</c>
     /// (field 8) header uses an EXPLICIT Thrift-compact field id of <c>65544</c> (<c>0x10008</c>) carrying an
     /// unknown union member. Parquet.Net decodes the explicit id via <c>ReadI16</c> =

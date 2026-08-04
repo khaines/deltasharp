@@ -1141,16 +1141,17 @@ public sealed class DeltaCheckpointReaderTests
     }
 
     [Fact]
-    public async Task EmptyEncryptionAlgorithmUnionCheckpoint_IsNotClassifiedEncrypted()
+    public async Task EmptyEncryptionAlgorithmUnionCheckpoint_FailsClosed_AsUnsupportedFeature()
     {
-        // #698 review FIX 4 — precision guard on the SUCCESS-path arm, independent of the schema-first
-        // ordering. The footer carries a NON-NULL encryption_algorithm whose union has NEITHER member set:
-        // the shape a corrupt footer parses into, and the shape every observed single-bit-flip false positive
-        // took. Everything else in the footer is intact, so the file opens AND its schema materializes —
-        // schema-first therefore does NOT reject it, leaving the union-non-empty rule as the only control
-        // that can. Post-fix the marker is correctly ignored and the checkpoint simply reads.
-        // RED-on-revert: relax IsPlaintextFooterEncrypted back to bare `EncryptionAlgorithm is not null` and
-        // this read throws UnsupportedFeature on a file that is not encrypted.
+        // #773 (supersedes #698 review FIX 4) — the SUCCESS-path arm on the checkpoint door. The footer carries
+        // a NON-NULL encryption_algorithm whose parsed union has NEITHER member set. That shape is AMBIGUOUS:
+        // a corrupt footer parses into it AND Parquet.Net produces it for an UNKNOWN union member it dropped
+        // via SkipField. Since the parsed layer cannot distinguish them and a raw re-parse cannot securely
+        // agree with Parquet.Net's tolerant parser (four differentials found), the classifier now BARE-PRESENCE
+        // fails closed on ANY parsed encryption_algorithm. Everything else in the footer is intact, so the file
+        // opens AND its schema materializes — schema-first does NOT reject it — leaving this bare-presence check
+        // as the control: UnsupportedFeature, not a plaintext read. RED-on-revert: narrowing arm-1 back to a
+        // non-empty-union requirement reopens the #773 fail-open and this Assert.ThrowsAsync fails.
         byte[] parquet = await new CheckpointFixture()
             .Protocol(1, 2)
             .Metadata("t", EmptySchema)
@@ -1158,12 +1159,11 @@ public sealed class DeltaCheckpointReaderTests
             .ToParquetAsync();
         byte[] forged = await ParquetTestHelpers.EmptyEncryptionAlgorithmUnionFileAsync(parquet);
 
-        IReadOnlyList<DeltaAction> actions =
-            await DeltaCheckpointReader.ReadAsync(new MemoryStream(forged), default);
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(forged), default));
 
-        // The real markers still round-trip, so the door must produce the same actions as the unforged file.
-        Assert.Equal(3, actions.Count);
-        Assert.Contains(actions, a => a is AddFileAction { Path: "a.parquet" });
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

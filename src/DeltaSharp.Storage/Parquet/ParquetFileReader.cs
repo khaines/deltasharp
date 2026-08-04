@@ -680,7 +680,7 @@ internal sealed class ParquetFileReader
             // the field's existence is the diagnosis; no footer content is read or echoed (#653 hygiene). The
             // rules themselves live in the shared ParquetEncryption classifier so the checkpoint door applies
             // exactly the same ones (#681).
-            if (ParquetEncryption.IsPlaintextFooterEncrypted(reader.Metadata, input))
+            if (ParquetEncryption.IsPlaintextFooterEncrypted(reader.Metadata))
             {
                 // Dispose the healthy reader (leaveStreamOpen:false also releases the input stream) before
                 // failing closed; guard the dispose so a dispose-time fault cannot escape UNMAPPED and

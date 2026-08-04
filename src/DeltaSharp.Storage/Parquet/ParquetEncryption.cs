@@ -82,61 +82,6 @@ internal static class ParquetEncryption
     // those flips lands on the third arm above (empty union + zero inspectable column chunks), which by
     // design reads as bare presence. The schema probe is the sole control for them, and it is pinned by
     // DeltaCheckpointReaderTests.SchemaFirstOrdering_IsSoleControl_ForAtLeastOneCorruptFlip.
-    /// <summary>Success-path classifier with RAW-FOOTER disambiguation (#773). Behaves exactly like
-    /// <see cref="IsPlaintextFooterEncrypted(global::Parquet.Meta.FileMetaData?)"/>, except it closes the
-    /// foreign-writer residual named at that method's third arm: when the parsed check is inconclusive because
-    /// the file carries a non-null <c>EncryptionAlgorithm</c> whose two KNOWN union members are BOTH null, it
-    /// re-reads the raw footer. That shape is what Parquet.Net produces for an <b>unknown</b> union member it
-    /// could not deserialize (its reader <c>SkipField</c>s the unrecognized id, leaving the parsed union
-    /// empty) — reachable today by any foreign/spec-violating writer, not only if a third member ever ships —
-    /// and it is indistinguishable at the PARSED layer from a corrupt footer's spurious empty union. The RAW
-    /// footer separates them: a NON-EMPTY field-8 struct carries a real (if unknown) member → encrypted; an
-    /// EMPTY field-8 is the corruption shape → not encrypted. This closes the residual WITHOUT the
-    /// bare-presence collapse the third arm warns against (which would reintroduce the empty-union false
-    /// positive), because the raw probe — unlike the parsed model — can see the dropped member. The extra read
-    /// runs ONLY in this rare ambiguous case; normal files (no algorithm) and known-member encrypted files are
-    /// already decided by the parsed check. Falls back to the parsed verdict when <paramref name="input"/> is
-    /// not seekable (the probe cannot run), which is no worse than the prior behaviour.</summary>
-    internal static bool IsPlaintextFooterEncrypted(global::Parquet.Meta.FileMetaData? metadata, Stream input)
-    {
-        if (IsPlaintextFooterEncrypted(metadata))
-        {
-            return true;
-        }
-
-        global::Parquet.Meta.EncryptionAlgorithm? algorithm = metadata?.EncryptionAlgorithm;
-        if (algorithm is not null && algorithm.AESGCMV1 is null && algorithm.AESGCMCTRV1 is null)
-        {
-            // Empty PARSED union but a present algorithm — the #773 ambiguous shape. Parquet.Net already
-            // confirmed an encryption_algorithm is present, so we must be CONSERVATIVE: read this file as
-            // plaintext ONLY when the raw footer POSITIVELY confirms the benign empty-union corruption shape
-            // (a field-8 struct that is a plausible-FileMetaData member-less/empty union). EVERY other outcome
-            // fails CLOSED (→ encrypted / UnsupportedFeature):
-            //   * a NON-EMPTY field-8 (a real, unknown union member Parquet.Net dropped) → encrypted;
-            //   * field-8 ABSENT in the raw walk while the parsed layer saw one (a parser DISAGREEMENT — e.g.
-            //     the field-id truncation or required-field mistype differentials the red-team/security seats
-            //     found, where Parquet.Net tolerantly parses a field-8 the strict walk skips) → fail closed;
-            //   * an unreadable footer (padded past MaxProbedFooterBytes, short read, I/O fault, non-seekable)
-            //     → fail closed.
-            // Mapping any raw-walk `false`/disagreement to plaintext would be a fail-OPEN; the inverted default
-            // here means only a positively-identified benign empty union is ever read (#773 R3 red-team +
-            // security). (The `both members null` check is defensive/self-documenting: control only reaches
-            // here after the base overload returned false, so a non-null algorithm already implies both known
-            // members are null — the base's first arm would have returned true otherwise.)
-            FooterInspection? probe = ProbeRawFooterEncryptionAlgorithm(input);
-            if (probe is null)
-            {
-                return true; // indeterminate → fail closed
-            }
-
-            bool benignEmptyUnion =
-                probe.Value.Field8 == RawField8.EmptyStruct && probe.Value.RequiredFieldsPresent;
-            return !benignEmptyUnion;
-        }
-
-        return false;
-    }
-
     internal static bool IsPlaintextFooterEncrypted(global::Parquet.Meta.FileMetaData? metadata)
     {
         if (metadata is null)
@@ -144,41 +89,39 @@ internal static class ParquetEncryption
             return false;
         }
 
-        // Require a NON-EMPTY union, the parsed analogue of the rule the FAILURE-path footer walk already
-        // applies: per parquet.thrift, EncryptionAlgorithm is a union of exactly AES_GCM_V1 and
-        // AES_GCM_CTR_V1, and a valid encrypted file always sets exactly one member — so requiring one carries
-        // no false-negative risk for a real encrypted file, while rejecting the EMPTY union that a corrupt
-        // footer can parse into (every observed fuzz false-positive was exactly this shape). Applying the same
-        // precision rule on both arms removes an EMPTY-union false positive here without relying on the
-        // unrelated property of schema materializability. It does NOT make the schema probe redundant: those
-        // same fuzz shapes also carry zero inspectable column chunks, so they fall through to the third arm
-        // below and are read as bare presence anyway — see the ordering note at the top of this method.
+        // BARE PRESENCE on the parsed encryption_algorithm (#773). If Parquet.Net parsed a non-null
+        // EncryptionAlgorithm — ANY shape: a known member (AES_GCM_V1/AES_GCM_CTR_V1), an UNKNOWN member it
+        // dropped via SkipField (leaving both known members null), or an empty union a corrupt footer parsed
+        // into — this success-path classifier FAILS CLOSED (UnsupportedFeature).
         //
-        // Forward-compat note: if a future format revision adds a third union member that this Parquet.Net
-        // version cannot deserialize, both properties stay null here. In THIS parsed-only overload the backstop
-        // is the PER-COLUMN CryptoMetadata arm below — NOT the raw-bytes failure-path probe, which only runs
-        // when CreateAsync THROWS, and such a file opens cleanly (verified: patching the union's member field id
-        // to an unknown value leaves Parquet.Net opening the file with a non-null algorithm and both members
-        // null). (Success-path callers close that same foreign-writer residual for the columns-present case via
-        // the stream-aware IsPlaintextFooterEncrypted(metadata, input) overload ABOVE, which runs the raw-footer
-        // probe on exactly this empty-parsed-union shape — see #773.) That is
-        // why the per-column arm is deliberately left BARE-PRESENCE rather than being tightened to match this
-        // one: the asymmetry between the two arms is the mechanism that keeps an unknown future algorithm
-        // classified. The spec mandates crypto_metadata on every encrypted column, so a real file with any
-        // columns always carries it — an assumption about FOREIGN writers, whose residual is named at the
-        // third arm below. That clause is also VACUOUS for a file with no column chunks at all, so
-        // the third arm below restores fail-closed behaviour in exactly that case.
-        global::Parquet.Meta.EncryptionAlgorithm? algorithm = metadata.EncryptionAlgorithm;
-        if (algorithm is not null && (algorithm.AESGCMV1 is not null || algorithm.AESGCMCTRV1 is not null))
+        // This deliberately REPLACES the former "require a non-empty parsed union" precision (which read an
+        // empty parsed union as plaintext). That precision was a fail-OPEN: an unknown union member is
+        // INDISTINGUISHABLE at the parsed layer from an empty-union corruption (SkipField discards the member,
+        // so both leave a non-null algorithm with both known members null), so reading the "empty" case as
+        // plaintext also read a real unknown-member encrypted file as plaintext (#773). The only way to tell
+        // them apart is to re-read the raw footer bytes — but a hand-rolled re-parse CANNOT be made to agree
+        // with Parquet.Net's tolerant, generated parser on adversarial input: the #773 review found FOUR
+        // independent parser differentials that each turned a raw-probe verdict into a fail-open (a >16 MiB
+        // padded footer; an explicit field id 65544 that truncates to 8 in Parquet.Net's ReadI16; a mistyped
+        // required field; and a type-nibble/multi-field-8 desync where Parquet.Net dispatches field 8 by id
+        // alone and re-enters a nested struct). A security boundary must not depend on out-parsing a tolerant
+        // parser, so we fail closed on ANY parsed encryption_algorithm instead.
+        //
+        // Cost: an anomalous empty-union corruption (no real writer emits it; ~1% of single-bit checkpoint-fuzz
+        // flips) is now diagnosed UnsupportedFeature instead of read. That is the SAFE direction — a corrupt
+        // file is rejected either way; it is never read as (possibly-ciphertext) plaintext. Detection stays
+        // presence-only (#653): no footer field CONTENTS are read or echoed. A healthy unencrypted file has no
+        // EncryptionAlgorithm at all, so this never false-positives on one. Both doors still materialize the
+        // high-level schema BEFORE this check (schema-first ordering), so a genuinely corrupt footer that
+        // parsed a spurious algorithm is still proven corrupt (MALFORMED) first — pinned by
+        // DeltaCheckpointReaderTests.SchemaFirstOrdering_IsSoleControl_ForAtLeastOneCorruptFlip.
+        if (metadata.EncryptionAlgorithm is not null)
         {
             return true;
         }
 
-        // Per-column arm — BARE PRESENCE by design, not an oversight or an un-tightened leftover. Unlike the
-        // union above, ColumnCryptoMetaData has no "empty" shape that corruption is observed to produce, and
-        // keeping it presence-only is what makes it the forward-compat backstop described above: an unknown
-        // future algorithm nulls both union members but still leaves every encrypted column marked here.
-        bool anyColumnChunkInspected = false;
+        // No file-level algorithm: a plaintext-footer file may still mark encryption PER COLUMN
+        // (ColumnCryptoMetaData). Presence-only, like above.
         IReadOnlyList<global::Parquet.Meta.RowGroup>? rowGroups = metadata.RowGroups;
         if (rowGroups is not null)
         {
@@ -192,13 +135,7 @@ internal static class ParquetEncryption
 
                 foreach (global::Parquet.Meta.ColumnChunk? column in columns)
                 {
-                    if (column is null)
-                    {
-                        continue; // Not inspectable: a null chunk can neither carry nor deny the marker.
-                    }
-
-                    anyColumnChunkInspected = true;
-                    if (column.CryptoMetadata is not null)
+                    if (column?.CryptoMetadata is not null)
                     {
                         return true;
                     }
@@ -206,28 +143,7 @@ internal static class ParquetEncryption
             }
         }
 
-        // Third arm: the per-column backstop could not be EVALUATED — the footer has no column chunk to
-        // inspect (no row groups, or row groups with no columns) — so its silence is vacuous rather than a
-        // finding of "not encrypted". Where the backstop cannot speak, fall back to BARE PRESENCE on the
-        // algorithm so the narrowing above fails CLOSED instead of becoming silently permissive: a non-null
-        // algorithm whose known union members are both null (an unknown future algorithm id, which this
-        // Parquet.Net version drops) would otherwise be read as an ordinary plaintext file. Deliberately
-        // scoped to "no chunk was inspectable", NOT to "no chunk was marked": control only reaches here when
-        // nothing was marked, so the latter reduces EXACTLY to `algorithm is not null` — plain bare presence,
-        // undoing the empty-union precision fix. (It would not fire on ordinary unencrypted files, which carry
-        // no algorithm at all; it fires on the corrupt footers that parse into a spurious one.) A corrupt
-        // footer that parses into an empty union keeps its columns, so it is unaffected.
-        //
-        // NAMED RESIDUAL — this arm rests on a guarantee about FOREIGN writers, not on our own behaviour: the
-        // format spec mandates crypto_metadata on every encrypted column, which is why "columns exist and none
-        // is marked" is treated as real evidence of "not encrypted" rather than as absent evidence. A writer
-        // that violates the mandate — encrypted columns carrying no crypto_metadata, under an algorithm id
-        // this version cannot recognize — classifies as PLAINTEXT here. That is a deliberate trade, not an
-        // oversight: closing it requires the bare-presence collapse above. The practical backstop is that such
-        // a file's pages are ciphertext and do not decode as valid Parquet, so the read still fails closed as
-        // CORRUPT rather than returning wrong rows — a downstream consequence, not a guarantee this method
-        // makes. Diagnosis degrades from "unsupported feature" to "corrupt"; correctness does not.
-        return !anyColumnChunkInspected && algorithm is not null;
+        return false;
     }
 
     // Shared message for both plaintext-footer arms (success-path metadata check + failure-path footer probe).
@@ -278,54 +194,9 @@ internal static class ParquetEncryption
     /// </summary>
     private static bool IsPlaintextFooterEncryptedByFooterProbe(Stream input)
     {
-        // Failure-path mapping: positively-confirmed encrypted FileMetaData only (a NON-EMPTY field-8 union in
-        // a plausible FileMetaData). An indeterminate probe (couldn't read/oversized footer) or any other shape
-        // keeps the caller's fail-closed CorruptData default.
-        FooterInspection? probe = ProbeRawFooterEncryptionAlgorithm(input);
-        return probe is { Field8: RawField8.NonEmptyStruct, RequiredFieldsPresent: true };
-    }
-
-    // The raw walk's reading of the FileMetaData.encryption_algorithm (Thrift field 8) struct: absent, present
-    // but an EMPTY struct body (the empty-union corruption shape), or present with a NON-EMPTY body (a real,
-    // possibly unknown, union member — the #773 shape). Distinguishing empty from absent is load-bearing: the
-    // success path reads a file as plaintext ONLY for a positively-EMPTY field-8, and fails closed on ABSENT
-    // (a disagreement with Parquet.Net's tolerant parse).
-    private enum RawField8
-    {
-        Absent,
-        EmptyStruct,
-        NonEmptyStruct,
-    }
-
-    private readonly struct FooterInspection
-    {
-        public FooterInspection(RawField8 field8, bool requiredFieldsPresent)
-        {
-            Field8 = field8;
-            RequiredFieldsPresent = requiredFieldsPresent;
-        }
-
-        // The last field-8 the walk resolved (Parquet.Net's parse is last-field-wins, so the walk matches it).
-        public RawField8 Field8 { get; }
-
-        // Whether the footer carries the FileMetaData required fields (1=version i32, 2=schema list,
-        // 3=num_rows i64, 4=row_groups list) with their expected Thrift types.
-        public bool RequiredFieldsPresent { get; }
-    }
-
-    /// <summary>Reads and inspects the raw plaintext footer, returning a <see cref="FooterInspection"/>
-    /// (field-8 kind + required-fields presence) when the footer could be read within its bounds, or
-    /// <see langword="null"/> when it could NOT — non-seekable input, a footer_length that is non-positive,
-    /// exceeds the file, or exceeds <see cref="MaxProbedFooterBytes"/>, a short read, or an I/O fault. Callers
-    /// map the outcome to their own fail-closed default (the failure path treats anything but a confirmed
-    /// NON-EMPTY field-8 as CorruptData; the success path treats anything but a confirmed EMPTY field-8 as
-    /// UnsupportedFeature, so a footer padded past the cap or a parser disagreement cannot be read as
-    /// plaintext — #773 red-team/security). Never throws; restores the input position.</summary>
-    private static FooterInspection? ProbeRawFooterEncryptionAlgorithm(Stream input)
-    {
         if (input is null || !input.CanSeek)
         {
-            return null;
+            return false;
         }
 
         try
@@ -334,7 +205,7 @@ internal static class ParquetEncryption
             // Minimum plausible file: a (>=1 byte) footer + the 4-byte footer length + 4-byte trailing magic.
             if (length < ParquetMagicLength + 8)
             {
-                return null;
+                return false;
             }
 
             long savedPosition = input.Position;
@@ -347,26 +218,23 @@ internal static class ParquetEncryption
                 input.Position = length - 8;
                 if (input.ReadAtLeast(tail, 8, throwOnEndOfStream: false) != 8)
                 {
-                    return null;
+                    return false;
                 }
 
                 int footerLength = BinaryPrimitives.ReadInt32LittleEndian(tail);
                 if (footerLength <= 0 || footerLength > length - 8 || footerLength > MaxProbedFooterBytes)
                 {
-                    // Indeterminate: an oversized (attacker-padded) or invalid footer_length means the probe
-                    // cannot inspect field-8. The success-path caller fails closed on this (null), so padding
-                    // the footer past MaxProbedFooterBytes cannot bypass unknown-member detection.
-                    return null;
+                    return false;
                 }
 
                 byte[] footer = new byte[footerLength];
                 input.Position = length - 8 - footerLength;
                 if (input.ReadAtLeast(footer, footerLength, throwOnEndOfStream: false) != footerLength)
                 {
-                    return null;
+                    return false;
                 }
 
-                return InspectFooterMetadata(footer);
+                return ThriftFooterHasEncryptionAlgorithm(footer);
             }
             finally
             {
@@ -376,9 +244,8 @@ internal static class ParquetEncryption
         }
         catch (Exception ex) when (ex is IOException or ObjectDisposedException or NotSupportedException)
         {
-            // A probe I/O fault leaves the answer indeterminate; each caller maps null to its own fail-closed
-            // default (CorruptData on the failure path, UnsupportedFeature on the success path).
-            return null;
+            // A probe I/O fault on an already-failing input must never REPLACE the fail-closed classification.
+            return false;
         }
     }
 
@@ -395,58 +262,43 @@ internal static class ParquetEncryption
     // three. Fail-closed: returns false on truncation, an unparseable value, or a footer that is not a
     // plausible encrypted FileMetaData. Bounded: every non-boolean field/element consumes >= 1 byte (total
     // work is O(footer length)) and recursion is depth-capped.
-    // Walks the ENTIRE top-level FileMetaData struct (Thrift Compact Protocol), skipping every field's value,
-    // and returns a FooterInspection: which of {absent, empty struct, non-empty struct} the encryption_algorithm
-    // (field 8) resolves to, and whether the FileMetaData required fields (1=version i32, 2=schema list,
-    // 3=num_rows i64, 4=row_groups list per parquet.thrift) are present with their expected Thrift types.
-    //
-    // Field ids are resolved EXACTLY as Parquet.Net's ThriftCompactProtocolReader does — a delta id is
-    // (short)(lastFieldId + modifier) and an explicit id is (short)ZigzagToInt(varint32), with lastFieldId
-    // tracked as a short — so the walk identifies field 8 wherever Parquet.Net's tolerant parser does, closing
-    // the field-id-truncation differential (e.g. an explicit id 65544 truncates to 8 in BOTH; #773 red-team).
-    // field 8 is LAST-WINS, matching Parquet.Net overwriting metadata.EncryptionAlgorithm on a repeated field.
-    //
-    // A malformed/truncated footer (ran out before a clean top-level STOP, an unparseable value, or a bad field
-    // id) yields FooterInspection(Absent, false) — the safe sentinel both callers reject (CorruptData on the
-    // failure path, UnsupportedFeature on the success path). Bounded: every non-boolean field/element consumes
-    // >= 1 byte (O(footer length)) and recursion is depth-capped.
-    private static FooterInspection InspectFooterMetadata(ReadOnlySpan<byte> footer)
+    private static bool ThriftFooterHasEncryptionAlgorithm(ReadOnlySpan<byte> footer)
     {
         // Bits 1..4 = the FileMetaData required fields (version/schema/num_rows/row_groups).
         const int requiredFieldsMask = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4);
         int seenRequiredFields = 0;
-        RawField8 field8 = RawField8.Absent;
+        bool encryptionAlgorithmPresent = false;
         int pos = 0;
-        short lastFieldId = 0;
+        int lastFieldId = 0;
         while (true)
         {
             if (pos >= footer.Length)
             {
-                return new FooterInspection(RawField8.Absent, false); // no clean STOP => malformed.
+                return false; // Ran out before a clean STOP => malformed => not confidently encrypted.
             }
 
             byte header = footer[pos++];
             if (header == 0)
             {
-                // Clean top-level STOP: report field-8 kind, and whether this is a plausible FileMetaData.
-                bool requiredFieldsPresent = (seenRequiredFields & requiredFieldsMask) == requiredFieldsMask;
-                return new FooterInspection(field8, requiredFieldsPresent);
+                // Clean STOP: trust the encryption signal only on a plausible encrypted FileMetaData.
+                return encryptionAlgorithmPresent
+                    && (seenRequiredFields & requiredFieldsMask) == requiredFieldsMask;
             }
 
             int type = header & 0x0F;
-            int modifier = (header >> 4) & 0x0F;
-            short fieldId;
-            if (modifier != 0)
+            int delta = (header >> 4) & 0x0F;
+            int fieldId;
+            if (delta != 0)
             {
-                fieldId = (short)(lastFieldId + modifier);
+                fieldId = lastFieldId + delta;
             }
-            else if (TryReadCompactFieldId(footer, ref pos, out fieldId))
+            else if (TryReadZigZag(footer, ref pos, out long explicitId) && explicitId > 0 && explicitId <= int.MaxValue)
             {
-                // explicit zigzag i16 field id (already short-truncated to match Parquet.Net's ReadI16).
+                fieldId = (int)explicitId;
             }
             else
             {
-                return new FooterInspection(RawField8.Absent, false);
+                return false;
             }
 
             lastFieldId = fieldId;
@@ -469,16 +321,15 @@ internal static class ParquetEncryption
                     seenRequiredFields |= 1 << fieldId;
                 }
             }
-            else if (fieldId == EncryptionAlgorithmFieldId && type == ThriftStruct)
+            else if (fieldId == EncryptionAlgorithmFieldId
+                && type == ThriftStruct
+                && pos < footer.Length
+                && footer[pos] != 0)
             {
-                // Field 8 is a struct. Its body's first byte distinguishes an EMPTY union (immediate STOP =>
-                // the corruption shape) from a NON-EMPTY one (a member header => a real, possibly unknown,
-                // union member). Last-wins, mirroring Parquet.Net. A field-8 struct with no body byte at all
-                // is malformed and will fail the skip below. Fall through to skip (and fully validate) the body.
-                if (pos < footer.Length)
-                {
-                    field8 = footer[pos] != 0 ? RawField8.NonEmptyStruct : RawField8.EmptyStruct;
-                }
+                // Field 8 is a struct whose body does not start with an immediate STOP => a NON-EMPTY
+                // EncryptionAlgorithm union (a valid one has exactly one member). An empty field-8 struct is
+                // rejected. Fall through to skip (and thereby fully validate) the struct body.
+                encryptionAlgorithmPresent = true;
             }
 
             // A boolean field carries its value in the header (no data bytes); every other type has a value to
@@ -490,7 +341,7 @@ internal static class ParquetEncryption
 
             if (!SkipThriftValue(footer, ref pos, type, depth: 1))
             {
-                return new FooterInspection(RawField8.Absent, false);
+                return false;
             }
         }
     }
@@ -668,36 +519,16 @@ internal static class ParquetEncryption
 
     private static bool TrySkipVarint(ReadOnlySpan<byte> data, ref int pos) => TryReadVarint(data, ref pos, out _);
 
-    // Reads a Thrift-compact EXPLICIT field id, resolved EXACTLY as Parquet.Net's ThriftCompactProtocolReader
-    // does: (short)ZigzagToInt(ReadVarInt32()). It reads a 32-bit varint (uint accumulation, C# shift wraps
-    // at &31 exactly like ReadVarInt32), zigzag-decodes to an int, then TRUNCATES to short. Matching the
-    // truncation is load-bearing: an attacker-crafted explicit id such as 65544 (0x10008) truncates to 8 in
-    // BOTH parsers, so the walk sees the same field-8 Parquet.Net does (#773 red-team field-id differential).
-    // Fail-closed on truncation/overrun of the varint within the footer span.
-    private static bool TryReadCompactFieldId(ReadOnlySpan<byte> data, ref int pos, out short fieldId)
+    // Reads a zigzag-encoded varint (Thrift's signed int encoding), used only for an explicit field id.
+    private static bool TryReadZigZag(ReadOnlySpan<byte> data, ref int pos, out long value)
     {
-        uint result = 0;
-        int shift = 0;
-        while (true)
+        if (!TryReadVarint(data, ref pos, out long raw))
         {
-            if (pos >= data.Length)
-            {
-                fieldId = 0;
-                return false;
-            }
-
-            byte b = data[pos++];
-            result |= (uint)(b & 0x7F) << shift;
-            if ((b & 0x80) == 0)
-            {
-                break;
-            }
-
-            shift += 7;
+            value = 0;
+            return false;
         }
 
-        int zigzag = (int)(result >> 1) ^ -(int)(result & 1);
-        fieldId = (short)zigzag;
+        value = (long)((ulong)raw >> 1) ^ -(raw & 1L);
         return true;
     }
 
