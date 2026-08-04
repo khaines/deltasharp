@@ -65,22 +65,24 @@ internal static class ParquetEncryption
     }
 
     // Detects a plaintext-footer Parquet Modular Encryption file (#655) from the PARSED footer metadata.
-    // Three markers, any of which is sufficient (Parquet format Encryption.md):
+    // TWO markers, either of which is sufficient (Parquet format Encryption.md), both by BARE PRESENCE (#773):
     //   * FileMetaData.EncryptionAlgorithm (Thrift field 8) — "set only in encrypted files with plaintext
-    //     footer" per the format spec, carrying a NON-EMPTY union (see below);
-    //   * any ColumnChunk.CryptoMetadata (ColumnCryptoMetaData) — a plaintext-footer file may encrypt only a
-    //     SUBSET of columns, carrying per-column crypto metadata even when the file-level algorithm is unset;
-    //     and
-    //   * a non-null EncryptionAlgorithm of any shape when the footer has NO column chunk to inspect, where
-    //     the per-column marker is vacuous and the narrowed union rule must fail closed (#698 gate).
+    //     footer" per the format spec — in ANY parsed shape (a known member, an unknown member Parquet.Net
+    //     dropped via SkipField leaving both known members null, or an empty union a corrupt footer parsed
+    //     into); and
+    //   * any ColumnChunk.CryptoMetadata (ColumnCryptoMetaData), checked only when the file-level algorithm is
+    //     unset — a plaintext-footer file may encrypt only a SUBSET of columns.
+    // Bare presence on the file-level algorithm (rather than the former "require a non-empty union" precision)
+    // is deliberate: an unknown union member is INDISTINGUISHABLE at the parsed layer from an empty-union
+    // corruption, and the #773 review found FOUR parser differentials proving a raw-footer re-parse cannot
+    // securely tell them apart, so this fails closed on any parsed algorithm (see the classifier body).
     // Detection is presence-only: no field CONTENTS are read, so no attacker-controlled footer value can be
     // echoed (#653 hygiene). A healthy unencrypted file has no marker, so this never false-positives on one.
     // A CORRUPT footer, however, can still PARSE into a spurious marker (~1% of single-bit flips in the
     // checkpoint fuzz corpus) — which is why both doors materialize the high-level schema BEFORE consulting
-    // this check, so a genuinely corrupt file is proven corrupt first. That ordering is REQUIRED, not
-    // belt-and-braces: this classifier does NOT cover the observed corpus on its own, because every one of
-    // those flips lands on the third arm above (empty union + zero inspectable column chunks), which by
-    // design reads as bare presence. The schema probe is the sole control for them, and it is pinned by
+    // this check, so a genuinely corrupt file is proven corrupt (MALFORMED) first. That ordering is REQUIRED,
+    // not belt-and-braces: those flips parse a spurious (empty) algorithm that bare presence would call
+    // "encrypted", so the schema probe is the sole control that keeps them MALFORMED, pinned by
     // DeltaCheckpointReaderTests.SchemaFirstOrdering_IsSoleControl_ForAtLeastOneCorruptFlip.
     internal static bool IsPlaintextFooterEncrypted(global::Parquet.Meta.FileMetaData? metadata)
     {
@@ -89,38 +91,39 @@ internal static class ParquetEncryption
             return false;
         }
 
-        // Require a NON-EMPTY union, the parsed analogue of the rule the FAILURE-path footer walk already
-        // applies: per parquet.thrift, EncryptionAlgorithm is a union of exactly AES_GCM_V1 and
-        // AES_GCM_CTR_V1, and a valid encrypted file always sets exactly one member — so requiring one carries
-        // no false-negative risk for a real encrypted file, while rejecting the EMPTY union that a corrupt
-        // footer can parse into (every observed fuzz false-positive was exactly this shape). Applying the same
-        // precision rule on both arms removes an EMPTY-union false positive here without relying on the
-        // unrelated property of schema materializability. It does NOT make the schema probe redundant: those
-        // same fuzz shapes also carry zero inspectable column chunks, so they fall through to the third arm
-        // below and are read as bare presence anyway — see the ordering note at the top of this method.
+        // BARE PRESENCE on the parsed encryption_algorithm (#773). If Parquet.Net parsed a non-null
+        // EncryptionAlgorithm — ANY shape: a known member (AES_GCM_V1/AES_GCM_CTR_V1), an UNKNOWN member it
+        // dropped via SkipField (leaving both known members null), or an empty union a corrupt footer parsed
+        // into — this success-path classifier FAILS CLOSED (UnsupportedFeature).
         //
-        // Forward-compat note: if a future format revision adds a third union member that this Parquet.Net
-        // version cannot deserialize, both properties stay null here. The backstop is then the PER-COLUMN
-        // CryptoMetadata arm below — NOT the raw-bytes failure-path probe, which only runs when CreateAsync
-        // THROWS, and such a file opens cleanly (verified: patching the union's member field id to an unknown
-        // value leaves Parquet.Net opening the file with a non-null algorithm and both members null). That is
-        // why the per-column arm is deliberately left BARE-PRESENCE rather than being tightened to match this
-        // one: the asymmetry between the two arms is the mechanism that keeps an unknown future algorithm
-        // classified. The spec mandates crypto_metadata on every encrypted column, so a real file with any
-        // columns always carries it — an assumption about FOREIGN writers, whose residual is named at the
-        // third arm below. That clause is also VACUOUS for a file with no column chunks at all, so
-        // the third arm below restores fail-closed behaviour in exactly that case.
-        global::Parquet.Meta.EncryptionAlgorithm? algorithm = metadata.EncryptionAlgorithm;
-        if (algorithm is not null && (algorithm.AESGCMV1 is not null || algorithm.AESGCMCTRV1 is not null))
+        // This deliberately REPLACES the former "require a non-empty parsed union" precision (which read an
+        // empty parsed union as plaintext). That precision was a fail-OPEN: an unknown union member is
+        // INDISTINGUISHABLE at the parsed layer from an empty-union corruption (SkipField discards the member,
+        // so both leave a non-null algorithm with both known members null), so reading the "empty" case as
+        // plaintext also read a real unknown-member encrypted file as plaintext (#773). The only way to tell
+        // them apart is to re-read the raw footer bytes — but a hand-rolled re-parse CANNOT be made to agree
+        // with Parquet.Net's tolerant, generated parser on adversarial input: the #773 review found FOUR
+        // independent parser differentials that each turned a raw-probe verdict into a fail-open (a >16 MiB
+        // padded footer; an explicit field id 65544 that truncates to 8 in Parquet.Net's ReadI16; a mistyped
+        // required field; and a type-nibble/multi-field-8 desync where Parquet.Net dispatches field 8 by id
+        // alone and re-enters a nested struct). A security boundary must not depend on out-parsing a tolerant
+        // parser, so we fail closed on ANY parsed encryption_algorithm instead.
+        //
+        // Cost: an anomalous empty-union corruption (no real writer emits it; ~1% of single-bit checkpoint-fuzz
+        // flips) is now diagnosed UnsupportedFeature instead of read. That is the SAFE direction — a corrupt
+        // file is rejected either way; it is never read as (possibly-ciphertext) plaintext. Detection stays
+        // presence-only (#653): no footer field CONTENTS are read or echoed. A healthy unencrypted file has no
+        // EncryptionAlgorithm at all, so this never false-positives on one. Both doors still materialize the
+        // high-level schema BEFORE this check (schema-first ordering), so a genuinely corrupt footer that
+        // parsed a spurious algorithm is still proven corrupt (MALFORMED) first — pinned by
+        // DeltaCheckpointReaderTests.SchemaFirstOrdering_IsSoleControl_ForAtLeastOneCorruptFlip.
+        if (metadata.EncryptionAlgorithm is not null)
         {
             return true;
         }
 
-        // Per-column arm — BARE PRESENCE by design, not an oversight or an un-tightened leftover. Unlike the
-        // union above, ColumnCryptoMetaData has no "empty" shape that corruption is observed to produce, and
-        // keeping it presence-only is what makes it the forward-compat backstop described above: an unknown
-        // future algorithm nulls both union members but still leaves every encrypted column marked here.
-        bool anyColumnChunkInspected = false;
+        // No file-level algorithm: a plaintext-footer file may still mark encryption PER COLUMN
+        // (ColumnCryptoMetaData). Presence-only, like above.
         IReadOnlyList<global::Parquet.Meta.RowGroup>? rowGroups = metadata.RowGroups;
         if (rowGroups is not null)
         {
@@ -134,13 +137,7 @@ internal static class ParquetEncryption
 
                 foreach (global::Parquet.Meta.ColumnChunk? column in columns)
                 {
-                    if (column is null)
-                    {
-                        continue; // Not inspectable: a null chunk can neither carry nor deny the marker.
-                    }
-
-                    anyColumnChunkInspected = true;
-                    if (column.CryptoMetadata is not null)
+                    if (column?.CryptoMetadata is not null)
                     {
                         return true;
                     }
@@ -148,28 +145,7 @@ internal static class ParquetEncryption
             }
         }
 
-        // Third arm: the per-column backstop could not be EVALUATED — the footer has no column chunk to
-        // inspect (no row groups, or row groups with no columns) — so its silence is vacuous rather than a
-        // finding of "not encrypted". Where the backstop cannot speak, fall back to BARE PRESENCE on the
-        // algorithm so the narrowing above fails CLOSED instead of becoming silently permissive: a non-null
-        // algorithm whose known union members are both null (an unknown future algorithm id, which this
-        // Parquet.Net version drops) would otherwise be read as an ordinary plaintext file. Deliberately
-        // scoped to "no chunk was inspectable", NOT to "no chunk was marked": control only reaches here when
-        // nothing was marked, so the latter reduces EXACTLY to `algorithm is not null` — plain bare presence,
-        // undoing the empty-union precision fix. (It would not fire on ordinary unencrypted files, which carry
-        // no algorithm at all; it fires on the corrupt footers that parse into a spurious one.) A corrupt
-        // footer that parses into an empty union keeps its columns, so it is unaffected.
-        //
-        // NAMED RESIDUAL — this arm rests on a guarantee about FOREIGN writers, not on our own behaviour: the
-        // format spec mandates crypto_metadata on every encrypted column, which is why "columns exist and none
-        // is marked" is treated as real evidence of "not encrypted" rather than as absent evidence. A writer
-        // that violates the mandate — encrypted columns carrying no crypto_metadata, under an algorithm id
-        // this version cannot recognize — classifies as PLAINTEXT here. That is a deliberate trade, not an
-        // oversight: closing it requires the bare-presence collapse above. The practical backstop is that such
-        // a file's pages are ciphertext and do not decode as valid Parquet, so the read still fails closed as
-        // CORRUPT rather than returning wrong rows — a downstream consequence, not a guarantee this method
-        // makes. Diagnosis degrades from "unsupported feature" to "corrupt"; correctness does not.
-        return !anyColumnChunkInspected && algorithm is not null;
+        return false;
     }
 
     // Shared message for both plaintext-footer arms (success-path metadata check + failure-path footer probe).

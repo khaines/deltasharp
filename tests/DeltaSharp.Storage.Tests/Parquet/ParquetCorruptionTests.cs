@@ -593,10 +593,11 @@ public sealed class ParquetCorruptionTests
     [Fact]
     public async Task EncryptionAlgorithmWithNoRowGroups_FailsClosed_AsUnsupportedFeature()
     {
-        // #698 gate finding — the same zero-column-chunk gap on the DATA-FILE door, which shares the
-        // classifier. Non-null encryption_algorithm with both known union members null (an unknown future
-        // algorithm id) and no row groups, so the per-column backstop is vacuous. Must fail closed rather
-        // than read as an ordinary empty plaintext file.
+        // #773 (was #698 gate finding) — the same no-row-group shape on the DATA-FILE door, which shares the
+        // classifier. Non-null encryption_algorithm with both known union members null (an unknown algorithm
+        // id) and no row groups; bare-presence arm-1 fails closed on any parsed algorithm. Must be
+        // UnsupportedFeature, not an ordinary empty plaintext read. RED-on-revert: narrowing arm-1 to a
+        // non-empty union reopens it.
         var schema = new StructType(new[] { KeepField });
         ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3 });
         byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
@@ -629,21 +630,174 @@ public sealed class ParquetCorruptionTests
     }
 
     [Fact]
-    public async Task EmptyEncryptionAlgorithmUnion_IsNotClassifiedEncrypted()
+    public async Task EmptyEncryptionAlgorithmUnion_FailsClosed_AsUnsupportedFeature()
     {
-        // #698 review FIX 4 — the same precision guard on the DATA-FILE door, which shares the classifier.
-        // encryption_algorithm is present but its union is EMPTY: not a shape any real encryptor writes (per
-        // parquet.thrift exactly one member is always set), only a shape corruption parses into. The rest of
-        // the footer is untouched, so the file opens and its schema materializes — the read must succeed and
-        // return the original rows rather than being mislabelled UnsupportedFeature.
+        // #773 (supersedes #698 review FIX 4). encryption_algorithm is present but its parsed union is EMPTY.
+        // This shape is AMBIGUOUS: it is what a corrupt footer parses into AND what Parquet.Net produces for an
+        // UNKNOWN union member it dropped via SkipField (both leave a non-null algorithm with both known
+        // members null). The parsed layer cannot tell them apart, and a raw re-parse cannot be made to agree
+        // with Parquet.Net's tolerant parser on adversarial input (four differentials were found — see
+        // ParquetEncryption.IsPlaintextFooterEncrypted). So the success-path classifier now BARE-PRESENCE fails
+        // closed on ANY parsed encryption_algorithm: an empty union is diagnosed UnsupportedFeature rather than
+        // read. Safe direction — the file is anomalous/corrupt and is rejected, never read as (possibly
+        // ciphertext) plaintext. RED-on-revert: narrowing arm-1 back to "non-empty union" reopens the #773
+        // fail-open and this Assert.ThrowsAsync fails (rows returned).
         var schema = new StructType(new[] { KeepField });
         ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3, 4, 5 });
         byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
         byte[] forged = await ParquetTestHelpers.EmptyEncryptionAlgorithmUnionFileAsync(file);
 
-        IReadOnlyList<ColumnBatch> read = await ParquetTestHelpers.ReadAllAsync(forged, schema);
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(forged, schema));
 
-        Assert.Equal(5, read.Sum(b => b.RowCount));
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task UnknownEncryptionAlgorithmUnionMember_ThroughReadAsync_IsUnsupportedFeature()
+    {
+        // #773 — the foreign-writer residual, closed on the DATA-FILE door. A file whose EncryptionAlgorithm
+        // union carries an UNKNOWN member id (3) — reachable TODAY by any spec-violating writer, not gated on a
+        // third member shipping — is deserialized by Parquet.Net with BOTH known members null (it SkipFields
+        // the unrecognized id), so the file opens cleanly with a NON-NULL parsed EncryptionAlgorithm. The
+        // bare-presence success-path classifier fails closed on ANY parsed algorithm, so this is
+        // UnsupportedFeature — never a plaintext read of its (ciphertext) columns. RED-on-revert: narrowing
+        // arm-1 back to "non-empty union" lets ReadAsync open the file and return rows (the #773 fail-open).
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3, 4, 5 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] forged = await ParquetTestHelpers.UnknownEncryptionAlgorithmUnionMemberFileAsync(file);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(forged, schema));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("malformed", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task UnknownEncryptionAlgorithmUnionMember_ThroughReadDataSchemaAsync_IsUnsupportedFeature()
+    {
+        // The footer-only schema door funnels through the same OpenAsync classifier, so the #773 residual is
+        // closed there too — UnsupportedFeature, not a schema returned for an encrypted file.
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 6, 7, 8 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] forged = await ParquetTestHelpers.UnknownEncryptionAlgorithmUnionMemberFileAsync(file);
+        using var stream = new MemoryStream(forged, writable: false);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new ParquetFileReader().ReadDataSchemaAsync(stream, CancellationToken.None));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("malformed", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task UnknownEncryptionAlgorithmUnionMember_OversizedFooter_FailsClosed_NotReadAsPlaintext()
+    {
+        // #773 red-team MISS (historical): an earlier raw-footer-probe fix capped the footer it would read at
+        // 16 MiB, so a footer padded past the cap (here a ~17 MiB key_value_metadata entry) behind an UNKNOWN
+        // member bypassed the probe and read the ciphertext file as plaintext. The final bare-presence design
+        // does not re-read the footer at all: Parquet.Net still opens this file with a NON-NULL parsed
+        // EncryptionAlgorithm, so it fails closed regardless of footer size. Kept as a regression that this
+        // padded shape cannot be read. RED-on-revert: narrowing arm-1 to "non-empty union" reopens it.
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] padded = await ParquetTestHelpers.PadFooterMetadataAsync(file, padBytes: 17 * 1024 * 1024);
+        byte[] forged = await ParquetTestHelpers.UnknownEncryptionAlgorithmUnionMemberFileAsync(padded);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(forged, schema));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("malformed", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task UnknownEncryptionAlgorithmUnionMember_ExplicitFieldId65544_FailsClosed()
+    {
+        // #773 R3 red-team MISS (historical): a field-8 header written with an EXPLICIT Thrift-compact field id
+        // of 65544 (0x10008). Parquet.Net's ReadI16 truncates it to (short)8, so it parses the field AS
+        // encryption_algorithm (non-null parsed algorithm, both known members null). An earlier raw walk read
+        // the id full-width (65544 != 8), missed field-8, and read the file as plaintext. The final
+        // bare-presence design fails closed on ANY parsed algorithm, so this is UnsupportedFeature — no
+        // field-id re-parse involved. RED-on-revert: narrowing arm-1 to "non-empty union" reopens it.
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] forged = await ParquetTestHelpers.UnknownEncryptionAlgorithmUnionMember_ExplicitFieldId65544_FileAsync(file);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(forged, schema));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("malformed", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task UnknownEncryptionAlgorithmUnionMember_MistypedRequiredField_FailsClosed()
+    {
+        // #773 R3 security MISS (historical): an unknown-member file with num_rows (required field 3) mistyped
+        // from i64 to i32 (a single-nibble footer edit). Parquet.Net tolerantly opens it (row counts come from
+        // row-group metadata), so the parsed layer still confirms a NON-NULL algorithm; an earlier raw walk's
+        // FileMetaData-required-fields gate then failed and read the encrypted file as plaintext. The final
+        // bare-presence design fails closed on ANY parsed algorithm regardless of a mistyped required field.
+        // Must be UnsupportedFeature. RED-on-revert: narrowing arm-1 to "non-empty union" reopens it.
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] forged = await ParquetTestHelpers.UnknownEncryptionAlgorithmUnionMember_MistypedNumRows_FileAsync(file, rowCount: 3);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(forged, schema));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("malformed", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task UnknownEncryptionAlgorithmUnionMember_TypeConfusedMultiField8_FailsClosed()
+    {
+        // #773 R4 red-team/security MISS (historical): TWO field-8 headers — an empty struct, then a
+        // BOOLEAN-typed field-8 carrying an unknown member. Parquet.Net dispatches field 8 by id alone
+        // (ignoring the type nibble), re-enters EncryptionAlgorithm.Read as a struct, and parses the member —
+        // opening the file with a NON-NULL algorithm. An earlier raw walk gated field-8 on type==struct,
+        // skipped the boolean-typed second field-8, and locked in the first (empty) struct → read as plaintext.
+        // The final bare-presence design fails closed on ANY parsed algorithm, no raw walk involved.
+        var schema = new StructType(new[] { KeepField });
+        ColumnBatch batch = BuildLongBatch(schema, new long[] { 1, 2, 3 });
+        byte[] file = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        byte[] forged = await ParquetTestHelpers.UnknownEncryptionAlgorithmUnionMember_TypeConfusedMultiField8_FileAsync(file);
+
+        // Precondition: Parquet.Net must actually OPEN this fixture with a non-null EncryptionAlgorithm (both
+        // known members null) — the exact residual shape. If the fixture stops doing so, fail loudly here
+        // rather than passing vacuously.
+        using (var pre = new MemoryStream(forged, writable: false))
+        {
+            global::Parquet.ParquetReader reader = await global::Parquet.ParquetReader.CreateAsync(pre, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                global::Parquet.Meta.EncryptionAlgorithm? alg = reader.Metadata!.EncryptionAlgorithm;
+                Assert.NotNull(alg);
+                Assert.Null(alg!.AESGCMV1);
+                Assert.Null(alg.AESGCMCTRV1);
+            }
+        }
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(forged, schema));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("malformed", error.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
