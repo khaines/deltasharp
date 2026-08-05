@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
+using DeltaSharp.Diagnostics;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Diagnostics;
 using DeltaSharp.Types;
@@ -46,6 +47,14 @@ internal sealed class DeltaLog
     private readonly ILogger<DeltaLog> _logger;
     private readonly DeltaStorageTelemetry _telemetry;
 
+    /// <summary>The shared <c>deltasharp.component</c>/<c>deltasharp.operation</c>/<c>deltasharp.backend</c>
+    /// correlation scope attached to the checkpoint-fallback log line (design §7.2.1; #772), so an operator
+    /// can route/localize the event by the same bounded dimensions the sibling storage components emit
+    /// (<see cref="DeltaCommitter"/> et al.). Built once per reader (backend identity is instance-scoped) so
+    /// <see cref="ILogger.BeginScope"/> allocates no new state array per discard. All three values are bounded
+    /// (component/operation are constants; backend is the closed <see cref="StorageBackendKind"/> set).</summary>
+    private readonly KeyValuePair<string, object?>[] _checkpointLogScope;
+
     /// <summary>Creates a reader over <paramref name="backend"/>, which must be rooted at the Delta table
     /// directory (so <c>_delta_log/…</c> is reachable).</summary>
     public DeltaLog(IStorageBackend backend)
@@ -71,6 +80,12 @@ internal sealed class DeltaLog
         _maxLogObjectBytes = maxLogObjectBytes;
         _logger = logger ?? NullLogger<DeltaLog>.Instance;
         _telemetry = telemetry ?? DeltaStorageTelemetry.Shared;
+        _checkpointLogScope = new KeyValuePair<string, object?>[]
+        {
+            new(DeltaSharpTelemetry.ComponentKey, DeltaStorageTelemetry.DeltaComponent),
+            new(DeltaSharpTelemetry.OperationKey, DeltaStorageTelemetry.ReconstructOperation),
+            new(DeltaStorageTelemetry.BackendKey, backend.Kind.ToLabel()),
+        };
     }
 
     /// <summary>
@@ -824,13 +839,20 @@ internal sealed class DeltaLog
     }
 
     /// <summary>Emits the structured checkpoint-fallback signal (#772): a bounded-reason metric increment on
-    /// the <c>DeltaSharp.Delta</c> meter plus a Warning log carrying the discarded checkpoint version, so an
-    /// otherwise-silent discard (an encrypted #681/#698 or malformed checkpoint that falls back to JSON
-    /// replay) is recoverable from telemetry without a code-level repro. A safe no-op until a host wires a
-    /// meter/logging provider.</summary>
+    /// the <c>DeltaSharp.Delta</c> meter plus a Warning log carrying the discarded checkpoint version, scoped
+    /// with the shared component/operation/backend correlation dimensions. So an otherwise-silent discard (an
+    /// encrypted #681/#698 or malformed checkpoint that falls back to JSON replay) is recoverable from
+    /// telemetry without a code-level repro. A safe no-op until a host wires a meter/logging provider.
+    /// <para>Fires once per <b>selected checkpoint discarded while seeding</b> — i.e. per candidate the loop
+    /// in <see cref="ReconstructAsync"/> tries and discards. A persistently unreadable checkpoint (e.g. an
+    /// encrypted one, which does not self-heal) therefore re-emits on every snapshot load; the counter is the
+    /// rate instrument to alert on, and the per-load Warning is the human detail. Selection-time skips
+    /// (incomplete multi-part groups, V2/UUID checkpoints, a failed <c>_last_checkpoint</c> hint) are NOT a
+    /// seed-time discard and are intentionally not signalled here.</para></summary>
     private void RecordCheckpointFallback(CheckpointFallbackReason reason, long version)
     {
         _telemetry.RecordCheckpointFallback(reason);
+        using IDisposable? scope = _logger.BeginScope(_checkpointLogScope);
         DeltaCheckpointLog.CheckpointFallback(_logger, version, DeltaStorageTelemetry.ToLabel(reason));
     }
 

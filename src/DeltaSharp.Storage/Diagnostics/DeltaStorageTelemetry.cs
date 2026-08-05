@@ -243,6 +243,11 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     /// <summary>The bounded <c>deltasharp.operation=commit</c> value for the commit path.</summary>
     internal const string CommitOperation = "commit";
 
+    /// <summary>The bounded <c>deltasharp.operation=reconstruct</c> value for the snapshot-reconstruction
+    /// path (checkpoint seeding + JSON replay). Used as the <c>ILogger.BeginScope</c> correlation dimension
+    /// on the checkpoint-fallback log line (#772).</summary>
+    internal const string ReconstructOperation = "reconstruct";
+
     /// <summary>The bounded <c>deltasharp.component=delta</c> value for the Delta log subsystem.</summary>
     internal const string DeltaComponent = "delta";
 
@@ -366,8 +371,8 @@ internal sealed class DeltaStorageTelemetry : IDisposable
             "deltasharp.delta.delete.rows", unit: "{row}",
             description: "Rows logically deleted by DELETE via deletion vectors, by outcome.");
         _checkpointFallback = _deltaMeter.CreateCounter<long>(
-            "deltasharp.delta.checkpoint.fallback", unit: "{fallback}",
-            description: "Classic checkpoints discarded during reconstruction (state not seeded; falls back to an older checkpoint or full JSON replay), by reason.");
+            "deltasharp.delta.checkpoint.fallbacks", unit: "{fallback}",
+            description: "Selected classic checkpoints discarded while SEEDING a snapshot (a post-selection decode failure — unsupported feature or malformed; state not seeded, reconstruction falls back to an older checkpoint or full JSON replay), by reason. Selection-time skips (incomplete multi-part groups, V2/UUID checkpoints, a failed _last_checkpoint hint) are not counted.");
     }
 
     /// <summary>The <c>DeltaSharp.Delta</c> meter (commit instruments). Exposed for reference-identity

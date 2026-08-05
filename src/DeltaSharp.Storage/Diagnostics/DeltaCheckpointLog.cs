@@ -13,9 +13,24 @@ namespace DeltaSharp.Storage.Diagnostics;
 /// Messages name only low-cardinality, non-sensitive values — the discarded checkpoint <b>version</b> (an
 /// integer, safe) and the bounded <b>reason</b> (<c>unsupported_feature</c>/<c>malformed</c>). A raw storage
 /// path, the checkpoint's contents, or any table/credential value is never rendered (§7.2.2
-/// redaction-by-omission). A discarded checkpoint is logged at <c>Warning</c>: the read still succeeds via
-/// JSON replay (or an older checkpoint), but an unreadable checkpoint — e.g. an encrypted one (#681/#698) —
-/// is an actionable operator signal that is otherwise invisible until the log ages out (#772).
+/// redaction-by-omission), and the site takes no <see cref="System.Exception"/> object, so a swallowed
+/// (attacker-influenced) exception message can never leak. The shared
+/// <c>deltasharp.component</c>/<c>deltasharp.operation</c>/<c>deltasharp.backend</c> correlation dimensions
+/// ride the <see cref="ILogger.BeginScope"/> the caller opens (design §7.2.1), so the line is routable by
+/// the same bounded keys the sibling storage components emit.
+/// <para>A discarded checkpoint is logged at <c>Warning</c>: the read still succeeds via JSON replay (or an
+/// older checkpoint), but an unreadable checkpoint — e.g. an encrypted one (#681/#698) — is an actionable
+/// operator signal that is otherwise invisible until the log ages out (#772).</para>
+/// <para><b>Volume:</b> one line per selected checkpoint discarded <i>while seeding</i>, per snapshot load.
+/// A persistently unreadable checkpoint (an encrypted one does not self-heal until re-checkpointed) therefore
+/// re-emits on every load. This is intentional — a seed-time discard is an exceptional, individually-
+/// actionable event, and <see cref="DeltaLog"/> is constructed per-operation, so there is no cross-load
+/// dedupe seam. Alert on the <c>deltasharp.delta.checkpoint.fallbacks</c> counter (the rate instrument); the
+/// Warning is the per-occurrence detail.</para>
+/// <para><b>Production reach:</b> the counter reaches the shared meter and is live today; this log line is a
+/// no-op until a host wires a logging provider (the #450 no-op-by-default posture, host wiring tracked on the
+/// telemetry-export track). Until then the operator-observable artifact of #772 is the counter, not the
+/// version on this line.</para>
 /// </remarks>
 internal static partial class DeltaCheckpointLog
 {
