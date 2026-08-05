@@ -2,7 +2,10 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
 using DeltaSharp.Storage.Backends;
+using DeltaSharp.Storage.Diagnostics;
 using DeltaSharp.Types;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace DeltaSharp.Storage.Delta;
 
@@ -40,6 +43,8 @@ internal sealed class DeltaLog
 
     private readonly IStorageBackend _backend;
     private readonly long _maxLogObjectBytes;
+    private readonly ILogger<DeltaLog> _logger;
+    private readonly DeltaStorageTelemetry _telemetry;
 
     /// <summary>Creates a reader over <paramref name="backend"/>, which must be rooted at the Delta table
     /// directory (so <c>_delta_log/…</c> is reachable).</summary>
@@ -49,12 +54,23 @@ internal sealed class DeltaLog
     }
 
     /// <summary>Creates a reader with an explicit untrusted-object read ceiling (tests use a small ceiling
-    /// to exercise the fail-closed bound without materializing a multi-hundred-MiB object).</summary>
-    internal DeltaLog(IStorageBackend backend, long maxLogObjectBytes)
+    /// to exercise the fail-closed bound without materializing a multi-hundred-MiB object) and, optionally,
+    /// an injected <paramref name="logger"/>/<paramref name="telemetry"/> surface. Both default to the
+    /// process no-op (<see cref="NullLogger{T}"/> / <see cref="DeltaStorageTelemetry.Shared"/>), so the read
+    /// path is a safe no-op until a host wires a logging provider or a meter/activity listener (design
+    /// §7 — a <c>Counter.Add</c> with no <see cref="System.Diagnostics.Metrics.MeterListener"/> and an
+    /// <see cref="ILogger"/> call with no provider both perform no work).</summary>
+    internal DeltaLog(
+        IStorageBackend backend,
+        long maxLogObjectBytes,
+        ILogger<DeltaLog>? logger = null,
+        DeltaStorageTelemetry? telemetry = null)
     {
         ArgumentNullException.ThrowIfNull(backend);
         _backend = backend;
         _maxLogObjectBytes = maxLogObjectBytes;
+        _logger = logger ?? NullLogger<DeltaLog>.Instance;
+        _telemetry = telemetry ?? DeltaStorageTelemetry.Shared;
     }
 
     /// <summary>
@@ -773,6 +789,7 @@ internal sealed class DeltaLog
                         // The same kind raised by _backend.OpenReadAsync above would mean the TABLE itself is
                         // unreadable, and swallowing that would mask it behind a silent full JSON replay, so
                         // it must keep propagating (PR #698 security review, FIX 1).
+                        RecordCheckpointFallback(CheckpointFallbackReason.UnsupportedFeature, checkpoint.Version);
                         return null;
                     }
 
@@ -801,8 +818,20 @@ internal sealed class DeltaLog
         {
             // The checkpoint is non-authoritative (design §2.10.3): any decode failure falls back to JSON
             // replay rather than propagating, and never publishes half-built state.
+            RecordCheckpointFallback(CheckpointFallbackReason.Malformed, checkpoint.Version);
             return null;
         }
+    }
+
+    /// <summary>Emits the structured checkpoint-fallback signal (#772): a bounded-reason metric increment on
+    /// the <c>DeltaSharp.Delta</c> meter plus a Warning log carrying the discarded checkpoint version, so an
+    /// otherwise-silent discard (an encrypted #681/#698 or malformed checkpoint that falls back to JSON
+    /// replay) is recoverable from telemetry without a code-level repro. A safe no-op until a host wires a
+    /// meter/logging provider.</summary>
+    private void RecordCheckpointFallback(CheckpointFallbackReason reason, long version)
+    {
+        _telemetry.RecordCheckpointFallback(reason);
+        DeltaCheckpointLog.CheckpointFallback(_logger, version, DeltaStorageTelemetry.ToLabel(reason));
     }
 
     /// <summary>Replays JSON commits <c>[start, target]</c> in ascending order into <paramref name="state"/>,

@@ -66,7 +66,7 @@ apply these rules to any PR that adds logging, metrics, or tracing.
 | Stage/metrics seam | `ExecutionMetrics` snapshot per action; `QueryExecutionStage` attribution; `ExecutionAudit` lazy/eager audit | Stage/task spans and instruments fed from the same values |
 | Correlation | Ambient `Activity` (if tracing enabled) within one process; no cross-process boundary yet | W3C Trace Context over gRPC + Arrow Flight; shuffle re-resolution spans ([ADR-0004](../../adr/0004-shuffle-architecture.md)) |
 | Redaction | Core/Executor: `SecretRedaction.RedactPath` (path/credential-scoped) in plan/diagnostic rendering; **Storage: `DiagnosticText.DescribePath`/`Sanitize`** (Storage cannot see `SecretRedaction`); SQL/rows/option values kept safe by never rendering them | Layer-appropriate path primitive at every log/metric/span path site — one per assembly reach, **not** one global (see storage-delta-architecture.md §5.3); credential-bearing URIs OUT OF SCOPE |
-| Storage telemetry | `DeltaStorageTelemetry` ships the `DeltaSharp.Delta` commit/VACUUM/OPTIMIZE/DELETE instruments and spans, plus the `LoggerMessage` log sites in `src/DeltaSharp.Storage/Diagnostics/` | Adapter and Parquet I/O instruments on the `DeltaSharp.Storage` meter/source, which are created (to fix the naming) but carry no instruments yet |
+| Storage telemetry | `DeltaStorageTelemetry` ships the `DeltaSharp.Delta` commit/VACUUM/OPTIMIZE/DELETE instruments and spans, the snapshot-reconstruction `deltasharp.delta.checkpoint.fallback` counter (#772), plus the `LoggerMessage` log sites in `src/DeltaSharp.Storage/Diagnostics/` | Adapter and Parquet I/O instruments on the `DeltaSharp.Storage` meter/source, which are created (to fix the naming) but carry no instruments yet |
 
 This document changes **no public API**. `DeltaSharpTelemetry` is `internal`, so the
 `DeltaSharp.Abstractions` and `DeltaSharp.Core` PublicAPI baselines are unchanged (RS0016/RS0017 stay
@@ -422,6 +422,7 @@ boundary.
 | Storage I/O | Counter / Histogram | `deltasharp.storage.io.bytes` (`direction`, `backend` tags), `deltasharp.storage.io.duration` | `By`, `s` | future storage layer | delta-storage-format-engineer |
 | Delta commit | Counter / Histogram | `deltasharp.delta.commit.count` (`deltasharp.outcome` tag), `deltasharp.delta.commit.duration`, `deltasharp.delta.commit.attempts` (`deltasharp.outcome` tag), `deltasharp.delta.commit.conflicts` (`deltasharp.conflict.class` tag), `deltasharp.delta.commit.transient_retries` | `{commit}`, `s`, `{attempt}`, `{conflict}`, `{retry}` | Delta log (#479) | delta-storage-format-engineer |
 | Delta VACUUM | Counter / Histogram | `deltasharp.delta.vacuum.count` (`deltasharp.outcome` tag), `deltasharp.delta.vacuum.duration` (`deltasharp.outcome` tag), `deltasharp.delta.vacuum.files` (`deltasharp.vacuum.decision` tag) | `{vacuum}`, `s`, `{file}` | Delta maintenance (#196) | delta-storage-format-engineer |
+| Delta snapshot reconstruction | Counter | `deltasharp.delta.checkpoint.fallback` (`deltasharp.checkpoint.fallback.reason` tag — `unsupported_feature`/`malformed`) | `{fallback}` | Delta log (#772) | delta-storage-format-engineer |
 | Shuffle | Counter / Histogram | `deltasharp.shuffle.bytes`, `deltasharp.shuffle.fetch.duration`, `deltasharp.shuffle.reresolve.count` | `By`, `s`, `{operation}` | future shuffle ([ADR-0004](../../adr/0004-shuffle-architecture.md)) | dotnet-distributed-execution-engineer |
 | Saturation / USE | UpDownCounter / ObservableGauge | `deltasharp.executor.active`, `deltasharp.exec.queue.depth`, `deltasharp.rpc.inflight`, `deltasharp.exec.memory.reserved` | `{executor}`, `{task}`, `{operation}`, `By` | future driver/executor + shuffle | cloud-native-site-reliability-engineer |
 | Runtime / GC | EventCounters | allocation rate, GC pause, thread-pool queue (`dotnet-counters`) | varies | .NET runtime | dotnet-runtime-performance-engineer |
@@ -451,7 +452,10 @@ Labels use the **metric-label-safe** set only — today the six bounded `DeltaSh
 `deltasharp.backend` and `deltasharp.conflict.class`, minted by the Delta commit path in #479), and the
 bounded `deltasharp.vacuum.decision` key (a closed four-value set — `deletable`, `active`,
 `retention_protected_tombstone`, `recently_staged` — minted by the Delta VACUUM path in #196; a candidate
-object path is **never** a metric tag and appears only on the audit log). The
+object path is **never** a metric tag and appears only on the audit log), and the bounded
+`deltasharp.checkpoint.fallback.reason` key (a closed set — `unsupported_feature`, `malformed` — minted by
+the snapshot-reconstruction fallback path in #772; the discarded checkpoint's **version** is
+correlation/exemplar-only and never a metric tag). The
 remaining storage, error-classification, and propagation instruments add their own bounded labels (a
 storage-I/O `direction` — `read`/`write` —, a sanitized error class, and a wire `protocol`), **documented
 here but not yet minted** in `DeltaSharpTelemetry` and added as `deltasharp.`-prefixed (or adopted OpenTelemetry

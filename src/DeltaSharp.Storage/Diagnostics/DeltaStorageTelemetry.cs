@@ -65,6 +65,25 @@ internal enum CommitRetryReason
 }
 
 /// <summary>
+/// The bounded reason a classic checkpoint was discarded during snapshot reconstruction and its state was
+/// NOT used to seed the snapshot — reconstruction falls back to an older checkpoint or full JSON replay
+/// (design §2.10.3; #772). A closed value set, safe as the <see cref="DeltaStorageTelemetry.CheckpointFallbackReasonKey"/>
+/// metric label; the discarded checkpoint's <b>version</b> is a correlation/exemplar-only signal that never
+/// becomes a metric label (unbounded over a table's lifetime — checklist 09b), so it rides only the log line.
+/// </summary>
+internal enum CheckpointFallbackReason
+{
+    /// <summary>The checkpoint is a VALID Parquet file DeltaSharp cannot read (an unsupported feature such as
+    /// Parquet Modular Encryption, #681/#698) — a <see cref="DeltaStorageException"/> with
+    /// <see cref="StorageErrorKind.UnsupportedFeature"/> from the checkpoint reader.</summary>
+    UnsupportedFeature,
+
+    /// <summary>The checkpoint is malformed/corrupt (unreadable Parquet, a protocol-illegal action set, or a
+    /// forged multi-<c>metaData</c> part set) — a <see cref="DeltaProtocolException"/> raised while seeding.</summary>
+    Malformed,
+}
+
+/// <summary>
 /// The bounded terminal outcome of a Delta VACUUM (design §2.14, STORY-05.6.2) behind the shared
 /// <see cref="DeltaSharpTelemetry.OutcomeKey"/> label — so a dry-run, a real reclamation, a fail-closed
 /// sub-threshold rejection, a cancellation, and an unexpected failure are never collapsed into one
@@ -255,6 +274,12 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     /// the candidate <i>path</i> is never a metric tag (unbounded — it lives only on the audit log).</summary>
     internal const string VacuumDecisionKey = "deltasharp.vacuum.decision";
 
+    /// <summary>The bounded <c>deltasharp.checkpoint.fallback.reason</c> metric label key sub-classifying a
+    /// discarded checkpoint by why reconstruction fell back to JSON replay (<c>unsupported_feature</c>,
+    /// <c>malformed</c>). A closed value set (metric-label-safe); the discarded checkpoint <i>version</i> is
+    /// never a metric tag (unbounded over a table's lifetime — it lives only on the fallback log line).</summary>
+    internal const string CheckpointFallbackReasonKey = "deltasharp.checkpoint.fallback.reason";
+
     private static readonly string AssemblyVersion =
         typeof(DeltaStorageTelemetry).Assembly.GetName().Version?.ToString() ?? "0.0.0";
 
@@ -280,6 +305,7 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     private readonly Counter<long> _deleteCount;
     private readonly Counter<long> _deleteFiles;
     private readonly Counter<long> _deleteRows;
+    private readonly Counter<long> _checkpointFallback;
 
     internal DeltaStorageTelemetry()
     {
@@ -339,6 +365,9 @@ internal sealed class DeltaStorageTelemetry : IDisposable
         _deleteRows = _deltaMeter.CreateCounter<long>(
             "deltasharp.delta.delete.rows", unit: "{row}",
             description: "Rows logically deleted by DELETE via deletion vectors, by outcome.");
+        _checkpointFallback = _deltaMeter.CreateCounter<long>(
+            "deltasharp.delta.checkpoint.fallback", unit: "{fallback}",
+            description: "Classic checkpoints discarded during reconstruction (state not seeded; falls back to an older checkpoint or full JSON replay), by reason.");
     }
 
     /// <summary>The <c>DeltaSharp.Delta</c> meter (commit instruments). Exposed for reference-identity
@@ -518,6 +547,15 @@ internal sealed class DeltaStorageTelemetry : IDisposable
         }
     }
 
+    /// <summary>Increments the checkpoint-fallback counter for one classic checkpoint that was discarded
+    /// during reconstruction (its state did not seed the snapshot; reconstruction falls back to an older
+    /// checkpoint or full JSON replay — design §2.10.3, #772), tagged with the bounded
+    /// <see cref="CheckpointFallbackReasonKey"/>. The input is a bounded <see cref="CheckpointFallbackReason"/>
+    /// (never a raw string, so no unbounded/free-text value can reach the metric tag); the discarded
+    /// checkpoint's version is deliberately NOT a tag (correlation/exemplar-only) and rides the log line.</summary>
+    internal void RecordCheckpointFallback(CheckpointFallbackReason reason) =>
+        _checkpointFallback.Add(1, new KeyValuePair<string, object?>(CheckpointFallbackReasonKey, ToLabel(reason)));
+
     /// <summary>The bounded <c>deltasharp.outcome</c> string for an <see cref="OptimizeOutcome"/>.</summary>
     internal static string ToLabel(OptimizeOutcome outcome) => outcome switch
     {
@@ -591,6 +629,16 @@ internal sealed class DeltaStorageTelemetry : IDisposable
         CommitRetryReason.ConflictRebase => "conflict_rebase",
         CommitRetryReason.AmbiguousSlotFree => "ambiguous_slot_free",
         _ => "transient",
+    };
+
+    /// <summary>The bounded <c>deltasharp.checkpoint.fallback.reason</c> string for a
+    /// <see cref="CheckpointFallbackReason"/> (design §7.3 closed value set). An unrecognized value maps to
+    /// <c>malformed</c> — the fail-safe generic reason — so no free-text value can reach the metric tag.</summary>
+    internal static string ToLabel(CheckpointFallbackReason reason) => reason switch
+    {
+        CheckpointFallbackReason.UnsupportedFeature => "unsupported_feature",
+        CheckpointFallbackReason.Malformed => "malformed",
+        _ => "malformed",
     };
 
     public void Dispose()

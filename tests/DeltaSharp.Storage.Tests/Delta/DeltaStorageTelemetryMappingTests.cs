@@ -49,6 +49,14 @@ public sealed class DeltaStorageTelemetryMappingTests
     }
 
     [Fact]
+    public void CheckpointFallbackReason_MapsToBoundedLabel()
+    {
+        Assert.Equal("unsupported_feature", DeltaStorageTelemetry.ToLabel(CheckpointFallbackReason.UnsupportedFeature));
+        Assert.Equal("malformed", DeltaStorageTelemetry.ToLabel(CheckpointFallbackReason.Malformed));
+        Assert.Equal("malformed", DeltaStorageTelemetry.ToLabel((CheckpointFallbackReason)999));
+    }
+
+    [Fact]
     public void ConflictKind_MapsToBoundedClass()
     {
         Assert.Equal("concurrent_append", DeltaStorageTelemetry.ToConflictClass(DeltaConflictKind.ConcurrentAppend));

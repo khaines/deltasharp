@@ -173,6 +173,7 @@ public sealed class StorageExceptionToStringTests
     /// </summary>
     private static readonly string[] StorageLogSiteSignatures =
     [
+        "DeltaCheckpointLog.CheckpointFallback(ILogger logger, Int64 version, String reason)",
         "DeltaCommitLog.CommitCanceled(ILogger logger, Int64 version, Int32 attempts)",
         "DeltaCommitLog.CommitCompleted(ILogger logger, Int64 version, Int32 attempts, Double durationMs)",
         "DeltaCommitLog.CommitConflict(ILogger logger, Int32 attempt, Int64 targetVersion, String conflictClass)",
