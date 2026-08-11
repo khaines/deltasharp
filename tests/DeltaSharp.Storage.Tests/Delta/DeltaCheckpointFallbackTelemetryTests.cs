@@ -31,6 +31,7 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
     private const string OperationKey = "deltasharp.operation";
     private const string BackendKey = "deltasharp.backend";
     private const string FallbackEvent = "DeltaCheckpointFallback";
+    private const string ForgedEvent = "DeltaCheckpointForgedMultiMetadataRejected";
 
     private const string EmptySchemaUnescaped = """{"type":"struct","fields":[]}""";
 
@@ -149,14 +150,15 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
     }
 
     [Fact]
-    public async Task ForgedMultiMetadataCheckpoint_EmitsFallbackEvent_WithMalformedReason_NoLeak()
+    public async Task ForgedMultiMetadataCheckpoint_EmitsForgedRejectSignal_WithForgedReason_NoLeak()
     {
         IStorageBackend backend = NewBackend();
         await WriteHistoryAsync(backend);
         // A forged checkpoint carrying TWO metaData actions (split across parts) — the #671 cross-part
-        // forgery the single-metaData guard rejects. It must be discarded as `malformed` (never seeded), and
-        // the swallowed exception's message (which embeds the attacker-chosen metaData count) must NOT leak
-        // into the log line — only {Version, Reason} may be rendered.
+        // forgery the single-metaData guard rejects. It must be discarded (never seeded) and attributed to the
+        // DISTINGUISHED `forged_multi_metadata` reason (a security signal, #763) — not the generic `malformed`
+        // that bit-rot uses — via a distinct EventId 4401. The swallowed reject's detail (which embeds the
+        // attacker-chosen metaData id/count) must NOT leak: only {Version} may be rendered.
         CheckpointFixture forged = new CheckpointFixture()
             .Protocol(1, 2)
             .Metadata(id: "t", schemaString: EmptySchemaUnescaped)
@@ -166,16 +168,27 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
         await DeltaTestHarness.WriteLastCheckpointAsync(backend, 1, parts: 2);
 
         (Snapshot snapshot, MeterCapture.Measurement metric, RecordingLogger<DeltaLog>.Entry log) =
-            await LoadWithCaptureAsync(backend);
+            await LoadWithCaptureAsync(backend, ForgedEvent);
 
         Assert.Null(snapshot.Metrics.CheckpointVersion); // forged checkpoint discarded → JSON replay
         Assert.Equal(2, snapshot.Metrics.ReplayedCommitCount);
-        Assert.Equal("malformed", metric.Tags[ReasonKey]);
+
+        // Distinguished from bit-rot `malformed`: bounded metric reason + the security-specific EventId 4401.
+        Assert.Equal(1, metric.Value);
+        Assert.Equal("forged_multi_metadata", metric.Tags[ReasonKey]);
+        Assert.Equal(LogLevel.Warning, log.Level);
+        Assert.Equal(4401, log.EventId.Id);
         Assert.Equal(1L, log.Field("Version"));
-        Assert.Equal("malformed", log.Field("Reason"));
-        // Redaction: neither the attacker-chosen metaData id nor the reject message's text may surface.
+
+        // No-leak (#763/#671): the log line is a compile-time template with only {Version} substituted, so no
+        // attacker-planted metaData id or count can surface. Pin the exact rendered message and the absence of
+        // the forged identity as a decisive redaction-by-omission guard (the #786 `_NoLeak` template).
         Assert.DoesNotContain("t-forged-identity", log.Message, StringComparison.Ordinal);
-        Assert.DoesNotContain("carries", log.Message, StringComparison.Ordinal);
+        Assert.Equal(
+            "Delta checkpoint at version 1 was rejected as forged and not used to seed the snapshot: it carries "
+            + "more than one metaData action across its parts (a checkpoint must summarize at most one); "
+            + "reconstruction falls back to an older checkpoint or full JSON replay.",
+            log.Message);
     }
 
     [Fact]
@@ -225,7 +238,7 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
     }
 
     private async Task<(Snapshot Snapshot, MeterCapture.Measurement Metric, RecordingLogger<DeltaLog>.Entry Log)>
-        LoadWithCaptureAsync(IStorageBackend backend)
+        LoadWithCaptureAsync(IStorageBackend backend, string eventName = FallbackEvent)
     {
         var logger = new RecordingLogger<DeltaLog>();
         using var telemetry = new DeltaStorageTelemetry();
@@ -235,7 +248,7 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
             .LoadSnapshotAsync();
 
         MeterCapture.Measurement metric = Assert.Single(meters.ForInstrument(FallbackInstrument));
-        RecordingLogger<DeltaLog>.Entry log = logger.Single(FallbackEvent);
+        RecordingLogger<DeltaLog>.Entry log = logger.Single(eventName);
 
         // Cardinality invariant (design 09b / #772): the counter carries EXACTLY the bounded reason tag. The
         // discarded checkpoint version is correlation/exemplar-only and must NEVER become a metric label

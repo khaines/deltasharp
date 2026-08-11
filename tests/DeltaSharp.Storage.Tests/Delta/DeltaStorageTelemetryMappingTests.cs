@@ -53,6 +53,7 @@ public sealed class DeltaStorageTelemetryMappingTests
     {
         Assert.Equal("unsupported_feature", DeltaStorageTelemetry.ToLabel(CheckpointFallbackReason.UnsupportedFeature));
         Assert.Equal("malformed", DeltaStorageTelemetry.ToLabel(CheckpointFallbackReason.Malformed));
+        Assert.Equal("forged_multi_metadata", DeltaStorageTelemetry.ToLabel(CheckpointFallbackReason.ForgedMetadata));
         Assert.Equal("malformed", DeltaStorageTelemetry.ToLabel((CheckpointFallbackReason)999));
     }
 

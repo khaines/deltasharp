@@ -422,7 +422,7 @@ boundary.
 | Storage I/O | Counter / Histogram | `deltasharp.storage.io.bytes` (`direction`, `backend` tags), `deltasharp.storage.io.duration` | `By`, `s` | future storage layer | delta-storage-format-engineer |
 | Delta commit | Counter / Histogram | `deltasharp.delta.commit.count` (`deltasharp.outcome` tag), `deltasharp.delta.commit.duration`, `deltasharp.delta.commit.attempts` (`deltasharp.outcome` tag), `deltasharp.delta.commit.conflicts` (`deltasharp.conflict.class` tag), `deltasharp.delta.commit.transient_retries` | `{commit}`, `s`, `{attempt}`, `{conflict}`, `{retry}` | Delta log (#479) | delta-storage-format-engineer |
 | Delta VACUUM | Counter / Histogram | `deltasharp.delta.vacuum.count` (`deltasharp.outcome` tag), `deltasharp.delta.vacuum.duration` (`deltasharp.outcome` tag), `deltasharp.delta.vacuum.files` (`deltasharp.vacuum.decision` tag) | `{vacuum}`, `s`, `{file}` | Delta maintenance (#196) | delta-storage-format-engineer |
-| Delta snapshot reconstruction | Counter | `deltasharp.delta.checkpoint.fallbacks` (`deltasharp.checkpoint.fallback.reason` tag — `unsupported_feature`/`malformed`) | `{fallback}` | Delta log (#772) | delta-storage-format-engineer |
+| Delta snapshot reconstruction | Counter | `deltasharp.delta.checkpoint.fallbacks` (`deltasharp.checkpoint.fallback.reason` tag — `unsupported_feature`/`malformed`/`forged_multi_metadata`) | `{fallback}` | Delta log (#772, #763) | delta-storage-format-engineer |
 | Shuffle | Counter / Histogram | `deltasharp.shuffle.bytes`, `deltasharp.shuffle.fetch.duration`, `deltasharp.shuffle.reresolve.count` | `By`, `s`, `{operation}` | future shuffle ([ADR-0004](../../adr/0004-shuffle-architecture.md)) | dotnet-distributed-execution-engineer |
 | Saturation / USE | UpDownCounter / ObservableGauge | `deltasharp.executor.active`, `deltasharp.exec.queue.depth`, `deltasharp.rpc.inflight`, `deltasharp.exec.memory.reserved` | `{executor}`, `{task}`, `{operation}`, `By` | future driver/executor + shuffle | cloud-native-site-reliability-engineer |
 | Runtime / GC | EventCounters | allocation rate, GC pause, thread-pool queue (`dotnet-counters`) | varies | .NET runtime | dotnet-runtime-performance-engineer |
@@ -453,11 +453,14 @@ Labels use the **metric-label-safe** set only — today the six bounded `DeltaSh
 bounded `deltasharp.vacuum.decision` key (a closed four-value set — `deletable`, `active`,
 `retention_protected_tombstone`, `recently_staged` — minted by the Delta VACUUM path in #196; a candidate
 object path is **never** a metric tag and appears only on the audit log), and the bounded
-`deltasharp.checkpoint.fallback.reason` key (a closed set — `unsupported_feature`, `malformed` — minted by
-the snapshot-reconstruction fallback path in #772; the discarded checkpoint's **version** is
+`deltasharp.checkpoint.fallback.reason` key (a closed set — `unsupported_feature`, `malformed`,
+`forged_multi_metadata` — minted by
+the snapshot-reconstruction fallback path in #772/#763; the discarded checkpoint's **version** is
 correlation/exemplar-only and never a metric tag). The `deltasharp.delta.checkpoint.fallbacks` counter
 signals only a **selected checkpoint discarded while seeding** (a post-selection `unsupported_feature`/
-`malformed` decode failure); selection-time skips (an incomplete multi-part group, a V2/UUID checkpoint, or
+`malformed` decode failure, or a `forged_multi_metadata` reject — the #671 cross-part identity forgery,
+distinguished at the guard site and logged under its own EventId 4401 because it is a security signal, not
+routine bit-rot); selection-time skips (an incomplete multi-part group, a V2/UUID checkpoint, or
 a failed `_last_checkpoint` hint) are not counted, and — per the no-op-by-default posture — the counter, not
 the (host-wiring-gated) Warning log, is the operator-observable artifact today. The
 remaining storage, error-classification, and propagation instruments add their own bounded labels (a
