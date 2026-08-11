@@ -325,15 +325,22 @@ rendering it**, not by a redactor:
   embeds the table identifier in its message, and `SinkDescriptor.SimpleString`/EXPLAIN render
   `table=<identifier>` — that is required for the diagnostic to be useful and is **not** a telemetry sink.
   The tenant-scrubbing rule applies at the moment such a diagnostic **crosses into telemetry**: do **not**
-  blindly `Activity.RecordException(ex)` (which captures `exception.message`) on a span, nor attach a raw
-  EXPLAIN/plan string to a span or structured log, when the identifier can carry tenant identity — record a
-  structural/redacted form or omit the identifier. **Audited (#455):** there are no exception-onto-span
-  recording call sites today (telemetry export is host-gated, #458), so there is no live leak;
-  `Activity.AddException` and `Activity.RecordException` are now banned APIs (`BannedSymbols.txt` → RS0030),
-  so a future telemetry site must consciously scrub/omit the identifier (or record a structural form) rather
-  than blindly record a raw diagnostic, and a source-scan test pins zero call sites. The sibling "no raw
-  EXPLAIN/plan string on a span or structured log" rule stays a review-enforced convention — a free-text tag
-  cannot be mechanically banned.
+  blindly `Activity.RecordException(ex)`/`AddException(ex)` (which capture `exception.message`) on a span, nor
+  flow a diagnostic `.Message`/`.SimpleString` into a span tag/status/event, nor attach a raw EXPLAIN/plan
+  string to a span or structured log, when the identifier can carry tenant identity — scrub/omit the
+  identifier and emit a **bounded structural** value instead. **Audited (#455):** spans, tags and events *are*
+  emitted today (only the collector is host-gated, #458), and the whole live span surface was enumerated —
+  every `SetTag`/`SetStatus`/`AddEvent` uses bounded keys/values, `deltasharp.table` has **zero** producers, no
+  `.Message`/`.SimpleString` reaches a tag/status/event, and Core/Executor have no `ILogger`, so an
+  `AnalysisException` message reaches no persisted or exported channel — i.e. **no live leak**. The mechanical
+  guard: `Activity.AddException`/`RecordException` (and `TelemetrySpan.RecordException`) are banned
+  (`BannedSymbols.txt` → RS0030, **no `#pragma` exemption** — the sanctioned form is a bounded structural tag,
+  not a pragma'd raw record), and a source-scan test (`TelemetryExceptionScrubbingGuardTests`) additionally
+  pins that no production code flows a diagnostic `.Message`/`.SimpleString` or an `exception.message` key onto
+  a span. Two residuals stay outside the mechanical guard: an arbitrary human-chosen free-text EXPLAIN/plan
+  string attached to a span/log (a review-enforced convention — a free-text value cannot be symbol- or
+  scan-banned), and a tenant-scrubbing seam for the `deltasharp.table` key when a producer is added, tracked in
+  [#790](https://github.com/khaines/deltasharp/issues/790) <!-- issue-state:open --> (gated on #458).
 - **Exception objects are diagnostics too — let `Exception.ToString()` do the chain walk, never do it
   yourself.** Treat every storage `Exception.Message` as untrusted tenant data: some tokens are routed
   through `DiagnosticText.Sanitize`, others are interpolated raw, and the reviewed producer examples are
@@ -345,7 +352,8 @@ rendering it**, not by a redactor:
   `Exception.ToString()` recurses through the inner's *own* virtual `ToString()`. So the safe/unsafe axis
   is **not** "renders vs reflects" — it is **"does the sink walk `.InnerException` itself"**:
   - Safe: a sink that prints `.Message`, or calls `ToString()` **once** — the built-in console providers,
-    Serilog's default `{Exception}` token and JSON formatters, `Activity.AddException(ex)`.
+    Serilog's default `{Exception}` token and JSON formatters, `Activity.AddException(ex)` (safe on this
+    chain-walk axis, but separately **RS0030-banned** for the tenant-identifier reason above — #455).
   - **Leaks:** a sink that enumerates the chain itself even while *rendering* each level — measured on
     NLog's `${exception:maxInnerExceptionLevel=…}` and on Application Insights' `ExceptionDetails` list —
     or that reflects over the object graph (a destructurer, `{@Ex}` in a Serilog template, an
