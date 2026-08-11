@@ -8,16 +8,18 @@
 > [What #694 corrected](#what-694-corrected-one-defect-class-six-symptoms). Grounded in the
 > message-hygiene work of #648/#651/#653/#667 and in `DiagnosticText.DescribeWithoutInner`
 > (`src/DeltaSharp.Storage/Delta/DiagnosticText.cs`). Reviewed against checklists
-> [05](../checklists/05-security-checklist.md), [07](../checklists/07-privacy-checklist.md),
+> [05](../checklists/05-security-checklist.md),
 > [09a](../checklists/09a-logging-checklist.md),
 > [09c](../checklists/09c-distributed-tracing-checklist.md),
 > [11](../checklists/11-documentation-support-checklist.md), and
-> [14](../checklists/14-tenant-isolation-checklist.md). **Checklist 07 is not fully satisfied by this
-> page alone:** the server-side-only diagnostic sink it recommends needs the retention, audited access,
-> ownership, collection, review, failure-signal, residency, and erasure governance below that only the
-> deploying host can set, and a
-> `privacy-compliance-grc-lead` sign-off on the default recommendation is tracked in
-> [#744](https://github.com/khaines/deltasharp/issues/744) <!-- issue-state:open -->. See
+> [14](../checklists/14-tenant-isolation-checklist.md). **Checklist [07](../checklists/07-privacy-checklist.md) is satisfied for the guidance this
+> page provides**, with host-instantiation obligations delineated: the server-side-only diagnostic sink it
+> recommends is the deploying host's to instantiate and operate, so this page's 07 obligation is to
+> *define, require, name owners for, and ratify defaults for* the retention, audited access, ownership,
+> collection, review, failure-signal, residency, and erasure governance below — which it now does. The
+> `privacy-compliance-grc-lead` sign-off ratifying those default recommendations landed in #744; the host —
+> not DeltaSharp — is the accountable party for the sink it deploys (controller or processor per the Owner
+> row). See
 > [What a storage `.Message` still retains](#what-a-storage-message-still-retains). Read with
 > [observability-conventions.md](observability-conventions.md) (the repo-wide logging, metrics, tracing,
 > and redaction rules) and [storage-delta-architecture.md](storage-delta-architecture.md) (the storage
@@ -308,8 +310,9 @@ removes the tenant's own data from a relative path or column name.
 - If your sink is shared across tenants, or is retained beyond your table-data retention, treat
   `.Message` as tenant data: scope it, retain it no longer than the data it describes, and include it in
   erasure scope.
-- If the sink is hosted or third-party, treat it as a sub-processor receiving tenant personal data:
-  its region, residency, support access, and transfer basis are part of the routing decision.
+- If the sink is hosted or third-party, the provider is your **processor or sub-processor** depending on
+  your own posture (see the **Owner** row below): its region, residency, support access, and transfer
+  basis are part of the routing decision.
 - The library-side minimum-disclosure improvement drops partition values from surfaced paths that use
   `DiagnosticText.DescribePath`; producers not yet routed through it remain a routing obligation rather
   than a library guarantee.
@@ -317,23 +320,28 @@ removes the tenant's own data from a relative path or column name.
 ### If you route the raw inner to a server-side-only sink
 
 The DO list below recommends a server-side-only diagnostics sink for `ex.InnerException?.Message`. That
-sink is **yours**, not DeltaSharp's, and checklist 07 requires the governance below before it can be
-called compliant. This page cannot set these properties for you — it can only require them and fail the
-"satisfies 07" claim until they exist:
+sink is **yours**, not DeltaSharp's — DeltaSharp is a library and cannot instantiate or operate it.
+Checklist 07's obligation on *this page* is therefore to define, require, name owners for, and ratify
+defaults for the governance below; the third column gives the ratified default for each. These defaults
+are **obligation floors** — the strictness you must meet or exceed — **not retention floors**: for
+duration, shorter is always compliant, up to and including not retaining at all.
 
-| Required | What to define | Suggested floor |
+| Required | What to define | Ratified default (an obligation floor — meet or exceed; for duration, shorter is always compliant) |
 | --- | --- | --- |
-| **Retention period** | How long the raw inner text is kept | No longer than the table data it describes, and short enough to be defensible as diagnostic — days, not months |
-| **Access scope** | Who can read it and how access is audited | Named on-call/operations role only; never a tenant, never a shared dashboard; every read is logged |
-| **Owner** | Who is accountable for the sink and its reviews | A named operations owner in your organisation; in-repo, `cloud-native-site-reliability-engineer` owns the guidance |
-| **Collection path** | How records reach the sink and remain attributable | A documented, bounded route with table/time correlation and no ambient fan-out |
-| **Review cadence** | How often retention, access, residency, and need are reassessed | At least annually and after any sink/provider or data-classification change |
-| **Failure signal** | How collection, retention, access-audit, or erasure failures surface | An owned alert or compliance control failure, never silent best effort |
-| **Erasure path** | How a subject-erasure request reaches this sink | Enumerable by table and time window, and included in your DSAR/erasure runbook |
+| **Retention period** | How long the raw inner text is kept | **Maximum 30 days, and never longer than the described table's own retention (whichever is shorter). No minimum — shorter, or not retaining, is always compliant.** Defensible only because the payload is *unsanitized*: it can carry absolute/caller-relative object paths, **undropped Hive partition values** (partition = column values = table data/PII), and value-bearing decoder text — none of it minimized. **Legal hold** overrides to block deletion as a documented, owned privacy exception carrying **basis, owner, expiry, compensating controls, and tenant/customer-communication requirements**. |
+| **Access scope** | Who can read it and how access is audited | Named on-call/operations role only; never a tenant, never a shared/cross-tenant dashboard; every read logged (who, when, table id + time window). **07 gate:** the access path must first pass **checklist 05** (authenticated non-shared identity, least-privilege role binding, short-lived/workload credentials over static sink tokens, deny-by-default) and **checklist 14** (query surface cannot return another tenant's records) before you may call your sink compliant — this page's 05/14 review covers its routing *guidance*, not your sink. The **read-audit log itself** must be append-only/tamper-evident, stored where the reading role cannot delete or mutate it, **owned by someone other than the audited role**, retained ≥ the sink's retention, and in review-cadence + legal-hold scope. |
+| **Owner** | Who is accountable, and the controller/processor posture | A named operations owner accountable for the sink and its reviews. **Determine the posture before executing the DPA:** the host is a **controller** for a diagnostics sink whose purpose and means it determines (even while it is a *processor* for the tenant's table data), and a hosted provider is then its **processor**; where the host runs the sink strictly on a customer's documented instructions it is a **processor** and the provider is a **sub-processor**. In-repo, `cloud-native-site-reliability-engineer` owns operational guidance and `privacy-compliance-grc-lead` owns data-classification. |
+| **Collection path** | How records reach the sink and stay attributable | A documented, bounded route with **no ambient fan-out**. Attribution keys on every record: **table id + Delta version + timestamp**. Separately maintain an **owned, documented table-id → tenant + storage-location/region mapping**, retained ≥ the sink's retention **plus your breach-notification window** — table id alone resolves neither tenant nor region, both of which 07 breach-triage and residency require. |
+| **Review cadence** | How often retention, access, residency, need are reassessed | At least annually, **and on-event** after any sink/provider, region/residency, or data-classification change (including a new producer entering the message-posture door list, or a `ToString()`/typed-property change). |
+| **Failure signal** | How governance failures surface | An owned, **non-silent** alert / compliance-control failure across **five** classes: (1) collection, (2) retention/expiry, (3) access-audit-logging, (4) erasure failures → **operations owner**; and (5) **unauthorized/anomalous read or exposure** — a denied cross-tenant read, the sink surfaced on a shared or tenant-visible dashboard, or a routing change feeding the raw inner to a chain-walking provider → **security alert to the security/incident owner**, not only ops. |
+| **Erasure path** | How a subject-erasure request reaches this sink | Table id + time window yields a **candidate set, not a subject** — the payload is unsanitized free text, so table+time resolves a *window*, not a person. The host either **deletes the whole candidate window (the defensible default)** or content-matches within it, and **must record which**. **Subject-level enumeration is out of scope** — it runs via the source table. Co-erasure scope with the source row: `_delta_log`, time-travel versions, backups, derived tables, **caches, and object-store versions**. Emit an **erasure completion/verification record**: tables, version range, time window, count of records deleted, verification result, and exceptions — carrying **no new PII**. |
+| **Breach triage** | How affected parties are resolved on the clock | Use the **table-id → tenant + storage-location/region mapping** (Collection path) to resolve affected **tenants, storage locations, and regions** within the regulatory clock. Subject-level identification is out of scope for the sink and runs via the source table. |
+| **Hosted / third-party sink** | Processor / sub-processor, residency, transfer basis | Treat the provider as a **processor / sub-processor** (per the Owner determination) receiving **unsanitized** tenant personal data. Before use, pin and bind: sub-processor status disclosed; the primary region; **and its cross-region DR/replication regions, lifecycle-tiering regions, and the provider's own sub-processors (fourth parties)** — a region pin that does not bind backup and DR is not a residency commitment. Document the transfer basis where data crosses borders: **DPA executed, SCCs in place, TIA completed, support-access geography reviewed.** |
 
-`privacy-compliance-grc-lead` sign-off on recommended defaults for these obligations is tracked in
-[#744](https://github.com/khaines/deltasharp/issues/744) <!-- issue-state:open -->. Until that lands, this page claims only
-"reviewed against 07", not "satisfies 07".
+`privacy-compliance-grc-lead` has ratified these default recommendations (#744). With them, **this page
+satisfies checklist 07 for the guidance it provides** — you still own instantiating and operating a sink
+that meets them, and, per the Access row, your sink is compliant only once its access path passes
+checklists 05 and 14.
 
 ## The residual: reflection over the exception graph
 
@@ -474,7 +482,10 @@ their own call-out:
   1), not ephemeral console output. They remain subject to the personal-data, readership, retention, and
   erasure obligations above. Encode and bound the message before writing it — the sweep covers all
   producers known as of `76d2c8e`; any producer at a new guard is a reviewer obligation — and include
-  these sinks in the host controls tracked by #744 and the hygiene work in #749.
+  these sinks: **every #744 governance row above applies except _Access scope_** — CRD status and
+  Kubernetes Events are tenant-readable by design, which is why they are `.Message`-only sinks, so the
+  access-scope row does not apply; retention, owner, collection, review cadence, failure signal, erasure,
+  breach triage, and the hosted-sink row all do. See also the hygiene work in #749.
 
 - If you need the raw inner for on-node debugging, route it to a **server-side-only** sink that no tenant
   can read, with the governance properties in
