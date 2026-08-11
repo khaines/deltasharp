@@ -18,4 +18,10 @@
     <ProjectReference Include="../../src/DeltaSharp.Core/DeltaSharp.Core.csproj" />
   </ItemGroup>
 
+  <!-- Runtime library (not an analyzer): parses production source with a real C# parser for the
+       #455 telemetry-leak guard, replacing a hand-rolled masker. Test-only. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" />
+  </ItemGroup>
+
 </Project>

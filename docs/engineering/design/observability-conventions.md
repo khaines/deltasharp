@@ -335,11 +335,18 @@ rendering it**, not by a redactor:
   `AnalysisException` message reaches no persisted or exported channel — i.e. **no live leak**. The mechanical
   guard: `Activity.AddException`/`RecordException` (and `TelemetrySpan.RecordException`) are banned
   (`BannedSymbols.txt` → RS0030, **no `#pragma` exemption** — the sanctioned form is a bounded structural tag,
-  not a pragma'd raw record), and a source-scan test (`TelemetryExceptionScrubbingGuardTests`) additionally
-  pins that no production code flows a diagnostic `.Message`/`.SimpleString` or an `exception.message` key onto
-  a span. Two residuals stay outside the mechanical guard: an arbitrary human-chosen free-text EXPLAIN/plan
-  string attached to a span/log (a review-enforced convention — a free-text value cannot be symbol- or
-  scan-banned), and a tenant-scrubbing seam for the `deltasharp.table` key when a producer is added, tracked in
+  not a pragma'd raw record), and a source-scan test (`TelemetryExceptionScrubbingGuardTests`, a real-parser
+  AST walk) additionally pins that no production code flows a diagnostic member (`.Message`/`.SimpleString`/
+  `.ToString()` of an exception/`.FilePath`/`.ColumnName`/`.Constraint`/`.Reference`/`.TableIdentifier`), an
+  `exception.message`/`exception.stacktrace`/`deltasharp.table` literal key, or the `TableKey` constant, onto
+  **any** span-attribution sink (`SetTag`/`AddTag`/`SetStatus`/`AddEvent`/`ActivityEvent`/`SetBaggage`/
+  `AddBaggage`/`SetCustomProperty`/`StartActivity`/`DisplayName`) — within a statement. Three residuals stay
+  outside the mechanical guard, each a **review-enforced** obligation: (1) an arbitrary human-chosen free-text
+  EXPLAIN/plan string attached to a span/log (a free-text value cannot be symbol- or scan-banned); (2) a
+  diagnostic value **laundered through an intermediate local, field, or helper** (`var m = ex.Message;
+  SetTag(k, m);`) — intra-procedural dataflow beyond a syntactic scan, where the authoritative dataflow-proof
+  control is the RS0030 ban on the recording APIs plus review; and (3) a tenant-scrubbing seam for the
+  `deltasharp.table` key when a producer is added, tracked in
   [#790](https://github.com/khaines/deltasharp/issues/790) <!-- issue-state:open --> (gated on #458).
 - **Exception objects are diagnostics too — let `Exception.ToString()` do the chain walk, never do it
   yourself.** Treat every storage `Exception.Message` as untrusted tenant data: some tokens are routed

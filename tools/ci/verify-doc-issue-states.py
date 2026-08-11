@@ -49,9 +49,9 @@ EXPECTED_ANNOTATED_ISSUE_LINE_ANCHORS = {
     ],
     "docs/engineering/design/observability-conventions.md": [
         (46, 479),
-        (343, 790),
-        (349, 747),
-        (350, 749),
+        (350, 790),
+        (356, 747),
+        (357, 749),
     ],
 }
 MAX_MARKER_DISTANCE_CHARS = 200
